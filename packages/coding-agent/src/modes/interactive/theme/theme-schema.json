@@ -137,6 +137,10 @@
 					"$ref": "#/$defs/colorValue",
 					"description": "Selected item background"
 				},
+				"sidebarSelectedBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Selected conversation background in the sidebar (falls back to selectedBg)"
+				},
 				"userMessageBg": {
 					"$ref": "#/$defs/colorValue",
 					"description": "User message background"

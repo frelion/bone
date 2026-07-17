@@ -79,5 +79,7 @@ describe("SessionInfo.modified", () => {
 		expect(s).toBeDefined();
 		expect(s!.modified.getTime()).toBe(msgTime);
 		expect(s!.modified.getTime()).not.toBe(before.mtime.getTime());
+		expect(s!.lastMessage).toBe("later");
+		expect(s!.lastMessageRole).toBe("assistant");
 	});
 });

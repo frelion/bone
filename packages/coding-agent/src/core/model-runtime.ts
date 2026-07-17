@@ -32,7 +32,7 @@ import {
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { getAgentDir } from "../config.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
-import { ModelConfig } from "./model-config.ts";
+import { ModelConfig, type ModelsJson } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
 import {
 	type AuthStatus,
@@ -44,6 +44,7 @@ import {
 	resolveConfiguredModelHeaders,
 	validateExtensionProvider,
 } from "./provider-composer.ts";
+import { deriveProviderPresets, type ProviderPreset } from "./provider-presets.ts";
 import { withRemoteCatalog } from "./remote-catalog-provider.ts";
 import { RuntimeCredentials } from "./runtime-credentials.ts";
 
@@ -72,6 +73,22 @@ export interface ModelRuntimeAuthOverrides {
 	env?: Record<string, string>;
 }
 
+/** Secret-free status exposed to the Settings Center for extension providers. */
+export interface ExtensionProviderRuntimeStatus {
+	providerId: string;
+	sourcePath?: string;
+	auth: AuthStatus;
+	modelCount: number;
+	availableModelCount: number;
+	compositionError?: string;
+	configuration: "extension-only" | "builtin+extension" | "models-json+extension" | "builtin+models-json+extension";
+	capabilities: {
+		oauth: boolean;
+		customStream: boolean;
+		dynamicModels: boolean;
+	};
+}
+
 function mergeHeaders(
 	base: ProviderHeaders | undefined,
 	override: ProviderHeaders | undefined,
@@ -95,6 +112,7 @@ export class ModelRuntime implements Models {
 	private readonly defaultBuiltins: ReadonlyMap<string, Provider>;
 	private readonly builtins = new Map<string, Provider>();
 	private readonly extensionProviders = new Map<string, ProviderConfigInput>();
+	private readonly extensionProviderSources = new Map<string, string>();
 	private readonly compositionErrors = new Map<string, string>();
 	private readonly modelsPath: string | undefined;
 	private readonly allowModelNetwork: boolean;
@@ -282,6 +300,11 @@ export class ModelRuntime implements Models {
 		return this.models.getProviders();
 	}
 
+	/** Provider presets are derived from the active runtime catalog and contain no credentials. */
+	getProviderPresets(): readonly ProviderPreset[] {
+		return deriveProviderPresets(this.models.getProviders());
+	}
+
 	getProvider(providerId: string): Provider | undefined {
 		return this.models.getProvider(providerId);
 	}
@@ -338,6 +361,41 @@ export class ModelRuntime implements Models {
 		return [...this.extensionProviders.keys()];
 	}
 
+	/**
+	 * Return the complete, credential-blind state of an extension-managed
+	 * provider. Function-valued configuration is represented only by capability
+	 * flags so Settings can explain it without making it editable or serializing
+	 * implementation details.
+	 */
+	getExtensionProviderRuntimeStatus(providerId: string): ExtensionProviderRuntimeStatus | undefined {
+		const config = this.extensionProviders.get(providerId);
+		if (!config) return undefined;
+		const hasBuiltin = this.builtins.has(providerId);
+		const hasModelsJson = this.config.getProvider(providerId) !== undefined;
+		const configuration = hasBuiltin
+			? hasModelsJson
+				? "builtin+models-json+extension"
+				: "builtin+extension"
+			: hasModelsJson
+				? "models-json+extension"
+				: "extension-only";
+		const models = this.getModels(providerId);
+		return {
+			providerId,
+			sourcePath: this.extensionProviderSources.get(providerId),
+			auth: this.getProviderAuthStatus(providerId),
+			modelCount: models.length,
+			availableModelCount: this.snapshot.available.filter((model) => model.provider === providerId).length,
+			compositionError: this.compositionErrors.get(providerId),
+			configuration,
+			capabilities: {
+				oauth: config.oauth !== undefined,
+				customStream: config.streamSimple !== undefined,
+				dynamicModels: config.refreshModels !== undefined,
+			},
+		};
+	}
+
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */
 	getCompatibilityRequestConfig(model: Model<Api>): CompatibilityRequestConfig {
 		return resolveCompatibilityRequestConfig(
@@ -380,8 +438,16 @@ export class ModelRuntime implements Models {
 	}
 
 	async setRuntimeApiKey(providerId: string, apiKey: string): Promise<void> {
-		this.credentials.setRuntimeApiKey(providerId, apiKey);
-		const auth = new Map(this.snapshot.auth).set(providerId, { type: "api_key", source: "runtime API key" });
+		await this.setRuntimeCredential(providerId, { type: "api_key", key: apiKey });
+	}
+
+	/** Apply a non-persistent credential override to this ModelRuntime only. */
+	async setRuntimeCredential(providerId: string, credential: Credential): Promise<void> {
+		this.credentials.setRuntimeCredential(providerId, credential);
+		const auth = new Map(this.snapshot.auth).set(providerId, {
+			type: credential.type,
+			source: "runtime override",
+		});
 		const configuredProviders = new Set(this.snapshot.configuredProviders).add(providerId);
 		const storedProviders = new Set(this.snapshot.storedProviders).add(providerId);
 		this.snapshot = {
@@ -394,8 +460,29 @@ export class ModelRuntime implements Models {
 		await this.refresh({ allowNetwork: this.allowModelNetwork });
 	}
 
+	/** Persist the one credential owned by a Provider in auth.json. */
+	async setProviderCredential(providerId: string, credential: Credential): Promise<void> {
+		await this.credentials.setStoredCredential(providerId, credential);
+		await this.refresh({ allowNetwork: this.allowModelNetwork });
+	}
+
+	/** Remove the Provider's persisted API key or OAuth credential. */
+	async clearProviderCredential(providerId: string): Promise<void> {
+		await this.credentials.delete(providerId);
+		await this.refresh({ allowNetwork: this.allowModelNetwork });
+	}
+
+	/** Return the Provider credential for in-process transaction rollback. */
+	getProviderCredential(providerId: string): Promise<Credential | undefined> {
+		return this.credentials.read(providerId);
+	}
+
 	async removeRuntimeApiKey(providerId: string): Promise<void> {
-		this.credentials.removeRuntimeApiKey(providerId);
+		await this.removeRuntimeCredential(providerId);
+	}
+
+	async removeRuntimeCredential(providerId: string): Promise<void> {
+		this.credentials.removeRuntimeCredential(providerId);
 		await this.refresh({ allowNetwork: this.allowModelNetwork });
 	}
 
@@ -413,6 +500,11 @@ export class ModelRuntime implements Models {
 		if (configured) return configured;
 		const check = this.snapshot.auth.get(providerId);
 		return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
+	}
+
+	/** A credential-blind model configuration snapshot for the settings transaction. */
+	getModelsJson(): ModelsJson {
+		return this.config.toJson();
 	}
 
 	private async prepareRequest(
@@ -494,6 +586,7 @@ export class ModelRuntime implements Models {
 	}
 
 	async reloadConfig(): Promise<void> {
+		this.credentials.reloadStoredCredentials();
 		this.config = await ModelConfig.load(this.modelsPath);
 		this.configureRadiusProviders();
 		this.rebuildProviders();
@@ -520,7 +613,7 @@ export class ModelRuntime implements Models {
 		return result;
 	}
 
-	registerProvider(providerId: string, config: ProviderConfigInput): void {
+	registerProvider(providerId: string, config: ProviderConfigInput, sourcePath?: string): void {
 		// Validate the incoming registration on its own, like the legacy registry:
 		// a broken re-registration must throw without touching the stored config.
 		validateExtensionProvider(providerId, this.builtins.get(providerId), this.config.getProvider(providerId), config);
@@ -532,6 +625,7 @@ export class ModelRuntime implements Models {
 			if (value !== undefined) (effective as Record<string, unknown>)[key] = value;
 		}
 		this.extensionProviders.set(providerId, effective);
+		if (sourcePath) this.extensionProviderSources.set(providerId, sourcePath);
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
 		if (
@@ -559,6 +653,7 @@ export class ModelRuntime implements Models {
 
 	unregisterProvider(providerId: string): void {
 		this.extensionProviders.delete(providerId);
+		this.extensionProviderSources.delete(providerId);
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
 		void this.refresh({ allowNetwork: false });

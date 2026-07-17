@@ -136,7 +136,7 @@ describe("--session-id read-only commands", () => {
 
 		expect(result.code).toBe(1);
 		expect(result.stderr).toContain(
-			"Warning: No project session found with id 'missing-session-id'; creating a new session with that id.",
+			"Warning: No stored conversation found with id 'missing-session-id'; creating a new conversation with that id.",
 		);
 	});
 
@@ -173,7 +173,7 @@ describe("--session-id read-only commands", () => {
 		);
 
 		expect(result.code).toBe(1);
-		expect(result.stderr).toContain("Session already exists with id 'existing-id'");
+		expect(result.stderr).toContain("Conversation already exists with id 'existing-id'");
 	});
 });
 

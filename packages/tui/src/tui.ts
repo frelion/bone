@@ -70,6 +70,13 @@ export interface Component {
 	render(width: number): string[];
 
 	/**
+	 * Optional notification for overlays with a bounded height. Components that
+	 * render fixed chrome around scrollable content can use this to reserve rows
+	 * before their output is composed and clipped by the TUI.
+	 */
+	setViewportRows?(rows: number): void;
+
+	/**
 	 * Optional handler for keyboard input when component has focus
 	 */
 	handleInput?(data: string): void;
@@ -1045,6 +1052,11 @@ export class TUI extends Container {
 			// Get layout with height=0 first to determine width and maxHeight
 			// (width and maxHeight don't depend on overlay height)
 			const { width, maxHeight } = this.resolveOverlayLayout(options, 0, termWidth, termHeight);
+
+			// Give viewport-aware overlays their usable height before rendering. This
+			// prevents fixed modal headers and footers being removed by post-render
+			// clipping when their body is longer than maxHeight.
+			component.setViewportRows?.(maxHeight ?? termHeight);
 
 			// Render component at calculated width
 			let overlayLines = component.render(width);

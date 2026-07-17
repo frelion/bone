@@ -65,7 +65,7 @@ export class TrustSelectorComponent extends Container {
 			),
 		);
 		this.addChild(
-			new Text(theme.fg("muted", `Current session: ${options.projectTrusted ? "trusted" : "untrusted"}`), 1, 0),
+			new Text(theme.fg("muted", `Current workspace: ${options.projectTrusted ? "trusted" : "untrusted"}`), 1, 0),
 		);
 		this.addChild(new Spacer(1));
 

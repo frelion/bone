@@ -1166,6 +1166,11 @@ export class AgentSession {
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
+			if (!this._modelRuntime.getModel(this.model.provider, this.model.id)) {
+				throw new Error(
+					`The selected model "${this.model.provider}/${this.model.id}" is no longer available. Run /model to choose a replacement.`,
+				);
+			}
 
 			const hasConfiguredAuth =
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
@@ -2415,8 +2420,8 @@ export class AgentSession {
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
 			},
 			{
-				registerProvider: (name, config) => {
-					this._modelRuntime.registerProvider(name, config);
+				registerProvider: (name, config, extensionPath) => {
+					this._modelRuntime.registerProvider(name, config, extensionPath);
 					this._refreshCurrentModelFromRegistry();
 				},
 				unregisterProvider: (name) => {

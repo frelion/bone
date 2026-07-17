@@ -1,6 +1,9 @@
 /** Immutable, credential-blind models.json snapshot. */
 
+import { randomUUID } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { type Static, Type } from "typebox";
 import { Compile } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
@@ -200,7 +203,7 @@ const validateModelsConfig = Compile(ModelsConfigSchema);
 export type ModelsJsonModel = Static<typeof ModelDefinitionSchema>;
 export type ModelsJsonModelOverride = Static<typeof ModelOverrideSchema>;
 export type ModelsJsonProvider = Static<typeof ProviderConfigSchema>;
-type ModelsJson = Static<typeof ModelsConfigSchema>;
+export type ModelsJson = Static<typeof ModelsConfigSchema>;
 
 function formatValidationPath(error: TLocalizedValidationError): string {
 	if (error.keyword === "required") {
@@ -272,12 +275,50 @@ export class ModelConfig {
 		return new ModelConfig(providers);
 	}
 
+	/** Validate and atomically save a Pi-compatible models.json document. */
+	static validate(data: ModelsJson): void {
+		if (!validateModelsConfig.Check(data)) {
+			const errors = validateModelsConfig
+				.Errors(data)
+				.map((error) => `${formatValidationPath(error)}: ${error.message}`)
+				.join("\n");
+			throw new Error(`Invalid models configuration:\n${errors || "Unknown schema error"}`);
+		}
+	}
+
+	/** Validate and atomically save a Pi-compatible models.json document. */
+	static save(modelsJsonPath: string, data: ModelsJson): void {
+		ModelConfig.validate(data);
+		const path = normalizePath(modelsJsonPath);
+		const directory = dirname(path);
+		if (!existsSync(directory)) mkdirSync(directory, { recursive: true, mode: 0o700 });
+		const temporary = `${path}.${randomUUID()}.tmp`;
+		try {
+			writeFileSync(temporary, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+			chmodSync(temporary, 0o600);
+			renameSync(temporary, path);
+			chmodSync(path, 0o600);
+		} catch (error) {
+			if (existsSync(temporary)) unlinkSync(temporary);
+			throw new Error(`Failed to save models.json: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
 	getProvider(providerId: string): ModelsJsonProvider | undefined {
 		return this.providers.get(providerId);
 	}
 
 	getProviderIds(): readonly string[] {
 		return [...this.providers.keys()];
+	}
+
+	/** Return a mutable, schema-compatible snapshot for a transactional editor. */
+	toJson(): ModelsJson {
+		return {
+			providers: Object.fromEntries(
+				[...this.providers.entries()].map(([providerId, provider]) => [providerId, structuredClone(provider)]),
+			),
+		};
 	}
 
 	getError(): string | undefined {

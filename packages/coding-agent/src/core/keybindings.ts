@@ -30,7 +30,14 @@ export interface AppKeybindings {
 	"app.session.new": true;
 	"app.session.tree": true;
 	"app.session.fork": true;
-	"app.session.resume": true;
+	"app.focus.left": true;
+	"app.focus.right": true;
+	"app.focus.up": true;
+	"app.focus.down": true;
+	"app.session.focusSidebar": true;
+	"app.session.focusChat": true;
+	"app.chat.scrollUp": true;
+	"app.chat.scrollDown": true;
 	"app.tree.foldOrUp": true;
 	"app.tree.unfoldOrDown": true;
 	"app.tree.editLabel": true;
@@ -46,6 +53,15 @@ export interface AppKeybindings {
 	"app.models.toggleProvider": true;
 	"app.models.reorderUp": true;
 	"app.models.reorderDown": true;
+	"app.settings.save": true;
+	"app.settings.provider.new": true;
+	"app.settings.model.new": true;
+	"app.settings.models.edit": true;
+	"app.settings.headers.edit": true;
+	"app.settings.model.advanced": true;
+	"app.settings.compat.edit": true;
+	"app.settings.override.edit": true;
+	"app.settings.models.delete": true;
 	"app.tree.filter.default": true;
 	"app.tree.filter.noTools": true;
 	"app.tree.filter.userOnly": true;
@@ -90,7 +106,7 @@ export const KEYBINDINGS = {
 	},
 	"app.session.toggleNamedFilter": {
 		defaultKeys: "ctrl+n",
-		description: "Toggle named session filter",
+		description: "Toggle named conversation filter",
 	},
 	"app.editor.external": {
 		defaultKeys: "ctrl+g",
@@ -112,10 +128,19 @@ export const KEYBINDINGS = {
 		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",
 		description: "Paste image from clipboard (text fallback)",
 	},
-	"app.session.new": { defaultKeys: [], description: "Start a new session" },
-	"app.session.tree": { defaultKeys: [], description: "Open session tree" },
-	"app.session.fork": { defaultKeys: [], description: "Fork current session" },
-	"app.session.resume": { defaultKeys: [], description: "Resume a session" },
+	"app.session.new": { defaultKeys: [], description: "Start a new conversation" },
+	"app.session.tree": { defaultKeys: [], description: "Open conversation history" },
+	"app.session.fork": { defaultKeys: [], description: "Branch current conversation" },
+	"app.focus.left": { defaultKeys: "shift+left", description: "Move focus left" },
+	"app.focus.right": { defaultKeys: "shift+right", description: "Move focus right" },
+	"app.focus.up": { defaultKeys: "shift+up", description: "Move focus up" },
+	"app.focus.down": { defaultKeys: "shift+down", description: "Move focus down" },
+	// Kept as unbound compatibility names for custom keybinding files written
+	// before focus movement became a single TUI-wide protocol.
+	"app.session.focusSidebar": { defaultKeys: [], description: "Focus conversations" },
+	"app.session.focusChat": { defaultKeys: [], description: "Focus chat" },
+	"app.chat.scrollUp": { defaultKeys: "pageUp", description: "Scroll chat history up" },
+	"app.chat.scrollDown": { defaultKeys: "pageDown", description: "Scroll chat history down" },
 	"app.tree.foldOrUp": {
 		defaultKeys: process.platform === "darwin" ? ["alt+left", "ctrl+left"] : ["ctrl+left", "alt+left"],
 		description: "Fold tree branch or move up",
@@ -134,23 +159,23 @@ export const KEYBINDINGS = {
 	},
 	"app.session.togglePath": {
 		defaultKeys: "ctrl+p",
-		description: "Toggle session path display",
+		description: "Toggle conversation path display",
 	},
 	"app.session.toggleSort": {
 		defaultKeys: "ctrl+s",
-		description: "Toggle session sort mode",
+		description: "Toggle conversation sort mode",
 	},
 	"app.session.rename": {
 		defaultKeys: "ctrl+r",
-		description: "Rename session",
+		description: "Rename conversation",
 	},
 	"app.session.delete": {
 		defaultKeys: "ctrl+d",
-		description: "Delete session",
+		description: "Delete conversation",
 	},
 	"app.session.deleteNoninvasive": {
 		defaultKeys: "ctrl+backspace",
-		description: "Delete session when query is empty",
+		description: "Delete conversation when query is empty",
 	},
 	"app.models.save": {
 		defaultKeys: "ctrl+s",
@@ -175,6 +200,42 @@ export const KEYBINDINGS = {
 	"app.models.reorderDown": {
 		defaultKeys: "alt+down",
 		description: "Move model down in order",
+	},
+	"app.settings.save": {
+		defaultKeys: "ctrl+s",
+		description: "Save settings",
+	},
+	"app.settings.provider.new": {
+		defaultKeys: "alt+p",
+		description: "Add model provider",
+	},
+	"app.settings.model.new": {
+		defaultKeys: "alt+m",
+		description: "Add provider model",
+	},
+	"app.settings.models.edit": {
+		defaultKeys: "alt+e",
+		description: "Edit provider or model",
+	},
+	"app.settings.headers.edit": {
+		defaultKeys: "alt+h",
+		description: "Edit provider or model headers",
+	},
+	"app.settings.model.advanced": {
+		defaultKeys: "alt+a",
+		description: "Edit model thinking and cost settings",
+	},
+	"app.settings.compat.edit": {
+		defaultKeys: "alt+c",
+		description: "Edit provider or model compatibility settings",
+	},
+	"app.settings.override.edit": {
+		defaultKeys: "alt+v",
+		description: "Edit provider model override",
+	},
+	"app.settings.models.delete": {
+		defaultKeys: "alt+d",
+		description: "Delete provider, model, or override",
 	},
 	"app.tree.filter.default": {
 		defaultKeys: "ctrl+d",
@@ -256,7 +317,8 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	newSession: "app.session.new",
 	tree: "app.session.tree",
 	fork: "app.session.fork",
-	resume: "app.session.resume",
+	focusSessionSidebar: "app.session.focusSidebar",
+	focusChat: "app.session.focusChat",
 	treeFoldOrUp: "app.tree.foldOrUp",
 	treeUnfoldOrDown: "app.tree.unfoldOrDown",
 	treeEditLabel: "app.tree.editLabel",

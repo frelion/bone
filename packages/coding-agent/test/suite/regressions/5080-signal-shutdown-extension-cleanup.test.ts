@@ -132,7 +132,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		expect(order).toEqual(["drainInput", "stop", "dispose"]);
 	});
 
-	test("interactive quit prints a resume hint for persisted sessions", async () => {
+	test("interactive quit prints a workspace return hint", async () => {
 		vi.spyOn(process, "exit").mockImplementation((() => {
 			throw new ProcessExitError();
 		}) as typeof process.exit);
@@ -147,11 +147,11 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 
 		expect(order).toEqual(["drainInput", "stop", "dispose"]);
 		expect(stdoutWrite).toHaveBeenCalledWith(
-			`${chalk.dim("To resume this session:")} ${APP_NAME} --session test-session\n`,
+			`${chalk.dim(`Reopen ${APP_NAME} in this workspace to choose a conversation from Side.`)}\n`,
 		);
 	});
 
-	test("signal-triggered shutdown does not print a resume hint", async () => {
+	test("signal-triggered shutdown does not print a workspace return hint", async () => {
 		vi.spyOn(process, "exit").mockImplementation((() => {
 			throw new ProcessExitError();
 		}) as typeof process.exit);
@@ -165,7 +165,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		await callShutdown(context, { fromSignal: true });
 
 		for (const call of stdoutWrite.mock.calls) {
-			expect(call[0]).not.toContain("To resume this session:");
+			expect(call[0]).not.toContain("Reopen");
 		}
 	});
 

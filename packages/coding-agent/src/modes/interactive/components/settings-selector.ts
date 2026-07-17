@@ -3,6 +3,7 @@ import type { Transport } from "@earendil-works/pi-ai";
 import {
 	type Component,
 	Container,
+	type Focusable,
 	getCapabilities,
 	type SelectItem,
 	SelectList,
@@ -469,8 +470,17 @@ class ThemeSubmenu extends Container {
 /**
  * Main settings selector component.
  */
-export class SettingsSelectorComponent extends Container {
+export class SettingsSelectorComponent extends Container implements Focusable {
 	private settingsList: SettingsList;
+	private _focused = false;
+
+	get focused(): boolean {
+		return this._focused;
+	}
+
+	set focused(value: boolean) {
+		this._focused = value;
+	}
 
 	constructor(config: SettingsConfig, callbacks: SettingsCallbacks) {
 		super();
@@ -834,5 +844,9 @@ export class SettingsSelectorComponent extends Container {
 
 	getSettingsList(): SettingsList {
 		return this.settingsList;
+	}
+
+	handleInput(data: string): void {
+		this.settingsList.handleInput(data);
 	}
 }

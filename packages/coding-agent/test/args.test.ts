@@ -72,15 +72,14 @@ describe("parseArgs", () => {
 		});
 	});
 
-	describe("--resume flag", () => {
-		test("parses --resume flag", () => {
-			const result = parseArgs(["--resume"]);
-			expect(result.resume).toBe(true);
-		});
-
-		test("parses -r shorthand", () => {
-			const result = parseArgs(["-r"]);
-			expect(result.resume).toBe(true);
+	describe("removed --resume flag", () => {
+		test.each(["--resume", "-r"])("rejects %s", (arg) => {
+			const result = parseArgs([arg]);
+			expect(result.unknownFlags.size).toBe(0);
+			expect(result.diagnostics).toContainEqual({
+				type: "error",
+				message: "--resume has been removed. Start bone and choose a conversation from Side.",
+			});
 		});
 	});
 

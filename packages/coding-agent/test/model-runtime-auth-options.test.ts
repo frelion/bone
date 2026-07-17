@@ -1,3 +1,6 @@
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type AuthType, type CredentialStore, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
@@ -39,6 +42,34 @@ describe("ModelRuntime auth options", () => {
 		const runtime = await ModelRuntime.create({ credentials, modelsPath: null });
 
 		expect((await runtime.getAuth("anthropic"))?.auth.apiKey).toBe("stored-key");
+	});
+
+	it("persists and clears one provider credential in auth.json without changing models.json", async () => {
+		const directory = join(tmpdir(), `pi-model-runtime-auth-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const authPath = join(directory, "auth.json");
+		const modelsPath = join(directory, "models.json");
+		const models = '{"providers":{"anthropic":{"name":"Configured Anthropic"}}}\n';
+		mkdirSync(directory, { recursive: true });
+		writeFileSync(modelsPath, models);
+
+		try {
+			const runtime = await ModelRuntime.create({ authPath, modelsPath, allowModelNetwork: false });
+
+			await runtime.setProviderCredential("anthropic", { type: "api_key", key: "provider-key" });
+
+			expect(JSON.parse(readFileSync(authPath, "utf8"))).toEqual({
+				anthropic: { type: "api_key", key: "provider-key" },
+			});
+			expect(readFileSync(modelsPath, "utf8")).toBe(models);
+
+			await runtime.clearProviderCredential("anthropic");
+
+			expect(JSON.parse(readFileSync(authPath, "utf8"))).toEqual({});
+			expect(await runtime.getProviderCredential("anthropic")).toBeUndefined();
+			expect(readFileSync(modelsPath, "utf8")).toBe(models);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 
 	it("scopes provider availability reads and records refresh failures", async () => {

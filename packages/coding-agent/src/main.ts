@@ -13,7 +13,6 @@ import { processFileArguments } from "./cli/file-processor.ts";
 import { buildInitialMessage } from "./cli/initial-message.ts";
 import { listModels } from "./cli/list-models.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
-import { selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
 import { ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, VERSION } from "./config.ts";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
@@ -23,9 +22,11 @@ import {
 	createAgentSessionServices,
 } from "./core/agent-session-services.ts";
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.ts";
+import { getLastActiveConversation } from "./core/conversation-state.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
+import { InteractiveSessionHost } from "./core/interactive-session-host.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
 import type { ModelRuntime } from "./core/model-runtime.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
@@ -207,7 +208,6 @@ function validateForkFlags(parsed: Args): void {
 	const conflictingFlags = [
 		parsed.session ? "--session" : undefined,
 		parsed.continue ? "--continue" : undefined,
-		parsed.resume ? "--resume" : undefined,
 		parsed.noSession ? "--no-session" : undefined,
 	].filter((flag): flag is string => flag !== undefined);
 
@@ -223,7 +223,6 @@ function validateSessionIdFlags(parsed: Args): void {
 	const conflictingFlags = [
 		parsed.session ? "--session" : undefined,
 		parsed.continue ? "--continue" : undefined,
-		parsed.resume ? "--resume" : undefined,
 	].filter((flag): flag is string => flag !== undefined);
 
 	if (conflictingFlags.length > 0) {
@@ -264,7 +263,8 @@ async function createSessionManager(
 	parsed: Args,
 	cwd: string,
 	sessionDir: string | undefined,
-	settingsManager: SettingsManager,
+	appMode: AppMode,
+	agentDir: string,
 ): Promise<SessionManager> {
 	if (parsed.noSession || parsed.help || parsed.listModels !== undefined) {
 		return SessionManager.inMemory(cwd, parsed.sessionId !== undefined ? { id: parsed.sessionId } : undefined);
@@ -274,7 +274,7 @@ async function createSessionManager(
 		if (parsed.sessionId) {
 			const existingTarget = await findLocalSessionByExactId(parsed.sessionId, cwd, sessionDir);
 			if (existingTarget) {
-				console.error(chalk.red(`Session already exists with id '${parsed.sessionId}'`));
+				console.error(chalk.red(`Conversation already exists with id '${parsed.sessionId}'`));
 				process.exit(1);
 			}
 		}
@@ -288,7 +288,7 @@ async function createSessionManager(
 				return forkSessionOrExit(resolved.path, cwd, sessionDir, parsed.sessionId);
 
 			case "not_found":
-				console.error(chalk.red(`No session found matching '${resolved.arg}'`));
+				console.error(chalk.red(`No conversation found matching '${resolved.arg}'`));
 				process.exit(1);
 		}
 	}
@@ -302,8 +302,8 @@ async function createSessionManager(
 				return openSessionOrExit(resolved.path, sessionDir);
 
 			case "global": {
-				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
-				const shouldFork = await promptConfirm("Fork this session into current directory?");
+				console.log(chalk.yellow(`Conversation found in a different workspace: ${resolved.cwd}`));
+				const shouldFork = await promptConfirm("Copy this conversation into the current workspace?");
 				if (!shouldFork) {
 					console.log(chalk.dim("Aborted."));
 					process.exit(0);
@@ -312,25 +312,8 @@ async function createSessionManager(
 			}
 
 			case "not_found":
-				console.error(chalk.red(`No session found matching '${resolved.arg}'`));
+				console.error(chalk.red(`No conversation found matching '${resolved.arg}'`));
 				process.exit(1);
-		}
-	}
-
-	if (parsed.resume) {
-		try {
-			const selectedPath = await selectSession(
-				(onProgress) => SessionManager.list(cwd, sessionDir, onProgress),
-				(onProgress) => SessionManager.listAll(sessionDir, onProgress),
-				settingsManager,
-			);
-			if (!selectedPath) {
-				console.log(chalk.dim("No session selected"));
-				process.exit(0);
-			}
-			return SessionManager.open(selectedPath, sessionDir);
-		} finally {
-			stopThemeWatcher();
 		}
 	}
 
@@ -345,9 +328,21 @@ async function createSessionManager(
 		}
 		console.error(
 			chalk.yellow(
-				`Warning: No project session found with id '${parsed.sessionId}'; creating a new session with that id.`,
+				`Warning: No stored conversation found with id '${parsed.sessionId}'; creating a new conversation with that id.`,
 			),
 		);
+	}
+
+	if (appMode === "interactive") {
+		const lastActiveConversation = getLastActiveConversation(cwd, sessionDir, agentDir);
+		if (lastActiveConversation) {
+			const conversations = await SessionManager.list(cwd, sessionDir);
+			if (conversations.some((conversation) => resolvePath(conversation.path) === lastActiveConversation)) {
+				return SessionManager.open(lastActiveConversation, sessionDir);
+			}
+		}
+
+		return SessionManager.continueRecent(cwd, sessionDir);
 	}
 
 	return SessionManager.create(cwd, sessionDir, { id: parsed.sessionId });
@@ -527,7 +522,7 @@ export async function main(args: string[], options?: MainOptions) {
 			const outputPath = parsed.messages.length > 0 ? parsed.messages[0] : undefined;
 			result = await exportFromFile(parsed.export, outputPath);
 		} catch (error: unknown) {
-			const message = error instanceof Error ? error.message : "Failed to export session";
+			const message = error instanceof Error ? error.message : "Failed to export conversation";
 			console.error(chalk.red(`Error: ${message}`));
 			process.exit(1);
 		}
@@ -564,16 +559,16 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	// Decide the final runtime cwd before creating cwd-bound runtime services.
-	// --session and --resume may select a session from another project, so project-local
+	// --session may select a conversation from another workspace, so workspace-local
 	// settings, resources, provider registrations, and models must be resolved only after
 	// the target session cwd is known. The startup-cwd settings manager is used only for
-	// sessionDir lookup during session selection.
+	// sessionDir lookup during conversation selection.
 	const envSessionDir = process.env[ENV_SESSION_DIR];
 	const sessionDir =
 		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
-	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, appMode, agentDir);
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
@@ -810,7 +805,7 @@ export async function main(args: string[], options?: MainOptions) {
 		printTimings();
 		await runRpcMode(runtime);
 	} else if (appMode === "interactive") {
-		const interactiveMode = new InteractiveMode(runtime, {
+		const interactiveMode = new InteractiveMode(new InteractiveSessionHost(runtime, createRuntime), {
 			migratedProviders,
 			modelFallbackMessage,
 			autoTrustOnReloadCwd,

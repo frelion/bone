@@ -17,7 +17,6 @@ export interface Args {
 	appendSystemPrompt?: string[];
 	thinking?: ThinkingLevel;
 	continue?: boolean;
-	resume?: boolean;
 	help?: boolean;
 	version?: boolean;
 	mode?: Mode;
@@ -83,7 +82,10 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
 		} else if (arg === "--resume" || arg === "-r") {
-			result.resume = true;
+			result.diagnostics.push({
+				type: "error",
+				message: "--resume has been removed. Start bone and choose a conversation from Side.",
+			});
 		} else if (arg === "--provider" && i + 1 < args.length) {
 			result.provider = args[++i];
 		} else if (arg === "--model" && i + 1 < args.length) {
@@ -242,14 +244,13 @@ ${chalk.bold("Options:")}
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
-  --continue, -c                 Continue previous session
-  --resume, -r                   Select a session to resume
-  --session <path|id>            Use specific session file or partial UUID
-  --session-id <id>              Use exact project session ID, creating it if missing
-  --fork <path|id>               Fork specific session file or partial UUID into a new session
-  --session-dir <dir>            Directory for session storage and lookup
-  --no-session                   Don't save session (ephemeral)
-  --name, -n <name>              Set session display name
+	--continue, -c                 Continue the most recent conversation in this workspace
+	--session <path|id>            Open a stored conversation by file or ID (advanced)
+	--session-id <id>              Set an internal conversation storage ID (advanced)
+	--fork <path|id>               Copy a stored conversation into this workspace (advanced)
+	--session-dir <dir>            Conversation storage directory (advanced)
+	--no-session                   Keep this conversation ephemeral
+	--name, -n <name>              Set conversation display name
   --models <patterns>            Comma-separated model patterns for Ctrl+P cycling
                                  Supports globs (anthropic/*, *sonnet*) and fuzzy matching
   --no-tools, -nt                Disable all tools by default (built-in and extension)
@@ -268,7 +269,7 @@ ${chalk.bold("Options:")}
   --theme <path>                 Load a theme file or directory (can be used multiple times)
   --no-themes                    Disable theme discovery and loading
   --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
-  --export <file>                Export session file to HTML and exit
+	--export <file>                Export a stored conversation to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
   --approve, -a                  Trust project-local files for this run
@@ -295,11 +296,11 @@ ${chalk.bold("Examples:")}
   # Multiple messages (interactive)
   ${APP_NAME} "Read package.json" "What dependencies do we have?"
 
-  # Continue previous session
-  ${APP_NAME} --continue "What did we discuss?"
+	# Continue the latest conversation in this workspace
+	${APP_NAME} --continue "What did we discuss?"
 
-  # Start a named session
-  ${APP_NAME} --name "Refactor auth module"
+	# Start a named conversation
+	${APP_NAME} --name "Refactor auth module"
 
   # Use different model
   ${APP_NAME} --provider openai --model gpt-4o-mini "Help me refactor this code"
@@ -328,7 +329,7 @@ ${chalk.bold("Examples:")}
   # Disable one tool while keeping the rest available
   ${APP_NAME} --exclude-tools ask_question
 
-  # Export a session file to HTML
+	# Export a stored conversation to HTML
   ${APP_NAME} --export ~/${CONFIG_DIR_NAME}/agent/sessions/--path--/session.jsonl
   ${APP_NAME} --export session.jsonl output.html
 
@@ -372,7 +373,7 @@ ${chalk.bold("Environment Variables:")}
   AWS_BEARER_TOKEN_BEDROCK         - Bedrock API key (bearer token)
   AWS_REGION                       - AWS region for Amazon Bedrock (e.g., us-east-1)
   ${ENV_AGENT_DIR.padEnd(32)} - Config directory (default: ~/${CONFIG_DIR_NAME}/agent)
-  ${ENV_SESSION_DIR.padEnd(32)} - Session storage directory (overridden by --session-dir)
+  ${ENV_SESSION_DIR.padEnd(32)} - Conversation storage directory (overridden by --session-dir)
   PI_PACKAGE_DIR                   - Override package directory (for Nix/Guix store paths)
   PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes
   PI_TELEMETRY                     - Override install telemetry when set to 1/true/yes or 0/false/no

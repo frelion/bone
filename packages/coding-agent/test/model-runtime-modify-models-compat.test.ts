@@ -27,22 +27,33 @@ describe("extension provider model lifecycle", () => {
 			modelsPath: null,
 			allowModelNetwork: false,
 		});
-		runtime.registerProvider("extension-dynamic", {
-			baseUrl: "http://localhost:8080/v1",
-			apiKey: "local",
-			api: "openai-completions",
-			refreshModels: async () => [
-				{
-					...model("live"),
-					provider: "extension-dynamic",
-					baseUrl: "http://localhost:8080/v1",
-				},
-			],
-		});
+		runtime.registerProvider(
+			"extension-dynamic",
+			{
+				baseUrl: "http://localhost:8080/v1",
+				apiKey: "local",
+				api: "openai-completions",
+				refreshModels: async () => [
+					{
+						...model("live"),
+						provider: "extension-dynamic",
+						baseUrl: "http://localhost:8080/v1",
+					},
+				],
+			},
+			"/tmp/bone/extensions/dynamic-provider.ts",
+		);
 
 		await runtime.refresh({ allowNetwork: false });
 		expect(runtime.getModel("extension-dynamic", "live")).toBeDefined();
 		expect(await modelsStore.read("extension-dynamic")).toBeUndefined();
+		expect(runtime.getExtensionProviderRuntimeStatus("extension-dynamic")).toMatchObject({
+			providerId: "extension-dynamic",
+			sourcePath: "/tmp/bone/extensions/dynamic-provider.ts",
+			modelCount: 1,
+			configuration: "extension-only",
+			capabilities: { oauth: false, customStream: false, dynamicModels: true },
+		});
 	});
 
 	it("applies legacy OAuth modifyModels after async credential initialization", async () => {

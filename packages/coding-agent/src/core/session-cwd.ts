@@ -33,12 +33,12 @@ export function getMissingSessionCwdIssue(
 }
 
 export function formatMissingSessionCwdError(issue: SessionCwdIssue): string {
-	const sessionFile = issue.sessionFile ? `\nSession file: ${issue.sessionFile}` : "";
-	return `Stored session working directory does not exist: ${issue.sessionCwd}${sessionFile}\nCurrent working directory: ${issue.fallbackCwd}`;
+	const conversationFile = issue.sessionFile ? `\nConversation storage: ${issue.sessionFile}` : "";
+	return `Stored conversation workspace does not exist: ${issue.sessionCwd}${conversationFile}\nCurrent workspace: ${issue.fallbackCwd}`;
 }
 
 export function formatMissingSessionCwdPrompt(issue: SessionCwdIssue): string {
-	return `cwd from session file does not exist\n${issue.sessionCwd}\n\ncontinue in current cwd\n${issue.fallbackCwd}`;
+	return `workspace from this conversation does not exist\n${issue.sessionCwd}\n\ncontinue in current workspace\n${issue.fallbackCwd}`;
 }
 
 export class MissingSessionCwdError extends Error {

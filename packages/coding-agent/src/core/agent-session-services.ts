@@ -14,6 +14,7 @@ import {
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.ts";
 import type { SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
+import { SettingsTransactionJournal } from "./settings-transaction-journal.ts";
 
 /**
  * Non-fatal issues collected while creating services or sessions.
@@ -136,6 +137,7 @@ export async function createAgentSessionServices(
 ): Promise<AgentSessionServices> {
 	const cwd = resolvePath(options.cwd);
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getAgentDir();
+	SettingsTransactionJournal.recover(agentDir);
 	const modelRuntime =
 		options.modelRuntime ??
 		(await ModelRuntime.create({
@@ -155,7 +157,7 @@ export async function createAgentSessionServices(
 	const extensionsResult = resourceLoader.getExtensions();
 	for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
 		try {
-			modelRuntime.registerProvider(name, config);
+			modelRuntime.registerProvider(name, config, extensionPath);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			diagnostics.push({

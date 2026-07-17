@@ -20,7 +20,7 @@ type InteractiveModePrototype = {
 const interactiveModePrototype = InteractiveMode.prototype as unknown as InteractiveModePrototype;
 
 describe("InteractiveMode /clone", () => {
-	it("clones the current leaf into a new session", async () => {
+	it("clones the current leaf into a new conversation", async () => {
 		const fork = vi.fn(async () => ({ cancelled: false }));
 		const renderCurrentSessionState = vi.fn();
 		const setText = vi.fn();
@@ -43,7 +43,7 @@ describe("InteractiveMode /clone", () => {
 		expect(fork).toHaveBeenCalledWith("leaf-123", { position: "at" });
 		expect(renderCurrentSessionState).not.toHaveBeenCalled();
 		expect(setText).toHaveBeenCalledWith("");
-		expect(showStatus).toHaveBeenCalledWith("Cloned to new session");
+		expect(showStatus).toHaveBeenCalledWith("Cloned to new conversation");
 		expect(showError).not.toHaveBeenCalled();
 		expect(requestRender).not.toHaveBeenCalled();
 	});

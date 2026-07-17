@@ -181,6 +181,9 @@ export interface SessionInfo {
 	messageCount: number;
 	firstMessage: string;
 	allMessagesText: string;
+	/** Latest visible user or assistant message for compact conversation previews. */
+	lastMessage?: string;
+	lastMessageRole?: "user" | "assistant";
 }
 
 export type ReadonlySessionManager = Pick<
@@ -629,6 +632,8 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 		const allMessages: string[] = [];
 		let name: string | undefined;
 		let lastActivityTime: number | undefined;
+		let lastMessage: string | undefined;
+		let lastMessageRole: "user" | "assistant" | undefined;
 
 		const rl = createInterface({
 			input: createReadStream(filePath, { encoding: "utf8" }),
@@ -669,6 +674,8 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 			if (!firstMessage && message.role === "user") {
 				firstMessage = textContent;
 			}
+			lastMessage = textContent;
+			lastMessageRole = message.role;
 		}
 
 		if (!header) return null;
@@ -694,6 +701,8 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 			messageCount,
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.join(" "),
+			lastMessage,
+			lastMessageRole,
 		};
 	} catch {
 		return null;

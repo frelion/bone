@@ -7,6 +7,7 @@ import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
+import { SettingsTransactionJournal } from "./settings-transaction-journal.ts";
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
@@ -311,6 +312,7 @@ export class SettingsManager {
 		agentDir: string = getAgentDir(),
 		options: SettingsManagerCreateOptions = {},
 	): SettingsManager {
+		SettingsTransactionJournal.recover(agentDir);
 		const storage = new FileSettingsStorage(cwd, agentDir);
 		return SettingsManager.fromStorage(storage, options);
 	}
@@ -648,6 +650,30 @@ export class SettingsManager {
 	}
 
 	async flush(): Promise<void> {
+		await this.writeQueue;
+	}
+
+	/**
+	 * Atomically replace one settings scope with a validated editor draft.
+	 * The settings center uses this instead of the immediate-write setters so
+	 * cancelling a modal never changes the active configuration.
+	 */
+	async replaceScope(scope: SettingsScope, draft: Settings): Promise<void> {
+		if (scope === "project") this.assertProjectTrustedForWrite();
+		const next = SettingsManager.migrateSettings(structuredClone(draft) as Record<string, unknown>);
+		this.writeQueue = this.writeQueue.then(() => {
+			this.storage.withLock(scope, () => JSON.stringify(next, null, 2));
+			if (scope === "global") {
+				this.globalSettings = next;
+				this.modifiedFields.clear();
+				this.modifiedNestedFields.clear();
+			} else {
+				this.projectSettings = next;
+				this.modifiedProjectFields.clear();
+				this.modifiedProjectNestedFields.clear();
+			}
+			this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		});
 		await this.writeQueue;
 	}
 

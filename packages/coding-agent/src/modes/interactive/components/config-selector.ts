@@ -29,6 +29,15 @@ type SettingsScope = "user" | "project";
 type ProjectOverrideState = "inherit" | "load" | "unload";
 export type ScopedResolvedPaths = Record<ConfigWriteScope, ResolvedPaths>;
 
+/**
+ * Resource list contract shared by the standalone config selector and the
+ * settings center. The list intentionally has no persistence behavior: its
+ * SettingsManager decides whether changes remain a draft or reach disk.
+ */
+export interface ResourceSettingsList extends Component, Focusable {
+	setWriteScope(writeScope: ConfigWriteScope): void;
+}
+
 const RESOURCE_TYPES = ["extensions", "skills", "prompts", "themes"] as const satisfies readonly ResourceType[];
 
 const RESOURCE_TYPE_LABELS: Record<ResourceType, string> = {
@@ -187,10 +196,12 @@ type FlatEntry =
 class ConfigSelectorHeader implements Component {
 	private writeScope: ConfigWriteScope;
 	private projectModeAvailable: boolean;
+	private transactional: boolean;
 
-	constructor(writeScope: ConfigWriteScope, projectModeAvailable: boolean) {
+	constructor(writeScope: ConfigWriteScope, projectModeAvailable: boolean, transactional = false) {
 		this.writeScope = writeScope;
 		this.projectModeAvailable = projectModeAvailable;
+		this.transactional = transactional;
 	}
 
 	setWriteScope(writeScope: ConfigWriteScope): void {
@@ -205,7 +216,9 @@ class ConfigSelectorHeader implements Component {
 		const switchHint = this.projectModeAvailable ? keyHint("tui.input.tab", "switch mode") + sep : "";
 		const actionHint =
 			this.writeScope === "project" ? rawKeyHint("space", "cycle inherit/+/-") : rawKeyHint("space", "toggle");
-		const hint = switchHint + actionHint + sep + rawKeyHint("esc", "close");
+		const saveHint = this.transactional ? rawKeyHint("ctrl+s", "save") + sep : "";
+		const hint =
+			switchHint + actionHint + sep + saveHint + rawKeyHint("esc", this.transactional ? "cancel" : "close");
 		const spacing = Math.max(1, width - visibleWidth(title) - visibleWidth(hint));
 		const scopeHint =
 			this.writeScope === "project"
@@ -219,7 +232,7 @@ class ConfigSelectorHeader implements Component {
 	}
 }
 
-class ResourceList implements Component, Focusable {
+class ResourceList implements ResourceSettingsList {
 	private groupsByScope: Record<ConfigWriteScope, ResourceGroup[]>;
 	private flatItems: FlatEntry[] = [];
 	private filteredItems: FlatEntry[] = [];
@@ -233,6 +246,7 @@ class ResourceList implements Component, Focusable {
 	private inheritedEnabledByKey: Map<string, boolean>;
 
 	public onCancel?: () => void;
+	public onSave?: () => void;
 	public onExit?: () => void;
 	public onToggle?: (item: ResourceItem, newEnabled: boolean) => void;
 	public onSwitchMode?: () => void;
@@ -486,6 +500,10 @@ class ResourceList implements Component, Focusable {
 		}
 		if (kb.matches(data, "tui.select.cancel")) {
 			this.onCancel?.();
+			return;
+		}
+		if (kb.matches(data, "app.settings.save")) {
+			this.onSave?.();
 			return;
 		}
 		if (matchesKey(data, "ctrl+c")) {
@@ -863,6 +881,22 @@ class ResourceList implements Component, Focusable {
 	}
 }
 
+/** Create the unframed resource tree for embedding in another TUI surface. */
+export function createResourceSettingsList(
+	resolvedPaths: ScopedResolvedPaths,
+	settingsManager: SettingsManager,
+	cwd: string,
+	agentDir: string,
+	terminalHeight?: number,
+	writeScope: ConfigWriteScope = "global",
+): ResourceSettingsList {
+	const groupsByScope = {
+		global: buildGroups(resolvedPaths.global, agentDir),
+		project: buildGroups(resolvedPaths.project, agentDir),
+	};
+	return new ResourceList(groupsByScope, settingsManager, cwd, agentDir, terminalHeight, writeScope);
+}
+
 export class ConfigSelectorComponent extends Container implements Focusable {
 	private header: ConfigSelectorHeader;
 	private resourceList: ResourceList;
@@ -888,33 +922,31 @@ export class ConfigSelectorComponent extends Container implements Focusable {
 		terminalHeight?: number,
 		writeScope: ConfigWriteScope = "global",
 		projectModeAvailable = true,
+		onSave?: () => void,
+		transactional = false,
 	) {
 		super();
 
 		this.writeScope = writeScope;
-		const groupsByScope = {
-			global: buildGroups(resolvedPaths.global, agentDir),
-			project: buildGroups(resolvedPaths.project, agentDir),
-		};
-
 		// Add header
 		this.addChild(new Spacer(1));
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
-		this.header = new ConfigSelectorHeader(this.writeScope, projectModeAvailable);
+		this.header = new ConfigSelectorHeader(this.writeScope, projectModeAvailable, transactional);
 		this.addChild(this.header);
 		this.addChild(new Spacer(1));
 
 		// Resource list
-		this.resourceList = new ResourceList(
-			groupsByScope,
+		this.resourceList = createResourceSettingsList(
+			resolvedPaths,
 			settingsManager,
 			cwd,
 			agentDir,
 			terminalHeight,
 			this.writeScope,
-		);
+		) as ResourceList;
 		this.resourceList.onCancel = onClose;
+		this.resourceList.onSave = onSave;
 		this.resourceList.onExit = onExit;
 		this.resourceList.onToggle = () => requestRender();
 		if (projectModeAvailable) {
