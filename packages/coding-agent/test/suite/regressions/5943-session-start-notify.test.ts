@@ -75,10 +75,12 @@ type LoadedResourcesContext = {
 
 type RebindContext = {
 	unsubscribe?: () => void;
+	session: { isStreaming: boolean };
 	applyRuntimeSettings: () => void;
 	renderCurrentSessionState: () => void;
 	bindCurrentSessionExtensions: () => Promise<void>;
 	subscribeToAgent: () => void;
+	restoreParkedStatusIndicator: () => boolean;
 	updateAvailableProviderCount: () => Promise<void>;
 	updateEditorBorderColor: () => void;
 	updateTerminalTitle: () => void;
@@ -283,6 +285,7 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				session: { isStreaming: false },
 				applyRuntimeSettings: () => events.push("apply"),
 				renderCurrentSessionState: () => events.push("render"),
 				bindCurrentSessionExtensions: async () => {
@@ -293,6 +296,7 @@ describe("regression #5943: session_start transient UI", () => {
 					});
 				},
 				subscribeToAgent: () => events.push("subscribe"),
+				restoreParkedStatusIndicator: () => false,
 				updateAvailableProviderCount: async () => {},
 				updateEditorBorderColor: () => {},
 				updateTerminalTitle: () => {},
@@ -324,6 +328,7 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				session: { isStreaming: false },
 				applyRuntimeSettings: () => {},
 				renderCurrentSessionState: () => events.push("render"),
 				bindCurrentSessionExtensions: async () => {
@@ -342,6 +347,7 @@ describe("regression #5943: session_start transient UI", () => {
 						events.push(`${event.type}:${event.message.role}:${getMessageText(event)}`);
 					});
 				},
+				restoreParkedStatusIndicator: () => false,
 				updateAvailableProviderCount: async () => {},
 				updateEditorBorderColor: () => {},
 				updateTerminalTitle: () => {},
@@ -376,6 +382,7 @@ describe("regression #5943: session_start transient UI", () => {
 
 		try {
 			const context: RebindContext = {
+				session: { isStreaming: false },
 				applyRuntimeSettings: () => {},
 				renderCurrentSessionState: () => events.push("render"),
 				bindCurrentSessionExtensions: async () => {
@@ -394,6 +401,7 @@ describe("regression #5943: session_start transient UI", () => {
 						events.push(`${event.type}:${event.message.role}:${getMessageText(event)}`);
 					});
 				},
+				restoreParkedStatusIndicator: () => false,
 				updateAvailableProviderCount: async () => {},
 				updateEditorBorderColor: () => {},
 				updateTerminalTitle: () => {},

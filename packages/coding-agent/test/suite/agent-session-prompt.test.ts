@@ -392,7 +392,7 @@ describe("AgentSession prompt characterization", () => {
 		harnesses.push(harness);
 
 		await expect(harness.session.prompt("hi")).rejects.toThrow(
-			`No API key found for ${harness.getModel().provider}.`,
+			`The selected model "${harness.getModel().provider}/${harness.getModel().id}" is no longer available.`,
 		);
 	});
 });

@@ -59,7 +59,7 @@ type RenderSessionEntries = (
 	options?: { updateFooter?: boolean; populateHistory?: boolean },
 ) => void;
 
-type HandleEvent = (this: RenderSessionContextThis, event: AgentSessionEvent) => Promise<void>;
+type HandleEvent = (this: RenderSessionContextThis, event: AgentSessionEvent, eventSession: unknown) => Promise<void>;
 
 function createFakeInteractiveModeThis(): RenderSessionContextThis {
 	const chatContainer = new Container();
@@ -153,13 +153,17 @@ describe("InteractiveMode.renderSessionEntries", () => {
 
 		expect(fakeThis.pendingTools.has(TOOL_CALL_ID)).toBe(true);
 
-		await handleEvent.call(fakeThis, {
-			type: "tool_execution_end",
-			toolCallId: TOOL_CALL_ID,
-			toolName: TOOL_NAME,
-			result: { content: [{ type: "text", text: "FINAL_RESULT" }], details: undefined },
-			isError: false,
-		});
+		await handleEvent.call(
+			fakeThis,
+			{
+				type: "tool_execution_end",
+				toolCallId: TOOL_CALL_ID,
+				toolName: TOOL_NAME,
+				result: { content: [{ type: "text", text: "FINAL_RESULT" }], details: undefined },
+				isError: false,
+			},
+			fakeThis.session,
+		);
 
 		expect(fakeThis.pendingTools.has(TOOL_CALL_ID)).toBe(false);
 		expect(renderChat(fakeThis.chatContainer)).toContain("FINAL_RESULT");

@@ -109,8 +109,9 @@ describe("SessionSidebar", () => {
 
 	it("renders conversation title, activity, preview, and creation metadata", () => {
 		const sidebar = new SessionSidebar();
-		const created = new Date(2026, 6, 17, 9, 41);
 		const modified = new Date();
+		const created = new Date(modified);
+		created.setHours(9, 41, 0, 0);
 		sidebar.setSessions([
 			{
 				...makeSession("details", "background-running"),

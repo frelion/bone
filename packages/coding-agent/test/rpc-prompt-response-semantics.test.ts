@@ -194,18 +194,6 @@ describe("RPC prompt response semantics", () => {
 		const { lineHandler, cleanup } = await startRpcMode({
 			withAuth: false,
 			responseDelayMs: 0,
-			model: {
-				id: "fake-model",
-				name: "Fake Model",
-				api: "openai-completions",
-				provider: "fake-provider",
-				baseUrl: "https://example.invalid",
-				reasoning: false,
-				input: [],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 0,
-				maxTokens: 0,
-			},
 		});
 
 		try {
@@ -219,9 +207,7 @@ describe("RPC prompt response semantics", () => {
 					type: "response",
 					command: "prompt",
 					success: false,
-					error: expect.stringContaining(
-						"No API key found for fake-provider.\n\nUse /login to log into a provider via OAuth or API key. See:",
-					),
+					error: expect.stringContaining("No API key found for anthropic."),
 				});
 			});
 		} finally {

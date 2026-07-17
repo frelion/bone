@@ -13,7 +13,10 @@ import {
 import type { Readable } from "node:stream";
 import crossSpawn from "cross-spawn";
 
-const EXIT_STDIO_GRACE_MS = 100;
+// Allow a little scheduling slack for descendants that inherit stdio and keep
+// producing output after their short-lived parent exits. This remains short
+// enough that a quiet inherited pipe cannot stall an interactive command.
+const EXIT_STDIO_GRACE_MS = 250;
 
 export function spawnProcess(
 	command: string,

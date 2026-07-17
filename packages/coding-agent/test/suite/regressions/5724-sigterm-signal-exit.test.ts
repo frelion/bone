@@ -11,7 +11,9 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 type ShutdownThis = {
 	isShuttingDown: boolean;
 	unregisterSignalHandlers: () => void;
-	runtimeHost: { dispose: () => Promise<void> };
+	runtimeHost: unknown;
+	sessionHost: { disposeAll: () => Promise<void> };
+	rememberActiveConversation: (runtime: unknown) => void;
 	ui: { terminal: { drainInput: (ms: number) => Promise<void> } };
 	themeController: { disableAutoSync: () => void };
 	stop: () => void;
@@ -61,12 +63,14 @@ describe("InteractiveMode SIGTERM shutdown with signal-exit (#5724)", () => {
 			unregisterSignalHandlers: vi.fn(() => {
 				order.push("unregister");
 			}),
-			runtimeHost: {
-				dispose: vi.fn(() => {
+			runtimeHost: undefined,
+			sessionHost: {
+				disposeAll: vi.fn(() => {
 					order.push("dispose");
 					return dispose.promise;
 				}),
 			},
+			rememberActiveConversation: vi.fn(),
 			ui: {
 				terminal: {
 					drainInput: vi.fn(async () => {

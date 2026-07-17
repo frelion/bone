@@ -6,10 +6,10 @@ import { spawnProcess, waitForChildProcess } from "../../../src/utils/child-proc
 /**
  * Regression test for https://github.com/earendil-works/pi/issues/5303
  *
- * waitForChildProcess armed a fixed 100ms timer on `exit` and destroyed the
+ * waitForChildProcess armed a fixed short timer on `exit` and destroyed the
  * stdio streams when it fired. When a short-lived detached descendant kept the
  * stdout pipe open, `close` never fired, so that timer was the only thing that
- * resolved the wait, and any output written more than 100ms after exit was
+ * resolved the wait, and any output written after that deadline was
  * binned. In practice every git commit whose pre-commit hook runs lint-staged
  * came back truncated mid-listr2 output, read by the model as a hang.
  *
@@ -33,7 +33,7 @@ describe.skipIf(process.platform === "win32")("issue #5303 bash output truncatio
 
 	it("captures output emitted after exit while a detached child holds stdout open", async () => {
 		// The shell exits immediately, but a backgrounded subshell keeps the stdout
-		// pipe open and emits ticks every 50ms, the last well past the 100ms grace.
+		// pipe open and emits ticks every 50ms, the last well past the idle grace.
 		const command = 'printf "HEAD\\n"; ( for i in 1 2 3 4 5 6; do sleep 0.05; printf "TICK$i\\n"; done ) &';
 		child = spawnProcess("/bin/sh", ["-c", command], {
 			stdio: ["ignore", "pipe", "pipe"],

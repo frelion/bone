@@ -19,7 +19,9 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 type ShutdownThis = {
 	isShuttingDown: boolean;
 	unregisterSignalHandlers: () => void;
-	runtimeHost: { dispose: () => Promise<void> };
+	runtimeHost: unknown;
+	sessionHost: { disposeAll: () => Promise<void> };
+	rememberActiveConversation: (runtime: unknown) => void;
 	ui: { terminal: { drainInput: (ms: number) => Promise<void> } };
 	themeController: { disableAutoSync: () => void };
 	stop: () => void;
@@ -70,11 +72,13 @@ function createContext(order: string[], sessionManager = createSessionManager())
 	return {
 		isShuttingDown: false,
 		unregisterSignalHandlers: vi.fn(),
-		runtimeHost: {
-			dispose: vi.fn(async () => {
+		runtimeHost: undefined,
+		sessionHost: {
+			disposeAll: vi.fn(async () => {
 				order.push("dispose");
 			}),
 		},
+		rememberActiveConversation: vi.fn(),
 		ui: {
 			terminal: {
 				drainInput: vi.fn(async () => {
@@ -180,6 +184,6 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		await callShutdown(context, { fromSignal: true });
 
 		expect(order).toEqual([]);
-		expect(context.runtimeHost.dispose).not.toHaveBeenCalled();
+		expect(context.sessionHost.disposeAll).not.toHaveBeenCalled();
 	});
 });
