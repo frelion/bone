@@ -8,6 +8,7 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 import { SettingsTransactionJournal } from "./settings-transaction-journal.ts";
+import type { AuxiliaryModelTaskId, TaskModelReference } from "./task-model-router.ts";
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
@@ -85,6 +86,8 @@ export interface Settings {
 	lastChangelogVersion?: string;
 	defaultProvider?: string;
 	defaultModel?: string;
+	/** Global model assignments for Bone helper tasks. Missing entries inherit the conversation model. */
+	taskModels?: Partial<Record<AuxiliaryModelTaskId, TaskModelReference>>;
 	defaultThinkingLevel?: ThinkingLevel;
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
@@ -723,6 +726,21 @@ export class SettingsManager {
 		this.globalSettings.defaultModel = modelId;
 		this.markModified("defaultProvider");
 		this.markModified("defaultModel");
+		this.save();
+	}
+
+	getTaskModel(taskId: AuxiliaryModelTaskId): TaskModelReference | undefined {
+		const model = this.globalSettings.taskModels?.[taskId];
+		return model ? { ...model } : undefined;
+	}
+
+	setTaskModel(taskId: AuxiliaryModelTaskId, model: TaskModelReference | undefined): void {
+		const taskModels = { ...(this.globalSettings.taskModels ?? {}) };
+		if (model) taskModels[taskId] = { ...model };
+		else delete taskModels[taskId];
+		if (Object.keys(taskModels).length === 0) delete this.globalSettings.taskModels;
+		else this.globalSettings.taskModels = taskModels;
+		this.markModified("taskModels");
 		this.save();
 	}
 

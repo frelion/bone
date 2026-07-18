@@ -24,7 +24,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "import", description: "Import a conversation from a JSONL file" },
 	{ name: "share", description: "Share conversation as a secret GitHub gist" },
 	{ name: "copy", description: "Copy last agent message to clipboard" },
-	{ name: "name", description: "Set conversation display name" },
+	{ name: "name", description: "Generate or set conversation display name", argumentHint: "[name]" },
 	{ name: "conversation", description: "Show conversation info and stats" },
 	{ name: "conversations", description: "Focus conversations in Side" },
 	{ name: "changelog", description: "Show changelog entries" },

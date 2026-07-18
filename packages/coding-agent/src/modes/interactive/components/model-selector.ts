@@ -1,4 +1,4 @@
-import { type Model, modelsAreEqual } from "@earendil-works/pi-ai";
+import { type Api, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import {
 	Container,
 	type Focusable,
@@ -10,20 +10,28 @@ import {
 	type TUI,
 } from "@earendil-works/pi-tui";
 import type { ModelRuntime } from "../../../core/model-runtime.ts";
-import type { SettingsManager } from "../../../core/settings-manager.ts";
 import { getModelSelectorSearchText } from "../model-search.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint } from "./keybinding-hints.ts";
 
 interface ModelItem {
+	kind: "model";
 	provider: string;
 	id: string;
-	model: Model<any>;
+	model: Model<Api>;
 }
 
+interface FollowConversationItem {
+	kind: "follow-conversation";
+}
+
+type ModelSelectorItem = ModelItem | FollowConversationItem;
+
+export type ModelSelectorSelection = { kind: "model"; model: Model<Api> } | { kind: "follow-conversation" };
+
 interface ScopedModelItem {
-	model: Model<any>;
+	model: Model<Api>;
 	thinkingLevel?: string;
 }
 
@@ -48,13 +56,13 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private allModels: ModelItem[] = [];
 	private scopedModelItems: ModelItem[] = [];
 	private activeModels: ModelItem[] = [];
-	private filteredModels: ModelItem[] = [];
+	private filteredModels: ModelSelectorItem[] = [];
 	private selectedIndex: number = 0;
-	private currentModel?: Model<any>;
-	private settingsManager: SettingsManager;
+	private currentModel?: Model<Api>;
 	private modelRuntime: ModelRuntime;
-	private onSelectCallback: (model: Model<any>) => void;
+	private onSelectCallback: (selection: ModelSelectorSelection) => void;
 	private onCancelCallback: () => void;
+	private readonly allowFollowConversation: boolean;
 	private errorMessage?: string;
 	private refreshStatusMessage = "Refreshing model catalogs…";
 	private refreshStatusSuccess = false;
@@ -69,24 +77,24 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	constructor(
 		tui: TUI,
-		currentModel: Model<any> | undefined,
-		settingsManager: SettingsManager,
+		currentModel: Model<Api> | undefined,
 		modelRuntime: ModelRuntime,
 		scopedModels: ReadonlyArray<ScopedModelItem>,
-		onSelect: (model: Model<any>) => void,
+		onSelect: (selection: ModelSelectorSelection) => void,
 		onCancel: () => void,
 		initialSearchInput?: string,
+		options?: { allowFollowConversation?: boolean },
 	) {
 		super();
 
 		this.tui = tui;
 		this.currentModel = currentModel;
-		this.settingsManager = settingsManager;
 		this.modelRuntime = modelRuntime;
 		this.scopedModels = scopedModels;
 		this.scope = scopedModels.length > 0 ? "scoped" : "all";
 		this.onSelectCallback = onSelect;
 		this.onCancelCallback = onCancel;
+		this.allowFollowConversation = options?.allowFollowConversation ?? false;
 
 		// Add top border
 		this.addChild(new DynamicBorder());
@@ -111,9 +119,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		}
 		this.searchInput.onSubmit = () => {
 			// Enter on search input selects the first filtered item
-			if (this.filteredModels[this.selectedIndex]) {
-				this.handleSelect(this.filteredModels[this.selectedIndex].model);
-			}
+			const selected = this.filteredModels[this.selectedIndex];
+			if (selected) this.handleSelect(selected);
 		};
 		this.addChild(this.searchInput);
 
@@ -137,7 +144,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private loadModelsFromSnapshot(): void {
-		const models = this.modelRuntime.getAvailableSnapshot().map((model: Model<any>) => ({
+		const models = this.modelRuntime.getAvailableSnapshot().map((model: Model<Api>) => ({
+			kind: "model" as const,
 			provider: model.provider,
 			id: model.id,
 			model,
@@ -148,13 +156,16 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			return refreshed ? { ...scoped, model: refreshed } : scoped;
 		});
 		this.scopedModelItems = this.scopedModels.map((scoped) => ({
+			kind: "model" as const,
 			provider: scoped.model.provider,
 			id: scoped.model.id,
 			model: scoped.model,
 		}));
 		this.activeModels = this.scope === "scoped" ? this.scopedModelItems : this.allModels;
-		this.filteredModels = this.activeModels;
-		const currentIndex = this.filteredModels.findIndex((item) => modelsAreEqual(this.currentModel, item.model));
+		this.filteredModels = this.getSelectableItems(this.activeModels);
+		const currentIndex = this.filteredModels.findIndex(
+			(item) => item.kind === "model" && modelsAreEqual(this.currentModel, item.model),
+		);
 		this.selectedIndex =
 			currentIndex >= 0 ? currentIndex : Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
 	}
@@ -224,7 +235,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		if (this.scope === scope) return;
 		this.scope = scope;
 		this.activeModels = this.scope === "scoped" ? this.scopedModelItems : this.allModels;
-		const currentIndex = this.activeModels.findIndex((item) => modelsAreEqual(this.currentModel, item.model));
+		const currentIndex = this.getSelectableItems(this.activeModels).findIndex(
+			(item) => item.kind === "model" && modelsAreEqual(this.currentModel, item.model),
+		);
 		this.selectedIndex = currentIndex >= 0 ? currentIndex : 0;
 		this.filterModels(this.searchInput.getValue());
 		if (this.scopeText) {
@@ -233,11 +246,16 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private filterModels(query: string): void {
-		this.filteredModels = query
+		const models = query
 			? fuzzyFilter(this.activeModels, query, ({ id, provider, model }) =>
 					getModelSelectorSearchText({ id, provider, name: model.name }),
 				)
 			: this.activeModels;
+		const followConversation =
+			this.allowFollowConversation && (!query || "follow conversation".includes(query.toLowerCase()))
+				? [{ kind: "follow-conversation" as const }]
+				: [];
+		this.filteredModels = [...followConversation, ...models];
 		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
 		this.updateList();
 	}
@@ -258,6 +276,16 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			if (!item) continue;
 
 			const isSelected = i === this.selectedIndex;
+			if (item.kind === "follow-conversation") {
+				const prefix = isSelected ? theme.fg("accent", "→ ") : "  ";
+				const label = isSelected
+					? theme.fg("accent", "Follow Conversation")
+					: theme.fg("text", "Follow Conversation");
+				this.listContainer.addChild(
+					new Text(`${prefix}${label} ${theme.fg("muted", "(use the current conversation model)")}`, 0, 0),
+				);
+				continue;
+			}
 			const isCurrent = modelsAreEqual(this.currentModel, item.model);
 
 			let line = "";
@@ -294,8 +322,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.listContainer.addChild(new Text(theme.fg("muted", "  No matching models"), 0, 0));
 		} else {
 			const selected = this.filteredModels[this.selectedIndex];
-			this.listContainer.addChild(new Spacer(1));
-			this.listContainer.addChild(new Text(theme.fg("muted", `  Model Name: ${selected.model.name}`), 0, 0));
+			if (selected?.kind === "model") {
+				this.listContainer.addChild(new Spacer(1));
+				this.listContainer.addChild(new Text(theme.fg("muted", `  Model Name: ${selected.model.name}`), 0, 0));
+			}
 		}
 		if (this.refreshStatusMessage) {
 			this.listContainer.addChild(new Spacer(1));
@@ -332,9 +362,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		// Enter
 		else if (kb.matches(keyData, "tui.select.confirm")) {
 			const selectedModel = this.filteredModels[this.selectedIndex];
-			if (selectedModel) {
-				this.handleSelect(selectedModel.model);
-			}
+			if (selectedModel) this.handleSelect(selectedModel);
 		}
 		// Escape or Ctrl+C
 		else if (kb.matches(keyData, "tui.select.cancel")) {
@@ -348,11 +376,13 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		}
 	}
 
-	private handleSelect(model: Model<any>): void {
+	private getSelectableItems(models: ModelItem[]): ModelSelectorItem[] {
+		return this.allowFollowConversation ? [{ kind: "follow-conversation" }, ...models] : models;
+	}
+
+	private handleSelect(item: ModelSelectorItem): void {
 		this.close();
-		// Save as new default
-		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
-		this.onSelectCallback(model);
+		this.onSelectCallback(item.kind === "model" ? { kind: "model", model: item.model } : item);
 	}
 
 	getSearchInput(): Input {

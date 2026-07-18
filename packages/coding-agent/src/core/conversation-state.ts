@@ -19,6 +19,24 @@ function getStatePath(agentDir: string): string {
 	return join(resolvePath(agentDir), STATE_FILE_NAME);
 }
 
+function writeState(agentDir: string, state: ConversationStateFile): void {
+	const statePath = getStatePath(agentDir);
+	mkdirSync(dirname(statePath), { recursive: true });
+	const temporaryPath = `${statePath}.${randomUUID()}.tmp`;
+	try {
+		writeFileSync(temporaryPath, `${JSON.stringify(state, null, "\t")}\n`, { encoding: "utf8", mode: 0o600 });
+		renameSync(temporaryPath, statePath);
+	} catch {
+		try {
+			if (existsSync(temporaryPath)) {
+				unlinkSync(temporaryPath);
+			}
+		} catch {
+			// Persisted active-conversation state is a convenience and must never interrupt the UI.
+		}
+	}
+}
+
 function getWorkspaceKey(cwd: string, sessionDir: string | undefined, agentDir: string): string {
 	const resolvedCwd = resolvePath(cwd);
 	const resolvedAgentDir = resolvePath(agentDir);
@@ -72,22 +90,20 @@ export function rememberLastActiveConversation(
 	sessionPath: string,
 	agentDir: string,
 ): void {
-	const statePath = getStatePath(agentDir);
 	const state = readState(agentDir);
 	state.lastActiveByWorkspace[getWorkspaceKey(cwd, sessionDir, agentDir)] = resolvePath(sessionPath);
+	writeState(agentDir, state);
+}
 
-	mkdirSync(dirname(statePath), { recursive: true });
-	const temporaryPath = `${statePath}.${randomUUID()}.tmp`;
-	try {
-		writeFileSync(temporaryPath, `${JSON.stringify(state, null, "\t")}\n`, { encoding: "utf8", mode: 0o600 });
-		renameSync(temporaryPath, statePath);
-	} catch {
-		try {
-			if (existsSync(temporaryPath)) {
-				unlinkSync(temporaryPath);
-			}
-		} catch {
-			// The persisted location is a convenience; a write failure must not interrupt a conversation.
-		}
+/** Remove every workspace pointer that references a conversation being archived. */
+export function forgetLastActiveConversation(sessionPath: string, agentDir: string): void {
+	const resolvedSessionPath = resolvePath(sessionPath);
+	const state = readState(agentDir);
+	let changed = false;
+	for (const [workspaceKey, activePath] of Object.entries(state.lastActiveByWorkspace)) {
+		if (resolvePath(activePath) !== resolvedSessionPath) continue;
+		delete state.lastActiveByWorkspace[workspaceKey];
+		changed = true;
 	}
+	if (changed) writeState(agentDir, state);
 }

@@ -88,6 +88,7 @@ import { InMemorySettingsStorage, SettingsManager } from "../../core/settings-ma
 import { SettingsTransactionJournal } from "../../core/settings-transaction-journal.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
+import { resolveTaskModel } from "../../core/task-model-router.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
@@ -107,6 +108,7 @@ import { BorderedLoader } from "./components/bordered-loader.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
 import { ChatHistoryFocus } from "./components/chat-history-focus.ts";
 import { ChatScrollLayout } from "./components/chat-scroll-layout.ts";
+import { ChatTextSelectionController } from "./components/chat-text-selection-controller.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
@@ -121,6 +123,7 @@ import { FooterComponent, formatTokens } from "./components/footer.ts";
 import { formatKeyText, keyDisplayText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.ts";
 import { LoginDialogComponent } from "./components/login-dialog.ts";
 import { ModelSelectorComponent } from "./components/model-selector.ts";
+import { ModelTaskSelectorComponent } from "./components/model-task-selector.ts";
 import {
 	type AuthSelectorProvider,
 	formatAuthSelectorProviderType,
@@ -309,6 +312,9 @@ export interface InteractiveModeOptions {
 }
 
 export class InteractiveMode {
+	private static readonly SESSION_SIDEBAR_WIDTH = 32;
+	private static readonly SESSION_SIDEBAR_SEPARATOR_WIDTH = 2;
+	private static readonly MINIMUM_MAIN_PANE_WIDTH = 44;
 	private readonly sessionHost: InteractiveSessionHost;
 	private ui: TUI;
 	private paneFocus: PaneFocusController;
@@ -338,6 +344,8 @@ export class InteractiveMode {
 	private isInitialized = false;
 	private onInputCallback?: (text: string) => void;
 	private mouseScrollUnsubscribe: (() => void) | undefined;
+	private mouseTextSelectionUnsubscribe: (() => void) | undefined;
+	private chatTextSelection!: ChatTextSelectionController;
 	private pendingUserInputs: string[] = [];
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private readonly parkedStatusIndicators = new Map<AgentSessionRuntime, StatusIndicator>();
@@ -508,6 +516,8 @@ export class InteractiveMode {
 		this.paneFocus.register("history", this.chatHistoryFocus);
 		this.paneFocus.register("chat", this.defaultEditor);
 		this.sessionSidebar.onActivateSession = (sessionPath) => void this.activateSidebarSession(sessionPath);
+		this.sessionSidebar.onDeleteSession = (sessionPath, replacementPath) =>
+			void this.deleteSidebarSession(sessionPath, replacementPath);
 		this.sessionSidebar.onFocusChat = () => {
 			this.paneFocus.focus("chat");
 		};
@@ -771,9 +781,9 @@ export class InteractiveMode {
 			new SplitPane(
 				this.sessionSidebar,
 				this.mainContainer,
-				32,
+				InteractiveMode.SESSION_SIDEBAR_WIDTH,
 				`${theme.fg("borderMuted", "│")} `,
-				44,
+				InteractiveMode.MINIMUM_MAIN_PANE_WIDTH,
 				() => this.ui.terminal.rows,
 			),
 		);
@@ -793,6 +803,7 @@ export class InteractiveMode {
 		this.ui.start();
 		this.isInitialized = true;
 		this.enableChatMouseScroll();
+		this.enableChatTextSelection();
 
 		await this.themeController.applyFromSettings();
 
@@ -2817,7 +2828,7 @@ export class InteractiveMode {
 				return;
 			}
 			if (text === "/name" || text.startsWith("/name ")) {
-				this.handleNameCommand(text);
+				await this.handleNameCommand(text);
 				this.editor.setText("");
 				return;
 			}
@@ -4415,6 +4426,7 @@ export class InteractiveMode {
 				await this.sessionHost.refreshLiveRuntimes(async (liveRuntime) => {
 					await liveRuntime.services.settingsManager.reload();
 					await liveRuntime.services.modelRuntime.reloadConfig();
+					liveRuntime.session.refreshCurrentModelFromRegistry();
 					await liveRuntime.services.resourceLoader.reload();
 				});
 				this.applySavedSettingsToCurrentSession();
@@ -4516,7 +4528,7 @@ export class InteractiveMode {
 
 	private async handleModelCommand(searchTerm?: string): Promise<void> {
 		if (!searchTerm) {
-			this.showModelSelector();
+			this.showModelTaskSelector();
 			return;
 		}
 
@@ -4649,10 +4661,11 @@ export class InteractiveMode {
 			const selector = new ModelSelectorComponent(
 				this.ui,
 				this.session.model,
-				this.settingsManager,
 				this.session.modelRuntime,
 				this.session.scopedModels,
-				async (model) => {
+				async (selection) => {
+					if (selection.kind !== "model") return;
+					const model = selection.model;
 					try {
 						await this.session.setModel(model);
 						this.footer.invalidate();
@@ -4673,6 +4686,77 @@ export class InteractiveMode {
 				initialSearchInput,
 			);
 			return { component: selector, focus: selector };
+		});
+	}
+
+	private showModelTaskSelector(): void {
+		this.showSelector((done) => {
+			const selector = new ModelTaskSelectorComponent({
+				conversationModel: this.session.model,
+				titleModel: this.settingsManager.getTaskModel("title"),
+				onSelect: (taskId) => {
+					done();
+					if (taskId === "conversation") this.showModelSelector();
+					else this.showTitleModelSelector();
+				},
+				onCancel: () => {
+					done();
+					this.ui.requestRender();
+				},
+			});
+			return { component: selector, focus: selector };
+		});
+	}
+
+	private showTitleModelSelector(): void {
+		const titleReference = this.settingsManager.getTaskModel("title");
+		const currentTitleModel = titleReference
+			? this.session.modelRuntime.getModel(titleReference.providerId, titleReference.modelId)
+			: undefined;
+		this.showSelector((done) => {
+			const selector = new ModelSelectorComponent(
+				this.ui,
+				currentTitleModel,
+				this.session.modelRuntime,
+				[],
+				async (selection) => {
+					try {
+						if (selection.kind === "follow-conversation") {
+							this.settingsManager.setTaskModel("title", undefined);
+							await this.refreshTaskModelSettings();
+							done();
+							this.showStatus("Title generation model: Follow Conversation");
+							return;
+						}
+						if (!(await this.session.modelRuntime.checkAuth(selection.model.provider))) {
+							throw new Error(`No API key for ${selection.model.provider}/${selection.model.id}`);
+						}
+						this.settingsManager.setTaskModel("title", {
+							providerId: selection.model.provider,
+							modelId: selection.model.id,
+						});
+						await this.refreshTaskModelSettings();
+						done();
+						this.showStatus(`Title generation model: ${selection.model.id}`);
+					} catch (error) {
+						done();
+						this.showError(error instanceof Error ? error.message : String(error));
+					}
+				},
+				() => {
+					done();
+					this.ui.requestRender();
+				},
+				undefined,
+				{ allowFollowConversation: true },
+			);
+			return { component: selector, focus: selector };
+		});
+	}
+
+	private async refreshTaskModelSettings(): Promise<void> {
+		await this.sessionHost.refreshLiveRuntimes(async (runtime) => {
+			await runtime.services.settingsManager.reload();
 		});
 	}
 
@@ -4984,6 +5068,27 @@ export class InteractiveMode {
 		if (!result.cancelled) this.paneFocus.focus("chat");
 	}
 
+	private async deleteSidebarSession(sessionPath: string, replacementPath: string | undefined): Promise<void> {
+		const restoreSidebarFocus = this.sessionSidebar.focused;
+		try {
+			const result = await this.sessionHost.deleteSession(sessionPath, replacementPath);
+			await this.refreshSessionSidebar();
+			this.sessionSidebar.setStatusMessage(
+				result.method === "system-trash"
+					? "Conversation moved to system Trash"
+					: result.method === "bone-trash"
+						? "Conversation moved to Bone Trash"
+						: "Unpersisted conversation discarded",
+			);
+			this.ui.requestRender();
+			if (restoreSidebarFocus) this.paneFocus.focus("sidebar");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this.sessionSidebar.setStatusMessage(`Failed to delete: ${message}`, "error");
+			this.ui.requestRender();
+		}
+	}
+
 	private focusSidebar(): void {
 		// Match SplitPane's layout threshold. A hidden Side must never become an
 		// invisible keyboard trap on a narrow terminal.
@@ -4999,7 +5104,7 @@ export class InteractiveMode {
 		if (id === "chat") return;
 		const text =
 			id === "sidebar"
-				? "Focus · Side  ↑↓ select · Enter open · Shift+→ conversation"
+				? "Focus · Side  ↑↓ select · Enter open · d delete · Shift+→ conversation"
 				: "Focus · Conversation history  ↑↓ scroll · Shift+↓ composer · Shift+← Side";
 		this.focusHintContainer.addChild(new Text(theme.fg("accent", text), 0, 0));
 		if (this.isInitialized) this.ui.requestRender();
@@ -5030,7 +5135,11 @@ export class InteractiveMode {
 	}
 
 	private enableChatMouseScroll(): void {
-		this.ui.terminal.write("\x1b[?1000h\x1b[?1006h");
+		// Button-motion reporting is required for drag selection; it also carries
+		// wheel events, so the existing per-session chat scrolling remains intact.
+		// Clear basic tracking first in case a previous, interrupted TUI process
+		// left the terminal in that mode.
+		this.ui.terminal.write("\x1b[?1000l\x1b[?1002h\x1b[?1006h");
 		this.mouseScrollUnsubscribe = this.ui.addInputListener((data) => {
 			const direction = this.getMouseScrollDirection(data);
 			if (!direction) return;
@@ -5038,6 +5147,39 @@ export class InteractiveMode {
 			this.scrollChat(direction);
 			return { consume: true };
 		});
+	}
+
+	private enableChatTextSelection(): void {
+		this.chatTextSelection = new ChatTextSelectionController({
+			layout: this.chatScrollLayout,
+			getBounds: () => this.getChatTextSelectionBounds(),
+			isBlocked: () => this.ui.hasOverlay(),
+			onRender: () => this.ui.requestRender(),
+			onCopy: copyToClipboard,
+			onCopied: (characterCount) =>
+				this.showStatus(`Copied ${characterCount} character${characterCount === 1 ? "" : "s"}`),
+			onCopyError: (error) =>
+				this.showError(`Could not copy selection: ${error instanceof Error ? error.message : String(error)}`),
+		});
+		this.mouseTextSelectionUnsubscribe = this.ui.addInputListener((data) => this.chatTextSelection.handleInput(data));
+	}
+
+	private getChatTextSelectionBounds(): { left: number; top: number; width: number; height: number } {
+		const terminalWidth = this.ui.terminal.columns;
+		const sidebarVisible =
+			terminalWidth >=
+			InteractiveMode.SESSION_SIDEBAR_WIDTH +
+				InteractiveMode.SESSION_SIDEBAR_SEPARATOR_WIDTH +
+				InteractiveMode.MINIMUM_MAIN_PANE_WIDTH;
+		const left = sidebarVisible
+			? InteractiveMode.SESSION_SIDEBAR_WIDTH + InteractiveMode.SESSION_SIDEBAR_SEPARATOR_WIDTH
+			: 0;
+		return {
+			left,
+			top: 0,
+			width: Math.max(0, terminalWidth - left),
+			height: this.chatScrollLayout.getVisibleContentRowCount(),
+		};
 	}
 
 	private getMouseScrollDirection(data: string): "up" | "down" | undefined {
@@ -5836,17 +5978,21 @@ export class InteractiveMode {
 		}
 	}
 
-	private handleNameCommand(text: string): void {
+	private async handleNameCommand(text: string): Promise<void> {
 		const name = text.replace(/^\/name\s*/, "").trim();
 		if (!name) {
 			const currentName = this.sessionManager.getSessionName();
 			if (currentName) {
-				this.chatContainer.addChild(new Spacer(1));
-				this.chatContainer.addChild(new Text(theme.fg("dim", `Conversation name: ${currentName}`), 1, 0));
-			} else {
-				this.showWarning("Usage: /name <name>");
+				const confirmed = await this.showExtensionConfirm(
+					"Generate conversation name",
+					`Replace the current name "${currentName}" with a generated title?`,
+				);
+				if (!confirmed) {
+					this.showStatus("Conversation name unchanged");
+					return;
+				}
 			}
-			this.ui.requestRender();
+			await this.generateConversationName();
 			return;
 		}
 
@@ -5860,6 +6006,38 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(theme.fg("dim", `Conversation name set: ${sessionName ?? name}`), 1, 0));
 		this.ui.requestRender();
+	}
+
+	private async generateConversationName(): Promise<void> {
+		let resolved: Awaited<ReturnType<typeof resolveTaskModel>>;
+		try {
+			resolved = await resolveTaskModel("title", {
+				conversationModel: this.session.model,
+				taskModel: this.settingsManager.getTaskModel("title"),
+				modelRuntime: this.session.modelRuntime,
+			});
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
+		}
+
+		const session = this.session;
+		this.showStatus(`Generating conversation name with ${resolved.model.provider}/${resolved.model.id}…`);
+		const result = await session.generateTitle(resolved.model);
+		if (result.kind === "title") {
+			session.setSessionName(result.title);
+			this.showStatus(`Conversation name set: ${result.title}`);
+			return;
+		}
+		if (result.kind === "not-ready") {
+			this.showWarning("Conversation needs more concrete task detail before it can be named");
+			return;
+		}
+		if (result.kind === "cancelled") {
+			this.showStatus("Conversation name generation cancelled");
+			return;
+		}
+		this.showError(`Could not generate conversation name: ${result.message}`);
 	}
 
 	private handleConversationCommand(): void {
@@ -6260,9 +6438,12 @@ export class InteractiveMode {
 		}
 		this.clearStatusIndicator();
 		this.disposeAllParkedStatusIndicators();
+		this.chatTextSelection?.cancel();
 		this.mouseScrollUnsubscribe?.();
 		this.mouseScrollUnsubscribe = undefined;
-		this.ui.terminal.write("\x1b[?1000l\x1b[?1006l");
+		this.mouseTextSelectionUnsubscribe?.();
+		this.mouseTextSelectionUnsubscribe = undefined;
+		this.ui.terminal.write("\x1b[?1000l\x1b[?1002l\x1b[?1006l");
 		this.themeController.disableAutoSync();
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();

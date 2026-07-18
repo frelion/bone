@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { extname, relative, sep } from "node:path";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSessionEvent } from "./agent-session.ts";
 import {
@@ -5,13 +7,17 @@ import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionRuntime,
 } from "./agent-session-runtime.ts";
+import { forgetLastActiveConversation } from "./conversation-state.ts";
 import { type SessionInfo, SessionManager } from "./session-manager.ts";
+import { type SessionTrashMethod, softDeleteSessionFile } from "./session-trash.ts";
 
 export type InteractiveSessionState = "foreground" | "background-running" | "background-waiting" | "cold";
 
 export interface InteractiveSessionSummary extends SessionInfo {
 	state: InteractiveSessionState;
 }
+
+export type InteractiveSessionDeletionResult = { method: SessionTrashMethod } | { method: "discarded" };
 
 interface RuntimeSlot {
 	runtime: AgentSessionRuntime;
@@ -75,54 +81,72 @@ export class InteractiveSessionHost {
 	}
 
 	async activate(sessionPath: string, options?: { cwdOverride?: string }): Promise<void> {
-		return this.enqueue(async () => {
-			const targetPath = this.normalizeSessionPath(sessionPath);
-			const currentPath = this.getSessionPath(this.foreground.runtime);
-			if (targetPath === currentPath) return;
-
-			await this.hooks.beforeForegroundChange?.(this.foreground.runtime);
-			await this.parkForeground();
-
-			const existing = this.background.get(targetPath);
-			if (existing) {
-				this.background.delete(targetPath);
-				existing.state = "foreground";
-				this.foreground = existing;
-			} else {
-				const runtime = await this.openRuntime(targetPath, currentPath, options?.cwdOverride);
-				this.foreground = this.createSlot(runtime, "foreground");
-			}
-
-			await this.hooks.foregroundChanged?.(this.foreground.runtime);
-			this.hooks.stateChanged?.();
-		});
+		return this.enqueue(async () => await this.activateWithinTransition(sessionPath, options));
 	}
 
 	async createNew(): Promise<void> {
+		return this.enqueue(async () => await this.createNewWithinTransition());
+	}
+
+	/**
+	 * Stop, dispose, and soft-delete a conversation without allowing its runtime
+	 * lifecycle to race a JSONL move. The replacement path is selected by Side.
+	 */
+	async deleteSession(
+		sessionPath: string,
+		replacementSessionPath?: string,
+	): Promise<InteractiveSessionDeletionResult> {
 		return this.enqueue(async () => {
+			const targetPath = this.normalizeSessionPath(sessionPath);
 			const currentRuntime = this.foreground.runtime;
 			const currentManager = currentRuntime.session.sessionManager;
-			const previousSessionFile = this.getSessionPath(currentRuntime);
-			const sessionManager = currentManager.isPersisted()
-				? SessionManager.create(currentManager.getCwd(), currentManager.getSessionDir())
-				: SessionManager.inMemory(currentManager.getCwd());
+			const sessionDir = this.normalizeSessionPath(currentManager.getSessionDir());
+			if (!this.isManagedSessionPath(targetPath, sessionDir)) {
+				throw new Error("Conversation path is outside the managed session directory");
+			}
 
-			await this.hooks.beforeForegroundChange?.(currentRuntime);
-			await this.parkForeground();
+			const sessions = await SessionManager.list(currentManager.getCwd(), currentManager.getSessionDir());
+			const targetSlot = this.findLiveSlot(targetPath);
+			if (!targetSlot && !sessions.some((session) => this.normalizeSessionPath(session.path) === targetPath)) {
+				throw new Error("Conversation no longer exists");
+			}
 
-			const runtime = await createAgentSessionRuntime(this.createRuntime, {
-				cwd: sessionManager.getCwd(),
-				agentDir: currentRuntime.services.agentDir,
-				sessionManager,
-				sessionStartEvent: {
-					type: "session_start",
-					reason: "new",
-					previousSessionFile,
-				},
-			});
-			this.foreground = this.createSlot(runtime, "foreground");
-			await this.hooks.foregroundChanged?.(runtime);
+			const agentDir = currentRuntime.services.agentDir;
+			if (targetSlot === this.foreground) {
+				if (this.hasOngoingWork(targetSlot.runtime)) {
+					await targetSlot.runtime.session.abort();
+				}
+
+				const replacementPath = replacementSessionPath && this.normalizeSessionPath(replacementSessionPath);
+				const replacementExists =
+					replacementPath !== targetPath &&
+					sessions.some((session) => this.normalizeSessionPath(session.path) === replacementPath);
+				if (replacementExists && replacementPath) {
+					await this.activateWithinTransition(replacementPath);
+				} else {
+					await this.createNewWithinTransition();
+				}
+			} else if (targetSlot) {
+				// Suppress the queued background-settled cleanup: this deletion owns the
+				// slot until it has been fully stopped and disposed exactly once.
+				targetSlot.state = "background-waiting";
+				if (this.hasOngoingWork(targetSlot.runtime)) {
+					await targetSlot.runtime.session.abort();
+				}
+				await this.suspend(targetSlot);
+			}
+
+			if (!existsSync(targetPath)) {
+				forgetLastActiveConversation(targetPath, agentDir);
+				this.hooks.stateChanged?.();
+				return { method: "discarded" };
+			}
+
+			const result = await softDeleteSessionFile(targetPath, agentDir);
+			if (!result.ok) throw new Error(result.error);
+			forgetLastActiveConversation(targetPath, agentDir);
 			this.hooks.stateChanged?.();
+			return { method: result.method };
 		});
 	}
 
@@ -218,6 +242,54 @@ export class InteractiveSessionHost {
 		}
 	}
 
+	private async activateWithinTransition(sessionPath: string, options?: { cwdOverride?: string }): Promise<void> {
+		const targetPath = this.normalizeSessionPath(sessionPath);
+		const currentPath = this.getSessionPath(this.foreground.runtime);
+		if (targetPath === currentPath) return;
+
+		await this.hooks.beforeForegroundChange?.(this.foreground.runtime);
+		await this.parkForeground();
+
+		const existing = this.background.get(targetPath);
+		if (existing) {
+			this.background.delete(targetPath);
+			existing.state = "foreground";
+			this.foreground = existing;
+		} else {
+			const runtime = await this.openRuntime(targetPath, currentPath, options?.cwdOverride);
+			this.foreground = this.createSlot(runtime, "foreground");
+		}
+
+		await this.hooks.foregroundChanged?.(this.foreground.runtime);
+		this.hooks.stateChanged?.();
+	}
+
+	private async createNewWithinTransition(): Promise<void> {
+		const currentRuntime = this.foreground.runtime;
+		const currentManager = currentRuntime.session.sessionManager;
+		const previousSessionFile = this.getSessionPath(currentRuntime);
+		const sessionManager = currentManager.isPersisted()
+			? SessionManager.create(currentManager.getCwd(), currentManager.getSessionDir())
+			: SessionManager.inMemory(currentManager.getCwd());
+
+		await this.hooks.beforeForegroundChange?.(currentRuntime);
+		await this.parkForeground();
+
+		const runtime = await createAgentSessionRuntime(this.createRuntime, {
+			cwd: sessionManager.getCwd(),
+			agentDir: currentRuntime.services.agentDir,
+			sessionManager,
+			sessionStartEvent: {
+				type: "session_start",
+				reason: "new",
+				previousSessionFile,
+			},
+		});
+		this.foreground = this.createSlot(runtime, "foreground");
+		await this.hooks.foregroundChanged?.(runtime);
+		this.hooks.stateChanged?.();
+	}
+
 	private async parkForeground(): Promise<void> {
 		const slot = this.foreground;
 		const sessionPath = this.getSessionPath(slot.runtime);
@@ -248,6 +320,21 @@ export class InteractiveSessionHost {
 		} finally {
 			this.hooks.runtimeDisposed?.(slot.runtime);
 		}
+	}
+
+	private findLiveSlot(sessionPath: string): RuntimeSlot | undefined {
+		if (this.getSessionPath(this.foreground.runtime) === sessionPath) return this.foreground;
+		return this.background.get(sessionPath);
+	}
+
+	private isManagedSessionPath(sessionPath: string, sessionDir: string): boolean {
+		if (extname(sessionPath) !== ".jsonl") return false;
+		const pathRelativeToSessionDir = relative(sessionDir, sessionPath);
+		return (
+			pathRelativeToSessionDir.length > 0 &&
+			pathRelativeToSessionDir !== ".." &&
+			!pathRelativeToSessionDir.startsWith(`..${sep}`)
+		);
 	}
 
 	private async openRuntime(
@@ -315,9 +402,12 @@ export class InteractiveSessionHost {
 		return resolvePath(sessionPath);
 	}
 
-	private enqueue(operation: () => Promise<void>): Promise<void> {
+	private enqueue<T>(operation: () => Promise<T>): Promise<T> {
 		const next = this.transition.then(operation, operation);
-		this.transition = next.catch(() => {});
+		this.transition = next.then(
+			() => {},
+			() => {},
+		);
 		return next;
 	}
 }

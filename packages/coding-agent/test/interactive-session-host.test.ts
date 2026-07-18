@@ -8,6 +8,7 @@ import {
 	createAgentSessionRuntime,
 	createAgentSessionServices,
 } from "../src/core/agent-session-runtime.ts";
+import { getLastActiveConversation, rememberLastActiveConversation } from "../src/core/conversation-state.ts";
 import { InteractiveSessionHost } from "../src/core/interactive-session-host.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { assistantMsg, userMsg } from "./utilities.ts";
@@ -223,6 +224,69 @@ describe("InteractiveSessionHost", () => {
 			state: "background-running",
 			firstMessage: "first turn is still streaming",
 		});
+		await host.disposeAll();
+	});
+
+	it("switches away from the foreground conversation before soft-deleting it", async () => {
+		const tempDir = join(tmpdir(), `bone-session-host-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDirs.push(tempDir);
+		mkdirSync(tempDir, { recursive: true });
+
+		const firstSession = createPersistedSession(tempDir, "first session");
+		const secondSession = createPersistedSession(tempDir, "second session");
+		const firstPath = firstSession.getSessionFile();
+		const secondPath = secondSession.getSessionFile();
+		if (!firstPath || !secondPath) throw new Error("expected persisted session files");
+
+		const factory: CreateAgentSessionRuntimeFactory = async ({
+			cwd,
+			agentDir,
+			sessionManager,
+			sessionStartEvent,
+		}) => {
+			const services = await createAgentSessionServices({
+				cwd,
+				agentDir,
+				resourceLoaderOptions: {
+					noExtensions: true,
+					noSkills: true,
+					noPromptTemplates: true,
+					noThemes: true,
+				},
+			});
+			return {
+				...(await createAgentSessionFromServices({
+					services,
+					sessionManager,
+					sessionStartEvent,
+					noTools: "all",
+				})),
+				services,
+				diagnostics: services.diagnostics,
+			};
+		};
+
+		const initialRuntime = await createAgentSessionRuntime(factory, {
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.open(firstPath),
+		});
+		const host = new InteractiveSessionHost(initialRuntime, factory);
+		rememberLastActiveConversation(
+			tempDir,
+			initialRuntime.session.sessionManager.getSessionDir(),
+			firstPath,
+			tempDir,
+		);
+
+		const result = await host.deleteSession(firstPath, secondPath);
+
+		expect(["system-trash", "bone-trash"]).toContain(result.method);
+		expect(existsSync(firstPath)).toBe(false);
+		expect(host.current.session.sessionFile).toBe(secondPath);
+		expect(
+			getLastActiveConversation(tempDir, initialRuntime.session.sessionManager.getSessionDir(), tempDir),
+		).toBeUndefined();
 		await host.disposeAll();
 	});
 });

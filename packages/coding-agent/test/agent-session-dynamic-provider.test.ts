@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import { ModelConfig } from "../src/core/model-config.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import type { ExtensionFactory } from "../src/core/sdk.ts";
@@ -54,11 +55,11 @@ describe("AgentSession dynamic provider registration", () => {
 			resourceLoader,
 		});
 
-		return session;
+		return { session, modelRuntime, modelsPath: join(agentDir, "models.json") };
 	}
 
 	async function capturePromptBaseUrl(
-		session: Awaited<ReturnType<typeof createSession>>,
+		session: Awaited<ReturnType<typeof createSession>>["session"],
 	): Promise<string | undefined> {
 		let baseUrl: string | undefined;
 		session.agent.streamFn = async (model) => {
@@ -70,7 +71,7 @@ describe("AgentSession dynamic provider registration", () => {
 	}
 
 	it("applies top-level registerProvider overrides to the active model", async () => {
-		const session = await createSession([
+		const { session } = await createSession([
 			(pi) => {
 				pi.registerProvider("anthropic", { baseUrl: "http://localhost:8080/top-level" });
 			},
@@ -83,7 +84,7 @@ describe("AgentSession dynamic provider registration", () => {
 	});
 
 	it("applies session_start registerProvider overrides to the active model", async () => {
-		const session = await createSession([
+		const { session } = await createSession([
 			(pi) => {
 				pi.on("session_start", () => {
 					pi.registerProvider("anthropic", { baseUrl: "http://localhost:8080/session-start" });
@@ -100,7 +101,7 @@ describe("AgentSession dynamic provider registration", () => {
 	});
 
 	it("applies command-time registerProvider overrides without reload", async () => {
-		const session = await createSession([
+		const { session } = await createSession([
 			(pi) => {
 				pi.registerCommand("use-proxy", {
 					description: "Use proxy",
@@ -116,6 +117,41 @@ describe("AgentSession dynamic provider registration", () => {
 
 		expect(session.model?.baseUrl).toBe("http://localhost:8080/command");
 		expect(await capturePromptBaseUrl(session)).toBe("http://localhost:8080/command");
+
+		session.dispose();
+	});
+
+	it("replaces the selected model after a Provider protocol change is reloaded", async () => {
+		const { session, modelRuntime, modelsPath } = await createSession([]);
+		const originalModel = session.model;
+
+		ModelConfig.save(modelsPath, {
+			providers: {
+				anthropic: {
+					baseUrl: "http://localhost:8080/v1",
+					api: "openai-completions",
+					models: [{ id: "claude-sonnet-4-5" }],
+				},
+			},
+		});
+		await modelRuntime.reloadConfig();
+
+		expect(session.model).toBe(originalModel);
+		expect(session.refreshCurrentModelFromRegistry()).toBe("updated");
+		expect(session.model).toMatchObject({
+			provider: "anthropic",
+			id: "claude-sonnet-4-5",
+			api: "openai-completions",
+			baseUrl: "http://localhost:8080/v1",
+		});
+
+		let requestApi: string | undefined;
+		session.agent.streamFn = async (model) => {
+			requestApi = model.api;
+			throw new Error("stop");
+		};
+		await session.prompt("hello");
+		expect(requestApi).toBe("openai-completions");
 
 		session.dispose();
 	});

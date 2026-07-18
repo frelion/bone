@@ -79,6 +79,64 @@ describe("SessionSidebar", () => {
 		expect(exit).toHaveBeenCalledTimes(1);
 	});
 
+	it("confirms Side deletion with d and preserves selection while confirming", () => {
+		const sidebar = new SessionSidebar();
+		const remove = vi.fn();
+		sidebar.onDeleteSession = remove;
+		sidebar.focused = true;
+		sidebar.setSessions([makeSession("a", "foreground"), makeSession("b", "cold")]);
+
+		sidebar.handleInput("d");
+		sidebar.handleInput("\x1b[B");
+		const output = stripVTControlCharacters(sidebar.render(42).join("\n"));
+		expect(output).toContain("Delete this conversation?");
+		expect(output).toContain("Enter confirm · Esc cancel");
+
+		sidebar.handleInput("\r");
+		expect(remove).toHaveBeenCalledWith("/sessions/a.jsonl", "/sessions/b.jsonl");
+	});
+
+	it("cancels Side deletion confirmation with Escape", () => {
+		const sidebar = new SessionSidebar();
+		const remove = vi.fn();
+		sidebar.onDeleteSession = remove;
+		sidebar.focused = true;
+		sidebar.setSessions([makeSession("a", "foreground")]);
+
+		sidebar.handleInput("d");
+		sidebar.handleInput("\x1b");
+		sidebar.handleInput("\r");
+
+		expect(remove).not.toHaveBeenCalled();
+	});
+
+	it("keeps the title compact and renders confirmation inside the selected conversation", () => {
+		const sidebar = new SessionSidebar();
+		sidebar.focused = true;
+		sidebar.setSessions([makeSession("a", "foreground")]);
+
+		const normalLines = stripVTControlCharacters(sidebar.render(42).join("\n")).split("\n");
+		expect(normalLines[0]?.trimEnd()).toMatch(/^ Conversations\s+1$/);
+		expect(normalLines.join("\n")).not.toContain("Shift+→");
+		expect(normalLines.join("\n")).not.toContain("d delete");
+
+		sidebar.handleInput("d");
+		const confirmationLines = stripVTControlCharacters(sidebar.render(42).join("\n")).split("\n");
+		expect(confirmationLines[0]?.trimEnd()).toMatch(/^ Conversations\s+1$/);
+		expect(confirmationLines.join("\n")).toContain("Delete this conversation?");
+	});
+
+	it("renders deletion feedback within the selected conversation", () => {
+		const sidebar = new SessionSidebar();
+		sidebar.focused = true;
+		sidebar.setSessions([makeSession("a", "foreground")]);
+		sidebar.setStatusMessage("Conversation moved to Bone Trash");
+
+		const output = stripVTControlCharacters(sidebar.render(48).join("\n"));
+		expect(output).toContain("Conversation moved to Bone Trash");
+		expect(output).not.toContain("Shift+← focus Side");
+	});
+
 	it("keeps the sidebar within the terminal viewport", () => {
 		const sidebar = new SessionSidebar();
 		sidebar.setViewportRows(5);
@@ -87,6 +145,7 @@ describe("SessionSidebar", () => {
 			makeSession("b", "cold"),
 			makeSession("c", "cold"),
 			makeSession("d", "cold"),
+			makeSession("e", "cold"),
 		]);
 
 		expect(sidebar.render(30)).toHaveLength(5);

@@ -2,7 +2,11 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { getLastActiveConversation, rememberLastActiveConversation } from "../src/core/conversation-state.ts";
+import {
+	forgetLastActiveConversation,
+	getLastActiveConversation,
+	rememberLastActiveConversation,
+} from "../src/core/conversation-state.ts";
 
 describe("conversation state", () => {
 	const tempDirs: string[] = [];
@@ -41,5 +45,20 @@ describe("conversation state", () => {
 		writeFileSync(join(agentDir, "conversation-state.json"), "not json");
 
 		expect(getLastActiveConversation(join(root, "workspace"), undefined, agentDir)).toBeUndefined();
+	});
+
+	it("forgets every workspace pointer to an archived conversation", () => {
+		const root = join(tmpdir(), `bone-conversation-state-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDirs.push(root);
+		const agentDir = join(root, "agent");
+		const sharedSessions = join(root, "sessions");
+		const workspace = join(root, "workspace");
+		const session = join(sharedSessions, "archived.jsonl");
+		mkdirSync(sharedSessions, { recursive: true });
+
+		rememberLastActiveConversation(workspace, sharedSessions, session, agentDir);
+		forgetLastActiveConversation(session, agentDir);
+
+		expect(getLastActiveConversation(workspace, sharedSessions, agentDir)).toBeUndefined();
 	});
 });

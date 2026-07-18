@@ -25,6 +25,7 @@ import type {
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import type {
+	Api,
 	AssistantMessage,
 	AuthResult,
 	ImageContent,
@@ -60,6 +61,7 @@ import {
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
+import { type ConversationTitleResult, generateConversationTitle } from "./conversation-title.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -317,6 +319,11 @@ export class AgentSession {
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
+	private _titleAbortController: AbortController | undefined = undefined;
+	// A settings save can replace the configured Model object while a request is
+	// already using the previous one. Apply that replacement only once the active
+	// run settles so an in-flight request keeps its original request contract.
+	private _pendingCurrentModelRefresh = false;
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
@@ -560,6 +567,9 @@ export class AgentSession {
 	private async _emitAgentSettled(): Promise<void> {
 		this._isAgentRunActive = false;
 		try {
+			if (this._pendingCurrentModelRefresh) {
+				this._refreshCurrentModelFromRegistry();
+			}
 			await this._extensionRunner.emit({ type: "agent_settled" });
 			this._emit({ type: "agent_settled" });
 		} finally {
@@ -828,6 +838,7 @@ export class AgentSession {
 			this.abortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
+			this._titleAbortController?.abort();
 			this.agent.abort();
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
@@ -853,6 +864,21 @@ export class AgentSession {
 	/** Current model (may be undefined if not yet selected) */
 	get model(): Model<any> | undefined {
 		return this.agent.state.model;
+	}
+
+	/**
+	 * Re-resolve the selected model after its Provider configuration changes.
+	 *
+	 * A live request retains the model it started with. If one is in progress,
+	 * the replacement is deferred until `agent_settled`, before the next prompt
+	 * or queued continuation can start.
+	 */
+	refreshCurrentModelFromRegistry(): "updated" | "unchanged" | "missing" | "deferred" {
+		if (this.isStreaming) {
+			this._pendingCurrentModelRefresh = true;
+			return "deferred";
+		}
+		return this._refreshCurrentModelFromRegistry();
 	}
 
 	/** Current thinking level */
@@ -1585,6 +1611,29 @@ export class AgentSession {
 		await this._emitModelSelect(model, previousModel, "set");
 	}
 
+	/** Generate a title without touching the agent's chat context or selected conversation model. */
+	async generateTitle(model: Model<Api>): Promise<ConversationTitleResult> {
+		if (!this.isIdle) {
+			return { kind: "error", message: "Wait for the current response to finish before generating a title" };
+		}
+		if (this._titleAbortController) {
+			return { kind: "error", message: "Conversation title generation is already in progress" };
+		}
+
+		const controller = new AbortController();
+		this._titleAbortController = controller;
+		try {
+			return await generateConversationTitle(
+				this._modelRuntime,
+				model,
+				this.sessionManager.buildContextEntries(),
+				controller.signal,
+			);
+		} finally {
+			if (this._titleAbortController === controller) this._titleAbortController = undefined;
+		}
+	}
+
 	/**
 	 * Cycle to next/previous model.
 	 * Uses scoped models (from --models flag) if available, otherwise all available models.
@@ -2299,18 +2348,23 @@ export class AgentSession {
 			: undefined;
 	}
 
-	private _refreshCurrentModelFromRegistry(): void {
+	private _refreshCurrentModelFromRegistry(): "updated" | "unchanged" | "missing" {
+		this._pendingCurrentModelRefresh = false;
 		const currentModel = this.model;
 		if (!currentModel) {
-			return;
+			return "unchanged";
 		}
 
 		const refreshedModel = this._modelRuntime.getModel(currentModel.provider, currentModel.id);
-		if (!refreshedModel || refreshedModel === currentModel) {
-			return;
+		if (!refreshedModel) {
+			return "missing";
+		}
+		if (refreshedModel === currentModel) {
+			return "unchanged";
 		}
 
 		this.agent.state.model = refreshedModel;
+		return "updated";
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
@@ -2422,11 +2476,11 @@ export class AgentSession {
 			{
 				registerProvider: (name, config, extensionPath) => {
 					this._modelRuntime.registerProvider(name, config, extensionPath);
-					this._refreshCurrentModelFromRegistry();
+					this.refreshCurrentModelFromRegistry();
 				},
 				unregisterProvider: (name) => {
 					this._modelRuntime.unregisterProvider(name);
-					this._refreshCurrentModelFromRegistry();
+					this.refreshCurrentModelFromRegistry();
 				},
 			},
 		);

@@ -78,7 +78,6 @@ describe("issue #3217 scoped model ordering", () => {
 		const selector = new ModelSelectorComponent(
 			createFakeTui(),
 			modelOne,
-			harness.settingsManager,
 			harness.session.modelRuntime,
 			[{ model: modelTwo }, { model: modelOne }, { model: modelThree }],
 			() => {},
@@ -100,5 +99,29 @@ describe("issue #3217 scoped model ordering", () => {
 		});
 
 		expect(orderedIds).toEqual([modelTwo.id, modelOne.id, modelThree.id]);
+	});
+
+	it("offers Follow Conversation without persisting a default model", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const select = vi.fn();
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			undefined,
+			harness.session.modelRuntime,
+			[],
+			select,
+			() => {},
+			undefined,
+			{ allowFollowConversation: true },
+		);
+
+		await vi.waitFor(() => {
+			expect(stripAnsi(selector.render(120).join("\n"))).toContain("Follow Conversation");
+		});
+		selector.handleInput("\r");
+
+		expect(select).toHaveBeenCalledWith({ kind: "follow-conversation" });
+		expect(harness.settingsManager.getDefaultModel()).toBeUndefined();
 	});
 });

@@ -18,6 +18,12 @@ const STATE_ICON: Record<InteractiveSessionSummary["state"], string> = {
 
 const DETAIL_ROWS_PER_CONVERSATION = 3;
 const DIVIDER_ROWS_PER_CONVERSATION = 1;
+const MIN_ROWS_FOR_DETAILED_LIST = DETAIL_ROWS_PER_CONVERSATION * 2 + DIVIDER_ROWS_PER_CONVERSATION;
+
+type SidebarItemState =
+	| { kind: "normal" }
+	| { kind: "confirm-delete"; path: string }
+	| { kind: "status"; path: string; tone: "success" | "error"; message: string };
 
 function normalizePreview(text: string): string {
 	return text
@@ -88,8 +94,10 @@ export class SessionSidebar implements Component, Focusable {
 	private selectedIndex = 0;
 	private selectedPath: string | undefined;
 	private viewportRows = Number.POSITIVE_INFINITY;
+	private itemState: SidebarItemState = { kind: "normal" };
 	focused = false;
 	public onActivateSession?: (sessionPath: string) => void;
+	public onDeleteSession?: (sessionPath: string, replacementPath: string | undefined) => void;
 	public onFocusChat?: () => void;
 	public onScrollChat?: (direction: "up" | "down") => void;
 	/** Keep application-level quit/interrupt behavior available while Side owns focus. */
@@ -103,10 +111,20 @@ export class SessionSidebar implements Component, Focusable {
 		const foregroundIndex = sessions.findIndex((session) => session.state === "foreground");
 		this.selectedIndex = selectedIndex >= 0 ? selectedIndex : Math.max(0, foregroundIndex);
 		this.selectedPath = sessions[this.selectedIndex]?.path;
+		const itemState = this.itemState;
+		if (itemState.kind !== "normal" && !sessions.some((session) => session.path === itemState.path)) {
+			this.itemState = { kind: "normal" };
+		}
 	}
 
 	setViewportRows(rows: number): void {
 		this.viewportRows = Math.max(1, rows);
+	}
+
+	setStatusMessage(message: string | undefined, tone: "success" | "error" = "success"): void {
+		const selected = this.sessions[this.selectedIndex];
+		this.itemState =
+			message && selected ? { kind: "status", path: selected.path, tone, message } : { kind: "normal" };
 	}
 
 	invalidate(): void {}
@@ -123,16 +141,10 @@ export class SessionSidebar implements Component, Focusable {
 			addSidebarLine(theme.fg("borderMuted", `  ${"┄".repeat(Math.max(1, width - 4))}`));
 		};
 
-		const header = this.focused ? "Conversations · Focus" : "Conversations";
+		const header = "Conversations";
 		const count = String(this.sessions.length);
 		const headerGap = " ".repeat(Math.max(1, width - visibleWidth(header) - visibleWidth(count) - 2));
 		addSidebarLine(` ${theme.bold(theme.fg("accent", header))}${headerGap}${theme.fg("dim", count)}`);
-		if (this.focused) {
-			addSidebarLine(theme.fg("muted", " Shift+→ Conversation · Enter open"));
-			addSidebarLine(theme.fg("muted", " ↑↓ select · Wheel/PgUp scroll"));
-		} else {
-			addSidebarLine(theme.fg("muted", " Shift+← focus Side · Wheel/PgUp"));
-		}
 		if (this.sessions.length === 0) {
 			addDivider();
 			addSidebarLine(theme.fg("muted", " No conversations yet"));
@@ -141,7 +153,7 @@ export class SessionSidebar implements Component, Focusable {
 
 		const remainingRows =
 			viewportRows === undefined ? Number.POSITIVE_INFINITY : Math.max(1, viewportRows - lines.length);
-		const detailedRows = remainingRows >= DETAIL_ROWS_PER_CONVERSATION + 1;
+		const detailedRows = remainingRows >= MIN_ROWS_FOR_DETAILED_LIST;
 		const listRows = detailedRows ? Math.max(0, remainingRows - 1) : remainingRows;
 		let visibleCount = this.getVisibleCount(listRows, detailedRows, false);
 		let showOverflow = this.sessions.length > visibleCount;
@@ -166,9 +178,13 @@ export class SessionSidebar implements Component, Focusable {
 			const icon = STATE_ICON[session.state];
 			const title = normalizePreview(session.name ?? session.firstMessage) || "(empty conversation)";
 			const selected = this.focused && index === this.selectedIndex;
+			const isConfirmingDelete = this.itemState.kind === "confirm-delete" && session.path === this.itemState.path;
+			const status =
+				this.itemState.kind === "status" && session.path === this.itemState.path ? this.itemState : undefined;
 			const prefix = `${selected ? "›" : " "} ${icon} `;
-			const statusColor =
-				session.state === "foreground"
+			const statusColor = isConfirmingDelete
+				? "error"
+				: session.state === "foreground"
 					? "accent"
 					: session.state === "background-running"
 						? "warning"
@@ -184,14 +200,31 @@ export class SessionSidebar implements Component, Focusable {
 						: undefined;
 			const activityLabel = stateLabel ? `${activity} · ${stateLabel}` : activity;
 			const titleWidth = Math.max(1, width - visibleWidth(prefix) - visibleWidth(activityLabel) - 1);
-			const titleLabel = truncateSidebarText(title, titleWidth);
+			const compactStateLabel = isConfirmingDelete ? "Delete? Enter confirm · Esc cancel" : status?.message;
+			const titleLabel = truncateSidebarText(compactStateLabel ?? title, titleWidth);
 			const titleGap = " ".repeat(
 				Math.max(1, width - visibleWidth(prefix) - visibleWidth(titleLabel) - visibleWidth(activityLabel)),
 			);
-			const titleLine = `${theme.fg(statusColor, prefix)}${selected ? theme.bold(theme.fg("text", titleLabel)) : theme.fg("text", titleLabel)}${titleGap}${theme.fg("dim", activityLabel)}`;
+			const titleText = compactStateLabel
+				? theme.fg(isConfirmingDelete ? "error" : status?.tone === "error" ? "error" : "accent", titleLabel)
+				: theme.fg("text", titleLabel);
+			const titleLine = `${theme.fg(statusColor, prefix)}${selected ? theme.bold(titleText) : titleText}${titleGap}${theme.fg("dim", activityLabel)}`;
 			addSidebarLine(titleLine, selected);
 
 			if (!detailedRows) continue;
+			if (isConfirmingDelete) {
+				addSidebarLine(theme.fg("error", "    Delete this conversation?"), selected);
+				addSidebarLine(theme.fg("muted", "    Enter confirm · Esc cancel"), selected);
+				if (index + 1 < endIndex) addDivider();
+				continue;
+			}
+			if (status) {
+				addSidebarLine(theme.fg(status.tone === "error" ? "error" : "accent", `    ${status.message}`), selected);
+				const metadata = `${formatConversationCreatedTime(session.created)} · ${session.messageCount} ${session.messageCount === 1 ? "msg" : "msgs"}`;
+				addSidebarLine(theme.fg("dim", `    ${truncateSidebarText(metadata, Math.max(1, width - 4))}`), selected);
+				if (index + 1 < endIndex) addDivider();
+				continue;
+			}
 
 			const role =
 				session.lastMessageRole === "assistant" ? "Bone" : session.lastMessageRole === "user" ? "You" : undefined;
@@ -239,6 +272,23 @@ export class SessionSidebar implements Component, Focusable {
 
 	handleInput(data: string): void {
 		const keybindings = getKeybindings();
+		if (this.itemState.kind === "confirm-delete") {
+			if (keybindings.matches(data, "tui.select.confirm")) {
+				const sessionPath = this.itemState.path;
+				this.itemState = { kind: "normal" };
+				const selectedIndex = this.sessions.findIndex((session) => session.path === sessionPath);
+				const replacementPath =
+					this.sessions[selectedIndex + 1]?.path ?? this.sessions[Math.max(0, selectedIndex - 1)]?.path;
+				this.onDeleteSession?.(sessionPath, replacementPath === sessionPath ? undefined : replacementPath);
+				return;
+			}
+			if (keybindings.matches(data, "tui.select.cancel")) {
+				this.itemState = { kind: "normal" };
+				return;
+			}
+			return;
+		}
+		if (this.itemState.kind === "status") this.itemState = { kind: "normal" };
 		if (keybindings.matches(data, "app.clear")) {
 			this.onInterrupt?.();
 			return;
@@ -270,6 +320,11 @@ export class SessionSidebar implements Component, Focusable {
 		if (keybindings.matches(data, "tui.select.confirm")) {
 			const selected = this.sessions[this.selectedIndex];
 			if (selected) this.onActivateSession?.(selected.path);
+			return;
+		}
+		if (keybindings.matches(data, "app.session.deleteFromSidebar")) {
+			const selected = this.sessions[this.selectedIndex];
+			if (selected) this.itemState = { kind: "confirm-delete", path: selected.path };
 		}
 	}
 

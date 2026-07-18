@@ -1,4 +1,5 @@
 import type { Component } from "@earendil-works/pi-tui";
+import { ChatTextSelection } from "./chat-text-selection.ts";
 
 /** Keeps chat history scrollable while the composer and status area stay visible. */
 export class ChatScrollLayout implements Component {
@@ -8,6 +9,8 @@ export class ChatScrollLayout implements Component {
 	private scrollOffset = 0;
 	private contentRows = 1;
 	private previousContentLineCount: number | undefined;
+	private visibleContentLines: string[] = [];
+	readonly textSelection = new ChatTextSelection();
 
 	constructor(content: Component, fixedBottom: Component, getViewportRows: () => number) {
 		this.content = content;
@@ -29,6 +32,28 @@ export class ChatScrollLayout implements Component {
 
 	getScrollOffset(): number {
 		return this.scrollOffset;
+	}
+
+	getVisibleContentRowCount(): number {
+		return this.visibleContentLines.length;
+	}
+
+	beginTextSelection(row: number, column: number): boolean {
+		return this.textSelection.begin(this.visibleContentLines, row, column);
+	}
+
+	updateTextSelection(row: number, column: number): boolean {
+		return this.textSelection.update(row, column);
+	}
+
+	finishTextSelection(): string | undefined {
+		const text = this.textSelection.copyText();
+		this.textSelection.cancel();
+		return text;
+	}
+
+	cancelTextSelection(): boolean {
+		return this.textSelection.cancel();
 	}
 
 	/**
@@ -64,6 +89,15 @@ export class ChatScrollLayout implements Component {
 		while (visibleContent.length < this.contentRows) {
 			visibleContent.push("");
 		}
-		return [...visibleContent, ...fixedLines];
+
+		const frozenSnapshot = this.textSelection.getSnapshot();
+		const contentForRender =
+			frozenSnapshot && frozenSnapshot.length === visibleContent.length ? frozenSnapshot : visibleContent;
+		if (frozenSnapshot && frozenSnapshot.length !== visibleContent.length) {
+			this.textSelection.cancel();
+		}
+		this.visibleContentLines = [...contentForRender];
+		const renderedContent = contentForRender.map((line, row) => this.textSelection.renderLine(line, row));
+		return [...renderedContent, ...fixedLines];
 	}
 }
