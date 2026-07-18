@@ -43,6 +43,25 @@ describe("AgentSession title generation", () => {
 		expect(harness.sessionManager.getSessionName()).toBeUndefined();
 	});
 
+	it("keeps a model-provided not-ready message for the TUI to show", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("Hello."),
+			fauxAssistantMessage(
+				'{"title":null,"message":"Describe what you want to build or fix, then try /name again."}',
+			),
+		]);
+
+		await harness.session.prompt("Hello");
+		const result = await harness.session.generateTitle(harness.getModel());
+
+		expect(result).toEqual({
+			kind: "not-ready",
+			message: "Describe what you want to build or fix, then try /name again.",
+		});
+	});
+
 	it("rejects malformed title responses", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

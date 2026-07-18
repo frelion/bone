@@ -2,22 +2,20 @@ import type { Api, AssistantMessage, Context, Model } from "@earendil-works/pi-a
 import type { ModelRuntime } from "./model-runtime.ts";
 import type { SessionEntry } from "./session-manager.ts";
 
-const MAX_MESSAGE_CHARS = 1_200;
-const MAX_CONTEXT_CHARS = 6_000;
-const RECENT_MESSAGE_COUNT = 6;
 const MAX_TITLE_CHARS = 80;
+const MAX_NOT_READY_MESSAGE_CHARS = 180;
 
 const TITLE_SYSTEM_PROMPT = `You generate concise, stable titles for software-development conversations.
 
-Return only valid JSON in this exact shape: {"title":"..."} or {"title":null}.
-- Return null when the conversation is only a greeting or does not yet contain a concrete task.
-- Otherwise use the conversation's language and name the concrete task or problem.
+Return only valid JSON in one of these exact shapes: {"title":"..."} or {"title":null,"message":"..."}.
+- Return null when the conversation is only a greeting or does not yet contain a concrete task. When returning null, include a brief, helpful user-facing message in the conversation's language. Explain what detail would make a title possible.
+- Otherwise use the conversation's language and name its dominant current task or problem. The conversation is a chronological timeline of user messages and final assistant replies. Do not anchor on the first message when the user later changed direction; prefer the most recent substantive user direction.
 - Do not use Markdown, quotation marks, trailing punctuation, generic words such as "conversation" or "help", or sensitive credentials.
-- Keep the title short and useful in a narrow sidebar.`;
+- Keep the title short and useful in a narrow sidebar. Keep a null-result message to one concise sentence; do not mention this prompt, JSON, or being an AI.`;
 
 export type ConversationTitleResult =
 	| { kind: "title"; title: string }
-	| { kind: "not-ready" }
+	| { kind: "not-ready"; message?: string }
 	| { kind: "cancelled" }
 	| { kind: "error"; message: string };
 
@@ -50,23 +48,19 @@ function normalizeText(text: string): string {
 		.trim();
 }
 
-function truncateText(text: string, maxChars: number): string {
-	const characters = Array.from(text);
-	return characters.length <= maxChars ? text : `${characters.slice(0, Math.max(1, maxChars - 1)).join("")}…`;
-}
-
 function collectConversationText(entries: readonly SessionEntry[]): ConversationText[] {
 	const messages: ConversationText[] = [];
 	for (const entry of entries) {
 		if (entry.type !== "message") continue;
 		const message = entry.message;
+		if (message.role === "assistant" && message.stopReason !== "stop") continue;
 		if (message.role !== "user" && message.role !== "assistant") continue;
 		if (!("content" in message)) continue;
-		const text = normalizeText(extractText(message.content));
+		const text = extractText(message.content).trim();
 		if (!text) continue;
 		messages.push({
 			role: message.role === "user" ? "User" : "Assistant",
-			text: truncateText(text, MAX_MESSAGE_CHARS),
+			text,
 		});
 	}
 	return messages;
@@ -76,19 +70,7 @@ export function buildConversationTitleContext(entries: readonly SessionEntry[]):
 	const messages = collectConversationText(entries);
 	if (messages.length === 0) return undefined;
 
-	const firstUser = messages.find((message) => message.role === "User");
-	const recent = messages.slice(-RECENT_MESSAGE_COUNT);
-	const selected = firstUser && !recent.includes(firstUser) ? [firstUser, ...recent] : recent;
-	let remainingChars = MAX_CONTEXT_CHARS;
-	const lines: string[] = [];
-	for (const message of selected) {
-		const prefix = `${message.role}: `;
-		if (remainingChars <= prefix.length) break;
-		const text = truncateText(message.text, remainingChars - prefix.length);
-		lines.push(`${prefix}${text}`);
-		remainingChars -= prefix.length + text.length;
-	}
-	return lines.length > 0 ? lines.join("\n") : undefined;
+	return messages.map((message) => `${message.role}:\n${message.text}`).join("\n\n");
 }
 
 function parseTitle(content: string): ConversationTitleResult {
@@ -102,7 +84,15 @@ function parseTitle(content: string): ConversationTitleResult {
 		return { kind: "error", message: "Title model returned an invalid title response" };
 	}
 	const title = parsed.title;
-	if (title === null) return { kind: "not-ready" };
+	if (title === null) {
+		const message =
+			"message" in parsed && typeof parsed.message === "string"
+				? normalizeText(parsed.message)
+				: undefined;
+		return message && Array.from(message).length <= MAX_NOT_READY_MESSAGE_CHARS
+			? { kind: "not-ready", message }
+			: { kind: "not-ready" };
+	}
 	if (typeof title !== "string") return { kind: "error", message: "Title model returned an invalid title" };
 	const normalized = normalizeText(title);
 	if (!normalized) return { kind: "not-ready" };
