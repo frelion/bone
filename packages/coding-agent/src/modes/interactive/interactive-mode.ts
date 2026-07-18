@@ -109,6 +109,7 @@ import { BranchSummaryMessageComponent } from "./components/branch-summary-messa
 import { ChatHistoryFocus } from "./components/chat-history-focus.ts";
 import { ChatScrollLayout } from "./components/chat-scroll-layout.ts";
 import { ChatTextSelectionController } from "./components/chat-text-selection-controller.ts";
+import { KineticScrollController } from "./components/kinetic-scroll-controller.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
@@ -346,6 +347,8 @@ export class InteractiveMode {
 	private mouseScrollUnsubscribe: (() => void) | undefined;
 	private mouseTextSelectionUnsubscribe: (() => void) | undefined;
 	private chatTextSelection!: ChatTextSelectionController;
+	private mouseScrollTimer: NodeJS.Timeout | undefined;
+	private readonly kineticMouseScroll = new KineticScrollController();
 	private pendingUserInputs: string[] = [];
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private readonly parkedStatusIndicators = new Map<AgentSessionRuntime, StatusIndicator>();
@@ -463,6 +466,7 @@ export class InteractiveMode {
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.sessionHost.setHooks({
 			beforeForegroundChange: async (runtime) => {
+				this.cancelMouseScroll();
 				this.unsubscribe?.();
 				this.unsubscribe = undefined;
 				this.saveConversationScrollOffset(runtime);
@@ -528,7 +532,7 @@ export class InteractiveMode {
 		this.chatHistoryFocus.onFocusComposer = () => {
 			this.paneFocus.focus("chat");
 		};
-		this.chatHistoryFocus.onScroll = (direction) => this.scrollChat(direction);
+		this.chatHistoryFocus.onScroll = (direction, granularity) => this.scrollChat(direction, granularity);
 		this.chatHistoryFocus.onInterrupt = () => this.handleCtrlC();
 		this.chatHistoryFocus.onExit = () => this.handleCtrlD();
 		this.editorContainer = new Container();
@@ -5104,8 +5108,8 @@ export class InteractiveMode {
 		if (id === "chat") return;
 		const text =
 			id === "sidebar"
-				? "Focus · Side  ↑↓ select · Enter open · d delete · Shift+→ conversation"
-				: "Focus · Conversation history  ↑↓ scroll · Shift+↓ composer · Shift+← Side";
+					? "Focus · Side  ↑↓ select · Enter open · d delete · Shift+→ conversation"
+					: "Focus · Conversation history  ↑↓ line · PgUp/PgDn page · Shift+↓ composer · Shift+← Side";
 		this.focusHintContainer.addChild(new Text(theme.fg("accent", text), 0, 0));
 		if (this.isInitialized) this.ui.requestRender();
 	}
@@ -5128,9 +5132,52 @@ export class InteractiveMode {
 		this.chatScrollLayout.setScrollOffset(offset ?? 0);
 	}
 
-	private scrollChat(direction: "up" | "down"): void {
-		if (this.chatScrollLayout.scrollPage(direction)) {
+	private scrollChat(direction: "up" | "down", granularity: "line" | "page" = "page"): void {
+		this.cancelMouseScroll();
+		const scrolled =
+			granularity === "line"
+				? this.chatScrollLayout.scrollLines(direction)
+				: this.chatScrollLayout.scrollPage(direction);
+		if (scrolled) {
 			this.ui.requestRender();
+		}
+	}
+
+	private enqueueMouseScroll(direction: "up" | "down"): void {
+		const immediateStep = this.kineticMouseScroll.receive(direction, performance.now());
+		if (this.chatScrollLayout.scrollLines(immediateStep.direction, immediateStep.lineCount)) {
+			this.ui.requestRender();
+		} else {
+			this.cancelMouseScroll();
+			return;
+		}
+		if (this.kineticMouseScroll.active) this.scheduleMouseScroll(16);
+	}
+
+	private scheduleMouseScroll(delayMs: number): void {
+		if (this.mouseScrollTimer) return;
+		this.mouseScrollTimer = setTimeout(() => {
+			this.mouseScrollTimer = undefined;
+			this.drainMouseScroll();
+		}, delayMs);
+	}
+
+	private drainMouseScroll(): void {
+		const step = this.kineticMouseScroll.advance(performance.now());
+		if (step && this.chatScrollLayout.scrollLines(step.direction, step.lineCount)) {
+			this.ui.requestRender();
+		} else if (step) {
+			this.cancelMouseScroll();
+			return;
+		}
+		if (this.kineticMouseScroll.active) this.scheduleMouseScroll(16);
+	}
+
+	private cancelMouseScroll(): void {
+		this.kineticMouseScroll.cancel();
+		if (this.mouseScrollTimer) {
+			clearTimeout(this.mouseScrollTimer);
+			this.mouseScrollTimer = undefined;
 		}
 	}
 
@@ -5141,10 +5188,11 @@ export class InteractiveMode {
 		// left the terminal in that mode.
 		this.ui.terminal.write("\x1b[?1000l\x1b[?1002h\x1b[?1006h");
 		this.mouseScrollUnsubscribe = this.ui.addInputListener((data) => {
+			if (this.ui.hasOverlay()) return;
 			const direction = this.getMouseScrollDirection(data);
 			if (!direction) return;
 
-			this.scrollChat(direction);
+			this.enqueueMouseScroll(direction);
 			return { consume: true };
 		});
 	}
@@ -5155,6 +5203,11 @@ export class InteractiveMode {
 			getBounds: () => this.getChatTextSelectionBounds(),
 			isBlocked: () => this.ui.hasOverlay(),
 			onRender: () => this.ui.requestRender(),
+			onSelectionStart: () => this.cancelMouseScroll(),
+			onAutoScroll: (direction) => {
+				this.cancelMouseScroll();
+				return this.chatScrollLayout.scrollLines(direction);
+			},
 			onCopy: copyToClipboard,
 			onCopied: (characterCount) =>
 				this.showStatus(`Copied ${characterCount} character${characterCount === 1 ? "" : "s"}`),
@@ -5992,7 +6045,7 @@ export class InteractiveMode {
 					return;
 				}
 			}
-			await this.generateConversationName();
+			await this.generateConversationName(currentName);
 			return;
 		}
 
@@ -6008,7 +6061,7 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private async generateConversationName(): Promise<void> {
+	private async generateConversationName(previousName: string | undefined): Promise<void> {
 		let resolved: Awaited<ReturnType<typeof resolveTaskModel>>;
 		try {
 			resolved = await resolveTaskModel("title", {
@@ -6030,7 +6083,12 @@ export class InteractiveMode {
 			return;
 		}
 		if (result.kind === "not-ready") {
-			this.showWarning("Conversation needs more concrete task detail before it can be named");
+			const fallback = "No title suggested yet — describe a task, then run /name again.";
+			this.showStatus(
+				previousName
+					? `${result.message ?? fallback} Kept "${previousName}".`
+					: (result.message ?? fallback),
+			);
 			return;
 		}
 		if (result.kind === "cancelled") {
@@ -6438,6 +6496,7 @@ export class InteractiveMode {
 		}
 		this.clearStatusIndicator();
 		this.disposeAllParkedStatusIndicators();
+		this.cancelMouseScroll();
 		this.chatTextSelection?.cancel();
 		this.mouseScrollUnsubscribe?.();
 		this.mouseScrollUnsubscribe = undefined;

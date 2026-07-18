@@ -23,6 +23,8 @@ type ChatTextSelectionControllerOptions = {
 	getBounds: () => ChatTextSelectionBounds;
 	isBlocked: () => boolean;
 	onRender: () => void;
+	onSelectionStart?: () => void;
+	onAutoScroll?: (direction: "up" | "down") => boolean;
 	onCopy: (text: string) => Promise<void>;
 	onCopied: (characterCount: number) => void;
 	onCopyError: (error: unknown) => void;
@@ -53,26 +55,34 @@ function parseSgrMouseEvent(data: string): SgrMouseEvent | undefined {
  * for wheel support, so native terminal selection cannot coexist reliably.
  */
 export class ChatTextSelectionController {
+	private static readonly AUTO_SCROLL_INTERVAL_MS = 40;
 	private readonly layout: ChatScrollLayout;
 	private readonly getBounds: () => ChatTextSelectionBounds;
 	private readonly isBlocked: () => boolean;
 	private readonly onRender: () => void;
+	private readonly onSelectionStart: (() => void) | undefined;
+	private readonly onAutoScroll: ((direction: "up" | "down") => boolean) | undefined;
 	private readonly onCopy: (text: string) => Promise<void>;
 	private readonly onCopied: (characterCount: number) => void;
 	private readonly onCopyError: (error: unknown) => void;
+	private autoScrollTimer: NodeJS.Timeout | undefined;
+	private autoScrollDirection: "up" | "down" | undefined;
+	private lastDragEvent: SgrMouseEvent | undefined;
 
 	constructor(options: ChatTextSelectionControllerOptions) {
 		this.layout = options.layout;
 		this.getBounds = options.getBounds;
 		this.isBlocked = options.isBlocked;
 		this.onRender = options.onRender;
+		this.onSelectionStart = options.onSelectionStart;
+		this.onAutoScroll = options.onAutoScroll;
 		this.onCopy = options.onCopy;
 		this.onCopied = options.onCopied;
 		this.onCopyError = options.onCopyError;
 	}
 
 	handleInput(data: string): InputListenerResult {
-		if (data === "\x1b" && this.layout.cancelTextSelection()) {
+		if (data === "\x1b" && this.cancelSelection()) {
 			this.onRender();
 			return { consume: true };
 		}
@@ -82,7 +92,7 @@ export class ChatTextSelectionController {
 		if (event.isWheel) return undefined;
 
 		if (this.isBlocked()) {
-			if (this.layout.cancelTextSelection()) this.onRender();
+			if (this.cancelSelection()) this.onRender();
 			return { consume: true };
 		}
 
@@ -90,6 +100,8 @@ export class ChatTextSelectionController {
 		if (!event.isRelease && !event.isMotion && leftButton) {
 			const point = this.toInitialPoint(event);
 			if (point) {
+				this.stopAutoScroll();
+				this.onSelectionStart?.();
 				this.layout.beginTextSelection(point.row, point.column);
 				this.onRender();
 			}
@@ -97,15 +109,18 @@ export class ChatTextSelectionController {
 		}
 
 		if (event.isMotion && this.layout.textSelection.active) {
+			this.lastDragEvent = event;
 			const point = this.toDraggedPoint(event);
 			if (point) {
 				this.layout.updateTextSelection(point.row, point.column);
-				this.onRender();
 			}
+			this.updateAutoScroll(event);
+			this.onRender();
 			return { consume: true };
 		}
 
 		if (event.isRelease && this.layout.textSelection.active) {
+			this.stopAutoScroll();
 			const point = this.toDraggedPoint(event);
 			if (point) this.layout.updateTextSelection(point.row, point.column);
 			const text = this.layout.finishTextSelection();
@@ -118,7 +133,60 @@ export class ChatTextSelectionController {
 	}
 
 	cancel(): void {
-		if (this.layout.cancelTextSelection()) this.onRender();
+		if (this.cancelSelection()) this.onRender();
+	}
+
+	private updateAutoScroll(event: SgrMouseEvent): void {
+		const bounds = this.getBounds();
+		const y = event.row - 1;
+		// Terminals clamp mouse coordinates at the top edge to row 1, so a drag
+		// cannot report a value above the screen. Treat the first chat row as the
+		// upward auto-scroll edge zone; the lower edge can use the real area below
+		// the scrollable chat because the fixed composer occupies it.
+		const direction = y <= bounds.top ? "up" : y >= bounds.top + bounds.height ? "down" : undefined;
+		if (!direction) {
+			this.stopAutoScroll();
+			return;
+		}
+		if (!this.onAutoScroll) return;
+		if (this.autoScrollDirection === direction) return;
+		this.stopAutoScroll();
+		this.lastDragEvent = event;
+		this.autoScrollDirection = direction;
+		this.autoScrollSelection();
+	}
+
+	private autoScrollSelection(): void {
+		const direction = this.autoScrollDirection;
+		if (!direction || !this.layout.textSelection.active || !this.onAutoScroll) {
+			this.stopAutoScroll();
+			return;
+		}
+		if (!this.onAutoScroll(direction)) {
+			this.stopAutoScroll();
+			return;
+		}
+		const point = this.lastDragEvent ? this.toDraggedPoint(this.lastDragEvent) : undefined;
+		if (point) this.layout.updateTextSelection(point.row, point.column);
+		this.onRender();
+		this.autoScrollTimer = setTimeout(() => {
+			this.autoScrollTimer = undefined;
+			this.autoScrollSelection();
+		}, ChatTextSelectionController.AUTO_SCROLL_INTERVAL_MS);
+	}
+
+	private stopAutoScroll(): void {
+		this.autoScrollDirection = undefined;
+		this.lastDragEvent = undefined;
+		if (this.autoScrollTimer) {
+			clearTimeout(this.autoScrollTimer);
+			this.autoScrollTimer = undefined;
+		}
+	}
+
+	private cancelSelection(): boolean {
+		this.stopAutoScroll();
+		return this.layout.cancelTextSelection();
 	}
 
 	private toInitialPoint(event: SgrMouseEvent): { row: number; column: number } | undefined {

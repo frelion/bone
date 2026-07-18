@@ -71,4 +71,19 @@ describe("ChatTextSelection", () => {
 		expect(rendered[0]).toContain("first");
 		expect(layout.finishTextSelection()).toBe("first");
 	});
+
+	it("keeps selecting across chat viewports while the visible area scrolls", () => {
+		const content = new MutableComponent(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+		const layout = new ChatScrollLayout(content, new MutableComponent([]), () => 4);
+		layout.render(30);
+
+		// The initial viewport contains rows 6–9. Start from its first row,
+		// scroll upward, then extend the selection to the newly visible row 4.
+		layout.beginTextSelection(0, 0);
+		layout.scrollLines("up", 2);
+		layout.render(30);
+		layout.updateTextSelection(0, 0);
+
+		expect(layout.finishTextSelection()).toBe("4\n5\n6");
+	});
 });

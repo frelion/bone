@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatScrollLayout } from "../src/modes/interactive/components/chat-scroll-layout.ts";
 import {
 	ChatTextSelectionController,
@@ -35,6 +35,10 @@ function makeController(layout: ChatScrollLayout) {
 	return { controller, onCopy, onCopied };
 }
 
+afterEach(() => {
+	vi.useRealTimers();
+});
+
 describe("ChatTextSelectionController", () => {
 	it("parses SGR drag and wheel events", () => {
 		expect(parseSgrMouseEvent("\x1b[<0;4;2M")).toMatchObject({ button: 0, column: 4, row: 2, isRelease: false });
@@ -70,5 +74,43 @@ describe("ChatTextSelectionController", () => {
 
 		controller.handleInput("\x1b[<0;2;1M");
 		expect(layout.textSelection.active).toBe(false);
+	});
+
+	it("auto-scrolls while a drag remains above the chat viewport and stops on cancel", () => {
+		vi.useFakeTimers();
+		const layout = new ChatScrollLayout(
+			new StaticComponent(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]),
+			new StaticComponent([]),
+			() => 4,
+		);
+		layout.render(20);
+		const onAutoScroll = vi.fn((direction: "up" | "down") => {
+			const scrolled = layout.scrollLines(direction);
+			layout.render(20);
+			return scrolled;
+		});
+		const controller = new ChatTextSelectionController({
+			layout,
+			getBounds: () => ({ left: 3, top: 0, width: 20, height: layout.getVisibleContentRowCount() }),
+			isBlocked: () => false,
+			onRender: vi.fn(),
+			onAutoScroll,
+			onCopy: async () => {},
+			onCopied: vi.fn(),
+			onCopyError: vi.fn(),
+		});
+
+		controller.handleInput("\x1b[<0;5;4M");
+		// A real terminal clamps a pointer above the top edge to row 1.
+		controller.handleInput("\x1b[<32;5;1M");
+		vi.advanceTimersByTime(120);
+
+		expect(onAutoScroll).toHaveBeenCalledWith("up");
+		expect(layout.getScrollOffset()).toBeGreaterThan(1);
+
+		controller.cancel();
+		const callsAfterCancel = onAutoScroll.mock.calls.length;
+		vi.advanceTimersByTime(200);
+		expect(onAutoScroll).toHaveBeenCalledTimes(callsAfterCancel);
 	});
 });

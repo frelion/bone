@@ -1,5 +1,7 @@
 import { type Component, type Focusable, getKeybindings } from "@earendil-works/pi-tui";
 
+export type ChatHistoryScrollGranularity = "line" | "page";
+
 /**
  * Focus target for the read-only conversation transcript.
  *
@@ -12,7 +14,7 @@ export class ChatHistoryFocus implements Component, Focusable {
 	focused = false;
 	public onFocusSidebar?: () => void;
 	public onFocusComposer?: () => void;
-	public onScroll?: (direction: "up" | "down") => void;
+	public onScroll?: (direction: "up" | "down", granularity: ChatHistoryScrollGranularity) => void;
 	/** Keep application-level quit/interrupt behavior available while history owns focus. */
 	public onInterrupt?: () => void;
 	public onExit?: () => void;
@@ -41,12 +43,20 @@ export class ChatHistoryFocus implements Component, Focusable {
 			this.onFocusComposer?.();
 			return;
 		}
-		if (keybindings.matches(data, "tui.select.up") || keybindings.matches(data, "tui.select.pageUp")) {
-			this.onScroll?.("up");
+		if (keybindings.matches(data, "tui.select.up")) {
+			this.onScroll?.("up", "line");
 			return;
 		}
-		if (keybindings.matches(data, "tui.select.down") || keybindings.matches(data, "tui.select.pageDown")) {
-			this.onScroll?.("down");
+		if (keybindings.matches(data, "tui.select.down")) {
+			this.onScroll?.("down", "line");
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.pageUp")) {
+			this.onScroll?.("up", "page");
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.pageDown")) {
+			this.onScroll?.("down", "page");
 		}
 	}
 }

@@ -281,4 +281,20 @@ describe("SplitPane", () => {
 		expect(layout.getScrollOffset()).toBe(savedOffset);
 		expect(restoredLines.join("\n")).toContain("4");
 	});
+
+	it("supports small line-by-line chat scrolling without changing page behavior", () => {
+		const layout = new ChatScrollLayout(
+			new StaticComponent(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]),
+			new StaticComponent(["Composer"]),
+			() => 5,
+		);
+
+		layout.render(40);
+		expect(layout.scrollLines("up")).toBe(true);
+		expect(layout.getScrollOffset()).toBe(1);
+		expect(layout.render(40).map(stripVTControlCharacters).join("\n")).toContain("5");
+
+		expect(layout.scrollPage("up")).toBe(true);
+		expect(layout.getScrollOffset()).toBe(4);
+	});
 });
