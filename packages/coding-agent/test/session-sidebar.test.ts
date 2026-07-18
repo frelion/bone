@@ -218,6 +218,48 @@ describe("SessionSidebar", () => {
 		expect(formatConversationCreatedTime(new Date(2026, 6, 17, 9, 41), now)).toBe("created 09:41");
 		expect(formatConversationCreatedTime(new Date(2026, 6, 14, 9, 41), now)).toBe("created Jul 14");
 	});
+
+	it("provides a Side-local search interaction with explainable result rows", () => {
+		const sidebar = new SessionSidebar();
+		const queryChanges = vi.fn();
+		const activateSession = vi.fn();
+		const stateChanges = vi.fn();
+		sidebar.onSearchQueryChange = queryChanges;
+		sidebar.onActivateSession = activateSession;
+		sidebar.onSearchStateChange = stateChanges;
+		sidebar.setSessions([makeSession("a", "foreground"), makeSession("b", "cold")]);
+
+		sidebar.handleInput("/");
+		expect(sidebar.searchActive).toBe(true);
+		expect(stateChanges).toHaveBeenLastCalledWith(true);
+		expect(stripVTControlCharacters(sidebar.render(42).join("\n"))).toContain("Search conversations");
+
+		sidebar.handleInput("semantic cache");
+		expect(sidebar.searchQuery).toBe("semantic cache");
+		expect(queryChanges).toHaveBeenLastCalledWith("semantic cache");
+
+		sidebar.setSearchResults([
+			{
+				sessionPath: "/sessions/b.jsonl",
+				score: 1,
+				evidence: { kind: "user", label: "You", snippet: "semantic cache implementation" },
+			},
+		]);
+		const resultOutput = stripVTControlCharacters(sidebar.render(42).join("\n"));
+		expect(resultOutput).toContain("Session b");
+		expect(resultOutput).not.toContain("Session a");
+
+		expect(resultOutput).toContain("semantic cache implementation");
+		sidebar.handleInput("\r");
+		expect(activateSession).toHaveBeenCalledWith("/sessions/b.jsonl");
+
+		sidebar.handleInput("\x1b");
+		expect(sidebar.searchQuery).toBe("");
+		expect(sidebar.searchActive).toBe(true);
+		sidebar.handleInput("\x1b");
+		expect(sidebar.searchActive).toBe(false);
+		expect(stateChanges).toHaveBeenLastCalledWith(false);
+	});
 });
 
 describe("SplitPane", () => {

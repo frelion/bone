@@ -74,8 +74,9 @@ import type {
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher } from "../../core/http-dispatcher.ts";
-import type { InteractiveSessionHost } from "../../core/interactive-session-host.ts";
+import type { InteractiveSessionHost, InteractiveSessionSummary } from "../../core/interactive-session-host.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
+import type { LocalEmbeddingStatus } from "../../core/local-embedding.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import { ModelConfig, type ModelsJson } from "../../core/model-config.ts";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.ts";
@@ -84,6 +85,7 @@ import { discoverOpenAICompatibleModelIds, type OpenAICompatibleApi } from "../.
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import { type SessionEntry, sessionEntryToContextMessages } from "../../core/session-manager.ts";
+import { SessionSearchService } from "../../core/session-search.ts";
 import { InMemorySettingsStorage, SettingsManager } from "../../core/settings-manager.ts";
 import { SettingsTransactionJournal } from "../../core/settings-transaction-journal.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
@@ -109,7 +111,6 @@ import { BranchSummaryMessageComponent } from "./components/branch-summary-messa
 import { ChatHistoryFocus } from "./components/chat-history-focus.ts";
 import { ChatScrollLayout } from "./components/chat-scroll-layout.ts";
 import { ChatTextSelectionController } from "./components/chat-text-selection-controller.ts";
-import { KineticScrollController } from "./components/kinetic-scroll-controller.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
@@ -122,6 +123,7 @@ import { ExtensionInputComponent } from "./components/extension-input.ts";
 import { ExtensionSelectorComponent } from "./components/extension-selector.ts";
 import { FooterComponent, formatTokens } from "./components/footer.ts";
 import { formatKeyText, keyDisplayText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.ts";
+import { KineticScrollController } from "./components/kinetic-scroll-controller.ts";
 import { LoginDialogComponent } from "./components/login-dialog.ts";
 import { ModelSelectorComponent } from "./components/model-selector.ts";
 import { ModelTaskSelectorComponent } from "./components/model-task-selector.ts";
@@ -325,6 +327,11 @@ export class InteractiveMode {
 	private chatScrollLayout: ChatScrollLayout;
 	private chatHistoryFocus: ChatHistoryFocus;
 	private sessionSidebar: SessionSidebar;
+	private readonly sessionSearch: SessionSearchService;
+	private sidebarSessions: InteractiveSessionSummary[] = [];
+	private sessionSearchTimer: NodeJS.Timeout | undefined;
+	private semanticSearchTimer: NodeJS.Timeout | undefined;
+	private sessionSearchGeneration = 0;
 	private loadedResourcesContainer: Container;
 	private chatContainer: Container;
 	private pendingMessagesContainer: Container;
@@ -498,6 +505,14 @@ export class InteractiveMode {
 		);
 		this.chatHistoryFocus = new ChatHistoryFocus();
 		this.sessionSidebar = new SessionSidebar();
+		this.sessionSearch = new SessionSearchService({
+			agentDir: this.sessionHost.current.services.agentDir,
+			cwd: this.sessionHost.current.session.sessionManager.getCwd(),
+			onSemanticStatus: (status) => {
+				this.sessionSidebar.setSearchStatus(this.formatSemanticSearchStatus(status));
+				this.ui.requestRender();
+			},
+		});
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
 		this.chatContainer = new Container();
@@ -522,6 +537,8 @@ export class InteractiveMode {
 		this.sessionSidebar.onActivateSession = (sessionPath) => void this.activateSidebarSession(sessionPath);
 		this.sessionSidebar.onDeleteSession = (sessionPath, replacementPath) =>
 			void this.deleteSidebarSession(sessionPath, replacementPath);
+		this.sessionSidebar.onSearchQueryChange = (query) => this.scheduleSidebarSearch(query);
+		this.sessionSidebar.onSearchStateChange = () => this.renderPaneFocusHint("sidebar");
 		this.sessionSidebar.onFocusChat = () => {
 			this.paneFocus.focus("chat");
 		};
@@ -3039,6 +3056,7 @@ export class InteractiveMode {
 				break;
 
 			case "session_info_changed":
+				this.sessionSearch.invalidate();
 				this.updateTerminalTitle();
 				this.footer.invalidate();
 				await this.refreshSessionSidebar();
@@ -3083,6 +3101,7 @@ export class InteractiveMode {
 				break;
 
 			case "message_end":
+				this.sessionSearch.invalidate();
 				if (event.message.role === "user") {
 					await this.refreshSessionSidebar();
 					break;
@@ -5060,10 +5079,16 @@ export class InteractiveMode {
 
 	private async refreshSessionSidebar(): Promise<void> {
 		try {
-			this.sessionSidebar.setSessions(await this.sessionHost.list());
+			this.sidebarSessions = await this.sessionHost.list();
+			this.sessionSidebar.setSessions(this.sidebarSessions);
+			const query = this.sessionSidebar.searchQuery;
+			if (query?.trim()) this.scheduleSidebarSearch(query, 0);
 			this.ui.requestRender();
-		} catch {
-			// The chat remains usable if a session directory cannot be read.
+		} catch (error) {
+			// A blank Side is indistinguishable from an empty workspace. Preserve the
+			// chat, but surface the actionable reason instead of swallowing it.
+			const message = error instanceof Error ? error.message : String(error);
+			this.showStatus(`Unable to refresh conversations: ${message}`);
 		}
 	}
 
@@ -5076,6 +5101,7 @@ export class InteractiveMode {
 		const restoreSidebarFocus = this.sessionSidebar.focused;
 		try {
 			const result = await this.sessionHost.deleteSession(sessionPath, replacementPath);
+			await this.sessionSearch.remove(sessionPath);
 			await this.refreshSessionSidebar();
 			this.sessionSidebar.setStatusMessage(
 				result.method === "system-trash"
@@ -5093,6 +5119,73 @@ export class InteractiveMode {
 		}
 	}
 
+	private scheduleSidebarSearch(query: string, delay = 80): void {
+		if (this.sessionSearchTimer) {
+			clearTimeout(this.sessionSearchTimer);
+			this.sessionSearchTimer = undefined;
+		}
+		if (this.semanticSearchTimer) {
+			clearTimeout(this.semanticSearchTimer);
+			this.semanticSearchTimer = undefined;
+		}
+		const generation = ++this.sessionSearchGeneration;
+		if (!query.trim()) {
+			this.sessionSidebar.setSearchResults(undefined);
+			this.sessionSidebar.setSearchStatus(undefined);
+			this.ui.requestRender();
+			return;
+		}
+		this.sessionSearchTimer = setTimeout(() => {
+			void this.runSidebarSearch(query, generation);
+		}, delay);
+		this.semanticSearchTimer = setTimeout(() => {
+			this.sessionSidebar.setSearchStatus("Local semantic search · preparing model…");
+			this.ui.requestRender();
+			void this.runSemanticSidebarSearch(query, generation);
+		}, 250);
+	}
+
+	private async runSidebarSearch(query: string, generation: number): Promise<void> {
+		try {
+			const results = await this.sessionSearch.search(query, this.sidebarSessions);
+			if (generation !== this.sessionSearchGeneration || query !== this.sessionSidebar.searchQuery) return;
+			this.sessionSidebar.setSearchResults(results);
+			this.ui.requestRender();
+		} catch {
+			if (generation !== this.sessionSearchGeneration) return;
+			this.sessionSidebar.setSearchResults([]);
+			this.ui.requestRender();
+		}
+	}
+
+	private async runSemanticSidebarSearch(query: string, generation: number): Promise<void> {
+		try {
+			const results = await this.sessionSearch.searchSemantic(query, this.sidebarSessions);
+			if (generation !== this.sessionSearchGeneration || query !== this.sessionSidebar.searchQuery) return;
+			this.sessionSidebar.setSearchResults(results);
+			this.sessionSidebar.setSearchStatus(undefined);
+			this.ui.requestRender();
+		} catch {
+			// The lexical result remains usable when the local model is offline, downloading, or unavailable.
+			if (generation === this.sessionSearchGeneration) {
+				this.sessionSidebar.setSearchStatus("Local semantic search unavailable · lexical results shown");
+				this.ui.requestRender();
+			}
+		}
+	}
+
+	private formatSemanticSearchStatus(status: LocalEmbeddingStatus | undefined): string | undefined {
+		if (!status) return undefined;
+		if (status.phase === "ready") return "Local semantic search · updating results…";
+		if (status.phase === "loading") return "Local semantic search · loading local model…";
+		if (!status.totalBytes || status.totalBytes <= 0 || status.loadedBytes === undefined) {
+			return "Local semantic search · downloading model…";
+		}
+		const percent = Math.min(100, Math.floor((status.loadedBytes / status.totalBytes) * 100));
+		const file = status.file ? ` · ${path.basename(status.file)}` : "";
+		return `Local semantic search · downloading ${percent}%${file}`;
+	}
+
 	private focusSidebar(): void {
 		// Match SplitPane's layout threshold. A hidden Side must never become an
 		// invisible keyboard trap on a narrow terminal.
@@ -5100,6 +5193,10 @@ export class InteractiveMode {
 			this.showStatus("Side is hidden at this terminal width; widen the terminal to focus conversations.");
 			return;
 		}
+		// The Side is an independently navigable surface. Refresh on entry so a
+		// just-persisted or background conversation never requires a restart or
+		// unrelated lifecycle event before it becomes visible.
+		void this.refreshSessionSidebar();
 		this.paneFocus.focus("sidebar");
 	}
 
@@ -5108,8 +5205,10 @@ export class InteractiveMode {
 		if (id === "chat") return;
 		const text =
 			id === "sidebar"
-					? "Focus · Side  ↑↓ select · Enter open · d delete · Shift+→ conversation"
-					: "Focus · Conversation history  ↑↓ line · PgUp/PgDn page · Shift+↓ composer · Shift+← Side";
+				? this.sessionSidebar.searchActive
+					? "Search · Type query · ↑↓ select · Enter open · Esc clear/close · Shift+→ conversation"
+					: "Focus · Side  ↑↓ select · Enter open · / search · d delete · Shift+→ conversation"
+				: "Focus · Conversation history  ↑↓ line · PgUp/PgDn page · Shift+↓ composer · Shift+← Side";
 		this.focusHintContainer.addChild(new Text(theme.fg("accent", text), 0, 0));
 		if (this.isInitialized) this.ui.requestRender();
 	}
@@ -6085,9 +6184,7 @@ export class InteractiveMode {
 		if (result.kind === "not-ready") {
 			const fallback = "No title suggested yet — describe a task, then run /name again.";
 			this.showStatus(
-				previousName
-					? `${result.message ?? fallback} Kept "${previousName}".`
-					: (result.message ?? fallback),
+				previousName ? `${result.message ?? fallback} Kept "${previousName}".` : (result.message ?? fallback),
 			);
 			return;
 		}
@@ -6491,6 +6588,9 @@ export class InteractiveMode {
 	}
 
 	stop(): void {
+		if (this.sessionSearchTimer) clearTimeout(this.sessionSearchTimer);
+		if (this.semanticSearchTimer) clearTimeout(this.semanticSearchTimer);
+		void this.sessionSearch.dispose();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
 		}

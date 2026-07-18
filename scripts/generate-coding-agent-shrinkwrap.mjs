@@ -12,7 +12,12 @@ const shrinkwrapPath = join(codingAgentDir, "npm-shrinkwrap.json");
 const internalPackagePrefix = "@earendil-works/pi-";
 const allowedInstallScriptPackages = new Map([
 	["@google/genai@1.52.0", "preinstall is a no-op in the published package"],
+	[
+		"onnxruntime-node@1.19.2",
+		"postinstall only fetches optional Linux CUDA providers; Bone installs with --ignore-scripts and uses the bundled CPU N-API binary",
+	],
 	["protobufjs@7.6.4", "postinstall only warns about protobufjs version scheme mismatches"],
+	["sharp@0.33.5", "install only checks optional libvips/source-build availability; Transformers.js does not invoke image processing for text embeddings"],
 ]);
 
 const args = new Set(process.argv.slice(2));

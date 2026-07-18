@@ -48,6 +48,7 @@ export interface AppKeybindings {
 	"app.session.delete": true;
 	"app.session.deleteNoninvasive": true;
 	"app.session.deleteFromSidebar": true;
+	"app.session.searchFromSidebar": true;
 	"app.models.save": true;
 	"app.models.enableAll": true;
 	"app.models.clearAll": true;
@@ -181,6 +182,10 @@ export const KEYBINDINGS = {
 	"app.session.deleteFromSidebar": {
 		defaultKeys: "d",
 		description: "Delete selected conversation from Side",
+	},
+	"app.session.searchFromSidebar": {
+		defaultKeys: "/",
+		description: "Search conversations from Side",
 	},
 	"app.models.save": {
 		defaultKeys: "ctrl+s",

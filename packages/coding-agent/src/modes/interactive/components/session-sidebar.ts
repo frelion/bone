@@ -2,11 +2,13 @@ import {
 	type Component,
 	type Focusable,
 	getKeybindings,
+	Input,
 	sliceByColumn,
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { InteractiveSessionSummary } from "../../../core/interactive-session-host.ts";
+import type { SessionSearchResult } from "../../../core/session-search.ts";
 import { theme } from "../theme/theme.ts";
 
 const STATE_ICON: Record<InteractiveSessionSummary["state"], string> = {
@@ -95,26 +97,84 @@ export class SessionSidebar implements Component, Focusable {
 	private selectedPath: string | undefined;
 	private viewportRows = Number.POSITIVE_INFINITY;
 	private itemState: SidebarItemState = { kind: "normal" };
+	private searchInput: Input | undefined;
+	private searchResults: readonly SessionSearchResult[] | undefined;
+	private searchStatus: string | undefined;
 	focused = false;
 	public onActivateSession?: (sessionPath: string) => void;
 	public onDeleteSession?: (sessionPath: string, replacementPath: string | undefined) => void;
+	/** Called as the user edits the Side search query. Search execution is provided by the host. */
+	public onSearchQueryChange?: (query: string) => void;
+	/** Called when the user submits a non-empty Side search query. */
+	public onSearchSubmit?: (query: string) => void;
+	public onSearchStateChange?: (active: boolean) => void;
 	public onFocusChat?: () => void;
 	public onScrollChat?: (direction: "up" | "down") => void;
 	/** Keep application-level quit/interrupt behavior available while Side owns focus. */
 	public onInterrupt?: () => void;
 	public onExit?: () => void;
 
+	get searchActive(): boolean {
+		return this.searchInput !== undefined;
+	}
+
+	get searchQuery(): string | undefined {
+		return this.searchInput?.getValue();
+	}
+
 	setSessions(sessions: InteractiveSessionSummary[]): void {
-		const previousPath = this.sessions[this.selectedIndex]?.path ?? this.selectedPath;
 		this.sessions = sessions;
-		const selectedIndex = sessions.findIndex((session) => session.path === previousPath);
-		const foregroundIndex = sessions.findIndex((session) => session.state === "foreground");
-		this.selectedIndex = selectedIndex >= 0 ? selectedIndex : Math.max(0, foregroundIndex);
-		this.selectedPath = sessions[this.selectedIndex]?.path;
+		this.reconcileSelection();
 		const itemState = this.itemState;
 		if (itemState.kind !== "normal" && !sessions.some((session) => session.path === itemState.path)) {
 			this.itemState = { kind: "normal" };
 		}
+	}
+
+	/** Replace the visible session order with ranked, explainable search results. */
+	setSearchResults(results: readonly SessionSearchResult[] | undefined): void {
+		if (!this.searchInput) return;
+		this.searchResults = results;
+		this.reconcileSelection();
+	}
+
+	/** Render local indexing and model-download progress independently from a session row. */
+	setSearchStatus(status: string | undefined): void {
+		this.searchStatus = status;
+	}
+
+	startSearch(): void {
+		if (this.searchInput) return;
+		this.itemState = { kind: "normal" };
+		this.searchResults = undefined;
+		this.searchStatus = undefined;
+		this.searchInput = new Input();
+		this.searchInput.focused = true;
+		this.searchInput.onEscape = () => {
+			if (this.searchInput?.getValue()) {
+				this.searchInput.setValue("");
+				this.searchResults = undefined;
+				this.reconcileSelection();
+				return;
+			}
+			this.stopSearch();
+		};
+		this.searchInput.onSubmit = (query) => {
+			if (query.trim()) this.onSearchSubmit?.(query);
+		};
+		this.onSearchQueryChange?.("");
+		this.onSearchStateChange?.(true);
+	}
+
+	stopSearch(): void {
+		if (!this.searchInput) return;
+		this.searchInput.focused = false;
+		this.searchInput = undefined;
+		this.searchResults = undefined;
+		this.searchStatus = undefined;
+		this.reconcileSelection();
+		this.onSearchQueryChange?.("");
+		this.onSearchStateChange?.(false);
 	}
 
 	setViewportRows(rows: number): void {
@@ -122,7 +182,7 @@ export class SessionSidebar implements Component, Focusable {
 	}
 
 	setStatusMessage(message: string | undefined, tone: "success" | "error" = "success"): void {
-		const selected = this.sessions[this.selectedIndex];
+		const selected = this.getDisplayedSessions()[this.selectedIndex];
 		this.itemState =
 			message && selected ? { kind: "status", path: selected.path, tone, message } : { kind: "normal" };
 	}
@@ -131,6 +191,7 @@ export class SessionSidebar implements Component, Focusable {
 
 	render(width: number): string[] {
 		const viewportRows = Number.isFinite(this.viewportRows) ? Math.max(1, this.viewportRows) : undefined;
+		const displayedSessions = this.getDisplayedSessions();
 		const lines: string[] = [];
 		const addSidebarLine = (line = "", selected = false) => {
 			const truncated = truncateToWidth(line, width, "…");
@@ -141,13 +202,18 @@ export class SessionSidebar implements Component, Focusable {
 			addSidebarLine(theme.fg("borderMuted", `  ${"┄".repeat(Math.max(1, width - 4))}`));
 		};
 
-		const header = "Conversations";
-		const count = String(this.sessions.length);
+		const header = this.searchInput ? "Search conversations" : "Conversations";
+		const count = String(displayedSessions.length);
 		const headerGap = " ".repeat(Math.max(1, width - visibleWidth(header) - visibleWidth(count) - 2));
 		addSidebarLine(` ${theme.bold(theme.fg("accent", header))}${headerGap}${theme.fg("dim", count)}`);
-		if (this.sessions.length === 0) {
+		if (this.searchInput) {
+			const searchLine = this.searchInput.render(Math.max(1, width - 2))[0] ?? "> ";
+			addSidebarLine(` ${theme.fg("text", searchLine)}`);
+			if (this.searchStatus) addSidebarLine(theme.fg("muted", ` ${this.searchStatus}`));
+		}
+		if (displayedSessions.length === 0) {
 			addDivider();
-			addSidebarLine(theme.fg("muted", " No conversations yet"));
+			addSidebarLine(theme.fg("muted", this.searchInput ? " No matching conversations" : " No conversations yet"));
 			return this.fillViewport(lines, width, viewportRows);
 		}
 
@@ -156,25 +222,26 @@ export class SessionSidebar implements Component, Focusable {
 		const detailedRows = remainingRows >= MIN_ROWS_FOR_DETAILED_LIST;
 		const listRows = detailedRows ? Math.max(0, remainingRows - 1) : remainingRows;
 		let visibleCount = this.getVisibleCount(listRows, detailedRows, false);
-		let showOverflow = this.sessions.length > visibleCount;
+		let showOverflow = displayedSessions.length > visibleCount;
 		if (showOverflow) {
 			const countWithOverflow = this.getVisibleCount(listRows, detailedRows, true);
 			if (countWithOverflow > 0) {
 				visibleCount = countWithOverflow;
-				showOverflow = this.sessions.length > visibleCount;
+				showOverflow = displayedSessions.length > visibleCount;
 			} else {
 				showOverflow = false;
 			}
 		}
 		const startIndex = Math.max(
 			0,
-			Math.min(this.selectedIndex - Math.floor(visibleCount / 2), this.sessions.length - visibleCount),
+			Math.min(this.selectedIndex - Math.floor(visibleCount / 2), displayedSessions.length - visibleCount),
 		);
-		const endIndex = Math.min(this.sessions.length, startIndex + visibleCount);
+		const endIndex = Math.min(displayedSessions.length, startIndex + visibleCount);
 		if (detailedRows) addDivider();
 
 		for (let index = startIndex; index < endIndex; index++) {
-			const session = this.sessions[index]!;
+			const session = displayedSessions[index]!;
+			const searchResult = this.searchResults?.find((result) => result.sessionPath === session.path);
 			const icon = STATE_ICON[session.state];
 			const title = normalizePreview(session.name ?? session.firstMessage) || "(empty conversation)";
 			const selected = this.focused && index === this.selectedIndex;
@@ -227,8 +294,9 @@ export class SessionSidebar implements Component, Focusable {
 			}
 
 			const role =
-				session.lastMessageRole === "assistant" ? "Bone" : session.lastMessageRole === "user" ? "You" : undefined;
-			const preview = normalizePreview(session.lastMessage ?? "");
+				searchResult?.evidence.label ??
+				(session.lastMessageRole === "assistant" ? "Bone" : session.lastMessageRole === "user" ? "You" : undefined);
+			const preview = normalizePreview(searchResult?.evidence.snippet ?? session.lastMessage ?? "");
 			const metadata = `${formatConversationCreatedTime(session.created)} · ${session.messageCount} ${session.messageCount === 1 ? "msg" : "msgs"}`;
 			const metadataLine = `    ${truncateSidebarText(metadata, Math.max(1, width - 4))}`;
 			const previewPrefix = `    ${role ?? "Message"} · `;
@@ -244,7 +312,7 @@ export class SessionSidebar implements Component, Focusable {
 
 		if (showOverflow) {
 			if (detailedRows) addDivider();
-			addSidebarLine(theme.fg("muted", ` … ${this.sessions.length - visibleCount} more`));
+			addSidebarLine(theme.fg("muted", ` … ${displayedSessions.length - visibleCount} more`));
 		}
 
 		return this.fillViewport(lines, width, viewportRows);
@@ -297,8 +365,17 @@ export class SessionSidebar implements Component, Focusable {
 			this.onExit?.();
 			return;
 		}
+		if (this.searchInput) {
+			this.handleSearchInput(data, keybindings);
+			return;
+		}
 		if (keybindings.matches(data, "app.focus.right")) {
 			this.onFocusChat?.();
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.confirm")) {
+			const selected = this.getDisplayedSessions()[this.selectedIndex];
+			if (selected) this.onActivateSession?.(selected.path);
 			return;
 		}
 		if (keybindings.matches(data, "tui.select.up")) {
@@ -317,20 +394,78 @@ export class SessionSidebar implements Component, Focusable {
 			this.onScrollChat?.("down");
 			return;
 		}
-		if (keybindings.matches(data, "tui.select.confirm")) {
-			const selected = this.sessions[this.selectedIndex];
-			if (selected) this.onActivateSession?.(selected.path);
+		if (keybindings.matches(data, "app.session.searchFromSidebar")) {
+			this.startSearch();
 			return;
 		}
 		if (keybindings.matches(data, "app.session.deleteFromSidebar")) {
-			const selected = this.sessions[this.selectedIndex];
+			const selected = this.getDisplayedSessions()[this.selectedIndex];
 			if (selected) this.itemState = { kind: "confirm-delete", path: selected.path };
 		}
 	}
 
+	private handleSearchInput(data: string, keybindings: ReturnType<typeof getKeybindings>): void {
+		if (keybindings.matches(data, "app.focus.right")) {
+			this.stopSearch();
+			this.onFocusChat?.();
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.confirm")) {
+			const selected = this.getDisplayedSessions()[this.selectedIndex];
+			if (selected) this.onActivateSession?.(selected.path);
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.up")) {
+			this.moveSelection(-1);
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.down")) {
+			this.moveSelection(1);
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.pageUp")) {
+			this.onScrollChat?.("up");
+			return;
+		}
+		if (keybindings.matches(data, "tui.select.pageDown")) {
+			this.onScrollChat?.("down");
+			return;
+		}
+
+		const input = this.searchInput;
+		if (!input) return;
+		const previousQuery = input.getValue();
+		input.handleInput(data);
+		if (this.searchInput !== input) return;
+		const query = input.getValue();
+		if (query !== previousQuery) {
+			this.searchResults = undefined;
+			this.reconcileSelection();
+			this.onSearchQueryChange?.(query);
+		}
+	}
+
 	private moveSelection(delta: number): void {
-		if (this.sessions.length === 0) return;
-		this.selectedIndex = Math.max(0, Math.min(this.sessions.length - 1, this.selectedIndex + delta));
-		this.selectedPath = this.sessions[this.selectedIndex]?.path;
+		const displayedSessions = this.getDisplayedSessions();
+		if (displayedSessions.length === 0) return;
+		this.selectedIndex = Math.max(0, Math.min(displayedSessions.length - 1, this.selectedIndex + delta));
+		this.selectedPath = displayedSessions[this.selectedIndex]?.path;
+	}
+
+	private getDisplayedSessions(): InteractiveSessionSummary[] {
+		if (!this.searchInput || !this.searchResults) return this.sessions;
+		const sessionsByPath = new Map(this.sessions.map((session) => [session.path, session]));
+		return this.searchResults.flatMap((result) => {
+			const session = sessionsByPath.get(result.sessionPath);
+			return session ? [session] : [];
+		});
+	}
+
+	private reconcileSelection(): void {
+		const displayedSessions = this.getDisplayedSessions();
+		const selectedIndex = displayedSessions.findIndex((session) => session.path === this.selectedPath);
+		const foregroundIndex = displayedSessions.findIndex((session) => session.state === "foreground");
+		this.selectedIndex = selectedIndex >= 0 ? selectedIndex : Math.max(0, foregroundIndex);
+		this.selectedPath = displayedSessions[this.selectedIndex]?.path;
 	}
 }
