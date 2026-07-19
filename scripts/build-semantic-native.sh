@@ -56,8 +56,10 @@ cmake_args=(
 if [[ "$TARGET" == "win32-arm64" ]]; then
     # ggml's ARM backend rejects MSVC, but the Windows SDK and linker are
     # still provided by Visual Studio. ClangCL keeps that integration while
-    # satisfying ggml's Clang requirement.
-    cmake_args+=( -A ARM64 -T ClangCL )
+    # satisfying ggml's Clang requirement. This is cross-compilation from an
+    # x64 runner, so `-mcpu=native` would target the host and is invalid for
+    # clang-cl's ARM64 target; use ggml's portable ARM64 baseline instead.
+    cmake_args+=( -A ARM64 -T ClangCL -DCRISPEMBED_NATIVE=OFF )
 elif [[ "$TARGET" == "win32-x64" ]]; then
     cmake_args+=( -A x64 )
 fi
