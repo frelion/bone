@@ -219,7 +219,7 @@ describe("SessionSidebar", () => {
 		expect(formatConversationCreatedTime(new Date(2026, 6, 14, 9, 41), now)).toBe("created Jul 14");
 	});
 
-	it("provides a Side-local search interaction with explainable result rows", () => {
+	it("keeps Side search live, exits on Enter, and restores the previous query", () => {
 		const sidebar = new SessionSidebar();
 		const queryChanges = vi.fn();
 		const activateSession = vi.fn();
@@ -252,13 +252,35 @@ describe("SessionSidebar", () => {
 		expect(resultOutput).toContain("semantic cache implementation");
 		sidebar.handleInput("\r");
 		expect(activateSession).toHaveBeenCalledWith("/sessions/b.jsonl");
+		expect(sidebar.searchActive).toBe(false);
+		expect(stateChanges).toHaveBeenLastCalledWith(false);
 
-		sidebar.handleInput("\x1b");
-		expect(sidebar.searchQuery).toBe("");
-		expect(sidebar.searchActive).toBe(true);
+		sidebar.handleInput("/");
+		expect(sidebar.searchQuery).toBe("semantic cache");
+		sidebar.handleInput(" implementation");
+		expect(sidebar.searchQuery).toBe("semantic cache implementation");
 		sidebar.handleInput("\x1b");
 		expect(sidebar.searchActive).toBe(false);
 		expect(stateChanges).toHaveBeenLastCalledWith(false);
+	});
+
+	it("does not repeat a matching title as the result preview", () => {
+		const sidebar = new SessionSidebar();
+		sidebar.focused = true;
+		sidebar.setSessions([makeSession("a", "foreground")]);
+		sidebar.handleInput("/");
+		sidebar.handleInput("session a");
+		sidebar.setSearchResults([
+			{
+				sessionPath: "/sessions/a.jsonl",
+				score: 1,
+				evidence: { kind: "title", label: "Title", snippet: "Session a" },
+			},
+		]);
+
+		const output = stripVTControlCharacters(sidebar.render(42).join("\n"));
+		expect(output).toContain("Session a");
+		expect(output).not.toContain("Title · Session a");
 	});
 });
 

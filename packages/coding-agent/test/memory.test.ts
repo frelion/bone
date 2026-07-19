@@ -189,6 +189,87 @@ describe("Memory runtime", () => {
 		await runtime.dispose();
 	});
 
+	it("replaces historical title terms when a conversation is renamed", async () => {
+		const directory = await createTemporaryDirectory();
+		const sessionPath = join(directory, "renamed.jsonl");
+		await writeFile(
+			sessionPath,
+			[
+				JSON.stringify({ type: "session", id: "renamed", timestamp: "2026-07-18T10:00:00.000Z", cwd: directory }),
+				JSON.stringify({
+					type: "session_info",
+					id: "title-old",
+					timestamp: "2026-07-18T10:01:00.000Z",
+					name: "Old title",
+				}),
+				JSON.stringify({
+					type: "message",
+					id: "user-1",
+					parentId: "title-old",
+					timestamp: "2026-07-18T10:02:00.000Z",
+					message: { role: "user", content: "Implement the sidebar search flow" },
+				}),
+				JSON.stringify({
+					type: "message",
+					id: "assistant-1",
+					parentId: "user-1",
+					timestamp: "2026-07-18T10:03:00.000Z",
+					message: { role: "assistant", content: "Implemented the interaction", stopReason: "stop" },
+				}),
+			].join("\n"),
+		);
+		const session = { ...makeSession(sessionPath), name: "Old title" };
+		const runtime = new MemoryRuntime({
+			agentDir: join(directory, "agent"),
+			cwd: directory,
+			embeddingEngine: new FakeEmbeddingEngine(),
+		});
+		await runtime.start([session]);
+
+		expect((await runtime.search("old title", [session])).map((result) => result.sessionPath)).toEqual([sessionPath]);
+		await runtime.recordTitle({ path: sessionPath, id: session.id }, "New title");
+		expect(await runtime.search("old title", [session])).toEqual([]);
+		expect((await runtime.search("new title", [session])).map((result) => result.sessionPath)).toEqual([sessionPath]);
+
+		await runtime.dispose();
+	});
+
+	it("uses only the latest saved title while rebuilding a conversation", async () => {
+		const directory = await createTemporaryDirectory();
+		const sessionPath = join(directory, "renamed-during-rebuild.jsonl");
+		await writeFile(
+			sessionPath,
+			[
+				JSON.stringify({ type: "session", id: "renamed", timestamp: "2026-07-18T10:00:00.000Z", cwd: directory }),
+				JSON.stringify({
+					type: "session_info",
+					id: "title-old",
+					timestamp: "2026-07-18T10:01:00.000Z",
+					name: "Old title",
+				}),
+				JSON.stringify({
+					type: "message",
+					id: "user-1",
+					parentId: "title-old",
+					timestamp: "2026-07-18T10:02:00.000Z",
+					message: { role: "user", content: "Implement the sidebar search flow" },
+				}),
+				JSON.stringify({
+					type: "session_info",
+					id: "title-new",
+					parentId: "user-1",
+					timestamp: "2026-07-18T10:03:00.000Z",
+					name: "New title",
+				}),
+			].join("\n"),
+		);
+
+		const items = await extractMemoryItems(makeSession(sessionPath));
+		expect(items).toHaveLength(2);
+		expect(items[0]?.titleText).toBe(normalizeSearchTerms("New title"));
+		expect(items.slice(1).every((item) => item.titleText === "")).toBe(true);
+	});
+
 	it("keeps workspaces isolated and overlays only unpersisted live conversations", async () => {
 		const directory = await createTemporaryDirectory();
 		const agentDir = join(directory, "agent");

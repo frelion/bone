@@ -100,13 +100,12 @@ export class SessionSidebar implements Component, Focusable {
 	private searchInput: Input | undefined;
 	private searchResults: readonly MemorySearchResult[] | undefined;
 	private searchStatus: string | undefined;
+	private lastSearchQuery = "";
 	focused = false;
 	public onActivateSession?: (sessionPath: string) => void;
 	public onDeleteSession?: (sessionPath: string, replacementPath: string | undefined) => void;
 	/** Called as the user edits the Side search query. Search execution is provided by the host. */
 	public onSearchQueryChange?: (query: string) => void;
-	/** Called when the user submits a non-empty Side search query. */
-	public onSearchSubmit?: (query: string) => void;
 	public onSearchStateChange?: (active: boolean) => void;
 	public onFocusChat?: () => void;
 	public onScrollChat?: (direction: "up" | "down") => void;
@@ -146,28 +145,21 @@ export class SessionSidebar implements Component, Focusable {
 	startSearch(): void {
 		if (this.searchInput) return;
 		this.itemState = { kind: "normal" };
-		this.searchResults = undefined;
+		this.searchResults = this.lastSearchQuery.trim() ? [] : undefined;
 		this.searchStatus = undefined;
-		this.searchInput = new Input();
-		this.searchInput.focused = true;
-		this.searchInput.onEscape = () => {
-			if (this.searchInput?.getValue()) {
-				this.searchInput.setValue("");
-				this.searchResults = undefined;
-				this.reconcileSelection();
-				return;
-			}
-			this.stopSearch();
-		};
-		this.searchInput.onSubmit = (query) => {
-			if (query.trim()) this.onSearchSubmit?.(query);
-		};
-		this.onSearchQueryChange?.("");
+		const input = new Input();
+		input.setValue(this.lastSearchQuery, this.lastSearchQuery.length);
+		input.focused = true;
+		input.onEscape = () => this.stopSearch();
+		this.searchInput = input;
+		this.reconcileSelection();
+		this.onSearchQueryChange?.(this.lastSearchQuery);
 		this.onSearchStateChange?.(true);
 	}
 
 	stopSearch(): void {
 		if (!this.searchInput) return;
+		this.lastSearchQuery = this.searchInput.getValue();
 		this.searchInput.focused = false;
 		this.searchInput = undefined;
 		this.searchResults = undefined;
@@ -293,17 +285,22 @@ export class SessionSidebar implements Component, Focusable {
 				continue;
 			}
 
+			const hasTitleEvidence = searchResult?.evidence.kind === "title";
 			const role =
-				searchResult?.evidence.label ??
+				(hasTitleEvidence ? undefined : searchResult?.evidence.label) ??
 				(session.lastMessageRole === "assistant" ? "Bone" : session.lastMessageRole === "user" ? "You" : undefined);
-			const preview = normalizePreview(searchResult?.evidence.snippet ?? session.lastMessage ?? "");
+			const preview = normalizePreview(
+				hasTitleEvidence
+					? (session.lastMessage ?? "")
+					: (searchResult?.evidence.snippet ?? session.lastMessage ?? ""),
+			);
 			const metadata = `${formatConversationCreatedTime(session.created)} · ${session.messageCount} ${session.messageCount === 1 ? "msg" : "msgs"}`;
 			const metadataLine = `    ${truncateSidebarText(metadata, Math.max(1, width - 4))}`;
 			const previewPrefix = `    ${role ?? "Message"} · `;
 			const previewContentWidth = Math.max(1, width - visibleWidth(previewPrefix));
 			const styledPreview = preview
 				? `${theme.fg("dim", previewPrefix)}${theme.fg("muted", truncateSidebarText(preview, previewContentWidth))}`
-				: theme.fg("dim", "    No messages yet");
+				: theme.fg("dim", hasTitleEvidence ? "    Title match" : "    No messages yet");
 			const styledMetadata = theme.fg("dim", metadataLine);
 			addSidebarLine(styledPreview, selected);
 			addSidebarLine(styledMetadata, selected);
@@ -375,7 +372,10 @@ export class SessionSidebar implements Component, Focusable {
 		}
 		if (keybindings.matches(data, "tui.select.confirm")) {
 			const selected = this.getDisplayedSessions()[this.selectedIndex];
-			if (selected) this.onActivateSession?.(selected.path);
+			if (selected) {
+				this.stopSearch();
+				this.onActivateSession?.(selected.path);
+			}
 			return;
 		}
 		if (keybindings.matches(data, "tui.select.up")) {
@@ -412,7 +412,10 @@ export class SessionSidebar implements Component, Focusable {
 		}
 		if (keybindings.matches(data, "tui.select.confirm")) {
 			const selected = this.getDisplayedSessions()[this.selectedIndex];
-			if (selected) this.onActivateSession?.(selected.path);
+			if (selected) {
+				this.stopSearch();
+				this.onActivateSession?.(selected.path);
+			}
 			return;
 		}
 		if (keybindings.matches(data, "tui.select.up")) {
@@ -439,7 +442,7 @@ export class SessionSidebar implements Component, Focusable {
 		if (this.searchInput !== input) return;
 		const query = input.getValue();
 		if (query !== previousQuery) {
-			this.searchResults = undefined;
+			this.searchResults = query.trim() ? [] : undefined;
 			this.reconcileSelection();
 			this.onSearchQueryChange?.(query);
 		}

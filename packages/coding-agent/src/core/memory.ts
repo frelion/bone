@@ -15,7 +15,10 @@ import {
 import { isMessageWithContent, parseSessionEntryLine, type SessionEntry, type SessionInfo } from "./session-manager.ts";
 import { isCodeLikeSearchQuery, normalizeSearchPreview, normalizeSearchTerms } from "./session-search-normalizer.ts";
 
-const MEMORY_VERSION = "v2";
+// v3 keeps mutable conversation titles in one dedicated document. Previous
+// derived stores duplicated title terms on every exchange, so rebuild instead
+// of carrying stale title tokens forward.
+const MEMORY_VERSION = "v3";
 const VECTOR_DIMENSIONS = 384;
 const ITEMS_TABLE = "memory_items";
 const STATE_TABLE = "memory_state";
@@ -160,7 +163,6 @@ interface PendingExchange {
 	id: string;
 	sourceEntryId: string;
 	userText: string;
-	title: string;
 }
 
 function stableHash(value: string): string {
@@ -374,7 +376,6 @@ function createExchangeItem(input: {
 	sessionPath: string;
 	sessionId: string;
 	sourceEntryId: string;
-	title: string;
 	userText: string;
 	assistantText?: string;
 	createdAt: number;
@@ -390,7 +391,10 @@ function createExchangeItem(input: {
 		sessionId: input.sessionId,
 		kind: "conversation-exchange",
 		sourceEntryId: input.sourceEntryId,
-		titleText: normalizeSearchTerms(input.title),
+		// Conversation titles are indexed only by their dedicated, mutable title
+		// item. Repeating a title on every exchange made renamed titles accumulate
+		// in the FTS corpus and could surface an obsolete name as message evidence.
+		titleText: "",
 		bodyText: normalizeSearchTerms(body),
 		referenceText: normalizeSearchTerms(
 			extractReferences(body)
@@ -447,7 +451,7 @@ function createReferenceItems(exchange: MemoryItem): MemoryItem[] {
 			sessionId: exchange.sessionId,
 			kind: reference.kind,
 			sourceEntryId: exchange.sourceEntryId,
-			titleText: exchange.titleText,
+			titleText: "",
 			bodyText: "",
 			referenceText: normalizeSearchTerms(text),
 			displayText: text,
@@ -598,6 +602,12 @@ class LanceMemoryRepository {
 		if (!table || !existingTable) return;
 		await table.delete(`id = ${quotePredicate(item.id)}`);
 		await table.add([replacement] as unknown as Record<string, unknown>[]);
+	}
+
+	async deleteSessionTitle(sessionPath: string): Promise<void> {
+		const table = await this.getItemsTable();
+		if (!table) return;
+		await table.delete(`sessionPath = ${quotePredicate(sessionPath)} AND kind = 'conversation-title'`);
 	}
 
 	async replaceExchangeReferences(exchange: MemoryItem): Promise<void> {
@@ -1015,6 +1025,13 @@ export class MemoryRuntime {
 	private readonly agentDir: string;
 	private readonly usesLocalEmbeddingAssets: boolean;
 	private readonly pendingBySession = new Map<string, PendingExchange[]>();
+	/**
+	 * A title is mutable session metadata rather than immutable conversation
+	 * content. This map is the authoritative value between a session_info write
+	 * and the next sidebar refresh, and lets us reject a stale Lance FTS title
+	 * hit without rebuilding indexes on every rename.
+	 */
+	private readonly currentTitles = new Map<string, string>();
 	private started = false;
 	private startup: Promise<void> | undefined;
 	private store: MemoryStoreState = "preparing";
@@ -1223,7 +1240,6 @@ export class MemoryRuntime {
 				sessionPath: session.path,
 				sessionId: session.id,
 				sourceEntryId: entry.id,
-				title: session.name ?? "",
 				userText,
 				createdAt: Date.parse(entry.timestamp),
 			});
@@ -1231,7 +1247,7 @@ export class MemoryRuntime {
 			await this.repository.replaceExchangeReferences(exchange);
 			const pending = this.pendingBySession.get(session.path) ?? [];
 			if (!pending.some((item) => item.id === exchange.id)) {
-				pending.push({ id: exchange.id, sourceEntryId: entry.id, userText, title: session.name ?? "" });
+				pending.push({ id: exchange.id, sourceEntryId: entry.id, userText });
 				this.pendingBySession.set(session.path, pending);
 			}
 		}
@@ -1253,7 +1269,6 @@ export class MemoryRuntime {
 				sourceEntryId: latest.sourceEntryId,
 				userText:
 					latest.semanticText.replace(/^User task:\s*/, "").split("\nFinal result:")[0] ?? latest.displayText,
-				title: session.name ?? "",
 			};
 		}
 		const assistantText = normalizeSearchPreview(textFromMessage(assistant), 4_000);
@@ -1262,7 +1277,6 @@ export class MemoryRuntime {
 			sessionPath: session.path,
 			sessionId: session.id,
 			sourceEntryId: pending.sourceEntryId,
-			title: session.name ?? pending.title,
 			userText: pending.userText,
 			assistantText,
 			createdAt: Date.now(),
@@ -1279,12 +1293,15 @@ export class MemoryRuntime {
 
 	async recordTitle(session: { path: string; id: string }, title: string, updatedAt = Date.now()): Promise<void> {
 		if (!this.started || !session.path.endsWith(".jsonl")) return;
+		this.currentTitles.set(session.path, title);
 		const item = createTitleItem({ sessionPath: session.path, sessionId: session.id, title, updatedAt });
 		if (item) await this.repository.upsert(item);
+		else await this.repository.deleteSessionTitle(session.path);
 	}
 
 	async removeSession(sessionPath: string): Promise<void> {
 		this.pendingBySession.delete(sessionPath);
+		this.currentTitles.delete(sessionPath);
 		await this.repository.deleteSession(sessionPath);
 	}
 
@@ -1308,6 +1325,8 @@ export class MemoryRuntime {
 	private async reconcile(sessions: readonly SessionInfo[]): Promise<void> {
 		const persisted = sessions.filter((session) => session.path.endsWith(".jsonl") && existsSync(session.path));
 		for (const session of persisted) {
+			if (!this.currentTitles.has(session.path))
+				this.currentTitles.set(session.path, session.name ?? normalizeSearchPreview(session.firstMessage, 120));
 			const sessionStat = await stat(session.path);
 			const fingerprint = `${sessionStat.mtimeMs}:${sessionStat.size}`;
 			if ((await this.repository.fingerprintFor(session.path)) === fingerprint) continue;
@@ -1324,12 +1343,50 @@ export class MemoryRuntime {
 		indexed: readonly MemorySearchResult[],
 		limit: number,
 	): MemorySearchResult[] {
-		const results = new Map(indexed.map((result) => [result.sessionPath, result]));
 		const queryTerms = normalizeSearchTerms(query).split(" ").filter(Boolean);
+		const codeLike = isCodeLikeSearchQuery(query);
+		const sessionsByPath = new Map(sessions.map((session) => [session.path, session]));
+		const titleFor = (session: SessionInfo): string =>
+			this.currentTitles.get(session.path) ?? session.name ?? normalizeSearchPreview(session.firstMessage, 120);
+		const matchesTitleQuery = (text: string): boolean => {
+			const terms = normalizeSearchTerms(text);
+			return (
+				queryTerms.length > 0 &&
+				(codeLike
+					? queryTerms.some((term) => terms.includes(term))
+					: queryTerms.every((term) => terms.includes(term)))
+			);
+		};
+
+		// Lance FTS compacts mutable documents asynchronously. A renamed title can
+		// therefore be returned briefly for its previous tokens. Only title
+		// evidence is metadata-driven, so verify it against the current title
+		// before presenting it; body, file, and semantic evidence remain intact.
+		const results = new Map(
+			indexed.flatMap((result) => {
+				const session = sessionsByPath.get(result.sessionPath);
+				if (result.evidence.kind === "title" && session && !matchesTitleQuery(titleFor(session))) return [];
+				return [[result.sessionPath, result] as const];
+			}),
+		);
 		for (const session of sessions) {
-			if (results.has(session.path) || existsSync(session.path)) continue;
-			const title = session.name || session.firstMessage;
+			const title = titleFor(session);
 			const titleTerms = normalizeSearchTerms(title);
+			if (matchesTitleQuery(title)) {
+				const candidate: MemorySearchResult = {
+					sessionPath: session.path,
+					score: 20 + queryTerms.length,
+					evidence: {
+						kind: "title",
+						label: "Title",
+						snippet: normalizeSearchPreview(title, 180),
+					},
+				};
+				const existing = results.get(session.path);
+				if (!existing || candidate.score > existing.score) results.set(session.path, candidate);
+				continue;
+			}
+			if (results.has(session.path) || existsSync(session.path)) continue;
 			const body = `${session.firstMessage} ${session.lastMessage ?? ""}`;
 			const bodyTerms = normalizeSearchTerms(body);
 			const matched = queryTerms.filter((term) => titleTerms.includes(term) || bodyTerms.includes(term)).length;
@@ -1381,7 +1438,6 @@ export async function extractMemoryItems(session: SessionInfo): Promise<MemoryIt
 				id: stableHash(`${session.path}:exchange:${entry.id}`),
 				sourceEntryId: entry.id,
 				userText: text,
-				title,
 			});
 			continue;
 		}
@@ -1392,7 +1448,6 @@ export async function extractMemoryItems(session: SessionInfo): Promise<MemoryIt
 			sessionPath: session.path,
 			sessionId,
 			sourceEntryId: user.sourceEntryId,
-			title: title || user.title,
 			userText: user.userText,
 			assistantText: text,
 			createdAt: Date.parse(entry.timestamp),
@@ -1404,7 +1459,6 @@ export async function extractMemoryItems(session: SessionInfo): Promise<MemoryIt
 			sessionPath: session.path,
 			sessionId,
 			sourceEntryId: user.sourceEntryId,
-			title: title || user.title,
 			userText: user.userText,
 			createdAt: session.modified.getTime(),
 		});
