@@ -337,6 +337,8 @@ export class InteractiveMode {
 	private sessionSearchTimer: NodeJS.Timeout | undefined;
 	private semanticSearchTimer: NodeJS.Timeout | undefined;
 	private sessionSearchGeneration = 0;
+	private sidebarPreviewTarget: string | undefined;
+	private sidebarPreviewInFlight: Promise<void> | undefined;
 	private loadedResourcesContainer: Container;
 	private chatContainer: Container;
 	private pendingMessagesContainer: Container;
@@ -574,6 +576,7 @@ export class InteractiveMode {
 		this.paneFocus.register("history", this.chatHistoryFocus);
 		this.paneFocus.register("chat", this.defaultEditor);
 		this.sessionSidebar.onActivateSession = (sessionPath) => void this.activateSidebarSession(sessionPath);
+		this.sessionSidebar.onPreviewSession = (sessionPath) => this.previewSidebarSession(sessionPath);
 		this.sessionSidebar.onDeleteSession = (sessionPath, replacementPath) =>
 			void this.deleteSidebarSession(sessionPath, replacementPath);
 		this.sessionSidebar.onSearchQueryChange = (query) => this.scheduleSidebarSearch(query);
@@ -5166,6 +5169,33 @@ export class InteractiveMode {
 		if (!result.cancelled) this.paneFocus.focus("chat");
 	}
 
+	/**
+	 * Arrow navigation in Side search previews a real conversation switch without
+	 * stealing Side focus. Keep only the newest target while a lifecycle
+	 * transition is underway so held arrow keys cannot enqueue stale sessions.
+	 */
+	private previewSidebarSession(sessionPath: string): void {
+		this.sidebarPreviewTarget = sessionPath;
+		if (this.sidebarPreviewInFlight) return;
+		this.sidebarPreviewInFlight = this.drainSidebarPreviews().finally(() => {
+			this.sidebarPreviewInFlight = undefined;
+			if (this.sidebarPreviewTarget) this.previewSidebarSession(this.sidebarPreviewTarget);
+		});
+	}
+
+	private async drainSidebarPreviews(): Promise<void> {
+		while (this.sidebarPreviewTarget) {
+			const sessionPath = this.sidebarPreviewTarget;
+			this.sidebarPreviewTarget = undefined;
+			await this.handleResumeSession(sessionPath);
+			// Rebinding a resumed runtime may replace extension UI. Search previews
+			// must never transfer keyboard ownership away from the Side input.
+			if (this.sessionSidebar.searchActive) {
+				this.paneFocus.focus("sidebar");
+			}
+		}
+	}
+
 	private async deleteSidebarSession(sessionPath: string, replacementPath: string | undefined): Promise<void> {
 		const restoreSidebarFocus = this.sessionSidebar.focused;
 		try {
@@ -5275,7 +5305,7 @@ export class InteractiveMode {
 		const text =
 			id === "sidebar"
 				? this.sessionSidebar.searchActive
-					? "Search · Type query · ↑↓ select · Enter open · Esc clear/close · Shift+→ conversation"
+					? "Search · Type query · ↑↓ preview · Enter confirm · Esc cancel · Shift+→ conversation"
 					: "Focus · Side  ↑↓ select · Enter open · / search · d delete · Shift+→ conversation"
 				: "Focus · Conversation history  ↑↓ line · PgUp/PgDn page · Shift+↓ composer · Shift+← Side";
 		this.focusHintContainer.addChild(new Text(theme.fg("accent", text), 0, 0));

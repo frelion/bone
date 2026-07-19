@@ -223,9 +223,11 @@ describe("SessionSidebar", () => {
 		const sidebar = new SessionSidebar();
 		const queryChanges = vi.fn();
 		const activateSession = vi.fn();
+		const previewSession = vi.fn();
 		const stateChanges = vi.fn();
 		sidebar.onSearchQueryChange = queryChanges;
 		sidebar.onActivateSession = activateSession;
+		sidebar.onPreviewSession = previewSession;
 		sidebar.onSearchStateChange = stateChanges;
 		sidebar.setSessions([makeSession("a", "foreground"), makeSession("b", "cold")]);
 
@@ -252,6 +254,7 @@ describe("SessionSidebar", () => {
 		expect(resultOutput).toContain("semantic cache implementation");
 		sidebar.handleInput("\r");
 		expect(activateSession).toHaveBeenCalledWith("/sessions/b.jsonl");
+		expect(previewSession).not.toHaveBeenCalled();
 		expect(sidebar.searchActive).toBe(false);
 		expect(stateChanges).toHaveBeenLastCalledWith(false);
 
@@ -262,6 +265,65 @@ describe("SessionSidebar", () => {
 		sidebar.handleInput("\x1b");
 		expect(sidebar.searchActive).toBe(false);
 		expect(stateChanges).toHaveBeenLastCalledWith(false);
+	});
+
+	it("previews arrow-selected search results and restores the original conversation on Escape", () => {
+		const sidebar = new SessionSidebar();
+		const previewSession = vi.fn();
+		sidebar.focused = true;
+		sidebar.onPreviewSession = previewSession;
+		sidebar.setSessions([makeSession("a", "foreground"), makeSession("b", "cold"), makeSession("c", "cold")]);
+
+		sidebar.handleInput("/");
+		sidebar.handleInput("semantic");
+		sidebar.setSearchResults([
+			{
+				sessionPath: "/sessions/b.jsonl",
+				score: 2,
+				evidence: { kind: "user", label: "You", snippet: "semantic cache" },
+			},
+			{
+				sessionPath: "/sessions/c.jsonl",
+				score: 1,
+				evidence: { kind: "assistant", label: "Bone", snippet: "semantic search" },
+			},
+		]);
+
+		sidebar.handleInput("\x1b[B");
+		expect(previewSession).toHaveBeenLastCalledWith("/sessions/c.jsonl");
+		sidebar.handleInput("\x1b");
+		expect(previewSession).toHaveBeenLastCalledWith("/sessions/a.jsonl");
+		expect(sidebar.searchActive).toBe(false);
+		expect(stripVTControlCharacters(sidebar.render(42).join("\n"))).toContain("› ● Session a");
+	});
+
+	it("restores the original conversation when reopening a saved query is cancelled", () => {
+		const sidebar = new SessionSidebar();
+		const previewSession = vi.fn();
+		sidebar.onPreviewSession = previewSession;
+		sidebar.setSessions([makeSession("a", "foreground"), makeSession("b", "cold"), makeSession("c", "cold")]);
+
+		sidebar.handleInput("/");
+		sidebar.handleInput("semantic");
+		sidebar.handleInput("\x1b");
+		sidebar.handleInput("/");
+		sidebar.setSearchResults([
+			{
+				sessionPath: "/sessions/b.jsonl",
+				score: 2,
+				evidence: { kind: "user", label: "You", snippet: "semantic cache" },
+			},
+			{
+				sessionPath: "/sessions/c.jsonl",
+				score: 1,
+				evidence: { kind: "assistant", label: "Bone", snippet: "semantic search" },
+			},
+		]);
+
+		sidebar.handleInput("\x1b[B");
+		expect(previewSession).toHaveBeenLastCalledWith("/sessions/c.jsonl");
+		sidebar.handleInput("\x1b");
+		expect(previewSession).toHaveBeenLastCalledWith("/sessions/a.jsonl");
 	});
 
 	it("does not repeat a matching title as the result preview", () => {

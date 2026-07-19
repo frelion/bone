@@ -1237,7 +1237,9 @@ export class TUI extends Container {
 
 	/**
 	 * Find and extract cursor position from rendered lines.
-	 * Searches for CURSOR_MARKER, calculates its position, and strips it from the output.
+	 * Searches for CURSOR_MARKER, calculates its position, and strips every marker
+	 * from the output. Multiple components can briefly emit a marker while focus is
+	 * transferred between panes; no internal marker may reach the terminal.
 	 * Only scans the bottom terminal height lines (visible viewport).
 	 * @param lines - Rendered lines to search
 	 * @param height - Terminal height (visible viewport size)
@@ -1246,21 +1248,20 @@ export class TUI extends Container {
 	private extractCursorPosition(lines: string[], height: number): { row: number; col: number } | null {
 		// Only scan the bottom `height` lines (visible viewport)
 		const viewportTop = Math.max(0, lines.length - height);
+		let cursorPosition: { row: number; col: number } | null = null;
 		for (let row = lines.length - 1; row >= viewportTop; row--) {
 			const line = lines[row];
 			const markerIndex = line.indexOf(CURSOR_MARKER);
 			if (markerIndex !== -1) {
-				// Calculate visual column (width of text before marker)
-				const beforeMarker = line.slice(0, markerIndex);
-				const col = visibleWidth(beforeMarker);
-
-				// Strip marker from the line
-				lines[row] = line.slice(0, markerIndex) + line.slice(markerIndex + CURSOR_MARKER.length);
-
-				return { row, col };
+				if (!cursorPosition) {
+					// Preserve the existing bottom-most marker priority for hardware
+					// cursor placement while removing transient duplicate markers.
+					cursorPosition = { row, col: visibleWidth(line.slice(0, markerIndex)) };
+				}
+				lines[row] = line.replaceAll(CURSOR_MARKER, "");
 			}
 		}
-		return null;
+		return cursorPosition;
 	}
 
 	private doRender(): void {

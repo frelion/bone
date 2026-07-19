@@ -9,7 +9,7 @@ import {
 	setCapabilities,
 	setCellDimensions,
 } from "../src/terminal-image.ts";
-import { type Component, TUI } from "../src/tui.ts";
+import { type Component, CURSOR_MARKER, TUI } from "../src/tui.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class TestComponent implements Component {
@@ -483,6 +483,24 @@ describe("TUI content shrinkage", () => {
 });
 
 describe("TUI differential rendering", () => {
+	it("never writes duplicate internal cursor markers during focus transfer", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = [`Search title${CURSOR_MARKER} `, `Composer${CURSOR_MARKER} `];
+		tui.start();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(writes.includes("Search title "));
+		assert.ok(writes.includes("Composer "));
+		assert.ok(!writes.includes(CURSOR_MARKER), "internal cursor markers must be stripped before terminal output");
+
+		tui.stop();
+	});
+
 	it("tracks cursor correctly when content shrinks with unchanged remaining lines", async () => {
 		const terminal = new VirtualTerminal(40, 10);
 		const tui = new TUI(terminal);

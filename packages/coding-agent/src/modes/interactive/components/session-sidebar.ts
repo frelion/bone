@@ -101,8 +101,12 @@ export class SessionSidebar implements Component, Focusable {
 	private searchResults: readonly MemorySearchResult[] | undefined;
 	private searchStatus: string | undefined;
 	private lastSearchQuery = "";
+	private searchStartPath: string | undefined;
+	private previewedSearchPath: string | undefined;
 	focused = false;
 	public onActivateSession?: (sessionPath: string) => void;
+	/** Switch the foreground conversation while Side search remains active. */
+	public onPreviewSession?: (sessionPath: string) => void;
 	public onDeleteSession?: (sessionPath: string, replacementPath: string | undefined) => void;
 	/** Called as the user edits the Side search query. Search execution is provided by the host. */
 	public onSearchQueryChange?: (query: string) => void;
@@ -144,29 +148,41 @@ export class SessionSidebar implements Component, Focusable {
 
 	startSearch(): void {
 		if (this.searchInput) return;
+		// Capture the active selection before an existing query temporarily clears
+		// the result list. Escape must always restore this exact conversation.
+		this.searchStartPath = this.selectedPath;
+		this.previewedSearchPath = undefined;
 		this.itemState = { kind: "normal" };
 		this.searchResults = this.lastSearchQuery.trim() ? [] : undefined;
 		this.searchStatus = undefined;
 		const input = new Input();
 		input.setValue(this.lastSearchQuery, this.lastSearchQuery.length);
 		input.focused = true;
-		input.onEscape = () => this.stopSearch();
+		input.onEscape = () => this.stopSearch({ restorePreview: true });
 		this.searchInput = input;
 		this.reconcileSelection();
 		this.onSearchQueryChange?.(this.lastSearchQuery);
 		this.onSearchStateChange?.(true);
 	}
 
-	stopSearch(): void {
+	stopSearch(options?: { restorePreview?: boolean }): void {
 		if (!this.searchInput) return;
+		const restorePath =
+			options?.restorePreview && this.previewedSearchPath && this.previewedSearchPath !== this.searchStartPath
+				? this.searchStartPath
+				: undefined;
 		this.lastSearchQuery = this.searchInput.getValue();
 		this.searchInput.focused = false;
 		this.searchInput = undefined;
 		this.searchResults = undefined;
 		this.searchStatus = undefined;
+		this.searchStartPath = undefined;
+		this.previewedSearchPath = undefined;
+		if (restorePath) this.selectedPath = restorePath;
 		this.reconcileSelection();
 		this.onSearchQueryChange?.("");
 		this.onSearchStateChange?.(false);
+		if (restorePath) this.onPreviewSession?.(restorePath);
 	}
 
 	setViewportRows(rows: number): void {
@@ -419,11 +435,11 @@ export class SessionSidebar implements Component, Focusable {
 			return;
 		}
 		if (keybindings.matches(data, "tui.select.up")) {
-			this.moveSelection(-1);
+			this.moveSearchSelection(-1);
 			return;
 		}
 		if (keybindings.matches(data, "tui.select.down")) {
-			this.moveSelection(1);
+			this.moveSearchSelection(1);
 			return;
 		}
 		if (keybindings.matches(data, "tui.select.pageUp")) {
@@ -446,6 +462,14 @@ export class SessionSidebar implements Component, Focusable {
 			this.reconcileSelection();
 			this.onSearchQueryChange?.(query);
 		}
+	}
+
+	private moveSearchSelection(delta: number): void {
+		const previousPath = this.selectedPath;
+		this.moveSelection(delta);
+		if (!this.selectedPath || this.selectedPath === previousPath) return;
+		this.previewedSearchPath = this.selectedPath;
+		this.onPreviewSession?.(this.selectedPath);
 	}
 
 	private moveSelection(delta: number): void {
