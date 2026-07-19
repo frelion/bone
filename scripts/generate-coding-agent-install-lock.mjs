@@ -17,10 +17,14 @@ const allowedInstallScriptPackages = new Map([
 	["@google/genai@1.52.0", "preinstall is a no-op in the published package"],
 	[
 		"onnxruntime-node@1.19.2",
-		"postinstall only fetches optional Linux CUDA providers; Bone installs with --ignore-scripts and uses the bundled CPU N-API binary",
+		"postinstall only fetches optional Linux CUDA providers; it remains a transitive package and Bone installs with --ignore-scripts",
+	],
+	[
+		"koffi@2.14.1",
+		"install selects a platform prebuilt or source build; Bone installs with --ignore-scripts and uses the prebuilt N-API binary carried in koffi's npm package",
 	],
 	["protobufjs@7.6.4", "postinstall only warns about protobufjs version scheme mismatches"],
-	["sharp@0.33.5", "install only checks optional libvips/source-build availability; Transformers.js does not invoke image processing for text embeddings"],
+	["sharp@0.33.5", "install only checks optional libvips/source-build availability; it remains a transitive package and Bone installs with --ignore-scripts"],
 ]);
 
 const args = new Set(process.argv.slice(2));

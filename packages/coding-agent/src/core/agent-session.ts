@@ -166,6 +166,12 @@ export type AgentSessionEvent =
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 
+/** Called only after entries have been physically written to the JSONL session file. */
+export type AgentSessionPersistedEntriesListener = (entries: readonly SessionEntry[]) => void | Promise<void>;
+
+/** Called after all messages in an agent run have completed their persistence handling. */
+export type AgentSessionRunCompletedListener = (messages: readonly AgentMessage[]) => void | Promise<void>;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -293,6 +299,8 @@ export class AgentSession {
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
+	private _persistedEntriesListeners: AgentSessionPersistedEntriesListener[] = [];
+	private _runCompletedListeners: AgentSessionRunCompletedListener[] = [];
 	private _isAgentRunActive = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
@@ -627,7 +635,8 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				const result = this.sessionManager.appendMessageWithPersistence(event.message);
+				await this._emitPersistedEntries(result.persistedEntries);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -652,7 +661,32 @@ export class AgentSession {
 				}
 			}
 		}
+
+		if (event.type === "agent_end") {
+			await this._emitRunCompleted(event.messages);
+		}
 	};
+
+	private async _emitPersistedEntries(entries: readonly SessionEntry[]): Promise<void> {
+		if (entries.length === 0) return;
+		for (const listener of this._persistedEntriesListeners) {
+			try {
+				await listener(entries);
+			} catch {
+				// Memory and other derived-data consumers must never make JSONL persistence fail.
+			}
+		}
+	}
+
+	private async _emitRunCompleted(messages: readonly AgentMessage[]): Promise<void> {
+		for (const listener of this._runCompletedListeners) {
+			try {
+				await listener(messages);
+			} catch {
+				// Derived-data consumers must not prevent a completed agent run from settling.
+			}
+		}
+	}
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		const settings = this.settingsManager.getRetrySettings();
@@ -807,6 +841,24 @@ export class AgentSession {
 		};
 	}
 
+	/** Subscribe to post-persistence entries without exposing a pre-write event as durable data. */
+	subscribePersistedEntries(listener: AgentSessionPersistedEntriesListener): () => void {
+		this._persistedEntriesListeners.push(listener);
+		return () => {
+			const index = this._persistedEntriesListeners.indexOf(listener);
+			if (index !== -1) this._persistedEntriesListeners.splice(index, 1);
+		};
+	}
+
+	/** Subscribe to completed runs after their message entries have been persisted. */
+	subscribeRunCompleted(listener: AgentSessionRunCompletedListener): () => void {
+		this._runCompletedListeners.push(listener);
+		return () => {
+			const index = this._runCompletedListeners.indexOf(listener);
+			if (index !== -1) this._runCompletedListeners.splice(index, 1);
+		};
+	}
+
 	/**
 	 * Temporarily disconnect from agent events.
 	 * User listeners are preserved and will receive events again after resubscribe().
@@ -849,6 +901,8 @@ export class AgentSession {
 		);
 		this._disconnectFromAgent();
 		this._eventListeners = [];
+		this._persistedEntriesListeners = [];
+		this._runCompletedListeners = [];
 		cleanupSessionResources(this.sessionId);
 	}
 
@@ -2867,7 +2921,8 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	setSessionName(name: string): void {
-		this.sessionManager.appendSessionInfo(name);
+		const result = this.sessionManager.appendSessionInfoWithPersistence(name);
+		void this._emitPersistedEntries(result.persistedEntries);
 		const event = { type: "session_info_changed", name: this.sessionManager.getSessionName() } as const;
 		this._emit(event);
 		void this._extensionRunner.emit(event);

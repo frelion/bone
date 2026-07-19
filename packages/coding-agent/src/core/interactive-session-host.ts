@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { extname, relative, sep } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSessionEvent } from "./agent-session.ts";
 import {
@@ -8,7 +9,7 @@ import {
 	createAgentSessionRuntime,
 } from "./agent-session-runtime.ts";
 import { forgetLastActiveConversation } from "./conversation-state.ts";
-import { type SessionInfo, SessionManager } from "./session-manager.ts";
+import { type SessionEntry, type SessionInfo, SessionManager } from "./session-manager.ts";
 import { type SessionTrashMethod, softDeleteSessionFile } from "./session-trash.ts";
 
 export type InteractiveSessionState = "foreground" | "background-running" | "background-waiting" | "cold";
@@ -23,6 +24,8 @@ interface RuntimeSlot {
 	runtime: AgentSessionRuntime;
 	state: Exclude<InteractiveSessionState, "cold">;
 	unsubscribe: () => void;
+	unsubscribePersistedEntries: () => void;
+	unsubscribeRunCompleted: () => void;
 }
 
 function extractText(content: unknown): string {
@@ -51,6 +54,10 @@ export interface InteractiveSessionHostHooks {
 	runtimeDisposed?: (runtime: AgentSessionRuntime) => void;
 	/** Refresh any session status UI after a lifecycle transition. */
 	stateChanged?: () => void;
+	/** Materialize entries that have successfully reached a JSONL session file. */
+	persistedEntries?: (runtime: AgentSessionRuntime, entries: readonly SessionEntry[]) => Promise<void>;
+	/** Materialize the final, user-visible response for a completed agent run. */
+	runCompleted?: (runtime: AgentSessionRuntime, messages: readonly AgentMessage[]) => Promise<void>;
 }
 
 /**
@@ -180,6 +187,8 @@ export class InteractiveSessionHost {
 			this.background.clear();
 			for (const slot of slots) {
 				slot.unsubscribe();
+				slot.unsubscribePersistedEntries();
+				slot.unsubscribeRunCompleted();
 				try {
 					await slot.runtime.dispose();
 				} finally {
@@ -212,12 +221,20 @@ export class InteractiveSessionHost {
 			runtime,
 			state,
 			unsubscribe: () => {},
+			unsubscribePersistedEntries: () => {},
+			unsubscribeRunCompleted: () => {},
 		};
 		const subscribe = () =>
 			runtime.session.subscribe((event) => {
 				this.handleRuntimeEvent(slot, event);
 			});
 		slot.unsubscribe = subscribe();
+		slot.unsubscribePersistedEntries = runtime.session.subscribePersistedEntries(async (entries) => {
+			await this.hooks.persistedEntries?.(runtime, entries);
+		});
+		slot.unsubscribeRunCompleted = runtime.session.subscribeRunCompleted(async (messages) => {
+			await this.hooks.runCompleted?.(runtime, messages);
+		});
 		runtime.setRebindSession(async () => {
 			slot.unsubscribe();
 			slot.unsubscribe = subscribe();
@@ -315,6 +332,8 @@ export class InteractiveSessionHost {
 		const sessionPath = this.getSessionPath(slot.runtime);
 		if (sessionPath) this.background.delete(sessionPath);
 		slot.unsubscribe();
+		slot.unsubscribePersistedEntries();
+		slot.unsubscribeRunCompleted();
 		try {
 			await slot.runtime.dispose();
 		} finally {

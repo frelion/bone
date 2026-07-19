@@ -1,17 +1,101 @@
+import { createHash } from "node:crypto";
+import { createReadStream, existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 
-const IDLE_WORKER_TIMEOUT_MS = 5 * 60_000;
+const MODEL_ID = "cstr/multilingual-e5-small-GGUF";
+const MODEL_CACHE_DIRECTORY = "bone-semantic-search-v2";
+const GGUF_MODEL_FILE = "multilingual-e5-small-q8_0.gguf";
+
+export type LocalEmbeddingAvailability =
+	| { state: "ready" }
+	| { state: "missing" }
+	| { state: "invalid"; reason: string };
 
 export type LocalEmbeddingStatus =
 	| { phase: "downloading"; loadedBytes?: number; totalBytes?: number; file?: string }
 	| { phase: "loading" }
 	| { phase: "ready" };
 
-/** Minimal boundary used by search so tests never need to start a native ONNX runtime. */
+/** Minimal boundary used by search so tests never need to start the native GGUF runtime. */
 export interface LocalEmbeddingEngine {
+	/** Resolve and verify the fixed local model before any search query needs it. */
+	prepare(): Promise<void>;
 	embedQuery(query: string): Promise<Float32Array>;
 	embedDocuments(documents: readonly string[]): Promise<Float32Array[]>;
 	dispose(): Promise<void>;
+}
+
+interface ModelAssetManifest {
+	format: "bone-semantic-search-assets-v2";
+	modelId: string;
+	revision: string;
+	files: Record<string, string>;
+}
+
+function getCacheDirectory(agentDir: string): string {
+	return join(agentDir, "models", MODEL_CACHE_DIRECTORY);
+}
+
+function getManifestPath(agentDir: string): string {
+	return join(getCacheDirectory(agentDir), "asset-manifest.json");
+}
+
+function isAssetManifest(value: unknown): value is ModelAssetManifest {
+	if (!value || typeof value !== "object") return false;
+	const candidate = value as Partial<ModelAssetManifest>;
+	return (
+		candidate.format === "bone-semantic-search-assets-v2" &&
+		candidate.modelId === MODEL_ID &&
+		typeof candidate.revision === "string" &&
+		/^[0-9a-f]{40}$/i.test(candidate.revision) &&
+		candidate.files !== undefined &&
+		candidate.files !== null &&
+		typeof candidate.files === "object" &&
+		Object.entries(candidate.files).every(
+			([path, hash]) =>
+				path.length > 0 &&
+				!path.startsWith("../") &&
+				!path.includes("\\") &&
+				typeof hash === "string" &&
+				/^[0-9a-f]{64}$/i.test(hash),
+		) &&
+		Object.keys(candidate.files).some((path) => path.endsWith(`/${GGUF_MODEL_FILE}`))
+	);
+}
+
+async function hashFile(path: string): Promise<string> {
+	const hash = createHash("sha256");
+	for await (const chunk of createReadStream(path)) hash.update(chunk);
+	return hash.digest("hex");
+}
+
+/** Verify only local, already-downloaded semantic assets. This function never fetches. */
+export async function getLocalEmbeddingAvailability(agentDir: string): Promise<LocalEmbeddingAvailability> {
+	const manifestPath = getManifestPath(agentDir);
+	if (!existsSync(manifestPath)) return { state: "missing" };
+	let manifest: unknown;
+	try {
+		manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+	} catch {
+		return { state: "invalid", reason: "asset manifest cannot be read" };
+	}
+	if (!isAssetManifest(manifest) || Object.keys(manifest.files).length === 0) {
+		return { state: "invalid", reason: "asset manifest is invalid" };
+	}
+	const root = getCacheDirectory(agentDir);
+	for (const [relativePath, expectedHash] of Object.entries(manifest.files)) {
+		const assetPath = join(root, relativePath);
+		if (!existsSync(assetPath)) return { state: "invalid", reason: `missing ${relativePath}` };
+		try {
+			const actualHash = await hashFile(assetPath);
+			if (actualHash !== expectedHash) return { state: "invalid", reason: `checksum mismatch for ${relativePath}` };
+		} catch {
+			return { state: "invalid", reason: `cannot verify ${relativePath}` };
+		}
+	}
+	return { state: "ready" };
 }
 
 interface WorkerResponse {
@@ -64,13 +148,21 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 	private worker: Worker | undefined;
 	private nextRequestId = 1;
 	private readonly pending = new Map<number, PendingRequest>();
-	private idleTimer: NodeJS.Timeout | undefined;
 	private readonly agentDir: string;
 	private readonly onStatus: ((status: LocalEmbeddingStatus) => void) | undefined;
 
 	constructor(agentDir: string, options?: { onStatus?: (status: LocalEmbeddingStatus) => void }) {
 		this.agentDir = agentDir;
 		this.onStatus = options?.onStatus;
+	}
+
+	async prepare(): Promise<void> {
+		const worker = this.ensureWorker();
+		const id = this.nextRequestId++;
+		await new Promise<void>((resolve, reject) => {
+			this.pending.set(id, { resolve: () => resolve(), reject });
+			worker.postMessage({ id, kind: "prepare", agentDir: this.agentDir });
+		});
 	}
 
 	async embedQuery(query: string): Promise<Float32Array> {
@@ -84,8 +176,6 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 	}
 
 	async dispose(): Promise<void> {
-		if (this.idleTimer) clearTimeout(this.idleTimer);
-		this.idleTimer = undefined;
 		const worker = this.worker;
 		this.worker = undefined;
 		for (const request of this.pending.values()) request.reject(new Error("Local embedding worker disposed"));
@@ -96,8 +186,6 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 	private async embed(mode: "query" | "document", texts: readonly string[]): Promise<Float32Array[]> {
 		if (texts.length === 0) return [];
 		const worker = this.ensureWorker();
-		if (this.idleTimer) clearTimeout(this.idleTimer);
-		this.idleTimer = undefined;
 		const id = this.nextRequestId++;
 		return await new Promise<Float32Array[]>((resolve, reject) => {
 			this.pending.set(id, { resolve, reject });
@@ -148,17 +236,10 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 			return;
 		}
 		pending.resolve(vectors);
-		this.scheduleIdleDispose();
 	}
 
 	private failPending(error: Error): void {
 		for (const pending of this.pending.values()) pending.reject(error);
 		this.pending.clear();
-	}
-
-	private scheduleIdleDispose(): void {
-		if (this.pending.size > 0) return;
-		if (this.idleTimer) clearTimeout(this.idleTimer);
-		this.idleTimer = setTimeout(() => void this.dispose(), IDLE_WORKER_TIMEOUT_MS);
 	}
 }

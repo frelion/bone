@@ -156,6 +156,38 @@ for platform in "${PLATFORMS[@]}"; do
     cp -r docs "$OUTPUT_DIR/$platform/"
     cp -r examples "$OUTPUT_DIR/$platform/"
 
+    # Release archive labels use `windows-*`, while Node's runtime platform is
+    # `win32-*`. Native sidecar directories always follow Node's identifiers.
+    native_platform="$platform"
+    case "$platform" in
+        windows-x64) native_platform="win32-x64" ;;
+        windows-arm64) native_platform="win32-arm64" ;;
+    esac
+
+    # The compiled binary resolves the GGUF engine relative to its own
+    # directory, so each archive carries only its matching native sidecar.
+    test -d "native/$native_platform"
+    mkdir -p "$OUTPUT_DIR/$platform/native"
+    cp -R "native/$native_platform" "$OUTPUT_DIR/$platform/native/"
+
+    # Koffi loads its N-API binding dynamically. Bun embeds its JavaScript but
+    # not this `.node` file, so stage the target binding beside the executable.
+    case "$platform" in
+        darwin-arm64) koffi_triplets=(darwin_arm64) ;;
+        darwin-x64) koffi_triplets=(darwin_x64) ;;
+        linux-x64) koffi_triplets=(linux_x64 musl_x64) ;;
+        linux-arm64) koffi_triplets=(linux_arm64 musl_arm64) ;;
+        windows-x64) koffi_triplets=(win32_x64) ;;
+        windows-arm64) koffi_triplets=(win32_arm64) ;;
+    esac
+    for koffi_triplet in "${koffi_triplets[@]}"; do
+        koffi_source="../../node_modules/koffi/build/koffi/$koffi_triplet/koffi.node"
+        test -f "$koffi_source"
+        koffi_destination="$OUTPUT_DIR/$platform/node_modules/koffi/build/koffi/$koffi_triplet"
+        mkdir -p "$koffi_destination"
+        cp "$koffi_source" "$koffi_destination/koffi.node"
+    done
+
     case "$platform" in
         darwin-arm64)
             clipboard_native_package="clipboard-darwin-arm64"

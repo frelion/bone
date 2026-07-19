@@ -1,0 +1,17 @@
+diff --git a/src/crispembed.cpp b/src/crispembed.cpp
+index 1d22c33..fa07550 100644
+--- a/src/crispembed.cpp
++++ b/src/crispembed.cpp
+@@ -481,7 +481,11 @@ static bool load_model(crispembed_context * ctx, const char * path) {
+     // Allocate metadata buffer for graph building (no_alloc=true pattern)
+     ctx->compute_meta.resize(ggml_tensor_overhead() * graph_nodes + ggml_graph_overhead_custom(graph_nodes, false));
+ 
+-    if (!core_gguf::load_weights(path, ctx->backend, "crispembed", ctx->wl)) {
++    // Bone's local semantic model is CPU-only and intentionally keeps its GGUF
++    // weights as a shared, read-only mapping.  The CPU backend accepts host
++    // pointers, so this avoids allocating and copying a second full model-sized
++    // buffer for the lifetime of the embedding engine.
++    if (!core_gguf::load_weights(path, ctx->backend, "crispembed", ctx->wl, /*try_mmap=*/true)) {
+         fprintf(stderr, "crispembed: failed to load weights\n");
+         return false;
+     }

@@ -1,18 +1,34 @@
-import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parentPort } from "node:worker_threads";
-import { env, pipeline } from "@huggingface/transformers";
-import lockfile from "proper-lockfile";
 
-const MODEL_ID = "Xenova/multilingual-e5-small";
-const MODEL_CACHE_DIRECTORY = "bone-semantic-search-v1";
-const MODEL_API_URL = `https://huggingface.co/api/models/${MODEL_ID}`;
-const MODEL_REVISION_REQUEST_TIMEOUT_MS = 20_000;
+const MODEL_ID = "cstr/multilingual-e5-small-GGUF";
+const MODEL_CACHE_DIRECTORY = "bone-semantic-search-v2";
+const GGUF_MODEL_FILE = "multilingual-e5-small-q8_0.gguf";
+const EMBEDDING_DIMENSIONS = 384;
+
+const require = createRequire(import.meta.url);
+
+/**
+ * Bun embeds Koffi's JavaScript but cannot embed its N-API addon. Release
+ * archives place that addon beside the executable under node_modules/koffi;
+ * Koffi's resource-path fallback then resolves it from there.
+ */
+function loadKoffi(): typeof import("koffi") {
+	if (process.versions.bun) {
+		const processWithResourcesPath = process as NodeJS.Process & { resourcesPath?: string };
+		processWithResourcesPath.resourcesPath ??= dirname(process.execPath);
+	}
+	return require("koffi") as typeof import("koffi");
+}
+
+const koffi = loadKoffi();
 
 interface ModelAssetManifest {
-	format: "bone-semantic-search-assets-v1";
+	format: "bone-semantic-search-assets-v2";
 	modelId: string;
 	revision: string;
 	files: Record<string, string>;
@@ -26,205 +42,223 @@ interface EmbedRequest {
 	texts: string[];
 }
 
+interface PrepareRequest {
+	id: number;
+	kind: "prepare";
+	agentDir: string;
+}
+
 interface DisposeRequest {
 	id: number;
 	kind: "dispose";
 }
 
-type WorkerRequest = EmbedRequest | DisposeRequest;
+type WorkerRequest = EmbedRequest | PrepareRequest | DisposeRequest;
 
 interface WorkerResponse {
 	id: number;
 	vectors?: number[][];
 	error?: string;
-	status?:
-		| { phase: "downloading"; loadedBytes?: number; totalBytes?: number; file?: string }
-		| { phase: "loading" }
-		| { phase: "ready" };
+	status?: { phase: "loading" } | { phase: "ready" };
 }
+
+interface CrispEmbedFunctions {
+	init: (modelPath: string, threads: number) => unknown;
+	setPrefix: (context: unknown, prefix: string) => void;
+	encodeBatch: (context: unknown, texts: Array<string | null>, count: number, dimensions: number[]) => unknown;
+	free: (context: unknown) => void;
+	unload: () => void;
+}
+
+interface NativeE5Engine {
+	context: unknown;
+	native: CrispEmbedFunctions;
+}
+
+let engine: NativeE5Engine | undefined;
+let requestQueue: Promise<void> = Promise.resolve();
 
 function isWorkerRequest(value: unknown): value is WorkerRequest {
 	if (!value || typeof value !== "object") return false;
 	const candidate = value as Partial<WorkerRequest>;
-	return typeof candidate.id === "number" && (candidate.kind === "dispose" || candidate.kind === "embed");
+	return (
+		typeof candidate.id === "number" &&
+		(candidate.kind === "dispose" || candidate.kind === "embed" || candidate.kind === "prepare")
+	);
 }
-
-type FeatureExtractor = (
-	texts: string[],
-	options: { pooling: "mean"; normalize: true },
-) => Promise<{ tolist(): number[][] }>;
-
-let extractor: FeatureExtractor | undefined;
 
 function cacheDirectory(agentDir: string): string {
 	return join(agentDir, "models", MODEL_CACHE_DIRECTORY);
 }
 
-function manifestPath(agentDir: string): string {
-	return join(cacheDirectory(agentDir), "asset-manifest.json");
-}
-
-function isManifest(value: unknown): value is ModelAssetManifest {
-	if (!value || typeof value !== "object") return false;
-	const candidate = value as Partial<ModelAssetManifest>;
-	return (
-		candidate.format === "bone-semantic-search-assets-v1" &&
-		candidate.modelId === MODEL_ID &&
-		typeof candidate.revision === "string" &&
-		/^[0-9a-f]{40}$/i.test(candidate.revision) &&
-		candidate.files !== undefined &&
-		candidate.files !== null &&
-		typeof candidate.files === "object" &&
-		Object.entries(candidate.files).every(
-			([path, hash]) => path.length > 0 && typeof hash === "string" && /^[0-9a-f]{64}$/i.test(hash),
-		)
-	);
-}
-
-async function fileHash(path: string): Promise<string> {
-	return createHash("sha256")
-		.update(await readFile(path))
-		.digest("hex");
-}
-
-async function listCachedFiles(root: string): Promise<string[]> {
-	const entries = await readdir(root, { withFileTypes: true });
-	const files: string[] = [];
-	for (const entry of entries) {
-		const path = join(root, entry.name);
-		if (entry.isDirectory()) files.push(...(await listCachedFiles(path)));
-		else if (entry.isFile()) files.push(path);
-	}
-	return files;
-}
-
 async function readVerifiedManifest(agentDir: string): Promise<ModelAssetManifest | undefined> {
-	const path = manifestPath(agentDir);
+	const path = join(cacheDirectory(agentDir), "asset-manifest.json");
 	if (!existsSync(path)) return undefined;
 	try {
 		const manifest: unknown = JSON.parse(await readFile(path, "utf8"));
-		if (!isManifest(manifest) || Object.keys(manifest.files).length === 0) return undefined;
-		const root = cacheDirectory(agentDir);
-		for (const [file, expectedHash] of Object.entries(manifest.files)) {
-			const filePath = join(root, file);
-			if (!existsSync(filePath) || (await fileHash(filePath)) !== expectedHash) return undefined;
+		if (!manifest || typeof manifest !== "object") return undefined;
+		const candidate = manifest as Partial<ModelAssetManifest>;
+		if (
+			candidate.format !== "bone-semantic-search-assets-v2" ||
+			candidate.modelId !== MODEL_ID ||
+			typeof candidate.revision !== "string" ||
+			!/^[0-9a-f]{40}$/i.test(candidate.revision) ||
+			!candidate.files ||
+			!Object.keys(candidate.files).some((file) => file.endsWith(`/${GGUF_MODEL_FILE}`))
+		) {
+			return undefined;
 		}
-		return manifest;
+		const files = candidate.files as Record<string, unknown>;
+		const fileEntries = Object.entries(files);
+		if (
+			!fileEntries.every(
+				([file, hash]) =>
+					file.length > 0 &&
+					!file.startsWith("../") &&
+					!file.includes("\\") &&
+					typeof hash === "string" &&
+					/^[0-9a-f]{64}$/i.test(hash),
+			)
+		)
+			return undefined;
+		const verifiedFiles = Object.fromEntries(fileEntries) as Record<string, string>;
+		const root = cacheDirectory(agentDir);
+		// The parent process has already performed the full SHA-256 verification
+		// before starting this worker. Avoid a second complete read of the GGUF at
+		// startup; this worker only validates the manifest structure and paths.
+		for (const file of Object.keys(verifiedFiles)) {
+			const filePath = join(root, file);
+			if (!existsSync(filePath)) return undefined;
+		}
+		return {
+			format: "bone-semantic-search-assets-v2",
+			modelId: MODEL_ID,
+			revision: candidate.revision,
+			files: verifiedFiles,
+		};
 	} catch {
 		return undefined;
 	}
-}
-
-async function resolveImmutableRevision(): Promise<string> {
-	const response = await fetch(MODEL_API_URL, { signal: AbortSignal.timeout(MODEL_REVISION_REQUEST_TIMEOUT_MS) });
-	if (!response.ok) throw new Error(`Could not resolve local semantic model revision (${response.status})`);
-	const payload: unknown = await response.json();
-	const sha = payload && typeof payload === "object" ? (payload as { sha?: unknown }).sha : undefined;
-	if (typeof sha !== "string" || !/^[0-9a-f]{40}$/i.test(sha))
-		throw new Error("Local semantic model registry returned an invalid revision");
-	return sha;
 }
 
 function postStatus(status: NonNullable<WorkerResponse["status"]>): void {
 	parentPort?.postMessage({ id: 0, status } satisfies WorkerResponse);
 }
 
-function formatProgress(progress: unknown): { loadedBytes?: number; totalBytes?: number; file?: string } {
-	if (!progress || typeof progress !== "object") return {};
-	const value = progress as { loaded?: unknown; total?: unknown; file?: unknown };
-	return {
-		...(typeof value.loaded === "number" && Number.isFinite(value.loaded) ? { loadedBytes: value.loaded } : {}),
-		...(typeof value.total === "number" && Number.isFinite(value.total) ? { totalBytes: value.total } : {}),
-		...(typeof value.file === "string" ? { file: value.file } : {}),
-	};
-}
-
-async function writeManifest(agentDir: string, revision: string): Promise<void> {
-	const root = cacheDirectory(agentDir);
-	const revisionRoot = join(root, MODEL_ID, revision);
-	const resolvedFiles = Object.fromEntries(
-		await Promise.all(
-			(await listCachedFiles(revisionRoot)).map(
-				async (path) => [relative(root, path), await fileHash(path)] as const,
-			),
+function resolveNativeLibraryPath(): string {
+	const platform = `${process.platform}-${process.arch}`;
+	const libraryName =
+		platform === "darwin-arm64" || platform === "darwin-x64"
+			? "libcrispembed.0.dylib"
+			: platform === "linux-x64" || platform === "linux-arm64"
+				? "libcrispembed.so.0"
+				: platform === "win32-x64" || platform === "win32-arm64"
+					? "crispembed.dll"
+					: undefined;
+	if (!libraryName) {
+		throw new Error(`Local GGUF semantic search is not bundled for ${platform}`);
+	}
+	const sourceRuntime = import.meta.url.endsWith(".ts");
+	const moduleRelativePath = fileURLToPath(
+		new URL(
+			sourceRuntime ? `../../native/${platform}/${libraryName}` : `../native/${platform}/${libraryName}`,
+			import.meta.url,
 		),
 	);
-	const manifest: ModelAssetManifest = {
-		format: "bone-semantic-search-assets-v1",
-		modelId: MODEL_ID,
-		revision,
-		files: resolvedFiles,
-	};
-	const target = manifestPath(agentDir);
-	const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
-	await writeFile(temporary, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
-	await rename(temporary, target);
+	if (existsSync(moduleRelativePath)) return moduleRelativePath;
+	// Bun's compiled filesystem has no ordinary module-relative path. The binary
+	// release places the sidecars beside the executable instead.
+	const binaryRelativePath = join(dirname(process.execPath), "native", platform, libraryName);
+	if (existsSync(binaryRelativePath)) return binaryRelativePath;
+	throw new Error("Bone's local GGUF embedding engine is missing from this installation");
 }
 
-async function loadExtractor(agentDir: string): Promise<NonNullable<typeof extractor>> {
-	if (extractor) return extractor;
-	const cacheDir = cacheDirectory(agentDir);
-	await mkdir(cacheDir, { recursive: true, mode: 0o700 });
-	const release = await lockfile.lock(cacheDir, {
-		realpath: false,
-		stale: 120_000,
-		retries: { retries: 8, factor: 1.5, minTimeout: 200, maxTimeout: 2_000 },
-	});
-	try {
-		if (extractor) return extractor;
-		let manifest = await readVerifiedManifest(agentDir);
-		if (!manifest) {
-			await rm(manifestPath(agentDir), { force: true });
-			postStatus({ phase: "downloading" });
-			const revision = await resolveImmutableRevision();
-			await rm(join(cacheDir, MODEL_ID, revision), { recursive: true, force: true });
-			env.allowRemoteModels = true;
-			env.cacheDir = cacheDir;
-			const loaded = await pipeline("feature-extraction", MODEL_ID, {
-				dtype: "q8",
-				revision,
-				progress_callback: (progress: unknown) => postStatus({ phase: "downloading", ...formatProgress(progress) }),
-			});
-			extractor = loaded as unknown as FeatureExtractor;
-			await writeManifest(agentDir, revision);
-			manifest = await readVerifiedManifest(agentDir);
-			if (!manifest) throw new Error("Local semantic model asset verification failed after download");
-		}
-		postStatus({ phase: "loading" });
-		env.cacheDir = cacheDir;
-		env.allowRemoteModels = false;
-		if (!extractor) {
-			const loaded = await pipeline("feature-extraction", MODEL_ID, {
-				dtype: "q8",
-				revision: manifest.revision,
-				local_files_only: true,
-			});
-			extractor = loaded as unknown as FeatureExtractor;
-		}
-	} finally {
-		await release();
+function loadCrispEmbed(): CrispEmbedFunctions {
+	const library = koffi.load(resolveNativeLibraryPath());
+	return {
+		init: library.func("void * crispembed_init(const char * model_path, int n_threads)"),
+		setPrefix: library.func("void crispembed_set_prefix(void * context, const char * prefix)"),
+		encodeBatch: library.func(
+			"const float * crispembed_encode_batch(void * context, const char ** texts, int n_texts, _Out_ int * out_n_dim)",
+		),
+		free: library.func("void crispembed_free(void * context)"),
+		unload: () => library.unload(),
+	};
+}
+
+async function loadNativeEngine(agentDir: string): Promise<NativeE5Engine> {
+	if (engine) return engine;
+	const manifest = await readVerifiedManifest(agentDir);
+	if (!manifest) throw new Error("Local semantic model assets are not prepared. Run bone setup.");
+	const modelPath = join(cacheDirectory(agentDir), MODEL_ID, manifest.revision, GGUF_MODEL_FILE);
+	if (!existsSync(modelPath)) throw new Error("Local semantic model is missing its Q8 GGUF model");
+	postStatus({ phase: "loading" });
+	// The native engine uses a fixed CPU-only single-thread configuration. It keeps
+	// the GGUF's weights as a read-only MAP_SHARED mapping instead of making an
+	// ORT/JS heap copy of the model.
+	process.env.CRISPEMBED_FORCE_CPU = "1";
+	const native = loadCrispEmbed();
+	const context = native.init(modelPath, 1);
+	if (!context) {
+		native.unload();
+		throw new Error("Could not initialize Bone's local GGUF embedding engine");
 	}
+	engine = { context, native };
 	postStatus({ phase: "ready" });
-	return extractor;
+	return engine;
+}
+
+function decodeVectors(pointer: unknown, dimensions: number, count: number): number[][] {
+	if (!pointer) throw new Error("Local GGUF embedding engine returned no vectors");
+	if (dimensions !== EMBEDDING_DIMENSIONS) {
+		throw new Error(
+			`Local GGUF embedding engine returned ${dimensions} dimensions; expected ${EMBEDDING_DIMENSIONS}`,
+		);
+	}
+	const data = koffi.decode(pointer, "float", dimensions * count) as Float32Array;
+	if (!(data instanceof Float32Array) || data.length !== dimensions * count) {
+		throw new Error("Local GGUF embedding engine returned an invalid vector buffer");
+	}
+	return Array.from({ length: count }, (_, index) =>
+		Array.from(data.subarray(index * dimensions, (index + 1) * dimensions)),
+	);
 }
 
 async function embed(request: EmbedRequest): Promise<number[][]> {
-	const pipeline = await loadExtractor(request.agentDir);
-	const prefix = request.mode === "query" ? "query: Find the previous Bone conversation relevant to: " : "passage: ";
-	const output = await pipeline(
-		request.texts.map((text) => `${prefix}${text}`),
-		{ pooling: "mean", normalize: true },
+	const native = await loadNativeEngine(request.agentDir);
+	native.native.setPrefix(
+		native.context,
+		request.mode === "query" ? "query: Find the previous Bone conversation relevant to: " : "passage: ",
 	);
-	return output.tolist();
+	const dimensions = [0];
+	const pointer = native.native.encodeBatch(native.context, request.texts, request.texts.length, dimensions);
+	return decodeVectors(pointer, dimensions[0] ?? 0, request.texts.length);
+}
+
+async function dispose(): Promise<void> {
+	const current = engine;
+	engine = undefined;
+	if (!current) return;
+	current.native.free(current.context);
+	current.native.unload();
+}
+
+function enqueue(task: () => Promise<void>): void {
+	requestQueue = requestQueue.then(task, task);
 }
 
 parentPort?.on("message", (message: unknown) => {
 	if (!isWorkerRequest(message)) return;
-	void (async () => {
+	enqueue(async () => {
 		try {
 			if (message.kind === "dispose") {
-				extractor = undefined;
-				parentPort?.postMessage({ id: message.id } satisfies WorkerResponse);
+				await dispose();
+				parentPort?.postMessage({ id: message.id, vectors: [] } satisfies WorkerResponse);
+				return;
+			}
+			if (message.kind === "prepare") {
+				await loadNativeEngine(message.agentDir);
+				parentPort?.postMessage({ id: message.id, vectors: [] } satisfies WorkerResponse);
 				return;
 			}
 			parentPort?.postMessage({ id: message.id, vectors: await embed(message) } satisfies WorkerResponse);
@@ -234,5 +268,5 @@ parentPort?.on("message", (message: unknown) => {
 				error: error instanceof Error ? error.message : String(error),
 			} satisfies WorkerResponse);
 		}
-	})();
+	});
 });

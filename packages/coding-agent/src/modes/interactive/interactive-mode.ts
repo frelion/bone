@@ -77,6 +77,7 @@ import { configureHttpDispatcher } from "../../core/http-dispatcher.ts";
 import type { InteractiveSessionHost, InteractiveSessionSummary } from "../../core/interactive-session-host.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import type { LocalEmbeddingStatus } from "../../core/local-embedding.ts";
+import { MemoryRuntime } from "../../core/memory.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import { ModelConfig, type ModelsJson } from "../../core/model-config.ts";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.ts";
@@ -85,7 +86,6 @@ import { discoverOpenAICompatibleModelIds, type OpenAICompatibleApi } from "../.
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import { type SessionEntry, sessionEntryToContextMessages } from "../../core/session-manager.ts";
-import { SessionSearchService } from "../../core/session-search.ts";
 import { InMemorySettingsStorage, SettingsManager } from "../../core/settings-manager.ts";
 import { SettingsTransactionJournal } from "../../core/settings-transaction-journal.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
@@ -327,7 +327,7 @@ export class InteractiveMode {
 	private chatScrollLayout: ChatScrollLayout;
 	private chatHistoryFocus: ChatHistoryFocus;
 	private sessionSidebar: SessionSidebar;
-	private readonly sessionSearch: SessionSearchService;
+	private readonly memory: MemoryRuntime;
 	private sidebarSessions: InteractiveSessionSummary[] = [];
 	private sessionSearchTimer: NodeJS.Timeout | undefined;
 	private semanticSearchTimer: NodeJS.Timeout | undefined;
@@ -491,6 +491,24 @@ export class InteractiveMode {
 			stateChanged: () => {
 				void this.refreshSessionSidebar();
 			},
+			persistedEntries: async (runtime, entries) => {
+				const manager = runtime.session.sessionManager;
+				const sessionPath = runtime.session.sessionFile;
+				if (!sessionPath) return;
+				await this.memory.recordPersistedEntries(
+					{ path: sessionPath, id: manager.getSessionId(), name: manager.getSessionName() },
+					entries,
+				);
+			},
+			runCompleted: async (runtime, messages) => {
+				const manager = runtime.session.sessionManager;
+				const sessionPath = runtime.session.sessionFile;
+				if (!sessionPath) return;
+				await this.memory.recordCompletedRun(
+					{ path: sessionPath, id: manager.getSessionId(), name: manager.getSessionName() },
+					messages,
+				);
+			},
 		});
 		this.version = VERSION;
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
@@ -505,12 +523,22 @@ export class InteractiveMode {
 		);
 		this.chatHistoryFocus = new ChatHistoryFocus();
 		this.sessionSidebar = new SessionSidebar();
-		this.sessionSearch = new SessionSearchService({
+		this.memory = new MemoryRuntime({
 			agentDir: this.sessionHost.current.services.agentDir,
 			cwd: this.sessionHost.current.session.sessionManager.getCwd(),
-			onSemanticStatus: (status) => {
+			onStatus: (status) => {
+				if (status.phase === "preparing") this.sessionSidebar.setSearchStatus(status.message);
+				if (status.phase === "unavailable")
+					this.sessionSidebar.setSearchStatus(status.message ?? "Keyword search · semantic search unavailable");
+				this.ui.requestRender();
+			},
+			onEmbeddingStatus: (status) => {
 				this.sessionSidebar.setSearchStatus(this.formatSemanticSearchStatus(status));
 				this.ui.requestRender();
+			},
+			onSearchRefresh: () => {
+				const query = this.sessionSidebar.searchQuery;
+				if (query?.trim()) this.scheduleSidebarSearch(query, 0);
 			},
 		});
 		this.headerContainer = new Container();
@@ -912,6 +940,12 @@ export class InteractiveMode {
 		// Initialize available provider count for footer display
 		await this.updateAvailableProviderCount();
 		await this.refreshSessionSidebar();
+		void this.memory.start(this.sidebarSessions).catch((error: unknown) => {
+			const message = error instanceof Error ? error.message : String(error);
+			this.sessionSidebar.setSearchStatus("Local memory unavailable · conversations remain usable");
+			this.showWarning(`Local memory initialization failed: ${message}`);
+			this.ui.requestRender();
+		});
 	}
 
 	/**
@@ -2858,6 +2892,16 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (text === "/status") {
+				this.editor.setText("");
+				await this.handleStatusCommand();
+				return;
+			}
+			if (text.startsWith("/status ")) {
+				this.editor.setText("");
+				this.showStatus("Usage: /status");
+				return;
+			}
 			if (text === "/changelog") {
 				this.handleChangelogCommand();
 				this.editor.setText("");
@@ -3056,7 +3100,13 @@ export class InteractiveMode {
 				break;
 
 			case "session_info_changed":
-				this.sessionSearch.invalidate();
+				void this.memory.recordTitle(
+					{
+						path: this.session.sessionFile ?? "",
+						id: this.sessionManager.getSessionId(),
+					},
+					event.name ?? "",
+				);
 				this.updateTerminalTitle();
 				this.footer.invalidate();
 				await this.refreshSessionSidebar();
@@ -3101,7 +3151,6 @@ export class InteractiveMode {
 				break;
 
 			case "message_end":
-				this.sessionSearch.invalidate();
 				if (event.message.role === "user") {
 					await this.refreshSessionSidebar();
 					break;
@@ -5101,7 +5150,7 @@ export class InteractiveMode {
 		const restoreSidebarFocus = this.sessionSidebar.focused;
 		try {
 			const result = await this.sessionHost.deleteSession(sessionPath, replacementPath);
-			await this.sessionSearch.remove(sessionPath);
+			await this.memory.removeSession(sessionPath);
 			await this.refreshSessionSidebar();
 			this.sessionSidebar.setStatusMessage(
 				result.method === "system-trash"
@@ -5147,7 +5196,7 @@ export class InteractiveMode {
 
 	private async runSidebarSearch(query: string, generation: number): Promise<void> {
 		try {
-			const results = await this.sessionSearch.search(query, this.sidebarSessions);
+			const results = await this.memory.search(query, this.sidebarSessions);
 			if (generation !== this.sessionSearchGeneration || query !== this.sessionSidebar.searchQuery) return;
 			this.sessionSidebar.setSearchResults(results);
 			this.ui.requestRender();
@@ -5160,7 +5209,7 @@ export class InteractiveMode {
 
 	private async runSemanticSidebarSearch(query: string, generation: number): Promise<void> {
 		try {
-			const results = await this.sessionSearch.searchSemantic(query, this.sidebarSessions);
+			const results = await this.memory.searchSemantic(query, this.sidebarSessions);
 			if (generation !== this.sessionSearchGeneration || query !== this.sessionSidebar.searchQuery) return;
 			this.sessionSidebar.setSearchResults(results);
 			this.sessionSidebar.setSearchStatus(undefined);
@@ -6270,6 +6319,75 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	/**
+	 * Render a local, read-only runtime snapshot. In particular, this never
+	 * invokes memory reconciliation, model setup, embedding, or index creation.
+	 */
+	private async handleStatusCommand(): Promise<void> {
+		const [sessions, memory] = await Promise.all([this.sessionHost.list(), this.memory.getDiagnostics()]);
+		const backgroundRunning = sessions.filter((session) => session.state === "background-running").length;
+		const backgroundWaiting = sessions.filter((session) => session.state === "background-waiting").length;
+		const cold = sessions.filter((session) => session.state === "cold").length;
+		const currentState = this.session.isStreaming
+			? "working"
+			: this.session.isCompacting
+				? "compacting"
+				: this.session.isBashRunning
+					? "running shell"
+					: "idle";
+		const background = [
+			backgroundRunning > 0 ? `${backgroundRunning} running` : undefined,
+			backgroundWaiting > 0 ? `${backgroundWaiting} settling` : undefined,
+		]
+			.filter((state): state is string => Boolean(state))
+			.join(" · ");
+		const semantic = this.formatSemanticRuntimeStatus(memory.semantic);
+
+		let info = `${theme.bold("Bone status")}\n\n`;
+		info += `${theme.bold("Sessions")}\n`;
+		info += `${theme.fg("dim", "Current:")} ${currentState}\n`;
+		info += `${theme.fg("dim", "Background:")} ${background || "none"}\n`;
+		info += `${theme.fg("dim", "Saved:")} ${cold.toLocaleString()} cold\n\n`;
+		info += `${theme.bold("Memory")}\n`;
+		info += `${theme.fg("dim", "Store:")} ${memory.store}\n`;
+		info += `${theme.fg("dim", "Indexed:")} ${memory.conversations.toLocaleString()} conversations · ${memory.exchanges.toLocaleString()} exchanges\n`;
+		info += `${theme.fg("dim", "Embedding:")} ${memory.embeddings.pending.toLocaleString()} pending · ${memory.embeddings.ready.toLocaleString()} ready · ${memory.embeddings.failed.toLocaleString()} failed\n`;
+		info += `${theme.fg("dim", "Worker:")} ${this.formatEmbeddingWorkerStatus(memory.worker)}\n`;
+		info += `${theme.fg("dim", "Vector index:")} ${memory.vectorIndex === "hnsw-sq" ? "HNSW-SQ" : "flat"}\n\n`;
+		info += `${theme.bold("Search")}\n`;
+		info += `${theme.fg("dim", "Keyword:")} ${memory.store === "ready" ? "ready" : memory.store}\n`;
+		info += `${theme.fg("dim", "Semantic:")} ${semantic.label}`;
+		if (semantic.action) info += `\n${theme.fg("dim", "Action:")} ${semantic.action}`;
+
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(info, 1, 0));
+		this.ui.requestRender();
+	}
+
+	private formatEmbeddingWorkerStatus(
+		worker: "not-started" | "starting" | "active" | "idle" | "unavailable" | "another-process",
+	): string {
+		switch (worker) {
+			case "not-started":
+				return "not started";
+			case "another-process":
+				return "another Bone process owns it";
+			default:
+				return worker;
+		}
+	}
+
+	private formatSemanticRuntimeStatus(status: { phase: "preparing" | "ready" | "unavailable"; message?: string }): {
+		label: string;
+		action?: string;
+	} {
+		if (status.phase === "ready") return { label: "ready · multilingual-e5-small" };
+		if (status.phase === "preparing") return { label: "preparing" };
+		if (status.message?.includes("not installed")) return { label: "not installed", action: "Run bone setup" };
+		if (status.message?.includes("needs repair")) return { label: "needs repair", action: "Run bone setup" };
+		return { label: status.message ?? "unavailable" };
+	}
+
 	private handleChangelogCommand(): void {
 		const changelogPath = getChangelogPath();
 		const allEntries = parseChangelog(changelogPath);
@@ -6590,7 +6708,7 @@ export class InteractiveMode {
 	stop(): void {
 		if (this.sessionSearchTimer) clearTimeout(this.sessionSearchTimer);
 		if (this.semanticSearchTimer) clearTimeout(this.semanticSearchTimer);
-		void this.sessionSearch.dispose();
+		void this.memory.dispose();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
 		}

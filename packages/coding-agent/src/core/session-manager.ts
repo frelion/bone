@@ -952,18 +952,19 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
-	_persist(entry: SessionEntry): void {
-		if (!this.persist || !this.sessionFile) return;
+	_persist(entry: SessionEntry): SessionEntry[] {
+		if (!this.persist || !this.sessionFile) return [];
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
 				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				return [entry];
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
 			}
-			return;
+			return [];
 		}
 
 		if (!this.flushed) {
@@ -976,16 +977,18 @@ export class SessionManager {
 				closeSync(fd);
 			}
 			this.flushed = true;
+			return this.fileEntries.filter((fileEntry): fileEntry is SessionEntry => fileEntry.type !== "session");
 		} else {
 			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			return [entry];
 		}
 	}
 
-	private _appendEntry(entry: SessionEntry): void {
+	private _appendEntry(entry: SessionEntry): SessionEntry[] {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this._persist(entry);
+		return this._persist(entry);
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -995,6 +998,14 @@ export class SessionManager {
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		return this.appendMessageWithPersistence(message).id;
+	}
+
+	/** Append a message and return every entry that became physically durable in this write. */
+	appendMessageWithPersistence(message: Message | CustomMessage | BashExecutionMessage): {
+		id: string;
+		persistedEntries: SessionEntry[];
+	} {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
@@ -1002,8 +1013,7 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			message,
 		};
-		this._appendEntry(entry);
-		return entry.id;
+		return { id: entry.id, persistedEntries: this._appendEntry(entry) };
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
@@ -1072,6 +1082,11 @@ export class SessionManager {
 
 	/** Append a session info entry (e.g., display name). Returns entry id. */
 	appendSessionInfo(name: string): string {
+		return this.appendSessionInfoWithPersistence(name).id;
+	}
+
+	/** Append display metadata and report the entries made durable by this write. */
+	appendSessionInfoWithPersistence(name: string): { id: string; persistedEntries: SessionEntry[] } {
 		const sanitizedName = name.replace(/[\r\n]+/g, " ").trim();
 		const entry: SessionInfoEntry = {
 			type: "session_info",
@@ -1080,8 +1095,7 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			name: sanitizedName,
 		};
-		this._appendEntry(entry);
-		return entry.id;
+		return { id: entry.id, persistedEntries: this._appendEntry(entry) };
 	}
 
 	/** Get the current session name from the latest session_info entry, if any. */

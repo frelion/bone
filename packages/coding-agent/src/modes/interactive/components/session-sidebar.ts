@@ -8,7 +8,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import type { InteractiveSessionSummary } from "../../../core/interactive-session-host.ts";
-import type { SessionSearchResult } from "../../../core/session-search.ts";
+import type { MemorySearchResult } from "../../../core/memory.ts";
 import { theme } from "../theme/theme.ts";
 
 const STATE_ICON: Record<InteractiveSessionSummary["state"], string> = {
@@ -98,7 +98,7 @@ export class SessionSidebar implements Component, Focusable {
 	private viewportRows = Number.POSITIVE_INFINITY;
 	private itemState: SidebarItemState = { kind: "normal" };
 	private searchInput: Input | undefined;
-	private searchResults: readonly SessionSearchResult[] | undefined;
+	private searchResults: readonly MemorySearchResult[] | undefined;
 	private searchStatus: string | undefined;
 	focused = false;
 	public onActivateSession?: (sessionPath: string) => void;
@@ -132,7 +132,7 @@ export class SessionSidebar implements Component, Focusable {
 	}
 
 	/** Replace the visible session order with ranked, explainable search results. */
-	setSearchResults(results: readonly SessionSearchResult[] | undefined): void {
+	setSearchResults(results: readonly MemorySearchResult[] | undefined): void {
 		if (!this.searchInput) return;
 		this.searchResults = results;
 		this.reconcileSelection();

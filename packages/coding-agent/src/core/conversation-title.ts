@@ -86,9 +86,7 @@ function parseTitle(content: string): ConversationTitleResult {
 	const title = parsed.title;
 	if (title === null) {
 		const message =
-			"message" in parsed && typeof parsed.message === "string"
-				? normalizeText(parsed.message)
-				: undefined;
+			"message" in parsed && typeof parsed.message === "string" ? normalizeText(parsed.message) : undefined;
 		return message && Array.from(message).length <= MAX_NOT_READY_MESSAGE_CHARS
 			? { kind: "not-ready", message }
 			: { kind: "not-ready" };
