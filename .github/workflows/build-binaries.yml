@@ -31,7 +31,7 @@ jobs:
           - target: darwin-arm64
             runner: macos-14
           - target: darwin-x64
-            runner: macos-13
+            runner: macos-15-intel
           - target: linux-x64
             runner: ubuntu-24.04
           - target: linux-arm64
@@ -53,6 +53,24 @@ jobs:
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: '22'
+
+      # setup-node's Windows cache does not include the Node-API headers or
+      # node.lib. Download the matching SDK explicitly; ARM64 needs an ARM64
+      # import library even though the hosted runner itself is x64.
+      - name: Download Windows Node-API SDK
+        if: startsWith(matrix.target, 'win32-')
+        shell: pwsh
+        run: |
+          $version = node -p "process.versions.node"
+          $arch = if ("${{ matrix.target }}" -eq "win32-arm64") { "arm64" } else { "x64" }
+          $archive = "node-v$version-win-$arch.zip"
+          $download = Join-Path $env:RUNNER_TEMP $archive
+          $destination = Join-Path $env:RUNNER_TEMP "node-sdk-$arch"
+          Invoke-WebRequest "https://nodejs.org/dist/v$version/$archive" -OutFile $download
+          Expand-Archive -Path $download -DestinationPath $destination
+          $nodeHome = Join-Path $destination "node-v$version-win-$arch"
+          Add-Content $env:GITHUB_ENV "BONE_NODE_API_INCLUDE_DIR=$(Join-Path $nodeHome 'include\node')"
+          Add-Content $env:GITHUB_ENV "BONE_NODE_LIBRARY=$(Join-Path $nodeHome 'node.lib')"
 
       - name: Build semantic native addon
         shell: bash
@@ -198,14 +216,15 @@ jobs:
           for asset in "${release_assets[@]}" SHA256SUMS RELEASE_NOTES.md; do test -f "${asset}"; done
           sha256sum -c SHA256SUMS
 
-          existing_release="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null || true)"
-          if [[ "${existing_release}" != "" ]]; then
-            echo "::error::Release ${RELEASE_TAG} already exists; releases are immutable."
-            exit 1
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" --clobber "${release_assets[@]}" SHA256SUMS
+            gh release edit "${RELEASE_TAG}" \
+              --title "Bone ${RELEASE_TAG#v}" \
+              --notes-file RELEASE_NOTES.md
+          else
+            gh release create "${RELEASE_TAG}" \
+              --verify-tag \
+              --title "Bone ${RELEASE_TAG#v}" \
+              --notes-file RELEASE_NOTES.md \
+              "${release_assets[@]}" SHA256SUMS
           fi
-
-          gh release create "${RELEASE_TAG}" \
-            --verify-tag \
-            --title "Bone ${RELEASE_TAG#v}" \
-            --notes-file RELEASE_NOTES.md \
-            "${release_assets[@]}" SHA256SUMS

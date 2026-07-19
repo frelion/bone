@@ -54,7 +54,10 @@ cmake_args=(
 )
 
 if [[ "$TARGET" == "win32-arm64" ]]; then
-    cmake_args+=( -A ARM64 )
+    # ggml's ARM backend rejects MSVC, but the Windows SDK and linker are
+    # still provided by Visual Studio. ClangCL keeps that integration while
+    # satisfying ggml's Clang requirement.
+    cmake_args+=( -A ARM64 -T ClangCL )
 elif [[ "$TARGET" == "win32-x64" ]]; then
     cmake_args+=( -A x64 )
 fi
@@ -102,10 +105,14 @@ case "$TARGET" in
 esac
 
 NODE_PREFIX="$(node -p "require('node:path').resolve(require('node:path').dirname(process.execPath), '..')")"
-NODE_API_INCLUDE_DIR="${NODE_PREFIX}/include/node"
-NODE_LIBRARY="${NODE_PREFIX}/node.lib"
+NODE_API_INCLUDE_DIR="${BONE_NODE_API_INCLUDE_DIR:-${NODE_PREFIX}/include/node}"
+NODE_LIBRARY="${BONE_NODE_LIBRARY:-${NODE_PREFIX}/node.lib}"
 if [[ ! -f "${NODE_API_INCLUDE_DIR}/node_api.h" ]]; then
     echo "Node-API headers are missing: ${NODE_API_INCLUDE_DIR}/node_api.h" >&2
+    exit 1
+fi
+if [[ "$TARGET" == win32-* && ! -f "${NODE_LIBRARY}" ]]; then
+    echo "Node import library is missing: ${NODE_LIBRARY}" >&2
     exit 1
 fi
 
@@ -122,7 +129,7 @@ if [[ "$TARGET" == win32-* ]]; then
     addon_cmake_args+=( -DBONE_NODE_LIBRARY="$NODE_LIBRARY" )
 fi
 if [[ "$TARGET" == "win32-arm64" ]]; then
-    addon_cmake_args+=( -A ARM64 )
+    addon_cmake_args+=( -A ARM64 -T ClangCL )
 elif [[ "$TARGET" == "win32-x64" ]]; then
     addon_cmake_args+=( -A x64 )
 fi
