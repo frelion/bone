@@ -59,7 +59,7 @@ if [[ "$TARGET" == "win32-arm64" ]]; then
     # satisfying ggml's Clang requirement. This is cross-compilation from an
     # x64 runner, so `-mcpu=native` would target the host and is invalid for
     # clang-cl's ARM64 target; use ggml's portable ARM64 baseline instead.
-    cmake_args+=( -A ARM64 -T ClangCL -DCRISPEMBED_NATIVE=OFF )
+    cmake_args+=( -A ARM64 -T ClangCL -DCRISPEMBED_NATIVE=OFF -DGGML_NATIVE=OFF )
 elif [[ "$TARGET" == "win32-x64" ]]; then
     cmake_args+=( -A x64 )
 fi
