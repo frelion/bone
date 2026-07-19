@@ -4,19 +4,17 @@ import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/p
 import { dirname, join, relative } from "node:path";
 import { parentPort } from "node:worker_threads";
 import lockfile from "proper-lockfile";
+import {
+	getLocalEmbeddingCacheDirectory,
+	getLocalEmbeddingManifestPath,
+	isLocalEmbeddingAssetManifest,
+	LOCAL_EMBEDDING_GGUF_FILE,
+	LOCAL_EMBEDDING_MODEL_ID,
+	type LocalEmbeddingAssetManifest,
+} from "./local-embedding-assets.ts";
 
-const MODEL_ID = "cstr/multilingual-e5-small-GGUF";
-const MODEL_CACHE_DIRECTORY = "bone-semantic-search-v2";
-const MODEL_API_URL = `https://huggingface.co/api/models/${MODEL_ID}`;
+const MODEL_API_URL = `https://huggingface.co/api/models/${LOCAL_EMBEDDING_MODEL_ID}`;
 const REQUEST_TIMEOUT_MS = 20_000;
-const GGUF_MODEL_FILE = "multilingual-e5-small-q8_0.gguf";
-
-interface ModelAssetManifest {
-	format: "bone-semantic-search-assets-v2";
-	modelId: string;
-	revision: string;
-	files: Record<string, string>;
-}
 
 type SetupStatus =
 	| { phase: "downloading"; loadedBytes?: number; totalBytes?: number; file?: string }
@@ -24,29 +22,11 @@ type SetupStatus =
 	| { phase: "ready" };
 
 function cacheDirectory(agentDir: string): string {
-	return join(agentDir, "models", MODEL_CACHE_DIRECTORY);
+	return getLocalEmbeddingCacheDirectory(agentDir);
 }
 
 function manifestPath(agentDir: string): string {
-	return join(cacheDirectory(agentDir), "asset-manifest.json");
-}
-
-function isManifest(value: unknown): value is ModelAssetManifest {
-	if (!value || typeof value !== "object") return false;
-	const candidate = value as Partial<ModelAssetManifest>;
-	return (
-		candidate.format === "bone-semantic-search-assets-v2" &&
-		candidate.modelId === MODEL_ID &&
-		typeof candidate.revision === "string" &&
-		/^[0-9a-f]{40}$/i.test(candidate.revision) &&
-		candidate.files !== undefined &&
-		candidate.files !== null &&
-		typeof candidate.files === "object" &&
-		Object.entries(candidate.files).every(
-			([path, hash]) => path.length > 0 && typeof hash === "string" && /^[0-9a-f]{64}$/i.test(hash),
-		) &&
-		Object.keys(candidate.files).some((path) => path.endsWith(`/${GGUF_MODEL_FILE}`))
-	);
+	return getLocalEmbeddingManifestPath(agentDir);
 }
 
 async function fileHash(path: string): Promise<string> {
@@ -66,12 +46,12 @@ async function listCachedFiles(root: string): Promise<string[]> {
 	return files;
 }
 
-async function readVerifiedManifest(agentDir: string): Promise<ModelAssetManifest | undefined> {
+async function readVerifiedManifest(agentDir: string): Promise<LocalEmbeddingAssetManifest | undefined> {
 	const path = manifestPath(agentDir);
 	if (!existsSync(path)) return undefined;
 	try {
 		const manifest: unknown = JSON.parse(await readFile(path, "utf8"));
-		if (!isManifest(manifest) || Object.keys(manifest.files).length === 0) return undefined;
+		if (!isLocalEmbeddingAssetManifest(manifest) || Object.keys(manifest.files).length === 0) return undefined;
 		const root = cacheDirectory(agentDir);
 		for (const [file, expectedHash] of Object.entries(manifest.files)) {
 			const filePath = join(root, file);
@@ -99,13 +79,18 @@ async function resolveImmutableRevision(): Promise<string> {
 }
 
 async function downloadModel(agentDir: string, revision: string): Promise<void> {
-	const target = join(cacheDirectory(agentDir), MODEL_ID, revision, GGUF_MODEL_FILE);
+	const target = join(cacheDirectory(agentDir), LOCAL_EMBEDDING_MODEL_ID, revision, LOCAL_EMBEDDING_GGUF_FILE);
 	if (existsSync(target)) return;
 	const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
-	const response = await fetch(`https://huggingface.co/${MODEL_ID}/resolve/${revision}/${GGUF_MODEL_FILE}`, {
-		signal: AbortSignal.timeout(10 * 60_000),
-	});
-	if (!response.ok || !response.body) throw new Error(`Could not download ${GGUF_MODEL_FILE} (${response.status})`);
+	const response = await fetch(
+		`https://huggingface.co/${LOCAL_EMBEDDING_MODEL_ID}/resolve/${revision}/${LOCAL_EMBEDDING_GGUF_FILE}`,
+		{
+			signal: AbortSignal.timeout(10 * 60_000),
+		},
+	);
+	if (!response.ok || !response.body) {
+		throw new Error(`Could not download ${LOCAL_EMBEDDING_GGUF_FILE} (${response.status})`);
+	}
 	const totalBytes = Number(response.headers.get("content-length"));
 	let loadedBytes = 0;
 	await mkdir(dirname(target), { recursive: true, mode: 0o700 });
@@ -116,7 +101,7 @@ async function downloadModel(agentDir: string, revision: string): Promise<void> 
 			loadedBytes += chunk.length;
 			postStatus({
 				phase: "downloading",
-				file: GGUF_MODEL_FILE,
+				file: LOCAL_EMBEDDING_GGUF_FILE,
 				loadedBytes,
 				...(Number.isFinite(totalBytes) && totalBytes > 0 ? { totalBytes } : {}),
 			});
@@ -132,7 +117,7 @@ async function downloadModel(agentDir: string, revision: string): Promise<void> 
 
 async function writeManifest(agentDir: string, revision: string): Promise<void> {
 	const root = cacheDirectory(agentDir);
-	const revisionRoot = join(root, MODEL_ID, revision);
+	const revisionRoot = join(root, LOCAL_EMBEDDING_MODEL_ID, revision);
 	const files = Object.fromEntries(
 		await Promise.all(
 			(await listCachedFiles(revisionRoot)).map(
@@ -143,7 +128,11 @@ async function writeManifest(agentDir: string, revision: string): Promise<void> 
 	const temporary = `${manifestPath(agentDir)}.${process.pid}.${Date.now()}.tmp`;
 	await writeFile(
 		temporary,
-		`${JSON.stringify({ format: "bone-semantic-search-assets-v2", modelId: MODEL_ID, revision, files }, null, 2)}\n`,
+		`${JSON.stringify(
+			{ format: "bone-semantic-search-assets-v2", modelId: LOCAL_EMBEDDING_MODEL_ID, revision, files },
+			null,
+			2,
+		)}\n`,
 		{ mode: 0o600 },
 	);
 	await rename(temporary, manifestPath(agentDir));
@@ -160,9 +149,9 @@ async function prepare(agentDir: string): Promise<void> {
 	try {
 		if (await readVerifiedManifest(agentDir)) return;
 		await rm(manifestPath(agentDir), { force: true });
-		postStatus({ phase: "downloading", file: GGUF_MODEL_FILE });
+		postStatus({ phase: "downloading", file: LOCAL_EMBEDDING_GGUF_FILE });
 		const revision = await resolveImmutableRevision();
-		await rm(join(cacheDir, MODEL_ID, revision), { recursive: true, force: true });
+		await rm(join(cacheDir, LOCAL_EMBEDDING_MODEL_ID, revision), { recursive: true, force: true });
 		await downloadModel(agentDir, revision);
 		await writeManifest(agentDir, revision);
 		if (!(await readVerifiedManifest(agentDir))) {

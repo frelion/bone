@@ -40,3 +40,8 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
+
+# Bone runtime state and local release artifacts
+.bone/
+packages/coding-agent/.bone/
+artifacts/

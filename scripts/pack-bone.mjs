@@ -72,6 +72,10 @@ if (!skipBuild) {
 	run("npm", ["run", "build"], repoRoot);
 }
 
+const nativeAssets = join(codingAgentDir, "dist", "native");
+run("node", ["scripts/verify-semantic-native.mjs", "--root", nativeAssets], repoRoot);
+run("node", ["scripts/verify-bone-package-metadata.mjs", "--root", codingAgentDir], repoRoot);
+
 const stagingDir = mkdtempSync(join(tmpdir(), "bone-pack-"));
 const stagingPackageDir = join(stagingDir, "package");
 const tarballsDir = join(stagingDir, "tarballs");
@@ -90,6 +94,8 @@ for (const entry of ["README.md", "CHANGELOG.md"]) {
 	cpSync(join(codingAgentDir, entry), join(stagingPackageDir, entry));
 }
 
+run("node", ["scripts/verify-semantic-native.mjs", "--root", join(stagingPackageDir, "dist", "native")], repoRoot);
+
 const packageJson = JSON.parse(readFileSync(join(codingAgentDir, "package.json"), "utf8"));
 const publishedDependencies = { ...packageJson.dependencies };
 const bundledDependencies = packageDirectories.map((pkg) => pkg.name);
@@ -105,6 +111,7 @@ packageJson.dependencies = {
 	),
 };
 writeFileSync(join(stagingPackageDir, "package.json"), `${JSON.stringify(packageJson, null, "\t")}\n`);
+run("node", ["scripts/verify-bone-package-metadata.mjs", "--root", stagingPackageDir], repoRoot);
 
 run("npm", ["install", "--omit=dev", "--ignore-scripts", "--package-lock=false"], stagingPackageDir);
 

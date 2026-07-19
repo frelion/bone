@@ -273,6 +273,29 @@ describe("Memory runtime", () => {
 		});
 	});
 
+	it("rejects unsafe paths in a local semantic asset manifest", async () => {
+		const directory = await createTemporaryDirectory();
+		const agentDir = join(directory, "agent");
+		const cacheDirectory = join(agentDir, "models", "bone-semantic-search-v2");
+		await mkdir(cacheDirectory, { recursive: true });
+		await writeFile(
+			join(cacheDirectory, "asset-manifest.json"),
+			JSON.stringify({
+				format: "bone-semantic-search-assets-v2",
+				modelId: "cstr/multilingual-e5-small-GGUF",
+				revision: "e5708111f19bcfd279811f8f0702d6c33242b402",
+				files: {
+					"cstr/../../../outside/multilingual-e5-small-q8_0.gguf": "0".repeat(64),
+				},
+			}),
+		);
+
+		expect(await getLocalEmbeddingAvailability(agentDir)).toEqual({
+			state: "invalid",
+			reason: "asset manifest is invalid",
+		});
+	});
+
 	it("reports a read-only memory status snapshot without preparing the local model", async () => {
 		const directory = await createTemporaryDirectory();
 		const agentDir = join(directory, "agent");

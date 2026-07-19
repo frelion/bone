@@ -1,14 +1,19 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	getLocalEmbeddingCacheDirectory,
+	getLocalEmbeddingManifestPath,
+	isLocalEmbeddingAssetManifest,
+	LOCAL_EMBEDDING_DIMENSIONS,
+	LOCAL_EMBEDDING_GGUF_FILE,
+	LOCAL_EMBEDDING_MODEL_ID,
+	type LocalEmbeddingAssetManifest,
+} from "./local-embedding-assets.ts";
 
-const MODEL_ID = "cstr/multilingual-e5-small-GGUF";
-const MODEL_CACHE_DIRECTORY = "bone-semantic-search-v2";
-const GGUF_MODEL_FILE = "multilingual-e5-small-q8_0.gguf";
-const EMBEDDING_DIMENSIONS = 384;
 const MAX_SIDECAR_FRAME_BYTES = 128 * 1024 * 1024;
 
 const SIDECAR_PREPARE = 1;
@@ -36,49 +41,11 @@ export interface LocalEmbeddingEngine {
 	dispose(): Promise<void>;
 }
 
-interface ModelAssetManifest {
-	format: "bone-semantic-search-assets-v2";
-	modelId: string;
-	revision: string;
-	files: Record<string, string>;
-}
-
 interface PendingRequest {
 	kind: "prepare" | "embed" | "dispose";
 	expectedCount: number;
 	resolve: (vectors: Float32Array[]) => void;
 	reject: (error: Error) => void;
-}
-
-function getCacheDirectory(agentDir: string): string {
-	return join(agentDir, "models", MODEL_CACHE_DIRECTORY);
-}
-
-function getManifestPath(agentDir: string): string {
-	return join(getCacheDirectory(agentDir), "asset-manifest.json");
-}
-
-function isAssetManifest(value: unknown): value is ModelAssetManifest {
-	if (!value || typeof value !== "object") return false;
-	const candidate = value as Partial<ModelAssetManifest>;
-	return (
-		candidate.format === "bone-semantic-search-assets-v2" &&
-		candidate.modelId === MODEL_ID &&
-		typeof candidate.revision === "string" &&
-		/^[0-9a-f]{40}$/i.test(candidate.revision) &&
-		candidate.files !== undefined &&
-		candidate.files !== null &&
-		typeof candidate.files === "object" &&
-		Object.entries(candidate.files).every(
-			([path, hash]) =>
-				path.length > 0 &&
-				!path.startsWith("../") &&
-				!path.includes("\\") &&
-				typeof hash === "string" &&
-				/^[0-9a-f]{64}$/i.test(hash),
-		) &&
-		Object.keys(candidate.files).some((path) => path.endsWith(`/${GGUF_MODEL_FILE}`))
-	);
 }
 
 async function hashFile(path: string): Promise<string> {
@@ -87,54 +54,85 @@ async function hashFile(path: string): Promise<string> {
 	return hash.digest("hex");
 }
 
-async function readVerifiedManifest(agentDir: string): Promise<ModelAssetManifest | undefined> {
-	const manifestPath = getManifestPath(agentDir);
-	if (!existsSync(manifestPath)) return undefined;
+interface VerifiedManifestCacheEntry {
+	manifestSource: string;
+	assetSignature: string;
+	manifest: LocalEmbeddingAssetManifest;
+}
+
+type ManifestVerification =
+	| { state: "ready"; manifest: LocalEmbeddingAssetManifest }
+	| { state: "missing" }
+	| { state: "invalid"; reason: string };
+
+// A startup checks availability first and then starts this worker. Reusing a
+// verified manifest prevents reading the Q8 GGUF twice while still rechecking
+// the manifest and every asset's metadata before trusting the cache.
+const verifiedManifestCache = new Map<string, VerifiedManifestCacheEntry>();
+
+async function verifyLocalEmbeddingManifest(agentDir: string): Promise<ManifestVerification> {
+	const manifestPath = getLocalEmbeddingManifestPath(agentDir);
+	if (!existsSync(manifestPath)) return { state: "missing" };
+
+	let manifestSource: string;
 	let manifest: unknown;
 	try {
-		manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+		manifestSource = await readFile(manifestPath, "utf8");
+		manifest = JSON.parse(manifestSource);
 	} catch {
-		return undefined;
+		verifiedManifestCache.delete(manifestPath);
+		return { state: "invalid", reason: "asset manifest cannot be read" };
 	}
-	if (!isAssetManifest(manifest) || Object.keys(manifest.files).length === 0) return undefined;
-	const root = getCacheDirectory(agentDir);
-	for (const [relativePath, expectedHash] of Object.entries(manifest.files)) {
+	if (!isLocalEmbeddingAssetManifest(manifest) || Object.keys(manifest.files).length === 0) {
+		verifiedManifestCache.delete(manifestPath);
+		return { state: "invalid", reason: "asset manifest is invalid" };
+	}
+
+	const root = getLocalEmbeddingCacheDirectory(agentDir);
+	const assets: Array<{ path: string; expectedHash: string; signature: string }> = [];
+	for (const [relativePath, expectedHash] of Object.entries(manifest.files).sort(([left], [right]) =>
+		left.localeCompare(right),
+	)) {
 		const assetPath = join(root, relativePath);
-		if (!existsSync(assetPath)) return undefined;
 		try {
-			if ((await hashFile(assetPath)) !== expectedHash) return undefined;
+			const metadata = await stat(assetPath);
+			if (!metadata.isFile()) throw new Error("not a file");
+			assets.push({
+				path: assetPath,
+				expectedHash,
+				signature: `${relativePath}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}`,
+			});
 		} catch {
-			return undefined;
+			verifiedManifestCache.delete(manifestPath);
+			return { state: "invalid", reason: `missing ${relativePath}` };
 		}
 	}
-	return manifest;
+
+	const assetSignature = assets.map((asset) => asset.signature).join("|");
+	const cached = verifiedManifestCache.get(manifestPath);
+	if (cached?.manifestSource === manifestSource && cached.assetSignature === assetSignature) {
+		return { state: "ready", manifest: cached.manifest };
+	}
+
+	for (const asset of assets) {
+		try {
+			if ((await hashFile(asset.path)) !== asset.expectedHash) {
+				verifiedManifestCache.delete(manifestPath);
+				return { state: "invalid", reason: `checksum mismatch for ${asset.path.slice(root.length + 1)}` };
+			}
+		} catch {
+			verifiedManifestCache.delete(manifestPath);
+			return { state: "invalid", reason: `cannot verify ${asset.path.slice(root.length + 1)}` };
+		}
+	}
+	verifiedManifestCache.set(manifestPath, { manifestSource, assetSignature, manifest });
+	return { state: "ready", manifest };
 }
 
 /** Verify only local, already-downloaded semantic assets. This function never fetches. */
 export async function getLocalEmbeddingAvailability(agentDir: string): Promise<LocalEmbeddingAvailability> {
-	const manifestPath = getManifestPath(agentDir);
-	if (!existsSync(manifestPath)) return { state: "missing" };
-	let manifest: unknown;
-	try {
-		manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-	} catch {
-		return { state: "invalid", reason: "asset manifest cannot be read" };
-	}
-	if (!isAssetManifest(manifest) || Object.keys(manifest.files).length === 0) {
-		return { state: "invalid", reason: "asset manifest is invalid" };
-	}
-	const root = getCacheDirectory(agentDir);
-	for (const [relativePath, expectedHash] of Object.entries(manifest.files)) {
-		const assetPath = join(root, relativePath);
-		if (!existsSync(assetPath)) return { state: "invalid", reason: `missing ${relativePath}` };
-		try {
-			const actualHash = await hashFile(assetPath);
-			if (actualHash !== expectedHash) return { state: "invalid", reason: `checksum mismatch for ${relativePath}` };
-		} catch {
-			return { state: "invalid", reason: `cannot verify ${relativePath}` };
-		}
-	}
-	return { state: "ready" };
+	const verification = await verifyLocalEmbeddingManifest(agentDir);
+	return verification.state === "ready" ? { state: "ready" } : verification;
 }
 
 function uint32(value: number): Buffer {
@@ -241,9 +239,15 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 	}
 
 	private async prepareInternal(): Promise<void> {
-		const manifest = await readVerifiedManifest(this.agentDir);
-		if (!manifest) throw new Error("Local semantic model assets are not prepared. Run bone setup.");
-		const modelPath = join(getCacheDirectory(this.agentDir), MODEL_ID, manifest.revision, GGUF_MODEL_FILE);
+		const verification = await verifyLocalEmbeddingManifest(this.agentDir);
+		if (verification.state !== "ready")
+			throw new Error("Local semantic model assets are not prepared. Run bone setup.");
+		const modelPath = join(
+			getLocalEmbeddingCacheDirectory(this.agentDir),
+			LOCAL_EMBEDDING_MODEL_ID,
+			verification.manifest.revision,
+			LOCAL_EMBEDDING_GGUF_FILE,
+		);
 		if (!existsSync(modelPath)) throw new Error("Local semantic model is missing its Q8 GGUF model");
 		this.onStatus?.({ phase: "loading" });
 		this.ensureSidecar();
@@ -367,7 +371,7 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 			pending.resolve([]);
 			return;
 		}
-		if (count !== pending.expectedCount || dimensions !== EMBEDDING_DIMENSIONS) {
+		if (count !== pending.expectedCount || dimensions !== LOCAL_EMBEDDING_DIMENSIONS) {
 			pending.reject(new Error("Local embedding sidecar returned an unexpected vector shape"));
 			return;
 		}

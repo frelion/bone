@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Release script for pi-mono
+ * Release script for Bone.
  *
  * Usage:
  *   node scripts/release.mjs <major|minor|patch>
@@ -15,7 +15,7 @@
  * 6. Commit and tag the release
  * 7. Add new [Unreleased] section to changelogs
  * 8. Commit next-cycle changelog updates
- * 9. Push main and the tag to trigger CI publishing
+ * 9. Push main and the tag to trigger the GitHub Release workflow
  */
 
 import { execSync } from "child_process";
