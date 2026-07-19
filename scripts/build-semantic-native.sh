@@ -65,10 +65,7 @@ cmake --build "$BUILD_DIR" --config Release --parallel 4 \
     --target crispembed-shared crispembed-cli crispembed-server crispembed-quantize
 cmake --install "$BUILD_DIR" --config Release --prefix "$INSTALL_DIR"
 
-if [[ -e "$DESTINATION" ]]; then
-    echo "Refusing to overwrite existing native sidecar: $DESTINATION" >&2
-    exit 1
-fi
+rm -rf "$DESTINATION"
 mkdir -p "$DESTINATION"
 
 copy_required() {
@@ -87,20 +84,40 @@ case "$TARGET" in
         copy_required "$INSTALL_DIR/lib/libggml.0.dylib" "libggml.0.dylib"
         copy_required "$INSTALL_DIR/lib/libggml-cpu.0.dylib" "libggml-cpu.0.dylib"
         copy_required "$INSTALL_DIR/lib/libggml-base.0.dylib" "libggml-base.0.dylib"
+        CRISPEMBED_LINK_LIBRARY="$INSTALL_DIR/lib/libcrispembed.0.dylib"
         ;;
     linux-*)
         copy_required "$INSTALL_DIR/lib/libcrispembed.so.0" "libcrispembed.so.0"
         copy_required "$INSTALL_DIR/lib/libggml.so.0" "libggml.so.0"
         copy_required "$INSTALL_DIR/lib/libggml-cpu.so.0" "libggml-cpu.so.0"
         copy_required "$INSTALL_DIR/lib/libggml-base.so.0" "libggml-base.so.0"
+        CRISPEMBED_LINK_LIBRARY="$INSTALL_DIR/lib/libcrispembed.so.0"
         ;;
     win32-*)
         copy_required "$INSTALL_DIR/bin/crispembed.dll" "crispembed.dll"
         copy_required "$INSTALL_DIR/bin/ggml.dll" "ggml.dll"
         copy_required "$INSTALL_DIR/bin/ggml-cpu.dll" "ggml-cpu.dll"
         copy_required "$INSTALL_DIR/bin/ggml-base.dll" "ggml-base.dll"
+        CRISPEMBED_LINK_LIBRARY="$INSTALL_DIR/lib/crispembed.lib"
         ;;
 esac
+
+SIDECAR_BUILD_DIR="${SOURCE_DIR}/bone-embed-build"
+sidecar_cmake_args=(
+    -S "${ROOT}/packages/coding-agent/native"
+    -B "$SIDECAR_BUILD_DIR"
+    -DCMAKE_BUILD_TYPE=Release
+    -DBONE_CRISPEMBED_INCLUDE_DIR="$INSTALL_DIR/include"
+    -DBONE_CRISPEMBED_LIBRARY="$CRISPEMBED_LINK_LIBRARY"
+)
+if [[ "$TARGET" == "win32-arm64" ]]; then
+    sidecar_cmake_args+=( -A ARM64 )
+elif [[ "$TARGET" == "win32-x64" ]]; then
+    sidecar_cmake_args+=( -A x64 )
+fi
+cmake "${sidecar_cmake_args[@]}"
+cmake --build "$SIDECAR_BUILD_DIR" --config Release --parallel 4
+cmake --install "$SIDECAR_BUILD_DIR" --config Release --prefix "$DESTINATION"
 
 printf '%s\n' "$CRISPEMBED_COMMIT" > "$DESTINATION/CRISPEMBED_COMMIT"
 echo "Built $TARGET semantic sidecar in $DESTINATION"
