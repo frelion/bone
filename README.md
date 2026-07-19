@@ -1,5 +1,7 @@
 # Bone
 
+**English** | [简体中文](README.zh-CN.md)
+
 Bone is a local-first coding agent built on a maintained fork of Pi. It adds a
 session Side panel, concurrent background conversations, visual provider
 configuration, task-model routing, and local semantic memory.
@@ -11,6 +13,9 @@ bone
 Use `/settings` to configure providers and models. Run `bone setup` once to
 download Bone's optional local semantic-search model; normal startup never
 downloads it automatically.
+
+Read the [documentation](docs/README.md) for installation, sessions, settings,
+local memory, and release guidance.
 
 ## Releases
 

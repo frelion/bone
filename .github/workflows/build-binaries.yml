@@ -127,7 +127,9 @@ jobs:
           mkdir -p release-assets
 
           VERSION="${RELEASE_TAG#v}"
-          node scripts/release-notes.mjs extract --version "${VERSION}" --tag "${RELEASE_TAG}" --repo "frelion/bone" --out release-assets/RELEASE_NOTES.md
+          printf '%s\n\n' "> [简体中文：安装与发布指南](https://github.com/frelion/bone/blob/${RELEASE_TAG}/docs/zh-CN/releases.md)" > release-assets/RELEASE_NOTES.md
+          node scripts/release-notes.mjs extract --version "${VERSION}" --tag "${RELEASE_TAG}" --repo "frelion/bone" --out /tmp/bone-release-notes.md
+          cat /tmp/bone-release-notes.md >> release-assets/RELEASE_NOTES.md
           node scripts/generate-coding-agent-install-lock.mjs --check
           cp packages/coding-agent/install-lock/package.json release-assets/bone-install-package.json
           cp packages/coding-agent/install-lock/package-lock.json release-assets/bone-install-package-lock.json
