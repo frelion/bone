@@ -1,9 +1,9 @@
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import {
 	getLocalEmbeddingCacheDirectory,
 	getLocalEmbeddingManifestPath,
@@ -13,14 +13,6 @@ import {
 	LOCAL_EMBEDDING_MODEL_ID,
 	type LocalEmbeddingAssetManifest,
 } from "./local-embedding-assets.ts";
-
-const MAX_SIDECAR_FRAME_BYTES = 128 * 1024 * 1024;
-
-const SIDECAR_PREPARE = 1;
-const SIDECAR_EMBED = 2;
-const SIDECAR_DISPOSE = 3;
-const SIDECAR_SUCCESS = 128;
-const SIDECAR_ERROR = 129;
 
 export type LocalEmbeddingAvailability =
 	| { state: "ready" }
@@ -32,6 +24,19 @@ export type LocalEmbeddingStatus =
 	| { phase: "loading" }
 	| { phase: "ready" };
 
+export type LocalEmbeddingEnginePhase = "not-started" | "loading" | "ready" | "embedding" | "failed" | "disposed";
+
+export interface LocalEmbeddingEngineDiagnostics {
+	phase: LocalEmbeddingEnginePhase;
+	runtime: "same-process-worker-thread";
+	pendingQueries: number;
+	pendingDocuments: number;
+	activeDocuments: number;
+	pid?: number;
+	modelFingerprint?: string;
+	error?: string;
+}
+
 /** Minimal boundary used by search so tests never need to start the native GGUF runtime. */
 export interface LocalEmbeddingEngine {
 	/** Resolve and verify the fixed local model before any search query needs it. */
@@ -39,13 +44,35 @@ export interface LocalEmbeddingEngine {
 	embedQuery(query: string): Promise<Float32Array>;
 	embedDocuments(documents: readonly string[]): Promise<Float32Array[]>;
 	dispose(): Promise<void>;
+	/** Optional because tests may substitute a minimal in-memory embedding engine. */
+	getDiagnostics?(): LocalEmbeddingEngineDiagnostics;
 }
 
-interface PendingRequest {
+type PendingRequest = {
 	kind: "prepare" | "embed" | "dispose";
 	expectedCount: number;
 	resolve: (vectors: Float32Array[]) => void;
 	reject: (error: Error) => void;
+};
+
+type WorkerStatus = {
+	phase?: unknown;
+	pendingQueries?: unknown;
+	pendingDocuments?: unknown;
+	activeDocuments?: unknown;
+	pid?: unknown;
+	modelFingerprint?: unknown;
+	error?: unknown;
+};
+
+function initialDiagnostics(): LocalEmbeddingEngineDiagnostics {
+	return {
+		phase: "not-started",
+		runtime: "same-process-worker-thread",
+		pendingQueries: 0,
+		pendingDocuments: 0,
+		activeDocuments: 0,
+	};
 }
 
 async function hashFile(path: string): Promise<string> {
@@ -65,9 +92,6 @@ type ManifestVerification =
 	| { state: "missing" }
 	| { state: "invalid"; reason: string };
 
-// A startup checks availability first and then starts this worker. Reusing a
-// verified manifest prevents reading the Q8 GGUF twice while still rechecking
-// the manifest and every asset's metadata before trusting the cache.
 const verifiedManifestCache = new Map<string, VerifiedManifestCacheEntry>();
 
 async function verifyLocalEmbeddingManifest(agentDir: string): Promise<ManifestVerification> {
@@ -135,57 +159,83 @@ export async function getLocalEmbeddingAvailability(agentDir: string): Promise<L
 	return verification.state === "ready" ? { state: "ready" } : verification;
 }
 
-function uint32(value: number): Buffer {
-	const buffer = Buffer.allocUnsafe(4);
-	buffer.writeUInt32LE(value, 0);
-	return buffer;
-}
-
-function stringFrame(value: string): Buffer {
-	const encoded = Buffer.from(value, "utf8");
-	return Buffer.concat([uint32(encoded.length), encoded]);
-}
-
-function sidecarExecutableName(): string | undefined {
+function nativePlatform(): string | undefined {
 	const platform = `${process.platform}-${process.arch}`;
-	if (!new Set(["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64", "win32-x64", "win32-arm64"]).has(platform)) {
-		return undefined;
-	}
-	return process.platform === "win32" ? "bone-embed.exe" : "bone-embed";
+	return new Set(["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64", "win32-x64", "win32-arm64"]).has(platform)
+		? platform
+		: undefined;
 }
 
-function resolveSidecarExecutable(): string {
-	const executable = sidecarExecutableName();
-	const platform = `${process.platform}-${process.arch}`;
-	if (!executable) throw new Error(`Local GGUF semantic search is not bundled for ${platform}`);
+function resolveNativeAddon(): string {
+	const platform = nativePlatform();
+	if (!platform) throw new Error(`Local GGUF semantic search is not bundled for ${process.platform}-${process.arch}`);
 	const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 	const sourceRuntime = import.meta.url.endsWith(".ts");
 	const candidates = [
 		sourceRuntime
-			? join(moduleDirectory, "..", "..", "native", platform, executable)
-			: join(moduleDirectory, "..", "native", platform, executable),
-		join(dirname(process.execPath), "native", platform, executable),
+			? join(moduleDirectory, "..", "..", "native", platform, "bone-embed.node")
+			: join(moduleDirectory, "..", "native", platform, "bone-embed.node"),
+		join(dirname(process.execPath), "native", platform, "bone-embed.node"),
 	];
 	for (const candidate of candidates) {
 		if (existsSync(candidate)) return candidate;
 	}
-	throw new Error("Bone's local GGUF embedding sidecar is missing from this installation");
+	throw new Error("Bone's local GGUF embedding addon is missing from this installation");
+}
+
+function workerSpecifier(): URL {
+	return new URL(
+		import.meta.url.endsWith(".ts") ? "./local-embedding-worker.ts" : "./local-embedding-worker.js",
+		import.meta.url,
+	);
+}
+
+function localEmbeddingWorkerEntry(): string | URL {
+	// Bun standalone executables resolve explicitly bundled worker entrypoints
+	// by their source path. URL resolution points into the executable's virtual
+	// filesystem instead, leaving the worker alive but unable to receive work.
+	if (typeof process.versions.bun === "string") return "./src/core/local-embedding-worker.ts";
+	return workerSpecifier();
+}
+
+function asDiagnostics(status: WorkerStatus): LocalEmbeddingEngineDiagnostics | undefined {
+	const phase = status.phase;
+	if (
+		phase !== "not-started" &&
+		phase !== "loading" &&
+		phase !== "ready" &&
+		phase !== "embedding" &&
+		phase !== "failed" &&
+		phase !== "disposed"
+	)
+		return undefined;
+	const number = (value: unknown): number =>
+		typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+	return {
+		phase,
+		runtime: "same-process-worker-thread",
+		pendingQueries: number(status.pendingQueries),
+		pendingDocuments: number(status.pendingDocuments),
+		activeDocuments: number(status.activeDocuments),
+		...(typeof status.pid === "number" && Number.isSafeInteger(status.pid) ? { pid: status.pid } : {}),
+		...(typeof status.modelFingerprint === "string" ? { modelFingerprint: status.modelFingerprint } : {}),
+		...(typeof status.error === "string" ? { error: status.error } : {}),
+	};
 }
 
 /**
- * Owns a private native child process. It contains the model and its mmap'd
- * weights, while the Node process retains only TUI/search orchestration state.
+ * Owns one Node Worker Thread in the same Bone process. The thread loads the
+ * Node-API addon and is the only thread allowed to access CrispEmbed's context.
  */
 export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
-	private sidecar: ChildProcessWithoutNullStreams | undefined;
+	private worker: Worker | undefined;
 	private nextRequestId = 1;
 	private readonly pending = new Map<number, PendingRequest>();
-	private output = Buffer.alloc(0);
-	private stderr = "";
 	private preparePromise: Promise<void> | undefined;
 	private prepared = false;
 	private readonly agentDir: string;
 	private readonly onStatus: ((status: LocalEmbeddingStatus) => void) | undefined;
+	private diagnostics = initialDiagnostics();
 
 	constructor(agentDir: string, options?: { onStatus?: (status: LocalEmbeddingStatus) => void }) {
 		this.agentDir = agentDir;
@@ -203,6 +253,10 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 		await this.preparePromise;
 	}
 
+	getDiagnostics(): LocalEmbeddingEngineDiagnostics {
+		return { ...this.diagnostics };
+	}
+
 	async embedQuery(query: string): Promise<Float32Array> {
 		const [vector] = await this.embed("query", [query]);
 		if (!vector) throw new Error("Local embedding model returned no query vector");
@@ -214,28 +268,28 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 	}
 
 	async dispose(): Promise<void> {
-		const sidecar = this.sidecar;
+		const worker = this.worker;
 		this.prepared = false;
 		this.preparePromise = undefined;
-		if (!sidecar) return;
-		try {
-			await this.sendRequest("dispose", 0, Buffer.alloc(0));
-		} catch {
-			// The process may already have exited; it is still safe to finish disposal.
+		if (!worker) {
+			this.diagnostics = { ...this.diagnostics, phase: "disposed" };
+			return;
 		}
-		sidecar.stdin.end();
-		await new Promise<void>((resolve) => {
-			const timeout = setTimeout(() => {
-				if (!sidecar.killed) sidecar.kill();
-				resolve();
-			}, 1_000);
-			sidecar.once("exit", () => {
-				clearTimeout(timeout);
-				resolve();
-			});
-		});
-		if (this.sidecar === sidecar) this.sidecar = undefined;
-		this.failPending(new Error("Local embedding sidecar disposed"));
+		try {
+			await this.request("dispose", 0, {});
+		} catch {
+			// The Worker may already have exited. Termination still releases its JS state.
+		}
+		await worker.terminate().catch(() => undefined);
+		if (this.worker === worker) this.worker = undefined;
+		this.diagnostics = {
+			...this.diagnostics,
+			phase: "disposed",
+			pendingQueries: 0,
+			pendingDocuments: 0,
+			activeDocuments: 0,
+		};
+		this.failPending(new Error("Local embedding worker disposed"));
 	}
 
 	private async prepareInternal(): Promise<void> {
@@ -249,9 +303,13 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 			LOCAL_EMBEDDING_GGUF_FILE,
 		);
 		if (!existsSync(modelPath)) throw new Error("Local semantic model is missing its Q8 GGUF model");
+		this.diagnostics = { ...this.diagnostics, phase: "loading" };
 		this.onStatus?.({ phase: "loading" });
-		this.ensureSidecar();
-		await this.sendRequest("prepare", 0, stringFrame(modelPath));
+		await this.request("prepare", 0, {
+			modelPath,
+			addonPath: resolveNativeAddon(),
+			fingerprint: `${verification.manifest.modelId}@${verification.manifest.revision}`,
+		});
 		this.prepared = true;
 		this.onStatus?.({ phase: "ready" });
 	}
@@ -259,138 +317,85 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 	private async embed(mode: "query" | "document", texts: readonly string[]): Promise<Float32Array[]> {
 		if (texts.length === 0) return [];
 		await this.prepare();
-		const payload = Buffer.concat([
-			Buffer.from([mode === "query" ? 0 : 1]),
-			uint32(texts.length),
-			...texts.map((text) => stringFrame(text)),
-		]);
-		return await this.sendRequest("embed", texts.length, payload);
+		return await this.request("embed", texts.length, { mode, texts: [...texts] });
 	}
 
-	private ensureSidecar(): ChildProcessWithoutNullStreams {
-		if (this.sidecar) return this.sidecar;
-		const sidecar = spawn(resolveSidecarExecutable(), [], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
-		sidecar.stdout.on("data", (chunk: Buffer) => this.handleOutput(chunk));
-		sidecar.stderr.on("data", (chunk: Buffer) => {
-			this.stderr = `${this.stderr}${chunk.toString("utf8")}`.slice(-8_192);
+	private ensureWorker(): Worker {
+		if (this.worker) return this.worker;
+		const worker = new Worker(localEmbeddingWorkerEntry(), {
+			execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
 		});
-		sidecar.on("error", (error) => this.failPending(error));
-		sidecar.on("exit", (code, signal) => {
-			if (this.sidecar === sidecar) this.sidecar = undefined;
-			if (this.pending.size > 0) {
-				const detail = this.stderr.trim();
-				this.failPending(
-					new Error(
-						`Local embedding sidecar exited (${signal ?? code ?? "unknown"})${detail ? `: ${detail}` : ""}`,
-					),
-				);
-			}
+		worker.on("message", (message: unknown) => this.handleMessage(message));
+		worker.on("error", (error) => this.handleWorkerFailure(error));
+		worker.on("exit", (code) => {
+			if (this.worker === worker) this.worker = undefined;
+			if (code !== 0) this.handleWorkerFailure(new Error(`Local embedding worker exited with code ${code}`));
 		});
-		this.sidecar = sidecar;
-		return sidecar;
+		this.worker = worker;
+		return worker;
 	}
 
-	private async sendRequest(
+	private async request(
 		kind: PendingRequest["kind"],
 		expectedCount: number,
-		payload: Buffer,
+		payload: Record<string, unknown>,
 	): Promise<Float32Array[]> {
-		const sidecar = this.sidecar ?? this.ensureSidecar();
+		const worker = this.ensureWorker();
 		const id = this.nextRequestId++;
-		const type = kind === "prepare" ? SIDECAR_PREPARE : kind === "embed" ? SIDECAR_EMBED : SIDECAR_DISPOSE;
-		const frame = Buffer.concat([Buffer.from([type]), uint32(id), payload]);
 		return await new Promise<Float32Array[]>((resolve, reject) => {
 			this.pending.set(id, { kind, expectedCount, resolve, reject });
-			sidecar.stdin.write(frame, (error) => {
-				if (!error) return;
-				const pending = this.pending.get(id);
-				if (!pending) return;
-				this.pending.delete(id);
-				pending.reject(error);
-			});
+			worker.postMessage({ type: kind, id, ...payload });
 		});
 	}
 
-	private handleOutput(chunk: Buffer): void {
-		this.output = Buffer.concat([this.output, chunk]);
-		if (this.output.length > MAX_SIDECAR_FRAME_BYTES) {
-			this.failPending(new Error("Local embedding sidecar emitted an oversized response"));
-			this.sidecar?.kill();
+	private handleMessage(message: unknown): void {
+		if (!message || typeof message !== "object" || !("type" in message) || typeof message.type !== "string") return;
+		const candidate = message as {
+			type: string;
+			id?: unknown;
+			status?: unknown;
+			vectors?: unknown;
+			message?: unknown;
+		};
+		if (candidate.type === "status") {
+			const status = asDiagnostics((candidate.status ?? {}) as WorkerStatus);
+			if (status) this.diagnostics = status;
 			return;
 		}
-		while (this.output.length >= 5) {
-			const type = this.output.readUInt8(0);
-			const id = this.output.readUInt32LE(1);
-			if (type === SIDECAR_SUCCESS) {
-				if (this.output.length < 13) return;
-				const count = this.output.readUInt32LE(5);
-				const dimensions = this.output.readUInt32LE(9);
-				const vectorBytes = count * dimensions * Float32Array.BYTES_PER_ELEMENT;
-				const frameBytes = 13 + vectorBytes;
-				if (!Number.isSafeInteger(frameBytes) || frameBytes > MAX_SIDECAR_FRAME_BYTES) {
-					this.failPending(new Error("Local embedding sidecar emitted an invalid response size"));
-					this.sidecar?.kill();
-					return;
-				}
-				if (this.output.length < frameBytes) return;
-				const frame = this.output.subarray(0, frameBytes);
-				this.output = this.output.subarray(frameBytes);
-				this.resolveSuccess(id, count, dimensions, frame.subarray(13));
-				continue;
-			}
-			if (type === SIDECAR_ERROR) {
-				if (this.output.length < 9) return;
-				const messageBytes = this.output.readUInt32LE(5);
-				const frameBytes = 9 + messageBytes;
-				if (frameBytes > MAX_SIDECAR_FRAME_BYTES) {
-					this.failPending(new Error("Local embedding sidecar emitted an invalid error size"));
-					this.sidecar?.kill();
-					return;
-				}
-				if (this.output.length < frameBytes) return;
-				const message = this.output.toString("utf8", 9, frameBytes);
-				this.output = this.output.subarray(frameBytes);
-				this.rejectRequest(id, new Error(message || "Local embedding sidecar failed"));
-				continue;
-			}
-			this.failPending(new Error("Local embedding sidecar emitted an unknown response"));
-			this.sidecar?.kill();
-			return;
-		}
-	}
-
-	private resolveSuccess(id: number, count: number, dimensions: number, bytes: Buffer): void {
-		const pending = this.pending.get(id);
+		if (typeof candidate.id !== "number") return;
+		const pending = this.pending.get(candidate.id);
 		if (!pending) return;
-		this.pending.delete(id);
-		if (pending.kind !== "embed") {
-			if (count !== 0 || dimensions !== 0 || bytes.length !== 0) {
-				pending.reject(new Error("Local embedding sidecar returned an invalid control response"));
-				return;
-			}
-			pending.resolve([]);
+		this.pending.delete(candidate.id);
+		if (candidate.type === "error") {
+			pending.reject(
+				new Error(typeof candidate.message === "string" ? candidate.message : "Local embedding worker failed"),
+			);
 			return;
 		}
-		if (count !== pending.expectedCount || dimensions !== LOCAL_EMBEDDING_DIMENSIONS) {
-			pending.reject(new Error("Local embedding sidecar returned an unexpected vector shape"));
+		if (candidate.type === "result") {
+			if (pending.kind === "embed") pending.reject(new Error("Local embedding worker returned no vectors"));
+			else pending.resolve([]);
 			return;
 		}
-		const vectors: Float32Array[] = [];
-		for (let item = 0; item < count; item++) {
-			const vector = new Float32Array(dimensions);
-			for (let dimension = 0; dimension < dimensions; dimension++) {
-				vector[dimension] = bytes.readFloatLE((item * dimensions + dimension) * Float32Array.BYTES_PER_ELEMENT);
-			}
-			vectors.push(vector);
+		if (candidate.type !== "vectors" || pending.kind !== "embed" || !Array.isArray(candidate.vectors)) {
+			pending.reject(new Error("Local embedding worker returned an invalid response"));
+			return;
+		}
+		const vectors = candidate.vectors.filter((vector): vector is Float32Array => vector instanceof Float32Array);
+		if (
+			vectors.length !== pending.expectedCount ||
+			vectors.some((vector) => vector.length !== LOCAL_EMBEDDING_DIMENSIONS)
+		) {
+			pending.reject(new Error("Local embedding worker returned an unexpected vector shape"));
+			return;
 		}
 		pending.resolve(vectors);
 	}
 
-	private rejectRequest(id: number, error: Error): void {
-		const pending = this.pending.get(id);
-		if (!pending) return;
-		this.pending.delete(id);
-		pending.reject(error);
+	private handleWorkerFailure(error: Error): void {
+		this.prepared = false;
+		this.diagnostics = { ...this.diagnostics, phase: "failed", error: error.message };
+		this.failPending(error);
 	}
 
 	private failPending(error: Error): void {

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Build the platform-specific CrispEmbed/ggml sidecar used by Bone's local
-# semantic search. This script is intentionally for release CI, not end-user
-# installation: normal Bone installs use the prebuilt sidecar in the package.
+# Build the platform-specific Node-API addon and CrispEmbed/ggml libraries used
+# by Bone's local semantic search. This script is intentionally for release CI.
 
 set -euo pipefail
 
@@ -102,22 +101,34 @@ case "$TARGET" in
         ;;
 esac
 
-SIDECAR_BUILD_DIR="${SOURCE_DIR}/bone-embed-build"
-sidecar_cmake_args=(
+NODE_PREFIX="$(node -p "require('node:path').resolve(require('node:path').dirname(process.execPath), '..')")"
+NODE_API_INCLUDE_DIR="${NODE_PREFIX}/include/node"
+NODE_LIBRARY="${NODE_PREFIX}/node.lib"
+if [[ ! -f "${NODE_API_INCLUDE_DIR}/node_api.h" ]]; then
+    echo "Node-API headers are missing: ${NODE_API_INCLUDE_DIR}/node_api.h" >&2
+    exit 1
+fi
+
+ADDON_BUILD_DIR="${SOURCE_DIR}/bone-embed-addon-build"
+addon_cmake_args=(
     -S "${ROOT}/packages/coding-agent/native"
-    -B "$SIDECAR_BUILD_DIR"
+    -B "$ADDON_BUILD_DIR"
     -DCMAKE_BUILD_TYPE=Release
     -DBONE_CRISPEMBED_INCLUDE_DIR="$INSTALL_DIR/include"
     -DBONE_CRISPEMBED_LIBRARY="$CRISPEMBED_LINK_LIBRARY"
+    -DBONE_NODE_API_INCLUDE_DIR="$NODE_API_INCLUDE_DIR"
 )
-if [[ "$TARGET" == "win32-arm64" ]]; then
-    sidecar_cmake_args+=( -A ARM64 )
-elif [[ "$TARGET" == "win32-x64" ]]; then
-    sidecar_cmake_args+=( -A x64 )
+if [[ "$TARGET" == win32-* ]]; then
+    addon_cmake_args+=( -DBONE_NODE_LIBRARY="$NODE_LIBRARY" )
 fi
-cmake "${sidecar_cmake_args[@]}"
-cmake --build "$SIDECAR_BUILD_DIR" --config Release --parallel 4
-cmake --install "$SIDECAR_BUILD_DIR" --config Release --prefix "$DESTINATION"
+if [[ "$TARGET" == "win32-arm64" ]]; then
+    addon_cmake_args+=( -A ARM64 )
+elif [[ "$TARGET" == "win32-x64" ]]; then
+    addon_cmake_args+=( -A x64 )
+fi
+cmake "${addon_cmake_args[@]}"
+cmake --build "$ADDON_BUILD_DIR" --config Release --parallel 4
+cmake --install "$ADDON_BUILD_DIR" --config Release --prefix "$DESTINATION"
 
 printf '%s\n' "$CRISPEMBED_COMMIT" > "$DESTINATION/CRISPEMBED_COMMIT"
-echo "Built $TARGET semantic sidecar in $DESTINATION"
+echo "Built $TARGET semantic Node-API addon in $DESTINATION"

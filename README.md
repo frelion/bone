@@ -42,7 +42,7 @@ published by this repository.
 - Direct dependencies use exact versions; `.npmrc` enforces a two-day npm age gate.
 - CI installs dependencies with `--ignore-scripts` and verifies build, checks, and tests.
 - Generated shrinkwrap and installer lockfiles are validated before release.
-- Release artifacts carry SHA-256 checksums and native sidecars are checked before packaging.
+- Release artifacts carry SHA-256 checksums and native semantic runtimes are checked before packaging.
 
 ## Upstream
 

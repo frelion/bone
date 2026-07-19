@@ -49,11 +49,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build semantic native sidecar
+      - name: Setup Node.js headers
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '22'
+
+      - name: Build semantic native addon
         shell: bash
         run: ./scripts/build-semantic-native.sh ${{ matrix.target }}
 
-      - name: Upload semantic native sidecar
+      - name: Upload semantic native runtime
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: semantic-native-${{ matrix.target }}
@@ -77,14 +82,14 @@ jobs:
           ref: ${{ env.SOURCE_REF }}
           persist-credentials: false
 
-      - name: Download semantic native sidecars
+      - name: Download semantic native runtimes
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: semantic-native-*
           path: packages/coding-agent/native
           merge-multiple: false
 
-      - name: Place semantic native sidecars
+      - name: Place semantic native runtimes
         shell: bash
         run: |
           set -euo pipefail

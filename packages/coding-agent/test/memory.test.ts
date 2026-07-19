@@ -61,6 +61,13 @@ class FakeEmbeddingEngine implements LocalEmbeddingEngine {
 	async dispose(): Promise<void> {}
 }
 
+class ZeroEmbeddingEngine extends FakeEmbeddingEngine {
+	override async embedDocuments(documents: readonly string[]): Promise<Float32Array[]> {
+		this.documentCalls++;
+		return documents.map(() => new Float32Array(384));
+	}
+}
+
 afterEach(async () => {
 	await Promise.all(
 		temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
@@ -215,6 +222,64 @@ describe("Memory runtime", () => {
 
 		expect(engine.prepareCalls).toBe(1);
 		expect(runtime.getStatus()).toEqual({ phase: "ready" });
+		await runtime.dispose();
+	});
+
+	it("presents an empty verified queue as up to date instead of idle", async () => {
+		const directory = await createTemporaryDirectory();
+		const runtime = new MemoryRuntime({
+			agentDir: join(directory, "agent"),
+			cwd: directory,
+			embeddingEngine: new FakeEmbeddingEngine(),
+		});
+		await runtime.start([]);
+
+		let diagnostics = await runtime.getDiagnostics();
+		for (let attempt = 0; attempt < 50 && diagnostics.indexing.state !== "up-to-date"; attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			diagnostics = await runtime.getDiagnostics();
+		}
+
+		expect(diagnostics.indexing).toEqual({ state: "up-to-date", pending: 0, active: 0 });
+		await runtime.dispose();
+	});
+
+	it("never marks a zero vector ready", async () => {
+		const directory = await createTemporaryDirectory();
+		const sessionPath = join(directory, "session.jsonl");
+		await writeFile(
+			sessionPath,
+			[
+				JSON.stringify({ type: "session", id: "session-a", timestamp: "2026-07-18T10:00:00.000Z", cwd: directory }),
+				JSON.stringify({
+					type: "message",
+					id: "u",
+					parentId: null,
+					timestamp: "2026-07-18T10:01:00.000Z",
+					message: { role: "user", content: "Index this exchange" },
+				}),
+				JSON.stringify({
+					type: "message",
+					id: "a",
+					parentId: "u",
+					timestamp: "2026-07-18T10:02:00.000Z",
+					message: { role: "assistant", content: "Final answer", stopReason: "stop" },
+				}),
+			].join("\n"),
+		);
+		const runtime = new MemoryRuntime({
+			agentDir: join(directory, "agent"),
+			cwd: directory,
+			embeddingEngine: new ZeroEmbeddingEngine(),
+		});
+		await runtime.start([makeSession(sessionPath)]);
+
+		let diagnostics = await runtime.getDiagnostics();
+		for (let attempt = 0; attempt < 50 && diagnostics.embeddings.failed === 0; attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			diagnostics = await runtime.getDiagnostics();
+		}
+		expect(diagnostics.embeddings).toEqual({ pending: 0, ready: 0, failed: 1 });
 		await runtime.dispose();
 	});
 

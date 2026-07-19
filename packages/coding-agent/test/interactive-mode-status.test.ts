@@ -7,6 +7,7 @@ import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.ts";
+import { WorkspaceStatusTray } from "../src/modes/interactive/components/workspace-status-tray.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
@@ -114,6 +115,139 @@ describe("InteractiveMode.showStatus", () => {
 		// adds spacer + text
 		expect(fakeThis.chatContainer.children).toHaveLength(5);
 		expect(renderLastLine(fakeThis.chatContainer)).toContain("STATUS_TWO");
+	});
+});
+
+describe("InteractiveMode /status", () => {
+	test("toggles a read-only tray without opening an overlay", async () => {
+		const workspaceStatusTray = new WorkspaceStatusTray();
+		const refreshWorkspaceStatusTray = vi.fn(async () => {});
+		const showOverlay = vi.fn();
+		const fakeThis = {
+			workspaceStatusTray,
+			workspaceStatusRefreshTimer: undefined as NodeJS.Timeout | undefined,
+			ui: { requestRender: vi.fn(), showOverlay },
+			refreshWorkspaceStatusTray,
+			hideWorkspaceStatusTray: (InteractiveMode as any).prototype.hideWorkspaceStatusTray,
+		};
+
+		await (InteractiveMode as any).prototype.handleStatusCommand.call(fakeThis);
+
+		expect(workspaceStatusTray.visible).toBe(true);
+		expect(refreshWorkspaceStatusTray).toHaveBeenCalledOnce();
+		expect(showOverlay).not.toHaveBeenCalled();
+
+		await (InteractiveMode as any).prototype.handleStatusCommand.call(fakeThis);
+		expect(workspaceStatusTray.visible).toBe(false);
+		expect(fakeThis.workspaceStatusRefreshTimer).toBeUndefined();
+	});
+
+	test("summarizes indexed exchanges without exposing worker polling state", async () => {
+		const fakeThis = {
+			sessionHost: { list: vi.fn(async () => [{ state: "cold" }]) },
+			memory: {
+				getDiagnostics: vi.fn(async () => ({
+					store: "ready",
+					conversations: 1,
+					exchanges: 3,
+					embeddings: { pending: 0, ready: 3, failed: 0 },
+					worker: "idle",
+					engine: {
+						phase: "ready" as const,
+						runtime: "same-process-worker-thread" as const,
+						pendingQueries: 0,
+						pendingDocuments: 0,
+						activeDocuments: 0,
+						pid: 123,
+					},
+					indexing: { state: "up-to-date" as const, pending: 0, active: 0 },
+					vectorIndex: "flat",
+					semantic: { phase: "ready" as const },
+				})),
+			},
+			session: { isStreaming: false, isCompacting: false, isBashRunning: false },
+			formatEmbeddingRuntime: (InteractiveMode as any).prototype.formatEmbeddingRuntime,
+			formatMemoryIndexingStatus: (InteractiveMode as any).prototype.formatMemoryIndexingStatus,
+			formatSemanticRuntimeStatus: (InteractiveMode as any).prototype.formatSemanticRuntimeStatus,
+		};
+
+		const snapshot = await (InteractiveMode as any).prototype.collectWorkspaceStatusSnapshot.call(fakeThis);
+
+		expect(snapshot.search).toEqual({ label: "Ready", detail: "All 3 exchanges indexed", tone: "success" });
+		expect(snapshot.sessions).toEqual({ current: "idle", background: "none", stored: 1 });
+		expect(snapshot.runtime).toEqual({ label: "Local CPU · GGUF mmap" });
+	});
+
+	test("uses singular wording for one indexed exchange", async () => {
+		const fakeThis = {
+			sessionHost: { list: vi.fn(async () => []) },
+			memory: {
+				getDiagnostics: vi.fn(async () => ({
+					store: "ready" as const,
+					conversations: 1,
+					exchanges: 1,
+					embeddings: { pending: 0, ready: 1, failed: 0 },
+					worker: "idle",
+					engine: {
+						phase: "ready" as const,
+						runtime: "same-process-worker-thread" as const,
+						pendingQueries: 0,
+						pendingDocuments: 0,
+						activeDocuments: 0,
+						pid: 123,
+					},
+					indexing: { state: "up-to-date" as const, pending: 0, active: 0 },
+					vectorIndex: "flat",
+					semantic: { phase: "ready" as const },
+				})),
+			},
+			session: { isStreaming: false, isCompacting: false, isBashRunning: false },
+			formatEmbeddingRuntime: (InteractiveMode as any).prototype.formatEmbeddingRuntime,
+			formatMemoryIndexingStatus: (InteractiveMode as any).prototype.formatMemoryIndexingStatus,
+			formatSemanticRuntimeStatus: (InteractiveMode as any).prototype.formatSemanticRuntimeStatus,
+		};
+
+		const snapshot = await (InteractiveMode as any).prototype.collectWorkspaceStatusSnapshot.call(fakeThis);
+
+		expect(snapshot.search.detail).toBe("All 1 exchange indexed");
+	});
+
+	test("reports memory initialization as preparing instead of unavailable", async () => {
+		const fakeThis = {
+			sessionHost: { list: vi.fn(async () => []) },
+			memory: {
+				getDiagnostics: vi.fn(async () => ({
+					store: "preparing" as const,
+					conversations: 0,
+					exchanges: 0,
+					embeddings: { pending: 0, ready: 0, failed: 0 },
+					worker: "starting",
+					engine: {
+						phase: "loading" as const,
+						runtime: "same-process-worker-thread" as const,
+						pendingQueries: 0,
+						pendingDocuments: 0,
+						activeDocuments: 0,
+						pid: 123,
+					},
+					indexing: { state: "starting" as const, pending: 0, active: 0 },
+					vectorIndex: "flat",
+					semantic: { phase: "preparing" as const, message: "Preparing local memory…" },
+				})),
+			},
+			session: { isStreaming: false, isCompacting: false, isBashRunning: false },
+			formatEmbeddingRuntime: (InteractiveMode as any).prototype.formatEmbeddingRuntime,
+			formatMemoryIndexingStatus: (InteractiveMode as any).prototype.formatMemoryIndexingStatus,
+			formatSemanticRuntimeStatus: (InteractiveMode as any).prototype.formatSemanticRuntimeStatus,
+		};
+
+		const snapshot = await (InteractiveMode as any).prototype.collectWorkspaceStatusSnapshot.call(fakeThis);
+
+		expect(snapshot.search).toEqual({
+			label: "Preparing",
+			detail: "Loading local semantic search…",
+			tone: "accent",
+		});
 	});
 });
 

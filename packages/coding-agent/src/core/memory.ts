@@ -8,13 +8,14 @@ import lockfile from "proper-lockfile";
 import {
 	getLocalEmbeddingAvailability,
 	type LocalEmbeddingEngine,
+	type LocalEmbeddingEngineDiagnostics,
 	type LocalEmbeddingStatus,
 	LocalEmbeddingWorker,
 } from "./local-embedding.ts";
 import { isMessageWithContent, parseSessionEntryLine, type SessionEntry, type SessionInfo } from "./session-manager.ts";
 import { isCodeLikeSearchQuery, normalizeSearchPreview, normalizeSearchTerms } from "./session-search-normalizer.ts";
 
-const MEMORY_VERSION = "v1";
+const MEMORY_VERSION = "v2";
 const VECTOR_DIMENSIONS = 384;
 const ITEMS_TABLE = "memory_items";
 const STATE_TABLE = "memory_state";
@@ -53,6 +54,20 @@ export type MemoryEmbeddingWorkerState =
 	| "idle"
 	| "unavailable"
 	| "another-process";
+
+export type MemoryIndexingState =
+	| "starting"
+	| "queued"
+	| "embedding"
+	| "up-to-date"
+	| "unavailable"
+	| "another-process";
+
+export interface MemoryIndexingDiagnostics {
+	state: MemoryIndexingState;
+	pending: number;
+	active: number;
+}
 export type MemoryVectorIndexMode = "flat" | "hnsw-sq";
 
 /**
@@ -67,6 +82,8 @@ export interface MemoryRuntimeDiagnostics {
 	exchanges: number;
 	embeddings: Record<MemoryEmbeddingState, number>;
 	worker: MemoryEmbeddingWorkerState;
+	engine: LocalEmbeddingEngineDiagnostics;
+	indexing: MemoryIndexingDiagnostics;
 	vectorIndex: MemoryVectorIndexMode;
 	semantic: MemoryRuntimeStatus;
 }
@@ -180,6 +197,17 @@ function asEmbedding(value: unknown): number[] | undefined {
 		return asEmbedding((value as { toArray: () => unknown }).toArray());
 	}
 	return undefined;
+}
+
+function isVerifiedEmbedding(vector: ArrayLike<number>): boolean {
+	if (vector.length !== VECTOR_DIMENSIONS) return false;
+	let normSquared = 0;
+	for (let index = 0; index < vector.length; index++) {
+		const value = vector[index];
+		if (!Number.isFinite(value)) return false;
+		normSquared += value * value;
+	}
+	return Number.isFinite(normSquared) && normSquared > 1e-12;
 }
 
 function asMemoryKind(value: unknown): MemoryKind | undefined {
@@ -540,7 +568,14 @@ class LanceMemoryRepository {
 	}
 
 	private preserveEmbedding(item: MemoryItem, existing: MemoryItem | undefined): MemoryItem {
-		if (!existing || existing.sourceHash !== item.sourceHash) return item;
+		if (
+			!existing ||
+			existing.sourceHash !== item.sourceHash ||
+			existing.embeddingState !== "ready" ||
+			existing.embeddingSourceHash !== item.sourceHash ||
+			!isVerifiedEmbedding(existing.embedding)
+		)
+			return item;
 		return {
 			...item,
 			embedding: existing.embedding,
@@ -626,9 +661,10 @@ class LanceMemoryRepository {
 		});
 	}
 
-	async saveEmbedding(entry: PendingEmbedding, vector: Float32Array): Promise<void> {
+	async saveEmbedding(entry: PendingEmbedding, vector: Float32Array): Promise<boolean> {
+		if (!isVerifiedEmbedding(vector)) return false;
 		const table = await this.getItemsTable();
-		if (!table) return;
+		if (!table) return false;
 		await table.update({
 			where: `id = ${quotePredicate(entry.id)} AND sourceHash = ${quotePredicate(entry.sourceHash)}`,
 			values: {
@@ -637,6 +673,7 @@ class LanceMemoryRepository {
 				embeddingSourceHash: entry.sourceHash,
 			},
 		});
+		return true;
 	}
 
 	async markEmbeddingFailed(entry: PendingEmbedding): Promise<void> {
@@ -917,8 +954,8 @@ class MemoryEmbeddingController {
 			const vectors = await this.engine.embedDocuments(pending.map((item) => item.semanticText));
 			for (const [index, item] of pending.entries()) {
 				const vector = vectors[index];
-				if (!vector || vector.length !== VECTOR_DIMENSIONS) await this.repository.markEmbeddingFailed(item);
-				else await this.repository.saveEmbedding(item, vector);
+				if (!vector || !(await this.repository.saveEmbedding(item, vector)))
+					await this.repository.markEmbeddingFailed(item);
 			}
 			await this.repository.ensureVectorIndex();
 			this.onWorkComplete();
@@ -937,6 +974,34 @@ class MemoryEmbeddingController {
 		if (this.releaseLock) await this.releaseLock().catch(() => {});
 		this.releaseLock = undefined;
 	}
+}
+
+function deriveIndexingDiagnostics(options: {
+	store: MemoryStoreState;
+	semantic: MemoryRuntimeStatus;
+	worker: MemoryEmbeddingWorkerState;
+	engine: LocalEmbeddingEngineDiagnostics;
+	embeddings: Record<MemoryEmbeddingState, number>;
+}): MemoryIndexingDiagnostics {
+	const pending = options.embeddings.pending;
+	const active = options.engine.activeDocuments;
+	if (options.store !== "ready") {
+		return { state: options.store === "unavailable" ? "unavailable" : "starting", pending, active };
+	}
+	if (
+		options.semantic.phase === "unavailable" ||
+		options.worker === "unavailable" ||
+		options.engine.phase === "failed"
+	)
+		return { state: "unavailable", pending, active };
+	if (options.worker === "another-process") return { state: "another-process", pending, active };
+	if (options.engine.phase === "embedding" && active > 0) return { state: "embedding", pending, active };
+	if (options.worker === "not-started" || options.worker === "starting") return { state: "starting", pending, active };
+	if (pending === 0) return { state: "up-to-date", pending, active };
+	if (options.engine.phase === "not-started" || options.engine.phase === "loading")
+		return { state: "starting", pending, active };
+	if (pending > 0) return { state: "queued", pending, active };
+	return { state: "up-to-date", pending, active };
 }
 
 /**
@@ -1011,30 +1076,66 @@ export class MemoryRuntime {
 			embeddings: { pending: 0, ready: 0, failed: 0 },
 			vectorIndex: "flat" as const,
 		};
+		const engine =
+			this.embeddingEngine.getDiagnostics?.() ??
+			({
+				phase: "not-started",
+				runtime: "same-process-worker-thread",
+				pendingQueries: 0,
+				pendingDocuments: 0,
+				activeDocuments: 0,
+			} satisfies LocalEmbeddingEngineDiagnostics);
+		const worker = this.controller.getStatus();
 		if (this.store !== "ready") {
 			return {
 				store: this.store,
 				...empty,
-				worker: this.controller.getStatus(),
+				worker,
+				engine,
+				indexing: deriveIndexingDiagnostics({
+					store: this.store,
+					semantic: this.status,
+					worker,
+					engine,
+					embeddings: empty.embeddings,
+				}),
 				semantic: this.status,
 			};
 		}
 		try {
+			const repository = await this.repository.getDiagnostics();
 			return {
 				store: "ready",
-				...(await this.repository.getDiagnostics()),
-				worker: this.controller.getStatus(),
+				...repository,
+				worker,
+				engine,
+				indexing: deriveIndexingDiagnostics({
+					store: "ready",
+					semantic: this.status,
+					worker,
+					engine,
+					embeddings: repository.embeddings,
+				}),
 				semantic: this.status,
 			};
 		} catch (error) {
+			const semantic: MemoryRuntimeStatus = {
+				phase: "unavailable",
+				message: `Memory store unavailable: ${error instanceof Error ? error.message : String(error)}`,
+			};
 			return {
 				store: "unavailable",
 				...empty,
-				worker: this.controller.getStatus(),
-				semantic: {
-					phase: "unavailable",
-					message: `Memory store unavailable: ${error instanceof Error ? error.message : String(error)}`,
-				},
+				worker,
+				engine,
+				indexing: deriveIndexingDiagnostics({
+					store: "unavailable",
+					semantic,
+					worker,
+					engine,
+					embeddings: empty.embeddings,
+				}),
+				semantic,
 			};
 		}
 	}

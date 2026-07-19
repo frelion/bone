@@ -19,13 +19,13 @@ On Windows, use the matching zip archive and verify its SHA-256 with a trusted
 local tool before extracting it.
 
 The executable is self-contained with its matching terminal helper and local
-semantic-search sidecar. The model itself is intentionally not included; run
+semantic-search native runtime. The model itself is intentionally not included; run
 `bone setup` after installation if you want semantic search.
 
 ## Release policy
 
 Tags in the form `vX.Y.Z` trigger a six-platform GitHub Release pipeline. It
-builds native semantic sidecars, compiles Bun binaries, runs source validation,
+builds native semantic runtimes, compiles Bun binaries, runs source validation,
 and uploads assets only after checksum verification.
 
 npm publication is not active yet. Do not rely on an npm package name as an

@@ -24,8 +24,8 @@ bone setup
 ```
 
 This downloads and verifies the fixed CPU GGUF model once. Normal `bone` startup
-never downloads it. The native `bone-embed` sidecar uses CrispEmbed/ggml and mmap
-for the model weights, keeping the inference memory outside the Node/TUI process.
+never downloads it. A same-process Node Worker Thread loads Bone's native CrispEmbed/ggml addon and mmaps
+the model weights, keeping inference off the TUI thread and weights out of the Node.js heap.
 
 ## Indexing and status
 

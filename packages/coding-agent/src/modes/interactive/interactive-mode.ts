@@ -155,6 +155,11 @@ import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
+import {
+	type WorkspaceStatusTone,
+	WorkspaceStatusTray,
+	type WorkspaceStatusTraySnapshot,
+} from "./components/workspace-status-tray.ts";
 import { getModelSearchText } from "./model-search.ts";
 import {
 	getAvailableThemesWithPaths,
@@ -344,6 +349,9 @@ export class InteractiveMode {
 	private autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
 	private fdPath: string | undefined;
 	private editorContainer: Container;
+	private workspaceStatusTray: WorkspaceStatusTray;
+	private workspaceStatusRefreshTimer: NodeJS.Timeout | undefined;
+	private workspaceStatusRefreshInFlight = false;
 	private footer: FooterComponent;
 	private footerDataProvider: FooterDataProvider;
 	// Stored so the same manager can be injected into custom editors, selectors, and extension UI.
@@ -523,6 +531,7 @@ export class InteractiveMode {
 		);
 		this.chatHistoryFocus = new ChatHistoryFocus();
 		this.sessionSidebar = new SessionSidebar();
+		this.workspaceStatusTray = new WorkspaceStatusTray();
 		this.memory = new MemoryRuntime({
 			agentDir: this.sessionHost.current.services.agentDir,
 			cwd: this.sessionHost.current.session.sessionManager.getCwd(),
@@ -530,10 +539,12 @@ export class InteractiveMode {
 				if (status.phase === "preparing") this.sessionSidebar.setSearchStatus(status.message);
 				if (status.phase === "unavailable")
 					this.sessionSidebar.setSearchStatus(status.message ?? "Keyword search · semantic search unavailable");
+				void this.refreshWorkspaceStatusTray();
 				this.ui.requestRender();
 			},
 			onEmbeddingStatus: (status) => {
 				this.sessionSidebar.setSearchStatus(this.formatSemanticSearchStatus(status));
+				void this.refreshWorkspaceStatusTray();
 				this.ui.requestRender();
 			},
 			onSearchRefresh: () => {
@@ -823,6 +834,7 @@ export class InteractiveMode {
 		this.fixedBottomContainer.addChild(this.widgetContainerAbove);
 		this.fixedBottomContainer.addChild(this.editorContainer);
 		this.fixedBottomContainer.addChild(this.widgetContainerBelow);
+		this.fixedBottomContainer.addChild(this.workspaceStatusTray);
 		this.fixedBottomContainer.addChild(this.footer);
 		this.mainContainer.addChild(this.chatHistoryFocus);
 		this.mainContainer.addChild(this.chatScrollLayout);
@@ -840,6 +852,14 @@ export class InteractiveMode {
 
 		this.setupKeyHandlers();
 		this.ui.addInputListener((data) => {
+			if (
+				!this.ui.hasOverlay() &&
+				this.workspaceStatusTray.visible &&
+				this.keybindings.matches(data, "app.interrupt")
+			) {
+				this.hideWorkspaceStatusTray();
+				return { consume: true };
+			}
 			if (!this.sessionSidebar.focused) return;
 			if (this.keybindings.matches(data, "app.clear") || this.keybindings.matches(data, "app.exit")) {
 				void this.shutdown();
@@ -6320,14 +6340,13 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Render a local, read-only runtime snapshot. In particular, this never
+	 * Gather a local, read-only runtime snapshot. In particular, this never
 	 * invokes memory reconciliation, model setup, embedding, or index creation.
 	 */
-	private async handleStatusCommand(): Promise<void> {
+	private async collectWorkspaceStatusSnapshot(): Promise<WorkspaceStatusTraySnapshot> {
 		const [sessions, memory] = await Promise.all([this.sessionHost.list(), this.memory.getDiagnostics()]);
 		const backgroundRunning = sessions.filter((session) => session.state === "background-running").length;
 		const backgroundWaiting = sessions.filter((session) => session.state === "background-waiting").length;
-		const cold = sessions.filter((session) => session.state === "cold").length;
 		const currentState = this.session.isStreaming
 			? "working"
 			: this.session.isCompacting
@@ -6342,50 +6361,133 @@ export class InteractiveMode {
 			.filter((state): state is string => Boolean(state))
 			.join(" · ");
 		const semantic = this.formatSemanticRuntimeStatus(memory.semantic);
+		const indexedDetail =
+			memory.indexing.state === "up-to-date"
+				? memory.exchanges === 0
+					? "No exchanges yet"
+					: `All ${memory.exchanges.toLocaleString()} ${memory.exchanges === 1 ? "exchange" : "exchanges"} indexed`
+				: this.formatMemoryIndexingStatus(memory.indexing);
+		const search =
+			memory.store === "unavailable"
+				? {
+						label: "Search unavailable",
+						detail: semantic.detail ?? `Memory store ${memory.store}`,
+						tone: "error" as const,
+					}
+				: memory.store === "preparing"
+					? {
+							label: "Preparing",
+							detail: semantic.detail ?? "Reading workspace status",
+							tone: semantic.tone === "error" ? ("accent" as const) : semantic.tone,
+						}
+					: semantic.tone === "success"
+						? { label: "Ready", detail: indexedDetail, tone: "success" as const }
+						: {
+								label: "Keyword ready",
+								detail: [semantic.label, semantic.action ?? semantic.detail ?? indexedDetail].join(" · "),
+								tone: semantic.tone,
+							};
+		return {
+			search,
+			sessions: { current: currentState, background: background || "none", stored: sessions.length },
+			runtime: { label: this.formatEmbeddingRuntime(memory.engine) },
+		};
+	}
 
-		let info = `${theme.bold("Bone status")}\n\n`;
-		info += `${theme.bold("Sessions")}\n`;
-		info += `${theme.fg("dim", "Current:")} ${currentState}\n`;
-		info += `${theme.fg("dim", "Background:")} ${background || "none"}\n`;
-		info += `${theme.fg("dim", "Saved:")} ${cold.toLocaleString()} cold\n\n`;
-		info += `${theme.bold("Memory")}\n`;
-		info += `${theme.fg("dim", "Store:")} ${memory.store}\n`;
-		info += `${theme.fg("dim", "Indexed:")} ${memory.conversations.toLocaleString()} conversations · ${memory.exchanges.toLocaleString()} exchanges\n`;
-		info += `${theme.fg("dim", "Embedding:")} ${memory.embeddings.pending.toLocaleString()} pending · ${memory.embeddings.ready.toLocaleString()} ready · ${memory.embeddings.failed.toLocaleString()} failed\n`;
-		info += `${theme.fg("dim", "Worker:")} ${this.formatEmbeddingWorkerStatus(memory.worker)}\n`;
-		info += `${theme.fg("dim", "Vector index:")} ${memory.vectorIndex === "hnsw-sq" ? "HNSW-SQ" : "flat"}\n\n`;
-		info += `${theme.bold("Search")}\n`;
-		info += `${theme.fg("dim", "Keyword:")} ${memory.store === "ready" ? "ready" : memory.store}\n`;
-		info += `${theme.fg("dim", "Semantic:")} ${semantic.label}`;
-		if (semantic.action) info += `\n${theme.fg("dim", "Action:")} ${semantic.action}`;
+	private async handleStatusCommand(): Promise<void> {
+		if (this.workspaceStatusTray.visible) {
+			this.hideWorkspaceStatusTray();
+			return;
+		}
+		this.workspaceStatusTray.setVisible(true);
+		this.ui.requestRender();
+		await this.refreshWorkspaceStatusTray();
+		if (!this.workspaceStatusTray.visible) return;
+		this.workspaceStatusRefreshTimer = setInterval(() => void this.refreshWorkspaceStatusTray(), 1000);
+		this.workspaceStatusRefreshTimer.unref();
+	}
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(info, 1, 0));
+	private async refreshWorkspaceStatusTray(): Promise<void> {
+		if (!this.workspaceStatusTray.visible || this.workspaceStatusRefreshInFlight) return;
+		this.workspaceStatusRefreshInFlight = true;
+		try {
+			const snapshot = await this.collectWorkspaceStatusSnapshot();
+			if (!this.workspaceStatusTray.visible) return;
+			this.workspaceStatusTray.setSnapshot(snapshot);
+			this.ui.requestRender();
+		} finally {
+			this.workspaceStatusRefreshInFlight = false;
+		}
+	}
+
+	private hideWorkspaceStatusTray(): void {
+		if (!this.workspaceStatusTray.visible) return;
+		if (this.workspaceStatusRefreshTimer) {
+			clearInterval(this.workspaceStatusRefreshTimer);
+			this.workspaceStatusRefreshTimer = undefined;
+		}
+		this.workspaceStatusTray.setVisible(false);
 		this.ui.requestRender();
 	}
 
-	private formatEmbeddingWorkerStatus(
-		worker: "not-started" | "starting" | "active" | "idle" | "unavailable" | "another-process",
-	): string {
-		switch (worker) {
-			case "not-started":
-				return "not started";
+	private formatEmbeddingRuntime(engine: {
+		phase: "not-started" | "loading" | "ready" | "embedding" | "failed" | "disposed";
+	}): string {
+		return engine.phase === "not-started" || engine.phase === "disposed"
+			? "Local model not loaded"
+			: "Local CPU · GGUF mmap";
+	}
+
+	private formatMemoryIndexingStatus(indexing: {
+		state: "starting" | "queued" | "embedding" | "up-to-date" | "unavailable" | "another-process";
+		pending: number;
+		active: number;
+	}): string {
+		const exchangeCount = (count: number): string => `${count} ${count === 1 ? "exchange" : "exchanges"}`;
+		switch (indexing.state) {
+			case "up-to-date":
+				return "Up to date";
+			case "starting":
+				return "Starting";
+			case "queued":
+				return `${exchangeCount(indexing.pending)} queued`;
+			case "embedding":
+				return `Embedding ${exchangeCount(indexing.active || indexing.pending)}`;
 			case "another-process":
-				return "another Bone process owns it";
-			default:
-				return worker;
+				return indexing.pending > 0
+					? `Waiting for another Bone · ${exchangeCount(indexing.pending)} queued`
+					: "Managed by another Bone process";
+			case "unavailable":
+				return "Unavailable";
 		}
 	}
 
 	private formatSemanticRuntimeStatus(status: { phase: "preparing" | "ready" | "unavailable"; message?: string }): {
 		label: string;
+		detail?: string;
+		tone: WorkspaceStatusTone;
 		action?: string;
 	} {
-		if (status.phase === "ready") return { label: "ready · multilingual-e5-small" };
-		if (status.phase === "preparing") return { label: "preparing" };
-		if (status.message?.includes("not installed")) return { label: "not installed", action: "Run bone setup" };
-		if (status.message?.includes("needs repair")) return { label: "needs repair", action: "Run bone setup" };
-		return { label: status.message ?? "unavailable" };
+		if (status.phase === "ready") return { label: "Ready", tone: "success" };
+		if (status.phase === "preparing")
+			return { label: "Preparing", detail: "Loading local semantic search…", tone: "accent" };
+		if (status.message?.includes("not installed")) {
+			return {
+				label: "Semantic search needs setup",
+				detail: "Keyword search remains available. The local model has not been installed.",
+				tone: "warning",
+				action: "Run bone setup",
+			};
+		}
+		if (status.message?.includes("needs repair")) {
+			return {
+				label: "Semantic model needs repair",
+				detail: "Keyword search remains available. The local model assets did not pass validation.",
+				tone: "warning",
+				action: "Run bone setup",
+			};
+		}
+		return { label: "Semantic search unavailable", detail: status.message, tone: "error" };
 	}
 
 	private handleChangelogCommand(): void {
@@ -6708,6 +6810,7 @@ export class InteractiveMode {
 	stop(): void {
 		if (this.sessionSearchTimer) clearTimeout(this.sessionSearchTimer);
 		if (this.semanticSearchTimer) clearTimeout(this.semanticSearchTimer);
+		this.hideWorkspaceStatusTray();
 		void this.memory.dispose();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);

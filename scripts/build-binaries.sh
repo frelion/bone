@@ -134,9 +134,9 @@ for platform in "${PLATFORMS[@]}"; do
     # explicit build entrypoints. The runtime can still use new URL(...), but the
     # worker must be present in the compiled executable.
     if [[ "$platform" == windows-* ]]; then
-		bun build --compile --target=bun-$platform ./dist/bun/cli.js ./src/utils/image-resize-worker.ts --outfile "$OUTPUT_DIR/$platform/bone.exe"
+		bun build --compile --target=bun-$platform ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/core/local-embedding-worker.ts --outfile "$OUTPUT_DIR/$platform/bone.exe"
     else
-		bun build --compile --target=bun-$platform ./dist/bun/cli.js ./src/utils/image-resize-worker.ts --outfile "$OUTPUT_DIR/$platform/bone"
+		bun build --compile --target=bun-$platform ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/core/local-embedding-worker.ts --outfile "$OUTPUT_DIR/$platform/bone"
     fi
 done
 
@@ -157,15 +157,15 @@ for platform in "${PLATFORMS[@]}"; do
     cp -r examples "$OUTPUT_DIR/$platform/"
 
     # Release archive labels use `windows-*`, while Node's runtime platform is
-    # `win32-*`. Native sidecar directories always follow Node's identifiers.
+    # `win32-*`. Native runtime directories always follow Node's identifiers.
     native_platform="$platform"
     case "$platform" in
         windows-x64) native_platform="win32-x64" ;;
         windows-arm64) native_platform="win32-arm64" ;;
     esac
 
-    # The compiled binary resolves the GGUF engine relative to its own
-    # directory, so each archive carries only its matching native sidecar.
+    # The compiled binary resolves the GGUF addon relative to its own
+    # directory, so each archive carries only its matching native runtime.
     test -d "native/$native_platform"
     mkdir -p "$OUTPUT_DIR/$platform/native"
     cp -R "native/$native_platform" "$OUTPUT_DIR/$platform/native/"

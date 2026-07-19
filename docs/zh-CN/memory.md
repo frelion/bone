@@ -22,8 +22,8 @@ bone setup
 ```
 
 它会下载并校验固定的 CPU GGUF 模型。正常 `bone` 启动绝不会下载。原生
-`bone-embed` sidecar 使用 CrispEmbed/ggml 与 mmap，使模型权重不驻留在 Node/TUI
-进程内。
+Bone 会在同一进程的 Node Worker Thread 中加载 CrispEmbed/ggml 原生 addon 与 mmap，使模型权重不进入 Node.js 堆，
+推理也不会阻塞 TUI 主线程。
 
 ## 索引与状态
 
