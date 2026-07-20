@@ -219,13 +219,13 @@ jobs:
           for asset in "${release_assets[@]}" SHA256SUMS RELEASE_NOTES.md; do test -f "${asset}"; done
           sha256sum -c SHA256SUMS
 
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" --clobber "${release_assets[@]}" SHA256SUMS
-            gh release edit "${RELEASE_TAG}" \
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${release_assets[@]}" SHA256SUMS
+            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
               --title "Bone ${RELEASE_TAG#v}" \
               --notes-file RELEASE_NOTES.md
           else
-            gh release create "${RELEASE_TAG}" \
+            gh release create "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
               --title "Bone ${RELEASE_TAG#v}" \
               --notes-file RELEASE_NOTES.md \
