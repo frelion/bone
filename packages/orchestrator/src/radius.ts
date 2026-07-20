@@ -5,7 +5,6 @@ import { getOrchestratorDir, getSocketPath, VERSION } from "./config.ts";
 import { loadMachine, saveMachine } from "./storage.ts";
 import type { InstanceRecord, MachineRecord, RadiusRegistration } from "./types.ts";
 
-const DEFAULT_RADIUS_URL = "https://radius.pi.dev/";
 const DEFAULT_ORCHESTRATOR_BASE_PATH = "/v1/";
 const NOT_FOUND_RETRY_THRESHOLD = 3;
 const HEARTBEAT_BACKOFF_BASE_MS = 1_000;
@@ -104,17 +103,21 @@ function logRadiusRetry(scope: string, action: string, delayMs: number, failureC
 	);
 }
 
-export function getRadiusUrl(): string {
-	return process.env.PI_RADIUS_URL || DEFAULT_RADIUS_URL;
+export function getRadiusUrl(): string | undefined {
+	return process.env.BONE_RADIUS_URL;
 }
 
 export function getRadiusOrchestratorBaseUrl(): string {
-	const explicitUrl = process.env.PI_RADIUS_ORCHESTRATOR_URL;
+	const explicitUrl = process.env.BONE_RADIUS_ORCHESTRATOR_URL;
 	if (explicitUrl) {
 		return explicitUrl;
 	}
 
-	return new URL(DEFAULT_ORCHESTRATOR_BASE_PATH, getRadiusUrl()).toString();
+	const radiusUrl = getRadiusUrl();
+	if (!radiusUrl) {
+		throw new Error("Radius is not configured. Set BONE_RADIUS_URL or BONE_RADIUS_ORCHESTRATOR_URL.");
+	}
+	return new URL(DEFAULT_ORCHESTRATOR_BASE_PATH, radiusUrl).toString();
 }
 
 function getStoredRadiusCredential(): OAuthCredential | undefined {
@@ -133,11 +136,14 @@ export function getRadiusAccessToken(): string {
 		return apiKey;
 	}
 
-	throw new Error("Radius credentials are required in ~/.pi/agent/auth.json or RADIUS_API_KEY");
+	throw new Error("Radius credentials are required in ~/.bone/agent/auth.json or RADIUS_API_KEY");
 }
 
 export function isRadiusEnabled(): boolean {
-	return !!getStoredRadiusCredential()?.access || !!process.env.RADIUS_API_KEY;
+	return (
+		!!(getRadiusUrl() || process.env.BONE_RADIUS_ORCHESTRATOR_URL) &&
+		(!!getStoredRadiusCredential()?.access || !!process.env.RADIUS_API_KEY)
+	);
 }
 
 export class RadiusPresence {
@@ -192,7 +198,7 @@ export class RadiusPresence {
 		}
 		const machine = this.machine ?? loadMachine();
 		if (!machine) {
-			throw new Error("No registered machine available for Pi registration");
+			throw new Error("No registered machine available for Bone registration");
 		}
 		const registered = await post<RegisterPiResponse>("pis/register", {
 			machineId: machine.id,
@@ -365,7 +371,7 @@ export class RadiusPresence {
 			if (!isNotFoundError(error)) {
 				state.transientFailureCount += 1;
 				const delayMs = computeBackoffDelayMs(state.transientFailureCount);
-				logRadiusRetry(`Radius Pi ${instanceId}`, "heartbeat", delayMs, state.transientFailureCount, error);
+				logRadiusRetry(`Radius Bone ${instanceId}`, "heartbeat", delayMs, state.transientFailureCount, error);
 				this.schedulePiHeartbeat(instanceId, delayMs);
 				return;
 			}
@@ -381,14 +387,14 @@ export class RadiusPresence {
 				const recovered = await this.reRegisterPi(instanceId);
 				if (!recovered) {
 					const delayMs = computeBackoffDelayMs(1);
-					console.error(`Radius Pi ${instanceId} re-registration skipped; retrying in ${delayMs}ms`);
+					console.error(`Radius Bone ${instanceId} re-registration skipped; retrying in ${delayMs}ms`);
 					this.schedulePiHeartbeat(instanceId, delayMs);
 				}
 			} catch (recoveryError) {
 				state.transientFailureCount += 1;
 				const delayMs = computeBackoffDelayMs(state.transientFailureCount);
 				logRadiusRetry(
-					`Radius Pi ${instanceId}`,
+					`Radius Bone ${instanceId}`,
 					"re-registration",
 					delayMs,
 					state.transientFailureCount,
@@ -408,7 +414,7 @@ export class RadiusPresence {
 			try {
 				await this.reRegisterPi(instance.id);
 			} catch (error) {
-				console.error(`Radius Pi ${instance.id} re-registration failed: ${formatRadiusError(error)}`);
+				console.error(`Radius Bone ${instance.id} re-registration failed: ${formatRadiusError(error)}`);
 			}
 		}
 	}

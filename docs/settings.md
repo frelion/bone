@@ -21,7 +21,7 @@ In **Providers & Models**, you can:
 5. Expand advanced fields only when needed for headers, compatibility, reasoning,
    thinking levels, or token/cost constraints.
 
-Provider definitions are stored in Pi-compatible `~/.bone/agent/models.json`.
+Provider definitions are stored in `~/.bone/agent/models.json`.
 Secrets are stored only in global `~/.bone/agent/auth.json` with restrictive file
 permissions; they are never written to project settings or `models.json`.
 

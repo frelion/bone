@@ -1,8 +1,7 @@
 import type { Api, Model, Provider } from "@earendil-works/pi-ai";
-import { VERSION } from "../config.ts";
+import { getModelCatalogUrl, VERSION } from "../config.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 
-const DEFAULT_CATALOG_BASE_URL = "https://pi.dev";
 export const REMOTE_CATALOG_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
 
 function mergeModels(baseline: readonly Model<Api>[], dynamic: readonly Model<Api>[]): Model<Api>[] {
@@ -29,8 +28,11 @@ function parseCatalog(providerId: string, value: unknown): Model<Api>[] {
 		.map((model) => ({ ...model, provider: providerId }));
 }
 
-/** Add a persisted pi.dev catalog overlay to a static built-in provider. */
-export function withRemoteCatalog(provider: Provider, catalogBaseUrl: string = DEFAULT_CATALOG_BASE_URL): Provider {
+/** Add a persisted, optionally remote catalog overlay to a static built-in provider. */
+export function withRemoteCatalog(
+	provider: Provider,
+	catalogBaseUrl: string | undefined = getModelCatalogUrl(),
+): Provider {
 	let dynamicModels: readonly Model<Api>[] = [];
 	let inflightRefresh: Promise<void> | undefined;
 
@@ -42,7 +44,7 @@ export function withRemoteCatalog(provider: Provider, catalogBaseUrl: string = D
 				try {
 					const stored = await context.store.read();
 					if (stored) dynamicModels = stored.models.filter((model) => model.provider === provider.id);
-					if (!context.allowNetwork || context.signal?.aborted) return;
+					if (!catalogBaseUrl || !context.allowNetwork || context.signal?.aborted) return;
 					if (
 						!context.force &&
 						stored?.checkedAt !== undefined &&

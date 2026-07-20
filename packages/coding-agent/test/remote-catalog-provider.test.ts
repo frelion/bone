@@ -43,6 +43,7 @@ describe("remote catalog provider", () => {
 					},
 				},
 			}),
+			"https://catalog.bone.test",
 		);
 		const store = new InMemoryModelsStore();
 		await provider.refreshModels?.({
@@ -78,11 +79,11 @@ describe("remote catalog provider", () => {
 		expect((await store.read(provider.id))?.models.map((entry) => entry.id)).toEqual(["dynamic"]);
 		expect(fetchSpy).toHaveBeenCalledTimes(2);
 		expect(fetchSpy.mock.calls[0]?.[1]?.headers).toMatchObject({
-			"User-Agent": expect.stringContaining(`pi/${VERSION}`),
+			"User-Agent": expect.stringContaining(`bone/${VERSION}`),
 		});
 	});
 
-	it("treats unimplemented pi.dev catalog routes as an unavailable overlay", async () => {
+	it("does not request a remote catalog unless a Bone catalog endpoint is configured", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("not implemented", { status: 501 }));
 		const provider = withRemoteCatalog(
 			createProvider({
@@ -113,6 +114,7 @@ describe("remote catalog provider", () => {
 			}),
 		).resolves.toBeUndefined();
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static"]);
-		expect(await store.read(provider.id)).toMatchObject({ models: [], checkedAt: expect.any(Number) });
+		expect(await store.read(provider.id)).toBeUndefined();
+		expect(fetch).not.toHaveBeenCalled();
 	});
 });

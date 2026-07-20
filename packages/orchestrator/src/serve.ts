@@ -24,7 +24,9 @@ export async function serve(): Promise<void> {
 				console.log(`radius machine id: ${machine.id}`);
 			}
 		} else {
-			console.log("radius integration disabled: login radius in ~/.pi/agent/auth.json or set RADIUS_API_KEY");
+			console.log(
+				"radius integration disabled: set BONE_RADIUS_URL and configure ~/.bone/agent/auth.json or RADIUS_API_KEY",
+			);
 		}
 	} catch (error) {
 		server.close();

@@ -1,10 +1,10 @@
 import { compare, valid } from "semver";
+import { getUpdateCheckUrl } from "../config.ts";
 import { getPiUserAgent } from "./pi-user-agent.ts";
 
-const LATEST_VERSION_URL = "https://pi.dev/api/latest-version";
 const DEFAULT_VERSION_CHECK_TIMEOUT_MS = 10000;
 
-export interface LatestPiRelease {
+export interface LatestBoneRelease {
 	version: string;
 	packageName?: string;
 	note?: string;
@@ -27,13 +27,17 @@ export function isNewerPackageVersion(candidateVersion: string, currentVersion: 
 	return candidateVersion.trim() !== currentVersion.trim();
 }
 
-export async function getLatestPiRelease(
+export async function getLatestBoneRelease(
 	currentVersion: string,
 	options: { timeoutMs?: number } = {},
-): Promise<LatestPiRelease | undefined> {
-	if (process.env.PI_SKIP_VERSION_CHECK || process.env.PI_OFFLINE) return undefined;
+): Promise<LatestBoneRelease | undefined> {
+	if (process.env.BONE_SKIP_VERSION_CHECK || process.env.BONE_OFFLINE) {
+		return undefined;
+	}
+	const latestVersionUrl = getUpdateCheckUrl();
+	if (!latestVersionUrl) return undefined;
 
-	const response = await fetch(LATEST_VERSION_URL, {
+	const response = await fetch(latestVersionUrl, {
 		headers: {
 			"User-Agent": getPiUserAgent(currentVersion),
 			accept: "application/json",
@@ -60,16 +64,16 @@ export async function getLatestPiRelease(
 	};
 }
 
-export async function getLatestPiVersion(
+export async function getLatestBoneVersion(
 	currentVersion: string,
 	options: { timeoutMs?: number } = {},
 ): Promise<string | undefined> {
-	return (await getLatestPiRelease(currentVersion, options))?.version;
+	return (await getLatestBoneRelease(currentVersion, options))?.version;
 }
 
-export async function checkForNewPiVersion(currentVersion: string): Promise<LatestPiRelease | undefined> {
+export async function checkForNewBoneVersion(currentVersion: string): Promise<LatestBoneRelease | undefined> {
 	try {
-		const latestRelease = await getLatestPiRelease(currentVersion);
+		const latestRelease = await getLatestBoneRelease(currentVersion);
 		if (latestRelease && isNewerPackageVersion(latestRelease.version, currentVersion)) {
 			return latestRelease;
 		}

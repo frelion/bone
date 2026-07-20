@@ -333,7 +333,7 @@ export function getSelfUpdateUnavailableInstruction(
 	const method = detectInstallMethod();
 	const target = normalizeSelfUpdatePackageTarget(updatePackageTarget);
 	if (method === "bun-binary") {
-		return `Download from: https://github.com/earendil-works/pi-mono/releases/latest`;
+		return `Download from: https://github.com/frelion/bone/releases/latest`;
 	}
 	const command = getSelfUpdateCommandForMethod(method, packageName, target, npmCommand);
 	if (command) {
@@ -366,7 +366,7 @@ export function getUpdateInstruction(packageName: string): string {
  */
 export function getPackageDir(): string {
 	// Allow override via environment variable (useful for Nix/Guix where store paths tokenize poorly)
-	const envDir = process.env.PI_PACKAGE_DIR;
+	const envDir = process.env.BONE_PACKAGE_DIR;
 	if (envDir) {
 		return normalizePath(envDir);
 	}
@@ -485,13 +485,13 @@ try {
 }
 
 const piConfigName: string | undefined = pkg.piConfig?.name;
-export const PACKAGE_NAME: string = pkg.name || "@earendil-works/pi-coding-agent";
-export const APP_NAME: string = piConfigName || "pi";
-export const APP_TITLE: string = piConfigName ? APP_NAME : "π";
-export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".pi";
+export const PACKAGE_NAME: string = pkg.name || "bone";
+export const APP_NAME: string = piConfigName || "bone";
+export const APP_TITLE: string = APP_NAME;
+export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".bone";
 export const VERSION: string = pkg.version || "0.0.0";
 
-// e.g., PI_CODING_AGENT_DIR or TAU_CODING_AGENT_DIR
+// e.g., BONE_CODING_AGENT_DIR or TAU_CODING_AGENT_DIR
 export const ENV_AGENT_DIR = `${APP_NAME.toUpperCase()}_CODING_AGENT_DIR`;
 export const ENV_SESSION_DIR = `${APP_NAME.toUpperCase()}_CODING_AGENT_SESSION_DIR`;
 
@@ -499,19 +499,45 @@ export function expandTildePath(path: string): string {
 	return normalizePath(path);
 }
 
-const DEFAULT_SHARE_VIEWER_URL = "https://pi.dev/session/";
+function getConfiguredUrl(...names: string[]): string | undefined {
+	for (const name of names) {
+		const value = process.env[name]?.trim();
+		if (!value) continue;
+		try {
+			return new URL(value).toString();
+		} catch {}
+	}
+	return undefined;
+}
+
+export function getUpdateCheckUrl(): string | undefined {
+	return getConfiguredUrl("BONE_UPDATE_URL");
+}
+
+export function getInstallTelemetryUrl(): string | undefined {
+	return getConfiguredUrl("BONE_TELEMETRY_URL");
+}
+
+export function getModelCatalogUrl(): string | undefined {
+	return getConfiguredUrl("BONE_MODEL_CATALOG_URL");
+}
+
+export function getChangelogUrl(): string | undefined {
+	return getConfiguredUrl("BONE_CHANGELOG_URL");
+}
 
 /** Get the share viewer URL for a gist ID */
-export function getShareViewerUrl(gistId: string): string {
-	const baseUrl = process.env.PI_SHARE_VIEWER_URL || DEFAULT_SHARE_VIEWER_URL;
+export function getShareViewerUrl(gistId: string): string | undefined {
+	const baseUrl = getConfiguredUrl("BONE_SHARE_VIEWER_URL");
+	if (!baseUrl) return undefined;
 	return `${baseUrl}#${gistId}`;
 }
 
 // =============================================================================
-// User Config Paths (~/.pi/agent/*)
+// User Config Paths (~/.bone/agent/*)
 // =============================================================================
 
-/** Get the agent config directory (e.g., ~/.pi/agent/) */
+/** Get the agent config directory (e.g., ~/.bone/agent/) */
 export function getAgentDir(): string {
 	const envDir = process.env[ENV_AGENT_DIR];
 	if (envDir) {

@@ -2,7 +2,7 @@
 
 [English](../README.md) | **简体中文**
 
-这里是 Bone 的用户文档。Pi 继承而来的 SDK、扩展等底层参考暂时保留在
+这里是 Bone 的用户文档。SDK、扩展等底层参考暂时保留在
 [`packages/coding-agent/docs`](../../packages/coding-agent/docs/)；它们会按 Bone
 实际需求逐步拥有独立文档。
 

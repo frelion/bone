@@ -15,7 +15,7 @@ bone --version
 
 ```bash
 npm run pack:bone
-npm install --global --force --ignore-scripts artifacts/earendil-works-pi-coding-agent-<version>.tgz
+npm install --global --force --ignore-scripts artifacts/*.tgz
 ```
 
 ## 2. 配置 Provider

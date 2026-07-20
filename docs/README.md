@@ -2,8 +2,8 @@
 
 **English** | [简体中文](zh-CN/README.md)
 
-This documentation covers Bone-specific user workflows. Pi-derived SDK and
-extension references remain in [`packages/coding-agent/docs`](../packages/coding-agent/docs/)
+This documentation covers Bone-specific user workflows. SDK and extension
+references remain in [`packages/coding-agent/docs`](../packages/coding-agent/docs/)
 until they receive dedicated Bone documentation.
 
 | Guide | What it covers |

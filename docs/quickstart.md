@@ -15,7 +15,7 @@ For development builds, create the self-contained local package and install it:
 
 ```bash
 npm run pack:bone
-npm install --global --force --ignore-scripts artifacts/earendil-works-pi-coding-agent-<version>.tgz
+npm install --global --force --ignore-scripts artifacts/*.tgz
 ```
 
 ## 2. Configure a provider

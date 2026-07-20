@@ -46,8 +46,10 @@ import {
 	CONFIG_DIR_NAME,
 	getAgentDir,
 	getAuthPath,
+	getChangelogUrl,
 	getDebugLogPath,
 	getDocsPath,
+	getInstallTelemetryUrl,
 	getShareViewerUrl,
 	VERSION,
 } from "../../config.ts";
@@ -102,7 +104,7 @@ import { getCwdRelativePath } from "../../utils/paths.ts";
 import { getPiUserAgent } from "../../utils/pi-user-agent.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
-import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
+import { checkForNewBoneVersion, type LatestBoneRelease } from "../../utils/version-check.ts";
 import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
@@ -920,7 +922,7 @@ export class InteractiveMode {
 			);
 			const onboarding = theme.fg(
 				"dim",
-				`Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.`,
+				`${APP_NAME} can explain its own features and look up its docs. Ask it how to use or extend ${APP_NAME}.`,
 			);
 			this.builtInHeader = new ExpandableText(
 				() => `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`,
@@ -991,14 +993,11 @@ export class InteractiveMode {
 	async run(): Promise<void> {
 		await this.init();
 
-		// The upstream release endpoint tracks Pi versions, not independently branded forks.
-		if (APP_NAME === "pi") {
-			checkForNewPiVersion(this.version).then((newRelease) => {
-				if (newRelease) {
-					this.showNewVersionNotification(newRelease);
-				}
-			});
-		}
+		checkForNewBoneVersion(this.version).then((newRelease) => {
+			if (newRelease) {
+				this.showNewVersionNotification(newRelease);
+			}
+		});
 
 		// Start package update check asynchronously
 		this.checkForPackageUpdates()
@@ -1009,7 +1008,7 @@ export class InteractiveMode {
 			})
 			.finally(() => {
 				// On Windows, npm can overwrite the shared console title while checking
-				// extension package versions. Restore Pi's title after the startup check.
+				// extension package versions. Restore Bone's title after the startup check.
 				if (process.platform === "win32" && this.isInitialized) {
 					this.updateTerminalTitle();
 				}
@@ -1074,7 +1073,7 @@ export class InteractiveMode {
 	}
 
 	private async checkForPackageUpdates(): Promise<string[]> {
-		if (process.env.PI_OFFLINE) {
+		if (process.env.BONE_OFFLINE) {
 			return [];
 		}
 
@@ -1132,7 +1131,7 @@ export class InteractiveMode {
 		}
 
 		if (extendedKeysFormat === "xterm") {
-			return "tmux extended-keys-format is xterm. Pi works best with csi-u. Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.";
+			return "tmux extended-keys-format is xterm. Bone works best with csi-u. Add `set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.";
 		}
 
 		return undefined;
@@ -1170,7 +1169,7 @@ export class InteractiveMode {
 	}
 
 	private reportInstallTelemetry(version: string): void {
-		if (process.env.PI_OFFLINE) {
+		if (process.env.BONE_OFFLINE) {
 			return;
 		}
 
@@ -1178,7 +1177,14 @@ export class InteractiveMode {
 			return;
 		}
 
-		void fetch(`https://pi.dev/api/report-install?version=${encodeURIComponent(version)}`, {
+		const telemetryUrl = getInstallTelemetryUrl();
+		if (!telemetryUrl) {
+			return;
+		}
+
+		const url = new URL(telemetryUrl);
+		url.searchParams.set("version", version);
+		void fetch(url, {
 			headers: {
 				"User-Agent": getPiUserAgent(version),
 			},
@@ -2844,7 +2850,7 @@ export class InteractiveMode {
 			if (image) {
 				const tmpDir = os.tmpdir();
 				const ext = extensionForImageMimeType(image.mimeType) ?? "png";
-				const fileName = `pi-clipboard-${crypto.randomUUID()}.${ext}`;
+				const fileName = `bone-clipboard-${crypto.randomUUID()}.${ext}`;
 				const filePath = path.join(tmpDir, fileName);
 				fs.writeFileSync(filePath, Buffer.from(image.bytes));
 
@@ -3681,7 +3687,7 @@ export class InteractiveMode {
 			new Text(
 				theme.fg(
 					"warning",
-					`This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart pi.`,
+					`This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart ${APP_NAME}.`,
 				),
 				1,
 				0,
@@ -3821,7 +3827,7 @@ export class InteractiveMode {
 		try {
 			this.ui.stop();
 		} catch {}
-		console.error("pi exiting due to uncaughtException:");
+		console.error(`${APP_NAME} exiting due to uncaughtException:`);
 		console.error(error);
 		process.exit(1);
 	}
@@ -3868,7 +3874,7 @@ export class InteractiveMode {
 
 		// Restore the terminal before the process dies on any uncaught throw.
 		// Without this, an unhandled exception from extension code (or anywhere
-		// in pi) leaves the terminal in raw mode with no cursor.
+		// in Bone) leaves the terminal in raw mode with no cursor.
 		const uncaughtExceptionHandler = (error: Error) => this.uncaughtCrash(error);
 		process.prependListener("uncaughtException", uncaughtExceptionHandler);
 		this.signalCleanupHandlers.push(() => process.off("uncaughtException", uncaughtExceptionHandler));
@@ -4045,7 +4051,7 @@ export class InteractiveMode {
 		}
 
 		const currentText = this.editor.getExpandedText?.() ?? this.editor.getText();
-		const tmpFile = path.join(os.tmpdir(), `pi-editor-${Date.now()}.pi.md`);
+		const tmpFile = path.join(os.tmpdir(), `bone-editor-${Date.now()}.bone.md`);
 
 		try {
 			// Write current content to temp file
@@ -4113,14 +4119,16 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	showNewVersionNotification(release: LatestPiRelease): void {
+	showNewVersionNotification(release: LatestBoneRelease): void {
 		const action = theme.fg("accent", `${APP_NAME} update`);
 		const updateInstruction = theme.fg("muted", `New version ${release.version} is available. Run `) + action;
-		const changelogUrl = "https://pi.dev/changelog";
-		const changelogLink = getCapabilities().hyperlinks
-			? hyperlink(theme.fg("accent", changelogUrl), changelogUrl)
-			: theme.fg("accent", changelogUrl);
-		const changelogLine = theme.fg("muted", "Changelog: ") + changelogLink;
+		const changelogUrl = getChangelogUrl();
+		const changelogLine = changelogUrl
+			? theme.fg("muted", "Changelog: ") +
+				(getCapabilities().hyperlinks
+					? hyperlink(theme.fg("accent", changelogUrl), changelogUrl)
+					: theme.fg("accent", changelogUrl))
+			: undefined;
 		const note = release.note?.trim();
 
 		this.chatContainer.addChild(new Spacer(1));
@@ -4137,7 +4145,9 @@ export class InteractiveMode {
 			);
 			this.chatContainer.addChild(new Spacer(1));
 		}
-		this.chatContainer.addChild(new Text(changelogLine, 1, 0));
+		if (changelogLine) {
+			this.chatContainer.addChild(new Text(changelogLine, 1, 0));
+		}
 		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
 		this.ui.requestRender();
 	}
@@ -4739,7 +4749,7 @@ export class InteractiveMode {
 					trustStore.setMany(selection.updates);
 					done();
 					this.showStatus(
-						`Saved trust decision: ${selection.trusted ? "trusted" : "untrusted"}. Restart pi for this to take effect.`,
+						`Saved trust decision: ${selection.trusted ? "trusted" : "untrusted"}. Restart ${APP_NAME} for this to take effect.`,
 					);
 				},
 				onCancel: () => {
@@ -5757,7 +5767,11 @@ export class InteractiveMode {
 			providerOption.name,
 			`${providerOption.name} setup`,
 		);
-		dialog.showInfo(`${providerOption.method?.name ?? "Authentication"} is configured outside pi.`, [], true);
+		dialog.showInfo(
+			`${providerOption.method?.name ?? "Authentication"} is configured outside ${APP_NAME}.`,
+			[],
+			true,
+		);
 
 		this.editorContainer.clear();
 		this.editorContainer.addChild(dialog);
@@ -6205,7 +6219,7 @@ export class InteractiveMode {
 
 			// Create the preview URL
 			const previewUrl = getShareViewerUrl(gistId);
-			this.showStatus(`Share URL: ${previewUrl}\nGist: ${gistUrl}`);
+			this.showStatus(previewUrl ? `Share URL: ${previewUrl}\nGist: ${gistUrl}` : `Gist: ${gistUrl}`);
 		} catch (error: unknown) {
 			if (!loader.signal.aborted) {
 				restoreEditor();

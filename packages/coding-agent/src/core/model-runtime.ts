@@ -166,7 +166,7 @@ export class ModelRuntime implements Models {
 			modelsPath,
 			modelsStore,
 			providers,
-			options.allowModelNetwork ?? process.env.PI_OFFLINE === undefined,
+			options.allowModelNetwork ?? process.env.BONE_OFFLINE === undefined,
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
