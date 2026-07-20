@@ -66,10 +66,17 @@ jobs:
           $archive = "node-v$version-win-$arch.zip"
           $download = Join-Path $env:RUNNER_TEMP $archive
           $destination = Join-Path $env:RUNNER_TEMP "node-sdk-$arch"
+          $headersArchive = "node-v$version-headers.tar.gz"
+          $headersDownload = Join-Path $env:RUNNER_TEMP $headersArchive
+          $headersDestination = Join-Path $env:RUNNER_TEMP "node-headers"
           Invoke-WebRequest "https://nodejs.org/dist/v$version/$archive" -OutFile $download
+          Invoke-WebRequest "https://nodejs.org/dist/v$version/$headersArchive" -OutFile $headersDownload
           Expand-Archive -Path $download -DestinationPath $destination
+          New-Item -ItemType Directory -Path $headersDestination | Out-Null
+          tar -xzf $headersDownload -C $headersDestination
           $nodeHome = Join-Path $destination "node-v$version-win-$arch"
-          Add-Content $env:GITHUB_ENV "BONE_NODE_API_INCLUDE_DIR=$(Join-Path $nodeHome 'include\node')"
+          $headersHome = Join-Path $headersDestination "node-v$version"
+          Add-Content $env:GITHUB_ENV "BONE_NODE_API_INCLUDE_DIR=$(Join-Path $headersHome 'include\node')"
           Add-Content $env:GITHUB_ENV "BONE_NODE_LIBRARY=$(Join-Path $nodeHome 'node.lib')"
 
       - name: Build semantic native addon
