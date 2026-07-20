@@ -55,29 +55,25 @@ jobs:
           node-version: '22'
 
       # setup-node's Windows cache does not include the Node-API headers or
-      # node.lib. Download the matching SDK explicitly; ARM64 needs an ARM64
-      # import library even though the hosted runner itself is x64.
-      - name: Download Windows Node-API SDK
+      # node.lib. Download both explicitly; ARM64 needs an ARM64 import
+      # library even though the hosted runner itself is x64.
+      - name: Download Windows Node-API headers and library
         if: startsWith(matrix.target, 'win32-')
         shell: pwsh
         run: |
           $version = node -p "process.versions.node"
           $arch = if ("${{ matrix.target }}" -eq "win32-arm64") { "arm64" } else { "x64" }
-          $archive = "node-v$version-win-$arch.zip"
-          $download = Join-Path $env:RUNNER_TEMP $archive
-          $destination = Join-Path $env:RUNNER_TEMP "node-sdk-$arch"
           $headersArchive = "node-v$version-headers.tar.gz"
           $headersDownload = Join-Path $env:RUNNER_TEMP $headersArchive
           $headersDestination = Join-Path $env:RUNNER_TEMP "node-headers"
-          Invoke-WebRequest "https://nodejs.org/dist/v$version/$archive" -OutFile $download
+          $nodeLibrary = Join-Path $env:RUNNER_TEMP "node-$arch.lib"
           Invoke-WebRequest "https://nodejs.org/dist/v$version/$headersArchive" -OutFile $headersDownload
-          Expand-Archive -Path $download -DestinationPath $destination
+          Invoke-WebRequest "https://nodejs.org/dist/v$version/win-$arch/node.lib" -OutFile $nodeLibrary
           New-Item -ItemType Directory -Path $headersDestination | Out-Null
           tar -xzf $headersDownload -C $headersDestination
-          $nodeHome = Join-Path $destination "node-v$version-win-$arch"
           $headersHome = Join-Path $headersDestination "node-v$version"
           Add-Content $env:GITHUB_ENV "BONE_NODE_API_INCLUDE_DIR=$(Join-Path $headersHome 'include\node')"
-          Add-Content $env:GITHUB_ENV "BONE_NODE_LIBRARY=$(Join-Path $nodeHome 'node.lib')"
+          Add-Content $env:GITHUB_ENV "BONE_NODE_LIBRARY=$nodeLibrary"
 
       - name: Build semantic native addon
         shell: bash
