@@ -219,15 +219,42 @@ jobs:
           for asset in "${release_assets[@]}" SHA256SUMS RELEASE_NOTES.md; do test -f "${asset}"; done
           sha256sum -c SHA256SUMS
 
-          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${release_assets[@]}" SHA256SUMS
-            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
-              --title "Bone ${RELEASE_TAG#v}" \
-              --notes-file RELEASE_NOTES.md
-          else
+          if ! gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release create "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
               --title "Bone ${RELEASE_TAG#v}" \
-              --notes-file RELEASE_NOTES.md \
-              "${release_assets[@]}" SHA256SUMS
+              --notes-file RELEASE_NOTES.md
           fi
+
+          # GitHub Release assets are uploaded through uploads.github.com. Its
+          # policy endpoint can occasionally return transient 5xx responses;
+          # upload files independently so a retry never discards assets that
+          # were already accepted before a later upload failed.
+          upload_asset() {
+            local asset="$1"
+            local attempt
+            local delay
+
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${asset}"; then
+                return 0
+              fi
+
+              if [[ "${attempt}" -eq 5 ]]; then
+                echo "Failed to upload ${asset} after ${attempt} attempts." >&2
+                return 1
+              fi
+
+              delay=$((attempt * 15))
+              echo "Upload of ${asset} failed; retrying in ${delay}s (attempt $((attempt + 1))/5)." >&2
+              sleep "${delay}"
+            done
+          }
+
+          for asset in "${release_assets[@]}" SHA256SUMS; do
+            upload_asset "${asset}"
+          done
+
+          gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --title "Bone ${RELEASE_TAG#v}" \
+            --notes-file RELEASE_NOTES.md
