@@ -132,11 +132,11 @@ for platform in "${PLATFORMS[@]}"; do
     echo "Building for $platform..."
     # Bun compiled executables only embed worker scripts when they are passed as
     # explicit build entrypoints. The runtime can still use new URL(...), but the
-    # worker must be present in the compiled executable.
+    # workers must be present in the compiled executable.
     if [[ "$platform" == windows-* ]]; then
-		bun build --compile --target=bun-$platform ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/core/local-embedding-worker.ts --outfile "$OUTPUT_DIR/$platform/bone.exe"
+		bun build --compile --target=bun-$platform ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/core/local-embedding-worker.ts ./src/core/local-embedding-setup-worker.ts --outfile "$OUTPUT_DIR/$platform/bone.exe"
     else
-		bun build --compile --target=bun-$platform ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/core/local-embedding-worker.ts --outfile "$OUTPUT_DIR/$platform/bone"
+		bun build --compile --target=bun-$platform ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/core/local-embedding-worker.ts ./src/core/local-embedding-setup-worker.ts --outfile "$OUTPUT_DIR/$platform/bone"
     fi
 done
 

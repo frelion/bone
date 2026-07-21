@@ -22,6 +22,14 @@ interface DownloadProgressBar {
 	totalBytes: number;
 }
 
+function setupWorkerEntry(): string | URL {
+	// Bun standalone executables resolve explicitly bundled worker entrypoints
+	// by their source path. Resolving a URL from the compiled CLI instead
+	// targets a different virtual filesystem path.
+	if (typeof process.versions.bun === "string") return "./src/core/local-embedding-setup-worker.ts";
+	return new URL("../core/local-embedding-setup-worker.js", import.meta.url);
+}
+
 function asStatus(value: unknown): LocalEmbeddingStatus | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const candidate = value as { phase?: unknown; loadedBytes?: unknown; totalBytes?: unknown; file?: unknown };
@@ -44,14 +52,9 @@ async function prepareLocalEmbeddingAssets(
 	agentDir: string,
 	onStatus: (status: LocalEmbeddingStatus) => void,
 ): Promise<void> {
-	const isTypeScriptRuntime = import.meta.url.endsWith(".ts");
-	const worker = new Worker(
-		new URL(
-			isTypeScriptRuntime ? "../core/local-embedding-setup-worker.ts" : "../core/local-embedding-setup-worker.js",
-			import.meta.url,
-		),
-		{ execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")) },
-	);
+	const worker = new Worker(setupWorkerEntry(), {
+		execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
+	});
 	try {
 		await new Promise<void>((resolve, reject) => {
 			let settled = false;

@@ -156,6 +156,7 @@ function buildStandalone() {
 			"./dist/bun/cli.js",
 			"./src/utils/image-resize-worker.ts",
 			"./src/core/local-embedding-worker.ts",
+			"./src/core/local-embedding-setup-worker.ts",
 			"--outfile",
 			"dist/bone",
 		],
