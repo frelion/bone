@@ -144,18 +144,26 @@ Attribution:
    ```
    Verify both Node and Bun startup, model/account listing, interactive startup, and at least one real prompt with the intended default provider. The bare commands `/tmp/bone-local-release/node/bone` and `/tmp/bone-local-release/bun/bone` start interactive mode; run each in tmux, submit a prompt, and wait for the model reply before considering the interactive smoke test passed. Failures are release blockers unless the user explicitly accepts the risk.
 
-3. **Run the release script**:
+3. **Run the release doctor** before changing versions:
    ```bash
-   PI_ALLOW_LOCKFILE_CHANGE=1 npm_config_min_release_age=0 npm run release:patch    # fixes + additions
-   PI_ALLOW_LOCKFILE_CHANGE=1 npm_config_min_release_age=0 npm run release:minor    # breaking changes
+   npm run release:doctor
    ```
-   Use `npm_config_min_release_age=0` only for the release command. The repo's normal npm age gate can otherwise block the release lockfile refresh when the current workspace package version was published recently. Review any lockfile or shrinkwrap diffs the release creates before push.
+   This verifies lockstep package versions and internal dependency ranges, performs a clean-install dependency resolution, and checks generated release locks. Fix every failure before preparing a release.
 
-   The release script bumps all package versions, updates changelogs, regenerates release artifacts, runs `npm run check`, commits `Release vX.Y.Z`, tags `vX.Y.Z`, adds fresh `## [Unreleased]` changelog sections, commits `Add [Unreleased] section for next cycle`, then pushes `main` and the tag. Do not rerun the release script after a tag was pushed.
+4. **Prepare an explicit version**. Never use an implicit patch/minor bump:
+   ```bash
+   npm run release:prepare -- 0.0.10 --dry-run
+   npm run release:prepare -- 0.0.10
+   ```
+   Preparation atomically updates only the five lockstep packages and their internal dependency ranges, refreshes the root lockfile, shrinkwrap, and installer lock, then runs clean dependency resolution, `npm run check`, and `./test.sh`. It does not commit, tag, or push. Review every generated diff before publishing. Re-running prepare with the same explicit version is safe; do not choose a new version merely because preparation failed.
 
-4. **CI publishes npm packages**: pushing the `vX.Y.Z` tag triggers `.github/workflows/build-binaries.yml`. The `publish-npm` job uses npm trusted publishing through GitHub Actions OIDC with environment `npm-publish`; no local `npm publish`, `npm whoami`, OTP, or WebAuthn flow is required.
+5. **Publish the prepared version**:
+   ```bash
+   PI_ALLOW_LOCKFILE_CHANGE=1 npm run release:publish -- 0.0.10
+   ```
+   Publish accepts only expected release files, commits `Release vX.Y.Z`, adds and commits the next `[Unreleased]` sections, pushes `main`, waits for the exact main commit's CI run, then creates and pushes the tag. It waits for the GitHub Release workflow and reports failure instead of claiming the release succeeded early.
 
-5. **If CI publish fails**: inspect the failed `publish-npm` job. The publish helper is idempotent and skips package versions already present on npm, so rerun the tag workflow after fixing CI or transient npm issues. Do not rerun `npm run release:patch` or `npm run release:minor` for the same version.
+6. **If GitHub Release CI fails**: for a transient runner, network, or upload failure, rerun `release:publish` with the same version; it reruns the failed tag workflow without moving the tag or creating new commits. If the fix changes tracked source or release metadata, keep the failed tag immutable, prepare a new explicit patch version, and publish that version. npm publication is not active; GitHub Releases are the distribution channel.
 
 ## User Override
 

@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed the conversation sidebar alignment and width so sessions use the available terminal space more effectively.
 - Fixed standalone release builds failing to resolve lockstep workspace packages in clean environments.
 
 ## [0.0.9] - 2026-07-21

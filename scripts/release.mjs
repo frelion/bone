@@ -1,208 +1,255 @@
 #!/usr/bin/env node
-/**
- * Release script for Bone.
- *
- * Usage:
- *   node scripts/release.mjs <major|minor|patch>
- *   node scripts/release.mjs <x.y.z>
- *
- * Steps:
- * 1. Check for uncommitted changes
- * 2. Bump version via npm run version:xxx or set an explicit version
- * 3. Update CHANGELOG.md files: [Unreleased] -> [version] - date
- * 4. Regenerate release artifacts
- * 5. Run checks and tests
- * 6. Commit and tag the release
- * 7. Add new [Unreleased] section to changelogs
- * 8. Commit next-cycle changelog updates
- * 9. Push main and the tag to trigger the GitHub Release workflow
- */
 
-import { execSync } from "child_process";
-import { readFileSync, writeFileSync, readdirSync, existsSync } from "fs";
-import { join } from "path";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { syncWorkspaceVersions } from "./sync-versions.js";
 
-const RELEASE_TARGET = process.argv[2];
-const BUMP_TYPES = new Set(["major", "minor", "patch"]);
+const root = process.cwd();
+const statePath = join(root, ".git", "bone-release-state.json");
+const changelogs = ["ai", "agent", "tui", "coding-agent", "orchestrator"].map(
+	(packageName) => `packages/${packageName}/CHANGELOG.md`,
+);
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
+const releasePathPatterns = [
+	/^package-lock\.json$/,
+	/^packages\/(ai|agent|tui|coding-agent|orchestrator)\/package\.json$/,
+	/^packages\/(ai|agent|tui|coding-agent|orchestrator)\/CHANGELOG\.md$/,
+	/^packages\/coding-agent\/(npm-shrinkwrap\.json|install-lock\/(package|package-lock)\.json)$/,
+];
 
-if (!RELEASE_TARGET || (!BUMP_TYPES.has(RELEASE_TARGET) && !SEMVER_RE.test(RELEASE_TARGET))) {
-	console.error("Usage: node scripts/release.mjs <major|minor|patch|x.y.z>");
-	process.exit(1);
+function run(command, args, options = {}) {
+	console.log(`$ ${[command, ...args].join(" ")}`);
+	return execFileSync(command, args, {
+		cwd: root,
+		encoding: "utf8",
+		stdio: options.capture ? ["inherit", "pipe", "inherit"] : "inherit",
+		env: { ...process.env, npm_config_min_release_age: "0", ...options.env },
+	});
 }
 
-function run(cmd, options = {}) {
-	console.log(`$ ${cmd}`);
-	try {
-		return execSync(cmd, { encoding: "utf-8", stdio: options.silent ? "pipe" : "inherit", ...options });
-	} catch (e) {
-		if (!options.ignoreError) {
-			console.error(`Command failed: ${cmd}`);
-			process.exit(1);
-		}
-		return null;
-	}
+function capture(command, args) {
+	return run(command, args, { capture: true }).trim();
 }
 
 function getVersion() {
-	const pkg = JSON.parse(readFileSync("packages/ai/package.json", "utf-8"));
-	return pkg.version;
+	return JSON.parse(readFileSync(join(root, "packages/ai/package.json"), "utf8")).version;
 }
 
-function compareVersions(a, b) {
-	const aParts = a.split(".").map(Number);
-	const bParts = b.split(".").map(Number);
+function requireVersion(version) {
+	if (!SEMVER_RE.test(version ?? "")) throw new Error("A target version such as 0.0.10 is required.");
+	return version;
+}
 
-	for (let i = 0; i < 3; i++) {
-		const diff = (aParts[i] || 0) - (bParts[i] || 0);
-		if (diff !== 0) {
-			return diff;
-		}
+function changedPaths() {
+	const output = capture("git", ["status", "--porcelain"]);
+	if (!output) return [];
+	return output.split("\n").map((line) => line.slice(3).trim());
+}
+
+function assertClean() {
+	const paths = changedPaths();
+	if (paths.length > 0) throw new Error(`Working tree must be clean:\n${paths.map((path) => `  ${path}`).join("\n")}`);
+}
+
+function assertReleaseChanges(paths) {
+	const unexpected = paths.filter((path) => !releasePathPatterns.some((pattern) => pattern.test(path)));
+	if (unexpected.length > 0) {
+		throw new Error(`Unexpected files in prepared release:\n${unexpected.map((path) => `  ${path}`).join("\n")}`);
 	}
-
-	return 0;
 }
 
-function shellQuote(value) {
-	return `'${value.replace(/'/g, `'\\''`)}'`;
+function updateChangelogs(version) {
+	const date = new Date().toISOString().slice(0, 10);
+	for (const path of changelogs) {
+		const content = readFileSync(join(root, path), "utf8");
+		if (content.includes(`## [${version}]`)) continue;
+		if (!content.includes("## [Unreleased]")) throw new Error(`${path} has no [Unreleased] section`);
+		writeFileSync(join(root, path), content.replace("## [Unreleased]", `## [${version}] - ${date}`));
+	}
 }
 
-function stageChangedFiles() {
-	const output = run("git ls-files -m -o -d --exclude-standard", { silent: true });
-	const paths = [...new Set((output || "").split("\n").map((line) => line.trim()).filter(Boolean))];
+function addNextUnreleasedSections() {
+	for (const path of changelogs) {
+		const content = readFileSync(join(root, path), "utf8");
+		if (content.includes("## [Unreleased]")) continue;
+		writeFileSync(join(root, path), content.replace(/^# Changelog\n\n/, "# Changelog\n\n## [Unreleased]\n\n"));
+	}
+}
+
+function writeState(state) {
+	writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+function readState(version) {
+	if (!existsSync(statePath)) throw new Error(`No prepared release state for ${version}. Run release:prepare first.`);
+	const state = JSON.parse(readFileSync(statePath, "utf8"));
+	if (state.version !== version) throw new Error(`Prepared release is ${state.version}, not ${version}.`);
+	return state;
+}
+
+function verifyWorkspaceAndLocks() {
+	const syncResult = syncWorkspaceVersions({ root, write: false });
+	if (syncResult.changes.length > 0) throw new Error(syncResult.changes.join("\n"));
+	run("npm", ["ci", "--ignore-scripts", "--dry-run"]);
+	run("node", ["scripts/generate-coding-agent-shrinkwrap.mjs", "--check"]);
+	run("node", ["scripts/generate-coding-agent-install-lock.mjs", "--check"]);
+}
+
+function doctor({ requireClean = true, requirePublishTools = false } = {}) {
+	if (requireClean) assertClean();
+	for (const command of ["git", "node", "npm", "bun", ...(requirePublishTools ? ["gh"] : [])]) {
+		run(command, ["--version"]);
+	}
+	verifyWorkspaceAndLocks();
+	console.log(`Release prerequisites are valid at ${getVersion()}.`);
+}
+
+function prepare(version, { dryRun = false } = {}) {
+	const paths = changedPaths();
 	if (paths.length === 0) {
+		doctor({ requireClean: false });
+	} else {
+		if (dryRun) throw new Error("A prepare dry run requires a clean working tree.");
+		const state = readState(version);
+		if (state.phase !== "preparing") throw new Error(`Release ${version} is already in phase ${state.phase}.`);
+		assertReleaseChanges(paths);
+		console.log(`Resuming release ${version} from the preparing phase.`);
+	}
+	if (!dryRun) writeState({ phase: "preparing", version });
+	const result = syncWorkspaceVersions({ root, target: version, write: !dryRun });
+	console.log(result.changes.join("\n"));
+	if (dryRun) {
+		console.log(`Dry run complete for ${version}; no files changed.`);
 		return;
 	}
-
-	run(`git add -- ${paths.map(shellQuote).join(" ")}`);
+	run("npm", ["install", "--package-lock-only", "--ignore-scripts"]);
+	updateChangelogs(version);
+	run("node", ["scripts/generate-coding-agent-shrinkwrap.mjs"]);
+	run("node", ["scripts/generate-coding-agent-install-lock.mjs"]);
+	verifyWorkspaceAndLocks();
+	run("npm", ["run", "check"]);
+	run("./test.sh", []);
+	const preparedPaths = changedPaths();
+	assertReleaseChanges(preparedPaths);
+	writeState({ phase: "prepared", version });
+	console.log(`Release ${version} is prepared but not committed, tagged, or pushed.`);
 }
 
-function bumpOrSetVersion(target) {
-	const currentVersion = getVersion();
-
-	if (BUMP_TYPES.has(target)) {
-		console.log(`Bumping version (${target})...`);
-		run(`npm run version:${target}`);
-		return getVersion();
-	}
-
-	if (compareVersions(target, currentVersion) <= 0) {
-		console.error(`Error: explicit version ${target} must be greater than current version ${currentVersion}.`);
-		process.exit(1);
-	}
-
-	console.log(`Setting explicit version (${target})...`);
-	run(`npm version ${target} -ws --no-git-tag-version --package-lock=false && node scripts/sync-versions.js && npm install --package-lock-only --ignore-scripts`);
-	return getVersion();
-}
-
-function getChangelogs() {
-	const packagesDir = "packages";
-	const packages = readdirSync(packagesDir);
-	return packages
-		.map((pkg) => join(packagesDir, pkg, "CHANGELOG.md"))
-		.filter((path) => existsSync(path));
-}
-
-function updateChangelogsForRelease(version) {
-	const date = new Date().toISOString().split("T")[0];
-	const changelogs = getChangelogs();
-
-	for (const changelog of changelogs) {
-		const content = readFileSync(changelog, "utf-8");
-
-		if (!content.includes("## [Unreleased]")) {
-			console.log(`  Skipping ${changelog}: no [Unreleased] section`);
-			continue;
+function waitForRun(workflow, ref, { commit, retryFailed = false } = {}) {
+	let runInfo;
+	for (let attempt = 0; attempt < 120; attempt++) {
+		const args = [
+			"run",
+			"list",
+			"--workflow",
+			workflow,
+			"--limit",
+			"1",
+			"--json",
+			"databaseId,status,conclusion,url",
+		];
+		if (commit) args.push("--commit", commit);
+		else args.push("--branch", ref);
+		const output = capture("gh", args);
+		const runs = JSON.parse(output || "[]");
+		if (runs[0]) {
+			runInfo = runs[0];
+			break;
 		}
-
-		const updated = content.replace(
-			"## [Unreleased]",
-			`## [${version}] - ${date}`
-		);
-		writeFileSync(changelog, updated);
-		console.log(`  Updated ${changelog}`);
+		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);
 	}
-}
-
-function addUnreleasedSection() {
-	const changelogs = getChangelogs();
-	const unreleasedSection = "## [Unreleased]\n\n";
-
-	for (const changelog of changelogs) {
-		const content = readFileSync(changelog, "utf-8");
-
-		// Insert after "# Changelog\n\n"
-		const updated = content.replace(
-			/^(# Changelog\n\n)/,
-			`$1${unreleasedSection}`
-		);
-		writeFileSync(changelog, updated);
-		console.log(`  Added [Unreleased] to ${changelog}`);
+	if (!runInfo) throw new Error(`No ${workflow} run found for ${ref}.`);
+	if (runInfo.status === "completed" && runInfo.conclusion !== "success" && retryFailed) {
+		run("gh", ["run", "rerun", String(runInfo.databaseId), "--failed"]);
 	}
+	run("gh", ["run", "watch", String(runInfo.databaseId), "--exit-status"]);
+	return runInfo.url;
 }
 
-// Main flow
-console.log("\n=== Release Script ===\n");
-
-// 1. Check for uncommitted changes
-console.log("Checking for uncommitted changes...");
-const status = run("git status --porcelain", { silent: true });
-if (status && status.trim()) {
-	console.error("Error: Uncommitted changes detected. Commit or stash first.");
-	console.error(status);
-	process.exit(1);
+function publish(version) {
+	let state = readState(version);
+	if (state.phase === "prepared") {
+		const paths = changedPaths();
+		assertReleaseChanges(paths);
+		if (getVersion() !== version) throw new Error(`Package version is ${getVersion()}, expected ${version}.`);
+		verifyWorkspaceAndLocks();
+		run("git", ["add", "--", ...paths]);
+		run("git", ["commit", "-m", `Release v${version}`], { env: { PI_ALLOW_LOCKFILE_CHANGE: "1" } });
+		state = { phase: "release-committed", releaseCommit: capture("git", ["rev-parse", "HEAD"]), version };
+		writeState(state);
+	}
+	if (state.phase === "release-committed") {
+		assertClean();
+		addNextUnreleasedSections();
+		run("git", ["add", "--", ...changelogs]);
+		run("git", ["commit", "-m", "Add [Unreleased] section for next cycle"]);
+		state = {
+			headCommit: capture("git", ["rev-parse", "HEAD"]),
+			phase: "next-cycle-committed",
+			releaseCommit: state.releaseCommit,
+			version,
+		};
+		writeState(state);
+	}
+	assertClean();
+	const headCommit = state.headCommit ?? capture("git", ["rev-parse", "HEAD"]);
+	const nativeInputsChanged = Boolean(
+		capture("git", [
+			"diff",
+			"--name-only",
+			"origin/main...HEAD",
+			"--",
+			".github/workflows/warm-native-cache.yml",
+			"scripts/build-semantic-native.sh",
+			"packages/coding-agent/native/CMakeLists.txt",
+			"packages/coding-agent/native/bone-embed-addon.cpp",
+			"patches/crispembed-bone-mmap.patch",
+		]),
+	);
+	const tag = `v${version}`;
+	if (state.phase === "next-cycle-committed") {
+		run("git", ["push", "origin", "main"]);
+		waitForRun("ci.yml", "main", { commit: headCommit, retryFailed: true });
+		if (nativeInputsChanged) {
+			waitForRun("warm-native-cache.yml", "main", { commit: headCommit, retryFailed: true });
+		}
+		const remoteTag = capture("git", ["ls-remote", "--tags", "origin", tag]);
+		if (remoteTag) throw new Error(`Remote tag ${tag} already exists before this publish reached the tag phase.`);
+		run("git", ["tag", tag, state.releaseCommit]);
+		run("git", ["push", "origin", tag]);
+		state = { ...state, phase: "tagged" };
+		writeState(state);
+	}
+	const remoteTagCommit = capture("git", ["ls-remote", "--tags", "origin", tag]).split(/\s+/)[0];
+	if (remoteTagCommit !== state.releaseCommit) {
+		throw new Error(`Remote tag ${tag} does not point to prepared release commit ${state.releaseCommit}.`);
+	}
+	const releaseRun = waitForRun("build-binaries.yml", tag, { retryFailed: true });
+	rmSync(statePath, { force: true });
+	console.log(`Published ${tag}: ${releaseRun}`);
 }
-console.log("  Working directory clean\n");
 
-// 2. Bump or set version
-const version = bumpOrSetVersion(RELEASE_TARGET);
-console.log(`  New version: ${version}\n`);
+function usage() {
+	console.log("Usage: release.mjs doctor | prepare <x.y.z> [--dry-run] | publish <x.y.z>");
+}
 
-// 3. Update changelogs
-console.log("Updating CHANGELOG.md files...");
-updateChangelogsForRelease(version);
-console.log();
-
-// 4. Regenerate release artifacts
-console.log("Regenerating release artifacts...");
-run("npm --prefix packages/ai run generate-models");
-run("npm --prefix packages/ai run generate-image-models");
-run("npm run shrinkwrap:coding-agent");
-run("npm run install-lock:coding-agent");
-console.log();
-
-// 5. Run checks and tests
-console.log("Running checks...");
-run("npm run check");
-console.log();
-
-console.log("Running tests...");
-run("./test.sh");
-console.log();
-
-// 6. Commit and tag
-console.log("Committing and tagging...");
-stageChangedFiles();
-run(`git commit -m "Release v${version}"`);
-run(`git tag v${version}`);
-console.log();
-
-// 7. Add new [Unreleased] sections
-console.log("Adding [Unreleased] sections for next cycle...");
-addUnreleasedSection();
-console.log();
-
-// 8. Commit
-console.log("Committing changelog updates...");
-stageChangedFiles();
-run(`git commit -m "Add [Unreleased] section for next cycle"`);
-console.log();
-
-// 9. Push
-console.log("Pushing to remote...");
-run("git push origin main");
-run(`git push origin v${version}`);
-console.log();
-
-console.log(`=== Prepared release v${version}; CI publishing starts after the tag push ===`);
+try {
+	const [command, versionArg, ...flags] = process.argv.slice(2);
+	if (command === "doctor") doctor({ requirePublishTools: false });
+	else if (command === "prepare") {
+		const unknownFlags = flags.filter((flag) => flag !== "--dry-run");
+		if (unknownFlags.length > 0) throw new Error(`Unknown arguments: ${unknownFlags.join(", ")}`);
+		prepare(requireVersion(versionArg), { dryRun: flags.includes("--dry-run") });
+	}
+	else if (command === "publish") {
+		doctor({ requireClean: false, requirePublishTools: true });
+		publish(requireVersion(versionArg));
+	} else {
+		usage();
+		process.exitCode = 1;
+	}
+} catch (error) {
+	console.error(error instanceof Error ? error.message : String(error));
+	process.exitCode = 1;
+}

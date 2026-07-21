@@ -1,96 +1,113 @@
 #!/usr/bin/env node
 
-/**
- * Syncs all workspace package dependency versions to match their current versions.
- * This ensures lockstep versioning across the monorepo.
- */
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { readFileSync, writeFileSync, readdirSync } from 'fs';
-import { join } from 'path';
+export const LOCKSTEP_PACKAGE_DIRS = ["ai", "agent", "tui", "coding-agent", "orchestrator"];
+const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 
-const packagesDir = join(process.cwd(), 'packages');
-const packageDirs = readdirSync(packagesDir, { withFileTypes: true })
-	.filter(dirent => dirent.isDirectory())
-	.map(dirent => dirent.name);
+function compareVersions(left, right) {
+	const leftParts = left.split(".").map(Number);
+	const rightParts = right.split(".").map(Number);
+	for (let index = 0; index < 3; index++) {
+		const difference = leftParts[index] - rightParts[index];
+		if (difference !== 0) return difference;
+	}
+	return 0;
+}
 
-// Read all package.json files and build version map
-const packages = {};
-const versionMap = {};
+function readPackages(root) {
+	return LOCKSTEP_PACKAGE_DIRS.map((directory) => {
+		const path = join(root, "packages", directory, "package.json");
+		return { directory, path, data: JSON.parse(readFileSync(path, "utf8")) };
+	});
+}
 
-for (const dir of packageDirs) {
-	const pkgPath = join(packagesDir, dir, 'package.json');
+function updateDependencyGroup(group, versions, targetVersion, changes, packageName, field) {
+	if (!group) return;
+	for (const [dependencyName, currentSpec] of Object.entries(group)) {
+		if (!versions.has(dependencyName)) continue;
+		const nextSpec = `^${targetVersion}`;
+		if (currentSpec === nextSpec) continue;
+		group[dependencyName] = nextSpec;
+		changes.push(`${packageName} ${field}.${dependencyName}: ${currentSpec} -> ${nextSpec}`);
+	}
+}
+
+export function syncWorkspaceVersions({ root, target, write = true }) {
+	const packages = readPackages(root);
+	const currentVersions = new Set(packages.map((pkg) => pkg.data.version));
+	if (currentVersions.size !== 1) {
+		throw new Error(`Lockstep package versions differ: ${[...currentVersions].join(", ")}`);
+	}
+
+	const currentVersion = packages[0].data.version;
+	const targetVersion = target ?? currentVersion;
+	if (!SEMVER_RE.test(targetVersion)) throw new Error(`Invalid target version: ${targetVersion}`);
+	if (compareVersions(targetVersion, currentVersion) < 0) {
+		throw new Error(`Target version ${targetVersion} is lower than current version ${currentVersion}`);
+	}
+
+	const versions = new Set(packages.map((pkg) => pkg.data.name));
+	const changes = [];
+	for (const pkg of packages) {
+		if (pkg.data.version !== targetVersion) {
+			changes.push(`${pkg.data.name} version: ${pkg.data.version} -> ${targetVersion}`);
+			pkg.data.version = targetVersion;
+		}
+		updateDependencyGroup(pkg.data.dependencies, versions, targetVersion, changes, pkg.data.name, "dependencies");
+		updateDependencyGroup(pkg.data.devDependencies, versions, targetVersion, changes, pkg.data.name, "devDependencies");
+	}
+
+	if (write) {
+		for (const pkg of packages) writeFileSync(pkg.path, `${JSON.stringify(pkg.data, null, "\t")}\n`);
+	}
+
+	return { changes, currentVersion, targetVersion };
+}
+
+function parseArgs(args) {
+	const options = { check: false, dryRun: false, root: resolve(dirname(fileURLToPath(import.meta.url)), ".."), target: undefined };
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--check") options.check = true;
+		else if (arg === "--dry-run") options.dryRun = true;
+		else if (arg === "--target") options.target = args[++index];
+		else if (arg === "--root") options.root = resolve(args[++index]);
+		else throw new Error(`Unknown argument: ${arg}`);
+	}
+	if (options.check && options.target) throw new Error("--check cannot be combined with --target");
+	return options;
+}
+
+function main() {
+	const options = parseArgs(process.argv.slice(2));
+	const result = syncWorkspaceVersions({
+		root: options.root,
+		target: options.target,
+		write: !options.check && !options.dryRun,
+	});
+	if (result.changes.length === 0) {
+		console.log(`Lockstep workspaces are synchronized at ${result.targetVersion}.`);
+		return;
+	}
+	for (const change of result.changes) console.log(change);
+	if (options.check) {
+		console.error("Lockstep workspace versions or dependency ranges are out of sync.");
+		process.exitCode = 1;
+	} else if (options.dryRun) {
+		console.log("Dry run only; no files changed.");
+	} else {
+		console.log(`Synchronized lockstep workspaces at ${result.targetVersion}.`);
+	}
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
 	try {
-		const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
-		packages[dir] = { path: pkgPath, data: pkg };
-		versionMap[pkg.name] = pkg.version;
-	} catch (e) {
-		console.error(`Failed to read ${pkgPath}:`, e.message);
+		main();
+	} catch (error) {
+		console.error(error instanceof Error ? error.message : String(error));
+		process.exitCode = 1;
 	}
-}
-
-console.log('Current versions:');
-for (const [name, version] of Object.entries(versionMap).sort()) {
-	console.log(`  ${name}: ${version}`);
-}
-
-// Verify all versions are the same (lockstep)
-const versions = new Set(Object.values(versionMap));
-if (versions.size > 1) {
-	console.error('\n❌ ERROR: Not all packages have the same version!');
-	console.error('Expected lockstep versioning. Run one of:');
-	console.error('  npm run version:patch');
-	console.error('  npm run version:minor');
-	console.error('  npm run version:major');
-	process.exit(1);
-}
-
-console.log('\n✅ All packages at same version (lockstep)');
-
-// Update all inter-package dependencies
-let totalUpdates = 0;
-for (const [dir, pkg] of Object.entries(packages)) {
-	let updated = false;
-	
-	// Check dependencies
-	if (pkg.data.dependencies) {
-		for (const [depName, currentVersion] of Object.entries(pkg.data.dependencies)) {
-			if (versionMap[depName]) {
-				const newVersion = `^${versionMap[depName]}`;
-				if (currentVersion !== newVersion) {
-					console.log(`\n${pkg.data.name}:`);
-					console.log(`  ${depName}: ${currentVersion} → ${newVersion}`);
-					pkg.data.dependencies[depName] = newVersion;
-					updated = true;
-					totalUpdates++;
-				}
-			}
-		}
-	}
-	
-	// Check devDependencies
-	if (pkg.data.devDependencies) {
-		for (const [depName, currentVersion] of Object.entries(pkg.data.devDependencies)) {
-			if (versionMap[depName]) {
-				const newVersion = `^${versionMap[depName]}`;
-				if (currentVersion !== newVersion) {
-					console.log(`\n${pkg.data.name}:`);
-					console.log(`  ${depName}: ${currentVersion} → ${newVersion} (devDependencies)`);
-					pkg.data.devDependencies[depName] = newVersion;
-					updated = true;
-					totalUpdates++;
-				}
-			}
-		}
-	}
-	
-	// Write if updated
-	if (updated) {
-		writeFileSync(pkg.path, JSON.stringify(pkg.data, null, '\t') + '\n');
-	}
-}
-
-if (totalUpdates === 0) {
-	console.log('\nAll inter-package dependencies already in sync.');
-} else {
-	console.log(`\n✅ Updated ${totalUpdates} dependency version(s)`);
 }
