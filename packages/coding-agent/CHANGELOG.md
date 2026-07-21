@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the conversation sidebar alignment and width so sessions use the available terminal space more effectively.
+- Fixed release builds verifying cached native runtimes from the wrong directory.
+
 ## [0.0.10] - 2026-07-21
 
 ### Fixed
