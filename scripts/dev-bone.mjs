@@ -203,6 +203,25 @@ function switchCurrentRelease(releaseDirectory) {
 	renameSync(temporaryLink, currentLink);
 }
 
+function ensureCommandShim(commandPath) {
+	const expected = join(currentLink, process.platform === "win32" ? "bone.exe" : "bone");
+	if (existsSync(commandPath)) {
+		const metadata = lstatSync(commandPath);
+		if (
+			metadata.isSymbolicLink() &&
+			resolve(dirname(commandPath), readlinkSync(commandPath)) === resolve(expected)
+		) {
+			return;
+		}
+		if (!metadata.isSymbolicLink() && !metadata.isFile()) {
+			fail(`Bone command is not a file or symlink: ${commandPath}`);
+		}
+		rmSync(commandPath);
+	}
+	mkdirSync(dirname(commandPath), { recursive: true });
+	symlinkSync(expected, commandPath);
+}
+
 function pruneReleases() {
 	if (!existsSync(releasesDir)) return;
 	const currentTarget = existsSync(currentLink) ? realpathSync(currentLink) : undefined;
@@ -240,6 +259,8 @@ function installRelease(skipBuild) {
 		verifyRelease(temporaryDirectory, platform);
 		renameSync(temporaryDirectory, releaseDirectory);
 		switchCurrentRelease(releaseDirectory);
+		const hookConfig = readHookConfig();
+		if (hookConfig) ensureCommandShim(resolve(hookConfig.commandPath));
 		pruneReleases();
 	} catch (error) {
 		rmSync(temporaryDirectory, { recursive: true, force: true });
@@ -263,6 +284,7 @@ function installCommandShim(commandPath) {
 		if (resolve(config.commandPath) !== commandPath) {
 			fail(`This repository already manages ${config.commandPath}. Run npm run dev:uninstall-hook before changing the command path.`);
 		}
+		ensureCommandShim(commandPath);
 		return config.commandBackup;
 	}
 
@@ -286,7 +308,7 @@ function installCommandShim(commandPath) {
 		renameSync(commandPath, backupPath);
 		commandBackup = { type: "file", path: backupPath };
 	}
-	symlinkSync(join(currentLink, process.platform === "win32" ? "bone.exe" : "bone"), commandPath);
+	ensureCommandShim(commandPath);
 	return commandBackup;
 }
 
