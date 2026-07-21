@@ -16,7 +16,7 @@ import {
 	visibleWidth,
 } from "@frelion/bone-tui";
 import { CONFIG_DIR_NAME } from "../../../config.ts";
-import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../core/package-manager.ts";
+import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../core/resource-types.ts";
 import type { SettingsManager } from "../../../core/settings-manager.ts";
 import { canonicalizePath } from "../../../utils/paths.ts";
 import { theme } from "../theme/theme.ts";

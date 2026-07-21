@@ -6,8 +6,7 @@
  * Tool names are matched against all available tools. If you use a custom `cwd`,
  * createAgentSession() applies that cwd when it builds the actual built-in tools.
  *
- * For custom tools, see 06-extensions.ts - custom tools are registered via the
- * extensions system using pi.registerTool().
+ * Bone's built-in tools are the supported user-facing tool surface.
  */
 
 import { createAgentSession, SessionManager } from "@frelion/bone-coding-agent";

@@ -1,6 +1,6 @@
 # SDK Examples
 
-Programmatic usage of pi-coding-agent via `createAgentSession()` and `createAgentSessionRuntime()`.
+Programmatic usage of Bone via `createAgentSession()` and `createAgentSessionRuntime()`.
 
 The runtime example shows how to build a recreate function that closes over process-global fixed inputs and recreates cwd-bound services and sessions as the active session cwd changes.
 
@@ -13,13 +13,11 @@ The runtime example shows how to build a recreate function that closes over proc
 | `03-custom-prompt.ts` | Replace or modify system prompt |
 | `04-skills.ts` | Discover, filter, or replace skills |
 | `05-tools.ts` | Built-in tool allowlists |
-| `06-extensions.ts` | Logging, blocking, result modification |
 | `07-context-files.ts` | AGENTS.md context files |
 | `08-slash-commands.ts` | File-based slash commands |
 | `09-api-keys-and-oauth.ts` | API key resolution, OAuth config |
 | `10-settings.ts` | Override compaction, retry, terminal settings |
 | `11-sessions.ts` | In-memory, persistent, continue, list sessions |
-| `12-full-control.ts` | Replace everything, no discovery |
 | `13-session-runtime.ts` | Manage runtime-backed session replacement |
 
 ## Running
@@ -75,7 +73,6 @@ customRuntime.setRuntimeApiKey("anthropic", process.env.MY_KEY!);
 
 const resourceLoader = new DefaultResourceLoader({
   systemPromptOverride: () => "You are helpful.",
-  extensionFactories: [myExtension],
   skillsOverride: () => ({ skills: [], diagnostics: [] }),
   agentsFilesOverride: () => ({ agentsFiles: [] }),
   promptsOverride: () => ({ prompts: [], diagnostics: [] }),
@@ -107,12 +104,12 @@ await session.prompt("Hello");
 |--------|---------|-------------|
 | `modelRuntime` | Runtime using `agentDir/auth.json` and `models.json` | Canonical model and authentication runtime |
 | `cwd` | `process.cwd()` | Working directory |
-| `agentDir` | `~/.pi/agent` | Config directory |
+| `agentDir` | `~/.bone/agent` | Config directory |
 | `model` | From settings/first available | Model to use |
 | `thinkingLevel` | From settings/"off" | off, low, medium, high |
-| `tools` | `["read", "bash", "edit", "write"]` built-ins | Allowlist tool names across built-in, extension, and custom tools |
+| `tools` | `["read", "bash", "edit", "write"]` built-ins | Allowlist built-in and Bone-owned custom tool names |
 | `customTools` | `[]` | Additional tool definitions |
-| `resourceLoader` | DefaultResourceLoader | Resource loader for extensions, skills, prompts, themes, and context files |
+| `resourceLoader` | DefaultResourceLoader | Resource loader for local skills, prompts, themes, and context files |
 | `sessionManager` | `SessionManager.create(cwd)` | Persistence |
 | `settingsManager` | `SettingsManager.create(cwd, agentDir)` | Settings overrides |
 

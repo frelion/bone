@@ -43,7 +43,7 @@ import { assertValidSessionId, SessionManager } from "./core/session-manager.ts"
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
-import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
+import { runMigrations } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { handlePackageCommand } from "./package-manager-cli.ts";
@@ -541,7 +541,7 @@ export async function main(args: string[], options?: MainOptions) {
 	validateSessionIdFlags(parsed);
 
 	// Run migrations (pass cwd for project-local migrations)
-	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
+	const { migratedAuthProviders: migratedProviders } = runMigrations();
 	time("runMigrations");
 
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
@@ -768,11 +768,6 @@ export async function main(args: string[], options?: MainOptions) {
 	time("prepareInitialMessage");
 	initTheme(settingsManager.getTheme(), appMode === "interactive");
 	time("initTheme");
-
-	// Show deprecation warnings in interactive mode
-	if (appMode === "interactive" && deprecationWarnings.length > 0) {
-		await showDeprecationWarnings(deprecationWarnings);
-	}
 
 	time("resolveModelScope");
 	reportDiagnostics(runtime.diagnostics);

@@ -83,16 +83,8 @@
           "path": "sdk.md"
         },
         {
-          "title": "RPC Mode",
-          "path": "rpc.md"
-        },
-        {
           "title": "JSON Event Stream Mode",
           "path": "json.md"
-        },
-        {
-          "title": "TUI Components",
-          "path": "tui.md"
         }
       ]
     },

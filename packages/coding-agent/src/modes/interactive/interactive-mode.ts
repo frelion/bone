@@ -4406,7 +4406,7 @@ export class InteractiveMode {
 		resourceStorage.withLock("global", () => JSON.stringify(runtime.services.settingsManager.getGlobalSettings()));
 		resourceStorage.withLock("project", () => JSON.stringify(runtime.services.settingsManager.getProjectSettings()));
 		const resourceSettingsManager = SettingsManager.fromStorage(resourceStorage, { projectTrusted });
-		const emptyResolvedPaths = { extensions: [], skills: [], prompts: [], themes: [] };
+		const emptyResolvedPaths = { skills: [], prompts: [], themes: [] };
 		const globalResolvedPaths = emptyResolvedPaths;
 		const projectResolvedPaths = projectTrusted ? emptyResolvedPaths : globalResolvedPaths;
 		const storedCredentials = await runtime.services.modelRuntime.listCredentials();

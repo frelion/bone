@@ -260,8 +260,7 @@ export default function(pi) {
 		});
 
 		it("should ignore legacy extension settings and load local resources", async () => {
-			const settingsManager = SettingsManager.inMemory();
-			settingsManager.setExtensionPaths(["extensions/disabled.ts"]);
+			const settingsManager = SettingsManager.inMemory({ extensions: ["extensions/disabled.ts"] });
 
 			const extensionsDir = join(agentDir, "extensions");
 			mkdirSync(extensionsDir, { recursive: true });

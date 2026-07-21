@@ -28,6 +28,7 @@
 		"packages/coding-agent/examples/extensions/**",
 		"packages/coding-agent/examples/sdk/06-extensions.ts",
 		"packages/coding-agent/examples/sdk/12-full-control.ts",
-		"packages/coding-agent/test/**"
+		"packages/coding-agent/test/**",
+		"packages/coding-agent/src/core/package-manager.ts"
 	]
 }

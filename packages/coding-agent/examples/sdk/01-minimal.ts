@@ -1,8 +1,8 @@
 /**
  * Minimal SDK Usage
  *
- * Uses all defaults: discovers skills, extensions, tools, context files
- * from cwd and ~/.pi/agent. Model chosen from settings or first available.
+ * Uses all defaults: discovers local skills, prompts, themes, tools, and context files
+ * from cwd and ~/.bone/agent. Model chosen from settings or first available.
  */
 
 import { createAgentSession } from "@frelion/bone-coding-agent";
