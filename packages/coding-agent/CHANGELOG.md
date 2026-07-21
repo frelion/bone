@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### New Features
+
+- **Faster conversation switching** - Large conversation histories and Side lists load incrementally, while previously initialized workspaces avoid redundant model network refreshes.
+
 ### Changed
 
 - Improved conversation switching with single-pass cooperative JSONL loading, local-only model refreshes for previously initialized workspaces, paged transcript rendering, and lazy Side summaries.
