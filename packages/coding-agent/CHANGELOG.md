@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the conversation sidebar alignment and width so sessions use the available terminal space more effectively.
+
 ## [0.0.8] - 2026-07-21
 
 ### New Features
