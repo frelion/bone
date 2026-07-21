@@ -29,7 +29,7 @@ function run(command, args, options = {}) {
 }
 
 function capture(command, args) {
-	return run(command, args, { capture: true }).trim();
+	return run(command, args, { capture: true }).trimEnd();
 }
 
 function getVersion() {
