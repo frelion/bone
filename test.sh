@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
-AUTH_FILE="$HOME/.pi/agent/auth.json"
-AUTH_BACKUP="$HOME/.pi/agent/auth.json.bak"
+AUTH_FILE="$HOME/.bone/agent/auth.json"
+AUTH_BACKUP="$HOME/.bone/agent/auth.json.bak"
 
 # Restore auth.json on exit (success or failure)
 cleanup() {
@@ -20,7 +20,7 @@ if [[ -f "$AUTH_FILE" ]]; then
 fi
 
 # Skip local LLM tests (ollama, lmstudio)
-export PI_NO_LOCAL_LLM=1
+export BONE_NO_LOCAL_LLM=1
 
 # Unset API keys (see packages/ai/src/stream.ts getEnvApiKey)
 unset ANTHROPIC_API_KEY
@@ -56,8 +56,7 @@ unset XIAOMI_TOKEN_PLAN_CN_API_KEY
 unset XIAOMI_TOKEN_PLAN_AMS_API_KEY
 unset XIAOMI_TOKEN_PLAN_SGP_API_KEY
 unset RADIUS_API_KEY
-unset PI_GATEWAY
-unset PI_EXPERIMENTAL
+unset BONE_EXPERIMENTAL
 unset COPILOT_GITHUB_TOKEN
 unset GH_TOKEN
 unset GITHUB_TOKEN

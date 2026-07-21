@@ -1,4 +1,4 @@
-import { type Component, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, visibleWidth } from "@frelion/bone-tui";
 import { type ThemeColor, theme } from "../theme/theme.ts";
 import { keyText } from "./keybinding-hints.ts";
 import { fitLine } from "./terminal-layout.ts";

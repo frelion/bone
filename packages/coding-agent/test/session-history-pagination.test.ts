@@ -1,4 +1,4 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "@frelion/bone-agent-core";
 import { describe, expect, it } from "vitest";
 import type { SessionEntry } from "../src/core/session-manager.ts";
 import { groupSessionEntriesForRendering } from "../src/modes/interactive/interactive-mode.ts";

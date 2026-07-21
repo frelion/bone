@@ -1,4 +1,4 @@
-import type { ApiKeyCredential, ProviderHeaders } from "@earendil-works/pi-ai";
+import type { ApiKeyCredential, ProviderHeaders } from "@frelion/bone-ai";
 
 export type OpenAICompatibleApi = "openai-completions" | "openai-responses";
 

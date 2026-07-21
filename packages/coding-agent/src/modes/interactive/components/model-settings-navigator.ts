@@ -1,4 +1,4 @@
-import { type Component, getKeybindings, truncateToWidth } from "@earendil-works/pi-tui";
+import { type Component, getKeybindings, truncateToWidth } from "@frelion/bone-tui";
 import type { ModelsJsonModel, ModelsJsonProvider } from "../../../core/model-config.ts";
 import { theme } from "../theme/theme.ts";
 

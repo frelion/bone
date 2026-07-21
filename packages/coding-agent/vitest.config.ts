@@ -23,16 +23,12 @@ export default defineConfig({
 	},
 	resolve: {
 		alias: [
-			{ find: /^@earendil-works\/pi-ai$/, replacement: aiSrcIndex },
-			{ find: /^@earendil-works\/pi-ai\/compat$/, replacement: aiSrcCompat },
-			{ find: /^@earendil-works\/pi-ai\/oauth$/, replacement: aiSrcOAuth },
-			{ find: /^@earendil-works\/pi-ai\/providers\/(.+)$/, replacement: `${aiSrcProviders}/$1.ts` },
-			{ find: /^@earendil-works\/pi-agent-core$/, replacement: agentSrcIndex },
-			{ find: /^@earendil-works\/pi-tui$/, replacement: tuiSrcIndex },
-			{ find: /^@mariozechner\/pi-ai$/, replacement: aiSrcIndex },
-			{ find: /^@mariozechner\/pi-ai\/oauth$/, replacement: aiSrcOAuth },
-			{ find: /^@mariozechner\/pi-agent-core$/, replacement: agentSrcIndex },
-			{ find: /^@mariozechner\/pi-tui$/, replacement: tuiSrcIndex },
+			{ find: /^@frelion\/bone-ai$/, replacement: aiSrcIndex },
+			{ find: /^@frelion\/bone-ai\/compat$/, replacement: aiSrcCompat },
+			{ find: /^@frelion\/bone-ai\/oauth$/, replacement: aiSrcOAuth },
+			{ find: /^@frelion\/bone-ai\/providers\/(.+)$/, replacement: `${aiSrcProviders}/$1.ts` },
+			{ find: /^@frelion\/bone-agent-core$/, replacement: agentSrcIndex },
+			{ find: /^@frelion\/bone-tui$/, replacement: tuiSrcIndex },
 		],
 	},
 });

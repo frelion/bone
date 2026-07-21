@@ -1,4 +1,4 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@frelion/bone-ai";
 import {
 	Container,
 	type Focusable,
@@ -7,7 +7,7 @@ import {
 	type SelectListLayoutOptions,
 	Spacer,
 	Text,
-} from "@earendil-works/pi-tui";
+} from "@frelion/bone-tui";
 import { MODEL_TASK_DEFINITIONS, type ModelTaskId, type TaskModelReference } from "../../../core/task-model-router.ts";
 import { getSelectListTheme, theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";

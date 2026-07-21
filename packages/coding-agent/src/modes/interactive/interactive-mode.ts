@@ -7,9 +7,9 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
-import type { AssistantMessage, ImageContent, Message, Model } from "@earendil-works/pi-ai/compat";
+import type { AgentMessage } from "@frelion/bone-agent-core";
+import type { AuthEvent, AuthPrompt } from "@frelion/bone-ai";
+import type { AssistantMessage, ImageContent, Message, Model } from "@frelion/bone-ai/compat";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -20,7 +20,7 @@ import type {
 	OverlayHandle,
 	OverlayOptions,
 	SlashCommand,
-} from "@earendil-works/pi-tui";
+} from "@frelion/bone-tui";
 import {
 	CombinedAutocompleteProvider,
 	type Component,
@@ -37,14 +37,13 @@ import {
 	TruncatedText,
 	TUI,
 	visibleWidth,
-} from "@earendil-works/pi-tui";
+} from "@frelion/bone-tui";
 import chalk from "chalk";
 import { spawn, spawnSync } from "child_process";
 import {
 	APP_NAME,
 	APP_TITLE,
 	CONFIG_DIR_NAME,
-	getAgentDir,
 	getAuthPath,
 	getChangelogUrl,
 	getDebugLogPath,
@@ -83,7 +82,6 @@ import { MemoryRuntime } from "../../core/memory.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import { ModelConfig, type ModelsJson } from "../../core/model-config.ts";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.ts";
-import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { discoverOpenAICompatibleModelIds, type OpenAICompatibleApi } from "../../core/provider-model-discovery.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
@@ -1029,21 +1027,6 @@ export class InteractiveMode {
 			}
 		});
 
-		// Start package update check asynchronously
-		this.checkForPackageUpdates()
-			.then((updates) => {
-				if (updates.length > 0) {
-					this.showPackageUpdateNotification(updates);
-				}
-			})
-			.finally(() => {
-				// On Windows, npm can overwrite the shared console title while checking
-				// extension package versions. Restore Bone's title after the startup check.
-				if (process.platform === "win32" && this.isInitialized) {
-					this.updateTerminalTitle();
-				}
-			});
-
 		// Check tmux keyboard setup asynchronously
 		this.checkTmuxKeyboardSetup().then((warning) => {
 			if (warning) {
@@ -1091,24 +1074,6 @@ export class InteractiveMode {
 		}
 
 		await new Promise<void>(() => {});
-	}
-
-	private async checkForPackageUpdates(): Promise<string[]> {
-		if (process.env.BONE_OFFLINE) {
-			return [];
-		}
-
-		try {
-			const packageManager = new DefaultPackageManager({
-				cwd: this.sessionManager.getCwd(),
-				agentDir: getAgentDir(),
-				settingsManager: this.settingsManager,
-			});
-			const updates = await packageManager.checkForAvailableUpdates();
-			return updates.map((update) => update.displayName);
-		} catch {
-			return [];
-		}
 	}
 
 	private async checkTmuxKeyboardSetup(): Promise<string | undefined> {
@@ -4231,24 +4196,6 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	showPackageUpdateNotification(packages: string[]): void {
-		const action = theme.fg("accent", `${APP_NAME} update --extensions`);
-		const updateInstruction = theme.fg("muted", "Package updates are available. Run ") + action;
-		const packageLines = packages.map((pkg) => `- ${pkg}`).join("\n");
-
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
-		this.chatContainer.addChild(
-			new Text(
-				`${theme.bold(theme.fg("warning", "Package Updates Available"))}\n${updateInstruction}\n${theme.fg("muted", "Packages:")}\n${packageLines}`,
-				1,
-				0,
-			),
-		);
-		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
-		this.ui.requestRender();
-	}
-
 	/**
 	 * Get all queued messages (read-only).
 	 * Combines session queue and compaction queue.
@@ -4459,15 +4406,9 @@ export class InteractiveMode {
 		resourceStorage.withLock("global", () => JSON.stringify(runtime.services.settingsManager.getGlobalSettings()));
 		resourceStorage.withLock("project", () => JSON.stringify(runtime.services.settingsManager.getProjectSettings()));
 		const resourceSettingsManager = SettingsManager.fromStorage(resourceStorage, { projectTrusted });
-		const globalResourceSettingsManager = SettingsManager.fromStorage(resourceStorage, { projectTrusted: false });
-		const globalResolvedPaths = await new DefaultPackageManager({
-			cwd,
-			agentDir,
-			settingsManager: globalResourceSettingsManager,
-		}).resolve();
-		const projectResolvedPaths = projectTrusted
-			? await new DefaultPackageManager({ cwd, agentDir, settingsManager: resourceSettingsManager }).resolve()
-			: globalResolvedPaths;
+		const emptyResolvedPaths = { extensions: [], skills: [], prompts: [], themes: [] };
+		const globalResolvedPaths = emptyResolvedPaths;
+		const projectResolvedPaths = projectTrusted ? emptyResolvedPaths : globalResolvedPaths;
 		const storedCredentials = await runtime.services.modelRuntime.listCredentials();
 		const providerAuthentication = Object.fromEntries(
 			[

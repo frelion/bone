@@ -1,4 +1,4 @@
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@frelion/bone-tui";
 
 /**
  * Terminal-safe layout primitives. ANSI escape sequences must never be passed

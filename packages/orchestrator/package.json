@@ -1,7 +1,7 @@
 {
-	"name": "@earendil-works/pi-orchestrator",
+	"name": "@frelion/bone-orchestrator",
 	"version": "0.0.10",
-	"description": "experimental orchestrator package for pi",
+	"description": "experimental orchestrator package for Bone",
 	"type": "module",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
@@ -23,7 +23,7 @@
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"keywords": [
-		"pi",
+		"bone",
 		"orchestrator"
 	],
 	"author": "Earendil Works",
@@ -37,7 +37,7 @@
 		"node": ">=22.19.0"
 	},
 	"dependencies": {
-		"@earendil-works/pi-coding-agent": "^0.0.10"
+		"@frelion/bone-coding-agent": "^0.0.10"
 	},
 	"devDependencies": {
 		"shx": "0.4.0"

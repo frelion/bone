@@ -1,4 +1,4 @@
-import type { Component, TUI } from "@earendil-works/pi-tui";
+import type { Component, TUI } from "@frelion/bone-tui";
 
 /** Coordinates focus between independently interactive panes. */
 export class PaneFocusController {

@@ -1,91 +1,46 @@
 # Quickstart
 
-This page gets you from install to a useful first pi session.
+Bone is a local coding agent with built-in tools and local customization resources.
 
 ## Install
 
-Pi is distributed as an npm package:
-
 ```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+npm install -g --ignore-scripts @frelion/bone-coding-agent
 ```
 
-`--ignore-scripts` disables dependency lifecycle scripts during install. Pi does not require install scripts for normal npm installs.
-
-### Uninstall
-
-Use the package manager that installed pi. The curl installer uses npm globally, so curl and npm installs are removed with npm:
-
-```bash
-# curl installer or npm install -g
-npm uninstall -g @earendil-works/pi-coding-agent
-
-# pnpm
-pnpm remove -g @earendil-works/pi-coding-agent
-
-# Yarn
-yarn global remove @earendil-works/pi-coding-agent
-
-# Bun
-bun uninstall -g @earendil-works/pi-coding-agent
-```
-
-Uninstalling pi leaves settings, credentials, sessions, and installed pi packages in `~/.pi/agent/`.
-
-Then start pi in the project directory you want it to work on:
+Then start Bone in the project directory:
 
 ```bash
 cd /path/to/project
-pi
+bone
 ```
+
+Use the package manager that installed Bone to uninstall it. Removing Bone leaves settings, credentials, and sessions in `~/.bone/agent/`. Legacy package directories such as `~/.bone/agent/npm/` and `.bone/npm/` are also left untouched.
 
 ## Authenticate
 
-Pi can use subscription providers through `/login`, or API-key providers through environment variables or the auth file.
-
-### Option 1: subscription login
-
-Start pi and run:
-
-```text
-/login
-```
-
-Then select a provider. Built-in subscription logins include Claude Pro/Max, ChatGPT Plus/Pro (Codex), and GitHub Copilot.
-
-### Option 2: API key
-
-Set an API key before launching pi:
+Run `/login` to configure a subscription or stored API-key provider. You can also set an API key before starting Bone:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-pi
+bone
 ```
 
-You can also run `/login` and select an API-key provider to store the key in `~/.pi/agent/auth.json`.
-
-See [Providers](providers.md) for all supported providers, environment variables, and cloud-provider setup.
+See [Providers](providers.md) for supported providers and environment variables.
 
 ## First session
 
-Once pi starts, type a request and press Enter:
+Ask Bone to inspect the current project:
 
 ```text
 Summarize this repository and tell me how to run its checks.
 ```
 
-By default, pi gives the model four tools:
+Bone provides `read`, `write`, `edit`, and `bash` by default. The read-only `grep`, `find`, and `ls` tools can be enabled through tool options.
 
-- `read` - read files
-- `write` - create or overwrite files
-- `edit` - patch files
-- `bash` - run shell commands
+## Project instructions
 
-Additional built-in read-only tools (`grep`, `find`, `ls`) are available through tool options. Pi runs in your current working directory and can modify files there. Use git or another checkpointing workflow if you want easy rollback.
-
-## Give pi project instructions
-
-Pi loads context files at startup. Add an `AGENTS.md` file to tell it how to work in a project:
+Bone reads `AGENTS.md` or `CLAUDE.md` from `~/.bone/agent/`, parent directories, and the current directory. Add an `AGENTS.md` file for project conventions:
 
 ```markdown
 # Project Instructions
@@ -95,71 +50,35 @@ Pi loads context files at startup. Add an `AGENTS.md` file to tell it how to wor
 - Keep responses concise.
 ```
 
-Pi loads:
+Restart Bone or run `/reload` after changing context files.
 
-- `~/.pi/agent/AGENTS.md` for global instructions
-- `AGENTS.md` or `CLAUDE.md` from parent directories and the current directory
+## Local resources
 
-Restart pi, or run `/reload`, after changing context files.
+Bone loads local resources from these directories:
 
-## Common things to try
+- `~/.bone/agent/skills/`, `~/.bone/agent/prompts/`, and `~/.bone/agent/themes/`
+- `.bone/skills/`, `.bone/prompts/`, and `.bone/themes/` in a trusted project
+- local paths in the `skills`, `prompts`, and `themes` settings arrays
 
-### Reference files
+Use `--skill`, `--prompt-template`, or `--theme` for a temporary local path. See [Skills](skills.md), [Prompt Templates](prompt-templates.md), and [Themes](themes.md).
 
-Type `@` in the editor to fuzzy-search files, or pass files on the command line:
+Bone does not install or discover third-party extensions. Pi extension packages, `package.json#pi` manifests, Pi SDK imports, npm/git resource packages, and legacy extension directories are unsupported. Existing files remain on disk but are inert.
 
-```bash
-pi @README.md "Summarize this"
-pi @src/app.ts @src/app.test.ts "Review these together"
-```
-
-Images or text can be pasted with Ctrl+V (Alt+V on Windows); images can also be dragged into supported terminals.
-
-### Run shell commands
-
-In interactive mode:
-
-```text
-!npm run lint
-```
-
-The command output is sent to the model. Use `!!command` to run a command without adding its output to the model context.
-
-### Switch models
-
-Use `/model` or Ctrl+L to choose a model. Use Shift+Tab to cycle thinking level. Use Ctrl+P / Shift+Ctrl+P to cycle through scoped models.
-
-### Continue later
-
-Sessions are saved automatically:
+## Common commands
 
 ```bash
-pi -c                  # Continue most recent session
-pi -r                  # Browse previous sessions
-pi --name "my task"    # Set session display name at startup
-pi --session <path|id> # Open a specific session
+bone @README.md "Summarize this"
+bone -p "Summarize this codebase"
+bone -c
+bone --name "release audit" -p "Audit this repository"
+bone update
 ```
 
-Inside pi, use `/resume`, `/new`, `/tree`, `/fork`, and `/clone` to manage sessions.
-
-### Non-interactive mode
-
-For one-shot prompts:
-
-```bash
-pi -p "Summarize this codebase"
-cat README.md | pi -p "Summarize this text"
-pi -p @screenshot.png "What's in this image?"
-```
-
-Use `--mode json` for JSON event output or `--mode rpc` for process integration.
+`bone update` updates Bone itself only. `install`, `remove`, `uninstall`, `list`, and `config` are not available.
 
 ## Next steps
 
-- [Using Pi](usage.md) - interactive mode, slash commands, sessions, context files, and CLI reference.
-- [Providers](providers.md) - authentication and model setup.
-- [Settings](settings.md) - global and project configuration.
-- [Keybindings](keybindings.md) - shortcuts and customization.
-- [Pi Packages](packages.md) - install shared extensions, skills, prompts, and themes.
-
-Platform notes: [Windows](windows.md), [Termux](termux.md), [tmux](tmux.md), [Terminal setup](terminal-setup.md), [Shell aliases](shell-aliases.md).
+- [Using Bone](usage.md) for the CLI and interactive workflow
+- [Settings](settings.md) for global and project configuration
+- [Providers](providers.md) for authentication and model setup
+- [Skills](skills.md), [Prompt Templates](prompt-templates.md), and [Themes](themes.md) for local customization

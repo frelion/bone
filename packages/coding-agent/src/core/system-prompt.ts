@@ -128,12 +128,12 @@ In addition to the tools above, you may have access to other custom tools depend
 Guidelines:
 ${guidelines}
 
-Bone documentation (read only when the user asks about Bone itself, its SDK, extensions, themes, skills, or TUI):
+	Bone documentation (read only when the user asks about Bone itself, its SDK, internal modules, local resources, or TUI):
 - Main documentation: ${readmePath}
 - Additional docs: ${docsPath}
-- Examples: ${examplesPath} (extensions, custom tools, SDK)
+- Examples: ${examplesPath} (Bone-owned modules, custom tools, SDK)
 - When reading Bone docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory
-- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), or packages (docs/packages.md)
+- When asked about: internal modules or local resources (docs/extensions.md, docs/packages.md), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), or adding models (docs/models.md)
 - When working on Bone topics, read the docs and examples, and follow .md cross-references before implementing
 - Always read Bone .md files completely and follow links to related docs (e.g., tui.md for TUI API details)`;
 

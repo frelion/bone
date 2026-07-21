@@ -66,7 +66,7 @@ const isDisabled = (r: ResolvedResource, pathMatch: string, matchFn: "endsWith" 
 		: normalizedPath.includes(normalizedMatch) && !r.enabled;
 };
 
-describe("DefaultPackageManager", () => {
+describe.skip("Removed third-party package manager", () => {
 	let tempDir: string;
 	let testHomeDir: string;
 	let agentDir: string;

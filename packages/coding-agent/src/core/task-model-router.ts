@@ -1,4 +1,4 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@frelion/bone-ai";
 import type { ModelRuntime } from "./model-runtime.ts";
 
 export type ModelTaskId = "conversation" | "title";

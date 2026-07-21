@@ -198,7 +198,7 @@ function verifyRelease(releaseDirectory, platform) {
 
 function switchCurrentRelease(releaseDirectory) {
 	mkdirSync(devRoot, { recursive: true, mode: 0o700 });
-	const temporaryLink = join(devRoot, `.current-${process.pid}-${Date.now()}`);
+	const temporaryLink = join(devRoot, `.current-${process.boned}-${Date.now()}`);
 	symlinkSync(relative(devRoot, releaseDirectory), temporaryLink, "dir");
 	renameSync(temporaryLink, currentLink);
 }
@@ -245,7 +245,7 @@ function installRelease(skipBuild) {
 	if (!existsSync(sourceDirectory)) fail("Bone build output is missing. Run npm run dev:install without --skip-build.");
 	mkdirSync(releasesDir, { recursive: true, mode: 0o700 });
 	const releaseDirectory = join(releasesDir, releaseName());
-	const temporaryDirectory = `${releaseDirectory}.tmp-${process.pid}`;
+	const temporaryDirectory = `${releaseDirectory}.tmp-${process.boned}`;
 	rmSync(temporaryDirectory, { recursive: true, force: true });
 	cpSync(sourceDirectory, temporaryDirectory, { recursive: true });
 	try {

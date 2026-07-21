@@ -28,7 +28,6 @@ type TrustFile = Record<string, boolean | null | undefined>;
 
 const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES = [
 	"settings.json",
-	"extensions",
 	"skills",
 	"prompts",
 	"themes",

@@ -7,7 +7,7 @@ import {
 	type Message,
 	type Model,
 	type Usage,
-} from "@earendil-works/pi-ai";
+} from "@frelion/bone-ai";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type CompactionPreparation,

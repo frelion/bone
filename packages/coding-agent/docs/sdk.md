@@ -16,7 +16,7 @@ See [examples/sdk/](../examples/sdk/) for working examples from minimal to full 
 ## Quick Start
 
 ```typescript
-import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, ModelRuntime, SessionManager } from "@frelion/bone-coding-agent";
 
 const modelRuntime = await ModelRuntime.create();
 const { session } = await createAgentSession({
@@ -36,7 +36,7 @@ await session.prompt("What files are in the current directory?");
 ## Installation
 
 ```bash
-npm install @earendil-works/pi-coding-agent
+npm install @frelion/bone-coding-agent
 ```
 
 The SDK is included in the main package. No separate installation needed.
@@ -50,7 +50,7 @@ The main factory function for a single `AgentSession`.
 `createAgentSession()` uses a `ResourceLoader` to supply extensions, skills, prompt templates, themes, and context files. If you do not provide one, it uses `DefaultResourceLoader` with standard discovery.
 
 ```typescript
-import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, SessionManager } from "@frelion/bone-coding-agent";
 
 // Minimal: defaults with DefaultResourceLoader
 const { session } = await createAgentSession();
@@ -128,7 +128,7 @@ import {
   createAgentSessionServices,
   getAgentDir,
   SessionManager,
-} from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-coding-agent";
 
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
   const services = await createAgentSessionServices({ cwd });
@@ -235,7 +235,7 @@ Both `steer()` and `followUp()` expand file-based prompt templates but error on 
 
 ### Agent and AgentState
 
-The `Agent` class (from `@earendil-works/pi-agent-core`) handles the core LLM interaction. Access it via `session.agent`.
+The `Agent` class (from `@frelion/bone-agent-core`) handles the core LLM interaction. Access it via `session.agent`.
 
 ```typescript
 // Access current state
@@ -334,23 +334,23 @@ const { session } = await createAgentSession({
   cwd: process.cwd(), // default
   
   // Global config directory
-  agentDir: "~/.pi/agent", // default (expands ~)
+  agentDir: "~/.bone/agent", // default (expands ~)
 });
 ```
 
 `cwd` is used by `DefaultResourceLoader` for:
-- Project extensions (`.pi/extensions/`)
+- Project extensions (`.bone/extensions/`)
 - Project skills:
-  - `.pi/skills/`
+  - `.bone/skills/`
   - `.agents/skills/` in `cwd` and ancestor directories (up to git repo root, or filesystem root when not in a repo)
-- Project prompts (`.pi/prompts/`)
+- Project prompts (`.bone/prompts/`)
 - Context files (`AGENTS.md` walking up from cwd)
 - Session directory naming
 
 `agentDir` is used by `DefaultResourceLoader` for:
 - Global extensions (`extensions/`)
 - Global skills:
-  - `skills/` under `agentDir` (for example `~/.pi/agent/skills/`)
+  - `skills/` under `agentDir` (for example `~/.bone/agent/skills/`)
   - `~/.agents/skills/`
 - Global prompts (`prompts/`)
 - Global context file (`AGENTS.md`)
@@ -364,8 +364,8 @@ When you pass a custom `ResourceLoader`, `cwd` and `agentDir` no longer control 
 ### Model
 
 ```typescript
-import { getModel } from "@earendil-works/pi-ai";
-import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { getModel } from "@frelion/bone-ai";
+import { ModelRuntime } from "@frelion/bone-coding-agent";
 
 const modelRuntime = await ModelRuntime.create();
 
@@ -405,7 +405,7 @@ To match CLI model parsing, use the exported resolver helpers:
 import {
   resolveCliModel,
   resolveModelScopeWithDiagnostics,
-} from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-coding-agent";
 
 const cliModel = resolveCliModel({
   cliModel: "anthropic/claude-opus-4-5:high",
@@ -436,10 +436,10 @@ Authentication resolution priority (handled by `ModelRuntime`):
 4. Fallback resolver (for custom provider keys from `models.json`)
 
 ```typescript
-import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
-import { createAgentSession, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { InMemoryCredentialStore } from "@frelion/bone-ai";
+import { createAgentSession, ModelRuntime } from "@frelion/bone-coding-agent";
 
-// Default: uses ~/.pi/agent/auth.json and ~/.pi/agent/models.json
+// Default: uses ~/.bone/agent/auth.json and ~/.bone/agent/models.json
 const modelRuntime = await ModelRuntime.create();
 
 // Provider-owned auth methods and current status
@@ -473,7 +473,7 @@ const { session } = await createAgentSession({
 Use a `ResourceLoader` to override the system prompt:
 
 ```typescript
-import { createAgentSession, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader } from "@frelion/bone-coding-agent";
 
 const loader = new DefaultResourceLoader({
   systemPromptOverride: () => "You are a helpful assistant.",
@@ -498,7 +498,7 @@ Specify which built-in tools to enable:
 The `edit` tool returns `details.diff` for Pi's TUI display and `details.patch` as a standard unified patch for SDK consumers.
 
 ```typescript
-import { createAgentSession } from "@earendil-works/pi-coding-agent";
+import { createAgentSession } from "@frelion/bone-coding-agent";
 
 // Read-only mode
 const { session } = await createAgentSession({
@@ -521,7 +521,7 @@ const { session } = await createAgentSession({
 When you pass a custom `cwd`, `createAgentSession()` builds selected built-in tools for that cwd.
 
 ```typescript
-import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, SessionManager } from "@frelion/bone-coding-agent";
 
 const cwd = "/path/to/project";
 
@@ -545,7 +545,7 @@ const { session } = await createAgentSession({
 
 ```typescript
 import { Type } from "typebox";
-import { createAgentSession, defineTool } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, defineTool } from "@frelion/bone-coding-agent";
 
 // Inline custom tool
 const myTool = defineTool({
@@ -575,66 +575,9 @@ If you pass `tools`, include each custom or extension tool name you want enabled
 
 > See [examples/sdk/05-tools.ts](../examples/sdk/05-tools.ts)
 
-### Extensions
+### Internal runtime
 
-Extensions are loaded by the `ResourceLoader`. `DefaultResourceLoader` discovers extensions from `~/.pi/agent/extensions/`, `.pi/extensions/`, and settings.json extension sources.
-
-```typescript
-import { createAgentSession, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
-
-const loader = new DefaultResourceLoader({
-  additionalExtensionPaths: ["/path/to/my-extension.ts"],
-  extensionFactories: [
-    (pi) => {
-      pi.on("agent_start", () => {
-        console.log("[Inline Extension] Agent starting");
-      });
-    },
-  ],
-});
-await loader.reload();
-
-const { session } = await createAgentSession({ resourceLoader: loader });
-```
-
-Extensions can register tools, subscribe to events, add commands, and more. See [extensions.md](extensions.md) for the full API.
-
-**Named inline extensions:** By default, inline factories display as `<inline:1>`, `<inline:2>`, etc. in the startup Extensions list. To show a descriptive name instead, wrap the factory:
-
-```typescript
-import type { InlineExtension } from "@earendil-works/pi-coding-agent";
-
-const myProvider: InlineExtension = {
-  name: "my-provider",
-  factory: (pi) => {
-    pi.on("agent_start", () => {
-      console.log("[my-provider] Agent starting");
-    });
-  },
-};
-
-const loader = new DefaultResourceLoader({
-  extensionFactories: [myProvider],
-});
-```
-
-This displays as `<inline:my-provider>` instead of `<inline:1>`. Bare factory functions are still accepted for backward compatibility.
-
-**Event Bus:** Extensions can communicate via `pi.events`. Pass a shared `eventBus` to `DefaultResourceLoader` if you need to emit or listen from outside:
-
-```typescript
-import { createEventBus, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
-
-const eventBus = createEventBus();
-const loader = new DefaultResourceLoader({
-  eventBus,
-});
-await loader.reload();
-
-eventBus.on("my-extension:status", (data) => console.log(data));
-```
-
-> See [examples/sdk/06-extensions.ts](../examples/sdk/06-extensions.ts) and [docs/extensions.md](extensions.md)
+Bone's inline extension runtime is reserved for Bone-owned modules and tests. It is not exported as a plugin SDK and does not load extension files, package manifests, npm/git packages, or Pi aliases. Applications embedding Bone should use the supported session, model, tool, skill, prompt, and theme APIs instead.
 
 ### Skills
 
@@ -643,7 +586,7 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   type Skill,
-} from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-coding-agent";
 
 const customSkill: Skill = {
   name: "my-skill",
@@ -669,7 +612,7 @@ const { session } = await createAgentSession({ resourceLoader: loader });
 ### Context Files
 
 ```typescript
-import { createAgentSession, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader } from "@frelion/bone-coding-agent";
 
 const loader = new DefaultResourceLoader({
   agentsFilesOverride: (current) => ({
@@ -693,7 +636,7 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   type PromptTemplate,
-} from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-coding-agent";
 
 const customCommand: PromptTemplate = {
   name: "deploy",
@@ -728,7 +671,7 @@ import {
   createAgentSessionServices,
   getAgentDir,
   SessionManager,
-} from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-coding-agent";
 
 // In-memory (no persistence)
 const { session } = await createAgentSession({
@@ -822,7 +765,7 @@ sm.createBranchedSession(leafId);       // Extract path to new file
 ### Settings Management
 
 ```typescript
-import { createAgentSession, SettingsManager, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, SettingsManager, SessionManager } from "@frelion/bone-coding-agent";
 
 // Default: loads from files (global + project merged)
 const { session } = await createAgentSession({
@@ -856,8 +799,8 @@ const { session } = await createAgentSession({
 **Project-specific settings:**
 
 Settings load from two locations and merge:
-1. Global: `~/.pi/agent/settings.json`
-2. Project: `<cwd>/.pi/settings.json`
+1. Global: `~/.bone/agent/settings.json`
+2. Project: `<cwd>/.bone/settings.json`
 
 Project overrides global. Nested objects merge keys. Setters modify global settings by default.
 
@@ -878,7 +821,7 @@ Use `DefaultResourceLoader` to discover extensions, skills, prompts, themes, and
 import {
   DefaultResourceLoader,
   getAgentDir,
-} from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-coding-agent";
 
 const loader = new DefaultResourceLoader({
   cwd,
@@ -919,7 +862,7 @@ interface LoadExtensionsResult {
 ## Complete Example
 
 ```typescript
-import { getModel } from "@earendil-works/pi-ai";
+import { getModel } from "@frelion/bone-ai";
 import { Type } from "typebox";
 import {
   createAgentSession,
@@ -928,7 +871,7 @@ import {
   ModelRuntime,
   SessionManager,
   SettingsManager,
-} from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-coding-agent";
 
 const modelRuntime = await ModelRuntime.create({
   authPath: "/custom/agent/auth.json",
@@ -1009,7 +952,7 @@ import {
   getAgentDir,
   InteractiveMode,
   SessionManager,
-} from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-coding-agent";
 
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
   const services = await createAgentSessionServices({ cwd });
@@ -1049,7 +992,7 @@ import {
   getAgentDir,
   runPrintMode,
   SessionManager,
-} from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-coding-agent";
 
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
   const services = await createAgentSessionServices({ cwd });
@@ -1086,7 +1029,7 @@ import {
   getAgentDir,
   runRpcMode,
   SessionManager,
-} from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-coding-agent";
 
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
   const services = await createAgentSessionServices({ cwd });

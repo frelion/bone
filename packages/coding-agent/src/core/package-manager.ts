@@ -24,7 +24,6 @@ function getEnv(): NodeJS.ProcessEnv {
 
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
-import { globSync } from "glob";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
 import { maxSatisfying, rcompare, satisfies, valid, validRange } from "semver";
@@ -155,13 +154,6 @@ interface GitUpdateTarget extends ConfiguredUpdateSource {
 	parsed: GitSource;
 }
 
-interface PiManifest {
-	extensions?: string[];
-	skills?: string[];
-	prompts?: string[];
-	themes?: string[];
-}
-
 interface ResourceAccumulator {
 	extensions: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	skills: Map<string, { metadata: PathMetadata; enabled: boolean }>;
@@ -272,14 +264,6 @@ function isPattern(s: string): boolean {
 	return s.startsWith("!") || s.startsWith("+") || s.startsWith("-") || s.includes("*") || s.includes("?");
 }
 
-function isOverridePattern(s: string): boolean {
-	return s.startsWith("!") || s.startsWith("+") || s.startsWith("-");
-}
-
-function hasGlobPattern(s: string): boolean {
-	return s.includes("*") || s.includes("?");
-}
-
 function splitPatterns(entries: string[]): { plain: string[]; patterns: string[] } {
 	const plain: string[] = [];
 	const patterns: string[] = [];
@@ -344,7 +328,7 @@ function collectFiles(
 	return files;
 }
 
-type SkillDiscoveryMode = "pi" | "agents";
+type SkillDiscoveryMode = "bone" | "agents";
 
 function collectSkillEntries(
 	dir: string,
@@ -403,7 +387,7 @@ function collectSkillEntries(
 			}
 
 			const relPath = toPosixPath(relative(root, fullPath));
-			if (mode === "pi" && dir === root && isFile && entry.name.endsWith(".md") && !ig.ignores(relPath)) {
+			if (mode === "bone" && dir === root && isFile && entry.name.endsWith(".md") && !ig.ignores(relPath)) {
 				entries.push(fullPath);
 				continue;
 			}
@@ -533,98 +517,9 @@ function collectAutoThemeEntries(dir: string): string[] {
 	return entries;
 }
 
-function readPiManifestFile(packageJsonPath: string): PiManifest | null {
-	try {
-		const content = readFileSync(packageJsonPath, "utf-8");
-		const pkg = JSON.parse(content) as { pi?: PiManifest };
-		return pkg.pi ?? null;
-	} catch {
-		return null;
-	}
-}
-
-function resolveExtensionEntries(dir: string): string[] | null {
-	const packageJsonPath = join(dir, "package.json");
-	if (existsSync(packageJsonPath)) {
-		const manifest = readPiManifestFile(packageJsonPath);
-		if (manifest?.extensions?.length) {
-			const entries: string[] = [];
-			for (const extPath of manifest.extensions) {
-				const resolvedExtPath = resolve(dir, extPath);
-				if (existsSync(resolvedExtPath)) {
-					entries.push(resolvedExtPath);
-				}
-			}
-			if (entries.length > 0) {
-				return entries;
-			}
-		}
-	}
-
-	const indexTs = join(dir, "index.ts");
-	const indexJs = join(dir, "index.js");
-	if (existsSync(indexTs)) {
-		return [indexTs];
-	}
-	if (existsSync(indexJs)) {
-		return [indexJs];
-	}
-
-	return null;
-}
-
 function collectAutoExtensionEntries(dir: string): string[] {
-	const entries: string[] = [];
-	if (!existsSync(dir)) return entries;
-
-	// First check if this directory itself has explicit extension entries (package.json or index)
-	const rootEntries = resolveExtensionEntries(dir);
-	if (rootEntries) {
-		return rootEntries;
-	}
-
-	// Otherwise, discover extensions from directory contents
-	const ig = ignore();
-	addIgnoreRules(ig, dir, dir);
-
-	try {
-		const dirEntries = readdirSync(dir, { withFileTypes: true });
-		for (const entry of dirEntries) {
-			if (entry.name.startsWith(".")) continue;
-			if (entry.name === "node_modules") continue;
-
-			const fullPath = join(dir, entry.name);
-			let isDir = entry.isDirectory();
-			let isFile = entry.isFile();
-
-			if (entry.isSymbolicLink()) {
-				try {
-					const stats = statSync(fullPath);
-					isDir = stats.isDirectory();
-					isFile = stats.isFile();
-				} catch {
-					continue;
-				}
-			}
-
-			const relPath = toPosixPath(relative(dir, fullPath));
-			const ignorePath = isDir ? `${relPath}/` : relPath;
-			if (ig.ignores(ignorePath)) continue;
-
-			if (isFile && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
-				entries.push(fullPath);
-			} else if (isDir) {
-				const resolvedEntries = resolveExtensionEntries(fullPath);
-				if (resolvedEntries) {
-					entries.push(...resolvedEntries);
-				}
-			}
-		}
-	} catch {
-		// Ignore errors
-	}
-
-	return entries;
+	void dir;
+	return [];
 }
 
 /**
@@ -633,7 +528,7 @@ function collectAutoExtensionEntries(dir: string): string[] {
  */
 function collectResourceFiles(dir: string, resourceType: ResourceType): string[] {
 	if (resourceType === "skills") {
-		return collectSkillEntries(dir, "pi");
+		return collectSkillEntries(dir, "bone");
 	}
 	if (resourceType === "extensions") {
 		return collectAutoExtensionEntries(dir);
@@ -1776,7 +1671,7 @@ export class DefaultPackageManager implements PackageManager {
 		// Extension packages run inside pi and resolve pi APIs through loader aliases/virtual modules.
 		// Disable peer dependency resolution for managed installs (npm's --legacy-peer-deps, and
 		// equivalent bun/pnpm settings) so package managers do not install or solve host-provided
-		// @earendil-works/pi-* peers. Stale auto-installed pi peers can otherwise block updates.
+		// @frelion/bone-* peers. Stale auto-installed pi peers can otherwise block updates.
 		if (packageManagerName === "bun") {
 			return ["install", ...specs, "--cwd", installRoot, "--omit=peer"];
 		}
@@ -1938,7 +1833,7 @@ export class DefaultPackageManager implements PackageManager {
 		this.ensureGitIgnore(installRoot);
 		const packageJsonPath = join(installRoot, "package.json");
 		if (!existsSync(packageJsonPath)) {
-			const pkgJson = { name: "pi-extensions", private: true };
+			const pkgJson = { name: "bone-resources", private: true };
 			writeFileSync(packageJsonPath, JSON.stringify(pkgJson, null, 2), "utf-8");
 		}
 	}
@@ -2102,21 +1997,6 @@ export class DefaultPackageManager implements PackageManager {
 			return true;
 		}
 
-		const manifest = this.readPiManifest(packageRoot);
-		if (manifest) {
-			for (const resourceType of RESOURCE_TYPES) {
-				const entries = manifest[resourceType as keyof PiManifest];
-				this.addManifestEntries(
-					entries,
-					packageRoot,
-					resourceType,
-					this.getTargetMap(accumulator, resourceType),
-					metadata,
-				);
-			}
-			return true;
-		}
-
 		let hasAnyDir = false;
 		for (const resourceType of RESOURCE_TYPES) {
 			const dir = join(packageRoot, resourceType);
@@ -2138,12 +2018,6 @@ export class DefaultPackageManager implements PackageManager {
 		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		metadata: PathMetadata,
 	): void {
-		const manifest = this.readPiManifest(packageRoot);
-		const entries = manifest?.[resourceType as keyof PiManifest];
-		if (entries) {
-			this.addManifestEntries(entries, packageRoot, resourceType, target, metadata);
-			return;
-		}
 		const dir = join(packageRoot, resourceType);
 		if (existsSync(dir)) {
 			// Collect all files from the directory (all enabled by default)
@@ -2207,74 +2081,12 @@ export class DefaultPackageManager implements PackageManager {
 		packageRoot: string,
 		resourceType: ResourceType,
 	): { allFiles: string[]; enabledByManifest: Set<string> } {
-		const manifest = this.readPiManifest(packageRoot);
-		const entries = manifest?.[resourceType as keyof PiManifest];
-		if (entries && entries.length > 0) {
-			const allFiles = this.collectFilesFromManifestEntries(entries, packageRoot, resourceType);
-			const manifestPatterns = entries.filter(isOverridePattern);
-			const enabledByManifest =
-				manifestPatterns.length > 0 ? applyPatterns(allFiles, manifestPatterns, packageRoot) : new Set(allFiles);
-			return { allFiles: Array.from(enabledByManifest), enabledByManifest };
-		}
-
 		const conventionDir = join(packageRoot, resourceType);
 		if (!existsSync(conventionDir)) {
 			return { allFiles: [], enabledByManifest: new Set() };
 		}
 		const allFiles = collectResourceFiles(conventionDir, resourceType);
 		return { allFiles, enabledByManifest: new Set(allFiles) };
-	}
-
-	private readPiManifest(packageRoot: string): PiManifest | null {
-		const packageJsonPath = join(packageRoot, "package.json");
-		if (!existsSync(packageJsonPath)) {
-			return null;
-		}
-
-		try {
-			const content = readFileSync(packageJsonPath, "utf-8");
-			const pkg = JSON.parse(content) as { pi?: PiManifest };
-			return pkg.pi ?? null;
-		} catch {
-			return null;
-		}
-	}
-
-	private addManifestEntries(
-		entries: string[] | undefined,
-		root: string,
-		resourceType: ResourceType,
-		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
-		metadata: PathMetadata,
-	): void {
-		if (!entries) return;
-
-		const allFiles = this.collectFilesFromManifestEntries(entries, root, resourceType);
-		const patterns = entries.filter(isOverridePattern);
-		const enabledPaths = applyPatterns(allFiles, patterns, root);
-
-		for (const f of allFiles) {
-			if (enabledPaths.has(f)) {
-				this.addResource(target, f, metadata, true);
-			}
-		}
-	}
-
-	private collectFilesFromManifestEntries(entries: string[], root: string, resourceType: ResourceType): string[] {
-		const sourceEntries = entries.filter((entry) => !isOverridePattern(entry));
-		const resolved = sourceEntries.flatMap((entry) => {
-			if (!hasGlobPattern(entry)) {
-				return [resolve(root, entry)];
-			}
-
-			return globSync(entry, {
-				cwd: root,
-				absolute: true,
-				dot: false,
-				nodir: false,
-			}).map((match) => resolve(match));
-		});
-		return this.collectFilesFromPaths(resolved, resourceType);
 	}
 
 	private resolveLocalEntries(
@@ -2366,7 +2178,7 @@ export class DefaultPackageManager implements PackageManager {
 		};
 
 		if (projectTrusted) {
-			// Project extensions from .pi/
+			// Project extensions from .bone/
 			addResources(
 				"extensions",
 				collectAutoExtensionEntries(projectDirs.extensions),
@@ -2375,10 +2187,10 @@ export class DefaultPackageManager implements PackageManager {
 				projectBaseDir,
 			);
 
-			// Project skills from .pi/
+			// Project skills from .bone/
 			addResources(
 				"skills",
-				collectAutoSkillEntries(projectDirs.skills, "pi"),
+				collectAutoSkillEntries(projectDirs.skills, "bone"),
 				projectMetadata,
 				projectOverrides.skills,
 				projectBaseDir,
@@ -2418,7 +2230,7 @@ export class DefaultPackageManager implements PackageManager {
 			);
 		}
 
-		// User extensions from ~/.pi/agent/
+		// User extensions from ~/.bone/agent/
 		addResources(
 			"extensions",
 			collectAutoExtensionEntries(userDirs.extensions),
@@ -2427,10 +2239,10 @@ export class DefaultPackageManager implements PackageManager {
 			globalBaseDir,
 		);
 
-		// User skills from ~/.pi/agent/
+		// User skills from ~/.bone/agent/
 		addResources(
 			"skills",
-			collectAutoSkillEntries(userDirs.skills, "pi"),
+			collectAutoSkillEntries(userDirs.skills, "bone"),
 			userMetadata,
 			userOverrides.skills,
 			globalBaseDir,

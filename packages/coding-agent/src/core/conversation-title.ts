@@ -1,4 +1,4 @@
-import type { Api, AssistantMessage, Context, Model } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Context, Model } from "@frelion/bone-ai";
 import type { ModelRuntime } from "./model-runtime.ts";
 import type { SessionEntry } from "./session-manager.ts";
 

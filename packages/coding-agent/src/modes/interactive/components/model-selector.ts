@@ -1,4 +1,4 @@
-import { type Api, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
+import { type Api, type Model, modelsAreEqual } from "@frelion/bone-ai";
 import {
 	Container,
 	type Focusable,
@@ -8,7 +8,7 @@ import {
 	Spacer,
 	Text,
 	type TUI,
-} from "@earendil-works/pi-tui";
+} from "@frelion/bone-tui";
 import type { ModelRuntime } from "../../../core/model-runtime.ts";
 import { getModelSelectorSearchText } from "../model-search.ts";
 import { theme } from "../theme/theme.ts";

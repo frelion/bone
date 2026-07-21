@@ -1,82 +1,28 @@
-# Pi Documentation
+# Bone Documentation
 
-Pi is a minimal terminal coding harness. It is designed to stay small at the core while being extended through TypeScript extensions, skills, prompt templates, themes, and pi packages.
+Bone is a local coding agent with built-in tools, provider integrations, conversations, and local customization resources.
 
-## Quick start
-
-Install Pi with npm:
+## Install
 
 ```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+npm install -g --ignore-scripts @frelion/bone-coding-agent
+bone
 ```
 
-`--ignore-scripts` disables dependency lifecycle scripts during install. Pi does not require install scripts for normal npm installs.
+Authenticate with `/login` or configure an API key before starting Bone.
 
-On Linux or macOS, you can also use the installer:
+## Guides
 
-```bash
-curl -fsSL https://pi.dev/install.sh | sh
-```
+- [Quickstart](quickstart.md) - install, authenticate, and start a conversation
+- [Using Bone](usage.md) - interactive mode and CLI reference
+- [Settings](settings.md) - global and project configuration
+- [Skills](skills.md) - local skill directories and format
+- [Prompt Templates](prompt-templates.md) - local prompt resources
+- [Themes](themes.md) - local theme resources
+- [Providers](providers.md) - model authentication and configuration
+- [Sessions](sessions.md) - stored conversations and branches
+- [RPC](rpc.md) - process integration
 
-To uninstall pi itself, use npm for curl and npm installs:
+## Resource boundary
 
-```bash
-npm uninstall -g @earendil-works/pi-coding-agent
-```
-
-For pnpm, Yarn, or Bun installs, use the matching global remove command: `pnpm remove -g @earendil-works/pi-coding-agent`, `yarn global remove @earendil-works/pi-coding-agent`, or `bun uninstall -g @earendil-works/pi-coding-agent`.
-
-Then run it in a project directory:
-
-```bash
-pi
-```
-
-Authenticate with `/login` for subscription providers, or set an API key such as `ANTHROPIC_API_KEY` before starting pi.
-
-For the full first-run flow, see [Quickstart](quickstart.md).
-
-## Start here
-
-- [Quickstart](quickstart.md) - install, authenticate, and run a first session.
-- [Using Pi](usage.md) - interactive mode, slash commands, context files, and CLI reference.
-- [Providers](providers.md) - subscription and API-key setup for built-in providers.
-- [Security](security.md) - project trust, sandbox boundaries, and vulnerability reporting.
-- [Containerization](containerization.md) - sandbox pi with Gondolin, Docker, or OpenShell.
-- [Settings](settings.md) - global and project settings.
-- [Keybindings](keybindings.md) - default shortcuts and custom keybindings.
-- [Sessions](sessions.md) - session management, branching, and tree navigation.
-- [Compaction](compaction.md) - context compaction and branch summarization.
-
-## Customization
-
-- [Extensions](extensions.md) - TypeScript modules for tools, commands, events, and custom UI.
-- [Skills](skills.md) - Agent Skills for reusable on-demand capabilities.
-- [Prompt templates](prompt-templates.md) - reusable prompts that expand from slash commands.
-- [Themes](themes.md) - built-in and custom terminal themes.
-- [Pi packages](packages.md) - bundle and share extensions, skills, prompts, and themes.
-- [Custom models](models.md) - add model entries for supported provider APIs.
-- [Custom providers](custom-provider.md) - implement custom APIs and OAuth flows.
-
-## Programmatic usage
-
-- [SDK](sdk.md) - embed pi in Node.js applications.
-- [RPC mode](rpc.md) - integrate over stdin/stdout JSONL.
-- [JSON event stream mode](json.md) - print mode with structured events.
-- [TUI components](tui.md) - build custom terminal UI for extensions.
-
-## Reference
-
-- [Session format](session-format.md) - JSONL session file format, entry types, and SessionManager API.
-
-## Platform setup
-
-- [Windows](windows.md)
-- [Termux on Android](termux.md)
-- [tmux](tmux.md)
-- [Terminal setup](terminal-setup.md)
-- [Shell aliases](shell-aliases.md)
-
-## Development
-
-- [Development](development.md) - local setup, project structure, and debugging.
+Bone supports local skills, prompts, and themes. It does not provide a third-party extension marketplace or package installer. Pi extension packages, Pi manifests, Pi SDK imports, npm/git packages, and extension-path discovery are unsupported. Old package files remain untouched and inert.

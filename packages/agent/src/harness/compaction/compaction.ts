@@ -1,4 +1,4 @@
-import type { AssistantMessage, ImageContent, Model, Models, TextContent, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, Model, Models, TextContent, Usage } from "@frelion/bone-ai";
 import type { AgentMessage, ThinkingLevel } from "../../types.ts";
 import {
 	convertToLlm,

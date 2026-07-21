@@ -2,10 +2,9 @@
  * CLI argument parsing and help display
  */
 
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ThinkingLevel } from "@frelion/bone-agent-core";
 import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../config.ts";
-import type { ExtensionFlag } from "../core/extensions/types.ts";
 
 export type Mode = "text" | "json" | "rpc";
 
@@ -31,8 +30,6 @@ export interface Args {
 	excludeTools?: string[];
 	noTools?: boolean;
 	noBuiltinTools?: boolean;
-	extensions?: string[];
-	noExtensions?: boolean;
 	print?: boolean;
 	export?: string;
 	noSkills?: boolean;
@@ -148,11 +145,6 @@ export function parseArgs(args: string[]): Args {
 			}
 		} else if (arg === "--export" && i + 1 < args.length) {
 			result.export = args[++i];
-		} else if ((arg === "--extension" || arg === "-e") && i + 1 < args.length) {
-			result.extensions = result.extensions ?? [];
-			result.extensions.push(args[++i]);
-		} else if (arg === "--no-extensions" || arg === "-ne") {
-			result.noExtensions = true;
 		} else if (arg === "--skill" && i + 1 < args.length) {
 			result.skills = result.skills ?? [];
 			result.skills.push(args[++i]);
@@ -211,31 +203,16 @@ export function parseArgs(args: string[]): Args {
 	return result;
 }
 
-export function printHelp(extensionFlags?: ExtensionFlag[]): void {
-	const extensionFlagsText =
-		extensionFlags && extensionFlags.length > 0
-			? `\n${chalk.bold("Extension CLI Flags:")}\n${extensionFlags
-					.map((flag) => {
-						const value = flag.type === "string" ? " <value>" : "";
-						const description = flag.description ?? `Registered by ${flag.extensionPath}`;
-						return `  --${flag.name}${value}`.padEnd(30) + description;
-					})
-					.join("\n")}\n`
-			: "";
+export function printHelp(): void {
 	console.log(`${chalk.bold(APP_NAME)} - AI coding assistant with read, bash, edit, write tools
 
 ${chalk.bold("Usage:")}
   ${APP_NAME} [options] [@files...] [messages...]
 
 ${chalk.bold("Commands:")}
-  ${APP_NAME} install <source> [-l]     Install extension source and add to settings
-  ${APP_NAME} remove <source> [-l]      Remove extension source from settings
-  ${APP_NAME} uninstall <source> [-l]   Alias for remove
-  ${APP_NAME} update [source|self|bone] Update Bone, extensions, or model catalogs
-  ${APP_NAME} list                      List installed extensions from settings
-  ${APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
+  ${APP_NAME} update                   Update Bone itself
   ${APP_NAME} setup                     Download and verify the local semantic-search model
-  ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config
+  ${APP_NAME} <command> --help          Show command help
 
 ${chalk.bold("Options:")}
   --provider <name>              Provider name (default: google)
@@ -254,16 +231,14 @@ ${chalk.bold("Options:")}
 	--name, -n <name>              Set conversation display name
   --models <patterns>            Comma-separated model patterns for Ctrl+P cycling
                                  Supports globs (anthropic/*, *sonnet*) and fuzzy matching
-  --no-tools, -nt                Disable all tools by default (built-in and extension)
-  --no-builtin-tools, -nbt       Disable built-in tools by default but keep extension/custom tools enabled
+	  --no-tools, -nt                Disable all tools by default
+	  --no-builtin-tools, -nbt       Disable built-in tools by default but keep Bone custom tools enabled
   --tools, -t <tools>            Comma-separated allowlist of tool names to enable
-                                 Applies to built-in, extension, and custom tools
+	                                 Applies to built-in and Bone custom tools
   --exclude-tools, -xt <tools>   Comma-separated denylist of tool names to disable
-                                 Applies to built-in, extension, and custom tools
+	                                 Applies to built-in and Bone custom tools
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
-  --extension, -e <path>         Load an extension file (can be used multiple times)
-  --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
-  --skill <path>                 Load a skill file or directory (can be used multiple times)
+	  --skill <path>                 Load a skill file or directory (can be used multiple times)
   --no-skills, -ns               Disable skills discovery and loading
   --prompt-template <path>       Load a prompt template file or directory (can be used multiple times)
   --no-prompt-templates, -np     Disable prompt template discovery and loading
@@ -279,7 +254,7 @@ ${chalk.bold("Options:")}
   --help, -h                     Show this help
   --version, -v                  Show version number
 
-Extensions can register additional flags (e.g., --plan from plan-mode extension).${extensionFlagsText}
+Bone does not load external extensions or extension-specific flags.
 
 ${chalk.bold("Examples:")}
   # Interactive mode

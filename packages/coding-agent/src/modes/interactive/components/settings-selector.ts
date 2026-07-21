@@ -1,5 +1,5 @@
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Transport } from "@earendil-works/pi-ai";
+import type { ThinkingLevel } from "@frelion/bone-agent-core";
+import type { Transport } from "@frelion/bone-ai";
 import {
 	type Component,
 	Container,
@@ -12,7 +12,7 @@ import {
 	SettingsList,
 	Spacer,
 	Text,
-} from "@earendil-works/pi-tui";
+} from "@frelion/bone-tui";
 import { formatHttpIdleTimeoutMs, HTTP_IDLE_TIMEOUT_CHOICES } from "../../../core/http-dispatcher.ts";
 import type { DefaultProjectTrust, WarningSettings } from "../../../core/settings-manager.ts";
 import {

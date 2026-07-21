@@ -1,5 +1,5 @@
 /**
- * TUI component for managing package resources (enable/disable)
+ * TUI component for managing local Bone resources (enable/disable).
  */
 
 import { homedir } from "node:os";
@@ -14,16 +14,16 @@ import {
 	Spacer,
 	truncateToWidth,
 	visibleWidth,
-} from "@earendil-works/pi-tui";
+} from "@frelion/bone-tui";
 import { CONFIG_DIR_NAME } from "../../../config.ts";
 import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../core/package-manager.ts";
-import type { PackageSource, SettingsManager } from "../../../core/settings-manager.ts";
-import { canonicalizePath, isLocalPath, resolvePath } from "../../../utils/paths.ts";
+import type { SettingsManager } from "../../../core/settings-manager.ts";
+import { canonicalizePath } from "../../../utils/paths.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint, rawKeyHint } from "./keybinding-hints.ts";
 
-type ResourceType = "extensions" | "skills" | "prompts" | "themes";
+type ResourceType = "skills" | "prompts" | "themes";
 type ConfigWriteScope = "global" | "project";
 type SettingsScope = "user" | "project";
 type ProjectOverrideState = "inherit" | "load" | "unload";
@@ -38,10 +38,7 @@ export interface ResourceSettingsList extends Component, Focusable {
 	setWriteScope(writeScope: ConfigWriteScope): void;
 }
 
-const RESOURCE_TYPES = ["extensions", "skills", "prompts", "themes"] as const satisfies readonly ResourceType[];
-
 const RESOURCE_TYPE_LABELS: Record<ResourceType, string> = {
-	extensions: "Extensions",
 	skills: "Skills",
 	prompts: "Prompts",
 	themes: "Themes",
@@ -67,7 +64,7 @@ interface ResourceGroup {
 	key: string;
 	label: string;
 	scope: "user" | "project" | "temporary";
-	origin: "package" | "top-level";
+	origin: "top-level";
 	source: string;
 	subgroups: ResourceSubgroup[];
 }
@@ -90,10 +87,6 @@ function formatBaseDir(baseDir: string): string {
 }
 
 function getGroupLabel(metadata: PathMetadata, agentDir: string): string {
-	if (metadata.origin === "package") {
-		return `${metadata.source} (${metadata.scope})`;
-	}
-	// Top-level resources
 	if (metadata.source === "auto") {
 		if (metadata.baseDir) {
 			return metadata.scope === "user"
@@ -111,6 +104,7 @@ function buildGroups(resolved: ResolvedPaths, agentDir: string): ResourceGroup[]
 	const addToGroup = (resources: ResolvedResource[], resourceType: ResourceType) => {
 		for (const res of resources) {
 			const { path, enabled, metadata } = res;
+			if (metadata.origin !== "top-level") continue;
 			const groupKey = `${metadata.origin}:${metadata.scope}:${metadata.source}:${metadata.baseDir ?? ""}`;
 
 			if (!groupMap.has(groupKey)) {
@@ -118,7 +112,7 @@ function buildGroups(resolved: ResolvedPaths, agentDir: string): ResourceGroup[]
 					key: groupKey,
 					label: getGroupLabel(metadata, agentDir),
 					scope: metadata.scope,
-					origin: metadata.origin,
+					origin: "top-level",
 					source: metadata.source,
 					subgroups: [],
 				});
@@ -140,9 +134,7 @@ function buildGroups(resolved: ResolvedPaths, agentDir: string): ResourceGroup[]
 			const fileName = basename(path);
 			const parentFolder = basename(dirname(path));
 			let displayName: string;
-			if (resourceType === "extensions" && parentFolder !== "extensions") {
-				displayName = `${parentFolder}/${fileName}`;
-			} else if (resourceType === "skills" && fileName === "SKILL.md") {
+			if (resourceType === "skills" && fileName === "SKILL.md") {
 				displayName = parentFolder;
 			} else {
 				displayName = fileName;
@@ -159,17 +151,13 @@ function buildGroups(resolved: ResolvedPaths, agentDir: string): ResourceGroup[]
 		}
 	};
 
-	addToGroup(resolved.extensions, "extensions");
 	addToGroup(resolved.skills, "skills");
 	addToGroup(resolved.prompts, "prompts");
 	addToGroup(resolved.themes, "themes");
 
-	// Sort groups: packages first, then top-level; user before project
+	// Sort local resource groups with user resources before project resources.
 	const groups = Array.from(groupMap.values());
 	groups.sort((a, b) => {
-		if (a.origin !== b.origin) {
-			return a.origin === "package" ? -1 : 1;
-		}
 		if (a.scope !== b.scope) {
 			return a.scope === "user" ? -1 : 1;
 		}
@@ -177,7 +165,7 @@ function buildGroups(resolved: ResolvedPaths, agentDir: string): ResourceGroup[]
 	});
 
 	// Sort subgroups within each group by type order, and items by name
-	const typeOrder: Record<ResourceType, number> = { extensions: 0, skills: 1, prompts: 2, themes: 3 };
+	const typeOrder: Record<ResourceType, number> = { skills: 0, prompts: 1, themes: 2 };
 	for (const group of groups) {
 		group.subgroups.sort((a, b) => typeOrder[a.type] - typeOrder[b.type]);
 		for (const subgroup of group.subgroups) {
@@ -539,11 +527,7 @@ class ResourceList implements ResourceSettingsList {
 		}
 
 		const enabled = !item.enabled;
-		if (item.metadata.origin === "top-level") {
-			this.toggleTopLevelResource(item, enabled);
-		} else {
-			this.togglePackageResource(item, enabled);
-		}
+		this.toggleTopLevelResource(item, enabled);
 		return enabled;
 	}
 
@@ -552,7 +536,7 @@ class ResourceList implements ResourceSettingsList {
 		const settings =
 			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
 
-		const arrayKey = item.resourceType as "extensions" | "skills" | "prompts" | "themes";
+		const arrayKey = item.resourceType;
 		const current = (settings[arrayKey] ?? []) as string[];
 
 		// Generate pattern for this resource
@@ -573,9 +557,7 @@ class ResourceList implements ResourceSettingsList {
 		}
 
 		if (scope === "project") {
-			if (arrayKey === "extensions") {
-				this.settingsManager.setProjectExtensionPaths(updated);
-			} else if (arrayKey === "skills") {
+			if (arrayKey === "skills") {
 				this.settingsManager.setProjectSkillPaths(updated);
 			} else if (arrayKey === "prompts") {
 				this.settingsManager.setProjectPromptTemplatePaths(updated);
@@ -583,74 +565,13 @@ class ResourceList implements ResourceSettingsList {
 				this.settingsManager.setProjectThemePaths(updated);
 			}
 		} else {
-			if (arrayKey === "extensions") {
-				this.settingsManager.setExtensionPaths(updated);
-			} else if (arrayKey === "skills") {
+			if (arrayKey === "skills") {
 				this.settingsManager.setSkillPaths(updated);
 			} else if (arrayKey === "prompts") {
 				this.settingsManager.setPromptTemplatePaths(updated);
 			} else if (arrayKey === "themes") {
 				this.settingsManager.setThemePaths(updated);
 			}
-		}
-	}
-
-	private togglePackageResource(item: ResourceItem, enabled: boolean): void {
-		const scope = item.metadata.scope as "user" | "project";
-		const settings =
-			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
-
-		const packages = [...(settings.packages ?? [])] as PackageSource[];
-		const pkgIndex = packages.findIndex((pkg) => {
-			const source = typeof pkg === "string" ? pkg : pkg.source;
-			return source === item.metadata.source;
-		});
-
-		if (pkgIndex === -1) return;
-
-		let pkg = packages[pkgIndex];
-
-		// Convert string to object form if needed
-		if (typeof pkg === "string") {
-			pkg = { source: pkg };
-			packages[pkgIndex] = pkg;
-		}
-
-		// Get the resource array for this type
-		const arrayKey = item.resourceType as "extensions" | "skills" | "prompts" | "themes";
-		const current = (pkg[arrayKey] ?? []) as string[];
-
-		// Generate pattern relative to package root
-		const pattern = this.getPackageResourcePattern(item);
-		const disablePattern = `-${pattern}`;
-		const enablePattern = `+${pattern}`;
-
-		// Filter out existing patterns for this resource
-		const updated = current.filter((p) => {
-			const stripped = p.startsWith("!") || p.startsWith("+") || p.startsWith("-") ? p.slice(1) : p;
-			return stripped !== pattern;
-		});
-
-		if (enabled) {
-			updated.push(enablePattern);
-		} else {
-			updated.push(disablePattern);
-		}
-
-		(pkg as Record<string, unknown>)[arrayKey] = updated.length > 0 ? updated : undefined;
-
-		// Clean up empty filter object
-		const hasFilters = ["extensions", "skills", "prompts", "themes"].some(
-			(k) => (pkg as Record<string, unknown>)[k] !== undefined,
-		);
-		if (!hasFilters) {
-			packages[pkgIndex] = (pkg as { source: string }).source;
-		}
-
-		if (scope === "project") {
-			this.settingsManager.setProjectPackages(packages);
-		} else {
-			this.settingsManager.setPackages(packages);
 		}
 	}
 
@@ -681,9 +602,7 @@ class ResourceList implements ResourceSettingsList {
 	}
 
 	private setProjectResourceOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
-		return item.metadata.origin === "top-level"
-			? this.setProjectTopLevelOverride(item, state)
-			: this.setProjectPackageOverride(item, state);
+		return this.setProjectTopLevelOverride(item, state);
 	}
 
 	private setProjectTopLevelOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
@@ -705,45 +624,9 @@ class ResourceList implements ResourceSettingsList {
 	}
 
 	private setProjectTopLevelPaths(key: ResourceType, paths: string[]): void {
-		if (key === "extensions") this.settingsManager.setProjectExtensionPaths(paths);
-		else if (key === "skills") this.settingsManager.setProjectSkillPaths(paths);
+		if (key === "skills") this.settingsManager.setProjectSkillPaths(paths);
 		else if (key === "prompts") this.settingsManager.setProjectPromptTemplatePaths(paths);
 		else this.settingsManager.setProjectThemePaths(paths);
-	}
-
-	private setProjectPackageOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
-		const packages = [...(this.settingsManager.getProjectSettings().packages ?? [])] as PackageSource[];
-		let pkgIndex = packages.findIndex((pkg) =>
-			this.packageSourceStringMatches(
-				item.metadata.source,
-				this.getItemScope(item),
-				typeof pkg === "string" ? pkg : pkg.source,
-				"project",
-			),
-		);
-		if (pkgIndex === -1) {
-			if (state === "inherit") return false;
-			packages.push(this.createPackageOverrideSource(item));
-			pkgIndex = packages.length - 1;
-		}
-		let pkg = packages[pkgIndex];
-		if (pkg === undefined) return false;
-		if (typeof pkg === "string") {
-			pkg = { source: pkg };
-			packages[pkgIndex] = pkg;
-		}
-		const pattern = this.getPackageResourcePattern(item);
-		const updated = ((pkg[item.resourceType] ?? []) as string[]).filter(
-			(entry) => this.getPatternEntryTarget(entry) !== pattern,
-		);
-		if (state !== "inherit") updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
-		(pkg as Record<string, unknown>)[item.resourceType] = updated.length > 0 ? updated : undefined;
-		if (!RESOURCE_TYPES.some((key) => (pkg as Record<string, unknown>)[key] !== undefined)) {
-			if (pkg.autoload === false) packages.splice(pkgIndex, 1);
-			else packages[pkgIndex] = pkg.source;
-		}
-		this.settingsManager.setProjectPackages(packages);
-		return true;
 	}
 
 	private getNextOverrideState(item: ResourceItem): ProjectOverrideState {
@@ -756,21 +639,10 @@ class ResourceList implements ResourceSettingsList {
 
 	private getProjectOverrideState(item: ResourceItem): ProjectOverrideState {
 		if (this.writeScope !== "project") return "inherit";
-		if (item.metadata.origin === "top-level") {
-			return this.getOverrideStateFromEntries(
-				(this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[],
-				this.getTopLevelOverridePatterns(item, "project"),
-				false,
-			);
-		}
-		const pkg = this.findMatchingPackageSource(item, "project");
-		if (typeof pkg !== "object") return "inherit";
-		const entries = pkg[item.resourceType];
-		if (entries === undefined) return "inherit";
 		return this.getOverrideStateFromEntries(
-			entries,
-			new Set([this.getPackageResourcePattern(item)]),
-			pkg.autoload !== false,
+			(this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[],
+			this.getTopLevelOverridePatterns(item, "project"),
+			false,
 		);
 	}
 
@@ -818,41 +690,6 @@ class ResourceList implements ResourceSettingsList {
 		return relative(baseDir, item.path);
 	}
 
-	private createPackageOverrideSource(item: ResourceItem): PackageSource {
-		const source = item.metadata.source;
-		if (!isLocalPath(source)) return { source, autoload: false };
-		const sourcePath = resolvePath(source, this.getTopLevelBaseDir(this.getItemScope(item)), { trim: true });
-		return { source: relative(this.getTopLevelBaseDir("project"), sourcePath) || ".", autoload: false };
-	}
-
-	private packageSourceStringMatches(
-		leftSource: string,
-		leftScope: SettingsScope,
-		rightSource: string,
-		rightScope: SettingsScope,
-	): boolean {
-		if (leftSource === rightSource) return true;
-		if (!isLocalPath(leftSource) || !isLocalPath(rightSource)) return false;
-		const left = resolvePath(leftSource, this.getTopLevelBaseDir(leftScope), { trim: true });
-		const right = resolvePath(rightSource, this.getTopLevelBaseDir(rightScope), { trim: true });
-		return left === right;
-	}
-
-	private findMatchingPackageSource(item: ResourceItem, targetScope: SettingsScope): PackageSource | undefined {
-		const settings =
-			targetScope === "project"
-				? this.settingsManager.getProjectSettings()
-				: this.settingsManager.getGlobalSettings();
-		return (settings.packages ?? []).find((pkg) =>
-			this.packageSourceStringMatches(
-				item.metadata.source,
-				this.getItemScope(item),
-				typeof pkg === "string" ? pkg : pkg.source,
-				targetScope,
-			),
-		);
-	}
-
 	private getPatternEntryTarget(entry: string): string {
 		return entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-") ? entry.slice(1) : entry;
 	}
@@ -872,11 +709,6 @@ class ResourceList implements ResourceSettingsList {
 	private getResourcePattern(item: ResourceItem): string {
 		const scope = item.metadata.scope as "user" | "project";
 		const baseDir = item.metadata.baseDir ?? this.getTopLevelBaseDir(scope);
-		return relative(baseDir, item.path);
-	}
-
-	private getPackageResourcePattern(item: ResourceItem): string {
-		const baseDir = item.metadata.baseDir ?? dirname(item.path);
 		return relative(baseDir, item.path);
 	}
 }

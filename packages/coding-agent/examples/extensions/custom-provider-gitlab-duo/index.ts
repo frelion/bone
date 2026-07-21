@@ -21,8 +21,8 @@ import {
 	openAIResponsesApi,
 	type SimpleStreamOptions,
 	type ThinkingLevelMap,
-} from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-ai/compat";
+import type { ExtensionAPI } from "@frelion/bone-coding-agent";
 
 // =============================================================================
 // Constants

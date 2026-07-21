@@ -10,9 +10,9 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, "..");
 const codingAgentDir = join(repoRoot, "packages", "coding-agent");
 const packageDirectories = [
-	{ name: "@earendil-works/pi-ai", directory: join(repoRoot, "packages", "ai") },
-	{ name: "@earendil-works/pi-tui", directory: join(repoRoot, "packages", "tui") },
-	{ name: "@earendil-works/pi-agent-core", directory: join(repoRoot, "packages", "agent") },
+	{ name: "@frelion/bone-ai", directory: join(repoRoot, "packages", "ai") },
+	{ name: "@frelion/bone-tui", directory: join(repoRoot, "packages", "tui") },
+	{ name: "@frelion/bone-agent-core", directory: join(repoRoot, "packages", "agent") },
 ];
 
 function run(command, args, cwd) {

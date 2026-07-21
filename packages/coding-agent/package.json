@@ -1,9 +1,9 @@
 {
-	"name": "@earendil-works/pi-coding-agent",
+	"name": "@frelion/bone-coding-agent",
 	"version": "0.0.10",
 	"description": "Bone local-first coding agent with concurrent conversations and semantic memory",
 	"type": "module",
-	"piConfig": {
+	"boneConfig": {
 		"name": "bone",
 		"configDir": ".bone"
 	},
@@ -24,7 +24,7 @@
 	"files": [
 		"dist",
 		"docs",
-		"examples",
+		"examples/sdk",
 		"containerization.md",
 		"CHANGELOG.md",
 		"npm-shrinkwrap.json"
@@ -41,9 +41,9 @@
 		"prepublishOnly": "npm run clean && npm run build && npm run shrinkwrap"
 	},
 	"dependencies": {
-		"@earendil-works/pi-agent-core": "^0.0.10",
-		"@earendil-works/pi-ai": "^0.0.10",
-		"@earendil-works/pi-tui": "^0.0.10",
+		"@frelion/bone-agent-core": "^0.0.10",
+		"@frelion/bone-ai": "^0.0.10",
+		"@frelion/bone-tui": "^0.0.10",
 		"@lancedb/lancedb": "0.31.0",
 		"@silvia-odwyer/photon-node": "0.3.4",
 		"apache-arrow": "18.1.0",
@@ -55,7 +55,6 @@
 		"highlight.js": "10.7.3",
 		"hosted-git-info": "9.0.3",
 		"ignore": "7.0.5",
-		"jiti": "2.7.0",
 		"minimatch": "10.2.5",
 		"proper-lockfile": "4.1.2",
 		"semver": "7.8.0",

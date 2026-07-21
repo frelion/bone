@@ -1,8 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createModels } from "@earendil-works/pi-ai";
-import { cloudflareAIGatewayProvider } from "@earendil-works/pi-ai/providers/cloudflare-ai-gateway";
-import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
+import { createModels } from "@frelion/bone-ai";
+import { cloudflareAIGatewayProvider } from "@frelion/bone-ai/providers/cloudflare-ai-gateway";
+import { openaiProvider } from "@frelion/bone-ai/providers/openai";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
 import { InMemorySessionStorage } from "../../src/harness/session/memory-storage.ts";
 import {

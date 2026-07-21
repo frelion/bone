@@ -1,5 +1,5 @@
-import type { Credential } from "@earendil-works/pi-ai";
-import { type Component, type Focusable, getKeybindings, Input, truncateToWidth } from "@earendil-works/pi-tui";
+import type { Credential } from "@frelion/bone-ai";
+import { type Component, type Focusable, getKeybindings, Input, truncateToWidth } from "@frelion/bone-tui";
 import type { ModelsJson, ModelsJsonModel } from "../../../core/model-config.ts";
 import type { ExtensionProviderRuntimeStatus } from "../../../core/model-runtime.ts";
 import type { ProviderPreset } from "../../../core/provider-presets.ts";
@@ -1260,7 +1260,7 @@ export class SettingsCenterComponent implements Component, Focusable {
 				? this.options.resources?.settingsManager.getGlobalSettings()
 				: this.options.resources?.settingsManager.getProjectSettings();
 		const draftFields = draft as Record<string, unknown>;
-		for (const field of ["packages", "extensions", "skills", "prompts", "themes"] as const) {
+		for (const field of ["skills", "prompts", "themes"] as const) {
 			const value = resources?.[field];
 			if (value === undefined) delete draftFields[field];
 			else draftFields[field] = structuredClone(value);
