@@ -1,0 +1,260 @@
+name: Build Bone Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (for example, v0.0.5)'
+        required: true
+        type: string
+      source_ref:
+        description: 'Commit, branch, or tag to build; defaults to the release tag'
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: bone-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-semantic-native:
+    name: Semantic native (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-14
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: linux-x64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: win32-x64
+            runner: windows-2022
+          - target: win32-arm64
+            runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js headers
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '22'
+
+      # setup-node's Windows cache does not include the Node-API headers or
+      # node.lib. Download both explicitly; ARM64 needs an ARM64 import
+      # library even though the hosted runner itself is x64.
+      - name: Download Windows Node-API headers and library
+        if: startsWith(matrix.target, 'win32-')
+        shell: pwsh
+        run: |
+          $version = node -p "process.versions.node"
+          $arch = if ("${{ matrix.target }}" -eq "win32-arm64") { "arm64" } else { "x64" }
+          $headersArchive = "node-v$version-headers.tar.gz"
+          $headersDownload = Join-Path $env:RUNNER_TEMP $headersArchive
+          $headersDestination = Join-Path $env:RUNNER_TEMP "node-headers"
+          $nodeLibrary = Join-Path $env:RUNNER_TEMP "node-$arch.lib"
+          Invoke-WebRequest "https://nodejs.org/dist/v$version/$headersArchive" -OutFile $headersDownload
+          Invoke-WebRequest "https://nodejs.org/dist/v$version/win-$arch/node.lib" -OutFile $nodeLibrary
+          New-Item -ItemType Directory -Path $headersDestination | Out-Null
+          tar -xzf $headersDownload -C $headersDestination
+          $headersHome = Join-Path $headersDestination "node-v$version"
+          Add-Content $env:GITHUB_ENV "BONE_NODE_API_INCLUDE_DIR=$(Join-Path $headersHome 'include\node')"
+          Add-Content $env:GITHUB_ENV "BONE_NODE_LIBRARY=$nodeLibrary"
+
+      - name: Build semantic native addon
+        shell: bash
+        run: ./scripts/build-semantic-native.sh ${{ matrix.target }}
+
+      - name: Upload semantic native runtime
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: semantic-native-${{ matrix.target }}
+          path: packages/coding-agent/native/${{ matrix.target }}/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build:
+    name: Build release assets
+    runs-on: ubuntu-latest
+    needs: build-semantic-native
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      SOURCE_REF: ${{ github.event.inputs.source_ref || github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Download semantic native runtimes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: semantic-native-*
+          path: packages/coding-agent/native
+          merge-multiple: false
+
+      - name: Place semantic native runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64 win32-arm64; do
+            mkdir -p "packages/coding-agent/native/${target}"
+            cp -R "packages/coding-agent/native/semantic-native-${target}/." "packages/coding-agent/native/${target}/"
+            rm -rf "packages/coding-agent/native/semantic-native-${target}"
+          done
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s $(which fdfind) /usr/local/bin/fd
+
+      - name: Build release binaries
+        run: ./scripts/build-binaries.sh
+
+      - name: Check release source
+        run: npm run check
+
+      - name: Test release source
+        run: npm test
+
+      - name: Prepare GitHub release payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          VERSION="${RELEASE_TAG#v}"
+          printf '%s\n\n' "> [简体中文：安装与发布指南](https://github.com/frelion/bone/blob/${RELEASE_TAG}/docs/zh-CN/releases.md)" > release-assets/RELEASE_NOTES.md
+          node scripts/release-notes.mjs extract --version "${VERSION}" --tag "${RELEASE_TAG}" --repo "frelion/bone" --out /tmp/bone-release-notes.md
+          cat /tmp/bone-release-notes.md >> release-assets/RELEASE_NOTES.md
+          node scripts/generate-coding-agent-install-lock.mjs --check
+          cp packages/coding-agent/install-lock/package.json release-assets/bone-install-package.json
+          cp packages/coding-agent/install-lock/package-lock.json release-assets/bone-install-package-lock.json
+
+          cd packages/coding-agent/binaries
+          binary_assets=(
+            bone-darwin-arm64.tar.gz
+            bone-darwin-x64.tar.gz
+            bone-linux-x64.tar.gz
+            bone-linux-arm64.tar.gz
+            bone-windows-x64.zip
+            bone-windows-arm64.zip
+          )
+          for asset in "${binary_assets[@]}"; do test -f "${asset}"; done
+          cp "${binary_assets[@]}" "${GITHUB_WORKSPACE}/release-assets/"
+
+          cd "${GITHUB_WORKSPACE}/release-assets"
+          release_assets=("${binary_assets[@]}" bone-install-package.json bone-install-package-lock.json)
+          sha256sum "${release_assets[@]}" > SHA256SUMS
+
+      - name: Upload release payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bone-release-assets-${{ env.RELEASE_TAG }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-github-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Download release payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bone-release-assets-${{ env.RELEASE_TAG }}
+          path: release-assets
+
+      - name: Validate and publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          release_assets=(
+            bone-darwin-arm64.tar.gz
+            bone-darwin-x64.tar.gz
+            bone-linux-x64.tar.gz
+            bone-linux-arm64.tar.gz
+            bone-windows-x64.zip
+            bone-windows-arm64.zip
+            bone-install-package.json
+            bone-install-package-lock.json
+          )
+          for asset in "${release_assets[@]}" SHA256SUMS RELEASE_NOTES.md; do test -f "${asset}"; done
+          sha256sum -c SHA256SUMS
+
+          if ! gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "Bone ${RELEASE_TAG#v}" \
+              --notes-file RELEASE_NOTES.md
+          fi
+
+          # GitHub Release assets are uploaded through uploads.github.com. Its
+          # policy endpoint can occasionally return transient 5xx responses;
+          # upload files independently so a retry never discards assets that
+          # were already accepted before a later upload failed.
+          upload_asset() {
+            local asset="$1"
+            local attempt
+            local delay
+
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${asset}"; then
+                return 0
+              fi
+
+              if [[ "${attempt}" -eq 5 ]]; then
+                echo "Failed to upload ${asset} after ${attempt} attempts." >&2
+                return 1
+              fi
+
+              delay=$((attempt * 15))
+              echo "Upload of ${asset} failed; retrying in ${delay}s (attempt $((attempt + 1))/5)." >&2
+              sleep "${delay}"
+            done
+          }
+
+          for asset in "${release_assets[@]}" SHA256SUMS; do
+            upload_asset "${asset}"
+          done
+
+          gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --title "Bone ${RELEASE_TAG#v}" \
+            --notes-file RELEASE_NOTES.md

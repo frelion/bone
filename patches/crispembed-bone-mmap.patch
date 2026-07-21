@@ -1,0 +1,76 @@
+diff --git a/src/crispembed.cpp b/src/crispembed.cpp
+index 1d22c33..fb13ede 100644
+--- a/src/crispembed.cpp
++++ b/src/crispembed.cpp
+@@ -17,2 +17,3 @@
+ #include <chrono>
++#include <cstdarg>
+ #include <cmath>
+@@ -71,2 +72,25 @@ static std::vector<float> compute_rel_pos_bias(ggml_tensor * rel_attn_bias, int
+-
++
++static crispembed_log_callback g_log_callback = nullptr;
++static void * g_log_user_data = nullptr;
++
++static int crispembed_fprintf(FILE * stream, const char * format, ...) {
++    va_list args;
++    va_start(args, format);
++    if (stream == stderr && g_log_callback) {
++        char message[4096];
++        va_list copy;
++        va_copy(copy, args);
++        const int written = vsnprintf(message, sizeof(message), format, copy);
++        va_end(copy);
++        g_log_callback(message, g_log_user_data);
++        va_end(args);
++        return written;
++    }
++    const int written = vfprintf(stream, format, args);
++    va_end(args);
++    return written;
++}
++
++#define fprintf(stream, ...) crispembed_fprintf(stream, __VA_ARGS__)
++
+ static ggml_backend_t crispembed_init_backend(int n_threads) {
+@@ -483,3 +507,7 @@ static bool load_model(crispembed_context * ctx, const char * path) {
+-
++
+-    if (!core_gguf::load_weights(path, ctx->backend, "crispembed", ctx->wl)) {
++    // Bone's local semantic model is CPU-only and intentionally keeps its GGUF
++    // weights as a shared, read-only mapping.  The CPU backend accepts host
++    // pointers, so this avoids allocating and copying a second full model-sized
++    // buffer for the lifetime of the embedding engine.
++    if (!core_gguf::load_weights(path, ctx->backend, "crispembed", ctx->wl, /*try_mmap=*/true)) {
+         fprintf(stderr, "crispembed: failed to load weights\n");
+@@ -2010,2 +2038,7 @@ static std::vector<float> run_encoder_raw(crispembed_context * ctx, const embed_
+-
++
++extern "C" void crispembed_set_log_callback(crispembed_log_callback callback, void * user_data) {
++    g_log_callback = callback;
++    g_log_user_data = user_data;
++}
++
+ extern "C" crispembed_context * crispembed_init(const char * model_path, int n_threads) {
+diff --git a/src/crispembed.h b/src/crispembed.h
+index 162c7ac..8b6c503 100644
+--- a/src/crispembed.h
++++ b/src/crispembed.h
+@@ -43,2 +43,7 @@ typedef struct crispembed_context crispembed_context;
+-
++
++// Optional process-local diagnostic sink. When configured, CrispEmbed delivers
++// its native diagnostics to this callback instead of writing directly to
++// stderr. Pass NULL to restore the default stderr output.
++typedef void (*crispembed_log_callback)(const char * message, void * user_data);
++
+ // Model hyperparameters (read-only after init)
+@@ -62,2 +67,7 @@ CRISPEMBED_API crispembed_context * crispembed_init(const char * model_path, int
+-
++
++// Configure where native diagnostics are delivered. The callback must remain
++// valid until it is replaced or cleared. This does not take ownership of
++// user_data.
++CRISPEMBED_API void crispembed_set_log_callback(crispembed_log_callback callback, void * user_data);
++
+ // Set the process-global GPU backend preference (issue #214 semantics):
