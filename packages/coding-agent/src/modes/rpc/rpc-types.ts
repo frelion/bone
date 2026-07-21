@@ -10,6 +10,7 @@ import type { ImageContent, Model } from "@frelion/bone-ai";
 import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
+import type { CollaborationMode, PlanState } from "../../core/plan-mode.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 
@@ -27,6 +28,10 @@ export type RpcCommand =
 
 	// State
 	| { id?: string; type: "get_state" }
+	| { id?: string; type: "set_collaboration_mode"; mode: CollaborationMode }
+	| { id?: string; type: "approve_plan"; proposalId: string }
+	| { id?: string; type: "revise_plan"; proposalId: string; feedback: string }
+	| { id?: string; type: "cancel_plan"; proposalId: string }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -104,6 +109,8 @@ export interface RpcSessionState {
 	autoCompactionEnabled: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+	collaborationMode: CollaborationMode;
+	planState: PlanState;
 }
 
 // ============================================================================
@@ -121,6 +128,10 @@ export type RpcResponse =
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "set_collaboration_mode"; success: true }
+	| { id?: string; type: "response"; command: "approve_plan"; success: true }
+	| { id?: string; type: "response"; command: "revise_plan"; success: true }
+	| { id?: string; type: "response"; command: "cancel_plan"; success: true }
 
 	// Model
 	| {

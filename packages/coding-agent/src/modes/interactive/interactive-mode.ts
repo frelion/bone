@@ -133,6 +133,7 @@ import {
 	OAuthSelectorComponent,
 } from "./components/oauth-selector.ts";
 import { PaneFocusController } from "./components/pane-focus-controller.ts";
+import { PlanProposalComponent } from "./components/plan-proposal.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
 import { SessionSidebar } from "./components/session-sidebar.ts";
 import {
@@ -215,7 +216,10 @@ type ConversationComposerState = {
 	compactionQueuedMessages: CompactionQueuedMessage[];
 };
 
-type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }>;
+type RenderSessionItem =
+	| AgentMessage
+	| Extract<SessionEntry, { type: "custom" }>
+	| Extract<SessionEntry, { type: "plan_proposal" }>;
 
 export function groupSessionEntriesForRendering(entries: readonly SessionEntry[]): SessionEntry[][] {
 	const groups: SessionEntry[][] = [];
@@ -233,6 +237,10 @@ export function groupSessionEntriesForRendering(entries: readonly SessionEntry[]
 
 function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "custom" }> {
 	return "type" in item && item.type === "custom";
+}
+
+function isPlanProposalEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "plan_proposal" }> {
+	return "type" in item && item.type === "plan_proposal";
 }
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
@@ -403,6 +411,8 @@ export class InteractiveMode {
 	private readonly defaultWorkingMessage = "Working...";
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
+	private pendingPlanApprovalId: string | undefined;
+	private reviewingPlanProposalId: string | undefined;
 
 	private lastSigintTime = 0;
 	private lastEscapeTime = 0;
@@ -417,6 +427,7 @@ export class InteractiveMode {
 	// Streaming message tracking
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
+	private acceptedPlanMessages = new WeakSet<object>();
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
@@ -977,6 +988,11 @@ export class InteractiveMode {
 
 		// Render initial messages AFTER showing loaded resources
 		this.renderInitialMessages();
+		this.updatePlanModeStatus();
+		if (this.session.planState.status === "awaitingApproval") {
+			this.pendingPlanApprovalId = this.session.planState.proposal.id;
+			void this.reviewPendingPlan();
+		}
 
 		// Set up theme file watcher
 		onThemeChange(() => {
@@ -1939,6 +1955,7 @@ export class InteractiveMode {
 			this.getMarkdownThemeWithSettings(),
 			this.hiddenThinkingLabel,
 			this.outputPad,
+			this.session.collaborationMode === "plan",
 		);
 		this.streamingMessage = message;
 		this.chatContainer.addChild(this.streamingComponent);
@@ -2585,6 +2602,70 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private updatePlanModeStatus(): void {
+		const state = this.session.planState;
+		if (this.session.collaborationMode !== "plan") {
+			this.setExtensionStatus("plan-mode", undefined);
+			this.updateEditorBorderColor();
+			return;
+		}
+		const label = state.status === "awaitingApproval" ? `plan v${state.proposal.version} · review` : "plan";
+		this.setExtensionStatus("plan-mode", theme.fg("warning", label));
+		this.updateEditorBorderColor();
+	}
+
+	private handlePlanCommand(): void {
+		try {
+			if (this.session.collaborationMode === "plan") {
+				this.session.exitPlanMode();
+				this.pendingPlanApprovalId = undefined;
+				this.showStatus("Plan mode disabled");
+			} else {
+				this.session.enterPlanMode();
+				this.showStatus("Plan mode enabled · changes require approval");
+			}
+			this.updatePlanModeStatus();
+			this.ui.requestRender();
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private async reviewPendingPlan(): Promise<void> {
+		if (this.session.planState.status !== "awaitingApproval") return;
+		if (this.reviewingPlanProposalId !== undefined) return;
+		try {
+			while (true) {
+				const state = this.session.planState;
+				if (state.status !== "awaitingApproval") return;
+				this.pendingPlanApprovalId = state.proposal.id;
+				this.reviewingPlanProposalId = state.proposal.id;
+
+				const choice = await this.showExtensionSelector(`Plan v${state.proposal.version} · what next?`, [
+					"Execute plan",
+					"Revise plan",
+					"Cancel plan",
+				]);
+				if (choice === "Execute plan") {
+					await this.session.approvePlan(state.proposal.id);
+				} else if (choice === "Revise plan") {
+					const feedback = await this.showExtensionEditor("Revise plan:", "");
+					if (feedback?.trim()) await this.session.revisePlan(state.proposal.id, feedback);
+				} else if (choice === "Cancel plan") {
+					this.session.cancelPlan(state.proposal.id);
+					this.showStatus("Plan cancelled");
+				}
+			}
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		} finally {
+			this.reviewingPlanProposalId = undefined;
+			if (this.session.planState.status !== "awaitingApproval") this.pendingPlanApprovalId = undefined;
+			this.updatePlanModeStatus();
+			this.ui.requestRender();
+		}
+	}
+
 	/**
 	 * Set a custom editor component from an extension.
 	 * Pass undefined to restore the default editor.
@@ -2988,6 +3069,11 @@ export class InteractiveMode {
 				await this.handleCompactCommand(customInstructions);
 				return;
 			}
+			if (text === "/plan") {
+				this.editor.setText("");
+				this.handlePlanCommand();
+				return;
+			}
 			if (text === "/reload") {
 				this.editor.setText("");
 				await this.handleReloadCommand();
@@ -3179,6 +3265,7 @@ export class InteractiveMode {
 						this.getMarkdownThemeWithSettings(),
 						this.hiddenThinkingLabel,
 						this.outputPad,
+						this.session.collaborationMode === "plan",
 					);
 					this.streamingMessage = event.message;
 					this.chatContainer.addChild(this.streamingComponent);
@@ -3301,7 +3388,29 @@ export class InteractiveMode {
 			case "agent_settled":
 				await this.refreshSessionSidebar();
 				if (!this.isCurrentForegroundBinding(eventRuntime, eventSession, binding)) return;
+				await this.reviewPendingPlan();
 				await this.checkShutdownRequested();
+				break;
+
+			case "collaboration_mode_changed":
+				this.updatePlanModeStatus();
+				this.ui.requestRender();
+				break;
+
+			case "plan_proposed":
+				this.chatContainer.addChild(new PlanProposalComponent(event.proposal, this.getMarkdownThemeWithSettings()));
+				this.pendingPlanApprovalId = event.proposal.id;
+				this.updatePlanModeStatus();
+				this.ui.requestRender();
+				break;
+
+			case "plan_decided":
+				if (this.pendingPlanApprovalId === event.proposal.id) this.pendingPlanApprovalId = undefined;
+				this.updatePlanModeStatus();
+				break;
+
+			case "plan_submission_error":
+				this.showError(`Plan proposal was not accepted: ${event.error}`);
 				break;
 
 			case "compaction_start": {
@@ -3534,6 +3643,7 @@ export class InteractiveMode {
 					this.getMarkdownThemeWithSettings(),
 					this.hiddenThinkingLabel,
 					this.outputPad,
+					this.acceptedPlanMessages.has(message),
 				);
 				target.addChild(assistantComponent);
 				break;
@@ -3574,6 +3684,10 @@ export class InteractiveMode {
 		for (const item of items) {
 			if (isCustomSessionEntry(item)) {
 				this.addCustomEntryToChat(item, target);
+				continue;
+			}
+			if (isPlanProposalEntry(item)) {
+				target.addChild(new PlanProposalComponent(item.proposal, this.getMarkdownThemeWithSettings()));
 				continue;
 			}
 
@@ -3656,8 +3770,15 @@ export class InteractiveMode {
 			updatePendingTools?: boolean;
 		} = {},
 	): void {
+		const branch = this.sessionManager.getBranch();
+		const sourceMessageIds = new Set(
+			branch.filter((entry) => entry.type === "plan_proposal").map((entry) => entry.proposal.sourceMessageId),
+		);
+		this.acceptedPlanMessages = new WeakSet(
+			branch.flatMap((entry) => (entry.type === "message" && sourceMessageIds.has(entry.id) ? [entry.message] : [])),
+		);
 		const items = entries.flatMap((entry): RenderSessionItem[] => {
-			if (entry.type === "custom") {
+			if (entry.type === "custom" || entry.type === "plan_proposal") {
 				return [entry];
 			}
 			return sessionEntryToContextMessages(entry);
@@ -3702,6 +3823,15 @@ export class InteractiveMode {
 		this.renderSessionEntries(this.historyGroups.slice(this.firstRenderedHistoryGroup).flat(), {
 			updateFooter: true,
 		});
+		const planState = this.session.planState;
+		if (
+			planState.status === "awaitingApproval" &&
+			!entries.some((entry) => entry.type === "plan_proposal" && entry.proposal.id === planState.proposal.id)
+		) {
+			this.chatContainer.addChild(
+				new PlanProposalComponent(planState.proposal, this.getMarkdownThemeWithSettings()),
+			);
+		}
 		this.renderProjectTrustWarningIfNeeded();
 
 		// Show compaction info if session was compacted
@@ -4012,6 +4142,9 @@ export class InteractiveMode {
 	private updateEditorBorderColor(): void {
 		if (this.isBashMode) {
 			this.editor.borderColor = theme.getBashModeBorderColor();
+		} else if (this.session.collaborationMode === "plan") {
+			this.editor.borderColor = (text) =>
+				theme.fg(this.session.planState.status === "awaitingApproval" ? "warning" : "borderAccent", text);
 		} else {
 			const level = this.session.thinkingLevel || "off";
 			this.editor.borderColor = theme.getThinkingBorderColor(level);
@@ -5115,6 +5248,11 @@ export class InteractiveMode {
 						// Update UI
 						this.chatContainer.clear();
 						this.renderInitialMessages();
+						this.updatePlanModeStatus();
+						if (this.session.planState.status === "awaitingApproval") {
+							this.pendingPlanApprovalId = this.session.planState.proposal.id;
+							void this.reviewPendingPlan();
+						}
 						if (result.editorText && !this.editor.getText().trim()) {
 							this.editor.setText(result.editorText);
 						}

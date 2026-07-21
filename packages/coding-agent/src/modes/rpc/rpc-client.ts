@@ -10,6 +10,7 @@ import type { ImageContent } from "@frelion/bone-ai";
 import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
+import type { CollaborationMode } from "../../core/plan-mode.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
@@ -235,6 +236,22 @@ export class RpcClient {
 	async getState(): Promise<RpcSessionState> {
 		const response = await this.send({ type: "get_state" });
 		return this.getData(response);
+	}
+
+	async setCollaborationMode(mode: CollaborationMode): Promise<void> {
+		await this.send({ type: "set_collaboration_mode", mode });
+	}
+
+	async approvePlan(proposalId: string): Promise<void> {
+		await this.send({ type: "approve_plan", proposalId });
+	}
+
+	async revisePlan(proposalId: string, feedback: string): Promise<void> {
+		await this.send({ type: "revise_plan", proposalId, feedback });
+	}
+
+	async cancelPlan(proposalId: string): Promise<void> {
+		await this.send({ type: "cancel_plan", proposalId });
 	}
 
 	/**

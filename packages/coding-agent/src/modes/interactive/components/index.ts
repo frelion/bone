@@ -23,6 +23,7 @@ export { keyHint, keyText, rawKeyHint } from "./keybinding-hints.ts";
 export { LoginDialogComponent } from "./login-dialog.ts";
 export { ModelSelectorComponent } from "./model-selector.ts";
 export { OAuthSelectorComponent } from "./oauth-selector.ts";
+export { PlanProposalComponent } from "./plan-proposal.ts";
 export { type ModelsCallbacks, type ModelsConfig, ScopedModelsSelectorComponent } from "./scoped-models-selector.ts";
 export { SessionSelectorComponent } from "./session-selector.ts";
 export { ShowImagesSelectorComponent } from "./show-images-selector.ts";

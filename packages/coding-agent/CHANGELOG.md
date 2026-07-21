@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added built-in Plan Mode for read-only investigation, persisted Markdown proposals, explicit execute/revise/cancel approval, automatic execution after approval, and matching TUI, SDK, and RPC state and actions.
+
 ## [0.1.0] - 2026-07-21
 
 ## [0.0.11] - 2026-07-21

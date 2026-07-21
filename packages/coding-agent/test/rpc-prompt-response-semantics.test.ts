@@ -95,7 +95,12 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: number; model?: Model<any> }): Promise<{
+async function createRuntimeHost(options: {
+	withAuth: boolean;
+	responseDelayMs: number;
+	model?: Model<any>;
+	responseText?: string;
+}): Promise<{
 	runtimeHost: AgentSessionRuntime;
 	cleanup: () => Promise<void>;
 }> {
@@ -119,7 +124,11 @@ async function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: 
 			queueMicrotask(() => {
 				stream.push({ type: "start", partial: createAssistantMessage("") });
 				setTimeout(() => {
-					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage(options.responseText ?? "done"),
+					});
 				}, options.responseDelayMs);
 			});
 			return stream;
@@ -170,7 +179,12 @@ async function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: 
 	};
 }
 
-async function startRpcMode(options: { withAuth: boolean; responseDelayMs: number; model?: Model<any> }): Promise<{
+async function startRpcMode(options: {
+	withAuth: boolean;
+	responseDelayMs: number;
+	model?: Model<any>;
+	responseText?: string;
+}): Promise<{
 	lineHandler: (line: string) => void;
 	cleanup: () => Promise<void>;
 }> {
@@ -267,6 +281,59 @@ describe("RPC prompt response semantics", () => {
 			});
 
 			await sleep(150);
+		} finally {
+			await cleanup();
+		}
+	});
+
+	it("exposes Plan state, commands, and session events", async () => {
+		const { lineHandler, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			responseText: "<proposed_plan>\n# RPC plan\n</proposed_plan>",
+		});
+
+		try {
+			lineHandler(JSON.stringify({ id: "plan-mode", type: "set_collaboration_mode", mode: "plan" }));
+			await vi.waitFor(() => {
+				expect(parseOutputLines(rpcIo.outputLines)).toContainEqual(
+					expect.objectContaining({ type: "collaboration_mode_changed", mode: "plan" }),
+				);
+			});
+
+			lineHandler(JSON.stringify({ id: "plan-prompt", type: "prompt", message: "Plan it" }));
+			await vi.waitFor(() => {
+				expect(parseOutputLines(rpcIo.outputLines).some((record) => record.type === "plan_proposed")).toBe(true);
+			});
+			const proposalEvent = parseOutputLines(rpcIo.outputLines).find((record) => record.type === "plan_proposed");
+			const proposal = proposalEvent?.proposal as { id: string } | undefined;
+			expect(proposal?.id).toBeDefined();
+
+			lineHandler(JSON.stringify({ id: "plan-state", type: "get_state" }));
+			await vi.waitFor(() => {
+				const stateResponse = parseOutputLines(rpcIo.outputLines).find((record) => record.id === "plan-state");
+				expect(stateResponse).toMatchObject({
+					success: true,
+					data: {
+						collaborationMode: "plan",
+						planState: { status: "awaitingApproval", proposal: { id: proposal?.id } },
+					},
+				});
+			});
+
+			lineHandler(JSON.stringify({ id: "plan-cancel", type: "cancel_plan", proposalId: proposal?.id }));
+			await vi.waitFor(() => {
+				const records = parseOutputLines(rpcIo.outputLines);
+				expect(records).toContainEqual(expect.objectContaining({ type: "plan_decided", decision: "cancelled" }));
+				expect(records).toContainEqual(
+					expect.objectContaining({
+						id: "plan-cancel",
+						type: "response",
+						command: "cancel_plan",
+						success: true,
+					}),
+				);
+			});
 		} finally {
 			await cleanup();
 		}

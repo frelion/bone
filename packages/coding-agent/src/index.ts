@@ -66,6 +66,14 @@ export {
 	ModelRuntime,
 	type ModelRuntimeAuthOverrides,
 } from "./core/model-runtime.ts";
+export {
+	appendPlanModeInstructions,
+	type CollaborationMode,
+	type PlanDecision,
+	type PlanProposal,
+	type PlanState,
+	parseProposedPlan,
+} from "./core/plan-mode.ts";
 export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.ts";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
 // SDK for programmatic usage
@@ -100,6 +108,7 @@ export {
 	type BranchSummaryEntry,
 	buildContextEntries,
 	buildSessionContext,
+	type CollaborationModeChangeEntry,
 	type CompactionEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
@@ -109,6 +118,8 @@ export {
 	type ModelChangeEntry,
 	migrateSessionEntries,
 	type NewSessionOptions,
+	type PlanDecisionEntry,
+	type PlanProposalEntry,
 	parseSessionEntries,
 	type SessionContext,
 	type SessionEntry,

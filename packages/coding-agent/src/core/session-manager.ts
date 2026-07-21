@@ -26,6 +26,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import type { CollaborationMode, PlanDecision, PlanProposal } from "./plan-mode.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -116,6 +117,24 @@ export interface SessionInfoEntry extends SessionEntryBase {
 	name?: string;
 }
 
+export interface CollaborationModeChangeEntry extends SessionEntryBase {
+	type: "collaboration_mode_change";
+	mode: CollaborationMode;
+	toolsBeforePlanMode?: string[];
+}
+
+export interface PlanProposalEntry extends SessionEntryBase {
+	type: "plan_proposal";
+	proposal: PlanProposal;
+}
+
+export interface PlanDecisionEntry extends SessionEntryBase {
+	type: "plan_decision";
+	proposalId: string;
+	version: number;
+	decision: PlanDecision;
+}
+
 /**
  * Custom message entry for extensions to inject messages into LLM context.
  * Use customType to identify your extension's entries.
@@ -146,7 +165,10 @@ export type SessionEntry =
 	| CustomEntry
 	| CustomMessageEntry
 	| LabelEntry
-	| SessionInfoEntry;
+	| SessionInfoEntry
+	| CollaborationModeChangeEntry
+	| PlanProposalEntry
+	| PlanDecisionEntry;
 
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
@@ -1127,6 +1149,56 @@ export class SessionManager {
 		};
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	appendCollaborationModeChange(
+		mode: CollaborationMode,
+		toolsBeforePlanMode?: string[],
+	): CollaborationModeChangeEntry {
+		const entry: CollaborationModeChangeEntry = {
+			type: "collaboration_mode_change",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			mode,
+			...(toolsBeforePlanMode && { toolsBeforePlanMode: [...toolsBeforePlanMode] }),
+		};
+		this._appendEntry(entry);
+		return entry;
+	}
+
+	appendPlanProposal(content: string, version: number, sourceMessageId: string): PlanProposalEntry {
+		const id = generateId(this.byId);
+		const timestamp = new Date().toISOString();
+		const entry: PlanProposalEntry = {
+			type: "plan_proposal",
+			id,
+			parentId: this.leafId,
+			timestamp,
+			proposal: {
+				id,
+				version,
+				content,
+				createdAt: timestamp,
+				sourceMessageId,
+			},
+		};
+		this._appendEntry(entry);
+		return entry;
+	}
+
+	appendPlanDecision(proposal: PlanProposal, decision: PlanDecision): PlanDecisionEntry {
+		const entry: PlanDecisionEntry = {
+			type: "plan_decision",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			proposalId: proposal.id,
+			version: proposal.version,
+			decision,
+		};
+		this._appendEntry(entry);
+		return entry;
 	}
 
 	/** Append a compaction summary as child of current leaf, then advance leaf. Returns entry id. */

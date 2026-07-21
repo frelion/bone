@@ -1,10 +1,45 @@
 import type { AssistantMessage } from "@frelion/bone-ai";
 import { Container, Markdown, type MarkdownTheme, Spacer, Text } from "@frelion/bone-tui";
+import { PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG } from "../../../core/plan-mode.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+
+function getVisibleTextParts(message: AssistantMessage): Map<number, string> {
+	const visibleByIndex = new Map<number, string>();
+	let insidePlanBlock = false;
+
+	for (let index = 0; index < message.content.length; index++) {
+		const content = message.content[index];
+		if (content.type !== "text") continue;
+
+		let remaining = content.text;
+		let visible = "";
+		while (remaining.length > 0) {
+			if (insidePlanBlock) {
+				const closeIndex = remaining.indexOf(PROPOSED_PLAN_CLOSE_TAG);
+				if (closeIndex === -1) break;
+				remaining = remaining.slice(closeIndex + PROPOSED_PLAN_CLOSE_TAG.length);
+				insidePlanBlock = false;
+				continue;
+			}
+
+			const openIndex = remaining.indexOf(PROPOSED_PLAN_OPEN_TAG);
+			if (openIndex === -1) {
+				visible += remaining;
+				break;
+			}
+			visible += remaining.slice(0, openIndex);
+			remaining = remaining.slice(openIndex + PROPOSED_PLAN_OPEN_TAG.length);
+			insidePlanBlock = true;
+		}
+		visibleByIndex.set(index, visible);
+	}
+
+	return visibleByIndex;
+}
 
 /**
  * Component that renders a complete assistant message
@@ -15,6 +50,7 @@ export class AssistantMessageComponent extends Container {
 	private markdownTheme: MarkdownTheme;
 	private hiddenThinkingLabel: string;
 	private outputPad: number;
+	private hideProposedPlan: boolean;
 	private lastMessage?: AssistantMessage;
 	private hasToolCalls = false;
 
@@ -24,6 +60,7 @@ export class AssistantMessageComponent extends Container {
 		markdownTheme: MarkdownTheme = getMarkdownTheme(),
 		hiddenThinkingLabel = "Thinking...",
 		outputPad = 1,
+		hideProposedPlan = false,
 	) {
 		super();
 
@@ -31,6 +68,7 @@ export class AssistantMessageComponent extends Container {
 		this.markdownTheme = markdownTheme;
 		this.hiddenThinkingLabel = hiddenThinkingLabel;
 		this.outputPad = outputPad;
+		this.hideProposedPlan = hideProposedPlan;
 
 		// Container for text/thinking content
 		this.contentContainer = new Container();
@@ -86,8 +124,11 @@ export class AssistantMessageComponent extends Container {
 		// Clear content container
 		this.contentContainer.clear();
 
-		const hasVisibleContent = message.content.some(
-			(c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()),
+		const visibleTextParts = this.hideProposedPlan ? getVisibleTextParts(message) : new Map<number, string>();
+		const hasVisibleContent = message.content.some((content, index) =>
+			content.type === "text"
+				? (this.hideProposedPlan ? visibleTextParts.get(index) : content.text)?.trim()
+				: content.type === "thinking" && content.thinking.trim(),
 		);
 
 		if (hasVisibleContent) {
@@ -98,9 +139,11 @@ export class AssistantMessageComponent extends Container {
 		for (let i = 0; i < message.content.length; i++) {
 			const content = message.content[i];
 			if (content.type === "text" && content.text.trim()) {
+				const visibleText = this.hideProposedPlan ? (visibleTextParts.get(i) ?? "") : content.text;
+				if (!visibleText.trim()) continue;
 				// Assistant text messages with no background - trim the text
 				// Set paddingY=0 to avoid extra spacing before tool executions
-				this.contentContainer.addChild(new Markdown(content.text.trim(), this.outputPad, 0, this.markdownTheme));
+				this.contentContainer.addChild(new Markdown(visibleText.trim(), this.outputPad, 0, this.markdownTheme));
 			} else if (content.type === "thinking") {
 				const thinkingBlocks: string[] = [];
 				for (; i < message.content.length; i++) {

@@ -456,8 +456,31 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					autoCompactionEnabled: session.autoCompactionEnabled,
 					messageCount: session.messages.length,
 					pendingMessageCount: session.pendingMessageCount,
+					collaborationMode: session.collaborationMode,
+					planState: session.planState,
 				};
 				return success(id, "get_state", state);
+			}
+
+			case "set_collaboration_mode": {
+				if (command.mode === "plan") session.enterPlanMode();
+				else session.exitPlanMode();
+				return success(id, "set_collaboration_mode");
+			}
+
+			case "approve_plan": {
+				await session.approvePlan(command.proposalId);
+				return success(id, "approve_plan");
+			}
+
+			case "revise_plan": {
+				await session.revisePlan(command.proposalId, command.feedback);
+				return success(id, "revise_plan");
+			}
+
+			case "cancel_plan": {
+				session.cancelPlan(command.proposalId);
+				return success(id, "cancel_plan");
 			}
 
 			// =================================================================

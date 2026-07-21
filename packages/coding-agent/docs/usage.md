@@ -10,6 +10,7 @@ The interface contains a startup header, conversation history, editor, and statu
 |---|---|
 | `/login`, `/logout` | Manage provider credentials |
 | `/model` | Switch models |
+| `/plan` | Enter or leave Plan Mode |
 | `/settings` | Configure Bone |
 | `/new`, `/tree`, `/fork`, `/clone` | Manage conversations |
 | `/compact` | Compact context |
@@ -18,6 +19,14 @@ The interface contains a startup header, conversation history, editor, and statu
 | `/quit` | Quit Bone |
 
 Use `!command` to run a shell command and send its output to the model. Use `!!command` to run it without adding output to the conversation.
+
+### Plan Mode
+
+Use `/plan` when the goal and likely solution are clear but you want to approve the proposed changes before Bone implements them. While Plan Mode is active, Bone can inspect the workspace only with `read`, `grep`, `find`, and `ls`; it cannot edit files or run shell commands.
+
+Bone may investigate or ask clarifying questions before presenting a formal plan. A completed plan opens actions to execute it, request a revised full plan, or cancel. Executing a plan returns to Default mode, restores the tools that were active before planning, and immediately starts implementation. Ordinary chat replies such as `start` or `looks good` do not approve a plan.
+
+`/plan` leaves Plan Mode while planning. If a proposal is awaiting approval, leaving Plan Mode cancels it. Mode changes and plan decisions are rejected while the agent is running; interrupt the current turn first.
 
 ## Sessions
 
