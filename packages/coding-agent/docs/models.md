@@ -140,7 +140,7 @@ Set `api` at provider level (default for all models) or model level (override pe
 | `headers` | Custom headers (see value resolution below) |
 | `authHeader` | Set `true` to add `Authorization: Bearer <apiKey>` automatically |
 | `models` | Array of model configurations |
-| `modelOverrides` | Per-model overrides for built-in or extension-registered models on this provider |
+| `modelOverrides` | Per-model overrides for built-in models on this provider |
 
 For providers with `models`, non-built-in provider configs need `baseUrl` and an `api` value at either provider or model level. `apiKey` is not required to load the file: models become available when auth is configured through `/login`/`auth.json`, CLI `--api-key`, or provider `apiKey`. If no auth is configured, the models load but stay unavailable in `/model` and `--list-models`.
 
@@ -317,7 +317,7 @@ Merge semantics:
 
 ## Per-model Overrides
 
-Use `modelOverrides` to customize built-in models and matching extension-registered models without replacing the provider's full model list.
+Use `modelOverrides` to customize built-in models without replacing the provider's full model list.
 
 ```json
 {
@@ -359,7 +359,7 @@ Direct OpenAI GPT-5.6 Sol, Terra, and Luna default to a `272000` context window 
 The override preserves the built-in pricing metadata. Requests with more than 272K total input tokens use GPT-5.6's long-context rates for the entire request. Apply the same override to `gpt-5.6-terra` or `gpt-5.6-luna` when needed.
 
 Behavior notes:
-- `modelOverrides` are applied to built-in provider models and matching extension-registered provider models.
+- `modelOverrides` are applied to built-in provider models.
 - Unknown model IDs are ignored.
 - You can combine provider-level `baseUrl`/`headers` with `modelOverrides`.
 - Overriding `name` changes model matching and secondary detail text only; the footer and primary model lists continue to show the model `id`.

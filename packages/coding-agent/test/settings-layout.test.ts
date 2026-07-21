@@ -4,8 +4,6 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import { ModelConfig, type ModelsJson } from "../src/core/model-config.ts";
 import type { Settings } from "../src/core/settings-manager.ts";
-import { SettingsManager } from "../src/core/settings-manager.ts";
-import type { ScopedResolvedPaths } from "../src/modes/interactive/components/config-selector.ts";
 import { ModalShell } from "../src/modes/interactive/components/modal-shell.ts";
 import {
 	SettingsCenterComponent,
@@ -479,66 +477,6 @@ describe("SettingsCenterComponent layout", () => {
 		expect(rendered).toContain("auth configured · runtime (session credential)");
 		expect(rendered).toContain("models 2/3 available · OAuth, custom stream, dynamic models");
 		expect(rendered).toContain("composition error: model API mismatch");
-	});
-
-	it("keeps resource changes in the settings draft until the parent modal saves", async () => {
-		const resourceSettings = SettingsManager.inMemory({});
-		let resolveSaved: (() => void) | undefined;
-		const savedPromise = new Promise<void>((resolve) => {
-			resolveSaved = resolve;
-		});
-		const resolvedPaths: ScopedResolvedPaths = {
-			global: {
-				extensions: [
-					{
-						path: "/tmp/bone-settings-resources/extensions/demo.ts",
-						enabled: true,
-						metadata: {
-							source: "manual",
-							scope: "user",
-							origin: "top-level",
-							baseDir: "/tmp/bone-settings-resources",
-						},
-					},
-				],
-				skills: [],
-				prompts: [],
-				themes: [],
-			},
-			project: { extensions: [], skills: [], prompts: [], themes: [] },
-		};
-		let saved: Settings | undefined;
-		const settings = new SettingsCenterComponent({
-			global: {} as Settings,
-			project: {} as Settings,
-			projectTrusted: true,
-			models: { providers: {} } as ModelsJson,
-			resources: {
-				settingsManager: resourceSettings,
-				resolvedPaths,
-				cwd: "/tmp/bone-settings-resources",
-				agentDir: "/tmp/bone-settings-resources",
-				terminalRows: 24,
-			},
-			onSave: async (request) => {
-				saved = request.global;
-				resolveSaved?.();
-			},
-			onCancel: () => {},
-			onStartOAuth: () => {},
-		});
-
-		for (let index = 0; index < 5; index++) settings.handleInput("\x1b[B");
-		settings.handleInput("\t");
-		settings.handleInput(" ");
-
-		expect(resourceSettings.getGlobalSettings().extensions).toEqual(["-extensions/demo.ts"]);
-		expect(saved).toBeUndefined();
-
-		settings.handleInput("\x13");
-		await savedPromise;
-
-		expect(saved?.extensions).toEqual(["-extensions/demo.ts"]);
 	});
 
 	it("edits numeric settings in the modal draft before saving", async () => {

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -25,33 +25,8 @@ async function runCli(args: string[]): Promise<{ stdout: string; stderr: string;
 	const tempRoot = createTempDir();
 	const agentDir = join(tempRoot, "agent");
 	const projectDir = join(tempRoot, "project");
-	const projectConfigDir = join(projectDir, ".bone");
 	mkdirSync(agentDir, { recursive: true });
-	mkdirSync(projectConfigDir, { recursive: true });
-
-	const fakeNpmPath = join(tempRoot, "fake-npm.mjs");
-	writeFileSync(
-		fakeNpmPath,
-		[
-			'console.log("changed 1 package in 471ms");',
-			'console.log("found 0 vulnerabilities");',
-			"process.exit(0);",
-		].join("\n"),
-		"utf-8",
-	);
-
-	writeFileSync(
-		join(projectConfigDir, "settings.json"),
-		JSON.stringify(
-			{
-				packages: ["npm:fake-package"],
-				npmCommand: [process.execPath, fakeNpmPath],
-			},
-			null,
-			2,
-		),
-		"utf-8",
-	);
+	mkdirSync(projectDir, { recursive: true });
 
 	return await new Promise((resolvePromise, reject) => {
 		const child = spawn(process.execPath, [cliPath, ...args], {
@@ -96,33 +71,27 @@ describe("stdout cleanliness in non-interactive modes", () => {
 		expect(result.stderr).not.toContain("Usage:");
 	});
 
-	it("keeps stdout empty for --mode json --help while routing trusted startup chatter to stderr", async () => {
+	it("keeps stdout empty for --mode json --help", async () => {
 		const result = await runCli(["--mode", "json", "--help", "--approve"]);
 
 		expect(result.code).toBe(0);
 		expect(result.stdout).toBe("");
-		expect(result.stderr).toContain("changed 1 package in 471ms");
-		expect(result.stderr).toContain("found 0 vulnerabilities");
 		expect(result.stderr).toContain("Usage:");
 	});
 
-	it("keeps stdout empty for -p --help while routing trusted startup chatter to stderr", async () => {
+	it("keeps stdout empty for -p --help", async () => {
 		const result = await runCli(["-p", "--help", "--approve"]);
 
 		expect(result.code).toBe(0);
 		expect(result.stdout).toBe("");
-		expect(result.stderr).toContain("changed 1 package in 471ms");
-		expect(result.stderr).toContain("found 0 vulnerabilities");
 		expect(result.stderr).toContain("Usage:");
 	});
 
-	it("ignores untrusted project package installs for help", async () => {
+	it("does not process legacy package settings for help", async () => {
 		const result = await runCli(["-p", "--help"]);
 
 		expect(result.code).toBe(0);
 		expect(result.stdout).toBe("");
-		expect(result.stderr).not.toContain("changed 1 package in 471ms");
-		expect(result.stderr).not.toContain("found 0 vulnerabilities");
 		expect(result.stderr).toContain("Usage:");
 	});
 });

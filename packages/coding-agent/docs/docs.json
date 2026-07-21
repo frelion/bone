@@ -79,10 +79,6 @@
       "title": "Programmatic Usage",
       "items": [
         {
-          "title": "SDK",
-          "path": "sdk.md"
-        },
-        {
           "title": "JSON Event Stream Mode",
           "path": "json.md"
         }

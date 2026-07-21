@@ -104,10 +104,9 @@ describe("issue #2781 skill collision precedence: user skills should override pa
 		expect(webFetch!.description).toBe("Project web-fetch override");
 	});
 
-	it("collision diagnostics should report package skill as loser when user skill wins", async () => {
-		const pkgDir = createPackageWithSkill("web-fetch", "Package web-fetch skill");
+	it("collision diagnostics report the user skill as the loser when a project skill wins", async () => {
 		createUserSkill("web-fetch", "User web-fetch override");
-		createSettingsWithPackage(pkgDir, "user");
+		createProjectSkill("web-fetch", "Project web-fetch override");
 
 		const loader = new DefaultResourceLoader({ cwd, agentDir });
 		await loader.reload();
@@ -115,6 +114,6 @@ describe("issue #2781 skill collision precedence: user skills should override pa
 		const { diagnostics } = loader.getSkills();
 		const collision = diagnostics.find((d) => d.type === "collision" && d.collision?.name === "web-fetch");
 		expect(collision).toBeDefined();
-		expect(collision!.collision!.loserPath).toContain("fake-package");
+		expect(collision!.collision!.loserPath).toContain("agent/skills");
 	});
 });

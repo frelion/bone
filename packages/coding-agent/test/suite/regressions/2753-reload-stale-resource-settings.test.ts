@@ -95,11 +95,12 @@ describe("issue #2753 reload stale resource settings", () => {
 
 		expect(runtime.session.promptTemplates.map((prompt) => prompt.name)).toContain("test");
 
-		writeFileSync(join(agentDir, "settings.json"), `${JSON.stringify({ prompts: ["-prompts/test.md"] }, null, 2)}\n`);
+		writeFileSync(join(agentDir, "settings.json"), `${JSON.stringify({ prompts: [] }, null, 2)}\n`);
+		rmSync(join(promptsDir, "test.md"));
 
 		await runtime.session.reload();
 
-		expect(runtime.services.settingsManager.getGlobalSettings().prompts).toEqual(["-prompts/test.md"]);
+		expect(runtime.services.settingsManager.getGlobalSettings().prompts).toEqual([]);
 		expect(runtime.session.promptTemplates.map((prompt) => prompt.name)).not.toContain("test");
 	});
 });

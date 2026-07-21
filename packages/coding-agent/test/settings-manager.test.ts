@@ -111,51 +111,6 @@ describe("SettingsManager", () => {
 		});
 	});
 
-	describe("packages migration", () => {
-		it("should keep local-only extensions in extensions array", () => {
-			const settingsPath = join(agentDir, "settings.json");
-			writeFileSync(
-				settingsPath,
-				JSON.stringify({
-					extensions: ["/local/ext.ts", "./relative/ext.ts"],
-				}),
-			);
-
-			const manager = SettingsManager.create(projectDir, agentDir);
-
-			expect(manager.getPackages()).toEqual([]);
-			expect(manager.getExtensionPaths()).toEqual(["/local/ext.ts", "./relative/ext.ts"]);
-		});
-
-		it("should handle packages with filtering objects", () => {
-			const settingsPath = join(agentDir, "settings.json");
-			writeFileSync(
-				settingsPath,
-				JSON.stringify({
-					packages: [
-						"npm:simple-pkg",
-						{
-							source: "npm:shitty-extensions",
-							extensions: ["extensions/oracle.ts"],
-							skills: [],
-						},
-					],
-				}),
-			);
-
-			const manager = SettingsManager.create(projectDir, agentDir);
-
-			const packages = manager.getPackages();
-			expect(packages).toHaveLength(2);
-			expect(packages[0]).toBe("npm:simple-pkg");
-			expect(packages[1]).toEqual({
-				source: "npm:shitty-extensions",
-				extensions: ["extensions/oracle.ts"],
-				skills: [],
-			});
-		});
-	});
-
 	describe("reload", () => {
 		it("should reload global settings from disk", async () => {
 			const settingsPath = join(agentDir, "settings.json");
@@ -163,7 +118,6 @@ describe("SettingsManager", () => {
 				settingsPath,
 				JSON.stringify({
 					theme: "dark",
-					extensions: ["/before.ts"],
 				}),
 			);
 
@@ -173,7 +127,6 @@ describe("SettingsManager", () => {
 				settingsPath,
 				JSON.stringify({
 					theme: "light",
-					extensions: ["/after.ts"],
 					defaultModel: "claude-sonnet",
 				}),
 			);
@@ -181,7 +134,6 @@ describe("SettingsManager", () => {
 			await manager.reload();
 
 			expect(manager.getTheme()).toBe("light");
-			expect(manager.getExtensionPaths()).toEqual(["/after.ts"]);
 			expect(manager.getDefaultModel()).toBe("claude-sonnet");
 		});
 
@@ -257,16 +209,16 @@ describe("SettingsManager", () => {
 
 		it("should fail project settings writes when project is not trusted", async () => {
 			const projectSettingsPath = join(projectDir, ".bone", "settings.json");
-			writeFileSync(projectSettingsPath, JSON.stringify({ packages: ["npm:existing"] }));
+			writeFileSync(projectSettingsPath, JSON.stringify({ prompts: ["./existing.md"] }));
 			const manager = SettingsManager.create(projectDir, agentDir, { projectTrusted: false });
 
-			expect(() => manager.setProjectPackages(["npm:new"])).toThrow(
+			expect(() => manager.setProjectPromptTemplatePaths(["./new.md"])).toThrow(
 				"Project is not trusted; refusing to write project settings",
 			);
 			await manager.flush();
 
 			expect(manager.getProjectSettings()).toEqual({});
-			expect(JSON.parse(readFileSync(projectSettingsPath, "utf-8"))).toEqual({ packages: ["npm:existing"] });
+			expect(JSON.parse(readFileSync(projectSettingsPath, "utf-8"))).toEqual({ prompts: ["./existing.md"] });
 		});
 
 		it("should read default project trust from global settings only", () => {
@@ -320,7 +272,7 @@ describe("SettingsManager", () => {
 			expect(existsSync(join(projectDir, ".bone"))).toBe(false);
 
 			// Write a project-specific setting
-			manager.setProjectPackages([{ source: "npm:test-pkg" }]);
+			manager.setProjectPromptTemplatePaths(["./project-prompt.md"]);
 			await manager.flush();
 
 			// Now .bone folder should exist

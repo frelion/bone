@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -78,15 +78,9 @@ describe("createAgentSession stream options", () => {
 		api: Api,
 		settings: { httpIdleTimeoutMs?: number; websocketConnectTimeoutMs?: number },
 		requestOptions: SimpleStreamOptions = {},
-		extensionSource?: string,
 	): Promise<SimpleStreamOptions | undefined> {
 		const model = createModel(api);
 		const settingsManager = SettingsManager.inMemory(settings);
-		if (extensionSource) {
-			const extensionsDir = join(agentDir, "extensions");
-			mkdirSync(extensionsDir, { recursive: true });
-			writeFileSync(join(extensionsDir, "headers.ts"), extensionSource);
-		}
 
 		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
 		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "test-api-key" }));
@@ -159,30 +153,5 @@ describe("createAgentSession stream options", () => {
 		);
 
 		expect(options?.websocketConnectTimeoutMs).toBe(0);
-	});
-
-	it("runs before_provider_headers on assembled headers without forwarding the transform", async () => {
-		const options = await captureStreamOptions(
-			"openai-completions",
-			{},
-			{ headers: { "x-explicit": "explicit" } },
-			`export default function (pi) {
-				pi.on("before_provider_headers", (event) => {
-					event.headers["x-hook"] = [
-						event.headers["x-provider"],
-						event.headers["x-model"],
-						event.headers["x-explicit"],
-					].join(":");
-				});
-			}`,
-		);
-
-		expect(options?.headers).toMatchObject({
-			"x-provider": "provider",
-			"x-model": "model",
-			"x-explicit": "explicit",
-			"x-hook": "provider:model:explicit",
-		});
-		expect(options).not.toHaveProperty("transformHeaders");
 	});
 });

@@ -170,9 +170,9 @@ Every theme must define all 51 required color tokens. `thinkingMax` is optional 
 | `selectedBg` | Selected line background |
 | `userMessageBg` | User message background |
 | `userMessageText` | User message text |
-| `customMessageBg` | Extension message background |
-| `customMessageText` | Extension message text |
-| `customMessageLabel` | Extension message label |
+| `customMessageBg` | Bone runtime message background |
+| `customMessageText` | Bone runtime message text |
+| `customMessageLabel` | Bone runtime message label |
 | `toolPendingBg` | Tool box (pending) |
 | `toolSuccessBg` | Tool box (success) |
 | `toolErrorBg` | Tool box (error) |
