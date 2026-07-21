@@ -1,6 +1,6 @@
 {
 	"name": "@earendil-works/pi-coding-agent",
-	"version": "0.0.8",
+	"version": "0.0.9",
 	"description": "Bone local-first coding agent with concurrent conversations and semantic memory",
 	"type": "module",
 	"piConfig": {
