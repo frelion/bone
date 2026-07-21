@@ -1667,9 +1667,6 @@ export class AgentSession {
 
 	/** Generate a title without touching the agent's chat context or selected conversation model. */
 	async generateTitle(model: Model<Api>): Promise<ConversationTitleResult> {
-		if (!this.isIdle) {
-			return { kind: "error", message: "Wait for the current response to finish before generating a title" };
-		}
 		if (this._titleAbortController) {
 			return { kind: "error", message: "Conversation title generation is already in progress" };
 		}

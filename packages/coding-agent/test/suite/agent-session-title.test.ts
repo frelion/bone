@@ -31,6 +31,37 @@ describe("AgentSession title generation", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
+	it("generates a title while the agent is processing a response", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let releaseResponse: (() => void) | undefined;
+		let signalResponseStarted: (() => void) | undefined;
+		const responseStarted = new Promise<void>((resolve) => {
+			signalResponseStarted = resolve;
+		});
+		harness.setResponses([
+			() =>
+				new Promise((resolve) => {
+					signalResponseStarted?.();
+					releaseResponse = () => resolve(fauxAssistantMessage("The agent response is complete."));
+				}),
+			fauxAssistantMessage('{"title":"Name during streaming"}'),
+		]);
+
+		const prompt = harness.session.prompt("Start a long-running response.");
+		await responseStarted;
+		expect(harness.session.isStreaming).toBe(true);
+
+		await expect(harness.session.generateTitle(harness.getModel())).resolves.toEqual({
+			kind: "title",
+			title: "Name during streaming",
+		});
+		expect(harness.session.isStreaming).toBe(true);
+
+		releaseResponse?.();
+		await prompt;
+	});
+
 	it("keeps the session unnamed when the title model reports insufficient detail", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
