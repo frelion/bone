@@ -47,6 +47,7 @@ type RenderSessionContextThis = {
 	session: { retryAttempt: number; modelRegistry: { find(provider: string, modelId: string): undefined } };
 	toolOutputExpanded: boolean;
 	isInitialized: boolean;
+	isCurrentForegroundBinding(): boolean;
 	updateEditorBorderColor(): void;
 	getRegisteredToolDefinition(toolName: string): undefined;
 	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void;
@@ -59,7 +60,13 @@ type RenderSessionEntries = (
 	options?: { updateFooter?: boolean; populateHistory?: boolean },
 ) => void;
 
-type HandleEvent = (this: RenderSessionContextThis, event: AgentSessionEvent, eventSession: unknown) => Promise<void>;
+type HandleEvent = (
+	this: RenderSessionContextThis,
+	event: AgentSessionEvent,
+	eventRuntime: unknown,
+	eventSession: unknown,
+	binding: number,
+) => Promise<void>;
 
 function createFakeInteractiveModeThis(): RenderSessionContextThis {
 	const chatContainer = new Container();
@@ -77,6 +84,7 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		session: { retryAttempt: 0, modelRegistry: { find: () => undefined } },
 		toolOutputExpanded: false,
 		isInitialized: true,
+		isCurrentForegroundBinding: () => true,
 		updateEditorBorderColor: vi.fn(),
 		getRegisteredToolDefinition: (_toolName: string) => undefined,
 		renderSessionItems: (InteractiveMode.prototype as unknown as { renderSessionItems: RenderSessionItems })
@@ -162,7 +170,9 @@ describe("InteractiveMode.renderSessionEntries", () => {
 				result: { content: [{ type: "text", text: "FINAL_RESULT" }], details: undefined },
 				isError: false,
 			},
+			{},
 			fakeThis.session,
+			1,
 		);
 
 		expect(fakeThis.pendingTools.has(TOOL_CALL_ID)).toBe(false);

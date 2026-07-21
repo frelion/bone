@@ -2,9 +2,29 @@ import { describe, expect, test, vi } from "vitest";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
 describe("InteractiveMode compaction events", () => {
+	test("ignores an event from a stale foreground binding", async () => {
+		const fakeThis = {
+			isCurrentForegroundBinding: vi.fn(() => false),
+			isInitialized: true,
+			footer: { invalidate: vi.fn() },
+		};
+		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
+			this: typeof fakeThis,
+			event: { type: "agent_start" },
+			eventRuntime: unknown,
+			eventSession: unknown,
+			binding: number,
+		) => Promise<void>;
+
+		await handleEvent.call(fakeThis, { type: "agent_start" }, {}, {}, 1);
+
+		expect(fakeThis.footer.invalidate).not.toHaveBeenCalled();
+	});
+
 	test("rebuilds chat and appends a synthetic compaction summary at the bottom", async () => {
 		const fakeThis = {
 			isInitialized: true,
+			isCurrentForegroundBinding: vi.fn(() => true),
 			footer: { invalidate: vi.fn() },
 			autoCompactionEscapeHandler: undefined as (() => void) | undefined,
 			autoCompactionLoader: undefined,
@@ -31,18 +51,27 @@ describe("InteractiveMode compaction events", () => {
 				willRetry: boolean;
 				errorMessage?: string;
 			},
+			eventRuntime: unknown,
+			eventSession: unknown,
+			binding: number,
 		) => Promise<void>;
 
-		await handleEvent.call(fakeThis, {
-			type: "compaction_end",
-			reason: "manual",
-			result: {
-				tokensBefore: 123,
-				summary: "summary",
+		await handleEvent.call(
+			fakeThis,
+			{
+				type: "compaction_end",
+				reason: "manual",
+				result: {
+					tokensBefore: 123,
+					summary: "summary",
+				},
+				aborted: false,
+				willRetry: false,
 			},
-			aborted: false,
-			willRetry: false,
-		});
+			{},
+			{},
+			1,
+		);
 
 		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
 		expect(fakeThis.rebuildChatFromMessages).toHaveBeenCalledTimes(1);

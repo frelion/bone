@@ -212,6 +212,11 @@ type CompactionQueuedMessage = {
 	mode: "steer" | "followUp";
 };
 
+type ConversationComposerState = {
+	draft: string;
+	compactionQueuedMessages: CompactionQueuedMessage[];
+};
+
 type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }>;
 
 function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "custom" }> {
@@ -362,13 +367,13 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
-	private onInputCallback?: (text: string) => void;
 	private mouseScrollUnsubscribe: (() => void) | undefined;
 	private mouseTextSelectionUnsubscribe: (() => void) | undefined;
 	private chatTextSelection!: ChatTextSelectionController;
 	private mouseScrollTimer: NodeJS.Timeout | undefined;
 	private readonly kineticMouseScroll = new KineticScrollController();
-	private pendingUserInputs: string[] = [];
+	private readonly composerStates = new WeakMap<AgentSessionRuntime, ConversationComposerState>();
+	private foregroundBinding = 0;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private readonly parkedStatusIndicators = new Map<AgentSessionRuntime, StatusIndicator>();
 	private readonly conversationScrollOffsets = new Map<string, number>();
@@ -485,6 +490,8 @@ export class InteractiveMode {
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.sessionHost.setHooks({
 			beforeForegroundChange: async (runtime) => {
+				this.foregroundBinding++;
+				this.saveComposerState(runtime);
 				this.cancelMouseScroll();
 				this.unsubscribe?.();
 				this.unsubscribe = undefined;
@@ -494,6 +501,7 @@ export class InteractiveMode {
 			},
 			foregroundChanged: async (runtime) => {
 				await this.rebindCurrentSession({ renderBeforeBind: true });
+				this.restoreComposerState(runtime);
 				this.restoreConversationScrollOffset(runtime);
 				this.rememberActiveConversation(runtime);
 			},
@@ -1060,16 +1068,7 @@ export class InteractiveMode {
 			}
 		}
 
-		// Main interactive loop
-		while (true) {
-			const userInput = await this.getUserInput();
-			try {
-				await this.session.prompt(userInput);
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				this.showError(errorMessage);
-			}
-		}
+		await new Promise<void>(() => {});
 	}
 
 	private async checkForPackageUpdates(): Promise<string[]> {
@@ -1879,6 +1878,7 @@ export class InteractiveMode {
 	}
 
 	private async rebindCurrentSession(options: { renderBeforeBind?: boolean } = {}): Promise<void> {
+		this.foregroundBinding++;
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.applyRuntimeSettings();
@@ -1917,12 +1917,28 @@ export class InteractiveMode {
 		this.loadedResourcesContainer.clear();
 		this.chatContainer.clear();
 		this.pendingMessagesContainer.clear();
-		this.compactionQueuedMessages = [];
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.pendingTools.clear();
 		this.renderInitialMessages();
 		this.restoreStreamingMessage();
+	}
+
+	private saveComposerState(runtime: AgentSessionRuntime): void {
+		this.composerStates.set(runtime, {
+			draft: this.editor.getText(),
+			compactionQueuedMessages: [...this.compactionQueuedMessages],
+		});
+	}
+
+	private restoreComposerState(runtime: AgentSessionRuntime): void {
+		const state = this.composerStates.get(runtime) ?? { draft: "", compactionQueuedMessages: [] };
+		this.editor.setText(state.draft);
+		this.compactionQueuedMessages = [...state.compactionQueuedMessages];
+		this.updatePendingMessagesDisplay();
+		if (!runtime.session.isCompacting && this.compactionQueuedMessages.length > 0) {
+			void this.flushCompactionQueue({ willRetry: false });
+		}
 	}
 
 	/** Rebuild the partial assistant message when returning to a live background session. */
@@ -2873,6 +2889,8 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
+			const submittedRuntime = this.runtimeHost;
+			const submittedSession = submittedRuntime.session;
 
 			// Handle commands
 			if (text === "/settings") {
@@ -3038,11 +3056,11 @@ export class InteractiveMode {
 			}
 
 			// Queue input during compaction (extension commands execute immediately)
-			if (this.session.isCompacting) {
+			if (submittedSession.isCompacting) {
 				if (this.isExtensionCommand(text)) {
 					this.editor.addToHistory?.(text);
 					this.editor.setText("");
-					await this.session.prompt(text);
+					await submittedSession.prompt(text);
 				} else {
 					this.queueCompactionMessage(text, "steer");
 				}
@@ -3051,10 +3069,11 @@ export class InteractiveMode {
 
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
-			if (this.session.isStreaming) {
+			if (submittedSession.isStreaming) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
+				await submittedSession.prompt(text, { streamingBehavior: "steer" });
+				if (this.runtimeHost !== submittedRuntime || submittedRuntime.session !== submittedSession) return;
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				return;
@@ -3064,28 +3083,38 @@ export class InteractiveMode {
 			// First, move any pending bash components to chat
 			this.flushPendingBashComponents();
 
-			if (this.onInputCallback) {
-				this.onInputCallback(text);
-			} else {
-				this.pendingUserInputs.push(text);
-			}
 			this.editor.addToHistory?.(text);
+			void this.sessionHost.prompt(submittedRuntime, text).catch((error: unknown) => {
+				if (this.runtimeHost !== submittedRuntime) return;
+				this.showError(error instanceof Error ? error.message : "Unknown error occurred");
+			});
 		};
 	}
 
 	private subscribeToAgent(): void {
+		const subscribedRuntime = this.runtimeHost;
 		const subscribedSession = this.session;
+		const binding = this.foregroundBinding;
 		this.unsubscribe = subscribedSession.subscribe((event) => {
-			if (this.session !== subscribedSession) return;
-			void this.handleEvent(event, subscribedSession);
+			if (!this.isCurrentForegroundBinding(subscribedRuntime, subscribedSession, binding)) return;
+			void this.handleEvent(event, subscribedRuntime, subscribedSession, binding);
 		});
 	}
 
-	private async handleEvent(event: AgentSessionEvent, eventSession: AgentSession): Promise<void> {
-		if (this.session !== eventSession) return;
+	private isCurrentForegroundBinding(runtime: AgentSessionRuntime, session: AgentSession, binding: number): boolean {
+		return this.runtimeHost === runtime && runtime.session === session && this.foregroundBinding === binding;
+	}
+
+	private async handleEvent(
+		event: AgentSessionEvent,
+		eventRuntime: AgentSessionRuntime,
+		eventSession: AgentSession,
+		binding: number,
+	): Promise<void> {
+		if (!this.isCurrentForegroundBinding(eventRuntime, eventSession, binding)) return;
 		if (!this.isInitialized) {
 			await this.init();
-			if (this.session !== eventSession) return;
+			if (!this.isCurrentForegroundBinding(eventRuntime, eventSession, binding)) return;
 		}
 
 		this.footer.invalidate();
@@ -3131,14 +3160,15 @@ export class InteractiveMode {
 			case "session_info_changed":
 				void this.memory.recordTitle(
 					{
-						path: this.session.sessionFile ?? "",
-						id: this.sessionManager.getSessionId(),
+						path: eventSession.sessionFile ?? "",
+						id: eventSession.sessionManager.getSessionId(),
 					},
 					event.name ?? "",
 				);
 				this.updateTerminalTitle();
 				this.footer.invalidate();
 				await this.refreshSessionSidebar();
+				if (!this.isCurrentForegroundBinding(eventRuntime, eventSession, binding)) return;
 				this.ui.requestRender();
 				break;
 
@@ -3182,6 +3212,7 @@ export class InteractiveMode {
 			case "message_end":
 				if (event.message.role === "user") {
 					await this.refreshSessionSidebar();
+					if (!this.isCurrentForegroundBinding(eventRuntime, eventSession, binding)) return;
 					break;
 				}
 				if (this.streamingComponent && event.message.role === "assistant") {
@@ -3282,6 +3313,7 @@ export class InteractiveMode {
 
 			case "agent_settled":
 				await this.refreshSessionSidebar();
+				if (!this.isCurrentForegroundBinding(eventRuntime, eventSession, binding)) return;
 				await this.checkShutdownRequested();
 				break;
 
@@ -3693,20 +3725,6 @@ export class InteractiveMode {
 				0,
 			),
 		);
-	}
-
-	async getUserInput(): Promise<string> {
-		const queuedInput = this.pendingUserInputs.shift();
-		if (queuedInput !== undefined) {
-			return queuedInput;
-		}
-
-		return new Promise((resolve) => {
-			this.onInputCallback = (text: string) => {
-				this.onInputCallback = undefined;
-				resolve(text);
-			};
-		});
 	}
 
 	private rebuildChatFromMessages(): void {

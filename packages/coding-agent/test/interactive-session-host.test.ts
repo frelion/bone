@@ -165,6 +165,74 @@ describe("InteractiveSessionHost", () => {
 		await host.disposeAll();
 	});
 
+	it("routes prompts independently to the runtime captured at submission", async () => {
+		const tempDir = join(tmpdir(), `bone-session-host-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDirs.push(tempDir);
+		mkdirSync(tempDir, { recursive: true });
+
+		const firstSession = createPersistedSession(tempDir, "first session");
+		const secondSession = createPersistedSession(tempDir, "second session");
+		const firstPath = firstSession.getSessionFile();
+		const secondPath = secondSession.getSessionFile();
+		if (!firstPath || !secondPath) throw new Error("expected persisted session files");
+
+		const factory: CreateAgentSessionRuntimeFactory = async ({
+			cwd,
+			agentDir,
+			sessionManager,
+			sessionStartEvent,
+		}) => {
+			const services = await createAgentSessionServices({
+				cwd,
+				agentDir,
+				resourceLoaderOptions: {
+					noExtensions: true,
+					noSkills: true,
+					noPromptTemplates: true,
+					noThemes: true,
+				},
+			});
+			return {
+				...(await createAgentSessionFromServices({
+					services,
+					sessionManager,
+					sessionStartEvent,
+					noTools: "all",
+				})),
+				services,
+				diagnostics: services.diagnostics,
+			};
+		};
+
+		const runtimeA = await createAgentSessionRuntime(factory, {
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.open(firstPath),
+		});
+		const host = new InteractiveSessionHost(runtimeA, factory);
+		let finishA: () => void = () => {};
+		const promptA = vi.spyOn(runtimeA.session, "prompt").mockImplementation(
+			async () =>
+				await new Promise<void>((resolve) => {
+					finishA = resolve;
+				}),
+		);
+
+		const submittedA = host.prompt(runtimeA, "message for A");
+		await vi.waitFor(() => expect(promptA).toHaveBeenCalledWith("message for A", undefined));
+		await host.activate(secondPath);
+
+		const runtimeB = host.current;
+		const promptB = vi.spyOn(runtimeB.session, "prompt").mockResolvedValue();
+		await host.prompt(runtimeB, "message for B");
+
+		expect(promptB).toHaveBeenCalledWith("message for B", undefined);
+		expect((await host.list()).find((session) => session.path === firstPath)?.state).toBe("background-running");
+		finishA();
+		await submittedA;
+		await host.disposeAll();
+	});
+
 	it("keeps an unflushed first turn visible after switching to another session", async () => {
 		const tempDir = join(tmpdir(), `bone-session-host-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		tempDirs.push(tempDir);

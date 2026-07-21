@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { extname, relative, sep } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { resolvePath } from "../utils/paths.ts";
-import type { AgentSessionEvent } from "./agent-session.ts";
+import type { AgentSessionEvent, PromptOptions } from "./agent-session.ts";
 import {
 	type AgentSessionRuntime,
 	type CreateAgentSessionRuntimeFactory,
@@ -23,6 +23,9 @@ export type InteractiveSessionDeletionResult = { method: SessionTrashMethod } | 
 interface RuntimeSlot {
 	runtime: AgentSessionRuntime;
 	state: Exclude<InteractiveSessionState, "cold">;
+	acceptingPrompts: boolean;
+	pendingPrompts: number;
+	promptTail: Promise<void>;
 	unsubscribe: () => void;
 	unsubscribePersistedEntries: () => void;
 	unsubscribeRunCompleted: () => void;
@@ -95,6 +98,30 @@ export class InteractiveSessionHost {
 		return this.enqueue(async () => await this.createNewWithinTransition());
 	}
 
+	/** Route composer input to the runtime that was foreground when it was submitted. */
+	async prompt(runtime: AgentSessionRuntime, text: string, options?: PromptOptions): Promise<void> {
+		const slot = this.findRuntimeSlot(runtime);
+		if (!slot || !slot.acceptingPrompts) throw new Error("Conversation is no longer active");
+		const submittedSession = runtime.session;
+
+		slot.pendingPrompts++;
+		const prompt = slot.promptTail
+			.catch(() => {})
+			.then(async () => {
+				if (!slot.acceptingPrompts || runtime.session !== submittedSession) {
+					throw new Error("Conversation runtime was replaced");
+				}
+				await submittedSession.prompt(text, options);
+			});
+		slot.promptTail = prompt;
+		try {
+			await prompt;
+		} finally {
+			slot.pendingPrompts--;
+			this.scheduleBackgroundSuspend(slot);
+		}
+	}
+
 	/**
 	 * Stop, dispose, and soft-delete a conversation without allowing its runtime
 	 * lifecycle to race a JSONL move. The replacement path is selected by Side.
@@ -120,9 +147,11 @@ export class InteractiveSessionHost {
 
 			const agentDir = currentRuntime.services.agentDir;
 			if (targetSlot === this.foreground) {
-				if (this.hasOngoingWork(targetSlot.runtime)) {
+				targetSlot.acceptingPrompts = false;
+				if (this.hasOngoingWork(targetSlot)) {
 					await targetSlot.runtime.session.abort();
 				}
+				await targetSlot.promptTail.catch(() => {});
 
 				const replacementPath = replacementSessionPath && this.normalizeSessionPath(replacementSessionPath);
 				const replacementExists =
@@ -137,9 +166,11 @@ export class InteractiveSessionHost {
 				// Suppress the queued background-settled cleanup: this deletion owns the
 				// slot until it has been fully stopped and disposed exactly once.
 				targetSlot.state = "background-waiting";
-				if (this.hasOngoingWork(targetSlot.runtime)) {
+				targetSlot.acceptingPrompts = false;
+				if (this.hasOngoingWork(targetSlot)) {
 					await targetSlot.runtime.session.abort();
 				}
+				await targetSlot.promptTail.catch(() => {});
 				await this.suspend(targetSlot);
 			}
 
@@ -220,6 +251,9 @@ export class InteractiveSessionHost {
 		const slot: RuntimeSlot = {
 			runtime,
 			state,
+			acceptingPrompts: true,
+			pendingPrompts: 0,
+			promptTail: Promise.resolve(),
 			unsubscribe: () => {},
 			unsubscribePersistedEntries: () => {},
 			unsubscribeRunCompleted: () => {},
@@ -251,11 +285,7 @@ export class InteractiveSessionHost {
 
 	private handleRuntimeEvent(slot: RuntimeSlot, event: AgentSessionEvent): void {
 		if (slot.state === "background-running" && event.type === "agent_settled") {
-			void this.enqueue(async () => {
-				if (slot.state !== "background-running") return;
-				await this.suspend(slot);
-				this.hooks.stateChanged?.();
-			});
+			this.scheduleBackgroundSuspend(slot);
 		}
 	}
 
@@ -314,7 +344,7 @@ export class InteractiveSessionHost {
 			throw new Error("Cannot switch sessions when the current session is not persisted");
 		}
 
-		if (!this.hasOngoingWork(slot.runtime)) {
+		if (!this.hasOngoingWork(slot)) {
 			await this.suspend(slot);
 			return;
 		}
@@ -323,9 +353,26 @@ export class InteractiveSessionHost {
 		this.background.set(sessionPath, slot);
 	}
 
-	private hasOngoingWork(runtime: AgentSessionRuntime): boolean {
-		const session = runtime.session;
-		return session.isStreaming || session.isCompacting || session.isBashRunning;
+	private hasOngoingWork(slot: RuntimeSlot): boolean {
+		const session = slot.runtime.session;
+		return slot.pendingPrompts > 0 || session.isStreaming || session.isCompacting || session.isBashRunning;
+	}
+
+	private scheduleBackgroundSuspend(slot: RuntimeSlot): void {
+		if (slot.state !== "background-running" || this.hasOngoingWork(slot)) return;
+		void this.enqueue(async () => {
+			if (slot.state !== "background-running" || this.hasOngoingWork(slot)) return;
+			await this.suspend(slot);
+			this.hooks.stateChanged?.();
+		});
+	}
+
+	private findRuntimeSlot(runtime: AgentSessionRuntime): RuntimeSlot | undefined {
+		if (this.foreground.runtime === runtime) return this.foreground;
+		for (const slot of this.background.values()) {
+			if (slot.runtime === runtime) return slot;
+		}
+		return undefined;
 	}
 
 	private async suspend(slot: RuntimeSlot): Promise<void> {
