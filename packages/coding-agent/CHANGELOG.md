@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Improved conversation switching with single-pass cooperative JSONL loading, local-only model refreshes for previously initialized workspaces, paged transcript rendering, and lazy Side summaries.
+
 ## [0.0.7] - 2026-07-21
 
 ## [0.0.6] - 2026-07-21

@@ -607,6 +607,7 @@ export async function main(args: string[], options?: MainOptions) {
 	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
 	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
+	const networkInitializedCwds = new Set<string>();
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -614,6 +615,7 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionStartEvent,
 		projectTrustContext,
 	}) => {
+		const resolvedRuntimeCwd = resolvePath(cwd);
 		const isInitialRuntime = sessionStartEvent === undefined;
 		const projectTrustDiagnostics: AgentSessionRuntimeDiagnostic[] = [];
 		const cachedProjectTrust = projectTrustByCwd.get(cwd);
@@ -629,6 +631,7 @@ export async function main(args: string[], options?: MainOptions) {
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
+			allowModelNetwork: !networkInitializedCwds.has(resolvedRuntimeCwd),
 			settingsManager: runtimeSettingsManager,
 			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderReloadOptions: shouldResolveProjectTrust
@@ -670,6 +673,7 @@ export async function main(args: string[], options?: MainOptions) {
 				extensionFactories: options?.extensionFactories,
 			},
 		});
+		networkInitializedCwds.add(resolvedRuntimeCwd);
 		const { settingsManager, modelRuntime, resourceLoader } = services;
 		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
 			...projectTrustDiagnostics,

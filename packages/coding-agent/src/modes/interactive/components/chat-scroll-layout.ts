@@ -49,6 +49,12 @@ export class ChatScrollLayout implements Component {
 		return this.visibleContentLines.length;
 	}
 
+	/** Whether upward navigation is close enough to the loaded boundary to prefetch older history. */
+	isNearOldestContent(): boolean {
+		const maxOffset = Math.max(0, this.contentLines.length - this.contentRows);
+		return maxOffset - this.scrollOffset <= Math.max(1, this.contentRows * 2);
+	}
+
 	beginTextSelection(row: number, column: number): boolean {
 		return this.textSelection.begin(this.contentLines, this.visibleContentStart + row, column);
 	}

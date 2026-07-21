@@ -219,6 +219,20 @@ type ConversationComposerState = {
 
 type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }>;
 
+export function groupSessionEntriesForRendering(entries: readonly SessionEntry[]): SessionEntry[][] {
+	const groups: SessionEntry[][] = [];
+	let current: SessionEntry[] = [];
+	for (const entry of entries) {
+		if (entry.type === "message" && entry.message.role === "user" && current.length > 0) {
+			groups.push(current);
+			current = [];
+		}
+		current.push(entry);
+	}
+	if (current.length > 0) groups.push(current);
+	return groups;
+}
+
 function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "custom" }> {
 	return "type" in item && item.type === "custom";
 }
@@ -327,6 +341,7 @@ export interface InteractiveModeOptions {
 }
 
 export class InteractiveMode {
+	private static readonly HISTORY_PAGE_GROUPS = 20;
 	private static readonly SESSION_SIDEBAR_WIDTH = 32;
 	private static readonly SESSION_SIDEBAR_SEPARATOR_WIDTH = 2;
 	private static readonly MINIMUM_MAIN_PANE_WIDTH = 44;
@@ -341,6 +356,10 @@ export class InteractiveMode {
 	private sessionSidebar: SessionSidebar;
 	private readonly memory: MemoryRuntime;
 	private sidebarSessions: InteractiveSessionSummary[] = [];
+	private sidebarSessionTotal = 0;
+	private sidebarSessionOffset = 0;
+	private sidebarLoadInFlight: Promise<void> | undefined;
+	private static readonly SIDEBAR_PAGE_SIZE = 40;
 	private sessionSearchTimer: NodeJS.Timeout | undefined;
 	private semanticSearchTimer: NodeJS.Timeout | undefined;
 	private sessionSearchGeneration = 0;
@@ -348,6 +367,8 @@ export class InteractiveMode {
 	private sidebarPreviewInFlight: Promise<void> | undefined;
 	private loadedResourcesContainer: Container;
 	private chatContainer: Container;
+	private historyGroups: SessionEntry[][] = [];
+	private firstRenderedHistoryGroup = 0;
 	private pendingMessagesContainer: Container;
 	private statusContainer: Container;
 	private focusHintContainer: Container;
@@ -376,7 +397,6 @@ export class InteractiveMode {
 	private foregroundBinding = 0;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private readonly parkedStatusIndicators = new Map<AgentSessionRuntime, StatusIndicator>();
-	private readonly conversationScrollOffsets = new Map<string, number>();
 	private readonly transientConversationScrollOffsets = new WeakMap<AgentSessionRuntime, number>();
 	private readonly idleStatus = new IdleStatus();
 	private workingMessage: string | undefined = undefined;
@@ -508,8 +528,9 @@ export class InteractiveMode {
 			runtimeDisposed: (runtime) => {
 				this.disposeParkedStatusIndicator(runtime);
 			},
-			stateChanged: () => {
-				void this.refreshSessionSidebar();
+			stateChanged: (structureChanged) => {
+				if (structureChanged) void this.refreshSessionSidebar();
+				else this.refreshSessionSidebarStates();
 			},
 			persistedEntries: async (runtime, entries) => {
 				const manager = runtime.session.sessionManager;
@@ -595,6 +616,7 @@ export class InteractiveMode {
 			this.paneFocus.focus("chat");
 		};
 		this.sessionSidebar.onScrollChat = (direction) => this.scrollChat(direction);
+		this.sessionSidebar.onLoadMore = () => void this.loadMoreSidebarSessions();
 		this.sessionSidebar.onInterrupt = () => this.handleCtrlC();
 		this.sessionSidebar.onExit = () => this.handleCtrlD();
 		this.chatHistoryFocus.onFocusSidebar = () => this.focusSidebar();
@@ -3436,7 +3458,10 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private addCustomEntryToChat(entry: Extract<SessionEntry, { type: "custom" }>): void {
+	private addCustomEntryToChat(
+		entry: Extract<SessionEntry, { type: "custom" }>,
+		target: Container = this.chatContainer,
+	): void {
 		const renderer = this.session.extensionRunner.getEntryRenderer(entry.customType);
 		if (!renderer) {
 			return;
@@ -3447,18 +3472,19 @@ export class InteractiveMode {
 			return;
 		}
 
-		if (this.streamingComponent) {
-			const streamingIndex = this.chatContainer.children.indexOf(this.streamingComponent);
+		if (target === this.chatContainer && this.streamingComponent) {
+			const streamingIndex = target.children.indexOf(this.streamingComponent);
 			if (streamingIndex >= 0) {
-				this.chatContainer.children.splice(streamingIndex, 0, component);
+				target.children.splice(streamingIndex, 0, component);
 				return;
 			}
 		}
 
-		this.chatContainer.addChild(component);
+		target.addChild(component);
 	}
 
-	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
+	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean; target?: Container }): void {
+		const target = options?.target ?? this.chatContainer;
 		switch (message.role) {
 			case "bashExecution": {
 				const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext);
@@ -3471,7 +3497,7 @@ export class InteractiveMode {
 					message.truncated ? ({ truncated: true } as TruncationResult) : undefined,
 					message.fullOutputPath,
 				);
-				this.chatContainer.addChild(component);
+				target.addChild(component);
 				break;
 			}
 			case "custom": {
@@ -3479,29 +3505,29 @@ export class InteractiveMode {
 					const renderer = this.session.extensionRunner.getMessageRenderer(message.customType);
 					const component = new CustomMessageComponent(message, renderer, this.getMarkdownThemeWithSettings());
 					component.setExpanded(this.toolOutputExpanded);
-					this.chatContainer.addChild(component);
+					target.addChild(component);
 				}
 				break;
 			}
 			case "compactionSummary": {
-				this.chatContainer.addChild(new Spacer(1));
+				target.addChild(new Spacer(1));
 				const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
 				component.setExpanded(this.toolOutputExpanded);
-				this.chatContainer.addChild(component);
+				target.addChild(component);
 				break;
 			}
 			case "branchSummary": {
-				this.chatContainer.addChild(new Spacer(1));
+				target.addChild(new Spacer(1));
 				const component = new BranchSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
 				component.setExpanded(this.toolOutputExpanded);
-				this.chatContainer.addChild(component);
+				target.addChild(component);
 				break;
 			}
 			case "user": {
 				const textContent = this.getUserMessageText(message);
 				if (textContent) {
-					if (this.chatContainer.children.length > 0) {
-						this.chatContainer.addChild(new Spacer(1));
+					if (target.children.length > 0) {
+						target.addChild(new Spacer(1));
 					}
 					const skillBlock = parseSkillBlock(textContent);
 					if (skillBlock) {
@@ -3511,16 +3537,16 @@ export class InteractiveMode {
 							this.getMarkdownThemeWithSettings(),
 						);
 						component.setExpanded(this.toolOutputExpanded);
-						this.chatContainer.addChild(component);
+						target.addChild(component);
 						// Render user message separately if present
 						if (skillBlock.userMessage) {
-							this.chatContainer.addChild(new Spacer(1));
+							target.addChild(new Spacer(1));
 							const userComponent = new UserMessageComponent(
 								skillBlock.userMessage,
 								this.getMarkdownThemeWithSettings(),
 								this.outputPad,
 							);
-							this.chatContainer.addChild(userComponent);
+							target.addChild(userComponent);
 						}
 					} else {
 						const userComponent = new UserMessageComponent(
@@ -3528,7 +3554,7 @@ export class InteractiveMode {
 							this.getMarkdownThemeWithSettings(),
 							this.outputPad,
 						);
-						this.chatContainer.addChild(userComponent);
+						target.addChild(userComponent);
 					}
 					if (options?.populateHistory) {
 						this.editor.addToHistory?.(textContent);
@@ -3544,7 +3570,7 @@ export class InteractiveMode {
 					this.hiddenThinkingLabel,
 					this.outputPad,
 				);
-				this.chatContainer.addChild(assistantComponent);
+				target.addChild(assistantComponent);
 				break;
 			}
 			case "toolResult": {
@@ -3559,9 +3585,15 @@ export class InteractiveMode {
 
 	private renderSessionItems(
 		items: readonly RenderSessionItem[],
-		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
+		options: {
+			updateFooter?: boolean;
+			populateHistory?: boolean;
+			target?: Container;
+			updatePendingTools?: boolean;
+		} = {},
 	): void {
-		this.pendingTools.clear();
+		const target = options.target ?? this.chatContainer;
+		if (options.updatePendingTools !== false) this.pendingTools.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 		// Cache-miss notices are not persisted; re-derive them from the full entry
 		// list and re-inject them after the assistant messages that paid for them.
@@ -3576,14 +3608,14 @@ export class InteractiveMode {
 
 		for (const item of items) {
 			if (isCustomSessionEntry(item)) {
-				this.addCustomEntryToChat(item);
+				this.addCustomEntryToChat(item, target);
 				continue;
 			}
 
 			const message = item;
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
-				this.addMessageToChat(message);
+				this.addMessageToChat(message, { target });
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
@@ -3600,7 +3632,7 @@ export class InteractiveMode {
 							this.sessionManager.getCwd(),
 						);
 						component.setExpanded(this.toolOutputExpanded);
-						this.chatContainer.addChild(component);
+						target.addChild(component);
 
 						if (message.stopReason === "aborted" || message.stopReason === "error") {
 							let errorMessage: string;
@@ -3621,7 +3653,7 @@ export class InteractiveMode {
 				}
 				if (message.stopReason !== "aborted" && message.stopReason !== "error") {
 					const miss = cacheMisses.get(message);
-					if (miss) this.addCacheMissNotice(miss);
+					if (miss) this.addCacheMissNotice(miss, target);
 				}
 			} else if (message.role === "toolResult") {
 				// Match tool results to pending tool components
@@ -3632,14 +3664,16 @@ export class InteractiveMode {
 				}
 			} else {
 				// All other messages use standard rendering
-				this.addMessageToChat(message, options);
+				this.addMessageToChat(message, { populateHistory: options.populateHistory, target });
 			}
 		}
 
-		for (const [toolCallId, component] of renderedPendingTools) {
-			this.pendingTools.set(toolCallId, component);
+		if (options.updatePendingTools !== false) {
+			for (const [toolCallId, component] of renderedPendingTools) {
+				this.pendingTools.set(toolCallId, component);
+			}
 		}
-		this.ui.requestRender();
+		if (target === this.chatContainer) this.ui.requestRender();
 	}
 
 	/**
@@ -3650,7 +3684,12 @@ export class InteractiveMode {
 	 */
 	private renderSessionEntries(
 		entries: SessionEntry[],
-		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
+		options: {
+			updateFooter?: boolean;
+			populateHistory?: boolean;
+			target?: Container;
+			updatePendingTools?: boolean;
+		} = {},
 	): void {
 		const items = entries.flatMap((entry): RenderSessionItem[] => {
 			if (entry.type === "custom") {
@@ -3674,7 +3713,7 @@ export class InteractiveMode {
 		if (miss) this.addCacheMissNotice(miss);
 	}
 
-	private addCacheMissNotice(miss: CacheMiss): void {
+	private addCacheMissNotice(miss: CacheMiss, target: Container = this.chatContainer): void {
 		if (miss.missedTokens < 20_000 && miss.missedCost < 0.1) return;
 
 		const cost = miss.missedCost >= 0.01 ? ` (~$${miss.missedCost.toFixed(2)})` : "";
@@ -3686,25 +3725,47 @@ export class InteractiveMode {
 			label = `Cache miss after ${Math.round(miss.idleMs / 60_000)}m idle`;
 		}
 		const text = theme.fg("warning", `${label}: ${reBilled}`);
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(text, 1, 0));
+		target.addChild(new Spacer(1));
+		target.addChild(new Text(text, 1, 0));
 	}
 
-	renderInitialMessages(): void {
+	renderInitialMessages(options: { populateHistory?: boolean; showCompactionStatus?: boolean } = {}): void {
 		const entries = this.sessionManager.buildContextEntries();
-		this.renderSessionEntries(entries, {
+		this.historyGroups = groupSessionEntriesForRendering(entries);
+		this.firstRenderedHistoryGroup = Math.max(0, this.historyGroups.length - InteractiveMode.HISTORY_PAGE_GROUPS);
+		if (options.populateHistory !== false) this.populateEditorHistory(entries);
+		this.renderSessionEntries(this.historyGroups.slice(this.firstRenderedHistoryGroup).flat(), {
 			updateFooter: true,
-			populateHistory: true,
 		});
 		this.renderProjectTrustWarningIfNeeded();
 
 		// Show compaction info if session was compacted
 		const allEntries = this.sessionManager.getEntries();
 		const compactionCount = allEntries.filter((e) => e.type === "compaction").length;
-		if (compactionCount > 0) {
+		if (options.showCompactionStatus !== false && compactionCount > 0) {
 			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
 			this.showStatus(`Conversation compacted ${times}`);
 		}
+	}
+
+	private populateEditorHistory(entries: readonly SessionEntry[]): void {
+		for (const entry of entries) {
+			if (entry.type !== "message" || entry.message.role !== "user") continue;
+			const text = this.getUserMessageText(entry.message);
+			if (text) this.editor.addToHistory?.(text);
+		}
+	}
+
+	private loadEarlierHistoryPage(): boolean {
+		if (this.firstRenderedHistoryGroup === 0 || this.chatScrollLayout.textSelection.getSnapshot()) return false;
+		const nextStart = Math.max(0, this.firstRenderedHistoryGroup - InteractiveMode.HISTORY_PAGE_GROUPS);
+		const entries = this.historyGroups.slice(nextStart, this.firstRenderedHistoryGroup).flat();
+		const prefix = new Container();
+		this.renderSessionEntries(entries, { target: prefix, updatePendingTools: false });
+		if (prefix.children.length > 0 && this.chatContainer.children.length > 0) prefix.addChild(new Spacer(1));
+		this.chatContainer.children.unshift(...prefix.children);
+		this.firstRenderedHistoryGroup = nextStart;
+		return true;
 	}
 
 	private renderProjectTrustWarningIfNeeded(): void {
@@ -3729,7 +3790,7 @@ export class InteractiveMode {
 
 	private rebuildChatFromMessages(): void {
 		this.chatContainer.clear();
-		this.renderSessionEntries(this.sessionManager.buildContextEntries());
+		this.renderInitialMessages({ populateHistory: false, showCompactionStatus: false });
 	}
 
 	// =========================================================================
@@ -5178,18 +5239,55 @@ export class InteractiveMode {
 	}
 
 	private async refreshSessionSidebar(): Promise<void> {
+		const startedAt = performance.now();
 		try {
-			this.sidebarSessions = await this.sessionHost.list();
+			const page = await this.sessionHost.listPage(0, InteractiveMode.SIDEBAR_PAGE_SIZE);
+			this.sidebarSessions = page.sessions;
+			this.sidebarSessionTotal = page.total;
+			this.sidebarSessionOffset = page.nextOffset;
 			this.sessionSidebar.setSessions(this.sidebarSessions);
 			const query = this.sessionSidebar.searchQuery;
 			if (query?.trim()) this.scheduleSidebarSearch(query, 0);
 			this.ui.requestRender();
+			if (process.env.BONE_TIMING === "1") {
+				console.error(`[bone switch] sidebarRefresh=${(performance.now() - startedAt).toFixed(1)}ms`);
+			}
 		} catch (error) {
 			// A blank Side is indistinguishable from an empty workspace. Preserve the
 			// chat, but surface the actionable reason instead of swallowing it.
 			const message = error instanceof Error ? error.message : String(error);
 			this.showStatus(`Unable to refresh conversations: ${message}`);
 		}
+	}
+
+	private refreshSessionSidebarStates(): void {
+		this.sidebarSessions = this.sidebarSessions.map((session) => ({
+			...session,
+			state: this.sessionHost.getSessionState(session.path),
+		}));
+		this.sessionSidebar.setSessions(this.sidebarSessions);
+		this.ui.requestRender();
+	}
+
+	private async loadMoreSidebarSessions(): Promise<void> {
+		if (this.sidebarLoadInFlight || this.sidebarSessionOffset >= this.sidebarSessionTotal) return;
+		this.sidebarLoadInFlight = (async () => {
+			const page = await this.sessionHost.listPage(this.sidebarSessionOffset, InteractiveMode.SIDEBAR_PAGE_SIZE);
+			const known = new Set(this.sidebarSessions.map((session) => path.resolve(session.path)));
+			this.sidebarSessions.push(...page.sessions.filter((session) => !known.has(path.resolve(session.path))));
+			this.sidebarSessionTotal = page.total;
+			this.sidebarSessionOffset = page.nextOffset;
+			this.sessionSidebar.setSessions(this.sidebarSessions);
+			this.ui.requestRender();
+		})()
+			.catch((error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				this.showStatus(`Unable to load more conversations: ${message}`);
+			})
+			.finally(() => {
+				this.sidebarLoadInFlight = undefined;
+			});
+		await this.sidebarLoadInFlight;
 	}
 
 	private async activateSidebarSession(sessionPath: string): Promise<void> {
@@ -5276,6 +5374,8 @@ export class InteractiveMode {
 		try {
 			const results = await this.memory.search(query, this.sidebarSessions);
 			if (generation !== this.sessionSearchGeneration || query !== this.sessionSidebar.searchQuery) return;
+			await this.includeSidebarSearchSessions(results.map((result) => result.sessionPath));
+			if (generation !== this.sessionSearchGeneration || query !== this.sessionSidebar.searchQuery) return;
 			this.sessionSidebar.setSearchResults(results);
 			this.ui.requestRender();
 		} catch {
@@ -5289,6 +5389,8 @@ export class InteractiveMode {
 		try {
 			const results = await this.memory.searchSemantic(query, this.sidebarSessions);
 			if (generation !== this.sessionSearchGeneration || query !== this.sessionSidebar.searchQuery) return;
+			await this.includeSidebarSearchSessions(results.map((result) => result.sessionPath));
+			if (generation !== this.sessionSearchGeneration || query !== this.sessionSidebar.searchQuery) return;
 			this.sessionSidebar.setSearchResults(results);
 			this.sessionSidebar.setSearchStatus(undefined);
 			this.ui.requestRender();
@@ -5299,6 +5401,15 @@ export class InteractiveMode {
 				this.ui.requestRender();
 			}
 		}
+	}
+
+	private async includeSidebarSearchSessions(sessionPaths: readonly string[]): Promise<void> {
+		const known = new Set(this.sidebarSessions.map((session) => path.resolve(session.path)));
+		const missing = sessionPaths.filter((sessionPath) => !known.has(path.resolve(sessionPath)));
+		if (missing.length === 0) return;
+		const summaries = await this.sessionHost.getSessionSummaries(missing);
+		this.sidebarSessions.push(...summaries);
+		this.sessionSidebar.setSessions(this.sidebarSessions);
 	}
 
 	private formatSemanticSearchStatus(status: LocalEmbeddingStatus | undefined): string | undefined {
@@ -5342,24 +5453,19 @@ export class InteractiveMode {
 
 	private saveConversationScrollOffset(runtime: AgentSessionRuntime): void {
 		const offset = this.chatScrollLayout.getScrollOffset();
-		const sessionFile = runtime.session.sessionFile;
-		if (sessionFile) {
-			this.conversationScrollOffsets.set(path.resolve(sessionFile), offset);
-			return;
-		}
 		this.transientConversationScrollOffsets.set(runtime, offset);
 	}
 
 	private restoreConversationScrollOffset(runtime: AgentSessionRuntime): void {
-		const sessionFile = runtime.session.sessionFile;
-		const offset = sessionFile
-			? this.conversationScrollOffsets.get(path.resolve(sessionFile))
-			: this.transientConversationScrollOffsets.get(runtime);
+		const offset = this.transientConversationScrollOffsets.get(runtime);
 		this.chatScrollLayout.setScrollOffset(offset ?? 0);
 	}
 
 	private scrollChat(direction: "up" | "down", granularity: "line" | "page" = "page"): void {
 		this.cancelMouseScroll();
+		if (direction === "up" && this.chatScrollLayout.isNearOldestContent()) {
+			this.loadEarlierHistoryPage();
+		}
 		const scrolled =
 			granularity === "line"
 				? this.chatScrollLayout.scrollLines(direction)
@@ -5370,6 +5476,9 @@ export class InteractiveMode {
 	}
 
 	private enqueueMouseScroll(direction: "up" | "down"): void {
+		if (direction === "up" && this.chatScrollLayout.isNearOldestContent()) {
+			this.loadEarlierHistoryPage();
+		}
 		const immediateStep = this.kineticMouseScroll.receive(direction, performance.now());
 		if (this.chatScrollLayout.scrollLines(immediateStep.direction, immediateStep.lineCount)) {
 			this.ui.requestRender();

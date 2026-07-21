@@ -56,7 +56,7 @@ export interface InteractiveSessionHostHooks {
 	/** Release UI retained for a runtime that is no longer live. */
 	runtimeDisposed?: (runtime: AgentSessionRuntime) => void;
 	/** Refresh any session status UI after a lifecycle transition. */
-	stateChanged?: () => void;
+	stateChanged?: (structureChanged: boolean) => void;
 	/** Materialize entries that have successfully reached a JSONL session file. */
 	persistedEntries?: (runtime: AgentSessionRuntime, entries: readonly SessionEntry[]) => Promise<void>;
 	/** Materialize the final, user-visible response for a completed agent run. */
@@ -176,14 +176,14 @@ export class InteractiveSessionHost {
 
 			if (!existsSync(targetPath)) {
 				forgetLastActiveConversation(targetPath, agentDir);
-				this.hooks.stateChanged?.();
+				this.hooks.stateChanged?.(true);
 				return { method: "discarded" };
 			}
 
 			const result = await softDeleteSessionFile(targetPath, agentDir);
 			if (!result.ok) throw new Error(result.error);
 			forgetLastActiveConversation(targetPath, agentDir);
-			this.hooks.stateChanged?.();
+			this.hooks.stateChanged?.(true);
 			return { method: result.method };
 		});
 	}
@@ -210,6 +210,47 @@ export class InteractiveSessionHost {
 				state: path === currentPath ? "foreground" : (background?.state ?? "cold"),
 			};
 		});
+	}
+
+	async listPage(
+		offset: number,
+		limit: number,
+	): Promise<{ sessions: InteractiveSessionSummary[]; total: number; hasMore: boolean; nextOffset: number }> {
+		const current = this.current.session.sessionManager;
+		const page = await SessionManager.listPage(current.getCwd(), current.getSessionDir(), offset, limit);
+		const currentPath = this.getSessionPath(this.current);
+		const sessions = page.sessions.map((session) => this.decorateSessionInfo(session, currentPath));
+		if (offset === 0) {
+			for (const slot of [this.foreground, ...this.background.values()]) {
+				const sessionPath = this.getSessionPath(slot.runtime);
+				if (!sessionPath || sessions.some((session) => this.normalizeSessionPath(session.path) === sessionPath))
+					continue;
+				sessions.unshift(
+					this.decorateSessionInfo(this.createRuntimeSessionInfo(slot.runtime, sessionPath), currentPath),
+				);
+			}
+		}
+		return { ...page, sessions, nextOffset: Math.min(page.total, Math.max(0, offset) + Math.max(1, limit)) };
+	}
+
+	private decorateSessionInfo(session: SessionInfo, currentPath: string | undefined): InteractiveSessionSummary {
+		const path = this.normalizeSessionPath(session.path);
+		const background = this.background.get(path);
+		return { ...session, state: path === currentPath ? "foreground" : (background?.state ?? "cold") };
+	}
+
+	getSessionState(sessionPath: string): InteractiveSessionState {
+		const path = this.normalizeSessionPath(sessionPath);
+		if (path === this.getSessionPath(this.current)) return "foreground";
+		return this.background.get(path)?.state ?? "cold";
+	}
+
+	async getSessionSummaries(paths: readonly string[]): Promise<InteractiveSessionSummary[]> {
+		const currentPath = this.getSessionPath(this.current);
+		const summaries = await Promise.all(paths.map(async (path) => await SessionManager.getInfo(path)));
+		return summaries
+			.filter((summary): summary is SessionInfo => summary !== null)
+			.map((summary) => this.decorateSessionInfo(summary, currentPath));
 	}
 
 	async disposeAll(): Promise<void> {
@@ -274,7 +315,7 @@ export class InteractiveSessionHost {
 			slot.unsubscribe = subscribe();
 			if (this.foreground !== slot) return;
 			await this.hooks.foregroundChanged?.(runtime);
-			this.hooks.stateChanged?.();
+			this.hooks.stateChanged?.(true);
 		});
 		runtime.setBeforeSessionInvalidate(() => {
 			if (this.foreground !== slot) return;
@@ -290,12 +331,19 @@ export class InteractiveSessionHost {
 	}
 
 	private async activateWithinTransition(sessionPath: string, options?: { cwdOverride?: string }): Promise<void> {
+		const timingEnabled = process.env.BONE_TIMING === "1";
+		const totalStartedAt = performance.now();
+		const timings: Record<string, number> = {};
 		const targetPath = this.normalizeSessionPath(sessionPath);
 		const currentPath = this.getSessionPath(this.foreground.runtime);
 		if (targetPath === currentPath) return;
 
+		let startedAt = performance.now();
 		await this.hooks.beforeForegroundChange?.(this.foreground.runtime);
+		timings.uiDetach = performance.now() - startedAt;
+		startedAt = performance.now();
 		await this.parkForeground();
+		timings.teardown = performance.now() - startedAt;
 
 		const existing = this.background.get(targetPath);
 		if (existing) {
@@ -303,12 +351,22 @@ export class InteractiveSessionHost {
 			existing.state = "foreground";
 			this.foreground = existing;
 		} else {
-			const runtime = await this.openRuntime(targetPath, currentPath, options?.cwdOverride);
+			const runtime = await this.openRuntime(targetPath, currentPath, options?.cwdOverride, timings);
 			this.foreground = this.createSlot(runtime, "foreground");
 		}
 
+		startedAt = performance.now();
 		await this.hooks.foregroundChanged?.(this.foreground.runtime);
-		this.hooks.stateChanged?.();
+		timings.foregroundBind = performance.now() - startedAt;
+		this.hooks.stateChanged?.(false);
+		if (timingEnabled) {
+			timings.total = performance.now() - totalStartedAt;
+			console.error(
+				`[bone switch] ${Object.entries(timings)
+					.map(([label, ms]) => `${label}=${ms.toFixed(1)}ms`)
+					.join(" ")}`,
+			);
+		}
 	}
 
 	private async createNewWithinTransition(): Promise<void> {
@@ -334,7 +392,7 @@ export class InteractiveSessionHost {
 		});
 		this.foreground = this.createSlot(runtime, "foreground");
 		await this.hooks.foregroundChanged?.(runtime);
-		this.hooks.stateChanged?.();
+		this.hooks.stateChanged?.(true);
 	}
 
 	private async parkForeground(): Promise<void> {
@@ -363,7 +421,7 @@ export class InteractiveSessionHost {
 		void this.enqueue(async () => {
 			if (slot.state !== "background-running" || this.hasOngoingWork(slot)) return;
 			await this.suspend(slot);
-			this.hooks.stateChanged?.();
+			this.hooks.stateChanged?.(false);
 		});
 	}
 
@@ -407,9 +465,18 @@ export class InteractiveSessionHost {
 		sessionPath: string,
 		previousSessionFile?: string,
 		cwdOverride?: string,
+		timings?: Record<string, number>,
 	): Promise<AgentSessionRuntime> {
-		const sessionManager = SessionManager.open(sessionPath, undefined, cwdOverride);
-		return createAgentSessionRuntime(this.createRuntime, {
+		const sessionManager = await SessionManager.openAsync(sessionPath, undefined, cwdOverride, {
+			onTiming: (sessionTimings) => {
+				if (!timings) return;
+				timings.jsonlRead = sessionTimings.readMs;
+				timings.jsonlParse = sessionTimings.parseMs;
+				timings.sessionIndex = sessionTimings.indexMs;
+			},
+		});
+		const runtimeStartedAt = performance.now();
+		const runtime = await createAgentSessionRuntime(this.createRuntime, {
 			cwd: sessionManager.getCwd(),
 			agentDir: this.current.services.agentDir,
 			sessionManager,
@@ -419,6 +486,8 @@ export class InteractiveSessionHost {
 				previousSessionFile,
 			},
 		});
+		if (timings) timings.runtimeCreate = performance.now() - runtimeStartedAt;
+		return runtime;
 	}
 
 	private getSessionPath(runtime: AgentSessionRuntime): string | undefined {

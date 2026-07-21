@@ -152,6 +152,15 @@ describe("SessionSidebar", () => {
 		expect(stripVTControlCharacters(sidebar.render(30).join("\n"))).toContain("more");
 	});
 
+	it("requests another conversation page near the loaded tail", () => {
+		const sidebar = new SessionSidebar();
+		const loadMore = vi.fn();
+		sidebar.onLoadMore = loadMore;
+		sidebar.setSessions(Array.from({ length: 10 }, (_, index) => makeSession(String(index), "cold")));
+		for (let index = 0; index < 6; index++) sidebar.handleInput("\x1b[B");
+		expect(loadMore).toHaveBeenCalled();
+	});
+
 	it("fills the complete viewport and separates detailed conversations", () => {
 		const sidebar = new SessionSidebar();
 		sidebar.setViewportRows(14);
@@ -422,5 +431,20 @@ describe("SplitPane", () => {
 
 		expect(layout.scrollPage("up")).toBe(true);
 		expect(layout.getScrollOffset()).toBe(4);
+	});
+
+	it("signals when upward navigation is close to the oldest loaded content", () => {
+		const layout = new ChatScrollLayout(
+			new StaticComponent(Array.from({ length: 30 }, (_, index) => String(index))),
+			new StaticComponent(["Composer"]),
+			() => 5,
+		);
+
+		layout.render(40);
+		expect(layout.isNearOldestContent()).toBe(false);
+		while (layout.scrollPage("up")) {
+			if (layout.isNearOldestContent()) break;
+		}
+		expect(layout.isNearOldestContent()).toBe(true);
 	});
 });

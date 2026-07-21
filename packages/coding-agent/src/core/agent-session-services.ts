@@ -38,6 +38,8 @@ export interface AgentSessionRuntimeDiagnostic {
 export interface CreateAgentSessionServicesOptions {
 	cwd: string;
 	agentDir?: string;
+	/** Whether a newly-created ModelRuntime may refresh providers over the network. Defaults to true. */
+	allowModelNetwork?: boolean;
 	settingsManager?: SettingsManager;
 	modelRuntime?: ModelRuntime;
 	extensionFlagValues?: Map<string, boolean | string>;
@@ -143,6 +145,7 @@ export async function createAgentSessionServices(
 		(await ModelRuntime.create({
 			authPath: join(agentDir, "auth.json"),
 			modelsPath: join(agentDir, "models.json"),
+			allowModelNetwork: options.allowModelNetwork,
 		}));
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const resourceLoader = new DefaultResourceLoader({

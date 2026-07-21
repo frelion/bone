@@ -113,6 +113,7 @@ export class SessionSidebar implements Component, Focusable {
 	public onSearchStateChange?: (active: boolean) => void;
 	public onFocusChat?: () => void;
 	public onScrollChat?: (direction: "up" | "down") => void;
+	public onLoadMore?: () => void;
 	/** Keep application-level quit/interrupt behavior available while Side owns focus. */
 	public onInterrupt?: () => void;
 	public onExit?: () => void;
@@ -477,6 +478,9 @@ export class SessionSidebar implements Component, Focusable {
 		if (displayedSessions.length === 0) return;
 		this.selectedIndex = Math.max(0, Math.min(displayedSessions.length - 1, this.selectedIndex + delta));
 		this.selectedPath = displayedSessions[this.selectedIndex]?.path;
+		if (!this.searchInput && delta > 0 && this.selectedIndex >= displayedSessions.length - 5) {
+			this.onLoadMore?.();
+		}
 	}
 
 	private getDisplayedSessions(): InteractiveSessionSummary[] {
