@@ -342,7 +342,7 @@ export interface InteractiveModeOptions {
 
 export class InteractiveMode {
 	private static readonly HISTORY_PAGE_GROUPS = 20;
-	private static readonly SESSION_SIDEBAR_WIDTH = 32;
+	private static readonly SESSION_SIDEBAR_WIDTH = 40;
 	private static readonly SESSION_SIDEBAR_SEPARATOR_WIDTH = 2;
 	private static readonly MINIMUM_MAIN_PANE_WIDTH = 44;
 	private readonly sessionHost: InteractiveSessionHost;
@@ -5427,7 +5427,12 @@ export class InteractiveMode {
 	private focusSidebar(): void {
 		// Match SplitPane's layout threshold. A hidden Side must never become an
 		// invisible keyboard trap on a narrow terminal.
-		if (this.ui.terminal.columns < 78) {
+		if (
+			this.ui.terminal.columns <
+			InteractiveMode.SESSION_SIDEBAR_WIDTH +
+				InteractiveMode.SESSION_SIDEBAR_SEPARATOR_WIDTH +
+				InteractiveMode.MINIMUM_MAIN_PANE_WIDTH
+		) {
 			this.showStatus("Side is hidden at this terminal width; widen the terminal to focus conversations.");
 			return;
 		}

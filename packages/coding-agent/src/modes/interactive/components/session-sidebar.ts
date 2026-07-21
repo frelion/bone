@@ -208,21 +208,21 @@ export class SessionSidebar implements Component, Focusable {
 			lines.push(selected ? theme.bg("sidebarSelectedBg", padded) : padded);
 		};
 		const addDivider = () => {
-			addSidebarLine(theme.fg("borderMuted", `  ${"┄".repeat(Math.max(1, width - 4))}`));
+			addSidebarLine(theme.fg("borderMuted", "┄".repeat(Math.max(1, width))));
 		};
 
 		const header = this.searchInput ? "Search conversations" : "Conversations";
 		const count = String(displayedSessions.length);
-		const headerGap = " ".repeat(Math.max(1, width - visibleWidth(header) - visibleWidth(count) - 2));
-		addSidebarLine(` ${theme.bold(theme.fg("accent", header))}${headerGap}${theme.fg("dim", count)}`);
+		const headerGap = " ".repeat(Math.max(1, width - visibleWidth(header) - visibleWidth(count) - 1));
+		addSidebarLine(`${theme.bold(theme.fg("accent", header))}${headerGap}${theme.fg("dim", count)}`);
 		if (this.searchInput) {
-			const searchLine = this.searchInput.render(Math.max(1, width - 2))[0] ?? "> ";
-			addSidebarLine(` ${theme.fg("text", searchLine)}`);
-			if (this.searchStatus) addSidebarLine(theme.fg("muted", ` ${this.searchStatus}`));
+			const searchLine = this.searchInput.render(Math.max(1, width))[0] ?? "> ";
+			addSidebarLine(theme.fg("text", searchLine));
+			if (this.searchStatus) addSidebarLine(theme.fg("muted", this.searchStatus));
 		}
 		if (displayedSessions.length === 0) {
 			addDivider();
-			addSidebarLine(theme.fg("muted", this.searchInput ? " No matching conversations" : " No conversations yet"));
+			addSidebarLine(theme.fg("muted", this.searchInput ? "No matching conversations" : "No conversations yet"));
 			return this.fillViewport(lines, width, viewportRows);
 		}
 
@@ -257,7 +257,7 @@ export class SessionSidebar implements Component, Focusable {
 			const isConfirmingDelete = this.itemState.kind === "confirm-delete" && session.path === this.itemState.path;
 			const status =
 				this.itemState.kind === "status" && session.path === this.itemState.path ? this.itemState : undefined;
-			const prefix = `${selected ? "›" : " "} ${icon} `;
+			const prefix = `${icon} `;
 			const statusColor = isConfirmingDelete
 				? "error"
 				: session.state === "foreground"
@@ -326,7 +326,7 @@ export class SessionSidebar implements Component, Focusable {
 
 		if (showOverflow) {
 			if (detailedRows) addDivider();
-			addSidebarLine(theme.fg("muted", ` … ${displayedSessions.length - visibleCount} more`));
+			addSidebarLine(theme.fg("muted", `… ${displayedSessions.length - visibleCount} more`));
 		}
 
 		return this.fillViewport(lines, width, viewportRows);

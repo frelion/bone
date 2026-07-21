@@ -62,7 +62,7 @@ describe("SessionSidebar", () => {
 		sidebar.handleInput("\r");
 
 		expect(activate).toHaveBeenCalledWith("/sessions/b.jsonl");
-		expect(stripVTControlCharacters(sidebar.render(30).join("\n"))).toContain("› ○ Session b");
+		expect(stripVTControlCharacters(sidebar.render(30).join("\n"))).toContain("○ Session b");
 	});
 
 	it("keeps Ctrl+C and Ctrl+D connected to application-level handlers while Side has focus", () => {
@@ -116,14 +116,36 @@ describe("SessionSidebar", () => {
 		sidebar.setSessions([makeSession("a", "foreground")]);
 
 		const normalLines = stripVTControlCharacters(sidebar.render(42).join("\n")).split("\n");
-		expect(normalLines[0]?.trimEnd()).toMatch(/^ Conversations\s+1$/);
+		expect(normalLines[0]?.trimEnd()).toMatch(/^Conversations\s+1$/);
 		expect(normalLines.join("\n")).not.toContain("Shift+→");
 		expect(normalLines.join("\n")).not.toContain("d delete");
 
 		sidebar.handleInput("d");
 		const confirmationLines = stripVTControlCharacters(sidebar.render(42).join("\n")).split("\n");
-		expect(confirmationLines[0]?.trimEnd()).toMatch(/^ Conversations\s+1$/);
+		expect(confirmationLines[0]?.trimEnd()).toMatch(/^Conversations\s+1$/);
 		expect(confirmationLines.join("\n")).toContain("Delete this conversation?");
+	});
+
+	it("aligns first-level sidebar content with the terminal left edge", () => {
+		const sidebar = new SessionSidebar();
+		sidebar.focused = true;
+		sidebar.setSessions([makeSession("a", "foreground")]);
+
+		const normalLines = stripVTControlCharacters(sidebar.render(42).join("\n")).split("\n");
+		expect(normalLines[0]).toMatch(/^Conversations/);
+		expect(normalLines.find((line) => line.includes("Session a"))).toMatch(/^● Session a/);
+		expect(normalLines.join("\n")).not.toContain("›");
+
+		sidebar.handleInput("/");
+		sidebar.setSearchStatus("Searching");
+		const searchLines = stripVTControlCharacters(sidebar.render(42).join("\n")).split("\n");
+		expect(searchLines[0]).toMatch(/^Search conversations/);
+		expect(searchLines[1]).toMatch(/^> /);
+		expect(searchLines[2]).toBe("Searching".padEnd(42));
+
+		const emptySidebar = new SessionSidebar();
+		const emptyLines = stripVTControlCharacters(emptySidebar.render(42).join("\n")).split("\n");
+		expect(emptyLines[2]).toMatch(/^No conversations yet/);
 	});
 
 	it("renders deletion feedback within the selected conversation", () => {
@@ -303,7 +325,7 @@ describe("SessionSidebar", () => {
 		sidebar.handleInput("\x1b");
 		expect(previewSession).toHaveBeenLastCalledWith("/sessions/a.jsonl");
 		expect(sidebar.searchActive).toBe(false);
-		expect(stripVTControlCharacters(sidebar.render(42).join("\n"))).toContain("› ● Session a");
+		expect(stripVTControlCharacters(sidebar.render(42).join("\n"))).toContain("● Session a");
 	});
 
 	it("restores the original conversation when reopening a saved query is cancelled", () => {
@@ -356,6 +378,13 @@ describe("SessionSidebar", () => {
 });
 
 describe("SplitPane", () => {
+	it("shows a 40-column sidebar at its 86-column layout threshold", () => {
+		const pane = new SplitPane(new StaticComponent(["Side"]), new StaticComponent(["Main"]), 40, "│ ", 44);
+
+		expect(pane.render(85).map(stripVTControlCharacters)).toEqual(["Main"]);
+		expect(pane.render(86).map(stripVTControlCharacters)).toEqual([`${"Side".padEnd(40)}│ Main`]);
+	});
+
 	it("anchors the sidebar to the active terminal viewport", () => {
 		const pane = new SplitPane(
 			new StaticComponent(["Sessions", "Session A"]),
