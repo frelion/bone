@@ -31,11 +31,11 @@ npm run check
 npm test
 ```
 
-日常使用源码开发时，可以运行 `npm run dev:install-hook` 安装仅作用于当前
-clone 的 post-commit hook。每次提交后它会构建当前平台的 Bun 二进制，并在构建
-成功后原子切换本地 `bone` 命令；构建失败时保留上一版。单次跳过可使用
-`BONE_SKIP_LOCAL_INSTALL=1 git commit ...`。运行 `npm run dev:uninstall-hook`
-会恢复该 clone 原来的 Git hook 路径与 `bone` 命令。
+日常使用源码开发时，可以运行 `npm run dev:install-hook` 为主 checkout 安装本地
+post-commit 和 post-merge hook。提交或合并后它会构建当前平台的 Bun 二进制，
+并在构建成功后原子切换本地 `bone` 命令；构建失败时保留上一版。其他 worktree
+中的事件不会触发安装。单次跳过可设置 `BONE_SKIP_LOCAL_INSTALL=1`。运行
+`npm run dev:uninstall-hook` 会恢复该 clone 原来的 Git hook 路径与 `bone` 命令。
 
 源码仍是 npm workspace monorepo。在 GitHub Release 阶段，内部 package 名称只是
 实现细节，Bone 仓库不会发布它们。

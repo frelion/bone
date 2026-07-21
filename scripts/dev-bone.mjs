@@ -317,6 +317,31 @@ function writeHook(path, source) {
 	chmodSync(path, 0o755);
 }
 
+function createInstallHookSource(hookName, originalHooksPath, logPath) {
+	return `#!/bin/sh
+if [ -x ${shellQuote(join(originalHooksPath, hookName))} ]; then
+	${shellQuote(join(originalHooksPath, hookName))} "$@"
+	status=$?
+	if [ "$status" -ne 0 ]; then
+		exit "$status"
+	fi
+fi
+if [ "\${BONE_SKIP_LOCAL_INSTALL:-}" = "1" ]; then
+	exit 0
+fi
+worktree_root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+if [ "$worktree_root" != ${shellQuote(repoRoot)} ]; then
+	exit 0
+fi
+if ${shellQuote(process.execPath)} ${shellQuote(scriptPath)} install >> ${shellQuote(logPath)} 2>&1; then
+	printf '%s\\n' "Bone dev install updated. Log: ${logPath}"
+else
+	printf '%s\\n' "Bone dev install failed; the previous binary is still active. Log: ${logPath}" >&2
+fi
+exit 0
+`;
+}
+
 function getOriginalHooksPath() {
 	const configured = spawnSync("git", ["config", "--get", "core.hooksPath"], {
 		cwd: repoRoot,
@@ -341,32 +366,14 @@ function installHook(commandPath) {
 	rmSync(hookDir, { recursive: true, force: true });
 	mkdirSync(hookDir, { recursive: true, mode: 0o700 });
 	for (const entry of readdirSync(originalHooksPath, { withFileTypes: true })) {
-		if (!entry.isFile() || entry.name === "post-commit") continue;
+		if (!entry.isFile() || entry.name === "post-commit" || entry.name === "post-merge") continue;
 		writeHook(join(hookDir, entry.name), `#!/bin/sh\nexec ${shellQuote(join(originalHooksPath, entry.name))} "$@"\n`);
 	}
 	const gitDirectory = resolve(repoRoot, getGitValue(["rev-parse", "--git-dir"]));
 	const logPath = join(gitDirectory, "bone-dev-install.log");
-	writeHook(
-		join(hookDir, "post-commit"),
-		`#!/bin/sh
-if [ -x ${shellQuote(join(originalHooksPath, "post-commit"))} ]; then
-	${shellQuote(join(originalHooksPath, "post-commit"))} "$@"
-	status=$?
-	if [ "$status" -ne 0 ]; then
-		exit "$status"
-	fi
-fi
-if [ "\${BONE_SKIP_LOCAL_INSTALL:-}" = "1" ]; then
-	exit 0
-fi
-if ${shellQuote(process.execPath)} ${shellQuote(scriptPath)} install >> ${shellQuote(logPath)} 2>&1; then
-	printf '%s\\n' "Bone dev install updated. Log: ${logPath}"
-else
-	printf '%s\\n' "Bone dev install failed; the previous binary is still active. Log: ${logPath}" >&2
-fi
-exit 0
-`,
-	);
+	for (const hookName of ["post-commit", "post-merge"]) {
+		writeHook(join(hookDir, hookName), createInstallHookSource(hookName, originalHooksPath, logPath));
+	}
 
 	writeJson(hookConfigPath, {
 		version: 1,
@@ -378,7 +385,7 @@ exit 0
 		hookDir,
 	});
 	run("git", ["config", "core.hooksPath", hookDir]);
-	console.log(`Enabled Bone dev install after commits for this clone.`);
+	console.log(`Enabled Bone dev install after commits and merges for this clone.`);
 	console.log(`bone now resolves through ${currentLink}.`);
 }
 

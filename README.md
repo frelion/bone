@@ -33,12 +33,13 @@ npm run check
 npm test
 ```
 
-For a source checkout used every day, `npm run dev:install-hook` installs a
-local-only post-commit hook. It builds the current-platform Bun binary, switches
-the local `bone` command atomically after a successful build, and keeps the
-previous binary if the build fails. `BONE_SKIP_LOCAL_INSTALL=1 git commit ...`
-skips one install. Use `npm run dev:uninstall-hook` to restore the clone's
-previous Git hook path and `bone` command.
+For a source checkout used every day, `npm run dev:install-hook` installs
+local-only post-commit and post-merge hooks for the primary checkout. They build
+the current-platform Bun binary, switch the local `bone` command atomically after
+a successful build, and keep the previous binary if the build fails. Events from
+other worktrees do not trigger an install. Set `BONE_SKIP_LOCAL_INSTALL=1` to skip
+one install. Use `npm run dev:uninstall-hook` to restore the clone's previous Git
+hook path and `bone` command.
 
 The source remains an npm workspace monorepo. Its internal package names are an
 implementation detail during the GitHub Release phase and are not published by
