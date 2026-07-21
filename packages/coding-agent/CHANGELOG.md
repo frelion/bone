@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.6] - 2026-07-21
 
 ### Breaking Changes
 
@@ -26,6 +26,7 @@
 
 ### Fixed
 
+- Fixed standalone `bone setup` binaries to embed and resolve the local semantic-search setup worker.
 - Fixed configured-provider catalog refresh to parse pi.dev's model-ID keyed responses, throttle checks to once per four hours, send the versioned pi user agent, treat unimplemented routes as unavailable overlays, and show concise refresh status in `/model`.
 - Fixed adjacent assistant thinking blocks to render as one thinking section.
 
