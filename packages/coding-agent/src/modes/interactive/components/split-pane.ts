@@ -1,5 +1,5 @@
-import type { Component } from "@earendil-works/pi-tui";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { Component } from "@frelion/bone-tui";
+import { truncateToWidth, visibleWidth } from "@frelion/bone-tui";
 
 /** Renders two vertical component trees next to each other. */
 export class SplitPane implements Component {

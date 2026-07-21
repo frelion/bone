@@ -1,5 +1,5 @@
 import { stripVTControlCharacters } from "node:util";
-import { setKeybindings } from "@earendil-works/pi-tui";
+import { setKeybindings } from "@frelion/bone-tui";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { InteractiveSessionSummary } from "../src/core/interactive-session-host.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";

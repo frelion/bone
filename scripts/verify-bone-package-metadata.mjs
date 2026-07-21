@@ -28,8 +28,8 @@ if (existsSync(distPackagePath)) {
 }
 
 const packageJson = readJson(packagePath);
-if (packageJson.piConfig?.name !== "bone" || packageJson.piConfig?.configDir !== ".bone") {
-	throw new Error("Bone package is missing its expected Bone piConfig metadata");
+if (packageJson.boneConfig?.name !== "bone" || packageJson.boneConfig?.configDir !== ".bone") {
+	throw new Error("Bone package is missing its expected Bone boneConfig metadata");
 }
 
 console.log(`Verified Node Bone package metadata: ${packageJson.name}@${packageJson.version}`);

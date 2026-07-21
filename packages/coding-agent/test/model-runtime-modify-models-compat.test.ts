@@ -1,4 +1,4 @@
-import { InMemoryModelsStore, type Model } from "@earendil-works/pi-ai";
+import { InMemoryModelsStore, type Model } from "@frelion/bone-ai";
 import { describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";

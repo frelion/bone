@@ -1,4 +1,4 @@
-import { type Component, type Focusable, getKeybindings } from "@earendil-works/pi-tui";
+import { type Component, type Focusable, getKeybindings } from "@frelion/bone-tui";
 
 export type ChatHistoryScrollGranularity = "line" | "page";
 

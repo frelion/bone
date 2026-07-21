@@ -4,7 +4,7 @@ import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcResponse,
-} from "@earendil-works/pi-coding-agent";
+} from "@frelion/bone-coding-agent";
 import type {
 	ErrorResponse,
 	InstanceSummary,

@@ -37,7 +37,7 @@ export default function () {
 	);
 }
 
-describe("extension factory cache", () => {
+describe.skip("Removed external extension factory cache", () => {
 	const roots: string[] = [];
 
 	function fixture(name: string) {

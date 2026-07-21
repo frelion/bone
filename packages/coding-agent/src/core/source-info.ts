@@ -1,4 +1,4 @@
-import type { PathMetadata } from "./package-manager.ts";
+import type { PathMetadata } from "./resource-types.ts";
 
 export type SourceScope = "user" | "project" | "temporary";
 export type SourceOrigin = "package" | "top-level";

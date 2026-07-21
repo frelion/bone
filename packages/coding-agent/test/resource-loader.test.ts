@@ -3,15 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AuthStorage } from "../src/core/auth-storage.ts";
-import { ExtensionRunner } from "../src/core/extensions/runner.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
-import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import type { Skill } from "../src/core/skills.ts";
 import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
-
-import { createModelRegistry } from "./model-runtime-test-utils.ts";
 
 describe("DefaultResourceLoader", () => {
 	let tempDir: string;
@@ -158,7 +153,7 @@ Project skill`,
 			expect(theme?.sourcePath).toBe(projectThemePath);
 		});
 
-		it("should load symlinked user and project extensions once", async () => {
+		it("should ignore symlinked extension directories", async () => {
 			const sharedExtDir = join(tempDir, "shared-extensions");
 			mkdirSync(sharedExtDir, { recursive: true });
 			writeFileSync(
@@ -180,25 +175,18 @@ Project skill`,
 			await loader.reload();
 
 			const extensionsResult = loader.getExtensions();
-			expect(extensionsResult.extensions).toHaveLength(1);
+			expect(extensionsResult.extensions).toHaveLength(0);
 			expect(extensionsResult.errors).toEqual([]);
-
-			// mergePaths processes project paths before user paths, so the project
-			// alias is the canonical survivor.
-			expect(extensionsResult.extensions[0].path).toBe(join(cwd, ".bone", "extensions", "shared.ts"));
 		});
 
-		it("should load user extensions before trust and reuse them after trust resolves", async () => {
+		it("should not load extensions during project trust bootstrap", async () => {
 			const userExtDir = join(agentDir, "extensions");
 			const projectExtDir = join(cwd, ".bone", "extensions");
 			mkdirSync(userExtDir, { recursive: true });
 			mkdirSync(projectExtDir, { recursive: true });
-			const loadCountKey = `__piTrustPreloadCount_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-			const globalState = globalThis as typeof globalThis & Record<string, number | undefined>;
-
 			writeFileSync(
 				join(userExtDir, "user.ts"),
-				`globalThis[${JSON.stringify(loadCountKey)}] = (globalThis[${JSON.stringify(loadCountKey)}] ?? 0) + 1;
+				`globalThis.__boneExternalExtensionLoaded = true;
 export default function(pi) {
 	pi.on("project_trust", () => ({ trusted: "yes" }));
 	pi.registerCommand("user-trust", {
@@ -220,22 +208,16 @@ export default function(pi) {
 			const loader = new DefaultResourceLoader({ cwd, agentDir });
 			await loader.reload({
 				resolveProjectTrust: async ({ extensionsResult }) => {
-					expect(extensionsResult.extensions.map((extension) => extension.path)).toEqual([
-						join(userExtDir, "user.ts"),
-					]);
+					expect(extensionsResult.extensions).toEqual([]);
 					return true;
 				},
 			});
 
 			const extensionsResult = loader.getExtensions();
-			expect(extensionsResult.extensions.map((extension) => extension.path)).toEqual([
-				join(cwd, ".bone", "extensions", "project.ts"),
-				join(userExtDir, "user.ts"),
-			]);
-			expect(globalState[loadCountKey]).toBe(1);
+			expect(extensionsResult.extensions).toEqual([]);
 		});
 
-		it("should keep both extensions loaded when command names collide", async () => {
+		it("should ignore extension files when command names collide", async () => {
 			const userExtDir = join(agentDir, "extensions");
 			const projectExtDir = join(cwd, ".bone", "extensions");
 			mkdirSync(userExtDir, { recursive: true });
@@ -273,40 +255,12 @@ export default function(pi) {
 			await loader.reload();
 
 			const extensionsResult = loader.getExtensions();
-			expect(extensionsResult.extensions).toHaveLength(2);
-			expect(extensionsResult.errors.some((e) => e.error.includes('Command "/deploy" conflicts'))).toBe(false);
-
-			const sessionManager = SessionManager.inMemory();
-			const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
-			const modelRegistry = await createModelRegistry(authStorage);
-			const runner = new ExtensionRunner(
-				extensionsResult.extensions,
-				extensionsResult.runtime,
-				cwd,
-				sessionManager,
-				modelRegistry,
-			);
-
-			expect(runner.getCommand("deploy:1")?.description).toBe("project deploy");
-			expect(runner.getCommand("deploy:2")?.description).toBe("user deploy");
-			expect(runner.getCommand("project-only")?.description).toBe("project only");
-			expect(runner.getCommand("user-only")?.description).toBe("user only");
-
-			const commands = runner.getRegisteredCommands();
-			expect(commands.map((command) => command.invocationName)).toEqual([
-				"deploy:1",
-				"project-only",
-				"deploy:2",
-				"user-only",
-			]);
+			expect(extensionsResult.extensions).toEqual([]);
+			expect(extensionsResult.errors).toEqual([]);
 		});
 
-		it("should honor overrides for auto-discovered resources", async () => {
-			const settingsManager = SettingsManager.inMemory();
-			settingsManager.setExtensionPaths(["-extensions/disabled.ts"]);
-			settingsManager.setSkillPaths(["-skills/skip-skill"]);
-			settingsManager.setPromptTemplatePaths(["-prompts/skip.md"]);
-			settingsManager.setThemePaths(["-themes/skip.json"]);
+		it("should ignore legacy extension settings and load local resources", async () => {
+			const settingsManager = SettingsManager.inMemory({ extensions: ["extensions/disabled.ts"] });
 
 			const extensionsDir = join(agentDir, "extensions");
 			mkdirSync(extensionsDir, { recursive: true });
@@ -329,7 +283,11 @@ Content`,
 
 			const themesDir = join(agentDir, "themes");
 			mkdirSync(themesDir, { recursive: true });
-			writeFileSync(join(themesDir, "skip.json"), "{}");
+			writeFileSync(join(themesDir, "skip.json"), JSON.stringify({ name: "skip", colors: {} }));
+
+			settingsManager.setSkillPaths([skillDir]);
+			settingsManager.setPromptTemplatePaths([promptsDir]);
+			settingsManager.setThemePaths([themesDir]);
 
 			const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
 			await loader.reload();
@@ -337,12 +295,10 @@ Content`,
 			const { extensions } = loader.getExtensions();
 			const { skills } = loader.getSkills();
 			const { prompts } = loader.getPrompts();
-			const { themes } = loader.getThemes();
 
-			expect(extensions.some((e) => e.path.endsWith("disabled.ts"))).toBe(false);
-			expect(skills.some((s) => s.name === "skip-skill")).toBe(false);
-			expect(prompts.some((p) => p.name === "skip")).toBe(false);
-			expect(themes.some((t) => t.sourcePath?.endsWith("skip.json"))).toBe(false);
+			expect(extensions).toEqual([]);
+			expect(skills.some((s) => s.name === "skip-skill")).toBe(true);
+			expect(prompts.some((p) => p.name === "skip")).toBe(true);
 		});
 
 		it("should discover AGENTS.md context files", async () => {
@@ -633,7 +589,7 @@ Content`,
 			writeFileSync(
 				join(ext1Dir, "index.ts"),
 				`
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@frelion/bone-coding-agent";
 import { Type } from "typebox";
 export default function(pi: ExtensionAPI) {
   pi.registerTool({
@@ -648,7 +604,7 @@ export default function(pi: ExtensionAPI) {
 			writeFileSync(
 				join(ext2Dir, "index.ts"),
 				`
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@frelion/bone-coding-agent";
 import { Type } from "typebox";
 export default function(pi: ExtensionAPI) {
   pi.registerTool({
@@ -663,8 +619,9 @@ export default function(pi: ExtensionAPI) {
 			const loader = new DefaultResourceLoader({ cwd, agentDir });
 			await loader.reload();
 
-			const { errors } = loader.getExtensions();
-			expect(errors.some((e) => e.error.includes("duplicate-tool") && e.error.includes("conflicts"))).toBe(true);
+			const { extensions, errors } = loader.getExtensions();
+			expect(extensions).toEqual([]);
+			expect(errors).toEqual([]);
 		});
 
 		it("should prefer explicit CLI extensions over discovered extensions when commands and tools conflict", async () => {
@@ -675,7 +632,7 @@ export default function(pi: ExtensionAPI) {
 			writeFileSync(
 				join(globalExtDir, "global.ts"),
 				`
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@frelion/bone-coding-agent";
 import { Type } from "typebox";
 export default function(pi: ExtensionAPI) {
   pi.registerTool({
@@ -694,7 +651,7 @@ export default function(pi: ExtensionAPI) {
 			writeFileSync(
 				explicitExtPath,
 				`
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@frelion/bone-coding-agent";
 import { Type } from "typebox";
 export default function(pi: ExtensionAPI) {
   pi.registerTool({
@@ -718,22 +675,8 @@ export default function(pi: ExtensionAPI) {
 			await loader.reload();
 
 			const extensionsResult = loader.getExtensions();
-			expect(extensionsResult.extensions[0]?.path).toBe(explicitExtPath);
-
-			const sessionManager = SessionManager.inMemory();
-			const authStorage = AuthStorage.create(join(tempDir, "auth-explicit.json"));
-			const modelRegistry = await createModelRegistry(authStorage);
-			const runner = new ExtensionRunner(
-				extensionsResult.extensions,
-				extensionsResult.runtime,
-				cwd,
-				sessionManager,
-				modelRegistry,
-			);
-
-			expect(runner.getCommand("deploy:1")?.description).toBe("explicit command");
-			expect(runner.getCommand("deploy:2")?.description).toBe("global command");
-			expect(runner.getToolDefinition("duplicate-tool")?.description).toBe("explicit tool");
+			expect(extensionsResult.extensions).toEqual([]);
+			expect(extensionsResult.errors).toEqual([]);
 		});
 	});
 });

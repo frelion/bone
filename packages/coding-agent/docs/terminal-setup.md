@@ -1,6 +1,6 @@
 # Terminal Setup
 
-Pi uses the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) for reliable modifier key detection. Most modern terminals support this protocol, but some require configuration.
+Bone uses the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) for reliable modifier key detection. Most modern terminals support this protocol, but some require configuration.
 
 ## Kitty, iTerm2
 
@@ -8,9 +8,9 @@ Work out of the box.
 
 ## Apple Terminal
 
-Pi enables enhanced key reporting when available. If Terminal.app still sends plain Return for `Shift+Enter`, pi uses a local macOS modifier fallback to treat that Return as `Shift+Enter`.
+Bone enables enhanced key reporting when available. If Terminal.app still sends plain Return for `Shift+Enter`, Bone uses a local macOS modifier fallback to treat that Return as `Shift+Enter`.
 
-This fallback only works when pi runs on the same Mac as Terminal.app. It cannot detect the local keyboard over remote SSH.
+This fallback only works when Bone runs on the same Mac as Terminal.app. It cannot detect the local keyboard over remote SSH.
 
 ## Ghostty
 
@@ -26,11 +26,11 @@ Older Claude Code versions may have added this Ghostty mapping:
 keybind = shift+enter=text:\n
 ```
 
-That mapping sends a raw linefeed byte. Inside pi, that is indistinguishable from `Ctrl+J`, so tmux and pi no longer see a real `shift+enter` key event.
+That mapping sends a raw linefeed byte. Inside Bone, that is indistinguishable from `Ctrl+J`, so tmux and Bone no longer see a real `shift+enter` key event.
 
 If Claude Code 2.x or newer is the only reason you added that mapping, you can remove it, unless you want to use Claude Code in tmux, where it still requires that Ghostty mapping.
 
-Pi binds `Ctrl+J` as a default newline alias, so `Shift+Enter` keeps working in tmux via that remap without extra pi configuration.
+Bone binds `Ctrl+J` as a default newline alias, so `Shift+Enter` keeps working in tmux via that remap without extra Bone configuration.
 
 ## WezTerm
 
@@ -60,7 +60,7 @@ return config
 
 If you already have a `config.keys` table, add the entry to it.
 
-On WSL, WezTerm may require a visible hardware cursor for IME candidate window positioning. If CJK IME candidates do not follow the text cursor, set `PI_HARDWARE_CURSOR=1` before running pi or set `showHardwareCursor` to `true` in settings.
+On WSL, WezTerm may require a visible hardware cursor for IME candidate window positioning. If CJK IME candidates do not follow the text cursor, set `BONE_HARDWARE_CURSOR=1` before running pi or set `showHardwareCursor` to `true` in settings.
 
 ## Alacritty
 
@@ -137,6 +137,6 @@ For the best experience, use a terminal that supports the Kitty keyboard protoco
 
 The built-in terminal has limited escape sequence support. Shift+Enter cannot be distinguished from Enter in IntelliJ's terminal.
 
-If you want the hardware cursor visible, set `PI_HARDWARE_CURSOR=1` before running pi (disabled by default for compatibility).
+If you want the hardware cursor visible, set `BONE_HARDWARE_CURSOR=1` before running pi (disabled by default for compatibility).
 
 Consider using a dedicated terminal emulator for the best experience.

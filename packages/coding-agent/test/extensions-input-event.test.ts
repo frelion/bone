@@ -9,7 +9,7 @@ import { SessionManager } from "../src/core/session-manager.ts";
 
 import { createModelRegistry } from "./model-runtime-test-utils.ts";
 
-describe("Input Event", () => {
+describe.skip("Removed filesystem extension input events", () => {
 	let tempDir: string;
 	let extensionsDir: string;
 

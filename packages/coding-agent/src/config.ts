@@ -464,13 +464,13 @@ export function getBundledInteractiveAssetPath(name: string): string {
 }
 
 // =============================================================================
-// App Config (from package.json piConfig)
+// App Config (from package.json boneConfig)
 // =============================================================================
 
 interface PackageJson {
 	name?: string;
 	version?: string;
-	piConfig?: {
+	boneConfig?: {
 		name?: string;
 		configDir?: string;
 	};
@@ -484,11 +484,11 @@ try {
 	if (err.code !== "ENOENT") throw e;
 }
 
-const piConfigName: string | undefined = pkg.piConfig?.name;
+const boneConfigName: string | undefined = pkg.boneConfig?.name;
 export const PACKAGE_NAME: string = pkg.name || "bone";
-export const APP_NAME: string = piConfigName || "bone";
+export const APP_NAME: string = boneConfigName || "bone";
 export const APP_TITLE: string = APP_NAME;
-export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".bone";
+export const CONFIG_DIR_NAME: string = pkg.boneConfig?.configDir || ".bone";
 export const VERSION: string = pkg.version || "0.0.0";
 
 // e.g., BONE_CODING_AGENT_DIR or TAU_CODING_AGENT_DIR

@@ -1,4 +1,4 @@
-import { setKeybindings } from "@earendil-works/pi-tui";
+import { setKeybindings } from "@frelion/bone-tui";
 import { describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import { ChatHistoryFocus } from "../src/modes/interactive/components/chat-history-focus.ts";

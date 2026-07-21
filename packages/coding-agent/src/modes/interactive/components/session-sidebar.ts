@@ -6,7 +6,7 @@ import {
 	sliceByColumn,
 	truncateToWidth,
 	visibleWidth,
-} from "@earendil-works/pi-tui";
+} from "@frelion/bone-tui";
 import type { InteractiveSessionSummary } from "../../../core/interactive-session-host.ts";
 import type { MemorySearchResult } from "../../../core/memory.ts";
 import { theme } from "../theme/theme.ts";

@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { extname, relative, sep } from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "@frelion/bone-agent-core";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSessionEvent, PromptOptions } from "./agent-session.ts";
 import {

@@ -1,4 +1,4 @@
-import { type Api, createProvider, type Model, type Provider } from "@earendil-works/pi-ai";
+import { type Api, createProvider, type Model, type Provider } from "@frelion/bone-ai";
 import { describe, expect, it } from "vitest";
 import { deriveProviderPresets } from "../src/core/provider-presets.ts";
 

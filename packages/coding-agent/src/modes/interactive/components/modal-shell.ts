@@ -1,5 +1,5 @@
-import type { Component } from "@earendil-works/pi-tui";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import type { Component } from "@frelion/bone-tui";
+import { visibleWidth } from "@frelion/bone-tui";
 import { theme } from "../theme/theme.ts";
 import { fitLine } from "./terminal-layout.ts";
 

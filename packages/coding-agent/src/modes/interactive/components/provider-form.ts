@@ -1,11 +1,4 @@
-import {
-	type Component,
-	type Focusable,
-	fuzzyFilter,
-	getKeybindings,
-	Input,
-	truncateToWidth,
-} from "@earendil-works/pi-tui";
+import { type Component, type Focusable, fuzzyFilter, getKeybindings, Input, truncateToWidth } from "@frelion/bone-tui";
 import type { ModelsJsonModel, ModelsJsonModelOverride, ModelsJsonProvider } from "../../../core/model-config.ts";
 import type { ProviderPreset } from "../../../core/provider-presets.ts";
 import { theme } from "../theme/theme.ts";

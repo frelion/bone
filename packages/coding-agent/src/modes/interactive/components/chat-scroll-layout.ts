@@ -1,4 +1,4 @@
-import type { Component } from "@earendil-works/pi-tui";
+import type { Component } from "@frelion/bone-tui";
 import { ChatTextSelection } from "./chat-text-selection.ts";
 
 /** Keeps chat history scrollable while the composer and status area stay visible. */

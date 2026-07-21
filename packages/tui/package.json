@@ -1,5 +1,5 @@
 {
-	"name": "@earendil-works/pi-tui",
+	"name": "@frelion/bone-tui",
 	"version": "0.0.11",
 	"description": "Terminal User Interface library with differential rendering for efficient text-based applications",
 	"type": "module",

@@ -10,7 +10,7 @@ import {
 	streamSimple,
 	type ToolResultMessage,
 	validateToolArguments,
-} from "@earendil-works/pi-ai/compat";
+} from "@frelion/bone-ai/compat";
 import type {
 	AgentContext,
 	AgentEvent,

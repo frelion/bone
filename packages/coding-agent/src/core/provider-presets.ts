@@ -1,4 +1,4 @@
-import type { Api, Provider } from "@earendil-works/pi-ai";
+import type { Api, Provider } from "@frelion/bone-ai";
 
 /**
  * Non-sensitive provider metadata suitable for a selection UI or a draft

@@ -12,7 +12,7 @@
           "path": "quickstart.md"
         },
         {
-          "title": "Using Pi",
+          "title": "Using Bone",
           "path": "usage.md"
         },
         {
@@ -49,10 +49,6 @@
       "title": "Customization",
       "items": [
         {
-          "title": "Extensions",
-          "path": "extensions.md"
-        },
-        {
           "title": "Skills",
           "path": "skills.md"
         },
@@ -65,16 +61,8 @@
           "path": "themes.md"
         },
         {
-          "title": "Pi Packages",
-          "path": "packages.md"
-        },
-        {
           "title": "Custom Models",
           "path": "models.md"
-        },
-        {
-          "title": "Custom Providers",
-          "path": "custom-provider.md"
         }
       ]
     },
@@ -95,16 +83,8 @@
           "path": "sdk.md"
         },
         {
-          "title": "RPC Mode",
-          "path": "rpc.md"
-        },
-        {
           "title": "JSON Event Stream Mode",
           "path": "json.md"
-        },
-        {
-          "title": "TUI Components",
-          "path": "tui.md"
         }
       ]
     },

@@ -1,5 +1,5 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@frelion/bone-agent-core";
+import { fauxAssistantMessage } from "@frelion/bone-ai";
 import { describe, expect, it } from "vitest";
 import { buildConversationTitleContext } from "../src/core/conversation-title.ts";
 import type { SessionEntry } from "../src/core/session-manager.ts";

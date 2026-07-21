@@ -1,4 +1,4 @@
-import { extractAnsiCode, normalizeTerminalOutput, sliceByColumn, visibleWidth } from "@earendil-works/pi-tui";
+import { extractAnsiCode, normalizeTerminalOutput, sliceByColumn, visibleWidth } from "@frelion/bone-tui";
 
 export type ChatTextSelectionPoint = {
 	row: number;
