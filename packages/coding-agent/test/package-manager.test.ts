@@ -68,16 +68,22 @@ const isDisabled = (r: ResolvedResource, pathMatch: string, matchFn: "endsWith" 
 
 describe("DefaultPackageManager", () => {
 	let tempDir: string;
+	let testHomeDir: string;
 	let agentDir: string;
 	let settingsManager: SettingsManager;
 	let packageManager: DefaultPackageManager;
 	let previousOfflineEnv: string | undefined;
+	let previousHomeEnv: string | undefined;
 
 	beforeEach(() => {
 		previousOfflineEnv = process.env.BONE_OFFLINE;
+		previousHomeEnv = process.env.HOME;
 		delete process.env.BONE_OFFLINE;
 		tempDir = join(tmpdir(), `pm-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		testHomeDir = join(tmpdir(), `pm-home-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
+		mkdirSync(testHomeDir, { recursive: true });
+		process.env.HOME = testHomeDir;
 		agentDir = join(tempDir, "agent");
 		mkdirSync(agentDir, { recursive: true });
 
@@ -95,9 +101,15 @@ describe("DefaultPackageManager", () => {
 		} else {
 			process.env.BONE_OFFLINE = previousOfflineEnv;
 		}
+		if (previousHomeEnv === undefined) {
+			delete process.env.HOME;
+		} else {
+			process.env.HOME = previousHomeEnv;
+		}
 		vi.restoreAllMocks();
 		vi.unstubAllGlobals();
 		rmSync(tempDir, { recursive: true, force: true });
+		rmSync(testHomeDir, { recursive: true, force: true });
 	});
 
 	describe("resolve", () => {
