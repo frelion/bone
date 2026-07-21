@@ -83,4 +83,4 @@ jobs:
 
       - name: Verify semantic native runtime
         shell: bash
-        run: node scripts/verify-semantic-native.mjs --root packages/coding-agent/native/${{ matrix.target }} --target ${{ matrix.target }}
+        run: node scripts/verify-semantic-native.mjs --root packages/coding-agent/native --target ${{ matrix.target }}

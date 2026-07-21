@@ -122,7 +122,7 @@ jobs:
 
       - name: Verify semantic native runtime
         shell: bash
-        run: node scripts/verify-semantic-native.mjs --root packages/coding-agent/native/${{ matrix.target }} --target ${{ matrix.target }}
+        run: node scripts/verify-semantic-native.mjs --root packages/coding-agent/native --target ${{ matrix.target }}
 
       - name: Upload semantic native runtime
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

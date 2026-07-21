@@ -193,7 +193,7 @@ function publish(version) {
 		writeState(state);
 	}
 	assertClean();
-	const headCommit = state.headCommit ?? capture("git", ["rev-parse", "HEAD"]);
+	const headCommit = capture("git", ["rev-parse", "HEAD"]);
 	const nativeInputsChanged = Boolean(
 		capture("git", [
 			"diff",
