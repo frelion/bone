@@ -50,10 +50,6 @@ export function createOpenTUIDialogShell(
 	const status = context.createText({ content: "", fg: dialogTheme.getFgColor("warning"), wrapMode: "word" });
 	status.visible = false;
 	root.append(status);
-	if (options.footer) {
-		root.append(context.createSpacer({ size: 1, direction: "vertical" }));
-		root.append(context.createText({ content: options.footer, fg: dialogTheme.getFgColor("dim"), wrapMode: "word" }));
-	}
 	return { root, body, status };
 }
 

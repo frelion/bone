@@ -12,8 +12,8 @@ import { MemoryRuntime } from "../../core/memory.ts";
 import type { PlanProposal } from "../../core/plan-mode.ts";
 import type { QuestionAnswer, QuestionRequest } from "../../core/question.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
-import { OpenTUITopBar } from "./components/opentui-chrome.ts";
-import { OpenTUIComposer } from "./components/opentui-composer.ts";
+import { OpenTUITopBar, OpenTUIWelcome } from "./components/opentui-chrome.ts";
+import { OpenTUIComposer, type OpenTUIComposerStatus } from "./components/opentui-composer.ts";
 import { OpenTUIStatusView } from "./components/opentui-rich-messages.ts";
 import { OpenTUISessionSidebar } from "./components/opentui-session-sidebar.ts";
 import { OpenTUITranscriptFactory } from "./components/opentui-transcript-factory.ts";
@@ -61,6 +61,12 @@ export interface OpenTUISessionHostContract {
 		limit: number,
 	): Promise<{ sessions: InteractiveSessionSummary[]; total: number; hasMore: boolean; nextOffset: number }>;
 	getSessionState(sessionPath: string): InteractiveSessionSummary["state"];
+	getSessionPresentation(
+		sessionPath: string,
+	): Pick<
+		InteractiveSessionSummary,
+		"state" | "livePreview" | "throughputTokensPerSecond" | "messageCount" | "modified"
+	>;
 	getSessionSummaries(paths: readonly string[]): Promise<InteractiveSessionSummary[]>;
 	disposeAll(): Promise<void>;
 }
@@ -116,6 +122,7 @@ export class OpenTUIInteractiveMode {
 	private shell: OpenTUIInteractiveShell | undefined;
 	private composer: OpenTUIComposer | undefined;
 	private topBar: OpenTUITopBar | undefined;
+	private welcome: OpenTUIWelcome | undefined;
 	private sidebar: OpenTUISessionSidebar | undefined;
 	private paneFocus: OpenTUIPaneFocusController | undefined;
 	private transcriptFocus: OpenTUITranscriptFocusController | undefined;
@@ -142,6 +149,7 @@ export class OpenTUIInteractiveMode {
 	private foregroundGeneration = 0;
 	private reviewingPlanProposalId: string | undefined;
 	private reviewingQuestionRequestId: string | undefined;
+	private allToolDetailsExpanded = false;
 	private planInteractionAbort: AbortController | undefined;
 	private questionInteractionAbort: AbortController | undefined;
 	private initialized = false;
@@ -218,7 +226,9 @@ export class OpenTUIInteractiveMode {
 	async init(): Promise<void> {
 		if (this.initialized) return;
 		this.renderer = await (this.options.createRenderer ?? (() => createBoneRenderer()))();
-		this.shell = new OpenTUIInteractiveShell();
+		const settingsManager = this.sessionHost.current.services.settingsManager;
+		this.shell = new OpenTUIInteractiveShell({ sidebarWidth: settingsManager.getSidebarWidth() });
+		this.shell.onSidebarWidthChange = (width) => settingsManager.setSidebarWidth(width);
 		this.renderer.mount(this.shell);
 
 		this.sidebar = new OpenTUISessionSidebar();
@@ -232,6 +242,7 @@ export class OpenTUIInteractiveMode {
 		this.renderer.mount(this.topBar, regions.header);
 		this.renderer.mount(this.status, regions.aboveEditor);
 		this.composer = new OpenTUIComposer({
+			status: this.getComposerStatus(this.sessionHost.current),
 			autocompleteProvider: this.options.autocompleteProvider ?? this.commandRouter.createAutocompleteProvider(),
 			onSubmit: (text) => {
 				this.submissionTail = this.submissionTail.then(async () => this.submit(text));
@@ -251,6 +262,10 @@ export class OpenTUIInteractiveMode {
 		this.transcriptFocus.onFocusComposer = () => this.paneFocus?.focus("composer");
 		this.transcriptFocus.onInterrupt = () => void this.abortOrClear();
 		this.transcriptFocus.onExit = () => this.stop();
+		this.shell.onTranscriptScrollRequest = (delta) => this.transcriptFocus?.scrollByUser(delta);
+		this.shell.onTranscriptContentChange = () => {
+			if (this.transcriptFocus?.isAutoFollowing()) this.transcriptFocus.followLatest();
+		};
 		this.paneFocus.register("transcript", this.transcriptFocus.toPane());
 		this.paneFocus.register("sidebar", {
 			node: sidebarNode,
@@ -271,6 +286,14 @@ export class OpenTUIInteractiveMode {
 			onFocusChange: (focused) => (focused ? this.composer?.focus() : this.composer?.blur()),
 		});
 		this.unsubscribeApplicationKeys = this.renderer.onKey((event) => {
+			if (matchesOpenTUIAction(event, "toggleToolDetails")) {
+				event.preventDefault();
+				event.stopPropagation();
+				this.allToolDetailsExpanded = !this.allToolDetailsExpanded;
+				this.transcriptFactory.setAllToolDetailsExpanded(this.allToolDetailsExpanded);
+				this.renderer?.requestRender();
+				return;
+			}
 			if (this.paneFocus?.focusedPane !== "composer") return;
 			if (matchesOpenTUIAction(event, "clear")) {
 				event.preventDefault();
@@ -393,6 +416,7 @@ export class OpenTUIInteractiveMode {
 		this.composer?.setAutocompleteProvider(
 			this.options.autocompleteProvider ?? this.commandRouter.createAutocompleteProvider(runtime.cwd),
 		);
+		this.composer?.updateStatus(this.getComposerStatus(runtime));
 		await this.renderTranscript(runtime);
 		this.unsubscribeSession = runtime.session.subscribe((event) => {
 			this.eventTail = this.eventTail
@@ -457,6 +481,7 @@ export class OpenTUIInteractiveMode {
 	private async renderTranscript(runtime: AgentSessionRuntime): Promise<void> {
 		if (!this.shell) return;
 		this.shell.clearTranscript();
+		this.welcome = undefined;
 		this.transcriptFactory =
 			this.options.createTranscriptFactory?.() ??
 			new OpenTUITranscriptFactory({
@@ -479,9 +504,16 @@ export class OpenTUIInteractiveMode {
 				});
 			},
 		});
-		for (const entry of runtime.session.sessionManager.getEntries()) {
-			const item = await this.transcriptFactory.createSessionEntry(entry);
-			if (item) this.shell.appendTranscript(item.view);
+		this.transcriptFactory.setAllToolDetailsExpanded(this.allToolDetailsExpanded);
+		const entries = runtime.session.sessionManager.getEntries();
+		for (const item of await this.transcriptFactory.createSessionEntries(entries))
+			this.shell.appendTranscript(item.view);
+		const hasConversationMessages = entries.some(
+			(entry) => entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant"),
+		);
+		if (!hasConversationMessages) {
+			this.welcome = new OpenTUIWelcome({ workspace: runtime.cwd });
+			this.shell.appendTranscript(this.welcome);
 		}
 	}
 
@@ -498,6 +530,10 @@ export class OpenTUIInteractiveMode {
 
 	private async handleSessionEvent(runtime: AgentSessionRuntime, event: AgentSessionEvent): Promise<void> {
 		if (runtime !== this.sessionHost.current || !this.shell) return;
+		if (event.type === "message_start" && event.message.role === "user") {
+			this.welcome?.dismiss();
+			this.welcome = undefined;
+		}
 		switch (event.type) {
 			case "agent_start":
 				this.status?.setMessage("Working...");
@@ -516,8 +552,17 @@ export class OpenTUIInteractiveMode {
 		}
 		const mutation = await this.transcriptFactory.handleEvent(event);
 		if (mutation.type === "append") this.shell.appendTranscript(mutation.item.view);
+		if (this.transcriptFocus?.isAutoFollowing()) this.transcriptFocus.followLatest();
 		if (event.type === "session_info_changed" || event.type === "thinking_level_changed") {
 			this.topBar?.update(this.getTopBarState(runtime));
+		}
+		if (
+			event.type === "agent_start" ||
+			event.type === "agent_end" ||
+			event.type === "agent_settled" ||
+			event.type === "thinking_level_changed"
+		) {
+			this.composer?.updateStatus(this.getComposerStatus(runtime));
 		}
 		this.renderer?.requestRender();
 		if (event.type === "question_asked") {
@@ -771,6 +816,23 @@ export class OpenTUIInteractiveMode {
 		};
 	}
 
+	private getComposerStatus(runtime: AgentSessionRuntime): OpenTUIComposerStatus {
+		const model = runtime.session.model;
+		const usage = runtime.session.getContextUsage?.();
+		const remaining = usage?.percent === null || usage?.percent === undefined ? undefined : 100 - usage.percent;
+		const sessionPath = runtime.session.sessionFile;
+		const throughput = sessionPath
+			? this.sessionHost.getSessionPresentation(sessionPath).throughputTokensPerSecond
+			: undefined;
+		return {
+			cwd: basename(runtime.cwd) || runtime.cwd,
+			model: model ? `${model.provider}/${model.id}` : "No model",
+			thinking: runtime.session.thinkingLevel ?? "off",
+			contextRemaining: remaining === undefined ? "--" : `${Math.max(0, Math.round(remaining))}%`,
+			foregroundThroughput: throughput ? `${throughput.toFixed(1)} t/s` : "",
+		};
+	}
+
 	private async submit(text: string, options?: PromptOptions): Promise<void> {
 		const value = text.trim();
 		if (!value) return;
@@ -819,9 +881,10 @@ export class OpenTUIInteractiveMode {
 	private refreshSidebarStates(): void {
 		this.sidebarSessions = this.sidebarSessions.map((session) => ({
 			...session,
-			state: this.sessionHost.getSessionState(session.path),
+			...this.sessionHost.getSessionPresentation(session.path),
 		}));
 		this.sidebar?.setSessions(this.sidebarSessions);
+		this.composer?.updateStatus(this.getComposerStatus(this.sessionHost.current));
 		this.renderer?.requestRender();
 	}
 
@@ -1010,6 +1073,7 @@ export class OpenTUIInteractiveMode {
 			this.unsubscribeApplicationKeys = undefined;
 			this.paneFocus?.dispose();
 			this.topBar?.dispose();
+			this.sidebar?.dispose();
 			this.shell?.dispose();
 			this.composer?.destroy();
 			this.renderer?.stop();

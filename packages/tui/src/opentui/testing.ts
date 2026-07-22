@@ -29,6 +29,10 @@ class BoneTestRendererImpl extends BoneRendererImpl implements BoneTestRenderer 
 				const nativeButton = button === "left" ? 0 : button === "middle" ? 1 : 2;
 				return setup.mockMouse.click(x, y, nativeButton);
 			},
+			drag: (startX, startY, endX, endY, button = "left") => {
+				const nativeButton = button === "left" ? 0 : button === "middle" ? 1 : 2;
+				return setup.mockMouse.drag(startX, startY, endX, endY, nativeButton);
+			},
 			scroll: (x, y, direction) => setup.mockMouse.scroll(x, y, direction),
 		};
 	}

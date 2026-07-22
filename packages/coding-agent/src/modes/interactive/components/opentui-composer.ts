@@ -11,14 +11,16 @@ import type {
 	BoneTextNode,
 	BoneView,
 } from "@frelion/bone-tui";
+import { OPEN_TUI_COLORS } from "../opentui-design.ts";
 import { matchesOpenTUIAction } from "../opentui-keymap.ts";
-import { type Theme, theme } from "../theme/theme.ts";
+import type { Theme } from "../theme/theme.ts";
 
 const MAX_HISTORY_SIZE = 100;
 const DEFAULT_AUTOCOMPLETE_ROWS = 5;
 
 export interface OpenTUIComposerOptions {
 	placeholder?: string;
+	status?: Partial<OpenTUIComposerStatus>;
 	history?: readonly string[];
 	autocompleteProvider?: AutocompleteProvider;
 	autocompleteMaxVisible?: number;
@@ -27,6 +29,22 @@ export interface OpenTUIComposerOptions {
 	onSubmit?: (value: string) => void;
 	onCancel?: () => void;
 }
+
+export interface OpenTUIComposerStatus {
+	cwd: string;
+	model: string;
+	thinking: string;
+	contextRemaining: string;
+	foregroundThroughput: string;
+}
+
+const DEFAULT_STATUS: OpenTUIComposerStatus = {
+	cwd: ".",
+	model: "No model",
+	thinking: "off",
+	contextRemaining: "--",
+	foregroundThroughput: "idle",
+};
 
 function consume(event: BoneKeyEvent): true {
 	event.preventDefault();
@@ -58,8 +76,8 @@ export class OpenTUIComposer implements BoneView {
 	public onChange: ((value: string) => void) | undefined;
 	public onSubmit: ((value: string) => void) | undefined;
 	public onCancel: (() => void) | undefined;
-	private composerTheme: Theme;
 	private placeholderValue: string;
+	private status: OpenTUIComposerStatus;
 	private autocompleteProvider: AutocompleteProvider | undefined;
 	private readonly autocompleteMaxVisible: number;
 	private history: string[];
@@ -67,7 +85,8 @@ export class OpenTUIComposer implements BoneView {
 	private historyDraft = "";
 	private root: BoneContainerNode | undefined;
 	private promptRoot: BoneContainerNode | undefined;
-	private focusMarker: BoneTextNode | undefined;
+	private statusLeft: BoneTextNode | undefined;
+	private statusRight: BoneTextNode | undefined;
 	private textarea: BoneTextareaNode | undefined;
 	private autocomplete: BoneSelectNode<AutocompleteItem> | undefined;
 	private autocompleteSuggestions: AutocompleteSuggestions | undefined;
@@ -79,8 +98,8 @@ export class OpenTUIComposer implements BoneView {
 	private destroyed = false;
 
 	constructor(options: OpenTUIComposerOptions = {}) {
-		this.composerTheme = options.theme ?? theme;
-		this.placeholderValue = options.placeholder ?? "Message Bone";
+		this.placeholderValue = options.placeholder ?? "Ask anything";
+		this.status = { ...DEFAULT_STATUS, ...options.status };
 		this.autocompleteProvider = options.autocompleteProvider;
 		const autocompleteRows = options.autocompleteMaxVisible ?? DEFAULT_AUTOCOMPLETE_ROWS;
 		this.autocompleteMaxVisible = Number.isFinite(autocompleteRows)
@@ -127,19 +146,17 @@ export class OpenTUIComposer implements BoneView {
 		autocomplete.visible = false;
 		const promptRoot = context.createBox({
 			width: "100%",
-			flexDirection: "row",
+			flexDirection: "column",
 			paddingX: 1,
-			gap: 1,
-			backgroundColor: this.composerTheme.getBgColor("customMessageBg"),
+			border: true,
+			borderStyle: "rounded",
+			borderColor: OPEN_TUI_COLORS.border,
+			backgroundColor: OPEN_TUI_COLORS.page,
 			onMouseDown: () => this.focus(),
 		});
-		const focusMarker = context.createText({
-			content: "›",
-			fg: this.composerTheme.getFgColor("muted"),
-			flexShrink: 0,
-		});
 		const textarea = context.createTextarea({
-			flexGrow: 1,
+			width: "100%",
+			height: 1,
 			minWidth: 0,
 			minHeight: 1,
 			maxHeight: 8,
@@ -155,15 +172,41 @@ export class OpenTUIComposer implements BoneView {
 			onSubmit: () => this.submit(),
 			onCancel: () => this.cancel(),
 		});
+		const statusRow = context.createBox({
+			width: "100%",
+			height: 1,
+			flexDirection: "row",
+			alignItems: "center",
+		});
+		const statusLeft = context.createText({
+			content: "",
+			fg: OPEN_TUI_COLORS.muted,
+			truncate: true,
+			flexGrow: 1,
+			minWidth: 0,
+			height: 1,
+		});
+		const statusRight = context.createText({
+			content: "",
+			fg: OPEN_TUI_COLORS.dim,
+			truncate: true,
+			flexShrink: 1,
+			minWidth: 0,
+			height: 1,
+		});
+		statusRow.append(statusLeft);
+		statusRow.append(statusRight);
 		root.append(autocomplete);
-		promptRoot.append(focusMarker);
 		promptRoot.append(textarea);
+		promptRoot.append(statusRow);
 		root.append(promptRoot);
 		this.root = root;
 		this.promptRoot = promptRoot;
-		this.focusMarker = focusMarker;
+		this.statusLeft = statusLeft;
+		this.statusRight = statusRight;
 		this.autocomplete = autocomplete;
 		this.textarea = textarea;
+		this.refreshStatus();
 		this.refreshFocusStyle();
 		return root;
 	}
@@ -242,6 +285,11 @@ export class OpenTUIComposer implements BoneView {
 		if (this.textarea && !this.textarea.destroyed) this.textarea.placeholder = placeholder;
 	}
 
+	updateStatus(status: Partial<OpenTUIComposerStatus>): void {
+		this.status = { ...this.status, ...status };
+		this.refreshStatus();
+	}
+
 	setHistory(history: readonly string[]): void {
 		this.history = history
 			.map((entry) => entry.trim())
@@ -262,12 +310,13 @@ export class OpenTUIComposer implements BoneView {
 		this.closeAutocomplete();
 	}
 
-	updateTheme(nextTheme: Theme): void {
-		this.composerTheme = nextTheme;
+	updateTheme(_nextTheme: Theme): void {
 		if (this.nativeDestroyed) return;
-		this.promptRoot?.updateStyle({ backgroundColor: nextTheme.getBgColor("customMessageBg") });
+		this.promptRoot?.updateStyle({ borderColor: this.focused ? OPEN_TUI_COLORS.primary : OPEN_TUI_COLORS.border });
 		this.textarea?.updateStyle(this.textareaStyle());
 		this.autocomplete?.updateStyle(this.selectStyle());
+		this.statusLeft?.updateStyle({ fg: OPEN_TUI_COLORS.muted });
+		this.statusRight?.updateStyle({ fg: OPEN_TUI_COLORS.dim });
 		this.refreshFocusStyle();
 	}
 
@@ -284,28 +333,29 @@ export class OpenTUIComposer implements BoneView {
 
 	private textareaStyle() {
 		return {
-			textColor: this.composerTheme.getFgColor("text"),
-			focusedTextColor: this.composerTheme.getFgColor("text"),
-			placeholderColor: this.composerTheme.getFgColor("muted"),
-			cursorColor: this.composerTheme.getFgColor("accent"),
+			textColor: OPEN_TUI_COLORS.text,
+			focusedTextColor: OPEN_TUI_COLORS.text,
+			placeholderColor: OPEN_TUI_COLORS.muted,
+			cursorColor: OPEN_TUI_COLORS.primary,
 			showCursor: true,
 		} as const;
 	}
 
 	private selectStyle() {
 		return {
-			textColor: this.composerTheme.getFgColor("text"),
-			focusedTextColor: this.composerTheme.getFgColor("text"),
-			selectedBackgroundColor: this.composerTheme.getBgColor("selectedBg"),
-			selectedTextColor: this.composerTheme.getFgColor("text"),
-			descriptionColor: this.composerTheme.getFgColor("muted"),
-			selectedDescriptionColor: this.composerTheme.getFgColor("muted"),
+			textColor: OPEN_TUI_COLORS.text,
+			focusedTextColor: OPEN_TUI_COLORS.text,
+			selectedBackgroundColor: OPEN_TUI_COLORS.selection,
+			selectedTextColor: OPEN_TUI_COLORS.selectionText,
+			descriptionColor: OPEN_TUI_COLORS.muted,
+			selectedDescriptionColor: OPEN_TUI_COLORS.muted,
 		} as const;
 	}
 
 	private handleTextChange(value: string): void {
 		if (this.internalChange) return;
 		this.currentValue = value;
+		this.refreshTextareaHeight(value);
 		this.exitHistory();
 		this.onChange?.(value);
 		void this.requestAutocomplete(false);
@@ -322,16 +372,30 @@ export class OpenTUIComposer implements BoneView {
 		this.internalChange = true;
 		textarea.value = value;
 		textarea.setCursorOffset(Math.max(0, Math.min(cursor, value.length)));
+		this.refreshTextareaHeight(value);
 		this.internalChange = false;
 		if (changed && notify) this.onChange?.(value);
 	}
 
+	private refreshTextareaHeight(value: string): void {
+		if (!this.textarea || this.textarea.destroyed) return;
+		this.textarea.updateLayout({ height: Math.min(8, Math.max(1, value.split("\n").length)) });
+	}
+
 	private refreshFocusStyle(): void {
-		if (!this.focusMarker || this.focusMarker.destroyed) return;
-		this.focusMarker.updateStyle({
-			fg: this.composerTheme.getFgColor(this.focused ? "accent" : "muted"),
-			bold: this.focused,
+		if (!this.promptRoot || this.promptRoot.destroyed) return;
+		this.promptRoot.updateStyle({
+			borderColor: this.focused ? OPEN_TUI_COLORS.primary : OPEN_TUI_COLORS.border,
 		});
+	}
+
+	private refreshStatus(): void {
+		if (this.statusLeft && !this.statusLeft.destroyed) {
+			this.statusLeft.content = `${this.status.cwd}  ${this.status.model}  ${this.status.thinking}`;
+		}
+		if (this.statusRight && !this.statusRight.destroyed) {
+			this.statusRight.content = `${this.status.contextRemaining} left  ${this.status.foregroundThroughput}`;
+		}
 	}
 
 	private insertNewline(): void {

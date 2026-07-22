@@ -16,6 +16,16 @@ export type InteractiveSessionState = "foreground" | "background-running" | "bac
 
 export interface InteractiveSessionSummary extends SessionInfo {
 	state: InteractiveSessionState;
+	livePreview?: string;
+	throughputTokensPerSecond?: number;
+}
+
+export interface InteractiveSessionPresentation {
+	state: InteractiveSessionState;
+	livePreview?: string;
+	throughputTokensPerSecond?: number;
+	messageCount: number;
+	modified: Date;
 }
 
 export type InteractiveSessionDeletionResult = { method: SessionTrashMethod } | { method: "discarded" };
@@ -29,6 +39,11 @@ interface RuntimeSlot {
 	unsubscribe: () => void;
 	unsubscribePersistedEntries: () => void;
 	unsubscribeRunCompleted: () => void;
+	livePreview: string | undefined;
+	messageCount: number;
+	modified: Date;
+	generationStartedAt: number | undefined;
+	streamedCharacters: number;
 }
 
 function extractText(content: unknown): string {
@@ -46,6 +61,13 @@ function extractText(content: unknown): string {
 		)
 		.map((part) => part.text)
 		.join(" ");
+}
+
+function normalizeLivePreview(text: string): string {
+	return text
+		.replace(/[\r\n\t]+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
 }
 
 export interface InteractiveSessionHostHooks {
@@ -76,6 +98,8 @@ export class InteractiveSessionHost {
 	private hooks: InteractiveSessionHostHooks = {};
 	private transition: Promise<void> = Promise.resolve();
 	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
+	private readonly presentationByPath = new Map<string, Omit<InteractiveSessionPresentation, "state">>();
+	private presentationRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 
 	constructor(initialRuntime: AgentSessionRuntime, createRuntime: CreateAgentSessionRuntimeFactory) {
 		this.createRuntime = createRuntime;
@@ -202,14 +226,7 @@ export class InteractiveSessionHost {
 			}
 			sessions.unshift(this.createRuntimeSessionInfo(slot.runtime, sessionPath));
 		}
-		return sessions.map((session) => {
-			const path = this.normalizeSessionPath(session.path);
-			const background = this.background.get(path);
-			return {
-				...session,
-				state: path === currentPath ? "foreground" : (background?.state ?? "cold"),
-			};
-		});
+		return sessions.map((session) => this.decorateSessionInfo(session, currentPath));
 	}
 
 	async listPage(
@@ -235,14 +252,40 @@ export class InteractiveSessionHost {
 
 	private decorateSessionInfo(session: SessionInfo, currentPath: string | undefined): InteractiveSessionSummary {
 		const path = this.normalizeSessionPath(session.path);
-		const background = this.background.get(path);
-		return { ...session, state: path === currentPath ? "foreground" : (background?.state ?? "cold") };
+		const slot = this.findLiveSlot(path);
+		const presentation = slot
+			? this.presentationForSlot(slot)
+			: (this.presentationByPath.get(path) ?? {
+					livePreview: session.lastMessage,
+					throughputTokensPerSecond: undefined,
+					messageCount: session.messageCount,
+					modified: session.modified,
+				});
+		this.presentationByPath.set(path, presentation);
+		return {
+			...session,
+			...presentation,
+			path,
+			state: path === currentPath ? "foreground" : (this.background.get(path)?.state ?? "cold"),
+		};
 	}
 
 	getSessionState(sessionPath: string): InteractiveSessionState {
 		const path = this.normalizeSessionPath(sessionPath);
 		if (path === this.getSessionPath(this.current)) return "foreground";
 		return this.background.get(path)?.state ?? "cold";
+	}
+
+	getSessionPresentation(sessionPath: string): InteractiveSessionPresentation {
+		const path = this.normalizeSessionPath(sessionPath);
+		const slot = this.findLiveSlot(path);
+		const recent = slot ? this.presentationForSlot(slot) : this.presentationByPath.get(path);
+		return {
+			state: this.getSessionState(path),
+			...recent,
+			messageCount: recent?.messageCount ?? 0,
+			modified: recent?.modified ?? new Date(0),
+		};
 	}
 
 	async getSessionSummaries(paths: readonly string[]): Promise<InteractiveSessionSummary[]> {
@@ -255,6 +298,8 @@ export class InteractiveSessionHost {
 
 	async disposeAll(): Promise<void> {
 		return this.enqueue(async () => {
+			if (this.presentationRefreshTimer) clearTimeout(this.presentationRefreshTimer);
+			this.presentationRefreshTimer = undefined;
 			const slots = [this.foreground, ...this.background.values()];
 			this.background.clear();
 			for (const slot of slots) {
@@ -289,6 +334,14 @@ export class InteractiveSessionHost {
 	}
 
 	private createSlot(runtime: AgentSessionRuntime, state: Exclude<InteractiveSessionState, "cold">): RuntimeSlot {
+		const messages = runtime.session.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "message")
+			.map((entry) => entry.message)
+			.filter((message) => message.role === "user" || message.role === "assistant");
+		const latestMessage = [...messages].reverse().find((message) => extractText(message.content).trim().length > 0);
+		const latestTimestamp = messages.at(-1)?.timestamp;
+		const headerTimestamp = runtime.session.sessionManager.getHeader()?.timestamp;
 		const slot: RuntimeSlot = {
 			runtime,
 			state,
@@ -298,6 +351,16 @@ export class InteractiveSessionHost {
 			unsubscribe: () => {},
 			unsubscribePersistedEntries: () => {},
 			unsubscribeRunCompleted: () => {},
+			livePreview: latestMessage ? normalizeLivePreview(extractText(latestMessage.content)) : undefined,
+			messageCount: messages.length,
+			modified:
+				typeof latestTimestamp === "number"
+					? new Date(latestTimestamp)
+					: headerTimestamp
+						? new Date(headerTimestamp)
+						: new Date(),
+			generationStartedAt: runtime.session.isStreaming ? Date.now() : undefined,
+			streamedCharacters: 0,
 		};
 		const subscribe = () =>
 			runtime.session.subscribe((event) => {
@@ -325,9 +388,76 @@ export class InteractiveSessionHost {
 	}
 
 	private handleRuntimeEvent(slot: RuntimeSlot, event: AgentSessionEvent): void {
+		const now = Date.now();
+		if (event.type === "agent_start") {
+			slot.generationStartedAt = now;
+			slot.streamedCharacters = 0;
+			slot.modified = new Date(now);
+			this.publishPresentation(slot, true);
+		} else if (event.type === "message_start") {
+			if (event.message.role === "user" || event.message.role === "assistant") {
+				slot.messageCount = (slot.messageCount ?? 0) + 1;
+				const text = normalizeLivePreview(extractText(event.message.content));
+				if (text) slot.livePreview = text;
+				slot.modified = new Date(now);
+				this.publishPresentation(slot);
+			}
+		} else if (event.type === "message_update") {
+			if (event.assistantMessageEvent.type === "text_delta") {
+				slot.streamedCharacters += event.assistantMessageEvent.delta.length;
+				const text = normalizeLivePreview(extractText(event.assistantMessageEvent.partial.content));
+				if (text) slot.livePreview = text;
+				slot.modified = new Date(now);
+				this.publishPresentation(slot);
+			}
+		} else if (event.type === "message_end") {
+			if (event.message.role === "user" || event.message.role === "assistant") {
+				const text = normalizeLivePreview(extractText(event.message.content));
+				if (text) slot.livePreview = text;
+				slot.modified = new Date(now);
+				this.publishPresentation(slot);
+			}
+		} else if (event.type === "agent_end" || event.type === "agent_settled") {
+			slot.generationStartedAt = undefined;
+			slot.modified = new Date(now);
+			this.publishPresentation(slot, true);
+		}
 		if (slot.state === "background-running" && event.type === "agent_settled") {
 			this.scheduleBackgroundSuspend(slot);
 		}
+	}
+
+	private presentationForSlot(slot: RuntimeSlot): Omit<InteractiveSessionPresentation, "state"> {
+		const elapsedSeconds =
+			slot.generationStartedAt !== undefined ? (Date.now() - slot.generationStartedAt) / 1000 : 0;
+		const throughputTokensPerSecond =
+			elapsedSeconds > 0.2 && slot.streamedCharacters > 0 ? slot.streamedCharacters / 4 / elapsedSeconds : undefined;
+		return {
+			livePreview: slot.livePreview,
+			throughputTokensPerSecond,
+			messageCount: slot.messageCount,
+			modified: slot.modified,
+		};
+	}
+
+	private publishPresentation(slot: RuntimeSlot, immediate = false): void {
+		const path = this.getSessionPath(slot.runtime);
+		if (path) this.presentationByPath.set(path, this.presentationForSlot(slot));
+		if (immediate) {
+			if (this.presentationRefreshTimer) clearTimeout(this.presentationRefreshTimer);
+			this.presentationRefreshTimer = undefined;
+			this.hooks.stateChanged?.(false);
+			return;
+		}
+		if (this.presentationRefreshTimer) return;
+		this.presentationRefreshTimer = setTimeout(() => {
+			this.presentationRefreshTimer = undefined;
+			for (const liveSlot of [this.foreground, ...this.background.values()]) {
+				const livePath = this.getSessionPath(liveSlot.runtime);
+				if (livePath) this.presentationByPath.set(livePath, this.presentationForSlot(liveSlot));
+			}
+			this.hooks.stateChanged?.(false);
+		}, 250);
 	}
 
 	private async activateWithinTransition(sessionPath: string, options?: { cwdOverride?: string }): Promise<void> {

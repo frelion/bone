@@ -139,4 +139,26 @@ describe("OpenTUI interactive shell", () => {
 			"CONVERSATIONS",
 		);
 	});
+
+	test("constrains sidebar resizing and emits persisted widths", async () => {
+		initTheme("dark");
+		const renderer = await createBoneTestRenderer({ width: 120, height: 24 });
+		renderers.add(renderer);
+		renderer.start();
+		const shell = new OpenTUIInteractiveShell();
+		const onSidebarWidthChange = vi.fn();
+		shell.onSidebarWidthChange = onSidebarWidthChange;
+		renderer.mount(shell);
+		shell.setSidebar(textView("CONVERSATIONS"));
+
+		shell.setSidebarWidth(50, true);
+
+		expect(shell.sidebarWidth).toBe(50);
+		expect(shell.layoutMode).toBe("split");
+		expect(onSidebarWidthChange).toHaveBeenLastCalledWith(50);
+
+		shell.setSidebarWidth(90, true);
+		expect(shell.sidebarWidth).toBe(60);
+		expect(onSidebarWidthChange).toHaveBeenLastCalledWith(60);
+	});
 });

@@ -106,8 +106,16 @@ function applyLayout(node: Renderable, layout: BoneLayout): void {
 
 function withoutBoneInteractions<Options extends BoneNodeOptions>(
 	options: Options,
-): Omit<Options, "onMouseDown" | "onMouseScroll"> {
-	const { onMouseDown: _onMouseDown, onMouseScroll: _onMouseScroll, ...nativeOptions } = options;
+): Omit<Options, "onMouseDown" | "onMouseDrag" | "onMouseDragEnd" | "onMouseOver" | "onMouseOut" | "onMouseScroll"> {
+	const {
+		onMouseDown: _onMouseDown,
+		onMouseDrag: _onMouseDrag,
+		onMouseDragEnd: _onMouseDragEnd,
+		onMouseOver: _onMouseOver,
+		onMouseOut: _onMouseOut,
+		onMouseScroll: _onMouseScroll,
+		...nativeOptions
+	} = options;
 	return nativeOptions;
 }
 
@@ -119,6 +127,10 @@ abstract class NodeFacade<T extends Renderable> implements BoneNode {
 		nativeNodes.set(this, native);
 		applyLayout(native, layout);
 		if (layout.onMouseDown) native.onMouseDown = (event) => layout.onMouseDown?.(toBoneMouseEvent(event));
+		if (layout.onMouseDrag) native.onMouseDrag = (event) => layout.onMouseDrag?.(toBoneMouseEvent(event));
+		if (layout.onMouseDragEnd) native.onMouseDragEnd = (event) => layout.onMouseDragEnd?.(toBoneMouseEvent(event));
+		if (layout.onMouseOver) native.onMouseOver = (event) => layout.onMouseOver?.(toBoneMouseEvent(event));
+		if (layout.onMouseOut) native.onMouseOut = (event) => layout.onMouseOut?.(toBoneMouseEvent(event));
 		if (layout.onMouseScroll) native.onMouseScroll = (event) => layout.onMouseScroll?.(toBoneMouseEvent(event));
 	}
 
@@ -136,6 +148,31 @@ abstract class NodeFacade<T extends Renderable> implements BoneNode {
 
 	get destroyed(): boolean {
 		return this.native.isDestroyed;
+	}
+
+	get effectivelyVisible(): boolean {
+		let current: Renderable | null = this.native;
+		while (current) {
+			if (!current.visible || current.isDestroyed) return false;
+			current = current.parent;
+		}
+		return true;
+	}
+
+	get screenX(): number {
+		return this.native.screenX;
+	}
+
+	get screenY(): number {
+		return this.native.screenY;
+	}
+
+	get width(): number {
+		return this.native.width;
+	}
+
+	get height(): number {
+		return this.native.height;
 	}
 
 	updateLayout(layout: BoneLayout): void {
@@ -269,6 +306,10 @@ class ScrollViewFacade extends ContainerFacade<ScrollBoxRenderable> implements B
 
 	set scrollLeft(value: number) {
 		this.native.scrollLeft = value;
+	}
+
+	get viewportHeight(): number {
+		return this.native.height;
 	}
 
 	get scrollHeight(): number {

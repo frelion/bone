@@ -63,6 +63,28 @@ describe("OpenTUI Bone renderer", () => {
 		assert.match(renderer.captureFrame(), /line-11/);
 	});
 
+	it("exposes computed geometry and ancestor-aware visibility", async () => {
+		const renderer = await createRenderer(30, 8);
+		const parent = renderer.createBox({ width: 20, height: 4, paddingLeft: 2 });
+		const child = renderer.createText({ content: "child", width: 10, height: 1 });
+		parent.append(child);
+		renderer.content.append(parent);
+		await renderer.flush();
+
+		assert.equal(child.width, 10);
+		assert.equal(child.height, 1);
+		assert.ok(child.screenX >= parent.screenX);
+		assert.ok(child.screenY >= parent.screenY);
+		assert.equal(child.visible, true);
+		assert.equal(child.effectivelyVisible, true);
+
+		parent.visible = false;
+		assert.equal(child.visible, true);
+		assert.equal(child.effectivelyVisible, false);
+		parent.visible = true;
+		assert.equal(child.effectivelyVisible, true);
+	});
+
 	it("renders a flex-grown transcript beside fixed chrome", async () => {
 		const renderer = await createRenderer(80, 16);
 		const shell = renderer.createBox({ width: "100%", height: "100%", flexDirection: "column" });
@@ -243,9 +265,10 @@ describe("OpenTUI Bone renderer", () => {
 		assert.equal(cancelled, 1);
 	});
 
-	it("provides structured mouse down and scroll events", async () => {
+	it("provides structured mouse down, drag, and scroll events", async () => {
 		const renderer = await createRenderer(30, 8);
 		let clicked = false;
+		let draggedTo = -1;
 		let direction = "";
 		const target = renderer.createText({
 			content: "mouse target",
@@ -258,13 +281,18 @@ describe("OpenTUI Bone renderer", () => {
 				direction = event.scrollDirection ?? "";
 				event.preventDefault();
 			},
+			onMouseDrag: (event) => {
+				draggedTo = event.x;
+			},
 		});
 		renderer.content.append(target);
 		await renderer.flush();
 
 		await renderer.mouse.click(2, 1);
+		await renderer.mouse.drag(2, 1, 8, 1);
 		await renderer.mouse.scroll(2, 1, "down");
 		assert.equal(clicked, true);
+		assert.ok(draggedTo >= 2);
 		assert.equal(direction, "down");
 	});
 

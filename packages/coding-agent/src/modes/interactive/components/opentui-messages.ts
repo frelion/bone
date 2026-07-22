@@ -66,16 +66,9 @@ export class OpenTUIUserMessage implements BoneView {
 		const body = context.createBox({ flexDirection: "column", paddingX: this.outputPad });
 		body.append(
 			context.createText({
-				content: "YOU",
-				fg: this.messageTheme.getFgColor("accent"),
-				bold: true,
-				height: 1,
-			}),
-		);
-		body.append(
-			context.createMarkdown({
-				content: this.text,
+				content: `› ${this.text}`,
 				fg: this.messageTheme.getFgColor("userMessageText"),
+				wrapMode: "word",
 			}),
 		);
 		root.append(body);
@@ -96,6 +89,68 @@ type AssistantSegmentKind = "text" | "thinking" | "thinking-label" | "error";
 interface AssistantSegment {
 	kind: AssistantSegmentKind;
 	content: string;
+}
+
+interface AssistantSegmentOptions {
+	hideThinkingBlock: boolean;
+	hiddenThinkingLabel: string;
+	hideProposedPlan: boolean;
+}
+
+function createAssistantSegments(message: AssistantMessage, options: AssistantSegmentOptions): AssistantSegment[] {
+	const segments: AssistantSegment[] = [];
+	const visibleTextParts = options.hideProposedPlan ? getVisibleTextParts(message) : undefined;
+	for (let index = 0; index < message.content.length; index++) {
+		const content = message.content[index]!;
+		if (content.type === "text") {
+			const visibleText = visibleTextParts?.get(index) ?? content.text;
+			if (visibleText.trim()) segments.push({ kind: "text", content: visibleText.trim() });
+			continue;
+		}
+		if (content.type !== "thinking") continue;
+
+		const thinkingBlocks: string[] = [];
+		for (; index < message.content.length; index++) {
+			const thinking = message.content[index];
+			if (thinking?.type !== "thinking") break;
+			if (thinking.thinking.trim()) thinkingBlocks.push(thinking.thinking.trim());
+		}
+		index--;
+		if (thinkingBlocks.length > 0 && message.stopReason === undefined) {
+			segments.push({
+				kind: options.hideThinkingBlock ? "thinking-label" : "thinking",
+				content: options.hideThinkingBlock ? options.hiddenThinkingLabel : thinkingBlocks.at(-1)!,
+			});
+		}
+	}
+
+	const hasToolCalls = message.content.some((content) => content.type === "toolCall");
+	let error: string | undefined;
+	if (message.stopReason === "length") {
+		error = "Error: Model stopped because it reached the maximum output token limit. The response may be incomplete.";
+	} else if (!hasToolCalls && message.stopReason === "aborted") {
+		error =
+			message.errorMessage && message.errorMessage !== "Request was aborted"
+				? message.errorMessage
+				: "Operation aborted";
+	} else if (!hasToolCalls && message.stopReason === "error") {
+		error = `Error: ${message.errorMessage || "Unknown error"}`;
+	}
+	if (error) segments.push({ kind: "error", content: error });
+	return segments;
+}
+
+export function hasVisibleOpenTUIAssistantContent(
+	message: AssistantMessage,
+	options: Pick<OpenTUIAssistantMessageOptions, "hideThinkingBlock" | "hiddenThinkingLabel" | "hideProposedPlan"> = {},
+): boolean {
+	return (
+		createAssistantSegments(message, {
+			hideThinkingBlock: options.hideThinkingBlock ?? false,
+			hiddenThinkingLabel: options.hiddenThinkingLabel ?? "Thinking...",
+			hideProposedPlan: options.hideProposedPlan ?? false,
+		}).length > 0
+	);
 }
 
 export class OpenTUIAssistantMessage implements BoneView {
@@ -134,48 +189,7 @@ export class OpenTUIAssistantMessage implements BoneView {
 		const context = this.context;
 		const root = this.root;
 		if (!context || !root) return;
-		const segments: AssistantSegment[] = [];
-		const visibleTextParts = this.options.hideProposedPlan ? getVisibleTextParts(this.message) : undefined;
-		for (let index = 0; index < this.message.content.length; index++) {
-			const content = this.message.content[index]!;
-			if (content.type === "text") {
-				const visibleText = visibleTextParts?.get(index) ?? content.text;
-				if (!visibleText.trim()) continue;
-				segments.push({ kind: "text", content: visibleText.trim() });
-				continue;
-			}
-			if (content.type !== "thinking") continue;
-
-			const thinkingBlocks: string[] = [];
-			for (; index < this.message.content.length; index++) {
-				const thinking = this.message.content[index];
-				if (thinking?.type !== "thinking") break;
-				if (thinking.thinking.trim()) thinkingBlocks.push(thinking.thinking.trim());
-			}
-			index--;
-			if (thinkingBlocks.length === 0) continue;
-
-			if (this.options.hideThinkingBlock) {
-				segments.push({ kind: "thinking-label", content: this.options.hiddenThinkingLabel });
-			} else {
-				segments.push({ kind: "thinking", content: thinkingBlocks.join("\n\n") });
-			}
-		}
-
-		const hasToolCalls = this.message.content.some((content) => content.type === "toolCall");
-		let error: string | undefined;
-		if (this.message.stopReason === "length") {
-			error =
-				"Error: Model stopped because it reached the maximum output token limit. The response may be incomplete.";
-		} else if (!hasToolCalls && this.message.stopReason === "aborted") {
-			error =
-				this.message.errorMessage && this.message.errorMessage !== "Request was aborted"
-					? this.message.errorMessage
-					: "Operation aborted";
-		} else if (!hasToolCalls && this.message.stopReason === "error") {
-			error = `Error: ${this.message.errorMessage || "Unknown error"}`;
-		}
-		if (error) segments.push({ kind: "error", content: error });
+		const segments = createAssistantSegments(this.message, this.options);
 
 		const kinds = segments.map((segment) => segment.kind);
 		if (
@@ -197,15 +211,6 @@ export class OpenTUIAssistantMessage implements BoneView {
 		this.renderedNodes = [];
 		if (segments.length === 0) return;
 		appendSpacer(context, root);
-		root.append(
-			context.createText({
-				content: "BONE",
-				paddingX: this.options.outputPad,
-				fg: this.messageTheme.getFgColor("muted"),
-				bold: true,
-				height: 1,
-			}),
-		);
 		for (const segment of segments) {
 			if (segment.kind === "error" && segments.length > 1) appendSpacer(context, root);
 			const node =

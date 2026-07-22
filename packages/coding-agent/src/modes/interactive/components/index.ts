@@ -1,4 +1,9 @@
-export { OpenTUIComposer, type OpenTUIComposerOptions } from "./opentui-composer.ts";
+export { OpenTUIWelcome, type OpenTUIWelcomeOptions } from "./opentui-chrome.ts";
+export {
+	OpenTUIComposer,
+	type OpenTUIComposerOptions,
+	type OpenTUIComposerStatus,
+} from "./opentui-composer.ts";
 export { type OpenTUILoginDialogOptionsV2, OpenTUILoginDialogV2 } from "./opentui-login-dialog-v2.ts";
 export {
 	OpenTUIAssistantMessage,

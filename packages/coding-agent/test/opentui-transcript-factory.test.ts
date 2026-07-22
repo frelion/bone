@@ -78,6 +78,288 @@ describe("OpenTUI transcript factory", () => {
 		expect(hidden).toBeUndefined();
 	});
 
+	test("groups consecutive persisted tool results during batch replay", async () => {
+		initTheme("dark");
+		const factory = new OpenTUITranscriptFactory();
+		const entries = await factory.createSessionEntries([
+			{
+				type: "message",
+				id: "assistant-tool-1",
+				parentId: null,
+				timestamp: "2026-07-22T00:00:00.000Z",
+				message: {
+					...assistant(""),
+					content: [{ type: "toolCall", id: "replay-1", name: "read", arguments: { path: "one.txt" } }],
+					timestamp: 1_000,
+				},
+			},
+			{
+				type: "message",
+				id: "tool-entry-1",
+				parentId: "assistant-tool-1",
+				timestamp: "2026-07-22T00:00:00.000Z",
+				message: {
+					role: "toolResult",
+					toolName: "read",
+					toolCallId: "replay-1",
+					content: [{ type: "text", text: "first result" }],
+					isError: false,
+					timestamp: 1_000,
+				},
+			},
+			{
+				type: "message",
+				id: "assistant-tool-2",
+				parentId: "tool-entry-1",
+				timestamp: "2026-07-22T00:00:09.000Z",
+				message: {
+					...assistant(""),
+					content: [{ type: "toolCall", id: "replay-2", name: "read", arguments: { path: "two.txt" } }],
+					timestamp: 10_000,
+				},
+			},
+			{
+				type: "message",
+				id: "tool-entry-2",
+				parentId: "tool-entry-1",
+				timestamp: "2026-07-22T00:00:18.000Z",
+				message: {
+					role: "toolResult",
+					toolName: "read",
+					toolCallId: "replay-2",
+					content: [{ type: "text", text: "second result" }],
+					isError: false,
+					timestamp: 19_000,
+				},
+			},
+		]);
+		expect(entries).toHaveLength(1);
+		expect(entries[0]?.key).toBe("working-group:replay:assistant-tool-1");
+
+		const renderer = await createBoneTestRenderer({ width: 90, height: 18 });
+		renderers.add(renderer);
+		renderer.start();
+		if (!entries[0]) throw new Error("expected replay working group");
+		renderer.content.append(entries[0].view.mount(renderer));
+		const captured = await frame(renderer, "✓ Worked for 18s · 2 tool calls");
+		expect(captured).not.toContain("first result");
+		expect(captured).not.toContain("second result");
+	});
+
+	test("does not merge replay working groups across visible assistant text", async () => {
+		initTheme("dark");
+		const factory = new OpenTUITranscriptFactory();
+		const toolAssistant = (id: string, timestamp: number): AssistantMessage => ({
+			...assistant(""),
+			content: [{ type: "toolCall", id, name: "read", arguments: {} }],
+			timestamp,
+		});
+		const toolResult = (id: string, timestamp: number) => ({
+			role: "toolResult" as const,
+			toolName: "read",
+			toolCallId: id,
+			content: [{ type: "text" as const, text: id }],
+			isError: false,
+			timestamp,
+		});
+		const entries = await factory.createSessionEntries([
+			{
+				type: "message",
+				id: "assistant-a",
+				parentId: null,
+				timestamp: "2026-07-22T00:00:00.000Z",
+				message: toolAssistant("call-a", 1),
+			},
+			{
+				type: "message",
+				id: "result-a",
+				parentId: "assistant-a",
+				timestamp: "2026-07-22T00:00:01.000Z",
+				message: toolResult("call-a", 2),
+			},
+			{
+				type: "message",
+				id: "assistant-text",
+				parentId: "result-a",
+				timestamp: "2026-07-22T00:00:02.000Z",
+				message: { ...assistant("A visible boundary"), timestamp: 3 },
+			},
+			{
+				type: "message",
+				id: "assistant-b",
+				parentId: "assistant-text",
+				timestamp: "2026-07-22T00:00:03.000Z",
+				message: toolAssistant("call-b", 4),
+			},
+			{
+				type: "message",
+				id: "result-b",
+				parentId: "assistant-b",
+				timestamp: "2026-07-22T00:00:04.000Z",
+				message: toolResult("call-b", 5),
+			},
+		]);
+
+		expect(entries.map((entry) => entry.key)).toEqual([
+			"working-group:replay:assistant-a",
+			"assistant-text",
+			"working-group:replay:assistant-b",
+		]);
+	});
+
+	test("preserves a visible length error on a tool-call assistant during replay", async () => {
+		initTheme("dark");
+		const factory = new OpenTUITranscriptFactory();
+		const toolAssistant = (
+			id: string,
+			timestamp: number,
+			stopReason?: AssistantMessage["stopReason"],
+		): AssistantMessage => ({
+			...assistant(""),
+			content: [{ type: "toolCall", id, name: "read", arguments: {} }],
+			stopReason,
+			timestamp,
+		});
+		const toolResult = (id: string, timestamp: number) => ({
+			role: "toolResult" as const,
+			toolName: "read",
+			toolCallId: id,
+			content: [{ type: "text" as const, text: `${id} result` }],
+			isError: false,
+			timestamp,
+		});
+		const entries = await factory.createSessionEntries([
+			{
+				type: "message",
+				id: "assistant-before-limit",
+				parentId: null,
+				timestamp: "2026-07-22T00:00:00.000Z",
+				message: toolAssistant("call-before-limit", 1),
+			},
+			{
+				type: "message",
+				id: "result-before-limit",
+				parentId: "assistant-before-limit",
+				timestamp: "2026-07-22T00:00:01.000Z",
+				message: toolResult("call-before-limit", 2),
+			},
+			{
+				type: "message",
+				id: "assistant-limit",
+				parentId: "result-before-limit",
+				timestamp: "2026-07-22T00:00:02.000Z",
+				message: toolAssistant("call-after-limit", 3, "length"),
+			},
+			{
+				type: "message",
+				id: "result-after-limit",
+				parentId: "assistant-limit",
+				timestamp: "2026-07-22T00:00:03.000Z",
+				message: toolResult("call-after-limit", 4),
+			},
+		]);
+
+		expect(entries.map((entry) => entry.key)).toEqual([
+			"working-group:replay:assistant-before-limit",
+			"assistant-limit",
+			"working-group:replay:result-after-limit",
+		]);
+		const renderer = await createBoneTestRenderer({ width: 100, height: 18 });
+		renderers.add(renderer);
+		renderer.start();
+		const limitEntry = entries[1];
+		if (!limitEntry) throw new Error("expected visible length error");
+		renderer.content.append(limitEntry.view.mount(renderer));
+		expect(await frame(renderer, "maximum output token limit")).toContain("Error: Model stopped");
+	});
+
+	test("preserves streaming thinking on a tool-call assistant during replay", async () => {
+		initTheme("dark");
+		const factory = new OpenTUITranscriptFactory({
+			hideThinkingBlock: true,
+			hiddenThinkingLabel: "Reasoning...",
+		});
+		const entries = await factory.createSessionEntries([
+			{
+				type: "message",
+				id: "assistant-tool",
+				parentId: null,
+				timestamp: "2026-07-22T00:00:00.000Z",
+				message: {
+					...assistant(""),
+					content: [{ type: "toolCall", id: "call-thinking", name: "read", arguments: {} }],
+					timestamp: 1,
+				},
+			},
+			{
+				type: "message",
+				id: "result-tool",
+				parentId: "assistant-tool",
+				timestamp: "2026-07-22T00:00:01.000Z",
+				message: {
+					role: "toolResult",
+					toolName: "read",
+					toolCallId: "call-thinking",
+					content: [{ type: "text", text: "done" }],
+					isError: false,
+					timestamp: 2,
+				},
+			},
+			{
+				type: "message",
+				id: "assistant-thinking",
+				parentId: "result-tool",
+				timestamp: "2026-07-22T00:00:02.000Z",
+				message: {
+					...assistant(""),
+					content: [
+						{ type: "thinking", thinking: "Inspecting the next dependency" },
+						{ type: "toolCall", id: "call-next", name: "read", arguments: {} },
+					],
+					stopReason: undefined,
+					timestamp: 3,
+				},
+			},
+		]);
+
+		expect(entries.map((entry) => entry.key)).toEqual(["working-group:replay:assistant-tool", "assistant-thinking"]);
+		const renderer = await createBoneTestRenderer({ width: 90, height: 14 });
+		renderers.add(renderer);
+		renderer.start();
+		const thinkingEntry = entries[1];
+		if (!thinkingEntry) throw new Error("expected visible thinking entry");
+		renderer.content.append(thinkingEntry.view.mount(renderer));
+		expect(await frame(renderer, "Reasoning...")).toContain("Reasoning...");
+	});
+
+	test("keeps future successful groups expanded while the global override is active", async () => {
+		initTheme("dark");
+		const factory = new OpenTUITranscriptFactory();
+		factory.setAllToolDetailsExpanded(true);
+		const started = await factory.handleEvent({
+			type: "tool_execution_start",
+			toolCallId: "future-expanded-tool",
+			toolName: "read",
+			args: { path: "expanded.txt" },
+		});
+		if (started.type !== "append") throw new Error("expected working group");
+		await factory.handleEvent({
+			type: "tool_execution_end",
+			toolCallId: "future-expanded-tool",
+			toolName: "read",
+			result: { content: [{ type: "text", text: "future detail" }], details: {} },
+			isError: false,
+		});
+
+		const renderer = await createBoneTestRenderer({ width: 90, height: 18 });
+		renderers.add(renderer);
+		renderer.start();
+		renderer.content.append(started.item.view.mount(renderer));
+		const captured = await frame(renderer, "future detail");
+		expect(captured).toContain("read · complete");
+		expect(captured).toContain("⌄ ✓ Worked for 1s · 1 tool calls");
+	});
+
 	test("keeps stable assistant and tool views through streaming updates", async () => {
 		initTheme("dark");
 		const renderer = await createBoneTestRenderer({ width: 90, height: 26 });
@@ -117,6 +399,9 @@ describe("OpenTUI transcript factory", () => {
 		expect(toolEnd.type).toBe("updated");
 		if (toolEnd.type !== "updated") throw new Error("expected tool update");
 		expect(toolEnd.view).toBe(toolStart.item.view);
+		const collapsed = await frame(renderer, "Worked for 1s · 1 tool calls");
+		expect(collapsed).not.toContain("done");
+		factory.setAllToolDetailsExpanded(true);
 		expect(await frame(renderer, "done")).toContain("read · complete");
 
 		const duplicateResult = await factory.handleEvent({
@@ -204,6 +489,99 @@ describe("OpenTUI transcript factory", () => {
 		expect(states[1]).toBe(states[0]);
 		expect(previousViews.every(Boolean)).toBe(true);
 		expect(await frame(renderer, "custom result:complete")).not.toContain("custom result:partial");
+	});
+
+	test("groups consecutive live tool calls into one stable working group", async () => {
+		let now = 0;
+		const factory = new OpenTUITranscriptFactory({ now: () => now });
+		const first = await factory.handleEvent({
+			type: "tool_execution_start",
+			toolCallId: "group-call-1",
+			toolName: "read",
+			args: { path: "one.txt" },
+		});
+		const second = await factory.handleEvent({
+			type: "tool_execution_start",
+			toolCallId: "group-call-2",
+			toolName: "read",
+			args: { path: "two.txt" },
+		});
+		expect(first.type).toBe("append");
+		expect(second.type).toBe("updated");
+		if (first.type !== "append" || second.type !== "updated") throw new Error("expected one working group");
+		expect(second.key).toBe(first.item.key);
+		expect(second.view).toBe(first.item.view);
+
+		await factory.handleEvent({
+			type: "tool_execution_end",
+			toolCallId: "group-call-1",
+			toolName: "read",
+			result: { content: [{ type: "text", text: "one" }], details: {} },
+			isError: false,
+		});
+		now = 18_000;
+		const completed = await factory.handleEvent({
+			type: "tool_execution_end",
+			toolCallId: "group-call-2",
+			toolName: "read",
+			result: { content: [{ type: "text", text: "two" }], details: {} },
+			isError: false,
+		});
+		expect(completed.type).toBe("updated");
+		if (completed.type !== "updated") throw new Error("expected group update");
+		expect(completed.view).toBe(first.item.view);
+
+		initTheme("dark");
+		const renderer = await createBoneTestRenderer({ width: 90, height: 18 });
+		renderers.add(renderer);
+		renderer.start();
+		renderer.content.append(first.item.view.mount(renderer));
+		const captured = await frame(renderer, "✓ Worked for 18s · 2 tool calls");
+		expect(captured).not.toContain("one.txt");
+		expect(captured).not.toContain("two.txt");
+	});
+
+	test("ends a live working group when text arrives after an empty assistant start", async () => {
+		const factory = new OpenTUITranscriptFactory();
+		const startAndComplete = async (id: string) => {
+			const started = await factory.handleEvent({
+				type: "tool_execution_start",
+				toolCallId: id,
+				toolName: "read",
+				args: {},
+			});
+			await factory.handleEvent({
+				type: "tool_execution_end",
+				toolCallId: id,
+				toolName: "read",
+				result: { content: [{ type: "text", text: id }], details: {} },
+				isError: false,
+			});
+			return started;
+		};
+
+		const first = await startAndComplete("before-update");
+		await factory.handleEvent({ type: "message_start", message: { ...assistant(""), content: [] } });
+		await factory.handleEvent({
+			type: "message_update",
+			message: assistant("visible update"),
+			assistantMessageEvent: {
+				type: "text_delta",
+				contentIndex: 0,
+				delta: "visible update",
+				partial: assistant("visible update"),
+			},
+		});
+		const second = await startAndComplete("after-update");
+		if (first.type !== "append" || second.type !== "append") throw new Error("expected distinct groups");
+		expect(second.item.key).not.toBe(first.item.key);
+
+		await factory.handleEvent({ type: "message_start", message: { ...assistant(""), content: [] } });
+		await factory.handleEvent({ type: "message_end", message: assistant("visible end") });
+		const third = await startAndComplete("after-end");
+		expect(third.type).toBe("append");
+		if (third.type !== "append") throw new Error("expected third group");
+		expect(third.item.key).not.toBe(second.item.key);
 	});
 
 	test("uses registered custom message and session entry views with fallback behavior", async () => {
@@ -414,15 +792,14 @@ describe("OpenTUI transcript factory", () => {
 		expect(completed.type).toBe("updated");
 		expect(renderCall).toHaveBeenCalled();
 		expect(renderResult).toHaveBeenCalledTimes(2);
+		expect(await frame(renderer, "Worked for 1s · 1 tool calls")).not.toContain("complete fallback");
+		factory.setAllToolDetailsExpanded(true);
 		const toolFrame = await frame(renderer, "complete fallback");
 		expect(toolFrame).toContain("read · complete");
 		expect(toolFrame).not.toContain("partial fallback");
 
 		const following = await factory.handleEvent({ type: "message_start", message: assistant("still alive") });
 		expect(following.type).toBe("append");
-		if (following.type !== "append") throw new Error("expected following assistant message");
-		renderer.content.append(following.item.view.mount(renderer));
-		expect(await frame(renderer, "still alive")).toContain("still alive");
 	});
 
 	test("decodes images to RGBA and returns an explicit fallback for corrupt input", async () => {

@@ -27,7 +27,8 @@ export type OpenTUIAction =
 	| "sessionNamedFilter"
 	| "sessionPath"
 	| "sessionDelete"
-	| "configToggle";
+	| "configToggle"
+	| "toggleToolDetails";
 
 interface OpenTUIKeySpec {
 	name: string;
@@ -64,6 +65,7 @@ const OPEN_TUI_KEYMAP: Record<OpenTUIAction, OpenTUIKeySpec> = {
 	sessionPath: { name: "p", ctrl: true },
 	sessionDelete: { name: "d", ctrl: true },
 	configToggle: { name: "space" },
+	toggleToolDetails: { name: "o", ctrl: true },
 };
 
 function normalizeName(name: string): string {

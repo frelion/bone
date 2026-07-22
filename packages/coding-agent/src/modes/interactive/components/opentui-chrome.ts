@@ -1,4 +1,4 @@
-import type { BoneNode, BoneRenderContext, BoneTextNode, BoneUnsubscribe, BoneView } from "@frelion/bone-tui";
+import type { BoneContainerNode, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
 import { type Theme, theme } from "../theme/theme.ts";
 
 export interface OpenTUITopBarState {
@@ -9,79 +9,59 @@ export interface OpenTUITopBarState {
 }
 
 export class OpenTUITopBar implements BoneView {
-	private state: OpenTUITopBarState;
-	private barTheme: Theme;
-	private conversationNode: BoneTextNode | undefined;
-	private contextNode: BoneTextNode | undefined;
-	private viewportWidth = 120;
-	private unsubscribeResize: BoneUnsubscribe | undefined;
+	// biome-ignore lint/complexity/noUselessConstructor: Preserve the mode call site while the top bar is removed.
+	constructor(_state: OpenTUITopBarState, _barTheme: Theme = theme) {}
 
-	constructor(state: OpenTUITopBarState, barTheme: Theme = theme) {
-		this.state = state;
-		this.barTheme = barTheme;
+	mount(context: BoneRenderContext): BoneNode {
+		return context.createBox({ width: "100%", height: 0 });
+	}
+
+	update(_state: OpenTUITopBarState): void {}
+
+	updateTheme(_nextTheme: Theme): void {}
+
+	dispose(): void {}
+}
+
+export interface OpenTUIWelcomeOptions {
+	workspace?: string;
+	theme?: Theme;
+}
+
+export class OpenTUIWelcome implements BoneView {
+	private readonly options: OpenTUIWelcomeOptions;
+	private root: BoneContainerNode | undefined;
+	private dismissed = false;
+
+	constructor(options: OpenTUIWelcomeOptions = {}) {
+		this.options = options;
 	}
 
 	mount(context: BoneRenderContext): BoneNode {
-		this.viewportWidth = context.width;
-		const root = context.createBox({
-			width: "100%",
-			height: 1,
-			flexDirection: "row",
-			alignItems: "center",
-			gap: 1,
-			paddingX: 1,
-		});
+		const welcomeTheme = this.options.theme ?? theme;
+		const root = context.createBox({ width: "100%", flexDirection: "column", paddingX: 1, paddingTop: 1 });
 		root.append(
 			context.createText({
-				content: "BONE",
-				fg: this.barTheme.getFgColor("accent"),
-				bold: true,
-				flexShrink: 0,
+				content: "What would you like to work on?",
+				fg: welcomeTheme.getFgColor("text"),
 			}),
 		);
-		this.conversationNode = context.createText({
-			content: "",
-			fg: this.barTheme.getFgColor("text"),
-			truncate: true,
-			flexGrow: 1,
-			minWidth: 0,
-		});
-		this.contextNode = context.createText({
-			content: "",
-			fg: this.barTheme.getFgColor("muted"),
-			truncate: true,
-			flexShrink: 1,
-		});
-		root.append(this.conversationNode);
-		root.append(this.contextNode);
-		this.unsubscribeResize = context.onResize((width) => {
-			this.viewportWidth = width;
-			this.refresh();
-		});
-		this.refresh();
+		if (this.options.workspace) {
+			root.append(
+				context.createText({
+					content: this.options.workspace,
+					fg: welcomeTheme.getFgColor("muted"),
+					truncate: true,
+				}),
+			);
+		}
+		root.visible = !this.dismissed;
+		this.root = root;
 		return root;
 	}
 
-	update(state: OpenTUITopBarState): void {
-		this.state = state;
-		this.refresh();
-	}
-
-	updateTheme(nextTheme: Theme): void {
-		this.barTheme = nextTheme;
-		this.conversationNode?.updateStyle({ fg: nextTheme.getFgColor("text") });
-		this.contextNode?.updateStyle({ fg: nextTheme.getFgColor("muted") });
-	}
-
-	dispose(): void {
-		this.unsubscribeResize?.();
-		this.unsubscribeResize = undefined;
-	}
-
-	private refresh(): void {
-		if (this.conversationNode) this.conversationNode.content = `/ ${this.state.conversation}`;
-		if (!this.contextNode) return;
-		this.contextNode.visible = this.viewportWidth >= 132;
-		this.contextNode.content = `${this.state.workspace} · ${this.state.model} · ${this.state.thinking}`;
+	dismiss(): void {
+		this.dismissed = true;
+		if (this.root && !this.root.destroyed) this.root.visible = false;
 	}
 }

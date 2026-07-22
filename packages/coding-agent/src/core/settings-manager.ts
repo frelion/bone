@@ -61,6 +61,10 @@ export interface WarningSettings {
 	anthropicExtraUsage?: boolean; // default: true
 }
 
+export interface UISettings {
+	sidebarWidth?: number;
+}
+
 export type DefaultProjectTrust = "ask" | "always" | "never";
 
 export type TransportSetting = Transport;
@@ -111,6 +115,7 @@ export interface Settings {
 	showHardwareCursor?: boolean; // Show terminal cursor while still positioning it for IME
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
+	ui?: UISettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
 	httpProxy?: string; // Proxy URL applied as HTTP_PROXY and HTTPS_PROXY for Pi-managed HTTP clients
 	httpIdleTimeoutMs?: number; // HTTP header/body idle timeout in milliseconds; 0 disables it
@@ -1202,6 +1207,18 @@ export class SettingsManager {
 	setOutputPad(padding: 0 | 1): void {
 		this.globalSettings.outputPad = padding;
 		this.markModified("outputPad");
+		this.save();
+	}
+
+	getSidebarWidth(): number | undefined {
+		const width = this.settings.ui?.sidebarWidth;
+		return typeof width === "number" && Number.isFinite(width) ? width : undefined;
+	}
+
+	setSidebarWidth(width: number): void {
+		if (!Number.isFinite(width)) return;
+		this.globalSettings.ui = { ...this.globalSettings.ui, sidebarWidth: Math.round(width) };
+		this.markModified("ui", "sidebarWidth");
 		this.save();
 	}
 

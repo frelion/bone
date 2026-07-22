@@ -198,5 +198,7 @@ describe("OpenTUI dialog and selector v2 flows", () => {
 		expect(captured).toContain("Thinking level");
 		expect(captured).not.toContain("levelSet reasoning");
 		expect(Math.max(...captured.split("\n").map((line) => line.length))).toBeLessThanOrEqual(60);
+		expect(captured).not.toContain("fields");
+		expect(captured).not.toContain("Esc cancel");
 	});
 });

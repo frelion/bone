@@ -1,16 +1,23 @@
-import type {
-	BoneContainerNode,
-	BoneKeyEvent,
-	BoneNode,
-	BoneRenderContext,
-	BoneScrollViewNode,
-	BoneTextareaNode,
-	BoneView,
+import {
+	type BoneContainerNode,
+	type BoneKeyEvent,
+	type BoneMouseEvent,
+	type BoneNode,
+	type BoneRenderContext,
+	type BoneScrollViewNode,
+	type BoneTextareaNode,
+	type BoneTextNode,
+	type BoneView,
+	visibleWidth,
 } from "@frelion/bone-tui";
 import type { InteractiveSessionSummary } from "../../../core/interactive-session-host.ts";
 import type { MemorySearchResult } from "../../../core/memory.ts";
+import { OPEN_TUI_COLORS, OPEN_TUI_LAYOUT } from "../opentui-design.ts";
 import { matchesOpenTUIAction } from "../opentui-keymap.ts";
 import { type Theme, type ThemeColor, theme } from "../theme/theme.ts";
+import { formatConversationActivityTime, formatConversationCreatedTime } from "./conversation-time.ts";
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 const STATE_ICON: Record<InteractiveSessionSummary["state"], string> = {
 	foreground: "●",
@@ -44,6 +51,29 @@ function consume(event: BoneKeyEvent): true {
 	return true;
 }
 
+function sortByActivity(sessions: readonly InteractiveSessionSummary[]): InteractiveSessionSummary[] {
+	return sessions
+		.map((session, index) => ({ session, index }))
+		.sort(
+			(left, right) =>
+				right.session.modified.getTime() - left.session.modified.getTime() || left.index - right.index,
+		)
+		.map(({ session }) => session);
+}
+
+function formatThroughput(tokensPerSecond: number | undefined): string {
+	if (tokensPerSecond === undefined || !Number.isFinite(tokensPerSecond)) return "";
+	return `${tokensPerSecond.toFixed(1)} tok/s`;
+}
+
+interface MarqueeEntry {
+	node: BoneTextNode;
+	text: string;
+	graphemes: string[];
+	offset: number;
+	pauseFrames: number;
+}
+
 /** Structured OpenTUI conversation sidebar with search and session actions. */
 export class OpenTUISessionSidebar implements BoneView {
 	private sidebarTheme: Theme;
@@ -59,11 +89,13 @@ export class OpenTUISessionSidebar implements BoneView {
 	private previewedSearchPath: string | undefined;
 	private context: BoneRenderContext | undefined;
 	private root: BoneContainerNode | undefined;
-	private headerCount: ReturnType<BoneRenderContext["createText"]> | undefined;
 	private searchInput: BoneTextareaNode | undefined;
 	private searchStatusNode: ReturnType<BoneRenderContext["createText"]> | undefined;
 	private list: BoneScrollViewNode | undefined;
 	private focused = false;
+	private frozenOrder: string[] | undefined;
+	private readonly marqueeEntries = new Map<string, MarqueeEntry>();
+	private marqueeTimer: ReturnType<typeof setInterval> | undefined;
 
 	public onActivateSession?: (sessionPath: string) => void;
 	public onPreviewSession?: (sessionPath: string) => void;
@@ -98,11 +130,21 @@ export class OpenTUISessionSidebar implements BoneView {
 			focusable: true,
 		});
 		this.rebuildChrome();
+		this.startMarquee();
 		return this.root;
 	}
 
 	setFocused(focused: boolean): void {
+		if (focused === this.focused) return;
+		if (focused) {
+			this.sessions = sortByActivity(this.sessions);
+			this.frozenOrder = this.sessions.map((session) => session.path);
+		} else {
+			this.frozenOrder = undefined;
+			this.sessions = sortByActivity(this.sessions);
+		}
 		this.focused = focused;
+		this.reconcileSelection();
 		if (focused) {
 			(this.searchInput ?? this.root)?.focus();
 		} else {
@@ -117,7 +159,20 @@ export class OpenTUISessionSidebar implements BoneView {
 	}
 
 	setSessions(sessions: InteractiveSessionSummary[]): void {
-		this.sessions = sessions;
+		if (this.focused && this.frozenOrder) {
+			const sessionsByPath = new Map(sessions.map((session) => [session.path, session]));
+			const frozen = this.frozenOrder.flatMap((path) => {
+				const session = sessionsByPath.get(path);
+				if (!session) return [];
+				sessionsByPath.delete(path);
+				return [session];
+			});
+			const additions = sortByActivity([...sessionsByPath.values()]);
+			this.sessions = [...frozen, ...additions];
+			this.frozenOrder = this.sessions.map((session) => session.path);
+		} else {
+			this.sessions = sortByActivity(sessions);
+		}
 		this.reconcileSelection();
 		const itemState = this.itemState;
 		if (itemState.kind !== "normal" && !sessions.some((session) => session.path === itemState.path)) {
@@ -146,6 +201,12 @@ export class OpenTUISessionSidebar implements BoneView {
 		this.itemState =
 			message && selected ? { kind: "status", path: selected.path, tone, message } : { kind: "normal" };
 		this.rebuildList();
+	}
+
+	dispose(): void {
+		if (this.marqueeTimer) clearInterval(this.marqueeTimer);
+		this.marqueeTimer = undefined;
+		this.marqueeEntries.clear();
 	}
 
 	startSearch(): void {
@@ -299,29 +360,22 @@ export class OpenTUISessionSidebar implements BoneView {
 		const root = this.root;
 		if (!context || !root) return;
 		root.clear();
-		const displayedSessions = this.getDisplayedSessions();
 		const header = context.createBox({
 			width: "100%",
 			height: 2,
-			flexDirection: "row",
+			flexDirection: "column",
 			alignItems: "center",
-			justifyContent: "space-between",
+			justifyContent: "center",
 		});
 		header.append(
 			context.createText({
-				content: this.searchActive ? "SEARCH" : "CONVERSATIONS",
-				fg: this.sidebarTheme.getFgColor("muted"),
+				content: "CONVERSATIONS",
+				fg: OPEN_TUI_COLORS.muted,
 				bold: true,
 				truncate: true,
-				flexShrink: 1,
+				width: "100%",
 			}),
 		);
-		this.headerCount = context.createText({
-			content: String(displayedSessions.length),
-			fg: this.sidebarTheme.getFgColor("dim"),
-			flexShrink: 0,
-		});
-		header.append(this.headerCount);
 		root.append(header);
 
 		if (this.searchStartPath !== undefined) {
@@ -364,8 +418,8 @@ export class OpenTUISessionSidebar implements BoneView {
 		const list = this.list;
 		if (!context || !list) return;
 		list.clear();
+		this.marqueeEntries.clear();
 		const sessions = this.getDisplayedSessions();
-		if (this.headerCount) this.headerCount.content = String(sessions.length);
 		if (sessions.length === 0) {
 			list.append(
 				context.createText({
@@ -383,108 +437,194 @@ export class OpenTUISessionSidebar implements BoneView {
 			const confirming = this.itemState.kind === "confirm-delete" && this.itemState.path === session.path;
 			const status =
 				this.itemState.kind === "status" && this.itemState.path === session.path ? this.itemState : undefined;
+			const foreground = session.state === "foreground";
+			const selectedText = selected ? OPEN_TUI_COLORS.selectionText : undefined;
+			const activateFromMouse = (event: BoneMouseEvent) => {
+				this.selectedIndex = index;
+				this.selectedPath = session.path;
+				event.preventDefault();
+				event.stopPropagation();
+				if (this.searchActive) this.stopSearch();
+				this.onActivateSession?.(session.path);
+			};
 			const row = context.createBox({
 				width: "100%",
+				height: 3,
 				flexDirection: "column",
-				marginBottom: 1,
-				backgroundColor: selected ? this.sidebarTheme.getBgColor("sidebarSelectedBg") : undefined,
-				onMouseDown: (event) => {
-					this.selectedIndex = index;
-					this.selectedPath = session.path;
-					this.rebuildList();
-					event.preventDefault();
-					event.stopPropagation();
-				},
+				backgroundColor: foreground
+					? OPEN_TUI_COLORS.primaryStrong
+					: selected
+						? OPEN_TUI_COLORS.selection
+						: undefined,
+				onMouseDown: activateFromMouse,
 			});
-			const titleRow = context.createBox({ width: "100%", height: 1, flexDirection: "row", gap: 1 });
-			titleRow.append(
-				context.createText({
-					content: selected ? "›" : " ",
-					fg: this.sidebarTheme.getFgColor(selected ? "accent" : "muted"),
-					flexShrink: 0,
-				}),
-			);
+			const foregroundText = foreground ? OPEN_TUI_COLORS.primaryText : selectedText;
+			const titleRow = context.createBox({
+				width: "100%",
+				height: 1,
+				flexDirection: "row",
+				gap: 1,
+				paddingLeft: 1,
+				onMouseDown: activateFromMouse,
+			});
 			titleRow.append(
 				context.createText({
 					content: STATE_ICON[session.state],
-					fg: this.sidebarTheme.getFgColor(confirming ? "error" : stateColor(session.state)),
+					fg: foregroundText ?? this.sidebarTheme.getFgColor(confirming ? "error" : stateColor(session.state)),
 					flexShrink: 0,
+					onMouseDown: activateFromMouse,
 				}),
 			);
 			const title = normalizePreview(session.name ?? session.firstMessage) || "(empty conversation)";
 			titleRow.append(
 				context.createText({
 					content: title,
-					fg: this.sidebarTheme.getFgColor(confirming ? "error" : status?.tone === "error" ? "error" : "text"),
-					bold: selected,
+					fg:
+						foregroundText ??
+						this.sidebarTheme.getFgColor(confirming ? "error" : status?.tone === "error" ? "error" : "text"),
+					bold: foreground || selected,
 					truncate: true,
 					flexGrow: 1,
 					minWidth: 0,
+					onMouseDown: activateFromMouse,
 				}),
 			);
-			const stateLabel =
-				session.state === "background-running"
-					? "run"
-					: session.state === "background-waiting"
-						? "wait"
-						: undefined;
-			if (stateLabel) {
-				titleRow.append(
-					context.createText({
-						content: stateLabel,
-						fg: this.sidebarTheme.getFgColor("dim"),
-						flexShrink: 0,
-					}),
-				);
-			}
 			row.append(titleRow);
 
+			const previewRow = context.createBox({
+				width: "100%",
+				height: 1,
+				flexDirection: "row",
+				paddingLeft: 1,
+				paddingRight: 1,
+				onMouseDown: activateFromMouse,
+			});
 			if (confirming) {
-				row.append(
+				previewRow.append(
 					context.createText({
 						content: "Delete this conversation?",
-						paddingLeft: 4,
-						fg: this.sidebarTheme.getFgColor("error"),
+						fg: foregroundText ?? this.sidebarTheme.getFgColor("error"),
 						truncate: true,
+						flexGrow: 1,
+						minWidth: 0,
+						onMouseDown: activateFromMouse,
 					}),
 				);
 			} else if (status) {
-				row.append(
+				previewRow.append(
 					context.createText({
 						content: status.message,
-						paddingLeft: 4,
-						fg: this.sidebarTheme.getFgColor(status.tone === "error" ? "error" : "accent"),
+						fg: foregroundText ?? this.sidebarTheme.getFgColor(status.tone === "error" ? "error" : "accent"),
 						truncate: true,
+						flexGrow: 1,
+						minWidth: 0,
+						onMouseDown: activateFromMouse,
 					}),
 				);
 			} else {
 				const result = this.searchResults?.find((candidate) => candidate.sessionPath === session.path);
 				const titleEvidence = result?.evidence.kind === "title";
-				const role =
-					(titleEvidence ? undefined : result?.evidence.label) ??
-					(session.lastMessageRole === "assistant"
-						? "Bone"
-						: session.lastMessageRole === "user"
-							? "You"
-							: "Message");
 				const preview = normalizePreview(
-					titleEvidence ? (session.lastMessage ?? "") : (result?.evidence.snippet ?? session.lastMessage ?? ""),
+					titleEvidence
+						? (session.livePreview ?? session.lastMessage ?? "")
+						: (result?.evidence.snippet ?? session.livePreview ?? session.lastMessage ?? ""),
 				);
-				row.append(
+				const previewText = preview || (titleEvidence ? "Title match" : "No messages yet");
+				const previewNode = context.createText({
+					content: previewText,
+					fg: foregroundText ?? this.sidebarTheme.getFgColor(preview ? "muted" : "dim"),
+					truncate: true,
+					flexGrow: 1,
+					minWidth: 0,
+					onMouseDown: activateFromMouse,
+				});
+				previewRow.append(previewNode);
+				this.marqueeEntries.set(session.path, {
+					node: previewNode,
+					text: previewText,
+					graphemes: [
+						...Array.from(graphemeSegmenter.segment(previewText), ({ segment }) => segment),
+						...Array.from({ length: OPEN_TUI_LAYOUT.marqueeGap }, () => " "),
+					],
+					offset: 0,
+					pauseFrames: OPEN_TUI_LAYOUT.marqueeEdgePauseFrames,
+				});
+			}
+			if (!confirming && !status && session.throughputTokensPerSecond !== undefined) {
+				previewRow.append(
 					context.createText({
-						content: preview
-							? `${role} · ${preview}`
-							: titleEvidence
-								? "Title match"
-								: `${session.messageCount} ${session.messageCount === 1 ? "message" : "messages"}`,
-						paddingLeft: 4,
-						fg: this.sidebarTheme.getFgColor(preview ? "muted" : "dim"),
+						content: formatThroughput(session.throughputTokensPerSecond).padStart(11),
+						width: 11,
+						fg: foregroundText ?? this.sidebarTheme.getFgColor("dim"),
+						truncate: true,
+						flexShrink: 0,
+						onMouseDown: activateFromMouse,
+					}),
+				);
+			}
+			row.append(previewRow);
+			row.append(
+				context.createText({
+					content: `${session.messageCount} msg${session.messageCount === 1 ? "" : "s"} · ${formatConversationActivityTime(session.modified)} · ${formatConversationCreatedTime(session.created)}`,
+					height: 1,
+					paddingLeft: 1,
+					paddingRight: 1,
+					fg: foregroundText ?? this.sidebarTheme.getFgColor("dim"),
+					truncate: true,
+					onMouseDown: activateFromMouse,
+				}),
+			);
+			list.append(row);
+			if (index < sessions.length - 1) {
+				list.append(
+					context.createText({
+						content: "─".repeat(OPEN_TUI_LAYOUT.sidebarMaxWidth),
+						height: 1,
+						fg: OPEN_TUI_COLORS.borderSubtle,
 						truncate: true,
 					}),
 				);
 			}
-			list.append(row);
 		}
+	}
+
+	private startMarquee(): void {
+		if (this.marqueeTimer) return;
+		this.marqueeTimer = setInterval(() => {
+			if (this.root?.destroyed) {
+				if (this.marqueeTimer) clearInterval(this.marqueeTimer);
+				this.marqueeTimer = undefined;
+				return;
+			}
+			const list = this.list;
+			if (!list?.effectivelyVisible) return;
+			const viewportTop = list.screenY;
+			const viewportBottom = viewportTop + list.viewportHeight;
+			for (const entry of this.marqueeEntries.values()) {
+				if (!entry.node.effectivelyVisible || entry.node.width <= 0) continue;
+				const previewTop = entry.node.screenY;
+				const previewBottom = previewTop + entry.node.height;
+				if (previewBottom <= viewportTop || previewTop >= viewportBottom) continue;
+				if (visibleWidth(entry.text) <= entry.node.width) {
+					if (entry.offset !== 0) {
+						entry.offset = 0;
+						entry.pauseFrames = OPEN_TUI_LAYOUT.marqueeEdgePauseFrames;
+						entry.node.content = entry.text;
+					}
+					continue;
+				}
+				if (entry.pauseFrames > 0) {
+					entry.pauseFrames--;
+					continue;
+				}
+				entry.offset = (entry.offset + 1) % entry.graphemes.length;
+				if (entry.offset === 0) entry.pauseFrames = OPEN_TUI_LAYOUT.marqueeEdgePauseFrames;
+				entry.node.content = `${entry.graphemes.slice(entry.offset).join("")}${entry.graphemes
+					.slice(0, entry.offset)
+					.join("")}`;
+			}
+		}, OPEN_TUI_LAYOUT.marqueeIntervalMs);
+		this.marqueeTimer.unref?.();
 	}
 
 	private moveSearchSelection(delta: number): void {
@@ -510,7 +650,7 @@ export class OpenTUISessionSidebar implements BoneView {
 			const query = this.searchQueryValue.trim().toLowerCase();
 			if (!query) return this.sessions;
 			return this.sessions.filter((session) =>
-				[session.name, session.firstMessage, session.lastMessage, session.path].some((value) =>
+				[session.name, session.firstMessage, session.livePreview, session.lastMessage, session.path].some((value) =>
 					value?.toLowerCase().includes(query),
 				),
 			);

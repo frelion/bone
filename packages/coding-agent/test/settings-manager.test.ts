@@ -372,6 +372,31 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("ui settings", () => {
+		it("persists sidebar width globally without replacing sibling ui settings", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ ui: { sidebarWidth: 36, density: "compact" } }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getSidebarWidth()).toBe(36);
+			manager.setSidebarWidth(44.6);
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			expect(savedSettings.ui).toEqual({ sidebarWidth: 45, density: "compact" });
+		});
+
+		it("ignores invalid sidebar widths", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			manager.setSidebarWidth(Number.NaN);
+			await manager.flush();
+
+			expect(manager.getSidebarWidth()).toBeUndefined();
+			expect(existsSync(join(agentDir, "settings.json"))).toBe(false);
+		});
+	});
+
 	describe("shellCommandPrefix", () => {
 		it("should load shellCommandPrefix from settings", () => {
 			const settingsPath = join(agentDir, "settings.json");

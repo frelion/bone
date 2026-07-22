@@ -97,7 +97,7 @@ abstract class RebuildableView implements BoneView {
 	protected abstract rebuild(): void;
 
 	protected begin(backgroundColor?: string): { context: BoneRenderContext; body: BoneContainerNode } | undefined {
-		if (!this.context || !this.root) return undefined;
+		if (!this.context || !this.root || this.root.destroyed) return undefined;
 		this.root.clear();
 		this.root.append(this.context.createSpacer({ size: 1, direction: "vertical" }));
 		const body = this.context.createBox({
@@ -114,6 +114,10 @@ abstract class RebuildableView implements BoneView {
 export interface OpenTUIToolExecutionOptions {
 	theme?: Theme;
 	expanded?: boolean;
+}
+
+export interface OpenTUIWorkingGroupTool extends BoneView {
+	setExpanded(expanded: boolean): void;
 }
 
 export class OpenTUIToolExecution extends RebuildableView {
@@ -235,6 +239,97 @@ export class OpenTUIToolExecution extends RebuildableView {
 					dim: true,
 				}),
 			);
+		}
+	}
+}
+
+interface WorkingGroupEntry {
+	id: string;
+	view: OpenTUIWorkingGroupTool;
+	complete: boolean;
+	failed: boolean;
+}
+
+export class OpenTUIWorkingGroup extends RebuildableView {
+	private readonly startedAt: number;
+	private readonly now: () => number;
+	private readonly entries: WorkingGroupEntry[] = [];
+	private readonly viewTheme: Theme;
+	private expanded = true;
+	private completedAt: number | undefined;
+
+	constructor(startedAt = Date.now(), now: () => number = Date.now, viewTheme: Theme = theme) {
+		super();
+		this.startedAt = startedAt;
+		this.now = now;
+		this.viewTheme = viewTheme;
+	}
+
+	addTool(id: string, view: OpenTUIWorkingGroupTool): void {
+		if (this.entries.some((entry) => entry.id === id)) return;
+		this.entries.push({ id, view, complete: false, failed: false });
+		this.expanded = true;
+		this.completedAt = undefined;
+		this.rebuild();
+	}
+
+	markToolComplete(id: string, failed: boolean): void {
+		const entry = this.entries.find((candidate) => candidate.id === id);
+		if (!entry) return;
+		entry.complete = true;
+		entry.failed = failed;
+		if (this.entries.every((candidate) => candidate.complete)) {
+			this.completedAt = this.now();
+			this.expanded = this.entries.some((candidate) => candidate.failed);
+		}
+		this.rebuild();
+	}
+
+	setExpanded(expanded: boolean): void {
+		this.expanded = expanded;
+		this.rebuild();
+	}
+
+	toggleExpanded(): void {
+		this.setExpanded(!this.expanded);
+	}
+
+	isComplete(): boolean {
+		return this.completedAt !== undefined;
+	}
+
+	protected rebuild(): void {
+		if (!this.context || !this.root) return;
+		this.root.clear();
+		this.root.append(this.context.createSpacer({ size: 1, direction: "vertical" }));
+		const failed = this.entries.some((entry) => entry.failed);
+		const header = this.context.createBox({
+			flexDirection: "column",
+			paddingX: 1,
+			onMouseDown: (event) => {
+				if (event.button !== 0) return;
+				event.preventDefault();
+				event.stopPropagation();
+				this.toggleExpanded();
+			},
+		});
+		const count = this.entries.length;
+		const elapsedSeconds = Math.max(1, Math.round(((this.completedAt ?? this.now()) - this.startedAt) / 1000));
+		const summary = this.completedAt
+			? `${failed ? "✗" : "✓"} Worked for ${elapsedSeconds}s · ${count} tool calls`
+			: `◐ Working group · ${count} tool calls`;
+		header.append(
+			this.context.createText({
+				content: `${this.expanded ? "⌄" : "›"} ${summary}`,
+				fg: this.viewTheme.getFgColor(failed ? "error" : this.completedAt ? "muted" : "accent"),
+				bold: !this.completedAt,
+			}),
+		);
+		this.root.append(header);
+		if (!this.expanded) return;
+		for (const entry of this.entries) {
+			entry.view.setExpanded(true);
+			this.root.append(entry.view.mount(this.context));
 		}
 	}
 }

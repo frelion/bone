@@ -8,6 +8,7 @@ import {
 	OpenTUISkillInvocation,
 	OpenTUIStatusView,
 	OpenTUIToolExecution,
+	OpenTUIWorkingGroup,
 	textOnlyToolResult,
 } from "../src/modes/interactive/components/opentui-rich-messages.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -126,5 +127,43 @@ describe("OpenTUI rich messages", () => {
 		const captured = await frame(renderer, "new value");
 		expect(captured).toContain("old value");
 		expect(captured).toContain("edit · complete");
+	});
+
+	test("summarizes a successful working group and toggles that group by mouse", async () => {
+		const renderer = await setup();
+		let now = 0;
+		const group = new OpenTUIWorkingGroup(0, () => now);
+		for (let index = 0; index < 7; index++) {
+			const id = `call-${index}`;
+			const tool = new OpenTUIToolExecution("read", id, { path: `${index}.txt` });
+			tool.markExecutionStarted();
+			tool.updateResult(textOnlyToolResult("read", id, `result ${index}`));
+			group.addTool(id, tool);
+			if (index === 6) now = 18_000;
+			group.markToolComplete(id, false);
+		}
+		renderer.content.append(group.mount(renderer));
+		let captured = await frame(renderer, "✓ Worked for 18s · 7 tool calls");
+		expect(captured).not.toContain("result 0");
+
+		await renderer.mouse.click(2, 1);
+		captured = await frame(renderer, "result 0");
+		expect(captured).toContain("⌄ ✓ Worked for 18s · 7 tool calls");
+		expect(captured).toContain("result 1");
+	});
+
+	test("keeps a failed working group expanded", async () => {
+		const renderer = await setup();
+		const group = new OpenTUIWorkingGroup(0, () => 2_000);
+		const tool = new OpenTUIToolExecution("write", "failed-call", { path: "locked.txt" });
+		tool.markExecutionStarted();
+		tool.updateResult(textOnlyToolResult("write", "failed-call", "permission denied", true));
+		group.addTool("failed-call", tool);
+		group.markToolComplete("failed-call", true);
+		renderer.content.append(group.mount(renderer));
+
+		const captured = await frame(renderer, "permission denied");
+		expect(captured).toContain("✗ Worked for 2s · 1 tool calls");
+		expect(captured).toContain("write · failed");
 	});
 });

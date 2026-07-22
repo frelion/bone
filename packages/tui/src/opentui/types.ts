@@ -62,6 +62,11 @@ export interface BoneNode {
 	readonly id: string;
 	visible: boolean;
 	readonly destroyed: boolean;
+	readonly effectivelyVisible: boolean;
+	readonly screenX: number;
+	readonly screenY: number;
+	readonly width: number;
+	readonly height: number;
 	updateLayout(layout: BoneLayout): void;
 	focus(): void;
 	blur(): void;
@@ -85,6 +90,10 @@ export interface BoneMouseEvent {
 
 export interface BoneNodeOptions extends BoneLayout {
 	onMouseDown?: (event: BoneMouseEvent) => void;
+	onMouseDrag?: (event: BoneMouseEvent) => void;
+	onMouseDragEnd?: (event: BoneMouseEvent) => void;
+	onMouseOver?: (event: BoneMouseEvent) => void;
+	onMouseOut?: (event: BoneMouseEvent) => void;
 	onMouseScroll?: (event: BoneMouseEvent) => void;
 }
 
@@ -128,6 +137,7 @@ export interface BoneTextNode extends BoneNode {
 export interface BoneScrollViewNode extends BoneContainerNode {
 	scrollTop: number;
 	scrollLeft: number;
+	readonly viewportHeight: number;
 	readonly scrollHeight: number;
 	readonly scrollWidth: number;
 	scrollBy(delta: number | { x: number; y: number }): void;
@@ -478,6 +488,13 @@ export interface BoneTestInput {
 
 export interface BoneTestMouse {
 	click(x: number, y: number, button?: "left" | "middle" | "right"): Promise<void>;
+	drag(
+		startX: number,
+		startY: number,
+		endX: number,
+		endY: number,
+		button?: "left" | "middle" | "right",
+	): Promise<void>;
 	scroll(x: number, y: number, direction: "up" | "down" | "left" | "right"): Promise<void>;
 }
 
