@@ -11,6 +11,7 @@ export const RESERVED_QUESTION_OPTION_LABELS = new Set(["other", "cancel"]);
 export interface QuestionOption {
 	label: string;
 	description: string;
+	preview?: string;
 }
 
 export interface QuestionDefinition {
@@ -49,6 +50,7 @@ export interface QuestionToolDetails {
 const questionOptionSchema = Type.Object({
 	label: Type.String({ minLength: 1, maxLength: 60 }),
 	description: Type.String({ minLength: 1 }),
+	preview: Type.Optional(Type.String({ minLength: 1 })),
 });
 
 export const askUserQuestionSchema = Type.Object({
@@ -88,6 +90,7 @@ export function validateQuestionDefinitions(input: AskUserQuestionInput): Questi
 		const options = question.options.map((option, optionIndex) => {
 			const label = option.label.trim();
 			const description = option.description.trim();
+			const preview = option.preview?.trim();
 			if (!label || !description) {
 				throw new Error(
 					`Question ${questionIndex + 1} option ${optionIndex + 1} must have a label and description.`,
@@ -99,7 +102,7 @@ export function validateQuestionDefinitions(input: AskUserQuestionInput): Questi
 			}
 			if (labels.has(key)) throw new Error(`Question ${questionIndex + 1} has duplicate option label "${label}".`);
 			labels.add(key);
-			return { label, description };
+			return { label, description, ...(preview && { preview }) };
 		});
 
 		return { question: text, header, options, ...(question.multiSelect && { multiSelect: true }) };
@@ -192,12 +195,13 @@ export function createAskUserQuestionToolDefinition(
 		name: "ask_user_question",
 		label: "Ask User Question",
 		description:
-			"Ask the user one to four structured questions when a material product decision cannot be discovered from the workspace. Each question must offer two to four concrete options. The user can also provide a custom answer or cancel.",
+			"Ask the user one to four structured questions when a material product decision cannot be discovered from the workspace. Each question must offer two to four concrete options and may include a Markdown preview for choices that benefit from visual detail. The user can also provide a custom answer or cancel.",
 		promptSnippet: "Ask the user structured questions when a material decision cannot be discovered",
 		promptGuidelines: [
 			"Investigate discoverable workspace facts before using ask_user_question. Use it only for material user preferences, requirements, constraints, or acceptance criteria.",
 			"Group related decisions into one invocation. Do not ask the user to choose internal helper names, file locations, or test organization.",
 			"Put the recommended option first and explain each option's trade-off in its description.",
+			"Use an option preview for concise code, Markdown, ASCII diagrams, or concrete output examples when that detail materially helps the user decide.",
 		],
 		parameters: askUserQuestionSchema,
 		executionMode: "sequential",

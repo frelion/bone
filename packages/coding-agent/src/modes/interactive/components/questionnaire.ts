@@ -1,8 +1,21 @@
-import { Container, getKeybindings, Input, Key, matchesKey, Spacer, Text } from "@frelion/bone-tui";
+import {
+	type Component,
+	Container,
+	getKeybindings,
+	Input,
+	Key,
+	Markdown,
+	matchesKey,
+	Spacer,
+	Text,
+	truncateToWidth,
+	visibleWidth,
+} from "@frelion/bone-tui";
 import type { QuestionAnswer, QuestionRequest } from "../../../core/question.ts";
-import { theme } from "../theme/theme.ts";
+import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { rawKeyHint } from "./keybinding-hints.ts";
+import { fitLine } from "./terminal-layout.ts";
 
 export type QuestionnaireResult = { cancelled: false; answers: QuestionAnswer[] } | { cancelled: true };
 
@@ -11,10 +24,96 @@ type DraftAnswer =
 	| { kind: "custom"; value: string }
 	| { kind: "multi"; values: Set<string> };
 
-type ActiveViewState =
-	| { kind: "question"; questionIndex: number; selectedRow: number }
-	| { kind: "submit"; selectedRow: 0 | 1 };
+type ActiveViewState = { kind: "question"; questionIndex: number; selectedRow: number } | { kind: "submit" };
 type ViewState = ActiveViewState | { kind: "cancelConfirm"; returnTo: ActiveViewState };
+
+const DETAILS_SIDE_BY_SIDE_MIN_WIDTH = 100;
+const DETAILS_MIN_LEFT_WIDTH = 30;
+const DETAILS_MIN_RIGHT_WIDTH = 45;
+
+class QuestionChoicePane implements Component {
+	private readonly question: QuestionRequest["questions"][number];
+	private readonly selectedRow: number;
+	private readonly draft: DraftAnswer | undefined;
+	private readonly input: Input;
+
+	constructor(
+		question: QuestionRequest["questions"][number],
+		selectedRow: number,
+		draft: DraftAnswer | undefined,
+		input: Input,
+	) {
+		this.question = question;
+		this.selectedRow = selectedRow;
+		this.draft = draft;
+		this.input = input;
+	}
+
+	invalidate(): void {
+		this.input.invalidate();
+	}
+
+	render(width: number): string[] {
+		const inputFocused = this.selectedRow === this.question.options.length;
+		this.input.focused = inputFocused;
+		const selectedOption = this.question.options[this.selectedRow];
+		if (width < DETAILS_SIDE_BY_SIDE_MIN_WIDTH || !selectedOption) {
+			const left = this.renderChoices(width);
+			return selectedOption ? [...left, "", ...this.renderDetails(width, selectedOption)] : left;
+		}
+
+		const leftWidth = Math.max(
+			DETAILS_MIN_LEFT_WIDTH,
+			Math.min(Math.floor(width * 0.42), width - DETAILS_MIN_RIGHT_WIDTH - 2),
+		);
+		const rightWidth = Math.max(1, width - leftWidth - 2);
+		const left = this.renderChoices(leftWidth);
+		const right = this.renderDetails(rightWidth, selectedOption);
+		const rows = Math.max(left.length, right.length);
+		return Array.from({ length: rows }, (_, index) => {
+			const leftLine = truncateToWidth(left[index] ?? "", leftWidth, "");
+			const padding = " ".repeat(Math.max(0, leftWidth - visibleWidth(leftLine)));
+			return truncateToWidth(`${leftLine}${padding}  ${right[index] ?? ""}`, width, "");
+		});
+	}
+
+	private renderChoices(width: number): string[] {
+		const lines: string[] = [];
+		for (let index = 0; index < this.question.options.length; index++) {
+			const option = this.question.options[index]!;
+			const focused = this.selectedRow === index;
+			const checked =
+				this.draft?.kind === "multi"
+					? this.draft.values.has(option.label)
+					: this.draft?.kind === "option" && this.draft.value === option.label;
+			const marker = this.question.multiSelect ? (checked ? "[x]" : "[ ]") : checked ? "(*)" : "( )";
+			const pointer = focused ? theme.fg("accent", "❯") : " ";
+			const label = focused ? theme.bold(option.label) : option.label;
+			const row = `${pointer} ${checked ? theme.fg("accent", marker) : marker} ${label}`;
+			lines.push(...new Text(row, 1, 0, focused ? (line) => theme.bg("selectedBg", line) : undefined).render(width));
+		}
+		lines.push(...this.input.render(width));
+		return lines;
+	}
+
+	private renderDetails(width: number, option: QuestionRequest["questions"][number]["options"][number]): string[] {
+		const frameWidth = Math.max(12, width);
+		const contentWidth = Math.max(1, frameWidth - 4);
+		const title = ` ${truncateToWidth(option.label, Math.max(1, frameWidth - 6), "…")} `;
+		const top = `┌${title}${"─".repeat(Math.max(0, frameWidth - visibleWidth(title) - 2))}┐`;
+		const body = [
+			...new Text(theme.fg("muted", option.description), 0, 0).render(contentWidth),
+			...(option.preview
+				? ["", ...new Markdown(option.preview, 0, 0, getMarkdownTheme()).render(contentWidth)]
+				: []),
+		];
+		return [
+			theme.fg("borderAccent", fitLine(top, frameWidth)),
+			...body.map((line) => `│ ${fitLine(line, contentWidth)} │`),
+			theme.fg("borderAccent", `└${"─".repeat(Math.max(0, frameWidth - 2))}┘`),
+		];
+	}
+}
 
 export class QuestionnaireComponent extends Container {
 	private readonly request: QuestionRequest;
@@ -92,13 +191,7 @@ export class QuestionnaireComponent extends Container {
 		this.addChild(new Spacer(1));
 		this.renderFooter(state);
 		if (this.state.kind === "cancelConfirm") {
-			this.addChild(
-				new Text(
-					theme.fg("warning", "Cancel this questionnaire? Press y to confirm or any other key to return."),
-					1,
-					0,
-				),
-			);
+			this.addChild(new Text(theme.fg("warning", "Press Esc again to cancel, or any other key to return."), 1, 0));
 		}
 		this.addChild(new Spacer(1));
 		this.addChild(new DynamicBorder());
@@ -126,28 +219,12 @@ export class QuestionnaireComponent extends Container {
 		this.addChild(new Text(question.question, 1, 0));
 		this.addChild(new Text(theme.fg("muted", mode), 1, 0));
 		this.addChild(new Spacer(1));
-
-		for (let index = 0; index < question.options.length; index++) {
-			const option = question.options[index]!;
-			const focused = state.selectedRow === index;
-			const checked =
-				draft?.kind === "multi"
-					? draft.values.has(option.label)
-					: draft?.kind === "option" && draft.value === option.label;
-			const marker = question.multiSelect ? (checked ? "[x]" : "[ ]") : checked ? "(*)" : "( )";
-			this.addRow(`${focused ? "❯" : " "} ${marker} ${option.label}`, focused, checked ? "accent" : undefined);
-			this.addChild(new Text(`    ${theme.fg("muted", option.description)}`, 1, 0));
-		}
-
-		const inputFocused = state.selectedRow === question.options.length;
 		const input = this.getCustomInput(state.questionIndex);
-		input.focused = inputFocused;
-		this.addRow(`${inputFocused ? "❯" : " "} Other`, inputFocused, "muted");
-		this.addChild(input);
+		this.addChild(new QuestionChoicePane(question, state.selectedRow, draft, input));
 		if (this.error) this.addChild(new Text(theme.fg("error", this.error), 1, 0));
 	}
 
-	private renderSubmit(state: Extract<ActiveViewState, { kind: "submit" }>): void {
+	private renderSubmit(_state: Extract<ActiveViewState, { kind: "submit" }>): void {
 		this.addChild(new Text(theme.fg("accent", theme.bold("Review your answers")), 1, 0));
 		this.addChild(new Spacer(1));
 		for (let index = 0; index < this.request.questions.length; index++) {
@@ -167,18 +244,13 @@ export class QuestionnaireComponent extends Container {
 			this.addChild(new Text(theme.fg("warning", "Answer the remaining questions before submitting."), 1, 0));
 		}
 		this.addChild(new Spacer(1));
-		this.addRow(
-			`${state.selectedRow === 0 ? "❯" : " "} Submit answers`,
-			state.selectedRow === 0,
-			this.hasAllAnswers() ? "accent" : "muted",
-		);
-		this.addRow(`${state.selectedRow === 1 ? "❯" : " "} Cancel`, state.selectedRow === 1, "muted");
+		this.addRow("❯ Submit answers", true, this.hasAllAnswers() ? "accent" : "muted");
 	}
 
 	private renderFooter(state: ActiveViewState): void {
 		const hints =
 			state.kind === "submit"
-				? `${rawKeyHint("←→", "switch tab")}  ${rawKeyHint("↑↓", "choose")}  ${rawKeyHint("Enter", "confirm")}  ${rawKeyHint("Esc", "cancel")}`
+				? `${rawKeyHint("←→", "switch tab")}  ${rawKeyHint("Enter", "submit")}  ${rawKeyHint("Esc", "cancel")}`
 				: `${rawKeyHint("←→", "switch tab")}  ${rawKeyHint("↑↓", "navigate")}  ${rawKeyHint("Space", "select/unselect")}  ${rawKeyHint("Esc", "cancel")}`;
 		this.addChild(new Text(hints, 1, 0));
 	}
@@ -189,16 +261,14 @@ export class QuestionnaireComponent extends Container {
 		this.error = undefined;
 		this.state =
 			next === this.request.questions.length
-				? { kind: "submit", selectedRow: 0 }
+				? { kind: "submit" }
 				: { kind: "question", questionIndex: next, selectedRow: 0 };
 		this.rebuild();
 	}
 
 	private moveRow(delta: number): void {
 		const state = this.activeState;
-		if (state.kind === "submit") {
-			this.state = { kind: "submit", selectedRow: state.selectedRow === 0 ? 1 : 0 };
-		} else {
+		if (state.kind === "question") {
 			const optionCount = this.request.questions[state.questionIndex]!.options.length + 1;
 			this.state = {
 				...state,
@@ -277,8 +347,9 @@ export class QuestionnaireComponent extends Container {
 	}
 
 	handleInput(data: string): void {
+		const kb = getKeybindings();
 		if (this.state.kind === "cancelConfirm") {
-			if (data.toLocaleLowerCase() === "y") this.done({ cancelled: true });
+			if (matchesKey(data, Key.escape)) this.done({ cancelled: true });
 			else {
 				this.state = this.state.returnTo;
 				this.rebuild();
@@ -294,8 +365,7 @@ export class QuestionnaireComponent extends Container {
 			return;
 		}
 
-		const kb = getKeybindings();
-		if (kb.matches(data, "tui.select.cancel")) {
+		if (matchesKey(data, Key.escape)) {
 			this.requestCancel();
 			return;
 		}
@@ -311,8 +381,7 @@ export class QuestionnaireComponent extends Container {
 		const state = this.activeState;
 		if (state.kind === "submit") {
 			if (kb.matches(data, "tui.select.confirm") || data === "\n" || data === "\r") {
-				if (state.selectedRow === 0) this.submitAnswers();
-				else this.requestCancel();
+				this.submitAnswers();
 			}
 			return;
 		}

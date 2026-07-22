@@ -37,6 +37,22 @@ describe("structured questions", () => {
 		expect(validateQuestionDefinitions(input)).toEqual(input.questions);
 	});
 
+	it("normalizes optional Markdown previews", () => {
+		const withPreview: AskUserQuestionInput = {
+			questions: [
+				{
+					...input.questions[0],
+					options: [
+						{ ...input.questions[0].options[0], preview: "  ```ts\nconst safe = true;\n```  " },
+						input.questions[0].options[1],
+					],
+				},
+			],
+		};
+
+		expect(validateQuestionDefinitions(withPreview)[0]?.options[0]?.preview).toBe("```ts\nconst safe = true;\n```");
+	});
+
 	it("rejects duplicate and reserved labels", () => {
 		expect(() =>
 			validateQuestionDefinitions({

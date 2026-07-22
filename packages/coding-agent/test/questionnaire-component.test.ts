@@ -1,3 +1,4 @@
+import { visibleWidth } from "@frelion/bone-tui";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { QuestionRequest } from "../src/core/question.ts";
 import { QuestionnaireComponent } from "../src/modes/interactive/components/questionnaire.ts";
@@ -16,7 +17,7 @@ const request: QuestionRequest = {
 			question: "Which mode?",
 			header: "Mode",
 			options: [
-				{ label: "Fast", description: "Fast path" },
+				{ label: "Fast", description: "Fast path", preview: "```ts\nrun({ checks: false });\n```" },
 				{ label: "Safe", description: "Safe path" },
 			],
 		},
@@ -35,9 +36,9 @@ const request: QuestionRequest = {
 describe("QuestionnaireComponent", () => {
 	beforeEach(() => initTheme("dark"));
 
-	function rendered(component: QuestionnaireComponent): string {
+	function rendered(component: QuestionnaireComponent, width = 100): string {
 		return component
-			.render(100)
+			.render(width)
 			.join("\n")
 			.replace(/\u001b\[[0-9;]*m/g, "");
 	}
@@ -67,6 +68,26 @@ describe("QuestionnaireComponent", () => {
 		expect(rendered(component)).toContain("□ Mode");
 	});
 
+	it("shows focused option details beside choices on wide panes", () => {
+		const component = new QuestionnaireComponent(request, vi.fn());
+		const output = rendered(component, 120);
+
+		expect(output).toContain("❯ ( ) Fast");
+		expect(output).toContain("Fast path");
+		expect(output).toContain("run({ checks: false });");
+		expect(component.render(120).every((line) => visibleWidth(line) <= 120)).toBe(true);
+	});
+
+	it("stacks focused option details below choices on narrow panes", () => {
+		const component = new QuestionnaireComponent(request, vi.fn());
+		const output = rendered(component, 72);
+
+		expect(output).toContain("❯ ( ) Fast");
+		expect(output).toContain("Fast path");
+		expect(output.indexOf("Fast path")).toBeGreaterThan(output.indexOf("Safe"));
+		expect(component.render(72).every((line) => visibleWidth(line) <= 72)).toBe(true);
+	});
+
 	it("toggles multiple options with Space and remains on the question tab", () => {
 		const component = new QuestionnaireComponent(request, vi.fn());
 		component.handleInput(RIGHT);
@@ -79,13 +100,14 @@ describe("QuestionnaireComponent", () => {
 		expect(rendered(component)).toContain("Which clients?");
 	});
 
-	it("renders Other as a direct input and stores typed text without Enter", () => {
+	it("renders a direct unlabeled input and stores typed text without Enter", () => {
 		const component = new QuestionnaireComponent(request, vi.fn());
 		component.handleInput(DOWN);
 		component.handleInput(DOWN);
 		component.handleInput("Custom j/k mode");
 
 		expect(rendered(component)).toContain("Custom j/k mode");
+		expect(rendered(component)).not.toContain("Other");
 		expect(rendered(component)).toContain("■ Mode");
 		expect(rendered(component)).toContain("Which mode?");
 	});
@@ -101,6 +123,7 @@ describe("QuestionnaireComponent", () => {
 		expect(rendered(component)).toContain("Review your answers");
 		expect(rendered(component)).toContain("Mode: Fast");
 		expect(rendered(component)).toContain("Clients: TUI");
+		expect(rendered(component)).not.toContain("Cancel");
 		expect(done).not.toHaveBeenCalled();
 
 		component.handleInput("\r");
@@ -125,7 +148,7 @@ describe("QuestionnaireComponent", () => {
 		expect(rendered(component)).toContain("Answer every question before submitting.");
 	});
 
-	it("returns to Submit when cancellation is not confirmed", () => {
+	it("returns to Submit when the second key is not Escape", () => {
 		const done = vi.fn();
 		const component = new QuestionnaireComponent(request, done);
 		component.handleInput(LEFT);
@@ -137,12 +160,22 @@ describe("QuestionnaireComponent", () => {
 		expect(done).not.toHaveBeenCalled();
 	});
 
-	it("requires cancellation confirmation", () => {
+	it("cancels after pressing Escape twice", () => {
 		const done = vi.fn();
 		const component = new QuestionnaireComponent(request, done);
 		component.handleInput("\x1b");
 		expect(done).not.toHaveBeenCalled();
-		component.handleInput("y");
+		component.handleInput("\x1b");
 		expect(done).toHaveBeenCalledWith({ cancelled: true });
+	});
+
+	it("does not treat Ctrl+C as questionnaire cancellation", () => {
+		const done = vi.fn();
+		const component = new QuestionnaireComponent(request, done);
+		component.handleInput("\x03");
+		component.handleInput("\x03");
+
+		expect(done).not.toHaveBeenCalled();
+		expect(rendered(component)).not.toContain("Press Esc again");
 	});
 });
