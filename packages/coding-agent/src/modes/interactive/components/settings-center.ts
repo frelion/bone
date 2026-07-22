@@ -1,5 +1,14 @@
 import type { Credential } from "@frelion/bone-ai";
-import { type Component, type Focusable, getKeybindings, Input, truncateToWidth } from "@frelion/bone-tui";
+import {
+	type Component,
+	CURSOR_MARKER,
+	type Focusable,
+	getKeybindings,
+	Input,
+	truncateToWidth,
+} from "@frelion/bone-tui";
+import type { ForgeConfig, ForgeInstanceConfig } from "../../../core/forge/config.ts";
+import type { ForgeRepositoryRef } from "../../../core/forge/contracts.ts";
 import type { ModelsJson, ModelsJsonModel } from "../../../core/model-config.ts";
 import type { ExtensionProviderRuntimeStatus } from "../../../core/model-runtime.ts";
 import type { ProviderPreset } from "../../../core/provider-presets.ts";
@@ -19,7 +28,7 @@ import {
 import { ProviderFormComponent, type ProviderFormDraft } from "./provider-form.ts";
 import { alignEnd, joinColumns } from "./terminal-layout.ts";
 
-type PageId = "providers" | "defaults" | "delivery" | "appearance" | "tools" | "resources" | "security";
+type PageId = "providers" | "defaults" | "delivery" | "appearance" | "tools" | "forge" | "resources" | "security";
 type SettingsFocus = "scope" | "navigation" | "content" | "actions";
 export type SettingsProviderErrorTarget = {
 	providerId?: string;
@@ -248,6 +257,10 @@ export interface SettingsCenterSaveRequest {
 	project: Settings;
 	models: ModelsJson;
 	credentials: ProviderCredentialMutation[];
+	forge?: {
+		config: ForgeConfig;
+		credential?: { key: string; token: string | undefined };
+	};
 }
 
 export interface SettingsCenterOptions {
@@ -260,6 +273,11 @@ export interface SettingsCenterOptions {
 	providerAuthentication?: Readonly<Record<string, ProviderAuthenticationStatus>>;
 	/** Runtime-derived, credential-free Provider templates. */
 	providerPresets?: readonly ProviderPreset[];
+	forge?: {
+		repository?: ForgeRepositoryRef;
+		config: ForgeConfig;
+		configuredCredentialKeys: readonly string[];
+	};
 	resources?: {
 		settingsManager: SettingsManager;
 		resolvedPaths: ScopedResolvedPaths;
@@ -283,6 +301,7 @@ const PAGES: readonly Page[] = [
 	{ id: "delivery", label: "Context & Delivery" },
 	{ id: "appearance", label: "Appearance & Terminal" },
 	{ id: "tools", label: "Tools, Shell & Network" },
+	{ id: "forge", label: "GitLab & GitHub" },
 	{ id: "resources", label: "Resources" },
 	{ id: "security", label: "Security & Data" },
 ];
@@ -304,6 +323,11 @@ export class SettingsCenterComponent implements Component, Focusable {
 	private globalDraft: Settings;
 	private projectDraft: Settings;
 	private modelsDraft: ModelsJson;
+	private forgeDraft: ForgeConfig | undefined;
+	private forgeInstanceDraft: ForgeInstanceConfig | undefined;
+	private readonly forgeOriginalIdentity: string | undefined;
+	private forgeDirty = false;
+	private forgeCredentialMutation: { key: string; token: string | undefined } | undefined;
 	private scope: SettingsScope = "global";
 	private focus: SettingsFocus = "navigation";
 	private footerAction: "cancel" | "save" = "save";
@@ -326,7 +350,12 @@ export class SettingsCenterComponent implements Component, Focusable {
 		| undefined;
 	private overrideTarget: { providerId: string; id: string } | undefined;
 	private settingEditor:
-		| { label: string; apply: (value: string) => string | undefined; preserveWhitespace?: boolean }
+		| {
+				label: string;
+				apply: (value: string) => string | undefined;
+				preserveWhitespace?: boolean;
+				sensitive?: boolean;
+		  }
 		| undefined;
 	private modelDeletionPicker: { targets: ModelDeletionTarget[]; index: number; confirming: boolean } | undefined;
 	private actionMenu: SettingsActionMenu | undefined;
@@ -351,6 +380,17 @@ export class SettingsCenterComponent implements Component, Focusable {
 		this.globalDraft = structuredClone(options.global);
 		this.projectDraft = structuredClone(options.project);
 		this.modelsDraft = structuredClone(options.models);
+		this.forgeDraft = options.forge ? structuredClone(options.forge.config) : undefined;
+		const repository = options.forge?.repository;
+		const persistedInstance = repository
+			? options.forge?.config.instances.find(
+					(instance) => instance.provider === repository.provider && instance.host === repository.host,
+				)
+			: undefined;
+		this.forgeOriginalIdentity = persistedInstance
+			? `${persistedInstance.provider}:${persistedInstance.host}`
+			: undefined;
+		this.forgeInstanceDraft = this.initialForgeInstance();
 		this.providersBrowser.onActivate = (entry) => this.openModelsProvidersEntry(entry);
 		if (options.resources) {
 			this.resourceList = createResourceSettingsList(
@@ -592,6 +632,8 @@ export class SettingsCenterComponent implements Component, Focusable {
 				return [title, "", ...this.renderRows(width, this.appearanceRows())];
 			case "tools":
 				return [title, "", ...this.renderRows(width, this.toolsRows())];
+			case "forge":
+				return [title, "", ...this.renderRows(width, this.forgeRows())];
 			case "resources":
 				return this.renderResources(title, width);
 			case "security":
@@ -1163,7 +1205,15 @@ export class SettingsCenterComponent implements Component, Focusable {
 			...advancedSummary,
 			...compatSummary,
 			promptByStep[this.editorStep!],
-			...this.input!.render(width),
+			...(this.settingEditor?.sensitive
+				? [
+						truncateToWidth(
+							`> ${"*".repeat(Math.min(this.input!.getValue().length, Math.max(0, width - 3)))}${this.focused ? CURSOR_MARKER : ""}`,
+							width,
+							"",
+						),
+					]
+				: this.input!.render(width)),
 			"",
 			theme.fg("muted", "Enter next · Esc cancel"),
 		];
@@ -1774,6 +1824,148 @@ export class SettingsCenterComponent implements Component, Focusable {
 		];
 	}
 
+	private initialForgeInstance(): ForgeInstanceConfig | undefined {
+		const repository = this.options.forge?.repository;
+		if (!repository) return undefined;
+		const configured = this.options.forge?.config.instances.find(
+			(instance) => instance.provider === repository.provider && instance.host === repository.host,
+		);
+		if (configured) return structuredClone(configured);
+		return {
+			provider: repository.provider,
+			host: repository.host,
+			apiBaseUrl:
+				repository.host === "github.com"
+					? "https://api.github.com"
+					: repository.host === "gitlab.com"
+						? "https://gitlab.com"
+						: `https://${repository.host}`,
+			credential: `${repository.provider}:${repository.host}`,
+			allowPrivateNetwork: false,
+		};
+	}
+
+	private forgeRows(): SettingsRow[] {
+		const repository = this.options.forge?.repository;
+		const instance = this.forgeInstanceDraft;
+		if (!repository || !instance) {
+			return [
+				{
+					label: "Repository",
+					value: "No Git remote detected",
+					action: () => this.statusMessage("No Git remote detected"),
+				},
+			];
+		}
+		const credentialKey = instance.credential ?? `${instance.provider}:${instance.host}`;
+		const staged = this.forgeCredentialMutation?.key === credentialKey;
+		const configured = this.options.forge?.configuredCredentialKeys.includes(credentialKey) === true;
+		const credentialStatus = staged
+			? this.forgeCredentialMutation?.token === undefined
+				? "Removal staged"
+				: "Staged"
+			: configured
+				? "Configured"
+				: "Not configured";
+		return [
+			{
+				label: "Repository",
+				value: `${repository.host}/${repository.projectPath}`,
+				action: () => this.statusMessage("Repository is detected from the current Git remote"),
+			},
+			{
+				label: "Platform",
+				value: instance.provider === "gitlab" ? "GitLab" : "GitHub",
+				action: this.globalOnly(() => {
+					const provider = instance.provider === "gitlab" ? "github" : "gitlab";
+					const identity = `${provider}:${instance.host}`;
+					if (
+						identity !== this.forgeOriginalIdentity &&
+						this.forgeDraft?.instances.some((candidate) => `${candidate.provider}:${candidate.host}` === identity)
+					) {
+						this.status = `${provider === "gitlab" ? "GitLab" : "GitHub"} is already configured for this host`;
+						return;
+					}
+					instance.provider = provider;
+					instance.credential = `${instance.provider}:${instance.host}`;
+					this.forgeCredentialMutation = undefined;
+					this.forgeDirty = true;
+				}),
+			},
+			{
+				label: "API base URL",
+				value: instance.apiBaseUrl,
+				action: this.globalOnly(() =>
+					this.editSetting("API base URL", instance.apiBaseUrl, (next) => {
+						try {
+							const url = new URL(next);
+							if (url.protocol !== "https:") return "Forge API base URL must use HTTPS";
+							const apiBaseUrl = next.replace(/\/$/, "");
+							if (instance.apiBaseUrl !== apiBaseUrl) this.forgeDirty = true;
+							instance.apiBaseUrl = apiBaseUrl;
+							return undefined;
+						} catch {
+							return "Enter a valid HTTPS URL";
+						}
+					}),
+				),
+			},
+			{
+				label: "Private network",
+				value: boolValue(instance.allowPrivateNetwork),
+				action: this.globalOnly(() => {
+					instance.allowPrivateNetwork = !instance.allowPrivateNetwork;
+					this.forgeDirty = true;
+				}),
+			},
+			{
+				label: "Credential key",
+				value: credentialKey,
+				action: this.globalOnly(() =>
+					this.editSetting("Credential key", credentialKey, (next) => {
+						if (!next) return "Credential key is required";
+						if (credentialKey !== next) this.forgeDirty = true;
+						instance.credential = next;
+						this.forgeCredentialMutation = undefined;
+						return undefined;
+					}),
+				),
+			},
+			{
+				label: "Token",
+				value: credentialStatus,
+				action: this.globalOnly(() => this.openForgeCredentialMenu(credentialKey)),
+			},
+		];
+	}
+
+	private openForgeCredentialMenu(key: string): void {
+		this.openActionMenu("Forge token", key, [
+			{
+				label: "Set token or $ENV_VAR reference",
+				action: () =>
+					this.editSetting(
+						"Token or $ENV_VAR",
+						"",
+						(token) => {
+							if (!token) return "Token or environment variable reference is required";
+							this.forgeCredentialMutation = { key, token };
+							return undefined;
+						},
+						false,
+						true,
+					),
+			},
+			{
+				label: "Clear token",
+				action: () => {
+					this.forgeCredentialMutation = { key, token: undefined };
+					this.status = "Forge token removal added to draft";
+				},
+			},
+		]);
+	}
+
 	private globalOnly(action: () => void): () => void {
 		return () => {
 			if (this.scope !== "global") {
@@ -1789,6 +1981,7 @@ export class SettingsCenterComponent implements Component, Focusable {
 		if (page === "delivery") return this.deliveryRows();
 		if (page === "appearance") return this.appearanceRows();
 		if (page === "tools") return this.toolsRows();
+		if (page === "forge") return this.forgeRows();
 		if (page === "security") return this.securityRows();
 		return [];
 	}
@@ -1803,8 +1996,9 @@ export class SettingsCenterComponent implements Component, Focusable {
 		value: string,
 		apply: (next: string) => string | undefined,
 		preserveWhitespace = false,
+		sensitive = false,
 	): void {
-		this.settingEditor = { label, apply, preserveWhitespace };
+		this.settingEditor = { label, apply, preserveWhitespace, sensitive };
 		this.editorStep = "settingValue";
 		this.input = new Input();
 		this.input.focused = this.focused;
@@ -3174,6 +3368,20 @@ export class SettingsCenterComponent implements Component, Focusable {
 					providerId,
 					credential: credential ? structuredClone(credential) : undefined,
 				})),
+				forge:
+					this.forgeDraft && this.forgeInstanceDraft && (this.forgeDirty || this.forgeCredentialMutation)
+						? {
+								config: {
+									instances: [
+										...this.forgeDraft.instances.filter(
+											(instance) => `${instance.provider}:${instance.host}` !== this.forgeOriginalIdentity,
+										),
+										structuredClone(this.forgeInstanceDraft),
+									],
+								},
+								credential: this.forgeCredentialMutation ? { ...this.forgeCredentialMutation } : undefined,
+							}
+						: undefined,
 			});
 			this.status = "Saved — changes are applied. Esc closes Settings.";
 		} catch (error) {

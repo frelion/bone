@@ -5,6 +5,7 @@
 ### Added
 
 - Added built-in Plan Mode for read-only investigation, persisted Markdown proposals, explicit execute/revise/cancel approval, automatic execution after approval, and matching TUI, SDK, and RPC state and actions.
+- Added built-in governed GitLab and GitHub tools with self-managed GitLab capability negotiation, fine-grained token storage, repository policy gates, mutation replay protection, bounded status polling, and Plan Mode read access.
 
 ## [0.1.0] - 2026-07-21
 

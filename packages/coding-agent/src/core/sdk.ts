@@ -17,15 +17,24 @@ import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
 import { time } from "./timings.ts";
 import {
+	type CreateForgeToolDefinitionsOptions,
 	createBashTool,
 	createCodingTools,
 	createEditTool,
 	createFindTool,
+	createForgeToolDefinitions,
+	createForgeTools,
 	createGrepTool,
 	createLsTool,
 	createReadOnlyTools,
 	createReadTool,
 	createWriteTool,
+	FORGE_READ_TOOL_NAMES,
+	FORGE_TOOL_NAMES,
+	FORGE_WRITE_TOOL_NAMES,
+	type ForgeService,
+	type ForgeToolContext,
+	type ForgeToolName,
 	type ToolName,
 	withFileMutationQueue,
 } from "./tools/index.ts";
@@ -64,6 +73,8 @@ export interface CreateAgentSessionOptions {
 	tools?: string[];
 	/** Optional denylist of tool names to disable. Applies after `tools` when both are provided. */
 	excludeTools?: string[];
+	/** Optional Forge service implementation. When omitted, the built-in service is created lazily. */
+	forgeService?: ForgeService;
 	/** Custom tools to register (in addition to built-in tools). */
 	customTools?: ToolDefinition[];
 
@@ -117,7 +128,16 @@ export {
 	createWriteTool,
 	createGrepTool,
 	createFindTool,
+	createForgeToolDefinitions,
+	createForgeTools,
 	createLsTool,
+	FORGE_READ_TOOL_NAMES,
+	FORGE_TOOL_NAMES,
+	FORGE_WRITE_TOOL_NAMES,
+	type CreateForgeToolDefinitionsOptions,
+	type ForgeService,
+	type ForgeToolContext,
+	type ForgeToolName,
 };
 
 // Helper Functions
@@ -237,7 +257,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
 	}
 
-	const defaultActiveToolNames: ToolName[] = ["read", "bash", "edit", "write"];
+	const defaultActiveToolNames: ToolName[] = ["read", "bash", "edit", "write", ...FORGE_TOOL_NAMES];
 	const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
 	const excludedToolNames = options.excludeTools;
 	const excludedToolNameSet = excludedToolNames ? new Set(excludedToolNames) : undefined;
@@ -373,6 +393,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager,
 		settingsManager,
 		cwd,
+		agentDir,
+		forgeService: options.forgeService,
 		scopedModels: options.scopedModels,
 		resourceLoader,
 		customTools: options.customTools,

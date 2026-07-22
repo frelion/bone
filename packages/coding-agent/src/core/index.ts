@@ -77,4 +77,5 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export * from "./forge/index.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";

@@ -99,7 +99,7 @@ There is no `--extension`, `-e`, or `--no-extensions` option. Bone never discove
 | `--no-builtin-tools`, `-nbt` | Disable built-in tools |
 | `--no-tools`, `-nt` | Disable all tools |
 
-Built-in tools are `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls`.
+Built-in tools are `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, and the `forge_*` GitLab/GitHub tools. See [GitLab and GitHub integration](../../../docs/forge.md).
 
 ### Examples
 

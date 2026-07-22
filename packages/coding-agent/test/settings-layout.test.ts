@@ -55,6 +55,232 @@ describe("ModalShell", () => {
 });
 
 describe("SettingsCenterComponent layout", () => {
+	it("configures the current Forge instance and masks a staged token", async () => {
+		let saved:
+			| Parameters<NonNullable<ConstructorParameters<typeof SettingsCenterComponent>[0]["onSave"]>>[0]
+			| undefined;
+		let resolveSaved: (() => void) | undefined;
+		const savedPromise = new Promise<void>((resolve) => {
+			resolveSaved = resolve;
+		});
+		const settings = new SettingsCenterComponent({
+			global: {},
+			project: {},
+			projectTrusted: true,
+			models: { providers: {} } as ModelsJson,
+			forge: {
+				repository: {
+					provider: "gitlab",
+					host: "gitlab.company.test",
+					projectPath: "team/service",
+					remoteName: "origin",
+					remoteUrl: "git@gitlab.company.test:team/service.git",
+					rootDir: "/workspace/service",
+				},
+				config: { instances: [] },
+				configuredCredentialKeys: [],
+			},
+			onSave: async (request) => {
+				saved = request;
+				resolveSaved?.();
+			},
+			onCancel: () => {},
+			onStartOAuth: () => {},
+		});
+		settings.setViewportRows(24);
+		for (let index = 0; index < 5; index++) settings.handleInput("\x1b[B");
+		settings.handleInput("\x1b[c");
+		expect(stripVTControlCharacters(settings.render(100).join("\n"))).toContain("gitlab.company.test/team/service");
+		for (let index = 0; index < 5; index++) settings.handleInput("\x1b[B");
+		settings.handleInput("\r");
+		settings.handleInput("\r");
+		const token = "glpat-settings-secret";
+		settings.handleInput(token);
+		expect(stripVTControlCharacters(settings.render(100).join("\n"))).not.toContain(token);
+		settings.handleInput("\r");
+		settings.handleInput("\x13");
+		await savedPromise;
+
+		expect(saved?.forge).toMatchObject({
+			config: {
+				instances: [
+					{
+						provider: "gitlab",
+						host: "gitlab.company.test",
+						apiBaseUrl: "https://gitlab.company.test",
+					},
+				],
+			},
+			credential: { key: "gitlab:gitlab.company.test", token },
+		});
+	});
+
+	it("discards a staged Forge token when the platform identity changes", async () => {
+		let saved:
+			| Parameters<NonNullable<ConstructorParameters<typeof SettingsCenterComponent>[0]["onSave"]>>[0]
+			| undefined;
+		let resolveSaved: (() => void) | undefined;
+		const savedPromise = new Promise<void>((resolve) => {
+			resolveSaved = resolve;
+		});
+		const settings = new SettingsCenterComponent({
+			global: {},
+			project: {},
+			projectTrusted: true,
+			models: { providers: {} } as ModelsJson,
+			forge: {
+				repository: {
+					provider: "gitlab",
+					host: "forge.company.test",
+					projectPath: "team/service",
+					remoteName: "origin",
+					remoteUrl: "git@forge.company.test:team/service.git",
+					rootDir: "/workspace/service",
+				},
+				config: { instances: [] },
+				configuredCredentialKeys: [],
+			},
+			onSave: async (request) => {
+				saved = request;
+				resolveSaved?.();
+			},
+			onCancel: () => {},
+			onStartOAuth: () => {},
+		});
+		settings.setViewportRows(24);
+		for (let index = 0; index < 5; index++) settings.handleInput("\x1b[B");
+		settings.handleInput("\x1b[c");
+		for (let index = 0; index < 5; index++) settings.handleInput("\x1b[B");
+		settings.handleInput("\r");
+		settings.handleInput("\r");
+		settings.handleInput("glpat-discarded-draft");
+		settings.handleInput("\r");
+		for (let index = 0; index < 4; index++) settings.handleInput("\x1b[A");
+		settings.handleInput("\r");
+		settings.handleInput("\x13");
+		await savedPromise;
+
+		expect(saved?.forge?.config.instances).toMatchObject([
+			{
+				provider: "github",
+				host: "forge.company.test",
+				credential: "github:forge.company.test",
+			},
+		]);
+		expect(saved?.forge?.credential).toBeUndefined();
+	});
+
+	it("preserves another provider configured on the same Forge host", async () => {
+		let saved:
+			| Parameters<NonNullable<ConstructorParameters<typeof SettingsCenterComponent>[0]["onSave"]>>[0]
+			| undefined;
+		let resolveSaved: (() => void) | undefined;
+		const savedPromise = new Promise<void>((resolve) => {
+			resolveSaved = resolve;
+		});
+		const settings = new SettingsCenterComponent({
+			global: {},
+			project: {},
+			projectTrusted: true,
+			models: { providers: {} } as ModelsJson,
+			forge: {
+				repository: {
+					provider: "gitlab",
+					host: "forge.company.test",
+					projectPath: "team/service",
+					remoteName: "origin",
+					remoteUrl: "git@forge.company.test:team/service.git",
+					rootDir: "/workspace/service",
+				},
+				config: {
+					instances: [
+						{
+							provider: "gitlab",
+							host: "forge.company.test",
+							apiBaseUrl: "https://forge.company.test",
+							allowPrivateNetwork: false,
+						},
+						{
+							provider: "github",
+							host: "forge.company.test",
+							apiBaseUrl: "https://forge.company.test/api",
+							allowPrivateNetwork: false,
+						},
+					],
+				},
+				configuredCredentialKeys: [],
+			},
+			onSave: async (request) => {
+				saved = request;
+				resolveSaved?.();
+			},
+			onCancel: () => {},
+			onStartOAuth: () => {},
+		});
+		for (let index = 0; index < 5; index++) settings.handleInput("\x1b[B");
+		settings.handleInput("\x1b[c");
+		for (let index = 0; index < 3; index++) settings.handleInput("\x1b[B");
+		settings.handleInput("\r");
+		settings.handleInput("\x13");
+		await savedPromise;
+
+		expect(saved?.forge?.config.instances).toEqual([
+			{
+				provider: "github",
+				host: "forge.company.test",
+				apiBaseUrl: "https://forge.company.test/api",
+				allowPrivateNetwork: false,
+			},
+			{
+				provider: "gitlab",
+				host: "forge.company.test",
+				apiBaseUrl: "https://forge.company.test",
+				allowPrivateNetwork: true,
+			},
+		]);
+	});
+
+	it("does not submit Forge changes when saving project settings without editing Forge", async () => {
+		let saved:
+			| Parameters<NonNullable<ConstructorParameters<typeof SettingsCenterComponent>[0]["onSave"]>>[0]
+			| undefined;
+		let resolveSaved: (() => void) | undefined;
+		const savedPromise = new Promise<void>((resolve) => {
+			resolveSaved = resolve;
+		});
+		const settings = new SettingsCenterComponent({
+			global: {},
+			project: {},
+			projectTrusted: true,
+			models: { providers: {} } as ModelsJson,
+			forge: {
+				repository: {
+					provider: "gitlab",
+					host: "forge.company.test",
+					projectPath: "team/service",
+					remoteName: "origin",
+					remoteUrl: "git@forge.company.test:team/service.git",
+					rootDir: "/workspace/service",
+				},
+				config: { instances: [] },
+				configuredCredentialKeys: [],
+			},
+			onSave: async (request) => {
+				saved = request;
+				resolveSaved?.();
+			},
+			onCancel: () => {},
+			onStartOAuth: () => {},
+		});
+		settings.handleInput("\x1b[a");
+		settings.handleInput("\r");
+		expect(stripVTControlCharacters(settings.render(100).join("\n"))).toContain("Project scope");
+		settings.handleInput("\x13");
+		await savedPromise;
+
+		expect(saved?.forge).toBeUndefined();
+	});
+
 	it("renders bounded, aligned rows at desktop and compact terminal widths", () => {
 		const models = {
 			providers: {

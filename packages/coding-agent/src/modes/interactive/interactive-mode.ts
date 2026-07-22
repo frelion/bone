@@ -74,6 +74,9 @@ import type {
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
+import { loadForgeConfig, parseForgeConfig, resolveForgeProvider, saveForgeConfig } from "../../core/forge/config.ts";
+import { resolveForgeContext } from "../../core/forge/context-resolver.ts";
+import { ForgeCredentialStore } from "../../core/forge/credential-store.ts";
 import { configureHttpDispatcher } from "../../core/http-dispatcher.ts";
 import type { InteractiveSessionHost, InteractiveSessionSummary } from "../../core/interactive-session-host.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
@@ -4543,6 +4546,32 @@ export class InteractiveMode {
 		const globalResolvedPaths = emptyResolvedPaths;
 		const projectResolvedPaths = projectTrusted ? emptyResolvedPaths : globalResolvedPaths;
 		const storedCredentials = await runtime.services.modelRuntime.listCredentials();
+		const forgeConfig = loadForgeConfig(agentDir);
+		const forgeCredentialStore = new ForgeCredentialStore(agentDir);
+		const forgeRepository = await resolveForgeContext(cwd).catch(() => undefined);
+		if (forgeRepository) {
+			forgeRepository.provider = resolveForgeProvider(forgeConfig, forgeRepository.host, forgeRepository.provider);
+		}
+		const forgeCredentialKeys = new Set(
+			forgeConfig.instances
+				.map((instance) => instance.credential ?? `${instance.provider}:${instance.host}`)
+				.filter((key) => forgeCredentialStore.has(key)),
+		);
+		for (const instance of forgeConfig.instances) {
+			const available =
+				instance.provider === "gitlab"
+					? Boolean(process.env.GITLAB_TOKEN ?? process.env.GITLAB_PRIVATE_TOKEN)
+					: Boolean(process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN);
+			if (available) forgeCredentialKeys.add(instance.credential ?? `${instance.provider}:${instance.host}`);
+		}
+		if (forgeRepository) {
+			const defaultKey = `${forgeRepository.provider}:${forgeRepository.host}`;
+			const environmentAvailable =
+				forgeRepository.provider === "gitlab"
+					? Boolean(process.env.GITLAB_TOKEN ?? process.env.GITLAB_PRIVATE_TOKEN)
+					: Boolean(process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN);
+			if (forgeCredentialStore.has(defaultKey) || environmentAvailable) forgeCredentialKeys.add(defaultKey);
+		}
 		const providerAuthentication = Object.fromEntries(
 			[
 				...new Set([
@@ -4569,6 +4598,11 @@ export class InteractiveMode {
 				.filter((provider): provider is NonNullable<typeof provider> => provider !== undefined),
 			providerAuthentication,
 			providerPresets: runtime.services.modelRuntime.getProviderPresets(),
+			forge: {
+				repository: forgeRepository,
+				config: forgeConfig,
+				configuredCredentialKeys: [...forgeCredentialKeys],
+			},
 			resources: {
 				settingsManager: resourceSettingsManager,
 				resolvedPaths: { global: globalResolvedPaths, project: projectResolvedPaths },
@@ -4592,6 +4626,16 @@ export class InteractiveMode {
 						this.modelValidationErrorTarget(message, request.models),
 					);
 				}
+				if (request.forge) {
+					try {
+						parseForgeConfig(JSON.stringify({ version: 1, instances: request.forge.config.instances }));
+					} catch (error) {
+						throw new SettingsCenterSaveError(
+							"forge",
+							`Forge configuration is invalid: ${error instanceof Error ? error.message : error}`,
+						);
+					}
+				}
 				const credentialsBefore = new Map(
 					await Promise.all(
 						request.credentials.map(
@@ -4614,6 +4658,8 @@ export class InteractiveMode {
 					path.join(runtime.cwd, CONFIG_DIR_NAME, "settings.json"),
 					modelsPath,
 					path.join(runtime.services.agentDir, "auth.json"),
+					path.join(runtime.services.agentDir, "forge.json"),
+					path.join(runtime.services.agentDir, "forge-auth.json"),
 				]);
 				try {
 					transactionJournal.markApplying();
@@ -4623,6 +4669,19 @@ export class InteractiveMode {
 						else await runtime.services.modelRuntime.clearProviderCredential(change.providerId);
 					}
 					ModelConfig.save(modelsPath, request.models);
+					if (request.forge) {
+						saveForgeConfig(runtime.services.agentDir, request.forge.config);
+						if (request.forge.credential) {
+							if (request.forge.credential.token === undefined) {
+								new ForgeCredentialStore(runtime.services.agentDir).remove(request.forge.credential.key);
+							} else {
+								new ForgeCredentialStore(runtime.services.agentDir).set(request.forge.credential.key, {
+									type: "token",
+									token: request.forge.credential.token,
+								});
+							}
+						}
+					}
 					await runtime.services.settingsManager.replaceScope("global", request.global);
 					if (runtime.services.settingsManager.isProjectTrusted()) {
 						await runtime.services.settingsManager.replaceScope("project", request.project);
