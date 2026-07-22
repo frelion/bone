@@ -3,6 +3,10 @@ import type { QuestionRequest } from "../src/core/question.ts";
 import { QuestionnaireComponent } from "../src/modes/interactive/components/questionnaire.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
+const LEFT = "\x1b[D";
+const RIGHT = "\x1b[C";
+const DOWN = "\x1b[B";
+
 const request: QuestionRequest = {
 	id: "request-1",
 	toolCallId: "tool-1",
@@ -38,22 +42,68 @@ describe("QuestionnaireComponent", () => {
 			.replace(/\u001b\[[0-9;]*m/g, "");
 	}
 
-	it("advances through questions and shows review before submission", () => {
+	it("renders questions and Submit as left/right navigable tabs", () => {
+		const component = new QuestionnaireComponent(request, vi.fn());
+		expect(rendered(component)).toContain("□ Mode");
+		expect(rendered(component)).toContain("□ Clients");
+		expect(rendered(component)).toContain("✓ Submit");
+
+		component.handleInput(RIGHT);
+		expect(rendered(component)).toContain("Which clients?");
+		component.handleInput(RIGHT);
+		expect(rendered(component)).toContain("Review your answers");
+		component.handleInput(LEFT);
+		expect(rendered(component)).toContain("Which clients?");
+	});
+
+	it("selects and unselects a single option with Space without changing tabs", () => {
+		const component = new QuestionnaireComponent(request, vi.fn());
+		component.handleInput(" ");
+		expect(rendered(component)).toContain("(*) Fast");
+		expect(rendered(component)).toContain("Which mode?");
+
+		component.handleInput(" ");
+		expect(rendered(component)).toContain("( ) Fast");
+		expect(rendered(component)).toContain("□ Mode");
+	});
+
+	it("toggles multiple options with Space and remains on the question tab", () => {
+		const component = new QuestionnaireComponent(request, vi.fn());
+		component.handleInput(RIGHT);
+		component.handleInput(" ");
+		component.handleInput(DOWN);
+		component.handleInput(" ");
+
+		expect(rendered(component)).toContain("[x] TUI");
+		expect(rendered(component)).toContain("[x] RPC");
+		expect(rendered(component)).toContain("Which clients?");
+	});
+
+	it("renders Other as a direct input and stores typed text without Enter", () => {
+		const component = new QuestionnaireComponent(request, vi.fn());
+		component.handleInput(DOWN);
+		component.handleInput(DOWN);
+		component.handleInput("Custom j/k mode");
+
+		expect(rendered(component)).toContain("Custom j/k mode");
+		expect(rendered(component)).toContain("■ Mode");
+		expect(rendered(component)).toContain("Which mode?");
+	});
+
+	it("submits complete answers from the Submit tab", () => {
 		const done = vi.fn();
 		const component = new QuestionnaireComponent(request, done);
-		component.handleInput("\r");
-		expect(rendered(component)).toContain("Clients  2/2");
 		component.handleInput(" ");
-		component.handleInput("\x1b[A");
-		component.handleInput("\r");
+		component.handleInput(RIGHT);
+		component.handleInput(" ");
+		component.handleInput(RIGHT);
 
-		expect(done).not.toHaveBeenCalled();
 		expect(rendered(component)).toContain("Review your answers");
 		expect(rendered(component)).toContain("Mode: Fast");
 		expect(rendered(component)).toContain("Clients: TUI");
+		expect(done).not.toHaveBeenCalled();
 
 		component.handleInput("\r");
-
 		expect(done).toHaveBeenCalledWith({
 			cancelled: false,
 			answers: [
@@ -63,73 +113,23 @@ describe("QuestionnaireComponent", () => {
 		});
 	});
 
-	it("returns to the first unanswered question after completing the last question", () => {
+	it("returns to the first unanswered question when Submit is incomplete", () => {
 		const done = vi.fn();
 		const component = new QuestionnaireComponent(request, done);
-		component.handleInput("\t");
-		component.handleInput(" ");
-		component.handleInput("\x1b[A");
+		component.handleInput(RIGHT);
+		component.handleInput(RIGHT);
 		component.handleInput("\r");
 
 		expect(done).not.toHaveBeenCalled();
-		expect(rendered(component)).toContain("Mode  1/2");
-		expect(rendered(component)).not.toContain("Review your answers");
+		expect(rendered(component)).toContain("Which mode?");
+		expect(rendered(component)).toContain("Answer every question before submitting.");
 	});
 
-	it("allows returning from review to modify answers", () => {
+	it("returns to Submit when cancellation is not confirmed", () => {
 		const done = vi.fn();
 		const component = new QuestionnaireComponent(request, done);
-		component.handleInput("\r");
-		component.handleInput(" ");
-		component.handleInput("\x1b[A");
-		component.handleInput("\r");
-		component.handleInput("\x1b[B");
-		component.handleInput("\r");
-
-		expect(rendered(component)).toContain("Clients  2/2");
-		expect(done).not.toHaveBeenCalled();
-	});
-
-	it("collects an Other answer and advances", () => {
-		const done = vi.fn();
-		const component = new QuestionnaireComponent(request, done);
-		component.handleInput("\x1b[A");
-		component.handleInput("\r");
-		component.handleInput("Custom mode");
-		component.handleInput("\r");
-
-		expect(rendered(component)).toContain("Clients  2/2");
-		expect(rendered(component)).toContain("■ Mode");
-	});
-
-	it("does not confirm a single-select question with Space", () => {
-		const done = vi.fn();
-		const component = new QuestionnaireComponent(request, done);
-		component.handleInput(" ");
-
-		expect(rendered(component)).toContain("Mode  1/2");
-		expect(rendered(component)).not.toContain("■ Mode");
-		expect(done).not.toHaveBeenCalled();
-	});
-
-	it("shows review after answering a single-question request", () => {
-		const done = vi.fn();
-		const component = new QuestionnaireComponent({ ...request, questions: [request.questions[0]!] }, done);
-		component.handleInput("\r");
-
+		component.handleInput(LEFT);
 		expect(rendered(component)).toContain("Review your answers");
-		expect(done).not.toHaveBeenCalled();
-		component.handleInput("\r");
-		expect(done).toHaveBeenCalledOnce();
-	});
-
-	it("returns to review when cancellation is not confirmed", () => {
-		const done = vi.fn();
-		const component = new QuestionnaireComponent(request, done);
-		component.handleInput("\r");
-		component.handleInput(" ");
-		component.handleInput("\x1b[A");
-		component.handleInput("\r");
 		component.handleInput("\x1b");
 		component.handleInput("n");
 
