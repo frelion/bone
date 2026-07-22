@@ -4,9 +4,10 @@ Bone is a local coding agent with built-in tools and local customization resourc
 
 ## Install
 
-```bash
-npm install -g --ignore-scripts @frelion/bone-coding-agent
-```
+Download the standalone executable for your platform from
+[GitHub Releases](https://github.com/frelion/bone/releases). Package installs,
+when available, require Bun 1.3.14 or newer. Node.js is not a supported CLI
+runtime.
 
 Then start Bone in the project directory:
 
@@ -15,7 +16,7 @@ cd /path/to/project
 bone
 ```
 
-Use the package manager that installed Bone to uninstall it. Removing Bone leaves settings, credentials, and sessions in `~/.bone/agent/`. Legacy package directories such as `~/.bone/agent/npm/` and `.bone/npm/` are also left untouched.
+Removing Bone leaves settings, credentials, and sessions in `~/.bone/agent/`. Legacy package directories such as `~/.bone/agent/npm/` and `.bone/npm/` are also left untouched.
 
 ## Authenticate
 

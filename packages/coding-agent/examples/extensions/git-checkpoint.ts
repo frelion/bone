@@ -35,14 +35,17 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const choice = await ctx.ui.select("Restore code state?", [
-			"Yes, restore code to that point",
-			"No, keep current code",
-		]);
+		const choice = await ctx.uiV2.dialogs.select({
+			title: "Restore code state?",
+			options: [
+				{ value: "restore", label: "Yes, restore code to that point" },
+				{ value: "keep", label: "No, keep current code" },
+			],
+		});
 
-		if (choice?.startsWith("Yes")) {
+		if (choice === "restore") {
 			await pi.exec("git", ["stash", "apply", ref]);
-			ctx.ui.notify("Code restored to checkpoint", "info");
+			ctx.uiV2.dialogs.notify("Code restored to checkpoint", "info");
 		}
 	});
 

@@ -11,34 +11,17 @@
  * - input() - via /rpc-input command
  * - editor() - via /rpc-editor command
  * - notify() - after each dialog completes
- * - setStatus() - on turn_start/turn_end
- * - setWidget() - on session_start
  * - setTitle() - on session_start
- * - setEditorText() - via /rpc-prefill command
+ * - editor.setText() - via /rpc-prefill command
  */
 
 import type { ExtensionAPI } from "@frelion/bone-coding-agent";
 
 export default function (pi: ExtensionAPI) {
-	let turnCount = 0;
-
-	// -- setTitle, setWidget, setStatus on session lifecycle --
+	// -- setTitle on session lifecycle --
 
 	pi.on("session_start", async (event, ctx) => {
-		ctx.ui.setTitle(event.reason === "new" ? "pi RPC Demo (new session)" : "pi RPC Demo");
-		ctx.ui.setWidget("rpc-demo", ["--- RPC Extension UI Demo ---", "Loaded and ready."]);
-		ctx.ui.setStatus("rpc-demo", `Turns: ${turnCount}`);
-	});
-
-	// -- setStatus on turn lifecycle --
-
-	pi.on("turn_start", async (_event, ctx) => {
-		turnCount++;
-		ctx.ui.setStatus("rpc-demo", `Turn ${turnCount} running...`);
-	});
-
-	pi.on("turn_end", async (_event, ctx) => {
-		ctx.ui.setStatus("rpc-demo", `Turn ${turnCount} done`);
+		ctx.uiV2.chrome.setTitle(event.reason === "new" ? "pi RPC Demo (new session)" : "pi RPC Demo");
 	});
 
 	// -- select on dangerous tool calls --
@@ -54,12 +37,18 @@ export default function (pi: ExtensionAPI) {
 				return { block: true, reason: "Dangerous command blocked (no UI)" };
 			}
 
-			const choice = await ctx.ui.select(`Dangerous command: ${command}`, ["Allow", "Block"]);
-			if (choice !== "Allow") {
-				ctx.ui.notify("Command blocked by user", "warning");
+			const choice = await ctx.uiV2.dialogs.select({
+				title: `Dangerous command: ${command}`,
+				options: [
+					{ value: "allow", label: "Allow" },
+					{ value: "block", label: "Block" },
+				],
+			});
+			if (choice !== "allow") {
+				ctx.uiV2.dialogs.notify("Command blocked by user", "warning");
 				return { block: true, reason: "Blocked by user" };
 			}
-			ctx.ui.notify("Command allowed", "info");
+			ctx.uiV2.dialogs.notify("Command allowed", "info");
 		}
 
 		return undefined;
@@ -71,9 +60,12 @@ export default function (pi: ExtensionAPI) {
 		if (event.reason !== "new") return;
 		if (!ctx.hasUI) return;
 
-		const confirmed = await ctx.ui.confirm("Clear session?", "All messages will be lost.");
+		const confirmed = await ctx.uiV2.dialogs.confirm({
+			title: "Clear session?",
+			message: "All messages will be lost.",
+		});
 		if (!confirmed) {
-			ctx.ui.notify("Clear cancelled", "info");
+			ctx.uiV2.dialogs.notify("Clear cancelled", "info");
 			return { cancel: true };
 		}
 	});
@@ -81,13 +73,13 @@ export default function (pi: ExtensionAPI) {
 	// -- input via command --
 
 	pi.registerCommand("rpc-input", {
-		description: "Prompt for text input (demonstrates ctx.ui.input in RPC)",
+		description: "Prompt for text input through the structured UI service",
 		handler: async (_args, ctx) => {
-			const value = await ctx.ui.input("Enter a value", "type something...");
+			const value = await ctx.uiV2.dialogs.input({ title: "Enter a value", placeholder: "type something..." });
 			if (value) {
-				ctx.ui.notify(`You entered: ${value}`, "info");
+				ctx.uiV2.dialogs.notify(`You entered: ${value}`, "info");
 			} else {
-				ctx.ui.notify("Input cancelled", "info");
+				ctx.uiV2.dialogs.notify("Input cancelled", "info");
 			}
 		},
 	});
@@ -95,13 +87,17 @@ export default function (pi: ExtensionAPI) {
 	// -- editor via command --
 
 	pi.registerCommand("rpc-editor", {
-		description: "Open multi-line editor (demonstrates ctx.ui.editor in RPC)",
+		description: "Open a multi-line editor through the structured UI service",
 		handler: async (_args, ctx) => {
-			const text = await ctx.ui.editor("Edit some text", "Line 1\nLine 2\nLine 3");
+			const text = await ctx.uiV2.editor.open({
+				title: "Edit some text",
+				initialValue: "Line 1\nLine 2\nLine 3",
+				multiline: true,
+			});
 			if (text) {
-				ctx.ui.notify(`Editor submitted (${text.split("\n").length} lines)`, "info");
+				ctx.uiV2.dialogs.notify(`Editor submitted (${text.split("\n").length} lines)`, "info");
 			} else {
-				ctx.ui.notify("Editor cancelled", "info");
+				ctx.uiV2.dialogs.notify("Editor cancelled", "info");
 			}
 		},
 	});
@@ -109,10 +105,10 @@ export default function (pi: ExtensionAPI) {
 	// -- setEditorText via command --
 
 	pi.registerCommand("rpc-prefill", {
-		description: "Prefill the input editor (demonstrates ctx.ui.setEditorText in RPC)",
+		description: "Prefill the composer through the structured UI service",
 		handler: async (_args, ctx) => {
-			ctx.ui.setEditorText("This text was set by the rpc-demo extension.");
-			ctx.ui.notify("Editor prefilled", "info");
+			ctx.uiV2.editor.setText("This text was set by the rpc-demo extension.");
+			ctx.uiV2.dialogs.notify("Editor prefilled", "info");
 		},
 	});
 }

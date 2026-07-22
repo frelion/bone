@@ -13,8 +13,9 @@
 	"scripts": {
 		"clean": "npm run clean --workspaces",
 		"build": "cd packages/tui && npm run build && cd ../ai && npm run build && cd ../agent && npm run build && cd ../coding-agent && npm run build && cd ../orchestrator && npm run build",
-		"check": "biome check --write --error-on-warnings . && npm run check:pinned-deps && npm run check:ts-imports && npm run check:release-scripts && npm run check:shrinkwrap && npm run check:install-lock:coding-agent && tsgo --noEmit && npm run check:browser-smoke",
+		"check": "biome check --write --error-on-warnings . && npm run check:pinned-deps && npm run check:ts-imports && npm run check:release-scripts && npm run check:shrinkwrap && npm run check:install-lock:coding-agent && tsgo --noEmit && npm run check:examples && npm run check:browser-smoke",
 		"check:browser-smoke": "node scripts/check-browser-smoke.mjs",
+		"check:examples": "tsgo -p packages/coding-agent/tsconfig.examples.json --noEmit",
 		"check:pinned-deps": "node scripts/check-pinned-deps.mjs",
 		"check:release-scripts": "node --test scripts/*.test.mjs && node scripts/sync-versions.js --check",
 		"check:shrinkwrap": "node scripts/generate-coding-agent-shrinkwrap.mjs --check",
@@ -22,8 +23,8 @@
 		"check:ts-imports": "node scripts/check-ts-relative-imports.mjs",
 		"generate:model-catalog": "npm --prefix packages/ai run generate-model-catalog",
 		"check:model-catalog": "node scripts/publish-model-catalog.mjs --input .artifacts/model-catalog --dry-run",
-		"profile:tui": "node scripts/profile-coding-agent-node.mjs --mode tui",
-		"profile:rpc": "node scripts/profile-coding-agent-node.mjs --mode rpc",
+		"profile:tui": "bun scripts/profile-coding-agent-node.mjs --mode tui --runtime bun",
+		"profile:rpc": "bun scripts/profile-coding-agent-node.mjs --mode rpc --runtime bun",
 		"test": "npm run test --workspaces --if-present",
 		"version:sync": "node scripts/sync-versions.js",
 		"prepublishOnly": "npm run clean && npm run build && npm run check",
@@ -55,6 +56,7 @@
 		"typescript": "5.9.3"
 	},
 	"engines": {
+		"bun": ">=1.3.14",
 		"node": ">=22.19.0"
 	},
 	"version": "0.0.4",

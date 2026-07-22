@@ -20,7 +20,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (isProtected) {
 			if (ctx.hasUI) {
-				ctx.ui.notify(`Blocked write to protected path: ${path}`, "warning");
+				ctx.uiV2.dialogs.notify(`Blocked write to protected path: ${path}`, "warning");
 			}
 			return { block: true, reason: `Path "${path}" is protected` };
 		}

@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Changed the supported product runtime to Bun 1.3.14 or newer. The CLI, RPC entrypoint, package install, profiling, and release smoke tests no longer support Node.js execution.
+- Removed user-configurable `keybindings.json` files and the public keybinding configuration API. Bone now uses fixed built-in shortcuts; existing files are ignored and left untouched.
+
+### Changed
+
+- Added isolated standalone release verification that loads OpenTUI's embedded native library before checking CLI startup.
+- Added the structured extension UI v2 contract for dialogs, widgets, chrome, editors, and tool results, with a trusted BoneView escape hatch and a machine-checkable legacy UI removal gate.
+
 ## [0.1.2] - 2026-07-22
 
 ### Added

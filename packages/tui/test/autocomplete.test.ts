@@ -38,6 +38,7 @@ const setupFolder = (baseDir: string, structure: FolderStructure = {}): void => 
 
 const fdPath = resolveFdPath();
 const isFdInstalled = Boolean(fdPath);
+const describeWithFd = isFdInstalled ? describe : describe.skip;
 
 const requireFdPath = (): string => {
 	if (!fdPath) {
@@ -114,7 +115,7 @@ describe("CombinedAutocompleteProvider", () => {
 		});
 	});
 
-	describe("fd @ file suggestions", { skip: !isFdInstalled }, () => {
+	describeWithFd("fd @ file suggestions", () => {
 		let rootDir = "";
 		let baseDir = "";
 		let outsideDir = "";

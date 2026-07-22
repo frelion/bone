@@ -4,10 +4,9 @@ Bone is a local coding agent with built-in tools, provider integrations, convers
 
 ## Install
 
-```bash
-npm install -g --ignore-scripts @frelion/bone-coding-agent
-bone
-```
+Install a standalone executable from [GitHub Releases](https://github.com/frelion/bone/releases),
+or install the package with Bun 1.3.14 or newer when package publication is available.
+Node.js is not a supported CLI runtime.
 
 Authenticate with `/login` or configure an API key before starting Bone.
 

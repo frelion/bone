@@ -1,4 +1,3 @@
-import { Markdown, type MarkdownTheme } from "@frelion/bone-tui";
 import chalk from "chalk";
 import {
 	APP_NAME,
@@ -17,23 +16,6 @@ import {
 	cleanupWindowsSelfUpdateQuarantine,
 	quarantineWindowsNativeDependencies,
 } from "./utils/windows-self-update.ts";
-
-const SELF_UPDATE_NOTE_MARKDOWN_THEME: MarkdownTheme = {
-	heading: (text) => chalk.bold(chalk.yellow(text)),
-	link: (text) => chalk.cyan(text),
-	linkUrl: (text) => chalk.dim(text),
-	code: (text) => chalk.yellow(text),
-	codeBlock: (text) => chalk.dim(text),
-	codeBlockBorder: (text) => chalk.dim(text),
-	quote: (text) => chalk.dim(text),
-	quoteBorder: (text) => chalk.dim(text),
-	hr: (text) => chalk.dim(text),
-	listBullet: (text) => chalk.yellow(text),
-	bold: (text) => chalk.bold(text),
-	italic: (text) => chalk.italic(text),
-	strikethrough: (text) => chalk.strikethrough(text),
-	underline: (text) => chalk.underline(text),
-};
 
 interface SelfUpdatePlan {
 	packageName: string;
@@ -67,17 +49,7 @@ function printSelfUpdateNote(note: string): void {
 	if (!trimmedNote) return;
 	console.log();
 	console.log(chalk.bold(chalk.yellow("Update note")));
-	try {
-		const width = Math.max(20, process.stdout.columns ?? 80);
-		console.log(
-			new Markdown(trimmedNote, 0, 0, SELF_UPDATE_NOTE_MARKDOWN_THEME)
-				.render(width)
-				.map((line) => line.trimEnd())
-				.join("\n"),
-		);
-	} catch {
-		console.log(trimmedNote);
-	}
+	console.log(trimmedNote);
 	console.log();
 }
 

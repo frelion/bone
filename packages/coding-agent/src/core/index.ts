@@ -40,6 +40,8 @@ export {
 	type BeforeAgentStartEventResult,
 	type BuildSystemPromptOptions,
 	type ContextEvent,
+	type CustomEntryViewRenderer,
+	type CustomMessageViewRenderer,
 	defineTool,
 	discoverAndLoadExtensions,
 	type ExecOptions,
@@ -54,11 +56,8 @@ export {
 	type ExtensionFlag,
 	type ExtensionHandler,
 	ExtensionRunner,
-	type ExtensionShortcut,
-	type ExtensionUIContext,
 	type InlineExtension,
 	type LoadExtensionsResult,
-	type MessageRenderer,
 	type RegisteredCommand,
 	type SessionBeforeCompactEvent,
 	type SessionBeforeForkEvent,
@@ -71,11 +70,9 @@ export {
 	type ToolCallEvent,
 	type ToolCallEventResult,
 	type ToolDefinition,
-	type ToolRenderResultOptions,
 	type ToolResultEvent,
 	type TurnEndEvent,
 	type TurnStartEvent,
-	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
 export * from "./forge/index.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";

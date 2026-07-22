@@ -20,7 +20,7 @@ export default function (pi: ExtensionAPI) {
 	// Listen for events from other extensions
 	pi.events.on("my:notification", (data) => {
 		const { message, from } = data as { message: string; from: string };
-		currentCtx?.ui.notify(`Event from ${from}: ${message}`, "info");
+		currentCtx?.uiV2.dialogs.notify(`Event from ${from}: ${message}`, "info");
 	});
 
 	// Command to emit events (emits "my:notification" which the listener above receives)

@@ -94,11 +94,11 @@ export default function (pi: ExtensionAPI) {
 
 			ref = upstream.trim();
 			const remote = ref.split("/")[0];
-			ctx.ui.notify(`git-merge-and-resolve: fetching ${remote}, merging ${ref}`, "info");
+			ctx.uiV2.dialogs.notify(`git-merge-and-resolve: fetching ${remote}, merging ${ref}`, "info");
 
 			const { code: fetchCode, stderr: fetchErr } = await pi.exec("git", ["fetch", remote]);
 			if (fetchCode !== 0) {
-				ctx.ui.notify(`git-merge-and-resolve: fetch failed: ${fetchErr.trim()}`, "warning");
+				ctx.uiV2.dialogs.notify(`git-merge-and-resolve: fetch failed: ${fetchErr.trim()}`, "warning");
 				return;
 			}
 

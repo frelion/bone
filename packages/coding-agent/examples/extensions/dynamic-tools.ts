@@ -50,7 +50,7 @@ export default function dynamicToolsExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		registerEchoTool("echo_session", "Echo Session", "[session] ");
-		ctx.ui.notify("Registered dynamic tool: echo_session", "info");
+		ctx.uiV2.dialogs.notify("Registered dynamic tool: echo_session", "info");
 	});
 
 	pi.registerCommand("add-echo-tool", {
@@ -58,17 +58,17 @@ export default function dynamicToolsExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const toolName = normalizeToolName(args);
 			if (!toolName) {
-				ctx.ui.notify("Usage: /add-echo-tool <tool_name> (lowercase, numbers, underscores)", "warning");
+				ctx.uiV2.dialogs.notify("Usage: /add-echo-tool <tool_name> (lowercase, numbers, underscores)", "warning");
 				return;
 			}
 
 			const created = registerEchoTool(toolName, `Echo ${toolName}`, `[${toolName}] `);
 			if (!created) {
-				ctx.ui.notify(`Tool already registered: ${toolName}`, "warning");
+				ctx.uiV2.dialogs.notify(`Tool already registered: ${toolName}`, "warning");
 				return;
 			}
 
-			ctx.ui.notify(`Registered dynamic tool: ${toolName}`, "info");
+			ctx.uiV2.dialogs.notify(`Registered dynamic tool: ${toolName}`, "info");
 		},
 	});
 }

@@ -1,14 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ThinkingLevel } from "@frelion/bone-agent-core";
-import {
-	type EditorTheme,
-	getCapabilities,
-	type MarkdownTheme,
-	type RgbColor,
-	type SelectListTheme,
-	type SettingsListTheme,
-} from "@frelion/bone-tui";
 import chalk from "chalk";
 import { type Static, Type } from "typebox";
 import { Compile } from "typebox/compile";
@@ -166,6 +158,12 @@ export type ThemeBg =
 
 type ColorMode = "truecolor" | "256color";
 
+interface RgbColor {
+	r: number;
+	g: number;
+	b: number;
+}
+
 // ============================================================================
 // Color Utilities
 // ============================================================================
@@ -262,6 +260,41 @@ function hexTo256(hex: string): number {
 	return rgbTo256(r, g, b);
 }
 
+const ANSI_16_COLORS = [
+	"#000000",
+	"#800000",
+	"#008000",
+	"#808000",
+	"#000080",
+	"#800080",
+	"#008080",
+	"#c0c0c0",
+	"#808080",
+	"#ff0000",
+	"#00ff00",
+	"#ffff00",
+	"#0000ff",
+	"#ff00ff",
+	"#00ffff",
+	"#ffffff",
+] as const;
+
+function colorValueToHex(color: string | number): string {
+	if (typeof color === "string") return color || "#ffffff";
+	const index = Math.max(0, Math.min(255, Math.trunc(color)));
+	if (index < ANSI_16_COLORS.length) return ANSI_16_COLORS[index]!;
+	if (index < 232) {
+		const cube = index - 16;
+		const r = CUBE_VALUES[Math.floor(cube / 36)]!;
+		const g = CUBE_VALUES[Math.floor((cube % 36) / 6)]!;
+		const b = CUBE_VALUES[cube % 6]!;
+		return `#${[r, g, b].map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
+	}
+	const gray = GRAY_VALUES[index - 232]!;
+	const channel = gray.toString(16).padStart(2, "0");
+	return `#${channel}${channel}${channel}`;
+}
+
 function fgAnsi(color: string | number, mode: ColorMode): string {
 	if (color === "") return "\x1b[39m";
 	if (typeof color === "number") return `\x1b[38;5;${color}m`;
@@ -341,6 +374,8 @@ export class Theme {
 	sourceInfo?: SourceInfo;
 	private fgColors: Map<ThemeColor, string>;
 	private bgColors: Map<ThemeBg, string>;
+	private rawFgColors: Map<ThemeColor, string | number>;
+	private rawBgColors: Map<ThemeBg, string | number>;
 	private mode: ColorMode;
 
 	constructor(
@@ -354,13 +389,17 @@ export class Theme {
 		this.sourceInfo = options.sourceInfo;
 		this.mode = mode;
 		this.fgColors = new Map();
+		this.rawFgColors = new Map();
 		const colors = { ...fgColors, thinkingMax: fgColors.thinkingMax ?? fgColors.thinkingXhigh };
 		for (const [key, value] of Object.entries(colors) as [ThemeColor, string | number][]) {
 			this.fgColors.set(key, fgAnsi(value, mode));
+			this.rawFgColors.set(key, value);
 		}
 		this.bgColors = new Map();
+		this.rawBgColors = new Map();
 		for (const [key, value] of Object.entries(bgColors) as [ThemeBg, string | number][]) {
 			this.bgColors.set(key, bgAnsi(value, mode));
+			this.rawBgColors.set(key, value);
 		}
 	}
 
@@ -406,6 +445,20 @@ export class Theme {
 		const ansi = this.bgColors.get(color);
 		if (!ansi) throw new Error(`Unknown theme background color: ${color}`);
 		return ansi;
+	}
+
+	/** Raw theme color for structured renderers such as OpenTUI. */
+	getFgColor(color: ThemeColor): string {
+		const value = this.rawFgColors.get(color);
+		if (value === undefined) throw new Error(`Unknown theme color: ${color}`);
+		return colorValueToHex(value);
+	}
+
+	/** Raw theme background color for structured renderers such as OpenTUI. */
+	getBgColor(color: ThemeBg): string {
+		const value = this.rawBgColors.get(color);
+		if (value === undefined) throw new Error(`Unknown theme background color: ${color}`);
+		return colorValueToHex(value);
 	}
 
 	getColorMode(): ColorMode {
@@ -603,7 +656,7 @@ function loadThemeJson(name: string): ThemeJson {
 }
 
 function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string): Theme {
-	const colorMode = mode ?? (getCapabilities().trueColor ? "truecolor" : "256color");
+	const colorMode = mode ?? "truecolor";
 	const resolvedColors = resolveThemeColors(withThemeColorFallbacks(themeJson.colors), themeJson.vars);
 	const fgColors: Record<ThemeColor, string | number> = {} as Record<ThemeColor, string | number>;
 	const bgColors: Record<ThemeBg, string | number> = {} as Record<ThemeBg, string | number>;
@@ -1234,70 +1287,4 @@ export function getLanguageFromPath(filePath: string): string | undefined {
 	};
 
 	return extToLang[ext];
-}
-
-export function getMarkdownTheme(): MarkdownTheme {
-	return {
-		heading: (text: string) => theme.fg("mdHeading", text),
-		link: (text: string) => theme.fg("mdLink", text),
-		linkUrl: (text: string) => theme.fg("mdLinkUrl", text),
-		code: (text: string) => theme.fg("mdCode", text),
-		codeBlock: (text: string) => theme.fg("mdCodeBlock", text),
-		codeBlockBorder: (text: string) => theme.fg("mdCodeBlockBorder", text),
-		quote: (text: string) => theme.fg("mdQuote", text),
-		quoteBorder: (text: string) => theme.fg("mdQuoteBorder", text),
-		hr: (text: string) => theme.fg("mdHr", text),
-		listBullet: (text: string) => theme.fg("mdListBullet", text),
-		bold: (text: string) => theme.bold(text),
-		italic: (text: string) => theme.italic(text),
-		underline: (text: string) => theme.underline(text),
-		strikethrough: (text: string) => chalk.strikethrough(text),
-		highlightCode: (code: string, lang?: string): string[] => {
-			// Validate language before highlighting to avoid stderr spam from cli-highlight
-			const validLang = lang && supportsLanguage(lang) ? lang : undefined;
-			// Skip highlighting when no valid language is specified. cli-highlight's
-			// auto-detection is unreliable and can misidentify prose as AppleScript,
-			// LiveCodeServer, etc., coloring random English words as keywords.
-			if (!validLang) {
-				return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
-			}
-			const opts = {
-				language: validLang,
-				ignoreIllegals: true,
-				theme: getCliHighlightTheme(theme),
-			};
-			try {
-				return highlight(code, opts).split("\n");
-			} catch {
-				return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
-			}
-		},
-	};
-}
-
-export function getSelectListTheme(): SelectListTheme {
-	return {
-		selectedPrefix: (text: string) => theme.fg("accent", text),
-		selectedText: (text: string) => theme.fg("accent", text),
-		description: (text: string) => theme.fg("muted", text),
-		scrollInfo: (text: string) => theme.fg("muted", text),
-		noMatch: (text: string) => theme.fg("muted", text),
-	};
-}
-
-export function getEditorTheme(): EditorTheme {
-	return {
-		borderColor: (text: string) => theme.fg("borderMuted", text),
-		selectList: getSelectListTheme(),
-	};
-}
-
-export function getSettingsListTheme(): SettingsListTheme {
-	return {
-		label: (text: string, selected: boolean) => (selected ? theme.fg("accent", text) : text),
-		value: (text: string, selected: boolean) => (selected ? theme.fg("accent", text) : theme.fg("muted", text)),
-		description: (text: string) => theme.fg("dim", text),
-		cursor: theme.fg("accent", "→ "),
-		hint: (text: string) => theme.fg("dim", text),
-	};
 }

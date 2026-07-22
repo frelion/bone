@@ -43,7 +43,7 @@ export default function (pi: ExtensionAPI) {
 		const { code: commitCode } = await pi.exec("git", ["commit", "-m", commitMessage]);
 
 		if (commitCode === 0 && ctx.hasUI) {
-			ctx.ui.notify(`Auto-committed: ${commitMessage}`, "info");
+			ctx.uiV2.dialogs.notify(`Auto-committed: ${commitMessage}`, "info");
 		}
 	});
 }

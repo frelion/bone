@@ -1,10 +1,9 @@
 import * as os from "node:os";
-import { pathToFileURL } from "node:url";
 import type { ImageContent, TextContent } from "@frelion/bone-ai";
-import { getCapabilities, getImageDimensions, hyperlink, imageFallback } from "@frelion/bone-tui";
+import type { BoneColor, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import { decodeOpenTUIImages, OpenTUIImageAttachments } from "../../modes/interactive/components/opentui-image.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../../utils/ansi.ts";
-import { resolvePath } from "../../utils/paths.ts";
 import { sanitizeBinaryOutput } from "../../utils/shell.ts";
 
 export function shortenPath(path: unknown): string {
@@ -16,10 +15,8 @@ export function shortenPath(path: unknown): string {
 	return path;
 }
 
-export function linkPath(styledText: string, rawPath: string, cwd: string): string {
-	if (!getCapabilities().hyperlinks) return styledText;
-	const absolutePath = resolvePath(rawPath, cwd);
-	return hyperlink(styledText, pathToFileURL(absolutePath).href);
+export function linkPath(styledText: string, _rawPath: string, _cwd: string): string {
+	return styledText;
 }
 
 export function str(value: unknown): string | null {
@@ -47,20 +44,67 @@ export function getTextOutput(
 
 	let output = textBlocks.map((c) => sanitizeBinaryOutput(stripAnsi(c.text || "")).replace(/\r/g, "")).join("\n");
 
-	const caps = getCapabilities();
-	if (imageBlocks.length > 0 && (!caps.images || !showImages)) {
+	if (imageBlocks.length > 0 && !showImages) {
 		const imageIndicators = imageBlocks
 			.map((img) => {
 				const mimeType = img.mimeType ?? "image/unknown";
-				const dims =
-					img.data && img.mimeType ? (getImageDimensions(img.data, img.mimeType) ?? undefined) : undefined;
-				return imageFallback(mimeType, dims);
+				return `[image: ${mimeType}; hidden]`;
 			})
 			.join("\n");
 		output = output ? `${output}\n${imageIndicators}` : imageIndicators;
 	}
 
 	return output;
+}
+
+export interface StructuredToolTextOptions {
+	fg?: BoneColor;
+	backgroundColor?: BoneColor;
+	paddingX?: number;
+	paddingY?: number;
+	bold?: boolean;
+}
+
+export function structuredToolTextView(content: string, options: StructuredToolTextOptions = {}): BoneView {
+	return {
+		mount(context: BoneRenderContext): BoneNode {
+			return context.createText({
+				content: stripAnsi(content),
+				fg: options.fg,
+				bg: options.backgroundColor,
+				paddingX: options.paddingX,
+				paddingY: options.paddingY,
+				bold: options.bold,
+				wrapMode: "word",
+			});
+		},
+	};
+}
+
+export function structuredToolResultView(
+	result: { content: (TextContent | ImageContent)[] },
+	text: string,
+	options: StructuredToolTextOptions & { imageWidthCells?: number } = {},
+): BoneView {
+	return {
+		mount(context: BoneRenderContext): BoneNode {
+			const root = context.createBox({ flexDirection: "column" });
+			if (stripAnsi(text).trim()) root.append(structuredToolTextView(text, options).mount(context));
+			const imageContent = result.content.filter((part): part is ImageContent => part.type === "image");
+			if (imageContent.length > 0) {
+				const images = context.createBox({ flexDirection: "column" });
+				images.append(
+					context.createText({ content: "[decoding image...]", fg: options.fg, paddingX: options.paddingX }),
+				);
+				root.append(images);
+				void decodeOpenTUIImages(imageContent, { terminalWidth: options.imageWidthCells ?? 40 }).then((decoded) => {
+					images.clear();
+					images.append(new OpenTUIImageAttachments(decoded).mount(context));
+				});
+			}
+			return root;
+		},
+	};
 }
 
 export type ToolRenderResultLike<TDetails> = {

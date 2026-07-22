@@ -237,7 +237,7 @@ export function visibleWidth(str: string): number {
 	if (clean.includes("\x1b")) {
 		// Strip supported ANSI/OSC/APC escape sequences in one pass.
 		// This covers CSI styling/cursor codes, OSC hyperlinks and prompt markers,
-		// and APC sequences like CURSOR_MARKER.
+		// and APC control sequences.
 		let stripped = "";
 		let i = 0;
 		while (i < clean.length) {

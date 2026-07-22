@@ -135,9 +135,9 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const log = readFileSync(LOG_FILE, "utf-8");
 				const lines = log.trim().split("\n").slice(-20); // Last 20 entries
-				ctx.ui.notify(`Recent file access:\n${lines.join("\n")}`, "info");
+				ctx.uiV2.dialogs.notify(`Recent file access:\n${lines.join("\n")}`, "info");
 			} catch {
-				ctx.ui.notify("No access log found", "info");
+				ctx.uiV2.dialogs.notify("No access log found", "info");
 			}
 		},
 	});

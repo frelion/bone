@@ -1,8 +1,13 @@
 import type { AgentTool, ThinkingLevel } from "@frelion/bone-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type Model } from "@frelion/bone-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
-import type { BuildSystemPromptOptions, ExtensionAPI } from "../../src/index.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	type BuildSystemPromptOptions,
+	createExtensionUIV2Context,
+	type ExtensionAPI,
+	type ExtensionUIV2Context,
+} from "../../src/index.ts";
 import { createHarness, getAssistantTexts, type Harness } from "./harness.ts";
 
 describe("AgentSession model and extension characterization", () => {
@@ -369,5 +374,63 @@ describe("AgentSession model and extension characterization", () => {
 		await harness.session.reload();
 
 		expect(lifecycleEvents).toEqual(["start:startup", "shutdown:reload", "start:reload"]);
+	});
+
+	it("rebinds parked UI and command actions without repeating startup discovery", async () => {
+		let sessionStarts = 0;
+		let resourceDiscoveries = 0;
+		const observedUI: ExtensionUIV2Context[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", () => {
+						sessionStarts++;
+					});
+					pi.on("resources_discover", () => {
+						resourceDiscoveries++;
+					});
+					pi.registerCommand("inspect-rebind", {
+						description: "Inspect rebound foreground services",
+						handler: async (_args, ctx) => {
+							observedUI.push(ctx.uiV2);
+							await ctx.newSession();
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const firstUI = { ...createExtensionUIV2Context(), available: true };
+		const secondUI = { ...createExtensionUIV2Context(), available: true };
+		const firstNewSession = vi.fn(async () => ({ cancelled: false }));
+		const secondNewSession = vi.fn(async () => ({ cancelled: false }));
+		const commandActions = (newSession: typeof firstNewSession) => ({
+			waitForIdle: async () => {},
+			newSession,
+			fork: async () => ({ cancelled: false }),
+			navigateTree: async () => ({ cancelled: false }),
+			switchSession: async () => ({ cancelled: false }),
+			reload: async () => {},
+		});
+
+		await harness.session.bindExtensions({
+			uiV2Context: firstUI,
+			mode: "tui",
+			commandContextActions: commandActions(firstNewSession),
+		});
+		await harness.session.prompt("/inspect-rebind");
+		harness.session.parkExtensionUI();
+		await harness.session.bindExtensions({
+			uiV2Context: secondUI,
+			mode: "tui",
+			commandContextActions: commandActions(secondNewSession),
+		});
+		await harness.session.prompt("/inspect-rebind");
+
+		expect(sessionStarts).toBe(1);
+		expect(resourceDiscoveries).toBe(1);
+		expect(observedUI).toEqual([firstUI, secondUI]);
+		expect(firstNewSession).toHaveBeenCalledOnce();
+		expect(secondNewSession).toHaveBeenCalledOnce();
 	});
 });

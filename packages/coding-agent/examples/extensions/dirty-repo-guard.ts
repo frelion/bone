@@ -33,13 +33,16 @@ async function checkDirtyRepo(
 	// Count changed files
 	const changedFiles = stdout.trim().split("\n").filter(Boolean).length;
 
-	const choice = await ctx.ui.select(`You have ${changedFiles} uncommitted file(s). ${action} anyway?`, [
-		"Yes, proceed anyway",
-		"No, let me commit first",
-	]);
+	const choice = await ctx.uiV2.dialogs.select({
+		title: `You have ${changedFiles} uncommitted file(s). ${action} anyway?`,
+		options: [
+			{ value: "proceed", label: "Yes, proceed anyway" },
+			{ value: "cancel", label: "No, let me commit first" },
+		],
+	});
 
-	if (choice !== "Yes, proceed anyway") {
-		ctx.ui.notify("Commit your changes first", "warning");
+	if (choice !== "proceed") {
+		ctx.uiV2.dialogs.notify("Commit your changes first", "warning");
 		return { cancel: true };
 	}
 }

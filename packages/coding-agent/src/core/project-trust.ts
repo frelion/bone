@@ -30,11 +30,11 @@ async function selectProjectTrustOption(
 	ctx: ProjectTrustContext,
 ): Promise<ProjectTrustOption | undefined> {
 	const options = getProjectTrustOptions(cwd, { includeSessionOnly: true });
-	const selected = await ctx.ui.select(
-		formatProjectTrustPrompt(cwd),
-		options.map((option) => option.label),
-	);
-	return options.find((option) => option.label === selected);
+	const selected = await ctx.uiV2.dialogs.select({
+		title: formatProjectTrustPrompt(cwd),
+		options: options.map((option, index) => ({ value: String(index), label: option.label })),
+	});
+	return selected === undefined ? undefined : options[Number(selected)];
 }
 
 function saveProjectTrustPromptResult(trustStore: ProjectTrustStore, result: ProjectTrustOption): void {

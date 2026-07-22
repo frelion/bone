@@ -48,7 +48,45 @@ export {
 	shouldCompact,
 } from "./core/compaction/index.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
+export type {
+	BuildSystemPromptOptions,
+	ExtensionAPI,
+	ExtensionContext,
+	ExtensionFactory,
+	ProjectTrustEventResult,
+	SessionBeforeSwitchEvent,
+	SlashCommandInfo,
+} from "./core/extensions/index.ts";
+export { defineTool } from "./core/extensions/index.ts";
+export type {
+	ExtensionUIAdvancedOptions,
+	ExtensionUIAdvancedService,
+	ExtensionUIAdvancedViewContext,
+	ExtensionUIChromeService,
+	ExtensionUIConfirmRequest,
+	ExtensionUIDialogOptionsV2,
+	ExtensionUIDialogService,
+	ExtensionUIEditorService,
+	ExtensionUIInputRequest,
+	ExtensionUINotificationKind,
+	ExtensionUISelectOption,
+	ExtensionUISelectRequest,
+	ExtensionUIToolResultService,
+	ExtensionUIToolResultViewInput,
+	ExtensionUIToolViewRenderer,
+	ExtensionUIToolViewState,
+	ExtensionUIV2Context,
+	ExtensionUIViewFactory,
+	ExtensionUIViewHandle,
+	ExtensionUIWidgetOptionsV2,
+	ExtensionUIWidgetPlacement,
+	ExtensionUIWidgetService,
+} from "./core/extensions/ui-v2.ts";
 // Extension runtime types and factories are internal Bone implementation details.
+export {
+	createExtensionUIV2Context,
+	resolveExtensionUIV2,
+} from "./core/extensions/ui-v2.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export { convertToLlm } from "./core/messages.ts";
@@ -259,48 +297,9 @@ export {
 	runPrintMode,
 	runRpcMode,
 } from "./modes/index.ts";
-// UI components for extensions
-export {
-	ArminComponent,
-	AssistantMessageComponent,
-	BashExecutionComponent,
-	BorderedLoader,
-	BranchSummaryMessageComponent,
-	CompactionSummaryMessageComponent,
-	CustomEditor,
-	CustomMessageComponent,
-	DynamicBorder,
-	ExtensionEditorComponent,
-	ExtensionInputComponent,
-	ExtensionSelectorComponent,
-	FooterComponent,
-	keyHint,
-	keyText,
-	LoginDialogComponent,
-	ModelSelectorComponent,
-	OAuthSelectorComponent,
-	type RenderDiffOptions,
-	rawKeyHint,
-	renderDiff,
-	SessionSelectorComponent,
-	ShowImagesSelectorComponent,
-	SkillInvocationMessageComponent,
-	ThemeSelectorComponent,
-	ThinkingSelectorComponent,
-	ToolExecutionComponent,
-	type ToolExecutionOptions,
-	TreeSelectorComponent,
-	truncateToVisualLines,
-	UserMessageComponent,
-	UserMessageSelectorComponent,
-	type VisualTruncateResult,
-} from "./modes/interactive/components/index.ts";
 // Theme utilities for custom tools and extensions
 export {
 	getLanguageFromPath,
-	getMarkdownTheme,
-	getSelectListTheme,
-	getSettingsListTheme,
 	highlightCode,
 	initTheme,
 	Theme,

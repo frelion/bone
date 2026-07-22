@@ -73,7 +73,7 @@ import {
 	type ExtensionErrorListener,
 	type ExtensionMode,
 	ExtensionRunner,
-	type ExtensionUIContext,
+	type ExtensionUIV2Context,
 	type InputSource,
 	type MessageEndEvent,
 	type MessageStartEvent,
@@ -250,7 +250,7 @@ export interface AgentSessionConfig {
 }
 
 export interface ExtensionBindings {
-	uiContext?: ExtensionUIContext;
+	uiV2Context?: ExtensionUIV2Context;
 	mode?: ExtensionMode;
 	commandContextActions?: ExtensionCommandContextActions;
 	abortHandler?: () => void;
@@ -384,13 +384,14 @@ export class AgentSession {
 	private _excludedToolNames?: Set<string>;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
-	private _extensionUIContext?: ExtensionUIContext;
+	private _extensionUIV2Context?: ExtensionUIV2Context;
 	private _extensionMode: ExtensionMode = "print";
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
 	private _extensionAbortHandler?: () => void;
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	private _extensionLifecycleStarted = false;
 
 	private _modelRuntime: ModelRuntime;
 
@@ -2744,8 +2745,8 @@ export class AgentSession {
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
-		if (bindings.uiContext !== undefined) {
-			this._extensionUIContext = bindings.uiContext;
+		if (bindings.uiV2Context !== undefined) {
+			this._extensionUIV2Context = bindings.uiV2Context;
 		}
 		if (bindings.mode !== undefined) {
 			this._extensionMode = bindings.mode;
@@ -2764,8 +2765,44 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
+		if (this._extensionLifecycleStarted) return;
+		this._extensionLifecycleStarted = true;
 		await this._extensionRunner.emit(this._sessionStartEvent);
 		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+	}
+
+	/** Detach foreground-only extension capabilities without re-emitting lifecycle events. */
+	parkExtensionUI(): void {
+		this._extensionUIV2Context = undefined;
+		this._extensionCommandContextActions = undefined;
+		this._extensionAbortHandler = undefined;
+		this._extensionShutdownHandler = undefined;
+		this._extensionErrorListener = undefined;
+		this._applyExtensionBindings(this._extensionRunner);
+	}
+
+	/** Commands currently available to an interactive composer. */
+	getSlashCommands(): SlashCommandInfo[] {
+		return [
+			...this._extensionRunner.getRegisteredCommands().map((command) => ({
+				name: command.invocationName,
+				description: command.description,
+				source: "extension" as const,
+				sourceInfo: command.sourceInfo,
+			})),
+			...this.promptTemplates.map((template) => ({
+				name: template.name,
+				description: template.description,
+				source: "prompt" as const,
+				sourceInfo: template.sourceInfo,
+			})),
+			...this._resourceLoader.getSkills().skills.map((skill) => ({
+				name: `skill:${skill.name}`,
+				description: skill.description,
+				source: "skill" as const,
+				sourceInfo: skill.sourceInfo,
+			})),
+		];
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
@@ -2822,7 +2859,7 @@ export class AgentSession {
 	}
 
 	private _applyExtensionBindings(runner: ExtensionRunner): void {
-		runner.setUIContext(this._extensionUIContext, this._extensionMode);
+		runner.setUIV2Context(this._extensionUIV2Context, this._extensionMode);
 		runner.bindCommandContext(this._extensionCommandContextActions);
 
 		this._extensionErrorUnsubscriber?.();
@@ -3142,7 +3179,7 @@ export class AgentSession {
 		});
 
 		const hasBindings =
-			this._extensionUIContext ||
+			this._extensionUIV2Context ||
 			this._extensionCommandContextActions ||
 			this._extensionShutdownHandler ||
 			this._extensionErrorListener;

@@ -22,6 +22,10 @@ The executable is self-contained with its matching terminal helper and local
 semantic-search native runtime. The model itself is intentionally not included; run
 `bone setup` after installation if you want semantic search.
 
+Bone's supported runtime is Bun. GitHub Release archives contain standalone Bun
+executables; package and source-checkout execution require Bun 1.3.14 or newer.
+Running the CLI with Node.js is not supported.
+
 ## Release policy
 
 Tags in the form `vX.Y.Z` trigger a six-platform GitHub Release pipeline. It

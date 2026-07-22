@@ -53,4 +53,6 @@ npm run check
 ```
 
 Bone is released through GitHub Releases. npm publication is intentionally
-disabled until the internal package scope is migrated.
+disabled until the internal package scope is migrated. The supported CLI
+runtime is Bun 1.3.14 or newer; Node.js is used only by the repository's
+existing development tooling.

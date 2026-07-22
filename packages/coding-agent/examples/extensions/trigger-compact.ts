@@ -7,18 +7,18 @@ export default function (pi: ExtensionAPI) {
 
 	const triggerCompaction = (ctx: ExtensionContext, customInstructions?: string) => {
 		if (ctx.hasUI) {
-			ctx.ui.notify("Compaction started", "info");
+			ctx.uiV2.dialogs.notify("Compaction started", "info");
 		}
 		ctx.compact({
 			customInstructions,
 			onComplete: () => {
 				if (ctx.hasUI) {
-					ctx.ui.notify("Compaction completed", "info");
+					ctx.uiV2.dialogs.notify("Compaction completed", "info");
 				}
 			},
 			onError: (error) => {
 				if (ctx.hasUI) {
-					ctx.ui.notify(`Compaction failed: ${error.message}`, "error");
+					ctx.uiV2.dialogs.notify(`Compaction failed: ${error.message}`, "error");
 				}
 			},
 		});

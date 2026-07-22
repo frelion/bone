@@ -19,7 +19,7 @@ import { convertToLlm, serializeConversation } from "@frelion/bone-coding-agent"
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_before_compact", async (event, ctx) => {
-		ctx.ui.notify("Custom compaction extension triggered", "info");
+		ctx.uiV2.dialogs.notify("Custom compaction extension triggered", "info");
 
 		const { preparation, branchEntries: _, signal } = event;
 		const { messagesToSummarize, turnPrefixMessages, tokensBefore, firstKeptEntryId, previousSummary } = preparation;
@@ -27,25 +27,25 @@ export default function (pi: ExtensionAPI) {
 		// Use Gemini Flash for summarization (cheaper/faster than most conversation models)
 		const model = ctx.modelRegistry.find("google", "gemini-2.5-flash");
 		if (!model) {
-			ctx.ui.notify(`Could not find Gemini Flash model, using default compaction`, "warning");
+			ctx.uiV2.dialogs.notify(`Could not find Gemini Flash model, using default compaction`, "warning");
 			return;
 		}
 
 		// Resolve request auth for the summarization model
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 		if (!auth.ok) {
-			ctx.ui.notify(`Compaction auth failed: ${auth.error}`, "warning");
+			ctx.uiV2.dialogs.notify(`Compaction auth failed: ${auth.error}`, "warning");
 			return;
 		}
 		if (!auth.apiKey) {
-			ctx.ui.notify(`No API key for ${model.provider}, using default compaction`, "warning");
+			ctx.uiV2.dialogs.notify(`No API key for ${model.provider}, using default compaction`, "warning");
 			return;
 		}
 
 		// Combine all messages for full summary
 		const allMessages = [...messagesToSummarize, ...turnPrefixMessages];
 
-		ctx.ui.notify(
+		ctx.uiV2.dialogs.notify(
 			`Custom compaction: summarizing ${allMessages.length} messages (${tokensBefore.toLocaleString()} tokens) with ${model.id}...`,
 			"info",
 		);
@@ -105,7 +105,8 @@ ${conversationText}
 				.join("\n");
 
 			if (!summary.trim()) {
-				if (!signal.aborted) ctx.ui.notify("Compaction summary was empty, using default compaction", "warning");
+				if (!signal.aborted)
+					ctx.uiV2.dialogs.notify("Compaction summary was empty, using default compaction", "warning");
 				return;
 			}
 
@@ -120,7 +121,7 @@ ${conversationText}
 			};
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			ctx.ui.notify(`Compaction failed: ${message}`, "error");
+			ctx.uiV2.dialogs.notify(`Compaction failed: ${message}`, "error");
 			// Fall back to default compaction on error
 			return;
 		}

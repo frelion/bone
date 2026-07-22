@@ -24,41 +24,47 @@ export default function (pi: ExtensionAPI) {
 	// trust prompt. Return { trusted: "undecided" } to let another handler or the
 	// built-in flow decide.
 	pi.on("project_trust", async (event, ctx): Promise<ProjectTrustEventResult> => {
-		ctx.ui.notify(`project_trust fired for ${event.cwd} (mode: ${ctx.mode}, load: ${loadCount})`, "info");
+		ctx.uiV2.dialogs.notify(`project_trust fired for ${event.cwd} (mode: ${ctx.mode}, load: ${loadCount})`, "info");
 
 		if (!ctx.hasUI) {
 			return { trusted: "undecided" };
 		}
 
-		const choice = await ctx.ui.select(`Project trust for:\n${event.cwd}`, [
-			"Trust and remember",
-			"Trust with note and remember",
-			"Trust this session",
-			"Do not trust this session",
-			"Let built-in prompt decide",
-		]);
+		const choice = await ctx.uiV2.dialogs.select({
+			title: `Project trust for:\n${event.cwd}`,
+			options: [
+				{ value: "trust-remember", label: "Trust and remember" },
+				{ value: "trust-note", label: "Trust with note and remember" },
+				{ value: "trust-session", label: "Trust this session" },
+				{ value: "deny-session", label: "Do not trust this session" },
+				{ value: "builtin", label: "Let built-in prompt decide" },
+			],
+		});
 
-		if (choice === "Trust with note and remember") {
-			const note = await ctx.ui.input("Project trust note", "Optional note for this demo");
-			ctx.ui.notify(note ? `Recorded demo note: ${note}` : "No demo note entered", "info");
+		if (choice === "trust-note") {
+			const note = await ctx.uiV2.dialogs.input({
+				title: "Project trust note",
+				placeholder: "Optional note for this demo",
+			});
+			ctx.uiV2.dialogs.notify(note ? `Recorded demo note: ${note}` : "No demo note entered", "info");
 			return { trusted: "yes", remember: true };
 		}
-		if (choice === "Trust and remember") {
+		if (choice === "trust-remember") {
 			return { trusted: "yes", remember: true };
 		}
-		if (choice === "Trust this session") {
+		if (choice === "trust-session") {
 			return { trusted: "yes" };
 		}
-		if (choice === "Do not trust this session") {
+		if (choice === "deny-session") {
 			return { trusted: "no" };
 		}
-		if (choice === "Let built-in prompt decide") {
+		if (choice === "builtin") {
 			return { trusted: "undecided" };
 		}
 		return { trusted: "undecided" };
 	});
 
 	pi.on("session_start", (_event, ctx) => {
-		ctx.ui.notify(`project-trust example loaded after trust resolution in ${ctx.cwd}`, "info");
+		ctx.uiV2.dialogs.notify(`project-trust example loaded after trust resolution in ${ctx.cwd}`, "info");
 	});
 }

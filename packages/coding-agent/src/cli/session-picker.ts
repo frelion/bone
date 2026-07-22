@@ -1,17 +1,12 @@
-/**
- * TUI session selector for --resume flag
- */
-
-import { setKeybindings } from "@frelion/bone-tui";
-import { KeybindingsManager } from "../core/keybindings.ts";
+/** OpenTUI conversation selector for --resume. */
 import type { SessionInfo, SessionListProgress } from "../core/session-manager.ts";
 import type { SettingsManager } from "../core/settings-manager.ts";
-import { SessionSelectorComponent } from "../modes/interactive/components/session-selector.ts";
+import { OpenTUISessionPickerV2 } from "../modes/interactive/components/opentui-session-picker.ts";
+import { matchesOpenTUIAction } from "../modes/interactive/opentui-keymap.ts";
 import { createStartupTui, startStartupTui } from "./startup-ui.ts";
 
 type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
 
-/** Show TUI session selector and return selected session path or null if cancelled */
 export async function selectSession(
 	currentSessionsLoader: SessionsLoader,
 	allSessionsLoader: SessionsLoader,
@@ -19,37 +14,51 @@ export async function selectSession(
 ): Promise<string | null> {
 	const ui = await createStartupTui(settingsManager);
 	return new Promise((resolve) => {
-		const keybindings = KeybindingsManager.create();
-		setKeybindings(keybindings);
-		let resolved = false;
-
-		const selector = new SessionSelectorComponent(
+		let settled = false;
+		let unsubscribe = () => {};
+		const finish = (path: string | null) => {
+			if (settled) return;
+			settled = true;
+			unsubscribe();
+			ui.stop();
+			ui.destroy();
+			resolve(path);
+		};
+		const picker = new OpenTUISessionPickerV2({
 			currentSessionsLoader,
 			allSessionsLoader,
-			(path: string) => {
-				if (!resolved) {
-					resolved = true;
-					ui.stop();
-					resolve(path);
-				}
-			},
-			() => {
-				if (!resolved) {
-					resolved = true;
-					ui.stop();
-					resolve(null);
-				}
-			},
-			() => {
+			onSelect: (path) => finish(path),
+			onCancel: () => finish(null),
+			onExit: () => {
 				ui.stop();
+				ui.destroy();
 				process.exit(0);
 			},
-			() => ui.requestRender(),
-			{ showRenameHint: false, keybindings },
-		);
-
-		ui.addChild(selector);
-		ui.setFocus(selector.getSessionList());
+		});
+		ui.mount(picker);
+		unsubscribe = ui.onKey((event) => {
+			for (const action of ["confirm", "cancel", "up", "down", "pageUp", "pageDown"] as const) {
+				if (!matchesOpenTUIAction(event, action)) continue;
+				event.preventDefault();
+				event.stopPropagation();
+				picker.handleAction(action);
+				return;
+			}
+			for (const [action, command] of [
+				["startupScope", "scope"],
+				["startupExit", "exit"],
+				["sessionSort", "sort"],
+				["sessionNamedFilter", "named"],
+				["sessionPath", "path"],
+				["sessionDelete", "delete"],
+			] as const) {
+				if (!matchesOpenTUIAction(event, action)) continue;
+				event.preventDefault();
+				event.stopPropagation();
+				picker.handleCommand(command);
+				return;
+			}
+		});
 		startStartupTui(ui, settingsManager);
 	});
 }

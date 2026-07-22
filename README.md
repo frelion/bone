@@ -43,7 +43,9 @@ hook path and `bone` command.
 
 The source remains an npm workspace monorepo. Its internal package names are an
 implementation detail during the GitHub Release phase and are not published by
-this repository.
+this repository. npm and Node.js remain development tools only; Bone's supported
+product runtime is Bun 1.3.14 or newer, and release archives contain standalone
+Bun executables.
 
 ## Supply-chain policy
 

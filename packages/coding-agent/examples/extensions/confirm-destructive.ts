@@ -12,13 +12,13 @@ export default function (pi: ExtensionAPI) {
 		if (!ctx.hasUI) return;
 
 		if (event.reason === "new") {
-			const confirmed = await ctx.ui.confirm(
-				"Clear session?",
-				"This will delete all messages in the current session.",
-			);
+			const confirmed = await ctx.uiV2.dialogs.confirm({
+				title: "Clear session?",
+				message: "This will delete all messages in the current session.",
+			});
 
 			if (!confirmed) {
-				ctx.ui.notify("Clear cancelled", "info");
+				ctx.uiV2.dialogs.notify("Clear cancelled", "info");
 				return { cancel: true };
 			}
 			return;
@@ -31,13 +31,13 @@ export default function (pi: ExtensionAPI) {
 		);
 
 		if (hasUnsavedWork) {
-			const confirmed = await ctx.ui.confirm(
-				"Switch session?",
-				"You have messages in the current session. Switch anyway?",
-			);
+			const confirmed = await ctx.uiV2.dialogs.confirm({
+				title: "Switch session?",
+				message: "You have messages in the current session. Switch anyway?",
+			});
 
 			if (!confirmed) {
-				ctx.ui.notify("Switch cancelled", "info");
+				ctx.uiV2.dialogs.notify("Switch cancelled", "info");
 				return { cancel: true };
 			}
 		}
@@ -46,13 +46,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_before_fork", async (event, ctx) => {
 		if (!ctx.hasUI) return;
 
-		const choice = await ctx.ui.select(`Fork from entry ${event.entryId.slice(0, 8)}?`, [
-			"Yes, create fork",
-			"No, stay in current session",
-		]);
+		const choice = await ctx.uiV2.dialogs.select({
+			title: `Fork from entry ${event.entryId.slice(0, 8)}?`,
+			options: [
+				{ value: "fork", label: "Yes, create fork" },
+				{ value: "stay", label: "No, stay in current session" },
+			],
+		});
 
-		if (choice !== "Yes, create fork") {
-			ctx.ui.notify("Fork cancelled", "info");
+		if (choice !== "fork") {
+			ctx.uiV2.dialogs.notify("Fork cancelled", "info");
 			return { cancel: true };
 		}
 	});

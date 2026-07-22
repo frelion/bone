@@ -8,35 +8,29 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
 const packageDir = join(repoRoot, "packages", "coding-agent");
-const distCliPath = join(packageDir, "dist", "cli.js");
 const srcCliPath = join(packageDir, "src", "cli.ts");
-const defaultNodeProfileDir = join(repoRoot, "profiles-node");
 const defaultBunProfileDir = join(repoRoot, "profiles-bun");
 const agentDirEnvName = "BONE_CODING_AGENT_DIR";
 const startupBenchmarkEnvName = "BONE_STARTUP_BENCHMARK";
 
 function printHelp() {
 	console.log(`Usage:
-  node scripts/profile-coding-agent-node.mjs [options]
+  bun scripts/profile-coding-agent-node.mjs [options]
 
 Profiles coding-agent startup with the runtime selected below:
-- npm run profile:tui     -> builds packages/coding-agent and profiles TUI startup with Node
-- npm run profile:rpc     -> builds packages/coding-agent and profiles RPC startup with Node
-- bun run profile:tui     -> profiles TUI startup from src/cli.ts directly with Bun
-- bun run profile:rpc     -> profiles RPC startup from src/cli.ts directly with Bun
+- npm run profile:tui     -> profiles TUI startup from src/cli.ts with Bun
+- npm run profile:rpc     -> profiles RPC startup from src/cli.ts with Bun
 
 Options:
   --mode <name>          tui or rpc (default: tui)
   --runs <n>             Number of measured runs (default: 1)
   --warmup <n>           Number of warmup runs before measurements (default: 0)
-  --profile-dir <dir>    CPU profile output directory
-                         Default: profiles-node for Node, profiles-bun for Bun
+  --profile-dir <dir>    CPU profile output directory (default: profiles-bun)
   --label <name>         Profile name prefix (default: <mode>-startup)
-  --runtime <name>       node, bun, or auto (default: auto)
+  --runtime <name>       bun (the only supported runtime)
   --agent-dir <dir>      Use a specific BONE_CODING_AGENT_DIR for the benchmark run
   --isolated-agent-dir   Use a fresh temporary agent dir instead of the normal one
   --no-offline           Do not force BONE_OFFLINE=1 / BONE_SKIP_VERSION_CHECK=1
-  --skip-build           Reuse the current dist/cli.js without rebuilding first (Node only)
   --cpu-profile          Write CPU profiles for benchmark runs
   --help                 Show this help
 
@@ -57,10 +51,10 @@ function parseIntegerFlag(value, name) {
 }
 
 function parseRuntime(value) {
-	if (value === "auto" || value === "node" || value === "bun") {
+	if (value === "bun") {
 		return value;
 	}
-	throw new Error(`Invalid --runtime: ${value}`);
+	throw new Error(`Invalid --runtime: ${value}. Bone supports Bun only.`);
 }
 
 function parseMode(value) {
@@ -78,8 +72,7 @@ function parseArgs(argv) {
 		profileDir: undefined,
 		label: undefined,
 		offline: true,
-		build: true,
-		runtime: "auto",
+		runtime: "bun",
 		agentDir: undefined,
 		isolatedAgentDir: false,
 		cpuProfile: false,
@@ -103,10 +96,6 @@ function parseArgs(argv) {
 			continue;
 		}
 
-		if (arg === "--skip-build") {
-			options.build = false;
-			continue;
-		}
 
 		if (arg === "--cpu-profile") {
 			options.cpuProfile = true;
@@ -167,23 +156,11 @@ function parseArgs(argv) {
 	return options;
 }
 
-function detectRuntimeFromPackageManager() {
-	const userAgent = process.env.npm_config_user_agent ?? "";
-	return userAgent.startsWith("bun/") ? "bun" : "node";
-}
-
-function resolveRuntime(requestedRuntime) {
-	if (requestedRuntime === "auto") {
-		return detectRuntimeFromPackageManager();
-	}
-	return requestedRuntime;
-}
-
-function resolveProfileDir(runtime, requestedProfileDir) {
+function resolveProfileDir(requestedProfileDir) {
 	if (requestedProfileDir) {
 		return requestedProfileDir;
 	}
-	return runtime === "bun" ? defaultBunProfileDir : defaultNodeProfileDir;
+	return defaultBunProfileDir;
 }
 
 function resolveLabel(mode, requestedLabel) {
@@ -278,81 +255,19 @@ async function waitForExit(child, errorPrefix) {
 	});
 }
 
-async function runBuild() {
-	process.stdout.write("Building packages/tui, packages/ai, packages/agent, and packages/coding-agent...\n");
-	const startedAt = performance.now();
-	const child = spawn(
-		"npm",
-		[
-			"run",
-			"build",
-			"--workspace",
-			"packages/tui",
-			"--workspace",
-			"packages/ai",
-			"--workspace",
-			"packages/agent",
-			"--workspace",
-			"packages/coding-agent",
-		],
-		{
-			cwd: repoRoot,
-			env: process.env,
-			stdio: ["ignore", "pipe", "pipe"],
-			shell: process.platform === "win32",
-		},
-	);
-
-	let stdout = "";
-	let stderr = "";
-	child.stdout.setEncoding("utf8");
-	child.stdout.on("data", (chunk) => {
-		stdout += chunk;
-	});
-	child.stderr.setEncoding("utf8");
-	child.stderr.on("data", (chunk) => {
-		stderr += chunk;
-	});
-
-	const exitCode = await waitForExit(child, "Build");
-	if (exitCode !== 0) {
-		if (stdout.trim()) {
-			process.stdout.write(`${stdout}${stdout.endsWith("\n") ? "" : "\n"}`);
-		}
-		if (stderr.trim()) {
-			process.stderr.write(`${stderr}${stderr.endsWith("\n") ? "" : "\n"}`);
-		}
-		throw new Error(`Build failed with exit code ${exitCode}`);
-	}
-
-	process.stdout.write(`Build completed in ${formatMs(performance.now() - startedAt)}\n`);
-}
-
-function getRuntimeCommand(runtime, mode, profileDir, profileName, cpuProfile) {
+function getRuntimeCommand(mode, profileDir, profileName, cpuProfile) {
 	const benchmarkArgs = ["--no-session"];
 	if (mode === "rpc") {
 		benchmarkArgs.push("--mode", "rpc");
-	}
-
-	if (runtime === "bun") {
-		const args = [];
-		if (cpuProfile) {
-			args.push("--cpu-prof", `--cpu-prof-dir=${profileDir}`, `--cpu-prof-name=${profileName}`);
-		}
-		args.push(srcCliPath, ...benchmarkArgs);
-		return {
-			executable: "bun",
-			args,
-		};
 	}
 
 	const args = [];
 	if (cpuProfile) {
 		args.push("--cpu-prof", `--cpu-prof-dir=${profileDir}`, `--cpu-prof-name=${profileName}`);
 	}
-	args.push(distCliPath, ...benchmarkArgs);
+	args.push(srcCliPath, ...benchmarkArgs);
 	return {
-		executable: process.execPath,
+		executable: "bun",
 		args,
 	};
 }
@@ -384,7 +299,7 @@ async function runTuiBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 		mkdirSync(isolatedAgentDir, { recursive: true });
 	}
 
-	const command = getRuntimeCommand(runtime, "tui", profileDir, profileName, options.cpuProfile);
+	const command = getRuntimeCommand("tui", profileDir, profileName, options.cpuProfile);
 	const child = spawn(command.executable, command.args, {
 		cwd: packageDir,
 		env: createBenchmarkEnv(options, isolatedAgentDir),
@@ -443,7 +358,7 @@ async function runRpcBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 		mkdirSync(isolatedAgentDir, { recursive: true });
 	}
 
-	const command = getRuntimeCommand(runtime, "rpc", profileDir, profileName, options.cpuProfile);
+	const command = getRuntimeCommand("rpc", profileDir, profileName, options.cpuProfile);
 	const child = spawn(command.executable, command.args, {
 		cwd: packageDir,
 		env: createBenchmarkEnv(options, isolatedAgentDir),
@@ -544,20 +459,15 @@ async function main() {
 		throw new Error("TUI benchmark must be run from an interactive terminal.");
 	}
 
-	const runtime = resolveRuntime(options.runtime);
+	const runtime = options.runtime;
 	options.label = resolveLabel(options.mode, options.label);
-	const profileDir = resolveProfileDir(runtime, options.profileDir);
+	const profileDir = resolveProfileDir(options.profileDir);
 
-	if (runtime === "node" && options.build) {
-		await runBuild();
-	}
-	if (runtime === "bun") {
-		process.stdout.write(
-			`Using Bun runtime with ${options.mode === "rpc" ? "packages/coding-agent/src/cli.ts --mode rpc" : "packages/coding-agent/src/cli.ts"}\n`,
-		);
-	}
+	process.stdout.write(
+		`Using Bun runtime with ${options.mode === "rpc" ? "packages/coding-agent/src/cli.ts --mode rpc" : "packages/coding-agent/src/cli.ts"}\n`,
+	);
 
-	const entryPath = runtime === "bun" ? srcCliPath : distCliPath;
+	const entryPath = srcCliPath;
 	if (!existsSync(entryPath)) {
 		throw new Error(`CLI entrypoint not found: ${entryPath}`);
 	}

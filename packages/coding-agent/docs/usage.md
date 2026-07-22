@@ -14,7 +14,7 @@ The interface contains a startup header, conversation history, editor, and statu
 | `/settings` | Configure Bone |
 | `/new`, `/tree`, `/fork`, `/clone` | Manage conversations |
 | `/compact` | Compact context |
-| `/reload` | Reload local skills, prompts, themes, keybindings, and context files |
+| `/reload` | Reload local skills, prompts, themes, and context files |
 | `/trust` | Save a project trust decision |
 | `/quit` | Quit Bone |
 

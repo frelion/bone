@@ -19,14 +19,14 @@ export default function (pi: ExtensionAPI) {
 		description: "Send a user message to the agent",
 		handler: async (args, ctx) => {
 			if (!args.trim()) {
-				ctx.ui.notify("Usage: /ask <message>", "warning");
+				ctx.uiV2.dialogs.notify("Usage: /ask <message>", "warning");
 				return;
 			}
 
 			// sendUserMessage always triggers a turn when not streaming
 			// If streaming, it will throw (no deliverAs specified)
 			if (!ctx.isIdle()) {
-				ctx.ui.notify("Agent is busy. Use /steer or /followup instead.", "warning");
+				ctx.uiV2.dialogs.notify("Agent is busy. Use /steer or /followup instead.", "warning");
 				return;
 			}
 
@@ -39,7 +39,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Send a steering message (interrupts current processing)",
 		handler: async (args, ctx) => {
 			if (!args.trim()) {
-				ctx.ui.notify("Usage: /steer <message>", "warning");
+				ctx.uiV2.dialogs.notify("Usage: /steer <message>", "warning");
 				return;
 			}
 
@@ -58,7 +58,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Queue a follow-up message (waits for current processing)",
 		handler: async (args, ctx) => {
 			if (!args.trim()) {
-				ctx.ui.notify("Usage: /followup <message>", "warning");
+				ctx.uiV2.dialogs.notify("Usage: /followup <message>", "warning");
 				return;
 			}
 
@@ -68,7 +68,7 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				// Streaming - queue as follow-up
 				pi.sendUserMessage(args, { deliverAs: "followUp" });
-				ctx.ui.notify("Follow-up queued", "info");
+				ctx.uiV2.dialogs.notify("Follow-up queued", "info");
 			}
 		},
 	});
@@ -78,12 +78,12 @@ export default function (pi: ExtensionAPI) {
 		description: "Send a user message with structured content",
 		handler: async (args, ctx) => {
 			if (!args.trim()) {
-				ctx.ui.notify("Usage: /askwith <message>", "warning");
+				ctx.uiV2.dialogs.notify("Usage: /askwith <message>", "warning");
 				return;
 			}
 
 			if (!ctx.isIdle()) {
-				ctx.ui.notify("Agent is busy", "warning");
+				ctx.uiV2.dialogs.notify("Agent is busy", "warning");
 				return;
 			}
 

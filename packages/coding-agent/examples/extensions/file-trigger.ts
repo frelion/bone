@@ -35,7 +35,7 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		if (ctx.hasUI) {
-			ctx.ui.notify(`Watching ${triggerFile}`, "info");
+			ctx.uiV2.dialogs.notify(`Watching ${triggerFile}`, "info");
 		}
 	});
 }

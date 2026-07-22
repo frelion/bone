@@ -1,5 +1,4 @@
-import { resetCapabilitiesCache, setCapabilities } from "@frelion/bone-tui";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { highlightCode, initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { highlight, renderHighlightedHtml, supportsLanguage } from "../src/utils/syntax-highlight.ts";
 
@@ -51,12 +50,7 @@ describe("syntax highlight renderer", () => {
 
 describe("theme syntax highlighting", () => {
 	beforeEach(() => {
-		setCapabilities({ images: null, trueColor: true, hyperlinks: false });
 		initTheme("dark");
-	});
-
-	afterEach(() => {
-		resetCapabilitiesCache();
 	});
 
 	it("colors diff additions and deletions in fenced diff blocks", () => {

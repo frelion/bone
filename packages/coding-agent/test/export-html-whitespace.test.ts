@@ -1,4 +1,3 @@
-import type { Component } from "@frelion/bone-tui";
 import { readFileSync } from "fs";
 import { describe, expect, it } from "vitest";
 import { ansiLinesToHtml } from "../src/core/export-html/ansi-to-html.ts";
@@ -21,13 +20,18 @@ describe("export HTML tool output whitespace", () => {
 		expect(ansiLinesToHtml(["one", "two"])).toBe('<div class="ansi-line">one</div><div class="ansi-line">two</div>');
 	});
 
-	it("trims TUI spacing lines from custom tool result HTML", () => {
-		const component: Component = { render: () => ["", "\u001b[31mone\u001b[0m", "two", ""], invalidate: () => {} };
+	it("trims data spacing lines from structured tool result HTML", () => {
 		const tool = {
 			name: "custom",
 			label: "custom",
 			description: "custom",
-			renderResult: () => component,
+			renderV2: {
+				renderResult: () => ({
+					mount: () => {
+						throw new Error("HTML export must not mount views");
+					},
+				}),
+			},
 		} as unknown as ToolDefinition;
 		const renderer = createToolHtmlRenderer({
 			getToolDefinition: () => tool,
@@ -35,8 +39,14 @@ describe("export HTML tool output whitespace", () => {
 			cwd: "/tmp",
 		});
 
-		expect(renderer.renderResult("id", "custom", [], undefined, false)?.expanded).toBe(
-			'<div class="ansi-line"><span style="color:#800000">one</span></div><div class="ansi-line">two</div>',
-		);
+		expect(
+			renderer.renderResult(
+				"id",
+				"custom",
+				[{ type: "text", text: "\n\u001b[31mone\u001b[0m\ntwo\n" }],
+				undefined,
+				false,
+			)?.expanded,
+		).toBe('<div class="ansi-line"><span style="color:#800000">one</span></div><div class="ansi-line">two</div>');
 	});
 });

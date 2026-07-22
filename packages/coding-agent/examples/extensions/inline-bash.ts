@@ -86,7 +86,7 @@ export default function (pi: ExtensionAPI) {
 				})
 				.join("\n");
 
-			ctx.ui.notify(`Expanded ${expansions.length} inline command(s):\n${summary}`, "info");
+			ctx.uiV2.dialogs.notify(`Expanded ${expansions.length} inline command(s):\n${summary}`, "info");
 		}
 
 		return { action: "transform", text: result, images: event.images };

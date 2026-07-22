@@ -21,12 +21,12 @@ export default function (pi: ExtensionAPI) {
 				const entry = entries[i];
 				if (entry.type === "message" && entry.message.role === "assistant") {
 					pi.setLabel(entry.id, label);
-					ctx.ui.notify(`Bookmarked as: ${label}`, "info");
+					ctx.uiV2.dialogs.notify(`Bookmarked as: ${label}`, "info");
 					return;
 				}
 			}
 
-			ctx.ui.notify("No assistant message to bookmark", "warning");
+			ctx.uiV2.dialogs.notify("No assistant message to bookmark", "warning");
 		},
 	});
 
@@ -40,11 +40,11 @@ export default function (pi: ExtensionAPI) {
 				const label = ctx.sessionManager.getLabel(entry.id);
 				if (label) {
 					pi.setLabel(entry.id, undefined);
-					ctx.ui.notify(`Removed bookmark: ${label}`, "info");
+					ctx.uiV2.dialogs.notify(`Removed bookmark: ${label}`, "info");
 					return;
 				}
 			}
-			ctx.ui.notify("No bookmarked entry found", "warning");
+			ctx.uiV2.dialogs.notify("No bookmarked entry found", "warning");
 		},
 	});
 }

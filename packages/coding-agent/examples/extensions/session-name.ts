@@ -17,10 +17,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (name) {
 				pi.setSessionName(name);
-				ctx.ui.notify(`Session named: ${name}`, "info");
+				ctx.uiV2.dialogs.notify(`Session named: ${name}`, "info");
 			} else {
 				const current = pi.getSessionName();
-				ctx.ui.notify(current ? `Session: ${current}` : "No session name set", "info");
+				ctx.uiV2.dialogs.notify(current ? `Session: ${current}` : "No session name set", "info");
 			}
 		},
 	});

@@ -1,14 +1,19 @@
 import type { AgentTool } from "@frelion/bone-agent-core";
-import { Container, Text } from "@frelion/bone-tui";
 import { mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
 import { dirname } from "path";
 import { type Static, Type } from "typebox";
-import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
-import { getLanguageFromPath, highlightCode, type Theme } from "../../modes/interactive/theme/theme.ts";
-import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import { getLanguageFromPath, highlightCode, type Theme, theme } from "../../modes/interactive/theme/theme.ts";
+import type { ToolDefinition } from "../extensions/types.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
-import { normalizeDisplayText, renderToolPath, replaceTabs, str } from "./render-utils.ts";
+import {
+	normalizeDisplayText,
+	renderToolPath,
+	replaceTabs,
+	str,
+	structuredToolResultView,
+	structuredToolTextView,
+} from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 
 const writeSchema = Type.Object({
@@ -47,13 +52,7 @@ type WriteHighlightCache = {
 	highlightedLines: string[];
 };
 
-class WriteCallRenderComponent extends Text {
-	cache?: WriteHighlightCache;
-
-	constructor() {
-		super("", 0, 0);
-	}
-}
+type WriteRenderState = { cache?: WriteHighlightCache };
 
 const WRITE_PARTIAL_FULL_HIGHLIGHT_LINES = 50;
 
@@ -130,7 +129,7 @@ function trimTrailingEmptyLines(lines: string[]): string[] {
 
 function formatWriteCall(
 	args: { path?: string; file_path?: string; content?: string } | undefined,
-	options: ToolRenderResultOptions,
+	options: { expanded: boolean },
 	theme: Theme,
 	cache: WriteHighlightCache | undefined,
 	cwd: string,
@@ -154,7 +153,7 @@ function formatWriteCall(
 		const remaining = lines.length - maxLines;
 		text += `\n\n${displayLines.map((line) => (lang ? line : theme.fg("toolOutput", replaceTabs(line)))).join("\n")}`;
 		if (remaining > 0) {
-			text += `${theme.fg("muted", `\n... (${remaining} more lines, ${totalLines} total,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+			text += theme.fg("muted", `\n... (${remaining} more lines, ${totalLines} total)`);
 		}
 	}
 
@@ -181,7 +180,7 @@ function formatWriteResult(
 export function createWriteToolDefinition(
 	cwd: string,
 	options?: WriteToolOptions,
-): ToolDefinition<typeof writeSchema, undefined> {
+): ToolDefinition<typeof writeSchema, undefined, WriteRenderState> {
 	const ops = options?.operations ?? defaultWriteOperations;
 	return {
 		name: "write",
@@ -224,40 +223,27 @@ export function createWriteToolDefinition(
 				};
 			});
 		},
-		renderCall(args, theme, context) {
-			const renderArgs = args as { path?: string; file_path?: string; content?: string } | undefined;
-			const rawPath = str(renderArgs?.file_path ?? renderArgs?.path);
-			const fileContent = str(renderArgs?.content);
-			const component =
-				(context.lastComponent as WriteCallRenderComponent | undefined) ?? new WriteCallRenderComponent();
-			if (fileContent !== null) {
-				component.cache = context.argsComplete
-					? rebuildWriteHighlightCacheFull(rawPath, fileContent)
-					: updateWriteHighlightCacheIncremental(component.cache, rawPath, fileContent);
-			} else {
-				component.cache = undefined;
-			}
-			component.setText(
-				formatWriteCall(
-					renderArgs,
-					{ expanded: context.expanded, isPartial: context.isPartial },
-					theme,
-					component.cache,
-					context.cwd,
-				),
-			);
-			return component;
-		},
-		renderResult(result, _options, theme, context) {
-			const output = formatWriteResult({ ...result, isError: context.isError }, theme);
-			if (!output) {
-				const component = (context.lastComponent as Container | undefined) ?? new Container();
-				component.clear();
-				return component;
-			}
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(output);
-			return text;
+		renderV2: {
+			renderCall(args, context) {
+				const renderArgs = args as { path?: string; file_path?: string; content?: string } | undefined;
+				const rawPath = str(renderArgs?.file_path ?? renderArgs?.path);
+				const fileContent = str(renderArgs?.content);
+				if (fileContent !== null) {
+					context.state.cache = context.argsComplete
+						? rebuildWriteHighlightCacheFull(rawPath, fileContent)
+						: updateWriteHighlightCacheIncremental(context.state.cache, rawPath, fileContent);
+				} else {
+					context.state.cache = undefined;
+				}
+				return structuredToolTextView(
+					formatWriteCall(renderArgs, { expanded: context.expanded }, theme, context.state.cache, context.cwd),
+					{ fg: theme.getFgColor("toolOutput") },
+				);
+			},
+			renderResult(input, context) {
+				const output = formatWriteResult({ ...input.result, isError: context.isError }, theme) ?? "";
+				return structuredToolResultView(input.result, output, { fg: theme.getFgColor("error"), paddingX: 1 });
+			},
 		},
 	};
 }

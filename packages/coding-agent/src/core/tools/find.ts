@@ -1,15 +1,20 @@
 import { createInterface } from "node:readline";
 import type { AgentTool } from "@frelion/bone-agent-core";
-import { Text } from "@frelion/bone-tui";
 import { spawn } from "child_process";
 import path from "path";
 import { type Static, Type } from "typebox";
-import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
-import type { Theme } from "../../modes/interactive/theme/theme.ts";
+import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
-import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import type { ToolDefinition } from "../extensions/types.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
-import { getTextOutput, invalidArgText, shortenPath, str } from "./render-utils.ts";
+import {
+	getTextOutput,
+	invalidArgText,
+	shortenPath,
+	str,
+	structuredToolResultView,
+	structuredToolTextView,
+} from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
 
@@ -78,7 +83,7 @@ function formatFindResult(
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 		details?: FindToolDetails;
 	},
-	options: ToolRenderResultOptions,
+	options: { expanded: boolean },
 	theme: Theme,
 	showImages: boolean,
 ): string {
@@ -91,7 +96,7 @@ function formatFindResult(
 		const remaining = lines.length - maxLines;
 		text += `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
 		if (remaining > 0) {
-			text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+			text += theme.fg("muted", `\n... (${remaining} more lines)`);
 		}
 	}
 
@@ -356,15 +361,16 @@ export function createFindToolDefinition(
 				})();
 			});
 		},
-		renderCall(args, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(formatFindCall(args, theme));
-			return text;
-		},
-		renderResult(result, options, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(formatFindResult(result as any, options, theme, context.showImages));
-			return text;
+		renderV2: {
+			renderCall(args) {
+				return structuredToolTextView(formatFindCall(args, theme), { fg: theme.getFgColor("toolTitle") });
+			},
+			renderResult(input) {
+				return structuredToolResultView(input.result, formatFindResult(input.result, input, theme, true), {
+					fg: theme.getFgColor("toolOutput"),
+					paddingX: 1,
+				});
+			},
 		},
 	};
 }

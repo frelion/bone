@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Changed the supported runtime to Bun 1.3.14 or newer.
+
 ## [0.1.2] - 2026-07-22
 
 ## [0.1.1] - 2026-07-22

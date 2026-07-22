@@ -6,18 +6,20 @@ See [AGENTS.md](https://github.com/frelion/bone/blob/main/AGENTS.md) for additio
 
 ```bash
 git clone https://github.com/frelion/bone
-cd pi-mono
-npm install
+cd bone
+npm install --ignore-scripts
 npm run build
 ```
 
 Run from source:
 
 ```bash
-/path/to/pi-mono/pi-test.sh
+/path/to/bone/pi-test.sh
 ```
 
-The script can be run from any directory. Pi keeps the caller's current working directory.
+The script can be run from any directory. Bone keeps the caller's current working directory.
+The repository keeps npm and Node.js as development tooling, but the Bone CLI
+itself must run with Bun 1.3.14 or newer.
 
 ## Forking / Rebranding
 
@@ -36,7 +38,7 @@ Change `name`, `configDir`, and `bin` field for your fork. Affects CLI banner, c
 
 ## Path Resolution
 
-Three execution modes: npm install, standalone binary, tsx from source.
+Three execution modes: Bun package install, standalone Bun binary, and Bun from source.
 
 **Always use `src/config.ts`** for package assets:
 

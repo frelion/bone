@@ -377,7 +377,6 @@ export default function (pi: ExtensionAPI) {
 	let shellPath = "/bin/sh";
 
 	async function startVm(ctx?: ExtensionContext): Promise<VM> {
-		ctx?.ui.setStatus("gondolin", ctx.ui.theme.fg("accent", `Gondolin: starting ${GUEST_WORKSPACE}`));
 		const created = await VM.create({
 			sessionLabel: `pi ${path.basename(localCwd)}`,
 			vfs: {
@@ -389,11 +388,7 @@ export default function (pi: ExtensionAPI) {
 		const bashProbe = await created.exec(["/bin/sh", "-lc", "command -v bash || true"]);
 		shellPath = bashProbe.stdout.trim() || "/bin/sh";
 		vm = created;
-		ctx?.ui.setStatus(
-			"gondolin",
-			ctx.ui.theme.fg("accent", `Gondolin: ${created.id.slice(0, 8)} (${GUEST_WORKSPACE})`),
-		);
-		ctx?.ui.notify(`Gondolin VM ready. ${localCwd} is mounted at ${GUEST_WORKSPACE}.`, "info");
+		ctx?.uiV2.dialogs.notify(`Gondolin VM ready. ${localCwd} is mounted at ${GUEST_WORKSPACE}.`, "info");
 		return created;
 	}
 
@@ -411,24 +406,19 @@ export default function (pi: ExtensionAPI) {
 		await ensureVm(ctx);
 	});
 
-	pi.on("session_shutdown", async (_event, ctx) => {
+	pi.on("session_shutdown", async () => {
 		const activeVm = vm;
 		vm = undefined;
 		vmStarting = undefined;
 		if (!activeVm) return;
-		ctx.ui.setStatus("gondolin", ctx.ui.theme.fg("muted", "Gondolin: stopping"));
-		try {
-			await activeVm.close();
-		} finally {
-			ctx.ui.setStatus("gondolin", undefined);
-		}
+		await activeVm.close();
 	});
 
 	pi.registerCommand("gondolin", {
 		description: "Show Gondolin VM status",
 		handler: async (_args, ctx) => {
 			const activeVm = await ensureVm(ctx);
-			ctx.ui.notify(
+			ctx.uiV2.dialogs.notify(
 				[
 					`Gondolin VM: ${activeVm.id}`,
 					`Host workspace: ${localCwd}`,

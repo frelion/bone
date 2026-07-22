@@ -20,6 +20,9 @@ Windows 请下载对应 zip，在解压前使用可信的本地工具校验 SHA-
 可执行文件会携带对应的终端 helper 与本地语义搜索 native runtime；模型权重不会放进
 release archive，需要语义搜索时在安装后运行 `bone setup`。
 
+Bone 支持的运行时是 Bun。GitHub Release archive 包含独立 Bun 可执行文件；通过
+package 或源码运行时需要 Bun 1.3.14 或更高版本。不支持使用 Node.js 运行 CLI。
+
 ## 发布策略
 
 `vX.Y.Z` tag 会触发六平台 GitHub Release 流程：构建 native semantic runtime、编译

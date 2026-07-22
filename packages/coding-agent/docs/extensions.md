@@ -16,6 +16,26 @@ These directories are loaded as local resources and remain subject to project tr
 
 Bone modules and tests may inject inline extension factories while constructing a session. The factory runtime supports Bone-owned tools, commands, event handlers, renderers, and provider registrations. It is not a filesystem loader and does not resolve package imports for external code.
 
+## Structured UI v2
+
+Internal extensions use `ctx.uiV2` for interactive UI. The contract is split into
+product services rather than exposing renderer internals:
+
+- `dialogs` for select, confirm, input, and notifications
+- `widgets` for keyed views above or below the editor
+- `chrome` for header, footer, and terminal title
+- `editor` for text operations, editor dialogs, and structured editor views
+- `toolResults` for structured tool call/result renderers
+- `advanced` for trusted `BoneView` composition when the product services are insufficient
+
+Factories return `BoneView`; they do not receive OpenTUI renderables. The advanced
+service exposes `BoneRenderContext` and `BoneNode` through Bone's stable adapter,
+not `@opentui/core` types. See `examples/extensions/ui-v2.ts`.
+
+The v2 contract is the only extension UI surface. ANSI `Component` factories and
+the former renderer-shaped dialog, editor, message, entry, and tool APIs are not
+adapted or rasterized.
+
 ## Compatibility boundary
 
 The following are intentionally unsupported:

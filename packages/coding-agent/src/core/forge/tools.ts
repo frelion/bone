@@ -253,7 +253,8 @@ export function createForgeToolDefinitions(
 						toolCallId,
 						interactive: extensionContext?.hasUI ?? false,
 						projectTrusted: extensionContext?.isProjectTrusted() ?? false,
-						confirm: (title, message) => extensionContext?.ui.confirm(title, message) ?? Promise.resolve(false),
+						confirm: (title, message) =>
+							extensionContext?.uiV2?.dialogs.confirm({ title, message }) ?? Promise.resolve(false),
 					});
 					return { content: [{ type: "text", text: formatResult(result) }], details: result };
 				},

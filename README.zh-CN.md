@@ -38,7 +38,8 @@ post-commit 和 post-merge hook。提交或合并后它会构建当前平台的 
 `npm run dev:uninstall-hook` 会恢复该 clone 原来的 Git hook 路径与 `bone` 命令。
 
 源码仍是 npm workspace monorepo。在 GitHub Release 阶段，内部 package 名称只是
-实现细节，Bone 仓库不会发布它们。
+实现细节，Bone 仓库不会发布它们。npm 与 Node.js 仅保留为开发工具；Bone 产品
+运行时要求 Bun 1.3.14 或更高版本，release archive 提供独立 Bun 可执行文件。
 
 ## 供应链策略
 

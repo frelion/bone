@@ -1,9 +1,10 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
+import "./bun/require-bun.ts";
 /**
  * CLI entry point for the refactored coding agent.
  * Uses main.ts with AgentSession and new mode modules.
  *
- * Test with: npx tsx src/cli-new.ts [args...]
+ * Test with: bun src/cli.ts [args...]
  */
 import { APP_NAME } from "./config.ts";
 import { configureHttpDispatcher } from "./core/http-dispatcher.ts";

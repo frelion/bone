@@ -12,6 +12,9 @@ export default defineConfig({
 	test: {
 		globals: true,
 		environment: "node",
+		// OpenTUI 0.4.5 owns a process-global TreeSitter client. Parallel test
+		// files can otherwise destroy the client while another renderer uses it.
+		fileParallelism: false,
 		testTimeout: 30000,
 		reporters: process.env.GITHUB_ACTIONS ? ["dot", "github-actions"] : ["dot"],
 		silent: "passed-only",

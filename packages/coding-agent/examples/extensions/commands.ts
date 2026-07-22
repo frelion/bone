@@ -28,7 +28,7 @@ export default function commandsExtension(pi: ExtensionAPI) {
 			const filtered = sourceFilter ? commands.filter((c) => c.source === sourceFilter) : commands;
 
 			if (filtered.length === 0) {
-				ctx.ui.notify(sourceFilter ? `No ${sourceFilter} commands found` : "No commands found", "info");
+				ctx.uiV2.dialogs.notify(sourceFilter ? `No ${sourceFilter} commands found` : "No commands found", "info");
 				return;
 			}
 
@@ -38,7 +38,7 @@ export default function commandsExtension(pi: ExtensionAPI) {
 				return `/${cmd.name}${desc}`;
 			};
 
-			const items: string[] = [];
+			const items: Array<{ value: string; label: string; disabled?: boolean }> = [];
 			const sources: Array<{ key: "extension" | "prompt" | "skill"; label: string }> = [
 				{ key: "extension", label: "Extensions" },
 				{ key: "prompt", label: "Prompts" },
@@ -48,22 +48,23 @@ export default function commandsExtension(pi: ExtensionAPI) {
 			for (const { key, label } of sources) {
 				const cmds = filtered.filter((c) => c.source === key);
 				if (cmds.length > 0) {
-					items.push(`--- ${label} ---`);
-					items.push(...cmds.map(formatCommand));
+					items.push({ value: `header:${key}`, label, disabled: true });
+					items.push(...cmds.map((command) => ({ value: command.name, label: formatCommand(command) })));
 				}
 			}
 
 			// Show in a selector (user can scroll and see all commands)
-			const selected = await ctx.ui.select("Available Commands", items);
+			const selected = await ctx.uiV2.dialogs.select({ title: "Available Commands", options: items });
 
-			// If user selected a command (not a header), offer to show its path
-			if (selected && !selected.startsWith("---")) {
-				const cmdName = selected.split(" - ")[0].slice(1); // Remove leading /
-				const cmd = commands.find((c) => c.name === cmdName);
+			if (selected) {
+				const cmd = commands.find((command) => command.name === selected);
 				if (cmd?.sourceInfo.path) {
-					const showPath = await ctx.ui.confirm(cmd.name, `View source path?\n${cmd.sourceInfo.path}`);
+					const showPath = await ctx.uiV2.dialogs.confirm({
+						title: cmd.name,
+						message: `View source path?\n${cmd.sourceInfo.path}`,
+					});
 					if (showPath) {
-						ctx.ui.notify(cmd.sourceInfo.path, "info");
+						ctx.uiV2.dialogs.notify(cmd.sourceInfo.path, "info");
 					}
 				}
 			}

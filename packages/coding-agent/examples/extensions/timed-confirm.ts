@@ -14,16 +14,16 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("timed", {
 		description: "Show a timed confirmation dialog (auto-cancels in 5s with countdown)",
 		handler: async (_args, ctx) => {
-			const confirmed = await ctx.ui.confirm(
-				"Timed Confirmation",
-				"This dialog will auto-cancel in 5 seconds. Confirm?",
-				{ timeout: 5000 },
-			);
+			const confirmed = await ctx.uiV2.dialogs.confirm({
+				title: "Timed Confirmation",
+				message: "This dialog will auto-cancel in 5 seconds. Confirm?",
+				timeoutMs: 5000,
+			});
 
 			if (confirmed) {
-				ctx.ui.notify("Confirmed by user!", "info");
+				ctx.uiV2.dialogs.notify("Confirmed by user!", "info");
 			} else {
-				ctx.ui.notify("Cancelled or timed out", "info");
+				ctx.uiV2.dialogs.notify("Cancelled or timed out", "info");
 			}
 		},
 	});
@@ -31,12 +31,20 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("timed-select", {
 		description: "Show a timed select dialog (auto-cancels in 10s with countdown)",
 		handler: async (_args, ctx) => {
-			const choice = await ctx.ui.select("Pick an option", ["Option A", "Option B", "Option C"], { timeout: 10000 });
+			const choice = await ctx.uiV2.dialogs.select({
+				title: "Pick an option",
+				options: [
+					{ value: "a", label: "Option A" },
+					{ value: "b", label: "Option B" },
+					{ value: "c", label: "Option C" },
+				],
+				timeoutMs: 10000,
+			});
 
 			if (choice) {
-				ctx.ui.notify(`Selected: ${choice}`, "info");
+				ctx.uiV2.dialogs.notify(`Selected: ${choice}`, "info");
 			} else {
-				ctx.ui.notify("Selection cancelled or timed out", "info");
+				ctx.uiV2.dialogs.notify("Selection cancelled or timed out", "info");
 			}
 		},
 	});
@@ -48,22 +56,22 @@ export default function (pi: ExtensionAPI) {
 			const controller = new AbortController();
 			const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-			ctx.ui.notify("Dialog will auto-cancel in 5 seconds...", "info");
+			ctx.uiV2.dialogs.notify("Dialog will auto-cancel in 5 seconds...", "info");
 
-			const confirmed = await ctx.ui.confirm(
-				"Timed Confirmation",
-				"This dialog will auto-cancel in 5 seconds. Confirm?",
-				{ signal: controller.signal },
-			);
+			const confirmed = await ctx.uiV2.dialogs.confirm({
+				title: "Timed Confirmation",
+				message: "This dialog will auto-cancel in 5 seconds. Confirm?",
+				signal: controller.signal,
+			});
 
 			clearTimeout(timeoutId);
 
 			if (confirmed) {
-				ctx.ui.notify("Confirmed by user!", "info");
+				ctx.uiV2.dialogs.notify("Confirmed by user!", "info");
 			} else if (controller.signal.aborted) {
-				ctx.ui.notify("Dialog timed out (auto-cancelled)", "warning");
+				ctx.uiV2.dialogs.notify("Dialog timed out (auto-cancelled)", "warning");
 			} else {
-				ctx.ui.notify("Cancelled by user", "info");
+				ctx.uiV2.dialogs.notify("Cancelled by user", "info");
 			}
 		},
 	});

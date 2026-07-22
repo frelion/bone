@@ -91,8 +91,9 @@ fi
 if [[ "$SKIP_DEPS" == "false" ]]; then
     echo "==> Installing cross-platform native bindings..."
     CLIPBOARD_VERSION=$(node -p "require('./packages/coding-agent/package.json').optionalDependencies['@mariozechner/clipboard']")
-    # npm ci only installs optional deps for the current platform
-    # We need the base clipboard package and all platform bindings for bun cross-compilation
+    OPENTUI_VERSION=$(node -p "require('./packages/tui/package.json').dependencies['@opentui/core']")
+    # npm ci only installs optional deps for the current platform. Bun cross-compilation
+    # needs every clipboard binding and OpenTUI native library available to the bundler.
     # Use --force to bypass platform checks (os/cpu restrictions in package.json)
     # Install all in one command to avoid npm removing packages from previous installs
     npm install --include=optional --no-save --package-lock=false --force --ignore-scripts \
@@ -102,7 +103,15 @@ if [[ "$SKIP_DEPS" == "false" ]]; then
         @mariozechner/clipboard-linux-x64-gnu@"$CLIPBOARD_VERSION" \
         @mariozechner/clipboard-linux-arm64-gnu@"$CLIPBOARD_VERSION" \
         @mariozechner/clipboard-win32-x64-msvc@"$CLIPBOARD_VERSION" \
-        @mariozechner/clipboard-win32-arm64-msvc@"$CLIPBOARD_VERSION"
+        @mariozechner/clipboard-win32-arm64-msvc@"$CLIPBOARD_VERSION" \
+        @opentui/core-darwin-arm64@"$OPENTUI_VERSION" \
+        @opentui/core-darwin-x64@"$OPENTUI_VERSION" \
+        @opentui/core-linux-arm64@"$OPENTUI_VERSION" \
+        @opentui/core-linux-x64@"$OPENTUI_VERSION" \
+        @opentui/core-linux-arm64-musl@"$OPENTUI_VERSION" \
+        @opentui/core-linux-x64-musl@"$OPENTUI_VERSION" \
+        @opentui/core-win32-arm64@"$OPENTUI_VERSION" \
+        @opentui/core-win32-x64@"$OPENTUI_VERSION"
 else
     echo "==> Skipping cross-platform native bindings (--skip-deps)"
 fi
@@ -135,8 +144,36 @@ for platform in "${PLATFORMS[@]}"; do
     # workers must be present in the compiled executable.
     if [[ "$platform" == windows-* ]]; then
 		bun build --compile --target=bun-$platform ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/core/local-embedding-worker.ts ./src/core/local-embedding-setup-worker.ts --outfile "$OUTPUT_DIR/$platform/bone.exe"
+		opentui_binary="$OUTPUT_DIR/$platform/bone.exe"
     else
 		bun build --compile --target=bun-$platform ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/core/local-embedding-worker.ts ./src/core/local-embedding-setup-worker.ts --outfile "$OUTPUT_DIR/$platform/bone"
+		opentui_binary="$OUTPUT_DIR/$platform/bone"
+    fi
+    case "$platform" in
+        darwin-arm64) opentui_library="../../node_modules/@opentui/core-darwin-arm64/libopentui.dylib" ;;
+        darwin-x64) opentui_library="../../node_modules/@opentui/core-darwin-x64/libopentui.dylib" ;;
+        linux-arm64) opentui_library="../../node_modules/@opentui/core-linux-arm64/libopentui.so" ;;
+        linux-x64) opentui_library="../../node_modules/@opentui/core-linux-x64/libopentui.so" ;;
+        windows-arm64) opentui_library="../../node_modules/@opentui/core-win32-arm64/opentui.dll" ;;
+        windows-x64) opentui_library="../../node_modules/@opentui/core-win32-x64/opentui.dll" ;;
+    esac
+    node ../../scripts/verify-opentui-standalone.mjs \
+        --binary "$opentui_binary" \
+        --native-library "$opentui_library" \
+        --skip-run
+done
+
+# A successful compile does not prove that OpenTUI's file-imported dynamic
+# library can be extracted from $bunfs and loaded. Exercise the host binary
+# from an isolated directory whenever this build includes the host target.
+HOST_PLATFORM=$(node -p "(process.platform === 'win32' ? 'windows' : process.platform) + '-' + process.arch")
+for platform in "${PLATFORMS[@]}"; do
+    if [[ "$platform" == "$HOST_PLATFORM" ]]; then
+        host_binary="$OUTPUT_DIR/$platform/bone"
+        if [[ "$platform" == windows-* ]]; then
+            host_binary="$OUTPUT_DIR/$platform/bone.exe"
+        fi
+        node ../../scripts/verify-opentui-standalone.mjs --binary "$host_binary"
     fi
 done
 
@@ -203,20 +240,6 @@ for platform in "${PLATFORMS[@]}"; do
     cp "../../node_modules/@mariozechner/$clipboard_native_package/$clipboard_native_file" \
         "$OUTPUT_DIR/$platform/node_modules/@mariozechner/clipboard/"
 
-    # Copy terminal input native helpers next to compiled binaries.
-    if [[ "$platform" == darwin-* ]]; then
-        mkdir -p "$OUTPUT_DIR/$platform/native/darwin/prebuilds/$platform"
-        cp ../tui/native/darwin/prebuilds/$platform/darwin-modifiers.node "$OUTPUT_DIR/$platform/native/darwin/prebuilds/$platform/"
-    fi
-    if [[ "$platform" == windows-* ]]; then
-        if [[ "$platform" == "windows-arm64" ]]; then
-            win32_arch_dir="win32-arm64"
-        else
-            win32_arch_dir="win32-x64"
-        fi
-        mkdir -p "$OUTPUT_DIR/$platform/native/win32/prebuilds/$win32_arch_dir"
-        cp ../tui/native/win32/prebuilds/$win32_arch_dir/win32-console-mode.node "$OUTPUT_DIR/$platform/native/win32/prebuilds/$win32_arch_dir/"
-    fi
 done
 
 # Create archives

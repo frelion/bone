@@ -28,9 +28,6 @@ export type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	AppendEntryHandler,
-	// App keybindings (for custom editors)
-	AppKeybinding,
-	AutocompleteProviderFactory,
 	// Events - Tool (ToolCallEvent types)
 	BashToolCallEvent,
 	BashToolResultEvent,
@@ -47,14 +44,14 @@ export type {
 	// Event Results
 	ContextEventResult,
 	ContextUsage,
+	// Message and Entry Rendering
+	CustomEntryViewRenderer,
+	CustomMessageViewRenderer,
 	CustomToolCallEvent,
 	CustomToolResultEvent,
-	EditorFactory,
 	EditToolCallEvent,
 	EditToolResultEvent,
-	// Message and Entry Rendering
-	EntryRenderer,
-	EntryRenderOptions,
+	EntryViewOptions,
 	ExecOptions,
 	ExecResult,
 	Extension,
@@ -74,10 +71,6 @@ export type {
 	ExtensionMode,
 	// Runtime
 	ExtensionRuntime,
-	ExtensionShortcut,
-	ExtensionUIContext,
-	ExtensionUIDialogOptions,
-	ExtensionWidgetOptions,
 	FindToolCallEvent,
 	FindToolResultEvent,
 	GetActiveToolsHandler,
@@ -91,16 +84,14 @@ export type {
 	InputEvent,
 	InputEventResult,
 	InputSource,
-	KeybindingsManager,
 	LoadExtensionsResult,
 	LsToolCallEvent,
 	LsToolResultEvent,
 	// Events - Message
 	MessageEndEvent,
-	MessageRenderer,
-	MessageRenderOptions,
 	MessageStartEvent,
 	MessageUpdateEvent,
+	MessageViewOptions,
 	ModelSelectEvent,
 	ModelSelectSource,
 	ProjectTrustContext,
@@ -142,7 +133,6 @@ export type {
 	SetLabelHandler,
 	SetModelHandler,
 	SetThinkingLevelHandler,
-	TerminalInputHandler,
 	// Events - Tool
 	ToolCallEvent,
 	ToolCallEventResult,
@@ -155,7 +145,6 @@ export type {
 	ToolExecutionStartEvent,
 	ToolExecutionUpdateEvent,
 	ToolInfo,
-	ToolRenderResultOptions,
 	ToolResultEvent,
 	ToolResultEventResult,
 	TreePreparation,
@@ -164,8 +153,6 @@ export type {
 	// Events - User Bash
 	UserBashEvent,
 	UserBashEventResult,
-	WidgetPlacement,
-	WorkingIndicatorOptions,
 	WriteToolCallEvent,
 	WriteToolResultEvent,
 } from "./types.ts";
@@ -181,4 +168,29 @@ export {
 	isToolCallEventType,
 	isWriteToolResult,
 } from "./types.ts";
+export type {
+	ExtensionUIAdvancedOptions,
+	ExtensionUIAdvancedService,
+	ExtensionUIAdvancedViewContext,
+	ExtensionUIChromeService,
+	ExtensionUIConfirmRequest,
+	ExtensionUIDialogOptionsV2,
+	ExtensionUIDialogService,
+	ExtensionUIEditorService,
+	ExtensionUIInputRequest,
+	ExtensionUINotificationKind,
+	ExtensionUISelectOption,
+	ExtensionUISelectRequest,
+	ExtensionUIToolResultService,
+	ExtensionUIToolResultViewInput,
+	ExtensionUIToolViewRenderer,
+	ExtensionUIToolViewState,
+	ExtensionUIV2Context,
+	ExtensionUIViewFactory,
+	ExtensionUIViewHandle,
+	ExtensionUIWidgetOptionsV2,
+	ExtensionUIWidgetPlacement,
+	ExtensionUIWidgetService,
+} from "./ui-v2.ts";
+export { createExtensionUIV2Context, resolveExtensionUIV2 } from "./ui-v2.ts";
 export { wrapRegisteredTool, wrapRegisteredTools } from "./wrapper.ts";

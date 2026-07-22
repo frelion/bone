@@ -22,9 +22,15 @@ export default function (pi: ExtensionAPI) {
 				return { block: true, reason: "Dangerous command blocked (no UI for confirmation)" };
 			}
 
-			const choice = await ctx.ui.select(`⚠️ Dangerous command:\n\n  ${command}\n\nAllow?`, ["Yes", "No"]);
+			const choice = await ctx.uiV2.dialogs.select({
+				title: `Dangerous command:\n\n  ${command}\n\nAllow?`,
+				options: [
+					{ value: "allow", label: "Yes" },
+					{ value: "block", label: "No" },
+				],
+			});
 
-			if (choice !== "Yes") {
+			if (choice !== "allow") {
 				return { block: true, reason: "Blocked by user" };
 			}
 		}

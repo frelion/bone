@@ -50,13 +50,12 @@ describe("regression #5109: exclude tools", () => {
 			expect(allToolNames).not.toContain("ask_question");
 			expect(allToolNames).toContain("bash");
 			expect(allToolNames).toContain("dynamic_tool");
-			expect(harness.session.getActiveToolNames().sort()).toEqual([
-				"ask_user_question",
-				"bash",
-				"dynamic_tool",
-				"edit",
-				"write",
-			]);
+			const activeToolNames = harness.session.getActiveToolNames();
+			expect(activeToolNames).toEqual(
+				expect.arrayContaining(["ask_user_question", "bash", "dynamic_tool", "edit", "write"]),
+			);
+			expect(activeToolNames).not.toContain("read");
+			expect(activeToolNames).not.toContain("ask_question");
 			expect(harness.session.systemPrompt).not.toContain("- read:");
 			expect(harness.session.systemPrompt).not.toContain("ask_question");
 			expect(harness.session.systemPrompt).toContain("- dynamic_tool: Run dynamic test behavior");

@@ -263,21 +263,6 @@ export type RpcExtensionUIRequest =
 			message: string;
 			notifyType?: "info" | "warning" | "error";
 	  }
-	| {
-			type: "extension_ui_request";
-			id: string;
-			method: "setStatus";
-			statusKey: string;
-			statusText: string | undefined;
-	  }
-	| {
-			type: "extension_ui_request";
-			id: string;
-			method: "setWidget";
-			widgetKey: string;
-			widgetLines: string[] | undefined;
-			widgetPlacement?: "aboveEditor" | "belowEditor";
-	  }
 	| { type: "extension_ui_request"; id: string; method: "setTitle"; title: string }
 	| { type: "extension_ui_request"; id: string; method: "set_editor_text"; text: string };
 

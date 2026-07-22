@@ -20,7 +20,7 @@ export default function pirateExtension(pi: ExtensionAPI) {
 		description: "Toggle pirate mode (agent speaks like a pirate)",
 		handler: async (_args, ctx) => {
 			pirateMode = !pirateMode;
-			ctx.ui.notify(pirateMode ? "Arrr! Pirate mode enabled!" : "Pirate mode disabled", "info");
+			ctx.uiV2.dialogs.notify(pirateMode ? "Arrr! Pirate mode enabled!" : "Pirate mode disabled", "info");
 		},
 	});
 

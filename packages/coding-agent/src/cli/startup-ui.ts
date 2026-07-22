@@ -1,24 +1,28 @@
 import { join } from "node:path";
-import { ProcessTerminal, setKeybindings, TUI } from "@frelion/bone-tui";
+import {
+	type BoneInputNode,
+	type BoneNode,
+	type BoneRenderContext,
+	type BoneRenderer,
+	type BoneView,
+	createBoneRenderer,
+} from "@frelion/bone-tui";
 import { existsSync, readdirSync, statSync } from "fs";
 import { getAgentDir, getSettingsPath } from "../config.ts";
-import { KeybindingsManager } from "../core/keybindings.ts";
 import type { SettingsManager } from "../core/settings-manager.ts";
-import { ExtensionInputComponent } from "../modes/interactive/components/extension-input.ts";
-import { ExtensionSelectorComponent } from "../modes/interactive/components/extension-selector.ts";
+import { createOpenTUIDialogShell } from "../modes/interactive/components/opentui-dialog-v2.ts";
 import {
-	FirstTimeSetupComponent,
 	type FirstTimeSetupResult,
-} from "../modes/interactive/components/first-time-setup.ts";
+	OpenTUIFirstTimeSetupV2,
+} from "../modes/interactive/components/opentui-first-time-setup.ts";
+import { OpenTUISelectorViewV2 } from "../modes/interactive/components/opentui-selector-v2.ts";
+import { matchesOpenTUIAction } from "../modes/interactive/opentui-keymap.ts";
 import {
 	detectTerminalBackgroundFromEnv,
-	detectTerminalThemeForAuto,
 	initTheme,
 	loadThemeFromPath,
-	parseAutoThemeSetting,
 	resolveThemeSetting,
 	setRegisteredThemes,
-	setTheme,
 	type Theme,
 } from "../modes/interactive/theme/theme.ts";
 
@@ -34,8 +38,7 @@ function loadThemes(paths: string[]): Theme[] {
 			}
 			themes.push(loadedTheme);
 		} catch {
-			// Startup prompts should not fail because a theme is broken. The normal
-			// resource loader reports theme diagnostics later in startup.
+			// Resource loading reports broken theme files after startup.
 		}
 	}
 	return themes;
@@ -59,56 +62,45 @@ async function loadStartupThemes(settingsManager: SettingsManager): Promise<Them
 	return loadThemes(paths);
 }
 
-export async function createStartupTui(settingsManager: SettingsManager): Promise<TUI> {
+export async function createStartupTui(settingsManager: SettingsManager): Promise<BoneRenderer> {
 	setRegisteredThemes(await loadStartupThemes(settingsManager));
 	const terminalTheme = detectTerminalBackgroundFromEnv().theme;
 	initTheme(resolveThemeSetting(settingsManager.getThemeSetting(), terminalTheme) ?? terminalTheme);
-	setKeybindings(KeybindingsManager.create());
-	const ui = new TUI(new ProcessTerminal(), settingsManager.getShowHardwareCursor());
-	ui.setClearOnShrink(settingsManager.getClearOnShrink());
-	return ui;
+	return createBoneRenderer({ screenMode: "alternate-screen", useMouse: true, clearOnShutdown: true });
 }
 
-export function startStartupTui(ui: TUI, settingsManager: SettingsManager): void {
+export function startStartupTui(ui: BoneRenderer, settingsManager: SettingsManager): void {
+	void settingsManager;
 	ui.start();
-	void applyDetectedStartupTheme(ui, settingsManager);
 }
 
-async function applyDetectedStartupTheme(ui: TUI, settingsManager: SettingsManager): Promise<void> {
-	const themeSetting = settingsManager.getThemeSetting();
-	if (themeSetting && !parseAutoThemeSetting(themeSetting)) return;
-
-	const terminalTheme = await detectTerminalThemeForAuto({ ui, timeoutMs: 100 });
-	setTheme(resolveThemeSetting(themeSetting, terminalTheme) ?? terminalTheme);
-	ui.invalidate();
+async function clearStartupTui(ui: BoneRenderer): Promise<void> {
+	ui.content.clear();
 	ui.requestRender();
+	await ui.idle();
+	ui.stop();
+	ui.destroy();
 }
 
-async function clearStartupTui(ui: TUI): Promise<void> {
-	ui.clear();
-	ui.requestRender();
-	await new Promise((resolve) => setTimeout(resolve, 25));
-}
-
-/**
- * First-time setup runs when all of these hold:
- * - this is the official Pi distribution (not a fork/rebrand)
- * - experimental features are enabled (BONE_EXPERIMENTAL=1)
- * - the default agent directory is used (no custom agent dir override)
- * - setup was not completed before (settings.json does not exist)
- */
+/** First-time setup is currently disabled for this distribution. */
 export function shouldRunFirstTimeSetup(settingsPath: string = getSettingsPath()): boolean {
 	void settingsPath;
 	return false;
-	/*
-	if (!areExperimentalFeaturesEnabled()) {
-		return false;
-	}
-	if (process.env[ENV_AGENT_DIR]) {
-		return false;
-	}
-	return !existsSync(settingsPath);
-	*/
+}
+
+function bindSelectorKeys(
+	ui: BoneRenderer,
+	selector: { handleAction(action: "confirm" | "cancel" | "up" | "down" | "pageUp" | "pageDown"): boolean },
+): () => void {
+	return ui.onKey((event) => {
+		for (const action of ["confirm", "cancel", "up", "down", "pageUp", "pageDown"] as const) {
+			if (!matchesOpenTUIAction(event, action)) continue;
+			event.preventDefault();
+			event.stopPropagation();
+			selector.handleAction(action);
+			return;
+		}
+	});
 }
 
 export async function showStartupSelector<T>(
@@ -119,69 +111,92 @@ export async function showStartupSelector<T>(
 	const ui = await createStartupTui(settingsManager);
 	return new Promise((resolve) => {
 		let settled = false;
+		let unsubscribe = () => {};
 		const finish = async (result: T | undefined) => {
-			if (settled) {
-				return;
-			}
+			if (settled) return;
 			settled = true;
+			unsubscribe();
 			await clearStartupTui(ui);
-			ui.stop();
 			resolve(result);
 		};
-
-		const selector = new ExtensionSelectorComponent(
+		const selector = new OpenTUISelectorViewV2({
 			title,
-			options.map((option) => option.label),
-			(option) => void finish(options.find((entry) => entry.label === option)?.value),
-			() => void finish(undefined),
-			{ tui: ui },
-		);
-		ui.addChild(selector);
-		ui.setFocus(selector);
+			items: options,
+			onSelect: (value) => void finish(value),
+			onCancel: () => void finish(undefined),
+		});
+		ui.mount(selector);
+		unsubscribe = bindSelectorKeys(ui, selector);
 		startStartupTui(ui, settingsManager);
 	});
 }
 
-/** Show the first-time setup dialog and persist the result */
 export async function showFirstTimeSetup(settingsManager: SettingsManager): Promise<void> {
 	const ui = await createStartupTui(settingsManager);
 	return new Promise((resolve) => {
 		let settled = false;
+		let unsubscribe = () => {};
 		const finish = async (result: FirstTimeSetupResult | undefined) => {
-			if (settled) {
-				return;
-			}
+			if (settled) return;
 			settled = true;
+			unsubscribe();
 			if (result) {
 				settingsManager.setTheme(result.theme);
 				settingsManager.setEnableAnalytics(result.shareAnalytics);
 				await settingsManager.flush();
 			}
 			await clearStartupTui(ui);
-			ui.stop();
 			resolve();
 		};
-
-		const showSetup = async () => {
-			ui.start();
-			const detectedTheme = await detectTerminalThemeForAuto({ ui, timeoutMs: 100 });
-			setTheme(detectedTheme);
-			const component = new FirstTimeSetupComponent({
-				detectedTheme,
-				onThemePreview: (themeName) => {
-					setTheme(themeName);
-					ui.requestRender();
-				},
-				onSubmit: (result) => void finish(result),
-				onCancel: () => void finish(undefined),
-			});
-			ui.addChild(component);
-			ui.setFocus(component);
-			ui.requestRender();
-		};
-
-		void showSetup();
+		const detectedTheme = detectTerminalBackgroundFromEnv().theme;
+		const setup = new OpenTUIFirstTimeSetupV2({
+			detectedTheme,
+			onSubmit: (result) => void finish(result),
+			onCancel: () => void finish(undefined),
+		});
+		ui.mount(setup);
+		unsubscribe = bindSelectorKeys(ui, setup);
+		startStartupTui(ui, settingsManager);
 	});
+}
+
+class StartupInputView implements BoneView {
+	private readonly title: string;
+	private readonly placeholder: string | undefined;
+	private readonly onSubmit: (value: string) => void;
+	private readonly onCancel: () => void;
+	private input: BoneInputNode | undefined;
+
+	constructor(
+		title: string,
+		placeholder: string | undefined,
+		onSubmit: (value: string) => void,
+		onCancel: () => void,
+	) {
+		this.title = title;
+		this.placeholder = placeholder;
+		this.onSubmit = onSubmit;
+		this.onCancel = onCancel;
+	}
+
+	mount(context: BoneRenderContext): BoneNode {
+		const dialog = createOpenTUIDialogShell(context, { title: this.title, footer: "Enter submit · Esc cancel" });
+		this.input = context.createInput({
+			width: "100%",
+			placeholder: this.placeholder,
+			onConfirm: this.onSubmit,
+			onCancel: this.onCancel,
+		});
+		dialog.body.append(this.input);
+		this.input.focus();
+		return dialog.root;
+	}
+
+	handleAction(action: "confirm" | "cancel" | "up" | "down" | "pageUp" | "pageDown"): boolean {
+		if (action === "confirm") this.input?.submit();
+		else if (action === "cancel") this.onCancel();
+		return true;
+	}
 }
 
 export async function showStartupInput(
@@ -192,28 +207,22 @@ export async function showStartupInput(
 	const ui = await createStartupTui(settingsManager);
 	return new Promise((resolve) => {
 		let settled = false;
+		let unsubscribe = () => {};
 		const finish = async (result: string | undefined) => {
-			if (settled) {
-				return;
-			}
+			if (settled) return;
 			settled = true;
-			input.dispose();
+			unsubscribe();
 			await clearStartupTui(ui);
-			ui.stop();
 			resolve(result);
 		};
-
-		const input = new ExtensionInputComponent(
+		const input = new StartupInputView(
 			title,
 			placeholder,
 			(value) => void finish(value),
 			() => void finish(undefined),
-			{
-				tui: ui,
-			},
 		);
-		ui.addChild(input);
-		ui.setFocus(input);
+		ui.mount(input);
+		unsubscribe = bindSelectorKeys(ui, input);
 		startStartupTui(ui, settingsManager);
 	});
 }

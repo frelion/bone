@@ -22,7 +22,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.text.startsWith("?quick ")) {
 			const query = event.text.slice(7).trim();
 			if (!query) {
-				ctx.ui.notify("Usage: ?quick <question>", "warning");
+				ctx.uiV2.dialogs.notify("Usage: ?quick <question>", "warning");
 				return { action: "handled" };
 			}
 			return { action: "transform", text: `Respond briefly in 1-2 sentences: ${query}` };
@@ -30,11 +30,11 @@ export default function (pi: ExtensionAPI) {
 
 		// Handle: instant responses without LLM (extension shows its own feedback)
 		if (event.text.toLowerCase() === "ping") {
-			ctx.ui.notify("pong", "info");
+			ctx.uiV2.dialogs.notify("pong", "info");
 			return { action: "handled" };
 		}
 		if (event.text.toLowerCase() === "time") {
-			ctx.ui.notify(new Date().toLocaleString(), "info");
+			ctx.uiV2.dialogs.notify(new Date().toLocaleString(), "info");
 			return { action: "handled" };
 		}
 

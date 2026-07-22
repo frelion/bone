@@ -42,7 +42,7 @@ describe("Forge built-in tools", () => {
 			{
 				hasUI: true,
 				isProjectTrusted: () => true,
-				ui: { confirm },
+				uiV2: { dialogs: { confirm } },
 			} as never,
 		);
 
@@ -56,7 +56,7 @@ describe("Forge built-in tools", () => {
 		});
 		const context = execute.mock.calls[0][3];
 		await context.confirm("Merge", "Merge change 42?");
-		expect(confirm).toHaveBeenCalledWith("Merge", "Merge change 42?");
+		expect(confirm).toHaveBeenCalledWith({ title: "Merge", message: "Merge change 42?" });
 		expect(output).toEqual({
 			content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
 			details: result,

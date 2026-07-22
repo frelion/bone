@@ -4,10 +4,7 @@
 
 import type { AgentMessage } from "@frelion/bone-agent-core";
 import type { ImageContent, Model, ProviderHeaders } from "@frelion/bone-ai";
-import type { KeyId } from "@frelion/bone-tui";
-import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
-import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { SessionManager } from "../session-manager.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
@@ -20,7 +17,8 @@ import type {
 	ContextEvent,
 	ContextEventResult,
 	ContextUsage,
-	EntryRenderer,
+	CustomEntryViewRenderer,
+	CustomMessageViewRenderer,
 	Extension,
 	ExtensionActions,
 	ExtensionCommandContext,
@@ -32,15 +30,12 @@ import type {
 	ExtensionFlag,
 	ExtensionMode,
 	ExtensionRuntime,
-	ExtensionShortcut,
-	ExtensionUIContext,
 	InputEvent,
 	InputEventResult,
 	InputSource,
 	LoadExtensionsResult,
 	MessageEndEvent,
 	MessageEndEventResult,
-	MessageRenderer,
 	ProjectTrustContext,
 	ProjectTrustEvent,
 	ProjectTrustEventResult,
@@ -63,52 +58,7 @@ import type {
 	UserBashEvent,
 	UserBashEventResult,
 } from "./types.ts";
-
-// Extension shortcuts compete with canonical keybinding ids from keybindings.json.
-// Only editor-global shortcuts are reserved here. Picker-specific bindings are not.
-const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS = [
-	"app.interrupt",
-	"app.clear",
-	"app.exit",
-	"app.suspend",
-	"app.thinking.cycle",
-	"app.model.cycleForward",
-	"app.model.cycleBackward",
-	"app.model.select",
-	"app.tools.expand",
-	"app.thinking.toggle",
-	"app.editor.external",
-	"app.message.copy",
-	"app.message.followUp",
-	"tui.input.submit",
-	"tui.select.confirm",
-	"tui.select.cancel",
-	"tui.input.copy",
-	"tui.editor.deleteToLineEnd",
-] as const;
-
-type BuiltInKeyBindings = Partial<Record<KeyId, { keybinding: string; restrictOverride: boolean }>>;
-
-const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltInKeyBindings => {
-	const builtinKeybindings = {} as BuiltInKeyBindings;
-	for (const [keybinding, keys] of Object.entries(resolvedKeybindings)) {
-		if (keys === undefined) continue;
-		const keyList = Array.isArray(keys) ? keys : [keys];
-		const restrictOverride = (RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS as readonly string[]).includes(keybinding);
-		for (const key of keyList) {
-			const normalizedKey = key.toLowerCase() as KeyId;
-			// If multiple actions bind the same key, the reserved action wins so extensions
-			// remain blocked by reserved shortcuts regardless of iteration order.
-			const existing = builtinKeybindings[normalizedKey];
-			if (existing?.restrictOverride && !restrictOverride) continue;
-			builtinKeybindings[normalizedKey] = {
-				keybinding,
-				restrictOverride,
-			};
-		}
-	}
-	return builtinKeybindings;
-};
+import { createExtensionUIV2Context, type ExtensionUIV2Context } from "./ui-v2.ts";
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
@@ -230,43 +180,11 @@ export async function emitProjectTrustEvent(
 	return { errors };
 }
 
-const noOpUIContext: ExtensionUIContext = {
-	select: async () => undefined,
-	confirm: async () => false,
-	input: async () => undefined,
-	notify: () => {},
-	onTerminalInput: () => () => {},
-	setStatus: () => {},
-	setWorkingMessage: () => {},
-	setWorkingVisible: () => {},
-	setWorkingIndicator: () => {},
-	setHiddenThinkingLabel: () => {},
-	setWidget: () => {},
-	setFooter: () => {},
-	setHeader: () => {},
-	setTitle: () => {},
-	custom: async () => undefined as never,
-	pasteToEditor: () => {},
-	setEditorText: () => {},
-	getEditorText: () => "",
-	editor: async () => undefined,
-	addAutocompleteProvider: () => {},
-	setEditorComponent: () => {},
-	getEditorComponent: () => undefined,
-	get theme() {
-		return theme;
-	},
-	getAllThemes: () => [],
-	getTheme: () => undefined,
-	setTheme: (_theme: string | Theme) => ({ success: false, error: "UI not available" }),
-	getToolsExpanded: () => false,
-	setToolsExpanded: () => {},
-};
-
 export class ExtensionRunner {
 	private extensions: Extension[];
 	private runtime: ExtensionRuntime;
-	private uiContext: ExtensionUIContext;
+	private uiV2Context = createExtensionUIV2Context();
+	private uiAvailable = false;
 	private mode: ExtensionMode = "print";
 	private cwd: string;
 	private sessionManager: SessionManager;
@@ -289,7 +207,6 @@ export class ExtensionRunner {
 	private switchSessionHandler: SwitchSessionHandler = async () => ({ cancelled: false });
 	private reloadHandler: ReloadHandler = async () => {};
 	private shutdownHandler: ShutdownHandler = () => {};
-	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
 
@@ -302,7 +219,6 @@ export class ExtensionRunner {
 	) {
 		this.extensions = extensions;
 		this.runtime = runtime;
-		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
@@ -401,17 +317,14 @@ export class ExtensionRunner {
 		this.reloadHandler = async () => {};
 	}
 
-	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
-		this.uiContext = uiContext ?? noOpUIContext;
+	setUIV2Context(uiContext?: ExtensionUIV2Context, mode: ExtensionMode = "print"): void {
+		this.uiV2Context = uiContext ?? createExtensionUIV2Context();
+		this.uiAvailable = this.uiV2Context.available;
 		this.mode = mode;
 	}
 
-	getUIContext(): ExtensionUIContext {
-		return this.uiContext;
-	}
-
 	hasUI(): boolean {
-		return this.uiContext !== noOpUIContext;
+		return this.uiAvailable;
 	}
 
 	getExtensionPaths(): string[] {
@@ -462,55 +375,6 @@ export class ExtensionRunner {
 		return new Map(this.runtime.flagValues);
 	}
 
-	getShortcuts(resolvedKeybindings: KeybindingsConfig): Map<KeyId, ExtensionShortcut> {
-		this.shortcutDiagnostics = [];
-		const builtinKeybindings = buildBuiltinKeybindings(resolvedKeybindings);
-		const extensionShortcuts = new Map<KeyId, ExtensionShortcut>();
-
-		const addDiagnostic = (message: string, extensionPath: string) => {
-			this.shortcutDiagnostics.push({ type: "warning", message, path: extensionPath });
-			if (!this.hasUI()) {
-				console.warn(message);
-			}
-		};
-
-		for (const ext of this.extensions) {
-			for (const [key, shortcut] of ext.shortcuts) {
-				const normalizedKey = key.toLowerCase() as KeyId;
-
-				const builtInKeybinding = builtinKeybindings[normalizedKey];
-				if (builtInKeybinding?.restrictOverride === true) {
-					addDiagnostic(
-						`Extension shortcut '${key}' from ${shortcut.extensionPath} conflicts with built-in shortcut. Skipping.`,
-						shortcut.extensionPath,
-					);
-					continue;
-				}
-
-				if (builtInKeybinding?.restrictOverride === false) {
-					addDiagnostic(
-						`Extension shortcut conflict: '${key}' is built-in shortcut for ${builtInKeybinding.keybinding} and ${shortcut.extensionPath}. Using ${shortcut.extensionPath}.`,
-						shortcut.extensionPath,
-					);
-				}
-
-				const existingExtensionShortcut = extensionShortcuts.get(normalizedKey);
-				if (existingExtensionShortcut) {
-					addDiagnostic(
-						`Extension shortcut conflict: '${key}' registered by both ${existingExtensionShortcut.extensionPath} and ${shortcut.extensionPath}. Using ${shortcut.extensionPath}.`,
-						shortcut.extensionPath,
-					);
-				}
-				extensionShortcuts.set(normalizedKey, shortcut);
-			}
-		}
-		return extensionShortcuts;
-	}
-
-	getShortcutDiagnostics(): ResourceDiagnostic[] {
-		return this.shortcutDiagnostics;
-	}
-
 	invalidate(
 		message = "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 	): void {
@@ -547,9 +411,9 @@ export class ExtensionRunner {
 		return false;
 	}
 
-	getMessageRenderer(customType: string): MessageRenderer | undefined {
+	getMessageView(customType: string): CustomMessageViewRenderer | undefined {
 		for (const ext of this.extensions) {
-			const renderer = ext.messageRenderers.get(customType);
+			const renderer = ext.messageViews.get(customType);
 			if (renderer) {
 				return renderer;
 			}
@@ -557,9 +421,9 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
-	getEntryRenderer(customType: string): EntryRenderer | undefined {
+	getEntryView(customType: string): CustomEntryViewRenderer | undefined {
 		for (const ext of this.extensions) {
-			const renderer = ext.entryRenderers?.get(customType);
+			const renderer = ext.entryViews?.get(customType);
 			if (renderer) {
 				return renderer;
 			}
@@ -641,9 +505,9 @@ export class ExtensionRunner {
 		const runner = this;
 		const getModel = this.getModel;
 		return {
-			get ui() {
+			get uiV2() {
 				runner.assertActive();
-				return runner.uiContext;
+				return runner.uiV2Context;
 			},
 			get mode() {
 				runner.assertActive();

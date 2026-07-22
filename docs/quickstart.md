@@ -15,8 +15,12 @@ For development builds, create the self-contained local package and install it:
 
 ```bash
 npm run pack:bone
-npm install --global --force --ignore-scripts artifacts/*.tgz
+bun add --global artifacts/frelion-bone-coding-agent-*.tgz
 ```
+
+Bone requires Bun 1.3.14 or newer when run from a package or source checkout.
+The GitHub Release archives contain standalone Bun executables and do not
+require a separate Bun installation.
 
 ## 2. Configure a provider
 

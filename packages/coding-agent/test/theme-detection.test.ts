@@ -1,5 +1,4 @@
-import { type RgbColor, resetCapabilitiesCache, setCapabilities } from "@frelion/bone-tui";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
 	detectTerminalBackgroundFromEnv,
 	detectTerminalBackgroundTheme,
@@ -9,9 +8,11 @@ import {
 	resolveThemeSetting,
 } from "../src/modes/interactive/theme/theme.ts";
 
-afterEach(() => {
-	resetCapabilitiesCache();
-});
+interface RgbColor {
+	r: number;
+	g: number;
+	b: number;
+}
 
 describe("detectTerminalBackgroundFromEnv", () => {
 	it("uses the COLORFGBG background color index", () => {
@@ -100,14 +101,7 @@ describe("detectTerminalBackgroundTheme", () => {
 });
 
 describe("theme color mode", () => {
-	it("uses terminal capabilities", () => {
-		setCapabilities({ images: null, trueColor: false, hyperlinks: false });
-		const ansi256Theme = getThemeByName("dark");
-		if (!ansi256Theme) throw new Error("dark theme not found");
-		expect(ansi256Theme.getColorMode()).toBe("256color");
-		expect(ansi256Theme.getFgAnsi("accent")).toMatch(/^\x1b\[38;5;\d+m$/);
-
-		setCapabilities({ images: null, trueColor: true, hyperlinks: false });
+	it("uses the OpenTUI truecolor contract", () => {
 		const truecolorTheme = getThemeByName("dark");
 		if (!truecolorTheme) throw new Error("dark theme not found");
 		expect(truecolorTheme.getColorMode()).toBe("truecolor");

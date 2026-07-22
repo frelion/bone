@@ -71,27 +71,27 @@ describe("stdout cleanliness in non-interactive modes", () => {
 		expect(result.stderr).not.toContain("Usage:");
 	});
 
-	it("keeps stdout empty for --mode json --help", async () => {
+	it("prints --mode json --help to stdout without starting JSON mode", async () => {
 		const result = await runCli(["--mode", "json", "--help", "--approve"]);
 
 		expect(result.code).toBe(0);
-		expect(result.stdout).toBe("");
-		expect(result.stderr).toContain("Usage:");
+		expect(result.stdout).toContain("Usage:");
+		expect(result.stderr).not.toContain("Usage:");
 	});
 
-	it("keeps stdout empty for -p --help", async () => {
+	it("prints -p --help to stdout without starting print mode", async () => {
 		const result = await runCli(["-p", "--help", "--approve"]);
 
 		expect(result.code).toBe(0);
-		expect(result.stdout).toBe("");
-		expect(result.stderr).toContain("Usage:");
+		expect(result.stdout).toContain("Usage:");
+		expect(result.stderr).not.toContain("Usage:");
 	});
 
 	it("does not process legacy package settings for help", async () => {
 		const result = await runCli(["-p", "--help"]);
 
 		expect(result.code).toBe(0);
-		expect(result.stdout).toBe("");
-		expect(result.stderr).toContain("Usage:");
+		expect(result.stdout).toContain("Usage:");
+		expect(result.stderr).not.toContain("Usage:");
 	});
 });

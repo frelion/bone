@@ -1,38 +1,34 @@
-// UI Components for extensions
-export { ArminComponent } from "./armin.ts";
-export { AssistantMessageComponent } from "./assistant-message.ts";
-export { BashExecutionComponent } from "./bash-execution.ts";
-export { BorderedLoader } from "./bordered-loader.ts";
-export { BranchSummaryMessageComponent } from "./branch-summary-message.ts";
-export { CompactionSummaryMessageComponent } from "./compaction-summary-message.ts";
-export { CustomEditor } from "./custom-editor.ts";
-export { CustomMessageComponent } from "./custom-message.ts";
-export { DaxnutsComponent } from "./daxnuts.ts";
-export { type RenderDiffOptions, renderDiff } from "./diff.ts";
-export { DynamicBorder } from "./dynamic-border.ts";
-export { ExtensionEditorComponent } from "./extension-editor.ts";
-export { ExtensionInputComponent } from "./extension-input.ts";
-export { ExtensionSelectorComponent } from "./extension-selector.ts";
+export { OpenTUIComposer, type OpenTUIComposerOptions } from "./opentui-composer.ts";
+export { type OpenTUILoginDialogOptionsV2, OpenTUILoginDialogV2 } from "./opentui-login-dialog-v2.ts";
 export {
-	FirstTimeSetupComponent,
-	type FirstTimeSetupOptions,
-	type FirstTimeSetupResult,
-} from "./first-time-setup.ts";
-export { FooterComponent } from "./footer.ts";
-export { keyHint, keyText, rawKeyHint } from "./keybinding-hints.ts";
-export { LoginDialogComponent } from "./login-dialog.ts";
-export { ModelSelectorComponent } from "./model-selector.ts";
-export { OAuthSelectorComponent } from "./oauth-selector.ts";
-export { PlanProposalComponent } from "./plan-proposal.ts";
-export { type ModelsCallbacks, type ModelsConfig, ScopedModelsSelectorComponent } from "./scoped-models-selector.ts";
-export { SessionSelectorComponent } from "./session-selector.ts";
-export { ShowImagesSelectorComponent } from "./show-images-selector.ts";
-export { SkillInvocationMessageComponent } from "./skill-invocation-message.ts";
-export { ThemeSelectorComponent } from "./theme-selector.ts";
-export { ThinkingSelectorComponent } from "./thinking-selector.ts";
-export { ToolExecutionComponent, type ToolExecutionOptions } from "./tool-execution.ts";
-export { TreeSelectorComponent } from "./tree-selector.ts";
-export { TrustSelectorComponent } from "./trust-selector.ts";
-export { UserMessageComponent } from "./user-message.ts";
-export { UserMessageSelectorComponent } from "./user-message-selector.ts";
-export { truncateToVisualLines, type VisualTruncateResult } from "./visual-truncate.ts";
+	OpenTUIAssistantMessage,
+	type OpenTUIAssistantMessageOptions,
+	OpenTUIPlanProposal,
+	OpenTUIUserMessage,
+} from "./opentui-messages.ts";
+export {
+	OpenTUIBashExecution,
+	OpenTUIBranchSummary,
+	OpenTUICompactionSummary,
+	OpenTUICustomMessage,
+	OpenTUISkillInvocation,
+	OpenTUIStatusView,
+	OpenTUIToolExecution,
+} from "./opentui-rich-messages.ts";
+export { type OpenTUISelectorItem, OpenTUISelectorViewV2 } from "./opentui-selector-v2.ts";
+export {
+	OpenTUIModelSelectorV2,
+	OpenTUIShowImagesSelectorV2,
+	OpenTUIThemeSelectorV2,
+	OpenTUIThinkingSelectorV2,
+	OpenTUITrustSelectorV2,
+} from "./opentui-selectors-v2.ts";
+export { OpenTUISessionSidebar } from "./opentui-session-sidebar.ts";
+export { OpenTUIFormViewV2, OpenTUISettingsListViewV2 } from "./opentui-settings-v2.ts";
+export {
+	OpenTUITranscriptFactory,
+	type OpenTUITranscriptFactoryOptions,
+	type OpenTUITranscriptFactoryResolvers,
+	type OpenTUITranscriptItem,
+	type OpenTUITranscriptMutation,
+} from "./opentui-transcript-factory.ts";

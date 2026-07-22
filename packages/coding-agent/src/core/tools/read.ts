@@ -1,19 +1,24 @@
 import { basename, dirname, isAbsolute, relative, resolve as resolvePath, sep } from "node:path";
 import type { AgentTool } from "@frelion/bone-agent-core";
 import type { Api, ImageContent, Model, TextContent } from "@frelion/bone-ai";
-import { Text } from "@frelion/bone-tui";
 import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { getReadmePath } from "../../config.ts";
-import { keyHint, keyText } from "../../modes/interactive/components/keybinding-hints.ts";
-import { getLanguageFromPath, highlightCode, type Theme } from "../../modes/interactive/theme/theme.ts";
+import { getLanguageFromPath, highlightCode, type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import { processImage } from "../../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
 import { formatPathRelativeToCwdOrAbsolute } from "../../utils/paths.ts";
-import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import type { ToolDefinition } from "../extensions/types.ts";
 import { resolveReadPathAsync, resolveToCwd } from "./path-utils.ts";
-import { getTextOutput, renderToolPath, replaceTabs, str } from "./render-utils.ts";
+import {
+	getTextOutput,
+	renderToolPath,
+	replaceTabs,
+	str,
+	structuredToolResultView,
+	structuredToolTextView,
+} from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
 
@@ -142,7 +147,7 @@ function formatCompactReadCall(
 	args: ReadRenderArgs | undefined,
 	theme: Theme,
 ): string {
-	const expandHint = theme.fg("dim", ` (${keyText("app.tools.expand")} to expand)`);
+	const expandHint = "";
 	if (classification.kind === "skill") {
 		return (
 			theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m `) +
@@ -164,7 +169,7 @@ function formatCompactReadCall(
 function formatReadResult(
 	args: ReadRenderArgs | undefined,
 	result: { content: (TextContent | ImageContent)[]; details?: ReadToolDetails },
-	options: ToolRenderResultOptions,
+	options: { expanded: boolean },
 	theme: Theme,
 	showImages: boolean,
 	_cwd: string,
@@ -184,7 +189,7 @@ function formatReadResult(
 	const remaining = lines.length - maxLines;
 	let text = `\n${displayLines.map((line) => (lang ? replaceTabs(line) : theme.fg("toolOutput", replaceTabs(line)))).join("\n")}`;
 	if (remaining > 0) {
-		text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+		text += theme.fg("muted", `\n... (${remaining} more lines)`);
 	}
 
 	const truncation = result.details?.truncation;
@@ -326,22 +331,23 @@ export function createReadToolDefinition(
 				},
 			);
 		},
-		renderCall(args, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			const classification = !context.expanded ? getCompactReadClassification(args, context.cwd) : undefined;
-			text.setText(
-				classification
-					? formatCompactReadCall(classification, args, theme)
-					: formatReadCall(args, theme, context.cwd),
-			);
-			return text;
-		},
-		renderResult(result, options, theme, context) {
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(
-				formatReadResult(context.args, result, options, theme, context.showImages, context.cwd, context.isError),
-			);
-			return text;
+		renderV2: {
+			renderCall(args, context) {
+				const classification = !context.expanded ? getCompactReadClassification(args, context.cwd) : undefined;
+				return structuredToolTextView(
+					classification
+						? formatCompactReadCall(classification, args, theme)
+						: formatReadCall(args, theme, context.cwd),
+					{ fg: theme.getFgColor("toolTitle") },
+				);
+			},
+			renderResult(input, context) {
+				return structuredToolResultView(
+					input.result,
+					formatReadResult(context.args, input.result, input, theme, true, context.cwd, context.isError),
+					{ fg: context.isError ? theme.getFgColor("error") : theme.getFgColor("toolOutput"), paddingX: 1 },
+				);
+			},
 		},
 	};
 }

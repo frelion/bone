@@ -15,8 +15,11 @@ bone --version
 
 ```bash
 npm run pack:bone
-npm install --global --force --ignore-scripts artifacts/*.tgz
+bun add --global artifacts/frelion-bone-coding-agent-*.tgz
 ```
+
+通过 package 或源码运行 Bone 时需要 Bun 1.3.14 或更高版本。GitHub Release
+archive 内是独立 Bun 可执行文件，不要求用户另行安装 Bun。
 
 ## 2. 配置 Provider
 

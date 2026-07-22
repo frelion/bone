@@ -236,7 +236,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (noSandbox) {
 			sandboxEnabled = false;
-			ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
+			ctx.uiV2.dialogs.notify("Sandbox disabled via --no-sandbox", "warning");
 			return;
 		}
 
@@ -244,14 +244,14 @@ export default function (pi: ExtensionAPI) {
 
 		if (!config.enabled) {
 			sandboxEnabled = false;
-			ctx.ui.notify("Sandbox disabled via config", "info");
+			ctx.uiV2.dialogs.notify("Sandbox disabled via config", "info");
 			return;
 		}
 
 		const platform = process.platform;
 		if (platform !== "darwin" && platform !== "linux") {
 			sandboxEnabled = false;
-			ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
+			ctx.uiV2.dialogs.notify(`Sandbox not supported on ${platform}`, "warning");
 			return;
 		}
 
@@ -271,16 +271,10 @@ export default function (pi: ExtensionAPI) {
 			sandboxEnabled = true;
 			sandboxInitialized = true;
 
-			const networkCount = config.network?.allowedDomains?.length ?? 0;
-			const writeCount = config.filesystem?.allowWrite?.length ?? 0;
-			ctx.ui.setStatus(
-				"sandbox",
-				ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkCount} domains, ${writeCount} write paths`),
-			);
-			ctx.ui.notify("Sandbox initialized", "info");
+			ctx.uiV2.dialogs.notify("Sandbox initialized", "info");
 		} catch (err) {
 			sandboxEnabled = false;
-			ctx.ui.notify(`Sandbox initialization failed: ${err instanceof Error ? err.message : err}`, "error");
+			ctx.uiV2.dialogs.notify(`Sandbox initialization failed: ${err instanceof Error ? err.message : err}`, "error");
 		}
 	});
 
@@ -298,7 +292,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Show sandbox configuration",
 		handler: async (_args, ctx) => {
 			if (!sandboxEnabled) {
-				ctx.ui.notify("Sandbox is disabled", "info");
+				ctx.uiV2.dialogs.notify("Sandbox is disabled", "info");
 				return;
 			}
 
@@ -315,7 +309,7 @@ export default function (pi: ExtensionAPI) {
 				`  Allow Write: ${config.filesystem?.allowWrite?.join(", ") || "(none)"}`,
 				`  Deny Write: ${config.filesystem?.denyWrite?.join(", ") || "(none)"}`,
 			];
-			ctx.ui.notify(lines.join("\n"), "info");
+			ctx.uiV2.dialogs.notify(lines.join("\n"), "info");
 		},
 	});
 }

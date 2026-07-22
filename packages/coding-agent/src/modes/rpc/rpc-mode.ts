@@ -13,12 +13,7 @@
 
 import * as crypto from "node:crypto";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
-import type {
-	ExtensionUIContext,
-	ExtensionUIDialogOptions,
-	ExtensionWidgetOptions,
-	WorkingIndicatorOptions,
-} from "../../core/extensions/index.ts";
+import type { ExtensionUIV2Context } from "../../core/extensions/ui-v2.ts";
 import {
 	flushRawStdout,
 	takeOverStdout,
@@ -26,7 +21,6 @@ import {
 	writeRawStdout,
 } from "../../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
-import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
 	RpcCommand,
@@ -78,7 +72,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	// Pending extension UI requests waiting for response
 	const pendingExtensionRequests = new Map<
 		string,
-		{ resolve: (value: any) => void; reject: (error: Error) => void }
+		{ resolve: (value: RpcExtensionUIResponse) => void; reject: (error: Error) => void }
 	>();
 
 	// Shutdown request flag
@@ -88,7 +82,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 	/** Helper for dialog methods with signal/timeout support */
 	function createDialogPromise<T>(
-		opts: ExtensionUIDialogOptions | undefined,
+		opts: { signal?: AbortSignal; timeoutMs?: number } | undefined,
 		defaultValue: T,
 		request: Record<string, unknown>,
 		parseResponse: (response: RpcExtensionUIResponse) => T,
@@ -111,11 +105,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			};
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
-			if (opts?.timeout) {
+			if (opts?.timeoutMs) {
 				timeoutId = setTimeout(() => {
 					cleanup();
 					resolve(defaultValue);
-				}, opts.timeout);
+				}, opts.timeoutMs);
 			}
 
 			pendingExtensionRequests.set(id, {
@@ -132,180 +126,109 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	/**
 	 * Create an extension UI context that uses the RPC protocol.
 	 */
-	const createExtensionUIContext = (): ExtensionUIContext => ({
-		select: (title, options, opts) =>
-			createDialogPromise(opts, undefined, { method: "select", title, options, timeout: opts?.timeout }, (r) =>
-				"cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
-			),
-
-		confirm: (title, message, opts) =>
-			createDialogPromise(opts, false, { method: "confirm", title, message, timeout: opts?.timeout }, (r) =>
-				"cancelled" in r && r.cancelled ? false : "confirmed" in r ? r.confirmed : false,
-			),
-
-		input: (title, placeholder, opts) =>
-			createDialogPromise(opts, undefined, { method: "input", title, placeholder, timeout: opts?.timeout }, (r) =>
-				"cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
-			),
-
-		notify(message: string, type?: "info" | "warning" | "error"): void {
-			// Fire and forget - no response needed
-			output({
-				type: "extension_ui_request",
-				id: crypto.randomUUID(),
-				method: "notify",
-				message,
-				notifyType: type,
-			} as RpcExtensionUIRequest);
-		},
-
-		onTerminalInput(): () => void {
-			// Raw terminal input not supported in RPC mode
-			return () => {};
-		},
-
-		setStatus(key: string, text: string | undefined): void {
-			// Fire and forget - no response needed
-			output({
-				type: "extension_ui_request",
-				id: crypto.randomUUID(),
-				method: "setStatus",
-				statusKey: key,
-				statusText: text,
-			} as RpcExtensionUIRequest);
-		},
-
-		setWorkingMessage(_message?: string): void {
-			// Working message not supported in RPC mode - requires TUI loader access
-		},
-
-		setWorkingVisible(_visible: boolean): void {
-			// Working visibility not supported in RPC mode - requires TUI loader access
-		},
-
-		setWorkingIndicator(_options?: WorkingIndicatorOptions): void {
-			// Working indicator customization not supported in RPC mode - requires TUI loader access
-		},
-
-		setHiddenThinkingLabel(_label?: string): void {
-			// Hidden thinking label not supported in RPC mode - requires TUI message rendering access
-		},
-
-		setWidget(key: string, content: unknown, options?: ExtensionWidgetOptions): void {
-			// Only support string arrays in RPC mode - factory functions are ignored
-			if (content === undefined || Array.isArray(content)) {
+	const createRpcExtensionUIV2Context = (): ExtensionUIV2Context => ({
+		version: 2,
+		available: true,
+		dialogs: {
+			select: async (request) => {
+				const enabled = request.options.filter((option) => !option.disabled);
+				const selected = await createDialogPromise(
+					{ signal: request.signal, timeoutMs: request.timeoutMs },
+					undefined,
+					{ method: "select", title: request.title, options: enabled.map((option) => option.label) },
+					(response) =>
+						"cancelled" in response && response.cancelled
+							? undefined
+							: "value" in response
+								? response.value
+								: undefined,
+				);
+				return enabled.find((option) => option.label === selected)?.value;
+			},
+			confirm: (request) =>
+				createDialogPromise(
+					{ signal: request.signal, timeoutMs: request.timeoutMs },
+					false,
+					{ method: "confirm", title: request.title, message: request.message },
+					(response) =>
+						"cancelled" in response && response.cancelled
+							? false
+							: "confirmed" in response
+								? response.confirmed
+								: false,
+				),
+			input: (request) =>
+				createDialogPromise(
+					{ signal: request.signal, timeoutMs: request.timeoutMs },
+					undefined,
+					{
+						method: request.multiline ? "editor" : "input",
+						title: request.title,
+						placeholder: request.placeholder,
+						prefill: request.initialValue,
+					},
+					(response) =>
+						"cancelled" in response && response.cancelled
+							? undefined
+							: "value" in response
+								? response.value
+								: undefined,
+				),
+			notify: (message, kind) =>
 				output({
 					type: "extension_ui_request",
 					id: crypto.randomUUID(),
-					method: "setWidget",
-					widgetKey: key,
-					widgetLines: content as string[] | undefined,
-					widgetPlacement: options?.placement,
-				} as RpcExtensionUIRequest);
-			}
-			// Component factories are not supported in RPC mode - would need TUI access
+					method: "notify",
+					message,
+					notifyType: kind,
+				} as RpcExtensionUIRequest),
 		},
-
-		setFooter(_factory: unknown): void {
-			// Custom footer not supported in RPC mode - requires TUI access
+		widgets: { set: () => ({ mounted: false, update: () => {}, close: () => {} }), clear: () => {} },
+		chrome: {
+			setHeader: () => ({ mounted: false, update: () => {}, close: () => {} }),
+			setFooter: () => ({ mounted: false, update: () => {}, close: () => {} }),
+			setTitle: (title) =>
+				output({
+					type: "extension_ui_request",
+					id: crypto.randomUUID(),
+					method: "setTitle",
+					title,
+				} as RpcExtensionUIRequest),
 		},
-
-		setHeader(_factory: unknown): void {
-			// Custom header not supported in RPC mode - requires TUI access
-		},
-
-		setTitle(title: string): void {
-			// Fire and forget - host can implement terminal title control
-			output({
-				type: "extension_ui_request",
-				id: crypto.randomUUID(),
-				method: "setTitle",
-				title,
-			} as RpcExtensionUIRequest);
-		},
-
-		async custom() {
-			// Custom UI not supported in RPC mode
-			return undefined as never;
-		},
-
-		pasteToEditor(text: string): void {
-			// Paste handling not supported in RPC mode - falls back to setEditorText
-			this.setEditorText(text);
-		},
-
-		setEditorText(text: string): void {
-			// Fire and forget - host can implement editor control
-			output({
-				type: "extension_ui_request",
-				id: crypto.randomUUID(),
-				method: "set_editor_text",
-				text,
-			} as RpcExtensionUIRequest);
-		},
-
-		getEditorText(): string {
-			// Synchronous method can't wait for RPC response
-			// Host should track editor state locally if needed
-			return "";
-		},
-
-		async editor(title: string, prefill?: string): Promise<string | undefined> {
-			const id = crypto.randomUUID();
-			return new Promise((resolve, reject) => {
-				pendingExtensionRequests.set(id, {
-					resolve: (response: RpcExtensionUIResponse) => {
-						if ("cancelled" in response && response.cancelled) {
-							resolve(undefined);
-						} else if ("value" in response) {
-							resolve(response.value);
-						} else {
-							resolve(undefined);
-						}
+		editor: {
+			getText: () => "",
+			setText: (text) =>
+				output({
+					type: "extension_ui_request",
+					id: crypto.randomUUID(),
+					method: "set_editor_text",
+					text,
+				} as RpcExtensionUIRequest),
+			insertText: (text) =>
+				output({
+					type: "extension_ui_request",
+					id: crypto.randomUUID(),
+					method: "set_editor_text",
+					text,
+				} as RpcExtensionUIRequest),
+			open: (request) =>
+				createDialogPromise(
+					{ signal: request.signal, timeoutMs: request.timeoutMs },
+					undefined,
+					{
+						method: request.multiline ? "editor" : "input",
+						title: request.title,
+						prefill: request.initialValue,
 					},
-					reject,
-				});
-				output({ type: "extension_ui_request", id, method: "editor", title, prefill } as RpcExtensionUIRequest);
-			});
+					(response) => ("value" in response ? response.value : undefined),
+				),
+			setView: () => ({ mounted: false, update: () => {}, close: () => {} }),
 		},
-
-		addAutocompleteProvider(): void {
-			// Autocomplete provider composition is not supported in RPC mode
-		},
-
-		setEditorComponent(): void {
-			// Custom editor components not supported in RPC mode
-		},
-
-		getEditorComponent() {
-			// Custom editor components not supported in RPC mode
-			return undefined;
-		},
-
-		get theme() {
-			return theme;
-		},
-
-		getAllThemes() {
-			return [];
-		},
-
-		getTheme(_name: string) {
-			return undefined;
-		},
-
-		setTheme(_theme: string | Theme) {
-			// Theme switching not supported in RPC mode
-			return { success: false, error: "Theme switching not supported in RPC mode" };
-		},
-
-		getToolsExpanded() {
-			// Tool expansion not supported in RPC mode - no TUI
-			return false;
-		},
-
-		setToolsExpanded(_expanded: boolean) {
-			// Tool expansion not supported in RPC mode - no TUI
+		toolResults: { setRenderer: () => {} },
+		advanced: {
+			show: async () => undefined,
+			close: () => {},
+			createView: (factory) => ({ mount: factory }),
 		},
 	});
 
@@ -316,7 +239,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
 		await session.bindExtensions({
-			uiContext: createExtensionUIContext(),
+			uiV2Context: createRpcExtensionUIV2Context(),
 			mode: "rpc",
 			commandContextActions: {
 				waitForIdle: () => session.waitForIdle(),

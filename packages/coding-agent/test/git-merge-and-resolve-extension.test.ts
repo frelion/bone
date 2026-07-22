@@ -39,7 +39,7 @@ function setup(cwd: string, execResults: Map<string, ExecResult>) {
 
 	mergeAndResolve(api);
 
-	const ctx = { cwd, ui: { notify: vi.fn() } } as unknown as ExtensionContext;
+	const ctx = { cwd, uiV2: { dialogs: { notify: vi.fn() } } } as unknown as ExtensionContext;
 
 	async function trigger() {
 		await handler!({ type: "agent_end" }, ctx);

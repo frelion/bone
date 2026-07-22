@@ -2,7 +2,7 @@
  * Titlebar Spinner Extension
  *
  * Shows a braille spinner animation in the terminal title while the agent is working.
- * Uses `ctx.ui.setTitle()` to update the terminal title via the extension API.
+ * Uses `ctx.uiV2.chrome.setTitle()` to update the terminal title via the extension API.
  *
  * Usage:
  *   pi --extension examples/extensions/titlebar-spinner.ts
@@ -29,7 +29,7 @@ export default function (pi: ExtensionAPI) {
 			timer = null;
 		}
 		frameIndex = 0;
-		ctx.ui.setTitle(getBaseTitle(pi));
+		ctx.uiV2.chrome.setTitle(getBaseTitle(pi));
 	}
 
 	function startAnimation(ctx: ExtensionContext) {
@@ -39,7 +39,7 @@ export default function (pi: ExtensionAPI) {
 			const cwd = path.basename(process.cwd());
 			const session = pi.getSessionName();
 			const title = session ? `${frame} π - ${session} - ${cwd}` : `${frame} π - ${cwd}`;
-			ctx.ui.setTitle(title);
+			ctx.uiV2.chrome.setTitle(title);
 			frameIndex++;
 		}, 80);
 	}

@@ -4,7 +4,6 @@
  */
 
 import * as path from "node:path";
-import type { KeyId } from "@frelion/bone-tui";
 import { resolvePath } from "../../utils/paths.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
@@ -12,13 +11,13 @@ import { execCommand } from "../exec.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
 import { time } from "../timings.ts";
 import type {
-	EntryRenderer,
+	CustomEntryViewRenderer,
+	CustomMessageViewRenderer,
 	Extension,
 	ExtensionAPI,
 	ExtensionFactory,
 	ExtensionRuntime,
 	LoadExtensionsResult,
-	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
 	ToolDefinition,
@@ -119,17 +118,6 @@ function createExtensionAPI(
 			});
 		},
 
-		registerShortcut(
-			shortcut: KeyId,
-			options: {
-				description?: string;
-				handler: (ctx: import("./types.ts").ExtensionContext) => Promise<void> | void;
-			},
-		): void {
-			runtime.assertActive();
-			extension.shortcuts.set(shortcut, { shortcut, extensionPath: extension.path, ...options });
-		},
-
 		registerFlag(
 			name: string,
 			options: { description?: string; type: "boolean" | "string"; default?: boolean | string },
@@ -141,15 +129,15 @@ function createExtensionAPI(
 			}
 		},
 
-		registerMessageRenderer<T>(customType: string, renderer: MessageRenderer<T>): void {
+		registerMessageView<T>(customType: string, renderer: CustomMessageViewRenderer<T>): void {
 			runtime.assertActive();
-			extension.messageRenderers.set(customType, renderer as MessageRenderer);
+			extension.messageViews.set(customType, renderer as CustomMessageViewRenderer);
 		},
 
-		registerEntryRenderer<T>(customType: string, renderer: EntryRenderer<T>): void {
+		registerEntryView<T>(customType: string, renderer: CustomEntryViewRenderer<T>): void {
 			runtime.assertActive();
-			extension.entryRenderers ??= new Map();
-			extension.entryRenderers.set(customType, renderer as EntryRenderer);
+			extension.entryViews ??= new Map();
+			extension.entryViews.set(customType, renderer as CustomEntryViewRenderer);
 		},
 
 		// Flag access - checks extension registered it, reads from runtime
@@ -262,11 +250,10 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		sourceInfo: createSyntheticSourceInfo(extensionPath, { source, baseDir }),
 		handlers: new Map(),
 		tools: new Map(),
-		messageRenderers: new Map(),
-		entryRenderers: new Map(),
+		messageViews: new Map(),
+		entryViews: new Map(),
 		commands: new Map(),
 		flags: new Map(),
-		shortcuts: new Map(),
 	};
 }
 
