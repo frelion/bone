@@ -105,7 +105,7 @@ export class GitHubAdapter {
 		const capabilities = await Promise.all(
 			probes.map(async ([id, path]): Promise<ForgeCapability> => {
 				try {
-					await this.client.request<unknown>("GET", path, { signal });
+					await this.client.probe(path, { signal });
 					return { id, state: "supported" };
 				} catch (error) {
 					if (!(error instanceof ForgeError)) return { id, state: "unknown", reason: "Probe failed" };
@@ -140,6 +140,16 @@ export class GitHubAdapter {
 	): Promise<GitHubResource | undefined> {
 		const response = await this.client.request<unknown>(method, path, { body, signal });
 		if (response.data === undefined) return undefined;
+		return requireResource(response.data, path);
+	}
+
+	private async mutateResource(
+		method: "POST" | "PATCH",
+		path: string,
+		body: GitHubWriteBody,
+		signal?: AbortSignal,
+	): Promise<GitHubResource> {
+		const response = await this.client.request<unknown>(method, path, { body, signal });
 		return requireResource(response.data, path);
 	}
 
@@ -274,10 +284,15 @@ export class GitHubAdapter {
 	}
 
 	createRelease(repository: string, body: GitHubWriteBody, signal?: AbortSignal) {
-		return this.mutate("POST", `/repos/${encodedRepository(repository)}/releases`, body, signal);
+		return this.mutateResource("POST", `/repos/${encodedRepository(repository)}/releases`, body, signal);
 	}
 
 	updateRelease(repository: string, releaseId: number, body: GitHubWriteBody, signal?: AbortSignal) {
-		return this.mutate("PATCH", `/repos/${encodedRepository(repository)}/releases/${releaseId}`, body, signal);
+		return this.mutateResource(
+			"PATCH",
+			`/repos/${encodedRepository(repository)}/releases/${releaseId}`,
+			body,
+			signal,
+		);
 	}
 }

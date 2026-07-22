@@ -204,6 +204,23 @@ function objectValue(value: unknown, operation: string): Record<string, unknown>
 	return value as Record<string, unknown>;
 }
 
+function projectGitHubUser(value: Record<string, unknown> & { id: number }): Record<string, unknown> {
+	if (typeof value.login !== "string" || value.login.length === 0) {
+		throw new ForgeError("invalid_remote_response", "GitHub current user response is missing login", {
+			provider: "github",
+			operation: "current user",
+		});
+	}
+	return Object.fromEntries(
+		Object.entries({
+			id: value.id,
+			login: value.login,
+			name: typeof value.name === "string" || value.name === null ? value.name : undefined,
+			htmlUrl: typeof value.html_url === "string" ? value.html_url : undefined,
+		}).filter(([, entry]) => entry !== undefined),
+	);
+}
+
 function arrayValue(value: unknown, operation: string): unknown[] {
 	if (!Array.isArray(value)) {
 		throw new ForgeError("invalid_remote_response", `${operation} response is not a list`, { operation });
@@ -391,7 +408,12 @@ class DefaultForgeService implements ForgeService {
 			resolved.adapter.getCurrentUser(signal),
 			resolved.adapter.getCapabilities(resolved.repository.projectPath, signal),
 		]);
-		return { repository: resolved.repository, instance: resolved.instance, user, capabilities };
+		return {
+			repository: resolved.repository,
+			instance: resolved.instance,
+			user: projectGitHubUser(user),
+			capabilities,
+		};
 	}
 
 	private async query(
@@ -826,7 +848,8 @@ class DefaultForgeService implements ForgeService {
 		const key = `${resolved.repository.provider}:${resolved.repository.host}:${resolved.repository.projectPath}:${resolved.credentialIdentity}:${capability}`;
 		if ((this.capabilities.get(key) ?? 0) > Date.now()) return;
 		try {
-			await resolved.adapter.client.request("GET", path, { signal });
+			if (resolved.adapter instanceof GitHubAdapter) await resolved.adapter.client.probe(path, { signal });
+			else await resolved.adapter.client.request("GET", path, { signal });
 			this.capabilities.set(key, Date.now() + 15 * 60 * 1_000);
 		} catch (error) {
 			if (
@@ -1334,8 +1357,8 @@ class DefaultForgeService implements ForgeService {
 					? `/api/v4/projects/${encoded}/releases`
 					: `/api/v4/projects/${encoded}/releases/${encodeURIComponent(tag ?? "")}`;
 			return adapter.client
-				.request(action === "create" ? "POST" : "PUT", path, { body, signal })
-				.then((response) => response.data);
+				.request<unknown>(action === "create" ? "POST" : "PUT", path, { body, signal })
+				.then((response) => objectValue(response.data, "GitLab release"));
 		}
 		throw new ForgeError("validation_failed", `Unsupported GitLab ${toolName} action: ${action}`);
 	}

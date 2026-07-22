@@ -67,7 +67,17 @@ describe("DefaultForgeService", () => {
 	it("resolves public GitHub context and negotiates capabilities", async () => {
 		vi.stubEnv("GITHUB_TOKEN", "service-secret");
 		const api = dispatcher.get("https://api.github.com");
-		api.intercept({ method: "GET", path: "/user" }).reply(200, { id: 9, login: "octo" });
+		api.intercept({ method: "GET", path: "/user" }).reply(200, {
+			id: 9,
+			login: "octo",
+			name: null,
+			html_url: "https://github.com/octo",
+			avatar_url: "https://avatars.example/octo",
+			followers_url: "https://api.github.com/users/octo/followers",
+			events_url: "https://api.github.com/users/octo/events",
+			public_repos: 99,
+			token_echo: "service-secret",
+		});
 		for (const path of [
 			"/repos/acme/widget/issues?per_page=1",
 			"/repos/acme/widget/milestones?per_page=1",
@@ -88,8 +98,52 @@ describe("DefaultForgeService", () => {
 
 		expect(result).toMatchObject({
 			repository: { provider: "github", host: "github.com", projectPath: "acme/widget" },
-			user: { id: 9, login: "octo" },
+			user: { id: 9, login: "octo", name: null, htmlUrl: "https://github.com/octo" },
 		});
+		if (typeof result !== "object" || result === null || !("user" in result)) throw new Error("Expected Forge user");
+		expect(result.user).toEqual({ id: 9, login: "octo", name: null, htmlUrl: "https://github.com/octo" });
+		expect(JSON.stringify(result)).not.toMatch(
+			/service-secret|avatar_url|followers_url|events_url|public_repos|token_echo/,
+		);
+	});
+
+	it("keeps release queries strict after a status-only capability probe", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://api.github.com");
+		api.intercept({ method: "GET", path: "/repos/acme/widget/releases?per_page=1" }).reply(200, "probe body");
+		api.intercept({ method: "GET", path: "/repos/acme/widget/releases?per_page=10" }).reply(200, "not json");
+		const { service, context } = harness();
+
+		await expect(
+			service.execute(
+				"forge_query",
+				{ remote: "https://github.com/acme/widget.git", resource: "release" },
+				undefined,
+				context,
+			),
+		).rejects.toMatchObject({ code: "invalid_remote_response" });
+	});
+
+	it("rejects an empty successful GitLab release write response", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://gitlab.com");
+		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/releases?per_page=1" }).reply(200, []);
+		api.intercept({ method: "POST", path: "/api/v4/projects/acme%2Fwidget/releases" }).reply(201, "");
+		const { service, context } = harness(true);
+
+		await expect(
+			service.execute(
+				"forge_release",
+				{
+					remote: "https://gitlab.com/acme/widget.git",
+					action: "create",
+					requestId: "release-empty-response",
+					input: { tag_name: "v1.0.0" },
+				},
+				undefined,
+				context,
+			),
+		).rejects.toMatchObject({ code: "invalid_remote_response" });
 	});
 
 	it("returns compact issue summaries with a default limit of 10", async () => {

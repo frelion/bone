@@ -173,7 +173,7 @@ const specs: ForgeToolSpec[] = [
 		name: "forge_context",
 		label: "Forge context",
 		description:
-			"Resolve the GitLab or GitHub repository, instance version, identity, permissions, and negotiated capabilities.",
+			"Resolve the GitLab or GitHub repository, instance version, identity, and negotiated read capabilities.",
 		promptSnippet: "Inspect repository hosting context and capabilities",
 		parameters: contextSchema,
 	},

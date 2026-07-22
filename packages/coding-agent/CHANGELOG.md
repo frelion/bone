@@ -106,6 +106,7 @@
 
 ### Fixed
 
+- Fixed Forge context output to return compact GitHub identities and probe read capabilities without parsing successful response bodies.
 - Fixed inherited OpenRouter model context windows to use the top provider's actual context length ([#6481](https://github.com/earendil-works/pi-mono/pull/6481) by [@davidbrai](https://github.com/davidbrai)).
 - Fixed inherited OpenRouter OpenAI-compatible session IDs to use the `x-session-id` header instead of OpenAI-specific session-affinity fields ([#6496](https://github.com/earendil-works/pi-mono/pull/6496) by [@petrroll](https://github.com/petrroll)).
 - Fixed `Ctrl+V` to paste clipboard text when the pasteboard does not contain an image.
