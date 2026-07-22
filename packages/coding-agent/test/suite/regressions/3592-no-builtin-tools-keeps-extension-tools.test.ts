@@ -8,6 +8,7 @@ import {
 	createAgentSessionFromServices,
 	createAgentSessionServices,
 } from "../../../src/core/agent-session-services.ts";
+import { FORGE_TOOL_NAMES } from "../../../src/core/forge/tools.ts";
 import { DefaultResourceLoader } from "../../../src/core/resource-loader.ts";
 import { createAgentSession } from "../../../src/core/sdk.ts";
 import { SessionManager } from "../../../src/core/session-manager.ts";
@@ -78,7 +79,20 @@ describe("regression #3592: no-builtin-tools keeps extension tools enabled", () 
 				.getAllTools()
 				.map((tool) => tool.name)
 				.sort(),
-		).toEqual(["ask_user_question", "bash", "dynamic_tool", "edit", "find", "grep", "ls", "read", "write"]);
+		).toEqual(
+			[
+				"ask_user_question",
+				"bash",
+				"dynamic_tool",
+				"edit",
+				"find",
+				...FORGE_TOOL_NAMES,
+				"grep",
+				"ls",
+				"read",
+				"write",
+			].sort(),
+		);
 		expect(session.getActiveToolNames()).toEqual(["dynamic_tool"]);
 		expect(session.systemPrompt).toContain("- dynamic_tool: Run dynamic test behavior");
 		expect(session.systemPrompt).not.toContain("- read:");

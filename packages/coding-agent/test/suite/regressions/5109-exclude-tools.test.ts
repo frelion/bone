@@ -1,5 +1,6 @@
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
+import { FORGE_TOOL_NAMES } from "../../../src/core/forge/tools.ts";
 import type { ExtensionFactory } from "../../../src/index.ts";
 import { createHarness } from "../harness.ts";
 
@@ -50,13 +51,9 @@ describe("regression #5109: exclude tools", () => {
 			expect(allToolNames).not.toContain("ask_question");
 			expect(allToolNames).toContain("bash");
 			expect(allToolNames).toContain("dynamic_tool");
-			expect(harness.session.getActiveToolNames().sort()).toEqual([
-				"ask_user_question",
-				"bash",
-				"dynamic_tool",
-				"edit",
-				"write",
-			]);
+			expect(harness.session.getActiveToolNames().sort()).toEqual(
+				["ask_user_question", "bash", "dynamic_tool", "edit", ...FORGE_TOOL_NAMES, "write"].sort(),
+			);
 			expect(harness.session.systemPrompt).not.toContain("- read:");
 			expect(harness.session.systemPrompt).not.toContain("ask_question");
 			expect(harness.session.systemPrompt).toContain("- dynamic_tool: Run dynamic test behavior");
