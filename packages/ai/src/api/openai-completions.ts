@@ -534,6 +534,9 @@ function createClient(
 	if (optionsHeaders) {
 		Object.assign(headers, optionsHeaders);
 	}
+	if (!hasHeader(headers, "user-agent")) {
+		headers["User-Agent"] = "bone-ai";
+	}
 
 	return new OpenAI({
 		apiKey,

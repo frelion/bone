@@ -92,6 +92,28 @@ describe("openai-completions empty tools handling", () => {
 		expect("tools" in (params as object)).toBe(false);
 	});
 
+	it("identifies OpenAI SDK requests as bone-ai while allowing an explicit override", async () => {
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
+		const model = { ...baseModel, api: "openai-completions" } as const;
+
+		await streamSimple(
+			model,
+			{ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] },
+			{ apiKey: "test" },
+		).result();
+		const defaultOptions = mockState.lastClientOptions as { defaultHeaders?: Record<string, string> };
+		expect(defaultOptions.defaultHeaders?.["User-Agent"]).toBe("bone-ai");
+
+		await streamSimple(
+			model,
+			{ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] },
+			{ apiKey: "test", headers: { "user-agent": "custom-client" } },
+		).result();
+		const explicitOptions = mockState.lastClientOptions as { defaultHeaders?: Record<string, string> };
+		expect(explicitOptions.defaultHeaders?.["user-agent"]).toBe("custom-client");
+		expect(explicitOptions.defaultHeaders?.["User-Agent"]).toBeUndefined();
+	});
+
 	it("sends default maxTokens", async () => {
 		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
 		const model = { ...baseModel, api: "openai-completions" } as const;

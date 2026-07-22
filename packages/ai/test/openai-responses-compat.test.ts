@@ -34,16 +34,19 @@ async function captureOpenAIResponseHeaders(
 	sessionId: string | null;
 	clientRequestId: string | null;
 	xSessionId: string | null;
+	userAgent: string | null;
 }> {
 	const captured = {
 		sessionId: null as string | null,
 		clientRequestId: null as string | null,
 		xSessionId: null as string | null,
+		userAgent: null as string | null,
 	};
 	vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
 		captured.sessionId = getHeader(init?.headers, "session_id");
 		captured.clientRequestId = getHeader(init?.headers, "x-client-request-id");
 		captured.xSessionId = getHeader(init?.headers, "x-session-id");
+		captured.userAgent = getHeader(init?.headers, "user-agent");
 		return new Response("data: [DONE]\n\n", {
 			status: 200,
 			headers: { "content-type": "text/event-stream" },
@@ -104,6 +107,14 @@ describe("openai-responses provider defaults", () => {
 		expect(capturedPayload).not.toMatchObject({
 			reasoning: expect.anything(),
 		});
+	});
+
+	it("identifies OpenAI SDK requests as bone-ai while allowing an explicit override", async () => {
+		const defaultHeaders = await captureOpenAIResponseHeaders({});
+		const explicitHeaders = await captureOpenAIResponseHeaders({ headers: { "user-agent": "custom-client" } });
+
+		expect(defaultHeaders.userAgent).toBe("bone-ai");
+		expect(explicitHeaders.userAgent).toBe("custom-client");
 	});
 
 	it("forwards required tool choice", async () => {
