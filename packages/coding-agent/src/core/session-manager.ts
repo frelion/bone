@@ -27,6 +27,7 @@ import {
 	createCustomMessage,
 } from "./messages.ts";
 import type { CollaborationMode, PlanDecision, PlanProposal } from "./plan-mode.ts";
+import type { QuestionAnswer, QuestionCancelReason, QuestionRequest } from "./question.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -135,6 +136,23 @@ export interface PlanDecisionEntry extends SessionEntryBase {
 	decision: PlanDecision;
 }
 
+export interface QuestionAskedEntry extends SessionEntryBase {
+	type: "question_asked";
+	request: QuestionRequest;
+}
+
+export interface QuestionAnsweredEntry extends SessionEntryBase {
+	type: "question_answered";
+	requestId: string;
+	answers: QuestionAnswer[];
+}
+
+export interface QuestionCancelledEntry extends SessionEntryBase {
+	type: "question_cancelled";
+	requestId: string;
+	reason: QuestionCancelReason;
+}
+
 /**
  * Custom message entry for extensions to inject messages into LLM context.
  * Use customType to identify your extension's entries.
@@ -168,7 +186,10 @@ export type SessionEntry =
 	| SessionInfoEntry
 	| CollaborationModeChangeEntry
 	| PlanProposalEntry
-	| PlanDecisionEntry;
+	| PlanDecisionEntry
+	| QuestionAskedEntry
+	| QuestionAnsweredEntry
+	| QuestionCancelledEntry;
 
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
@@ -1196,6 +1217,50 @@ export class SessionManager {
 			proposalId: proposal.id,
 			version: proposal.version,
 			decision,
+		};
+		this._appendEntry(entry);
+		return entry;
+	}
+
+	appendQuestionAsked(request: QuestionRequest): QuestionAskedEntry {
+		const entry: QuestionAskedEntry = {
+			type: "question_asked",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			request: {
+				...request,
+				questions: request.questions.map((q) => ({ ...q, options: q.options.map((o) => ({ ...o })) })),
+			},
+		};
+		this._appendEntry(entry);
+		return entry;
+	}
+
+	appendQuestionAnswered(requestId: string, answers: QuestionAnswer[]): QuestionAnsweredEntry {
+		const entry: QuestionAnsweredEntry = {
+			type: "question_answered",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			requestId,
+			answers: answers.map((answer) => ({
+				...answer,
+				selected: answer.selected ? [...answer.selected] : undefined,
+			})),
+		};
+		this._appendEntry(entry);
+		return entry;
+	}
+
+	appendQuestionCancelled(requestId: string, reason: QuestionCancelReason): QuestionCancelledEntry {
+		const entry: QuestionCancelledEntry = {
+			type: "question_cancelled",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			requestId,
+			reason,
 		};
 		this._appendEntry(entry);
 		return entry;

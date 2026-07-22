@@ -74,6 +74,27 @@ export {
 	type PlanState,
 	parseProposedPlan,
 } from "./core/plan-mode.ts";
+export {
+	type AskUserQuestionInput,
+	askUserQuestionSchema,
+	createAskUserQuestionToolDefinition,
+	createCancelledQuestionToolResult,
+	createQuestionToolResult,
+	MAX_QUESTION_HEADER_LENGTH,
+	MAX_QUESTION_OPTIONS,
+	MAX_QUESTIONS,
+	MIN_QUESTION_OPTIONS,
+	type QuestionAnswer,
+	type QuestionCancelReason,
+	type QuestionDefinition,
+	type QuestionOption,
+	type QuestionRequest,
+	type QuestionState,
+	type QuestionToolDetails,
+	RESERVED_QUESTION_OPTION_LABELS,
+	validateQuestionAnswers,
+	validateQuestionDefinitions,
+} from "./core/question.ts";
 export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.ts";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.ts";
 // SDK for programmatic usage

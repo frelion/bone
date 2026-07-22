@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
@@ -33,6 +34,7 @@ import type {
 	Model,
 	ProviderHeaders,
 	TextContent,
+	ToolResultMessage,
 } from "@frelion/bone-ai/compat";
 import {
 	clampThinkingLevel,
@@ -105,6 +107,18 @@ import {
 	parseProposedPlan,
 } from "./plan-mode.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
+import {
+	type AskUserQuestionInput,
+	createAskUserQuestionToolDefinition,
+	createCancelledQuestionToolResult,
+	createQuestionToolResult,
+	type QuestionAnswer,
+	type QuestionCancelReason,
+	type QuestionRequest,
+	type QuestionState,
+	validateQuestionAnswers,
+	validateQuestionDefinitions,
+} from "./question.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
@@ -165,6 +179,10 @@ export type AgentSessionEvent =
 	| { type: "plan_proposed"; proposal: PlanProposal }
 	| { type: "plan_decided"; proposal: PlanProposal; decision: PlanDecision }
 	| { type: "plan_submission_error"; error: string }
+	| { type: "question_asked"; request: QuestionRequest }
+	| { type: "question_answered"; requestId: string; answers: QuestionAnswer[] }
+	| { type: "question_cancelled"; requestId: string; reason: QuestionCancelReason }
+	| { type: "question_error"; requestId?: string; error: string }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -385,6 +403,14 @@ export class AgentSession {
 	private _planState: PlanState = { status: "inactive" };
 	private _toolsBeforePlanMode: string[] | undefined;
 	private _nextPlanVersion = 1;
+	private _questionState: QuestionState = { status: "inactive" };
+	private _pendingQuestionResolution?: {
+		resolve: (
+			result: ReturnType<typeof createQuestionToolResult> | ReturnType<typeof createCancelledQuestionToolResult>,
+		) => void;
+		reject?: (error: Error) => void;
+		requestId: string;
+	};
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -413,6 +439,7 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 		this._restorePlanModeState();
+		this._restoreQuestionState();
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -1029,9 +1056,165 @@ export class AgentSession {
 		return { status: "awaitingApproval", proposal: { ...this._planState.proposal } };
 	}
 
+	get questionState(): QuestionState {
+		if (this._questionState.status !== "awaitingAnswer") return { ...this._questionState };
+		return {
+			status: "awaitingAnswer",
+			request: {
+				...this._questionState.request,
+				questions: this._questionState.request.questions.map((q) => ({
+					...q,
+					options: q.options.map((option) => ({ ...option })),
+				})),
+			},
+		};
+	}
+
+	private _restoreQuestionState(): void {
+		let state: QuestionState = { status: "inactive" };
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type === "question_asked") {
+				state = { status: "awaitingAnswer", request: entry.request };
+			} else if (
+				(entry.type === "question_answered" || entry.type === "question_cancelled") &&
+				state.status === "awaitingAnswer" &&
+				entry.requestId === state.request.id
+			) {
+				state = { status: "inactive" };
+			}
+		}
+		this._questionState = state;
+	}
+
+	private async _executeQuestion(
+		toolCallId: string,
+		input: AskUserQuestionInput,
+		signal?: AbortSignal,
+	): Promise<ReturnType<typeof createQuestionToolResult> | ReturnType<typeof createCancelledQuestionToolResult>> {
+		if (this._questionState.status === "awaitingAnswer" || this._pendingQuestionResolution) {
+			throw new Error("Another structured question is already awaiting an answer.");
+		}
+		let questions: QuestionRequest["questions"];
+		try {
+			questions = validateQuestionDefinitions(input);
+		} catch (error: unknown) {
+			this._emit({
+				type: "question_error",
+				requestId: toolCallId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			throw error;
+		}
+		const request: QuestionRequest = {
+			id: randomUUID(),
+			toolCallId,
+			questions,
+			createdAt: new Date().toISOString(),
+		};
+		const entry = this.sessionManager.appendQuestionAsked(request);
+		this._questionState = { status: "awaitingAnswer", request: entry.request };
+		this._emitAppendedEntry(entry);
+		this._emit({
+			type: "question_asked",
+			request: {
+				...request,
+				questions: request.questions.map((q) => ({ ...q, options: q.options.map((o) => ({ ...o })) })),
+			},
+		});
+		if (this._extensionMode === "print") {
+			const error =
+				"Structured question UI is unavailable in print mode. The request was persisted as unavailable; ask the question as plain chat text instead.";
+			const cancelledEntry = this.sessionManager.appendQuestionCancelled(request.id, "no_ui");
+			this._questionState = { status: "inactive" };
+			this._emitAppendedEntry(cancelledEntry);
+			this._emit({ type: "question_cancelled", requestId: request.id, reason: "no_ui" });
+			this._emit({ type: "question_error", requestId: request.id, error });
+			throw new Error(error);
+		}
+
+		return await new Promise((resolve, reject) => {
+			this._pendingQuestionResolution = { resolve, reject, requestId: request.id };
+			if (signal) {
+				const onAbort = () => {
+					if (this._pendingQuestionResolution?.requestId === request.id) {
+						this.cancelQuestion(request.id, "abort");
+					}
+				};
+				if (signal.aborted) onAbort();
+				else signal.addEventListener("abort", onAbort, { once: true });
+			}
+		});
+	}
+
+	private _resumeAnsweredQuestion(
+		request: QuestionRequest,
+		result: ReturnType<typeof createQuestionToolResult> | ReturnType<typeof createCancelledQuestionToolResult>,
+	): void {
+		const message: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: request.toolCallId,
+			toolName: "ask_user_question",
+			content: result.content,
+			details: result.details,
+			isError: false,
+			timestamp: Date.now(),
+		};
+		void this._runAgentPrompt(message).catch((error: unknown) => {
+			this._emit({
+				type: "question_error",
+				requestId: request.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	}
+
+	answerQuestion(requestId: string, answers: QuestionAnswer[]): void {
+		if (this._questionState.status !== "awaitingAnswer" || this._questionState.request.id !== requestId) {
+			throw new Error("The structured question request is stale or does not exist.");
+		}
+		const normalizedAnswers = validateQuestionAnswers(this._questionState.request, answers);
+		const entry = this.sessionManager.appendQuestionAnswered(requestId, normalizedAnswers);
+		const request = this._questionState.request;
+		this._questionState = { status: "inactive" };
+		this._emitAppendedEntry(entry);
+		this._emit({ type: "question_answered", requestId, answers: normalizedAnswers });
+		const pending = this._pendingQuestionResolution;
+		this._pendingQuestionResolution = undefined;
+		const result = createQuestionToolResult(request.id, normalizedAnswers);
+		if (pending) pending.resolve(result);
+		else this._resumeAnsweredQuestion(request, result);
+	}
+
+	cancelQuestion(requestId: string, reason: QuestionCancelReason = "user"): void {
+		if (this._questionState.status !== "awaitingAnswer" || this._questionState.request.id !== requestId) {
+			throw new Error("The structured question request is stale or does not exist.");
+		}
+		const request = this._questionState.request;
+		const entry = this.sessionManager.appendQuestionCancelled(requestId, reason);
+		this._questionState = { status: "inactive" };
+		this._emitAppendedEntry(entry);
+		this._emit({ type: "question_cancelled", requestId, reason });
+		const pending = this._pendingQuestionResolution;
+		this._pendingQuestionResolution = undefined;
+		const result = createCancelledQuestionToolResult(requestId, reason);
+		if (pending) pending.resolve(result);
+		else this._resumeAnsweredQuestion(request, result);
+	}
+
 	private _assertPlanTransitionAllowed(): void {
 		if (this.isStreaming) {
 			throw new Error("Cannot change Plan mode while the agent is running. Interrupt the current turn first.");
+		}
+		if (this._questionState.status === "awaitingAnswer") {
+			throw new Error("Cannot change Plan mode while a structured question is awaiting an answer.");
+		}
+	}
+
+	private _assertQuestionInputAllowed(): void {
+		if (this._questionState.status === "awaitingAnswer") {
+			throw new Error(
+				"A structured question is awaiting an answer. Answer or cancel it before sending another message.",
+			);
 		}
 	}
 
@@ -1412,6 +1595,7 @@ export class AgentSession {
 		let messages: AgentMessage[] | undefined;
 
 		try {
+			this._assertQuestionInputAllowed();
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
@@ -1637,6 +1821,7 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		this._assertQuestionInputAllowed();
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1657,6 +1842,7 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async followUp(text: string, images?: ImageContent[]): Promise<void> {
+		this._assertQuestionInputAllowed();
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -2796,6 +2982,7 @@ export class AgentSession {
 				]),
 		);
 		for (const tool of allCustomTools) {
+			if (tool.definition.name === "ask_user_question" && definitionRegistry.has(tool.definition.name)) continue;
 			definitionRegistry.set(tool.definition.name, {
 				definition: tool.definition,
 				sourceInfo: tool.sourceInfo,
@@ -2833,6 +3020,7 @@ export class AgentSession {
 		const toolRegistry = new Map(wrappedBuiltInTools.map((tool) => [tool.name, tool]));
 		this._builtInToolRegistry = new Map(toolRegistry);
 		for (const tool of wrappedExtensionTools as AgentTool[]) {
+			if (tool.name === "ask_user_question" && toolRegistry.has(tool.name)) continue;
 			toolRegistry.set(tool.name, tool);
 		}
 		this._toolRegistry = toolRegistry;
@@ -2881,6 +3069,13 @@ export class AgentSession {
 					read: { autoResizeImages },
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
+		if (!this._baseToolsOverride) {
+			Object.assign(baseToolDefinitions, {
+				ask_user_question: createAskUserQuestionToolDefinition((toolCallId, input, signal) =>
+					this._executeQuestion(toolCallId, input, signal),
+				),
+			});
+		}
 
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
@@ -2908,7 +3103,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write"];
+			: ["read", "bash", "edit", "write", "ask_user_question"];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
@@ -3344,6 +3539,7 @@ export class AgentSession {
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 			this._restorePlanModeState();
+			this._restoreQuestionState();
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({

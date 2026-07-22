@@ -11,6 +11,7 @@ import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.t
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { CollaborationMode } from "../../core/plan-mode.ts";
+import type { QuestionAnswer, QuestionCancelReason } from "../../core/question.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
@@ -252,6 +253,14 @@ export class RpcClient {
 
 	async cancelPlan(proposalId: string): Promise<void> {
 		await this.send({ type: "cancel_plan", proposalId });
+	}
+
+	async answerQuestion(requestId: string, answers: QuestionAnswer[]): Promise<void> {
+		await this.send({ type: "answer_question", requestId, answers });
+	}
+
+	async cancelQuestion(requestId: string, reason: QuestionCancelReason = "user"): Promise<void> {
+		await this.send({ type: "cancel_question", requestId, reason });
 	}
 
 	/**

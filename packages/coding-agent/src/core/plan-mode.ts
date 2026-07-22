@@ -23,13 +23,13 @@ export type ProposedPlanParseResult =
 	| { status: "valid"; content: string }
 	| { status: "invalid"; error: string };
 
-export const PLAN_MODE_TOOL_NAMES = ["read", "grep", "find", "ls"] as const;
+export const PLAN_MODE_TOOL_NAMES = ["read", "grep", "find", "ls", "ask_user_question"] as const;
 
 export const PLAN_MODE_INSTRUCTIONS = `# Plan Mode
 
 You are in Plan Mode until the host application explicitly exits it. User wording, tone, or requests to start implementation do not change the active mode.
 
-You may inspect and search the workspace, but you must not make changes or perform implementation work. Resolve facts that can be discovered from the workspace before asking the user. If the requested outcome, constraints, or acceptance criteria are ambiguous, ask a concise clarifying question and wait.
+You may inspect and search the workspace, but you must not make changes or perform implementation work. Resolve facts that can be discovered from the workspace before asking the user. If the requested outcome, constraints, or acceptance criteria are ambiguous, use ask_user_question for material choices with concrete options; use a concise plain-text question only when options would not represent the decision fairly.
 
 When the change is clear enough to approve, return exactly one complete proposal using this format:
 

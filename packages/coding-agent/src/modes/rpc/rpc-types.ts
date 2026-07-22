@@ -11,6 +11,7 @@ import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { CollaborationMode, PlanState } from "../../core/plan-mode.ts";
+import type { QuestionAnswer, QuestionCancelReason, QuestionState } from "../../core/question.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 
@@ -32,6 +33,8 @@ export type RpcCommand =
 	| { id?: string; type: "approve_plan"; proposalId: string }
 	| { id?: string; type: "revise_plan"; proposalId: string; feedback: string }
 	| { id?: string; type: "cancel_plan"; proposalId: string }
+	| { id?: string; type: "answer_question"; requestId: string; answers: QuestionAnswer[] }
+	| { id?: string; type: "cancel_question"; requestId: string; reason?: QuestionCancelReason }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -111,6 +114,7 @@ export interface RpcSessionState {
 	pendingMessageCount: number;
 	collaborationMode: CollaborationMode;
 	planState: PlanState;
+	questionState: QuestionState;
 }
 
 // ============================================================================
@@ -132,6 +136,8 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "approve_plan"; success: true }
 	| { id?: string; type: "response"; command: "revise_plan"; success: true }
 	| { id?: string; type: "response"; command: "cancel_plan"; success: true }
+	| { id?: string; type: "response"; command: "answer_question"; success: true }
+	| { id?: string; type: "response"; command: "cancel_question"; success: true }
 
 	// Model
 	| {

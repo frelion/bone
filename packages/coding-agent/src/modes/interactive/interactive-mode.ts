@@ -134,6 +134,7 @@ import {
 } from "./components/oauth-selector.ts";
 import { PaneFocusController } from "./components/pane-focus-controller.ts";
 import { PlanProposalComponent } from "./components/plan-proposal.ts";
+import { QuestionnaireComponent, type QuestionnaireResult } from "./components/questionnaire.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
 import { SessionSidebar } from "./components/session-sidebar.ts";
 import {
@@ -413,6 +414,7 @@ export class InteractiveMode {
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 	private pendingPlanApprovalId: string | undefined;
 	private reviewingPlanProposalId: string | undefined;
+	private reviewingQuestionRequestId: string | undefined;
 
 	private lastSigintTime = 0;
 	private lastEscapeTime = 0;
@@ -993,6 +995,7 @@ export class InteractiveMode {
 			this.pendingPlanApprovalId = this.session.planState.proposal.id;
 			void this.reviewPendingPlan();
 		}
+		if (this.session.questionState.status === "awaitingAnswer") void this.reviewPendingQuestion();
 
 		// Set up theme file watcher
 		onThemeChange(() => {
@@ -2603,6 +2606,10 @@ export class InteractiveMode {
 	}
 
 	private updatePlanModeStatus(): void {
+		this.setExtensionStatus(
+			"structured-question",
+			this.session.questionState.status === "awaitingAnswer" ? theme.fg("warning", "awaiting answer") : undefined,
+		);
 		const state = this.session.planState;
 		if (this.session.collaborationMode !== "plan") {
 			this.setExtensionStatus("plan-mode", undefined);
@@ -2662,6 +2669,30 @@ export class InteractiveMode {
 			this.reviewingPlanProposalId = undefined;
 			if (this.session.planState.status !== "awaitingApproval") this.pendingPlanApprovalId = undefined;
 			this.updatePlanModeStatus();
+			this.ui.requestRender();
+		}
+	}
+
+	private async reviewPendingQuestion(): Promise<void> {
+		const state = this.session.questionState;
+		if (state.status !== "awaitingAnswer" || this.reviewingQuestionRequestId !== undefined) return;
+		this.reviewingQuestionRequestId = state.request.id;
+		try {
+			const result = await this.showExtensionCustom<QuestionnaireResult>(
+				(_tui, _theme, _keybindings, done) => new QuestionnaireComponent(state.request, done),
+				{ overlay: true, overlayOptions: { anchor: "bottom-center", width: "100%", maxHeight: "100%" } },
+			);
+			if (
+				this.session.questionState.status !== "awaitingAnswer" ||
+				this.session.questionState.request.id !== state.request.id
+			)
+				return;
+			if (result.cancelled) this.session.cancelQuestion(state.request.id, "user");
+			else this.session.answerQuestion(state.request.id, result.answers);
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		} finally {
+			this.reviewingQuestionRequestId = undefined;
 			this.ui.requestRender();
 		}
 	}
@@ -3411,6 +3442,19 @@ export class InteractiveMode {
 
 			case "plan_submission_error":
 				this.showError(`Plan proposal was not accepted: ${event.error}`);
+				break;
+
+			case "question_asked":
+				this.updatePlanModeStatus();
+				void this.reviewPendingQuestion();
+				this.ui.requestRender();
+				break;
+
+			case "question_answered":
+			case "question_cancelled":
+			case "question_error":
+				this.updatePlanModeStatus();
+				this.ui.requestRender();
 				break;
 
 			case "compaction_start": {
@@ -5253,6 +5297,7 @@ export class InteractiveMode {
 							this.pendingPlanApprovalId = this.session.planState.proposal.id;
 							void this.reviewPendingPlan();
 						}
+						if (this.session.questionState.status === "awaitingAnswer") void this.reviewPendingQuestion();
 						if (result.editorText && !this.editor.getText().trim()) {
 							this.editor.setText(result.editorText);
 						}

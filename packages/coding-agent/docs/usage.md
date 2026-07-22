@@ -22,11 +22,17 @@ Use `!command` to run a shell command and send its output to the model. Use `!!c
 
 ### Plan Mode
 
-Use `/plan` when the goal and likely solution are clear but you want to approve the proposed changes before Bone implements them. While Plan Mode is active, Bone can inspect the workspace only with `read`, `grep`, `find`, and `ls`; it cannot edit files or run shell commands.
+Use `/plan` when the goal and likely solution are clear but you want to approve the proposed changes before Bone implements them. While Plan Mode is active, Bone can inspect the workspace with `read`, `grep`, `find`, and `ls`, and can ask structured questions with `ask_user_question`; it cannot edit files or run shell commands.
 
 Bone may investigate or ask clarifying questions before presenting a formal plan. A completed plan opens actions to execute it, request a revised full plan, or cancel. Executing a plan returns to Default mode, restores the tools that were active before planning, and immediately starts implementation. Ordinary chat replies such as `start` or `looks good` do not approve a plan.
 
 `/plan` leaves Plan Mode while planning. If a proposal is awaiting approval, leaving Plan Mode cancels it. Mode changes and plan decisions are rejected while the agent is running; interrupt the current turn first.
+
+### Structured questions
+
+Bone can pause a Default or Plan mode turn to ask up to four structured questions. Each question offers concrete single- or multi-select choices plus an `Other` answer. The interactive questionnaire must be submitted as a complete set; Escape asks for confirmation before cancelling. After submission or cancellation, the result is recorded as the pending tool result and the same agent turn continues automatically.
+
+Question requests and decisions are stored in the session tree. Reopening a session or navigating to a branch with an unanswered request restores the questionnaire. Print mode persists and emits the request, records a `no_ui` cancellation, and returns an explicit unavailable error so the model can ask in ordinary chat text instead.
 
 ## Sessions
 
@@ -99,7 +105,18 @@ There is no `--extension`, `-e`, or `--no-extensions` option. Bone never discove
 | `--no-builtin-tools`, `-nbt` | Disable built-in tools |
 | `--no-tools`, `-nt` | Disable all tools |
 
-Built-in tools are `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls`.
+Built-in tools are `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, and `ask_user_question`.
+
+### Structured questions over RPC
+
+`get_state` includes `questionState`. When an agent calls `ask_user_question`, RPC emits `question_asked` with the complete request and remains in `awaitingAnswer` until the client responds:
+
+```json
+{"id":"1","type":"answer_question","requestId":"...","answers":[{"questionIndex":0,"question":"Which mode?","kind":"option","answer":"Safe"}]}
+{"id":"2","type":"cancel_question","requestId":"...","reason":"user"}
+```
+
+Successful responses emit `question_answered` or `question_cancelled`; invalid, stale, or duplicate request IDs return an RPC error. Clients must send the complete answer array and must not infer an answer when no interactive UI is available.
 
 ### Examples
 

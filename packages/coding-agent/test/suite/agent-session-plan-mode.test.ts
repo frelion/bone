@@ -93,7 +93,7 @@ describe("AgentSession Plan mode", () => {
 
 		const readTool = harness.session.agent.state.tools.find((tool) => tool.name === "read");
 		expect(readTool?.description).not.toContain("mutating extension");
-		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls"]);
+		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls", "ask_user_question"]);
 	});
 
 	it("restores a pending proposal from the active branch even after compaction", async () => {
@@ -112,7 +112,7 @@ describe("AgentSession Plan mode", () => {
 
 		expect(harness.session.collaborationMode).toBe("plan");
 		expect(harness.session.planState).toEqual({ status: "awaitingApproval", proposal: proposal.proposal });
-		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls"]);
+		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls", "ask_user_question"]);
 	});
 
 	it("restores Plan state and tools when navigating to older tree nodes", async () => {
