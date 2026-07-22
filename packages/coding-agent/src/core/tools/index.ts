@@ -70,18 +70,47 @@ export {
 
 import type { AgentTool } from "@frelion/bone-agent-core";
 import type { ToolDefinition } from "../extensions/types.ts";
+import {
+	createForgeToolDefinitions,
+	FORGE_READ_TOOL_NAMES,
+	FORGE_TOOL_NAMES,
+	type ForgeService,
+	type ForgeToolName,
+} from "../forge/tools.ts";
 import { type BashToolOptions, createBashTool, createBashToolDefinition } from "./bash.ts";
 import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.ts";
 import { createFindTool, createFindToolDefinition, type FindToolOptions } from "./find.ts";
 import { createGrepTool, createGrepToolDefinition, type GrepToolOptions } from "./grep.ts";
 import { createLsTool, createLsToolDefinition, type LsToolOptions } from "./ls.ts";
 import { createReadTool, createReadToolDefinition, type ReadToolOptions } from "./read.ts";
+import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { createWriteTool, createWriteToolDefinition, type WriteToolOptions } from "./write.ts";
+
+export {
+	type CreateForgeToolDefinitionsOptions,
+	createForgeToolDefinitions,
+	createForgeTools,
+	FORGE_READ_TOOL_NAMES,
+	FORGE_TOOL_NAMES,
+	FORGE_WRITE_TOOL_NAMES,
+	type ForgeService,
+	type ForgeToolContext,
+	type ForgeToolName,
+} from "../forge/tools.ts";
 
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
-export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "ls";
-export const allToolNames: Set<ToolName> = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "ls" | ForgeToolName;
+export const allToolNames: Set<ToolName> = new Set([
+	"read",
+	"bash",
+	"edit",
+	"write",
+	"grep",
+	"find",
+	"ls",
+	...FORGE_TOOL_NAMES,
+]);
 
 export interface ToolsOptions {
 	read?: ReadToolOptions;
@@ -91,6 +120,7 @@ export interface ToolsOptions {
 	grep?: GrepToolOptions;
 	find?: FindToolOptions;
 	ls?: LsToolOptions;
+	forge?: { agentDir?: string; service?: ForgeService };
 }
 
 export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {
@@ -110,6 +140,9 @@ export function createToolDefinition(toolName: ToolName, cwd: string, options?: 
 		case "ls":
 			return createLsToolDefinition(cwd, options?.ls);
 		default:
+			if (FORGE_TOOL_NAMES.includes(toolName as ForgeToolName)) {
+				return createForgeToolDefinitions({ cwd, ...options?.forge })[toolName as ForgeToolName];
+			}
 			throw new Error(`Unknown tool name: ${toolName}`);
 	}
 }
@@ -131,6 +164,11 @@ export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptio
 		case "ls":
 			return createLsTool(cwd, options?.ls);
 		default:
+			if (FORGE_TOOL_NAMES.includes(toolName as ForgeToolName)) {
+				return wrapToolDefinition(
+					createForgeToolDefinitions({ cwd, ...options?.forge })[toolName as ForgeToolName],
+				);
+			}
 			throw new Error(`Unknown tool name: ${toolName}`);
 	}
 }
@@ -141,6 +179,7 @@ export function createCodingToolDefinitions(cwd: string, options?: ToolsOptions)
 		createBashToolDefinition(cwd, options?.bash),
 		createEditToolDefinition(cwd, options?.edit),
 		createWriteToolDefinition(cwd, options?.write),
+		...Object.values(createForgeToolDefinitions({ cwd, ...options?.forge })),
 	];
 }
 
@@ -150,6 +189,7 @@ export function createReadOnlyToolDefinitions(cwd: string, options?: ToolsOption
 		createGrepToolDefinition(cwd, options?.grep),
 		createFindToolDefinition(cwd, options?.find),
 		createLsToolDefinition(cwd, options?.ls),
+		...FORGE_READ_TOOL_NAMES.map((name) => createForgeToolDefinitions({ cwd, ...options?.forge })[name]),
 	];
 }
 
@@ -162,6 +202,7 @@ export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): R
 		grep: createGrepToolDefinition(cwd, options?.grep),
 		find: createFindToolDefinition(cwd, options?.find),
 		ls: createLsToolDefinition(cwd, options?.ls),
+		...createForgeToolDefinitions({ cwd, ...options?.forge }),
 	};
 }
 
@@ -171,6 +212,9 @@ export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[] {
 		createBashTool(cwd, options?.bash),
 		createEditTool(cwd, options?.edit),
 		createWriteTool(cwd, options?.write),
+		...Object.values(createForgeToolDefinitions({ cwd, ...options?.forge })).map((definition) =>
+			wrapToolDefinition(definition),
+		),
 	];
 }
 
@@ -180,10 +224,19 @@ export function createReadOnlyTools(cwd: string, options?: ToolsOptions): Tool[]
 		createGrepTool(cwd, options?.grep),
 		createFindTool(cwd, options?.find),
 		createLsTool(cwd, options?.ls),
+		...FORGE_READ_TOOL_NAMES.map((name) =>
+			wrapToolDefinition(createForgeToolDefinitions({ cwd, ...options?.forge })[name]),
+		),
 	];
 }
 
 export function createAllTools(cwd: string, options?: ToolsOptions): Record<ToolName, Tool> {
+	const forgeTools = Object.fromEntries(
+		Object.entries(createForgeToolDefinitions({ cwd, ...options?.forge })).map(([name, definition]) => [
+			name,
+			wrapToolDefinition(definition),
+		]),
+	) as Record<ForgeToolName, Tool>;
 	return {
 		read: createReadTool(cwd, options?.read),
 		bash: createBashTool(cwd, options?.bash),
@@ -192,5 +245,6 @@ export function createAllTools(cwd: string, options?: ToolsOptions): Record<Tool
 		grep: createGrepTool(cwd, options?.grep),
 		find: createFindTool(cwd, options?.find),
 		ls: createLsTool(cwd, options?.ls),
+		...forgeTools,
 	};
 }

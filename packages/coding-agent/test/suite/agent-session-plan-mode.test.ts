@@ -93,7 +93,17 @@ describe("AgentSession Plan mode", () => {
 
 		const readTool = harness.session.agent.state.tools.find((tool) => tool.name === "read");
 		expect(readTool?.description).not.toContain("mutating extension");
-		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls", "ask_user_question"]);
+		expect(harness.session.getActiveToolNames()).toEqual([
+			"read",
+			"grep",
+			"find",
+			"ls",
+			"ask_user_question",
+			"forge_context",
+			"forge_query",
+			"forge_audit",
+			"forge_watch",
+		]);
 	});
 
 	it("restores a pending proposal from the active branch even after compaction", async () => {
@@ -112,7 +122,45 @@ describe("AgentSession Plan mode", () => {
 
 		expect(harness.session.collaborationMode).toBe("plan");
 		expect(harness.session.planState).toEqual({ status: "awaitingApproval", proposal: proposal.proposal });
-		expect(harness.session.getActiveToolNames()).toEqual(["read", "grep", "find", "ls", "ask_user_question"]);
+		expect(harness.session.getActiveToolNames()).toEqual([
+			"read",
+			"grep",
+			"find",
+			"ls",
+			"ask_user_question",
+			"forge_context",
+			"forge_query",
+			"forge_audit",
+			"forge_watch",
+		]);
+	});
+
+	it("restores all default tools when an older Plan mode entry has no saved tool list", async () => {
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendCollaborationModeChange("plan");
+		const harness = await createHarness({ sessionManager });
+		harnesses.push(harness);
+
+		harness.session.exitPlanMode();
+
+		expect(harness.session.getActiveToolNames()).toEqual([
+			"read",
+			"bash",
+			"edit",
+			"write",
+			"ask_user_question",
+			"forge_context",
+			"forge_query",
+			"forge_audit",
+			"forge_watch",
+			"forge_issue",
+			"forge_milestone",
+			"forge_change",
+			"forge_wiki",
+			"forge_pipeline",
+			"forge_release",
+			"forge_transition",
+		]);
 	});
 
 	it("restores Plan state and tools when navigating to older tree nodes", async () => {

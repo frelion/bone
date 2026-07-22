@@ -94,6 +94,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { FORGE_TOOL_NAMES, type ForgeService } from "./forge/tools.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
@@ -218,6 +219,9 @@ export interface AgentSessionConfig {
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	cwd: string;
+	agentDir?: string;
+	/** Optional Forge service override, primarily for embedding and tests. */
+	forgeService?: ForgeService;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	/** Resource loader for extensions, skills, prompts, themes, context files, and system prompt */
@@ -372,6 +376,8 @@ export class AgentSession {
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private _agentDir?: string;
+	private _forgeService?: ForgeService;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
@@ -420,6 +426,8 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		this._agentDir = config.agentDir;
+		this._forgeService = config.forgeService;
 		this._modelRuntime = config.modelRuntime;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -1227,7 +1235,14 @@ export class AgentSession {
 	}
 
 	private _restoreToolsAfterPlanMode(): void {
-		const toolNames = this._toolsBeforePlanMode ?? ["read", "bash", "edit", "write"];
+		const toolNames = this._toolsBeforePlanMode ?? [
+			"read",
+			"bash",
+			"edit",
+			"write",
+			"ask_user_question",
+			...FORGE_TOOL_NAMES,
+		];
 		this.setActiveToolsByName(toolNames);
 		this._toolsBeforePlanMode = undefined;
 	}
@@ -3068,6 +3083,7 @@ export class AgentSession {
 			: createAllToolDefinitions(this._cwd, {
 					read: { autoResizeImages },
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
+					forge: { agentDir: this._agentDir, service: this._forgeService },
 				});
 		if (!this._baseToolsOverride) {
 			Object.assign(baseToolDefinitions, {
@@ -3103,7 +3119,7 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write", "ask_user_question"];
+			: ["read", "bash", "edit", "write", "ask_user_question", ...FORGE_TOOL_NAMES];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,

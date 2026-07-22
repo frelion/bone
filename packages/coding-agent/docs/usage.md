@@ -22,7 +22,7 @@ Use `!command` to run a shell command and send its output to the model. Use `!!c
 
 ### Plan Mode
 
-Use `/plan` when the goal and likely solution are clear but you want to approve the proposed changes before Bone implements them. While Plan Mode is active, Bone can inspect the workspace with `read`, `grep`, `find`, and `ls`, and can ask structured questions with `ask_user_question`; it cannot edit files or run shell commands.
+Use `/plan` when the goal and likely solution are clear but you want to approve the proposed changes before Bone implements them. While Plan Mode is active, Bone can inspect the workspace with `read`, `grep`, `find`, and `ls`, query development platforms with `forge_context`, `forge_query`, `forge_audit`, and `forge_watch`, and ask structured questions with `ask_user_question`; it cannot edit files, run shell commands, or perform Forge mutations.
 
 Bone may investigate or ask clarifying questions before presenting a formal plan. A completed plan opens actions to execute it, request a revised full plan, or cancel. Executing a plan returns to Default mode, restores the tools that were active before planning, and immediately starts implementation. Ordinary chat replies such as `start` or `looks good` do not approve a plan.
 
@@ -105,7 +105,7 @@ There is no `--extension`, `-e`, or `--no-extensions` option. Bone never discove
 | `--no-builtin-tools`, `-nbt` | Disable built-in tools |
 | `--no-tools`, `-nt` | Disable all tools |
 
-Built-in tools are `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, and `ask_user_question`.
+Built-in tools are `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `ask_user_question`, and the `forge_*` GitLab/GitHub tools. See [GitLab and GitHub integration](../../../docs/forge.md).
 
 ### Structured questions over RPC
 

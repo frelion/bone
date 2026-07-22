@@ -23,7 +23,17 @@ export type ProposedPlanParseResult =
 	| { status: "valid"; content: string }
 	| { status: "invalid"; error: string };
 
-export const PLAN_MODE_TOOL_NAMES = ["read", "grep", "find", "ls", "ask_user_question"] as const;
+export const PLAN_MODE_TOOL_NAMES = [
+	"read",
+	"grep",
+	"find",
+	"ls",
+	"ask_user_question",
+	"forge_context",
+	"forge_query",
+	"forge_audit",
+	"forge_watch",
+] as const;
 
 export const PLAN_MODE_INSTRUCTIONS = `# Plan Mode
 
