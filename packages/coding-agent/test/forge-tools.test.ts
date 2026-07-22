@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { projectForgePage } from "../src/core/forge/result.ts";
 import {
 	createForgeToolDefinitions,
 	FORGE_READ_TOOL_NAMES,
@@ -66,5 +67,37 @@ describe("Forge built-in tools", () => {
 	it("participates in the complete built-in definition registry", () => {
 		const definitions = createAllToolDefinitions("/workspace", { forge: { service: { execute: vi.fn() } } });
 		for (const name of FORGE_TOOL_NAMES) expect(definitions[name].name).toBe(name);
+	});
+
+	it("bounds serialized Forge tool content and details to 64 KiB with valid JSON", async () => {
+		const sentinel = "尾部-secret-sentinel";
+		const execute = vi
+			.fn<ForgeService["execute"]>()
+			.mockResolvedValue({ payload: `${"上下文".repeat(80_000)}${sentinel}` });
+		const definition = createForgeToolDefinitions({ cwd: "/workspace", service: { execute } }).forge_query;
+
+		const output = await definition.execute("large-result", { resource: "issue" }, undefined, undefined, undefined);
+		const content = output.content[0];
+		if (content?.type !== "text") throw new Error("Expected text Forge result");
+		const parsed = JSON.parse(content.text) as Record<string, unknown>;
+
+		expect(Buffer.byteLength(content.text, "utf8")).toBeLessThanOrEqual(64 * 1024);
+		expect(parsed).toMatchObject({ truncated: true, reason: "output_budget", maximumBytes: 64 * 1024 });
+		expect(JSON.stringify(output.details)).not.toContain(sentinel);
+	});
+
+	it("omits complete list items with structured metadata when summaries exceed the page budget", () => {
+		const result = projectForgePage("issue", {
+			items: Array.from({ length: 50 }, (_, index) => ({
+				id: index + 1,
+				title: `Issue ${index} ${"界".repeat(2_000)}`,
+				web_url: `https://gitlab.example/issues/${index}/${"x".repeat(3_000)}`,
+			})),
+			hasMore: false,
+		});
+
+		expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThan(64 * 1024);
+		expect(result).toMatchObject({ truncated: true, truncationReason: "output_budget", hasMore: true });
+		expect(result.omittedItems).toEqual(expect.any(Number));
 	});
 });

@@ -82,6 +82,8 @@ approvals:
 
 Plan Mode 可以使用 `forge_context`、`forge_query`、`forge_audit` 和 `forge_watch`。执行模式还提供 `forge_issue`、`forge_milestone`、`forge_change`、`forge_wiki`、`forge_pipeline`、`forge_release` 和 `forge_transition`。
 
+`forge_query` 返回紧凑摘要，不会返回平台原始响应。列表默认返回 10 条，最多 50 条，每条最多包含 384 字节正文预览。使用 `search` 执行平台侧的当前仓库文本检索，使用 `cursor` 获取下一页，使用 `id` 获取一条详情，或使用 `ids` 获取最多五条用于比较的详情。单条详情正文限制为 16 KiB，批量详情每条正文限制为 8 KiB；列出某个 pipeline 或 workflow run 的 jobs 时使用 `parentId`。所有 Forge 工具结果还具有独立的 64 KiB 输出上限，并在省略内容时返回明确的截断元数据。
+
 `forge_context` 会逐项协商 GitLab 能力，而不会因为存在 `/api/v4` 就假设所有 API 都可用。能力结果区分 supported、unsupported、forbidden、disabled 和 unknown；高级能力缺失不会影响稳定的基础操作。
 
 GitHub 没有正式支持的 Wiki REST API，因此 GitHub Wiki 写操作返回 `unsupported_capability`。GitHub REST 也不提供 review thread 的 resolved 状态；当策略要求所有讨论已解决时，GitHub 集成会按未满足处理。

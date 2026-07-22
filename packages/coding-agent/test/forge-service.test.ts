@@ -92,6 +92,172 @@ describe("DefaultForgeService", () => {
 		});
 	});
 
+	it("returns compact issue summaries with a default limit of 10", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://gitlab.com");
+		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/issues?per_page=1" }).reply(200, []);
+		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/issues?per_page=10" }).reply(
+			200,
+			[
+				{
+					id: 70,
+					iid: 7,
+					title: "Compact issue",
+					state: "opened",
+					description: `${"Relevant preview text. ".repeat(40)}BODY_TAIL_SENTINEL`,
+					author: { username: "alice", avatar_url: "RAW_SENTINEL" },
+					raw: { nested: "RAW_SENTINEL" },
+				},
+			],
+			{ headers: { "x-next-page": "2" } },
+		);
+		const { service, context } = harness();
+
+		const result = await service.execute(
+			"forge_query",
+			{ remote: "https://gitlab.com/acme/widget.git", resource: "issue" },
+			undefined,
+			context,
+		);
+
+		expect(result).toMatchObject({
+			resource: "issue",
+			mode: "list",
+			returned: 1,
+			hasMore: true,
+			nextCursor: "2",
+			items: [
+				{
+					id: 70,
+					number: 7,
+					title: "Compact issue",
+					author: "alice",
+					bodyPreviewTruncated: true,
+				},
+			],
+		});
+		const serialized = JSON.stringify(result);
+		expect(serialized).toContain("Relevant preview text");
+		expect(serialized).not.toMatch(/BODY_TAIL_SENTINEL|RAW_SENTINEL|description|avatar_url/);
+	});
+
+	it("uses GitHub Search API for issue body searches", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://api.github.com");
+		api.intercept({ method: "GET", path: "/repos/acme/widget/issues?per_page=1" }).reply(200, []);
+		api.intercept({
+			method: "GET",
+			path: "/search/issues?per_page=10&q=database+deadlock+repo%3Aacme%2Fwidget+is%3Aissue+is%3Aopen",
+		}).reply(200, {
+			total_count: 1,
+			items: [{ id: 70, number: 7, title: "Database deadlock", body: "Relevant issue body" }],
+		});
+		const { service, context } = harness();
+
+		await expect(
+			service.execute(
+				"forge_query",
+				{
+					remote: "https://github.com/acme/widget.git",
+					resource: "issue",
+					search: "database deadlock",
+					state: "open",
+				},
+				undefined,
+				context,
+			),
+		).resolves.toMatchObject({
+			items: [{ number: 7, title: "Database deadlock", bodyPreview: "Relevant issue body" }],
+		});
+	});
+
+	it("retrieves at most five issue details in a bounded batch", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://gitlab.com");
+		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/issues?per_page=1" }).reply(200, []);
+		for (const id of [7, 8]) {
+			api.intercept({ method: "GET", path: `/api/v4/projects/acme%2Fwidget/issues/${id}` }).reply(200, {
+				id: id * 10,
+				iid: id,
+				title: `Issue ${id}`,
+				description: "x".repeat(10_000),
+			});
+		}
+		const { service, context } = harness();
+
+		const result = await service.execute(
+			"forge_query",
+			{ remote: "https://gitlab.com/acme/widget.git", resource: "issue", ids: [7, 8] },
+			undefined,
+			context,
+		);
+		if (typeof result !== "object" || result === null || !("items" in result) || !Array.isArray(result.items)) {
+			throw new Error("Expected Forge batch result");
+		}
+
+		expect(result).toMatchObject({ mode: "batch", returned: 2 });
+		for (const item of result.items) {
+			if (typeof item !== "object" || item === null || !("body" in item) || typeof item.body !== "string") {
+				throw new Error("Expected bounded batch body");
+			}
+			expect(Buffer.byteLength(item.body, "utf8")).toBeLessThanOrEqual(8 * 1024);
+		}
+	});
+
+	it("rejects oversized batches and GitHub repository-scope search qualifiers before network access", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "service-secret");
+		const { service, context } = harness();
+		const common = { remote: "https://github.com/acme/widget.git", resource: "issue" };
+
+		await expect(
+			service.execute("forge_query", { ...common, ids: [1, 2, 3, 4, 5, 6] }, undefined, context),
+		).rejects.toMatchObject({ code: "validation_failed" });
+		await expect(
+			service.execute("forge_query", { ...common, search: "deadlock repo:another/project" }, undefined, context),
+		).rejects.toMatchObject({ code: "validation_failed" });
+	});
+
+	it("uses a detail endpoint and bounds multibyte issue bodies to 16 KiB", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://api.github.com");
+		api.intercept({ method: "GET", path: "/repos/acme/widget/issues?per_page=1" }).reply(200, []);
+		api.intercept({ method: "GET", path: "/repos/acme/widget/issues/7" }).reply(200, {
+			id: 70,
+			number: 7,
+			title: "Detailed issue",
+			body: "界".repeat(20_000),
+			raw: "RAW_SENTINEL",
+		});
+		const { service, context } = harness();
+
+		const result = await service.execute(
+			"forge_query",
+			{ remote: "https://github.com/acme/widget.git", resource: "issue", id: 7 },
+			undefined,
+			context,
+		);
+		const serialized = JSON.stringify(result);
+		const item = (result as { item: { body: string; bodyTruncated: boolean; bodyOriginalBytes: number } }).item;
+
+		expect(Buffer.byteLength(item.body, "utf8")).toBeLessThanOrEqual(16 * 1024);
+		expect(item).toMatchObject({ bodyTruncated: true, bodyOriginalBytes: 60_000 });
+		expect(serialized).not.toContain("RAW_SENTINEL");
+	});
+
+	it("rejects query limits above 50 before sending a list request", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "service-secret");
+		const { service, context } = harness();
+
+		await expect(
+			service.execute(
+				"forge_query",
+				{ remote: "https://gitlab.com/acme/widget.git", resource: "issue", limit: 51 },
+				undefined,
+				context,
+			),
+		).rejects.toMatchObject({ code: "validation_failed" });
+	});
+
 	it("replays a completed mutation without sending a duplicate request", async () => {
 		vi.stubEnv("GITHUB_TOKEN", "service-secret");
 		const api = dispatcher.get("https://api.github.com");
@@ -335,10 +501,10 @@ describe("DefaultForgeService", () => {
 				undefined,
 				context,
 			),
-		).resolves.toMatchObject({ state: "success", data: { id: 4 } });
+		).resolves.toMatchObject({ state: "success", item: { id: 4 } });
 		await expect(
 			service.execute("forge_watch", { ...common, resource: "job", id: 9, until: ["failed"] }, undefined, context),
-		).resolves.toMatchObject({ state: "failed", data: { id: 9 } });
+		).resolves.toMatchObject({ state: "failed", item: { id: 9 } });
 	});
 
 	it("blocks writes when the repository provider violates policy", async () => {
@@ -562,7 +728,12 @@ describe("DefaultForgeService", () => {
 		const api = dispatcher.get("https://api.github.com");
 		api.intercept({ method: "GET", path: "/repos/acme/widget/pulls?per_page=1" }).reply(200, []);
 		api.intercept({ method: "GET", path: "/repos/acme/widget/pulls/7/reviews?per_page=100&page=1" }).reply(200, [
-			{ id: 1, state: "APPROVED", user: { login: "reviewer" } },
+			{
+				id: 1,
+				state: "APPROVED",
+				body: "REVIEW_BODY_SENTINEL",
+				user: { login: "reviewer", avatar_url: "RAW_REVIEW_SENTINEL" },
+			},
 			...Array.from({ length: 99 }, (_, index) => ({
 				id: index + 2,
 				state: "COMMENTED",
@@ -574,19 +745,25 @@ describe("DefaultForgeService", () => {
 		]);
 		const { service, context } = harness();
 
-		await expect(
-			service.execute(
-				"forge_watch",
-				{
-					remote: "https://github.com/acme/widget.git",
-					resource: "review",
-					id: 7,
-					until: ["pending"],
-					timeoutSeconds: 1,
-				},
-				undefined,
-				context,
-			),
-		).resolves.toMatchObject({ state: "pending" });
+		const result = await service.execute(
+			"forge_watch",
+			{
+				remote: "https://github.com/acme/widget.git",
+				resource: "review",
+				id: 7,
+				until: ["pending"],
+				timeoutSeconds: 1,
+			},
+			undefined,
+			context,
+		);
+
+		expect(result).toMatchObject({
+			state: "pending",
+			reviewCount: 101,
+			reviewerCount: 100,
+			states: { dismissed: 1, commented: 99 },
+		});
+		expect(JSON.stringify(result)).not.toMatch(/REVIEW_BODY_SENTINEL|RAW_REVIEW_SENTINEL|avatar_url|reviews/);
 	});
 });

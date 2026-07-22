@@ -21,6 +21,16 @@ import {
 	type ForgePolicyStage,
 	loadForgePolicy,
 } from "./policy.ts";
+import {
+	DEFAULT_FORGE_QUERY_LIMIT,
+	type ForgeQueryResource,
+	MAX_FORGE_BATCH_IDS,
+	MAX_FORGE_QUERY_LIMIT,
+	projectForgeBatch,
+	projectForgeDetail,
+	projectForgePage,
+	projectForgeResource,
+} from "./result.ts";
 import type { ForgeService, ForgeToolContext, ForgeToolName } from "./tools.ts";
 
 const execFileAsync = promisify(execFile);
@@ -75,6 +85,49 @@ function stringInput(value: unknown, name: string): string {
 		throw new ForgeError("validation_failed", `${name} must be a non-empty string`);
 	}
 	return value;
+}
+
+function queryResource(value: unknown): ForgeQueryResource {
+	const resource = stringInput(value, "resource");
+	switch (resource) {
+		case "issue":
+		case "milestone":
+		case "change":
+		case "wiki":
+		case "pipeline":
+		case "job":
+		case "release":
+			return resource;
+		default:
+			throw new ForgeError("validation_failed", `Unsupported Forge query resource: ${resource}`);
+	}
+}
+
+function queryLimit(value: unknown): number {
+	if (value === undefined) return DEFAULT_FORGE_QUERY_LIMIT;
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > MAX_FORGE_QUERY_LIMIT) {
+		throw new ForgeError("validation_failed", `limit must be an integer between 1 and ${MAX_FORGE_QUERY_LIMIT}`);
+	}
+	return value;
+}
+
+function queryIds(value: unknown): readonly (string | number)[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.length < 1 || value.length > MAX_FORGE_BATCH_IDS) {
+		throw new ForgeError("validation_failed", `ids must contain between 1 and ${MAX_FORGE_BATCH_IDS} values`);
+	}
+	const ids: (string | number)[] = [];
+	const identities = new Set<string>();
+	for (const id of value) {
+		if ((typeof id !== "string" && typeof id !== "number") || (typeof id === "string" && id.trim().length === 0)) {
+			throw new ForgeError("validation_failed", "ids must contain only non-empty strings or numbers");
+		}
+		const identity = `${typeof id}:${id}`;
+		if (identities.has(identity)) throw new ForgeError("validation_failed", "ids cannot contain duplicates");
+		identities.add(identity);
+		ids.push(id);
+	}
+	return ids;
 }
 
 function inputBody(input: Record<string, unknown>): Record<string, unknown> {
@@ -347,33 +400,85 @@ class DefaultForgeService implements ForgeService {
 		signal?: AbortSignal,
 		checkCapability = true,
 	): Promise<unknown> {
-		const resource = stringInput(input.resource, "resource");
+		const resource = queryResource(input.resource);
+		const ids = queryIds(input.ids);
+		if (input.id !== undefined && ids) throw new ForgeError("validation_failed", "Use either id or ids, not both");
+		const detailMode = input.id !== undefined || ids !== undefined;
+		if (
+			detailMode &&
+			(input.limit !== undefined ||
+				input.cursor !== undefined ||
+				input.parentId !== undefined ||
+				input.search !== undefined ||
+				input.state !== undefined)
+		) {
+			throw new ForgeError("validation_failed", "Detail queries cannot use list filters or pagination");
+		}
+		if (input.parentId !== undefined && resource !== "job") {
+			throw new ForgeError("validation_failed", "parentId is supported only for job lists");
+		}
+		if (!detailMode && resource === "job" && input.parentId === undefined) {
+			throw new ForgeError("validation_failed", "Job lists require parentId");
+		}
+		const search = typeof input.search === "string" && input.search.trim() ? input.search.trim() : undefined;
+		if (input.search !== undefined && !search) throw new ForgeError("validation_failed", "search cannot be empty");
+		if (search && search.length > 512)
+			throw new ForgeError("validation_failed", "search cannot exceed 512 characters");
+		if (search && resolved.adapter instanceof GitHubAdapter && /(?:^|\s)(?:repo|org|user):/i.test(search)) {
+			throw new ForgeError("validation_failed", "GitHub search cannot override the current repository scope");
+		}
+		if (search) {
+			const supported =
+				resolved.adapter instanceof GitLabAdapter
+					? resource === "issue" || resource === "milestone" || resource === "change"
+					: resource === "issue" || resource === "change";
+			if (!supported) {
+				throw new ForgeError(
+					"validation_failed",
+					`${resolved.repository.provider} ${resource} does not support search`,
+				);
+			}
+		}
+		const limit = detailMode ? undefined : queryLimit(input.limit);
 		if (checkCapability) await this.ensureResourceCapability(resolved, resource, signal);
+		if (input.id !== undefined) {
+			return projectForgeDetail(resource, await this.fetchQueryDetail(resolved, resource, input.id, signal));
+		}
+		if (ids) {
+			const values = await Promise.all(ids.map((id) => this.fetchQueryDetail(resolved, resource, id, signal)));
+			return projectForgeBatch(resource, values);
+		}
 		const query = {
 			state: typeof input.state === "string" ? input.state : undefined,
-			search: typeof input.search === "string" ? input.search : undefined,
+			search,
 			page: typeof input.cursor === "string" ? input.cursor : undefined,
-			per_page: typeof input.limit === "number" ? input.limit : undefined,
+			per_page: limit,
 		};
 		const project = resolved.repository.projectPath;
 		if (resolved.adapter instanceof GitLabAdapter) {
 			switch (resource) {
 				case "issue":
-					return resolved.adapter.listIssues(project, query, signal);
+					return projectForgePage(resource, await resolved.adapter.listIssues(project, query, signal));
 				case "milestone":
-					return resolved.adapter.listMilestones(project, query, signal);
+					return projectForgePage(resource, await resolved.adapter.listMilestones(project, query, signal));
 				case "change":
-					return resolved.adapter.listMergeRequests(project, query, signal);
+					return projectForgePage(resource, await resolved.adapter.listMergeRequests(project, query, signal));
 				case "wiki":
-					return resolved.adapter.listWikiPages(project, signal);
+					return projectForgePage(resource, await resolved.adapter.listWikiPages(project, query, signal));
 				case "pipeline":
-					return resolved.adapter.listPipelines(project, query, signal);
+					return projectForgePage(resource, await resolved.adapter.listPipelines(project, query, signal));
 				case "job":
-					return resolved.adapter.listPipelineJobs(project, numberInput(input.id, "id"), signal);
+					return projectForgePage(
+						resource,
+						await resolved.adapter.listPipelineJobs(
+							project,
+							numberInput(input.parentId, "parentId"),
+							query,
+							signal,
+						),
+					);
 				case "release":
-					return resolved.adapter.client
-						.request("GET", `/api/v4/projects/${encodeURIComponent(project)}/releases`, { query, signal })
-						.then((response) => response.data);
+					return projectForgePage(resource, await resolved.adapter.listReleases(project, query, signal));
 			}
 		}
 		if (!(resolved.adapter instanceof GitHubAdapter)) {
@@ -386,20 +491,100 @@ class DefaultForgeService implements ForgeService {
 		}
 		switch (resource) {
 			case "issue":
-				return resolved.adapter.listIssues(project, query, signal);
+				return projectForgePage(
+					resource,
+					await (search
+						? resolved.adapter.searchIssues(
+								project,
+								search,
+								"issue",
+								{ state: query.state, page: query.page, per_page: query.per_page },
+								signal,
+							)
+						: resolved.adapter.listIssues(project, query, signal)),
+				);
 			case "milestone":
-				return resolved.adapter.listMilestones(project, query, signal);
+				return projectForgePage(resource, await resolved.adapter.listMilestones(project, query, signal));
 			case "change":
-				return resolved.adapter.listPullRequests(project, query, signal);
+				return projectForgePage(
+					resource,
+					await (search
+						? resolved.adapter.searchIssues(
+								project,
+								search,
+								"pr",
+								{ state: query.state, page: query.page, per_page: query.per_page },
+								signal,
+							)
+						: resolved.adapter.listPullRequests(project, query, signal)),
+				);
 			case "pipeline":
-				return resolved.adapter.listWorkflowRuns(project, query, signal);
+				return projectForgePage(resource, await resolved.adapter.listWorkflowRuns(project, query, signal));
+			case "job":
+				return projectForgePage(
+					resource,
+					await resolved.adapter.listWorkflowJobs(project, numberInput(input.parentId, "parentId"), query, signal),
+				);
 			case "release":
-				return resolved.adapter.listReleases(project, query, signal);
+				return projectForgePage(resource, await resolved.adapter.listReleases(project, query, signal));
 			default:
 				throw new ForgeError("unsupported_capability", `GitHub query does not support ${resource}`, {
 					capability: resource,
 				});
 		}
+	}
+
+	private async fetchQueryDetail(
+		resolved: ResolvedForge,
+		resource: ForgeQueryResource,
+		id: unknown,
+		signal?: AbortSignal,
+	): Promise<Record<string, unknown>> {
+		const project =
+			resolved.adapter instanceof GitLabAdapter
+				? encodeURIComponent(resolved.repository.projectPath)
+				: encodedGitHubProject(resolved.repository.projectPath);
+		let path: string;
+		if (resolved.adapter instanceof GitLabAdapter) {
+			const identifier =
+				resource === "wiki" || resource === "release"
+					? encodeURIComponent(stringInput(id, "id"))
+					: String(numberInput(id, "id"));
+			path =
+				resource === "issue"
+					? `/api/v4/projects/${project}/issues/${identifier}`
+					: resource === "milestone"
+						? `/api/v4/projects/${project}/milestones/${identifier}`
+						: resource === "change"
+							? `/api/v4/projects/${project}/merge_requests/${identifier}`
+							: resource === "wiki"
+								? `/api/v4/projects/${project}/wikis/${identifier}`
+								: resource === "pipeline"
+									? `/api/v4/projects/${project}/pipelines/${identifier}`
+									: resource === "job"
+										? `/api/v4/projects/${project}/jobs/${identifier}`
+										: `/api/v4/projects/${project}/releases/${identifier}`;
+		} else {
+			if (resource === "wiki") throw new ForgeError("unsupported_capability", "GitHub Wiki is unsupported");
+			const identifier =
+				resource === "release" && typeof id === "string"
+					? `tags/${encodeURIComponent(stringInput(id, "id"))}`
+					: String(numberInput(id, "id"));
+			path =
+				resource === "issue"
+					? `/repos/${project}/issues/${identifier}`
+					: resource === "milestone"
+						? `/repos/${project}/milestones/${identifier}`
+						: resource === "change"
+							? `/repos/${project}/pulls/${identifier}`
+							: resource === "pipeline"
+								? `/repos/${project}/actions/runs/${identifier}`
+								: resource === "job"
+									? `/repos/${project}/actions/jobs/${identifier}`
+									: `/repos/${project}/releases/${identifier}`;
+		}
+		const response = await resolved.adapter.client.request<unknown>("GET", path, { signal });
+		return objectValue(response.data, `${resolved.repository.provider} ${resource}`);
 	}
 
 	private async audit(
@@ -468,7 +653,7 @@ class DefaultForgeService implements ForgeService {
 		resource: string,
 		id: unknown,
 		signal?: AbortSignal,
-	): Promise<{ state: string; data: unknown }> {
+	): Promise<Record<string, unknown> & { state: string }> {
 		const numericId = numberInput(id, "id");
 		if (resolved.adapter instanceof GitLabAdapter) {
 			const project = encodeURIComponent(resolved.repository.projectPath);
@@ -498,7 +683,25 @@ class DefaultForgeService implements ForgeService {
 						: typeof data.state === "string"
 							? data.state
 							: "unknown";
-			return { state, data };
+			if (resource === "review") {
+				return {
+					resource,
+					id: numericId,
+					state,
+					approvalsLeft: data.approvals_left,
+					approvalCount: Array.isArray(data.approved_by) ? data.approved_by.length : undefined,
+				};
+			}
+			return {
+				resource,
+				id: numericId,
+				state,
+				item: projectForgeResource(
+					resource === "change" ? "change" : resource === "job" ? "job" : "pipeline",
+					data,
+					"list",
+				),
+			};
 		}
 		const project = encodedGitHubProject(resolved.repository.projectPath);
 		const path =
@@ -513,20 +716,24 @@ class DefaultForgeService implements ForgeService {
 							: undefined;
 		if (!path) throw new ForgeError("unsupported_capability", `Cannot watch GitHub ${resource}`);
 		if (resource === "review") {
-			const reviews = await this.fetchPolicyArrayPages(resolved, path, "GitHub pull request reviews", signal);
-			const currentStates = new Map<string, string>();
-			for (const review of reviews) {
-				const value = objectValue(review, "GitHub pull request review");
-				const user =
-					typeof value.user === "object" && value.user !== null
-						? (value.user as { login?: unknown }).login
-						: undefined;
-				if (typeof user === "string" && typeof value.state === "string") {
-					currentStates.set(user, value.state.toUpperCase());
-				}
-			}
+			const { reviewCount, states: currentStates } = await this.collectGitHubReviewStates(resolved, path, signal);
 			const approved = [...currentStates.values()].some((state) => state === "APPROVED");
-			return { state: approved ? "approved" : "pending", data: reviews };
+			const states = Object.fromEntries(
+				[...new Set(currentStates.values())]
+					.sort()
+					.map((state) => [
+						state.toLowerCase(),
+						[...currentStates.values()].filter((value) => value === state).length,
+					]),
+			);
+			return {
+				resource,
+				id: numericId,
+				state: approved ? "approved" : "pending",
+				reviewCount,
+				reviewerCount: currentStates.size,
+				states,
+			};
 		}
 		const response = await resolved.adapter.client.request<unknown>("GET", path, { signal });
 		const data = objectValue(response.data, `GitHub ${resource}`);
@@ -538,7 +745,16 @@ class DefaultForgeService implements ForgeService {
 					: typeof data.state === "string"
 						? data.state
 						: "unknown";
-		return { state, data };
+		return {
+			resource,
+			id: numericId,
+			state,
+			item: projectForgeResource(
+				resource === "change" ? "change" : resource === "job" ? "job" : "pipeline",
+				data,
+				"list",
+			),
+		};
 	}
 
 	private async ensureResourceCapability(
@@ -634,20 +850,60 @@ class DefaultForgeService implements ForgeService {
 		signal?: AbortSignal,
 	): Promise<unknown[]> {
 		const items: unknown[] = [];
+		await this.forEachPolicyArrayPage(resolved, path, operation, (pageItems) => items.push(...pageItems), signal);
+		return items;
+	}
+
+	private async forEachPolicyArrayPage(
+		resolved: ResolvedForge,
+		path: string,
+		operation: string,
+		consume: (items: unknown[]) => void,
+		signal?: AbortSignal,
+	): Promise<number> {
+		let itemCount = 0;
 		for (let page = 1; page <= MAX_POLICY_FACT_PAGES; page++) {
 			const response = await resolved.adapter.client.request<unknown>("GET", path, {
 				query: { per_page: 100, page },
 				signal,
 			});
 			const pageItems = arrayValue(response.data, operation);
-			items.push(...pageItems);
+			consume(pageItems);
+			itemCount += pageItems.length;
 			const hasNext =
 				resolved.adapter instanceof GitLabAdapter
 					? Boolean(headerValue(response.headers["x-next-page"])) || pageItems.length === 100
 					: githubHasNextPage(headerValue(response.headers.link)) || pageItems.length === 100;
-			if (!hasNext) return items;
+			if (!hasNext) return itemCount;
 		}
 		throw new ForgeError("policy_denied", `${operation} exceeds the ${MAX_POLICY_FACT_PAGES}-page audit limit`);
+	}
+
+	private async collectGitHubReviewStates(
+		resolved: ResolvedForge,
+		path: string,
+		signal?: AbortSignal,
+	): Promise<{ reviewCount: number; states: Map<string, string> }> {
+		const states = new Map<string, string>();
+		const reviewCount = await this.forEachPolicyArrayPage(
+			resolved,
+			path,
+			"GitHub pull request reviews",
+			(pageItems) => {
+				for (const review of pageItems) {
+					const value = objectValue(review, "GitHub pull request review");
+					const user =
+						typeof value.user === "object" && value.user !== null
+							? (value.user as { login?: unknown }).login
+							: undefined;
+					if (typeof user === "string" && typeof value.state === "string") {
+						states.set(user, value.state.toUpperCase());
+					}
+				}
+			},
+			signal,
+		);
+		return { reviewCount, states };
 	}
 
 	private async fetchGitHubCheckRunPages(
@@ -894,22 +1150,11 @@ class DefaultForgeService implements ForgeService {
 					: undefined,
 		};
 		if (policy.workflow.requiredApprovals > 0) {
-			const reviews = await this.fetchPolicyArrayPages(
+			const { states } = await this.collectGitHubReviewStates(
 				resolved,
 				`/repos/${githubProject}/pulls/${id}/reviews`,
-				"GitHub pull request reviews",
 				signal,
 			);
-			const states = new Map<string, string>();
-			for (const review of reviews) {
-				const value = objectValue(review, "GitHub pull request review");
-				const user =
-					typeof value.user === "object" && value.user !== null
-						? (value.user as { login?: unknown }).login
-						: undefined;
-				if (typeof user === "string" && typeof value.state === "string")
-					states.set(user, value.state.toUpperCase());
-			}
 			facts.approvals = [...states.values()].filter((state) => state === "APPROVED").length;
 		}
 		if (policy.workflow.blockUnresolvedDiscussions) {

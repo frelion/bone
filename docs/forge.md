@@ -82,6 +82,8 @@ Read operations run automatically. Sensitive and destructive mutations require a
 
 Plan Mode can use `forge_context`, `forge_query`, `forge_audit`, and `forge_watch`. Execution mode additionally provides `forge_issue`, `forge_milestone`, `forge_change`, `forge_wiki`, `forge_pipeline`, `forge_release`, and `forge_transition`.
 
+`forge_query` returns compact summaries rather than raw provider responses. Lists default to 10 items, accept at most 50, and include at most 384 bytes of body preview per item. Use `search` for provider-side repository text search, `cursor` for another page, `id` for one detail record, or `ids` for up to five comparison records. Single-detail bodies are limited to 16 KiB; batch-detail bodies are limited to 8 KiB each. Use `parentId` when listing jobs for a pipeline or workflow run. Every Forge tool result has an independent 64 KiB output ceiling with explicit truncation metadata.
+
 `forge_context` negotiates GitLab capabilities separately instead of treating `/api/v4` as a guarantee that every endpoint exists. Capability results distinguish supported, unsupported, forbidden, disabled, and unknown behavior. Missing advanced capabilities do not disable stable core operations.
 
 GitHub does not publish a supported Wiki REST API, so GitHub Wiki mutations return `unsupported_capability`. GitHub REST also does not expose review-thread resolution; a policy requiring resolved discussions therefore fails closed on GitHub.

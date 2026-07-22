@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bounded Forge query and watch results with compact previews, provider-side repository search, single and batch detail retrieval, uniform pagination, and a 64 KiB tool-output ceiling so large GitLab or GitHub responses cannot consume the model context.
+
 ## [0.1.2] - 2026-07-22
 
 ### Added

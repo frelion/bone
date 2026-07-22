@@ -59,6 +59,15 @@ function requireWikiPage(value: unknown, operation: string): GitLabWikiPage {
 	return value as GitLabWikiPage;
 }
 
+function requireRelease(value: unknown, operation: string): Record<string, unknown> {
+	if (typeof value !== "object" || value === null || typeof (value as { tag_name?: unknown }).tag_name !== "string") {
+		throw new ForgeError("invalid_remote_response", `GitLab ${operation} response is missing tag_name`, {
+			operation,
+		});
+	}
+	return value as Record<string, unknown>;
+}
+
 function headerValue(value: string | string[] | undefined): string | undefined {
 	return Array.isArray(value) ? value[0] : value;
 }
@@ -150,7 +159,7 @@ export class GitLabAdapter {
 		query: Record<string, string | number | boolean | undefined> = {},
 		signal?: AbortSignal,
 	): Promise<ForgePage<T>> {
-		const response = await this.client.request<unknown>("GET", path, { query: { per_page: 30, ...query }, signal });
+		const response = await this.client.request<unknown>("GET", path, { query: { per_page: 10, ...query }, signal });
 		const items = requireResourceList(response.data, path) as T[];
 		const nextCursor = headerValue(response.headers["x-next-page"]);
 		return { items, nextCursor: nextCursor || undefined, hasMore: Boolean(nextCursor) };
@@ -266,9 +275,13 @@ export class GitLabAdapter {
 		);
 	}
 
-	async listWikiPages(project: Project, signal?: AbortSignal): Promise<ForgePage<GitLabWikiPage>> {
+	async listWikiPages(
+		project: Project,
+		query: Record<string, string | number | boolean | undefined> = {},
+		signal?: AbortSignal,
+	): Promise<ForgePage<GitLabWikiPage>> {
 		const path = `/api/v4/projects/${encodedProject(project)}/wikis`;
-		const response = await this.client.request<unknown>("GET", path, { query: { per_page: 30 }, signal });
+		const response = await this.client.request<unknown>("GET", path, { query: { per_page: 10, ...query }, signal });
 		if (!Array.isArray(response.data)) {
 			throw new ForgeError("invalid_remote_response", "GitLab Wiki response is not a list", { operation: path });
 		}
@@ -342,8 +355,36 @@ export class GitLabAdapter {
 		);
 	}
 
-	listPipelineJobs(project: Project, pipelineId: number, signal?: AbortSignal): Promise<ForgePage<GitLabJob>> {
-		return this.list(`/api/v4/projects/${encodedProject(project)}/pipelines/${pipelineId}/jobs`, {}, signal);
+	listPipelineJobs(
+		project: Project,
+		pipelineId: number,
+		query?: Record<string, string | number | boolean | undefined>,
+		signal?: AbortSignal,
+	): Promise<ForgePage<GitLabJob>> {
+		return this.list(`/api/v4/projects/${encodedProject(project)}/pipelines/${pipelineId}/jobs`, query, signal);
+	}
+
+	listReleases(
+		project: Project,
+		query?: Record<string, string | number | boolean | undefined>,
+		signal?: AbortSignal,
+	): Promise<ForgePage<Record<string, unknown>>> {
+		const path = `/api/v4/projects/${encodedProject(project)}/releases`;
+		return this.client
+			.request<unknown>("GET", path, { query: { per_page: 10, ...query }, signal })
+			.then((response) => {
+				if (!Array.isArray(response.data)) {
+					throw new ForgeError("invalid_remote_response", "GitLab release response is not a list", {
+						operation: path,
+					});
+				}
+				const nextCursor = headerValue(response.headers["x-next-page"]);
+				return {
+					items: response.data.map((item) => requireRelease(item, path)),
+					nextCursor: nextCursor || undefined,
+					hasMore: Boolean(nextCursor),
+				};
+			});
 	}
 
 	playJob(

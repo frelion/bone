@@ -46,6 +46,41 @@ describe("GitHubAdapter", () => {
 		expect(result).toMatchObject({ nextCursor: "2", hasMore: true });
 	});
 
+	it("unwraps workflow jobs while preserving cursor pagination", async () => {
+		const { adapter: github, mock } = adapter();
+		mock.intercept({ method: "GET", path: "/repos/acme/widget/actions/runs/44/jobs?per_page=10&page=2" }).reply(
+			200,
+			{ total_count: 12, jobs: [{ id: 9, name: "test", status: "completed" }] },
+			{
+				headers: { link: '<https://api.github.com/repos/acme/widget/actions/runs/44/jobs?page=3>; rel="next"' },
+			},
+		);
+
+		await expect(github.listWorkflowJobs("acme/widget", 44, { per_page: 10, page: "2" })).resolves.toMatchObject({
+			items: [{ id: 9, name: "test", status: "completed" }],
+			nextCursor: "3",
+			hasMore: true,
+		});
+	});
+
+	it("uses repository-scoped GitHub Search for issue text", async () => {
+		const { adapter: github, mock } = adapter();
+		mock
+			.intercept({
+				method: "GET",
+				path: "/search/issues?per_page=10&page=2&q=database+deadlock+repo%3Aacme%2Fwidget+is%3Aissue+is%3Aopen",
+			})
+			.reply(200, { items: [{ id: 11, number: 3, title: "Deadlock" }] });
+
+		await expect(
+			github.searchIssues("acme/widget", "database deadlock", "issue", {
+				per_page: 10,
+				page: "2",
+				state: "open",
+			}),
+		).resolves.toMatchObject({ items: [{ id: 11, number: 3 }] });
+	});
+
 	it("reports GitHub Wiki as unsupported while preserving other capability probes", async () => {
 		const { adapter: github, mock } = adapter();
 		for (const path of [

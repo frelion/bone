@@ -126,7 +126,7 @@ export class GitHubAdapter {
 		signal?: AbortSignal,
 		extract?: (value: unknown) => unknown,
 	): Promise<ForgePage<GitHubResource>> {
-		const response = await this.client.request<unknown>("GET", path, { query: { per_page: 30, ...query }, signal });
+		const response = await this.client.request<unknown>("GET", path, { query: { per_page: 10, ...query }, signal });
 		const items = requireResourceList(extract ? extract(response.data) : response.data, path);
 		const cursor = nextPage(headerValue(response.headers.link));
 		return { items, nextCursor: cursor, hasMore: cursor !== undefined };
@@ -145,6 +145,25 @@ export class GitHubAdapter {
 
 	listIssues(repository: string, query?: Record<string, string | number | boolean | undefined>, signal?: AbortSignal) {
 		return this.list(`/repos/${encodedRepository(repository)}/issues`, query, signal);
+	}
+
+	searchIssues(
+		repository: string,
+		search: string,
+		kind: "issue" | "pr",
+		query: Record<string, string | number | boolean | undefined> = {},
+		signal?: AbortSignal,
+	) {
+		encodedRepository(repository);
+		const { state, ...pagination } = query;
+		const normalizedState = state === "opened" ? "open" : state;
+		const stateQualifier = normalizedState === "open" || normalizedState === "closed" ? ` is:${normalizedState}` : "";
+		return this.list(
+			"/search/issues",
+			{ ...pagination, q: `${search} repo:${repository} is:${kind}${stateQualifier}` },
+			signal,
+			(value) => (typeof value === "object" && value !== null ? (value as { items?: unknown }).items : undefined),
+		);
 	}
 
 	createIssue(repository: string, body: GitHubWriteBody, signal?: AbortSignal) {
@@ -218,6 +237,17 @@ export class GitHubAdapter {
 	) {
 		return this.list(`/repos/${encodedRepository(repository)}/actions/runs`, query, signal, (value) =>
 			typeof value === "object" && value !== null ? (value as { workflow_runs?: unknown }).workflow_runs : undefined,
+		);
+	}
+
+	listWorkflowJobs(
+		repository: string,
+		runId: number,
+		query?: Record<string, string | number | boolean | undefined>,
+		signal?: AbortSignal,
+	) {
+		return this.list(`/repos/${encodedRepository(repository)}/actions/runs/${runId}/jobs`, query, signal, (value) =>
+			typeof value === "object" && value !== null ? (value as { jobs?: unknown }).jobs : undefined,
 		);
 	}
 
