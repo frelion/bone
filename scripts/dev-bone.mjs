@@ -20,6 +20,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { isBoneManagedHooksPath } from "./dev-bone-hooks.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = resolve(dirname(scriptPath), "..");
@@ -78,7 +79,7 @@ function usage() {
 
 function parseArgs() {
 	const [action, ...args] = process.argv.slice(2);
-	if (action !== "install" && action !== "install-hook" && action !== "uninstall-hook") {
+	if (action !== "install" && action !== "install-hook" && action !== "uninstall-hook" && action !== "prepare") {
 		usage();
 		fail("A dev Bone action is required");
 	}
@@ -98,6 +99,18 @@ function parseArgs() {
 		fail(`Unknown option: ${argument}`);
 	}
 	return { action, skipBuild, commandPath };
+}
+
+function runHuskyPrepare() {
+	if (process.env.HUSKY === "0") return;
+	const configuredHooksPath = spawnSync("git", ["config", "--get", "core.hooksPath"], {
+		cwd: repoRoot,
+		encoding: "utf8",
+	}).stdout.trim();
+	if (isBoneManagedHooksPath(configuredHooksPath, { repoRoot, devRoot })) return;
+	const huskyPath = resolveCommand("husky");
+	if (!huskyPath) fail("Husky is missing. Run npm install --ignore-scripts first.");
+	run(huskyPath);
 }
 
 function getPlatformTarget() {
@@ -416,6 +429,7 @@ function uninstallHook() {
 
 try {
 	const options = parseArgs();
+	if (options.action === "prepare") runHuskyPrepare();
 	if (options.action === "install") installRelease(options.skipBuild);
 	if (options.action === "install-hook") {
 		installRelease(false);

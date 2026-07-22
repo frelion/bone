@@ -37,9 +37,11 @@ For a source checkout used every day, `npm run dev:install-hook` installs
 local-only post-commit and post-merge hooks for the primary checkout. They build
 the current-platform Bun binary, switch the local `bone` command atomically after
 a successful build, and keep the previous binary if the build fails. Events from
-other worktrees do not trigger an install. Set `BONE_SKIP_LOCAL_INSTALL=1` to skip
-one install. Use `npm run dev:uninstall-hook` to restore the clone's previous Git
-hook path and `bone` command.
+other worktrees do not trigger an install. The package `prepare` step preserves
+this hook when dependencies are installed again, including from another worktree.
+Set `BONE_SKIP_LOCAL_INSTALL=1` to skip one install. Use
+`npm run dev:uninstall-hook` to restore the clone's previous Git hook path and
+`bone` command.
 
 The source remains an npm workspace monorepo. Its internal package names are an
 implementation detail during the GitHub Release phase and are not published by
