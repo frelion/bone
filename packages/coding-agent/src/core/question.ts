@@ -34,6 +34,7 @@ export interface QuestionAnswer {
 	kind: "option" | "custom" | "multi";
 	answer: string | null;
 	selected?: string[];
+	notes?: string;
 }
 
 export type QuestionCancelReason = "user" | "abort" | "client_disconnect" | "no_ui";
@@ -133,6 +134,7 @@ export function validateQuestionAnswers(request: QuestionRequest, answers: Quest
 			throw new Error(`Question ${questionIndex + 1} text does not match the request.`);
 
 		const optionLabels = new Set(question.options.map((option) => option.label));
+		const notes = answer.notes?.trim() || undefined;
 		if (question.multiSelect) {
 			if (answer.kind === "custom") {
 				const value = answer.answer?.trim();
@@ -146,14 +148,27 @@ export function validateQuestionAnswers(request: QuestionRequest, answers: Quest
 			if (selected.some((label) => !optionLabels.has(label))) {
 				throw new Error(`Question ${questionIndex + 1} contains an unknown option.`);
 			}
-			return { questionIndex, question: question.question, kind: "multi" as const, answer: null, selected };
+			return {
+				questionIndex,
+				question: question.question,
+				kind: "multi" as const,
+				answer: null,
+				selected,
+				...(notes && { notes }),
+			};
 		}
 
 		if (answer.kind === "option") {
 			if (!answer.answer || !optionLabels.has(answer.answer)) {
 				throw new Error(`Question ${questionIndex + 1} must select a valid option.`);
 			}
-			return { questionIndex, question: question.question, kind: "option" as const, answer: answer.answer };
+			return {
+				questionIndex,
+				question: question.question,
+				kind: "option" as const,
+				answer: answer.answer,
+				...(notes && { notes }),
+			};
 		}
 		if (answer.kind === "custom") {
 			const value = answer.answer?.trim();

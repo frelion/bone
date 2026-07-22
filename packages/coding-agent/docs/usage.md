@@ -30,7 +30,7 @@ Bone may investigate or ask clarifying questions before presenting a formal plan
 
 ### Structured questions
 
-Bone can pause a Default or Plan mode turn to ask up to four structured questions. Each question offers concrete single- or multi-select choices plus an unlabeled custom-answer input. Options may include a Markdown preview; the interactive UI shows the focused option's description and preview beside the choices on wide terminals and below them on narrow terminals. The questionnaire must be submitted as a complete set. Press Escape twice to cancel. After submission or cancellation, the result is recorded as the pending tool result and the same agent turn continues automatically.
+Bone can pause a Default or Plan mode turn to ask up to four structured questions. Each question offers concrete single- or multi-select choices plus an unlabeled custom-answer input. Custom text can stand alone or supplement selected options; supplemental text is returned in the answer's optional `notes` field. Options may include a Markdown preview; the interactive UI shows the focused option's description and preview in a fixed-height pane beside the choices on wide terminals and below them on narrow terminals. The questionnaire must be submitted as a complete set. Press Escape twice to cancel. After submission or cancellation, the result is recorded as the pending tool result and the same agent turn continues automatically.
 
 Question requests and decisions are stored in the session tree. Reopening a session or navigating to a branch with an unanswered request restores the questionnaire. Print mode persists and emits the request, records a `no_ui` cancellation, and returns an explicit unavailable error so the model can ask in ordinary chat text instead.
 

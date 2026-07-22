@@ -45,9 +45,11 @@ describe("QuestionnaireComponent", () => {
 
 	it("renders questions and Submit as left/right navigable tabs", () => {
 		const component = new QuestionnaireComponent(request, vi.fn());
-		expect(rendered(component)).toContain("□ Mode");
+		const initial = rendered(component);
+		expect(initial).toContain("□ Mode");
 		expect(rendered(component)).toContain("□ Clients");
 		expect(rendered(component)).toContain("✓ Submit");
+		expect(initial.split("\n").filter((line) => line.trim() === "Mode")).toHaveLength(0);
 
 		component.handleInput(RIGHT);
 		expect(rendered(component)).toContain("Which clients?");
@@ -110,6 +112,65 @@ describe("QuestionnaireComponent", () => {
 		expect(rendered(component)).not.toContain("Other");
 		expect(rendered(component)).toContain("■ Mode");
 		expect(rendered(component)).toContain("Which mode?");
+	});
+
+	it("keeps supplemental input alongside selected options", () => {
+		const done = vi.fn();
+		const component = new QuestionnaireComponent(request, done);
+		component.handleInput(" ");
+		component.handleInput(DOWN);
+		component.handleInput(DOWN);
+		component.handleInput("Prioritize startup latency");
+		component.handleInput(RIGHT);
+		component.handleInput(" ");
+		component.handleInput(DOWN);
+		component.handleInput(DOWN);
+		component.handleInput("Desktop follows later");
+		component.handleInput(RIGHT);
+
+		expect(rendered(component)).toContain("Mode: Fast · “Prioritize startup latency”");
+		expect(rendered(component)).toContain("Clients: TUI · “Desktop follows later”");
+		component.handleInput("\r");
+		expect(done).toHaveBeenCalledWith({
+			cancelled: false,
+			answers: [
+				{
+					questionIndex: 0,
+					question: "Which mode?",
+					kind: "option",
+					answer: "Fast",
+					notes: "Prioritize startup latency",
+				},
+				{
+					questionIndex: 1,
+					question: "Which clients?",
+					kind: "multi",
+					answer: null,
+					selected: ["TUI"],
+					notes: "Desktop follows later",
+				},
+			],
+		});
+	});
+
+	it("keeps the details pane height fixed while focus moves", () => {
+		const component = new QuestionnaireComponent(request, vi.fn());
+		const wideHeights = [component.render(120).length];
+		component.handleInput(DOWN);
+		wideHeights.push(component.render(120).length);
+		component.handleInput(DOWN);
+		wideHeights.push(component.render(120).length);
+
+		expect(new Set(wideHeights)).toEqual(new Set([wideHeights[0]]));
+
+		const narrowComponent = new QuestionnaireComponent(request, vi.fn());
+		const narrowHeights = [narrowComponent.render(72).length];
+		narrowComponent.handleInput(DOWN);
+		narrowHeights.push(narrowComponent.render(72).length);
+		narrowComponent.handleInput(DOWN);
+		narrowHeights.push(narrowComponent.render(72).length);
+
+		expect(new Set(narrowHeights)).toEqual(new Set([narrowHeights[0]]));
 	});
 
 	it("submits complete answers from the Submit tab", () => {

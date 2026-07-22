@@ -19,10 +19,11 @@ import { fitLine } from "./terminal-layout.ts";
 
 export type QuestionnaireResult = { cancelled: false; answers: QuestionAnswer[] } | { cancelled: true };
 
-type DraftAnswer =
-	| { kind: "option"; value: string }
-	| { kind: "custom"; value: string }
-	| { kind: "multi"; values: Set<string> };
+interface DraftAnswer {
+	option?: string;
+	selected?: Set<string>;
+	custom?: string;
+}
 
 type ActiveViewState = { kind: "question"; questionIndex: number; selectedRow: number } | { kind: "submit" };
 type ViewState = ActiveViewState | { kind: "cancelConfirm"; returnTo: ActiveViewState };
@@ -36,17 +37,20 @@ class QuestionChoicePane implements Component {
 	private readonly selectedRow: number;
 	private readonly draft: DraftAnswer | undefined;
 	private readonly input: Input;
+	private readonly allQuestions: QuestionRequest["questions"];
 
 	constructor(
 		question: QuestionRequest["questions"][number],
 		selectedRow: number,
 		draft: DraftAnswer | undefined,
 		input: Input,
+		allQuestions: QuestionRequest["questions"],
 	) {
 		this.question = question;
 		this.selectedRow = selectedRow;
 		this.draft = draft;
 		this.input = input;
+		this.allQuestions = allQuestions;
 	}
 
 	invalidate(): void {
@@ -56,10 +60,10 @@ class QuestionChoicePane implements Component {
 	render(width: number): string[] {
 		const inputFocused = this.selectedRow === this.question.options.length;
 		this.input.focused = inputFocused;
-		const selectedOption = this.question.options[this.selectedRow];
-		if (width < DETAILS_SIDE_BY_SIDE_MIN_WIDTH || !selectedOption) {
+		const selectedOption = this.getDetailOption();
+		if (width < DETAILS_SIDE_BY_SIDE_MIN_WIDTH) {
 			const left = this.renderChoices(width);
-			return selectedOption ? [...left, "", ...this.renderDetails(width, selectedOption)] : left;
+			return [...left, "", ...this.renderDetails(width, selectedOption)];
 		}
 
 		const leftWidth = Math.max(
@@ -82,10 +86,9 @@ class QuestionChoicePane implements Component {
 		for (let index = 0; index < this.question.options.length; index++) {
 			const option = this.question.options[index]!;
 			const focused = this.selectedRow === index;
-			const checked =
-				this.draft?.kind === "multi"
-					? this.draft.values.has(option.label)
-					: this.draft?.kind === "option" && this.draft.value === option.label;
+			const checked = this.question.multiSelect
+				? this.draft?.selected?.has(option.label) === true
+				: this.draft?.option === option.label;
 			const marker = this.question.multiSelect ? (checked ? "[x]" : "[ ]") : checked ? "(*)" : "( )";
 			const pointer = focused ? theme.fg("accent", "❯") : " ";
 			const label = focused ? theme.bold(option.label) : option.label;
@@ -94,6 +97,17 @@ class QuestionChoicePane implements Component {
 		}
 		lines.push(...this.input.render(width));
 		return lines;
+	}
+
+	private getDetailOption(): QuestionRequest["questions"][number]["options"][number] {
+		const focused = this.question.options[this.selectedRow];
+		if (focused) return focused;
+		if (this.draft?.option) {
+			const selected = this.question.options.find((option) => option.label === this.draft?.option);
+			if (selected) return selected;
+		}
+		const selectedLabel = this.draft?.selected?.values().next().value;
+		return this.question.options.find((option) => option.label === selectedLabel) ?? this.question.options[0]!;
 	}
 
 	private renderDetails(width: number, option: QuestionRequest["questions"][number]["options"][number]): string[] {
@@ -107,9 +121,24 @@ class QuestionChoicePane implements Component {
 				? ["", ...new Markdown(option.preview, 0, 0, getMarkdownTheme()).render(contentWidth)]
 				: []),
 		];
+		const maxBodyRows = Math.max(
+			body.length,
+			...this.allQuestions.flatMap((question) =>
+				question.options.map((candidate) => {
+					const candidateWidth = Math.max(1, frameWidth - 4);
+					return (
+						new Text(candidate.description, 0, 0).render(candidateWidth).length +
+						(candidate.preview
+							? 1 + new Markdown(candidate.preview, 0, 0, getMarkdownTheme()).render(candidateWidth).length
+							: 0)
+					);
+				}),
+			),
+		);
+		const paddedBody = [...body, ...Array.from({ length: maxBodyRows - body.length }, () => "")];
 		return [
 			theme.fg("borderAccent", fitLine(top, frameWidth)),
-			...body.map((line) => `│ ${fitLine(line, contentWidth)} │`),
+			...paddedBody.map((line) => `│ ${fitLine(line, contentWidth)} │`),
 			theme.fg("borderAccent", `└${"─".repeat(Math.max(0, frameWidth - 2))}┘`),
 		];
 	}
@@ -154,7 +183,7 @@ export class QuestionnaireComponent extends Container {
 
 	private isAnswered(index: number): boolean {
 		const draft = this.getDraft(index);
-		return draft !== undefined && (draft.kind !== "multi" || draft.values.size > 0);
+		return Boolean(draft?.option || draft?.selected?.size || draft?.custom?.trim());
 	}
 
 	private hasAllAnswers(): boolean {
@@ -215,12 +244,11 @@ export class QuestionnaireComponent extends Container {
 		const question = this.request.questions[state.questionIndex]!;
 		const draft = this.getDraft(state.questionIndex);
 		const mode = question.multiSelect ? "Choose one or more options" : "Choose one option";
-		this.addChild(new Text(theme.fg("accent", theme.bold(question.header)), 1, 0));
 		this.addChild(new Text(question.question, 1, 0));
 		this.addChild(new Text(theme.fg("muted", mode), 1, 0));
 		this.addChild(new Spacer(1));
 		const input = this.getCustomInput(state.questionIndex);
-		this.addChild(new QuestionChoicePane(question, state.selectedRow, draft, input));
+		this.addChild(new QuestionChoicePane(question, state.selectedRow, draft, input, this.request.questions));
 		if (this.error) this.addChild(new Text(theme.fg("error", this.error), 1, 0));
 	}
 
@@ -230,9 +258,9 @@ export class QuestionnaireComponent extends Container {
 		for (let index = 0; index < this.request.questions.length; index++) {
 			const question = this.request.questions[index]!;
 			const draft = this.getDraft(index);
-			let answer = "Unanswered";
-			if (draft?.kind === "option" || draft?.kind === "custom") answer = draft.value;
-			if (draft?.kind === "multi") answer = [...draft.values].join(", ") || "Unanswered";
+			const selection = draft?.option ?? (draft?.selected?.size ? [...draft.selected].join(", ") : undefined);
+			const custom = draft?.custom?.trim();
+			const answer = selection ? (custom ? `${selection} · “${custom}”` : selection) : custom || "Unanswered";
 			this.addRow(
 				`${this.isAnswered(index) ? "✓" : "⚠"} ${question.header}: ${answer}`,
 				false,
@@ -288,19 +316,21 @@ export class QuestionnaireComponent extends Container {
 		}
 		const option = question.options[state.selectedRow];
 		if (!option) return;
-		const existing = this.getDraft(state.questionIndex);
+		const existing = this.getDraft(state.questionIndex) ?? {};
 		if (question.multiSelect) {
-			const values = existing?.kind === "multi" ? new Set(existing.values) : new Set<string>();
-			if (values.has(option.label)) values.delete(option.label);
-			else values.add(option.label);
-			if (values.size === 0) this.drafts.delete(state.questionIndex);
-			else this.drafts.set(state.questionIndex, { kind: "multi", values });
-		} else if (existing?.kind === "option" && existing.value === option.label) {
-			this.drafts.delete(state.questionIndex);
+			const selected = new Set(existing.selected);
+			if (selected.has(option.label)) selected.delete(option.label);
+			else selected.add(option.label);
+			const next = { ...existing, selected: selected.size ? selected : undefined };
+			if (next.selected || next.custom?.trim()) this.drafts.set(state.questionIndex, next);
+			else this.drafts.delete(state.questionIndex);
+		} else if (existing.option === option.label) {
+			const next = { ...existing, option: undefined };
+			if (next.custom?.trim()) this.drafts.set(state.questionIndex, next);
+			else this.drafts.delete(state.questionIndex);
 		} else {
-			this.drafts.set(state.questionIndex, { kind: "option", value: option.label });
+			this.drafts.set(state.questionIndex, { ...existing, option: option.label });
 		}
-		this.getCustomInput(state.questionIndex).setValue("");
 		this.error = undefined;
 		this.rebuild();
 	}
@@ -311,7 +341,9 @@ export class QuestionnaireComponent extends Container {
 		const input = this.getCustomInput(state.questionIndex);
 		input.handleInput(data);
 		const value = input.getValue().trim();
-		if (value) this.drafts.set(state.questionIndex, { kind: "custom", value });
+		const existing = this.getDraft(state.questionIndex) ?? {};
+		const next = { ...existing, custom: value || undefined };
+		if (next.option || next.selected?.size || next.custom) this.drafts.set(state.questionIndex, next);
 		else this.drafts.delete(state.questionIndex);
 		this.error = undefined;
 		this.rebuild();
@@ -327,15 +359,27 @@ export class QuestionnaireComponent extends Container {
 		}
 		const answers = this.request.questions.map<QuestionAnswer>((question, index) => {
 			const draft = this.getDraft(index)!;
-			return draft.kind === "multi"
-				? {
-						questionIndex: index,
-						question: question.question,
-						kind: "multi",
-						answer: null,
-						selected: [...draft.values],
-					}
-				: { questionIndex: index, question: question.question, kind: draft.kind, answer: draft.value };
+			const notes = draft.custom?.trim() || undefined;
+			if (question.multiSelect && draft.selected?.size) {
+				return {
+					questionIndex: index,
+					question: question.question,
+					kind: "multi",
+					answer: null,
+					selected: [...draft.selected],
+					...(notes && { notes }),
+				};
+			}
+			if (!question.multiSelect && draft.option) {
+				return {
+					questionIndex: index,
+					question: question.question,
+					kind: "option",
+					answer: draft.option,
+					...(notes && { notes }),
+				};
+			}
+			return { questionIndex: index, question: question.question, kind: "custom", answer: notes! };
 		});
 		this.done({ cancelled: false, answers });
 	}

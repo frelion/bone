@@ -6,6 +6,7 @@
 
 - Added the built-in `ask_user_question` tool with persisted single-select, multi-select, custom-answer, and cancellation flows across Default and Plan modes, plus shared AgentSession, TUI, SDK, and RPC state and actions.
 - Added optional Markdown previews and a responsive choice-details pane to the structured-question TUI.
+- Improved structured questions so selected options can include supplemental custom text, question tabs no longer repeat their headers in the body, and option details keep a stable height while navigating.
 
 ## [0.1.1] - 2026-07-22
 

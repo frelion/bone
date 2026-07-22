@@ -111,6 +111,44 @@ describe("structured questions", () => {
 		]);
 	});
 
+	it("normalizes supplemental notes for selected answers", () => {
+		expect(
+			validateQuestionAnswers(request(), [
+				{
+					questionIndex: 0,
+					question: input.questions[0].question,
+					kind: "option",
+					answer: "Minimal",
+					notes: "  Keep the facade small  ",
+				},
+				{
+					questionIndex: 1,
+					question: input.questions[1].question,
+					kind: "multi",
+					answer: null,
+					selected: ["TUI"],
+					notes: "  RPC can follow later  ",
+				},
+			]),
+		).toEqual([
+			{
+				questionIndex: 0,
+				question: input.questions[0].question,
+				kind: "option",
+				answer: "Minimal",
+				notes: "Keep the facade small",
+			},
+			{
+				questionIndex: 1,
+				question: input.questions[1].question,
+				kind: "multi",
+				answer: null,
+				selected: ["TUI"],
+				notes: "RPC can follow later",
+			},
+		]);
+	});
+
 	it("allows a custom answer for a multi-select question", () => {
 		expect(
 			validateQuestionAnswers(request(), [
