@@ -112,6 +112,24 @@ describe("OpenTUI interactive shell", () => {
 		expect(createMarkdown).toHaveBeenCalledTimes(1);
 	});
 
+	test("keeps the transcript viewport and scrollbar in one continuous region", async () => {
+		initTheme("dark");
+		const renderer = await createBoneTestRenderer({ width: 100, height: 40 });
+		renderers.add(renderer);
+		renderer.start();
+		const shell = new OpenTUIInteractiveShell({ sidebarWidth: 32 });
+		renderer.mount(shell);
+
+		let lastLine: ReturnType<OpenTUIInteractiveShell["appendTranscript"]> | undefined;
+		for (let index = 0; index < 50; index++) lastLine = shell.appendTranscript(textView(`line-${index}`));
+		const transcript = shell.getTranscriptNode();
+		transcript.scrollTo(Number.MAX_SAFE_INTEGER);
+		await flushUntil(renderer, (frame) => frame.includes("line-49"));
+
+		expect(lastLine).toBeDefined();
+		expect(lastLine!.screenY + lastLine!.height).toBe(transcript.screenY + transcript.height);
+	});
+
 	test("switches between split and single-pane layouts without remounting content", async () => {
 		initTheme("dark");
 		const renderer = await createBoneTestRenderer({ width: 100, height: 24 });

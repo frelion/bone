@@ -119,7 +119,6 @@ export class OpenTUIInteractiveShell implements BoneView {
 		});
 		const header = context.createBox({ flexDirection: "column", flexShrink: 0 });
 		const transcript = context.createScrollView({
-			flexDirection: "column",
 			flexGrow: 1,
 			flexBasis: 0,
 			width: "100%",
