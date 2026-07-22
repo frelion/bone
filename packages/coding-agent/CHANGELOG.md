@@ -2,9 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added built-in governed GitLab and GitHub tools with automatic repository detection, `/settings` token configuration, self-managed GitLab capability negotiation, repository policy gates, mutation replay protection, and Plan Mode read access.
+
 ### Fixed
 
 - Bounded Forge query and watch results with compact previews, provider-side repository search, single and batch detail retrieval, uniform pagination, and a 64 KiB tool-output ceiling so large GitLab or GitHub responses cannot consume the model context.
+- Fixed Forge context output to return compact GitHub identities and probe read capabilities without parsing successful response bodies.
 
 ## [0.1.2] - 2026-07-22
 
@@ -19,7 +24,6 @@
 ### Added
 
 - Added built-in Plan Mode for read-only investigation, persisted Markdown proposals, explicit execute/revise/cancel approval, automatic execution after approval, and matching TUI, SDK, and RPC state and actions.
-- Added built-in governed GitLab and GitHub tools with self-managed GitLab capability negotiation, fine-grained token storage, repository policy gates, mutation replay protection, bounded status polling, and Plan Mode read access.
 
 ## [0.1.0] - 2026-07-21
 
@@ -106,7 +110,6 @@
 
 ### Fixed
 
-- Fixed Forge context output to return compact GitHub identities and probe read capabilities without parsing successful response bodies.
 - Fixed inherited OpenRouter model context windows to use the top provider's actual context length ([#6481](https://github.com/earendil-works/pi-mono/pull/6481) by [@davidbrai](https://github.com/davidbrai)).
 - Fixed inherited OpenRouter OpenAI-compatible session IDs to use the `x-session-id` header instead of OpenAI-specific session-affinity fields ([#6496](https://github.com/earendil-works/pi-mono/pull/6496) by [@petrroll](https://github.com/petrroll)).
 - Fixed `Ctrl+V` to paste clipboard text when the pasteboard does not contain an image.
