@@ -3770,7 +3770,7 @@ export class InteractiveMode {
 			updatePendingTools?: boolean;
 		} = {},
 	): void {
-		const branch = this.sessionManager.getBranch();
+		const branch = this.sessionManager.getBranch?.() ?? entries;
 		const sourceMessageIds = new Set(
 			branch.filter((entry) => entry.type === "plan_proposal").map((entry) => entry.proposal.sourceMessageId),
 		);
