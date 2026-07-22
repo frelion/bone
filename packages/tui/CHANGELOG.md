@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## [Unreleased]
 
 ### Breaking
 
+- Changed the supported runtime to Bun 1.3.14 or newer.
 - Replaced the legacy differential ANSI renderer with the Bun/OpenTUI structured `BoneView` and `BoneNode` boundary.
 - Removed `TUI`, `Terminal`, `StdinBuffer`, legacy components and editors, configurable keybindings, cursor markers, and terminal image protocol helpers.
 - Removed the legacy `Component`, `Editor`, and `Markdown` public contracts. Product and extension UI must use structured Bone views.
@@ -13,15 +14,11 @@
 - Retained autocomplete, fuzzy matching, terminal color parsing, and Unicode/ANSI width helpers as renderer-independent utilities.
 - Tests now run exclusively with Bun.
 
-## [Unreleased]
-
-### Breaking Changes
-
-- The package now requires Bun 1.3.14 or newer. The legacy ANSI `TUI`, `Component`, and `ProcessTerminal` APIs remain temporarily available only while coding-agent migrates and will be removed before release.
-
 ### Added
 
 - Added the OpenTUI-backed `BoneRenderer` boundary, structured render nodes, overlays, keyboard events, and an in-memory Bun test renderer.
+
+## [0.1.3] - 2026-07-22
 
 ## [0.1.2] - 2026-07-22
 

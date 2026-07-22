@@ -6,6 +6,12 @@
 
 - Changed the supported runtime to Bun 1.3.14 or newer.
 
+### Fixed
+
+- Identified OpenAI-compatible SDK requests as `bone-ai` so gateways do not reject Bone as an official OpenAI SDK client.
+
+## [0.1.3] - 2026-07-22
+
 ## [0.1.2] - 2026-07-22
 
 ## [0.1.1] - 2026-07-22

@@ -105,7 +105,7 @@ export class GitHubAdapter {
 		const capabilities = await Promise.all(
 			probes.map(async ([id, path]): Promise<ForgeCapability> => {
 				try {
-					await this.client.request<unknown>("GET", path, { signal });
+					await this.client.probe(path, { signal });
 					return { id, state: "supported" };
 				} catch (error) {
 					if (!(error instanceof ForgeError)) return { id, state: "unknown", reason: "Probe failed" };
@@ -126,7 +126,7 @@ export class GitHubAdapter {
 		signal?: AbortSignal,
 		extract?: (value: unknown) => unknown,
 	): Promise<ForgePage<GitHubResource>> {
-		const response = await this.client.request<unknown>("GET", path, { query: { per_page: 30, ...query }, signal });
+		const response = await this.client.request<unknown>("GET", path, { query: { per_page: 10, ...query }, signal });
 		const items = requireResourceList(extract ? extract(response.data) : response.data, path);
 		const cursor = nextPage(headerValue(response.headers.link));
 		return { items, nextCursor: cursor, hasMore: cursor !== undefined };
@@ -143,8 +143,37 @@ export class GitHubAdapter {
 		return requireResource(response.data, path);
 	}
 
+	private async mutateResource(
+		method: "POST" | "PATCH",
+		path: string,
+		body: GitHubWriteBody,
+		signal?: AbortSignal,
+	): Promise<GitHubResource> {
+		const response = await this.client.request<unknown>(method, path, { body, signal });
+		return requireResource(response.data, path);
+	}
+
 	listIssues(repository: string, query?: Record<string, string | number | boolean | undefined>, signal?: AbortSignal) {
 		return this.list(`/repos/${encodedRepository(repository)}/issues`, query, signal);
+	}
+
+	searchIssues(
+		repository: string,
+		search: string,
+		kind: "issue" | "pr",
+		query: Record<string, string | number | boolean | undefined> = {},
+		signal?: AbortSignal,
+	) {
+		encodedRepository(repository);
+		const { state, ...pagination } = query;
+		const normalizedState = state === "opened" ? "open" : state;
+		const stateQualifier = normalizedState === "open" || normalizedState === "closed" ? ` is:${normalizedState}` : "";
+		return this.list(
+			"/search/issues",
+			{ ...pagination, q: `${search} repo:${repository} is:${kind}${stateQualifier}` },
+			signal,
+			(value) => (typeof value === "object" && value !== null ? (value as { items?: unknown }).items : undefined),
+		);
 	}
 
 	createIssue(repository: string, body: GitHubWriteBody, signal?: AbortSignal) {
@@ -221,6 +250,17 @@ export class GitHubAdapter {
 		);
 	}
 
+	listWorkflowJobs(
+		repository: string,
+		runId: number,
+		query?: Record<string, string | number | boolean | undefined>,
+		signal?: AbortSignal,
+	) {
+		return this.list(`/repos/${encodedRepository(repository)}/actions/runs/${runId}/jobs`, query, signal, (value) =>
+			typeof value === "object" && value !== null ? (value as { jobs?: unknown }).jobs : undefined,
+		);
+	}
+
 	async rerunWorkflow(repository: string, runId: number, signal?: AbortSignal): Promise<void> {
 		await this.client.request("POST", `/repos/${encodedRepository(repository)}/actions/runs/${runId}/rerun`, {
 			body: {},
@@ -244,10 +284,15 @@ export class GitHubAdapter {
 	}
 
 	createRelease(repository: string, body: GitHubWriteBody, signal?: AbortSignal) {
-		return this.mutate("POST", `/repos/${encodedRepository(repository)}/releases`, body, signal);
+		return this.mutateResource("POST", `/repos/${encodedRepository(repository)}/releases`, body, signal);
 	}
 
 	updateRelease(repository: string, releaseId: number, body: GitHubWriteBody, signal?: AbortSignal) {
-		return this.mutate("PATCH", `/repos/${encodedRepository(repository)}/releases/${releaseId}`, body, signal);
+		return this.mutateResource(
+			"PATCH",
+			`/repos/${encodedRepository(repository)}/releases/${releaseId}`,
+			body,
+			signal,
+		);
 	}
 }

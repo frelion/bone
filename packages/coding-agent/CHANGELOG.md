@@ -12,6 +12,17 @@
 - Added isolated standalone release verification that loads OpenTUI's embedded native library before checking CLI startup.
 - Added the structured extension UI v2 contract for dialogs, widgets, chrome, editors, and tool results, with a trusted BoneView escape hatch and a machine-checkable legacy UI removal gate.
 
+## [0.1.3] - 2026-07-22
+
+### Added
+
+- Added built-in governed GitLab and GitHub tools with automatic repository detection, `/settings` token configuration, self-managed GitLab capability negotiation, repository policy gates, mutation replay protection, and Plan Mode read access.
+
+### Fixed
+
+- Bounded Forge query and watch results with compact previews, provider-side repository search, single and batch detail retrieval, uniform pagination, and a 64 KiB tool-output ceiling so large GitLab or GitHub responses cannot consume the model context.
+- Fixed Forge context output to return compact GitHub identities and probe read capabilities without parsing successful response bodies.
+
 ## [0.1.2] - 2026-07-22
 
 ### Added
@@ -25,7 +36,6 @@
 ### Added
 
 - Added built-in Plan Mode for read-only investigation, persisted Markdown proposals, explicit execute/revise/cancel approval, automatic execution after approval, and matching TUI, SDK, and RPC state and actions.
-- Added built-in governed GitLab and GitHub tools with self-managed GitLab capability negotiation, fine-grained token storage, repository policy gates, mutation replay protection, bounded status polling, and Plan Mode read access.
 
 ## [0.1.0] - 2026-07-21
 

@@ -71,12 +71,38 @@ describe("GitLab Forge adapter", () => {
 		const { adapter, mock } = createAdapter();
 		mock
 			.get("http://gitlab.internal.example")
-			.intercept({ path: "/api/v4/projects/group%2Fproject/issues?per_page=30&state=opened", method: "GET" })
+			.intercept({ path: "/api/v4/projects/group%2Fproject/issues?per_page=10&state=opened", method: "GET" })
 			.reply(200, [{ id: 8, iid: 2, title: "Issue", extra: "preserved" }], { headers: { "x-next-page": "2" } });
 
 		await expect(adapter.listIssues("group/project", { state: "opened" })).resolves.toEqual({
 			items: [{ id: 8, iid: 2, title: "Issue", extra: "preserved" }],
 			nextCursor: "2",
+			hasMore: true,
+		});
+	});
+
+	it("paginates Wiki pages, pipeline jobs, and releases with the same contract", async () => {
+		const { adapter, mock } = createAdapter();
+		const pool = mock.get("http://gitlab.internal.example");
+		for (const [path, item] of [
+			["/api/v4/projects/group%2Fproject/wikis?per_page=10&page=2", { slug: "runbook", title: "Runbook" }],
+			["/api/v4/projects/group%2Fproject/pipelines/44/jobs?per_page=10&page=2", { id: 9, name: "test" }],
+			["/api/v4/projects/group%2Fproject/releases?per_page=10&page=2", { tag_name: "v1.0.0" }],
+		] as const) {
+			pool.intercept({ path, method: "GET" }).reply(200, [item], { headers: { "x-next-page": "3" } });
+		}
+
+		const query = { per_page: 10, page: "2" };
+		await expect(adapter.listWikiPages("group/project", query)).resolves.toMatchObject({
+			nextCursor: "3",
+			hasMore: true,
+		});
+		await expect(adapter.listPipelineJobs("group/project", 44, query)).resolves.toMatchObject({
+			nextCursor: "3",
+			hasMore: true,
+		});
+		await expect(adapter.listReleases("group/project", query)).resolves.toMatchObject({
+			nextCursor: "3",
 			hasMore: true,
 		});
 	});
@@ -144,7 +170,7 @@ describe("GitLab Forge adapter", () => {
 		expect(redirectError).toBeInstanceOf(ForgeError);
 		expect((redirectError as ForgeError).code).toBe("unsafe_remote");
 
-		pool.intercept({ path: "/api/v4/projects/1/issues?per_page=30", method: "GET" }).reply(500, { message: token });
+		pool.intercept({ path: "/api/v4/projects/1/issues?per_page=10", method: "GET" }).reply(500, { message: token });
 		const apiError = await adapter.listIssues(1).catch((error: unknown) => error);
 		expect(String(apiError)).not.toContain(token);
 		expect(String(apiError)).toContain("[REDACTED]");

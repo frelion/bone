@@ -19,6 +19,21 @@ export interface ForgeHttpResponse<T> {
 	data: T;
 }
 
+export interface ForgeHttpProbeResponse {
+	status: number;
+	headers: Record<string, string | string[] | undefined>;
+}
+
+interface ForgeHttpRequestOptions {
+	query?: Record<string, string | number | boolean | undefined>;
+	body?: unknown;
+	signal?: AbortSignal;
+}
+
+interface ForgeHttpRawResponse extends ForgeHttpProbeResponse {
+	raw: string;
+}
+
 const MAX_ERROR_BODY_LENGTH = 2_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 
@@ -91,12 +106,33 @@ export class ForgeHttpClient {
 	async request<T>(
 		method: Dispatcher.HttpMethod,
 		path: string,
-		options: {
-			query?: Record<string, string | number | boolean | undefined>;
-			body?: unknown;
-			signal?: AbortSignal;
-		} = {},
+		options: ForgeHttpRequestOptions = {},
 	): Promise<ForgeHttpResponse<T>> {
+		const response = await this.requestRaw(method, path, options);
+		let data: T;
+		try {
+			data = (response.raw.length === 0 ? undefined : JSON.parse(response.raw)) as T;
+		} catch (error) {
+			throw new ForgeError(
+				"invalid_remote_response",
+				"Forge API returned invalid JSON",
+				{ status: response.status },
+				{ cause: error },
+			);
+		}
+		return { status: response.status, headers: response.headers, data };
+	}
+
+	async probe(path: string, options: Pick<ForgeHttpRequestOptions, "signal"> = {}): Promise<ForgeHttpProbeResponse> {
+		const response = await this.requestRaw("GET", path, options);
+		return { status: response.status, headers: response.headers };
+	}
+
+	private async requestRaw(
+		method: Dispatcher.HttpMethod,
+		path: string,
+		options: ForgeHttpRequestOptions,
+	): Promise<ForgeHttpRawResponse> {
 		const requestUrl = new URL(path, "https://forge.invalid");
 		const target = new URL(this.baseUrl);
 		const basePath = target.pathname.replace(/\/$/, "");
@@ -163,18 +199,7 @@ export class ForgeHttpClient {
 				);
 			}
 
-			let data: T;
-			try {
-				data = (raw.length === 0 ? undefined : JSON.parse(raw)) as T;
-			} catch (error) {
-				throw new ForgeError(
-					"invalid_remote_response",
-					"Forge API returned invalid JSON",
-					{ status: response.statusCode },
-					{ cause: error },
-				);
-			}
-			return { status: response.statusCode, headers: response.headers, data };
+			return { status: response.statusCode, headers: response.headers, raw };
 		} catch (error) {
 			if (error instanceof ForgeError) throw error;
 			const message = error instanceof Error ? error.message : String(error);

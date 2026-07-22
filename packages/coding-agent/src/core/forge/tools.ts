@@ -1,6 +1,7 @@
 import { type TSchema, Type } from "typebox";
 import type { AgentToolResult, ToolDefinition } from "../extensions/types.ts";
 import { wrapToolDefinitions } from "../tools/tool-definition-wrapper.ts";
+import { boundedForgeToolResult, MAX_FORGE_BATCH_IDS, MAX_FORGE_QUERY_LIMIT } from "./result.ts";
 import { createForgeService } from "./service.ts";
 
 export const FORGE_READ_TOOL_NAMES = ["forge_context", "forge_query", "forge_audit", "forge_watch"] as const;
@@ -72,11 +73,37 @@ const querySchema = Type.Object({
 		],
 		{ description: "Resource type to retrieve" },
 	),
-	id: Type.Optional(Type.Union([Type.String(), Type.Number()])),
+	id: Type.Optional(
+		Type.Union([Type.String(), Type.Number()], {
+			description: "Retrieve one bounded detail record instead of a list",
+		}),
+	),
+	ids: Type.Optional(
+		Type.Array(Type.Union([Type.String(), Type.Number()]), {
+			minItems: 1,
+			maxItems: MAX_FORGE_BATCH_IDS,
+			description: "Retrieve 1 to 5 bounded detail records for comparison",
+		}),
+	),
+	parentId: Type.Optional(
+		Type.Union([Type.String(), Type.Number()], { description: "Parent pipeline or workflow run id for job lists" }),
+	),
 	state: Type.Optional(Type.String()),
-	search: Type.Optional(Type.String()),
-	cursor: Type.Optional(Type.String()),
-	limit: Type.Optional(Type.Number({ minimum: 1, maximum: 100 })),
+	search: Type.Optional(
+		Type.String({
+			minLength: 1,
+			maxLength: 512,
+			description: "Provider-side text search within the current repository",
+		}),
+	),
+	cursor: Type.Optional(Type.String({ description: "Opaque nextCursor from the preceding list result" })),
+	limit: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: MAX_FORGE_QUERY_LIMIT,
+			description: "List size; defaults to 10 and cannot exceed 50",
+		}),
+	),
 });
 
 const auditSchema = Type.Object({
@@ -146,7 +173,7 @@ const specs: ForgeToolSpec[] = [
 		name: "forge_context",
 		label: "Forge context",
 		description:
-			"Resolve the GitLab or GitHub repository, instance version, identity, permissions, and negotiated capabilities.",
+			"Resolve the GitLab or GitHub repository, instance version, identity, and negotiated read capabilities.",
 		promptSnippet: "Inspect repository hosting context and capabilities",
 		parameters: contextSchema,
 	},
@@ -226,11 +253,6 @@ const specs: ForgeToolSpec[] = [
 	},
 ];
 
-function formatResult(value: unknown): string {
-	if (typeof value === "string") return value;
-	return JSON.stringify(value, null, 2) ?? "null";
-}
-
 export function createForgeToolDefinitions(
 	options: CreateForgeToolDefinitionsOptions,
 ): Record<ForgeToolName, ToolDefinition> {
@@ -256,7 +278,8 @@ export function createForgeToolDefinitions(
 						confirm: (title, message) =>
 							extensionContext?.uiV2?.dialogs.confirm({ title, message }) ?? Promise.resolve(false),
 					});
-					return { content: [{ type: "text", text: formatResult(result) }], details: result };
+					const bounded = boundedForgeToolResult(result);
+					return { content: [{ type: "text", text: bounded.text }], details: bounded.value };
 				},
 			};
 			return [spec.name, definition];
