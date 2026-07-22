@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the built-in `ask_user_question` tool with persisted single-select, multi-select, custom-answer, and cancellation flows across Default and Plan modes, plus shared AgentSession, TUI, SDK, and RPC state and actions.
+
 ## [0.1.1] - 2026-07-22
 
 ### Added

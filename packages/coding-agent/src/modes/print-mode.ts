@@ -104,6 +104,8 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe = session.subscribe((event) => {
 			if (mode === "json") {
 				writeRawStdout(`${JSON.stringify(event)}\n`);
+			} else if (event.type === "question_asked") {
+				writeRawStdout(`${JSON.stringify(event)}\n`);
 			}
 		});
 	};

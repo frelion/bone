@@ -458,6 +458,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					pendingMessageCount: session.pendingMessageCount,
 					collaborationMode: session.collaborationMode,
 					planState: session.planState,
+					questionState: session.questionState,
 				};
 				return success(id, "get_state", state);
 			}
@@ -481,6 +482,16 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			case "cancel_plan": {
 				session.cancelPlan(command.proposalId);
 				return success(id, "cancel_plan");
+			}
+
+			case "answer_question": {
+				session.answerQuestion(command.requestId, command.answers);
+				return success(id, "answer_question");
+			}
+
+			case "cancel_question": {
+				session.cancelQuestion(command.requestId, command.reason ?? "user");
+				return success(id, "cancel_question");
 			}
 
 			// =================================================================
@@ -732,6 +743,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
+		if (session.questionState.status === "awaitingAnswer") {
+			try {
+				session.cancelQuestion(session.questionState.request.id, "client_disconnect");
+			} catch {
+				// Shutdown must continue even if session persistence has become unavailable.
+			}
+		}
 		await runtimeHost.dispose();
 		detachInput();
 		process.stdin.pause();
