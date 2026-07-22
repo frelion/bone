@@ -177,4 +177,22 @@ describe("OpenTUI composer", () => {
 		expect(renderer.captureFrame()).toContain("Updated prompt");
 		expect(composer.value).toBe("");
 	});
+
+	test("keeps public state updates safe after the native edit buffer is destroyed", async () => {
+		const { renderer, composer } = await mountComposer();
+		await renderer.input.typeText("draft survives teardown");
+		renderer.destroy();
+
+		expect(composer.value).toBe("draft survives teardown");
+		expect(() => composer.focus()).not.toThrow();
+		expect(() => composer.blur()).not.toThrow();
+		expect(() => composer.setPlaceholder("Next prompt")).not.toThrow();
+		initTheme("light");
+		expect(() => composer.updateTheme(theme)).not.toThrow();
+		expect(() => composer.setAutocompleteProvider(undefined)).not.toThrow();
+		expect(composer.selectedAutocompleteItem).toBeUndefined();
+		expect(() => composer.setValue("updated after teardown")).not.toThrow();
+		expect(composer.value).toBe("updated after teardown");
+		expect(() => composer.destroy()).not.toThrow();
+	});
 });

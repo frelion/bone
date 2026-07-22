@@ -289,8 +289,12 @@ describe("OpenTUI Bone renderer", () => {
 	it("supports resize, key unsubscribe, clear, and destroy", async () => {
 		const renderer = await createRenderer();
 		let keyEvents = 0;
+		let resized: { width: number; height: number } | undefined;
 		const unsubscribe = renderer.onKey(() => {
 			keyEvents++;
+		});
+		const unsubscribeResize = renderer.onResize((width, height) => {
+			resized = { width, height };
 		});
 		const text: BoneTextNode = renderer.createText({ content: "wide" });
 		renderer.content.append(text);
@@ -303,6 +307,8 @@ describe("OpenTUI Bone renderer", () => {
 		assert.equal(keyEvents, 1);
 		assert.equal(renderer.width, 28);
 		assert.equal(renderer.height, 8);
+		assert.deepEqual(resized, { width: 28, height: 8 });
+		unsubscribeResize();
 		renderer.content.clear();
 		assert.equal(renderer.content.childCount, 0);
 		assert.equal(text.destroyed, true);

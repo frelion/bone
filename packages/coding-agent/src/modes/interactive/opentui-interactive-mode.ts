@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import type { ImageContent } from "@frelion/bone-ai/compat";
 import { type AutocompleteProvider, type BoneRenderer, createBoneRenderer } from "@frelion/bone-tui";
 import type { AgentSessionEvent, PromptOptions } from "../../core/agent-session.ts";
@@ -12,6 +12,7 @@ import { MemoryRuntime } from "../../core/memory.ts";
 import type { PlanProposal } from "../../core/plan-mode.ts";
 import type { QuestionAnswer, QuestionRequest } from "../../core/question.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
+import { OpenTUITopBar } from "./components/opentui-chrome.ts";
 import { OpenTUIComposer } from "./components/opentui-composer.ts";
 import { OpenTUIStatusView } from "./components/opentui-rich-messages.ts";
 import { OpenTUISessionSidebar } from "./components/opentui-session-sidebar.ts";
@@ -114,6 +115,7 @@ export class OpenTUIInteractiveMode {
 	private renderer: BoneRenderer | undefined;
 	private shell: OpenTUIInteractiveShell | undefined;
 	private composer: OpenTUIComposer | undefined;
+	private topBar: OpenTUITopBar | undefined;
 	private sidebar: OpenTUISessionSidebar | undefined;
 	private paneFocus: OpenTUIPaneFocusController | undefined;
 	private transcriptFocus: OpenTUITranscriptFocusController | undefined;
@@ -226,7 +228,9 @@ export class OpenTUIInteractiveMode {
 		this.status = new OpenTUIStatusView("working", "Ready");
 		this.status.stop();
 		const regions = this.shell.getExtensionRegions();
-		this.renderer.mount(this.status, regions.header);
+		this.topBar = new OpenTUITopBar(this.getTopBarState(this.sessionHost.current));
+		this.renderer.mount(this.topBar, regions.header);
+		this.renderer.mount(this.status, regions.aboveEditor);
 		this.composer = new OpenTUIComposer({
 			autocompleteProvider: this.options.autocompleteProvider ?? this.commandRouter.createAutocompleteProvider(),
 			onSubmit: (text) => {
@@ -236,7 +240,9 @@ export class OpenTUIInteractiveMode {
 		});
 		const composerNode = this.renderer.mount(this.composer, regions.editor);
 
-		this.paneFocus = new OpenTUIPaneFocusController(this.renderer);
+		this.paneFocus = new OpenTUIPaneFocusController(this.renderer, (pane) =>
+			this.shell?.showPane(pane === "sidebar" ? "sidebar" : "main"),
+		);
 		this.transcriptFocus = new OpenTUITranscriptFocusController(
 			this.shell.getTranscriptNode(),
 			() => this.renderer?.height ?? 24,
@@ -394,6 +400,7 @@ export class OpenTUIInteractiveMode {
 				.catch((error: unknown) => this.showInteractionError(error));
 		});
 		this.renderer.requestRender();
+		this.topBar?.update(this.getTopBarState(runtime));
 		this.rememberActiveConversation(runtime);
 		if (this.initialized) this.schedulePendingInteractions(runtime, generation);
 	}
@@ -483,6 +490,8 @@ export class OpenTUIInteractiveMode {
 		this.sidebar?.updateTheme(theme);
 		this.composer?.updateTheme(theme);
 		this.status?.updateTheme(theme);
+		this.topBar?.updateTheme(theme);
+		this.topBar?.update(this.getTopBarState(this.sessionHost.current));
 		await this.renderTranscript(this.sessionHost.current);
 		this.renderer?.requestRender();
 	}
@@ -507,6 +516,9 @@ export class OpenTUIInteractiveMode {
 		}
 		const mutation = await this.transcriptFactory.handleEvent(event);
 		if (mutation.type === "append") this.shell.appendTranscript(mutation.item.view);
+		if (event.type === "session_info_changed" || event.type === "thinking_level_changed") {
+			this.topBar?.update(this.getTopBarState(runtime));
+		}
 		this.renderer?.requestRender();
 		if (event.type === "question_asked") {
 			this.launchInteraction(() => this.reviewPendingQuestion(runtime, this.foregroundGeneration));
@@ -749,6 +761,16 @@ export class OpenTUIInteractiveMode {
 		this.renderer?.requestRender();
 	}
 
+	private getTopBarState(runtime: AgentSessionRuntime) {
+		const model = runtime.session.model;
+		return {
+			conversation: runtime.session.sessionName?.trim() || "New conversation",
+			workspace: basename(runtime.cwd) || runtime.cwd,
+			model: model ? `${model.provider}/${model.id}` : "No model",
+			thinking: runtime.session.thinkingLevel ?? "off",
+		};
+	}
+
 	private async submit(text: string, options?: PromptOptions): Promise<void> {
 		const value = text.trim();
 		if (!value) return;
@@ -987,6 +1009,8 @@ export class OpenTUIInteractiveMode {
 			this.unsubscribeApplicationKeys?.();
 			this.unsubscribeApplicationKeys = undefined;
 			this.paneFocus?.dispose();
+			this.topBar?.dispose();
+			this.shell?.dispose();
 			this.composer?.destroy();
 			this.renderer?.stop();
 			this.renderer?.destroy();

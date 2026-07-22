@@ -11,6 +11,12 @@
 
 - Added isolated standalone release verification that loads OpenTUI's embedded native library before checking CLI startup.
 - Added the structured extension UI v2 contract for dialogs, widgets, chrome, editors, and tool results, with a trusted BoneView escape hatch and a machine-checkable legacy UI removal gate.
+- Redesigned the OpenTUI workspace with responsive split and single-pane layouts, compact conversation navigation, bounded transcript width, stable composer chrome, and narrow-terminal dialogs.
+- Updated streaming assistant messages in place instead of rebuilding their Markdown nodes for every token.
+
+### Fixed
+
+- Fixed interactive shutdown when OpenTUI destroys the native edit buffer before application cleanup reads the current draft.
 
 ## [0.1.3] - 2026-07-22
 

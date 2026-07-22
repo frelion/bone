@@ -1,4 +1,5 @@
 import type { BoneContainerNode, BoneNode, BoneRenderContext, BoneTextNode, BoneView } from "@frelion/bone-tui";
+import { resolveOpenTUIDialogLayout } from "../opentui-design.ts";
 import { type Theme, theme } from "../theme/theme.ts";
 
 export interface OpenTUIDialogShellOptions {
@@ -22,13 +23,15 @@ export function createOpenTUIDialogShell(
 	options: OpenTUIDialogShellOptions,
 ): OpenTUIDialogMount {
 	const dialogTheme = options.theme ?? theme;
+	const responsiveLayout = resolveOpenTUIDialogLayout(context.width, context.height);
 	const root = context.createBox({
-		width: options.width ?? "72%",
-		maxHeight: options.maxHeight ?? "88%",
+		width: options.width ?? responsiveLayout.width,
+		height: responsiveLayout.height,
+		maxHeight: options.maxHeight ?? responsiveLayout.maxHeight,
 		flexDirection: "column",
 		padding: 1,
 		border: true,
-		borderStyle: "rounded",
+		borderStyle: "single",
 		borderColor: dialogTheme.getFgColor("borderAccent"),
 		backgroundColor: dialogTheme.getBgColor("customMessageBg"),
 		focusable: true,

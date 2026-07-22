@@ -1,5 +1,12 @@
 import type { AssistantMessage } from "@frelion/bone-ai";
-import type { BoneContainerNode, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import type {
+	BoneContainerNode,
+	BoneMarkdownNode,
+	BoneNode,
+	BoneRenderContext,
+	BoneTextNode,
+	BoneView,
+} from "@frelion/bone-tui";
 import type { PlanProposal } from "../../../core/plan-mode.ts";
 import { PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG } from "../../../core/plan-mode.ts";
 import { type Theme, theme } from "../theme/theme.ts";
@@ -54,19 +61,25 @@ export class OpenTUIUserMessage implements BoneView {
 	}
 
 	mount(context: BoneRenderContext): BoneNode {
-		const box = context.createBox({
-			flexDirection: "column",
-			paddingX: this.outputPad,
-			paddingY: 1,
-			backgroundColor: this.messageTheme.getBgColor("userMessageBg"),
-		});
-		box.append(
+		const root = context.createBox({ flexDirection: "column" });
+		appendSpacer(context, root);
+		const body = context.createBox({ flexDirection: "column", paddingX: this.outputPad });
+		body.append(
+			context.createText({
+				content: "YOU",
+				fg: this.messageTheme.getFgColor("accent"),
+				bold: true,
+				height: 1,
+			}),
+		);
+		body.append(
 			context.createMarkdown({
 				content: this.text,
 				fg: this.messageTheme.getFgColor("userMessageText"),
 			}),
 		);
-		return box;
+		root.append(body);
+		return root;
 	}
 }
 
@@ -78,12 +91,21 @@ export interface OpenTUIAssistantMessageOptions {
 	theme?: Theme;
 }
 
+type AssistantSegmentKind = "text" | "thinking" | "thinking-label" | "error";
+
+interface AssistantSegment {
+	kind: AssistantSegmentKind;
+	content: string;
+}
+
 export class OpenTUIAssistantMessage implements BoneView {
 	private message: AssistantMessage;
 	private readonly options: Required<Omit<OpenTUIAssistantMessageOptions, "theme">>;
 	private readonly messageTheme: Theme;
 	private context: BoneRenderContext | undefined;
 	private root: BoneContainerNode | undefined;
+	private renderedKinds: AssistantSegmentKind[] = [];
+	private renderedNodes: Array<BoneMarkdownNode | BoneTextNode> = [];
 
 	constructor(message: AssistantMessage, options: OpenTUIAssistantMessageOptions = {}) {
 		this.message = message;
@@ -112,29 +134,14 @@ export class OpenTUIAssistantMessage implements BoneView {
 		const context = this.context;
 		const root = this.root;
 		if (!context || !root) return;
-		root.clear();
-
+		const segments: AssistantSegment[] = [];
 		const visibleTextParts = this.options.hideProposedPlan ? getVisibleTextParts(this.message) : undefined;
-		const hasVisibleContent = this.message.content.some((content, index) =>
-			content.type === "text"
-				? (visibleTextParts?.get(index) ?? content.text).trim()
-				: content.type === "thinking" && content.thinking.trim(),
-		);
-		if (hasVisibleContent) appendSpacer(context, root);
-
 		for (let index = 0; index < this.message.content.length; index++) {
 			const content = this.message.content[index]!;
 			if (content.type === "text") {
 				const visibleText = visibleTextParts?.get(index) ?? content.text;
 				if (!visibleText.trim()) continue;
-				root.append(
-					context.createMarkdown({
-						content: visibleText.trim(),
-						paddingX: this.options.outputPad,
-						fg: this.messageTheme.getFgColor("text"),
-						streaming: this.message.stopReason === undefined,
-					}),
-				);
+				segments.push({ kind: "text", content: visibleText.trim() });
 				continue;
 			}
 			if (content.type !== "thinking") continue;
@@ -149,23 +156,9 @@ export class OpenTUIAssistantMessage implements BoneView {
 			if (thinkingBlocks.length === 0) continue;
 
 			if (this.options.hideThinkingBlock) {
-				root.append(
-					context.createText({
-						content: this.options.hiddenThinkingLabel,
-						paddingX: this.options.outputPad,
-						fg: this.messageTheme.getFgColor("thinkingText"),
-						italic: true,
-					}),
-				);
+				segments.push({ kind: "thinking-label", content: this.options.hiddenThinkingLabel });
 			} else {
-				root.append(
-					context.createMarkdown({
-						content: thinkingBlocks.join("\n\n"),
-						paddingX: this.options.outputPad,
-						fg: this.messageTheme.getFgColor("thinkingText"),
-						streaming: this.message.stopReason === undefined,
-					}),
-				);
+				segments.push({ kind: "thinking", content: thinkingBlocks.join("\n\n") });
 			}
 		}
 
@@ -182,16 +175,56 @@ export class OpenTUIAssistantMessage implements BoneView {
 		} else if (!hasToolCalls && this.message.stopReason === "error") {
 			error = `Error: ${this.message.errorMessage || "Unknown error"}`;
 		}
-		if (error) {
-			appendSpacer(context, root);
-			root.append(
-				context.createText({
-					content: error,
-					paddingX: this.options.outputPad,
-					fg: this.messageTheme.getFgColor("error"),
-					wrapMode: "word",
-				}),
-			);
+		if (error) segments.push({ kind: "error", content: error });
+
+		const kinds = segments.map((segment) => segment.kind);
+		if (
+			kinds.length === this.renderedKinds.length &&
+			kinds.every((kind, index) => kind === this.renderedKinds[index]) &&
+			this.renderedNodes.every((node) => !node.destroyed)
+		) {
+			for (let index = 0; index < segments.length; index++) {
+				const node = this.renderedNodes[index];
+				if (!node) continue;
+				node.content = segments[index]!.content;
+				if ("streaming" in node) node.streaming = this.message.stopReason === undefined;
+			}
+			return;
+		}
+
+		root.clear();
+		this.renderedKinds = kinds;
+		this.renderedNodes = [];
+		if (segments.length === 0) return;
+		appendSpacer(context, root);
+		root.append(
+			context.createText({
+				content: "BONE",
+				paddingX: this.options.outputPad,
+				fg: this.messageTheme.getFgColor("muted"),
+				bold: true,
+				height: 1,
+			}),
+		);
+		for (const segment of segments) {
+			if (segment.kind === "error" && segments.length > 1) appendSpacer(context, root);
+			const node =
+				segment.kind === "thinking-label" || segment.kind === "error"
+					? context.createText({
+							content: segment.content,
+							paddingX: this.options.outputPad,
+							fg: this.messageTheme.getFgColor(segment.kind === "error" ? "error" : "thinkingText"),
+							italic: segment.kind === "thinking-label",
+							wrapMode: "word",
+						})
+					: context.createMarkdown({
+							content: segment.content,
+							paddingX: this.options.outputPad,
+							fg: this.messageTheme.getFgColor(segment.kind === "thinking" ? "thinkingText" : "text"),
+							streaming: this.message.stopReason === undefined,
+						});
+			this.renderedNodes.push(node);
+			root.append(node);
 		}
 	}
 }

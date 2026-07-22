@@ -1,6 +1,6 @@
 import type { AssistantMessage } from "@frelion/bone-ai";
 import { type BoneRenderContext, type BoneView, createBoneTestRenderer } from "@frelion/bone-tui";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
 	OpenTUIAssistantMessage,
 	OpenTUIPlanProposal,
@@ -98,6 +98,7 @@ describe("OpenTUI interactive shell", () => {
 		renderer.start();
 		const shell = new OpenTUIInteractiveShell({ sidebarWidth: 20 });
 		renderer.mount(shell);
+		const createMarkdown = vi.spyOn(renderer, "createMarkdown");
 		const assistant = new OpenTUIAssistantMessage(assistantMessage("first chunk"));
 		shell.appendTranscript(assistant);
 
@@ -108,5 +109,34 @@ describe("OpenTUI interactive shell", () => {
 
 		expect(finalFrame).toContain("final response");
 		expect(finalFrame).not.toContain("first chunk");
+		expect(createMarkdown).toHaveBeenCalledTimes(1);
+	});
+
+	test("switches between split and single-pane layouts without remounting content", async () => {
+		initTheme("dark");
+		const renderer = await createBoneTestRenderer({ width: 100, height: 24 });
+		renderers.add(renderer);
+		renderer.start();
+		const shell = new OpenTUIInteractiveShell();
+		renderer.mount(shell);
+		shell.setSidebar(textView("CONVERSATIONS\ncurrent"));
+		shell.appendTranscript(textView("responsive transcript"));
+
+		expect(await flushUntil(renderer, (frame) => frame.includes("responsive transcript"))).toContain("CONVERSATIONS");
+		expect(shell.layoutMode).toBe("split");
+
+		renderer.resize(70, 18);
+		const compactMain = await flushUntil(renderer, (frame) => frame.includes("responsive transcript"));
+		expect(shell.layoutMode).toBe("single");
+		expect(compactMain).not.toContain("CONVERSATIONS");
+
+		shell.showPane("sidebar");
+		const compactSidebar = await flushUntil(renderer, (frame) => frame.includes("CONVERSATIONS"));
+		expect(compactSidebar).not.toContain("responsive transcript");
+
+		shell.showPane("main");
+		expect(await flushUntil(renderer, (frame) => frame.includes("responsive transcript"))).not.toContain(
+			"CONVERSATIONS",
+		);
 	});
 });

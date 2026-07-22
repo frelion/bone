@@ -426,7 +426,7 @@ describe("OpenTUIInteractiveMode", () => {
 		await settle(renderer);
 		renderer.input.pressKey("/");
 		await settle(renderer);
-		expect(renderer.captureFrame()).toContain("Search conversations");
+		expect(renderer.captureFrame()).toContain("SEARCH");
 		await renderer.input.typeText("indexed");
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 120));
 		await settle(renderer);

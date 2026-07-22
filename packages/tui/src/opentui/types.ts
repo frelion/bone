@@ -366,6 +366,8 @@ export interface BoneSpacerOptions extends BoneNodeOptions {
 }
 
 export interface BoneRenderContext {
+	readonly width: number;
+	readonly height: number;
 	createBox(options?: BoneBoxOptions): BoneContainerNode;
 	createText(options?: BoneTextOptions): BoneTextNode;
 	createScrollView(options?: BoneScrollViewOptions): BoneScrollViewNode;
@@ -376,6 +378,7 @@ export interface BoneRenderContext {
 	createInput(options?: BoneInputOptions): BoneInputNode;
 	createSelect<Value = string>(options?: BoneSelectOptions<Value>): BoneSelectNode<Value>;
 	createSpacer(options?: BoneSpacerOptions): BoneNode;
+	onResize(listener: BoneResizeListener): BoneUnsubscribe;
 }
 
 export interface BoneView {
@@ -398,6 +401,7 @@ export interface BoneKeyEvent {
 
 export type BoneKeyListener = (event: BoneKeyEvent) => void;
 export type BoneUnsubscribe = () => void;
+export type BoneResizeListener = (width: number, height: number) => void;
 export type BoneOverlayAnchor =
 	| "center"
 	| "top-left"
@@ -418,6 +422,7 @@ export interface BoneOverlayOptions {
 	margin?: number;
 	captureFocus?: boolean;
 	zIndex?: number;
+	backdropColor?: BoneColor;
 }
 
 export interface BoneOverlayHandle {
@@ -425,6 +430,7 @@ export interface BoneOverlayHandle {
 	hide(): void;
 	show(): void;
 	focus(): void;
+	update(options: BoneOverlayOptions): void;
 	close(): void;
 	readonly hidden: boolean;
 }
@@ -444,8 +450,6 @@ export interface BoneRenderer extends BoneRenderContext {
 	readonly root: BoneContainerNode;
 	readonly content: BoneContainerNode;
 	readonly overlays: BoneContainerNode;
-	readonly width: number;
-	readonly height: number;
 	readonly running: boolean;
 	mount(view: BoneView, parent?: BoneContainerNode): BoneNode;
 	showOverlay(node: BoneNode, options?: BoneOverlayOptions): BoneOverlayHandle;

@@ -339,6 +339,7 @@ export class OpenTUIStatusView extends RebuildableView {
 
 	setMessage(message: string): void {
 		this.message = message;
+		this.active = message !== "Ready";
 		this.rebuild();
 	}
 
@@ -360,10 +361,13 @@ export class OpenTUIStatusView extends RebuildableView {
 	protected rebuild(): void {
 		if (!this.context || !this.root) return;
 		this.root.clear();
-		const spinner = this.active ? ["|", "/", "-", "\\"][this.frame % 4] : "·";
+		this.root.visible = this.message !== "Ready";
+		if (!this.root.visible) return;
+		const spinner = this.active ? ["◐", "◓", "◑", "◒"][this.frame % 4] : "·";
 		this.root.append(
 			this.context.createText({
 				content: `${spinner} ${this.message}`,
+				paddingX: 1,
 				fg: this.viewTheme.getFgColor(this.kind === "retry" ? "warning" : "accent"),
 			}),
 		);

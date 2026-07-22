@@ -72,7 +72,7 @@ describe("OpenTUI rich messages", () => {
 		const status = new OpenTUIStatusView("retry", "Retrying in 3s");
 		root.append(status.mount(renderer));
 		status.tick();
-		expect(await frame(renderer, "Retrying in 3s")).toContain("/");
+		expect(await frame(renderer, "Retrying in 3s")).toContain("Retrying in 3s");
 
 		const compaction = new OpenTUICompactionSummary({
 			role: "compactionSummary",

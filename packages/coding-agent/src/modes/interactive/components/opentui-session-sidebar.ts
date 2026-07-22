@@ -11,7 +11,6 @@ import type { InteractiveSessionSummary } from "../../../core/interactive-sessio
 import type { MemorySearchResult } from "../../../core/memory.ts";
 import { matchesOpenTUIAction } from "../opentui-keymap.ts";
 import { type Theme, type ThemeColor, theme } from "../theme/theme.ts";
-import { formatConversationActivityTime, formatConversationCreatedTime } from "./conversation-time.ts";
 
 const STATE_ICON: Record<InteractiveSessionSummary["state"], string> = {
 	foreground: "●",
@@ -303,14 +302,15 @@ export class OpenTUISessionSidebar implements BoneView {
 		const displayedSessions = this.getDisplayedSessions();
 		const header = context.createBox({
 			width: "100%",
-			height: 1,
+			height: 2,
 			flexDirection: "row",
+			alignItems: "center",
 			justifyContent: "space-between",
 		});
 		header.append(
 			context.createText({
-				content: this.searchActive ? "Search conversations" : "Conversations",
-				fg: this.sidebarTheme.getFgColor("accent"),
+				content: this.searchActive ? "SEARCH" : "CONVERSATIONS",
+				fg: this.sidebarTheme.getFgColor("muted"),
 				bold: true,
 				truncate: true,
 				flexShrink: 1,
@@ -386,7 +386,7 @@ export class OpenTUISessionSidebar implements BoneView {
 			const row = context.createBox({
 				width: "100%",
 				flexDirection: "column",
-				paddingY: 1,
+				marginBottom: 1,
 				backgroundColor: selected ? this.sidebarTheme.getBgColor("sidebarSelectedBg") : undefined,
 				onMouseDown: (event) => {
 					this.selectedIndex = index;
@@ -396,7 +396,14 @@ export class OpenTUISessionSidebar implements BoneView {
 					event.stopPropagation();
 				},
 			});
-			const titleRow = context.createBox({ width: "100%", flexDirection: "row", gap: 1 });
+			const titleRow = context.createBox({ width: "100%", height: 1, flexDirection: "row", gap: 1 });
+			titleRow.append(
+				context.createText({
+					content: selected ? "›" : " ",
+					fg: this.sidebarTheme.getFgColor(selected ? "accent" : "muted"),
+					flexShrink: 0,
+				}),
+			);
 			titleRow.append(
 				context.createText({
 					content: STATE_ICON[session.state],
@@ -407,10 +414,8 @@ export class OpenTUISessionSidebar implements BoneView {
 			const title = normalizePreview(session.name ?? session.firstMessage) || "(empty conversation)";
 			titleRow.append(
 				context.createText({
-					content: confirming ? "Delete? Enter confirm · Esc cancel" : (status?.message ?? title),
-					fg: this.sidebarTheme.getFgColor(
-						confirming ? "error" : status?.tone === "error" ? "error" : status ? "accent" : "text",
-					),
+					content: title,
+					fg: this.sidebarTheme.getFgColor(confirming ? "error" : status?.tone === "error" ? "error" : "text"),
 					bold: selected,
 					truncate: true,
 					flexGrow: 1,
@@ -423,32 +428,35 @@ export class OpenTUISessionSidebar implements BoneView {
 					: session.state === "background-waiting"
 						? "wait"
 						: undefined;
-			const activity = formatConversationActivityTime(session.modified);
-			titleRow.append(
-				context.createText({
-					content: stateLabel ? `${activity} · ${stateLabel}` : activity,
-					fg: this.sidebarTheme.getFgColor("dim"),
-					flexShrink: 0,
-				}),
-			);
+			if (stateLabel) {
+				titleRow.append(
+					context.createText({
+						content: stateLabel,
+						fg: this.sidebarTheme.getFgColor("dim"),
+						flexShrink: 0,
+					}),
+				);
+			}
 			row.append(titleRow);
 
 			if (confirming) {
 				row.append(
-					context.createText({ content: "Delete this conversation?", fg: this.sidebarTheme.getFgColor("error") }),
-				);
-				row.append(
-					context.createText({ content: "Enter confirm · Esc cancel", fg: this.sidebarTheme.getFgColor("muted") }),
+					context.createText({
+						content: "Delete this conversation?",
+						paddingLeft: 4,
+						fg: this.sidebarTheme.getFgColor("error"),
+						truncate: true,
+					}),
 				);
 			} else if (status) {
 				row.append(
 					context.createText({
 						content: status.message,
+						paddingLeft: 4,
 						fg: this.sidebarTheme.getFgColor(status.tone === "error" ? "error" : "accent"),
 						truncate: true,
 					}),
 				);
-				row.append(this.createMetadata(context, session));
 			} else {
 				const result = this.searchResults?.find((candidate) => candidate.sessionPath === session.path);
 				const titleEvidence = result?.evidence.kind === "title";
@@ -464,23 +472,19 @@ export class OpenTUISessionSidebar implements BoneView {
 				);
 				row.append(
 					context.createText({
-						content: preview ? `${role} · ${preview}` : titleEvidence ? "Title match" : "No messages yet",
+						content: preview
+							? `${role} · ${preview}`
+							: titleEvidence
+								? "Title match"
+								: `${session.messageCount} ${session.messageCount === 1 ? "message" : "messages"}`,
+						paddingLeft: 4,
 						fg: this.sidebarTheme.getFgColor(preview ? "muted" : "dim"),
 						truncate: true,
 					}),
 				);
-				row.append(this.createMetadata(context, session));
 			}
 			list.append(row);
 		}
-	}
-
-	private createMetadata(context: BoneRenderContext, session: InteractiveSessionSummary): BoneNode {
-		return context.createText({
-			content: `${formatConversationCreatedTime(session.created)} · ${session.messageCount} ${session.messageCount === 1 ? "msg" : "msgs"}`,
-			fg: this.sidebarTheme.getFgColor("dim"),
-			truncate: true,
-		});
 	}
 
 	private moveSearchSelection(delta: number): void {

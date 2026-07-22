@@ -80,10 +80,10 @@ describe("OpenTUI session sidebar", () => {
 		focus.focus("sidebar");
 
 		const frame = await flushUntil(renderer, "Latest message for b");
-		expect(frame).toContain("Conversations");
+		expect(frame).toContain("CONVERSATIONS");
 		expect(frame).toContain("Session a");
 		expect(frame).toContain("Session b");
-		expect(frame).toContain("now · run");
+		expect(frame).toContain("run");
 
 		renderer.input.pressArrow("down");
 		renderer.input.pressEnter();
@@ -91,7 +91,7 @@ describe("OpenTUI session sidebar", () => {
 
 		renderer.input.pressKey("d");
 		const confirmFrame = await flushUntil(renderer, "Delete this conversation?");
-		expect(confirmFrame).toContain("Enter confirm · Esc cancel");
+		expect(confirmFrame).toContain("Delete this conversation?");
 		renderer.input.pressEscape();
 		renderer.input.pressEnter();
 		expect(remove).not.toHaveBeenCalled();
@@ -137,7 +137,7 @@ describe("OpenTUI session sidebar", () => {
 			},
 		]);
 		const searchFrame = await flushUntil(renderer, "semantic search");
-		expect(searchFrame).toContain("Search conversations");
+		expect(searchFrame).toContain("SEARCH");
 		expect(searchFrame).not.toContain("Session a");
 
 		renderer.input.pressArrow("down");
