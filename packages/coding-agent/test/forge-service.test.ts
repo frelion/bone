@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getGlobalDispatcher, MockAgent, setGlobalDispatcher } from "undici";
@@ -117,7 +117,7 @@ describe("DefaultForgeService", () => {
 		await expect(
 			service.execute(
 				"forge_query",
-				{ remote: "https://github.com/acme/widget.git", resource: "release" },
+				{ remote: "https://github.com/acme/widget.git", operation: "list", resource: "release" },
 				undefined,
 				context,
 			),
@@ -169,7 +169,7 @@ describe("DefaultForgeService", () => {
 
 		const result = await service.execute(
 			"forge_query",
-			{ remote: "https://gitlab.com/acme/widget.git", resource: "issue" },
+			{ remote: "https://gitlab.com/acme/widget.git", operation: "list", resource: "issue" },
 			undefined,
 			context,
 		);
@@ -214,6 +214,7 @@ describe("DefaultForgeService", () => {
 				{
 					remote: "https://github.com/acme/widget.git",
 					resource: "issue",
+					operation: "list",
 					search: "database deadlock",
 					state: "open",
 				},
@@ -223,6 +224,51 @@ describe("DefaultForgeService", () => {
 		).resolves.toMatchObject({
 			items: [{ number: 7, title: "Database deadlock", bodyPreview: "Relevant issue body" }],
 		});
+	});
+
+	it("maps provider-neutral pipeline states to provider status filters", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "gitlab-secret");
+		vi.stubEnv("GITHUB_TOKEN", "github-secret");
+		const gitlab = dispatcher.get("https://gitlab.com");
+		gitlab.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/pipelines?per_page=1" }).reply(200, []);
+		gitlab
+			.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/pipelines?per_page=10&status=failed" })
+			.reply(200, []);
+		const github = dispatcher.get("https://api.github.com");
+		github.intercept({ method: "GET", path: "/repos/acme/widget/actions/runs?per_page=1" }).reply(200, {
+			workflow_runs: [],
+		});
+		github
+			.intercept({ method: "GET", path: "/repos/acme/widget/actions/runs?per_page=10&status=failure" })
+			.reply(200, { workflow_runs: [] });
+		const { service, context } = harness();
+
+		await expect(
+			service.execute(
+				"forge_query",
+				{
+					remote: "https://gitlab.com/acme/widget.git",
+					operation: "list",
+					resource: "pipeline",
+					state: "failed",
+				},
+				undefined,
+				context,
+			),
+		).resolves.toMatchObject({ resource: "pipeline", items: [] });
+		await expect(
+			service.execute(
+				"forge_query",
+				{
+					remote: "https://github.com/acme/widget.git",
+					operation: "list",
+					resource: "pipeline",
+					state: "failed",
+				},
+				undefined,
+				context,
+			),
+		).resolves.toMatchObject({ resource: "pipeline", items: [] });
 	});
 
 	it("retrieves at most five issue details in a bounded batch", async () => {
@@ -241,7 +287,7 @@ describe("DefaultForgeService", () => {
 
 		const result = await service.execute(
 			"forge_query",
-			{ remote: "https://gitlab.com/acme/widget.git", resource: "issue", ids: [7, 8] },
+			{ remote: "https://gitlab.com/acme/widget.git", operation: "get_many", resource: "issue", ids: [7, 8] },
 			undefined,
 			context,
 		);
@@ -261,10 +307,15 @@ describe("DefaultForgeService", () => {
 	it("rejects oversized batches and GitHub repository-scope search qualifiers before network access", async () => {
 		vi.stubEnv("GITHUB_TOKEN", "service-secret");
 		const { service, context } = harness();
-		const common = { remote: "https://github.com/acme/widget.git", resource: "issue" };
+		const common = { remote: "https://github.com/acme/widget.git", operation: "list", resource: "issue" };
 
 		await expect(
-			service.execute("forge_query", { ...common, ids: [1, 2, 3, 4, 5, 6] }, undefined, context),
+			service.execute(
+				"forge_query",
+				{ ...common, operation: "get_many", ids: [1, 2, 3, 4, 5, 6] },
+				undefined,
+				context,
+			),
 		).rejects.toMatchObject({ code: "validation_failed" });
 		await expect(
 			service.execute("forge_query", { ...common, search: "deadlock repo:another/project" }, undefined, context),
@@ -286,7 +337,7 @@ describe("DefaultForgeService", () => {
 
 		const result = await service.execute(
 			"forge_query",
-			{ remote: "https://github.com/acme/widget.git", resource: "issue", id: 7 },
+			{ remote: "https://github.com/acme/widget.git", operation: "get", resource: "issue", id: 7 },
 			undefined,
 			context,
 		);
@@ -305,7 +356,7 @@ describe("DefaultForgeService", () => {
 		await expect(
 			service.execute(
 				"forge_query",
-				{ remote: "https://gitlab.com/acme/widget.git", resource: "issue", limit: 51 },
+				{ remote: "https://gitlab.com/acme/widget.git", operation: "list", resource: "issue", limit: 51 },
 				undefined,
 				context,
 			),
@@ -336,6 +387,271 @@ describe("DefaultForgeService", () => {
 		expect(replay).toEqual(first);
 	});
 
+	it("classifies reuse of a request id for a different mutation as a Forge conflict", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://api.github.com");
+		api.intercept({ method: "GET", path: "/repos/acme/widget/issues?per_page=1" }).reply(200, []);
+		api.intercept({ method: "POST", path: "/repos/acme/widget/issues" }).reply(201, {
+			id: 31,
+			number: 12,
+			title: "First intent",
+		});
+		const { service, context } = harness();
+		const common = {
+			remote: "https://github.com/acme/widget.git",
+			action: "create",
+			requestId: "conflicting-request",
+		};
+
+		await service.execute("forge_issue", { ...common, input: { title: "First intent" } }, undefined, context);
+		await expect(
+			service.execute("forge_issue", { ...common, input: { title: "Different intent" } }, undefined, context),
+		).rejects.toMatchObject({ code: "conflict" });
+	});
+
+	it("maps normalized issue content to GitHub request fields", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://api.github.com");
+		api.intercept({ method: "GET", path: "/repos/acme/widget/issues?per_page=1" }).reply(200, []);
+		api.intercept({
+			method: "POST",
+			path: "/repos/acme/widget/issues",
+			body: JSON.stringify({
+				title: "Agent-friendly contract",
+				body: "Normalized body",
+				labels: ["tooling"],
+				assignees: ["octo"],
+				milestone: 3,
+			}),
+		}).reply(201, {
+			id: 31,
+			number: 12,
+			title: "Agent-friendly contract",
+			body: "RAW_MUTATION_BODY_SENTINEL",
+			user: { login: "octo", token: "RAW_MUTATION_USER_SENTINEL" },
+		});
+		const { service, context } = harness();
+
+		await expect(
+			service.execute(
+				"forge_issue",
+				{
+					remote: "https://github.com/acme/widget.git",
+					action: "create",
+					requestId: "normalized-issue",
+					input: {
+						title: "Agent-friendly contract",
+						body: "Normalized body",
+						labels: ["tooling"],
+						assignees: ["octo"],
+						milestoneNumber: 3,
+					},
+				},
+				undefined,
+				context,
+			),
+		).resolves.toMatchObject({ ok: true, resource: "issue", number: 12 });
+		const journal = readFileSync(join(context.agentDir, "forge-mutations.json"), "utf8");
+		expect(journal).not.toMatch(/RAW_MUTATION_BODY_SENTINEL|RAW_MUTATION_USER_SENTINEL|"body"|"user"/);
+	});
+
+	it("resolves GitLab assignee usernames instead of silently dropping them", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://gitlab.com");
+		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/issues?per_page=1" }).reply(200, []);
+		api.intercept({ method: "GET", path: "/api/v4/users?username=alice" }).reply(200, [
+			{ id: 17, username: "alice" },
+		]);
+		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/milestones?iids%5B%5D=3&per_page=2" }).reply(
+			200,
+			[{ id: 103, iid: 3, title: "Version 1" }],
+		);
+		api.intercept({
+			method: "POST",
+			path: "/api/v4/projects/acme%2Fwidget/issues",
+			body: JSON.stringify({ title: "Assigned issue", milestone_id: 103, assignee_ids: [17] }),
+		}).reply(201, { id: 31, iid: 12, title: "Assigned issue" });
+		const { service, context } = harness();
+
+		await expect(
+			service.execute(
+				"forge_issue",
+				{
+					remote: "https://gitlab.com/acme/widget.git",
+					action: "create",
+					requestId: "assigned-issue",
+					input: { title: "Assigned issue", assignees: ["alice"], milestoneNumber: 3 },
+				},
+				undefined,
+				context,
+			),
+		).resolves.toMatchObject({ ok: true, resource: "issue", number: 12 });
+	});
+
+	it("maps normalized change branches to GitLab merge request fields", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://gitlab.com");
+		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/merge_requests?per_page=1" }).reply(200, []);
+		api.intercept({
+			method: "POST",
+			path: "/api/v4/projects/acme%2Fwidget/merge_requests",
+			body: JSON.stringify({
+				title: "Draft: Normalize branches",
+				description: "Portable input",
+				source_branch: "feature/contracts",
+				target_branch: "main",
+			}),
+		}).reply(201, { id: 70, iid: 7, title: "Normalize branches" });
+		const { service, context } = harness();
+
+		await expect(
+			service.execute(
+				"forge_change",
+				{
+					remote: "https://gitlab.com/acme/widget.git",
+					action: "create",
+					requestId: "normalized-change",
+					input: {
+						title: "Normalize branches",
+						body: "Portable input",
+						sourceBranch: "feature/contracts",
+						targetBranch: "main",
+						draft: true,
+					},
+				},
+				undefined,
+				context,
+			),
+		).resolves.toMatchObject({ ok: true, resource: "change", number: 7 });
+	});
+
+	it("maps provider-neutral squash merges to the GitLab merge API", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://gitlab.com");
+		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/merge_requests?per_page=1" }).reply(200, []);
+		api.intercept({
+			method: "PUT",
+			path: "/api/v4/projects/acme%2Fwidget/merge_requests/7/merge",
+			body: JSON.stringify({ squash: true }),
+		}).reply(200, { id: 70, iid: 7, state: "merged" });
+		const { service, context } = harness(true);
+
+		await expect(
+			service.execute(
+				"forge_change",
+				{
+					remote: "https://gitlab.com/acme/widget.git",
+					action: "merge",
+					id: 7,
+					requestId: "merge-squash-7",
+					input: { mergeMethod: "squash" },
+				},
+				undefined,
+				context,
+			),
+		).resolves.toMatchObject({ ok: true, resource: "change", number: 7, state: "merged" });
+	});
+
+	it("maps normalized pipeline variables to GitLab key-value entries", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://gitlab.com");
+		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/pipelines?per_page=1" }).reply(200, []);
+		api.intercept({
+			method: "POST",
+			path: "/api/v4/projects/acme%2Fwidget/pipeline",
+			body: JSON.stringify({ ref: "main", variables: [{ key: "DEPLOY_ENV", value: "staging" }] }),
+		}).reply(201, { id: 42, status: "pending", ref: "main" });
+		const { service, context } = harness(true);
+
+		await expect(
+			service.execute(
+				"forge_pipeline",
+				{
+					remote: "https://gitlab.com/acme/widget.git",
+					action: "trigger",
+					requestId: "pipeline-trigger",
+					input: { ref: "main", variables: [{ name: "DEPLOY_ENV", value: "staging" }] },
+				},
+				undefined,
+				context,
+			),
+		).resolves.toMatchObject({ id: 42 });
+	});
+
+	it("resolves a GitHub release tag before updating the numeric release endpoint", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://api.github.com");
+		api.intercept({ method: "GET", path: "/repos/acme/widget/releases?per_page=1" }).reply(200, []);
+		api.intercept({ method: "GET", path: "/repos/acme/widget/releases/tags/v1.2.0" }).reply(200, {
+			id: 91,
+			tag_name: "v1.2.0",
+		});
+		api.intercept({
+			method: "PATCH",
+			path: "/repos/acme/widget/releases/91",
+			body: JSON.stringify({ tag_name: "v1.2.0", name: "Version 1.2", body: "Release notes" }),
+		}).reply(200, { id: 91, tag_name: "v1.2.0", name: "Version 1.2" });
+		const { service, context } = harness(true);
+
+		await expect(
+			service.execute(
+				"forge_release",
+				{
+					remote: "https://github.com/acme/widget.git",
+					action: "update",
+					id: "v1.2.0",
+					requestId: "release-update-tag",
+					input: { name: "Version 1.2", body: "Release notes" },
+				},
+				undefined,
+				context,
+			),
+		).resolves.toMatchObject({ id: 91, key: "v1.2.0" });
+	});
+
+	it("rejects release fields that the resolved provider cannot preserve", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "gitlab-secret");
+		vi.stubEnv("GITHUB_TOKEN", "github-secret");
+		dispatcher
+			.get("https://gitlab.com")
+			.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/releases?per_page=1" })
+			.reply(200, []);
+		dispatcher
+			.get("https://api.github.com")
+			.intercept({ method: "GET", path: "/repos/acme/widget/releases?per_page=1" })
+			.reply(200, []);
+		const { service, context } = harness(true);
+
+		await expect(
+			service.execute(
+				"forge_release",
+				{
+					remote: "https://gitlab.com/acme/widget.git",
+					action: "create",
+					id: "v1.0.0",
+					requestId: "gitlab-draft",
+					input: { draft: true },
+				},
+				undefined,
+				context,
+			),
+		).rejects.toMatchObject({ code: "unsupported_capability" });
+		await expect(
+			service.execute(
+				"forge_release",
+				{
+					remote: "https://github.com/acme/widget.git",
+					action: "create",
+					id: "v1.0.0",
+					requestId: "github-milestone",
+					input: { milestoneTitles: ["Version 1"] },
+				},
+				undefined,
+				context,
+			),
+		).rejects.toMatchObject({ code: "unsupported_capability" });
+	});
+
 	it("maps GitHub milestone close to the remote closed state", async () => {
 		vi.stubEnv("GITHUB_TOKEN", "service-secret");
 		const api = dispatcher.get("https://api.github.com");
@@ -362,6 +678,101 @@ describe("DefaultForgeService", () => {
 		).resolves.toMatchObject({ state: "closed" });
 	});
 
+	it("resolves a GitLab milestone number before updating the global milestone id", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://gitlab.com");
+		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/milestones?per_page=1" }).reply(200, []);
+		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/milestones?iids%5B%5D=3&per_page=2" }).reply(
+			200,
+			[{ id: 103, iid: 3, title: "Version 1" }],
+		);
+		api.intercept({
+			method: "PUT",
+			path: "/api/v4/projects/acme%2Fwidget/milestones/103",
+			body: JSON.stringify({ state_event: "close" }),
+		}).reply(200, { id: 103, iid: 3, state: "closed" });
+		const { service, context } = harness(true);
+
+		await expect(
+			service.execute(
+				"forge_milestone",
+				{
+					remote: "https://gitlab.com/acme/widget.git",
+					action: "close",
+					id: 3,
+					requestId: "close-gitlab-milestone-3",
+				},
+				undefined,
+				context,
+			),
+		).resolves.toMatchObject({ resource: "milestone", number: 3, state: "closed" });
+	});
+
+	it("rejects a GitLab approval body before confirmation", async () => {
+		vi.stubEnv("GITLAB_TOKEN", "service-secret");
+		const { service, context, confirm } = harness(true);
+
+		await expect(
+			service.execute(
+				"forge_change",
+				{
+					remote: "https://gitlab.com/acme/widget.git",
+					action: "approve",
+					id: 7,
+					requestId: "approve-with-body",
+					input: { body: "Approved" },
+				},
+				undefined,
+				context,
+			),
+		).rejects.toMatchObject({ code: "unsupported_capability" });
+		expect(confirm).not.toHaveBeenCalled();
+	});
+
+	it("supports GitHub job reruns and returns identifiers for empty mutation responses", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://api.github.com");
+		api.intercept({ method: "GET", path: "/repos/acme/widget/actions/runs?per_page=1" }).reply(200, {
+			workflow_runs: [],
+		});
+		api.intercept({ method: "POST", path: "/repos/acme/widget/actions/jobs/9/rerun" }).reply(201, "");
+		const { service, context } = harness(true);
+
+		await expect(
+			service.execute(
+				"forge_pipeline",
+				{
+					remote: "https://github.com/acme/widget.git",
+					action: "retry_job",
+					id: 9,
+					requestId: "retry-job-9",
+				},
+				undefined,
+				context,
+			),
+		).resolves.toEqual({ ok: true, resource: "job", action: "retry_job", id: 9 });
+	});
+
+	it("rejects unsupported GitHub pipeline actions before confirmation", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "service-secret");
+		const { service, context, confirm } = harness(true);
+
+		await expect(
+			service.execute(
+				"forge_pipeline",
+				{
+					remote: "https://github.com/acme/widget.git",
+					action: "trigger",
+					requestId: "github-trigger",
+					input: { ref: "main" },
+				},
+				undefined,
+				context,
+			),
+		).rejects.toMatchObject({ code: "unsupported_capability" });
+		expect(confirm).not.toHaveBeenCalled();
+	});
+
 	it("allows read-only prepare transitions without a request id", async () => {
 		vi.stubEnv("GITHUB_TOKEN", "service-secret");
 		dispatcher
@@ -383,6 +794,33 @@ describe("DefaultForgeService", () => {
 			),
 		).resolves.toMatchObject({ compliant: true, policy: "not_configured" });
 		expect(confirm).not.toHaveBeenCalled();
+	});
+
+	it("returns the change number for a GitHub transition merge response without identifiers", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "service-secret");
+		const api = dispatcher.get("https://api.github.com");
+		api.intercept({ method: "GET", path: "/repos/acme/widget/pulls?per_page=1" }).reply(200, []);
+		api.intercept({
+			method: "PUT",
+			path: "/repos/acme/widget/pulls/7/merge",
+			body: JSON.stringify({ merge_method: "squash" }),
+		}).reply(200, { sha: "abc123", merged: true, message: "Pull Request successfully merged" });
+		const { service, context } = harness(true);
+
+		await expect(
+			service.execute(
+				"forge_transition",
+				{
+					remote: "https://github.com/acme/widget.git",
+					transition: "merge",
+					changeId: 7,
+					requestId: "transition-merge-7",
+					input: { mergeMethod: "squash" },
+				},
+				undefined,
+				context,
+			),
+		).resolves.toEqual({ ok: true, resource: "change", action: "merge", number: 7 });
 	});
 
 	it("does not execute a destructive mutation when confirmation is declined", async () => {
@@ -493,7 +931,7 @@ describe("DefaultForgeService", () => {
 				undefined,
 				context,
 			),
-		).resolves.toMatchObject({ slug: "operations/runbook" });
+		).resolves.toMatchObject({ key: "operations/runbook" });
 		await expect(
 			service.execute(
 				"forge_release",
@@ -507,14 +945,18 @@ describe("DefaultForgeService", () => {
 				undefined,
 				context,
 			),
-		).resolves.toMatchObject({ tag_name: "v1.2.0" });
+		).resolves.toMatchObject({ key: "v1.2.0" });
 	});
 
 	it("journals mutating workflow transitions", async () => {
 		vi.stubEnv("GITLAB_TOKEN", "service-secret");
 		const api = dispatcher.get("https://gitlab.com");
 		api.intercept({ method: "GET", path: "/api/v4/projects/acme%2Fwidget/releases?per_page=1" }).reply(200, []);
-		api.intercept({ method: "POST", path: "/api/v4/projects/acme%2Fwidget/releases" }).reply(201, {
+		api.intercept({
+			method: "POST",
+			path: "/api/v4/projects/acme%2Fwidget/releases",
+			body: JSON.stringify({ tag_name: "v2.0.0", name: "Version 2", milestones: ["Version 2"] }),
+		}).reply(201, {
 			tag_name: "v2.0.0",
 			name: "Version 2",
 		});
@@ -523,7 +965,7 @@ describe("DefaultForgeService", () => {
 			remote: "https://gitlab.com/acme/widget.git",
 			transition: "release",
 			requestId: "transition-release",
-			input: { tag_name: "v2.0.0", name: "Version 2" },
+			input: { tagName: "v2.0.0", name: "Version 2", milestoneTitles: ["Version 2"] },
 		};
 
 		const first = await service.execute("forge_transition", input, undefined, context);

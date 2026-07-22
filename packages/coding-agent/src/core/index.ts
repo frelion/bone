@@ -76,3 +76,12 @@ export {
 } from "./extensions/index.ts";
 export * from "./forge/index.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";
+export {
+	type AgentToolContract,
+	type AgentToolEffect,
+	type AgentToolExample,
+	type AgentToolIdempotency,
+	type AgentToolOutputBudget,
+	type AgentToolRetryPolicy,
+	defineAgentToolContract,
+} from "./tools/agent-tool-contract.ts";

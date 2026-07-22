@@ -11,15 +11,17 @@ import {
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@frelion/bone-ai/compat";
-import type {
-	AgentContext,
-	AgentEvent,
-	AgentLoopConfig,
-	AgentMessage,
-	AgentTool,
-	AgentToolCall,
-	AgentToolResult,
-	StreamFn,
+import {
+	type AgentContext,
+	type AgentEvent,
+	type AgentLoopConfig,
+	type AgentMessage,
+	type AgentTool,
+	type AgentToolCall,
+	AgentToolError,
+	type AgentToolErrorDetails,
+	type AgentToolResult,
+	type StreamFn,
 } from "./types.ts";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
@@ -599,6 +601,234 @@ function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall)
 	};
 }
 
+function canonicalToolArguments(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(canonicalToolArguments);
+	if (typeof value !== "object" || value === null) return value;
+	return Object.fromEntries(
+		Object.entries(value as Record<string, unknown>)
+			.sort(([left], [right]) => left.localeCompare(right))
+			.map(([key, entry]) => [key, canonicalToolArguments(entry)]),
+	);
+}
+
+interface UnchangedToolFailure {
+	retryable: boolean;
+	count: number;
+}
+
+const MAX_AGENT_TOOL_ERROR_BYTES = 4 * 1024;
+const MAX_AGENT_TOOL_ERROR_MESSAGE_BYTES = 1024;
+const MAX_AGENT_TOOL_ERROR_DETAIL_STRING_BYTES = 1024;
+const MAX_AGENT_TOOL_ERROR_RAW_TEXT_CODE_UNITS = 4 * 1024;
+const AGENT_TOOL_ERROR_DETAIL_KEYS = [
+	"retryAfterSeconds",
+	"statusCode",
+	"provider",
+	"resource",
+	"operation",
+	"field",
+	"requestId",
+] as const satisfies readonly (keyof AgentToolErrorDetails)[];
+
+function truncateUtf8(value: string, maximumBytes: number): string {
+	const encoder = new TextEncoder();
+	if (encoder.encode(value).byteLength <= maximumBytes) return value;
+	const suffix = "...[truncated]";
+	const suffixBytes = encoder.encode(suffix).byteLength;
+	let result = "";
+	let bytes = 0;
+	for (const character of value) {
+		const characterBytes = encoder.encode(character).byteLength;
+		if (bytes + characterBytes + suffixBytes > maximumBytes) break;
+		result += character;
+		bytes += characterBytes;
+	}
+	return result + suffix;
+}
+
+function boundRawErrorText(value: string): string {
+	if (value.length <= MAX_AGENT_TOOL_ERROR_RAW_TEXT_CODE_UNITS) return value;
+	return `${value.slice(0, MAX_AGENT_TOOL_ERROR_RAW_TEXT_CODE_UNITS - 128)}...[input truncated]`;
+}
+
+function redactErrorText(value: string): string {
+	return boundRawErrorText(value)
+		.replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]")
+		.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/gi, "[REDACTED]")
+		.replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/gi, "[REDACTED]")
+		.replace(/\bglpat-[A-Za-z0-9_-]{10,}\b/gi, "[REDACTED]")
+		.replace(/\bsk-[A-Za-z0-9_-]{10,}\b/gi, "[REDACTED]")
+		.replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/gi, "[REDACTED]")
+		.replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[REDACTED]")
+		.replace(/\b(?:gsk|hf|npm)_[A-Za-z0-9_-]{10,}\b/gi, "[REDACTED]")
+		.replace(/\bxai-[A-Za-z0-9_-]{10,}\b/gi, "[REDACTED]")
+		.replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "[REDACTED]")
+		.replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED]")
+		.replace(/(authorization|cookie|password|secret|token|api[-_]?key)(\s*[:=]\s*)([^\s,;]+)/gi, "$1$2[REDACTED]")
+		.replace(/([?&](?:private_token|access_token|api_key)=)[^&\s]+/gi, "$1[REDACTED]");
+}
+
+function safeErrorCode(value: string): string {
+	const normalized = redactErrorText(value).replace(/[^A-Za-z0-9_.-]/g, "_");
+	return normalized.slice(0, 256) || "tool_error";
+}
+
+function safeErrorDetailValue(value: unknown): unknown {
+	if (value === null || typeof value === "boolean") return value;
+	if (typeof value === "string") {
+		return truncateUtf8(redactErrorText(value), MAX_AGENT_TOOL_ERROR_DETAIL_STRING_BYTES);
+	}
+	if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
+	if (typeof value === "bigint") return `${value}n`;
+	if (typeof value === "undefined" || typeof value === "symbol" || typeof value === "function") {
+		return `[Unsupported: ${typeof value}]`;
+	}
+	return "[Unsupported: object]";
+}
+
+function safeAgentToolErrorDetails(details: AgentToolErrorDetails): Record<string, unknown> {
+	const result: Record<string, unknown> = {};
+	for (const key of AGENT_TOOL_ERROR_DETAIL_KEYS) {
+		try {
+			const value = details[key];
+			if (value !== undefined) result[key] = safeErrorDetailValue(value);
+		} catch {
+			result[key] = "[Unavailable]";
+		}
+	}
+	return result;
+}
+
+function safeAgentToolErrorText(error: AgentToolError): string {
+	try {
+		const code = safeErrorCode(error.code);
+		const message = truncateUtf8(redactErrorText(error.message), MAX_AGENT_TOOL_ERROR_MESSAGE_BYTES);
+		const errorResult = {
+			ok: false,
+			error: {
+				code,
+				retryable: error.retryable,
+				message,
+				...(error.details === undefined ? {} : { details: safeAgentToolErrorDetails(error.details) }),
+			},
+		};
+		const serialized = JSON.stringify(errorResult);
+		if (new TextEncoder().encode(serialized).byteLength <= MAX_AGENT_TOOL_ERROR_BYTES) return serialized;
+
+		const characters = Array.from(message);
+		let minimum = 0;
+		let maximum = characters.length;
+		let bounded = "";
+		while (minimum <= maximum) {
+			const length = Math.floor((minimum + maximum) / 2);
+			const candidate = JSON.stringify({
+				ok: false,
+				error: {
+					code,
+					retryable: error.retryable,
+					message: length < characters.length ? `${characters.slice(0, length).join("")}...[truncated]` : message,
+					details: { truncated: true },
+				},
+			});
+			if (new TextEncoder().encode(candidate).byteLength <= MAX_AGENT_TOOL_ERROR_BYTES) {
+				bounded = candidate;
+				minimum = length + 1;
+			} else {
+				maximum = length - 1;
+			}
+		}
+		if (bounded) return bounded;
+		throw new Error("Agent tool error envelope exceeds its fixed output budget");
+	} catch {
+		return JSON.stringify({
+			ok: false,
+			error: {
+				code: "tool_error_serialization_failed",
+				retryable: false,
+				message: "The tool failure could not be safely serialized.",
+			},
+		});
+	}
+}
+
+function retryableFailure(text: string): boolean | undefined {
+	if (text.includes("Validation failed for tool")) return false;
+	try {
+		const parsed = JSON.parse(text) as { error?: { retryable?: unknown } };
+		return typeof parsed.error?.retryable === "boolean" ? parsed.error.retryable : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function toolErrorText(error: unknown): string {
+	try {
+		if (error instanceof AgentToolError) {
+			return safeAgentToolErrorText(error);
+		}
+		const message = error instanceof Error ? error.message : String(error);
+		return truncateUtf8(redactErrorText(message), MAX_AGENT_TOOL_ERROR_BYTES);
+	} catch {
+		return "Tool execution failed with an unreadable error.";
+	}
+}
+
+function toolCallFingerprint(tool: AgentTool<any>, toolCall: AgentToolCall): string {
+	let argumentsValue: unknown = toolCall.arguments;
+	try {
+		const prepared = prepareToolCallArguments(tool, toolCall);
+		try {
+			argumentsValue = validateToolArguments(tool, prepared);
+		} catch {
+			argumentsValue = prepared.arguments;
+		}
+	} catch {
+		// Raw arguments are the only stable identity when preparation itself fails.
+	}
+	return JSON.stringify(canonicalToolArguments(argumentsValue));
+}
+
+function unchangedToolFailure(
+	context: AgentContext,
+	tool: AgentTool<any>,
+	toolCall: AgentToolCall,
+): UnchangedToolFailure | undefined {
+	const fingerprint = toolCallFingerprint(tool, toolCall);
+	let retryableCount = 0;
+	for (let index = context.messages.length - 1; index >= 0; index--) {
+		const message = context.messages[index];
+		if (message.role === "user") break;
+		if (message.role !== "toolResult" || message.toolName !== toolCall.name) continue;
+		const source = context.messages
+			.slice(0, index)
+			.reverse()
+			.find(
+				(candidate) =>
+					candidate.role === "assistant" &&
+					candidate.content.some((content) => content.type === "toolCall" && content.id === message.toolCallId),
+			);
+		if (source?.role !== "assistant") continue;
+		const previousCall = source.content.find(
+			(content) => content.type === "toolCall" && content.id === message.toolCallId,
+		);
+		if (
+			previousCall?.type === "toolCall" &&
+			previousCall.name === toolCall.name &&
+			toolCallFingerprint(tool, previousCall) === fingerprint
+		) {
+			if (!message.isError) return undefined;
+			const failureText = message.content
+				.flatMap((content) => (content.type === "text" ? [content.text] : []))
+				.join("\n");
+			const retryable = retryableFailure(failureText);
+			if (retryable === undefined) continue;
+			if (!retryable) return { retryable: false, count: 1 };
+			retryableCount++;
+		}
+	}
+	return retryableCount > 0 ? { retryable: true, count: retryableCount } : undefined;
+}
+
 async function prepareToolCall(
 	currentContext: AgentContext,
 	assistantMessage: AssistantMessage,
@@ -611,6 +841,40 @@ async function prepareToolCall(
 		return {
 			kind: "immediate",
 			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+			isError: true,
+		};
+	}
+	const precedingFailure = unchangedToolFailure(currentContext, tool, toolCall);
+	const rejectUnchanged = tool.retryPolicy?.rejectUnchangedRetry !== false;
+	if (precedingFailure && !precedingFailure.retryable && rejectUnchanged) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(
+				JSON.stringify({
+					ok: false,
+					error: {
+						code: "duplicate_failed_call",
+						retryable: false,
+						message: "This unchanged tool call already failed. Change its arguments or stop.",
+					},
+				}),
+			),
+			isError: true,
+		};
+	}
+	if (precedingFailure?.retryable && tool.retryPolicy && precedingFailure.count >= tool.retryPolicy.maxAttempts) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(
+				JSON.stringify({
+					ok: false,
+					error: {
+						code: "retry_limit_exceeded",
+						retryable: false,
+						message: `This unchanged tool call reached its ${tool.retryPolicy.maxAttempts}-attempt limit. Change its arguments or stop.`,
+					},
+				}),
+			),
 			isError: true,
 		};
 	}
@@ -659,7 +923,7 @@ async function prepareToolCall(
 	} catch (error) {
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			result: createErrorToolResult(toolErrorText(error)),
 			isError: true,
 		};
 	}
@@ -700,7 +964,7 @@ async function executePreparedToolCall(
 		acceptingUpdates = false;
 		await Promise.all(updateEvents);
 		return {
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			result: createErrorToolResult(toolErrorText(error)),
 			isError: true,
 		};
 	} finally {
@@ -742,7 +1006,7 @@ async function finalizeExecutedToolCall(
 				isError = afterResult.isError ?? isError;
 			}
 		} catch (error) {
-			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+			result = createErrorToolResult(toolErrorText(error));
 			isError = true;
 		}
 	}

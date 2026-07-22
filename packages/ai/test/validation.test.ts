@@ -113,4 +113,58 @@ describe("validateToolArguments", () => {
 			expect(() => validateToolArguments(tool, toolCall)).toThrow("Validation failed");
 		}
 	});
+
+	it("bounds invalid argument previews without splitting multibyte text", () => {
+		const tool: Tool = {
+			name: "bounded_validation",
+			description: "Test bounded validation errors",
+			parameters: Type.Object({ id: Type.Integer({ minimum: 1 }) }, { additionalProperties: false }),
+		};
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call-1",
+			name: tool.name,
+			arguments: { id: 0, unexpected: `${"界".repeat(10_000)}TAIL_SENTINEL` },
+		};
+
+		let message = "";
+		try {
+			validateToolArguments(tool, toolCall);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+
+		expect(message).toContain("Validation failed for tool");
+		expect(message).toContain("arguments truncated");
+		expect(message).not.toContain("TAIL_SENTINEL");
+		expect(Buffer.byteLength(message, "utf8")).toBeLessThan(8 * 1024);
+		expect(message).not.toContain("�");
+	});
+
+	it("bounds validation paths as well as argument previews", () => {
+		const tool: Tool = {
+			name: "bounded_path",
+			description: "Test bounded validation paths",
+			parameters: Type.Record(Type.String(), Type.Integer()),
+		};
+		const oversizedKey = "界".repeat(200_000);
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call-path",
+			name: tool.name,
+			arguments: { [oversizedKey]: "not-an-integer" },
+		};
+
+		let message = "";
+		try {
+			validateToolArguments(tool, toolCall);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+
+		expect(message).toContain("validation errors truncated");
+		expect(message).toContain("arguments truncated");
+		expect(Buffer.byteLength(message, "utf8")).toBeLessThan(10 * 1024);
+		expect(message).not.toContain("�");
+	});
 });

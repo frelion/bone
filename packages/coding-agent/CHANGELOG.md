@@ -11,6 +11,10 @@
 
 - Added isolated standalone release verification that loads OpenTUI's embedded native library before checking CLI startup.
 - Added the structured extension UI v2 contract for dialogs, widgets, chrome, editors, and tool results, with a trusted BoneView escape hatch and a machine-checkable legacy UI removal gate.
+- Added Agent Tool Contract v1 metadata for closed schemas, effects, idempotency, retry behavior, examples, and semantic output budgets; Forge is the first complete implementation.
+- Replaced Forge parameter bags with operation-specific, provider-neutral contracts and compact mutation receipts. Forge context now has no Agent-visible parameters, and queries require an explicit `list`, `get`, or `get_many` operation.
+- Added an offline scripted Forge protocol evaluation harness with a real Agent loop, strict fake service, seven recovery/schema/budget/execution cases, and JSON/HTML reports. It is intentionally separate from provider compatibility and live-model quality evaluation.
+- Added an explicit opt-in live Forge model evaluation harness that reuses Bone's configured `ModelRuntime`, bounds turns/time, keeps Forge calls on a fake service, and reports task/tool/context metrics separately from scripted protocol pass rate.
 
 ## [0.1.3] - 2026-07-22
 

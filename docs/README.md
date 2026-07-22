@@ -12,6 +12,7 @@ until they receive dedicated Bone documentation.
 | [Sessions](sessions.md) | Side navigation, background conversations, focus, search, and deletion. |
 | [Settings](settings.md) | Provider, model, authentication, and task-model configuration. |
 | [GitLab and GitHub](forge.md) | Forge authentication, self-managed instances, workflow policy, and compatibility. |
+| [Agent Tool Contract v1](agent-tool-contract.md) | Model-facing schema, error, retry, effect, idempotency, and output-budget conventions. |
 | [Local memory](memory.md) | Local semantic search, `bone setup`, indexing, and `/status`. |
 | [Releases](releases.md) | GitHub Release assets, checksums, and upgrade guidance. |
 

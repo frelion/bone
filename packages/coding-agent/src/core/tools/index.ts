@@ -1,4 +1,13 @@
 export {
+	type AgentToolContract,
+	type AgentToolEffect,
+	type AgentToolExample,
+	type AgentToolIdempotency,
+	type AgentToolOutputBudget,
+	type AgentToolRetryPolicy,
+	defineAgentToolContract,
+} from "./agent-tool-contract.ts";
+export {
 	type BashOperations,
 	type BashSpawnContext,
 	type BashSpawnHook,

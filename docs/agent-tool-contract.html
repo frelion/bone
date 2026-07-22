@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Bone Agent Tool Contract v1 教学：用清晰契约提高 Agent 调用 GitHub 与 GitLab 工具的成功率。">
+  <title>Agent Tool Contract v1 | Bone</title>
+  <style>
+    :root {
+      --ink: #18212b;
+      --muted: #5c6875;
+      --line: #d8e0e6;
+      --paper: #f7f9fa;
+      --surface: #ffffff;
+      --navy: #153b52;
+      --blue: #1d6f8f;
+      --teal: #087f77;
+      --gold: #b16d19;
+      --red: #a33d36;
+      --code: #14242c;
+      --shadow: 0 12px 28px rgba(20, 49, 64, .08);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font: 16px/1.65 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--blue); }
+    a:focus-visible, button:focus-visible { outline: 3px solid #e5a33b; outline-offset: 3px; }
+    .shell { width: min(1160px, calc(100% - 40px)); margin: 0 auto; }
+    .topbar {
+      border-bottom: 1px solid var(--line);
+      background: rgba(255,255,255,.94);
+      position: sticky; top: 0; z-index: 10;
+      backdrop-filter: blur(12px);
+    }
+    .topbar-inner { min-height: 60px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+    .brand { color: var(--navy); font-weight: 800; letter-spacing: .02em; text-decoration: none; }
+    nav { display: flex; gap: 18px; overflow-x: auto; white-space: nowrap; }
+    nav a { color: var(--muted); text-decoration: none; font-size: .92rem; }
+    nav a:hover { color: var(--navy); }
+    main { padding-bottom: 72px; }
+    .intro { padding: 74px 0 48px; display: grid; grid-template-columns: 1.25fr .75fr; gap: 60px; align-items: end; }
+    .eyebrow { color: var(--teal); font-size: .8rem; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    h1, h2, h3 { color: var(--navy); line-height: 1.16; margin: 0; }
+    h1 { font-size: clamp(2.5rem, 6vw, 5rem); letter-spacing: -.045em; max-width: 760px; }
+    h2 { font-size: clamp(1.65rem, 3vw, 2.45rem); margin-bottom: 16px; }
+    h3 { font-size: 1.15rem; margin-bottom: 8px; }
+    .lede { color: var(--muted); font-size: 1.18rem; max-width: 700px; margin: 22px 0 0; }
+    .promise { border-left: 4px solid var(--teal); padding: 18px 20px; background: var(--surface); box-shadow: var(--shadow); }
+    .promise strong { display: block; color: var(--navy); font-size: 1.1rem; margin-bottom: 5px; }
+    .section { padding: 58px 0; border-top: 1px solid var(--line); }
+    .section-intro { max-width: 760px; margin-bottom: 26px; }
+    .section-intro p { color: var(--muted); margin: 0; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .grid.two { grid-template-columns: repeat(2, 1fr); }
+    .card { background: var(--surface); border: 1px solid var(--line); padding: 23px; box-shadow: 0 5px 14px rgba(20, 49, 64, .04); }
+    .card p { color: var(--muted); margin: 0; }
+    .number { color: var(--teal); font-size: .78rem; font-weight: 800; letter-spacing: .12em; }
+    .flow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; border: 1px solid var(--line); background: var(--surface); box-shadow: var(--shadow); }
+    .flow-step { min-height: 150px; padding: 20px; position: relative; border-right: 1px solid var(--line); }
+    .flow-step:last-child { border-right: 0; }
+    .flow-step:not(:last-child)::after { content: "→"; position: absolute; right: -12px; top: 54px; width: 24px; height: 24px; color: var(--teal); background: var(--surface); text-align: center; font-size: 1.2rem; z-index: 1; }
+    .flow-step p { color: var(--muted); font-size: .92rem; margin: 8px 0 0; }
+    .code-wrap { background: var(--code); color: #e6f0ef; border: 1px solid #27404a; box-shadow: var(--shadow); overflow: hidden; }
+    .code-head { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2b4a55; padding: 9px 14px; color: #96b8ba; font-size: .78rem; }
+    .copy { border: 1px solid #55747a; background: transparent; color: #d6ece7; padding: 4px 8px; cursor: pointer; border-radius: 4px; }
+    pre { margin: 0; padding: 18px; overflow-x: auto; font: .88rem/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .compare > div { min-width: 0; }
+    .label { display: block; margin-bottom: 7px; color: var(--muted); font-size: .8rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .label.bad { color: var(--red); }
+    .label.good { color: var(--teal); }
+    .callout { padding: 17px 20px; border-left: 4px solid var(--gold); background: #fffaf1; color: #55401f; }
+    .callout strong { color: #70470e; }
+    .budget { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: stretch; }
+    .budget-list { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); }
+    .budget-item { background: var(--surface); padding: 16px; }
+    .budget-item strong { display: block; color: var(--navy); font-size: 1.45rem; line-height: 1.2; }
+    .budget-item span { color: var(--muted); font-size: .88rem; }
+    table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--line); }
+    th, td { padding: 13px 15px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--navy); background: #edf3f5; font-size: .85rem; }
+    td { color: var(--muted); }
+    tr:last-child td { border-bottom: 0; }
+    .status { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: .78rem; font-weight: 750; }
+    .status.retry { color: #78500e; background: #fff0c9; }
+    .status.stop { color: #85342f; background: #fbe4e0; }
+    .status.fix { color: #09645f; background: #dff4ef; }
+    .timeline { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+    .timeline .card { border-top: 4px solid var(--blue); }
+    .timeline .card:nth-child(2) { border-top-color: var(--gold); }
+    .timeline .card:nth-child(3) { border-top-color: var(--teal); }
+    .step-list { display: grid; gap: 18px; }
+    .step-row { display: grid; grid-template-columns: 58px 1fr 1fr; gap: 20px; align-items: start; padding: 20px 0; border-bottom: 1px solid var(--line); }
+    .step-row:last-child { border-bottom: 0; }
+    .step-index { width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center; color: #fff; background: var(--teal); font-weight: 800; }
+    .step-row p { color: var(--muted); margin: 0; }
+    .step-row .code-wrap { box-shadow: none; }
+    .matrix { overflow-x: auto; }
+    .matrix table { min-width: 720px; }
+    .matrix td:first-child, .matrix th:first-child { white-space: nowrap; }
+    .checklist { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+    .checklist li { display: grid; grid-template-columns: 28px 1fr; gap: 10px; align-items: start; color: var(--muted); }
+    .checklist li::before { content: "✓"; color: var(--teal); font-weight: 900; }
+    .split-note { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .mini-flow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); }
+    .mini-flow b { padding: 5px 10px; background: #e8f2f3; color: var(--navy); border-radius: 4px; font-size: .88rem; }
+    .mini-flow span { color: var(--teal); font-weight: 800; }
+    .muted-note { color: var(--muted); font-size: .92rem; }
+    footer { border-top: 1px solid var(--line); padding: 28px 0 60px; color: var(--muted); font-size: .9rem; }
+    footer p { margin: 6px 0; }
+    @media (max-width: 850px) {
+      .intro, .budget { grid-template-columns: 1fr; gap: 26px; }
+      .flow { grid-template-columns: 1fr; }
+      .flow-step { min-height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      .flow-step:last-child { border-bottom: 0; }
+      .flow-step:not(:last-child)::after { content: "↓"; right: 18px; top: auto; bottom: -13px; }
+      .grid, .grid.two, .timeline { grid-template-columns: 1fr; }
+      .step-row, .split-note { grid-template-columns: 1fr; gap: 10px; }
+      .step-index { width: 32px; height: 32px; }
+    }
+    @media (max-width: 560px) {
+      .shell { width: min(100% - 26px, 1160px); }
+      .topbar-inner { align-items: flex-start; flex-direction: column; padding: 12px 0 10px; gap: 8px; }
+      nav { width: 100%; }
+      .intro { padding-top: 48px; }
+      .compare { grid-template-columns: 1fr; }
+      .budget-list { grid-template-columns: 1fr; }
+      th, td { padding: 10px; }
+    }
+    @media print {
+      .topbar { position: static; }
+      .copy, nav { display: none; }
+      .section { break-inside: avoid; }
+      .card, .code-wrap, .promise { box-shadow: none; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="shell topbar-inner">
+      <a class="brand" href="#top">BONE / TOOL CONTRACT</a>
+      <nav aria-label="页面导航">
+        <a href="#why">为什么</a>
+        <a href="#contract">契约</a>
+        <a href="#flow">流程</a>
+        <a href="#walkthrough">演练</a>
+        <a href="#recovery">恢复</a>
+        <a href="#mapping">映射</a>
+        <a href="#budget">上下文</a>
+        <a href="#new-tool">清单</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="shell intro">
+      <div>
+        <div class="eyebrow">Agent Tool Contract v1</div>
+        <h1>让工具更容易被 Agent 正确调用。</h1>
+        <p class="lede">这不是一套更长的 API 文档，而是一份把“意图、参数、权限、失败和输出”说清楚的协作协议。Forge 用它连接 GitHub 与 GitLab，同时保护 Agent 的上下文窗口。</p>
+      </div>
+      <aside class="promise">
+        <strong>一句话理解</strong>
+        Agent-friendly 不等于接受模糊输入。它意味着：可推导的信息自动推导，必须明确的意图强制明确，失败时告诉 Agent 下一步，返回时只给真正需要的信息。
+      </aside>
+    </section>
+
+    <section class="section" id="why">
+      <div class="shell">
+        <div class="section-intro">
+          <h2>我们先解决三个真实问题</h2>
+          <p>工具调用失败通常不是 Agent 不会工作，而是工具把太多歧义、平台差异和原始数据交给了它。</p>
+        </div>
+        <div class="grid">
+          <article class="card"><span class="number">01 / 歧义</span><h3>占位字段也算“传了”</h3><p><code>id: ""</code>、<code>ids: [0]</code> 仍会触发互斥校验。模型看见一个大参数袋，很容易把所有字段都填上。</p></article>
+          <article class="card"><span class="number">02 / 差异</span><h3>GitHub 与 GitLab 不是同一个 API</h3><p>Release、pipeline、milestone、merge 的字段和能力不同。静默丢弃字段会制造“工具成功、语义错误”。</p></article>
+          <article class="card"><span class="number">03 / 上下文</span><h3>列表会吞掉注意力</h3><p>几十条 issue 的完整正文、用户对象和 URL 会挤走真正需要的决策信息，Agent 反而更难检索。</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="contract">
+      <div class="shell">
+        <div class="section-intro"><h2>契约由六层组成</h2><p>Schema 只是第一层。每一层都在减少一种具体的调用错误。</p></div>
+        <div class="grid two">
+          <article class="card"><span class="number">01</span><h3>意图</h3><p><code>useWhen</code>、<code>doNotUseWhen</code> 和最小示例告诉 Agent 什么时候调用，什么时候先做别的事。</p></article>
+          <article class="card"><span class="number">02</span><h3>参数</h3><p>封闭、按操作区分的 schema。<code>list</code>、<code>get</code>、<code>get_many</code> 不共享一份模糊参数袋。</p></article>
+          <article class="card"><span class="number">03</span><h3>副作用</h3><p>每个工具标记为 read、routine_write、sensitive_write 或 destructive，写入动作继续经过策略门禁。</p></article>
+          <article class="card"><span class="number">04</span><h3>幂等与重试</h3><p>契约声明是否可安全重试、最多几次，以及确定性失败是否拒绝完全相同的调用。</p></article>
+          <article class="card"><span class="number">05</span><h3>平台能力</h3><p>能翻译就翻译，不能保持语义就返回 <code>unsupported_capability</code>，绝不静默忽略请求。</p></article>
+          <article class="card"><span class="number">06</span><h3>输出预算</h3><p>列表、详情、错误和 mutation receipt 都有字节预算。结果是投影，不是 provider 原始响应。</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="flow">
+      <div class="shell">
+        <div class="section-intro"><h2>一次调用如何被保护</h2><p>Agent 只需要表达任务意图；平台细节和安全边界由工具链逐层处理。</p></div>
+        <div class="flow" aria-label="工具调用流程">
+          <div class="flow-step"><span class="number">01</span><h3>表达意图</h3><p>选择 operation 或 action，不填无关占位字段。</p></div>
+          <div class="flow-step"><span class="number">02</span><h3>规范化</h3><p>把等价写法统一，例如把数字字符串转成数字。</p></div>
+          <div class="flow-step"><span class="number">03</span><h3>校验</h3><p>封闭 schema 拒绝互斥字段、空占位和不支持的组合。</p></div>
+          <div class="flow-step"><span class="number">04</span><h3>门禁</h3><p>检查仓库信任、token、策略、平台 capability 和确认要求。</p></div>
+          <div class="flow-step"><span class="number">05</span><h3>投影结果</h3><p>返回稳定、紧凑、有预算的 receipt 或结构化错误。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="shell">
+        <div class="section-intro"><h2>从“参数大杂烩”到明确操作</h2><p>显式 operation 让模型先做一个小而重要的决定：我要列出、读取一个，还是读取一组？</p></div>
+        <div class="compare">
+          <div><span class="label bad">容易出错的 payload</span><div class="code-wrap"><pre><code>{
+  "resource": "issue",
+  "id": "",
+  "ids": [0],
+  "state": "opened",
+  "search": "x",
+  "limit": 50
+}</code></pre></div></div>
+          <div><span class="label good">明确且最小的 payload</span><div class="code-wrap"><div class="code-head"><span>forge_query · list</span><button class="copy" type="button" data-copy="good-query">复制</button></div><pre id="good-query"><code>{
+  "operation": "list",
+  "resource": "issue",
+  "state": "open",
+  "search": "x",
+  "limit": 10
+}</code></pre></div></div>
+        </div>
+        <div class="callout" style="margin-top: 18px;"><strong>关键取舍：</strong>工具不会替 Agent 猜测 <code>id</code> 还是 <code>ids</code>。自动猜测可能执行错误读取；明确失败并阻止原样重试，才会迫使调用真正变正确。</div>
+      </div>
+    </section>
+
+    <section class="section" id="walkthrough">
+      <div class="shell">
+        <div class="section-intro"><h2>完整演练：从当前仓库找到一个 issue</h2><p>下面是一条推荐的读流程。每一步都只做一个决定，结果也只返回下一步需要的信息。</p></div>
+        <div class="step-list">
+          <div class="step-row">
+            <div class="step-index">1</div>
+            <div><h3>确认仓库与平台</h3><p>Agent 不填写 remote、project 或 provider。当前 Git worktree 的 remote 是确定事实，工具自动解析它。</p></div>
+            <div class="code-wrap"><div class="code-head"><span>forge_context</span><button class="copy" type="button" data-copy="context-call">复制</button></div><pre id="context-call"><code>{}</code></pre></div>
+          </div>
+          <div class="step-row">
+            <div class="step-index">2</div>
+            <div><h3>用服务端搜索缩小候选</h3><p>先 list，不要一次读取所有正文。默认只取 10 条，必要时再用 cursor 翻页。</p></div>
+            <div class="code-wrap"><div class="code-head"><span>forge_query · list</span><button class="copy" type="button" data-copy="list-call">复制</button></div><pre id="list-call"><code>{
+  "operation": "list",
+  "resource": "issue",
+  "state": "open",
+  "search": "登录失败",
+  "limit": 10
+}</code></pre></div>
+          </div>
+          <div class="step-row">
+            <div class="step-index">3</div>
+            <div><h3>读取一个明确详情</h3><p>拿到候选 number 后，才请求单条详情。详情预算更高，但仍然有上限。</p></div>
+            <div class="code-wrap"><div class="code-head"><span>forge_query · get</span><button class="copy" type="button" data-copy="get-call">复制</button></div><pre id="get-call"><code>{
+  "operation": "get",
+  "resource": "issue",
+  "id": 42
+}</code></pre></div>
+          </div>
+          <div class="step-row">
+            <div class="step-index">4</div>
+            <div><h3>需要写入时再进入 mutation</h3><p>写操作使用明确 action、领域标识和最小字段，并经过 policy gate 与确认要求。</p></div>
+            <div class="code-wrap"><div class="code-head"><span>forge_mutate · update</span><button class="copy" type="button" data-copy="mutation-call">复制</button></div><pre id="mutation-call"><code>{
+  "resource": "issue",
+  "action": "update",
+  "issueNumber": 42,
+  "set": { "state": "closed" },
+  "requestId": "close-issue-42"
+}</code></pre></div>
+          </div>
+        </div>
+        <div class="callout" style="margin-top: 22px;"><strong>读写边界：</strong>capability 的 <code>supported</code> 只说明读取端点可访问，不等于 token 拥有创建、修改、合并、重跑或发布权限。写权限要由真实写请求和策略门禁验证。</div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="shell">
+        <div class="section-intro"><h2>参数决策树：先问自己是哪一种任务</h2><p>Agent 友好的工具不要求模型记住几十个端点，而是把任务压缩成几个稳定的选择。</p></div>
+        <div class="grid two">
+          <article class="card"><div class="mini-flow"><b>我要找候选</b><span>→</span><b>operation: list</b></div><p style="margin-top: 14px;">提供资源和筛选条件，例如 <code>state</code>、<code>search</code>、<code>limit</code>。不要提供 <code>id</code> 或 <code>ids</code>。</p></article>
+          <article class="card"><div class="mini-flow"><b>我知道一个编号</b><span>→</span><b>operation: get</b></div><p style="margin-top: 14px;">提供单个领域标识，例如 <code>issueNumber</code> 或查询中的 <code>id</code>。不要把它包装成数组。</p></article>
+          <article class="card"><div class="mini-flow"><b>我知道一组编号</b><span>→</span><b>operation: get_many</b></div><p style="margin-top: 14px;">提供有限的 <code>ids</code>，适合已经从 list 结果中选出的少量资源，不适合全库导出。</p></article>
+          <article class="card"><div class="mini-flow"><b>我要改变远端</b><span>→</span><b>action + requestId</b></div><p style="margin-top: 14px;">先确认资源、action、真正修改的字段和重复执行策略，再接受写入的确认与权限检查。</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="mapping">
+      <div class="shell">
+        <div class="section-intro"><h2>平台映射：Agent 不需要学习两套字段</h2><p>公开契约保持领域语言，适配器负责把同一意图翻译成 GitLab 或 GitHub 的请求。</p></div>
+        <div class="matrix">
+          <table>
+            <thead><tr><th>Agent 看到的概念</th><th>GitLab 适配</th><th>GitHub 适配</th><th>不能静默处理时</th></tr></thead>
+            <tbody>
+              <tr><td><code>body</code></td><td><code>description</code></td><td><code>body</code></td><td>保持正文语义，不丢内容</td></tr>
+              <tr><td><code>sourceBranch</code> / <code>targetBranch</code></td><td><code>source_branch</code> / <code>target_branch</code></td><td><code>head</code> / <code>base</code></td><td>字段无法表达时返回 capability 错误</td></tr>
+              <tr><td>milestone number</td><td>先用 IID 解析全局 ID</td><td>使用 GitHub milestone number</td><td>找不到目标返回 <code>not_found</code></td></tr>
+              <tr><td>release tag</td><td>解析 release 并映射版本字段</td><td>按 tag 解析 release ID</td><td>draft、prerelease 等不支持语义明确拒绝</td></tr>
+              <tr><td>job retry</td><td>调用 GitLab retry endpoint</td><td>调用 Actions job rerun endpoint</td><td>没有等价动作返回 <code>unsupported_capability</code></td></tr>
+              <tr><td>pipeline state</td><td>使用平台状态字段</td><td><code>failed → failure</code>、<code>running → in_progress</code> 等</td><td>无法保持状态含义时不猜测</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted-note" style="margin-top: 14px;">这张表的重点不是记忆映射，而是理解边界：通用参数只有在两个平台都能保持相同语义时才会进入公共契约。</p>
+      </div>
+    </section>
+
+    <section class="section" id="recovery">
+      <div class="shell">
+        <div class="section-intro"><h2>失败不是一堵墙，而是恢复信号</h2><p>结构化错误把“发生了什么”和“下一步做什么”分开，让 Agent 不需要从自然语言里猜策略。</p></div>
+        <div class="grid two">
+          <div class="code-wrap"><div class="code-head"><span>结构化错误</span><button class="copy" type="button" data-copy="error-example">复制</button></div><pre id="error-example"><code>{
+  "ok": false,
+  "error": {
+    "code": "rate_limited",
+    "retryable": true,
+    "message": "Try again after cooldown",
+    "details": { "retryAfterSeconds": 30 }
+  }
+}</code></pre></div>
+          <table>
+            <thead><tr><th>错误类型</th><th>Agent 动作</th></tr></thead>
+            <tbody>
+              <tr><td><code>validation_error</code></td><td><span class="status fix">修正参数</span></td></tr>
+              <tr><td><code>unsupported_capability</code></td><td><span class="status stop">换操作或停止</span></td></tr>
+              <tr><td><code>forbidden</code></td><td><span class="status stop">检查权限，不盲重试</span></td></tr>
+              <tr><td><code>rate_limited</code></td><td><span class="status retry">有限重试</span></td></tr>
+              <tr><td><code>duplicate_failed_call</code></td><td><span class="status fix">改变参数或停止</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="timeline" style="margin-top: 22px;">
+          <article class="card"><h3>第一次失败</h3><p>工具保存调用指纹和失败类型，告诉 Agent 这是参数问题、权限问题还是瞬时问题。</p></article>
+          <article class="card"><h3>原样重试</h3><p>如果失败是确定性的，完全相同的规范化参数会被阻止，避免浪费请求和上下文。</p></article>
+          <article class="card"><h3>真正修正</h3><p>参数改变、用户开启新一轮，或瞬时失败在额度内重试，调用链重新获得机会。</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="shell">
+        <div class="section-intro"><h2>重试状态：什么会重试，什么不会</h2><p>重试不是统一的“再来一次”。工具根据错误性质和规范化后的调用指纹决定下一步。</p></div>
+        <div class="matrix">
+          <table>
+            <thead><tr><th>状态</th><th>例子</th><th>相同参数再次调用</th><th>正确恢复方式</th></tr></thead>
+            <tbody>
+              <tr><td>确定性失败</td><td>schema 校验失败、<code>forbidden</code>、<code>unsupported_capability</code></td><td><span class="status stop">阻止</span></td><td>修正参数、换操作或补充权限</td></tr>
+              <tr><td>瞬时失败</td><td><code>rate_limited</code>、短暂网络错误</td><td><span class="status retry">有限允许</span></td><td>遵守 retry policy 和退避信息</td></tr>
+              <tr><td>参数已变化</td><td>从 <code>id: "7"</code> 改为合法的 <code>id: 7</code></td><td><span class="status fix">允许</span></td><td>重新进入规范化与校验流程</td></tr>
+              <tr><td>用户开启新一轮</td><td>用户提供新要求或外部状态发生变化</td><td><span class="status fix">允许</span></td><td>旧失败边界不再阻塞新任务</td></tr>
+              <tr><td>调用已成功</td><td>同一资源之前已经成功读取或写入</td><td><span class="status fix">重置</span></td><td>后续新失败重新开始计数</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout" style="margin-top: 20px;"><strong>指纹很重要：</strong>工具先执行 <code>prepareArguments</code>，再进行运行时校验和属性排序。这样 <code>{"id":"7"}</code> 与 <code>{"id":7}</code> 如果最终表示同一个调用，就不能靠改变 JSON 表面写法绕过失败保护。</div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="shell">
+        <div class="section-intro"><h2>输出投影：为什么不返回原始 provider 对象</h2><p>返回值要服务于下一步决策，而不是复制平台 API 的所有字段。</p></div>
+        <div class="split-note">
+          <div><span class="label bad">不适合进入 Agent 上下文</span><div class="code-wrap"><pre><code>{
+  "id": 42,
+  "title": "登录失败",
+  "user": {
+    "avatar_url": "...",
+    "followers_url": "...",
+    "events_url": "...",
+    "public_repos": 18
+  },
+  "repository_url": "...",
+  "timeline_url": "...",
+  "body": "非常长的正文..."
+}</code></pre></div></div>
+          <div><span class="label good">适合决策的紧凑投影</span><div class="code-wrap"><pre><code>{
+  "ok": true,
+  "resource": "issue",
+  "number": 42,
+  "title": "登录失败",
+  "state": "open",
+  "author": "frelion",
+  "webUrl": "https://..."
+}</code></pre></div></div>
+        </div>
+        <ul class="checklist" style="margin-top: 22px;">
+          <li>列表只保留定位、比较和下一步读取需要的字段。</li>
+          <li>单条详情通过显式 <code>get</code> 请求获取，正文仍受字节预算限制。</li>
+          <li>mutation journal 保存 compact receipt，不保存 token、headers 或 provider 原始 body。</li>
+          <li>错误 details 使用白名单，循环对象、BigInt、超大字符串和 secret-like 字段不会破坏上下文。</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section" id="budget">
+      <div class="shell">
+        <div class="section-intro"><h2>上下文窗口是正式资源</h2><p>Forge 不把“更多原始数据”误认为“更多检索能力”。它先返回定位信息，再按需读取详情。</p></div>
+        <div class="budget">
+          <div class="budget-list">
+            <div class="budget-item"><strong>10</strong><span>列表默认条数</span></div>
+            <div class="budget-item"><strong>50</strong><span>列表最大条数</span></div>
+            <div class="budget-item"><strong>384 B</strong><span>列表单条正文预览</span></div>
+            <div class="budget-item"><strong>16 KiB</strong><span>单条详情正文</span></div>
+            <div class="budget-item"><strong>8 KiB</strong><span>批量详情单条正文</span></div>
+            <div class="budget-item"><strong>64 KiB</strong><span>Forge 单次最终结果</span></div>
+          </div>
+          <div class="card"><h3>推荐检索路径</h3><p><strong>list</strong> 用于定位，配合 <code>search</code> 缩小候选集；使用 <code>cursor</code> 翻页；确认目标后用 <strong>get</strong> 读取单条详情；只有已经明确知道一组小 ID 时才用 <strong>get_many</strong>。</p><p style="margin-top: 14px;">mutation 只返回 <code>id</code>、<code>number</code>、<code>state</code>、<code>webUrl</code> 等 receipt，不把完整 GitHub/GitLab 响应写进对话或 journal。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="new-tool">
+      <div class="shell">
+        <div class="section-intro"><h2>新增一个工具时，逐项检查这份清单</h2><p>这份清单把“看起来能用”变成可以 review、可以测试的契约。</p></div>
+        <div class="grid two">
+          <div class="card">
+            <h3>调用前</h3>
+            <ul class="checklist">
+              <li>工具名称是否表达一个明确动作，而不是一个万能入口？</li>
+              <li>是否有 <code>useWhen</code>、<code>doNotUseWhen</code> 和最小合法示例？</li>
+              <li>是否按 operation/action 拆分了互斥参数？</li>
+              <li>是否关闭了未知字段，并拒绝空字符串、零值和空数组占位？</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>执行中</h3>
+            <ul class="checklist">
+              <li>是否使用领域标识，而不是暴露 provider 内部 ID 规则？</li>
+              <li>GitHub 与 GitLab 的字段是否能保持同一语义？</li>
+              <li>不支持的操作是否返回明确的 <code>unsupported_capability</code>？</li>
+              <li>写操作是否经过 effect、policy、确认和 request ID 门禁？</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>执行后</h3>
+            <ul class="checklist">
+              <li>成功结果是否是紧凑 receipt，而不是原始 provider body？</li>
+              <li>列表、详情、错误和 journal 是否都有独立预算？</li>
+              <li>错误是否包含稳定 code、retryable 和可恢复 details？</li>
+              <li>同一确定性失败是否会阻止无变化重试？</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>测试中</h3>
+            <ul class="checklist">
+              <li>是否测试真实 Agent loop，而不只测试函数返回值？</li>
+              <li>是否覆盖错误发生在 prepare、execute、after hook 三个入口？</li>
+              <li>是否测试空响应、非法 JSON、401/403/404/5xx 和网络错误？</li>
+              <li>是否用大列表和大错误验证上下文预算没有被突破？</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="shell">
+        <div class="section-intro"><h2>最后记住这五条</h2></div>
+        <div class="grid">
+          <article class="card"><h3>能推导的，自动推导</h3><p>当前 Git remote 决定 repository、host 和 provider。</p></article>
+          <article class="card"><h3>必须明确的，强制明确</h3><p>operation、action、资源标识和真正要更新的字段不能靠猜。</p></article>
+          <article class="card"><h3>不能做的，明确拒绝</h3><p>平台不支持的语义返回 capability 错误，不静默降级。</p></article>
+          <article class="card"><h3>会失败的，说明恢复</h3><p>稳定 code、retryable 和 bounded details 让 Agent 采取正确动作。</p></article>
+          <article class="card"><h3>会变大的，先做投影</h3><p>列表和错误都有字节预算，详情通过显式操作按需读取。</p></article>
+          <article class="card"><h3>要验证的，端到端验证</h3><p>不仅测 schema，还测试真实 Agent loop 的重试、错误和上下文边界。</p></article>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell">
+      <p><strong>Bone · Agent Tool Contract v1</strong></p>
+      <p>实现参考：<a href="agent-tool-contract.md">agent-tool-contract.md</a> · <a href="forge.md">forge.md</a></p>
+    </div>
+  </footer>
+  <script>
+    document.querySelectorAll("[data-copy]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const target = document.getElementById(button.dataset.copy);
+        if (!target) return;
+        try {
+          await navigator.clipboard.writeText(target.innerText);
+          const original = button.innerText;
+          button.innerText = "已复制";
+          setTimeout(() => { button.innerText = original; }, 1400);
+        } catch {
+          button.innerText = "请手动复制";
+        }
+      });
+    });
+  </script>
+</body>
+</html>

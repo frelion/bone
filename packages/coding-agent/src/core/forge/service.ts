@@ -11,7 +11,7 @@ import { ForgeCredentialStore } from "./credential-store.ts";
 import { ForgeError } from "./errors.ts";
 import { GitHubAdapter, type GitHubWriteBody } from "./github-adapter.ts";
 import { GitLabAdapter } from "./gitlab-adapter.ts";
-import { ForgeMutationJournal } from "./mutation-journal.ts";
+import { type ForgeMutationBegin, ForgeMutationConflictError, ForgeMutationJournal } from "./mutation-journal.ts";
 import { assertPublicNetworkHostname, createPublicNetworkDispatcher } from "./network-security.ts";
 import {
 	enforceForgePolicy,
@@ -28,6 +28,7 @@ import {
 	MAX_FORGE_QUERY_LIMIT,
 	projectForgeBatch,
 	projectForgeDetail,
+	projectForgeMutation,
 	projectForgePage,
 	projectForgeResource,
 } from "./result.ts";
@@ -146,10 +147,165 @@ function gitLabBody(body: Record<string, unknown>): GitLabWriteBody {
 			typeof value === "string" ||
 			typeof value === "number" ||
 			typeof value === "boolean" ||
-			(Array.isArray(value) && value.every((item) => typeof item === "string"));
+			(Array.isArray(value) &&
+				value.every(
+					(item) =>
+						typeof item === "string" ||
+						typeof item === "number" ||
+						(typeof item === "object" &&
+							item !== null &&
+							!Array.isArray(item) &&
+							Object.values(item).every((entry) => typeof entry === "string")),
+				));
 		if (!valid) throw new ForgeError("validation_failed", `GitLab field ${key} has an unsupported value`);
 	}
 	return body as GitLabWriteBody;
+}
+
+function defined(entries: Record<string, unknown>): Record<string, unknown> {
+	return Object.fromEntries(Object.entries(entries).filter(([, value]) => value !== undefined));
+}
+
+function normalizedMutationBody(
+	provider: "gitlab" | "github",
+	toolName: ForgeToolName,
+	action: string,
+	id: unknown,
+	body: Record<string, unknown>,
+): Record<string, unknown> {
+	if (toolName === "forge_issue") {
+		return defined({
+			title: body.title,
+			[provider === "gitlab" ? "description" : "body"]: body.body ?? body.description,
+			labels: body.labels,
+			...(provider === "github" ? { assignees: body.assignees } : { assignee_ids: body.assignee_ids }),
+			[provider === "gitlab" ? "milestone_id" : "milestone"]:
+				body.milestoneNumber ?? body.milestone_id ?? body.milestone,
+		});
+	}
+	if (toolName === "forge_milestone") {
+		const dueDate = typeof body.dueDate === "string" ? body.dueDate : undefined;
+		return defined({
+			title: body.title,
+			description: body.description,
+			[provider === "gitlab" ? "due_date" : "due_on"]:
+				provider === "github" && dueDate ? `${dueDate}T00:00:00Z` : (dueDate ?? body.due_date ?? body.due_on),
+		});
+	}
+	if (toolName === "forge_change") {
+		if (provider === "gitlab" && action === "approve" && body.body !== undefined) {
+			throw new ForgeError("unsupported_capability", "GitLab approvals do not support a review body");
+		}
+		const mergeMethod = body.mergeMethod ?? body.merge_method;
+		if (provider === "gitlab" && action === "merge" && mergeMethod === "rebase") {
+			throw new ForgeError("unsupported_capability", "GitLab merge requests do not support mergeMethod=rebase");
+		}
+		const rawTitle = body.title;
+		const title =
+			provider === "gitlab" && action === "create" && body.draft === true && typeof rawTitle === "string"
+				? /^(?:draft|wip):/i.test(rawTitle)
+					? rawTitle
+					: `Draft: ${rawTitle}`
+				: rawTitle;
+		return defined({
+			title,
+			[provider === "gitlab" ? "description" : "body"]: body.body ?? body.description,
+			[provider === "gitlab" ? "source_branch" : "head"]: body.sourceBranch ?? body.source_branch ?? body.head,
+			[provider === "gitlab" ? "target_branch" : "base"]: body.targetBranch ?? body.target_branch ?? body.base,
+			...(provider === "github" && action === "create" ? { draft: body.draft } : {}),
+			...(provider === "github" && action === "merge" ? { merge_method: mergeMethod } : {}),
+			...(provider === "gitlab" && action === "merge" && mergeMethod !== undefined
+				? { squash: mergeMethod === "squash" }
+				: {}),
+		});
+	}
+	if (toolName === "forge_pipeline" && Array.isArray(body.variables)) {
+		return {
+			...body,
+			variables: body.variables.map((entry) => {
+				if (provider !== "gitlab" || typeof entry !== "object" || entry === null || Array.isArray(entry))
+					return entry;
+				const variable = entry as Record<string, unknown>;
+				return defined({ key: variable.name, value: variable.value });
+			}),
+		};
+	}
+	if (toolName === "forge_release") {
+		if (provider === "gitlab" && (body.draft !== undefined || body.prerelease !== undefined)) {
+			throw new ForgeError("unsupported_capability", "GitLab releases do not support draft or prerelease state");
+		}
+		if (provider === "github" && body.milestoneTitles !== undefined) {
+			throw new ForgeError("unsupported_capability", "GitHub releases do not support milestone associations");
+		}
+		return defined({
+			tag_name: id,
+			name: body.name,
+			[provider === "gitlab" ? "description" : "body"]: body.body ?? body.description,
+			[provider === "gitlab" ? "ref" : "target_commitish"]: body.ref ?? body.target_commitish,
+			...(provider === "gitlab" ? { milestones: body.milestoneTitles ?? body.milestones } : {}),
+			...(provider === "github" ? { draft: body.draft, prerelease: body.prerelease } : {}),
+		});
+	}
+	if (toolName === "forge_wiki") return body;
+	if (action === "comment" || action === "approve") return defined({ body: body.body });
+	return body;
+}
+
+async function gitLabAssigneeIds(
+	adapter: GitLabAdapter,
+	value: unknown,
+	signal?: AbortSignal,
+): Promise<number[] | undefined> {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string" && entry.length > 0)) {
+		throw new ForgeError("validation_failed", "assignees must contain non-empty GitLab usernames");
+	}
+	return Promise.all(
+		value.map(async (username) => {
+			const response = await adapter.client.request<unknown>(
+				"GET",
+				`/api/v4/users?username=${encodeURIComponent(username)}`,
+				{ signal },
+			);
+			if (!Array.isArray(response.data)) {
+				throw new ForgeError("invalid_remote_response", "GitLab user lookup did not return an array");
+			}
+			const exact = response.data.find((entry) => {
+				const user = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : undefined;
+				return user?.username === username;
+			});
+			if (typeof exact !== "object" || exact === null || typeof (exact as Record<string, unknown>).id !== "number") {
+				throw new ForgeError("not_found", `GitLab assignee ${username} was not found`);
+			}
+			return (exact as { id: number }).id;
+		}),
+	);
+}
+
+async function gitLabMilestoneId(
+	adapter: GitLabAdapter,
+	project: string,
+	value: unknown,
+	signal?: AbortSignal,
+): Promise<number | undefined> {
+	if (value === undefined) return undefined;
+	const milestoneNumber = numberInput(value, "milestoneNumber");
+	const response = await adapter.client.request<unknown>(
+		"GET",
+		`/api/v4/projects/${encodeURIComponent(project)}/milestones?iids%5B%5D=${milestoneNumber}&per_page=2`,
+		{ signal },
+	);
+	if (!Array.isArray(response.data)) {
+		throw new ForgeError("invalid_remote_response", "GitLab milestone lookup did not return an array");
+	}
+	const exact = response.data.find((entry) => {
+		const milestone = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : undefined;
+		return milestone?.iid === milestoneNumber;
+	});
+	if (typeof exact !== "object" || exact === null || typeof (exact as Record<string, unknown>).id !== "number") {
+		throw new ForgeError("not_found", `GitLab milestone ${milestoneNumber} was not found`);
+	}
+	return (exact as { id: number }).id;
 }
 
 function canonical(value: unknown): unknown {
@@ -286,7 +442,7 @@ class DefaultForgeService implements ForgeService {
 	}
 
 	private async resolve(input: Record<string, unknown>): Promise<ResolvedForge> {
-		const remote = typeof input.remote === "string" ? input.remote : "origin";
+		const remote = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
 		const repository =
 			/^(?:https?|ssh|git):\/\//.test(remote) || remote.startsWith("git@")
 				? parseGitRemote(remote, "explicit", this.cwd)
@@ -368,7 +524,15 @@ class DefaultForgeService implements ForgeService {
 		}
 		const requestId = stringInput(input.requestId, "requestId");
 		const operationFingerprint = fingerprint(toolName, resolved.repository, input);
-		const begin = this.journal.begin(requestId, operationFingerprint);
+		let begin: ForgeMutationBegin;
+		try {
+			begin = this.journal.begin(requestId, operationFingerprint);
+		} catch (error) {
+			if (error instanceof ForgeMutationConflictError) {
+				throw new ForgeError("conflict", error.message, { operation: action }, { cause: error });
+			}
+			throw error;
+		}
 		if (begin.action === "replay") return begin.result;
 		if (begin.action === "in_progress" || begin.action === "ambiguous") {
 			throw new ForgeError("ambiguous_result", `Forge mutation ${requestId} is ${begin.action}`, {
@@ -380,8 +544,19 @@ class DefaultForgeService implements ForgeService {
 				toolName === "forge_transition"
 					? await this.transition(resolved, action, input, signal, context)
 					: await this.mutate(resolved, toolName, action, input, signal, context);
-			this.journal.complete(requestId, operationFingerprint, result);
-			return result;
+			const receiptResource =
+				toolName === "forge_transition"
+					? action === "release"
+						? "release"
+						: "change"
+					: toolName === "forge_pipeline" && action.includes("job")
+						? "job"
+						: toolName.replace(/^forge_/, "");
+			const receiptReference =
+				input.id ?? input.changeId ?? (toolName === "forge_transition" ? inputBody(input).tagName : undefined);
+			const receipt = projectForgeMutation(receiptResource, action, result, receiptReference);
+			this.journal.complete(requestId, operationFingerprint, receipt);
+			return receipt;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			if (
@@ -423,19 +598,18 @@ class DefaultForgeService implements ForgeService {
 		checkCapability = true,
 	): Promise<unknown> {
 		const resource = queryResource(input.resource);
-		const ids = queryIds(input.ids);
-		if (input.id !== undefined && ids) throw new ForgeError("validation_failed", "Use either id or ids, not both");
-		const detailMode = input.id !== undefined || ids !== undefined;
-		if (
-			detailMode &&
-			(input.limit !== undefined ||
-				input.cursor !== undefined ||
-				input.parentId !== undefined ||
-				input.search !== undefined ||
-				input.state !== undefined)
-		) {
-			throw new ForgeError("validation_failed", "Detail queries cannot use list filters or pagination");
+		const operation = stringInput(input.operation, "operation");
+		if (operation !== "list" && operation !== "get" && operation !== "get_many") {
+			throw new ForgeError("validation_failed", "operation must be list, get, or get_many");
 		}
+		const ids = operation === "get_many" ? queryIds(input.ids) : undefined;
+		if (operation === "get" && input.id === undefined) {
+			throw new ForgeError("validation_failed", "get requires id");
+		}
+		if (operation === "get_many" && !ids) {
+			throw new ForgeError("validation_failed", "get_many requires ids");
+		}
+		const detailMode = operation !== "list";
 		if (input.parentId !== undefined && resource !== "job") {
 			throw new ForgeError("validation_failed", "parentId is supported only for job lists");
 		}
@@ -463,15 +637,32 @@ class DefaultForgeService implements ForgeService {
 		}
 		const limit = detailMode ? undefined : queryLimit(input.limit);
 		if (checkCapability) await this.ensureResourceCapability(resolved, resource, signal);
-		if (input.id !== undefined) {
+		if (operation === "get") {
 			return projectForgeDetail(resource, await this.fetchQueryDetail(resolved, resource, input.id, signal));
 		}
-		if (ids) {
+		if (operation === "get_many" && ids) {
 			const values = await Promise.all(ids.map((id) => this.fetchQueryDetail(resolved, resource, id, signal)));
 			return projectForgeBatch(resource, values);
 		}
+		const state = typeof input.state === "string" ? input.state : undefined;
+		const normalizedState =
+			resource === "pipeline" && resolved.adapter instanceof GitHubAdapter
+				? state === "running"
+					? "in_progress"
+					: state === "pending"
+						? "queued"
+						: state === "failed"
+							? "failure"
+							: state === "canceled"
+								? "cancelled"
+								: state
+				: state === "open" && resolved.adapter instanceof GitLabAdapter
+					? resource === "milestone"
+						? "active"
+						: "opened"
+					: state;
 		const query = {
-			state: typeof input.state === "string" ? input.state : undefined,
+			...(resource === "pipeline" ? { status: normalizedState } : { state: normalizedState }),
 			search,
 			page: typeof input.cursor === "string" ? input.cursor : undefined,
 			per_page: limit,
@@ -520,7 +711,7 @@ class DefaultForgeService implements ForgeService {
 								project,
 								search,
 								"issue",
-								{ state: query.state, page: query.page, per_page: query.per_page },
+								{ state: normalizedState, page: query.page, per_page: query.per_page },
 								signal,
 							)
 						: resolved.adapter.listIssues(project, query, signal)),
@@ -535,7 +726,7 @@ class DefaultForgeService implements ForgeService {
 								project,
 								search,
 								"pr",
-								{ state: query.state, page: query.page, per_page: query.per_page },
+								{ state: normalizedState, page: query.page, per_page: query.per_page },
 								signal,
 							)
 						: resolved.adapter.listPullRequests(project, query, signal)),
@@ -960,6 +1151,28 @@ class DefaultForgeService implements ForgeService {
 		input: Record<string, unknown>,
 		signal?: AbortSignal,
 	): Promise<void> {
+		const body = inputBody(input);
+		if (
+			resolved.adapter instanceof GitLabAdapter &&
+			toolName === "forge_change" &&
+			action === "approve" &&
+			body.body !== undefined
+		) {
+			throw new ForgeError("unsupported_capability", "GitLab approvals do not support a review body");
+		}
+		if (toolName === "forge_pipeline" && resolved.adapter instanceof GitHubAdapter) {
+			if (action === "trigger" || action === "play_job" || action === "cancel_job") {
+				throw new ForgeError("unsupported_capability", `GitHub Actions does not support Forge action ${action}`);
+			}
+		}
+		if (toolName === "forge_release" || (toolName === "forge_transition" && action === "release")) {
+			if (resolved.adapter instanceof GitLabAdapter && (body.draft !== undefined || body.prerelease !== undefined)) {
+				throw new ForgeError("unsupported_capability", "GitLab releases do not support draft or prerelease state");
+			}
+			if (resolved.adapter instanceof GitHubAdapter && body.milestoneTitles !== undefined) {
+				throw new ForgeError("unsupported_capability", "GitHub releases do not support milestone associations");
+			}
+		}
 		if (resolved.adapter instanceof GitLabAdapter && toolName === "forge_change" && action === "approve") {
 			const project = encodeURIComponent(resolved.repository.projectPath);
 			const changeId = numberInput(input.id, "id");
@@ -1026,8 +1239,22 @@ class DefaultForgeService implements ForgeService {
 		context: ForgeToolContext,
 	): Promise<unknown> {
 		const project = resolved.repository.projectPath;
-		const body = inputBody(input);
-		const id = input.id;
+		const rawBody = inputBody(input);
+		let id = input.id;
+		if (resolved.adapter instanceof GitLabAdapter && toolName === "forge_milestone" && action !== "create") {
+			id = await gitLabMilestoneId(resolved.adapter, project, id, signal);
+		}
+		const body = normalizedMutationBody(resolved.repository.provider, toolName, action, id, rawBody);
+		if (resolved.adapter instanceof GitLabAdapter && toolName === "forge_issue" && rawBody.assignees !== undefined) {
+			body.assignee_ids = await gitLabAssigneeIds(resolved.adapter, rawBody.assignees, signal);
+		}
+		if (
+			resolved.adapter instanceof GitLabAdapter &&
+			toolName === "forge_issue" &&
+			rawBody.milestoneNumber !== undefined
+		) {
+			body.milestone_id = await gitLabMilestoneId(resolved.adapter, project, rawBody.milestoneNumber, signal);
+		}
 		const policy = loadForgePolicy(context.cwd, context.projectTrusted);
 		if (policy && toolName === "forge_change" && action === "create") {
 			const facts = await localFacts(context.cwd);
@@ -1062,7 +1289,7 @@ class DefaultForgeService implements ForgeService {
 					toolName === "forge_change"
 						? await this.remoteMergeFacts(resolved, numberInput(id, "id"), policy, signal)
 						: await this.remoteReleaseFacts(resolved, body, policy, signal);
-				const requestedMergeMethod = body.merge_method;
+				const requestedMergeMethod = rawBody.mergeMethod ?? body.merge_method;
 				const mergeMethod =
 					requestedMergeMethod === "merge" ||
 					requestedMergeMethod === "squash" ||
@@ -1254,8 +1481,9 @@ class DefaultForgeService implements ForgeService {
 			}
 		}
 		if (policy.workflow.release.requireMilestoneClosed && resolved.adapter instanceof GitLabAdapter) {
-			const milestoneTitles = Array.isArray(body.milestones)
-				? body.milestones.filter((value): value is string => typeof value === "string")
+			const milestones = body.milestoneTitles ?? body.milestones;
+			const milestoneTitles = Array.isArray(milestones)
+				? milestones.filter((value): value is string => typeof value === "string")
 				: [];
 			if (milestoneTitles.length > 0) {
 				const page = await resolved.adapter.listMilestones(
@@ -1363,7 +1591,7 @@ class DefaultForgeService implements ForgeService {
 		throw new ForgeError("validation_failed", `Unsupported GitLab ${toolName} action: ${action}`);
 	}
 
-	private mutateGitHub(
+	private async mutateGitHub(
 		adapter: GitHubAdapter,
 		project: string,
 		toolName: ForgeToolName,
@@ -1419,10 +1647,29 @@ class DefaultForgeService implements ForgeService {
 		if (toolName === "forge_pipeline") {
 			if (action === "retry") return adapter.rerunWorkflow(project, numberInput(id, "id"), signal);
 			if (action === "cancel") return adapter.cancelWorkflow(project, numberInput(id, "id"), signal);
+			if (action === "retry_job") {
+				return adapter.client
+					.request("POST", `/repos/${encodedGitHubProject(project)}/actions/jobs/${numberInput(id, "id")}/rerun`, {
+						signal,
+					})
+					.then((response) => response.data);
+			}
+			throw new ForgeError("unsupported_capability", `GitHub Actions does not support Forge action ${action}`);
 		}
 		if (toolName === "forge_release") {
 			if (action === "create") return adapter.createRelease(project, body, signal);
-			if (action === "update") return adapter.updateRelease(project, numberInput(id, "id"), body, signal);
+			if (action === "update") {
+				let releaseId = id;
+				if (typeof id === "string") {
+					const response = await adapter.client.request<unknown>(
+						"GET",
+						`/repos/${encodedGitHubProject(project)}/releases/tags/${encodeURIComponent(stringInput(id, "tagName"))}`,
+						{ signal },
+					);
+					releaseId = objectValue(response.data, "GitHub release by tag").id;
+				}
+				return adapter.updateRelease(project, numberInput(releaseId, "releaseId"), body, signal);
+			}
 			throw new ForgeError("validation_failed", `Unsupported GitHub release action: ${action}`);
 		}
 		if (toolName === "forge_wiki") {
@@ -1462,11 +1709,12 @@ class DefaultForgeService implements ForgeService {
 			return this.mutate(resolved, "forge_change", "create", input, signal, context);
 		}
 		if (transition === "release") {
+			const releaseInput = inputBody(input);
 			return this.mutate(
 				resolved,
 				"forge_release",
 				"create",
-				{ ...input, id: undefined, input: inputBody(input) },
+				{ ...input, id: releaseInput.tagName, input: releaseInput },
 				signal,
 				context,
 			);

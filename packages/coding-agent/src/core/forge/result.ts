@@ -192,6 +192,30 @@ export function projectForgeBatch(resource: ForgeQueryResource, values: readonly
 	return result();
 }
 
+export function projectForgeMutation(
+	resource: string,
+	action: string,
+	value: unknown,
+	reference?: unknown,
+): Record<string, unknown> {
+	const entry = object(value) ?? {};
+	const numberedResource = resource === "issue" || resource === "milestone" || resource === "change";
+	const keyedResource = resource === "wiki" || resource === "release";
+	return compactRecord({
+		ok: true,
+		resource,
+		action,
+		id:
+			number(entry.id) ??
+			text(entry.id, 128) ??
+			(!numberedResource && !keyedResource ? number(reference) : undefined),
+		number: number(entry.iid) ?? number(entry.number) ?? (numberedResource ? number(reference) : undefined),
+		key: text(entry.slug, 256) ?? text(entry.tag_name, 256) ?? (keyedResource ? text(reference, 256) : undefined),
+		state: text(entry.state, 128) ?? text(entry.status, 128),
+		webUrl: text(entry.web_url, MAX_URL_TEXT) ?? text(entry.html_url, MAX_URL_TEXT),
+	});
+}
+
 export function boundedForgeToolResult(value: unknown): { value: unknown; text: string } {
 	const serialized = typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? "null");
 	const originalBytes = Buffer.byteLength(serialized, "utf8");

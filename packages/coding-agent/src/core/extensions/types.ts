@@ -10,6 +10,7 @@
 
 import type {
 	AgentMessage,
+	AgentTool,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ThinkingLevel,
@@ -49,6 +50,7 @@ import type {
 import type { SlashCommandInfo } from "../slash-commands.ts";
 import type { SourceInfo } from "../source-info.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
+import type { AgentToolContract } from "../tools/agent-tool-contract.ts";
 import type { BashOperations } from "../tools/bash.ts";
 import type { EditToolDetails } from "../tools/edit.ts";
 import type {
@@ -211,6 +213,10 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	promptGuidelines?: string[];
 	/** Parameter schema (TypeBox) */
 	parameters: TParams;
+	/** Machine-readable behavioral contract for model-facing built-in tools. */
+	contract?: AgentToolContract;
+	/** Runtime retry policy retained when adapting a plain AgentTool. */
+	retryPolicy?: AgentTool["retryPolicy"];
 	/** Controls whether ToolExecutionComponent renders the standard colored shell or the tool renders its own framing. */
 	renderShell?: "default" | "self";
 

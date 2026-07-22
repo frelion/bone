@@ -41,3 +41,13 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: Forge protocol evaluation
+        run: npm run eval:forge:ci
+
+      - name: Upload Forge evaluation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-protocol-eval
+          path: .artifacts/forge-eval

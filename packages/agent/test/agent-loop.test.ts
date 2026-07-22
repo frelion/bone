@@ -9,7 +9,15 @@ import {
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
-import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
+import {
+	type AgentContext,
+	type AgentEvent,
+	type AgentLoopConfig,
+	type AgentMessage,
+	type AgentTool,
+	AgentToolError,
+	type AgentToolErrorDetails,
+} from "../src/types.ts";
 
 // Mock stream for testing - mimics MockAssistantStream
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -305,6 +313,649 @@ describe("agentLoop with AgentMessage", () => {
 		if (toolEnd?.type === "tool_execution_end") {
 			expect(toolEnd.isError).toBe(false);
 		}
+	});
+
+	it("blocks an unchanged retry after deterministic argument validation fails", async () => {
+		const toolSchema = Type.Object({ id: Type.Integer({ minimum: 1 }) }, { additionalProperties: false });
+		let executions = 0;
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "get_issue",
+			label: "Get issue",
+			description: "Get one issue",
+			parameters: toolSchema,
+			async execute() {
+				executions++;
+				return { content: [{ type: "text", text: "unexpected" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex < 2
+						? createAssistantMessage(
+								[
+									{
+										type: "toolCall",
+										id: `invalid-${callIndex}`,
+										name: "get_issue",
+										arguments: { id: 0 },
+									},
+								],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "stopped" }]);
+				callIndex++;
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("get issue")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+
+		expect(executions).toBe(0);
+		const results = events.filter((event) => event.type === "tool_execution_end");
+		expect(results).toHaveLength(2);
+		const second = results[1];
+		if (second?.type !== "tool_execution_end") throw new Error("Expected second tool result");
+		expect(second.isError).toBe(true);
+		expect(JSON.stringify(second.result.content)).toContain("duplicate_failed_call");
+	});
+
+	it("allows a corrected call after argument validation fails", async () => {
+		const toolSchema = Type.Object({ id: Type.Integer({ minimum: 1 }) }, { additionalProperties: false });
+		const executions: number[] = [];
+		const tool: AgentTool<typeof toolSchema, { id: number }> = {
+			name: "get_issue",
+			label: "Get issue",
+			description: "Get one issue",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executions.push(params.id);
+				return { content: [{ type: "text", text: "found" }], details: { id: params.id } };
+			},
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex < 2
+						? createAssistantMessage(
+								[
+									{
+										type: "toolCall",
+										id: `corrected-${callIndex}`,
+										name: "get_issue",
+										arguments: { id: callIndex },
+									},
+								],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				callIndex++;
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("get issue")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+
+		expect(executions).toEqual([1]);
+		expect(JSON.stringify(events)).not.toContain("duplicate_failed_call");
+	});
+
+	it("does not carry an unchanged failure guard across a new user turn", async () => {
+		const toolSchema = Type.Object({ id: Type.Integer({ minimum: 1 }) }, { additionalProperties: false });
+		let executions = 0;
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "get_issue",
+			label: "Get issue",
+			description: "Get one issue",
+			parameters: toolSchema,
+			async execute() {
+				executions++;
+				return { content: [{ type: "text", text: "found" }], details: { id: 7 } };
+			},
+		};
+		const previousAssistant = createAssistantMessage(
+			[{ type: "toolCall", id: "previous-call", name: "get_issue", arguments: { id: 7 } }],
+			"toolUse",
+		);
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [
+				createUserMessage("first attempt"),
+				previousAssistant,
+				{
+					role: "toolResult",
+					toolCallId: "previous-call",
+					toolName: "get_issue",
+					content: [{ type: "text", text: JSON.stringify({ error: { retryable: false } }) }],
+					isError: true,
+					timestamp: Date.now(),
+				},
+			],
+			tools: [tool],
+		};
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex++ === 0
+						? createAssistantMessage(
+								[{ type: "toolCall", id: "new-call", name: "get_issue", arguments: { id: 7 } }],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const stream = agentLoop(
+			[createUserMessage("try again after external changes")],
+			context,
+			config,
+			undefined,
+			streamFn,
+		);
+		for await (const event of stream) void event;
+
+		expect(executions).toBe(1);
+	});
+
+	it("allows an unchanged retry after a retryable execution failure", async () => {
+		const toolSchema = Type.Object({ id: Type.Integer({ minimum: 1 }) }, { additionalProperties: false });
+		let executions = 0;
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "get_issue",
+			label: "Get issue",
+			description: "Get one issue",
+			parameters: toolSchema,
+			retryPolicy: { maxAttempts: 2, rejectUnchangedRetry: true },
+			async execute() {
+				executions++;
+				if (executions === 1) {
+					throw new AgentToolError("rate_limited", "Try again", true);
+				}
+				return { content: [{ type: "text", text: "found" }], details: { id: 7 } };
+			},
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex < 2
+						? createAssistantMessage(
+								[
+									{
+										type: "toolCall",
+										id: `retryable-${callIndex}`,
+										name: "get_issue",
+										arguments: { id: 7 },
+									},
+								],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				callIndex++;
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("get issue")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+
+		expect(executions).toBe(2);
+		expect(JSON.stringify(events)).not.toContain("duplicate_failed_call");
+	});
+
+	it("enforces the unchanged retry attempt limit", async () => {
+		const toolSchema = Type.Object({ id: Type.Integer({ minimum: 1 }) }, { additionalProperties: false });
+		let executions = 0;
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "get_issue",
+			label: "Get issue",
+			description: "Get one issue",
+			parameters: toolSchema,
+			retryPolicy: { maxAttempts: 2, rejectUnchangedRetry: true },
+			async execute() {
+				executions++;
+				throw new AgentToolError("rate_limited", "Try again", true);
+			},
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex < 3
+						? createAssistantMessage(
+								[
+									{
+										type: "toolCall",
+										id: `bounded-retry-${callIndex}`,
+										name: "get_issue",
+										arguments: { id: 7 },
+									},
+								],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "stopped" }]);
+				callIndex++;
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("get issue")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+
+		expect(executions).toBe(2);
+		expect(JSON.stringify(events)).toContain("retry_limit_exceeded");
+	});
+
+	it("resets the retry chain after the same call succeeds", async () => {
+		const toolSchema = Type.Object({ id: Type.Integer({ minimum: 1 }) }, { additionalProperties: false });
+		let executions = 0;
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "get_issue",
+			label: "Get issue",
+			description: "Get one issue",
+			parameters: toolSchema,
+			retryPolicy: { maxAttempts: 2, rejectUnchangedRetry: true },
+			async execute() {
+				executions++;
+				return { content: [{ type: "text", text: "found" }], details: { id: 7 } };
+			},
+		};
+		const call = (id: string) =>
+			createAssistantMessage([{ type: "toolCall", id, name: "get_issue", arguments: { id: 7 } }], "toolUse");
+		const result = (toolCallId: string, isError: boolean) => ({
+			role: "toolResult" as const,
+			toolCallId,
+			toolName: "get_issue",
+			content: [
+				{
+					type: "text" as const,
+					text: isError ? JSON.stringify({ error: { code: "rate_limited", retryable: true } }) : "found",
+				},
+			],
+			isError,
+			timestamp: Date.now(),
+		});
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [
+				createUserMessage("get issue"),
+				call("failed-before-success"),
+				result("failed-before-success", true),
+				call("successful-call"),
+				result("successful-call", false),
+				call("new-failure"),
+				result("new-failure", true),
+			],
+			tools: [tool],
+		};
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex++ === 0
+						? call("retry-after-success")
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const stream = agentLoopContinue(context, config, undefined, streamFn);
+		for await (const event of stream) void event;
+
+		expect(executions).toBe(1);
+	});
+
+	it("fingerprints equivalent prepared arguments as the same call", async () => {
+		const toolSchema = Type.Object({ id: Type.Integer({ minimum: 1 }) }, { additionalProperties: false });
+		let executions = 0;
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "get_issue",
+			label: "Get issue",
+			description: "Get one issue",
+			parameters: toolSchema,
+			prepareArguments: (args) => ({ id: Number((args as { id?: unknown }).id) }),
+			retryPolicy: { maxAttempts: 2, rejectUnchangedRetry: true },
+			async execute() {
+				executions++;
+				return { content: [{ type: "text", text: "unexpected" }], details: {} };
+			},
+		};
+		const previous = createAssistantMessage(
+			[{ type: "toolCall", id: "prepared-string", name: "get_issue", arguments: { id: "7" } }],
+			"toolUse",
+		);
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [
+				createUserMessage("get issue"),
+				previous,
+				{
+					role: "toolResult",
+					toolCallId: "prepared-string",
+					toolName: "get_issue",
+					content: [{ type: "text", text: JSON.stringify({ error: { code: "not_found", retryable: false } }) }],
+					isError: true,
+					timestamp: Date.now(),
+				},
+			],
+			tools: [tool],
+		};
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex++ === 0
+						? createAssistantMessage(
+								[{ type: "toolCall", id: "prepared-number", name: "get_issue", arguments: { id: 7 } }],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "stopped" }]);
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoopContinue(context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+
+		expect(executions).toBe(0);
+		expect(JSON.stringify(events)).toContain("duplicate_failed_call");
+	});
+
+	it("serializes unsafe AgentToolError details from prepareArguments safely", async () => {
+		const githubToken = `ghp_${"A".repeat(36)}`;
+		const openAiToken = `sk-proj-${"D".repeat(36)}`;
+		const details: Record<string, unknown> = {
+			token: githubToken,
+			message: "多字节错误信息".repeat(2_000),
+			count: 1n,
+		};
+		for (let index = 0; index < 20; index++) details[`payload${index}`] = '\0"\\'.repeat(2_000);
+		details.self = details;
+		const toolSchema = Type.Object({}, { additionalProperties: false });
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "unsafe_prepare",
+			label: "Unsafe prepare",
+			description: "Raises a structured error while preparing arguments",
+			parameters: toolSchema,
+			prepareArguments: () => {
+				throw new AgentToolError(
+					"invalid_remote_response",
+					`bad response ${githubToken} ${openAiToken} ${'\0"\\'.repeat(2_000_000)}`,
+					false,
+					details as unknown as AgentToolErrorDetails,
+				);
+			},
+			async execute() {
+				throw new Error("must not execute");
+			},
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex++ === 0
+						? createAssistantMessage(
+								[{ type: "toolCall", id: "unsafe-prepare", name: "unsafe_prepare", arguments: {} }],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("prepare")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+		const toolEnd = events.find((event) => event.type === "tool_execution_end");
+		if (toolEnd?.type !== "tool_execution_end") throw new Error("Expected tool result");
+		const text = toolEnd.result.content[0]?.type === "text" ? toolEnd.result.content[0].text : "";
+		expect(() => JSON.parse(text)).not.toThrow();
+		expect(text).not.toContain(githubToken);
+		expect(text).not.toContain(openAiToken);
+		expect(new TextEncoder().encode(text).byteLength).toBeLessThanOrEqual(4 * 1024);
+	});
+
+	it("serializes unsafe AgentToolError details from execute safely", async () => {
+		const details = new Proxy<Record<string, unknown>>(
+			{
+				apiKey: "should-not-leak",
+				retryAfterSeconds: 99n,
+				[`token=ghp_${"C".repeat(36)}`]: true,
+			},
+			{
+				ownKeys() {
+					throw new Error("details must not be enumerated");
+				},
+			},
+		);
+		const toolSchema = Type.Object({}, { additionalProperties: false });
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "unsafe_execute",
+			label: "Unsafe execute",
+			description: "Raises a structured execution error",
+			parameters: toolSchema,
+			async execute() {
+				throw new AgentToolError(
+					"execution_failed",
+					"execution failed",
+					false,
+					details as unknown as AgentToolErrorDetails,
+				);
+			},
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex++ === 0
+						? createAssistantMessage(
+								[{ type: "toolCall", id: "unsafe-execute", name: "unsafe_execute", arguments: {} }],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("execute")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+		const toolEnd = events.find((event) => event.type === "tool_execution_end");
+		if (toolEnd?.type !== "tool_execution_end") throw new Error("Expected tool result");
+		const text = toolEnd.result.content[0]?.type === "text" ? toolEnd.result.content[0].text : "";
+		expect(() => JSON.parse(text)).not.toThrow();
+		expect(text).not.toContain("should-not-leak");
+		expect(text).toContain("99n");
+		expect(text).not.toContain("self");
+	});
+
+	it("serializes unsafe AgentToolError details from afterToolCall safely", async () => {
+		const gitlabToken = `glpat-${"B".repeat(20)}`;
+		const anthropicToken = `sk-ant-${"E".repeat(30)}`;
+		const details: Record<string, unknown> = {
+			authorization: "Bearer should-not-leak",
+			provider: gitlabToken,
+			requestId: anthropicToken,
+			statusCode: 123n,
+		};
+		details.self = details;
+		const toolSchema = Type.Object({}, { additionalProperties: false });
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "unsafe_after",
+			label: "Unsafe after",
+			description: "Returns a result before the after hook fails",
+			parameters: toolSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "ok" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			afterToolCall: async () => {
+				throw new AgentToolError("hook_failed", "hook failed", false, details as unknown as AgentToolErrorDetails);
+			},
+		};
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex++ === 0
+						? createAssistantMessage(
+								[{ type: "toolCall", id: "unsafe-after", name: "unsafe_after", arguments: {} }],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("after")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+		const toolEnd = events.find((event) => event.type === "tool_execution_end");
+		if (toolEnd?.type !== "tool_execution_end") throw new Error("Expected tool result");
+		const text = toolEnd.result.content[0]?.type === "text" ? toolEnd.result.content[0].text : "";
+		expect(() => JSON.parse(text)).not.toThrow();
+		expect(text).not.toContain("should-not-leak");
+		expect(text).not.toContain(gitlabToken);
+		expect(text).not.toContain(anthropicToken);
+		expect(text).toContain("hook_failed");
+	});
+
+	it("bounds and redacts unstructured tool errors", async () => {
+		const openAiToken = `sk-proj-${"F".repeat(36)}`;
+		const toolSchema = Type.Object({}, { additionalProperties: false });
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "unsafe_unstructured_error",
+			label: "Unsafe unstructured error",
+			description: "Raises a large plain error",
+			parameters: toolSchema,
+			async execute() {
+				throw new Error(`request failed ${openAiToken} ${"x".repeat(6_000_000)}`);
+			},
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex++ === 0
+						? createAssistantMessage(
+								[
+									{
+										type: "toolCall",
+										id: "unsafe-unstructured-error",
+										name: "unsafe_unstructured_error",
+										arguments: {},
+									},
+								],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("plain error")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+		const toolEnd = events.find((event) => event.type === "tool_execution_end");
+		if (toolEnd?.type !== "tool_execution_end") throw new Error("Expected tool result");
+		const text = toolEnd.result.content[0]?.type === "text" ? toolEnd.result.content[0].text : "";
+		expect(text).not.toContain(openAiToken);
+		expect(new TextEncoder().encode(text).byteLength).toBeLessThanOrEqual(4 * 1024);
+	});
+
+	it("handles an unreadable proxied tool error", async () => {
+		const toolSchema = Type.Object({}, { additionalProperties: false });
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "unreadable_error",
+			label: "Unreadable error",
+			description: "Raises a revoked proxy",
+			parameters: toolSchema,
+			async execute() {
+				const error = Proxy.revocable(new Error("hidden"), {});
+				error.revoke();
+				throw error.proxy;
+			},
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex++ === 0
+						? createAssistantMessage(
+								[{ type: "toolCall", id: "unreadable-error", name: "unreadable_error", arguments: {} }],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("proxy error")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+		const toolEnd = events.find((event) => event.type === "tool_execution_end");
+		if (toolEnd?.type !== "tool_execution_end") throw new Error("Expected tool result");
+		expect(toolEnd.result.content).toEqual([
+			{ type: "text", text: "Tool execution failed with an unreadable error." },
+		]);
 	});
 
 	it("should not execute tool calls from a length-truncated assistant message", async () => {

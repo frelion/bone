@@ -6,6 +6,12 @@
 
 - Changed the supported runtime to Bun 1.3.14 or newer.
 
+### Fixed
+
+- Rejected unchanged retries after deterministic tool validation or non-retryable execution failures, while continuing to allow changed arguments and transient retries.
+- Added structured `AgentToolError` failures, bounded retry attempts, prepared-argument fingerprints, success resets, and user-turn boundaries for model-facing tool retry chains.
+- Bounded and sanitized structured and plain tool failures so circular values, unsupported JSON types, oversized payloads, and secret-like fields cannot break the agent loop or consume unbounded model context.
+
 ## [0.1.3] - 2026-07-22
 
 ## [0.1.2] - 2026-07-22

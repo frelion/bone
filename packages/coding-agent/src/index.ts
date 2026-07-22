@@ -214,6 +214,12 @@ export { createSyntheticSourceInfo } from "./core/source-info.ts";
 export { type EditDiffResult, generateDiffString, generateUnifiedPatch } from "./core/tools/edit-diff.ts";
 // Tools
 export {
+	type AgentToolContract,
+	type AgentToolEffect,
+	type AgentToolExample,
+	type AgentToolIdempotency,
+	type AgentToolOutputBudget,
+	type AgentToolRetryPolicy,
 	type BashOperations,
 	type BashSpawnContext,
 	type BashSpawnHook,
@@ -233,6 +239,7 @@ export {
 	createWriteToolDefinition,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
+	defineAgentToolContract,
 	type EditOperations,
 	type EditToolDetails,
 	type EditToolInput,

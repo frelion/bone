@@ -5,6 +5,48 @@ import type { Tool, ToolCall } from "../types.ts";
 
 const validatorCache = new WeakMap<object, ReturnType<typeof Compile>>();
 const TYPEBOX_KIND = Symbol.for("TypeBox.Kind");
+const MAX_VALIDATION_ERRORS = 20;
+const MAX_VALIDATION_ERROR_BYTES = 4 * 1024;
+const MAX_VALIDATION_ARGUMENT_BYTES = 4 * 1024;
+
+function boundedUtf8(value: string, maximumBytes: number): { text: string; truncated: boolean; originalBytes: number } {
+	const encoder = new TextEncoder();
+	const originalBytes = encoder.encode(value).byteLength;
+	if (originalBytes <= maximumBytes) return { text: value, truncated: false, originalBytes };
+	let bytes = 0;
+	let text = "";
+	for (const character of value) {
+		const characterBytes = encoder.encode(character).byteLength;
+		if (bytes + characterBytes > maximumBytes) break;
+		text += character;
+		bytes += characterBytes;
+	}
+	return { text, truncated: true, originalBytes };
+}
+
+function validationErrorLines(errors: Iterable<TLocalizedValidationError>): string {
+	const lines: string[] = [];
+	let omitted = false;
+	for (const error of errors) {
+		if (lines.length === MAX_VALIDATION_ERRORS) {
+			omitted = true;
+			break;
+		}
+		lines.push(`  - ${formatValidationPath(error)}: ${error.message}`);
+	}
+	if (omitted) lines.push(`  - Additional validation errors omitted after ${MAX_VALIDATION_ERRORS} entries`);
+	const bounded = boundedUtf8(lines.join("\n") || "Unknown validation error", MAX_VALIDATION_ERROR_BYTES);
+	return bounded.truncated
+		? `${bounded.text}\n... validation errors truncated (${bounded.originalBytes} bytes total)`
+		: bounded.text;
+}
+
+function validationArgumentsPreview(value: unknown): string {
+	const serialized = JSON.stringify(value, null, 2) ?? String(value);
+	const bounded = boundedUtf8(serialized, MAX_VALIDATION_ARGUMENT_BYTES);
+	if (!bounded.truncated) return bounded.text;
+	return `${bounded.text}\n... arguments truncated (${bounded.originalBytes} bytes total, ${MAX_VALIDATION_ARGUMENT_BYTES} byte preview)`;
+}
 
 interface JsonSchemaObject {
 	type?: string | string[];
@@ -298,13 +340,9 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): any {
 		return args;
 	}
 
-	const errors =
-		validator
-			.Errors(args)
-			.map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
-			.join("\n") || "Unknown validation error";
+	const errors = validationErrorLines(validator.Errors(args));
 
-	const errorMessage = `Validation failed for tool "${toolCall.name}":\n${errors}\n\nReceived arguments:\n${JSON.stringify(toolCall.arguments, null, 2)}`;
+	const errorMessage = `Validation failed for tool "${toolCall.name}":\n${errors}\n\nReceived arguments:\n${validationArgumentsPreview(toolCall.arguments)}`;
 
 	throw new Error(errorMessage);
 }

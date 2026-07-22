@@ -361,6 +361,38 @@ export interface AgentToolResult<T> {
 	terminate?: boolean;
 }
 
+/** Bounded diagnostic metadata that may be exposed to the model for recovery. */
+export interface AgentToolErrorDetails {
+	retryAfterSeconds?: number;
+	statusCode?: number;
+	provider?: string;
+	resource?: string;
+	operation?: string;
+	field?: string;
+	requestId?: string;
+}
+
+/** Structured execution failure for model-facing tools. */
+export class AgentToolError extends Error {
+	readonly code: string;
+	readonly retryable: boolean;
+	readonly details?: Readonly<AgentToolErrorDetails>;
+
+	constructor(
+		code: string,
+		message: string,
+		retryable: boolean,
+		details?: Readonly<AgentToolErrorDetails>,
+		options?: ErrorOptions,
+	) {
+		super(message, options);
+		this.name = "AgentToolError";
+		this.code = code;
+		this.retryable = retryable;
+		this.details = details;
+	}
+}
+
 /**
  * Callback used by tools to stream partial execution updates.
  *
@@ -378,6 +410,11 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * Must return an object that matches `TParameters`.
 	 */
 	prepareArguments?: (args: unknown) => Static<TParameters>;
+	/** Runtime retry guard for unchanged calls within one autonomous user turn. */
+	retryPolicy?: {
+		maxAttempts: number;
+		rejectUnchangedRetry: boolean;
+	};
 	/** Execute the tool call. Throw on failure instead of encoding errors in `content`. */
 	execute: (
 		toolCallId: string,

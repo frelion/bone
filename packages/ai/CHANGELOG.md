@@ -9,6 +9,8 @@
 ### Fixed
 
 - Identified OpenAI-compatible SDK requests as `bone-ai` so gateways do not reject Bone as an official OpenAI SDK client.
+- Bounded tool-argument validation errors to a UTF-8-safe preview so malformed calls cannot flood the Agent context with their full payload.
+- Preserved root-level union schemas when converting tools for Anthropic so operation-specific parameters remain visible to Claude.
 
 ## [0.1.3] - 2026-07-22
 
