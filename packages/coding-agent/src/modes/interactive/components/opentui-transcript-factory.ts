@@ -11,7 +11,12 @@ import {
 } from "../../../core/messages.ts";
 import type { SessionEntry } from "../../../core/session-manager.ts";
 import { decodeOpenTUIImages, OpenTUIImageAttachments } from "./opentui-image.ts";
-import { OpenTUIAssistantMessage, OpenTUIPlanProposal, OpenTUIUserMessage } from "./opentui-messages.ts";
+import {
+	hasVisibleOpenTUIAssistantContent,
+	OpenTUIAssistantMessage,
+	OpenTUIPlanProposal,
+	OpenTUIUserMessage,
+} from "./opentui-messages.ts";
 import {
 	OpenTUIBashExecution,
 	OpenTUIBranchSummary,
@@ -20,6 +25,7 @@ import {
 	type OpenTUIImageAttachment,
 	OpenTUISkillInvocation,
 	OpenTUIToolExecution,
+	OpenTUIWorkingGroup,
 } from "./opentui-rich-messages.ts";
 
 export interface OpenTUITranscriptFactoryOptions {
@@ -28,6 +34,7 @@ export interface OpenTUITranscriptFactoryOptions {
 	hideProposedPlan?: boolean;
 	showImages?: boolean;
 	imageWidthCells?: number;
+	now?: () => number;
 }
 
 export interface OpenTUITranscriptFactoryResolvers {
@@ -106,6 +113,7 @@ class OpenTUIStructuredToolExecution implements BoneView {
 	private args: unknown;
 	private result: ToolResultMessage | undefined;
 	private isPartial = true;
+	private expanded = false;
 	private executionStarted = false;
 	private argsComplete = false;
 	private context: BoneRenderContext | undefined;
@@ -132,6 +140,8 @@ class OpenTUIStructuredToolExecution implements BoneView {
 	mount(context: BoneRenderContext): BoneNode {
 		this.context = context;
 		this.root = context.createBox({ flexDirection: "column" });
+		this.currentView = undefined;
+		this.currentNode = undefined;
 		this.refresh();
 		return this.root;
 	}
@@ -165,8 +175,14 @@ class OpenTUIStructuredToolExecution implements BoneView {
 		this.refresh();
 	}
 
+	setExpanded(expanded: boolean): void {
+		this.expanded = expanded;
+		this.fallback.setExpanded(expanded);
+		this.refresh();
+	}
+
 	private refresh(): void {
-		if (!this.context || !this.root) return;
+		if (!this.context || !this.root || this.root.destroyed) return;
 		const renderer = this.getRenderer();
 		const renderContext: ExtensionUIToolViewState = {
 			toolCallId: this.toolCallId,
@@ -176,7 +192,7 @@ class OpenTUIStructuredToolExecution implements BoneView {
 			executionStarted: this.executionStarted,
 			argsComplete: this.argsComplete,
 			isPartial: this.isPartial,
-			expanded: false,
+			expanded: this.expanded,
 			isError: this.result?.isError ?? false,
 			previousView: this.currentView,
 		};
@@ -191,7 +207,7 @@ class OpenTUIStructuredToolExecution implements BoneView {
 								addedToolNames: this.result.addedToolNames,
 							},
 							isPartial: this.isPartial,
-							expanded: false,
+							expanded: this.expanded,
 						},
 						renderContext,
 					)
@@ -260,6 +276,11 @@ export class OpenTUITranscriptFactory {
 	private readonly pendingTools = new Map<string, OpenTUIStructuredToolExecution>();
 	private readonly completedLiveTools = new Set<string>();
 	private readonly toolArgs = new Map<string, unknown>();
+	private readonly toolGroups = new Set<OpenTUIWorkingGroup>();
+	private readonly toolGroupByCall = new Map<string, { key: string; view: OpenTUIWorkingGroup }>();
+	private activeToolGroup: { key: string; view: OpenTUIWorkingGroup } | undefined;
+	private toolGroupSequence = 0;
+	private expandAllToolDetails = false;
 
 	constructor(options: OpenTUITranscriptFactoryOptions = {}, resolvers: OpenTUITranscriptFactoryResolvers = {}) {
 		this.options = {
@@ -268,12 +289,74 @@ export class OpenTUITranscriptFactory {
 			hideProposedPlan: options.hideProposedPlan ?? false,
 			showImages: options.showImages ?? true,
 			imageWidthCells: options.imageWidthCells ?? 40,
+			now: options.now ?? Date.now,
 		};
 		this.resolvers = resolvers;
 	}
 
 	setResolvers(resolvers: OpenTUITranscriptFactoryResolvers): void {
 		this.resolvers = resolvers;
+	}
+
+	setAllToolDetailsExpanded(expanded: boolean): void {
+		this.expandAllToolDetails = expanded;
+		for (const group of this.toolGroups) group.setExpanded(expanded);
+	}
+
+	async createSessionEntries(entries: readonly SessionEntry[]): Promise<OpenTUITranscriptItem[]> {
+		const items: OpenTUITranscriptItem[] = [];
+		let pendingSequence: { key: string; startedAt: number } | undefined;
+		let replayGroup: { key: string; view: OpenTUIWorkingGroup; clock: { completedAt: number } } | undefined;
+		const flushGroup = (): void => {
+			if (!replayGroup) return;
+			this.toolGroups.add(replayGroup.view);
+			if (this.expandAllToolDetails) replayGroup.view.setExpanded(true);
+			items.push({ key: replayGroup.key, view: replayGroup.view });
+			replayGroup = undefined;
+			pendingSequence = undefined;
+		};
+
+		for (const entry of entries) {
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				this.rememberToolArgs(entry.message);
+				const hasToolCalls = entry.message.content.some((content) => content.type === "toolCall");
+				if (!this.hasVisibleAssistantContent(entry.message)) {
+					if (hasToolCalls)
+						pendingSequence ??= { key: `working-group:replay:${entry.id}`, startedAt: entry.message.timestamp };
+					continue;
+				}
+				flushGroup();
+				pendingSequence = undefined;
+				const item = await this.createSessionEntry(entry);
+				if (item) items.push(item);
+				continue;
+			}
+
+			if (entry.type === "message" && entry.message.role === "toolResult") {
+				if (!replayGroup) {
+					const startedAt = pendingSequence?.startedAt ?? entry.message.timestamp;
+					const clock = { completedAt: entry.message.timestamp };
+					replayGroup = {
+						key: pendingSequence?.key ?? `working-group:replay:${entry.id}`,
+						view: new OpenTUIWorkingGroup(startedAt, () => clock.completedAt),
+						clock,
+					};
+				}
+				replayGroup.clock.completedAt = entry.message.timestamp;
+				const view = await this.createCompletedToolView(entry.message);
+				replayGroup.view.addTool(entry.message.toolCallId, view);
+				replayGroup.view.markToolComplete(entry.message.toolCallId, entry.message.isError);
+				continue;
+			}
+
+			const item = await this.createSessionEntry(entry);
+			if (!item) continue;
+			flushGroup();
+			pendingSequence = undefined;
+			items.push(item);
+		}
+		flushGroup();
+		return items;
 	}
 
 	async createSessionEntry(entry: SessionEntry): Promise<OpenTUITranscriptItem | undefined> {
@@ -355,14 +438,7 @@ export class OpenTUITranscriptFactory {
 				this.rememberToolArgs(message);
 				return { key, view: this.createAssistant(message) };
 			case "toolResult": {
-				const view = this.createToolView(
-					message.toolName,
-					message.toolCallId,
-					this.toolArgs.get(message.toolCallId) ?? {},
-				);
-				view.setArgsComplete();
-				view.markExecutionStarted();
-				view.updateResult(message, false, await this.decodeImages(message.content));
+				const view = await this.createCompletedToolView(message);
 				return { key, view };
 			}
 			case "bashExecution": {
@@ -407,15 +483,18 @@ export class OpenTUITranscriptFactory {
 					return { type: "ignored" };
 				}
 				if (event.message.role === "assistant") {
+					if (this.hasVisibleAssistantContent(event.message)) this.activeToolGroup = undefined;
 					this.rememberToolArgs(event.message);
 					const key = keyForMessage(event.message);
 					const view = this.createAssistant(event.message);
 					this.streamingAssistant = { key, view };
 					return { type: "append", item: { key, view } };
 				}
+				this.activeToolGroup = undefined;
 				return this.appendMessage(await this.createMessage(event.message));
 			case "message_update":
 				if (event.message.role !== "assistant" || !this.streamingAssistant) return { type: "ignored" };
+				if (this.hasVisibleAssistantContent(event.message)) this.activeToolGroup = undefined;
 				this.rememberToolArgs(event.message);
 				this.streamingAssistant.view.updateContent(event.message);
 				return {
@@ -425,6 +504,7 @@ export class OpenTUITranscriptFactory {
 				};
 			case "message_end":
 				if (event.message.role === "assistant" && this.streamingAssistant) {
+					if (this.hasVisibleAssistantContent(event.message)) this.activeToolGroup = undefined;
 					this.rememberToolArgs(event.message);
 					this.streamingAssistant.view.updateContent(event.message);
 					if (event.message.stopReason === "aborted" || event.message.stopReason === "error") {
@@ -448,14 +528,26 @@ export class OpenTUITranscriptFactory {
 				if (existing) {
 					existing.updateArgs(event.args);
 					existing.markExecutionStarted();
-					return { type: "updated", key: `tool:${event.toolCallId}`, view: existing };
+					const group = this.toolGroupByCall.get(event.toolCallId);
+					return group ? { type: "updated", key: group.key, view: group.view } : { type: "ignored" };
 				}
 				this.toolArgs.set(event.toolCallId, event.args);
 				const view = this.createToolView(event.toolName, event.toolCallId, event.args);
 				view.setArgsComplete();
 				view.markExecutionStarted();
 				this.pendingTools.set(event.toolCallId, view);
-				return { type: "append", item: { key: `tool:${event.toolCallId}`, view } };
+				const isNewGroup = !this.activeToolGroup;
+				if (!this.activeToolGroup) {
+					const group = new OpenTUIWorkingGroup(this.options.now(), this.options.now);
+					this.activeToolGroup = { key: `working-group:${++this.toolGroupSequence}`, view: group };
+					this.toolGroups.add(group);
+				}
+				this.activeToolGroup.view.addTool(event.toolCallId, view);
+				if (this.expandAllToolDetails) this.activeToolGroup.view.setExpanded(true);
+				this.toolGroupByCall.set(event.toolCallId, this.activeToolGroup);
+				return isNewGroup
+					? { type: "append", item: { key: this.activeToolGroup.key, view: this.activeToolGroup.view } }
+					: { type: "updated", key: this.activeToolGroup.key, view: this.activeToolGroup.view };
 			}
 			case "tool_execution_update": {
 				const view = this.pendingTools.get(event.toolCallId);
@@ -466,6 +558,9 @@ export class OpenTUITranscriptFactory {
 				const wasPending = this.pendingTools.has(event.toolCallId);
 				const updated = await this.updateTool(event.toolCallId, event.toolName, event.result, event.isError, false);
 				this.pendingTools.delete(event.toolCallId);
+				const group = this.toolGroupByCall.get(event.toolCallId)?.view;
+				group?.markToolComplete(event.toolCallId, event.isError);
+				if (group && this.expandAllToolDetails) group.setExpanded(true);
 				if (wasPending) this.completedLiveTools.add(event.toolCallId);
 				return updated;
 			}
@@ -474,6 +569,7 @@ export class OpenTUITranscriptFactory {
 				this.streamingAssistant = undefined;
 				this.pendingTools.clear();
 				this.completedLiveTools.clear();
+				this.activeToolGroup = undefined;
 				return { type: "ignored" };
 			default:
 				return { type: "ignored" };
@@ -482,6 +578,14 @@ export class OpenTUITranscriptFactory {
 
 	private createAssistant(message: AssistantMessage): OpenTUIAssistantMessage {
 		return new OpenTUIAssistantMessage(message, {
+			hideThinkingBlock: this.options.hideThinkingBlock,
+			hiddenThinkingLabel: this.options.hiddenThinkingLabel,
+			hideProposedPlan: this.options.hideProposedPlan,
+		});
+	}
+
+	private hasVisibleAssistantContent(message: AssistantMessage): boolean {
+		return hasVisibleOpenTUIAssistantContent(message, {
 			hideThinkingBlock: this.options.hideThinkingBlock,
 			hiddenThinkingLabel: this.options.hiddenThinkingLabel,
 			hideProposedPlan: this.options.hideProposedPlan,
@@ -497,6 +601,18 @@ export class OpenTUITranscriptFactory {
 			() => this.resolvers.getToolRenderer?.(toolName),
 			this.resolvers.onError,
 		);
+	}
+
+	private async createCompletedToolView(message: ToolResultMessage): Promise<OpenTUIStructuredToolExecution> {
+		const view = this.createToolView(
+			message.toolName,
+			message.toolCallId,
+			this.toolArgs.get(message.toolCallId) ?? {},
+		);
+		view.setArgsComplete();
+		view.markExecutionStarted();
+		view.updateResult(message, false, await this.decodeImages(message.content));
+		return view;
 	}
 
 	private rememberToolArgs(message: AssistantMessage): void {
@@ -522,6 +638,7 @@ export class OpenTUITranscriptFactory {
 				},
 				false,
 			);
+			this.toolGroupByCall.get(toolCallId)?.view.markToolComplete(toolCallId, true);
 		}
 		this.pendingTools.clear();
 	}
@@ -537,7 +654,8 @@ export class OpenTUITranscriptFactory {
 		if (!view) return { type: "ignored" };
 		const message = toolResultFromEvent(toolName, toolCallId, result, isError);
 		view.updateResult(message, partial, await this.decodeImages(message.content));
-		return { type: "updated", key: `tool:${toolCallId}`, view };
+		const group = this.toolGroupByCall.get(toolCallId);
+		return group ? { type: "updated", key: group.key, view: group.view } : { type: "ignored" };
 	}
 
 	private async decodeImages(content: unknown): Promise<OpenTUIImageAttachment[]> {

@@ -13,6 +13,7 @@
 
 - Retained autocomplete, fuzzy matching, terminal color parsing, and Unicode/ANSI width helpers as renderer-independent utilities.
 - Tests now run exclusively with Bun.
+- Added renderer resize subscriptions and runtime-updatable overlay layouts with backdrop colors for responsive product UI.
 
 ### Added
 

@@ -124,6 +124,8 @@ function createRuntime(
 			settingsManager: {
 				getShowImages: () => true,
 				getHideThinkingBlock: () => false,
+				getSidebarWidth: () => undefined,
+				setSidebarWidth: vi.fn(),
 			},
 		},
 	} as unknown as AgentSessionRuntime;
@@ -178,6 +180,7 @@ class FakeHost implements OpenTUISessionHostContract {
 		nextOffset: 0,
 	}));
 	readonly getSessionState = vi.fn((_sessionPath: string) => "cold" as const);
+	readonly getSessionPresentation = vi.fn((_sessionPath: string) => ({ state: "cold" as const }));
 	readonly getSessionSummaries = vi.fn(async (_paths: readonly string[]) => [] as InteractiveSessionSummary[]);
 
 	constructor(runtime: AgentSessionRuntime) {
@@ -304,7 +307,12 @@ describe("OpenTUIInteractiveMode", () => {
 		await mode.idle();
 		await settle(renderer);
 
-		const frame = renderer.captureFrame();
+		let frame = renderer.captureFrame();
+		expect(frame).toContain("✓ Worked for 1s · 1 tool calls");
+		expect(frame).not.toContain("final chunk");
+		renderer.input.pressKey("o", { ctrl: true });
+		await settle(renderer);
+		frame = renderer.captureFrame();
 		expect(frame).toContain("read · complete");
 		expect(frame).toContain("final chunk");
 		mode.stop();

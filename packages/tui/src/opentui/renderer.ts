@@ -1,4 +1,4 @@
-import { type CliRenderer, createCliRenderer, type KeyEvent, type Renderable } from "@opentui/core";
+import { CliRenderEvents, type CliRenderer, createCliRenderer, type KeyEvent, type Renderable } from "@opentui/core";
 import { BoneNodeFactory, getNativeNode } from "./nodes.ts";
 import type {
 	BoneBoxOptions,
@@ -19,6 +19,7 @@ import type {
 	BoneOverlayOptions,
 	BoneRenderer,
 	BoneRendererOptions,
+	BoneResizeListener,
 	BoneScrollViewNode,
 	BoneScrollViewOptions,
 	BoneSelectNode,
@@ -86,6 +87,24 @@ class OverlayHandleImpl implements BoneOverlayHandle {
 		this.node.focus();
 	}
 
+	update(options: BoneOverlayOptions): void {
+		if (this.closed) return;
+		this.wrapper.updateLayout({
+			padding: options.margin ?? 0,
+			zIndex: options.zIndex ?? 0,
+			...anchorLayout(options.anchor ?? "center"),
+		});
+		if (options.backdropColor !== undefined) {
+			this.wrapper.updateStyle({ backgroundColor: options.backdropColor });
+		}
+		this.node.updateLayout({
+			width: options.width,
+			height: options.height,
+			maxWidth: options.maxWidth,
+			maxHeight: options.maxHeight,
+		});
+	}
+
 	close(): void {
 		if (this.closed) return;
 		this.closed = true;
@@ -108,7 +127,9 @@ export class BoneRendererImpl implements BoneRenderer {
 	protected readonly nativeRenderer: CliRenderer;
 	private readonly nodes: BoneNodeFactory;
 	private readonly keyListeners = new Set<BoneKeyListener>();
+	private readonly resizeListeners = new Set<BoneResizeListener>();
 	private readonly keyHandler: (event: KeyEvent) => void;
+	private readonly resizeHandler: (width: number, height: number) => void;
 
 	constructor(nativeRenderer: CliRenderer) {
 		this.nativeRenderer = nativeRenderer;
@@ -151,6 +172,10 @@ export class BoneRendererImpl implements BoneRenderer {
 		};
 		nativeRenderer.keyInput.on("keypress", this.keyHandler);
 		nativeRenderer.keyInput.on("keyrelease", this.keyHandler);
+		this.resizeHandler = (width, height) => {
+			for (const listener of this.resizeListeners) listener(width, height);
+		};
+		nativeRenderer.on(CliRenderEvents.RESIZE, this.resizeHandler);
 	}
 
 	get width(): number {
@@ -212,7 +237,6 @@ export class BoneRendererImpl implements BoneRenderer {
 	}
 
 	showOverlay(node: BoneNode, options: BoneOverlayOptions = {}): BoneOverlayHandle {
-		const margin = options.margin ?? 0;
 		const wrapper = this.createBox({
 			id: `bone-overlay-${node.id}`,
 			position: "absolute",
@@ -220,21 +244,13 @@ export class BoneRendererImpl implements BoneRenderer {
 			right: 0,
 			bottom: 0,
 			left: 0,
-			padding: margin,
-			zIndex: options.zIndex ?? 0,
-			...anchorLayout(options.anchor ?? "center"),
-		});
-		node.updateLayout({
-			width: options.width,
-			height: options.height,
-			maxWidth: options.maxWidth,
-			maxHeight: options.maxHeight,
 		});
 		const previousFocus = this.nativeRenderer.currentFocusedRenderable;
 		wrapper.append(node);
 		this.overlays.visible = true;
 		this.overlays.append(wrapper);
 		const handle = new OverlayHandleImpl(this.nativeRenderer, this.overlays, wrapper, node, previousFocus);
+		handle.update(options);
 		if (options.captureFocus !== false) handle.focus();
 		return handle;
 	}
@@ -250,6 +266,11 @@ export class BoneRendererImpl implements BoneRenderer {
 	onKey(listener: BoneKeyListener): BoneUnsubscribe {
 		this.keyListeners.add(listener);
 		return () => this.keyListeners.delete(listener);
+	}
+
+	onResize(listener: BoneResizeListener): BoneUnsubscribe {
+		this.resizeListeners.add(listener);
+		return () => this.resizeListeners.delete(listener);
 	}
 
 	requestRender(): void {
@@ -270,8 +291,10 @@ export class BoneRendererImpl implements BoneRenderer {
 
 	destroy(): void {
 		this.keyListeners.clear();
+		this.resizeListeners.clear();
 		this.nativeRenderer.keyInput.off("keypress", this.keyHandler);
 		this.nativeRenderer.keyInput.off("keyrelease", this.keyHandler);
+		this.nativeRenderer.off(CliRenderEvents.RESIZE, this.resizeHandler);
 		this.nativeRenderer.destroy();
 	}
 

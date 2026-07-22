@@ -1,5 +1,12 @@
 import type { AssistantMessage } from "@frelion/bone-ai";
-import type { BoneContainerNode, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import type {
+	BoneContainerNode,
+	BoneMarkdownNode,
+	BoneNode,
+	BoneRenderContext,
+	BoneTextNode,
+	BoneView,
+} from "@frelion/bone-tui";
 import type { PlanProposal } from "../../../core/plan-mode.ts";
 import { PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG } from "../../../core/plan-mode.ts";
 import { type Theme, theme } from "../theme/theme.ts";
@@ -54,19 +61,18 @@ export class OpenTUIUserMessage implements BoneView {
 	}
 
 	mount(context: BoneRenderContext): BoneNode {
-		const box = context.createBox({
-			flexDirection: "column",
-			paddingX: this.outputPad,
-			paddingY: 1,
-			backgroundColor: this.messageTheme.getBgColor("userMessageBg"),
-		});
-		box.append(
-			context.createMarkdown({
-				content: this.text,
+		const root = context.createBox({ flexDirection: "column" });
+		appendSpacer(context, root);
+		const body = context.createBox({ flexDirection: "column", paddingX: this.outputPad });
+		body.append(
+			context.createText({
+				content: `› ${this.text}`,
 				fg: this.messageTheme.getFgColor("userMessageText"),
+				wrapMode: "word",
 			}),
 		);
-		return box;
+		root.append(body);
+		return root;
 	}
 }
 
@@ -78,12 +84,83 @@ export interface OpenTUIAssistantMessageOptions {
 	theme?: Theme;
 }
 
+type AssistantSegmentKind = "text" | "thinking" | "thinking-label" | "error";
+
+interface AssistantSegment {
+	kind: AssistantSegmentKind;
+	content: string;
+}
+
+interface AssistantSegmentOptions {
+	hideThinkingBlock: boolean;
+	hiddenThinkingLabel: string;
+	hideProposedPlan: boolean;
+}
+
+function createAssistantSegments(message: AssistantMessage, options: AssistantSegmentOptions): AssistantSegment[] {
+	const segments: AssistantSegment[] = [];
+	const visibleTextParts = options.hideProposedPlan ? getVisibleTextParts(message) : undefined;
+	for (let index = 0; index < message.content.length; index++) {
+		const content = message.content[index]!;
+		if (content.type === "text") {
+			const visibleText = visibleTextParts?.get(index) ?? content.text;
+			if (visibleText.trim()) segments.push({ kind: "text", content: visibleText.trim() });
+			continue;
+		}
+		if (content.type !== "thinking") continue;
+
+		const thinkingBlocks: string[] = [];
+		for (; index < message.content.length; index++) {
+			const thinking = message.content[index];
+			if (thinking?.type !== "thinking") break;
+			if (thinking.thinking.trim()) thinkingBlocks.push(thinking.thinking.trim());
+		}
+		index--;
+		if (thinkingBlocks.length > 0 && message.stopReason === undefined) {
+			segments.push({
+				kind: options.hideThinkingBlock ? "thinking-label" : "thinking",
+				content: options.hideThinkingBlock ? options.hiddenThinkingLabel : thinkingBlocks.at(-1)!,
+			});
+		}
+	}
+
+	const hasToolCalls = message.content.some((content) => content.type === "toolCall");
+	let error: string | undefined;
+	if (message.stopReason === "length") {
+		error = "Error: Model stopped because it reached the maximum output token limit. The response may be incomplete.";
+	} else if (!hasToolCalls && message.stopReason === "aborted") {
+		error =
+			message.errorMessage && message.errorMessage !== "Request was aborted"
+				? message.errorMessage
+				: "Operation aborted";
+	} else if (!hasToolCalls && message.stopReason === "error") {
+		error = `Error: ${message.errorMessage || "Unknown error"}`;
+	}
+	if (error) segments.push({ kind: "error", content: error });
+	return segments;
+}
+
+export function hasVisibleOpenTUIAssistantContent(
+	message: AssistantMessage,
+	options: Pick<OpenTUIAssistantMessageOptions, "hideThinkingBlock" | "hiddenThinkingLabel" | "hideProposedPlan"> = {},
+): boolean {
+	return (
+		createAssistantSegments(message, {
+			hideThinkingBlock: options.hideThinkingBlock ?? false,
+			hiddenThinkingLabel: options.hiddenThinkingLabel ?? "Thinking...",
+			hideProposedPlan: options.hideProposedPlan ?? false,
+		}).length > 0
+	);
+}
+
 export class OpenTUIAssistantMessage implements BoneView {
 	private message: AssistantMessage;
 	private readonly options: Required<Omit<OpenTUIAssistantMessageOptions, "theme">>;
 	private readonly messageTheme: Theme;
 	private context: BoneRenderContext | undefined;
 	private root: BoneContainerNode | undefined;
+	private renderedKinds: AssistantSegmentKind[] = [];
+	private renderedNodes: Array<BoneMarkdownNode | BoneTextNode> = [];
 
 	constructor(message: AssistantMessage, options: OpenTUIAssistantMessageOptions = {}) {
 		this.message = message;
@@ -112,86 +189,47 @@ export class OpenTUIAssistantMessage implements BoneView {
 		const context = this.context;
 		const root = this.root;
 		if (!context || !root) return;
+		const segments = createAssistantSegments(this.message, this.options);
+
+		const kinds = segments.map((segment) => segment.kind);
+		if (
+			kinds.length === this.renderedKinds.length &&
+			kinds.every((kind, index) => kind === this.renderedKinds[index]) &&
+			this.renderedNodes.every((node) => !node.destroyed)
+		) {
+			for (let index = 0; index < segments.length; index++) {
+				const node = this.renderedNodes[index];
+				if (!node) continue;
+				node.content = segments[index]!.content;
+				if ("streaming" in node) node.streaming = this.message.stopReason === undefined;
+			}
+			return;
+		}
+
 		root.clear();
-
-		const visibleTextParts = this.options.hideProposedPlan ? getVisibleTextParts(this.message) : undefined;
-		const hasVisibleContent = this.message.content.some((content, index) =>
-			content.type === "text"
-				? (visibleTextParts?.get(index) ?? content.text).trim()
-				: content.type === "thinking" && content.thinking.trim(),
-		);
-		if (hasVisibleContent) appendSpacer(context, root);
-
-		for (let index = 0; index < this.message.content.length; index++) {
-			const content = this.message.content[index]!;
-			if (content.type === "text") {
-				const visibleText = visibleTextParts?.get(index) ?? content.text;
-				if (!visibleText.trim()) continue;
-				root.append(
-					context.createMarkdown({
-						content: visibleText.trim(),
-						paddingX: this.options.outputPad,
-						fg: this.messageTheme.getFgColor("text"),
-						streaming: this.message.stopReason === undefined,
-					}),
-				);
-				continue;
-			}
-			if (content.type !== "thinking") continue;
-
-			const thinkingBlocks: string[] = [];
-			for (; index < this.message.content.length; index++) {
-				const thinking = this.message.content[index];
-				if (thinking?.type !== "thinking") break;
-				if (thinking.thinking.trim()) thinkingBlocks.push(thinking.thinking.trim());
-			}
-			index--;
-			if (thinkingBlocks.length === 0) continue;
-
-			if (this.options.hideThinkingBlock) {
-				root.append(
-					context.createText({
-						content: this.options.hiddenThinkingLabel,
-						paddingX: this.options.outputPad,
-						fg: this.messageTheme.getFgColor("thinkingText"),
-						italic: true,
-					}),
-				);
-			} else {
-				root.append(
-					context.createMarkdown({
-						content: thinkingBlocks.join("\n\n"),
-						paddingX: this.options.outputPad,
-						fg: this.messageTheme.getFgColor("thinkingText"),
-						streaming: this.message.stopReason === undefined,
-					}),
-				);
-			}
-		}
-
-		const hasToolCalls = this.message.content.some((content) => content.type === "toolCall");
-		let error: string | undefined;
-		if (this.message.stopReason === "length") {
-			error =
-				"Error: Model stopped because it reached the maximum output token limit. The response may be incomplete.";
-		} else if (!hasToolCalls && this.message.stopReason === "aborted") {
-			error =
-				this.message.errorMessage && this.message.errorMessage !== "Request was aborted"
-					? this.message.errorMessage
-					: "Operation aborted";
-		} else if (!hasToolCalls && this.message.stopReason === "error") {
-			error = `Error: ${this.message.errorMessage || "Unknown error"}`;
-		}
-		if (error) {
-			appendSpacer(context, root);
-			root.append(
-				context.createText({
-					content: error,
-					paddingX: this.options.outputPad,
-					fg: this.messageTheme.getFgColor("error"),
-					wrapMode: "word",
-				}),
-			);
+		this.renderedKinds = kinds;
+		this.renderedNodes = [];
+		if (segments.length === 0) return;
+		appendSpacer(context, root);
+		for (const segment of segments) {
+			if (segment.kind === "error" && segments.length > 1) appendSpacer(context, root);
+			const node =
+				segment.kind === "thinking-label" || segment.kind === "error"
+					? context.createText({
+							content: segment.content,
+							paddingX: this.options.outputPad,
+							fg: this.messageTheme.getFgColor(segment.kind === "error" ? "error" : "thinkingText"),
+							italic: segment.kind === "thinking-label",
+							wrapMode: "word",
+						})
+					: context.createMarkdown({
+							content: segment.content,
+							paddingX: this.options.outputPad,
+							fg: this.messageTheme.getFgColor(segment.kind === "thinking" ? "thinkingText" : "text"),
+							streaming: this.message.stopReason === undefined,
+						});
+			this.renderedNodes.push(node);
+			root.append(node);
 		}
 	}
 }

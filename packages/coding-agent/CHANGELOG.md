@@ -15,6 +15,12 @@
 - Replaced Forge parameter bags with operation-specific, provider-neutral contracts and compact mutation receipts. Forge context now has no Agent-visible parameters, and queries require an explicit `list`, `get`, or `get_many` operation.
 - Added an offline scripted Forge protocol evaluation harness with a real Agent loop, strict fake service, seven recovery/schema/budget/execution cases, and JSON/HTML reports. It is intentionally separate from provider compatibility and live-model quality evaluation.
 - Added an explicit opt-in live Forge model evaluation harness that reuses Bone's configured `ModelRuntime`, bounds turns/time, keeps Forge calls on a fake service, and reports task/tool/context metrics separately from scripted protocol pass rate.
+- Redesigned the OpenTUI workspace with responsive split and single-pane layouts, compact conversation navigation, bounded transcript width, stable composer chrome, and narrow-terminal dialogs.
+- Updated streaming assistant messages in place instead of rebuilding their Markdown nodes for every token.
+
+### Fixed
+
+- Fixed interactive shutdown when OpenTUI destroys the native edit buffer before application cleanup reads the current draft.
 
 ## [0.1.3] - 2026-07-22
 

@@ -70,7 +70,7 @@ export class OpenTUISelectorViewV2<T> implements BoneView {
 		this.dialog = createOpenTUIDialogShell(context, {
 			title: this.options.title,
 			subtitle: this.options.subtitle,
-			footer: this.options.footer ?? "↑↓ navigate · Enter select · Esc cancel",
+			footer: this.options.footer,
 			theme: this.selectorTheme,
 		});
 		if (this.options.searchable) {
@@ -155,8 +155,7 @@ export class OpenTUISelectorViewV2<T> implements BoneView {
 			const selected = index === this.selectedIndex;
 			const row: BoneContainerNode = context.createBox({
 				width: "100%",
-				flexDirection: "row",
-				gap: 1,
+				flexDirection: "column",
 				backgroundColor: selected ? this.selectorTheme.getBgColor("selectedBg") : undefined,
 				onMouseDown: (event) => {
 					this.selectedIndex = index;
@@ -166,14 +165,15 @@ export class OpenTUISelectorViewV2<T> implements BoneView {
 					event.stopPropagation();
 				},
 			});
-			row.append(
+			const labelRow = context.createBox({ width: "100%", flexDirection: "row", gap: 1 });
+			labelRow.append(
 				context.createText({
-					content: selected ? "›" : " ",
+					content: selected ? "›" : "·",
 					fg: this.selectorTheme.getFgColor(selected ? "accent" : "muted"),
 					flexShrink: 0,
 				}),
 			);
-			row.append(
+			labelRow.append(
 				context.createText({
 					content: item.label,
 					fg: this.selectorTheme.getFgColor(item.disabled ? "dim" : selected ? "accent" : "text"),
@@ -183,13 +183,14 @@ export class OpenTUISelectorViewV2<T> implements BoneView {
 					minWidth: 1,
 				}),
 			);
+			row.append(labelRow);
 			if (item.description || item.current) {
 				row.append(
 					context.createText({
 						content: item.current ? `${item.description ?? ""} (current)`.trim() : item.description!,
 						fg: this.selectorTheme.getFgColor(item.current ? "success" : "muted"),
 						truncate: true,
-						flexShrink: 1,
+						paddingLeft: 2,
 					}),
 				);
 			}

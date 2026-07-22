@@ -1,4 +1,5 @@
 import type { BoneContainerNode, BoneNode, BoneRenderContext, BoneTextNode, BoneView } from "@frelion/bone-tui";
+import { resolveOpenTUIDialogLayout } from "../opentui-design.ts";
 import { type Theme, theme } from "../theme/theme.ts";
 
 export interface OpenTUIDialogShellOptions {
@@ -22,13 +23,15 @@ export function createOpenTUIDialogShell(
 	options: OpenTUIDialogShellOptions,
 ): OpenTUIDialogMount {
 	const dialogTheme = options.theme ?? theme;
+	const responsiveLayout = resolveOpenTUIDialogLayout(context.width, context.height);
 	const root = context.createBox({
-		width: options.width ?? "72%",
-		maxHeight: options.maxHeight ?? "88%",
+		width: options.width ?? responsiveLayout.width,
+		height: responsiveLayout.height,
+		maxHeight: options.maxHeight ?? responsiveLayout.maxHeight,
 		flexDirection: "column",
 		padding: 1,
 		border: true,
-		borderStyle: "rounded",
+		borderStyle: "single",
 		borderColor: dialogTheme.getFgColor("borderAccent"),
 		backgroundColor: dialogTheme.getBgColor("customMessageBg"),
 		focusable: true,
@@ -47,10 +50,6 @@ export function createOpenTUIDialogShell(
 	const status = context.createText({ content: "", fg: dialogTheme.getFgColor("warning"), wrapMode: "word" });
 	status.visible = false;
 	root.append(status);
-	if (options.footer) {
-		root.append(context.createSpacer({ size: 1, direction: "vertical" }));
-		root.append(context.createText({ content: options.footer, fg: dialogTheme.getFgColor("dim"), wrapMode: "word" }));
-	}
 	return { root, body, status };
 }
 

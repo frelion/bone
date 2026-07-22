@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentSessionEvent } from "../src/core/agent-session.ts";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -14,6 +15,7 @@ import { SessionManager } from "../src/core/session-manager.ts";
 import { assistantMsg, userMsg } from "./utilities.ts";
 
 type SessionInternals = {
+	_emit(event: AgentSessionEvent): void;
 	_emitAgentSettled(): Promise<void>;
 	_isAgentRunActive: boolean;
 };
@@ -293,6 +295,67 @@ describe("InteractiveSessionHost", () => {
 			firstMessage: "first turn is still streaming",
 		});
 		await host.disposeAll();
+	});
+
+	it("publishes throttled live preview, count, and throughput presentation", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-07-22T12:00:00.000Z"));
+		const tempDir = join(tmpdir(), `bone-session-host-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDirs.push(tempDir);
+		mkdirSync(tempDir, { recursive: true });
+		const sessionManager = createPersistedSession(tempDir, "live session");
+		const sessionPath = sessionManager.getSessionFile();
+		if (!sessionPath) throw new Error("expected persisted session file");
+		const factory: CreateAgentSessionRuntimeFactory = async ({ cwd, agentDir, sessionManager: manager }) => {
+			const services = await createAgentSessionServices({
+				cwd,
+				agentDir,
+				resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true },
+			});
+			return {
+				...(await createAgentSessionFromServices({ services, sessionManager: manager, noTools: "all" })),
+				services,
+				diagnostics: services.diagnostics,
+			};
+		};
+		const runtime = await createAgentSessionRuntime(factory, {
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.open(sessionPath),
+		});
+		const host = new InteractiveSessionHost(runtime, factory);
+		const stateChanged = vi.fn();
+		host.setHooks({ stateChanged });
+		const getEntries = vi.spyOn(runtime.session.sessionManager, "getEntries");
+		getEntries.mockClear();
+		const internals = runtime.session as unknown as SessionInternals;
+		const partial = assistantMsg("Streaming answer");
+
+		internals._emit({ type: "agent_start" });
+		expect(stateChanged).toHaveBeenCalledOnce();
+		internals._emit({ type: "message_start", message: assistantMsg("") });
+		internals._emit({
+			type: "message_update",
+			message: partial,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Streaming answer", partial },
+		});
+		await vi.advanceTimersByTimeAsync(249);
+		expect(stateChanged).toHaveBeenCalledOnce();
+		await vi.advanceTimersByTimeAsync(1);
+		expect(stateChanged).toHaveBeenCalledTimes(2);
+		expect(getEntries).not.toHaveBeenCalled();
+
+		expect(host.getSessionPresentation(sessionPath)).toMatchObject({
+			state: "foreground",
+			livePreview: "Streaming answer",
+			messageCount: 3,
+		});
+		expect(host.getSessionPresentation(sessionPath).throughputTokensPerSecond).toBeGreaterThan(0);
+
+		internals._emit({ type: "agent_end", messages: [], willRetry: false });
+		expect(host.getSessionPresentation(sessionPath).throughputTokensPerSecond).toBeUndefined();
+		await host.disposeAll();
+		vi.useRealTimers();
 	});
 
 	it("switches away from the foreground conversation before soft-deleting it", async () => {

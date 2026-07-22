@@ -44,7 +44,7 @@
 		"release:prepare": "node scripts/release.mjs prepare",
 		"release:publish": "node scripts/release.mjs publish",
 		"release:fix-links": "node scripts/release-notes.mjs fix-github-releases",
-		"prepare": "husky"
+		"prepare": "node scripts/dev-bone.mjs prepare"
 	},
 	"devDependencies": {
 		"@anthropic-ai/sandbox-runtime": "0.0.26",

@@ -1,6 +1,6 @@
 import type { AssistantMessage } from "@frelion/bone-ai";
 import { type BoneRenderContext, type BoneView, createBoneTestRenderer } from "@frelion/bone-tui";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
 	OpenTUIAssistantMessage,
 	OpenTUIPlanProposal,
@@ -98,6 +98,7 @@ describe("OpenTUI interactive shell", () => {
 		renderer.start();
 		const shell = new OpenTUIInteractiveShell({ sidebarWidth: 20 });
 		renderer.mount(shell);
+		const createMarkdown = vi.spyOn(renderer, "createMarkdown");
 		const assistant = new OpenTUIAssistantMessage(assistantMessage("first chunk"));
 		shell.appendTranscript(assistant);
 
@@ -108,5 +109,74 @@ describe("OpenTUI interactive shell", () => {
 
 		expect(finalFrame).toContain("final response");
 		expect(finalFrame).not.toContain("first chunk");
+		expect(createMarkdown).toHaveBeenCalledTimes(1);
+	});
+
+	test("keeps the transcript viewport and scrollbar in one continuous region", async () => {
+		initTheme("dark");
+		const renderer = await createBoneTestRenderer({ width: 100, height: 40 });
+		renderers.add(renderer);
+		renderer.start();
+		const shell = new OpenTUIInteractiveShell({ sidebarWidth: 32 });
+		renderer.mount(shell);
+
+		let lastLine: ReturnType<OpenTUIInteractiveShell["appendTranscript"]> | undefined;
+		for (let index = 0; index < 50; index++) lastLine = shell.appendTranscript(textView(`line-${index}`));
+		const transcript = shell.getTranscriptNode();
+		transcript.scrollTo(Number.MAX_SAFE_INTEGER);
+		await flushUntil(renderer, (frame) => frame.includes("line-49"));
+
+		expect(lastLine).toBeDefined();
+		expect(lastLine!.screenY + lastLine!.height).toBe(transcript.screenY + transcript.height);
+	});
+
+	test("switches between split and single-pane layouts without remounting content", async () => {
+		initTheme("dark");
+		const renderer = await createBoneTestRenderer({ width: 100, height: 24 });
+		renderers.add(renderer);
+		renderer.start();
+		const shell = new OpenTUIInteractiveShell();
+		renderer.mount(shell);
+		shell.setSidebar(textView("CONVERSATIONS\ncurrent"));
+		shell.appendTranscript(textView("responsive transcript"));
+
+		expect(await flushUntil(renderer, (frame) => frame.includes("responsive transcript"))).toContain("CONVERSATIONS");
+		expect(shell.layoutMode).toBe("split");
+
+		renderer.resize(70, 18);
+		const compactMain = await flushUntil(renderer, (frame) => frame.includes("responsive transcript"));
+		expect(shell.layoutMode).toBe("single");
+		expect(compactMain).not.toContain("CONVERSATIONS");
+
+		shell.showPane("sidebar");
+		const compactSidebar = await flushUntil(renderer, (frame) => frame.includes("CONVERSATIONS"));
+		expect(compactSidebar).not.toContain("responsive transcript");
+
+		shell.showPane("main");
+		expect(await flushUntil(renderer, (frame) => frame.includes("responsive transcript"))).not.toContain(
+			"CONVERSATIONS",
+		);
+	});
+
+	test("constrains sidebar resizing and emits persisted widths", async () => {
+		initTheme("dark");
+		const renderer = await createBoneTestRenderer({ width: 120, height: 24 });
+		renderers.add(renderer);
+		renderer.start();
+		const shell = new OpenTUIInteractiveShell();
+		const onSidebarWidthChange = vi.fn();
+		shell.onSidebarWidthChange = onSidebarWidthChange;
+		renderer.mount(shell);
+		shell.setSidebar(textView("CONVERSATIONS"));
+
+		shell.setSidebarWidth(50, true);
+
+		expect(shell.sidebarWidth).toBe(50);
+		expect(shell.layoutMode).toBe("split");
+		expect(onSidebarWidthChange).toHaveBeenLastCalledWith(50);
+
+		shell.setSidebarWidth(90, true);
+		expect(shell.sidebarWidth).toBe(60);
+		expect(onSidebarWidthChange).toHaveBeenLastCalledWith(60);
 	});
 });

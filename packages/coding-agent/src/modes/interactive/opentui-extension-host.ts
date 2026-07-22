@@ -3,6 +3,7 @@ import type {
 	BoneInputNode,
 	BoneNode,
 	BoneOverlayHandle,
+	BoneOverlayOptions,
 	BoneRenderer,
 	BoneTextareaNode,
 	BoneView,
@@ -20,7 +21,9 @@ import type {
 import type { ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { createOpenTUIDialogShell } from "./components/opentui-dialog-v2.ts";
 import { OpenTUISelectorViewV2 } from "./components/opentui-selector-v2.ts";
+import { resolveOpenTUIDialogLayout } from "./opentui-design.ts";
 import { matchesOpenTUIAction } from "./opentui-keymap.ts";
+import { getThemeExportColors, theme } from "./theme/theme.ts";
 
 export interface OpenTUIExtensionEditorAdapter {
 	getText(): string;
@@ -57,6 +60,10 @@ type DialogAction = (action: "confirm" | "cancel" | "up" | "down" | "pageUp" | "
 
 function resolveView(view: BoneView | ExtensionUIViewFactory): BoneView {
 	return typeof view === "function" ? view() : view;
+}
+
+function dialogBackdropColor(): string {
+	return getThemeExportColors().pageBg ?? theme.getBgColor("customMessageBg");
 }
 
 class MountedSlot implements ExtensionUIViewHandle {
@@ -176,11 +183,13 @@ export class OpenTUIExtensionHost {
 	private readonly toolRenderers = new Map<string, ExtensionUIToolViewRenderer>();
 	private readonly unsubscribeKey: () => void;
 	private readonly unsubscribeFooter: () => void;
+	private readonly unsubscribeResize: () => void;
 	private header: MountedSlot | undefined;
 	private footer: MountedSlot | undefined;
 	private footerFactory: ((data: ReadonlyFooterDataProvider) => BoneView) | undefined;
 	private editorView: MountedSlot | undefined;
 	private activeOverlay: BoneOverlayHandle | undefined;
+	private activeOverlayLayout: ((width: number, height: number) => BoneOverlayOptions) | undefined;
 	private activeDialogAction: DialogAction | undefined;
 	private activeDialogCancel: (() => void) | undefined;
 	private advancedCancel: (() => void) | undefined;
@@ -201,6 +210,10 @@ export class OpenTUIExtensionHost {
 			}
 		});
 		this.unsubscribeFooter = options.footerData.onBranchChange(() => this.refreshFooter());
+		this.unsubscribeResize = options.renderer.onResize((width, height) => {
+			const layout = this.activeOverlayLayout?.(width, height);
+			if (layout) this.activeOverlay?.update(layout);
+		});
 		this.context = this.createContext();
 	}
 
@@ -219,6 +232,7 @@ export class OpenTUIExtensionHost {
 		this.advancedCancel?.();
 		this.unsubscribeKey();
 		this.unsubscribeFooter();
+		this.unsubscribeResize();
 		for (const widget of this.widgets.values()) widget.slot.close();
 		this.widgets.clear();
 		this.header?.close();
@@ -419,6 +433,7 @@ export class OpenTUIExtensionHost {
 				options.signal?.removeEventListener("abort", cancel);
 				this.activeOverlay?.close();
 				this.activeOverlay = undefined;
+				this.activeOverlayLayout = undefined;
 				this.activeDialogAction = undefined;
 				this.activeDialogCancel = undefined;
 				resolve(value);
@@ -430,7 +445,14 @@ export class OpenTUIExtensionHost {
 			}
 			const dialog = create(finish);
 			const node = dialog.view.mount(this.options.renderer);
-			this.activeOverlay = this.options.renderer.showOverlay(node, { width: "76%", maxHeight: "90%" });
+			this.activeOverlayLayout = (width, height) => {
+				const layout = resolveOpenTUIDialogLayout(width, height);
+				return { ...layout, backdropColor: dialogBackdropColor() };
+			};
+			this.activeOverlay = this.options.renderer.showOverlay(
+				node,
+				this.activeOverlayLayout(this.options.renderer.width, this.options.renderer.height),
+			);
 			dialog.focus?.();
 			this.activeDialogAction = dialog.action;
 			this.activeDialogCancel = cancel;
@@ -453,6 +475,7 @@ export class OpenTUIExtensionHost {
 				settled = true;
 				this.activeOverlay?.close();
 				this.activeOverlay = undefined;
+				this.activeOverlayLayout = undefined;
 				this.advancedCancel = undefined;
 				resolve(value);
 			};
@@ -461,11 +484,20 @@ export class OpenTUIExtensionHost {
 				(view) => {
 					if (settled) return;
 					const node = view.mount(this.options.renderer);
-					this.activeOverlay = this.options.renderer.showOverlay(node, {
-						width: options.width ?? (options.presentation === "overlay" ? "100%" : "76%"),
-						height: options.height ?? (options.presentation === "replace" ? "100%" : undefined),
-						maxHeight: "100%",
-					});
+					this.activeOverlayLayout = (width, height) => {
+						const layout = resolveOpenTUIDialogLayout(width, height);
+						return {
+							width: options.width ?? (options.presentation === "overlay" ? "100%" : layout.width),
+							height: options.height ?? (options.presentation === "replace" ? "100%" : layout.height),
+							maxHeight: "100%",
+							margin: options.presentation === "replace" ? 0 : layout.margin,
+							backdropColor: dialogBackdropColor(),
+						};
+					};
+					this.activeOverlay = this.options.renderer.showOverlay(
+						node,
+						this.activeOverlayLayout(this.options.renderer.width, this.options.renderer.height),
+					);
 				},
 				() => finish(undefined),
 			);

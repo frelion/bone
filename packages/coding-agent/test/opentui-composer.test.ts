@@ -177,4 +177,49 @@ describe("OpenTUI composer", () => {
 		expect(renderer.captureFrame()).toContain("Updated prompt");
 		expect(composer.value).toBe("");
 	});
+
+	test("renders a bordered prompt with one fixed status row and no legacy prompt chrome", async () => {
+		const { renderer, composer } = await mountComposer({
+			status: {
+				cwd: "~/src/bone",
+				model: "openai/gpt-5",
+				thinking: "high",
+				contextRemaining: "82%",
+				foregroundThroughput: "14.2 tok/s",
+			},
+		});
+		await settle(renderer);
+		const initial = renderer.captureFrame();
+		expect(initial).toContain("Ask anything");
+		expect(initial).toContain("~/src/bone  openai/gpt-5  high");
+		expect(initial).toContain("82% left  14.2 tok/s");
+		expect(initial).not.toContain("Message Bone");
+		expect(initial).not.toContain("›");
+
+		const occupiedRows = initial.split("\n").filter((line) => line.trim()).length;
+		composer.updateStatus({ contextRemaining: "79%", foregroundThroughput: "31.8 tok/s" });
+		await settle(renderer);
+		const streaming = renderer.captureFrame();
+		expect(streaming).toContain("79% left  31.8 tok/s");
+		expect(streaming.split("\n").filter((line) => line.trim())).toHaveLength(occupiedRows);
+	});
+
+	test("keeps public state updates safe after the native edit buffer is destroyed", async () => {
+		const { renderer, composer } = await mountComposer();
+		await renderer.input.typeText("draft survives teardown");
+		renderer.destroy();
+
+		expect(composer.value).toBe("draft survives teardown");
+		expect(() => composer.focus()).not.toThrow();
+		expect(() => composer.blur()).not.toThrow();
+		expect(() => composer.setPlaceholder("Next prompt")).not.toThrow();
+		expect(() => composer.updateStatus({ foregroundThroughput: "20 tok/s" })).not.toThrow();
+		initTheme("light");
+		expect(() => composer.updateTheme(theme)).not.toThrow();
+		expect(() => composer.setAutocompleteProvider(undefined)).not.toThrow();
+		expect(composer.selectedAutocompleteItem).toBeUndefined();
+		expect(() => composer.setValue("updated after teardown")).not.toThrow();
+		expect(composer.value).toBe("updated after teardown");
+		expect(() => composer.destroy()).not.toThrow();
+	});
 });

@@ -16,8 +16,8 @@ import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 const renderers = new Set<BoneTestRenderer>();
 
-async function createRenderer(): Promise<BoneTestRenderer> {
-	const renderer = await createBoneTestRenderer({ width: 100, height: 28 });
+async function createRenderer(width = 100, height = 28): Promise<BoneTestRenderer> {
+	const renderer = await createBoneTestRenderer({ width, height });
 	renderers.add(renderer);
 	renderer.start();
 	return renderer;
@@ -179,5 +179,26 @@ describe("OpenTUI dialog and selector v2 flows", () => {
 		login.handleAction("confirm");
 		await expect(response).resolves.toBe("verified");
 		expect(complete).not.toHaveBeenCalled();
+	});
+
+	test("uses a readable single-column settings layout on narrow terminals", async () => {
+		const renderer = await createRenderer(60, 18);
+		const settings = new OpenTUISettingsListViewV2({
+			title: "Settings",
+			items: [
+				{ id: "model", label: "Model", value: "Select the active model" },
+				{ id: "thinking", label: "Thinking level", value: "Set reasoning effort" },
+			],
+			onActivate: vi.fn(),
+			onCancel: vi.fn(),
+		});
+		renderer.mount(settings);
+		const captured = await flushUntil(renderer, "Set reasoning effort");
+
+		expect(captured).toContain("Thinking level");
+		expect(captured).not.toContain("levelSet reasoning");
+		expect(Math.max(...captured.split("\n").map((line) => line.length))).toBeLessThanOrEqual(60);
+		expect(captured).not.toContain("fields");
+		expect(captured).not.toContain("Esc cancel");
 	});
 });
