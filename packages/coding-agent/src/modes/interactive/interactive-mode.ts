@@ -2680,7 +2680,7 @@ export class InteractiveMode {
 		try {
 			const result = await this.showExtensionCustom<QuestionnaireResult>(
 				(_tui, _theme, _keybindings, done) => new QuestionnaireComponent(state.request, done),
-				{ overlay: true, overlayOptions: { anchor: "bottom-center", width: "100%", maxHeight: "100%" } },
+				{ overlay: true, overlayOptions: () => this.getMainPaneOverlayOptions() },
 			);
 			if (
 				this.session.questionState.status !== "awaitingAnswer" ||
@@ -5683,19 +5683,32 @@ export class InteractiveMode {
 
 	private getChatTextSelectionBounds(): { left: number; top: number; width: number; height: number } {
 		const terminalWidth = this.ui.terminal.columns;
-		const sidebarVisible =
-			terminalWidth >=
-			InteractiveMode.SESSION_SIDEBAR_WIDTH +
-				InteractiveMode.SESSION_SIDEBAR_SEPARATOR_WIDTH +
-				InteractiveMode.MINIMUM_MAIN_PANE_WIDTH;
-		const left = sidebarVisible
-			? InteractiveMode.SESSION_SIDEBAR_WIDTH + InteractiveMode.SESSION_SIDEBAR_SEPARATOR_WIDTH
-			: 0;
+		const left = this.getMainPaneLeft(terminalWidth);
 		return {
 			left,
 			top: 0,
 			width: Math.max(0, terminalWidth - left),
 			height: this.chatScrollLayout.getVisibleContentRowCount(),
+		};
+	}
+
+	private getMainPaneLeft(terminalWidth = this.ui.terminal.columns): number {
+		const sidebarVisible =
+			terminalWidth >=
+			InteractiveMode.SESSION_SIDEBAR_WIDTH +
+				InteractiveMode.SESSION_SIDEBAR_SEPARATOR_WIDTH +
+				InteractiveMode.MINIMUM_MAIN_PANE_WIDTH;
+		return sidebarVisible
+			? InteractiveMode.SESSION_SIDEBAR_WIDTH + InteractiveMode.SESSION_SIDEBAR_SEPARATOR_WIDTH
+			: 0;
+	}
+
+	private getMainPaneOverlayOptions(): OverlayOptions {
+		return {
+			anchor: "bottom-left",
+			width: "100%",
+			maxHeight: "100%",
+			margin: { left: this.getMainPaneLeft() },
 		};
 	}
 

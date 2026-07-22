@@ -408,6 +408,33 @@ describe("InteractiveMode.showExtensionCustom", () => {
 	});
 });
 
+describe("InteractiveMode questionnaire overlay layout", () => {
+	test("is constrained to the main conversation pane when the sidebar is visible", () => {
+		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			ui: { terminal: { columns: 120 } },
+		});
+
+		const options = (InteractiveMode as any).prototype.getMainPaneOverlayOptions.call(fakeThis);
+
+		expect(options).toEqual({
+			anchor: "bottom-left",
+			width: "100%",
+			maxHeight: "100%",
+			margin: { left: 42 },
+		});
+	});
+
+	test("uses the full conversation width when the sidebar is hidden", () => {
+		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+			ui: { terminal: { columns: 80 } },
+		});
+
+		const options = (InteractiveMode as any).prototype.getMainPaneOverlayOptions.call(fakeThis);
+
+		expect(options.margin).toEqual({ left: 0 });
+	});
+});
+
 describe("InteractiveMode.createExtensionUIContext addAutocompleteProvider", () => {
 	test("stores wrapper factories and rebuilds autocomplete immediately", () => {
 		const wrapper: AutocompleteProviderFactory = (current) => current;
