@@ -96,7 +96,7 @@ if [[ "$SKIP_DEPS" == "false" ]]; then
     # needs every clipboard binding and OpenTUI native library available to the bundler.
     # Use --force to bypass platform checks (os/cpu restrictions in package.json)
     # Install all in one command to avoid removing packages from previous installs
-    bun add --no-save --force --ignore-scripts \
+    bun add --no-save --force --ignore-scripts --os="*" --cpu="*" \
         @mariozechner/clipboard@"$CLIPBOARD_VERSION" \
         @mariozechner/clipboard-darwin-arm64@"$CLIPBOARD_VERSION" \
         @mariozechner/clipboard-darwin-x64@"$CLIPBOARD_VERSION" \
