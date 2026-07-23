@@ -1,4 +1,4 @@
-import { type Dispatcher, request } from "undici";
+import { type Dispatcher, request } from "undici-client";
 import { ForgeError, redactSecrets } from "./errors.ts";
 
 export interface ForgeHttpClientOptions {

@@ -90,7 +90,7 @@ Unified LLM API with provider collections, automatic auth resolution, token and 
 ## Installation
 
 ```bash
-npm install @frelion/bone-ai
+bun add @frelion/bone-ai
 ```
 
 TypeBox exports are re-exported from `@frelion/bone-ai`: `Type`, `Static`, and `TSchema`.
@@ -1484,9 +1484,9 @@ Official docs: [Application Default Credentials](https://cloud.google.com/docs/a
 The quickest way to authenticate:
 
 ```bash
-npx @frelion/bone-ai login              # interactive provider selection
-npx @frelion/bone-ai login anthropic    # login to specific provider
-npx @frelion/bone-ai list               # list available providers
+bunx @frelion/bone-ai login              # interactive provider selection
+bunx @frelion/bone-ai login anthropic    # login to specific provider
+bunx @frelion/bone-ai list               # list available providers
 ```
 
 Credentials are saved to `auth.json` in the current directory.

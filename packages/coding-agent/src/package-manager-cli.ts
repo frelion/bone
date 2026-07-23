@@ -25,23 +25,15 @@ interface SelfUpdatePlan {
 	note?: string;
 }
 
-function printSelfUpdateUnavailable(
-	npmCommand?: string[],
-	updatePackageTarget: SelfUpdatePackageTarget = PACKAGE_NAME,
-): void {
+function printSelfUpdateUnavailable(updatePackageTarget: SelfUpdatePackageTarget = PACKAGE_NAME): void {
 	console.error(`error: ${APP_NAME} cannot self-update this installation.`);
-	console.error(getSelfUpdateUnavailableInstruction(PACKAGE_NAME, npmCommand, updatePackageTarget));
+	console.error(getSelfUpdateUnavailableInstruction(PACKAGE_NAME, updatePackageTarget));
 	const entrypoint = process.argv[1];
 	if (entrypoint) console.error(`\nLocation of ${APP_NAME} executable: ${entrypoint}`);
 }
 
 function printSelfUpdateFallback(command: SelfUpdateCommand): void {
 	console.error(chalk.dim(`If this keeps failing, run this command yourself: ${command.display}`));
-}
-
-function printPnpmSelfUpdateMetadataHint(): void {
-	console.error(chalk.yellow("If pnpm reports missing package versions, its cached registry metadata may be stale."));
-	console.error(chalk.yellow(`Run \`pnpm store prune\` and retry \`${APP_NAME} update\`.`));
 }
 
 function printSelfUpdateNote(note: string): void {
@@ -94,7 +86,7 @@ async function runSelfUpdate(command: SelfUpdateCommand): Promise<void> {
 	}
 }
 
-function prepareWindowsNpmSelfUpdate(): void {
+function prepareWindowsBunSelfUpdate(): void {
 	if (process.platform !== "win32") return;
 	const packageDir = getPackageDir();
 	cleanupWindowsSelfUpdateQuarantine(packageDir);
@@ -134,17 +126,12 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 		const selfUpdatePlan = await getSelfUpdatePlan(force);
 		if (!selfUpdatePlan.shouldRun) return true;
 		const installMethod = detectInstallMethod();
-		if (process.platform === "win32" && installMethod !== "npm" && installMethod !== "pnpm") {
-			console.error(chalk.red(`${APP_NAME} self-update on Windows is only supported for npm and pnpm installs.`));
-			process.exitCode = 1;
-			return true;
-		}
-		const selfUpdateCommand = getSelfUpdateCommand(PACKAGE_NAME, undefined, {
+		const selfUpdateCommand = getSelfUpdateCommand(PACKAGE_NAME, {
 			packageName: selfUpdatePlan.packageName,
 			installSpec: selfUpdatePlan.installSpec,
 		});
 		if (!selfUpdateCommand) {
-			printSelfUpdateUnavailable(undefined, {
+			printSelfUpdateUnavailable({
 				packageName: selfUpdatePlan.packageName,
 				installSpec: selfUpdatePlan.installSpec,
 			});
@@ -153,12 +140,11 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 		}
 		if (selfUpdatePlan.note) printSelfUpdateNote(selfUpdatePlan.note);
 		try {
-			if (installMethod === "npm") prepareWindowsNpmSelfUpdate();
+			if (installMethod === "bun") prepareWindowsBunSelfUpdate();
 			await runSelfUpdate(selfUpdateCommand);
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : "Unknown update error";
 			console.error(chalk.red(`Error: ${message}`));
-			if (installMethod === "pnpm") printPnpmSelfUpdateMetadataHint();
 			printSelfUpdateFallback(selfUpdateCommand);
 			process.exitCode = 1;
 			return true;

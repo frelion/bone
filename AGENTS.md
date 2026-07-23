@@ -25,9 +25,9 @@
 
 ## Commands
 
-- After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
-- Never run `npm run build` or `npm test` unless requested by the user.
-- Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root: `node ../../node_modules/vitest/dist/cli.js --run test/specific.test.ts`.
+- After code changes (not docs): `bun run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
+- Never run `bun run build` or `bun run test` unless requested by the user.
+- Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root: `bunx --bun vitest --run test/specific.test.ts`.
 - If you create or modify a test file, run it and iterate on test or implementation until it passes.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
@@ -36,11 +36,9 @@
 
 ## Dependency and Install Security
 
-- Treat npm dep and lockfile changes as reviewed code. Direct external deps stay pinned to exact versions.
-- Hydrate/update locally with `npm install --ignore-scripts`; clean/CI-style with `npm ci --ignore-scripts`. Don't run lifecycle scripts unless the user asks.
-- If dep metadata changes, refresh `package-lock.json` with `npm install --package-lock-only --ignore-scripts`.
-- If `packages/coding-agent/npm-shrinkwrap.json` needs regen, run `node scripts/generate-coding-agent-shrinkwrap.mjs` (verify with `--check` or `npm run check`). New deps with lifecycle scripts require review and an explicit allowlist entry in that script; never add one silently.
-- Pre-commit blocks lockfile commits unless `PI_ALLOW_LOCKFILE_CHANGE=1`. Don't bypass unless the user wants the lockfile change committed.
+- Treat dependency and Bun lockfile changes as reviewed code. Direct external deps stay pinned to exact versions.
+- Hydrate/update locally with `bun install --ignore-scripts`; clean/CI-style with `bun install --frozen-lockfile --ignore-scripts`. Don't run lifecycle scripts unless the user asks.
+- If dependency metadata changes, refresh `bun.lock` with `bun install --lockfile-only --ignore-scripts` and review the resulting diff.
 
 ## Git
 
@@ -125,7 +123,7 @@ Attribution:
 
 2. **Local smoke test**: build an unpublished release and smoke test from outside the repo (so it can't resolve workspace files):
    ```bash
-   npm run release:local -- --out /tmp/bone-local-release --force
+   bun run release:local -- --out /tmp/bone-local-release --force
    cd /tmp
 
    # Bun package install smoke tests
@@ -146,20 +144,20 @@ Attribution:
 
 3. **Run the release doctor** before changing versions:
    ```bash
-   npm run release:doctor
+   bun run release:doctor
    ```
-   This verifies lockstep package versions and internal dependency ranges, performs a clean-install dependency resolution, and checks generated release locks. Fix every failure before preparing a release.
+   This verifies lockstep package versions and internal dependency ranges and performs a frozen Bun dependency resolution. Fix every failure before preparing a release.
 
 4. **Prepare an explicit version**. Never use an implicit patch/minor bump:
    ```bash
-   npm run release:prepare -- 0.0.10 --dry-run
-   npm run release:prepare -- 0.0.10
+   bun run release:prepare -- 0.0.10 --dry-run
+   bun run release:prepare -- 0.0.10
    ```
-   Preparation atomically updates only the five lockstep packages and their internal dependency ranges, refreshes the root lockfile, shrinkwrap, and installer lock, then runs clean dependency resolution, `npm run check`, and `./test.sh`. It does not commit, tag, or push. Review every generated diff before publishing. Re-running prepare with the same explicit version is safe; do not choose a new version merely because preparation failed.
+   Preparation atomically updates only the five lockstep packages and their internal dependency ranges, refreshes `bun.lock`, then runs clean dependency resolution, `bun run check`, and `./test.sh`. It does not commit, tag, or push. Review every generated diff before publishing. Re-running prepare with the same explicit version is safe; do not choose a new version merely because preparation failed.
 
 5. **Publish the prepared version**:
    ```bash
-   PI_ALLOW_LOCKFILE_CHANGE=1 npm run release:publish -- 0.0.10
+   bun run release:publish -- 0.0.10
    ```
    Publish accepts only expected release files, commits `Release vX.Y.Z`, adds and commits the next `[Unreleased]` sections, pushes `main`, waits for the exact main commit's CI run, then creates and pushes the tag. It waits for the GitHub Release workflow and reports failure instead of claiming the release succeeded early.
 

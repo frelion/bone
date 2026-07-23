@@ -48,11 +48,10 @@ memory, and release guidance:
 ## Development
 
 ```bash
-npm install --ignore-scripts
-npm run check
+bun install --ignore-scripts
+bun run check
 ```
 
 Bone is released through GitHub Releases. npm publication is intentionally
-disabled until the internal package scope is migrated. The supported CLI
-runtime is Bun 1.3.14 or newer; Node.js is used only by the repository's
-existing development tooling.
+disabled until the internal package scope is migrated. Bun 1.3.14 or newer is
+the repository's only JavaScript runtime and toolchain.

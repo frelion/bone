@@ -45,12 +45,12 @@
 	],
 	"scripts": {
 		"clean": "shx rm -rf dist",
-		"generate-models": "node scripts/generate-models.ts",
-		"generate-model-catalog": "node scripts/generate-models.ts --strict --json-only --json-output ../../.artifacts/model-catalog",
-		"generate-image-models": "node scripts/generate-image-models.ts",
-		"build": "npm run generate-models && npm run generate-image-models && tsgo -p tsconfig.build.json",
-		"test": "vitest --run",
-		"prepublishOnly": "npm run clean && npm run build"
+		"generate-models": "bun scripts/generate-models.ts",
+		"generate-model-catalog": "bun scripts/generate-models.ts --strict --json-only --json-output ../../.artifacts/model-catalog",
+		"generate-image-models": "bun scripts/generate-image-models.ts",
+		"build": "bun run generate-models && bun run generate-image-models && tsgo -p tsconfig.build.json",
+		"test": "bunx --bun vitest --run",
+		"prepublishOnly": "bun run clean && bun run build"
 	},
 	"dependencies": {
 		"@anthropic-ai/sdk": "0.91.1",
@@ -58,6 +58,7 @@
 		"@google/genai": "1.52.0",
 		"@mistralai/mistralai": "2.2.6",
 		"@opentelemetry/api": "1.9.0",
+		"@smithy/types": "4.16.1",
 		"@smithy/node-http-handler": "4.7.3",
 		"http-proxy-agent": "7.0.2",
 		"https-proxy-agent": "7.0.6",

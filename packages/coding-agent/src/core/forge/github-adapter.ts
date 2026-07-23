@@ -1,4 +1,4 @@
-import type { Dispatcher } from "undici";
+import type { Dispatcher } from "undici-client";
 import type { ForgeCapability, ForgePage } from "./contracts.ts";
 import { ForgeError } from "./errors.ts";
 import { ForgeHttpClient } from "./http-client.ts";

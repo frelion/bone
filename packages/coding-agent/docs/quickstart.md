@@ -46,7 +46,7 @@ Bone reads `AGENTS.md` or `CLAUDE.md` from `~/.bone/agent/`, parent directories,
 ```markdown
 # Project Instructions
 
-- Run `npm run check` after code changes.
+- Run `bun run check` after code changes.
 - Do not run production migrations locally.
 - Keep responses concise.
 ```

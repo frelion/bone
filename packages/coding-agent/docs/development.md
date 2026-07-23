@@ -7,8 +7,8 @@ See [AGENTS.md](https://github.com/frelion/bone/blob/main/AGENTS.md) for additio
 ```bash
 git clone https://github.com/frelion/bone
 cd bone
-npm install --ignore-scripts
-npm run build
+bun install --ignore-scripts
+bun run build
 ```
 
 Run from source:
@@ -18,8 +18,7 @@ Run from source:
 ```
 
 The script can be run from any directory. Bone keeps the caller's current working directory.
-The repository keeps npm and Node.js as development tooling, but the Bone CLI
-itself must run with Bun 1.3.14 or newer.
+The repository and Bone CLI use Bun 1.3.14 or newer. Node.js is not required.
 
 ## Forking / Rebranding
 
@@ -58,8 +57,8 @@ Never use `__dirname` directly for package assets.
 
 ```bash
 ./test.sh                         # Run non-LLM tests (no API keys needed)
-npm test                          # Run all tests
-npm test -- test/specific.test.ts # Run specific test
+bun run test                       # Run all tests
+bunx --bun vitest --run test/specific.test.ts # Run specific test
 ```
 
 ## Project Structure

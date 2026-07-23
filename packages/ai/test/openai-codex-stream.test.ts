@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	closeOpenAICodexWebSocketSessions,
 	getOpenAICodexWebSocketDebugStats,
@@ -14,6 +14,13 @@ import {
 import type { Context, Model } from "../src/types.ts";
 
 const originalAgentDir = process.env.BONE_CODING_AGENT_DIR;
+
+beforeEach(() => {
+	vi.useRealTimers();
+	vi.unstubAllGlobals();
+	closeOpenAICodexWebSocketSessions();
+	resetOpenAICodexWebSocketDebugStats();
+});
 
 afterEach(() => {
 	vi.unstubAllGlobals();

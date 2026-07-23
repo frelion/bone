@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -15,7 +15,7 @@ const dryRun = process.argv.includes("--dry-run");
 const unknownArgs = process.argv.slice(2).filter((arg) => arg !== "--dry-run");
 
 if (unknownArgs.length > 0) {
-	console.error(`Usage: node scripts/publish.mjs [--dry-run]`);
+	console.error(`Usage: bun scripts/publish.mjs [--dry-run]`);
 	process.exit(1);
 }
 
@@ -45,18 +45,18 @@ function readPackageJson(directory) {
 
 function assertBuildOutputExists(directory) {
 	if (!existsSync(join(directory, "dist"))) {
-		throw new Error(`${directory}/dist does not exist. Run npm run build before publishing.`);
+		throw new Error(`${directory}/dist does not exist. Run bun run build before publishing.`);
 	}
 }
 
 function validatePack(directory) {
-	const result = run("npm", ["pack", "--dry-run", "--ignore-scripts", "--json"], { capture: true, cwd: directory });
-	const packed = JSON.parse(result.stdout)[0];
-	console.log(`  ${packed.filename}: ${packed.files.length} files, ${packed.size} bytes packed, ${packed.unpackedSize} bytes unpacked`);
+	const result = run("bun", ["pm", "pack", "--dry-run", "--ignore-scripts"], { capture: true, cwd: directory });
+	const summary = result.stdout.trim();
+	if (summary) console.log(summary);
 }
 
 function isPublished(name, version) {
-	const result = spawnSync(commandForPlatform("npm"), ["view", `${name}@${version}`, "version", "--json"], {
+	const result = spawnSync(commandForPlatform("bun"), ["info", `${name}@${version}`, "version", "--json"], {
 		encoding: "utf8",
 		stdio: ["inherit", "pipe", "pipe"],
 	});
@@ -120,6 +120,6 @@ for (const pkg of packageStates) {
 		continue;
 	}
 
-	run("npm", ["publish", "--access", "public", "--provenance", "--ignore-scripts"], { cwd: pkg.directory });
+	run("bun", ["publish", "--access", "public", "--ignore-scripts"], { cwd: pkg.directory });
 	console.log();
 }

@@ -1,14 +1,14 @@
 /**
  * OpenAI Codex (ChatGPT OAuth) flow
  *
- * NOTE: This module uses Node.js crypto and http for the OAuth callback.
+ * NOTE: This module uses Bun's crypto and HTTP-compatible builtins for the OAuth callback.
  * It is only intended for CLI use, not browser environments.
  */
 
 // NEVER convert to top-level imports - breaks browser/Vite builds
 let _randomBytes: typeof import("node:crypto").randomBytes | null = null;
 let _http: typeof import("node:http") | null = null;
-if (typeof process !== "undefined" && (process.versions?.node || process.versions?.bun)) {
+if (typeof process !== "undefined" && process.versions?.bun) {
 	import("node:crypto").then((m) => {
 		_randomBytes = m.randomBytes;
 	});
@@ -65,7 +65,7 @@ type JwtPayload = {
 
 function createState(): string {
 	if (!_randomBytes) {
-		throw new Error("OpenAI Codex OAuth is only available in Node.js environments");
+		throw new Error("OpenAI Codex OAuth is only available in Bun");
 	}
 	return _randomBytes(16).toString("hex");
 }
@@ -318,7 +318,7 @@ type OAuthServerInfo = {
 
 function startLocalOAuthServer(state: string): Promise<OAuthServerInfo> {
 	if (!_http) {
-		throw new Error("OpenAI Codex OAuth is only available in Node.js environments");
+		throw new Error("OpenAI Codex OAuth is only available in Bun");
 	}
 
 	let settleWait: ((value: { code: string } | null) => void) | undefined;

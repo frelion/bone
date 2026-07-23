@@ -1,6 +1,6 @@
 import { lookup as dnsLookup } from "node:dns";
 import { isIP } from "node:net";
-import { Agent, type Dispatcher } from "undici";
+import { Agent, type Dispatcher } from "undici-client";
 import { ForgeError } from "./errors.ts";
 
 function ipv4Number(address: string): number | undefined {

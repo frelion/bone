@@ -237,8 +237,8 @@ Use the `pi-ai` faux provider (`registerFauxProvider`, `fauxAssistantMessage`) f
 Harness coverage is configured separately from the default package test run:
 
 ```bash
-npm run test:harness
-npm run coverage:harness
+bun run test:harness
+bun run coverage:harness
 ```
 
 `coverage:harness` runs `test/harness/**/*.test.ts` and reports coverage for `src/harness/**/*.ts` plus the non-harness runtime files it directly exercises (`src/agent.ts` and `src/agent-loop.ts`) into `coverage/harness`. Type-only dependencies such as `src/types.ts` are not included because they have no meaningful runtime coverage.

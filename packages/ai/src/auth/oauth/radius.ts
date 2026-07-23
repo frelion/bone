@@ -4,13 +4,13 @@
  * Radius is a pi-messages gateway. OAuth endpoints are discovered from the
  * gateway (`/v1/oauth`); model catalog loading is owned by the Radius provider.
  *
- * NOTE: This module uses node:http for the OAuth callback server.
+ * NOTE: This module uses Bun's HTTP-compatible builtin for the OAuth callback server.
  * It is only intended for CLI use, not browser environments.
  */
 
 // NEVER convert to top-level imports - breaks browser/Vite builds
 let _http: typeof import("node:http") | null = null;
-if (typeof process !== "undefined" && (process.versions?.node || process.versions?.bun)) {
+if (typeof process !== "undefined" && process.versions?.bun) {
 	import("node:http").then((m) => {
 		_http = m;
 	});
@@ -149,7 +149,7 @@ function startOAuthCallbackServer(
 	signal: AbortSignal | undefined,
 ): Promise<OAuthCallbackServer> {
 	if (!_http) {
-		throw new Error("Radius OAuth is only available in Node.js environments");
+		throw new Error("Radius OAuth is only available in Bun");
 	}
 
 	let settle: (code: string | null) => void = () => {};

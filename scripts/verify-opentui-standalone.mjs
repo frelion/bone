@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { chmodSync, copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 
 function usage() {
 	console.error(
-		"Usage: node scripts/verify-opentui-standalone.mjs --binary <path> [--native-library <path>] [--skip-run]",
+		"Usage: bun scripts/verify-opentui-standalone.mjs --binary <path> [--native-library <path>] [--skip-run]",
 	);
 }
 

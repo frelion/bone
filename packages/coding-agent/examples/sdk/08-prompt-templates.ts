@@ -21,9 +21,9 @@ const deployTemplate: PromptTemplate = {
 	sourceInfo: createSyntheticSourceInfo("/virtual/prompts/deploy.md", { source: "sdk" }),
 	content: `# Deploy Instructions
 
-1. Build: npm run build
-2. Test: npm test
-3. Deploy: npm run deploy`,
+1. Build: bun run build
+2. Test: bun run test
+3. Deploy: bun run deploy`,
 };
 
 const loader = new DefaultResourceLoader({

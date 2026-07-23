@@ -14,7 +14,7 @@ bone --version
 For development builds, create the self-contained local package and install it:
 
 ```bash
-npm run pack:bone
+bun run pack:bone
 bun add --global artifacts/frelion-bone-coding-agent-*.tgz
 ```
 

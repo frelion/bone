@@ -24,8 +24,9 @@ bone setup
 ```
 
 This downloads and verifies the fixed CPU GGUF model once. Normal `bone` startup
-never downloads it. A same-process Node Worker Thread loads Bone's native CrispEmbed/ggml addon and mmaps
-the model weights, keeping inference off the TUI thread and weights out of the Node.js heap.
+never downloads it. A same-process Bun Worker loads CrispEmbed/ggml through Bun
+FFI and mmaps the model weights, keeping inference off the TUI thread and the
+weights outside Bun's JavaScript heap.
 
 ## Indexing and status
 

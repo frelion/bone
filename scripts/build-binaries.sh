@@ -7,9 +7,9 @@
 #   ./scripts/build-binaries.sh [--skip-install] [--skip-deps] [--skip-build] [--platform <platform>] [--out <dir>]
 #
 # Options:
-#   --skip-install      Skip npm ci
+#   --skip-install      Skip bun install
 #   --skip-deps         Skip installing cross-platform dependencies
-#   --skip-build        Skip npm run build
+#   --skip-build        Skip bun run build
 #   --platform <name>   Build only for specified platform (darwin-arm64, darwin-x64, linux-x64, linux-arm64, windows-x64, windows-arm64)
 #   --out <dir>         Output directory (default: packages/coding-agent/binaries)
 #
@@ -83,20 +83,20 @@ fi
 
 if [[ "$SKIP_INSTALL" == "false" ]]; then
     echo "==> Installing dependencies..."
-    npm ci --ignore-scripts
+    bun install --ignore-scripts
 else
-    echo "==> Skipping npm ci (--skip-install)"
+    echo "==> Skipping bun install (--skip-install)"
 fi
 
 if [[ "$SKIP_DEPS" == "false" ]]; then
     echo "==> Installing cross-platform native bindings..."
-    CLIPBOARD_VERSION=$(node -p "require('./packages/coding-agent/package.json').optionalDependencies['@mariozechner/clipboard']")
-    OPENTUI_VERSION=$(node -p "require('./packages/tui/package.json').dependencies['@opentui/core']")
-    # npm ci only installs optional deps for the current platform. Bun cross-compilation
+    CLIPBOARD_VERSION=$(bun -e "console.log(require('./packages/coding-agent/package.json').optionalDependencies['@mariozechner/clipboard'])")
+    OPENTUI_VERSION=$(bun -e "console.log(require('./packages/tui/package.json').dependencies['@opentui/core'])")
+    # Bun install only installs optional deps for the current platform. Cross-compilation
     # needs every clipboard binding and OpenTUI native library available to the bundler.
     # Use --force to bypass platform checks (os/cpu restrictions in package.json)
-    # Install all in one command to avoid npm removing packages from previous installs
-    npm install --include=optional --no-save --package-lock=false --force --ignore-scripts \
+    # Install all in one command to avoid removing packages from previous installs
+    bun add --no-save --force --ignore-scripts \
         @mariozechner/clipboard@"$CLIPBOARD_VERSION" \
         @mariozechner/clipboard-darwin-arm64@"$CLIPBOARD_VERSION" \
         @mariozechner/clipboard-darwin-x64@"$CLIPBOARD_VERSION" \
@@ -118,7 +118,7 @@ fi
 
 if [[ "$SKIP_BUILD" == "false" ]]; then
     echo "==> Building all packages..."
-    npm run build
+    bun run build
 else
     echo "==> Skipping package build (--skip-build)"
 fi
@@ -150,14 +150,20 @@ for platform in "${PLATFORMS[@]}"; do
 		opentui_binary="$OUTPUT_DIR/$platform/bone"
     fi
     case "$platform" in
-        darwin-arm64) opentui_library="../../node_modules/@opentui/core-darwin-arm64/libopentui.dylib" ;;
-        darwin-x64) opentui_library="../../node_modules/@opentui/core-darwin-x64/libopentui.dylib" ;;
-        linux-arm64) opentui_library="../../node_modules/@opentui/core-linux-arm64/libopentui.so" ;;
-        linux-x64) opentui_library="../../node_modules/@opentui/core-linux-x64/libopentui.so" ;;
-        windows-arm64) opentui_library="../../node_modules/@opentui/core-win32-arm64/opentui.dll" ;;
-        windows-x64) opentui_library="../../node_modules/@opentui/core-win32-x64/opentui.dll" ;;
+        darwin-arm64) opentui_package="@opentui/core-darwin-arm64"; opentui_filename="libopentui.dylib" ;;
+        darwin-x64) opentui_package="@opentui/core-darwin-x64"; opentui_filename="libopentui.dylib" ;;
+        linux-arm64) opentui_package="@opentui/core-linux-arm64"; opentui_filename="libopentui.so" ;;
+        linux-x64) opentui_package="@opentui/core-linux-x64"; opentui_filename="libopentui.so" ;;
+        windows-arm64) opentui_package="@opentui/core-win32-arm64"; opentui_filename="opentui.dll" ;;
+        windows-x64) opentui_package="@opentui/core-win32-x64"; opentui_filename="opentui.dll" ;;
     esac
-    node ../../scripts/verify-opentui-standalone.mjs \
+    opentui_library=$(bun -e '
+        import { dirname, resolve } from "node:path";
+        const coreEntry = Bun.resolveSync("@opentui/core", resolve(process.cwd(), "../tui"));
+        const entry = Bun.resolveSync(process.argv[1], dirname(coreEntry));
+        console.log(resolve(dirname(entry), process.argv[2]));
+    ' "$opentui_package" "$opentui_filename")
+    bun ../../scripts/verify-opentui-standalone.mjs \
         --binary "$opentui_binary" \
         --native-library "$opentui_library" \
         --skip-run
@@ -166,14 +172,14 @@ done
 # A successful compile does not prove that OpenTUI's file-imported dynamic
 # library can be extracted from $bunfs and loaded. Exercise the host binary
 # from an isolated directory whenever this build includes the host target.
-HOST_PLATFORM=$(node -p "(process.platform === 'win32' ? 'windows' : process.platform) + '-' + process.arch")
+HOST_PLATFORM=$(bun -e "console.log((process.platform === 'win32' ? 'windows' : process.platform) + '-' + process.arch)")
 for platform in "${PLATFORMS[@]}"; do
     if [[ "$platform" == "$HOST_PLATFORM" ]]; then
         host_binary="$OUTPUT_DIR/$platform/bone"
         if [[ "$platform" == windows-* ]]; then
             host_binary="$OUTPUT_DIR/$platform/bone.exe"
         fi
-        node ../../scripts/verify-opentui-standalone.mjs --binary "$host_binary"
+        bun ../../scripts/verify-opentui-standalone.mjs --binary "$host_binary"
     fi
 done
 
@@ -184,7 +190,7 @@ for platform in "${PLATFORMS[@]}"; do
     cp package.json "$OUTPUT_DIR/$platform/"
     cp README.md "$OUTPUT_DIR/$platform/"
     cp CHANGELOG.md "$OUTPUT_DIR/$platform/"
-    cp ../../node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm "$OUTPUT_DIR/$platform/"
+    bun scripts/copy-photon-wasm.ts "$OUTPUT_DIR/$platform/photon_rs_bg.wasm"
     mkdir -p "$OUTPUT_DIR/$platform/theme"
     cp dist/modes/interactive/theme/*.json "$OUTPUT_DIR/$platform/theme/"
     mkdir -p "$OUTPUT_DIR/$platform/assets"
@@ -206,7 +212,7 @@ for platform in "${PLATFORMS[@]}"; do
     test -d "native/$native_platform"
     mkdir -p "$OUTPUT_DIR/$platform/native"
     cp -R "native/$native_platform" "$OUTPUT_DIR/$platform/native/"
-    node ../../scripts/verify-semantic-native.mjs --root "$OUTPUT_DIR/$platform/native" --target "$native_platform"
+    bun ../../scripts/verify-semantic-native.mjs --root "$OUTPUT_DIR/$platform/native" --target "$native_platform"
 
     case "$platform" in
         darwin-arm64)
@@ -234,10 +240,19 @@ for platform in "${PLATFORMS[@]}"; do
             clipboard_native_file="clipboard.win32-arm64-msvc.node"
             ;;
     esac
+    clipboard_package_dir=$(bun -e '
+        import { dirname } from "node:path";
+        console.log(dirname(Bun.resolveSync("@mariozechner/clipboard", process.cwd())));
+    ')
+    clipboard_native_dir=$(bun -e '
+        import { dirname } from "node:path";
+        const clipboardDir = dirname(Bun.resolveSync("@mariozechner/clipboard", process.cwd()));
+        console.log(dirname(Bun.resolveSync(`@mariozechner/${process.argv[1]}`, clipboardDir)));
+    ' "$clipboard_native_package")
     mkdir -p "$OUTPUT_DIR/$platform/node_modules/@mariozechner"
-    cp -r ../../node_modules/@mariozechner/clipboard "$OUTPUT_DIR/$platform/node_modules/@mariozechner/"
-    cp -r ../../node_modules/@mariozechner/$clipboard_native_package "$OUTPUT_DIR/$platform/node_modules/@mariozechner/"
-    cp "../../node_modules/@mariozechner/$clipboard_native_package/$clipboard_native_file" \
+    cp -r "$clipboard_package_dir" "$OUTPUT_DIR/$platform/node_modules/@mariozechner/clipboard"
+    cp -r "$clipboard_native_dir" "$OUTPUT_DIR/$platform/node_modules/@mariozechner/$clipboard_native_package"
+    cp "$clipboard_native_dir/$clipboard_native_file" \
         "$OUTPUT_DIR/$platform/node_modules/@mariozechner/clipboard/"
 
 done

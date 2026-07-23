@@ -139,9 +139,9 @@ describe("NodeExecutionEnv", () => {
 		const root = createTempDir();
 		const env = new NodeExecutionEnv({ cwd: root });
 		const tempDir = getOrThrow(await env.createTempDir("node-env-test-"));
-		await expect(access(tempDir)).resolves.toBeUndefined();
+		await expect(access(tempDir)).resolves.toBeNull();
 		const tempFile = getOrThrow(await env.createTempFile({ prefix: "prefix-", suffix: ".txt" }));
-		await expect(access(tempFile)).resolves.toBeUndefined();
+		await expect(access(tempFile)).resolves.toBeNull();
 		expect(tempFile.endsWith(".txt")).toBe(true);
 	});
 

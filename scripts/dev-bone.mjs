@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import {
 	chmodSync,
@@ -72,9 +72,9 @@ function shellQuote(value) {
 
 function usage() {
 	console.error(`Usage:
-  npm run dev:install [-- --skip-build]
-  npm run dev:install-hook [-- --command <path-to-bone>]
-  npm run dev:uninstall-hook`);
+  bun run dev:install [-- --skip-build]
+  bun run dev:install-hook [-- --command <path-to-bone>]
+  bun run dev:uninstall-hook`);
 }
 
 function parseArgs() {
@@ -109,7 +109,7 @@ function runHuskyPrepare() {
 	}).stdout.trim();
 	if (isBoneManagedHooksPath(configuredHooksPath, { repoRoot, devRoot })) return;
 	const huskyPath = resolveCommand("husky");
-	if (!huskyPath) fail("Husky is missing. Run npm install --ignore-scripts first.");
+	if (!huskyPath) fail("Husky is missing. Run bun install --ignore-scripts first.");
 	run(huskyPath);
 }
 
@@ -125,10 +125,6 @@ function getGitValue(args) {
 	return runOutput("git", args);
 }
 
-function getNpmPath() {
-	return resolveCommand("npm") ?? join(dirname(process.execPath), process.platform === "win32" ? "npm.cmd" : "npm");
-}
-
 function getBunPath() {
 	const fallback = join(homedir(), ".bun", "bin", process.platform === "win32" ? "bun.exe" : "bun");
 	return resolveCommand("bun") ?? (existsSync(fallback) ? fallback : undefined);
@@ -139,7 +135,7 @@ function buildTools() {
 	if (!bunPath) fail("Bun is required to build the local Bone binary. Install Bun or add it to PATH.");
 	const commandExtension = process.platform === "win32" ? ".cmd" : "";
 	const tsgoPath = join(repoRoot, "node_modules", ".bin", `tsgo${commandExtension}`);
-	if (!existsSync(tsgoPath)) fail("The TypeScript native compiler is missing. Run npm install --ignore-scripts first.");
+	if (!existsSync(tsgoPath)) fail("The TypeScript native compiler is missing. Run bun install --ignore-scripts first.");
 	return {
 		bunPath,
 		tsgoPath,
@@ -160,7 +156,7 @@ function buildStandalone() {
 	}
 	chmodSync(join(codingAgentDir, "dist", "cli.js"), 0o755);
 	chmodSync(join(codingAgentDir, "dist", "rpc-entry.js"), 0o755);
-	run(getNpmPath(), ["run", "copy-assets"], { cwd: codingAgentDir, env: environment });
+	run(bunPath, ["run", "copy-assets"], { cwd: codingAgentDir, env: environment });
 	run(
 		bunPath,
 		[
@@ -175,7 +171,7 @@ function buildStandalone() {
 		],
 		{ cwd: codingAgentDir, env: environment },
 	);
-	run(getNpmPath(), ["run", "copy-binary-assets"], { cwd: codingAgentDir, env: environment });
+	run(bunPath, ["run", "copy-binary-assets"], { cwd: codingAgentDir, env: environment });
 }
 
 function writeJson(path, value) {
@@ -255,7 +251,7 @@ function installRelease(skipBuild) {
 	}
 
 	const sourceDirectory = join(codingAgentDir, "dist");
-	if (!existsSync(sourceDirectory)) fail("Bone build output is missing. Run npm run dev:install without --skip-build.");
+	if (!existsSync(sourceDirectory)) fail("Bone build output is missing. Run bun run dev:install without --skip-build.");
 	mkdirSync(releasesDir, { recursive: true, mode: 0o700 });
 	const releaseDirectory = join(releasesDir, releaseName());
 	const temporaryDirectory = `${releaseDirectory}.tmp-${process.boned}`;
@@ -295,7 +291,7 @@ function installCommandShim(commandPath) {
 	const config = readHookConfig();
 	if (config) {
 		if (resolve(config.commandPath) !== commandPath) {
-			fail(`This repository already manages ${config.commandPath}. Run npm run dev:uninstall-hook before changing the command path.`);
+			fail(`This repository already manages ${config.commandPath}. Run bun run dev:uninstall-hook before changing the command path.`);
 		}
 		ensureCommandShim(commandPath);
 		return config.commandBackup;

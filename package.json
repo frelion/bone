@@ -2,6 +2,7 @@
 	"name": "bone-monorepo",
 	"private": true,
 	"type": "module",
+	"packageManager": "bun@1.3.14",
 	"workspaces": [
 		"packages/*",
 		"packages/coding-agent/examples/extensions/with-deps",
@@ -11,40 +12,36 @@
 		"packages/coding-agent/examples/extensions/gondolin"
 	],
 	"scripts": {
-		"clean": "npm run clean --workspaces",
-		"build": "cd packages/tui && npm run build && cd ../ai && npm run build && cd ../agent && npm run build && cd ../coding-agent && npm run build && cd ../orchestrator && npm run build",
-		"check": "biome check --write --error-on-warnings . && npm run check:pinned-deps && npm run check:ts-imports && npm run check:release-scripts && npm run check:shrinkwrap && npm run check:install-lock:coding-agent && tsgo --noEmit && npm run check:examples && npm run check:browser-smoke",
-		"check:browser-smoke": "node scripts/check-browser-smoke.mjs",
+		"clean": "bun run --filter '*' clean",
+		"build": "bun run --cwd packages/tui build && bun run --cwd packages/ai build && bun run --cwd packages/agent build && bun run --cwd packages/coding-agent build && bun run --cwd packages/orchestrator build",
+		"check": "biome check --write --error-on-warnings . && bun run check:pinned-deps && bun run check:ts-imports && bun run check:release-scripts && tsgo --noEmit && bun run check:examples && bun run check:browser-smoke",
+		"check:browser-smoke": "bun scripts/check-browser-smoke.mjs",
 		"check:examples": "tsgo -p packages/coding-agent/tsconfig.examples.json --noEmit",
-		"check:pinned-deps": "node scripts/check-pinned-deps.mjs",
-		"check:release-scripts": "node --test scripts/*.test.mjs && node scripts/sync-versions.js --check",
-		"check:shrinkwrap": "node scripts/generate-coding-agent-shrinkwrap.mjs --check",
-		"check:install-lock:coding-agent": "node scripts/generate-coding-agent-install-lock.mjs --check",
-		"check:ts-imports": "node scripts/check-ts-relative-imports.mjs",
-		"generate:model-catalog": "npm --prefix packages/ai run generate-model-catalog",
-		"check:model-catalog": "node scripts/publish-model-catalog.mjs --input .artifacts/model-catalog --dry-run",
-		"profile:tui": "bun scripts/profile-coding-agent-node.mjs --mode tui --runtime bun",
-		"profile:rpc": "bun scripts/profile-coding-agent-node.mjs --mode rpc --runtime bun",
-		"test": "npm run test --workspaces --if-present",
-		"eval:forge": "npm --prefix packages/coding-agent run eval:forge",
-		"eval:forge:ci": "npm --prefix packages/coding-agent run eval:forge:ci",
-		"eval:forge:live": "npm --prefix packages/coding-agent run eval:forge:live",
-		"version:sync": "node scripts/sync-versions.js",
-		"prepublishOnly": "npm run clean && npm run build && npm run check",
-		"publish": "node -e \"throw new Error('Bone npm publishing is intentionally disabled until its package scope is migrated from Pi.')\"",
-		"publish:dry": "node -e \"throw new Error('Bone npm publishing is intentionally disabled until its package scope is migrated from Pi.')\"",
-		"release:local": "node scripts/local-release.mjs",
-		"pack:bone": "node scripts/pack-bone.mjs",
-		"dev:install": "node scripts/dev-bone.mjs install",
-		"dev:install-hook": "node scripts/dev-bone.mjs install-hook",
-		"dev:uninstall-hook": "node scripts/dev-bone.mjs uninstall-hook",
-		"shrinkwrap:coding-agent": "node scripts/generate-coding-agent-shrinkwrap.mjs",
-		"install-lock:coding-agent": "node scripts/generate-coding-agent-install-lock.mjs",
-		"release:doctor": "node scripts/release.mjs doctor",
-		"release:prepare": "node scripts/release.mjs prepare",
-		"release:publish": "node scripts/release.mjs publish",
-		"release:fix-links": "node scripts/release-notes.mjs fix-github-releases",
-		"prepare": "node scripts/dev-bone.mjs prepare"
+		"check:pinned-deps": "bun scripts/check-pinned-deps.mjs",
+		"check:release-scripts": "bun test scripts/*.test.mjs && bun scripts/sync-versions.js --check",
+		"check:ts-imports": "bun scripts/check-ts-relative-imports.mjs",
+		"generate:model-catalog": "bun run --cwd packages/ai generate-model-catalog",
+		"check:model-catalog": "bun scripts/publish-model-catalog.mjs --input .artifacts/model-catalog --dry-run",
+		"profile:tui": "bun scripts/profile-coding-agent-node.mjs --mode tui",
+		"profile:rpc": "bun scripts/profile-coding-agent-node.mjs --mode rpc",
+		"test": "bun run --filter '*' test",
+		"eval:forge": "bun run --cwd packages/coding-agent eval:forge",
+		"eval:forge:ci": "bun run --cwd packages/coding-agent eval:forge:ci",
+		"eval:forge:live": "bun run --cwd packages/coding-agent eval:forge:live",
+		"version:sync": "bun scripts/sync-versions.js",
+		"prepublishOnly": "bun run clean && bun run build && bun run check",
+		"publish": "bun -e \"throw new Error('Bone registry publishing is intentionally disabled; GitHub Releases are the distribution channel.')\"",
+		"publish:dry": "bun -e \"throw new Error('Bone registry publishing is intentionally disabled; GitHub Releases are the distribution channel.')\"",
+		"release:local": "bun scripts/local-release.mjs",
+		"pack:bone": "bun scripts/pack-bone.mjs",
+		"dev:install": "bun scripts/dev-bone.mjs install",
+		"dev:install-hook": "bun scripts/dev-bone.mjs install-hook",
+		"dev:uninstall-hook": "bun scripts/dev-bone.mjs uninstall-hook",
+		"release:doctor": "bun scripts/release.mjs doctor",
+		"release:prepare": "bun scripts/release.mjs prepare",
+		"release:publish": "bun scripts/release.mjs publish",
+		"release:fix-links": "bun scripts/release-notes.mjs fix-github-releases",
+		"prepare": "bun scripts/dev-bone.mjs prepare"
 	},
 	"devDependencies": {
 		"@anthropic-ai/sandbox-runtime": "0.0.26",
@@ -59,14 +56,10 @@
 		"typescript": "5.9.3"
 	},
 	"engines": {
-		"bun": ">=1.3.14",
-		"node": ">=22.19.0"
+		"bun": ">=1.3.14"
 	},
 	"version": "0.0.4",
 	"overrides": {
-		"rimraf": "6.1.2",
-		"gaxios": {
-			"rimraf": "6.1.2"
-		}
+		"rimraf": "6.1.2"
 	}
 }

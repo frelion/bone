@@ -12,7 +12,7 @@ type ProcessWithOsBuiltinModule = typeof process & {
 };
 
 function loadNodeOs(): typeof NodeOs | null {
-	if (typeof process === "undefined" || !(process.versions?.node || process.versions?.bun)) {
+	if (typeof process === "undefined" || !process.versions?.bun) {
 		return null;
 	}
 	return (process as ProcessWithOsBuiltinModule).getBuiltinModule?.("node:os") ?? null;
@@ -192,7 +192,7 @@ type ProcessWithBuiltinModule = typeof process & {
 };
 
 function loadNodeZlib(): typeof NodeZlib | null {
-	if (typeof process === "undefined" || !(process.versions?.node || process.versions?.bun)) {
+	if (typeof process === "undefined" || !process.versions?.bun) {
 		return null;
 	}
 	return (process as ProcessWithBuiltinModule).getBuiltinModule?.("node:zlib") ?? null;
@@ -882,10 +882,7 @@ type WebSocketConstructor = new (
 	protocols?: string | string[] | { headers?: Record<string, string> },
 ) => WebSocketLike;
 
-let _cachedWebsocket: WebSocketConstructor | null = null;
 async function getWebSocketConstructor(env?: ProviderEnv): Promise<WebSocketConstructor | null> {
-	if (!env && _cachedWebsocket) return _cachedWebsocket;
-
 	// bun doesn't respect http proxy envs, ref: https://github.com/oven-sh/bun/issues/15489
 	// TODO: remove this when bun supports proxy envs in websocket.
 	if (typeof process !== "undefined" && process.versions?.bun) {
@@ -905,9 +902,6 @@ async function getWebSocketConstructor(env?: ProviderEnv): Promise<WebSocketCons
 				super(url, { ..._opts, ...(proxyUrl ? { proxy: proxyUrl.toString() } : {}) } as any);
 			}
 		};
-		if (!env) {
-			_cachedWebsocket = WebSocketWithProxy;
-		}
 		return WebSocketWithProxy;
 	}
 

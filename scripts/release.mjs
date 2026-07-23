@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -12,10 +12,9 @@ const changelogs = ["ai", "agent", "tui", "coding-agent", "orchestrator"].map(
 );
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 const releasePathPatterns = [
-	/^package-lock\.json$/,
+	/^bun\.lock$/,
 	/^packages\/(ai|agent|tui|coding-agent|orchestrator)\/package\.json$/,
 	/^packages\/(ai|agent|tui|coding-agent|orchestrator)\/CHANGELOG\.md$/,
-	/^packages\/coding-agent\/(npm-shrinkwrap\.json|install-lock\/(package|package-lock)\.json)$/,
 ];
 
 function run(command, args, options = {}) {
@@ -24,7 +23,7 @@ function run(command, args, options = {}) {
 		cwd: root,
 		encoding: "utf8",
 		stdio: options.capture ? ["inherit", "pipe", "inherit"] : "inherit",
-		env: { ...process.env, npm_config_min_release_age: "0", ...options.env },
+		env: { ...process.env, ...options.env },
 	});
 }
 
@@ -91,14 +90,12 @@ function readState(version) {
 function verifyWorkspaceAndLocks() {
 	const syncResult = syncWorkspaceVersions({ root, write: false });
 	if (syncResult.changes.length > 0) throw new Error(syncResult.changes.join("\n"));
-	run("npm", ["ci", "--ignore-scripts", "--dry-run"]);
-	run("node", ["scripts/generate-coding-agent-shrinkwrap.mjs", "--check"]);
-	run("node", ["scripts/generate-coding-agent-install-lock.mjs", "--check"]);
+	run("bun", ["install", "--frozen-lockfile", "--ignore-scripts", "--dry-run"]);
 }
 
 function doctor({ requireClean = true, requirePublishTools = false } = {}) {
 	if (requireClean) assertClean();
-	for (const command of ["git", "node", "npm", "bun", ...(requirePublishTools ? ["gh"] : [])]) {
+	for (const command of ["git", "bun", ...(requirePublishTools ? ["gh"] : [])]) {
 		run(command, ["--version"]);
 	}
 	verifyWorkspaceAndLocks();
@@ -123,12 +120,10 @@ function prepare(version, { dryRun = false } = {}) {
 		console.log(`Dry run complete for ${version}; no files changed.`);
 		return;
 	}
-	run("npm", ["install", "--package-lock-only", "--ignore-scripts"]);
+	run("bun", ["install", "--lockfile-only", "--ignore-scripts"]);
 	updateChangelogs(version);
-	run("node", ["scripts/generate-coding-agent-shrinkwrap.mjs"]);
-	run("node", ["scripts/generate-coding-agent-install-lock.mjs"]);
 	verifyWorkspaceAndLocks();
-	run("npm", ["run", "check"]);
+	run("bun", ["run", "check"]);
 	run("./test.sh", []);
 	const preparedPaths = changedPaths();
 	assertReleaseChanges(preparedPaths);
@@ -175,7 +170,7 @@ function publish(version) {
 		if (getVersion() !== version) throw new Error(`Package version is ${getVersion()}, expected ${version}.`);
 		verifyWorkspaceAndLocks();
 		run("git", ["add", "--", ...paths]);
-		run("git", ["commit", "-m", `Release v${version}`], { env: { PI_ALLOW_LOCKFILE_CHANGE: "1" } });
+		run("git", ["commit", "-m", `Release v${version}`]);
 		state = { phase: "release-committed", releaseCommit: capture("git", ["rev-parse", "HEAD"]), version };
 		writeState(state);
 	}

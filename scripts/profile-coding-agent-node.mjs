@@ -17,9 +17,9 @@ function printHelp() {
 	console.log(`Usage:
   bun scripts/profile-coding-agent-node.mjs [options]
 
-Profiles coding-agent startup with the runtime selected below:
-- npm run profile:tui     -> profiles TUI startup from src/cli.ts with Bun
-- npm run profile:rpc     -> profiles RPC startup from src/cli.ts with Bun
+Profiles coding-agent startup under Bun:
+- bun run profile:tui     -> profiles TUI startup from src/cli.ts
+- bun run profile:rpc     -> profiles RPC startup from src/cli.ts
 
 Options:
   --mode <name>          tui or rpc (default: tui)
@@ -27,7 +27,6 @@ Options:
   --warmup <n>           Number of warmup runs before measurements (default: 0)
   --profile-dir <dir>    CPU profile output directory (default: profiles-bun)
   --label <name>         Profile name prefix (default: <mode>-startup)
-  --runtime <name>       bun (the only supported runtime)
   --agent-dir <dir>      Use a specific BONE_CODING_AGENT_DIR for the benchmark run
   --isolated-agent-dir   Use a fresh temporary agent dir instead of the normal one
   --no-offline           Do not force BONE_OFFLINE=1 / BONE_SKIP_VERSION_CHECK=1
@@ -50,13 +49,6 @@ function parseIntegerFlag(value, name) {
 	return parsed;
 }
 
-function parseRuntime(value) {
-	if (value === "bun") {
-		return value;
-	}
-	throw new Error(`Invalid --runtime: ${value}. Bone supports Bun only.`);
-}
-
 function parseMode(value) {
 	if (value === "tui" || value === "rpc") {
 		return value;
@@ -72,7 +64,6 @@ function parseArgs(argv) {
 		profileDir: undefined,
 		label: undefined,
 		offline: true,
-		runtime: "bun",
 		agentDir: undefined,
 		isolatedAgentDir: false,
 		cpuProfile: false,
@@ -108,7 +99,6 @@ function parseArgs(argv) {
 				arg === "--warmup" ||
 				arg === "--profile-dir" ||
 				arg === "--label" ||
-				arg === "--runtime" ||
 				arg === "--agent-dir") &&
 			index + 1 >= argv.length
 		) {
@@ -137,11 +127,6 @@ function parseArgs(argv) {
 
 		if (arg === "--label") {
 			options.label = argv[++index];
-			continue;
-		}
-
-		if (arg === "--runtime") {
-			options.runtime = parseRuntime(argv[++index]);
 			continue;
 		}
 
@@ -289,7 +274,7 @@ function createBenchmarkEnv(options, isolatedAgentDir) {
 	return env;
 }
 
-async function runTuiBenchmarkRun({ runtime, runIndex, measuredIndex, options, profileDir }) {
+async function runTuiBenchmarkRun({ runIndex, measuredIndex, options, profileDir }) {
 	const runNumber = runIndex + 1;
 	const suffix = String(runNumber).padStart(3, "0");
 	const profileName = `${options.label}-${suffix}.cpuprofile`;
@@ -304,7 +289,7 @@ async function runTuiBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 		cwd: packageDir,
 		env: createBenchmarkEnv(options, isolatedAgentDir),
 		stdio: ["inherit", "ignore", "pipe"],
-		shell: process.platform === "win32" && runtime === "bun",
+		shell: process.platform === "win32",
 	});
 
 	let stderr = "";
@@ -348,7 +333,7 @@ function splitJsonLines(buffer, onLine) {
 	}
 }
 
-async function runRpcBenchmarkRun({ runtime, runIndex, measuredIndex, options, profileDir }) {
+async function runRpcBenchmarkRun({ runIndex, measuredIndex, options, profileDir }) {
 	const runNumber = runIndex + 1;
 	const suffix = String(runNumber).padStart(3, "0");
 	const profileName = `${options.label}-${suffix}.cpuprofile`;
@@ -363,7 +348,7 @@ async function runRpcBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 		cwd: packageDir,
 		env: createBenchmarkEnv(options, isolatedAgentDir),
 		stdio: ["pipe", "pipe", "pipe"],
-		shell: process.platform === "win32" && runtime === "bun",
+		shell: process.platform === "win32",
 	});
 
 	let stdoutBuffer = "";
@@ -459,7 +444,6 @@ async function main() {
 		throw new Error("TUI benchmark must be run from an interactive terminal.");
 	}
 
-	const runtime = options.runtime;
 	options.label = resolveLabel(options.mode, options.label);
 	const profileDir = resolveProfileDir(options.profileDir);
 
@@ -479,7 +463,6 @@ async function main() {
 	for (let runIndex = 0; runIndex < totalRuns; runIndex++) {
 		const measuredIndex = runIndex >= options.warmup ? runIndex - options.warmup + 1 : undefined;
 		const result = await runBenchmarkRun({
-			runtime,
 			runIndex,
 			measuredIndex,
 			options,
@@ -505,7 +488,7 @@ async function main() {
 	const maxElapsedRun = measuredRuns.reduce((slowest, run) => (run.elapsedMs > slowest.elapsedMs ? run : slowest));
 	if (measuredRuns.length === 1) {
 		process.stdout.write("\nResult\n");
-		process.stdout.write(`  runtime:          ${runtime}\n`);
+		process.stdout.write("  runtime:          bun\n");
 		process.stdout.write(`  mode:             ${options.mode}\n`);
 		process.stdout.write(`  elapsed:          ${formatMs(measuredRuns[0].elapsedMs)}\n`);
 		for (const [label, summary] of timingSummaries.entries()) {
@@ -523,7 +506,7 @@ async function main() {
 	}
 
 	process.stdout.write("\nSummary\n");
-	process.stdout.write(`  runtime:          ${runtime}\n`);
+	process.stdout.write("  runtime:          bun\n");
 	process.stdout.write(`  mode:             ${options.mode}\n`);
 	process.stdout.write(`  elapsed min:      ${formatMs(elapsedSummary.min)}\n`);
 	process.stdout.write(`  elapsed median:   ${formatMs(elapsedSummary.median)}\n`);

@@ -1,4 +1,4 @@
-import { MockAgent } from "undici";
+import { MockAgent } from "undici-client";
 import { afterEach, describe, expect, it } from "vitest";
 import { GitHubAdapter } from "../src/core/forge/github-adapter.ts";
 

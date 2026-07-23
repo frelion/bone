@@ -3,7 +3,6 @@ import { createReadStream, existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Worker } from "node:worker_threads";
 import {
 	getLocalEmbeddingCacheDirectory,
 	getLocalEmbeddingManifestPath,
@@ -36,6 +35,17 @@ export interface LocalEmbeddingEngineDiagnostics {
 	modelFingerprint?: string;
 	error?: string;
 }
+
+interface BunWorker {
+	onmessage: ((event: { data: unknown }) => void) | null;
+	onerror: ((event: { message: string }) => void) | null;
+	postMessage(message: unknown): void;
+	terminate(): void;
+}
+
+declare const Worker: {
+	new (specifier: string | URL, options: { type: "module" }): BunWorker;
+};
 
 /** Minimal boundary used by search so tests never need to start the native GGUF runtime. */
 export interface LocalEmbeddingEngine {
@@ -166,21 +176,28 @@ function nativePlatform(): string | undefined {
 		: undefined;
 }
 
-function resolveNativeAddon(): string {
+function resolveNativeLibrary(): string {
 	const platform = nativePlatform();
 	if (!platform) throw new Error(`Local GGUF semantic search is not bundled for ${process.platform}-${process.arch}`);
 	const moduleDirectory = dirname(fileURLToPath(import.meta.url));
 	const sourceRuntime = import.meta.url.endsWith(".ts");
 	const candidates = [
 		sourceRuntime
-			? join(moduleDirectory, "..", "..", "native", platform, "bone-embed.node")
-			: join(moduleDirectory, "..", "native", platform, "bone-embed.node"),
-		join(dirname(process.execPath), "native", platform, "bone-embed.node"),
+			? join(moduleDirectory, "..", "..", "native", platform)
+			: join(moduleDirectory, "..", "native", platform),
+		join(dirname(process.execPath), "native", platform),
 	];
-	for (const candidate of candidates) {
+	const libraryName =
+		process.platform === "darwin"
+			? "libcrispembed.0.dylib"
+			: process.platform === "win32"
+				? "crispembed.dll"
+				: "libcrispembed.so.0";
+	for (const directory of candidates) {
+		const candidate = join(directory, libraryName);
 		if (existsSync(candidate)) return candidate;
 	}
-	throw new Error("Bone's local GGUF embedding addon is missing from this installation");
+	throw new Error("Bone's local GGUF embedding library is missing from this installation");
 }
 
 function workerSpecifier(): URL {
@@ -194,7 +211,9 @@ function localEmbeddingWorkerEntry(): string | URL {
 	// Bun standalone executables resolve explicitly bundled worker entrypoints
 	// by their source path. URL resolution points into the executable's virtual
 	// filesystem instead, leaving the worker alive but unable to receive work.
-	if (typeof process.versions.bun === "string") return "./src/core/local-embedding-worker.ts";
+	if (typeof process.versions.bun === "string" && !import.meta.url.startsWith("file:")) {
+		return "./src/core/local-embedding-worker.ts";
+	}
 	return workerSpecifier();
 }
 
@@ -224,11 +243,11 @@ function asDiagnostics(status: WorkerStatus): LocalEmbeddingEngineDiagnostics | 
 }
 
 /**
- * Owns one Node Worker Thread in the same Bone process. The thread loads the
- * Node-API addon and is the only thread allowed to access CrispEmbed's context.
+ * Owns one Bun Worker in the same Bone process. The worker is the only thread
+ * allowed to access CrispEmbed's context through Bun FFI.
  */
 export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
-	private worker: Worker | undefined;
+	private worker: BunWorker | undefined;
 	private nextRequestId = 1;
 	private readonly pending = new Map<number, PendingRequest>();
 	private preparePromise: Promise<void> | undefined;
@@ -280,7 +299,7 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 		} catch {
 			// The Worker may already have exited. Termination still releases its JS state.
 		}
-		await worker.terminate().catch(() => undefined);
+		worker.terminate();
 		if (this.worker === worker) this.worker = undefined;
 		this.diagnostics = {
 			...this.diagnostics,
@@ -307,7 +326,7 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 		this.onStatus?.({ phase: "loading" });
 		await this.request("prepare", 0, {
 			modelPath,
-			addonPath: resolveNativeAddon(),
+			libraryPath: resolveNativeLibrary(),
 			fingerprint: `${verification.manifest.modelId}@${verification.manifest.revision}`,
 		});
 		this.prepared = true;
@@ -320,17 +339,11 @@ export class LocalEmbeddingWorker implements LocalEmbeddingEngine {
 		return await this.request("embed", texts.length, { mode, texts: [...texts] });
 	}
 
-	private ensureWorker(): Worker {
+	private ensureWorker(): BunWorker {
 		if (this.worker) return this.worker;
-		const worker = new Worker(localEmbeddingWorkerEntry(), {
-			execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
-		});
-		worker.on("message", (message: unknown) => this.handleMessage(message));
-		worker.on("error", (error) => this.handleWorkerFailure(error));
-		worker.on("exit", (code) => {
-			if (this.worker === worker) this.worker = undefined;
-			if (code !== 0) this.handleWorkerFailure(new Error(`Local embedding worker exited with code ${code}`));
-		});
+		const worker = new Worker(localEmbeddingWorkerEntry(), { type: "module" });
+		worker.onmessage = (event) => this.handleMessage(event.data);
+		worker.onerror = (event) => this.handleWorkerFailure(new Error(event.message));
 		this.worker = worker;
 		return worker;
 	}

@@ -1,7 +1,7 @@
 /**
  * Anthropic OAuth flow (Claude Pro/Max)
  *
- * NOTE: This module uses Node.js http.createServer for the OAuth callback server.
+ * NOTE: This module uses Bun's HTTP-compatible builtin for the OAuth callback server.
  * It is only intended for CLI use, not browser environments.
  */
 
@@ -38,8 +38,8 @@ const SCOPES =
 async function getNodeApis(): Promise<NodeApis> {
 	if (nodeApis) return nodeApis;
 	if (!nodeApisPromise) {
-		if (typeof process === "undefined" || (!process.versions?.node && !process.versions?.bun)) {
-			throw new Error("Anthropic OAuth is only available in Node.js environments");
+		if (typeof process === "undefined" || !process.versions?.bun) {
+			throw new Error("Anthropic OAuth is only available in Bun");
 		}
 		nodeApisPromise = import("node:http").then((httpModule) => ({
 			createServer: httpModule.createServer,
