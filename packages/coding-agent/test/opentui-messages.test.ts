@@ -6,6 +6,15 @@ import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 const renderers = new Set<TestRendererSetup>();
 
+async function flushUntil(setup: TestRendererSetup, text: string): Promise<string> {
+	for (let attempt = 0; attempt < 8; attempt++) {
+		await setup.flush();
+		const frame = setup.captureCharFrame();
+		if (frame.includes(text)) return frame;
+	}
+	return setup.captureCharFrame();
+}
+
 afterEach(() => {
 	for (const setup of renderers) setup.renderer.destroy();
 	renderers.clear();
@@ -73,8 +82,7 @@ describe("OpenTUI transcript messages", () => {
 				"stop",
 			),
 		);
-		await setup.flush();
-		const captured = setup.captureCharFrame();
+		const captured = await flushUntil(setup, "The dependency graph is valid.");
 		expect(captured).toContain("The dependency graph is valid.");
 		expect(captured).not.toContain("Checking the dependency graph");
 	});
