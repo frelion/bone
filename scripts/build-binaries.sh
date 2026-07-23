@@ -112,6 +112,49 @@ if [[ "$SKIP_DEPS" == "false" ]]; then
         @opentui/core-linux-x64-musl@"$OPENTUI_VERSION" \
         @opentui/core-win32-arm64@"$OPENTUI_VERSION" \
         @opentui/core-win32-x64@"$OPENTUI_VERSION"
+
+    # Bun stores explicitly added platform packages without linking them into
+    # the optional-dependency package directory. Link them there so dynamic
+    # imports inside the package resolve for every cross-compiled target.
+    link_bun_package() {
+        local package_name="$1"
+        local version="$2"
+        local link_parent="$3"
+        local scope="${package_name%%/*}"
+        local name="${package_name#*/}"
+        local store_dir
+        store_dir=$(find "$(pwd)/node_modules/.bun" -maxdepth 1 -type d -name "${scope}+${name}@${version}*" -print -quit)
+        if [[ -z "$store_dir" ]]; then
+            echo "Could not find installed package ${package_name}@${version}" >&2
+            exit 1
+        fi
+        mkdir -p "$link_parent"
+        ln -sfn "$store_dir/node_modules/$scope/$name" "$link_parent/$name"
+    }
+
+    opentui_core_dir=$(dirname "$(bun -e 'import { resolve } from "node:path"; console.log(Bun.resolveSync("@opentui/core", resolve(process.cwd(), "packages/tui")))')")
+    for package_name in \
+        @opentui/core-darwin-arm64 \
+        @opentui/core-darwin-x64 \
+        @opentui/core-linux-arm64 \
+        @opentui/core-linux-x64 \
+        @opentui/core-linux-arm64-musl \
+        @opentui/core-linux-x64-musl \
+        @opentui/core-win32-arm64 \
+        @opentui/core-win32-x64; do
+        link_bun_package "$package_name" "$OPENTUI_VERSION" "$opentui_core_dir/node_modules/@opentui"
+    done
+
+    clipboard_dir=$(dirname "$(bun -e 'import { resolve } from "node:path"; console.log(Bun.resolveSync("@mariozechner/clipboard", resolve(process.cwd(), "packages/coding-agent")))')")
+    for package_name in \
+        @mariozechner/clipboard-darwin-arm64 \
+        @mariozechner/clipboard-darwin-x64 \
+        @mariozechner/clipboard-linux-x64-gnu \
+        @mariozechner/clipboard-linux-arm64-gnu \
+        @mariozechner/clipboard-win32-x64-msvc \
+        @mariozechner/clipboard-win32-arm64-msvc; do
+        link_bun_package "$package_name" "$CLIPBOARD_VERSION" "$clipboard_dir/node_modules/@mariozechner"
+    done
 else
     echo "==> Skipping cross-platform native bindings (--skip-deps)"
 fi
