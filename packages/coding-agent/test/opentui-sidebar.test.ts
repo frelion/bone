@@ -91,6 +91,8 @@ describe("OpenTUI session sidebar", () => {
 		expect(frame).toContain("Session b");
 		expect(frame).toContain("↻");
 		expect(frame).toContain("3 msgs");
+		expect(frame).toContain("↑↓ select    / search");
+		expect(frame).toContain("d delete     ↵ open");
 		expect(frame).not.toContain("You ·");
 		expect(frame).not.toContain("Bone ·");
 
@@ -99,11 +101,12 @@ describe("OpenTUI session sidebar", () => {
 		expect(activate).toHaveBeenCalledWith("/sessions/b.jsonl");
 
 		renderer.input.pressKey("d");
-		const confirmFrame = await flushUntil(renderer, "Delete this conversation?");
-		expect(confirmFrame).toContain("Delete this conversation?");
-		renderer.input.pressEscape();
+		const confirmFrame = await flushUntil(renderer, "Press d again to delete");
+		expect(confirmFrame).toContain("Press d again to delete");
 		renderer.input.pressEnter();
 		expect(remove).not.toHaveBeenCalled();
+		renderer.input.pressKey("d");
+		expect(remove).toHaveBeenCalledWith("/sessions/b.jsonl", "/sessions/a.jsonl");
 		focus.dispose();
 	});
 
@@ -147,10 +150,15 @@ describe("OpenTUI session sidebar", () => {
 		]);
 		const searchFrame = await flushUntil(renderer, "semantic search");
 		expect(searchFrame).toContain("CONVERSATIONS");
+		expect(searchFrame).toContain("↑↓ results   type to search");
+		expect(searchFrame).toContain("↵ open       esc cancel");
 		expect(searchFrame).not.toContain("Session a");
 
 		renderer.input.pressArrow("down");
 		expect(preview).toHaveBeenLastCalledWith("/sessions/c.jsonl");
+		focus.focus("sidebar");
+		await renderer.input.typeText(" cache");
+		expect(sidebar.searchQuery).toBe("semantic cache");
 		renderer.input.pressEscape();
 		expect(preview).toHaveBeenLastCalledWith("/sessions/a.jsonl");
 		expect(sidebar.searchActive).toBe(false);

@@ -106,9 +106,13 @@ function applyLayout(node: Renderable, layout: BoneLayout): void {
 
 function withoutBoneInteractions<Options extends BoneNodeOptions>(
 	options: Options,
-): Omit<Options, "onMouseDown" | "onMouseDrag" | "onMouseDragEnd" | "onMouseOver" | "onMouseOut" | "onMouseScroll"> {
+): Omit<
+	Options,
+	"onMouseDown" | "onMouseUp" | "onMouseDrag" | "onMouseDragEnd" | "onMouseOver" | "onMouseOut" | "onMouseScroll"
+> {
 	const {
 		onMouseDown: _onMouseDown,
+		onMouseUp: _onMouseUp,
 		onMouseDrag: _onMouseDrag,
 		onMouseDragEnd: _onMouseDragEnd,
 		onMouseOver: _onMouseOver,
@@ -127,6 +131,7 @@ abstract class NodeFacade<T extends Renderable> implements BoneNode {
 		nativeNodes.set(this, native);
 		applyLayout(native, layout);
 		if (layout.onMouseDown) native.onMouseDown = (event) => layout.onMouseDown?.(toBoneMouseEvent(event));
+		if (layout.onMouseUp) native.onMouseUp = (event) => layout.onMouseUp?.(toBoneMouseEvent(event));
 		if (layout.onMouseDrag) native.onMouseDrag = (event) => layout.onMouseDrag?.(toBoneMouseEvent(event));
 		if (layout.onMouseDragEnd) native.onMouseDragEnd = (event) => layout.onMouseDragEnd?.(toBoneMouseEvent(event));
 		if (layout.onMouseOver) native.onMouseOver = (event) => layout.onMouseOver?.(toBoneMouseEvent(event));

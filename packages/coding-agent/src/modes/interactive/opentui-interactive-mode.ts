@@ -308,7 +308,7 @@ export class OpenTUIInteractiveMode {
 		});
 
 		this.shell.onTranscriptFocusRequest = () => this.paneFocus?.focus("transcript");
-		this.sidebar.onFocusChat = () => this.paneFocus?.focus("transcript");
+		this.sidebar.onFocusChat = () => this.paneFocus?.focus("composer");
 		this.sidebar.onScrollChat = (direction) => this.shell?.scrollTranscript(direction === "up" ? -10 : 10);
 		this.sidebar.onActivateSession = (path) => void this.runAction(() => this.sessionHost.activate(path));
 		this.sidebar.onPreviewSession = (path) => this.previewSidebarSession(path);

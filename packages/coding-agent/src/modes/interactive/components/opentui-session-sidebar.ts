@@ -135,7 +135,10 @@ export class OpenTUISessionSidebar implements BoneView {
 	}
 
 	setFocused(focused: boolean): void {
-		if (focused === this.focused) return;
+		if (focused === this.focused) {
+			if (focused) (this.searchInput ?? this.root)?.focus();
+			return;
+		}
 		if (focused) {
 			this.sessions = sortByActivity(this.sessions);
 			this.frozenOrder = this.sessions.map((session) => session.path);
@@ -247,7 +250,7 @@ export class OpenTUISessionSidebar implements BoneView {
 	handleKey(event: BoneKeyEvent): boolean {
 		if (event.eventType === "release") return false;
 		if (this.itemState.kind === "confirm-delete") {
-			if (matchesOpenTUIAction(event, "confirm")) {
+			if (matchesOpenTUIAction(event, "sidebarDelete")) {
 				const sessionPath = this.itemState.path;
 				this.itemState = { kind: "normal" };
 				const selectedIndex = this.sessions.findIndex((session) => session.path === sessionPath);
@@ -410,6 +413,34 @@ export class OpenTUISessionSidebar implements BoneView {
 
 		this.list = context.createScrollView({ width: "100%", flexGrow: 1, minHeight: 0, scrollY: true });
 		root.append(this.list);
+		const shortcutFooter = context.createBox({
+			width: "100%",
+			height: 3,
+			flexDirection: "column",
+			flexShrink: 0,
+		});
+		shortcutFooter.append(
+			context.createText({
+				content: "─".repeat(OPEN_TUI_LAYOUT.sidebarMaxWidth),
+				height: 1,
+				fg: OPEN_TUI_COLORS.borderSubtle,
+				truncate: true,
+			}),
+		);
+		const shortcutLines = this.searchActive
+			? ["↑↓ results   type to search", "↵ open       esc cancel"]
+			: ["↑↓ select    / search", "d delete     ↵ open"];
+		for (const content of shortcutLines) {
+			shortcutFooter.append(
+				context.createText({
+					content,
+					height: 1,
+					fg: this.sidebarTheme.getFgColor("dim"),
+					truncate: true,
+				}),
+			);
+		}
+		root.append(shortcutFooter);
 		this.rebuildList();
 	}
 
@@ -503,7 +534,7 @@ export class OpenTUISessionSidebar implements BoneView {
 			if (confirming) {
 				previewRow.append(
 					context.createText({
-						content: "Delete this conversation?",
+						content: "Press d again to delete",
 						fg: foregroundText ?? this.sidebarTheme.getFgColor("error"),
 						truncate: true,
 						flexGrow: 1,
@@ -635,6 +666,7 @@ export class OpenTUISessionSidebar implements BoneView {
 	private moveSearchSelection(delta: number): void {
 		const previousPath = this.selectedPath;
 		this.moveSelection(delta);
+		this.searchInput?.focus();
 		if (!this.selectedPath || this.selectedPath === previousPath) return;
 		this.previewedSearchPath = this.selectedPath;
 		this.onPreviewSession?.(this.selectedPath);

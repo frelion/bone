@@ -74,7 +74,15 @@ export class OpenTUIInteractiveShell implements BoneView {
 			flexDirection: "column",
 			backgroundColor: OPEN_TUI_COLORS.page,
 		});
-		const body = context.createBox({ flexDirection: "row", flexGrow: 1, minHeight: 0, width: "100%" });
+		const body = context.createBox({
+			flexDirection: "row",
+			flexGrow: 1,
+			minHeight: 0,
+			width: "100%",
+			onMouseUp: (event) => this.endSidebarDrag(event),
+			onMouseDrag: (event) => this.updateSidebarDrag(event),
+			onMouseDragEnd: (event) => this.endSidebarDrag(event),
+		});
 		const sidebar = context.createBox({
 			height: "100%",
 			flexShrink: 0,
@@ -245,6 +253,7 @@ export class OpenTUIInteractiveShell implements BoneView {
 	}
 
 	private beginSidebarDrag(event: BoneMouseEvent): void {
+		if (event.button !== 0) return;
 		this.separatorDragging = true;
 		this.refreshSeparator();
 		this.updateSidebarWidthFromPointer(event.x);
@@ -253,10 +262,7 @@ export class OpenTUIInteractiveShell implements BoneView {
 	}
 
 	private updateSidebarDrag(event: BoneMouseEvent): void {
-		if (!this.separatorDragging) {
-			this.separatorDragging = true;
-			this.refreshSeparator();
-		}
+		if (!this.separatorDragging) return;
 		this.updateSidebarWidthFromPointer(event.x);
 		this.scheduleSidebarWidthPersist();
 		event.preventDefault();

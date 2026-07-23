@@ -90,6 +90,7 @@ export interface BoneMouseEvent {
 
 export interface BoneNodeOptions extends BoneLayout {
 	onMouseDown?: (event: BoneMouseEvent) => void;
+	onMouseUp?: (event: BoneMouseEvent) => void;
 	onMouseDrag?: (event: BoneMouseEvent) => void;
 	onMouseDragEnd?: (event: BoneMouseEvent) => void;
 	onMouseOver?: (event: BoneMouseEvent) => void;

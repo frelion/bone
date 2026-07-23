@@ -179,4 +179,23 @@ describe("OpenTUI interactive shell", () => {
 		expect(shell.sidebarWidth).toBe(60);
 		expect(onSidebarWidthChange).toHaveBeenLastCalledWith(60);
 	});
+
+	test("keeps resizing after the pointer leaves the one-column separator", async () => {
+		initTheme("dark");
+		const renderer = await createBoneTestRenderer({ width: 120, height: 24 });
+		renderers.add(renderer);
+		renderer.start();
+		const shell = new OpenTUIInteractiveShell({ sidebarWidth: 38 });
+		const onSidebarWidthChange = vi.fn();
+		shell.onSidebarWidthChange = onSidebarWidthChange;
+		renderer.mount(shell);
+		shell.setSidebar(textView("CONVERSATIONS"));
+		await renderer.flush();
+
+		await renderer.mouse.drag(38, 5, 50, 5);
+		await renderer.flush();
+
+		expect(shell.sidebarWidth).toBe(50);
+		expect(onSidebarWidthChange).toHaveBeenLastCalledWith(50);
+	});
 });
