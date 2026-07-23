@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -38,7 +38,7 @@ function parseOptions() {
 			outputDir = resolve(process.cwd(), args[++index]);
 			continue;
 		}
-		throw new Error("Usage: npm run pack:bone -- [--out <directory>] [--skip-build]");
+		throw new Error("Usage: bun run pack:bone -- [--out <directory>] [--skip-build]");
 	}
 
 	return { outputDir, skipBuild };
@@ -46,35 +46,31 @@ function parseOptions() {
 
 function pack(directory, outputDir) {
 	const packageJson = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
-	// npm pack does not consistently overwrite an existing tarball in its
-	// destination. The default artifacts directory is intentionally reused by
-	// local development, so remove only this package's exact previous output.
+	// The default artifacts directory is intentionally reused by local development,
+	// so remove only this package's exact previous output.
 	const filename = `${packageJson.name.replace("@", "").replace("/", "-")}-${packageJson.version}.tgz`;
 	const destination = join(outputDir, filename);
 	if (existsSync(destination)) rmSync(destination);
-	const packed = spawnSync("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", outputDir], {
+	const packed = spawnSync("bun", ["pm", "pack", "--ignore-scripts", "--quiet", "--filename", destination], {
 		cwd: directory,
 		encoding: "utf8",
 		maxBuffer: 32 * 1024 * 1024,
 		stdio: ["inherit", "pipe", "inherit"],
 	});
-	const [result] = JSON.parse(packed.stdout);
-	if (!result?.filename) {
-		throw new Error(`npm pack did not return a filename for ${directory}`);
-	}
-	return join(outputDir, result.filename);
+	if (packed.status !== 0 || !existsSync(destination)) throw new Error(`bun pm pack failed for ${directory}`);
+	return destination;
 }
 
 const { outputDir, skipBuild } = parseOptions();
 mkdirSync(outputDir, { recursive: true });
 
 if (!skipBuild) {
-	run("npm", ["run", "build"], repoRoot);
+	run("bun", ["run", "build"], repoRoot);
 }
 
 const nativeAssets = join(codingAgentDir, "dist", "native");
-run("node", ["scripts/verify-semantic-native.mjs", "--root", nativeAssets], repoRoot);
-run("node", ["scripts/verify-bone-package-metadata.mjs", "--root", codingAgentDir], repoRoot);
+run("bun", ["scripts/verify-semantic-native.mjs", "--root", nativeAssets], repoRoot);
+run("bun", ["scripts/verify-bone-package-metadata.mjs", "--root", codingAgentDir], repoRoot);
 
 const stagingDir = mkdtempSync(join(tmpdir(), "bone-pack-"));
 const stagingPackageDir = join(stagingDir, "package");
@@ -94,7 +90,7 @@ for (const entry of ["README.md", "CHANGELOG.md"]) {
 	cpSync(join(codingAgentDir, entry), join(stagingPackageDir, entry));
 }
 
-run("node", ["scripts/verify-semantic-native.mjs", "--root", join(stagingPackageDir, "dist", "native")], repoRoot);
+run("bun", ["scripts/verify-semantic-native.mjs", "--root", join(stagingPackageDir, "dist", "native")], repoRoot);
 
 const packageJson = JSON.parse(readFileSync(join(codingAgentDir, "package.json"), "utf8"));
 const publishedDependencies = { ...packageJson.dependencies };
@@ -111,9 +107,9 @@ packageJson.dependencies = {
 	),
 };
 writeFileSync(join(stagingPackageDir, "package.json"), `${JSON.stringify(packageJson, null, "\t")}\n`);
-run("node", ["scripts/verify-bone-package-metadata.mjs", "--root", stagingPackageDir], repoRoot);
+run("bun", ["scripts/verify-bone-package-metadata.mjs", "--root", stagingPackageDir], repoRoot);
 
-run("npm", ["install", "--omit=dev", "--ignore-scripts", "--package-lock=false"], stagingPackageDir);
+run("bun", ["install", "--production", "--ignore-scripts", "--no-save"], stagingPackageDir);
 
 packageJson.dependencies = publishedDependencies;
 writeFileSync(join(stagingPackageDir, "package.json"), `${JSON.stringify(packageJson, null, "\t")}\n`);

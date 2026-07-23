@@ -1,4 +1,4 @@
-import { MockAgent } from "undici";
+import { MockAgent } from "undici-client";
 import { afterEach, describe, expect, it } from "vitest";
 import { parseGitRemote } from "../src/core/forge/context-resolver.ts";
 import { ForgeError } from "../src/core/forge/errors.ts";

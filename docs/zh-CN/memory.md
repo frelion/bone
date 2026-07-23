@@ -21,9 +21,9 @@ Bone 物化的是一个对话 exchange，而不是逐条镜像 JSONL。exchange 
 bone setup
 ```
 
-它会下载并校验固定的 CPU GGUF 模型。正常 `bone` 启动绝不会下载。原生
-Bone 会在同一进程的 Node Worker Thread 中加载 CrispEmbed/ggml 原生 addon 与 mmap，使模型权重不进入 Node.js 堆，
-推理也不会阻塞 TUI 主线程。
+它会下载并校验固定的 CPU GGUF 模型。正常 `bone` 启动绝不会下载。Bone 会在同一
+进程的 Bun Worker 中通过 Bun FFI 加载 CrispEmbed/ggml 并 mmap 模型，使模型权重
+不进入 Bun 的 JavaScript heap，推理也不会阻塞 TUI 主线程。
 
 ## 索引与状态
 

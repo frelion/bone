@@ -14,7 +14,7 @@ bone --version
 开发构建可使用自包含本地包：
 
 ```bash
-npm run pack:bone
+bun run pack:bone
 bun add --global artifacts/frelion-bone-coding-agent-*.tgz
 ```
 

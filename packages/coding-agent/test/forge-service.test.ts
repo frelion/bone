@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getGlobalDispatcher, MockAgent, setGlobalDispatcher } from "undici";
+import { getGlobalDispatcher, MockAgent, setGlobalDispatcher } from "undici-client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createForgeService } from "../src/core/forge/service.ts";
 import type { ForgeToolContext } from "../src/core/forge/tools.ts";

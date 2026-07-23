@@ -81,7 +81,7 @@ export interface GitLabAdapterOptions {
 	baseUrl: string;
 	token: string;
 	allowedHosts: readonly string[];
-	dispatcher?: import("undici").Dispatcher;
+	dispatcher?: import("undici-client").Dispatcher;
 	allowInsecureHttp?: boolean;
 	requestTimeoutMs?: number;
 }

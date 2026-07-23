@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,7 +13,7 @@ const packages = [
 ];
 
 function printUsage() {
-	console.log(`Usage: node scripts/local-release.mjs [options]
+	console.log(`Usage: bun scripts/local-release.mjs [options]
 
 Builds and packs the publishable packages, then installs the tarballs into an
 isolated directory outside the repository for local release testing.
@@ -21,7 +21,7 @@ isolated directory outside the repository for local release testing.
 Options:
   --out <dir>          Output directory. Defaults to a new directory under ${tmpdir()}
   --force              Remove --out first if it already exists
-  --skip-check         Do not run npm run check before building
+  --skip-check         Do not run bun run check before building
   --skip-test          Do not run ./test.sh before building
   --skip-install       Only create tarballs; do not create isolated installs
   --help               Show this help
@@ -180,12 +180,11 @@ function packPackage(pkg, tarballDirectory) {
 		throw new Error(`${pkg.directory}/package.json has name ${packageJson.name}, expected ${pkg.name}`);
 	}
 
-	const output = run("npm", ["pack", "--json", "--pack-destination", tarballDirectory], {
-		capture: true,
+	const filename = `${packageJson.name.replace("@", "").replace("/", "-")}-${packageJson.version}.tgz`;
+	run("bun", ["pm", "pack", "--ignore-scripts", "--quiet", "--filename", join(tarballDirectory, filename)], {
 		cwd: pkg.directory,
 	});
-	const packed = JSON.parse(output)[0];
-	return join(tarballDirectory, packed.filename);
+	return join(tarballDirectory, filename);
 }
 
 const options = parseArgs();
@@ -203,7 +202,7 @@ const binaryDirectory = join(outDir, "bun");
 mkdirSync(tarballDirectory, { recursive: true });
 
 if (!options.skipCheck) {
-	run("npm", ["run", "check"], { cwd: repoRoot });
+	run("bun", ["run", "check"], { cwd: repoRoot });
 }
 
 if (!options.skipTest) {
@@ -211,8 +210,8 @@ if (!options.skipTest) {
 }
 
 for (const pkg of packages) {
-	run("npm", ["run", "clean"], { cwd: pkg.directory });
-	run("npm", ["run", "build"], { cwd: pkg.directory });
+	run("bun", ["run", "clean"], { cwd: pkg.directory });
+	run("bun", ["run", "build"], { cwd: pkg.directory });
 }
 
 const tarballs = new Map();

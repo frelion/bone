@@ -72,6 +72,11 @@ export function normalizePath(input: string, options: PathInputOptions = {}): st
 	}
 
 	if (/^file:\/\//.test(normalized)) {
+		try {
+			decodeURIComponent(normalized);
+		} catch {
+			throw new TypeError(`Invalid file URL: ${normalized}`);
+		}
 		return fileURLToPath(normalized);
 	}
 

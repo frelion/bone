@@ -1,10 +1,20 @@
 import { basename } from "node:path";
-import { Worker } from "node:worker_threads";
 import chalk from "chalk";
 import { MultiBar, type SingleBar } from "cli-progress";
 import { getLocalEmbeddingAvailability, type LocalEmbeddingStatus } from "../core/local-embedding.ts";
 
 const MAX_PROGRESS_FILE_NAME_WIDTH = 18;
+
+interface BunWorker {
+	onmessage: ((event: { data: unknown }) => void) | null;
+	onerror: ((event: { message: string }) => void) | null;
+	postMessage(message: unknown): void;
+	terminate(): void;
+}
+
+declare const Worker: {
+	new (specifier: string | URL, options: { type: "module" }): BunWorker;
+};
 
 function formatBytes(bytes: number): string {
 	if (bytes < 1024 * 1024) return `${Math.max(0, Math.round(bytes / 1024))} KB`;
@@ -26,7 +36,9 @@ function setupWorkerEntry(): string | URL {
 	// Bun standalone executables resolve explicitly bundled worker entrypoints
 	// by their source path. Resolving a URL from the compiled CLI instead
 	// targets a different virtual filesystem path.
-	if (typeof process.versions.bun === "string") return "./src/core/local-embedding-setup-worker.ts";
+	if (typeof process.versions.bun === "string" && !import.meta.url.startsWith("file:")) {
+		return "./src/core/local-embedding-setup-worker.ts";
+	}
 	return new URL("../core/local-embedding-setup-worker.js", import.meta.url);
 }
 
@@ -52,9 +64,7 @@ async function prepareLocalEmbeddingAssets(
 	agentDir: string,
 	onStatus: (status: LocalEmbeddingStatus) => void,
 ): Promise<void> {
-	const worker = new Worker(setupWorkerEntry(), {
-		execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
-	});
+	const worker = new Worker(setupWorkerEntry(), { type: "module" });
 	try {
 		await new Promise<void>((resolve, reject) => {
 			let settled = false;
@@ -63,7 +73,8 @@ async function prepareLocalEmbeddingAssets(
 				settled = true;
 				callback();
 			};
-			worker.on("message", (message: unknown) => {
+			worker.onmessage = (event) => {
+				const message = event.data;
 				if (!message || typeof message !== "object") return;
 				const candidate = message as { type?: unknown; status?: unknown; message?: unknown };
 				if (candidate.type === "status") {
@@ -77,15 +88,12 @@ async function prepareLocalEmbeddingAssets(
 						reject(new Error(typeof candidate.message === "string" ? candidate.message : "Model setup failed")),
 					);
 				}
-			});
-			worker.once("error", (error) => finish(() => reject(error)));
-			worker.once("exit", (code) => {
-				if (code !== 0) finish(() => reject(new Error(`Model setup worker exited with code ${code}`)));
-			});
+			};
+			worker.onerror = (event) => finish(() => reject(new Error(event.message)));
 			worker.postMessage({ agentDir });
 		});
 	} finally {
-		await worker.terminate();
+		worker.terminate();
 	}
 }
 

@@ -10,8 +10,8 @@ const NODE_FS_SPECIFIER = "node:" + "fs";
 const NODE_OS_SPECIFIER = "node:" + "os";
 const NODE_PATH_SPECIFIER = "node:" + "path";
 
-// Eagerly load in Node.js/Bun environment only
-if (typeof process !== "undefined" && (process.versions?.node || process.versions?.bun)) {
+// Eagerly load in Bun only; browser builds never resolve filesystem modules.
+if (typeof process !== "undefined" && process.versions?.bun) {
 	dynamicImport(NODE_FS_SPECIFIER).then((m) => {
 		_existsSync = (m as typeof import("node:fs")).existsSync;
 	});
@@ -35,12 +35,12 @@ function hasVertexAdcCredentials(env?: ProviderEnv): boolean {
 	}
 
 	if (cachedVertexAdcCredentialsExists === null) {
-		// If node modules haven't loaded yet (async import race at startup),
+		// If Bun modules haven't loaded yet (async import race at startup),
 		// return false WITHOUT caching so the next call retries once they're ready.
 		// Only cache false permanently in a browser environment where fs is never available.
 		if (!_existsSync || !_homedir || !_join) {
-			const isNode = typeof process !== "undefined" && (process.versions?.node || process.versions?.bun);
-			if (!isNode) {
+			const isBun = typeof process !== "undefined" && Boolean(process.versions?.bun);
+			if (!isBun) {
 				// Definitively in a browser — safe to cache false permanently
 				cachedVertexAdcCredentialsExists = false;
 			}

@@ -89,9 +89,9 @@ async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void
 
 function triggerReftableRefresh(provider: FooterDataProvider): void {
 	const providerWithInternals = provider as unknown as {
-		reftableTablesListWatcher: FSWatcher | null;
+		scheduleRefresh(): void;
 	};
-	providerWithInternals.reftableTablesListWatcher?.emit("change", "change", "tables.list");
+	providerWithInternals.scheduleRefresh();
 }
 
 describe("FooterDataProvider reftable branch detection", () => {

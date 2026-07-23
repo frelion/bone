@@ -5,7 +5,7 @@ Stateful agent with tool execution and event streaming. Built on `@frelion/bone-
 ## Installation
 
 ```bash
-npm install @frelion/bone-agent-core
+bun add @frelion/bone-agent-core
 ```
 
 ## Quick Start

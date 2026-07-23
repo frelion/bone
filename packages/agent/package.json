@@ -10,9 +10,9 @@
 			"types": "./dist/index.d.ts",
 			"import": "./dist/index.js"
 		},
-		"./node": {
-			"types": "./dist/node.d.ts",
-			"import": "./dist/node.js"
+		"./bun": {
+			"types": "./dist/bun.d.ts",
+			"import": "./dist/bun.js"
 		},
 		"./package.json": "./package.json"
 	},
@@ -23,10 +23,10 @@
 	"scripts": {
 		"clean": "shx rm -rf dist",
 		"build": "tsgo -p tsconfig.build.json",
-		"test": "vitest --run",
-		"test:harness": "vitest --run --config vitest.harness.config.ts",
-		"coverage:harness": "vitest --run --config vitest.harness.config.ts --coverage",
-		"prepublishOnly": "npm run clean && npm run build"
+		"test": "bunx --bun vitest --run",
+		"test:harness": "bunx --bun vitest --run --config vitest.harness.config.ts",
+		"coverage:harness": "bunx --bun vitest --run --config vitest.harness.config.ts --coverage",
+		"prepublishOnly": "bun run clean && bun run build"
 	},
 	"dependencies": {
 		"@frelion/bone-ai": "^0.1.4",

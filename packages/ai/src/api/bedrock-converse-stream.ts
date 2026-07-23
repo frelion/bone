@@ -158,8 +158,8 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			undefined;
 		const useBearerToken = bearerToken !== undefined && !skipAuth;
 
-		// in Node.js/Bun environment only
-		if (typeof process !== "undefined" && (process.versions?.node || process.versions?.bun)) {
+		// Bun runtime only; browser builds use the provider defaults.
+		if (typeof process !== "undefined" && process.versions?.bun) {
 			// Region resolution: ARN-embedded > explicit option > env vars > SDK default chain.
 			// When the model ID is an inference profile ARN, extract the region from it.
 			// This avoids conflicts with AWS_REGION set for other services.

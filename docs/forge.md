@@ -111,7 +111,7 @@ Forge includes a deterministic, no-network scripted evaluation harness. It runs 
 Run it from the repository root:
 
 ```bash
-npm run eval:forge
+bun run eval:forge
 ```
 
 The command writes `.artifacts/forge-eval/report.json` and `.artifacts/forge-eval/report.html`. The JSON is the canonical machine result; the HTML is a human-readable view of each case's tool trace, service trace, context observations, and hard assertions. CI runs the same offline command and uploads both files as the `forge-protocol-eval` artifact. A passing report means the Forge protocol invariants hold. It does not measure general model intelligence, production latency, or GitHub/GitLab version compatibility. Those require separate live-model replay and provider canary evaluations.
@@ -120,7 +120,7 @@ The command writes `.artifacts/forge-eval/report.json` and `.artifacts/forge-eva
 
 ### Opt-in live model evaluation
 
-Run `npm run eval:forge:live -- --model provider/model --runs 3` to evaluate the current Forge contract with a real configured model. The runner uses Bone's `ModelRuntime`, so `/settings`, `models.json`, `auth.json`, OAuth, and custom provider configuration are reused. Without `--model`, it selects the configured default model or the first authenticated model. Forge calls still go to a strict Fake Forge Service: no GitHub/GitLab endpoint is contacted and no mutation is performed. Reports are written separately under `.artifacts/forge-eval/live`.
+Run `bun run eval:forge:live -- --model provider/model --runs 3` to evaluate the current Forge contract with a real configured model. The runner uses Bone's `ModelRuntime`, so `/settings`, `models.json`, `auth.json`, OAuth, and custom provider configuration are reused. Without `--model`, it selects the configured default model or the first authenticated model. Forge calls still go to a strict Fake Forge Service: no GitHub/GitLab endpoint is contacted and no mutation is performed. Reports are written separately under `.artifacts/forge-eval/live`.
 
 Use `--max-turns` and `--timeout-ms` to bound cost and runtime. Live reports use task completion, first tool selection, first-call validity, correction success, deterministic repeat rate, mean tool calls, and mean context bytes; they are never merged with scripted `protocolPassRate`. A baseline/candidate comparison requires the same model, prompts, fixtures, and run count against a frozen legacy contract; the live report alone is an absolute measurement, not proof of causality.
 

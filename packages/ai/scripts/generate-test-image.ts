@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { createCanvas } from "canvas";
 import { mkdirSync, writeFileSync } from "fs";

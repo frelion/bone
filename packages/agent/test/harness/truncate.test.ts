@@ -9,7 +9,7 @@ function byteLength(content: string): number {
 
 function bufferTail(content: string, maxBytes: number): string {
 	const bytes = Buffer.from(content, "utf8");
-	if (bytes.length <= maxBytes) return content;
+	if (bytes.length <= maxBytes) return bytes.toString("utf8");
 	let start = bytes.length - maxBytes;
 	while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++;
 	return bytes.subarray(start).toString("utf8");

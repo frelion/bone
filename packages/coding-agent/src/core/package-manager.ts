@@ -28,7 +28,7 @@ import ignore from "ignore";
 import { minimatch } from "minimatch";
 import { maxSatisfying, rcompare, satisfies, valid, validRange } from "semver";
 import { CONFIG_DIR_NAME } from "../config.ts";
-import { spawnProcess, spawnProcessSync } from "../utils/child-process.ts";
+import { spawnProcess } from "../utils/child-process.ts";
 import { type GitSource, parseGitUrl } from "../utils/git.ts";
 import { canonicalizePath, isLocalPath, markPathIgnoredByCloudSync, resolvePath } from "../utils/paths.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
@@ -691,8 +691,6 @@ export class DefaultPackageManager implements PackageManager {
 	private cwd: string;
 	private agentDir: string;
 	private settingsManager: SettingsManager;
-	private globalNpmRoot: string | undefined;
-	private globalNpmRootCommandKey: string | undefined;
 	private progressCallback: ProgressCallback | undefined;
 
 	constructor(options: PackageManagerOptions) {
@@ -1393,14 +1391,12 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async getLatestNpmVersion(packageSpec: string, range?: string): Promise<string> {
-		const npmCommand = this.getNpmCommand();
-		const stdout = await this.runCommandCapture(
-			npmCommand.command,
-			[...npmCommand.args, "view", packageSpec, "version", "--json"],
-			{ cwd: this.cwd, timeoutMs: NETWORK_TIMEOUT_MS },
-		);
+		const stdout = await this.runCommandCapture("bun", ["info", packageSpec, "version", "--json"], {
+			cwd: this.cwd,
+			timeoutMs: NETWORK_TIMEOUT_MS,
+		});
 		const raw = stdout.trim();
-		if (!raw) throw new Error("Empty response from npm view");
+		if (!raw) throw new Error("Empty response from bun info");
 		const parsed = JSON.parse(raw) as unknown;
 		if (typeof parsed === "string") {
 			return parsed;
@@ -1410,7 +1406,7 @@ export class DefaultPackageManager implements PackageManager {
 			const latest = range ? maxSatisfying(versions, range) : [...versions].sort(rcompare)[0];
 			if (latest) return latest;
 		}
-		throw new Error("Unexpected response from npm view");
+		throw new Error("Unexpected response from bun info");
 	}
 
 	private async gitHasAvailableUpdate(installedPath: string): Promise<boolean> {
@@ -1628,65 +1624,16 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private getNpmCommand(): { command: string; args: string[] } {
-		const configuredCommand = this.settingsManager.getNpmCommand();
-		if (!configuredCommand || configuredCommand.length === 0) {
-			return { command: "npm", args: [] };
-		}
-		const [command, ...args] = configuredCommand;
-		if (!command) {
-			throw new Error("Invalid npmCommand: first array entry must be a non-empty command");
-		}
-		return { command, args };
-	}
-
-	private getPackageManagerName(): string {
-		const npmCommand = this.getNpmCommand();
-		const commandParts = [npmCommand.command, ...npmCommand.args];
-		const separatorIndex = commandParts.lastIndexOf("--");
-		const packageManagerCommand = separatorIndex >= 0 ? commandParts[separatorIndex + 1] : npmCommand.command;
-		return packageManagerCommand ? basename(packageManagerCommand).replace(/\.(cmd|exe)$/i, "") : "";
-	}
-
 	private async runNpmCommand(args: string[], options?: { cwd?: string }): Promise<void> {
-		const npmCommand = this.getNpmCommand();
-		await this.runCommand(npmCommand.command, [...npmCommand.args, ...args], options);
+		await this.runCommand("bun", args, options);
 	}
 
 	private getGitDependencyInstallArgs(): string[] {
-		const configuredCommand = this.settingsManager.getNpmCommand();
-		if (configuredCommand && configuredCommand.length > 0) {
-			return ["install"];
-		}
 		return ["install", "--omit=dev"];
 	}
 
-	private runNpmCommandSync(args: string[]): string {
-		const npmCommand = this.getNpmCommand();
-		return this.runCommandSync(npmCommand.command, [...npmCommand.args, ...args]);
-	}
-
 	private getNpmInstallArgs(specs: string[], installRoot: string): string[] {
-		const packageManagerName = this.getPackageManagerName();
-		// Extension packages run inside pi and resolve pi APIs through loader aliases/virtual modules.
-		// Disable peer dependency resolution for managed installs (npm's --legacy-peer-deps, and
-		// equivalent bun/pnpm settings) so package managers do not install or solve host-provided
-		// @frelion/bone-* peers. Stale auto-installed pi peers can otherwise block updates.
-		if (packageManagerName === "bun") {
-			return ["install", ...specs, "--cwd", installRoot, "--omit=peer"];
-		}
-		if (packageManagerName === "pnpm") {
-			return [
-				"install",
-				...specs,
-				"--prefix",
-				installRoot,
-				"--config.auto-install-peers=false",
-				"--config.strict-peer-dependencies=false",
-				"--config.strict-dep-builds=false",
-			];
-		}
-		return ["install", ...specs, "--prefix", installRoot, "--legacy-peer-deps"];
+		return ["install", ...specs, "--cwd", installRoot, "--omit=peer"];
 	}
 
 	private async installNpm(source: NpmSource, scope: SourceScope, temporary: boolean): Promise<void> {
@@ -1700,16 +1647,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (!existsSync(installRoot)) {
 			return;
 		}
-		const packageManagerName = this.getPackageManagerName();
-		if (packageManagerName === "bun") {
-			await this.runNpmCommand(["uninstall", source.name, "--cwd", installRoot]);
-			return;
-		}
-		const args = ["uninstall", source.name, "--prefix", installRoot];
-		if (packageManagerName !== "pnpm") {
-			args.push("--legacy-peer-deps");
-		}
-		await this.runNpmCommand(args);
+		await this.runNpmCommand(["uninstall", source.name, "--cwd", installRoot]);
 	}
 
 	private async installGit(source: GitSource, scope: SourceScope): Promise<void> {
@@ -1859,36 +1797,6 @@ export class DefaultPackageManager implements PackageManager {
 		return join(this.agentDir, "npm");
 	}
 
-	private getGlobalNpmRoot(): string {
-		const npmCommand = this.getNpmCommand();
-		const commandKey = [npmCommand.command, ...npmCommand.args].join("\0");
-		if (this.globalNpmRoot && this.globalNpmRootCommandKey === commandKey) {
-			return this.globalNpmRoot;
-		}
-		if (this.getPackageManagerName() === "bun") {
-			const binDir = this.runNpmCommandSync(["pm", "bin", "-g"]).trim();
-			this.globalNpmRoot = join(dirname(binDir), "install", "global", "node_modules");
-		} else {
-			this.globalNpmRoot = this.runNpmCommandSync(["root", "-g"]).trim();
-		}
-		this.globalNpmRootCommandKey = commandKey;
-		return this.globalNpmRoot;
-	}
-
-	private getPnpmGlobalPackagePath(packageName: string): string | undefined {
-		if (this.getPackageManagerName() !== "pnpm") {
-			return undefined;
-		}
-
-		const output = this.runNpmCommandSync(["list", "-g", "--depth", "0", "--json"]);
-		const entries = JSON.parse(output) as Array<{ dependencies?: Record<string, { path?: string }> }>;
-		for (const entry of entries) {
-			const path = entry.dependencies?.[packageName]?.path;
-			if (path) return path;
-		}
-		return undefined;
-	}
-
 	private getManagedNpmInstallPath(source: NpmSource, scope: SourceScope): string {
 		if (scope === "temporary") {
 			return join(this.getTemporaryDir("npm"), "node_modules", source.name);
@@ -1900,21 +1808,8 @@ export class DefaultPackageManager implements PackageManager {
 		return join(this.agentDir, "npm", "node_modules", source.name);
 	}
 
-	private getLegacyGlobalNpmInstallPath(source: NpmSource): string | undefined {
-		try {
-			return this.getPnpmGlobalPackagePath(source.name) ?? join(this.getGlobalNpmRoot(), source.name);
-		} catch {
-			return undefined;
-		}
-	}
-
 	private getNpmInstallPath(source: NpmSource, scope: SourceScope): string {
-		const managedPath = this.getManagedNpmInstallPath(source, scope);
-		if (scope !== "user" || existsSync(managedPath)) {
-			return managedPath;
-		}
-		const legacyPath = this.getLegacyGlobalNpmInstallPath(source);
-		return legacyPath && existsSync(legacyPath) ? legacyPath : managedPath;
+		return this.getManagedNpmInstallPath(source, scope);
 	}
 
 	private getGitInstallPath(source: GitSource, scope: SourceScope): string {
@@ -2443,20 +2338,5 @@ export class DefaultPackageManager implements PackageManager {
 				}
 			});
 		});
-	}
-
-	private runCommandSync(command: string, args: string[]): string {
-		const env = getEnv();
-		const result = spawnProcessSync(command, args, {
-			stdio: ["ignore", "pipe", "pipe"],
-			encoding: "utf-8",
-			env,
-		});
-		if (result.error || result.status !== 0) {
-			throw new Error(
-				`Failed to run ${command} ${args.join(" ")}: ${result.error?.message || result.stderr || result.stdout}`,
-			);
-		}
-		return (result.stdout || result.stderr || "").trim();
 	}
 }

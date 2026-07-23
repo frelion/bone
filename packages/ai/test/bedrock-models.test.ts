@@ -12,7 +12,7 @@
  *
  * You can run this test suite with:
  * ```bash
- * $ AWS_REGION=us-west-2 BEDROCK_EXTENSIVE_MODEL_TEST=1 AWS_PROFILE=... npm test -- ./test/bedrock-models.test.ts
+ * $ AWS_REGION=us-west-2 BEDROCK_EXTENSIVE_MODEL_TEST=1 AWS_PROFILE=... bunx --bun vitest --run ./test/bedrock-models.test.ts
  * ```
  */
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -13,7 +13,7 @@ function readJson(path) {
 
 const args = process.argv.slice(2);
 if (args.length !== 2 || args[0] !== "--root") {
-	throw new Error("Usage: node scripts/verify-bone-package-metadata.mjs --root <coding-agent-package-directory>");
+	throw new Error("Usage: bun scripts/verify-bone-package-metadata.mjs --root <coding-agent-package-directory>");
 }
 
 const root = resolve(args[1]);

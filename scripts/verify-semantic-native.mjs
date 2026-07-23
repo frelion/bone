@@ -1,15 +1,15 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 
 const requiredFiles = {
-	"darwin-arm64": ["bone-embed.node", "libcrispembed.0.dylib", "libggml.0.dylib", "libggml-cpu.0.dylib", "libggml-base.0.dylib"],
-	"darwin-x64": ["bone-embed.node", "libcrispembed.0.dylib", "libggml.0.dylib", "libggml-cpu.0.dylib", "libggml-base.0.dylib"],
-	"linux-x64": ["bone-embed.node", "libcrispembed.so.0", "libggml.so.0", "libggml-cpu.so.0", "libggml-base.so.0"],
-	"linux-arm64": ["bone-embed.node", "libcrispembed.so.0", "libggml.so.0", "libggml-cpu.so.0", "libggml-base.so.0"],
-	"win32-x64": ["bone-embed.node", "crispembed.dll", "ggml.dll", "ggml-cpu.dll", "ggml-base.dll"],
-	"win32-arm64": ["bone-embed.node", "crispembed.dll", "ggml.dll", "ggml-cpu.dll", "ggml-base.dll"],
+	"darwin-arm64": ["libcrispembed.0.dylib", "libggml.0.dylib", "libggml-cpu.0.dylib", "libggml-base.0.dylib"],
+	"darwin-x64": ["libcrispembed.0.dylib", "libggml.0.dylib", "libggml-cpu.0.dylib", "libggml-base.0.dylib"],
+	"linux-x64": ["libcrispembed.so.0", "libggml.so.0", "libggml-cpu.so.0", "libggml-base.so.0"],
+	"linux-arm64": ["libcrispembed.so.0", "libggml.so.0", "libggml-cpu.so.0", "libggml-base.so.0"],
+	"win32-x64": ["crispembed.dll", "ggml.dll", "ggml-cpu.dll", "ggml-base.dll"],
+	"win32-arm64": ["crispembed.dll", "ggml.dll", "ggml-cpu.dll", "ggml-base.dll"],
 };
 
 function currentTarget() {
@@ -32,7 +32,7 @@ function parseOptions() {
 			target = args[++index];
 			continue;
 		}
-		throw new Error("Usage: node scripts/verify-semantic-native.mjs --root <native-directory> [--target <platform>]");
+	throw new Error("Usage: bun scripts/verify-semantic-native.mjs --root <native-directory> [--target <platform>]");
 	}
 	if (!root) throw new Error("--root is required");
 	target ??= currentTarget();
@@ -47,7 +47,9 @@ if (missing.length > 0) {
 	throw new Error(`Incomplete ${target} semantic native runtime in ${targetDirectory}: missing ${missing.join(", ")}`);
 }
 
-const addon = resolve(targetDirectory, requiredFiles[target][0]);
-if (!statSync(addon).isFile()) throw new Error(`Semantic Node-API addon is invalid: ${addon}`);
+for (const filename of requiredFiles[target]) {
+	const library = resolve(targetDirectory, filename);
+	if (!statSync(library).isFile()) throw new Error(`Semantic Bun FFI library is invalid: ${library}`);
+}
 
-console.log(`Verified ${target} semantic Node-API addon: ${targetDirectory}`);
+console.log(`Verified ${target} semantic Bun FFI libraries: ${targetDirectory}`);

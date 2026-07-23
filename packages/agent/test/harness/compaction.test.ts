@@ -264,7 +264,7 @@ describe("harness compaction", () => {
 		};
 		const bashExecution: AgentMessage = {
 			role: "bashExecution",
-			command: "npm run check",
+			command: "bun run check",
 			output: "ok",
 			exitCode: 0,
 			cancelled: false,

@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import { parentPort } from "node:worker_threads";
 import lockfile from "proper-lockfile";
 import {
 	getLocalEmbeddingCacheDirectory,
@@ -20,6 +19,13 @@ type SetupStatus =
 	| { phase: "downloading"; loadedBytes?: number; totalBytes?: number; file?: string }
 	| { phase: "loading" }
 	| { phase: "ready" };
+
+interface BunWorkerPort {
+	postMessage(message: unknown): void;
+	onmessage: ((event: { data: unknown }) => void) | null;
+}
+
+const port = globalThis as unknown as BunWorkerPort;
 
 function cacheDirectory(agentDir: string): string {
 	return getLocalEmbeddingCacheDirectory(agentDir);
@@ -64,7 +70,7 @@ async function readVerifiedManifest(agentDir: string): Promise<LocalEmbeddingAss
 }
 
 function postStatus(status: SetupStatus): void {
-	parentPort?.postMessage({ type: "status", status });
+	port.postMessage({ type: "status", status });
 }
 
 async function resolveImmutableRevision(): Promise<string> {
@@ -163,15 +169,16 @@ async function prepare(agentDir: string): Promise<void> {
 	}
 }
 
-parentPort?.once("message", (message: unknown) => {
+port.onmessage = (event) => {
+	const message = event.data;
 	const agentDir = message && typeof message === "object" ? (message as { agentDir?: unknown }).agentDir : undefined;
 	if (typeof agentDir !== "string") {
-		parentPort?.postMessage({ type: "error", message: "Invalid local embedding setup request" });
+		port.postMessage({ type: "error", message: "Invalid local embedding setup request" });
 		return;
 	}
 	void prepare(agentDir)
-		.then(() => parentPort?.postMessage({ type: "complete" }))
+		.then(() => port.postMessage({ type: "complete" }))
 		.catch((error) =>
-			parentPort?.postMessage({ type: "error", message: error instanceof Error ? error.message : String(error) }),
+			port.postMessage({ type: "error", message: error instanceof Error ? error.message : String(error) }),
 		);
-});
+};

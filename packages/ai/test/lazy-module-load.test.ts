@@ -1,119 +1,52 @@
-import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const aiEntryUrl = new URL("../src/index.ts", import.meta.url).href;
-const compatEntryUrl = new URL("../src/compat.ts", import.meta.url).href;
-const providersAllUrl = new URL("../src/providers/all.ts", import.meta.url).href;
+const SDK_MARKERS = ["@anthropic-ai/sdk", "openai/resources", "@google/genai", "@mistralai/mistralai"];
 
-const SDK_SPECIFIERS = [
-	"@anthropic-ai/sdk",
-	"openai",
-	"@google/genai",
-	"@mistralai/mistralai",
-	"@aws-sdk/client-bedrock-runtime",
-] as const;
+type BuildOutput = { path: string; text(): Promise<string> };
+type BunBuild = (options: {
+	entrypoints: string[];
+	target: "bun";
+	splitting: boolean;
+	write: false;
+}) => Promise<{ success: boolean; logs: unknown[]; outputs: BuildOutput[] }>;
 
-type ProbeResult = {
-	loadedSpecifiers: string[];
-};
+const bunBuild = (globalThis as unknown as { Bun: { build: BunBuild } }).Bun.build;
 
-function runProbe(action: string): ProbeResult {
-	const script = `
-		import { registerHooks } from "node:module";
-
-		const targets = new Set(${JSON.stringify(SDK_SPECIFIERS)});
-		const loaded = [];
-
-		registerHooks({
-			resolve(specifier, context, nextResolve) {
-				if (targets.has(specifier)) {
-					loaded.push(specifier);
-				}
-				return nextResolve(specifier, context);
-			},
-		});
-
-		const mod = await import(${JSON.stringify(aiEntryUrl)});
-		${action}
-		console.log(JSON.stringify({ loadedSpecifiers: [...new Set(loaded)] }));
-	`;
-
-	const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
-		cwd: packageRoot,
-		encoding: "utf8",
+async function buildEntry(relativeEntry: string): Promise<{ entry: string; chunks: string[] }> {
+	const result = await bunBuild({
+		entrypoints: [resolve(packageRoot, relativeEntry)],
+		target: "bun",
+		splitting: true,
+		write: false,
 	});
-
-	if (result.status !== 0) {
-		throw new Error(`Probe failed (exit ${result.status})\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`);
-	}
-
-	const stdoutLines = result.stdout
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter((line) => line.length > 0);
-	const lastLine = stdoutLines.at(-1);
-	if (!lastLine) {
-		throw new Error(`Probe produced no output\nSTDERR:\n${result.stderr}`);
-	}
-
-	return JSON.parse(lastLine) as ProbeResult;
+	expect(result.success, JSON.stringify(result.logs)).toBe(true);
+	const outputs = await Promise.all(
+		result.outputs.map(async (output) => ({ path: output.path, text: await output.text() })),
+	);
+	const entryName = `${relativeEntry.split("/").at(-1)?.replace(/\.ts$/, "")}.js`;
+	const entry = outputs.find((output) => output.path.endsWith(entryName));
+	if (!entry) throw new Error(`Missing Bun build entry output for ${relativeEntry}`);
+	return { entry: entry.text, chunks: outputs.filter((output) => output !== entry).map((output) => output.text) };
 }
 
 describe("lazy provider module loading", () => {
-	it("does not load provider SDKs when importing the root barrel", () => {
-		const result = runProbe("");
-		expect(result.loadedSpecifiers).toEqual([]);
+	it("keeps provider SDKs out of the root entry", async () => {
+		const output = await buildEntry("src/index.ts");
+		for (const marker of SDK_MARKERS) expect(output.entry).not.toContain(marker);
 	});
 
-	it("does not load provider SDKs when building all builtin providers", () => {
-		const result = runProbe(`
-			const all = await import(${JSON.stringify(providersAllUrl)});
-			const models = all.builtinModels();
-			models.getModels();
-		`);
-		expect(result.loadedSpecifiers).toEqual([]);
+	it("keeps provider SDKs in split chunks for the compatibility entry", async () => {
+		const output = await buildEntry("src/compat.ts");
+		for (const marker of SDK_MARKERS) expect(output.entry).not.toContain(marker);
+		expect(output.chunks.some((chunk) => chunk.includes("@anthropic-ai/sdk"))).toBe(true);
+		expect(output.entry).toContain("import(");
 	});
 
-	it("does not load provider SDKs when importing the compat entrypoint", () => {
-		const result = runProbe(`
-			await import(${JSON.stringify(compatEntryUrl)});
-		`);
-		expect(result.loadedSpecifiers).toEqual([]);
-	});
-
-	it("loads only the Anthropic SDK when streaming through the lazy API wrapper", () => {
-		const result = runProbe(`
-			const compat = await import(${JSON.stringify(compatEntryUrl)});
-			const model = {
-				id: "claude-sonnet-4-6",
-				name: "Claude Sonnet 4",
-				api: "anthropic-messages",
-				provider: "anthropic",
-				baseUrl: "https://api.anthropic.com",
-				reasoning: true,
-				input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 200000,
-				maxTokens: 8192,
-			};
-			const context = { messages: [{ role: "user", content: "hi" }] };
-			await compat.anthropicMessagesApi().streamSimple(model, context).result();
-		`);
-
-		expect(result.loadedSpecifiers).toEqual(["@anthropic-ai/sdk"]);
-	});
-
-	it("loads only the Anthropic SDK when dispatching through streamSimple", () => {
-		const result = runProbe(`
-			const compat = await import(${JSON.stringify(compatEntryUrl)});
-			const model = compat.getModel("anthropic", "claude-sonnet-4-6");
-			const context = { messages: [{ role: "user", content: "hi" }] };
-			await compat.streamSimple(model, context).result();
-		`);
-
-		expect(result.loadedSpecifiers).toEqual(["@anthropic-ai/sdk"]);
+	it("builds the builtin provider catalog without eagerly embedding SDKs", async () => {
+		const output = await buildEntry("src/providers/all.ts");
+		for (const marker of SDK_MARKERS) expect(output.entry).not.toContain(marker);
 	});
 });

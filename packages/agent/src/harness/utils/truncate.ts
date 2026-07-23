@@ -123,6 +123,7 @@ export function formatSize(bytes: number): string {
  * returns empty content with firstLineExceedsLimit=true.
  */
 export function truncateHead(content: string, options: TruncationOptions = {}): TruncationResult {
+	content = replaceUnpairedSurrogates(content);
 	const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 
@@ -213,6 +214,7 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
  * May return partial first line if the last line of original content exceeds byte limit.
  */
 export function truncateTail(content: string, options: TruncationOptions = {}): TruncationResult {
+	content = replaceUnpairedSurrogates(content);
 	const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 

@@ -1,17 +1,10 @@
-import { createRequire } from "node:module";
-import { parentPort } from "node:worker_threads";
+import { BunFfiEmbeddingLibrary } from "./local-embedding-ffi.ts";
 
 const DIMENSIONS = 384;
 
 type EmbedMode = "query" | "document";
 
-type NativeEmbeddingAddon = {
-	prepare(modelPath: string): void;
-	embed(mode: 0 | 1, texts: string[]): Float32Array;
-	dispose(): void;
-};
-
-type PrepareRequest = { type: "prepare"; id: number; modelPath: string; fingerprint: string };
+type PrepareRequest = { type: "prepare"; id: number; modelPath: string; fingerprint: string; libraryPath: string };
 type EmbedRequest = { type: "embed"; id: number; mode: EmbedMode; texts: string[] };
 type DisposeRequest = { type: "dispose"; id: number };
 type Request = PrepareRequest | EmbedRequest | DisposeRequest;
@@ -26,10 +19,14 @@ type WorkerStatus = {
 	pid: number;
 };
 
-if (!parentPort) throw new Error("Bone local embedding worker requires a parent port");
-const port = parentPort;
+interface BunWorkerPort {
+	postMessage(message: unknown, transfer?: ArrayBuffer[]): void;
+	onmessage: ((event: { data: unknown }) => void) | null;
+}
 
-let addon: NativeEmbeddingAddon | undefined;
+const port = globalThis as unknown as BunWorkerPort;
+
+let library: BunFfiEmbeddingLibrary | undefined;
 let fingerprint: string | undefined;
 let phase: WorkerStatus["phase"] = "not-started";
 let activeDocuments = 0;
@@ -62,11 +59,6 @@ function reject(request: Request, error: string): void {
 	port.postMessage({ type: "error", id: request.id, message: error });
 }
 
-function loadAddon(addonPath: string): NativeEmbeddingAddon {
-	const require = createRequire(import.meta.url);
-	return require(addonPath) as NativeEmbeddingAddon;
-}
-
 function schedule(): void {
 	if (scheduled || draining || closing) return;
 	scheduled = true;
@@ -80,7 +72,7 @@ async function drain(): Promise<void> {
 	if (draining || closing) return;
 	const request = queryQueue.shift() ?? documentQueue.shift();
 	if (!request) {
-		if (phase !== "failed" && phase !== "disposed") phase = addon ? "ready" : "not-started";
+		if (phase !== "failed" && phase !== "disposed") phase = library ? "ready" : "not-started";
 		publishStatus();
 		return;
 	}
@@ -89,8 +81,8 @@ async function drain(): Promise<void> {
 	phase = "embedding";
 	publishStatus();
 	try {
-		if (!addon) throw new Error("Local semantic engine is not prepared");
-		const flat = addon.embed(request.mode === "query" ? 0 : 1, request.texts);
+		if (!library) throw new Error("Local semantic engine is not prepared");
+		const flat = library.embed(request.mode === "query" ? 0 : 1, request.texts);
 		if (flat.length !== request.texts.length * DIMENSIONS) {
 			throw new Error("Local semantic engine returned an unexpected vector shape");
 		}
@@ -109,15 +101,16 @@ async function drain(): Promise<void> {
 	} finally {
 		activeDocuments = 0;
 		draining = false;
-		if (phase !== "failed") phase = addon ? "ready" : "not-started";
+		if (phase !== "failed") phase = library ? "ready" : "not-started";
 		publishStatus();
 		schedule();
 	}
 }
 
-port.on("message", (message: unknown) => {
+port.onmessage = (event) => {
+	const message = event.data;
 	if (!message || typeof message !== "object" || !("type" in message) || typeof message.type !== "string") return;
-	const request = message as Request & { addonPath?: unknown };
+	const request = message as Request;
 	if (request.type === "prepare") {
 		if (
 			typeof request.id !== "number" ||
@@ -125,13 +118,13 @@ port.on("message", (message: unknown) => {
 			typeof request.fingerprint !== "string"
 		)
 			return;
-		if (typeof request.addonPath !== "string") return reject(request, "Local semantic addon path is missing");
+		if (typeof request.libraryPath !== "string") return reject(request, "Local semantic library path is missing");
 		if (closing) return reject(request, "Local semantic engine is closing");
 		phase = "loading";
 		publishStatus();
 		try {
-			addon ??= loadAddon(request.addonPath);
-			addon.prepare(request.modelPath);
+			library ??= new BunFfiEmbeddingLibrary(request.libraryPath);
+			library.prepare(request.modelPath);
 			fingerprint = request.fingerprint;
 			phase = "ready";
 			port.postMessage({ type: "result", id: request.id });
@@ -162,8 +155,8 @@ port.on("message", (message: unknown) => {
 	for (const pending of [...queryQueue.splice(0), ...documentQueue.splice(0)])
 		reject(pending, "Local semantic engine disposed");
 	try {
-		addon?.dispose();
-		addon = undefined;
+		library?.close();
+		library = undefined;
 		fingerprint = undefined;
 		phase = "disposed";
 		port.postMessage({ type: "result", id: request.id });
@@ -174,6 +167,6 @@ port.on("message", (message: unknown) => {
 		reject(request, detail);
 		publishStatus(detail);
 	}
-});
+};
 
 publishStatus();

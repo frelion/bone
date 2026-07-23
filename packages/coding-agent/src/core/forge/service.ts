@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import type { Dispatcher } from "undici";
+import type { Dispatcher } from "undici-client";
 import { getAgentDir } from "../../config.ts";
 import { enforceForgeApproval, type ForgeOperationRisk } from "./approval.ts";
 import { type ForgeInstanceConfig, findForgeInstance, loadForgeConfig, resolveForgeProvider } from "./config.ts";

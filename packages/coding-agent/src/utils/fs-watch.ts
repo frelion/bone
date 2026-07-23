@@ -18,9 +18,10 @@ export function watchWithErrorHandler(
 	path: string,
 	listener: WatchListener<string>,
 	onError: () => void,
+	watchFile: typeof watch = watch,
 ): FSWatcher | null {
 	try {
-		const watcher = watch(path, listener);
+		const watcher = watchFile(path, listener);
 		watcher.on("error", onError);
 		return watcher;
 	} catch {

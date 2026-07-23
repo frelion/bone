@@ -1,6 +1,6 @@
 /**
  * PKCE utilities using Web Crypto API.
- * Works in both Node.js 20+ and browsers.
+ * Works in both Bun and browsers.
  */
 
 /**
