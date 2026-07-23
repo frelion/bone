@@ -19,9 +19,9 @@
     },
     "packages/agent": {
       "name": "@frelion/bone-agent-core",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "dependencies": {
-        "@frelion/bone-ai": "^0.1.4",
+        "@frelion/bone-ai": "^0.1.5",
         "ignore": "7.0.5",
         "typebox": "1.1.38",
         "yaml": "2.9.0",
@@ -35,7 +35,7 @@
     },
     "packages/ai": {
       "name": "@frelion/bone-ai",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "bin": {
         "bone-ai": "./dist/cli.js",
       },
@@ -61,14 +61,14 @@
     },
     "packages/coding-agent": {
       "name": "@frelion/bone-coding-agent",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "bin": {
         "bone": "dist/bun/cli.js",
       },
       "dependencies": {
-        "@frelion/bone-agent-core": "^0.1.4",
-        "@frelion/bone-ai": "^0.1.4",
-        "@frelion/bone-tui": "^0.1.4",
+        "@frelion/bone-agent-core": "^0.1.5",
+        "@frelion/bone-ai": "^0.1.5",
+        "@frelion/bone-tui": "^0.1.5",
         "@lancedb/lancedb": "0.31.0",
         "@opentui/core": "0.4.5",
         "@silvia-odwyer/photon-node": "0.3.4",
@@ -143,9 +143,10 @@
     },
     "packages/orchestrator": {
       "name": "@frelion/bone-orchestrator",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "dependencies": {
-        "@frelion/bone-coding-agent": "^0.1.4",
+        "@frelion/bone-ai": "^0.1.5",
+        "@frelion/bone-coding-agent": "^0.1.5",
       },
       "devDependencies": {
         "shx": "0.4.0",
@@ -153,7 +154,7 @@
     },
     "packages/tui": {
       "name": "@frelion/bone-tui",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "dependencies": {
         "@opentui/core": "0.4.5",
         "get-east-asian-width": "1.6.0",
