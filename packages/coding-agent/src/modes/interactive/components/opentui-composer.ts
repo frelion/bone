@@ -89,6 +89,7 @@ export class OpenTUIComposer {
 	private autocompleteSuggestions: AutocompleteSuggestions | undefined;
 	private autocompleteAbort: AbortController | undefined;
 	private autocompleteGeneration = 0;
+	private suppressedAutocompleteValue: string | undefined;
 	private internalChange = false;
 	private currentValue = "";
 	private focused = false;
@@ -375,11 +376,13 @@ export class OpenTUIComposer {
 
 	private handleTextChange(value: string): void {
 		if (this.internalChange) return;
+		const suppressAutocomplete = this.suppressedAutocompleteValue === value;
+		this.suppressedAutocompleteValue = undefined;
 		this.currentValue = value;
 		this.refreshTextareaHeight(value);
 		this.exitHistory();
 		this.onChange?.(value);
-		void this.requestAutocomplete(false);
+		if (!suppressAutocomplete) void this.requestAutocomplete(false);
 	}
 
 	private setTextareaValue(value: string, cursor: number, notify: boolean): void {
@@ -518,9 +521,10 @@ export class OpenTUIComposer {
 			suggestions.prefix,
 		);
 		const value = result.lines.join("\n");
-		this.closeAutocomplete();
 		this.exitHistory();
+		this.suppressedAutocompleteValue = value;
 		this.setTextareaValue(value, cursorOffset(result.lines, result.cursorLine, result.cursorCol), true);
+		this.closeAutocomplete();
 	}
 
 	private hasUniqueSlashCommandSuggestion(): boolean {
