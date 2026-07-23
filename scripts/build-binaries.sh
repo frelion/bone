@@ -122,14 +122,14 @@ if [[ "$SKIP_DEPS" == "false" ]]; then
         local link_parent="$3"
         local scope="${package_name%%/*}"
         local name="${package_name#*/}"
-        local store_dir
-        store_dir=$(find "$(pwd)/node_modules/.bun" -maxdepth 1 -type d -name "${scope}+${name}@${version}*" -print -quit)
-        if [[ -z "$store_dir" ]]; then
+        local package_dir
+        package_dir=$(find "$(pwd)/node_modules" -type d -path "*/node_modules/$scope/$name" -print -quit)
+        if [[ -z "$package_dir" ]]; then
             echo "Could not find installed package ${package_name}@${version}" >&2
             exit 1
         fi
         mkdir -p "$link_parent"
-        ln -sfn "$store_dir/node_modules/$scope/$name" "$link_parent/$name"
+        ln -sfn "$package_dir" "$link_parent/$name"
     }
 
     opentui_core_dir=$(dirname "$(bun -e 'import { resolve } from "node:path"; console.log(Bun.resolveSync("@opentui/core", resolve(process.cwd(), "packages/tui")))')")
