@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import * as undici from "undici";
+import * as undici from "undici-client";
 
 export const DEFAULT_HTTP_IDLE_TIMEOUT_MS = 300_000;
 
@@ -86,21 +86,22 @@ export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TI
 			allowH2: false,
 			bodyTimeout: normalizedTimeoutMs,
 			headersTimeout: normalizedTimeoutMs,
+			// Undici 6 supports this option at runtime, but its EnvHttpProxyAgent
+			// declaration omits the inherited ProxyAgent option.
 			clientFactory: createUndiciClient,
 			factory: createUndiciOriginDispatcher,
-		}),
+		} as undici.ProxyAgent.Options),
 	);
 	undici.setGlobalDispatcher(dispatcher);
-	// Keep fetch and the dispatcher on the same undici implementation. Node 26.0's
-	// bundled fetch can otherwise consume compressed responses through npm undici's
-	// dispatcher without decompressing them, causing response.json() failures.
-	// If a caller replaced fetch after module load, preserve that deliberate override.
-	const shouldInstallGlobals =
+
+	// Bun's native fetch does not consume the dispatcher installed by the npm
+	// undici package. Bind fetch to that package while preserving caller overrides.
+	const shouldInstallFetch =
 		installedGlobalFetch === undefined
 			? globalThis.fetch === originalGlobalFetch
 			: globalThis.fetch === installedGlobalFetch;
-	if (shouldInstallGlobals) {
-		undici.install?.();
-		installedGlobalFetch = globalThis.fetch;
+	if (shouldInstallFetch) {
+		installedGlobalFetch = undici.fetch as unknown as typeof globalThis.fetch;
+		globalThis.fetch = installedGlobalFetch;
 	}
 }
