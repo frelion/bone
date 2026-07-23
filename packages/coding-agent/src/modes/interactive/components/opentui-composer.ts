@@ -235,7 +235,12 @@ export class OpenTUIComposer {
 			}
 			if (matchesOpenTUIAction(event, "composerSubmit") || matchesOpenTUIAction(event, "composerAutocomplete")) {
 				const item = this.autocomplete.getSelectedOption()?.value as AutocompleteItem | undefined;
-				if (item) this.applyAutocomplete(item);
+				if (item) {
+					const submitAfterCompletion =
+						matchesOpenTUIAction(event, "composerSubmit") && this.hasUniqueSlashCommandSuggestion();
+					this.applyAutocomplete(item);
+					if (submitAfterCompletion) this.submit();
+				}
 				return consume(event);
 			}
 		}
@@ -516,6 +521,12 @@ export class OpenTUIComposer {
 		this.closeAutocomplete();
 		this.exitHistory();
 		this.setTextareaValue(value, cursorOffset(result.lines, result.cursorLine, result.cursorCol), true);
+	}
+
+	private hasUniqueSlashCommandSuggestion(): boolean {
+		const suggestions = this.autocompleteSuggestions;
+		if (!suggestions || suggestions.items.length !== 1) return false;
+		return /^\/[^/\s]*$/.test(suggestions.prefix);
 	}
 
 	private closeAutocomplete(): void {

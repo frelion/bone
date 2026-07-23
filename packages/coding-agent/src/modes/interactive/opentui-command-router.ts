@@ -41,6 +41,13 @@ function parseCommand(text: string): { name: string; argument: string } | undefi
 		: { name: text.slice(1, separator).toLowerCase(), argument: text.slice(separator).trim() };
 }
 
+function resolveBuiltinCommand(name: string): string | undefined {
+	const exact = BUILTIN_SLASH_COMMANDS.find((item) => item.name === name);
+	if (exact) return exact.name;
+	const prefixMatches = BUILTIN_SLASH_COMMANDS.filter((item) => item.name.startsWith(name));
+	return prefixMatches.length === 1 ? prefixMatches[0]?.name : undefined;
+}
+
 function requireUI(ui: ExtensionUIV2Context | undefined): ExtensionUIV2Context {
 	if (!ui?.available) throw new Error("This command requires the interactive OpenTUI dialog host");
 	return ui;
@@ -87,8 +94,10 @@ export class OpenTUICommandRouter {
 			return { handled: true, kind: "bash" };
 		}
 		const command = parseCommand(trimmed);
-		if (!command || !BUILTIN_SLASH_COMMANDS.some((item) => item.name === command.name)) return { handled: false };
-		await this.executeCommand(command.name, command.argument);
+		if (!command) return { handled: false };
+		const resolvedName = resolveBuiltinCommand(command.name);
+		if (!resolvedName) return { handled: false };
+		await this.executeCommand(resolvedName, command.argument);
 		return { handled: true, kind: "command" };
 	}
 

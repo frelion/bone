@@ -54,6 +54,22 @@ describe("OpenTUICommandRouter", () => {
 		expect(onQuit).toHaveBeenCalledOnce();
 	});
 
+	test("routes a unique slash-command prefix", async () => {
+		const { router, onQuit } = createHarness();
+		await router.route("/qui");
+		expect(onQuit).toHaveBeenCalledOnce();
+	});
+
+	test("routes /set to the settings command", async () => {
+		const { router } = createHarness();
+		const settings = vi.spyOn(router as unknown as { settings: () => Promise<void> }, "settings").mockResolvedValue();
+
+		const result = await router.route("/set");
+
+		expect(result).toEqual({ handled: true, kind: "command" });
+		expect(settings).toHaveBeenCalledOnce();
+	});
+
 	test("routes stateful session commands without prompting the model", async () => {
 		const { router, compact, enterPlanMode, setSessionName, createNew, statuses } = createHarness();
 		await router.route("/new");

@@ -135,9 +135,11 @@ describe("OpenTUI composer", () => {
 			applyCompletion,
 		};
 		const changes: string[] = [];
+		const submitted = vi.fn();
 		const { testSetup, mockInput, composer } = await mountComposer({
 			autocompleteProvider: provider,
 			onChange: (value) => changes.push(value),
+			onSubmit: submitted,
 		});
 		await mockInput.typeText("/");
 		await settle(testSetup);
@@ -146,10 +148,32 @@ describe("OpenTUI composer", () => {
 		mockInput.pressArrow("down");
 		expect(composer.selectedAutocompleteItem?.value).toBe("history");
 		mockInput.pressEnter();
+		await settle(testSetup);
 		expect(composer.value).toBe("/history");
 		expect(composer.autocompleteOpen).toBe(false);
 		expect(changes.at(-1)).toBe("/history");
 		expect(applyCompletion).toHaveBeenCalledOnce();
+		mockInput.pressEnter();
+		expect(submitted).toHaveBeenCalledWith("/history");
+	});
+
+	test("submits a unique slash-command match with one Enter press", async () => {
+		const provider: AutocompleteProvider = {
+			async getSuggestions() {
+				return { prefix: "/set", items: [{ value: "settings", label: "settings" }] };
+			},
+			applyCompletion() {
+				return { lines: ["/settings "], cursorLine: 0, cursorCol: 10 };
+			},
+		};
+		const submitted = vi.fn();
+		const { testSetup, mockInput } = await mountComposer({ autocompleteProvider: provider, onSubmit: submitted });
+
+		await mockInput.typeText("/set");
+		await settle(testSetup);
+		mockInput.pressEnter();
+
+		expect(submitted).toHaveBeenCalledWith("/settings");
 	});
 
 	test("ignores stale asynchronous autocomplete results", async () => {
