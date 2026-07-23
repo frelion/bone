@@ -83,7 +83,6 @@ const FIELDS: Readonly<Record<string, readonly Field[]>> = {
 		{ label: "HTTP proxy", path: "httpProxy", kind: "string" },
 		{ label: "HTTP idle timeout", path: "httpIdleTimeoutMs", kind: "number" },
 		{ label: "WebSocket connect timeout", path: "websocketConnectTimeoutMs", kind: "number" },
-		{ label: "NPM command argv", path: "npmCommand", kind: "string", description: "Space-separated argv" },
 	],
 	Resources: [
 		{ label: "Skill paths", path: "skills", kind: "string", description: "Comma-separated paths" },
