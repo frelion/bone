@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it, test } from "node:test";
-import { CombinedAutocompleteProvider } from "../src/autocomplete.ts";
+import { CombinedAutocompleteProvider, classifyCompletionContext } from "../src/autocomplete.ts";
 
 const resolveFdPath = (): string | null => {
 	const command = process.platform === "win32" ? "where" : "which";
@@ -56,6 +56,71 @@ const getSuggestions = (
 ) => provider.getSuggestions(lines, cursorLine, cursorCol, { signal: new AbortController().signal, force });
 
 describe("CombinedAutocompleteProvider", () => {
+	it("classifies completion only from explicit user intent", () => {
+		assert.deepStrictEqual(classifyCompletionContext("write about .agent", false), { kind: "none" });
+		assert.deepStrictEqual(classifyCompletionContext("open ./src", false), { kind: "none" });
+		assert.deepStrictEqual(classifyCompletionContext("open ./src", true), {
+			kind: "explicit-path",
+			prefix: "./src",
+		});
+		assert.deepStrictEqual(classifyCompletionContext("attach @.agent", false), {
+			kind: "mention-file",
+			prefix: "@.agent",
+		});
+		assert.deepStrictEqual(classifyCompletionContext("/set", false), {
+			kind: "slash-command",
+			prefix: "/set",
+		});
+		assert.deepStrictEqual(classifyCompletionContext("/name @draft", false), {
+			kind: "slash-argument",
+			commandName: "name",
+			prefix: "@draft",
+		});
+	});
+
+	it("never offers file paths during ordinary text entry", async () => {
+		const baseDir = mkdtempSync(join(tmpdir(), "bone-autocomplete-intent-"));
+		try {
+			writeFileSync(join(baseDir, ".agent"), "config");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "write about .agent";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+			assert.strictEqual(result, null);
+		} finally {
+			rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
+
+	it("offers plain file paths only after explicit completion", async () => {
+		const baseDir = mkdtempSync(join(tmpdir(), "bone-autocomplete-intent-"));
+		try {
+			writeFileSync(join(baseDir, ".agent"), "config");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const result = await getSuggestions(provider, [".ag"], 0, 3, true);
+			assert.deepStrictEqual(
+				result?.items.map((item) => item.value),
+				[".agent"],
+			);
+		} finally {
+			rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
+
+	it("offers @ file mentions naturally without requiring fd", async () => {
+		const baseDir = mkdtempSync(join(tmpdir(), "bone-autocomplete-intent-"));
+		try {
+			writeFileSync(join(baseDir, ".agent"), "config");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const result = await getSuggestions(provider, ["@.ag"], 0, 4);
+			assert.deepStrictEqual(
+				result?.items.map((item) => item.value),
+				["@.agent"],
+			);
+		} finally {
+			rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
+
 	it("matches slash commands during explicit completion", async () => {
 		const provider = new CombinedAutocompleteProvider([{ name: "settings", description: "Open settings" }], "/tmp");
 		const result = await provider.getSuggestions(["/set"], 0, 4, {
@@ -110,7 +175,7 @@ describe("CombinedAutocompleteProvider", () => {
 			assert.strictEqual(result, null, "Should not trigger for slash commands");
 		});
 
-		it("triggers for absolute paths after slash command argument", async () => {
+		it("does not reinterpret unknown slash-command arguments as paths", async () => {
 			const provider = new CombinedAutocompleteProvider([], "/tmp");
 			const lines = ["/command /"];
 			const cursorLine = 0;
@@ -119,10 +184,7 @@ describe("CombinedAutocompleteProvider", () => {
 			const result = await getSuggestions(provider, lines, cursorLine, cursorCol, true);
 
 			console.log("Result:", result);
-			assert.notEqual(result, null, "Should trigger for absolute paths in command arguments");
-			if (result) {
-				assert.strictEqual(result.prefix, "/", "Prefix should be '/'");
-			}
+			assert.strictEqual(result, null);
 		});
 	});
 

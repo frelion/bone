@@ -3,6 +3,8 @@ export {
 	type AutocompleteProvider,
 	type AutocompleteSuggestions,
 	CombinedAutocompleteProvider,
+	type CompletionContext,
+	classifyCompletionContext,
 	type SlashCommand,
 } from "./autocomplete.ts";
 export { type FuzzyMatch, fuzzyFilter, fuzzyMatch } from "./fuzzy.ts";

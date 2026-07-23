@@ -238,6 +238,46 @@ export interface AutocompleteSuggestions {
 	prefix: string; // What we're matching against (e.g., "/" or "src/")
 }
 
+export type CompletionContext =
+	| { kind: "slash-command"; prefix: string }
+	| { kind: "slash-argument"; commandName: string; prefix: string }
+	| { kind: "mention-file"; prefix: string }
+	| { kind: "explicit-path"; prefix: string }
+	| { kind: "none" };
+
+function extractAtPrefix(text: string): string | null {
+	const quotedPrefix = extractQuotedPrefix(text);
+	if (quotedPrefix?.startsWith('@"')) return quotedPrefix;
+	const lastDelimiterIndex = findLastDelimiter(text);
+	const tokenStart = lastDelimiterIndex === -1 ? 0 : lastDelimiterIndex + 1;
+	return text[tokenStart] === "@" ? text.slice(tokenStart) : null;
+}
+
+function extractExplicitPathPrefix(text: string): string {
+	const quotedPrefix = extractQuotedPrefix(text);
+	if (quotedPrefix) return quotedPrefix;
+	const lastDelimiterIndex = findLastDelimiter(text);
+	return lastDelimiterIndex === -1 ? text : text.slice(lastDelimiterIndex + 1);
+}
+
+export function classifyCompletionContext(textBeforeCursor: string, force: boolean): CompletionContext {
+	if (textBeforeCursor.startsWith("/")) {
+		const spaceIndex = textBeforeCursor.indexOf(" ");
+		if (spaceIndex === -1) return { kind: "slash-command", prefix: textBeforeCursor };
+		return {
+			kind: "slash-argument",
+			commandName: textBeforeCursor.slice(1, spaceIndex),
+			prefix: textBeforeCursor.slice(spaceIndex + 1),
+		};
+	}
+
+	const atPrefix = extractAtPrefix(textBeforeCursor);
+	if (atPrefix) return { kind: "mention-file", prefix: atPrefix };
+
+	if (force) return { kind: "explicit-path", prefix: extractExplicitPathPrefix(textBeforeCursor) };
+	return { kind: "none" };
+}
+
 export interface AutocompleteProvider {
 	/** Characters that should naturally trigger this provider at token boundaries. */
 	triggerCharacters?: string[];
@@ -269,109 +309,68 @@ export interface AutocompleteProvider {
 	shouldTriggerFileCompletion?(lines: string[], cursorLine: number, cursorCol: number): boolean;
 }
 
-// Combined provider that handles both slash commands and file paths
-export class CombinedAutocompleteProvider implements AutocompleteProvider {
-	private commands: (SlashCommand | AutocompleteItem)[];
+class SlashCommandAutocompleteProvider {
+	private readonly commands: (SlashCommand | AutocompleteItem)[];
+
+	constructor(commands: (SlashCommand | AutocompleteItem)[]) {
+		this.commands = commands;
+	}
+
+	async getSuggestions(context: CompletionContext): Promise<AutocompleteSuggestions | null> {
+		if (context.kind === "slash-command") {
+			const prefix = context.prefix.slice(1);
+			const commandItems = this.commands.map((cmd) => {
+				const name = "name" in cmd ? cmd.name : cmd.value;
+				const hint = "argumentHint" in cmd && cmd.argumentHint ? cmd.argumentHint : undefined;
+				const desc = cmd.description ?? "";
+				const fullDesc = hint ? (desc ? `${hint} — ${desc}` : hint) : desc;
+				return { name, label: name, description: fullDesc || undefined };
+			});
+			const filtered = fuzzyFilter(commandItems, prefix, (item) => item.name).map((item) => ({
+				value: item.name,
+				label: item.label,
+				...(item.description && { description: item.description }),
+			}));
+			return filtered.length > 0 ? { items: filtered, prefix: context.prefix } : null;
+		}
+
+		if (context.kind !== "slash-argument") return null;
+		const command = this.commands.find((cmd) => ("name" in cmd ? cmd.name : cmd.value) === context.commandName);
+		if (!command || !("getArgumentCompletions" in command) || !command.getArgumentCompletions) return null;
+		const items = await command.getArgumentCompletions(context.prefix);
+		return Array.isArray(items) && items.length > 0 ? { items, prefix: context.prefix } : null;
+	}
+}
+
+class FileAutocompleteProvider {
 	private basePath: string;
 	private fdPath: string | null;
 
-	constructor(commands: (SlashCommand | AutocompleteItem)[] = [], basePath: string, fdPath: string | null = null) {
-		this.commands = commands;
+	constructor(basePath: string, fdPath: string | null = null) {
 		this.basePath = basePath;
 		this.fdPath = fdPath;
 	}
 
 	async getSuggestions(
-		lines: string[],
-		cursorLine: number,
-		cursorCol: number,
-		options: { signal: AbortSignal; force?: boolean },
+		context: CompletionContext,
+		options: { signal: AbortSignal },
 	): Promise<AutocompleteSuggestions | null> {
-		const currentLine = lines[cursorLine] || "";
-		const textBeforeCursor = currentLine.slice(0, cursorCol);
-
-		const atPrefix = this.extractAtPrefix(textBeforeCursor);
-		if (atPrefix) {
-			const { rawPrefix, isQuotedPrefix } = parsePathPrefix(atPrefix);
-			const suggestions = await this.getFuzzyFileSuggestions(rawPrefix, {
-				isQuotedPrefix,
-				signal: options.signal,
-			});
+		if (context.kind === "mention-file") {
+			const { rawPrefix, isQuotedPrefix } = parsePathPrefix(context.prefix);
+			const suggestions = this.fdPath
+				? await this.getFuzzyFileSuggestions(rawPrefix, {
+						isQuotedPrefix,
+						signal: options.signal,
+					})
+				: this.getFileSuggestions(context.prefix);
 			if (suggestions.length === 0) return null;
-
-			return {
-				items: suggestions,
-				prefix: atPrefix,
-			};
+			return { items: suggestions, prefix: context.prefix };
 		}
 
-		// Slash commands are explicit user intent. Keep them available for both
-		// natural typing and an explicit Tab completion request.
-		if (textBeforeCursor.startsWith("/")) {
-			const spaceIndex = textBeforeCursor.indexOf(" ");
-
-			if (spaceIndex === -1) {
-				const prefix = textBeforeCursor.slice(1);
-				const commandItems = this.commands.map((cmd) => {
-					const name = "name" in cmd ? cmd.name : cmd.value;
-					const hint = "argumentHint" in cmd && cmd.argumentHint ? cmd.argumentHint : undefined;
-					const desc = cmd.description ?? "";
-					const fullDesc = hint ? (desc ? `${hint} — ${desc}` : hint) : desc;
-					return {
-						name,
-						label: name,
-						description: fullDesc || undefined,
-					};
-				});
-
-				const filtered = fuzzyFilter(commandItems, prefix, (item) => item.name).map((item) => ({
-					value: item.name,
-					label: item.label,
-					...(item.description && { description: item.description }),
-				}));
-
-				if (filtered.length === 0) return null;
-
-				return {
-					items: filtered,
-					prefix: textBeforeCursor,
-				};
-			}
-
-			const commandName = textBeforeCursor.slice(1, spaceIndex);
-			const argumentText = textBeforeCursor.slice(spaceIndex + 1);
-
-			const command = this.commands.find((cmd) => {
-				const name = "name" in cmd ? cmd.name : cmd.value;
-				return name === commandName;
-			});
-			if (!command || !("getArgumentCompletions" in command) || !command.getArgumentCompletions) {
-				return null;
-			}
-
-			const argumentSuggestions = await command.getArgumentCompletions(argumentText);
-			if (!Array.isArray(argumentSuggestions) || argumentSuggestions.length === 0) {
-				return null;
-			}
-
-			return {
-				items: argumentSuggestions,
-				prefix: argumentText,
-			};
-		}
-
-		const pathMatch = this.extractPathPrefix(textBeforeCursor, options.force ?? false);
-		if (pathMatch === null) {
-			return null;
-		}
-
-		const suggestions = this.getFileSuggestions(pathMatch);
+		if (context.kind !== "explicit-path") return null;
+		const suggestions = this.getFileSuggestions(context.prefix);
 		if (suggestions.length === 0) return null;
-
-		return {
-			items: suggestions,
-			prefix: pathMatch,
-		};
+		return { items: suggestions, prefix: context.prefix };
 	}
 
 	applyCompletion(
@@ -459,53 +458,6 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			cursorLine,
 			cursorCol: beforePrefix.length + cursorOffset,
 		};
-	}
-
-	// Extract @ prefix for fuzzy file suggestions
-	private extractAtPrefix(text: string): string | null {
-		const quotedPrefix = extractQuotedPrefix(text);
-		if (quotedPrefix?.startsWith('@"')) {
-			return quotedPrefix;
-		}
-
-		const lastDelimiterIndex = findLastDelimiter(text);
-		const tokenStart = lastDelimiterIndex === -1 ? 0 : lastDelimiterIndex + 1;
-
-		if (text[tokenStart] === "@") {
-			return text.slice(tokenStart);
-		}
-
-		return null;
-	}
-
-	// Extract a path-like prefix from the text before cursor
-	private extractPathPrefix(text: string, forceExtract: boolean = false): string | null {
-		const quotedPrefix = extractQuotedPrefix(text);
-		if (quotedPrefix) {
-			return quotedPrefix;
-		}
-
-		const lastDelimiterIndex = findLastDelimiter(text);
-		const pathPrefix = lastDelimiterIndex === -1 ? text : text.slice(lastDelimiterIndex + 1);
-
-		// For forced extraction (Tab key), always return something
-		if (forceExtract) {
-			return pathPrefix;
-		}
-
-		// For natural triggers, return if it looks like a path, ends with /, starts with ~/, .
-		// Only return empty string if the text looks like it's starting a path context
-		if (pathPrefix.includes("/") || pathPrefix.startsWith(".") || pathPrefix.startsWith("~/")) {
-			return pathPrefix;
-		}
-
-		// Return empty string only after a space (not for completely empty text)
-		// Empty text should not trigger file suggestions - that's for forced Tab completion
-		if (pathPrefix === "" && text.endsWith(" ")) {
-			return pathPrefix;
-		}
-
-		return null;
 	}
 
 	// Expand home directory (~/) to actual home path
@@ -784,5 +736,44 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		}
 
 		return true;
+	}
+}
+
+// Routes completion by explicit input intent. File completion never sees ordinary text.
+export class CombinedAutocompleteProvider implements AutocompleteProvider {
+	private readonly slashCommands: SlashCommandAutocompleteProvider;
+	private readonly files: FileAutocompleteProvider;
+
+	constructor(commands: (SlashCommand | AutocompleteItem)[] = [], basePath: string, fdPath: string | null = null) {
+		this.slashCommands = new SlashCommandAutocompleteProvider(commands);
+		this.files = new FileAutocompleteProvider(basePath, fdPath);
+	}
+
+	async getSuggestions(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+		options: { signal: AbortSignal; force?: boolean },
+	): Promise<AutocompleteSuggestions | null> {
+		const textBeforeCursor = (lines[cursorLine] ?? "").slice(0, cursorCol);
+		const context = classifyCompletionContext(textBeforeCursor, options.force ?? false);
+		if (context.kind === "slash-command" || context.kind === "slash-argument") {
+			return this.slashCommands.getSuggestions(context);
+		}
+		return this.files.getSuggestions(context, { signal: options.signal });
+	}
+
+	applyCompletion(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+		item: AutocompleteItem,
+		prefix: string,
+	): { lines: string[]; cursorLine: number; cursorCol: number } {
+		return this.files.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+	}
+
+	shouldTriggerFileCompletion(lines: string[], cursorLine: number, cursorCol: number): boolean {
+		return this.files.shouldTriggerFileCompletion(lines, cursorLine, cursorCol);
 	}
 }
