@@ -120,10 +120,9 @@ if [[ "$SKIP_DEPS" == "false" ]]; then
         local package_name="$1"
         local version="$2"
         local link_parent="$3"
-        local scope="${package_name%%/*}"
         local name="${package_name#*/}"
         local package_dir
-        package_dir=$(find "$(pwd)/node_modules" \( -type d -o -type l \) -path "*/$scope/$name" -print -quit)
+        package_dir=$(find "$(pwd)/node_modules" \( -type d -o -type l \) -name "$name" -print -quit)
         if [[ -z "$package_dir" ]]; then
             echo "Could not find installed package ${package_name}@${version}" >&2
             exit 1
