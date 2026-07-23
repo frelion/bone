@@ -78,6 +78,11 @@ describe("OpenTUICommandRouter", () => {
 	test("completes from the fixed built-in command catalog", async () => {
 		const { router } = createHarness();
 		const provider = router.createAutocompleteProvider("/tmp");
+		const settings = await provider.getSuggestions(["/set"], 0, 4, {
+			signal: new AbortController().signal,
+			force: true,
+		});
+		expect(settings?.items.map((item) => item.value)).toContain("settings");
 		const suggestions = await provider.getSuggestions(["/mod"], 0, 4, { signal: new AbortController().signal });
 		expect(suggestions?.items.some((item) => item.value === "model")).toBe(true);
 		const completion = provider.applyCompletion(["/mod"], 0, 4, { value: "model", label: "model" }, "/mod");

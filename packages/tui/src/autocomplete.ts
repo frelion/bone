@@ -305,7 +305,9 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			};
 		}
 
-		if (!options.force && textBeforeCursor.startsWith("/")) {
+		// Slash commands are explicit user intent. Keep them available for both
+		// natural typing and an explicit Tab completion request.
+		if (textBeforeCursor.startsWith("/")) {
 			const spaceIndex = textBeforeCursor.indexOf(" ");
 
 			if (spaceIndex === -1) {

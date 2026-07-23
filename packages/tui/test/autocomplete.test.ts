@@ -56,6 +56,17 @@ const getSuggestions = (
 ) => provider.getSuggestions(lines, cursorLine, cursorCol, { signal: new AbortController().signal, force });
 
 describe("CombinedAutocompleteProvider", () => {
+	it("matches slash commands during explicit completion", async () => {
+		const provider = new CombinedAutocompleteProvider([{ name: "settings", description: "Open settings" }], "/tmp");
+		const result = await provider.getSuggestions(["/set"], 0, 4, {
+			signal: new AbortController().signal,
+			force: true,
+		});
+		assert.deepStrictEqual(
+			result?.items.map((item) => item.value),
+			["settings"],
+		);
+	});
 	describe("extractPathPrefix", () => {
 		it("extracts / from 'hey /' when forced", async () => {
 			const provider = new CombinedAutocompleteProvider([], "/tmp");
