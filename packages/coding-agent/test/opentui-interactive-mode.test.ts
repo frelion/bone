@@ -8,7 +8,12 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { getLastActiveConversation } from "../src/core/conversation-state.ts";
-import type { InteractiveSessionHostHooks, InteractiveSessionSummary } from "../src/core/interactive-session-host.ts";
+import type {
+	InteractiveSessionHostHooks,
+	InteractiveSessionSummary,
+	RuntimeEventEnvelope,
+	RuntimeStreamSnapshot,
+} from "../src/core/interactive-session-host.ts";
 import type { MemorySearchResult } from "../src/core/memory.ts";
 import type { PlanState } from "../src/core/plan-mode.ts";
 import type { QuestionAnswer, QuestionState } from "../src/core/question.ts";
@@ -182,6 +187,10 @@ class FakeHost implements OpenTUISessionHostContract {
 	readonly getSessionState = vi.fn((_sessionPath: string) => "cold" as const);
 	readonly getSessionPresentation = vi.fn((_sessionPath: string) => ({ state: "cold" as const }));
 	readonly getSessionSummaries = vi.fn(async (_paths: readonly string[]) => [] as InteractiveSessionSummary[]);
+	private readonly streamState = new WeakMap<
+		AgentSessionRuntime,
+		{ revision: number; liveEvents: AgentSessionEvent[]; liveEventRevisions: number[] }
+	>();
 
 	constructor(runtime: AgentSessionRuntime) {
 		this.current = runtime;
@@ -193,6 +202,40 @@ class FakeHost implements OpenTUISessionHostContract {
 
 	async prompt(runtime: AgentSessionRuntime, text: string, options?: PromptOptions): Promise<void> {
 		this.prompts.push({ runtime, text, options });
+	}
+
+	getRuntimeStreamSnapshot(runtime: AgentSessionRuntime): RuntimeStreamSnapshot {
+		const state = this.streamState.get(runtime) ?? { revision: 0, liveEvents: [], liveEventRevisions: [] };
+		return {
+			revision: state.revision,
+			generationId: undefined,
+			liveEvents: state.liveEvents.slice(),
+			liveEventEnvelopes: state.liveEvents.map((event, index) => ({
+				runtime,
+				revision: state.liveEventRevisions[index] ?? state.revision,
+				generationId: undefined,
+				event,
+			})),
+		};
+	}
+
+	subscribeRuntime(runtime: AgentSessionRuntime, listener: (envelope: RuntimeEventEnvelope) => void): () => void {
+		const state = this.streamState.get(runtime) ?? { revision: 0, liveEvents: [], liveEventRevisions: [] };
+		this.streamState.set(runtime, state);
+		return runtime.session.subscribe((event) => {
+			state.revision++;
+			if (event.type === "agent_start") {
+				state.liveEvents = [];
+				state.liveEventRevisions = [];
+			}
+			state.liveEvents.push(event);
+			state.liveEventRevisions.push(state.revision);
+			listener({ runtime, revision: state.revision, generationId: undefined, event });
+			if (event.type === "agent_settled") {
+				state.liveEvents = [];
+				state.liveEventRevisions = [];
+			}
+		});
 	}
 }
 
@@ -260,6 +303,26 @@ describe("OpenTUIInteractiveMode", () => {
 		await vi.waitFor(() => expect(host.disposeAll).toHaveBeenCalledOnce());
 	});
 
+	test("keeps the composer focused when clicking the transcript", async () => {
+		const session = createRuntime([entry(userMessage("earlier prompt"), "one")]);
+		const host = new FakeHost(session.runtime);
+		const renderer = await createBoneTestRenderer({ width: 90, height: 24 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+
+		await mode.init();
+		await settle(renderer);
+		await renderer.mouse.click(60, 6);
+		await renderer.input.typeText("draft after transcript click");
+		await settle(renderer);
+
+		expect(renderer.captureFrame()).toContain("draft after transcript click");
+		mode.stop();
+	});
+
 	test("updates streaming assistant and tool output without rebuilding the shell", async () => {
 		const session = createRuntime();
 		const host = new FakeHost(session.runtime);
@@ -315,6 +378,56 @@ describe("OpenTUIInteractiveMode", () => {
 		frame = renderer.captureFrame();
 		expect(frame).toContain("read · complete");
 		expect(frame).toContain("final chunk");
+		mode.stop();
+	});
+
+	test("replays runtime events emitted while transcript history is loading", async () => {
+		const active = createRuntime([entry(userMessage("earlier prompt"), "one")]);
+		const host = new FakeHost(active.runtime);
+		const renderer = await createBoneTestRenderer({ width: 90, height: 24 });
+		const transcriptFactory = new OpenTUITranscriptFactory();
+		const handleEvent = vi.spyOn(transcriptFactory, "handleEvent");
+		let releaseBinding!: () => void;
+		const bindingReady = new Promise<void>((resolve) => {
+			releaseBinding = resolve;
+		});
+		active.session.bindExtensions = async () => await bindingReady;
+		let releaseHistory!: () => void;
+		const historyReady = new Promise<void>((resolve) => {
+			releaseHistory = resolve;
+		});
+		const createSessionEntries = vi
+			.spyOn(transcriptFactory, "createSessionEntries")
+			.mockImplementation(async (entries) => {
+				await historyReady;
+				return await new OpenTUITranscriptFactory().createSessionEntries(entries);
+			});
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			createTranscriptFactory: () => transcriptFactory,
+			installSignalHandlers: false,
+		});
+
+		const initPromise = mode.init();
+		await vi.waitFor(() => expect(active.listenerCount()).toBe(1));
+		const partial = assistantMessage("partial answer");
+		active.emit({ type: "agent_start" });
+		active.emit({ type: "message_start", message: partial });
+		active.emit({
+			type: "message_update",
+			message: partial,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "partial answer", partial },
+		});
+		releaseBinding();
+		await vi.waitFor(() => expect(createSessionEntries).toHaveBeenCalled());
+		active.emit({ type: "agent_settled" });
+		releaseHistory();
+		await initPromise;
+		await mode.idle();
+		await settle(renderer);
+
+		expect(handleEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "message_update" }));
 		mode.stop();
 	});
 
@@ -443,8 +556,12 @@ describe("OpenTUIInteractiveMode", () => {
 		expect(renderer.captureFrame()).toContain("Indexed result");
 
 		renderer.input.pressEscape();
+		await settle(renderer);
+		expect(renderer.captureFrame()).toContain("Indexed result");
 		renderer.input.pressKey("d");
-		renderer.input.pressEnter();
+		await settle(renderer);
+		expect(renderer.captureFrame()).toContain("Press d again to delete");
+		renderer.input.pressKey("d");
 		await settle(renderer);
 		expect(host.deleteSession).toHaveBeenCalledWith(indexed.path, visible.path);
 		expect(memory.removeSession).toHaveBeenCalledWith(indexed.path);

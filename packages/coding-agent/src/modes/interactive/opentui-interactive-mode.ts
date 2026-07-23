@@ -6,7 +6,12 @@ import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import { rememberLastActiveConversation } from "../../core/conversation-state.ts";
 import type { ExtensionUIV2Context } from "../../core/extensions/ui-v2.ts";
 import { FooterDataProvider } from "../../core/footer-data-provider.ts";
-import type { InteractiveSessionHostHooks, InteractiveSessionSummary } from "../../core/interactive-session-host.ts";
+import type {
+	InteractiveSessionHostHooks,
+	InteractiveSessionSummary,
+	RuntimeEventEnvelope,
+	RuntimeStreamSnapshot,
+} from "../../core/interactive-session-host.ts";
 import type { LocalEmbeddingStatus } from "../../core/local-embedding.ts";
 import { MemoryRuntime } from "../../core/memory.ts";
 import type { PlanProposal } from "../../core/plan-mode.ts";
@@ -68,6 +73,9 @@ export interface OpenTUISessionHostContract {
 		"state" | "livePreview" | "throughputTokensPerSecond" | "messageCount" | "modified"
 	>;
 	getSessionSummaries(paths: readonly string[]): Promise<InteractiveSessionSummary[]>;
+	getRuntimeStreamSnapshot?(runtime: AgentSessionRuntime): RuntimeStreamSnapshot;
+	subscribeRuntime?(runtime: AgentSessionRuntime, listener: (envelope: RuntimeEventEnvelope) => void): () => void;
+	refreshForeground?(task: (runtime: AgentSessionRuntime) => Promise<void>): Promise<void>;
 	disposeAll(): Promise<void>;
 }
 
@@ -155,6 +163,7 @@ export class OpenTUIInteractiveMode {
 	private initialized = false;
 	private stopping = false;
 	private cleanupPromise: Promise<void> | undefined;
+	private renderTail: Promise<void> = Promise.resolve();
 	private resolveShutdown: (() => void) | undefined;
 	private readonly shutdown = new Promise<void>((resolve) => {
 		this.resolveShutdown = resolve;
@@ -267,7 +276,6 @@ export class OpenTUIInteractiveMode {
 		this.shell.onTranscriptContentChange = () => {
 			if (this.transcriptFocus?.isAutoFollowing()) this.transcriptFocus.followLatest();
 		};
-		this.paneFocus.register("transcript", this.transcriptFocus.toPane());
 		this.paneFocus.register("sidebar", {
 			node: sidebarNode,
 			handleKey: (event) => this.sidebar?.handleKey(event) ?? false,
@@ -307,7 +315,10 @@ export class OpenTUIInteractiveMode {
 			}
 		});
 
-		this.shell.onTranscriptFocusRequest = () => this.paneFocus?.focus("transcript");
+		// The transcript is a reading surface, not a separate input mode. A click
+		// there must leave the composer ready for immediate typing.
+		this.shell.onTranscriptFocusRequest = () => this.paneFocus?.focus("composer");
+		this.sidebar.onFocusRequest = () => this.paneFocus?.focus("sidebar");
 		this.sidebar.onFocusChat = () => this.paneFocus?.focus("composer");
 		this.sidebar.onScrollChat = (direction) => this.shell?.scrollTranscript(direction === "up" ? -10 : 10);
 		this.sidebar.onActivateSession = (path) => void this.runAction(() => this.sessionHost.activate(path));
@@ -365,8 +376,25 @@ export class OpenTUIInteractiveMode {
 
 	private async bindForeground(runtime: AgentSessionRuntime): Promise<void> {
 		if (!this.shell || !this.renderer) return;
-		await this.unbindForeground();
 		const generation = this.foregroundGeneration;
+		let replaying = true;
+		let snapshotRevision = 0;
+		let fallbackRevision = 0;
+		const pendingEvents: RuntimeEventEnvelope[] = [];
+		const enqueueEvent = (envelope: RuntimeEventEnvelope) => {
+			if (replaying) {
+				pendingEvents.push(envelope);
+				return;
+			}
+			if (envelope.revision <= snapshotRevision) return;
+			snapshotRevision = envelope.revision;
+			this.queueSessionEvent(runtime, envelope.event, generation);
+		};
+		this.unsubscribeSession = this.sessionHost.subscribeRuntime
+			? this.sessionHost.subscribeRuntime(runtime, enqueueEvent)
+			: runtime.session.subscribe((event) =>
+					enqueueEvent({ runtime, revision: ++fallbackRevision, generationId: undefined, event }),
+				);
 		this.shell.clearTranscript();
 		const history: string[] = [];
 		for (const entry of runtime.session.sessionManager.getEntries()) {
@@ -418,16 +446,52 @@ export class OpenTUIInteractiveMode {
 			this.options.autocompleteProvider ?? this.commandRouter.createAutocompleteProvider(runtime.cwd),
 		);
 		this.composer?.updateStatus(this.getComposerStatus(runtime));
-		await this.renderTranscript(runtime);
-		this.unsubscribeSession = runtime.session.subscribe((event) => {
-			this.eventTail = this.eventTail
-				.then(async () => this.handleSessionEvent(runtime, event))
-				.catch((error: unknown) => this.showInteractionError(error));
-		});
+		const historySnapshot = await this.renderTranscript(
+			runtime,
+			generation,
+			() =>
+				this.sessionHost.getRuntimeStreamSnapshot?.(runtime) ?? {
+					revision: fallbackRevision,
+					generationId: undefined,
+					liveEvents: [],
+					liveEventEnvelopes: [],
+				},
+		);
+		if (!this.isCurrentForeground(runtime, generation)) return;
+		// Read again after history rendering. Persistence acknowledgements may have
+		// removed events that are now represented by durable SessionEntries.
+		const replaySnapshot = this.sessionHost.getRuntimeStreamSnapshot?.(runtime) ?? {
+			revision: fallbackRevision,
+			generationId: undefined,
+			liveEvents: [],
+			liveEventEnvelopes: [],
+		};
+		const replayEnvelopes = [
+			...historySnapshot.liveEventEnvelopes,
+			...replaySnapshot.liveEventEnvelopes,
+			...pendingEvents.filter((envelope) => envelope.revision > historySnapshot.revision),
+		].sort((left, right) => left.revision - right.revision);
+		const replayedRevisions = new Set<number>();
+		for (const envelope of replayEnvelopes) {
+			if (replayedRevisions.has(envelope.revision)) continue;
+			replayedRevisions.add(envelope.revision);
+			await this.handleSessionEvent(runtime, envelope.event, generation);
+		}
+		if (replayEnvelopes.length === 0 && historySnapshot.liveEvents.length === 0) {
+			for (const event of replaySnapshot.liveEvents) await this.handleSessionEvent(runtime, event, generation);
+		}
+		snapshotRevision = Math.max(replaySnapshot.revision, ...pendingEvents.map((envelope) => envelope.revision));
+		replaying = false;
 		this.renderer.requestRender();
 		this.topBar?.update(this.getTopBarState(runtime));
 		this.rememberActiveConversation(runtime);
 		if (this.initialized) this.schedulePendingInteractions(runtime, generation);
+	}
+
+	private queueSessionEvent(runtime: AgentSessionRuntime, event: AgentSessionEvent, generation: number): void {
+		this.eventTail = this.eventTail
+			.then(async () => this.handleSessionEvent(runtime, event, generation))
+			.catch((error: unknown) => this.showInteractionError(error));
 	}
 
 	private async unbindForeground(runtime?: AgentSessionRuntime): Promise<void> {
@@ -479,43 +543,65 @@ export class OpenTUIInteractiveMode {
 		};
 	}
 
-	private async renderTranscript(runtime: AgentSessionRuntime): Promise<void> {
-		if (!this.shell) return;
-		this.shell.clearTranscript();
-		this.welcome = undefined;
-		this.transcriptFactory =
-			this.options.createTranscriptFactory?.() ??
-			new OpenTUITranscriptFactory({
-				showImages: runtime.services.settingsManager?.getShowImages?.() ?? true,
-				hideThinkingBlock: runtime.services.settingsManager?.getHideThinkingBlock?.() ?? false,
-			});
-		this.transcriptFactory.setResolvers({
-			cwd: runtime.cwd,
-			getToolRenderer: (name) =>
-				this.extensionBinding?.getToolRenderer?.(name) ?? runtime.session.getToolDefinition?.(name)?.renderV2,
-			getMessageView: (type) => runtime.session.extensionRunner.getMessageView(type),
-			getEntryView: (type) => runtime.session.extensionRunner.getEntryView(type),
-			onError: (error, surface) => {
-				const message = error instanceof Error ? error.message : String(error);
-				runtime.session.extensionRunner.emitError({
-					extensionPath: "<ui-renderer>",
-					event: surface,
-					error: message,
-					stack: error instanceof Error ? error.stack : undefined,
-				});
+	private async renderTranscript(
+		runtime: AgentSessionRuntime,
+		generation = this.foregroundGeneration,
+		readSnapshot: () => RuntimeStreamSnapshot = () =>
+			this.sessionHost.getRuntimeStreamSnapshot?.(runtime) ?? {
+				revision: 0,
+				generationId: undefined,
+				liveEvents: [],
+				liveEventEnvelopes: [],
 			},
-		});
-		this.transcriptFactory.setAllToolDetailsExpanded(this.allToolDetailsExpanded);
-		const entries = runtime.session.sessionManager.getEntries();
-		for (const item of await this.transcriptFactory.createSessionEntries(entries))
-			this.shell.appendTranscript(item.view);
-		const hasConversationMessages = entries.some(
-			(entry) => entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant"),
-		);
-		if (!hasConversationMessages) {
-			this.welcome = new OpenTUIWelcome({ workspace: runtime.cwd });
-			this.shell.appendTranscript(this.welcome);
-		}
+	): Promise<RuntimeStreamSnapshot> {
+		let historySnapshot = readSnapshot();
+		const render = this.renderTail
+			.catch(() => {})
+			.then(async () => {
+				if (!this.shell || !this.isCurrentForeground(runtime, generation)) return;
+				const transcriptFactory =
+					this.options.createTranscriptFactory?.() ??
+					new OpenTUITranscriptFactory({
+						showImages: runtime.services.settingsManager?.getShowImages?.() ?? true,
+						hideThinkingBlock: runtime.services.settingsManager?.getHideThinkingBlock?.() ?? false,
+					});
+				transcriptFactory.setResolvers({
+					cwd: runtime.cwd,
+					getToolRenderer: (name) =>
+						this.extensionBinding?.getToolRenderer?.(name) ?? runtime.session.getToolDefinition?.(name)?.renderV2,
+					getMessageView: (type) => runtime.session.extensionRunner.getMessageView(type),
+					getEntryView: (type) => runtime.session.extensionRunner.getEntryView(type),
+					onError: (error, surface) => {
+						const message = error instanceof Error ? error.message : String(error);
+						runtime.session.extensionRunner.emitError({
+							extensionPath: "<ui-renderer>",
+							event: surface,
+							error: message,
+							stack: error instanceof Error ? error.stack : undefined,
+						});
+					},
+				});
+				transcriptFactory.setAllToolDetailsExpanded(this.allToolDetailsExpanded);
+				historySnapshot = readSnapshot();
+				const entries = runtime.session.sessionManager.getEntries();
+				const items = await transcriptFactory.createSessionEntries(entries);
+				if (!this.shell || !this.isCurrentForeground(runtime, generation)) return;
+				this.shell.clearTranscript();
+				this.welcome = undefined;
+				this.transcriptFactory = transcriptFactory;
+				for (const item of items) this.shell.appendTranscript(item.view);
+				const hasConversationMessages = entries.some(
+					(entry) =>
+						entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant"),
+				);
+				if (!hasConversationMessages) {
+					this.welcome = new OpenTUIWelcome({ workspace: runtime.cwd });
+					this.shell.appendTranscript(this.welcome);
+				}
+			});
+		this.renderTail = render;
+		await render;
+		return historySnapshot;
 	}
 
 	private async refreshPresentation(): Promise<void> {
@@ -525,12 +611,23 @@ export class OpenTUIInteractiveMode {
 		this.status?.updateTheme(theme);
 		this.topBar?.updateTheme(theme);
 		this.topBar?.update(this.getTopBarState(this.sessionHost.current));
-		await this.renderTranscript(this.sessionHost.current);
+		const runtime = this.sessionHost.current;
+		const rebind = async (target: AgentSessionRuntime) => {
+			if (target !== this.sessionHost.current || this.stopping) return;
+			await this.unbindForeground(target);
+			await this.bindForeground(target);
+		};
+		if (this.sessionHost.refreshForeground) await this.sessionHost.refreshForeground(rebind);
+		else await rebind(runtime);
 		this.renderer?.requestRender();
 	}
 
-	private async handleSessionEvent(runtime: AgentSessionRuntime, event: AgentSessionEvent): Promise<void> {
-		if (runtime !== this.sessionHost.current || !this.shell) return;
+	private async handleSessionEvent(
+		runtime: AgentSessionRuntime,
+		event: AgentSessionEvent,
+		generation = this.foregroundGeneration,
+	): Promise<void> {
+		if (!this.isCurrentForeground(runtime, generation) || !this.shell) return;
 		if (event.type === "message_start" && event.message.role === "user") {
 			this.welcome?.dismiss();
 			this.welcome = undefined;

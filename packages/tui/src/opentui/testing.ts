@@ -77,6 +77,7 @@ export async function createBoneTestRenderer(
 		clearOnShutdown: options.clearOnShutdown ?? true,
 		targetFps: options.targetFps ?? 60,
 		backgroundColor: options.backgroundColor,
+		autoFocus: false,
 	});
 	return new BoneTestRendererImpl(setup);
 }

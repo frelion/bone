@@ -176,6 +176,22 @@ describe("OpenTUI Bone renderer", () => {
 		assert.ok(renderer.captureCursor().x >= 0);
 	});
 
+	it("keeps native input focus under explicit application control after unrelated clicks", async () => {
+		const renderer = await createRenderer(32, 8);
+		const editor = renderer.createTextarea({ width: 24, height: 1 });
+		const clickableSurface = renderer.createBox({ width: 24, height: 3, focusable: true });
+		clickableSurface.append(renderer.createText({ content: "transcript surface" }));
+		renderer.content.append(clickableSurface);
+		renderer.content.append(editor);
+		renderer.focus(editor);
+		await renderer.flush();
+
+		await renderer.mouse.click(2, 1);
+		await renderer.input.typeText("still editing");
+
+		assert.equal(editor.value, "still editing");
+	});
+
 	it("supports single-line input events, limits, cancellation, and custom keybindings", async () => {
 		const renderer = await createRenderer();
 		const inputs: string[] = [];

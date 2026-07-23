@@ -16,6 +16,7 @@ import { assistantMsg, userMsg } from "./utilities.ts";
 
 type SessionInternals = {
 	_emit(event: AgentSessionEvent): void;
+	_emitPersistedEntries(entries: readonly SessionEntry[]): Promise<void>;
 	_emitAgentSettled(): Promise<void>;
 	_isAgentRunActive: boolean;
 };
@@ -25,6 +26,10 @@ function createPersistedSession(cwd: string, text: string): SessionManager {
 	sessionManager.appendMessage(userMsg(text));
 	sessionManager.appendMessage(assistantMsg(`${text} response`));
 	return sessionManager;
+}
+
+function messageEntry(message: AgentMessage, id: string): SessionEntry {
+	return { type: "message", id, parentId: null, timestamp: new Date(0).toISOString(), message };
 }
 
 describe("InteractiveSessionHost", () => {
@@ -330,6 +335,12 @@ describe("InteractiveSessionHost", () => {
 		getEntries.mockClear();
 		const internals = runtime.session as unknown as SessionInternals;
 		const partial = assistantMsg("Streaming answer");
+		const streamedEvents: AgentSessionEvent[] = [];
+		const revisions: number[] = [];
+		host.subscribeRuntime(runtime, (envelope) => {
+			streamedEvents.push(envelope.event);
+			revisions.push(envelope.revision);
+		});
 
 		internals._emit({ type: "agent_start" });
 		expect(stateChanged).toHaveBeenCalledOnce();
@@ -351,9 +362,34 @@ describe("InteractiveSessionHost", () => {
 			messageCount: 3,
 		});
 		expect(host.getSessionPresentation(sessionPath).throughputTokensPerSecond).toBeGreaterThan(0);
+		const snapshot = host.getRuntimeStreamSnapshot(runtime);
+		expect(snapshot.liveEvents.map((event) => event.type)).toEqual([
+			"agent_start",
+			"message_start",
+			"message_update",
+		]);
+		expect(revisions).toEqual([1, 2, 3]);
+		expect(streamedEvents).toHaveLength(3);
+		const content = partial.content.find((part) => part.type === "text");
+		if (content?.type === "text") content.text = "mutated after emission";
+		const replayedUpdate = host
+			.getRuntimeStreamSnapshot(runtime)
+			.liveEvents.find((event) => event.type === "message_update");
+		const replayedText =
+			replayedUpdate?.type === "message_update"
+				? replayedUpdate.assistantMessageEvent.partial.content
+						.filter((part) => part.type === "text")
+						.map((part) => part.text)
+						.join("")
+				: "";
+		expect(replayedText).toBe("Streaming answer");
+		await internals._emitPersistedEntries([messageEntry(partial, "streamed-message")]);
+		expect(host.getRuntimeStreamSnapshot(runtime).liveEvents.map((event) => event.type)).toEqual(["agent_start"]);
 
 		internals._emit({ type: "agent_end", messages: [], willRetry: false });
 		expect(host.getSessionPresentation(sessionPath).throughputTokensPerSecond).toBeUndefined();
+		internals._emit({ type: "agent_settled" });
+		expect(host.getRuntimeStreamSnapshot(runtime).liveEvents).toEqual([]);
 		await host.disposeAll();
 		vi.useRealTimers();
 	});

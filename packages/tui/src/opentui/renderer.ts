@@ -313,6 +313,9 @@ export async function createBoneRenderer(options: BoneRendererOptions = {}): Pro
 		clearOnShutdown: options.clearOnShutdown ?? true,
 		targetFps: options.targetFps ?? 60,
 		backgroundColor: options.backgroundColor,
+		// Application focus must be explicit. Otherwise a clicked scroll view or
+		// container can silently steal text input from the active editor.
+		autoFocus: false,
 	});
 	return new BoneRendererImpl(renderer);
 }

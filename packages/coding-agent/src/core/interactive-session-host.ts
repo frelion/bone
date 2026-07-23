@@ -30,6 +30,20 @@ export interface InteractiveSessionPresentation {
 
 export type InteractiveSessionDeletionResult = { method: SessionTrashMethod } | { method: "discarded" };
 
+export interface RuntimeEventEnvelope {
+	runtime: AgentSessionRuntime;
+	revision: number;
+	generationId: string | undefined;
+	event: AgentSessionEvent;
+}
+
+export interface RuntimeStreamSnapshot {
+	revision: number;
+	generationId: string | undefined;
+	liveEvents: readonly AgentSessionEvent[];
+	liveEventEnvelopes: readonly RuntimeEventEnvelope[];
+}
+
 interface RuntimeSlot {
 	runtime: AgentSessionRuntime;
 	state: Exclude<InteractiveSessionState, "cold">;
@@ -44,6 +58,11 @@ interface RuntimeSlot {
 	modified: Date;
 	generationStartedAt: number | undefined;
 	streamedCharacters: number;
+	revision: number;
+	generationId: string | undefined;
+	liveEvents: AgentSessionEvent[];
+	liveEventRevisions: number[];
+	streamListeners: Set<(envelope: RuntimeEventEnvelope) => void>;
 }
 
 function extractText(content: unknown): string {
@@ -68,6 +87,37 @@ function normalizeLivePreview(text: string): string {
 		.replace(/[\r\n\t]+/g, " ")
 		.replace(/\s+/g, " ")
 		.trim();
+}
+
+/** Agent events contain mutable partial messages; replay must capture their value at emission time. */
+function cloneAgentSessionEvent(event: AgentSessionEvent): AgentSessionEvent {
+	if (typeof structuredClone === "function") {
+		try {
+			return structuredClone(event);
+		} catch {
+			// Extension-defined event payloads can contain values structuredClone rejects.
+		}
+	}
+	const clone = (value: unknown): unknown => {
+		if (value === null || typeof value !== "object") return value;
+		if (value instanceof Date) return new Date(value);
+		if (Array.isArray(value)) return value.map(clone);
+		return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, clone(item)]));
+	};
+	return clone(event) as AgentSessionEvent;
+}
+
+function messageReplayKey(message: AgentMessage): string {
+	const toolCallId = "toolCallId" in message && typeof message.toolCallId === "string" ? message.toolCallId : "";
+	return `${message.role}:${message.timestamp}:${toolCallId}`;
+}
+
+function messageContentSignature(message: AgentMessage): string {
+	try {
+		return JSON.stringify("content" in message ? message.content : message);
+	} catch {
+		return String("content" in message ? message.content : message);
+	}
 }
 
 export interface InteractiveSessionHostHooks {
@@ -288,6 +338,32 @@ export class InteractiveSessionHost {
 		};
 	}
 
+	/** Read the non-durable stream currently held by a live runtime. */
+	getRuntimeStreamSnapshot(runtime: AgentSessionRuntime): RuntimeStreamSnapshot {
+		const slot = this.findRuntimeSlot(runtime);
+		if (!slot) return { revision: 0, generationId: undefined, liveEvents: [], liveEventEnvelopes: [] };
+		const liveEventEnvelopes = slot.liveEvents.map((event, index) => ({
+			runtime: slot.runtime,
+			revision: slot.liveEventRevisions[index] ?? slot.revision,
+			generationId: slot.generationId,
+			event: cloneAgentSessionEvent(event),
+		}));
+		return {
+			revision: slot.revision,
+			generationId: slot.generationId,
+			liveEvents: liveEventEnvelopes.map(({ event }) => event),
+			liveEventEnvelopes,
+		};
+	}
+
+	/** Subscribe to a runtime's ordered event stream. This remains attached while the runtime is backgrounded. */
+	subscribeRuntime(runtime: AgentSessionRuntime, listener: (envelope: RuntimeEventEnvelope) => void): () => void {
+		const slot = this.findRuntimeSlot(runtime);
+		if (!slot) return () => {};
+		slot.streamListeners.add(listener);
+		return () => slot.streamListeners.delete(listener);
+	}
+
 	async getSessionSummaries(paths: readonly string[]): Promise<InteractiveSessionSummary[]> {
 		const currentPath = this.getSessionPath(this.current);
 		const summaries = await Promise.all(paths.map(async (path) => await SessionManager.getInfo(path)));
@@ -318,6 +394,11 @@ export class InteractiveSessionHost {
 	/** Wait until currently queued lifecycle transitions have completed. */
 	async waitForTransitions(): Promise<void> {
 		await this.transition;
+	}
+
+	/** Run a foreground UI rebind inside the same queue as session activation. */
+	async refreshForeground(task: (runtime: AgentSessionRuntime) => Promise<void>): Promise<void> {
+		return this.enqueue(async () => await task(this.foreground.runtime));
 	}
 
 	/**
@@ -361,6 +442,11 @@ export class InteractiveSessionHost {
 						: new Date(),
 			generationStartedAt: runtime.session.isStreaming ? Date.now() : undefined,
 			streamedCharacters: 0,
+			revision: 0,
+			generationId: undefined,
+			liveEvents: [],
+			liveEventRevisions: [],
+			streamListeners: new Set(),
 		};
 		const subscribe = () =>
 			runtime.session.subscribe((event) => {
@@ -368,6 +454,7 @@ export class InteractiveSessionHost {
 			});
 		slot.unsubscribe = subscribe();
 		slot.unsubscribePersistedEntries = runtime.session.subscribePersistedEntries(async (entries) => {
+			this.reconcilePersistedEntries(slot, entries);
 			await this.hooks.persistedEntries?.(runtime, entries);
 		});
 		slot.unsubscribeRunCompleted = runtime.session.subscribeRunCompleted(async (messages) => {
@@ -387,8 +474,82 @@ export class InteractiveSessionHost {
 		return slot;
 	}
 
+	private reconcilePersistedEntries(slot: RuntimeSlot, entries: readonly SessionEntry[]): void {
+		for (const entry of entries) {
+			if (entry.type !== "message") continue;
+			const persistedKey = messageReplayKey(entry.message);
+			const completedToolCallId =
+				entry.message.role === "toolResult" && "toolCallId" in entry.message ? entry.message.toolCallId : undefined;
+			const matchingEndIndex = slot.liveEvents.findIndex(
+				(event) =>
+					event.type === "message_end" &&
+					messageReplayKey(event.message) === persistedKey &&
+					messageContentSignature(event.message) === messageContentSignature(entry.message),
+			);
+			const removeMessageRange = matchingEndIndex >= 0;
+			let matchingStartIndex = -1;
+			if (removeMessageRange) {
+				for (let index = matchingEndIndex - 1; index >= 0; index--) {
+					const event = slot.liveEvents[index];
+					if (event.type === "message_start" && messageReplayKey(event.message) === persistedKey) {
+						matchingStartIndex = index;
+						break;
+					}
+				}
+			}
+			const rangeStart = matchingStartIndex >= 0 ? matchingStartIndex : matchingEndIndex;
+			const retainedEvents: AgentSessionEvent[] = [];
+			const retainedRevisions: number[] = [];
+			for (const [index, event] of slot.liveEvents.entries()) {
+				let keep = true;
+				if (removeMessageRange && index >= rangeStart && index <= matchingEndIndex) {
+					keep = false;
+				}
+				if (keep && (event.type === "message_start" || event.type === "message_end")) {
+					if (!removeMessageRange && messageReplayKey(event.message) === persistedKey) keep = false;
+				}
+				if (keep && event.type === "message_update") {
+					if (!removeMessageRange && messageReplayKey(event.message) === persistedKey) keep = false;
+				}
+				if (
+					keep &&
+					completedToolCallId &&
+					(event.type === "tool_execution_start" ||
+						event.type === "tool_execution_update" ||
+						event.type === "tool_execution_end")
+				) {
+					if (event.toolCallId === completedToolCallId) keep = false;
+				}
+				if (keep) {
+					retainedEvents.push(event);
+					retainedRevisions.push(slot.liveEventRevisions[index] ?? slot.revision);
+				}
+			}
+			slot.liveEvents = retainedEvents;
+			slot.liveEventRevisions = retainedRevisions;
+		}
+	}
+
 	private handleRuntimeEvent(slot: RuntimeSlot, event: AgentSessionEvent): void {
 		const now = Date.now();
+		if (event.type === "agent_start") {
+			slot.generationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+			slot.liveEvents = [];
+			slot.liveEventRevisions = [];
+		}
+		slot.revision++;
+		const eventSnapshot = cloneAgentSessionEvent(event);
+		if (slot.generationId !== undefined) {
+			slot.liveEvents.push(eventSnapshot);
+			slot.liveEventRevisions.push(slot.revision);
+		}
+		const envelope: RuntimeEventEnvelope = {
+			runtime: slot.runtime,
+			revision: slot.revision,
+			generationId: slot.generationId,
+			event: eventSnapshot,
+		};
+		for (const listener of slot.streamListeners) listener(envelope);
 		if (event.type === "agent_start") {
 			slot.generationStartedAt = now;
 			slot.streamedCharacters = 0;
@@ -421,6 +582,11 @@ export class InteractiveSessionHost {
 			slot.generationStartedAt = undefined;
 			slot.modified = new Date(now);
 			this.publishPresentation(slot, true);
+		}
+		if (event.type === "agent_settled") {
+			slot.liveEvents = [];
+			slot.liveEventRevisions = [];
+			slot.generationId = undefined;
 		}
 		if (slot.state === "background-running" && event.type === "agent_settled") {
 			this.scheduleBackgroundSuspend(slot);

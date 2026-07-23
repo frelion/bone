@@ -200,7 +200,9 @@ describe("OpenTUI session sidebar", () => {
 		const sidebarNode = shell.setSidebar(sidebar);
 		if (!sidebarNode) throw new Error("Expected sidebar node");
 		const activate = vi.fn();
+		const focusChat = vi.fn();
 		sidebar.onActivateSession = activate;
+		sidebar.onFocusChat = focusChat;
 		sidebar.setSessions([makeSession("a", "foreground"), makeSession("b", "cold")]);
 		for (let index = 0; index < 30; index++) shell.appendTranscript(lineView(`transcript-${index}`));
 
@@ -219,6 +221,7 @@ describe("OpenTUI session sidebar", () => {
 
 		await renderer.mouse.click(5, 7);
 		expect(activate).toHaveBeenCalledWith("/sessions/b.jsonl");
+		expect(focusChat).toHaveBeenCalledOnce();
 
 		await renderer.mouse.click(50, 8);
 		expect(focus.focusedPane).toBe("history");
@@ -260,7 +263,7 @@ describe("OpenTUI session sidebar", () => {
 		expect(frame.indexOf("Session older")).toBeLessThan(frame.indexOf("Session newer"));
 	});
 
-	test("renders live throughput in a fixed column and advances long visible previews at 4 FPS", async () => {
+	test("renders live throughput and keeps a running preview pinned to its newest output", async () => {
 		const renderer = await createBoneTestRenderer({ width: 100, height: 18 });
 		renderers.add(renderer);
 		renderer.start();
@@ -276,17 +279,25 @@ describe("OpenTUI session sidebar", () => {
 			}),
 		]);
 
-		const before = await flushUntil(renderer, "12.3 tok/s");
-		await new Promise((resolve) =>
-			setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs * (OPEN_TUI_LAYOUT.marqueeEdgePauseFrames + 1) + 40),
-		);
+		await flushUntil(renderer, "12.3 tok/s");
+		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs + 40));
+		await renderer.flush();
+		expect(renderer.captureFrame()).toContain("keeps moving");
+
+		sidebar.setSessions([
+			makeSession("live", "background-running", {
+				livePreview: `${preview} with newest streamed tokens`,
+				throughputTokensPerSecond: 12.34,
+			}),
+		]);
+		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs + 40));
 		await renderer.flush();
 		const after = renderer.captureFrame();
-		expect(after).toContain("12.3 tok/s");
-		expect(after).not.toBe(before);
+		expect(after).toContain("newest streamed tokens");
+		expect(after).not.toContain("This is a deliberately");
 	});
 
-	test("marquees previews that overflow their measured width below the old length threshold", async () => {
+	test("uses measured preview width and never loops old output back into a running conversation", async () => {
 		const renderer = await createBoneTestRenderer({ width: 100, height: 18 });
 		renderers.add(renderer);
 		renderer.start();
@@ -301,14 +312,13 @@ describe("OpenTUI session sidebar", () => {
 			}),
 		]);
 
-		const before = await flushUntil(renderer, "12.3 tok/s");
-		await new Promise((resolve) =>
-			setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs * (OPEN_TUI_LAYOUT.marqueeEdgePauseFrames + 1) + 40),
-		);
+		await flushUntil(renderer, "12.3 tok/s");
+		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs + 40));
 		await renderer.flush();
 		const after = renderer.captureFrame();
 		expect(after).toContain("12.3 tok/s");
-		expect(after).not.toBe(before);
+		expect(after).toContain("PQRSTUV");
+		expect(after).not.toContain("ABCDEF");
 
 		sidebar.dispose();
 		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs + 40));
@@ -316,44 +326,7 @@ describe("OpenTUI session sidebar", () => {
 		expect(renderer.captureFrame()).toBe(after);
 	});
 
-	test("pauses marquee under a hidden sidebar ancestor and resumes when compact sidebar returns", async () => {
-		const renderer = await createBoneTestRenderer({ width: 100, height: 18 });
-		renderers.add(renderer);
-		renderer.start();
-		const shell = new OpenTUIInteractiveShell({ sidebarWidth: 38 });
-		renderer.mount(shell);
-		const sidebar = new OpenTUISessionSidebar();
-		shell.setSidebar(sidebar);
-		sidebar.setSessions([
-			makeSession("visibility", "background-running", {
-				livePreview: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
-				throughputTokensPerSecond: 12.34,
-			}),
-		]);
-
-		await flushUntil(renderer, "12.3 tok/s");
-		await new Promise((resolve) =>
-			setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs * (OPEN_TUI_LAYOUT.marqueeEdgePauseFrames + 1) + 40),
-		);
-		await renderer.flush();
-		expect(renderer.captureFrame()).toContain("BCDEFG");
-
-		renderer.resize(70, 18);
-		await renderer.flush();
-		expect(shell.layoutMode).toBe("single");
-		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs * 3));
-
-		shell.showPane("sidebar");
-		await renderer.flush();
-		expect(renderer.captureFrame()).toContain("BCDEFG");
-
-		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs + 40));
-		await renderer.flush();
-		expect(renderer.captureFrame()).toContain("CDEFG");
-		sidebar.dispose();
-	});
-
-	test("rotates emoji previews without splitting grapheme clusters", async () => {
+	test("keeps emoji output intact while following the latest preview tail", async () => {
 		const renderer = await createBoneTestRenderer({ width: 100, height: 18 });
 		renderers.add(renderer);
 		renderer.start();
@@ -369,12 +342,10 @@ describe("OpenTUI session sidebar", () => {
 		]);
 
 		await flushUntil(renderer, "12.3 tok/s");
-		await new Promise((resolve) =>
-			setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs * (OPEN_TUI_LAYOUT.marqueeEdgePauseFrames + 1) + 40),
-		);
+		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs + 40));
 		await renderer.flush();
 		const frame = renderer.captureFrame();
-		expect(frame).toContain("ABCDEFGHI");
+		expect(frame).toContain("TUVWXYZ");
 		expect(frame).not.toContain("�");
 		sidebar.dispose();
 	});

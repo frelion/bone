@@ -38,6 +38,22 @@ function normalizePreview(text: string): string {
 		.trim();
 }
 
+/** Keep a running conversation's preview anchored to its newest model output. */
+function latestPreviewWindow(text: string, width: number): string {
+	if (width <= 0 || visibleWidth(text) <= width) return text;
+	const graphemes = Array.from(graphemeSegmenter.segment(text), ({ segment }) => segment);
+	const tail: string[] = [];
+	let usedWidth = 0;
+	for (let index = graphemes.length - 1; index >= 0; index--) {
+		const grapheme = graphemes[index]!;
+		const graphemeWidth = visibleWidth(grapheme);
+		if (usedWidth + graphemeWidth > width) break;
+		tail.unshift(grapheme);
+		usedWidth += graphemeWidth;
+	}
+	return tail.join("");
+}
+
 function stateColor(state: InteractiveSessionSummary["state"]): ThemeColor {
 	if (state === "foreground") return "accent";
 	if (state === "background-running") return "warning";
@@ -69,9 +85,6 @@ function formatThroughput(tokensPerSecond: number | undefined): string {
 interface MarqueeEntry {
 	node: BoneTextNode;
 	text: string;
-	graphemes: string[];
-	offset: number;
-	pauseFrames: number;
 }
 
 /** Structured OpenTUI conversation sidebar with search and session actions. */
@@ -103,6 +116,7 @@ export class OpenTUISessionSidebar implements BoneView {
 	public onSearchQueryChange?: (query: string) => void;
 	public onSearchStateChange?: (active: boolean) => void;
 	public onFocusChat?: () => void;
+	public onFocusRequest?: () => void;
 	public onScrollChat?: (direction: "up" | "down") => void;
 	public onLoadMore?: () => void;
 	public onInterrupt?: () => void;
@@ -128,6 +142,7 @@ export class OpenTUISessionSidebar implements BoneView {
 			height: "100%",
 			flexDirection: "column",
 			focusable: true,
+			onMouseDown: () => this.onFocusRequest?.(),
 		});
 		this.rebuildChrome();
 		this.startMarquee();
@@ -287,7 +302,7 @@ export class OpenTUISessionSidebar implements BoneView {
 		}
 		if (matchesOpenTUIAction(event, "confirm")) {
 			const selected = this.getDisplayedSessions()[this.selectedIndex];
-			if (selected) this.onActivateSession?.(selected.path);
+			if (selected) this.activateSession(selected.path);
 			return consume(event);
 		}
 		if (matchesOpenTUIAction(event, "up")) {
@@ -335,7 +350,7 @@ export class OpenTUISessionSidebar implements BoneView {
 			const selected = this.getDisplayedSessions()[this.selectedIndex];
 			if (selected) {
 				this.stopSearch();
-				this.onActivateSession?.(selected.path);
+				this.activateSession(selected.path);
 			}
 			return consume(event);
 		}
@@ -356,6 +371,11 @@ export class OpenTUISessionSidebar implements BoneView {
 			return consume(event);
 		}
 		return false;
+	}
+
+	private activateSession(sessionPath: string): void {
+		this.onFocusChat?.();
+		this.onActivateSession?.(sessionPath);
 	}
 
 	private rebuildChrome(): void {
@@ -448,7 +468,6 @@ export class OpenTUISessionSidebar implements BoneView {
 		const context = this.context;
 		const list = this.list;
 		if (!context || !list) return;
-		const previousMarqueeEntries = new Map(this.marqueeEntries);
 		list.clear();
 		this.marqueeEntries.clear();
 		const sessions = this.getDisplayedSessions();
@@ -477,7 +496,7 @@ export class OpenTUISessionSidebar implements BoneView {
 				event.preventDefault();
 				event.stopPropagation();
 				if (this.searchActive) this.stopSearch();
-				this.onActivateSession?.(session.path);
+				this.activateSession(session.path);
 			};
 			const row = context.createBox({
 				width: "100%",
@@ -572,17 +591,9 @@ export class OpenTUISessionSidebar implements BoneView {
 				});
 				previewRow.append(previewNode);
 				if (session.state === "background-running") {
-					const graphemes = [
-						...Array.from(graphemeSegmenter.segment(previewText), ({ segment }) => segment),
-						...Array.from({ length: OPEN_TUI_LAYOUT.marqueeGap }, () => " "),
-					];
-					const previous = previousMarqueeEntries.get(session.path);
 					this.marqueeEntries.set(session.path, {
 						node: previewNode,
 						text: previewText,
-						graphemes,
-						offset: previous ? previous.offset % graphemes.length : 0,
-						pauseFrames: previous?.pauseFrames ?? OPEN_TUI_LAYOUT.marqueeEdgePauseFrames,
 					});
 				}
 			}
@@ -641,23 +652,8 @@ export class OpenTUISessionSidebar implements BoneView {
 				const previewTop = entry.node.screenY;
 				const previewBottom = previewTop + entry.node.height;
 				if (previewBottom <= viewportTop || previewTop >= viewportBottom) continue;
-				if (visibleWidth(entry.text) <= entry.node.width) {
-					if (entry.offset !== 0) {
-						entry.offset = 0;
-						entry.pauseFrames = OPEN_TUI_LAYOUT.marqueeEdgePauseFrames;
-						entry.node.content = entry.text;
-					}
-					continue;
-				}
-				if (entry.pauseFrames > 0) {
-					entry.pauseFrames--;
-					continue;
-				}
-				entry.offset = (entry.offset + 1) % entry.graphemes.length;
-				if (entry.offset === 0) entry.pauseFrames = OPEN_TUI_LAYOUT.marqueeEdgePauseFrames;
-				entry.node.content = `${entry.graphemes.slice(entry.offset).join("")}${entry.graphemes
-					.slice(0, entry.offset)
-					.join("")}`;
+				const latest = latestPreviewWindow(entry.text, entry.node.width);
+				if (entry.node.content !== latest) entry.node.content = latest;
 			}
 		}, OPEN_TUI_LAYOUT.marqueeIntervalMs);
 		this.marqueeTimer.unref?.();
