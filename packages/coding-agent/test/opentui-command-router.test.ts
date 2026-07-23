@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
@@ -131,15 +134,36 @@ describe("OpenTUICommandRouter", () => {
 		expect(setScopedModels).toHaveBeenCalledWith([{ model: first }, { model: second }]);
 	});
 
-	test("updates thinking from the settings dialog", async () => {
-		const setThinkingLevel = vi.fn();
+	test("opens the transactional settings center", async () => {
+		const root = mkdtempSync(join(tmpdir(), "bone-settings-center-"));
+		const replaceScope = vi.fn(async () => {});
 		const session = {
-			thinkingLevel: "off",
-			getAvailableThinkingLevels: () => ["off", "high"],
-			setThinkingLevel,
+			modelRuntime: {
+				getModelsJson: () => ({ providers: {} }),
+				reloadConfig: vi.fn(async () => {}),
+			},
 		} as unknown as AgentSession;
-		const runtime = { session, cwd: "/tmp" } as AgentSessionRuntime;
-		const select = vi.fn().mockResolvedValueOnce("thinking").mockResolvedValueOnce("high");
+		const runtime = {
+			session,
+			cwd: root,
+			services: {
+				agentDir: root,
+				settingsManager: {
+					getGlobalSettings: () => ({}),
+					getProjectSettings: () => ({}),
+					isProjectTrusted: () => true,
+					replaceScope,
+					reload: vi.fn(async () => {}),
+				},
+			},
+		} as unknown as AgentSessionRuntime;
+		const select = vi
+			.fn()
+			.mockResolvedValueOnce("Context & Delivery")
+			.mockResolvedValueOnce("hideThinkingBlock")
+			.mockResolvedValueOnce("true")
+			.mockResolvedValueOnce("back")
+			.mockResolvedValueOnce("save");
 		const ui = { available: true, dialogs: { select } } as unknown as ExtensionUIV2Context;
 		const router = new OpenTUICommandRouter({
 			host: { current: runtime, createNew: async () => {} },
@@ -149,7 +173,11 @@ describe("OpenTUICommandRouter", () => {
 			onQuit: vi.fn(),
 		});
 
-		await router.route("/settings");
-		expect(setThinkingLevel).toHaveBeenCalledWith("high");
+		try {
+			await router.route("/settings");
+			expect(replaceScope).toHaveBeenCalledWith("global", { hideThinkingBlock: true });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

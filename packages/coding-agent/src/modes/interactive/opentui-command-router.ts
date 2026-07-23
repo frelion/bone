@@ -11,7 +11,7 @@ import type { ExtensionUIV2Context } from "../../core/extensions/ui-v2.ts";
 import { BUILTIN_SLASH_COMMANDS, type BuiltinSlashCommand, type SlashCommandInfo } from "../../core/slash-commands.ts";
 import { getProjectTrustOptions, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { copyToClipboard } from "../../utils/clipboard.ts";
-import { getAvailableThemes, setTheme } from "./theme/theme.ts";
+import { OpenTUISettingsCenter } from "./components/opentui-settings-center.ts";
 
 export interface OpenTUICommandHost {
 	readonly current: AgentSessionRuntime;
@@ -183,22 +183,14 @@ export class OpenTUICommandRouter {
 
 	private async settings(): Promise<void> {
 		const ui = requireUI(this.options.getUI());
-		const selection = await ui.dialogs.select({
-			title: "Settings",
-			options: [
-				{ value: "model", label: "Model", description: "Select the active model" },
-				{ value: "scoped-models", label: "Scoped models", description: "Enable models in the cycling scope" },
-				{ value: "thinking", label: "Thinking level", description: "Set reasoning effort for the active model" },
-				{ value: "theme", label: "Theme", description: "Select the terminal color theme" },
-				{ value: "images", label: "Images", description: "Show or hide inline image output" },
-				{ value: "trust", label: "Workspace trust", description: "Save a trust decision" },
-			],
-		});
-		if (!selection) return;
-		if (selection === "thinking") await this.thinking();
-		else if (selection === "theme") await this.theme();
-		else if (selection === "images") await this.images();
-		else await this.executeCommand(selection, "");
+		await new OpenTUISettingsCenter({
+			runtime: this.options.host.current,
+			ui,
+			onLogin: (providerId) => this.login(providerId),
+			onLogout: () => this.logout(),
+			onPresentationChanged: this.options.onPresentationChanged,
+			status: this.options.onStatus,
+		}).run();
 	}
 
 	private async model(query: string): Promise<void> {
@@ -258,50 +250,6 @@ export class OpenTUICommandRouter {
 		}
 		session.setScopedModels(models.filter((model) => selected.has(modelKey(model))).map((model) => ({ model })));
 		this.status(selected.size === 0 ? "Model cycling scope cleared" : `${selected.size} scoped models enabled`);
-	}
-
-	private async thinking(): Promise<void> {
-		const session = this.options.host.current.session;
-		const level = await requireUI(this.options.getUI()).dialogs.select({
-			title: "Thinking level",
-			options: session.getAvailableThinkingLevels().map((value) => ({ value, label: value })),
-			initialValue: session.thinkingLevel,
-		});
-		if (!level) return;
-		session.setThinkingLevel(level);
-		this.status(`Thinking level: ${level}`);
-	}
-
-	private async theme(): Promise<void> {
-		const runtime = this.options.host.current;
-		const selected = await requireUI(this.options.getUI()).dialogs.select({
-			title: "Theme",
-			options: getAvailableThemes().map((value) => ({ value, label: value })),
-			initialValue: runtime.services.settingsManager.getTheme(),
-		});
-		if (!selected) return;
-		const result = setTheme(selected, true);
-		if (!result.success) throw new Error(result.error ?? `Could not load theme ${selected}`);
-		runtime.services.settingsManager.setTheme(selected);
-		await this.options.onPresentationChanged?.();
-		this.status(`Theme: ${selected}`);
-	}
-
-	private async images(): Promise<void> {
-		const settings = this.options.host.current.services.settingsManager;
-		const selected = await requireUI(this.options.getUI()).dialogs.select({
-			title: "Inline images",
-			options: [
-				{ value: "show", label: "Show", description: "Render supported images in the transcript" },
-				{ value: "hide", label: "Hide", description: "Replace images with text placeholders" },
-			],
-			initialValue: settings.getShowImages() ? "show" : "hide",
-		});
-		if (!selected) return;
-		const enabled = selected === "show";
-		settings.setShowImages(enabled);
-		await this.options.onPresentationChanged?.();
-		this.status(`Inline images: ${enabled ? "shown" : "hidden"}`);
 	}
 
 	private async trust(runtime: AgentSessionRuntime): Promise<void> {
