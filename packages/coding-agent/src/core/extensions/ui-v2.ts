@@ -1,5 +1,5 @@
 import type { AgentToolResult } from "@frelion/bone-agent-core";
-import type { BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import type { CliRenderer, Renderable } from "@opentui/core";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 
 export type ExtensionUINotificationKind = "info" | "warning" | "error";
@@ -43,11 +43,12 @@ export interface ExtensionUIDialogService {
 	notify(message: string, kind?: ExtensionUINotificationKind): void;
 }
 
-export type ExtensionUIViewFactory = () => BoneView;
+export type ExtensionUIViewFactory = (renderer: CliRenderer) => Renderable;
+export type ExtensionUIView = Renderable | ExtensionUIViewFactory;
 
 export interface ExtensionUIViewHandle {
 	readonly mounted: boolean;
-	update(view: BoneView | ExtensionUIViewFactory): void;
+	update(view: ExtensionUIView): void;
 	close(): void;
 }
 
@@ -59,18 +60,14 @@ export interface ExtensionUIWidgetOptionsV2 {
 }
 
 export interface ExtensionUIWidgetService {
-	set(
-		key: string,
-		view: BoneView | ExtensionUIViewFactory,
-		options?: ExtensionUIWidgetOptionsV2,
-	): ExtensionUIViewHandle;
+	set(key: string, view: ExtensionUIView, options?: ExtensionUIWidgetOptionsV2): ExtensionUIViewHandle;
 	clear(key: string): void;
 }
 
 export interface ExtensionUIChromeService {
-	setHeader(view: BoneView | ExtensionUIViewFactory | undefined): ExtensionUIViewHandle;
+	setHeader(view: ExtensionUIView | undefined): ExtensionUIViewHandle;
 	setFooter(
-		view: BoneView | ((footerData: ReadonlyFooterDataProvider) => BoneView) | undefined,
+		view: Renderable | ((footerData: ReadonlyFooterDataProvider) => ExtensionUIView) | undefined,
 	): ExtensionUIViewHandle;
 	setTitle(title: string): void;
 }
@@ -80,7 +77,7 @@ export interface ExtensionUIEditorService {
 	setText(text: string): void;
 	insertText(text: string): void;
 	open(request: ExtensionUIInputRequest): Promise<string | undefined>;
-	setView(view: BoneView | ExtensionUIViewFactory | undefined): ExtensionUIViewHandle;
+	setView(view: ExtensionUIView | undefined): ExtensionUIViewHandle;
 }
 
 export interface ExtensionUIToolViewState<TState = unknown, TArgs = unknown> {
@@ -93,7 +90,7 @@ export interface ExtensionUIToolViewState<TState = unknown, TArgs = unknown> {
 	isPartial: boolean;
 	expanded: boolean;
 	isError: boolean;
-	previousView?: BoneView;
+	previousView?: ExtensionUIView;
 }
 
 export interface ExtensionUIToolResultViewInput<TDetails = unknown> {
@@ -103,11 +100,11 @@ export interface ExtensionUIToolResultViewInput<TDetails = unknown> {
 }
 
 export interface ExtensionUIToolViewRenderer<TArgs = unknown, TDetails = unknown, TState = unknown> {
-	renderCall?(args: TArgs, context: ExtensionUIToolViewState<TState, TArgs>): BoneView;
+	renderCall?(args: TArgs, context: ExtensionUIToolViewState<TState, TArgs>): ExtensionUIView;
 	renderResult?(
 		input: ExtensionUIToolResultViewInput<TDetails>,
 		context: ExtensionUIToolViewState<TState, TArgs>,
-	): BoneView;
+	): ExtensionUIView;
 }
 
 export interface ExtensionUIToolResultService {
@@ -126,16 +123,18 @@ export interface ExtensionUIAdvancedOptions {
 	presentation?: "dialog" | "overlay" | "replace";
 	width?: number | `${number}%`;
 	height?: number | `${number}%`;
+	signal?: AbortSignal;
+	timeoutMs?: number;
 }
 
-/** Trusted escape hatch for extensions that need direct Bone view composition. */
+/** Trusted escape hatch for extensions that need direct OpenTUI composition. */
 export interface ExtensionUIAdvancedService {
 	show<Result>(
-		factory: (control: ExtensionUIAdvancedViewContext<Result>) => BoneView | Promise<BoneView>,
+		factory: (control: ExtensionUIAdvancedViewContext<Result>) => ExtensionUIView | Promise<ExtensionUIView>,
 		options?: ExtensionUIAdvancedOptions,
 	): Promise<Result | undefined>;
 	close(): void;
-	createView(factory: (context: BoneRenderContext) => BoneNode): BoneView;
+	createView(factory: ExtensionUIViewFactory): ExtensionUIViewFactory;
 }
 
 export interface ExtensionUIV2Context {
@@ -181,7 +180,7 @@ export function createExtensionUIV2Context(): ExtensionUIV2Context {
 		advanced: {
 			show: async () => undefined,
 			close: () => {},
-			createView: (factory) => ({ mount: factory }),
+			createView: (factory) => factory,
 		},
 	};
 }

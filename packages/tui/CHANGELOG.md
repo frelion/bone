@@ -5,9 +5,9 @@
 ### Breaking
 
 - Changed the supported runtime to Bun 1.3.14 or newer.
-- Replaced the legacy differential ANSI renderer with the Bun/OpenTUI structured `BoneView` and `BoneNode` boundary.
+- Replaced the legacy differential ANSI renderer with native `@opentui/core` renderables and a single `CliRenderer` runtime.
 - Removed `TUI`, `Terminal`, `StdinBuffer`, legacy components and editors, configurable keybindings, cursor markers, and terminal image protocol helpers.
-- Removed the legacy `Component`, `Editor`, and `Markdown` public contracts. Product and extension UI must use structured Bone views.
+- Removed the legacy `Component`, `Editor`, and `Markdown` public contracts. Product and extension UI must use native OpenTUI renderables.
 
 ### Changed
 
@@ -17,7 +17,7 @@
 
 ### Added
 
-- Added the OpenTUI-backed `BoneRenderer` boundary, structured render nodes, overlays, keyboard events, and an in-memory Bun test renderer.
+- Added native OpenTUI renderer/runtime helpers, centralized overlay lifecycle management, and an in-memory Bun test renderer.
 
 ## [0.1.3] - 2026-07-22
 

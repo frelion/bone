@@ -1,4 +1,4 @@
-import type { BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import type { BoxRenderable, CliRenderer, Renderable } from "@opentui/core";
 import { getAgentDir } from "../../../config.ts";
 import type { SessionInfo, SessionListProgress } from "../../../core/session-manager.ts";
 import { softDeleteSessionFile } from "../../../core/session-trash.ts";
@@ -28,7 +28,7 @@ export interface OpenTUISessionPickerOptions {
 }
 
 /** Structured startup conversation picker with fixed product commands. */
-export class OpenTUISessionPickerV2 implements BoneView {
+export class OpenTUISessionPickerV2 {
 	private readonly options: OpenTUISessionPickerOptions;
 	private selector: OpenTUISelectorViewV2<string> | undefined;
 	private scope: SessionScope = "current";
@@ -44,7 +44,15 @@ export class OpenTUISessionPickerV2 implements BoneView {
 		this.options = options;
 	}
 
-	mount(context: BoneRenderContext): BoneNode {
+	get root(): BoxRenderable | undefined {
+		return this.selector?.root;
+	}
+
+	get focusTarget(): Renderable | undefined {
+		return this.selector?.focusTarget;
+	}
+
+	build(renderer: CliRenderer): BoxRenderable {
 		this.selector = new OpenTUISelectorViewV2({
 			title: "Conversations",
 			subtitle: "Tab scope · Ctrl+S sort · Ctrl+N named · Ctrl+P path · Ctrl+D delete",
@@ -54,9 +62,13 @@ export class OpenTUISessionPickerV2 implements BoneView {
 			onSelect: this.options.onSelect,
 			onCancel: this.options.onCancel,
 		});
-		const node = this.selector.mount(context);
+		const node = this.selector.build(renderer);
 		void this.loadScope("current");
 		return node;
+	}
+
+	focus(): void {
+		this.selector?.focus();
 	}
 
 	handleAction(action: "confirm" | "cancel" | "up" | "down" | "pageUp" | "pageDown"): boolean {

@@ -1,11 +1,12 @@
 import type { AgentTool } from "@frelion/bone-agent-core";
-import type { BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import { BoxRenderable, createTextAttributes, DiffRenderable, TextRenderable } from "@opentui/core";
 import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../../utils/ansi.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
+import type { ExtensionUIViewFactory } from "../extensions/ui-v2.ts";
 import {
 	applyEditsToNormalizedContent,
 	computeEditsDiff,
@@ -31,6 +32,7 @@ type EditRenderState = {
 	previewArgsKey?: string;
 	previewPending?: boolean;
 	settledError?: boolean;
+	previewRequestRender?: () => void;
 };
 
 const replaceEditSchema = Type.Object(
@@ -170,33 +172,39 @@ function createEditView(
 	state: EditRenderState,
 	cwd: string,
 	isError: boolean,
-): BoneView {
-	return {
-		mount(context: BoneRenderContext): BoneNode {
-			const root = context.createBox({ flexDirection: "column", paddingX: 1 });
-			root.append(
-				context.createText({
+): ExtensionUIViewFactory {
+	return (renderer) => {
+		const root = new BoxRenderable(renderer, { flexDirection: "column", paddingX: 1 });
+		const renderPreview = (): void => {
+			if (root.isDestroyed) return;
+			for (const child of root.getChildren()) {
+				root.remove(child);
+				child.destroyRecursively();
+			}
+			root.add(
+				new TextRenderable(renderer, {
 					content: stripAnsi(formatEditCall(args, theme, cwd)),
 					fg: theme.getFgColor("toolTitle"),
-					bold: true,
+					attributes: createTextAttributes({ bold: true }),
 				}),
 			);
-			if (state.preview) {
-				if ("error" in state.preview) {
-					root.append(context.createText({ content: state.preview.error, fg: theme.getFgColor("error") }));
-				} else {
-					root.append(
-						context.createDiff({
-							diff: state.preview.diff,
-							view: "unified",
-							showLineNumbers: true,
-							fg: isError ? theme.getFgColor("error") : theme.getFgColor("toolOutput"),
-						}),
-					);
-				}
+			if (!state.preview) return;
+			if ("error" in state.preview) {
+				root.add(new TextRenderable(renderer, { content: state.preview.error, fg: theme.getFgColor("error") }));
+				return;
 			}
-			return root;
-		},
+			root.add(
+				new DiffRenderable(renderer, {
+					diff: state.preview.diff,
+					view: "unified",
+					showLineNumbers: true,
+					fg: isError ? theme.getFgColor("error") : theme.getFgColor("toolOutput"),
+				}),
+			);
+		};
+		state.previewRequestRender = renderPreview;
+		renderPreview();
+		return root;
 	};
 }
 
@@ -294,12 +302,20 @@ export function createEditToolDefinition(
 				if (context.argsComplete && previewInput && !state.preview && !state.previewPending) {
 					state.previewPending = true;
 					const requestKey = argsKey;
-					void computeEditsDiff(previewInput.path, previewInput.edits, context.cwd).then((preview) => {
-						if (state.previewArgsKey === requestKey) {
-							state.preview = preview;
+					void computeEditsDiff(previewInput.path, previewInput.edits, context.cwd)
+						.then((preview) => {
+							if (state.previewArgsKey === requestKey) {
+								state.preview = preview;
+								state.previewPending = false;
+								state.previewRequestRender?.();
+							}
+						})
+						.catch((error: unknown) => {
+							if (state.previewArgsKey !== requestKey) return;
+							state.preview = { error: error instanceof Error ? error.message : String(error) };
 							state.previewPending = false;
-						}
-					});
+							state.previewRequestRender?.();
+						});
 				}
 
 				return createEditView(args as RenderableEditArgs | undefined, state, context.cwd, false);

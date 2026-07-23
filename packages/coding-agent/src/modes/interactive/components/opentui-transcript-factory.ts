@@ -1,9 +1,13 @@
 import type { AgentMessage } from "@frelion/bone-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@frelion/bone-ai";
-import type { BoneContainerNode, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import { BoxRenderable, type CliRenderer, type Renderable, TextRenderable } from "@opentui/core";
 import { type AgentSessionEvent, parseSkillBlock } from "../../../core/agent-session.ts";
 import type { CustomEntryViewRenderer, CustomMessageViewRenderer } from "../../../core/extensions/types.ts";
-import type { ExtensionUIToolViewRenderer, ExtensionUIToolViewState } from "../../../core/extensions/ui-v2.ts";
+import type {
+	ExtensionUIToolViewRenderer,
+	ExtensionUIToolViewState,
+	ExtensionUIView,
+} from "../../../core/extensions/ui-v2.ts";
 import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
@@ -47,63 +51,26 @@ export interface OpenTUITranscriptFactoryResolvers {
 
 export interface OpenTUITranscriptItem {
 	key: string;
-	view: BoneView;
+	root: Renderable;
 }
 
 export type OpenTUITranscriptMutation =
 	| { type: "append"; item: OpenTUITranscriptItem }
-	| { type: "updated"; key: string; view: BoneView }
+	| { type: "updated"; key: string; root: Renderable }
 	| { type: "ignored" };
 
-class OpenTUIGroupedView implements BoneView {
-	private readonly views: readonly BoneView[];
+class OpenTUIGroupedView {
+	readonly root: BoxRenderable;
 
-	constructor(views: readonly BoneView[]) {
-		this.views = views;
-	}
-
-	mount(context: BoneRenderContext): BoneNode {
-		const root = context.createBox({ flexDirection: "column" });
-		for (const view of this.views) root.append(view.mount(context));
-		return root;
+	constructor(renderer: CliRenderer, views: readonly Renderable[]) {
+		this.root = new BoxRenderable(renderer, { flexDirection: "column" });
+		for (const view of views) this.root.add(view);
 	}
 }
 
-class OpenTUISafeView implements BoneView {
-	private readonly primary: BoneView;
-	private readonly fallback: BoneView;
-	private readonly onError: ((error: unknown, surface: string) => void) | undefined;
-	private readonly surface: string;
-
-	constructor(
-		primary: BoneView,
-		fallback: BoneView,
-		onError: ((error: unknown, surface: string) => void) | undefined,
-		surface: string,
-	) {
-		this.primary = primary;
-		this.fallback = fallback;
-		this.onError = onError;
-		this.surface = surface;
-	}
-
-	mount(context: BoneRenderContext): BoneNode {
-		try {
-			return this.primary.mount(context);
-		} catch (error) {
-			this.onError?.(error, this.surface);
-			return this.fallback.mount(context);
-		}
-	}
-}
-
-class OpenTUICustomEntryFallback implements BoneView {
-	mount(context: BoneRenderContext): BoneNode {
-		return context.createText({ content: "[custom entry unavailable]" });
-	}
-}
-
-class OpenTUIStructuredToolExecution implements BoneView {
+class OpenTUIStructuredToolExecution {
+	readonly root: BoxRenderable;
+	private readonly renderer: CliRenderer;
 	private readonly toolCallId: string;
 	private readonly cwd: string;
 	private readonly getRenderer: () => ExtensionUIToolViewRenderer | undefined;
@@ -116,12 +83,10 @@ class OpenTUIStructuredToolExecution implements BoneView {
 	private expanded = false;
 	private executionStarted = false;
 	private argsComplete = false;
-	private context: BoneRenderContext | undefined;
-	private root: BoneContainerNode | undefined;
-	private currentView: BoneView | undefined;
-	private currentNode: BoneNode | undefined;
+	private currentView: Renderable | undefined;
 
 	constructor(
+		renderer: CliRenderer,
 		toolName: string,
 		toolCallId: string,
 		args: unknown,
@@ -129,21 +94,14 @@ class OpenTUIStructuredToolExecution implements BoneView {
 		getRenderer: () => ExtensionUIToolViewRenderer | undefined,
 		onError?: (error: unknown, surface: string) => void,
 	) {
+		this.renderer = renderer;
 		this.toolCallId = toolCallId;
 		this.args = args;
 		this.cwd = cwd;
 		this.getRenderer = getRenderer;
 		this.onError = onError;
-		this.fallback = new OpenTUIToolExecution(toolName, toolCallId, args);
-	}
-
-	mount(context: BoneRenderContext): BoneNode {
-		this.context = context;
-		this.root = context.createBox({ flexDirection: "column" });
-		this.currentView = undefined;
-		this.currentNode = undefined;
-		this.refresh();
-		return this.root;
+		this.root = new BoxRenderable(renderer, { flexDirection: "column" });
+		this.fallback = new OpenTUIToolExecution(renderer, toolName, toolCallId, args);
 	}
 
 	updateArgs(args: unknown): void {
@@ -182,7 +140,7 @@ class OpenTUIStructuredToolExecution implements BoneView {
 	}
 
 	private refresh(): void {
-		if (!this.context || !this.root || this.root.destroyed) return;
+		if (this.root.isDestroyed) return;
 		const renderer = this.getRenderer();
 		const renderContext: ExtensionUIToolViewState = {
 			toolCallId: this.toolCallId,
@@ -196,7 +154,7 @@ class OpenTUIStructuredToolExecution implements BoneView {
 			isError: this.result?.isError ?? false,
 			previousView: this.currentView,
 		};
-		let nextView: BoneView | undefined;
+		let nextView: ExtensionUIView | undefined;
 		try {
 			nextView = this.result
 				? renderer?.renderResult?.(
@@ -216,24 +174,33 @@ class OpenTUIStructuredToolExecution implements BoneView {
 			this.onError?.(error, "tool result renderer");
 			nextView = undefined;
 		}
-		let resolvedView = nextView ?? this.fallback;
+		let resolvedView = this.fallback.root as Renderable;
+		if (nextView) {
+			try {
+				resolvedView = resolveExtensionView(nextView, this.renderer);
+				if (resolvedView.isDestroyed || (resolvedView.parent && resolvedView.parent !== this.root)) {
+					throw new Error("Extension tool renderer returned an attached or destroyed renderable");
+				}
+			} catch (error) {
+				this.onError?.(error, "tool renderer view");
+				resolvedView = this.fallback.root;
+			}
+		}
 		if (resolvedView === this.currentView) {
-			this.currentNode?.requestRender();
+			this.currentView?.requestRender();
 			return;
 		}
-		let nextNode: BoneNode;
-		try {
-			nextNode = resolvedView.mount(this.context);
-		} catch (error) {
-			this.onError?.(error, "tool renderer view");
-			resolvedView = this.fallback;
-			nextNode = this.fallback.mount(this.context);
+		if (this.currentView && !this.currentView.isDestroyed) this.root.remove(this.currentView);
+		if (this.currentView && this.currentView !== this.fallback.root && !this.currentView.isDestroyed) {
+			this.currentView.destroyRecursively();
 		}
-		if (this.currentNode && !this.currentNode.destroyed) this.currentNode.destroy();
 		this.currentView = resolvedView;
-		this.currentNode = nextNode;
-		this.root.append(this.currentNode);
+		this.root.add(this.currentView);
 	}
+}
+
+function resolveExtensionView(view: ExtensionUIView, renderer: CliRenderer): Renderable {
+	return typeof view === "function" ? view(renderer) : view;
 }
 
 function textFromContent(content: unknown): string {
@@ -270,19 +237,26 @@ function toolResultFromEvent(
 
 /** Owns stable views for transcript replay and the streaming agent event lifecycle. */
 export class OpenTUITranscriptFactory {
+	private readonly renderer: CliRenderer;
 	private readonly options: Required<OpenTUITranscriptFactoryOptions>;
 	private resolvers: OpenTUITranscriptFactoryResolvers;
 	private streamingAssistant: { key: string; view: OpenTUIAssistantMessage } | undefined;
 	private readonly pendingTools = new Map<string, OpenTUIStructuredToolExecution>();
 	private readonly completedLiveTools = new Set<string>();
 	private readonly toolArgs = new Map<string, unknown>();
+	private readonly toolUpdateGeneration = new Map<string, number>();
 	private readonly toolGroups = new Set<OpenTUIWorkingGroup>();
 	private readonly toolGroupByCall = new Map<string, { key: string; view: OpenTUIWorkingGroup }>();
 	private activeToolGroup: { key: string; view: OpenTUIWorkingGroup } | undefined;
 	private toolGroupSequence = 0;
 	private expandAllToolDetails = false;
 
-	constructor(options: OpenTUITranscriptFactoryOptions = {}, resolvers: OpenTUITranscriptFactoryResolvers = {}) {
+	constructor(
+		renderer: CliRenderer,
+		options: OpenTUITranscriptFactoryOptions = {},
+		resolvers: OpenTUITranscriptFactoryResolvers = {},
+	) {
+		this.renderer = renderer;
 		this.options = {
 			hideThinkingBlock: options.hideThinkingBlock ?? false,
 			hiddenThinkingLabel: options.hiddenThinkingLabel ?? "Thinking...",
@@ -303,6 +277,18 @@ export class OpenTUITranscriptFactory {
 		for (const group of this.toolGroups) group.setExpanded(expanded);
 	}
 
+	/** Drop runtime bookkeeping when the factory is no longer associated with a session. */
+	reset(): void {
+		this.streamingAssistant = undefined;
+		this.pendingTools.clear();
+		this.completedLiveTools.clear();
+		this.toolArgs.clear();
+		this.toolUpdateGeneration.clear();
+		this.toolGroupByCall.clear();
+		this.toolGroups.clear();
+		this.activeToolGroup = undefined;
+	}
+
 	async createSessionEntries(entries: readonly SessionEntry[]): Promise<OpenTUITranscriptItem[]> {
 		const items: OpenTUITranscriptItem[] = [];
 		let pendingSequence: { key: string; startedAt: number } | undefined;
@@ -311,7 +297,7 @@ export class OpenTUITranscriptFactory {
 			if (!replayGroup) return;
 			this.toolGroups.add(replayGroup.view);
 			if (this.expandAllToolDetails) replayGroup.view.setExpanded(true);
-			items.push({ key: replayGroup.key, view: replayGroup.view });
+			items.push({ key: replayGroup.key, root: replayGroup.view.root });
 			replayGroup = undefined;
 			pendingSequence = undefined;
 		};
@@ -338,7 +324,7 @@ export class OpenTUITranscriptFactory {
 					const clock = { completedAt: entry.message.timestamp };
 					replayGroup = {
 						key: pendingSequence?.key ?? `working-group:replay:${entry.id}`,
-						view: new OpenTUIWorkingGroup(startedAt, () => clock.completedAt),
+						view: new OpenTUIWorkingGroup(this.renderer, startedAt, () => clock.completedAt),
 						clock,
 					};
 				}
@@ -368,14 +354,18 @@ export class OpenTUITranscriptFactory {
 			case "compaction":
 				return {
 					key: entry.id,
-					view: new OpenTUICompactionSummary(
+					root: new OpenTUICompactionSummary(
+						this.renderer,
 						createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp),
-					),
+					).root,
 				};
 			case "branch_summary":
 				return {
 					key: entry.id,
-					view: new OpenTUIBranchSummary(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)),
+					root: new OpenTUIBranchSummary(
+						this.renderer,
+						createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp),
+					).root,
 				};
 			case "custom_message":
 				if (!entry.display) return undefined;
@@ -384,26 +374,18 @@ export class OpenTUITranscriptFactory {
 					entry.id,
 				);
 			case "plan_proposal":
-				return { key: entry.id, view: new OpenTUIPlanProposal(entry.proposal) };
+				return { key: entry.id, root: new OpenTUIPlanProposal(this.renderer, entry.proposal).root };
 			case "custom": {
-				let customView: BoneView | undefined;
 				try {
-					customView = this.resolvers.getEntryView?.(entry.customType)?.(entry, { expanded: false });
+					const customView = this.resolvers.getEntryView?.(entry.customType)?.(entry, { expanded: false });
+					return customView ? { key: entry.id, root: resolveExtensionView(customView, this.renderer) } : undefined;
 				} catch (error) {
-					this.resolvers.onError?.(error, "custom entry renderer");
-					customView = undefined;
+					this.resolvers.onError?.(error, "custom entry view");
+					return {
+						key: entry.id,
+						root: new TextRenderable(this.renderer, { content: "[custom entry unavailable]" }),
+					};
 				}
-				return customView
-					? {
-							key: entry.id,
-							view: new OpenTUISafeView(
-								customView,
-								new OpenTUICustomEntryFallback(),
-								this.resolvers.onError,
-								"custom entry view",
-							),
-						}
-					: undefined;
 			}
 			case "thinking_level_change":
 			case "model_change":
@@ -430,45 +412,43 @@ export class OpenTUITranscriptFactory {
 			case "user": {
 				const skill = typeof message.content === "string" ? parseSkillBlock(message.content) : null;
 				const base = skill
-					? new OpenTUISkillInvocation(skill)
-					: new OpenTUIUserMessage(textFromContent(message.content) || "[image attachment]");
-				return { key, view: await this.withImages(base, message.content) };
+					? new OpenTUISkillInvocation(this.renderer, skill)
+					: new OpenTUIUserMessage(this.renderer, textFromContent(message.content) || "[image attachment]");
+				return { key, root: await this.withImages(base.root, message.content) };
 			}
 			case "assistant":
 				this.rememberToolArgs(message);
-				return { key, view: this.createAssistant(message) };
+				return { key, root: this.createAssistant(message).root };
 			case "toolResult": {
 				const view = await this.createCompletedToolView(message);
-				return { key, view };
+				return { key, root: view.root };
 			}
 			case "bashExecution": {
-				const view = new OpenTUIBashExecution(message.command, message.excludeFromContext);
+				const view = new OpenTUIBashExecution(this.renderer, message.command, message.excludeFromContext);
 				view.updateFromMessage(message);
-				return { key, view };
+				return { key, root: view.root };
 			}
 			case "custom":
 				if (!message.display) return undefined;
 				{
-					const fallback = await this.withImages(new OpenTUICustomMessage(message), message.content);
-					let customView: BoneView | undefined;
+					const fallback = await this.withImages(
+						new OpenTUICustomMessage(this.renderer, message).root,
+						message.content,
+					);
 					try {
-						customView = this.resolvers.getMessageView?.(message.customType)?.(message, { expanded: false });
+						const customView = this.resolvers.getMessageView?.(message.customType)?.(message, {
+							expanded: false,
+						});
+						if (customView) return { key, root: resolveExtensionView(customView, this.renderer) };
 					} catch (error) {
-						this.resolvers.onError?.(error, "custom message renderer");
-						customView = undefined;
+						this.resolvers.onError?.(error, "custom message view");
 					}
-					if (customView) {
-						return {
-							key,
-							view: new OpenTUISafeView(customView, fallback, this.resolvers.onError, "custom message view"),
-						};
-					}
-					return { key, view: fallback };
+					return { key, root: fallback };
 				}
 			case "branchSummary":
-				return { key, view: new OpenTUIBranchSummary(message) };
+				return { key, root: new OpenTUIBranchSummary(this.renderer, message).root };
 			case "compactionSummary":
-				return { key, view: new OpenTUICompactionSummary(message) };
+				return { key, root: new OpenTUICompactionSummary(this.renderer, message).root };
 			default: {
 				const exhaustive: never = message;
 				return exhaustive;
@@ -488,7 +468,7 @@ export class OpenTUITranscriptFactory {
 					const key = keyForMessage(event.message);
 					const view = this.createAssistant(event.message);
 					this.streamingAssistant = { key, view };
-					return { type: "append", item: { key, view } };
+					return { type: "append", item: { key, root: view.root } };
 				}
 				this.activeToolGroup = undefined;
 				return this.appendMessage(await this.createMessage(event.message));
@@ -500,7 +480,7 @@ export class OpenTUITranscriptFactory {
 				return {
 					type: "updated",
 					key: this.streamingAssistant.key,
-					view: this.streamingAssistant.view,
+					root: this.streamingAssistant.view.root,
 				};
 			case "message_end":
 				if (event.message.role === "assistant" && this.streamingAssistant) {
@@ -513,7 +493,7 @@ export class OpenTUITranscriptFactory {
 					const updated = {
 						type: "updated" as const,
 						key: this.streamingAssistant.key,
-						view: this.streamingAssistant.view,
+						root: this.streamingAssistant.view.root,
 					};
 					this.streamingAssistant = undefined;
 					return updated;
@@ -529,7 +509,7 @@ export class OpenTUITranscriptFactory {
 					existing.updateArgs(event.args);
 					existing.markExecutionStarted();
 					const group = this.toolGroupByCall.get(event.toolCallId);
-					return group ? { type: "updated", key: group.key, view: group.view } : { type: "ignored" };
+					return group ? { type: "updated", key: group.key, root: group.view.root } : { type: "ignored" };
 				}
 				this.toolArgs.set(event.toolCallId, event.args);
 				const view = this.createToolView(event.toolName, event.toolCallId, event.args);
@@ -538,7 +518,7 @@ export class OpenTUITranscriptFactory {
 				this.pendingTools.set(event.toolCallId, view);
 				const isNewGroup = !this.activeToolGroup;
 				if (!this.activeToolGroup) {
-					const group = new OpenTUIWorkingGroup(this.options.now(), this.options.now);
+					const group = new OpenTUIWorkingGroup(this.renderer, this.options.now(), this.options.now);
 					this.activeToolGroup = { key: `working-group:${++this.toolGroupSequence}`, view: group };
 					this.toolGroups.add(group);
 				}
@@ -546,8 +526,8 @@ export class OpenTUITranscriptFactory {
 				if (this.expandAllToolDetails) this.activeToolGroup.view.setExpanded(true);
 				this.toolGroupByCall.set(event.toolCallId, this.activeToolGroup);
 				return isNewGroup
-					? { type: "append", item: { key: this.activeToolGroup.key, view: this.activeToolGroup.view } }
-					: { type: "updated", key: this.activeToolGroup.key, view: this.activeToolGroup.view };
+					? { type: "append", item: { key: this.activeToolGroup.key, root: this.activeToolGroup.view.root } }
+					: { type: "updated", key: this.activeToolGroup.key, root: this.activeToolGroup.view.root };
 			}
 			case "tool_execution_update": {
 				const view = this.pendingTools.get(event.toolCallId);
@@ -561,6 +541,9 @@ export class OpenTUITranscriptFactory {
 				const group = this.toolGroupByCall.get(event.toolCallId)?.view;
 				group?.markToolComplete(event.toolCallId, event.isError);
 				if (group && this.expandAllToolDetails) group.setExpanded(true);
+				this.toolGroupByCall.delete(event.toolCallId);
+				this.toolArgs.delete(event.toolCallId);
+				this.toolUpdateGeneration.delete(event.toolCallId);
 				if (wasPending) this.completedLiveTools.add(event.toolCallId);
 				return updated;
 			}
@@ -569,6 +552,8 @@ export class OpenTUITranscriptFactory {
 				this.streamingAssistant = undefined;
 				this.pendingTools.clear();
 				this.completedLiveTools.clear();
+				this.toolUpdateGeneration.clear();
+				this.toolGroupByCall.clear();
 				this.activeToolGroup = undefined;
 				return { type: "ignored" };
 			default:
@@ -577,7 +562,7 @@ export class OpenTUITranscriptFactory {
 	}
 
 	private createAssistant(message: AssistantMessage): OpenTUIAssistantMessage {
-		return new OpenTUIAssistantMessage(message, {
+		return new OpenTUIAssistantMessage(this.renderer, message, {
 			hideThinkingBlock: this.options.hideThinkingBlock,
 			hiddenThinkingLabel: this.options.hiddenThinkingLabel,
 			hideProposedPlan: this.options.hideProposedPlan,
@@ -594,6 +579,7 @@ export class OpenTUITranscriptFactory {
 
 	private createToolView(toolName: string, toolCallId: string, args: unknown): OpenTUIStructuredToolExecution {
 		return new OpenTUIStructuredToolExecution(
+			this.renderer,
 			toolName,
 			toolCallId,
 			args,
@@ -639,6 +625,7 @@ export class OpenTUITranscriptFactory {
 				false,
 			);
 			this.toolGroupByCall.get(toolCallId)?.view.markToolComplete(toolCallId, true);
+			this.toolUpdateGeneration.delete(toolCallId);
 		}
 		this.pendingTools.clear();
 	}
@@ -652,10 +639,16 @@ export class OpenTUITranscriptFactory {
 	): Promise<OpenTUITranscriptMutation> {
 		const view = this.pendingTools.get(toolCallId);
 		if (!view) return { type: "ignored" };
+		const generation = (this.toolUpdateGeneration.get(toolCallId) ?? 0) + 1;
+		this.toolUpdateGeneration.set(toolCallId, generation);
 		const message = toolResultFromEvent(toolName, toolCallId, result, isError);
-		view.updateResult(message, partial, await this.decodeImages(message.content));
+		const attachments = await this.decodeImages(message.content);
+		if (this.toolUpdateGeneration.get(toolCallId) !== generation || this.pendingTools.get(toolCallId) !== view) {
+			return { type: "ignored" };
+		}
+		view.updateResult(message, partial, attachments);
 		const group = this.toolGroupByCall.get(toolCallId);
-		return group ? { type: "updated", key: group.key, view: group.view } : { type: "ignored" };
+		return group ? { type: "updated", key: group.key, root: group.view.root } : { type: "ignored" };
 	}
 
 	private async decodeImages(content: unknown): Promise<OpenTUIImageAttachment[]> {
@@ -663,8 +656,10 @@ export class OpenTUITranscriptFactory {
 		return decodeOpenTUIImages(content, { terminalWidth: this.options.imageWidthCells });
 	}
 
-	private async withImages(base: BoneView, content: unknown): Promise<BoneView> {
+	private async withImages(base: Renderable, content: unknown): Promise<Renderable> {
 		const images = await this.decodeImages(content);
-		return images.length > 0 ? new OpenTUIGroupedView([base, new OpenTUIImageAttachments(images)]) : base;
+		return images.length > 0
+			? new OpenTUIGroupedView(this.renderer, [base, new OpenTUIImageAttachments(this.renderer, images).root]).root
+			: base;
 	}
 }

@@ -3,8 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@frelion/bone-agent-core";
 import type { AssistantMessage } from "@frelion/bone-ai/compat";
-import { type BoneTestRenderer, createBoneTestRenderer } from "@frelion/bone-tui";
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import { TextRenderable } from "@opentui/core";
+import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { getLastActiveConversation } from "../src/core/conversation-state.ts";
@@ -24,6 +25,34 @@ import {
 	type OpenTUISessionHostContract,
 } from "../src/modes/interactive/opentui-interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+
+type NativeTestRenderer = TestRendererSetup["renderer"] & {
+	readonly input: TestRendererSetup["mockInput"];
+	readonly mouse: TestRendererSetup["mockMouse"];
+	captureFrame(): string;
+	flush(): Promise<void>;
+	waitForFrameText(text: string): Promise<string>;
+};
+
+const testSetups = new Set<TestRendererSetup>();
+
+async function createNativeTestRenderer(options: { width: number; height: number }): Promise<NativeTestRenderer> {
+	const setup = await createTestRenderer({ ...options, autoFocus: false, useMouse: true, exitOnCtrlC: false });
+	setup.renderer.start();
+	testSetups.add(setup);
+	return Object.assign(setup.renderer, {
+		input: setup.mockInput,
+		mouse: setup.mockMouse,
+		captureFrame: setup.captureCharFrame,
+		flush: () => setup.flush(),
+		waitForFrameText: (text: string) => setup.waitForFrame((frame) => frame.includes(text), { maxPasses: 50 }),
+	}) as NativeTestRenderer;
+}
+
+afterEach(() => {
+	for (const setup of testSetups) setup.renderer.destroy();
+	testSetups.clear();
+});
 
 function userMessage(text: string, timestamp = 1): AgentMessage {
 	return { role: "user", content: text, timestamp };
@@ -189,7 +218,13 @@ class FakeHost implements OpenTUISessionHostContract {
 	readonly getSessionSummaries = vi.fn(async (_paths: readonly string[]) => [] as InteractiveSessionSummary[]);
 	private readonly streamState = new WeakMap<
 		AgentSessionRuntime,
-		{ revision: number; liveEvents: AgentSessionEvent[]; liveEventRevisions: number[] }
+		{
+			revision: number;
+			generationId: string;
+			liveEvents: AgentSessionEvent[];
+			liveEventRevisions: number[];
+			liveEventGenerationIds: string[];
+		}
 	>();
 
 	constructor(runtime: AgentSessionRuntime) {
@@ -204,42 +239,72 @@ class FakeHost implements OpenTUISessionHostContract {
 		this.prompts.push({ runtime, text, options });
 	}
 
+	seedRuntimeStream(
+		runtime: AgentSessionRuntime,
+		generationId: string,
+		envelopes: Array<{ revision: number; generationId: string; event: AgentSessionEvent }>,
+	): void {
+		this.streamState.set(runtime, {
+			revision: Math.max(0, ...envelopes.map((envelope) => envelope.revision)),
+			generationId,
+			liveEvents: envelopes.map((envelope) => envelope.event),
+			liveEventRevisions: envelopes.map((envelope) => envelope.revision),
+			liveEventGenerationIds: envelopes.map((envelope) => envelope.generationId),
+		});
+	}
+
 	getRuntimeStreamSnapshot(runtime: AgentSessionRuntime): RuntimeStreamSnapshot {
-		const state = this.streamState.get(runtime) ?? { revision: 0, liveEvents: [], liveEventRevisions: [] };
+		const state = this.streamState.get(runtime) ?? {
+			revision: 0,
+			generationId: "generation-0",
+			liveEvents: [],
+			liveEventRevisions: [],
+			liveEventGenerationIds: [],
+		};
 		return {
 			revision: state.revision,
-			generationId: undefined,
+			generationId: state.generationId,
 			liveEvents: state.liveEvents.slice(),
 			liveEventEnvelopes: state.liveEvents.map((event, index) => ({
 				runtime,
 				revision: state.liveEventRevisions[index] ?? state.revision,
-				generationId: undefined,
+				generationId: state.liveEventGenerationIds[index] ?? state.generationId,
 				event,
 			})),
 		};
 	}
 
 	subscribeRuntime(runtime: AgentSessionRuntime, listener: (envelope: RuntimeEventEnvelope) => void): () => void {
-		const state = this.streamState.get(runtime) ?? { revision: 0, liveEvents: [], liveEventRevisions: [] };
+		const state = this.streamState.get(runtime) ?? {
+			revision: 0,
+			generationId: "generation-0",
+			liveEvents: [],
+			liveEventRevisions: [],
+			liveEventGenerationIds: [],
+		};
 		this.streamState.set(runtime, state);
 		return runtime.session.subscribe((event) => {
 			state.revision++;
 			if (event.type === "agent_start") {
+				state.generationId = `generation-${state.revision}`;
 				state.liveEvents = [];
 				state.liveEventRevisions = [];
+				state.liveEventGenerationIds = [];
 			}
 			state.liveEvents.push(event);
 			state.liveEventRevisions.push(state.revision);
-			listener({ runtime, revision: state.revision, generationId: undefined, event });
+			state.liveEventGenerationIds.push(state.generationId);
+			listener({ runtime, revision: state.revision, generationId: state.generationId, event });
 			if (event.type === "agent_settled") {
 				state.liveEvents = [];
 				state.liveEventRevisions = [];
+				state.liveEventGenerationIds = [];
 			}
 		});
 	}
 }
 
-async function settle(renderer: BoneTestRenderer): Promise<void> {
+async function settle(renderer: NativeTestRenderer): Promise<void> {
 	for (let index = 0; index < 8; index++) await Promise.resolve();
 	await renderer.flush();
 }
@@ -268,17 +333,13 @@ describe("OpenTUIInteractiveMode", () => {
 			entry(assistantMessage("earlier answer", "stop"), "two"),
 		]);
 		const host = new FakeHost(session.runtime);
-		const renderer = await createBoneTestRenderer({ width: 90, height: 24 });
-		const transcriptFactory = new OpenTUITranscriptFactory();
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const transcriptFactory = new OpenTUITranscriptFactory(renderer);
 		vi.spyOn(transcriptFactory, "createSessionEntry").mockImplementation(async (sessionEntry) => ({
 			key: sessionEntry.id,
-			view: {
-				mount: (context) =>
-					context.createText({
-						content:
-							sessionEntry.type === "message" ? JSON.stringify(sessionEntry.message.content) : sessionEntry.type,
-					}),
-			},
+			root: new TextRenderable(renderer, {
+				content: sessionEntry.type === "message" ? JSON.stringify(sessionEntry.message.content) : sessionEntry.type,
+			}),
 		}));
 		const mode = new OpenTUIInteractiveMode(host, {
 			createRenderer: async () => renderer,
@@ -306,7 +367,7 @@ describe("OpenTUIInteractiveMode", () => {
 	test("keeps the composer focused when clicking the transcript", async () => {
 		const session = createRuntime([entry(userMessage("earlier prompt"), "one")]);
 		const host = new FakeHost(session.runtime);
-		const renderer = await createBoneTestRenderer({ width: 90, height: 24 });
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
 		const mode = new OpenTUIInteractiveMode(host, {
 			createRenderer: async () => renderer,
 			createMemoryRuntime: () => new FakeMemoryRuntime(),
@@ -326,8 +387,8 @@ describe("OpenTUIInteractiveMode", () => {
 	test("updates streaming assistant and tool output without rebuilding the shell", async () => {
 		const session = createRuntime();
 		const host = new FakeHost(session.runtime);
-		const renderer = await createBoneTestRenderer({ width: 90, height: 28 });
-		const transcriptFactory = new OpenTUITranscriptFactory();
+		const renderer = await createNativeTestRenderer({ width: 90, height: 28 });
+		const transcriptFactory = new OpenTUITranscriptFactory(renderer);
 		const handleEvent = vi.spyOn(transcriptFactory, "handleEvent");
 		const mode = new OpenTUIInteractiveMode(host, {
 			createRenderer: async () => renderer,
@@ -384,8 +445,8 @@ describe("OpenTUIInteractiveMode", () => {
 	test("replays runtime events emitted while transcript history is loading", async () => {
 		const active = createRuntime([entry(userMessage("earlier prompt"), "one")]);
 		const host = new FakeHost(active.runtime);
-		const renderer = await createBoneTestRenderer({ width: 90, height: 24 });
-		const transcriptFactory = new OpenTUITranscriptFactory();
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const transcriptFactory = new OpenTUITranscriptFactory(renderer);
 		const handleEvent = vi.spyOn(transcriptFactory, "handleEvent");
 		let releaseBinding!: () => void;
 		const bindingReady = new Promise<void>((resolve) => {
@@ -400,7 +461,7 @@ describe("OpenTUIInteractiveMode", () => {
 			.spyOn(transcriptFactory, "createSessionEntries")
 			.mockImplementation(async (entries) => {
 				await historyReady;
-				return await new OpenTUITranscriptFactory().createSessionEntries(entries);
+				return await new OpenTUITranscriptFactory(renderer).createSessionEntries(entries);
 			});
 		const mode = new OpenTUIInteractiveMode(host, {
 			createRenderer: async () => renderer,
@@ -431,12 +492,38 @@ describe("OpenTUIInteractiveMode", () => {
 		mode.stop();
 	});
 
+	test("filters replay envelopes from stale stream generations", async () => {
+		const active = createRuntime();
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const transcriptFactory = new OpenTUITranscriptFactory(renderer);
+		const handleEvent = vi.spyOn(transcriptFactory, "handleEvent");
+		const stale = assistantMessage("stale generation output");
+		const current = assistantMessage("current generation output");
+		host.seedRuntimeStream(active.runtime, "generation-current", [
+			{ revision: 2, generationId: "generation-old", event: { type: "message_start", message: stale } },
+			{ revision: 3, generationId: "generation-current", event: { type: "message_start", message: current } },
+		]);
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			createTranscriptFactory: () => transcriptFactory,
+			installSignalHandlers: false,
+		});
+
+		await mode.init();
+		await settle(renderer);
+		expect(handleEvent).toHaveBeenCalledWith(expect.objectContaining({ message: current }));
+		expect(handleEvent).not.toHaveBeenCalledWith(expect.objectContaining({ message: stale }));
+		mode.stop();
+	});
+
 	test("rebinds foreground subscriptions and handles fixed interrupt and shutdown keys", async () => {
 		const first = createRuntime([entry(userMessage("first session"), "first")]);
 		const second = createRuntime([entry(userMessage("second session"), "second")]);
 		const host = new FakeHost(first.runtime);
-		const renderer = await createBoneTestRenderer({ width: 90, height: 24 });
-		const transcriptFactory = new OpenTUITranscriptFactory();
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const transcriptFactory = new OpenTUITranscriptFactory(renderer);
 		const createSessionEntry = vi.spyOn(transcriptFactory, "createSessionEntry");
 		const mode = new OpenTUIInteractiveMode(host, {
 			createRenderer: async () => renderer,
@@ -459,10 +546,11 @@ describe("OpenTUIInteractiveMode", () => {
 		renderer.input.pressKey("d", { ctrl: true });
 		await settle(renderer);
 		expect(host.disposeAll).not.toHaveBeenCalled();
-		renderer.input.pressKey("c", { ctrl: true });
+		renderer.input.pressCtrlC();
+		await settle(renderer);
 
 		second.session.isStreaming = true;
-		renderer.input.pressKey("c", { ctrl: true });
+		renderer.input.pressCtrlC();
 		await settle(renderer);
 		expect(second.abort).toHaveBeenCalledOnce();
 
@@ -479,7 +567,7 @@ describe("OpenTUIInteractiveMode", () => {
 			const second = createRuntime([], { sessionFile: secondPath, agentDir, id: "second", name: "Second" });
 			const host = new FakeHost(first.runtime);
 			const memory = new FakeMemoryRuntime();
-			const renderer = await createBoneTestRenderer({ width: 90, height: 24 });
+			const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
 			const mode = new OpenTUIInteractiveMode(host, {
 				createRenderer: async () => renderer,
 				createMemoryRuntime: () => memory,
@@ -533,7 +621,7 @@ describe("OpenTUIInteractiveMode", () => {
 			},
 		]);
 		memory.searchSemantic.mockResolvedValue([]);
-		const renderer = await createBoneTestRenderer({ width: 100, height: 28 });
+		const renderer = await createNativeTestRenderer({ width: 100, height: 28 });
 		const mode = new OpenTUIInteractiveMode(host, {
 			createRenderer: async () => renderer,
 			createMemoryRuntime: () => memory,
@@ -550,6 +638,7 @@ describe("OpenTUIInteractiveMode", () => {
 		expect(renderer.captureFrame()).toContain("Search conversations");
 		await renderer.input.typeText("indexed");
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 120));
+		await mode.idle();
 		await settle(renderer);
 		expect(memory.search).toHaveBeenCalledWith("indexed", expect.arrayContaining([visible]));
 		expect(host.getSessionSummaries).toHaveBeenCalledWith([indexed.path]);
@@ -571,7 +660,7 @@ describe("OpenTUIInteractiveMode", () => {
 	test("keeps built-in commands out of prompts and steers ordinary input while streaming", async () => {
 		const session = createRuntime();
 		const host = new FakeHost(session.runtime);
-		const renderer = await createBoneTestRenderer({ width: 90, height: 24 });
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
 		const mode = new OpenTUIInteractiveMode(host, {
 			createRenderer: async () => renderer,
 			createMemoryRuntime: () => new FakeMemoryRuntime(),
@@ -589,7 +678,7 @@ describe("OpenTUIInteractiveMode", () => {
 		const streamingSession = createRuntime();
 		streamingSession.session.isStreaming = true;
 		const streamingHost = new FakeHost(streamingSession.runtime);
-		const streamingRenderer = await createBoneTestRenderer({ width: 90, height: 24 });
+		const streamingRenderer = await createNativeTestRenderer({ width: 90, height: 24 });
 		const streamingMode = new OpenTUIInteractiveMode(streamingHost, {
 			createRenderer: async () => streamingRenderer,
 			createMemoryRuntime: () => new FakeMemoryRuntime(),
@@ -606,58 +695,54 @@ describe("OpenTUIInteractiveMode", () => {
 		streamingMode.stop();
 	});
 
-	test("wires plan approval, revision, and cancellation to the foreground session", async () => {
-		const scenarios = [
-			{ action: "approve" as const, down: 0 },
-			{ action: "revise" as const, down: 1 },
-			{ action: "cancel" as const, down: 2 },
-		];
-		for (const scenario of scenarios) {
-			const active = createRuntime();
-			const host = new FakeHost(active.runtime);
-			const renderer = await createBoneTestRenderer({ width: 100, height: 28 });
-			const mode = new OpenTUIInteractiveMode(host, {
-				createRenderer: async () => renderer,
-				createMemoryRuntime: () => new FakeMemoryRuntime(),
-				installSignalHandlers: false,
-			});
-			await mode.init();
-			const proposal = {
-				id: `plan-${scenario.action}`,
-				version: 2,
-				content: "# Implement the migration",
-				createdAt: new Date(0).toISOString(),
-				sourceMessageId: "assistant-1",
-			};
-			active.emit({ type: "plan_proposed", proposal });
-			active.emit({ type: "agent_settled" });
+	test.each([
+		{ action: "approve" as const, down: 0 },
+		{ action: "revise" as const, down: 1 },
+		{ action: "cancel" as const, down: 2 },
+	])("wires plan $action to the foreground session", async (scenario) => {
+		const active = createRuntime();
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 100, height: 28 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		const proposal = {
+			id: `plan-${scenario.action}`,
+			version: 2,
+			content: "# Implement the migration",
+			createdAt: new Date(0).toISOString(),
+			sourceMessageId: "assistant-1",
+		};
+		active.emit({ type: "plan_proposed", proposal });
+		active.emit({ type: "agent_settled" });
+		expect(await renderer.waitForFrameText("Plan v2")).toContain("Plan v2");
+		for (let index = 0; index < scenario.down; index++) renderer.input.pressArrow("down");
+		renderer.input.pressEnter();
+		if (scenario.action === "revise") {
 			await settle(renderer);
-			expect(renderer.captureFrame()).toContain("Plan v2");
-			for (let index = 0; index < scenario.down; index++) renderer.input.pressArrow("down");
+			expect(renderer.captureFrame()).toContain("Revise plan v2");
+			await renderer.input.typeText("Keep the public API smaller");
 			renderer.input.pressEnter();
-			if (scenario.action === "revise") {
-				await settle(renderer);
-				expect(renderer.captureFrame()).toContain("Revise plan v2");
-				await renderer.input.typeText("Keep the public API smaller");
-				renderer.input.pressEnter();
-			}
-			await mode.idle();
-			await settle(renderer);
-			if (scenario.action === "approve") {
-				expect(active.session.approvePlan).toHaveBeenCalledWith(proposal.id);
-			} else if (scenario.action === "revise") {
-				expect(active.session.revisePlan).toHaveBeenCalledWith(proposal.id, "Keep the public API smaller");
-			} else {
-				expect(active.session.cancelPlan).toHaveBeenCalledWith(proposal.id);
-			}
-			mode.stop();
 		}
+		await mode.idle();
+		await settle(renderer);
+		if (scenario.action === "approve") {
+			expect(active.session.approvePlan).toHaveBeenCalledWith(proposal.id);
+		} else if (scenario.action === "revise") {
+			expect(active.session.revisePlan).toHaveBeenCalledWith(proposal.id, "Keep the public API smaller");
+		} else {
+			expect(active.session.cancelPlan).toHaveBeenCalledWith(proposal.id);
+		}
+		mode.stop();
 	});
 
 	test("collects complete option, custom, and multi-select answers and restores composer focus", async () => {
 		const active = createRuntime();
 		const host = new FakeHost(active.runtime);
-		const renderer = await createBoneTestRenderer({ width: 110, height: 32 });
+		const renderer = await createNativeTestRenderer({ width: 110, height: 32 });
 		const mode = new OpenTUIInteractiveMode(host, {
 			createRenderer: async () => renderer,
 			createMemoryRuntime: () => new FakeMemoryRuntime(),
@@ -697,7 +782,7 @@ describe("OpenTUIInteractiveMode", () => {
 			],
 		};
 		active.emit({ type: "question_asked", request });
-		await settle(renderer);
+		expect(await renderer.waitForFrameText("Which runtime?")).toContain("Which runtime?");
 		renderer.input.pressEnter();
 
 		await settle(renderer);
@@ -742,7 +827,7 @@ describe("OpenTUIInteractiveMode", () => {
 	test("cancels a pending structured question when the questionnaire is dismissed", async () => {
 		const active = createRuntime();
 		const host = new FakeHost(active.runtime);
-		const renderer = await createBoneTestRenderer({ width: 90, height: 24 });
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
 		const mode = new OpenTUIInteractiveMode(host, {
 			createRenderer: async () => renderer,
 			createMemoryRuntime: () => new FakeMemoryRuntime(),
@@ -775,8 +860,8 @@ describe("OpenTUIInteractiveMode", () => {
 	test("closes a question dialog on an external abort and continues draining session events", async () => {
 		const active = createRuntime();
 		const host = new FakeHost(active.runtime);
-		const renderer = await createBoneTestRenderer({ width: 90, height: 24 });
-		const transcriptFactory = new OpenTUITranscriptFactory();
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const transcriptFactory = new OpenTUITranscriptFactory(renderer);
 		const handleEvent = vi.spyOn(transcriptFactory, "handleEvent");
 		const mode = new OpenTUIInteractiveMode(host, {
 			createRenderer: async () => renderer,
@@ -820,8 +905,8 @@ describe("OpenTUIInteractiveMode", () => {
 	test("closes a plan dialog on an external decision and continues draining session events", async () => {
 		const active = createRuntime();
 		const host = new FakeHost(active.runtime);
-		const renderer = await createBoneTestRenderer({ width: 100, height: 28 });
-		const transcriptFactory = new OpenTUITranscriptFactory();
+		const renderer = await createNativeTestRenderer({ width: 100, height: 28 });
+		const transcriptFactory = new OpenTUITranscriptFactory(renderer);
 		const handleEvent = vi.spyOn(transcriptFactory, "handleEvent");
 		const mode = new OpenTUIInteractiveMode(host, {
 			createRenderer: async () => renderer,

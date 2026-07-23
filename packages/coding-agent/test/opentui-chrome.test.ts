@@ -1,31 +1,30 @@
-import { type BoneTestRenderer, createBoneTestRenderer } from "@frelion/bone-tui";
+import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, describe, expect, test } from "vitest";
 import { OpenTUITopBar, OpenTUIWelcome } from "../src/modes/interactive/components/opentui-chrome.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
-const renderers = new Set<BoneTestRenderer>();
+const setups = new Set<TestRendererSetup>();
 
 afterEach(() => {
-	for (const renderer of renderers) renderer.destroy();
-	renderers.clear();
+	for (const setup of setups) setup.renderer.destroy();
+	setups.clear();
 });
 
 describe("OpenTUI chrome", () => {
 	test("removes the branded conversation top bar without spending a terminal row", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 80, height: 12 });
-		renderers.add(renderer);
-		renderer.start();
-		const topBar = new OpenTUITopBar({
+		const setup = await createTestRenderer({ width: 80, height: 12 });
+		setups.add(setup);
+		const topBar = new OpenTUITopBar(setup.renderer, {
 			conversation: "Current conversation",
 			workspace: "bone",
 			model: "openai/gpt-5",
 			thinking: "high",
 		});
-		renderer.mount(topBar);
-		await renderer.flush();
+		setup.renderer.root.add(topBar.root);
+		await setup.flush();
 
-		const frame = renderer.captureFrame();
+		const frame = setup.captureCharFrame();
 		expect(frame).not.toContain("BONE");
 		expect(frame).not.toContain("Current conversation");
 		expect(frame.split("\n").filter((line) => line.trim())).toHaveLength(0);
@@ -33,18 +32,17 @@ describe("OpenTUI chrome", () => {
 
 	test("shows a restrained empty-session welcome once and dismisses it permanently", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 80, height: 12 });
-		renderers.add(renderer);
-		renderer.start();
-		const welcome = new OpenTUIWelcome({ workspace: "~/src/bone" });
-		renderer.mount(welcome);
-		await renderer.flush();
-		expect(renderer.captureFrame()).toContain("What would you like to work on?");
-		expect(renderer.captureFrame()).toContain("~/src/bone");
+		const setup = await createTestRenderer({ width: 80, height: 12 });
+		setups.add(setup);
+		const welcome = new OpenTUIWelcome(setup.renderer, { workspace: "~/src/bone" });
+		setup.renderer.root.add(welcome.root);
+		await setup.flush();
+		expect(setup.captureCharFrame()).toContain("What would you like to work on?");
+		expect(setup.captureCharFrame()).toContain("~/src/bone");
 
 		welcome.dismiss();
-		await renderer.flush();
-		expect(renderer.captureFrame()).not.toContain("What would you like to work on?");
+		await setup.flush();
+		expect(setup.captureCharFrame()).not.toContain("What would you like to work on?");
 		expect(() => welcome.dismiss()).not.toThrow();
 	});
 });

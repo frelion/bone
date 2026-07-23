@@ -1,4 +1,4 @@
-import type { BoneContainerNode, BoneNode, BoneRenderContext, BoneTextNode, BoneView } from "@frelion/bone-tui";
+import { BoxRenderable, type CliRenderer, createTextAttributes, type Renderable, TextRenderable } from "@opentui/core";
 import { resolveOpenTUIDialogLayout } from "../opentui-design.ts";
 import { type Theme, theme } from "../theme/theme.ts";
 
@@ -12,19 +12,19 @@ export interface OpenTUIDialogShellOptions {
 }
 
 export interface OpenTUIDialogMount {
-	root: BoneContainerNode;
-	body: BoneContainerNode;
-	status: BoneTextNode;
+	root: BoxRenderable;
+	body: BoxRenderable;
+	status: TextRenderable;
 }
 
-/** Build a fixed-frame modal with a scrollable body and fixed footer/status. */
+/** Build a native modal tree. The caller owns attach, focus and destruction. */
 export function createOpenTUIDialogShell(
-	context: BoneRenderContext,
+	renderer: CliRenderer,
 	options: OpenTUIDialogShellOptions,
 ): OpenTUIDialogMount {
 	const dialogTheme = options.theme ?? theme;
-	const responsiveLayout = resolveOpenTUIDialogLayout(context.width, context.height);
-	const root = context.createBox({
+	const responsiveLayout = resolveOpenTUIDialogLayout(renderer.width, renderer.height);
+	const root = new BoxRenderable(renderer, {
 		width: options.width ?? responsiveLayout.width,
 		height: responsiveLayout.height,
 		maxHeight: options.maxHeight ?? responsiveLayout.maxHeight,
@@ -34,46 +34,44 @@ export function createOpenTUIDialogShell(
 		borderStyle: "single",
 		borderColor: dialogTheme.getFgColor("borderAccent"),
 		backgroundColor: dialogTheme.getBgColor("customMessageBg"),
-		focusable: true,
 	});
-	root.append(
-		context.createText({ content: options.title, fg: dialogTheme.getFgColor("accent"), bold: true, height: 1 }),
+	root.add(
+		new TextRenderable(renderer, {
+			content: options.title,
+			fg: dialogTheme.getFgColor("accent"),
+			attributes: createTextAttributes({ bold: true }),
+			height: 1,
+		}),
 	);
 	if (options.subtitle) {
-		root.append(
-			context.createText({ content: options.subtitle, fg: dialogTheme.getFgColor("muted"), wrapMode: "word" }),
+		root.add(
+			new TextRenderable(renderer, {
+				content: options.subtitle,
+				fg: dialogTheme.getFgColor("muted"),
+				wrapMode: "word",
+			}),
 		);
 	}
-	root.append(context.createSpacer({ size: 1, direction: "vertical" }));
-	const body = context.createBox({ width: "100%", flexDirection: "column", flexGrow: 1, minHeight: 1 });
-	root.append(body);
-	const status = context.createText({ content: "", fg: dialogTheme.getFgColor("warning"), wrapMode: "word" });
-	status.visible = false;
-	root.append(status);
+	root.add(new BoxRenderable(renderer, { height: 1, flexShrink: 0 }));
+	const body = new BoxRenderable(renderer, { width: "100%", flexDirection: "column", flexGrow: 1, minHeight: 1 });
+	root.add(body);
+	const status = new TextRenderable(renderer, {
+		content: "",
+		fg: dialogTheme.getFgColor("warning"),
+		wrapMode: "word",
+		visible: false,
+	});
+	root.add(status);
 	return { root, body, status };
 }
 
 export interface OpenTUIDialogViewOptions extends OpenTUIDialogShellOptions {
-	body: BoneView;
+	body: (renderer: CliRenderer) => Renderable;
 }
 
-export class OpenTUIDialogViewV2 implements BoneView {
-	private readonly options: OpenTUIDialogViewOptions;
-	private mounted: OpenTUIDialogMount | undefined;
-
-	constructor(options: OpenTUIDialogViewOptions) {
-		this.options = options;
-	}
-
-	mount(context: BoneRenderContext): BoneNode {
-		this.mounted = createOpenTUIDialogShell(context, this.options);
-		this.mounted.body.append(this.options.body.mount(context));
-		return this.mounted.root;
-	}
-
-	setStatus(message: string | undefined): void {
-		if (!this.mounted) return;
-		this.mounted.status.content = message ?? "";
-		this.mounted.status.visible = Boolean(message);
-	}
+/** Build a native dialog from a native body factory. */
+export function createOpenTUIDialogView(renderer: CliRenderer, options: OpenTUIDialogViewOptions): OpenTUIDialogMount {
+	const mounted = createOpenTUIDialogShell(renderer, options);
+	mounted.body.add(options.body(renderer));
+	return mounted;
 }

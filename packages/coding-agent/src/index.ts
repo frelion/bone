@@ -76,6 +76,7 @@ export type {
 	ExtensionUIToolViewRenderer,
 	ExtensionUIToolViewState,
 	ExtensionUIV2Context,
+	ExtensionUIView,
 	ExtensionUIViewFactory,
 	ExtensionUIViewHandle,
 	ExtensionUIWidgetOptionsV2,

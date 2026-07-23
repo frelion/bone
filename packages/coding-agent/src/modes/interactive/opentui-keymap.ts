@@ -1,4 +1,4 @@
-import type { BoneKeyEvent } from "@frelion/bone-tui";
+import type { KeyEvent } from "@opentui/core";
 
 export type OpenTUIAction =
 	| "confirm"
@@ -76,7 +76,7 @@ function normalizeName(name: string): string {
 }
 
 /** Match a product action against OpenTUI's structured keyboard event. */
-export function matchesOpenTUIAction(event: BoneKeyEvent, action: OpenTUIAction): boolean {
+export function matchesOpenTUIAction(event: KeyEvent, action: OpenTUIAction): boolean {
 	if (event.eventType === "release") return false;
 	const spec = OPEN_TUI_KEYMAP[action];
 	return (

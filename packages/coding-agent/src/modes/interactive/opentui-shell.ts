@@ -1,12 +1,11 @@
-import type {
-	BoneContainerNode,
-	BoneMouseEvent,
-	BoneNode,
-	BoneRenderContext,
-	BoneScrollViewNode,
-	BoneUnsubscribe,
-	BoneView,
-} from "@frelion/bone-tui";
+import {
+	BoxRenderable,
+	CliRenderEvents,
+	type CliRenderer,
+	type MouseEvent,
+	type Renderable,
+	ScrollBoxRenderable,
+} from "@opentui/core";
 import {
 	clampOpenTUISidebarWidth,
 	OPEN_TUI_COLORS,
@@ -22,59 +21,45 @@ export interface OpenTUIInteractiveShellOptions {
 
 export type OpenTUIPrimaryPane = "sidebar" | "main";
 
-/** Full-width conversation workspace with a persistent, draggable session rail. */
-export class OpenTUIInteractiveShell implements BoneView {
+/** Full-width native OpenTUI workspace with one transcript scroll owner. */
+export class OpenTUIInteractiveShell {
+	readonly root: BoxRenderable;
+	readonly transcript: ScrollBoxRenderable;
 	public onTranscriptFocusRequest?: () => void;
 	public onTranscriptScrollRequest?: (deltaRows: number) => void;
 	public onTranscriptContentChange?: () => void;
 	public onSidebarWidthChange?: (width: number) => void;
+	private readonly renderer: CliRenderer;
+	private readonly bodyRoot: BoxRenderable;
+	private readonly sidebarRoot: BoxRenderable;
+	private readonly separatorRoot: BoxRenderable;
+	private readonly mainRoot: BoxRenderable;
+	private readonly fixedRoot: BoxRenderable;
+	private readonly headerRoot: BoxRenderable;
+	private readonly aboveEditorRoot: BoxRenderable;
+	private readonly editorRoot: BoxRenderable;
+	private readonly belowEditorRoot: BoxRenderable;
+	private readonly footerRoot: BoxRenderable;
+	private readonly resizeHandler: () => void;
 	private sidebarWidthValue: number;
-	private context: BoneRenderContext | undefined;
-	private shellRoot: BoneContainerNode | undefined;
-	private bodyRoot: BoneContainerNode | undefined;
-	private sidebarRoot: BoneContainerNode | undefined;
-	private separatorRoot: BoneContainerNode | undefined;
-	private mainRoot: BoneContainerNode | undefined;
-	private transcriptRoot: BoneScrollViewNode | undefined;
-	private fixedRoot: BoneContainerNode | undefined;
-	private headerRoot: BoneContainerNode | undefined;
-	private aboveEditorRoot: BoneContainerNode | undefined;
-	private editorRoot: BoneContainerNode | undefined;
-	private belowEditorRoot: BoneContainerNode | undefined;
-	private footerRoot: BoneContainerNode | undefined;
-	private unsubscribeResize: BoneUnsubscribe | undefined;
 	private activePane: OpenTUIPrimaryPane = "main";
 	private layoutModeValue: OpenTUILayoutMode = "split";
 	private separatorHovered = false;
 	private separatorDragging = false;
 	private sidebarPersistTimer: ReturnType<typeof setTimeout> | undefined;
 
-	constructor(options: OpenTUIInteractiveShellOptions = {}) {
+	constructor(renderer: CliRenderer, options: OpenTUIInteractiveShellOptions = {}) {
+		this.renderer = renderer;
 		this.sidebarWidthValue = clampOpenTUISidebarWidth(options.sidebarWidth ?? OPEN_TUI_LAYOUT.sidebarDefaultWidth);
-	}
-
-	get layoutMode(): OpenTUILayoutMode {
-		return this.layoutModeValue;
-	}
-
-	get primaryPane(): OpenTUIPrimaryPane {
-		return this.activePane;
-	}
-
-	get sidebarWidth(): number {
-		return this.sidebarWidthValue;
-	}
-
-	mount(context: BoneRenderContext): BoneNode {
-		if (this.shellRoot) throw new Error("OpenTUIInteractiveShell is already mounted");
-		this.context = context;
-		const root = context.createBox({
+		this.root = new BoxRenderable(renderer, {
+			id: "bone-shell",
 			width: "100%",
 			height: "100%",
 			flexDirection: "column",
 			backgroundColor: OPEN_TUI_COLORS.page,
 		});
-		const body = context.createBox({
+		this.bodyRoot = new BoxRenderable(renderer, {
+			id: "bone-shell-body",
 			flexDirection: "row",
 			flexGrow: 1,
 			minHeight: 0,
@@ -83,7 +68,8 @@ export class OpenTUIInteractiveShell implements BoneView {
 			onMouseDrag: (event) => this.updateSidebarDrag(event),
 			onMouseDragEnd: (event) => this.endSidebarDrag(event),
 		});
-		const sidebar = context.createBox({
+		this.sidebarRoot = new BoxRenderable(renderer, {
+			id: "bone-sidebar-region",
 			height: "100%",
 			flexShrink: 0,
 			flexDirection: "column",
@@ -91,7 +77,8 @@ export class OpenTUIInteractiveShell implements BoneView {
 			paddingX: 1,
 			backgroundColor: OPEN_TUI_COLORS.panel,
 		});
-		const separator = context.createBox({
+		this.separatorRoot = new BoxRenderable(renderer, {
+			id: "bone-sidebar-separator",
 			width: OPEN_TUI_LAYOUT.separatorWidth,
 			height: "100%",
 			flexShrink: 0,
@@ -109,24 +96,25 @@ export class OpenTUIInteractiveShell implements BoneView {
 				this.refreshSeparator();
 			},
 		});
-		const main = context.createBox({
+		this.mainRoot = new BoxRenderable(renderer, {
+			id: "bone-main-region",
 			flexDirection: "column",
 			flexGrow: 1,
 			height: "100%",
 			minWidth: 0,
 			minHeight: 0,
 			backgroundColor: OPEN_TUI_COLORS.page,
-			onMouseScroll: (event) => this.handleMainScroll(event),
 		});
-		const mainInner = context.createBox({
+		const mainInner = new BoxRenderable(renderer, {
 			flexDirection: "column",
 			width: "100%",
 			height: "100%",
 			minHeight: 0,
 			paddingX: 1,
 		});
-		const header = context.createBox({ flexDirection: "column", flexShrink: 0 });
-		const transcript = context.createScrollView({
+		this.headerRoot = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 });
+		this.transcript = new ScrollBoxRenderable(renderer, {
+			id: "bone-transcript",
 			flexGrow: 1,
 			flexBasis: 0,
 			width: "100%",
@@ -137,105 +125,98 @@ export class OpenTUIInteractiveShell implements BoneView {
 			viewportCulling: true,
 			onMouseDown: () => this.onTranscriptFocusRequest?.(),
 		});
-		const fixed = context.createBox({ flexDirection: "column", flexShrink: 0 });
-		const aboveEditor = context.createBox({ flexDirection: "column" });
-		const editor = context.createBox({ flexDirection: "column" });
-		const belowEditor = context.createBox({ flexDirection: "column" });
-		const footer = context.createBox({ flexDirection: "column" });
-		fixed.append(aboveEditor);
-		fixed.append(editor);
-		fixed.append(belowEditor);
-		fixed.append(footer);
+		this.fixedRoot = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 });
+		this.aboveEditorRoot = new BoxRenderable(renderer, { flexDirection: "column" });
+		this.editorRoot = new BoxRenderable(renderer, { flexDirection: "column" });
+		this.belowEditorRoot = new BoxRenderable(renderer, { flexDirection: "column" });
+		this.footerRoot = new BoxRenderable(renderer, { flexDirection: "column" });
 
-		mainInner.append(header);
-		mainInner.append(transcript);
-		mainInner.append(fixed);
-		main.append(mainInner);
-		body.append(sidebar);
-		body.append(separator);
-		body.append(main);
-		root.append(body);
+		this.fixedRoot.add(this.aboveEditorRoot);
+		this.fixedRoot.add(this.editorRoot);
+		this.fixedRoot.add(this.belowEditorRoot);
+		this.fixedRoot.add(this.footerRoot);
+		mainInner.add(this.headerRoot);
+		mainInner.add(this.transcript);
+		mainInner.add(this.fixedRoot);
+		this.mainRoot.add(mainInner);
+		this.bodyRoot.add(this.sidebarRoot);
+		this.bodyRoot.add(this.separatorRoot);
+		this.bodyRoot.add(this.mainRoot);
+		this.root.add(this.bodyRoot);
 
-		this.shellRoot = root;
-		this.bodyRoot = body;
-		this.sidebarRoot = sidebar;
-		this.separatorRoot = separator;
-		this.mainRoot = main;
-		this.transcriptRoot = transcript;
-		this.fixedRoot = fixed;
-		this.headerRoot = header;
-		this.aboveEditorRoot = aboveEditor;
-		this.editorRoot = editor;
-		this.belowEditorRoot = belowEditor;
-		this.footerRoot = footer;
-		this.applyResponsiveLayout(context.width);
-		this.unsubscribeResize = context.onResize((width) => this.applyResponsiveLayout(width));
-		return root;
+		this.applyResponsiveLayout(renderer.width);
+		this.resizeHandler = () => this.applyResponsiveLayout(renderer.width);
+		renderer.on(CliRenderEvents.RESIZE, this.resizeHandler);
+	}
+
+	get layoutMode(): OpenTUILayoutMode {
+		return this.layoutModeValue;
+	}
+
+	get primaryPane(): OpenTUIPrimaryPane {
+		return this.activePane;
+	}
+
+	get sidebarWidth(): number {
+		return this.sidebarWidthValue;
 	}
 
 	showPane(pane: OpenTUIPrimaryPane): void {
 		this.activePane = pane;
-		if (this.context) this.applyResponsiveLayout(this.context.width);
+		this.applyResponsiveLayout(this.renderer.width);
 	}
 
 	setSidebarWidth(width: number, persist = false): void {
 		const next = clampOpenTUISidebarWidth(width);
 		if (next === this.sidebarWidthValue) return;
 		this.sidebarWidthValue = next;
-		if (this.context) this.applyResponsiveLayout(this.context.width);
+		this.applyResponsiveLayout(this.renderer.width);
 		if (persist) this.onSidebarWidthChange?.(next);
 	}
 
-	appendTranscript(view: BoneView): BoneNode {
-		const node = view.mount(this.requireContext());
-		this.requireTranscript().append(node);
+	appendTranscript(node: Renderable): Renderable {
+		this.transcript.add(node);
 		if (this.onTranscriptContentChange) this.onTranscriptContentChange();
-		else this.requireTranscript().scrollTo(Number.MAX_SAFE_INTEGER);
+		else this.transcript.scrollTo(Number.MAX_SAFE_INTEGER);
 		return node;
 	}
 
-	appendFixed(view: BoneView): BoneNode {
-		const node = view.mount(this.requireContext());
-		this.requireFixed().append(node);
+	appendFixed(node: Renderable): Renderable {
+		this.fixedRoot.add(node);
 		return node;
 	}
 
-	setSidebar(view: BoneView | undefined): BoneNode | undefined {
-		const sidebar = this.requireSidebar();
-		sidebar.clear();
-		if (!view) return undefined;
-		const node = view.mount(this.requireContext());
-		sidebar.append(node);
+	setSidebar(node: Renderable | undefined): Renderable | undefined {
+		this.clearChildren(this.sidebarRoot);
+		if (!node) return undefined;
+		this.sidebarRoot.add(node);
 		return node;
 	}
 
 	clearTranscript(): void {
-		this.requireTranscript().clear();
+		this.clearChildren(this.transcript);
 	}
 
 	updateTheme(_nextTheme: Theme): void {
-		// V2 intentionally owns one OpenCode-derived dark surface system.
+		// The product surface currently owns one OpenCode-derived dark palette.
 	}
 
 	scrollTranscript(deltaRows: number): void {
 		if (this.onTranscriptScrollRequest) this.onTranscriptScrollRequest(deltaRows);
-		else this.requireTranscript().scrollBy(deltaRows);
+		else this.transcript.scrollBy(deltaRows);
 	}
 
-	getTranscriptNode(): BoneScrollViewNode {
-		return this.requireTranscript();
+	getTranscriptNode(): ScrollBoxRenderable {
+		return this.transcript;
 	}
 
 	getExtensionRegions(): {
-		header: BoneContainerNode;
-		aboveEditor: BoneContainerNode;
-		editor: BoneContainerNode;
-		belowEditor: BoneContainerNode;
-		footer: BoneContainerNode;
+		header: BoxRenderable;
+		aboveEditor: BoxRenderable;
+		editor: BoxRenderable;
+		belowEditor: BoxRenderable;
+		footer: BoxRenderable;
 	} {
-		if (!this.headerRoot || !this.aboveEditorRoot || !this.editorRoot || !this.belowEditorRoot || !this.footerRoot) {
-			throw new Error("OpenTUIInteractiveShell must be mounted first");
-		}
 		return {
 			header: this.headerRoot,
 			aboveEditor: this.aboveEditorRoot,
@@ -246,13 +227,12 @@ export class OpenTUIInteractiveShell implements BoneView {
 	}
 
 	dispose(): void {
-		this.unsubscribeResize?.();
-		this.unsubscribeResize = undefined;
+		this.renderer.off(CliRenderEvents.RESIZE, this.resizeHandler);
 		if (this.sidebarPersistTimer) clearTimeout(this.sidebarPersistTimer);
 		this.sidebarPersistTimer = undefined;
 	}
 
-	private beginSidebarDrag(event: BoneMouseEvent): void {
+	private beginSidebarDrag(event: MouseEvent): void {
 		if (event.button !== 0) return;
 		this.separatorDragging = true;
 		this.refreshSeparator();
@@ -261,7 +241,7 @@ export class OpenTUIInteractiveShell implements BoneView {
 		event.stopPropagation();
 	}
 
-	private updateSidebarDrag(event: BoneMouseEvent): void {
+	private updateSidebarDrag(event: MouseEvent): void {
 		if (!this.separatorDragging) return;
 		this.updateSidebarWidthFromPointer(event.x);
 		this.scheduleSidebarWidthPersist();
@@ -269,7 +249,7 @@ export class OpenTUIInteractiveShell implements BoneView {
 		event.stopPropagation();
 	}
 
-	private endSidebarDrag(event: BoneMouseEvent): void {
+	private endSidebarDrag(event: MouseEvent): void {
 		if (!this.separatorDragging) return;
 		this.updateSidebarWidthFromPointer(event.x);
 		this.separatorDragging = false;
@@ -291,74 +271,42 @@ export class OpenTUIInteractiveShell implements BoneView {
 	}
 
 	private updateSidebarWidthFromPointer(pointerX: number): void {
-		const context = this.context;
-		if (!context) return;
 		const maxForMain = Math.max(
 			OPEN_TUI_LAYOUT.sidebarMinWidth,
-			context.width - OPEN_TUI_LAYOUT.separatorWidth - OPEN_TUI_LAYOUT.mainMinWidth,
+			this.renderer.width - OPEN_TUI_LAYOUT.separatorWidth - OPEN_TUI_LAYOUT.mainMinWidth,
 		);
 		this.setSidebarWidth(Math.min(pointerX, maxForMain));
 	}
 
 	private refreshSeparator(): void {
-		this.separatorRoot?.updateStyle({
-			backgroundColor:
-				this.separatorDragging || this.separatorHovered ? OPEN_TUI_COLORS.primary : OPEN_TUI_COLORS.borderSubtle,
-		});
-	}
-
-	private handleMainScroll(event: BoneMouseEvent): void {
-		const direction = event.scrollDirection;
-		if (direction !== "up" && direction !== "down") return;
-		const delta = Math.max(1, Math.round(event.scrollDelta ?? 3));
-		const rows = direction === "up" ? -delta : delta;
-		if (this.onTranscriptScrollRequest) this.onTranscriptScrollRequest(rows);
-		else this.transcriptRoot?.scrollBy(rows);
-		event.preventDefault();
-		event.stopPropagation();
+		this.separatorRoot.backgroundColor =
+			this.separatorDragging || this.separatorHovered ? OPEN_TUI_COLORS.primary : OPEN_TUI_COLORS.borderSubtle;
 	}
 
 	private applyResponsiveLayout(width: number): void {
-		const sidebar = this.sidebarRoot;
-		const separator = this.separatorRoot;
-		const main = this.mainRoot;
-		const body = this.bodyRoot;
-		if (!sidebar || !separator || !main || !body) return;
 		this.layoutModeValue = resolveOpenTUILayoutMode(width, this.sidebarWidthValue);
 		if (this.layoutModeValue === "split") {
-			sidebar.visible = true;
-			separator.visible = true;
-			main.visible = true;
-			sidebar.updateLayout({ width: this.sidebarWidthValue });
-			separator.updateLayout({ width: OPEN_TUI_LAYOUT.separatorWidth });
-			main.updateLayout({ width: "auto", flexGrow: 1 });
+			this.sidebarRoot.visible = true;
+			this.separatorRoot.visible = true;
+			this.mainRoot.visible = true;
+			this.sidebarRoot.width = this.sidebarWidthValue;
+			this.separatorRoot.width = OPEN_TUI_LAYOUT.separatorWidth;
+			this.mainRoot.width = "auto";
+			this.mainRoot.flexGrow = 1;
 			return;
 		}
-		separator.visible = false;
+		this.separatorRoot.visible = false;
 		const showSidebar = this.activePane === "sidebar";
-		sidebar.visible = showSidebar;
-		main.visible = !showSidebar;
-		if (showSidebar) sidebar.updateLayout({ width: "100%" });
-		else main.updateLayout({ width: "100%", flexGrow: 1 });
+		this.sidebarRoot.visible = showSidebar;
+		this.mainRoot.visible = !showSidebar;
+		if (showSidebar) this.sidebarRoot.width = "100%";
+		else {
+			this.mainRoot.width = "100%";
+			this.mainRoot.flexGrow = 1;
+		}
 	}
 
-	private requireContext(): BoneRenderContext {
-		if (!this.context) throw new Error("OpenTUIInteractiveShell must be mounted first");
-		return this.context;
-	}
-
-	private requireSidebar(): BoneContainerNode {
-		if (!this.sidebarRoot) throw new Error("OpenTUIInteractiveShell must be mounted first");
-		return this.sidebarRoot;
-	}
-
-	private requireTranscript(): BoneScrollViewNode {
-		if (!this.transcriptRoot) throw new Error("OpenTUIInteractiveShell must be mounted first");
-		return this.transcriptRoot;
-	}
-
-	private requireFixed(): BoneContainerNode {
-		if (!this.fixedRoot) throw new Error("OpenTUIInteractiveShell must be mounted first");
-		return this.fixedRoot;
+	private clearChildren(parent: Renderable): void {
+		for (const child of parent.getChildren()) child.destroyRecursively();
 	}
 }

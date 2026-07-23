@@ -1,11 +1,12 @@
-import type {
-	BoneContainerNode,
-	BoneInputNode,
-	BoneNode,
-	BoneRenderContext,
-	BoneScrollViewNode,
-	BoneView,
-} from "@frelion/bone-tui";
+import {
+	BoxRenderable,
+	type CliRenderer,
+	InputRenderable,
+	InputRenderableEvents,
+	type Renderable,
+	SelectRenderable,
+	SelectRenderableEvents,
+} from "@opentui/core";
 import { type Theme, theme } from "../theme/theme.ts";
 import { createOpenTUIDialogShell, type OpenTUIDialogMount } from "./opentui-dialog-v2.ts";
 
@@ -35,18 +36,17 @@ export interface OpenTUISelectorOptions<T> {
 	onPreview?: (value: T) => void;
 }
 
-/** Generic structured selector. Callers map keyboard events to handleAction(). */
-export class OpenTUISelectorViewV2<T> implements BoneView {
+/** Native SelectRenderable-backed structured selector. */
+export class OpenTUISelectorViewV2<T> {
 	private readonly options: OpenTUISelectorOptions<T>;
 	private readonly selectorTheme: Theme;
 	private allItems: OpenTUISelectorItem<T>[];
 	private filteredItems: OpenTUISelectorItem<T>[];
 	private selectedIndex: number;
 	private queryValue = "";
-	private context: BoneRenderContext | undefined;
 	private dialog: OpenTUIDialogMount | undefined;
-	private list: BoneScrollViewNode | undefined;
-	private searchInput: BoneInputNode | undefined;
+	private select: SelectRenderable | undefined;
+	private searchInput: InputRenderable | undefined;
 
 	constructor(options: OpenTUISelectorOptions<T>) {
 		this.options = options;
@@ -56,40 +56,75 @@ export class OpenTUISelectorViewV2<T> implements BoneView {
 		this.selectedIndex = Math.max(0, Math.min(options.selectedIndex ?? 0, this.filteredItems.length - 1));
 	}
 
+	get root(): BoxRenderable | undefined {
+		return this.dialog?.root;
+	}
+
+	get focusTarget(): Renderable | undefined {
+		return this.searchInput ?? this.select;
+	}
+
 	get selectedItem(): OpenTUISelectorItem<T> | undefined {
-		return this.filteredItems[this.selectedIndex];
+		const index = this.select?.getSelectedIndex() ?? this.selectedIndex;
+		return this.filteredItems[index];
 	}
 
 	get query(): string {
 		return this.queryValue;
 	}
 
-	mount(context: BoneRenderContext): BoneNode {
-		if (this.dialog) throw new Error("OpenTUISelectorViewV2 is already mounted");
-		this.context = context;
-		this.dialog = createOpenTUIDialogShell(context, {
+	build(renderer: CliRenderer): BoxRenderable {
+		if (this.dialog) throw new Error("OpenTUISelectorViewV2 is already built");
+		this.dialog = createOpenTUIDialogShell(renderer, {
 			title: this.options.title,
 			subtitle: this.options.subtitle,
 			footer: this.options.footer,
 			theme: this.selectorTheme,
 		});
 		if (this.options.searchable) {
-			this.searchInput = context.createInput({
+			this.searchInput = new InputRenderable(renderer, {
 				width: "100%",
 				placeholder: this.options.searchPlaceholder ?? "Search",
 				textColor: this.selectorTheme.getFgColor("text"),
 				focusedTextColor: this.selectorTheme.getFgColor("text"),
 				placeholderColor: this.selectorTheme.getFgColor("muted"),
-				onInput: (value) => this.setQuery(value),
 			});
-			this.dialog.body.append(this.searchInput);
-			this.dialog.body.append(context.createSpacer({ size: 1, direction: "vertical" }));
+			this.searchInput.on(InputRenderableEvents.INPUT, (value: string) => this.setQuery(value));
+			this.searchInput.on(InputRenderableEvents.ENTER, () => this.selectCurrent());
+			this.dialog.body.add(this.searchInput);
+			this.dialog.body.add(new BoxRenderable(renderer, { height: 1, flexShrink: 0 }));
 		}
-		this.list = context.createScrollView({ width: "100%", flexGrow: 1, minHeight: 1, scrollY: true });
-		this.dialog.body.append(this.list);
-		this.rebuildList();
-		(this.searchInput ?? this.dialog.root).focus();
+		this.select = new SelectRenderable(renderer, {
+			width: "100%",
+			flexGrow: 1,
+			minHeight: 1,
+			options: this.nativeOptions(),
+			selectedIndex: this.selectedIndex,
+			backgroundColor: this.selectorTheme.getBgColor("customMessageBg"),
+			textColor: this.selectorTheme.getFgColor("text"),
+			focusedTextColor: this.selectorTheme.getFgColor("text"),
+			selectedBackgroundColor: this.selectorTheme.getBgColor("selectedBg"),
+			selectedTextColor: this.selectorTheme.getFgColor("accent"),
+			descriptionColor: this.selectorTheme.getFgColor("muted"),
+			selectedDescriptionColor: this.selectorTheme.getFgColor("muted"),
+			showDescription: true,
+			showSelectionIndicator: true,
+		});
+		this.select.on(SelectRenderableEvents.SELECTION_CHANGED, (index: number) => {
+			this.selectedIndex = index;
+			const selected = this.filteredItems[index];
+			if (selected) this.options.onPreview?.(selected.value);
+		});
+		this.select.on(SelectRenderableEvents.ITEM_SELECTED, (index: number) => {
+			const selected = this.filteredItems[index];
+			if (selected && !selected.disabled) this.options.onSelect(selected.value);
+		});
+		this.dialog.body.add(this.select);
 		return this.dialog.root;
+	}
+
+	focus(): void {
+		this.focusTarget?.focus();
 	}
 
 	setItems(items: readonly OpenTUISelectorItem<T>[]): void {
@@ -114,18 +149,18 @@ export class OpenTUISelectorViewV2<T> implements BoneView {
 			return true;
 		}
 		if (action === "confirm") {
-			const selected = this.selectedItem;
-			if (selected && !selected.disabled) this.options.onSelect(selected.value);
+			this.selectCurrent();
 			return true;
 		}
-		if (this.filteredItems.length === 0) return true;
-		const pageSize = Math.max(1, this.options.pageSize ?? 8);
-		const delta = action === "up" ? -1 : action === "down" ? 1 : action === "pageUp" ? -pageSize : pageSize;
-		this.selectedIndex = Math.max(0, Math.min(this.filteredItems.length - 1, this.selectedIndex + delta));
-		this.rebuildList();
-		const selected = this.selectedItem;
-		if (selected) this.options.onPreview?.(selected.value);
+		if (!this.select || this.filteredItems.length === 0) return true;
+		const steps = action === "pageUp" || action === "pageDown" ? Math.max(1, this.options.pageSize ?? 8) : 1;
+		if (action === "up" || action === "pageUp") this.select.moveUp(steps);
+		else this.select.moveDown(steps);
 		return true;
+	}
+
+	private selectCurrent(): void {
+		this.select?.selectCurrent();
 	}
 
 	private filterItems(): void {
@@ -136,67 +171,15 @@ export class OpenTUISelectorViewV2<T> implements BoneView {
 				)
 			: [...this.allItems];
 		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, this.filteredItems.length - 1));
-		this.rebuildList();
+		if (!this.select) return;
+		this.select.options = this.nativeOptions();
+		if (this.filteredItems.length > 0) this.select.selectedIndex = this.selectedIndex;
 	}
 
-	private rebuildList(): void {
-		const context = this.context;
-		const list = this.list;
-		if (!context || !list) return;
-		list.clear();
-		if (this.filteredItems.length === 0) {
-			list.append(
-				context.createText({ content: "No matching options", fg: this.selectorTheme.getFgColor("muted") }),
-			);
-			return;
-		}
-		for (let index = 0; index < this.filteredItems.length; index++) {
-			const item = this.filteredItems[index]!;
-			const selected = index === this.selectedIndex;
-			const row: BoneContainerNode = context.createBox({
-				width: "100%",
-				flexDirection: "column",
-				backgroundColor: selected ? this.selectorTheme.getBgColor("selectedBg") : undefined,
-				onMouseDown: (event) => {
-					this.selectedIndex = index;
-					this.rebuildList();
-					this.options.onPreview?.(item.value);
-					event.preventDefault();
-					event.stopPropagation();
-				},
-			});
-			const labelRow = context.createBox({ width: "100%", flexDirection: "row", gap: 1 });
-			labelRow.append(
-				context.createText({
-					content: selected ? "›" : "·",
-					fg: this.selectorTheme.getFgColor(selected ? "accent" : "muted"),
-					flexShrink: 0,
-				}),
-			);
-			labelRow.append(
-				context.createText({
-					content: item.label,
-					fg: this.selectorTheme.getFgColor(item.disabled ? "dim" : selected ? "accent" : "text"),
-					bold: selected,
-					truncate: true,
-					flexGrow: 1,
-					minWidth: 1,
-				}),
-			);
-			row.append(labelRow);
-			if (item.description || item.current) {
-				row.append(
-					context.createText({
-						content: item.current ? `${item.description ?? ""} (current)`.trim() : item.description!,
-						fg: this.selectorTheme.getFgColor(item.current ? "success" : "muted"),
-						truncate: true,
-						paddingLeft: 2,
-					}),
-				);
-			}
-			list.append(row);
-		}
-		const selected = this.selectedItem;
-		if (selected) list.scrollTo(Math.max(0, this.selectedIndex - 1));
+	private nativeOptions(): Array<{ name: string; description: string }> {
+		return this.filteredItems.map((item) => ({
+			name: item.label,
+			description: item.current ? `${item.description ?? ""} (current)`.trim() : (item.description ?? ""),
+		}));
 	}
 }

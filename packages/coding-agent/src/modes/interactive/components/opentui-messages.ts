@@ -1,18 +1,31 @@
 import type { AssistantMessage } from "@frelion/bone-ai";
-import type {
-	BoneContainerNode,
-	BoneMarkdownNode,
-	BoneNode,
-	BoneRenderContext,
-	BoneTextNode,
-	BoneView,
-} from "@frelion/bone-tui";
+import {
+	BoxRenderable,
+	type CliRenderer,
+	MarkdownRenderable,
+	SyntaxStyle,
+	TextAttributes,
+	TextRenderable,
+} from "@opentui/core";
 import type { PlanProposal } from "../../../core/plan-mode.ts";
 import { PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG } from "../../../core/plan-mode.ts";
 import { type Theme, theme } from "../theme/theme.ts";
 
-function appendSpacer(context: BoneRenderContext, parent: BoneContainerNode, size = 1): void {
-	parent.append(context.createSpacer({ size, direction: "vertical" }));
+function appendSpacer(renderer: CliRenderer, parent: BoxRenderable, size = 1): void {
+	parent.add(new BoxRenderable(renderer, { width: "100%", height: size }));
+}
+
+function clearChildren(root: BoxRenderable): void {
+	for (const child of root.getChildren()) child.destroyRecursively();
+}
+
+function markdownStyle(fg: string): SyntaxStyle {
+	return SyntaxStyle.fromStyles({
+		default: { fg },
+		"markup.heading": { fg, bold: true },
+		"markup.link": { fg: "#5fafff", underline: true },
+		"markup.raw": { fg: "#87d787" },
+	});
 }
 
 function getVisibleTextParts(message: AssistantMessage): Map<number, string> {
@@ -49,30 +62,27 @@ function getVisibleTextParts(message: AssistantMessage): Map<number, string> {
 	return visibleByIndex;
 }
 
-export class OpenTUIUserMessage implements BoneView {
+export class OpenTUIUserMessage {
+	readonly root: BoxRenderable;
 	private readonly text: string;
 	private readonly outputPad: number;
 	private readonly messageTheme: Theme;
 
-	constructor(text: string, outputPad = 1, messageTheme: Theme = theme) {
+	constructor(renderer: CliRenderer, text: string, outputPad = 1, messageTheme: Theme = theme) {
 		this.text = text;
 		this.outputPad = outputPad;
 		this.messageTheme = messageTheme;
-	}
-
-	mount(context: BoneRenderContext): BoneNode {
-		const root = context.createBox({ flexDirection: "column" });
-		appendSpacer(context, root);
-		const body = context.createBox({ flexDirection: "column", paddingX: this.outputPad });
-		body.append(
-			context.createText({
+		this.root = new BoxRenderable(renderer, { flexDirection: "column" });
+		appendSpacer(renderer, this.root);
+		const body = new BoxRenderable(renderer, { flexDirection: "column", paddingX: this.outputPad });
+		body.add(
+			new TextRenderable(renderer, {
 				content: `› ${this.text}`,
 				fg: this.messageTheme.getFgColor("userMessageText"),
 				wrapMode: "word",
 			}),
 		);
-		root.append(body);
-		return root;
+		this.root.add(body);
 	}
 }
 
@@ -153,16 +163,17 @@ export function hasVisibleOpenTUIAssistantContent(
 	);
 }
 
-export class OpenTUIAssistantMessage implements BoneView {
+export class OpenTUIAssistantMessage {
+	readonly root: BoxRenderable;
 	private message: AssistantMessage;
 	private readonly options: Required<Omit<OpenTUIAssistantMessageOptions, "theme">>;
 	private readonly messageTheme: Theme;
-	private context: BoneRenderContext | undefined;
-	private root: BoneContainerNode | undefined;
+	private readonly renderer: CliRenderer;
 	private renderedKinds: AssistantSegmentKind[] = [];
-	private renderedNodes: Array<BoneMarkdownNode | BoneTextNode> = [];
+	private renderedNodes: Array<MarkdownRenderable | TextRenderable> = [];
 
-	constructor(message: AssistantMessage, options: OpenTUIAssistantMessageOptions = {}) {
+	constructor(renderer: CliRenderer, message: AssistantMessage, options: OpenTUIAssistantMessageOptions = {}) {
+		this.renderer = renderer;
 		this.message = message;
 		this.options = {
 			hideThinkingBlock: options.hideThinkingBlock ?? false,
@@ -171,13 +182,8 @@ export class OpenTUIAssistantMessage implements BoneView {
 			hideProposedPlan: options.hideProposedPlan ?? false,
 		};
 		this.messageTheme = options.theme ?? theme;
-	}
-
-	mount(context: BoneRenderContext): BoneNode {
-		this.context = context;
-		this.root = context.createBox({ flexDirection: "column" });
+		this.root = new BoxRenderable(renderer, { flexDirection: "column" });
 		this.rebuild();
-		return this.root;
 	}
 
 	updateContent(message: AssistantMessage): void {
@@ -186,16 +192,15 @@ export class OpenTUIAssistantMessage implements BoneView {
 	}
 
 	private rebuild(): void {
-		const context = this.context;
 		const root = this.root;
-		if (!context || !root) return;
+		if (root.isDestroyed) return;
 		const segments = createAssistantSegments(this.message, this.options);
 
 		const kinds = segments.map((segment) => segment.kind);
 		if (
 			kinds.length === this.renderedKinds.length &&
 			kinds.every((kind, index) => kind === this.renderedKinds[index]) &&
-			this.renderedNodes.every((node) => !node.destroyed)
+			this.renderedNodes.every((node) => !node.isDestroyed)
 		) {
 			for (let index = 0; index < segments.length; index++) {
 				const node = this.renderedNodes[index];
@@ -206,66 +211,65 @@ export class OpenTUIAssistantMessage implements BoneView {
 			return;
 		}
 
-		root.clear();
+		clearChildren(root);
 		this.renderedKinds = kinds;
 		this.renderedNodes = [];
 		if (segments.length === 0) return;
-		appendSpacer(context, root);
+		appendSpacer(this.renderer, root);
 		for (const segment of segments) {
-			if (segment.kind === "error" && segments.length > 1) appendSpacer(context, root);
+			if (segment.kind === "error" && segments.length > 1) appendSpacer(this.renderer, root);
 			const node =
 				segment.kind === "thinking-label" || segment.kind === "error"
-					? context.createText({
+					? new TextRenderable(this.renderer, {
 							content: segment.content,
 							paddingX: this.options.outputPad,
 							fg: this.messageTheme.getFgColor(segment.kind === "error" ? "error" : "thinkingText"),
-							italic: segment.kind === "thinking-label",
+							attributes: segment.kind === "thinking-label" ? TextAttributes.ITALIC : TextAttributes.NONE,
 							wrapMode: "word",
 						})
-					: context.createMarkdown({
+					: new MarkdownRenderable(this.renderer, {
 							content: segment.content,
 							paddingX: this.options.outputPad,
 							fg: this.messageTheme.getFgColor(segment.kind === "thinking" ? "thinkingText" : "text"),
 							streaming: this.message.stopReason === undefined,
+							syntaxStyle: markdownStyle(this.messageTheme.getFgColor("text")),
 						});
 			this.renderedNodes.push(node);
-			root.append(node);
+			root.add(node);
 		}
 	}
 }
 
-export class OpenTUIPlanProposal implements BoneView {
+export class OpenTUIPlanProposal {
+	readonly root: BoxRenderable;
 	private readonly proposal: PlanProposal;
 	private readonly proposalTheme: Theme;
 
-	constructor(proposal: PlanProposal, proposalTheme: Theme = theme) {
+	constructor(renderer: CliRenderer, proposal: PlanProposal, proposalTheme: Theme = theme) {
 		this.proposal = proposal;
 		this.proposalTheme = proposalTheme;
-	}
-
-	mount(context: BoneRenderContext): BoneNode {
-		const root = context.createBox({ flexDirection: "column" });
-		appendSpacer(context, root);
-		const box = context.createBox({
+		this.root = new BoxRenderable(renderer, { flexDirection: "column" });
+		appendSpacer(renderer, this.root);
+		const box = new BoxRenderable(renderer, {
 			flexDirection: "column",
 			padding: 1,
 			backgroundColor: this.proposalTheme.getBgColor("customMessageBg"),
 		});
-		box.append(
-			context.createText({
+		box.add(
+			new TextRenderable(renderer, {
 				content: `Plan v${this.proposal.version}`,
 				fg: this.proposalTheme.getFgColor("accent"),
-				bold: true,
+				attributes: TextAttributes.BOLD,
 			}),
 		);
-		appendSpacer(context, box);
-		box.append(
-			context.createMarkdown({
+		appendSpacer(renderer, box);
+		box.add(
+			new MarkdownRenderable(renderer, {
 				content: this.proposal.content,
 				fg: this.proposalTheme.getFgColor("customMessageText"),
+				syntaxStyle: markdownStyle(this.proposalTheme.getFgColor("customMessageText")),
 			}),
 		);
-		root.append(box);
-		return root;
+		this.root.add(box);
 	}
 }

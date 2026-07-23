@@ -1,4 +1,4 @@
-import type { BoneContainerNode, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import { BoxRenderable, type CliRenderer, TextRenderable } from "@opentui/core";
 import { type Theme, theme } from "../theme/theme.ts";
 
 export interface OpenTUITopBarState {
@@ -8,12 +8,11 @@ export interface OpenTUITopBarState {
 	thinking: string;
 }
 
-export class OpenTUITopBar implements BoneView {
-	// biome-ignore lint/complexity/noUselessConstructor: Preserve the mode call site while the top bar is removed.
-	constructor(_state: OpenTUITopBarState, _barTheme: Theme = theme) {}
+export class OpenTUITopBar {
+	readonly root: BoxRenderable;
 
-	mount(context: BoneRenderContext): BoneNode {
-		return context.createBox({ width: "100%", height: 0 });
+	constructor(renderer: CliRenderer, _state: OpenTUITopBarState, _barTheme: Theme = theme) {
+		this.root = new BoxRenderable(renderer, { width: "100%", height: 0 });
 	}
 
 	update(_state: OpenTUITopBarState): void {}
@@ -28,40 +27,35 @@ export interface OpenTUIWelcomeOptions {
 	theme?: Theme;
 }
 
-export class OpenTUIWelcome implements BoneView {
+export class OpenTUIWelcome {
+	readonly root: BoxRenderable;
 	private readonly options: OpenTUIWelcomeOptions;
-	private root: BoneContainerNode | undefined;
 	private dismissed = false;
 
-	constructor(options: OpenTUIWelcomeOptions = {}) {
+	constructor(renderer: CliRenderer, options: OpenTUIWelcomeOptions = {}) {
 		this.options = options;
-	}
-
-	mount(context: BoneRenderContext): BoneNode {
 		const welcomeTheme = this.options.theme ?? theme;
-		const root = context.createBox({ width: "100%", flexDirection: "column", paddingX: 1, paddingTop: 1 });
-		root.append(
-			context.createText({
+		this.root = new BoxRenderable(renderer, { width: "100%", flexDirection: "column", paddingX: 1, paddingTop: 1 });
+		this.root.add(
+			new TextRenderable(renderer, {
 				content: "What would you like to work on?",
 				fg: welcomeTheme.getFgColor("text"),
 			}),
 		);
 		if (this.options.workspace) {
-			root.append(
-				context.createText({
+			this.root.add(
+				new TextRenderable(renderer, {
 					content: this.options.workspace,
 					fg: welcomeTheme.getFgColor("muted"),
 					truncate: true,
 				}),
 			);
 		}
-		root.visible = !this.dismissed;
-		this.root = root;
-		return root;
+		this.root.visible = !this.dismissed;
 	}
 
 	dismiss(): void {
 		this.dismissed = true;
-		if (this.root && !this.root.destroyed) this.root.visible = false;
+		if (!this.root.isDestroyed) this.root.visible = false;
 	}
 }

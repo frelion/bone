@@ -1,12 +1,8 @@
 import type { ExtensionAPI } from "@frelion/bone-coding-agent";
-import type { BoneView } from "@frelion/bone-tui";
+import { type CliRenderer, TextAttributes, TextRenderable } from "@opentui/core";
 
-function labelView(content: string): BoneView {
-	return {
-		mount(context) {
-			return context.createText({ content, bold: true });
-		},
-	};
+function labelView(content: string): (renderer: CliRenderer) => TextRenderable {
+	return (renderer) => new TextRenderable(renderer, { content, attributes: TextAttributes.BOLD });
 }
 
 export default function (bone: ExtensionAPI) {
@@ -23,7 +19,7 @@ export default function (bone: ExtensionAPI) {
 			});
 			if (!mode) return;
 
-			ui.widgets.set("ui-v2-mode", () => labelView(`Mode: ${mode}`), { placement: "aboveEditor" });
+			ui.widgets.set("ui-v2-mode", labelView(`Mode: ${mode}`), { placement: "aboveEditor" });
 			ui.dialogs.notify(`Selected ${mode} mode`, "info");
 		},
 	});

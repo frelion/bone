@@ -1,5 +1,5 @@
 import { basename, dirname, join, relative } from "node:path";
-import type { BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import type { BoxRenderable, CliRenderer, Renderable } from "@opentui/core";
 import { CONFIG_DIR_NAME } from "../../../config.ts";
 import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../core/resource-types.ts";
 import type { SettingsManager } from "../../../core/settings-manager.ts";
@@ -59,7 +59,7 @@ function flattenResources(resolved: ResolvedPaths): ResourceItem[] {
 }
 
 /** Structured local-resource config editor for `bone config`. */
-export class OpenTUIConfigSelectorV2 implements BoneView {
+export class OpenTUIConfigSelectorV2 {
 	private readonly options: OpenTUIConfigSelectorOptions;
 	private readonly itemsByScope: Record<ConfigWriteScope, ResourceItem[]>;
 	private readonly inheritedEnabled = new Map<string, boolean>();
@@ -76,7 +76,15 @@ export class OpenTUIConfigSelectorV2 implements BoneView {
 		for (const item of this.itemsByScope.global) this.inheritedEnabled.set(item.key, item.enabled);
 	}
 
-	mount(context: BoneRenderContext): BoneNode {
+	get root(): BoxRenderable | undefined {
+		return this.selector?.root;
+	}
+
+	get focusTarget(): Renderable | undefined {
+		return this.selector?.focusTarget;
+	}
+
+	build(renderer: CliRenderer): BoxRenderable {
 		this.selector = new OpenTUISelectorViewV2({
 			title: "Local Resources",
 			subtitle: "Tab scope · Space/Enter toggle · Esc close",
@@ -86,9 +94,13 @@ export class OpenTUIConfigSelectorV2 implements BoneView {
 			onSelect: () => this.toggleSelected(),
 			onCancel: this.options.onClose,
 		});
-		const node = this.selector.mount(context);
+		const node = this.selector.build(renderer);
 		this.updateItems();
 		return node;
+	}
+
+	focus(): void {
+		this.selector?.focus();
 	}
 
 	handleAction(action: "confirm" | "cancel" | "up" | "down" | "pageUp" | "pageDown"): boolean {

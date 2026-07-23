@@ -1,4 +1,4 @@
-import type { BoneView } from "@frelion/bone-tui";
+import { type CliRenderer, TextRenderable } from "@opentui/core";
 import { describe, expect, test } from "vitest";
 import { createEventBus } from "../src/core/event-bus.ts";
 import {
@@ -9,12 +9,8 @@ import {
 	loadExtensionFromFactory,
 } from "../src/core/extensions/index.ts";
 
-function view(content: string): BoneView {
-	return {
-		mount(context) {
-			return context.createText({ content });
-		},
-	};
+function view(content: string) {
+	return (renderer: CliRenderer) => new TextRenderable(renderer, { content });
 }
 
 describe("extension UI v2", () => {
@@ -37,7 +33,7 @@ describe("extension UI v2", () => {
 
 		const handle = ui.widgets.set("status", view("Ready"));
 		expect(handle.mounted).toBe(false);
-		expect(ui.advanced.createView((context) => context.createText({ content: "Advanced" }))).toBeDefined();
+		expect(ui.advanced.createView(view("Advanced"))).toBeDefined();
 		expect("keybindings" in ui).toBe(false);
 		expect("shortcuts" in ui).toBe(false);
 	});
@@ -58,7 +54,7 @@ describe("extension UI v2", () => {
 		expect("shortcuts" in extension).toBe(false);
 	});
 
-	test("exposes a typed BoneView tool rendering contract", () => {
+	test("exposes a typed native tool rendering contract", () => {
 		const renderer: ExtensionUIToolViewRenderer<{ path: string }> = {
 			renderCall: (args: { path: string }) => view(`Reading ${args.path}`),
 			renderResult: ({ result }) =>

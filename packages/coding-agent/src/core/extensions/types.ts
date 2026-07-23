@@ -31,7 +31,6 @@ import type {
 	TextContent,
 	ToolResultMessage,
 } from "@frelion/bone-ai";
-import type { BoneView } from "@frelion/bone-tui";
 import type { Static, TSchema } from "typebox";
 import type { BashResult } from "../bash-executor.ts";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
@@ -67,7 +66,7 @@ import type {
 	ReadToolInput,
 	WriteToolInput,
 } from "../tools/index.ts";
-import type { ExtensionUIToolViewRenderer, ExtensionUIV2Context } from "./ui-v2.ts";
+import type { ExtensionUIToolViewRenderer, ExtensionUIV2Context, ExtensionUIView } from "./ui-v2.ts";
 
 interface AutocompleteItem {
 	value: string;
@@ -241,7 +240,7 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 		ctx: ExtensionContext,
 	): Promise<AgentToolResult<TDetails>>;
 
-	/** Structured BoneView rendering for tool calls and streaming results. */
+	/** Structured native rendering for tool calls and streaming results. */
 	renderV2?: ExtensionUIToolViewRenderer<Static<TParams>, TDetails, TState>;
 }
 
@@ -888,12 +887,12 @@ export interface EntryViewOptions {
 export type CustomMessageViewRenderer<T = unknown> = (
 	message: CustomMessage<T>,
 	options: MessageViewOptions,
-) => BoneView | undefined;
+) => ExtensionUIView | undefined;
 
 export type CustomEntryViewRenderer<T = unknown> = (
 	entry: CustomEntry<T>,
 	options: EntryViewOptions,
-) => BoneView | undefined;
+) => ExtensionUIView | undefined;
 
 // ============================================================================
 // Command Registration

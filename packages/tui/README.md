@@ -1,6 +1,6 @@
 # @frelion/bone-tui
 
-Bone's Bun-native OpenTUI boundary. The package exposes framework-independent `BoneView` and `BoneNode` contracts so product code does not depend directly on OpenTUI implementation types.
+Bone's Bun-native OpenTUI utilities. Product UI is built directly from `@opentui/core` renderables; this package owns only Bone-level renderer defaults, overlays, autocomplete, fuzzy matching, and terminal utilities.
 
 ## Runtime
 
@@ -11,34 +11,34 @@ Bone's Bun-native OpenTUI boundary. The package exposes framework-independent `B
 ## Renderer
 
 ```ts
-import { createBoneRenderer, type BoneView } from "@frelion/bone-tui";
+import { BoxRenderable, TextRenderable } from "@opentui/core";
+import { createRenderer } from "@frelion/bone-tui";
 
-const view: BoneView = {
-	mount(context) {
-		return context.createText({ content: "Bone", bold: true });
-	},
-};
-
-const renderer = await createBoneRenderer();
-renderer.mount(view);
+const renderer = await createRenderer();
+const root = new BoxRenderable(renderer, { width: "100%", height: "100%" });
+root.add(new TextRenderable(renderer, { content: "Bone", bold: true }));
+renderer.root.add(root);
 renderer.start();
 ```
 
-The structured boundary includes boxes, text, Markdown, diff, raw RGBA images, scroll views, textareas, inputs, selectors, overlays, focus, keyboard and mouse events, resize handling, and deterministic test rendering.
+OpenTUI provides boxes, text, Markdown, diff, scroll views, textareas, inputs, selectors, focus, keyboard and mouse events, resize handling, and deterministic test rendering. `OverlayManager` is Bone's single overlay lifecycle owner.
 
-Image decoding belongs to the product layer. `BoneImageNode` accepts raw RGBA pixels and explicit pixel and terminal dimensions.
+Image decoding belongs to the product layer. Product code converts decoded image data into native OpenTUI renderables.
 
 ## Testing
 
 ```ts
-import { createBoneTestRenderer } from "@frelion/bone-tui";
+import { BoxRenderable, TextRenderable } from "@opentui/core";
+import { createTestRenderer } from "@opentui/core/testing";
 
-const renderer = await createBoneTestRenderer({ width: 80, height: 24 });
-renderer.start();
-renderer.mount(view);
-await renderer.flush();
-console.log(renderer.captureFrame());
-renderer.destroy();
+const setup = await createTestRenderer({ width: 80, height: 24, autoFocus: false });
+const root = new BoxRenderable(setup.renderer, { width: "100%", height: "100%" });
+root.add(new TextRenderable(setup.renderer, { content: "Bone" }));
+setup.renderer.root.add(root);
+setup.renderer.start();
+await setup.flush();
+console.log(setup.captureCharFrame());
+setup.renderer.destroy();
 ```
 
 The package also retains framework-independent autocomplete, fuzzy matching, terminal color report parsing, and Unicode/ANSI width utilities. The previous differential ANSI renderer, terminal abstraction, component hierarchy, editor widgets, configurable keybindings, and terminal image protocols were removed in the Bun/OpenTUI v2 migration.

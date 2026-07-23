@@ -1,15 +1,19 @@
 import { readFileSync } from "node:fs";
 import type { AssistantMessage, ImageContent } from "@frelion/bone-ai";
-import { type BoneView, createBoneTestRenderer } from "@frelion/bone-tui";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { type CliRenderer, type Renderable, TextRenderable } from "@opentui/core";
+import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import type { ExtensionUIViewFactory } from "../src/core/extensions/ui-v2.ts";
 import { decodeOpenTUIImage } from "../src/modes/interactive/components/opentui-image.ts";
 import { OpenTUITranscriptFactory } from "../src/modes/interactive/components/opentui-transcript-factory.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
-const renderers = new Set<Awaited<ReturnType<typeof createBoneTestRenderer>>>();
+const renderers = new Set<TestRendererSetup>();
+let nativeRenderer: CliRenderer;
+let nativeSetup: TestRendererSetup;
 
-function textView(content: string): BoneView {
-	return { mount: (context) => context.createText({ content }) };
+function textView(content: string): ExtensionUIViewFactory {
+	return (renderer) => new TextRenderable(renderer, { content });
 }
 
 function assistant(text: string): AssistantMessage {
@@ -32,23 +36,36 @@ function assistant(text: string): AssistantMessage {
 	};
 }
 
-async function frame(renderer: Awaited<ReturnType<typeof createBoneTestRenderer>>, expected: string): Promise<string> {
+async function frame(setup: TestRendererSetup, expected: string): Promise<string> {
 	for (let attempt = 0; attempt < 8; attempt++) {
-		await renderer.flush();
-		const captured = renderer.captureFrame();
+		await setup.flush();
+		const captured = setup.captureCharFrame();
 		if (captured.includes(expected)) return captured;
 	}
-	return renderer.captureFrame();
+	return setup.captureCharFrame();
+}
+
+beforeEach(async () => {
+	initTheme("dark");
+	const setup = await createTestRenderer({ width: 100, height: 32 });
+	renderers.add(setup);
+	nativeSetup = setup;
+	nativeRenderer = setup.renderer;
+});
+
+function setupAt(width: number, height: number): TestRendererSetup {
+	nativeSetup.resize(width, height);
+	return nativeSetup;
 }
 
 afterEach(() => {
-	for (const renderer of renderers) renderer.destroy();
+	for (const setup of renderers) setup.renderer.destroy();
 	renderers.clear();
 });
 
 describe("OpenTUI transcript factory", () => {
 	test("maps persisted entries and intentionally ignores metadata entries", async () => {
-		const factory = new OpenTUITranscriptFactory();
+		const factory = new OpenTUITranscriptFactory(nativeRenderer);
 		const message = await factory.createSessionEntry({
 			type: "message",
 			id: "entry-1",
@@ -80,7 +97,7 @@ describe("OpenTUI transcript factory", () => {
 
 	test("groups consecutive persisted tool results during batch replay", async () => {
 		initTheme("dark");
-		const factory = new OpenTUITranscriptFactory();
+		const factory = new OpenTUITranscriptFactory(nativeRenderer);
 		const entries = await factory.createSessionEntries([
 			{
 				type: "message",
@@ -136,19 +153,18 @@ describe("OpenTUI transcript factory", () => {
 		expect(entries).toHaveLength(1);
 		expect(entries[0]?.key).toBe("working-group:replay:assistant-tool-1");
 
-		const renderer = await createBoneTestRenderer({ width: 90, height: 18 });
-		renderers.add(renderer);
-		renderer.start();
+		const setup = setupAt(90, 18);
+		const renderer = setup.renderer;
 		if (!entries[0]) throw new Error("expected replay working group");
-		renderer.content.append(entries[0].view.mount(renderer));
-		const captured = await frame(renderer, "✓ Worked for 18s · 2 tool calls");
+		renderer.root.add(entries[0].root);
+		const captured = await frame(setup, "✓ Worked for 18s · 2 tool calls");
 		expect(captured).not.toContain("first result");
 		expect(captured).not.toContain("second result");
 	});
 
 	test("does not merge replay working groups across visible assistant text", async () => {
 		initTheme("dark");
-		const factory = new OpenTUITranscriptFactory();
+		const factory = new OpenTUITranscriptFactory(nativeRenderer);
 		const toolAssistant = (id: string, timestamp: number): AssistantMessage => ({
 			...assistant(""),
 			content: [{ type: "toolCall", id, name: "read", arguments: {} }],
@@ -209,7 +225,7 @@ describe("OpenTUI transcript factory", () => {
 
 	test("preserves a visible length error on a tool-call assistant during replay", async () => {
 		initTheme("dark");
-		const factory = new OpenTUITranscriptFactory();
+		const factory = new OpenTUITranscriptFactory(nativeRenderer);
 		const toolAssistant = (
 			id: string,
 			timestamp: number,
@@ -264,18 +280,17 @@ describe("OpenTUI transcript factory", () => {
 			"assistant-limit",
 			"working-group:replay:result-after-limit",
 		]);
-		const renderer = await createBoneTestRenderer({ width: 100, height: 18 });
-		renderers.add(renderer);
-		renderer.start();
+		const setup = setupAt(100, 18);
+		const renderer = setup.renderer;
 		const limitEntry = entries[1];
 		if (!limitEntry) throw new Error("expected visible length error");
-		renderer.content.append(limitEntry.view.mount(renderer));
-		expect(await frame(renderer, "maximum output token limit")).toContain("Error: Model stopped");
+		renderer.root.add(limitEntry.root);
+		expect(await frame(setup, "maximum output token limit")).toContain("Error: Model stopped");
 	});
 
 	test("preserves streaming thinking on a tool-call assistant during replay", async () => {
 		initTheme("dark");
-		const factory = new OpenTUITranscriptFactory({
+		const factory = new OpenTUITranscriptFactory(nativeRenderer, {
 			hideThinkingBlock: true,
 			hiddenThinkingLabel: "Reasoning...",
 		});
@@ -323,18 +338,17 @@ describe("OpenTUI transcript factory", () => {
 		]);
 
 		expect(entries.map((entry) => entry.key)).toEqual(["working-group:replay:assistant-tool", "assistant-thinking"]);
-		const renderer = await createBoneTestRenderer({ width: 90, height: 14 });
-		renderers.add(renderer);
-		renderer.start();
+		const setup = setupAt(90, 14);
+		const renderer = setup.renderer;
 		const thinkingEntry = entries[1];
 		if (!thinkingEntry) throw new Error("expected visible thinking entry");
-		renderer.content.append(thinkingEntry.view.mount(renderer));
-		expect(await frame(renderer, "Reasoning...")).toContain("Reasoning...");
+		renderer.root.add(thinkingEntry.root);
+		expect(await frame(setup, "Reasoning...")).toContain("Reasoning...");
 	});
 
 	test("keeps future successful groups expanded while the global override is active", async () => {
 		initTheme("dark");
-		const factory = new OpenTUITranscriptFactory();
+		const factory = new OpenTUITranscriptFactory(nativeRenderer);
 		factory.setAllToolDetailsExpanded(true);
 		const started = await factory.handleEvent({
 			type: "tool_execution_start",
@@ -351,25 +365,23 @@ describe("OpenTUI transcript factory", () => {
 			isError: false,
 		});
 
-		const renderer = await createBoneTestRenderer({ width: 90, height: 18 });
-		renderers.add(renderer);
-		renderer.start();
-		renderer.content.append(started.item.view.mount(renderer));
-		const captured = await frame(renderer, "future detail");
+		const setup = setupAt(90, 18);
+		const renderer = setup.renderer;
+		renderer.root.add(started.item.root);
+		const captured = await frame(setup, "future detail");
 		expect(captured).toContain("read · complete");
 		expect(captured).toContain("⌄ ✓ Worked for 1s · 1 tool calls");
 	});
 
 	test("keeps stable assistant and tool views through streaming updates", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 90, height: 26 });
-		renderers.add(renderer);
-		renderer.start();
-		const factory = new OpenTUITranscriptFactory();
+		const setup = setupAt(90, 26);
+		const renderer = setup.renderer;
+		const factory = new OpenTUITranscriptFactory(nativeRenderer);
 		const started = await factory.handleEvent({ type: "message_start", message: assistant("first") });
 		expect(started.type).toBe("append");
 		if (started.type !== "append") throw new Error("expected append");
-		renderer.content.append(started.item.view.mount(renderer));
+		renderer.root.add(started.item.root);
 		const updated = await factory.handleEvent({
 			type: "message_update",
 			message: assistant("second"),
@@ -377,8 +389,8 @@ describe("OpenTUI transcript factory", () => {
 		});
 		expect(updated.type).toBe("updated");
 		if (updated.type !== "updated") throw new Error("expected update");
-		expect(updated.view).toBe(started.item.view);
-		expect(await frame(renderer, "second")).not.toContain("first");
+		expect(updated.root).toBe(started.item.root);
+		expect(await frame(setup, "second")).not.toContain("first");
 
 		const toolStart = await factory.handleEvent({
 			type: "tool_execution_start",
@@ -388,7 +400,7 @@ describe("OpenTUI transcript factory", () => {
 		});
 		expect(toolStart.type).toBe("append");
 		if (toolStart.type !== "append") throw new Error("expected tool append");
-		renderer.content.append(toolStart.item.view.mount(renderer));
+		renderer.root.add(toolStart.item.root);
 		const toolEnd = await factory.handleEvent({
 			type: "tool_execution_end",
 			toolCallId: "call-1",
@@ -398,11 +410,11 @@ describe("OpenTUI transcript factory", () => {
 		});
 		expect(toolEnd.type).toBe("updated");
 		if (toolEnd.type !== "updated") throw new Error("expected tool update");
-		expect(toolEnd.view).toBe(toolStart.item.view);
-		const collapsed = await frame(renderer, "Worked for 1s · 1 tool calls");
+		expect(toolEnd.root).toBe(toolStart.item.root);
+		const collapsed = await frame(setup, "Worked for 1s · 1 tool calls");
 		expect(collapsed).not.toContain("done");
 		factory.setAllToolDetailsExpanded(true);
-		expect(await frame(renderer, "done")).toContain("read · complete");
+		expect(await frame(setup, "done")).toContain("read · complete");
 
 		const duplicateResult = await factory.handleEvent({
 			type: "message_start",
@@ -432,16 +444,15 @@ describe("OpenTUI transcript factory", () => {
 
 	test("uses structured tool renderers with stable transcript identity and state", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 90, height: 26 });
-		renderers.add(renderer);
-		renderer.start();
+		const setup = setupAt(90, 26);
+		const renderer = setup.renderer;
 		const states: unknown[] = [];
-		const previousViews: Array<BoneView | undefined> = [];
+		const previousViews: Array<Renderable | undefined> = [];
 		const renderCall = vi.fn((args: unknown) => textView(`custom call:${JSON.stringify(args)}`));
 		const renderResult = vi.fn(
 			(
 				input: { result: { content: Array<{ type: string; text?: string }> } },
-				context: { state: unknown; previousView?: BoneView },
+				context: { state: unknown; previousView?: Renderable },
 			) => {
 				states.push(context.state);
 				previousViews.push(context.previousView);
@@ -450,6 +461,7 @@ describe("OpenTUI transcript factory", () => {
 			},
 		);
 		const factory = new OpenTUITranscriptFactory(
+			nativeRenderer,
 			{},
 			{
 				cwd: "/workspace",
@@ -464,8 +476,8 @@ describe("OpenTUI transcript factory", () => {
 		});
 		expect(started.type).toBe("append");
 		if (started.type !== "append") throw new Error("expected tool append");
-		renderer.content.append(started.item.view.mount(renderer));
-		expect(await frame(renderer, "custom call")).toContain("one.txt");
+		renderer.root.add(started.item.root);
+		expect(await frame(setup, "custom call")).toContain("one.txt");
 
 		const partial = await factory.handleEvent({
 			type: "tool_execution_update",
@@ -484,16 +496,16 @@ describe("OpenTUI transcript factory", () => {
 		expect(partial.type).toBe("updated");
 		expect(completed.type).toBe("updated");
 		if (partial.type !== "updated" || completed.type !== "updated") throw new Error("expected tool updates");
-		expect(partial.view).toBe(started.item.view);
-		expect(completed.view).toBe(started.item.view);
+		expect(partial.root).toBe(started.item.root);
+		expect(completed.root).toBe(started.item.root);
 		expect(states[1]).toBe(states[0]);
 		expect(previousViews.every(Boolean)).toBe(true);
-		expect(await frame(renderer, "custom result:complete")).not.toContain("custom result:partial");
+		expect(await frame(setup, "custom result:complete")).not.toContain("custom result:partial");
 	});
 
 	test("groups consecutive live tool calls into one stable working group", async () => {
 		let now = 0;
-		const factory = new OpenTUITranscriptFactory({ now: () => now });
+		const factory = new OpenTUITranscriptFactory(nativeRenderer, { now: () => now });
 		const first = await factory.handleEvent({
 			type: "tool_execution_start",
 			toolCallId: "group-call-1",
@@ -510,7 +522,7 @@ describe("OpenTUI transcript factory", () => {
 		expect(second.type).toBe("updated");
 		if (first.type !== "append" || second.type !== "updated") throw new Error("expected one working group");
 		expect(second.key).toBe(first.item.key);
-		expect(second.view).toBe(first.item.view);
+		expect(second.root).toBe(first.item.root);
 
 		await factory.handleEvent({
 			type: "tool_execution_end",
@@ -529,20 +541,19 @@ describe("OpenTUI transcript factory", () => {
 		});
 		expect(completed.type).toBe("updated");
 		if (completed.type !== "updated") throw new Error("expected group update");
-		expect(completed.view).toBe(first.item.view);
+		expect(completed.root).toBe(first.item.root);
 
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 90, height: 18 });
-		renderers.add(renderer);
-		renderer.start();
-		renderer.content.append(first.item.view.mount(renderer));
-		const captured = await frame(renderer, "✓ Worked for 18s · 2 tool calls");
+		const setup = setupAt(90, 18);
+		const renderer = setup.renderer;
+		renderer.root.add(first.item.root);
+		const captured = await frame(setup, "✓ Worked for 18s · 2 tool calls");
 		expect(captured).not.toContain("one.txt");
 		expect(captured).not.toContain("two.txt");
 	});
 
 	test("ends a live working group when text arrives after an empty assistant start", async () => {
-		const factory = new OpenTUITranscriptFactory();
+		const factory = new OpenTUITranscriptFactory(nativeRenderer);
 		const startAndComplete = async (id: string) => {
 			const started = await factory.handleEvent({
 				type: "tool_execution_start",
@@ -587,7 +598,7 @@ describe("OpenTUI transcript factory", () => {
 	test("uses registered custom message and session entry views with fallback behavior", async () => {
 		const messageView = vi.fn(() => textView("registered message"));
 		const entryView = vi.fn(() => textView("registered entry"));
-		const factory = new OpenTUITranscriptFactory();
+		const factory = new OpenTUITranscriptFactory(nativeRenderer);
 		factory.setResolvers({
 			getMessageView: (customType) => (customType === "notice" ? messageView : undefined),
 			getEntryView: (customType) => (customType === "state" ? entryView : undefined),
@@ -600,7 +611,7 @@ describe("OpenTUI transcript factory", () => {
 			display: true,
 			timestamp: 1,
 		});
-		expect(customMessage?.view).toBeDefined();
+		expect(customMessage?.root).toBeDefined();
 		expect(messageView).toHaveBeenCalledWith(expect.objectContaining({ customType: "notice" }), { expanded: false });
 
 		const customEntry = await factory.createSessionEntry({
@@ -633,20 +644,19 @@ describe("OpenTUI transcript factory", () => {
 			display: true,
 			timestamp: 2,
 		});
-		const renderer = await createBoneTestRenderer({ width: 80, height: 16 });
-		renderers.add(renderer);
-		renderer.start();
+		const setup = setupAt(80, 16);
+		const renderer = setup.renderer;
 		if (!fallback) throw new Error("expected custom message fallback");
-		renderer.content.append(fallback.view.mount(renderer));
-		expect(await frame(renderer, "fallback content")).toContain("fallback content");
+		renderer.root.add(fallback.root);
+		expect(await frame(setup, "fallback content")).toContain("fallback content");
 	});
 
 	test("isolates throwing custom and tool renderers while replaying history", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 90, height: 20 });
-		renderers.add(renderer);
-		renderer.start();
+		const setup = setupAt(90, 20);
+		const renderer = setup.renderer;
 		const factory = new OpenTUITranscriptFactory(
+			nativeRenderer,
 			{},
 			{
 				getMessageView: () => () => {
@@ -677,10 +687,10 @@ describe("OpenTUI transcript factory", () => {
 			timestamp: 2,
 		});
 		if (!custom || !tool) throw new Error("expected replay fallbacks");
-		renderer.content.append(custom.view.mount(renderer));
-		renderer.content.append(tool.view.mount(renderer));
+		renderer.root.add(custom.root);
+		renderer.root.add(tool.root);
 
-		const captured = await frame(renderer, "generic tool fallback");
+		const captured = await frame(setup, "generic tool fallback");
 		expect(captured).toContain("generic custom fallback");
 		expect(captured).toContain("read · complete");
 		expect(captured).toContain("generic tool fallback");
@@ -688,19 +698,19 @@ describe("OpenTUI transcript factory", () => {
 
 	test("falls back and reports extension views that throw while mounting", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 90, height: 22 });
-		renderers.add(renderer);
-		renderer.start();
+		const setup = setupAt(90, 22);
+		const renderer = setup.renderer;
 		const toolError = new Error("tool view mount failed");
 		const messageError = new Error("custom message view mount failed");
 		const entryError = new Error("custom entry view mount failed");
 		const onError = vi.fn();
-		const throwingView = (error: Error): BoneView => ({
-			mount: () => {
+		const throwingView =
+			(error: Error): ExtensionUIViewFactory =>
+			() => {
 				throw error;
-			},
-		});
+			};
 		const factory = new OpenTUITranscriptFactory(
+			nativeRenderer,
 			{},
 			{
 				getToolRenderer: () => ({ renderResult: () => throwingView(toolError) }),
@@ -735,11 +745,11 @@ describe("OpenTUI transcript factory", () => {
 			data: { ready: true },
 		});
 		if (!tool || !customMessage || !customEntry) throw new Error("expected extension views");
-		renderer.content.append(tool.view.mount(renderer));
-		renderer.content.append(customMessage.view.mount(renderer));
-		renderer.content.append(customEntry.view.mount(renderer));
+		renderer.root.add(tool.root);
+		renderer.root.add(customMessage.root);
+		renderer.root.add(customEntry.root);
 
-		const captured = await frame(renderer, "[custom entry unavailable]");
+		const captured = await frame(setup, "[custom entry unavailable]");
 		expect(captured).toContain("read · complete");
 		expect(captured).toContain("tool mount fallback");
 		expect(captured).toContain("message mount fallback");
@@ -752,16 +762,19 @@ describe("OpenTUI transcript factory", () => {
 
 	test("keeps processing live events after a structured tool renderer throws", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 90, height: 22 });
-		renderers.add(renderer);
-		renderer.start();
+		const setup = setupAt(90, 22);
+		const renderer = setup.renderer;
 		const renderCall = vi.fn(() => {
 			throw new Error("tool call renderer failed");
 		});
 		const renderResult = vi.fn(() => {
 			throw new Error("tool result renderer failed");
 		});
-		const factory = new OpenTUITranscriptFactory({}, { getToolRenderer: () => ({ renderCall, renderResult }) });
+		const factory = new OpenTUITranscriptFactory(
+			nativeRenderer,
+			{},
+			{ getToolRenderer: () => ({ renderCall, renderResult }) },
+		);
 
 		const started = await factory.handleEvent({
 			type: "tool_execution_start",
@@ -771,8 +784,8 @@ describe("OpenTUI transcript factory", () => {
 		});
 		expect(started.type).toBe("append");
 		if (started.type !== "append") throw new Error("expected tool append");
-		renderer.content.append(started.item.view.mount(renderer));
-		expect(await frame(renderer, "fallback.txt")).toContain("read · running");
+		renderer.root.add(started.item.root);
+		expect(await frame(setup, "fallback.txt")).toContain("read · running");
 
 		const partial = await factory.handleEvent({
 			type: "tool_execution_update",
@@ -792,9 +805,9 @@ describe("OpenTUI transcript factory", () => {
 		expect(completed.type).toBe("updated");
 		expect(renderCall).toHaveBeenCalled();
 		expect(renderResult).toHaveBeenCalledTimes(2);
-		expect(await frame(renderer, "Worked for 1s · 1 tool calls")).not.toContain("complete fallback");
+		expect(await frame(setup, "Worked for 1s · 1 tool calls")).not.toContain("complete fallback");
 		factory.setAllToolDetailsExpanded(true);
-		const toolFrame = await frame(renderer, "complete fallback");
+		const toolFrame = await frame(setup, "complete fallback");
 		expect(toolFrame).toContain("read · complete");
 		expect(toolFrame).not.toContain("partial fallback");
 

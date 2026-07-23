@@ -1,5 +1,6 @@
 import type { AssistantMessage } from "@frelion/bone-ai";
-import { type BoneRenderContext, type BoneView, createBoneTestRenderer } from "@frelion/bone-tui";
+import { type Renderable, TextRenderable } from "@opentui/core";
+import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
 	OpenTUIAssistantMessage,
@@ -9,26 +10,26 @@ import {
 import { OpenTUIInteractiveShell } from "../src/modes/interactive/opentui-shell.ts";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 
-const renderers = new Set<Awaited<ReturnType<typeof createBoneTestRenderer>>>();
+const renderers = new Set<TestRendererSetup>();
 
-async function flushUntil(
-	renderer: Awaited<ReturnType<typeof createBoneTestRenderer>>,
-	predicate: (frame: string) => boolean,
-): Promise<string> {
-	for (let attempt = 0; attempt < 8; attempt++) {
-		await renderer.flush();
-		const frame = renderer.captureFrame();
-		if (predicate(frame)) return frame;
-	}
-	return renderer.captureFrame();
+async function createRenderer(width: number, height: number): Promise<TestRendererSetup> {
+	const setup = await createTestRenderer({ width, height, autoFocus: false, useMouse: true });
+	renderers.add(setup);
+	setup.renderer.start();
+	return setup;
 }
 
-function textView(content: string): BoneView {
-	return {
-		mount(context: BoneRenderContext) {
-			return context.createText({ content, fg: theme.getFgColor("text") });
-		},
-	};
+async function flushUntil(setup: TestRendererSetup, predicate: (frame: string) => boolean): Promise<string> {
+	for (let attempt = 0; attempt < 8; attempt++) {
+		await setup.flush();
+		const frame = setup.captureCharFrame();
+		if (predicate(frame)) return frame;
+	}
+	return setup.captureCharFrame();
+}
+
+function textView(setup: TestRendererSetup, content: string): Renderable {
+	return new TextRenderable(setup.renderer, { content, fg: theme.getFgColor("text") });
 }
 
 function assistantMessage(text: string): AssistantMessage {
@@ -52,79 +53,78 @@ function assistantMessage(text: string): AssistantMessage {
 }
 
 afterEach(() => {
-	for (const renderer of renderers) renderer.destroy();
+	for (const setup of renderers) setup.renderer.destroy();
 	renderers.clear();
 });
 
 describe("OpenTUI interactive shell", () => {
 	test("lays out sidebar, structured transcript messages, and fixed chrome", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 100, height: 28 });
-		renderers.add(renderer);
-		renderer.start();
+		const setup = await createRenderer(100, 28);
+		const { renderer } = setup;
 
-		const shell = new OpenTUIInteractiveShell({ sidebarWidth: 24 });
-		renderer.mount(shell);
-		shell.setSidebar(textView("Conversations\ncurrent"));
-		shell.appendTranscript(new OpenTUIUserMessage("Inspect this repository"));
-		shell.appendTranscript(new OpenTUIAssistantMessage(assistantMessage("The repository uses Bun.")));
-		shell.appendFixed(textView("Bun · OpenTUI"));
+		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 24 });
+		renderer.root.add(shell.root);
+		shell.setSidebar(textView(setup, "Conversations\ncurrent"));
+		shell.appendTranscript(new OpenTUIUserMessage(renderer, "Inspect this repository").root);
+		shell.appendTranscript(new OpenTUIAssistantMessage(renderer, assistantMessage("The repository uses Bun.")).root);
+		shell.appendFixed(textView(setup, "Bun · OpenTUI"));
 
-		const conversationFrame = await flushUntil(renderer, (frame) => frame.includes("The repository uses Bun."));
+		const conversationFrame = await flushUntil(setup, (frame) => frame.includes("The repository uses Bun."));
 		expect(conversationFrame).toContain("Conversations");
 		expect(conversationFrame).toContain("Inspect this repository");
 		expect(conversationFrame).toContain("The repository uses Bun.");
 		expect(conversationFrame).toContain("Bun · OpenTUI");
 
 		shell.appendTranscript(
-			new OpenTUIPlanProposal({
+			new OpenTUIPlanProposal(renderer, {
 				id: "plan-1",
 				version: 2,
 				content: "# Migration\n\nMove the renderer to OpenTUI.",
 				createdAt: "2026-07-22T00:00:00.000Z",
 				sourceMessageId: "assistant-1",
-			}),
+			}).root,
 		);
 
-		const planFrame = await flushUntil(renderer, (frame) => frame.includes("Move the renderer to OpenTUI."));
+		const planFrame = await flushUntil(setup, (frame) => frame.includes("Move the renderer to OpenTUI."));
 		expect(planFrame).toContain("Plan v2");
 		expect(planFrame).toContain("Move the renderer to OpenTUI.");
 	});
 
 	test("updates an assistant message in place without rebuilding the shell", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 80, height: 18 });
-		renderers.add(renderer);
-		renderer.start();
-		const shell = new OpenTUIInteractiveShell({ sidebarWidth: 20 });
-		renderer.mount(shell);
-		const createMarkdown = vi.spyOn(renderer, "createMarkdown");
-		const assistant = new OpenTUIAssistantMessage(assistantMessage("first chunk"));
-		shell.appendTranscript(assistant);
+		const setup = await createRenderer(80, 18);
+		const { renderer } = setup;
+		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 20 });
+		renderer.root.add(shell.root);
+		const assistant = new OpenTUIAssistantMessage(renderer, assistantMessage("first chunk"));
+		shell.appendTranscript(assistant.root);
 
-		const initialFrame = await flushUntil(renderer, (frame) => frame.includes("first chunk"));
+		const initialFrame = await flushUntil(setup, (frame) => frame.includes("first chunk"));
 		expect(initialFrame).toContain("first chunk");
+		const renderedMessage = assistant.root.getChildren().at(-1);
 		assistant.updateContent(assistantMessage("final response"));
-		const finalFrame = await flushUntil(renderer, (frame) => frame.includes("final response"));
+		const finalFrame = await flushUntil(setup, (frame) => frame.includes("final response"));
 
 		expect(finalFrame).toContain("final response");
 		expect(finalFrame).not.toContain("first chunk");
-		expect(createMarkdown).toHaveBeenCalledTimes(1);
+		expect(assistant.root.getChildren().at(-1)).toBe(renderedMessage);
 	});
 
 	test("keeps the transcript viewport and scrollbar in one continuous region", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 100, height: 40 });
-		renderers.add(renderer);
-		renderer.start();
-		const shell = new OpenTUIInteractiveShell({ sidebarWidth: 32 });
-		renderer.mount(shell);
+		const setup = await createRenderer(100, 40);
+		const { renderer } = setup;
+		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 32 });
+		renderer.root.add(shell.root);
 
 		let lastLine: ReturnType<OpenTUIInteractiveShell["appendTranscript"]> | undefined;
-		for (let index = 0; index < 50; index++) lastLine = shell.appendTranscript(textView(`line-${index}`));
+		for (let index = 0; index < 50; index++) {
+			lastLine = shell.appendTranscript(textView(setup, `line-${index}`));
+		}
 		const transcript = shell.getTranscriptNode();
 		transcript.scrollTo(Number.MAX_SAFE_INTEGER);
-		await flushUntil(renderer, (frame) => frame.includes("line-49"));
+		await flushUntil(setup, (frame) => frame.includes("line-49"));
 
 		expect(lastLine).toBeDefined();
 		expect(lastLine!.screenY + lastLine!.height).toBe(transcript.screenY + transcript.height);
@@ -132,42 +132,40 @@ describe("OpenTUI interactive shell", () => {
 
 	test("switches between split and single-pane layouts without remounting content", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 100, height: 24 });
-		renderers.add(renderer);
-		renderer.start();
-		const shell = new OpenTUIInteractiveShell();
-		renderer.mount(shell);
-		shell.setSidebar(textView("CONVERSATIONS\ncurrent"));
-		shell.appendTranscript(textView("responsive transcript"));
+		const setup = await createRenderer(100, 24);
+		const { renderer } = setup;
+		const shell = new OpenTUIInteractiveShell(renderer);
+		renderer.root.add(shell.root);
+		shell.setSidebar(textView(setup, "CONVERSATIONS\ncurrent"));
+		shell.appendTranscript(textView(setup, "responsive transcript"));
 
-		expect(await flushUntil(renderer, (frame) => frame.includes("responsive transcript"))).toContain("CONVERSATIONS");
+		expect(await flushUntil(setup, (frame) => frame.includes("responsive transcript"))).toContain("CONVERSATIONS");
 		expect(shell.layoutMode).toBe("split");
 
-		renderer.resize(70, 18);
-		const compactMain = await flushUntil(renderer, (frame) => frame.includes("responsive transcript"));
+		setup.resize(70, 18);
+		const compactMain = await flushUntil(setup, (frame) => frame.includes("responsive transcript"));
 		expect(shell.layoutMode).toBe("single");
 		expect(compactMain).not.toContain("CONVERSATIONS");
 
 		shell.showPane("sidebar");
-		const compactSidebar = await flushUntil(renderer, (frame) => frame.includes("CONVERSATIONS"));
+		const compactSidebar = await flushUntil(setup, (frame) => frame.includes("CONVERSATIONS"));
 		expect(compactSidebar).not.toContain("responsive transcript");
 
 		shell.showPane("main");
-		expect(await flushUntil(renderer, (frame) => frame.includes("responsive transcript"))).not.toContain(
+		expect(await flushUntil(setup, (frame) => frame.includes("responsive transcript"))).not.toContain(
 			"CONVERSATIONS",
 		);
 	});
 
 	test("constrains sidebar resizing and emits persisted widths", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 120, height: 24 });
-		renderers.add(renderer);
-		renderer.start();
-		const shell = new OpenTUIInteractiveShell();
+		const setup = await createRenderer(120, 24);
+		const { renderer } = setup;
+		const shell = new OpenTUIInteractiveShell(renderer);
 		const onSidebarWidthChange = vi.fn();
 		shell.onSidebarWidthChange = onSidebarWidthChange;
-		renderer.mount(shell);
-		shell.setSidebar(textView("CONVERSATIONS"));
+		renderer.root.add(shell.root);
+		shell.setSidebar(textView(setup, "CONVERSATIONS"));
 
 		shell.setSidebarWidth(50, true);
 
@@ -182,18 +180,17 @@ describe("OpenTUI interactive shell", () => {
 
 	test("keeps resizing after the pointer leaves the one-column separator", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 120, height: 24 });
-		renderers.add(renderer);
-		renderer.start();
-		const shell = new OpenTUIInteractiveShell({ sidebarWidth: 38 });
+		const setup = await createRenderer(120, 24);
+		const { renderer } = setup;
+		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 38 });
 		const onSidebarWidthChange = vi.fn();
 		shell.onSidebarWidthChange = onSidebarWidthChange;
-		renderer.mount(shell);
-		shell.setSidebar(textView("CONVERSATIONS"));
-		await renderer.flush();
+		renderer.root.add(shell.root);
+		shell.setSidebar(textView(setup, "CONVERSATIONS"));
+		await setup.flush();
 
-		await renderer.mouse.drag(38, 5, 50, 5);
-		await renderer.flush();
+		await setup.mockMouse.drag(38, 5, 50, 5);
+		await setup.flush();
 
 		expect(shell.sidebarWidth).toBe(50);
 		expect(onSidebarWidthChange).toHaveBeenLastCalledWith(50);

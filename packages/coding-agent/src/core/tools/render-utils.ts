@@ -1,10 +1,11 @@
 import * as os from "node:os";
 import type { ImageContent, TextContent } from "@frelion/bone-ai";
-import type { BoneColor, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import { BoxRenderable, type CliRenderer, type ColorInput, createTextAttributes, TextRenderable } from "@opentui/core";
 import { decodeOpenTUIImages, OpenTUIImageAttachments } from "../../modes/interactive/components/opentui-image.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../../utils/ansi.ts";
 import { sanitizeBinaryOutput } from "../../utils/shell.ts";
+import type { ExtensionUIViewFactory } from "../extensions/ui-v2.ts";
 
 export function shortenPath(path: unknown): string {
 	if (typeof path !== "string") return "";
@@ -58,52 +59,72 @@ export function getTextOutput(
 }
 
 export interface StructuredToolTextOptions {
-	fg?: BoneColor;
-	backgroundColor?: BoneColor;
+	fg?: ColorInput;
+	backgroundColor?: ColorInput;
 	paddingX?: number;
 	paddingY?: number;
 	bold?: boolean;
 }
 
-export function structuredToolTextView(content: string, options: StructuredToolTextOptions = {}): BoneView {
-	return {
-		mount(context: BoneRenderContext): BoneNode {
-			return context.createText({
-				content: stripAnsi(content),
-				fg: options.fg,
-				bg: options.backgroundColor,
-				paddingX: options.paddingX,
-				paddingY: options.paddingY,
-				bold: options.bold,
-				wrapMode: "word",
-			});
-		},
-	};
+export function structuredToolTextView(
+	content: string,
+	options: StructuredToolTextOptions = {},
+): ExtensionUIViewFactory {
+	return (renderer: CliRenderer) =>
+		new TextRenderable(renderer, {
+			content: stripAnsi(content),
+			fg: options.fg,
+			bg: options.backgroundColor,
+			paddingX: options.paddingX,
+			paddingY: options.paddingY,
+			attributes: options.bold ? createTextAttributes({ bold: true }) : undefined,
+			wrapMode: "word",
+		});
 }
 
 export function structuredToolResultView(
 	result: { content: (TextContent | ImageContent)[] },
 	text: string,
 	options: StructuredToolTextOptions & { imageWidthCells?: number } = {},
-): BoneView {
-	return {
-		mount(context: BoneRenderContext): BoneNode {
-			const root = context.createBox({ flexDirection: "column" });
-			if (stripAnsi(text).trim()) root.append(structuredToolTextView(text, options).mount(context));
-			const imageContent = result.content.filter((part): part is ImageContent => part.type === "image");
-			if (imageContent.length > 0) {
-				const images = context.createBox({ flexDirection: "column" });
-				images.append(
-					context.createText({ content: "[decoding image...]", fg: options.fg, paddingX: options.paddingX }),
-				);
-				root.append(images);
-				void decodeOpenTUIImages(imageContent, { terminalWidth: options.imageWidthCells ?? 40 }).then((decoded) => {
-					images.clear();
-					images.append(new OpenTUIImageAttachments(decoded).mount(context));
+): ExtensionUIViewFactory {
+	return (renderer: CliRenderer) => {
+		const root = new BoxRenderable(renderer, { flexDirection: "column" });
+		if (stripAnsi(text).trim()) root.add(structuredToolTextView(text, options)(renderer));
+		const imageContent = result.content.filter((part): part is ImageContent => part.type === "image");
+		if (imageContent.length > 0) {
+			const images = new BoxRenderable(renderer, { flexDirection: "column" });
+			images.add(
+				new TextRenderable(renderer, {
+					content: "[decoding image...]",
+					fg: options.fg,
+					paddingX: options.paddingX,
+				}),
+			);
+			root.add(images);
+			void decodeOpenTUIImages(imageContent, { terminalWidth: options.imageWidthCells ?? 40 })
+				.then((decoded) => {
+					if (images.isDestroyed) return;
+					for (const child of images.getChildren()) {
+						images.remove(child);
+						child.destroyRecursively();
+					}
+					images.add(new OpenTUIImageAttachments(renderer, decoded).root);
+				})
+				.catch((error: unknown) => {
+					if (images.isDestroyed) return;
+					for (const child of images.getChildren()) {
+						images.remove(child);
+						child.destroyRecursively();
+					}
+					images.add(
+						new TextRenderable(renderer, {
+							content: `[image: unable to decode; ${error instanceof Error ? error.message : String(error)}]`,
+							fg: options.fg,
+						}),
+					);
 				});
-			}
-			return root;
-		},
+		}
+		return root;
 	};
 }
 

@@ -1,4 +1,4 @@
-import type { BoneInputNode, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import { BoxRenderable, type CliRenderer, InputRenderable, type Renderable, TextRenderable } from "@opentui/core";
 import { type Theme, theme } from "../theme/theme.ts";
 import { createOpenTUIDialogShell, type OpenTUIDialogMount } from "./opentui-dialog-v2.ts";
 import { type OpenTUISelectorAction, type OpenTUISelectorItem, OpenTUISelectorViewV2 } from "./opentui-selector-v2.ts";
@@ -19,7 +19,7 @@ export interface OpenTUISettingsListOptionsV2 {
 	theme?: Theme;
 }
 
-export class OpenTUISettingsListViewV2 implements BoneView {
+export class OpenTUISettingsListViewV2 {
 	private readonly selector: OpenTUISelectorViewV2<string>;
 
 	constructor(options: OpenTUISettingsListOptionsV2) {
@@ -39,8 +39,20 @@ export class OpenTUISettingsListViewV2 implements BoneView {
 		});
 	}
 
-	mount(context: BoneRenderContext): BoneNode {
-		return this.selector.mount(context);
+	get root(): BoxRenderable | undefined {
+		return this.selector.root;
+	}
+
+	get focusTarget(): Renderable | undefined {
+		return this.selector.focusTarget;
+	}
+
+	build(renderer: CliRenderer): BoxRenderable {
+		return this.selector.build(renderer);
+	}
+
+	focus(): void {
+		this.selector.focus();
 	}
 
 	handleAction(action: OpenTUISelectorAction): boolean {
@@ -67,12 +79,12 @@ export interface OpenTUIFormOptionsV2 {
 	theme?: Theme;
 }
 
-/** Structured text form primitive with product-owned submit validation. */
-export class OpenTUIFormViewV2 implements BoneView {
+/** Structured native text form with product-owned submit validation. */
+export class OpenTUIFormViewV2 {
 	private readonly options: OpenTUIFormOptionsV2;
 	private readonly formTheme: Theme;
 	private readonly values = new Map<string, string>();
-	private readonly inputs = new Map<string, BoneInputNode>();
+	private readonly inputs = new Map<string, InputRenderable>();
 	private dialog: OpenTUIDialogMount | undefined;
 	private selectedField = 0;
 
@@ -82,41 +94,54 @@ export class OpenTUIFormViewV2 implements BoneView {
 		for (const field of options.fields) this.values.set(field.id, field.value ?? "");
 	}
 
-	mount(context: BoneRenderContext): BoneNode {
-		this.dialog = createOpenTUIDialogShell(context, {
+	get root(): BoxRenderable | undefined {
+		return this.dialog?.root;
+	}
+
+	get focusTarget(): Renderable | undefined {
+		const field = this.options.fields[this.selectedField];
+		return field ? this.inputs.get(field.id) : undefined;
+	}
+
+	build(renderer: CliRenderer): BoxRenderable {
+		if (this.dialog) throw new Error("OpenTUIFormViewV2 is already built");
+		this.dialog = createOpenTUIDialogShell(renderer, {
 			title: this.options.title,
 			subtitle: this.options.subtitle,
-			footer: "↑↓ fields · Enter save · Esc cancel",
+			footer: "fields · save · cancel",
 			theme: this.formTheme,
 		});
 		for (const [index, field] of this.options.fields.entries()) {
-			this.dialog.body.append(
-				context.createText({
+			this.dialog.body.add(
+				new TextRenderable(renderer, {
 					content: field.required ? `${field.label} *` : field.label,
 					fg: this.formTheme.getFgColor("text"),
-					bold: index === this.selectedField,
+					attributes: index === this.selectedField ? 1 : 0,
 				}),
 			);
 			if (field.description) {
-				this.dialog.body.append(
-					context.createText({ content: field.description, fg: this.formTheme.getFgColor("muted") }),
+				this.dialog.body.add(
+					new TextRenderable(renderer, { content: field.description, fg: this.formTheme.getFgColor("muted") }),
 				);
 			}
-			const input = context.createInput({
+			const input = new InputRenderable(renderer, {
 				width: "100%",
 				value: field.value ?? "",
 				placeholder: field.placeholder ?? "",
 				textColor: this.formTheme.getFgColor("text"),
 				focusedTextColor: this.formTheme.getFgColor("text"),
 				placeholderColor: this.formTheme.getFgColor("dim"),
-				onInput: (value) => this.values.set(field.id, value),
 			});
+			input.on("input", (value: string) => this.values.set(field.id, value));
 			this.inputs.set(field.id, input);
-			this.dialog.body.append(input);
-			this.dialog.body.append(context.createSpacer({ size: 1, direction: "vertical" }));
+			this.dialog.body.add(input);
+			this.dialog.body.add(new BoxRenderable(renderer, { height: 1, flexShrink: 0 }));
 		}
-		this.focusSelectedField();
 		return this.dialog.root;
+	}
+
+	focus(): void {
+		this.focusTarget?.focus();
 	}
 
 	handleAction(action: "confirm" | "cancel" | "up" | "down"): boolean {
@@ -127,7 +152,7 @@ export class OpenTUIFormViewV2 implements BoneView {
 		if (action === "up" || action === "down") {
 			const delta = action === "up" ? -1 : 1;
 			this.selectedField = Math.max(0, Math.min(this.options.fields.length - 1, this.selectedField + delta));
-			this.focusSelectedField();
+			this.focus();
 			return true;
 		}
 		const values = Object.fromEntries(this.values);
@@ -142,10 +167,5 @@ export class OpenTUIFormViewV2 implements BoneView {
 		}
 		this.options.onSubmit(values);
 		return true;
-	}
-
-	private focusSelectedField(): void {
-		const field = this.options.fields[this.selectedField];
-		if (field) this.inputs.get(field.id)?.focus();
 	}
 }

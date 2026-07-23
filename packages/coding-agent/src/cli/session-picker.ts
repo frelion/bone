@@ -1,9 +1,11 @@
 /** OpenTUI conversation selector for --resume. */
+import type { OverlayHandle } from "@frelion/bone-tui";
+import type { KeyEvent } from "@opentui/core";
 import type { SessionInfo, SessionListProgress } from "../core/session-manager.ts";
 import type { SettingsManager } from "../core/settings-manager.ts";
 import { OpenTUISessionPickerV2 } from "../modes/interactive/components/opentui-session-picker.ts";
 import { matchesOpenTUIAction } from "../modes/interactive/opentui-keymap.ts";
-import { createStartupTui, startStartupTui } from "./startup-ui.ts";
+import { clearStartupTui, createStartupTui, startStartupTui } from "./startup-ui.ts";
 
 type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
 
@@ -15,34 +17,28 @@ export async function selectSession(
 	const ui = await createStartupTui(settingsManager);
 	return new Promise((resolve) => {
 		let settled = false;
-		let unsubscribe = () => {};
-		const finish = (path: string | null) => {
+		let handle: OverlayHandle | undefined;
+		const finish = async (path: string | null) => {
 			if (settled) return;
 			settled = true;
-			unsubscribe();
-			ui.stop();
-			ui.destroy();
+			await handle?.close();
+			await clearStartupTui(ui);
 			resolve(path);
 		};
 		const picker = new OpenTUISessionPickerV2({
 			currentSessionsLoader,
 			allSessionsLoader,
-			onSelect: (path) => finish(path),
-			onCancel: () => finish(null),
+			onSelect: (path) => void finish(path),
+			onCancel: () => void finish(null),
 			onExit: () => {
-				ui.stop();
-				ui.destroy();
-				process.exit(0);
+				void finish(null).then(() => process.exit(0));
 			},
 		});
-		ui.mount(picker);
-		unsubscribe = ui.onKey((event) => {
+		const onKey = (event: KeyEvent): boolean => {
 			for (const action of ["confirm", "cancel", "up", "down", "pageUp", "pageDown"] as const) {
 				if (!matchesOpenTUIAction(event, action)) continue;
-				event.preventDefault();
-				event.stopPropagation();
 				picker.handleAction(action);
-				return;
+				return true;
 			}
 			for (const [action, command] of [
 				["startupScope", "scope"],
@@ -53,12 +49,20 @@ export async function selectSession(
 				["sessionDelete", "delete"],
 			] as const) {
 				if (!matchesOpenTUIAction(event, action)) continue;
-				event.preventDefault();
-				event.stopPropagation();
 				picker.handleCommand(command);
-				return;
+				return true;
 			}
-		});
-		startStartupTui(ui, settingsManager);
+			return false;
+		};
+		void ui.overlays
+			.openAsync((renderer) => ({ root: picker.build(renderer), focusTarget: picker.focusTarget ?? null }), {
+				restoreFocus: null,
+				onKey,
+			})
+			.then((opened) => {
+				handle = opened;
+				startStartupTui(ui, settingsManager);
+			})
+			.catch(() => void finish(null));
 	});
 }

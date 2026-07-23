@@ -1,25 +1,35 @@
-import type { AutocompleteProvider, BoneKeyEvent, BoneTestRenderer } from "@frelion/bone-tui";
-import { createBoneTestRenderer } from "@frelion/bone-tui";
+import type { AutocompleteProvider } from "@frelion/bone-tui";
+import type { KeyEvent } from "@opentui/core";
+import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { OpenTUIComposer } from "../src/modes/interactive/components/opentui-composer.ts";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 
-const renderers = new Set<BoneTestRenderer>();
+const setups = new Set<TestRendererSetup>();
 
 async function mountComposer(options: ConstructorParameters<typeof OpenTUIComposer>[0] = {}) {
-	const renderer = await createBoneTestRenderer({ width: 60, height: 16 });
-	renderers.add(renderer);
+	const testSetup = await createTestRenderer({
+		width: 60,
+		height: 16,
+		autoFocus: false,
+		useMouse: true,
+		kittyKeyboard: true,
+	});
+	setups.add(testSetup);
+	const { renderer } = testSetup;
 	renderer.start();
-	const composer = new OpenTUIComposer(options);
-	renderer.mount(composer);
+	const composer = new OpenTUIComposer(renderer, options);
+	renderer.root.add(composer.root);
 	composer.focus();
-	const unsubscribe = renderer.onKey((event: BoneKeyEvent) => composer.handleKey(event));
-	return { renderer, composer, unsubscribe };
+	const onKey = (event: KeyEvent) => composer.handleKey(event);
+	renderer.keyInput.prependListener("keypress", onKey);
+	const unsubscribe = () => renderer.keyInput.off("keypress", onKey);
+	return { testSetup, renderer, mockInput: testSetup.mockInput, composer, unsubscribe };
 }
 
-async function settle(renderer: BoneTestRenderer): Promise<void> {
+async function settle(setup: TestRendererSetup): Promise<void> {
 	await Promise.resolve();
-	await renderer.flush();
+	await setup.flush();
 	await Promise.resolve();
 }
 
@@ -28,26 +38,26 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	for (const renderer of renderers) renderer.destroy();
-	renderers.clear();
+	for (const setup of setups) setup.renderer.destroy();
+	setups.clear();
 });
 
 describe("OpenTUI composer", () => {
 	test("types, pastes multiline text, submits, and resets", async () => {
 		const changes: string[] = [];
 		const submitted = vi.fn();
-		const { renderer, composer } = await mountComposer({
+		const { testSetup, mockInput, composer } = await mountComposer({
 			onChange: (value) => changes.push(value),
 			onSubmit: submitted,
 		});
 
-		await renderer.input.typeText("hello");
-		await renderer.input.paste("\nworld");
+		await mockInput.typeText("hello");
+		await mockInput.pasteBracketedText("\nworld");
 		expect(composer.value).toBe("hello\nworld");
 		expect(changes.at(-1)).toBe("hello\nworld");
 
-		renderer.input.pressEnter();
-		await settle(renderer);
+		mockInput.pressEnter();
+		await settle(testSetup);
 		expect(submitted).toHaveBeenCalledWith("hello\nworld");
 		expect(composer.value).toBe("");
 		expect(changes.at(-1)).toBe("");
@@ -55,28 +65,28 @@ describe("OpenTUI composer", () => {
 
 	test("inserts newlines with fixed structured actions without submitting", async () => {
 		const submitted = vi.fn();
-		const { renderer, composer } = await mountComposer({ onSubmit: submitted });
-		await renderer.input.typeText("first");
-		renderer.input.pressEnter({ shift: true });
-		await renderer.input.typeText("second");
-		renderer.input.pressKey("j", { ctrl: true });
-		await renderer.input.typeText("third");
+		const { mockInput, composer } = await mountComposer({ onSubmit: submitted });
+		await mockInput.typeText("first");
+		mockInput.pressEnter({ shift: true });
+		await mockInput.typeText("second");
+		mockInput.pressKey("j", { ctrl: true });
+		await mockInput.typeText("third");
 
 		expect(composer.value).toBe("first\nsecond\nthird");
 		expect(submitted).not.toHaveBeenCalled();
 	});
 
 	test("navigates newest-first history and restores the captured draft", async () => {
-		const { renderer, composer } = await mountComposer({ history: ["newest", "older"] });
-		await renderer.input.typeText("draft");
+		const { mockInput, composer } = await mountComposer({ history: ["newest", "older"] });
+		await mockInput.typeText("draft");
 
-		renderer.input.pressArrow("up");
+		mockInput.pressArrow("up");
 		expect(composer.value).toBe("newest");
-		renderer.input.pressArrow("up");
+		mockInput.pressArrow("up");
 		expect(composer.value).toBe("older");
-		renderer.input.pressArrow("down");
+		mockInput.pressArrow("down");
 		expect(composer.value).toBe("newest");
-		renderer.input.pressArrow("down");
+		mockInput.pressArrow("down");
 		expect(composer.value).toBe("draft");
 	});
 
@@ -90,15 +100,19 @@ describe("OpenTUI composer", () => {
 				return { lines, cursorLine: 0, cursorCol: 0 };
 			},
 		};
-		const { renderer, composer } = await mountComposer({ autocompleteProvider: provider, onCancel: cancelled });
-		renderer.input.pressKey("\t");
-		await settle(renderer);
+		const { testSetup, mockInput, composer } = await mountComposer({
+			autocompleteProvider: provider,
+			onCancel: cancelled,
+		});
+		mockInput.pressKey("\t");
+		await settle(testSetup);
 		expect(composer.autocompleteOpen).toBe(true);
 
-		renderer.input.pressEscape();
+		mockInput.pressEscape();
+		await settle(testSetup);
 		expect(composer.autocompleteOpen).toBe(false);
 		expect(cancelled).not.toHaveBeenCalled();
-		renderer.input.pressEscape();
+		mockInput.pressEscape();
 		expect(cancelled).toHaveBeenCalledOnce();
 	});
 
@@ -121,17 +135,17 @@ describe("OpenTUI composer", () => {
 			applyCompletion,
 		};
 		const changes: string[] = [];
-		const { renderer, composer } = await mountComposer({
+		const { testSetup, mockInput, composer } = await mountComposer({
 			autocompleteProvider: provider,
 			onChange: (value) => changes.push(value),
 		});
-		await renderer.input.typeText("/");
-		await settle(renderer);
+		await mockInput.typeText("/");
+		await settle(testSetup);
 		expect(composer.autocompleteOpen).toBe(true);
 
-		renderer.input.pressArrow("down");
+		mockInput.pressArrow("down");
 		expect(composer.selectedAutocompleteItem?.value).toBe("history");
-		renderer.input.pressEnter();
+		mockInput.pressEnter();
 		expect(composer.value).toBe("/history");
 		expect(composer.autocompleteOpen).toBe(false);
 		expect(changes.at(-1)).toBe("/history");
@@ -154,32 +168,32 @@ describe("OpenTUI composer", () => {
 				return { lines, cursorLine: 0, cursorCol: 0 };
 			},
 		};
-		const { renderer, composer } = await mountComposer({ autocompleteProvider: provider });
-		await renderer.input.typeText("a");
-		await renderer.input.typeText("b");
-		await settle(renderer);
+		const { testSetup, mockInput, composer } = await mountComposer({ autocompleteProvider: provider });
+		await mockInput.typeText("a");
+		await mockInput.typeText("b");
+		await settle(testSetup);
 		expect(composer.selectedAutocompleteItem?.value).toBe("beta");
 
 		resolveFirst?.({ prefix: "a", items: [{ value: "alpha", label: "alpha" }] });
-		await settle(renderer);
+		await settle(testSetup);
 		expect(composer.selectedAutocompleteItem?.value).toBe("beta");
 	});
 
 	test("updates placeholder and theme without replacing composer state", async () => {
-		const { renderer, composer } = await mountComposer({ placeholder: "Initial prompt" });
-		await settle(renderer);
-		expect(renderer.captureFrame()).toContain("Initial prompt");
+		const { testSetup, composer } = await mountComposer({ placeholder: "Initial prompt" });
+		await settle(testSetup);
+		expect(testSetup.captureCharFrame()).toContain("Initial prompt");
 		composer.setPlaceholder("Updated prompt");
 		initTheme("light");
 		composer.updateTheme(theme);
-		await settle(renderer);
+		await settle(testSetup);
 
-		expect(renderer.captureFrame()).toContain("Updated prompt");
+		expect(testSetup.captureCharFrame()).toContain("Updated prompt");
 		expect(composer.value).toBe("");
 	});
 
 	test("renders a bordered prompt with one fixed status row and no legacy prompt chrome", async () => {
-		const { renderer, composer } = await mountComposer({
+		const { testSetup, composer } = await mountComposer({
 			status: {
 				cwd: "~/src/bone",
 				model: "openai/gpt-5",
@@ -188,8 +202,8 @@ describe("OpenTUI composer", () => {
 				foregroundThroughput: "14.2 tok/s",
 			},
 		});
-		await settle(renderer);
-		const initial = renderer.captureFrame();
+		await settle(testSetup);
+		const initial = testSetup.captureCharFrame();
 		expect(initial).toContain("Ask anything");
 		expect(initial).toContain("~/src/bone  openai/gpt-5  high");
 		expect(initial).toContain("82% left  14.2 tok/s");
@@ -198,15 +212,15 @@ describe("OpenTUI composer", () => {
 
 		const occupiedRows = initial.split("\n").filter((line) => line.trim()).length;
 		composer.updateStatus({ contextRemaining: "79%", foregroundThroughput: "31.8 tok/s" });
-		await settle(renderer);
-		const streaming = renderer.captureFrame();
+		await settle(testSetup);
+		const streaming = testSetup.captureCharFrame();
 		expect(streaming).toContain("79% left  31.8 tok/s");
 		expect(streaming.split("\n").filter((line) => line.trim())).toHaveLength(occupiedRows);
 	});
 
 	test("keeps public state updates safe after the native edit buffer is destroyed", async () => {
-		const { renderer, composer } = await mountComposer();
-		await renderer.input.typeText("draft survives teardown");
+		const { renderer, mockInput, composer } = await mountComposer();
+		await mockInput.typeText("draft survives teardown");
 		renderer.destroy();
 
 		expect(composer.value).toBe("draft survives teardown");

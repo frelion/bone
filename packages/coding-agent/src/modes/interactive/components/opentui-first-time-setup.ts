@@ -1,4 +1,4 @@
-import type { BoneContainerNode, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import { BoxRenderable, type CliRenderer, type Renderable } from "@opentui/core";
 import { APP_NAME } from "../../../config.ts";
 import { setTheme, type TerminalTheme } from "../theme/theme.ts";
 import { OpenTUISelectorViewV2 } from "./opentui-selector-v2.ts";
@@ -12,13 +12,14 @@ export interface OpenTUIFirstTimeSetupOptions {
 	detectedTheme: TerminalTheme;
 	onSubmit: (result: FirstTimeSetupResult) => void;
 	onCancel: () => void;
+	onFocusTargetChange?: (target: Renderable) => void;
 }
 
 /** Two-step first-run setup implemented with structured selectors. */
-export class OpenTUIFirstTimeSetupV2 implements BoneView {
+export class OpenTUIFirstTimeSetupV2 {
 	private readonly options: OpenTUIFirstTimeSetupOptions;
-	private root: BoneContainerNode | undefined;
-	private context: BoneRenderContext | undefined;
+	private renderer: CliRenderer | undefined;
+	private rootNode: BoxRenderable | undefined;
 	private selector: OpenTUISelectorViewV2<TerminalTheme | boolean> | undefined;
 	private selectedTheme: TerminalTheme;
 
@@ -27,11 +28,28 @@ export class OpenTUIFirstTimeSetupV2 implements BoneView {
 		this.selectedTheme = options.detectedTheme;
 	}
 
-	mount(context: BoneRenderContext): BoneNode {
-		this.context = context;
-		this.root = context.createBox({ width: "100%", height: "100%", alignItems: "center", justifyContent: "center" });
+	get root(): BoxRenderable | undefined {
+		return this.rootNode;
+	}
+
+	get focusTarget(): Renderable | undefined {
+		return this.selector?.focusTarget;
+	}
+
+	build(renderer: CliRenderer): BoxRenderable {
+		this.renderer = renderer;
+		this.rootNode = new BoxRenderable(renderer, {
+			width: "100%",
+			height: "100%",
+			alignItems: "center",
+			justifyContent: "center",
+		});
 		this.showThemeStep();
-		return this.root;
+		return this.rootNode;
+	}
+
+	focus(): void {
+		this.selector?.focus();
 	}
 
 	handleAction(action: "confirm" | "cancel" | "up" | "down" | "pageUp" | "pageDown"): boolean {
@@ -78,13 +96,11 @@ export class OpenTUIFirstTimeSetupV2 implements BoneView {
 	}
 
 	private replaceSelector(): void {
-		if (!this.root || !this.selector) return;
-		this.root.clear();
-		this.root.append(this.selector.mount(this.requireContext()));
-	}
-
-	private requireContext(): BoneRenderContext {
-		if (!this.context) throw new Error("OpenTUIFirstTimeSetupV2 must be mounted first");
-		return this.context;
+		if (!this.rootNode || !this.selector) return;
+		for (const child of this.rootNode.getChildren()) child.destroyRecursively();
+		if (!this.renderer) throw new Error("OpenTUIFirstTimeSetupV2 must be built before replacing its selector");
+		this.rootNode.add(this.selector.build(this.renderer));
+		const target = this.selector.focusTarget;
+		if (this.rootNode.parent && target) this.options.onFocusTargetChange?.(target);
 	}
 }

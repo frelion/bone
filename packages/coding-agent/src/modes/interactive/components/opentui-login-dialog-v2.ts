@@ -1,5 +1,12 @@
 import type { AuthInfoLink, OAuthDeviceCodeInfo } from "@frelion/bone-ai";
-import type { BoneContainerNode, BoneInputNode, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import {
+	BoxRenderable,
+	type CliRenderer,
+	InputRenderable,
+	InputRenderableEvents,
+	type Renderable,
+	TextRenderable,
+} from "@opentui/core";
 import { type Theme, theme } from "../theme/theme.ts";
 import { createOpenTUIDialogShell, type OpenTUIDialogMount } from "./opentui-dialog-v2.ts";
 
@@ -12,18 +19,23 @@ export interface OpenTUILoginDialogOptionsV2 {
 	theme?: Theme;
 }
 
-/** Structured OAuth/device-code/login prompt flow. */
-export class OpenTUILoginDialogV2 implements BoneView {
+interface PendingLoginInput {
+	control: InputRenderable;
+	resolve: (value: string) => void;
+	reject: (error: Error) => void;
+}
+
+/** Structured native OAuth/device-code/login prompt flow. */
+export class OpenTUILoginDialogV2 {
 	private readonly options: OpenTUILoginDialogOptionsV2;
 	private readonly loginTheme: Theme;
 	private readonly abortController = new AbortController();
-	private context: BoneRenderContext | undefined;
+	private renderer: CliRenderer | undefined;
 	private dialog: OpenTUIDialogMount | undefined;
-	private content: BoneContainerNode | undefined;
-	private input: BoneInputNode | undefined;
-	private inputResolver: ((value: string) => void) | undefined;
-	private inputRejecter: ((error: Error) => void) | undefined;
+	private content: BoxRenderable | undefined;
+	private pendingInput: PendingLoginInput | undefined;
 	private pendingLines: Array<{ text: string; tone: "text" | "accent" | "warning" | "muted" }> = [];
+	private completed = false;
 
 	constructor(options: OpenTUILoginDialogOptionsV2) {
 		this.options = options;
@@ -34,18 +46,31 @@ export class OpenTUILoginDialogV2 implements BoneView {
 		return this.abortController.signal;
 	}
 
-	mount(context: BoneRenderContext): BoneNode {
-		this.context = context;
+	get root(): BoxRenderable | undefined {
+		return this.dialog?.root;
+	}
+
+	get focusTarget(): Renderable | undefined {
+		return this.pendingInput?.control;
+	}
+
+	build(renderer: CliRenderer): BoxRenderable {
+		if (this.dialog) throw new Error("OpenTUILoginDialogV2 is already built");
+		this.renderer = renderer;
 		const providerName = this.options.providerName ?? this.options.providerId;
-		this.dialog = createOpenTUIDialogShell(context, {
+		this.dialog = createOpenTUIDialogShell(renderer, {
 			title: this.options.title ?? `Login to ${providerName}`,
-			footer: "Enter submit · Esc cancel",
+			footer: "submit · cancel",
 			theme: this.loginTheme,
 		});
-		this.content = context.createBox({ width: "100%", flexDirection: "column", gap: 1 });
-		this.dialog.body.append(this.content);
+		this.content = new BoxRenderable(renderer, { width: "100%", flexDirection: "column", gap: 1 });
+		this.dialog.body.add(this.content);
 		this.renderPendingLines();
 		return this.dialog.root;
+	}
+
+	focus(): void {
+		this.focusTarget?.focus();
 	}
 
 	showAuth(url: string, instructions?: string): void {
@@ -101,82 +126,85 @@ export class OpenTUILoginDialogV2 implements BoneView {
 			this.cancel();
 			return true;
 		}
-		this.input?.submit();
+		this.pendingInput?.control.submit();
 		return true;
 	}
 
 	private requestInput(placeholder = ""): Promise<string> {
-		const context = this.requireContext();
+		const renderer = this.requireRenderer();
 		const content = this.requireContent();
-		this.input = context.createInput({
+		this.rejectPendingInput(new Error("Login input was replaced"));
+		const control = new InputRenderable(renderer, {
 			width: "100%",
 			placeholder,
 			textColor: this.loginTheme.getFgColor("text"),
 			focusedTextColor: this.loginTheme.getFgColor("text"),
 			placeholderColor: this.loginTheme.getFgColor("dim"),
-			onConfirm: (value) => {
-				this.inputResolver?.(value);
-				this.inputResolver = undefined;
-				this.inputRejecter = undefined;
-			},
-			onCancel: () => this.cancel(),
 		});
-		content.append(this.input);
-		this.input.focus();
+		content.add(control);
 		return new Promise((resolve, reject) => {
-			this.inputResolver = resolve;
-			this.inputRejecter = reject;
+			this.pendingInput = { control, resolve, reject };
+			control.once(InputRenderableEvents.ENTER, (value: string) => {
+				if (this.pendingInput?.control !== control) return;
+				this.pendingInput = undefined;
+				resolve(value);
+			});
 		});
 	}
 
 	private appendLine(text: string, tone: "text" | "accent" | "warning" | "muted"): void {
 		this.pendingLines.push({ text, tone });
-		const context = this.context;
+		const renderer = this.renderer;
 		const content = this.content;
-		if (!context || !content) return;
-		content.append(
-			context.createText({
-				content: text,
-				fg: this.loginTheme.getFgColor(tone),
-				wrapMode: "word",
-				selectable: true,
-			}),
-		);
+		if (!renderer || !content) return;
+		content.add(this.createLine(renderer, text, tone));
 	}
 
 	private renderPendingLines(): void {
-		const context = this.context;
+		const renderer = this.renderer;
 		const content = this.content;
-		if (!context || !content) return;
-		content.clear();
-		this.input = undefined;
-		for (const line of this.pendingLines) {
-			content.append(
-				context.createText({
-					content: line.text,
-					fg: this.loginTheme.getFgColor(line.tone),
-					wrapMode: "word",
-					selectable: true,
-				}),
-			);
-		}
+		if (!renderer || !content) return;
+		this.rejectPendingInput(new Error("Login view changed while input was pending"));
+		for (const child of content.getChildren()) child.destroyRecursively();
+		for (const line of this.pendingLines) content.add(this.createLine(renderer, line.text, line.tone));
+	}
+
+	private createLine(
+		renderer: CliRenderer,
+		text: string,
+		tone: "text" | "accent" | "warning" | "muted",
+	): TextRenderable {
+		return new TextRenderable(renderer, {
+			content: text,
+			fg: this.loginTheme.getFgColor(tone),
+			wrapMode: "word",
+			selectable: true,
+		});
 	}
 
 	private cancel(): void {
+		if (this.completed) return;
+		this.completed = true;
 		this.abortController.abort();
-		this.inputRejecter?.(new Error("Login cancelled"));
-		this.inputResolver = undefined;
-		this.inputRejecter = undefined;
+		this.rejectPendingInput(new Error("Login cancelled"));
 		this.options.onComplete(false, "Login cancelled");
 	}
 
-	private requireContext(): BoneRenderContext {
-		if (!this.context) throw new Error("OpenTUILoginDialogV2 must be mounted before requesting input");
-		return this.context;
+	private rejectPendingInput(error: Error): void {
+		const pending = this.pendingInput;
+		if (!pending) return;
+		this.pendingInput = undefined;
+		pending.reject(error);
+		if (!pending.control.isDestroyed) pending.control.destroyRecursively();
 	}
 
-	private requireContent(): BoneContainerNode {
-		if (!this.content) throw new Error("OpenTUILoginDialogV2 must be mounted before requesting input");
+	private requireRenderer(): CliRenderer {
+		if (!this.renderer) throw new Error("OpenTUILoginDialogV2 must be built before requesting input");
+		return this.renderer;
+	}
+
+	private requireContent(): BoxRenderable {
+		if (!this.content) throw new Error("OpenTUILoginDialogV2 must be built before requesting input");
 		return this.content;
 	}
 }

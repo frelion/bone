@@ -1,30 +1,30 @@
-import { type BoneView, createBoneTestRenderer } from "@frelion/bone-tui";
+import { BoxRenderable, ScrollBoxRenderable, TextRenderable } from "@opentui/core";
+import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { OpenTUITranscriptFocusController } from "../src/modes/interactive/components/opentui-transcript-focus.ts";
-import { OpenTUIInteractiveShell } from "../src/modes/interactive/opentui-shell.ts";
 
-const renderers = new Set<Awaited<ReturnType<typeof createBoneTestRenderer>>>();
+const renderers = new Set<TestRendererSetup>();
 
 afterEach(() => {
-	for (const renderer of renderers) renderer.destroy();
+	for (const setup of renderers) setup.renderer.destroy();
 	renderers.clear();
 });
 
-function line(content: string): BoneView {
-	return { mount: (context) => context.createText({ content }) };
-}
-
 describe("OpenTUI transcript focus", () => {
 	test("shares sticky follow state between keyboard and mouse scrolling", async () => {
-		const renderer = await createBoneTestRenderer({ width: 80, height: 14 });
-		renderers.add(renderer);
-		renderer.start();
-		const shell = new OpenTUIInteractiveShell();
-		renderer.mount(shell);
-		for (let index = 0; index < 40; index++) shell.appendTranscript(line(`line-${index}`));
-		await renderer.flush();
+		const setup = await createTestRenderer({ width: 80, height: 14 });
+		renderers.add(setup);
+		const { renderer } = setup;
+		const transcript = new ScrollBoxRenderable(renderer, { width: "100%", height: "100%" });
+		const content = new BoxRenderable(renderer, { width: "100%", flexDirection: "column" });
+		transcript.add(content);
+		renderer.root.add(transcript);
+		for (let index = 0; index < 40; index++) {
+			content.add(new TextRenderable(renderer, { content: `line-${index}`, height: 1 }));
+		}
+		await setup.flush();
 
-		const controller = new OpenTUITranscriptFocusController(shell.getTranscriptNode(), () => renderer.height);
+		const controller = new OpenTUITranscriptFocusController(transcript, () => renderer.height);
 		const changes = vi.fn();
 		controller.onAutoFollowChange = changes;
 		controller.followLatest();
@@ -41,6 +41,13 @@ describe("OpenTUI transcript focus", () => {
 		controller.handleMouseScroll(-3);
 		expect(controller.isAutoFollowing()).toBe(false);
 		controller.followLatest();
+		expect(controller.isAutoFollowing()).toBe(true);
+
+		// Native ScrollBox dispatches onMouseScroll before it applies its own
+		// delta, so the owner predicts the post-event position explicitly.
+		controller.handleNativeMouseScroll("up", 3);
+		expect(controller.isAutoFollowing()).toBe(false);
+		controller.handleNativeMouseScroll("down", Number.MAX_SAFE_INTEGER);
 		expect(controller.isAutoFollowing()).toBe(true);
 	});
 });

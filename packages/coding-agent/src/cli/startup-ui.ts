@@ -1,16 +1,20 @@
 import { join } from "node:path";
+import { createRenderer, type OverlayHandle, OverlayManager } from "@frelion/bone-tui";
 import {
-	type BoneInputNode,
-	type BoneNode,
-	type BoneRenderContext,
-	type BoneRenderer,
-	type BoneView,
-	createBoneRenderer,
-} from "@frelion/bone-tui";
+	type BoxRenderable,
+	type CliRenderer,
+	InputRenderable,
+	InputRenderableEvents,
+	type KeyEvent,
+	type Renderable,
+} from "@opentui/core";
 import { existsSync, readdirSync, statSync } from "fs";
 import { getAgentDir, getSettingsPath } from "../config.ts";
 import type { SettingsManager } from "../core/settings-manager.ts";
-import { createOpenTUIDialogShell } from "../modes/interactive/components/opentui-dialog-v2.ts";
+import {
+	createOpenTUIDialogShell,
+	type OpenTUIDialogShellOptions,
+} from "../modes/interactive/components/opentui-dialog-v2.ts";
 import {
 	type FirstTimeSetupResult,
 	OpenTUIFirstTimeSetupV2,
@@ -62,24 +66,27 @@ async function loadStartupThemes(settingsManager: SettingsManager): Promise<Them
 	return loadThemes(paths);
 }
 
-export async function createStartupTui(settingsManager: SettingsManager): Promise<BoneRenderer> {
+export interface StartupTui {
+	readonly renderer: CliRenderer;
+	readonly overlays: OverlayManager;
+}
+
+export async function createStartupTui(settingsManager: SettingsManager): Promise<StartupTui> {
 	setRegisteredThemes(await loadStartupThemes(settingsManager));
 	const terminalTheme = detectTerminalBackgroundFromEnv().theme;
 	initTheme(resolveThemeSetting(settingsManager.getThemeSetting(), terminalTheme) ?? terminalTheme);
-	return createBoneRenderer({ screenMode: "alternate-screen", useMouse: true, clearOnShutdown: true });
+	const renderer = await createRenderer({ screenMode: "alternate-screen" });
+	return { renderer, overlays: new OverlayManager(renderer) };
 }
 
-export function startStartupTui(ui: BoneRenderer, settingsManager: SettingsManager): void {
-	void settingsManager;
-	ui.start();
+export function startStartupTui(ui: StartupTui, _settingsManager?: SettingsManager): void {
+	ui.renderer.start();
 }
 
-async function clearStartupTui(ui: BoneRenderer): Promise<void> {
-	ui.content.clear();
-	ui.requestRender();
-	await ui.idle();
-	ui.stop();
-	ui.destroy();
+export async function clearStartupTui(ui: StartupTui): Promise<void> {
+	await ui.overlays.dispose();
+	ui.renderer.stop();
+	ui.renderer.destroy();
 }
 
 /** First-time setup is currently disabled for this distribution. */
@@ -88,19 +95,29 @@ export function shouldRunFirstTimeSetup(settingsPath: string = getSettingsPath()
 	return false;
 }
 
-function bindSelectorKeys(
-	ui: BoneRenderer,
-	selector: { handleAction(action: "confirm" | "cancel" | "up" | "down" | "pageUp" | "pageDown"): boolean },
-): () => void {
-	return ui.onKey((event) => {
-		for (const action of ["confirm", "cancel", "up", "down", "pageUp", "pageDown"] as const) {
-			if (!matchesOpenTUIAction(event, action)) continue;
-			event.preventDefault();
-			event.stopPropagation();
-			selector.handleAction(action);
-			return;
-		}
-	});
+interface StartupOverlayView {
+	root: BoxRenderable;
+	focusTarget?: Renderable;
+}
+
+function finishOnEscape(finish: () => void): (event: KeyEvent) => boolean {
+	return (event) => {
+		if (!matchesOpenTUIAction(event, "cancel")) return false;
+		finish();
+		return true;
+	};
+}
+
+async function openStartupOverlay(
+	ui: StartupTui,
+	create: (renderer: CliRenderer) => StartupOverlayView,
+	onKey: (event: KeyEvent) => boolean,
+): Promise<OverlayHandle | undefined> {
+	try {
+		return await ui.overlays.openAsync((renderer) => create(renderer), { restoreFocus: null, onKey });
+	} catch {
+		return undefined;
+	}
 }
 
 export async function showStartupSelector<T>(
@@ -111,11 +128,11 @@ export async function showStartupSelector<T>(
 	const ui = await createStartupTui(settingsManager);
 	return new Promise((resolve) => {
 		let settled = false;
-		let unsubscribe = () => {};
+		let handle: OverlayHandle | undefined;
 		const finish = async (result: T | undefined) => {
 			if (settled) return;
 			settled = true;
-			unsubscribe();
+			await handle?.close();
 			await clearStartupTui(ui);
 			resolve(result);
 		};
@@ -125,9 +142,15 @@ export async function showStartupSelector<T>(
 			onSelect: (value) => void finish(value),
 			onCancel: () => void finish(undefined),
 		});
-		ui.mount(selector);
-		unsubscribe = bindSelectorKeys(ui, selector);
-		startStartupTui(ui, settingsManager);
+		handle = undefined;
+		void openStartupOverlay(
+			ui,
+			(renderer) => ({ root: selector.build(renderer), focusTarget: selector.focusTarget }),
+			finishOnEscape(() => void finish(undefined)),
+		).then((opened) => {
+			handle = opened;
+			startStartupTui(ui, settingsManager);
+		});
 	});
 }
 
@@ -135,68 +158,52 @@ export async function showFirstTimeSetup(settingsManager: SettingsManager): Prom
 	const ui = await createStartupTui(settingsManager);
 	return new Promise((resolve) => {
 		let settled = false;
-		let unsubscribe = () => {};
+		let handle: OverlayHandle | undefined;
 		const finish = async (result: FirstTimeSetupResult | undefined) => {
 			if (settled) return;
 			settled = true;
-			unsubscribe();
 			if (result) {
 				settingsManager.setTheme(result.theme);
 				settingsManager.setEnableAnalytics(result.shareAnalytics);
 				await settingsManager.flush();
 			}
+			await handle?.close();
 			await clearStartupTui(ui);
 			resolve();
 		};
-		const detectedTheme = detectTerminalBackgroundFromEnv().theme;
 		const setup = new OpenTUIFirstTimeSetupV2({
-			detectedTheme,
+			detectedTheme: detectTerminalBackgroundFromEnv().theme,
 			onSubmit: (result) => void finish(result),
 			onCancel: () => void finish(undefined),
+			onFocusTargetChange: (target) => target.focus(),
 		});
-		ui.mount(setup);
-		unsubscribe = bindSelectorKeys(ui, setup);
-		startStartupTui(ui, settingsManager);
+		void openStartupOverlay(
+			ui,
+			(renderer) => ({ root: setup.build(renderer), focusTarget: setup.focusTarget }),
+			finishOnEscape(() => void finish(undefined)),
+		).then((opened) => {
+			handle = opened;
+			startStartupTui(ui, settingsManager);
+		});
 	});
 }
 
-class StartupInputView implements BoneView {
-	private readonly title: string;
-	private readonly placeholder: string | undefined;
-	private readonly onSubmit: (value: string) => void;
-	private readonly onCancel: () => void;
-	private input: BoneInputNode | undefined;
+interface StartupInputView extends StartupOverlayView {
+	input: InputRenderable;
+}
 
-	constructor(
-		title: string,
-		placeholder: string | undefined,
-		onSubmit: (value: string) => void,
-		onCancel: () => void,
-	) {
-		this.title = title;
-		this.placeholder = placeholder;
-		this.onSubmit = onSubmit;
-		this.onCancel = onCancel;
-	}
-
-	mount(context: BoneRenderContext): BoneNode {
-		const dialog = createOpenTUIDialogShell(context, { title: this.title, footer: "Enter submit · Esc cancel" });
-		this.input = context.createInput({
-			width: "100%",
-			placeholder: this.placeholder,
-			onConfirm: this.onSubmit,
-			onCancel: this.onCancel,
-		});
-		dialog.body.append(this.input);
-		this.input.focus();
-		return dialog.root;
-	}
-
-	handleAction(action: "confirm" | "cancel" | "up" | "down" | "pageUp" | "pageDown"): boolean {
-		if (action === "confirm") this.input?.submit();
-		else if (action === "cancel") this.onCancel();
-		return true;
-	}
+function createStartupInput(
+	renderer: CliRenderer,
+	title: string,
+	placeholder: string | undefined,
+	onSubmit: (value: string) => void,
+): StartupInputView {
+	const dialogOptions: OpenTUIDialogShellOptions = { title, footer: "submit · cancel" };
+	const dialog = createOpenTUIDialogShell(renderer, dialogOptions);
+	const input = new InputRenderable(renderer, { width: "100%", placeholder });
+	input.on(InputRenderableEvents.ENTER, (value: string) => onSubmit(value));
+	dialog.body.add(input);
+	return { root: dialog.root, focusTarget: input, input };
 }
 
 export async function showStartupInput(
@@ -207,22 +214,21 @@ export async function showStartupInput(
 	const ui = await createStartupTui(settingsManager);
 	return new Promise((resolve) => {
 		let settled = false;
-		let unsubscribe = () => {};
+		let handle: OverlayHandle | undefined;
 		const finish = async (result: string | undefined) => {
 			if (settled) return;
 			settled = true;
-			unsubscribe();
+			await handle?.close();
 			await clearStartupTui(ui);
 			resolve(result);
 		};
-		const input = new StartupInputView(
-			title,
-			placeholder,
-			(value) => void finish(value),
-			() => void finish(undefined),
-		);
-		ui.mount(input);
-		unsubscribe = bindSelectorKeys(ui, input);
-		startStartupTui(ui, settingsManager);
+		void openStartupOverlay(
+			ui,
+			(renderer) => createStartupInput(renderer, title, placeholder, (value) => void finish(value)),
+			finishOnEscape(() => void finish(undefined)),
+		).then((opened) => {
+			handle = opened;
+			startStartupTui(ui, settingsManager);
+		});
 	});
 }

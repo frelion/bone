@@ -1,6 +1,7 @@
 import { basename, resolve } from "node:path";
 import type { ImageContent } from "@frelion/bone-ai/compat";
-import { type AutocompleteProvider, type BoneRenderer, createBoneRenderer } from "@frelion/bone-tui";
+import { type AutocompleteProvider, createRenderer, OverlayManager } from "@frelion/bone-tui";
+import type { CliRenderer, KeyEvent } from "@opentui/core";
 import type { AgentSessionEvent, PromptOptions } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import { rememberLastActiveConversation } from "../../core/conversation-state.ts";
@@ -23,7 +24,7 @@ import { OpenTUIStatusView } from "./components/opentui-rich-messages.ts";
 import { OpenTUISessionSidebar } from "./components/opentui-session-sidebar.ts";
 import { OpenTUITranscriptFactory } from "./components/opentui-transcript-factory.ts";
 import { OpenTUITranscriptFocusController } from "./components/opentui-transcript-focus.ts";
-import { OpenTUIPaneFocusController } from "./components/pane-focus-controller.ts";
+import { OpenTUIPaneNavigator } from "./components/pane-navigator.ts";
 import { OpenTUICommandRouter } from "./opentui-command-router.ts";
 import { OpenTUIExtensionHost } from "./opentui-extension-host.ts";
 import { matchesOpenTUIAction } from "./opentui-keymap.ts";
@@ -93,9 +94,9 @@ export interface OpenTUIInteractiveModeOptions {
 	initialImages?: ImageContent[];
 	initialMessages?: string[];
 	autocompleteProvider?: AutocompleteProvider;
-	createRenderer?: () => Promise<BoneRenderer>;
-	createTranscriptFactory?: () => OpenTUITranscriptFactory;
-	bindExtensionUI?: (runtime: AgentSessionRuntime, renderer: BoneRenderer) => OpenTUIExtensionBinding;
+	createRenderer?: () => Promise<CliRenderer>;
+	createTranscriptFactory?: (renderer: CliRenderer) => OpenTUITranscriptFactory;
+	bindExtensionUI?: (runtime: AgentSessionRuntime, renderer: CliRenderer) => OpenTUIExtensionBinding;
 	createMemoryRuntime?: (options: OpenTUIMemoryRuntimeOptions) => OpenTUIMemoryRuntime;
 	installSignalHandlers?: boolean;
 	verbose?: boolean;
@@ -123,16 +124,17 @@ function messageText(message: { content?: unknown }): string {
 export class OpenTUIInteractiveMode {
 	private readonly sessionHost: OpenTUISessionHostContract;
 	private readonly options: OpenTUIInteractiveModeOptions;
-	private transcriptFactory: OpenTUITranscriptFactory;
+	private transcriptFactory!: OpenTUITranscriptFactory;
 	private readonly commandRouter: OpenTUICommandRouter;
 	private readonly memory: OpenTUIMemoryRuntime;
-	private renderer: BoneRenderer | undefined;
+	private renderer: CliRenderer | undefined;
 	private shell: OpenTUIInteractiveShell | undefined;
 	private composer: OpenTUIComposer | undefined;
 	private topBar: OpenTUITopBar | undefined;
 	private welcome: OpenTUIWelcome | undefined;
 	private sidebar: OpenTUISessionSidebar | undefined;
-	private paneFocus: OpenTUIPaneFocusController | undefined;
+	private paneFocus: OpenTUIPaneNavigator | undefined;
+	private overlayManager: OverlayManager | undefined;
 	private transcriptFocus: OpenTUITranscriptFocusController | undefined;
 	private status: OpenTUIStatusView | undefined;
 	private unsubscribeSession: (() => void) | undefined;
@@ -173,7 +175,6 @@ export class OpenTUIInteractiveMode {
 		this.sessionHost = sessionHost;
 		this.options = options;
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
-		this.transcriptFactory = options.createTranscriptFactory?.() ?? new OpenTUITranscriptFactory();
 		const memoryOptions: OpenTUIMemoryRuntimeOptions = {
 			agentDir: sessionHost.current.services.agentDir,
 			cwd: sessionHost.current.session.sessionManager.getCwd(),
@@ -234,23 +235,25 @@ export class OpenTUIInteractiveMode {
 
 	async init(): Promise<void> {
 		if (this.initialized) return;
-		this.renderer = await (this.options.createRenderer ?? (() => createBoneRenderer()))();
+		this.renderer = await (this.options.createRenderer ?? (() => createRenderer()))();
+		this.transcriptFactory =
+			this.options.createTranscriptFactory?.(this.renderer) ?? new OpenTUITranscriptFactory(this.renderer);
+		this.overlayManager = new OverlayManager(this.renderer);
 		const settingsManager = this.sessionHost.current.services.settingsManager;
-		this.shell = new OpenTUIInteractiveShell({ sidebarWidth: settingsManager.getSidebarWidth() });
+		this.shell = new OpenTUIInteractiveShell(this.renderer, { sidebarWidth: settingsManager.getSidebarWidth() });
 		this.shell.onSidebarWidthChange = (width) => settingsManager.setSidebarWidth(width);
-		this.renderer.mount(this.shell);
+		this.renderer.root.add(this.shell.root);
 
-		this.sidebar = new OpenTUISessionSidebar();
-		const sidebarNode = this.shell.setSidebar(this.sidebar);
-		if (!sidebarNode) throw new Error("OpenTUI sidebar did not mount");
+		this.sidebar = new OpenTUISessionSidebar(this.renderer);
+		this.shell.setSidebar(this.sidebar.root);
 
-		this.status = new OpenTUIStatusView("working", "Ready");
+		this.status = new OpenTUIStatusView(this.renderer, "working", "Ready");
 		this.status.stop();
 		const regions = this.shell.getExtensionRegions();
-		this.topBar = new OpenTUITopBar(this.getTopBarState(this.sessionHost.current));
-		this.renderer.mount(this.topBar, regions.header);
-		this.renderer.mount(this.status, regions.aboveEditor);
-		this.composer = new OpenTUIComposer({
+		this.topBar = new OpenTUITopBar(this.renderer, this.getTopBarState(this.sessionHost.current));
+		regions.header.add(this.topBar.root);
+		regions.aboveEditor.add(this.status.root);
+		this.composer = new OpenTUIComposer(this.renderer, {
 			status: this.getComposerStatus(this.sessionHost.current),
 			autocompleteProvider: this.options.autocompleteProvider ?? this.commandRouter.createAutocompleteProvider(),
 			onSubmit: (text) => {
@@ -258,43 +261,41 @@ export class OpenTUIInteractiveMode {
 			},
 			onCancel: () => void this.abortOrClear(),
 		});
-		const composerNode = this.renderer.mount(this.composer, regions.editor);
+		regions.editor.add(this.composer.root);
 
-		this.paneFocus = new OpenTUIPaneFocusController(this.renderer, (pane) =>
+		this.paneFocus = new OpenTUIPaneNavigator(this.renderer, (pane) =>
 			this.shell?.showPane(pane === "sidebar" ? "sidebar" : "main"),
 		);
+		const sidebar = this.sidebar;
+		const composer = this.composer;
+		const paneFocus = this.paneFocus;
+		if (!sidebar || !composer || !paneFocus) throw new Error("OpenTUI panes did not initialize");
 		this.composer.onFocusRequest = () => this.paneFocus?.focus("composer");
 		this.transcriptFocus = new OpenTUITranscriptFocusController(
 			this.shell.getTranscriptNode(),
 			() => this.renderer?.height ?? 24,
 		);
-		this.transcriptFocus.onFocusSidebar = () => this.paneFocus?.focus("sidebar");
-		this.transcriptFocus.onFocusComposer = () => this.paneFocus?.focus("composer");
-		this.transcriptFocus.onInterrupt = () => void this.abortOrClear();
-		this.transcriptFocus.onExit = () => this.stop();
 		this.shell.onTranscriptScrollRequest = (delta) => this.transcriptFocus?.scrollByUser(delta);
+		this.shell.transcript.onMouseScroll = (event) => {
+			const scroll = event.scroll;
+			if (scroll && (scroll.direction === "up" || scroll.direction === "down")) {
+				this.transcriptFocus?.handleNativeMouseScroll(scroll.direction, scroll.delta);
+			}
+		};
 		this.shell.onTranscriptContentChange = () => {
 			if (this.transcriptFocus?.isAutoFollowing()) this.transcriptFocus.followLatest();
 		};
-		this.paneFocus.register("sidebar", {
-			node: sidebarNode,
-			handleKey: (event) => this.sidebar?.handleKey(event) ?? false,
+		paneFocus.register("sidebar", {
+			root: sidebar.root,
+			focusTarget: () => sidebar.focusTarget,
 			onFocusChange: (focused) => this.sidebar?.setFocused(focused),
 		});
-		this.paneFocus.register("composer", {
-			node: this.composer.focusNode ?? composerNode,
-			handleKey: (event) => {
-				if (matchesOpenTUIAction(event, "focusLeft")) {
-					event.preventDefault();
-					event.stopPropagation();
-					this.paneFocus?.focus("sidebar");
-					return true;
-				}
-				return this.composer?.handleKey(event) ?? false;
-			},
-			onFocusChange: (focused) => (focused ? this.composer?.focus() : this.composer?.blur()),
+		paneFocus.register("composer", {
+			root: composer.root,
+			focusTarget: () => composer.focusNode,
 		});
-		this.unsubscribeApplicationKeys = this.renderer.onKey((event) => {
+		const applicationKeyHandler = (event: KeyEvent) => {
+			if (this.overlayManager?.active) return;
 			if (matchesOpenTUIAction(event, "toggleToolDetails")) {
 				event.preventDefault();
 				event.stopPropagation();
@@ -303,7 +304,18 @@ export class OpenTUIInteractiveMode {
 				this.renderer?.requestRender();
 				return;
 			}
+			if (this.paneFocus?.focusedPane === "sidebar") {
+				this.sidebar?.handleKey(event);
+				return;
+			}
 			if (this.paneFocus?.focusedPane !== "composer") return;
+			if (matchesOpenTUIAction(event, "focusLeft")) {
+				event.preventDefault();
+				event.stopPropagation();
+				this.paneFocus.focus("sidebar");
+				return;
+			}
+			this.composer?.handleKey(event);
 			if (matchesOpenTUIAction(event, "clear")) {
 				event.preventDefault();
 				event.stopPropagation();
@@ -313,12 +325,18 @@ export class OpenTUIInteractiveMode {
 				event.stopPropagation();
 				this.stop();
 			}
-		});
+		};
+		this.renderer.keyInput.on("keypress", applicationKeyHandler);
+		this.unsubscribeApplicationKeys = () => this.renderer?.keyInput.off("keypress", applicationKeyHandler);
 
 		// The transcript is a reading surface, not a separate input mode. A click
 		// there must leave the composer ready for immediate typing.
 		this.shell.onTranscriptFocusRequest = () => this.paneFocus?.focus("composer");
 		this.sidebar.onFocusRequest = () => this.paneFocus?.focus("sidebar");
+		// Search replaces the sidebar's focus target with a native textarea.
+		// Re-run the navigator after the subtree is rebuilt so typing starts
+		// immediately and Esc restores focus to the native sidebar root.
+		this.sidebar.onSearchStateChange = () => this.paneFocus?.focus("sidebar");
 		this.sidebar.onFocusChat = () => this.paneFocus?.focus("composer");
 		this.sidebar.onScrollChat = (direction) => this.shell?.scrollTranscript(direction === "up" ? -10 : 10);
 		this.sidebar.onActivateSession = (path) => void this.runAction(() => this.sessionHost.activate(path));
@@ -466,15 +484,21 @@ export class OpenTUIInteractiveMode {
 			liveEvents: [],
 			liveEventEnvelopes: [],
 		};
+		const activeStreamGeneration = replaySnapshot.generationId ?? historySnapshot.generationId;
+		const belongsToActiveStream = (envelope: RuntimeEventEnvelope): boolean =>
+			activeStreamGeneration === undefined || envelope.generationId === activeStreamGeneration;
 		const replayEnvelopes = [
-			...historySnapshot.liveEventEnvelopes,
-			...replaySnapshot.liveEventEnvelopes,
-			...pendingEvents.filter((envelope) => envelope.revision > historySnapshot.revision),
+			...historySnapshot.liveEventEnvelopes.filter(belongsToActiveStream),
+			...replaySnapshot.liveEventEnvelopes.filter(belongsToActiveStream),
+			...pendingEvents.filter(
+				(envelope) => envelope.revision > historySnapshot.revision && belongsToActiveStream(envelope),
+			),
 		].sort((left, right) => left.revision - right.revision);
-		const replayedRevisions = new Set<number>();
+		const replayedRevisions = new Set<string>();
 		for (const envelope of replayEnvelopes) {
-			if (replayedRevisions.has(envelope.revision)) continue;
-			replayedRevisions.add(envelope.revision);
+			const replayKey = `${envelope.generationId ?? "legacy"}:${envelope.revision}`;
+			if (replayedRevisions.has(replayKey)) continue;
+			replayedRevisions.add(replayKey);
 			await this.handleSessionEvent(runtime, envelope.event, generation);
 		}
 		if (replayEnvelopes.length === 0 && historySnapshot.liveEvents.length === 0) {
@@ -485,7 +509,10 @@ export class OpenTUIInteractiveMode {
 		this.renderer.requestRender();
 		this.topBar?.update(this.getTopBarState(runtime));
 		this.rememberActiveConversation(runtime);
-		if (this.initialized) this.schedulePendingInteractions(runtime, generation);
+		if (this.initialized) {
+			this.schedulePendingInteractions(runtime, generation);
+			if (!this.overlayManager?.active) this.paneFocus?.focus("composer");
+		}
 	}
 
 	private queueSessionEvent(runtime: AgentSessionRuntime, event: AgentSessionEvent, generation: number): void {
@@ -515,19 +542,18 @@ export class OpenTUIInteractiveMode {
 		this.footerData = undefined;
 	}
 
-	private createDefaultExtensionBinding(
-		runtime: AgentSessionRuntime,
-		renderer: BoneRenderer,
-	): OpenTUIExtensionBinding {
-		if (!this.shell || !this.composer) throw new Error("OpenTUI shell is not mounted");
+	private createDefaultExtensionBinding(runtime: AgentSessionRuntime, renderer: CliRenderer): OpenTUIExtensionBinding {
+		if (!this.shell || !this.composer || !this.overlayManager) throw new Error("OpenTUI shell is not mounted");
 		this.footerData = new FooterDataProvider(runtime.cwd);
 		const host = new OpenTUIExtensionHost({
 			renderer,
+			overlayManager: this.overlayManager,
 			regions: this.shell.getExtensionRegions(),
 			editor: {
 				getText: () => this.composer?.value ?? "",
 				setText: (text) => this.composer?.setValue(text),
 				insertText: (text) => this.composer?.setValue(`${this.composer.value}${text}`),
+				focusTarget: this.composer.focusNode,
 			},
 			footerData: this.footerData,
 			onNotify: (message) => {
@@ -560,11 +586,15 @@ export class OpenTUIInteractiveMode {
 			.then(async () => {
 				if (!this.shell || !this.isCurrentForeground(runtime, generation)) return;
 				const transcriptFactory =
-					this.options.createTranscriptFactory?.() ??
-					new OpenTUITranscriptFactory({
+					this.options.createTranscriptFactory?.(this.renderer!) ??
+					new OpenTUITranscriptFactory(this.renderer!, {
 						showImages: runtime.services.settingsManager?.getShowImages?.() ?? true,
 						hideThinkingBlock: runtime.services.settingsManager?.getHideThinkingBlock?.() ?? false,
 					});
+				// A caller may intentionally reuse one factory across foreground
+				// sessions. Clear call-scoped tool bookkeeping before replay so
+				// reused tool ids cannot update a previous session's native roots.
+				transcriptFactory.reset();
 				transcriptFactory.setResolvers({
 					cwd: runtime.cwd,
 					getToolRenderer: (name) =>
@@ -589,14 +619,14 @@ export class OpenTUIInteractiveMode {
 				this.shell.clearTranscript();
 				this.welcome = undefined;
 				this.transcriptFactory = transcriptFactory;
-				for (const item of items) this.shell.appendTranscript(item.view);
+				for (const item of items) this.shell.appendTranscript(item.root);
 				const hasConversationMessages = entries.some(
 					(entry) =>
 						entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant"),
 				);
 				if (!hasConversationMessages) {
-					this.welcome = new OpenTUIWelcome({ workspace: runtime.cwd });
-					this.shell.appendTranscript(this.welcome);
+					this.welcome = new OpenTUIWelcome(this.renderer!, { workspace: runtime.cwd });
+					this.shell.appendTranscript(this.welcome.root);
 				}
 			});
 		this.renderTail = render;
@@ -612,13 +642,38 @@ export class OpenTUIInteractiveMode {
 		this.topBar?.updateTheme(theme);
 		this.topBar?.update(this.getTopBarState(this.sessionHost.current));
 		const runtime = this.sessionHost.current;
-		const rebind = async (target: AgentSessionRuntime) => {
-			if (target !== this.sessionHost.current || this.stopping) return;
-			await this.unbindForeground(target);
-			await this.bindForeground(target);
+		const refresh = async (target: AgentSessionRuntime) => {
+			if (target !== this.sessionHost.current || this.stopping || !this.shell) return;
+			// Serialize the destructive transcript replacement with live event handling.
+			// Events arriving after this task is queued are appended behind it by
+			// queueSessionEvent and therefore apply to the new transcript factory.
+			const refreshTask = this.eventTail.then(async () => {
+				if (!this.shell || target !== this.sessionHost.current || this.stopping) return;
+				const transcript = this.shell.getTranscriptNode();
+				const scrollTop = transcript.scrollTop;
+				const snapshot = this.sessionHost.getRuntimeStreamSnapshot?.(target) ?? {
+					revision: 0,
+					generationId: undefined,
+					liveEvents: [],
+					liveEventEnvelopes: [],
+				};
+				await this.renderTranscript(target, this.foregroundGeneration, () => snapshot);
+				if (!this.isCurrentForeground(target, this.foregroundGeneration)) return;
+				for (const envelope of snapshot.liveEventEnvelopes) {
+					await this.handleSessionEvent(target, envelope.event, this.foregroundGeneration);
+				}
+				if (snapshot.liveEventEnvelopes.length === 0) {
+					for (const event of snapshot.liveEvents) {
+						await this.handleSessionEvent(target, event, this.foregroundGeneration);
+					}
+				}
+				transcript.scrollTo(scrollTop);
+			});
+			this.eventTail = refreshTask.catch((error: unknown) => this.showInteractionError(error));
+			await refreshTask;
 		};
-		if (this.sessionHost.refreshForeground) await this.sessionHost.refreshForeground(rebind);
-		else await rebind(runtime);
+		if (this.sessionHost.refreshForeground) await this.sessionHost.refreshForeground(refresh);
+		else await refresh(runtime);
 		this.renderer?.requestRender();
 	}
 
@@ -649,7 +704,7 @@ export class OpenTUIInteractiveMode {
 				break;
 		}
 		const mutation = await this.transcriptFactory.handleEvent(event);
-		if (mutation.type === "append") this.shell.appendTranscript(mutation.item.view);
+		if (mutation.type === "append") this.shell.appendTranscript(mutation.item.root);
 		if (this.transcriptFocus?.isAutoFollowing()) this.transcriptFocus.followLatest();
 		if (event.type === "session_info_changed" || event.type === "thinking_level_changed") {
 			this.topBar?.update(this.getTopBarState(runtime));
@@ -1170,6 +1225,11 @@ export class OpenTUIInteractiveMode {
 			this.unsubscribeApplicationKeys?.();
 			this.unsubscribeApplicationKeys = undefined;
 			this.paneFocus?.dispose();
+			// OverlayManager owns the native key/resize listeners and the overlay
+			// layer. Dispose it before tearing down the shell or renderer so no
+			// late async dialog can attach into a destroyed native tree.
+			await this.overlayManager?.dispose();
+			this.overlayManager = undefined;
 			this.topBar?.dispose();
 			this.sidebar?.dispose();
 			this.shell?.dispose();

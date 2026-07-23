@@ -1,4 +1,4 @@
-import { type BoneTestRenderer, createBoneTestRenderer } from "@frelion/bone-tui";
+import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -9,24 +9,24 @@ import { OpenTUIFirstTimeSetupV2 } from "../src/modes/interactive/components/ope
 import { OpenTUISessionPickerV2 } from "../src/modes/interactive/components/opentui-session-picker.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
-const renderers = new Set<BoneTestRenderer>();
+const setups = new Set<TestRendererSetup>();
 const temporaryDirectories: string[] = [];
 
-async function renderer(): Promise<BoneTestRenderer> {
-	const value = await createBoneTestRenderer({ width: 90, height: 26 });
-	renderers.add(value);
-	value.start();
+async function renderer(): Promise<TestRendererSetup> {
+	const value = await createTestRenderer({ width: 90, height: 26, autoFocus: false, useMouse: true });
+	setups.add(value);
+	value.renderer.start();
 	return value;
 }
 
-async function frameWith(value: BoneTestRenderer, text: string): Promise<string> {
+async function frameWith(value: TestRendererSetup, text: string): Promise<string> {
 	for (let attempt = 0; attempt < 10; attempt++) {
 		await value.flush();
-		const frame = value.captureFrame();
+		const frame = value.captureCharFrame();
 		if (frame.includes(text)) return frame;
 		await Promise.resolve();
 	}
-	return value.captureFrame();
+	return value.captureCharFrame();
 }
 
 function temporaryDirectory(): string {
@@ -38,17 +38,19 @@ function temporaryDirectory(): string {
 beforeEach(() => initTheme("dark"));
 
 afterEach(() => {
-	for (const value of renderers) value.destroy();
-	renderers.clear();
+	for (const value of setups) value.renderer.destroy();
+	setups.clear();
 	for (const path of temporaryDirectories.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
 describe("OpenTUI startup views", () => {
 	test("completes theme and analytics setup as a two-step structured flow", async () => {
 		const value = await renderer();
+		const { renderer: nativeRenderer } = value;
 		const submit = vi.fn();
 		const setup = new OpenTUIFirstTimeSetupV2({ detectedTheme: "dark", onSubmit: submit, onCancel: vi.fn() });
-		value.mount(setup);
+		nativeRenderer.root.add(setup.build(nativeRenderer));
+		setup.focus();
 		expect(await frameWith(value, "Pick a theme")).toContain("Dark");
 		setup.handleAction("down");
 		setup.handleAction("confirm");
@@ -60,6 +62,7 @@ describe("OpenTUI startup views", () => {
 
 	test("loads, searches, switches scope, and selects conversations", async () => {
 		const value = await renderer();
+		const { renderer: nativeRenderer } = value;
 		const selected = vi.fn();
 		const session = (path: string, name: string, cwd: string) => ({
 			path,
@@ -79,7 +82,8 @@ describe("OpenTUI startup views", () => {
 			onCancel: vi.fn(),
 			onExit: vi.fn(),
 		});
-		value.mount(picker);
+		nativeRenderer.root.add(picker.build(nativeRenderer));
+		picker.focus();
 		expect(await frameWith(value, "Current task")).toContain("Current folder");
 		picker.handleAction("confirm");
 		expect(selected).toHaveBeenCalledWith("/sessions/current.jsonl");
@@ -89,6 +93,7 @@ describe("OpenTUI startup views", () => {
 
 	test("toggles global resources and project overrides", async () => {
 		const value = await renderer();
+		const { renderer: nativeRenderer } = value;
 		const cwd = temporaryDirectory();
 		const agentDir = temporaryDirectory();
 		const manager = SettingsManager.create(cwd, agentDir);
@@ -112,7 +117,8 @@ describe("OpenTUI startup views", () => {
 			onClose: vi.fn(),
 			onExit: vi.fn(),
 		});
-		value.mount(selector);
+		nativeRenderer.root.add(selector.build(nativeRenderer));
+		selector.focus();
 		expect(await frameWith(value, "review")).toContain("[x]");
 		selector.handleCommand("toggle");
 		expect(manager.getGlobalSettings().skills).toContain("-skills/review/SKILL.md");

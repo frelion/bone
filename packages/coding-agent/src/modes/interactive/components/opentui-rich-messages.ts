@@ -1,5 +1,13 @@
 import type { TextContent, ToolResultMessage } from "@frelion/bone-ai";
-import type { BoneContainerNode, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import {
+	BoxRenderable,
+	type CliRenderer,
+	DiffRenderable,
+	MarkdownRenderable,
+	SyntaxStyle,
+	TextAttributes,
+	TextRenderable,
+} from "@opentui/core";
 import type { ParsedSkillBlock } from "../../../core/agent-session.ts";
 import type {
 	BashExecutionMessage,
@@ -9,8 +17,13 @@ import type {
 } from "../../../core/messages.ts";
 import { stripAnsi } from "../../../utils/ansi.ts";
 import { type Theme, theme } from "../theme/theme.ts";
+import { OpenTUIRgbaImage } from "./opentui-image.ts";
 
 const PREVIEW_LINES = 20;
+
+function clearChildren(root: BoxRenderable): void {
+	for (const child of root.getChildren()) child.destroyRecursively();
+}
 
 export interface OpenTUIImageAttachment {
 	mimeType: string;
@@ -49,8 +62,8 @@ function isUnifiedDiff(content: string): boolean {
 }
 
 function appendImageAttachments(
-	context: BoneRenderContext,
-	body: BoneContainerNode,
+	renderer: CliRenderer,
+	body: BoxRenderable,
 	attachments: readonly OpenTUIImageAttachment[],
 	viewTheme: Theme,
 ): void {
@@ -62,8 +75,8 @@ function appendImageAttachments(
 			attachment.terminalWidth &&
 			attachment.terminalHeight
 		) {
-			body.append(
-				context.createImage({
+			body.add(
+				new OpenTUIRgbaImage(renderer, {
 					pixels: attachment.pixels,
 					pixelWidth: attachment.pixelWidth,
 					pixelHeight: attachment.pixelHeight,
@@ -73,8 +86,8 @@ function appendImageAttachments(
 			);
 			continue;
 		}
-		body.append(
-			context.createText({
+		body.add(
+			new TextRenderable(renderer, {
 				content: `[image: ${attachment.mimeType}; ${attachment.error ?? "unable to decode"}]`,
 				fg: viewTheme.getFgColor("warning"),
 				wrapMode: "word",
@@ -83,31 +96,29 @@ function appendImageAttachments(
 	}
 }
 
-abstract class RebuildableView implements BoneView {
-	protected context: BoneRenderContext | undefined;
-	protected root: BoneContainerNode | undefined;
+abstract class RebuildableView {
+	readonly root: BoxRenderable;
+	protected readonly renderer: CliRenderer;
 
-	mount(context: BoneRenderContext): BoneNode {
-		this.context = context;
-		this.root = context.createBox({ flexDirection: "column" });
-		this.rebuild();
-		return this.root;
+	constructor(renderer: CliRenderer) {
+		this.renderer = renderer;
+		this.root = new BoxRenderable(renderer, { flexDirection: "column" });
 	}
 
 	protected abstract rebuild(): void;
 
-	protected begin(backgroundColor?: string): { context: BoneRenderContext; body: BoneContainerNode } | undefined {
-		if (!this.context || !this.root || this.root.destroyed) return undefined;
-		this.root.clear();
-		this.root.append(this.context.createSpacer({ size: 1, direction: "vertical" }));
-		const body = this.context.createBox({
+	protected begin(backgroundColor?: string): { renderer: CliRenderer; body: BoxRenderable } | undefined {
+		if (this.root.isDestroyed) return undefined;
+		clearChildren(this.root);
+		this.root.add(new BoxRenderable(this.renderer, { width: "100%", height: 1 }));
+		const body = new BoxRenderable(this.renderer, {
 			flexDirection: "column",
 			paddingX: 1,
 			paddingY: 1,
 			backgroundColor,
 		});
-		this.root.append(body);
-		return { context: this.context, body };
+		this.root.add(body);
+		return { renderer: this.renderer, body };
 	}
 }
 
@@ -116,7 +127,8 @@ export interface OpenTUIToolExecutionOptions {
 	expanded?: boolean;
 }
 
-export interface OpenTUIWorkingGroupTool extends BoneView {
+export interface OpenTUIWorkingGroupTool {
+	readonly root: BoxRenderable;
 	setExpanded(expanded: boolean): void;
 }
 
@@ -131,14 +143,42 @@ export class OpenTUIToolExecution extends RebuildableView {
 	private expanded: boolean;
 	private attachments: readonly OpenTUIImageAttachment[] = [];
 	private viewTheme: Theme;
+	private readonly body: BoxRenderable;
+	private readonly titleNode: TextRenderable;
+	private readonly argsNode: TextRenderable;
+	private readonly outputRoot: BoxRenderable;
+	private readonly attachmentsRoot: BoxRenderable;
+	private readonly hiddenNode: TextRenderable;
+	private outputNode: TextRenderable | DiffRenderable | undefined;
+	private renderedAttachments: readonly OpenTUIImageAttachment[] = [];
 
-	constructor(toolName: string, toolCallId: string, args: unknown, options: OpenTUIToolExecutionOptions = {}) {
-		super();
+	constructor(
+		renderer: CliRenderer,
+		toolName: string,
+		toolCallId: string,
+		args: unknown,
+		options: OpenTUIToolExecutionOptions = {},
+	) {
+		super(renderer);
 		this.toolName = toolName;
 		this.toolCallId = toolCallId;
 		this.args = args;
 		this.expanded = options.expanded ?? false;
 		this.viewTheme = options.theme ?? theme;
+		this.root.add(new BoxRenderable(renderer, { width: "100%", height: 1 }));
+		this.body = new BoxRenderable(renderer, { flexDirection: "column", paddingX: 1, paddingY: 1 });
+		this.titleNode = new TextRenderable(renderer, { content: "", attributes: TextAttributes.BOLD });
+		this.argsNode = new TextRenderable(renderer, { content: "", wrapMode: "word" });
+		this.outputRoot = new BoxRenderable(renderer, { flexDirection: "column" });
+		this.attachmentsRoot = new BoxRenderable(renderer, { flexDirection: "column" });
+		this.hiddenNode = new TextRenderable(renderer, { content: "", attributes: TextAttributes.DIM });
+		this.body.add(this.titleNode);
+		this.body.add(this.argsNode);
+		this.body.add(this.outputRoot);
+		this.body.add(this.attachmentsRoot);
+		this.body.add(this.hiddenNode);
+		this.root.add(this.body);
+		this.rebuild();
 	}
 
 	updateArgs(args: unknown): void {
@@ -170,14 +210,13 @@ export class OpenTUIToolExecution extends RebuildableView {
 	}
 
 	protected rebuild(): void {
+		if (this.root.isDestroyed) return;
 		const background = this.partial
 			? this.viewTheme.getBgColor("toolPendingBg")
 			: this.result?.isError
 				? this.viewTheme.getBgColor("toolErrorBg")
 				: this.viewTheme.getBgColor("toolSuccessBg");
-		const mounted = this.begin(background);
-		if (!mounted) return;
-		const { context, body } = mounted;
+		this.body.backgroundColor = background;
 		const phase = this.result
 			? this.partial
 				? "streaming"
@@ -189,29 +228,27 @@ export class OpenTUIToolExecution extends RebuildableView {
 				: this.argsComplete
 					? "ready"
 					: "preparing";
-		body.append(
-			context.createText({
-				content: `${this.toolName} · ${phase}`,
-				fg: this.result?.isError ? this.viewTheme.getFgColor("error") : this.viewTheme.getFgColor("toolTitle"),
-				bold: true,
-			}),
-		);
+		this.titleNode.content = `${this.toolName} · ${phase}`;
+		this.titleNode.fg = this.result?.isError
+			? this.viewTheme.getFgColor("error")
+			: this.viewTheme.getFgColor("toolTitle");
 		const serializedArgs = JSON.stringify(this.args, null, 2);
-		if (serializedArgs && serializedArgs !== "{}") {
-			body.append(
-				context.createText({
-					content: serializedArgs,
-					fg: this.viewTheme.getFgColor("toolOutput"),
-					wrapMode: "word",
-				}),
-			);
+		this.argsNode.content = serializedArgs && serializedArgs !== "{}" ? serializedArgs : "";
+		this.argsNode.fg = this.viewTheme.getFgColor("toolOutput");
+		this.argsNode.visible = Boolean(this.argsNode.content);
+		if (!this.result) {
+			this.outputRoot.visible = false;
+			this.attachmentsRoot.visible = false;
+			this.hiddenNode.visible = false;
+			return;
 		}
-		if (!this.result) return;
 		const resultContent = textContent(this.result.content);
 		const output = preview(resultContent, this.expanded);
-		if (resultContent && isUnifiedDiff(resultContent)) {
-			body.append(
-				context.createDiff({
+		const diff = resultContent && isUnifiedDiff(resultContent);
+		if (diff) {
+			if (!(this.outputNode instanceof DiffRenderable)) {
+				clearChildren(this.outputRoot);
+				this.outputNode = new DiffRenderable(this.renderer, {
 					diff: resultContent,
 					view: "unified",
 					wrapMode: "word",
@@ -219,27 +256,35 @@ export class OpenTUIToolExecution extends RebuildableView {
 					fg: this.viewTheme.getFgColor("toolOutput"),
 					addedSignColor: this.viewTheme.getFgColor("toolDiffAdded"),
 					removedSignColor: this.viewTheme.getFgColor("toolDiffRemoved"),
-				}),
-			);
-		} else if (output.content) {
-			body.append(
-				context.createText({
-					content: output.content,
-					fg: this.result.isError ? this.viewTheme.getFgColor("error") : this.viewTheme.getFgColor("toolOutput"),
-					wrapMode: "word",
-				}),
-			);
+				});
+				this.outputRoot.add(this.outputNode);
+			} else {
+				this.outputNode.diff = resultContent;
+			}
+		} else {
+			if (!(this.outputNode instanceof TextRenderable)) {
+				clearChildren(this.outputRoot);
+				this.outputNode = new TextRenderable(this.renderer, { content: "", wrapMode: "word" });
+				this.outputRoot.add(this.outputNode);
+			}
+			this.outputNode.content = output.content;
+			this.outputNode.fg = this.result.isError
+				? this.viewTheme.getFgColor("error")
+				: this.viewTheme.getFgColor("toolOutput");
 		}
-		appendImageAttachments(context, body, this.attachments, this.viewTheme);
-		if (output.hiddenLines > 0 && !isUnifiedDiff(resultContent)) {
-			body.append(
-				context.createText({
-					content: `${output.hiddenLines} earlier lines hidden`,
-					fg: this.viewTheme.getFgColor("muted"),
-					dim: true,
-				}),
-			);
+		this.outputRoot.visible = Boolean(resultContent);
+		if (
+			this.renderedAttachments.length !== this.attachments.length ||
+			this.renderedAttachments.some((attachment, index) => attachment !== this.attachments[index])
+		) {
+			clearChildren(this.attachmentsRoot);
+			appendImageAttachments(this.renderer, this.attachmentsRoot, this.attachments, this.viewTheme);
+			this.renderedAttachments = this.attachments;
 		}
+		this.attachmentsRoot.visible = this.attachments.length > 0;
+		this.hiddenNode.content = output.hiddenLines > 0 && !diff ? `${output.hiddenLines} earlier lines hidden` : "";
+		this.hiddenNode.fg = this.viewTheme.getFgColor("muted");
+		this.hiddenNode.visible = Boolean(this.hiddenNode.content);
 	}
 }
 
@@ -258,11 +303,12 @@ export class OpenTUIWorkingGroup extends RebuildableView {
 	private expanded = true;
 	private completedAt: number | undefined;
 
-	constructor(startedAt = Date.now(), now: () => number = Date.now, viewTheme: Theme = theme) {
-		super();
+	constructor(renderer: CliRenderer, startedAt = Date.now(), now: () => number = Date.now, viewTheme: Theme = theme) {
+		super(renderer);
 		this.startedAt = startedAt;
 		this.now = now;
 		this.viewTheme = viewTheme;
+		this.rebuild();
 	}
 
 	addTool(id: string, view: OpenTUIWorkingGroupTool): void {
@@ -299,11 +345,15 @@ export class OpenTUIWorkingGroup extends RebuildableView {
 	}
 
 	protected rebuild(): void {
-		if (!this.context || !this.root) return;
-		this.root.clear();
-		this.root.append(this.context.createSpacer({ size: 1, direction: "vertical" }));
+		if (this.root.isDestroyed) return;
+		const entryRoots = new Set<unknown>(this.entries.map((entry) => entry.view.root));
+		for (const child of this.root.getChildren()) {
+			this.root.remove(child);
+			if (!entryRoots.has(child)) child.destroyRecursively();
+		}
+		this.root.add(new BoxRenderable(this.renderer, { width: "100%", height: 1 }));
 		const failed = this.entries.some((entry) => entry.failed);
-		const header = this.context.createBox({
+		const header = new BoxRenderable(this.renderer, {
 			flexDirection: "column",
 			paddingX: 1,
 			onMouseDown: (event) => {
@@ -318,24 +368,23 @@ export class OpenTUIWorkingGroup extends RebuildableView {
 		const summary = this.completedAt
 			? `${failed ? "✗" : "✓"} Worked for ${elapsedSeconds}s · ${count} tool calls`
 			: `◐ Working group · ${count} tool calls`;
-		header.append(
-			this.context.createText({
+		header.add(
+			new TextRenderable(this.renderer, {
 				content: `${this.expanded ? "⌄" : "›"} ${summary}`,
 				fg: this.viewTheme.getFgColor(failed ? "error" : this.completedAt ? "muted" : "accent"),
-				bold: !this.completedAt,
+				attributes: this.completedAt ? TextAttributes.NONE : TextAttributes.BOLD,
 			}),
 		);
-		this.root.append(header);
+		this.root.add(header);
 		if (!this.expanded) return;
 		for (const entry of this.entries) {
 			entry.view.setExpanded(true);
-			this.root.append(entry.view.mount(this.context));
+			this.root.add(entry.view.root);
 		}
 	}
 }
 
 export class OpenTUIBashExecution extends RebuildableView {
-	private readonly command: string;
 	private output = "";
 	private status: "running" | "complete" | "cancelled" | "error" = "running";
 	private exitCode: number | undefined;
@@ -344,12 +393,29 @@ export class OpenTUIBashExecution extends RebuildableView {
 	private fullOutputPath: string | undefined;
 	private readonly excluded: boolean;
 	private readonly viewTheme: Theme;
+	private readonly body: BoxRenderable;
+	private readonly commandNode: TextRenderable;
+	private readonly outputNode: TextRenderable;
+	private readonly detailsNode: TextRenderable;
 
-	constructor(command: string, excludeFromContext = false, viewTheme: Theme = theme) {
-		super();
-		this.command = command;
+	constructor(renderer: CliRenderer, command: string, excludeFromContext = false, viewTheme: Theme = theme) {
+		super(renderer);
 		this.excluded = excludeFromContext;
 		this.viewTheme = viewTheme;
+		this.root.add(new BoxRenderable(renderer, { width: "100%", height: 1 }));
+		this.body = new BoxRenderable(renderer, { flexDirection: "column", paddingX: 1, paddingY: 1 });
+		this.commandNode = new TextRenderable(renderer, {
+			content: `$ ${command}`,
+			fg: viewTheme.getFgColor(this.excluded ? "dim" : "bashMode"),
+			attributes: TextAttributes.BOLD,
+		});
+		this.outputNode = new TextRenderable(renderer, { content: "", wrapMode: "word" });
+		this.detailsNode = new TextRenderable(renderer, { content: "" });
+		this.body.add(this.commandNode);
+		this.body.add(this.outputNode);
+		this.body.add(this.detailsNode);
+		this.root.add(this.body);
+		this.rebuild();
 	}
 
 	appendOutput(chunk: string): void {
@@ -380,39 +446,25 @@ export class OpenTUIBashExecution extends RebuildableView {
 	}
 
 	protected rebuild(): void {
+		if (this.root.isDestroyed) return;
 		const failed = this.status === "error";
-		const mounted = this.begin(
-			failed ? this.viewTheme.getBgColor("toolErrorBg") : this.viewTheme.getBgColor("customMessageBg"),
-		);
-		if (!mounted) return;
-		const { context, body } = mounted;
-		body.append(
-			context.createText({
-				content: `$ ${this.command}`,
-				fg: this.viewTheme.getFgColor(this.excluded ? "dim" : "bashMode"),
-				bold: true,
-			}),
-		);
+		this.body.backgroundColor = failed
+			? this.viewTheme.getBgColor("toolErrorBg")
+			: this.viewTheme.getBgColor("customMessageBg");
 		const output = preview(this.output, this.expanded);
-		if (output.content)
-			body.append(
-				context.createText({ content: output.content, fg: this.viewTheme.getFgColor("muted"), wrapMode: "word" }),
-			);
+		this.outputNode.content = output.content;
+		this.outputNode.fg = this.viewTheme.getFgColor("muted");
+		this.outputNode.visible = Boolean(output.content);
 		const details: string[] = [];
 		if (output.hiddenLines > 0) details.push(`${output.hiddenLines} earlier lines hidden`);
 		if (this.status === "running") details.push("Running...");
 		if (this.status === "cancelled") details.push("Cancelled");
 		if (failed) details.push(`Exited with code ${this.exitCode}`);
 		if (this.truncated && this.fullOutputPath) details.push(`Output truncated: ${this.fullOutputPath}`);
-		if (details.length > 0) {
-			body.append(
-				context.createText({
-					content: details.join("\n"),
-					fg: failed ? this.viewTheme.getFgColor("error") : this.viewTheme.getFgColor("muted"),
-					dim: !failed,
-				}),
-			);
-		}
+		this.detailsNode.content = details.join("\n");
+		this.detailsNode.fg = failed ? this.viewTheme.getFgColor("error") : this.viewTheme.getFgColor("muted");
+		this.detailsNode.attributes = failed ? TextAttributes.NONE : TextAttributes.DIM;
+		this.detailsNode.visible = details.length > 0;
 	}
 }
 
@@ -425,11 +477,12 @@ export class OpenTUIStatusView extends RebuildableView {
 	private readonly kind: OpenTUIStatusKind;
 	private viewTheme: Theme;
 
-	constructor(kind: OpenTUIStatusKind, message: string, viewTheme: Theme = theme) {
-		super();
+	constructor(renderer: CliRenderer, kind: OpenTUIStatusKind, message: string, viewTheme: Theme = theme) {
+		super(renderer);
 		this.kind = kind;
 		this.message = message;
 		this.viewTheme = viewTheme;
+		this.rebuild();
 	}
 
 	setMessage(message: string): void {
@@ -454,13 +507,13 @@ export class OpenTUIStatusView extends RebuildableView {
 	}
 
 	protected rebuild(): void {
-		if (!this.context || !this.root) return;
-		this.root.clear();
+		if (this.root.isDestroyed) return;
+		clearChildren(this.root);
 		this.root.visible = this.message !== "Ready";
 		if (!this.root.visible) return;
 		const spinner = this.active ? ["◐", "◓", "◑", "◒"][this.frame % 4] : "·";
-		this.root.append(
-			this.context.createText({
+		this.root.add(
+			new TextRenderable(this.renderer, {
 				content: `${spinner} ${this.message}`,
 				paddingX: 1,
 				fg: this.viewTheme.getFgColor(this.kind === "retry" ? "warning" : "accent"),
@@ -473,8 +526,8 @@ abstract class ExpandableSummaryView extends RebuildableView {
 	protected expanded = false;
 	protected readonly viewTheme: Theme;
 
-	constructor(viewTheme: Theme) {
-		super();
+	constructor(renderer: CliRenderer, viewTheme: Theme) {
+		super(renderer);
 		this.viewTheme = viewTheme;
 	}
 
@@ -486,20 +539,29 @@ abstract class ExpandableSummaryView extends RebuildableView {
 	protected renderSummary(label: string, collapsed: string, markdown: string): void {
 		const mounted = this.begin(this.viewTheme.getBgColor("customMessageBg"));
 		if (!mounted) return;
-		mounted.body.append(
-			mounted.context.createText({
+		mounted.body.add(
+			new TextRenderable(mounted.renderer, {
 				content: `[${label}]`,
 				fg: this.viewTheme.getFgColor("customMessageLabel"),
-				bold: true,
+				attributes: TextAttributes.BOLD,
 			}),
 		);
 		if (this.expanded) {
-			mounted.body.append(
-				mounted.context.createMarkdown({ content: markdown, fg: this.viewTheme.getFgColor("customMessageText") }),
+			mounted.body.add(
+				new MarkdownRenderable(mounted.renderer, {
+					content: markdown,
+					fg: this.viewTheme.getFgColor("customMessageText"),
+					syntaxStyle: SyntaxStyle.fromStyles({
+						default: { fg: this.viewTheme.getFgColor("customMessageText") },
+					}),
+				}),
 			);
 		} else {
-			mounted.body.append(
-				mounted.context.createText({ content: collapsed, fg: this.viewTheme.getFgColor("customMessageText") }),
+			mounted.body.add(
+				new TextRenderable(mounted.renderer, {
+					content: collapsed,
+					fg: this.viewTheme.getFgColor("customMessageText"),
+				}),
 			);
 		}
 	}
@@ -508,9 +570,10 @@ abstract class ExpandableSummaryView extends RebuildableView {
 export class OpenTUICompactionSummary extends ExpandableSummaryView {
 	private readonly message: CompactionSummaryMessage;
 
-	constructor(message: CompactionSummaryMessage, viewTheme: Theme = theme) {
-		super(viewTheme);
+	constructor(renderer: CliRenderer, message: CompactionSummaryMessage, viewTheme: Theme = theme) {
+		super(renderer, viewTheme);
 		this.message = message;
+		this.rebuild();
 	}
 
 	protected rebuild(): void {
@@ -526,9 +589,10 @@ export class OpenTUICompactionSummary extends ExpandableSummaryView {
 export class OpenTUIBranchSummary extends ExpandableSummaryView {
 	private readonly message: BranchSummaryMessage;
 
-	constructor(message: BranchSummaryMessage, viewTheme: Theme = theme) {
-		super(viewTheme);
+	constructor(renderer: CliRenderer, message: BranchSummaryMessage, viewTheme: Theme = theme) {
+		super(renderer, viewTheme);
 		this.message = message;
+		this.rebuild();
 	}
 
 	protected rebuild(): void {
@@ -539,9 +603,10 @@ export class OpenTUIBranchSummary extends ExpandableSummaryView {
 export class OpenTUISkillInvocation extends ExpandableSummaryView {
 	private readonly skill: ParsedSkillBlock;
 
-	constructor(skill: ParsedSkillBlock, viewTheme: Theme = theme) {
-		super(viewTheme);
+	constructor(renderer: CliRenderer, skill: ParsedSkillBlock, viewTheme: Theme = theme) {
+		super(renderer, viewTheme);
 		this.skill = skill;
+		this.rebuild();
 	}
 
 	protected rebuild(): void {
@@ -552,9 +617,10 @@ export class OpenTUISkillInvocation extends ExpandableSummaryView {
 export class OpenTUICustomMessage extends ExpandableSummaryView {
 	private message: CustomMessage<unknown>;
 
-	constructor(message: CustomMessage<unknown>, viewTheme: Theme = theme) {
-		super(viewTheme);
+	constructor(renderer: CliRenderer, message: CustomMessage<unknown>, viewTheme: Theme = theme) {
+		super(renderer, viewTheme);
 		this.message = message;
+		this.rebuild();
 	}
 
 	updateContent(message: CustomMessage<unknown>): void {

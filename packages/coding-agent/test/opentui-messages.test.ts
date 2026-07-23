@@ -1,13 +1,13 @@
 import type { AssistantMessage } from "@frelion/bone-ai";
-import { createBoneTestRenderer } from "@frelion/bone-tui";
+import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, describe, expect, test } from "vitest";
 import { OpenTUIAssistantMessage, OpenTUIUserMessage } from "../src/modes/interactive/components/opentui-messages.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
-const renderers = new Set<Awaited<ReturnType<typeof createBoneTestRenderer>>>();
+const renderers = new Set<TestRendererSetup>();
 
 afterEach(() => {
-	for (const renderer of renderers) renderer.destroy();
+	for (const setup of renderers) setup.renderer.destroy();
 	renderers.clear();
 });
 
@@ -37,14 +37,14 @@ function assistant(
 describe("OpenTUI transcript messages", () => {
 	test("renders Codex-style prompts and a label-free assistant stream", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 80, height: 16 });
-		renderers.add(renderer);
-		renderer.start();
-		renderer.content.append(new OpenTUIUserMessage("inspect this repository").mount(renderer));
-		const response = new OpenTUIAssistantMessage(assistant([{ type: "text", text: "Reading the files" }]));
-		renderer.content.append(response.mount(renderer));
-		await renderer.flush();
-		const captured = renderer.captureFrame();
+		const setup = await createTestRenderer({ width: 80, height: 16 });
+		renderers.add(setup);
+		const { renderer } = setup;
+		renderer.root.add(new OpenTUIUserMessage(renderer, "inspect this repository").root);
+		const response = new OpenTUIAssistantMessage(renderer, assistant([{ type: "text", text: "Reading the files" }]));
+		renderer.root.add(response.root);
+		await setup.flush();
+		const captured = setup.captureCharFrame();
 		expect(captured).toContain("› inspect this repository");
 		expect(captured).toContain("Reading the files");
 		expect(captured).not.toContain("YOU");
@@ -53,15 +53,16 @@ describe("OpenTUI transcript messages", () => {
 
 	test("shows thinking only while the assistant is running", async () => {
 		initTheme("dark");
-		const renderer = await createBoneTestRenderer({ width: 80, height: 12 });
-		renderers.add(renderer);
-		renderer.start();
+		const setup = await createTestRenderer({ width: 80, height: 12 });
+		renderers.add(setup);
+		const { renderer } = setup;
 		const response = new OpenTUIAssistantMessage(
+			renderer,
 			assistant([{ type: "thinking", thinking: "Checking the dependency graph" }]),
 		);
-		renderer.content.append(response.mount(renderer));
-		await renderer.flush();
-		expect(renderer.captureFrame()).toContain("Checking the dependency graph");
+		renderer.root.add(response.root);
+		await setup.flush();
+		expect(setup.captureCharFrame()).toContain("Checking the dependency graph");
 
 		response.updateContent(
 			assistant(
@@ -72,8 +73,8 @@ describe("OpenTUI transcript messages", () => {
 				"stop",
 			),
 		);
-		await renderer.flush();
-		const captured = renderer.captureFrame();
+		await setup.flush();
+		const captured = setup.captureCharFrame();
 		expect(captured).toContain("The dependency graph is valid.");
 		expect(captured).not.toContain("Checking the dependency graph");
 	});

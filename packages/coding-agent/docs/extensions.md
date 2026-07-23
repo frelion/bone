@@ -26,11 +26,12 @@ product services rather than exposing renderer internals:
 - `chrome` for header, footer, and terminal title
 - `editor` for text operations, editor dialogs, and structured editor views
 - `toolResults` for structured tool call/result renderers
-- `advanced` for trusted `BoneView` composition when the product services are insufficient
+- `advanced` for trusted native `Renderable` composition when the product services are insufficient
 
-Factories return `BoneView`; they do not receive OpenTUI renderables. The advanced
-service exposes `BoneRenderContext` and `BoneNode` through Bone's stable adapter,
-not `@opentui/core` types. See `examples/extensions/ui-v2.ts`.
+Factories return an OpenTUI `Renderable`, or a `(renderer: CliRenderer) => Renderable`
+factory. They receive the same native renderer used by the application, so attachment,
+focus, sizing, and destruction follow OpenTUI's native tree. See
+`examples/extensions/ui-v2.ts`.
 
 The v2 contract is the only extension UI surface. ANSI `Component` factories and
 the former renderer-shaped dialog, editor, message, entry, and tool APIs are not

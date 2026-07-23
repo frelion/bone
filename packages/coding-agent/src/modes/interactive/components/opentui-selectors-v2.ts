@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@frelion/bone-agent-core";
-import type { BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import type { BoxRenderable, CliRenderer, Renderable } from "@opentui/core";
 import {
 	getProjectTrustOptions,
 	type ProjectTrustStoreEntry,
@@ -18,15 +18,27 @@ const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	max: "Maximum reasoning",
 };
 
-class SelectorFlowV2<T> implements BoneView {
+class SelectorFlowV2<T> {
 	protected readonly selector: OpenTUISelectorViewV2<T>;
 
 	constructor(selector: OpenTUISelectorViewV2<T>) {
 		this.selector = selector;
 	}
 
-	mount(context: BoneRenderContext): BoneNode {
-		return this.selector.mount(context);
+	get root(): BoxRenderable | undefined {
+		return this.selector.root;
+	}
+
+	get focusTarget(): Renderable | undefined {
+		return this.selector.focusTarget;
+	}
+
+	build(renderer: CliRenderer): BoxRenderable {
+		return this.selector.build(renderer);
+	}
+
+	focus(): void {
+		this.selector.focus();
 	}
 
 	handleAction(action: OpenTUISelectorAction): boolean {

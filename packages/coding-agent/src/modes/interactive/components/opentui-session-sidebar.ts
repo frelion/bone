@@ -1,15 +1,14 @@
 import {
-	type BoneContainerNode,
-	type BoneKeyEvent,
-	type BoneMouseEvent,
-	type BoneNode,
-	type BoneRenderContext,
-	type BoneScrollViewNode,
-	type BoneTextareaNode,
-	type BoneTextNode,
-	type BoneView,
-	visibleWidth,
-} from "@frelion/bone-tui";
+	BoxRenderable,
+	type CliRenderer,
+	type KeyEvent,
+	type MouseEvent,
+	ScrollBoxRenderable,
+	TextAttributes,
+	TextareaRenderable,
+	TextRenderable,
+} from "@opentui/core";
+import stringWidth from "string-width";
 import type { InteractiveSessionSummary } from "../../../core/interactive-session-host.ts";
 import type { MemorySearchResult } from "../../../core/memory.ts";
 import { OPEN_TUI_COLORS, OPEN_TUI_LAYOUT } from "../opentui-design.ts";
@@ -38,15 +37,19 @@ function normalizePreview(text: string): string {
 		.trim();
 }
 
+function clearChildren(root: BoxRenderable): void {
+	for (const child of root.getChildren()) child.destroyRecursively();
+}
+
 /** Keep a running conversation's preview anchored to its newest model output. */
 function latestPreviewWindow(text: string, width: number): string {
-	if (width <= 0 || visibleWidth(text) <= width) return text;
+	if (width <= 0 || stringWidth(text) <= width) return text;
 	const graphemes = Array.from(graphemeSegmenter.segment(text), ({ segment }) => segment);
 	const tail: string[] = [];
 	let usedWidth = 0;
 	for (let index = graphemes.length - 1; index >= 0; index--) {
 		const grapheme = graphemes[index]!;
-		const graphemeWidth = visibleWidth(grapheme);
+		const graphemeWidth = stringWidth(grapheme);
 		if (usedWidth + graphemeWidth > width) break;
 		tail.unshift(grapheme);
 		usedWidth += graphemeWidth;
@@ -61,7 +64,7 @@ function stateColor(state: InteractiveSessionSummary["state"]): ThemeColor {
 	return "muted";
 }
 
-function consume(event: BoneKeyEvent): true {
+function consume(event: KeyEvent): true {
 	event.preventDefault();
 	event.stopPropagation();
 	return true;
@@ -83,12 +86,23 @@ function formatThroughput(tokensPerSecond: number | undefined): string {
 }
 
 interface MarqueeEntry {
-	node: BoneTextNode;
+	node: TextRenderable;
 	text: string;
 }
 
+interface SessionRowRecord {
+	row: BoxRenderable;
+	stateNode: TextRenderable;
+	titleNode: TextRenderable;
+	previewNode: TextRenderable;
+	throughputNode: TextRenderable | undefined;
+	metadataNode: TextRenderable;
+}
+
 /** Structured OpenTUI conversation sidebar with search and session actions. */
-export class OpenTUISessionSidebar implements BoneView {
+export class OpenTUISessionSidebar {
+	readonly root: BoxRenderable;
+	readonly list: ScrollBoxRenderable;
 	private sidebarTheme: Theme;
 	private sessions: InteractiveSessionSummary[] = [];
 	private selectedIndex = 0;
@@ -100,14 +114,14 @@ export class OpenTUISessionSidebar implements BoneView {
 	private searchMode = false;
 	private searchStartPath: string | undefined;
 	private previewedSearchPath: string | undefined;
-	private context: BoneRenderContext | undefined;
-	private root: BoneContainerNode | undefined;
-	private searchInput: BoneTextareaNode | undefined;
-	private searchStatusNode: ReturnType<BoneRenderContext["createText"]> | undefined;
-	private list: BoneScrollViewNode | undefined;
+	private readonly renderer: CliRenderer;
+	private searchInput: TextareaRenderable | undefined;
+	private searchStatusNode: TextRenderable | undefined;
 	private focused = false;
 	private frozenOrder: string[] | undefined;
 	private readonly marqueeEntries = new Map<string, MarqueeEntry>();
+	private readonly rowRecords = new Map<string, SessionRowRecord>();
+	private renderedPaths: string[] = [];
 	private marqueeTimer: ReturnType<typeof setInterval> | undefined;
 
 	public onActivateSession?: (sessionPath: string) => void;
@@ -122,8 +136,19 @@ export class OpenTUISessionSidebar implements BoneView {
 	public onInterrupt?: () => void;
 	public onExit?: () => void;
 
-	constructor(sidebarTheme: Theme = theme) {
+	constructor(renderer: CliRenderer, sidebarTheme: Theme = theme) {
+		this.renderer = renderer;
 		this.sidebarTheme = sidebarTheme;
+		this.root = new BoxRenderable(renderer, {
+			width: "100%",
+			height: "100%",
+			flexDirection: "column",
+			focusable: true,
+			onMouseDown: () => this.onFocusRequest?.(),
+		});
+		this.list = new ScrollBoxRenderable(renderer, { width: "100%", flexGrow: 1, minHeight: 0, scrollY: true });
+		this.rebuildChrome();
+		this.startMarquee();
 	}
 
 	get searchActive(): boolean {
@@ -134,24 +159,12 @@ export class OpenTUISessionSidebar implements BoneView {
 		return this.searchActive ? this.searchQueryValue : undefined;
 	}
 
-	mount(context: BoneRenderContext): BoneNode {
-		if (this.root) throw new Error("OpenTUISessionSidebar is already mounted");
-		this.context = context;
-		this.root = context.createBox({
-			width: "100%",
-			height: "100%",
-			flexDirection: "column",
-			focusable: true,
-			onMouseDown: () => this.onFocusRequest?.(),
-		});
-		this.rebuildChrome();
-		this.startMarquee();
-		return this.root;
+	get focusTarget(): BoxRenderable | TextareaRenderable {
+		return this.searchInput ?? this.root;
 	}
 
 	setFocused(focused: boolean): void {
 		if (focused === this.focused) {
-			if (focused) (this.searchInput ?? this.root)?.focus();
 			return;
 		}
 		if (focused) {
@@ -163,11 +176,6 @@ export class OpenTUISessionSidebar implements BoneView {
 		}
 		this.focused = focused;
 		this.reconcileSelection();
-		if (focused) {
-			(this.searchInput ?? this.root)?.focus();
-		} else {
-			(this.searchInput ?? this.root)?.blur();
-		}
 		this.rebuildList();
 	}
 
@@ -236,7 +244,6 @@ export class OpenTUISessionSidebar implements BoneView {
 		this.searchResults = undefined;
 		this.searchStatus = undefined;
 		this.rebuildChrome();
-		this.searchInput?.focus();
 		this.onSearchQueryChange?.(this.searchQueryValue);
 		this.onSearchStateChange?.(true);
 	}
@@ -256,13 +263,12 @@ export class OpenTUISessionSidebar implements BoneView {
 		this.searchInput = undefined;
 		this.reconcileSelection();
 		this.rebuildChrome();
-		if (this.focused) this.root?.focus();
 		this.onSearchQueryChange?.("");
 		this.onSearchStateChange?.(false);
 		if (restorePath) this.onPreviewSession?.(restorePath);
 	}
 
-	handleKey(event: BoneKeyEvent): boolean {
+	handleKey(event: KeyEvent): boolean {
 		if (event.eventType === "release") return false;
 		if (this.itemState.kind === "confirm-delete") {
 			if (matchesOpenTUIAction(event, "sidebarDelete")) {
@@ -336,7 +342,7 @@ export class OpenTUISessionSidebar implements BoneView {
 		return false;
 	}
 
-	private handleSearchKey(event: BoneKeyEvent): boolean {
+	private handleSearchKey(event: KeyEvent): boolean {
 		if (matchesOpenTUIAction(event, "focusRight")) {
 			this.stopSearch();
 			this.onFocusChat?.();
@@ -379,30 +385,33 @@ export class OpenTUISessionSidebar implements BoneView {
 	}
 
 	private rebuildChrome(): void {
-		const context = this.context;
-		const root = this.root;
-		if (!context || !root) return;
-		root.clear();
-		const header = context.createBox({
+		for (const child of this.root.getChildren()) {
+			if (child === this.list) {
+				this.root.remove(child);
+				continue;
+			}
+			child.destroyRecursively();
+		}
+		const header = new BoxRenderable(this.renderer, {
 			width: "100%",
 			height: 2,
 			flexDirection: "column",
 			alignItems: "center",
 			justifyContent: "center",
 		});
-		header.append(
-			context.createText({
+		header.add(
+			new TextRenderable(this.renderer, {
 				content: "CONVERSATIONS",
 				fg: OPEN_TUI_COLORS.muted,
-				bold: true,
+				attributes: TextAttributes.BOLD,
 				truncate: true,
 				width: "100%",
 			}),
 		);
-		root.append(header);
+		this.root.add(header);
 
 		if (this.searchStartPath !== undefined) {
-			this.searchInput = context.createTextarea({
+			this.searchInput = new TextareaRenderable(this.renderer, {
 				width: "100%",
 				height: 1,
 				initialValue: this.searchQueryValue,
@@ -410,37 +419,36 @@ export class OpenTUISessionSidebar implements BoneView {
 				textColor: this.sidebarTheme.getFgColor("text"),
 				focusedTextColor: this.sidebarTheme.getFgColor("text"),
 				placeholderColor: this.sidebarTheme.getFgColor("muted"),
-				onChange: (value) => {
-					this.searchQueryValue = value;
+				onContentChange: () => {
+					this.searchQueryValue = this.searchInput?.plainText ?? "";
 					this.searchResults = undefined;
 					this.reconcileSelection();
 					this.rebuildList();
-					this.onSearchQueryChange?.(value);
+					this.onSearchQueryChange?.(this.searchQueryValue);
 				},
 			});
-			root.append(this.searchInput);
-			this.searchStatusNode = context.createText({
+			this.root.add(this.searchInput);
+			this.searchStatusNode = new TextRenderable(this.renderer, {
 				content: this.searchStatus ?? "",
 				fg: this.sidebarTheme.getFgColor("muted"),
 				wrapMode: "word",
 			});
 			this.searchStatusNode.visible = Boolean(this.searchStatus);
-			root.append(this.searchStatusNode);
+			this.root.add(this.searchStatusNode);
 		} else {
 			this.searchInput = undefined;
 			this.searchStatusNode = undefined;
 		}
 
-		this.list = context.createScrollView({ width: "100%", flexGrow: 1, minHeight: 0, scrollY: true });
-		root.append(this.list);
-		const shortcutFooter = context.createBox({
+		this.root.add(this.list);
+		const shortcutFooter = new BoxRenderable(this.renderer, {
 			width: "100%",
 			height: 3,
 			flexDirection: "column",
 			flexShrink: 0,
 		});
-		shortcutFooter.append(
-			context.createText({
+		shortcutFooter.add(
+			new TextRenderable(this.renderer, {
 				content: "─".repeat(OPEN_TUI_LAYOUT.sidebarMaxWidth),
 				height: 1,
 				fg: OPEN_TUI_COLORS.borderSubtle,
@@ -451,8 +459,8 @@ export class OpenTUISessionSidebar implements BoneView {
 			? ["↑↓ results   type to search", "↵ open       esc cancel"]
 			: ["↑↓ select    / search", "d delete     ↵ open"];
 		for (const content of shortcutLines) {
-			shortcutFooter.append(
-				context.createText({
+			shortcutFooter.add(
+				new TextRenderable(this.renderer, {
 					content,
 					height: 1,
 					fg: this.sidebarTheme.getFgColor("dim"),
@@ -460,20 +468,22 @@ export class OpenTUISessionSidebar implements BoneView {
 				}),
 			);
 		}
-		root.append(shortcutFooter);
+		this.root.add(shortcutFooter);
 		this.rebuildList();
 	}
 
 	private rebuildList(): void {
-		const context = this.context;
 		const list = this.list;
-		if (!context || !list) return;
-		list.clear();
-		this.marqueeEntries.clear();
+		if (list.isDestroyed) return;
 		const sessions = this.getDisplayedSessions();
+		if (this.updateStableRows(sessions)) return;
+		clearChildren(list);
+		this.marqueeEntries.clear();
+		this.rowRecords.clear();
+		this.renderedPaths = sessions.map((session) => session.path);
 		if (sessions.length === 0) {
-			list.append(
-				context.createText({
+			list.add(
+				new TextRenderable(this.renderer, {
 					content: this.searchActive ? "No matching conversations" : "No conversations yet",
 					fg: this.sidebarTheme.getFgColor("muted"),
 					wrapMode: "word",
@@ -490,7 +500,7 @@ export class OpenTUISessionSidebar implements BoneView {
 				this.itemState.kind === "status" && this.itemState.path === session.path ? this.itemState : undefined;
 			const foreground = session.state === "foreground";
 			const selectedText = selected ? OPEN_TUI_COLORS.selectionText : undefined;
-			const activateFromMouse = (event: BoneMouseEvent) => {
+			const activateFromMouse = (event: MouseEvent) => {
 				this.selectedIndex = index;
 				this.selectedPath = session.path;
 				event.preventDefault();
@@ -498,7 +508,7 @@ export class OpenTUISessionSidebar implements BoneView {
 				if (this.searchActive) this.stopSearch();
 				this.activateSession(session.path);
 			};
-			const row = context.createBox({
+			const row = new BoxRenderable(this.renderer, {
 				width: "100%",
 				height: 3,
 				flexDirection: "column",
@@ -510,7 +520,7 @@ export class OpenTUISessionSidebar implements BoneView {
 				onMouseDown: activateFromMouse,
 			});
 			const foregroundText = foreground ? OPEN_TUI_COLORS.primaryText : selectedText;
-			const titleRow = context.createBox({
+			const titleRow = new BoxRenderable(this.renderer, {
 				width: "100%",
 				height: 1,
 				flexDirection: "row",
@@ -518,31 +528,29 @@ export class OpenTUISessionSidebar implements BoneView {
 				paddingLeft: 1,
 				onMouseDown: activateFromMouse,
 			});
-			titleRow.append(
-				context.createText({
-					content: STATE_ICON[session.state],
-					fg: foregroundText ?? this.sidebarTheme.getFgColor(confirming ? "error" : stateColor(session.state)),
-					flexShrink: 0,
-					onMouseDown: activateFromMouse,
-				}),
-			);
+			const stateNode = new TextRenderable(this.renderer, {
+				content: STATE_ICON[session.state],
+				fg: foregroundText ?? this.sidebarTheme.getFgColor(confirming ? "error" : stateColor(session.state)),
+				flexShrink: 0,
+				onMouseDown: activateFromMouse,
+			});
+			titleRow.add(stateNode);
 			const title = normalizePreview(session.name ?? session.firstMessage) || "(empty conversation)";
-			titleRow.append(
-				context.createText({
-					content: title,
-					fg:
-						foregroundText ??
-						this.sidebarTheme.getFgColor(confirming ? "error" : status?.tone === "error" ? "error" : "text"),
-					bold: foreground || selected,
-					truncate: true,
-					flexGrow: 1,
-					minWidth: 0,
-					onMouseDown: activateFromMouse,
-				}),
-			);
-			row.append(titleRow);
+			const titleNode = new TextRenderable(this.renderer, {
+				content: title,
+				fg:
+					foregroundText ??
+					this.sidebarTheme.getFgColor(confirming ? "error" : status?.tone === "error" ? "error" : "text"),
+				attributes: foreground || selected ? TextAttributes.BOLD : TextAttributes.NONE,
+				truncate: true,
+				flexGrow: 1,
+				minWidth: 0,
+				onMouseDown: activateFromMouse,
+			});
+			titleRow.add(titleNode);
+			row.add(titleRow);
 
-			const previewRow = context.createBox({
+			const previewRow = new BoxRenderable(this.renderer, {
 				width: "100%",
 				height: 1,
 				flexDirection: "row",
@@ -550,28 +558,27 @@ export class OpenTUISessionSidebar implements BoneView {
 				paddingRight: 1,
 				onMouseDown: activateFromMouse,
 			});
+			let previewNode: TextRenderable;
 			if (confirming) {
-				previewRow.append(
-					context.createText({
-						content: "Press d again to delete",
-						fg: foregroundText ?? this.sidebarTheme.getFgColor("error"),
-						truncate: true,
-						flexGrow: 1,
-						minWidth: 0,
-						onMouseDown: activateFromMouse,
-					}),
-				);
+				previewNode = new TextRenderable(this.renderer, {
+					content: "Press d again to delete",
+					fg: foregroundText ?? this.sidebarTheme.getFgColor("error"),
+					truncate: true,
+					flexGrow: 1,
+					minWidth: 0,
+					onMouseDown: activateFromMouse,
+				});
+				previewRow.add(previewNode);
 			} else if (status) {
-				previewRow.append(
-					context.createText({
-						content: status.message,
-						fg: foregroundText ?? this.sidebarTheme.getFgColor(status.tone === "error" ? "error" : "accent"),
-						truncate: true,
-						flexGrow: 1,
-						minWidth: 0,
-						onMouseDown: activateFromMouse,
-					}),
-				);
+				previewNode = new TextRenderable(this.renderer, {
+					content: status.message,
+					fg: foregroundText ?? this.sidebarTheme.getFgColor(status.tone === "error" ? "error" : "accent"),
+					truncate: true,
+					flexGrow: 1,
+					minWidth: 0,
+					onMouseDown: activateFromMouse,
+				});
+				previewRow.add(previewNode);
 			} else {
 				const result = this.searchResults?.find((candidate) => candidate.sessionPath === session.path);
 				const titleEvidence = result?.evidence.kind === "title";
@@ -581,7 +588,7 @@ export class OpenTUISessionSidebar implements BoneView {
 						: (result?.evidence.snippet ?? session.livePreview ?? session.lastMessage ?? ""),
 				);
 				const previewText = preview || (titleEvidence ? "Title match" : "No messages yet");
-				const previewNode = context.createText({
+				previewNode = new TextRenderable(this.renderer, {
 					content: previewText,
 					fg: foregroundText ?? this.sidebarTheme.getFgColor(preview ? "muted" : "dim"),
 					truncate: true,
@@ -589,7 +596,7 @@ export class OpenTUISessionSidebar implements BoneView {
 					minWidth: 0,
 					onMouseDown: activateFromMouse,
 				});
-				previewRow.append(previewNode);
+				previewRow.add(previewNode);
 				if (session.state === "background-running") {
 					this.marqueeEntries.set(session.path, {
 						node: previewNode,
@@ -597,34 +604,41 @@ export class OpenTUISessionSidebar implements BoneView {
 					});
 				}
 			}
+			let throughputNode: TextRenderable | undefined;
 			if (!confirming && !status && session.throughputTokensPerSecond !== undefined) {
-				previewRow.append(
-					context.createText({
-						content: formatThroughput(session.throughputTokensPerSecond).padStart(11),
-						width: 11,
-						fg: foregroundText ?? this.sidebarTheme.getFgColor("dim"),
-						truncate: true,
-						flexShrink: 0,
-						onMouseDown: activateFromMouse,
-					}),
-				);
-			}
-			row.append(previewRow);
-			row.append(
-				context.createText({
-					content: `${session.messageCount} msg${session.messageCount === 1 ? "" : "s"} · ${formatConversationActivityTime(session.modified)} · ${formatConversationCreatedTime(session.created)}`,
-					height: 1,
-					paddingLeft: 1,
-					paddingRight: 1,
+				throughputNode = new TextRenderable(this.renderer, {
+					content: formatThroughput(session.throughputTokensPerSecond).padStart(11),
+					width: 11,
 					fg: foregroundText ?? this.sidebarTheme.getFgColor("dim"),
 					truncate: true,
+					flexShrink: 0,
 					onMouseDown: activateFromMouse,
-				}),
-			);
-			list.append(row);
+				});
+				previewRow.add(throughputNode);
+			}
+			row.add(previewRow);
+			const metadataNode = new TextRenderable(this.renderer, {
+				content: `${session.messageCount} msg${session.messageCount === 1 ? "" : "s"} · ${formatConversationActivityTime(session.modified)} · ${formatConversationCreatedTime(session.created)}`,
+				height: 1,
+				paddingLeft: 1,
+				paddingRight: 1,
+				fg: foregroundText ?? this.sidebarTheme.getFgColor("dim"),
+				truncate: true,
+				onMouseDown: activateFromMouse,
+			});
+			row.add(metadataNode);
+			this.rowRecords.set(session.path, {
+				row,
+				stateNode,
+				titleNode,
+				previewNode,
+				throughputNode,
+				metadataNode,
+			});
+			list.add(row);
 			if (index < sessions.length - 1) {
-				list.append(
-					context.createText({
+				list.add(
+					new TextRenderable(this.renderer, {
 						content: "─".repeat(OPEN_TUI_LAYOUT.sidebarMaxWidth),
 						height: 1,
 						fg: OPEN_TUI_COLORS.borderSubtle,
@@ -635,25 +649,75 @@ export class OpenTUISessionSidebar implements BoneView {
 		}
 	}
 
+	private updateStableRows(sessions: readonly InteractiveSessionSummary[]): boolean {
+		if (this.searchActive || this.itemState.kind !== "normal") return false;
+		if (sessions.length === 0 || sessions.length !== this.renderedPaths.length) return false;
+		for (let index = 0; index < sessions.length; index++) {
+			const session = sessions[index]!;
+			if (this.renderedPaths[index] !== session.path) return false;
+			const record = this.rowRecords.get(session.path);
+			if (!record) return false;
+			if (Boolean(record.throughputNode) !== (session.throughputTokensPerSecond !== undefined)) return false;
+		}
+
+		this.marqueeEntries.clear();
+		for (let index = 0; index < sessions.length; index++) {
+			const session = sessions[index]!;
+			const record = this.rowRecords.get(session.path)!;
+			const selected = this.focused && index === this.selectedIndex;
+			const foreground = session.state === "foreground";
+			const foregroundText = foreground
+				? OPEN_TUI_COLORS.primaryText
+				: selected
+					? OPEN_TUI_COLORS.selectionText
+					: undefined;
+			record.row.backgroundColor = foreground
+				? OPEN_TUI_COLORS.primaryStrong
+				: selected
+					? OPEN_TUI_COLORS.selection
+					: undefined;
+			record.stateNode.content = STATE_ICON[session.state];
+			record.stateNode.fg = foregroundText ?? this.sidebarTheme.getFgColor(stateColor(session.state));
+			record.titleNode.content = normalizePreview(session.name ?? session.firstMessage) || "(empty conversation)";
+			record.titleNode.fg = foregroundText ?? this.sidebarTheme.getFgColor("text");
+			record.titleNode.attributes = foreground || selected ? TextAttributes.BOLD : TextAttributes.NONE;
+
+			const preview = normalizePreview(session.livePreview ?? session.lastMessage ?? "");
+			const previewText = preview || "No messages yet";
+			record.previewNode.content = previewText;
+			record.previewNode.fg = foregroundText ?? this.sidebarTheme.getFgColor(preview ? "muted" : "dim");
+			if (session.state === "background-running") {
+				this.marqueeEntries.set(session.path, { node: record.previewNode, text: previewText });
+			}
+			if (record.throughputNode) {
+				record.throughputNode.content = formatThroughput(session.throughputTokensPerSecond).padStart(11);
+				record.throughputNode.fg = foregroundText ?? this.sidebarTheme.getFgColor("dim");
+			}
+			record.metadataNode.content = `${session.messageCount} msg${session.messageCount === 1 ? "" : "s"} · ${formatConversationActivityTime(session.modified)} · ${formatConversationCreatedTime(session.created)}`;
+			record.metadataNode.fg = foregroundText ?? this.sidebarTheme.getFgColor("dim");
+		}
+		return true;
+	}
+
 	private startMarquee(): void {
 		if (this.marqueeTimer) return;
 		this.marqueeTimer = setInterval(() => {
-			if (this.root?.destroyed) {
+			if (this.root.isDestroyed) {
 				if (this.marqueeTimer) clearInterval(this.marqueeTimer);
 				this.marqueeTimer = undefined;
 				return;
 			}
 			const list = this.list;
-			if (!list?.effectivelyVisible) return;
+			if (!list.visible || !this.root.visible) return;
 			const viewportTop = list.screenY;
-			const viewportBottom = viewportTop + list.viewportHeight;
+			const viewportBottom = viewportTop + list.viewport.height;
 			for (const entry of this.marqueeEntries.values()) {
-				if (!entry.node.effectivelyVisible || entry.node.width <= 0) continue;
+				if (!entry.node.visible || entry.node.width <= 0) continue;
 				const previewTop = entry.node.screenY;
 				const previewBottom = previewTop + entry.node.height;
 				if (previewBottom <= viewportTop || previewTop >= viewportBottom) continue;
 				const latest = latestPreviewWindow(entry.text, entry.node.width);
-				if (entry.node.content !== latest) entry.node.content = latest;
+				if (entry.node.plainText !== latest) entry.node.content = latest;
 			}
 		}, OPEN_TUI_LAYOUT.marqueeIntervalMs);
 		this.marqueeTimer.unref?.();
@@ -662,7 +726,6 @@ export class OpenTUISessionSidebar implements BoneView {
 	private moveSearchSelection(delta: number): void {
 		const previousPath = this.selectedPath;
 		this.moveSelection(delta);
-		this.searchInput?.focus();
 		if (!this.selectedPath || this.selectedPath === previousPath) return;
 		this.previewedSearchPath = this.selectedPath;
 		this.onPreviewSession?.(this.selectedPath);

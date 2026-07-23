@@ -7,7 +7,7 @@
 	"scripts": {
 		"clean": "shx rm -rf dist",
 		"build": "tsgo -p tsconfig.build.json",
-		"test": "bun test ./test/*.test.ts ./test/opentui-renderer.bun.ts",
+		"test": "bun test ./test/*.test.ts ./test/*.bun.ts",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"files": [

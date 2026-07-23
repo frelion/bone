@@ -1,9 +1,15 @@
 import type { ImageContent } from "@frelion/bone-ai";
-import type { BoneContainerNode, BoneNode, BoneRenderContext, BoneView } from "@frelion/bone-tui";
+import { BoxRenderable, type CliRenderer, FrameBufferRenderable, TextRenderable } from "@opentui/core";
 import { applyExifOrientation } from "../../../utils/exif-orientation.ts";
 import { loadPhoton } from "../../../utils/photon.ts";
 import { type Theme, theme } from "../theme/theme.ts";
 import type { OpenTUIImageAttachment } from "./opentui-rich-messages.ts";
+
+declare const Bun: {
+	FFI: {
+		ptr(value: ArrayBufferView): number;
+	};
+};
 
 export interface OpenTUIImageDecodeOptions {
 	terminalWidth?: number;
@@ -30,7 +36,12 @@ export async function decodeOpenTUIImage(
 	if (bytes.length === 0) return fallback("empty image data");
 	if (bytes.length > (options.maximumBytes ?? DEFAULT_MAXIMUM_BYTES)) return fallback("image exceeds decode limit");
 
-	const photon = await loadPhoton();
+	let photon: Awaited<ReturnType<typeof loadPhoton>>;
+	try {
+		photon = await loadPhoton();
+	} catch {
+		return fallback("image decoder unavailable");
+	}
 	if (!photon) return fallback("image decoder unavailable");
 	let image: ReturnType<typeof photon.PhotonImage.new_from_byteslice> | undefined;
 	try {
@@ -68,17 +79,54 @@ export async function decodeOpenTUIImages(
 	return Promise.all(images.map((part) => decodeOpenTUIImage(part, options)));
 }
 
-export class OpenTUIImageAttachments implements BoneView {
+export class OpenTUIRgbaImage extends FrameBufferRenderable {
+	private pixels: Uint8Array;
+	private pixelWidth: number;
+	private pixelHeight: number;
+
+	constructor(
+		renderer: CliRenderer,
+		options: {
+			pixels: Uint8Array;
+			pixelWidth: number;
+			pixelHeight: number;
+			terminalWidth: number;
+			terminalHeight: number;
+		},
+	) {
+		super(renderer, { width: options.terminalWidth, height: options.terminalHeight });
+		this.pixels = options.pixels;
+		this.pixelWidth = options.pixelWidth;
+		this.pixelHeight = options.pixelHeight;
+		this.redraw();
+	}
+
+	private redraw(): void {
+		const expectedLength = this.pixelWidth * this.pixelHeight * 4;
+		if (this.pixelWidth <= 0 || this.pixelHeight <= 0 || this.pixels.length !== expectedLength) {
+			throw new RangeError(`Expected ${expectedLength} RGBA bytes, received ${this.pixels.length}`);
+		}
+		this.frameBuffer.clear();
+		this.frameBuffer.drawSuperSampleBuffer(
+			0,
+			0,
+			Bun.FFI.ptr(this.pixels),
+			this.pixels.length,
+			"rgba8unorm",
+			this.pixelWidth * 4,
+		);
+	}
+}
+
+export class OpenTUIImageAttachments {
+	readonly root: BoxRenderable;
 	private readonly attachments: readonly OpenTUIImageAttachment[];
 	private readonly viewTheme: Theme;
 
-	constructor(attachments: readonly OpenTUIImageAttachment[], viewTheme: Theme = theme) {
+	constructor(renderer: CliRenderer, attachments: readonly OpenTUIImageAttachment[], viewTheme: Theme = theme) {
 		this.attachments = attachments;
 		this.viewTheme = viewTheme;
-	}
-
-	mount(context: BoneRenderContext): BoneNode {
-		const root: BoneContainerNode = context.createBox({ flexDirection: "column", paddingX: 1 });
+		this.root = new BoxRenderable(renderer, { flexDirection: "column", paddingX: 1 });
 		for (const attachment of this.attachments) {
 			if (
 				attachment.pixels &&
@@ -87,8 +135,8 @@ export class OpenTUIImageAttachments implements BoneView {
 				attachment.terminalWidth &&
 				attachment.terminalHeight
 			) {
-				root.append(
-					context.createImage({
+				this.root.add(
+					new OpenTUIRgbaImage(renderer, {
 						pixels: attachment.pixels,
 						pixelWidth: attachment.pixelWidth,
 						pixelHeight: attachment.pixelHeight,
@@ -97,8 +145,8 @@ export class OpenTUIImageAttachments implements BoneView {
 					}),
 				);
 			} else {
-				root.append(
-					context.createText({
+				this.root.add(
+					new TextRenderable(renderer, {
 						content: `[image: ${attachment.mimeType}; ${attachment.error ?? "unable to decode"}]`,
 						fg: this.viewTheme.getFgColor("warning"),
 						wrapMode: "word",
@@ -106,6 +154,5 @@ export class OpenTUIImageAttachments implements BoneView {
 				);
 			}
 		}
-		return root;
 	}
 }

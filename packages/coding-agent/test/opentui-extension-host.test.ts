@@ -1,34 +1,38 @@
-import {
-	type BoneContainerNode,
-	type BoneTestRenderer,
-	type BoneView,
-	createBoneTestRenderer,
-} from "@frelion/bone-tui";
+import { OverlayManager } from "@frelion/bone-tui";
+import { BoxRenderable, TextareaRenderable, TextRenderable } from "@opentui/core";
+import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import type { ExtensionUIView } from "../src/core/extensions/ui-v2.ts";
 import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.ts";
 import { OpenTUIExtensionHost } from "../src/modes/interactive/opentui-extension-host.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
-const renderers = new Set<BoneTestRenderer>();
+const setups = new Set<TestRendererSetup>();
+const managers = new Set<OverlayManager>();
+const setupByRenderer = new WeakMap<TestRendererSetup["renderer"], TestRendererSetup>();
 
-function textView(content: string): BoneView {
-	return { mount: (context) => context.createText({ content }) };
+function textView(content: string) {
+	return (renderer: TestRendererSetup["renderer"]) => new TextRenderable(renderer, { content });
 }
 
-async function flushUntil(renderer: BoneTestRenderer, expected: string): Promise<string> {
+async function flushUntil(renderer: TestRendererSetup["renderer"], expected: string): Promise<string> {
+	const setup = setupByRenderer.get(renderer);
+	if (!setup) throw new Error("Missing OpenTUI test renderer setup");
 	for (let attempt = 0; attempt < 8; attempt++) {
-		await renderer.flush();
-		const frame = renderer.captureFrame();
+		await setup.flush();
+		const frame = setup.captureCharFrame();
 		if (frame.includes(expected)) return frame;
 	}
-	return renderer.captureFrame();
+	return setup.captureCharFrame();
 }
 
 async function setup() {
-	const renderer = await createBoneTestRenderer({ width: 80, height: 28 });
-	renderers.add(renderer);
-	const root = renderer.createBox({ width: "100%", height: "100%", flexDirection: "column" });
-	const region = (): BoneContainerNode => renderer.createBox({ width: "100%", flexDirection: "column" });
+	const testSetup = await createTestRenderer({ width: 80, height: 28, autoFocus: false, useMouse: true });
+	setups.add(testSetup);
+	const { renderer } = testSetup;
+	setupByRenderer.set(renderer, testSetup);
+	const root = new BoxRenderable(renderer, { width: "100%", height: "100%", flexDirection: "column" });
+	const region = (): BoxRenderable => new BoxRenderable(renderer, { width: "100%", flexDirection: "column" });
 	const regions = {
 		header: region(),
 		aboveEditor: region(),
@@ -36,8 +40,9 @@ async function setup() {
 		belowEditor: region(),
 		footer: region(),
 	};
-	for (const child of Object.values(regions)) root.append(child);
-	renderer.content.append(root);
+	for (const child of Object.values(regions)) root.add(child);
+	renderer.root.add(root);
+	const overlayManager = new OverlayManager(renderer);
 	let editorText = "seed";
 	let branchCallback: (() => void) | undefined;
 	const footerData: ReadonlyFooterDataProvider = {
@@ -55,6 +60,7 @@ async function setup() {
 	const title = vi.fn();
 	const host = new OpenTUIExtensionHost({
 		renderer,
+		overlayManager,
 		regions,
 		footerData,
 		editor: {
@@ -70,7 +76,10 @@ async function setup() {
 		onTitle: title,
 	});
 	renderer.start();
+	managers.add(overlayManager);
 	return {
+		setup: testSetup,
+		input: testSetup.mockInput,
 		renderer,
 		regions,
 		host,
@@ -83,14 +92,16 @@ async function setup() {
 
 beforeEach(() => initTheme("dark"));
 
-afterEach(() => {
-	for (const renderer of renderers) renderer.destroy();
-	renderers.clear();
+afterEach(async () => {
+	for (const manager of managers) await manager.dispose();
+	managers.clear();
+	for (const setup of setups) setup.renderer.destroy();
+	setups.clear();
 });
 
 describe("OpenTUIExtensionHost", () => {
 	test("runs select, confirm, and input dialogs with the fixed keymap", async () => {
-		const { renderer, host } = await setup();
+		const { renderer, host, input } = await setup();
 		const selected = host.context.dialogs.select({
 			title: "Choose provider",
 			options: [
@@ -99,29 +110,29 @@ describe("OpenTUIExtensionHost", () => {
 			],
 		});
 		expect(await flushUntil(renderer, "Choose provider")).toContain("Beta");
-		renderer.input.pressArrow("down");
-		renderer.input.pressEnter();
-		await renderer.flush();
+		input.pressArrow("down");
+		input.pressEnter();
+		await setupByRenderer.get(renderer)?.flush();
 		await expect(selected).resolves.toBe("b");
 
 		const confirmed = host.context.dialogs.confirm({ title: "Remove", message: "Remove this item?" });
 		expect(await flushUntil(renderer, "Remove this item?")).toContain("Confirm");
-		renderer.input.pressArrow("down");
-		renderer.input.pressEnter();
+		input.pressArrow("down");
+		input.pressEnter();
 		await expect(confirmed).resolves.toBe(false);
 
-		const input = host.context.dialogs.input({ title: "Name", initialValue: "bo" });
+		const dialogInput = host.context.dialogs.input({ title: "Name", initialValue: "bo" });
 		await flushUntil(renderer, "Name");
-		await renderer.input.typeText("ne");
-		renderer.input.pressEnter();
-		await expect(input).resolves.toBe("bone");
+		await input.typeText("ne");
+		input.pressEnter();
+		await expect(dialogInput).resolves.toBe("bone");
 	});
 
 	test("cancels dialogs on escape, abort, and timeout", async () => {
-		const { renderer, host } = await setup();
+		const { renderer, host, input } = await setup();
 		const escaped = host.context.dialogs.input({ title: "Escape me" });
 		await flushUntil(renderer, "Escape me");
-		renderer.input.pressEscape();
+		input.pressEscape();
 		await expect(escaped).resolves.toBeUndefined();
 
 		const controller = new AbortController();
@@ -145,8 +156,8 @@ describe("OpenTUIExtensionHost", () => {
 		late.update(textView("widget-updated"));
 		expect(await flushUntil(renderer, "widget-updated")).not.toContain("widget-late");
 		host.context.widgets.clear("late");
-		await renderer.flush();
-		expect(renderer.captureFrame()).not.toContain("widget-updated");
+		await setupByRenderer.get(renderer)?.flush();
+		expect(setupByRenderer.get(renderer)?.captureCharFrame()).not.toContain("widget-updated");
 
 		const header = host.context.chrome.setHeader(textView("custom-header"));
 		host.context.chrome.setFooter((data) => textView(`branch:${data.getGitBranch()}`));
@@ -156,7 +167,7 @@ describe("OpenTUIExtensionHost", () => {
 		expect(frame).toContain("branch:main");
 		expect(header.mounted).toBe(true);
 		refreshBranch();
-		await renderer.flush();
+		await setupByRenderer.get(renderer)?.flush();
 
 		host.context.editor.setText("hello");
 		host.context.editor.insertText(" world");
@@ -191,6 +202,23 @@ describe("OpenTUIExtensionHost", () => {
 		await expect(closed).resolves.toBeUndefined();
 	});
 
+	test("focuses the first native input inside an advanced view wrapper", async () => {
+		const { renderer, host } = await setup();
+		let finish: (() => void) | undefined;
+		let input: TextareaRenderable | undefined;
+		const advanced = host.context.advanced.show<void>((control) => {
+			finish = control.cancel;
+			const wrapper = new BoxRenderable(renderer, { width: 30, height: 3 });
+			input = new TextareaRenderable(renderer, { width: 28, height: 1, initialValue: "editable" });
+			wrapper.add(input);
+			return wrapper;
+		});
+		await flushUntil(renderer, "editable");
+		expect(input?.focused).toBe(true);
+		finish?.();
+		await expect(advanced).resolves.toBeUndefined();
+	});
+
 	test("invalidates the retained context and settles active UI when disposed", async () => {
 		const { renderer, host, notify, title, getEditorText } = await setup();
 		const context = host.context;
@@ -206,16 +234,14 @@ describe("OpenTUIExtensionHost", () => {
 		await expect(dialog).resolves.toBeUndefined();
 		expect(widget.mounted).toBe(false);
 		widget.update(textView("must-not-remount"));
-		await renderer.flush();
-		const frame = renderer.captureFrame();
+		await setupByRenderer.get(renderer)?.flush();
+		const frame = setupByRenderer.get(renderer)?.captureCharFrame() ?? "";
 		expect(frame).not.toContain("Pending input");
 		expect(frame).not.toContain("active-widget");
 		expect(frame).not.toContain("active-header");
 		expect(frame).not.toContain("active-editor");
 		expect(frame).not.toContain("must-not-remount");
 
-		const mount = vi.spyOn(renderer, "mount");
-		const showOverlay = vi.spyOn(renderer, "showOverlay");
 		const requestRender = vi.spyOn(renderer, "requestRender");
 		const afterDisposeWidget = context.widgets.set("late", textView("late-widget"));
 		context.widgets.clear("status");
@@ -240,17 +266,15 @@ describe("OpenTUIExtensionHost", () => {
 		expect(notify).not.toHaveBeenCalled();
 		expect(title).not.toHaveBeenCalled();
 		expect(host.getToolRenderer("late")).toBeUndefined();
-		expect(mount).not.toHaveBeenCalled();
-		expect(showOverlay).not.toHaveBeenCalled();
 		expect(requestRender).not.toHaveBeenCalled();
 	});
 
 	test("cancels an asynchronous advanced view before it can mount after disposal", async () => {
 		const { renderer, host } = await setup();
-		let resolveView: ((view: BoneView) => void) | undefined;
+		let resolveView: ((view: ExtensionUIView) => void) | undefined;
 		const advanced = host.context.advanced.show(
 			() =>
-				new Promise<BoneView>((resolve) => {
+				new Promise<ExtensionUIView>((resolve) => {
 					resolveView = resolve;
 				}),
 		);
@@ -258,8 +282,8 @@ describe("OpenTUIExtensionHost", () => {
 		resolveView?.(textView("resolved-too-late"));
 
 		await expect(advanced).resolves.toBeUndefined();
-		await renderer.flush();
-		expect(renderer.captureFrame()).not.toContain("resolved-too-late");
+		await setupByRenderer.get(renderer)?.flush();
+		expect(setupByRenderer.get(renderer)?.captureCharFrame()).not.toContain("resolved-too-late");
 	});
 
 	test("closes a mounted advanced overlay when disposed", async () => {
@@ -270,7 +294,7 @@ describe("OpenTUIExtensionHost", () => {
 		host.dispose();
 
 		await expect(advanced).resolves.toBeUndefined();
-		await renderer.flush();
-		expect(renderer.captureFrame()).not.toContain("mounted-advanced");
+		await setupByRenderer.get(renderer)?.flush();
+		expect(setupByRenderer.get(renderer)?.captureCharFrame()).not.toContain("mounted-advanced");
 	});
 });

@@ -228,7 +228,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		advanced: {
 			show: async () => undefined,
 			close: () => {},
-			createView: (factory) => ({ mount: factory }),
+			createView: (factory) => factory,
 		},
 	});
 
