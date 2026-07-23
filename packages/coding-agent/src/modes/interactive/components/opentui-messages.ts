@@ -214,7 +214,10 @@ export class OpenTUIAssistantMessage {
 		clearChildren(root);
 		this.renderedKinds = kinds;
 		this.renderedNodes = [];
-		if (segments.length === 0) return;
+		if (segments.length === 0) {
+			this.renderer.requestRender();
+			return;
+		}
 		appendSpacer(this.renderer, root);
 		for (const segment of segments) {
 			if (segment.kind === "error" && segments.length > 1) appendSpacer(this.renderer, root);
@@ -237,6 +240,7 @@ export class OpenTUIAssistantMessage {
 			this.renderedNodes.push(node);
 			root.add(node);
 		}
+		this.renderer.requestRender();
 	}
 }
 
