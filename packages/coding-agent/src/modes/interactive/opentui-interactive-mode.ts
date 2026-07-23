@@ -254,6 +254,7 @@ export class OpenTUIInteractiveMode {
 		this.paneFocus = new OpenTUIPaneFocusController(this.renderer, (pane) =>
 			this.shell?.showPane(pane === "sidebar" ? "sidebar" : "main"),
 		);
+		this.composer.onFocusRequest = () => this.paneFocus?.focus("composer");
 		this.transcriptFocus = new OpenTUITranscriptFocusController(
 			this.shell.getTranscriptNode(),
 			() => this.renderer?.height ?? 24,
@@ -273,7 +274,7 @@ export class OpenTUIInteractiveMode {
 			onFocusChange: (focused) => this.sidebar?.setFocused(focused),
 		});
 		this.paneFocus.register("composer", {
-			node: composerNode,
+			node: this.composer.focusNode ?? composerNode,
 			handleKey: (event) => {
 				if (matchesOpenTUIAction(event, "focusLeft")) {
 					event.preventDefault();

@@ -417,6 +417,7 @@ export class OpenTUISessionSidebar implements BoneView {
 		const context = this.context;
 		const list = this.list;
 		if (!context || !list) return;
+		const previousMarqueeEntries = new Map(this.marqueeEntries);
 		list.clear();
 		this.marqueeEntries.clear();
 		const sessions = this.getDisplayedSessions();
@@ -539,16 +540,20 @@ export class OpenTUISessionSidebar implements BoneView {
 					onMouseDown: activateFromMouse,
 				});
 				previewRow.append(previewNode);
-				this.marqueeEntries.set(session.path, {
-					node: previewNode,
-					text: previewText,
-					graphemes: [
+				if (session.state === "background-running") {
+					const graphemes = [
 						...Array.from(graphemeSegmenter.segment(previewText), ({ segment }) => segment),
 						...Array.from({ length: OPEN_TUI_LAYOUT.marqueeGap }, () => " "),
-					],
-					offset: 0,
-					pauseFrames: OPEN_TUI_LAYOUT.marqueeEdgePauseFrames,
-				});
+					];
+					const previous = previousMarqueeEntries.get(session.path);
+					this.marqueeEntries.set(session.path, {
+						node: previewNode,
+						text: previewText,
+						graphemes,
+						offset: previous ? previous.offset % graphemes.length : 0,
+						pauseFrames: previous?.pauseFrames ?? OPEN_TUI_LAYOUT.marqueeEdgePauseFrames,
+					});
+				}
 			}
 			if (!confirming && !status && session.throughputTokensPerSecond !== undefined) {
 				previewRow.append(

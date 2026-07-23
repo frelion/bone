@@ -76,6 +76,7 @@ export class OpenTUIComposer implements BoneView {
 	public onChange: ((value: string) => void) | undefined;
 	public onSubmit: ((value: string) => void) | undefined;
 	public onCancel: (() => void) | undefined;
+	public onFocusRequest: (() => void) | undefined;
 	private placeholderValue: string;
 	private status: OpenTUIComposerStatus;
 	private autocompleteProvider: AutocompleteProvider | undefined;
@@ -116,6 +117,11 @@ export class OpenTUIComposer implements BoneView {
 		return this.currentValue;
 	}
 
+	/** Return the actual edit node used by application-level pane focus. */
+	get focusNode(): BoneTextareaNode | undefined {
+		return this.textarea;
+	}
+
 	get autocompleteOpen(): boolean {
 		return Boolean(this.autocompleteSuggestions);
 	}
@@ -130,7 +136,10 @@ export class OpenTUIComposer implements BoneView {
 		const root = context.createBox({
 			width: "100%",
 			flexDirection: "column",
-			onMouseDown: () => this.textarea?.focus(),
+			onMouseDown: () => {
+				this.onFocusRequest?.();
+				this.focus();
+			},
 		});
 		const autocomplete = context.createSelect<AutocompleteItem>({
 			width: "100%",
@@ -152,7 +161,11 @@ export class OpenTUIComposer implements BoneView {
 			borderStyle: "rounded",
 			borderColor: OPEN_TUI_COLORS.border,
 			backgroundColor: OPEN_TUI_COLORS.page,
-			onMouseDown: () => this.focus(),
+			onMouseDown: (event) => {
+				event.stopPropagation();
+				this.onFocusRequest?.();
+				this.focus();
+			},
 		});
 		const textarea = context.createTextarea({
 			width: "100%",
