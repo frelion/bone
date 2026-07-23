@@ -169,7 +169,6 @@ export class OpenTUIAssistantMessage {
 	private readonly options: Required<Omit<OpenTUIAssistantMessageOptions, "theme">>;
 	private readonly messageTheme: Theme;
 	private readonly renderer: CliRenderer;
-	private renderedKinds: AssistantSegmentKind[] = [];
 	private renderedNodes: Array<MarkdownRenderable | TextRenderable> = [];
 
 	constructor(renderer: CliRenderer, message: AssistantMessage, options: OpenTUIAssistantMessageOptions = {}) {
@@ -196,23 +195,33 @@ export class OpenTUIAssistantMessage {
 		if (root.isDestroyed) return;
 		const segments = createAssistantSegments(this.message, this.options);
 
-		const kinds = segments.map((segment) => segment.kind);
 		if (
-			kinds.length === this.renderedKinds.length &&
-			kinds.every((kind, index) => kind === this.renderedKinds[index]) &&
-			this.renderedNodes.every((node) => !node.isDestroyed)
+			segments.length === this.renderedNodes.length &&
+			segments.every((segment, index) => {
+				const node = this.renderedNodes[index];
+				if (!node || node.isDestroyed) return false;
+				const usesTextRenderable = segment.kind === "thinking-label" || segment.kind === "error";
+				return usesTextRenderable ? node instanceof TextRenderable : node instanceof MarkdownRenderable;
+			})
 		) {
 			for (let index = 0; index < segments.length; index++) {
 				const node = this.renderedNodes[index];
 				if (!node) continue;
 				node.content = segments[index]!.content;
-				if ("streaming" in node) node.streaming = this.message.stopReason === undefined;
+				if (node instanceof TextRenderable) {
+					node.fg = this.messageTheme.getFgColor(segments[index]!.kind === "error" ? "error" : "thinkingText");
+					node.attributes =
+						segments[index]!.kind === "thinking-label" ? TextAttributes.ITALIC : TextAttributes.NONE;
+				} else {
+					node.fg = this.messageTheme.getFgColor(segments[index]!.kind === "thinking" ? "thinkingText" : "text");
+					node.streaming = this.message.stopReason === undefined;
+				}
 			}
+			this.renderer.requestRender();
 			return;
 		}
 
 		clearChildren(root);
-		this.renderedKinds = kinds;
 		this.renderedNodes = [];
 		if (segments.length === 0) {
 			this.renderer.requestRender();
