@@ -1679,12 +1679,16 @@ describe("OpenTUIInteractiveMode", () => {
 		active.emit({ type: "question_asked", request });
 		await renderer.waitForFrameText("Which runtime?");
 		renderer.input.pressEnter();
-		renderer.input.pressKey("s", { ctrl: true });
+		renderer.input.pressArrow("right");
+		await renderer.waitForFrameText("Submit answers");
+		renderer.input.pressEnter();
 
 		await mode.idle();
-		expect(active.session.answerQuestion).toHaveBeenCalledWith(request.id, [
-			{ questionIndex: 0, question: "Which runtime?", kind: "option", answer: "Bun" },
-		]);
+		expect(active.session.answerQuestion).toHaveBeenCalledWith(
+			request.id,
+			[{ questionIndex: 0, question: "Which runtime?", kind: "option", answer: "Bun" }],
+			undefined,
+		);
 		mode.stop();
 	});
 
