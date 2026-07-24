@@ -16,7 +16,7 @@ import type {
 import type { LocalEmbeddingStatus } from "../../core/local-embedding.ts";
 import { MemoryRuntime } from "../../core/memory.ts";
 import type { PlanProposal } from "../../core/plan-mode.ts";
-import type { QuestionAnswer, QuestionRequest } from "../../core/question.ts";
+import type { QuestionRequest } from "../../core/question.ts";
 import { resolveTaskModel } from "../../core/task-model-router.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { OpenTUITopBar, OpenTUIWelcome } from "./components/opentui-chrome.ts";
@@ -26,7 +26,11 @@ import { OpenTUIHistoryNavigator, type OpenTUIHistoryNavigatorMode } from "./com
 import { OpenTUIInlinePrompt, type OpenTUIInlinePromptRequest } from "./components/opentui-inline-prompt.ts";
 import { OpenTUIMultiPicker, type OpenTUIMultiPickerRequest } from "./components/opentui-multi-picker.ts";
 import { OpenTUIPlanReview, type OpenTUIPlanReviewResult } from "./components/opentui-plan-review.ts";
-import { OpenTUIQuestionnaire, type OpenTUIQuestionnaireResult } from "./components/opentui-questionnaire.ts";
+import {
+	OpenTUIQuestionnaire,
+	type OpenTUIQuestionnaireDraft,
+	type OpenTUIQuestionnaireResult,
+} from "./components/opentui-questionnaire.ts";
 import { OpenTUIQuickPicker, type OpenTUIQuickPickerRequest } from "./components/opentui-quick-picker.ts";
 import { OpenTUIStatusView } from "./components/opentui-rich-messages.ts";
 import { OpenTUISessionSidebar } from "./components/opentui-session-sidebar.ts";
@@ -189,7 +193,7 @@ export class OpenTUIInteractiveMode {
 	private readonly automaticTitleGeneration = new WeakSet<AgentSessionRuntime>();
 	private readonly interactionTasks = new Set<Promise<void>>();
 	private readonly planFeedbackDrafts = new Map<string, string>();
-	private readonly questionDrafts = new Map<string, QuestionAnswer[]>();
+	private readonly questionDrafts = new Map<string, OpenTUIQuestionnaireDraft>();
 	private footerData: FooterDataProvider | undefined;
 	private sidebarSessions: InteractiveSessionSummary[] = [];
 	private sidebarOffset = 0;
@@ -1007,7 +1011,11 @@ export class OpenTUIInteractiveMode {
 		const semanticUpdate = this.getTranscriptSemanticUpdate(event);
 		if (semanticUpdate) this.transcriptFocus?.recordSemanticUpdate(semanticUpdate);
 		if (this.transcriptFocus?.isAutoFollowing()) this.transcriptFocus.followLatest();
-		if (event.type === "session_info_changed" || event.type === "thinking_level_changed") {
+		if (
+			event.type === "session_info_changed" ||
+			event.type === "thinking_level_changed" ||
+			event.type === "collaboration_mode_changed"
+		) {
 			this.topBar?.update(this.getTopBarState(runtime));
 		}
 		if (event.type === "session_info_changed") await this.refreshSidebar();
@@ -1015,7 +1023,8 @@ export class OpenTUIInteractiveMode {
 			event.type === "agent_start" ||
 			event.type === "agent_end" ||
 			event.type === "agent_settled" ||
-			event.type === "thinking_level_changed"
+			event.type === "thinking_level_changed" ||
+			event.type === "collaboration_mode_changed"
 		) {
 			this.composer?.updateStatus(this.getComposerStatus(runtime));
 		}
@@ -1359,7 +1368,8 @@ export class OpenTUIInteractiveMode {
 		try {
 			const result = await this.showQuestionnaire(ui, request, controller);
 			if (!this.isPendingQuestion(runtime, generation, request) || controller.signal.aborted) return;
-			if (result && !result.cancelled) runtime.session.answerQuestion(request.id, result.answers);
+			if (result && !result.cancelled)
+				runtime.session.answerQuestion(request.id, result.answers, result.overallNotes);
 			else runtime.session.cancelQuestion(request.id, "user");
 		} catch (error) {
 			this.showInteractionError(error);
@@ -1396,7 +1406,7 @@ export class OpenTUIInteractiveMode {
 				if (settled) return;
 				settled = true;
 				if (result) this.questionDrafts.delete(request.id);
-				else this.questionDrafts.set(request.id, questionnaire.getDraftAnswers());
+				else this.questionDrafts.set(request.id, questionnaire.getDraft());
 				if (this.questionnaire === questionnaire) this.questionnaire = undefined;
 				widget?.close();
 				resolve(result);
@@ -1474,6 +1484,7 @@ export class OpenTUIInteractiveMode {
 			workspace: basename(runtime.cwd) || runtime.cwd,
 			model: model ? `${model.provider}/${model.id}` : "No model",
 			thinking: runtime.session.thinkingLevel ?? "off",
+			...(runtime.session.collaborationMode === "plan" && { mode: "plan" as const }),
 		};
 	}
 
@@ -1491,6 +1502,7 @@ export class OpenTUIInteractiveMode {
 			thinking: runtime.session.thinkingLevel ?? "off",
 			contextRemaining: remaining === undefined ? "--" : `${Math.max(0, Math.round(remaining))}%`,
 			foregroundThroughput: throughput ? `${throughput.toFixed(1)} t/s` : "",
+			...(runtime.session.collaborationMode === "plan" && { mode: "plan" as const }),
 		};
 	}
 

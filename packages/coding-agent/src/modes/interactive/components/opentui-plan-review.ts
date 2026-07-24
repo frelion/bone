@@ -2,8 +2,11 @@ import {
 	BoxRenderable,
 	type CliRenderer,
 	type KeyEvent,
+	MarkdownRenderable,
+	ScrollBoxRenderable,
 	SelectRenderable,
 	SelectRenderableEvents,
+	SyntaxStyle,
 	TextAttributes,
 	TextareaRenderable,
 	TextRenderable,
@@ -58,6 +61,27 @@ export class OpenTUIPlanReview {
 				attributes: TextAttributes.BOLD,
 			}),
 		);
+		const planBody = new ScrollBoxRenderable(renderer, {
+			width: "100%",
+			height: 8,
+			minHeight: 4,
+			border: ["top", "bottom"],
+			borderColor: OPEN_TUI_COLORS.border,
+			paddingX: 1,
+		});
+		planBody.add(
+			new MarkdownRenderable(renderer, {
+				content: proposal.content,
+				fg: OPEN_TUI_COLORS.text,
+				syntaxStyle: SyntaxStyle.fromStyles({
+					default: { fg: OPEN_TUI_COLORS.text },
+					"markup.heading": { fg: OPEN_TUI_COLORS.primary, bold: true },
+					"markup.link": { fg: OPEN_TUI_COLORS.primary, underline: true },
+					"markup.raw": { fg: OPEN_TUI_COLORS.success },
+				}),
+			}),
+		);
+		this.root.add(planBody);
 		this.select = new SelectRenderable(renderer, {
 			width: "100%",
 			height: 6,
@@ -107,7 +131,7 @@ export class OpenTUIPlanReview {
 		this.root.add(this.feedbackInput);
 		this.root.add(this.errorNode);
 		this.hintNode = new TextRenderable(renderer, {
-			content: "Enter choose · Esc keep reviewing",
+			content: "Enter choose · Up/Down move · scroll plan with mouse",
 			fg: OPEN_TUI_COLORS.dim,
 			truncate: true,
 		});
@@ -190,7 +214,7 @@ export class OpenTUIPlanReview {
 		this.feedbackInput.visible = this.editingFeedback;
 		this.hintNode.content = this.editingFeedback
 			? "Enter submit · Shift+Enter newline · Esc back"
-			: "Enter choose · Esc keep reviewing";
+			: "Enter choose · Up/Down move · scroll plan with mouse";
 	}
 
 	private setError(message: string | undefined): void {

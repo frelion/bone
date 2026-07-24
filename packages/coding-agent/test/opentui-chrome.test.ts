@@ -60,6 +60,23 @@ describe("OpenTUI chrome", () => {
 		expect(() => topBar.dispose()).not.toThrow();
 	});
 
+	test("shows a persistent textual Plan mode marker", async () => {
+		initTheme("dark");
+		const setup = await createTestRenderer({ width: 60, height: 8 });
+		setups.add(setup);
+		const topBar = new OpenTUITopBar(setup.renderer, {
+			conversation: "Migration",
+			workspace: "bone",
+			model: "openai/gpt-5",
+			thinking: "high",
+			mode: "plan",
+		});
+		setup.renderer.root.add(topBar.root);
+		await setup.flush();
+
+		expect(setup.captureCharFrame()).toContain("[PLAN] Migration");
+	});
+
 	test("shows a restrained empty-session welcome once and dismisses it permanently", async () => {
 		initTheme("dark");
 		const setup = await createTestRenderer({ width: 80, height: 12 });

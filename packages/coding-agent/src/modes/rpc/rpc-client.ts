@@ -255,8 +255,8 @@ export class RpcClient {
 		await this.send({ type: "cancel_plan", proposalId });
 	}
 
-	async answerQuestion(requestId: string, answers: QuestionAnswer[]): Promise<void> {
-		await this.send({ type: "answer_question", requestId, answers });
+	async answerQuestion(requestId: string, answers: QuestionAnswer[], overallNotes?: string): Promise<void> {
+		await this.send({ type: "answer_question", requestId, answers, ...(overallNotes && { overallNotes }) });
 	}
 
 	async cancelQuestion(requestId: string, reason: QuestionCancelReason = "user"): Promise<void> {

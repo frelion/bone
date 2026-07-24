@@ -262,10 +262,11 @@ describe("OpenTUI composer", () => {
 		expect(initial).not.toContain("›");
 
 		const occupiedRows = initial.split("\n").filter((line) => line.trim()).length;
-		composer.updateStatus({ contextRemaining: "79%", foregroundThroughput: "31.8 tok/s" });
+		composer.updateStatus({ contextRemaining: "79%", foregroundThroughput: "31.8 tok/s", mode: "plan" });
 		await settle(testSetup);
 		const streaming = testSetup.captureCharFrame();
 		expect(streaming).toContain("79% left  31.8 tok/s");
+		expect(streaming).toContain("~/src/bone  openai/gpt-5  PLAN");
 		expect(streaming.split("\n").filter((line) => line.trim())).toHaveLength(occupiedRows);
 	});
 

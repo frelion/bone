@@ -88,8 +88,9 @@ describe("structured questions", () => {
 				{
 					questionIndex: 0,
 					question: input.questions[0].question,
-					kind: "custom",
-					answer: "A smaller public facade",
+					kind: "note",
+					answer: null,
+					notes: "A smaller public facade",
 				},
 				{
 					questionIndex: 1,
@@ -100,7 +101,13 @@ describe("structured questions", () => {
 				},
 			]),
 		).toEqual([
-			{ questionIndex: 0, question: input.questions[0].question, kind: "custom", answer: "A smaller public facade" },
+			{
+				questionIndex: 0,
+				question: input.questions[0].question,
+				kind: "note",
+				answer: null,
+				notes: "A smaller public facade",
+			},
 			{
 				questionIndex: 1,
 				question: input.questions[1].question,
@@ -149,15 +156,27 @@ describe("structured questions", () => {
 		]);
 	});
 
-	it("allows a custom answer for a multi-select question", () => {
+	it("allows a note-only answer for a multi-select question", () => {
 		expect(
 			validateQuestionAnswers(request(), [
 				{ questionIndex: 0, question: input.questions[0].question, kind: "option", answer: "Minimal" },
-				{ questionIndex: 1, question: input.questions[1].question, kind: "custom", answer: "A browser client" },
+				{
+					questionIndex: 1,
+					question: input.questions[1].question,
+					kind: "note",
+					answer: null,
+					notes: "A browser client",
+				},
 			]),
 		).toEqual([
 			{ questionIndex: 0, question: input.questions[0].question, kind: "option", answer: "Minimal" },
-			{ questionIndex: 1, question: input.questions[1].question, kind: "custom", answer: "A browser client" },
+			{
+				questionIndex: 1,
+				question: input.questions[1].question,
+				kind: "note",
+				answer: null,
+				notes: "A browser client",
+			},
 		]);
 	});
 
@@ -171,9 +190,9 @@ describe("structured questions", () => {
 		).toThrow("valid option");
 		expect(() =>
 			validateQuestionAnswers(request(), [
-				{ questionIndex: 0, question: input.questions[0].question, kind: "custom", answer: " " },
+				{ questionIndex: 0, question: input.questions[0].question, kind: "note", answer: null, notes: " " },
 				{ questionIndex: 1, question: input.questions[1].question, kind: "multi", answer: null, selected: [] },
 			]),
-		).toThrow("custom answer");
+		).toThrow("note must not be empty");
 	});
 });

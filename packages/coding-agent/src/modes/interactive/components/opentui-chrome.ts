@@ -6,6 +6,7 @@ export interface OpenTUITopBarState {
 	workspace: string;
 	model: string;
 	thinking: string;
+	mode?: "plan";
 }
 
 export class OpenTUITopBar {
@@ -46,7 +47,10 @@ export class OpenTUITopBar {
 
 	update(state: OpenTUITopBarState): void {
 		if (this.root.isDestroyed) return;
-		this.conversationNode.content = state.conversation.trim() || "New conversation";
+		const conversation = state.conversation.trim() || "New conversation";
+		this.conversationNode.content = state.mode === "plan" ? `[PLAN] ${conversation}` : conversation;
+		this.conversationNode.fg =
+			state.mode === "plan" ? this.barTheme.getFgColor("accent") : this.barTheme.getFgColor("text");
 		this.workspaceNode.content = state.workspace.trim();
 	}
 

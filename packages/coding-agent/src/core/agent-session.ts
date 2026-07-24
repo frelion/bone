@@ -182,7 +182,7 @@ export type AgentSessionEvent =
 	| { type: "plan_decided"; proposal: PlanProposal; decision: PlanDecision }
 	| { type: "plan_submission_error"; error: string }
 	| { type: "question_asked"; request: QuestionRequest }
-	| { type: "question_answered"; requestId: string; answers: QuestionAnswer[] }
+	| { type: "question_answered"; requestId: string; answers: QuestionAnswer[]; overallNotes?: string }
 	| { type: "question_cancelled"; requestId: string; reason: QuestionCancelReason }
 	| { type: "question_error"; requestId?: string; error: string }
 	| {
@@ -1185,19 +1185,25 @@ export class AgentSession {
 		});
 	}
 
-	answerQuestion(requestId: string, answers: QuestionAnswer[]): void {
+	answerQuestion(requestId: string, answers: QuestionAnswer[], overallNotes?: string): void {
 		if (this._questionState.status !== "awaitingAnswer" || this._questionState.request.id !== requestId) {
 			throw new Error("The structured question request is stale or does not exist.");
 		}
 		const normalizedAnswers = validateQuestionAnswers(this._questionState.request, answers);
-		const entry = this.sessionManager.appendQuestionAnswered(requestId, normalizedAnswers);
+		const normalizedOverallNotes = overallNotes?.trim() || undefined;
+		const entry = this.sessionManager.appendQuestionAnswered(requestId, normalizedAnswers, normalizedOverallNotes);
 		const request = this._questionState.request;
 		this._questionState = { status: "inactive" };
 		this._emitAppendedEntry(entry);
-		this._emit({ type: "question_answered", requestId, answers: normalizedAnswers });
+		this._emit({
+			type: "question_answered",
+			requestId,
+			answers: normalizedAnswers,
+			...(normalizedOverallNotes && { overallNotes: normalizedOverallNotes }),
+		});
 		const pending = this._pendingQuestionResolution;
 		this._pendingQuestionResolution = undefined;
-		const result = createQuestionToolResult(request.id, normalizedAnswers);
+		const result = createQuestionToolResult(request.id, normalizedAnswers, normalizedOverallNotes);
 		if (pending) pending.resolve(result);
 		else this._resumeAnsweredQuestion(request, result);
 	}
