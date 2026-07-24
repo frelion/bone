@@ -44,6 +44,8 @@ export interface RuntimeStreamSnapshot {
 	liveEventEnvelopes: readonly RuntimeEventEnvelope[];
 }
 
+const LIVE_PREVIEW_SOURCE_LIMIT = 4_096;
+
 interface RuntimeSlot {
 	runtime: AgentSessionRuntime;
 	state: Exclude<InteractiveSessionState, "cold">;
@@ -54,6 +56,7 @@ interface RuntimeSlot {
 	unsubscribePersistedEntries: () => void;
 	unsubscribeRunCompleted: () => void;
 	livePreview: string | undefined;
+	livePreviewSource: string;
 	messageCount: number;
 	modified: Date;
 	generationStartedAt: number | undefined;
@@ -89,8 +92,30 @@ function normalizeLivePreview(text: string): string {
 		.trim();
 }
 
+function clonePlainValue(value: unknown, seen = new WeakMap<object, object>()): unknown {
+	if (value === null || typeof value !== "object") return value;
+	if (value instanceof Date) return new Date(value);
+	const existing = seen.get(value);
+	if (existing) return existing;
+	if (Array.isArray(value)) {
+		const result: unknown[] = [];
+		seen.set(value, result);
+		for (const item of value) result.push(clonePlainValue(item, seen));
+		return result;
+	}
+	const result: Record<string, unknown> = {};
+	seen.set(value, result);
+	for (const [key, item] of Object.entries(value)) result[key] = clonePlainValue(item, seen);
+	return result;
+}
+
 /** Agent events contain mutable partial messages; replay must capture their value at emission time. */
 function cloneAgentSessionEvent(event: AgentSessionEvent): AgentSessionEvent {
+	// Cumulative stream updates are plain data. Preserve mutable-container isolation
+	// without asking structuredClone to copy the full accumulated text on every delta.
+	if (event.type === "message_update" || event.type === "tool_execution_update") {
+		return clonePlainValue(event) as AgentSessionEvent;
+	}
 	if (typeof structuredClone === "function") {
 		try {
 			return structuredClone(event);
@@ -98,13 +123,7 @@ function cloneAgentSessionEvent(event: AgentSessionEvent): AgentSessionEvent {
 			// Extension-defined event payloads can contain values structuredClone rejects.
 		}
 	}
-	const clone = (value: unknown): unknown => {
-		if (value === null || typeof value !== "object") return value;
-		if (value instanceof Date) return new Date(value);
-		if (Array.isArray(value)) return value.map(clone);
-		return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, clone(item)]));
-	};
-	return clone(event) as AgentSessionEvent;
+	return clonePlainValue(event) as AgentSessionEvent;
 }
 
 function messageReplayKey(message: AgentMessage): string {
@@ -424,6 +443,7 @@ export class InteractiveSessionHost {
 			.map((entry) => entry.message)
 			.filter((message) => message.role === "user" || message.role === "assistant");
 		const latestMessage = [...messages].reverse().find((message) => extractText(message.content).trim().length > 0);
+		const latestMessageText = latestMessage ? extractText(latestMessage.content) : "";
 		const latestTimestamp = messages.at(-1)?.timestamp;
 		const headerTimestamp = runtime.session.sessionManager.getHeader()?.timestamp;
 		const slot: RuntimeSlot = {
@@ -435,7 +455,8 @@ export class InteractiveSessionHost {
 			unsubscribe: () => {},
 			unsubscribePersistedEntries: () => {},
 			unsubscribeRunCompleted: () => {},
-			livePreview: latestMessage ? normalizeLivePreview(extractText(latestMessage.content)) : undefined,
+			livePreview: latestMessageText ? normalizeLivePreview(latestMessageText) : undefined,
+			livePreviewSource: latestMessageText.slice(-LIVE_PREVIEW_SOURCE_LIMIT),
 			messageCount: messages.length,
 			modified:
 				typeof latestTimestamp === "number"
@@ -483,36 +504,20 @@ export class InteractiveSessionHost {
 			const persistedKey = messageReplayKey(entry.message);
 			const completedToolCallId =
 				entry.message.role === "toolResult" && "toolCallId" in entry.message ? entry.message.toolCallId : undefined;
-			const matchingEndIndex = slot.liveEvents.findIndex(
+			const hasMatchingEnd = slot.liveEvents.some(
 				(event) =>
 					event.type === "message_end" &&
 					messageReplayKey(event.message) === persistedKey &&
 					messageContentSignature(event.message) === messageContentSignature(entry.message),
 			);
-			const removeMessageRange = matchingEndIndex >= 0;
-			let matchingStartIndex = -1;
-			if (removeMessageRange) {
-				for (let index = matchingEndIndex - 1; index >= 0; index--) {
-					const event = slot.liveEvents[index];
-					if (event.type === "message_start" && messageReplayKey(event.message) === persistedKey) {
-						matchingStartIndex = index;
-						break;
-					}
-				}
-			}
-			const rangeStart = matchingStartIndex >= 0 ? matchingStartIndex : matchingEndIndex;
 			const retainedEvents: AgentSessionEvent[] = [];
 			const retainedRevisions: number[] = [];
 			for (const [index, event] of slot.liveEvents.entries()) {
 				let keep = true;
-				if (removeMessageRange && index >= rangeStart && index <= matchingEndIndex) {
-					keep = false;
-				}
-				if (keep && (event.type === "message_start" || event.type === "message_end")) {
-					if (!removeMessageRange && messageReplayKey(event.message) === persistedKey) keep = false;
-				}
-				if (keep && event.type === "message_update") {
-					if (!removeMessageRange && messageReplayKey(event.message) === persistedKey) keep = false;
+				if (event.type === "message_start" || event.type === "message_update" || event.type === "message_end") {
+					if (messageReplayKey(event.message) === persistedKey) {
+						keep = event.type === "message_end" && !hasMatchingEnd;
+					}
 				}
 				if (
 					keep &&
@@ -533,6 +538,36 @@ export class InteractiveSessionHost {
 		}
 	}
 
+	private removeLiveEvents(slot: RuntimeSlot, predicate: (event: AgentSessionEvent) => boolean): void {
+		const retainedEvents: AgentSessionEvent[] = [];
+		const retainedRevisions: number[] = [];
+		for (const [index, event] of slot.liveEvents.entries()) {
+			if (predicate(event)) continue;
+			retainedEvents.push(event);
+			retainedRevisions.push(slot.liveEventRevisions[index] ?? slot.revision);
+		}
+		slot.liveEvents = retainedEvents;
+		slot.liveEventRevisions = retainedRevisions;
+	}
+
+	private appendLiveEvent(slot: RuntimeSlot, event: AgentSessionEvent, revision: number): void {
+		if (event.type === "message_update" || event.type === "message_end") {
+			const replayKey = messageReplayKey(event.message);
+			this.removeLiveEvents(
+				slot,
+				(candidate) => candidate.type === "message_update" && messageReplayKey(candidate.message) === replayKey,
+			);
+		} else if (event.type === "tool_execution_update" || event.type === "tool_execution_end") {
+			this.removeLiveEvents(
+				slot,
+				(candidate) => candidate.type === "tool_execution_update" && candidate.toolCallId === event.toolCallId,
+			);
+		}
+
+		slot.liveEvents.push(event);
+		slot.liveEventRevisions.push(revision);
+	}
+
 	private handleRuntimeEvent(slot: RuntimeSlot, event: AgentSessionEvent): void {
 		const now = Date.now();
 		if (event.type === "agent_start") {
@@ -543,8 +578,7 @@ export class InteractiveSessionHost {
 		slot.revision++;
 		const eventSnapshot = cloneAgentSessionEvent(event);
 		if (slot.generationId !== undefined) {
-			slot.liveEvents.push(eventSnapshot);
-			slot.liveEventRevisions.push(slot.revision);
+			this.appendLiveEvent(slot, eventSnapshot, slot.revision);
 		}
 		const envelope: RuntimeEventEnvelope = {
 			runtime: slot.runtime,
@@ -561,22 +595,24 @@ export class InteractiveSessionHost {
 		} else if (event.type === "message_start") {
 			if (event.message.role === "user" || event.message.role === "assistant") {
 				slot.messageCount = (slot.messageCount ?? 0) + 1;
-				const text = normalizeLivePreview(extractText(event.message.content));
+				slot.livePreviewSource = extractText(event.message.content).slice(-LIVE_PREVIEW_SOURCE_LIMIT);
+				const text = normalizeLivePreview(slot.livePreviewSource);
 				if (text) slot.livePreview = text;
 				slot.modified = new Date(now);
 				this.publishPresentation(slot);
 			}
 		} else if (event.type === "message_update") {
 			if (event.assistantMessageEvent.type === "text_delta") {
-				slot.streamedCharacters += event.assistantMessageEvent.delta.length;
-				const text = normalizeLivePreview(extractText(event.assistantMessageEvent.partial.content));
-				if (text) slot.livePreview = text;
+				const delta = event.assistantMessageEvent.delta;
+				slot.streamedCharacters += delta.length;
+				slot.livePreviewSource = `${slot.livePreviewSource}${delta}`.slice(-LIVE_PREVIEW_SOURCE_LIMIT);
 				slot.modified = new Date(now);
 				this.publishPresentation(slot);
 			}
 		} else if (event.type === "message_end") {
 			if (event.message.role === "user" || event.message.role === "assistant") {
-				const text = normalizeLivePreview(extractText(event.message.content));
+				slot.livePreviewSource = extractText(event.message.content).slice(-LIVE_PREVIEW_SOURCE_LIMIT);
+				const text = normalizeLivePreview(slot.livePreviewSource);
 				if (text) slot.livePreview = text;
 				slot.modified = new Date(now);
 				this.publishPresentation(slot);
@@ -615,18 +651,25 @@ export class InteractiveSessionHost {
 		if (immediate) {
 			if (this.presentationRefreshTimer) clearTimeout(this.presentationRefreshTimer);
 			this.presentationRefreshTimer = undefined;
+			this.flushPresentations();
 			this.hooks.stateChanged?.(false);
 			return;
 		}
 		if (this.presentationRefreshTimer) return;
 		this.presentationRefreshTimer = setTimeout(() => {
 			this.presentationRefreshTimer = undefined;
-			for (const liveSlot of [this.foreground, ...this.background.values()]) {
-				const livePath = this.getSessionPath(liveSlot.runtime);
-				if (livePath) this.presentationByPath.set(livePath, this.presentationForSlot(liveSlot));
-			}
+			this.flushPresentations();
 			this.hooks.stateChanged?.(false);
 		}, 250);
+	}
+
+	private flushPresentations(): void {
+		for (const liveSlot of [this.foreground, ...this.background.values()]) {
+			const text = normalizeLivePreview(liveSlot.livePreviewSource);
+			if (text) liveSlot.livePreview = text;
+			const livePath = this.getSessionPath(liveSlot.runtime);
+			if (livePath) this.presentationByPath.set(livePath, this.presentationForSlot(liveSlot));
+		}
 	}
 
 	private async activateWithinTransition(sessionPath: string, options?: { cwdOverride?: string }): Promise<void> {

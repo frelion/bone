@@ -37,13 +37,54 @@ describe("provider retry classification", () => {
 		).toBe(true);
 	});
 
+	it.each(["stream_read_error", "stream read error", "stream-read-error"])(
+		"matches OpenAI-compatible stream body read failures: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+		},
+	);
+
+	it("prefers a structured provider stream error code over display text", () => {
+		const message = fauxAssistantMessage("", { stopReason: "error" });
+		message.diagnostics = [
+			{
+				type: "provider_stream_failure",
+				timestamp: 0,
+				error: { message: "Upstream request failed", code: "STREAM_READ_ERROR" },
+			},
+		];
+
+		expect(isRetryableAssistantError(message)).toBe(true);
+	});
+
 	it("keeps provider limit errors non-retryable", () => {
 		expect(
 			isRetryableAssistantError(
 				fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 quota exceeded" }),
 			),
 		).toBe(false);
+		expect(
+			isRetryableAssistantError(
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "stream_read_error: insufficient_quota" }),
+			),
+		).toBe(false);
 	});
+
+	it.each(["invalid_api_key", "401 Unauthorized", "403 Forbidden", "permission_denied"])(
+		"keeps authentication and permission failures non-retryable: %s",
+		(errorMessage) => {
+			const message = fauxAssistantMessage("", { stopReason: "error", errorMessage });
+			message.diagnostics = [
+				{
+					type: "provider_stream_failure",
+					timestamp: 0,
+					error: { message: "Provider response stream failed", code: "stream_read_error" },
+				},
+			];
+
+			expect(isRetryableAssistantError(message)).toBe(false);
+		},
+	);
 
 	it("classifies assistant error messages", () => {
 		expect(

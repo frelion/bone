@@ -2,7 +2,7 @@ import type { AgentTool } from "@frelion/bone-agent-core";
 import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@frelion/bone-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { createHarness, type Harness } from "./harness.ts";
+import { createHarness, getAssistantTexts, type Harness } from "./harness.ts";
 
 function normalizeEventOrder(events: Harness["events"]): string[] {
 	const normalized: string[] = [];
@@ -198,6 +198,57 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.session.isStreaming).toBe(false);
 		await harness.session.prompt("follow-up");
 		expect(harness.faux.state.callCount).toBe(4);
+	});
+
+	it("retries a stream read failure after a completed tool without running the tool again", async () => {
+		let toolRunCount = 0;
+		let retryContextHasToolResult = false;
+		let retryContextHasFailedAssistant = false;
+		const echoTool: AgentTool = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo text back",
+			parameters: Type.Object({ text: Type.String() }),
+			execute: async (_toolCallId, params) => {
+				toolRunCount++;
+				const text = typeof params === "object" && params !== null && "text" in params ? String(params.text) : "";
+				return { content: [{ type: "text", text: `echo:${text}` }], details: { text } };
+			},
+		};
+		const harness = await createHarness({
+			tools: [echoTool],
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("echo", { text: "hello" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "stream_read_error" }),
+			(context) => {
+				retryContextHasToolResult = context.messages.some(
+					(message) => message.role === "toolResult" && message.toolName === "echo",
+				);
+				retryContextHasFailedAssistant = context.messages.some(
+					(message) => message.role === "assistant" && message.stopReason === "error",
+				);
+				return fauxAssistantMessage("recovered after stream retry");
+			},
+		]);
+
+		await harness.session.prompt("test");
+
+		expect(harness.faux.state.callCount).toBe(3);
+		expect(toolRunCount).toBe(1);
+		expect(retryContextHasToolResult).toBe(true);
+		expect(retryContextHasFailedAssistant).toBe(false);
+		expect(harness.eventsOfType("auto_retry_start").map((event) => event.errorMessage)).toEqual([
+			"stream_read_error",
+		]);
+		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
+		expect(harness.eventsOfType("agent_end").map((event) => event.willRetry)).toEqual([true, false]);
+		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+		expect(harness.events.at(-1)?.type).toBe("agent_settled");
+		expect(getAssistantTexts(harness)).toContain("recovered after stream retry");
+		expect(harness.session.isStreaming).toBe(false);
 	});
 
 	it("emits extension events before public event subscribers", async () => {

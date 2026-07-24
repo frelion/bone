@@ -1,9 +1,11 @@
 import type { ResponseStreamEvent } from "openai/resources/responses/responses.js";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamOpenAIResponses } from "../src/api/openai-responses.ts";
 import { processResponsesStream } from "../src/api/openai-responses-shared.ts";
 import type { AssistantMessage, AssistantMessageEvent, Context, Model } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
+
+const openAIMockState = vi.hoisted(() => ({ streamErrorCode: undefined as string | undefined }));
 
 vi.mock("openai", () => {
 	async function* createMockResponsesStream(): AsyncIterable<ResponseStreamEvent> {
@@ -12,6 +14,11 @@ vi.mock("openai", () => {
 			sequence_number: 0,
 			response: { id: "resp_wrapper_early_eof" },
 		} as ResponseStreamEvent;
+		if (openAIMockState.streamErrorCode) {
+			const error = new Error("Upstream response stream failed") as Error & { code?: string };
+			error.code = openAIMockState.streamErrorCode;
+			throw error;
+		}
 		yield {
 			type: "response.output_item.added",
 			sequence_number: 1,
@@ -154,6 +161,10 @@ async function* createFailedEvents(): AsyncIterable<ResponseStreamEvent> {
 }
 
 describe("OpenAI Responses terminal event handling", () => {
+	beforeEach(() => {
+		openAIMockState.streamErrorCode = undefined;
+	});
+
 	it("rejects streams that end before a terminal response event", async () => {
 		const model = createModel();
 		const output = createOutput(model);
@@ -183,6 +194,31 @@ describe("OpenAI Responses terminal event handling", () => {
 		expect(lastEvent?.type).toBe("error");
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("OpenAI Responses stream ended before a terminal response event");
+	});
+
+	it("preserves a structured SDK error code from the response body stream", async () => {
+		openAIMockState.streamErrorCode = "stream_read_error";
+		const model = createModel();
+		const context: Context = {
+			systemPrompt: "",
+			messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 }],
+			tools: [],
+		};
+		const stream = streamOpenAIResponses(model, context, { apiKey: "test" });
+		for await (const _event of stream) {
+			// Drain the wrapper stream so its final result is available.
+		}
+
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.diagnostics).toMatchObject([
+			{
+				type: "provider_stream_failure",
+				error: { message: "Provider response stream failed", code: "stream_read_error" },
+				details: { phase: "response_body" },
+			},
+		]);
+		expect(result.diagnostics?.[0]?.error?.stack).toBeUndefined();
 	});
 
 	it("finalizes completed terminal events as stop", async () => {
@@ -226,8 +262,9 @@ describe("OpenAI Responses terminal event handling", () => {
 		const output = createOutput(model);
 		const stream = new AssistantMessageEventStream();
 
-		await expect(processResponsesStream(createFailedEvents(), output, stream, model)).rejects.toThrow(
-			"server_error: boom",
-		);
+		await expect(processResponsesStream(createFailedEvents(), output, stream, model)).rejects.toMatchObject({
+			message: "server_error: boom",
+			code: "server_error",
+		});
 	});
 });

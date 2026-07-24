@@ -16,6 +16,7 @@ import type {
 	Usage,
 } from "../types.ts";
 import { splitDeferredTools } from "../utils/deferred-tools.ts";
+import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
@@ -119,6 +120,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			stopReason: "stop",
 			timestamp: Date.now(),
 		};
+		let responseStarted = false;
 
 		try {
 			// Create OpenAI client
@@ -138,6 +140,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			};
 			const { data: openaiStream, response } = await client.responses.create(params, requestOptions).withResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			responseStarted = true;
 			stream.push({ type: "start", partial: output });
 
 			await processResponsesStream(openaiStream, output, stream, model, {
@@ -160,6 +163,20 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				delete (block as { index?: number }).index;
 				// partialJson is only a streaming scratch buffer; never persist it.
 				delete (block as { partialJson?: string }).partialJson;
+			}
+			if (responseStarted) {
+				const code = error instanceof Error ? (error as Error & { code?: unknown }).code : undefined;
+				const diagnosticCode =
+					typeof code === "string" ? code.slice(0, 128) : typeof code === "number" ? code : undefined;
+				appendAssistantMessageDiagnostic(output, {
+					type: "provider_stream_failure",
+					timestamp: Date.now(),
+					error: {
+						message: "Provider response stream failed",
+						...(diagnosticCode === undefined ? {} : { code: diagnosticCode }),
+					},
+					details: { phase: "response_body", responseId: output.responseId },
+				});
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatOpenAIResponsesError(error);

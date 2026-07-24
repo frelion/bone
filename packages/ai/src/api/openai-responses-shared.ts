@@ -573,7 +573,11 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			finalizeResponse(event.response);
 		} else if (event.type === "error") {
-			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
+			const streamError = new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error") as Error & {
+				code?: string;
+			};
+			if (event.code) streamError.code = event.code;
+			throw streamError;
 		} else if (event.type === "response.failed") {
 			sawTerminalResponseEvent = true;
 			const error = event.response?.error;
@@ -583,7 +587,9 @@ export async function processResponsesStream<TApi extends Api>(
 				: details?.reason
 					? `incomplete: ${details.reason}`
 					: "Unknown error (no error details in response)";
-			throw new Error(msg);
+			const streamError = new Error(msg) as Error & { code?: string };
+			if (error?.code) streamError.code = error.code;
+			throw streamError;
 		}
 	}
 	if (!sawTerminalResponseEvent) {

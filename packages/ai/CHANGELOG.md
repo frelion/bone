@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved structured OpenAI Responses stream failure diagnostics and classified upstream stream read errors as retryable transport failures.
+
 ## [0.1.5] - 2026-07-23
 
 ## [0.1.4] - 2026-07-23

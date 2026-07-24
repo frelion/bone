@@ -1,10 +1,12 @@
 import type { AssistantMessage } from "../types.ts";
 
+const RETRYABLE_PROVIDER_ERROR_CODES = new Set(["stream_read_error"]);
+
 function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
 	return new RegExp(patterns.join("|"), "i");
 }
 
-const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
+const NON_RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	// OpenCode Go/free-tier limits returned as 429 JSON error types by OpenCode's
 	// Zen API. These are subscription/account limits, not transient throttles.
 	"GoUsageLimitError",
@@ -21,6 +23,17 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
 	"out of budget",
 	"quota exceeded",
 	"billing",
+
+	// Authentication and permission failures require configuration changes;
+	// retrying the same request cannot recover them.
+	"invalid[_. -]?api[_. -]?key",
+	"authentication.?error",
+	"authentication.?failed",
+	"unauthori[sz]ed",
+	"permission.?denied",
+	"forbidden",
+	"\\b401\\b",
+	"\\b403\\b",
 ]);
 
 const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
@@ -66,8 +79,11 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	// Premature stream endings from SDKs and transports. Anthropic can throw
 	// "stream ended without ..." and "Anthropic stream ended before message_stop"
 	// (#4433); Bedrock/Smithy can throw an HTTP/2 no-response error (#3594).
+	// OpenAI-compatible gateways can surface an upstream body read failure as
+	// the structured `stream_read_error` code or as equivalent display text.
 	"ended without",
 	"stream ended before message_stop",
+	"stream[_. -]?read[_. -]?error",
 	"http2 request did not get a response",
 
 	// Provider-requested retry delay cap failures should flow through the outer
@@ -94,8 +110,18 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
  * before restarting the assistant turn.
  */
 export function isRetryableAssistantError(message: AssistantMessage): boolean {
-	if (message.stopReason !== "error" || !message.errorMessage) return false;
-	const errorMessage = message.errorMessage;
-	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
-	return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
+	if (message.stopReason !== "error") return false;
+	const errorMessage = message.errorMessage ?? "";
+	if (NON_RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage)) return false;
+	if (
+		message.diagnostics?.some(
+			(diagnostic) =>
+				diagnostic.type === "provider_stream_failure" &&
+				typeof diagnostic.error?.code === "string" &&
+				RETRYABLE_PROVIDER_ERROR_CODES.has(diagnostic.error.code.toLowerCase()),
+		)
+	) {
+		return true;
+	}
+	return errorMessage.length > 0 && RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
 }

@@ -10,6 +10,8 @@
 
 - Fixed conversation search changing the active session while browsing results, Escape ambiguously aborting active work, long histories loading all entries at once, and background session previews continuously animating.
 - Fixed provider SSE responses hanging after their HTTP headers by preserving Bun's native streaming fetch, retaining environment-based HTTP proxy support, and settling stalled streams after the configured idle timeout.
+- Fixed OpenAI-compatible stream read failures after tool execution to retry from the completed tool result without running the tool again.
+- Fixed long streaming responses retaining and rendering every cumulative partial update instead of coalescing queued updates to the latest snapshot.
 
 ## [0.1.5] - 2026-07-23
 

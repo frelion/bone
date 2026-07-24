@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AgentMessage } from "@frelion/bone-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../src/core/agent-session.ts";
 import {
@@ -11,7 +12,7 @@ import {
 } from "../src/core/agent-session-runtime.ts";
 import { getLastActiveConversation, rememberLastActiveConversation } from "../src/core/conversation-state.ts";
 import { InteractiveSessionHost } from "../src/core/interactive-session-host.ts";
-import { SessionManager } from "../src/core/session-manager.ts";
+import { type SessionEntry, SessionManager } from "../src/core/session-manager.ts";
 import { assistantMsg, userMsg } from "./utilities.ts";
 
 type SessionInternals = {
@@ -490,6 +491,197 @@ describe("InteractiveSessionHost", () => {
 		expect(host.getRuntimeStreamSnapshot(runtime).liveEvents).toEqual([]);
 		await host.disposeAll();
 		vi.useRealTimers();
+	});
+
+	it("flushes every live preview when another runtime publishes an immediate lifecycle update", async () => {
+		vi.useFakeTimers();
+		const tempDir = join(tmpdir(), `bone-session-host-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDirs.push(tempDir);
+		mkdirSync(tempDir, { recursive: true });
+		const firstSession = createPersistedSession(tempDir, "first session");
+		const secondSession = createPersistedSession(tempDir, "second session");
+		const firstPath = firstSession.getSessionFile();
+		const secondPath = secondSession.getSessionFile();
+		if (!firstPath || !secondPath) throw new Error("expected persisted session files");
+		const factory: CreateAgentSessionRuntimeFactory = async ({
+			cwd,
+			agentDir,
+			sessionManager,
+			sessionStartEvent,
+		}) => {
+			const services = await createAgentSessionServices({
+				cwd,
+				agentDir,
+				resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true },
+			});
+			return {
+				...(await createAgentSessionFromServices({
+					services,
+					sessionManager,
+					sessionStartEvent,
+					noTools: "all",
+				})),
+				services,
+				diagnostics: services.diagnostics,
+			};
+		};
+		const firstRuntime = await createAgentSessionRuntime(factory, {
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.open(firstPath),
+		});
+		const host = new InteractiveSessionHost(firstRuntime, factory);
+		const firstInternals = firstRuntime.session as unknown as SessionInternals;
+		firstInternals._isAgentRunActive = true;
+		await host.activate(secondPath);
+
+		const partial = assistantMsg("background partial");
+		firstInternals._emit({ type: "message_start", message: assistantMsg("") });
+		firstInternals._emit({
+			type: "message_update",
+			message: partial,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "background partial", partial },
+		});
+		expect(host.getSessionPresentation(firstPath).livePreview).not.toBe("background partial");
+
+		const foregroundInternals = host.current.session as unknown as SessionInternals;
+		foregroundInternals._emit({ type: "agent_start" });
+		expect(host.getSessionPresentation(firstPath).livePreview).toBe("background partial");
+
+		await host.disposeAll();
+		vi.useRealTimers();
+	});
+
+	it("compacts cumulative message and tool updates without dropping replay boundaries", async () => {
+		const tempDir = join(tmpdir(), `bone-session-host-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDirs.push(tempDir);
+		mkdirSync(tempDir, { recursive: true });
+		const sessionManager = createPersistedSession(tempDir, "compacted stream");
+		const sessionPath = sessionManager.getSessionFile();
+		if (!sessionPath) throw new Error("expected persisted session file");
+		const factory: CreateAgentSessionRuntimeFactory = async ({ cwd, agentDir, sessionManager: manager }) => {
+			const services = await createAgentSessionServices({
+				cwd,
+				agentDir,
+				resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true },
+			});
+			return {
+				...(await createAgentSessionFromServices({ services, sessionManager: manager, noTools: "all" })),
+				services,
+				diagnostics: services.diagnostics,
+			};
+		};
+		const runtime = await createAgentSessionRuntime(factory, {
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.open(sessionPath),
+		});
+		const host = new InteractiveSessionHost(runtime, factory);
+		const internals = runtime.session as unknown as SessionInternals;
+		const partial = assistantMsg("");
+		const textPart = partial.content[0];
+		const subscriberRevisions: number[] = [];
+		host.subscribeRuntime(runtime, (envelope) => subscriberRevisions.push(envelope.revision));
+
+		internals._emit({ type: "agent_start" });
+		internals._emit({ type: "message_start", message: partial });
+		for (let index = 0; index < 5_000; index++) {
+			textPart.text += "x";
+			internals._emit({
+				type: "message_update",
+				message: partial,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x", partial },
+			});
+		}
+		internals._emit({ type: "queue_update", steering: [], followUp: ["keep this boundary"] });
+
+		let snapshot = host.getRuntimeStreamSnapshot(runtime);
+		expect(snapshot.revision).toBe(5_003);
+		expect(snapshot.liveEvents.map((event) => event.type)).toEqual([
+			"agent_start",
+			"message_start",
+			"message_update",
+			"queue_update",
+		]);
+		expect(snapshot.liveEventEnvelopes.map((envelope) => envelope.revision)).toEqual([1, 2, 5_002, 5_003]);
+		const replayedUpdate = snapshot.liveEvents.find((event) => event.type === "message_update");
+		expect(replayedUpdate?.type === "message_update" ? replayedUpdate.message.content[0] : undefined).toMatchObject({
+			type: "text",
+			text: "x".repeat(5_000),
+		});
+		if (replayedUpdate?.type !== "message_update") throw new Error("expected replayed message update");
+		expect(replayedUpdate.message.content).toBe(replayedUpdate.assistantMessageEvent.partial.content);
+		expect(subscriberRevisions).toHaveLength(5_003);
+		expect(subscriberRevisions.at(-1)).toBe(5_003);
+
+		internals._emit({ type: "message_end", message: partial });
+		snapshot = host.getRuntimeStreamSnapshot(runtime);
+		expect(snapshot.liveEvents.map((event) => event.type)).toEqual([
+			"agent_start",
+			"message_start",
+			"queue_update",
+			"message_end",
+		]);
+		expect(snapshot.liveEventEnvelopes.map((envelope) => envelope.revision)).toEqual([1, 2, 5_003, 5_004]);
+
+		internals._emit({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} });
+		for (let index = 0; index < 5_000; index++) {
+			internals._emit({
+				type: "tool_execution_update",
+				toolCallId: "call-1",
+				toolName: "read",
+				args: {},
+				partialResult: { content: [{ type: "text", text: `chunk ${index}` }] },
+			});
+		}
+		snapshot = host.getRuntimeStreamSnapshot(runtime);
+		expect(snapshot.liveEvents.filter((event) => event.type === "tool_execution_update")).toHaveLength(1);
+		expect(snapshot.liveEventEnvelopes.at(-1)?.revision).toBe(10_005);
+
+		internals._emit({
+			type: "tool_execution_end",
+			toolCallId: "call-1",
+			toolName: "read",
+			result: { content: [{ type: "text", text: "done" }] },
+			isError: false,
+		});
+		snapshot = host.getRuntimeStreamSnapshot(runtime);
+		expect(snapshot.liveEvents.filter((event) => event.type === "tool_execution_update")).toEqual([]);
+		expect(snapshot.liveEvents.slice(-2).map((event) => event.type)).toEqual([
+			"tool_execution_start",
+			"tool_execution_end",
+		]);
+		expect(snapshot.liveEventEnvelopes.slice(-2).map((envelope) => envelope.revision)).toEqual([5_005, 10_006]);
+
+		await internals._emitPersistedEntries([messageEntry(partial, "assistant-final")]);
+		snapshot = host.getRuntimeStreamSnapshot(runtime);
+		expect(snapshot.liveEvents.map((event) => event.type)).toEqual([
+			"agent_start",
+			"queue_update",
+			"tool_execution_start",
+			"tool_execution_end",
+		]);
+		expect(snapshot.liveEventEnvelopes.map((envelope) => envelope.revision)).toEqual([1, 5_003, 5_005, 10_006]);
+
+		await internals._emitPersistedEntries([
+			messageEntry(
+				{
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "read",
+					content: [{ type: "text", text: "done" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				"tool-final",
+			),
+		]);
+		expect(host.getRuntimeStreamSnapshot(runtime).liveEvents.map((event) => event.type)).toEqual([
+			"agent_start",
+			"queue_update",
+		]);
+
+		await host.disposeAll();
 	});
 
 	it("switches away from the foreground conversation before soft-deleting it", async () => {

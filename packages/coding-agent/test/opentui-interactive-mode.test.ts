@@ -486,6 +486,110 @@ describe("OpenTUIInteractiveMode", () => {
 		mode.stop();
 	});
 
+	test("coalesces queued streaming updates without crossing terminal event boundaries", async () => {
+		const session = createRuntime();
+		const host = new FakeHost(session.runtime);
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const transcriptFactory = new OpenTUITranscriptFactory(renderer);
+		const handleEvent = transcriptFactory.handleEvent.bind(transcriptFactory);
+		let releaseFrame!: () => void;
+		const frameBlocked = new Promise<void>((resolve) => {
+			releaseFrame = resolve;
+		});
+		const waitForStreamUpdateFrame = vi.fn(async () => await frameBlocked);
+		const handledTypes: AgentSessionEvent["type"][] = [];
+		vi.spyOn(transcriptFactory, "handleEvent").mockImplementation(async (event) => {
+			handledTypes.push(event.type);
+			return await handleEvent(event);
+		});
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			createTranscriptFactory: () => transcriptFactory,
+			installSignalHandlers: false,
+			waitForStreamUpdateFrame,
+		});
+		await mode.init();
+
+		session.emit({ type: "message_start", message: userMessage("stream a response") });
+		session.emit({ type: "message_start", message: assistantMessage("") });
+		const firstPartial = assistantMessage("partial 0");
+		session.emit({
+			type: "message_update",
+			message: firstPartial,
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "partial 0", partial: firstPartial },
+		});
+		await vi.waitFor(() => expect(waitForStreamUpdateFrame).toHaveBeenCalledOnce());
+		for (let index = 1; index <= 1000; index++) {
+			const partial = assistantMessage(`partial ${index}`);
+			session.emit({
+				type: "message_update",
+				message: partial,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: String(index), partial },
+			});
+			await Promise.resolve();
+		}
+		const idlePromise = mode.idle();
+		await Promise.resolve();
+		const completed = assistantMessage("final answer", "stop");
+		session.emit({ type: "message_end", message: completed });
+		session.emit({ type: "agent_settled" });
+		releaseFrame();
+		await idlePromise;
+		await settle(renderer);
+
+		expect(handledTypes.filter((type) => type === "message_update")).toHaveLength(1);
+		expect(handledTypes.lastIndexOf("message_update")).toBeLessThan(handledTypes.indexOf("message_end"));
+		expect(handledTypes.indexOf("message_end")).toBeLessThan(handledTypes.indexOf("agent_settled"));
+		expect(renderer.captureFrame()).toContain("final answer");
+		mode.stop();
+	});
+
+	test("coalesces bursty tool updates before the tool completion boundary", async () => {
+		const session = createRuntime();
+		const host = new FakeHost(session.runtime);
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const transcriptFactory = new OpenTUITranscriptFactory(renderer);
+		const handleEvent = vi.spyOn(transcriptFactory, "handleEvent");
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			createTranscriptFactory: () => transcriptFactory,
+			installSignalHandlers: false,
+		});
+		await mode.init();
+
+		session.emit({
+			type: "tool_execution_start",
+			toolCallId: "call-burst",
+			toolName: "read",
+			args: { path: "README.md" },
+		});
+		for (let index = 1; index <= 1000; index++) {
+			session.emit({
+				type: "tool_execution_update",
+				toolCallId: "call-burst",
+				toolName: "read",
+				args: { path: "README.md" },
+				partialResult: { content: [{ type: "text", text: `chunk ${index}` }] },
+			});
+		}
+		session.emit({
+			type: "tool_execution_end",
+			toolCallId: "call-burst",
+			toolName: "read",
+			result: { content: [{ type: "text", text: "final chunk" }] },
+			isError: false,
+		});
+		await mode.idle();
+
+		const handledTypes = handleEvent.mock.calls.map(([event]) => event.type);
+		expect(handledTypes.filter((type) => type === "tool_execution_update")).toHaveLength(1);
+		expect(handledTypes.indexOf("tool_execution_start")).toBeLessThan(handledTypes.indexOf("tool_execution_update"));
+		expect(handledTypes.indexOf("tool_execution_update")).toBeLessThan(handledTypes.indexOf("tool_execution_end"));
+		mode.stop();
+	});
+
 	test("replays runtime events emitted while transcript history is loading", async () => {
 		const active = createRuntime([entry(userMessage("earlier prompt"), "one")]);
 		const host = new FakeHost(active.runtime);

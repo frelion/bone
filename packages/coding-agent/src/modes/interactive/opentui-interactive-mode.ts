@@ -38,6 +38,7 @@ const SIDEBAR_PAGE_SIZE = 40;
 const TRANSCRIPT_PAGE_ENTRIES = 100;
 const LEXICAL_SEARCH_DELAY_MS = 80;
 const SEMANTIC_SEARCH_DELAY_MS = 250;
+const STREAM_UPDATE_FRAME_MS = 16;
 const CUSTOM_ANSWER = "custom";
 const SUBMIT_SELECTION = "submit";
 
@@ -63,6 +64,12 @@ interface ConversationViewState {
 interface TranscriptPageState {
 	startIndex: number;
 	loading: boolean;
+}
+
+interface PendingSessionUpdate {
+	runtime: AgentSessionRuntime;
+	event: AgentSessionEvent;
+	generation: number;
 }
 
 export function getOpenTUITranscriptPageStart(
@@ -123,6 +130,7 @@ export interface OpenTUIInteractiveModeOptions {
 	createMemoryRuntime?: (options: OpenTUIMemoryRuntimeOptions) => OpenTUIMemoryRuntime;
 	installSignalHandlers?: boolean;
 	verbose?: boolean;
+	waitForStreamUpdateFrame?: () => Promise<void>;
 }
 
 function messageText(message: { content?: unknown }): string {
@@ -147,6 +155,7 @@ function messageText(message: { content?: unknown }): string {
 export class OpenTUIInteractiveMode {
 	private readonly sessionHost: OpenTUISessionHostContract;
 	private readonly options: OpenTUIInteractiveModeOptions;
+	private readonly waitForStreamUpdateFrame: () => Promise<void>;
 	private transcriptFactory!: OpenTUITranscriptFactory;
 	private readonly commandRouter: OpenTUICommandRouter;
 	private readonly memory: OpenTUIMemoryRuntime;
@@ -166,6 +175,7 @@ export class OpenTUIInteractiveMode {
 	private extensionBinding: OpenTUIExtensionBinding | undefined;
 	private signalCleanups: Array<() => void> = [];
 	private eventTail: Promise<void> = Promise.resolve();
+	private readonly pendingSessionUpdates = new Map<string, PendingSessionUpdate>();
 	private submissionTail: Promise<void> = Promise.resolve();
 	private readonly runtimeSubmissionTails = new WeakMap<AgentSessionRuntime, Promise<void>>();
 	private readonly interactionTasks = new Set<Promise<void>>();
@@ -199,6 +209,9 @@ export class OpenTUIInteractiveMode {
 	constructor(sessionHost: OpenTUISessionHostContract, options: OpenTUIInteractiveModeOptions = {}) {
 		this.sessionHost = sessionHost;
 		this.options = options;
+		this.waitForStreamUpdateFrame =
+			options.waitForStreamUpdateFrame ??
+			(async () => await new Promise<void>((resolve) => setTimeout(resolve, STREAM_UPDATE_FRAME_MS)));
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		const memoryOptions: OpenTUIMemoryRuntimeOptions = {
 			agentDir: sessionHost.current.services.agentDir,
@@ -442,10 +455,24 @@ export class OpenTUIInteractiveMode {
 	}
 
 	async idle(): Promise<void> {
-		await this.submissionTail;
-		await this.eventTail;
-		await Promise.all([...this.interactionTasks]);
 		await this.memoryStartup;
+		while (true) {
+			const submissionTail = this.submissionTail;
+			const eventTail = this.eventTail;
+			const interactionTasks = [...this.interactionTasks];
+			await submissionTail;
+			await eventTail;
+			await Promise.all(interactionTasks);
+			const currentInteractionTasks = [...this.interactionTasks];
+			if (
+				submissionTail === this.submissionTail &&
+				eventTail === this.eventTail &&
+				currentInteractionTasks.length === interactionTasks.length &&
+				currentInteractionTasks.every((task) => interactionTasks.includes(task))
+			) {
+				return;
+			}
+		}
 	}
 
 	focusComposer(): void {
@@ -586,12 +613,40 @@ export class OpenTUIInteractiveMode {
 	}
 
 	private queueSessionEvent(runtime: AgentSessionRuntime, event: AgentSessionEvent, generation: number): void {
+		const updateKey =
+			event.type === "message_update"
+				? `${generation}:message`
+				: event.type === "tool_execution_update"
+					? `${generation}:tool:${event.toolCallId}`
+					: undefined;
+		if (updateKey) {
+			const pending = this.pendingSessionUpdates.get(updateKey);
+			if (pending) {
+				pending.runtime = runtime;
+				pending.event = event;
+				pending.generation = generation;
+				return;
+			}
+		} else {
+			// Boundary events must remain between updates that occurred on either side.
+			this.pendingSessionUpdates.clear();
+		}
+
+		const pending = { runtime, event, generation } satisfies PendingSessionUpdate;
+		if (updateKey) this.pendingSessionUpdates.set(updateKey, pending);
 		this.eventTail = this.eventTail
-			.then(async () => this.handleSessionEvent(runtime, event, generation))
+			.then(async () => {
+				if (updateKey) await this.waitForStreamUpdateFrame();
+				if (updateKey && this.pendingSessionUpdates.get(updateKey) === pending) {
+					this.pendingSessionUpdates.delete(updateKey);
+				}
+				await this.handleSessionEvent(pending.runtime, pending.event, pending.generation);
+			})
 			.catch((error: unknown) => this.showInteractionError(error));
 	}
 
 	private async unbindForeground(runtime?: AgentSessionRuntime): Promise<void> {
+		this.pendingSessionUpdates.clear();
 		if (runtime && this.composer && this.shell) {
 			const state = {
 				draft: this.composer.value,
@@ -723,6 +778,7 @@ export class OpenTUIInteractiveMode {
 		state.loading = true;
 
 		const generation = this.foregroundGeneration;
+		this.pendingSessionUpdates.clear();
 		const loadTask = this.eventTail.then(async () => {
 			if (!this.shell || !this.isCurrentForeground(runtime, generation)) return;
 			const transcript = this.shell.getTranscriptNode();
@@ -768,6 +824,7 @@ export class OpenTUIInteractiveMode {
 			// Serialize the destructive transcript replacement with live event handling.
 			// Events arriving after this task is queued are appended behind it by
 			// queueSessionEvent and therefore apply to the new transcript factory.
+			this.pendingSessionUpdates.clear();
 			const refreshTask = this.eventTail.then(async () => {
 				if (!this.shell || target !== this.sessionHost.current || this.stopping) return;
 				const transcript = this.shell.getTranscriptNode();
