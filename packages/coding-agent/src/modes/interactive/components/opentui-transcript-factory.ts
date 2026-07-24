@@ -14,9 +14,11 @@ import {
 	createCustomMessage,
 } from "../../../core/messages.ts";
 import type { SessionEntry } from "../../../core/session-manager.ts";
+import { OpenTUIClickCoordinator } from "./opentui-click.ts";
 import { decodeOpenTUIImages, OpenTUIImageAttachments } from "./opentui-image.ts";
 import {
 	hasVisibleOpenTUIAssistantContent,
+	isOpenTUICommentaryText,
 	OpenTUIAssistantMessage,
 	OpenTUIPlanProposal,
 	OpenTUIUserMessage,
@@ -77,6 +79,7 @@ class OpenTUIStructuredToolExecution {
 	private readonly getRenderer: () => ExtensionUIToolViewRenderer | undefined;
 	private readonly onError: ((error: unknown, surface: string) => void) | undefined;
 	private readonly fallback: OpenTUIToolExecution;
+	private readonly clicks = new OpenTUIClickCoordinator();
 	private readonly state: Record<string, unknown> = {};
 	private args: unknown;
 	private result: ToolResultMessage | undefined;
@@ -102,6 +105,9 @@ class OpenTUIStructuredToolExecution {
 		this.getRenderer = getRenderer;
 		this.onError = onError;
 		this.root = new BoxRenderable(renderer, { flexDirection: "column" });
+		this.root.onMouse = (event) => {
+			if (this.clicks.handle(event) && event.type === "down") this.renderer.clearSelection();
+		};
 		this.fallback = new OpenTUIToolExecution(renderer, toolName, toolCallId, args);
 	}
 
@@ -200,6 +206,9 @@ class OpenTUIStructuredToolExecution {
 			this.currentView.destroyRecursively();
 		}
 		this.currentView = resolvedView;
+		if (resolvedView !== this.fallback.root) {
+			this.clicks.register(resolvedView, () => this.setExpanded(!this.expanded));
+		}
 		this.root.add(this.currentView);
 	}
 }
@@ -215,6 +224,16 @@ function textFromContent(content: unknown): string {
 		.filter((part): part is { type: "text"; text: string } => part?.type === "text" && typeof part.text === "string")
 		.map((part) => part.text)
 		.join("\n");
+}
+
+function commentaryFromMessage(message: AssistantMessage): string | undefined {
+	const commentary = message.content
+		.filter((part): part is Extract<(typeof message.content)[number], { type: "text" }> => part.type === "text")
+		.filter(isOpenTUICommentaryText)
+		.map((part) => part.text.trim())
+		.filter(Boolean)
+		.join(" ");
+	return commentary || undefined;
 }
 
 function keyForMessage(message: AgentMessage): string {
@@ -252,7 +271,7 @@ export class OpenTUITranscriptFactory {
 	private readonly toolUpdateGeneration = new Map<string, number>();
 	private readonly toolGroups = new Set<OpenTUIWorkingGroup>();
 	private readonly toolGroupByCall = new Map<string, { key: string; view: OpenTUIWorkingGroup }>();
-	private activeToolGroup: { key: string; view: OpenTUIWorkingGroup } | undefined;
+	private activeToolGroup: { key: string; view: OpenTUIWorkingGroup; appended: boolean } | undefined;
 	private toolGroupSequence = 0;
 	private expandAllToolDetails = false;
 
@@ -279,7 +298,7 @@ export class OpenTUITranscriptFactory {
 
 	setAllToolDetailsExpanded(expanded: boolean): void {
 		this.expandAllToolDetails = expanded;
-		for (const group of this.toolGroups) group.setExpanded(expanded);
+		for (const group of this.toolGroups) group.setToolDetailsExpanded(expanded);
 	}
 
 	/** Drop runtime bookkeeping when the factory is no longer associated with a session. */
@@ -300,8 +319,9 @@ export class OpenTUITranscriptFactory {
 		let replayGroup: { key: string; view: OpenTUIWorkingGroup; clock: { completedAt: number } } | undefined;
 		const flushGroup = (): void => {
 			if (!replayGroup) return;
+			replayGroup.view.finish();
 			this.toolGroups.add(replayGroup.view);
-			if (this.expandAllToolDetails) replayGroup.view.setExpanded(true);
+			if (this.expandAllToolDetails) replayGroup.view.setToolDetailsExpanded(true);
 			items.push({ key: replayGroup.key, root: replayGroup.view.root });
 			replayGroup = undefined;
 			pendingSequence = undefined;
@@ -463,23 +483,47 @@ export class OpenTUITranscriptFactory {
 
 	async handleEvent(event: AgentSessionEvent): Promise<OpenTUITranscriptMutation> {
 		switch (event.type) {
+			case "agent_start": {
+				if (this.activeToolGroup && !this.activeToolGroup.view.isComplete()) {
+					this.activeToolGroup.view.setActivity("Working");
+					return { type: "updated", key: this.activeToolGroup.key, root: this.activeToolGroup.view.root };
+				}
+				const group = new OpenTUIWorkingGroup(this.renderer, this.options.now(), this.options.now);
+				group.waitForAgentEnd();
+				this.activeToolGroup = {
+					key: `working-group:${++this.toolGroupSequence}`,
+					view: group,
+					appended: false,
+				};
+				this.toolGroups.add(group);
+				return { type: "ignored" };
+			}
 			case "message_start":
 				if (event.message.role === "toolResult" && this.completedLiveTools.delete(event.message.toolCallId)) {
 					return { type: "ignored" };
 				}
 				if (event.message.role === "assistant") {
-					if (this.hasVisibleAssistantContent(event.message)) this.activeToolGroup = undefined;
+					this.activeToolGroup?.view.setActivity(commentaryFromMessage(event.message));
 					this.rememberToolArgs(event.message);
 					const key = keyForMessage(event.message);
 					const view = this.createAssistant(event.message);
 					this.streamingAssistant = { key, view };
+					if (this.activeToolGroup && !this.activeToolGroup.appended) {
+						this.activeToolGroup.appended = true;
+						return {
+							type: "append",
+							item: {
+								key: this.activeToolGroup.key,
+								root: new OpenTUIGroupedView(this.renderer, [this.activeToolGroup.view.root, view.root]).root,
+							},
+						};
+					}
 					return { type: "append", item: { key, root: view.root } };
 				}
-				this.activeToolGroup = undefined;
 				return this.appendMessage(await this.createMessage(event.message));
 			case "message_update":
 				if (event.message.role !== "assistant" || !this.streamingAssistant) return { type: "ignored" };
-				if (this.hasVisibleAssistantContent(event.message)) this.activeToolGroup = undefined;
+				this.activeToolGroup?.view.setActivity(commentaryFromMessage(event.message));
 				this.rememberToolArgs(event.message);
 				this.streamingAssistant.view.updateContent(event.message);
 				return {
@@ -488,8 +532,15 @@ export class OpenTUITranscriptFactory {
 					root: this.streamingAssistant.view.root,
 				};
 			case "message_end":
+				if (event.message.role === "user" && this.activeToolGroup && !this.activeToolGroup.appended) {
+					this.activeToolGroup.appended = true;
+					return {
+						type: "append",
+						item: { key: this.activeToolGroup.key, root: this.activeToolGroup.view.root },
+					};
+				}
 				if (event.message.role === "assistant" && this.streamingAssistant) {
-					if (this.hasVisibleAssistantContent(event.message)) this.activeToolGroup = undefined;
+					this.activeToolGroup?.view.setActivity(commentaryFromMessage(event.message));
 					this.rememberToolArgs(event.message);
 					this.streamingAssistant.view.updateContent(event.message);
 					if (event.message.stopReason === "aborted" || event.message.stopReason === "error") {
@@ -509,6 +560,7 @@ export class OpenTUITranscriptFactory {
 					? this.appendMessage(await this.createSessionEntry(event.entry))
 					: { type: "ignored" };
 			case "tool_execution_start": {
+				if (this.activeToolGroup?.view.isComplete()) this.activeToolGroup = undefined;
 				const existing = this.pendingTools.get(event.toolCallId);
 				if (existing) {
 					existing.updateArgs(event.args);
@@ -524,11 +576,15 @@ export class OpenTUITranscriptFactory {
 				const isNewGroup = !this.activeToolGroup;
 				if (!this.activeToolGroup) {
 					const group = new OpenTUIWorkingGroup(this.renderer, this.options.now(), this.options.now);
-					this.activeToolGroup = { key: `working-group:${++this.toolGroupSequence}`, view: group };
+					this.activeToolGroup = {
+						key: `working-group:${++this.toolGroupSequence}`,
+						view: group,
+						appended: true,
+					};
 					this.toolGroups.add(group);
 				}
 				this.activeToolGroup.view.addTool(event.toolCallId, view);
-				if (this.expandAllToolDetails) this.activeToolGroup.view.setExpanded(true);
+				if (this.expandAllToolDetails) this.activeToolGroup.view.setToolDetailsExpanded(true);
 				this.toolGroupByCall.set(event.toolCallId, this.activeToolGroup);
 				return isNewGroup
 					? { type: "append", item: { key: this.activeToolGroup.key, root: this.activeToolGroup.view.root } }
@@ -545,22 +601,37 @@ export class OpenTUITranscriptFactory {
 				this.pendingTools.delete(event.toolCallId);
 				const group = this.toolGroupByCall.get(event.toolCallId)?.view;
 				group?.markToolComplete(event.toolCallId, event.isError);
-				if (group && this.expandAllToolDetails) group.setExpanded(true);
+				if (group && this.expandAllToolDetails) group.setToolDetailsExpanded(true);
 				this.toolGroupByCall.delete(event.toolCallId);
 				this.toolArgs.delete(event.toolCallId);
 				this.toolUpdateGeneration.delete(event.toolCallId);
 				if (wasPending) this.completedLiveTools.add(event.toolCallId);
 				return updated;
 			}
-			case "agent_end":
+			case "auto_retry_start":
+				if (!this.activeToolGroup) return { type: "ignored" };
+				this.activeToolGroup.view.setActivity(`Retrying · ${event.attempt}/${event.maxAttempts}`);
+				return { type: "updated", key: this.activeToolGroup.key, root: this.activeToolGroup.view.root };
+			case "agent_end": {
 				this.failPendingTools("Tool execution ended before producing a result");
 				this.streamingAssistant = undefined;
 				this.pendingTools.clear();
 				this.completedLiveTools.clear();
 				this.toolUpdateGeneration.clear();
 				this.toolGroupByCall.clear();
+				const group = this.activeToolGroup;
+				if (!group) return { type: "ignored" };
+				if (event.willRetry) {
+					group.view.setActivity("Retrying");
+					return { type: "updated", key: group.key, root: group.view.root };
+				}
+				const failed = event.messages.some(
+					(message) => message.role === "assistant" && message.stopReason === "error",
+				);
+				group.view.finish(failed);
 				this.activeToolGroup = undefined;
-				return { type: "ignored" };
+				return { type: "updated", key: group.key, root: group.view.root };
+			}
 			default:
 				return { type: "ignored" };
 		}
@@ -603,6 +674,7 @@ export class OpenTUITranscriptFactory {
 		view.setArgsComplete();
 		view.markExecutionStarted();
 		view.updateResult(message, false, await this.decodeImages(message.content));
+		if (this.expandAllToolDetails) view.setExpanded(true);
 		return view;
 	}
 

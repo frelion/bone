@@ -3,7 +3,9 @@ import {
 	BoxRenderable,
 	type CliRenderer,
 	DiffRenderable,
+	fg,
 	MarkdownRenderable,
+	StyledText,
 	SyntaxStyle,
 	TextAttributes,
 	TextRenderable,
@@ -17,6 +19,7 @@ import type {
 } from "../../../core/messages.ts";
 import { stripAnsi } from "../../../utils/ansi.ts";
 import { type Theme, theme } from "../theme/theme.ts";
+import { OpenTUIClickCoordinator } from "./opentui-click.ts";
 import { OpenTUIRgbaImage } from "./opentui-image.ts";
 
 const PREVIEW_LINES = 20;
@@ -158,12 +161,17 @@ export class OpenTUIToolExecution extends RebuildableView {
 	private viewTheme: Theme;
 	private readonly body: BoxRenderable;
 	private readonly titleNode: TextRenderable;
+	private readonly detailsRoot: BoxRenderable;
 	private readonly argsNode: TextRenderable;
 	private readonly outputRoot: BoxRenderable;
 	private readonly attachmentsRoot: BoxRenderable;
 	private readonly hiddenNode: TextRenderable;
 	private outputNode: TextRenderable | DiffRenderable | undefined;
 	private renderedAttachments: readonly OpenTUIImageAttachment[] = [];
+	private readonly clicks = new OpenTUIClickCoordinator();
+	private detailProgress: number;
+	private detailTarget: number;
+	private detailAnimationTimer: ReturnType<typeof setInterval> | undefined;
 
 	constructor(
 		renderer: CliRenderer,
@@ -177,19 +185,34 @@ export class OpenTUIToolExecution extends RebuildableView {
 		this.toolCallId = toolCallId;
 		this.args = args;
 		this.expanded = options.expanded ?? false;
+		this.detailProgress = this.expanded ? 1 : 0;
+		this.detailTarget = this.detailProgress;
 		this.viewTheme = options.theme ?? theme;
+		this.root.onMouse = (event) => {
+			if (this.clicks.handle(event) && event.type === "down") this.renderer.clearSelection();
+		};
 		this.root.add(new BoxRenderable(renderer, { width: "100%", height: 1 }));
 		this.body = new BoxRenderable(renderer, { flexDirection: "column", paddingX: 1, paddingY: 1 });
-		this.titleNode = new TextRenderable(renderer, { content: "", attributes: TextAttributes.BOLD });
+		this.titleNode = new TextRenderable(renderer, {
+			content: "",
+			attributes: TextAttributes.BOLD,
+		});
+		this.clicks.register(this.titleNode, () => this.setExpanded(!this.expanded));
+		this.detailsRoot = new BoxRenderable(renderer, {
+			flexDirection: "column",
+			visible: this.expanded,
+			opacity: this.detailProgress,
+		});
 		this.argsNode = new TextRenderable(renderer, { content: "", wrapMode: "word" });
 		this.outputRoot = new BoxRenderable(renderer, { flexDirection: "column" });
 		this.attachmentsRoot = new BoxRenderable(renderer, { flexDirection: "column" });
 		this.hiddenNode = new TextRenderable(renderer, { content: "", attributes: TextAttributes.DIM });
 		this.body.add(this.titleNode);
-		this.body.add(this.argsNode);
-		this.body.add(this.outputRoot);
-		this.body.add(this.attachmentsRoot);
-		this.body.add(this.hiddenNode);
+		this.detailsRoot.add(this.argsNode);
+		this.detailsRoot.add(this.outputRoot);
+		this.detailsRoot.add(this.attachmentsRoot);
+		this.detailsRoot.add(this.hiddenNode);
+		this.body.add(this.detailsRoot);
 		this.root.add(this.body);
 		this.rebuild();
 	}
@@ -218,8 +241,13 @@ export class OpenTUIToolExecution extends RebuildableView {
 	}
 
 	setExpanded(expanded: boolean): void {
+		if (this.expanded === expanded && this.detailTarget === (expanded ? 1 : 0)) return;
 		this.expanded = expanded;
+		this.detailTarget = expanded ? 1 : 0;
+		if (expanded) this.detailsRoot.visible = true;
 		this.rebuild();
+		this.advanceDetailAnimation();
+		this.startDetailAnimation();
 	}
 
 	getActivityKind(): OpenTUIToolActivityKind {
@@ -257,6 +285,7 @@ export class OpenTUIToolExecution extends RebuildableView {
 			this.outputRoot.visible = false;
 			this.attachmentsRoot.visible = false;
 			this.hiddenNode.visible = false;
+			this.applyDetailAnimation();
 			return;
 		}
 		const resultContent = textContent(this.result.content);
@@ -302,6 +331,34 @@ export class OpenTUIToolExecution extends RebuildableView {
 		this.hiddenNode.content = output.hiddenLines > 0 && !diff ? `${output.hiddenLines} earlier lines hidden` : "";
 		this.hiddenNode.fg = this.viewTheme.getFgColor("muted");
 		this.hiddenNode.visible = Boolean(this.hiddenNode.content);
+		this.applyDetailAnimation();
+	}
+
+	private startDetailAnimation(): void {
+		if (this.detailAnimationTimer || this.detailProgress === this.detailTarget) return;
+		this.detailAnimationTimer = setInterval(() => this.advanceDetailAnimation(), 40);
+		(this.detailAnimationTimer as { unref?: () => void }).unref?.();
+	}
+
+	private advanceDetailAnimation(): void {
+		if (this.root.isDestroyed) {
+			if (this.detailAnimationTimer) clearInterval(this.detailAnimationTimer);
+			this.detailAnimationTimer = undefined;
+			return;
+		}
+		const direction = this.detailTarget > this.detailProgress ? 1 : -1;
+		this.detailProgress = Math.max(0, Math.min(1, this.detailProgress + direction * 0.25));
+		this.applyDetailAnimation();
+		this.renderer.requestRender();
+		if (this.detailProgress === this.detailTarget && this.detailAnimationTimer) {
+			clearInterval(this.detailAnimationTimer);
+			this.detailAnimationTimer = undefined;
+		}
+	}
+
+	private applyDetailAnimation(): void {
+		this.detailsRoot.opacity = this.detailProgress;
+		this.detailsRoot.visible = this.detailProgress > 0;
 	}
 }
 
@@ -354,22 +411,52 @@ export class OpenTUIWorkingGroup extends RebuildableView {
 	private readonly now: () => number;
 	private readonly entries: WorkingGroupEntry[] = [];
 	private readonly viewTheme: Theme;
-	private expanded = true;
+	private readonly header: BoxRenderable;
+	private readonly summaryNode: TextRenderable;
+	private readonly detailsRoot: BoxRenderable;
+	private expanded = false;
 	private completedAt: number | undefined;
+	private activityMessage: string | undefined;
+	private frame = 0;
+	private readonly clicks = new OpenTUIClickCoordinator();
+	private detailProgress = 0;
+	private detailTarget = 0;
+	private animationTimer: ReturnType<typeof setInterval> | undefined;
+	private completeWithTools = true;
+	private failed = false;
 
 	constructor(renderer: CliRenderer, startedAt = Date.now(), now: () => number = Date.now, viewTheme: Theme = theme) {
 		super(renderer);
 		this.startedAt = startedAt;
 		this.now = now;
 		this.viewTheme = viewTheme;
+		this.root.onMouse = (event) => {
+			if (this.clicks.handle(event) && event.type === "down") this.renderer.clearSelection();
+		};
+		this.root.add(new BoxRenderable(renderer, { width: "100%", height: 1 }));
+		this.header = new BoxRenderable(renderer, {
+			flexDirection: "column",
+			paddingX: 1,
+		});
+		this.clicks.register(this.header, () => this.toggleExpanded());
+		this.summaryNode = new TextRenderable(renderer, { content: "" });
+		this.header.add(this.summaryNode);
+		this.detailsRoot = new BoxRenderable(renderer, { flexDirection: "column", visible: false, opacity: 0 });
+		this.root.add(this.header);
+		this.root.add(this.detailsRoot);
 		this.rebuild();
+		this.startAnimation();
 	}
 
 	addTool(id: string, view: OpenTUIWorkingGroupTool): void {
 		if (this.entries.some((entry) => entry.id === id)) return;
+		if (this.completeWithTools && this.completedAt !== undefined) {
+			this.completedAt = undefined;
+			this.startAnimation();
+		}
 		this.entries.push({ id, view, complete: false, failed: false });
-		this.expanded = true;
-		this.completedAt = undefined;
+		view.root.visible = false;
+		this.detailsRoot.add(view.root);
 		this.rebuild();
 	}
 
@@ -378,16 +465,49 @@ export class OpenTUIWorkingGroup extends RebuildableView {
 		if (!entry) return;
 		entry.complete = true;
 		entry.failed = failed;
-		if (this.entries.every((candidate) => candidate.complete)) {
-			this.completedAt = this.now();
-			this.expanded = this.entries.some((candidate) => candidate.failed);
+		if (failed) {
+			entry.view.setExpanded(true);
+			this.setExpanded(true);
 		}
+		if (this.completeWithTools && this.entries.every((candidate) => candidate.complete)) this.finish(failed);
+		this.rebuild();
+	}
+
+	waitForAgentEnd(): void {
+		this.completeWithTools = false;
+	}
+
+	setActivity(message: string | undefined): void {
+		const normalized = message?.replace(/\s+/g, " ").trim().slice(0, 140);
+		this.activityMessage = normalized || undefined;
+		this.rebuild();
+	}
+
+	finish(failed = false): void {
+		this.failed ||= failed;
+		if (this.completedAt !== undefined) {
+			this.rebuild();
+			return;
+		}
+		this.completedAt = this.now();
+		if (this.failed || this.entries.some((entry) => entry.failed)) this.setExpanded(true);
+		else this.setExpanded(false);
 		this.rebuild();
 	}
 
 	setExpanded(expanded: boolean): void {
+		if (this.expanded === expanded && this.detailTarget === (expanded ? 1 : 0)) return;
 		this.expanded = expanded;
+		this.detailTarget = expanded ? 1 : 0;
+		if (expanded) this.detailsRoot.visible = true;
 		this.rebuild();
+		this.advanceAnimation();
+		this.startAnimation();
+	}
+
+	setToolDetailsExpanded(expanded: boolean): void {
+		this.setExpanded(expanded);
+		for (const entry of this.entries) entry.view.setExpanded(expanded);
 	}
 
 	toggleExpanded(): void {
@@ -400,43 +520,68 @@ export class OpenTUIWorkingGroup extends RebuildableView {
 
 	protected rebuild(): void {
 		if (this.root.isDestroyed) return;
-		const entryRoots = new Set<unknown>(this.entries.map((entry) => entry.view.root));
-		for (const child of this.root.getChildren()) {
-			this.root.remove(child);
-			if (!entryRoots.has(child)) child.destroyRecursively();
-		}
-		this.root.add(new BoxRenderable(this.renderer, { width: "100%", height: 1 }));
-		const failed = this.entries.some((entry) => entry.failed);
-		const header = new BoxRenderable(this.renderer, {
-			flexDirection: "column",
-			paddingX: 1,
-			onMouseDown: (event) => {
-				if (event.button !== 0) return;
-				event.preventDefault();
-				event.stopPropagation();
-				this.toggleExpanded();
-			},
-		});
+		const failed = this.failed || this.entries.some((entry) => entry.failed);
 		const count = this.entries.length;
 		const elapsedSeconds = Math.max(1, Math.round(((this.completedAt ?? this.now()) - this.startedAt) / 1000));
 		const toolCount = `${count} tool ${count === 1 ? "call" : "calls"}`;
-		const activity = workingGroupActivity(this.entries, this.completedAt !== undefined, failed);
-		const summary = this.completedAt
-			? `${failed ? "✗" : "✓"} ${activity} · ${elapsedSeconds}s · ${toolCount}`
-			: `◐ ${activity} · ${toolCount}`;
-		header.add(
-			new TextRenderable(this.renderer, {
-				content: `${this.expanded ? "⌄" : "›"} ${summary}`,
-				fg: this.viewTheme.getFgColor(failed ? "error" : this.completedAt ? "muted" : "accent"),
-				attributes: this.completedAt ? TextAttributes.NONE : TextAttributes.BOLD,
-			}),
-		);
-		this.root.add(header);
-		if (!this.expanded) return;
-		for (const entry of this.entries) {
-			entry.view.setExpanded(true);
-			this.root.add(entry.view.root);
+		const activity =
+			this.completedAt !== undefined && failed
+				? workingGroupActivity(this.entries, true, true)
+				: (this.activityMessage ?? workingGroupActivity(this.entries, this.completedAt !== undefined, failed));
+		const suffix = count > 0 ? ` · ${toolCount}` : "";
+		if (this.completedAt !== undefined) {
+			this.summaryNode.content = `${this.expanded ? "⌄" : "›"} ${failed ? "✗" : "✓"} ${activity} · ${elapsedSeconds}s${suffix}`;
+			this.summaryNode.fg = this.viewTheme.getFgColor(failed ? "error" : "muted");
+			this.summaryNode.attributes = TextAttributes.NONE;
+		} else {
+			const prefix = `${this.expanded ? "⌄" : "›"} ${["◐", "◓", "◑", "◒"][this.frame % 4]} `;
+			const highlight = this.frame % Math.max(1, activity.length + 4);
+			const chunks = [fg(this.viewTheme.getFgColor("muted"))(prefix)];
+			for (let index = 0; index < activity.length; index++) {
+				chunks.push(
+					fg(this.viewTheme.getFgColor(Math.abs(index - highlight) <= 1 ? "accent" : "toolTitle"))(
+						activity[index] ?? "",
+					),
+				);
+			}
+			if (suffix) chunks.push(fg(this.viewTheme.getFgColor("muted"))(suffix));
+			this.summaryNode.content = new StyledText(chunks);
+			this.summaryNode.attributes = TextAttributes.BOLD;
 		}
+		this.applyDetailAnimation();
+	}
+
+	private startAnimation(): void {
+		if (this.animationTimer) return;
+		if (this.completedAt !== undefined && this.detailProgress === this.detailTarget) return;
+		this.animationTimer = setInterval(() => this.advanceAnimation(), 60);
+		(this.animationTimer as { unref?: () => void }).unref?.();
+	}
+
+	private advanceAnimation(): void {
+		if (this.root.isDestroyed) {
+			if (this.animationTimer) clearInterval(this.animationTimer);
+			this.animationTimer = undefined;
+			return;
+		}
+		this.frame++;
+		if (this.detailProgress !== this.detailTarget) {
+			const direction = this.detailTarget > this.detailProgress ? 1 : -1;
+			this.detailProgress = Math.max(0, Math.min(1, this.detailProgress + direction * 0.25));
+		}
+		this.rebuild();
+		this.renderer.requestRender();
+		if (this.completedAt !== undefined && this.detailProgress === this.detailTarget && this.animationTimer) {
+			clearInterval(this.animationTimer);
+			this.animationTimer = undefined;
+		}
+	}
+
+	private applyDetailAnimation(): void {
+		this.detailsRoot.opacity = this.detailProgress;
+		this.detailsRoot.visible = this.detailProgress > 0;
+		const visibleCount = Math.ceil(this.entries.length * this.detailProgress);
+		for (const [index, entry] of this.entries.entries()) entry.view.root.visible = index < visibleCount;
 	}
 }
 

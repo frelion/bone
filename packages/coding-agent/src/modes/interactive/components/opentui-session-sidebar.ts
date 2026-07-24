@@ -2,7 +2,6 @@ import {
 	BoxRenderable,
 	type CliRenderer,
 	type KeyEvent,
-	type MouseEvent,
 	ScrollBoxRenderable,
 	TextAttributes,
 	TextareaRenderable,
@@ -14,6 +13,7 @@ import { OPEN_TUI_COLORS, OPEN_TUI_LAYOUT } from "../opentui-design.ts";
 import { matchesOpenTUIAction } from "../opentui-keymap.ts";
 import { type Theme, type ThemeColor, theme } from "../theme/theme.ts";
 import { formatConversationActivityTime } from "./conversation-time.ts";
+import { OpenTUIClickCoordinator } from "./opentui-click.ts";
 
 const STATE_ICON: Record<InteractiveSessionSummary["state"], string> = {
 	foreground: "●",
@@ -61,17 +61,11 @@ function sortByActivity(sessions: readonly InteractiveSessionSummary[]): Interac
 		.map(({ session }) => session);
 }
 
-function formatThroughput(tokensPerSecond: number | undefined): string {
-	if (tokensPerSecond === undefined || !Number.isFinite(tokensPerSecond)) return "";
-	return `${tokensPerSecond.toFixed(1)} tok/s`;
-}
-
 interface SessionRowRecord {
 	row: BoxRenderable;
 	stateNode: TextRenderable;
 	titleNode: TextRenderable;
 	previewNode: TextRenderable;
-	throughputNode: TextRenderable | undefined;
 	metadataNode: TextRenderable;
 }
 
@@ -94,6 +88,7 @@ export class OpenTUISessionSidebar {
 	private searchStatusNode: TextRenderable | undefined;
 	private focused = false;
 	private frozenOrder: string[] | undefined;
+	private readonly clicks = new OpenTUIClickCoordinator();
 	private readonly rowRecords = new Map<string, SessionRowRecord>();
 	private renderedPaths: string[] = [];
 
@@ -117,7 +112,13 @@ export class OpenTUISessionSidebar {
 			height: "100%",
 			flexDirection: "column",
 			focusable: true,
-			onMouseDown: () => this.onFocusRequest?.(),
+			onMouse: (event) => {
+				const clickHandled = this.clicks.handle(event);
+				if (event.type === "down" && event.button === 0) {
+					if (clickHandled) this.renderer.clearSelection();
+					else this.onFocusRequest?.();
+				}
+			},
 		});
 		this.list = new ScrollBoxRenderable(renderer, { width: "100%", flexGrow: 1, minHeight: 0, scrollY: true });
 		this.rebuildChrome();
@@ -439,6 +440,7 @@ export class OpenTUISessionSidebar {
 		if (list.isDestroyed) return;
 		const sessions = this.getDisplayedSessions();
 		if (this.updateStableRows(sessions)) return;
+		this.clicks.reset();
 		clearChildren(list);
 		this.rowRecords.clear();
 		this.renderedPaths = sessions.map((session) => session.path);
@@ -461,11 +463,9 @@ export class OpenTUISessionSidebar {
 				this.itemState.kind === "status" && this.itemState.path === session.path ? this.itemState : undefined;
 			const foreground = session.state === "foreground";
 			const selectedText = selected ? OPEN_TUI_COLORS.selectionText : undefined;
-			const activateFromMouse = (event: MouseEvent) => {
+			const activateFromMouse = () => {
 				this.selectedIndex = index;
 				this.selectedPath = session.path;
-				event.preventDefault();
-				event.stopPropagation();
 				if (this.searchActive) this.stopSearch();
 				this.activateSession(session.path);
 			};
@@ -478,8 +478,8 @@ export class OpenTUISessionSidebar {
 					: selected
 						? OPEN_TUI_COLORS.selection
 						: undefined,
-				onMouseDown: activateFromMouse,
 			});
+			this.clicks.register(row, activateFromMouse);
 			const foregroundText = foreground ? OPEN_TUI_COLORS.primaryText : selectedText;
 			const titleRow = new BoxRenderable(this.renderer, {
 				width: "100%",
@@ -487,13 +487,11 @@ export class OpenTUISessionSidebar {
 				flexDirection: "row",
 				gap: 1,
 				paddingLeft: 1,
-				onMouseDown: activateFromMouse,
 			});
 			const stateNode = new TextRenderable(this.renderer, {
 				content: STATE_ICON[session.state],
 				fg: foregroundText ?? this.sidebarTheme.getFgColor(confirming ? "error" : stateColor(session.state)),
 				flexShrink: 0,
-				onMouseDown: activateFromMouse,
 			});
 			titleRow.add(stateNode);
 			const title = normalizePreview(session.name ?? session.firstMessage) || "(empty conversation)";
@@ -506,7 +504,6 @@ export class OpenTUISessionSidebar {
 				truncate: true,
 				flexGrow: 1,
 				minWidth: 0,
-				onMouseDown: activateFromMouse,
 			});
 			titleRow.add(titleNode);
 			row.add(titleRow);
@@ -517,7 +514,6 @@ export class OpenTUISessionSidebar {
 				flexDirection: "row",
 				paddingLeft: 1,
 				paddingRight: 1,
-				onMouseDown: activateFromMouse,
 			});
 			let previewNode: TextRenderable;
 			if (confirming) {
@@ -527,7 +523,6 @@ export class OpenTUISessionSidebar {
 					truncate: true,
 					flexGrow: 1,
 					minWidth: 0,
-					onMouseDown: activateFromMouse,
 				});
 				previewRow.add(previewNode);
 			} else if (status) {
@@ -537,16 +532,13 @@ export class OpenTUISessionSidebar {
 					truncate: true,
 					flexGrow: 1,
 					minWidth: 0,
-					onMouseDown: activateFromMouse,
 				});
 				previewRow.add(previewNode);
 			} else {
 				const result = this.searchResults?.find((candidate) => candidate.sessionPath === session.path);
 				const titleEvidence = result?.evidence.kind === "title";
 				const preview = normalizePreview(
-					titleEvidence
-						? (session.livePreview ?? session.lastMessage ?? "")
-						: (result?.evidence.snippet ?? session.livePreview ?? session.lastMessage ?? ""),
+					titleEvidence ? (session.lastMessage ?? "") : (result?.evidence.snippet ?? session.lastMessage ?? ""),
 				);
 				const previewText = preview || (titleEvidence ? "Title match" : "No messages yet");
 				previewNode = new TextRenderable(this.renderer, {
@@ -555,26 +547,8 @@ export class OpenTUISessionSidebar {
 					truncate: true,
 					flexGrow: 1,
 					minWidth: 0,
-					onMouseDown: activateFromMouse,
 				});
 				previewRow.add(previewNode);
-			}
-			let throughputNode: TextRenderable | undefined;
-			if (
-				!confirming &&
-				!status &&
-				session.state === "background-running" &&
-				session.throughputTokensPerSecond !== undefined
-			) {
-				throughputNode = new TextRenderable(this.renderer, {
-					content: formatThroughput(session.throughputTokensPerSecond).padStart(11),
-					width: 11,
-					fg: foregroundText ?? this.sidebarTheme.getFgColor("dim"),
-					truncate: true,
-					flexShrink: 0,
-					onMouseDown: activateFromMouse,
-				});
-				previewRow.add(throughputNode);
 			}
 			row.add(previewRow);
 			const metadataNode = new TextRenderable(this.renderer, {
@@ -584,7 +558,6 @@ export class OpenTUISessionSidebar {
 				paddingRight: 1,
 				fg: foregroundText ?? this.sidebarTheme.getFgColor("dim"),
 				truncate: true,
-				onMouseDown: activateFromMouse,
 			});
 			row.add(metadataNode);
 			this.rowRecords.set(session.path, {
@@ -592,7 +565,6 @@ export class OpenTUISessionSidebar {
 				stateNode,
 				titleNode,
 				previewNode,
-				throughputNode,
 				metadataNode,
 			});
 			list.add(row);
@@ -617,11 +589,6 @@ export class OpenTUISessionSidebar {
 			if (this.renderedPaths[index] !== session.path) return false;
 			const record = this.rowRecords.get(session.path);
 			if (!record) return false;
-			if (
-				Boolean(record.throughputNode) !==
-				(session.state === "background-running" && session.throughputTokensPerSecond !== undefined)
-			)
-				return false;
 		}
 
 		for (let index = 0; index < sessions.length; index++) {
@@ -645,14 +612,10 @@ export class OpenTUISessionSidebar {
 			record.titleNode.fg = foregroundText ?? this.sidebarTheme.getFgColor("text");
 			record.titleNode.attributes = foreground || selected ? TextAttributes.BOLD : TextAttributes.NONE;
 
-			const preview = normalizePreview(session.livePreview ?? session.lastMessage ?? "");
+			const preview = normalizePreview(session.lastMessage ?? "");
 			const previewText = preview || "No messages yet";
 			record.previewNode.content = previewText;
 			record.previewNode.fg = foregroundText ?? this.sidebarTheme.getFgColor(preview ? "muted" : "dim");
-			if (record.throughputNode) {
-				record.throughputNode.content = formatThroughput(session.throughputTokensPerSecond).padStart(11);
-				record.throughputNode.fg = foregroundText ?? this.sidebarTheme.getFgColor("dim");
-			}
 			record.metadataNode.content = `${session.messageCount} msg${session.messageCount === 1 ? "" : "s"} · ${formatConversationActivityTime(session.modified)}`;
 			record.metadataNode.fg = foregroundText ?? this.sidebarTheme.getFgColor("dim");
 		}

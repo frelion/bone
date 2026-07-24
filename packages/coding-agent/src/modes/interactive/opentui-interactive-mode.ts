@@ -19,6 +19,7 @@ import type { PlanProposal } from "../../core/plan-mode.ts";
 import type { QuestionAnswer, QuestionRequest } from "../../core/question.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { OpenTUITopBar, OpenTUIWelcome } from "./components/opentui-chrome.ts";
+import { OpenTUIClickCoordinator } from "./components/opentui-click.ts";
 import { OpenTUIComposer, type OpenTUIComposerStatus } from "./components/opentui-composer.ts";
 import { OpenTUIStatusView } from "./components/opentui-rich-messages.ts";
 import { OpenTUISessionSidebar } from "./components/opentui-session-sidebar.ts";
@@ -156,6 +157,7 @@ export class OpenTUIInteractiveMode {
 	private readonly sessionHost: OpenTUISessionHostContract;
 	private readonly options: OpenTUIInteractiveModeOptions;
 	private readonly waitForStreamUpdateFrame: () => Promise<void>;
+	private readonly clicks = new OpenTUIClickCoordinator();
 	private transcriptFactory!: OpenTUITranscriptFactory;
 	private readonly commandRouter: OpenTUICommandRouter;
 	private readonly memory: OpenTUIMemoryRuntime;
@@ -283,6 +285,9 @@ export class OpenTUIInteractiveMode {
 		this.overlayManager = new OverlayManager(this.renderer);
 		const settingsManager = this.sessionHost.current.services.settingsManager;
 		this.shell = new OpenTUIInteractiveShell(this.renderer, { sidebarWidth: settingsManager.getSidebarWidth() });
+		this.shell.root.onMouse = (event) => {
+			if (this.clicks.handle(event) && event.type === "down") this.renderer?.clearSelection();
+		};
 		this.shell.onSidebarWidthChange = (width) => settingsManager.setSidebarWidth(width);
 		this.renderer.root.add(this.shell.root);
 
@@ -299,13 +304,8 @@ export class OpenTUIInteractiveMode {
 			content: "",
 			paddingX: 1,
 			fg: theme.getFgColor("accent"),
-			onMouseDown: (event) => {
-				if (event.button !== 0) return;
-				event.preventDefault();
-				event.stopPropagation();
-				this.transcriptFocus?.jumpToLatest();
-			},
 		});
+		this.clicks.register(this.transcriptUpdatesBanner, () => this.transcriptFocus?.jumpToLatest());
 		this.transcriptUpdatesBanner.visible = false;
 		regions.aboveEditor.add(this.transcriptUpdatesBanner);
 		this.composer = new OpenTUIComposer(this.renderer, {
@@ -402,9 +402,6 @@ export class OpenTUIInteractiveMode {
 		this.renderer.keyInput.on("keypress", applicationKeyHandler);
 		this.unsubscribeApplicationKeys = () => this.renderer?.keyInput.off("keypress", applicationKeyHandler);
 
-		// The transcript is a reading surface, not a separate input mode. A click
-		// there must leave the composer ready for immediate typing.
-		this.shell.onTranscriptFocusRequest = () => this.paneFocus?.focus("composer");
 		this.sidebar.onFocusRequest = () => this.paneFocus?.focus("sidebar");
 		// Search replaces the sidebar's focus target with a native textarea.
 		// Re-run the navigator after the subtree is rebuilt so typing starts
@@ -867,7 +864,8 @@ export class OpenTUIInteractiveMode {
 		}
 		switch (event.type) {
 			case "agent_start":
-				this.status?.setMessage("Working...");
+				this.status?.setMessage("Ready");
+				this.status?.stop();
 				this.composer?.setInteractionState({ kind: "working" });
 				break;
 			case "agent_settled":
@@ -885,7 +883,8 @@ export class OpenTUIInteractiveMode {
 				});
 				break;
 			case "auto_retry_start":
-				this.status?.setMessage(`Retry ${event.attempt}/${event.maxAttempts}`);
+				this.status?.setMessage("Ready");
+				this.status?.stop();
 				this.composer?.setInteractionState({
 					kind: "working",
 					placeholder: "Add instructions while retrying",

@@ -1,5 +1,5 @@
 import { BoxRenderable } from "@opentui/core";
-import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
+import { createTestRenderer, MouseButtons, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, describe, expect, test } from "vitest";
 import {
 	OpenTUIBashExecution,
@@ -46,11 +46,24 @@ describe("OpenTUI rich messages", () => {
 		const tool = new OpenTUIToolExecution(renderer, "read", "call-1", { path: "README.md" });
 		root.add(tool.root);
 		tool.markExecutionStarted();
-		expect(await frame(testRenderer, "read · running")).toContain("README.md");
+		let captured = await frame(testRenderer, "read · running");
+		expect(captured).not.toContain("README.md");
+		await testRenderer.mockMouse.pressDown(2, 2);
+		expect(await frame(testRenderer, "read · running")).not.toContain("README.md");
+		await testRenderer.mockMouse.release(2, 2);
+		captured = await frame(testRenderer, "README.md");
+		expect(captured).toContain("README.md");
+		tool.setExpanded(false);
+		await testRenderer.mockMouse.click(2, 2, MouseButtons.RIGHT);
+		expect(await frame(testRenderer, "read · running")).not.toContain("README.md");
+		await testRenderer.mockMouse.drag(2, 2, 8, 2);
+		expect(await frame(testRenderer, "read · running")).not.toContain("README.md");
+		await testRenderer.mockMouse.click(2, 2);
+		expect(await frame(testRenderer, "README.md")).toContain("README.md");
 
 		const manyLines = Array.from({ length: 24 }, (_, index) => `line ${index + 1}`).join("\n");
 		tool.updateResult(textOnlyToolResult("read", "call-1", manyLines), true);
-		let captured = await frame(testRenderer, "4 earlier lines hidden");
+		captured = await frame(testRenderer, "4 earlier lines hidden");
 		expect(captured).toContain("read · streaming");
 		tool.setExpanded(true);
 		captured = await frame(testRenderer, "line 1");
@@ -124,6 +137,7 @@ describe("OpenTUI rich messages", () => {
 		const { renderer } = testRenderer;
 		const tool = new OpenTUIToolExecution(renderer, "edit", "call-diff", { path: "a.ts" });
 		renderer.root.add(tool.root);
+		tool.setExpanded(true);
 		tool.updateResult(
 			textOnlyToolResult("edit", "call-diff", "--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-old value\n+new value"),
 		);
@@ -137,9 +151,11 @@ describe("OpenTUI rich messages", () => {
 		const { renderer } = testRenderer;
 		let now = 0;
 		const group = new OpenTUIWorkingGroup(renderer, 0, () => now);
+		let firstTool: OpenTUIToolExecution | undefined;
 		for (let index = 0; index < 7; index++) {
 			const id = `call-${index}`;
 			const tool = new OpenTUIToolExecution(renderer, "read", id, { path: `${index}.txt` });
+			firstTool ??= tool;
 			tool.markExecutionStarted();
 			tool.updateResult(textOnlyToolResult("read", id, `result ${index}`));
 			group.addTool(id, tool);
@@ -150,10 +166,15 @@ describe("OpenTUI rich messages", () => {
 		let captured = await frame(testRenderer, "✓ Inspected the workspace · 18s · 7 tool calls");
 		expect(captured).not.toContain("result 0");
 
-		await testRenderer.mockMouse.click(2, 1);
-		captured = await frame(testRenderer, "result 0");
+		await testRenderer.mockMouse.pressDown(2, 1);
+		expect(await frame(testRenderer, "Inspected the workspace")).not.toContain("read · complete");
+		await testRenderer.mockMouse.release(2, 1);
+		captured = await frame(testRenderer, "read · complete");
 		expect(captured).toContain("⌄ ✓ Inspected the workspace · 18s · 7 tool calls");
-		expect(captured).toContain("result 1");
+		expect(captured).not.toContain("result 0");
+		firstTool?.setExpanded(true);
+		captured = await frame(testRenderer, "result 0");
+		expect(captured).toContain("result 0");
 	});
 
 	test("keeps a failed working group expanded", async () => {
@@ -172,6 +193,19 @@ describe("OpenTUI rich messages", () => {
 		expect(captured).toContain("write · failed");
 	});
 
+	test("shows a failed Agent activity even when no tool failed", async () => {
+		const testRenderer = await setup();
+		const { renderer } = testRenderer;
+		const group = new OpenTUIWorkingGroup(renderer, 0, () => 2_000);
+		group.waitForAgentEnd();
+		group.finish(true);
+		renderer.root.add(group.root);
+
+		const captured = await frame(testRenderer, "Work failed");
+		expect(captured).toContain("✗ Work failed · 2s");
+		expect(captured).not.toContain("✓");
+	});
+
 	test("describes mixed file activity while preserving completion expansion rules", async () => {
 		const testRenderer = await setup();
 		const { renderer } = testRenderer;
@@ -183,7 +217,7 @@ describe("OpenTUI rich messages", () => {
 		renderer.root.add(group.root);
 
 		let captured = await frame(testRenderer, "Inspecting and updating files · 2 tool calls");
-		expect(captured).toContain("⌄ ◐");
+		expect(captured).toContain("› ◐");
 
 		read.updateResult(textOnlyToolResult("read", "read-call", "old"));
 		edit.updateResult(textOnlyToolResult("apply_patch", "edit-call", "done"));

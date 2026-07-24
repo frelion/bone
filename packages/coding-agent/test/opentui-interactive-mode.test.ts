@@ -1071,6 +1071,13 @@ describe("OpenTUIInteractiveMode", () => {
 		await host.hooks.foregroundChanged?.(resumedFirst.runtime);
 		await settle(renderer);
 		expect(renderer.captureFrame()).toContain("Task completed");
+		const banner = (mode as unknown as { transcriptUpdatesBanner: TextRenderable }).transcriptUpdatesBanner;
+		await renderer.mouse.pressDown(banner.screenX + 1, banner.screenY);
+		await settle(renderer);
+		expect(renderer.captureFrame()).toContain("Task completed");
+		await renderer.mouse.release(banner.screenX + 1, banner.screenY);
+		await settle(renderer);
+		expect(renderer.captureFrame()).not.toContain("Task completed");
 		mode.stop();
 	});
 

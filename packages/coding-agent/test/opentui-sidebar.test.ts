@@ -1,5 +1,5 @@
 import { type KeyEvent, TextareaRenderable, TextRenderable } from "@opentui/core";
-import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
+import { createTestRenderer, MouseButtons, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { InteractiveSessionSummary } from "../src/core/interactive-session-host.ts";
 import { OpenTUISessionSidebar } from "../src/modes/interactive/components/opentui-session-sidebar.ts";
@@ -257,15 +257,52 @@ describe("OpenTUI session sidebar", () => {
 		renderer.keyInput.on("keypress", routeKeys);
 		await flushUntil(setup, "transcript-29");
 
-		await mockMouse.click(5, 7);
+		const rows = sidebar.list.getChildren().filter((child) => child.height === 3);
+		const firstRow = rows[0];
+		const secondRow = rows[1];
+		if (!firstRow || !secondRow) throw new Error("Expected two session rows");
+		const firstPoint = { x: firstRow.screenX + 2, y: firstRow.screenY + 1 };
+		const secondPoint = { x: secondRow.screenX + 2, y: secondRow.screenY + 1 };
+
+		await mockMouse.pressDown(secondPoint.x, secondPoint.y);
+		expect(activate).not.toHaveBeenCalled();
+		expect(focusChat).not.toHaveBeenCalled();
+		await mockMouse.release(secondPoint.x, secondPoint.y);
 		expect(activate).toHaveBeenCalledWith("/sessions/b.jsonl");
 		expect(focusChat).toHaveBeenCalledOnce();
 		expect(focus.focusedPane).toBe("composer");
 		expect(renderer.currentFocusedRenderable).toBe(composer);
 
-		await mockMouse.click(50, 8);
-		expect(focus.focusedPane).toBe("composer");
+		activate.mockClear();
+		focusChat.mockClear();
 		focus.focus("sidebar");
+		await mockMouse.drag(secondPoint.x, secondPoint.y, firstPoint.x, firstPoint.y);
+		expect(activate).not.toHaveBeenCalled();
+		expect(focusChat).not.toHaveBeenCalled();
+		await mockMouse.click(secondPoint.x, secondPoint.y, MouseButtons.RIGHT);
+		expect(activate).not.toHaveBeenCalled();
+		expect(focusChat).not.toHaveBeenCalled();
+		await mockMouse.pressDown(secondPoint.x, secondPoint.y);
+		await mockMouse.release(firstPoint.x, firstPoint.y);
+		expect(activate).not.toHaveBeenCalled();
+		expect(focusChat).not.toHaveBeenCalled();
+		await mockMouse.pressDown(secondPoint.x, secondPoint.y);
+		sidebar.setStatusMessage("Session changed while pressed");
+		await setup.flush();
+		await mockMouse.release(secondPoint.x, secondPoint.y);
+		expect(activate).not.toHaveBeenCalled();
+		expect(focusChat).not.toHaveBeenCalled();
+		sidebar.setStatusMessage(undefined);
+		await setup.flush();
+		await mockMouse.click(secondPoint.x, secondPoint.y);
+		expect(activate).toHaveBeenCalledOnce();
+		expect(activate).toHaveBeenCalledWith("/sessions/b.jsonl");
+		expect(focusChat).toHaveBeenCalledOnce();
+
+		focus.focus("sidebar");
+		await mockMouse.click(50, 8);
+		expect(focus.focusedPane).toBe("sidebar");
+		expect(renderer.currentFocusedRenderable).toBe(sidebar.focusTarget);
 		const before = shell.getTranscriptNode().scrollTop;
 		mockInput.pressKey("\x1b[5~");
 		await setup.flush();
@@ -294,10 +331,10 @@ describe("OpenTUI session sidebar", () => {
 		expect(frame.indexOf("Session newer")).toBeLessThan(frame.indexOf("Session older"));
 
 		sidebar.setSessions([
-			{ ...older, modified: new Date("2026-07-22T11:00:00Z"), livePreview: "new activity while focused" },
+			{ ...older, modified: new Date("2026-07-22T11:00:00Z"), lastMessage: "new completed activity" },
 			newer,
 		]);
-		frame = await flushUntil(setup, "new activity while focused");
+		frame = await flushUntil(setup, "new completed activity");
 		expect(frame.indexOf("Session newer")).toBeLessThan(frame.indexOf("Session older"));
 
 		sidebar.setFocused(false);
@@ -305,103 +342,40 @@ describe("OpenTUI session sidebar", () => {
 		expect(frame.indexOf("Session older")).toBeLessThan(frame.indexOf("Session newer"));
 	});
 
-	test("renders live throughput and updates running previews without periodic motion", async () => {
+	test("keeps running rows stable while live output and throughput change", async () => {
 		const setup = await createRenderer(100, 18);
 		const { renderer } = setup;
 		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 38 });
 		renderer.root.add(shell.root);
 		const sidebar = new OpenTUISessionSidebar(renderer);
 		shell.setSidebar(sidebar.root);
-		const preview = "This is a deliberately long live preview that keeps moving";
 		sidebar.setSessions([
 			makeSession("live", "background-running", {
-				livePreview: preview,
+				lastMessage: "Last completed response",
+				livePreview: "first streaming fragment",
 				throughputTokensPerSecond: 12.34,
 			}),
 		]);
 
-		await flushUntil(setup, "12.3 tok/s");
+		await flushUntil(setup, "Last completed response");
 		const initial = setup.captureCharFrame();
-		expect(initial).toContain("This is a deliberately");
-		await setup.flush();
-		expect(setup.captureCharFrame()).toBe(initial);
+		const firstRow = sidebar.list.getChildren()[0];
+		expect(initial).toContain("↻");
+		expect(initial).not.toContain("first streaming fragment");
+		expect(initial).not.toContain("tok/s");
 
 		sidebar.setSessions([
 			makeSession("live", "background-running", {
-				livePreview: `${preview} with newest streamed tokens`,
-				throughputTokensPerSecond: 12.34,
-			}),
-		]);
-		const after = await flushUntil(setup, "This is a deliberately");
-		expect(after).toContain("This is a deliberately");
-	});
-
-	test("updates a streaming row in place without rebuilding the native list", async () => {
-		const setup = await createRenderer(100, 24);
-		const { renderer } = setup;
-		const sidebar = new OpenTUISessionSidebar(renderer);
-		renderer.root.add(sidebar.root);
-		sidebar.setSessions([
-			makeSession("stream", "background-running", { livePreview: "first", throughputTokensPerSecond: 4 }),
-		]);
-		await setup.flush();
-		const firstRow = sidebar.list.getChildren()[0];
-		expect(firstRow).toBeDefined();
-		sidebar.setSessions([
-			makeSession("stream", "background-running", {
-				livePreview: "second streamed output",
-				throughputTokensPerSecond: 18,
-				messageCount: 4,
+				lastMessage: "Last completed response",
+				livePreview: "newest streaming fragment",
+				throughputTokensPerSecond: 98.76,
 			}),
 		]);
 		await setup.flush();
 		expect(sidebar.list.getChildren()[0]).toBe(firstRow);
-		expect(await flushUntil(setup, "second streamed output")).toContain("18.0 tok/s");
-	});
-
-	test("uses stable leading truncation for long running previews", async () => {
-		const setup = await createRenderer(100, 18);
-		const { renderer } = setup;
-		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 32 });
-		renderer.root.add(shell.root);
-		const sidebar = new OpenTUISessionSidebar(renderer);
-		shell.setSidebar(sidebar.root);
-		sidebar.setSessions([
-			makeSession("measured", "background-running", {
-				livePreview: "ABCDEFGHIJKLMNOPQRSTUV",
-				throughputTokensPerSecond: 12.34,
-			}),
-		]);
-
-		await flushUntil(setup, "12.3 tok/s");
 		const after = setup.captureCharFrame();
-		expect(after).toContain("12.3 tok/s");
-		expect(after).toContain("ABCDEF");
-		expect(after).not.toContain("PQRSTUV");
-
-		sidebar.dispose();
-		await setup.flush();
-		expect(setup.captureCharFrame()).toBe(after);
-	});
-
-	test("keeps emoji output intact in a stable preview", async () => {
-		const setup = await createRenderer(100, 18);
-		const { renderer } = setup;
-		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 32 });
-		renderer.root.add(shell.root);
-		const sidebar = new OpenTUISessionSidebar(renderer);
-		shell.setSidebar(sidebar.root);
-		sidebar.setSessions([
-			makeSession("emoji", "background-running", {
-				livePreview: "🙂ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-				throughputTokensPerSecond: 12.34,
-			}),
-		]);
-
-		await flushUntil(setup, "12.3 tok/s");
-		const frame = setup.captureCharFrame();
-		expect(frame).toContain("🙂ABCDEF");
-		expect(frame).not.toContain("�");
-		sidebar.dispose();
+		expect(after).toBe(initial);
+		expect(after).not.toContain("newest streaming fragment");
+		expect(after).not.toContain("98.8 tok/s");
 	});
 });

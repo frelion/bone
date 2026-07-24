@@ -448,7 +448,9 @@ describe("OpenTUI transcript factory", () => {
 		const renderer = setup.renderer;
 		const states: unknown[] = [];
 		const previousViews: Array<Renderable | undefined> = [];
-		const renderCall = vi.fn((args: unknown) => textView(`custom call:${JSON.stringify(args)}`));
+		const renderCall = vi.fn((args: unknown, context: { expanded: boolean }) =>
+			textView(`custom call:${context.expanded}:${JSON.stringify(args)}`),
+		);
 		const renderResult = vi.fn(
 			(
 				input: { result: { content: Array<{ type: string; text?: string }> } },
@@ -477,7 +479,13 @@ describe("OpenTUI transcript factory", () => {
 		expect(started.type).toBe("append");
 		if (started.type !== "append") throw new Error("expected tool append");
 		renderer.root.add(started.item.root);
-		expect(await frame(setup, "custom call")).toContain("one.txt");
+		expect(await frame(setup, "Inspecting the workspace")).not.toContain("custom call");
+		await setup.mockMouse.click(2, 1);
+		expect(await frame(setup, "custom call:false")).toContain("one.txt");
+		await setup.mockMouse.pressDown(2, 3);
+		expect(renderCall).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ expanded: false }));
+		await setup.mockMouse.release(2, 3);
+		expect(await frame(setup, "custom call:true")).toContain("one.txt");
 
 		const partial = await factory.handleEvent({
 			type: "tool_execution_update",
@@ -550,6 +558,106 @@ describe("OpenTUI transcript factory", () => {
 		const captured = await frame(setup, "✓ Worked for 18s · 2 tool calls");
 		expect(captured).not.toContain("one.txt");
 		expect(captured).not.toContain("two.txt");
+	});
+
+	test("places live Agent activity after the user and updates it through commentary and tools", async () => {
+		let now = 0;
+		const factory = new OpenTUITranscriptFactory(nativeRenderer, { now: () => now });
+		const setup = setupAt(100, 24);
+		const renderer = setup.renderer;
+
+		expect((await factory.handleEvent({ type: "agent_start" })).type).toBe("ignored");
+		const user = { role: "user" as const, content: "Check the event queue", timestamp: 1 };
+		const userStart = await factory.handleEvent({ type: "message_start", message: user });
+		expect(userStart.type).toBe("append");
+		if (userStart.type !== "append") throw new Error("expected user append");
+		renderer.root.add(userStart.item.root);
+
+		const activity = await factory.handleEvent({ type: "message_end", message: user });
+		expect(activity.type).toBe("append");
+		if (activity.type !== "append") throw new Error("expected activity append");
+		renderer.root.add(activity.item.root);
+		let captured = await frame(setup, "Working");
+		expect(captured.indexOf("Check the event queue")).toBeLessThan(captured.indexOf("Working"));
+
+		const commentary = {
+			...assistant("Inspecting the stream event queue"),
+			content: [
+				{
+					type: "text" as const,
+					text: "Inspecting the stream event queue",
+					textSignature: JSON.stringify({ v: 1, id: "commentary-1", phase: "commentary" }),
+				},
+			],
+		};
+		const assistantStart = await factory.handleEvent({ type: "message_start", message: commentary });
+		expect(assistantStart.type).toBe("append");
+		if (assistantStart.type === "append") renderer.root.add(assistantStart.item.root);
+		captured = await frame(setup, "Inspecting the stream event queue");
+		expect(captured).toContain("Inspecting the stream event queue");
+
+		const toolStart = await factory.handleEvent({
+			type: "tool_execution_start",
+			toolCallId: "activity-call",
+			toolName: "read",
+			args: { path: "events.ts" },
+		});
+		expect(toolStart.type).toBe("updated");
+		captured = await frame(setup, "Inspecting the stream event queue");
+		expect(captured).not.toContain("read · running");
+		expect(captured).not.toContain("events.ts");
+
+		await factory.handleEvent({
+			type: "tool_execution_end",
+			toolCallId: "activity-call",
+			toolName: "read",
+			result: { content: [{ type: "text", text: "event queue result" }], details: {} },
+			isError: false,
+		});
+		factory.setAllToolDetailsExpanded(true);
+		captured = await frame(setup, "event queue result");
+		expect(captured).toContain("read · complete");
+		expect(captured).toContain("events.ts");
+
+		now = 4_000;
+		const ended = await factory.handleEvent({ type: "agent_end", messages: [commentary], willRetry: false });
+		expect(ended.type).toBe("updated");
+		captured = await frame(setup, "Inspecting the stream event queue");
+		expect(captured).toContain("✓ Inspecting the stream event queue · 4s · 1 tool call");
+	});
+
+	test("keeps Agent activity alive across retry and reports a tool-free provider failure", async () => {
+		let now = 0;
+		const factory = new OpenTUITranscriptFactory(nativeRenderer, { now: () => now });
+		const setup = setupAt(90, 16);
+		const renderer = setup.renderer;
+
+		await factory.handleEvent({ type: "agent_start" });
+		const user = { role: "user" as const, content: "Retry this", timestamp: 1 };
+		await factory.handleEvent({ type: "message_start", message: user });
+		const activity = await factory.handleEvent({ type: "message_end", message: user });
+		if (activity.type !== "append") throw new Error("expected activity append");
+		renderer.root.add(activity.item.root);
+
+		const retrying = await factory.handleEvent({ type: "agent_end", messages: [], willRetry: true });
+		expect(retrying.type).toBe("updated");
+		expect(await frame(setup, "Retrying")).not.toContain("✓");
+		await factory.handleEvent({
+			type: "auto_retry_start",
+			attempt: 1,
+			maxAttempts: 3,
+			delayMs: 100,
+			errorMessage: "temporary failure",
+		});
+		expect(await frame(setup, "Retrying · 1/3")).not.toContain("✓");
+
+		await factory.handleEvent({ type: "agent_start" });
+		now = 3_000;
+		const failedMessage = { ...assistant(""), stopReason: "error" as const, errorMessage: "provider failed" };
+		await factory.handleEvent({ type: "agent_end", messages: [failedMessage], willRetry: false });
+		const captured = await frame(setup, "Work failed");
+		expect(captured).toContain("✗ Work failed · 3s");
+		expect(captured).not.toContain("✓");
 	});
 
 	test("ends a live working group when text arrives after an empty assistant start", async () => {
@@ -669,6 +777,7 @@ describe("OpenTUI transcript factory", () => {
 				}),
 			},
 		);
+		factory.setAllToolDetailsExpanded(true);
 
 		const custom = await factory.createMessage({
 			role: "custom",
@@ -719,6 +828,7 @@ describe("OpenTUI transcript factory", () => {
 				onError,
 			},
 		);
+		factory.setAllToolDetailsExpanded(true);
 
 		const tool = await factory.createMessage({
 			role: "toolResult",
@@ -754,7 +864,7 @@ describe("OpenTUI transcript factory", () => {
 		expect(captured).toContain("tool mount fallback");
 		expect(captured).toContain("message mount fallback");
 		expect(captured).toContain("[custom entry unavailable]");
-		expect(onError).toHaveBeenCalledTimes(3);
+		expect(onError).toHaveBeenCalledTimes(4);
 		expect(onError).toHaveBeenCalledWith(toolError, "tool renderer view");
 		expect(onError).toHaveBeenCalledWith(messageError, "custom message view");
 		expect(onError).toHaveBeenCalledWith(entryError, "custom entry view");
@@ -785,7 +895,7 @@ describe("OpenTUI transcript factory", () => {
 		expect(started.type).toBe("append");
 		if (started.type !== "append") throw new Error("expected tool append");
 		renderer.root.add(started.item.root);
-		expect(await frame(setup, "fallback.txt")).toContain("read · running");
+		expect(await frame(setup, "Inspecting the workspace")).not.toContain("fallback.txt");
 
 		const partial = await factory.handleEvent({
 			type: "tool_execution_update",

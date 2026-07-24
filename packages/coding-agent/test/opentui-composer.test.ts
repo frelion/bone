@@ -157,6 +157,33 @@ describe("OpenTUI composer", () => {
 		expect(submitted).toHaveBeenCalledWith("/history");
 	});
 
+	test("limits focus requests to the prompt and preserves child mouse ownership", async () => {
+		const provider: AutocompleteProvider = {
+			async getSuggestions() {
+				return { prefix: "/", items: [{ value: "help", label: "help" }] };
+			},
+			applyCompletion(lines) {
+				return { lines, cursorLine: 0, cursorCol: 0 };
+			},
+		};
+		const { testSetup, mockInput, composer } = await mountComposer({ autocompleteProvider: provider });
+		const focusRequest = vi.fn();
+		composer.onFocusRequest = focusRequest;
+		composer.setQueuedMessages([{ id: "queued", text: "Run focused tests" }]);
+		await mockInput.typeText("/");
+		await settle(testSetup);
+		expect(composer.autocompleteOpen).toBe(true);
+
+		await testSetup.mockMouse.click(composer.autocomplete.screenX + 1, composer.autocomplete.screenY);
+		const queuePanel = composer.root.getChildren()[1];
+		if (!queuePanel) throw new Error("Expected queue panel");
+		await testSetup.mockMouse.click(queuePanel.screenX + 1, queuePanel.screenY);
+		expect(focusRequest).not.toHaveBeenCalled();
+
+		await testSetup.mockMouse.click(composer.input.screenX + 1, composer.input.screenY);
+		expect(focusRequest).toHaveBeenCalledOnce();
+	});
+
 	test("submits a unique slash-command match with one Enter press", async () => {
 		const provider: AutocompleteProvider = {
 			async getSuggestions() {

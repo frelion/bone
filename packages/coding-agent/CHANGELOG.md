@@ -5,6 +5,8 @@
 ### Changed
 
 - Refined the OpenTUI conversation workflow with task-aware composer states, explicit follow-up queueing, semantic tool summaries, stable conversation identity, paused-scroll update notices, and background-separated user prompts.
+- Moved animated Agent activity into the transcript, with live commentary plus independently expandable tool calls and details.
+- Kept conversation sidebar rows stable while responses stream by showing only completed-message previews and run state.
 
 ### Fixed
 
@@ -12,6 +14,7 @@
 - Fixed provider SSE responses hanging after their HTTP headers by preserving Bun's native streaming fetch, retaining environment-based HTTP proxy support, and settling stalled streams after the configured idle timeout.
 - Fixed OpenAI-compatible stream read failures after tool execution to retry from the completed tool result without running the tool again.
 - Fixed long streaming responses retaining and rendering every cumulative partial update instead of coalescing queued updates to the latest snapshot.
+- Fixed transcript clicks stealing composer focus and interactive rows activating before a primary-button click completed.
 
 ## [0.1.5] - 2026-07-23
 

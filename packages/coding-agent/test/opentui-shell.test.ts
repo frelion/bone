@@ -1,5 +1,5 @@
 import type { AssistantMessage } from "@frelion/bone-ai";
-import { type Renderable, TextRenderable } from "@opentui/core";
+import { type Renderable, TextareaRenderable, TextRenderable } from "@opentui/core";
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
@@ -128,6 +128,29 @@ describe("OpenTUI interactive shell", () => {
 
 		expect(lastLine).toBeDefined();
 		expect(lastLine!.screenY + lastLine!.height).toBe(transcript.screenY + transcript.height);
+	});
+
+	test("does not redirect transcript mouse interaction to the composer", async () => {
+		initTheme("dark");
+		const setup = await createRenderer(80, 18);
+		const { renderer, mockMouse } = setup;
+		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 20 });
+		renderer.root.add(shell.root);
+		const previousFocus = new TextareaRenderable(renderer, { width: "100%", height: 1 });
+		const composer = new TextareaRenderable(renderer, { width: "100%", height: 1 });
+		shell.setSidebar(previousFocus);
+		shell.appendTranscript(textView(setup, "selectable transcript content"));
+		shell.appendFixed(composer);
+		previousFocus.focus();
+		await flushUntil(setup, (frame) => frame.includes("selectable transcript content"));
+		const transcript = shell.getTranscriptNode();
+		const x = transcript.screenX + 4;
+		const y = transcript.screenY;
+
+		await mockMouse.click(x, y);
+		await mockMouse.drag(x, y, x + 8, y);
+
+		expect(renderer.currentFocusedRenderable).toBe(previousFocus);
 	});
 
 	test("switches between split and single-pane layouts without remounting content", async () => {

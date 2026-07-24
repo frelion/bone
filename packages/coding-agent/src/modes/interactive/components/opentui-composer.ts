@@ -156,7 +156,6 @@ export class OpenTUIComposer {
 		this.root = new BoxRenderable(renderer, {
 			width: "100%",
 			flexDirection: "column",
-			onMouseDown: () => this.onFocusRequest?.(),
 		});
 		this.autocomplete = new SelectRenderable(renderer, {
 			width: "100%",
@@ -195,6 +194,7 @@ export class OpenTUIComposer {
 			borderColor: OPEN_TUI_COLORS.border,
 			backgroundColor: OPEN_TUI_COLORS.page,
 			onMouseDown: (event) => {
+				if (event.button !== 0) return;
 				event.stopPropagation();
 				this.onFocusRequest?.();
 			},

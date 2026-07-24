@@ -28,13 +28,25 @@ function markdownStyle(fg: string): SyntaxStyle {
 	});
 }
 
+export function isOpenTUICommentaryText(
+	content: Extract<AssistantMessage["content"][number], { type: "text" }>,
+): boolean {
+	if (!content.textSignature?.startsWith("{")) return false;
+	try {
+		const signature = JSON.parse(content.textSignature) as { v?: unknown; phase?: unknown };
+		return signature.v === 1 && signature.phase === "commentary";
+	} catch {
+		return false;
+	}
+}
+
 function getVisibleTextParts(message: AssistantMessage): Map<number, string> {
 	const visibleByIndex = new Map<number, string>();
 	let insidePlanBlock = false;
 
 	for (let index = 0; index < message.content.length; index++) {
 		const content = message.content[index];
-		if (content.type !== "text") continue;
+		if (content.type !== "text" || isOpenTUICommentaryText(content)) continue;
 
 		let remaining = content.text;
 		let visible = "";
@@ -118,6 +130,7 @@ function createAssistantSegments(message: AssistantMessage, options: AssistantSe
 	for (let index = 0; index < message.content.length; index++) {
 		const content = message.content[index]!;
 		if (content.type === "text") {
+			if (isOpenTUICommentaryText(content)) continue;
 			const visibleText = visibleTextParts?.get(index) ?? content.text;
 			if (visibleText.trim()) segments.push({ kind: "text", content: visibleText.trim() });
 			continue;

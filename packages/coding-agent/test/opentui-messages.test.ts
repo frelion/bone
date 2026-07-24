@@ -89,4 +89,31 @@ describe("OpenTUI transcript messages", () => {
 		expect(captured).toContain("The dependency graph is valid.");
 		expect(captured).not.toContain("Checking the dependency graph");
 	});
+
+	test("keeps Responses commentary out of the assistant body", async () => {
+		initTheme("dark");
+		const setup = await createTestRenderer({ width: 80, height: 12 });
+		renderers.add(setup);
+		const { renderer } = setup;
+		const response = new OpenTUIAssistantMessage(
+			renderer,
+			assistant([
+				{
+					type: "text",
+					text: "Inspecting the event queue",
+					textSignature: JSON.stringify({ v: 1, id: "commentary-1", phase: "commentary" }),
+				},
+				{
+					type: "text",
+					text: "The event queue is healthy.",
+					textSignature: JSON.stringify({ v: 1, id: "answer-1", phase: "final_answer" }),
+				},
+			]),
+		);
+		renderer.root.add(response.root);
+
+		const captured = await flushUntil(setup, "The event queue is healthy.");
+		expect(captured).toContain("The event queue is healthy.");
+		expect(captured).not.toContain("Inspecting the event queue");
+	});
 });

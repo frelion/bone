@@ -25,7 +25,6 @@ export type OpenTUIPrimaryPane = "sidebar" | "main";
 export class OpenTUIInteractiveShell {
 	readonly root: BoxRenderable;
 	readonly transcript: ScrollBoxRenderable;
-	public onTranscriptFocusRequest?: () => void;
 	public onTranscriptScrollRequest?: (deltaRows: number) => void;
 	public onTranscriptContentChange?: () => void;
 	public onSidebarWidthChange?: (width: number) => void;
@@ -123,7 +122,6 @@ export class OpenTUIInteractiveShell {
 			stickyScroll: true,
 			stickyStart: "bottom",
 			viewportCulling: true,
-			onMouseDown: () => this.onTranscriptFocusRequest?.(),
 		});
 		this.fixedRoot = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 });
 		this.aboveEditorRoot = new BoxRenderable(renderer, { flexDirection: "column" });
