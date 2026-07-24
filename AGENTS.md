@@ -39,6 +39,9 @@
 - Treat dependency and Bun lockfile changes as reviewed code. Direct external deps stay pinned to exact versions.
 - Hydrate/update locally with `bun install --ignore-scripts`; clean/CI-style with `bun install --frozen-lockfile --ignore-scripts`. Don't run lifecycle scripts unless the user asks.
 - If dependency metadata changes, refresh `bun.lock` with `bun install --lockfile-only --ignore-scripts` and review the resulting diff.
+- Bun workspace dependencies are distributed across the root and each workspace's `node_modules`. In a new or reused worktree, missing package-level dependencies must be repaired from that worktree's repository root with `bun install --frozen-lockfile --ignore-scripts`; do not install packages one workspace at a time.
+- Never treat a shared root `node_modules` as a complete workspace install. Do not work around missing modules with `NODE_PATH`, direct `.bun` store imports, or by linking only the root `node_modules` from another checkout.
+- Never symlink an entire package-level `node_modules` from another worktree. Its relative workspace links can resolve back into the source worktree and silently mix code between branches. Each worktree must own a complete Bun-generated workspace link topology, even when Bun's download cache or a copy-on-write dependency snapshot is reused.
 
 ## Git
 

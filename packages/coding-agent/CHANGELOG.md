@@ -28,6 +28,7 @@
 - Restored automatic conversation titles after the first user message and automatic title generation with `/name`.
 - Fixed pending steering messages being omitted from the composer queue while an Agent is working.
 - Fixed transcript Agent activity remaining above an automatically started follow-up message.
+- Fixed structured-question focus recovery after submitting an answer or cancelling the questionnaire.
 
 ## [0.1.5] - 2026-07-23
 
