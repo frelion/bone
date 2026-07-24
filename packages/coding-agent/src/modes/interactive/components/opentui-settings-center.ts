@@ -19,7 +19,7 @@ type ValueKind = "string" | "number" | "boolean";
 
 const SAVE_SETTINGS = "__save_settings__";
 
-class SaveSettingsRequested extends Error {}
+export class OpenTUISettingsSaveRequested extends Error {}
 
 interface Field {
 	label: string;
@@ -148,6 +148,7 @@ function parseValue(value: string, kind: ValueKind): unknown {
 export interface OpenTUISettingsCenterOptions {
 	runtime: AgentSessionRuntime;
 	ui: ExtensionUIV2Context;
+	dialogs?: Dialogs;
 	onLogin?: (providerId: string) => Promise<void>;
 	onLogout?: (providerId: string) => Promise<void>;
 	onPresentationChanged?: () => void | Promise<void>;
@@ -170,7 +171,7 @@ export class OpenTUISettingsCenter {
 	constructor(options: OpenTUISettingsCenterOptions) {
 		this.options = options;
 		this.runtime = options.runtime;
-		this.dialogs = options.ui.dialogs;
+		this.dialogs = options.dialogs ?? options.ui.dialogs;
 		const manager = options.runtime.services.settingsManager;
 		this.global = manager.getGlobalSettings();
 		this.project = manager.getProjectSettings();
@@ -214,7 +215,7 @@ export class OpenTUISettingsCenter {
 				else await this.editPage(page);
 			}
 		} catch (error) {
-			if (!(error instanceof SaveSettingsRequested)) throw error;
+			if (!(error instanceof OpenTUISettingsSaveRequested)) throw error;
 			await this.save();
 		}
 	}
@@ -225,7 +226,7 @@ export class OpenTUISettingsCenter {
 			shortcuts: [{ action: "save", value: SAVE_SETTINGS }],
 			footer: "Ctrl+S save · Esc discard",
 		});
-		if (selected === SAVE_SETTINGS) throw new SaveSettingsRequested();
+		if (selected === SAVE_SETTINGS) throw new OpenTUISettingsSaveRequested();
 		return selected;
 	}
 
