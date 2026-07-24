@@ -145,6 +145,7 @@ export interface QuestionAnsweredEntry extends SessionEntryBase {
 	type: "question_answered";
 	requestId: string;
 	answers: QuestionAnswer[];
+	overallNotes?: string;
 }
 
 export interface QuestionCancelledEntry extends SessionEntryBase {
@@ -1237,7 +1238,7 @@ export class SessionManager {
 		return entry;
 	}
 
-	appendQuestionAnswered(requestId: string, answers: QuestionAnswer[]): QuestionAnsweredEntry {
+	appendQuestionAnswered(requestId: string, answers: QuestionAnswer[], overallNotes?: string): QuestionAnsweredEntry {
 		const entry: QuestionAnsweredEntry = {
 			type: "question_answered",
 			id: generateId(this.byId),
@@ -1248,6 +1249,7 @@ export class SessionManager {
 				...answer,
 				selected: answer.selected ? [...answer.selected] : undefined,
 			})),
+			...(overallNotes && { overallNotes }),
 		};
 		this._appendEntry(entry);
 		return entry;

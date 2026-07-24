@@ -55,6 +55,10 @@ describe("OpenTUIPlanReview", () => {
 
 		await setup.flush();
 		expect(setup.captureCharFrame()).toContain("Plan v2 is ready");
+		await vi.waitFor(async () => {
+			await setup.flush();
+			expect(setup.captureCharFrame()).toContain("Implement the migration");
+		});
 		review.handleKey(key("enter"));
 		expect(done).toHaveBeenCalledWith({ action: "approve" });
 

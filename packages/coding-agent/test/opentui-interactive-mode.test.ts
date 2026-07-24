@@ -115,7 +115,7 @@ interface FakeSession {
 	approvePlan(proposalId: string): Promise<void>;
 	revisePlan(proposalId: string, feedback: string): Promise<void>;
 	cancelPlan(proposalId: string): void;
-	answerQuestion(requestId: string, answers: QuestionAnswer[]): void;
+	answerQuestion(requestId: string, answers: QuestionAnswer[], overallNotes?: string): void;
 	cancelQuestion(requestId: string, reason: "user" | "abort" | "client_disconnect" | "no_ui"): void;
 	getFollowUpMessages(): readonly string[];
 	getSteeringMessages(): readonly string[];
@@ -900,7 +900,7 @@ describe("OpenTUIInteractiveMode", () => {
 		expect(host.getSessionSummaries).toHaveBeenCalledWith([indexed.path]);
 		expect(renderer.captureFrame()).toContain("Indexed result");
 
-		renderer.input.pressEscape();
+		renderer.input.pressEnter();
 		await settle(renderer);
 		expect(renderer.captureFrame()).toContain("Indexed result");
 		renderer.input.pressKey("d");
@@ -1593,37 +1593,50 @@ describe("OpenTUIInteractiveMode", () => {
 		active.emit({ type: "question_asked", request });
 		const questionFrame = await renderer.waitForFrameText("Which runtime?");
 		expect(questionFrame).toContain("Agent needs your input");
-		expect(questionFrame).toContain("[1 Runtime]  2 Scope  3 Notes");
+		expect(questionFrame).toContain("[1 Runtime]  2 Scope  3 Notes  Review");
 		expect((mode as unknown as { overlayManager: { active: unknown } }).overlayManager.active).toBeFalsy();
 		renderer.input.pressEnter();
-		renderer.input.pressTab();
+		renderer.input.pressArrow("right");
 		renderer.input.pressEnter();
-		renderer.input.pressTab();
+		renderer.input.pressArrow("right");
 		for (let index = 0; index < 2; index++) renderer.input.pressArrow("down");
-		renderer.input.pressEnter();
 		await settle(renderer);
 		await renderer.input.typeText("Do not add configurable keys");
 		renderer.input.pressEnter();
-		renderer.input.pressKey("s", { ctrl: true });
+		renderer.input.pressArrow("right");
+		await renderer.waitForFrameText("Review answers and add an overall note");
+		renderer.input.pressArrow("down");
+		renderer.input.pressEnter();
+		await renderer.waitForFrameText("Write overall note");
+		await renderer.input.typeText("Apply these answers to the whole migration");
+		renderer.input.pressEnter();
+		renderer.input.pressArrow("up");
+		renderer.input.pressEnter();
 
+		await vi.waitFor(() => expect(active.session.answerQuestion).toHaveBeenCalledOnce());
 		await mode.idle();
 		await settle(renderer);
-		expect(active.session.answerQuestion).toHaveBeenCalledWith(request.id, [
-			{ questionIndex: 0, question: "Which runtime?", kind: "option", answer: "Bun" },
-			{
-				questionIndex: 1,
-				question: "What should be included?",
-				kind: "multi",
-				answer: null,
-				selected: ["TUI"],
-			},
-			{
-				questionIndex: 2,
-				question: "Any final constraint?",
-				kind: "custom",
-				answer: "Do not add configurable keys",
-			},
-		]);
+		expect(active.session.answerQuestion).toHaveBeenCalledWith(
+			request.id,
+			[
+				{ questionIndex: 0, question: "Which runtime?", kind: "option", answer: "Bun" },
+				{
+					questionIndex: 1,
+					question: "What should be included?",
+					kind: "multi",
+					answer: null,
+					selected: ["TUI"],
+				},
+				{
+					questionIndex: 2,
+					question: "Any final constraint?",
+					kind: "note",
+					answer: null,
+					notes: "Do not add configurable keys",
+				},
+			],
+			"Apply these answers to the whole migration",
+		);
 
 		await renderer.input.typeText("focus restored");
 		renderer.input.pressEnter();

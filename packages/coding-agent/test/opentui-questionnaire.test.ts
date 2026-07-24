@@ -10,7 +10,7 @@ import {
 const renderers = new Set<TestRendererSetup>();
 
 async function createQuestionnaireRenderer() {
-	const setup = await createTestRenderer({ width: 84, height: 28, autoFocus: false, kittyKeyboard: true });
+	const setup = await createTestRenderer({ width: 100, height: 32, autoFocus: false, kittyKeyboard: true });
 	renderers.add(setup);
 	return setup;
 }
@@ -42,12 +42,12 @@ function request(): QuestionRequest {
 	};
 }
 
-function key(name: string, modifiers: { ctrl?: boolean; shift?: boolean; meta?: boolean } = {}): KeyEvent {
+function key(name: string): KeyEvent {
 	return new KeyEvent({
 		name,
-		ctrl: modifiers.ctrl ?? false,
-		meta: modifiers.meta ?? false,
-		shift: modifiers.shift ?? false,
+		ctrl: false,
+		meta: false,
+		shift: false,
 		option: false,
 		sequence: "",
 		number: false,
@@ -63,118 +63,29 @@ afterEach(() => {
 });
 
 describe("OpenTUIQuestionnaire", () => {
-	test("keeps all question drafts in one panel and submits them together", async () => {
+	test("keeps option choices and per-question notes, then submits from Review", async () => {
 		const setup = await createQuestionnaireRenderer();
 		const done = vi.fn<(result: OpenTUIQuestionnaireResult) => void>();
 		const questionnaire = new OpenTUIQuestionnaire(setup.renderer, request(), done);
 		setup.renderer.root.add(questionnaire.root);
 		questionnaire.focus();
 
-		await setup.flush();
-		let frame = setup.captureCharFrame();
-		expect(frame).toContain("Agent needs your input");
-		expect(frame).toContain("[1 Build]  2 Targets");
-		expect(frame).toContain("Which build should run?");
-
-		questionnaire.handleKey(key("enter"));
-		questionnaire.handleKey(key("tab"));
 		questionnaire.handleKey(key("enter"));
 		questionnaire.handleKey(key("down"));
-		questionnaire.handleKey(key("enter"));
-		questionnaire.handleKey(key("s", { ctrl: true }));
-
-		expect(done).toHaveBeenCalledWith({
-			cancelled: false,
-			answers: [
-				{
-					questionIndex: 0,
-					question: "Which build should run?",
-					kind: "option",
-					answer: "Local",
-				},
-				{
-					questionIndex: 1,
-					question: "Which targets are required?",
-					kind: "multi",
-					answer: null,
-					selected: ["Linux", "macOS"],
-				},
-			],
-		});
-
-		await setup.flush();
-		frame = setup.captureCharFrame();
-		expect(frame).toContain("[x] Linux");
-		expect(frame).toContain("[x] macOS");
-	});
-
-	test("validates incomplete answers and keeps custom input inside the panel", async () => {
-		const setup = await createQuestionnaireRenderer();
-		const done = vi.fn<(result: OpenTUIQuestionnaireResult) => void>();
-		const questionnaire = new OpenTUIQuestionnaire(setup.renderer, request(), done);
-		setup.renderer.root.add(questionnaire.root);
-		questionnaire.focus();
-
-		questionnaire.handleKey(key("s", { ctrl: true }));
-		await setup.flush();
-		expect(setup.captureCharFrame()).toContain("Answer every question before submitting.");
-		expect(done).not.toHaveBeenCalled();
-
 		questionnaire.handleKey(key("down"));
-		questionnaire.handleKey(key("down"));
-		questionnaire.handleKey(key("enter"));
-		expect(questionnaire.customAnswerActive).toBe(true);
-		await setup.flush();
-		expect(setup.captureCharFrame()).toContain("Enter apply · Shift+Enter newline · Esc back");
-		await setup.mockInput.typeText("Use the release build");
+		expect(questionnaire.questionNoteActive).toBe(true);
+		await setup.mockInput.typeText("Prefer the fast local path");
 		setup.mockInput.pressEnter();
-		await setup.flush();
-		expect(questionnaire.customAnswerActive).toBe(false);
-		expect(setup.captureCharFrame()).toContain("(*) Custom answer");
-	});
-
-	test("clears custom-answer validation when returning to options", async () => {
-		const setup = await createQuestionnaireRenderer();
-		const questionnaire = new OpenTUIQuestionnaire(setup.renderer, request(), vi.fn());
-		setup.renderer.root.add(questionnaire.root);
-		questionnaire.handleKey(key("down"));
+		questionnaire.handleKey(key("right"));
+		questionnaire.handleKey(key("enter"));
+		questionnaire.handleKey(key("right"));
+		expect(questionnaire.reviewActive).toBe(true);
 		questionnaire.handleKey(key("down"));
 		questionnaire.handleKey(key("enter"));
-		questionnaire.handleKey(key("s", { ctrl: true }));
-		await setup.flush();
-		expect(setup.captureCharFrame()).toContain("Custom answer must not be empty.");
-
-		questionnaire.handleKey(key("escape"));
-		await setup.flush();
-		expect(setup.captureCharFrame()).not.toContain("Custom answer must not be empty.");
-		expect(setup.captureCharFrame()).toContain("Enter choose · Tab next · Ctrl+S submit · Esc cancel");
-	});
-
-	test("cancels without answering when Escape is pressed", async () => {
-		const setup = await createQuestionnaireRenderer();
-		const done = vi.fn<(result: OpenTUIQuestionnaireResult) => void>();
-		const questionnaire = new OpenTUIQuestionnaire(setup.renderer, request(), done);
-		setup.renderer.root.add(questionnaire.root);
-
-		questionnaire.handleKey(key("escape"));
-
-		expect(done).toHaveBeenCalledWith({ cancelled: true });
-	});
-
-	test("restores partial drafts when a pending question surface is remounted", async () => {
-		const setup = await createQuestionnaireRenderer();
-		const first = new OpenTUIQuestionnaire(setup.renderer, request(), vi.fn());
-		setup.renderer.root.add(first.root);
-		first.handleKey(key("enter"));
-		const draft = first.getDraftAnswers();
-		first.root.destroyRecursively();
-
-		const done = vi.fn<(result: OpenTUIQuestionnaireResult) => void>();
-		const restored = new OpenTUIQuestionnaire(setup.renderer, request(), done, draft);
-		setup.renderer.root.add(restored.root);
-		restored.handleKey(key("tab"));
-		restored.handleKey(key("enter"));
-		restored.handleKey(key("s", { ctrl: true }));
+		await setup.mockInput.typeText("Ship both decisions together");
+		setup.mockInput.pressEnter();
+		questionnaire.handleKey(key("up"));
+		questionnaire.handleKey(key("enter"));
 
 		expect(done).toHaveBeenCalledWith({
 			cancelled: false,
@@ -184,6 +95,7 @@ describe("OpenTUIQuestionnaire", () => {
 					question: "Which build should run?",
 					kind: "option",
 					answer: "Local",
+					notes: "Prefer the fast local path",
 				},
 				{
 					questionIndex: 1,
@@ -193,6 +105,93 @@ describe("OpenTUIQuestionnaire", () => {
 					selected: ["Linux"],
 				},
 			],
+			overallNotes: "Ship both decisions together",
+		});
+	});
+
+	test("accepts a note without an option and reports the first unanswered question", async () => {
+		const setup = await createQuestionnaireRenderer();
+		const done = vi.fn<(result: OpenTUIQuestionnaireResult) => void>();
+		const questionnaire = new OpenTUIQuestionnaire(setup.renderer, request(), done);
+		setup.renderer.root.add(questionnaire.root);
+
+		questionnaire.handleKey(key("right"));
+		questionnaire.handleKey(key("right"));
+		questionnaire.handleKey(key("enter"));
+		await setup.flush();
+		expect(setup.captureCharFrame()).toContain("Answer question 1");
+		expect(done).not.toHaveBeenCalled();
+
+		questionnaire.handleKey(key("down"));
+		questionnaire.handleKey(key("down"));
+		await setup.mockInput.typeText("Use a remote build farm instead");
+		setup.mockInput.pressEnter();
+		questionnaire.handleKey(key("right"));
+		questionnaire.handleKey(key("enter"));
+		questionnaire.handleKey(key("right"));
+		questionnaire.handleKey(key("enter"));
+
+		expect(done).toHaveBeenCalledWith({
+			cancelled: false,
+			answers: [
+				{
+					questionIndex: 0,
+					question: "Which build should run?",
+					kind: "note",
+					answer: null,
+					notes: "Use a remote build farm instead",
+				},
+				{
+					questionIndex: 1,
+					question: "Which targets are required?",
+					kind: "multi",
+					answer: null,
+					selected: ["Linux"],
+				},
+			],
+		});
+	});
+
+	test("restores selections and both note levels after remounting", async () => {
+		const setup = await createQuestionnaireRenderer();
+		const first = new OpenTUIQuestionnaire(setup.renderer, request(), vi.fn(), {
+			answers: [
+				{
+					questionIndex: 0,
+					question: "Which build should run?",
+					kind: "option",
+					answer: "CI",
+					notes: "Keep logs",
+				},
+			],
+			overallNotes: "Release context",
+		});
+		setup.renderer.root.add(first.root);
+		await setup.flush();
+		const frame = setup.captureCharFrame();
+		expect(frame).toContain("(*) CI");
+		expect(frame).toContain("Keep logs");
+		expect(first.getDraft()).toEqual({
+			answers: [
+				{
+					questionIndex: 0,
+					question: "Which build should run?",
+					kind: "option",
+					answer: "CI",
+					notes: "Keep logs",
+				},
+			],
+			overallNotes: "Release context",
+		});
+	});
+
+	test("cancels from the option surface", () => {
+		const setupPromise = createQuestionnaireRenderer();
+		return setupPromise.then((setup) => {
+			const done = vi.fn<(result: OpenTUIQuestionnaireResult) => void>();
+			const questionnaire = new OpenTUIQuestionnaire(setup.renderer, request(), done);
+			questionnaire.handleKey(key("escape"));
+			expect(done).toHaveBeenCalledWith({ cancelled: true });
 		});
 	});
 });

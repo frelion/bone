@@ -33,7 +33,7 @@ export type RpcCommand =
 	| { id?: string; type: "approve_plan"; proposalId: string }
 	| { id?: string; type: "revise_plan"; proposalId: string; feedback: string }
 	| { id?: string; type: "cancel_plan"; proposalId: string }
-	| { id?: string; type: "answer_question"; requestId: string; answers: QuestionAnswer[] }
+	| { id?: string; type: "answer_question"; requestId: string; answers: QuestionAnswer[]; overallNotes?: string }
 	| { id?: string; type: "cancel_question"; requestId: string; reason?: QuestionCancelReason }
 
 	// Model

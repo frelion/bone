@@ -408,7 +408,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			case "answer_question": {
-				session.answerQuestion(command.requestId, command.answers);
+				session.answerQuestion(command.requestId, command.answers, command.overallNotes);
 				return success(id, "answer_question");
 			}
 

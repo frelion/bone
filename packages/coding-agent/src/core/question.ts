@@ -31,7 +31,7 @@ export interface QuestionRequest {
 export interface QuestionAnswer {
 	questionIndex: number;
 	question: string;
-	kind: "option" | "custom" | "multi";
+	kind: "option" | "multi" | "note";
 	answer: string | null;
 	selected?: string[];
 	notes?: string;
@@ -44,6 +44,7 @@ export type QuestionState = { status: "inactive" } | { status: "awaitingAnswer";
 export interface QuestionToolDetails {
 	requestId?: string;
 	answers: QuestionAnswer[];
+	overallNotes?: string;
 	cancelled: boolean;
 	reason?: QuestionCancelReason;
 }
@@ -135,12 +136,11 @@ export function validateQuestionAnswers(request: QuestionRequest, answers: Quest
 
 		const optionLabels = new Set(question.options.map((option) => option.label));
 		const notes = answer.notes?.trim() || undefined;
+		if (answer.kind === "note") {
+			if (!notes) throw new Error(`Question ${questionIndex + 1} note must not be empty.`);
+			return { questionIndex, question: question.question, kind: "note" as const, answer: null, notes };
+		}
 		if (question.multiSelect) {
-			if (answer.kind === "custom") {
-				const value = answer.answer?.trim();
-				if (!value) throw new Error(`Question ${questionIndex + 1} custom answer must not be empty.`);
-				return { questionIndex, question: question.question, kind: "custom" as const, answer: value };
-			}
 			if (answer.kind !== "multi" || !answer.selected?.length) {
 				throw new Error(`Question ${questionIndex + 1} requires at least one selected option.`);
 			}
@@ -170,11 +170,6 @@ export function validateQuestionAnswers(request: QuestionRequest, answers: Quest
 				...(notes && { notes }),
 			};
 		}
-		if (answer.kind === "custom") {
-			const value = answer.answer?.trim();
-			if (!value) throw new Error(`Question ${questionIndex + 1} custom answer must not be empty.`);
-			return { questionIndex, question: question.question, kind: "custom" as const, answer: value };
-		}
 		throw new Error(`Question ${questionIndex + 1} does not accept multiple selections.`);
 	});
 }
@@ -182,10 +177,13 @@ export function validateQuestionAnswers(request: QuestionRequest, answers: Quest
 export function createQuestionToolResult(
 	requestId: string,
 	answers: QuestionAnswer[],
+	overallNotes?: string,
 ): AgentToolResult<QuestionToolDetails> {
+	const normalizedOverallNotes = overallNotes?.trim() || undefined;
+	const payload = { requestId, answers, ...(normalizedOverallNotes && { overallNotes: normalizedOverallNotes }) };
 	return {
-		content: [{ type: "text", text: JSON.stringify({ requestId, answers }, null, 2) }],
-		details: { requestId, answers, cancelled: false },
+		content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+		details: { ...payload, cancelled: false },
 	};
 }
 
@@ -210,7 +208,7 @@ export function createAskUserQuestionToolDefinition(
 		name: "ask_user_question",
 		label: "Ask User Question",
 		description:
-			"Ask the user one to four structured questions when a material product decision cannot be discovered from the workspace. Each question must offer two to four concrete options and may include a Markdown preview for choices that benefit from visual detail. The user can also provide a custom answer or cancel.",
+			"Ask the user one to four structured questions when a material product decision cannot be discovered from the workspace. Each question must offer two to four concrete options and may include a Markdown preview for choices that benefit from visual detail. The user may select options, add a note to each answer, add overall notes, or cancel.",
 		promptSnippet: "Ask the user structured questions when a material decision cannot be discovered",
 		promptGuidelines: [
 			"Investigate discoverable workspace facts before using ask_user_question. Use it only for material user preferences, requirements, constraints, or acceptance criteria.",

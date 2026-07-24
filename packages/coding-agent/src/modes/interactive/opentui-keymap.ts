@@ -31,7 +31,9 @@ export type OpenTUIAction =
 	| "configToggle"
 	| "toggleToolDetails"
 	| "jumpToLatest"
-	| "save";
+	| "save"
+	| "questionPrevious"
+	| "questionNext";
 
 interface OpenTUIKeySpec {
 	name: string;
@@ -72,6 +74,8 @@ const OPEN_TUI_KEYMAP: Record<OpenTUIAction, OpenTUIKeySpec> = {
 	toggleToolDetails: { name: "o", ctrl: true },
 	jumpToLatest: { name: "end" },
 	save: { name: "s", ctrl: true },
+	questionPrevious: { name: "left" },
+	questionNext: { name: "right" },
 };
 
 function normalizeName(name: string): string {

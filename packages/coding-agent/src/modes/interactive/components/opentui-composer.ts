@@ -34,6 +34,7 @@ export interface OpenTUIComposerStatus {
 	thinking: string;
 	contextRemaining: string;
 	foregroundThroughput: string;
+	mode?: "plan";
 }
 
 export type OpenTUIComposerInteractionKind = "idle" | "working" | "waiting";
@@ -518,7 +519,7 @@ export class OpenTUIComposer {
 		this.statusLeft.content =
 			this.interactionState.leftHint ??
 			defaults.leftHint ??
-			`${this.status.cwd}  ${this.status.model}  ${this.status.thinking}`;
+			`${this.status.cwd}  ${this.status.model}  ${this.status.mode === "plan" ? "PLAN" : this.status.thinking}`;
 		this.statusRight.content =
 			this.interactionState.rightHint ??
 			defaults.rightHint ??
