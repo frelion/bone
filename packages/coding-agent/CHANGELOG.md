@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed provider SSE responses hanging after their HTTP headers by preserving Bun's native streaming fetch, retaining environment-based HTTP proxy support, and settling stalled streams after the configured idle timeout.
+
 ## [0.1.5] - 2026-07-23
 
 ## [0.1.4] - 2026-07-23

@@ -8,7 +8,7 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 } from "@frelion/bone-ai";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -30,6 +30,7 @@ describe("createAgentSession stream options", () => {
 	});
 
 	afterEach(() => {
+		vi.useRealTimers();
 		if (tempDir) {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -117,6 +118,63 @@ describe("createAgentSession stream options", () => {
 		}
 	}
 
+	async function createHangingProviderSession(retryEnabled = false) {
+		const model = createModel("openai-responses");
+		const settingsManager = SettingsManager.inMemory({
+			httpIdleTimeoutMs: 100,
+			retry: {
+				enabled: retryEnabled,
+				maxRetries: retryEnabled ? 1 : undefined,
+				baseDelayMs: retryEnabled ? 1 : undefined,
+				provider: { timeoutMs: 10_000 },
+			},
+		});
+		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
+		await authStorage.modify(model.provider, async () => ({ type: "api_key", key: "test-api-key" }));
+		const modelRegistry = await createModelRegistry(authStorage, join(agentDir, "models.json"));
+		let capturedOptions: SimpleStreamOptions | undefined;
+		let providerSignal: AbortSignal | undefined;
+		let providerCalls = 0;
+		let notifyProviderStarted = (): void => {};
+		const providerStarted = new Promise<void>((resolve) => {
+			notifyProviderStarted = resolve;
+		});
+
+		modelRegistry.registerProvider(model.provider, {
+			api: model.api,
+			models: [model],
+			streamSimple: (_model, _context, providerOptions) => {
+				providerCalls += 1;
+				capturedOptions = providerOptions;
+				providerSignal = providerOptions?.signal;
+				notifyProviderStarted();
+				return createAssistantMessageEventStream();
+			},
+		});
+
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			model,
+			modelRuntime: getModelRuntime(modelRegistry),
+			settingsManager,
+			sessionManager: SessionManager.inMemory(cwd),
+		});
+
+		return {
+			model,
+			session,
+			providerStarted,
+			getCapturedOptions: () => capturedOptions,
+			getProviderSignal: () => providerSignal,
+			getProviderCalls: () => providerCalls,
+			cleanup: () => {
+				session.dispose();
+				modelRegistry.unregisterProvider(model.provider);
+			},
+		};
+	}
+
 	it("forwards httpIdleTimeoutMs as timeoutMs for OpenAI Codex", async () => {
 		const options = await captureStreamOptions("openai-codex-responses", { httpIdleTimeoutMs: 1234 });
 
@@ -153,5 +211,71 @@ describe("createAgentSession stream options", () => {
 		);
 
 		expect(options?.websocketConnectTimeoutMs).toBe(0);
+	});
+
+	it("keeps stream idleness independent from a request timeout override", async () => {
+		vi.useFakeTimers();
+		const created = await createHangingProviderSession();
+
+		try {
+			const stream = await created.session.agent.streamFn(created.model, { messages: [] }, { timeoutMs: 20_000 });
+			await created.providerStarted;
+			await vi.advanceTimersByTimeAsync(100);
+
+			expect((await stream.result()).stopReason).toBe("error");
+			expect(created.getCapturedOptions()?.timeoutMs).toBe(20_000);
+			expect(created.getProviderSignal()?.aborted).toBe(true);
+		} finally {
+			created.cleanup();
+		}
+	});
+
+	it("settles the agent session when a provider never emits an event", async () => {
+		vi.useFakeTimers();
+		const created = await createHangingProviderSession();
+		const events: string[] = [];
+		const unsubscribe = created.session.subscribe((event) => events.push(event.type));
+
+		try {
+			const promptPromise = created.session.prompt("hello");
+			await created.providerStarted;
+			await vi.advanceTimersByTimeAsync(100);
+			await promptPromise;
+
+			expect(events).toContain("agent_start");
+			expect(events.at(-1)).toBe("agent_settled");
+			expect(created.session.messages.at(-1)).toMatchObject({
+				role: "assistant",
+				stopReason: "error",
+				errorMessage: "Provider stream timed out after 100ms of inactivity.",
+			});
+			expect(created.getCapturedOptions()?.timeoutMs).toBe(10_000);
+			expect(created.getProviderSignal()?.aborted).toBe(true);
+		} finally {
+			unsubscribe();
+			created.cleanup();
+		}
+	});
+
+	it("settles once after repeated stream timeouts exhaust automatic retries", async () => {
+		vi.useFakeTimers();
+		const created = await createHangingProviderSession(true);
+		const events: string[] = [];
+		const unsubscribe = created.session.subscribe((event) => events.push(event.type));
+
+		try {
+			const promptPromise = created.session.prompt("hello");
+			await created.providerStarted;
+			await vi.runAllTimersAsync();
+			await promptPromise;
+
+			expect(created.getProviderCalls()).toBe(2);
+			expect(events.filter((type) => type === "agent_end")).toHaveLength(2);
+			expect(events.filter((type) => type === "agent_settled")).toHaveLength(1);
+			expect(events.at(-1)).toBe("agent_settled");
+		} finally {
+			unsubscribe();
+			created.cleanup();
+		}
 	});
 });

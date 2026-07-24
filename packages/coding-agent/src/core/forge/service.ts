@@ -12,7 +12,11 @@ import { ForgeError } from "./errors.ts";
 import { GitHubAdapter, type GitHubWriteBody } from "./github-adapter.ts";
 import { GitLabAdapter } from "./gitlab-adapter.ts";
 import { type ForgeMutationBegin, ForgeMutationConflictError, ForgeMutationJournal } from "./mutation-journal.ts";
-import { assertPublicNetworkHostname, createPublicNetworkDispatcher } from "./network-security.ts";
+import {
+	assertPublicNetworkHostname,
+	createPrivateNetworkDispatcher,
+	createPublicNetworkDispatcher,
+} from "./network-security.ts";
 import {
 	enforceForgePolicy,
 	evaluateForgePolicy,
@@ -428,8 +432,10 @@ class DefaultForgeService implements ForgeService {
 	private readonly agentDir: string;
 	private readonly credentials: ForgeCredentialStore;
 	private readonly journal: ForgeMutationJournal;
-	private readonly dispatcher?: Dispatcher;
+	private privateDispatcher: Dispatcher | undefined;
 	private readonly publicDispatcher: Dispatcher;
+	private readonly ownsDispatchers: boolean;
+	private closePromise: Promise<void> | undefined;
 	private readonly capabilities = new Map<string, number>();
 
 	constructor(options: CreateForgeServiceOptions) {
@@ -437,11 +443,25 @@ class DefaultForgeService implements ForgeService {
 		this.agentDir = options.agentDir ?? getAgentDir();
 		this.credentials = new ForgeCredentialStore(this.agentDir);
 		this.journal = new ForgeMutationJournal(this.agentDir);
-		this.dispatcher = options.dispatcher;
+		this.ownsDispatchers = options.dispatcher === undefined;
+		this.privateDispatcher = options.dispatcher;
 		this.publicDispatcher = options.dispatcher ?? createPublicNetworkDispatcher();
 	}
 
+	close(): Promise<void> {
+		if (!this.ownsDispatchers) return Promise.resolve();
+		if (!this.closePromise) {
+			const dispatchers = [this.publicDispatcher];
+			if (this.privateDispatcher && this.privateDispatcher !== this.publicDispatcher) {
+				dispatchers.push(this.privateDispatcher);
+			}
+			this.closePromise = Promise.all(dispatchers.map((dispatcher) => dispatcher.close())).then(() => undefined);
+		}
+		return this.closePromise;
+	}
+
 	private async resolve(input: Record<string, unknown>): Promise<ResolvedForge> {
+		if (this.closePromise) throw new ForgeError("remote_failure", "Forge service is closed");
 		const remote = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
 		const repository =
 			/^(?:https?|ssh|git):\/\//.test(remote) || remote.startsWith("git@")
@@ -465,7 +485,11 @@ class DefaultForgeService implements ForgeService {
 		}
 		const allowedHosts = [new URL(instance.apiBaseUrl).host];
 		if (!instance.allowPrivateNetwork) assertPublicNetworkHostname(new URL(instance.apiBaseUrl).hostname);
-		const dispatcher = instance.allowPrivateNetwork ? this.dispatcher : this.publicDispatcher;
+		let dispatcher = this.publicDispatcher;
+		if (instance.allowPrivateNetwork) {
+			this.privateDispatcher ??= createPrivateNetworkDispatcher();
+			dispatcher = this.privateDispatcher;
+		}
 		const common = { baseUrl: instance.apiBaseUrl, token, allowedHosts, dispatcher };
 		const adapter = instance.provider === "gitlab" ? new GitLabAdapter(common) : new GitHubAdapter(common);
 		return {

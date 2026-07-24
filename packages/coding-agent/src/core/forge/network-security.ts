@@ -1,6 +1,6 @@
 import { lookup as dnsLookup } from "node:dns";
 import { isIP } from "node:net";
-import { Agent, type Dispatcher } from "undici-client";
+import { Agent, type Dispatcher, EnvHttpProxyAgent } from "undici-client";
 import { ForgeError } from "./errors.ts";
 
 function ipv4Number(address: string): number | undefined {
@@ -70,4 +70,8 @@ export function createPublicNetworkDispatcher(): Dispatcher {
 			},
 		},
 	});
+}
+
+export function createPrivateNetworkDispatcher(): Dispatcher {
+	return new EnvHttpProxyAgent({ allowH2: false });
 }

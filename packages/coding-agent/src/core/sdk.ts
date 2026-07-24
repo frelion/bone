@@ -11,6 +11,7 @@ import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
+import { streamProviderWithIdleTimeout } from "./provider-stream-watchdog.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
@@ -323,23 +324,30 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const headerRunner = extensionRunnerRef.current;
-			return modelRuntime.streamSimple(model, context, {
-				...options,
-				timeoutMs,
-				websocketConnectTimeoutMs,
-				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-				transformHeaders: async (requestHeaders) => {
-					const headers = mergeProviderAttributionHeaders(
-						model,
-						settingsManager,
-						options?.sessionId,
-						requestHeaders,
-					);
-					return headerRunner?.hasHandlers("before_provider_headers")
-						? headerRunner.emitBeforeProviderHeaders(headers ?? {})
-						: (headers ?? {});
-				},
+			return streamProviderWithIdleTimeout({
+				model,
+				timeoutMs: httpIdleTimeoutMs,
+				signal: options?.signal,
+				start: (signal) =>
+					modelRuntime.streamSimple(model, context, {
+						...options,
+						signal,
+						timeoutMs,
+						websocketConnectTimeoutMs,
+						maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
+						maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+						transformHeaders: async (requestHeaders) => {
+							const headers = mergeProviderAttributionHeaders(
+								model,
+								settingsManager,
+								options?.sessionId,
+								requestHeaders,
+							);
+							return headerRunner?.hasHandlers("before_provider_headers")
+								? headerRunner.emitBeforeProviderHeaders(headers ?? {})
+								: (headers ?? {});
+						},
+					}),
 			});
 		},
 		onPayload: async (payload, _model) => {
