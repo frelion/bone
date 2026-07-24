@@ -85,7 +85,7 @@ const FIELDS: Readonly<Record<string, readonly Field[]>> = {
 		{ label: "Shell path", path: "shellPath", kind: "string" },
 		{ label: "Shell command prefix", path: "shellCommandPrefix", kind: "string" },
 		{ label: "HTTP proxy", path: "httpProxy", kind: "string" },
-		{ label: "HTTP idle timeout", path: "httpIdleTimeoutMs", kind: "number" },
+		{ label: "Provider stream idle timeout", path: "httpIdleTimeoutMs", kind: "number" },
 		{ label: "WebSocket connect timeout", path: "websocketConnectTimeoutMs", kind: "number" },
 	],
 	Resources: [

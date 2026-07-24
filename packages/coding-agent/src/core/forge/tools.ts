@@ -45,6 +45,7 @@ export interface ForgeService {
 		signal: AbortSignal | undefined,
 		context: ForgeToolContext,
 	): Promise<unknown>;
+	close?(): Promise<void>;
 }
 
 export interface CreateForgeToolDefinitionsOptions {

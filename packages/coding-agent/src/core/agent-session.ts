@@ -94,6 +94,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { createForgeService } from "./forge/service.ts";
 import { FORGE_TOOL_NAMES, type ForgeService } from "./forge/tools.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
@@ -378,7 +379,8 @@ export class AgentSession {
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
 	private _agentDir?: string;
-	private _forgeService?: ForgeService;
+	private _forgeService: ForgeService;
+	private readonly _ownsForgeService: boolean;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
@@ -429,7 +431,8 @@ export class AgentSession {
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
 		this._agentDir = config.agentDir;
-		this._forgeService = config.forgeService;
+		this._ownsForgeService = config.forgeService === undefined;
+		this._forgeService = config.forgeService ?? createForgeService({ cwd: config.cwd, agentDir: config.agentDir });
 		this._modelRuntime = config.modelRuntime;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -992,6 +995,10 @@ export class AgentSession {
 		this._eventListeners = [];
 		this._persistedEntriesListeners = [];
 		this._runCompletedListeners = [];
+		if (this._ownsForgeService) {
+			const closingForgeService = this._forgeService.close?.();
+			if (closingForgeService) void closingForgeService.catch(() => {});
+		}
 		cleanupSessionResources(this.sessionId);
 	}
 
@@ -3190,6 +3197,10 @@ export class AgentSession {
 		this.syncQueueModesFromSettings();
 		resetApiProviders();
 		await this._resourceLoader.reload();
+		if (this._ownsForgeService) {
+			await this._forgeService.close?.();
+			this._forgeService = createForgeService({ cwd: this._cwd, agentDir: this._agentDir });
+		}
 		this._buildRuntime({
 			activeToolNames: this.getActiveToolNames(),
 			flagValues: previousFlagValues,
