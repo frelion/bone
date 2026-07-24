@@ -263,6 +263,21 @@ describe("OpenTUI session sidebar", () => {
 		if (!firstRow || !secondRow) throw new Error("Expected two session rows");
 		const firstPoint = { x: firstRow.screenX + 2, y: firstRow.screenY + 1 };
 		const secondPoint = { x: secondRow.screenX + 2, y: secondRow.screenY + 1 };
+		const pointerChanges = vi.spyOn(renderer, "setMousePointer");
+		const renderRequests = vi.spyOn(renderer, "requestRender");
+		const restingBackground = secondRow.backgroundColor.toString();
+		await mockMouse.moveTo(secondPoint.x, secondPoint.y);
+		expect(pointerChanges).toHaveBeenLastCalledWith("pointer");
+		expect(renderRequests).toHaveBeenCalled();
+		const normalHoverBackground = secondRow.backgroundColor.toString();
+		expect(normalHoverBackground).not.toBe(restingBackground);
+		await mockMouse.moveTo(shell.mainRoot.screenX + 2, shell.mainRoot.screenY + 2);
+		expect(pointerChanges).toHaveBeenLastCalledWith("default");
+		expect(secondRow.backgroundColor.toString()).toBe(restingBackground);
+		sidebar.setSessions([makeSession("a", "cold"), makeSession("b", "foreground")]);
+		await mockMouse.moveTo(secondPoint.x, secondPoint.y);
+		expect(secondRow.backgroundColor.toString()).not.toBe(normalHoverBackground);
+		await mockMouse.moveTo(shell.mainRoot.screenX + 2, shell.mainRoot.screenY + 2);
 
 		await mockMouse.pressDown(secondPoint.x, secondPoint.y);
 		expect(activate).not.toHaveBeenCalled();

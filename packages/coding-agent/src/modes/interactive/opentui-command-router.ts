@@ -9,6 +9,7 @@ import type { AgentSession } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type { ExtensionUIV2Context } from "../../core/extensions/ui-v2.ts";
 import { BUILTIN_SLASH_COMMANDS, type BuiltinSlashCommand, type SlashCommandInfo } from "../../core/slash-commands.ts";
+import { resolveTaskModel } from "../../core/task-model-router.ts";
 import { getProjectTrustOptions, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { copyToClipboard } from "../../utils/clipboard.ts";
 import { OpenTUISettingsCenter } from "./components/opentui-settings-center.ts";
@@ -29,6 +30,7 @@ export interface OpenTUICommandRouterOptions {
 	onShowChangelog?: () => void | Promise<void>;
 	onShowHotkeys?: () => void | Promise<void>;
 	onPresentationChanged?: () => void | Promise<void>;
+	onSessionListChanged?: () => void | Promise<void>;
 }
 
 export type OpenTUICommandResult = { handled: false } | { handled: true; kind: "command" | "bash" };
@@ -141,7 +143,7 @@ export class OpenTUICommandRouter {
 				this.status("Reloaded local resources");
 				return;
 			case "name":
-				await this.name(session, argument);
+				await this.name(runtime, argument);
 				return;
 			case "conversation":
 				this.conversation(session);
@@ -340,16 +342,57 @@ export class OpenTUICommandRouter {
 		this.status(`Logged out of ${selected}`);
 	}
 
-	private async name(session: AgentSession, argument: string): Promise<void> {
-		const name =
-			argument ||
-			(await requireUI(this.options.getUI()).dialogs.input({
-				title: "Conversation name",
-				initialValue: session.sessionManager.getSessionName(),
-			}));
-		if (!name?.trim()) return;
-		session.setSessionName(name.trim());
-		this.status(`Conversation name: ${name.trim()}`);
+	private async name(runtime: AgentSessionRuntime, argument: string): Promise<void> {
+		const session = runtime.session;
+		const explicitName = argument.trim();
+		if (explicitName) {
+			session.setSessionName(explicitName);
+			if (runtime !== this.options.host.current) await this.options.onSessionListChanged?.();
+			this.status(`Conversation name set: ${session.sessionManager.getSessionName() ?? explicitName}`);
+			return;
+		}
+
+		const previousName = session.sessionManager.getSessionName();
+		if (previousName) {
+			const confirmed = await requireUI(this.options.getUI()).dialogs.confirm({
+				title: "Generate conversation name",
+				message: `Replace the current name "${previousName}" with a generated title?`,
+			});
+			if (!confirmed) {
+				this.status("Conversation name unchanged");
+				return;
+			}
+		}
+
+		try {
+			const resolved = await resolveTaskModel("title", {
+				conversationModel: session.model,
+				taskModel: runtime.services.settingsManager.getTaskModel("title"),
+				modelRuntime: session.modelRuntime,
+			});
+			this.status(`Generating conversation name with ${resolved.model.provider}/${resolved.model.id}...`);
+			const result = await session.generateTitle(resolved.model);
+			if (result.kind === "title") {
+				session.setSessionName(result.title);
+				if (runtime !== this.options.host.current) await this.options.onSessionListChanged?.();
+				this.status(`Conversation name set: ${result.title}`);
+				return;
+			}
+			if (result.kind === "not-ready") {
+				const fallback = "No title suggested yet. Describe a task, then run /name again.";
+				this.status(
+					previousName ? `${result.message ?? fallback} Kept "${previousName}".` : (result.message ?? fallback),
+				);
+				return;
+			}
+			if (result.kind === "cancelled") {
+				this.status("Conversation name generation cancelled");
+				return;
+			}
+			this.status(`Could not generate conversation name: ${result.message}`, "error");
+		} catch (error) {
+			this.status(error instanceof Error ? error.message : String(error), "error");
+		}
 	}
 
 	private conversation(session: AgentSession): void {

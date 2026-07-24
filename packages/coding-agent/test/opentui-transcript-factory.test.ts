@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import type { AssistantMessage, ImageContent } from "@frelion/bone-ai";
-import { type CliRenderer, type Renderable, TextRenderable } from "@opentui/core";
+import { type BoxRenderable, type CliRenderer, type Renderable, TextRenderable } from "@opentui/core";
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ExtensionUIViewFactory } from "../src/core/extensions/ui-v2.ts";
@@ -369,7 +369,7 @@ describe("OpenTUI transcript factory", () => {
 		const renderer = setup.renderer;
 		renderer.root.add(started.item.root);
 		const captured = await frame(setup, "future detail");
-		expect(captured).toContain("read · complete");
+		expect(captured).toContain("read · expanded.txt · complete");
 		expect(captured).toContain("⌄ ✓ Inspected the workspace · 1s · 1 tool call");
 	});
 
@@ -414,7 +414,7 @@ describe("OpenTUI transcript factory", () => {
 		const collapsed = await frame(setup, "Worked for 1s · 1 tool calls");
 		expect(collapsed).not.toContain("done");
 		factory.setAllToolDetailsExpanded(true);
-		expect(await frame(setup, "done")).toContain("read · complete");
+		expect(await frame(setup, "done")).toContain("read · README.md · complete");
 
 		const duplicateResult = await factory.handleEvent({
 			type: "message_start",
@@ -448,6 +448,7 @@ describe("OpenTUI transcript factory", () => {
 		const renderer = setup.renderer;
 		const states: unknown[] = [];
 		const previousViews: Array<Renderable | undefined> = [];
+		const detailAnchors: Renderable[] = [];
 		const renderCall = vi.fn((args: unknown, context: { expanded: boolean }) =>
 			textView(`custom call:${context.expanded}:${JSON.stringify(args)}`),
 		);
@@ -468,6 +469,10 @@ describe("OpenTUI transcript factory", () => {
 			{
 				cwd: "/workspace",
 				getToolRenderer: (toolName) => (toolName === "read" ? { renderCall, renderResult } : undefined),
+				onToolDetailChange: (anchor, mutate) => {
+					detailAnchors.push(anchor);
+					mutate();
+				},
 			},
 		);
 		const started = await factory.handleEvent({
@@ -481,11 +486,22 @@ describe("OpenTUI transcript factory", () => {
 		renderer.root.add(started.item.root);
 		expect(await frame(setup, "Inspecting the workspace")).not.toContain("custom call");
 		await setup.mockMouse.click(2, 1);
-		expect(await frame(setup, "custom call:false")).toContain("one.txt");
-		await setup.mockMouse.pressDown(2, 3);
-		expect(renderCall).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ expanded: false }));
-		await setup.mockMouse.release(2, 3);
+		expect(await frame(setup, "read · one.txt · running")).not.toContain("custom call");
+		const groupDetails = (started.item.root as BoxRenderable).getChildren()[2] as BoxRenderable;
+		const structuredRoot = groupDetails.getChildren()[0] as BoxRenderable;
+		const fallbackRoot = structuredRoot.getChildren()[0] as BoxRenderable;
+		const fallbackBody = fallbackRoot.getChildren()[0] as BoxRenderable;
+		const toolTitle = fallbackBody.getChildren()[0];
+		if (!toolTitle) throw new Error("expected structured tool title");
+		await setup.mockMouse.click(toolTitle.screenX + 1, toolTitle.screenY);
 		expect(await frame(setup, "custom call:true")).toContain("one.txt");
+		expect(detailAnchors).toEqual([toolTitle]);
+		expect(fallbackBody.getChildren()[0] as Renderable | undefined).toBe(toolTitle);
+		expect(renderCall).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ expanded: true }));
+		await setup.mockMouse.click(toolTitle.screenX + 1, toolTitle.screenY);
+		expect(await frame(setup, "read · one.txt · running")).not.toContain("custom call");
+		expect(detailAnchors).toEqual([toolTitle, toolTitle]);
+		expect(fallbackBody.getChildren()[0] as Renderable | undefined).toBe(toolTitle);
 
 		const partial = await factory.handleEvent({
 			type: "tool_execution_update",
@@ -616,7 +632,7 @@ describe("OpenTUI transcript factory", () => {
 		});
 		factory.setAllToolDetailsExpanded(true);
 		captured = await frame(setup, "event queue result");
-		expect(captured).toContain("read · complete");
+		expect(captured).toContain("read · events.ts · complete");
 		expect(captured).toContain("events.ts");
 
 		now = 4_000;
@@ -864,7 +880,7 @@ describe("OpenTUI transcript factory", () => {
 		expect(captured).toContain("tool mount fallback");
 		expect(captured).toContain("message mount fallback");
 		expect(captured).toContain("[custom entry unavailable]");
-		expect(onError).toHaveBeenCalledTimes(4);
+		expect(onError).toHaveBeenCalledTimes(3);
 		expect(onError).toHaveBeenCalledWith(toolError, "tool renderer view");
 		expect(onError).toHaveBeenCalledWith(messageError, "custom message view");
 		expect(onError).toHaveBeenCalledWith(entryError, "custom entry view");
@@ -913,13 +929,14 @@ describe("OpenTUI transcript factory", () => {
 		});
 		expect(partial.type).toBe("updated");
 		expect(completed.type).toBe("updated");
-		expect(renderCall).toHaveBeenCalled();
-		expect(renderResult).toHaveBeenCalledTimes(2);
+		expect(renderCall).not.toHaveBeenCalled();
+		expect(renderResult).not.toHaveBeenCalled();
 		expect(await frame(setup, "Worked for 1s · 1 tool calls")).not.toContain("complete fallback");
 		factory.setAllToolDetailsExpanded(true);
 		const toolFrame = await frame(setup, "complete fallback");
-		expect(toolFrame).toContain("read · complete");
+		expect(toolFrame).toContain("read · fallback.txt · complete");
 		expect(toolFrame).not.toContain("partial fallback");
+		expect(renderResult).toHaveBeenCalledOnce();
 
 		const following = await factory.handleEvent({ type: "message_start", message: assistant("still alive") });
 		expect(following.type).toBe("append");

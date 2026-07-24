@@ -5,6 +5,7 @@ import {
 	DiffRenderable,
 	fg,
 	MarkdownRenderable,
+	type Renderable,
 	StyledText,
 	SyntaxStyle,
 	TextAttributes,
@@ -18,6 +19,7 @@ import type {
 	CustomMessage,
 } from "../../../core/messages.ts";
 import { stripAnsi } from "../../../utils/ansi.ts";
+import { OPEN_TUI_COLORS } from "../opentui-design.ts";
 import { type Theme, theme } from "../theme/theme.ts";
 import { OpenTUIClickCoordinator } from "./opentui-click.ts";
 import { OpenTUIRgbaImage } from "./opentui-image.ts";
@@ -54,10 +56,19 @@ function customContent(message: CustomMessage<unknown>): string {
 		.join("\n");
 }
 
-function preview(content: string, expanded: boolean): { content: string; hiddenLines: number } {
+function preview(
+	content: string,
+	full: boolean,
+	options: { limit?: number; fromEnd?: boolean } = {},
+): { content: string; hiddenLines: number; hiddenBefore: boolean } {
 	const lines = content.split("\n");
-	if (expanded || lines.length <= PREVIEW_LINES) return { content, hiddenLines: 0 };
-	return { content: lines.slice(-PREVIEW_LINES).join("\n"), hiddenLines: lines.length - PREVIEW_LINES };
+	const limit = options.limit ?? PREVIEW_LINES;
+	if (full || lines.length <= limit) return { content, hiddenLines: 0, hiddenBefore: false };
+	return {
+		content: options.fromEnd ? lines.slice(-limit).join("\n") : lines.slice(0, limit).join("\n"),
+		hiddenLines: lines.length - limit,
+		hiddenBefore: options.fromEnd ?? false,
+	};
 }
 
 function isUnifiedDiff(content: string): boolean {
@@ -128,11 +139,15 @@ abstract class RebuildableView {
 export interface OpenTUIToolExecutionOptions {
 	theme?: Theme;
 	expanded?: boolean;
+	onDetailLevelChange?: (level: OpenTUIToolDetailLevel, anchor: Renderable) => void;
 }
+
+export type OpenTUIToolDetailLevel = "collapsed" | "full";
 
 export interface OpenTUIWorkingGroupTool {
 	readonly root: BoxRenderable;
 	setExpanded(expanded: boolean): void;
+	setDetailLevel(level: OpenTUIToolDetailLevel): void;
 	getActivityKind?(): OpenTUIToolActivityKind;
 }
 
@@ -148,6 +163,82 @@ function activityKindForTool(toolName: string): OpenTUIToolActivityKind {
 	return "other";
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function firstString(record: Record<string, unknown> | undefined, keys: readonly string[]): string | undefined {
+	for (const key of keys) {
+		const value = record?.[key];
+		if (typeof value === "string" && value.trim()) return value;
+	}
+	return undefined;
+}
+
+function compactSummaryPart(value: string, limit = 72): string {
+	const compact = value.replace(/\s+/g, " ").trim();
+	return compact.length <= limit ? compact : `${compact.slice(0, Math.max(1, limit - 3)).trimEnd()}...`;
+}
+
+function toolSummaryTarget(toolName: string, args: unknown): string | undefined {
+	const record = asRecord(args);
+	const normalized = toolName.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+	if (/^(?:bash|shell|exec|execute|command|run)(?:_|$)/.test(normalized)) {
+		return firstString(record, ["command", "cmd", "script"]);
+	}
+	if (/^(?:grep|search|find)(?:_|$)/.test(normalized)) {
+		const query = firstString(record, ["query", "pattern", "search", "text"]);
+		const path = firstString(record, ["path", "cwd", "directory"]);
+		return query && path ? `"${query}" in ${path}` : query ? `"${query}"` : path;
+	}
+	const path = firstString(record, ["path", "filePath", "file", "target", "directory", "cwd"]);
+	if (path) return path;
+	return firstString(record, ["action", "query", "pattern", "name", "url", "id"]);
+}
+
+function toolSummaryFact(toolName: string, phase: string, result: ToolResultMessage | undefined): string {
+	if (phase === "failed") {
+		const firstErrorLine = result
+			? textContent(result.content)
+					.split("\n")
+					.find((line) => line.trim())
+			: undefined;
+		return firstErrorLine ? `failed: ${compactSummaryPart(firstErrorLine, 44)}` : phase;
+	}
+	if (!result || phase !== "complete") return phase;
+	const details = asRecord(result.details);
+	if (activityKindForTool(toolName) === "command") {
+		for (const key of ["exitCode", "exit_code", "code"] as const) {
+			const value = details?.[key];
+			if (typeof value === "number") return `exit ${value}`;
+		}
+	}
+	if (activityKindForTool(toolName) === "inspect") {
+		const lines = textContent(result.content).split("\n").length;
+		if (lines > 1) return `${lines} lines`;
+	}
+	return phase;
+}
+
+export function summarizeOpenTUIToolCall(
+	toolName: string,
+	args: unknown,
+	options: { phase: string; result?: ToolResultMessage },
+): string {
+	const target = toolSummaryTarget(toolName, args);
+	const name = compactSummaryPart(toolName, 28);
+	const fact = toolSummaryFact(toolName, options.phase, options.result);
+	const parts = [name];
+	if (target) {
+		const availableTargetLength = Math.max(16, 104 - name.length - fact.length - 6);
+		parts.push(compactSummaryPart(target, availableTargetLength));
+	}
+	parts.push(fact);
+	return compactSummaryPart(parts.join(" · "), 104);
+}
+
 export class OpenTUIToolExecution extends RebuildableView {
 	private readonly toolName: string;
 	private readonly toolCallId: string;
@@ -156,7 +247,8 @@ export class OpenTUIToolExecution extends RebuildableView {
 	private partial = true;
 	private executionStarted = false;
 	private argsComplete = false;
-	private expanded: boolean;
+	private detailLevel: OpenTUIToolDetailLevel;
+	private readonly onDetailLevelChange: ((level: OpenTUIToolDetailLevel, anchor: Renderable) => void) | undefined;
 	private attachments: readonly OpenTUIImageAttachment[] = [];
 	private viewTheme: Theme;
 	private readonly body: BoxRenderable;
@@ -165,7 +257,6 @@ export class OpenTUIToolExecution extends RebuildableView {
 	private readonly argsNode: TextRenderable;
 	private readonly outputRoot: BoxRenderable;
 	private readonly attachmentsRoot: BoxRenderable;
-	private readonly hiddenNode: TextRenderable;
 	private outputNode: TextRenderable | DiffRenderable | undefined;
 	private renderedAttachments: readonly OpenTUIImageAttachment[] = [];
 	private readonly clicks = new OpenTUIClickCoordinator();
@@ -184,34 +275,48 @@ export class OpenTUIToolExecution extends RebuildableView {
 		this.toolName = toolName;
 		this.toolCallId = toolCallId;
 		this.args = args;
-		this.expanded = options.expanded ?? false;
-		this.detailProgress = this.expanded ? 1 : 0;
+		this.detailLevel = options.expanded ? "full" : "collapsed";
+		this.onDetailLevelChange = options.onDetailLevelChange;
+		this.detailProgress = this.detailLevel === "collapsed" ? 0 : 1;
 		this.detailTarget = this.detailProgress;
 		this.viewTheme = options.theme ?? theme;
 		this.root.onMouse = (event) => {
 			if (this.clicks.handle(event) && event.type === "down") this.renderer.clearSelection();
 		};
-		this.root.add(new BoxRenderable(renderer, { width: "100%", height: 1 }));
-		this.body = new BoxRenderable(renderer, { flexDirection: "column", paddingX: 1, paddingY: 1 });
+		this.body = new BoxRenderable(renderer, { flexDirection: "column", paddingX: 1 });
 		this.titleNode = new TextRenderable(renderer, {
 			content: "",
 			attributes: TextAttributes.BOLD,
+			wrapMode: "none",
+			truncate: true,
+			width: "100%",
+			onMouseOver: () => {
+				this.titleNode.attributes = TextAttributes.BOLD | TextAttributes.UNDERLINE;
+			},
+			onMouseOut: () => {
+				this.titleNode.attributes = TextAttributes.BOLD;
+			},
 		});
-		this.clicks.register(this.titleNode, () => this.setExpanded(!this.expanded));
+		this.clicks.register(
+			this.titleNode,
+			() => {
+				this.requestDetailLevel(this.detailLevel === "collapsed" ? "full" : "collapsed");
+			},
+			this.renderer,
+		);
 		this.detailsRoot = new BoxRenderable(renderer, {
 			flexDirection: "column",
-			visible: this.expanded,
+			paddingLeft: 2,
+			visible: this.detailLevel !== "collapsed",
 			opacity: this.detailProgress,
 		});
 		this.argsNode = new TextRenderable(renderer, { content: "", wrapMode: "word" });
 		this.outputRoot = new BoxRenderable(renderer, { flexDirection: "column" });
 		this.attachmentsRoot = new BoxRenderable(renderer, { flexDirection: "column" });
-		this.hiddenNode = new TextRenderable(renderer, { content: "", attributes: TextAttributes.DIM });
 		this.body.add(this.titleNode);
 		this.detailsRoot.add(this.argsNode);
 		this.detailsRoot.add(this.outputRoot);
 		this.detailsRoot.add(this.attachmentsRoot);
-		this.detailsRoot.add(this.hiddenNode);
 		this.body.add(this.detailsRoot);
 		this.root.add(this.body);
 		this.rebuild();
@@ -241,10 +346,15 @@ export class OpenTUIToolExecution extends RebuildableView {
 	}
 
 	setExpanded(expanded: boolean): void {
-		if (this.expanded === expanded && this.detailTarget === (expanded ? 1 : 0)) return;
-		this.expanded = expanded;
-		this.detailTarget = expanded ? 1 : 0;
-		if (expanded) this.detailsRoot.visible = true;
+		this.setDetailLevel(expanded ? "full" : "collapsed");
+	}
+
+	setDetailLevel(level: OpenTUIToolDetailLevel): void {
+		const visible = level !== "collapsed";
+		if (this.detailLevel === level && this.detailTarget === (visible ? 1 : 0)) return;
+		this.detailLevel = level;
+		this.detailTarget = visible ? 1 : 0;
+		if (visible) this.detailsRoot.visible = true;
 		this.rebuild();
 		this.advanceDetailAnimation();
 		this.startDetailAnimation();
@@ -254,14 +364,13 @@ export class OpenTUIToolExecution extends RebuildableView {
 		return activityKindForTool(this.toolName);
 	}
 
+	getSummaryNode(): Renderable {
+		return this.titleNode;
+	}
+
 	protected rebuild(): void {
 		if (this.root.isDestroyed) return;
-		const background = this.partial
-			? this.viewTheme.getBgColor("toolPendingBg")
-			: this.result?.isError
-				? this.viewTheme.getBgColor("toolErrorBg")
-				: this.viewTheme.getBgColor("toolSuccessBg");
-		this.body.backgroundColor = background;
+		this.body.backgroundColor = undefined;
 		const phase = this.result
 			? this.partial
 				? "streaming"
@@ -273,7 +382,10 @@ export class OpenTUIToolExecution extends RebuildableView {
 				: this.argsComplete
 					? "ready"
 					: "preparing";
-		this.titleNode.content = `${this.toolName} · ${phase}`;
+		this.titleNode.content = summarizeOpenTUIToolCall(this.toolName, this.args, {
+			phase,
+			result: this.result,
+		});
 		this.titleNode.fg = this.result?.isError
 			? this.viewTheme.getFgColor("error")
 			: this.viewTheme.getFgColor("toolTitle");
@@ -284,12 +396,10 @@ export class OpenTUIToolExecution extends RebuildableView {
 		if (!this.result) {
 			this.outputRoot.visible = false;
 			this.attachmentsRoot.visible = false;
-			this.hiddenNode.visible = false;
 			this.applyDetailAnimation();
 			return;
 		}
 		const resultContent = textContent(this.result.content);
-		const output = preview(resultContent, this.expanded);
 		const diff = resultContent && isUnifiedDiff(resultContent);
 		if (diff) {
 			if (!(this.outputNode instanceof DiffRenderable)) {
@@ -313,25 +423,28 @@ export class OpenTUIToolExecution extends RebuildableView {
 				this.outputNode = new TextRenderable(this.renderer, { content: "", wrapMode: "word" });
 				this.outputRoot.add(this.outputNode);
 			}
-			this.outputNode.content = output.content;
+			this.outputNode.content = resultContent;
 			this.outputNode.fg = this.result.isError
 				? this.viewTheme.getFgColor("error")
 				: this.viewTheme.getFgColor("toolOutput");
 		}
 		this.outputRoot.visible = Boolean(resultContent);
 		if (
-			this.renderedAttachments.length !== this.attachments.length ||
-			this.renderedAttachments.some((attachment, index) => attachment !== this.attachments[index])
+			this.detailLevel === "full" &&
+			(this.renderedAttachments.length !== this.attachments.length ||
+				this.renderedAttachments.some((attachment, index) => attachment !== this.attachments[index]))
 		) {
 			clearChildren(this.attachmentsRoot);
 			appendImageAttachments(this.renderer, this.attachmentsRoot, this.attachments, this.viewTheme);
 			this.renderedAttachments = this.attachments;
 		}
-		this.attachmentsRoot.visible = this.attachments.length > 0;
-		this.hiddenNode.content = output.hiddenLines > 0 && !diff ? `${output.hiddenLines} earlier lines hidden` : "";
-		this.hiddenNode.fg = this.viewTheme.getFgColor("muted");
-		this.hiddenNode.visible = Boolean(this.hiddenNode.content);
+		this.attachmentsRoot.visible = this.detailLevel === "full" && this.attachments.length > 0;
 		this.applyDetailAnimation();
+	}
+
+	private requestDetailLevel(level: OpenTUIToolDetailLevel): void {
+		if (this.onDetailLevelChange) this.onDetailLevelChange(level, this.titleNode);
+		else this.setDetailLevel(level);
 	}
 
 	private startDetailAnimation(): void {
@@ -437,8 +550,14 @@ export class OpenTUIWorkingGroup extends RebuildableView {
 		this.header = new BoxRenderable(renderer, {
 			flexDirection: "column",
 			paddingX: 1,
+			onMouseOver: () => {
+				this.header.backgroundColor = OPEN_TUI_COLORS.elementRaised;
+			},
+			onMouseOut: () => {
+				this.header.backgroundColor = undefined;
+			},
 		});
-		this.clicks.register(this.header, () => this.toggleExpanded());
+		this.clicks.register(this.header, () => this.toggleExpanded(), this.renderer);
 		this.summaryNode = new TextRenderable(renderer, { content: "" });
 		this.header.add(this.summaryNode);
 		this.detailsRoot = new BoxRenderable(renderer, { flexDirection: "column", visible: false, opacity: 0 });
@@ -465,10 +584,7 @@ export class OpenTUIWorkingGroup extends RebuildableView {
 		if (!entry) return;
 		entry.complete = true;
 		entry.failed = failed;
-		if (failed) {
-			entry.view.setExpanded(true);
-			this.setExpanded(true);
-		}
+		if (failed) this.setExpanded(true);
 		if (this.completeWithTools && this.entries.every((candidate) => candidate.complete)) this.finish(failed);
 		this.rebuild();
 	}
@@ -507,7 +623,7 @@ export class OpenTUIWorkingGroup extends RebuildableView {
 
 	setToolDetailsExpanded(expanded: boolean): void {
 		this.setExpanded(expanded);
-		for (const entry of this.entries) entry.view.setExpanded(expanded);
+		for (const entry of this.entries) entry.view.setDetailLevel(expanded ? "full" : "collapsed");
 	}
 
 	toggleExpanded(): void {

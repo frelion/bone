@@ -6,7 +6,12 @@ import type { AssistantMessage } from "@frelion/bone-ai/compat";
 import { TextRenderable } from "@opentui/core";
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.ts";
+import type {
+	AgentSession,
+	AgentSessionEvent,
+	AgentSessionEventListener,
+	PromptOptions,
+} from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { getLastActiveConversation } from "../src/core/conversation-state.ts";
 import type {
@@ -469,7 +474,14 @@ describe("OpenTUIInteractiveMode", () => {
 			type: "tool_execution_end",
 			toolCallId: "call-1",
 			toolName: "read",
-			result: { content: [{ type: "text", text: "final chunk" }] },
+			result: {
+				content: [
+					{
+						type: "text",
+						text: `${Array.from({ length: 23 }, (_, index) => `line ${index + 1}`).join("\n")}\nfinal chunk`,
+					},
+				],
+			},
 			isError: false,
 		});
 		await mode.idle();
@@ -478,11 +490,25 @@ describe("OpenTUIInteractiveMode", () => {
 		let frame = renderer.captureFrame();
 		expect(frame).toContain("✓ Inspected the workspace · 1s · 1 tool call");
 		expect(frame).not.toContain("final chunk");
+		const activityRow = frame.split("\n").findIndex((line) => line.includes("Inspected the workspace"));
+		expect(activityRow).toBeGreaterThanOrEqual(0);
+		await renderer.mouse.click(4, activityRow);
+		await settle(renderer);
+		frame = renderer.captureFrame();
+		const summary = "read · README.md · 24 lines";
+		const summaryRow = frame.split("\n").findIndex((line) => line.includes(summary));
+		expect(summaryRow).toBeGreaterThanOrEqual(0);
+		await renderer.mouse.click(5, summaryRow);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		await settle(renderer);
+		frame = renderer.captureFrame();
+		expect(frame).toContain("line 1");
+		expect(frame.split("\n").findIndex((line) => line.includes(summary))).toBe(summaryRow);
 		renderer.input.pressKey("o", { ctrl: true });
 		await settle(renderer);
 		frame = renderer.captureFrame();
-		expect(frame).toContain("read · complete");
-		expect(frame).toContain("final chunk");
+		expect(frame).toContain(summary);
+		expect(frame).toContain("line 1");
 		mode.stop();
 	});
 
@@ -637,6 +663,86 @@ describe("OpenTUIInteractiveMode", () => {
 		await settle(renderer);
 
 		expect(handleEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "message_update" }));
+		mode.stop();
+	});
+
+	test("generates and refreshes an unnamed conversation title after the first user message is persisted", async () => {
+		const entries: SessionEntry[] = [];
+		const active = createRuntime(entries, { sessionFile: "/tmp/automatic-title.jsonl" });
+		const model = { provider: "test", id: "title-model" };
+		const generateTitle = vi.fn(async () => {
+			expect(active.session.sessionManager.getEntries()).toHaveLength(1);
+			return { kind: "title" as const, title: "Automatic title" };
+		});
+		const setSessionName = vi.fn();
+		Object.assign(active.runtime.session as AgentSession, {
+			model,
+			modelRuntime: { checkAuth: vi.fn(async () => true) },
+			generateTitle,
+			setSessionName,
+		});
+		Object.assign(active.runtime.services.settingsManager, { getTaskModel: () => undefined });
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		const listCallsBeforeStart = host.listPage.mock.calls.length;
+		const firstUserEntry = entry(userMessage("Fix title generation"), "first-user");
+		entries.push(firstUserEntry);
+
+		await host.hooks.persistedEntries?.(active.runtime, [firstUserEntry]);
+		await mode.idle();
+
+		expect(generateTitle).toHaveBeenCalledWith(model);
+		expect(setSessionName).toHaveBeenCalledWith("Automatic title");
+		expect(host.listPage.mock.calls.length).toBeGreaterThan(listCallsBeforeStart);
+		mode.stop();
+	});
+
+	test("does not replace a manual name while automatic title generation is in flight", async () => {
+		const entries = [entry(userMessage("Fix title generation"), "first-user")];
+		const active = createRuntime(entries, { sessionFile: "/tmp/manual-title-race.jsonl" });
+		const model = { provider: "test", id: "title-model" };
+		let currentName: string | undefined;
+		let finishTitle!: (result: { kind: "title"; title: string }) => void;
+		const generateTitle = vi.fn(
+			async () =>
+				await new Promise<{ kind: "title"; title: string }>((resolve) => {
+					finishTitle = resolve;
+				}),
+		);
+		const setSessionName = vi.fn((name: string) => {
+			currentName = name;
+		});
+		Object.assign(active.session.sessionManager, { getSessionName: () => currentName });
+		Object.assign(active.runtime.session as AgentSession, {
+			model,
+			modelRuntime: { checkAuth: vi.fn(async () => true) },
+			generateTitle,
+			setSessionName,
+		});
+		Object.assign(active.runtime.services.settingsManager, { getTaskModel: () => undefined });
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+
+		await host.hooks.persistedEntries?.(active.runtime, entries);
+		await vi.waitFor(() => expect(generateTitle).toHaveBeenCalledOnce());
+		setSessionName("Manual title");
+		finishTitle({ kind: "title", title: "Automatic title" });
+		await mode.idle();
+
+		expect(setSessionName).toHaveBeenCalledTimes(1);
+		expect(currentName).toBe("Manual title");
 		mode.stop();
 	});
 
@@ -1072,6 +1178,11 @@ describe("OpenTUIInteractiveMode", () => {
 		await settle(renderer);
 		expect(renderer.captureFrame()).toContain("Task completed");
 		const banner = (mode as unknown as { transcriptUpdatesBanner: TextRenderable }).transcriptUpdatesBanner;
+		const restingBannerAttributes = banner.attributes;
+		await renderer.mouse.moveTo(banner.screenX + 1, banner.screenY);
+		expect(banner.attributes).not.toBe(restingBannerAttributes);
+		await renderer.mouse.moveTo(banner.screenX + 1, banner.screenY - 1);
+		expect(banner.attributes).toBe(restingBannerAttributes);
 		await renderer.mouse.pressDown(banner.screenX + 1, banner.screenY);
 		await settle(renderer);
 		expect(renderer.captureFrame()).toContain("Task completed");

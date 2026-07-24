@@ -10,6 +10,7 @@ import {
 	OpenTUIStatusView,
 	OpenTUIToolExecution,
 	OpenTUIWorkingGroup,
+	summarizeOpenTUIToolCall,
 	textOnlyToolResult,
 } from "../src/modes/interactive/components/opentui-rich-messages.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -38,6 +39,30 @@ async function setup() {
 }
 
 describe("OpenTUI rich messages", () => {
+	test("builds bounded one-line tool summaries from the primary target", () => {
+		expect(summarizeOpenTUIToolCall("bash", { command: "bun test\n--watch" }, { phase: "running" })).toBe(
+			"bash · bun test --watch · running",
+		);
+		const long = summarizeOpenTUIToolCall(
+			"read",
+			{ path: `/workspace/${"deep/".repeat(30)}file.ts` },
+			{ phase: "complete", result: textOnlyToolResult("read", "summary-call", "one\ntwo\nthree") },
+		);
+		expect(long).toContain("3 lines");
+		expect(long).not.toContain("\n");
+		expect(long.length).toBeLessThanOrEqual(104);
+		const failed = summarizeOpenTUIToolCall(
+			"write",
+			{ path: `/workspace/${"deep/".repeat(30)}locked.ts` },
+			{
+				phase: "failed",
+				result: textOnlyToolResult("write", "failed-summary", "permission denied\nlong stack", true),
+			},
+		);
+		expect(failed).toContain("failed: permission denied");
+		expect(failed.length).toBeLessThanOrEqual(104);
+	});
+
 	test("updates tool and bash streaming content in place with error and expansion states", async () => {
 		const testRenderer = await setup();
 		const { renderer } = testRenderer;
@@ -46,30 +71,48 @@ describe("OpenTUI rich messages", () => {
 		const tool = new OpenTUIToolExecution(renderer, "read", "call-1", { path: "README.md" });
 		root.add(tool.root);
 		tool.markExecutionStarted();
-		let captured = await frame(testRenderer, "read · running");
-		expect(captured).not.toContain("README.md");
-		await testRenderer.mockMouse.pressDown(2, 2);
-		expect(await frame(testRenderer, "read · running")).not.toContain("README.md");
-		await testRenderer.mockMouse.release(2, 2);
+		let captured = await frame(testRenderer, "read · README.md · running");
+		expect(captured).not.toContain('"path": "README.md"');
+		expect(tool.root.height).toBe(1);
+		const toolBody = tool.root.getChildren()[0] as BoxRenderable;
+		const toolTitle = toolBody.getChildren()[0];
+		if (!toolTitle) throw new Error("Expected tool title");
+		const restingToolTitleAttributes = toolTitle.attributes;
+		await testRenderer.mockMouse.moveTo(toolTitle.screenX + 1, toolTitle.screenY);
+		await testRenderer.flush();
+		expect(toolTitle.attributes).not.toBe(restingToolTitleAttributes);
+		await testRenderer.mockMouse.moveTo(40, 20);
+		await testRenderer.flush();
+		expect(toolTitle.attributes).toBe(restingToolTitleAttributes);
+		await testRenderer.mockMouse.pressDown(toolTitle.screenX + 1, toolTitle.screenY);
+		expect(await frame(testRenderer, "read · README.md · running")).not.toContain('"path": "README.md"');
+		await testRenderer.mockMouse.release(toolTitle.screenX + 1, toolTitle.screenY);
 		captured = await frame(testRenderer, "README.md");
 		expect(captured).toContain("README.md");
 		tool.setExpanded(false);
-		await testRenderer.mockMouse.click(2, 2, MouseButtons.RIGHT);
-		expect(await frame(testRenderer, "read · running")).not.toContain("README.md");
-		await testRenderer.mockMouse.drag(2, 2, 8, 2);
-		expect(await frame(testRenderer, "read · running")).not.toContain("README.md");
-		await testRenderer.mockMouse.click(2, 2);
+		await testRenderer.mockMouse.click(toolTitle.screenX + 1, toolTitle.screenY, MouseButtons.RIGHT);
+		expect(await frame(testRenderer, "read · README.md · running")).not.toContain('"path": "README.md"');
+		await testRenderer.mockMouse.drag(
+			toolTitle.screenX + 1,
+			toolTitle.screenY,
+			toolTitle.screenX + 7,
+			toolTitle.screenY,
+		);
+		expect(await frame(testRenderer, "read · README.md · running")).not.toContain('"path": "README.md"');
+		await testRenderer.mockMouse.click(toolTitle.screenX + 1, toolTitle.screenY);
 		expect(await frame(testRenderer, "README.md")).toContain("README.md");
 
 		const manyLines = Array.from({ length: 24 }, (_, index) => `line ${index + 1}`).join("\n");
 		tool.updateResult(textOnlyToolResult("read", "call-1", manyLines), true);
-		captured = await frame(testRenderer, "4 earlier lines hidden");
-		expect(captured).toContain("read · streaming");
-		tool.setExpanded(true);
-		captured = await frame(testRenderer, "line 1");
-		expect(captured).not.toContain("earlier lines hidden");
+		captured = await frame(testRenderer, "line 24");
+		expect(captured).toContain("read · README.md · streaming");
+		expect(captured).toContain("line 1");
+		expect(captured).toContain("line 20");
+		expect(captured).toContain("line 21");
+		expect(captured).not.toContain("lines hidden");
+		expect(captured).not.toContain("Show all");
 		tool.updateResult(textOnlyToolResult("read", "call-1", "permission denied", true));
-		expect(await frame(testRenderer, "permission denied")).toContain("read · failed");
+		expect(await frame(testRenderer, "permission denied")).toContain("read · README.md · failed");
 
 		const bash = new OpenTUIBashExecution(renderer, "bun test");
 		root.add(bash.root);
@@ -78,6 +121,22 @@ describe("OpenTUI rich messages", () => {
 		expect(await frame(testRenderer, "second")).toContain("Running...");
 		bash.setComplete(2, false);
 		expect(await frame(testRenderer, "Exited with code 2")).toContain("$ bun test");
+	});
+
+	test("shows complete long command output when expanded", async () => {
+		const testRenderer = await setup();
+		const { renderer } = testRenderer;
+		const tool = new OpenTUIToolExecution(renderer, "bash", "call-command", { command: "bun test" });
+		renderer.root.add(tool.root);
+		tool.markExecutionStarted();
+		tool.setDetailLevel("full");
+		const output = Array.from({ length: 24 }, (_, index) => `command line ${index + 1}`).join("\n");
+		tool.updateResult(textOnlyToolResult("bash", "call-command", output));
+
+		const captured = await frame(testRenderer, "command line 24");
+		expect(captured).toContain("command line 1");
+		expect(captured).toContain("command line 24");
+		expect(captured).not.toContain("Show all");
 	});
 
 	test("renders status, summaries, skill, and custom messages as structured nodes", async () => {
@@ -143,7 +202,7 @@ describe("OpenTUI rich messages", () => {
 		);
 		const captured = await frame(testRenderer, "new value");
 		expect(captured).toContain("old value");
-		expect(captured).toContain("edit · complete");
+		expect(captured).toContain("edit · a.ts · complete");
 	});
 
 	test("summarizes a successful working group and toggles that group by mouse", async () => {
@@ -165,11 +224,20 @@ describe("OpenTUI rich messages", () => {
 		renderer.root.add(group.root);
 		let captured = await frame(testRenderer, "✓ Inspected the workspace · 18s · 7 tool calls");
 		expect(captured).not.toContain("result 0");
+		const header = group.root.getChildren()[1];
+		if (!header) throw new Error("Expected working group header");
+		const restingHeaderBackground = header.backgroundColor.toString();
+		await testRenderer.mockMouse.moveTo(header.screenX + 1, header.screenY);
+		await testRenderer.flush();
+		expect(header.backgroundColor.toString()).not.toBe(restingHeaderBackground);
+		await testRenderer.mockMouse.moveTo(40, 20);
+		await testRenderer.flush();
+		expect(header.backgroundColor.toString()).toBe(restingHeaderBackground);
 
 		await testRenderer.mockMouse.pressDown(2, 1);
-		expect(await frame(testRenderer, "Inspected the workspace")).not.toContain("read · complete");
+		expect(await frame(testRenderer, "Inspected the workspace")).not.toContain("read · 0.txt · complete");
 		await testRenderer.mockMouse.release(2, 1);
-		captured = await frame(testRenderer, "read · complete");
+		captured = await frame(testRenderer, "read · 0.txt · complete");
 		expect(captured).toContain("⌄ ✓ Inspected the workspace · 18s · 7 tool calls");
 		expect(captured).not.toContain("result 0");
 		firstTool?.setExpanded(true);
@@ -183,14 +251,20 @@ describe("OpenTUI rich messages", () => {
 		const group = new OpenTUIWorkingGroup(renderer, 0, () => 2_000);
 		const tool = new OpenTUIToolExecution(renderer, "write", "failed-call", { path: "locked.txt" });
 		tool.markExecutionStarted();
-		tool.updateResult(textOnlyToolResult("write", "failed-call", "permission denied", true));
+		const longError = [
+			"permission denied",
+			...Array.from({ length: 40 }, (_, index) => `stack line ${index + 1}`),
+		].join("\n");
+		tool.updateResult(textOnlyToolResult("write", "failed-call", longError, true));
 		group.addTool("failed-call", tool);
 		group.markToolComplete("failed-call", true);
 		renderer.root.add(group.root);
 
 		const captured = await frame(testRenderer, "permission denied");
 		expect(captured).toContain("✗ Update failed · 2s · 1 tool call");
-		expect(captured).toContain("write · failed");
+		expect(captured).toContain("write · locked.txt · failed: permission denied");
+		expect(captured).not.toContain('"path": "locked.txt"');
+		expect(captured).not.toContain("stack line 40");
 	});
 
 	test("shows a failed Agent activity even when no tool failed", async () => {

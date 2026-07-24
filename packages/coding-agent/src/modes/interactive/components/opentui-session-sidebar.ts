@@ -45,6 +45,12 @@ function stateColor(state: InteractiveSessionSummary["state"]): ThemeColor {
 	return "muted";
 }
 
+function sessionRowBackground(foreground: boolean, selected: boolean, hovered: boolean): string | undefined {
+	if (foreground) return hovered ? OPEN_TUI_COLORS.primary : OPEN_TUI_COLORS.primaryStrong;
+	if (selected) return hovered ? OPEN_TUI_COLORS.border : OPEN_TUI_COLORS.selection;
+	return hovered ? OPEN_TUI_COLORS.elementRaised : undefined;
+}
+
 function consume(event: KeyEvent): true {
 	event.preventDefault();
 	event.stopPropagation();
@@ -67,6 +73,8 @@ interface SessionRowRecord {
 	titleNode: TextRenderable;
 	previewNode: TextRenderable;
 	metadataNode: TextRenderable;
+	foreground: boolean;
+	selected: boolean;
 }
 
 /** Structured OpenTUI conversation sidebar with search and session actions. */
@@ -91,6 +99,7 @@ export class OpenTUISessionSidebar {
 	private readonly clicks = new OpenTUIClickCoordinator();
 	private readonly rowRecords = new Map<string, SessionRowRecord>();
 	private renderedPaths: string[] = [];
+	private hoveredPath: string | undefined;
 
 	public onActivateSession?: (sessionPath: string) => void;
 	public onPreviewSession?: (sessionPath: string) => void;
@@ -441,6 +450,7 @@ export class OpenTUISessionSidebar {
 		const sessions = this.getDisplayedSessions();
 		if (this.updateStableRows(sessions)) return;
 		this.clicks.reset();
+		this.hoveredPath = undefined;
 		clearChildren(list);
 		this.rowRecords.clear();
 		this.renderedPaths = sessions.map((session) => session.path);
@@ -473,13 +483,19 @@ export class OpenTUISessionSidebar {
 				width: "100%",
 				height: 3,
 				flexDirection: "column",
-				backgroundColor: foreground
-					? OPEN_TUI_COLORS.primaryStrong
-					: selected
-						? OPEN_TUI_COLORS.selection
-						: undefined,
+				backgroundColor: sessionRowBackground(foreground, selected, false),
+				onMouseOver: () => {
+					this.hoveredPath = session.path;
+					const record = this.rowRecords.get(session.path);
+					if (record) record.row.backgroundColor = sessionRowBackground(record.foreground, record.selected, true);
+				},
+				onMouseOut: () => {
+					if (this.hoveredPath === session.path) this.hoveredPath = undefined;
+					const record = this.rowRecords.get(session.path);
+					if (record) record.row.backgroundColor = sessionRowBackground(record.foreground, record.selected, false);
+				},
 			});
-			this.clicks.register(row, activateFromMouse);
+			this.clicks.register(row, activateFromMouse, this.renderer);
 			const foregroundText = foreground ? OPEN_TUI_COLORS.primaryText : selectedText;
 			const titleRow = new BoxRenderable(this.renderer, {
 				width: "100%",
@@ -566,6 +582,8 @@ export class OpenTUISessionSidebar {
 				titleNode,
 				previewNode,
 				metadataNode,
+				foreground,
+				selected,
 			});
 			list.add(row);
 			if (index < sessions.length - 1) {
@@ -596,16 +614,14 @@ export class OpenTUISessionSidebar {
 			const record = this.rowRecords.get(session.path)!;
 			const selected = this.focused && index === this.selectedIndex;
 			const foreground = session.state === "foreground";
+			record.foreground = foreground;
+			record.selected = selected;
 			const foregroundText = foreground
 				? OPEN_TUI_COLORS.primaryText
 				: selected
 					? OPEN_TUI_COLORS.selectionText
 					: undefined;
-			record.row.backgroundColor = foreground
-				? OPEN_TUI_COLORS.primaryStrong
-				: selected
-					? OPEN_TUI_COLORS.selection
-					: undefined;
+			record.row.backgroundColor = sessionRowBackground(foreground, selected, this.hoveredPath === session.path);
 			record.stateNode.content = STATE_ICON[session.state];
 			record.stateNode.fg = foregroundText ?? this.sidebarTheme.getFgColor(stateColor(session.state));
 			record.titleNode.content = normalizePreview(session.name ?? session.firstMessage) || "(empty conversation)";

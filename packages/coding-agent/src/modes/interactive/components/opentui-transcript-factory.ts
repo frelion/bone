@@ -14,7 +14,6 @@ import {
 	createCustomMessage,
 } from "../../../core/messages.ts";
 import type { SessionEntry } from "../../../core/session-manager.ts";
-import { OpenTUIClickCoordinator } from "./opentui-click.ts";
 import { decodeOpenTUIImages, OpenTUIImageAttachments } from "./opentui-image.ts";
 import {
 	hasVisibleOpenTUIAssistantContent,
@@ -31,6 +30,7 @@ import {
 	type OpenTUIImageAttachment,
 	OpenTUISkillInvocation,
 	type OpenTUIToolActivityKind,
+	type OpenTUIToolDetailLevel,
 	OpenTUIToolExecution,
 	OpenTUIWorkingGroup,
 } from "./opentui-rich-messages.ts";
@@ -50,6 +50,7 @@ export interface OpenTUITranscriptFactoryResolvers {
 	getMessageView?: (customType: string) => CustomMessageViewRenderer | undefined;
 	getEntryView?: (customType: string) => CustomEntryViewRenderer | undefined;
 	onError?: (error: unknown, surface: string) => void;
+	onToolDetailChange?: (anchor: Renderable, mutate: () => void) => void;
 }
 
 export interface OpenTUITranscriptItem {
@@ -77,17 +78,19 @@ class OpenTUIStructuredToolExecution {
 	private readonly toolCallId: string;
 	private readonly cwd: string;
 	private readonly getRenderer: () => ExtensionUIToolViewRenderer | undefined;
+	private readonly getOnToolDetailChange: () => OpenTUITranscriptFactoryResolvers["onToolDetailChange"];
 	private readonly onError: ((error: unknown, surface: string) => void) | undefined;
 	private readonly fallback: OpenTUIToolExecution;
-	private readonly clicks = new OpenTUIClickCoordinator();
+	private readonly structuredDetails: BoxRenderable;
+	private readonly structuredContent: BoxRenderable;
 	private readonly state: Record<string, unknown> = {};
 	private args: unknown;
 	private result: ToolResultMessage | undefined;
 	private isPartial = true;
-	private expanded = false;
+	private detailLevel: OpenTUIToolDetailLevel = "collapsed";
 	private executionStarted = false;
 	private argsComplete = false;
-	private currentView: Renderable | undefined;
+	private customView: Renderable | undefined;
 
 	constructor(
 		renderer: CliRenderer,
@@ -96,6 +99,7 @@ class OpenTUIStructuredToolExecution {
 		args: unknown,
 		cwd: string,
 		getRenderer: () => ExtensionUIToolViewRenderer | undefined,
+		getOnToolDetailChange: () => OpenTUITranscriptFactoryResolvers["onToolDetailChange"],
 		onError?: (error: unknown, surface: string) => void,
 	) {
 		this.renderer = renderer;
@@ -103,12 +107,22 @@ class OpenTUIStructuredToolExecution {
 		this.args = args;
 		this.cwd = cwd;
 		this.getRenderer = getRenderer;
+		this.getOnToolDetailChange = getOnToolDetailChange;
 		this.onError = onError;
 		this.root = new BoxRenderable(renderer, { flexDirection: "column" });
-		this.root.onMouse = (event) => {
-			if (this.clicks.handle(event) && event.type === "down") this.renderer.clearSelection();
-		};
-		this.fallback = new OpenTUIToolExecution(renderer, toolName, toolCallId, args);
+		this.fallback = new OpenTUIToolExecution(renderer, toolName, toolCallId, args, {
+			onDetailLevelChange: (_level, anchor) =>
+				this.requestDetailLevel(this.detailLevel === "collapsed" ? "full" : "collapsed", anchor),
+		});
+		this.structuredDetails = new BoxRenderable(renderer, {
+			flexDirection: "column",
+			paddingLeft: 3,
+			visible: false,
+		});
+		this.structuredContent = new BoxRenderable(renderer, { flexDirection: "column", minWidth: 0 });
+		this.structuredDetails.add(this.structuredContent);
+		this.root.add(this.fallback.root);
+		this.root.add(this.structuredDetails);
 	}
 
 	updateArgs(args: unknown): void {
@@ -141,8 +155,12 @@ class OpenTUIStructuredToolExecution {
 	}
 
 	setExpanded(expanded: boolean): void {
-		this.expanded = expanded;
-		this.fallback.setExpanded(expanded);
+		this.setDetailLevel(expanded ? "full" : "collapsed");
+	}
+
+	setDetailLevel(level: OpenTUIToolDetailLevel): void {
+		if (this.detailLevel === level) return;
+		this.detailLevel = level;
 		this.refresh();
 	}
 
@@ -153,6 +171,14 @@ class OpenTUIStructuredToolExecution {
 	private refresh(): void {
 		if (this.root.isDestroyed) return;
 		const renderer = this.getRenderer();
+		if (!renderer || this.detailLevel === "collapsed") {
+			this.fallback.setDetailLevel(this.detailLevel);
+			this.structuredDetails.visible = false;
+			return;
+		}
+		this.fallback.setDetailLevel("collapsed");
+		this.structuredDetails.visible = true;
+		const expanded = this.detailLevel === "full";
 		const renderContext: ExtensionUIToolViewState = {
 			toolCallId: this.toolCallId,
 			args: this.args,
@@ -161,14 +187,14 @@ class OpenTUIStructuredToolExecution {
 			executionStarted: this.executionStarted,
 			argsComplete: this.argsComplete,
 			isPartial: this.isPartial,
-			expanded: this.expanded,
+			expanded,
 			isError: this.result?.isError ?? false,
-			previousView: this.currentView,
+			previousView: this.customView,
 		};
 		let nextView: ExtensionUIView | undefined;
 		try {
 			nextView = this.result
-				? renderer?.renderResult?.(
+				? renderer.renderResult?.(
 						{
 							result: {
 								content: this.result.content,
@@ -176,40 +202,52 @@ class OpenTUIStructuredToolExecution {
 								addedToolNames: this.result.addedToolNames,
 							},
 							isPartial: this.isPartial,
-							expanded: this.expanded,
+							expanded,
 						},
 						renderContext,
 					)
-				: renderer?.renderCall?.(this.args, renderContext);
+				: renderer.renderCall?.(this.args, renderContext);
 		} catch (error) {
 			this.onError?.(error, "tool result renderer");
 			nextView = undefined;
 		}
-		let resolvedView = this.fallback.root as Renderable;
+		let resolvedView: Renderable | undefined;
 		if (nextView) {
 			try {
 				resolvedView = resolveExtensionView(nextView, this.renderer);
-				if (resolvedView.isDestroyed || (resolvedView.parent && resolvedView.parent !== this.root)) {
+				if (resolvedView.isDestroyed || (resolvedView.parent && resolvedView.parent !== this.structuredContent)) {
 					throw new Error("Extension tool renderer returned an attached or destroyed renderable");
 				}
 			} catch (error) {
 				this.onError?.(error, "tool renderer view");
-				resolvedView = this.fallback.root;
+				resolvedView = undefined;
 			}
 		}
-		if (resolvedView === this.currentView) {
-			this.currentView?.requestRender();
+		if (!resolvedView) {
+			this.fallback.setDetailLevel(this.detailLevel);
+			this.structuredDetails.visible = false;
 			return;
 		}
-		if (this.currentView && !this.currentView.isDestroyed) this.root.remove(this.currentView);
-		if (this.currentView && this.currentView !== this.fallback.root && !this.currentView.isDestroyed) {
-			this.currentView.destroyRecursively();
+		if (resolvedView === this.customView) {
+			this.customView.requestRender();
+			return;
 		}
-		this.currentView = resolvedView;
-		if (resolvedView !== this.fallback.root) {
-			this.clicks.register(resolvedView, () => this.setExpanded(!this.expanded));
+		if (this.customView && !this.customView.isDestroyed) {
+			this.structuredContent.remove(this.customView);
+			this.customView.destroyRecursively();
 		}
-		this.root.add(this.currentView);
+		this.customView = resolvedView;
+		this.structuredContent.add(resolvedView);
+	}
+
+	private requestDetailLevel(level: OpenTUIToolDetailLevel, anchor: Renderable): void {
+		const mutate = () => this.setDetailLevel(level);
+		if (this.resolversOnToolDetailChange) this.resolversOnToolDetailChange(anchor, mutate);
+		else mutate();
+	}
+
+	private get resolversOnToolDetailChange(): OpenTUITranscriptFactoryResolvers["onToolDetailChange"] {
+		return this.getOnToolDetailChange();
 	}
 }
 
@@ -661,6 +699,7 @@ export class OpenTUITranscriptFactory {
 			args,
 			this.resolvers.cwd ?? process.cwd(),
 			() => this.resolvers.getToolRenderer?.(toolName),
+			() => this.resolvers.onToolDetailChange,
 			this.resolvers.onError,
 		);
 	}

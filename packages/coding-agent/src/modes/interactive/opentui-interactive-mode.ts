@@ -1,7 +1,7 @@
 import { basename, resolve } from "node:path";
 import type { ImageContent } from "@frelion/bone-ai/compat";
 import { type AutocompleteProvider, createRenderer, OverlayManager } from "@frelion/bone-tui";
-import { type CliRenderer, type KeyEvent, TextRenderable } from "@opentui/core";
+import { type CliRenderer, type KeyEvent, type Renderable, TextAttributes, TextRenderable } from "@opentui/core";
 import type { AgentSessionEvent, PromptOptions } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import { rememberLastActiveConversation } from "../../core/conversation-state.ts";
@@ -17,6 +17,7 @@ import type { LocalEmbeddingStatus } from "../../core/local-embedding.ts";
 import { MemoryRuntime } from "../../core/memory.ts";
 import type { PlanProposal } from "../../core/plan-mode.ts";
 import type { QuestionAnswer, QuestionRequest } from "../../core/question.ts";
+import { resolveTaskModel } from "../../core/task-model-router.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { OpenTUITopBar, OpenTUIWelcome } from "./components/opentui-chrome.ts";
 import { OpenTUIClickCoordinator } from "./components/opentui-click.ts";
@@ -180,11 +181,13 @@ export class OpenTUIInteractiveMode {
 	private readonly pendingSessionUpdates = new Map<string, PendingSessionUpdate>();
 	private submissionTail: Promise<void> = Promise.resolve();
 	private readonly runtimeSubmissionTails = new WeakMap<AgentSessionRuntime, Promise<void>>();
+	private readonly automaticTitleGeneration = new WeakSet<AgentSessionRuntime>();
 	private readonly interactionTasks = new Set<Promise<void>>();
 	private footerData: FooterDataProvider | undefined;
 	private sidebarSessions: InteractiveSessionSummary[] = [];
 	private sidebarOffset = 0;
 	private sidebarHasMore = false;
+	private sidebarRefreshGeneration = 0;
 	private sessionSearchTimer: ReturnType<typeof setTimeout> | undefined;
 	private semanticSearchTimer: ReturnType<typeof setTimeout> | undefined;
 	private sessionSearchGeneration = 0;
@@ -203,6 +206,7 @@ export class OpenTUIInteractiveMode {
 	private stopping = false;
 	private cleanupPromise: Promise<void> | undefined;
 	private renderTail: Promise<void> = Promise.resolve();
+	private toolAnchorAdjustmentGeneration = 0;
 	private resolveShutdown: (() => void) | undefined;
 	private readonly shutdown = new Promise<void>((resolve) => {
 		this.resolveShutdown = resolve;
@@ -243,6 +247,7 @@ export class OpenTUIInteractiveMode {
 			onQuit: () => this.stop(),
 			onReloaded: () => this.maybeSaveImplicitProjectTrustAfterReload(),
 			onPresentationChanged: () => this.refreshPresentation(),
+			onSessionListChanged: () => this.refreshSidebar(),
 		});
 		this.sessionHost.setHooks({
 			beforeForegroundChange: async (runtime) => this.unbindForeground(runtime),
@@ -263,6 +268,10 @@ export class OpenTUIInteractiveMode {
 					{ path: sessionPath, id: manager.getSessionId(), name: manager.getSessionName() },
 					entries,
 				);
+				if (entries.some((entry) => entry.type === "message" && entry.message.role === "user")) {
+					this.launchInteraction(() => this.maybeGenerateConversationName(runtime));
+					this.launchInteraction(() => this.refreshSidebar());
+				}
 			},
 			runCompleted: async (runtime, messages) => {
 				if (runtime !== this.sessionHost.current) this.recordBackgroundCompletion(runtime);
@@ -273,6 +282,7 @@ export class OpenTUIInteractiveMode {
 					{ path: sessionPath, id: manager.getSessionId(), name: manager.getSessionName() },
 					messages,
 				);
+				await this.refreshSidebar();
 			},
 		});
 	}
@@ -305,7 +315,14 @@ export class OpenTUIInteractiveMode {
 			paddingX: 1,
 			fg: theme.getFgColor("accent"),
 		});
-		this.clicks.register(this.transcriptUpdatesBanner, () => this.transcriptFocus?.jumpToLatest());
+		const transcriptUpdatesBanner = this.transcriptUpdatesBanner;
+		transcriptUpdatesBanner.onMouseOver = () => {
+			transcriptUpdatesBanner.attributes = TextAttributes.UNDERLINE;
+		};
+		transcriptUpdatesBanner.onMouseOut = () => {
+			transcriptUpdatesBanner.attributes = TextAttributes.NONE;
+		};
+		this.clicks.register(this.transcriptUpdatesBanner, () => this.transcriptFocus?.jumpToLatest(), this.renderer);
 		this.transcriptUpdatesBanner.visible = false;
 		regions.aboveEditor.add(this.transcriptUpdatesBanner);
 		this.composer = new OpenTUIComposer(this.renderer, {
@@ -643,6 +660,7 @@ export class OpenTUIInteractiveMode {
 	}
 
 	private async unbindForeground(runtime?: AgentSessionRuntime): Promise<void> {
+		this.toolAnchorAdjustmentGeneration++;
 		this.pendingSessionUpdates.clear();
 		if (runtime && this.composer && this.shell) {
 			const state = {
@@ -727,6 +745,7 @@ export class OpenTUIInteractiveMode {
 				transcriptFactory.reset();
 				transcriptFactory.setResolvers({
 					cwd: runtime.cwd,
+					onToolDetailChange: (anchor, mutate) => this.changeToolDetailsAtAnchor(anchor, mutate),
 					getToolRenderer: (name) =>
 						this.extensionBinding?.getToolRenderer?.(name) ?? runtime.session.getToolDefinition?.(name)?.renderV2,
 					getMessageView: (type) => runtime.session.extensionRunner.getMessageView(type),
@@ -763,6 +782,30 @@ export class OpenTUIInteractiveMode {
 		this.renderTail = render;
 		await render;
 		return historySnapshot;
+	}
+
+	private changeToolDetailsAtAnchor(anchor: Renderable, mutate: () => void): void {
+		const transcript = this.shell?.getTranscriptNode();
+		if (!transcript || anchor.isDestroyed) {
+			mutate();
+			return;
+		}
+		const generation = ++this.toolAnchorAdjustmentGeneration;
+		const screenY = anchor.screenY;
+		mutate();
+		this.renderer?.requestRender();
+
+		const correct = (): void => {
+			if (generation !== this.toolAnchorAdjustmentGeneration || anchor.isDestroyed) return;
+			const delta = anchor.screenY - screenY;
+			if (delta !== 0) transcript.scrollTo(transcript.scrollTop + delta);
+			this.renderer?.requestRender();
+		};
+		setImmediate(correct);
+		for (const delay of [50, 100, 160, 240]) {
+			const timer = setTimeout(correct, delay);
+			(timer as { unref?: () => void }).unref?.();
+		}
 	}
 
 	private loadEarlierTranscriptPage(): void {
@@ -910,6 +953,7 @@ export class OpenTUIInteractiveMode {
 		if (event.type === "session_info_changed" || event.type === "thinking_level_changed") {
 			this.topBar?.update(this.getTopBarState(runtime));
 		}
+		if (event.type === "session_info_changed") await this.refreshSidebar();
 		if (
 			event.type === "agent_start" ||
 			event.type === "agent_end" ||
@@ -948,6 +992,29 @@ export class OpenTUIInteractiveMode {
 			.catch((error: unknown) => this.showInteractionError(error))
 			.finally(() => this.interactionTasks.delete(task));
 		this.interactionTasks.add(task);
+	}
+
+	private async maybeGenerateConversationName(runtime: AgentSessionRuntime): Promise<void> {
+		const session = runtime.session;
+		if (session.sessionManager.getSessionName() || this.automaticTitleGeneration.has(runtime)) return;
+
+		this.automaticTitleGeneration.add(runtime);
+		try {
+			const resolved = await resolveTaskModel("title", {
+				conversationModel: session.model,
+				taskModel: runtime.services.settingsManager.getTaskModel("title"),
+				modelRuntime: session.modelRuntime,
+			});
+			if (this.stopping || session.sessionManager.getSessionName()) return;
+			const result = await session.generateTitle(resolved.model);
+			if (result.kind !== "title" || this.stopping || session.sessionManager.getSessionName()) return;
+			session.setSessionName(result.title);
+			if (runtime !== this.sessionHost.current) await this.refreshSidebar();
+		} catch {
+			// Automatic naming is best effort. An unnamed conversation retries on the next turn.
+		} finally {
+			this.automaticTitleGeneration.delete(runtime);
+		}
 	}
 
 	private isCurrentForeground(runtime: AgentSessionRuntime, generation: number): boolean {
@@ -1342,7 +1409,9 @@ export class OpenTUIInteractiveMode {
 
 	private async refreshSidebar(): Promise<void> {
 		if (!this.sidebar) return;
+		const generation = ++this.sidebarRefreshGeneration;
 		const page = await this.sessionHost.listPage(0, SIDEBAR_PAGE_SIZE);
+		if (generation !== this.sidebarRefreshGeneration || !this.sidebar) return;
 		this.sidebarSessions = page.sessions;
 		this.sidebarOffset = page.nextOffset;
 		this.sidebarHasMore = page.hasMore;

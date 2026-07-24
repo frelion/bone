@@ -111,6 +111,41 @@ describe("OpenTUICommandRouter", () => {
 		expect(secondName).not.toHaveBeenCalled();
 	});
 
+	test("generates a conversation title when /name has no argument", async () => {
+		const model = { provider: "test", id: "title-model" };
+		const generateTitle = vi.fn(async () => ({ kind: "title" as const, title: "Generated title" }));
+		const setSessionName = vi.fn();
+		const session = {
+			model,
+			modelRuntime: { checkAuth: vi.fn(async () => true) },
+			generateTitle,
+			setSessionName,
+			sessionManager: { getSessionName: () => undefined },
+		} as unknown as AgentSession;
+		const runtime = {
+			session,
+			cwd: "/tmp",
+			services: {
+				agentDir: "/tmp",
+				settingsManager: { getTaskModel: () => undefined },
+			},
+		} as unknown as AgentSessionRuntime;
+		const statuses: string[] = [];
+		const router = new OpenTUICommandRouter({
+			host: { current: runtime, createNew: async () => {} },
+			getUI: () => undefined,
+			onStatus: (message) => statuses.push(message),
+			onFocusConversations: vi.fn(),
+			onQuit: vi.fn(),
+		});
+
+		await router.route("/name");
+
+		expect(generateTitle).toHaveBeenCalledWith(model);
+		expect(setSessionName).toHaveBeenCalledWith("Generated title");
+		expect(statuses.at(-1)).toBe("Conversation name set: Generated title");
+	});
+
 	test("routes ! and !! through executeBash with context semantics", async () => {
 		const { router, executeBash } = createHarness();
 		expect(await router.route("! pwd")).toEqual({ handled: true, kind: "bash" });
