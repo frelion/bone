@@ -130,6 +130,19 @@ export interface OpenTUIToolExecutionOptions {
 export interface OpenTUIWorkingGroupTool {
 	readonly root: BoxRenderable;
 	setExpanded(expanded: boolean): void;
+	getActivityKind?(): OpenTUIToolActivityKind;
+}
+
+export type OpenTUIToolActivityKind = "inspect" | "update" | "command" | "other";
+
+function activityKindForTool(toolName: string): OpenTUIToolActivityKind {
+	const normalized = toolName.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+	if (/^(?:read|view|open|grep|search|find|glob|list|ls)(?:_|$)/.test(normalized)) return "inspect";
+	if (/^(?:edit|write|create|delete|remove|move|copy|mkdir|patch|apply_patch)(?:_|$)/.test(normalized)) {
+		return "update";
+	}
+	if (/^(?:bash|shell|exec|execute|command|run)(?:_|$)/.test(normalized)) return "command";
+	return "other";
 }
 
 export class OpenTUIToolExecution extends RebuildableView {
@@ -207,6 +220,10 @@ export class OpenTUIToolExecution extends RebuildableView {
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
 		this.rebuild();
+	}
+
+	getActivityKind(): OpenTUIToolActivityKind {
+		return activityKindForTool(this.toolName);
 	}
 
 	protected rebuild(): void {
@@ -295,6 +312,43 @@ interface WorkingGroupEntry {
 	failed: boolean;
 }
 
+function workingGroupActivity(entries: readonly WorkingGroupEntry[], complete: boolean, failed: boolean): string {
+	const kinds = new Set(entries.map((entry) => entry.view.getActivityKind?.() ?? "other"));
+	if (kinds.size === 1) {
+		const kind = kinds.values().next().value as OpenTUIToolActivityKind;
+		if (failed) {
+			if (kind === "inspect") return "Inspection failed";
+			if (kind === "update") return "Update failed";
+			if (kind === "command") return "Command failed";
+			return "Work failed";
+		}
+		if (kind === "inspect") return complete ? "Inspected the workspace" : "Inspecting the workspace";
+		if (kind === "update") {
+			return complete
+				? entries.length === 1
+					? "Updated a file"
+					: "Updated files"
+				: entries.length === 1
+					? "Updating a file"
+					: "Updating files";
+		}
+		if (kind === "command") {
+			return complete
+				? entries.length === 1
+					? "Ran a command"
+					: "Ran commands"
+				: entries.length === 1
+					? "Running a command"
+					: "Running commands";
+		}
+	}
+	if (failed) return "Work failed";
+	if (kinds.size === 2 && kinds.has("inspect") && kinds.has("update")) {
+		return complete ? "Inspected and updated files" : "Inspecting and updating files";
+	}
+	return complete ? "Completed work" : "Working";
+}
+
 export class OpenTUIWorkingGroup extends RebuildableView {
 	private readonly startedAt: number;
 	private readonly now: () => number;
@@ -365,9 +419,11 @@ export class OpenTUIWorkingGroup extends RebuildableView {
 		});
 		const count = this.entries.length;
 		const elapsedSeconds = Math.max(1, Math.round(((this.completedAt ?? this.now()) - this.startedAt) / 1000));
+		const toolCount = `${count} tool ${count === 1 ? "call" : "calls"}`;
+		const activity = workingGroupActivity(this.entries, this.completedAt !== undefined, failed);
 		const summary = this.completedAt
-			? `${failed ? "✗" : "✓"} Worked for ${elapsedSeconds}s · ${count} tool calls`
-			: `◐ Working group · ${count} tool calls`;
+			? `${failed ? "✗" : "✓"} ${activity} · ${elapsedSeconds}s · ${toolCount}`
+			: `◐ ${activity} · ${toolCount}`;
 		header.add(
 			new TextRenderable(this.renderer, {
 				content: `${this.expanded ? "⌄" : "›"} ${summary}`,

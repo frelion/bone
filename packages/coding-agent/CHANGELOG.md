@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Refined the OpenTUI conversation workflow with task-aware composer states, explicit follow-up queueing, semantic tool summaries, stable conversation identity, paused-scroll update notices, and background-separated user prompts.
+
+### Fixed
+
+- Fixed conversation search changing the active session while browsing results, Escape ambiguously aborting active work, long histories loading all entries at once, and background session previews continuously animating.
+
 ## [0.1.5] - 2026-07-23
 
 ## [0.1.4] - 2026-07-23

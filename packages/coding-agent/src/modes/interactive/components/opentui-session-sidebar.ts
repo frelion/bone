@@ -8,15 +8,12 @@ import {
 	TextareaRenderable,
 	TextRenderable,
 } from "@opentui/core";
-import stringWidth from "string-width";
 import type { InteractiveSessionSummary } from "../../../core/interactive-session-host.ts";
 import type { MemorySearchResult } from "../../../core/memory.ts";
 import { OPEN_TUI_COLORS, OPEN_TUI_LAYOUT } from "../opentui-design.ts";
 import { matchesOpenTUIAction } from "../opentui-keymap.ts";
 import { type Theme, type ThemeColor, theme } from "../theme/theme.ts";
-import { formatConversationActivityTime, formatConversationCreatedTime } from "./conversation-time.ts";
-
-const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+import { formatConversationActivityTime } from "./conversation-time.ts";
 
 const STATE_ICON: Record<InteractiveSessionSummary["state"], string> = {
 	foreground: "●",
@@ -39,22 +36,6 @@ function normalizePreview(text: string): string {
 
 function clearChildren(root: BoxRenderable): void {
 	for (const child of root.getChildren()) child.destroyRecursively();
-}
-
-/** Keep a running conversation's preview anchored to its newest model output. */
-function latestPreviewWindow(text: string, width: number): string {
-	if (width <= 0 || stringWidth(text) <= width) return text;
-	const graphemes = Array.from(graphemeSegmenter.segment(text), ({ segment }) => segment);
-	const tail: string[] = [];
-	let usedWidth = 0;
-	for (let index = graphemes.length - 1; index >= 0; index--) {
-		const grapheme = graphemes[index]!;
-		const graphemeWidth = stringWidth(grapheme);
-		if (usedWidth + graphemeWidth > width) break;
-		tail.unshift(grapheme);
-		usedWidth += graphemeWidth;
-	}
-	return tail.join("");
 }
 
 function stateColor(state: InteractiveSessionSummary["state"]): ThemeColor {
@@ -85,11 +66,6 @@ function formatThroughput(tokensPerSecond: number | undefined): string {
 	return `${tokensPerSecond.toFixed(1)} tok/s`;
 }
 
-interface MarqueeEntry {
-	node: TextRenderable;
-	text: string;
-}
-
 interface SessionRowRecord {
 	row: BoxRenderable;
 	stateNode: TextRenderable;
@@ -113,16 +89,13 @@ export class OpenTUISessionSidebar {
 	private searchQueryValue = "";
 	private searchMode = false;
 	private searchStartPath: string | undefined;
-	private previewedSearchPath: string | undefined;
 	private readonly renderer: CliRenderer;
 	private searchInput: TextareaRenderable | undefined;
 	private searchStatusNode: TextRenderable | undefined;
 	private focused = false;
 	private frozenOrder: string[] | undefined;
-	private readonly marqueeEntries = new Map<string, MarqueeEntry>();
 	private readonly rowRecords = new Map<string, SessionRowRecord>();
 	private renderedPaths: string[] = [];
-	private marqueeTimer: ReturnType<typeof setInterval> | undefined;
 
 	public onActivateSession?: (sessionPath: string) => void;
 	public onPreviewSession?: (sessionPath: string) => void;
@@ -148,7 +121,6 @@ export class OpenTUISessionSidebar {
 		});
 		this.list = new ScrollBoxRenderable(renderer, { width: "100%", flexGrow: 1, minHeight: 0, scrollY: true });
 		this.rebuildChrome();
-		this.startMarquee();
 	}
 
 	get searchActive(): boolean {
@@ -230,16 +202,13 @@ export class OpenTUISessionSidebar {
 	}
 
 	dispose(): void {
-		if (this.marqueeTimer) clearInterval(this.marqueeTimer);
-		this.marqueeTimer = undefined;
-		this.marqueeEntries.clear();
+		// Retained for owners that dispose all view components uniformly.
 	}
 
 	startSearch(): void {
 		if (this.searchActive) return;
 		this.searchStartPath = this.selectedPath;
 		this.searchMode = true;
-		this.previewedSearchPath = undefined;
 		this.itemState = { kind: "normal" };
 		this.searchResults = undefined;
 		this.searchStatus = undefined;
@@ -248,24 +217,17 @@ export class OpenTUISessionSidebar {
 		this.onSearchStateChange?.(true);
 	}
 
-	stopSearch(options?: { restorePreview?: boolean }): void {
+	stopSearch(): void {
 		if (!this.searchActive) return;
-		const restorePath =
-			options?.restorePreview && this.previewedSearchPath && this.previewedSearchPath !== this.searchStartPath
-				? this.searchStartPath
-				: undefined;
 		this.searchResults = undefined;
 		this.searchMode = false;
 		this.searchStatus = undefined;
 		this.searchStartPath = undefined;
-		this.previewedSearchPath = undefined;
-		if (restorePath) this.selectedPath = restorePath;
 		this.searchInput = undefined;
 		this.reconcileSelection();
 		this.rebuildChrome();
 		this.onSearchQueryChange?.("");
 		this.onSearchStateChange?.(false);
-		if (restorePath) this.onPreviewSession?.(restorePath);
 	}
 
 	handleKey(event: KeyEvent): boolean {
@@ -349,7 +311,7 @@ export class OpenTUISessionSidebar {
 			return consume(event);
 		}
 		if (matchesOpenTUIAction(event, "cancel")) {
-			this.stopSearch({ restorePreview: true });
+			this.stopSearch();
 			return consume(event);
 		}
 		if (matchesOpenTUIAction(event, "confirm")) {
@@ -478,7 +440,6 @@ export class OpenTUISessionSidebar {
 		const sessions = this.getDisplayedSessions();
 		if (this.updateStableRows(sessions)) return;
 		clearChildren(list);
-		this.marqueeEntries.clear();
 		this.rowRecords.clear();
 		this.renderedPaths = sessions.map((session) => session.path);
 		if (sessions.length === 0) {
@@ -597,15 +558,14 @@ export class OpenTUISessionSidebar {
 					onMouseDown: activateFromMouse,
 				});
 				previewRow.add(previewNode);
-				if (session.state === "background-running") {
-					this.marqueeEntries.set(session.path, {
-						node: previewNode,
-						text: previewText,
-					});
-				}
 			}
 			let throughputNode: TextRenderable | undefined;
-			if (!confirming && !status && session.throughputTokensPerSecond !== undefined) {
+			if (
+				!confirming &&
+				!status &&
+				session.state === "background-running" &&
+				session.throughputTokensPerSecond !== undefined
+			) {
 				throughputNode = new TextRenderable(this.renderer, {
 					content: formatThroughput(session.throughputTokensPerSecond).padStart(11),
 					width: 11,
@@ -618,7 +578,7 @@ export class OpenTUISessionSidebar {
 			}
 			row.add(previewRow);
 			const metadataNode = new TextRenderable(this.renderer, {
-				content: `${session.messageCount} msg${session.messageCount === 1 ? "" : "s"} · ${formatConversationActivityTime(session.modified)} · ${formatConversationCreatedTime(session.created)}`,
+				content: `${session.messageCount} msg${session.messageCount === 1 ? "" : "s"} · ${formatConversationActivityTime(session.modified)}`,
 				height: 1,
 				paddingLeft: 1,
 				paddingRight: 1,
@@ -657,10 +617,13 @@ export class OpenTUISessionSidebar {
 			if (this.renderedPaths[index] !== session.path) return false;
 			const record = this.rowRecords.get(session.path);
 			if (!record) return false;
-			if (Boolean(record.throughputNode) !== (session.throughputTokensPerSecond !== undefined)) return false;
+			if (
+				Boolean(record.throughputNode) !==
+				(session.state === "background-running" && session.throughputTokensPerSecond !== undefined)
+			)
+				return false;
 		}
 
-		this.marqueeEntries.clear();
 		for (let index = 0; index < sessions.length; index++) {
 			const session = sessions[index]!;
 			const record = this.rowRecords.get(session.path)!;
@@ -686,49 +649,18 @@ export class OpenTUISessionSidebar {
 			const previewText = preview || "No messages yet";
 			record.previewNode.content = previewText;
 			record.previewNode.fg = foregroundText ?? this.sidebarTheme.getFgColor(preview ? "muted" : "dim");
-			if (session.state === "background-running") {
-				this.marqueeEntries.set(session.path, { node: record.previewNode, text: previewText });
-			}
 			if (record.throughputNode) {
 				record.throughputNode.content = formatThroughput(session.throughputTokensPerSecond).padStart(11);
 				record.throughputNode.fg = foregroundText ?? this.sidebarTheme.getFgColor("dim");
 			}
-			record.metadataNode.content = `${session.messageCount} msg${session.messageCount === 1 ? "" : "s"} · ${formatConversationActivityTime(session.modified)} · ${formatConversationCreatedTime(session.created)}`;
+			record.metadataNode.content = `${session.messageCount} msg${session.messageCount === 1 ? "" : "s"} · ${formatConversationActivityTime(session.modified)}`;
 			record.metadataNode.fg = foregroundText ?? this.sidebarTheme.getFgColor("dim");
 		}
 		return true;
 	}
 
-	private startMarquee(): void {
-		if (this.marqueeTimer) return;
-		this.marqueeTimer = setInterval(() => {
-			if (this.root.isDestroyed) {
-				if (this.marqueeTimer) clearInterval(this.marqueeTimer);
-				this.marqueeTimer = undefined;
-				return;
-			}
-			const list = this.list;
-			if (!list.visible || !this.root.visible) return;
-			const viewportTop = list.screenY;
-			const viewportBottom = viewportTop + list.viewport.height;
-			for (const entry of this.marqueeEntries.values()) {
-				if (!entry.node.visible || entry.node.width <= 0) continue;
-				const previewTop = entry.node.screenY;
-				const previewBottom = previewTop + entry.node.height;
-				if (previewBottom <= viewportTop || previewTop >= viewportBottom) continue;
-				const latest = latestPreviewWindow(entry.text, entry.node.width);
-				if (entry.node.plainText !== latest) entry.node.content = latest;
-			}
-		}, OPEN_TUI_LAYOUT.marqueeIntervalMs);
-		this.marqueeTimer.unref?.();
-	}
-
 	private moveSearchSelection(delta: number): void {
-		const previousPath = this.selectedPath;
 		this.moveSelection(delta);
-		if (!this.selectedPath || this.selectedPath === previousPath) return;
-		this.previewedSearchPath = this.selectedPath;
-		this.onPreviewSession?.(this.selectedPath);
 	}
 
 	private moveSelection(delta: number): void {

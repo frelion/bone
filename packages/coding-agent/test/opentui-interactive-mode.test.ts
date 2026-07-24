@@ -21,6 +21,7 @@ import type { QuestionAnswer, QuestionState } from "../src/core/question.ts";
 import type { SessionEntry } from "../src/core/session-manager.ts";
 import { OpenTUITranscriptFactory } from "../src/modes/interactive/components/opentui-transcript-factory.ts";
 import {
+	getOpenTUITranscriptPageStart,
 	OpenTUIInteractiveMode,
 	type OpenTUISessionHostContract,
 } from "../src/modes/interactive/opentui-interactive-mode.ts";
@@ -98,6 +99,12 @@ interface FakeSession {
 	};
 	subscribe(listener: AgentSessionEventListener): () => void;
 	abort(): Promise<void>;
+	waitForCompaction(): Promise<void>;
+	executeBash(
+		command: string,
+		onChunk?: (chunk: string) => void,
+		options?: { excludeFromContext?: boolean },
+	): Promise<{ output: string; exitCode: number; cancelled: boolean; truncated: boolean }>;
 	bindExtensions(): Promise<void>;
 	parkExtensionUI(): void;
 	approvePlan(proposalId: string): Promise<void>;
@@ -105,6 +112,7 @@ interface FakeSession {
 	cancelPlan(proposalId: string): void;
 	answerQuestion(requestId: string, answers: QuestionAnswer[]): void;
 	cancelQuestion(requestId: string, reason: "user" | "abort" | "client_disconnect" | "no_ui"): void;
+	getFollowUpMessages(): readonly string[];
 }
 
 function createRuntime(
@@ -132,6 +140,8 @@ function createRuntime(
 			return () => listeners.delete(listener);
 		},
 		abort,
+		waitForCompaction: async () => {},
+		executeBash: async () => ({ output: "", exitCode: 0, cancelled: false, truncated: false }),
 		bindExtensions: async () => {},
 		parkExtensionUI: vi.fn(),
 		approvePlan: vi.fn(async () => {
@@ -149,6 +159,7 @@ function createRuntime(
 		cancelQuestion: vi.fn(() => {
 			session.questionState = { status: "inactive" };
 		}),
+		getFollowUpMessages: () => [],
 	};
 	const runtime = {
 		session,
@@ -327,6 +338,39 @@ function sessionSummary(path: string, overrides: Partial<InteractiveSessionSumma
 beforeEach(() => initTheme("dark"));
 
 describe("OpenTUIInteractiveMode", () => {
+	test("renders only the latest complete-turn page for large histories", async () => {
+		const entries = Array.from({ length: 600 }, (_, index) =>
+			entry(
+				index % 2 === 0
+					? userMessage(`prompt ${index / 2}`)
+					: assistantMessage(`answer ${(index - 1) / 2}`, "stop"),
+				`entry-${index}`,
+			),
+		);
+		const firstPageStart = getOpenTUITranscriptPageStart(entries);
+		expect(firstPageStart).toBe(500);
+		expect(entries[firstPageStart]).toMatchObject({ type: "message", message: { role: "user" } });
+		expect(getOpenTUITranscriptPageStart(entries, firstPageStart)).toBe(400);
+
+		const active = createRuntime(entries);
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const transcriptFactory = new OpenTUITranscriptFactory(renderer);
+		const createSessionEntries = vi.spyOn(transcriptFactory, "createSessionEntries");
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			createTranscriptFactory: () => transcriptFactory,
+			installSignalHandlers: false,
+		});
+
+		await mode.init();
+		await settle(renderer);
+		expect(createSessionEntries).toHaveBeenNthCalledWith(1, entries.slice(500));
+		expect(renderer.captureFrame()).toContain("prompt 299");
+		mode.stop();
+	});
+
 	test("renders initial history and routes the fixed composer submit action", async () => {
 		const session = createRuntime([
 			entry(userMessage("earlier prompt"), "one"),
@@ -432,7 +476,7 @@ describe("OpenTUIInteractiveMode", () => {
 		await settle(renderer);
 
 		let frame = renderer.captureFrame();
-		expect(frame).toContain("✓ Worked for 1s · 1 tool calls");
+		expect(frame).toContain("✓ Inspected the workspace · 1s · 1 tool call");
 		expect(frame).not.toContain("final chunk");
 		renderer.input.pressKey("o", { ctrl: true });
 		await settle(renderer);
@@ -692,7 +736,258 @@ describe("OpenTUIInteractiveMode", () => {
 				options: { source: "interactive", streamingBehavior: "steer" },
 			}),
 		]);
+		await settle(streamingRenderer);
+		expect(streamingRenderer.captureFrame()).toContain("Add instructions to the current task");
+
+		streamingRenderer.input.pressEscape();
+		await settle(streamingRenderer);
+		expect(streamingSession.abort).not.toHaveBeenCalled();
+
+		await streamingRenderer.input.typeText("queue next");
+		streamingRenderer.input.pressEnter({ meta: true });
+		await streamingMode.idle();
+		expect(streamingHost.prompts.at(-1)).toEqual(
+			expect.objectContaining({
+				text: "queue next",
+				options: { source: "interactive", streamingBehavior: "followUp" },
+			}),
+		);
+
+		streamingRenderer.input.pressKey("c", { ctrl: true });
+		await streamingMode.idle();
+		expect(streamingSession.abort).toHaveBeenCalledOnce();
 		streamingMode.stop();
+	});
+
+	test("dispatches steer and follow-up immediately without erasing newer input", async () => {
+		const active = createRuntime();
+		const host = new FakeHost(active.runtime);
+		let releaseFirst!: () => void;
+		const firstTurn = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		vi.spyOn(host, "prompt").mockImplementation(async (runtime, text, options) => {
+			host.prompts.push({ runtime, text, options });
+			if (text === "start") {
+				active.session.isStreaming = true;
+				await firstTurn;
+				active.session.isStreaming = false;
+			}
+		});
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+
+		await renderer.input.typeText("start");
+		renderer.input.pressEnter();
+		await vi.waitFor(() => expect(host.prompts).toHaveLength(1));
+		await renderer.input.typeText("steer now");
+		renderer.input.pressEnter();
+		await vi.waitFor(() => expect(host.prompts).toHaveLength(2));
+		expect(host.prompts[1]).toEqual(
+			expect.objectContaining({ text: "steer now", options: { source: "interactive", streamingBehavior: "steer" } }),
+		);
+
+		await renderer.input.typeText("queue next");
+		renderer.input.pressEnter({ meta: true });
+		await renderer.input.typeText("newer draft");
+		await vi.waitFor(() => expect(host.prompts).toHaveLength(3));
+		expect(host.prompts[2]).toEqual(
+			expect.objectContaining({
+				text: "queue next",
+				options: { source: "interactive", streamingBehavior: "followUp" },
+			}),
+		);
+
+		releaseFirst();
+		await mode.idle();
+		renderer.input.pressEnter();
+		await mode.idle();
+		expect(host.prompts.at(-1)).toEqual(expect.objectContaining({ text: "newer draft" }));
+		mode.stop();
+	});
+
+	test("restores a failed submission to its originating conversation after a switch", async () => {
+		const first = createRuntime();
+		const second = createRuntime();
+		const host = new FakeHost(first.runtime);
+		let rejectPrompt!: (error: Error) => void;
+		const pendingPrompt = new Promise<void>((_resolve, reject) => {
+			rejectPrompt = reject;
+		});
+		vi.spyOn(host, "prompt").mockImplementationOnce(async (runtime, text, options) => {
+			host.prompts.push({ runtime, text, options });
+			await pendingPrompt;
+		});
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		await renderer.input.typeText("restore me");
+		renderer.input.pressEnter();
+		await vi.waitFor(() => expect(host.prompts).toHaveLength(1));
+
+		await host.hooks.beforeForegroundChange?.(first.runtime);
+		host.current = second.runtime;
+		await host.hooks.foregroundChanged?.(second.runtime);
+		rejectPrompt(new Error("prompt failed"));
+		await mode.idle();
+		await host.hooks.beforeForegroundChange?.(second.runtime);
+		host.current = first.runtime;
+		await host.hooks.foregroundChanged?.(first.runtime);
+		renderer.input.pressEnter();
+		await mode.idle();
+		expect(host.prompts.at(-1)).toEqual(expect.objectContaining({ runtime: first.runtime, text: "restore me" }));
+		mode.stop();
+	});
+
+	test("merges a failed submission back without overwriting a newer draft", async () => {
+		const active = createRuntime();
+		const host = new FakeHost(active.runtime);
+		let rejectPrompt!: (error: Error) => void;
+		const pendingPrompt = new Promise<void>((_resolve, reject) => {
+			rejectPrompt = reject;
+		});
+		vi.spyOn(host, "prompt").mockImplementationOnce(async (runtime, text, options) => {
+			host.prompts.push({ runtime, text, options });
+			await pendingPrompt;
+		});
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		await renderer.input.typeText("failed prompt");
+		renderer.input.pressEnter();
+		await vi.waitFor(() => expect(host.prompts).toHaveLength(1));
+		await renderer.input.typeText("newer draft");
+		rejectPrompt(new Error("prompt failed"));
+		await mode.idle();
+		renderer.input.pressEnter();
+		await mode.idle();
+		expect(host.prompts.at(-1)).toEqual(expect.objectContaining({ text: "failed prompt\n\nnewer draft" }));
+		mode.stop();
+	});
+
+	test("waits for manual compaction before starting queued composer input", async () => {
+		const active = createRuntime();
+		active.session.isCompacting = true;
+		let finishCompaction!: () => void;
+		active.session.waitForCompaction = async () =>
+			await new Promise<void>((resolve) => {
+				finishCompaction = () => {
+					active.session.isCompacting = false;
+					resolve();
+				};
+			});
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		await renderer.input.typeText("after compact");
+		renderer.input.pressEnter();
+		await vi.waitFor(() => expect(finishCompaction).toBeTypeOf("function"));
+		expect(host.prompts).toHaveLength(0);
+		finishCompaction();
+		await mode.idle();
+		expect(host.prompts).toEqual([expect.objectContaining({ text: "after compact" })]);
+		mode.stop();
+	});
+
+	test("keeps a prompt behind a preceding bash command in the same conversation", async () => {
+		const active = createRuntime();
+		let finishBash!: () => void;
+		active.session.executeBash = async () => {
+			active.session.isBashRunning = true;
+			await new Promise<void>((resolve) => {
+				finishBash = resolve;
+			});
+			active.session.isBashRunning = false;
+			return { output: "done", exitCode: 0, cancelled: false, truncated: false };
+		};
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		await renderer.input.typeText("! slow-command");
+		renderer.input.pressEnter();
+		await vi.waitFor(() => expect(finishBash).toBeTypeOf("function"));
+		await renderer.input.typeText("use the command result");
+		renderer.input.pressEnter();
+		await settle(renderer);
+		expect(host.prompts).toHaveLength(0);
+		finishBash();
+		await mode.idle();
+		expect(host.prompts).toEqual([expect.objectContaining({ text: "use the command result" })]);
+		mode.stop();
+	});
+
+	test("preserves a paused conversation's task-completed indicator while it runs in the background", async () => {
+		const history = Array.from({ length: 30 }, (_, index) =>
+			entry(assistantMessage(`historical response ${index}`), `history-${index}`),
+		);
+		const first = createRuntime(history, { sessionFile: "/tmp/first-background.jsonl" });
+		const second = createRuntime([], { sessionFile: "/tmp/second-background.jsonl" });
+		const host = new FakeHost(first.runtime);
+		const renderer = await createNativeTestRenderer({ width: 90, height: 18 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		const focus = (mode as unknown as { transcriptFocus: { scrollByUser(delta: number): void } }).transcriptFocus;
+		focus.scrollByUser(-8);
+
+		await host.hooks.beforeForegroundChange?.(first.runtime);
+		host.current = second.runtime;
+		await host.hooks.foregroundChanged?.(second.runtime);
+		await host.hooks.runCompleted?.(first.runtime, [assistantMessage("background result", "stop")]);
+		host.hooks.runtimeDisposed?.(first.runtime);
+		const resumedFirst = createRuntime(history, { sessionFile: "/tmp/first-background.jsonl" });
+		await host.hooks.beforeForegroundChange?.(second.runtime);
+		host.current = resumedFirst.runtime;
+		await host.hooks.foregroundChanged?.(resumedFirst.runtime);
+		await settle(renderer);
+		expect(renderer.captureFrame()).toContain("Task completed");
+		mode.stop();
+	});
+
+	test("does not report a failed abort as stopped", async () => {
+		const active = createRuntime();
+		active.session.isStreaming = true;
+		active.abort.mockRejectedValueOnce(new Error("abort failed"));
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 90, height: 24 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		renderer.input.pressKey("c", { ctrl: true });
+		await settle(renderer);
+		const frame = renderer.captureFrame();
+		expect(frame).toContain("abort failed");
+		expect(frame).not.toContain("Stopped by user");
+		mode.stop();
 	});
 
 	test.each([

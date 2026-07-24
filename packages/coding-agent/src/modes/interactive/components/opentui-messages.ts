@@ -74,10 +74,15 @@ export class OpenTUIUserMessage {
 		this.messageTheme = messageTheme;
 		this.root = new BoxRenderable(renderer, { flexDirection: "column" });
 		appendSpacer(renderer, this.root);
-		const body = new BoxRenderable(renderer, { flexDirection: "column", paddingX: this.outputPad });
+		const body = new BoxRenderable(renderer, {
+			width: "100%",
+			flexDirection: "column",
+			paddingX: this.outputPad,
+			backgroundColor: this.messageTheme.getBgColor("userMessageBg"),
+		});
 		body.add(
 			new TextRenderable(renderer, {
-				content: `› ${this.text}`,
+				content: this.text,
 				fg: this.messageTheme.getFgColor("userMessageText"),
 				wrapMode: "word",
 			}),

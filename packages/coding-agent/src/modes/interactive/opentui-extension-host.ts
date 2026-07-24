@@ -273,6 +273,7 @@ export class OpenTUIExtensionHost {
 							title: request.title,
 							items: request.options,
 							selectedIndex,
+							footer: request.footer,
 							onSelect: finish,
 							onCancel: () => finish(undefined),
 						});
@@ -280,6 +281,11 @@ export class OpenTUIExtensionHost {
 							root: selector.build(this.options.renderer),
 							focusTarget: selector.focusTarget,
 							onKey: (event) => {
+								const shortcut = request.shortcuts?.find((item) => matchesOpenTUIAction(event, item.action));
+								if (shortcut) {
+									finish(shortcut.value);
+									return true;
+								}
 								if (!matchesOpenTUIAction(event, "cancel")) return false;
 								finish(undefined);
 								return true;

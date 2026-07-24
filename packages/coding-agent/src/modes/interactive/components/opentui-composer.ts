@@ -17,6 +17,8 @@ const DEFAULT_AUTOCOMPLETE_ROWS = 5;
 export interface OpenTUIComposerOptions {
 	placeholder?: string;
 	status?: Partial<OpenTUIComposerStatus>;
+	interactionState?: OpenTUIComposerInteractionState;
+	queuedMessages?: readonly OpenTUIQueuedMessage[];
 	history?: readonly string[];
 	autocompleteProvider?: AutocompleteProvider;
 	autocompleteMaxVisible?: number;
@@ -34,6 +36,20 @@ export interface OpenTUIComposerStatus {
 	foregroundThroughput: string;
 }
 
+export type OpenTUIComposerInteractionKind = "idle" | "working" | "waiting";
+
+export interface OpenTUIComposerInteractionState {
+	kind: OpenTUIComposerInteractionKind;
+	placeholder?: string;
+	leftHint?: string;
+	rightHint?: string;
+}
+
+export interface OpenTUIQueuedMessage {
+	id: string;
+	text: string;
+}
+
 const DEFAULT_STATUS: OpenTUIComposerStatus = {
 	cwd: ".",
 	model: "No model",
@@ -41,6 +57,27 @@ const DEFAULT_STATUS: OpenTUIComposerStatus = {
 	contextRemaining: "--",
 	foregroundThroughput: "idle",
 };
+
+const DEFAULT_INTERACTION_COPY: Record<
+	OpenTUIComposerInteractionKind,
+	{ placeholder: string; leftHint?: string; rightHint?: string }
+> = {
+	idle: { placeholder: "Ask anything" },
+	working: {
+		placeholder: "Add instructions to the current task",
+		leftHint: "Enter add to current task · Alt+Enter queue",
+		rightHint: "Ctrl+C stop",
+	},
+	waiting: {
+		placeholder: "Type your answer",
+		leftHint: "Enter answer",
+		rightHint: "Esc cancel",
+	},
+};
+
+function copyQueuedMessages(messages: readonly OpenTUIQueuedMessage[]): OpenTUIQueuedMessage[] {
+	return messages.map((message) => ({ id: message.id, text: message.text }));
+}
 
 function consume(event: KeyEvent): true {
 	event.preventDefault();
@@ -78,12 +115,17 @@ export class OpenTUIComposer {
 	public onFocusRequest: (() => void) | undefined;
 	private placeholderValue: string;
 	private status: OpenTUIComposerStatus;
+	private interactionState: OpenTUIComposerInteractionState;
+	private queuedMessages: OpenTUIQueuedMessage[];
 	private autocompleteProvider: AutocompleteProvider | undefined;
 	private readonly autocompleteMaxVisible: number;
 	private history: string[];
 	private historyIndex = -1;
 	private historyDraft = "";
 	private readonly promptRoot: BoxRenderable;
+	private readonly queuePanel: BoxRenderable;
+	private readonly queueHeader: TextRenderable;
+	private readonly queueItems: TextRenderable;
 	private readonly statusLeft: TextRenderable;
 	private readonly statusRight: TextRenderable;
 	private autocompleteSuggestions: AutocompleteSuggestions | undefined;
@@ -98,6 +140,8 @@ export class OpenTUIComposer {
 	constructor(renderer: CliRenderer, options: OpenTUIComposerOptions = {}) {
 		this.placeholderValue = options.placeholder ?? "Ask anything";
 		this.status = { ...DEFAULT_STATUS, ...options.status };
+		this.interactionState = { kind: "idle", ...options.interactionState };
+		this.queuedMessages = copyQueuedMessages(options.queuedMessages ?? []);
 		this.autocompleteProvider = options.autocompleteProvider;
 		const autocompleteRows = options.autocompleteMaxVisible ?? DEFAULT_AUTOCOMPLETE_ROWS;
 		this.autocompleteMaxVisible = Number.isFinite(autocompleteRows)
@@ -124,6 +168,24 @@ export class OpenTUIComposer {
 			...this.selectStyle(),
 		});
 		this.autocomplete.visible = false;
+		this.queuePanel = new BoxRenderable(renderer, {
+			width: "100%",
+			flexDirection: "column",
+			paddingX: 1,
+		});
+		this.queueHeader = new TextRenderable(renderer, {
+			content: "",
+			fg: OPEN_TUI_COLORS.muted,
+			height: 1,
+		});
+		this.queueItems = new TextRenderable(renderer, {
+			content: "",
+			fg: OPEN_TUI_COLORS.dim,
+			truncate: true,
+			height: 1,
+		});
+		this.queuePanel.add(this.queueHeader);
+		this.queuePanel.add(this.queueItems);
 		this.promptRoot = new BoxRenderable(renderer, {
 			width: "100%",
 			flexDirection: "column",
@@ -165,6 +227,7 @@ export class OpenTUIComposer {
 			height: 1,
 			flexDirection: "row",
 			alignItems: "center",
+			gap: 1,
 		});
 		this.statusLeft = new TextRenderable(renderer, {
 			content: "",
@@ -185,6 +248,7 @@ export class OpenTUIComposer {
 		statusRow.add(this.statusLeft);
 		statusRow.add(this.statusRight);
 		this.root.add(this.autocomplete);
+		this.root.add(this.queuePanel);
 		this.promptRoot.add(this.input);
 		this.promptRoot.add(statusRow);
 		this.root.add(this.promptRoot);
@@ -197,6 +261,8 @@ export class OpenTUIComposer {
 			this.refreshFocusStyle();
 		});
 		this.refreshStatus();
+		this.refreshInteractionPresentation();
+		this.refreshQueuePanel();
 		this.refreshFocusStyle();
 	}
 
@@ -218,12 +284,20 @@ export class OpenTUIComposer {
 		return this.autocomplete.getSelectedOption()?.value as AutocompleteItem | undefined;
 	}
 
+	get interactionKind(): OpenTUIComposerInteractionKind {
+		return this.interactionState.kind;
+	}
+
+	get queuedMessageCount(): number {
+		return this.queuedMessages.length;
+	}
+
 	handleKey(event: KeyEvent): boolean {
 		if (this.nativeDestroyed) return false;
 		if (event.eventType === "release") return false;
 		if (this.autocompleteOpen) {
 			if (matchesOpenTUIAction(event, "composerCancel")) {
-				this.closeAutocomplete();
+				this.dismissAutocomplete();
 				return consume(event);
 			}
 			if (matchesOpenTUIAction(event, "composerHistoryUp")) {
@@ -294,7 +368,27 @@ export class OpenTUIComposer {
 
 	setPlaceholder(placeholder: string): void {
 		this.placeholderValue = placeholder;
-		if (!this.input.isDestroyed) this.input.placeholder = placeholder;
+		this.refreshInteractionPresentation();
+	}
+
+	setInteractionState(state: OpenTUIComposerInteractionState): void {
+		this.interactionState = { ...state };
+		this.refreshInteractionPresentation();
+	}
+
+	setQueuedMessages(messages: readonly OpenTUIQueuedMessage[]): void {
+		this.queuedMessages = copyQueuedMessages(messages);
+		this.refreshQueuePanel();
+	}
+
+	getQueuedMessages(): readonly OpenTUIQueuedMessage[] {
+		return copyQueuedMessages(this.queuedMessages);
+	}
+
+	dismissAutocomplete(): boolean {
+		if (!this.autocompleteOpen) return false;
+		this.closeAutocomplete();
+		return true;
 	}
 
 	updateStatus(status: Partial<OpenTUIComposerStatus>): void {
@@ -339,6 +433,8 @@ export class OpenTUIComposer {
 		this.autocomplete.selectedDescriptionColor = selectStyle.selectedDescriptionColor;
 		this.statusLeft.fg = OPEN_TUI_COLORS.muted;
 		this.statusRight.fg = OPEN_TUI_COLORS.dim;
+		this.queueHeader.fg = OPEN_TUI_COLORS.muted;
+		this.queueItems.fg = OPEN_TUI_COLORS.dim;
 		this.refreshFocusStyle();
 	}
 
@@ -413,8 +509,45 @@ export class OpenTUIComposer {
 
 	private refreshStatus(): void {
 		if (this.statusLeft.isDestroyed || this.statusRight.isDestroyed) return;
-		this.statusLeft.content = `${this.status.cwd}  ${this.status.model}  ${this.status.thinking}`;
-		this.statusRight.content = `${this.status.contextRemaining} left  ${this.status.foregroundThroughput}`;
+		const defaults = DEFAULT_INTERACTION_COPY[this.interactionState.kind];
+		this.statusLeft.content =
+			this.interactionState.leftHint ??
+			defaults.leftHint ??
+			`${this.status.cwd}  ${this.status.model}  ${this.status.thinking}`;
+		this.statusRight.content =
+			this.interactionState.rightHint ??
+			defaults.rightHint ??
+			`${this.status.contextRemaining} left  ${this.status.foregroundThroughput}`;
+	}
+
+	private refreshInteractionPresentation(): void {
+		if (this.input.isDestroyed) return;
+		const defaults = DEFAULT_INTERACTION_COPY[this.interactionState.kind];
+		this.input.placeholder =
+			this.interactionState.placeholder ??
+			(this.interactionState.kind === "idle" ? this.placeholderValue : defaults.placeholder);
+		this.refreshStatus();
+	}
+
+	private refreshQueuePanel(): void {
+		if (this.queuePanel.isDestroyed || this.queueHeader.isDestroyed || this.queueItems.isDestroyed) return;
+		const count = this.queuedMessages.length;
+		this.queuePanel.visible = count > 0;
+		if (count === 0) {
+			this.queueHeader.content = "";
+			this.queueItems.content = "";
+			this.queueItems.height = 1;
+			return;
+		}
+		this.queueHeader.content = `Queued next: ${count}`;
+		const visibleMessages = this.queuedMessages.slice(0, 3);
+		const lines = visibleMessages.map((message, index) => {
+			const summary = message.text.replace(/\s+/g, " ").trim();
+			return `  ${index + 1}. ${summary}`;
+		});
+		if (count > visibleMessages.length) lines.push(`  +${count - visibleMessages.length} more`);
+		this.queueItems.content = lines.join("\n");
+		this.queueItems.height = lines.length;
 	}
 
 	private insertNewline(): void {
@@ -434,10 +567,7 @@ export class OpenTUIComposer {
 	}
 
 	private cancel(): void {
-		if (this.autocompleteOpen) {
-			this.closeAutocomplete();
-			return;
-		}
+		if (this.dismissAutocomplete()) return;
 		this.onCancel?.();
 	}
 

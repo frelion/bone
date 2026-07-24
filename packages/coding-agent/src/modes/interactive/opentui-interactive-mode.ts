@@ -1,7 +1,7 @@
 import { basename, resolve } from "node:path";
 import type { ImageContent } from "@frelion/bone-ai/compat";
 import { type AutocompleteProvider, createRenderer, OverlayManager } from "@frelion/bone-tui";
-import type { CliRenderer, KeyEvent } from "@opentui/core";
+import { type CliRenderer, type KeyEvent, TextRenderable } from "@opentui/core";
 import type { AgentSessionEvent, PromptOptions } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import { rememberLastActiveConversation } from "../../core/conversation-state.ts";
@@ -23,7 +23,10 @@ import { OpenTUIComposer, type OpenTUIComposerStatus } from "./components/opentu
 import { OpenTUIStatusView } from "./components/opentui-rich-messages.ts";
 import { OpenTUISessionSidebar } from "./components/opentui-session-sidebar.ts";
 import { OpenTUITranscriptFactory } from "./components/opentui-transcript-factory.ts";
-import { OpenTUITranscriptFocusController } from "./components/opentui-transcript-focus.ts";
+import {
+	OpenTUITranscriptFocusController,
+	type OpenTUITranscriptFocusState,
+} from "./components/opentui-transcript-focus.ts";
 import { OpenTUIPaneNavigator } from "./components/pane-navigator.ts";
 import { OpenTUICommandRouter } from "./opentui-command-router.ts";
 import { OpenTUIExtensionHost } from "./opentui-extension-host.ts";
@@ -32,6 +35,7 @@ import { OpenTUIInteractiveShell } from "./opentui-shell.ts";
 import { theme } from "./theme/theme.ts";
 
 const SIDEBAR_PAGE_SIZE = 40;
+const TRANSCRIPT_PAGE_ENTRIES = 100;
 const LEXICAL_SEARCH_DELAY_MS = 80;
 const SEMANTIC_SEARCH_DELAY_MS = 250;
 const CUSTOM_ANSWER = "custom";
@@ -53,6 +57,25 @@ interface OpenTUIMemoryRuntimeOptions {
 interface ConversationViewState {
 	draft: string;
 	scrollTop: number;
+	transcriptFocus: OpenTUITranscriptFocusState;
+}
+
+interface TranscriptPageState {
+	startIndex: number;
+	loading: boolean;
+}
+
+export function getOpenTUITranscriptPageStart(
+	entries: readonly { type: string; message?: { role?: string } }[],
+	endIndex = entries.length,
+): number {
+	let startIndex = Math.max(0, endIndex - TRANSCRIPT_PAGE_ENTRIES);
+	while (startIndex > 0) {
+		const entry = entries[startIndex];
+		if (entry?.type === "message" && entry.message?.role === "user") break;
+		startIndex--;
+	}
+	return startIndex;
 }
 
 export interface OpenTUISessionHostContract {
@@ -136,6 +159,7 @@ export class OpenTUIInteractiveMode {
 	private paneFocus: OpenTUIPaneNavigator | undefined;
 	private overlayManager: OverlayManager | undefined;
 	private transcriptFocus: OpenTUITranscriptFocusController | undefined;
+	private transcriptUpdatesBanner: TextRenderable | undefined;
 	private status: OpenTUIStatusView | undefined;
 	private unsubscribeSession: (() => void) | undefined;
 	private unsubscribeApplicationKeys: (() => void) | undefined;
@@ -143,6 +167,7 @@ export class OpenTUIInteractiveMode {
 	private signalCleanups: Array<() => void> = [];
 	private eventTail: Promise<void> = Promise.resolve();
 	private submissionTail: Promise<void> = Promise.resolve();
+	private readonly runtimeSubmissionTails = new WeakMap<AgentSessionRuntime, Promise<void>>();
 	private readonly interactionTasks = new Set<Promise<void>>();
 	private footerData: FooterDataProvider | undefined;
 	private sidebarSessions: InteractiveSessionSummary[] = [];
@@ -151,10 +176,10 @@ export class OpenTUIInteractiveMode {
 	private sessionSearchTimer: ReturnType<typeof setTimeout> | undefined;
 	private semanticSearchTimer: ReturnType<typeof setTimeout> | undefined;
 	private sessionSearchGeneration = 0;
-	private sidebarPreviewTarget: string | undefined;
-	private sidebarPreviewInFlight: Promise<void> | undefined;
 	private memoryStartup: Promise<void> = Promise.resolve();
 	private readonly conversationViewStates = new WeakMap<AgentSessionRuntime, ConversationViewState>();
+	private readonly conversationViewStatesByPath = new Map<string, ConversationViewState>();
+	private readonly transcriptPages = new WeakMap<AgentSessionRuntime, TranscriptPageState>();
 	private autoTrustOnReloadCwd: string | undefined;
 	private foregroundGeneration = 0;
 	private reviewingPlanProposalId: string | undefined;
@@ -211,7 +236,10 @@ export class OpenTUIInteractiveMode {
 				if (structureChanged) void this.refreshSidebar();
 				else this.refreshSidebarStates();
 			},
-			runtimeDisposed: (runtime) => this.conversationViewStates.delete(runtime),
+			runtimeDisposed: (runtime) => {
+				this.conversationViewStates.delete(runtime);
+				this.transcriptPages.delete(runtime);
+			},
 			persistedEntries: async (runtime, entries) => {
 				const sessionPath = runtime.session.sessionFile;
 				if (!sessionPath) return;
@@ -222,6 +250,7 @@ export class OpenTUIInteractiveMode {
 				);
 			},
 			runCompleted: async (runtime, messages) => {
+				if (runtime !== this.sessionHost.current) this.recordBackgroundCompletion(runtime);
 				const sessionPath = runtime.session.sessionFile;
 				if (!sessionPath) return;
 				const manager = runtime.session.sessionManager;
@@ -253,13 +282,26 @@ export class OpenTUIInteractiveMode {
 		this.topBar = new OpenTUITopBar(this.renderer, this.getTopBarState(this.sessionHost.current));
 		regions.header.add(this.topBar.root);
 		regions.aboveEditor.add(this.status.root);
+		this.transcriptUpdatesBanner = new TextRenderable(this.renderer, {
+			content: "",
+			paddingX: 1,
+			fg: theme.getFgColor("accent"),
+			onMouseDown: (event) => {
+				if (event.button !== 0) return;
+				event.preventDefault();
+				event.stopPropagation();
+				this.transcriptFocus?.jumpToLatest();
+			},
+		});
+		this.transcriptUpdatesBanner.visible = false;
+		regions.aboveEditor.add(this.transcriptUpdatesBanner);
 		this.composer = new OpenTUIComposer(this.renderer, {
 			status: this.getComposerStatus(this.sessionHost.current),
 			autocompleteProvider: this.options.autocompleteProvider ?? this.commandRouter.createAutocompleteProvider(),
 			onSubmit: (text) => {
-				this.submissionTail = this.submissionTail.then(async () => this.submit(text));
+				const runtime = this.sessionHost.current;
+				this.dispatchSubmission(text, undefined, runtime);
 			},
-			onCancel: () => void this.abortOrClear(),
 		});
 		regions.editor.add(this.composer.root);
 
@@ -275,6 +317,8 @@ export class OpenTUIInteractiveMode {
 			this.shell.getTranscriptNode(),
 			() => this.renderer?.height ?? 24,
 		);
+		this.transcriptFocus.onNearOldestContent = () => this.loadEarlierTranscriptPage();
+		this.transcriptFocus.onStateChange = (state) => this.updateTranscriptUpdatesBanner(state);
 		this.shell.onTranscriptScrollRequest = (delta) => this.transcriptFocus?.scrollByUser(delta);
 		this.shell.transcript.onMouseScroll = (event) => {
 			const scroll = event.scroll;
@@ -309,10 +353,26 @@ export class OpenTUIInteractiveMode {
 				return;
 			}
 			if (this.paneFocus?.focusedPane !== "composer") return;
+			if (matchesOpenTUIAction(event, "jumpToLatest")) {
+				event.preventDefault();
+				event.stopPropagation();
+				this.transcriptFocus?.jumpToLatest();
+				return;
+			}
 			if (matchesOpenTUIAction(event, "focusLeft")) {
 				event.preventDefault();
 				event.stopPropagation();
 				this.paneFocus.focus("sidebar");
+				return;
+			}
+			if (matchesOpenTUIAction(event, "composerQueue")) {
+				event.preventDefault();
+				event.stopPropagation();
+				const value = this.composer?.value ?? "";
+				if (value.trim()) {
+					const runtime = this.sessionHost.current;
+					this.dispatchSubmission(value, { streamingBehavior: "followUp" }, runtime);
+				}
 				return;
 			}
 			this.composer?.handleKey(event);
@@ -340,10 +400,10 @@ export class OpenTUIInteractiveMode {
 		this.sidebar.onFocusChat = () => this.paneFocus?.focus("composer");
 		this.sidebar.onScrollChat = (direction) => this.shell?.scrollTranscript(direction === "up" ? -10 : 10);
 		this.sidebar.onActivateSession = (path) => void this.runAction(() => this.sessionHost.activate(path));
-		this.sidebar.onPreviewSession = (path) => this.previewSidebarSession(path);
 		this.sidebar.onDeleteSession = (path, replacement) =>
 			void this.runAction(async () => {
 				await this.sessionHost.deleteSession(path, replacement);
+				this.conversationViewStatesByPath.delete(path);
 				await this.memory.removeSession(path);
 				await this.refreshSidebar();
 			});
@@ -414,13 +474,21 @@ export class OpenTUIInteractiveMode {
 					enqueueEvent({ runtime, revision: ++fallbackRevision, generationId: undefined, event }),
 				);
 		this.shell.clearTranscript();
+		const entries = runtime.session.sessionManager.getEntries();
+		this.transcriptPages.set(runtime, {
+			startIndex: getOpenTUITranscriptPageStart(entries),
+			loading: false,
+		});
 		const history: string[] = [];
-		for (const entry of runtime.session.sessionManager.getEntries()) {
+		for (const entry of entries) {
 			if (entry.type === "message" && entry.message.role === "user") history.unshift(messageText(entry.message));
 		}
 		this.composer?.setHistory(history);
-		const viewState = this.conversationViewStates.get(runtime);
+		const viewState = this.getConversationViewState(runtime);
 		this.composer?.setValue(viewState?.draft ?? "");
+		this.transcriptFocus?.restoreState(
+			viewState?.transcriptFocus ?? { following: true, unseenUpdateCount: 0, latestUpdateKind: undefined },
+		);
 		this.shell.getTranscriptNode().scrollTop = viewState?.scrollTop ?? Number.MAX_SAFE_INTEGER;
 		this.extensionBinding = this.options.bindExtensionUI
 			? this.options.bindExtensionUI(runtime, this.renderer)
@@ -464,6 +532,8 @@ export class OpenTUIInteractiveMode {
 			this.options.autocompleteProvider ?? this.commandRouter.createAutocompleteProvider(runtime.cwd),
 		);
 		this.composer?.updateStatus(this.getComposerStatus(runtime));
+		this.updateComposerInteractionState(runtime);
+		this.updateQueuedMessages(runtime.session.getFollowUpMessages());
 		const historySnapshot = await this.renderTranscript(
 			runtime,
 			generation,
@@ -523,10 +593,18 @@ export class OpenTUIInteractiveMode {
 
 	private async unbindForeground(runtime?: AgentSessionRuntime): Promise<void> {
 		if (runtime && this.composer && this.shell) {
-			this.conversationViewStates.set(runtime, {
+			const state = {
 				draft: this.composer.value,
 				scrollTop: this.shell.getTranscriptNode().scrollTop,
-			});
+				transcriptFocus: this.transcriptFocus?.getState() ?? {
+					following: true,
+					unseenUpdateCount: 0,
+					latestUpdateKind: undefined,
+				},
+			};
+			this.conversationViewStates.set(runtime, state);
+			const sessionPath = runtime.session.sessionFile;
+			if (sessionPath) this.conversationViewStatesByPath.set(sessionPath, state);
 		}
 		this.foregroundGeneration++;
 		this.planInteractionAbort?.abort();
@@ -614,7 +692,8 @@ export class OpenTUIInteractiveMode {
 				transcriptFactory.setAllToolDetailsExpanded(this.allToolDetailsExpanded);
 				historySnapshot = readSnapshot();
 				const entries = runtime.session.sessionManager.getEntries();
-				const items = await transcriptFactory.createSessionEntries(entries);
+				const startIndex = this.transcriptPages.get(runtime)?.startIndex ?? 0;
+				const items = await transcriptFactory.createSessionEntries(entries.slice(startIndex));
 				if (!this.shell || !this.isCurrentForeground(runtime, generation)) return;
 				this.shell.clearTranscript();
 				this.welcome = undefined;
@@ -632,6 +711,48 @@ export class OpenTUIInteractiveMode {
 		this.renderTail = render;
 		await render;
 		return historySnapshot;
+	}
+
+	private loadEarlierTranscriptPage(): void {
+		const runtime = this.sessionHost.current;
+		const state = this.transcriptPages.get(runtime);
+		if (!state || state.loading || state.startIndex === 0 || !this.shell) return;
+		const entries = runtime.session.sessionManager.getEntries();
+		const nextStartIndex = getOpenTUITranscriptPageStart(entries, state.startIndex);
+		if (nextStartIndex === state.startIndex) return;
+		state.loading = true;
+
+		const generation = this.foregroundGeneration;
+		const loadTask = this.eventTail.then(async () => {
+			if (!this.shell || !this.isCurrentForeground(runtime, generation)) return;
+			const transcript = this.shell.getTranscriptNode();
+			const previousScrollHeight = transcript.scrollHeight;
+			const previousScrollTop = transcript.scrollTop;
+			const snapshot = this.sessionHost.getRuntimeStreamSnapshot?.(runtime) ?? {
+				revision: 0,
+				generationId: undefined,
+				liveEvents: [],
+				liveEventEnvelopes: [],
+			};
+			state.startIndex = nextStartIndex;
+			await this.renderTranscript(runtime, generation, () => snapshot);
+			if (!this.shell || !this.isCurrentForeground(runtime, generation)) return;
+			for (const envelope of snapshot.liveEventEnvelopes) {
+				await this.handleSessionEvent(runtime, envelope.event, generation);
+			}
+			if (snapshot.liveEventEnvelopes.length === 0) {
+				for (const event of snapshot.liveEvents) await this.handleSessionEvent(runtime, event, generation);
+			}
+			this.renderer?.requestRender();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			const addedHeight = Math.max(0, transcript.scrollHeight - previousScrollHeight);
+			transcript.scrollTo(previousScrollTop + addedHeight);
+		});
+		this.eventTail = loadTask
+			.catch((error: unknown) => this.showInteractionError(error))
+			.finally(() => {
+				state.loading = false;
+			});
 	}
 
 	private async refreshPresentation(): Promise<void> {
@@ -690,21 +811,45 @@ export class OpenTUIInteractiveMode {
 		switch (event.type) {
 			case "agent_start":
 				this.status?.setMessage("Working...");
+				this.composer?.setInteractionState({ kind: "working" });
 				break;
-			case "agent_end":
 			case "agent_settled":
 				this.status?.setMessage("Ready");
 				this.status?.stop();
+				this.updateComposerInteractionState(runtime);
 				break;
 			case "compaction_start":
 				this.status?.setMessage("Compacting context...");
+				this.composer?.setInteractionState({
+					kind: "working",
+					placeholder: "Queue instructions for after compaction",
+					leftHint: "Enter queue",
+					rightHint: "Ctrl+C stop",
+				});
 				break;
 			case "auto_retry_start":
 				this.status?.setMessage(`Retry ${event.attempt}/${event.maxAttempts}`);
+				this.composer?.setInteractionState({
+					kind: "working",
+					placeholder: "Add instructions while retrying",
+					leftHint: "Enter add to current task · Alt+Enter queue",
+					rightHint: "Ctrl+C stop",
+				});
+				break;
+			case "question_asked":
+				this.composer?.setInteractionState({ kind: "waiting", placeholder: "Answer the current question" });
+				break;
+			case "plan_proposed":
+				this.composer?.setInteractionState({ kind: "waiting", placeholder: "Review the proposed plan" });
+				break;
+			case "queue_update":
+				this.updateQueuedMessages(event.followUp);
 				break;
 		}
 		const mutation = await this.transcriptFactory.handleEvent(event);
 		if (mutation.type === "append") this.shell.appendTranscript(mutation.item.root);
+		const semanticUpdate = this.getTranscriptSemanticUpdate(event);
+		if (semanticUpdate) this.transcriptFocus?.recordSemanticUpdate(semanticUpdate);
 		if (this.transcriptFocus?.isAutoFollowing()) this.transcriptFocus.followLatest();
 		if (event.type === "session_info_changed" || event.type === "thinking_level_changed") {
 			this.topBar?.update(this.getTopBarState(runtime));
@@ -729,6 +874,9 @@ export class OpenTUIInteractiveMode {
 			this.reviewingQuestionRequestId === event.requestId
 		) {
 			this.questionInteractionAbort?.abort();
+		}
+		if (event.type === "question_answered" || event.type === "question_cancelled" || event.type === "plan_decided") {
+			this.updateComposerInteractionState(runtime);
 		}
 	}
 
@@ -959,6 +1107,52 @@ export class OpenTUIInteractiveMode {
 		this.renderer?.requestRender();
 	}
 
+	private updateComposerInteractionState(runtime: AgentSessionRuntime): void {
+		if (
+			runtime.session.questionState.status === "awaitingAnswer" ||
+			runtime.session.planState.status === "awaitingApproval"
+		) {
+			this.composer?.setInteractionState({ kind: "waiting" });
+			return;
+		}
+		if (runtime.session.isStreaming || runtime.session.isCompacting || runtime.session.isBashRunning) {
+			this.composer?.setInteractionState({ kind: "working" });
+			return;
+		}
+		this.composer?.setInteractionState({ kind: "idle" });
+	}
+
+	private updateQueuedMessages(messages: readonly string[]): void {
+		this.composer?.setQueuedMessages(
+			messages.map((text, index) => ({
+				id: `follow-up:${index}:${text}`,
+				text,
+			})),
+		);
+	}
+
+	private updateTranscriptUpdatesBanner(state: OpenTUITranscriptFocusState): void {
+		const banner = this.transcriptUpdatesBanner;
+		if (!banner || banner.isDestroyed) return;
+		banner.visible = !state.following && state.unseenUpdateCount > 0;
+		if (!banner.visible) {
+			banner.content = "";
+			return;
+		}
+		banner.content =
+			state.latestUpdateKind === "completion"
+				? "↓ Task completed · End to jump to latest"
+				: `↓ ${state.unseenUpdateCount} new update${state.unseenUpdateCount === 1 ? "" : "s"} · End to jump to latest`;
+		this.renderer?.requestRender();
+	}
+
+	private getTranscriptSemanticUpdate(event: AgentSessionEvent): "content" | "tool" | "completion" | undefined {
+		if (event.type === "tool_execution_start" || event.type === "tool_execution_end") return "tool";
+		if (event.type === "message_end" && event.message.role === "assistant") return "content";
+		if (event.type === "agent_settled") return "completion";
+		return undefined;
+	}
+
 	private getTopBarState(runtime: AgentSessionRuntime) {
 		const model = runtime.session.model;
 		return {
@@ -986,21 +1180,83 @@ export class OpenTUIInteractiveMode {
 		};
 	}
 
-	private async submit(text: string, options?: PromptOptions): Promise<void> {
+	private async submit(
+		text: string,
+		options?: PromptOptions,
+		runtime: AgentSessionRuntime = this.sessionHost.current,
+		prepared = false,
+	): Promise<void> {
 		const value = text.trim();
 		if (!value) return;
-		const runtime = this.sessionHost.current;
-		this.composer?.addHistoryEntry(value);
-		this.composer?.setValue("");
-		await this.runAction(async () => {
-			const routed = await this.commandRouter.route(value);
+		if (!prepared) this.prepareSubmission(value);
+		try {
+			const routed = await this.commandRouter.route(value, runtime);
 			if (routed.handled) return;
+			if (runtime.session.isCompacting && !runtime.session.isStreaming) await runtime.session.waitForCompaction();
 			await this.sessionHost.prompt(runtime, value, {
 				source: "interactive",
 				...(runtime.session.isStreaming ? { streamingBehavior: "steer" as const } : {}),
 				...options,
 			});
-		});
+		} catch (error) {
+			this.restoreFailedSubmission(runtime, value);
+			this.showInteractionError(error);
+		}
+	}
+
+	private dispatchSubmission(text: string, options: PromptOptions | undefined, runtime: AgentSessionRuntime): void {
+		const value = text.trim();
+		if (!value) return;
+		this.prepareSubmission(value);
+		const deliversToActiveRun = runtime.session.isStreaming;
+		const task = deliversToActiveRun
+			? this.submit(value, options, runtime, true)
+			: (this.runtimeSubmissionTails.get(runtime) ?? Promise.resolve())
+					.catch(() => {})
+					.then(async () => this.submit(value, options, runtime, true));
+		if (!deliversToActiveRun) this.runtimeSubmissionTails.set(runtime, task);
+		this.trackSubmission(task);
+	}
+
+	private prepareSubmission(value: string): void {
+		this.composer?.addHistoryEntry(value);
+		this.composer?.setValue("");
+	}
+
+	private trackSubmission(task: Promise<void>): void {
+		this.submissionTail = Promise.all([this.submissionTail, task]).then(() => undefined);
+	}
+
+	private restoreFailedSubmission(runtime: AgentSessionRuntime, value: string): void {
+		if (runtime === this.sessionHost.current) {
+			const currentDraft = this.composer?.value ?? "";
+			this.composer?.setValue(this.mergeFailedSubmission(value, currentDraft));
+			return;
+		}
+		const state = this.getConversationViewState(runtime);
+		if (state) state.draft = this.mergeFailedSubmission(value, state.draft);
+	}
+
+	private mergeFailedSubmission(value: string, draft: string): string {
+		if (!draft.trim()) return value;
+		return `${value}\n\n${draft}`;
+	}
+
+	private recordBackgroundCompletion(runtime: AgentSessionRuntime): void {
+		const state = this.getConversationViewState(runtime);
+		if (!state || state.transcriptFocus.following) return;
+		state.transcriptFocus = {
+			...state.transcriptFocus,
+			unseenUpdateCount: state.transcriptFocus.unseenUpdateCount + 1,
+			latestUpdateKind: "completion",
+		};
+	}
+
+	private getConversationViewState(runtime: AgentSessionRuntime): ConversationViewState | undefined {
+		return (
+			this.conversationViewStates.get(runtime) ??
+			(runtime.session.sessionFile ? this.conversationViewStatesByPath.get(runtime.session.sessionFile) : undefined)
+		);
 	}
 
 	private async submitInitialMessages(): Promise<void> {
@@ -1013,7 +1269,16 @@ export class OpenTUIInteractiveMode {
 	private async abortOrClear(): Promise<void> {
 		const session = this.sessionHost.current.session;
 		if (session.isStreaming || session.isCompacting || session.isBashRunning) {
-			await this.runAction(() => session.abort());
+			try {
+				await session.abort();
+				this.status?.setMessage("Stopped by user");
+				this.status?.stop();
+			} catch (error) {
+				this.showInteractionError(error);
+				return;
+			}
+			this.updateComposerInteractionState(this.sessionHost.current);
+			this.renderer?.requestRender();
 			return;
 		}
 		this.composer?.setValue("");
@@ -1049,24 +1314,6 @@ export class OpenTUIInteractiveMode {
 		this.sidebarHasMore = page.hasMore;
 		this.sidebar.setSessions(this.sidebarSessions);
 		this.renderer?.requestRender();
-	}
-
-	private previewSidebarSession(sessionPath: string): void {
-		this.sidebarPreviewTarget = sessionPath;
-		if (this.sidebarPreviewInFlight) return;
-		this.sidebarPreviewInFlight = this.drainSidebarPreviews().finally(() => {
-			this.sidebarPreviewInFlight = undefined;
-			if (this.sidebarPreviewTarget) this.previewSidebarSession(this.sidebarPreviewTarget);
-		});
-	}
-
-	private async drainSidebarPreviews(): Promise<void> {
-		while (this.sidebarPreviewTarget) {
-			const sessionPath = this.sidebarPreviewTarget;
-			this.sidebarPreviewTarget = undefined;
-			await this.runAction(() => this.sessionHost.activate(sessionPath));
-			if (this.sidebar?.searchActive) this.paneFocus?.focus("sidebar");
-		}
 	}
 
 	private scheduleSidebarSearch(query: string, delay = LEXICAL_SEARCH_DELAY_MS): void {
@@ -1220,7 +1467,6 @@ export class OpenTUIInteractiveMode {
 			await this.unbindForeground(this.sessionHost.current);
 			if (this.sessionSearchTimer) clearTimeout(this.sessionSearchTimer);
 			if (this.semanticSearchTimer) clearTimeout(this.semanticSearchTimer);
-			this.sidebarPreviewTarget = undefined;
 			for (const cleanup of this.signalCleanups.splice(0)) cleanup();
 			this.unsubscribeApplicationKeys?.();
 			this.unsubscribeApplicationKeys = undefined;

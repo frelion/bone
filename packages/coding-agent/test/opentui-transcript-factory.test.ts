@@ -370,7 +370,7 @@ describe("OpenTUI transcript factory", () => {
 		renderer.root.add(started.item.root);
 		const captured = await frame(setup, "future detail");
 		expect(captured).toContain("read · complete");
-		expect(captured).toContain("⌄ ✓ Worked for 1s · 1 tool calls");
+		expect(captured).toContain("⌄ ✓ Inspected the workspace · 1s · 1 tool call");
 	});
 
 	test("keeps stable assistant and tool views through streaming updates", async () => {

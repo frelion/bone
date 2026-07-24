@@ -1,8 +1,11 @@
 export { OpenTUIWelcome, type OpenTUIWelcomeOptions } from "./opentui-chrome.ts";
 export {
 	OpenTUIComposer,
+	type OpenTUIComposerInteractionKind,
+	type OpenTUIComposerInteractionState,
 	type OpenTUIComposerOptions,
 	type OpenTUIComposerStatus,
+	type OpenTUIQueuedMessage,
 } from "./opentui-composer.ts";
 export { type OpenTUILoginDialogOptionsV2, OpenTUILoginDialogV2 } from "./opentui-login-dialog-v2.ts";
 export {

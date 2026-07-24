@@ -240,6 +240,104 @@ describe("InteractiveSessionHost", () => {
 		await host.disposeAll();
 	});
 
+	it("delivers steer and follow-up prompts without waiting for the active prompt tail", async () => {
+		const tempDir = join(tmpdir(), `bone-session-host-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDirs.push(tempDir);
+		mkdirSync(tempDir, { recursive: true });
+		const manager = createPersistedSession(tempDir, "active session");
+		const sessionPath = manager.getSessionFile();
+		if (!sessionPath) throw new Error("expected persisted session file");
+		const factory: CreateAgentSessionRuntimeFactory = async ({ cwd, agentDir, sessionManager }) => {
+			const services = await createAgentSessionServices({
+				cwd,
+				agentDir,
+				resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true },
+			});
+			return {
+				...(await createAgentSessionFromServices({ services, sessionManager, noTools: "all" })),
+				services,
+				diagnostics: services.diagnostics,
+			};
+		};
+		const runtime = await createAgentSessionRuntime(factory, {
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.open(sessionPath),
+		});
+		const host = new InteractiveSessionHost(runtime, factory);
+		const internals = runtime.session as unknown as SessionInternals;
+		internals._isAgentRunActive = true;
+		let releaseActive!: () => void;
+		const activePrompt = new Promise<void>((resolve) => {
+			releaseActive = resolve;
+		});
+		const prompt = vi.spyOn(runtime.session, "prompt").mockImplementation(async (text) => {
+			if (text === "active") await activePrompt;
+		});
+
+		const running = host.prompt(runtime, "active");
+		await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+		const steer = host.prompt(runtime, "steer", { streamingBehavior: "steer" });
+		const followUp = host.prompt(runtime, "follow up", { streamingBehavior: "followUp" });
+		await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(3));
+		expect(prompt).toHaveBeenNthCalledWith(2, "steer", { streamingBehavior: "steer" });
+		expect(prompt).toHaveBeenNthCalledWith(3, "follow up", { streamingBehavior: "followUp" });
+		await Promise.all([steer, followUp]);
+		internals._isAgentRunActive = false;
+		releaseActive();
+		await running;
+		await host.disposeAll();
+	});
+
+	it("keeps lifecycle ordering after an immediate steer fails", async () => {
+		const tempDir = join(tmpdir(), `bone-session-host-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		tempDirs.push(tempDir);
+		mkdirSync(tempDir, { recursive: true });
+		const manager = createPersistedSession(tempDir, "active session");
+		const sessionPath = manager.getSessionFile();
+		if (!sessionPath) throw new Error("expected persisted session file");
+		const factory: CreateAgentSessionRuntimeFactory = async ({ cwd, agentDir, sessionManager }) => {
+			const services = await createAgentSessionServices({
+				cwd,
+				agentDir,
+				resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true },
+			});
+			return {
+				...(await createAgentSessionFromServices({ services, sessionManager, noTools: "all" })),
+				services,
+				diagnostics: services.diagnostics,
+			};
+		};
+		const runtime = await createAgentSessionRuntime(factory, {
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.open(sessionPath),
+		});
+		const host = new InteractiveSessionHost(runtime, factory);
+		const internals = runtime.session as unknown as SessionInternals;
+		internals._isAgentRunActive = true;
+		let releaseActive!: () => void;
+		const activePrompt = new Promise<void>((resolve) => {
+			releaseActive = resolve;
+		});
+		const prompt = vi.spyOn(runtime.session, "prompt").mockImplementation(async (text) => {
+			if (text === "active") await activePrompt;
+			if (text === "bad steer") throw new Error("steer rejected");
+		});
+
+		const running = host.prompt(runtime, "active");
+		await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+		await expect(host.prompt(runtime, "bad steer", { streamingBehavior: "steer" })).rejects.toThrow("steer rejected");
+		internals._isAgentRunActive = false;
+		const after = host.prompt(runtime, "after active run");
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(prompt).toHaveBeenCalledTimes(2);
+		releaseActive();
+		await Promise.all([running, after]);
+		expect(prompt).toHaveBeenNthCalledWith(3, "after active run", undefined);
+		await host.disposeAll();
+	});
+
 	it("keeps an unflushed first turn visible after switching to another session", async () => {
 		const tempDir = join(tmpdir(), `bone-session-host-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		tempDirs.push(tempDir);

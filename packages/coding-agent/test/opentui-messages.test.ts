@@ -44,20 +44,23 @@ function assistant(
 }
 
 describe("OpenTUI transcript messages", () => {
-	test("renders Codex-style prompts and a label-free assistant stream", async () => {
+	test("distinguishes user prompts from a label-free assistant stream", async () => {
 		initTheme("dark");
 		const setup = await createTestRenderer({ width: 80, height: 16 });
 		renderers.add(setup);
 		const { renderer } = setup;
-		renderer.root.add(new OpenTUIUserMessage(renderer, "inspect this repository").root);
+		const user = new OpenTUIUserMessage(renderer, "inspect this repository");
+		renderer.root.add(user.root);
 		const response = new OpenTUIAssistantMessage(renderer, assistant([{ type: "text", text: "Reading the files" }]));
 		renderer.root.add(response.root);
 		await setup.flush();
 		const captured = setup.captureCharFrame();
-		expect(captured).toContain("› inspect this repository");
+		expect(captured).toContain("inspect this repository");
 		expect(captured).toContain("Reading the files");
-		expect(captured).not.toContain("YOU");
-		expect(captured).not.toContain("BONE");
+		expect(captured.toLowerCase()).not.toContain("you  inspect");
+		expect(captured.toLowerCase()).not.toContain("bone  inspect");
+		const body = user.root.getChildren()[1];
+		expect(body?.backgroundColor).toBeDefined();
 	});
 
 	test("shows thinking only while the assistant is running", async () => {

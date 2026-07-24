@@ -147,12 +147,12 @@ describe("OpenTUI rich messages", () => {
 			group.markToolComplete(id, false);
 		}
 		renderer.root.add(group.root);
-		let captured = await frame(testRenderer, "✓ Worked for 18s · 7 tool calls");
+		let captured = await frame(testRenderer, "✓ Inspected the workspace · 18s · 7 tool calls");
 		expect(captured).not.toContain("result 0");
 
 		await testRenderer.mockMouse.click(2, 1);
 		captured = await frame(testRenderer, "result 0");
-		expect(captured).toContain("⌄ ✓ Worked for 18s · 7 tool calls");
+		expect(captured).toContain("⌄ ✓ Inspected the workspace · 18s · 7 tool calls");
 		expect(captured).toContain("result 1");
 	});
 
@@ -168,7 +168,29 @@ describe("OpenTUI rich messages", () => {
 		renderer.root.add(group.root);
 
 		const captured = await frame(testRenderer, "permission denied");
-		expect(captured).toContain("✗ Worked for 2s · 1 tool calls");
+		expect(captured).toContain("✗ Update failed · 2s · 1 tool call");
 		expect(captured).toContain("write · failed");
+	});
+
+	test("describes mixed file activity while preserving completion expansion rules", async () => {
+		const testRenderer = await setup();
+		const { renderer } = testRenderer;
+		const group = new OpenTUIWorkingGroup(renderer, 0, () => 3_000);
+		const read = new OpenTUIToolExecution(renderer, "read", "read-call", { path: "a.ts" });
+		const edit = new OpenTUIToolExecution(renderer, "apply_patch", "edit-call", { path: "a.ts" });
+		group.addTool("read-call", read);
+		group.addTool("edit-call", edit);
+		renderer.root.add(group.root);
+
+		let captured = await frame(testRenderer, "Inspecting and updating files · 2 tool calls");
+		expect(captured).toContain("⌄ ◐");
+
+		read.updateResult(textOnlyToolResult("read", "read-call", "old"));
+		edit.updateResult(textOnlyToolResult("apply_patch", "edit-call", "done"));
+		group.markToolComplete("read-call", false);
+		group.markToolComplete("edit-call", false);
+		captured = await frame(testRenderer, "Inspected and updated files · 3s · 2 tool calls");
+		expect(captured).toContain("› ✓");
+		expect(captured).not.toContain("old");
 	});
 });

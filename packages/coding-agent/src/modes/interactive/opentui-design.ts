@@ -8,9 +8,6 @@ export const OPEN_TUI_LAYOUT = {
 	separatorWidth: 1,
 	dialogMaxWidth: 92,
 	dialogMargin: 2,
-	// Running previews are tail-following, so a short polling interval keeps the
-	// newest streamed tokens visible without animating idle conversations.
-	marqueeIntervalMs: 80,
 } as const;
 
 export const OPEN_TUI_COLORS = {

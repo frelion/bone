@@ -83,6 +83,34 @@ describe("OpenTUICommandRouter", () => {
 		expect(statuses).toContain("Conversation compacted");
 	});
 
+	test("routes a captured submission to its originating runtime", async () => {
+		const firstName = vi.fn();
+		const secondName = vi.fn();
+		const runtime = (setSessionName: ReturnType<typeof vi.fn>) =>
+			({
+				session: {
+					setSessionName,
+					sessionManager: { getSessionName: () => "Original" },
+				},
+				cwd: "/tmp",
+			}) as unknown as AgentSessionRuntime;
+		const first = runtime(firstName);
+		const second = runtime(secondName);
+		const host = { current: second, createNew: vi.fn(async () => {}) };
+		const router = new OpenTUICommandRouter({
+			host,
+			getUI: () => undefined,
+			onStatus: vi.fn(),
+			onFocusConversations: vi.fn(),
+			onQuit: vi.fn(),
+		});
+
+		await router.route("/name Captured", first);
+
+		expect(firstName).toHaveBeenCalledWith("Captured");
+		expect(secondName).not.toHaveBeenCalled();
+	});
+
 	test("routes ! and !! through executeBash with context semantics", async () => {
 		const { router, executeBash } = createHarness();
 		expect(await router.route("! pwd")).toEqual({ handled: true, kind: "bash" });
@@ -184,7 +212,7 @@ describe("OpenTUICommandRouter", () => {
 			.mockResolvedValueOnce("hideThinkingBlock")
 			.mockResolvedValueOnce("true")
 			.mockResolvedValueOnce("back")
-			.mockResolvedValueOnce("save");
+			.mockResolvedValueOnce("__save_settings__");
 		const ui = { available: true, dialogs: { select } } as unknown as ExtensionUIV2Context;
 		const router = new OpenTUICommandRouter({
 			host: { current: runtime, createNew: async () => {} },
@@ -196,6 +224,13 @@ describe("OpenTUICommandRouter", () => {
 
 		try {
 			await router.route("/settings");
+			expect(select.mock.calls[0]?.[0]).toMatchObject({
+				footer: "Ctrl+S save · Esc discard",
+				shortcuts: [{ action: "save", value: "__save_settings__" }],
+			});
+			expect(select.mock.calls[0]?.[0].options).not.toEqual(
+				expect.arrayContaining([expect.objectContaining({ value: "save" })]),
+			);
 			expect(replaceScope).toHaveBeenCalledWith("global", { hideThinkingBlock: true });
 		} finally {
 			rmSync(root, { recursive: true, force: true });

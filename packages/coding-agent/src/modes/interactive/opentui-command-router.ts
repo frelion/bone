@@ -87,41 +87,40 @@ export class OpenTUICommandRouter {
 		return new CombinedAutocompleteProvider([...commands.values()], cwd);
 	}
 
-	async route(text: string): Promise<OpenTUICommandResult> {
+	async route(text: string, runtime = this.options.host.current): Promise<OpenTUICommandResult> {
 		const trimmed = text.trim();
 		if (trimmed.startsWith("!")) {
-			await this.executeBash(trimmed);
+			await this.executeBash(trimmed, runtime);
 			return { handled: true, kind: "bash" };
 		}
 		const command = parseCommand(trimmed);
 		if (!command) return { handled: false };
 		const resolvedName = resolveBuiltinCommand(command.name);
 		if (!resolvedName) return { handled: false };
-		await this.executeCommand(resolvedName, command.argument);
+		await this.executeCommand(resolvedName, command.argument, runtime);
 		return { handled: true, kind: "command" };
 	}
 
-	private async executeCommand(name: string, argument: string): Promise<void> {
-		const runtime = this.options.host.current;
+	private async executeCommand(name: string, argument: string, runtime: AgentSessionRuntime): Promise<void> {
 		const session = runtime.session;
 		switch (name) {
 			case "settings":
-				await this.settings();
+				await this.settings(runtime);
 				return;
 			case "model":
-				await this.model(argument);
+				await this.model(runtime, argument);
 				return;
 			case "scoped-models":
-				await this.scopedModels();
+				await this.scopedModels(runtime);
 				return;
 			case "trust":
 				await this.trust(runtime);
 				return;
 			case "login":
-				await this.login(argument);
+				await this.login(runtime, argument);
 				return;
 			case "logout":
-				await this.logout();
+				await this.logout(runtime);
 				return;
 			case "new":
 				await this.options.host.createNew();
@@ -190,20 +189,20 @@ export class OpenTUICommandRouter {
 		}
 	}
 
-	private async settings(): Promise<void> {
+	private async settings(runtime: AgentSessionRuntime): Promise<void> {
 		const ui = requireUI(this.options.getUI());
 		await new OpenTUISettingsCenter({
-			runtime: this.options.host.current,
+			runtime,
 			ui,
-			onLogin: (providerId) => this.login(providerId),
-			onLogout: () => this.logout(),
+			onLogin: (providerId) => this.login(runtime, providerId),
+			onLogout: () => this.logout(runtime),
 			onPresentationChanged: this.options.onPresentationChanged,
 			status: this.options.onStatus,
 		}).run();
 	}
 
-	private async model(query: string): Promise<void> {
-		const session = this.options.host.current.session;
+	private async model(runtime: AgentSessionRuntime, query: string): Promise<void> {
+		const session = runtime.session;
 		const available = await session.modelRuntime.getAvailable();
 		const normalized = query.toLowerCase();
 		const matches = normalized
@@ -232,8 +231,8 @@ export class OpenTUICommandRouter {
 		this.status(`Model: ${modelKey(model)}`);
 	}
 
-	private async scopedModels(): Promise<void> {
-		const session = this.options.host.current.session;
+	private async scopedModels(runtime: AgentSessionRuntime): Promise<void> {
+		const session = runtime.session;
 		const models = await session.modelRuntime.getAvailable();
 		if (models.length === 0) throw new Error("No models are available");
 		const selected = new Set(session.scopedModels.map((item) => modelKey(item.model)));
@@ -274,8 +273,7 @@ export class OpenTUICommandRouter {
 		this.status(choice.savedPath ? `${choice.label}: ${choice.savedPath}` : choice.label);
 	}
 
-	private async login(providerRef: string): Promise<void> {
-		const runtime = this.options.host.current;
+	private async login(runtime: AgentSessionRuntime, providerRef: string): Promise<void> {
 		const modelRuntime = runtime.session.modelRuntime;
 		const providers = modelRuntime.getProviders();
 		let providerId = providerRef;
@@ -328,8 +326,7 @@ export class OpenTUICommandRouter {
 		else ui.dialogs.notify(event.message);
 	}
 
-	private async logout(): Promise<void> {
-		const runtime = this.options.host.current;
+	private async logout(runtime: AgentSessionRuntime): Promise<void> {
 		const providers = runtime.session.modelRuntime
 			.getProviders()
 			.filter((provider) => runtime.session.modelRuntime.getProviderAuthStatus(provider.id).configured);
@@ -477,14 +474,14 @@ export class OpenTUICommandRouter {
 		});
 	}
 
-	private async executeBash(text: string): Promise<void> {
+	private async executeBash(text: string, runtime: AgentSessionRuntime): Promise<void> {
 		const excluded = text.startsWith("!!");
 		const command = text.slice(excluded ? 2 : 1).trim();
 		if (!command) {
 			this.status("Usage: !<command> or !!<command>", "warning");
 			return;
 		}
-		const session = this.options.host.current.session;
+		const session = runtime.session;
 		if (session.isBashRunning) throw new Error("A bash command is already running");
 		const result = await session.executeBash(command, undefined, { excludeFromContext: excluded });
 		this.status(`Bash exited ${result.exitCode}${result.cancelled ? " (cancelled)" : ""}`);

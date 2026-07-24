@@ -15,6 +15,7 @@ export type OpenTUIAction =
 	| "sidebarSearch"
 	| "sidebarDelete"
 	| "composerSubmit"
+	| "composerQueue"
 	| "composerNewline"
 	| "composerNewlineAlt"
 	| "composerHistoryUp"
@@ -28,7 +29,9 @@ export type OpenTUIAction =
 	| "sessionPath"
 	| "sessionDelete"
 	| "configToggle"
-	| "toggleToolDetails";
+	| "toggleToolDetails"
+	| "jumpToLatest"
+	| "save";
 
 interface OpenTUIKeySpec {
 	name: string;
@@ -52,6 +55,7 @@ const OPEN_TUI_KEYMAP: Record<OpenTUIAction, OpenTUIKeySpec> = {
 	sidebarSearch: { name: "/" },
 	sidebarDelete: { name: "d" },
 	composerSubmit: { name: "enter" },
+	composerQueue: { name: "enter", meta: true },
 	composerNewline: { name: "enter", shift: true },
 	composerNewlineAlt: { name: "j", ctrl: true },
 	composerHistoryUp: { name: "up" },
@@ -66,6 +70,8 @@ const OPEN_TUI_KEYMAP: Record<OpenTUIAction, OpenTUIKeySpec> = {
 	sessionDelete: { name: "d", ctrl: true },
 	configToggle: { name: "space" },
 	toggleToolDetails: { name: "o", ctrl: true },
+	jumpToLatest: { name: "end" },
+	save: { name: "s", ctrl: true },
 };
 
 function normalizeName(name: string): string {

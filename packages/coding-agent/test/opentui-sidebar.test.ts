@@ -5,7 +5,6 @@ import type { InteractiveSessionSummary } from "../src/core/interactive-session-
 import { OpenTUISessionSidebar } from "../src/modes/interactive/components/opentui-session-sidebar.ts";
 import { OpenTUITranscriptFocusController } from "../src/modes/interactive/components/opentui-transcript-focus.ts";
 import { OpenTUIPaneNavigator } from "../src/modes/interactive/components/pane-navigator.ts";
-import { OPEN_TUI_LAYOUT } from "../src/modes/interactive/opentui-design.ts";
 import { OpenTUIInteractiveShell } from "../src/modes/interactive/opentui-shell.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
@@ -114,7 +113,7 @@ describe("OpenTUI session sidebar", () => {
 		focus.dispose();
 	});
 
-	test("keeps search live, previews results, and restores the original session", async () => {
+	test("keeps search selection local until the user explicitly opens a result", async () => {
 		const setup = await createRenderer(100, 24);
 		const { renderer, mockInput } = setup;
 		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 38 });
@@ -124,8 +123,10 @@ describe("OpenTUI session sidebar", () => {
 		if (!sidebarNode) throw new Error("Expected sidebar node");
 		const queryChange = vi.fn();
 		const preview = vi.fn();
+		const activate = vi.fn();
 		sidebar.onSearchQueryChange = queryChange;
 		sidebar.onPreviewSession = preview;
+		sidebar.onActivateSession = activate;
 		sidebar.setSessions([makeSession("a", "foreground"), makeSession("b", "cold"), makeSession("c", "cold")]);
 		const focus = new OpenTUIPaneNavigator(renderer);
 		focus.register("sidebar", {
@@ -163,13 +164,27 @@ describe("OpenTUI session sidebar", () => {
 		expect(searchFrame).not.toContain("Session a");
 
 		mockInput.pressArrow("down");
-		expect(preview).toHaveBeenLastCalledWith("/sessions/c.jsonl");
+		expect(preview).not.toHaveBeenCalled();
+		expect(activate).not.toHaveBeenCalled();
 		focus.focus("sidebar");
 		await mockInput.typeText(" cache");
 		expect(sidebar.searchQuery).toBe("semantic cache");
 		mockInput.pressEscape();
-		expect(preview).toHaveBeenLastCalledWith("/sessions/a.jsonl");
+		expect(preview).not.toHaveBeenCalled();
+		expect(activate).not.toHaveBeenCalled();
 		expect(sidebar.searchActive).toBe(false);
+
+		mockInput.pressKey("/");
+		await mockInput.typeText("semantic");
+		sidebar.setSearchResults([
+			{
+				sessionPath: "/sessions/b.jsonl",
+				score: 2,
+				evidence: { kind: "user", label: "You", snippet: "semantic cache" },
+			},
+		]);
+		mockInput.pressEnter();
+		expect(activate).toHaveBeenCalledWith("/sessions/b.jsonl");
 		renderer.keyInput.off("keypress", routeKeys);
 		focus.dispose();
 	});
@@ -290,7 +305,7 @@ describe("OpenTUI session sidebar", () => {
 		expect(frame.indexOf("Session older")).toBeLessThan(frame.indexOf("Session newer"));
 	});
 
-	test("renders live throughput and keeps a running preview pinned to its newest output", async () => {
+	test("renders live throughput and updates running previews without periodic motion", async () => {
 		const setup = await createRenderer(100, 18);
 		const { renderer } = setup;
 		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 38 });
@@ -306,9 +321,10 @@ describe("OpenTUI session sidebar", () => {
 		]);
 
 		await flushUntil(setup, "12.3 tok/s");
-		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs + 40));
+		const initial = setup.captureCharFrame();
+		expect(initial).toContain("This is a deliberately");
 		await setup.flush();
-		expect(setup.captureCharFrame()).toContain("keeps moving");
+		expect(setup.captureCharFrame()).toBe(initial);
 
 		sidebar.setSessions([
 			makeSession("live", "background-running", {
@@ -316,11 +332,8 @@ describe("OpenTUI session sidebar", () => {
 				throughputTokensPerSecond: 12.34,
 			}),
 		]);
-		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs + 40));
-		await setup.flush();
-		const after = setup.captureCharFrame();
-		expect(after).toContain("newest streamed tokens");
-		expect(after).not.toContain("This is a deliberately");
+		const after = await flushUntil(setup, "This is a deliberately");
+		expect(after).toContain("This is a deliberately");
 	});
 
 	test("updates a streaming row in place without rebuilding the native list", async () => {
@@ -346,7 +359,7 @@ describe("OpenTUI session sidebar", () => {
 		expect(await flushUntil(setup, "second streamed output")).toContain("18.0 tok/s");
 	});
 
-	test("uses measured preview width and never loops old output back into a running conversation", async () => {
+	test("uses stable leading truncation for long running previews", async () => {
 		const setup = await createRenderer(100, 18);
 		const { renderer } = setup;
 		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 32 });
@@ -361,20 +374,17 @@ describe("OpenTUI session sidebar", () => {
 		]);
 
 		await flushUntil(setup, "12.3 tok/s");
-		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs + 40));
-		await setup.flush();
 		const after = setup.captureCharFrame();
 		expect(after).toContain("12.3 tok/s");
-		expect(after).toContain("PQRSTUV");
-		expect(after).not.toContain("ABCDEF");
+		expect(after).toContain("ABCDEF");
+		expect(after).not.toContain("PQRSTUV");
 
 		sidebar.dispose();
-		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs + 40));
 		await setup.flush();
 		expect(setup.captureCharFrame()).toBe(after);
 	});
 
-	test("keeps emoji output intact while following the latest preview tail", async () => {
+	test("keeps emoji output intact in a stable preview", async () => {
 		const setup = await createRenderer(100, 18);
 		const { renderer } = setup;
 		const shell = new OpenTUIInteractiveShell(renderer, { sidebarWidth: 32 });
@@ -389,10 +399,8 @@ describe("OpenTUI session sidebar", () => {
 		]);
 
 		await flushUntil(setup, "12.3 tok/s");
-		await new Promise((resolve) => setTimeout(resolve, OPEN_TUI_LAYOUT.marqueeIntervalMs + 40));
-		await setup.flush();
 		const frame = setup.captureCharFrame();
-		expect(frame).toContain("TUVWXYZ");
+		expect(frame).toContain("🙂ABCDEF");
 		expect(frame).not.toContain("�");
 		sidebar.dispose();
 	});

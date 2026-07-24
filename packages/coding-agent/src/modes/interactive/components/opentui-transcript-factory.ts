@@ -28,6 +28,7 @@ import {
 	OpenTUICustomMessage,
 	type OpenTUIImageAttachment,
 	OpenTUISkillInvocation,
+	type OpenTUIToolActivityKind,
 	OpenTUIToolExecution,
 	OpenTUIWorkingGroup,
 } from "./opentui-rich-messages.ts";
@@ -137,6 +138,10 @@ class OpenTUIStructuredToolExecution {
 		this.expanded = expanded;
 		this.fallback.setExpanded(expanded);
 		this.refresh();
+	}
+
+	getActivityKind(): OpenTUIToolActivityKind {
+		return this.fallback.getActivityKind();
 	}
 
 	private refresh(): void {

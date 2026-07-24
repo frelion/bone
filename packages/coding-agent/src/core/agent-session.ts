@@ -350,6 +350,7 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+	private _compactionWaiters = new Set<() => void>();
 	private _overflowRecoveryAttempted = false;
 
 	// Branch summarization state
@@ -2058,6 +2059,21 @@ export class AgentSession {
 		await this._getIdleWaitPromise();
 	}
 
+	/** Wait for any active compaction or branch summarization operation to settle. */
+	async waitForCompaction(): Promise<void> {
+		if (!this.isCompacting) return;
+		await new Promise<void>((resolve) => {
+			this._compactionWaiters.add(resolve);
+		});
+	}
+
+	private _resolveCompactionWaitersIfIdle(): void {
+		if (this.isCompacting) return;
+		const waiters = [...this._compactionWaiters];
+		this._compactionWaiters.clear();
+		for (const resolve of waiters) resolve();
+	}
+
 	// =========================================================================
 	// Model Management
 	// =========================================================================
@@ -2441,6 +2457,7 @@ export class AgentSession {
 		} finally {
 			this._compactionAbortController = undefined;
 			this._reconnectToAgent();
+			this._resolveCompactionWaitersIfIdle();
 		}
 	}
 
@@ -2729,6 +2746,7 @@ export class AgentSession {
 			return false;
 		} finally {
 			this._autoCompactionAbortController = undefined;
+			this._resolveCompactionWaitersIfIdle();
 		}
 	}
 
@@ -3608,6 +3626,7 @@ export class AgentSession {
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
 			this._branchSummaryAbortController = undefined;
+			this._resolveCompactionWaitersIfIdle();
 		}
 	}
 

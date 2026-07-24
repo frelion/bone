@@ -128,6 +128,21 @@ describe("OpenTUIExtensionHost", () => {
 		await expect(dialogInput).resolves.toBe("bone");
 	});
 
+	test("routes a select dialog save shortcut without a visible option", async () => {
+		const { renderer, host, input } = await setup();
+		const selected = host.context.dialogs.select({
+			title: "Settings",
+			options: [{ value: "general", label: "General" }],
+			shortcuts: [{ action: "save", value: "save" }],
+			footer: "Ctrl+S save · Esc discard",
+		});
+		const frame = await flushUntil(renderer, "Ctrl+S save");
+		expect(frame).toContain("General");
+		expect(frame).not.toContain("Save changes");
+		input.pressKey("s", { ctrl: true });
+		await expect(selected).resolves.toBe("save");
+	});
+
 	test("cancels dialogs on escape, abort, and timeout", async () => {
 		const { renderer, host, input } = await setup();
 		const escaped = host.context.dialogs.input({ title: "Escape me" });

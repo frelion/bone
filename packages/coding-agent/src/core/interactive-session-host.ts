@@ -179,15 +179,18 @@ export class InteractiveSessionHost {
 		const submittedSession = runtime.session;
 
 		slot.pendingPrompts++;
-		const prompt = slot.promptTail
-			.catch(() => {})
-			.then(async () => {
-				if (!slot.acceptingPrompts || runtime.session !== submittedSession) {
-					throw new Error("Conversation runtime was replaced");
-				}
-				await submittedSession.prompt(text, options);
-			});
-		slot.promptTail = prompt;
+		const runPrompt = async () => {
+			if (!slot.acceptingPrompts || runtime.session !== submittedSession) {
+				throw new Error("Conversation runtime was replaced");
+			}
+			await submittedSession.prompt(text, options);
+		};
+		const deliversToActiveRun = submittedSession.isStreaming && options?.streamingBehavior !== undefined;
+		const previousTail = slot.promptTail.catch(() => {});
+		const prompt = deliversToActiveRun ? runPrompt() : previousTail.then(runPrompt);
+		// Immediate steering still participates in lifecycle drains without being
+		// blocked by the long-lived prompt that owns the active agent turn.
+		slot.promptTail = deliversToActiveRun ? Promise.allSettled([previousTail, prompt]).then(() => undefined) : prompt;
 		try {
 			await prompt;
 		} finally {

@@ -2,7 +2,7 @@ import { join } from "node:path";
 import type { Credential } from "@frelion/bone-ai";
 import { CONFIG_DIR_NAME } from "../../../config.ts";
 import type { AgentSessionRuntime } from "../../../core/agent-session-runtime.ts";
-import type { ExtensionUIV2Context } from "../../../core/extensions/ui-v2.ts";
+import type { ExtensionUISelectRequest, ExtensionUIV2Context } from "../../../core/extensions/ui-v2.ts";
 import {
 	type ForgeConfig,
 	type ForgeInstanceConfig,
@@ -16,6 +16,10 @@ import { SettingsTransactionJournal } from "../../../core/settings-transaction-j
 
 type Dialogs = ExtensionUIV2Context["dialogs"];
 type ValueKind = "string" | "number" | "boolean";
+
+const SAVE_SETTINGS = "__save_settings__";
+
+class SaveSettingsRequested extends Error {}
 
 interface Field {
 	label: string;
@@ -175,40 +179,54 @@ export class OpenTUISettingsCenter {
 	}
 
 	async run(): Promise<void> {
-		for (;;) {
-			const page = await this.dialogs.select({
-				title: `Settings · ${this.scope === "global" ? "Global" : "Project"}`,
-				options: [
-					{
-						value: "providers",
-						label: "Providers & Models",
-						description: "Connections, auth, models and overrides",
-					},
-					{
-						value: "forge",
-						label: "GitLab & GitHub",
-						description: "Forge hosts, private network and credentials",
-					},
-					...Object.keys(FIELDS).map((value) => ({ value, label: value })),
-					{ value: "scope", label: "Configuration scope", description: "Switch Global / Project" },
-					{ value: "global-json", label: "Advanced: global JSON", description: "Edit every global setting" },
-					{ value: "project-json", label: "Advanced: project JSON", description: "Edit every project setting" },
-					{ value: "models-json", label: "Advanced: models JSON", description: "Edit every provider/model field" },
-					{ value: "save", label: "Save changes" },
-					{ value: "cancel", label: "Cancel" },
-				],
-			});
-			if (!page || page === "cancel") return;
-			if (page === "save") {
-				await this.save();
-				return;
+		try {
+			for (;;) {
+				const page = await this.select({
+					title: `Settings · ${this.scope === "global" ? "Global" : "Project"}`,
+					options: [
+						{
+							value: "providers",
+							label: "Providers & Models",
+							description: "Connections, auth, models and overrides",
+						},
+						{
+							value: "forge",
+							label: "GitLab & GitHub",
+							description: "Forge hosts, private network and credentials",
+						},
+						...Object.keys(FIELDS).map((value) => ({ value, label: value })),
+						{ value: "scope", label: "Configuration scope", description: "Switch Global / Project" },
+						{ value: "global-json", label: "Advanced: global JSON", description: "Edit every global setting" },
+						{ value: "project-json", label: "Advanced: project JSON", description: "Edit every project setting" },
+						{
+							value: "models-json",
+							label: "Advanced: models JSON",
+							description: "Edit every provider/model field",
+						},
+					],
+				});
+				if (!page) return;
+				if (page === "scope") await this.switchScope();
+				else if (page === "providers") await this.providers();
+				else if (page === "forge") await this.forgeSettings();
+				else if (page === "global-json" || page === "project-json" || page === "models-json")
+					await this.editRaw(page);
+				else await this.editPage(page);
 			}
-			if (page === "scope") await this.switchScope();
-			else if (page === "providers") await this.providers();
-			else if (page === "forge") await this.forgeSettings();
-			else if (page === "global-json" || page === "project-json" || page === "models-json") await this.editRaw(page);
-			else await this.editPage(page);
+		} catch (error) {
+			if (!(error instanceof SaveSettingsRequested)) throw error;
+			await this.save();
 		}
+	}
+
+	private async select<Value extends string>(request: ExtensionUISelectRequest<Value>): Promise<Value | undefined> {
+		const selected = await this.dialogs.select<Value | typeof SAVE_SETTINGS>({
+			...request,
+			shortcuts: [{ action: "save", value: SAVE_SETTINGS }],
+			footer: "Ctrl+S save · Esc discard",
+		});
+		if (selected === SAVE_SETTINGS) throw new SaveSettingsRequested();
+		return selected;
 	}
 
 	private current(): Settings {
@@ -220,7 +238,7 @@ export class OpenTUISettingsCenter {
 			this.options.status("Project settings require a trusted workspace", "warning");
 			return;
 		}
-		const selected = await this.dialogs.select({
+		const selected = await this.select({
 			title: "Configuration scope",
 			options: [
 				{ value: "global", label: "Global", description: "~/.bone/agent/settings.json" },
@@ -236,7 +254,7 @@ export class OpenTUISettingsCenter {
 		if (!fields) return;
 		for (;;) {
 			const draft = this.current();
-			const field = await this.dialogs.select({
+			const field = await this.select({
 				title: page,
 				options: [
 					...fields.map((entry) => ({
@@ -253,7 +271,7 @@ export class OpenTUISettingsCenter {
 			const initial = readPath(draft, entry.path);
 			const value =
 				entry.kind === "boolean" || entry.choices
-					? await this.dialogs.select({
+					? await this.select({
 							title: entry.label,
 							options: (entry.choices ?? ["true", "false"]).map((choice) => ({ value: choice, label: choice })),
 							initialValue: display(initial === undefined ? (entry.kind === "boolean" ? "false" : "") : initial),
@@ -304,7 +322,7 @@ export class OpenTUISettingsCenter {
 	private async providers(): Promise<void> {
 		for (;;) {
 			const providerIds = Object.keys(this.models.providers);
-			const providerId = await this.dialogs.select({
+			const providerId = await this.select({
 				title: "Providers & Models",
 				options: [
 					...providerIds.map((id) => ({
@@ -324,7 +342,7 @@ export class OpenTUISettingsCenter {
 
 	private async forgeSettings(): Promise<void> {
 		for (;;) {
-			const selected = await this.dialogs.select({
+			const selected = await this.select({
 				title: "GitLab & GitHub",
 				options: [
 					...this.forge.instances.map((instance) => ({
@@ -346,7 +364,7 @@ export class OpenTUISettingsCenter {
 	}
 
 	private async addForgeInstance(): Promise<void> {
-		const provider = await this.dialogs.select({
+		const provider = await this.select({
 			title: "Forge provider",
 			options: [
 				{ value: "github", label: "GitHub" },
@@ -374,7 +392,7 @@ export class OpenTUISettingsCenter {
 
 	private async editForgeInstance(instance: ForgeInstanceConfig): Promise<void> {
 		for (;;) {
-			const action = await this.dialogs.select({
+			const action = await this.select({
 				title: `${instance.provider} · ${instance.host}`,
 				options: [
 					{ value: "host", label: "Host", description: instance.host },
@@ -392,7 +410,7 @@ export class OpenTUISettingsCenter {
 			});
 			if (!action || action === "back") return;
 			if (action === "network") {
-				const value = await this.dialogs.select({
+				const value = await this.select({
 					title: "Private network",
 					options: [
 						{ value: "false", label: "Public network only" },
@@ -452,7 +470,7 @@ export class OpenTUISettingsCenter {
 		const provider = this.models.providers[providerId];
 		if (!provider) return;
 		for (;;) {
-			const action = await this.dialogs.select({
+			const action = await this.select({
 				title: provider.name || providerId,
 				options: [
 					{ value: "name", label: "Display name", description: display(provider.name) },
@@ -532,7 +550,7 @@ export class OpenTUISettingsCenter {
 				models = [];
 				provider.models = models;
 			}
-			const selected = await this.dialogs.select({
+			const selected = await this.select({
 				title: `${providerId} models`,
 				options: [
 					...models.map((model) => ({
@@ -552,7 +570,7 @@ export class OpenTUISettingsCenter {
 			}
 			const model = models.find((candidate) => candidate.id === selected);
 			if (!model) continue;
-			const action = await this.dialogs.select({
+			const action = await this.select({
 				title: model.name || model.id,
 				options: [
 					{ value: "name", label: "Display name", description: model.name ?? model.id },

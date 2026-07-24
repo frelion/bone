@@ -20,6 +20,8 @@ export interface ExtensionUISelectRequest<Value extends string = string> extends
 	title: string;
 	options: readonly ExtensionUISelectOption<Value>[];
 	initialValue?: Value;
+	shortcuts?: readonly { action: "save"; value: Value }[];
+	footer?: string;
 }
 
 export interface ExtensionUIConfirmRequest extends ExtensionUIDialogOptionsV2 {

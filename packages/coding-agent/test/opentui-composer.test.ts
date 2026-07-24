@@ -242,6 +242,59 @@ describe("OpenTUI composer", () => {
 		expect(streaming.split("\n").filter((line) => line.trim())).toHaveLength(occupiedRows);
 	});
 
+	test("presents task-aware placeholder and action hints", async () => {
+		const { testSetup, composer } = await mountComposer({ placeholder: "Start a task" });
+		await settle(testSetup);
+		expect(testSetup.captureCharFrame()).toContain("Start a task");
+
+		composer.setInteractionState({ kind: "working" });
+		await settle(testSetup);
+		const working = testSetup.captureCharFrame();
+		expect(composer.interactionKind).toBe("working");
+		expect(working).toContain("Add instructions to the current task");
+		expect(working).toContain("Enter add to current task");
+		expect(working).toContain("Ctrl+C stop");
+
+		composer.setInteractionState({
+			kind: "waiting",
+			placeholder: "Answer the permission question",
+			leftHint: "Enter confirm",
+		});
+		await settle(testSetup);
+		const waiting = testSetup.captureCharFrame();
+		expect(waiting).toContain("Answer the permission question");
+		expect(waiting).toContain("Enter confirm");
+		expect(waiting).toContain("Esc cancel");
+
+		composer.setInteractionState({ kind: "idle" });
+		await settle(testSetup);
+		expect(testSetup.captureCharFrame()).toContain("Start a task");
+	});
+
+	test("renders a read-only snapshot of queued messages", async () => {
+		const { testSetup, composer } = await mountComposer();
+		composer.setQueuedMessages([
+			{ id: "first", text: "Run the focused tests" },
+			{ id: "second", text: "Then update\nrelease notes" },
+		]);
+		await settle(testSetup);
+
+		const queued = testSetup.captureCharFrame();
+		expect(composer.queuedMessageCount).toBe(2);
+		expect(queued).toContain("Queued next: 2");
+		expect(queued).toContain("1. Run the focused tests");
+		expect(queued).toContain("2. Then update release notes");
+
+		expect(composer.getQueuedMessages()).toEqual([
+			{ id: "first", text: "Run the focused tests" },
+			{ id: "second", text: "Then update\nrelease notes" },
+		]);
+		composer.setQueuedMessages([]);
+		expect(composer.queuedMessageCount).toBe(0);
+		await settle(testSetup);
+		expect(testSetup.captureCharFrame()).not.toContain("Queued next");
+	});
+
 	test("keeps public state updates safe after the native edit buffer is destroyed", async () => {
 		const { renderer, mockInput, composer } = await mountComposer();
 		await mockInput.typeText("draft survives teardown");
@@ -251,6 +304,9 @@ describe("OpenTUI composer", () => {
 		expect(() => composer.focus()).not.toThrow();
 		expect(() => composer.blur()).not.toThrow();
 		expect(() => composer.setPlaceholder("Next prompt")).not.toThrow();
+		expect(() => composer.setInteractionState({ kind: "working" })).not.toThrow();
+		expect(() => composer.setQueuedMessages([{ id: "queued", text: "queued task" }])).not.toThrow();
+		expect(composer.getQueuedMessages()).toEqual([{ id: "queued", text: "queued task" }]);
 		expect(() => composer.updateStatus({ foregroundThroughput: "20 tok/s" })).not.toThrow();
 		initTheme("light");
 		expect(() => composer.updateTheme(theme)).not.toThrow();
