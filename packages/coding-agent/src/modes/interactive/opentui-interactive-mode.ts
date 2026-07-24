@@ -626,7 +626,7 @@ export class OpenTUIInteractiveMode {
 		);
 		this.composer?.updateStatus(this.getComposerStatus(runtime));
 		this.updateComposerInteractionState(runtime);
-		this.updateQueuedMessages(runtime.session.getFollowUpMessages());
+		this.updateQueuedMessages(runtime.session.getSteeringMessages(), runtime.session.getFollowUpMessages());
 		const historySnapshot = await this.renderTranscript(
 			runtime,
 			generation,
@@ -999,7 +999,7 @@ export class OpenTUIInteractiveMode {
 				this.composer?.setInteractionState({ kind: "waiting", placeholder: "Review the proposed plan" });
 				break;
 			case "queue_update":
-				this.updateQueuedMessages(event.followUp);
+				this.updateQueuedMessages(event.steering, event.followUp);
 				break;
 		}
 		const mutation = await this.transcriptFactory.handleEvent(event);
@@ -1438,13 +1438,11 @@ export class OpenTUIInteractiveMode {
 		this.composer?.setInteractionState({ kind: "idle" });
 	}
 
-	private updateQueuedMessages(messages: readonly string[]): void {
-		this.composer?.setQueuedMessages(
-			messages.map((text, index) => ({
-				id: `follow-up:${index}:${text}`,
-				text,
-			})),
-		);
+	private updateQueuedMessages(steering: readonly string[], followUp: readonly string[]): void {
+		this.composer?.setQueuedMessages([
+			...steering.map((text, index) => ({ id: `steering:${index}:${text}`, text, delivery: "current" as const })),
+			...followUp.map((text, index) => ({ id: `follow-up:${index}:${text}`, text, delivery: "next" as const })),
+		]);
 	}
 
 	private updateTranscriptUpdatesBanner(state: OpenTUITranscriptFocusState): void {

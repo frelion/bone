@@ -118,6 +118,7 @@ interface FakeSession {
 	answerQuestion(requestId: string, answers: QuestionAnswer[]): void;
 	cancelQuestion(requestId: string, reason: "user" | "abort" | "client_disconnect" | "no_ui"): void;
 	getFollowUpMessages(): readonly string[];
+	getSteeringMessages(): readonly string[];
 }
 
 function createRuntime(
@@ -165,6 +166,7 @@ function createRuntime(
 			session.questionState = { status: "inactive" };
 		}),
 		getFollowUpMessages: () => [],
+		getSteeringMessages: () => [],
 	};
 	const runtime = {
 		session,
@@ -962,6 +964,12 @@ describe("OpenTUIInteractiveMode", () => {
 				options: { source: "interactive", streamingBehavior: "followUp" },
 			}),
 		);
+		streamingSession.emit({ type: "queue_update", steering: ["steer now"], followUp: ["queue next"] });
+		await streamingMode.idle();
+		await settle(streamingRenderer);
+		const queuedFrame = streamingRenderer.captureFrame();
+		expect(queuedFrame).toContain("Current · steer now");
+		expect(queuedFrame).toContain("Next · queue next");
 
 		streamingRenderer.input.pressKey("c", { ctrl: true });
 		await streamingMode.idle();

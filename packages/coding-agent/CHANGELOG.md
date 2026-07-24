@@ -24,6 +24,7 @@
 - Fixed transcript clicks stealing composer focus and interactive rows activating before a primary-button click completed.
 - Restored hover feedback and pointer cursors for clickable conversation rows, tool summaries, working groups, and transcript update notices.
 - Restored automatic conversation titles after the first user message and automatic title generation with `/name`.
+- Fixed pending steering messages being omitted from the composer queue while an Agent is working.
 
 ## [0.1.5] - 2026-07-23
 

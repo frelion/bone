@@ -48,6 +48,7 @@ export interface OpenTUIComposerInteractionState {
 export interface OpenTUIQueuedMessage {
 	id: string;
 	text: string;
+	delivery?: "current" | "next";
 }
 
 const DEFAULT_STATUS: OpenTUIComposerStatus = {
@@ -76,7 +77,11 @@ const DEFAULT_INTERACTION_COPY: Record<
 };
 
 function copyQueuedMessages(messages: readonly OpenTUIQueuedMessage[]): OpenTUIQueuedMessage[] {
-	return messages.map((message) => ({ id: message.id, text: message.text }));
+	return messages.map((message) =>
+		message.delivery
+			? { id: message.id, text: message.text, delivery: message.delivery }
+			: { id: message.id, text: message.text },
+	);
 }
 
 function consume(event: KeyEvent): true {
@@ -543,7 +548,8 @@ export class OpenTUIComposer {
 		const visibleMessages = this.queuedMessages.slice(0, 3);
 		const lines = visibleMessages.map((message, index) => {
 			const summary = message.text.replace(/\s+/g, " ").trim();
-			return `  ${index + 1}. ${summary}`;
+			const delivery = message.delivery === "current" ? "Current · " : message.delivery === "next" ? "Next · " : "";
+			return `  ${index + 1}. ${delivery}${summary}`;
 		});
 		if (count > visibleMessages.length) lines.push(`  +${count - visibleMessages.length} more`);
 		this.queueItems.content = lines.join("\n");
