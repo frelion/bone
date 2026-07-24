@@ -1,6 +1,6 @@
 {
 	"name": "@frelion/bone-coding-agent",
-	"version": "0.1.5",
+	"version": "0.1.6",
 	"description": "Bone local-first coding agent with concurrent conversations and semantic memory",
 	"type": "module",
 	"boneConfig": {
@@ -42,9 +42,9 @@
 		"prepublishOnly": "bun run clean && bun run build"
 	},
 	"dependencies": {
-		"@frelion/bone-agent-core": "^0.1.5",
-		"@frelion/bone-ai": "^0.1.5",
-		"@frelion/bone-tui": "^0.1.5",
+		"@frelion/bone-agent-core": "^0.1.6",
+		"@frelion/bone-ai": "^0.1.6",
+		"@frelion/bone-tui": "^0.1.6",
 		"@opentui/core": "0.4.5",
 		"@lancedb/lancedb": "0.31.0",
 		"@silvia-odwyer/photon-node": "0.3.4",
