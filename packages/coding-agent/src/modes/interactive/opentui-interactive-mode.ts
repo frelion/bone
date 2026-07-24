@@ -402,10 +402,6 @@ export class OpenTUIInteractiveMode {
 				this.renderer?.requestRender();
 				return;
 			}
-			if (this.paneFocus?.focusedPane === "sidebar") {
-				this.sidebar?.handleKey(event);
-				return;
-			}
 			if (this.questionnaire) {
 				this.questionnaire.handleKey(event);
 				return;
@@ -432,6 +428,10 @@ export class OpenTUIInteractiveMode {
 			}
 			if (this.inlinePrompt) {
 				this.inlinePrompt.handleKey(event);
+				return;
+			}
+			if (this.paneFocus?.focusedPane === "sidebar") {
+				this.sidebar?.handleKey(event);
 				return;
 			}
 			if (this.paneFocus?.focusedPane !== "composer") return;

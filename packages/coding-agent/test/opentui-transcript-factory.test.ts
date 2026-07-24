@@ -3,6 +3,7 @@ import type { AssistantMessage, ImageContent } from "@frelion/bone-ai";
 import { type BoxRenderable, type CliRenderer, type Renderable, TextRenderable } from "@opentui/core";
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import type { AgentSessionEvent } from "../src/core/agent-session.ts";
 import type { ExtensionUIViewFactory } from "../src/core/extensions/ui-v2.ts";
 import { decodeOpenTUIImage } from "../src/modes/interactive/components/opentui-image.ts";
 import { OpenTUITranscriptFactory } from "../src/modes/interactive/components/opentui-transcript-factory.ts";
@@ -640,6 +641,35 @@ describe("OpenTUI transcript factory", () => {
 		expect(ended.type).toBe("updated");
 		captured = await frame(setup, "Inspecting the stream event queue");
 		expect(captured).toContain("✓ Inspecting the stream event queue · 4s · 1 tool call");
+	});
+
+	test("starts a new working group below a follow-up message in the same Agent run", async () => {
+		const factory = new OpenTUITranscriptFactory(nativeRenderer);
+		const setup = setupAt(100, 24);
+		const renderer = setup.renderer;
+		const appendEvent = async (event: AgentSessionEvent) => {
+			const mutation = await factory.handleEvent(event);
+			if (mutation.type === "append") renderer.root.add(mutation.item.root);
+			return mutation;
+		};
+
+		await appendEvent({ type: "agent_start" });
+		const initial = { role: "user" as const, content: "Initial request", timestamp: 1 };
+		await appendEvent({ type: "message_start", message: initial });
+		await appendEvent({ type: "message_end", message: initial });
+		const response = assistant("First response");
+		await appendEvent({ type: "message_start", message: response });
+		await appendEvent({ type: "message_end", message: response });
+
+		const followUp = { role: "user" as const, content: "Queued follow-up", timestamp: 2 };
+		await appendEvent({ type: "message_start", message: followUp });
+		const nextActivity = await appendEvent({ type: "message_end", message: followUp });
+		expect(nextActivity.type).toBe("append");
+
+		const captured = await frame(setup, "Working");
+		expect(captured.indexOf("Initial request")).toBeLessThan(captured.indexOf("✓ Completed work"));
+		expect(captured.indexOf("✓ Completed work")).toBeLessThan(captured.indexOf("Queued follow-up"));
+		expect(captured.indexOf("Queued follow-up")).toBeLessThan(captured.indexOf("Working"));
 	});
 
 	test("keeps Agent activity alive across retry and reports a tool-free provider failure", async () => {

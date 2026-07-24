@@ -526,19 +526,20 @@ export class OpenTUITranscriptFactory {
 					this.activeToolGroup.view.setActivity("Working");
 					return { type: "updated", key: this.activeToolGroup.key, root: this.activeToolGroup.view.root };
 				}
-				const group = new OpenTUIWorkingGroup(this.renderer, this.options.now(), this.options.now);
-				group.waitForAgentEnd();
-				this.activeToolGroup = {
-					key: `working-group:${++this.toolGroupSequence}`,
-					view: group,
-					appended: false,
-				};
-				this.toolGroups.add(group);
+				this.activeToolGroup = this.createLiveWorkingGroup();
 				return { type: "ignored" };
 			}
 			case "message_start":
 				if (event.message.role === "toolResult" && this.completedLiveTools.delete(event.message.toolCallId)) {
 					return { type: "ignored" };
+				}
+				if (
+					event.message.role === "user" &&
+					this.activeToolGroup?.appended &&
+					!this.activeToolGroup.view.isComplete()
+				) {
+					this.activeToolGroup.view.finish();
+					this.activeToolGroup = this.createLiveWorkingGroup();
 				}
 				if (event.message.role === "assistant") {
 					this.activeToolGroup?.view.setActivity(commentaryFromMessage(event.message));
@@ -673,6 +674,17 @@ export class OpenTUITranscriptFactory {
 			default:
 				return { type: "ignored" };
 		}
+	}
+
+	private createLiveWorkingGroup(): { key: string; view: OpenTUIWorkingGroup; appended: boolean } {
+		const group = new OpenTUIWorkingGroup(this.renderer, this.options.now(), this.options.now);
+		group.waitForAgentEnd();
+		this.toolGroups.add(group);
+		return {
+			key: `working-group:${++this.toolGroupSequence}`,
+			view: group,
+			appended: false,
+		};
 	}
 
 	private createAssistant(message: AssistantMessage): OpenTUIAssistantMessage {

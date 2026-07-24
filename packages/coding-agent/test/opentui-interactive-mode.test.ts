@@ -1632,6 +1632,49 @@ describe("OpenTUIInteractiveMode", () => {
 		mode.stop();
 	});
 
+	test("routes keys to a structured question that arrives while the sidebar is focused", async () => {
+		const active = createRuntime();
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 120, height: 28 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		const paneFocus = (
+			mode as unknown as { paneFocus: { focus(pane: "sidebar" | "composer"): void; focusedPane: string } }
+		).paneFocus;
+		paneFocus.focus("sidebar");
+		expect(paneFocus.focusedPane).toBe("sidebar");
+
+		const request = {
+			id: "question-from-sidebar",
+			toolCallId: "tool-from-sidebar",
+			createdAt: new Date(0).toISOString(),
+			questions: [
+				{
+					header: "Runtime",
+					question: "Which runtime?",
+					options: [
+						{ label: "Bun", description: "Use Bun only" },
+						{ label: "Node", description: "Keep Node support" },
+					],
+				},
+			],
+		};
+		active.emit({ type: "question_asked", request });
+		await renderer.waitForFrameText("Which runtime?");
+		renderer.input.pressEnter();
+		renderer.input.pressKey("s", { ctrl: true });
+
+		await mode.idle();
+		expect(active.session.answerQuestion).toHaveBeenCalledWith(request.id, [
+			{ questionIndex: 0, question: "Which runtime?", kind: "option", answer: "Bun" },
+		]);
+		mode.stop();
+	});
+
 	test("cancels a pending structured question when the questionnaire is dismissed", async () => {
 		const active = createRuntime();
 		const host = new FakeHost(active.runtime);
