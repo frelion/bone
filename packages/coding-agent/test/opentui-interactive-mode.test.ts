@@ -903,6 +903,7 @@ describe("OpenTUIInteractiveMode", () => {
 		renderer.input.pressEnter();
 		await settle(renderer);
 		expect(renderer.captureFrame()).toContain("Indexed result");
+		renderer.input.pressArrow("left", { shift: true });
 		renderer.input.pressKey("d");
 		await settle(renderer);
 		expect(renderer.captureFrame()).toContain("Press d again to delete");
