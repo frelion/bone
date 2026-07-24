@@ -564,12 +564,11 @@ describe("OpenTUIInteractiveMode", () => {
 		session.emit({ type: "agent_settled" });
 		releaseFrame();
 		await idlePromise;
-		await settle(renderer);
+		await renderer.waitForFrameText("final answer");
 
 		expect(handledTypes.filter((type) => type === "message_update")).toHaveLength(1);
 		expect(handledTypes.lastIndexOf("message_update")).toBeLessThan(handledTypes.indexOf("message_end"));
 		expect(handledTypes.indexOf("message_end")).toBeLessThan(handledTypes.indexOf("agent_settled"));
-		expect(renderer.captureFrame()).toContain("final answer");
 		mode.stop();
 	});
 
