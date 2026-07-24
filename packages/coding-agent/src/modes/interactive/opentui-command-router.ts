@@ -7,11 +7,15 @@ import { type AutocompleteProvider, CombinedAutocompleteProvider } from "@frelio
 import { getShareViewerUrl } from "../../config.ts";
 import type { AgentSession } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
-import type { ExtensionUIV2Context } from "../../core/extensions/ui-v2.ts";
+import type { ExtensionUIDialogService, ExtensionUIV2Context } from "../../core/extensions/ui-v2.ts";
 import { BUILTIN_SLASH_COMMANDS, type BuiltinSlashCommand, type SlashCommandInfo } from "../../core/slash-commands.ts";
 import { resolveTaskModel } from "../../core/task-model-router.ts";
 import { getProjectTrustOptions, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { copyToClipboard } from "../../utils/clipboard.ts";
+import type { OpenTUIHistoryNavigatorMode } from "./components/opentui-history-navigator.ts";
+import type { OpenTUIInlinePromptRequest } from "./components/opentui-inline-prompt.ts";
+import type { OpenTUIMultiPickerRequest } from "./components/opentui-multi-picker.ts";
+import type { OpenTUIQuickPickerRequest } from "./components/opentui-quick-picker.ts";
 import { OpenTUISettingsCenter } from "./components/opentui-settings-center.ts";
 
 export interface OpenTUICommandHost {
@@ -31,6 +35,20 @@ export interface OpenTUICommandRouterOptions {
 	onShowHotkeys?: () => void | Promise<void>;
 	onPresentationChanged?: () => void | Promise<void>;
 	onSessionListChanged?: () => void | Promise<void>;
+	pick?: <Value extends string>(
+		runtime: AgentSessionRuntime,
+		request: OpenTUIQuickPickerRequest<Value>,
+	) => Promise<Value | undefined>;
+	openSettings?: (
+		runtime: AgentSessionRuntime,
+		run: (dialogs: ExtensionUIDialogService) => Promise<void>,
+	) => Promise<void>;
+	openHistory?: (runtime: AgentSessionRuntime, mode: OpenTUIHistoryNavigatorMode) => Promise<string | undefined>;
+	multiPick?: <Value extends string>(
+		runtime: AgentSessionRuntime,
+		request: OpenTUIMultiPickerRequest<Value>,
+	) => Promise<Value[] | undefined>;
+	input?: (runtime: AgentSessionRuntime, request: OpenTUIInlinePromptRequest) => Promise<string | undefined>;
 }
 
 export type OpenTUICommandResult = { handled: false } | { handled: true; kind: "command" | "bash" };
@@ -170,7 +188,7 @@ export class OpenTUICommandRouter {
 				await this.clone(runtime);
 				return;
 			case "tree":
-				await this.tree(session);
+				await this.tree(runtime);
 				return;
 			case "status":
 				this.runtimeStatus(runtime, argument);
@@ -193,14 +211,18 @@ export class OpenTUICommandRouter {
 
 	private async settings(runtime: AgentSessionRuntime): Promise<void> {
 		const ui = requireUI(this.options.getUI());
-		await new OpenTUISettingsCenter({
-			runtime,
-			ui,
-			onLogin: (providerId) => this.login(runtime, providerId),
-			onLogout: () => this.logout(runtime),
-			onPresentationChanged: this.options.onPresentationChanged,
-			status: this.options.onStatus,
-		}).run();
+		const run = async (dialogs: ExtensionUIDialogService) =>
+			await new OpenTUISettingsCenter({
+				runtime,
+				ui,
+				dialogs,
+				onLogin: (providerId) => this.login(runtime, providerId),
+				onLogout: () => this.logout(runtime),
+				onPresentationChanged: this.options.onPresentationChanged,
+				status: this.options.onStatus,
+			}).run();
+		if (this.options.openSettings) await this.options.openSettings(runtime, run);
+		else await run(ui.dialogs);
 	}
 
 	private async model(runtime: AgentSessionRuntime, query: string): Promise<void> {
@@ -216,7 +238,7 @@ export class OpenTUICommandRouter {
 		if (matches.length === 0) throw new Error(query ? `No model matches ${query}` : "No models are available");
 		let selected = matches.length === 1 ? modelKey(matches[0]!) : undefined;
 		if (!selected) {
-			selected = await requireUI(this.options.getUI()).dialogs.select({
+			selected = await this.pick(runtime, {
 				title: "Select model",
 				options: matches.map((model) => ({
 					value: modelKey(model),
@@ -224,6 +246,8 @@ export class OpenTUICommandRouter {
 					description: modelKey(model),
 				})),
 				initialValue: session.model ? modelKey(session.model) : undefined,
+				searchable: true,
+				searchPlaceholder: "Search models",
 			});
 		}
 		if (!selected) return;
@@ -237,26 +261,42 @@ export class OpenTUICommandRouter {
 		const session = runtime.session;
 		const models = await session.modelRuntime.getAvailable();
 		if (models.length === 0) throw new Error("No models are available");
-		const selected = new Set(session.scopedModels.map((item) => modelKey(item.model)));
-		const ui = requireUI(this.options.getUI());
-		for (;;) {
-			const value = await ui.dialogs.select({
+		let selected = new Set(session.scopedModels.map((item) => modelKey(item.model)));
+		if (this.options.multiPick) {
+			const values = await this.options.multiPick(runtime, {
 				title: "Model cycling scope",
-				options: [
-					{ value: "__done__", label: "Done", description: `${selected.size} models enabled` },
-					...models.map((model) => {
-						const key = modelKey(model);
-						return {
-							value: key,
-							label: `${selected.has(key) ? "[x]" : "[ ]"} ${model.name || model.id}`,
-							description: key,
-						};
-					}),
-				],
+				options: models.map((model) => ({
+					value: modelKey(model),
+					label: model.name || model.id,
+					description: modelKey(model),
+				})),
+				initialValues: [...selected],
+				searchable: true,
+				searchPlaceholder: "Search models",
 			});
-			if (!value || value === "__done__") break;
-			if (selected.has(value)) selected.delete(value);
-			else selected.add(value);
+			if (!values) return;
+			selected = new Set(values);
+		} else {
+			const ui = requireUI(this.options.getUI());
+			for (;;) {
+				const value = await ui.dialogs.select({
+					title: "Model cycling scope",
+					options: [
+						{ value: "__done__", label: "Done", description: `${selected.size} models enabled` },
+						...models.map((model) => {
+							const key = modelKey(model);
+							return {
+								value: key,
+								label: `${selected.has(key) ? "[x]" : "[ ]"} ${model.name || model.id}`,
+								description: key,
+							};
+						}),
+					],
+				});
+				if (!value || value === "__done__") break;
+				if (selected.has(value)) selected.delete(value);
+				else selected.add(value);
+			}
 		}
 		session.setScopedModels(models.filter((model) => selected.has(modelKey(model))).map((model) => ({ model })));
 		this.status(selected.size === 0 ? "Model cycling scope cleared" : `${selected.size} scoped models enabled`);
@@ -264,7 +304,7 @@ export class OpenTUICommandRouter {
 
 	private async trust(runtime: AgentSessionRuntime): Promise<void> {
 		const choices = getProjectTrustOptions(runtime.cwd);
-		const selected = await requireUI(this.options.getUI()).dialogs.select({
+		const selected = await this.pick(runtime, {
 			title: "Workspace trust",
 			options: choices.map((choice, index) => ({ value: String(index), label: choice.label })),
 		});
@@ -281,7 +321,7 @@ export class OpenTUICommandRouter {
 		let providerId = providerRef;
 		if (!providerId) {
 			providerId =
-				(await requireUI(this.options.getUI()).dialogs.select({
+				(await this.pick(runtime, {
 					title: "Login provider",
 					options: providers.map((provider) => ({ value: provider.id, label: provider.name })),
 				})) ?? "";
@@ -294,7 +334,7 @@ export class OpenTUICommandRouter {
 		const method =
 			methods.length === 1
 				? methods[0]
-				: await requireUI(this.options.getUI()).dialogs.select({
+				: await this.pick(runtime, {
 						title: `Login to ${provider.name}`,
 						options: methods.map((value) => ({ value, label: value === "oauth" ? "OAuth" : "API key" })),
 					});
@@ -304,17 +344,25 @@ export class OpenTUICommandRouter {
 			prompt: async (prompt: AuthPrompt) => {
 				if (prompt.type === "select") {
 					return (
-						(await ui.dialogs.select({
+						(await this.pick(runtime, {
 							title: prompt.message,
 							options: prompt.options.map((option) => ({
 								value: option.id,
 								label: option.label,
 								description: option.description,
 							})),
+							signal: prompt.signal,
 						})) ?? ""
 					);
 				}
-				return (await ui.dialogs.input({ title: prompt.message, placeholder: prompt.placeholder })) ?? "";
+				return (
+					(await this.input(runtime, {
+						title: prompt.message,
+						placeholder: prompt.placeholder,
+						secret: prompt.type === "secret",
+						signal: prompt.signal,
+					})) ?? ""
+				);
 			},
 			notify: (event: AuthEvent) => this.notifyAuthEvent(ui, event),
 		});
@@ -333,13 +381,21 @@ export class OpenTUICommandRouter {
 			.getProviders()
 			.filter((provider) => runtime.session.modelRuntime.getProviderAuthStatus(provider.id).configured);
 		if (providers.length === 0) throw new Error("No configured providers");
-		const selected = await requireUI(this.options.getUI()).dialogs.select({
+		const selected = await this.pick(runtime, {
 			title: "Logout provider",
 			options: providers.map((provider) => ({ value: provider.id, label: provider.name })),
 		});
 		if (!selected) return;
 		await runtime.session.modelRuntime.logout(selected);
 		this.status(`Logged out of ${selected}`);
+	}
+
+	private async pick<Value extends string>(
+		runtime: AgentSessionRuntime,
+		request: OpenTUIQuickPickerRequest<Value>,
+	): Promise<Value | undefined> {
+		if (this.options.pick) return await this.options.pick(runtime, request);
+		return await requireUI(this.options.getUI()).dialogs.select(request);
 	}
 
 	private async name(runtime: AgentSessionRuntime, argument: string): Promise<void> {
@@ -416,13 +472,18 @@ export class OpenTUICommandRouter {
 	private async import(runtime: AgentSessionRuntime, argument: string): Promise<void> {
 		const path =
 			argument ||
-			(await requireUI(this.options.getUI()).dialogs.input({
+			(await this.input(runtime, {
 				title: "Import JSONL",
 				placeholder: "path/to/session.jsonl",
 			}));
 		if (!path) return;
 		const result = await runtime.importFromJsonl(path);
 		this.status(result.cancelled ? "Import cancelled" : `Conversation imported from: ${path}`);
+	}
+
+	private async input(runtime: AgentSessionRuntime, request: OpenTUIInlinePromptRequest): Promise<string | undefined> {
+		if (this.options.input) return await this.options.input(runtime, request);
+		return await requireUI(this.options.getUI()).dialogs.input(request);
 	}
 
 	private async copy(session: AgentSession): Promise<void> {
@@ -437,10 +498,12 @@ export class OpenTUICommandRouter {
 			.getBranch()
 			.filter((entry) => entry.type === "message" && entry.message.role === "user");
 		if (entries.length === 0) throw new Error("No user messages to fork from");
-		const id = await requireUI(this.options.getUI()).dialogs.select({
-			title: "Fork from message",
-			options: entries.map((entry) => ({ value: entry.id, label: entryLabel(entry) })),
-		});
+		const id = this.options.openHistory
+			? await this.options.openHistory(runtime, "fork")
+			: await requireUI(this.options.getUI()).dialogs.select({
+					title: "Fork from message",
+					options: entries.map((entry) => ({ value: entry.id, label: entryLabel(entry) })),
+				});
 		if (!id) return;
 		await runtime.fork(id);
 		this.status("Forked to a new conversation");
@@ -453,14 +516,17 @@ export class OpenTUICommandRouter {
 		this.status("Cloned to a new conversation");
 	}
 
-	private async tree(session: AgentSession): Promise<void> {
+	private async tree(runtime: AgentSessionRuntime): Promise<void> {
+		const session = runtime.session;
 		const entries = session.sessionManager.getBranch();
 		if (entries.length === 0) throw new Error("Conversation tree is empty");
-		const id = await requireUI(this.options.getUI()).dialogs.select({
-			title: "Conversation tree",
-			options: entries.map((entry) => ({ value: entry.id, label: entryLabel(entry) })),
-			initialValue: session.sessionManager.getLeafId() ?? undefined,
-		});
+		const id = this.options.openHistory
+			? await this.options.openHistory(runtime, "tree")
+			: await requireUI(this.options.getUI()).dialogs.select({
+					title: "Conversation tree",
+					options: entries.map((entry) => ({ value: entry.id, label: entryLabel(entry) })),
+					initialValue: session.sessionManager.getLeafId() ?? undefined,
+				});
 		if (!id) return;
 		await session.navigateTree(id);
 		this.status("Navigated conversation tree");

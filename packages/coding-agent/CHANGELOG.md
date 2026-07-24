@@ -4,6 +4,12 @@
 
 ### Changed
 
+- Replaced modal structured-question sequences with one persistent, non-modal answer panel above the composer.
+- Moved Plan approval and revision feedback into a persistent, non-modal review panel above the composer.
+- Moved model, provider authentication, logout, and workspace-trust choices into lightweight pickers above the composer.
+- Rebuilt `/settings` as a transactional main-area page with inline navigation and field editing, plus `Ctrl+S` saving from every level.
+- Replaced modal `/tree` and `/fork` lists with one searchable main-area history navigator that preserves branch context and message previews.
+- Replaced repeated `/scoped-models` dialogs with one searchable multi-select picker, and moved `/name`, `/import`, and authentication inputs above the composer.
 - Refined the OpenTUI conversation workflow with task-aware composer states, explicit follow-up queueing, semantic tool summaries, stable conversation identity, paused-scroll update notices, and background-separated user prompts.
 - Moved animated Agent activity into the transcript, with live commentary plus independently expandable tool calls and details.
 - Kept conversation sidebar rows stable while responses stream by showing only completed-message previews and run state.

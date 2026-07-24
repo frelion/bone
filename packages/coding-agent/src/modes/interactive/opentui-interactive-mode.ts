@@ -5,7 +5,7 @@ import { type CliRenderer, type KeyEvent, type Renderable, TextAttributes, TextR
 import type { AgentSessionEvent, PromptOptions } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import { rememberLastActiveConversation } from "../../core/conversation-state.ts";
-import type { ExtensionUIV2Context } from "../../core/extensions/ui-v2.ts";
+import type { ExtensionUIV2Context, ExtensionUIViewHandle } from "../../core/extensions/ui-v2.ts";
 import { FooterDataProvider } from "../../core/footer-data-provider.ts";
 import type {
 	InteractiveSessionHostHooks,
@@ -22,8 +22,15 @@ import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core
 import { OpenTUITopBar, OpenTUIWelcome } from "./components/opentui-chrome.ts";
 import { OpenTUIClickCoordinator } from "./components/opentui-click.ts";
 import { OpenTUIComposer, type OpenTUIComposerStatus } from "./components/opentui-composer.ts";
+import { OpenTUIHistoryNavigator, type OpenTUIHistoryNavigatorMode } from "./components/opentui-history-navigator.ts";
+import { OpenTUIInlinePrompt, type OpenTUIInlinePromptRequest } from "./components/opentui-inline-prompt.ts";
+import { OpenTUIMultiPicker, type OpenTUIMultiPickerRequest } from "./components/opentui-multi-picker.ts";
+import { OpenTUIPlanReview, type OpenTUIPlanReviewResult } from "./components/opentui-plan-review.ts";
+import { OpenTUIQuestionnaire, type OpenTUIQuestionnaireResult } from "./components/opentui-questionnaire.ts";
+import { OpenTUIQuickPicker, type OpenTUIQuickPickerRequest } from "./components/opentui-quick-picker.ts";
 import { OpenTUIStatusView } from "./components/opentui-rich-messages.ts";
 import { OpenTUISessionSidebar } from "./components/opentui-session-sidebar.ts";
+import { OpenTUISettingsPage } from "./components/opentui-settings-page.ts";
 import { OpenTUITranscriptFactory } from "./components/opentui-transcript-factory.ts";
 import {
 	OpenTUITranscriptFocusController,
@@ -41,8 +48,6 @@ const TRANSCRIPT_PAGE_ENTRIES = 100;
 const LEXICAL_SEARCH_DELAY_MS = 80;
 const SEMANTIC_SEARCH_DELAY_MS = 250;
 const STREAM_UPDATE_FRAME_MS = 16;
-const CUSTOM_ANSWER = "custom";
-const SUBMIT_SELECTION = "submit";
 
 type OpenTUIMemoryRuntime = Pick<
 	MemoryRuntime,
@@ -183,6 +188,8 @@ export class OpenTUIInteractiveMode {
 	private readonly runtimeSubmissionTails = new WeakMap<AgentSessionRuntime, Promise<void>>();
 	private readonly automaticTitleGeneration = new WeakSet<AgentSessionRuntime>();
 	private readonly interactionTasks = new Set<Promise<void>>();
+	private readonly planFeedbackDrafts = new Map<string, string>();
+	private readonly questionDrafts = new Map<string, QuestionAnswer[]>();
 	private footerData: FooterDataProvider | undefined;
 	private sidebarSessions: InteractiveSessionSummary[] = [];
 	private sidebarOffset = 0;
@@ -202,6 +209,18 @@ export class OpenTUIInteractiveMode {
 	private allToolDetailsExpanded = false;
 	private planInteractionAbort: AbortController | undefined;
 	private questionInteractionAbort: AbortController | undefined;
+	private planReview: OpenTUIPlanReview | undefined;
+	private questionnaire: OpenTUIQuestionnaire | undefined;
+	private quickPicker: { handleKey(event: KeyEvent): boolean } | undefined;
+	private dismissQuickPicker: (() => void) | undefined;
+	private settingsPage: OpenTUISettingsPage | undefined;
+	private dismissSettingsPage: (() => void) | undefined;
+	private historyNavigator: OpenTUIHistoryNavigator | undefined;
+	private dismissHistoryNavigator: (() => void) | undefined;
+	private multiPicker: { handleKey(event: KeyEvent): boolean } | undefined;
+	private dismissMultiPicker: (() => void) | undefined;
+	private inlinePrompt: { handleKey(event: KeyEvent): boolean } | undefined;
+	private dismissInlinePrompt: (() => void) | undefined;
 	private initialized = false;
 	private stopping = false;
 	private cleanupPromise: Promise<void> | undefined;
@@ -248,6 +267,11 @@ export class OpenTUIInteractiveMode {
 			onReloaded: () => this.maybeSaveImplicitProjectTrustAfterReload(),
 			onPresentationChanged: () => this.refreshPresentation(),
 			onSessionListChanged: () => this.refreshSidebar(),
+			pick: (runtime, request) => this.showQuickPicker(runtime, request),
+			openSettings: (runtime, run) => this.showSettingsPage(runtime, run),
+			openHistory: (runtime, mode) => this.showHistoryNavigator(runtime, mode),
+			multiPick: (runtime, request) => this.showMultiPicker(runtime, request),
+			input: (runtime, request) => this.showInlinePrompt(runtime, request),
 		});
 		this.sessionHost.setHooks({
 			beforeForegroundChange: async (runtime) => this.unbindForeground(runtime),
@@ -380,6 +404,34 @@ export class OpenTUIInteractiveMode {
 			}
 			if (this.paneFocus?.focusedPane === "sidebar") {
 				this.sidebar?.handleKey(event);
+				return;
+			}
+			if (this.questionnaire) {
+				this.questionnaire.handleKey(event);
+				return;
+			}
+			if (this.planReview) {
+				this.planReview.handleKey(event);
+				return;
+			}
+			if (this.quickPicker) {
+				this.quickPicker.handleKey(event);
+				return;
+			}
+			if (this.settingsPage) {
+				this.settingsPage.handleKey(event);
+				return;
+			}
+			if (this.historyNavigator) {
+				this.historyNavigator.handleKey(event);
+				return;
+			}
+			if (this.multiPicker) {
+				this.multiPicker.handleKey(event);
+				return;
+			}
+			if (this.inlinePrompt) {
+				this.inlinePrompt.handleKey(event);
 				return;
 			}
 			if (this.paneFocus?.focusedPane !== "composer") return;
@@ -681,6 +733,11 @@ export class OpenTUIInteractiveMode {
 		this.planInteractionAbort = undefined;
 		this.questionInteractionAbort?.abort();
 		this.questionInteractionAbort = undefined;
+		this.dismissQuickPicker?.();
+		this.dismissSettingsPage?.();
+		this.dismissHistoryNavigator?.();
+		this.dismissMultiPicker?.();
+		this.dismissInlinePrompt?.();
 		this.unsubscribeSession?.();
 		this.unsubscribeSession = undefined;
 		this.extensionBinding?.dispose();
@@ -1040,41 +1097,19 @@ export class OpenTUIInteractiveMode {
 		this.reviewingPlanProposalId = proposal.id;
 		this.planInteractionAbort = controller;
 		try {
-			while (this.isPendingPlan(runtime, generation, proposal)) {
-				const choice = await ui.dialogs.select({
-					title: `Plan v${proposal.version} · what next?`,
-					options: [
-						{ value: "approve", label: "Execute plan", description: "Approve and begin implementation" },
-						{ value: "revise", label: "Revise plan", description: "Send feedback and request a replacement" },
-						{ value: "cancel", label: "Cancel plan", description: "Leave Plan mode without executing" },
-					],
-					signal: controller.signal,
-				});
-				if (!this.isPendingPlan(runtime, generation, proposal) || controller.signal.aborted) return;
-				if (choice === "approve") {
-					await runtime.session.approvePlan(proposal.id);
-					return;
-				}
-				if (choice === "cancel" || choice === undefined) {
-					runtime.session.cancelPlan(proposal.id);
-					return;
-				}
-
-				const feedback = await ui.editor.open({
-					title: `Revise plan v${proposal.version}`,
-					placeholder: "Describe what should change",
-					multiline: true,
-					signal: controller.signal,
-				});
-				if (!this.isPendingPlan(runtime, generation, proposal) || controller.signal.aborted) return;
-				if (feedback?.trim()) {
-					await runtime.session.revisePlan(proposal.id, feedback);
-					return;
-				}
-			}
+			const result = await this.showPlanReview(ui, proposal, controller);
+			if (!this.isPendingPlan(runtime, generation, proposal) || controller.signal.aborted) return;
+			if (result?.action === "approve") await runtime.session.approvePlan(proposal.id);
+			else if (result?.action === "revise") await runtime.session.revisePlan(proposal.id, result.feedback);
+			else runtime.session.cancelPlan(proposal.id);
 		} catch (error) {
 			this.showInteractionError(error);
 		} finally {
+			controller.abort();
+			const planState = runtime.session.planState;
+			if (planState.status !== "awaitingApproval" || planState.proposal.id !== proposal.id) {
+				this.planFeedbackDrafts.delete(proposal.id);
+			}
 			if (this.planInteractionAbort === controller) this.planInteractionAbort = undefined;
 			if (this.reviewingPlanProposalId === proposal.id) this.reviewingPlanProposalId = undefined;
 			if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
@@ -1085,6 +1120,226 @@ export class OpenTUIInteractiveMode {
 		if (!this.isCurrentForeground(runtime, generation)) return false;
 		const state = runtime.session.planState;
 		return state.status === "awaitingApproval" && state.proposal.id === proposal.id;
+	}
+
+	private async showPlanReview(
+		ui: ExtensionUIV2Context,
+		proposal: PlanProposal,
+		controller: AbortController,
+	): Promise<OpenTUIPlanReviewResult | undefined> {
+		const renderer = this.renderer;
+		if (!renderer) return undefined;
+		return await new Promise<OpenTUIPlanReviewResult | undefined>((resolve) => {
+			let settled = false;
+			let widget: ExtensionUIViewHandle | undefined;
+			let review: OpenTUIPlanReview;
+			const finish = (result: OpenTUIPlanReviewResult | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (result) this.planFeedbackDrafts.delete(proposal.id);
+				else this.planFeedbackDrafts.set(proposal.id, review.getDraftFeedback());
+				if (this.planReview === review) this.planReview = undefined;
+				widget?.close();
+				resolve(result);
+			};
+			review = new OpenTUIPlanReview(renderer, proposal, finish, this.planFeedbackDrafts.get(proposal.id));
+			this.planReview = review;
+			widget = ui.widgets.set("bone:plan-review", review.root, { placement: "aboveEditor", order: -90 });
+			if (!widget.mounted) {
+				finish(undefined);
+				return;
+			}
+			controller.signal.addEventListener("abort", () => finish(undefined), { once: true });
+			review.focus();
+			renderer.requestRender();
+		});
+	}
+
+	private async showQuickPicker<Value extends string>(
+		runtime: AgentSessionRuntime,
+		request: OpenTUIQuickPickerRequest<Value>,
+	): Promise<Value | undefined> {
+		const renderer = this.renderer;
+		const ui = this.getInteractiveUI();
+		if (!renderer || !ui || runtime !== this.sessionHost.current) return undefined;
+		const generation = this.foregroundGeneration;
+		this.dismissQuickPicker?.();
+		return await new Promise<Value | undefined>((resolve, reject) => {
+			let settled = false;
+			let widget: ExtensionUIViewHandle | undefined;
+			let picker: OpenTUIQuickPicker<Value>;
+			const finish = (value: Value | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (this.quickPicker === picker) this.quickPicker = undefined;
+				if (this.dismissQuickPicker === dismiss) this.dismissQuickPicker = undefined;
+				widget?.close();
+				if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+				resolve(value);
+			};
+			const dismiss = () => finish(undefined);
+			picker = new OpenTUIQuickPicker(renderer, request, finish);
+			this.quickPicker = picker;
+			this.dismissQuickPicker = dismiss;
+			try {
+				widget = ui.widgets.set("bone:quick-picker", picker.root, { placement: "aboveEditor", order: -80 });
+			} catch (error) {
+				if (this.quickPicker === picker) this.quickPicker = undefined;
+				if (this.dismissQuickPicker === dismiss) this.dismissQuickPicker = undefined;
+				reject(error);
+				return;
+			}
+			if (!widget.mounted || request.signal?.aborted) {
+				finish(undefined);
+				return;
+			}
+			request.signal?.addEventListener("abort", dismiss, { once: true });
+			picker.focus();
+			renderer.requestRender();
+		});
+	}
+
+	private async showMultiPicker<Value extends string>(
+		runtime: AgentSessionRuntime,
+		request: OpenTUIMultiPickerRequest<Value>,
+	): Promise<Value[] | undefined> {
+		const renderer = this.renderer;
+		const ui = this.getInteractiveUI();
+		if (!renderer || !ui || runtime !== this.sessionHost.current) return undefined;
+		const generation = this.foregroundGeneration;
+		this.dismissMultiPicker?.();
+		return await new Promise<Value[] | undefined>((resolve) => {
+			let settled = false;
+			let widget: ExtensionUIViewHandle | undefined;
+			let picker: OpenTUIMultiPicker<Value>;
+			const finish = (values: Value[] | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (this.multiPicker === picker) this.multiPicker = undefined;
+				if (this.dismissMultiPicker === dismiss) this.dismissMultiPicker = undefined;
+				widget?.close();
+				if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+				resolve(values);
+			};
+			const dismiss = () => finish(undefined);
+			picker = new OpenTUIMultiPicker(renderer, request, finish);
+			this.multiPicker = picker;
+			this.dismissMultiPicker = dismiss;
+			widget = ui.widgets.set("bone:multi-picker", picker.root, { placement: "aboveEditor", order: -75 });
+			if (!widget.mounted) {
+				finish(undefined);
+				return;
+			}
+			picker.focus();
+			renderer.requestRender();
+		});
+	}
+
+	private async showInlinePrompt(
+		runtime: AgentSessionRuntime,
+		request: OpenTUIInlinePromptRequest,
+	): Promise<string | undefined> {
+		const renderer = this.renderer;
+		const ui = this.getInteractiveUI();
+		if (!renderer || !ui || runtime !== this.sessionHost.current) return undefined;
+		const generation = this.foregroundGeneration;
+		this.dismissInlinePrompt?.();
+		return await new Promise<string | undefined>((resolve) => {
+			let settled = false;
+			let widget: ExtensionUIViewHandle | undefined;
+			let prompt: OpenTUIInlinePrompt;
+			const finish = (value: string | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (this.inlinePrompt === prompt) this.inlinePrompt = undefined;
+				if (this.dismissInlinePrompt === dismiss) this.dismissInlinePrompt = undefined;
+				widget?.close();
+				if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+				resolve(value);
+			};
+			const dismiss = () => finish(undefined);
+			prompt = new OpenTUIInlinePrompt(renderer, request, finish);
+			this.inlinePrompt = prompt;
+			this.dismissInlinePrompt = dismiss;
+			widget = ui.widgets.set("bone:inline-prompt", prompt.root, { placement: "aboveEditor", order: -70 });
+			if (!widget.mounted || request.signal?.aborted) {
+				finish(undefined);
+				return;
+			}
+			request.signal?.addEventListener("abort", dismiss, { once: true });
+			prompt.focus();
+			renderer.requestRender();
+		});
+	}
+
+	private async showSettingsPage(
+		runtime: AgentSessionRuntime,
+		run: (dialogs: OpenTUISettingsPage["dialogs"]) => Promise<void>,
+	): Promise<void> {
+		const renderer = this.renderer;
+		const shell = this.shell;
+		const ui = this.getInteractiveUI();
+		if (!renderer || !shell || !ui || runtime !== this.sessionHost.current) return;
+		const generation = this.foregroundGeneration;
+		this.dismissSettingsPage?.();
+		const page = new OpenTUISettingsPage(renderer, {
+			confirm: (request) => ui.dialogs.confirm(request),
+			notify: (message, kind) => ui.dialogs.notify(message, kind),
+		});
+		this.settingsPage = page;
+		shell.setMainView(page.root);
+		let dismissed = false;
+		const dismiss = () => {
+			if (dismissed) return;
+			dismissed = true;
+			page.dispose();
+			if (this.settingsPage === page) this.settingsPage = undefined;
+			if (this.dismissSettingsPage === dismiss) this.dismissSettingsPage = undefined;
+			if (this.shell === shell) shell.setMainView(undefined);
+			if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+		};
+		this.dismissSettingsPage = dismiss;
+		try {
+			await run(page.dialogs);
+		} finally {
+			dismiss();
+		}
+	}
+
+	private async showHistoryNavigator(
+		runtime: AgentSessionRuntime,
+		mode: OpenTUIHistoryNavigatorMode,
+	): Promise<string | undefined> {
+		const renderer = this.renderer;
+		const shell = this.shell;
+		if (!renderer || !shell || runtime !== this.sessionHost.current) return undefined;
+		const generation = this.foregroundGeneration;
+		this.dismissHistoryNavigator?.();
+		return await new Promise<string | undefined>((resolve) => {
+			let settled = false;
+			let navigator: OpenTUIHistoryNavigator;
+			const finish = (entryId: string | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (this.historyNavigator === navigator) this.historyNavigator = undefined;
+				if (this.dismissHistoryNavigator === dismiss) this.dismissHistoryNavigator = undefined;
+				if (this.shell === shell) shell.setMainView(undefined);
+				if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+				resolve(entryId);
+			};
+			const dismiss = () => finish(undefined);
+			navigator = new OpenTUIHistoryNavigator(renderer, {
+				mode,
+				tree: runtime.session.sessionManager.getTree(),
+				currentLeafId: runtime.session.sessionManager.getLeafId() ?? undefined,
+				onDone: finish,
+			});
+			this.historyNavigator = navigator;
+			this.dismissHistoryNavigator = dismiss;
+			shell.setMainView(navigator.root);
+			navigator.focus();
+			renderer.requestRender();
+		});
 	}
 
 	private async reviewPendingQuestion(runtime: AgentSessionRuntime, generation: number): Promise<void> {
@@ -1102,13 +1357,18 @@ export class OpenTUIInteractiveMode {
 		this.reviewingQuestionRequestId = request.id;
 		this.questionInteractionAbort = controller;
 		try {
-			const answers = await this.collectQuestionAnswers(ui, request, controller.signal);
+			const result = await this.showQuestionnaire(ui, request, controller);
 			if (!this.isPendingQuestion(runtime, generation, request) || controller.signal.aborted) return;
-			if (answers) runtime.session.answerQuestion(request.id, answers);
+			if (result && !result.cancelled) runtime.session.answerQuestion(request.id, result.answers);
 			else runtime.session.cancelQuestion(request.id, "user");
 		} catch (error) {
 			this.showInteractionError(error);
 		} finally {
+			controller.abort();
+			const questionState = runtime.session.questionState;
+			if (questionState.status !== "awaitingAnswer" || questionState.request.id !== request.id) {
+				this.questionDrafts.delete(request.id);
+			}
 			if (this.questionInteractionAbort === controller) this.questionInteractionAbort = undefined;
 			if (this.reviewingQuestionRequestId === request.id) this.reviewingQuestionRequestId = undefined;
 			if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
@@ -1121,107 +1381,40 @@ export class OpenTUIInteractiveMode {
 		return state.status === "awaitingAnswer" && state.request.id === request.id;
 	}
 
-	private async collectQuestionAnswers(
+	private async showQuestionnaire(
 		ui: ExtensionUIV2Context,
 		request: QuestionRequest,
-		signal: AbortSignal,
-	): Promise<QuestionAnswer[] | undefined> {
-		const answers: QuestionAnswer[] = [];
-		for (let questionIndex = 0; questionIndex < request.questions.length; questionIndex++) {
-			const question = request.questions[questionIndex]!;
-			const title = `${questionIndex + 1}/${request.questions.length} · ${question.header}: ${question.question}`;
-			if (!question.multiSelect) {
-				const choice = await ui.dialogs.select({
-					title,
-					options: [
-						...question.options.map((option, optionIndex) => ({
-							value: `option:${optionIndex}`,
-							label: option.label,
-							description: option.preview ? `${option.description} · ${option.preview}` : option.description,
-						})),
-						{ value: CUSTOM_ANSWER, label: "Custom answer", description: "Enter a different answer" },
-					],
-					signal,
-				});
-				if (choice === undefined) return undefined;
-				if (choice === CUSTOM_ANSWER) {
-					const custom = await ui.editor.open({
-						title,
-						placeholder: "Enter your answer",
-						multiline: true,
-						signal,
-					});
-					if (custom === undefined) return undefined;
-					const value = custom.trim();
-					if (!value) {
-						questionIndex--;
-						continue;
-					}
-					answers.push({ questionIndex, question: question.question, kind: "custom", answer: value });
-					continue;
-				}
-				const optionIndex = Number(choice.slice("option:".length));
-				const option = question.options[optionIndex];
-				if (!option) throw new Error("The selected question option is no longer available.");
-				answers.push({ questionIndex, question: question.question, kind: "option", answer: option.label });
-				continue;
+		controller: AbortController,
+	): Promise<OpenTUIQuestionnaireResult | undefined> {
+		const renderer = this.renderer;
+		if (!renderer) return undefined;
+		return await new Promise<OpenTUIQuestionnaireResult | undefined>((resolve) => {
+			let settled = false;
+			let widget: ExtensionUIViewHandle | undefined;
+			let questionnaire: OpenTUIQuestionnaire;
+			const finish = (result: OpenTUIQuestionnaireResult | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (result) this.questionDrafts.delete(request.id);
+				else this.questionDrafts.set(request.id, questionnaire.getDraftAnswers());
+				if (this.questionnaire === questionnaire) this.questionnaire = undefined;
+				widget?.close();
+				resolve(result);
+			};
+			questionnaire = new OpenTUIQuestionnaire(renderer, request, finish, this.questionDrafts.get(request.id));
+			this.questionnaire = questionnaire;
+			widget = ui.widgets.set("bone:questionnaire", questionnaire.root, {
+				placement: "aboveEditor",
+				order: -100,
+			});
+			if (!widget.mounted) {
+				finish(undefined);
+				return;
 			}
-
-			const selected = new Set<number>();
-			while (true) {
-				const choice = await ui.dialogs.select({
-					title,
-					options: [
-						...question.options.map((option, optionIndex) => ({
-							value: `option:${optionIndex}`,
-							label: `${selected.has(optionIndex) ? "[x]" : "[ ]"} ${option.label}`,
-							description: option.preview ? `${option.description} · ${option.preview}` : option.description,
-						})),
-						{
-							value: CUSTOM_ANSWER,
-							label: "Custom answer",
-							description: "Replace selections with a written answer",
-						},
-						{
-							value: SUBMIT_SELECTION,
-							label: "Submit selection",
-							description: selected.size ? `${selected.size} selected` : "Select at least one option",
-							disabled: selected.size === 0,
-						},
-					],
-					signal,
-				});
-				if (choice === undefined) return undefined;
-				if (choice === CUSTOM_ANSWER) {
-					const custom = await ui.editor.open({
-						title,
-						placeholder: "Enter your answer",
-						multiline: true,
-						signal,
-					});
-					if (custom === undefined) return undefined;
-					const value = custom.trim();
-					if (!value) continue;
-					answers.push({ questionIndex, question: question.question, kind: "custom", answer: value });
-					break;
-				}
-				if (choice === SUBMIT_SELECTION) {
-					answers.push({
-						questionIndex,
-						question: question.question,
-						kind: "multi",
-						answer: null,
-						selected: [...selected].map((optionIndex) => question.options[optionIndex]!.label),
-					});
-					break;
-				}
-				const optionIndex = Number(choice.slice("option:".length));
-				if (!question.options[optionIndex]) throw new Error("The selected question option is no longer available.");
-				if (selected.has(optionIndex)) selected.delete(optionIndex);
-				else selected.add(optionIndex);
-			}
-		}
-		return answers;
+			controller.signal.addEventListener("abort", () => finish(undefined), { once: true });
+			questionnaire.focus();
+			renderer.requestRender();
+		});
 	}
 
 	private showInteractionError(error: unknown): void {

@@ -33,6 +33,8 @@ export class OpenTUIInteractiveShell {
 	private readonly sidebarRoot: BoxRenderable;
 	private readonly separatorRoot: BoxRenderable;
 	private readonly mainRoot: BoxRenderable;
+	private readonly mainContentRoot: BoxRenderable;
+	private readonly mainViewRoot: BoxRenderable;
 	private readonly fixedRoot: BoxRenderable;
 	private readonly headerRoot: BoxRenderable;
 	private readonly aboveEditorRoot: BoxRenderable;
@@ -104,13 +106,21 @@ export class OpenTUIInteractiveShell {
 			minHeight: 0,
 			backgroundColor: OPEN_TUI_COLORS.page,
 		});
-		const mainInner = new BoxRenderable(renderer, {
+		this.mainContentRoot = new BoxRenderable(renderer, {
 			flexDirection: "column",
 			width: "100%",
 			height: "100%",
 			minHeight: 0,
 			paddingX: 1,
 		});
+		this.mainViewRoot = new BoxRenderable(renderer, {
+			flexDirection: "column",
+			width: "100%",
+			height: "100%",
+			minHeight: 0,
+			paddingX: 1,
+		});
+		this.mainViewRoot.visible = false;
 		this.headerRoot = new BoxRenderable(renderer, { flexDirection: "column", flexShrink: 0 });
 		this.transcript = new ScrollBoxRenderable(renderer, {
 			id: "bone-transcript",
@@ -133,10 +143,11 @@ export class OpenTUIInteractiveShell {
 		this.fixedRoot.add(this.editorRoot);
 		this.fixedRoot.add(this.belowEditorRoot);
 		this.fixedRoot.add(this.footerRoot);
-		mainInner.add(this.headerRoot);
-		mainInner.add(this.transcript);
-		mainInner.add(this.fixedRoot);
-		this.mainRoot.add(mainInner);
+		this.mainContentRoot.add(this.headerRoot);
+		this.mainContentRoot.add(this.transcript);
+		this.mainContentRoot.add(this.fixedRoot);
+		this.mainRoot.add(this.mainContentRoot);
+		this.mainRoot.add(this.mainViewRoot);
 		this.bodyRoot.add(this.sidebarRoot);
 		this.bodyRoot.add(this.separatorRoot);
 		this.bodyRoot.add(this.mainRoot);
@@ -188,6 +199,15 @@ export class OpenTUIInteractiveShell {
 		this.clearChildren(this.sidebarRoot);
 		if (!node) return undefined;
 		this.sidebarRoot.add(node);
+		return node;
+	}
+
+	setMainView(node: Renderable | undefined): Renderable | undefined {
+		this.clearChildren(this.mainViewRoot);
+		this.mainContentRoot.visible = !node;
+		this.mainViewRoot.visible = Boolean(node);
+		if (!node) return undefined;
+		this.mainViewRoot.add(node);
 		return node;
 	}
 

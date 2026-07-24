@@ -153,6 +153,31 @@ describe("OpenTUI interactive shell", () => {
 		expect(renderer.currentFocusedRenderable).toBe(previousFocus);
 	});
 
+	test("replaces only the main conversation surface and restores it without remounting the sidebar", async () => {
+		initTheme("dark");
+		const setup = await createRenderer(100, 24);
+		const shell = new OpenTUIInteractiveShell(setup.renderer, { sidebarWidth: 24 });
+		setup.renderer.root.add(shell.root);
+		const sidebar = textView(setup, "CONVERSATIONS\ncurrent");
+		shell.setSidebar(sidebar);
+		shell.appendTranscript(textView(setup, "conversation transcript"));
+		shell.appendFixed(textView(setup, "composer surface"));
+
+		const initial = await flushUntil(setup, (frame) => frame.includes("conversation transcript"));
+		expect(initial).toContain("CONVERSATIONS");
+		shell.setMainView(textView(setup, "SETTINGS MAIN PAGE"));
+		const replaced = await flushUntil(setup, (frame) => frame.includes("SETTINGS MAIN PAGE"));
+		expect(replaced).toContain("CONVERSATIONS");
+		expect(replaced).not.toContain("conversation transcript");
+		expect(replaced).not.toContain("composer surface");
+		expect(sidebar.isDestroyed).toBe(false);
+
+		shell.setMainView(undefined);
+		const restored = await flushUntil(setup, (frame) => frame.includes("conversation transcript"));
+		expect(restored).toContain("composer surface");
+		expect(restored).toContain("CONVERSATIONS");
+	});
+
 	test("switches between split and single-pane layouts without remounting content", async () => {
 		initTheme("dark");
 		const setup = await createRenderer(100, 24);

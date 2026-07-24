@@ -1236,11 +1236,12 @@ describe("OpenTUIInteractiveMode", () => {
 		active.emit({ type: "plan_proposed", proposal });
 		active.emit({ type: "agent_settled" });
 		expect(await renderer.waitForFrameText("Plan v2")).toContain("Plan v2");
+		expect((mode as unknown as { overlayManager: { active: unknown } }).overlayManager.active).toBeFalsy();
 		for (let index = 0; index < scenario.down; index++) renderer.input.pressArrow("down");
 		renderer.input.pressEnter();
 		if (scenario.action === "revise") {
 			await settle(renderer);
-			expect(renderer.captureFrame()).toContain("Revise plan v2");
+			expect(renderer.captureFrame()).toContain("Describe what should change");
 			await renderer.input.typeText("Keep the public API smaller");
 			renderer.input.pressEnter();
 		}
@@ -1256,7 +1257,290 @@ describe("OpenTUIInteractiveMode", () => {
 		mode.stop();
 	});
 
-	test("collects complete option, custom, and multi-select answers and restores composer focus", async () => {
+	test("restores Plan revision feedback after switching conversations", async () => {
+		const first = createRuntime([], { sessionFile: "/tmp/plan-first.jsonl", id: "plan-first" });
+		const second = createRuntime([], { sessionFile: "/tmp/plan-second.jsonl", id: "plan-second" });
+		const host = new FakeHost(first.runtime);
+		const renderer = await createNativeTestRenderer({ width: 100, height: 28 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		const proposal = {
+			id: "plan-switch-draft",
+			version: 4,
+			content: "# Keep the draft",
+			createdAt: new Date(0).toISOString(),
+			sourceMessageId: "assistant-plan-switch",
+		};
+		first.emit({ type: "plan_proposed", proposal });
+		first.emit({ type: "agent_settled" });
+		await renderer.waitForFrameText("Plan v4");
+		renderer.input.pressArrow("down");
+		renderer.input.pressEnter();
+		await renderer.input.typeText("Keep the adapter boundary");
+
+		await host.hooks.beforeForegroundChange?.(first.runtime);
+		host.current = second.runtime;
+		await host.hooks.foregroundChanged?.(second.runtime);
+		await mode.idle();
+		await host.hooks.beforeForegroundChange?.(second.runtime);
+		host.current = first.runtime;
+		await host.hooks.foregroundChanged?.(first.runtime);
+		await renderer.waitForFrameText("Plan v4");
+		renderer.input.pressArrow("down");
+		renderer.input.pressEnter();
+		await settle(renderer);
+
+		expect(renderer.captureFrame()).toContain("Keep the adapter boundary");
+		expect(first.session.revisePlan).not.toHaveBeenCalled();
+		mode.stop();
+	});
+
+	test("opens /model as a non-modal quick picker above the composer", async () => {
+		const active = createRuntime();
+		const first = { provider: "test", id: "first", name: "First" };
+		const second = { provider: "test", id: "second", name: "Second" };
+		const setModel = vi.fn(async () => {});
+		Object.assign(active.session, {
+			model: first,
+			modelRuntime: { getAvailable: async () => [first, second] },
+			setModel,
+		});
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 100, height: 28 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		await renderer.input.typeText("/model");
+		renderer.input.pressEnter();
+		const frame = await renderer.waitForFrameText("Select model");
+		expect(frame).toContain("Search models");
+		expect(frame).toContain("test/first");
+		expect((mode as unknown as { overlayManager: { active: unknown } }).overlayManager.active).toBeFalsy();
+
+		renderer.input.pressArrow("down");
+		renderer.input.pressEnter();
+		await mode.idle();
+		await settle(renderer);
+		expect(setModel).toHaveBeenCalledWith(second);
+		expect(renderer.captureFrame()).not.toContain("Select model");
+		mode.stop();
+	});
+
+	test("dismisses a command quick picker when the foreground conversation changes", async () => {
+		const first = createRuntime([], { sessionFile: "/tmp/picker-first.jsonl", id: "picker-first" });
+		const second = createRuntime([], { sessionFile: "/tmp/picker-second.jsonl", id: "picker-second" });
+		const models = [
+			{ provider: "test", id: "first", name: "First" },
+			{ provider: "test", id: "second", name: "Second" },
+		];
+		const setModel = vi.fn(async () => {});
+		Object.assign(first.session, {
+			model: models[0],
+			modelRuntime: { getAvailable: async () => models },
+			setModel,
+		});
+		const host = new FakeHost(first.runtime);
+		const renderer = await createNativeTestRenderer({ width: 100, height: 28 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		await renderer.input.typeText("/model");
+		renderer.input.pressEnter();
+		await renderer.waitForFrameText("Select model");
+
+		await host.hooks.beforeForegroundChange?.(first.runtime);
+		host.current = second.runtime;
+		await host.hooks.foregroundChanged?.(second.runtime);
+		await mode.idle();
+		await settle(renderer);
+
+		expect(renderer.captureFrame()).not.toContain("Select model");
+		expect(setModel).not.toHaveBeenCalled();
+		mode.stop();
+	});
+
+	test("opens /settings as a main-area page and saves the draft with Ctrl+S", async () => {
+		const root = mkdtempSync(join(tmpdir(), "bone-inline-settings-"));
+		const active = createRuntime();
+		const replaceScope = vi.fn(async () => {});
+		const reloadSettings = vi.fn(async () => {});
+		const reloadConfig = vi.fn(async () => {});
+		Object.assign(active.runtime, { cwd: root });
+		Object.assign(active.runtime.services, { agentDir: root });
+		Object.assign(active.runtime.services.settingsManager, {
+			getGlobalSettings: () => ({}),
+			getProjectSettings: () => ({}),
+			isProjectTrusted: () => true,
+			replaceScope,
+			reload: reloadSettings,
+		});
+		Object.assign(active.session, {
+			modelRuntime: {
+				getModelsJson: () => ({ providers: {} }),
+				reloadConfig,
+			},
+		});
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 110, height: 32 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		try {
+			await mode.init();
+			await renderer.input.typeText("/settings");
+			renderer.input.pressEnter();
+			const settingsFrame = await renderer.waitForFrameText("Settings · Global");
+			expect(settingsFrame).toContain("CONVERSATIONS");
+			expect(settingsFrame).not.toContain("Ask anything");
+			expect((mode as unknown as { overlayManager: { active: unknown } }).overlayManager.active).toBeFalsy();
+
+			for (let index = 0; index < 3; index++) renderer.input.pressArrow("down");
+			renderer.input.pressEnter();
+			await renderer.waitForFrameText("Context & Delivery");
+			for (let index = 0; index < 5; index++) renderer.input.pressArrow("down");
+			renderer.input.pressEnter();
+			await renderer.waitForFrameText("Hide thinking block");
+			renderer.input.pressArrow("up");
+			renderer.input.pressEnter();
+			await renderer.waitForFrameText("Context & Delivery");
+			renderer.input.pressKey("s", { ctrl: true });
+			await mode.idle();
+			await settle(renderer);
+
+			expect(replaceScope).toHaveBeenCalledWith("global", { hideThinkingBlock: true });
+			expect(reloadSettings).toHaveBeenCalledOnce();
+			expect(reloadConfig).toHaveBeenCalledOnce();
+			expect(renderer.captureFrame()).toContain("Ask anything");
+			expect(renderer.captureFrame()).not.toContain("Settings · Global");
+		} finally {
+			mode.stop();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test.each([
+		{ command: "/tree", title: "Conversation tree", action: "navigate" as const },
+		{ command: "/fork", title: "Fork conversation", action: "fork" as const },
+	])("opens $command as a main-area history navigator", async (scenario) => {
+		const user = entry(userMessage("Start here"), "history-user");
+		const assistant = {
+			...entry(assistantMessage("Current answer", "stop"), "history-assistant"),
+			parentId: user.id,
+		};
+		const active = createRuntime([user, assistant]);
+		const navigateTree = vi.fn(async () => ({ cancelled: false }));
+		const fork = vi.fn(async () => ({ cancelled: false, selectedText: "Start here" }));
+		Object.assign(active.session.sessionManager, {
+			getBranch: () => [user, assistant],
+			getLeafId: () => assistant.id,
+			getTree: () => [
+				{
+					entry: user,
+					children: [{ entry: assistant, children: [] }],
+				},
+			],
+		});
+		Object.assign(active.session, { navigateTree });
+		Object.assign(active.runtime, { fork });
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 100, height: 28 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		await renderer.input.typeText(scenario.command);
+		renderer.input.pressEnter();
+		const frame = await renderer.waitForFrameText(scenario.title);
+		expect(frame).toContain("CONVERSATIONS");
+		expect(frame).not.toContain("Ask anything");
+		expect((mode as unknown as { overlayManager: { active: unknown } }).overlayManager.active).toBeFalsy();
+
+		renderer.input.pressArrow("up");
+		renderer.input.pressEnter();
+		await mode.idle();
+		await settle(renderer);
+		if (scenario.action === "navigate") expect(navigateTree).toHaveBeenCalledWith(user.id);
+		else expect(fork).toHaveBeenCalledWith(user.id);
+		expect(renderer.captureFrame()).toContain("Ask anything");
+		mode.stop();
+	});
+
+	test("opens /scoped-models as one non-modal multi-select picker", async () => {
+		const active = createRuntime();
+		const first = { provider: "test", id: "first", name: "First" };
+		const second = { provider: "test", id: "second", name: "Second" };
+		const setScopedModels = vi.fn();
+		Object.assign(active.session, {
+			scopedModels: [{ model: first }],
+			modelRuntime: { getAvailable: async () => [first, second] },
+			setScopedModels,
+		});
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 100, height: 28 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		await renderer.input.typeText("/scoped-models");
+		renderer.input.pressEnter();
+		const frame = await renderer.waitForFrameText("Model cycling scope");
+		expect(frame).toContain("[x] First");
+		expect(frame).toContain("1 selected");
+		expect((mode as unknown as { overlayManager: { active: unknown } }).overlayManager.active).toBeFalsy();
+
+		renderer.input.pressArrow("down");
+		renderer.input.pressEnter();
+		renderer.input.pressKey("s", { ctrl: true });
+		await mode.idle();
+		await settle(renderer);
+		expect(setScopedModels).toHaveBeenCalledWith([{ model: first }, { model: second }]);
+		expect(renderer.captureFrame()).not.toContain("Model cycling scope");
+		mode.stop();
+	});
+
+	test("opens /import as an inline prompt and restores composer focus", async () => {
+		const active = createRuntime();
+		const importFromJsonl = vi.fn(async () => ({ cancelled: false }));
+		Object.assign(active.runtime, { importFromJsonl });
+		const host = new FakeHost(active.runtime);
+		const renderer = await createNativeTestRenderer({ width: 100, height: 28 });
+		const mode = new OpenTUIInteractiveMode(host, {
+			createRenderer: async () => renderer,
+			createMemoryRuntime: () => new FakeMemoryRuntime(),
+			installSignalHandlers: false,
+		});
+		await mode.init();
+		await renderer.input.typeText("/import");
+		renderer.input.pressEnter();
+		const frame = await renderer.waitForFrameText("Import JSONL");
+		expect(frame).toContain("Import JSONL");
+		expect((mode as unknown as { overlayManager: { active: unknown } }).overlayManager.active).toBeFalsy();
+		await renderer.input.typeText("/tmp/release-work.jsonl");
+		renderer.input.pressEnter();
+		await mode.idle();
+		await settle(renderer);
+		expect(importFromJsonl).toHaveBeenCalledWith("/tmp/release-work.jsonl");
+		expect(renderer.captureFrame()).not.toContain("Enter submit · Esc cancel");
+		mode.stop();
+	});
+
+	test("collects structured answers in one non-modal panel and restores composer focus", async () => {
 		const active = createRuntime();
 		const host = new FakeHost(active.runtime);
 		const renderer = await createNativeTestRenderer({ width: 110, height: 32 });
@@ -1299,21 +1583,20 @@ describe("OpenTUIInteractiveMode", () => {
 			],
 		};
 		active.emit({ type: "question_asked", request });
-		expect(await renderer.waitForFrameText("Which runtime?")).toContain("Which runtime?");
+		const questionFrame = await renderer.waitForFrameText("Which runtime?");
+		expect(questionFrame).toContain("Agent needs your input");
+		expect(questionFrame).toContain("[1 Runtime]  2 Scope  3 Notes");
+		expect((mode as unknown as { overlayManager: { active: unknown } }).overlayManager.active).toBeFalsy();
 		renderer.input.pressEnter();
-
-		await settle(renderer);
+		renderer.input.pressTab();
 		renderer.input.pressEnter();
-		await settle(renderer);
-		for (let index = 0; index < 3; index++) renderer.input.pressArrow("down");
-		renderer.input.pressEnter();
-
-		await settle(renderer);
+		renderer.input.pressTab();
 		for (let index = 0; index < 2; index++) renderer.input.pressArrow("down");
 		renderer.input.pressEnter();
 		await settle(renderer);
 		await renderer.input.typeText("Do not add configurable keys");
 		renderer.input.pressEnter();
+		renderer.input.pressKey("s", { ctrl: true });
 
 		await mode.idle();
 		await settle(renderer);
