@@ -70,7 +70,7 @@ pub fn from_client<H>(
     client: rig_anthropic::Client<H>,
 ) -> Result<Endpoint, ConfigError>
 where
-    H: HttpClientExt + Clone + Default + 'static,
+    H: HttpClientExt + Clone + Default + Send + Sync + 'static,
 {
     from_model_factory(endpoint_id, move |model_id| {
         client.completion_model(model_id)

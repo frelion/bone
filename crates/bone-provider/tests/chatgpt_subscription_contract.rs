@@ -4,10 +4,12 @@ use bone_provider::{
         completion::{FinishReason, ToolDefinition},
         message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent},
         providers::chatgpt::{self as rig_chatgpt, ChatGPTAuth},
-        test_utils::RecordingHttpClient,
+        test_utils::{HttpErrorStreamingClient, RecordingHttpClient, SequencedStreamingHttpClient},
     },
     service::chatgpt_subscription,
 };
+use futures_util::StreamExt;
+use http::StatusCode;
 use serde_json::{Value, json};
 
 const TEXT_SSE: &str = r#"data: {"type":"response.output_text.delta","delta":"ok"}
@@ -39,13 +41,137 @@ fn test_client(
     (client, transport)
 }
 
+fn default_url_test_client(
+    body: &'static str,
+) -> (
+    rig_chatgpt::Client<RecordingHttpClient>,
+    RecordingHttpClient,
+) {
+    let transport = RecordingHttpClient::new(body);
+    let client = rig_chatgpt::Client::builder()
+        .api_key(ChatGPTAuth::AccessToken {
+            access_token: "sentinel-secret-token".to_owned(),
+            account_id: Some("acct_test".to_owned()),
+        })
+        .http_client(transport.clone())
+        .default_instructions("")
+        .originator("bone")
+        .user_agent("bone-provider/test")
+        .build()
+        .expect("test ChatGPT client should build with its production base URL");
+    (client, transport)
+}
+
+#[tokio::test]
+async fn keeps_rig_chatgpt_production_url_as_an_offline_contract() {
+    let (client, transport) = default_url_test_client(TEXT_SSE);
+    let model = chatgpt_subscription::from_unmanaged_client("chatgpt-default-url", client)
+        .expect("subscription endpoint should build")
+        .model("gpt-test")
+        .expect("model should build");
+
+    model
+        .request(Message::user("hello"))
+        .send()
+        .await
+        .expect("recorded ChatGPT request should normalize");
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].uri,
+        "https://chatgpt.com/backend-api/codex/responses"
+    );
+}
+
+#[tokio::test]
+async fn redacts_authentication_and_stream_provider_bodies() {
+    let unary_secret = "sentinel-secret-unary-401";
+    let unary_transport =
+        RecordingHttpClient::with_error_response(StatusCode::UNAUTHORIZED, unary_secret);
+    let unary_client = rig_chatgpt::Client::builder()
+        .api_key(ChatGPTAuth::AccessToken {
+            access_token: "rejected-test-token".to_owned(),
+            account_id: Some("acct_test".to_owned()),
+        })
+        .http_client(unary_transport)
+        .build()
+        .unwrap();
+    let unary_model =
+        chatgpt_subscription::from_unmanaged_client("chatgpt-unary-error", unary_client)
+            .unwrap()
+            .model("gpt-test")
+            .unwrap();
+    let unary_error = unary_model
+        .request(Message::user("hello"))
+        .send()
+        .await
+        .unwrap_err();
+    let rendered = format!("{unary_error:?}: {unary_error}");
+    assert!(rendered.contains("reconnect"));
+    assert!(!rendered.contains(unary_secret));
+
+    let handshake_secret = "sentinel-secret-stream-401";
+    let stream_transport =
+        HttpErrorStreamingClient::new(StatusCode::UNAUTHORIZED, handshake_secret);
+    let stream_client = rig_chatgpt::Client::builder()
+        .api_key(ChatGPTAuth::AccessToken {
+            access_token: "rejected-test-token".to_owned(),
+            account_id: Some("acct_test".to_owned()),
+        })
+        .http_client(stream_transport)
+        .build()
+        .unwrap();
+    let stream_model =
+        chatgpt_subscription::from_unmanaged_client("chatgpt-stream-error", stream_client)
+            .unwrap()
+            .model("gpt-test")
+            .unwrap();
+    let mut stream = stream_model
+        .request(Message::user("hello"))
+        .stream()
+        .await
+        .unwrap();
+    let stream_error = stream.next().await.unwrap().unwrap_err();
+    let rendered = format!("{stream_error:?}: {stream_error}");
+    assert!(rendered.contains("reconnect"));
+    assert!(!rendered.contains(handshake_secret));
+
+    let envelope_secret = "sentinel-secret-sse-envelope";
+    let body = format!(
+        "data: {{\"type\":\"error\",\"error\":{{\"message\":\"{envelope_secret}\",\"code\":\"server_error\",\"type\":\"server_error\"}}}}\n\n"
+    );
+    let envelope_transport = SequencedStreamingHttpClient::new(vec![Ok(bytes::Bytes::from(body))]);
+    let envelope_client = rig_chatgpt::Client::builder()
+        .api_key(ChatGPTAuth::AccessToken {
+            access_token: "test-token".to_owned(),
+            account_id: Some("acct_test".to_owned()),
+        })
+        .http_client(envelope_transport)
+        .build()
+        .unwrap();
+    let envelope_model =
+        chatgpt_subscription::from_unmanaged_client("chatgpt-envelope-error", envelope_client)
+            .unwrap()
+            .model("gpt-test")
+            .unwrap();
+    let mut stream = envelope_model
+        .request(Message::user("hello"))
+        .stream()
+        .await
+        .unwrap();
+    let envelope_error = stream.next().await.unwrap().unwrap_err();
+    let rendered = format!("{envelope_error:?}: {envelope_error}");
+    assert!(!rendered.contains(envelope_secret));
+}
+
 #[tokio::test]
 async fn maps_subscription_service_to_responses_without_hiding_backend_rules() {
     let (client, transport) = test_client(TEXT_SSE);
     let debug = format!("{client:?}");
     assert!(!debug.contains("sentinel-secret-token"));
 
-    let endpoint = chatgpt_subscription::from_client("chatgpt-test", client)
+    let endpoint = chatgpt_subscription::from_unmanaged_client("chatgpt-test", client)
         .expect("subscription endpoint should build");
     let model = endpoint.model("gpt-test").expect("model should build");
     let response = model
@@ -98,7 +224,7 @@ async fn maps_subscription_service_to_responses_without_hiding_backend_rules() {
 #[tokio::test]
 async fn preserves_tool_calls_and_replays_their_provider_ids() {
     let (client, transport) = test_client(TOOL_SSE);
-    let model = chatgpt_subscription::from_client("chatgpt-tools", client)
+    let model = chatgpt_subscription::from_unmanaged_client("chatgpt-tools", client)
         .expect("subscription endpoint should build")
         .model("gpt-test")
         .expect("model should build");
@@ -140,7 +266,7 @@ async fn preserves_tool_calls_and_replays_their_provider_ids() {
         vec![ToolResultContent::text("path is a directory")],
     );
     let (second_client, second_transport) = test_client(TEXT_SSE);
-    let second_model = chatgpt_subscription::from_client("chatgpt-tools", second_client)
+    let second_model = chatgpt_subscription::from_unmanaged_client("chatgpt-tools", second_client)
         .expect("subscription endpoint should build")
         .model("gpt-test")
         .expect("model should build");

@@ -12,7 +12,7 @@ does not require credentials.
 | OpenAI wire | `tests/openai_responses_contract.rs` | `POST /responses`, headers, text, tools, reasoning replay, SSE terminal/truncation, usage, error body |
 | OpenAI Chat wire | `tests/openai_chat_completions_contract.rs` and source unit tests | `POST /chat/completions`, headers, text, tools, SSE terminal/truncation, usage, error body |
 | Anthropic wire | `tests/anthropic_messages_contract.rs` | `POST /v1/messages`, headers, text, tools, caching, SSE terminal/truncation, usage, error body |
-| ChatGPT subscription service | `tests/chatgpt_subscription_contract.rs` | Codex Responses URL and headers, forced SSE/body rules, text, tools, replay, identity, secret redaction |
+| ChatGPT subscription service | `tests/chatgpt_subscription_contract.rs` | Default and custom Codex Responses URLs, headers, forced SSE/body rules, text, tools, replay, and identity |
 | Live certification | `tests/live_*.rs` | A configured real endpoint currently accepts the declared protocol |
 
 Fixtures live below `tests/fixtures/<protocol>/`. Request bodies are parsed as
@@ -28,10 +28,14 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo test --workspace --doc
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo check -p bone-provider --target wasm32-unknown-unknown
 ```
 
-The root CI workflow runs exactly those commands. Ignored live tests are built
-by `--all-targets` but are not executed.
+The root CI workflow runs those commands on Linux and also compiles the
+workspace on Windows. Ignored live tests are built by `--all-targets` but are
+not executed. The WASM check compiles only `bone-provider`; native subscription
+OAuth remains unavailable on that target.
 
 ## Live certification
 
@@ -71,6 +75,9 @@ run may require interactive device authorization and subsequent runs use an
 independent local OAuth cache. Never upload a personal ChatGPT refresh token to
 GitHub-hosted Actions. If an organization later automates this test, it should
 use a dedicated account or supported access token on a trusted private runner.
+Non-sensitive results from deliberate local runs are recorded under
+`docs/certifications/`; credential and provider-response content must never be
+included in those records.
 
 The workflow fails before checkout when no protocol has a complete
 credential/model selection, or when a selected model lacks its credential.
@@ -87,10 +94,14 @@ separate manual runs with the repository configuration switched between runs
 (or a future environment matrix), rather than conflated into one endpoint
 identity.
 
-Live tests assert structural behavior rather than exact prose: non-empty text,
-one real terminal event, a non-empty provider-resolved model identity, and a
-complete response. They do not require a provider to echo a requested alias
-verbatim. Output limits stay low to bound cost.
+Most live tests assert structural behavior rather than exact prose: non-empty
+text, one real terminal event, a non-empty provider-resolved model identity,
+and a complete response. They do not require a provider to echo a requested
+alias verbatim. The ChatGPT subscription certification deliberately asks for
+and asserts the exact text `ok`, then forces a harmless fictional tool call,
+replays the result with the provider call id, and asserts the exact final text
+`done`. The tool is not executed and does not access the filesystem. Output
+limits stay low to bound cost.
 
 ## Adding coverage
 
@@ -117,3 +128,11 @@ output, and never embed credentials in a configured base URL. Custom
 authentication belongs in headers on a client injected through the relevant
 protocol's `from_client` constructor. Never make a default test dependent on
 network availability.
+
+For the experimental subscription adapter, the equivalent escape hatch is
+named `chatgpt_subscription::from_unmanaged_client` to make its boundary
+explicit. Offline tests use a static fake access token and recording transport;
+they never read the managed OAuth cache. Rig request-time errors can include
+non-authentication provider diagnostic bodies; authentication 401/403 and
+Responses SSE provider-error envelopes are redacted by the pinned Rig patch.
+Live-test failures must still not be copied into public logs without review.

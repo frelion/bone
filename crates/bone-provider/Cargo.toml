@@ -2,19 +2,20 @@
 name = "bone-provider"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 rig-core.workspace = true
 serde_json.workspace = true
 
-[target.'cfg(any(unix, windows))'.dependencies]
-fs2.workspace = true
-
 [target.'cfg(unix)'.dependencies]
+fs2.workspace = true
 libc.workspace = true
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 bytes.workspace = true
 futures-util.workspace = true
+http.workspace = true
 rig-core = { workspace = true, features = ["test-utils"] }
 tokio.workspace = true

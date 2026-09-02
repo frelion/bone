@@ -117,8 +117,9 @@ and request restrictions stay inside Rig's ChatGPT provider.
 The adapter does not run a local proxy and does not invoke the Codex agent.
 The explicit `connect` call reports a device-login URL and code through the
 provided callback. The library never prints the code itself. Once the user has
-authorized it, Rig caches and refreshes credentials independently. No API key,
-`OPENAI_BASE_URL`, sidecar, or separate installation is required.
+authorized it, Rig caches and refreshes credentials in BONE's independent
+credential record. No API key, `OPENAI_BASE_URL`, sidecar, or separate
+installation is required.
 
 This backend is a ChatGPT/Codex product interface, not the public OpenAI
 Platform API, and has no equivalent public compatibility guarantee. The
@@ -127,33 +128,57 @@ Responses shape; it does not claim a Chat Completions subscription endpoint.
 Selecting this named adapter is the runtime opt-in; there is no Cargo feature
 that could be mistaken for a security boundary or accidentally skipped by CI.
 
+The workspace currently binds `bone-provider` directly to a self-contained,
+vendored Rig hardening patch and marks the crate as `publish = false`. The
+direct path dependency remains in force when this repository is consumed as a
+Git or path dependency; it cannot silently resolve the unpatched crates.io Rig.
+Publishing is deliberately blocked until an equivalent fix is available as a
+published dependency.
+
 Important boundaries:
 
 - Never configure Rig's `auth_file` as `~/.codex/auth.json`. Codex and Rig use
   different schemas, and sharing a rotating refresh token between independent
   clients can break either login.
 - The convenience connector uses BONE's independent record at
-  `~/.config/bone/chatgpt-subscription/auth.json` on Unix (respecting
-  `XDG_CONFIG_HOME`). It requires an absolute existing config root, creates the
-  app directories as `0700`, creates token/lock files as `0600`, uses
-  `O_NOFOLLOW`, and rejects symbolic links, foreign-owned files, and hard
-  links. The guarded convenience connector is temporarily unavailable on
-  Windows until equivalent ACL and reparse-point checks exist. An application
-  can supply a different app-owned path through a configured Rig client and
-  `chatgpt_subscription::from_client`.
+  `~/.config/bone/chatgpt-subscription/auth.json` on Unix (respecting a valid
+  absolute `XDG_CONFIG_HOME`, otherwise falling back to `$HOME/.config`). It
+  creates a missing private config hierarchy, creates app directories as
+  `0700`, creates token/lock files as `0600`, and requires every managed
+  artifact to belong to the process's effective user. BONE's preparation step
+  rejects symbolic links and hard links and opens the prepared files with
+  `O_NOFOLLOW`. The guarded convenience connector is temporarily unavailable
+  on Windows until equivalent ACL and reparse-point checks exist. An
+  application can supply a different app-owned client through
+  `chatgpt_subscription::from_unmanaged_client`.
 - Interactive device login is suitable for local CLI or desktop use. A server
   should construct the Rig client with `allow_device_flow(false)` so an
   ordinary request cannot wait for unattended login.
 - `connect` completes authorization before it returns, keeping device login out
   of ordinary completion requests. Reuse the returned endpoint: BONE keeps an
-  exclusive OS file lock for its entire endpoint/model lifetime, so a second
-  process fails safely instead of racing a rotating refresh token. A custom
-  client passed to `from_client` owns its own locking policy.
+  exclusive OS file lock for its entire endpoint/model lifetime, so another
+  managed BONE connector fails safely instead of racing a rotating refresh
+  token. This lock does not coordinate an unmanaged Rig client or another
+  program using the same path. A client passed to `from_unmanaged_client` owns
+  its credential path, authorization timing, locking, and error policy.
 - After explicit authorization, `connect` rebuilds the endpoint client with
-  interactive device flow disabled. A rejected refresh therefore returns a
-  redacted reconnect error instead of printing a new code or waiting inside an
-  ordinary completion. Generic provider setup errors are likewise redacted at
-  the guarded model boundary.
+  interactive device flow disabled, so an ordinary completion never prints a
+  new device code or waits for unattended login. `connect` maps authorization
+  failures to a stable service error and does not expose OAuth response text.
+  The repository's pinned Rig patch handles a backend 401 by refreshing one
+  rejected token generation and retrying the unary or lazy-SSE handshake at
+  most once. An unusable refresh token invalidates the cache and returns a
+  stable reconnect error; 401/403 bodies and Responses SSE provider-error
+  envelopes are redacted. Non-authentication HTTP and transport diagnostics
+  retain their Rig `CompletionError` classification and may contain provider
+  text, so raw errors still belong only in trusted logs.
+- The ownership, permission, link, and `O_NOFOLLOW` checks protect BONE's
+  managed preparation and cooperating BONE processes. The pinned Rig patch
+  replaces credentials atomically on Unix using a private `0600` sibling,
+  file and directory sync, and a same-directory rename; an interrupted write
+  therefore leaves either the prior complete record or the new one. A
+  same-user process that can replace path components remains outside this
+  boundary. Never share this credential path with another client.
 - Rig drops unsupported backend fields, including `max_output_tokens` and
   `temperature`; it forces `stream: true`, `store: false`, and requests
   replayable encrypted reasoning state. Do not treat `max_tokens` as a hard
@@ -286,8 +311,9 @@ Ordinary protocol constructors do not read environment variables or persist
 credentials; they receive resolved values explicitly. An explicitly selected
 OAuth service adapter may maintain the independent token cache documented by
 that adapter. Local construction failures use `ConfigError`; the explicit
-subscription handshake returns a redacted `ConnectError`; request-time network,
-protocol, and model failures remain Rig `CompletionError` values.
+subscription handshake returns a stable service-local error; request-time
+network, protocol, and model failures remain Rig `CompletionError` values and
+must be treated as potentially sensitive provider diagnostics.
 
 ## What belongs elsewhere
 

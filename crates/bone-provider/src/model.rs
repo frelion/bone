@@ -11,10 +11,19 @@ use rig_core::{
 
 use crate::Protocol;
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 type CompletionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CompletionResponse, CompletionError>> + Send + 'a>>;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+type CompletionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<CompletionResponse, CompletionError>> + 'a>>;
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 type StreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<StreamingCompletionResponse, CompletionError>> + Send + 'a>>;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+type StreamFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<StreamingCompletionResponse, CompletionError>> + 'a>>;
 
 trait ErasedModel: Send + Sync {
     fn complete(&self, request: CompletionRequest) -> CompletionFuture<'_>;
