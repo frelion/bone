@@ -1,0 +1,130 @@
+#!/usr/bin/env bun
+
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const packages = [
+	{ directory: "packages/ai", name: "@frelion/bone-ai" },
+	{ directory: "packages/agent", name: "@frelion/bone-agent-core" },
+	{ directory: "packages/tui", name: "@frelion/bone-tui" },
+	{ directory: "packages/session", name: "@frelion/bone-session" },
+	{ directory: "packages/protocol", name: "@frelion/bone-protocol" },
+	{ directory: "packages/images", name: "@frelion/bone-images" },
+	{ directory: "packages/forge", name: "@frelion/bone-forge" },
+	{ directory: "packages/memory", name: "@frelion/bone-memory" },
+	{ directory: "packages/coding-agent", name: "@frelion/bone-coding-agent" },
+];
+
+const dryRun = process.argv.includes("--dry-run");
+const unknownArgs = process.argv.slice(2).filter((arg) => arg !== "--dry-run");
+
+if (unknownArgs.length > 0) {
+	console.error(`Usage: bun scripts/publish.mjs [--dry-run]`);
+	process.exit(1);
+}
+
+function commandForPlatform(command) {
+	return process.platform === "win32" ? `${command}.cmd` : command;
+}
+
+function run(command, args, options = {}) {
+	console.log(`$ ${[command, ...args].join(" ")}`);
+	const result = spawnSync(commandForPlatform(command), args, {
+		cwd: options.cwd,
+		encoding: "utf8",
+		stdio: options.capture ? ["inherit", "pipe", "pipe"] : "inherit",
+	});
+
+	if (result.status !== 0) {
+		const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+		throw new Error(output ? `Command failed: ${command} ${args.join(" ")}\n${output}` : `Command failed: ${command} ${args.join(" ")}`);
+	}
+
+	return result;
+}
+
+function readPackageJson(directory) {
+	return JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
+}
+
+function assertBuildOutputExists(directory) {
+	if (!existsSync(join(directory, "dist"))) {
+		throw new Error(`${directory}/dist does not exist. Run bun run build before publishing.`);
+	}
+}
+
+function validatePack(directory) {
+	const result = run("bun", ["pm", "pack", "--dry-run", "--ignore-scripts"], { capture: true, cwd: directory });
+	const summary = result.stdout.trim();
+	if (summary) console.log(summary);
+}
+
+function isPublished(name, version) {
+	const result = spawnSync(commandForPlatform("bun"), ["info", `${name}@${version}`, "version", "--json"], {
+		encoding: "utf8",
+		stdio: ["inherit", "pipe", "pipe"],
+	});
+
+	if (result.status === 0 && result.stdout.trim()) {
+		return true;
+	}
+
+	const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+	if (result.status !== 0 && (output.includes("E404") || output.includes("404 Not Found"))) {
+		return false;
+	}
+
+	throw new Error(output ? `Failed to query ${name}@${version}\n${output}` : `Failed to query ${name}@${version}`);
+}
+
+const packageVersions = new Map();
+for (const pkg of packages) {
+	const packageJson = readPackageJson(pkg.directory);
+	if (packageJson.name !== pkg.name) {
+		throw new Error(`${pkg.directory}/package.json has name ${packageJson.name}, expected ${pkg.name}`);
+	}
+	packageVersions.set(pkg.name, packageJson.version);
+}
+
+const versions = [...new Set(packageVersions.values())];
+if (versions.length !== 1) {
+	throw new Error(`Publish packages are not lockstep versioned: ${versions.join(", ")}`);
+}
+
+console.log(`Publishing Bone packages at ${versions[0]}${dryRun ? " (dry run)" : ""}\n`);
+
+const packageStates = packages.map((pkg) => ({
+	...pkg,
+	published: false,
+	version: packageVersions.get(pkg.name),
+}));
+
+for (const pkg of packageStates) {
+	assertBuildOutputExists(pkg.directory);
+	pkg.published = isPublished(pkg.name, pkg.version);
+
+	if (pkg.published) {
+		console.log(`${pkg.name}@${pkg.version} is already published; validating package contents only.`);
+	} else {
+		console.log(`${pkg.name}@${pkg.version} is not published; validating package contents before publish.`);
+	}
+	validatePack(pkg.directory);
+	console.log();
+}
+
+if (dryRun) {
+	process.exit(0);
+}
+
+console.log("All packages validated; starting publication.\n");
+
+for (const pkg of packageStates) {
+	if (pkg.published) {
+		console.log(`Skipping ${pkg.name}@${pkg.version}: already published\n`);
+		continue;
+	}
+
+	run("bun", ["publish", "--access", "public", "--ignore-scripts"], { cwd: pkg.directory });
+	console.log();
+}

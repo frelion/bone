@@ -1,0 +1,27 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"outDir": "./dist",
+		"paths": {
+			"@frelion/bone-agent-core": ["../agent/dist/index.d.ts"],
+			"@frelion/bone-agent-core/*": ["../agent/dist/*.d.ts"],
+			"@frelion/bone-ai": ["../ai/dist/index.d.ts"],
+			"@frelion/bone-ai/*": ["../ai/dist/*.d.ts", "../ai/dist/providers/*.d.ts"],
+			"@frelion/bone-session": ["../session/dist/index.d.ts"],
+			"@frelion/bone-session/*": ["../session/dist/*.d.ts"],
+			"@frelion/bone-images": ["../images/dist/index.d.ts"],
+			"@frelion/bone-images/*": ["../images/dist/*.d.ts"],
+			"@frelion/bone-forge": ["../forge/dist/index.d.ts"],
+			"@frelion/bone-forge/*": ["../forge/dist/*.d.ts"],
+			"@frelion/bone-memory": ["../memory/dist/index.d.ts"],
+			"@frelion/bone-memory/*": ["../memory/dist/*.d.ts"],
+			"@frelion/bone-protocol": ["../protocol/dist/index.d.ts"],
+			"@frelion/bone-protocol/*": ["../protocol/dist/*.d.ts"],
+			"@frelion/bone-tui": ["../tui/dist/index.d.ts"],
+			"@frelion/bone-tui/*": ["../tui/dist/*.d.ts", "../tui/dist/components/*.d.ts"]
+		},
+		"rootDir": "./src"
+	},
+	"include": ["src/**/*.ts", "src/**/*.d.ts"],
+	"exclude": ["node_modules", "dist"]
+}

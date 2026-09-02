@@ -1,0 +1,47 @@
+{
+	"name": "@frelion/bone-forge",
+	"version": "0.2.1",
+	"description": "Required GitHub and GitLab integration runtime for Bone",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./*": {
+			"types": "./dist/*.d.ts",
+			"import": "./dist/*.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"test": "bunx --bun vitest --run",
+		"prepublishOnly": "bun run clean && bun run build"
+	},
+	"dependencies": {
+		"proper-lockfile": "4.1.2",
+		"semver": "7.8.0",
+		"undici-client": "npm:undici@6.27.0",
+		"yaml": "2.9.0"
+	},
+	"devDependencies": {
+		"@types/node": "24.12.4",
+		"@types/proper-lockfile": "4.1.4",
+		"@types/semver": "7.7.1",
+		"shx": "0.4.0",
+		"typescript": "5.9.3",
+		"vitest": "4.1.9"
+	},
+	"license": "MIT",
+	"engines": {
+		"bun": ">=1.3.14"
+	}
+}

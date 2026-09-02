@@ -1,0 +1,40 @@
+{
+	"extends": "./tsconfig.base.json",
+	"compilerOptions": {
+		"noEmit": true,
+		"paths": {
+			"*": ["./*"],
+			"@frelion/bone-ai": ["./packages/ai/src/index.ts"],
+			"@frelion/bone-ai/oauth": ["./packages/ai/src/oauth.ts"],
+			"@frelion/bone-ai/*": ["./packages/ai/src/*.ts", "./packages/ai/src/providers/*.ts"],
+			"@frelion/bone-ai/dist/*": ["./packages/ai/src/*"],
+			"@frelion/bone-agent-core": ["./packages/agent/src/index.ts"],
+			"@frelion/bone-agent-core/*": ["./packages/agent/src/*"],
+			"@frelion/bone-session": ["./packages/session/src/index.ts"],
+			"@frelion/bone-session/*": ["./packages/session/src/*.ts"],
+			"@frelion/bone-images": ["./packages/images/src/index.ts"],
+			"@frelion/bone-images/*": ["./packages/images/src/*.ts"],
+			"@frelion/bone-forge": ["./packages/forge/src/index.ts"],
+			"@frelion/bone-forge/*": ["./packages/forge/src/*.ts"],
+			"@frelion/bone-memory": ["./packages/memory/src/index.ts"],
+			"@frelion/bone-memory/*": ["./packages/memory/src/*.ts"],
+			"@frelion/bone-protocol": ["./packages/protocol/src/index.ts"],
+			"@frelion/bone-protocol/*": ["./packages/protocol/src/*.ts"],
+			"@frelion/bone-coding-agent": ["./packages/coding-agent/src/index.ts"],
+			"@frelion/bone-coding-agent/hooks": ["./packages/coding-agent/src/core/hooks/index.ts"],
+			"@frelion/bone-coding-agent/*": ["./packages/coding-agent/src/*"],
+			"@frelion/bone-orchestrator": ["./packages/orchestrator/src/index.ts"],
+			"@frelion/bone-orchestrator/*": ["./packages/orchestrator/src/*"],
+			"typebox": ["./node_modules/typebox"],
+			"@frelion/bone-tui": ["./packages/tui/src/index.ts"],
+			"@frelion/bone-tui/*": ["./packages/tui/src/*"],
+			"@frelion/bone-agent-old": ["./packages/agent-old/src/index.ts"],
+			"@frelion/bone-agent-old/*": ["./packages/agent-old/src/*"]
+		}
+	},
+	"include": ["packages/*/src/**/*", "packages/*/test/**/*", "packages/coding-agent/examples/**/*"],
+	"exclude": [
+		"**/dist/**",
+		"packages/coding-agent/test/**"
+	]
+}

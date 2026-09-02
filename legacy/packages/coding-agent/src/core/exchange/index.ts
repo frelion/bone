@@ -1,0 +1,26 @@
+export {
+	createExchangeProjection,
+	ExchangeProjectionError,
+	getActiveActions,
+	projectExchangeEvent,
+	shouldShowWorking,
+} from "./projector.ts";
+export type {
+	ActionItem,
+	ActionStatus,
+	Exchange,
+	ExchangeInput,
+	ExchangeInputDelivery,
+	ExchangeItem,
+	ExchangeProjection,
+	ExchangeProjectorEvent,
+	ExchangeStartDelivery,
+	ExchangeStatus,
+	ModelTurn,
+	ModelTurnStatus,
+	NarrativeItem,
+	NarrativePhase,
+	NarrativeStatus,
+	ToolCallExecution,
+	ToolCallStatus,
+} from "./types.ts";

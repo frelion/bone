@@ -1,0 +1,104 @@
+{
+	"name": "@frelion/bone-coding-agent",
+	"version": "0.2.1",
+	"description": "Bone local-first coding agent with concurrent conversations and semantic memory",
+	"type": "module",
+	"boneConfig": {
+		"name": "bone",
+		"configDir": ".bone"
+	},
+	"bin": {
+		"bone": "dist/bun/cli.js"
+	},
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		},
+		"./rpc-entry": {
+			"import": "./dist/rpc-entry.js"
+		}
+	},
+	"files": [
+		"dist",
+		"docs",
+		"examples/sdk",
+		"containerization.md",
+		"CHANGELOG.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json && shx chmod +x dist/bun/cli.js dist/rpc-entry.js && bun run copy-assets",
+		"build:binary": "bun run --cwd ../tui build && bun run --cwd ../ai build && bun run --cwd ../agent build && bun run --cwd ../session build && bun run --cwd ../protocol build && bun run --cwd ../images build && bun run --cwd ../forge build && bun run --cwd ../memory build && bun run build && bun build --compile ./dist/bun/cli.js ../images/src/image-resize-worker.ts ../memory/src/local-embedding-worker.ts ../memory/src/local-embedding-setup-worker.ts --outfile dist/bone && bun ../../scripts/verify-opentui-standalone.mjs --binary dist/bone && bun run copy-binary-assets",
+		"copy-assets": "shx rm -f dist/package.json && shx rm -rf dist/native && shx mkdir -p dist/modes/interactive/theme && shx cp src/modes/interactive/theme/*.json dist/modes/interactive/theme/ && shx mkdir -p dist/modes/interactive/assets && shx cp src/modes/interactive/assets/*.png dist/modes/interactive/assets/ && shx mkdir -p dist/core/export-html/vendor && shx cp src/core/export-html/template.html src/core/export-html/template.css src/core/export-html/template.js dist/core/export-html/ && shx cp src/core/export-html/vendor/*.js dist/core/export-html/vendor/ && shx cp -r ../memory/native dist/",
+		"copy-binary-assets": "shx cp package.json dist/ && shx cp README.md dist/ && shx cp CHANGELOG.md dist/ && shx rm -rf dist/native && shx mkdir -p dist/theme && shx cp src/modes/interactive/theme/*.json dist/theme/ && shx mkdir -p dist/assets && shx cp src/modes/interactive/assets/*.png dist/assets/ && shx mkdir -p dist/export-html/vendor && shx cp src/core/export-html/template.html dist/export-html/ && shx cp src/core/export-html/vendor/*.js dist/export-html/vendor/ && shx cp -r docs dist/ && shx cp -r examples dist/ && shx cp -r ../memory/native dist/ && bun ../images/scripts/copy-photon-wasm.ts dist/photon_rs_bg.wasm",
+		"test": "bunx --bun vitest --run --exclude 'test/opentui-*.test.ts' --exclude test/edit-tool-no-full-redraw.test.ts --exclude test/session-file-invalid.test.ts --exclude test/session-id-readonly.test.ts --exclude test/startup-session-name.test.ts --exclude test/stdout-cleanliness.test.ts && bunx --bun vitest --run test/opentui-*.test.ts test/edit-tool-no-full-redraw.test.ts test/session-file-invalid.test.ts test/session-id-readonly.test.ts test/startup-session-name.test.ts test/stdout-cleanliness.test.ts",
+		"eval:forge": "bun evals/forge/run.ts",
+		"eval:forge:ci": "bun evals/forge/run.ts --output ../../.artifacts/forge-eval",
+		"eval:forge:live": "bun evals/forge/live-run.ts",
+		"benchmark:session-load": "bun scripts/benchmark-session-load.ts",
+		"prepublishOnly": "bun run clean && bun run build"
+	},
+	"dependencies": {
+		"@frelion/bone-agent-core": "^0.2.1",
+		"@frelion/bone-ai": "^0.2.1",
+		"@frelion/bone-forge": "^0.2.1",
+		"@frelion/bone-images": "^0.2.1",
+		"@frelion/bone-memory": "^0.2.1",
+		"@frelion/bone-protocol": "^0.2.1",
+		"@frelion/bone-session": "^0.2.1",
+		"@frelion/bone-tui": "^0.2.1",
+		"@opentui/core": "0.4.5",
+		"chalk": "5.6.2",
+		"cli-progress": "3.12.0",
+		"cross-spawn": "7.0.6",
+		"diff": "8.0.4",
+		"glob": "13.0.6",
+		"highlight.js": "10.7.3",
+		"ignore": "7.0.5",
+		"minimatch": "10.2.5",
+		"proper-lockfile": "4.1.2",
+		"semver": "7.8.0",
+		"string-width": "4.2.3",
+		"typebox": "1.1.38",
+		"undici-client": "npm:undici@6.27.0",
+		"yaml": "2.9.0"
+	},
+	"overrides": {
+		"rimraf": "6.1.2",
+		"gaxios": {
+			"rimraf": "6.1.2"
+		}
+	},
+	"devDependencies": {
+		"@types/cli-progress": "3.11.6",
+		"@types/cross-spawn": "6.0.6",
+		"@types/diff": "7.0.2",
+		"@types/node": "24.12.4",
+		"@types/proper-lockfile": "4.1.4",
+		"@types/semver": "7.7.1",
+		"shx": "0.4.0",
+		"typescript": "5.9.3",
+		"vitest": "4.1.9"
+	},
+	"keywords": [
+		"coding-agent",
+		"ai",
+		"llm",
+		"cli",
+		"tui",
+		"agent"
+	],
+	"author": "Mario Zechner",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/frelion/bone.git",
+		"directory": "packages/coding-agent"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	}
+}

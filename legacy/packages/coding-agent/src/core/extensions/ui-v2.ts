@@ -1,0 +1,203 @@
+import type { AgentToolResult } from "@frelion/bone-agent-core";
+import type { CliRenderer, Renderable } from "@opentui/core";
+import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
+
+export type ExtensionUINotificationKind = "info" | "warning" | "error";
+
+export interface ExtensionUIDialogOptionsV2 {
+	signal?: AbortSignal;
+	timeoutMs?: number;
+}
+
+export interface ExtensionUISelectOption<Value extends string = string> {
+	value: Value;
+	label: string;
+	description?: string;
+	disabled?: boolean;
+}
+
+export interface ExtensionUISelectRequest<Value extends string = string> extends ExtensionUIDialogOptionsV2 {
+	title: string;
+	options: readonly ExtensionUISelectOption<Value>[];
+	initialValue?: Value;
+	shortcuts?: readonly { action: "save"; value: Value }[];
+	footer?: string;
+}
+
+export interface ExtensionUIConfirmRequest extends ExtensionUIDialogOptionsV2 {
+	title: string;
+	message: string;
+	confirmLabel?: string;
+	cancelLabel?: string;
+}
+
+export interface ExtensionUIInputRequest extends ExtensionUIDialogOptionsV2 {
+	title: string;
+	placeholder?: string;
+	initialValue?: string;
+	multiline?: boolean;
+}
+
+export interface ExtensionUIDialogService {
+	select<Value extends string>(request: ExtensionUISelectRequest<Value>): Promise<Value | undefined>;
+	confirm(request: ExtensionUIConfirmRequest): Promise<boolean>;
+	input(request: ExtensionUIInputRequest): Promise<string | undefined>;
+	notify(message: string, kind?: ExtensionUINotificationKind): void;
+}
+
+export type ExtensionUIViewFactory = (renderer: CliRenderer) => Renderable;
+export type ExtensionUIView = Renderable | ExtensionUIViewFactory;
+
+export interface ExtensionUIViewHandle {
+	readonly mounted: boolean;
+	update(view: ExtensionUIView): void;
+	close(): void;
+}
+
+export type ExtensionUIWidgetPlacement = "aboveEditor" | "belowEditor";
+
+export interface ExtensionUIWidgetOptionsV2 {
+	placement?: ExtensionUIWidgetPlacement;
+	order?: number;
+}
+
+export interface ExtensionUIWidgetService {
+	set(key: string, view: ExtensionUIView, options?: ExtensionUIWidgetOptionsV2): ExtensionUIViewHandle;
+	clear(key: string): void;
+}
+
+export interface ExtensionUIChromeService {
+	setHeader(view: ExtensionUIView | undefined): ExtensionUIViewHandle;
+	setFooter(
+		view: Renderable | ((footerData: ReadonlyFooterDataProvider) => ExtensionUIView) | undefined,
+	): ExtensionUIViewHandle;
+	setTitle(title: string): void;
+}
+
+export interface ExtensionUIEditorService {
+	getText(): string;
+	setText(text: string): void;
+	insertText(text: string): void;
+	open(request: ExtensionUIInputRequest): Promise<string | undefined>;
+	setView(view: ExtensionUIView | undefined): ExtensionUIViewHandle;
+}
+
+export interface ExtensionUIToolViewState<TState = unknown, TArgs = unknown> {
+	toolCallId: string;
+	args: TArgs;
+	state: TState;
+	cwd: string;
+	executionStarted: boolean;
+	argsComplete: boolean;
+	isPartial: boolean;
+	expanded: boolean;
+	isError: boolean;
+	previousView?: ExtensionUIView;
+}
+
+export interface ExtensionUIToolResultViewInput<TDetails = unknown> {
+	result: AgentToolResult<TDetails>;
+	isPartial: boolean;
+	expanded: boolean;
+}
+
+export type ExtensionUIToolSummaryPhase = "preparing" | "ready" | "running" | "streaming" | "complete" | "failed";
+
+export interface ExtensionUIToolSummaryInput<TArgs = unknown, TDetails = unknown> {
+	args: TArgs;
+	phase: ExtensionUIToolSummaryPhase;
+	result?: AgentToolResult<TDetails>;
+	isError: boolean;
+}
+
+export interface ExtensionUIToolViewRenderer<TArgs = unknown, TDetails = unknown, TState = unknown> {
+	/** Return a bounded, single-line human summary for the collapsed transcript view. */
+	summarize?(input: ExtensionUIToolSummaryInput<TArgs, TDetails>): string | undefined;
+	renderCall?(args: TArgs, context: ExtensionUIToolViewState<TState, TArgs>): ExtensionUIView;
+	renderResult?(
+		input: ExtensionUIToolResultViewInput<TDetails>,
+		context: ExtensionUIToolViewState<TState, TArgs>,
+	): ExtensionUIView;
+}
+
+export interface ExtensionUIToolResultService {
+	setRenderer<TArgs = unknown, TDetails = unknown, TState = unknown>(
+		toolName: string,
+		renderer: ExtensionUIToolViewRenderer<TArgs, TDetails, TState> | undefined,
+	): void;
+}
+
+export interface ExtensionUIAdvancedViewContext<Result> {
+	done(result: Result): void;
+	cancel(): void;
+}
+
+export interface ExtensionUIAdvancedOptions {
+	presentation?: "dialog" | "overlay" | "replace";
+	width?: number | `${number}%`;
+	height?: number | `${number}%`;
+	signal?: AbortSignal;
+	timeoutMs?: number;
+}
+
+/** Trusted escape hatch for extensions that need direct OpenTUI composition. */
+export interface ExtensionUIAdvancedService {
+	show<Result>(
+		factory: (control: ExtensionUIAdvancedViewContext<Result>) => ExtensionUIView | Promise<ExtensionUIView>,
+		options?: ExtensionUIAdvancedOptions,
+	): Promise<Result | undefined>;
+	close(): void;
+	createView(factory: ExtensionUIViewFactory): ExtensionUIViewFactory;
+}
+
+export interface ExtensionUIV2Context {
+	readonly version: 2;
+	readonly available: boolean;
+	readonly dialogs: ExtensionUIDialogService;
+	readonly widgets: ExtensionUIWidgetService;
+	readonly chrome: ExtensionUIChromeService;
+	readonly editor: ExtensionUIEditorService;
+	readonly toolResults: ExtensionUIToolResultService;
+	readonly advanced: ExtensionUIAdvancedService;
+}
+
+function unavailableHandle(): ExtensionUIViewHandle {
+	return { mounted: false, update: () => {}, close: () => {} };
+}
+
+/** Create the headless v2 UI used by print and JSON modes. */
+export function createExtensionUIV2Context(): ExtensionUIV2Context {
+	return {
+		version: 2,
+		available: false,
+		dialogs: {
+			select: async () => undefined,
+			confirm: async () => false,
+			input: async () => undefined,
+			notify: () => {},
+		},
+		widgets: { set: () => unavailableHandle(), clear: () => {} },
+		chrome: {
+			setHeader: () => unavailableHandle(),
+			setFooter: () => unavailableHandle(),
+			setTitle: () => {},
+		},
+		editor: {
+			getText: () => "",
+			setText: () => {},
+			insertText: () => {},
+			open: async () => undefined,
+			setView: () => unavailableHandle(),
+		},
+		toolResults: { setRenderer: () => {} },
+		advanced: {
+			show: async () => undefined,
+			close: () => {},
+			createView: (factory) => factory,
+		},
+	};
+}
+
+export function resolveExtensionUIV2(context: { uiV2: ExtensionUIV2Context }): ExtensionUIV2Context {
+	return context.uiV2;
+}

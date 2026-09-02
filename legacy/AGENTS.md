@@ -1,0 +1,178 @@
+# Development Rules
+
+## Conversational Style
+
+- Keep answers short and concise
+- No emojis in commits, issues, PR comments, or code
+- No fluff or cheerful filler text (e.g., "Thanks @user" not "Thanks so much @user!")
+- Technical prose only, be direct
+- When the user asks a question, answer it first before making edits or running implementation commands.
+- When responding to user feedback or an analysis, explicitly say whether you agree or disagree before saying what you changed.
+
+## Code Quality
+
+- Read files in full before wide-ranging changes, before editing files you have not fully inspected, and when asked to investigate or audit. Do not rely on search snippets for broad changes.
+- No `any` unless absolutely necessary.
+- Inline single-line helpers that have only one call site.
+- Check node_modules for external API types; don't guess.
+- **No inline imports** (`await import()`, `import("pkg").Type`, dynamic type imports). Top-level imports only.
+- Never remove or downgrade code to fix type errors from outdated deps; upgrade the dep instead.
+- Use only erasable TypeScript syntax (Node strip-only mode) in code checked by the root config (`packages/*/src`, `packages/*/test`, `packages/coding-agent/examples`): no parameter properties, `enum`, `namespace`/`module`, `import =`, `export =`, or other constructs needing JS emit. Use explicit fields with constructor assignments.
+- Always ask before removing functionality or code that appears intentional.
+- Do not preserve backward compatibility unless the user asks for it.
+- Never hardcode key checks (e.g. `matchesKey(keyData, "ctrl+x")`). Add defaults to `DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS` so they stay configurable.
+- Never modify `packages/ai/src/models.generated.ts` directly; update `packages/ai/scripts/generate-models.ts` instead, then regenerate. Including the resulting `models.generated.ts` diff is always OK, even if regeneration includes unrelated upstream model metadata changes.
+
+## Commands
+
+- After code changes (not docs): `bun run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
+- Never run `bun run build` or `bun run test` unless requested by the user.
+- Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root: `bunx --bun vitest --run test/specific.test.ts`.
+- If you create or modify a test file, run it and iterate on test or implementation until it passes.
+- For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
+- Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
+- For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
+- Never commit unless the user asks.
+
+## Dependency and Install Security
+
+- Treat dependency and Bun lockfile changes as reviewed code. Direct external deps stay pinned to exact versions.
+- Hydrate/update locally with `bun install --ignore-scripts`; clean/CI-style with `bun install --frozen-lockfile --ignore-scripts`. Don't run lifecycle scripts unless the user asks.
+- If dependency metadata changes, refresh `bun.lock` with `bun install --lockfile-only --ignore-scripts` and review the resulting diff.
+- Bun workspace dependencies are distributed across the root and each workspace's `node_modules`. In a new or reused worktree, missing package-level dependencies must be repaired from that worktree's repository root with `bun install --frozen-lockfile --ignore-scripts`; do not install packages one workspace at a time.
+- Never treat a shared root `node_modules` as a complete workspace install. Do not work around missing modules with `NODE_PATH`, direct `.bun` store imports, or by linking only the root `node_modules` from another checkout.
+- Never symlink an entire package-level `node_modules` from another worktree. Its relative workspace links can resolve back into the source worktree and silently mix code between branches. Each worktree must own a complete Bun-generated workspace link topology, even when Bun's download cache or a copy-on-write dependency snapshot is reused.
+
+## Git
+
+Multiple pi sessions may be running in this cwd at the same time, each modifying different files. Git operations that touch unstaged, staged, or untracked files outside your own changes will stomp on other sessions' work. Follow these rules:
+
+Worktree safety:
+
+- Before editing, report `git rev-parse --show-toplevel`, `git branch --show-current`, and `git status --short --branch`.
+- Verify that the absolute Git root and branch match the task. Stop before editing if either differs.
+- The primary checkout ending in `/bone` is reserved for maintaining `main`, managing worktrees, and integrating completed branches. Perform feature development in a dedicated linked worktree on its matching feature branch.
+- When the workspace container provides `../check-worktree.sh`, run it with the expected branch before editing, for example `../check-worktree.sh . codex/my-feature`.
+
+Committing:
+
+- Only commit files YOU changed in THIS session.
+- Stage explicit paths (`git add <path1> <path2>`); never `git add -A` / `git add .`.
+- Before committing, run `git status` and verify you are only staging your files.
+- `packages/ai/src/models.generated.ts` may always be included alongside your files.
+- Message format: `{feat,fix,docs}[(ai,tui,agent,coding-agent)]: <commit message> (optionally multiple lines)`. Message is informative and concise.
+
+Never run (destroys other agents' work or bypasses checks):
+
+- `git reset --hard`, `git checkout .`, `git clean -fd`, `git stash`, `git add -A`, `git add .`, `git commit --no-verify`.
+
+If rebase conflicts occur:
+
+- Resolve conflicts only in files you modified.
+- If a conflict is in a file you did not modify, abort and ask the user.
+- Never force push.
+
+## Issues and PRs
+
+See `CONTRIBUTING.md` for the contributor gate (auto-close workflows, `lgtm`/`lgtmi`, quality bar).
+
+When reviewing PRs:
+
+- Do not run `gh pr checkout`, `git switch`, or otherwise move the worktree to the PR branch unless the user explicitly asks.
+- Use `gh pr view`, `gh pr diff`, `gh api`, and local `git show`/`git diff` against fetched refs to inspect PR metadata, commits, and patches without changing branches.
+- If you need PR file contents, fetch/read them into temporary files or use `git show <ref>:<path>` without switching branches.
+
+When creating issues:
+
+- Add `pkg:*` labels for affected packages (`pkg:agent`, `pkg:ai`, `pkg:coding-agent`, `pkg:tui`); use all that apply.
+
+When posting issue/PR comments:
+
+- Write the comment to a temp file and post with `gh issue/pr comment --body-file` (never multi-line markdown via `--body`).
+- Keep comments concise, technical, in the user's tone.
+- End every AI-posted comment with the AI-generated disclaimer line specified by the originating prompt (e.g. `This comment is AI-generated by `/wr``).
+
+When closing issues via commit:
+
+- Include `fixes #<number>` or `closes #<number>` in the message so merging auto-closes the issue. For multiple issues, repeat the keyword per issue (`closes #1, closes #2`); a shared keyword (`closes #1, #2`) only closes the first.
+
+## Testing pi Interactive Mode with tmux
+
+Run the TUI in a controlled terminal (from the repo root):
+
+```bash
+tmux new-session -d -s pi-test -x 80 -y 24
+tmux send-keys -t pi-test "./pi-test.sh" Enter
+sleep 3 && tmux capture-pane -t pi-test -p     # capture after startup
+tmux send-keys -t pi-test "your prompt here" Enter
+tmux send-keys -t pi-test Escape               # special keys (also C-o for ctrl+o, etc.)
+tmux kill-session -t pi-test
+```
+
+## Changelog
+
+Location: `packages/*/CHANGELOG.md` (one per package).
+
+Sections under `## [Unreleased]`: `### Breaking Changes` (API changes requiring migration), `### Added`, `### Changed`, `### Fixed`, `### Removed`.
+
+Rules:
+
+- All new entries go under `## [Unreleased]`. Read the full section first and append to existing subsections; never duplicate them.
+- Released version sections (e.g. `## [0.12.2]`) are immutable; never modify them.
+
+Attribution:
+
+- Internal (from issues): `Fixed foo bar ([#123](https://github.com/frelion/bone/issues/123))`
+- External contributions: `Added feature X ([#456](https://github.com/frelion/bone/pull/456) by [@username](https://github.com/username))`
+
+## Releasing
+
+**Lockstep versioning**: all packages share one version; every release updates all together. `patch` = fixes + additions, `minor` = breaking changes. No major releases.
+
+1. **Update CHANGELOGs**: when the user explicitly requests a new release, automatically execute the complete `.pi/prompts/cl.md` audit on the latest `main` commit and update every affected package's `[Unreleased]` section before releasing. Do not require the user to run `/cl` or separately confirm routine changelog wording; ask only when missing product context would materially change the release notes.
+
+2. **Local smoke test**: build an unpublished release and smoke test from outside the repo (so it can't resolve workspace files):
+   ```bash
+   bun run release:local -- --out /tmp/bone-local-release --force
+   cd /tmp
+
+   # Bun package install smoke tests
+   /tmp/bone-local-release/bun-package/bone --help
+   /tmp/bone-local-release/bun-package/bone --version
+   /tmp/bone-local-release/bun-package/bone --list-models
+   /tmp/bone-local-release/bun-package/bone -p "Say exactly: ok"
+   /tmp/bone-local-release/bun-package/bone
+
+   # Bun standalone binary smoke tests
+   /tmp/bone-local-release/bun/bone --help
+   /tmp/bone-local-release/bun/bone --version
+   /tmp/bone-local-release/bun/bone --list-models
+   /tmp/bone-local-release/bun/bone -p "Say exactly: ok"
+   /tmp/bone-local-release/bun/bone
+   ```
+   Verify both Bun package and standalone binary startup, model/account listing, interactive startup, and at least one real prompt with the intended default provider. The bare commands `/tmp/bone-local-release/bun-package/bone` and `/tmp/bone-local-release/bun/bone` start interactive mode; run each in tmux, submit a prompt, and wait for the model reply before considering the interactive smoke test passed. Failures are release blockers unless the user explicitly accepts the risk.
+
+3. **Run the release doctor** before changing versions:
+   ```bash
+   bun run release:doctor
+   ```
+   This verifies lockstep package versions and internal dependency ranges and performs a frozen Bun dependency resolution. Fix every failure before preparing a release.
+
+4. **Prepare an explicit version**. Never use an implicit patch/minor bump:
+   ```bash
+   bun run release:prepare -- 0.0.10 --dry-run
+   bun run release:prepare -- 0.0.10
+   ```
+   Preparation atomically updates only the five lockstep packages and their internal dependency ranges, refreshes `bun.lock`, then runs clean dependency resolution, `bun run check`, and `./test.sh`. It does not commit, tag, or push. Review every generated diff before publishing. Re-running prepare with the same explicit version is safe; do not choose a new version merely because preparation failed.
+
+5. **Publish the prepared version**:
+   ```bash
+   bun run release:publish -- 0.0.10
+   ```
+   Publish accepts only expected release files, commits `Release vX.Y.Z`, adds and commits the next `[Unreleased]` sections, pushes `main`, waits for the exact main commit's CI run, then creates and pushes the tag. It waits for the GitHub Release workflow and reports failure instead of claiming the release succeeded early.
+
+6. **If GitHub Release CI fails**: for a transient runner, network, or upload failure, rerun `release:publish` with the same version; it reruns the failed tag workflow without moving the tag or creating new commits. If the fix changes tracked source or release metadata, keep the failed tag immutable, prepare a new explicit patch version, and publish that version. npm publication is not active; GitHub Releases are the distribution channel.
+
+## User Override
+
+If the user's instructions conflict with any rule in this document, ask for explicit confirmation before overriding. Only then execute their instructions.

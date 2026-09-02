@@ -1,0 +1,274 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, test, vi } from "vitest";
+import type { AgentSession } from "../src/core/agent-session.ts";
+import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+import type { ExtensionUIV2Context } from "../src/core/extensions/ui-v2.ts";
+import { OpenTUICommandRouter } from "../src/modes/interactive/opentui-command-router.ts";
+
+function createHarness() {
+	const executeBash = vi.fn(async () => ({ output: "ok", exitCode: 0, cancelled: false, truncated: false }));
+	const compact = vi.fn(async () => ({}));
+	const enterPlanMode = vi.fn();
+	const exitPlanMode = vi.fn();
+	const setSessionName = vi.fn();
+	const session = {
+		isBashRunning: false,
+		isStreaming: false,
+		isCompacting: false,
+		collaborationMode: "default",
+		executeBash,
+		compact,
+		enterPlanMode,
+		exitPlanMode,
+		setSessionName,
+		sessionManager: {
+			getSessionName: () => "Test",
+			getSessionId: () => "session-id",
+			getSessionFile: () => "/tmp/session.jsonl",
+			getBranch: () => [],
+			getCwd: () => "/tmp",
+		},
+	} as unknown as AgentSession;
+	const runtime = { session, cwd: "/tmp", services: { agentDir: "/tmp" } } as unknown as AgentSessionRuntime;
+	const createNew = vi.fn(async () => {});
+	const statuses: string[] = [];
+	const onQuit = vi.fn();
+	const router = new OpenTUICommandRouter({
+		host: { current: runtime, createNew },
+		getUI: () => undefined,
+		onStatus: (message) => statuses.push(message),
+		onFocusConversations: vi.fn(),
+		onQuit,
+	});
+	return { router, session, executeBash, compact, enterPlanMode, setSessionName, createNew, statuses, onQuit };
+}
+
+describe("OpenTUICommandRouter", () => {
+	test("distinguishes built-ins from ordinary prompts and extension commands", async () => {
+		const { router, onQuit } = createHarness();
+		expect(await router.route("explain this code")).toEqual({ handled: false });
+		expect(await router.route("/extension-command arg")).toEqual({ handled: false });
+		expect(await router.route("/quit")).toEqual({ handled: true, kind: "command" });
+		expect(onQuit).toHaveBeenCalledOnce();
+	});
+
+	test("routes a unique slash-command prefix", async () => {
+		const { router, onQuit } = createHarness();
+		await router.route("/qui");
+		expect(onQuit).toHaveBeenCalledOnce();
+	});
+
+	test("routes /set to the settings command", async () => {
+		const { router } = createHarness();
+		const settings = vi.spyOn(router as unknown as { settings: () => Promise<void> }, "settings").mockResolvedValue();
+
+		const result = await router.route("/set");
+
+		expect(result).toEqual({ handled: true, kind: "command" });
+		expect(settings).toHaveBeenCalledOnce();
+	});
+
+	test("routes stateful session commands without prompting the model", async () => {
+		const { router, compact, enterPlanMode, setSessionName, createNew, statuses } = createHarness();
+		await router.route("/new");
+		await router.route("/compact preserve decisions");
+		await router.route("/plan");
+		await router.route("/name Release work");
+		expect(createNew).toHaveBeenCalledOnce();
+		expect(compact).toHaveBeenCalledWith("preserve decisions");
+		expect(enterPlanMode).toHaveBeenCalledOnce();
+		expect(setSessionName).toHaveBeenCalledWith("Release work");
+		expect(statuses).toContain("Conversation compacted");
+	});
+
+	test("routes a captured submission to its originating runtime", async () => {
+		const firstName = vi.fn();
+		const secondName = vi.fn();
+		const runtime = (setSessionName: ReturnType<typeof vi.fn>) =>
+			({
+				session: {
+					setSessionName,
+					sessionManager: { getSessionName: () => "Original" },
+				},
+				cwd: "/tmp",
+			}) as unknown as AgentSessionRuntime;
+		const first = runtime(firstName);
+		const second = runtime(secondName);
+		const host = { current: second, createNew: vi.fn(async () => {}) };
+		const router = new OpenTUICommandRouter({
+			host,
+			getUI: () => undefined,
+			onStatus: vi.fn(),
+			onFocusConversations: vi.fn(),
+			onQuit: vi.fn(),
+		});
+
+		await router.route("/name Captured", first);
+
+		expect(firstName).toHaveBeenCalledWith("Captured");
+		expect(secondName).not.toHaveBeenCalled();
+	});
+
+	test("generates a conversation title when /name has no argument", async () => {
+		const model = { provider: "test", id: "title-model" };
+		const generateTitle = vi.fn(async () => ({ kind: "title" as const, title: "Generated title" }));
+		const setSessionName = vi.fn();
+		const session = {
+			model,
+			modelRuntime: { checkAuth: vi.fn(async () => true) },
+			generateTitle,
+			setSessionName,
+			sessionManager: { getSessionName: () => undefined },
+		} as unknown as AgentSession;
+		const runtime = {
+			session,
+			cwd: "/tmp",
+			services: {
+				agentDir: "/tmp",
+				settingsManager: { getTaskModel: () => undefined },
+			},
+		} as unknown as AgentSessionRuntime;
+		const statuses: string[] = [];
+		const router = new OpenTUICommandRouter({
+			host: { current: runtime, createNew: async () => {} },
+			getUI: () => undefined,
+			onStatus: (message) => statuses.push(message),
+			onFocusConversations: vi.fn(),
+			onQuit: vi.fn(),
+		});
+
+		await router.route("/name");
+
+		expect(generateTitle).toHaveBeenCalledWith(model);
+		expect(setSessionName).toHaveBeenCalledWith("Generated title");
+		expect(statuses.at(-1)).toBe("Conversation name set: Generated title");
+	});
+
+	test("routes ! and !! through executeBash with context semantics", async () => {
+		const { router, executeBash } = createHarness();
+		expect(await router.route("! pwd")).toEqual({ handled: true, kind: "bash" });
+		expect(await router.route("!! secret-command")).toEqual({ handled: true, kind: "bash" });
+		expect(executeBash).toHaveBeenNthCalledWith(1, "pwd", undefined, { excludeFromContext: false });
+		expect(executeBash).toHaveBeenNthCalledWith(2, "secret-command", undefined, { excludeFromContext: true });
+	});
+
+	test("completes from the fixed built-in command catalog", async () => {
+		const { router } = createHarness();
+		const provider = router.createAutocompleteProvider("/tmp");
+		const settings = await provider.getSuggestions(["/set"], 0, 4, {
+			signal: new AbortController().signal,
+			force: true,
+		});
+		expect(settings?.items.map((item) => item.value)).toContain("settings");
+		const suggestions = await provider.getSuggestions(["/mod"], 0, 4, { signal: new AbortController().signal });
+		expect(suggestions?.items.some((item) => item.value === "model")).toBe(true);
+		const completion = provider.applyCompletion(["/mod"], 0, 4, { value: "model", label: "model" }, "/mod");
+		expect(completion.lines[0]).toBe("/model ");
+	});
+
+	test("includes extension, prompt, and skill commands in autocomplete", async () => {
+		const { router, session } = createHarness();
+		(session as AgentSession & { getSlashCommands: AgentSession["getSlashCommands"] }).getSlashCommands = () => [
+			{
+				name: "review-worktree",
+				description: "Review local changes",
+				source: "extension",
+				sourceInfo: {
+					path: "/tmp/review.ts",
+					source: "extension",
+					scope: "temporary",
+					origin: "top-level",
+				},
+			},
+		];
+		const provider = router.createAutocompleteProvider("/tmp");
+		const suggestions = await provider.getSuggestions(["/review"], 0, 7, {
+			signal: new AbortController().signal,
+		});
+		expect(suggestions?.items.some((item) => item.value === "review-worktree")).toBe(true);
+	});
+
+	test("maintains a multi-model cycling scope", async () => {
+		const first = { provider: "test", id: "first", name: "First" };
+		const second = { provider: "test", id: "second", name: "Second" };
+		const setScopedModels = vi.fn();
+		const session = {
+			scopedModels: [],
+			modelRuntime: { getAvailable: async () => [first, second] },
+			setScopedModels,
+		} as unknown as AgentSession;
+		const runtime = { session, cwd: "/tmp" } as AgentSessionRuntime;
+		const select = vi
+			.fn()
+			.mockResolvedValueOnce("test/first")
+			.mockResolvedValueOnce("test/second")
+			.mockResolvedValueOnce("__done__");
+		const ui = { available: true, dialogs: { select } } as unknown as ExtensionUIV2Context;
+		const router = new OpenTUICommandRouter({
+			host: { current: runtime, createNew: async () => {} },
+			getUI: () => ui,
+			onStatus: vi.fn(),
+			onFocusConversations: vi.fn(),
+			onQuit: vi.fn(),
+		});
+
+		await router.route("/scoped-models");
+		expect(setScopedModels).toHaveBeenCalledWith([{ model: first }, { model: second }]);
+	});
+
+	test("opens the transactional settings center", async () => {
+		const root = mkdtempSync(join(tmpdir(), "bone-settings-center-"));
+		const replaceScope = vi.fn(async () => {});
+		const session = {
+			modelRuntime: {
+				getModelsJson: () => ({ providers: {} }),
+				reloadConfig: vi.fn(async () => {}),
+			},
+		} as unknown as AgentSession;
+		const runtime = {
+			session,
+			cwd: root,
+			services: {
+				agentDir: root,
+				settingsManager: {
+					getGlobalSettings: () => ({}),
+					getProjectSettings: () => ({}),
+					isProjectTrusted: () => true,
+					replaceScope,
+					reload: vi.fn(async () => {}),
+				},
+			},
+		} as unknown as AgentSessionRuntime;
+		const select = vi
+			.fn()
+			.mockResolvedValueOnce("Context & Delivery")
+			.mockResolvedValueOnce("hideThinkingBlock")
+			.mockResolvedValueOnce("true")
+			.mockResolvedValueOnce("back")
+			.mockResolvedValueOnce("__save_settings__");
+		const ui = { available: true, dialogs: { select } } as unknown as ExtensionUIV2Context;
+		const router = new OpenTUICommandRouter({
+			host: { current: runtime, createNew: async () => {} },
+			getUI: () => ui,
+			onStatus: vi.fn(),
+			onFocusConversations: vi.fn(),
+			onQuit: vi.fn(),
+		});
+
+		try {
+			await router.route("/settings");
+			expect(select.mock.calls[0]?.[0]).toMatchObject({
+				footer: "Ctrl+S save · Esc discard",
+				shortcuts: [{ action: "save", value: "__save_settings__" }],
+			});
+			expect(select.mock.calls[0]?.[0].options).not.toEqual(
+				expect.arrayContaining([expect.objectContaining({ value: "save" })]),
+			);
+			expect(replaceScope).toHaveBeenCalledWith("global", { hideThinkingBlock: true });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});

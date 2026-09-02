@@ -1,0 +1,1926 @@
+import { basename, resolve } from "node:path";
+import type { ImageContent } from "@frelion/bone-ai";
+import { type LocalEmbeddingStatus, MemoryRuntime } from "@frelion/bone-memory";
+import { type AutocompleteProvider, createRenderer, OverlayManager } from "@frelion/bone-tui";
+import { type CliRenderer, type KeyEvent, type Renderable, TextAttributes, TextRenderable } from "@opentui/core";
+import type { AgentSessionEvent, PromptOptions } from "../../core/agent-session.ts";
+import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
+import { rememberLastActiveConversation } from "../../core/conversation-state.ts";
+import type { ActionItem, ExchangeProjection } from "../../core/exchange/index.ts";
+import type { ExtensionUIV2Context, ExtensionUIViewHandle } from "../../core/extensions/ui-v2.ts";
+import { FooterDataProvider } from "../../core/footer-data-provider.ts";
+import type {
+	InteractiveSessionHostHooks,
+	InteractiveSessionSummary,
+	RuntimeEventEnvelope,
+	RuntimeStreamSnapshot,
+} from "../../core/interactive-session-host.ts";
+import type { PlanProposal } from "../../core/plan-mode.ts";
+import type { QuestionRequest } from "../../core/question.ts";
+import type { SubagentProjection } from "../../core/subagents/index.ts";
+import { resolveTaskModel } from "../../core/task-model-router.ts";
+import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
+import { OpenTUITopBar, OpenTUIWelcome } from "./components/opentui-chrome.ts";
+import { OpenTUIClickCoordinator } from "./components/opentui-click.ts";
+import { OpenTUIComposer, type OpenTUIComposerStatus } from "./components/opentui-composer.ts";
+import { OpenTUIHistoryNavigator, type OpenTUIHistoryNavigatorMode } from "./components/opentui-history-navigator.ts";
+import { OpenTUIInlinePrompt, type OpenTUIInlinePromptRequest } from "./components/opentui-inline-prompt.ts";
+import { OpenTUIMultiPicker, type OpenTUIMultiPickerRequest } from "./components/opentui-multi-picker.ts";
+import { OpenTUIPlanReview, type OpenTUIPlanReviewResult } from "./components/opentui-plan-review.ts";
+import {
+	OpenTUIQuestionnaire,
+	type OpenTUIQuestionnaireDraft,
+	type OpenTUIQuestionnaireResult,
+} from "./components/opentui-questionnaire.ts";
+import { OpenTUIQuickPicker, type OpenTUIQuickPickerRequest } from "./components/opentui-quick-picker.ts";
+import { OpenTUIStatusView } from "./components/opentui-rich-messages.ts";
+import { OpenTUISessionSidebar } from "./components/opentui-session-sidebar.ts";
+import { OpenTUISettingsPage } from "./components/opentui-settings-page.ts";
+import { OpenTUITranscriptFactory } from "./components/opentui-transcript-factory.ts";
+import {
+	OpenTUITranscriptFocusController,
+	type OpenTUITranscriptFocusState,
+} from "./components/opentui-transcript-focus.ts";
+import { OpenTUIPaneNavigator } from "./components/pane-navigator.ts";
+import { OpenTUICommandRouter } from "./opentui-command-router.ts";
+import { OpenTUIExtensionHost } from "./opentui-extension-host.ts";
+import { matchesOpenTUIAction } from "./opentui-keymap.ts";
+import { OpenTUIInteractiveShell } from "./opentui-shell.ts";
+import { theme } from "./theme/theme.ts";
+
+const SIDEBAR_PAGE_SIZE = 40;
+const TRANSCRIPT_PAGE_ENTRIES = 100;
+const LEXICAL_SEARCH_DELAY_MS = 80;
+const SEMANTIC_SEARCH_DELAY_MS = 250;
+const STREAM_UPDATE_FRAME_MS = 16;
+
+type OpenTUIMemoryRuntime = Pick<
+	MemoryRuntime,
+	"start" | "recordPersistedEntries" | "removeSession" | "search" | "searchSemantic" | "dispose"
+>;
+
+interface OpenTUIMemoryRuntimeOptions {
+	agentDir: string;
+	cwd: string;
+	onStatus: (status: ReturnType<MemoryRuntime["getStatus"]>) => void;
+	onEmbeddingStatus: (status: LocalEmbeddingStatus | undefined) => void;
+	onSearchRefresh: () => void;
+}
+
+interface ConversationViewState {
+	draft: string;
+	scrollTop: number;
+	transcriptFocus: OpenTUITranscriptFocusState;
+}
+
+interface TranscriptPageState {
+	startIndex: number;
+	loading: boolean;
+}
+
+interface PendingSessionUpdate {
+	runtime: AgentSessionRuntime;
+	event: AgentSessionEvent;
+	generation: number;
+}
+
+export function getOpenTUITranscriptPageStart(
+	entries: readonly { type: string; message?: { role?: string } }[],
+	endIndex = entries.length,
+): number {
+	let startIndex = Math.max(0, endIndex - TRANSCRIPT_PAGE_ENTRIES);
+	while (startIndex > 0) {
+		const entry = entries[startIndex];
+		if (entry?.type === "message" && entry.message?.role === "user") break;
+		startIndex--;
+	}
+	return startIndex;
+}
+
+export interface OpenTUISessionHostContract {
+	readonly current: AgentSessionRuntime;
+	setHooks(hooks: InteractiveSessionHostHooks): void;
+	prompt(runtime: AgentSessionRuntime, text: string, options?: PromptOptions): Promise<void>;
+	activate(sessionPath: string): Promise<void>;
+	createNew(): Promise<void>;
+	deleteSession(sessionPath: string, replacementSessionPath?: string): Promise<unknown>;
+	listPage(
+		offset: number,
+		limit: number,
+	): Promise<{ sessions: InteractiveSessionSummary[]; total: number; hasMore: boolean; nextOffset: number }>;
+	getSessionState(sessionPath: string): InteractiveSessionSummary["state"];
+	getSessionPresentation(
+		sessionPath: string,
+	): Pick<
+		InteractiveSessionSummary,
+		"state" | "livePreview" | "throughputTokensPerSecond" | "messageCount" | "modified"
+	>;
+	getSessionSummaries(paths: readonly string[]): Promise<InteractiveSessionSummary[]>;
+	getRuntimeStreamSnapshot?(runtime: AgentSessionRuntime): RuntimeStreamSnapshot;
+	subscribeRuntime?(runtime: AgentSessionRuntime, listener: (envelope: RuntimeEventEnvelope) => void): () => void;
+	refreshForeground?(task: (runtime: AgentSessionRuntime) => Promise<void>): Promise<void>;
+	disposeAll(): Promise<void>;
+}
+
+export interface OpenTUIExtensionBinding {
+	readonly context: ExtensionUIV2Context;
+	getToolRenderer?: OpenTUIExtensionHost["getToolRenderer"];
+	dispose(): void;
+}
+
+export interface OpenTUIInteractiveModeOptions {
+	migratedProviders?: string[];
+	modelFallbackMessage?: string;
+	autoTrustOnReloadCwd?: string;
+	initialMessage?: string;
+	initialImages?: ImageContent[];
+	initialMessages?: string[];
+	autocompleteProvider?: AutocompleteProvider;
+	createRenderer?: () => Promise<CliRenderer>;
+	createTranscriptFactory?: (renderer: CliRenderer) => OpenTUITranscriptFactory;
+	bindExtensionUI?: (runtime: AgentSessionRuntime, renderer: CliRenderer) => OpenTUIExtensionBinding;
+	createMemoryRuntime?: (options: OpenTUIMemoryRuntimeOptions) => OpenTUIMemoryRuntime;
+	installSignalHandlers?: boolean;
+	verbose?: boolean;
+	waitForStreamUpdateFrame?: () => Promise<void>;
+}
+
+function messageText(message: { content?: unknown }): string {
+	if (!("content" in message)) return "";
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return "";
+	return message.content
+		.filter(
+			(part): part is { type: "text"; text: string } =>
+				typeof part === "object" &&
+				part !== null &&
+				"type" in part &&
+				part.type === "text" &&
+				"text" in part &&
+				typeof part.text === "string",
+		)
+		.map((part) => part.text)
+		.join("\n");
+}
+
+interface ActionProjectionSlice {
+	exchangeId: string | undefined;
+	actions: readonly ActionItem[];
+}
+
+function actionProjectionSlice(projection: ExchangeProjection): ActionProjectionSlice {
+	const activeExchange = projection.exchanges.find((exchange) => exchange.id === projection.activeExchangeId);
+	return {
+		exchangeId: activeExchange?.id,
+		actions: activeExchange?.items.filter((item): item is ActionItem => item.type === "action") ?? [],
+	};
+}
+
+function sameActionProjection(left: ActionProjectionSlice, right: ActionProjectionSlice): boolean {
+	return (
+		left.exchangeId === right.exchangeId &&
+		left.actions.length === right.actions.length &&
+		left.actions.every((action, index) => action === right.actions[index])
+	);
+}
+
+function activeProjectedActionId(projection: ExchangeProjection): string | undefined {
+	return actionProjectionSlice(projection).actions.find((action) => action.status === "in_progress")?.id;
+}
+
+/** Production OpenTUI owner for one foreground interactive session. */
+export class OpenTUIInteractiveMode {
+	private readonly sessionHost: OpenTUISessionHostContract;
+	private readonly options: OpenTUIInteractiveModeOptions;
+	private readonly waitForStreamUpdateFrame: () => Promise<void>;
+	private readonly clicks = new OpenTUIClickCoordinator();
+	private transcriptFactory!: OpenTUITranscriptFactory;
+	private readonly commandRouter: OpenTUICommandRouter;
+	private readonly memory: OpenTUIMemoryRuntime;
+	private renderer: CliRenderer | undefined;
+	private shell: OpenTUIInteractiveShell | undefined;
+	private composer: OpenTUIComposer | undefined;
+	private topBar: OpenTUITopBar | undefined;
+	private welcome: OpenTUIWelcome | undefined;
+	private sidebar: OpenTUISessionSidebar | undefined;
+	private paneFocus: OpenTUIPaneNavigator | undefined;
+	private overlayManager: OverlayManager | undefined;
+	private transcriptFocus: OpenTUITranscriptFocusController | undefined;
+	private transcriptUpdatesBanner: TextRenderable | undefined;
+	private status: OpenTUIStatusView | undefined;
+	private unsubscribeSession: (() => void) | undefined;
+	private unsubscribeProjection: (() => void) | undefined;
+	private unsubscribeSubagentProjection: (() => void) | undefined;
+	private unsubscribeApplicationKeys: (() => void) | undefined;
+	private extensionBinding: OpenTUIExtensionBinding | undefined;
+	private signalCleanups: Array<() => void> = [];
+	private eventTail: Promise<void> = Promise.resolve();
+	private readonly pendingSessionUpdates = new Map<string, PendingSessionUpdate>();
+	private submissionTail: Promise<void> = Promise.resolve();
+	private readonly runtimeSubmissionTails = new WeakMap<AgentSessionRuntime, Promise<void>>();
+	private readonly automaticTitleGeneration = new WeakSet<AgentSessionRuntime>();
+	private readonly interactionTasks = new Set<Promise<void>>();
+	private readonly planFeedbackDrafts = new Map<string, string>();
+	private readonly questionDrafts = new Map<string, OpenTUIQuestionnaireDraft>();
+	private footerData: FooterDataProvider | undefined;
+	private sidebarSessions: InteractiveSessionSummary[] = [];
+	private sidebarOffset = 0;
+	private sidebarHasMore = false;
+	private sidebarRefreshGeneration = 0;
+	private sessionSearchTimer: ReturnType<typeof setTimeout> | undefined;
+	private semanticSearchTimer: ReturnType<typeof setTimeout> | undefined;
+	private sessionSearchGeneration = 0;
+	private memoryStartup: Promise<void> = Promise.resolve();
+	private readonly conversationViewStates = new WeakMap<AgentSessionRuntime, ConversationViewState>();
+	private readonly conversationViewStatesByPath = new Map<string, ConversationViewState>();
+	private readonly transcriptPages = new WeakMap<AgentSessionRuntime, TranscriptPageState>();
+	private autoTrustOnReloadCwd: string | undefined;
+	private foregroundGeneration = 0;
+	private reviewingPlanProposalId: string | undefined;
+	private reviewingQuestionRequestId: string | undefined;
+	private allToolDetailsExpanded = false;
+	private planInteractionAbort: AbortController | undefined;
+	private questionInteractionAbort: AbortController | undefined;
+	private planReview: OpenTUIPlanReview | undefined;
+	private questionnaire: OpenTUIQuestionnaire | undefined;
+	private quickPicker: { handleKey(event: KeyEvent): boolean } | undefined;
+	private dismissQuickPicker: (() => void) | undefined;
+	private settingsPage: OpenTUISettingsPage | undefined;
+	private dismissSettingsPage: (() => void) | undefined;
+	private historyNavigator: OpenTUIHistoryNavigator | undefined;
+	private dismissHistoryNavigator: (() => void) | undefined;
+	private multiPicker: { handleKey(event: KeyEvent): boolean } | undefined;
+	private dismissMultiPicker: (() => void) | undefined;
+	private inlinePrompt: { handleKey(event: KeyEvent): boolean } | undefined;
+	private dismissInlinePrompt: (() => void) | undefined;
+	private initialized = false;
+	private stopping = false;
+	private cleanupPromise: Promise<void> | undefined;
+	private renderTail: Promise<void> = Promise.resolve();
+	private toolAnchorAdjustmentGeneration = 0;
+	private resolveShutdown: (() => void) | undefined;
+	private readonly shutdown = new Promise<void>((resolve) => {
+		this.resolveShutdown = resolve;
+	});
+
+	constructor(sessionHost: OpenTUISessionHostContract, options: OpenTUIInteractiveModeOptions = {}) {
+		this.sessionHost = sessionHost;
+		this.options = options;
+		this.waitForStreamUpdateFrame =
+			options.waitForStreamUpdateFrame ??
+			(async () => await new Promise<void>((resolve) => setTimeout(resolve, STREAM_UPDATE_FRAME_MS)));
+		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
+		const memoryOptions: OpenTUIMemoryRuntimeOptions = {
+			agentDir: sessionHost.current.services.agentDir,
+			cwd: sessionHost.current.session.sessionManager.getCwd(),
+			onStatus: (status) => {
+				if (status.phase === "preparing") this.setSidebarSearchStatus(status.message);
+				if (status.phase === "unavailable") {
+					this.setSidebarSearchStatus(status.message ?? "Keyword search · semantic search unavailable");
+				}
+			},
+			onEmbeddingStatus: (status) => this.setSidebarSearchStatus(this.formatSemanticSearchStatus(status)),
+			onSearchRefresh: () => {
+				const query = this.sidebar?.searchQuery;
+				if (query?.trim()) this.scheduleSidebarSearch(query, 0);
+			},
+		};
+		this.memory = options.createMemoryRuntime?.(memoryOptions) ?? new MemoryRuntime(memoryOptions);
+		this.commandRouter = new OpenTUICommandRouter({
+			host: sessionHost,
+			getUI: () => this.extensionBinding?.context,
+			onStatus: (message) => {
+				this.status?.setMessage(message);
+				this.status?.stop();
+				this.renderer?.requestRender();
+			},
+			onFocusConversations: () => this.paneFocus?.focus("sidebar"),
+			onQuit: () => this.stop(),
+			onReloaded: () => this.maybeSaveImplicitProjectTrustAfterReload(),
+			onPresentationChanged: () => this.refreshPresentation(),
+			onSessionListChanged: () => this.refreshSidebar(),
+			pick: (runtime, request) => this.showQuickPicker(runtime, request),
+			openSettings: (runtime, run) => this.showSettingsPage(runtime, run),
+			openHistory: (runtime, mode) => this.showHistoryNavigator(runtime, mode),
+			multiPick: (runtime, request) => this.showMultiPicker(runtime, request),
+			input: (runtime, request) => this.showInlinePrompt(runtime, request),
+		});
+		this.sessionHost.setHooks({
+			beforeForegroundChange: async (runtime) => this.unbindForeground(runtime),
+			foregroundChanged: async (runtime) => this.bindForeground(runtime),
+			stateChanged: (structureChanged) => {
+				if (structureChanged) void this.refreshSidebar();
+				else this.refreshSidebarStates();
+			},
+			runtimeDisposed: (runtime) => {
+				this.conversationViewStates.delete(runtime);
+				this.transcriptPages.delete(runtime);
+			},
+			persistedEntries: async (runtime, entries) => {
+				const sessionPath = runtime.session.sessionFile;
+				if (!sessionPath) return;
+				const manager = runtime.session.sessionManager;
+				await this.memory.recordPersistedEntries(
+					{ path: sessionPath, id: manager.getSessionId(), name: manager.getSessionName() },
+					entries,
+				);
+				if (entries.some((entry) => entry.type === "message" && entry.message.role === "user")) {
+					this.launchInteraction(() => this.maybeGenerateConversationName(runtime));
+					this.launchInteraction(() => this.refreshSidebar());
+				}
+			},
+			runCompleted: async (runtime) => {
+				if (runtime !== this.sessionHost.current) this.recordBackgroundCompletion(runtime);
+				await this.refreshSidebar();
+			},
+		});
+	}
+
+	async init(): Promise<void> {
+		if (this.initialized) return;
+		this.renderer = await (this.options.createRenderer ?? (() => createRenderer()))();
+		this.transcriptFactory =
+			this.options.createTranscriptFactory?.(this.renderer) ?? new OpenTUITranscriptFactory(this.renderer);
+		this.overlayManager = new OverlayManager(this.renderer);
+		const settingsManager = this.sessionHost.current.services.settingsManager;
+		this.shell = new OpenTUIInteractiveShell(this.renderer, { sidebarWidth: settingsManager.getSidebarWidth() });
+		this.shell.root.onMouse = (event) => {
+			if (this.clicks.handle(event) && event.type === "down") this.renderer?.clearSelection();
+		};
+		this.shell.onSidebarWidthChange = (width) => settingsManager.setSidebarWidth(width);
+		this.renderer.root.add(this.shell.root);
+
+		this.sidebar = new OpenTUISessionSidebar(this.renderer);
+		this.shell.setSidebar(this.sidebar.root);
+
+		this.status = new OpenTUIStatusView(this.renderer, "working", "Ready");
+		this.status.stop();
+		const regions = this.shell.getExtensionRegions();
+		this.topBar = new OpenTUITopBar(this.renderer, this.getTopBarState(this.sessionHost.current));
+		regions.header.add(this.topBar.root);
+		regions.aboveEditor.add(this.status.root);
+		this.transcriptUpdatesBanner = new TextRenderable(this.renderer, {
+			content: "",
+			paddingX: 1,
+			fg: theme.getFgColor("accent"),
+		});
+		const transcriptUpdatesBanner = this.transcriptUpdatesBanner;
+		transcriptUpdatesBanner.onMouseOver = () => {
+			transcriptUpdatesBanner.attributes = TextAttributes.UNDERLINE;
+		};
+		transcriptUpdatesBanner.onMouseOut = () => {
+			transcriptUpdatesBanner.attributes = TextAttributes.NONE;
+		};
+		this.clicks.register(this.transcriptUpdatesBanner, () => this.transcriptFocus?.jumpToLatest(), this.renderer);
+		this.transcriptUpdatesBanner.visible = false;
+		regions.aboveEditor.add(this.transcriptUpdatesBanner);
+		this.composer = new OpenTUIComposer(this.renderer, {
+			status: this.getComposerStatus(this.sessionHost.current),
+			autocompleteProvider: this.options.autocompleteProvider ?? this.commandRouter.createAutocompleteProvider(),
+			onSubmit: (text) => {
+				const runtime = this.sessionHost.current;
+				this.dispatchSubmission(text, undefined, runtime);
+			},
+			onCancel: () => void this.interruptActiveSession(),
+		});
+		regions.editor.add(this.composer.root);
+
+		this.paneFocus = new OpenTUIPaneNavigator(this.renderer, (pane) =>
+			this.shell?.showPane(pane === "sidebar" ? "sidebar" : "main"),
+		);
+		const sidebar = this.sidebar;
+		const composer = this.composer;
+		const paneFocus = this.paneFocus;
+		if (!sidebar || !composer || !paneFocus) throw new Error("OpenTUI panes did not initialize");
+		this.composer.onFocusRequest = () => this.paneFocus?.focus("composer");
+		this.transcriptFocus = new OpenTUITranscriptFocusController(
+			this.shell.getTranscriptNode(),
+			() => this.renderer?.height ?? 24,
+		);
+		this.transcriptFocus.onNearOldestContent = () => this.loadEarlierTranscriptPage();
+		this.transcriptFocus.onStateChange = (state) => this.updateTranscriptUpdatesBanner(state);
+		this.shell.onTranscriptScrollRequest = (delta) => this.transcriptFocus?.scrollByUser(delta);
+		this.shell.transcript.onMouseScroll = (event) => {
+			const scroll = event.scroll;
+			if (scroll && (scroll.direction === "up" || scroll.direction === "down")) {
+				this.transcriptFocus?.handleNativeMouseScroll(scroll.direction, scroll.delta);
+			}
+		};
+		this.shell.onTranscriptContentChange = () => {
+			if (this.transcriptFocus?.isAutoFollowing()) this.transcriptFocus.followLatest();
+		};
+		paneFocus.register("sidebar", {
+			root: sidebar.root,
+			focusTarget: () => sidebar.focusTarget,
+			onFocusChange: (focused) => this.sidebar?.setFocused(focused),
+		});
+		paneFocus.register("composer", {
+			root: composer.root,
+			focusTarget: () => composer.focusNode,
+		});
+		const applicationKeyHandler = (event: KeyEvent) => {
+			if (this.overlayManager?.active) return;
+			if (matchesOpenTUIAction(event, "toggleToolDetails")) {
+				event.preventDefault();
+				event.stopPropagation();
+				this.allToolDetailsExpanded = !this.allToolDetailsExpanded;
+				this.transcriptFactory.setAllToolDetailsExpanded(this.allToolDetailsExpanded);
+				this.renderer?.requestRender();
+				return;
+			}
+			if (this.questionnaire) {
+				this.questionnaire.handleKey(event);
+				return;
+			}
+			if (this.planReview) {
+				this.planReview.handleKey(event);
+				return;
+			}
+			if (this.quickPicker) {
+				this.quickPicker.handleKey(event);
+				return;
+			}
+			if (this.settingsPage) {
+				this.settingsPage.handleKey(event);
+				return;
+			}
+			if (this.historyNavigator) {
+				this.historyNavigator.handleKey(event);
+				return;
+			}
+			if (this.multiPicker) {
+				this.multiPicker.handleKey(event);
+				return;
+			}
+			if (this.inlinePrompt) {
+				this.inlinePrompt.handleKey(event);
+				return;
+			}
+			if (this.paneFocus?.focusedPane === "sidebar") {
+				this.sidebar?.handleKey(event);
+				return;
+			}
+			if (this.paneFocus?.focusedPane !== "composer") return;
+			if (matchesOpenTUIAction(event, "jumpToLatest")) {
+				event.preventDefault();
+				event.stopPropagation();
+				this.transcriptFocus?.jumpToLatest();
+				return;
+			}
+			if (matchesOpenTUIAction(event, "focusLeft")) {
+				event.preventDefault();
+				event.stopPropagation();
+				this.paneFocus.focus("sidebar");
+				return;
+			}
+			if (matchesOpenTUIAction(event, "composerQueue")) {
+				event.preventDefault();
+				event.stopPropagation();
+				const value = this.composer?.value ?? "";
+				if (value.trim()) {
+					const runtime = this.sessionHost.current;
+					this.dispatchSubmission(value, { streamingBehavior: "followUp" }, runtime);
+				}
+				return;
+			}
+			this.composer?.handleKey(event);
+			if (matchesOpenTUIAction(event, "clear")) {
+				event.preventDefault();
+				event.stopPropagation();
+				this.clearComposer();
+			} else if (matchesOpenTUIAction(event, "exit") && !this.composer?.value) {
+				event.preventDefault();
+				event.stopPropagation();
+				this.stop();
+			}
+		};
+		this.renderer.keyInput.on("keypress", applicationKeyHandler);
+		this.unsubscribeApplicationKeys = () => this.renderer?.keyInput.off("keypress", applicationKeyHandler);
+
+		this.sidebar.onFocusRequest = () => this.paneFocus?.focus("sidebar");
+		// Search replaces the sidebar's focus target with a native textarea.
+		// Re-run the navigator after the subtree is rebuilt so typing starts
+		// immediately and Esc restores focus to the native sidebar root.
+		this.sidebar.onSearchStateChange = () => this.paneFocus?.focus("sidebar");
+		this.sidebar.onFocusChat = () => this.paneFocus?.focus("composer");
+		this.sidebar.onScrollChat = (direction) => this.shell?.scrollTranscript(direction === "up" ? -10 : 10);
+		this.sidebar.onActivateSession = (path) => void this.runAction(() => this.sessionHost.activate(path));
+		this.sidebar.onDeleteSession = (path, replacement) =>
+			void this.runAction(async () => {
+				await this.sessionHost.deleteSession(path, replacement);
+				this.conversationViewStatesByPath.delete(path);
+				await this.memory.removeSession(path);
+				await this.refreshSidebar();
+			});
+		this.sidebar.onSearchQueryChange = (query) => this.scheduleSidebarSearch(query);
+		this.sidebar.onLoadMore = () => void this.loadMoreSessions();
+		this.sidebar.onInterrupt = () => this.clearComposer();
+		this.sidebar.onExit = () => this.stop();
+
+		this.renderer.start();
+		await this.bindForeground(this.sessionHost.current);
+		await this.refreshSidebar();
+		this.memoryStartup = this.memory.start(this.sidebarSessions).catch((error: unknown) => {
+			this.setSidebarSearchStatus("Local memory unavailable · conversations remain usable");
+			this.showInteractionError(error);
+		});
+		this.installSignals();
+		this.paneFocus.focus("composer");
+		this.initialized = true;
+		this.schedulePendingInteractions(this.sessionHost.current);
+		this.showStartupNotices();
+		await this.submitInitialMessages();
+	}
+
+	async run(): Promise<void> {
+		await this.init();
+		await this.shutdown;
+		await this.cleanup();
+	}
+
+	stop(): void {
+		if (this.stopping) return;
+		this.stopping = true;
+		this.resolveShutdown?.();
+		this.resolveShutdown = undefined;
+		this.cleanupPromise = this.cleanup();
+	}
+
+	async idle(): Promise<void> {
+		await this.memoryStartup;
+		while (true) {
+			const submissionTail = this.submissionTail;
+			const eventTail = this.eventTail;
+			const interactionTasks = [...this.interactionTasks];
+			await submissionTail;
+			await eventTail;
+			await Promise.all(interactionTasks);
+			const currentInteractionTasks = [...this.interactionTasks];
+			if (
+				submissionTail === this.submissionTail &&
+				eventTail === this.eventTail &&
+				currentInteractionTasks.length === interactionTasks.length &&
+				currentInteractionTasks.every((task) => interactionTasks.includes(task))
+			) {
+				return;
+			}
+		}
+	}
+
+	focusComposer(): void {
+		this.paneFocus?.focus("composer");
+	}
+
+	private async bindForeground(runtime: AgentSessionRuntime): Promise<void> {
+		if (!this.shell || !this.renderer) return;
+		const generation = this.foregroundGeneration;
+		let replaying = true;
+		let snapshotRevision = 0;
+		let fallbackRevision = 0;
+		let latestProjection = runtime.session.exchangeProjection;
+		let latestSubagentProjection = runtime.session.subagentProjection;
+		let projectedActions = actionProjectionSlice(latestProjection);
+		const pendingEvents: RuntimeEventEnvelope[] = [];
+		const enqueueEvent = (envelope: RuntimeEventEnvelope) => {
+			if (replaying) {
+				pendingEvents.push(envelope);
+				return;
+			}
+			if (envelope.revision <= snapshotRevision) return;
+			snapshotRevision = envelope.revision;
+			this.queueSessionEvent(runtime, envelope.event, generation);
+		};
+		this.unsubscribeSession = this.sessionHost.subscribeRuntime
+			? this.sessionHost.subscribeRuntime(runtime, enqueueEvent)
+			: runtime.session.subscribe((event) =>
+					enqueueEvent({ runtime, revision: ++fallbackRevision, generationId: undefined, event }),
+				);
+		this.unsubscribeProjection = runtime.session.subscribeExchangeProjection((projection) => {
+			const nextActions = actionProjectionSlice(projection);
+			if (sameActionProjection(projectedActions, nextActions)) return;
+			projectedActions = nextActions;
+			latestProjection = projection;
+			if (!replaying) this.queueExchangeProjection(runtime, projection, generation);
+		});
+		this.unsubscribeSubagentProjection = runtime.session.subscribeSubagentProjection((projection) => {
+			latestSubagentProjection = projection;
+			if (!replaying) this.queueSubagentProjection(runtime, projection, generation);
+		});
+		this.shell.clearTranscript();
+		const entries = runtime.session.sessionManager.getEntries();
+		this.transcriptPages.set(runtime, {
+			startIndex: getOpenTUITranscriptPageStart(entries),
+			loading: false,
+		});
+		const history: string[] = [];
+		for (const entry of entries) {
+			if (entry.type === "message" && entry.message.role === "user") history.unshift(messageText(entry.message));
+		}
+		this.composer?.setHistory(history);
+		const viewState = this.getConversationViewState(runtime);
+		this.composer?.setValue(viewState?.draft ?? "");
+		this.transcriptFocus?.restoreState(
+			viewState?.transcriptFocus ?? { following: true, unseenUpdateCount: 0, latestUpdateKind: undefined },
+		);
+		this.shell.getTranscriptNode().scrollTop = viewState?.scrollTop ?? Number.MAX_SAFE_INTEGER;
+		this.extensionBinding = this.options.bindExtensionUI
+			? this.options.bindExtensionUI(runtime, this.renderer)
+			: this.createDefaultExtensionBinding(runtime, this.renderer);
+		if (this.extensionBinding) {
+			await runtime.session.bindExtensions({
+				uiV2Context: this.extensionBinding.context,
+				mode: "tui",
+				abortHandler: () => void this.interruptActiveSession(),
+				commandContextActions: {
+					waitForIdle: () => runtime.session.waitForIdle(),
+					newSession: async (options) => {
+						await runtime.newSession(options);
+						return { cancelled: false };
+					},
+					fork: async (entryId, options) => {
+						const result = await runtime.fork(entryId, options);
+						if (!result.cancelled && result.selectedText && !this.composer?.value.trim()) {
+							this.composer?.setValue(result.selectedText);
+						}
+						return { cancelled: result.cancelled };
+					},
+					navigateTree: async (targetId, options) => {
+						const result = await runtime.session.navigateTree(targetId, options);
+						if (!result.cancelled && result.editorText && !this.composer?.value.trim()) {
+							this.composer?.setValue(result.editorText);
+						}
+						return { cancelled: result.cancelled };
+					},
+					switchSession: async (sessionPath, options) => runtime.switchSession(sessionPath, options),
+					reload: async () => {
+						await runtime.session.reload();
+						this.maybeSaveImplicitProjectTrustAfterReload();
+					},
+				},
+				shutdownHandler: async () => this.stop(),
+				onError: (error) => this.showInteractionError(error.error),
+			});
+		}
+		this.composer?.setAutocompleteProvider(
+			this.options.autocompleteProvider ?? this.commandRouter.createAutocompleteProvider(runtime.cwd),
+		);
+		this.composer?.updateStatus(this.getComposerStatus(runtime));
+		this.updateComposerInteractionState(runtime);
+		this.updateQueuedMessages(runtime.session.getSteeringMessages(), runtime.session.getFollowUpMessages());
+		const historySnapshot = await this.renderTranscript(
+			runtime,
+			generation,
+			() =>
+				this.sessionHost.getRuntimeStreamSnapshot?.(runtime) ?? {
+					revision: fallbackRevision,
+					generationId: undefined,
+					liveEvents: [],
+					liveEventEnvelopes: [],
+				},
+		);
+		if (!this.isCurrentForeground(runtime, generation)) return;
+		// Read again after history rendering. Persistence acknowledgements may have
+		// removed events that are now represented by durable SessionEntries.
+		const replaySnapshot = this.sessionHost.getRuntimeStreamSnapshot?.(runtime) ?? {
+			revision: fallbackRevision,
+			generationId: undefined,
+			liveEvents: [],
+			liveEventEnvelopes: [],
+		};
+		const activeStreamGeneration = replaySnapshot.generationId ?? historySnapshot.generationId;
+		const belongsToActiveStream = (envelope: RuntimeEventEnvelope): boolean =>
+			activeStreamGeneration === undefined || envelope.generationId === activeStreamGeneration;
+		const replayEnvelopes = [
+			...historySnapshot.liveEventEnvelopes.filter(belongsToActiveStream),
+			...replaySnapshot.liveEventEnvelopes.filter(belongsToActiveStream),
+			...pendingEvents.filter(
+				(envelope) => envelope.revision > historySnapshot.revision && belongsToActiveStream(envelope),
+			),
+		].sort((left, right) => left.revision - right.revision);
+		await this.handleExchangeProjection(runtime, latestProjection, generation);
+		const replayedRevisions = new Set<string>();
+		const replayEnvelope = async (envelope: RuntimeEventEnvelope): Promise<void> => {
+			const replayKey = `${envelope.generationId ?? "legacy"}:${envelope.revision}`;
+			if (replayedRevisions.has(replayKey)) return;
+			replayedRevisions.add(replayKey);
+			await this.handleSessionEvent(runtime, envelope.event, generation);
+		};
+		for (const envelope of replayEnvelopes) await replayEnvelope(envelope);
+		if (replayEnvelopes.length === 0 && historySnapshot.liveEvents.length === 0) {
+			for (const event of replaySnapshot.liveEvents) await this.handleSessionEvent(runtime, event, generation);
+		}
+		let pendingCursor = 0;
+		while (pendingCursor < pendingEvents.length) {
+			const batch = pendingEvents.slice(pendingCursor).sort((left, right) => left.revision - right.revision);
+			pendingCursor = pendingEvents.length;
+			await this.handleExchangeProjection(runtime, latestProjection, generation);
+			await this.handleSubagentProjection(runtime, latestSubagentProjection, generation);
+			for (const envelope of batch) await replayEnvelope(envelope);
+		}
+		snapshotRevision = Math.max(replaySnapshot.revision, ...pendingEvents.map((envelope) => envelope.revision));
+		replaying = false;
+		await this.handleExchangeProjection(runtime, latestProjection, generation);
+		await this.handleSubagentProjection(runtime, latestSubagentProjection, generation);
+		this.renderer.requestRender();
+		this.topBar?.update(this.getTopBarState(runtime));
+		this.rememberActiveConversation(runtime);
+		if (this.initialized) {
+			this.schedulePendingInteractions(runtime, generation);
+			if (!this.overlayManager?.active) this.paneFocus?.focus("composer");
+		}
+	}
+
+	private queueSessionEvent(runtime: AgentSessionRuntime, event: AgentSessionEvent, generation: number): void {
+		const updateKey =
+			event.type === "message_update"
+				? `${generation}:message`
+				: event.type === "tool_execution_update"
+					? `${generation}:tool:${event.toolCallId}`
+					: undefined;
+		if (updateKey) {
+			const pending = this.pendingSessionUpdates.get(updateKey);
+			if (pending) {
+				pending.runtime = runtime;
+				pending.event = event;
+				pending.generation = generation;
+				return;
+			}
+		} else {
+			// Boundary events must remain between updates that occurred on either side.
+			this.pendingSessionUpdates.clear();
+		}
+
+		const pending = { runtime, event, generation } satisfies PendingSessionUpdate;
+		if (updateKey) this.pendingSessionUpdates.set(updateKey, pending);
+		this.eventTail = this.eventTail
+			.then(async () => {
+				if (updateKey) await this.waitForStreamUpdateFrame();
+				if (updateKey && this.pendingSessionUpdates.get(updateKey) === pending) {
+					this.pendingSessionUpdates.delete(updateKey);
+				}
+				await this.handleSessionEvent(pending.runtime, pending.event, pending.generation);
+			})
+			.catch((error: unknown) => this.showInteractionError(error));
+	}
+
+	private queueExchangeProjection(
+		runtime: AgentSessionRuntime,
+		projection: ExchangeProjection,
+		generation: number,
+	): void {
+		this.eventTail = this.eventTail
+			.then(async () => this.handleExchangeProjection(runtime, projection, generation))
+			.catch((error: unknown) => this.showInteractionError(error));
+	}
+
+	private queueSubagentProjection(
+		runtime: AgentSessionRuntime,
+		projection: SubagentProjection,
+		generation: number,
+	): void {
+		this.eventTail = this.eventTail
+			.then(async () => this.handleSubagentProjection(runtime, projection, generation))
+			.catch((error: unknown) => this.showInteractionError(error));
+	}
+
+	private async unbindForeground(runtime?: AgentSessionRuntime): Promise<void> {
+		this.toolAnchorAdjustmentGeneration++;
+		this.pendingSessionUpdates.clear();
+		if (runtime && this.composer && this.shell) {
+			const state = {
+				draft: this.composer.value,
+				scrollTop: this.shell.getTranscriptNode().scrollTop,
+				transcriptFocus: this.transcriptFocus?.getState() ?? {
+					following: true,
+					unseenUpdateCount: 0,
+					latestUpdateKind: undefined,
+				},
+			};
+			this.conversationViewStates.set(runtime, state);
+			const sessionPath = runtime.session.sessionFile;
+			if (sessionPath) this.conversationViewStatesByPath.set(sessionPath, state);
+		}
+		this.foregroundGeneration++;
+		this.planInteractionAbort?.abort();
+		this.planInteractionAbort = undefined;
+		this.questionInteractionAbort?.abort();
+		this.questionInteractionAbort = undefined;
+		this.dismissQuickPicker?.();
+		this.dismissSettingsPage?.();
+		this.dismissHistoryNavigator?.();
+		this.dismissMultiPicker?.();
+		this.dismissInlinePrompt?.();
+		this.unsubscribeSession?.();
+		this.unsubscribeSession = undefined;
+		this.unsubscribeProjection?.();
+		this.unsubscribeProjection = undefined;
+		this.unsubscribeSubagentProjection?.();
+		this.unsubscribeSubagentProjection = undefined;
+		this.extensionBinding?.dispose();
+		this.extensionBinding = undefined;
+		runtime?.session.parkExtensionUI?.();
+		this.footerData?.dispose();
+		this.footerData = undefined;
+	}
+
+	private createDefaultExtensionBinding(runtime: AgentSessionRuntime, renderer: CliRenderer): OpenTUIExtensionBinding {
+		if (!this.shell || !this.composer || !this.overlayManager) throw new Error("OpenTUI shell is not mounted");
+		this.footerData = new FooterDataProvider(runtime.cwd);
+		const host = new OpenTUIExtensionHost({
+			renderer,
+			overlayManager: this.overlayManager,
+			regions: this.shell.getExtensionRegions(),
+			editor: {
+				getText: () => this.composer?.value ?? "",
+				setText: (text) => this.composer?.setValue(text),
+				insertText: (text) => this.composer?.setValue(`${this.composer.value}${text}`),
+				focusTarget: this.composer.focusNode,
+			},
+			footerData: this.footerData,
+			onNotify: (message) => {
+				this.status?.setMessage(message);
+				this.status?.stop();
+			},
+			onTitle: (title) => process.stdout.write(`\u001b]0;${title}\u0007`),
+		});
+		return {
+			context: host.context,
+			getToolRenderer: (name) => host.getToolRenderer(name),
+			dispose: () => host.dispose(),
+		};
+	}
+
+	private async renderTranscript(
+		runtime: AgentSessionRuntime,
+		generation = this.foregroundGeneration,
+		readSnapshot: () => RuntimeStreamSnapshot = () =>
+			this.sessionHost.getRuntimeStreamSnapshot?.(runtime) ?? {
+				revision: 0,
+				generationId: undefined,
+				liveEvents: [],
+				liveEventEnvelopes: [],
+			},
+	): Promise<RuntimeStreamSnapshot> {
+		let historySnapshot = readSnapshot();
+		const render = this.renderTail
+			.catch(() => {})
+			.then(async () => {
+				if (!this.shell || !this.isCurrentForeground(runtime, generation)) return;
+				const transcriptFactory =
+					this.options.createTranscriptFactory?.(this.renderer!) ??
+					new OpenTUITranscriptFactory(this.renderer!, {
+						showImages: runtime.services.settingsManager?.getShowImages?.() ?? true,
+						hideThinkingBlock: runtime.services.settingsManager?.getHideThinkingBlock?.() ?? false,
+					});
+				// A caller may intentionally reuse one factory across foreground
+				// sessions. Clear call-scoped tool bookkeeping before replay so
+				// reused tool ids cannot update a previous session's native roots.
+				transcriptFactory.reset();
+				transcriptFactory.setResolvers({
+					cwd: runtime.cwd,
+					onToolDetailChange: (anchor, mutate) => this.changeToolDetailsAtAnchor(anchor, mutate),
+					getToolRenderer: (name) =>
+						this.extensionBinding?.getToolRenderer?.(name) ?? runtime.session.getToolDefinition?.(name)?.renderV2,
+					getMessageView: (type) => runtime.session.extensionRunner.getMessageView(type),
+					getEntryView: (type) => runtime.session.extensionRunner.getEntryView(type),
+					onError: (error, surface) => {
+						const message = error instanceof Error ? error.message : String(error);
+						runtime.session.extensionRunner.emitError({
+							extensionPath: "<ui-renderer>",
+							event: surface,
+							error: message,
+							stack: error instanceof Error ? error.stack : undefined,
+						});
+					},
+				});
+				transcriptFactory.setAllToolDetailsExpanded(this.allToolDetailsExpanded);
+				historySnapshot = readSnapshot();
+				const entries = runtime.session.sessionManager.getEntries();
+				const startIndex = this.transcriptPages.get(runtime)?.startIndex ?? 0;
+				const activeActionId = activeProjectedActionId(runtime.session.exchangeProjection);
+				const items = await transcriptFactory.createSessionEntries(entries.slice(startIndex), {
+					...(activeActionId ? { activeActionId } : {}),
+				});
+				if (!this.shell || !this.isCurrentForeground(runtime, generation)) return;
+				this.shell.clearTranscript();
+				this.welcome = undefined;
+				this.transcriptFactory = transcriptFactory;
+				for (const item of items) this.shell.appendTranscript(item.root);
+				const projectionMutation = transcriptFactory.applyExchangeProjection(runtime.session.exchangeProjection);
+				if (projectionMutation.type === "append") this.shell.appendTranscript(projectionMutation.item.root);
+				transcriptFactory.applySubagentProjection(runtime.session.subagentProjection);
+				const hasConversationMessages = entries.some(
+					(entry) =>
+						entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant"),
+				);
+				if (!hasConversationMessages) {
+					this.welcome = new OpenTUIWelcome(this.renderer!, { workspace: runtime.cwd });
+					this.shell.appendTranscript(this.welcome.root);
+				}
+			});
+		this.renderTail = render;
+		await render;
+		return historySnapshot;
+	}
+
+	private changeToolDetailsAtAnchor(anchor: Renderable, mutate: () => void): void {
+		const transcript = this.shell?.getTranscriptNode();
+		if (!transcript || anchor.isDestroyed) {
+			mutate();
+			return;
+		}
+		const generation = ++this.toolAnchorAdjustmentGeneration;
+		const screenY = anchor.screenY;
+		mutate();
+		this.renderer?.requestRender();
+
+		const correct = (): void => {
+			if (generation !== this.toolAnchorAdjustmentGeneration || anchor.isDestroyed) return;
+			const delta = anchor.screenY - screenY;
+			if (delta !== 0) transcript.scrollTo(transcript.scrollTop + delta);
+			this.renderer?.requestRender();
+		};
+		setImmediate(correct);
+		for (const delay of [50, 100, 160, 240]) {
+			const timer = setTimeout(correct, delay);
+			(timer as { unref?: () => void }).unref?.();
+		}
+	}
+
+	private loadEarlierTranscriptPage(): void {
+		const runtime = this.sessionHost.current;
+		const state = this.transcriptPages.get(runtime);
+		if (!state || state.loading || state.startIndex === 0 || !this.shell) return;
+		const entries = runtime.session.sessionManager.getEntries();
+		const nextStartIndex = getOpenTUITranscriptPageStart(entries, state.startIndex);
+		if (nextStartIndex === state.startIndex) return;
+		state.loading = true;
+
+		const generation = this.foregroundGeneration;
+		this.pendingSessionUpdates.clear();
+		const loadTask = this.eventTail.then(async () => {
+			if (!this.shell || !this.isCurrentForeground(runtime, generation)) return;
+			const transcript = this.shell.getTranscriptNode();
+			const previousScrollHeight = transcript.scrollHeight;
+			const previousScrollTop = transcript.scrollTop;
+			const snapshot = this.sessionHost.getRuntimeStreamSnapshot?.(runtime) ?? {
+				revision: 0,
+				generationId: undefined,
+				liveEvents: [],
+				liveEventEnvelopes: [],
+			};
+			state.startIndex = nextStartIndex;
+			await this.renderTranscript(runtime, generation, () => snapshot);
+			if (!this.shell || !this.isCurrentForeground(runtime, generation)) return;
+			for (const envelope of snapshot.liveEventEnvelopes) {
+				await this.handleSessionEvent(runtime, envelope.event, generation);
+			}
+			if (snapshot.liveEventEnvelopes.length === 0) {
+				for (const event of snapshot.liveEvents) await this.handleSessionEvent(runtime, event, generation);
+			}
+			this.renderer?.requestRender();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			const addedHeight = Math.max(0, transcript.scrollHeight - previousScrollHeight);
+			transcript.scrollTo(previousScrollTop + addedHeight);
+		});
+		this.eventTail = loadTask
+			.catch((error: unknown) => this.showInteractionError(error))
+			.finally(() => {
+				state.loading = false;
+			});
+	}
+
+	private async refreshPresentation(): Promise<void> {
+		this.shell?.updateTheme(theme);
+		this.sidebar?.updateTheme(theme);
+		this.composer?.updateTheme(theme);
+		this.status?.updateTheme(theme);
+		this.topBar?.updateTheme(theme);
+		this.topBar?.update(this.getTopBarState(this.sessionHost.current));
+		const runtime = this.sessionHost.current;
+		const refresh = async (target: AgentSessionRuntime) => {
+			if (target !== this.sessionHost.current || this.stopping || !this.shell) return;
+			// Serialize the destructive transcript replacement with live event handling.
+			// Events arriving after this task is queued are appended behind it by
+			// queueSessionEvent and therefore apply to the new transcript factory.
+			this.pendingSessionUpdates.clear();
+			const refreshTask = this.eventTail.then(async () => {
+				if (!this.shell || target !== this.sessionHost.current || this.stopping) return;
+				const transcript = this.shell.getTranscriptNode();
+				const scrollTop = transcript.scrollTop;
+				const snapshot = this.sessionHost.getRuntimeStreamSnapshot?.(target) ?? {
+					revision: 0,
+					generationId: undefined,
+					liveEvents: [],
+					liveEventEnvelopes: [],
+				};
+				await this.renderTranscript(target, this.foregroundGeneration, () => snapshot);
+				if (!this.isCurrentForeground(target, this.foregroundGeneration)) return;
+				for (const envelope of snapshot.liveEventEnvelopes) {
+					await this.handleSessionEvent(target, envelope.event, this.foregroundGeneration);
+				}
+				if (snapshot.liveEventEnvelopes.length === 0) {
+					for (const event of snapshot.liveEvents) {
+						await this.handleSessionEvent(target, event, this.foregroundGeneration);
+					}
+				}
+				transcript.scrollTo(scrollTop);
+			});
+			this.eventTail = refreshTask.catch((error: unknown) => this.showInteractionError(error));
+			await refreshTask;
+		};
+		if (this.sessionHost.refreshForeground) await this.sessionHost.refreshForeground(refresh);
+		else await refresh(runtime);
+		this.renderer?.requestRender();
+	}
+
+	private async handleSessionEvent(
+		runtime: AgentSessionRuntime,
+		event: AgentSessionEvent,
+		generation = this.foregroundGeneration,
+	): Promise<void> {
+		if (!this.isCurrentForeground(runtime, generation) || !this.shell) return;
+		if (event.type === "message_start" && event.message.role === "user") {
+			this.welcome?.dismiss();
+			this.welcome = undefined;
+		}
+		switch (event.type) {
+			case "agent_start":
+				this.status?.setMessage("Ready");
+				this.status?.stop();
+				this.composer?.setInteractionState({ kind: "working" });
+				break;
+			case "agent_settled":
+				this.status?.setMessage("Ready");
+				this.status?.stop();
+				this.updateComposerInteractionState(runtime);
+				break;
+			case "compaction_start":
+				this.status?.setMessage("Compacting context...");
+				this.composer?.setInteractionState({
+					kind: "working",
+					placeholder: "Queue instructions for after compaction",
+					leftHint: "Enter queue",
+					rightHint: "Esc stop",
+				});
+				break;
+			case "auto_retry_start":
+				this.status?.setMessage("Ready");
+				this.status?.stop();
+				this.composer?.setInteractionState({
+					kind: "working",
+					placeholder: "Add instructions while retrying",
+					leftHint: "Enter add to current task · Alt+Enter queue",
+					rightHint: "Esc stop",
+				});
+				break;
+			case "question_asked":
+				this.composer?.setInteractionState({ kind: "waiting", placeholder: "Answer the current question" });
+				break;
+			case "plan_proposed":
+				this.composer?.setInteractionState({ kind: "waiting", placeholder: "Review the proposed plan" });
+				break;
+			case "queue_update":
+				this.updateQueuedMessages(event.steering, event.followUp);
+				break;
+		}
+		const mutation = await this.transcriptFactory.handleEvent(event);
+		if (mutation.type === "append") this.shell.appendTranscript(mutation.item.root);
+		const semanticUpdate = this.getTranscriptSemanticUpdate(event);
+		if (semanticUpdate) this.transcriptFocus?.recordSemanticUpdate(semanticUpdate);
+		if (this.transcriptFocus?.isAutoFollowing()) this.transcriptFocus.followLatest();
+		if (
+			event.type === "session_info_changed" ||
+			event.type === "thinking_level_changed" ||
+			event.type === "collaboration_mode_changed"
+		) {
+			this.topBar?.update(this.getTopBarState(runtime));
+		}
+		if (event.type === "session_info_changed") await this.refreshSidebar();
+		if (
+			event.type === "agent_start" ||
+			event.type === "agent_end" ||
+			event.type === "agent_settled" ||
+			event.type === "thinking_level_changed" ||
+			event.type === "collaboration_mode_changed"
+		) {
+			this.composer?.updateStatus(this.getComposerStatus(runtime));
+		}
+		this.renderer?.requestRender();
+		if (event.type === "question_asked") {
+			this.launchInteraction(() => this.reviewPendingQuestion(runtime, this.foregroundGeneration));
+		} else if (event.type === "agent_settled") {
+			this.launchInteraction(() => this.reviewPendingPlan(runtime, this.foregroundGeneration));
+		} else if (event.type === "plan_decided" && this.reviewingPlanProposalId === event.proposal.id) {
+			this.planInteractionAbort?.abort();
+		} else if (
+			(event.type === "question_answered" || event.type === "question_cancelled") &&
+			this.reviewingQuestionRequestId === event.requestId
+		) {
+			this.questionInteractionAbort?.abort();
+		}
+		if (event.type === "question_answered" || event.type === "question_cancelled" || event.type === "plan_decided") {
+			this.updateComposerInteractionState(runtime);
+		}
+	}
+
+	private async handleExchangeProjection(
+		runtime: AgentSessionRuntime,
+		projection: ExchangeProjection,
+		generation = this.foregroundGeneration,
+	): Promise<void> {
+		if (!this.isCurrentForeground(runtime, generation) || !this.shell) return;
+		const mutation = this.transcriptFactory.applyExchangeProjection(projection);
+		if (mutation.type === "append") this.shell.appendTranscript(mutation.item.root);
+		if (mutation.type !== "ignored") {
+			this.transcriptFocus?.recordSemanticUpdate("tool");
+			if (this.transcriptFocus?.isAutoFollowing()) this.transcriptFocus.followLatest();
+			this.renderer?.requestRender();
+		}
+	}
+
+	private async handleSubagentProjection(
+		runtime: AgentSessionRuntime,
+		projection: SubagentProjection,
+		generation = this.foregroundGeneration,
+	): Promise<void> {
+		if (!this.isCurrentForeground(runtime, generation) || !this.shell) return;
+		const mutation = this.transcriptFactory.applySubagentProjection(projection);
+		if (mutation.type !== "ignored") {
+			this.transcriptFocus?.recordSemanticUpdate("tool");
+			if (this.transcriptFocus?.isAutoFollowing()) this.transcriptFocus.followLatest();
+			this.renderer?.requestRender();
+		}
+	}
+
+	private schedulePendingInteractions(runtime: AgentSessionRuntime, generation = this.foregroundGeneration): void {
+		this.launchInteraction(async () => {
+			await this.reviewPendingQuestion(runtime, generation);
+			await this.reviewPendingPlan(runtime, generation);
+		});
+	}
+
+	private launchInteraction(interaction: () => Promise<void>): void {
+		const task = interaction()
+			.catch((error: unknown) => this.showInteractionError(error))
+			.finally(() => this.interactionTasks.delete(task));
+		this.interactionTasks.add(task);
+	}
+
+	private async maybeGenerateConversationName(runtime: AgentSessionRuntime): Promise<void> {
+		const session = runtime.session;
+		if (session.sessionManager.getSessionName() || this.automaticTitleGeneration.has(runtime)) return;
+
+		this.automaticTitleGeneration.add(runtime);
+		try {
+			const resolved = await resolveTaskModel("title", {
+				conversationModel: session.model,
+				taskModel: runtime.services.settingsManager.getTaskModel("title"),
+				modelRuntime: session.modelRuntime,
+			});
+			if (this.stopping || session.sessionManager.getSessionName()) return;
+			const result = await session.generateTitle(resolved.model);
+			if (result.kind !== "title" || this.stopping || session.sessionManager.getSessionName()) return;
+			session.setSessionName(result.title);
+			if (runtime !== this.sessionHost.current) await this.refreshSidebar();
+		} catch {
+			// Automatic naming is best effort. An unnamed conversation retries on the next turn.
+		} finally {
+			this.automaticTitleGeneration.delete(runtime);
+		}
+	}
+
+	private isCurrentForeground(runtime: AgentSessionRuntime, generation: number): boolean {
+		return runtime === this.sessionHost.current && generation === this.foregroundGeneration && !this.stopping;
+	}
+
+	private getInteractiveUI(): ExtensionUIV2Context | undefined {
+		const ui = this.extensionBinding?.context;
+		return ui?.available ? ui : undefined;
+	}
+
+	private async reviewPendingPlan(runtime: AgentSessionRuntime, generation: number): Promise<void> {
+		const initialState = runtime.session.planState;
+		if (initialState.status !== "awaitingApproval" || this.reviewingPlanProposalId !== undefined) return;
+		const ui = this.getInteractiveUI();
+		if (!ui) {
+			this.showInteractionError("Plan review requires the interactive OpenTUI dialog host");
+			return;
+		}
+
+		const proposal = initialState.proposal;
+		const controller = new AbortController();
+		this.reviewingPlanProposalId = proposal.id;
+		this.planInteractionAbort = controller;
+		try {
+			const result = await this.showPlanReview(ui, proposal, controller);
+			if (!this.isPendingPlan(runtime, generation, proposal) || controller.signal.aborted) return;
+			if (result?.action === "approve") await runtime.session.approvePlan(proposal.id);
+			else if (result?.action === "revise") await runtime.session.revisePlan(proposal.id, result.feedback);
+			else runtime.session.cancelPlan(proposal.id);
+		} catch (error) {
+			this.showInteractionError(error);
+		} finally {
+			controller.abort();
+			const planState = runtime.session.planState;
+			if (planState.status !== "awaitingApproval" || planState.proposal.id !== proposal.id) {
+				this.planFeedbackDrafts.delete(proposal.id);
+			}
+			if (this.planInteractionAbort === controller) this.planInteractionAbort = undefined;
+			if (this.reviewingPlanProposalId === proposal.id) this.reviewingPlanProposalId = undefined;
+			if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+		}
+	}
+
+	private isPendingPlan(runtime: AgentSessionRuntime, generation: number, proposal: PlanProposal): boolean {
+		if (!this.isCurrentForeground(runtime, generation)) return false;
+		const state = runtime.session.planState;
+		return state.status === "awaitingApproval" && state.proposal.id === proposal.id;
+	}
+
+	private async showPlanReview(
+		ui: ExtensionUIV2Context,
+		proposal: PlanProposal,
+		controller: AbortController,
+	): Promise<OpenTUIPlanReviewResult | undefined> {
+		const renderer = this.renderer;
+		if (!renderer) return undefined;
+		return await new Promise<OpenTUIPlanReviewResult | undefined>((resolve) => {
+			let settled = false;
+			let widget: ExtensionUIViewHandle | undefined;
+			let review: OpenTUIPlanReview;
+			const finish = (result: OpenTUIPlanReviewResult | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (result) this.planFeedbackDrafts.delete(proposal.id);
+				else this.planFeedbackDrafts.set(proposal.id, review.getDraftFeedback());
+				if (this.planReview === review) this.planReview = undefined;
+				widget?.close();
+				resolve(result);
+			};
+			review = new OpenTUIPlanReview(renderer, proposal, finish, this.planFeedbackDrafts.get(proposal.id));
+			this.planReview = review;
+			widget = ui.widgets.set("bone:plan-review", review.root, { placement: "aboveEditor", order: -90 });
+			if (!widget.mounted) {
+				finish(undefined);
+				return;
+			}
+			controller.signal.addEventListener("abort", () => finish(undefined), { once: true });
+			review.focus();
+			renderer.requestRender();
+		});
+	}
+
+	private async showQuickPicker<Value extends string>(
+		runtime: AgentSessionRuntime,
+		request: OpenTUIQuickPickerRequest<Value>,
+	): Promise<Value | undefined> {
+		const renderer = this.renderer;
+		const ui = this.getInteractiveUI();
+		if (!renderer || !ui || runtime !== this.sessionHost.current) return undefined;
+		const generation = this.foregroundGeneration;
+		this.dismissQuickPicker?.();
+		return await new Promise<Value | undefined>((resolve, reject) => {
+			let settled = false;
+			let widget: ExtensionUIViewHandle | undefined;
+			let picker: OpenTUIQuickPicker<Value>;
+			const finish = (value: Value | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (this.quickPicker === picker) this.quickPicker = undefined;
+				if (this.dismissQuickPicker === dismiss) this.dismissQuickPicker = undefined;
+				widget?.close();
+				if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+				resolve(value);
+			};
+			const dismiss = () => finish(undefined);
+			picker = new OpenTUIQuickPicker(renderer, request, finish);
+			this.quickPicker = picker;
+			this.dismissQuickPicker = dismiss;
+			try {
+				widget = ui.widgets.set("bone:quick-picker", picker.root, { placement: "aboveEditor", order: -80 });
+			} catch (error) {
+				if (this.quickPicker === picker) this.quickPicker = undefined;
+				if (this.dismissQuickPicker === dismiss) this.dismissQuickPicker = undefined;
+				reject(error);
+				return;
+			}
+			if (!widget.mounted || request.signal?.aborted) {
+				finish(undefined);
+				return;
+			}
+			request.signal?.addEventListener("abort", dismiss, { once: true });
+			picker.focus();
+			renderer.requestRender();
+		});
+	}
+
+	private async showMultiPicker<Value extends string>(
+		runtime: AgentSessionRuntime,
+		request: OpenTUIMultiPickerRequest<Value>,
+	): Promise<Value[] | undefined> {
+		const renderer = this.renderer;
+		const ui = this.getInteractiveUI();
+		if (!renderer || !ui || runtime !== this.sessionHost.current) return undefined;
+		const generation = this.foregroundGeneration;
+		this.dismissMultiPicker?.();
+		return await new Promise<Value[] | undefined>((resolve) => {
+			let settled = false;
+			let widget: ExtensionUIViewHandle | undefined;
+			let picker: OpenTUIMultiPicker<Value>;
+			const finish = (values: Value[] | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (this.multiPicker === picker) this.multiPicker = undefined;
+				if (this.dismissMultiPicker === dismiss) this.dismissMultiPicker = undefined;
+				widget?.close();
+				if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+				resolve(values);
+			};
+			const dismiss = () => finish(undefined);
+			picker = new OpenTUIMultiPicker(renderer, request, finish);
+			this.multiPicker = picker;
+			this.dismissMultiPicker = dismiss;
+			widget = ui.widgets.set("bone:multi-picker", picker.root, { placement: "aboveEditor", order: -75 });
+			if (!widget.mounted) {
+				finish(undefined);
+				return;
+			}
+			picker.focus();
+			renderer.requestRender();
+		});
+	}
+
+	private async showInlinePrompt(
+		runtime: AgentSessionRuntime,
+		request: OpenTUIInlinePromptRequest,
+	): Promise<string | undefined> {
+		const renderer = this.renderer;
+		const ui = this.getInteractiveUI();
+		if (!renderer || !ui || runtime !== this.sessionHost.current) return undefined;
+		const generation = this.foregroundGeneration;
+		this.dismissInlinePrompt?.();
+		return await new Promise<string | undefined>((resolve) => {
+			let settled = false;
+			let widget: ExtensionUIViewHandle | undefined;
+			let prompt: OpenTUIInlinePrompt;
+			const finish = (value: string | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (this.inlinePrompt === prompt) this.inlinePrompt = undefined;
+				if (this.dismissInlinePrompt === dismiss) this.dismissInlinePrompt = undefined;
+				widget?.close();
+				if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+				resolve(value);
+			};
+			const dismiss = () => finish(undefined);
+			prompt = new OpenTUIInlinePrompt(renderer, request, finish);
+			this.inlinePrompt = prompt;
+			this.dismissInlinePrompt = dismiss;
+			widget = ui.widgets.set("bone:inline-prompt", prompt.root, { placement: "aboveEditor", order: -70 });
+			if (!widget.mounted || request.signal?.aborted) {
+				finish(undefined);
+				return;
+			}
+			request.signal?.addEventListener("abort", dismiss, { once: true });
+			prompt.focus();
+			renderer.requestRender();
+		});
+	}
+
+	private async showSettingsPage(
+		runtime: AgentSessionRuntime,
+		run: (dialogs: OpenTUISettingsPage["dialogs"]) => Promise<void>,
+	): Promise<void> {
+		const renderer = this.renderer;
+		const shell = this.shell;
+		const ui = this.getInteractiveUI();
+		if (!renderer || !shell || !ui || runtime !== this.sessionHost.current) return;
+		const generation = this.foregroundGeneration;
+		this.dismissSettingsPage?.();
+		const page = new OpenTUISettingsPage(renderer, {
+			confirm: (request) => ui.dialogs.confirm(request),
+			notify: (message, kind) => ui.dialogs.notify(message, kind),
+		});
+		this.settingsPage = page;
+		shell.setMainView(page.root);
+		let dismissed = false;
+		const dismiss = () => {
+			if (dismissed) return;
+			dismissed = true;
+			page.dispose();
+			if (this.settingsPage === page) this.settingsPage = undefined;
+			if (this.dismissSettingsPage === dismiss) this.dismissSettingsPage = undefined;
+			if (this.shell === shell) shell.setMainView(undefined);
+			if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+		};
+		this.dismissSettingsPage = dismiss;
+		try {
+			await run(page.dialogs);
+		} finally {
+			dismiss();
+		}
+	}
+
+	private async showHistoryNavigator(
+		runtime: AgentSessionRuntime,
+		mode: OpenTUIHistoryNavigatorMode,
+	): Promise<string | undefined> {
+		const renderer = this.renderer;
+		const shell = this.shell;
+		if (!renderer || !shell || runtime !== this.sessionHost.current) return undefined;
+		const generation = this.foregroundGeneration;
+		this.dismissHistoryNavigator?.();
+		return await new Promise<string | undefined>((resolve) => {
+			let settled = false;
+			let navigator: OpenTUIHistoryNavigator;
+			const finish = (entryId: string | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (this.historyNavigator === navigator) this.historyNavigator = undefined;
+				if (this.dismissHistoryNavigator === dismiss) this.dismissHistoryNavigator = undefined;
+				if (this.shell === shell) shell.setMainView(undefined);
+				if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+				resolve(entryId);
+			};
+			const dismiss = () => finish(undefined);
+			navigator = new OpenTUIHistoryNavigator(renderer, {
+				mode,
+				tree: runtime.session.sessionManager.getTree(),
+				currentLeafId: runtime.session.sessionManager.getLeafId() ?? undefined,
+				onDone: finish,
+			});
+			this.historyNavigator = navigator;
+			this.dismissHistoryNavigator = dismiss;
+			shell.setMainView(navigator.root);
+			navigator.focus();
+			renderer.requestRender();
+		});
+	}
+
+	private async reviewPendingQuestion(runtime: AgentSessionRuntime, generation: number): Promise<void> {
+		const state = runtime.session.questionState;
+		if (state.status !== "awaitingAnswer" || this.reviewingQuestionRequestId !== undefined) return;
+		const request = state.request;
+		const ui = this.getInteractiveUI();
+		if (!ui) {
+			if (this.isPendingQuestion(runtime, generation, request)) runtime.session.cancelQuestion(request.id, "no_ui");
+			this.showInteractionError("Structured question requires the interactive OpenTUI dialog host");
+			return;
+		}
+
+		const controller = new AbortController();
+		this.reviewingQuestionRequestId = request.id;
+		this.questionInteractionAbort = controller;
+		try {
+			const result = await this.showQuestionnaire(ui, request, controller);
+			if (!this.isPendingQuestion(runtime, generation, request) || controller.signal.aborted) return;
+			if (result && !result.cancelled)
+				runtime.session.answerQuestion(request.id, result.answers, result.overallNotes);
+			else runtime.session.cancelQuestion(request.id, "user");
+		} catch (error) {
+			this.showInteractionError(error);
+		} finally {
+			controller.abort();
+			const questionState = runtime.session.questionState;
+			if (questionState.status !== "awaitingAnswer" || questionState.request.id !== request.id) {
+				this.questionDrafts.delete(request.id);
+			}
+			if (this.questionInteractionAbort === controller) this.questionInteractionAbort = undefined;
+			if (this.reviewingQuestionRequestId === request.id) this.reviewingQuestionRequestId = undefined;
+			if (this.isCurrentForeground(runtime, generation)) this.focusComposer();
+		}
+	}
+
+	private isPendingQuestion(runtime: AgentSessionRuntime, generation: number, request: QuestionRequest): boolean {
+		if (!this.isCurrentForeground(runtime, generation)) return false;
+		const state = runtime.session.questionState;
+		return state.status === "awaitingAnswer" && state.request.id === request.id;
+	}
+
+	private async showQuestionnaire(
+		ui: ExtensionUIV2Context,
+		request: QuestionRequest,
+		controller: AbortController,
+	): Promise<OpenTUIQuestionnaireResult | undefined> {
+		const renderer = this.renderer;
+		if (!renderer) return undefined;
+		return await new Promise<OpenTUIQuestionnaireResult | undefined>((resolve) => {
+			let settled = false;
+			let widget: ExtensionUIViewHandle | undefined;
+			let questionnaire: OpenTUIQuestionnaire;
+			const finish = (result: OpenTUIQuestionnaireResult | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (result) this.questionDrafts.delete(request.id);
+				else this.questionDrafts.set(request.id, questionnaire.getDraft());
+				if (this.questionnaire === questionnaire) this.questionnaire = undefined;
+				widget?.close();
+				resolve(result);
+			};
+			questionnaire = new OpenTUIQuestionnaire(renderer, request, finish, this.questionDrafts.get(request.id));
+			this.questionnaire = questionnaire;
+			widget = ui.widgets.set("bone:questionnaire", questionnaire.root, {
+				placement: "aboveEditor",
+				order: -100,
+			});
+			if (!widget.mounted) {
+				finish(undefined);
+				return;
+			}
+			controller.signal.addEventListener("abort", () => finish(undefined), { once: true });
+			questionnaire.focus();
+			renderer.requestRender();
+		});
+	}
+
+	private showInteractionError(error: unknown): void {
+		this.status?.setMessage(error instanceof Error ? error.message : String(error));
+		this.status?.stop();
+		this.renderer?.requestRender();
+	}
+
+	private updateComposerInteractionState(runtime: AgentSessionRuntime): void {
+		if (
+			runtime.session.questionState.status === "awaitingAnswer" ||
+			runtime.session.planState.status === "awaitingApproval"
+		) {
+			this.composer?.setInteractionState({ kind: "waiting" });
+			return;
+		}
+		if (runtime.session.isStreaming || runtime.session.isCompacting || runtime.session.isBashRunning) {
+			this.composer?.setInteractionState({ kind: "working" });
+			return;
+		}
+		this.composer?.setInteractionState({ kind: "idle" });
+	}
+
+	private updateQueuedMessages(steering: readonly string[], followUp: readonly string[]): void {
+		this.composer?.setQueuedMessages([
+			...steering.map((text, index) => ({ id: `steering:${index}:${text}`, text, delivery: "current" as const })),
+			...followUp.map((text, index) => ({ id: `follow-up:${index}:${text}`, text, delivery: "next" as const })),
+		]);
+	}
+
+	private updateTranscriptUpdatesBanner(state: OpenTUITranscriptFocusState): void {
+		const banner = this.transcriptUpdatesBanner;
+		if (!banner || banner.isDestroyed) return;
+		banner.visible = !state.following && state.unseenUpdateCount > 0;
+		if (!banner.visible) {
+			banner.content = "";
+			return;
+		}
+		banner.content =
+			state.latestUpdateKind === "completion"
+				? "↓ Task completed · End to jump to latest"
+				: `↓ ${state.unseenUpdateCount} new update${state.unseenUpdateCount === 1 ? "" : "s"} · End to jump to latest`;
+		this.renderer?.requestRender();
+	}
+
+	private getTranscriptSemanticUpdate(event: AgentSessionEvent): "content" | "tool" | "completion" | undefined {
+		if (event.type === "tool_execution_start" || event.type === "tool_execution_end") return "tool";
+		if (event.type === "message_end" && event.message.role === "assistant") return "content";
+		if (event.type === "agent_settled") return "completion";
+		return undefined;
+	}
+
+	private getTopBarState(runtime: AgentSessionRuntime) {
+		const model = runtime.session.model;
+		return {
+			conversation: runtime.session.sessionName?.trim() || "New conversation",
+			workspace: basename(runtime.cwd) || runtime.cwd,
+			model: model ? `${model.provider}/${model.id}` : "No model",
+			thinking: runtime.session.thinkingLevel ?? "off",
+			...(runtime.session.collaborationMode === "plan" && { mode: "plan" as const }),
+		};
+	}
+
+	private getComposerStatus(runtime: AgentSessionRuntime): OpenTUIComposerStatus {
+		const model = runtime.session.model;
+		const usage = runtime.session.getContextUsage?.();
+		const remaining = usage?.percent === null || usage?.percent === undefined ? undefined : 100 - usage.percent;
+		const sessionPath = runtime.session.sessionFile;
+		const throughput = sessionPath
+			? this.sessionHost.getSessionPresentation(sessionPath).throughputTokensPerSecond
+			: undefined;
+		return {
+			cwd: basename(runtime.cwd) || runtime.cwd,
+			model: model ? `${model.provider}/${model.id}` : "No model",
+			thinking: runtime.session.thinkingLevel ?? "off",
+			contextRemaining: remaining === undefined ? "--" : `${Math.max(0, Math.round(remaining))}%`,
+			foregroundThroughput: throughput ? `${throughput.toFixed(1)} t/s` : "",
+			...(runtime.session.collaborationMode === "plan" && { mode: "plan" as const }),
+		};
+	}
+
+	private async submit(
+		text: string,
+		options?: PromptOptions,
+		runtime: AgentSessionRuntime = this.sessionHost.current,
+		prepared = false,
+	): Promise<void> {
+		const value = text.trim();
+		if (!value) return;
+		if (!prepared) this.prepareSubmission(value);
+		try {
+			const routed = await this.commandRouter.route(value, runtime);
+			if (routed.handled) return;
+			if (runtime.session.isCompacting && !runtime.session.isStreaming) await runtime.session.waitForCompaction();
+			await this.sessionHost.prompt(runtime, value, {
+				source: "interactive",
+				...(runtime.session.isStreaming ? { streamingBehavior: "steer" as const } : {}),
+				...options,
+			});
+		} catch (error) {
+			this.restoreFailedSubmission(runtime, value);
+			this.showInteractionError(error);
+		}
+	}
+
+	private dispatchSubmission(text: string, options: PromptOptions | undefined, runtime: AgentSessionRuntime): void {
+		const value = text.trim();
+		if (!value) return;
+		this.prepareSubmission(value);
+		const deliversToActiveRun = runtime.session.isStreaming;
+		const task = deliversToActiveRun
+			? this.submit(value, options, runtime, true)
+			: (this.runtimeSubmissionTails.get(runtime) ?? Promise.resolve())
+					.catch(() => {})
+					.then(async () => this.submit(value, options, runtime, true));
+		if (!deliversToActiveRun) this.runtimeSubmissionTails.set(runtime, task);
+		this.trackSubmission(task);
+	}
+
+	private prepareSubmission(value: string): void {
+		this.composer?.addHistoryEntry(value);
+		this.composer?.setValue("");
+	}
+
+	private trackSubmission(task: Promise<void>): void {
+		this.submissionTail = Promise.all([this.submissionTail, task]).then(() => undefined);
+	}
+
+	private restoreFailedSubmission(runtime: AgentSessionRuntime, value: string): void {
+		if (runtime === this.sessionHost.current) {
+			const currentDraft = this.composer?.value ?? "";
+			this.composer?.setValue(this.mergeFailedSubmission(value, currentDraft));
+			return;
+		}
+		const state = this.getConversationViewState(runtime);
+		if (state) state.draft = this.mergeFailedSubmission(value, state.draft);
+	}
+
+	private mergeFailedSubmission(value: string, draft: string): string {
+		if (!draft.trim()) return value;
+		return `${value}\n\n${draft}`;
+	}
+
+	private recordBackgroundCompletion(runtime: AgentSessionRuntime): void {
+		const state = this.getConversationViewState(runtime);
+		if (!state || state.transcriptFocus.following) return;
+		state.transcriptFocus = {
+			...state.transcriptFocus,
+			unseenUpdateCount: state.transcriptFocus.unseenUpdateCount + 1,
+			latestUpdateKind: "completion",
+		};
+	}
+
+	private getConversationViewState(runtime: AgentSessionRuntime): ConversationViewState | undefined {
+		return (
+			this.conversationViewStates.get(runtime) ??
+			(runtime.session.sessionFile ? this.conversationViewStatesByPath.get(runtime.session.sessionFile) : undefined)
+		);
+	}
+
+	private async submitInitialMessages(): Promise<void> {
+		if (this.options.initialMessage) {
+			await this.submit(this.options.initialMessage, { images: this.options.initialImages });
+		}
+		for (const message of this.options.initialMessages ?? []) await this.submit(message);
+	}
+
+	private async interruptActiveSession(): Promise<void> {
+		const session = this.sessionHost.current.session;
+		if (!session.isStreaming && !session.isCompacting && !session.isBashRunning) return;
+		try {
+			await session.abort();
+			this.status?.setMessage("Stopped by user");
+			this.status?.stop();
+		} catch (error) {
+			this.showInteractionError(error);
+			return;
+		}
+		this.updateComposerInteractionState(this.sessionHost.current);
+		this.renderer?.requestRender();
+	}
+
+	private clearComposer(): void {
+		this.composer?.setValue("");
+	}
+
+	private async refreshSidebar(): Promise<void> {
+		if (!this.sidebar) return;
+		const generation = ++this.sidebarRefreshGeneration;
+		const page = await this.sessionHost.listPage(0, SIDEBAR_PAGE_SIZE);
+		if (generation !== this.sidebarRefreshGeneration || !this.sidebar) return;
+		this.sidebarSessions = page.sessions;
+		this.sidebarOffset = page.nextOffset;
+		this.sidebarHasMore = page.hasMore;
+		this.sidebar.setSessions(this.sidebarSessions);
+		const query = this.sidebar.searchQuery;
+		if (query?.trim()) this.scheduleSidebarSearch(query, 0);
+		this.renderer?.requestRender();
+	}
+
+	private refreshSidebarStates(): void {
+		this.sidebarSessions = this.sidebarSessions.map((session) => ({
+			...session,
+			...this.sessionHost.getSessionPresentation(session.path),
+		}));
+		this.sidebar?.setSessions(this.sidebarSessions);
+		this.composer?.updateStatus(this.getComposerStatus(this.sessionHost.current));
+		this.renderer?.requestRender();
+	}
+
+	private async loadMoreSessions(): Promise<void> {
+		if (!this.sidebar || !this.sidebarHasMore) return;
+		const page = await this.sessionHost.listPage(this.sidebarOffset, SIDEBAR_PAGE_SIZE);
+		this.sidebarSessions = [...this.sidebarSessions, ...page.sessions];
+		this.sidebarOffset = page.nextOffset;
+		this.sidebarHasMore = page.hasMore;
+		this.sidebar.setSessions(this.sidebarSessions);
+		this.renderer?.requestRender();
+	}
+
+	private scheduleSidebarSearch(query: string, delay = LEXICAL_SEARCH_DELAY_MS): void {
+		if (this.sessionSearchTimer) clearTimeout(this.sessionSearchTimer);
+		if (this.semanticSearchTimer) clearTimeout(this.semanticSearchTimer);
+		this.sessionSearchTimer = undefined;
+		this.semanticSearchTimer = undefined;
+		const generation = ++this.sessionSearchGeneration;
+		if (!query.trim()) {
+			this.sidebar?.setSearchResults(undefined);
+			this.sidebar?.setSearchStatus(undefined);
+			this.renderer?.requestRender();
+			return;
+		}
+		this.sessionSearchTimer = setTimeout(() => void this.runSidebarSearch(query, generation), delay);
+		this.semanticSearchTimer = setTimeout(() => {
+			this.setSidebarSearchStatus("Local semantic search · preparing model...");
+			void this.runSemanticSidebarSearch(query, generation);
+		}, SEMANTIC_SEARCH_DELAY_MS);
+	}
+
+	private async runSidebarSearch(query: string, generation: number): Promise<void> {
+		try {
+			const results = await this.memory.search(query, this.sidebarSessions);
+			if (!this.isCurrentSidebarSearch(query, generation)) return;
+			await this.includeSidebarSearchSessions(results.map((result) => result.sessionPath));
+			if (!this.isCurrentSidebarSearch(query, generation)) return;
+			this.sidebar?.setSearchResults(results);
+			this.renderer?.requestRender();
+		} catch {
+			if (generation !== this.sessionSearchGeneration) return;
+			this.sidebar?.setSearchResults([]);
+			this.renderer?.requestRender();
+		}
+	}
+
+	private async runSemanticSidebarSearch(query: string, generation: number): Promise<void> {
+		try {
+			const results = await this.memory.searchSemantic(query, this.sidebarSessions);
+			if (!this.isCurrentSidebarSearch(query, generation)) return;
+			await this.includeSidebarSearchSessions(results.map((result) => result.sessionPath));
+			if (!this.isCurrentSidebarSearch(query, generation)) return;
+			this.sidebar?.setSearchResults(results);
+			this.setSidebarSearchStatus(undefined);
+		} catch {
+			if (generation === this.sessionSearchGeneration) {
+				this.setSidebarSearchStatus("Local semantic search unavailable · lexical results shown");
+			}
+		}
+	}
+
+	private isCurrentSidebarSearch(query: string, generation: number): boolean {
+		return generation === this.sessionSearchGeneration && query === this.sidebar?.searchQuery;
+	}
+
+	private async includeSidebarSearchSessions(sessionPaths: readonly string[]): Promise<void> {
+		const known = new Set(this.sidebarSessions.map((session) => resolve(session.path)));
+		const missing = sessionPaths.filter((sessionPath) => !known.has(resolve(sessionPath)));
+		if (missing.length === 0) return;
+		this.sidebarSessions.push(...(await this.sessionHost.getSessionSummaries(missing)));
+		this.sidebar?.setSessions(this.sidebarSessions);
+	}
+
+	private setSidebarSearchStatus(status: string | undefined): void {
+		this.sidebar?.setSearchStatus(status);
+		this.renderer?.requestRender();
+	}
+
+	private formatSemanticSearchStatus(status: LocalEmbeddingStatus | undefined): string | undefined {
+		if (!status) return undefined;
+		if (status.phase === "ready") return "Local semantic search · updating results...";
+		if (status.phase === "loading") return "Local semantic search · loading local model...";
+		if (!status.totalBytes || status.totalBytes <= 0 || status.loadedBytes === undefined) {
+			return "Local semantic search · downloading model...";
+		}
+		const percent = Math.min(100, Math.floor((status.loadedBytes / status.totalBytes) * 100));
+		return `Local semantic search · downloading ${percent}%`;
+	}
+
+	private rememberActiveConversation(runtime: AgentSessionRuntime): void {
+		const sessionPath = runtime.session.sessionFile;
+		if (!sessionPath) return;
+		const manager = runtime.session.sessionManager;
+		rememberLastActiveConversation(manager.getCwd(), manager.getSessionDir(), sessionPath, runtime.services.agentDir);
+	}
+
+	private showStartupNotices(): void {
+		const notices: string[] = [];
+		if (this.options.migratedProviders?.length) {
+			notices.push(`Migrated credentials to auth.json: ${this.options.migratedProviders.join(", ")}`);
+		}
+		if (this.options.modelFallbackMessage) notices.push(this.options.modelFallbackMessage);
+		if (this.options.verbose && this.sessionHost.current.session.scopedModels.length > 0) {
+			notices.push(
+				`Scoped models: ${this.sessionHost.current.session.scopedModels
+					.map(
+						({ model, thinkingLevel }) =>
+							`${model.provider}/${model.id}${thinkingLevel ? `:${thinkingLevel}` : ""}`,
+					)
+					.join(", ")}`,
+			);
+		}
+		if (notices.length === 0) return;
+		this.status?.setMessage(notices.join("\n"));
+		this.status?.stop();
+		this.renderer?.requestRender();
+	}
+
+	private maybeSaveImplicitProjectTrustAfterReload(): void {
+		const runtime = this.sessionHost.current;
+		if (this.autoTrustOnReloadCwd !== runtime.cwd) return;
+		if (!runtime.services.settingsManager.isProjectTrusted() || !hasTrustRequiringProjectResources(runtime.cwd)) {
+			return;
+		}
+		const trustStore = new ProjectTrustStore(runtime.services.agentDir);
+		try {
+			if (trustStore.get(runtime.cwd) === null) trustStore.set(runtime.cwd, true);
+			this.autoTrustOnReloadCwd = undefined;
+		} catch (error) {
+			this.showInteractionError(
+				`Could not save project trust after reload: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	private async runAction(action: () => Promise<unknown>): Promise<void> {
+		try {
+			await action();
+		} catch (error) {
+			this.status?.setMessage(error instanceof Error ? error.message : String(error));
+			this.status?.stop();
+			this.renderer?.requestRender();
+		}
+	}
+
+	private installSignals(): void {
+		if (this.options.installSignalHandlers === false) return;
+		const onSigint = () => void this.interruptActiveSession();
+		const onSigterm = () => this.stop();
+		process.on("SIGINT", onSigint);
+		process.on("SIGTERM", onSigterm);
+		this.signalCleanups.push(
+			() => process.off("SIGINT", onSigint),
+			() => process.off("SIGTERM", onSigterm),
+		);
+	}
+
+	private async cleanup(): Promise<void> {
+		if (this.cleanupPromise) return this.cleanupPromise;
+		this.cleanupPromise = (async () => {
+			await this.unbindForeground(this.sessionHost.current);
+			if (this.sessionSearchTimer) clearTimeout(this.sessionSearchTimer);
+			if (this.semanticSearchTimer) clearTimeout(this.semanticSearchTimer);
+			for (const cleanup of this.signalCleanups.splice(0)) cleanup();
+			this.unsubscribeApplicationKeys?.();
+			this.unsubscribeApplicationKeys = undefined;
+			this.paneFocus?.dispose();
+			// OverlayManager owns the native key/resize listeners and the overlay
+			// layer. Dispose it before tearing down the shell or renderer so no
+			// late async dialog can attach into a destroyed native tree.
+			await this.overlayManager?.dispose();
+			this.overlayManager = undefined;
+			this.topBar?.dispose();
+			this.sidebar?.dispose();
+			this.shell?.dispose();
+			this.composer?.destroy();
+			this.renderer?.stop();
+			this.renderer?.destroy();
+			await this.sessionHost.disposeAll();
+			await this.memory.dispose();
+		})();
+		return this.cleanupPromise;
+	}
+}

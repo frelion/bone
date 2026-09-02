@@ -1,0 +1,303 @@
+#!/usr/bin/env bun
+
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+
+const packages = [
+	{ directory: "packages/ai", name: "@frelion/bone-ai" },
+	{ directory: "packages/tui", name: "@frelion/bone-tui" },
+	{ directory: "packages/agent", name: "@frelion/bone-agent-core" },
+	{ directory: "packages/session", name: "@frelion/bone-session" },
+	{ directory: "packages/protocol", name: "@frelion/bone-protocol" },
+	{ directory: "packages/images", name: "@frelion/bone-images" },
+	{ directory: "packages/forge", name: "@frelion/bone-forge" },
+	{ directory: "packages/memory", name: "@frelion/bone-memory" },
+	{ directory: "packages/coding-agent", name: "@frelion/bone-coding-agent" },
+];
+
+function printUsage() {
+	console.log(`Usage: bun scripts/local-release.mjs [options]
+
+Builds and packs the publishable packages, then installs the tarballs into an
+isolated directory outside the repository for local release testing.
+
+Options:
+  --out <dir>          Output directory. Defaults to a new directory under ${tmpdir()}
+  --force              Remove --out first if it already exists
+  --skip-check         Do not run bun run check before building
+  --skip-test          Do not run ./test.sh before building
+  --skip-install       Only create tarballs; do not create isolated installs
+  --help               Show this help
+`);
+}
+
+function parseArgs() {
+	const options = {
+		force: false,
+		outDir: undefined,
+		skipCheck: false,
+		skipInstall: false,
+		skipTest: false,
+	};
+	const args = process.argv.slice(2);
+
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--help") {
+			printUsage();
+			process.exit(0);
+		}
+		if (arg === "--force") {
+			options.force = true;
+			continue;
+		}
+		if (arg === "--skip-check") {
+			options.skipCheck = true;
+			continue;
+		}
+		if (arg === "--skip-test") {
+			options.skipTest = true;
+			continue;
+		}
+		if (arg === "--skip-install") {
+			options.skipInstall = true;
+			continue;
+		}
+		if (arg === "--out") {
+			const value = args[++i];
+			if (!value) {
+				throw new Error("--out requires a directory");
+			}
+			options.outDir = value;
+			continue;
+		}
+		throw new Error(`Unknown option: ${arg}`);
+	}
+
+	return options;
+}
+
+function run(command, args, options = {}) {
+	console.log(`$ ${[command, ...args].join(" ")}`);
+	const result = spawnSync(command, args, {
+		cwd: options.cwd,
+		encoding: "utf8",
+		shell: process.platform === "win32",
+		stdio: options.capture ? ["inherit", "pipe", "inherit"] : "inherit",
+	});
+
+	if (result.status !== 0) {
+		throw new Error(`Command failed: ${[command, ...args].join(" ")}`);
+	}
+
+	return result.stdout ?? "";
+}
+
+function readPackageJson(directory) {
+	return JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
+}
+
+function commandExists(command) {
+	return spawnSync(command, ["--version"], { stdio: "ignore" }).status === 0;
+}
+
+function isInsidePath(child, parent) {
+	const relativePath = relative(parent, child);
+	return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+}
+
+function prepareOutputDirectory(options, repoRoot) {
+	if (!options.outDir) {
+		return mkdtempSync(join(tmpdir(), "bone-local-release-"));
+	}
+
+	const outDir = resolve(options.outDir);
+
+	if (isInsidePath(outDir, repoRoot)) {
+		throw new Error(`Output directory must be outside the repository: ${outDir}`);
+	}
+
+	if (existsSync(outDir)) {
+		if (!options.force) {
+			throw new Error(`Output directory already exists. Use --force to replace it: ${outDir}`);
+		}
+		rmSync(outDir, { force: true, recursive: true });
+	}
+
+	mkdirSync(outDir, { recursive: true });
+	return outDir;
+}
+
+function fileSpecifier(fromDirectory, file) {
+	const relativePath = relative(fromDirectory, file).replaceAll("\\", "/");
+	return `file:${relativePath.startsWith(".") ? relativePath : `./${relativePath}`}`;
+}
+
+function currentNativeTarget() {
+	if (process.platform === "win32") return process.arch === "arm64" ? "win32-arm64" : "win32-x64";
+	if (process.platform === "darwin") return process.arch === "arm64" ? "darwin-arm64" : "darwin-x64";
+	if (process.platform === "linux") return process.arch === "arm64" ? "linux-arm64" : "linux-x64";
+	throw new Error(`Unsupported native platform: ${process.platform} ${process.arch}`);
+}
+
+function currentBinaryPlatform() {
+	if (process.platform === "win32") return process.arch === "arm64" ? "windows-arm64" : "windows-x64";
+	if (process.platform === "darwin") return process.arch === "arm64" ? "darwin-arm64" : "darwin-x64";
+	if (process.platform === "linux") return process.arch === "arm64" ? "linux-arm64" : "linux-x64";
+	throw new Error(`Unsupported binary platform: ${process.platform} ${process.arch}`);
+}
+
+function buildBunBinaryRelease(targetDirectory, releaseDirectory) {
+	if (!commandExists("bun")) {
+		throw new Error("Bun is required for the local binary release build.");
+	}
+	const platform = currentBinaryPlatform();
+	const binaryBuildDirectory = join(releaseDirectory, "binary-build");
+	run("./scripts/build-binaries.sh", [
+		"--skip-install",
+		"--skip-deps",
+		"--skip-build",
+		"--platform",
+		platform,
+		"--out",
+		binaryBuildDirectory,
+	]);
+	rmSync(targetDirectory, { force: true, recursive: true });
+	mkdirSync(targetDirectory, { recursive: true });
+	const releaseName = platform.startsWith("windows-") ? `bone-${platform}.exe` : `bone-${platform}`;
+	const executableName = platform.startsWith("windows-") ? "bone.exe" : "bone";
+	cpSync(join(binaryBuildDirectory, releaseName), join(targetDirectory, executableName));
+	cpSync(join(binaryBuildDirectory, releaseName), join(releaseDirectory, releaseName));
+	return platform;
+}
+
+function createBoneShim(installDirectory) {
+	const binDirectory = join(installDirectory, "node_modules", ".bin");
+	if (process.platform === "win32") {
+		if (existsSync(join(binDirectory, "bone.cmd"))) {
+			writeFileSync(join(installDirectory, "bone.cmd"), '@ECHO off\r\n"%~dp0node_modules\\.bin\\bone.cmd" %*\r\n');
+			writeFileSync(join(installDirectory, "bone.ps1"), '& "$PSScriptRoot/node_modules/.bin/bone.ps1" @args\n');
+			return;
+		}
+		writeFileSync(join(installDirectory, "bone.cmd"), '@ECHO off\r\n"%~dp0node_modules\\.bin\\bone.exe" %*\r\n');
+		writeFileSync(join(installDirectory, "bone.ps1"), '& "$PSScriptRoot/node_modules/.bin/bone.exe" @args\n');
+		return;
+	}
+	symlinkSync(join("node_modules", ".bin", "bone"), join(installDirectory, "bone"));
+}
+
+function packPackage(pkg, tarballDirectory) {
+	const packageJson = readPackageJson(pkg.directory);
+	if (packageJson.name !== pkg.name) {
+		throw new Error(`${pkg.directory}/package.json has name ${packageJson.name}, expected ${pkg.name}`);
+	}
+
+	const filename = `${packageJson.name.replace("@", "").replace("/", "-")}-${packageJson.version}.tgz`;
+	run("bun", ["pm", "pack", "--ignore-scripts", "--quiet", "--filename", join(tarballDirectory, filename)], {
+		cwd: pkg.directory,
+	});
+	return join(tarballDirectory, filename);
+}
+
+const options = parseArgs();
+const repoRoot = process.cwd();
+const rootPackageJson = readPackageJson(repoRoot);
+
+if (rootPackageJson.name !== "bone-monorepo") {
+	throw new Error("Run this script from the repository root");
+}
+
+const outDir = prepareOutputDirectory(options, repoRoot);
+const tarballDirectory = join(outDir, "tarballs");
+const bunInstallDirectory = join(outDir, "bun-package");
+const binaryDirectory = join(outDir, "bun");
+mkdirSync(tarballDirectory, { recursive: true });
+
+if (!options.skipCheck) {
+	run("bun", ["run", "check"], { cwd: repoRoot });
+}
+
+if (!options.skipTest) {
+	run("./test.sh", [], { cwd: repoRoot });
+}
+
+for (const pkg of packages) {
+	run("bun", ["run", "clean"], { cwd: pkg.directory });
+	run("bun", ["run", "build"], { cwd: pkg.directory });
+}
+run(
+	"bun",
+	[
+		"scripts/verify-semantic-native.mjs",
+		"--root",
+		"packages/memory/native",
+		"--target",
+		currentNativeTarget(),
+	],
+	{ cwd: repoRoot },
+);
+
+const tarballs = new Map();
+for (const pkg of packages) {
+	const tarball = packPackage(pkg, tarballDirectory);
+	tarballs.set(pkg.name, tarball);
+}
+
+let binaryPlatform;
+if (!options.skipInstall) {
+	binaryPlatform = buildBunBinaryRelease(binaryDirectory, outDir);
+
+	if (!commandExists("bun")) {
+		throw new Error("Bun is required for the isolated package install.");
+	}
+	mkdirSync(bunInstallDirectory, { recursive: true });
+	const bunDependencies = Object.fromEntries(
+		packages.map((pkg) => [pkg.name, fileSpecifier(bunInstallDirectory, tarballs.get(pkg.name))]),
+	);
+	writeFileSync(join(bunInstallDirectory, "package.json"), `${JSON.stringify({ private: true, dependencies: bunDependencies, overrides: bunDependencies }, undefined, "\t")}\n`);
+	run("bun", ["install", "--production", "--ignore-scripts"], { cwd: bunInstallDirectory });
+	run(
+		"bun",
+		[
+			"-e",
+			"import { getLocalEmbeddingNativeLibraryPath } from '@frelion/bone-memory'; console.log(getLocalEmbeddingNativeLibraryPath());",
+		],
+		{ cwd: bunInstallDirectory },
+	);
+	run(
+		"bun",
+		[
+			join(repoRoot, "scripts/verify-semantic-native.mjs"),
+			"--root",
+			join(bunInstallDirectory, "node_modules/@frelion/bone-memory/native"),
+			"--target",
+			currentNativeTarget(),
+		],
+		{ cwd: bunInstallDirectory },
+	);
+	createBoneShim(bunInstallDirectory);
+}
+
+console.log("\nLocal release artifacts created:");
+console.log(`  ${outDir}`);
+console.log("\nTarballs:");
+for (const tarball of tarballs.values()) {
+	console.log(`  ${tarball}`);
+}
+
+if (!options.skipInstall) {
+	console.log("\nLocal Bun binary release:");
+	console.log(`  ${binaryDirectory}`);
+	console.log(
+		`  ${join(outDir, String(binaryPlatform).startsWith("windows-") ? `bone-${binaryPlatform}.exe` : `bone-${binaryPlatform}`)}`,
+	);
+	console.log("\nRun the local Bun binary release from outside the repository:");
+	console.log(`  ${join(binaryDirectory, String(binaryPlatform).startsWith("windows-") ? "bone.exe" : "bone")} --help`);
+
+	console.log("\nIsolated Bun package install:");
+	console.log(`  ${bunInstallDirectory}`);
+	console.log("\nRun the locally packed Bun package CLI from outside the repository:");
+	console.log(`  ${join(bunInstallDirectory, process.platform === "win32" ? "bone.cmd" : "bone")} --help`);
+}

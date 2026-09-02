@@ -1,0 +1,197 @@
+import type { AgentToolResult } from "@frelion/bone-agent-core";
+import { type Static, Type } from "typebox";
+
+export const MIN_QUESTION_OPTIONS = 2;
+export const MAX_QUESTION_OPTIONS = 4;
+export const MAX_QUESTIONS = 4;
+export const MAX_QUESTION_HEADER_LENGTH = 16;
+export const RESERVED_QUESTION_OPTION_LABELS = new Set(["other", "cancel"]);
+
+export interface QuestionOption {
+	label: string;
+	description: string;
+	preview?: string;
+}
+
+export interface QuestionDefinition {
+	question: string;
+	header: string;
+	options: QuestionOption[];
+	multiSelect?: boolean;
+}
+
+export interface QuestionRequest {
+	id: string;
+	toolCallId: string;
+	questions: QuestionDefinition[];
+	createdAt: string;
+}
+
+export interface QuestionAnswer {
+	questionIndex: number;
+	question: string;
+	kind: "option" | "multi" | "note";
+	answer: string | null;
+	selected?: string[];
+	notes?: string;
+}
+
+export type QuestionCancelReason = "user" | "abort" | "client_disconnect" | "no_ui";
+
+export type QuestionState = { status: "inactive" } | { status: "awaitingAnswer"; request: QuestionRequest };
+
+export interface QuestionToolDetails {
+	requestId?: string;
+	answers: QuestionAnswer[];
+	overallNotes?: string;
+	cancelled: boolean;
+	reason?: QuestionCancelReason;
+}
+
+const questionOptionSchema = Type.Object({
+	label: Type.String({ minLength: 1, maxLength: 60 }),
+	description: Type.String({ minLength: 1 }),
+	preview: Type.Optional(Type.String({ minLength: 1 })),
+});
+
+export const askUserQuestionSchema = Type.Object({
+	questions: Type.Array(
+		Type.Object({
+			question: Type.String({ minLength: 1 }),
+			header: Type.String({ minLength: 1, maxLength: MAX_QUESTION_HEADER_LENGTH }),
+			options: Type.Array(questionOptionSchema, {
+				minItems: MIN_QUESTION_OPTIONS,
+				maxItems: MAX_QUESTION_OPTIONS,
+			}),
+			multiSelect: Type.Optional(Type.Boolean()),
+		}),
+		{ minItems: 1, maxItems: MAX_QUESTIONS },
+	),
+});
+
+export type AskUserQuestionInput = Static<typeof askUserQuestionSchema>;
+
+function normalized(value: string): string {
+	return value.trim().toLocaleLowerCase();
+}
+
+export function validateQuestionDefinitions(input: AskUserQuestionInput): QuestionDefinition[] {
+	return input.questions.map((question, questionIndex) => {
+		const text = question.question.trim();
+		const header = question.header.trim();
+		if (!text) throw new Error(`Question ${questionIndex + 1} must not be empty.`);
+		if (!header) throw new Error(`Question ${questionIndex + 1} header must not be empty.`);
+		if (header.length > MAX_QUESTION_HEADER_LENGTH) {
+			throw new Error(
+				`Question ${questionIndex + 1} header must be at most ${MAX_QUESTION_HEADER_LENGTH} characters.`,
+			);
+		}
+
+		const labels = new Set<string>();
+		const options = question.options.map((option, optionIndex) => {
+			const label = option.label.trim();
+			const description = option.description.trim();
+			const preview = option.preview?.trim();
+			if (!label || !description) {
+				throw new Error(
+					`Question ${questionIndex + 1} option ${optionIndex + 1} must have a label and description.`,
+				);
+			}
+			const key = normalized(label);
+			if (RESERVED_QUESTION_OPTION_LABELS.has(key)) {
+				throw new Error(`Question ${questionIndex + 1} option label "${label}" is reserved.`);
+			}
+			if (labels.has(key)) throw new Error(`Question ${questionIndex + 1} has duplicate option label "${label}".`);
+			labels.add(key);
+			return { label, description, ...(preview && { preview }) };
+		});
+
+		return { question: text, header, options, ...(question.multiSelect && { multiSelect: true }) };
+	});
+}
+
+export function validateQuestionAnswers(request: QuestionRequest, answers: QuestionAnswer[]): QuestionAnswer[] {
+	if (answers.length !== request.questions.length)
+		throw new Error("Every question must be answered before submitting.");
+	const byIndex = new Map<number, QuestionAnswer>();
+	for (const answer of answers) {
+		if (
+			!Number.isInteger(answer.questionIndex) ||
+			answer.questionIndex < 0 ||
+			answer.questionIndex >= request.questions.length
+		) {
+			throw new Error(`Invalid question index ${answer.questionIndex}.`);
+		}
+		if (byIndex.has(answer.questionIndex))
+			throw new Error(`Question ${answer.questionIndex + 1} was answered more than once.`);
+		byIndex.set(answer.questionIndex, answer);
+	}
+
+	return request.questions.map((question, questionIndex) => {
+		const answer = byIndex.get(questionIndex);
+		if (!answer) throw new Error(`Question ${questionIndex + 1} is unanswered.`);
+		if (answer.question !== question.question)
+			throw new Error(`Question ${questionIndex + 1} text does not match the request.`);
+
+		const optionLabels = new Set(question.options.map((option) => option.label));
+		const notes = answer.notes?.trim() || undefined;
+		if (answer.kind === "note") {
+			if (!notes) throw new Error(`Question ${questionIndex + 1} note must not be empty.`);
+			return { questionIndex, question: question.question, kind: "note" as const, answer: null, notes };
+		}
+		if (question.multiSelect) {
+			if (answer.kind !== "multi" || !answer.selected?.length) {
+				throw new Error(`Question ${questionIndex + 1} requires at least one selected option.`);
+			}
+			const selected = [...new Set(answer.selected)];
+			if (selected.some((label) => !optionLabels.has(label))) {
+				throw new Error(`Question ${questionIndex + 1} contains an unknown option.`);
+			}
+			return {
+				questionIndex,
+				question: question.question,
+				kind: "multi" as const,
+				answer: null,
+				selected,
+				...(notes && { notes }),
+			};
+		}
+
+		if (answer.kind === "option") {
+			if (!answer.answer || !optionLabels.has(answer.answer)) {
+				throw new Error(`Question ${questionIndex + 1} must select a valid option.`);
+			}
+			return {
+				questionIndex,
+				question: question.question,
+				kind: "option" as const,
+				answer: answer.answer,
+				...(notes && { notes }),
+			};
+		}
+		throw new Error(`Question ${questionIndex + 1} does not accept multiple selections.`);
+	});
+}
+
+export function createQuestionToolResult(
+	requestId: string,
+	answers: QuestionAnswer[],
+	overallNotes?: string,
+): AgentToolResult<QuestionToolDetails> {
+	const normalizedOverallNotes = overallNotes?.trim() || undefined;
+	const payload = { requestId, answers, ...(normalizedOverallNotes && { overallNotes: normalizedOverallNotes }) };
+	return {
+		content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+		details: { ...payload, cancelled: false },
+	};
+}
+
+export function createCancelledQuestionToolResult(
+	requestId: string,
+	reason: QuestionCancelReason,
+): AgentToolResult<QuestionToolDetails> {
+	return {
+		content: [{ type: "text", text: `The user cancelled the questionnaire (${reason}).` }],
+		details: { requestId, answers: [], cancelled: true, reason },
+	};
+}
