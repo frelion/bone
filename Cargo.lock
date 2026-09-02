@@ -96,6 +96,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bone-config"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "bone-provider"
 version = "0.1.0"
 dependencies = [
@@ -114,6 +128,7 @@ dependencies = [
 name = "bone-tools"
 version = "0.1.0"
 dependencies = [
+ "bone-config",
  "globset",
  "grep-regex",
  "grep-searcher",

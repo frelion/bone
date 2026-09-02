@@ -6,6 +6,7 @@ description = "Provider-independent built-in tools for BONE agents"
 publish = false
 
 [dependencies]
+bone-config = { path = "../bone-config" }
 globset.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true

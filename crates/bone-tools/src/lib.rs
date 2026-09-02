@@ -1,10 +1,11 @@
 //! Provider-independent built-in tools for coding agents.
 //!
-//! Every tool implements [`rig_core::tool::PortableTool`] and captures an
-//! immutable workspace boundary plus execution limits; Bash also captures its
-//! sanitized or explicitly configured child environment. Registration,
-//! authorization, approval, lifecycle state, and provider translation remain
-//! outside this crate.
+//! Every tool implements [`rig_core::tool::PortableTool`]. Local coding tools
+//! capture an immutable workspace boundary plus execution limits; Bash also
+//! captures its sanitized or explicitly configured child environment. The
+//! config tool instead captures a registered [`bone_config::ConfigManager`]
+//! and a model-output limit. Registration, authorization, approval, lifecycle
+//! state, and provider translation remain outside this crate.
 //! Native tool calls require an active Tokio runtime; `PortableTool` describes
 //! Rig's normalized tool contract, not executor independence.
 //!
@@ -15,6 +16,7 @@
 
 mod bash;
 mod config;
+mod config_tool;
 mod environment;
 mod error;
 mod glob;
@@ -26,6 +28,7 @@ mod workspace;
 
 pub use bash::{BashArgs, BashOutput, BashTool};
 pub use config::ToolLimits;
+pub use config_tool::{ConfigArgs, ConfigListEntry, ConfigOutput, ConfigTool, ConfigToolError};
 pub use environment::ToolEnvironment;
 pub use error::ToolError;
 pub use glob::{GlobArgs, GlobOutput, GlobTool};

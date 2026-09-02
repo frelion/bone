@@ -2,10 +2,11 @@
 
 `bone-tools` is BONE's provider-independent local tool crate. It is a sibling
 of `bone-provider`; neither crate depends on the other. Both depend on Rig's
-normalized interfaces, and a future agent/runtime crate will compose them.
+normalized interfaces, while `bone-tools` uses the independent `bone-config`
+service for its config tool. A future agent/runtime crate will compose them.
 
 ```text
-bone-provider ──► rig-core ◄── bone-tools
+bone-provider ──► rig-core ◄── bone-tools ──► bone-config
        ▲                         ▲
        └──── future agent ───────┘
 ```
@@ -23,9 +24,12 @@ The first tool set is deliberately small:
   grammar. It resolves and validates the entire patch before the first write.
 - `bash`: one-shot, non-interactive `bash -c` execution with bounded output,
   deadlines, structured non-zero exits, and Unix process-group cleanup.
+- `config`: discover, inspect, validate, replace, and remove registered
+  non-secret configuration sections using optimistic revisions. Credentials
+  are deliberately unavailable to the model.
 
-Every tool implements `rig_core::tool::PortableTool`. Construction captures an
-immutable workspace root and shared hard limits:
+Every tool implements `rig_core::tool::PortableTool`. The local coding tools
+capture an immutable workspace root and shared hard limits:
 
 ```rust,no_run
 use bone_tools::ToolEnvironment;
@@ -41,6 +45,11 @@ let bash = tools.bash();
 # Ok(())
 # }
 ```
+
+`ConfigTool` is constructed separately from an `Arc<bone_config::ConfigManager>`
+after the host registers the sections it intends to expose. This keeps the
+workspace environment independent from application configuration and makes
+the registration set an explicit model-facing allowlist.
 
 Native tool calls must run inside an active Tokio runtime. `PortableTool`
 provides Rig's normalized tool definition and execution contract; it does not
