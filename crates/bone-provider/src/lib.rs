@@ -13,6 +13,8 @@ mod model;
 
 pub mod protocol;
 
+pub mod service;
+
 pub use endpoint::Endpoint;
 pub use error::ConfigError;
 pub use model::Model;

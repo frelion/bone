@@ -3,7 +3,8 @@
 use std::fmt::Debug;
 
 use rig_core::{
-    client::CompletionClient, http_client::HttpClientExt, providers::openai as rig_openai,
+    client::CompletionClient, completion::CompletionModel, http_client::HttpClientExt,
+    providers::openai as rig_openai,
 };
 use serde_json::{Value, json};
 
@@ -105,6 +106,22 @@ pub fn from_model_factory<F, H>(
 where
     F: Fn(String) -> rig_openai::responses_api::ResponsesCompletionModel<H> + Send + Sync + 'static,
     H: HttpClientExt + Clone + Default + Debug + Send + Sync + 'static,
+{
+    from_completion_model_factory(endpoint_id, factory)
+}
+
+/// Assign the Responses protocol identity to another in-crate service adapter
+/// whose concrete Rig model implements the same normalized wire contract.
+///
+/// This remains crate-private so public callers cannot label an arbitrary Rig
+/// provider as OpenAI Responses.
+pub(crate) fn from_completion_model_factory<F, M>(
+    endpoint_id: impl Into<String>,
+    factory: F,
+) -> Result<Endpoint, ConfigError>
+where
+    F: Fn(String) -> M + Send + Sync + 'static,
+    M: CompletionModel + Send + Sync + 'static,
 {
     Endpoint::from_model_factory(endpoint_id, Protocol::OpenAiResponses, factory)
 }

@@ -15,6 +15,10 @@ pub enum ConfigError {
     EmptyApiKey,
     /// The API key cannot be encoded as an HTTP authorization header.
     InvalidApiKey,
+    /// A provider client could not be constructed from local configuration.
+    InvalidClientConfiguration,
+    /// The provider's application-owned credential store is unavailable or unsafe.
+    CredentialStoreUnavailable,
     /// The configured base URL is empty.
     EmptyBaseUrl,
     /// The base URL is not an absolute HTTP(S) URL without embedded credentials or a query string.
@@ -29,6 +33,10 @@ impl fmt::Display for ConfigError {
             Self::EmptyEndpointId => "endpoint identifier is empty",
             Self::EmptyApiKey => "API key is empty",
             Self::InvalidApiKey => "API key is not a valid HTTP header value",
+            Self::InvalidClientConfiguration => "provider client configuration is invalid",
+            Self::CredentialStoreUnavailable => {
+                "provider credential store is unavailable or unsafe"
+            }
             Self::EmptyBaseUrl => "endpoint base URL is empty",
             Self::InvalidBaseUrl => {
                 "endpoint base URL must be an absolute HTTP(S) URL without embedded credentials or a query string"

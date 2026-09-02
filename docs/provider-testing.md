@@ -12,6 +12,7 @@ does not require credentials.
 | OpenAI wire | `tests/openai_responses_contract.rs` | `POST /responses`, headers, text, tools, reasoning replay, SSE terminal/truncation, usage, error body |
 | OpenAI Chat wire | `tests/openai_chat_completions_contract.rs` and source unit tests | `POST /chat/completions`, headers, text, tools, SSE terminal/truncation, usage, error body |
 | Anthropic wire | `tests/anthropic_messages_contract.rs` | `POST /v1/messages`, headers, text, tools, caching, SSE terminal/truncation, usage, error body |
+| ChatGPT subscription service | `tests/chatgpt_subscription_contract.rs` | Codex Responses URL and headers, forced SSE/body rules, text, tools, replay, identity, secret redaction |
 | Live certification | `tests/live_*.rs` | A configured real endpoint currently accepts the declared protocol |
 
 Fixtures live below `tests/fixtures/<protocol>/`. Request bodies are parsed as
@@ -55,11 +56,21 @@ export BONE_ANTHROPIC_MODEL='...'
 # Optional:
 export ANTHROPIC_BASE_URL='https://gateway.example'
 cargo test -p bone-provider --test live_anthropic_messages -- --ignored --nocapture
+
+export BONE_CHATGPT_MODEL='a-model-available-to-your-subscription'
+cargo test -p bone-provider \
+  --test live_chatgpt_subscription -- --ignored --nocapture
 ```
 
 `.github/workflows/provider-live.yml` is manual-only. It reads API keys from
 GitHub Actions secrets and model/base-URL settings from repository variables;
 ordinary pushes and pull requests can never trigger paid requests.
+
+The ChatGPT subscription certification is intentionally local-only. Its first
+run may require interactive device authorization and subsequent runs use an
+independent local OAuth cache. Never upload a personal ChatGPT refresh token to
+GitHub-hosted Actions. If an organization later automates this test, it should
+use a dedicated account or supported access token on a trusted private runner.
 
 The workflow fails before checkout when no protocol has a complete
 credential/model selection, or when a selected model lacks its credential.

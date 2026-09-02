@@ -85,6 +85,82 @@ through `openai_responses::from_client`. Merely putting a query string or
 credential in Rig's base URL is unsupported and risks leaking secrets into URI
 telemetry.
 
+## Experimental ChatGPT subscription service
+
+The experimental `chatgpt_subscription` service adapter provides in-process
+access to the Codex Responses backend using a ChatGPT subscription:
+
+```rust,no_run
+use bone_provider::{
+    rig::message::Message,
+    service::chatgpt_subscription,
+};
+
+# fn show_device_login(_url: String, _code: String) {}
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let endpoint = chatgpt_subscription::connect("chatgpt-subscription", |prompt| {
+    // Render only in the active connection UI; do not log or persist the code.
+    show_device_login(prompt.verification_uri, prompt.user_code);
+}).await?;
+let model = endpoint.model("a-model-available-to-your-subscription")?;
+let response = model.request(Message::user("Hello")).send().await?;
+# Ok(())
+# }
+```
+
+This is a service adapter, not a fourth protocol. Rig sends native Responses
+requests and SSE events, so the endpoint and selected model identify as
+`Protocol::OpenAiResponses`; the normalized response provider is `chatgpt`.
+The service-specific URL, subscription headers, OAuth lifecycle, forced SSE,
+and request restrictions stay inside Rig's ChatGPT provider.
+
+The adapter does not run a local proxy and does not invoke the Codex agent.
+The explicit `connect` call reports a device-login URL and code through the
+provided callback. The library never prints the code itself. Once the user has
+authorized it, Rig caches and refreshes credentials independently. No API key,
+`OPENAI_BASE_URL`, sidecar, or separate installation is required.
+
+This backend is a ChatGPT/Codex product interface, not the public OpenAI
+Platform API, and has no equivalent public compatibility guarantee. The
+adapter is therefore explicitly experimental. It currently supports the native
+Responses shape; it does not claim a Chat Completions subscription endpoint.
+Selecting this named adapter is the runtime opt-in; there is no Cargo feature
+that could be mistaken for a security boundary or accidentally skipped by CI.
+
+Important boundaries:
+
+- Never configure Rig's `auth_file` as `~/.codex/auth.json`. Codex and Rig use
+  different schemas, and sharing a rotating refresh token between independent
+  clients can break either login.
+- The convenience connector uses BONE's independent record at
+  `~/.config/bone/chatgpt-subscription/auth.json` on Unix (respecting
+  `XDG_CONFIG_HOME`). It requires an absolute existing config root, creates the
+  app directories as `0700`, creates token/lock files as `0600`, uses
+  `O_NOFOLLOW`, and rejects symbolic links, foreign-owned files, and hard
+  links. The guarded convenience connector is temporarily unavailable on
+  Windows until equivalent ACL and reparse-point checks exist. An application
+  can supply a different app-owned path through a configured Rig client and
+  `chatgpt_subscription::from_client`.
+- Interactive device login is suitable for local CLI or desktop use. A server
+  should construct the Rig client with `allow_device_flow(false)` so an
+  ordinary request cannot wait for unattended login.
+- `connect` completes authorization before it returns, keeping device login out
+  of ordinary completion requests. Reuse the returned endpoint: BONE keeps an
+  exclusive OS file lock for its entire endpoint/model lifetime, so a second
+  process fails safely instead of racing a rotating refresh token. A custom
+  client passed to `from_client` owns its own locking policy.
+- After explicit authorization, `connect` rebuilds the endpoint client with
+  interactive device flow disabled. A rejected refresh therefore returns a
+  redacted reconnect error instead of printing a new code or waiting inside an
+  ordinary completion. Generic provider setup errors are likewise redacted at
+  the guarded model boundary.
+- Rig drops unsupported backend fields, including `max_output_tokens` and
+  `temperature`; it forces `stream: true`, `store: false`, and requests
+  replayable encrypted reasoning state. Do not treat `max_tokens` as a hard
+  subscription budget boundary.
+- Native OAuth is unavailable on WASM. Subscription live tests must remain
+  manual and must not put a personal refresh token in hosted CI.
+
 ## OpenAI Chat Completions
 
 Chat Completions is a separate wire contract, not a compatibility mode for
@@ -206,10 +282,12 @@ let endpoint = anthropic_messages::from_model_factory(
 # }
 ```
 
-BONE does not read environment variables or persist credentials. Constructors
-receive resolved values explicitly. Local construction failures use
-`ConfigError`; network, protocol, and model failures remain Rig
-`CompletionError` values.
+Ordinary protocol constructors do not read environment variables or persist
+credentials; they receive resolved values explicitly. An explicitly selected
+OAuth service adapter may maintain the independent token cache documented by
+that adapter. Local construction failures use `ConfigError`; the explicit
+subscription handshake returns a redacted `ConnectError`; request-time network,
+protocol, and model failures remain Rig `CompletionError` values.
 
 ## What belongs elsewhere
 
@@ -272,3 +350,15 @@ export ANTHROPIC_BASE_URL='https://gateway.example'
 cargo run -p bone-provider --example anthropic_messages_probe -- text
 cargo run -p bone-provider --example anthropic_messages_probe -- tool
 ```
+
+The experimental ChatGPT subscription probe needs only a model identifier.
+Its first run performs device login; later runs reuse the independent cache:
+
+```sh
+export BONE_CHATGPT_MODEL='a-model-available-to-your-subscription'
+
+cargo run -p bone-provider --example chatgpt_subscription_probe -- text
+cargo run -p bone-provider --example chatgpt_subscription_probe -- tool
+```
+
+Tool mode only displays the requested call. It does not execute the tool.
