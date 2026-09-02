@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bone-provider"]
+members = ["crates/bone-provider", "crates/bone-tools"]
 exclude = ["third_party/rig-core-0.42.0"]
 resolver = "3"
 
@@ -11,8 +11,16 @@ edition = "2024"
 bytes = "1"
 futures-util = "0.3"
 fs2 = "0.4"
+globset = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
 http = "1"
+ignore = "0.4"
 libc = "0.2"
-rig-core = { version = "=0.42.0", path = "third_party/rig-core-0.42.0", default-features = false, features = ["reqwest", "rustls"] }
+rig-core = { version = "=0.42.0", path = "third_party/rig-core-0.42.0", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tempfile = "3"
+thiserror = "2"
+tokio = "1"
+walkdir = "2"
