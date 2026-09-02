@@ -1,0 +1,24 @@
+{
+  "id": "msg_tool_1",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-test",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "toolu_test_1",
+      "name": "inspect_path",
+      "input": {
+        "path": "/tmp/bone"
+      }
+    }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 18,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null,
+    "output_tokens": 12
+  }
+}

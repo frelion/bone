@@ -1,27 +1,47 @@
 # Provider API
 
-`bone-provider` is intentionally thin. Rig owns provider clients, normalized
-messages, requests, responses, tool calls, provider state, and streaming. BONE
-does not mirror those types.
+`bone-provider` is BONE's thin LLM protocol boundary. Rig owns normalized
+messages, completion requests and responses, tools, provider-native state, and
+streaming. BONE deliberately does not mirror those types.
+
+The public model has three parts:
 
 ```text
-future Turn / Action  <->  Rig types  <->  provider
+Protocol                 Endpoint                         Model
+wire contract      +     configured service       +      selected model
+openai-responses         gateway-a                        model-x
+openai-chat-completions  gateway-a                        model-y
+anthropic-messages       anthropic-primary                claude-*
 ```
 
-The only added abstraction is `Model`: a cloneable handle that erases a
-concrete Rig model type. This is needed because Rig's `CompletionModel` trait
-is not object-safe, while the runtime will select models dynamically.
+- [`Protocol`](../crates/bone-provider/src/protocol/mod.rs) identifies the wire
+  contract. OpenAI Responses, OpenAI Chat Completions, and Anthropic Messages
+  are distinct protocols.
+- [`Endpoint`](../crates/bone-provider/src/endpoint.rs) is an application-named
+  service instance with authentication, a base URL, and a model factory.
+- [`Model`](../crates/bone-provider/src/model.rs) is a cloneable, type-erased
+  Rig completion model carrying endpoint, protocol, and model identities.
 
-## OpenAI Responses protocol
+Two gateways speaking OpenAI Responses are two endpoints backed by one
+protocol implementation. They are not two Rust provider modules.
+
+## OpenAI Responses
 
 ```rust,no_run
 use bone_provider::{
-    openai::{OpenAi, Reasoning, ReasoningEffort, reasoning_params},
+    protocol::openai_responses::{
+        self, Reasoning, ReasoningEffort, reasoning_params,
+    },
     rig::message::Message,
 };
 
 # async fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
-let model = OpenAi::new(api_key)?.model("gpt-5.6-luna")?;
+let endpoint = openai_responses::official("openai-primary", api_key)?;
+let model = endpoint.model("your-responses-model")?;
+
+assert_eq!(model.endpoint_id(), "openai-primary");
+assert_eq!(model.protocol().as_str(), "openai-responses");
+
 let mut stream = model
     .request(Message::user("Hello"))
     .additional_params(reasoning_params(
@@ -37,63 +57,218 @@ let mut stream = model
 # }
 ```
 
-- Credentials are supplied explicitly and are moved into Rig's authorization
-  header. BONE does not persist them.
-- `OpenAi::compatible` accepts a different Responses-compatible API root. The
-  endpoint may be OpenAI, a gateway such as New API, or another vendor such as
-  DeepSeek; BONE does not add vendor-shaped wrapper types.
-- `OpenAi::from_client` remains the escape hatch for custom headers or a custom
-  Rig HTTP transport.
-- `reasoning_params` only encodes Rig's typed OpenAI reasoning controls into
-  the generic Rig request field. Rig owns the actual Responses conversion,
-  including encrypted reasoning state.
-- Provider call failures remain Rig `CompletionError` values. Sanitization and
-  user-facing presentation belong at the future runtime/GUI boundary.
-
-The real API smoke test is ignored by default:
-
-```sh
-export OPENAI_API_KEY='...'
-export BONE_OPENAI_MODEL='gpt-5.6-luna'
-cargo test -p bone-provider --test openai_live -- --ignored
-```
-
-For a compatible endpoint, set its full API root. It must be the prefix to
-which `/responses` is appended:
+For an OpenAI Responses-compatible API root:
 
 ```rust,no_run
-use bone_provider::openai::OpenAi;
+use bone_provider::protocol::openai_responses;
 
 # fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
-let model = OpenAi::compatible(api_key, "https://gateway.example/v1")?
-    .model("vendor-model")?;
+let endpoint = openai_responses::compatible(
+    "gateway-a",
+    api_key,
+    "https://gateway.example/v1",
+)?;
+let model = endpoint.model("vendor-model")?;
 # Ok(())
 # }
 ```
 
-Compatibility is about the wire endpoint, not the company name. This adapter
-requires the OpenAI Responses shape; an endpoint that implements only
-`/chat/completions` is not silently treated as equivalent.
+The base URL is the prefix to which `/responses` is appended. An endpoint that
+only implements `/chat/completions` does not implement this protocol and is not
+silently treated as equivalent.
 
-## Inspect the live boundary
+Compatible base URLs must be absolute HTTP(S) URLs without a query string or
+embedded `user:password@host` credentials. A gateway that requires query-based
+authentication or routing needs a custom `HttpClientExt` or Rig provider
+extension that rewrites the final request URI; pass that configured client
+through `openai_responses::from_client`. Merely putting a query string or
+credential in Rig's base URL is unsupported and risks leaking secrets into URI
+telemetry.
 
-`openai_probe` makes the provider boundary visible without adding an agent
-runtime. It prints the normalized Rig request, each normalized stream event,
-and Rig's final aggregated assistant choice.
+## OpenAI Chat Completions
+
+Chat Completions is a separate wire contract, not a compatibility mode for
+Responses:
+
+```rust,no_run
+use bone_provider::{
+    protocol::openai_chat_completions,
+    rig::message::Message,
+};
+
+# async fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
+let endpoint = openai_chat_completions::official("openai-chat", api_key)?;
+let model = endpoint.model("your-chat-completions-model")?;
+
+assert_eq!(model.endpoint_id(), "openai-chat");
+assert_eq!(model.protocol().as_str(), "openai-chat-completions");
+
+let response = model
+    .request(Message::user("Hello"))
+    .max_tokens(256)
+    .send()
+    .await?;
+# Ok(())
+# }
+```
+
+For a compatible API root, use the Chat-specific constructor:
+
+```rust,no_run
+use bone_provider::protocol::openai_chat_completions;
+
+# fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
+let endpoint = openai_chat_completions::compatible(
+    "chat-gateway",
+    api_key,
+    "https://gateway.example/v1",
+)?;
+let model = endpoint.model("vendor-chat-model")?;
+# Ok(())
+# }
+```
+
+This base URL is the prefix to which `/chat/completions` is appended. The same
+absolute HTTP(S), no-query, no-embedded-credentials rule applies as for
+Responses. Query-based routing requires a custom `HttpClientExt` or Rig
+provider extension that constructs the final URI, injected through
+`openai_chat_completions::from_client`.
+
+An OpenAI-compatible service may implement `/responses`, `/chat/completions`,
+or both. Supporting either path says nothing about support for the other. Pick
+the constructor that matches the service's documented wire protocol; BONE
+never probes one and silently falls back to the other.
+
+## Anthropic Messages
+
+```rust,no_run
+use bone_provider::{
+    protocol::anthropic_messages,
+    rig::message::Message,
+};
+
+# async fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
+let endpoint = anthropic_messages::official("anthropic-primary", api_key)?;
+let model = endpoint.model("claude-model")?;
+
+assert_eq!(model.endpoint_id(), "anthropic-primary");
+assert_eq!(model.protocol().as_str(), "anthropic-messages");
+
+let response = model
+    .request(Message::user("Hello"))
+    .max_tokens(256)
+    .send()
+    .await?;
+# Ok(())
+# }
+```
+
+`anthropic_messages::compatible` accepts a Messages-compatible base URL. Rig
+normalizes a trailing `/v1`, `/messages`, or `/v1/messages` and sends the final
+request to `/v1/messages` exactly once.
+
+The same base-URL rule applies: it must be an absolute HTTP(S) URL without a
+query string or embedded credentials. Query-based routing requires a custom
+`HttpClientExt` or Rig provider extension that rewrites the final URI, injected
+through `anthropic_messages::from_client`; a query-bearing ordinary base URL is
+not sufficient.
+
+## Custom clients and model options
+
+Each protocol module exposes `from_client`. Use it for custom authentication
+headers, other custom headers, a custom base URL, or a custom Rig
+`HttpClientExt` implementation. Keep credentials in headers or transport
+configuration, never in the URL. The transport's generic type is erased when
+the endpoint is built.
+
+Protocol-specific model options belong in that protocol module's
+`from_model_factory` escape hatch. For example, an Anthropic caller can build
+Rig models with prompt caching enabled without adding a generic JSON options
+bag to BONE:
+
+```rust,no_run
+use bone_provider::{
+    protocol::anthropic_messages,
+    rig::{client::CompletionClient, providers::anthropic},
+};
+
+# fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
+let client = anthropic::Client::new(api_key)?;
+let endpoint = anthropic_messages::from_model_factory(
+    "anthropic-cached",
+    move |model_id| {
+        client
+            .completion_model(model_id)
+            .with_automatic_caching()
+    },
+)?;
+# Ok(())
+# }
+```
+
+BONE does not read environment variables or persist credentials. Constructors
+receive resolved values explicitly. Local construction failures use
+`ConfigError`; network, protocol, and model failures remain Rig
+`CompletionError` values.
+
+## What belongs elsewhere
+
+The future runtime/config layer owns configuration deserialization, secret
+resolution, endpoint registries, routing, retries, fallback, rate limiting,
+budgets, and pricing. None of those policies belong in `bone-provider`.
+
+Adding a standard compatible service should normally require only new runtime
+configuration and live certification. Add a new `Protocol` variant and module
+only when the URL, headers, request/response JSON, or stream semantics form a
+genuinely different wire contract.
+
+## Inspect the OpenAI boundary
+
+The example prints endpoint identity, protocol identity, the normalized Rig
+request, stream events, and the final aggregated assistant choice:
 
 ```sh
 export OPENAI_API_KEY='...'
 export BONE_OPENAI_MODEL='...'
-# Optional for DeepSeek, New API, or another compatible endpoint:
+# Optional for a compatible endpoint:
 export OPENAI_BASE_URL='https://gateway.example/v1'
 
-# Observe reasoning and text events.
-cargo run -p bone-provider --example openai_probe -- text
-
-# Force a tool call. The probe displays it but deliberately does not execute it.
-cargo run -p bone-provider --example openai_probe -- tool
+cargo run -p bone-provider --example openai_responses_probe -- text
+cargo run -p bone-provider --example openai_responses_probe -- tool
 ```
 
-The tool mode defines a harmless fictional `inspect_path` function so the
-request and response shapes can be inspected before BONE has a tool runtime.
-No filesystem access occurs.
+Tool mode defines a harmless fictional `inspect_path` function and displays
+the model's call. It deliberately does not execute the tool or access the
+filesystem.
+
+Chat Completions has its own probe and model variable. It calls
+`/chat/completions` and never falls back to Responses:
+
+```sh
+export OPENAI_API_KEY='...'
+export BONE_OPENAI_CHAT_MODEL='...'
+# Optional for a compatible endpoint:
+export OPENAI_BASE_URL='https://gateway.example/v1'
+
+cargo run -p bone-provider --example openai_chat_completions_probe -- text
+cargo run -p bone-provider --example openai_chat_completions_probe -- tool
+```
+
+The two OpenAI probes reuse `OPENAI_API_KEY` and `OPENAI_BASE_URL` because one
+run represents one configured OpenAI-compatible service. Their model variables
+remain separate: `BONE_OPENAI_MODEL` selects a Responses-capable model, while
+`BONE_OPENAI_CHAT_MODEL` selects a Chat Completions-capable model. Set only the
+one the service supports. To certify services with different URLs or
+credentials, run the probes separately with the corresponding environment.
+
+The Anthropic probe exposes the same text/tool boundary for Messages:
+
+```sh
+export ANTHROPIC_API_KEY='...'
+export BONE_ANTHROPIC_MODEL='...'
+# Optional for a compatible endpoint:
+export ANTHROPIC_BASE_URL='https://gateway.example'
+
+cargo run -p bone-provider --example anthropic_messages_probe -- text
+cargo run -p bone-provider --example anthropic_messages_probe -- tool
+```

@@ -1,0 +1,3 @@
+data: {"id":"chatcmpl_truncated_1","object":"chat.completion.chunk","created":1700000003,"model":"chat-test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"partial"},"finish_reason":null}],"usage":null}
+
+data: [DONE]

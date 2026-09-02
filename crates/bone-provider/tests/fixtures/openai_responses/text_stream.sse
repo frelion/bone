@@ -1,0 +1,7 @@
+data: {"type":"response.output_text.delta","item_id":"msg_stream_1","output_index":0,"content_index":0,"sequence_number":1,"delta":"Hello"}
+
+data: {"type":"response.output_text.delta","item_id":"msg_stream_1","output_index":0,"content_index":0,"sequence_number":2,"delta":" stream"}
+
+data: {"type":"response.completed","sequence_number":3,"response":{"id":"resp_stream_1","object":"response","created_at":0,"status":"completed","model":"openai-test-model","usage":{"input_tokens":8,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":11},"output":[{"type":"message","id":"msg_stream_1","status":"completed","role":"assistant","content":[{"type":"output_text","annotations":[],"text":"Hello stream"}]}],"tools":[]}}
+
+: fixture-eof

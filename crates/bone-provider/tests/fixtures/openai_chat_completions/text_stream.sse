@@ -1,0 +1,9 @@
+data: {"id":"chatcmpl_stream_1","object":"chat.completion.chunk","created":1700000002,"model":"chat-test-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl_stream_1","object":"chat.completion.chunk","created":1700000002,"model":"chat-test-model","choices":[{"index":0,"delta":{"content":" stream"},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl_stream_1","object":"chat.completion.chunk","created":1700000002,"model":"chat-test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}
+
+data: {"id":"chatcmpl_stream_1","object":"chat.completion.chunk","created":1700000002,"model":"chat-test-model","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}}
+
+data: [DONE]

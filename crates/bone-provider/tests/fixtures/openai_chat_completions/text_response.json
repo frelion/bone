@@ -1,0 +1,23 @@
+{
+  "id": "chatcmpl_text_1",
+  "object": "chat.completion",
+  "created": 1700000000,
+  "model": "chat-test-model",
+  "system_fingerprint": "fp_test",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello from Chat Completions."
+      },
+      "logprobs": null,
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 8,
+    "completion_tokens": 5,
+    "total_tokens": 13
+  }
+}

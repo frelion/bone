@@ -2,7 +2,7 @@ use std::{env, error::Error, io};
 
 use bone_provider::{
     StreamedAssistantContent,
-    openai::{OpenAi, Reasoning, ReasoningEffort, ReasoningSummaryLevel, reasoning_params},
+    protocol::anthropic_messages,
     rig::{
         completion::ToolDefinition,
         message::{Message, ToolChoice},
@@ -24,23 +24,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
 
-    let api_key = required_env("OPENAI_API_KEY")?;
-    let model_id = required_env("BONE_OPENAI_MODEL")?;
-    let provider = match env::var("OPENAI_BASE_URL") {
-        Ok(base_url) => OpenAi::compatible(api_key, base_url)?,
-        Err(_) => OpenAi::new(api_key)?,
+    let api_key = required_env("ANTHROPIC_API_KEY")?;
+    let model_id = required_env("BONE_ANTHROPIC_MODEL")?;
+    let endpoint = match env::var("ANTHROPIC_BASE_URL") {
+        Ok(base_url) if !base_url.trim().is_empty() => {
+            anthropic_messages::compatible("anthropic-probe", api_key, base_url)?
+        }
+        _ => anthropic_messages::official("anthropic-probe", api_key)?,
     };
-    let model = provider.model(&model_id)?;
+    let model = endpoint.model(&model_id)?;
 
     let mut request = model
         .request(Message::user(mode.prompt()))
-        .preamble("This is a provider-boundary probe. Follow the user request exactly.".to_owned())
-        .max_tokens(1_024)
-        .additional_params(reasoning_params(
-            Reasoning::new()
-                .with_effort(ReasoningEffort::Low)
-                .with_summary_level(ReasoningSummaryLevel::Auto),
-        ));
+        .preamble("This is a protocol-boundary probe. Follow the user request exactly.".to_owned())
+        .max_tokens(1_024);
 
     if matches!(mode, Mode::Tool) {
         request = request
@@ -50,6 +47,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             });
     }
 
+    println!("endpoint: {}", model.endpoint_id());
+    println!("protocol: {:?}", model.protocol());
     println!("model: {model_id}");
     println!("mode: {}", mode.name());
     if matches!(mode, Mode::Tool) {
@@ -63,14 +62,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let mut stream = model.stream(request).await?;
-    println!("provider: {}\n", stream.provider());
+    println!("rig.provider: {}\n", stream.provider());
 
     while let Some(item) = stream.next().await {
         match item {
             Ok(event) => print_event(event)?,
-            // Rig can surface a recoverable malformed frame and then continue.
-            // Drain to `None`; the terminal record below decides completeness.
-            Err(error) => eprintln!("[stream.error] {error}"),
+            Err(error) => return Err(error.into()),
         }
     }
 
@@ -203,21 +200,9 @@ fn print_event(event: StreamedAssistantContent) -> Result<(), serde_json::Error>
 
 fn print_help() {
     println!(
-        "\
-Inspect Rig's normalized OpenAI streaming boundary.
-
-Usage:
-  cargo run -p bone-provider --example openai_probe -- [text|tool]
-
-Required environment:
-  OPENAI_API_KEY       OpenAI API key
-  BONE_OPENAI_MODEL    Reasoning-capable OpenAI model identifier
-
-Optional environment:
-  OPENAI_BASE_URL      OpenAI Responses-compatible API root
-
-Modes:
-  text   Observe reasoning, text, terminal, and aggregated events (default)
-  tool   Force one inspect_path call and display it without executing it"
+        "Anthropic Messages boundary probe\n\n\
+         Usage:\n  cargo run -p bone-provider --example anthropic_messages_probe -- [text|tool]\n\n\
+         Required environment:\n  ANTHROPIC_API_KEY\n  BONE_ANTHROPIC_MODEL\n\n\
+         Optional environment:\n  ANTHROPIC_BASE_URL  Anthropic-compatible endpoint base URL"
     );
 }

@@ -90,6 +90,7 @@ dependencies = [
 name = "bone-provider"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
  "rig-core",
  "serde_json",

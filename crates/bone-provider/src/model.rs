@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use rig_core::{
     completion::{
@@ -8,6 +8,8 @@ use rig_core::{
     message::Message,
     streaming::StreamingCompletionResponse,
 };
+
+use crate::Protocol;
 
 type CompletionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CompletionResponse, CompletionError>> + Send + 'a>>;
@@ -40,23 +42,51 @@ where
 /// A selected Rig model with its concrete provider type erased.
 ///
 /// Rig's [`CompletionModel`] uses return-position `impl Future`, so the trait
-/// cannot itself be used as `dyn CompletionModel`. This handle is the only
-/// abstraction BONE adds to Rig's model path.
+/// cannot itself be used as `dyn CompletionModel`. This handle keeps that
+/// concrete model type out of runtime code while preserving Rig's native
+/// request and response types.
 #[derive(Clone)]
 pub struct Model {
+    endpoint_id: Arc<str>,
+    protocol: Protocol,
     id: Arc<str>,
     inner: Arc<dyn ErasedModel>,
 }
 
+impl fmt::Debug for Model {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Model")
+            .field("endpoint_id", &self.endpoint_id)
+            .field("protocol", &self.protocol)
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Model {
     pub(crate) fn new(
-        id: impl Into<String>,
+        endpoint_id: Arc<str>,
+        protocol: Protocol,
+        id: Arc<str>,
         inner: impl CompletionModel + Send + Sync + 'static,
     ) -> Self {
         Self {
-            id: Arc::from(id.into()),
+            endpoint_id,
+            protocol,
+            id,
             inner: Arc::new(inner),
         }
+    }
+
+    /// The application-defined identity of the endpoint that selected this model.
+    pub fn endpoint_id(&self) -> &str {
+        &self.endpoint_id
+    }
+
+    /// The wire protocol used by this model.
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
     }
 
     /// The configured model identifier.
@@ -128,6 +158,7 @@ mod tests {
     };
 
     use super::Model;
+    use crate::Protocol;
 
     #[derive(Clone)]
     struct FakeModel {
@@ -158,7 +189,9 @@ mod tests {
     async fn erases_a_rig_model_without_changing_its_stream() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model = Model::new(
-            "fake-model",
+            Arc::from("fake-endpoint"),
+            Protocol::OpenAiResponses,
+            Arc::from("fake-model"),
             FakeModel {
                 calls: Arc::clone(&calls),
             },
@@ -170,6 +203,8 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(model.endpoint_id(), "fake-endpoint");
+        assert_eq!(model.protocol(), Protocol::OpenAiResponses);
         assert_eq!(model.id(), "fake-model");
         assert_eq!(stream.provider(), "fake");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -179,7 +214,9 @@ mod tests {
     async fn direct_calls_validate_rig_requests_before_dispatch() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model = Model::new(
-            "fake-model",
+            Arc::from("fake-endpoint"),
+            Protocol::OpenAiResponses,
+            Arc::from("fake-model"),
             FakeModel {
                 calls: Arc::clone(&calls),
             },

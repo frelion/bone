@@ -1,0 +1,71 @@
+name: Provider live certification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provider-live
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: Explicit live probes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+      BONE_OPENAI_MODEL: ${{ vars.BONE_OPENAI_MODEL }}
+      BONE_OPENAI_CHAT_MODEL: ${{ vars.BONE_OPENAI_CHAT_MODEL }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+      BONE_ANTHROPIC_MODEL: ${{ vars.BONE_ANTHROPIC_MODEL }}
+    steps:
+      - name: Validate live certification configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          openai_key=false
+          openai_responses_model=false
+          openai_chat_model=false
+          anthropic_key=false
+          anthropic_model=false
+
+          [[ -n "$OPENAI_API_KEY" ]] && openai_key=true
+          [[ -n "$BONE_OPENAI_MODEL" ]] && openai_responses_model=true
+          [[ -n "$BONE_OPENAI_CHAT_MODEL" ]] && openai_chat_model=true
+          [[ -n "$ANTHROPIC_API_KEY" ]] && anthropic_key=true
+          [[ -n "$BONE_ANTHROPIC_MODEL" ]] && anthropic_model=true
+
+          if [[ "$openai_key" == false && ( "$openai_responses_model" == true || "$openai_chat_model" == true ) ]]; then
+            echo "OpenAI certification requires OPENAI_API_KEY for every selected OpenAI protocol." >&2
+            exit 1
+          fi
+          if [[ "$openai_key" == true && "$openai_responses_model" == false && "$openai_chat_model" == false ]]; then
+            echo "OPENAI_API_KEY requires BONE_OPENAI_MODEL and/or BONE_OPENAI_CHAT_MODEL." >&2
+            exit 1
+          fi
+          if [[ "$anthropic_key" != "$anthropic_model" ]]; then
+            echo "Anthropic certification requires both ANTHROPIC_API_KEY and BONE_ANTHROPIC_MODEL." >&2
+            exit 1
+          fi
+          if [[ "$openai_responses_model" == false && "$openai_chat_model" == false && "$anthropic_model" == false ]]; then
+            echo "Configure at least one protocol model with its credential." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Certify OpenAI Responses
+        if: ${{ env.OPENAI_API_KEY != '' && env.BONE_OPENAI_MODEL != '' }}
+        run: cargo test -p bone-provider --test live_openai_responses -- --ignored --nocapture
+      - name: Certify OpenAI Chat Completions
+        if: ${{ env.OPENAI_API_KEY != '' && env.BONE_OPENAI_CHAT_MODEL != '' }}
+        run: cargo test -p bone-provider --test live_openai_chat_completions -- --ignored --nocapture
+      - name: Certify Anthropic Messages
+        if: ${{ env.ANTHROPIC_API_KEY != '' && env.BONE_ANTHROPIC_MODEL != '' }}
+        run: cargo test -p bone-provider --test live_anthropic_messages -- --ignored --nocapture
