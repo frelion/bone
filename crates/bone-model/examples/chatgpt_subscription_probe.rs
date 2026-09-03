@@ -1,10 +1,10 @@
 use std::{env, error::Error, io};
 
 use bone_model::{
-    StreamedAssistantContent,
     rig::{
         completion::ToolDefinition,
         message::{Message, ToolChoice},
+        streaming::StreamedAssistantContent,
     },
     service::chatgpt_subscription,
 };

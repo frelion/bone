@@ -1,5 +1,7 @@
 use bone_model::{
-    Protocol, StreamedAssistantContent, protocol::openai_chat_completions, rig::message::Message,
+    Protocol,
+    protocol::openai_chat_completions,
+    rig::{message::Message, streaming::StreamedAssistantContent},
 };
 use futures_util::StreamExt;
 

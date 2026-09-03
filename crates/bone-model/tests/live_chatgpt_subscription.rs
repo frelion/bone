@@ -1,8 +1,9 @@
 use bone_model::{
-    Protocol, StreamedAssistantContent,
+    Protocol,
     rig::{
         completion::{FinishReason, ToolDefinition},
         message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent},
+        streaming::StreamedAssistantContent,
     },
     service::chatgpt_subscription,
 };

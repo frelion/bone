@@ -20,7 +20,3 @@ pub use error::ConfigError;
 pub use model::Model;
 pub use protocol::Protocol;
 pub use rig_core as rig;
-pub use rig_core::{
-    completion::{CompletionError, CompletionRequest, CompletionResponse},
-    streaming::{StreamedAssistantContent, StreamingCompletionResponse},
-};

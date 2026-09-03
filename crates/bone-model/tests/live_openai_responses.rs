@@ -1,4 +1,7 @@
-use bone_model::{StreamedAssistantContent, protocol::openai_responses, rig::message::Message};
+use bone_model::{
+    protocol::openai_responses,
+    rig::{message::Message, streaming::StreamedAssistantContent},
+};
 use futures_util::StreamExt;
 
 #[tokio::test]

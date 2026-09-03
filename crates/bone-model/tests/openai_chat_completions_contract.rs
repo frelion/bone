@@ -1,13 +1,14 @@
 mod support;
 
 use bone_model::{
-    Protocol, StreamedAssistantContent,
+    Protocol,
     protocol::openai_chat_completions,
     rig::{
         client::CompletionClient,
         completion::{CompletionError, FinishReason, ToolDefinition},
         message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent},
         providers::openai as rig_openai,
+        streaming::StreamedAssistantContent,
     },
 };
 use futures_util::StreamExt;

@@ -1,7 +1,7 @@
 mod support;
 
 use bone_model::{
-    Protocol, StreamedAssistantContent,
+    Protocol,
     protocol::openai_responses::{
         self, Reasoning, ReasoningEffort, ReasoningSummaryLevel, reasoning_params,
     },
@@ -11,6 +11,7 @@ use bone_model::{
             AssistantContent, Message, ReasoningContent, ToolChoice, ToolResultContent, UserContent,
         },
         providers::openai as rig_openai,
+        streaming::StreamedAssistantContent,
     },
 };
 use futures_util::StreamExt;

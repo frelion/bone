@@ -1,11 +1,11 @@
 use std::{env, error::Error, io};
 
 use bone_model::{
-    StreamedAssistantContent,
     protocol::openai_chat_completions,
     rig::{
         completion::ToolDefinition,
         message::{AssistantContent, Message, ToolChoice},
+        streaming::StreamedAssistantContent,
     },
 };
 use futures_util::StreamExt;

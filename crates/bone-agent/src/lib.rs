@@ -16,6 +16,6 @@ mod error;
 mod runtime;
 mod tools;
 
-pub use action::{Action, ActionOutcome, ActionState, ToolExecution, Turn};
+pub use action::{Action, ActionOutcome, ToolExecution, Turn};
 pub use agent::{Agent, AgentReply};
 pub use error::{ActionError, AgentConfigError, AgentError};

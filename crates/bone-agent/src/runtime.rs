@@ -12,10 +12,40 @@ use bone_model::rig::{
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 
 use crate::{
-    Action, ActionError, ActionState, Turn,
-    agent::Limits,
+    Action, ActionError, Turn,
+    action::ActionState,
     tools::{Tools, missing_tool},
 };
+
+const DEFAULT_MAX_DECISIONS: usize = 32;
+const DEFAULT_MAX_ACTIONS_PER_DECISION: usize = 8;
+const DEFAULT_MAX_TURNS: usize = 32;
+const DEFAULT_MAX_TOOL_CALLS_PER_TURN: usize = 16;
+const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(900);
+
+#[derive(Clone, Copy)]
+pub(crate) struct Limits {
+    pub(crate) max_decisions: usize,
+    pub(crate) max_actions_per_decision: usize,
+    pub(crate) max_turns: usize,
+    pub(crate) max_tool_calls_per_turn: usize,
+    pub(crate) model_timeout: Duration,
+    pub(crate) tool_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_decisions: DEFAULT_MAX_DECISIONS,
+            max_actions_per_decision: DEFAULT_MAX_ACTIONS_PER_DECISION,
+            max_turns: DEFAULT_MAX_TURNS,
+            max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+            model_timeout: DEFAULT_MODEL_TIMEOUT,
+            tool_timeout: DEFAULT_TOOL_TIMEOUT,
+        }
+    }
+}
 
 struct FinishedTool {
     action: usize,

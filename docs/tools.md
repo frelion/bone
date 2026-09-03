@@ -3,13 +3,16 @@
 `bone-tools` is BONE's provider-independent local tool crate. It is a sibling
 of `bone-model`; neither crate depends on the other. Both depend on Rig's
 normalized interfaces, while `bone-tools` uses the independent `bone-config`
-service for its config tool. `bone-agent` composes a selected model with tools
-supplied by the host.
+service for its config tool. `bone-cli` is the composition root: it creates a
+model and concrete tools, then supplies them to `bone-agent`. The production
+`bone-agent` crate does not depend on `bone-tools`.
 
 ```text
-bone-model ──► rig-core ◄── bone-tools ──► bone-config
-       ▲                         ▲
-       └────── bone-agent ─────┘
+bone-cli
+├──► bone-agent ──► bone-model ──► rig-core
+├──► bone-model ─────────────────► rig-core
+└──► bone-tools ──┬──────────────► rig-core
+                  └──────────────► bone-config
 ```
 
 The first tool set is deliberately small:

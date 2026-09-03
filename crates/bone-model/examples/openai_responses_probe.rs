@@ -1,13 +1,13 @@
 use std::{env, error::Error, io};
 
 use bone_model::{
-    StreamedAssistantContent,
     protocol::openai_responses::{
         self, Reasoning, ReasoningEffort, ReasoningSummaryLevel, reasoning_params,
     },
     rig::{
         completion::ToolDefinition,
         message::{Message, ToolChoice},
+        streaming::StreamedAssistantContent,
     },
 };
 use futures_util::StreamExt;

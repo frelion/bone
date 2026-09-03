@@ -8,7 +8,9 @@ use bone_model::rig::{
     },
 };
 
-use crate::{AgentConfigError, agent::START_ACTION_TOOL};
+use crate::AgentConfigError;
+
+pub(crate) const START_ACTION_TOOL: &str = "start_action";
 
 #[derive(Debug, Default)]
 pub(crate) struct Tools {

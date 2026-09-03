@@ -1,12 +1,13 @@
 mod support;
 
 use bone_model::{
-    Protocol, StreamedAssistantContent,
+    Protocol,
     protocol::anthropic_messages,
     rig::{
         completion::{CompletionError, FinishReason, ToolDefinition},
         message::{AssistantContent, Message, ToolChoice, ToolResultContent, UserContent},
         providers::anthropic as rig_anthropic,
+        streaming::StreamedAssistantContent,
     },
 };
 use futures_util::StreamExt;

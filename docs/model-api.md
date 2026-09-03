@@ -171,7 +171,8 @@ Important boundaries:
   stable reconnect error; 401/403 bodies and Responses SSE provider-error
   envelopes are redacted. Non-authentication HTTP and transport diagnostics
   retain their Rig `CompletionError` classification and may contain provider
-  text, so raw errors still belong only in trusted logs.
+  text, so raw errors still belong only in trusted logs. The type is available
+  through `bone_model::rig::completion::CompletionError`.
 - The ownership, permission, link, and `O_NOFOLLOW` checks protect BONE's
   managed preparation and cooperating BONE processes. The pinned Rig patch
   replaces credentials atomically on Unix using a private `0600` sibling,
@@ -313,7 +314,8 @@ OAuth service adapter may maintain the independent token cache documented by
 that adapter. Local construction failures use `ConfigError`; the explicit
 subscription handshake returns a stable service-local error; request-time
 network, protocol, and model failures remain Rig `CompletionError` values and
-must be treated as potentially sensitive provider diagnostics.
+must be treated as potentially sensitive provider diagnostics. The type is
+available through `bone_model::rig::completion::CompletionError`.
 
 ## What belongs elsewhere
 

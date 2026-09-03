@@ -1,6 +1,6 @@
 use std::{fmt, time::Duration};
 
-use bone_model::{CompletionError, rig::completion::FinishReason};
+use bone_model::rig::completion::{CompletionError, FinishReason};
 use thiserror::Error;
 
 /// Why the agent could not produce a reply.
@@ -101,7 +101,7 @@ pub enum AgentConfigError {
 
 #[cfg(test)]
 mod tests {
-    use bone_model::CompletionError;
+    use bone_model::rig::completion::CompletionError;
 
     use super::{ActionError, AgentError};
 

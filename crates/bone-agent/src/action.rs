@@ -6,12 +6,8 @@ use bone_model::rig::{
 
 use crate::ActionError;
 
-/// Whether an action can advance, is waiting for tools, or has ended.
-///
-/// This value is derived from the action's turns and outcome; it is never
-/// stored as a second source of truth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActionState {
+pub(crate) enum ActionState {
     Ready,
     Waiting,
     Finished,
@@ -41,10 +37,11 @@ impl ActionOutcome {
     }
 }
 
-/// One independently resumable piece of work.
+/// One independently advancing piece of work.
 ///
 /// Each action owns its model transcript. This keeps another action's messages
-/// from being inserted between a tool call and its result.
+/// from being inserted between a tool call and its result. Public callers
+/// receive only settled actions through [`crate::AgentReply`].
 pub struct Action {
     intent: String,
     context: Vec<Message>,
@@ -75,8 +72,11 @@ impl Action {
         &self.turns
     }
 
-    pub fn outcome(&self) -> Option<&ActionOutcome> {
-        self.outcome.as_ref()
+    /// The action's terminal outcome.
+    pub fn outcome(&self) -> &ActionOutcome {
+        self.outcome
+            .as_ref()
+            .expect("actions returned by Agent are settled")
     }
 
     pub fn output(&self) -> Option<&str> {
@@ -87,7 +87,7 @@ impl Action {
         self.outcome.as_ref().and_then(ActionOutcome::error)
     }
 
-    pub fn state(&self) -> ActionState {
+    pub(crate) fn state(&self) -> ActionState {
         if self.outcome.is_some() {
             ActionState::Finished
         } else if self.turns.last().is_some_and(Turn::is_waiting) {
@@ -212,7 +212,7 @@ impl Turn {
         &self.tools
     }
 
-    pub fn is_waiting(&self) -> bool {
+    pub(crate) fn is_waiting(&self) -> bool {
         self.tools.iter().any(|tool| tool.result.is_none())
     }
 
@@ -266,7 +266,10 @@ impl ToolExecution {
         &self.call
     }
 
-    pub fn result(&self) -> Option<&ExecutionToolResult> {
-        self.result.as_ref()
+    /// The terminal execution result.
+    pub fn result(&self) -> &ExecutionToolResult {
+        self.result
+            .as_ref()
+            .expect("tool executions returned by Agent are settled")
     }
 }

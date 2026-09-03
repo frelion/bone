@@ -1,11 +1,11 @@
 use std::{env, error::Error, io};
 
 use bone_model::{
-    StreamedAssistantContent,
     protocol::anthropic_messages,
     rig::{
         completion::ToolDefinition,
         message::{Message, ToolChoice},
+        streaming::StreamedAssistantContent,
     },
 };
 use futures_util::StreamExt;

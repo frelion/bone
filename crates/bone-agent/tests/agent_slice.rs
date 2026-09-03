@@ -87,7 +87,7 @@ async fn real_provider_and_read_tool_cross_the_whole_agent_slice() {
         "Read note.txt and report its exact content"
     );
     assert_eq!(action.turns().len(), 2);
-    let read = action.turns()[0].tools()[0].result().expect("read result");
+    let read = action.turns()[0].tools()[0].result();
     assert!(read.is_success());
     assert!(read.output().render().contains("verified slice"));
 
