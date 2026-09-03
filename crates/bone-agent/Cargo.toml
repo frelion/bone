@@ -8,10 +8,13 @@ publish = false
 [dependencies]
 bone-provider = { path = "../bone-provider" }
 futures-util.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 
 [dev-dependencies]
+bone-tools = { path = "../bone-tools" }
 rig-core = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

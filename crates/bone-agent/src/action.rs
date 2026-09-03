@@ -47,14 +47,21 @@ impl ActionOutcome {
 /// from being inserted between a tool call and its result.
 pub struct Action {
     intent: String,
+    context: Vec<Message>,
     turns: Vec<Turn>,
     outcome: Option<ActionOutcome>,
 }
 
 impl Action {
-    pub fn new(intent: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(intent: impl Into<String>) -> Self {
+        Self::with_context(intent, Vec::new())
+    }
+
+    pub(crate) fn with_context(intent: impl Into<String>, context: Vec<Message>) -> Self {
         Self {
             intent: intent.into(),
+            context,
             turns: Vec::new(),
             outcome: None,
         }
@@ -91,10 +98,11 @@ impl Action {
     }
 
     pub(crate) fn messages(&self, instructions: Option<&str>) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(2 + self.turns.len() * 2);
+        let mut messages = Vec::with_capacity(2 + self.context.len() + self.turns.len() * 2);
         if let Some(instructions) = instructions.filter(|text| !text.trim().is_empty()) {
             messages.push(Message::system(instructions));
         }
+        messages.extend(self.context.iter().cloned());
         messages.push(Message::user(self.intent.clone()));
 
         for turn in &self.turns {
@@ -111,6 +119,14 @@ impl Action {
         }
 
         messages
+    }
+
+    pub(crate) fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
+        self.context.iter().flat_map(message_tool_calls).chain(
+            self.turns
+                .iter()
+                .flat_map(|turn| turn.tools.iter().map(ToolExecution::call)),
+        )
     }
 
     pub(crate) fn push_turn(&mut self, turn: Turn) -> usize {
@@ -140,6 +156,17 @@ impl Action {
     pub(crate) fn fail(&mut self, error: ActionError) {
         self.outcome = Some(ActionOutcome::Failed(error));
     }
+}
+
+fn message_tool_calls(message: &Message) -> impl Iterator<Item = &ToolCall> {
+    let content = match message {
+        Message::Assistant { content, .. } => content.as_slice(),
+        Message::System { .. } | Message::User { .. } => &[],
+    };
+    content.iter().filter_map(|content| match content {
+        AssistantContent::ToolCall(call) => Some(call),
+        _ => None,
+    })
 }
 
 /// One model decision and the tool calls produced by that decision.

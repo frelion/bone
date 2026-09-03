@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/bone-agent",
+    "crates/bone-cli",
     "crates/bone-config",
     "crates/bone-provider",
     "crates/bone-tools",

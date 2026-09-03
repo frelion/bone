@@ -8,7 +8,7 @@ use bone_provider::rig::{
     },
 };
 
-use crate::AgentConfigError;
+use crate::{AgentConfigError, agent::START_ACTION_TOOL};
 
 #[derive(Debug, Default)]
 pub(crate) struct Tools {
@@ -30,6 +30,9 @@ impl Tools {
         tool: PortableDynamicTool,
     ) -> Result<(), AgentConfigError> {
         let name = tool.name().to_owned();
+        if name == START_ACTION_TOOL {
+            return Err(AgentConfigError::ReservedTool);
+        }
         if self.entries.contains_key(&name) {
             return Err(AgentConfigError::DuplicateTool(name));
         }

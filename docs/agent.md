@@ -1,26 +1,58 @@
 # Agent core
 
-`bone-agent` executes independent Actions. It deliberately stops at that
-boundary: Exchange, Conversation, planning, teams, persistence, and UI events
-belong above this crate.
+`bone-agent` gives the user one conversational `Agent`. The user sends
+messages; the Agent decides whether to reply or create Actions. Callers cannot
+construct or submit Actions directly.
 
 ```text
-Agent
-├── Action A
-│   ├── Turn 1 ── tool A ─┐
-│   │                     ├── next Turn only after the whole batch settles
-│   │          ── tool B ─┘
-│   └── Turn 2 ── final output
-└── Action B
-    └── Turn 1 ── final output
+User message
+    ↓
+Agent decision
+    ├── final reply
+    └── start Action(s)
+            └── Turn(s)
+                    └── optional tool calls and results
+            ↓
+        ActionOutcome
+            └────────→ next Agent decision
 ```
 
-An **Action** is one independently resumable piece of work with its own model
-transcript. A **Turn** is one model decision plus the tool batch caused by that
-decision. Tool failure is recorded as an observation for the next Turn; it
-does not automatically fail the Action.
+An **Action** is one semantic piece of work selected by the Agent. It may be
+pure reasoning or tool-backed work, and it owns an isolated context plus one or
+more Turns. A **Turn** is one model decision and the complete tool batch caused
+by that decision. A tool failure is an observation for the next Turn; it does
+not automatically fail the Action.
 
-Action state is derived rather than stored:
+The Agent's private `start_action` command is only how a model asks the runtime
+to create an Action. It is not the Action itself and never appears as one of an
+Action's tools.
+
+## API
+
+```rust,ignore
+let environment = ToolEnvironment::new(workspace)?;
+let mut agent = Agent::new(model)
+    .instructions("Inspect facts before making claims.")
+    .tool(environment.read())?
+    .tool(environment.glob())?
+    .tool(environment.grep())?;
+
+let reply = agent.chat("Read Cargo.toml and explain the workspace").await?;
+println!("{}", reply.text());
+
+for action in reply.actions() {
+    println!("{}: {} turn(s)", action.intent(), action.turns().len());
+}
+```
+
+`Agent::chat` keeps provider-valid message history. It commits the new history
+only after producing a final reply; cancelling or failing a response leaves the
+previous history unchanged. `AgentReply` contains the final user-facing text
+and the complete Actions that informed it.
+
+## Scheduling
+
+Action state is derived from its trace:
 
 | Facts | State |
 | --- | --- |
@@ -28,59 +60,53 @@ Action state is derived rather than stored:
 | A tool result is unresolved | `Waiting` |
 | Otherwise | `Ready` |
 
-The scheduler has four rules:
+The runtime follows four rules:
 
-1. It makes at most one model request at a time.
-2. All tool calls from one Turn start concurrently.
-3. The Action resumes only after every tool in that Turn has settled.
-4. While one Action waits for tools, another ready Action may advance.
+1. One Agent makes at most one model request at a time.
+2. Tool calls from one Turn start concurrently.
+3. An Action starts its next Turn only after that Turn's complete tool batch settles.
+4. While Action A waits for a long tool, another ready Action B may advance.
 
-This is enough to prevent a long command in Action A from occupying the
-Agent's decision loop: Action B can continue. A tool that never returns still
-keeps A in `Waiting`; this first API waits for all supplied Actions before
-returning and does not yet expose a live handle for adding, observing, or
-cancelling one Action independently. Dropping the whole `run` future cancels
-its in-flight tool futures.
+One Agent decision can create several independent Actions. The first version
+waits for that whole Action batch before asking the Agent to choose more work.
+This keeps provider tool-result ordering unambiguous without introducing a
+background actor or Exchange lifecycle.
 
-## API
+Finite decision, Turn, tool-fan-out, and model-request limits prevent runaway
+model loops. Every tool future is also wrapped in a runtime timeout (fifteen
+minutes by default, configurable with `Agent::tool_timeout`). A tool may enforce
+a shorter domain-specific deadline. Expiry drops a cooperative future and
+becomes an ordinary failed tool observation, so the Action can recover or
+finish. Tool implementations must not block their executor thread and must own
+cancellation of detached work.
 
-```rust,ignore
-let agent = Agent::new(model)
-    .instructions("Work carefully and report verified results.")
-    .tool(read)?
-    .tool(bash)?
-    .max_turns(24)?;
+The history commit rule applies only to the model transcript. Cancelling a
+`chat` does not undo external effects already performed by a tool; effectful
+tools must therefore provide their own cancellation and retry guarantees. In
+particular, dropping a tool future must not leave effects or cleanup that can
+conflict with a later Turn. The first runnable slice avoids that boundary by
+exposing only read-only tools; write tools are deliberately not wired in yet.
 
-let action = agent.act("Find and explain the failing test").await;
-match action.outcome() {
-    Some(ActionOutcome::Completed { output }) => println!("{output}"),
-    Some(ActionOutcome::Failed(error)) => eprintln!("{error}"),
-    None => unreachable!("act runs an Action to a terminal outcome"),
-}
+## Runnable slice
 
-let actions = agent
-    .run([
-        Action::new("Inspect the provider implementation"),
-        Action::new("Run the focused integration tests"),
-    ])
-    .await;
+The `bone` binary connects the same core through the unified
+`bone_provider::Model` interface to a ChatGPT subscription and the real
+workspace-bound `read`, `glob`, and `grep` tools:
+
+```text
+BONE_MODEL='<model available to your subscription>' \
+  cargo run -p bone-cli -- "Read Cargo.toml and list the workspace crates"
 ```
 
-`run` preserves input order and failure isolation. Each returned Action keeps
-its complete Turn and tool trace, including work that occurred before a later
-model failure. Operator-facing provider diagnostics remain available as the
-error source, while the normal error display does not expose raw provider
-response bodies.
+Run it without a message for a small interactive prompt. No API key is needed.
+The first run may display a ChatGPT device-login URL and code; later runs reuse
+BONE's independent credential cache. This managed connector is experimental
+and currently requires Unix. It writes first-run device codes to stderr, so do
+not redirect authentication output to persistent logs. The CLI selects the
+service and renders login prompts; credential lifecycle and protocol
+translation end at `bone-provider`, while `bone-agent` receives only the
+selected `Model`. Run the CLI from the intended workspace: tools are read-only
+in this slice, but content they read is sent to the model.
 
-## Safety bounds
-
-The defaults are intentionally finite:
-
-- 32 model Turns per Action;
-- 16 tool calls per Turn;
-- 120 seconds per model request.
-
-If a response is truncated or exceeds the tool-call limit, the complete batch
-is marked skipped before any tool starts. Tool duration is left to the tool's
-own policy because some legitimate commands are long-running; its waiting
-future does not prevent other Actions from advancing.
+This crate intentionally does not yet model Exchange, Conversation, Task,
+planning, persistence, teams, streaming UI, or a long-lived mailbox actor.

@@ -1,47 +1,80 @@
-use std::{collections::VecDeque, time::Duration};
+use std::time::Duration;
 
 use bone_provider::{
     Model,
     rig::{
-        completion::{AssistantContent, CompletionModel, CompletionResponse, FinishReason},
-        message::ToolCall,
-        tool::{PortableDynamicTool, PortableTool, ToolResult as ExecutionToolResult},
-        wasm_compat::{WasmBoxedFuture, timeout},
+        completion::{
+            AssistantContent, CompletionModel, CompletionResponse, FinishReason, ToolDefinition,
+        },
+        message::{Message, ToolCall, UserContent},
+        tool::{
+            PortableDynamicTool, PortableTool, ToolExecutionError, ToolOutput,
+            ToolResult as ExecutionToolResult,
+        },
+        wasm_compat::timeout,
     },
 };
-use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use serde::Deserialize;
+use serde_json::json;
 
 use crate::{
-    Action, ActionError, ActionState, AgentConfigError, Turn,
+    Action, ActionOutcome, AgentConfigError, AgentError,
+    runtime::{drive, final_text, unique_call_ids},
     tools::{Tools, missing_tool},
 };
 
+pub(crate) const START_ACTION_TOOL: &str = "start_action";
+const DEFAULT_MAX_DECISIONS: usize = 32;
+const DEFAULT_MAX_ACTIONS_PER_DECISION: usize = 8;
 const DEFAULT_MAX_TURNS: usize = 32;
 const DEFAULT_MAX_TOOL_CALLS_PER_TURN: usize = 16;
 const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(900);
+
+const AGENT_PROTOCOL: &str = "\
+You decide how to respond to the user. For any work that benefits from isolated \
+reasoning or tools, call start_action with a concise, self-contained intent. You \
+may start several independent actions in one response; they run concurrently. \
+Completed action outcomes will return as tool results. Start further actions when \
+needed. Give the user a final answer only when you have enough information. Never \
+claim that an action or tool succeeded before its result is returned.";
+
+const ACTION_PROTOCOL: &str = "\
+You are carrying out one action selected by the parent agent. Complete only that \
+action. Use the available tools when useful; an action may also be pure reasoning. \
+Tool failures are observations you may recover from. When the action is complete, \
+return a concise result for the parent agent. Do not address the user directly and \
+do not create further actions.";
 
 #[derive(Clone, Copy)]
-struct Limits {
-    max_turns: usize,
-    max_tool_calls_per_turn: usize,
-    model_timeout: Duration,
+pub(crate) struct Limits {
+    pub(crate) max_decisions: usize,
+    pub(crate) max_actions_per_decision: usize,
+    pub(crate) max_turns: usize,
+    pub(crate) max_tool_calls_per_turn: usize,
+    pub(crate) model_timeout: Duration,
+    pub(crate) tool_timeout: Duration,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_decisions: DEFAULT_MAX_DECISIONS,
+            max_actions_per_decision: DEFAULT_MAX_ACTIONS_PER_DECISION,
             max_turns: DEFAULT_MAX_TURNS,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS_PER_TURN,
             model_timeout: DEFAULT_MODEL_TIMEOUT,
+            tool_timeout: DEFAULT_TOOL_TIMEOUT,
         }
     }
 }
 
-/// A model and a small set of tools that advance actions.
+/// A conversational agent that chooses and advances its own actions.
 pub struct Agent {
     model: Model,
     instructions: Option<String>,
     tools: Tools,
+    history: Vec<Message>,
     limits: Limits,
 }
 
@@ -51,17 +84,22 @@ impl Agent {
             model,
             instructions: None,
             tools: Tools::default(),
+            history: Vec::new(),
             limits: Limits::default(),
         }
     }
 
-    /// Set the system instructions shared by every action.
+    /// Set instructions shared by the agent and every action it creates.
     pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = Some(instructions.into());
         self
     }
 
     /// Register a typed Rig portable tool.
+    ///
+    /// The tool future must not block its executor thread. It may be dropped
+    /// on cancellation or timeout and must not leave effects or cleanup that
+    /// can conflict with a later Turn.
     pub fn tool<T>(mut self, tool: T) -> Result<Self, AgentConfigError>
     where
         T: PortableTool + 'static,
@@ -73,6 +111,10 @@ impl Agent {
     }
 
     /// Register an already type-erased Rig portable tool.
+    ///
+    /// The tool future must not block its executor thread. It may be dropped
+    /// on cancellation or timeout and must not leave effects or cleanup that
+    /// can conflict with a later Turn.
     pub fn dynamic_tool(mut self, tool: PortableDynamicTool) -> Result<Self, AgentConfigError> {
         self.tools.register_dynamic(tool)?;
         Ok(self)
@@ -99,7 +141,7 @@ impl Agent {
         Ok(self)
     }
 
-    /// Change the hard deadline for one model request.
+    /// Change the runtime timeout for one model request.
     pub fn model_timeout(mut self, model_timeout: Duration) -> Result<Self, AgentConfigError> {
         if model_timeout.is_zero() {
             return Err(AgentConfigError::ZeroModelTimeout);
@@ -108,258 +150,286 @@ impl Agent {
         Ok(self)
     }
 
-    /// Advance one action until it completes or fails.
-    ///
-    /// The returned action always retains its complete trace. Inspect
-    /// [`Action::outcome`] or the convenience [`Action::output`] and
-    /// [`Action::error`] methods.
-    pub async fn act(&self, intent: impl Into<String>) -> Action {
-        self.run([Action::new(intent)])
-            .await
-            .pop()
-            .expect("running one intent produces one action")
+    /// Change the runtime timeout for one tool execution.
+    pub fn tool_timeout(mut self, tool_timeout: Duration) -> Result<Self, AgentConfigError> {
+        if tool_timeout.is_zero() {
+            return Err(AgentConfigError::ZeroToolTimeout);
+        }
+        self.limits.tool_timeout = tool_timeout;
+        Ok(self)
     }
 
-    /// Run independent actions until each has completed or failed.
+    /// Respond to one user message, creating actions whenever the model needs
+    /// independent reasoning or tool-backed work.
     ///
-    /// Results preserve input order. A waiting action does not block later
-    /// ready actions, and one action's failure does not stop the others.
-    pub async fn run<I>(&self, actions: I) -> Vec<Action>
-    where
-        I: IntoIterator<Item = Action>,
-    {
-        drive(
+    /// History is committed only after a final reply is produced. Dropping the
+    /// returned future cancels the in-progress response and leaves the prior
+    /// history unchanged. External effects already performed by tools cannot
+    /// be rolled back by this history rule.
+    pub async fn chat(&mut self, input: impl Into<String>) -> Result<AgentReply, AgentError> {
+        let mut history = self.history.clone();
+        let reply = drive_agent(
             &self.model,
             self.instructions.as_deref(),
             &self.tools,
             self.limits,
-            actions.into_iter().collect(),
+            &mut history,
+            input.into(),
         )
-        .await
+        .await?;
+        self.history = history;
+        Ok(reply)
     }
 }
 
-struct FinishedTool {
-    action: usize,
-    turn: usize,
-    tool: usize,
-    result: ExecutionToolResult,
+/// One final user-facing reply and the actions that informed it.
+pub struct AgentReply {
+    text: String,
+    actions: Vec<Action>,
 }
 
-async fn drive<M>(
+impl AgentReply {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn actions(&self) -> &[Action] {
+        &self.actions
+    }
+
+    pub fn into_parts(self) -> (String, Vec<Action>) {
+        (self.text, self.actions)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartAction {
+    intent: String,
+}
+
+enum ActionStart {
+    Accepted {
+        call: ToolCall,
+        action: usize,
+    },
+    Rejected {
+        call: ToolCall,
+        result: ExecutionToolResult,
+    },
+}
+
+async fn drive_agent<M>(
     model: &M,
     instructions: Option<&str>,
     tools: &Tools,
     limits: Limits,
-    mut actions: Vec<Action>,
-) -> Vec<Action>
+    history: &mut Vec<Message>,
+    input: String,
+) -> Result<AgentReply, AgentError>
 where
     M: CompletionModel + Clone,
 {
-    let mut ready = (0..actions.len()).collect::<VecDeque<_>>();
-    let mut running = FuturesUnordered::<WasmBoxedFuture<'static, FinishedTool>>::new();
+    history.push(Message::user(input));
+    let agent_instructions = combined_instructions(instructions, AGENT_PROTOCOL);
+    let action_instructions = combined_instructions(instructions, ACTION_PROTOCOL);
+    let mut completed_actions = Vec::new();
 
-    loop {
-        while let Some(action_index) = ready.pop_front() {
-            if actions[action_index].state() != ActionState::Ready {
-                continue;
-            }
-            if actions[action_index].turns().len() >= limits.max_turns {
-                actions[action_index].fail(ActionError::TurnLimit {
-                    limit: limits.max_turns,
-                });
-                continue;
-            }
+    for _ in 0..limits.max_decisions {
+        let action_context = history.clone();
+        let response =
+            complete_agent(model, history, &agent_instructions, limits.model_timeout).await?;
+        let finish_reason = response.finish_reason();
 
-            let messages = actions[action_index].messages(instructions);
-            let definitions = tools.definitions();
-            let completion = complete(model, messages, definitions, limits.model_timeout);
-            tokio::pin!(completion);
-
-            let response = loop {
-                if running.is_empty() {
-                    break completion.await;
-                }
-
-                tokio::select! {
-                    response = &mut completion => break response,
-                    Some(finished) = running.next() => {
-                        let finished_action = finished.action;
-                        if record_result(&mut actions, finished) {
-                            ready.push_back(finished_action);
-                        }
-                    }
-                }
-            };
-
-            let response = match response {
-                Ok(response) => response,
-                Err(error) => {
-                    actions[action_index].fail(error);
-                    continue;
-                }
-            };
-
-            let finish_reason = response.finish_reason();
-            if response.choice.is_empty() {
-                actions[action_index].push_turn(Turn::new(response, Vec::new()));
-                actions[action_index].fail(ActionError::Incomplete { finish_reason });
-                continue;
-            }
-
-            let calls = response
-                .choice
-                .iter()
-                .filter_map(|content| match content {
-                    AssistantContent::ToolCall(call) => Some(call.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-
-            if finish_reason
+        if response.choice.is_empty()
+            || finish_reason
                 .as_ref()
                 .is_some_and(FinishReason::truncated_output)
-            {
-                // A truncated tool call may be syntactically valid but still
-                // incomplete. Preserve the model response, but never execute
-                // side effects from it.
-                actions[action_index].push_turn(Turn::skipped(
-                    response,
-                    calls,
-                    "model response was truncated; tool was not executed",
-                ));
-                actions[action_index].fail(ActionError::Incomplete { finish_reason });
-                continue;
-            }
+        {
+            return Err(AgentError::Incomplete { finish_reason });
+        }
 
-            if calls.len() > limits.max_tool_calls_per_turn {
-                let requested = calls.len();
-                actions[action_index].push_turn(Turn::skipped(
-                    response,
-                    calls,
-                    "tool batch exceeded the per-turn limit; tool was not executed",
-                ));
-                actions[action_index].fail(ActionError::ToolCallLimit {
-                    requested,
-                    limit: limits.max_tool_calls_per_turn,
-                });
-                continue;
-            }
+        let calls = tool_calls(&response);
+        if calls.is_empty() {
+            let text =
+                final_text(&response).ok_or_else(|| AgentError::Incomplete { finish_reason })?;
+            history.push(assistant_message(&response));
+            return Ok(AgentReply {
+                text,
+                actions: completed_actions,
+            });
+        }
 
-            if calls.is_empty() {
-                let output = final_text(&response);
-                actions[action_index].push_turn(Turn::new(response, calls));
-                match output {
-                    Some(output) => actions[action_index].complete(output),
-                    None => {
-                        actions[action_index].fail(ActionError::Incomplete { finish_reason });
+        if calls.len() > limits.max_actions_per_decision {
+            return Err(AgentError::ActionLimit {
+                requested: calls.len(),
+                limit: limits.max_actions_per_decision,
+            });
+        }
+        if !unique_call_ids(history_tool_calls(history).chain(calls.iter())) {
+            return Err(AgentError::DuplicateToolCall);
+        }
+
+        history.push(assistant_message(&response));
+        let mut actions = Vec::new();
+        let starts = calls
+            .into_iter()
+            .map(|call| match action_from_call(&call, &action_context) {
+                Ok(action) => {
+                    let index = actions.len();
+                    actions.push(action);
+                    ActionStart::Accepted {
+                        call,
+                        action: index,
                     }
                 }
-                continue;
-            }
+                Err(result) => ActionStart::Rejected { call, result },
+            })
+            .collect::<Vec<_>>();
 
-            let turn_index = actions[action_index].push_turn(Turn::new(response, calls.clone()));
-            for (tool_index, call) in calls.into_iter().enumerate() {
-                running.push(start_tool(
-                    action_index,
-                    turn_index,
-                    tool_index,
-                    call,
-                    tools,
-                ));
-            }
-            poll_ready_tools(&mut actions, &mut ready, &mut running);
-        }
-
-        let Some(finished) = running.next().await else {
-            break;
-        };
-        let action_index = finished.action;
-        if record_result(&mut actions, finished) {
-            ready.push_back(action_index);
-        }
+        let actions = drive(model, Some(&action_instructions), tools, limits, actions).await;
+        let results = starts
+            .into_iter()
+            .map(|start| match start {
+                ActionStart::Accepted { call, action } => {
+                    action_result_message(call, action_result(&actions[action]))
+                }
+                ActionStart::Rejected { call, result } => action_result_message(call, result),
+            })
+            .collect();
+        history.push(Message::User { content: results });
+        completed_actions.extend(actions);
     }
 
-    actions
-}
-
-async fn complete<M>(
-    model: &M,
-    mut messages: Vec<bone_provider::rig::message::Message>,
-    tools: Vec<bone_provider::rig::completion::ToolDefinition>,
-    deadline: Duration,
-) -> Result<CompletionResponse, ActionError>
-where
-    M: CompletionModel + Clone,
-{
-    let prompt = messages
-        .pop()
-        .expect("an action transcript always contains its intent");
-    let completion = model
-        .completion_request(prompt)
-        .messages(messages)
-        .tools(tools)
-        .send();
-    match timeout(deadline, completion).await {
-        Ok(response) => response.map_err(ActionError::Model),
-        Err(_) => Err(ActionError::ModelTimeout { timeout: deadline }),
-    }
-}
-
-fn start_tool(
-    action: usize,
-    turn: usize,
-    tool: usize,
-    call: ToolCall,
-    tools: &Tools,
-) -> WasmBoxedFuture<'static, FinishedTool> {
-    let registered = tools.get(&call.function.name);
-    Box::pin(async move {
-        let result = match registered {
-            Some(registered) => match registered.execute(call.function.arguments).await {
-                Ok(output) => ExecutionToolResult::success(output),
-                Err(error) => ExecutionToolResult::failed(error),
-            },
-            None => missing_tool(&call.function.name),
-        };
-        FinishedTool {
-            action,
-            turn,
-            tool,
-            result,
-        }
+    Err(AgentError::DecisionLimit {
+        limit: limits.max_decisions,
     })
 }
 
-fn poll_ready_tools(
-    actions: &mut [Action],
-    ready: &mut VecDeque<usize>,
-    running: &mut FuturesUnordered<WasmBoxedFuture<'static, FinishedTool>>,
-) {
-    while let Some(Some(finished)) = running.next().now_or_never() {
-        let action_index = finished.action;
-        if record_result(actions, finished) {
-            ready.push_back(action_index);
+fn action_from_call(call: &ToolCall, context: &[Message]) -> Result<Action, ExecutionToolResult> {
+    if call.function.name != START_ACTION_TOOL {
+        return Err(missing_tool(&call.function.name));
+    }
+
+    let request =
+        serde_json::from_value::<StartAction>(call.function.arguments.clone()).map_err(|_| {
+            ExecutionToolResult::failed(ToolExecutionError::invalid_args(
+                "start_action arguments must contain only a non-empty string field named `intent`",
+            ))
+        })?;
+    let intent = request.intent.trim();
+    if intent.is_empty() {
+        return Err(ExecutionToolResult::failed(
+            ToolExecutionError::invalid_args("action intent must not be empty"),
+        ));
+    }
+
+    Ok(Action::with_context(intent, context.to_vec()))
+}
+
+fn action_result(action: &Action) -> ExecutionToolResult {
+    let value = match action.outcome() {
+        Some(ActionOutcome::Completed { output }) => {
+            json!({ "status": "completed", "output": output })
         }
+        Some(ActionOutcome::Failed(error)) => {
+            json!({ "status": "failed", "error": error.to_string() })
+        }
+        None => unreachable!("the action driver returns only settled actions"),
+    };
+    ExecutionToolResult::success(ToolOutput::json(value))
+}
+
+fn action_result_message(call: ToolCall, result: ExecutionToolResult) -> UserContent {
+    UserContent::tool_result_for(
+        call.id,
+        call.provider,
+        call.function.name,
+        result.output().clone().into_content(),
+    )
+}
+
+async fn complete_agent<M>(
+    model: &M,
+    history: &[Message],
+    instructions: &str,
+    deadline: Duration,
+) -> Result<CompletionResponse, AgentError>
+where
+    M: CompletionModel + Clone,
+{
+    let mut messages = Vec::with_capacity(history.len() + 1);
+    messages.push(Message::system(instructions));
+    messages.extend(history.iter().cloned());
+    let prompt = messages
+        .pop()
+        .expect("chat history always contains the current input");
+    let completion = model
+        .completion_request(prompt)
+        .messages(messages)
+        .tools(vec![start_action_definition()])
+        .send();
+    match timeout(deadline, completion).await {
+        Ok(response) => response.map_err(AgentError::Model),
+        Err(_) => Err(AgentError::ModelTimeout { timeout: deadline }),
     }
 }
 
-fn record_result(actions: &mut [Action], finished: FinishedTool) -> bool {
-    actions[finished.action].record_result(finished.turn, finished.tool, finished.result)
+fn start_action_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: START_ACTION_TOOL.to_owned(),
+        description: "Start one independent action. An action owns one or more model turns, may use tools or reason without them, and returns one outcome to the parent agent. Start multiple actions in one response only when they can run independently."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "description": "A concise, self-contained description of the result this action should produce"
+                }
+            },
+            "required": ["intent"],
+            "additionalProperties": false
+        }),
+    }
 }
 
-fn final_text(response: &CompletionResponse) -> Option<String> {
-    let parts = response
+fn combined_instructions(custom: Option<&str>, protocol: &str) -> String {
+    match custom.filter(|text| !text.trim().is_empty()) {
+        Some(custom) => format!("{custom}\n\n{protocol}"),
+        None => protocol.to_owned(),
+    }
+}
+
+fn assistant_message(response: &CompletionResponse) -> Message {
+    Message::Assistant {
+        id: response.message_id.clone(),
+        content: response.choice.clone(),
+    }
+}
+
+fn tool_calls(response: &CompletionResponse) -> Vec<ToolCall> {
+    response
         .choice
         .iter()
         .filter_map(|content| match content {
-            AssistantContent::Text(text) if !text.text.trim().is_empty() => {
-                Some(text.text.as_str())
-            }
+            AssistantContent::ToolCall(call) => Some(call.clone()),
             _ => None,
         })
-        .collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join("\n"))
+        .collect()
+}
+
+fn history_tool_calls(history: &[Message]) -> impl Iterator<Item = &ToolCall> {
+    history.iter().flat_map(|message| {
+        let content = match message {
+            Message::Assistant { content, .. } => content.as_slice(),
+            Message::System { .. } | Message::User { .. } => &[],
+        };
+        content.iter().filter_map(|content| match content {
+            AssistantContent::ToolCall(call) => Some(call),
+            _ => None,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -383,7 +453,7 @@ mod tests {
     use tokio::sync::{Semaphore, mpsc};
 
     use super::*;
-    use crate::ActionOutcome;
+    use crate::{ActionError, ActionOutcome, ActionState};
 
     struct Echo;
 
@@ -404,6 +474,179 @@ mod tests {
         async fn call(&self, arguments: Self::Args) -> Result<Self::Output, Self::Error> {
             Ok(arguments)
         }
+    }
+
+    #[tokio::test]
+    async fn agent_creates_a_tool_using_action_before_it_replies() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call(
+                "start-1",
+                START_ACTION_TOOL,
+                serde_json::json!({"intent": "inspect the supplied value"}),
+            ),
+            MockTurn::tool_call("echo-1", "echo", serde_json::json!({"value": "hello"})),
+            MockTurn::text("The inspected value is hello."),
+            MockTurn::text("I inspected it; the value is hello."),
+        ]);
+        let mut tools = Tools::default();
+        tools.register(Echo).expect("register echo");
+        let mut history = Vec::new();
+
+        let reply = drive_agent(
+            &model,
+            Some("Verify facts before answering."),
+            &tools,
+            Limits::default(),
+            &mut history,
+            "What is the supplied value?".to_owned(),
+        )
+        .await
+        .expect("agent should reply");
+
+        assert_eq!(reply.text(), "I inspected it; the value is hello.");
+        assert_eq!(reply.actions().len(), 1);
+        let action = &reply.actions()[0];
+        assert_eq!(action.intent(), "inspect the supplied value");
+        assert_eq!(action.turns().len(), 2);
+        assert_eq!(action.output(), Some("The inspected value is hello."));
+        assert!(
+            action.turns()[0].tools()[0]
+                .result()
+                .is_some_and(ExecutionToolResult::is_success)
+        );
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            [START_ACTION_TOOL]
+        );
+        assert_eq!(
+            requests[1]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["echo"]
+        );
+        let action_result = find_tool_result(&requests[3].chat_history, START_ACTION_TOOL)
+            .expect("parent agent receives the action outcome");
+        assert_eq!(
+            action_result.content[0].as_json(),
+            Some(&serde_json::json!({
+                "status": "completed",
+                "output": "The inspected value is hello."
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_action_can_be_pure_reasoning() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call(
+                "start-1",
+                START_ACTION_TOOL,
+                serde_json::json!({"intent": "compare the two designs"}),
+            ),
+            MockTurn::text("Design A has the smaller state surface."),
+            MockTurn::text("Choose design A."),
+        ]);
+        let mut history = Vec::new();
+
+        let reply = drive_agent(
+            &model,
+            None,
+            &Tools::default(),
+            Limits::default(),
+            &mut history,
+            "Which design is cleaner?".to_owned(),
+        )
+        .await
+        .expect("agent should reply");
+
+        assert_eq!(reply.text(), "Choose design A.");
+        assert_eq!(reply.actions().len(), 1);
+        assert_eq!(reply.actions()[0].turns().len(), 1);
+        assert!(reply.actions()[0].turns()[0].tools().is_empty());
+        assert_eq!(
+            reply.actions()[0].output(),
+            Some("Design A has the smaller state surface.")
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_action_call_ids_start_no_action() {
+        let model = MockCompletionModel::new([MockTurn::from_contents([
+            AssistantContent::tool_call(
+                "duplicate",
+                START_ACTION_TOOL,
+                serde_json::json!({"intent": "first"}),
+            ),
+            AssistantContent::tool_call(
+                "duplicate",
+                START_ACTION_TOOL,
+                serde_json::json!({"intent": "second"}),
+            ),
+        ])]);
+        let mut history = Vec::new();
+
+        let result = drive_agent(
+            &model,
+            None,
+            &Tools::default(),
+            Limits::default(),
+            &mut history,
+            "do both".to_owned(),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("duplicate identifiers unexpectedly started actions"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, AgentError::DuplicateToolCall));
+        assert_eq!(model.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_replies_create_no_action_and_extend_history() {
+        let model = MockCompletionModel::new([
+            MockTurn::text("Hello."),
+            MockTurn::text("Yes, I remember greeting you."),
+        ]);
+        let mut history = Vec::new();
+
+        let first = drive_agent(
+            &model,
+            None,
+            &Tools::default(),
+            Limits::default(),
+            &mut history,
+            "Hello".to_owned(),
+        )
+        .await
+        .expect("first reply");
+        let second = drive_agent(
+            &model,
+            None,
+            &Tools::default(),
+            Limits::default(),
+            &mut history,
+            "Do you remember me?".to_owned(),
+        )
+        .await
+        .expect("second reply");
+
+        assert!(first.actions().is_empty());
+        assert!(second.actions().is_empty());
+        assert_eq!(history.len(), 4);
+        let requests = model.requests();
+        assert_eq!(first_user_text(&requests[1].chat_history), "Hello");
+        assert!(assistant_has_text(&requests[1].chat_history, "Hello."));
     }
 
     #[tokio::test]
@@ -525,6 +768,41 @@ mod tests {
         assert_eq!(actions[0].output(), Some("A done"));
         assert_eq!(actions[1].output(), Some("B done"));
         assert_eq!(model.request_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_tool_timeout_is_an_observation_the_action_can_recover_from() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("call-1", "hang", serde_json::json!({})),
+            MockTurn::text("recovered after timeout"),
+        ]);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+        let mut tools = Tools::default();
+        tools
+            .register_dynamic(hanging_tool("hang", started_tx, dropped_tx))
+            .expect("register hanging tool");
+
+        let actions = drive(
+            &model,
+            None,
+            &tools,
+            Limits {
+                tool_timeout: Duration::from_millis(20),
+                ..Limits::default()
+            },
+            vec![Action::new("recover from a hung tool")],
+        )
+        .await;
+
+        assert_eq!(recv(&mut started_rx).await, "hang");
+        assert_eq!(recv(&mut dropped_rx).await, "hang");
+        assert_eq!(actions[0].output(), Some("recovered after timeout"));
+        assert!(
+            actions[0].turns()[0].tools()[0]
+                .result()
+                .is_some_and(|result| result.is_error_kind(ToolErrorKind::Timeout))
+        );
     }
 
     #[tokio::test]
@@ -797,6 +1075,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_tool_call_ids_start_none_of_them() {
+        let model = MockCompletionModel::new([MockTurn::from_contents([
+            AssistantContent::tool_call("duplicate", "count", serde_json::json!({})),
+            AssistantContent::tool_call("duplicate", "count", serde_json::json!({})),
+        ])]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::clone(&calls);
+        let mut tools = Tools::default();
+        tools
+            .register_dynamic(PortableDynamicTool::new(
+                "count",
+                "Count executions",
+                serde_json::json!({"type": "object"}),
+                move |_| {
+                    let tool_calls = Arc::clone(&tool_calls);
+                    Box::pin(async move {
+                        tool_calls.fetch_add(1, Ordering::Relaxed);
+                        Ok(ToolOutput::text("ran"))
+                    })
+                },
+            ))
+            .expect("register counter");
+
+        let actions = drive(
+            &model,
+            None,
+            &tools,
+            Limits::default(),
+            vec![Action::new("reject ambiguous calls")],
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            actions[0].error(),
+            Some(ActionError::DuplicateToolCall)
+        ));
+        assert!(
+            actions[0].turns()[0]
+                .tools()
+                .iter()
+                .all(|tool| tool.result().is_some_and(|result| result.is_skipped()))
+        );
+    }
+
+    #[tokio::test]
     async fn model_timeout_does_not_starve_the_next_action() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model = FirstCallHangs {
@@ -948,6 +1272,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn start_action_is_reserved_for_the_agent_protocol() {
+        let mut tools = Tools::default();
+        let result = tools.register_dynamic(PortableDynamicTool::new(
+            START_ACTION_TOOL,
+            "Must never be exposed inside an Action",
+            serde_json::json!({"type": "object"}),
+            |_| Box::pin(async { Ok(ToolOutput::text("unreachable")) }),
+        ));
+
+        assert_eq!(result, Err(AgentConfigError::ReservedTool));
+    }
+
     fn gate_tool(
         name: &'static str,
         release: Arc<Semaphore>,
@@ -1067,6 +1404,28 @@ mod tests {
         let results = tool_results(message);
         assert_eq!(results.len(), 1);
         results[0]
+    }
+
+    fn find_tool_result<'a>(
+        messages: &'a [Message],
+        name: &str,
+    ) -> Option<&'a bone_provider::rig::message::ToolResult> {
+        messages.iter().find_map(|message| match message {
+            Message::User { content } => content.iter().find_map(|content| match content {
+                UserContent::ToolResult(result) if result.name == name => Some(result),
+                _ => None,
+            }),
+            _ => None,
+        })
+    }
+
+    fn assistant_has_text(messages: &[Message], expected: &str) -> bool {
+        messages.iter().any(|message| match message {
+            Message::Assistant { content, .. } => content.iter().any(
+                |content| matches!(content, AssistantContent::Text(text) if text.text == expected),
+            ),
+            _ => false,
+        })
     }
 
     fn tool_results(message: &Message) -> Vec<&bone_provider::rig::message::ToolResult> {

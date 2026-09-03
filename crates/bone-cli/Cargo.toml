@@ -1,0 +1,16 @@
+[package]
+name = "bone-cli"
+version.workspace = true
+edition.workspace = true
+description = "Runnable BONE agent"
+publish = false
+
+[[bin]]
+name = "bone"
+path = "src/main.rs"
+
+[dependencies]
+bone-agent = { path = "../bone-agent" }
+bone-provider = { path = "../bone-provider" }
+bone-tools = { path = "../bone-tools" }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread"] }

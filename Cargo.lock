@@ -100,10 +100,23 @@ name = "bone-agent"
 version = "0.1.0"
 dependencies = [
  "bone-provider",
+ "bone-tools",
  "futures-util",
  "rig-core",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "bone-cli"
+version = "0.1.0"
+dependencies = [
+ "bone-agent",
+ "bone-provider",
+ "bone-tools",
  "tokio",
 ]
 
