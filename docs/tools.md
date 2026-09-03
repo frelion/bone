@@ -3,12 +3,13 @@
 `bone-tools` is BONE's provider-independent local tool crate. It is a sibling
 of `bone-provider`; neither crate depends on the other. Both depend on Rig's
 normalized interfaces, while `bone-tools` uses the independent `bone-config`
-service for its config tool. A future agent/runtime crate will compose them.
+service for its config tool. `bone-agent` composes a selected model with tools
+supplied by the host.
 
 ```text
 bone-provider ──► rig-core ◄── bone-tools ──► bone-config
        ▲                         ▲
-       └──── future agent ───────┘
+       └────── bone-agent ─────┘
 ```
 
 The first tool set is deliberately small:
@@ -71,9 +72,9 @@ let bash = BashTool::with_process_environment(
 # }
 ```
 
-Tool registration, provider translation, conversation state, approvals,
-authorization, cancellation policy, and audit events do not belong in this
-crate. They are agent/runtime responsibilities.
+Tool registration belongs to `bone-agent`, while provider translation remains
+in `bone-provider`. Conversation state, approvals, authorization, host-level
+cancellation policy, and audit events remain responsibilities of higher layers.
 
 ## Safety contract
 
@@ -131,5 +132,4 @@ Model-requested limits can only narrow their corresponding hard limits.
 `max_output_bytes` applies to read/search output and to each Bash stream. Patch
 summaries are instead bounded indirectly by `max_patch_bytes` and
 `max_patch_files`. All text limits apply before JSON encoding; JSON field
-overhead and escaping are the future agent/runtime's final context-budget
-responsibility.
+overhead and escaping are the agent host's final context-budget responsibility.

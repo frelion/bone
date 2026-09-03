@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/bone-config", "crates/bone-provider", "crates/bone-tools"]
+members = [
+    "crates/bone-agent",
+    "crates/bone-config",
+    "crates/bone-provider",
+    "crates/bone-tools",
+]
 exclude = ["third_party/rig-core-0.42.0"]
 resolver = "3"
 

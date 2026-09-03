@@ -1,0 +1,17 @@
+[package]
+name = "bone-agent"
+version.workspace = true
+edition.workspace = true
+description = "Action-oriented agent runtime for BONE"
+publish = false
+
+[dependencies]
+bone-provider = { path = "../bone-provider" }
+futures-util.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros"] }
+
+[dev-dependencies]
+rig-core = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

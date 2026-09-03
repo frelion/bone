@@ -96,6 +96,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bone-agent"
+version = "0.1.0"
+dependencies = [
+ "bone-provider",
+ "futures-util",
+ "rig-core",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "bone-config"
 version = "0.1.0"
 dependencies = [
