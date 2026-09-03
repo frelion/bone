@@ -1,6 +1,6 @@
 mod support;
 
-use bone_provider::{
+use bone_model::{
     Protocol, StreamedAssistantContent,
     protocol::openai_chat_completions,
     rig::{

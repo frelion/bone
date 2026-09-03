@@ -219,7 +219,7 @@ where
 
 fn user_agent() -> String {
     format!(
-        "bone-provider/{} ({} {})",
+        "bone-model/{} ({} {})",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH

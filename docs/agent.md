@@ -90,7 +90,7 @@ exposing only read-only tools; write tools are deliberately not wired in yet.
 ## Runnable slice
 
 The `bone` binary connects the same core through the unified
-`bone_provider::Model` interface to a ChatGPT subscription and the real
+`bone_model::Model` interface to a ChatGPT subscription and the real
 workspace-bound `read`, `glob`, and `grep` tools:
 
 ```text
@@ -104,7 +104,7 @@ BONE's independent credential cache. This managed connector is experimental
 and currently requires Unix. It writes first-run device codes to stderr, so do
 not redirect authentication output to persistent logs. The CLI selects the
 service and renders login prompts; credential lifecycle and protocol
-translation end at `bone-provider`, while `bone-agent` receives only the
+translation end at `bone-model`, while `bone-agent` receives only the
 selected `Model`. Run the CLI from the intended workspace: tools are read-only
 in this slice, but content they read is sent to the model.
 

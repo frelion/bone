@@ -1,4 +1,4 @@
-use bone_provider::rig::{
+use bone_model::rig::{
     completion::{AssistantContent, CompletionResponse},
     message::{Message, ToolCall, UserContent},
     tool::ToolResult as ExecutionToolResult,

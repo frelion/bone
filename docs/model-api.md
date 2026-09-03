@@ -1,6 +1,6 @@
-# Provider API
+# Model API
 
-`bone-provider` is BONE's thin LLM protocol boundary. Rig owns normalized
+`bone-model` is BONE's unified LLM model boundary. Rig owns normalized
 messages, completion requests and responses, tools, provider-native state, and
 streaming. BONE deliberately does not mirror those types.
 
@@ -14,12 +14,12 @@ openai-chat-completions  gateway-a                        model-y
 anthropic-messages       anthropic-primary                claude-*
 ```
 
-- [`Protocol`](../crates/bone-provider/src/protocol/mod.rs) identifies the wire
+- [`Protocol`](../crates/bone-model/src/protocol/mod.rs) identifies the wire
   contract. OpenAI Responses, OpenAI Chat Completions, and Anthropic Messages
   are distinct protocols.
-- [`Endpoint`](../crates/bone-provider/src/endpoint.rs) is an application-named
+- [`Endpoint`](../crates/bone-model/src/endpoint.rs) is an application-named
   service instance with authentication, a base URL, and a model factory.
-- [`Model`](../crates/bone-provider/src/model.rs) is a cloneable, type-erased
+- [`Model`](../crates/bone-model/src/model.rs) is a cloneable, type-erased
   Rig completion model carrying endpoint, protocol, and model identities.
 
 Two gateways speaking OpenAI Responses are two endpoints backed by one
@@ -28,7 +28,7 @@ protocol implementation. They are not two Rust provider modules.
 ## OpenAI Responses
 
 ```rust,no_run
-use bone_provider::{
+use bone_model::{
     protocol::openai_responses::{
         self, Reasoning, ReasoningEffort, reasoning_params,
     },
@@ -60,7 +60,7 @@ let mut stream = model
 For an OpenAI Responses-compatible API root:
 
 ```rust,no_run
-use bone_provider::protocol::openai_responses;
+use bone_model::protocol::openai_responses;
 
 # fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = openai_responses::compatible(
@@ -91,7 +91,7 @@ The experimental `chatgpt_subscription` service adapter provides in-process
 access to the Codex Responses backend using a ChatGPT subscription:
 
 ```rust,no_run
-use bone_provider::{
+use bone_model::{
     rig::message::Message,
     service::chatgpt_subscription,
 };
@@ -128,7 +128,7 @@ Responses shape; it does not claim a Chat Completions subscription endpoint.
 Selecting this named adapter is the runtime opt-in; there is no Cargo feature
 that could be mistaken for a security boundary or accidentally skipped by CI.
 
-The workspace currently binds `bone-provider` directly to a self-contained,
+The workspace currently binds `bone-model` directly to a self-contained,
 vendored Rig hardening patch and marks the crate as `publish = false`. The
 direct path dependency remains in force when this repository is consumed as a
 Git or path dependency; it cannot silently resolve the unpatched crates.io Rig.
@@ -192,7 +192,7 @@ Chat Completions is a separate wire contract, not a compatibility mode for
 Responses:
 
 ```rust,no_run
-use bone_provider::{
+use bone_model::{
     protocol::openai_chat_completions,
     rig::message::Message,
 };
@@ -216,7 +216,7 @@ let response = model
 For a compatible API root, use the Chat-specific constructor:
 
 ```rust,no_run
-use bone_provider::protocol::openai_chat_completions;
+use bone_model::protocol::openai_chat_completions;
 
 # fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = openai_chat_completions::compatible(
@@ -243,7 +243,7 @@ never probes one and silently falls back to the other.
 ## Anthropic Messages
 
 ```rust,no_run
-use bone_provider::{
+use bone_model::{
     protocol::anthropic_messages,
     rig::message::Message,
 };
@@ -288,7 +288,7 @@ Rig models with prompt caching enabled without adding a generic JSON options
 bag to BONE:
 
 ```rust,no_run
-use bone_provider::{
+use bone_model::{
     protocol::anthropic_messages,
     rig::{client::CompletionClient, providers::anthropic},
 };
@@ -319,7 +319,7 @@ must be treated as potentially sensitive provider diagnostics.
 
 The future runtime/config layer owns configuration deserialization, secret
 resolution, endpoint registries, routing, retries, fallback, rate limiting,
-budgets, and pricing. None of those policies belong in `bone-provider`.
+budgets, and pricing. None of those policies belong in `bone-model`.
 
 Adding a standard compatible service should normally require only new runtime
 configuration and live certification. Add a new `Protocol` variant and module
@@ -337,8 +337,8 @@ export BONE_OPENAI_MODEL='...'
 # Optional for a compatible endpoint:
 export OPENAI_BASE_URL='https://gateway.example/v1'
 
-cargo run -p bone-provider --example openai_responses_probe -- text
-cargo run -p bone-provider --example openai_responses_probe -- tool
+cargo run -p bone-model --example openai_responses_probe -- text
+cargo run -p bone-model --example openai_responses_probe -- tool
 ```
 
 Tool mode defines a harmless fictional `inspect_path` function and displays
@@ -354,8 +354,8 @@ export BONE_OPENAI_CHAT_MODEL='...'
 # Optional for a compatible endpoint:
 export OPENAI_BASE_URL='https://gateway.example/v1'
 
-cargo run -p bone-provider --example openai_chat_completions_probe -- text
-cargo run -p bone-provider --example openai_chat_completions_probe -- tool
+cargo run -p bone-model --example openai_chat_completions_probe -- text
+cargo run -p bone-model --example openai_chat_completions_probe -- tool
 ```
 
 The two OpenAI probes reuse `OPENAI_API_KEY` and `OPENAI_BASE_URL` because one
@@ -373,8 +373,8 @@ export BONE_ANTHROPIC_MODEL='...'
 # Optional for a compatible endpoint:
 export ANTHROPIC_BASE_URL='https://gateway.example'
 
-cargo run -p bone-provider --example anthropic_messages_probe -- text
-cargo run -p bone-provider --example anthropic_messages_probe -- tool
+cargo run -p bone-model --example anthropic_messages_probe -- text
+cargo run -p bone-model --example anthropic_messages_probe -- tool
 ```
 
 The experimental ChatGPT subscription probe needs only a model identifier.
@@ -383,8 +383,8 @@ Its first run performs device login; later runs reuse the independent cache:
 ```sh
 export BONE_CHATGPT_MODEL='a-model-available-to-your-subscription'
 
-cargo run -p bone-provider --example chatgpt_subscription_probe -- text
-cargo run -p bone-provider --example chatgpt_subscription_probe -- tool
+cargo run -p bone-model --example chatgpt_subscription_probe -- text
+cargo run -p bone-model --example chatgpt_subscription_probe -- tool
 ```
 
 Tool mode only displays the requested call. It does not execute the tool.

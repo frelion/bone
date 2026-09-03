@@ -1,4 +1,4 @@
-use bone_provider::{StreamedAssistantContent, protocol::openai_responses, rig::message::Message};
+use bone_model::{StreamedAssistantContent, protocol::openai_responses, rig::message::Message};
 use futures_util::StreamExt;
 
 #[tokio::test]
@@ -42,7 +42,7 @@ async fn openai_responses_live_certification() {
         .response
         .expect("live stream needs a terminal record");
     assert_eq!(model.endpoint_id(), "openai-live");
-    assert_eq!(model.protocol(), bone_provider::Protocol::OpenAiResponses);
+    assert_eq!(model.protocol(), bone_model::Protocol::OpenAiResponses);
     assert!(
         terminal
             .model

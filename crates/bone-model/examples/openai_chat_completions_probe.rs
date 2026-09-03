@@ -1,6 +1,6 @@
 use std::{env, error::Error, io};
 
-use bone_provider::{
+use bone_model::{
     StreamedAssistantContent,
     protocol::openai_chat_completions,
     rig::{
@@ -90,11 +90,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             [tool_call]
                 if tool_call.function.name == "inspect_path"
                     && tool_call.function.arguments["path"]
-                        == "/tmp/bone-provider-probe"
+                        == "/tmp/bone-model-probe"
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "tool probe expected exactly one inspect_path call for /tmp/bone-provider-probe",
+                "tool probe expected exactly one inspect_path call for /tmp/bone-model-probe",
             )
             .into());
         }
@@ -123,7 +123,7 @@ impl Mode {
         match self {
             Self::Text => "In one short sentence, explain why the sky appears blue.",
             Self::Tool => {
-                "Call inspect_path exactly once for /tmp/bone-provider-probe. Do not invent its result."
+                "Call inspect_path exactly once for /tmp/bone-model-probe. Do not invent its result."
             }
         }
     }
@@ -228,7 +228,7 @@ fn print_help() {
 Inspect Rig's normalized OpenAI Chat Completions boundary.
 
 Usage:
-  cargo run -p bone-provider --example openai_chat_completions_probe -- [text|tool]
+  cargo run -p bone-model --example openai_chat_completions_probe -- [text|tool]
 
 Required environment:
   OPENAI_API_KEY            API key shared by the selected OpenAI-compatible service

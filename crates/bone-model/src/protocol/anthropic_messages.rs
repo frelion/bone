@@ -87,7 +87,7 @@ where
 /// A model for another protocol is rejected at compile time:
 ///
 /// ```compile_fail
-/// use bone_provider::{
+/// use bone_model::{
 ///     protocol::anthropic_messages,
 ///     rig::{client::CompletionClient, providers::openai},
 /// };

@@ -62,10 +62,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Certify OpenAI Responses
         if: ${{ env.OPENAI_API_KEY != '' && env.BONE_OPENAI_MODEL != '' }}
-        run: cargo test -p bone-provider --test live_openai_responses -- --ignored --nocapture
+        run: cargo test -p bone-model --test live_openai_responses -- --ignored --nocapture
       - name: Certify OpenAI Chat Completions
         if: ${{ env.OPENAI_API_KEY != '' && env.BONE_OPENAI_CHAT_MODEL != '' }}
-        run: cargo test -p bone-provider --test live_openai_chat_completions -- --ignored --nocapture
+        run: cargo test -p bone-model --test live_openai_chat_completions -- --ignored --nocapture
       - name: Certify Anthropic Messages
         if: ${{ env.ANTHROPIC_API_KEY != '' && env.BONE_ANTHROPIC_MODEL != '' }}
-        run: cargo test -p bone-provider --test live_anthropic_messages -- --ignored --nocapture
+        run: cargo test -p bone-model --test live_anthropic_messages -- --ignored --nocapture

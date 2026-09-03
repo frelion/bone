@@ -1,7 +1,7 @@
 use std::{env, error::Error, io::Write, process::ExitCode};
 
 use bone_agent::{Agent, AgentReply};
-use bone_provider::service::chatgpt_subscription;
+use bone_model::service::chatgpt_subscription;
 use bone_tools::ToolEnvironment;
 use tokio::io::{AsyncBufReadExt, BufReader};
 

@@ -1,6 +1,4 @@
-use bone_provider::{
-    StreamedAssistantContent, protocol::anthropic_messages, rig::message::Message,
-};
+use bone_model::{StreamedAssistantContent, protocol::anthropic_messages, rig::message::Message};
 use futures_util::StreamExt;
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use bone_provider::{
+use bone_model::{
     Model,
     rig::{
         completion::{
@@ -444,7 +444,7 @@ mod tests {
         time::Duration,
     };
 
-    use bone_provider::rig::{
+    use bone_model::rig::{
         completion::FinishReason,
         message::{Message, UserContent},
         tool::{PortableDynamicTool, PortableTool, ToolErrorKind, ToolExecutionError, ToolOutput},
@@ -1353,24 +1353,23 @@ mod tests {
     impl CompletionModel for FirstCallHangs {
         async fn completion(
             &self,
-            _request: bone_provider::CompletionRequest,
-        ) -> Result<CompletionResponse, bone_provider::CompletionError> {
+            _request: bone_model::CompletionRequest,
+        ) -> Result<CompletionResponse, bone_model::CompletionError> {
             if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
                 std::future::pending::<()>().await;
             }
             Ok(CompletionResponse::new(
                 vec![AssistantContent::text("B done")],
-                bone_provider::rig::completion::Usage::new(),
+                bone_model::rig::completion::Usage::new(),
                 "test",
             ))
         }
 
         async fn stream(
             &self,
-            _request: bone_provider::CompletionRequest,
-        ) -> Result<bone_provider::StreamingCompletionResponse, bone_provider::CompletionError>
-        {
-            Err(bone_provider::CompletionError::ProviderError(
+            _request: bone_model::CompletionRequest,
+        ) -> Result<bone_model::StreamingCompletionResponse, bone_model::CompletionError> {
+            Err(bone_model::CompletionError::ProviderError(
                 "streaming is not used in this test".to_owned(),
             ))
         }
@@ -1400,7 +1399,7 @@ mod tests {
             .expect("request contains its action intent")
     }
 
-    fn only_tool_result(message: &Message) -> &bone_provider::rig::message::ToolResult {
+    fn only_tool_result(message: &Message) -> &bone_model::rig::message::ToolResult {
         let results = tool_results(message);
         assert_eq!(results.len(), 1);
         results[0]
@@ -1409,7 +1408,7 @@ mod tests {
     fn find_tool_result<'a>(
         messages: &'a [Message],
         name: &str,
-    ) -> Option<&'a bone_provider::rig::message::ToolResult> {
+    ) -> Option<&'a bone_model::rig::message::ToolResult> {
         messages.iter().find_map(|message| match message {
             Message::User { content } => content.iter().find_map(|content| match content {
                 UserContent::ToolResult(result) if result.name == name => Some(result),
@@ -1428,7 +1427,7 @@ mod tests {
         })
     }
 
-    fn tool_results(message: &Message) -> Vec<&bone_provider::rig::message::ToolResult> {
+    fn tool_results(message: &Message) -> Vec<&bone_model::rig::message::ToolResult> {
         match message {
             Message::User { content } => content
                 .iter()

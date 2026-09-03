@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use bone_provider::rig::{
+use bone_model::rig::{
     completion::ToolDefinition,
     tool::{
         IntoToolOutput, PortableDynamicTool, PortableTool, ToolExecutionError,

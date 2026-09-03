@@ -29,12 +29,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo test --workspace --doc
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo check -p bone-provider --target wasm32-unknown-unknown
+cargo check -p bone-model --target wasm32-unknown-unknown
 ```
 
 The root CI workflow runs those commands on Linux and also compiles the
 workspace on Windows. Ignored live tests are built by `--all-targets` but are
-not executed. The WASM check compiles only `bone-provider`; native subscription
+not executed. The WASM check compiles only `bone-model`; native subscription
 OAuth remains unavailable on that target.
 
 ## Live certification
@@ -47,22 +47,22 @@ export OPENAI_API_KEY='...'
 export BONE_OPENAI_MODEL='...'
 # Optional:
 export OPENAI_BASE_URL='https://gateway.example/v1'
-cargo test -p bone-provider --test live_openai_responses -- --ignored --nocapture
+cargo test -p bone-model --test live_openai_responses -- --ignored --nocapture
 
 export OPENAI_API_KEY='...'
 export BONE_OPENAI_CHAT_MODEL='...'
 # Optional:
 export OPENAI_BASE_URL='https://gateway.example/v1'
-cargo test -p bone-provider --test live_openai_chat_completions -- --ignored --nocapture
+cargo test -p bone-model --test live_openai_chat_completions -- --ignored --nocapture
 
 export ANTHROPIC_API_KEY='...'
 export BONE_ANTHROPIC_MODEL='...'
 # Optional:
 export ANTHROPIC_BASE_URL='https://gateway.example'
-cargo test -p bone-provider --test live_anthropic_messages -- --ignored --nocapture
+cargo test -p bone-model --test live_anthropic_messages -- --ignored --nocapture
 
 export BONE_CHATGPT_MODEL='a-model-available-to-your-subscription'
-cargo test -p bone-provider \
+cargo test -p bone-model \
   --test live_chatgpt_subscription -- --ignored --nocapture
 ```
 

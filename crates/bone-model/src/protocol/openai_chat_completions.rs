@@ -86,7 +86,7 @@ where
 /// An OpenAI Responses model is rejected at compile time:
 ///
 /// ```compile_fail
-/// use bone_provider::{
+/// use bone_model::{
 ///     protocol::openai_chat_completions,
 ///     rig::{client::CompletionClient, providers::openai},
 /// };
@@ -100,7 +100,7 @@ where
 /// An Anthropic Messages model is also rejected:
 ///
 /// ```compile_fail
-/// use bone_provider::{
+/// use bone_model::{
 ///     protocol::openai_chat_completions,
 ///     rig::{client::CompletionClient, providers::anthropic},
 /// };

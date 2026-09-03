@@ -1,4 +1,4 @@
-use bone_provider::{
+use bone_model::{
     Protocol, StreamedAssistantContent,
     rig::{
         completion::{FinishReason, ToolDefinition},

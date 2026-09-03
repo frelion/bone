@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bone_provider::rig::{
+use bone_model::rig::{
     http_client::{
         self, HeaderMap, HttpClientExt, LazyBody, Method, MultipartForm, Request, Response,
         StreamingResponse,

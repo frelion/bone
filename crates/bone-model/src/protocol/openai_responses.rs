@@ -89,7 +89,7 @@ where
 /// mislabeled as OpenAI Responses.
 ///
 /// ```compile_fail
-/// use bone_provider::{
+/// use bone_model::{
 ///     protocol::openai_responses,
 ///     rig::{client::CompletionClient, providers::anthropic},
 /// };

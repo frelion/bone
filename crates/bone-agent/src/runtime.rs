@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use bone_provider::rig::{
+use bone_model::rig::{
     completion::{AssistantContent, CompletionModel, CompletionResponse, FinishReason},
     message::ToolCall,
     tool::{ToolExecutionError, ToolResult as ExecutionToolResult},
@@ -173,8 +173,8 @@ where
 
 async fn complete<M>(
     model: &M,
-    mut messages: Vec<bone_provider::rig::message::Message>,
-    tools: Vec<bone_provider::rig::completion::ToolDefinition>,
+    mut messages: Vec<bone_model::rig::message::Message>,
+    tools: Vec<bone_model::rig::completion::ToolDefinition>,
     deadline: Duration,
 ) -> Result<CompletionResponse, ActionError>
 where

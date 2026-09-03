@@ -6,7 +6,7 @@ description = "Action-oriented agent runtime for BONE"
 publish = false
 
 [dependencies]
-bone-provider = { path = "../bone-provider" }
+bone-model = { path = "../bone-model" }
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true

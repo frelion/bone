@@ -1,6 +1,6 @@
 use std::{env, error::Error, io};
 
-use bone_provider::{
+use bone_model::{
     StreamedAssistantContent,
     rig::{
         completion::ToolDefinition,
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let model = endpoint.model(&model_id)?;
     let mut request = model
         .request(Message::user(if tool_mode {
-            "Call inspect_path exactly once for /tmp/bone-provider-probe. Do not invent its result."
+            "Call inspect_path exactly once for /tmp/bone-model-probe. Do not invent its result."
         } else {
             "Reply with one short greeting."
         }))

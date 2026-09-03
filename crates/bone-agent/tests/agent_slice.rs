@@ -1,5 +1,5 @@
 use bone_agent::Agent;
-use bone_provider::{
+use bone_model::{
     protocol::openai_responses,
     rig::{
         providers::openai as rig_openai,

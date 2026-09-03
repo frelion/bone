@@ -1,6 +1,6 @@
 mod support;
 
-use bone_provider::{
+use bone_model::{
     Protocol, StreamedAssistantContent,
     protocol::openai_responses::{
         self, Reasoning, ReasoningEffort, ReasoningSummaryLevel, reasoning_params,

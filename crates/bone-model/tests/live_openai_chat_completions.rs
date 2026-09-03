@@ -1,4 +1,4 @@
-use bone_provider::{
+use bone_model::{
     Protocol, StreamedAssistantContent, protocol::openai_chat_completions, rig::message::Message,
 };
 use futures_util::StreamExt;

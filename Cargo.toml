@@ -3,7 +3,7 @@ members = [
     "crates/bone-agent",
     "crates/bone-cli",
     "crates/bone-config",
-    "crates/bone-provider",
+    "crates/bone-model",
     "crates/bone-tools",
 ]
 exclude = ["third_party/rig-core-0.42.0"]

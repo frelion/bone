@@ -1,8 +1,10 @@
 use std::{env, error::Error, io};
 
-use bone_provider::{
+use bone_model::{
     StreamedAssistantContent,
-    protocol::anthropic_messages,
+    protocol::openai_responses::{
+        self, Reasoning, ReasoningEffort, ReasoningSummaryLevel, reasoning_params,
+    },
     rig::{
         completion::ToolDefinition,
         message::{Message, ToolChoice},
@@ -24,20 +26,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
 
-    let api_key = required_env("ANTHROPIC_API_KEY")?;
-    let model_id = required_env("BONE_ANTHROPIC_MODEL")?;
-    let endpoint = match env::var("ANTHROPIC_BASE_URL") {
+    let api_key = required_env("OPENAI_API_KEY")?;
+    let model_id = required_env("BONE_OPENAI_MODEL")?;
+    let endpoint = match env::var("OPENAI_BASE_URL") {
         Ok(base_url) if !base_url.trim().is_empty() => {
-            anthropic_messages::compatible("anthropic-probe", api_key, base_url)?
+            openai_responses::compatible("openai-probe", api_key, base_url)?
         }
-        _ => anthropic_messages::official("anthropic-probe", api_key)?,
+        _ => openai_responses::official("openai-probe", api_key)?,
     };
     let model = endpoint.model(&model_id)?;
 
     let mut request = model
         .request(Message::user(mode.prompt()))
         .preamble("This is a protocol-boundary probe. Follow the user request exactly.".to_owned())
-        .max_tokens(1_024);
+        .max_tokens(1_024)
+        .additional_params(reasoning_params(
+            Reasoning::new()
+                .with_effort(ReasoningEffort::Low)
+                .with_summary_level(ReasoningSummaryLevel::Auto),
+        ));
 
     if matches!(mode, Mode::Tool) {
         request = request
@@ -47,8 +54,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             });
     }
 
-    println!("endpoint: {}", model.endpoint_id());
-    println!("protocol: {:?}", model.protocol());
+    println!("endpoint: {}", endpoint.id());
+    println!("protocol: {}", endpoint.protocol());
     println!("model: {model_id}");
     println!("mode: {}", mode.name());
     if matches!(mode, Mode::Tool) {
@@ -99,7 +106,7 @@ impl Mode {
         match self {
             Self::Text => "In one short sentence, explain why the sky appears blue.",
             Self::Tool => {
-                "Call inspect_path exactly once for /tmp/bone-provider-probe. Do not invent its result."
+                "Call inspect_path exactly once for /tmp/bone-model-probe. Do not invent its result."
             }
         }
     }
@@ -200,9 +207,21 @@ fn print_event(event: StreamedAssistantContent) -> Result<(), serde_json::Error>
 
 fn print_help() {
     println!(
-        "Anthropic Messages boundary probe\n\n\
-         Usage:\n  cargo run -p bone-provider --example anthropic_messages_probe -- [text|tool]\n\n\
-         Required environment:\n  ANTHROPIC_API_KEY\n  BONE_ANTHROPIC_MODEL\n\n\
-         Optional environment:\n  ANTHROPIC_BASE_URL  Anthropic-compatible endpoint base URL"
+        "\
+Inspect Rig's normalized OpenAI Responses boundary.
+
+Usage:
+  cargo run -p bone-model --example openai_responses_probe -- [text|tool]
+
+Required environment:
+  OPENAI_API_KEY       API key
+  BONE_OPENAI_MODEL    Responses-capable model identifier
+
+Optional environment:
+  OPENAI_BASE_URL      OpenAI Responses-compatible API root
+
+Modes:
+  text   Observe reasoning, text, terminal, and aggregated events (default)
+  tool   Force one inspect_path call and display it without executing it"
     );
 }

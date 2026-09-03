@@ -46,7 +46,7 @@ fn temporary_directory(case: &str) -> PathBuf {
         .expect("system clock should follow the Unix epoch")
         .as_nanos();
     let root = std::env::temp_dir().join(format!(
-        "bone-provider-chatgpt-{case}-{}-{nonce}",
+        "bone-model-chatgpt-{case}-{}-{nonce}",
         std::process::id()
     ));
     let mut builder = fs::DirBuilder::new();

@@ -1,4 +1,4 @@
-use bone_provider::{
+use bone_model::{
     Protocol,
     rig::{
         completion::{FinishReason, ToolDefinition},
@@ -35,7 +35,7 @@ fn test_client(
         .http_client(transport.clone())
         .default_instructions("")
         .originator("bone")
-        .user_agent("bone-provider/test")
+        .user_agent("bone-model/test")
         .build()
         .expect("test ChatGPT client should build");
     (client, transport)
@@ -56,7 +56,7 @@ fn default_url_test_client(
         .http_client(transport.clone())
         .default_instructions("")
         .originator("bone")
-        .user_agent("bone-provider/test")
+        .user_agent("bone-model/test")
         .build()
         .expect("test ChatGPT client should build with its production base URL");
     (client, transport)
@@ -300,7 +300,7 @@ async fn preserves_tool_calls_and_replays_their_provider_ids() {
 }
 
 fn header<'a>(
-    request: &'a bone_provider::rig::test_utils::CapturedHttpRequest,
+    request: &'a bone_model::rig::test_utils::CapturedHttpRequest,
     name: &str,
 ) -> Option<&'a str> {
     request

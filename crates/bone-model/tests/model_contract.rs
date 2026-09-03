@@ -1,4 +1,4 @@
-use bone_provider::{
+use bone_model::{
     ConfigError, Protocol,
     protocol::openai_responses,
     rig::{providers::openai as rig_openai, test_utils::RecordingHttpClient},

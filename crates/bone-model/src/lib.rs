@@ -1,4 +1,4 @@
-//! Thin protocol endpoint and model construction on top of Rig.
+//! Unified LLM model interface backed by explicit protocol endpoints.
 //!
 //! Rig owns provider clients, messages, requests, responses, and streaming.
 //! BONE adds a configured [`Endpoint`], explicit [`Protocol`] identity, and a

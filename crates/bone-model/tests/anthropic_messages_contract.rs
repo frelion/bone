@@ -1,6 +1,6 @@
 mod support;
 
-use bone_provider::{
+use bone_model::{
     Protocol, StreamedAssistantContent,
     protocol::anthropic_messages,
     rig::{
@@ -202,7 +202,7 @@ async fn maps_tools_to_anthropic_wire_and_normalizes_tool_use() {
 
 #[tokio::test]
 async fn custom_model_factory_keeps_anthropic_cache_and_strict_tool_options_available() {
-    use bone_provider::rig::client::CompletionClient;
+    use bone_model::rig::client::CompletionClient;
 
     let transport = ScriptedHttpClient::unary_json(TEXT_RESPONSE);
     let client = rig_anthropic::Client::builder()
