@@ -1,7 +1,7 @@
 use std::{env, error::Error, io::Write, process::ExitCode};
 
 use bone_agent::{Agent, AgentReply};
-use bone_model::service::chatgpt_subscription;
+use bone_llm::service::chatgpt_subscription;
 use bone_tools::ToolEnvironment;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -29,7 +29,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let model_id = required_env("BONE_MODEL")?;
     let tools = ToolEnvironment::new(env::current_dir()?)?;
-    let endpoint = chatgpt_subscription::connect("bone-cli", |prompt| {
+    let credential_root = chatgpt_subscription::default_credential_root()?;
+    let endpoint = chatgpt_subscription::connect("bone-cli", credential_root, |prompt| {
         eprintln!(
             "ChatGPT authorization required.\nOpen: {}\nCode: {}\nDo not share this code.\n",
             prompt.verification_uri, prompt.user_code

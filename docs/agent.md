@@ -23,6 +23,12 @@ more Turns. A **Turn** is one model decision and the complete tool batch caused
 by that decision. A tool failure is an observation for the next Turn; it does
 not automatically fail the Action.
 
+This initial Agent slice accepts one plain-text or one JSON value from a tool.
+Rich or multi-block output becomes an explicit tool failure; it is never
+silently flattened into text. Media can therefore be added later as a
+deliberate `bone-llm` contract instead of leaking Rig content types through
+the Agent API.
+
 The Agent's private `start_action` command is only how a model asks the runtime
 to create an Action. It is not the Action itself and never appears as one of an
 Action's tools.
@@ -90,7 +96,7 @@ exposing only read-only tools; write tools are deliberately not wired in yet.
 ## Runnable slice
 
 The `bone` binary connects the same core through the unified
-`bone_model::Model` interface to a ChatGPT subscription and the real
+`bone_llm::Model` interface to a ChatGPT subscription and the real
 workspace-bound `read`, `glob`, and `grep` tools:
 
 ```text
@@ -104,9 +110,21 @@ BONE's independent credential cache. This managed connector is experimental
 and currently requires Unix. It writes first-run device codes to stderr, so do
 not redirect authentication output to persistent logs. The CLI selects the
 service and renders login prompts; credential lifecycle and protocol
-translation end at `bone-model`, while `bone-agent` receives only the
+translation end at `bone-llm`, while `bone-agent` receives only the
 selected `Model`. Run the CLI from the intended workspace: tools are read-only
 in this slice, but content they read is sent to the model.
+
+`bone-llm` is also an independent terminal product, not an Agent mode. It can
+be used to test the model boundary directly, with streaming and multi-turn
+history but no Actions or tools:
+
+```text
+BONE_MODEL='<model available to your subscription>' cargo run -p bone-llm
+```
+
+The reusable `bone-llm` library does not depend on `bone-config`; callers
+inject resolved settings and credentials. As the full product configuration is
+wired, the composition boundary remains `bone-config → bone-llm → Agent`.
 
 This crate intentionally does not yet model Exchange, Conversation, Task,
 planning, persistence, teams, streaming UI, or a long-lived mailbox actor.

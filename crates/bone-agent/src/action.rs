@@ -1,8 +1,5 @@
-use bone_model::rig::{
-    completion::{AssistantContent, CompletionResponse},
-    message::{Message, ToolCall, UserContent},
-    tool::ToolResult as ExecutionToolResult,
-};
+use bone_llm::{InputItem, InputSource, Response, ToolCall, ToolOutput as ModelToolOutput};
+use rig_core::tool::ToolResult as ExecutionToolResult;
 
 use crate::ActionError;
 
@@ -44,7 +41,7 @@ impl ActionOutcome {
 /// receive only settled actions through [`crate::AgentReply`].
 pub struct Action {
     intent: String,
-    context: Vec<Message>,
+    context: Vec<InputItem>,
     turns: Vec<Turn>,
     outcome: Option<ActionOutcome>,
 }
@@ -55,7 +52,7 @@ impl Action {
         Self::with_context(intent, Vec::new())
     }
 
-    pub(crate) fn with_context(intent: impl Into<String>, context: Vec<Message>) -> Self {
+    pub(crate) fn with_context(intent: impl Into<String>, context: Vec<InputItem>) -> Self {
         Self {
             intent: intent.into(),
             context,
@@ -97,36 +94,22 @@ impl Action {
         }
     }
 
-    pub(crate) fn messages(&self, instructions: Option<&str>) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(2 + self.context.len() + self.turns.len() * 2);
-        if let Some(instructions) = instructions.filter(|text| !text.trim().is_empty()) {
-            messages.push(Message::system(instructions));
-        }
-        messages.extend(self.context.iter().cloned());
-        messages.push(Message::user(self.intent.clone()));
+    pub(crate) fn model_input(&self) -> Vec<InputItem> {
+        let mut input = Vec::with_capacity(1 + self.context.len() + self.turns.len() * 2);
+        input.extend(self.context.iter().cloned());
+        input.push(InputItem::external(
+            InputSource::Named("parent-agent".to_owned()),
+            self.intent.clone(),
+        ));
 
         for turn in &self.turns {
-            if !turn.response.choice.is_empty() {
-                messages.push(Message::Assistant {
-                    id: turn.response.message_id.clone(),
-                    content: turn.response.choice.clone(),
-                });
+            if let Some(assistant) = turn.response.clone().into_item() {
+                input.push(assistant);
             }
-
-            if let Some(results) = turn.result_message() {
-                messages.push(results);
-            }
+            input.extend(turn.result_items());
         }
 
-        messages
-    }
-
-    pub(crate) fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
-        self.context.iter().flat_map(message_tool_calls).chain(
-            self.turns
-                .iter()
-                .flat_map(|turn| turn.tools.iter().map(ToolExecution::call)),
-        )
+        input
     }
 
     pub(crate) fn push_turn(&mut self, turn: Turn) -> usize {
@@ -158,36 +141,21 @@ impl Action {
     }
 }
 
-fn message_tool_calls(message: &Message) -> impl Iterator<Item = &ToolCall> {
-    let content = match message {
-        Message::Assistant { content, .. } => content.as_slice(),
-        Message::System { .. } | Message::User { .. } => &[],
-    };
-    content.iter().filter_map(|content| match content {
-        AssistantContent::ToolCall(call) => Some(call),
-        _ => None,
-    })
-}
-
 /// One model decision and the tool calls produced by that decision.
 pub struct Turn {
-    response: CompletionResponse,
+    response: Response,
     tools: Vec<ToolExecution>,
 }
 
 impl Turn {
-    pub(crate) fn new(response: CompletionResponse, calls: Vec<ToolCall>) -> Self {
+    pub(crate) fn new(response: Response, calls: Vec<ToolCall>) -> Self {
         Self {
             response,
             tools: calls.into_iter().map(ToolExecution::new).collect(),
         }
     }
 
-    pub(crate) fn skipped(
-        response: CompletionResponse,
-        calls: Vec<ToolCall>,
-        reason: &'static str,
-    ) -> Self {
+    pub(crate) fn skipped(response: Response, calls: Vec<ToolCall>, reason: &'static str) -> Self {
         Self {
             response,
             tools: calls
@@ -200,12 +168,8 @@ impl Turn {
         }
     }
 
-    pub fn response(&self) -> &CompletionResponse {
+    pub fn response(&self) -> &Response {
         &self.response
-    }
-
-    pub fn assistant(&self) -> &[AssistantContent] {
-        &self.response.choice
     }
 
     pub fn tools(&self) -> &[ToolExecution] {
@@ -225,30 +189,48 @@ impl Turn {
         execution.result = Some(result);
     }
 
-    fn result_message(&self) -> Option<Message> {
+    fn result_items(&self) -> Vec<InputItem> {
         if self.tools.is_empty() || self.is_waiting() {
-            return None;
+            return Vec::new();
         }
 
-        let content = self
-            .tools
+        self.tools
             .iter()
             .map(|execution| {
                 let result = execution
                     .result
                     .as_ref()
                     .expect("a settled turn has every tool result");
-                UserContent::tool_result_for(
-                    execution.call.id.clone(),
-                    execution.call.provider.clone(),
-                    execution.call.function.name.clone(),
-                    result.output().clone().into_content(),
-                )
+                InputItem::tool_result(&execution.call, model_tool_output(result))
             })
-            .collect();
-
-        Some(Message::User { content })
+            .collect()
     }
+}
+
+fn supported_model_tool_output(result: &ExecutionToolResult) -> Option<ModelToolOutput> {
+    let output = result.output();
+    if let Some(text) = output.as_text() {
+        Some(ModelToolOutput::text(text))
+    } else {
+        output
+            .as_json()
+            .map(|value| ModelToolOutput::json(value.clone()))
+    }
+}
+
+pub(crate) fn normalize_tool_result(result: ExecutionToolResult) -> ExecutionToolResult {
+    if supported_model_tool_output(&result).is_some() {
+        result
+    } else {
+        ExecutionToolResult::failed(rig_core::tool::ToolExecutionError::other(
+            "tool output cannot be represented by this Agent; return one plain text or JSON value",
+        ))
+    }
+}
+
+pub(crate) fn model_tool_output(result: &ExecutionToolResult) -> ModelToolOutput {
+    supported_model_tool_output(result)
+        .expect("every stored tool result is normalized before entering an Action")
 }
 
 /// One tool call and its eventual execution result.

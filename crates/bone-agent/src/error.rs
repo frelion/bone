@@ -1,6 +1,6 @@
 use std::{fmt, time::Duration};
 
-use bone_model::rig::completion::{CompletionError, FinishReason};
+use bone_llm::{Error as ModelError, FinishReason};
 use thiserror::Error;
 
 /// Why the agent could not produce a reply.
@@ -8,7 +8,7 @@ use thiserror::Error;
 pub enum AgentError {
     /// The model request used to choose the next action failed.
     #[error("agent decision failed")]
-    Model(#[source] CompletionError),
+    Model(#[source] ModelError),
 
     /// The model did not decide before the request deadline.
     #[error("agent decision timed out after {timeout:?}")]
@@ -25,10 +25,6 @@ pub enum AgentError {
     /// One decision attempted to create an unsafe amount of parallel work.
     #[error("agent requested {requested} actions in one decision; the limit is {limit}")]
     ActionLimit { requested: usize, limit: usize },
-
-    /// A call reused a correlation identifier from the Agent transcript.
-    #[error("agent response reused a tool-call identifier from its transcript")]
-    DuplicateToolCall,
 }
 
 impl fmt::Debug for AgentError {
@@ -42,7 +38,7 @@ impl fmt::Debug for AgentError {
 pub enum ActionError {
     /// The model request failed before a turn could be committed.
     #[error("model turn failed")]
-    Model(#[source] CompletionError),
+    Model(#[source] ModelError),
 
     /// A model request did not finish before the agent deadline.
     #[error("model turn timed out after {timeout:?}")]
@@ -59,10 +55,6 @@ pub enum ActionError {
     /// The model requested an unsafe amount of parallel work in one turn.
     #[error("model requested {requested} tool calls in one turn; the limit is {limit}")]
     ToolCallLimit { requested: usize, limit: usize },
-
-    /// A call reused a correlation identifier from the Action transcript.
-    #[error("model turn reused a tool-call identifier from its transcript")]
-    DuplicateToolCall,
 }
 
 impl fmt::Debug for ActionError {
@@ -101,22 +93,22 @@ pub enum AgentConfigError {
 
 #[cfg(test)]
 mod tests {
-    use bone_model::rig::completion::CompletionError;
+    use bone_llm::ErrorKind;
 
     use super::{ActionError, AgentError};
 
     #[test]
     fn model_error_display_does_not_expose_provider_details() {
-        let error = ActionError::Model(CompletionError::ProviderError(
-            "sensitive provider response".to_owned(),
-        ));
+        let model_error =
+            bone_llm::testing::error(ErrorKind::Provider, "sensitive provider response");
+        let error = ActionError::Model(model_error);
 
         assert_eq!(error.to_string(), "model turn failed");
         assert_eq!(format!("{error:?}"), "model turn failed");
 
-        let error = AgentError::Model(CompletionError::ProviderError(
-            "sensitive provider response".to_owned(),
-        ));
+        let model_error =
+            bone_llm::testing::error(ErrorKind::Provider, "sensitive provider response");
+        let error = AgentError::Model(model_error);
         assert_eq!(error.to_string(), "agent decision failed");
         assert_eq!(format!("{error:?}"), "agent decision failed");
     }

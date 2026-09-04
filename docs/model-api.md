@@ -1,392 +1,274 @@
 # Model API
 
-`bone-model` is BONE's unified LLM model boundary. Rig owns normalized
-messages, completion requests and responses, tools, provider-native state, and
-streaming. BONE deliberately does not mirror those types.
-
-The public model has three parts:
+`bone-llm` is BONE's provider-independent model boundary and a runnable
+direct-model product. Provider clients and wire DTOs are implementation
+details; callers use BONE types from request construction through response
+replay.
 
 ```text
-Protocol                 Endpoint                         Model
-wire contract      +     configured service       +      selected model
-openai-responses         gateway-a                        model-x
-openai-chat-completions  gateway-a                        model-y
-anthropic-messages       anthropic-primary                claude-*
+Protocol                 Endpoint                  Model
+wire contract      +     configured service  +     selected model
+                         credentials + URL
+
+Request ───────────────► complete ───────────────► Response
+        └──────────────► stream   ───────────────► ResponseStream
 ```
 
-- [`Protocol`](../crates/bone-model/src/protocol/mod.rs) identifies the wire
-  contract. OpenAI Responses, OpenAI Chat Completions, and Anthropic Messages
-  are distinct protocols.
-- [`Endpoint`](../crates/bone-model/src/endpoint.rs) is an application-named
-  service instance with authentication, a base URL, and a model factory.
-- [`Model`](../crates/bone-model/src/model.rs) is a cloneable, type-erased
-  Rig completion model carrying endpoint, protocol, and model identities.
-
-Two gateways speaking OpenAI Responses are two endpoints backed by one
-protocol implementation. They are not two Rust provider modules.
-
-## OpenAI Responses
+There is one model selection path and two execution modes:
 
 ```rust,no_run
-use bone_model::{
-    protocol::openai_responses::{
-        self, Reasoning, ReasoningEffort, reasoning_params,
-    },
-    rig::message::Message,
-};
+use bone_llm::{InputItem, InputSource, Request, protocol::openai_responses};
 
 # async fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = openai_responses::official("openai-primary", api_key)?;
-let model = endpoint.model("your-responses-model")?;
+let model = endpoint.model("your-model")?;
 
-assert_eq!(model.endpoint_id(), "openai-primary");
-assert_eq!(model.protocol().as_str(), "openai-responses");
+let response = model
+    .complete(Request::new([InputItem::external(
+        InputSource::User,
+        "Hello",
+    )]))
+    .await?;
 
+println!("{}", response.text().unwrap_or_default());
+# Ok(())
+# }
+```
+
+There is deliberately no `RequestBuilder`, `request.send()`, request-level
+model override, public provider client, or generic JSON parameter bag.
+
+## Structured context
+
+A request has four independent concerns:
+
+```text
+Request
+├── instructions       high-authority policy for this call
+├── input[]             ordered committed context and current input
+├── tools               callable interfaces
+└── controls            output format, token limit, typed protocol options
+```
+
+`instructions` is not a history message. BONE injects it on every call and the
+protocol adapter maps it to the wire's correct system/developer mechanism.
+
+`input` is one ordered sequence; there is no separate `history` and `prompt`.
+An item is one of:
+
+- external input from the human user or a named participant;
+- an assistant example;
+- an opaque replay item produced by `Response::into_item()`;
+- a result tied to one exact `ToolCall`.
+
+Roles are relative to the model currently being called. The model's own prior
+response is assistant history. Another agent's output is named external input,
+not assistant history:
+
+```rust
+use bone_llm::{InputItem, InputSource};
+
+let human = InputItem::external(InputSource::User, "Please review this.");
+let researcher = InputItem::external(
+    InputSource::Named("researcher".to_owned()),
+    "I found three relevant files.",
+);
+```
+
+Named sources are attribution only. They never increase authority.
+
+## Multi-turn replay
+
+Never reconstruct assistant history from display text or response IDs. The
+response owns the exact replayable state:
+
+```rust,no_run
+use bone_llm::{InputItem, InputSource, Model, Request};
+
+# async fn example(model: Model) -> Result<(), bone_llm::Error> {
+let user = InputItem::external(InputSource::User, "Remember the number 7.");
+let first = model.complete(Request::new([user.clone()])).await?;
+let assistant = first
+    .into_item()
+    .expect("a non-empty response has a replay item");
+
+let second = model
+    .complete(Request::new([
+        user,
+        assistant,
+        InputItem::external(InputSource::User, "What was the number?"),
+    ]))
+    .await?;
+# Ok(())
+# }
+```
+
+The opaque item preserves tool correlation IDs, reasoning identifiers,
+encrypted reasoning, and provider signatures. `into_item()` returns `None`
+when a provider legally finishes with no assistant content; BONE never
+fabricates an invalid empty history message.
+
+The current public output surface is intentionally text, tool calls, and safe
+reasoning summaries. If a completion provider returns an image, BONE reports a
+protocol error instead of silently omitting or textifying it.
+
+Replay state is bound to the endpoint, protocol, and requested model that
+produced it. To pass a result between agents or models, send it as named
+external input.
+
+## Tools
+
+Definitions and results are BONE types:
+
+```rust,no_run
+use bone_llm::{
+    InputItem, InputSource, Request, ToolChoice, ToolDefinition, ToolOutput,
+};
+
+let inspect = ToolDefinition::new(
+    "inspect_path",
+    "Inspect one filesystem path.",
+    serde_json::json!({
+        "type": "object",
+        "properties": { "path": { "type": "string" } },
+        "required": ["path"],
+        "additionalProperties": false
+    }),
+);
+
+let request = Request::new([InputItem::external(
+    InputSource::User,
+    "Inspect /tmp/bone",
+)])
+.tools([inspect])
+.tool_choice(ToolChoice::Specific(vec!["inspect_path".to_owned()]));
+
+# fn next_request(
+#     original_user: InputItem,
+#     assistant: InputItem,
+#     call: &bone_llm::ToolCall,
+# ) -> Request {
+Request::new([
+    original_user,
+    assistant,
+    InputItem::tool_result(
+        call,
+        ToolOutput::json(serde_json::json!({ "kind": "directory" })),
+    ),
+])
+# }
+```
+
+`InputItem::tool_result` accepts the complete `ToolCall`, not a loose string
+ID, so protocol-specific correlation data cannot be accidentally discarded.
+Adjacent tool results are sent as one result batch when the wire requires it.
+BONE checks both the public correlation handle and opaque provider call/item
+handles against committed history before returning a response, so an Agent
+never executes a tool call with reused identity.
+
+## Streaming
+
+Streaming exposes display deltas and one canonical terminal response:
+
+```rust,no_run
+use bone_llm::{InputItem, InputSource, Model, Request, StreamEvent};
+use futures_util::StreamExt;
+
+# async fn example(model: Model) -> Result<(), bone_llm::Error> {
 let mut stream = model
-    .request(Message::user("Hello"))
-    .additional_params(reasoning_params(
-        Reasoning::new().with_effort(ReasoningEffort::High),
-    ))
-    .stream()
+    .stream(Request::new([InputItem::external(
+        InputSource::User,
+        "Hello",
+    )]))
     .await?;
 
-// `stream` is Rig's native `StreamingCompletionResponse`.
-# use futures_util::StreamExt;
-# while stream.next().await.is_some() {}
+let mut completed = None;
+while let Some(event) = stream.next().await {
+    match event? {
+        StreamEvent::TextDelta(text) => print!("{text}"),
+        StreamEvent::Completed(response) => completed = Some(response),
+        StreamEvent::ToolCallDelta { .. } => {}
+        _ => {}
+    }
+}
 # Ok(())
 # }
 ```
 
-For an OpenAI Responses-compatible API root:
+A fully consumed stream terminates with exactly one `Completed(Response)` or
+one `Error`. Text and tool-call fields may appear as deltas for display, but a
+complete tool call has exactly one trusted source: the terminal `Response`.
+`Completed` is emitted only after the provider stream is drained and its final
+response is fully aggregated. EOF without a genuine provider terminal is
+`ErrorKind::IncompleteStream`; partial output is never silently committed as a
+successful turn. The first provider stream error is terminal: BONE emits it
+immediately and drops the remaining stream instead of waiting on a failed
+connection.
 
-```rust,no_run
-use bone_model::protocol::openai_responses;
+Unary and streaming calls therefore converge on the same `Response` and the
+same `Response::into_item()` continuation path.
 
-# fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
-let endpoint = openai_responses::compatible(
-    "gateway-a",
-    api_key,
-    "https://gateway.example/v1",
-)?;
-let model = endpoint.model("vendor-model")?;
-# Ok(())
+## Controls and protocol options
+
+Portable controls stay on `Request`:
+
+- `.max_output_tokens(n)`
+- `.output(OutputFormat::Text | OutputFormat::JsonSchema(...))`
+- `.tools(...)` and `.tool_choice(...)`
+
+Protocol-only controls live in that protocol's typed `Options`:
+
+```rust
+use bone_llm::{Request, protocol::openai_responses};
+
+# fn configure(request: Request) -> Request {
+request.options(
+    openai_responses::Options::new().reasoning(
+        openai_responses::Reasoning::new()
+            .effort(openai_responses::ReasoningEffort::High)
+            .summary(openai_responses::ReasoningSummary::Concise),
+    ),
+)
 # }
 ```
 
-The base URL is the prefix to which `/responses` is appended. An endpoint that
-only implements `/chat/completions` does not implement this protocol and is not
-silently treated as equivalent.
+`temperature` is intentionally not a universal BONE control. It is not a
+reliable freedom across modern reasoning models or BONE's supported services.
+A control belongs in a protocol-specific typed option only when the adapter can
+faithfully send it. An accepted option is either honored or rejected before
+network I/O; it is never silently dropped.
 
-Compatible base URLs must be absolute HTTP(S) URLs without a query string or
-embedded `user:password@host` credentials. A gateway that requires query-based
-authentication or routing needs a custom `HttpClientExt` or Rig provider
-extension that rewrites the final request URI; pass that configured client
-through `openai_responses::from_client`. Merely putting a query string or
-credential in Rig's base URL is unsupported and risks leaking secrets into URI
-telemetry.
+Automatic tool selection is expressed only by omitting `tool_choice`; every
+explicit choice requires at least one tool definition. OpenAI Chat Completions
+cannot enforce a JSON schema on an initial request that also advertises tools,
+so BONE rejects that combination locally. The same schema is accepted after a
+tool result, when the protocol can actually send it.
 
-## Experimental ChatGPT subscription service
+## Endpoints
 
-The experimental `chatgpt_subscription` service adapter provides in-process
-access to the Codex Responses backend using a ChatGPT subscription:
+Supported public endpoint constructors are:
 
-```rust,no_run
-use bone_model::{
-    rig::message::Message,
-    service::chatgpt_subscription,
-};
+- `openai_responses::official` / `compatible`;
+- `openai_chat_completions::official` / `compatible`;
+- `anthropic_messages::official` / `compatible`;
+- `chatgpt_subscription::connect` for the experimental ChatGPT subscription
+  service.
 
-# fn show_device_login(_url: String, _code: String) {}
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let endpoint = chatgpt_subscription::connect("chatgpt-subscription", |prompt| {
-    // Render only in the active connection UI; do not log or persist the code.
-    show_device_login(prompt.verification_uri, prompt.user_code);
-}).await?;
-let model = endpoint.model("a-model-available-to-your-subscription")?;
-let response = model.request(Message::user("Hello")).send().await?;
-# Ok(())
-# }
-```
+Compatible base URLs must be absolute HTTP(S) URLs without embedded
+credentials or query strings. Authentication and routing configuration are
+injected while constructing the endpoint; `bone-llm` does not depend on
+`bone-config`.
 
-This is a service adapter, not a fourth protocol. Rig sends native Responses
-requests and SSE events, so the endpoint and selected model identify as
-`Protocol::OpenAiResponses`; the normalized response provider is `chatgpt`.
-The service-specific URL, subscription headers, OAuth lifecycle, forced SSE,
-and request restrictions stay inside Rig's ChatGPT provider.
+The ChatGPT subscription connector receives an explicit application-owned
+credential root. `default_credential_root()` is an opt-in convenience, while
+`connect` owns authorization, locking, secure credential storage, and refresh.
+The backend does not honor `max_output_tokens` or structured-output schemas,
+so BONE rejects those options locally instead of pretending they were applied.
 
-The adapter does not run a local proxy and does not invoke the Codex agent.
-The explicit `connect` call reports a device-login URL and code through the
-provided callback. The library never prints the code itself. Once the user has
-authorized it, Rig caches and refreshes credentials in BONE's independent
-credential record. No API key, `OPENAI_BASE_URL`, sidecar, or separate
-installation is required.
-
-This backend is a ChatGPT/Codex product interface, not the public OpenAI
-Platform API, and has no equivalent public compatibility guarantee. The
-adapter is therefore explicitly experimental. It currently supports the native
-Responses shape; it does not claim a Chat Completions subscription endpoint.
-Selecting this named adapter is the runtime opt-in; there is no Cargo feature
-that could be mistaken for a security boundary or accidentally skipped by CI.
-
-The workspace currently binds `bone-model` directly to a self-contained,
-vendored Rig hardening patch and marks the crate as `publish = false`. The
-direct path dependency remains in force when this repository is consumed as a
-Git or path dependency; it cannot silently resolve the unpatched crates.io Rig.
-Publishing is deliberately blocked until an equivalent fix is available as a
-published dependency.
-
-Important boundaries:
-
-- Never configure Rig's `auth_file` as `~/.codex/auth.json`. Codex and Rig use
-  different schemas, and sharing a rotating refresh token between independent
-  clients can break either login.
-- The convenience connector uses BONE's independent record at
-  `~/.config/bone/chatgpt-subscription/auth.json` on Unix (respecting a valid
-  absolute `XDG_CONFIG_HOME`, otherwise falling back to `$HOME/.config`). It
-  creates a missing private config hierarchy, creates app directories as
-  `0700`, creates token/lock files as `0600`, and requires every managed
-  artifact to belong to the process's effective user. BONE's preparation step
-  rejects symbolic links and hard links and opens the prepared files with
-  `O_NOFOLLOW`. The guarded convenience connector is temporarily unavailable
-  on Windows until equivalent ACL and reparse-point checks exist. An
-  application can supply a different app-owned client through
-  `chatgpt_subscription::from_unmanaged_client`.
-- Interactive device login is suitable for local CLI or desktop use. A server
-  should construct the Rig client with `allow_device_flow(false)` so an
-  ordinary request cannot wait for unattended login.
-- `connect` completes authorization before it returns, keeping device login out
-  of ordinary completion requests. Reuse the returned endpoint: BONE keeps an
-  exclusive OS file lock for its entire endpoint/model lifetime, so another
-  managed BONE connector fails safely instead of racing a rotating refresh
-  token. This lock does not coordinate an unmanaged Rig client or another
-  program using the same path. A client passed to `from_unmanaged_client` owns
-  its credential path, authorization timing, locking, and error policy.
-- After explicit authorization, `connect` rebuilds the endpoint client with
-  interactive device flow disabled, so an ordinary completion never prints a
-  new device code or waits for unattended login. `connect` maps authorization
-  failures to a stable service error and does not expose OAuth response text.
-  The repository's pinned Rig patch handles a backend 401 by refreshing one
-  rejected token generation and retrying the unary or lazy-SSE handshake at
-  most once. An unusable refresh token invalidates the cache and returns a
-  stable reconnect error; 401/403 bodies and Responses SSE provider-error
-  envelopes are redacted. Non-authentication HTTP and transport diagnostics
-  retain their Rig `CompletionError` classification and may contain provider
-  text, so raw errors still belong only in trusted logs. The type is available
-  through `bone_model::rig::completion::CompletionError`.
-- The ownership, permission, link, and `O_NOFOLLOW` checks protect BONE's
-  managed preparation and cooperating BONE processes. The pinned Rig patch
-  replaces credentials atomically on Unix using a private `0600` sibling,
-  file and directory sync, and a same-directory rename; an interrupted write
-  therefore leaves either the prior complete record or the new one. A
-  same-user process that can replace path components remains outside this
-  boundary. Never share this credential path with another client.
-- Rig drops unsupported backend fields, including `max_output_tokens` and
-  `temperature`; it forces `stream: true`, `store: false`, and requests
-  replayable encrypted reasoning state. Do not treat `max_tokens` as a hard
-  subscription budget boundary.
-- Native OAuth is unavailable on WASM. Subscription live tests must remain
-  manual and must not put a personal refresh token in hosted CI.
-
-## OpenAI Chat Completions
-
-Chat Completions is a separate wire contract, not a compatibility mode for
-Responses:
-
-```rust,no_run
-use bone_model::{
-    protocol::openai_chat_completions,
-    rig::message::Message,
-};
-
-# async fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
-let endpoint = openai_chat_completions::official("openai-chat", api_key)?;
-let model = endpoint.model("your-chat-completions-model")?;
-
-assert_eq!(model.endpoint_id(), "openai-chat");
-assert_eq!(model.protocol().as_str(), "openai-chat-completions");
-
-let response = model
-    .request(Message::user("Hello"))
-    .max_tokens(256)
-    .send()
-    .await?;
-# Ok(())
-# }
-```
-
-For a compatible API root, use the Chat-specific constructor:
-
-```rust,no_run
-use bone_model::protocol::openai_chat_completions;
-
-# fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
-let endpoint = openai_chat_completions::compatible(
-    "chat-gateway",
-    api_key,
-    "https://gateway.example/v1",
-)?;
-let model = endpoint.model("vendor-chat-model")?;
-# Ok(())
-# }
-```
-
-This base URL is the prefix to which `/chat/completions` is appended. The same
-absolute HTTP(S), no-query, no-embedded-credentials rule applies as for
-Responses. Query-based routing requires a custom `HttpClientExt` or Rig
-provider extension that constructs the final URI, injected through
-`openai_chat_completions::from_client`.
-
-An OpenAI-compatible service may implement `/responses`, `/chat/completions`,
-or both. Supporting either path says nothing about support for the other. Pick
-the constructor that matches the service's documented wire protocol; BONE
-never probes one and silently falls back to the other.
-
-## Anthropic Messages
-
-```rust,no_run
-use bone_model::{
-    protocol::anthropic_messages,
-    rig::message::Message,
-};
-
-# async fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
-let endpoint = anthropic_messages::official("anthropic-primary", api_key)?;
-let model = endpoint.model("claude-model")?;
-
-assert_eq!(model.endpoint_id(), "anthropic-primary");
-assert_eq!(model.protocol().as_str(), "anthropic-messages");
-
-let response = model
-    .request(Message::user("Hello"))
-    .max_tokens(256)
-    .send()
-    .await?;
-# Ok(())
-# }
-```
-
-`anthropic_messages::compatible` accepts a Messages-compatible base URL. Rig
-normalizes a trailing `/v1`, `/messages`, or `/v1/messages` and sends the final
-request to `/v1/messages` exactly once.
-
-The same base-URL rule applies: it must be an absolute HTTP(S) URL without a
-query string or embedded credentials. Query-based routing requires a custom
-`HttpClientExt` or Rig provider extension that rewrites the final URI, injected
-through `anthropic_messages::from_client`; a query-bearing ordinary base URL is
-not sufficient.
-
-## Custom clients and model options
-
-Each protocol module exposes `from_client`. Use it for custom authentication
-headers, other custom headers, a custom base URL, or a custom Rig
-`HttpClientExt` implementation. Keep credentials in headers or transport
-configuration, never in the URL. The transport's generic type is erased when
-the endpoint is built.
-
-Protocol-specific model options belong in that protocol module's
-`from_model_factory` escape hatch. For example, an Anthropic caller can build
-Rig models with prompt caching enabled without adding a generic JSON options
-bag to BONE:
-
-```rust,no_run
-use bone_model::{
-    protocol::anthropic_messages,
-    rig::{client::CompletionClient, providers::anthropic},
-};
-
-# fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
-let client = anthropic::Client::new(api_key)?;
-let endpoint = anthropic_messages::from_model_factory(
-    "anthropic-cached",
-    move |model_id| {
-        client
-            .completion_model(model_id)
-            .with_automatic_caching()
-    },
-)?;
-# Ok(())
-# }
-```
-
-Ordinary protocol constructors do not read environment variables or persist
-credentials; they receive resolved values explicitly. An explicitly selected
-OAuth service adapter may maintain the independent token cache documented by
-that adapter. Local construction failures use `ConfigError`; the explicit
-subscription handshake returns a stable service-local error; request-time
-network, protocol, and model failures remain Rig `CompletionError` values and
-must be treated as potentially sensitive provider diagnostics. The type is
-available through `bone_model::rig::completion::CompletionError`.
-
-## What belongs elsewhere
-
-The future runtime/config layer owns configuration deserialization, secret
-resolution, endpoint registries, routing, retries, fallback, rate limiting,
-budgets, and pricing. None of those policies belong in `bone-model`.
-
-Adding a standard compatible service should normally require only new runtime
-configuration and live certification. Add a new `Protocol` variant and module
-only when the URL, headers, request/response JSON, or stream semantics form a
-genuinely different wire contract.
-
-## Inspect the OpenAI boundary
-
-The example prints endpoint identity, protocol identity, the normalized Rig
-request, stream events, and the final aggregated assistant choice:
+The standalone product remains the smallest real smoke test:
 
 ```sh
-export OPENAI_API_KEY='...'
-export BONE_OPENAI_MODEL='...'
-# Optional for a compatible endpoint:
-export OPENAI_BASE_URL='https://gateway.example/v1'
-
-cargo run -p bone-model --example openai_responses_probe -- text
-cargo run -p bone-model --example openai_responses_probe -- tool
+BONE_MODEL='<model available to your subscription>' cargo run -p bone-llm
 ```
 
-Tool mode defines a harmless fictional `inspect_path` function and displays
-the model's call. It deliberately does not execute the tool or access the
-filesystem.
-
-Chat Completions has its own probe and model variable. It calls
-`/chat/completions` and never falls back to Responses:
-
-```sh
-export OPENAI_API_KEY='...'
-export BONE_OPENAI_CHAT_MODEL='...'
-# Optional for a compatible endpoint:
-export OPENAI_BASE_URL='https://gateway.example/v1'
-
-cargo run -p bone-model --example openai_chat_completions_probe -- text
-cargo run -p bone-model --example openai_chat_completions_probe -- tool
-```
-
-The two OpenAI probes reuse `OPENAI_API_KEY` and `OPENAI_BASE_URL` because one
-run represents one configured OpenAI-compatible service. Their model variables
-remain separate: `BONE_OPENAI_MODEL` selects a Responses-capable model, while
-`BONE_OPENAI_CHAT_MODEL` selects a Chat Completions-capable model. Set only the
-one the service supports. To certify services with different URLs or
-credentials, run the probes separately with the corresponding environment.
-
-The Anthropic probe exposes the same text/tool boundary for Messages:
-
-```sh
-export ANTHROPIC_API_KEY='...'
-export BONE_ANTHROPIC_MODEL='...'
-# Optional for a compatible endpoint:
-export ANTHROPIC_BASE_URL='https://gateway.example'
-
-cargo run -p bone-model --example anthropic_messages_probe -- text
-cargo run -p bone-model --example anthropic_messages_probe -- tool
-```
-
-The experimental ChatGPT subscription probe needs only a model identifier.
-Its first run performs device login; later runs reuse the independent cache:
-
-```sh
-export BONE_CHATGPT_MODEL='a-model-available-to-your-subscription'
-
-cargo run -p bone-model --example chatgpt_subscription_probe -- text
-cargo run -p bone-model --example chatgpt_subscription_probe -- tool
-```
-
-Tool mode only displays the requested call. It does not execute the tool.
+It uses the exact same `Request → Model → Response` path as downstream agents.

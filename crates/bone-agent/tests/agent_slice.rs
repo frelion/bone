@@ -1,12 +1,10 @@
 use bone_agent::Agent;
-use bone_model::{
-    protocol::openai_responses,
-    rig::{
-        providers::openai as rig_openai,
-        test_utils::{MockHttpResponse, SequencedHttpClient},
-    },
-};
+use bone_llm::testing;
 use bone_tools::ToolEnvironment;
+use rig_core::{
+    providers::openai as rig_openai,
+    test_utils::{MockHttpResponse, SequencedHttpClient},
+};
 
 const START_ACTION: &str = r#"{
   "id":"resp_start","object":"response","created_at":0,"status":"completed",
@@ -65,7 +63,7 @@ async fn real_provider_and_read_tool_cross_the_whole_agent_slice() {
         .http_client(transport.clone())
         .build()
         .expect("test client");
-    let model = openai_responses::from_client("agent-slice", client)
+    let model = testing::openai_responses_endpoint("agent-slice", client)
         .expect("test endpoint")
         .model("openai-test-model")
         .expect("test model");

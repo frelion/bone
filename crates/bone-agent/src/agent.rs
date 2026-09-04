@@ -1,25 +1,22 @@
 use std::time::Duration;
 
-use bone_model::{
-    Model,
-    rig::{
-        completion::{
-            AssistantContent, CompletionModel, CompletionResponse, FinishReason, ToolDefinition,
-        },
-        message::{Message, ToolCall, UserContent},
-        tool::{
-            PortableDynamicTool, PortableTool, ToolExecutionError, ToolOutput,
-            ToolResult as ExecutionToolResult,
-        },
-        wasm_compat::timeout,
+use bone_llm::{
+    FinishReason, InputItem, InputSource, Model, Request, Response, ToolCall, ToolDefinition,
+};
+use rig_core::{
+    tool::{
+        PortableDynamicTool, PortableTool, ToolExecutionError, ToolOutput,
+        ToolResult as ExecutionToolResult,
     },
+    wasm_compat::timeout,
 };
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
     Action, ActionOutcome, AgentConfigError, AgentError,
-    runtime::{Limits, drive, final_text, unique_call_ids},
+    action::{model_tool_output, normalize_tool_result},
+    runtime::{Limits, drive},
     tools::{START_ACTION_TOOL, Tools, missing_tool},
 };
 
@@ -39,12 +36,70 @@ Tool failures are observations you may recover from. When the action is complete
 return a concise result for the parent agent. Do not address the user directly and \
 do not create further actions.";
 
+const PARENT_AGENT_SOURCE: &str = "parent-agent";
+
+#[derive(Clone, Default)]
+struct AgentHistory {
+    input: Vec<InputItem>,
+    action_context: Vec<InputItem>,
+}
+
+impl AgentHistory {
+    fn push_user(&mut self, text: String) {
+        self.input
+            .push(InputItem::external(InputSource::User, text.clone()));
+        self.action_context
+            .push(InputItem::external(InputSource::User, text));
+    }
+
+    fn push_response(&mut self, response: &Response) {
+        if let Some(item) = response.clone().into_item() {
+            self.input.push(item);
+        }
+        if let Some(text) = parent_response_text(response) {
+            self.action_context.push(InputItem::external(
+                InputSource::Named(PARENT_AGENT_SOURCE.to_owned()),
+                text,
+            ));
+        }
+    }
+
+    fn push_tool_result(&mut self, call: &ToolCall, result: &ExecutionToolResult) {
+        self.input
+            .push(InputItem::tool_result(call, model_tool_output(result)));
+        self.action_context.push(InputItem::external(
+            InputSource::Named(PARENT_AGENT_SOURCE.to_owned()),
+            format!(
+                "Tool `{}` returned ({}): {}",
+                call.name(),
+                result.status_name(),
+                result.output().render()
+            ),
+        ));
+    }
+}
+
+fn parent_response_text(response: &Response) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(text) = response.text() {
+        parts.push(text);
+    }
+    parts.extend(response.tool_calls().map(|call| {
+        format!(
+            "Requested tool `{}` with arguments {}",
+            call.name(),
+            call.arguments()
+        )
+    }));
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
 /// A conversational agent that chooses and advances its own actions.
 pub struct Agent {
     model: Model,
     instructions: Option<String>,
     tools: Tools,
-    history: Vec<Message>,
+    history: AgentHistory,
     limits: Limits,
 }
 
@@ -54,7 +109,7 @@ impl Agent {
             model,
             instructions: None,
             tools: Tools::default(),
-            history: Vec::new(),
+            history: AgentHistory::default(),
             limits: Limits::default(),
         }
     }
@@ -189,29 +244,31 @@ enum ActionStart {
     },
 }
 
-async fn drive_agent<M>(
-    model: &M,
+async fn drive_agent(
+    model: &Model,
     instructions: Option<&str>,
     tools: &Tools,
     limits: Limits,
-    history: &mut Vec<Message>,
+    history: &mut AgentHistory,
     input: String,
-) -> Result<AgentReply, AgentError>
-where
-    M: CompletionModel + Clone,
-{
-    history.push(Message::user(input));
+) -> Result<AgentReply, AgentError> {
+    history.push_user(input);
     let agent_instructions = combined_instructions(instructions, AGENT_PROTOCOL);
     let action_instructions = combined_instructions(instructions, ACTION_PROTOCOL);
     let mut completed_actions = Vec::new();
 
     for _ in 0..limits.max_decisions {
-        let action_context = history.clone();
-        let response =
-            complete_agent(model, history, &agent_instructions, limits.model_timeout).await?;
-        let finish_reason = response.finish_reason();
+        let action_context = history.action_context.clone();
+        let response = complete_agent(
+            model,
+            &history.input,
+            &agent_instructions,
+            limits.model_timeout,
+        )
+        .await?;
+        let finish_reason = response.finish_reason().cloned();
 
-        if response.choice.is_empty()
+        if response.items().is_empty()
             || finish_reason
                 .as_ref()
                 .is_some_and(FinishReason::truncated_output)
@@ -219,11 +276,12 @@ where
             return Err(AgentError::Incomplete { finish_reason });
         }
 
-        let calls = tool_calls(&response);
+        let calls = response.tool_calls().cloned().collect::<Vec<_>>();
         if calls.is_empty() {
-            let text =
-                final_text(&response).ok_or_else(|| AgentError::Incomplete { finish_reason })?;
-            history.push(assistant_message(&response));
+            let text = response
+                .text()
+                .ok_or_else(|| AgentError::Incomplete { finish_reason })?;
+            history.push_response(&response);
             return Ok(AgentReply {
                 text,
                 actions: completed_actions,
@@ -236,11 +294,7 @@ where
                 limit: limits.max_actions_per_decision,
             });
         }
-        if !unique_call_ids(history_tool_calls(history).chain(calls.iter())) {
-            return Err(AgentError::DuplicateToolCall);
-        }
-
-        history.push(assistant_message(&response));
+        history.push_response(&response);
         let mut actions = Vec::new();
         let starts = calls
             .into_iter()
@@ -258,16 +312,13 @@ where
             .collect::<Vec<_>>();
 
         let actions = drive(model, Some(&action_instructions), tools, limits, actions).await;
-        let results = starts
-            .into_iter()
-            .map(|start| match start {
-                ActionStart::Accepted { call, action } => {
-                    action_result_message(call, action_result(&actions[action]))
-                }
-                ActionStart::Rejected { call, result } => action_result_message(call, result),
-            })
-            .collect();
-        history.push(Message::User { content: results });
+        for start in starts {
+            let (call, result) = match start {
+                ActionStart::Accepted { call, action } => (call, action_result(&actions[action])),
+                ActionStart::Rejected { call, result } => (call, result),
+            };
+            history.push_tool_result(&call, &normalize_tool_result(result));
+        }
         completed_actions.extend(actions);
     }
 
@@ -276,13 +327,13 @@ where
     })
 }
 
-fn action_from_call(call: &ToolCall, context: &[Message]) -> Result<Action, ExecutionToolResult> {
-    if call.function.name != START_ACTION_TOOL {
-        return Err(missing_tool(&call.function.name));
+fn action_from_call(call: &ToolCall, context: &[InputItem]) -> Result<Action, ExecutionToolResult> {
+    if call.name() != START_ACTION_TOOL {
+        return Err(missing_tool(call.name()));
     }
 
     let request =
-        serde_json::from_value::<StartAction>(call.function.arguments.clone()).map_err(|_| {
+        serde_json::from_value::<StartAction>(call.arguments().clone()).map_err(|_| {
             ExecutionToolResult::failed(ToolExecutionError::invalid_args(
                 "start_action arguments must contain only a non-empty string field named `intent`",
             ))
@@ -309,35 +360,16 @@ fn action_result(action: &Action) -> ExecutionToolResult {
     ExecutionToolResult::success(ToolOutput::json(value))
 }
 
-fn action_result_message(call: ToolCall, result: ExecutionToolResult) -> UserContent {
-    UserContent::tool_result_for(
-        call.id,
-        call.provider,
-        call.function.name,
-        result.output().clone().into_content(),
-    )
-}
-
-async fn complete_agent<M>(
-    model: &M,
-    history: &[Message],
+async fn complete_agent(
+    model: &Model,
+    history: &[InputItem],
     instructions: &str,
     deadline: Duration,
-) -> Result<CompletionResponse, AgentError>
-where
-    M: CompletionModel + Clone,
-{
-    let mut messages = Vec::with_capacity(history.len() + 1);
-    messages.push(Message::system(instructions));
-    messages.extend(history.iter().cloned());
-    let prompt = messages
-        .pop()
-        .expect("chat history always contains the current input");
-    let completion = model
-        .completion_request(prompt)
-        .messages(messages)
-        .tools(vec![start_action_definition()])
-        .send();
+) -> Result<Response, AgentError> {
+    let request = Request::new(history.iter().cloned())
+        .instructions(instructions)
+        .tools([start_action_definition()]);
+    let completion = model.complete(request);
     match timeout(deadline, completion).await {
         Ok(response) => response.map_err(AgentError::Model),
         Err(_) => Err(AgentError::ModelTimeout { timeout: deadline }),
@@ -345,11 +377,10 @@ where
 }
 
 fn start_action_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: START_ACTION_TOOL.to_owned(),
-        description: "Start one independent action. An action owns one or more model turns, may use tools or reason without them, and returns one outcome to the parent agent. Start multiple actions in one response only when they can run independently."
-            .to_owned(),
-        parameters: json!({
+    ToolDefinition::new(
+        START_ACTION_TOOL,
+        "Start one independent action. An action owns one or more model turns, may use tools or reason without them, and returns one outcome to the parent agent. Start multiple actions in one response only when they can run independently.",
+        json!({
             "type": "object",
             "properties": {
                 "intent": {
@@ -360,7 +391,7 @@ fn start_action_definition() -> ToolDefinition {
             "required": ["intent"],
             "additionalProperties": false
         }),
-    }
+    )
 }
 
 fn combined_instructions(custom: Option<&str>, protocol: &str) -> String {
@@ -368,37 +399,6 @@ fn combined_instructions(custom: Option<&str>, protocol: &str) -> String {
         Some(custom) => format!("{custom}\n\n{protocol}"),
         None => protocol.to_owned(),
     }
-}
-
-fn assistant_message(response: &CompletionResponse) -> Message {
-    Message::Assistant {
-        id: response.message_id.clone(),
-        content: response.choice.clone(),
-    }
-}
-
-fn tool_calls(response: &CompletionResponse) -> Vec<ToolCall> {
-    response
-        .choice
-        .iter()
-        .filter_map(|content| match content {
-            AssistantContent::ToolCall(call) => Some(call.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn history_tool_calls(history: &[Message]) -> impl Iterator<Item = &ToolCall> {
-    history.iter().flat_map(|message| {
-        let content = match message {
-            Message::Assistant { content, .. } => content.as_slice(),
-            Message::System { .. } | Message::User { .. } => &[],
-        };
-        content.iter().filter_map(|content| match content {
-            AssistantContent::ToolCall(call) => Some(call),
-            _ => None,
-        })
-    })
 }
 
 #[cfg(test)]

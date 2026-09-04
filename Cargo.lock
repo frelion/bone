@@ -99,7 +99,7 @@ dependencies = [
 name = "bone-agent"
 version = "0.1.0"
 dependencies = [
- "bone-model",
+ "bone-llm",
  "bone-tools",
  "futures-util",
  "rig-core",
@@ -115,7 +115,7 @@ name = "bone-cli"
 version = "0.1.0"
 dependencies = [
  "bone-agent",
- "bone-model",
+ "bone-llm",
  "bone-tools",
  "tokio",
 ]
@@ -135,7 +135,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bone-model"
+name = "bone-llm"
 version = "0.1.0"
 dependencies = [
  "bytes",
@@ -145,6 +145,7 @@ dependencies = [
  "libc",
  "rig-core",
  "rustix",
+ "schemars",
  "serde_json",
  "tokio",
 ]

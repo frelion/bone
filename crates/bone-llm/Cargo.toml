@@ -1,0 +1,49 @@
+[package]
+name = "bone-llm"
+version.workspace = true
+edition.workspace = true
+description = "Unified LLM model interface for BONE"
+publish = false
+
+[features]
+test-utils = []
+
+[dependencies]
+futures-util.workspace = true
+rig-core = { workspace = true, features = ["reqwest", "rustls"] }
+schemars.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
+
+[target.'cfg(unix)'.dependencies]
+fs2.workspace = true
+libc.workspace = true
+rustix.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+http.workspace = true
+rig-core = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[[test]]
+name = "anthropic_messages_contract"
+required-features = ["test-utils"]
+
+[[test]]
+name = "chatgpt_subscription_contract"
+required-features = ["test-utils"]
+
+[[test]]
+name = "model_contract"
+required-features = ["test-utils"]
+
+[[test]]
+name = "openai_chat_completions_contract"
+required-features = ["test-utils"]
+
+[[test]]
+name = "openai_responses_contract"
+required-features = ["test-utils"]

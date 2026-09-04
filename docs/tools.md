@@ -1,7 +1,7 @@
 # Built-in tools
 
 `bone-tools` is BONE's provider-independent local tool crate. It is a sibling
-of `bone-model`; neither crate depends on the other. Both depend on Rig's
+of `bone-llm`; neither crate depends on the other. Both depend on Rig's
 normalized interfaces, while `bone-tools` uses the independent `bone-config`
 service for its config tool. `bone-cli` is the composition root: it creates a
 model and concrete tools, then supplies them to `bone-agent`. The production
@@ -9,8 +9,8 @@ model and concrete tools, then supplies them to `bone-agent`. The production
 
 ```text
 bone-cli
-├──► bone-agent ──► bone-model ──► rig-core
-├──► bone-model ─────────────────► rig-core
+├──► bone-agent ──► bone-llm ──► rig-core
+├──► bone-llm ─────────────────► rig-core
 └──► bone-tools ──┬──────────────► rig-core
                   └──────────────► bone-config
 ```
@@ -76,7 +76,7 @@ let bash = BashTool::with_process_environment(
 ```
 
 Tool registration belongs to `bone-agent`, while provider translation remains
-in `bone-model`. Conversation state, approvals, authorization, host-level
+in `bone-llm`. Conversation state, approvals, authorization, host-level
 cancellation policy, and audit events remain responsibilities of higher layers.
 
 ## Safety contract

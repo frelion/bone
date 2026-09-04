@@ -20,7 +20,7 @@ BONE_CHATGPT_MODEL=gpt-5.4 \
   --locked -- --ignored --nocapture
 ```
 
-The crate was subsequently renamed to `bone-model`; the command above records
+The crate was subsequently renamed to `bone-llm`; the command above records
 the package name used by this historical run.
 
 ## Result

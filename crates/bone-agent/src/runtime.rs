@@ -1,19 +1,15 @@
-use std::{
-    collections::{HashSet, VecDeque},
-    time::Duration,
-};
+use std::{collections::VecDeque, time::Duration};
 
-use bone_model::rig::{
-    completion::{AssistantContent, CompletionModel, CompletionResponse, FinishReason},
-    message::ToolCall,
+use bone_llm::{FinishReason, InputItem, Model, Request, Response, ToolCall, ToolDefinition};
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use rig_core::{
     tool::{ToolExecutionError, ToolResult as ExecutionToolResult},
     wasm_compat::{WasmBoxedFuture, timeout},
 };
-use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 
 use crate::{
     Action, ActionError, Turn,
-    action::ActionState,
+    action::{ActionState, normalize_tool_result},
     tools::{Tools, missing_tool},
 };
 
@@ -54,16 +50,13 @@ struct FinishedTool {
     result: ExecutionToolResult,
 }
 
-pub(crate) async fn drive<M>(
-    model: &M,
+pub(crate) async fn drive(
+    model: &Model,
     instructions: Option<&str>,
     tools: &Tools,
     limits: Limits,
     mut actions: Vec<Action>,
-) -> Vec<Action>
-where
-    M: CompletionModel + Clone,
-{
+) -> Vec<Action> {
     let mut ready = (0..actions.len()).collect::<VecDeque<_>>();
     let mut running = FuturesUnordered::<WasmBoxedFuture<'static, FinishedTool>>::new();
 
@@ -79,9 +72,15 @@ where
                 continue;
             }
 
-            let messages = actions[action_index].messages(instructions);
+            let input = actions[action_index].model_input();
             let definitions = tools.definitions();
-            let completion = complete(model, messages, definitions, limits.model_timeout);
+            let completion = complete(
+                model,
+                input,
+                instructions,
+                definitions,
+                limits.model_timeout,
+            );
             tokio::pin!(completion);
 
             let response = loop {
@@ -108,21 +107,14 @@ where
                 }
             };
 
-            let finish_reason = response.finish_reason();
-            if response.choice.is_empty() {
+            let finish_reason = response.finish_reason().cloned();
+            if response.items().is_empty() {
                 actions[action_index].push_turn(Turn::new(response, Vec::new()));
                 actions[action_index].fail(ActionError::Incomplete { finish_reason });
                 continue;
             }
 
-            let calls = response
-                .choice
-                .iter()
-                .filter_map(|content| match content {
-                    AssistantContent::ToolCall(call) => Some(call.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            let calls = response.tool_calls().cloned().collect::<Vec<_>>();
 
             if finish_reason
                 .as_ref()
@@ -153,18 +145,8 @@ where
                 continue;
             }
 
-            if !unique_call_ids(actions[action_index].tool_calls().chain(calls.iter())) {
-                actions[action_index].push_turn(Turn::skipped(
-                    response,
-                    calls,
-                    "tool-call identifiers were duplicated; tools were not executed",
-                ));
-                actions[action_index].fail(ActionError::DuplicateToolCall);
-                continue;
-            }
-
             if calls.is_empty() {
-                let output = final_text(&response);
+                let output = response.text();
                 actions[action_index].push_turn(Turn::new(response, calls));
                 match output {
                     Some(output) => actions[action_index].complete(output),
@@ -201,23 +183,18 @@ where
     actions
 }
 
-async fn complete<M>(
-    model: &M,
-    mut messages: Vec<bone_model::rig::message::Message>,
-    tools: Vec<bone_model::rig::completion::ToolDefinition>,
+async fn complete(
+    model: &Model,
+    input: Vec<InputItem>,
+    instructions: Option<&str>,
+    tools: Vec<ToolDefinition>,
     deadline: Duration,
-) -> Result<CompletionResponse, ActionError>
-where
-    M: CompletionModel + Clone,
-{
-    let prompt = messages
-        .pop()
-        .expect("an action transcript always contains its intent");
-    let completion = model
-        .completion_request(prompt)
-        .messages(messages)
-        .tools(tools)
-        .send();
+) -> Result<Response, ActionError> {
+    let mut request = Request::new(input).tools(tools);
+    if let Some(instructions) = instructions.filter(|text| !text.trim().is_empty()) {
+        request = request.instructions(instructions);
+    }
+    let completion = model.complete(request);
     match timeout(deadline, completion).await {
         Ok(response) => response.map_err(ActionError::Model),
         Err(_) => Err(ActionError::ModelTimeout { timeout: deadline }),
@@ -232,12 +209,12 @@ fn start_tool(
     tools: &Tools,
     deadline: Duration,
 ) -> WasmBoxedFuture<'static, FinishedTool> {
-    let registered = tools.get(&call.function.name);
+    let registered = tools.get(call.name());
     Box::pin(async move {
         let result = match registered {
             Some(registered) => {
-                let name = call.function.name.clone();
-                match timeout(deadline, registered.execute(call.function.arguments)).await {
+                let name = call.name().to_owned();
+                match timeout(deadline, registered.execute(call.arguments().clone())).await {
                     Ok(Ok(output)) => ExecutionToolResult::success(output),
                     Ok(Err(error)) => ExecutionToolResult::failed(error),
                     Err(_) => ExecutionToolResult::failed(ToolExecutionError::timeout(format!(
@@ -245,39 +222,15 @@ fn start_tool(
                     ))),
                 }
             }
-            None => missing_tool(&call.function.name),
+            None => missing_tool(call.name()),
         };
         FinishedTool {
             action,
             turn,
             tool,
-            result,
+            result: normalize_tool_result(result),
         }
     })
-}
-
-pub(crate) fn unique_call_ids<'a>(calls: impl IntoIterator<Item = &'a ToolCall>) -> bool {
-    let mut ids = HashSet::new();
-    let mut provider_ids = HashSet::new();
-    let mut provider_item_ids = HashSet::new();
-
-    for call in calls {
-        if !ids.insert(call.id.as_str()) {
-            return false;
-        }
-        let Some(provider) = &call.provider else {
-            continue;
-        };
-        if !provider_ids.insert(provider.call_id.as_str()) {
-            return false;
-        }
-        if let Some(item_id) = provider.item_id.as_deref()
-            && !provider_item_ids.insert(item_id)
-        {
-            return false;
-        }
-    }
-    true
 }
 
 fn poll_ready_tools(
@@ -295,18 +248,4 @@ fn poll_ready_tools(
 
 fn record_result(actions: &mut [Action], finished: FinishedTool) -> bool {
     actions[finished.action].record_result(finished.turn, finished.tool, finished.result)
-}
-
-pub(crate) fn final_text(response: &CompletionResponse) -> Option<String> {
-    let parts = response
-        .choice
-        .iter()
-        .filter_map(|content| match content {
-            AssistantContent::Text(text) if !text.text.trim().is_empty() => {
-                Some(text.text.as_str())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join("\n"))
 }

@@ -25,17 +25,37 @@ Run the offline checks with:
 
 ```sh
 cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-cargo test --workspace --doc
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo check -p bone-model --target wasm32-unknown-unknown
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
+cargo test --workspace --doc --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+cargo check -p bone-llm --lib --target wasm32-unknown-unknown --locked
 ```
 
 The root CI workflow runs those commands on Linux and also compiles the
 workspace on Windows. Ignored live tests are built by `--all-targets` but are
-not executed. The WASM check compiles only `bone-model`; native subscription
-OAuth remains unavailable on that target.
+not executed. The WASM check compiles only the `bone-llm` library; the
+terminal binary and native subscription OAuth remain unavailable on that
+target.
+
+## Standalone product smoke test
+
+The official `bone-llm` binary is the smallest real end-to-end slice. It
+uses the current ChatGPT subscription adapter, reads the model ID from
+`BONE_MODEL`, streams a reply, and retains multi-turn history without involving
+the Agent or tools:
+
+```sh
+BONE_MODEL='a-model-available-to-your-subscription' \
+  cargo run -p bone-llm -- "Reply with exactly: ok"
+
+BONE_MODEL='a-model-available-to-your-subscription' cargo run -p bone-llm
+```
+
+In the interactive form, send multiple messages, use `/clear` to reset history,
+and `/exit` to quit. The first run may require device authorization; the binary
+resolves BONE's conventional credential root and passes it explicitly to the
+managed connector.
 
 ## Live certification
 
@@ -47,22 +67,22 @@ export OPENAI_API_KEY='...'
 export BONE_OPENAI_MODEL='...'
 # Optional:
 export OPENAI_BASE_URL='https://gateway.example/v1'
-cargo test -p bone-model --test live_openai_responses -- --ignored --nocapture
+cargo test -p bone-llm --test live_openai_responses -- --ignored --nocapture
 
 export OPENAI_API_KEY='...'
 export BONE_OPENAI_CHAT_MODEL='...'
 # Optional:
 export OPENAI_BASE_URL='https://gateway.example/v1'
-cargo test -p bone-model --test live_openai_chat_completions -- --ignored --nocapture
+cargo test -p bone-llm --test live_openai_chat_completions -- --ignored --nocapture
 
 export ANTHROPIC_API_KEY='...'
 export BONE_ANTHROPIC_MODEL='...'
 # Optional:
 export ANTHROPIC_BASE_URL='https://gateway.example'
-cargo test -p bone-model --test live_anthropic_messages -- --ignored --nocapture
+cargo test -p bone-llm --test live_anthropic_messages -- --ignored --nocapture
 
 export BONE_CHATGPT_MODEL='a-model-available-to-your-subscription'
-cargo test -p bone-model \
+cargo test -p bone-llm \
   --test live_chatgpt_subscription -- --ignored --nocapture
 ```
 
@@ -117,22 +137,17 @@ For another endpoint speaking an existing protocol:
 For a genuinely new protocol:
 
 1. Add an explicit `Protocol` variant and one protocol module.
-2. Add official/compatible/custom-client constructors returning `Endpoint`.
+2. Add official and compatible constructors returning `Endpoint`.
 3. Cover authentication, URL normalization, request JSON, unary response,
    stream termination, tools, usage, and error preservation offline.
 4. Add an ignored live certification target only after the offline contract
    is complete.
 
 Never put real credentials in fixtures, snapshots, error assertions, or test
-output, and never embed credentials in a configured base URL. Custom
-authentication belongs in headers on a client injected through the relevant
-protocol's `from_client` constructor. Never make a default test dependent on
-network availability.
-
-For the experimental subscription adapter, the equivalent escape hatch is
-named `chatgpt_subscription::from_unmanaged_client` to make its boundary
-explicit. Offline tests use a static fake access token and recording transport;
-they never read the managed OAuth cache. Rig request-time errors can include
-non-authentication provider diagnostic bodies; authentication 401/403 and
-Responses SSE provider-error envelopes are redacted by the pinned Rig patch.
-Live-test failures must still not be copied into public logs without review.
+output, and never embed credentials in a configured base URL. The opt-in
+`test-utils` feature exposes hidden constructors for this crate's offline
+contract tests; production callers never receive a Rig client or transport.
+Those tests use static fake credentials and recording transports and never read
+the managed OAuth cache. Authentication 401/403 and Responses SSE provider
+error envelopes are redacted by the pinned Rig patch. Live-test failures must
+still not be copied into public logs without review.

@@ -5,7 +5,7 @@ self-contained copy in `third_party/rig-core-0.42.0`. The copy starts from the
 published 0.42.0 crate and retains its upstream `LICENSE`, `README.md`, and
 `Cargo.toml.orig`.
 
-`bone-model` is intentionally marked `publish = false` while this direct
+`bone-llm` is intentionally marked `publish = false` while this direct
 path dependency is required. Git and path consumers keep the vendored
 dependency, but a crates.io package cannot include a dependency outside its
 package directory. Remove that guard only after depending on a published Rig

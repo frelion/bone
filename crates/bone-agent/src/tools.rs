@@ -1,11 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use bone_model::rig::{
-    completion::ToolDefinition,
-    tool::{
-        IntoToolOutput, PortableDynamicTool, PortableTool, ToolExecutionError,
-        ToolResult as ExecutionToolResult,
-    },
+use bone_llm::ToolDefinition;
+use rig_core::tool::{
+    IntoToolOutput, PortableDynamicTool, PortableTool, ToolExecutionError,
+    ToolResult as ExecutionToolResult,
 };
 
 use crate::AgentConfigError;
@@ -45,7 +43,14 @@ impl Tools {
     pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
         self.entries
             .values()
-            .map(PortableDynamicTool::definition)
+            .map(|tool| {
+                let definition = tool.definition();
+                ToolDefinition::new(
+                    definition.name,
+                    definition.description,
+                    definition.parameters,
+                )
+            })
             .collect()
     }
 

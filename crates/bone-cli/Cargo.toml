@@ -11,6 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 bone-agent = { path = "../bone-agent" }
-bone-model = { path = "../bone-model" }
+bone-llm = { path = "../bone-llm" }
 bone-tools = { path = "../bone-tools" }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread"] }

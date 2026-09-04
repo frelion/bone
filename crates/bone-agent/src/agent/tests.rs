@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     convert::Infallible,
+    ops::Deref,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -8,17 +9,64 @@ use std::{
     time::Duration,
 };
 
-use bone_model::rig::{
-    completion::{CompletionError, CompletionRequest, FinishReason},
-    message::{Message, UserContent},
+use bone_llm::{FinishReason, Model, Protocol, testing};
+use rig_core::test_utils::{MockCompletionModel, MockTurn};
+use rig_core::{
+    completion::{
+        AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
+        FinishReason as RigFinishReason, Usage,
+    },
+    message::{Message, ToolResultContent, UserContent},
     streaming::StreamingCompletionResponse,
     tool::{PortableDynamicTool, PortableTool, ToolErrorKind, ToolExecutionError, ToolOutput},
 };
-use rig_core::test_utils::{MockCompletionModel, MockTurn};
 use tokio::sync::{Semaphore, mpsc};
 
 use super::*;
 use crate::{ActionError, ActionOutcome};
+
+#[derive(Clone)]
+struct ScriptedModel {
+    inner: MockCompletionModel,
+    model: Model,
+}
+
+impl ScriptedModel {
+    fn new(turns: impl IntoIterator<Item = MockTurn>) -> Self {
+        Self::from_inner(MockCompletionModel::new(turns))
+    }
+
+    fn text(text: impl Into<String>) -> Self {
+        Self::from_inner(MockCompletionModel::text(text))
+    }
+
+    fn from_inner(inner: MockCompletionModel) -> Self {
+        let model = testing::model(
+            "bone-agent-test",
+            Protocol::OpenAiResponses,
+            "test-model",
+            inner.clone(),
+        )
+        .expect("test model");
+        Self { inner, model }
+    }
+
+    fn request_count(&self) -> usize {
+        self.inner.request_count()
+    }
+
+    fn requests(&self) -> Vec<CompletionRequest> {
+        self.inner.requests()
+    }
+}
+
+impl Deref for ScriptedModel {
+    type Target = Model;
+
+    fn deref(&self) -> &Self::Target {
+        &self.model
+    }
+}
 
 struct Echo;
 
@@ -43,7 +91,7 @@ impl PortableTool for Echo {
 
 #[tokio::test]
 async fn agent_creates_a_tool_using_action_before_it_replies() {
-    let model = MockCompletionModel::new([
+    let model = ScriptedModel::new([
         MockTurn::tool_call(
             "start-1",
             START_ACTION_TOOL,
@@ -55,7 +103,7 @@ async fn agent_creates_a_tool_using_action_before_it_replies() {
     ]);
     let mut tools = Tools::default();
     tools.register(Echo).expect("register echo");
-    let mut history = Vec::new();
+    let mut history = AgentHistory::default();
 
     let reply = drive_agent(
         &model,
@@ -107,7 +155,7 @@ async fn agent_creates_a_tool_using_action_before_it_replies() {
 
 #[tokio::test]
 async fn an_action_can_be_pure_reasoning() {
-    let model = MockCompletionModel::new([
+    let model = ScriptedModel::new([
         MockTurn::tool_call(
             "start-1",
             START_ACTION_TOOL,
@@ -116,7 +164,7 @@ async fn an_action_can_be_pure_reasoning() {
         MockTurn::text("Design A has the smaller state surface."),
         MockTurn::text("Choose design A."),
     ]);
-    let mut history = Vec::new();
+    let mut history = AgentHistory::default();
 
     let reply = drive_agent(
         &model,
@@ -141,7 +189,7 @@ async fn an_action_can_be_pure_reasoning() {
 
 #[tokio::test]
 async fn duplicate_action_call_ids_start_no_action() {
-    let model = MockCompletionModel::new([MockTurn::from_contents([
+    let model = ScriptedModel::new([MockTurn::from_contents([
         AssistantContent::tool_call(
             "duplicate",
             START_ACTION_TOOL,
@@ -153,7 +201,7 @@ async fn duplicate_action_call_ids_start_no_action() {
             serde_json::json!({"intent": "second"}),
         ),
     ])]);
-    let mut history = Vec::new();
+    let mut history = AgentHistory::default();
 
     let result = drive_agent(
         &model,
@@ -169,17 +217,20 @@ async fn duplicate_action_call_ids_start_no_action() {
         Err(error) => error,
     };
 
-    assert!(matches!(error, AgentError::DuplicateToolCall));
+    assert!(matches!(
+        error,
+        AgentError::Model(error) if error.kind() == bone_llm::ErrorKind::Protocol
+    ));
     assert_eq!(model.request_count(), 1);
 }
 
 #[tokio::test]
 async fn direct_replies_create_no_action_and_extend_history() {
-    let model = MockCompletionModel::new([
+    let model = ScriptedModel::new([
         MockTurn::text("Hello."),
         MockTurn::text("Yes, I remember greeting you."),
     ]);
-    let mut history = Vec::new();
+    let mut history = AgentHistory::default();
 
     let first = drive_agent(
         &model,
@@ -204,15 +255,66 @@ async fn direct_replies_create_no_action_and_extend_history() {
 
     assert!(first.actions().is_empty());
     assert!(second.actions().is_empty());
-    assert_eq!(history.len(), 4);
+    assert_eq!(history.input.len(), 4);
     let requests = model.requests();
     assert_eq!(first_user_text(&requests[1].chat_history), "Hello");
     assert!(assistant_has_text(&requests[1].chat_history, "Hello."));
 }
 
 #[tokio::test]
+async fn action_context_attributes_parent_output_as_external_input() {
+    let model = ScriptedModel::new([
+        MockTurn::text("A fact from the parent agent."),
+        MockTurn::tool_call(
+            "start-1",
+            START_ACTION_TOOL,
+            serde_json::json!({"intent": "use the earlier fact"}),
+        ),
+        MockTurn::text("The action used the fact."),
+        MockTurn::text("Done."),
+    ]);
+    let mut history = AgentHistory::default();
+
+    drive_agent(
+        &model,
+        None,
+        &Tools::default(),
+        Limits::default(),
+        &mut history,
+        "Remember this request.".to_owned(),
+    )
+    .await
+    .expect("first reply");
+    drive_agent(
+        &model,
+        None,
+        &Tools::default(),
+        Limits::default(),
+        &mut history,
+        "Use what you remember.".to_owned(),
+    )
+    .await
+    .expect("action-backed reply");
+
+    let requests = model.requests();
+    let action_history = &requests[2].chat_history;
+    assert!(
+        action_history
+            .iter()
+            .all(|message| !matches!(message, Message::Assistant { .. })),
+        "parent assistant state must not be replayed into an action"
+    );
+    assert!(action_history.iter().any(|message| {
+        message.rag_text().as_deref()
+            == Some(
+                "<bone_external source=\"parent-agent\">\nA fact from the parent agent.\n</bone_external>",
+            )
+    }));
+}
+
+#[tokio::test]
 async fn final_text_completes_action() {
-    let model = MockCompletionModel::text("done");
+    let model = ScriptedModel::text("done");
     let actions = drive(
         &model,
         Some("Keep it short."),
@@ -244,7 +346,7 @@ async fn tool_result_drives_the_next_turn_with_full_identity() {
         serde_json::json!({"value": "hello"}),
     ))
     .with_message_id("message-1");
-    let model = MockCompletionModel::new([first, MockTurn::text("observed")]);
+    let model = ScriptedModel::new([first, MockTurn::text("observed")]);
     let mut tools = Tools::default();
     tools.register(Echo).expect("register echo");
 
@@ -281,7 +383,7 @@ async fn tool_result_drives_the_next_turn_with_full_identity() {
 
 #[tokio::test]
 async fn a_waiting_action_does_not_block_the_next_action() {
-    let model = MockCompletionModel::new([
+    let model = ScriptedModel::new([
         MockTurn::tool_call("call-a", "gate", serde_json::json!({})),
         MockTurn::text("B done"),
         MockTurn::text("A done"),
@@ -328,7 +430,7 @@ async fn a_waiting_action_does_not_block_the_next_action() {
 
 #[tokio::test]
 async fn a_tool_timeout_is_an_observation_the_action_can_recover_from() {
-    let model = MockCompletionModel::new([
+    let model = ScriptedModel::new([
         MockTurn::tool_call("call-1", "hang", serde_json::json!({})),
         MockTurn::text("recovered after timeout"),
     ]);
@@ -363,7 +465,7 @@ async fn a_tool_timeout_is_an_observation_the_action_can_recover_from() {
 
 #[tokio::test]
 async fn one_turn_runs_tools_concurrently_and_waits_for_the_whole_batch() {
-    let model = MockCompletionModel::new([
+    let model = ScriptedModel::new([
         MockTurn::from_contents([
             AssistantContent::tool_call("call-a", "slow-a", serde_json::json!({})),
             AssistantContent::tool_call("call-b", "slow-b", serde_json::json!({})),
@@ -432,7 +534,7 @@ async fn one_turn_runs_tools_concurrently_and_waits_for_the_whole_batch() {
 
 #[tokio::test]
 async fn tool_failure_is_an_observation_the_model_can_recover_from() {
-    let model = MockCompletionModel::new([
+    let model = ScriptedModel::new([
         MockTurn::tool_call("call-1", "missing", serde_json::json!({})),
         MockTurn::text("recovered"),
     ]);
@@ -461,8 +563,53 @@ async fn tool_failure_is_an_observation_the_model_can_recover_from() {
 }
 
 #[tokio::test]
+async fn unsupported_rich_tool_output_becomes_an_explicit_failure() {
+    let model = ScriptedModel::new([
+        MockTurn::tool_call("call-1", "rich", serde_json::json!({})),
+        MockTurn::text("recovered"),
+    ]);
+    let mut tools = Tools::default();
+    tools
+        .register_dynamic(PortableDynamicTool::new(
+            "rich",
+            "Return several content blocks",
+            serde_json::json!({"type": "object"}),
+            |_| {
+                Box::pin(async {
+                    Ok(ToolOutput::content(vec![
+                        ToolResultContent::text("secret-first-block"),
+                        ToolResultContent::text("secret-second-block"),
+                    ])
+                    .expect("fixture has content"))
+                })
+            },
+        ))
+        .expect("register rich tool");
+
+    let actions = drive(
+        &model,
+        None,
+        &tools,
+        Limits::default(),
+        vec![Action::new("try rich output")],
+    )
+    .await;
+
+    assert_eq!(actions[0].output(), Some("recovered"));
+    let result = actions[0].turns()[0].tools()[0].result();
+    assert!(result.is_error_kind(ToolErrorKind::Other));
+    let requests = model.requests();
+    let visible = only_tool_result(&requests[1].chat_history[2]).content[0]
+        .as_text()
+        .expect("normalization failure is plain text");
+    assert!(visible.contains("cannot be represented"));
+    assert!(!visible.contains("secret-first-block"));
+    assert!(!visible.contains("secret-second-block"));
+}
+
+#[tokio::test]
 async fn a_failed_tool_still_waits_for_the_rest_of_its_batch() {
-    let model = MockCompletionModel::new([
+    let model = ScriptedModel::new([
         MockTurn::from_contents([
             AssistantContent::tool_call("call-a", "missing", serde_json::json!({})),
             AssistantContent::tool_call("call-b", "slow", serde_json::json!({})),
@@ -518,7 +665,7 @@ async fn a_failed_tool_still_waits_for_the_rest_of_its_batch() {
 
 #[tokio::test]
 async fn one_failed_action_does_not_end_the_agent_run() {
-    let model = MockCompletionModel::new([
+    let model = ScriptedModel::new([
         MockTurn::error("provider unavailable"),
         MockTurn::text("B done"),
     ]);
@@ -541,8 +688,7 @@ async fn one_failed_action_does_not_end_the_agent_run() {
 
 #[tokio::test]
 async fn turn_limit_stops_an_unbounded_tool_loop() {
-    let model =
-        MockCompletionModel::new([MockTurn::tool_call("call-1", "echo", serde_json::json!({}))]);
+    let model = ScriptedModel::new([MockTurn::tool_call("call-1", "echo", serde_json::json!({}))]);
     let mut tools = Tools::default();
     tools.register(Echo).expect("register echo");
 
@@ -568,7 +714,7 @@ async fn turn_limit_stops_an_unbounded_tool_loop() {
 
 #[tokio::test]
 async fn too_many_tool_calls_start_none_of_them() {
-    let model = MockCompletionModel::new([MockTurn::from_contents([
+    let model = ScriptedModel::new([MockTurn::from_contents([
         AssistantContent::tool_call("call-a", "count", serde_json::json!({})),
         AssistantContent::tool_call("call-b", "count", serde_json::json!({})),
     ])]);
@@ -621,7 +767,7 @@ async fn too_many_tool_calls_start_none_of_them() {
 
 #[tokio::test]
 async fn duplicate_tool_call_ids_start_none_of_them() {
-    let model = MockCompletionModel::new([MockTurn::from_contents([
+    let model = ScriptedModel::new([MockTurn::from_contents([
         AssistantContent::tool_call("duplicate", "count", serde_json::json!({})),
         AssistantContent::tool_call("duplicate", "count", serde_json::json!({})),
     ])]);
@@ -655,22 +801,24 @@ async fn duplicate_tool_call_ids_start_none_of_them() {
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     assert!(matches!(
         actions[0].error(),
-        Some(ActionError::DuplicateToolCall)
+        Some(ActionError::Model(error)) if error.kind() == bone_llm::ErrorKind::Protocol
     ));
-    assert!(
-        actions[0].turns()[0]
-            .tools()
-            .iter()
-            .all(|tool| tool.result().is_skipped())
-    );
+    assert!(actions[0].turns().is_empty());
 }
 
 #[tokio::test]
 async fn model_timeout_does_not_starve_the_next_action() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let model = FirstCallHangs {
+    let inner = FirstCallHangs {
         calls: Arc::clone(&calls),
     };
+    let model = testing::model(
+        "bone-agent-timeout-test",
+        Protocol::OpenAiResponses,
+        "test-model",
+        inner,
+    )
+    .expect("test model");
     let actions = drive(
         &model,
         None,
@@ -693,11 +841,11 @@ async fn model_timeout_does_not_starve_the_next_action() {
 
 #[tokio::test]
 async fn answerless_or_truncated_responses_are_not_success() {
-    let model = MockCompletionModel::new([
+    let model = ScriptedModel::new([
         MockTurn::from_content(AssistantContent::reasoning("still thinking")),
-        MockTurn::text("partial").with_finish_reason(FinishReason::Length),
+        MockTurn::text("partial").with_finish_reason(RigFinishReason::Length),
         MockTurn::tool_call("call-1", "must-not-run", serde_json::json!({}))
-            .with_finish_reason(FinishReason::Length),
+            .with_finish_reason(RigFinishReason::Length),
         MockTurn::from_contents([]),
     ]);
     let calls = Arc::new(AtomicUsize::new(0));
@@ -756,12 +904,12 @@ async fn answerless_or_truncated_responses_are_not_success() {
         })
     ));
     assert_eq!(actions[3].turns().len(), 1);
-    assert!(actions[3].turns()[0].assistant().is_empty());
+    assert!(actions[3].turns()[0].response().items().is_empty());
 }
 
 #[tokio::test]
 async fn dropping_the_run_drops_every_pending_tool() {
-    let model = MockCompletionModel::new([MockTurn::from_contents([
+    let model = ScriptedModel::new([MockTurn::from_contents([
         AssistantContent::tool_call("call-a", "hang-a", serde_json::json!({})),
         AssistantContent::tool_call("call-b", "hang-b", serde_json::json!({})),
     ])]);
@@ -901,7 +1049,7 @@ impl CompletionModel for FirstCallHangs {
         }
         Ok(CompletionResponse::new(
             vec![AssistantContent::text("B done")],
-            bone_model::rig::completion::Usage::new(),
+            Usage::new(),
             "test",
         ))
     }
@@ -934,13 +1082,17 @@ async fn wait_until(condition: impl Fn() -> bool) {
 }
 
 fn first_user_text(messages: &[Message]) -> String {
-    messages
+    let text = messages
         .iter()
         .find_map(Message::rag_text)
-        .expect("request contains its action intent")
+        .expect("request contains its action intent");
+    text.strip_prefix("<bone_external source=\"parent-agent\">\n")
+        .and_then(|text| text.strip_suffix("\n</bone_external>"))
+        .unwrap_or(&text)
+        .to_owned()
 }
 
-fn only_tool_result(message: &Message) -> &bone_model::rig::message::ToolResult {
+fn only_tool_result(message: &Message) -> &rig_core::message::ToolResult {
     let results = tool_results(message);
     assert_eq!(results.len(), 1);
     results[0]
@@ -949,7 +1101,7 @@ fn only_tool_result(message: &Message) -> &bone_model::rig::message::ToolResult 
 fn find_tool_result<'a>(
     messages: &'a [Message],
     name: &str,
-) -> Option<&'a bone_model::rig::message::ToolResult> {
+) -> Option<&'a rig_core::message::ToolResult> {
     messages.iter().find_map(|message| match message {
         Message::User { content } => content.iter().find_map(|content| match content {
             UserContent::ToolResult(result) if result.name == name => Some(result),
@@ -968,7 +1120,7 @@ fn assistant_has_text(messages: &[Message], expected: &str) -> bool {
     })
 }
 
-fn tool_results(message: &Message) -> Vec<&bone_model::rig::message::ToolResult> {
+fn tool_results(message: &Message) -> Vec<&rig_core::message::ToolResult> {
     match message {
         Message::User { content } => content
             .iter()
