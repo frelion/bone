@@ -10,19 +10,22 @@ tools.
 ```text
 bone-llm binary ──► bone-llm library ──► rig-core
 
-bone-cli
-├──► bone-agent ──► bone-llm ──► rig-core
-├──► bone-llm ─────────────────► rig-core
-└──► bone-tools ──┬──────────────► rig-core
-                  └──────────────► bone-config
+bone-tools ──┬──implements──► bone-agent::Tool
+             └──uses protocol values──► bone-llm
+bone-cli ────┬─composes────► bone-agent ──► bone-llm ──► rig-core
+             ├─selects─────► bone-llm
+             └─constructs──► bone-tools ──► bone-config
 ```
 
 The five workspace crates are:
 
-- `bone-agent`: Agent, Action, Turn, and tool-execution semantics.
+- `bone-agent`: Agent, Action, Turn, and the single BONE tool-execution
+  interface, including registration and scheduling.
 - `bone-llm`: the unified model library, service adapters, and official
-  direct-model terminal product.
-- `bone-tools`: provider-independent local tools.
+  direct-model terminal product. It owns model-facing tool definitions, calls,
+  outputs, and provider translation.
+- `bone-tools`: provider-independent built-in implementations of
+  `bone-agent::Tool`.
 - `bone-config`: typed, non-secret configuration storage.
 - `bone-cli`: the runnable assembly of a model, Agent, and tools.
 
@@ -32,6 +35,10 @@ is a small composition root that currently selects the ChatGPT subscription
 adapter, reads its model ID from `BONE_MODEL`, and explicitly supplies BONE's
 conventional local credential root. The intended full-product composition is
 `bone-config → bone-llm → Agent`.
+
+In production code, Rig is confined to `bone-llm`. Agent and built-in-tool APIs
+use BONE types: `bone-agent` owns execution, while `bone-tools` supplies
+concrete implementations.
 
 ## Talk directly to a model
 

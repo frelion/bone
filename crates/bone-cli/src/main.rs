@@ -78,7 +78,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
 fn show(reply: AgentReply) {
     for action in reply.actions() {
-        let result = if action.output().is_some() {
+        let result = if action.result().is_ok() {
             "completed"
         } else {
             "failed"

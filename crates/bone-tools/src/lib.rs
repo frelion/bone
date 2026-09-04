@@ -1,13 +1,13 @@
 //! Provider-independent built-in tools for coding agents.
 //!
-//! Every tool implements [`rig_core::tool::PortableTool`]. Local coding tools
+//! Every tool implements [`bone_agent::Tool`]. Local coding tools
 //! capture an immutable workspace boundary plus execution limits; Bash also
 //! captures its sanitized or explicitly configured child environment. The
 //! config tool instead captures a registered [`bone_config::ConfigManager`]
 //! and a model-output limit. Registration, authorization, approval, lifecycle
 //! state, and provider translation remain outside this crate.
-//! Native tool calls require an active Tokio runtime; `PortableTool` describes
-//! Rig's normalized tool contract, not executor independence.
+//! Native tool calls require an active Tokio runtime; [`bone_agent::Tool`]
+//! describes BONE's execution contract, not executor independence.
 //!
 //! The workspace checks prevent ordinary path escape, but are not an operating
 //! system sandbox or a defense against hostile concurrent path replacement.

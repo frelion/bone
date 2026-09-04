@@ -1,19 +1,20 @@
 use std::{
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::AtomicBool},
 };
 
+use bone_agent::{Tool, ToolFailure};
+use bone_llm::ToolDefinition;
 use globset::{GlobBuilder, GlobSetBuilder};
-use rig_core::tool::{PortableTool, ToolExecutionError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
     ToolEnvironment, ToolError, ToolLimits,
-    search_walk::{SearchWalk, SearchWalkEvent, is_vcs_name},
+    search_walk::{
+        CancellationGuard, SearchWalk, SearchWalkEvent, display_or_dot, push_bounded,
+        push_bounded_warning, reject_vcs_root,
+    },
     workspace::{ResolvedPath, path_to_slashes},
 };
 
@@ -58,56 +59,55 @@ pub struct GlobTool {
 }
 
 impl GlobTool {
-    pub fn new(environment: ToolEnvironment) -> Self {
+    pub(crate) fn new(environment: ToolEnvironment) -> Self {
         Self { environment }
     }
 }
 
-impl PortableTool for GlobTool {
-    const NAME: &'static str = "glob";
+impl Tool for GlobTool {
     type Args = GlobArgs;
     type Output = GlobOutput;
     type Error = ToolError;
 
-    fn description(&self) -> String {
-        format!(
-            "Find files inside the workspace using a root-relative glob. The search respects bounded workspace-local ignore files at or below the selected search root (rules above an explicitly selected root are not inherited), never enters VCS metadata, and returns at most {} sorted paths after scanning at most {} entries. If truncated, the selected subset can depend on filesystem enumeration order.",
-            self.environment.limits.max_glob_results, self.environment.limits.max_walk_entries,
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "glob",
+            format!(
+                "Find files inside the workspace using a root-relative glob. The search respects bounded workspace-local ignore files at or below the selected search root (rules above an explicitly selected root are not inherited), never enters VCS metadata, and returns at most {} sorted paths after scanning at most {} entries. If truncated, the selected subset can depend on filesystem enumeration order.",
+                self.environment.limits.max_glob_results, self.environment.limits.max_walk_entries,
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": format!("Glob relative to path, using / separators; * does not cross directories and ** does; at most {MAX_GLOB_PATTERN_BYTES} UTF-8 bytes")
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory relative to the workspace, or an absolute directory inside it; defaults to ."
+                    },
+                    "include_hidden": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Disable default dotfile filtering; ignore whitelists can still include hidden paths, while VCS metadata is always excluded"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": self.environment.limits.max_glob_results,
+                        "description": "Maximum paths to return"
+                    }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
         )
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": format!("Glob relative to path, using / separators; * does not cross directories and ** does; at most {MAX_GLOB_PATTERN_BYTES} UTF-8 bytes")
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Directory relative to the workspace, or an absolute directory inside it; defaults to ."
-                },
-                "include_hidden": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Disable default dotfile filtering; ignore whitelists can still include hidden paths, while VCS metadata is always excluded"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": self.environment.limits.max_glob_results,
-                    "description": "Maximum paths to return"
-                }
-            },
-            "required": ["pattern"],
-            "additionalProperties": false
-        })
-    }
-
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        error.into_execution_error()
+    fn map_error(&self, error: Self::Error) -> ToolFailure {
+        error.into_tool_failure()
     }
 
     async fn call(&self, arguments: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -175,18 +175,6 @@ fn validate_pattern(pattern: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn reject_vcs_root(resolved: &ResolvedPath) -> Result<(), ToolError> {
-    if Path::new(&resolved.display)
-        .components()
-        .any(|component| is_vcs_name(component.as_os_str()))
-    {
-        return Err(ToolError::PermissionDenied {
-            path: display_or_dot(&resolved.display).to_owned(),
-        });
-    }
-    Ok(())
-}
-
 fn run_glob(
     workspace_root: &Path,
     resolved: ResolvedPath,
@@ -221,11 +209,12 @@ fn run_glob(
     while let Some(event) = walk.next_event() {
         let path = match event {
             SearchWalkEvent::Warning(warning) => {
-                if !push_bounded(
+                if !push_bounded_warning(
                     &mut warnings,
                     &mut output_bytes,
                     limits.max_output_bytes,
-                    redact_workspace(warning, workspace_root),
+                    warning,
+                    workspace_root,
                 ) {
                     truncated = true;
                 }
@@ -276,65 +265,11 @@ fn run_glob(
     })
 }
 
-struct CancellationGuard {
-    cancelled: Arc<AtomicBool>,
-    armed: bool,
-}
-
-impl CancellationGuard {
-    fn new(cancelled: Arc<AtomicBool>) -> Self {
-        Self {
-            cancelled,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for CancellationGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.cancelled.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-fn push_bounded(
-    values: &mut Vec<String>,
-    used_bytes: &mut usize,
-    max_bytes: usize,
-    value: String,
-) -> bool {
-    let cost = value.len() + usize::from(!values.is_empty());
-    if used_bytes.saturating_add(cost) > max_bytes {
-        return false;
-    }
-    *used_bytes += cost;
-    values.push(value);
-    true
-}
-
-fn redact_workspace(value: String, workspace_root: &Path) -> String {
-    let root = workspace_root.display().to_string();
-    if root.is_empty() || root == std::path::MAIN_SEPARATOR_STR {
-        value
-    } else {
-        value.replace(&root, ".")
-    }
-}
-
-fn display_or_dot(display: &str) -> &str {
-    if display.is_empty() { "." } else { display }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use rig_core::tool::PortableTool;
+    use bone_agent::Tool;
 
     use super::*;
 
@@ -461,29 +396,5 @@ mod tests {
             })
             .await;
         assert!(matches!(vcs, Err(ToolError::PermissionDenied { .. })));
-    }
-
-    #[test]
-    fn cancellation_guard_signals_only_while_armed() {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        {
-            let _guard = CancellationGuard::new(cancelled.clone());
-        }
-        assert!(cancelled.load(Ordering::Relaxed));
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let mut guard = CancellationGuard::new(cancelled.clone());
-        guard.disarm();
-        drop(guard);
-        assert!(!cancelled.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn warning_paths_hide_the_workspace_prefix() {
-        let root = Path::new("/private/workspace");
-        assert_eq!(
-            redact_workspace("walk error under /private/workspace/src".to_owned(), root),
-            "walk error under ./src"
-        );
     }
 }

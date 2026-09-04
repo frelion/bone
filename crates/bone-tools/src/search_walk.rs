@@ -4,7 +4,10 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use ignore::{
@@ -13,11 +16,40 @@ use ignore::{
 };
 use walkdir::{IntoIter, WalkDir};
 
-use crate::{ToolLimits, workspace::path_to_slashes};
+use crate::{
+    ToolError, ToolLimits,
+    workspace::{ResolvedPath, path_to_slashes},
+};
 
 pub(crate) enum SearchWalkEvent {
     File(PathBuf),
     Warning(String),
+}
+
+pub(crate) struct CancellationGuard {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl CancellationGuard {
+    pub(crate) fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// A streaming workspace walk that exposes every raw directory entry before
@@ -594,18 +626,69 @@ fn walk_error_summary(error: &walkdir::Error) -> String {
     )
 }
 
-pub(crate) fn is_vcs_name(name: &OsStr) -> bool {
+fn is_vcs_name(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     [".git", ".hg", ".svn"]
         .iter()
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
+pub(crate) fn reject_vcs_root(resolved: &ResolvedPath) -> Result<(), ToolError> {
+    if Path::new(&resolved.display)
+        .components()
+        .any(|component| is_vcs_name(component.as_os_str()))
+    {
+        return Err(ToolError::PermissionDenied {
+            path: display_or_dot(&resolved.display).to_owned(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn push_bounded(
+    values: &mut Vec<String>,
+    used_bytes: &mut usize,
+    max_bytes: usize,
+    value: String,
+) -> bool {
+    let cost = value.len() + usize::from(!values.is_empty());
+    if used_bytes.saturating_add(cost) > max_bytes {
+        return false;
+    }
+    *used_bytes += cost;
+    values.push(value);
+    true
+}
+
+pub(crate) fn push_bounded_warning(
+    warnings: &mut Vec<String>,
+    used_bytes: &mut usize,
+    max_bytes: usize,
+    warning: String,
+    workspace_root: &Path,
+) -> bool {
+    push_bounded(
+        warnings,
+        used_bytes,
+        max_bytes,
+        redact_workspace(warning, workspace_root),
+    )
+}
+
+fn redact_workspace(value: String, workspace_root: &Path) -> String {
+    let root = workspace_root.display().to_string();
+    if root.is_empty() || root == std::path::MAIN_SEPARATOR_STR {
+        value
+    } else {
+        value.replace(&root, ".")
+    }
+}
+
 fn is_hidden_name(name: &OsStr) -> bool {
     name.as_encoded_bytes().first() == Some(&b'.')
 }
 
-fn display_or_dot(display: &str) -> &str {
+pub(crate) fn display_or_dot(display: &str) -> &str {
     if display.is_empty() { "." } else { display }
 }
 
@@ -654,6 +737,43 @@ mod tests {
 
         reader.read_to_end(&mut output).unwrap();
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn cancellation_guard_signals_only_while_armed() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = CancellationGuard::new(cancelled.clone());
+        }
+        assert!(cancelled.load(Ordering::Relaxed));
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut guard = CancellationGuard::new(cancelled.clone());
+        guard.disarm();
+        drop(guard);
+        assert!(!cancelled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn warning_paths_hide_the_workspace_prefix() {
+        let root = Path::new("/private/workspace");
+        assert_eq!(
+            redact_workspace("search error under /private/workspace/src".to_owned(), root),
+            "search error under ./src"
+        );
+    }
+
+    #[test]
+    fn selected_vcs_roots_are_rejected() {
+        let resolved = ResolvedPath {
+            absolute: PathBuf::from("/private/workspace/.GiT"),
+            display: ".GiT".to_owned(),
+        };
+
+        assert!(matches!(
+            reject_vcs_root(&resolved),
+            Err(ToolError::PermissionDenied { path }) if path == ".GiT"
+        ));
     }
 
     #[test]

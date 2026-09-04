@@ -100,7 +100,6 @@ name = "bone-agent"
 version = "0.1.0"
 dependencies = [
  "bone-llm",
- "bone-tools",
  "futures-util",
  "rig-core",
  "serde",
@@ -117,6 +116,9 @@ dependencies = [
  "bone-agent",
  "bone-llm",
  "bone-tools",
+ "rig-core",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -154,13 +156,14 @@ dependencies = [
 name = "bone-tools"
 version = "0.1.0"
 dependencies = [
+ "bone-agent",
  "bone-config",
+ "bone-llm",
  "globset",
  "grep-regex",
  "grep-searcher",
  "ignore",
  "libc",
- "rig-core",
  "serde",
  "serde_json",
  "tempfile",

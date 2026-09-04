@@ -8,15 +8,13 @@ publish = false
 [dependencies]
 bone-llm = { path = "../bone-llm" }
 futures-util.workspace = true
-rig-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "time"] }
 
 [dev-dependencies]
 bone-llm = { path = "../bone-llm", features = ["test-utils"] }
-bone-tools = { path = "../bone-tools" }
 rig-core = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

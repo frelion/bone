@@ -1,7 +1,11 @@
 use std::{
     collections::HashSet,
     convert::Infallible,
+    error::Error as StdError,
+    fmt,
+    future::Future,
     ops::Deref,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -9,21 +13,22 @@ use std::{
     time::Duration,
 };
 
-use bone_llm::{FinishReason, Model, Protocol, testing};
+use bone_llm::{FinishReason, Model, Protocol, ToolDefinition, testing};
 use rig_core::test_utils::{MockCompletionModel, MockTurn};
 use rig_core::{
     completion::{
         AssistantContent, CompletionError, CompletionModel, CompletionRequest, CompletionResponse,
         FinishReason as RigFinishReason, Usage,
     },
-    message::{Message, ToolResultContent, UserContent},
+    message::{Message, UserContent},
     streaming::StreamingCompletionResponse,
-    tool::{PortableDynamicTool, PortableTool, ToolErrorKind, ToolExecutionError, ToolOutput},
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::{Semaphore, mpsc};
 
 use super::*;
-use crate::{ActionError, ActionOutcome};
+use crate::{ActionError, ToolFailureKind};
 
 #[derive(Clone)]
 struct ScriptedModel {
@@ -70,22 +75,63 @@ impl Deref for ScriptedModel {
 
 struct Echo;
 
-impl PortableTool for Echo {
-    const NAME: &'static str = "echo";
+impl Tool for Echo {
     type Args = serde_json::Value;
     type Output = serde_json::Value;
     type Error = Infallible;
 
-    fn description(&self) -> String {
-        "Echo JSON".to_owned()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({"type": "object"})
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new("echo", "Echo JSON", serde_json::json!({"type": "object"}))
     }
 
     async fn call(&self, arguments: Self::Args) -> Result<Self::Output, Self::Error> {
         Ok(arguments)
+    }
+}
+
+#[derive(Debug)]
+struct TestError(&'static str);
+
+impl fmt::Display for TestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl StdError for TestError {}
+
+type TestToolFuture = Pin<Box<dyn Future<Output = Result<Value, TestError>> + Send + 'static>>;
+
+struct TestTool {
+    definition: ToolDefinition,
+    call: Arc<dyn Fn(Value) -> TestToolFuture + Send + Sync>,
+}
+
+impl Tool for TestTool {
+    type Args = Value;
+    type Output = Value;
+    type Error = TestError;
+
+    fn definition(&self) -> ToolDefinition {
+        self.definition.clone()
+    }
+
+    fn call(
+        &self,
+        arguments: Self::Args,
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send {
+        (self.call)(arguments)
+    }
+}
+
+fn test_tool(
+    name: &'static str,
+    description: &'static str,
+    call: impl Fn(Value) -> TestToolFuture + Send + Sync + 'static,
+) -> TestTool {
+    TestTool {
+        definition: ToolDefinition::new(name, description, serde_json::json!({"type": "object"})),
+        call: Arc::new(call),
     }
 }
 
@@ -121,8 +167,11 @@ async fn agent_creates_a_tool_using_action_before_it_replies() {
     let action = &reply.actions()[0];
     assert_eq!(action.intent(), "inspect the supplied value");
     assert_eq!(action.turns().len(), 2);
-    assert_eq!(action.output(), Some("The inspected value is hello."));
-    assert!(action.turns()[0].tools()[0].result().is_success());
+    assert_eq!(
+        action.result().expect("action completed"),
+        "The inspected value is hello."
+    );
+    assert!(action.turns()[0].tools()[0].is_success());
 
     let requests = model.requests();
     assert_eq!(requests.len(), 4);
@@ -182,8 +231,8 @@ async fn an_action_can_be_pure_reasoning() {
     assert_eq!(reply.actions()[0].turns().len(), 1);
     assert!(reply.actions()[0].turns()[0].tools().is_empty());
     assert_eq!(
-        reply.actions()[0].output(),
-        Some("Design A has the smaller state surface.")
+        reply.actions()[0].result().expect("action completed"),
+        "Design A has the smaller state surface."
     );
 }
 
@@ -310,6 +359,13 @@ async fn action_context_attributes_parent_output_as_external_input() {
                 "<bone_external source=\"parent-agent\">\nA fact from the parent agent.\n</bone_external>",
             )
     }));
+    assert!(
+        action_history
+            .iter()
+            .filter_map(Message::rag_text)
+            .all(|text| !text.contains("Requested tool `start_action`")),
+        "an action must not see the parent response that created it"
+    );
 }
 
 #[tokio::test]
@@ -325,7 +381,7 @@ async fn final_text_completes_action() {
     .await;
 
     assert_eq!(actions.len(), 1);
-    assert_eq!(actions[0].output(), Some("done"));
+    assert_eq!(actions[0].result().expect("action completed"), "done");
     assert_eq!(actions[0].turns().len(), 1);
 
     let requests = model.requests();
@@ -359,9 +415,14 @@ async fn tool_result_drives_the_next_turn_with_full_identity() {
     )
     .await;
 
-    assert_eq!(actions[0].output(), Some("observed"));
+    assert_eq!(actions[0].result().expect("action completed"), "observed");
     assert_eq!(actions[0].turns().len(), 2);
-    assert!(actions[0].turns()[0].tools()[0].result().is_success());
+    let execution = &actions[0].turns()[0].tools()[0];
+    assert!(execution.is_success());
+    assert_eq!(
+        execution.model_output().as_json(),
+        Some(&serde_json::json!({"value": "hello"}))
+    );
 
     let requests = model.requests();
     assert_eq!(requests.len(), 2);
@@ -393,7 +454,7 @@ async fn a_waiting_action_does_not_block_the_next_action() {
     let (finished_tx, _finished_rx) = mpsc::unbounded_channel();
     let mut tools = Tools::default();
     tools
-        .register_dynamic(gate_tool(
+        .register(gate_tool(
             "gate",
             Arc::clone(&release),
             started_tx,
@@ -423,8 +484,8 @@ async fn a_waiting_action_does_not_block_the_next_action() {
 
     release.add_permits(1);
     let actions = run.await.expect("agent run should not panic");
-    assert_eq!(actions[0].output(), Some("A done"));
-    assert_eq!(actions[1].output(), Some("B done"));
+    assert_eq!(actions[0].result().expect("action A completed"), "A done");
+    assert_eq!(actions[1].result().expect("action B completed"), "B done");
     assert_eq!(model.request_count(), 3);
 }
 
@@ -438,7 +499,7 @@ async fn a_tool_timeout_is_an_observation_the_action_can_recover_from() {
     let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
     let mut tools = Tools::default();
     tools
-        .register_dynamic(hanging_tool("hang", started_tx, dropped_tx))
+        .register(hanging_tool("hang", started_tx, dropped_tx))
         .expect("register hanging tool");
 
     let actions = drive(
@@ -455,11 +516,14 @@ async fn a_tool_timeout_is_an_observation_the_action_can_recover_from() {
 
     assert_eq!(recv(&mut started_rx).await, "hang");
     assert_eq!(recv(&mut dropped_rx).await, "hang");
-    assert_eq!(actions[0].output(), Some("recovered after timeout"));
+    assert_eq!(
+        actions[0].result().expect("action recovered"),
+        "recovered after timeout"
+    );
     assert!(
         actions[0].turns()[0].tools()[0]
-            .result()
-            .is_error_kind(ToolErrorKind::Timeout)
+            .failure()
+            .is_some_and(|failure| failure.kind() == ToolFailureKind::Timeout)
     );
 }
 
@@ -478,7 +542,7 @@ async fn one_turn_runs_tools_concurrently_and_waits_for_the_whole_batch() {
     let (finished_tx, mut finished_rx) = mpsc::unbounded_channel();
     let mut tools = Tools::default();
     tools
-        .register_dynamic(gate_tool(
+        .register(gate_tool(
             "slow-a",
             Arc::clone(&release_a),
             started_tx.clone(),
@@ -486,7 +550,7 @@ async fn one_turn_runs_tools_concurrently_and_waits_for_the_whole_batch() {
         ))
         .expect("register slow-a");
     tools
-        .register_dynamic(gate_tool(
+        .register(gate_tool(
             "slow-b",
             Arc::clone(&release_b),
             started_tx,
@@ -521,7 +585,7 @@ async fn one_turn_runs_tools_concurrently_and_waits_for_the_whole_batch() {
     release_a.add_permits(1);
     assert_eq!(recv(&mut finished_rx).await, "slow-a");
     let actions = run.await.expect("agent run should not panic");
-    assert_eq!(actions[0].output(), Some("both done"));
+    assert_eq!(actions[0].result().expect("action completed"), "both done");
 
     let requests = model.requests();
     let results = tool_results(&requests[1].chat_history[2]);
@@ -548,9 +612,13 @@ async fn tool_failure_is_an_observation_the_model_can_recover_from() {
     )
     .await;
 
-    assert_eq!(actions[0].output(), Some("recovered"));
+    assert_eq!(actions[0].result().expect("action recovered"), "recovered");
     let execution = &actions[0].turns()[0].tools()[0];
-    assert!(execution.result().is_error_kind(ToolErrorKind::NotFound));
+    assert!(
+        execution
+            .failure()
+            .is_some_and(|failure| failure.kind() == ToolFailureKind::NotFound)
+    );
     assert_eq!(model.request_count(), 2);
 
     let requests = model.requests();
@@ -563,48 +631,204 @@ async fn tool_failure_is_an_observation_the_model_can_recover_from() {
 }
 
 #[tokio::test]
-async fn unsupported_rich_tool_output_becomes_an_explicit_failure() {
+async fn invalid_tool_arguments_do_not_run_or_leak_into_model_history() {
     let model = ScriptedModel::new([
-        MockTurn::tool_call("call-1", "rich", serde_json::json!({})),
+        MockTurn::tool_call(
+            "call-1",
+            "strict",
+            serde_json::json!({"count": "sensitive argument value"}),
+        ),
         MockTurn::text("recovered"),
     ]);
+    let calls = Arc::new(AtomicUsize::new(0));
     let mut tools = Tools::default();
     tools
-        .register_dynamic(PortableDynamicTool::new(
-            "rich",
-            "Return several content blocks",
-            serde_json::json!({"type": "object"}),
-            |_| {
-                Box::pin(async {
-                    Ok(ToolOutput::content(vec![
-                        ToolResultContent::text("secret-first-block"),
-                        ToolResultContent::text("secret-second-block"),
-                    ])
-                    .expect("fixture has content"))
-                })
-            },
-        ))
-        .expect("register rich tool");
+        .register(StrictArgsTool {
+            calls: Arc::clone(&calls),
+        })
+        .expect("register strict tool");
 
     let actions = drive(
         &model,
         None,
         &tools,
         Limits::default(),
-        vec![Action::new("try rich output")],
+        vec![Action::new("try malformed arguments")],
     )
     .await;
 
-    assert_eq!(actions[0].output(), Some("recovered"));
-    let result = actions[0].turns()[0].tools()[0].result();
-    assert!(result.is_error_kind(ToolErrorKind::Other));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(actions[0].result().expect("action recovered"), "recovered");
+    let failure = actions[0].turns()[0].tools()[0]
+        .failure()
+        .expect("invalid arguments fail before execution");
+    assert_eq!(failure.kind(), ToolFailureKind::InvalidArguments);
+    assert!(StdError::source(failure).is_some());
+    assert!(!format!("{failure:?}").contains("sensitive argument value"));
+
     let requests = model.requests();
     let visible = only_tool_result(&requests[1].chat_history[2]).content[0]
         .as_text()
-        .expect("normalization failure is plain text");
-    assert!(visible.contains("cannot be represented"));
-    assert!(!visible.contains("secret-first-block"));
-    assert!(!visible.contains("secret-second-block"));
+        .expect("invalid argument feedback is text");
+    assert_eq!(
+        visible,
+        "arguments for tool `strict` did not match its schema"
+    );
+    assert!(!visible.contains("sensitive argument value"));
+}
+
+#[tokio::test]
+async fn unserializable_tool_output_becomes_a_model_safe_failure() {
+    let model = ScriptedModel::new([
+        MockTurn::tool_call("call-1", "broken", serde_json::json!({})),
+        MockTurn::text("recovered"),
+    ]);
+    let mut tools = Tools::default();
+    tools
+        .register(UnserializableTool)
+        .expect("register broken tool");
+
+    let actions = drive(
+        &model,
+        None,
+        &tools,
+        Limits::default(),
+        vec![Action::new("try broken output")],
+    )
+    .await;
+
+    assert_eq!(actions[0].result().expect("action recovered"), "recovered");
+    let execution = &actions[0].turns()[0].tools()[0];
+    assert!(
+        execution
+            .failure()
+            .is_some_and(|failure| failure.kind() == ToolFailureKind::Other)
+    );
+    let requests = model.requests();
+    let visible = only_tool_result(&requests[1].chat_history[2]).content[0]
+        .as_text()
+        .expect("serialization failure is plain text");
+    assert_eq!(visible, "tool output could not be serialized");
+    assert!(!visible.contains("sensitive serializer detail"));
+}
+
+#[tokio::test]
+async fn default_error_mapping_keeps_the_source_out_of_model_history() {
+    let model = ScriptedModel::new([
+        MockTurn::tool_call("call-1", "fails", serde_json::json!({})),
+        MockTurn::text("recovered"),
+    ]);
+    let mut tools = Tools::default();
+    tools.register(FailingTool).expect("register failing tool");
+
+    let actions = drive(
+        &model,
+        None,
+        &tools,
+        Limits::default(),
+        vec![Action::new("try a failing tool")],
+    )
+    .await;
+
+    let failure = actions[0].turns()[0].tools()[0]
+        .failure()
+        .expect("tool failed");
+    assert_eq!(failure.kind(), ToolFailureKind::Other);
+    assert_eq!(failure.message(), "sensitive implementation detail");
+    assert!(StdError::source(failure).is_some());
+    assert!(!format!("{failure:?}").contains("sensitive implementation detail"));
+
+    let requests = model.requests();
+    let visible = only_tool_result(&requests[1].chat_history[2]).content[0]
+        .as_text()
+        .expect("default failure feedback is text");
+    assert_eq!(visible, "tool execution failed");
+    assert!(!visible.contains("sensitive implementation detail"));
+}
+
+struct FailingTool;
+
+impl Tool for FailingTool {
+    type Args = Value;
+    type Output = Value;
+    type Error = TestError;
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "fails",
+            "Always fail",
+            serde_json::json!({"type": "object"}),
+        )
+    }
+
+    async fn call(&self, _arguments: Self::Args) -> Result<Self::Output, Self::Error> {
+        Err(TestError("sensitive implementation detail"))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictArgs {
+    count: usize,
+}
+
+struct StrictArgsTool {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Tool for StrictArgsTool {
+    type Args = StrictArgs;
+    type Output = usize;
+    type Error = Infallible;
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "strict",
+            "Accept one integer",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "count": { "type": "integer" } },
+                "required": ["count"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn call(&self, arguments: Self::Args) -> Result<Self::Output, Self::Error> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(arguments.count)
+    }
+}
+
+struct UnserializableTool;
+
+impl Tool for UnserializableTool {
+    type Args = Value;
+    type Output = UnserializableOutput;
+    type Error = Infallible;
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "broken",
+            "Return a value that cannot be serialized",
+            serde_json::json!({"type": "object"}),
+        )
+    }
+
+    async fn call(&self, _arguments: Self::Args) -> Result<Self::Output, Self::Error> {
+        Ok(UnserializableOutput)
+    }
+}
+
+struct UnserializableOutput;
+
+impl Serialize for UnserializableOutput {
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Err(serde::ser::Error::custom("sensitive serializer detail"))
+    }
 }
 
 #[tokio::test]
@@ -621,7 +845,7 @@ async fn a_failed_tool_still_waits_for_the_rest_of_its_batch() {
     let (finished_tx, _finished_rx) = mpsc::unbounded_channel();
     let mut tools = Tools::default();
     tools
-        .register_dynamic(gate_tool(
+        .register(gate_tool(
             "slow",
             Arc::clone(&release),
             started_tx,
@@ -648,14 +872,17 @@ async fn a_failed_tool_still_waits_for_the_rest_of_its_batch() {
 
     release.add_permits(1);
     let actions = run.await.expect("agent run should not panic");
-    assert_eq!(actions[0].output(), Some("recovered from the batch"));
+    assert_eq!(
+        actions[0].result().expect("action recovered"),
+        "recovered from the batch"
+    );
     let executions = actions[0].turns()[0].tools();
     assert!(
         executions[0]
-            .result()
-            .is_error_kind(ToolErrorKind::NotFound)
+            .failure()
+            .is_some_and(|failure| failure.kind() == ToolFailureKind::NotFound)
     );
-    assert!(executions[1].result().is_success());
+    assert!(executions[1].is_success());
 
     let requests = model.requests();
     let results = tool_results(&requests[1].chat_history[2]);
@@ -678,11 +905,8 @@ async fn one_failed_action_does_not_end_the_agent_run() {
     )
     .await;
 
-    assert!(matches!(
-        actions[0].outcome(),
-        ActionOutcome::Failed(ActionError::Model(_))
-    ));
-    assert_eq!(actions[1].output(), Some("B done"));
+    assert!(matches!(actions[0].result(), Err(ActionError::Model(_))));
+    assert_eq!(actions[1].result().expect("action B completed"), "B done");
     assert_eq!(model.request_count(), 2);
 }
 
@@ -705,8 +929,8 @@ async fn turn_limit_stops_an_unbounded_tool_loop() {
     .await;
 
     assert!(matches!(
-        actions[0].error(),
-        Some(ActionError::TurnLimit { limit: 1 })
+        actions[0].result(),
+        Err(ActionError::TurnLimit { limit: 1 })
     ));
     assert_eq!(actions[0].turns().len(), 1);
     assert_eq!(model.request_count(), 1);
@@ -722,18 +946,13 @@ async fn too_many_tool_calls_start_none_of_them() {
     let tool_calls = Arc::clone(&calls);
     let mut tools = Tools::default();
     tools
-        .register_dynamic(PortableDynamicTool::new(
-            "count",
-            "Count executions",
-            serde_json::json!({"type": "object"}),
-            move |_| {
-                let tool_calls = Arc::clone(&tool_calls);
-                Box::pin(async move {
-                    tool_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(ToolOutput::text("ran"))
-                })
-            },
-        ))
+        .register(test_tool("count", "Count executions", move |_| {
+            let tool_calls = Arc::clone(&tool_calls);
+            Box::pin(async move {
+                tool_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Value::String("ran".to_owned()))
+            })
+        }))
         .expect("register counter");
 
     let actions = drive(
@@ -749,8 +968,8 @@ async fn too_many_tool_calls_start_none_of_them() {
     .await;
 
     assert!(matches!(
-        actions[0].error(),
-        Some(ActionError::ToolCallLimit {
+        actions[0].result(),
+        Err(ActionError::ToolCallLimit {
             requested: 2,
             limit: 1
         })
@@ -761,7 +980,7 @@ async fn too_many_tool_calls_start_none_of_them() {
         actions[0].turns()[0]
             .tools()
             .iter()
-            .all(|tool| tool.result().is_skipped())
+            .all(|tool| tool.is_skipped())
     );
 }
 
@@ -775,18 +994,13 @@ async fn duplicate_tool_call_ids_start_none_of_them() {
     let tool_calls = Arc::clone(&calls);
     let mut tools = Tools::default();
     tools
-        .register_dynamic(PortableDynamicTool::new(
-            "count",
-            "Count executions",
-            serde_json::json!({"type": "object"}),
-            move |_| {
-                let tool_calls = Arc::clone(&tool_calls);
-                Box::pin(async move {
-                    tool_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(ToolOutput::text("ran"))
-                })
-            },
-        ))
+        .register(test_tool("count", "Count executions", move |_| {
+            let tool_calls = Arc::clone(&tool_calls);
+            Box::pin(async move {
+                tool_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Value::String("ran".to_owned()))
+            })
+        }))
         .expect("register counter");
 
     let actions = drive(
@@ -800,8 +1014,8 @@ async fn duplicate_tool_call_ids_start_none_of_them() {
 
     assert_eq!(calls.load(Ordering::Relaxed), 0);
     assert!(matches!(
-        actions[0].error(),
-        Some(ActionError::Model(error)) if error.kind() == bone_llm::ErrorKind::Protocol
+        actions[0].result(),
+        Err(ActionError::Model(error)) if error.kind() == bone_llm::ErrorKind::Protocol
     ));
     assert!(actions[0].turns().is_empty());
 }
@@ -832,10 +1046,10 @@ async fn model_timeout_does_not_starve_the_next_action() {
     .await;
 
     assert!(matches!(
-        actions[0].error(),
-        Some(ActionError::ModelTimeout { .. })
+        actions[0].result(),
+        Err(ActionError::ModelTimeout { .. })
     ));
-    assert_eq!(actions[1].output(), Some("B done"));
+    assert_eq!(actions[1].result().expect("action B completed"), "B done");
     assert_eq!(calls.load(Ordering::Relaxed), 2);
 }
 
@@ -852,15 +1066,14 @@ async fn answerless_or_truncated_responses_are_not_success() {
     let tool_calls = Arc::clone(&calls);
     let mut tools = Tools::default();
     tools
-        .register_dynamic(PortableDynamicTool::new(
+        .register(test_tool(
             "must-not-run",
             "A side effect used to test truncated calls",
-            serde_json::json!({"type": "object"}),
             move |_| {
                 let tool_calls = Arc::clone(&tool_calls);
                 Box::pin(async move {
                     tool_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(ToolOutput::text("ran"))
+                    Ok(Value::String("ran".to_owned()))
                 })
             },
         ))
@@ -880,26 +1093,26 @@ async fn answerless_or_truncated_responses_are_not_success() {
     .await;
 
     assert!(matches!(
-        actions[0].error(),
-        Some(ActionError::Incomplete { .. })
+        actions[0].result(),
+        Err(ActionError::Incomplete { .. })
     ));
     assert!(matches!(
-        actions[1].error(),
-        Some(ActionError::Incomplete {
+        actions[1].result(),
+        Err(ActionError::Incomplete {
             finish_reason: Some(FinishReason::Length)
         })
     ));
     assert!(matches!(
-        actions[2].error(),
-        Some(ActionError::Incomplete {
+        actions[2].result(),
+        Err(ActionError::Incomplete {
             finish_reason: Some(FinishReason::Length)
         })
     ));
     assert_eq!(calls.load(Ordering::Relaxed), 0);
-    assert!(actions[2].turns()[0].tools()[0].result().is_skipped());
+    assert!(actions[2].turns()[0].tools()[0].is_skipped());
     assert!(matches!(
-        actions[3].error(),
-        Some(ActionError::Incomplete {
+        actions[3].result(),
+        Err(ActionError::Incomplete {
             finish_reason: None
         })
     ));
@@ -917,14 +1130,14 @@ async fn dropping_the_run_drops_every_pending_tool() {
     let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
     let mut tools = Tools::default();
     tools
-        .register_dynamic(hanging_tool(
+        .register(hanging_tool(
             "hang-a",
             started_tx.clone(),
             dropped_tx.clone(),
         ))
         .expect("register hang-a");
     tools
-        .register_dynamic(hanging_tool("hang-b", started_tx, dropped_tx))
+        .register(hanging_tool("hang-b", started_tx, dropped_tx))
         .expect("register hang-b");
 
     let run = tokio::spawn(async move {
@@ -964,11 +1177,10 @@ fn duplicate_tool_names_are_rejected() {
 #[test]
 fn start_action_is_reserved_for_the_agent_protocol() {
     let mut tools = Tools::default();
-    let result = tools.register_dynamic(PortableDynamicTool::new(
+    let result = tools.register(test_tool(
         START_ACTION_TOOL,
         "Must never be exposed inside an Action",
-        serde_json::json!({"type": "object"}),
-        |_| Box::pin(async { Ok(ToolOutput::text("unreachable")) }),
+        |_| Box::pin(async { Ok(Value::String("unreachable".to_owned())) }),
     ));
 
     assert_eq!(result, Err(AgentConfigError::ReservedTool));
@@ -979,48 +1191,39 @@ fn gate_tool(
     release: Arc<Semaphore>,
     started: mpsc::UnboundedSender<&'static str>,
     finished: mpsc::UnboundedSender<&'static str>,
-) -> PortableDynamicTool {
-    PortableDynamicTool::new(
-        name,
-        "Wait until released by the test",
-        serde_json::json!({"type": "object"}),
-        move |_| {
-            let release = Arc::clone(&release);
-            let started = started.clone();
-            let finished = finished.clone();
-            Box::pin(async move {
-                started.send(name).expect("test receives start");
-                let permit = release.acquire_owned().await.map_err(|_| {
-                    ToolExecutionError::cancelled("test gate closed before release")
-                })?;
-                permit.forget();
-                finished.send(name).expect("test receives finish");
-                Ok(ToolOutput::text(name))
-            })
-        },
-    )
+) -> TestTool {
+    test_tool(name, "Wait until released by the test", move |_| {
+        let release = Arc::clone(&release);
+        let started = started.clone();
+        let finished = finished.clone();
+        Box::pin(async move {
+            started.send(name).expect("test receives start");
+            let permit = release
+                .acquire_owned()
+                .await
+                .map_err(|_| TestError("test gate closed before release"))?;
+            permit.forget();
+            finished.send(name).expect("test receives finish");
+            Ok(Value::String(name.to_owned()))
+        })
+    })
 }
 
 fn hanging_tool(
     name: &'static str,
     started: mpsc::UnboundedSender<&'static str>,
     dropped: mpsc::UnboundedSender<&'static str>,
-) -> PortableDynamicTool {
-    PortableDynamicTool::new(
-        name,
-        "Wait forever",
-        serde_json::json!({"type": "object"}),
-        move |_| {
-            let started = started.clone();
-            let dropped = dropped.clone();
-            Box::pin(async move {
-                let _drop_probe = DropProbe { name, dropped };
-                started.send(name).expect("test receives start");
-                std::future::pending::<()>().await;
-                Ok(ToolOutput::text("unreachable"))
-            })
-        },
-    )
+) -> TestTool {
+    test_tool(name, "Wait forever", move |_| {
+        let started = started.clone();
+        let dropped = dropped.clone();
+        Box::pin(async move {
+            let _drop_probe = DropProbe { name, dropped };
+            started.send(name).expect("test receives start");
+            std::future::pending::<()>().await;
+            Ok(Value::String("unreachable".to_owned()))
+        })
+    })
 }
 
 struct DropProbe {

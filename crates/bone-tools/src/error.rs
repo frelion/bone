@@ -1,6 +1,7 @@
 use std::io;
 
-use rig_core::tool::ToolExecutionError;
+use bone_agent::{ToolFailure, ToolFailureKind};
+use bone_llm::ToolOutput;
 use thiserror::Error;
 
 /// Concrete failures produced by built-in tools.
@@ -57,35 +58,39 @@ impl ToolError {
         }
     }
 
-    pub(crate) fn into_execution_error(self) -> ToolExecutionError {
+    pub(crate) fn into_tool_failure(self) -> ToolFailure {
         let message = self.to_string();
-        match &self {
+        let (kind, model_output) = match &self {
             Self::InvalidArgs(_)
             | Self::InvalidGlob(_)
             | Self::InvalidRegex(_)
-            | Self::Patch(_) => ToolExecutionError::invalid_args(message).with_source(self),
-            Self::NotFound { .. } => ToolExecutionError::not_found(message).with_source(self),
+            | Self::Patch(_) => (ToolFailureKind::InvalidArguments, message.clone()),
+            Self::NotFound { .. } => (ToolFailureKind::NotFound, message.clone()),
             Self::OutsideWorkspace { .. } | Self::PermissionDenied { .. } => {
-                ToolExecutionError::permission_denied(message).with_source(self)
+                (ToolFailureKind::PermissionDenied, message.clone())
             }
             Self::Io { source, .. } if source.kind() == io::ErrorKind::PermissionDenied => {
-                ToolExecutionError::permission_denied(message).with_source(self)
+                (ToolFailureKind::PermissionDenied, message.clone())
             }
             Self::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
-                ToolExecutionError::not_found(message).with_source(self)
+                (ToolFailureKind::NotFound, message.clone())
             }
             Self::Io {
                 operation, path, ..
-            } => ToolExecutionError::other(message)
-                .with_model_feedback(format!("{operation} failed for {path}"))
-                .with_source(self),
-            Self::Task(_) => ToolExecutionError::other(message)
-                .with_model_feedback("background tool task failed")
-                .with_source(self),
-            Self::Spawn { shell, .. } => ToolExecutionError::other(message)
-                .with_model_feedback(format!("failed to start shell `{shell}`"))
-                .with_source(self),
-        }
+            } => (
+                ToolFailureKind::Other,
+                format!("{operation} failed for {path}"),
+            ),
+            Self::Task(_) => (
+                ToolFailureKind::Other,
+                "background tool task failed".to_owned(),
+            ),
+            Self::Spawn { shell, .. } => (
+                ToolFailureKind::Other,
+                format!("failed to start shell `{shell}`"),
+            ),
+        };
+        ToolFailure::new(kind, message, ToolOutput::text(model_output)).with_source(self)
     }
 }
 
@@ -100,12 +105,13 @@ mod tests {
             path: "src/lib.rs".to_owned(),
             source: io::Error::other("host detail /private/workspace"),
         }
-        .into_execution_error();
+        .into_tool_failure();
 
         assert!(error.message().contains("/private/workspace"));
         assert_eq!(
-            error.model_feedback(),
-            Some("read file failed for src/lib.rs")
+            error.model_output(),
+            &ToolOutput::text("read file failed for src/lib.rs")
         );
+        assert!(std::error::Error::source(&error).is_some());
     }
 }

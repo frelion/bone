@@ -8,18 +8,22 @@ use std::{
     },
 };
 
+use bone_agent::{Tool, ToolFailure};
+use bone_llm::ToolDefinition;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{
     BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
 };
-use rig_core::tool::{PortableTool, ToolExecutionError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
     ToolEnvironment, ToolError, ToolLimits,
-    search_walk::{CancellableReader, SearchWalk, SearchWalkEvent, is_vcs_name},
+    search_walk::{
+        CancellableReader, CancellationGuard, SearchWalk, SearchWalkEvent, push_bounded_warning,
+        reject_vcs_root,
+    },
     workspace::{ResolvedPath, path_to_slashes},
 };
 
@@ -103,78 +107,77 @@ pub struct GrepTool {
 }
 
 impl GrepTool {
-    pub fn new(environment: ToolEnvironment) -> Self {
+    pub(crate) fn new(environment: ToolEnvironment) -> Self {
         Self { environment }
     }
 }
 
-impl PortableTool for GrepTool {
-    const NAME: &'static str = "grep";
+impl Tool for GrepTool {
     type Args = GrepArgs;
     type Output = GrepOutput;
     type Error = ToolError;
 
-    fn description(&self) -> String {
-        format!(
-            "Search text files inside the workspace with a Rust regular expression or literal string. The search respects bounded workspace-local ignore files at or below the selected search root (rules above an explicitly selected root are not inherited), skips binary and oversized files, never enters VCS metadata, and returns at most {} sorted matching lines. If truncated, the selected subset can depend on filesystem enumeration order.",
-            self.environment.limits.max_grep_matches,
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "grep",
+            format!(
+                "Search text files inside the workspace with a Rust regular expression or literal string. The search respects bounded workspace-local ignore files at or below the selected search root (rules above an explicitly selected root are not inherited), skips binary and oversized files, never enters VCS metadata, and returns at most {} sorted matching lines. If truncated, the selected subset can depend on filesystem enumeration order.",
+                self.environment.limits.max_grep_matches,
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": format!("Rust regex syntax, or literal text when literal is true; at most {} UTF-8 bytes", self.environment.limits.max_grep_pattern_bytes)
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory relative to the workspace, or an absolute path inside it; defaults to ."
+                    },
+                    "glob": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": format!("Optional file glob relative to path, using / separators; at most {MAX_FILTER_GLOB_BYTES} UTF-8 bytes")
+                    },
+                    "literal": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Treat pattern as literal text"
+                    },
+                    "case_insensitive": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Enable Unicode-aware case-insensitive matching"
+                    },
+                    "include_hidden": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Disable default dotfile filtering; ignore whitelists can still include hidden paths, while VCS metadata is always excluded"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": self.environment.limits.max_grep_matches,
+                        "description": "Maximum matching lines to return; context lines do not count"
+                    },
+                    "context": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 10,
+                        "default": 0,
+                        "description": "Number of lines before and after each match"
+                    }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
         )
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": format!("Rust regex syntax, or literal text when literal is true; at most {} UTF-8 bytes", self.environment.limits.max_grep_pattern_bytes)
-                },
-                "path": {
-                    "type": "string",
-                    "description": "File or directory relative to the workspace, or an absolute path inside it; defaults to ."
-                },
-                "glob": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": format!("Optional file glob relative to path, using / separators; at most {MAX_FILTER_GLOB_BYTES} UTF-8 bytes")
-                },
-                "literal": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Treat pattern as literal text"
-                },
-                "case_insensitive": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Enable Unicode-aware case-insensitive matching"
-                },
-                "include_hidden": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Disable default dotfile filtering; ignore whitelists can still include hidden paths, while VCS metadata is always excluded"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": self.environment.limits.max_grep_matches,
-                    "description": "Maximum matching lines to return; context lines do not count"
-                },
-                "context": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 10,
-                    "default": 0,
-                    "description": "Number of lines before and after each match"
-                }
-            },
-            "required": ["pattern"],
-            "additionalProperties": false
-        })
-    }
-
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        error.into_execution_error()
+    fn map_error(&self, error: Self::Error) -> ToolFailure {
+        error.into_tool_failure()
     }
 
     async fn call(&self, arguments: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -252,18 +255,6 @@ fn validate_arguments(arguments: &GrepArgs, limits: &ToolLimits) -> Result<(), T
     Ok(())
 }
 
-fn reject_vcs_root(resolved: &ResolvedPath) -> Result<(), ToolError> {
-    if Path::new(&resolved.display)
-        .components()
-        .any(|component| is_vcs_name(component.as_os_str()))
-    {
-        return Err(ToolError::PermissionDenied {
-            path: display_or_dot(&resolved.display).to_owned(),
-        });
-    }
-    Ok(())
-}
-
 fn run_grep(
     workspace_root: &Path,
     resolved: ResolvedPath,
@@ -315,8 +306,8 @@ fn run_grep(
     while let Some(event) = walk.next_event() {
         let path = match event {
             SearchWalkEvent::Warning(warning) => {
-                if !push_warning(
-                    &mut output,
+                if !push_bounded_warning(
+                    &mut output.warnings,
                     &mut output_bytes,
                     limits.max_output_bytes,
                     warning,
@@ -356,8 +347,8 @@ fn run_grep(
         let file = match File::open(&path) {
             Ok(file) => file,
             Err(error) => {
-                if !push_warning(
-                    &mut output,
+                if !push_bounded_warning(
+                    &mut output.warnings,
                     &mut output_bytes,
                     limits.max_output_bytes,
                     format!("could not open {display_path}: {:?}", error.kind()),
@@ -371,8 +362,8 @@ fn run_grep(
         let metadata = match file.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
-                if !push_warning(
-                    &mut output,
+                if !push_bounded_warning(
+                    &mut output.warnings,
                     &mut output_bytes,
                     limits.max_output_bytes,
                     format!("could not inspect {display_path}: {:?}", error.kind()),
@@ -384,8 +375,8 @@ fn run_grep(
             }
         };
         if !metadata.is_file() {
-            if !push_warning(
-                &mut output,
+            if !push_bounded_warning(
+                &mut output.warnings,
                 &mut output_bytes,
                 limits.max_output_bytes,
                 format!("skipped non-regular file {display_path}"),
@@ -397,8 +388,8 @@ fn run_grep(
         }
         if metadata.len() > limits.max_search_file_bytes {
             output.oversized_files_skipped += 1;
-            if !push_warning(
-                &mut output,
+            if !push_bounded_warning(
+                &mut output.warnings,
                 &mut output_bytes,
                 limits.max_output_bytes,
                 format!(
@@ -416,8 +407,8 @@ fn run_grep(
         let next_searched_bytes = output.searched_bytes.checked_add(metadata.len());
         if next_searched_bytes.is_none_or(|bytes| bytes > limits.max_search_total_bytes) {
             output.truncated = true;
-            let _ = push_warning(
-                &mut output,
+            let _ = push_bounded_warning(
+                &mut output.warnings,
                 &mut output_bytes,
                 limits.max_output_bytes,
                 format!(
@@ -468,8 +459,8 @@ fn run_grep(
             output.match_count = match_count_before_file;
             output_bytes = output_bytes_before_file;
             output.binary_files_skipped += 1;
-            if !push_warning(
-                &mut output,
+            if !push_bounded_warning(
+                &mut output.warnings,
                 &mut output_bytes,
                 limits.max_output_bytes,
                 format!("skipped binary file {display_path} (NUL at byte {offset})"),
@@ -486,8 +477,8 @@ fn run_grep(
             output.truncated = true;
         }
         if let Err(error) = search_result
-            && !push_warning(
-                &mut output,
+            && !push_bounded_warning(
+                &mut output.warnings,
                 &mut output_bytes,
                 limits.max_output_bytes,
                 format!("could not search {display_path}: {:?}", error.kind()),
@@ -651,32 +642,6 @@ impl Sink for CollectSink<'_> {
     }
 }
 
-struct CancellationGuard {
-    cancelled: Arc<AtomicBool>,
-    armed: bool,
-}
-
-impl CancellationGuard {
-    fn new(cancelled: Arc<AtomicBool>) -> Self {
-        Self {
-            cancelled,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for CancellationGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.cancelled.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
 impl CollectSink<'_> {
     fn commit_match_group(&mut self, mut matched: PendingRow) -> bool {
         let group_cost =
@@ -805,32 +770,6 @@ fn decimal_digits(mut value: u64) -> usize {
     digits
 }
 
-fn push_warning(
-    output: &mut GrepOutput,
-    used_bytes: &mut usize,
-    max_bytes: usize,
-    warning: String,
-    workspace_root: &Path,
-) -> bool {
-    let warning = redact_workspace(warning, workspace_root);
-    let cost = warning.len() + usize::from(!output.warnings.is_empty());
-    if used_bytes.saturating_add(cost) > max_bytes {
-        return false;
-    }
-    *used_bytes += cost;
-    output.warnings.push(warning);
-    true
-}
-
-fn redact_workspace(value: String, workspace_root: &Path) -> String {
-    let root = workspace_root.display().to_string();
-    if root.is_empty() || root == std::path::MAIN_SEPARATOR_STR {
-        value
-    } else {
-        value.replace(&root, ".")
-    }
-}
-
 fn match_kind_rank(kind: &str) -> u8 {
     match kind {
         "before_context" => 0,
@@ -840,15 +779,11 @@ fn match_kind_rank(kind: &str) -> u8 {
     }
 }
 
-fn display_or_dot(display: &str) -> &str {
-    if display.is_empty() { "." } else { display }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use rig_core::tool::PortableTool;
+    use bone_agent::Tool;
 
     use super::*;
 
@@ -1280,29 +1215,5 @@ mod tests {
         assert_eq!(output.match_count, 1);
         assert_eq!(output.matches[0].path, "a.txt");
         assert!(output.truncated);
-    }
-
-    #[test]
-    fn cancellation_guard_signals_only_while_armed() {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        {
-            let _guard = CancellationGuard::new(cancelled.clone());
-        }
-        assert!(cancelled.load(Ordering::Relaxed));
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let mut guard = CancellationGuard::new(cancelled.clone());
-        guard.disarm();
-        drop(guard);
-        assert!(!cancelled.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn warning_paths_hide_the_workspace_prefix() {
-        let root = Path::new("/private/workspace");
-        assert_eq!(
-            redact_workspace("search error under /private/workspace/src".to_owned(), root),
-            "search error under ./src"
-        );
     }
 }

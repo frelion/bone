@@ -1,19 +1,21 @@
 # Built-in tools
 
-`bone-tools` is BONE's provider-independent local tool crate. It is a sibling
-of `bone-llm`; neither crate depends on the other. Both depend on Rig's
-normalized interfaces, while `bone-tools` uses the independent `bone-config`
-service for its config tool. `bone-cli` is the composition root: it creates a
-model and concrete tools, then supplies them to `bone-agent`. The production
-`bone-agent` crate does not depend on `bone-tools`.
+`bone-tools` contains BONE's provider-independent built-in tool
+implementations. The boundary has one owner at each layer:
 
-```text
-bone-cli
-├──► bone-agent ──► bone-llm ──► rig-core
-├──► bone-llm ─────────────────► rig-core
-└──► bone-tools ──┬──────────────► rig-core
-                  └──────────────► bone-config
-```
+- `bone-llm` owns the model-facing tool definition, call, output, and replay
+  protocol;
+- `bone-agent` owns the executable `Tool` interface, registration, timeouts,
+  and scheduling;
+- `bone-tools` implements that interface for local filesystem, process, and
+  configuration operations.
+
+`bone-cli` is the composition root: it creates a model and concrete tools, then
+registers those tools with the Agent. `bone-agent` does not depend on the
+built-in implementations. In production code, Rig is confined to `bone-llm`.
+
+The complete workspace dependency map is kept in the
+[README](../README.md#workspace).
 
 The first tool set is deliberately small:
 
@@ -32,8 +34,11 @@ The first tool set is deliberately small:
   non-secret configuration sections using optimistic revisions. Credentials
   are deliberately unavailable to the model.
 
-Every tool implements `rig_core::tool::PortableTool`. The local coding tools
-capture an immutable workspace root and shared hard limits:
+Every built-in implements the single `bone_agent::Tool` execution interface.
+The Agent obtains its model-facing definition and calls it with the JSON
+arguments produced by `bone-llm`; there is no second dynamic registration API
+or provider-specific tool type. The local coding tools capture an immutable
+workspace root and shared hard limits:
 
 ```rust,no_run
 use bone_tools::ToolEnvironment;
@@ -55,11 +60,12 @@ after the host registers the sections it intends to expose. This keeps the
 workspace environment independent from application configuration and makes
 the registration set an explicit model-facing allowlist.
 
-Native tool calls must run inside an active Tokio runtime. `PortableTool`
-provides Rig's normalized tool definition and execution contract; it does not
-make these filesystem and process implementations executor-agnostic. Bash uses
-a sanitized default child environment. A runtime that needs a fully explicit
-replacement can construct it separately:
+Native tool calls must run inside an active Tokio runtime. The BONE `Tool`
+interface does not make these filesystem and process implementations
+executor-agnostic: `bone-agent` schedules calls and applies its runtime timeout,
+while an implementation may enforce a shorter domain-specific deadline. Bash
+uses a sanitized default child environment. A runtime that needs a fully
+explicit replacement can construct it separately:
 
 ```rust,no_run
 use bone_tools::{BashTool, ToolEnvironment};
@@ -75,9 +81,10 @@ let bash = BashTool::with_process_environment(
 # }
 ```
 
-Tool registration belongs to `bone-agent`, while provider translation remains
-in `bone-llm`. Conversation state, approvals, authorization, host-level
-cancellation policy, and audit events remain responsibilities of higher layers.
+Tool registration, execution outcomes, timeouts, and scheduling belong to
+`bone-agent`; provider translation and opaque tool-call correlation remain in
+`bone-llm`; concrete behavior belongs to `bone-tools`. Approvals,
+authorization, sandboxing, and audit policy remain host responsibilities.
 
 ## Safety contract
 

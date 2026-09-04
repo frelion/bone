@@ -159,6 +159,12 @@ Request::new([
 # }
 ```
 
+These are model-protocol values, not an execution framework. `bone-llm` never
+registers or runs a tool. `bone-agent` owns the executable `Tool` interface and
+uses these values to advertise tools, dispatch calls, and return results;
+`bone-tools` supplies the built-in implementations. Provider and Rig tool types
+do not cross the `bone-llm` boundary.
+
 `InputItem::tool_result` accepts the complete `ToolCall`, not a loose string
 ID, so protocol-specific correlation data cannot be accidentally discarded.
 Adjacent tool results are sent as one result batch when the wire requires it.

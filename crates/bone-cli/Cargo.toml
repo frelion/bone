@@ -14,3 +14,9 @@ bone-agent = { path = "../bone-agent" }
 bone-llm = { path = "../bone-llm" }
 bone-tools = { path = "../bone-tools" }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+bone-llm = { path = "../bone-llm", features = ["test-utils"] }
+rig-core = { workspace = true, features = ["test-utils"] }
+serde_json.workspace = true
+tempfile.workspace = true

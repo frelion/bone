@@ -8,7 +8,8 @@ use std::{
     time::Duration,
 };
 
-use rig_core::tool::{PortableTool, ToolExecutionError};
+use bone_agent::{Tool, ToolFailure};
+use bone_llm::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
@@ -93,7 +94,7 @@ impl BashTool {
     /// The child environment is cleared before a small usability allowlist is
     /// copied from the host. Credentials, proxy settings, `HOME`, `BASH_ENV`,
     /// and SSH-agent variables are not inherited by default.
-    pub fn new(environment: ToolEnvironment) -> Self {
+    pub(crate) fn new(environment: ToolEnvironment) -> Self {
         Self {
             environment,
             process_environment: Arc::new(sanitized_process_environment()),
@@ -278,48 +279,47 @@ impl fmt::Debug for BashTool {
     }
 }
 
-impl PortableTool for BashTool {
-    const NAME: &'static str = "bash";
+impl Tool for BashTool {
     type Args = BashArgs;
     type Output = BashOutput;
     type Error = ToolError;
 
-    fn description(&self) -> String {
-        format!(
-            "Execute one non-interactive Bash command in the workspace with a sanitized child environment. Returns bounded stdout and stderr, exit code, timeout state, and truncation state. Commands are limited to {} UTF-8 bytes, each output stream to {} bytes, and at most {}. Unix timeout or cancellation kills the process group; on non-Unix only the direct Bash child is guaranteed to terminate and descendants may survive.",
-            self.environment.limits.max_bash_command_bytes,
-            self.environment.limits.max_output_bytes,
-            display_duration(self.environment.limits.max_bash_timeout)
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "bash",
+            format!(
+                "Execute one non-interactive Bash command in the workspace with a sanitized child environment. Returns bounded stdout and stderr, exit code, timeout state, and truncation state. Commands are limited to {} UTF-8 bytes, each output stream to {} bytes, and at most {}. Unix timeout or cancellation kills the process group; on non-Unix only the direct Bash child is guaranteed to terminate and descendants may survive.",
+                self.environment.limits.max_bash_command_bytes,
+                self.environment.limits.max_output_bytes,
+                display_duration(self.environment.limits.max_bash_timeout)
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": format!("Exact Bash source to execute; at most {} UTF-8 bytes", self.environment.limits.max_bash_command_bytes)
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory relative to the workspace, or an absolute directory inside it"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": self.environment.limits.max_bash_timeout.as_secs(),
+                        "description": "Execution timeout in seconds"
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
         )
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": format!("Exact Bash source to execute; at most {} UTF-8 bytes", self.environment.limits.max_bash_command_bytes)
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Working directory relative to the workspace, or an absolute directory inside it"
-                },
-                "timeout_secs": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": self.environment.limits.max_bash_timeout.as_secs(),
-                    "description": "Execution timeout in seconds"
-                }
-            },
-            "required": ["command"],
-            "additionalProperties": false
-        })
-    }
-
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        error.into_execution_error()
+    fn map_error(&self, error: Self::Error) -> ToolFailure {
+        error.into_tool_failure()
     }
 
     async fn call(&self, arguments: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -620,7 +620,7 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) -> bool {
 mod tests {
     use std::time::Instant;
 
-    use rig_core::tool::PortableTool;
+    use bone_agent::Tool;
 
     use super::*;
     use crate::ToolLimits;

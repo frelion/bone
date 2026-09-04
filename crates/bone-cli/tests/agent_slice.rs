@@ -46,7 +46,7 @@ const FOLLOW_UP_REPLY: &str = r#"{
 }"#;
 
 #[tokio::test]
-async fn real_provider_and_read_tool_cross_the_whole_agent_slice() {
+async fn openai_responses_adapter_and_read_tool_cross_the_agent_slice() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     std::fs::write(workspace.path().join("note.txt"), "verified slice\n")
         .expect("write test fixture");
@@ -85,9 +85,14 @@ async fn real_provider_and_read_tool_cross_the_whole_agent_slice() {
         "Read note.txt and report its exact content"
     );
     assert_eq!(action.turns().len(), 2);
-    let read = action.turns()[0].tools()[0].result();
+    let read = &action.turns()[0].tools()[0];
     assert!(read.is_success());
-    assert!(read.output().render().contains("verified slice"));
+    assert!(
+        read.model_output()
+            .as_json()
+            .and_then(|value| value["content"].as_str())
+            .is_some_and(|content| content.contains("verified slice"))
+    );
 
     let followup = agent
         .chat("Do you remember what it said?")
@@ -116,6 +121,16 @@ async fn real_provider_and_read_tool_cross_the_whole_agent_slice() {
         .expect("action input array");
     assert!(has_call(action_input, "function_call", "call_read"));
     assert!(has_call(action_input, "function_call_output", "call_read"));
+    let read_output = action_input
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_read")
+        .expect("action receives the read result");
+    assert!(
+        read_output["output"]
+            .as_str()
+            .expect("read result is JSON text")
+            .contains("verified slice")
+    );
     assert!(!has_any_call(action_input, "call_start"));
 
     let controller_input = controller_followup["input"]

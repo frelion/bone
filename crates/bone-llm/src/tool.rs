@@ -188,6 +188,16 @@ impl ToolOutput {
             content: vec![ToolResultContent::json(value)],
         }
     }
+
+    /// Borrow the literal text when this output contains text.
+    pub fn as_text(&self) -> Option<&str> {
+        self.content.first().and_then(ToolResultContent::as_text)
+    }
+
+    /// Borrow the structured value when this output contains JSON.
+    pub fn as_json(&self) -> Option<&Value> {
+        self.content.first().and_then(ToolResultContent::as_json)
+    }
 }
 
 impl fmt::Debug for ToolOutput {
@@ -196,5 +206,24 @@ impl fmt::Debug for ToolOutput {
             .debug_struct("ToolOutput")
             .field("content_count", &self.content.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::ToolOutput;
+
+    #[test]
+    fn tool_output_preserves_text_and_json_kinds() {
+        let text = ToolOutput::text("hello");
+        assert_eq!(text.as_text(), Some("hello"));
+        assert_eq!(text.as_json(), None);
+
+        let value = json!({ "answer": 42 });
+        let structured = ToolOutput::json(value.clone());
+        assert_eq!(structured.as_text(), None);
+        assert_eq!(structured.as_json(), Some(&value));
     }
 }

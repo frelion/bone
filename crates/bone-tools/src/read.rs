@@ -1,4 +1,5 @@
-use rig_core::tool::{PortableTool, ToolExecutionError};
+use bone_agent::{Tool, ToolFailure};
+use bone_llm::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io;
@@ -41,53 +42,52 @@ pub struct ReadTool {
 }
 
 impl ReadTool {
-    pub fn new(environment: ToolEnvironment) -> Self {
+    pub(crate) fn new(environment: ToolEnvironment) -> Self {
         Self { environment }
     }
 }
 
-impl PortableTool for ReadTool {
-    const NAME: &'static str = "read";
+impl Tool for ReadTool {
     type Args = ReadArgs;
     type Output = ReadOutput;
     type Error = ToolError;
 
-    fn description(&self) -> String {
-        format!(
-            "Read a UTF-8 text file inside the workspace with line numbers. Files are limited to {} bytes and output to {} lines or {} bytes; use offset and limit to continue. A truncated long-line tail is omitted.",
-            self.environment.limits.max_read_file_bytes,
-            self.environment.limits.max_read_lines,
-            self.environment.limits.max_output_bytes
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "read",
+            format!(
+                "Read a UTF-8 text file inside the workspace with line numbers. Files are limited to {} bytes and output to {} lines or {} bytes; use offset and limit to continue. A truncated long-line tail is omitted.",
+                self.environment.limits.max_read_file_bytes,
+                self.environment.limits.max_read_lines,
+                self.environment.limits.max_output_bytes
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to the workspace, or an absolute path inside it"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "First line to return, using one-based indexing"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": self.environment.limits.max_read_lines,
+                        "description": "Maximum number of lines to return"
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
         )
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File path relative to the workspace, or an absolute path inside it"
-                },
-                "offset": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "First line to return, using one-based indexing"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": self.environment.limits.max_read_lines,
-                    "description": "Maximum number of lines to return"
-                }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        })
-    }
-
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        error.into_execution_error()
+    fn map_error(&self, error: Self::Error) -> ToolFailure {
+        error.into_tool_failure()
     }
 
     async fn call(&self, arguments: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -353,7 +353,7 @@ fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use rig_core::tool::PortableTool;
+    use bone_agent::Tool;
 
     use super::*;
 

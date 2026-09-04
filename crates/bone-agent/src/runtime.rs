@@ -1,20 +1,16 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, future::Future, pin::Pin, time::Duration};
 
-use bone_llm::{FinishReason, InputItem, Model, Request, Response, ToolCall, ToolDefinition};
-use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
-use rig_core::{
-    tool::{ToolExecutionError, ToolResult as ExecutionToolResult},
-    wasm_compat::{WasmBoxedFuture, timeout},
+use bone_llm::{
+    FinishReason, InputItem, Model, Request, Response, ToolCall, ToolDefinition, ToolOutput,
 };
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use tokio::time::timeout;
 
 use crate::{
-    Action, ActionError, Turn,
-    action::{ActionState, normalize_tool_result},
-    tools::{Tools, missing_tool},
+    Action, ActionError, ToolFailure, ToolFailureKind, Turn,
+    tools::{ToolOutcome, Tools, missing_tool},
 };
 
-const DEFAULT_MAX_DECISIONS: usize = 32;
-const DEFAULT_MAX_ACTIONS_PER_DECISION: usize = 8;
 const DEFAULT_MAX_TURNS: usize = 32;
 const DEFAULT_MAX_TOOL_CALLS_PER_TURN: usize = 16;
 const DEFAULT_MODEL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -22,8 +18,6 @@ const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(900);
 
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
-    pub(crate) max_decisions: usize,
-    pub(crate) max_actions_per_decision: usize,
     pub(crate) max_turns: usize,
     pub(crate) max_tool_calls_per_turn: usize,
     pub(crate) model_timeout: Duration,
@@ -33,8 +27,6 @@ pub(crate) struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_decisions: DEFAULT_MAX_DECISIONS,
-            max_actions_per_decision: DEFAULT_MAX_ACTIONS_PER_DECISION,
             max_turns: DEFAULT_MAX_TURNS,
             max_tool_calls_per_turn: DEFAULT_MAX_TOOL_CALLS_PER_TURN,
             model_timeout: DEFAULT_MODEL_TIMEOUT,
@@ -47,8 +39,10 @@ struct FinishedTool {
     action: usize,
     turn: usize,
     tool: usize,
-    result: ExecutionToolResult,
+    outcome: ToolOutcome,
 }
+
+type RunningTool = Pin<Box<dyn Future<Output = FinishedTool> + Send + 'static>>;
 
 pub(crate) async fn drive(
     model: &Model,
@@ -58,13 +52,10 @@ pub(crate) async fn drive(
     mut actions: Vec<Action>,
 ) -> Vec<Action> {
     let mut ready = (0..actions.len()).collect::<VecDeque<_>>();
-    let mut running = FuturesUnordered::<WasmBoxedFuture<'static, FinishedTool>>::new();
+    let mut running = FuturesUnordered::<RunningTool>::new();
 
     loop {
         while let Some(action_index) = ready.pop_front() {
-            if actions[action_index].state() != ActionState::Ready {
-                continue;
-            }
             if actions[action_index].turns().len() >= limits.max_turns {
                 actions[action_index].fail(ActionError::TurnLimit {
                     limit: limits.max_turns,
@@ -91,10 +82,7 @@ pub(crate) async fn drive(
                 tokio::select! {
                     response = &mut completion => break response,
                     Some(finished) = running.next() => {
-                        let finished_action = finished.action;
-                        if record_result(&mut actions, finished) {
-                            ready.push_back(finished_action);
-                        }
+                        settle_tool(&mut actions, &mut ready, finished);
                     }
                 }
             };
@@ -174,10 +162,7 @@ pub(crate) async fn drive(
         let Some(finished) = running.next().await else {
             break;
         };
-        let action_index = finished.action;
-        if record_result(&mut actions, finished) {
-            ready.push_back(action_index);
-        }
+        settle_tool(&mut actions, &mut ready, finished);
     }
 
     actions
@@ -208,18 +193,22 @@ fn start_tool(
     call: ToolCall,
     tools: &Tools,
     deadline: Duration,
-) -> WasmBoxedFuture<'static, FinishedTool> {
-    let registered = tools.get(call.name());
+) -> RunningTool {
+    let execution = tools.execute(call.name(), call.arguments().clone());
     Box::pin(async move {
-        let result = match registered {
-            Some(registered) => {
+        let outcome = match execution {
+            Some(execution) => {
                 let name = call.name().to_owned();
-                match timeout(deadline, registered.execute(call.arguments().clone())).await {
-                    Ok(Ok(output)) => ExecutionToolResult::success(output),
-                    Ok(Err(error)) => ExecutionToolResult::failed(error),
-                    Err(_) => ExecutionToolResult::failed(ToolExecutionError::timeout(format!(
-                        "tool `{name}` timed out after {deadline:?}"
-                    ))),
+                match timeout(deadline, execution).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        let feedback = format!("tool `{name}` timed out after {deadline:?}");
+                        ToolOutcome::failed(ToolFailure::new(
+                            ToolFailureKind::Timeout,
+                            feedback.clone(),
+                            ToolOutput::text(feedback),
+                        ))
+                    }
                 }
             }
             None => missing_tool(call.name()),
@@ -228,7 +217,7 @@ fn start_tool(
             action,
             turn,
             tool,
-            result: normalize_tool_result(result),
+            outcome,
         }
     })
 }
@@ -236,16 +225,16 @@ fn start_tool(
 fn poll_ready_tools(
     actions: &mut [Action],
     ready: &mut VecDeque<usize>,
-    running: &mut FuturesUnordered<WasmBoxedFuture<'static, FinishedTool>>,
+    running: &mut FuturesUnordered<RunningTool>,
 ) {
     while let Some(Some(finished)) = running.next().now_or_never() {
-        let action_index = finished.action;
-        if record_result(actions, finished) {
-            ready.push_back(action_index);
-        }
+        settle_tool(actions, ready, finished);
     }
 }
 
-fn record_result(actions: &mut [Action], finished: FinishedTool) -> bool {
-    actions[finished.action].record_result(finished.turn, finished.tool, finished.result)
+fn settle_tool(actions: &mut [Action], ready: &mut VecDeque<usize>, finished: FinishedTool) {
+    let action = finished.action;
+    if actions[action].record_outcome(finished.turn, finished.tool, finished.outcome) {
+        ready.push_back(action);
+    }
 }

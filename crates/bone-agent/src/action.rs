@@ -1,38 +1,7 @@
-use bone_llm::{InputItem, InputSource, Response, ToolCall, ToolOutput as ModelToolOutput};
-use rig_core::tool::ToolResult as ExecutionToolResult;
+use bone_llm::{InputItem, InputSource, Response, ToolCall};
 
-use crate::ActionError;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ActionState {
-    Ready,
-    Waiting,
-    Finished,
-}
-
-/// The terminal result of an action.
-pub enum ActionOutcome {
-    Completed { output: String },
-    Failed(ActionError),
-}
-
-impl ActionOutcome {
-    /// The final model text when the action completed successfully.
-    pub fn output(&self) -> Option<&str> {
-        match self {
-            Self::Completed { output } => Some(output),
-            Self::Failed(_) => None,
-        }
-    }
-
-    /// The terminal error when the action failed.
-    pub fn error(&self) -> Option<&ActionError> {
-        match self {
-            Self::Completed { .. } => None,
-            Self::Failed(error) => Some(error),
-        }
-    }
-}
+use crate::agent::PARENT_AGENT_SOURCE;
+use crate::{ActionError, ToolFailure, tools::ToolOutcome};
 
 /// One independently advancing piece of work.
 ///
@@ -43,7 +12,7 @@ pub struct Action {
     intent: String,
     context: Vec<InputItem>,
     turns: Vec<Turn>,
-    outcome: Option<ActionOutcome>,
+    result: Option<Result<String, ActionError>>,
 }
 
 impl Action {
@@ -57,7 +26,7 @@ impl Action {
             intent: intent.into(),
             context,
             turns: Vec::new(),
-            outcome: None,
+            result: None,
         }
     }
 
@@ -69,28 +38,15 @@ impl Action {
         &self.turns
     }
 
-    /// The action's terminal outcome.
-    pub fn outcome(&self) -> &ActionOutcome {
-        self.outcome
+    /// The action's terminal result.
+    pub fn result(&self) -> Result<&str, &ActionError> {
+        match self
+            .result
             .as_ref()
             .expect("actions returned by Agent are settled")
-    }
-
-    pub fn output(&self) -> Option<&str> {
-        self.outcome.as_ref().and_then(ActionOutcome::output)
-    }
-
-    pub fn error(&self) -> Option<&ActionError> {
-        self.outcome.as_ref().and_then(ActionOutcome::error)
-    }
-
-    pub(crate) fn state(&self) -> ActionState {
-        if self.outcome.is_some() {
-            ActionState::Finished
-        } else if self.turns.last().is_some_and(Turn::is_waiting) {
-            ActionState::Waiting
-        } else {
-            ActionState::Ready
+        {
+            Ok(output) => Ok(output),
+            Err(error) => Err(error),
         }
     }
 
@@ -98,7 +54,7 @@ impl Action {
         let mut input = Vec::with_capacity(1 + self.context.len() + self.turns.len() * 2);
         input.extend(self.context.iter().cloned());
         input.push(InputItem::external(
-            InputSource::Named("parent-agent".to_owned()),
+            InputSource::Named(PARENT_AGENT_SOURCE.to_owned()),
             self.intent.clone(),
         ));
 
@@ -118,26 +74,26 @@ impl Action {
         index
     }
 
-    pub(crate) fn record_result(
+    pub(crate) fn record_outcome(
         &mut self,
         turn: usize,
         tool: usize,
-        result: ExecutionToolResult,
+        outcome: ToolOutcome,
     ) -> bool {
         let turn = self
             .turns
             .get_mut(turn)
             .expect("pending tool points to its originating turn");
-        turn.record_result(tool, result);
+        turn.record_outcome(tool, outcome);
         !turn.is_waiting()
     }
 
     pub(crate) fn complete(&mut self, output: String) {
-        self.outcome = Some(ActionOutcome::Completed { output });
+        self.result = Some(Ok(output));
     }
 
     pub(crate) fn fail(&mut self, error: ActionError) {
-        self.outcome = Some(ActionOutcome::Failed(error));
+        self.result = Some(Err(error));
     }
 }
 
@@ -162,7 +118,7 @@ impl Turn {
                 .into_iter()
                 .map(|call| ToolExecution {
                     call,
-                    result: Some(ExecutionToolResult::skipped(reason)),
+                    outcome: Some(ToolOutcome::skipped(reason)),
                 })
                 .collect(),
         }
@@ -177,16 +133,19 @@ impl Turn {
     }
 
     pub(crate) fn is_waiting(&self) -> bool {
-        self.tools.iter().any(|tool| tool.result.is_none())
+        self.tools.iter().any(|tool| tool.outcome.is_none())
     }
 
-    pub(crate) fn record_result(&mut self, index: usize, result: ExecutionToolResult) {
+    pub(crate) fn record_outcome(&mut self, index: usize, outcome: ToolOutcome) {
         let execution = self
             .tools
             .get_mut(index)
             .expect("pending tool points to its originating turn");
-        debug_assert!(execution.result.is_none(), "a tool result is recorded once");
-        execution.result = Some(result);
+        debug_assert!(
+            execution.outcome.is_none(),
+            "a tool outcome is recorded once"
+        );
+        execution.outcome = Some(outcome);
     }
 
     fn result_items(&self) -> Vec<InputItem> {
@@ -197,60 +156,59 @@ impl Turn {
         self.tools
             .iter()
             .map(|execution| {
-                let result = execution
-                    .result
+                let outcome = execution
+                    .outcome
                     .as_ref()
                     .expect("a settled turn has every tool result");
-                InputItem::tool_result(&execution.call, model_tool_output(result))
+                InputItem::tool_result(&execution.call, outcome.model_output().clone())
             })
             .collect()
     }
 }
 
-fn supported_model_tool_output(result: &ExecutionToolResult) -> Option<ModelToolOutput> {
-    let output = result.output();
-    if let Some(text) = output.as_text() {
-        Some(ModelToolOutput::text(text))
-    } else {
-        output
-            .as_json()
-            .map(|value| ModelToolOutput::json(value.clone()))
-    }
-}
-
-pub(crate) fn normalize_tool_result(result: ExecutionToolResult) -> ExecutionToolResult {
-    if supported_model_tool_output(&result).is_some() {
-        result
-    } else {
-        ExecutionToolResult::failed(rig_core::tool::ToolExecutionError::other(
-            "tool output cannot be represented by this Agent; return one plain text or JSON value",
-        ))
-    }
-}
-
-pub(crate) fn model_tool_output(result: &ExecutionToolResult) -> ModelToolOutput {
-    supported_model_tool_output(result)
-        .expect("every stored tool result is normalized before entering an Action")
-}
-
 /// One tool call and its eventual execution result.
 pub struct ToolExecution {
     call: ToolCall,
-    result: Option<ExecutionToolResult>,
+    outcome: Option<ToolOutcome>,
 }
 
 impl ToolExecution {
     fn new(call: ToolCall) -> Self {
-        Self { call, result: None }
+        Self {
+            call,
+            outcome: None,
+        }
     }
 
     pub fn call(&self) -> &ToolCall {
         &self.call
     }
 
-    /// The terminal execution result.
-    pub fn result(&self) -> &ExecutionToolResult {
-        self.result
+    /// Whether the tool completed successfully.
+    pub fn is_success(&self) -> bool {
+        matches!(self.settled_outcome(), ToolOutcome::Success(_))
+    }
+
+    /// Whether the tool was intentionally not executed.
+    pub fn is_skipped(&self) -> bool {
+        matches!(self.settled_outcome(), ToolOutcome::Skipped(_))
+    }
+
+    /// The failure when execution failed.
+    pub fn failure(&self) -> Option<&ToolFailure> {
+        match self.settled_outcome() {
+            ToolOutcome::Failure(failure) => Some(failure),
+            ToolOutcome::Success(_) | ToolOutcome::Skipped(_) => None,
+        }
+    }
+
+    /// The exact observation returned to the model.
+    pub fn model_output(&self) -> &bone_llm::ToolOutput {
+        self.settled_outcome().model_output()
+    }
+
+    fn settled_outcome(&self) -> &ToolOutcome {
+        self.outcome
             .as_ref()
             .expect("tool executions returned by Agent are settled")
     }

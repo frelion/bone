@@ -8,7 +8,8 @@ use std::{
     },
 };
 
-use rig_core::tool::{PortableTool, ToolExecutionError};
+use bone_agent::{Tool, ToolFailure};
+use bone_llm::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tempfile::NamedTempFile;
@@ -62,7 +63,7 @@ pub struct ApplyPatchTool {
 }
 
 impl ApplyPatchTool {
-    pub fn new(environment: ToolEnvironment) -> Self {
+    pub(crate) fn new(environment: ToolEnvironment) -> Self {
         Self {
             environment,
             #[cfg(test)]
@@ -71,41 +72,40 @@ impl ApplyPatchTool {
     }
 }
 
-impl PortableTool for ApplyPatchTool {
-    const NAME: &'static str = "apply_patch";
+impl Tool for ApplyPatchTool {
     type Args = ApplyPatchArgs;
     type Output = ApplyPatchOutput;
     type Error = ToolError;
 
-    fn description(&self) -> String {
-        format!(
-            "Apply file changes inside the workspace. Grammar: wrap operations in `{BEGIN_PATCH}` and `{END_PATCH}`; `*** Add File: PATH` is followed by `+` lines; `*** Delete File: PATH` deletes a file; `*** Update File: PATH` uses `@@` hunks with context lines prefixed by a space, removals by `-`, and additions by `+`; an optional `*** Move to: PATH` must immediately follow its Update header. Paths must be workspace-relative. Limits: {} UTF-8 patch bytes, {} file operations, {} bytes per existing file, and {} combined existing-file bytes.",
-            self.environment.limits.max_patch_bytes,
-            self.environment.limits.max_patch_files,
-            self.environment.limits.max_patch_file_bytes,
-            self.environment.limits.max_patch_total_bytes,
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "apply_patch",
+            format!(
+                "Apply file changes inside the workspace. Grammar: wrap operations in `{BEGIN_PATCH}` and `{END_PATCH}`; `*** Add File: PATH` is followed by `+` lines; `*** Delete File: PATH` deletes a file; `*** Update File: PATH` uses `@@` hunks with context lines prefixed by a space, removals by `-`, and additions by `+`; an optional `*** Move to: PATH` must immediately follow its Update header. Paths must be workspace-relative. Limits: {} UTF-8 patch bytes, {} file operations, {} bytes per existing file, and {} combined existing-file bytes.",
+                self.environment.limits.max_patch_bytes,
+                self.environment.limits.max_patch_files,
+                self.environment.limits.max_patch_file_bytes,
+                self.environment.limits.max_patch_total_bytes,
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": format!(
+                            "Codex-style patch document beginning with `*** Begin Patch` and ending with `*** End Patch`; limited to {} UTF-8 bytes",
+                            self.environment.limits.max_patch_bytes
+                        )
+                    }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
         )
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "patch": {
-                    "type": "string",
-                    "description": format!(
-                        "Codex-style patch document beginning with `*** Begin Patch` and ending with `*** End Patch`; limited to {} UTF-8 bytes",
-                        self.environment.limits.max_patch_bytes
-                    )
-                }
-            },
-            "required": ["patch"],
-            "additionalProperties": false
-        })
-    }
-
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        error.into_execution_error()
+    fn map_error(&self, error: Self::Error) -> ToolFailure {
+        error.into_tool_failure()
     }
 
     async fn call(&self, arguments: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -1630,7 +1630,7 @@ fn logical_line_count(content: &str) -> usize {
 mod tests {
     use std::path::Path;
 
-    use rig_core::tool::PortableTool;
+    use bone_agent::Tool;
 
     use super::*;
     use crate::ToolLimits;
@@ -2003,10 +2003,11 @@ mod tests {
 
         let operator_message = error.to_string();
         assert!(operator_message.contains(".bone-patch-recovery-"));
-        let execution_error = error.into_execution_error();
-        let model_feedback = execution_error.model_feedback().unwrap();
-        assert!(model_feedback.contains("original.txt"));
-        assert!(!model_feedback.contains(".bone-patch-recovery-"));
+        let failure = error.into_tool_failure();
+        assert_eq!(
+            failure.model_output(),
+            &bone_llm::ToolOutput::text("apply patch rollback failed for original.txt")
+        );
 
         let mut entries = tokio::fs::read_dir(temp.path()).await.unwrap();
         let mut recovered = None;
@@ -2219,7 +2220,8 @@ mod tests {
     #[test]
     fn schema_describes_the_byte_limit_without_a_character_max_length() {
         let temp = tempfile::tempdir().unwrap();
-        let parameters = tool(temp.path()).parameters();
+        let definition = tool(temp.path()).definition();
+        let parameters = definition.parameters();
 
         assert!(parameters.pointer("/properties/patch/maxLength").is_none());
         assert!(

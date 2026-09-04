@@ -2,22 +2,16 @@ use std::time::Duration;
 
 use bone_llm::{
     FinishReason, InputItem, InputSource, Model, Request, Response, ToolCall, ToolDefinition,
-};
-use rig_core::{
-    tool::{
-        PortableDynamicTool, PortableTool, ToolExecutionError, ToolOutput,
-        ToolResult as ExecutionToolResult,
-    },
-    wasm_compat::timeout,
+    ToolOutput,
 };
 use serde::Deserialize;
 use serde_json::json;
+use tokio::time::timeout;
 
 use crate::{
-    Action, ActionOutcome, AgentConfigError, AgentError,
-    action::{model_tool_output, normalize_tool_result},
+    Action, AgentConfigError, AgentError, Tool,
     runtime::{Limits, drive},
-    tools::{START_ACTION_TOOL, Tools, missing_tool},
+    tools::{START_ACTION_TOOL, Tools},
 };
 
 const AGENT_PROTOCOL: &str = "\
@@ -36,7 +30,10 @@ Tool failures are observations you may recover from. When the action is complete
 return a concise result for the parent agent. Do not address the user directly and \
 do not create further actions.";
 
-const PARENT_AGENT_SOURCE: &str = "parent-agent";
+const MAX_DECISIONS: usize = 32;
+const MAX_ACTIONS_PER_DECISION: usize = 8;
+
+pub(crate) const PARENT_AGENT_SOURCE: &str = "parent-agent";
 
 #[derive(Clone, Default)]
 struct AgentHistory {
@@ -64,17 +61,17 @@ impl AgentHistory {
         }
     }
 
-    fn push_tool_result(&mut self, call: &ToolCall, result: &ExecutionToolResult) {
+    fn push_tool_result(&mut self, call: &ToolCall, output: &ToolOutput) {
         self.input
-            .push(InputItem::tool_result(call, model_tool_output(result)));
+            .push(InputItem::tool_result(call, output.clone()));
+        let summary = output
+            .as_text()
+            .map(str::to_owned)
+            .or_else(|| output.as_json().map(ToString::to_string))
+            .expect("agent control results are text or JSON");
         self.action_context.push(InputItem::external(
             InputSource::Named(PARENT_AGENT_SOURCE.to_owned()),
-            format!(
-                "Tool `{}` returned ({}): {}",
-                call.name(),
-                result.status_name(),
-                result.output().render()
-            ),
+            format!("Tool `{}` returned: {summary}", call.name()),
         ));
     }
 }
@@ -120,28 +117,16 @@ impl Agent {
         self
     }
 
-    /// Register a typed Rig portable tool.
+    /// Register a typed tool for actions created by this agent.
     ///
     /// The tool future must not block its executor thread. It may be dropped
     /// on cancellation or timeout and must not leave effects or cleanup that
     /// can conflict with a later Turn.
     pub fn tool<T>(mut self, tool: T) -> Result<Self, AgentConfigError>
     where
-        T: PortableTool + 'static,
-        T::Args: 'static,
-        T::Output: 'static,
+        T: Tool + 'static,
     {
         self.tools.register(tool)?;
-        Ok(self)
-    }
-
-    /// Register an already type-erased Rig portable tool.
-    ///
-    /// The tool future must not block its executor thread. It may be dropped
-    /// on cancellation or timeout and must not leave effects or cleanup that
-    /// can conflict with a later Turn.
-    pub fn dynamic_tool(mut self, tool: PortableDynamicTool) -> Result<Self, AgentConfigError> {
-        self.tools.register_dynamic(tool)?;
         Ok(self)
     }
 
@@ -234,14 +219,8 @@ struct StartAction {
 }
 
 enum ActionStart {
-    Accepted {
-        call: ToolCall,
-        action: usize,
-    },
-    Rejected {
-        call: ToolCall,
-        result: ExecutionToolResult,
-    },
+    Accepted { call: ToolCall, action: usize },
+    Rejected { call: ToolCall, output: ToolOutput },
 }
 
 async fn drive_agent(
@@ -257,8 +236,7 @@ async fn drive_agent(
     let action_instructions = combined_instructions(instructions, ACTION_PROTOCOL);
     let mut completed_actions = Vec::new();
 
-    for _ in 0..limits.max_decisions {
-        let action_context = history.action_context.clone();
+    for _ in 0..MAX_DECISIONS {
         let response = complete_agent(
             model,
             &history.input,
@@ -288,76 +266,75 @@ async fn drive_agent(
             });
         }
 
-        if calls.len() > limits.max_actions_per_decision {
+        if calls.len() > MAX_ACTIONS_PER_DECISION {
             return Err(AgentError::ActionLimit {
                 requested: calls.len(),
-                limit: limits.max_actions_per_decision,
+                limit: MAX_ACTIONS_PER_DECISION,
             });
         }
-        history.push_response(&response);
         let mut actions = Vec::new();
         let starts = calls
             .into_iter()
-            .map(|call| match action_from_call(&call, &action_context) {
-                Ok(action) => {
-                    let index = actions.len();
-                    actions.push(action);
-                    ActionStart::Accepted {
-                        call,
-                        action: index,
+            .map(
+                |call| match action_from_call(&call, &history.action_context) {
+                    Ok(action) => {
+                        let index = actions.len();
+                        actions.push(action);
+                        ActionStart::Accepted {
+                            call,
+                            action: index,
+                        }
                     }
-                }
-                Err(result) => ActionStart::Rejected { call, result },
-            })
+                    Err(output) => ActionStart::Rejected { call, output },
+                },
+            )
             .collect::<Vec<_>>();
+        history.push_response(&response);
 
         let actions = drive(model, Some(&action_instructions), tools, limits, actions).await;
         for start in starts {
-            let (call, result) = match start {
+            let (call, output) = match start {
                 ActionStart::Accepted { call, action } => (call, action_result(&actions[action])),
-                ActionStart::Rejected { call, result } => (call, result),
+                ActionStart::Rejected { call, output } => (call, output),
             };
-            history.push_tool_result(&call, &normalize_tool_result(result));
+            history.push_tool_result(&call, &output);
         }
         completed_actions.extend(actions);
     }
 
     Err(AgentError::DecisionLimit {
-        limit: limits.max_decisions,
+        limit: MAX_DECISIONS,
     })
 }
 
-fn action_from_call(call: &ToolCall, context: &[InputItem]) -> Result<Action, ExecutionToolResult> {
+fn action_from_call(call: &ToolCall, context: &[InputItem]) -> Result<Action, ToolOutput> {
     if call.name() != START_ACTION_TOOL {
-        return Err(missing_tool(call.name()));
+        return Err(ToolOutput::text(format!(
+            "tool `{}` is not registered",
+            call.name()
+        )));
     }
 
     let request =
         serde_json::from_value::<StartAction>(call.arguments().clone()).map_err(|_| {
-            ExecutionToolResult::failed(ToolExecutionError::invalid_args(
+            ToolOutput::text(
                 "start_action arguments must contain only a non-empty string field named `intent`",
-            ))
+            )
         })?;
     let intent = request.intent.trim();
     if intent.is_empty() {
-        return Err(ExecutionToolResult::failed(
-            ToolExecutionError::invalid_args("action intent must not be empty"),
-        ));
+        return Err(ToolOutput::text("action intent must not be empty"));
     }
 
     Ok(Action::with_context(intent, context.to_vec()))
 }
 
-fn action_result(action: &Action) -> ExecutionToolResult {
-    let value = match action.outcome() {
-        ActionOutcome::Completed { output } => {
-            json!({ "status": "completed", "output": output })
-        }
-        ActionOutcome::Failed(error) => {
-            json!({ "status": "failed", "error": error.to_string() })
-        }
+fn action_result(action: &Action) -> ToolOutput {
+    let value = match action.result() {
+        Ok(output) => json!({ "status": "completed", "output": output }),
+        Err(error) => json!({ "status": "failed", "error": error.to_string() }),
     };
-    ExecutionToolResult::success(ToolOutput::json(value))
+    ToolOutput::json(value)
 }
 
 async fn complete_agent(
