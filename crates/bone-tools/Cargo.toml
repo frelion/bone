@@ -6,7 +6,6 @@ description = "Provider-independent built-in tools for BONE agents"
 publish = false
 
 [dependencies]
-bone-agent = { path = "../bone-agent" }
 bone-config = { path = "../bone-config" }
 bone-llm = { path = "../bone-llm" }
 globset.workspace = true

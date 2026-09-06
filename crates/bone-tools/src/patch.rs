@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use bone_agent::{Tool, ToolFailure};
+use crate::{Tool, ToolFailure};
 use bone_llm::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1630,7 +1630,7 @@ fn logical_line_count(content: &str) -> usize {
 mod tests {
     use std::path::Path;
 
-    use bone_agent::Tool;
+    use crate::Tool;
 
     use super::*;
     use crate::ToolLimits;

@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use bone_agent::{Tool, ToolFailure};
+use crate::{Tool, ToolFailure};
 use bone_llm::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -620,7 +620,7 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) -> bool {
 mod tests {
     use std::time::Instant;
 
-    use bone_agent::Tool;
+    use crate::Tool;
 
     use super::*;
     use crate::ToolLimits;

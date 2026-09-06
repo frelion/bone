@@ -1,6 +1,6 @@
 use std::{fmt, str::FromStr, sync::Arc};
 
-use bone_agent::{Tool, ToolFailure, ToolFailureKind};
+use crate::{Tool, ToolFailure, ToolFailureKind};
 use bone_config::{ConfigError, ConfigManager, ConfigRevision};
 use bone_llm::{ToolDefinition, ToolOutput};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -530,7 +530,7 @@ fn execute(
 
 #[cfg(test)]
 mod tests {
-    use bone_agent::Tool;
+    use crate::Tool;
     use bone_config::ConfigSection;
     use serde::{Deserialize, Serialize};
 

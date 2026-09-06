@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
-use bone_agent::{Tool, ToolFailure};
+use crate::{Tool, ToolFailure};
 use bone_llm::ToolDefinition;
 use globset::{GlobBuilder, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
@@ -269,7 +269,7 @@ fn run_glob(
 mod tests {
     use std::fs;
 
-    use bone_agent::Tool;
+    use crate::Tool;
 
     use super::*;
 

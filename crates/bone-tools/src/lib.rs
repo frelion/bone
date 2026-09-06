@@ -1,12 +1,12 @@
 //! Provider-independent built-in tools for coding agents.
 //!
-//! Every tool implements [`bone_agent::Tool`]. Local coding tools
+//! Every tool implements [`Tool`]. Local coding tools
 //! capture an immutable workspace boundary plus execution limits; Bash also
 //! captures its sanitized or explicitly configured child environment. The
 //! config tool instead captures a registered [`bone_config::ConfigManager`]
 //! and a model-output limit. Registration, authorization, approval, lifecycle
 //! state, and provider translation remain outside this crate.
-//! Native tool calls require an active Tokio runtime; [`bone_agent::Tool`]
+//! Native tool calls require an active Tokio runtime; [`Tool`]
 //! describes BONE's execution contract, not executor independence.
 //!
 //! The workspace checks prevent ordinary path escape, but are not an operating
@@ -24,6 +24,7 @@ mod grep;
 mod patch;
 mod read;
 mod search_walk;
+mod tool;
 mod workspace;
 
 pub use bash::{BashArgs, BashOutput, BashTool};
@@ -35,3 +36,4 @@ pub use glob::{GlobArgs, GlobOutput, GlobTool};
 pub use grep::{GrepArgs, GrepMatch, GrepOutput, GrepTool};
 pub use patch::{ApplyPatchArgs, ApplyPatchChange, ApplyPatchOutput, ApplyPatchTool};
 pub use read::{ReadArgs, ReadOutput, ReadTool};
+pub use tool::{Tool, ToolFailure, ToolFailureKind};

@@ -1,6 +1,6 @@
 use std::io;
 
-use bone_agent::{ToolFailure, ToolFailureKind};
+use crate::{ToolFailure, ToolFailureKind};
 use bone_llm::ToolOutput;
 use thiserror::Error;
 

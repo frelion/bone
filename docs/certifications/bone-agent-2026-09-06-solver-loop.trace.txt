@@ -1,0 +1,55 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.82s
+     Running tests/live_agent.rs (target/debug/deps/live_agent-3c02b94dd275e4c9)
+
+running 1 test
+Input reviewer: gpt-5.6-terra; solver: gpt-5.6-sol
++  0.00s accepted input 1
++  0.00s job 1 started: Work { messages: [MessageId(1)] }
++  4.87s job 1 finished: ok
++  4.87s job 2 started: Tool(ToolCall { name: "read", arguments: Object {"path": String("proof.txt")} })
++  4.87s job 2 finished: ok
++  4.87s job 3 started: Work { messages: [] }
++ 10.34s job 3 finished: ok
++ 10.34s reply: bone-proof-.tmplgRTaE
++ 10.34s Finished { cleanup: [] }
+PASS: real solver -> native read -> solver answer, zero input reviews
++  0.00s accepted input 1
++  0.00s job 1 started: Work { messages: [MessageId(1)] }
++  0.00s accepted input 2
++  0.00s job 2 started: ReviewInput { messages: [MessageId(2)] }
++  2.72s job 2 finished: ok
++  2.72s reply: Work is in progress; no changes or restart requested.
+status reply received; first Work provider request returned = false (delivery remains gated)
++  2.73s accepted input 3
++  2.73s job 3 started: ReviewInput { messages: [MessageId(3)] }
++  6.29s job 3 finished: ok
++  6.29s reply: Yes, it is still in progress.
+status reply received; first Work provider request returned = false (delivery remains gated)
+PASS: real reviews answer status with Keep; original Work JobId is unchanged
++  6.29s accepted input 4
++  6.29s job 4 started: ReviewInput { messages: [MessageId(4)] }
++ 10.69s job 1 finished: ok
++ 10.69s job 4 finished: ok
++ 10.69s job 5 started: Work { messages: [MessageId(1), MessageId(4)] }
++ 18.46s job 5 finished: ok
++ 18.46s reply: Selected: B—a durable append-only log with a single state owner—provides deterministic replay and strong crash recovery from the last committed state. Redelivery after recovery can still cause duplicates, so commands need stable IDs and idempotent application or recorded outcomes. Cancellation should be another ordered log entry, with already-running work requiring cooperative interruption. A single owner preserves total ordering, though failover must prevent concurrent owners through fencing or consensus.
++ 18.46s Finished { cleanup: [] }
+PASS: real A result retained as material; no stale A reply; solver delivers B
++  0.00s accepted input 1
++  0.00s job 1 started: Work { messages: [MessageId(1)] }
++  0.01s accepted input 2
++  0.01s job 2 started: ReviewInput { messages: [MessageId(2)] }
++  0.01s Stopped
+PASS: Stop releases both local provider calls without reviving old work
++  0.01s accepted input 3
++  0.01s job 1 finished: Cancelled: cancellation acknowledged
++  0.01s job 2 finished: Cancelled: cancellation acknowledged
++  0.01s job 3 started: Work { messages: [MessageId(3)] }
++  3.94s job 3 finished: ok
++  3.94s reply: WELCOME
++  3.94s Finished { cleanup: [] }
+PASS: post-stop conversation stays open without restarting old work
+test real_models_read_interrupt_change_direction_and_stop ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.07s

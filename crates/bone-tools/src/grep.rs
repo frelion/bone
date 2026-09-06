@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use bone_agent::{Tool, ToolFailure};
+use crate::{Tool, ToolFailure};
 use bone_llm::ToolDefinition;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use grep_regex::RegexMatcherBuilder;
@@ -783,7 +783,7 @@ fn match_kind_rank(kind: &str) -> u8 {
 mod tests {
     use std::fs;
 
-    use bone_agent::Tool;
+    use crate::Tool;
 
     use super::*;
 
@@ -1104,20 +1104,32 @@ mod tests {
         }
         binary.extend_from_slice(b"\0late binary marker\n");
         fs::write(temp.path().join("a-binary.dat"), binary).unwrap();
-        fs::write(temp.path().join("z-text.txt"), "needle text\n").unwrap();
 
-        let output = ToolEnvironment::new(temp.path())
-            .unwrap()
-            .grep()
+        let tool = ToolEnvironment::new(temp.path()).unwrap().grep();
+        let arguments = GrepArgs {
+            pattern: "needle".to_owned(),
+            path: None,
+            glob: None,
+            literal: false,
+            case_insensitive: false,
+            include_hidden: false,
+            limit: Some(1),
+            context: None,
+        };
+        // With only the binary file, the NUL must be discovered even after
+        // reaching the match limit, and earlier matches must be rolled back.
+        let binary_only = tool.call(arguments.clone()).await.unwrap();
+        assert_eq!(binary_only.binary_files_skipped, 1);
+        assert_eq!(binary_only.match_count, 0);
+        assert!(binary_only.matches.is_empty());
+
+        // Permit both files to be visited in either filesystem order. Binary
+        // matches must not consume the quota for the valid text file.
+        fs::write(temp.path().join("z-text.txt"), "needle text\n").unwrap();
+        let output = tool
             .call(GrepArgs {
-                pattern: "needle".to_owned(),
-                path: None,
-                glob: None,
-                literal: false,
-                case_insensitive: false,
-                include_hidden: false,
-                limit: Some(1),
-                context: None,
+                limit: Some(2),
+                ..arguments
             })
             .await
             .unwrap();
@@ -1213,7 +1225,7 @@ mod tests {
         assert_eq!(output.searched_files, 1);
         assert_eq!(output.searched_bytes, 7);
         assert_eq!(output.match_count, 1);
-        assert_eq!(output.matches[0].path, "a.txt");
+        assert!(matches!(output.matches[0].path.as_str(), "a.txt" | "b.txt"));
         assert!(output.truncated);
     }
 }

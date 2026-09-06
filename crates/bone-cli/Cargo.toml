@@ -11,12 +11,16 @@ path = "src/main.rs"
 
 [dependencies]
 bone-agent = { path = "../bone-agent" }
+bone-config = { path = "../bone-config" }
 bone-llm = { path = "../bone-llm" }
 bone-tools = { path = "../bone-tools" }
-tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 bone-llm = { path = "../bone-llm", features = ["test-utils"] }
 rig-core = { workspace = true, features = ["test-utils"] }
-serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

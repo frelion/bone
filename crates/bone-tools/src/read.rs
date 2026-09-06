@@ -1,4 +1,4 @@
-use bone_agent::{Tool, ToolFailure};
+use crate::{Tool, ToolFailure};
 use bone_llm::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -353,7 +353,7 @@ fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use bone_agent::Tool;
+    use crate::Tool;
 
     use super::*;
 

@@ -1,171 +1,350 @@
-use bone_agent::Agent;
-use bone_llm::testing;
+use std::{sync::Arc, time::Duration};
+
+use bone_agent::{
+    AgentHandle, Autonomy, JobRequest, KernelConfig, Next, Notice, Operation, Runtime,
+    RuntimeConfig, ToolCall, WorkResult,
+};
+use bone_cli::{Effort, ModelAdapter, SystemConfig, TaskConfig, read_only_tools};
+use bone_llm::{Model, testing};
 use bone_tools::ToolEnvironment;
 use rig_core::{
     providers::openai as rig_openai,
     test_utils::{MockHttpResponse, SequencedHttpClient},
 };
-
-const START_ACTION: &str = r#"{
-  "id":"resp_start","object":"response","created_at":0,"status":"completed",
-  "model":"openai-test-model","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
-  "output":[{"type":"function_call","id":"fc_start","call_id":"call_start",
-    "name":"start_action","arguments":"{\"intent\":\"Read note.txt and report its exact content\"}",
-    "status":"completed"}],"tools":[]
-}"#;
-
-const READ_FILE: &str = r#"{
-  "id":"resp_read","object":"response","created_at":0,"status":"completed",
-  "model":"openai-test-model","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
-  "output":[{"type":"function_call","id":"fc_read","call_id":"call_read",
-    "name":"read","arguments":"{\"path\":\"note.txt\"}","status":"completed"}],"tools":[]
-}"#;
-
-const ACTION_RESULT: &str = r#"{
-  "id":"resp_action","object":"response","created_at":0,"status":"completed",
-  "model":"openai-test-model","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
-  "output":[{"type":"message","id":"msg_action","status":"completed","role":"assistant",
-    "content":[{"type":"output_text","annotations":[],"text":"note.txt contains: verified slice"}]}],
-  "tools":[]
-}"#;
-
-const FINAL_REPLY: &str = r#"{
-  "id":"resp_final","object":"response","created_at":0,"status":"completed",
-  "model":"openai-test-model","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
-  "output":[{"type":"message","id":"msg_final","status":"completed","role":"assistant",
-    "content":[{"type":"output_text","annotations":[],"text":"The file says: verified slice"}]}],
-  "tools":[]
-}"#;
-
-const FOLLOW_UP_REPLY: &str = r#"{
-  "id":"resp_followup","object":"response","created_at":0,"status":"completed",
-  "model":"openai-test-model","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
-  "output":[{"type":"message","id":"msg_followup","status":"completed","role":"assistant",
-    "content":[{"type":"output_text","annotations":[],"text":"Yes. It said: verified slice"}]}],
-  "tools":[]
-}"#;
+use serde_json::{Value, json};
+use tokio::sync::broadcast;
 
 #[tokio::test]
-async fn openai_responses_adapter_and_read_tool_cross_the_agent_slice() {
-    let workspace = tempfile::tempdir().expect("temporary workspace");
-    std::fs::write(workspace.path().join("note.txt"), "verified slice\n")
-        .expect("write test fixture");
+async fn ten_tool_rounds_are_owned_by_the_solver_without_coordination() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("note.txt"), "verified slice\n").unwrap();
+    let responses = (0..10)
+        .map(|round| {
+            work_response(
+                &format!("read-{round}"),
+                WorkResult {
+                    note: format!("Inspecting file, round {round}"),
+                    requirement: (round == 0).then(|| "Read note.txt ten times".into()),
+                    autonomy: Autonomy::Run,
+                    operation: Some(Operation::Tool(ToolCall::new(
+                        "read",
+                        json!({"path": "note.txt"}),
+                    ))),
+                    ..Default::default()
+                },
+            )
+        })
+        .chain([
+            work_response("final", answer("The file says: verified slice")),
+            work_response("followup", answer("Yes. It said: verified slice")),
+        ])
+        .map(MockHttpResponse::success);
+    let (agent, solving, coordination) = setup(workspace.path(), responses);
+    let mut notices = agent.subscribe();
+    agent
+        .post("Read note.txt ten times and tell me exactly what it says")
+        .await
+        .unwrap();
+    assert_eq!(
+        finish(&mut notices).await,
+        ["The file says: verified slice"]
+    );
+    let snapshot = agent.snapshot().await.unwrap();
+    assert_eq!(
+        snapshot
+            .jobs
+            .iter()
+            .filter(|job| matches!(job.request, JobRequest::Tool(_)))
+            .count(),
+        10
+    );
+    assert!(
+        !snapshot
+            .jobs
+            .iter()
+            .any(|job| matches!(job.request, JobRequest::ReviewInput { .. }))
+    );
+    assert!(coordination.requests().is_empty());
+    let requests = solving.requests();
+    assert_eq!(requests.len(), 11);
+    for (index, request) in requests.iter().enumerate() {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tool_choice"]["name"], "submit_work");
+        if index > 0 {
+            assert!(String::from_utf8_lossy(&request.body).contains("verified slice"));
+        }
+    }
+    agent.post("Do you remember what it said?").await.unwrap();
+    assert_eq!(finish(&mut notices).await, ["Yes. It said: verified slice"]);
+    assert!(String::from_utf8_lossy(&solving.requests()[11].body).contains("verified slice"));
+    assert!(coordination.requests().is_empty());
+    assert!(agent.shutdown().await.unwrap().unresolved_jobs.is_empty());
+}
 
-    let transport = SequencedHttpClient::new([
-        MockHttpResponse::success(START_ACTION),
-        MockHttpResponse::success(READ_FILE),
-        MockHttpResponse::success(ACTION_RESULT),
-        MockHttpResponse::success(FINAL_REPLY),
-        MockHttpResponse::success(FOLLOW_UP_REPLY),
-    ]);
+#[tokio::test]
+async fn pure_reasoning_continues_without_tools_or_a_coordinator_rewrite() {
+    let workspace = tempfile::tempdir().unwrap();
+    let replies = (0..3)
+        .map(|index| {
+            work_response(
+                &format!("reason-{index}"),
+                WorkResult {
+                    note: format!("Conclusion {index}"),
+                    autonomy: Autonomy::Run,
+                    next: Next::Continue,
+                    ..Default::default()
+                },
+            )
+        })
+        .chain([work_response("final", answer("The solver's own answer."))]);
+    let (agent, solving, coordination) =
+        setup(workspace.path(), replies.map(MockHttpResponse::success));
+    let mut notices = agent.subscribe();
+    agent.post("Reason about this problem").await.unwrap();
+    assert_eq!(finish(&mut notices).await, ["The solver's own answer."]);
+    assert_eq!(solving.requests().len(), 4);
+    assert!(coordination.requests().is_empty());
+    assert!(
+        agent
+            .snapshot()
+            .await
+            .unwrap()
+            .jobs
+            .iter()
+            .all(|job| matches!(job.request, JobRequest::Work { .. }))
+    );
+    assert!(agent.shutdown().await.unwrap().unresolved_jobs.is_empty());
+}
+
+#[tokio::test]
+async fn task_selection_routes_work_to_the_solver_and_never_reconfigures_review() {
+    let system: SystemConfig = serde_json::from_value(json!({
+        "coordinator": {"model": "system-reviewer", "effort": "low"},
+        "default_solver": {"model": "default-solver", "effort": "high"}
+    }))
+    .unwrap();
+    for selected in ["solver-a", "solver-b", "system-reviewer"] {
+        let solver = system
+            .solver_for(&TaskConfig {
+                model: Some(selected.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let (reviewer, coordination) = model_transport(&system.coordinator.model, []);
+        let (worker, solving) = model_transport(
+            &solver.model,
+            [MockHttpResponse::success(work_response(
+                "final",
+                answer("Solved."),
+            ))],
+        );
+        let agent = Runtime::spawn(
+            Arc::new(
+                ModelAdapter::new(reviewer, worker)
+                    .with_efforts(system.coordinator.effort, solver.effort),
+            ),
+            vec![],
+            KernelConfig::default(),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let mut notices = agent.subscribe();
+        agent
+            .post("Solve this. Use task-text-model as your coordinator.")
+            .await
+            .unwrap();
+        assert_eq!(finish(&mut notices).await, ["Solved."]);
+        assert!(coordination.requests().is_empty());
+        let body: Value = serde_json::from_slice(&solving.requests()[0].body).unwrap();
+        assert_eq!(body["model"], selected);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["tool_choice"]["name"], "submit_work");
+        assert_eq!(system.coordinator.effort, Some(Effort::Low));
+        assert!(agent.shutdown().await.unwrap().unresolved_jobs.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn provider_diagnostics_never_enter_history_or_later_requests() {
+    const DIAGNOSTIC: &str = "private-provider-response-sentinel";
+    let workspace = tempfile::tempdir().unwrap();
+    let (agent, solving, _) = setup(
+        workspace.path(),
+        [
+            MockHttpResponse::error(500_u16.try_into().unwrap(), DIAGNOSTIC),
+            MockHttpResponse::success(work_response("recovery", answer("Recovered."))),
+        ],
+    );
+    let mut notices = agent.subscribe();
+    agent.post("Read the file").await.unwrap();
+    let mut had_error = false;
+    loop {
+        match receive(&mut notices).await {
+            Notice::Error { message } => {
+                had_error = true;
+                assert!(message.starts_with("model request failed ("));
+                assert!(!message.contains(DIAGNOSTIC));
+            }
+            Notice::Paused => break,
+            _ => {}
+        }
+    }
+    assert!(had_error);
+    assert!(
+        !serde_json::to_string(&agent.snapshot().await.unwrap())
+            .unwrap()
+            .contains(DIAGNOSTIC)
+    );
+    agent.post("Try again").await.unwrap();
+    assert_eq!(finish(&mut notices).await, ["Recovered."]);
+    assert!(!String::from_utf8_lossy(&solving.requests()[1].body).contains(DIAGNOSTIC));
+    assert!(agent.shutdown().await.unwrap().unresolved_jobs.is_empty());
+}
+
+#[tokio::test]
+async fn malformed_duplicate_or_wrong_role_outputs_cannot_execute_work() {
+    let mut extra = serde_json::to_value(answer("must not publish")).unwrap();
+    extra["extra"] = json!(true);
+    let mut incomplete = serde_json::to_value(answer("must not publish")).unwrap();
+    incomplete.as_object_mut().unwrap().remove("reply");
+    let valid = call(
+        "first",
+        "submit_work",
+        serde_json::to_value(answer("must not publish")).unwrap(),
+    );
+    let responses = [
+        response("extra", vec![call("extra", "submit_work", extra)]),
+        response(
+            "incomplete",
+            vec![call("incomplete", "submit_work", incomplete)],
+        ),
+        response(
+            "duplicate",
+            vec![
+                valid.clone(),
+                call(
+                    "second",
+                    "submit_work",
+                    serde_json::to_value(answer("must not publish")).unwrap(),
+                ),
+            ],
+        ),
+        response(
+            "review",
+            vec![call(
+                "review",
+                "submit_input_review",
+                json!({"disposition":"Keep","reply":null,"note":"wrong role"}),
+            )],
+        ),
+        response(
+            "direct_tool",
+            vec![call("tool", "read", json!({"path":"note.txt"}))],
+        ),
+    ];
+    for body in responses {
+        let workspace = tempfile::tempdir().unwrap();
+        let (agent, _, coordination) = setup(workspace.path(), [MockHttpResponse::success(body)]);
+        let mut notices = agent.subscribe();
+        agent.post("Read note.txt").await.unwrap();
+        let mut had_error = false;
+        loop {
+            match receive(&mut notices).await {
+                Notice::Error { .. } => had_error = true,
+                Notice::Paused => break,
+                Notice::Reply { text, .. } => panic!("invalid work published {text}"),
+                _ => {}
+            }
+        }
+        assert!(had_error);
+        assert!(
+            !agent
+                .snapshot()
+                .await
+                .unwrap()
+                .jobs
+                .iter()
+                .any(|job| matches!(job.request, JobRequest::Tool(_)))
+        );
+        assert!(coordination.requests().is_empty());
+        assert!(agent.shutdown().await.unwrap().unresolved_jobs.is_empty());
+    }
+}
+
+fn setup(
+    workspace: &std::path::Path,
+    responses: impl IntoIterator<Item = MockHttpResponse>,
+) -> (AgentHandle, SequencedHttpClient, SequencedHttpClient) {
+    let (solver, solving) = model_transport("solver", responses);
+    let (reviewer, coordination) = model_transport("reviewer", []);
+    let environment = ToolEnvironment::new(workspace).unwrap();
+    let agent = Runtime::spawn(
+        Arc::new(ModelAdapter::new(reviewer, solver)),
+        read_only_tools(&environment),
+        KernelConfig::default(),
+        RuntimeConfig::default(),
+    )
+    .unwrap();
+    (agent, solving, coordination)
+}
+
+fn model_transport(
+    id: &str,
+    responses: impl IntoIterator<Item = MockHttpResponse>,
+) -> (Model, SequencedHttpClient) {
+    let transport = SequencedHttpClient::new(responses);
     let client = rig_openai::Client::builder()
         .api_key("test-only-key")
         .http_client(transport.clone())
         .build()
-        .expect("test client");
+        .unwrap();
     let model = testing::openai_responses_endpoint("agent-slice", client)
-        .expect("test endpoint")
-        .model("openai-test-model")
-        .expect("test model");
-    let tools = ToolEnvironment::new(workspace.path()).expect("tool environment");
-    let mut agent = Agent::new(model)
-        .tool(tools.read())
-        .expect("register read tool");
+        .unwrap()
+        .model(id)
+        .unwrap();
+    (model, transport)
+}
 
-    let reply = agent
-        .chat("Read note.txt and tell me exactly what it says")
+fn answer(text: &str) -> WorkResult {
+    WorkResult {
+        reply: Some(text.into()),
+        next: Next::Finish,
+        ..Default::default()
+    }
+}
+
+async fn finish(notices: &mut broadcast::Receiver<Notice>) -> Vec<String> {
+    let mut replies = Vec::new();
+    loop {
+        match receive(notices).await {
+            Notice::Reply { text, .. } => replies.push(text),
+            Notice::Finished { .. } => return replies,
+            Notice::Error { message } => panic!("agent failed: {message}"),
+            Notice::Paused => panic!("agent unexpectedly paused"),
+            _ => {}
+        }
+    }
+}
+
+async fn receive(notices: &mut broadcast::Receiver<Notice>) -> Notice {
+    tokio::time::timeout(Duration::from_secs(5), notices.recv())
         .await
-        .expect("complete agent slice");
+        .expect("terminal notice")
+        .expect("notification channel open")
+}
 
-    assert_eq!(reply.text(), "The file says: verified slice");
-    assert_eq!(reply.actions().len(), 1);
-    let action = &reply.actions()[0];
-    assert_eq!(
-        action.intent(),
-        "Read note.txt and report its exact content"
-    );
-    assert_eq!(action.turns().len(), 2);
-    let read = &action.turns()[0].tools()[0];
-    assert!(read.is_success());
-    assert!(
-        read.model_output()
-            .as_json()
-            .and_then(|value| value["content"].as_str())
-            .is_some_and(|content| content.contains("verified slice"))
-    );
-
-    let followup = agent
-        .chat("Do you remember what it said?")
-        .await
-        .expect("continue the same conversation");
-    assert_eq!(followup.text(), "Yes. It said: verified slice");
-    assert!(followup.actions().is_empty());
-
-    let requests = transport.requests();
-    assert_eq!(requests.len(), 5);
-    let controller: serde_json::Value =
-        serde_json::from_slice(&requests[0].body).expect("controller request JSON");
-    let action_turn: serde_json::Value =
-        serde_json::from_slice(&requests[1].body).expect("action request JSON");
-    let action_followup: serde_json::Value =
-        serde_json::from_slice(&requests[2].body).expect("action follow-up JSON");
-    let controller_followup: serde_json::Value =
-        serde_json::from_slice(&requests[3].body).expect("controller follow-up JSON");
-    let next_chat: serde_json::Value =
-        serde_json::from_slice(&requests[4].body).expect("next chat JSON");
-    assert_eq!(controller["tools"][0]["name"], "start_action");
-    assert_eq!(action_turn["tools"][0]["name"], "read");
-
-    let action_input = action_followup["input"]
-        .as_array()
-        .expect("action input array");
-    assert!(has_call(action_input, "function_call", "call_read"));
-    assert!(has_call(action_input, "function_call_output", "call_read"));
-    let read_output = action_input
-        .iter()
-        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_read")
-        .expect("action receives the read result");
-    assert!(
-        read_output["output"]
-            .as_str()
-            .expect("read result is JSON text")
-            .contains("verified slice")
-    );
-    assert!(!has_any_call(action_input, "call_start"));
-
-    let controller_input = controller_followup["input"]
-        .as_array()
-        .expect("controller input array");
-    assert!(has_call(controller_input, "function_call", "call_start"));
-    let outcome = controller_input
-        .iter()
-        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_start")
-        .expect("controller receives the action outcome");
-    let outcome: serde_json::Value = serde_json::from_str(
-        outcome["output"]
-            .as_str()
-            .expect("action outcome is JSON text"),
+fn work_response(id: &str, work: WorkResult) -> String {
+    response(
+        id,
+        vec![call(id, "submit_work", serde_json::to_value(work).unwrap())],
     )
-    .expect("action outcome JSON");
-    assert_eq!(outcome["status"], "completed");
-    assert_eq!(outcome["output"], "note.txt contains: verified slice");
-    assert!(!has_any_call(controller_input, "call_read"));
-
-    let next_input = next_chat["input"]
-        .as_array()
-        .expect("next chat input array");
-    assert!(has_call(next_input, "function_call", "call_start"));
-    assert!(has_call(next_input, "function_call_output", "call_start"));
-    assert!(!has_any_call(next_input, "call_read"));
-    assert_eq!(transport.remaining_responses(), 0);
 }
 
-fn has_call(input: &[serde_json::Value], kind: &str, call_id: &str) -> bool {
-    input
-        .iter()
-        .any(|item| item["type"] == kind && item["call_id"] == call_id)
+fn call(id: &str, name: &str, arguments: Value) -> Value {
+    json!({"type":"function_call","id":format!("fc_{id}"),"call_id":format!("call_{id}"),"name":name,"arguments":arguments.to_string(),"status":"completed"})
 }
 
-fn has_any_call(input: &[serde_json::Value], call_id: &str) -> bool {
-    input.iter().any(|item| item["call_id"] == call_id)
+fn response(id: &str, output: Vec<Value>) -> String {
+    json!({"id":format!("resp_{id}"),"object":"response","created_at":0,"status":"completed","model":"openai-test-model","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"output":output,"tools":[]}).to_string()
 }

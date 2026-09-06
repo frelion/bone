@@ -5,12 +5,11 @@ implementations. The boundary has one owner at each layer:
 
 - `bone-llm` owns the model-facing tool definition, call, output, and replay
   protocol;
-- `bone-agent` owns the executable `Tool` interface, registration, timeouts,
-  and scheduling;
-- `bone-tools` implements that interface for local filesystem, process, and
-  configuration operations.
+- `bone-tools` owns the typed native `Tool` interface and its filesystem,
+  process, and configuration implementations;
+- `bone-agent` owns asynchronous job execution through its `ToolPort`.
 
-`bone-cli` is the composition root: it creates a model and concrete tools, then
+`bone-cli` is the composition root: it configures coordinator and solver models and concrete tools, then
 registers those tools with the Agent. `bone-agent` does not depend on the
 built-in implementations. In production code, Rig is confined to `bone-llm`.
 
@@ -34,11 +33,10 @@ The first tool set is deliberately small:
   non-secret configuration sections using optimistic revisions. Credentials
   are deliberately unavailable to the model.
 
-Every built-in implements the single `bone_agent::Tool` execution interface.
-The Agent obtains its model-facing definition and calls it with the JSON
-arguments produced by `bone-llm`; there is no second dynamic registration API
-or provider-specific tool type. The local coding tools capture an immutable
-workspace root and shared hard limits:
+Every built-in implements `bone_tools::Tool`. The CLI adapts the read-only
+tools to `bone_agent::ToolPort`, converting validated JSON arguments and typed
+outputs at that boundary. An adapter supplies trusted external-effect metadata.
+The local coding tools capture an immutable workspace root and shared hard limits:
 
 ```rust,no_run
 use bone_tools::ToolEnvironment;
@@ -62,8 +60,9 @@ the registration set an explicit model-facing allowlist.
 
 Native tool calls must run inside an active Tokio runtime. The BONE `Tool`
 interface does not make these filesystem and process implementations
-executor-agnostic: `bone-agent` schedules calls and applies its runtime timeout,
-while an implementation may enforce a shorter domain-specific deadline. Bash
+executor-agnostic: `bone-agent` schedules calls and sends cooperative cancellation,
+while each implementation may enforce a domain-specific deadline. The agent's
+soft reminder prompts reconsideration without declaring a tool failed. Bash
 uses a sanitized default child environment. A runtime that needs a fully
 explicit replacement can construct it separately:
 

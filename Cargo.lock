@@ -99,12 +99,9 @@ dependencies = [
 name = "bone-agent"
 version = "0.1.0"
 dependencies = [
- "bone-llm",
  "futures-util",
- "rig-core",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror",
  "tokio",
 ]
@@ -114,9 +111,12 @@ name = "bone-cli"
 version = "0.1.0"
 dependencies = [
  "bone-agent",
+ "bone-config",
  "bone-llm",
  "bone-tools",
  "rig-core",
+ "schemars",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -156,7 +156,6 @@ dependencies = [
 name = "bone-tools"
 version = "0.1.0"
 dependencies = [
- "bone-agent",
  "bone-config",
  "bone-llm",
  "globset",

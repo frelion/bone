@@ -96,6 +96,11 @@ impl Error {
         use rig_core::completion::CompletionError as RigError;
 
         let kind = match &error {
+            // A received HTTP rejection is a provider failure, even when the
+            // transport reports it as HttpError (for example an unavailable model).
+            RigError::HttpError(_) if error.provider_response_status().is_some() => {
+                ErrorKind::Provider
+            }
             RigError::HttpError(_) | RigError::UrlError(_) => ErrorKind::Transport,
             RigError::RequestError(_) => ErrorKind::InvalidRequest,
             RigError::JsonError(_) | RigError::ResponseError(_) => ErrorKind::Protocol,
@@ -168,5 +173,38 @@ pub(crate) fn validate_model_id(id: &str) -> Result<(), ConfigError> {
         Err(ConfigError::EmptyModelId)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig_core::{completion::CompletionError, http_client};
+
+    #[test]
+    fn received_http_rejections_are_provider_failures() {
+        for status in [400, 429, 503] {
+            let status = http::StatusCode::from_u16(status).unwrap();
+            for transport in [
+                http_client::Error::InvalidStatusCode(status),
+                http_client::Error::InvalidStatusCodeWithMessage(status, "rejected".into()),
+                http_client::Error::InvalidStatusCodeWithDetails {
+                    status,
+                    body: "rejected".into(),
+                    headers: Box::default(),
+                },
+            ] {
+                let error = Error::from_rig(CompletionError::HttpError(transport));
+                assert_eq!(error.kind(), ErrorKind::Provider);
+            }
+        }
+    }
+
+    #[test]
+    fn connection_failures_remain_transport_failures() {
+        let error = Error::from_rig(CompletionError::HttpError(http_client::Error::Instance(
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset).into(),
+        )));
+        assert_eq!(error.kind(), ErrorKind::Transport);
     }
 }

@@ -46,6 +46,29 @@ There is deliberately no implicit environment overlay, project inheritance,
 deep merge, or hot mutation of existing provider and tool instances. The host
 constructs those instances from a snapshot and decides when to rebuild them.
 
+## Agent model settings
+
+`bone-cli` owns the `SystemConfig` section keyed by `agent.system` and loads
+it through `ConfigManager`. It contains `coordinator` and `default_solver`,
+each with a model ID, optional reasoning `effort`, and `timeout_seconds`
+(positive, default 120). See the [example](../crates/bone-cli/config.example.json).
+
+The coordinator handles only busy-time input review (`ReviewInput`); the solver
+owns task reasoning, tools, and delivery (`Work`). The coordinator is a system
+setting injected when the host creates a session.
+It is not part of task configuration. `TaskConfig` overrides only solver
+settings, leaving the system snapshot and file unchanged. In the CLI, solver
+model selection is `--model`, then `BONE_MODEL`, then the system default;
+model-only overrides retain the default solver's effort and deadline.
+This precedence is resolved explicitly by the CLI, outside the storage service.
+
+The CLI reads `$XDG_CONFIG_HOME/bone/config.json`, falling back to
+`$HOME/.config/bone/config.json` when that directory variable is unset or empty.
+`BONE_CONFIG` can supply another absolute path. Task text and the workspace
+directory do not select the system configuration. The configuration manager
+is kept by the host and is not exposed as a task tool. Existing sessions keep
+their injected models and settings until shutdown.
+
 ## Credentials
 
 Secret values are not configuration values. Configuration contains only a

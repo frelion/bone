@@ -1,0 +1,12 @@
+{
+  "agent.system": {
+    "coordinator": {
+      "model": "your-coordinator-model",
+      "timeout_seconds": 120
+    },
+    "default_solver": {
+      "model": "your-solver-model",
+      "timeout_seconds": 120
+    }
+  }
+}

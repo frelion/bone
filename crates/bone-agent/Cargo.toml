@@ -2,19 +2,16 @@
 name = "bone-agent"
 version.workspace = true
 edition.workspace = true
-description = "Action-oriented agent runtime for BONE"
+description = "Event-driven agent kernel and asynchronous job runtime"
+readme = "README.md"
 publish = false
 
 [dependencies]
-bone-llm = { path = "../bone-llm" }
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
-bone-llm = { path = "../bone-llm", features = ["test-utils"] }
-rig-core = { workspace = true, features = ["test-utils"] }
-tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
