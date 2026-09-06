@@ -7,8 +7,8 @@ terminal frontend; the executable is still named `bone`.
 ## Workspace
 
 ```text
-bone-tui ──► bone-agent ──► bone-llm ──► rig-core
-                       └─► bone-tools
+bone-tui ──► bone-agent ──┬─► bone-llm ──► rig-core
+                          └─► bone-tools ──► bone-llm
 
 bone-config supplies configuration to all four modules.
 ```
@@ -63,7 +63,8 @@ calls. The current application exposes `read`, `glob`, and `grep` tools.
 
 Start with [the Agent API](docs/agent.md), the
 [crate walkthrough](crates/bone-agent/README.md), and
-[shared configuration](docs/configuration.md).
+[shared configuration](docs/configuration.md). The researched design for the
+full-screen frontend is in [TUI architecture](docs/tui-architecture.md).
 
 ```sh
 cargo run -p bone-agent --example walkthrough

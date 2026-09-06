@@ -19,7 +19,7 @@ defaults when omitted. Model IDs must be selected explicitly.
 
 `bone_config::default_path()` resolves `BONE_CONFIG`, then
 `$XDG_CONFIG_HOME/bone/config.json`, then `$HOME/.config/bone/config.json`.
-Selected paths must be absolute. `ConfigManager::builder().build(path)` still
+Selected paths must be absolute. `ConfigManagerBuilder::build(path)` still
 accepts an explicit path for embedded applications and tests.
 
 ```rust,ignore
