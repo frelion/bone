@@ -8,6 +8,8 @@ use thiserror::Error;
 pub enum ConfigError {
     #[error("configuration path must be absolute")]
     RelativePath,
+    #[error("set BONE_CONFIG to an absolute system configuration path")]
+    MissingDefaultPath,
     #[error("configuration path has no parent directory")]
     MissingParent,
     #[error("invalid configuration section key: {0}")]

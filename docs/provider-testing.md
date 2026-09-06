@@ -34,28 +34,26 @@ cargo check -p bone-llm --lib --target wasm32-unknown-unknown --locked
 
 The root CI workflow runs those commands on Linux and also compiles the
 workspace on Windows. Ignored live tests are built by `--all-targets` but are
-not executed. The WASM check compiles only the `bone-llm` library; the
-terminal binary and native subscription OAuth remain unavailable on that
+not executed. The WASM check compiles only the model library; native
+file-backed configuration and subscription OAuth remain unavailable on that
 target.
 
-## Standalone product smoke test
+## Agent frontend smoke test
 
-The official `bone-llm` binary is the smallest real end-to-end slice. It
-uses the current ChatGPT subscription adapter, reads the model ID from
-`BONE_MODEL`, streams a reply, and retains multi-turn history without involving
-the Agent or tools:
+Configure `agent.system` as described in [Configuration](configuration.md),
+then run the terminal frontend. `bone-agent` constructs the subscription
+models, tools, and runtime from a shared configuration snapshot:
 
 ```sh
-BONE_MODEL='a-model-available-to-your-subscription' \
-  cargo run -p bone-llm -- "Reply with exactly: ok"
+cargo run -p bone-tui -- "Reply with exactly: ok"
 
-BONE_MODEL='a-model-available-to-your-subscription' cargo run -p bone-llm
+cargo run -p bone-tui
 ```
 
-In the interactive form, send multiple messages, use `/clear` to reset history,
-and `/exit` to quit. The first run may require device authorization; the binary
-resolves BONE's conventional credential root and passes it explicitly to the
-managed connector.
+In the interactive form, use `/stop` to stop work and `/exit` to quit. The first
+run may require device authorization. `llm.system.credential_root` can select
+an independent credential directory; omitting it retains BONE's conventional
+directory.
 
 ## Live certification
 
@@ -84,6 +82,9 @@ cargo test -p bone-llm --test live_anthropic_messages -- --ignored --nocapture
 export BONE_CHATGPT_MODEL='a-model-available-to-your-subscription'
 cargo test -p bone-llm \
   --test live_chatgpt_subscription -- --ignored --nocapture
+
+BONE_CONFIG='/absolute/path/config.json' \
+  cargo test -p bone-agent --test live_agent -- --ignored --nocapture
 ```
 
 `.github/workflows/provider-live.yml` is manual-only. It reads API keys from

@@ -17,7 +17,7 @@ use bone_agent::{
     KernelConfig, MessageId, ModelInput, ModelPort, ModelTask, Notice, RecordKind, Runtime,
     RuntimeConfig,
 };
-use bone_cli::{ModelAdapter, SystemConfig, TaskConfig, read_only_tools};
+use bone_agent::{ModelAdapter, SystemConfig, TaskConfig, read_only_tools};
 use bone_llm::service::chatgpt_subscription;
 use bone_tools::ToolEnvironment;
 use tokio::sync::{Notify, broadcast};
@@ -33,7 +33,12 @@ async fn real_models_read_interrupt_change_direction_and_stop() {
 async fn acceptance() {
     let path =
         std::env::var_os("BONE_CONFIG").expect("set BONE_CONFIG to the system configuration");
-    let system = SystemConfig::load(path).expect("valid system configuration");
+    let config = bone_agent::config_builder()
+        .unwrap()
+        .build(path)
+        .expect("valid shared configuration");
+    let snapshot = config.snapshot().unwrap();
+    let system = SystemConfig::from_snapshot(&snapshot).expect("valid system configuration");
     let solver = system.solver_for(&TaskConfig::default()).unwrap();
     println!(
         "Input reviewer: {}; solver: {}",
@@ -41,7 +46,12 @@ async fn acceptance() {
     );
     let endpoint = chatgpt_subscription::connect(
         "bone-agent-live",
-        chatgpt_subscription::default_credential_root().unwrap(),
+        snapshot
+            .get::<bone_llm::LlmConfig>()
+            .unwrap()
+            .unwrap_or_default()
+            .resolve_credential_root()
+            .unwrap(),
         |prompt| {
             // Interactive only; do not redirect a first login to a persistent log.
             println!("Authorize at {}", prompt.verification_uri);
@@ -58,9 +68,9 @@ async fn acceptance() {
         .with_efforts(system.coordinator.effort, solver.effort),
     );
     let config = KernelConfig {
+        soft_deadline: Duration::from_secs(u64::from(system.soft_deadline_seconds)),
         review_timeout: system.coordinator.timeout(),
         work_timeout: solver.timeout(),
-        ..Default::default()
     };
 
     let workspace = tempfile::tempdir().unwrap();
@@ -69,7 +79,14 @@ async fn acceptance() {
         workspace.path().file_name().unwrap().to_string_lossy()
     );
     std::fs::write(workspace.path().join("proof.txt"), &proof).unwrap();
-    let environment = ToolEnvironment::new(workspace.path()).unwrap();
+    let environment = ToolEnvironment::with_limits(
+        workspace.path(),
+        snapshot
+            .get::<bone_tools::ToolLimits>()
+            .unwrap()
+            .unwrap_or_default(),
+    )
+    .unwrap();
 
     let mut read = Session::new(model.clone(), &environment, config.clone());
     read.post("Read proof.txt with the read tool. Reply with its exact contents and finish.")

@@ -1,0 +1,22 @@
+{
+  "agent.system": {
+    "coordinator": {
+      "model": "your-coordinator-model",
+      "timeout_seconds": 120
+    },
+    "default_solver": {
+      "model": "your-solver-model",
+      "timeout_seconds": 120
+    },
+    "soft_deadline_seconds": 30,
+    "shutdown_grace_seconds": 5
+  },
+  "llm.system": {},
+  "tools.local": {
+    "max_read_lines": 2000,
+    "max_output_bytes": 51200
+  },
+  "tui.display": {
+    "show_progress": true
+  }
+}

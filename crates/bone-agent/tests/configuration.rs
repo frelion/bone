@@ -1,4 +1,4 @@
-use bone_cli::{Effort, SystemConfig, TaskConfig};
+use bone_agent::{Effort, SystemConfig, TaskConfig};
 use bone_config::{ConfigManager, ConfigSection};
 use serde_json::{Value, json};
 
@@ -26,7 +26,7 @@ fn task_overrides_leave_the_system_coordinator_and_persisted_defaults_unchanged(
         )
         .unwrap();
     let before = std::fs::read(&path).unwrap();
-    let system = SystemConfig::load(&path).unwrap();
+    let system = SystemConfig::from_snapshot(&store.snapshot().unwrap()).unwrap();
     let task = TaskConfig {
         model: Some("task-solver".into()),
         effort: Some(Effort::Max),
@@ -44,6 +44,8 @@ fn task_overrides_leave_the_system_coordinator_and_persisted_defaults_unchanged(
         system.default_solver
     );
     assert_eq!(system.default_solver.timeout().as_secs(), 120);
+    assert_eq!(system.soft_deadline_seconds, 30);
+    assert_eq!(system.shutdown_grace_seconds, 5);
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
@@ -68,12 +70,18 @@ fn invalid_system_settings_are_rejected_by_the_configuration_service() {
     unknown_effort["coordinator"]["effort"] = json!("unsupported-effort");
     let mut misspelled_setting = settings();
     misspelled_setting["coordinator"]["timeot_seconds"] = json!(10);
+    let mut zero_soft_deadline = settings();
+    zero_soft_deadline["soft_deadline_seconds"] = json!(0);
+    let mut zero_shutdown_grace = settings();
+    zero_shutdown_grace["shutdown_grace_seconds"] = json!(0);
     for value in [
         missing_coordinator,
         empty_model,
         zero_timeout,
         unknown_effort,
         misspelled_setting,
+        zero_soft_deadline,
+        zero_shutdown_grace,
     ] {
         assert!(
             store.validate_value(SystemConfig::KEY, &value).is_err(),
@@ -98,46 +106,4 @@ fn a_task_cannot_supply_coordinator_settings() {
             })
             .is_err()
     );
-}
-
-#[test]
-fn cli_requires_system_configuration_even_when_a_solver_is_selected() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("config.json");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bone"))
-        .env("BONE_CONFIG", &path)
-        .env("BONE_MODEL", "solver-from-environment")
-        .args(["--model", "solver-from-task", "hello"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let error = String::from_utf8(output.stderr).unwrap();
-    assert!(error.contains("agent.system"), "{error}");
-    assert!(error.contains("section is required"), "{error}");
-    assert!(!error.contains("authorization required"));
-    assert!(
-        !path.exists(),
-        "startup must not create a default system configuration"
-    );
-}
-
-#[test]
-fn cli_help_and_invalid_options_do_not_require_configuration_or_credentials() {
-    let directory = tempfile::tempdir().unwrap();
-    for (args, succeeds) in [
-        (vec!["--help"], true),
-        (vec!["--model"], false),
-        (vec!["--coordinator-model", "another-model"], false),
-    ] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bone"))
-            .env(
-                "BONE_CONFIG",
-                directory.path().join("not-created/config.json"),
-            )
-            .args(args)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.success(), succeeds);
-    }
-    assert!(!directory.path().join("not-created").exists());
 }

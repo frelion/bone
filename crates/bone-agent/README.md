@@ -165,10 +165,10 @@ loop {
 遗漏通过 `Lagged` 暴露，可重新获取一致快照；不会补发错过的原始步骤。进度按作业合并。
 观察者需要改变工作时，仍使用显式 `post()`、`stop()`，不能在回调里直接执行操作。
 
-CLI 可写出同一端口的事件：
+终端前端可写出同一端口的事件：
 
 ```sh
-cargo run -p bone-cli -- --events session.jsonl
+cargo run -p bone-tui -- --events session.jsonl
 ```
 
 文件必须不存在。JSONL 先写 `snapshot`，随后 `step`，落后时写 `gap`。
@@ -178,7 +178,8 @@ cargo run -p bone-cli -- --events session.jsonl
 ## 模型配置的归属
 
 协调是系统级配置；主力允许任务级选择。两种用途可以选同一型号，但不能共用一把跨请求的锁。
-Kernel 不读取配置或选择提供商；CLI 注入模型、推理参数和截止时间。
+`bone-agent::start` 从一次配置快照构造模型、工具和 Runtime；Kernel 仍然只接收普通参数，
+不读取配置或选择提供商。
 
 ```json
 {
@@ -190,13 +191,26 @@ Kernel 不读取配置或选择提供商；CLI 注入模型、推理参数和截
 ```
 
 配置默认在 `$XDG_CONFIG_HOME/bone/config.json`，该目录未设置时用 `$HOME/.config/bone/config.json`。
-`BONE_CONFIG` 可指定另一个绝对路径。配置在会话创建时读取。
+`BONE_CONFIG` 可指定另一个绝对路径。`config_builder()` 注册 Agent、LLM 和 Tools 配置，
+前端可继续注册自己的配置段。配置在会话创建时读取，已有会话不热更新。
 主力型号优先级：`--model`、`BONE_MODEL`、`default_solver.model`；不会修改协调或写回配置。
 `TaskConfig` 也可覆盖主力的 `effort` 和 `timeout_seconds`。
 独立推理强度支持 `none / minimal / low / medium / high / xhigh / max`，具体组合由提供商校验。
 主力和协调截止分别传入 `KernelConfig::work_timeout / review_timeout`。
 
 ## 接入与源码阅读
+
+```rust,ignore
+let config = bone_agent::config_builder()?.build(bone_config::default_path()?)?;
+let agent = bone_agent::start(
+    &config,
+    workspace,
+    bone_agent::TaskConfig::default(),
+    |prompt| show_login(prompt),
+).await?;
+```
+
+使用同一凭据目录重新创建会话前，应先等待旧会话 `shutdown()`；当前订阅连接在存活期间独占该目录。
 
 | 方法 | 完成意味着什么 |
 | --- | --- |

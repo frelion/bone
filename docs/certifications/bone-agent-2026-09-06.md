@@ -53,12 +53,12 @@
 
 ```sh
 BONE_CONFIG="$HOME/.config/bone/config.json" \
-  cargo test -p bone-cli --test live_agent --locked -- --ignored --nocapture
+  cargo test -p bone-agent --test live_agent --locked -- --ignored --nocapture
 
-cargo run -p bone-cli
+cargo run -p bone-tui
 ```
 
 真实验收：`1 passed; 0 failed`。工作区离线回归：216 项通过，6 项忽略（含需显式运行的真实接口测试）。
 工作区 Clippy、格式检查和 `git diff --check` 通过。
 
-测试实现见 [live_agent.rs](../../crates/bone-cli/tests/live_agent.rs)。后续运行依赖当时的账号权限、模型可用性和网络状况。
+测试实现现位于 [live_agent.rs](../../crates/bone-agent/tests/live_agent.rs)。后续运行依赖当时的账号权限、模型可用性和网络状况。

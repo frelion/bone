@@ -1,6 +1,6 @@
 //! Deliberately small input view for interruption review.
 
-use bone_agent::{JobOutput, JobRequest, JobState, ModelInput, ModelTask, RecordKind};
+use crate::{JobOutput, JobRequest, JobState, ModelInput, ModelTask, RecordKind};
 use serde_json::{Value, json};
 
 pub(crate) fn review_context(input: &ModelInput) -> Value {

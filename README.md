@@ -1,112 +1,81 @@
 # BONE
 
-BONE is an event-driven agent runtime written in Rust. `bone-agent` owns a
-synchronous session kernel and a shared asynchronous execution path for models
-and tools. `bone` connects it to a real model and workspace tools; `bone-llm`
-also provides a terminal product for talking directly to a model.
+BONE is an event-driven Agent written in Rust. `bone-agent` provides the complete
+application API, model/tool adapters, and session runtime. `bone-tui` is the
+terminal frontend; the executable is still named `bone`.
 
 ## Workspace
 
 ```text
-bone-llm binary ──► bone-llm library ──► rig-core
+bone-tui ──► bone-agent ──► bone-llm ──► rig-core
+                       └─► bone-tools
 
-bone-cli ────┬─runs────────► bone-agent (kernel, runtime, ports)
-             ├─adapts──────► bone-llm ──► rig-core
-             ├─configures──► bone-config
-             └─adapts──────► bone-tools ──┬──► bone-llm protocol values
-                                         └──► bone-config
+bone-config supplies configuration to all four modules.
 ```
 
-The five workspace crates are:
+- `bone-agent`: session creation, model/tool integration, synchronous kernel,
+  and asynchronous execution.
+- `bone-tui`: terminal input, replies, progress, and event export. Its BONE
+  dependencies are only `bone-agent` and `bone-config`.
+- `bone-config`: shared typed configuration, snapshots, and atomic persistence.
+- `bone-llm`: model protocols and service connections. It is a library.
+- `bone-tools`: native workspace tools and their execution limits.
 
-- `bone-agent`: the session kernel, model/tool ports, and unified job runtime.
-- `bone-llm`: the unified model library, service adapters, and official
-  direct-model terminal product. It owns model-facing tool definitions, calls,
-  outputs, and provider translation.
-- `bone-tools`: the native typed `Tool` interface and built-in implementations.
-- `bone-config`: typed, non-secret configuration storage.
-- `bone-cli`: the model/tool adapters and responsive terminal input loop.
+Each module owns its configuration types. Agent creation reads one fresh
+snapshot, builds the model and tools, then injects ordinary parameters into
+the kernel. Configuration changes affect later sessions; running sessions keep
+what they were created with.
 
-The `bone-llm` library receives endpoint settings, credentials, and storage
-roots through its constructors; it does not depend on `bone-config`. Its binary
-is a small composition root that currently selects the ChatGPT subscription
-adapter, reads its model ID from `BONE_MODEL`, and explicitly supplies BONE's
-conventional local credential root. Agent integration is assembled in
-`bone-cli`; `bone-agent` has no dependency on a model provider or native tools.
+## Run
 
-In production code, Rig is confined to `bone-llm`. Agent and built-in-tool APIs
-use BONE types: `bone-agent` owns execution, while `bone-tools` supplies
-concrete implementations through the CLI adapters.
-
-## Talk directly to a model
+Create `$XDG_CONFIG_HOME/bone/config.json`, or `$HOME/.config/bone/config.json`
+when `XDG_CONFIG_HOME` is unset. Start from
+[config.example.json](crates/bone-tui/config.example.json) and select models
+available to your subscription. Existing files containing only `agent.system`
+remain valid. `BONE_CONFIG` can select another absolute configuration path.
 
 ```sh
-BONE_MODEL='<model available to your subscription>' cargo run -p bone-llm
+cargo run -p bone-tui
 ```
 
-The official `bone-llm` binary streams a multi-turn conversation without an
-Agent or tools. Use `/clear` to reset its in-memory history and `/exit` to quit,
-or pass one message for a one-shot request:
+The frontend currently uses line-based terminal interaction. Input stays open
+while work runs. `/stop` stops autonomous work; `/exit` closes the session.
+The application connects to the existing ChatGPT subscription service and
+reuses BONE's independent login; initial authorization is displayed in the
+terminal when needed.
+
+For one request, pass its text:
 
 ```sh
-BONE_MODEL='<model available to your subscription>' \
-  cargo run -p bone-llm -- "Reply with exactly: ok"
+cargo run -p bone-tui -- "Read Cargo.toml and list the workspace crates"
 ```
 
-## Run the Agent
+Use `--model` to override the solver for this session. It takes precedence over
+`BONE_MODEL`, then the configured default. The coordinator remains a system
+setting. `--events session.jsonl` writes a new file containing the initial
+snapshot and live kernel events.
 
-Create the system configuration at `$XDG_CONFIG_HOME/bone/config.json`, or
-`$HOME/.config/bone/config.json` when `XDG_CONFIG_HOME` is unset. Start from
-[config.example.json](crates/bone-cli/config.example.json) and replace both
-model IDs with models available to your subscription. `coordinator` is a
-system setting; `default_solver` supplies the task's default model. They may
-use the same model.
+The solver owns reasoning, tools, and answers. The coordinator only interprets
+interruptions while the solver is busy. Uninterrupted work makes no coordinator
+calls. The current application exposes `read`, `glob`, and `grep` tools.
 
-The solver owns reasoning, tool selection, and final answers. The coordinator
-only interprets user interruptions while a solver decision is outstanding;
-uninterrupted work makes zero coordinator calls. Both use the same job runtime.
+## Develop
 
-```sh
-cargo run -p bone-cli -- "Read Cargo.toml and list the workspace crates"
-```
-
-Select a different solver for one session:
+Start with [the Agent API](docs/agent.md), the
+[crate walkthrough](crates/bone-agent/README.md), and
+[shared configuration](docs/configuration.md).
 
 ```sh
-cargo run -p bone-cli -- --model '<solver model>' "Investigate this design"
-```
-
-`--model` takes precedence over `BONE_MODEL`, which takes precedence over the
-system's default solver. These overrides do not affect the coordinator or
-write back to the system configuration. Each purpose independently supports
-an optional reasoning `effort` and a `timeout_seconds` value (default: 120).
-Use `BONE_CONFIG` for another absolute system configuration path.
-Configuration is read when the session starts; see the
-[crate guide](crates/bone-agent/README.md#模型配置的归属) for the full contract.
-
-Run without a message for an interactive prompt. Input remains available while
-background jobs run; `/stop` stops autonomous work and `/exit` shuts down.
-The deterministic core example needs no model credentials:
-
-```sh
+cargo run -p bone-agent --example walkthrough
 cargo run -p bone-agent --example interleaving
-cargo test -p bone-agent
+cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
-Use `cargo run -p bone-agent --example walkthrough` to inspect each synchronous
-kernel transition, or CLI `--events session.jsonl` to observe a real session.
+The examples use controlled ports and need no credentials. Model protocol and
+live-test details are in [Model API](docs/model-api.md) and
+[provider testing](docs/provider-testing.md); native tools are documented in
+[tools](docs/tools.md).
 
-Both terminal products currently use
-the experimental ChatGPT subscription slice; the first run may request device
-login and later runs reuse BONE's independent credential cache. Run the full
-test suite with `cargo test --workspace --all-features`.
-
-Start with the [Agent](docs/agent.md), [Model API](docs/model-api.md),
-[tools](docs/tools.md), and [configuration](docs/configuration.md) documents.
-Provider contract and live-test guidance live in
-[provider testing](docs/provider-testing.md).
-
-The current implementation lives in [`crates/`](crates/). [`legacy/`](legacy/)
-is the historical implementation, not the active architecture.
-[`third_party/`](third_party/) contains the pinned Rig patch used by this
-workspace.
+The active implementation is in [`crates/`](crates/). [`legacy/`](legacy/) holds
+historical code. [`third_party/`](third_party/) contains the pinned Rig patch.

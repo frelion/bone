@@ -15,7 +15,8 @@ schemars.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
+bone-config = { path = "../bone-config" }
+serde.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 fs2.workspace = true
@@ -26,6 +27,7 @@ rustix.workspace = true
 bytes.workspace = true
 http.workspace = true
 rig-core = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [[test]]

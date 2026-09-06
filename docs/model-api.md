@@ -1,9 +1,8 @@
 # Model API
 
-`bone-llm` is BONE's provider-independent model boundary and a runnable
-direct-model product. Provider clients and wire DTOs are implementation
-details; callers use BONE types from request construction through response
-replay.
+`bone-llm` is BONE's provider-independent model library. Provider clients and
+wire DTOs are implementation details; callers use BONE types from request
+construction through response replay.
 
 ```text
 Protocol                 Endpoint                  Model
@@ -160,10 +159,10 @@ Request::new([
 ```
 
 These are model-protocol values, not an execution framework. `bone-llm` never
-registers or runs a tool. `bone-agent` owns the executable `Tool` interface and
-uses these values to advertise tools, dispatch calls, and return results;
-`bone-tools` supplies the built-in implementations. Provider and Rig tool types
-do not cross the `bone-llm` boundary.
+registers or runs a tool. `bone-agent` adapts built-in tools to its `ToolPort`
+and uses these values to advertise tools, dispatch calls, and return results;
+`bone-tools` owns the native `Tool` interface and built-in implementations.
+Provider and Rig tool types do not cross the `bone-llm` boundary.
 
 `InputItem::tool_result` accepts the complete `ToolCall`, not a loose string
 ID, so protocol-specific correlation data cannot be accidentally discarded.
@@ -262,19 +261,23 @@ Supported public endpoint constructors are:
 
 Compatible base URLs must be absolute HTTP(S) URLs without embedded
 credentials or query strings. Authentication and routing configuration are
-injected while constructing the endpoint; `bone-llm` does not depend on
-`bone-config`.
+injected while constructing the endpoint.
+
+For native sessions, `LlmConfig` registers the `llm.system` section with
+`bone-config`. Its only setting is optional `credential_root`, an absolute
+directory for BONE's independent subscription credentials. An empty section
+uses the existing default credential directory. `bone-agent::start` reads this
+section from the session's shared configuration snapshot before connecting.
 
 The ChatGPT subscription connector receives an explicit application-owned
 credential root. `default_credential_root()` is an opt-in convenience, while
 `connect` owns authorization, locking, secure credential storage, and refresh.
 The backend does not honor `max_output_tokens` or structured-output schemas,
 so BONE rejects those options locally instead of pretending they were applied.
+A credential root supports one live subscription connection. Starting another
+session with the same root returns `CredentialStoreBusy` until the existing
+connection's endpoint and model handles are released.
 
-The standalone product remains the smallest real smoke test:
-
-```sh
-BONE_MODEL='<model available to your subscription>' cargo run -p bone-llm
-```
-
-It uses the exact same `Request → Model → Response` path as downstream agents.
+`bone-agent` composes the models, tools, and runtime. The terminal frontend is
+`bone-tui`, which depends on `bone-agent` and `bone-config`; run it with
+`cargo run -p bone-tui` after [configuring the agent](configuration.md).

@@ -65,11 +65,11 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 
 BONE_CONFIG="$HOME/.config/bone/config.json" \
-  cargo test -p bone-cli --test live_agent --locked -- --ignored --nocapture
+  cargo test -p bone-agent --test live_agent --locked -- --ignored --nocapture
 ```
 
 演示使用虚拟时间，不实际等待 30 秒。真实测试使用临时目录与本轮随机文件内容。
 首次登录需要交互授权时，不应把设备码写进验收日志。
 
 源码：[内核测试](../../crates/bone-agent/tests/kernel.rs)、[执行器测试](../../crates/bone-agent/tests/runtime.rs)、
-[交错枚举](../../crates/bone-agent/tests/interleavings.rs)、[真实验收](../../crates/bone-cli/tests/live_agent.rs)。
+[交错枚举](../../crates/bone-agent/tests/interleavings.rs)、[真实验收](../../crates/bone-agent/tests/live_agent.rs)。

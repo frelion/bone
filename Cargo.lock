@@ -99,26 +99,16 @@ dependencies = [
 name = "bone-agent"
 version = "0.1.0"
 dependencies = [
- "futures-util",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "bone-cli"
-version = "0.1.0"
-dependencies = [
- "bone-agent",
  "bone-config",
  "bone-llm",
  "bone-tools",
+ "futures-util",
  "rig-core",
  "schemars",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
 ]
 
@@ -140,6 +130,7 @@ dependencies = [
 name = "bone-llm"
 version = "0.1.0"
 dependencies = [
+ "bone-config",
  "bytes",
  "fs2",
  "futures-util",
@@ -148,7 +139,9 @@ dependencies = [
  "rig-core",
  "rustix",
  "schemars",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -163,12 +156,26 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "libc",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
  "walkdir",
+]
+
+[[package]]
+name = "bone-tui"
+version = "0.1.0"
+dependencies = [
+ "bone-agent",
+ "bone-config",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

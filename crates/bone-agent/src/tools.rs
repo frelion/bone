@@ -1,12 +1,12 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use bone_agent::{JobContext, JobOutcome, ToolEffect, ToolPort, ToolSpec};
+use crate::{JobContext, JobOutcome, ToolEffect, ToolPort, ToolSpec};
 use bone_tools::{Tool, ToolEnvironment};
 use serde_json::Value;
 
 use crate::model::cancelled;
 
-/// The CLI's first tool set. Classification belongs to the adapter, never to
+/// The agent's initial tool set. Classification belongs to the adapter, never to
 /// model-supplied arguments. Write tools need their own effect-aware adapter.
 pub fn read_only_tools(environment: &ToolEnvironment) -> Vec<Arc<dyn ToolPort>> {
     vec![

@@ -11,7 +11,7 @@ use bone_agent::{
     AgentHandle, Autonomy, JobContext, JobOutcome, KernelConfig, ModelInput, ModelPort, Next,
     Notice, Runtime, RuntimeConfig, WorkResult,
 };
-use bone_cli::write_events;
+use bone_tui::write_events;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 

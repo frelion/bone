@@ -1,48 +1,126 @@
 use std::time::Duration;
 
+use bone_config::ConfigSection;
+use schemars::{JsonSchema, schema_for};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
 use crate::ToolError;
 
 /// Hard limits shared by the built-in tools.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The `tools.local` configuration section uses these defaults for omitted
+/// fields. Bash deadlines are persisted as integer `*_seconds` fields; the
+/// direct Rust API continues to accept subsecond durations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
 pub struct ToolLimits {
     /// Maximum retained UTF-8 bytes in each tool-defined textual output budget.
+    #[schemars(range(min = 1))]
     pub max_output_bytes: usize,
     /// Maximum lines returned by one `read` call.
+    #[schemars(range(min = 1))]
     pub max_read_lines: usize,
     /// Maximum size of one file read or scanned by `read`.
+    #[schemars(range(min = 1))]
     pub max_read_file_bytes: u64,
     /// Maximum paths returned by one `glob` call.
+    #[schemars(range(min = 1))]
     pub max_glob_results: usize,
     /// Maximum matches returned by one `grep` call.
+    #[schemars(range(min = 1))]
     pub max_grep_matches: usize,
     /// Maximum UTF-8 bytes accepted in one grep pattern.
+    #[schemars(range(min = 1))]
     pub max_grep_pattern_bytes: usize,
     /// Maximum characters retained from one grep line.
+    #[schemars(range(min = 1))]
     pub max_grep_line_chars: usize,
     /// Maximum size of one file inspected by filesystem search tools.
+    #[schemars(range(min = 1))]
     pub max_search_file_bytes: u64,
     /// Maximum combined file bytes inspected by one grep call.
+    #[schemars(range(min = 1))]
     pub max_search_total_bytes: u64,
     /// Maximum size of one workspace-local ignore file loaded during search.
+    #[schemars(range(min = 1))]
     pub max_ignore_file_bytes: u64,
     /// Maximum combined ignore-file bytes loaded during one search call.
+    #[schemars(range(min = 1))]
     pub max_ignore_total_bytes: u64,
     /// Maximum filesystem entries inspected by one search call.
+    #[schemars(range(min = 1))]
     pub max_walk_entries: usize,
     /// Maximum UTF-8 bytes accepted in one patch document.
+    #[schemars(range(min = 1))]
     pub max_patch_bytes: usize,
     /// Maximum file operations accepted in one patch document.
+    #[schemars(range(min = 1))]
     pub max_patch_files: usize,
     /// Maximum size of one existing file read while planning a patch.
+    #[schemars(range(min = 1))]
     pub max_patch_file_bytes: u64,
     /// Maximum combined bytes retained from existing files while planning a patch.
+    #[schemars(range(min = 1))]
     pub max_patch_total_bytes: u64,
     /// Maximum UTF-8 bytes accepted in one Bash command.
+    #[schemars(range(min = 1))]
     pub max_bash_command_bytes: usize,
-    /// Default deadline for one shell command.
+    /// Default shell deadline; configuration stores a positive whole-second count.
+    #[serde(rename = "default_bash_timeout_seconds", with = "duration_seconds")]
+    #[schemars(with = "u64", range(min = 1))]
     pub default_bash_timeout: Duration,
-    /// Largest shell deadline the model may request.
+    /// Largest shell deadline; must be at least the default deadline.
+    #[serde(rename = "max_bash_timeout_seconds", with = "duration_seconds")]
+    #[schemars(with = "u64", range(min = 1))]
     pub max_bash_timeout: Duration,
+}
+
+impl ConfigSection for ToolLimits {
+    const KEY: &'static str = "tools.local";
+
+    fn description() -> &'static str {
+        "Local tool limits. Loaded when a session starts."
+    }
+
+    fn schema() -> Value {
+        schema_for!(Self).to_value()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        ToolLimits::validate(self).map_err(|error| error.to_string())?;
+        if self.default_bash_timeout.subsec_nanos() != 0
+            || self.max_bash_timeout.subsec_nanos() != 0
+        {
+            return Err("configured Bash timeouts must use whole seconds".to_owned());
+        }
+        Ok(())
+    }
+}
+
+mod duration_seconds {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer, ser::Error};
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if duration.subsec_nanos() != 0 {
+            return Err(S::Error::custom(
+                "configured Bash timeouts must use whole seconds",
+            ));
+        }
+        serializer.serialize_u64(duration.as_secs())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        u64::deserialize(deserializer).map(Duration::from_secs)
+    }
 }
 
 impl Default for ToolLimits {

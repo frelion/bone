@@ -1,4 +1,7 @@
-//! One synchronous session owner, with models and tools executed as ordinary jobs.
+//! A complete agent session, with models and tools executed as ordinary jobs.
+//!
+//! Frontends register settings with [`config_builder`] and create a configured
+//! session with [`start`]. Each session keeps its startup configuration snapshot.
 //!
 //! [`Kernel::step`] records observations and returns [`Effect`]s. [`Runtime`]
 //! executes them without waiting in the inbox loop. The solver owns task
@@ -6,18 +9,28 @@
 
 #![forbid(unsafe_code)]
 
+mod app;
+mod config;
 mod kernel;
+mod model;
 mod ports;
+mod review;
 mod runtime;
+mod tools;
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+pub use app::{StartError, config_builder, start};
+pub use bone_llm::service::chatgpt_subscription::DeviceCodePrompt as LoginPrompt;
+pub use config::{Effort, ModelSettings, SystemConfig, TaskConfig};
 pub use kernel::{Kernel, KernelConfig, KernelError};
+pub use model::ModelAdapter;
 pub use ports::*;
 pub use runtime::{
     AgentHandle, HandleError, Observation, Runtime, RuntimeConfig, RuntimeError, ShutdownReport,
 };
+pub use tools::read_only_tools;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MessageId(pub u64);

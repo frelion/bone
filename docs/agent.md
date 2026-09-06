@@ -1,6 +1,7 @@
-# Agent core
+# Agent API
 
-`bone-agent` owns one shared session record and one synchronous transition:
+`bone-agent` owns application setup and the event loop. Frontends use its
+configured entrypoint; the kernel remains one synchronous transition:
 
 ```rust,ignore
 Kernel::step(event) -> Vec<Effect>
@@ -34,20 +35,40 @@ See the [crate guide](../crates/bone-agent/README.md) for use cases and the
 ## Integration
 
 ```rust,ignore
-let agent = Runtime::spawn(model, tools, KernelConfig::default(), RuntimeConfig::default())?;
+let config = bone_agent::config_builder()?.build(bone_config::default_path()?)?;
+let agent = bone_agent::start(
+    &config,
+    workspace,
+    bone_agent::TaskConfig::default(),
+    |login| println!("Open {} and enter {}", login.verification_uri, login.user_code),
+).await?;
+
 let mut notices = agent.subscribe();
 let receipt = agent.post("Investigate the failing test").await?;
-// More input can arrive independently of replies and work completion.
 agent.stop().await?;
 let report = agent.shutdown().await?;
 ```
 
-`bone-cli` adapts `bone_llm::Model` and native `bone_tools::Tool` implementations.
-It supports concurrent terminal input, `/stop`, and `/exit`.
-`SystemConfig.coordinator` configures only input review; the task's solver
-performs Work. `TaskConfig`, CLI `--model`, and `BONE_MODEL` override only the
-solver. The host resolves settings and injects models at session creation.
-There is no shared global conversation or lock spanning model calls.
+`start` captures one fresh configuration snapshot, builds the native tools,
+connects models, and starts Runtime. Its login callback lets the frontend show
+initial authorization without depending on LLM protocol code. Registered
+settings and local paths are checked before connecting. The existing
+subscription service holds one connection per credential directory: await
+shutdown before starting another session with the same directory.
+
+`bone-tui` depends only on `bone-agent` and `bone-config` among BONE crates.
+It owns terminal input, display preferences, and JSONL export. Model prompts,
+input-review projection, and native-tool adaptation are in `bone-agent`.
+
+`SystemConfig.coordinator` selects the interruption reviewer; `TaskConfig`
+overrides only the solver. Runtime settings and tool limits come from the same
+snapshot. Later configuration writes affect new sessions. Kernel performs no
+configuration reads. See [configuration](configuration.md) for fields and
+ownership.
+
+For controlled ports and embedded custom execution, `Runtime::spawn(model,
+tools, kernel_config, runtime_config)` remains available. No model invocation
+shares mutable conversation state or a lock spanning the request.
 
 Read-only cancellation is supervised outside the port Future. The local slot
 is released only when that invocation ends. This does not prove remote work
@@ -76,7 +97,7 @@ records remain available, but missed raw steps are not replayed. Ordinary
 progress is coalesced per job. Observers act through explicit handle commands.
 
 ```sh
-cargo run -p bone-cli -- --events session.jsonl
+cargo run -p bone-tui -- --events session.jsonl
 ```
 
 This independent consumer writes a new JSONL file: baseline `snapshot`, live
@@ -95,12 +116,12 @@ Controlled tests exercise stale proposals, batching, cancellation, timeouts,
 unknown writes, and observation. Time tests use a single-thread Tokio runtime
 and virtual time.
 
-The opt-in [live test](../crates/bone-cli/tests/live_agent.rs) uses configured
+The opt-in [live test](../crates/bone-agent/tests/live_agent.rs) uses configured
 models, BONE's independent login, and native tools in temporary workspaces:
 
 ```sh
 BONE_CONFIG='/absolute/path/to/config.json' \
-  cargo test -p bone-cli --test live_agent --locked -- --ignored --nocapture
+  cargo test -p bone-agent --test live_agent --locked -- --ignored --nocapture
 ```
 
 It checks direct tool use, status during a pending solver call, changed
@@ -109,7 +130,7 @@ exercise a race; it does not replace provider outputs. Inspect the trace and
 its stated limits as well as assertions. Do not record device authorization
 codes in a saved trace.
 
-The [current acceptance](certifications/bone-agent-2026-09-06-solver-loop.md)
-records this refactor's offline checks and real-model interleavings.
+The [solver-loop acceptance](certifications/bone-agent-2026-09-06-solver-loop.md)
+records the earlier loop checks and real-model interleavings.
 The [earlier acceptance](certifications/bone-agent-2026-09-06.md) describes the
 previous coordinator-led architecture.

@@ -115,7 +115,10 @@ pub struct ConfigChange {
     pub changed: bool,
 }
 
-/// An immutable, validated view of all configured sections.
+/// An immutable view of all configured sections.
+///
+/// Registered sections have been validated. Unrecognized sections are retained
+/// unchanged so applications with different registries can share one file.
 #[derive(Clone)]
 pub struct ConfigSnapshot {
     values: Arc<BTreeMap<String, Value>>,
@@ -146,6 +149,14 @@ impl ConfigSnapshot {
         self.values.get(section)
     }
 
+    /// Configured section names that this manager has not registered or validated.
+    pub fn unrecognized_sections(&self) -> impl Iterator<Item = &str> {
+        self.values
+            .keys()
+            .filter(|key| !self.sections.contains_key(*key))
+            .map(String::as_str)
+    }
+
     pub fn get<T>(&self) -> Result<Option<T>, ConfigError>
     where
         T: ConfigSection,
@@ -157,7 +168,7 @@ impl ConfigSnapshot {
     }
 }
 
-/// Builder used to register every section before constructing the shared store.
+/// Builder used to register the sections an application understands.
 #[derive(Default)]
 pub struct ConfigManagerBuilder {
     sections: BTreeMap<String, RegisteredSection>,
@@ -361,11 +372,9 @@ impl ConfigManager {
 
     fn validate_values(&self, values: &BTreeMap<String, Value>) -> Result<(), ConfigError> {
         for (key, value) in values {
-            let registered = self
-                .sections
-                .get(key)
-                .ok_or_else(|| ConfigError::UnknownSection(key.clone()))?;
-            (registered.validate)(value)?;
+            if let Some(registered) = self.sections.get(key) {
+                (registered.validate)(value)?;
+            }
         }
         Ok(())
     }
@@ -849,28 +858,125 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_sections_and_unknown_fields_on_build() {
+    fn preserves_unrecognized_sections_when_setting_and_removing_registered_values() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.json");
-        fs::write(&path, br#"{"unknown":{}}"#).unwrap();
-        let error = ConfigManager::builder()
+        let foreign = json!({"nested": [null, true, {"theme": "dark"}]});
+        fs::write(&path, json!({"tui.settings": foreign}).to_string()).unwrap();
+        let manager = ConfigManager::builder()
             .register::<ExampleConfig>()
             .unwrap()
             .build(&path)
-            .unwrap_err();
-        assert!(matches!(error, ConfigError::UnknownSection(section) if section == "unknown"));
+            .unwrap();
+        let initial = manager.snapshot().unwrap();
+        assert_eq!(
+            initial.unrecognized_sections().collect::<Vec<_>>(),
+            vec!["tui.settings"]
+        );
+        let change = manager
+            .set_value(
+                ExampleConfig::KEY,
+                json!({"enabled": true, "limit": 1}),
+                initial.revision(),
+            )
+            .unwrap();
+        let updated = manager.snapshot().unwrap();
+        assert_eq!(updated.value("tui.settings"), Some(&foreign));
+        assert!(!initial.contains(ExampleConfig::KEY));
+        assert_eq!(
+            updated.unrecognized_sections().collect::<Vec<_>>(),
+            vec!["tui.settings"]
+        );
+        manager.remove::<ExampleConfig>(&change.revision).unwrap();
+        let persisted: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(persisted, json!({"tui.settings": foreign}));
+    }
 
-        fs::write(
-            &path,
-            br#"{"tools.example":{"enabled":true,"limit":1,"typo":true}}"#,
-        )
-        .unwrap();
-        let error = ConfigManager::builder()
-            .register::<ExampleConfig>()
+    #[test]
+    fn unregistered_sections_cannot_be_changed_or_removed() {
+        let (directory, manager) = manager();
+        let path = directory.path().join("config.json");
+        let original = br#"{"tools.unregistered":null}"#;
+        fs::write(&path, original).unwrap();
+        let revision = manager.snapshot().unwrap().revision().clone();
+        assert!(matches!(
+            manager.set_value(UnregisteredConfig::KEY, json!({}), &revision),
+            Err(ConfigError::UnknownSection(_))
+        ));
+        assert!(matches!(
+            manager.remove_value(UnregisteredConfig::KEY, &revision),
+            Err(ConfigError::UnknownSection(_))
+        ));
+        assert!(matches!(
+            manager.set(&UnregisteredConfig, &revision),
+            Err(ConfigError::UnknownSection(_))
+        ));
+        assert!(matches!(
+            manager.remove::<UnregisteredConfig>(&revision),
+            Err(ConfigError::UnknownSection(_))
+        ));
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn managers_with_different_registries_share_revisions_and_preserve_each_others_values() {
+        let (directory, first) = manager();
+        let second = ConfigManager::builder()
+            .register::<UnregisteredConfig>()
             .unwrap()
-            .build(&path)
-            .unwrap_err();
-        assert!(matches!(error, ConfigError::InvalidSection { .. }));
+            .build(directory.path().join("config.json"))
+            .unwrap();
+        let initial = second.snapshot().unwrap();
+        let example = json!({"enabled": true, "limit": 2});
+        first
+            .set_value(ExampleConfig::KEY, example.clone(), initial.revision())
+            .unwrap();
+        assert!(matches!(
+            second.set(&UnregisteredConfig, initial.revision()),
+            Err(ConfigError::RevisionConflict)
+        ));
+        let current = second.snapshot().unwrap();
+        let change = second.set(&UnregisteredConfig, current.revision()).unwrap();
+        let current = first.snapshot().unwrap();
+        assert_eq!(current.revision(), &change.revision);
+        assert_eq!(current.value(ExampleConfig::KEY), Some(&example));
+        assert_eq!(current.value(UnregisteredConfig::KEY), Some(&Value::Null));
+        first.remove::<ExampleConfig>(current.revision()).unwrap();
+        let final_snapshot = second.snapshot().unwrap();
+        assert!(
+            final_snapshot
+                .get::<UnregisteredConfig>()
+                .unwrap()
+                .is_some()
+        );
+        assert!(!final_snapshot.contains(ExampleConfig::KEY));
+        assert!(final_snapshot.unrecognized_sections().next().is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_registered_values_on_build_and_snapshot() {
+        let (directory, manager) = manager();
+        let path = directory.path().join("config.json");
+        for invalid in [
+            json!({"enabled": true, "limit": 1, "typo": true}),
+            json!({"enabled": true, "limit": 0}),
+        ] {
+            fs::write(
+                &path,
+                json!({"tools.example": invalid, "tui.settings": {}}).to_string(),
+            )
+            .unwrap();
+            let error = ConfigManager::builder()
+                .register::<ExampleConfig>()
+                .unwrap()
+                .build(&path)
+                .unwrap_err();
+            assert!(matches!(error, ConfigError::InvalidSection { .. }));
+            assert!(matches!(
+                manager.snapshot(),
+                Err(ConfigError::InvalidSection { .. })
+            ));
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ use bone_agent::{
     AgentHandle, Autonomy, JobRequest, KernelConfig, Next, Notice, Operation, Runtime,
     RuntimeConfig, ToolCall, WorkResult,
 };
-use bone_cli::{Effort, ModelAdapter, SystemConfig, TaskConfig, read_only_tools};
+use bone_agent::{Effort, ModelAdapter, SystemConfig, TaskConfig, read_only_tools};
 use bone_llm::{Model, testing};
 use bone_tools::ToolEnvironment;
 use rig_core::{

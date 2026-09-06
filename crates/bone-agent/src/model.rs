@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-use bone_agent::{
+use crate::{
     ExternalEffect, InputReview, JobContext, JobError, JobErrorKind, JobOutcome, ModelInput,
     ModelPort, ModelTask, Operation, WorkResult,
 };

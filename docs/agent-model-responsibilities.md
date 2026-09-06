@@ -343,7 +343,7 @@ C1 的 `Pause` 只消费第一句，暂停旧工作，第二句仍须处理。
 1. **归还求解权。** `ports.rs` 定义两类请求与输出；Kernel 让主力直接选择工具、继续和交付，删除 `Analyze` 派工路径。
 2. **只在插话时协调。** `kernel.rs` 固定批次、暂存结果、区分记录位置与依据版本，落实三个选项和 Stop 顺序。
 3. **执行与可观测性。** `runtime.rs` 对可放弃调用实施外层取消，补齐暂存原因、权限变化和完成清理信息。
-4. **可控端口通过后接真实模型。** 调整 `bone-cli/src/model.rs` 的协议和配置路由，更新 walkthrough、crate README 与真实验收。
+4. **可控端口通过后接真实模型。** 在 `bone-agent/src/model.rs` 接入协议与配置，终端前端只使用 Agent API，更新 walkthrough、crate README 与真实验收。
 
 | 验收场景 | 必须得到的结果 |
 | --- | --- |

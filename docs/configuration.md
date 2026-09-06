@@ -1,73 +1,87 @@
 # Configuration
 
-BONE keeps non-secret configuration behind one typed service. Human-facing
-clients can call that service directly, while agents use the `config` tool in
-`bone-tools`; neither interface parses or writes configuration independently.
+`bone-config` is the shared configuration store. Each module defines its own
+`ConfigSection`; the store handles registration, validation, snapshots, and
+atomic writes without depending on those modules.
 
-## Storage
+## One file, module-owned sections
 
-`ConfigManager::builder()` registers sections and `build` accepts an explicit
-absolute JSON path supplied by the host. A normal application host should use
-its platform configuration directory, for example
-`$XDG_CONFIG_HOME/bone/config.json` on Unix. The file is a top-level map from
-registered section names to complete section values:
+| Section | Owner | Settings |
+| --- | --- | --- |
+| `agent.system` | `bone-agent` | Coordinator, default solver, model deadlines, tool reminder, shutdown grace. |
+| `llm.system` | `bone-llm` | Optional `credential_root` for the current ChatGPT connection. |
+| `tools.local` | `bone-tools` | `ToolLimits`, including output, read, search, and shell limits. |
+| `tui.display` | `bone-tui` | `show_progress`, default true. |
 
-```json
-{
-  "tools.local": {
-    "max_output_bytes": 51200
-  },
-  "tools.forge": {
-    "default_connection": "github-work"
-  }
-}
+See the [complete example](../crates/bone-tui/config.example.json). Only
+`agent.system` is required; the other sections and individual tool limits use
+defaults when omitted. Model IDs must be selected explicitly.
+
+`bone_config::default_path()` resolves `BONE_CONFIG`, then
+`$XDG_CONFIG_HOME/bone/config.json`, then `$HOME/.config/bone/config.json`.
+Selected paths must be absolute. `ConfigManager::builder().build(path)` still
+accepts an explicit path for embedded applications and tests.
+
+```rust,ignore
+let config = bone_agent::config_builder()?
+    .register::<bone_tui::TuiConfig>()?
+    .build(bone_config::default_path()?)?;
 ```
 
-Each consumer owns a typed `ConfigSection` with a stable key, description,
-JSON Schema, and validation function. `bone-config` owns storage and does not
-depend on providers or tools. Unknown sections and invalid section values are
-rejected when a configuration is loaded or changed.
+Agent's builder registers Agent, LLM, and Tools settings. TUI adds only its
+presentation settings. Registration is complete before `build`; each manager
+then has a fixed set of known types and schemas.
 
-A snapshot is immutable and carries an opaque revision derived from the whole
-configuration. Replacing or removing a section requires the revision the
-caller read. The manager takes a cross-process lock, rereads and validates the
-file, compares the revision, and atomically replaces the file. A stale writer
-receives a conflict instead of overwriting newer configuration. Lock contention
-returns a retryable `Busy` error instead of waiting without a deadline.
+## Reading and writing
 
-New files are private by default, but existing non-secret configuration does
-not have to be mode `0600`; this keeps it usable in ordinary human-managed and
-shared workspaces. Regular-file and no-final-symlink checks still guard the
-atomic persistence boundary, and an existing file's Unix permission bits are
-preserved across writes. Strong no-follow guarantees currently apply on Unix;
-other platforms require equivalent protection from the host environment.
+A snapshot contains one complete file revision. Registered sections are
+validated through Serde and the module's `validate()` function. JSON Schema is
+available for editors; it does not replace those checks.
 
-There is deliberately no implicit environment overlay, project inheritance,
-deep merge, or hot mutation of existing provider and tool instances. The host
-constructs those instances from a snapshot and decides when to rebuild them.
+Unregistered sections remain in the snapshot and are preserved during writes.
+Their values have not been validated by this manager. They can be listed with
+`unrecognized_sections()`; the terminal reports their names. Typed reads and
+mutations require registration, so one component cannot silently edit an
+unknown section. Misspelled required section names still produce a missing
+configuration error.
 
-## Agent model settings
+```rust,ignore
+let snapshot = config.snapshot()?;
+let settings = snapshot.get::<bone_tui::TuiConfig>()?.unwrap_or_default();
+let change = config.set(&settings, snapshot.revision())?;
+```
 
-`bone-cli` owns the `SystemConfig` section keyed by `agent.system` and loads
-it through `ConfigManager`. It contains `coordinator` and `default_solver`,
-each with a model ID, optional reasoning `effort`, and `timeout_seconds`
-(positive, default 120). See the [example](../crates/bone-cli/config.example.json).
+Writes replace one complete section. The store locks, rereads the whole file,
+checks the expected revision, and atomically replaces it. A stale writer gets
+`RevisionConflict`; lock contention returns `Busy`. Unknown sections and other
+modules' values survive the operation. There is no implicit merge or retry.
 
-The coordinator handles only busy-time input review (`ReviewInput`); the solver
-owns task reasoning, tools, and delivery (`Work`). The coordinator is a system
-setting injected when the host creates a session.
-It is not part of task configuration. `TaskConfig` overrides only solver
-settings, leaving the system snapshot and file unchanged. In the CLI, solver
-model selection is `--model`, then `BONE_MODEL`, then the system default;
-model-only overrides retain the default solver's effort and deadline.
-This precedence is resolved explicitly by the CLI, outside the storage service.
+## When settings take effect
 
-The CLI reads `$XDG_CONFIG_HOME/bone/config.json`, falling back to
-`$HOME/.config/bone/config.json` when that directory variable is unset or empty.
-`BONE_CONFIG` can supply another absolute path. Task text and the workspace
-directory do not select the system configuration. The configuration manager
-is kept by the host and is not exposed as a task tool. Existing sessions keep
-their injected models and settings until shutdown.
+`bone_agent::start()` reads one new snapshot and resolves the task's solver,
+LLM connection, tool limits, and runtime settings from it. Existing sessions
+retain their captured settings. A saved change applies to the next session.
+The subscription connection currently allows one active session per credential
+root; close the old session before reopening it with that root.
+
+Coordinator selection is system-level. `TaskConfig` can override only the
+solver model, effort, and deadline. The terminal resolves `--model`, then
+`BONE_MODEL`, then the system default; overrides do not write back to the file.
+
+Agent's `soft_deadline_seconds` defaults to 30 and `shutdown_grace_seconds` to
+5. Model `timeout_seconds` defaults to 120. Tool durations are persisted as
+integer `default_bash_timeout_seconds` and `max_bash_timeout_seconds`; the Rust
+API still uses `Duration`. Saving a fractional second value is rejected rather
+than rounded.
+
+`llm.system.credential_root` selects the existing OAuth storage directory; it
+is not a credential value. Omitting it retains BONE's existing login path.
+The model library's protocol constructors remain available; this application
+entrypoint currently connects the ChatGPT subscription service.
+
+TUI reads display preferences at frontend startup. The store returns a
+`ConfigChange` with the saved revision; it does not send reload events or mutate
+running model/tool instances.
 
 ## Credentials
 

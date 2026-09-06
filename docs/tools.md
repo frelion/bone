@@ -9,11 +9,12 @@ implementations. The boundary has one owner at each layer:
   process, and configuration implementations;
 - `bone-agent` owns asynchronous job execution through its `ToolPort`.
 
-`bone-cli` is the composition root: it configures coordinator and solver models and concrete tools, then
-registers those tools with the Agent. `bone-agent` does not depend on the
-built-in implementations. In production code, Rig is confined to `bone-llm`.
+`bone-agent` is the composition root: it configures coordinator and solver
+models and concrete tools, then starts the runtime. `bone-tui` uses only
+`bone-agent` and `bone-config` from the workspace. In production code, Rig is
+confined to `bone-llm`.
 
-The complete workspace dependency map is kept in the
+The workspace composition overview is kept in the
 [README](../README.md#workspace).
 
 The first tool set is deliberately small:
@@ -33,9 +34,10 @@ The first tool set is deliberately small:
   non-secret configuration sections using optimistic revisions. Credentials
   are deliberately unavailable to the model.
 
-Every built-in implements `bone_tools::Tool`. The CLI adapts the read-only
-tools to `bone_agent::ToolPort`, converting validated JSON arguments and typed
-outputs at that boundary. An adapter supplies trusted external-effect metadata.
+Every built-in implements `bone_tools::Tool`. `bone-agent` currently adapts
+`read`, `glob`, and `grep` to `ToolPort`, converting validated JSON arguments
+and typed outputs at that boundary. An adapter supplies trusted external-effect
+metadata.
 The local coding tools capture an immutable workspace root and shared hard limits:
 
 ```rust,no_run
@@ -136,7 +138,13 @@ authorization, sandboxing, and audit policy remain host responsibilities.
   hostile concurrent path-replacement race. A runtime executing untrusted code
   must add a capability filesystem or OS sandbox.
 
-Default limits are centralized in `ToolLimits` and can be reduced by the host.
+`ToolLimits` owns the `tools.local` configuration section. Omitted fields use
+its existing defaults. `bone-agent::start` reads the section from its startup
+snapshot and passes it to `ToolEnvironment::with_limits`; later changes affect
+new sessions. The JSON fields `default_bash_timeout_seconds` and
+`max_bash_timeout_seconds` use positive integer seconds. Persisting subsecond
+Rust durations returns an error instead of truncating them.
+
 Model-requested limits can only narrow their corresponding hard limits.
 `max_output_bytes` applies to read/search output and to each Bash stream. Patch
 summaries are instead bounded indirectly by `max_patch_bytes` and

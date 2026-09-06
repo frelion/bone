@@ -1,8 +1,8 @@
 //! System interruption-review settings and task-local solver selection.
 
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
-use bone_config::{ConfigError, ConfigManager, ConfigSection};
+use bone_config::{ConfigError, ConfigSection, ConfigSnapshot};
 use bone_llm::protocol::openai_responses;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -14,13 +14,19 @@ use serde_json::Value;
 pub struct SystemConfig {
     pub coordinator: ModelSettings,
     pub default_solver: ModelSettings,
+    #[serde(default = "default_soft_deadline_seconds")]
+    #[schemars(range(min = 1))]
+    pub soft_deadline_seconds: u32,
+    #[serde(default = "default_shutdown_grace_seconds")]
+    #[schemars(range(min = 1))]
+    pub shutdown_grace_seconds: u32,
 }
 
 impl ConfigSection for SystemConfig {
     const KEY: &'static str = "agent.system";
 
     fn description() -> &'static str {
-        "System interruption reviewer and default solver. Loaded when a session starts."
+        "Agent models and runtime deadlines. Loaded when a session starts."
     }
 
     fn schema() -> Value {
@@ -33,20 +39,24 @@ impl ConfigSection for SystemConfig {
             .map_err(|message| format!("coordinator: {message}"))?;
         self.default_solver
             .validate()
-            .map_err(|message| format!("default_solver: {message}"))
+            .map_err(|message| format!("default_solver: {message}"))?;
+        if self.soft_deadline_seconds == 0 {
+            return Err("soft_deadline_seconds must be greater than zero".into());
+        }
+        if self.shutdown_grace_seconds == 0 {
+            return Err("shutdown_grace_seconds must be greater than zero".into());
+        }
+        Ok(())
     }
 }
 
 impl SystemConfig {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        ConfigManager::builder()
-            .register::<Self>()?
-            .build(path)?
-            .snapshot()?
+    pub fn from_snapshot(snapshot: &ConfigSnapshot) -> Result<Self, ConfigError> {
+        snapshot
             .get::<Self>()?
             .ok_or_else(|| ConfigError::InvalidSection {
                 section: Self::KEY.into(),
-                message: "section is required; run `bone --help` for setup".into(),
+                message: "section is required".into(),
             })
     }
 
@@ -109,7 +119,15 @@ fn default_timeout_seconds() -> u32 {
     120
 }
 
-/// The current CLI uses OpenAI Responses through the subscription adapter.
+fn default_soft_deadline_seconds() -> u32 {
+    30
+}
+
+fn default_shutdown_grace_seconds() -> u32 {
+    5
+}
+
+/// The agent uses OpenAI Responses through the subscription adapter.
 /// Unsupported model/effort combinations are reported by that provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]

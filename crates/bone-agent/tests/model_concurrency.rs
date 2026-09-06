@@ -7,7 +7,7 @@ use bone_agent::{
     KernelConfig, Next, Notice, Operation, RecordKind, Runtime, RuntimeConfig, ToolCall,
     ToolEffect, ToolPort, ToolSpec, WorkResult,
 };
-use bone_cli::{Effort, ModelAdapter};
+use bone_agent::{Effort, ModelAdapter};
 use bone_llm::{Model, Protocol, testing};
 use rig_core::{
     completion::{
