@@ -2,6 +2,7 @@
 name = "bone-tui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Terminal frontend for BONE"
 publish = false
 
@@ -12,9 +13,14 @@ path = "src/main.rs"
 [dependencies]
 bone-agent = { path = "../bone-agent" }
 bone-config = { path = "../bone-config" }
+crossterm = { workspace = true, features = ["event-stream", "bracketed-paste"] }
+futures-util.workspace = true
+ratatui.workspace = true
+ratatui-textarea.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]

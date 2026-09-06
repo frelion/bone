@@ -50,10 +50,11 @@ cargo run -p bone-tui -- "Reply with exactly: ok"
 cargo run -p bone-tui
 ```
 
-In the interactive form, use `/stop` to stop work and `/exit` to quit. The first
-run may require device authorization. `llm.system.credential_root` can select
-an independent credential directory; omitting it retains BONE's conventional
-directory.
+In the full-screen form, use `Ctrl-N` to create a conversation,
+`Alt-Up`/`Alt-Down` to switch, `Esc` to stop the current session, and `Ctrl-C`
+to exit. The first run may require device authorization.
+`llm.system.credential_root` can select an independent credential directory;
+omitting it retains BONE's conventional directory.
 
 ## Live certification
 

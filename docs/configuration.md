@@ -58,11 +58,17 @@ modules' values survive the operation. There is no implicit merge or retry.
 
 ## When settings take effect
 
-`bone_agent::start()` reads one new snapshot and resolves the task's solver,
-LLM connection, tool limits, and runtime settings from it. Existing sessions
-retain their captured settings. A saved change applies to the next session.
-The subscription connection currently allows one active session per credential
-root; close the old session before reopening it with that root.
+`bone_agent::connect()` reads `credential_root` and fixes that OAuth connection
+for the returned `AgentHost`'s lifetime. Each `AgentHost::start()` reads a fresh
+snapshot for Agent, tool, and runtime settings; existing sessions retain their
+captured settings. One Host can run several independent sessions concurrently.
+A separate live Host or process cannot connect the same credential root and
+receives `CredentialStoreBusy` until the original connection is released.
+Changing `credential_root` therefore takes effect on the next `connect`, while
+other saved settings take effect on the next session.
+
+`bone_agent::start()` remains the single-session convenience. It reads one
+snapshot, validates settings and local paths, then connects and starts Runtime.
 
 Coordinator selection is system-level. `TaskConfig` can override only the
 solver model, effort, and deadline. The terminal resolves `--model`, then

@@ -2,6 +2,7 @@
 name = "bone-llm"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Unified LLM model interface for BONE"
 publish = false
 

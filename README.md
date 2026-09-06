@@ -15,16 +15,15 @@ bone-config supplies configuration to all four modules.
 
 - `bone-agent`: session creation, model/tool integration, synchronous kernel,
   and asynchronous execution.
-- `bone-tui`: terminal input, replies, progress, and event export. Its BONE
+- `bone-tui`: full-screen multi-session interaction and event export. Its BONE
   dependencies are only `bone-agent` and `bone-config`.
 - `bone-config`: shared typed configuration, snapshots, and atomic persistence.
 - `bone-llm`: model protocols and service connections. It is a library.
 - `bone-tools`: native workspace tools and their execution limits.
 
-Each module owns its configuration types. Agent creation reads one fresh
-snapshot, builds the model and tools, then injects ordinary parameters into
-the kernel. Configuration changes affect later sessions; running sessions keep
-what they were created with.
+Each module owns its configuration types. `AgentHost` connects the model service
+once, then each session reads a fresh snapshot and builds its own model choices,
+tools, Kernel, and Runtime. Running sessions keep what they were created with.
 
 ## Run
 
@@ -38,11 +37,11 @@ remain valid. `BONE_CONFIG` can select another absolute configuration path.
 cargo run -p bone-tui
 ```
 
-The frontend currently uses line-based terminal interaction. Input stays open
-while work runs. `/stop` stops autonomous work; `/exit` closes the session.
-The application connects to the existing ChatGPT subscription service and
-reuses BONE's independent login; initial authorization is displayed in the
-terminal when needed.
+The full-screen frontend keeps several independent conversations running at
+once. `Ctrl-N` creates one, `Alt-Up` and `Alt-Down` switch the session rail,
+`Esc` stops work in the current conversation, and `Ctrl-C` exits. Every session
+keeps its own draft, history, jobs, and unread state while background work
+continues. Initial ChatGPT authorization is displayed before full-screen mode.
 
 For one request, pass its text:
 
@@ -52,8 +51,8 @@ cargo run -p bone-tui -- "Read Cargo.toml and list the workspace crates"
 
 Use `--model` to override the solver for this session. It takes precedence over
 `BONE_MODEL`, then the configured default. The coordinator remains a system
-setting. `--events session.jsonl` writes a new file containing the initial
-snapshot and live kernel events.
+setting. For one-shot execution, `--events session.jsonl` writes a new file
+containing the initial snapshot and live kernel events.
 
 The solver owns reasoning, tools, and answers. The coordinator only interprets
 interruptions while the solver is busy. Uninterrupted work makes no coordinator
@@ -63,8 +62,8 @@ calls. The current application exposes `read`, `glob`, and `grep` tools.
 
 Start with [the Agent API](docs/agent.md), the
 [crate walkthrough](crates/bone-agent/README.md), and
-[shared configuration](docs/configuration.md). The researched design for the
-full-screen frontend is in [TUI architecture](docs/tui-architecture.md).
+[shared configuration](docs/configuration.md). The full-screen implementation
+is explained in [TUI architecture](docs/tui-architecture.md).
 
 ```sh
 cargo run -p bone-agent --example walkthrough

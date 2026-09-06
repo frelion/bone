@@ -41,12 +41,54 @@ pub enum StartError {
     Preparation(#[from] tokio::task::JoinError),
 }
 
+/// A connected application host that can start independent Agent sessions.
+///
+/// The model connection is shared, while every session reads fresh Agent,
+/// tool, and runtime settings and owns its own tools, Kernel, and Runtime.
+#[derive(Clone)]
+pub struct AgentHost {
+    manager: ConfigManager,
+    endpoint: Endpoint,
+}
+
+impl AgentHost {
+    pub async fn start(
+        &self,
+        workspace: impl AsRef<Path>,
+        task: TaskConfig,
+    ) -> Result<AgentHandle, StartError> {
+        let session = prepare(&self.manager, workspace.as_ref().to_path_buf(), task).await?;
+        session.spawn(self.endpoint.clone())
+    }
+}
+
+/// Connect once, then use the returned host to start independent sessions.
+pub async fn connect(
+    manager: &ConfigManager,
+    on_login: impl Fn(LoginPrompt) + Send + Sync + 'static,
+) -> Result<AgentHost, StartError> {
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| RuntimeError::NoTokioRuntime)?;
+    let owned_manager = manager.clone();
+    let credential_root = runtime
+        .spawn_blocking(move || -> Result<_, StartError> {
+            let snapshot = owned_manager.snapshot()?;
+            SystemConfig::from_snapshot(&snapshot)?;
+            credential_root(&snapshot)
+        })
+        .await??;
+    let endpoint = chatgpt_subscription::connect("bone-agent", credential_root, on_login).await?;
+    Ok(AgentHost {
+        manager: manager.clone(),
+        endpoint,
+    })
+}
+
 /// Start a session from one fresh configuration snapshot.
 ///
 /// Task settings, local tools, and paths are validated before connecting the
 /// model service. Later configuration changes apply to later sessions.
-/// The subscription connector permits one active session per credential root;
-/// await the previous handle's shutdown before starting another with that root.
+/// Use [`connect`] when several sessions should share one model connection.
 pub async fn start(
     manager: &ConfigManager,
     workspace: impl AsRef<Path>,
@@ -57,21 +99,36 @@ pub async fn start(
         tokio::runtime::Handle::try_current().map_err(|_| RuntimeError::NoTokioRuntime)?;
     let manager = manager.clone();
     let workspace = workspace.as_ref().to_path_buf();
-    let session = runtime
+    let (session, credential_root) = runtime
+        .spawn_blocking(move || {
+            let snapshot = manager.snapshot()?;
+            let session = PreparedSession::from_snapshot(&snapshot, &workspace, &task)?;
+            Ok::<_, StartError>((session, credential_root(&snapshot)?))
+        })
+        .await??;
+    let endpoint = chatgpt_subscription::connect("bone-agent", credential_root, on_login).await?;
+    session.spawn(endpoint)
+}
+
+async fn prepare(
+    manager: &ConfigManager,
+    workspace: PathBuf,
+    task: TaskConfig,
+) -> Result<PreparedSession, StartError> {
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| RuntimeError::NoTokioRuntime)?;
+    let manager = manager.clone();
+    runtime
         .spawn_blocking(move || {
             PreparedSession::from_snapshot(&manager.snapshot()?, &workspace, &task)
         })
-        .await??;
-    let endpoint =
-        chatgpt_subscription::connect("bone-agent", &session.credential_root, on_login).await?;
-    session.spawn(endpoint)
+        .await?
 }
 
 struct PreparedSession {
     system: SystemConfig,
     solver: ModelSettings,
     environment: ToolEnvironment,
-    credential_root: PathBuf,
 }
 
 impl PreparedSession {
@@ -84,15 +141,10 @@ impl PreparedSession {
         let solver = system.solver_for(task).map_err(StartError::Task)?;
         let limits = snapshot.get::<ToolLimits>()?.unwrap_or_default();
         let environment = ToolEnvironment::with_limits(workspace, limits)?;
-        let credential_root = snapshot
-            .get::<LlmConfig>()?
-            .unwrap_or_default()
-            .resolve_credential_root()?;
         Ok(Self {
             system,
             solver,
             environment,
-            credential_root,
         })
     }
 
@@ -119,15 +171,30 @@ impl PreparedSession {
     }
 }
 
+fn credential_root(snapshot: &ConfigSnapshot) -> Result<PathBuf, StartError> {
+    Ok(snapshot
+        .get::<LlmConfig>()?
+        .unwrap_or_default()
+        .resolve_credential_root()?)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+
     use bone_config::ConfigSection;
     use bone_llm::testing;
+    use bytes::Bytes;
     use rig_core::{
+        http_client::{
+            self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
+        },
         providers::openai,
         test_utils::{MockHttpResponse, SequencedHttpClient},
+        wasm_compat::WasmCompatSend,
     };
     use serde_json::{Value, json};
+    use tokio::sync::Barrier;
 
     use super::*;
     use crate::{
@@ -156,24 +223,21 @@ mod tests {
         config_builder().unwrap().build(path).unwrap()
     }
 
-    fn scripted_endpoint() -> (Endpoint, SequencedHttpClient) {
-        let responses =
-            [
-                WorkResult {
-                    autonomy: Autonomy::Run,
-                    operation: Some(Operation::Tool(ToolCall::new(
-                        "read",
-                        json!({"path": "note.txt"}),
-                    ))),
-                    ..Default::default()
-                },
-                WorkResult {
-                    reply: Some("Read completed".into()),
-                    next: Next::Finish,
-                    ..Default::default()
-                },
-            ]
-            .into_iter()
+    fn read_responses(sessions: usize) -> Vec<MockHttpResponse> {
+        (0..sessions)
+            .map(|_| WorkResult {
+                autonomy: Autonomy::Run,
+                operation: Some(Operation::Tool(ToolCall::new(
+                    "read",
+                    json!({"path": "note.txt"}),
+                ))),
+                ..Default::default()
+            })
+            .chain((0..sessions).map(|_| WorkResult {
+                reply: Some("Read completed".into()),
+                next: Next::Finish,
+                ..Default::default()
+            }))
             .enumerate()
             .map(|(index, work)| {
                 MockHttpResponse::success(json!({
@@ -186,8 +250,12 @@ mod tests {
                     "arguments": serde_json::to_string(&work).unwrap(), "status": "completed"
                 }]
             }).to_string())
-            });
-        let transport = SequencedHttpClient::new(responses);
+            })
+            .collect()
+    }
+
+    fn scripted_endpoint() -> (Endpoint, SequencedHttpClient) {
+        let transport = SequencedHttpClient::new(read_responses(1));
         let client = openai::Client::builder()
             .api_key("test-only-key")
             .http_client(transport.clone())
@@ -197,6 +265,72 @@ mod tests {
             testing::openai_responses_endpoint("application-test", client).unwrap(),
             transport,
         )
+    }
+
+    #[derive(Clone, Debug)]
+    struct ConcurrentHttpClient {
+        inner: SequencedHttpClient,
+        requests_ready: Arc<Barrier>,
+    }
+
+    impl ConcurrentHttpClient {
+        fn new(responses: impl IntoIterator<Item = MockHttpResponse>) -> Self {
+            Self {
+                inner: SequencedHttpClient::new(responses),
+                requests_ready: Arc::new(Barrier::new(2)),
+            }
+        }
+
+        fn requests(&self) -> usize {
+            self.inner.requests().len()
+        }
+    }
+
+    impl Default for ConcurrentHttpClient {
+        fn default() -> Self {
+            Self {
+                inner: SequencedHttpClient::default(),
+                requests_ready: Arc::new(Barrier::new(1)),
+            }
+        }
+    }
+
+    impl HttpClientExt for ConcurrentHttpClient {
+        fn send<T, U>(
+            &self,
+            request: Request<T>,
+        ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+        where
+            T: Into<Bytes> + WasmCompatSend,
+            U: From<Bytes> + WasmCompatSend + 'static,
+        {
+            let response = self.inner.send(request);
+            let requests_ready = Arc::clone(&self.requests_ready);
+            async move {
+                requests_ready.wait().await;
+                response.await
+            }
+        }
+
+        fn send_multipart<U>(
+            &self,
+            request: Request<MultipartForm>,
+        ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+        where
+            U: From<Bytes> + WasmCompatSend + 'static,
+        {
+            self.inner.send_multipart(request)
+        }
+
+        fn send_streaming<T>(
+            &self,
+            request: Request<T>,
+        ) -> impl Future<Output = http_client::Result<StreamingResponse>> + WasmCompatSend
+        where
+            T: Into<Bytes> + WasmCompatSend,
+        {
+            self.inner.send_streaming(request)
+        }
     }
 
     #[cfg(unix)]
@@ -217,25 +351,21 @@ mod tests {
         .unwrap();
         let manager = config_builder().unwrap().build(path).unwrap();
 
-        let session = PreparedSession::from_snapshot(
-            &manager.snapshot().unwrap(),
-            directory.path(),
-            &TaskConfig::default(),
-        )
-        .unwrap();
+        let snapshot = manager.snapshot().unwrap();
+        let session =
+            PreparedSession::from_snapshot(&snapshot, directory.path(), &TaskConfig::default())
+                .unwrap();
 
         assert_eq!(session.environment.limits(), &ToolLimits::default());
         assert_eq!(session.system.soft_deadline_seconds, 30);
         assert_eq!(session.system.shutdown_grace_seconds, 5);
         assert_eq!(
-            session.credential_root,
+            credential_root(&snapshot).unwrap(),
             LlmConfig::default().resolve_credential_root().unwrap()
         );
     }
 
-    async fn run_read(session: PreparedSession, expected_lines: u64) {
-        let (endpoint, transport) = scripted_endpoint();
-        let handle = session.spawn(endpoint).unwrap();
+    async fn read_with(handle: AgentHandle, expected_lines: u64) {
         let mut observation = handle.observe().await.unwrap();
         handle.post("Read note.txt").await.unwrap();
         let mut effects = Vec::new();
@@ -276,10 +406,15 @@ mod tests {
             effect,
             EffectSummary::WakeAfter { delay, .. } if *delay == Duration::from_secs(3)
         )));
+        assert!(handle.shutdown().await.unwrap().unresolved_jobs.is_empty());
+    }
+
+    async fn run_read(session: PreparedSession, expected_lines: u64) {
+        let (endpoint, transport) = scripted_endpoint();
+        read_with(session.spawn(endpoint).unwrap(), expected_lines).await;
         let request: Value = serde_json::from_slice(&transport.requests()[0].body).unwrap();
         assert_eq!(request["model"], "solver");
         assert_eq!(request["reasoning"]["effort"], "high");
-        assert!(handle.shutdown().await.unwrap().unresolved_jobs.is_empty());
     }
 
     #[tokio::test]
@@ -296,7 +431,10 @@ mod tests {
         let first =
             PreparedSession::from_snapshot(&snapshot, directory.path(), &TaskConfig::default())
                 .unwrap();
-        assert_eq!(first.credential_root, directory.path().join("credentials"));
+        assert_eq!(
+            credential_root(&snapshot).unwrap(),
+            directory.path().join("credentials")
+        );
         manager
             .set_value(
                 ToolLimits::KEY,
@@ -316,6 +454,70 @@ mod tests {
             manager.snapshot().unwrap().value("another.frontend"),
             Some(&json!({"theme": "dark"}))
         );
+        assert!(!directory.path().join("credentials").exists());
+    }
+
+    #[tokio::test]
+    async fn host_reuses_its_endpoint_and_reads_fresh_configuration_for_each_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = configured_store(directory.path());
+        std::fs::write(directory.path().join("note.txt"), "one\ntwo\n").unwrap();
+        let transport = ConcurrentHttpClient::new(read_responses(2));
+        let client = openai::Client::builder()
+            .api_key("test-only-key")
+            .http_client(transport.clone())
+            .build()
+            .unwrap();
+        let endpoint = testing::openai_responses_endpoint("application-test", client).unwrap();
+        let host = AgentHost {
+            manager: manager.clone(),
+            endpoint,
+        };
+
+        let first = host
+            .start(directory.path(), TaskConfig::default())
+            .await
+            .unwrap();
+        let snapshot = manager.snapshot().unwrap();
+        manager
+            .set_value(
+                ToolLimits::KEY,
+                json!({"max_read_lines": 2}),
+                snapshot.revision(),
+            )
+            .unwrap();
+        let second = host
+            .start(directory.path(), TaskConfig::default())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(read_with(first, 1), read_with(second, 2));
+        })
+        .await
+        .expect("both sessions must reach the shared transport concurrently");
+        assert_eq!(transport.requests(), 4);
+    }
+
+    #[tokio::test]
+    async fn connecting_a_host_requires_valid_agent_settings_before_authorization() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        std::fs::write(
+            &path,
+            json!({
+                "llm.system": {"credential_root": directory.path().join("credentials")}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let manager = config_builder().unwrap().build(path).unwrap();
+
+        assert!(matches!(
+            connect(&manager, |_: LoginPrompt| panic!("invalid host must not request login")).await,
+            Err(StartError::Configuration(ConfigError::InvalidSection { section, .. }))
+                if section == SystemConfig::KEY
+        ));
         assert!(!directory.path().join("credentials").exists());
     }
 

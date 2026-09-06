@@ -1,11 +1,16 @@
-use std::{env, error::Error, io::Write, path::PathBuf, process::ExitCode};
-
-use bone_agent::{AgentHandle, JobRequest, Notice, TaskConfig};
-use bone_tui::{TuiConfig, write_events};
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    sync::broadcast,
+use std::{
+    env,
+    error::Error,
+    io::{self, IsTerminal},
+    path::PathBuf,
+    process::ExitCode,
 };
+
+use bone_agent::{
+    AgentHandle, JobRequest, Notice, Observation, RecordEntry, RecordKind, TaskConfig,
+};
+use bone_tui::{TuiConfig, write_events};
+use tokio::sync::broadcast::error::RecvError;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -23,6 +28,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if arguments.help {
         print_help();
         return Ok(());
+    }
+    if arguments.message.is_empty() && arguments.events.is_some() {
+        return Err(
+            invalid_input("--events is currently available only with one-shot messages").into(),
+        );
     }
 
     let config = bone_agent::config_builder()?
@@ -45,14 +55,26 @@ async fn run() -> Result<(), Box<dyn Error>> {
         ..TaskConfig::default()
     };
     let workspace = env::current_dir()?;
-    let agent = bone_agent::start(&config, &workspace, task, |prompt| {
-        eprintln!(
-            "ChatGPT authorization required.\nOpen: {}\nCode: {}\nDo not share this code.\n",
-            prompt.verification_uri, prompt.user_code
+    let input = arguments.message;
+    if input.is_empty() {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Err(invalid_input(
+                "interactive mode requires a terminal; pass a message as an argument",
+            )
+            .into());
+        }
+        let host = bone_agent::connect(&config, show_login).await?;
+        let reports = bone_tui::run(&host, workspace, task, &display).await?;
+        report_unresolved(
+            reports
+                .iter()
+                .flat_map(|report| &report.unresolved_jobs)
+                .count(),
         );
-    })
-    .await?;
-    let mut notices = agent.subscribe();
+        return Ok(());
+    }
+
+    let agent = bone_agent::start(&config, &workspace, task, show_login).await?;
     let event_log = match arguments.events {
         Some(path) => {
             let file = match tokio::fs::OpenOptions::new()
@@ -72,14 +94,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    let input = arguments.message;
-    let result = if input.is_empty() {
-        println!("BONE · {}", workspace.display());
-        println!("Type /stop to stop work, /exit to quit.\n");
-        interactive(&agent, &mut notices, &display).await
-    } else {
-        one_shot(&agent, &mut notices, input, &display).await
-    };
+    let observation = agent.observe().await?;
+    let result = one_shot(&agent, observation, input, &display).await;
 
     // Close even when stdin or the model failed. Shutdown collects late results.
     let shutdown = agent.shutdown().await;
@@ -89,83 +105,93 @@ async fn run() -> Result<(), Box<dyn Error>> {
         None => Ok(()),
     };
     let report = shutdown?;
-    if !report.unresolved_jobs.is_empty() {
-        eprintln!(
-            "{} job(s) remain unresolved after shutdown.",
-            report.unresolved_jobs.len()
-        );
-    }
+    report_unresolved(report.unresolved_jobs.len());
     result?;
     logged?;
     Ok(())
 }
 
-async fn interactive(
-    agent: &AgentHandle,
-    notices: &mut broadcast::Receiver<Notice>,
-    display: &TuiConfig,
-) -> Result<(), Box<dyn Error>> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    prompt()?;
-    loop {
-        tokio::select! {
-            line = lines.next_line() => {
-                let Some(line) = line? else { return Ok(()); };
-                match line.trim() {
-                    "/exit" => return Ok(()),
-                    "/stop" => agent.stop().await?,
-                    "" => {},
-                    text => { agent.post(text).await?; },
-                }
-                prompt()?;
-            }
-            notice = notices.recv() => match notice {
-                Ok(notice) => show(&notice, display),
-                Err(broadcast::error::RecvError::Lagged(count)) => {
-                    eprintln!("[{count} notifications skipped; session history remains available]");
-                }
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
-            },
-        }
+fn show_login(prompt: bone_agent::LoginPrompt) {
+    eprintln!(
+        "ChatGPT authorization required.\nOpen: {}\nCode: {}\nDo not share this code.\n",
+        prompt.verification_uri, prompt.user_code
+    );
+}
+
+fn report_unresolved(count: usize) {
+    if count > 0 {
+        eprintln!("{count} job(s) remain unresolved after shutdown.");
     }
 }
 
 async fn one_shot(
     agent: &AgentHandle,
-    notices: &mut broadcast::Receiver<Notice>,
+    mut observation: Observation,
     input: String,
     display: &TuiConfig,
 ) -> Result<(), Box<dyn Error>> {
+    let mut record_cursor = observation.snapshot.record_cursor;
     agent.post(input).await?;
     let mut last_error = None;
     loop {
-        match notices.recv().await {
-            Ok(notice) => {
-                show(&notice, display);
-                match notice {
-                    Notice::Finished { .. } | Notice::Stopped => return Ok(()),
-                    Notice::Error { message } => last_error = Some(message),
-                    Notice::Paused => {
-                        return match last_error {
-                            Some(message) => Err(std::io::Error::other(message).into()),
-                            None => Ok(()),
-                        };
-                    }
-                    _ => {}
+        match observation.events.recv().await {
+            Ok(step) if step.sequence == observation.sequence + 1 => {
+                observation.sequence = step.sequence;
+                if let Some(result) =
+                    consume_records(&step.records, &mut record_cursor, &mut last_error, display)
+                {
+                    return result.map_err(Into::into);
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(count)) => {
-                return Err(
-                    std::io::Error::other(format!("missed {count} agent notifications")).into(),
-                );
+            Ok(_) | Err(RecvError::Lagged(_)) => {
+                observation = agent.observe().await?;
+                let unseen = observation
+                    .snapshot
+                    .record
+                    .iter()
+                    .filter(|entry| entry.cursor > record_cursor)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some(result) =
+                    consume_records(&unseen, &mut record_cursor, &mut last_error, display)
+                {
+                    return result.map_err(Into::into);
+                }
             }
-            Err(broadcast::error::RecvError::Closed) => {
+            Err(RecvError::Closed) => {
                 return Err(
                     std::io::Error::other("agent closed before completing the request").into(),
                 );
             }
         }
     }
+}
+
+fn consume_records(
+    records: &[RecordEntry],
+    cursor: &mut u64,
+    last_error: &mut Option<String>,
+    display: &TuiConfig,
+) -> Option<Result<(), io::Error>> {
+    for entry in records {
+        *cursor = entry.cursor;
+        let RecordKind::Notice(notice) = &entry.kind else {
+            continue;
+        };
+        show(notice, display);
+        match notice {
+            Notice::Finished { .. } | Notice::Stopped => return Some(Ok(())),
+            Notice::Error { message } => *last_error = Some(message.clone()),
+            Notice::Paused => {
+                return Some(match last_error.take() {
+                    Some(message) => Err(io::Error::other(message)),
+                    None => Ok(()),
+                });
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn show(notice: &Notice, display: &TuiConfig) {
@@ -196,11 +222,6 @@ fn show(notice: &Notice, display: &TuiConfig) {
         }
         _ => {}
     }
-}
-
-fn prompt() -> std::io::Result<()> {
-    print!("you> ");
-    std::io::stdout().flush()
 }
 
 #[derive(Default)]
@@ -275,15 +296,20 @@ fn print_help() {
 Run the BONE agent in the current workspace.
 
 Usage:
-  bone                         Start an interactive conversation
+  bone                         Start the multi-session terminal workspace
   bone <message>               Complete one request, then shut down
-  bone --model <id> [message]   Select the solver for this session
-  bone --events <path> [message]  Write live kernel events as JSON Lines to a new file
+  bone --model <id> [message]  Select the solver for this session
+  bone --events <path> <message>  Write one session's live events as JSON Lines
   bone -- <message>            Treat the remaining arguments as task text
 
 Interactive commands:
-  /stop                        Stop autonomous work; keep the conversation open
-  /exit                        Shut down and exit
+  Ctrl-N                       Create a conversation
+  Alt-Up / Alt-Down            Switch conversations
+  Enter                        Send the current message
+  Ctrl-J                       Insert a newline
+  PageUp / PageDown            Read conversation history
+  Esc or /stop                 Stop work; keep the conversation open
+  Ctrl-C or /exit              Shut down and exit
 
 System configuration:
   Read $XDG_CONFIG_HOME/bone/config.json, or $HOME/.config/bone/config.json.
@@ -317,9 +343,10 @@ Other configuration sections (all optional):
   tools.local     workspace tool limits, such as max_read_lines
   tui.display     show_progress: true or false
 
-  Agent reads all runtime settings from one snapshot when the session starts.
-  Saved changes apply to the next session. Terminal display settings are read
-  when this frontend starts. Unrecognized sections are preserved and reported.
+  Agent and tool settings use a new snapshot when each session starts. Saved
+  changes apply to the next session; credential_root applies on the next BONE
+  connection. Display settings are read when this frontend starts.
+  Unrecognized sections are preserved and reported.
 
 Authentication:
   Uses the experimental ChatGPT subscription connector on Unix. First use may
@@ -330,8 +357,9 @@ The Agent exposes read, glob, and grep tools. Run it from the intended workspace
 content read by tools is sent to the model. Input remains available while jobs run.
 
 Event observation:
-  --events writes a baseline snapshot, then each kernel input, new records, and
-  emitted instructions. Model starts reference their input's record position.
+  In one-shot mode, --events writes a baseline snapshot, then each kernel input,
+  new records, and emitted instructions. Model starts reference their input's
+  record position.
   Existing files are never overwritten. The log includes session inputs and
   outputs; authentication traffic and model-internal reasoning are not captured.
   A slow consumer cannot block the agent; missed steps appear as gap records."
@@ -342,13 +370,11 @@ Event observation:
 mod tests {
     use std::{future::Future, pin::Pin, sync::Arc};
 
+    use super::{Arguments, TuiConfig, one_shot};
     use bone_agent::{
         Autonomy, JobContext, JobOutcome, ModelInput, ModelPort, Next, Notice, RecordKind, Runtime,
         WorkResult,
     };
-    use tokio::sync::broadcast;
-
-    use super::{Arguments, TuiConfig, one_shot};
 
     struct ClarifyingModel;
 
@@ -380,10 +406,10 @@ mod tests {
             Default::default(),
         )
         .unwrap();
-        let mut notices = agent.subscribe();
+        let observation = agent.observe().await.unwrap();
         one_shot(
             &agent,
-            &mut notices,
+            observation,
             "Inspect the file".into(),
             &TuiConfig::default(),
         )
@@ -393,12 +419,6 @@ mod tests {
             matches!(&entry.kind, RecordKind::Notice(Notice::Reply { text, .. })
                 if text == "Which file should I inspect?")
         }));
-        // one_shot shows each consumed notice. A reply behind Paused would be
-        // left here and silently lost when the frontend begins shutdown.
-        assert!(matches!(
-            notices.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
         agent.shutdown().await.unwrap();
     }
 

@@ -1,7 +1,9 @@
 //! A complete agent session, with models and tools executed as ordinary jobs.
 //!
-//! Frontends register settings with [`config_builder`] and create a configured
-//! session with [`start`]. Each session keeps its startup configuration snapshot.
+//! Frontends register settings with [`config_builder`], [`connect`] an
+//! [`AgentHost`], and start independent sessions from it. [`start`] remains a
+//! convenience for one session. Each session keeps its startup configuration
+//! snapshot.
 //!
 //! [`Kernel::step`] records observations and returns [`Effect`]s. [`Runtime`]
 //! executes them without waiting in the inbox loop. The solver owns task
@@ -21,7 +23,7 @@ mod tools;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub use app::{StartError, config_builder, start};
+pub use app::{AgentHost, StartError, config_builder, connect, start};
 pub use bone_llm::service::chatgpt_subscription::DeviceCodePrompt as LoginPrompt;
 pub use config::{Effort, ModelSettings, SystemConfig, TaskConfig};
 pub use kernel::{Kernel, KernelConfig, KernelError};

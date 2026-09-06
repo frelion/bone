@@ -36,12 +36,12 @@ See the [crate guide](../crates/bone-agent/README.md) for use cases and the
 
 ```rust,ignore
 let config = bone_agent::config_builder()?.build(bone_config::default_path()?)?;
-let agent = bone_agent::start(
-    &config,
-    workspace,
-    bone_agent::TaskConfig::default(),
-    |login| println!("Open {} and enter {}", login.verification_uri, login.user_code),
-).await?;
+let host = bone_agent::connect(&config, |login| {
+    println!("Open {} and enter {}", login.verification_uri, login.user_code)
+}).await?;
+let agent = host
+    .start(workspace, bone_agent::TaskConfig::default())
+    .await?;
 
 let mut notices = agent.subscribe();
 let receipt = agent.post("Investigate the failing test").await?;
@@ -49,12 +49,13 @@ agent.stop().await?;
 let report = agent.shutdown().await?;
 ```
 
-`start` captures one fresh configuration snapshot, builds the native tools,
-connects models, and starts Runtime. Its login callback lets the frontend show
-initial authorization without depending on LLM protocol code. Registered
-settings and local paths are checked before connecting. The existing
-subscription service holds one connection per credential directory: await
-shutdown before starting another session with the same directory.
+`connect` authorizes once and returns an `AgentHost`. One Host can start several
+independent sessions concurrently over that connection. Its `credential_root`
+is fixed when the Host connects; each `AgentHost::start` reads a fresh snapshot
+for Agent, tool, and runtime settings. A separate live Host or process using the
+same credential directory receives `CredentialStoreBusy`. Single-session
+programs may use the `bone_agent::start` convenience, which validates settings
+and local paths before it requests authorization.
 
 `bone-tui` depends only on `bone-agent` and `bone-config` among BONE crates.
 It owns terminal input, display preferences, and JSONL export. Model prompts,
@@ -97,7 +98,7 @@ records remain available, but missed raw steps are not replayed. Ordinary
 progress is coalesced per job. Observers act through explicit handle commands.
 
 ```sh
-cargo run -p bone-tui -- --events session.jsonl
+cargo run -p bone-tui -- --events session.jsonl "Inspect the workspace"
 ```
 
 This independent consumer writes a new JSONL file: baseline `snapshot`, live

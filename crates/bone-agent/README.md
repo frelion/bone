@@ -168,7 +168,7 @@ loop {
 终端前端可写出同一端口的事件：
 
 ```sh
-cargo run -p bone-tui -- --events session.jsonl
+cargo run -p bone-tui -- --events session.jsonl "Inspect the workspace"
 ```
 
 文件必须不存在。JSONL 先写 `snapshot`，随后 `step`，落后时写 `gap`。
@@ -178,8 +178,8 @@ cargo run -p bone-tui -- --events session.jsonl
 ## 模型配置的归属
 
 协调是系统级配置；主力允许任务级选择。两种用途可以选同一型号，但不能共用一把跨请求的锁。
-`bone-agent::start` 从一次配置快照构造模型、工具和 Runtime；Kernel 仍然只接收普通参数，
-不读取配置或选择提供商。
+`AgentHost::start` 每次从新配置快照构造模型、工具和 Runtime；Kernel 仍然只接收普通参数，
+不读取配置或选择提供商。Host 建立时读取一次 `credential_root`，其生命周期内保持该连接不变。
 
 ```json
 {
@@ -192,7 +192,7 @@ cargo run -p bone-tui -- --events session.jsonl
 
 配置默认在 `$XDG_CONFIG_HOME/bone/config.json`，该目录未设置时用 `$HOME/.config/bone/config.json`。
 `BONE_CONFIG` 可指定另一个绝对路径。`config_builder()` 注册 Agent、LLM 和 Tools 配置，
-前端可继续注册自己的配置段。配置在会话创建时读取，已有会话不热更新。
+前端可继续注册自己的配置段。除 Host 的 `credential_root` 外，配置在会话创建时读取，已有会话不热更新。
 主力型号优先级：`--model`、`BONE_MODEL`、`default_solver.model`；不会修改协调或写回配置。
 `TaskConfig` 也可覆盖主力的 `effort` 和 `timeout_seconds`。
 独立推理强度支持 `none / minimal / low / medium / high / xhigh / max`，具体组合由提供商校验。
@@ -202,15 +202,14 @@ cargo run -p bone-tui -- --events session.jsonl
 
 ```rust,ignore
 let config = bone_agent::config_builder()?.build(bone_config::default_path()?)?;
-let agent = bone_agent::start(
-    &config,
-    workspace,
-    bone_agent::TaskConfig::default(),
-    |prompt| show_login(prompt),
-).await?;
+let host = bone_agent::connect(&config, |prompt| show_login(prompt)).await?;
+let first = host.start(workspace_a, bone_agent::TaskConfig::default()).await?;
+let second = host.start(workspace_b, bone_agent::TaskConfig::default()).await?;
 ```
 
-使用同一凭据目录重新创建会话前，应先等待旧会话 `shutdown()`；当前订阅连接在存活期间独占该目录。
+一个 Host 的 OAuth 连接可以同时支撑多个相互独立的会话。另一个 Host 或进程不能同时连接同一凭据目录；
+它会得到 `CredentialStoreBusy`，直到原 Host 及其会话释放连接。单会话程序可继续使用
+`bone_agent::start` 便利函数。
 
 | 方法 | 完成意味着什么 |
 | --- | --- |
