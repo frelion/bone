@@ -4,25 +4,35 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use fs2::FileExt;
+/// An application-defined name for one fail-fast OS file lease.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LeaseKey(String);
 
-/// A process-lifetime, fail-fast OS writer lease.
+impl LeaseKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A process-lifetime, fail-fast OS lease.
 ///
-/// It represents runtime ownership, not ordinary SQLite write serialization.
-/// Dropping it releases the native lock; a crashed process releases it when
-/// the operating system closes its file descriptors.
-#[must_use = "dropping a Lease immediately releases writer ownership"]
+/// It represents application ownership and is separate from SQLite's short
+/// write transactions. Dropping it releases the lock.
 pub struct Lease {
     path: PathBuf,
-    file: File,
+    _file: File,
 }
 
 impl Lease {
     pub(crate) fn new(path: PathBuf, file: File) -> Self {
-        Self { path, file }
+        Self { path, _file: file }
     }
 
-    /// Diagnostic-only sidecar path. Callers must never delete or replace it.
+    /// Diagnostic-only sidecar path. Callers must not replace it.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -37,8 +47,12 @@ impl fmt::Debug for Lease {
     }
 }
 
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+pub(crate) fn lease_file_name(key: &LeaseKey) -> String {
+    let mut encoded = String::with_capacity(key.as_str().len() * 2 + 5);
+    for byte in key.as_str().bytes() {
+        use std::fmt::Write;
+        let _ = write!(encoded, "{byte:02x}");
     }
+    encoded.push_str(".lock");
+    encoded
 }

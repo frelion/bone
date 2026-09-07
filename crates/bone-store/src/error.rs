@@ -5,20 +5,18 @@ use thiserror::Error;
 
 use crate::Revision;
 
-/// Failures from BONE's local durable store.
+/// Failures from the local durable store.
 ///
-/// This error deliberately does not contain stored document payloads. BONE
-/// state can contain user conversation text, so callers should surface a
-/// concise presentation error instead of logging arbitrary values.
+/// This error deliberately does not contain stored document payloads. Callers
+/// should surface a concise presentation error instead of logging arbitrary
+/// values.
 #[derive(Debug, Error)]
 pub enum StoreError {
-    #[error("BONE store root must be absolute: {path}")]
+    #[error("store root must be absolute: {path}")]
     RelativeRoot { path: PathBuf },
-    #[error("could not determine a default local BONE store root")]
-    MissingDefaultRoot,
-    #[error("unsafe BONE storage at {path}: {reason}")]
+    #[error("unsafe local storage at {path}: {reason}")]
     UnsafeStorage { path: PathBuf, reason: &'static str },
-    #[error("BONE storage is busy")]
+    #[error("local storage is busy")]
     Busy,
     #[error(
         "stored document changed since it was read (expected revision {expected}, actual {actual})"
@@ -31,19 +29,19 @@ pub enum StoreError {
     RevisionExhausted,
     #[error("persistent payload exceeds the {maximum_bytes}-byte limit")]
     PayloadTooLarge { maximum_bytes: usize },
-    #[error("internal BONE storage identifier is invalid")]
-    InvalidIdentifier,
-    #[error("BONE storage data is corrupt: {message}")]
+    #[error("a document or journal belongs to a different store")]
+    WrongStore,
+    #[error("persistent data is corrupt: {message}")]
     Corrupt { message: &'static str },
     #[error("system time cannot be represented as Unix milliseconds")]
     Clock,
-    #[error("BONE store schema version {found} is unsupported")]
+    #[error("store schema version {found} is unsupported")]
     UnsupportedSchema { found: i64 },
-    #[error("failed to encode BONE persistent data")]
+    #[error("failed to encode persistent data")]
     Encode(#[source] serde_json::Error),
-    #[error("failed to decode BONE persistent data")]
+    #[error("failed to decode persistent data")]
     Decode(#[source] serde_json::Error),
-    #[error("failed to {operation} BONE storage at {path}: {source}")]
+    #[error("failed to {operation} local storage at {path}: {source}")]
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -88,27 +86,6 @@ impl StoreError {
                 }
             }
             _ => Self::Sqlite { operation, source },
-        }
-    }
-}
-
-/// Redacted failures from a provider-managed OAuth cache.
-///
-/// The cache is owned by Rig and can contain refresh tokens. This boundary
-/// intentionally hides paths, file metadata, and all OAuth payloads.
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum ProviderAuthError {
-    #[error("provider credential cache is in use by another BONE process")]
-    Busy,
-    #[error("provider credential cache is unavailable or unsafe")]
-    Unavailable,
-}
-
-impl From<StoreError> for ProviderAuthError {
-    fn from(error: StoreError) -> Self {
-        match error {
-            StoreError::Busy => Self::Busy,
-            _ => Self::Unavailable,
         }
     }
 }

@@ -263,13 +263,12 @@ Compatible base URLs must be absolute HTTP(S) URLs without embedded
 credentials or query strings. Authentication and routing configuration are
 injected while constructing the endpoint.
 
-The ChatGPT subscription connector accepts a
-`bone_store::ProviderAuthLease`, acquired by the product composition root:
+The ChatGPT subscription connector accepts a narrow OAuth-cache capability,
+acquired by the product composition root:
 
 ```rust,ignore
-let auth = store
-    .provider_auth()
-    .acquire(ProviderId::ChatGptSubscription)?;
+let credentials = ChatGptCredentials::default_for_current_user()?;
+let auth = credentials.acquire()?;
 let endpoint = chatgpt_subscription::connect("bone-agent", auth, show_device_code).await?;
 ```
 
@@ -277,14 +276,14 @@ The lease holds an exclusive, verified `auth.json` path for Rig's OAuth cache.
 Rig remains the sole owner of that file's JSON schema and token refresh
 lifecycle. `bone-llm` never discovers a credential root, reads OAuth bytes, or
 deletes the file. The resulting `Endpoint` and every selected `Model` retain
-the lease; a second same-provider connection under the same store root returns
-Busy until all existing endpoint/model handles are dropped.
+the capability; a second same-provider connection returns Busy until all
+existing endpoint/model handles are dropped.
 
 The backend does not honor `max_output_tokens` or structured-output schemas,
 so BONE rejects those options locally instead of pretending they were applied.
 
 `bone-app` is the composition root: it opens `BoneStore`, resolves typed
 global/Workspace/Session settings into `ResolvedAgentRuntimeConfig`, acquires
-provider auth, creates `AgentHost::new(endpoint)`, and starts a runtime with
-that immutable config. `bone-agent` performs no storage/configuration read at
-runtime. See [configuration and storage](configuration.md).
+the provider credential capability, creates `AgentHost::new(endpoint)`, and
+starts a runtime with that immutable config. `bone-agent` performs no
+storage/configuration read at runtime. See [configuration and storage](configuration.md).

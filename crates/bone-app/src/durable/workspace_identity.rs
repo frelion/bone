@@ -336,15 +336,9 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
-        let store = BoneStore::open_at(
-            StoreRoots::new(
-                directory.path().join("data"),
-                directory.path().join("config"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        (directory, WorkspaceRegistry::new(store.workspace_state()))
+        let store =
+            BoneStore::open_at(StoreRoots::new(directory.path().join("data")).unwrap()).unwrap();
+        (directory, WorkspaceRegistry::new(store))
     }
 
     #[test]

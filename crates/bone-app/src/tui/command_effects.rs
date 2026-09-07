@@ -7,10 +7,9 @@
 
 use std::collections::HashMap;
 
-use bone_store::{ProviderAuthError, ProviderId};
-
 use crate::{
-    ModelResolution, ModelSelection, Scope, SessionLifecycle, SettingsService, WorkspaceApplication,
+    ChatGptCredentials, CredentialError, ModelResolution, ModelSelection, Scope, SessionLifecycle,
+    SettingsService, WorkspaceApplication,
 };
 
 use super::{
@@ -18,7 +17,7 @@ use super::{
     commands::{ConfigCommand, LocalCommand, ModelCommand},
     report_notice,
     session_controller::{
-        DurableUiSession, create_session, persist_model_readiness, require_writer_lease,
+        DurableUiSession, create_session, persist_model_readiness, require_writer,
     },
 };
 
@@ -27,6 +26,7 @@ use super::{
 /// parameter list.
 pub(super) struct CommandContext<'a> {
     pub(super) application: &'a WorkspaceApplication,
+    pub(super) credentials: &'a ChatGptCredentials,
     pub(super) settings: &'a SettingsService,
     pub(super) durable: &'a mut HashMap<UiSessionId, DurableUiSession>,
     pub(super) show_progress: bool,
@@ -46,7 +46,7 @@ pub(super) fn handle_command(
         );
         return false;
     };
-    if let Err(error) = require_writer_lease(session) {
+    if let Err(error) = require_writer(session) {
         report_notice(context.app, error);
         return false;
     }
@@ -61,7 +61,7 @@ pub(super) fn handle_command(
         LocalCommand::Status => {
             let model = context
                 .settings
-                .resolve_model(session.record.workspace_id, session.record.id)
+                .resolve_model(&session.record)
                 .ok()
                 .and_then(|resolution| match resolution {
                     ModelResolution::Ready { resolved, .. } => Some(resolved.selection.model),
@@ -100,21 +100,23 @@ pub(super) fn handle_command(
             false
         }
         LocalCommand::Rename(title) => {
-            match context.application.sessions().rename(
-                session
-                    .writer_lease
-                    .as_ref()
-                    .expect("writer lease was required"),
-                session.record.id,
-                session.record.revision,
-                title,
-            ) {
-                Ok(record) => {
+            match session
+                .writer
+                .as_mut()
+                .expect("writer was required")
+                .rename(title)
+            {
+                Ok(()) => {
+                    session.record = session
+                        .writer
+                        .as_ref()
+                        .expect("writer was required")
+                        .record()
+                        .clone();
                     let _ = context.app.reduce(AppEvent::DurableTitleChanged {
                         id,
-                        title: record.metadata.title.clone(),
+                        title: session.record.metadata.title.clone(),
                     });
-                    session.record = record;
                     report_notice(context.app, "Conversation renamed");
                 }
                 Err(error) => {
@@ -129,16 +131,19 @@ pub(super) fn handle_command(
         LocalCommand::Archive => {
             let mut record = session.record.clone();
             record.status.lifecycle = SessionLifecycle::Archived;
-            match context.application.sessions().replace(
-                session
-                    .writer_lease
-                    .as_ref()
-                    .expect("writer lease was required"),
-                record,
-                session.record.revision,
-            ) {
-                Ok(record) => {
-                    session.record = record;
+            match session
+                .writer
+                .as_mut()
+                .expect("writer was required")
+                .replace(record)
+            {
+                Ok(()) => {
+                    session.record = session
+                        .writer
+                        .as_ref()
+                        .expect("writer was required")
+                        .record()
+                        .clone();
                     report_notice(
                         context.app,
                         "Conversation archived; it will be hidden on next launch",
@@ -208,21 +213,16 @@ pub(super) fn handle_command(
         }
         LocalCommand::Login => true,
         LocalCommand::Logout => {
-            match context
-                .application
-                .store()
-                .provider_auth()
-                .clear(ProviderId::ChatGptSubscription)
-            {
+            match context.credentials.clear() {
                 Ok(()) => report_notice(
                     context.app,
                     "Local ChatGPT sign-in cache removed. The next connection will require login.",
                 ),
-                Err(ProviderAuthError::Busy) => report_notice(
+                Err(CredentialError::Busy) => report_notice(
                     context.app,
                     "Cannot log out while an active runtime owns the ChatGPT connection. Stop it or exit BONE, then retry.",
                 ),
-                Err(ProviderAuthError::Unavailable) => report_notice(
+                Err(CredentialError::Unavailable) => report_notice(
                     context.app,
                     "Could not access the local ChatGPT sign-in cache. Run /config doctor and repair storage before retrying.",
                 ),
@@ -236,7 +236,7 @@ pub(super) fn handle_command(
 }
 
 fn apply_model_command(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     settings: &SettingsService,
     session: &mut DurableUiSession,
     ui_id: UiSessionId,
@@ -257,20 +257,20 @@ fn apply_model_command(
         }
         ModelCommand::SetUserDefault { model } => (Scope::User, model),
         ModelCommand::Inherit => {
-            match application.sessions().set_solver_model_override(
-                session
-                    .writer_lease
-                    .as_ref()
-                    .expect("writer lease was required"),
-                session.record.id,
-                session.record.revision,
-                None,
-            ) {
-                Ok(record) => {
-                    session.record = record;
-                    let resolution = match settings
-                        .resolve_model(session.record.workspace_id, session.record.id)
-                    {
+            match session
+                .writer
+                .as_mut()
+                .expect("writer was required")
+                .set_solver_model_override(None)
+            {
+                Ok(()) => {
+                    session.record = session
+                        .writer
+                        .as_ref()
+                        .expect("writer was required")
+                        .record()
+                        .clone();
+                    let resolution = match settings.resolve_model(&session.record) {
                         Ok(resolution) => resolution,
                         Err(error) => {
                             report_notice(
@@ -319,62 +319,50 @@ fn apply_model_command(
             return false;
         }
     };
-    let change = match scope {
-        Scope::Session(_) => match application.sessions().set_solver_model_override(
-            session
-                .writer_lease
-                .as_ref()
-                .expect("writer lease was required"),
-            session.record.id,
-            session.record.revision,
-            Some(selection),
-        ) {
-            Ok(record) => {
-                session.record = record;
-                match settings.resolve_model(session.record.workspace_id, session.record.id) {
-                    Ok(ModelResolution::Ready { resolved, .. }) => {
-                        crate::ModelChange { scope, resolved }
-                    }
-                    Ok(ModelResolution::NeedsModel) => {
-                        report_notice(app, "Could not resolve the saved Session model");
-                        return false;
-                    }
-                    Err(error) => {
-                        report_notice(
-                            app,
-                            format!("Could not resolve the saved Session model: {error}"),
-                        );
-                        return false;
-                    }
+    match scope {
+        Scope::Session(_) => match session
+            .writer
+            .as_mut()
+            .expect("writer was required")
+            .set_solver_model_override(Some(selection))
+        {
+            Ok(()) => {
+                session.record = session
+                    .writer
+                    .as_ref()
+                    .expect("writer was required")
+                    .record()
+                    .clone();
+            }
+            Err(error) => {
+                report_notice(app, format!("Could not save model selection: {error}"));
+                return false;
+            }
+        },
+        Scope::User | Scope::Workspace(_) => {
+            match settings.set_solver_model(session.record.workspace_id, scope, selection) {
+                Ok(()) => {}
+                Err(error) => {
+                    report_notice(app, format!("Could not save model selection: {error}"));
+                    return false;
                 }
             }
-            Err(error) => {
-                report_notice(app, format!("Could not save model selection: {error}"));
-                return false;
-            }
-        },
-        Scope::User | Scope::Workspace(_) => match settings.set_solver_model(
-            session.record.workspace_id,
-            session.record.id,
-            scope,
-            selection,
-        ) {
-            Ok(change) => change,
-            Err(error) => {
-                report_notice(app, format!("Could not save model selection: {error}"));
-                return false;
-            }
-        },
-    };
-    if let Err(error) = refresh_session_record(application, session) {
-        report_notice(
-            app,
-            format!(
-                "Model selection was saved, but this conversation could not refresh its SQLite revision: {error}"
-            ),
-        );
-        return false;
+        }
     }
+    let resolution = match settings.resolve_model(&session.record) {
+        Ok(ModelResolution::Ready { resolved, .. }) => resolved,
+        Ok(ModelResolution::NeedsModel) => {
+            report_notice(app, "Could not resolve the saved model selection");
+            return false;
+        }
+        Err(error) => {
+            report_notice(
+                app,
+                format!("Could not resolve the saved model selection: {error}"),
+            );
+            return false;
+        }
+    };
     let _ = app.reduce(AppEvent::SessionModelReadiness {
         id: ui_id,
         ready: true,
@@ -382,30 +370,12 @@ fn apply_model_command(
     report_notice(
         app,
         format!(
-            "Saved solver {} at {:?} scope. An already attached runtime keeps its pinned model; a new or recreated runtime uses this saved selection.",
-            change.resolved.selection.model,
-            change.scope.kind()
+            "Saved solver at {:?} scope; the effective solver is {}. An already attached runtime keeps its pinned model; a new or recreated runtime uses this saved selection.",
+            scope.kind(),
+            resolution.selection.model,
         ),
     );
     true
-}
-
-/// A session-scoped model mutation writes the same SQLite document that the
-/// TUI later uses for draft/status CAS. Refresh the local projection before
-/// returning so `/model` cannot leave an otherwise healthy composer holding a
-/// stale document revision and reject the next user turn.
-fn refresh_session_record(
-    application: &WorkspaceApplication,
-    session: &mut DurableUiSession,
-) -> Result<(), String> {
-    let id = session.record.id;
-    let record = application
-        .sessions()
-        .get(id)
-        .map_err(|error| format!("could not reload conversation: {error}"))?
-        .ok_or_else(|| "conversation disappeared after its model setting was saved".to_owned())?;
-    session.record = record;
-    Ok(())
 }
 
 /// Model settings may be inherited by many logical sessions. Recompute their
@@ -421,19 +391,18 @@ fn refresh_model_readiness(
         .iter()
         .map(|(id, session)| {
             let ready = settings
-                .resolve_model(session.record.workspace_id, session.record.id)
+                .resolve_model(&session.record)
                 .is_ok_and(|resolution| matches!(resolution, ModelResolution::Ready { .. }));
-            (*id, ready, session.writer_lease.is_some())
+            (*id, ready, session.writer.is_some())
         })
         .collect::<Vec<_>>();
-    for (id, ready, owns_writer_lease) in readiness {
+    for (id, ready, owns_writer) in readiness {
         let _ = app.reduce(AppEvent::SessionModelReadiness { id, ready });
         // The setting itself is durable and globally visible immediately, but
         // a background SessionRecord belongs to its writer process. Its small
         // readiness projection will be reconciled when this process later
         // acquires that session's lease.
-        if owns_writer_lease
-            && let Err(error) = persist_model_readiness(application, durable, id, ready)
+        if owns_writer && let Err(error) = persist_model_readiness(application, durable, id, ready)
         {
             report_notice(
                 app,
@@ -448,14 +417,9 @@ mod tests {
     use bone_store::{BoneStore, StoreRoots};
 
     use super::*;
-    use crate::{ModelSelection, SettingsService, WorkspaceApplication};
+    use crate::{ModelSelection, WorkspaceApplication};
 
-    fn application() -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
-        WorkspaceApplication,
-        SettingsService,
-    ) {
+    fn application() -> (tempfile::TempDir, tempfile::TempDir, WorkspaceApplication) {
         let data = tempfile::tempdir().unwrap();
         #[cfg(unix)]
         std::fs::set_permissions(
@@ -464,44 +428,30 @@ mod tests {
         )
         .unwrap();
         let project = tempfile::tempdir().unwrap();
-        let store = BoneStore::open_at(
-            StoreRoots::new(data.path().join("data"), data.path().join("config")).unwrap(),
-        )
-        .unwrap();
-        let application =
-            WorkspaceApplication::open_with_store(project.path(), store.clone()).unwrap();
-        let settings = SettingsService::open(store).unwrap();
-        (data, project, application, settings)
+        let store = BoneStore::open_at(StoreRoots::new(data.path().join("data")).unwrap()).unwrap();
+        let application = WorkspaceApplication::open_with_store(project.path(), store).unwrap();
+        (data, project, application)
     }
 
     #[test]
-    fn model_document_mutation_refreshes_the_tui_session_revision() {
-        let (_data, _project, application, _settings) = application();
+    fn session_model_mutation_keeps_the_ui_mirror_current() {
+        let (_data, _project, application) = application();
         let opened = application.open_or_create_writer_draft().unwrap();
         let record = opened.draft.record;
-        let lease = opened.lease;
-        let initial_revision = record.revision;
-        application
-            .sessions()
-            .set_solver_model_override(
-                &lease,
-                record.id,
-                record.revision,
-                Some(ModelSelection::new("gpt-test", None, None).unwrap()),
-            )
+        let mut writer = opened.writer;
+        writer
+            .set_solver_model_override(Some(ModelSelection::new("gpt-test", None, None).unwrap()))
             .unwrap();
 
         let mut session = DurableUiSession {
             record,
             journal: None,
-            writer_lease: Some(lease),
+            writer: Some(writer),
             next_turn: 1,
             active_turn: None,
             runtime_record_cursor: 0,
         };
-        assert_eq!(session.record.revision, initial_revision);
-        refresh_session_record(&application, &mut session).unwrap();
-        assert!(session.record.revision > initial_revision);
+        session.record = session.writer.as_ref().unwrap().record().clone();
         assert_eq!(
             session
                 .record

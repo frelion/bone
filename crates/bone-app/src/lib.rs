@@ -8,27 +8,31 @@
 
 #![forbid(unsafe_code)]
 
+mod credentials;
 pub mod durable;
 mod product_workspace;
 mod settings;
+mod storage;
 pub mod tui;
 
+pub use credentials::{ChatGptAuthLease, ChatGptCredentials, CredentialError};
 pub use durable::{
     CanonicalPath, JournalEntry, JournalError, JournalFact, JournalRead, JournalSequence,
     RecordError, RegistryError, RuntimeAttachment, SessionAttention, SessionAvailability,
     SessionDraft, SessionExecution, SessionId, SessionJournal, SessionLeaseError, SessionLifecycle,
     SessionListing, SessionMetadata, SessionRecord, SessionStatus, SessionStore, SessionStoreError,
-    SessionStoreIssue, SessionWriterLease, TurnOutcome, UnixMillis, WorkspaceContext,
-    WorkspaceError, WorkspaceId, WorkspaceRegistry,
+    SessionStoreIssue, SessionWriter, TurnOutcome, UnixMillis, WorkspaceContext, WorkspaceError,
+    WorkspaceId, WorkspaceRegistry,
 };
 
 pub use product_workspace::{
     DraftDisposition, OpenDraft, OpenWriterDraft, WorkspaceApplication, WorkspaceApplicationError,
 };
 pub use settings::{
-    ApplyBoundary, GlobalAgentSettings, GlobalSettings, ModelChange, ModelResolution,
-    ModelSelection, ModelSelectionError, PUBLIC_SETTINGS, ResolvedModel, Scope, ScopeKind,
-    SettingDescriptor, SettingKey, SettingKeyError, SettingSource, SettingsError, SettingsService,
-    TuiDisplaySettings, WorkspaceSettings,
+    ApplyBoundary, GlobalAgentSettings, GlobalSettings, ModelResolution, ModelSelection,
+    ModelSelectionError, PUBLIC_SETTINGS, ResolvedModel, Scope, ScopeKind, SettingDescriptor,
+    SettingKey, SettingKeyError, SettingSource, SettingsError, SettingsService, TuiDisplaySettings,
+    WorkspaceSettings,
 };
+pub use storage::{AppStorageError, open_default_store};
 pub use tui::{TuiError, run_storage_repair, run_workspace, write_events};

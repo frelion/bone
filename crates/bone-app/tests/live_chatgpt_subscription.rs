@@ -1,10 +1,10 @@
 use std::time::Duration;
 
+use bone_app::ChatGptCredentials;
 use bone_llm::{
     FinishReason, InputItem, InputSource, Protocol, Request, StreamEvent, ToolChoice,
     ToolDefinition, ToolOutput, service::chatgpt_subscription,
 };
-use bone_store::{BoneStore, ProviderId};
 use futures_util::StreamExt;
 use serde_json::json;
 
@@ -19,11 +19,10 @@ async fn chatgpt_subscription_live_text_tool_and_replay_certification() {
 async fn run_live_certification() {
     let model_id = std::env::var("BONE_CHATGPT_MODEL")
         .expect("set BONE_CHATGPT_MODEL before running the ignored live test");
-    let auth = BoneStore::open_default()
-        .expect("default BONE store should open")
-        .provider_auth()
-        .acquire(ProviderId::ChatGptSubscription)
-        .expect("BONE provider-auth lease should be available");
+    let auth = ChatGptCredentials::default_for_current_user()
+        .expect("default ChatGPT credential root should resolve")
+        .acquire()
+        .expect("ChatGPT credential-cache lease should be available");
     let endpoint = chatgpt_subscription::connect("chatgpt-subscription-live", auth, |prompt| {
         println!("Authorize at {}", prompt.verification_uri);
         println!("Device code: {}", prompt.user_code);

@@ -1,6 +1,6 @@
 use std::{io, path::PathBuf};
 
-use bone_store::{Revision, StoreError};
+use bone_store::StoreError;
 use thiserror::Error;
 
 use super::{SessionId, WorkspaceId};
@@ -76,8 +76,6 @@ pub enum SessionStoreError {
     Record(#[from] RecordError),
     #[error("session does not exist: {0}")]
     NotFound(SessionId),
-    #[error("session already exists: {0}")]
-    AlreadyExists(SessionId),
     #[error("session document key {key_id} does not match stored record ID {record_id}")]
     RecordKeyMismatch {
         key_id: SessionId,
@@ -95,21 +93,8 @@ pub enum SessionStoreError {
         expected_workspace: WorkspaceId,
         actual_workspace: WorkspaceId,
     },
-    #[error(
-        "session {session_id} changed since it was read (expected revision {expected}, actual {actual})"
-    )]
-    RevisionConflict {
-        session_id: SessionId,
-        expected: Revision,
-        actual: Revision,
-    },
-    #[error(
-        "writer lease for conversation {lease_session_id} does not grant write ownership for conversation {session_id}"
-    )]
-    WriterLeaseMismatch {
-        session_id: SessionId,
-        lease_session_id: SessionId,
-    },
+    #[error("session {session_id} changed before it could be saved")]
+    RevisionConflict { session_id: SessionId },
     #[error("session {session_id} attempted to change immutable field {field}")]
     ImmutableField {
         session_id: SessionId,
@@ -145,14 +130,6 @@ pub enum JournalError {
     Session(#[from] SessionStoreError),
     #[error("journal belongs to a session that does not exist: {0}")]
     SessionNotFound(SessionId),
-    #[error(
-        "journal for session {session_id} changed since it was read (expected next sequence {expected_next}, actual {actual_next})"
-    )]
-    SequenceConflict {
-        session_id: SessionId,
-        expected_next: crate::JournalSequence,
-        actual_next: crate::JournalSequence,
-    },
     #[error("journal entry is invalid: {message}")]
     InvalidEntry { message: String },
 }

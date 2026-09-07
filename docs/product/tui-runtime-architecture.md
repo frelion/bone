@@ -41,7 +41,7 @@ nor background tasks mutate presentation state directly.
 
 | Layer | Owns | Does not own |
 | --- | --- | --- |
-| `bone-store` | one SQLite database, typed documents/journals, private lease paths | product models, arbitrary SQL callers, OAuth payloads |
+| `bone-store` | one SQLite database, generic keyed documents/journals/leases | product models, key layout, OAuth payloads |
 | `bone-app::durable` | Workspace identity, Session records, journal facts, writer lease policy | JSON/JSONL files, a second session index |
 | `SettingsService` | typed settings validation and model overlay | runtime storage reads or provider credentials |
 | TUI reducer | deterministic presentation state | persistence, runtime handles, locks |
@@ -52,18 +52,19 @@ nor background tasks mutate presentation state directly.
 ## Startup and composition
 
 The binary opens exactly one `BoneStore` for the application instance. It
-passes clones of that store to the Workspace application, settings service,
-and provider-auth capability rather than having each crate discover a storage
-root for itself.
+passes clones only to its Workspace and settings services; those App-owned
+services define the keys and typed records. It separately constructs the
+App-owned ChatGPT credential manager rather than letting feature crates
+discover a storage root.
 
 ```rust,ignore
-let store = BoneStore::open_default()?;
+let store = open_default_store()?;
 let application = WorkspaceApplication::open_with_store(current_dir, store.clone())?;
 let settings = SettingsService::open(store.clone())?;
-// The connection effect receives store.provider_auth() when login is needed.
+let credentials = ChatGptCredentials::default_for_current_user()?;
 ```
 
-`BoneStore::open_default` uses the XDG data root for BONE data:
+`bone-app::open_default_store` uses the XDG data root for BONE data:
 
 ```text
 $XDG_DATA_HOME/bone/store-v1/bone.sqlite3
@@ -76,9 +77,9 @@ editable Session draft. It intentionally does **not** choose a model or log
 the user in. A valid workbench with no resolved model projects `NeedsModel` and
 offers configuration commands rather than failing before the terminal starts.
 
-Tests, portable hosts, and future desktop hosts inject explicit absolute roots
-with `StoreRoots` and `BoneStore::open_at`. There are no BONE-specific path
-override environment variables.
+Tests, portable hosts, and future desktop hosts inject an explicit absolute
+data root through the App composition layer. The generic Store only accepts
+that root; there are no BONE-specific path override environment variables.
 
 ## Durable Workspace and Session lifecycle
 
@@ -185,14 +186,13 @@ $XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/auth.json
 # or ~/.config/bone/store-v1/providers/chatgpt-subscription/auth.json
 ```
 
-The connection effect acquires `ProviderAuthLease` before calling Rig. The
+The connection effect acquires `ChatGptAuthLease` before calling Rig. The
 lease holds a fail-fast exclusive `auth.lock`; it is retained by the endpoint
 and all derived model handles, preventing a second process from concurrently
 owning the same provider cache. The lease exposes only a previously validated
 path. It never parses, logs, or serializes OAuth data.
 
-`/logout` calls the sole deletion entry point,
-`ProviderAuthStore::clear(ChatGptSubscription)`. If any endpoint/model still
+`/logout` calls `ChatGptCredentials::clear`. If any endpoint/model still
 holds the lease, it reports Busy and changes nothing. A successful logout only
 removes the local OAuth cache; it does not claim to revoke an upstream account.
 
@@ -215,8 +215,8 @@ background observer therefore cannot make an unsynchronized UI change.
 
 ## Invariants worth preserving
 
-- One app instance opens one `BoneStore`; scoped clones are injected, never
-  rediscovered by feature crates.
+- One app instance opens one `BoneStore`; only App-owned persistence services
+  receive it, while feature crates receive resolved values or narrow capabilities.
 - BONE-owned data has one SQLite source of truth. JSON appears only as an
   internal serialized payload column, not a user-facing persistence format.
 - The reducer is the only writer of TUI presentation state.

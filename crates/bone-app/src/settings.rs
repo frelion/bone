@@ -1,8 +1,9 @@
 //! Typed BONE product settings.
 //!
 //! The user never has to edit a configuration file: this service reads and
-//! writes one SQLite-backed `GlobalSettings` document plus the Workspace and
-//! Session documents that naturally own model inheritance. No dynamic section
+//! writes one SQLite-backed `GlobalSettings` document plus Workspace settings.
+//! Session records are supplied by their owning session repository, so this
+//! service never depends on session storage layout. No dynamic section
 //! registry, JSON schema registry, raw config revision, or arbitrary setting
 //! map leaks into the TUI or Agent.
 
@@ -11,12 +12,12 @@ use std::{fmt, time::Duration};
 use bone_agent::{
     Effort, ModelSettings, ResolvedAgentRuntimeConfig, ResolvedAgentRuntimeConfigError,
 };
-use bone_store::{BoneStore, SettingsStore, StoreError, WorkspaceStateStore};
+use bone_store::{BoneStore, StoreError};
 use bone_tools::{ToolLimits, ToolLimitsError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{RecordError, SessionId, SessionRecord, WorkspaceId};
+use crate::{RecordError, SessionId, SessionRecord, WorkspaceId, durable::keys};
 
 const MAX_MODEL_ID_BYTES: usize = 256;
 const SETTINGS_RETRY_LIMIT: usize = 4;
@@ -328,29 +329,17 @@ impl ModelResolution {
     }
 }
 
-/// Result of a durable model mutation. Existing runtimes are not modified;
-/// the returned resolution applies to a future/new runtime boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelChange {
-    pub scope: Scope,
-    pub resolved: ResolvedModel,
-}
-
 /// Typed settings service backed by one injected `BoneStore`.
 #[derive(Clone, Debug)]
 pub struct SettingsService {
-    settings: SettingsStore,
-    state: WorkspaceStateStore,
+    store: BoneStore,
 }
 
 impl SettingsService {
     /// Open / initialize the global document inside an already-open BONE
     /// store. App composition opens `BoneStore` once, then injects it here.
     pub fn open(store: BoneStore) -> Result<Self, SettingsError> {
-        let service = Self {
-            settings: store.settings(),
-            state: store.workspace_state(),
-        };
+        let service = Self { store };
         service.ensure_global()?;
         Ok(service)
     }
@@ -363,32 +352,22 @@ impl SettingsService {
         self.update_global(|settings| settings.tui.show_progress = show_progress)
     }
 
-    /// Resolve a complete immutable Agent runtime snapshot for a logical
-    /// Session. The precedence is Session > Workspace > User; coordinator and
-    /// tool/deadline values always come from typed global settings.
-    pub fn resolve_model(
-        &self,
-        workspace: WorkspaceId,
-        session: SessionId,
-    ) -> Result<ModelResolution, SettingsError> {
+    /// Resolve a complete immutable Agent runtime snapshot for a supplied
+    /// Session record. The precedence is Session > Workspace > User;
+    /// coordinator and tool/deadline values always come from typed global
+    /// settings.
+    pub fn resolve_model(&self, session: &SessionRecord) -> Result<ModelResolution, SettingsError> {
+        session.validate()?;
         let global = self.read_global()?;
+        let workspace = session.workspace_id;
         let workspace_document = self
-            .state
-            .workspace_settings::<WorkspaceSettings>(workspace)?;
+            .store
+            .document::<WorkspaceSettings>(keys::workspace_settings(workspace));
         let workspace_snapshot = workspace_document.read()?;
         let workspace_settings = workspace_snapshot.value.unwrap_or_default();
         workspace_settings.validate()?;
-        let session_document = self.state.session::<SessionRecord>(workspace, session)?;
-        let session_snapshot = session_document.read()?;
-        let session_record = session_snapshot
-            .value
-            .ok_or(SettingsError::SessionNotFound(session))?;
-        if session_record.workspace_id != workspace || session_record.id != session {
-            return Err(SettingsError::ScopeMismatch);
-        }
-        session_record.validate()?;
 
-        let selected = if let Some(selection) = session_record.metadata.solver_model_override {
+        let selected = if let Some(selection) = session.metadata.solver_model_override.clone() {
             Some((selection, SettingSource::Session))
         } else if let Some(selection) = workspace_settings.default_solver {
             Some((selection, SettingSource::Workspace))
@@ -424,18 +403,16 @@ impl SettingsService {
 
     /// Write a User or Workspace model selection at its natural lifecycle
     /// object. Session overrides intentionally go through `SessionStore` with
-    /// that Session's writer lease; this service only resolves their overlay.
+    /// that Session's writer; this service only resolves their overlay.
     /// A missing coordinator resolves to the selected solver at runtime; only
     /// a user-wide solver choice may initialize the user-wide coordinator.
     pub fn set_solver_model(
         &self,
         workspace: WorkspaceId,
-        session: SessionId,
         scope: Scope,
         selection: ModelSelection,
-    ) -> Result<ModelChange, SettingsError> {
+    ) -> Result<(), SettingsError> {
         selection.validate()?;
-        validate_scope_target(scope, workspace, session)?;
         match scope {
             Scope::User => {
                 self.update_global(|settings| {
@@ -445,22 +422,23 @@ impl SettingsService {
                     }
                 })?;
             }
-            Scope::Workspace(_) => {
+            Scope::Workspace(scope_workspace) => {
+                if scope_workspace != workspace {
+                    return Err(SettingsError::ScopeMismatch);
+                }
                 self.update_workspace(workspace, |settings| {
                     settings.default_solver = Some(selection.clone());
                 })?;
             }
-            Scope::Session(_) => return Err(SettingsError::SessionScopeRequiresWriterLease),
+            Scope::Session(_) => return Err(SettingsError::SessionScopeRequiresWriter),
         }
-        let ModelResolution::Ready { resolved, .. } = self.resolve_model(workspace, session)?
-        else {
-            return Err(SettingsError::NeedsModel);
-        };
-        Ok(ModelChange { scope, resolved })
+        Ok(())
     }
 
     fn ensure_global(&self) -> Result<(), SettingsError> {
-        let document = self.settings.global::<GlobalSettings>();
+        let document = self
+            .store
+            .document::<GlobalSettings>(keys::global_settings());
         for _ in 0..SETTINGS_RETRY_LIMIT {
             let snapshot = document.read()?;
             if let Some(settings) = snapshot.value {
@@ -479,14 +457,19 @@ impl SettingsService {
 
     fn read_global(&self) -> Result<GlobalSettings, SettingsError> {
         self.ensure_global()?;
-        let snapshot = self.settings.global::<GlobalSettings>().read()?;
+        let snapshot = self
+            .store
+            .document::<GlobalSettings>(keys::global_settings())
+            .read()?;
         let settings = snapshot.value.ok_or(SettingsError::MissingGlobalSettings)?;
         settings.validate()?;
         Ok(settings)
     }
 
     fn update_global(&self, mutate: impl Fn(&mut GlobalSettings)) -> Result<(), SettingsError> {
-        let document = self.settings.global::<GlobalSettings>();
+        let document = self
+            .store
+            .document::<GlobalSettings>(keys::global_settings());
         for _ in 0..SETTINGS_RETRY_LIMIT {
             let snapshot = document.read()?;
             let mut settings = snapshot.value.unwrap_or_default();
@@ -507,8 +490,8 @@ impl SettingsService {
         mutate: impl Fn(&mut WorkspaceSettings),
     ) -> Result<(), SettingsError> {
         let document = self
-            .state
-            .workspace_settings::<WorkspaceSettings>(workspace)?;
+            .store
+            .document::<WorkspaceSettings>(keys::workspace_settings(workspace));
         for _ in 0..SETTINGS_RETRY_LIMIT {
             let snapshot = document.read()?;
             let mut settings = snapshot.value.unwrap_or_default();
@@ -538,17 +521,15 @@ pub enum SettingsError {
     ToolLimits(#[from] ToolLimitsError),
     #[error(transparent)]
     Record(#[from] RecordError),
-    #[error("session-scoped model settings require that conversation's writer lease")]
-    SessionScopeRequiresWriterLease,
+    #[error("session-scoped model settings require that conversation's writer")]
+    SessionScopeRequiresWriter,
     #[error("{field} must be greater than zero")]
     NonPositive { field: &'static str },
     #[error("settings changed repeatedly; please retry")]
     Contention,
     #[error("global settings document is missing after initialization")]
     MissingGlobalSettings,
-    #[error("session does not exist: {0}")]
-    SessionNotFound(SessionId),
-    #[error("setting scope does not belong to the current workspace/session")]
+    #[error("setting workspace does not belong to the current workspace")]
     ScopeMismatch,
     #[error("choose a model with /model <id> before starting work")]
     NeedsModel,
@@ -578,30 +559,17 @@ fn resolved_runtime(
     .map_err(Into::into)
 }
 
-fn validate_scope_target(
-    scope: Scope,
-    workspace: WorkspaceId,
-    session: SessionId,
-) -> Result<(), SettingsError> {
-    match scope {
-        Scope::User => Ok(()),
-        Scope::Workspace(scope_workspace) if scope_workspace == workspace => Ok(()),
-        Scope::Session(scope_session) if scope_session == session => Ok(()),
-        _ => Err(SettingsError::ScopeMismatch),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use bone_store::StoreRoots;
 
     use super::*;
-    use crate::WorkspaceApplication;
+    use crate::{CanonicalPath, SessionStore, WorkspaceContext, WorkspaceRegistry};
 
-    fn app() -> (
+    fn fixture() -> (
         tempfile::TempDir,
         tempfile::TempDir,
-        WorkspaceApplication,
+        SessionStore,
         SettingsService,
     ) {
         let data = tempfile::tempdir().unwrap();
@@ -612,47 +580,45 @@ mod tests {
         )
         .unwrap();
         let project = tempfile::tempdir().unwrap();
-        let store = BoneStore::open_at(
-            StoreRoots::new(data.path().join("data"), data.path().join("config")).unwrap(),
+        let store = BoneStore::open_at(StoreRoots::new(data.path().join("data")).unwrap()).unwrap();
+        let registry = WorkspaceRegistry::new(store.clone());
+        let canonical = CanonicalPath::new(std::fs::canonicalize(project.path()).unwrap()).unwrap();
+        let workspace = WorkspaceContext::from_canonical(
+            registry.resolve_or_create_canonical(&canonical).unwrap(),
+            canonical,
+            project.path(),
         )
         .unwrap();
-        let application =
-            WorkspaceApplication::open_with_store(project.path(), store.clone()).unwrap();
+        let sessions = SessionStore::new(store.clone(), workspace);
         let settings = SettingsService::open(store).unwrap();
-        (data, project, application, settings)
+        (data, project, sessions, settings)
     }
 
     #[test]
     fn empty_store_is_usable_but_needs_a_model() {
-        let (_data, _project, application, settings) = app();
-        let opened = application.open_or_create_draft().unwrap();
+        let (_data, _project, sessions, settings) = fixture();
+        let record = SessionRecord::new(sessions.workspace(), "Unpersisted conversation").unwrap();
         assert!(matches!(
-            settings
-                .resolve_model(application.workspace().id(), opened.record.id)
-                .unwrap(),
+            settings.resolve_model(&record).unwrap(),
             ModelResolution::NeedsModel
         ));
     }
 
     #[test]
     fn settings_service_refuses_session_scope_without_a_writer_lease() {
-        let (_data, _project, application, settings) = app();
-        let opened = application.open_or_create_draft().unwrap();
-        let record = opened.record;
+        let (_data, _project, sessions, settings) = fixture();
+        let writer = sessions.create_writer("New conversation").unwrap();
+        let record = writer.record().clone();
 
         assert!(matches!(
             settings.set_solver_model(
                 record.workspace_id,
-                record.id,
-                Scope::Session(record.id),
+                Scope::Session(SessionId::new()),
                 ModelSelection::new("must-not-write", None, None).unwrap(),
             ),
-            Err(SettingsError::SessionScopeRequiresWriterLease)
+            Err(SettingsError::SessionScopeRequiresWriter)
         ));
-        assert_eq!(
-            application.sessions().get(record.id).unwrap().unwrap(),
-            record
-        );
+        assert_eq!(sessions.get(record.id).unwrap().unwrap(), record);
     }
 
     #[test]
@@ -664,10 +630,10 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
-        let roots = StoreRoots::new(data.path().join("data"), data.path().join("config")).unwrap();
+        let roots = StoreRoots::new(data.path().join("data")).unwrap();
 
         let store = BoneStore::open_at(roots.clone()).unwrap();
-        let document = store.settings().global::<serde_json::Value>();
+        let document = store.document::<serde_json::Value>(keys::global_settings());
         let snapshot = document.read().unwrap();
         document
             .replace(
@@ -683,7 +649,7 @@ mod tests {
         ));
 
         let store = BoneStore::open_at(roots).unwrap();
-        let document = store.settings().global::<serde_json::Value>();
+        let document = store.document::<serde_json::Value>(keys::global_settings());
         let snapshot = document.read().unwrap();
         document
             .replace(
@@ -699,51 +665,30 @@ mod tests {
 
     #[test]
     fn model_inheritance_follows_session_workspace_user() {
-        let (_data, _project, application, settings) = app();
-        let opened = application.open_or_create_writer_draft().unwrap();
-        let workspace = application.workspace().id();
-        let session = opened.draft.record.id;
-        let lease = opened.lease;
+        let (_data, _project, sessions, settings) = fixture();
+        let mut writer = sessions.create_writer("New conversation").unwrap();
+        let workspace = sessions.workspace().id();
         let user = ModelSelection::new("user", None, None).unwrap();
         let workspace_selection = ModelSelection::new("workspace", None, None).unwrap();
         let session_selection = ModelSelection::new("session", None, None).unwrap();
         settings
-            .set_solver_model(workspace, session, Scope::User, user)
+            .set_solver_model(workspace, Scope::User, user)
             .unwrap();
         settings
-            .set_solver_model(
-                workspace,
-                session,
-                Scope::Workspace(workspace),
-                workspace_selection,
-            )
+            .set_solver_model(workspace, Scope::Workspace(workspace), workspace_selection)
             .unwrap();
-        let session_record = application
-            .sessions()
-            .set_solver_model_override(
-                &lease,
-                session,
-                application
-                    .sessions()
-                    .get(session)
-                    .unwrap()
-                    .unwrap()
-                    .revision,
-                Some(session_selection),
-            )
+        writer
+            .set_solver_model_override(Some(session_selection))
             .unwrap();
         let ModelResolution::Ready { resolved, .. } =
-            settings.resolve_model(workspace, session).unwrap()
+            settings.resolve_model(writer.record()).unwrap()
         else {
             panic!("model should resolve");
         };
         assert_eq!(resolved.selection.model, "session");
-        application
-            .sessions()
-            .set_solver_model_override(&lease, session, session_record.revision, None)
-            .unwrap();
+        writer.set_solver_model_override(None).unwrap();
         let ModelResolution::Ready { resolved, .. } =
-            settings.resolve_model(workspace, session).unwrap()
+            settings.resolve_model(writer.record()).unwrap()
         else {
             panic!("model should resolve");
         };
@@ -752,28 +697,20 @@ mod tests {
 
     #[test]
     fn session_model_selection_does_not_mutate_user_defaults() {
-        let (_data, _project, application, settings) = app();
-        let opened = application.open_or_create_writer_draft().unwrap();
-        let workspace = application.workspace().id();
-        let session = opened.draft.record.id;
-        let lease = opened.lease;
+        let (_data, _project, sessions, settings) = fixture();
+        let mut writer = sessions.create_writer("New conversation").unwrap();
 
-        let record = application.sessions().get(session).unwrap().unwrap();
-        application
-            .sessions()
-            .set_solver_model_override(
-                &lease,
-                session,
-                record.revision,
-                Some(ModelSelection::new("session-only", None, None).unwrap()),
-            )
+        writer
+            .set_solver_model_override(Some(
+                ModelSelection::new("session-only", None, None).unwrap(),
+            ))
             .unwrap();
 
         let global = settings.read_global().unwrap();
         assert!(global.agent.default_solver.is_none());
         assert!(global.agent.coordinator.is_none());
         let ModelResolution::Ready { runtime, .. } =
-            settings.resolve_model(workspace, session).unwrap()
+            settings.resolve_model(writer.record()).unwrap()
         else {
             panic!("session model should resolve");
         };

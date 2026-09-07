@@ -1,61 +1,49 @@
-//! BONE's concrete local persistence port.
+//! Local SQLite persistence primitives.
 //!
-//! All BONE-owned durable data is stored in one local SQLite database. The
-//! public API deliberately exposes typed documents, journals, scoped state,
-//! and OS leases instead of raw SQL, raw paths, or a generic key/value API.
-//! Provider OAuth JSON remains an intentionally isolated exception because
-//! Rig owns its schema and refresh lifecycle.
+//! This crate owns one SQLite database, typed documents and journals, short
+//! transactions, and process-lifetime file leases. Applications define their
+//! own keys, persistent types, and business rules.
 
 mod document;
 mod error;
 mod journal;
 mod lease;
-mod provider_auth;
 mod roots;
+mod schema;
 mod security;
 mod sqlite;
 
-use std::{fmt::Display, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use serde::{Serialize, de::DeserializeOwned};
 
-pub use document::{Document, DocumentSnapshot, Revision};
-pub use error::{ProviderAuthError, StoreError};
-pub use journal::{Journal, JournalEntry, JournalRead};
-pub use lease::Lease;
-pub use provider_auth::{ProviderAuthLease, ProviderAuthStore, ProviderId};
+pub use document::{Document, DocumentKey, DocumentListEntry, DocumentSnapshot, Revision};
+pub use error::StoreError;
+pub use journal::{Journal, JournalAppend, JournalEntry, JournalKey, JournalRead};
+pub use lease::{Lease, LeaseKey};
 pub use roots::StoreRoots;
 
 use crate::{
     document::{
-        document, read_document, read_documents_with_prefix, remove_document, replace_document,
+        document, read_document, read_documents_with_prefix, replace_document,
         same_store as same_document_store,
     },
-    journal::{append_journal, journal, same_store as same_journal_store},
+    journal::{append_journal, journal, read_journal, same_store as same_journal_store},
+    lease::lease_file_name,
     security::{ensure_private_directory, try_acquire_private_lock},
     sqlite::StoreInner,
 };
 
-const SETTINGS_NAMESPACE: &str = "settings";
-const STATE_NAMESPACE: &str = "state";
-const GLOBAL_SETTINGS_KEY: &str = "global";
-const WORKSPACE_REGISTRY_KEY: &str = "workspace-registry";
-
-/// Thread-safe handle to one locally opened BONE store.
+/// Thread-safe handle to one locally opened SQLite store.
 ///
-/// Clones share immutable store roots but open short-lived SQLite connections
-/// per operation. This avoids a hidden process-global connection and lets
-/// SQLite enforce cross-process writer serialization.
+/// Clones share store roots while each operation opens its own short-lived
+/// connection. SQLite serializes writers across threads and processes.
 #[derive(Clone)]
 pub struct BoneStore {
     inner: Arc<StoreInner>,
 }
 
 impl BoneStore {
-    pub fn open_default() -> Result<Self, StoreError> {
-        Self::open_at(StoreRoots::default_for_current_user()?)
-    }
-
     pub fn open_at(roots: StoreRoots) -> Result<Self, StoreError> {
         Ok(Self {
             inner: StoreInner::open(roots)?,
@@ -70,20 +58,50 @@ impl BoneStore {
         self.inner.database_path()
     }
 
-    pub fn settings(&self) -> SettingsStore {
-        SettingsStore {
-            inner: Arc::clone(&self.inner),
-        }
+    pub fn document<T>(&self, key: DocumentKey) -> Document<T> {
+        document(Arc::clone(&self.inner), key)
     }
 
-    pub fn workspace_state(&self) -> WorkspaceStateStore {
-        WorkspaceStateStore {
-            inner: Arc::clone(&self.inner),
-        }
+    pub fn journal<E>(&self, key: JournalKey) -> Journal<E> {
+        journal(Arc::clone(&self.inner), key)
     }
 
-    pub fn provider_auth(&self) -> ProviderAuthStore {
-        ProviderAuthStore::new(Arc::clone(&self.inner))
+    /// List typed documents in one namespace whose keys begin with `prefix`.
+    ///
+    /// Results use SQLite's binary collation. Each row preserves its key and
+    /// reports decode failures independently.
+    pub fn list_documents<T>(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> Result<Vec<DocumentListEntry<T>>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        let connection = self.inner.connection()?;
+        read_documents_with_prefix(&connection, namespace, prefix)
+    }
+
+    /// Run document and journal mutations in one short `BEGIN IMMEDIATE`
+    /// transaction. Returning an error rolls back every mutation.
+    pub fn transaction<R>(
+        &self,
+        operation: impl FnOnce(&mut WriteTransaction<'_, '_>) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let inner = Arc::clone(&self.inner);
+        self.inner.with_write(|transaction| {
+            let mut write = WriteTransaction { inner, transaction };
+            operation(&mut write)
+        })
+    }
+
+    /// Acquire an exclusive process-lifetime lease for an application-defined
+    /// logical key. The key is encoded into a safe filename under `leases/`.
+    pub fn try_acquire_lease(&self, key: LeaseKey) -> Result<Lease, StoreError> {
+        let directory = ensure_private_directory(&self.inner.roots().data_root().join("leases"))?;
+        let path = directory.join(lease_file_name(&key));
+        let file = try_acquire_private_lock(&path)?;
+        Ok(Lease::new(path, file))
     }
 }
 
@@ -96,149 +114,23 @@ impl std::fmt::Debug for BoneStore {
     }
 }
 
-/// Capability for the one typed global settings document.
-#[derive(Clone, Debug)]
-pub struct SettingsStore {
-    inner: Arc<StoreInner>,
-}
-
-impl SettingsStore {
-    pub fn global<T>(&self) -> Document<T> {
-        document(
-            Arc::clone(&self.inner),
-            SETTINGS_NAMESPACE,
-            GLOBAL_SETTINGS_KEY.to_owned(),
-        )
-    }
-}
-
-/// Capability for Workspace, Session, and durable conversation state.
-#[derive(Clone, Debug)]
-pub struct WorkspaceStateStore {
-    inner: Arc<StoreInner>,
-}
-
-impl WorkspaceStateStore {
-    /// The fixed mapping between canonical workspace paths and durable IDs.
-    pub fn workspace_registry<T>(&self) -> Document<T> {
-        document(
-            Arc::clone(&self.inner),
-            STATE_NAMESPACE,
-            WORKSPACE_REGISTRY_KEY.to_owned(),
-        )
-    }
-
-    /// Settings that belong to exactly one durable Workspace.
-    pub fn workspace_settings<T>(
-        &self,
-        workspace_id: impl Display,
-    ) -> Result<Document<T>, StoreError> {
-        let workspace_id = opaque_id(workspace_id)?;
-        Ok(document(
-            Arc::clone(&self.inner),
-            STATE_NAMESPACE,
-            format!("workspace/{workspace_id}/settings"),
-        ))
-    }
-
-    /// The durable metadata/document record for one logical Session.
-    pub fn session<T>(
-        &self,
-        workspace_id: impl Display,
-        session_id: impl Display,
-    ) -> Result<Document<T>, StoreError> {
-        let workspace_id = opaque_id(workspace_id)?;
-        let session_id = opaque_id(session_id)?;
-        Ok(document(
-            Arc::clone(&self.inner),
-            STATE_NAMESPACE,
-            format!("workspace/{workspace_id}/session/{session_id}"),
-        ))
-    }
-
-    /// List all Session records belonging to one Workspace. The Session ID is
-    /// intentionally part of each domain record, so no duplicate sidebar
-    /// index is needed in storage.
-    pub fn list_sessions<T>(
-        &self,
-        workspace_id: impl Display,
-    ) -> Result<Vec<DocumentSnapshot<T>>, StoreError>
-    where
-        T: DeserializeOwned,
-    {
-        let workspace_id = opaque_id(workspace_id)?;
-        let connection = self.inner.connection()?;
-        read_documents_with_prefix(
-            &connection,
-            STATE_NAMESPACE,
-            &format!("workspace/{workspace_id}/session/"),
-        )
-    }
-
-    /// The strictly ordered, append-only conversation event stream for one
-    /// Session.
-    pub fn session_journal<E>(
-        &self,
-        workspace_id: impl Display,
-        session_id: impl Display,
-    ) -> Result<Journal<E>, StoreError> {
-        let workspace_id = opaque_id(workspace_id)?;
-        let session_id = opaque_id(session_id)?;
-        Ok(journal(
-            Arc::clone(&self.inner),
-            format!("workspace/{workspace_id}/session/{session_id}/events"),
-        ))
-    }
-
-    /// Acquire process-lifetime runtime ownership for one Session. This lock
-    /// is intentionally separate from short SQLite write transactions.
-    pub fn try_acquire_session_writer_lease(
-        &self,
-        session_id: impl Display,
-    ) -> Result<Lease, StoreError> {
-        let session_id = opaque_id(session_id)?;
-        let directory = ensure_private_directory(&self.inner.roots().data_root().join("leases"))?;
-        let path = directory.join(format!("session-{session_id}.lock"));
-        let file = try_acquire_private_lock(&path)?;
-        Ok(Lease::new(path, file))
-    }
-
-    /// Execute a small domain mutation in one `BEGIN IMMEDIATE` transaction.
-    ///
-    /// It exposes only typed document and journal operations. A callback error
-    /// drops the SQLite transaction and rolls back every mutation.
-    pub fn transaction<R>(
-        &self,
-        operation: impl FnOnce(&mut WorkspaceWriteTransaction<'_, '_>) -> Result<R, StoreError>,
-    ) -> Result<R, StoreError> {
-        let inner = Arc::clone(&self.inner);
-        self.inner.with_write(|transaction| {
-            let mut write = WorkspaceWriteTransaction { inner, transaction };
-            operation(&mut write)
-        })
-    }
-}
-
-/// Restricted typed operations available only inside a Workspace-state write
-/// transaction. It cannot execute arbitrary SQL or construct arbitrary keys,
-/// and it accepts only `state` documents from this same store—not global
-/// settings handles.
-pub struct WorkspaceWriteTransaction<'transaction, 'connection> {
+/// Typed operations available within [`BoneStore::transaction`].
+pub struct WriteTransaction<'transaction, 'connection> {
     inner: Arc<StoreInner>,
     transaction: &'transaction rusqlite::Transaction<'connection>,
 }
 
-impl WorkspaceWriteTransaction<'_, '_> {
-    pub fn read<T>(&mut self, document: &Document<T>) -> Result<DocumentSnapshot<T>, StoreError>
+impl WriteTransaction<'_, '_> {
+    pub fn read<T>(&self, document: &Document<T>) -> Result<DocumentSnapshot<T>, StoreError>
     where
         T: DeserializeOwned,
     {
         self.assert_document_store(document)?;
-        read_document(self.transaction, &document.address)
+        read_document(self.transaction, document.key())
     }
 
     pub fn replace<T>(
-        &mut self,
+        &self,
         document: &Document<T>,
         value: &T,
         expected: Revision,
@@ -247,42 +139,30 @@ impl WorkspaceWriteTransaction<'_, '_> {
         T: Serialize,
     {
         self.assert_document_store(document)?;
-        replace_document(self.transaction, &document.address, value, expected)
+        replace_document(self.transaction, document.key(), value, expected)
     }
 
-    pub fn remove<T>(
-        &mut self,
-        document: &Document<T>,
-        expected: Revision,
-    ) -> Result<(), StoreError> {
-        self.assert_document_store(document)?;
-        remove_document(self.transaction, &document.address, expected)
-    }
-
-    pub fn append<E>(
-        &mut self,
-        journal: &Journal<E>,
-        event: &E,
-    ) -> Result<JournalEntry<E>, StoreError>
+    pub fn read_journal<E>(&self, journal: &Journal<E>) -> Result<JournalRead<E>, StoreError>
     where
-        E: Serialize + DeserializeOwned,
+        E: DeserializeOwned,
     {
         self.assert_journal_store(journal)?;
-        append_journal(self.transaction, &journal.key, event)
+        read_journal(self.transaction, journal.key())
+    }
+
+    pub fn append<E>(&self, journal: &Journal<E>, event: &E) -> Result<JournalAppend, StoreError>
+    where
+        E: Serialize,
+    {
+        self.assert_journal_store(journal)?;
+        append_journal(self.transaction, journal.key(), event)
     }
 
     fn assert_document_store<T>(&self, document: &Document<T>) -> Result<(), StoreError> {
-        // A transaction obtained from `WorkspaceStateStore` is deliberately
-        // incapable of mutating the global settings document. Documents are
-        // constructed only by scoped store capabilities, but checking both
-        // their owning store and fixed namespace preserves that capability
-        // boundary even when callers hold handles from several scopes.
-        if same_document_store(document, &self.inner)
-            && document.address.namespace == STATE_NAMESPACE
-        {
+        if same_document_store(document, &self.inner) {
             Ok(())
         } else {
-            Err(StoreError::InvalidIdentifier)
+            Err(StoreError::WrongStore)
         }
     }
 
@@ -290,22 +170,8 @@ impl WorkspaceWriteTransaction<'_, '_> {
         if same_journal_store(journal, &self.inner) {
             Ok(())
         } else {
-            Err(StoreError::InvalidIdentifier)
+            Err(StoreError::WrongStore)
         }
-    }
-}
-
-fn opaque_id(value: impl Display) -> Result<String, StoreError> {
-    let value = value.to_string();
-    let valid = !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
-    if valid {
-        Ok(value)
-    } else {
-        Err(StoreError::InvalidIdentifier)
     }
 }
 
@@ -324,30 +190,21 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, BoneStore) {
         let temporary = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(
-            temporary.path(),
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .unwrap();
-        let store = BoneStore::open_at(
-            StoreRoots::new(
-                temporary.path().join("data"),
-                temporary.path().join("config"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let store =
+            BoneStore::open_at(StoreRoots::new(temporary.path().join("data")).unwrap()).unwrap();
         (temporary, store)
     }
 
+    fn settings_key(key: &str) -> DocumentKey {
+        DocumentKey::new("test.settings", key)
+    }
+
     #[test]
-    fn document_create_replace_and_remove_use_revision_cas() {
+    fn document_create_and_replace_use_revision_cas() {
         let (_temporary, store) = store();
-        let document = store.settings().global::<Settings>();
+        let document = store.document::<Settings>(settings_key("global"));
         let missing = document.read().unwrap();
         assert!(missing.is_missing());
-        assert_eq!(missing.revision, Revision::default());
         let first = document
             .replace(
                 &Settings {
@@ -372,26 +229,21 @@ mod tests {
                     &Settings {
                         name: "first".to_owned(),
                     },
-                    first
+                    first,
                 )
                 .unwrap(),
             first
         );
-        document.remove(first).unwrap();
-        assert!(document.read().unwrap().is_missing());
     }
 
     #[test]
     fn transaction_rolls_back_document_and_journal_together() {
         let (_temporary, store) = store();
-        let state = store.workspace_state();
-        let session = state.session::<Settings>("workspace", "session").unwrap();
-        let journal = state
-            .session_journal::<String>("workspace", "session")
-            .unwrap();
-        let failed = state.transaction(|transaction| {
+        let document = store.document::<Settings>(settings_key("session"));
+        let journal = store.journal::<String>(JournalKey::new("test/session/events"));
+        let failed = store.transaction(|transaction| {
             transaction.replace(
-                &session,
+                &document,
                 &Settings {
                     name: "uncommitted".to_owned(),
                 },
@@ -403,47 +255,116 @@ mod tests {
             })
         });
         assert!(failed.is_err());
-        assert!(session.read().unwrap().is_missing());
+        assert!(document.read().unwrap().is_missing());
         assert!(journal.read().unwrap().is_empty());
     }
 
     #[test]
-    fn workspace_transaction_cannot_mutate_global_settings() {
+    fn prefix_listing_is_case_sensitive_and_keeps_row_errors_local() {
         let (_temporary, store) = store();
-        let settings = store.settings().global::<Settings>();
-        let state = store.workspace_state();
-
-        let result = state.transaction(|transaction| {
-            transaction.replace(
-                &settings,
+        store
+            .document::<Settings>(settings_key("workspace/a_/healthy"))
+            .replace(
                 &Settings {
-                    name: "must remain outside workspace state".to_owned(),
+                    name: "healthy".to_owned(),
                 },
                 Revision::default(),
             )
-        });
+            .unwrap();
+        store
+            .document::<String>(settings_key("workspace/a_/damaged"))
+            .replace(&"wrong shape".to_owned(), Revision::default())
+            .unwrap();
+        store
+            .document::<Settings>(settings_key("workspace/A_/other"))
+            .replace(
+                &Settings {
+                    name: "other".to_owned(),
+                },
+                Revision::default(),
+            )
+            .unwrap();
 
-        assert!(matches!(result, Err(StoreError::InvalidIdentifier)));
-        assert!(settings.read().unwrap().is_missing());
+        let records = store
+            .list_documents::<Settings>("test.settings", "workspace/a_/")
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].key.key(), "workspace/a_/damaged");
+        assert!(matches!(records[0].snapshot, Err(StoreError::Decode(_))));
+        assert_eq!(records[1].key.key(), "workspace/a_/healthy");
+        assert!(records[1].snapshot.is_ok());
     }
 
     #[test]
-    fn session_writer_lease_is_exclusive() {
+    fn prefix_listing_handles_non_ascii_keys() {
         let (_temporary, store) = store();
-        let state = store.workspace_state();
-        let lease = state.try_acquire_session_writer_lease("session").unwrap();
+        store
+            .document::<Settings>(settings_key("\u{00ff}/included"))
+            .replace(
+                &Settings {
+                    name: "included".to_owned(),
+                },
+                Revision::default(),
+            )
+            .unwrap();
+        store
+            .document::<Settings>(settings_key("\u{00fe}/excluded"))
+            .replace(
+                &Settings {
+                    name: "excluded".to_owned(),
+                },
+                Revision::default(),
+            )
+            .unwrap();
+
+        let records = store
+            .list_documents::<Settings>("test.settings", "\u{00ff}")
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key.key(), "\u{00ff}/included");
+    }
+
+    #[test]
+    fn prefix_listing_query_uses_the_document_primary_key() {
+        let (_temporary, store) = store();
+        let connection = store.inner.connection().unwrap();
+        let plan: String = connection
+            .query_row(
+                "
+                    EXPLAIN QUERY PLAN
+                    SELECT key FROM documents
+                    WHERE namespace COLLATE BINARY = ?1
+                      AND key COLLATE BINARY >= ?2
+                      AND key COLLATE BINARY < CAST(?3 AS TEXT)
+                    ORDER BY key COLLATE BINARY ASC
+                ",
+                rusqlite::params!["test.settings", "workspace/a/", b"workspace/a0"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("INDEX"), "unexpected query plan: {plan}");
+    }
+
+    #[test]
+    fn lease_is_exclusive() {
+        let (_temporary, store) = store();
+        let lease = store
+            .try_acquire_lease(LeaseKey::new("session:one"))
+            .unwrap();
         assert!(matches!(
-            state.try_acquire_session_writer_lease("session"),
+            store.try_acquire_lease(LeaseKey::new("session:one")),
             Err(StoreError::Busy)
         ));
         drop(lease);
-        let _reacquired = state.try_acquire_session_writer_lease("session").unwrap();
+        store
+            .try_acquire_lease(LeaseKey::new("session:one"))
+            .unwrap();
     }
 
     #[test]
     fn document_writes_have_one_winner_under_contention() {
         let (_temporary, store) = store();
-        let document = Arc::new(store.settings().global::<Settings>());
+        let document = Arc::new(store.document::<Settings>(settings_key("contended")));
         let joins = (0..8)
             .map(|number| {
                 let document = Arc::clone(&document);
@@ -458,42 +379,12 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let successful = joins
-            .into_iter()
-            .filter_map(|join| join.join().unwrap().ok())
-            .count();
-        assert!(successful >= 1);
-    }
-
-    #[test]
-    fn session_listing_treats_workspace_ids_as_literal_prefixes() {
-        let (_temporary, store) = store();
-        let state = store.workspace_state();
-        let underscored = state.session::<Settings>("a_", "one").unwrap();
-        let similar = state.session::<Settings>("ab", "two").unwrap();
-
-        underscored
-            .replace(
-                &Settings {
-                    name: "underscored workspace".to_owned(),
-                },
-                Revision::default(),
-            )
-            .unwrap();
-        similar
-            .replace(
-                &Settings {
-                    name: "different workspace".to_owned(),
-                },
-                Revision::default(),
-            )
-            .unwrap();
-
-        let sessions = state.list_sessions::<Settings>("a_").unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(
-            sessions[0].value.as_ref().map(|settings| &settings.name),
-            Some(&"underscored workspace".to_owned())
+        assert!(
+            joins
+                .into_iter()
+                .filter_map(|join| join.join().unwrap().ok())
+                .count()
+                >= 1
         );
     }
 
@@ -502,13 +393,25 @@ mod tests {
         let (_temporary, store) = store();
         let writer = rusqlite::Connection::open(store.database_path()).unwrap();
         writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-
-        let result = store.settings().global::<Settings>().read();
-
+        let result = store.document::<Settings>(settings_key("global")).read();
         writer.execute_batch("ROLLBACK").unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn store_root_only_contains_data() {
+        let temporary = tempfile::tempdir().unwrap();
+        let roots = StoreRoots::new(temporary.path().join("data")).unwrap();
+        assert_eq!(
+            roots.database_path(),
+            temporary.path().join("data/bone.sqlite3")
+        );
+        assert!(!roots.data_root().exists());
+        let _store = BoneStore::open_at(roots).unwrap();
         assert!(
-            result.is_ok(),
-            "a WAL reader must not contend with a writer"
+            fs::metadata(temporary.path().join("data"))
+                .unwrap()
+                .is_dir()
         );
     }
 }

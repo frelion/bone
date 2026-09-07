@@ -14,7 +14,7 @@
 >
 > 当前 TUI 的设置入口是 `/model <id>`、`/model default <id>`、`/model global <id>` 与 `/model inherit`。它们分别写入 Session override、Workspace default、User default，解析顺序为 **Session > Workspace > User**。写入成功代表 SQLite 已保存；已经 attached 的 runtime 仍使用它启动时的 immutable `ResolvedAgentRuntimeConfig`，直到新建或重建 runtime 才采用新值。不要把后文的 `/config`、Settings Center、`Desired/Effective/LKG`、`TurnConfig revision`、watcher、apply acknowledgement 或热切换描述为当前功能。
 >
-> 每个 accepted user turn 在同一个 SQLite transaction 中写入 `UserTurnAccepted` event 与 Session summary/state；commit 失败不能清 Composer 或启动 Agent。Session writer ownership 用 fail-fast OS lease，冲突 Session 只读/Busy。SQLite corruption、权限错误或 schema mismatch 不自动 reset。ChatGPT OAuth 是唯一 JSON 例外，位于 `$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/store-v1/providers/chatgpt-subscription/`），由 Rig 管理 payload，BONE 仅持有 `ProviderAuthLease`。有活跃 Endpoint/Model lease 时 `/logout` 返回 Busy。
+> 每个 accepted user turn 在同一个 SQLite transaction 中写入 `UserTurnAccepted` event 与 Session summary/state；commit 失败不能清 Composer 或启动 Agent。Session writer ownership 用 fail-fast OS lease，冲突 Session 只读/Busy。SQLite corruption、权限错误或 schema mismatch 不自动 reset。ChatGPT OAuth 是唯一 JSON 例外，位于 `$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/store-v1/providers/chatgpt-subscription/`），由 Rig 管理 payload，App 仅持有 `ChatGptAuthLease`。有活跃 Endpoint/Model lease 时 `/logout` 返回 Busy。
 >
 > one-shot 的 `--model` / `BONE_MODEL` 是仅本次调用的 ephemeral override，不创建或持久化 `SessionRecord`；`--events` JSONL 仅作观察导出。后文涉及 one-shot durable Session 的内容是未来设计。
 
@@ -434,12 +434,12 @@ Composer 必须一直存在，用户可以在设置完成前形成草稿。
 
 ### 6.6 退出账号与切换账号
 
-`/logout` 不删除 SessionRecord、历史或草稿。当前它只有一个受控存储入口：`ProviderAuthStore::clear(ChatGptSubscription)`。
+`/logout` 不删除 SessionRecord、历史或草稿。当前它只有一个受控凭据入口：`ChatGptCredentials::clear()`。
 
-- 若没有活跃 Endpoint/Model 持有 `ProviderAuthLease`：删除本地 Rig OAuth cache；这不宣称 revoke 远端会话；
+- 若没有活跃 Endpoint/Model 持有 `ChatGptAuthLease`：删除本地 Rig OAuth cache；这不宣称 revoke 远端会话；
 - 若有活跃 lease：返回 Busy，不删除任何文件。UI 提示用户先停止或退出持有连接的实例后再试；
 - 不使用 credential revision 广播、后台 broker 或强制切换已有连接；这些是后续设计；
-- 重新登录会取得新的 provider lease 和新的连接，不能把 OAuth payload 放进 SQLite 或普通 TUI 状态。
+- 重新登录会取得新的 ChatGPT cache lease 和新的连接，不能把 OAuth payload 放进 SQLite 或普通 TUI 状态。
 
 ## 7. Command Palette
 
@@ -1570,13 +1570,13 @@ SessionPresentation
 
 ## 20. 后续设计评审需确认的决策
 
-这些决策不得改变第 0 节的 SQLite `BoneStore`、opaque provider auth lease 或 pinned runtime 契约。
+这些决策不得改变第 0 节的 SQLite `BoneStore`、opaque ChatGPT cache lease 或 pinned runtime 契约。
 
 以下是后续 UX 版本需要重新确认的决策：
 
 1. 将来是否提供 `/doctor` 或 `/config doctor`；当前不承诺二者之一；
 2. 哪些终端可靠传递 `Ctrl-,`、`Ctrl-Left/Right` 与 bracketed paste；探测失败时必须使用本文 slash/Enter fallback；
-3. 将来若放宽当前 provider-auth exclusive lease，采用何种多进程 OAuth 协调；不得泄露 secret 或绕过 `ProviderAuthStore`；
+3. 将来若放宽当前 ChatGPT cache exclusive lease，采用何种多进程 OAuth 协调；不得泄露 secret 或绕过 `ChatGptCredentials`；
 4. Session archive 的默认保留周期、可恢复删除窗口和存储配额；
 5. 当前 Provider 能否提供 authoritative model listing；不能时使用带“尚未验证”标签的版本化 catalog 与提交前能力检查；
 6. 引入写工具前，首次 Workspace 信任确认的内容和触发时机；当前只读能力不显示虚假写入承诺；

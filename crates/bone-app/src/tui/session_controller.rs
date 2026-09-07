@@ -1,7 +1,7 @@
 //! Durable Session control for the product TUI.
 //!
 //! This module owns only facts that survive the current BONE process:
-//! SessionRecord mutations, writer leases, journals, recovery, and the
+//! SessionRecord mutations, writers, journals, recovery, and the
 //! accepted-turn boundary. It deliberately knows nothing about terminal
 //! polling or Agent runtime handles.
 
@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     JournalFact, JournalRead, ModelResolution, RuntimeAttachment, SessionAttention,
     SessionAvailability, SessionDraft, SessionExecution, SessionJournal, SessionLeaseError,
-    SessionLifecycle, SessionRecord, SessionStatus, SessionStoreError, SessionWriterLease,
-    SettingsService, TurnOutcome, WorkspaceApplication,
+    SessionLifecycle, SessionRecord, SessionStatus, SessionWriter, SettingsService, TurnOutcome,
+    WorkspaceApplication,
 };
 use bone_agent::{RecordEntry, ResolvedAgentRuntimeConfig, ShutdownReport};
 
@@ -23,10 +23,10 @@ use super::{
 pub(super) struct DurableUiSession {
     pub(super) record: SessionRecord,
     pub(super) journal: Option<SessionJournal>,
-    /// Long-lived process ownership for every durable write or attached
-    /// runtime belonging to this logical session. A missing lease means this
+    /// Long-lived writer for every durable write or attached runtime belonging
+    /// to this logical session. A missing writer means this
     /// TUI is strictly read-only for it, even though its history stays visible.
-    pub(super) writer_lease: Option<SessionWriterLease>,
+    pub(super) writer: Option<SessionWriter>,
     pub(super) next_turn: u64,
     /// The active durable turn is intentionally singular for now. The Agent
     /// runtime can receive messages while working, but its terminal notices do
@@ -89,8 +89,8 @@ impl AcceptedPost {
     }
 }
 
-pub(super) fn require_writer_lease(session: &DurableUiSession) -> Result<(), String> {
-    if session.writer_lease.is_some() {
+pub(super) fn require_writer(session: &DurableUiSession) -> Result<(), String> {
+    if session.writer.is_some() {
         Ok(())
     } else {
         Err(format!(
@@ -100,11 +100,10 @@ pub(super) fn require_writer_lease(session: &DurableUiSession) -> Result<(), Str
     }
 }
 
-/// Change one logical session's durable summary with the record revision that
-/// the product runner currently owns. Runtime handles stay outside this
-/// record; only the last known execution/attachment truth is persisted.
+/// Change one logical session's durable summary through its owned writer.
+/// Runtime handles stay outside this record; only the last known
+/// execution/attachment truth is persisted.
 fn mutate_durable_record(
-    application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     mutate: impl Fn(&mut SessionRecord),
@@ -112,59 +111,29 @@ fn mutate_durable_record(
     let session = durable
         .get_mut(&id)
         .ok_or_else(|| "This conversation is not backed by durable storage".to_owned())?;
-    require_writer_lease(session)?;
-
-    // The event loop serializes writes made by this process, but another BONE
-    // process may have changed this record between two effects. Reload once on
-    // a CAS conflict and reapply only this operation's owned fields. Besides
-    // making a normal cross-process race recoverable, updating session.record
-    // here prevents every later local write from failing against a stale
-    // revision forever.
-    for attempt in 0..2 {
-        if session.record.status.lifecycle != SessionLifecycle::Active {
-            return Err("This conversation is no longer active".to_owned());
-        }
-        let mut record = session.record.clone();
-        mutate(&mut record);
-        // A replayed observer reset or an unchanged model-readiness refresh is
-        // not a state transition. Avoid needless revision churn, which also
-        // reduces avoidable cross-process CAS races.
-        if record == session.record {
-            return Ok(());
-        }
-        match application.sessions().replace(
-            session
-                .writer_lease
-                .as_ref()
-                .expect("writer lease was required"),
-            record,
-            session.record.revision,
-        ) {
-            Ok(record) => {
-                session.record = record;
-                return Ok(());
-            }
-            Err(SessionStoreError::RevisionConflict { .. }) if attempt == 0 => {
-                let refreshed = application
-                    .sessions()
-                    .get(session.record.id)
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| "This conversation was removed by another process".to_owned())?;
-                session.record = refreshed;
-            }
-            Err(error) => return Err(error.to_string()),
-        }
+    require_writer(session)?;
+    if session.record.status.lifecycle != SessionLifecycle::Active {
+        return Err("This conversation is no longer active".to_owned());
     }
-    unreachable!("the bounded durable-record retry always returns")
+    let mut record = session.record.clone();
+    mutate(&mut record);
+    // A replayed observer reset or an unchanged model-readiness refresh is
+    // not a state transition, so avoid needless durable writes.
+    if record == session.record {
+        return Ok(());
+    }
+    let writer = session.writer.as_mut().expect("writer was required");
+    writer.replace(record).map_err(|error| error.to_string())?;
+    session.record = writer.record().clone();
+    Ok(())
 }
 
 pub(super) fn persist_status(
-    application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     mutate: impl Fn(&mut SessionStatus),
 ) -> Result<(), String> {
-    mutate_durable_record(application, durable, id, |record| {
+    mutate_durable_record(durable, id, |record| {
         mutate(&mut record.status);
     })
 }
@@ -173,11 +142,11 @@ pub(super) fn persist_status(
 /// Connection failures are not local-storage failures, so availability stays
 /// Local rather than borrowing the overloaded UI word offline.
 pub(super) fn persist_runtime_retryable(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
 ) -> Result<(), String> {
-    persist_status(application, durable, id, |status| {
+    persist_status(durable, id, |status| {
         status.execution = SessionExecution::QueuedForRuntime;
         status.attachment = RuntimeAttachment::Detached;
         status.availability = SessionAvailability::Local;
@@ -187,11 +156,11 @@ pub(super) fn persist_runtime_retryable(
 /// The runtime start effect has been scheduled but has not yet produced an
 /// observed Agent handle.
 pub(super) fn persist_runtime_starting(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
 ) -> Result<(), String> {
-    persist_status(application, durable, id, |status| {
+    persist_status(durable, id, |status| {
         status.execution = SessionExecution::Opening;
         status.attachment = RuntimeAttachment::Attaching;
         status.availability = SessionAvailability::Local;
@@ -201,12 +170,12 @@ pub(super) fn persist_runtime_starting(
 /// An Agent runtime exists and can be observed. It may still be waiting for
 /// the durable turn to receive a runtime receipt.
 pub(super) fn persist_runtime_attached(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     awaiting_receipt: bool,
 ) -> Result<(), String> {
-    persist_status(application, durable, id, |status| {
+    persist_status(durable, id, |status| {
         status.execution = if awaiting_receipt {
             SessionExecution::Opening
         } else {
@@ -220,7 +189,7 @@ pub(super) fn persist_runtime_attached(
 /// AgentHandle::post has returned a receipt for the durable turn. Only now
 /// may the summary say that runtime work has begun.
 pub(super) fn persist_runtime_receipt(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     turn: u64,
@@ -228,29 +197,26 @@ pub(super) fn persist_runtime_receipt(
     solver_model: &str,
 ) -> Result<(), String> {
     let session = durable
-        .get(&id)
+        .get_mut(&id)
         .ok_or_else(|| "This conversation is not backed by durable storage".to_owned())?;
-    require_writer_lease(session)?;
+    require_writer(session)?;
     if session.active_turn != Some(turn) {
         return Err("The runtime receipt no longer matches this conversation's active turn".into());
     }
-    let journal = session.journal.clone().ok_or_else(|| {
+    session.journal.as_ref().ok_or_else(|| {
         "Conversation history is unavailable; the runtime receipt was not recorded".to_owned()
     })?;
-    journal
-        .append(
-            session
-                .writer_lease
-                .as_ref()
-                .expect("writer lease was required"),
-            JournalFact::TurnStarted {
-                turn,
-                runtime_fingerprint: runtime_fingerprint.to_owned(),
-                solver_model: solver_model.to_owned(),
-            },
-        )
+    session
+        .writer
+        .as_mut()
+        .expect("writer was required")
+        .append(JournalFact::TurnStarted {
+            turn,
+            runtime_fingerprint: runtime_fingerprint.to_owned(),
+            solver_model: solver_model.to_owned(),
+        })
         .map_err(|error| format!("Could not save runtime receipt: {error}"))?;
-    persist_status(application, durable, id, |status| {
+    persist_status(durable, id, |status| {
         status.execution = SessionExecution::Working;
         status.attachment = RuntimeAttachment::Attached;
         status.availability = SessionAvailability::Local;
@@ -258,11 +224,11 @@ pub(super) fn persist_runtime_receipt(
 }
 
 pub(super) fn persist_runtime_stopping(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
 ) -> Result<(), String> {
-    persist_status(application, durable, id, |status| {
+    persist_status(durable, id, |status| {
         status.execution = SessionExecution::Stopping;
         status.attachment = RuntimeAttachment::Attached;
         status.availability = SessionAvailability::Local;
@@ -273,12 +239,12 @@ pub(super) fn persist_runtime_stopping(
 /// rewrite an already accepted/working turn just because its inherited model
 /// selection changed; the next normal turn will resolve the new setting.
 pub(super) fn persist_model_readiness(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     ready: bool,
 ) -> Result<(), String> {
-    persist_status(application, durable, id, |status| {
+    persist_status(durable, id, |status| {
         if ready {
             status.attention.remove(&SessionAttention::ConfigPending);
             if matches!(
@@ -311,7 +277,7 @@ pub(super) fn persist_model_readiness(
 /// Project terminal Agent notices only after their journal facts have been
 /// appended. A summary is deliberately secondary to that append-only history.
 fn persist_runtime_observation_status(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     terminal: Option<SessionExecution>,
@@ -320,7 +286,7 @@ fn persist_runtime_observation_status(
     if terminal.is_none() && !unresolved_effect {
         return Ok(());
     }
-    persist_status(application, durable, id, |status| {
+    persist_status(durable, id, |status| {
         if let Some(execution) = terminal {
             status.execution = execution;
             status.attachment = RuntimeAttachment::Attached;
@@ -334,12 +300,12 @@ fn persist_runtime_observation_status(
 
 pub(super) fn model_is_ready(settings: &SettingsService, record: &SessionRecord) -> bool {
     settings
-        .resolve_model(record.workspace_id, record.id)
+        .resolve_model(record)
         .ok()
         .is_some_and(|resolution| matches!(resolution, ModelResolution::Ready { .. }))
 }
 
-/// Lazily acquire a session writer lease, then rerun the same cold-start
+/// Lazily acquire a session writer, then rerun the same cold-start
 /// reconciliation that the initially selected conversation receives. A
 /// background session is deliberately never recovered or status-mutated until
 /// this process owns it: otherwise opening BONE would write every visible
@@ -358,13 +324,13 @@ pub(super) fn activate_writer_session(
     };
     let already_owned = durable
         .get(&id)
-        .is_some_and(|session| session.writer_lease.is_some());
+        .is_some_and(|session| session.writer.is_some());
     if already_owned && !force_refresh {
         return true;
     }
     if !already_owned {
-        let lease = match application.sessions().try_acquire_writer_lease(logical_id) {
-            Ok(lease) => lease,
+        let writer = match application.sessions().try_open_writer(logical_id) {
+            Ok(writer) => writer,
             Err(SessionLeaseError::HeldElsewhere { .. }) => {
                 let _ = app.reduce(AppEvent::SessionReadOnlyElsewhere {
                     id,
@@ -383,32 +349,18 @@ pub(super) fn activate_writer_session(
             }
         };
         if let Some(session) = durable.get_mut(&id) {
-            session.writer_lease = Some(lease);
+            session.writer = Some(writer);
         }
     }
 
-    // A background row may have been hydrated before the former owner wrote
-    // its final status. Once this process owns the lease, replace the cached
-    // summary with the newest record before deciding whether recovery/model
-    // readiness is a no-op.
-    let refreshed_record = match application.sessions().get(logical_id) {
-        Ok(Some(record)) => record,
-        Ok(None) => {
-            let _ = app.reduce(AppEvent::SessionNeedsSetup {
-                id,
-                message: "This conversation disappeared before editing access was granted".into(),
-            });
-            return false;
-        }
-        Err(error) => {
-            let _ = app.reduce(AppEvent::SessionNeedsSetup {
-                id,
-                message: format!(
-                    "Could not reload this conversation after acquiring access: {error}"
-                ),
-            });
-            return false;
-        }
+    // The writer reads its record only after it owns the lock, so it is the
+    // authoritative local copy for the following recovery work.
+    let refreshed_record = durable
+        .get(&id)
+        .and_then(|session| session.writer.as_ref())
+        .map(|writer| writer.record().clone());
+    let Some(refreshed_record) = refreshed_record else {
+        return false;
     };
 
     let (journal, mut journal_read, journal_problem) =
@@ -468,7 +420,7 @@ pub(super) fn activate_writer_session(
         ));
     }
     if journal_needs_recovery
-        && let Err(error) = persist_status(application, durable, id, |status| {
+        && let Err(error) = persist_status(durable, id, |status| {
             status.attention.insert(SessionAttention::RecoveryNeeded);
         })
     {
@@ -478,7 +430,7 @@ pub(super) fn activate_writer_session(
     }
 
     if let Some(session) = durable.get(&id) {
-        let _ = app.reduce(AppEvent::SessionWriterLeaseAcquired {
+        let _ = app.reduce(AppEvent::SessionWriterAcquired {
             id,
             record: &session.record,
             journal: &journal_read,
@@ -498,12 +450,12 @@ pub(super) fn activate_writer_session(
 }
 
 /// Release local ownership that is no longer needed after a successful
-/// session switch. Runtime/pending/active-turn sessions keep their leases,
+/// session switch. Runtime/pending/active-turn sessions keep their writers,
 /// because their observer, receipt, and shutdown paths still append durable
 /// facts. If acquiring the newly selected session failed, callers must not
 /// invoke this helper: preserving the prior lease lets the user return to a
 /// known-writable conversation instead of losing it to a race.
-pub(super) fn release_idle_writer_leases_after_switch(
+pub(super) fn release_idle_writers_after_switch(
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     app: &mut App,
     busy_ids: &HashSet<UiSessionId>,
@@ -513,7 +465,7 @@ pub(super) fn release_idle_writer_leases_after_switch(
         .iter_mut()
         .filter_map(|(id, session)| {
             let retain = *id == selected || busy_ids.contains(id) || session.active_turn.is_some();
-            if !retain && session.writer_lease.take().is_some() {
+            if !retain && session.writer.take().is_some() {
                 Some(*id)
             } else {
                 None
@@ -529,12 +481,12 @@ pub(super) fn release_idle_writer_leases_after_switch(
 }
 
 pub(super) fn persist_draft(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     draft: SessionDraft,
 ) -> Result<(), String> {
-    mutate_durable_record(application, durable, id, |record| {
+    mutate_durable_record(durable, id, |record| {
         record.draft = draft.clone();
     })
 }
@@ -548,7 +500,7 @@ pub(super) fn prepare_post(
         .get(&id)
         .ok_or_else(|| "This conversation is not backed by durable storage".to_owned())?;
     let resolution = settings
-        .resolve_model(session.record.workspace_id, session.record.id)
+        .resolve_model(&session.record)
         .map_err(|error| error.to_string())?;
     let runtime = resolution
         .runtime_config()
@@ -561,7 +513,7 @@ pub(super) fn prepare_post(
 /// Agent receives anything. It intentionally does not deliver the message;
 /// delivery is a separate retryable effect boundary.
 pub(super) fn accept_post(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     text: String,
@@ -572,7 +524,7 @@ pub(super) fn accept_post(
         let session = durable
             .get_mut(&id)
             .ok_or_else(|| "This conversation is not backed by durable storage".to_owned())?;
-        require_writer_lease(session)?;
+        require_writer(session)?;
         let _journal = session.journal.as_ref().ok_or_else(|| {
             "Conversation history is unavailable; BONE will not risk losing this message".to_owned()
         })?;
@@ -593,15 +545,12 @@ pub(super) fn accept_post(
             .status
             .attention
             .remove(&SessionAttention::ConfigPending);
-        let (record, entry) = application
-            .sessions()
-            .replace_and_append(
-                session
-                    .writer_lease
-                    .as_ref()
-                    .expect("writer lease was required"),
+        let entry = session
+            .writer
+            .as_mut()
+            .expect("writer was required")
+            .accept_turn(
                 record,
-                session.record.revision,
                 JournalFact::UserTurnAccepted {
                     turn,
                     text: text.clone(),
@@ -614,7 +563,12 @@ pub(super) fn accept_post(
             })?;
         // The session summary and journal fact committed together. Only now
         // may this local projection advance or the reducer clear composer.
-        session.record = record;
+        session.record = session
+            .writer
+            .as_ref()
+            .expect("writer was required")
+            .record()
+            .clone();
         session.active_turn = Some(turn);
         session.next_turn = session.next_turn.saturating_add(1);
         (entry, turn, solver_model)
@@ -638,7 +592,8 @@ pub(super) fn create_session(
     settings: &SettingsService,
 ) {
     match application.sessions().create_writer("New conversation") {
-        Ok((record, lease)) => {
+        Ok(writer) => {
+            let record = writer.record().clone();
             let id = UiSessionId(*next_ui_id);
             *next_ui_id = next_ui_id.saturating_add(1);
             match application.sessions().journal(record.id) {
@@ -650,7 +605,7 @@ pub(super) fn create_session(
                         DurableUiSession {
                             record,
                             journal: Some(journal),
-                            writer_lease: Some(lease),
+                            writer: Some(writer),
                             next_turn: 1,
                             active_turn: None,
                             runtime_record_cursor: 0,
@@ -690,7 +645,7 @@ pub(super) fn create_session(
 /// Step and Reset both call this function: a broadcast gap therefore cannot
 /// make recovered replies visible only until the next restart.
 pub(super) fn persist_runtime_records(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     records: &[RecordEntry],
@@ -706,10 +661,10 @@ pub(super) fn persist_runtime_records(
         let Some(session) = durable.get_mut(&id) else {
             return Ok(());
         };
-        require_writer_lease(session)?;
-        let Some(journal) = session.journal.clone() else {
+        require_writer(session)?;
+        if session.journal.is_none() {
             return Ok(());
-        };
+        }
         for record in records {
             if record.cursor <= session.runtime_record_cursor {
                 continue;
@@ -746,13 +701,11 @@ pub(super) fn persist_runtime_records(
                 _ => None,
             };
             if let Some(fact) = fact
-                && let Err(error) = journal.append(
-                    session
-                        .writer_lease
-                        .as_ref()
-                        .expect("writer lease was required"),
-                    fact,
-                )
+                && let Err(error) = session
+                    .writer
+                    .as_mut()
+                    .expect("writer was required")
+                    .append(fact)
             {
                 journal_error = Some(format!(
                     "Live output is visible but history was not saved: {error}"
@@ -778,7 +731,7 @@ pub(super) fn persist_runtime_records(
         // below. The failed record keeps its cursor, so a future reset can
         // safely retry its journal append rather than duplicating a fact.
         if let Err(status_error) = persist_runtime_observation_status(
-            application,
+            _application,
             durable,
             id,
             terminal,
@@ -791,7 +744,7 @@ pub(super) fn persist_runtime_records(
         return Err(error);
     }
 
-    persist_runtime_observation_status(application, durable, id, terminal, unresolved_effect)
+    persist_runtime_observation_status(_application, durable, id, terminal, unresolved_effect)
         .map_err(|error| {
             format!(
                 "Live output is saved, but its durable session summary could not be updated: {error}"
@@ -800,16 +753,16 @@ pub(super) fn persist_runtime_records(
 }
 
 pub(super) fn persist_interruption(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     reason: &str,
 ) -> Result<(), String> {
-    let Some(session) = durable.get(&id) else {
+    let Some(session) = durable.get_mut(&id) else {
         return Ok(());
     };
-    require_writer_lease(session)?;
-    let journal = session.journal.clone();
+    require_writer(session)?;
+    let has_journal = session.journal.is_some();
     let had_active_turn = session.active_turn.is_some();
 
     // A completed/waiting turn has already written its terminal fact. Do not
@@ -818,20 +771,16 @@ pub(super) fn persist_interruption(
     // has definitely gone away.
     let mut interruption_error = None;
     let interrupted = if had_active_turn {
-        match journal {
-            Some(journal) => match journal.append(
-                session
-                    .writer_lease
-                    .as_ref()
-                    .expect("writer lease was required"),
-                JournalFact::RuntimeInterrupted {
+        if has_journal {
+            match session
+                .writer
+                .as_mut()
+                .expect("writer was required")
+                .append(JournalFact::RuntimeInterrupted {
                     reason: reason.to_owned(),
-                },
-            ) {
+                }) {
                 Ok(_) => {
-                    if let Some(session) = durable.get_mut(&id) {
-                        session.active_turn = None;
-                    }
+                    session.active_turn = None;
                     true
                 }
                 Err(error) => {
@@ -839,14 +788,15 @@ pub(super) fn persist_interruption(
                         Some(format!("Could not save runtime interruption: {error}"));
                     false
                 }
-            },
-            None => false,
+            }
+        } else {
+            false
         }
     } else {
         false
     };
 
-    let summary = persist_status(application, durable, id, |status| {
+    let summary = persist_status(durable, id, |status| {
         status.attachment = RuntimeAttachment::Detached;
         status.availability = SessionAvailability::Local;
         if interrupted {
@@ -865,39 +815,38 @@ pub(super) fn persist_interruption(
 }
 
 pub(super) fn persist_unresolved_shutdown_effects(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     report: &ShutdownReport,
 ) -> Result<(), String> {
-    let Some(session) = durable.get(&id) else {
+    let Some(session) = durable.get_mut(&id) else {
         return Ok(());
     };
-    require_writer_lease(session)?;
-    let Some(journal) = session.journal.clone() else {
+    require_writer(session)?;
+    if session.journal.is_none() {
         return Ok(());
-    };
+    }
     let mut wrote_unresolved_effect = false;
     for job in report
         .unresolved_jobs
         .iter()
         .filter(|job| job.external_write)
     {
-        if let Err(error) = journal.append(
-            session
-                .writer_lease
-                .as_ref()
-                .expect("writer lease was required"),
-            JournalFact::UnresolvedExternalEffect {
+        if let Err(error) = session
+            .writer
+            .as_mut()
+            .expect("writer was required")
+            .append(JournalFact::UnresolvedExternalEffect {
                 summary: format!(
                     "external job {} was unresolved when BONE shut down",
                     job.id.0
                 ),
-            },
-        ) {
+            })
+        {
             if wrote_unresolved_effect
                 && let Err(status_error) =
-                    persist_runtime_observation_status(application, durable, id, None, true)
+                    persist_runtime_observation_status(_application, durable, id, None, true)
             {
                 return Err(format!(
                     "Could not save unresolved external effect: {error}; earlier unresolved effects could not update the durable summary: {status_error}"
@@ -909,7 +858,7 @@ pub(super) fn persist_unresolved_shutdown_effects(
         }
         wrote_unresolved_effect = true;
     }
-    persist_runtime_observation_status(application, durable, id, None, wrote_unresolved_effect)
+    persist_runtime_observation_status(_application, durable, id, None, wrote_unresolved_effect)
         .map_err(|error| format!("Could not flag unresolved external effect: {error}"))
 }
 
@@ -971,7 +920,7 @@ fn has_active_runtime_receipt(journal: &JournalRead) -> bool {
 /// automatically; the recovery flag tells the user the delivery was not
 /// confirmable without risking a duplicate model/tool action.
 pub(super) fn reconcile_cold_runtime(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     journal_read: &mut JournalRead,
@@ -981,7 +930,7 @@ pub(super) fn reconcile_cold_runtime(
     }
     let delivery_unconfirmed = !has_active_runtime_receipt(journal_read);
     let interruption = persist_interruption(
-        application,
+        _application,
         durable,
         id,
         "BONE was restarted before this turn finished; delivery could not be confirmed",
@@ -1005,7 +954,7 @@ pub(super) fn reconcile_cold_runtime(
 
     interruption?;
     if delivery_unconfirmed {
-        persist_status(application, durable, id, |status| {
+        persist_status(durable, id, |status| {
             status.attention.insert(SessionAttention::RecoveryNeeded);
         })
         .map_err(|error| format!("Could not flag unconfirmed delivery for recovery: {error}"))?;
@@ -1018,7 +967,7 @@ pub(super) fn reconcile_cold_runtime(
 /// SessionRecord.status can be repaired after a prior disk/CAS failure
 /// without re-appending a terminal fact or replaying a runtime record.
 pub(super) fn reconcile_journal_summary(
-    application: &WorkspaceApplication,
+    _application: &WorkspaceApplication,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     journal: &JournalRead,
@@ -1045,7 +994,7 @@ pub(super) fn reconcile_journal_summary(
     if execution.is_none() && !unresolved_effect {
         return Ok(());
     }
-    persist_status(application, durable, id, |status| {
+    persist_status(durable, id, |status| {
         if let Some(execution) = execution {
             status.execution = execution;
             // Every product startup begins without an in-memory runtime.

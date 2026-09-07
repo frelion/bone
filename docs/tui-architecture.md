@@ -33,7 +33,7 @@ The interactive CLI follows this product path:
 
 ```text
 launch directory
-  → BoneStore::open_default
+  → bone_app::open_default_store
   → WorkspaceApplication::open_with_store
   → SettingsService::open(same store)
   → bone_app::run_workspace

@@ -10,7 +10,6 @@ publish = false
 test-utils = []
 
 [dependencies]
-bone-store = { path = "../bone-store" }
 futures-util.workspace = true
 rig-core = { workspace = true, features = ["reqwest", "rustls"] }
 schemars.workspace = true

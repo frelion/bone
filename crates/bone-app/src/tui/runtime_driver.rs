@@ -11,12 +11,11 @@ use std::{
     sync::Arc,
 };
 
-use crate::WorkspaceApplication;
+use crate::{ChatGptCredentials, WorkspaceApplication};
 use bone_agent::{
     AgentHandle, AgentHost, Observation, ResolvedAgentRuntimeConfig, Snapshot, StepEvent,
 };
 use bone_llm::service::chatgpt_subscription::{self, DeviceCodePrompt};
-use bone_store::{BoneStore, ProviderId};
 use futures_util::stream::FuturesUnordered;
 use tokio::{
     sync::{broadcast::error::RecvError, mpsc},
@@ -120,14 +119,11 @@ pub(super) async fn observe_session(
 
 pub(super) fn enqueue_connection(
     connecting: &mut FuturesUnordered<ConnectionTask>,
-    store: BoneStore,
+    credentials: ChatGptCredentials,
     login_tx: mpsc::UnboundedSender<DeviceCodePrompt>,
 ) {
     connecting.push(tokio::spawn(async move {
-        let auth = store
-            .provider_auth()
-            .acquire(ProviderId::ChatGptSubscription)
-            .map_err(|error| error.to_string())?;
+        let auth = credentials.acquire().map_err(|error| error.to_string())?;
         let endpoint = chatgpt_subscription::connect("bone-agent", auth, move |prompt| {
             let _ = login_tx.send(prompt);
         })

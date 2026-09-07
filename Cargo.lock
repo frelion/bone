@@ -172,7 +172,9 @@ dependencies = [
  "bone-store",
  "bone-tools",
  "crossterm",
+ "fs2",
  "futures-util",
+ "libc",
  "ratatui",
  "ratatui-textarea",
  "serde",
@@ -187,7 +189,6 @@ dependencies = [
 name = "bone-llm"
 version = "0.1.0"
 dependencies = [
- "bone-store",
  "bytes",
  "futures-util",
  "http",

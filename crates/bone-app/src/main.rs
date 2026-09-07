@@ -10,12 +10,12 @@ use bone_agent::{
     AgentHandle, AgentHost, JobRequest, Notice, Observation, RecordEntry, RecordKind,
 };
 use bone_app::{
-    ModelSelection, SettingsError, SettingsService, TuiDisplaySettings, TuiError,
-    WorkspaceApplication, WorkspaceApplicationError, WorkspaceError, run_storage_repair,
-    run_workspace, write_events,
+    AppStorageError, ChatGptCredentials, ModelSelection, SettingsError, SettingsService,
+    TuiDisplaySettings, TuiError, WorkspaceApplication, WorkspaceApplicationError, WorkspaceError,
+    open_default_store, run_storage_repair, run_workspace, write_events,
 };
 use bone_llm::service::chatgpt_subscription::{self, DeviceCodePrompt};
-use bone_store::{BoneStore, ProviderId, StoreError};
+use bone_store::StoreError;
 use tokio::sync::broadcast::error::RecvError;
 
 #[tokio::main]
@@ -50,6 +50,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         },
     };
     let workspace = env::current_dir()?;
+    let credentials = ChatGptCredentials::default_for_current_user()?;
     let input = arguments.message;
     if input.is_empty() {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -64,9 +65,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
         // dropping them back to a raw startup error.
         let reports = loop {
             let store = loop {
-                match BoneStore::open_default() {
+                match open_default_store() {
                     Ok(store) => break store,
-                    Err(error) if run_storage_repair(storage_repair_reason(&error)).await? => {}
+                    Err(error)
+                        if run_storage_repair(default_store_repair_reason(&error)).await? => {}
                     Err(_) => return Ok(()),
                 }
             };
@@ -96,7 +98,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     return Ok(());
                 }
             };
-            match run_workspace(application, settings, selected_model.clone()).await {
+            match run_workspace(
+                application,
+                settings,
+                credentials.clone(),
+                selected_model.clone(),
+            )
+            .await
+            {
                 Ok(reports) => break reports,
                 Err(error) => {
                     let Some(reason) = tui_storage_repair_reason(&error) else {
@@ -121,16 +130,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // auto-created settings document, but an unconfigured model is reported
     // as an ordinary startup error rather than starting an interactive repair
     // shell on a non-terminal stream.
-    let store = BoneStore::open_default()?;
+    let store = open_default_store()?;
     let settings = SettingsService::open(store.clone())?;
     let display = settings.display_settings()?;
     let explicit_solver = selected_model
         .map(|model| ModelSelection::new(model, None, None))
         .transpose()?;
     let runtime = settings.resolve_one_shot(explicit_solver)?;
-    let auth = store
-        .provider_auth()
-        .acquire(ProviderId::ChatGptSubscription)?;
+    let auth = credentials.acquire()?;
     let endpoint = chatgpt_subscription::connect("bone-agent", auth, show_login).await?;
     let agent = AgentHost::new(endpoint).start(&workspace, runtime)?;
     let event_log = match arguments.events {
@@ -193,9 +200,19 @@ fn storage_repair_reason(error: &StoreError) -> &'static str {
     }
 }
 
+fn default_store_repair_reason(error: &AppStorageError) -> &'static str {
+    match error {
+        AppStorageError::Store(error) => storage_repair_reason(error),
+        AppStorageError::MissingDefaultDataRoot => {
+            "BONE could not determine a safe local data directory."
+        }
+    }
+}
+
 fn workspace_repair_reason(error: &WorkspaceApplicationError) -> Option<&'static str> {
     match error {
         WorkspaceApplicationError::Store(_)
+        | WorkspaceApplicationError::AppStorage(_)
         | WorkspaceApplicationError::Registry(_)
         | WorkspaceApplicationError::Sessions(_)
         | WorkspaceApplicationError::Lease(_) => {

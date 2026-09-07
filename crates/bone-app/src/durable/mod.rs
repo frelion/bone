@@ -8,6 +8,7 @@
 
 mod error;
 mod journal;
+pub(crate) mod keys;
 mod registry;
 mod session;
 mod workspace_identity;
@@ -22,6 +23,6 @@ pub use registry::WorkspaceRegistry;
 pub use session::{
     RuntimeAttachment, SessionAttention, SessionAvailability, SessionDraft, SessionExecution,
     SessionId, SessionLifecycle, SessionListing, SessionMetadata, SessionRecord, SessionStatus,
-    SessionStore, SessionStoreIssue, SessionWriterLease, UnixMillis,
+    SessionStore, SessionStoreIssue, SessionWriter, UnixMillis,
 };
 pub use workspace_identity::{CanonicalPath, WorkspaceContext, WorkspaceId};

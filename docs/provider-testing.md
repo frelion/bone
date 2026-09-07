@@ -68,15 +68,15 @@ export BONE_ANTHROPIC_MODEL='...'
 cargo test -p bone-llm --test live_anthropic_messages -- --ignored --nocapture
 
 export BONE_CHATGPT_MODEL='a-model-available-to-your-subscription'
-cargo test -p bone-llm --test live_chatgpt_subscription -- --ignored --nocapture
+cargo test -p bone-app --test live_chatgpt_subscription -- --ignored --nocapture
 ```
 
-The ChatGPT subscription certification uses `BoneStore::open_default()` and
-acquires `ProviderId::ChatGptSubscription` before it connects. Its first local
-run may require device authorization; later local runs reuse Rig's private
-cache through the lease. Never upload a personal ChatGPT refresh token to
-GitHub-hosted Actions. If an organization automates this test, use a dedicated
-account or a supported access token on a trusted private runner.
+The ChatGPT subscription certification asks App-owned `ChatGptCredentials` for
+a `ChatGptAuthLease` before it connects. Its first local run may require device
+authorization; later local runs reuse Rig's private cache through that lease.
+Never upload a personal ChatGPT refresh token to GitHub-hosted Actions. If an
+organization automates this test, use a dedicated account or a supported access
+token on a trusted private runner.
 
 `/logout` only deletes the local OAuth cache after no Endpoint/Model holds the
 lease; it does not revoke an upstream account. Device codes, OAuth payloads,

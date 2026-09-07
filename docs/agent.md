@@ -23,7 +23,7 @@ constructing an Agent runtime:
 use bone_agent::{AgentHost, ResolvedAgentRuntimeConfig};
 use bone_llm::Endpoint;
 
-let endpoint: Endpoint = connect_provider_with_a_provider_auth_lease().await?;
+let endpoint: Endpoint = connect_provider_with_an_app_owned_auth_cache().await?;
 let config: ResolvedAgentRuntimeConfig = resolve_settings_for_this_session()?;
 let host = AgentHost::new(endpoint);
 let agent = host.start(workspace, config)?;
@@ -51,10 +51,10 @@ a new config and starts/recreates a runtime at an explicit lifecycle boundary.
 `bone-app` records that same runtime fingerprint and solver in the durable
 Session journal before delivering a user turn.
 
-The ChatGPT endpoint itself is connected by `bone-app` through
-`bone-store::ProviderAuthStore`. The resulting endpoint and models retain the
-provider-auth lease for their lifetime. `bone-agent` never sees an OAuth path,
-credential root, or token payload.
+The ChatGPT endpoint itself is connected by `bone-app` with its
+`ChatGptCredentials` manager. The resulting endpoint and models retain the
+narrow `ChatGptAuthLease` cache capability for their lifetime. `bone-agent`
+never sees an OAuth path, credential root, or token payload.
 
 For controlled ports and embedded custom execution,
 `Runtime::spawn(model, tools, kernel_config, runtime_config)` remains
@@ -130,7 +130,7 @@ and virtual time. The [crate guide](../crates/bone-agent/README.md) gives
 focused use cases; [agent model responsibilities](agent-model-responsibilities.md)
 contains the design rationale and adversarial examples.
 
-The ignored ChatGPT subscription live certification is owned by `bone-llm` and
-uses the local provider-auth cache described in [provider testing]
+The ignored ChatGPT subscription live certification is owned by `bone-app` and
+uses its local ChatGPT credential cache described in [provider testing]
 (provider-testing.md). Never record device authorization codes, OAuth payloads,
 or provider tokens in a trace.

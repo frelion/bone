@@ -137,15 +137,15 @@ pub(crate) enum AppEvent<'a> {
         message: String,
     },
     /// This process failed to obtain, or intentionally has not yet requested,
-    /// the per-session writer lease. It is a presentation-only overlay: the
+    /// the per-session writer. It is a presentation-only overlay: the
     /// durable record remains owned by whichever BONE process holds the lease.
     SessionReadOnlyElsewhere {
         id: UiSessionId,
         message: String,
     },
-    /// A product effect acquired writer ownership for a previously read-only
+    /// A product effect acquired a writer for a previously read-only
     /// session and completed a fresh durable hydration/recovery pass.
-    SessionWriterLeaseAcquired {
+    SessionWriterAcquired {
         id: UiSessionId,
         record: &'a SessionRecord,
         journal: &'a JournalRead,
@@ -520,7 +520,7 @@ impl App {
                 self.set_session_read_only_elsewhere_inner(id, message);
                 Action::None
             }
-            AppEvent::SessionWriterLeaseAcquired {
+            AppEvent::SessionWriterAcquired {
                 id,
                 record,
                 journal,
@@ -691,7 +691,7 @@ impl App {
             // Scrolling remains useful for a read-only transcript, but no
             // composer edit, command, send, or stop action may escape the
             // reducer. This prevents an unsaved ghost draft if the effect
-            // executor cannot obtain the writer lease.
+            // executor cannot obtain the writer.
             let navigation = matches!(
                 &event,
                 Event::Key(key)
@@ -784,7 +784,7 @@ impl App {
     }
 
     /// The product runner uses this after selection changes to lazily acquire
-    /// the current logical session's writer lease before accepting any edit or
+    /// the current logical session's writer before accepting any edit or
     /// runtime effect.
     pub(crate) fn current_id(&self) -> UiSessionId {
         self.current().id
@@ -868,7 +868,7 @@ pub(crate) enum SessionState {
     /// The durable session can be attached on the next user message. A former
     /// working runtime is deliberately displayed as detached after restart.
     Detached(String),
-    /// Another BONE process owns this logical session's writer lease, or this
+    /// Another BONE process owns this logical session's writer, or this
     /// process has not intentionally activated it yet. This is never written
     /// to `SessionRecord`: it is a local presentation safeguard only.
     ReadOnlyElsewhere(String),

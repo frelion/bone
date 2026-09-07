@@ -10,9 +10,9 @@ use bone_store::{BoneStore, StoreError, StoreRoots};
 use thiserror::Error;
 
 use crate::{
-    RegistryError, SessionLeaseError, SessionLifecycle, SessionRecord, SessionStore,
-    SessionStoreError, SessionStoreIssue, SessionWriterLease, WorkspaceContext, WorkspaceError,
-    WorkspaceRegistry,
+    AppStorageError, RegistryError, SessionLeaseError, SessionLifecycle, SessionRecord,
+    SessionStore, SessionStoreError, SessionStoreIssue, SessionWriter, WorkspaceContext,
+    WorkspaceError, WorkspaceRegistry, open_default_store,
 };
 
 const OPEN_RETRY_LIMIT: usize = 8;
@@ -26,13 +26,14 @@ pub struct OpenDraft {
     pub issues: Vec<SessionStoreIssue>,
 }
 
-/// A startup selection together with the process-lifetime right to mutate it.
-/// Product runners must retain this lease for every attached runtime and
-/// durable turn write; read-only callers can use `open_or_create_draft`.
+/// A startup selection together with its process-lifetime writer.
+///
+/// Product runners retain this for every attached runtime and durable turn
+/// write. Read-only callers can use `open_or_create_draft`.
 #[derive(Debug)]
 pub struct OpenWriterDraft {
     pub draft: OpenDraft,
-    pub lease: SessionWriterLease,
+    pub writer: SessionWriter,
 }
 
 /// Whether startup restored an existing logical session or persisted a fresh
@@ -46,7 +47,6 @@ pub enum DraftDisposition {
 /// Product boot services for exactly one launch-directory workspace.
 #[derive(Clone, Debug)]
 pub struct WorkspaceApplication {
-    store: BoneStore,
     registry: WorkspaceRegistry,
     workspace: WorkspaceContext,
     sessions: SessionStore,
@@ -56,22 +56,21 @@ impl WorkspaceApplication {
     /// Normal product entry point. It opens the conventional XDG SQLite store
     /// exactly once for this application instance.
     pub fn open(launch_directory: impl AsRef<Path>) -> Result<Self, WorkspaceApplicationError> {
-        let store = BoneStore::open_default()?;
+        let store = open_default_store()?;
         Self::open_with_store(launch_directory, store)
     }
 
     /// Composition-root constructor used by the binary, tests, portable hosts,
-    /// and future desktop hosts. Settings, OAuth, workspace state, and TUI
-    /// effects must all receive clones of this same `BoneStore`.
+    /// and future desktop hosts. App-owned settings and workspace services
+    /// receive clones of this same `BoneStore`.
     pub fn open_with_store(
         launch_directory: impl AsRef<Path>,
         store: BoneStore,
     ) -> Result<Self, WorkspaceApplicationError> {
-        let registry = WorkspaceRegistry::new(store.workspace_state());
+        let registry = WorkspaceRegistry::new(store.clone());
         let workspace = WorkspaceContext::discover(launch_directory, &registry)?;
-        let sessions = SessionStore::new(store.workspace_state(), workspace.clone());
+        let sessions = SessionStore::new(store, workspace.clone());
         Ok(Self {
-            store,
             registry,
             workspace,
             sessions,
@@ -85,11 +84,6 @@ impl WorkspaceApplication {
         roots: StoreRoots,
     ) -> Result<Self, WorkspaceApplicationError> {
         Self::open_with_store(launch_directory, BoneStore::open_at(roots)?)
-    }
-
-    /// The one store opened by the composition root.
-    pub fn store(&self) -> &BoneStore {
-        &self.store
     }
 
     pub fn registry(&self) -> &WorkspaceRegistry {
@@ -109,15 +103,15 @@ impl WorkspaceApplication {
 
     /// Read-only helper which never retains writer ownership after returning.
     pub fn open_or_create_draft(&self) -> Result<OpenDraft, WorkspaceApplicationError> {
-        let OpenWriterDraft { draft, lease } = self.open_or_create_writer_draft()?;
-        drop(lease);
+        let OpenWriterDraft { draft, writer } = self.open_or_create_writer_draft()?;
+        drop(writer);
         Ok(draft)
     }
 
     /// Select a writable startup conversation and retain its exclusive
-    /// process-lifetime writer lease. The lease is acquired before
-    /// `last_opened_at` changes, so a second process never mutates a session
-    /// it failed to own. If all active sessions are held, create a fresh one.
+    /// process-lifetime writer. Ownership is acquired before `last_opened_at`
+    /// changes, so a second process never mutates a session it failed to own.
+    /// If all active sessions are held, create a fresh one.
     pub fn open_or_create_writer_draft(
         &self,
     ) -> Result<OpenWriterDraft, WorkspaceApplicationError> {
@@ -140,8 +134,8 @@ impl WorkspaceApplication {
 
             let mut relist = false;
             for candidate in candidates {
-                let lease = match self.sessions.try_acquire_writer_lease(candidate.id) {
-                    Ok(lease) => lease,
+                let mut writer = match self.sessions.try_open_writer(candidate.id) {
+                    Ok(writer) => writer,
                     Err(SessionLeaseError::HeldElsewhere { .. }) => continue,
                     Err(SessionLeaseError::NotFound(_)) => {
                         relist = true;
@@ -149,24 +143,21 @@ impl WorkspaceApplication {
                     }
                     Err(error) => return Err(error.into()),
                 };
-                match self
-                    .sessions
-                    .mark_opened(&lease, candidate.id, candidate.revision)
-                {
-                    Ok(record) => {
+                match writer.mark_opened() {
+                    Ok(()) => {
                         return Ok(OpenWriterDraft {
                             draft: OpenDraft {
-                                record,
+                                record: writer.record().clone(),
                                 disposition: DraftDisposition::Restored,
                                 issues: listing.issues,
                             },
-                            lease,
+                            writer,
                         });
                     }
                     Err(
                         SessionStoreError::NotFound(_) | SessionStoreError::RevisionConflict { .. },
                     ) => {
-                        drop(lease);
+                        drop(writer);
                         relist = true;
                         break;
                     }
@@ -177,14 +168,14 @@ impl WorkspaceApplication {
                 continue;
             }
 
-            let (record, lease) = self.sessions.create_writer(NEW_CONVERSATION_TITLE)?;
+            let writer = self.sessions.create_writer(NEW_CONVERSATION_TITLE)?;
             return Ok(OpenWriterDraft {
                 draft: OpenDraft {
-                    record,
+                    record: writer.record().clone(),
                     disposition: DraftDisposition::Created,
                     issues: listing.issues,
                 },
-                lease,
+                writer,
             });
         }
         Err(WorkspaceApplicationError::ConcurrentDraftOpen)
@@ -198,6 +189,8 @@ pub enum WorkspaceApplicationError {
     ConcurrentDraftOpen,
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    AppStorage(#[from] AppStorageError),
     #[error(transparent)]
     Registry(#[from] RegistryError),
     #[error(transparent)]
@@ -221,11 +214,7 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
-        StoreRoots::new(
-            directory.path().join("data"),
-            directory.path().join("config"),
-        )
-        .unwrap()
+        StoreRoots::new(directory.path().join("data")).unwrap()
     }
 
     #[test]
@@ -236,7 +225,7 @@ mod tests {
         let opened = app.open_or_create_draft().unwrap();
         assert_eq!(opened.disposition, DraftDisposition::Created);
         assert_eq!(opened.record.metadata.title, NEW_CONVERSATION_TITLE);
-        assert!(app.store().database_path().exists());
+        assert!(data.path().join("data/bone.sqlite3").exists());
         assert!(!project.path().join(".bone").exists());
     }
 }

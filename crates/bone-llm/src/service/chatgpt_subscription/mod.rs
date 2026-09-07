@@ -4,14 +4,11 @@
 //! not start a proxy or a Codex agent, and it is not the public OpenAI Platform
 //! API. The explicit [`connect`] call may ask the user to complete a
 //! device-code login; later requests reuse and refresh BONE's independently
-//! managed ChatGPT token cache through a caller-provided provider-auth lease.
+//! managed ChatGPT token cache through a caller-provided cache lease.
 //!
 //! Never point Rig's `auth_file` option at `~/.codex/auth.json`. Codex and Rig
 //! use different file schemas and independent refresh-token lifecycles.
 
-use std::fmt::{self, Debug};
-
-use bone_store::ProviderAuthLease;
 use rig_core::{
     client::CompletionClient,
     completion::{CompletionError, CompletionModel, CompletionRequest, CompletionResponse},
@@ -22,6 +19,11 @@ use rig_core::{
 use rig_core::{
     http_client::HttpClientExt,
     wasm_compat::{WasmCompatSend, WasmCompatSync},
+};
+use std::{
+    fmt::{self, Debug},
+    path::Path,
+    sync::Arc,
 };
 
 use crate::{ConfigError, Endpoint, Protocol, error::validate_endpoint_id, model::RequestSupport};
@@ -61,6 +63,16 @@ impl From<ConfigError> for Error {
     }
 }
 
+/// A live, application-owned lease for Rig's ChatGPT OAuth cache file.
+///
+/// The application owns cache placement, access control, and exclusive
+/// lifetime management. This adapter only needs the already-validated path
+/// and retains the capability in every endpoint and model it creates.
+pub trait ChatGptAuthCache: Send + Sync + 'static {
+    /// The private cache file that Rig may read and update.
+    fn auth_file(&self) -> &Path;
+}
+
 /// Device-code details for the application's explicit ChatGPT connection UI.
 ///
 /// Treat the short code as ephemeral authentication material: display it only
@@ -84,23 +96,25 @@ impl Debug for DeviceCodePrompt {
 /// Explicitly connect an in-process ChatGPT subscription endpoint.
 ///
 /// No API key, sidecar, or local HTTP proxy is required. The caller acquires
-/// `auth` from `bone-store`; it owns a validated OAuth cache path and its
-/// exclusive provider-auth lease. Rig remains the sole owner of the cache
-/// schema and refresh lifecycle.
+/// `auth` from the product application; it owns a validated OAuth cache path
+/// and its exclusive lease. Rig remains the sole owner of the cache schema
+/// and refresh lifecycle.
 ///
 /// This call authorizes before returning, so a later model request never
 /// surprises the caller by starting a device-code flow. The returned endpoint
 /// and every model selected from it retain the lease until they are dropped.
-pub async fn connect<F>(
+pub async fn connect<F, A>(
     endpoint_id: impl Into<String>,
-    auth: ProviderAuthLease,
+    auth: A,
     on_device_code: F,
 ) -> Result<Endpoint, Error>
 where
     F: Fn(DeviceCodePrompt) + Send + Sync + 'static,
+    A: ChatGptAuthCache,
 {
     let endpoint_id = endpoint_id.into();
     validate_endpoint_id(&endpoint_id)?;
+    let auth: Arc<dyn ChatGptAuthCache> = Arc::new(auth);
     let auth_file = auth.auth_file().to_path_buf();
     let interactive_client = rig_chatgpt::Client::builder()
         .oauth()
@@ -175,7 +189,7 @@ where
 #[derive(Clone)]
 struct LeasedModel<M> {
     inner: M,
-    _auth: ProviderAuthLease,
+    _auth: Arc<dyn ChatGptAuthCache>,
 }
 
 impl<M> CompletionModel for LeasedModel<M>

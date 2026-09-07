@@ -1,6 +1,6 @@
 use std::{fmt, marker::PhantomData, sync::Arc};
 
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
@@ -11,7 +11,28 @@ use crate::{
 
 pub(crate) const MAX_JOURNAL_ENTRY_BYTES: usize = 1024 * 1024;
 
-/// One immutable, ordered entry in a durable journal.
+/// The durable address of one append-only journal.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct JournalKey(String);
+
+impl JournalKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Metadata for a newly appended event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JournalAppend {
+    pub sequence: u64,
+    pub occurred_at: i64,
+}
+
+/// One immutable, ordered journal entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JournalEntry<E> {
     pub sequence: u64,
@@ -32,10 +53,10 @@ impl<E> JournalRead<E> {
     }
 }
 
-/// A fixed, append-only journal location.
+/// A typed handle for one append-only journal.
 pub struct Journal<E> {
     pub(crate) inner: Arc<StoreInner>,
-    pub(crate) key: String,
+    pub(crate) key: JournalKey,
     marker: PhantomData<fn() -> E>,
 }
 
@@ -58,23 +79,30 @@ impl<E> fmt::Debug for Journal<E> {
     }
 }
 
-impl<E> Journal<E>
-where
-    E: Serialize + DeserializeOwned,
-{
-    pub fn read(&self) -> Result<JournalRead<E>, StoreError> {
+impl<E> Journal<E> {
+    pub fn key(&self) -> &JournalKey {
+        &self.key
+    }
+
+    pub fn read(&self) -> Result<JournalRead<E>, StoreError>
+    where
+        E: DeserializeOwned,
+    {
         let connection = self.inner.connection()?;
         read_journal(&connection, &self.key)
     }
 
     /// Append one event under a short `BEGIN IMMEDIATE` transaction.
-    pub fn append(&self, event: &E) -> Result<JournalEntry<E>, StoreError> {
+    pub fn append(&self, event: &E) -> Result<JournalAppend, StoreError>
+    where
+        E: Serialize,
+    {
         self.inner
             .with_write(|transaction| append_journal(transaction, &self.key, event))
     }
 }
 
-pub(crate) fn journal<E>(inner: Arc<StoreInner>, key: String) -> Journal<E> {
+pub(crate) fn journal<E>(inner: Arc<StoreInner>, key: JournalKey) -> Journal<E> {
     Journal {
         inner,
         key,
@@ -88,7 +116,7 @@ pub(crate) fn same_store<E>(journal: &Journal<E>, store: &Arc<StoreInner>) -> bo
 
 pub(crate) fn read_journal<E>(
     connection: &Connection,
-    key: &str,
+    key: &JournalKey,
 ) -> Result<JournalRead<E>, StoreError>
 where
     E: DeserializeOwned,
@@ -96,15 +124,15 @@ where
     let mut statement = connection
         .prepare(
             "
-            SELECT sequence, occurred_at, payload_json
-            FROM journal_entries
-            WHERE journal_key = ?1
-            ORDER BY sequence ASC
+                SELECT sequence, occurred_at, payload_json
+                FROM journal_entries
+                WHERE journal_key = ?1
+                ORDER BY sequence ASC
             ",
         )
         .map_err(|error| StoreError::sqlite("prepare journal read", error))?;
     let rows = statement
-        .query_map([key], |row| {
+        .query_map([key.as_str()], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -138,11 +166,10 @@ where
                 message: "journal payload exceeds its maximum size",
             });
         }
-        let event = decode_payload(&payload_json)?;
         entries.push(JournalEntry {
             sequence,
             occurred_at,
-            event,
+            event: decode_payload(&payload_json)?,
         });
         expected = expected
             .checked_add(1)
@@ -156,69 +183,108 @@ where
 
 pub(crate) fn append_journal<E>(
     transaction: &Transaction<'_>,
-    key: &str,
+    key: &JournalKey,
     event: &E,
-) -> Result<JournalEntry<E>, StoreError>
+) -> Result<JournalAppend, StoreError>
 where
-    E: Serialize + DeserializeOwned,
+    E: Serialize,
 {
     let payload_json = encode_payload(event, MAX_JOURNAL_ENTRY_BYTES)?;
-    let stored_event = decode_payload(&payload_json)?;
-    // A full typed read before append detects corruption and guarantees that a
-    // damaged sequence can never be extended into a seemingly valid history.
-    let next_sequence = read_journal::<E>(transaction, key)?.next_sequence;
-    let sequence = i64::try_from(next_sequence).map_err(|_| StoreError::RevisionExhausted)?;
+    let next_sequence = next_journal_sequence(transaction, key)?;
     let occurred_at = unix_millis()?;
     transaction
         .execute(
             "
-            INSERT INTO journal_entries (journal_key, sequence, occurred_at, payload_json)
-            VALUES (?1, ?2, ?3, ?4)
+                INSERT INTO journal_entries (journal_key, sequence, occurred_at, payload_json)
+                VALUES (?1, ?2, ?3, ?4)
             ",
-            params![key, sequence, occurred_at, payload_json],
+            params![
+                key.as_str(),
+                i64::try_from(next_sequence).map_err(|_| StoreError::RevisionExhausted)?,
+                occurred_at,
+                payload_json,
+            ],
         )
         .map_err(|error| StoreError::sqlite("append journal entry", error))?;
-    Ok(JournalEntry {
+    Ok(JournalAppend {
         sequence: next_sequence,
         occurred_at,
-        // The serialized form was decoded before mutation, so the returned
-        // event exactly reflects the durable payload without keeping a clone
-        // bound on arbitrary caller event types.
-        event: stored_event,
     })
+}
+
+fn next_journal_sequence(
+    transaction: &Transaction<'_>,
+    key: &JournalKey,
+) -> Result<u64, StoreError> {
+    let last_sequence = transaction
+        .query_row(
+            "
+                SELECT sequence
+                FROM journal_entries
+                WHERE journal_key = ?1
+                ORDER BY sequence DESC
+                LIMIT 1
+            ",
+            [key.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::sqlite("read journal tail", error))?;
+    match last_sequence {
+        None => Ok(1),
+        Some(sequence) if sequence <= 0 => Err(StoreError::Corrupt {
+            message: "journal sequence is invalid",
+        }),
+        Some(sequence) => sequence
+            .checked_add(1)
+            .ok_or(StoreError::RevisionExhausted)
+            .and_then(|sequence| {
+                u64::try_from(sequence).map_err(|_| StoreError::RevisionExhausted)
+            }),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use serde::Serialize;
 
-    use crate::{BoneStore, StoreRoots};
+    use crate::{BoneStore, JournalKey, StoreRoots};
+
+    #[derive(Serialize)]
+    struct WriteOnlyEvent {
+        value: String,
+    }
+
+    fn store() -> (tempfile::TempDir, BoneStore) {
+        let temporary = tempfile::tempdir().unwrap();
+        let store =
+            BoneStore::open_at(StoreRoots::new(temporary.path().join("data")).unwrap()).unwrap();
+        (temporary, store)
+    }
 
     #[test]
     fn journal_entries_are_strictly_ordered() {
-        let temporary = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(
-            temporary.path(),
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .unwrap();
-        let store = BoneStore::open_at(
-            StoreRoots::new(
-                temporary.path().join("data"),
-                temporary.path().join("config"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let journal = store
-            .workspace_state()
-            .session_journal::<String>("workspace", "session")
-            .unwrap();
+        let (_temporary, store) = store();
+        let journal = store.journal::<String>(JournalKey::new("test/events"));
         let first = journal.append(&"one".to_owned()).unwrap();
         let second = journal.append(&"two".to_owned()).unwrap();
         assert_eq!(first.sequence, 1);
         assert_eq!(second.sequence, 2);
         assert_eq!(journal.read().unwrap().next_sequence, 3);
+    }
+
+    #[test]
+    fn append_needs_no_deserializer() {
+        let (_temporary, store) = store();
+        let journal = store.journal::<WriteOnlyEvent>(JournalKey::new("test/write-only"));
+        assert_eq!(
+            journal
+                .append(&WriteOnlyEvent {
+                    value: "event".to_owned(),
+                })
+                .unwrap()
+                .sequence,
+            1
+        );
     }
 }

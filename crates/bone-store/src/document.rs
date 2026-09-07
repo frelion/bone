@@ -12,11 +12,34 @@ use crate::{StoreError, sqlite::StoreInner};
 
 pub(crate) const MAX_DOCUMENT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
-/// The optimistic-concurrency version of one stored document.
+/// The durable address of one document.
 ///
-/// Revision zero represents an absent document. Every persisted document has
-/// a positive revision assigned by SQLite; callers must use the snapshot's
-/// revision for a compare-and-swap replacement.
+/// Namespaces and keys are application-defined strings. They are always bound
+/// as SQLite parameters, never interpolated into SQL.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DocumentKey {
+    namespace: String,
+    key: String,
+}
+
+impl DocumentKey {
+    pub fn new(namespace: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            key: key.into(),
+        }
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+/// The optimistic-concurrency version of one stored document.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Revision(u64);
@@ -33,7 +56,7 @@ impl fmt::Display for Revision {
     }
 }
 
-/// Immutable typed result of reading one document.
+/// Immutable result of reading one document.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocumentSnapshot<T> {
     pub value: Option<T>,
@@ -46,20 +69,20 @@ impl<T> DocumentSnapshot<T> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct DocumentAddress {
-    pub(crate) namespace: &'static str,
-    pub(crate) key: String,
+/// One typed result from a namespace/prefix listing.
+///
+/// A bad payload stays attached to its durable key so callers can keep using
+/// healthy records from the same namespace.
+#[derive(Debug)]
+pub struct DocumentListEntry<T> {
+    pub key: DocumentKey,
+    pub snapshot: Result<DocumentSnapshot<T>, StoreError>,
 }
 
-/// One fixed, typed BONE document location.
-///
-/// Applications receive documents from a scoped store capability rather than
-/// constructing arbitrary namespaces or keys. This prevents the storage API
-/// from degrading into an untyped key/value database.
+/// A typed handle for one document key.
 pub struct Document<T> {
     pub(crate) inner: Arc<StoreInner>,
-    pub(crate) address: DocumentAddress,
+    pub(crate) key: DocumentKey,
     marker: PhantomData<fn() -> T>,
 }
 
@@ -67,7 +90,7 @@ impl<T> Clone for Document<T> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            address: self.address.clone(),
+            key: self.key.clone(),
             marker: PhantomData,
         }
     }
@@ -77,48 +100,39 @@ impl<T> fmt::Debug for Document<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Document")
-            .field("namespace", &self.address.namespace)
-            .field("key", &self.address.key)
+            .field("key", &self.key)
             .finish_non_exhaustive()
     }
 }
 
-impl<T> Document<T>
-where
-    T: Serialize + DeserializeOwned,
-{
-    pub fn read(&self) -> Result<DocumentSnapshot<T>, StoreError> {
+impl<T> Document<T> {
+    pub fn key(&self) -> &DocumentKey {
+        &self.key
+    }
+
+    pub fn read(&self) -> Result<DocumentSnapshot<T>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
         let connection = self.inner.connection()?;
-        read_document(&connection, &self.address)
+        read_document(&connection, &self.key)
     }
 
-    /// Replace this document only if `expected` is still current.
-    ///
-    /// To create a previously missing document, pass `Revision::default()`.
-    /// Replacing an identical encoded payload is idempotent and returns its
-    /// existing revision without creating a new version.
-    pub fn replace(&self, value: &T, expected: Revision) -> Result<Revision, StoreError> {
+    /// Replace this document only when its revision still equals `expected`.
+    /// Use revision zero to create a missing document.
+    pub fn replace(&self, value: &T, expected: Revision) -> Result<Revision, StoreError>
+    where
+        T: Serialize,
+    {
         self.inner
-            .with_write(|transaction| replace_document(transaction, &self.address, value, expected))
-    }
-
-    /// Remove this document only if `expected` is still current.
-    ///
-    /// Removing a missing document with revision zero is an idempotent no-op.
-    pub fn remove(&self, expected: Revision) -> Result<(), StoreError> {
-        self.inner
-            .with_write(|transaction| remove_document(transaction, &self.address, expected))
+            .with_write(|transaction| replace_document(transaction, &self.key, value, expected))
     }
 }
 
-pub(crate) fn document<T>(
-    inner: Arc<StoreInner>,
-    namespace: &'static str,
-    key: String,
-) -> Document<T> {
+pub(crate) fn document<T>(inner: Arc<StoreInner>, key: DocumentKey) -> Document<T> {
     Document {
         inner,
-        address: DocumentAddress { namespace, key },
+        key,
         marker: PhantomData,
     }
 }
@@ -129,91 +143,108 @@ pub(crate) fn same_store<T>(document: &Document<T>, store: &Arc<StoreInner>) -> 
 
 pub(crate) fn read_document<T>(
     connection: &Connection,
-    address: &DocumentAddress,
+    key: &DocumentKey,
 ) -> Result<DocumentSnapshot<T>, StoreError>
 where
     T: DeserializeOwned,
 {
-    let Some(raw) = read_raw_document(connection, address)? else {
+    let Some(raw) = read_raw_document(connection, key)? else {
         return Ok(DocumentSnapshot {
             value: None,
             revision: Revision::default(),
         });
     };
-    let value = serde_json::from_str(&raw.payload_json).map_err(StoreError::Decode)?;
     Ok(DocumentSnapshot {
-        value: Some(value),
+        value: Some(decode_payload(&raw.payload_json)?),
         revision: raw.revision,
     })
 }
 
 pub(crate) fn read_documents_with_prefix<T>(
     connection: &Connection,
-    namespace: &'static str,
+    namespace: &str,
     key_prefix: &str,
-) -> Result<Vec<DocumentSnapshot<T>>, StoreError>
+) -> Result<Vec<DocumentListEntry<T>>, StoreError>
 where
     T: DeserializeOwned,
 {
-    // Workspace/session IDs may legally contain `_`. In SQL `LIKE`, however,
-    // `_` is a single-character wildcard, which would let a prefix query
-    // return records belonging to a different Workspace. Escape every LIKE
-    // metacharacter even though the current domain key grammar only admits
-    // `_`; this keeps the storage boundary correct if a future fixed key adds
-    // one of the other characters.
-    let pattern = format!("{}%", escape_like_literal(key_prefix));
-    let mut statement = connection
-        .prepare(
+    let (sql, upper_bound) = match binary_prefix_upper_bound(key_prefix) {
+        Some(upper_bound) => (
             "
-            SELECT revision, payload_json
-            FROM documents
-            WHERE namespace = ?1 AND key LIKE ?2 ESCAPE '\\'
-            ORDER BY key ASC
+                SELECT key, revision, payload_json
+                FROM documents
+                WHERE namespace COLLATE BINARY = ?1
+                  AND key COLLATE BINARY >= ?2
+                  AND key COLLATE BINARY < CAST(?3 AS TEXT)
+                ORDER BY key COLLATE BINARY ASC
             ",
-        )
+            Some(upper_bound),
+        ),
+        None => (
+            "
+                SELECT key, revision, payload_json
+                FROM documents
+                WHERE namespace COLLATE BINARY = ?1
+                ORDER BY key COLLATE BINARY ASC
+            ",
+            None,
+        ),
+    };
+    let mut statement = connection
+        .prepare(sql)
         .map_err(|error| StoreError::sqlite("prepare document list", error))?;
-    let rows = statement
-        .query_map(params![namespace, pattern], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|error| StoreError::sqlite("read document list", error))?;
-    rows.map(|row| {
-        let (revision, payload_json) =
-            row.map_err(|error| StoreError::sqlite("read document list", error))?;
-        let revision = u64::try_from(revision)
-            .ok()
-            .filter(|revision| *revision > 0)
-            .map(Revision)
-            .ok_or(StoreError::Corrupt {
-                message: "document revision is invalid",
-            })?;
-        if payload_json.len() > MAX_DOCUMENT_PAYLOAD_BYTES {
-            return Err(StoreError::Corrupt {
-                message: "document payload exceeds its maximum size",
-            });
-        }
-        Ok(DocumentSnapshot {
-            value: Some(decode_payload(&payload_json)?),
-            revision,
-        })
-    })
-    .collect()
+    let mut rows = match upper_bound {
+        Some(upper_bound) => statement.query(params![namespace, key_prefix, upper_bound]),
+        None => statement.query([namespace]),
+    }
+    .map_err(|error| StoreError::sqlite("read document list", error))?;
+
+    let mut documents = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| StoreError::sqlite("read document list", error))?
+    {
+        let key = row
+            .get::<_, String>(0)
+            .map_err(|error| StoreError::sqlite("read listed document key", error))?;
+        let snapshot = (|| {
+            let revision = row
+                .get::<_, i64>(1)
+                .map_err(|error| StoreError::sqlite("read listed document revision", error))?;
+            let payload = row
+                .get::<_, String>(2)
+                .map_err(|error| StoreError::sqlite("read listed document payload", error))?;
+            let raw = validate_raw_document(revision, payload)?;
+            Ok(DocumentSnapshot {
+                value: Some(decode_payload(&raw.payload_json)?),
+                revision: raw.revision,
+            })
+        })();
+        documents.push(DocumentListEntry {
+            key: DocumentKey::new(namespace, key),
+            snapshot,
+        });
+    }
+    Ok(documents)
 }
 
-fn escape_like_literal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        if matches!(character, '\\' | '%' | '_') {
-            escaped.push('\\');
-        }
-        escaped.push(character);
+// SQLite's BINARY collation compares TEXT as UTF-8 bytes. Binding the upper
+// bound as a BLOB and casting it to TEXT retains a valid byte-range even when
+// incrementing the final byte would not itself be valid UTF-8.
+fn binary_prefix_upper_bound(prefix: &str) -> Option<Vec<u8>> {
+    if prefix.is_empty() {
+        return None;
     }
-    escaped
+    let mut bytes = prefix.as_bytes().to_vec();
+    let position = bytes.iter().rposition(|byte| *byte != u8::MAX)?;
+    bytes[position] += 1;
+    bytes.truncate(position + 1);
+    Some(bytes)
 }
 
 pub(crate) fn replace_document<T>(
     transaction: &Transaction<'_>,
-    address: &DocumentAddress,
+    key: &DocumentKey,
     value: &T,
     expected: Revision,
 ) -> Result<Revision, StoreError>
@@ -221,7 +252,7 @@ where
     T: Serialize,
 {
     let payload_json = encode_payload(value, MAX_DOCUMENT_PAYLOAD_BYTES)?;
-    let current = read_raw_document(transaction, address)?;
+    let current = read_raw_document(transaction, key)?;
     let actual = current
         .as_ref()
         .map_or_else(Revision::default, |document| document.revision);
@@ -234,11 +265,11 @@ where
     {
         return Ok(actual);
     }
-
     let revision = actual
-        .0
+        .value()
         .checked_add(1)
         .map(Revision)
+        .filter(|revision| i64::try_from(revision.value()).is_ok())
         .ok_or(StoreError::RevisionExhausted)?;
     let now = unix_millis()?;
     match current {
@@ -246,14 +277,15 @@ where
             transaction
                 .execute(
                     "
-                    UPDATE documents
-                    SET revision = ?3, payload_json = ?4, updated_at = ?5
-                    WHERE namespace = ?1 AND key = ?2
+                        UPDATE documents
+                        SET revision = ?3, payload_json = ?4, updated_at = ?5
+                        WHERE namespace = ?1 AND key = ?2
                     ",
                     params![
-                        address.namespace,
-                        address.key,
-                        i64::try_from(revision.0).map_err(|_| StoreError::RevisionExhausted)?,
+                        key.namespace(),
+                        key.key(),
+                        i64::try_from(revision.value())
+                            .map_err(|_| StoreError::RevisionExhausted)?,
                         payload_json,
                         now,
                     ],
@@ -264,14 +296,15 @@ where
             transaction
                 .execute(
                     "
-                    INSERT INTO documents
-                        (namespace, key, revision, payload_json, created_at, updated_at)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                        INSERT INTO documents
+                            (namespace, key, revision, payload_json, created_at, updated_at)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?5)
                     ",
                     params![
-                        address.namespace,
-                        address.key,
-                        i64::try_from(revision.0).map_err(|_| StoreError::RevisionExhausted)?,
+                        key.namespace(),
+                        key.key(),
+                        i64::try_from(revision.value())
+                            .map_err(|_| StoreError::RevisionExhausted)?,
                         payload_json,
                         now,
                     ],
@@ -280,29 +313,6 @@ where
         }
     }
     Ok(revision)
-}
-
-pub(crate) fn remove_document(
-    transaction: &Transaction<'_>,
-    address: &DocumentAddress,
-    expected: Revision,
-) -> Result<(), StoreError> {
-    let current = read_raw_document(transaction, address)?;
-    let actual = current
-        .as_ref()
-        .map_or_else(Revision::default, |document| document.revision);
-    if actual != expected {
-        return Err(StoreError::RevisionConflict { expected, actual });
-    }
-    if current.is_some() {
-        transaction
-            .execute(
-                "DELETE FROM documents WHERE namespace = ?1 AND key = ?2",
-                params![address.namespace, address.key],
-            )
-            .map_err(|error| StoreError::sqlite("remove document", error))?;
-    }
-    Ok(())
 }
 
 pub(crate) fn encode_payload<T: Serialize>(
@@ -334,33 +344,35 @@ struct RawDocument {
 
 fn read_raw_document(
     connection: &Connection,
-    address: &DocumentAddress,
+    key: &DocumentKey,
 ) -> Result<Option<RawDocument>, StoreError> {
     let row = connection
         .query_row(
             "SELECT revision, payload_json FROM documents WHERE namespace = ?1 AND key = ?2",
-            params![address.namespace, address.key],
+            params![key.namespace(), key.key()],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(|error| StoreError::sqlite("read document", error))?;
-    row.map(|(revision, payload_json)| {
-        let revision = u64::try_from(revision)
-            .ok()
-            .filter(|revision| *revision > 0)
-            .map(Revision)
-            .ok_or(StoreError::Corrupt {
-                message: "document revision is invalid",
-            })?;
-        if payload_json.len() > MAX_DOCUMENT_PAYLOAD_BYTES {
-            return Err(StoreError::Corrupt {
-                message: "document payload exceeds its maximum size",
-            });
-        }
-        Ok(RawDocument {
-            revision,
-            payload_json,
-        })
+    row.map(|(revision, payload_json)| validate_raw_document(revision, payload_json))
+        .transpose()
+}
+
+fn validate_raw_document(revision: i64, payload_json: String) -> Result<RawDocument, StoreError> {
+    let revision = u64::try_from(revision)
+        .ok()
+        .filter(|revision| *revision > 0)
+        .map(Revision)
+        .ok_or(StoreError::Corrupt {
+            message: "document revision is invalid",
+        })?;
+    if payload_json.len() > MAX_DOCUMENT_PAYLOAD_BYTES {
+        return Err(StoreError::Corrupt {
+            message: "document payload exceeds its maximum size",
+        });
+    }
+    Ok(RawDocument {
+        revision,
+        payload_json,
     })
-    .transpose()
 }

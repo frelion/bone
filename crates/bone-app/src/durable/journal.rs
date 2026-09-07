@@ -4,12 +4,12 @@
 //! format version, tail-recovery path, sidecar lock, or JSONL compatibility
 //! layer: SQLite commits every row atomically and is the only source of truth.
 
-use std::{fmt, sync::Arc};
+use std::fmt;
 
-use bone_store::Journal;
+use bone_store::{Journal, JournalAppend};
 use serde::{Deserialize, Serialize};
 
-use super::{JournalError, SessionId, SessionWriterLease, UnixMillis, WorkspaceId};
+use super::{JournalError, SessionId, UnixMillis};
 
 const MAX_FACT_TEXT_BYTES: usize = 512 * 1024;
 const MAX_RUNTIME_FINGERPRINT_BYTES: usize = 256;
@@ -163,6 +163,20 @@ impl JournalEntry {
         Ok(entry)
     }
 
+    pub(crate) fn from_append(
+        fact: JournalFact,
+        append: JournalAppend,
+    ) -> Result<Self, JournalError> {
+        let entry = Self {
+            sequence: JournalSequence::from_store(append.sequence)?,
+            occurred_at: UnixMillis::from_millis(append.occurred_at)
+                .map_err(|error| invalid(format!("journal timestamp is invalid: {error}")))?,
+            fact,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
     fn validate(&self) -> Result<(), JournalError> {
         if self.occurred_at.as_millis() < 0 {
             return Err(invalid(
@@ -193,8 +207,6 @@ impl JournalRead {
 #[derive(Clone)]
 pub struct SessionJournal {
     session_id: SessionId,
-    workspace_id: WorkspaceId,
-    lease_issuer: Arc<()>,
     journal: Journal<JournalFact>,
 }
 
@@ -208,16 +220,9 @@ impl fmt::Debug for SessionJournal {
 }
 
 impl SessionJournal {
-    pub(crate) fn new(
-        session_id: SessionId,
-        workspace_id: WorkspaceId,
-        lease_issuer: Arc<()>,
-        journal: Journal<JournalFact>,
-    ) -> Self {
+    pub(crate) fn new(session_id: SessionId, journal: Journal<JournalFact>) -> Self {
         Self {
             session_id,
-            workspace_id,
-            lease_issuer,
             journal,
         }
     }
@@ -234,21 +239,6 @@ impl SessionJournal {
             .map(JournalEntry::from_store)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(JournalRead { entries })
-    }
-
-    /// Append a fact only while this process owns the matching Session writer
-    /// lease. Reads intentionally remain lease-free so other BONE processes
-    /// can render a held conversation as read-only.
-    pub fn append(
-        &self,
-        lease: &SessionWriterLease,
-        fact: JournalFact,
-    ) -> Result<JournalEntry, JournalError> {
-        lease
-            .assert_grants_write(self.workspace_id, self.session_id, &self.lease_issuer)
-            .map_err(JournalError::Session)?;
-        fact.validate()?;
-        JournalEntry::from_store(self.journal.append(&fact)?)
     }
 }
 

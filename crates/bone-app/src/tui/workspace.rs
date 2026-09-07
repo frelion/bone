@@ -7,8 +7,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    JournalRead, ModelSelection, SessionDraft, SessionLifecycle, SessionStoreError,
-    SettingsService, WorkspaceApplication,
+    ChatGptCredentials, JournalRead, ModelSelection, SessionDraft, SessionLifecycle,
+    SessionStoreError, SettingsService, WorkspaceApplication,
 };
 use bone_agent::{AgentHost, ResolvedAgentRuntimeConfig, ShutdownReport};
 use crossterm::event::EventStream;
@@ -30,7 +30,7 @@ use super::{
         create_session, model_is_ready, persist_draft, persist_interruption,
         persist_runtime_attached, persist_runtime_receipt, persist_runtime_records,
         persist_runtime_retryable, persist_runtime_stopping, persist_unresolved_shutdown_effects,
-        prepare_post, release_idle_writer_leases_after_switch, turn_state,
+        prepare_post, release_idle_writers_after_switch, turn_state,
     },
     terminal::TerminalSession,
     view,
@@ -39,25 +39,29 @@ use super::{
 pub async fn run_workspace(
     application: WorkspaceApplication,
     settings: SettingsService,
+    credentials: ChatGptCredentials,
     initial_model: Option<String>,
 ) -> Result<Vec<ShutdownReport>, TuiError> {
     // This is the product startup boundary for the selected conversation. The
-    // lease stays in `durable` for the full runtime lifetime; it is not a
+    // writer stays in `durable` for the full runtime lifetime; it is not a
     // short record lock that can be dropped before recovery or posting work.
     let opened = application.open_or_create_writer_draft()?;
-    let mut opened_lease = Some(opened.lease);
+    let mut opened_writer = Some(opened.writer);
     let mut opened = opened.draft;
     if let Some(model) = initial_model {
         match ModelSelection::new(model, None, None) {
-            Ok(selection) => match application.sessions().set_solver_model_override(
-                opened_lease
-                    .as_ref()
-                    .expect("opened writer lease is retained"),
-                opened.record.id,
-                opened.record.revision,
-                Some(selection),
-            ) {
-                Ok(record) => opened.record = record,
+            Ok(selection) => match opened_writer
+                .as_mut()
+                .expect("opened writer is retained")
+                .set_solver_model_override(Some(selection))
+            {
+                Ok(()) => {
+                    opened.record = opened_writer
+                        .as_ref()
+                        .expect("opened writer is retained")
+                        .record()
+                        .clone();
+                }
                 Err(error) => return Err(TuiError::SessionStore(error)),
             },
             Err(error) => return Err(TuiError::Input(error)),
@@ -95,13 +99,13 @@ pub async fn run_workspace(
             };
         let (next_turn, active_turn) = turn_state(&journal_read);
         let select = record.id == opened.record.id;
-        let writer_lease = if select { opened_lease.take() } else { None };
+        let writer = if select { opened_writer.take() } else { None };
         durable.insert(
             ui_id,
             DurableUiSession {
                 record,
                 journal,
-                writer_lease,
+                writer,
                 next_turn,
                 active_turn,
                 runtime_record_cursor: 0,
@@ -140,7 +144,7 @@ pub async fn run_workspace(
             .is_some_and(|session| model_is_ready(&settings, &session.record));
         let writer_available = durable
             .get(&ui_id)
-            .is_some_and(|session| session.writer_lease.is_some());
+            .is_some_and(|session| session.writer.is_some());
         let record = &durable
             .get(&ui_id)
             .expect("a hydrated durable session was just inserted")
@@ -235,7 +239,7 @@ pub async fn run_workspace(
                         if acquired {
                             let busy_ids =
                                 busy_session_ids(&live_sessions, &pending_tasks, &starting_ids);
-                            release_idle_writer_leases_after_switch(
+                            release_idle_writers_after_switch(
                                 &mut durable,
                                 &mut app,
                                 &busy_ids,
@@ -381,7 +385,7 @@ pub async fn run_workspace(
                                             apply_enqueued_pending_starts(&mut app, started);
                                         } else if connecting.is_empty() {
                                             let _ = app.reduce(AppEvent::ConnectionStarting);
-                                            enqueue_connection(&mut connecting, application.store().clone(), login_tx.clone());
+                                            enqueue_connection(&mut connecting, credentials.clone(), login_tx.clone());
                                         }
                                     }
                                 }
@@ -426,6 +430,7 @@ pub async fn run_workspace(
                             let _ = app.reduce(AppEvent::ComposerCleared { id });
                             let mut command_context = CommandContext {
                                 application: &application,
+                                credentials: &credentials,
                                 settings: &settings,
                                 durable: &mut durable,
                                 show_progress,
@@ -449,7 +454,7 @@ pub async fn run_workspace(
                             if selected_after_command != id && acquired {
                                 let busy_ids =
                                     busy_session_ids(&live_sessions, &pending_tasks, &starting_ids);
-                                release_idle_writer_leases_after_switch(
+                                release_idle_writers_after_switch(
                                     &mut durable,
                                     &mut app,
                                     &busy_ids,
@@ -469,7 +474,7 @@ pub async fn run_workspace(
                                     apply_enqueued_pending_starts(&mut app, started);
                                 } else if connecting.is_empty() {
                                     let _ = app.reduce(AppEvent::ConnectionStarting);
-                                    enqueue_connection(&mut connecting, application.store().clone(), login_tx.clone());
+                                    enqueue_connection(&mut connecting, credentials.clone(), login_tx.clone());
                                 }
                             }
                         }
@@ -479,11 +484,11 @@ pub async fn run_workspace(
                             let selected_after_new = app.current_id();
                             let acquired = durable
                                 .get(&selected_after_new)
-                                .is_some_and(|session| session.writer_lease.is_some());
+                                .is_some_and(|session| session.writer.is_some());
                             if selected_after_new != selected_before_new && acquired {
                                 let busy_ids =
                                     busy_session_ids(&live_sessions, &pending_tasks, &starting_ids);
-                                release_idle_writer_leases_after_switch(
+                                release_idle_writers_after_switch(
                                     &mut durable,
                                     &mut app,
                                     &busy_ids,
@@ -816,7 +821,7 @@ mod tests {
         persist_draft, persist_interruption, persist_model_readiness, persist_runtime_attached,
         persist_runtime_receipt, persist_runtime_records, persist_runtime_retryable,
         persist_runtime_starting, persist_status, reconcile_cold_runtime,
-        reconcile_journal_summary, release_idle_writer_leases_after_switch,
+        reconcile_journal_summary, release_idle_writers_after_switch,
     };
     use crate::{
         JournalFact, JournalRead, ModelSelection, RuntimeAttachment, SessionAttention,
@@ -827,7 +832,7 @@ mod tests {
         JobId, JobOutcome, ModelSettings, Notice, RecordEntry, RecordKind,
         ResolvedAgentRuntimeConfig,
     };
-    use bone_store::StoreRoots;
+    use bone_store::{BoneStore, StoreRoots};
     use bone_tools::ToolLimits;
 
     const UI_ID: UiSessionId = UiSessionId(1);
@@ -858,15 +863,14 @@ mod tests {
     fn test_fixture() -> Fixture {
         let project = tempfile::tempdir().unwrap();
         let state = private_state();
-        let application = WorkspaceApplication::open_at(
-            project.path(),
-            StoreRoots::new(state.path().join("data"), state.path().join("config")).unwrap(),
-        )
-        .unwrap();
+        let store =
+            BoneStore::open_at(StoreRoots::new(state.path().join("data")).unwrap()).unwrap();
+        let application =
+            WorkspaceApplication::open_with_store(project.path(), store.clone()).unwrap();
         let opened = application.open_or_create_writer_draft().unwrap();
-        let settings = SettingsService::open(application.store().clone()).unwrap();
+        let settings = SettingsService::open(store).unwrap();
         let record = opened.draft.record;
-        let writer_lease = opened.lease;
+        let writer = opened.writer;
         let journal = application.sessions().journal(record.id).unwrap();
         let mut durable = HashMap::new();
         durable.insert(
@@ -874,7 +878,7 @@ mod tests {
             DurableUiSession {
                 record,
                 journal: Some(journal),
-                writer_lease: Some(writer_lease),
+                writer: Some(writer),
                 next_turn: 1,
                 active_turn: None,
                 runtime_record_cursor: 0,
@@ -961,15 +965,10 @@ mod tests {
         let draft =
             SessionDraft::new("implement the change", "implement the change".len()).unwrap();
         persist_draft(&fixture.application, &mut fixture.durable, UI_ID, draft).unwrap();
-        persist_status(
-            &fixture.application,
-            &mut fixture.durable,
-            UI_ID,
-            |status| {
-                status.attention.insert(SessionAttention::ConfigPending);
-                status.attention.insert(SessionAttention::RecoveryNeeded);
-            },
-        )
+        persist_status(&mut fixture.durable, UI_ID, |status| {
+            status.attention.insert(SessionAttention::ConfigPending);
+            status.attention.insert(SessionAttention::RecoveryNeeded);
+        })
         .unwrap();
 
         let _accepted = accept(&mut fixture, true);
@@ -1026,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_summary_moves_through_start_attach_receipt_and_retries_stale_cas() {
+    fn runtime_summary_moves_through_start_attach_receipt_and_retryable_state() {
         let mut fixture = test_fixture();
         accept(&mut fixture, true);
 
@@ -1045,61 +1044,35 @@ mod tests {
         assert_eq!(record.status.execution, SessionExecution::Working);
         assert_eq!(record.status.attachment, RuntimeAttachment::Attached);
 
-        // A different process can update metadata after this TUI cached the
-        // old revision. The next focused mutation reloads, preserves that
-        // external change, and retries the status patch once.
-        let current = persisted(&fixture);
-        let external = fixture
-            .application
-            .sessions()
-            .rename(
-                fixture.durable[&UI_ID]
-                    .writer_lease
-                    .as_ref()
-                    .expect("fixture owns the writer lease"),
-                current.id,
-                current.revision,
-                "Edited elsewhere",
-            )
-            .unwrap();
         persist_runtime_retryable(&fixture.application, &mut fixture.durable, UI_ID).unwrap();
         let record = persisted(&fixture);
-        assert_eq!(record.metadata.title, external.metadata.title);
         assert_eq!(record.status.execution, SessionExecution::QueuedForRuntime);
         assert_eq!(record.status.attachment, RuntimeAttachment::Detached);
         assert_eq!(record.status.availability, SessionAvailability::Local);
-        assert_eq!(fixture.durable[&UI_ID].record.revision, record.revision);
     }
 
     #[test]
     fn attached_runtime_turns_keep_the_pinned_config_after_model_changes() {
         let mut fixture = test_fixture();
-        let settings = SettingsService::open(fixture.application.store().clone()).unwrap();
         let pinned = test_runtime();
-        let current = fixture.durable[&UI_ID].record.clone();
-        let updated = fixture
-            .application
-            .sessions()
-            .set_solver_model_override(
-                fixture.durable[&UI_ID]
-                    .writer_lease
-                    .as_ref()
-                    .expect("fixture owns the writer lease"),
-                fixture.logical_id,
-                current.revision,
-                Some(ModelSelection::new("newly-saved-model", None, None).unwrap()),
-            )
+        let session = fixture.durable.get_mut(&UI_ID).unwrap();
+        session
+            .writer
+            .as_mut()
+            .expect("fixture owns the writer")
+            .set_solver_model_override(Some(
+                ModelSelection::new("newly-saved-model", None, None).unwrap(),
+            ))
             .unwrap();
-        fixture.durable.get_mut(&UI_ID).unwrap().record = updated;
-        // The `/model` command refreshes this local projection before a later
-        // post; mirror that effect in this controller-level test.
-        fixture.durable.get_mut(&UI_ID).unwrap().record = persisted(&fixture);
+        session.record = session.writer.as_ref().unwrap().record().clone();
 
-        let fresh = prepare_post_for_delivery(&settings, &fixture.durable, UI_ID, None).unwrap();
+        let fresh =
+            prepare_post_for_delivery(&fixture.settings, &fixture.durable, UI_ID, None).unwrap();
         assert_eq!(fresh.runtime.solver().model, "newly-saved-model");
         let pinned_fingerprint = pinned.fingerprint().to_string();
         let pinned_prepared =
-            prepare_post_for_delivery(&settings, &fixture.durable, UI_ID, Some(&pinned)).unwrap();
+            prepare_post_for_delivery(&fixture.settings, &fixture.durable, UI_ID, Some(&pinned))
+                .unwrap();
 
         let accepted = accept_post(
             &fixture.application,
@@ -1157,7 +1130,7 @@ mod tests {
             RuntimeAttachment::Attached
         );
         assert_eq!(fixture.durable[&UI_ID].active_turn, None);
-        let revision_after_terminal = terminal_record.revision;
+        let record_after_terminal = terminal_record.clone();
 
         // A reset after a broadcast gap repeats the same record. It must not
         // append a second TurnFinished fact or churn the record revision.
@@ -1168,7 +1141,7 @@ mod tests {
             std::slice::from_ref(&terminal),
         )
         .unwrap();
-        assert_eq!(persisted(&fixture).revision, revision_after_terminal);
+        assert_eq!(persisted(&fixture), record_after_terminal);
 
         let unknown = RecordEntry {
             cursor: 2,
@@ -1251,15 +1224,10 @@ mod tests {
         ));
 
         let mut idle_fixture = test_fixture();
-        persist_status(
-            &idle_fixture.application,
-            &mut idle_fixture.durable,
-            UI_ID,
-            |status| {
-                status.execution = SessionExecution::Complete;
-                status.attachment = RuntimeAttachment::Attached;
-            },
-        )
+        persist_status(&mut idle_fixture.durable, UI_ID, |status| {
+            status.execution = SessionExecution::Complete;
+            status.attachment = RuntimeAttachment::Attached;
+        })
         .unwrap();
         persist_interruption(
             &idle_fixture.application,
@@ -1342,17 +1310,12 @@ mod tests {
             &[terminal],
         )
         .unwrap();
-        persist_status(
-            &terminal_fixture.application,
-            &mut terminal_fixture.durable,
-            UI_ID,
-            |status| {
-                // Simulate the secondary summary write having failed after a
-                // prior process durably appended TurnFinished.
-                status.execution = SessionExecution::Working;
-                status.attachment = RuntimeAttachment::Attached;
-            },
-        )
+        persist_status(&mut terminal_fixture.durable, UI_ID, |status| {
+            // Simulate the secondary summary write having failed after a
+            // prior process durably appended TurnFinished.
+            status.execution = SessionExecution::Working;
+            status.attachment = RuntimeAttachment::Attached;
+        })
         .unwrap();
         let journal = terminal_fixture
             .application
@@ -1395,9 +1358,9 @@ mod tests {
                 .attention
                 .contains(&SessionAttention::ConfigPending)
         );
-        let ready_revision = record.revision;
+        let ready_record = record.clone();
         persist_model_readiness(&fixture.application, &mut fixture.durable, UI_ID, true).unwrap();
-        assert_eq!(persisted(&fixture).revision, ready_revision);
+        assert_eq!(persisted(&fixture), ready_record);
 
         accept(&mut fixture, false);
         record_test_receipt(&mut fixture);
@@ -1416,8 +1379,8 @@ mod tests {
     fn an_unleased_session_cannot_append_a_turn_or_change_its_summary() {
         let mut fixture = test_fixture();
         let before = persisted(&fixture);
-        let lease = fixture.durable.get_mut(&UI_ID).unwrap().writer_lease.take();
-        drop(lease);
+        let writer = fixture.durable.get_mut(&UI_ID).unwrap().writer.take();
+        drop(writer);
 
         let draft = SessionDraft::new("must not become a ghost draft", 0).unwrap();
         assert!(persist_draft(&fixture.application, &mut fixture.durable, UI_ID, draft).is_err());
@@ -1450,25 +1413,21 @@ mod tests {
     fn lazy_writer_activation_reconciles_a_background_active_turn_before_editing() {
         let mut fixture = test_fixture();
         fixture
-            .application
-            .sessions()
-            .journal(fixture.logical_id)
+            .durable
+            .get_mut(&UI_ID)
             .unwrap()
-            .append(
-                fixture.durable[&UI_ID]
-                    .writer_lease
-                    .as_ref()
-                    .expect("fixture owns the writer lease"),
-                JournalFact::UserTurnAccepted {
-                    turn: 1,
-                    text: "inspect the failure".into(),
-                    runtime_fingerprint: expected_runtime_fingerprint(),
-                    solver_model: "gpt-test".into(),
-                },
-            )
+            .writer
+            .as_mut()
+            .expect("fixture owns the writer")
+            .append(JournalFact::UserTurnAccepted {
+                turn: 1,
+                text: "inspect the failure".into(),
+                runtime_fingerprint: expected_runtime_fingerprint(),
+                solver_model: "gpt-test".into(),
+            })
             .unwrap();
-        let lease = fixture.durable.get_mut(&UI_ID).unwrap().writer_lease.take();
-        drop(lease);
+        let writer = fixture.durable.get_mut(&UI_ID).unwrap().writer.take();
+        drop(writer);
         let mut app = App::new("workspace".into());
 
         assert!(activate_writer_session(
@@ -1479,7 +1438,7 @@ mod tests {
             UI_ID,
             false,
         ));
-        assert!(fixture.durable[&UI_ID].writer_lease.is_some());
+        assert!(fixture.durable[&UI_ID].writer.is_some());
         assert_eq!(fixture.durable[&UI_ID].active_turn, None);
         assert!(
             fixture
@@ -1496,13 +1455,14 @@ mod tests {
     }
 
     #[test]
-    fn successful_session_switch_releases_only_idle_writer_leases() {
+    fn successful_session_switch_releases_only_idle_writers() {
         let mut fixture = test_fixture();
-        let (second_record, second_lease) = fixture
+        let second_writer = fixture
             .application
             .sessions()
             .create_writer("Second")
             .unwrap();
+        let second_record = second_writer.record().clone();
         let second_journal = fixture
             .application
             .sessions()
@@ -1514,7 +1474,7 @@ mod tests {
             DurableUiSession {
                 record: second_record.clone(),
                 journal: Some(second_journal),
-                writer_lease: Some(second_lease),
+                writer: Some(second_writer),
                 next_turn: 1,
                 active_turn: None,
                 runtime_record_cursor: 0,
@@ -1547,10 +1507,10 @@ mod tests {
         let starting_ids = HashSet::new();
         let busy_ids = busy_session_ids(&live_sessions, &pending_tasks, &starting_ids);
 
-        release_idle_writer_leases_after_switch(&mut fixture.durable, &mut app, &busy_ids);
+        release_idle_writers_after_switch(&mut fixture.durable, &mut app, &busy_ids);
 
-        assert!(fixture.durable[&UI_ID].writer_lease.is_none());
-        assert!(fixture.durable[&second_id].writer_lease.is_some());
+        assert!(fixture.durable[&UI_ID].writer.is_none());
+        assert!(fixture.durable[&second_id].writer.is_some());
         assert!(matches!(
             app.sessions[0].state,
             crate::tui::app::SessionState::ReadOnlyElsewhere(_)

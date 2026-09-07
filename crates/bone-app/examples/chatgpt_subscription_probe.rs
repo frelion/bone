@@ -1,10 +1,10 @@
 use std::{env, error::Error, io};
 
+use bone_app::ChatGptCredentials;
 use bone_llm::{
     InputItem, InputSource, Request, StreamEvent, ToolChoice, ToolDefinition,
     service::chatgpt_subscription,
 };
-use bone_store::{BoneStore, ProviderId};
 use futures_util::StreamExt;
 use serde_json::json;
 
@@ -18,9 +18,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })?;
     let tool_mode = matches!(env::args().nth(1).as_deref(), Some("tool"));
     println!("first use may require ChatGPT device authorization");
-    let auth = BoneStore::open_default()?
-        .provider_auth()
-        .acquire(ProviderId::ChatGptSubscription)?;
+    let auth = ChatGptCredentials::default_for_current_user()?.acquire()?;
     let endpoint = chatgpt_subscription::connect("chatgpt-subscription", auth, |prompt| {
         println!("Sign in at {}", prompt.verification_uri);
         println!("Enter code: {}", prompt.user_code);

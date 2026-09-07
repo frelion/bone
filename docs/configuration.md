@@ -4,9 +4,9 @@ BONE has no user-editable configuration file. The terminal UI is the normal
 configuration surface; it writes typed settings immediately and reports the
 result through the same event flow as every other TUI effect.
 
-The implementation is deliberately not a generic configuration registry or a
-generic key/value database. `bone-store` is a concrete local SQLite service
-with a small, typed port used by the product domain.
+The implementation is deliberately not a generic configuration registry.
+`bone-store` is a small generic SQLite backend; `bone-app` owns the durable
+keys, typed records, validation, and configuration policy that use it.
 
 ## What is stored where
 
@@ -39,8 +39,9 @@ $XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/auth.json
 # or ~/.config/bone/store-v1/providers/chatgpt-subscription/auth.json
 ```
 
-`bone-store` owns the safe directory/path checks and a fail-fast `auth.lock`.
-It never reads, serializes, prints, or stores OAuth payloads in SQLite.
+`bone-app` owns the safe credential directory/path checks and a fail-fast
+`auth.lock`. It never reads, serializes, prints, or stores OAuth payloads in
+SQLite.
 
 There is no `BONE_CONFIG`, `BONE_STATE_DIR`, `credential_root`, JSON settings
 file, JSONL Session transcript, legacy import, or automatic migration. Older
@@ -117,30 +118,30 @@ than blocking the TUI indefinitely.
 
 ## Store API and composition
 
-The app opens one `BoneStore` at startup and injects scoped capabilities:
+The app opens one `BoneStore` at startup and injects it into its own domain
+services. It separately constructs its credential manager:
 
 ```rust,ignore
-let store = BoneStore::open_default()?;
+let store = open_default_store()?;
 let settings = SettingsService::open(store.clone())?;
 let workspace = WorkspaceApplication::open_with_store(launch_dir, store.clone())?;
-
-let global = store.settings().global::<GlobalSettings>();
-let state = store.workspace_state();
-let auth = store.provider_auth();
+let credentials = ChatGptCredentials::default_for_current_user()?;
 ```
 
-For tests, portable embedding, and future desktop hosts, supply explicit
-absolute roots through `StoreRoots` and `BoneStore::open_at`. This is the only
-path injection point; it is not a hidden environment-variable setting.
+`bone-app::open_default_store` owns the XDG/default-path policy. For tests,
+portable embedding, and future desktop hosts, the App composition layer passes
+an explicit absolute root to `StoreRoots` and `BoneStore::open_at`; the generic
+store does not inspect environment variables or choose a BONE path.
 
-`Document<T>` supplies missing/read/compare-and-swap replace/remove through a
-`Revision`. `Journal<E>` supplies ordered append/read. Coupled Session summary
-and event changes use the restricted workspace transaction API, which exposes
-typed document/journal operations but not raw SQL or arbitrary keys.
+`Document<T>` supplies missing/read/compare-and-swap replace through a
+`Revision`; `Journal<E>` supplies ordered append/read. The App's durable module
+maps its Workspace, Session, and settings identities to generic document and
+journal keys. Coupled Session summary and event changes use one short generic
+store transaction.
 
-Session writer leases and provider-auth leases are separate, long-lived OS
-locks. They identify which process owns a runtime resource; SQLite itself
-serializes ordinary document writes.
+Session writer leases and the ChatGPT auth-cache lease are separate,
+long-lived OS locks managed by the App. They identify which process owns a
+runtime resource; SQLite itself serializes ordinary document writes.
 
 ## Reliability and privacy policy
 
@@ -156,7 +157,7 @@ repair/error state.
 
 `/logout` is the only product entry point for deleting the local ChatGPT cache.
 It does not revoke an upstream account. If an Endpoint or Model still holds the
-provider-auth lease, logout returns Busy and deletes nothing; stop/exit the
+ChatGPT cache lease, logout returns Busy and deletes nothing; stop/exit the
 owning BONE process before retrying.
 
 Secrets, device codes, refresh tokens, and OAuth payloads never enter global

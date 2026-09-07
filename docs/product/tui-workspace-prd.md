@@ -16,12 +16,12 @@
 > 当前持久化与运行时边界如下：
 >
 > - BONE 自有设置、Workspace、Session、草稿、状态和会话事件历史只写入一个 SQLite 数据库。默认路径为 `$XDG_DATA_HOME/bone/store-v1/bone.sqlite3`，未设置 XDG 时为 `~/.local/share/bone/store-v1/bone.sqlite3`。数据库使用 WAL、`synchronous = FULL`、foreign keys 和 fail-fast Busy 语义；它不是用户设置入口，也不应手工编辑。
-> - `BoneStore` 在 App 启动时只打开一次，并按 `SettingsStore`、`WorkspaceStateStore`、`ProviderAuthStore` 的职责注入。`documents` 和 `journal_entries` 是存储内部表；业务代码仅使用 typed `Document<T>`、`Journal<E>`、受限 transaction 与 lease，不能自行拼 SQL、路径或任意 key。
+> - App 在启动时只打开一次通用 `BoneStore`，并由 App 自己定义 settings、Workspace 和 Session 的 typed key 与记录。`documents` 和 `journal_entries` 是存储内部表；业务代码仅使用 typed `Document<T>`、`Journal<E>`、受限 transaction 与 lease，不能自行拼 SQL、路径或任意 key。
 > - `GlobalSettings` 保存用户默认 Solver；`WorkspaceSettings` 保存工作目录默认 Solver；`SessionRecord` 保存当前会话 override。解析顺序固定为 **Session override > Workspace default > User default**。没有模型时正常进入 `NeedsModel`，不会猜测模型。
 > - `/model` 的保存立即持久化到其选择的 scope。已 attached 的 runtime 保持原来的不可变 `ResolvedAgentRuntimeConfig`；只有新建或重建 runtime 才解析新值。本轮没有 `/config` Settings Center、文件 watcher、跨进程设置通知或运行中热切换。
 > - 交互 TUI 启动时传入的初始模型会写入其打开的 Session override；one-shot 的 `--model` / `BONE_MODEL` 仅对该次调用生效，不创建或持久化 `SessionRecord`。
 > - 每个已接受的用户消息在同一个 SQLite transaction 中写入 `UserTurnAccepted` journal fact 与 Session summary/state。提交失败时不得清空 Composer 或启动 Agent。SQLite document revision 只是不透明的乐观并发 token，不是面向用户的“配置版本”。Session writer lease 是 fail-fast OS lock；其他进程可只读打开该 Session。
-> - ChatGPT OAuth 是唯一的 JSON 例外：Rig 持有 schema 和 refresh 生命周期，BONE 只提供经权限检查的 `ProviderAuthLease`。其私有 cache 默认在 `$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/store-v1/providers/chatgpt-subscription/`）。secret 永不进入 SQLite、journal、诊断或 TUI。活跃 Endpoint/Model 仍持有 lease 时，`/logout` 必须返回 Busy，不能删除 cache。
+> - ChatGPT OAuth 是唯一的 JSON 例外：Rig 持有 schema 和 refresh 生命周期，App 的 `ChatGptCredentials` 只提供经权限检查的 `ChatGptAuthLease`。其私有 cache 默认在 `$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/store-v1/providers/chatgpt-subscription/`）。secret 永不进入 SQLite、journal、诊断或 TUI。活跃 Endpoint/Model 仍持有 lease 时，`/logout` 必须返回 Busy，不能删除 cache。
 >
 > 历史本地数据不会被读取、迁移、覆盖或删除；新版本从新的 `store-v1` 根开始。`--events` 的 JSONL 是 one-shot 观察导出，不是 BONE 的 durable store，也不得被拿来恢复 Session。
 
@@ -47,7 +47,7 @@ BONE 当前已经拥有：
 - 基于启动 `cwd` 的工具访问边界；
 - 一个 App 生命周期内共享的 `BoneStore`，以 SQLite 保存 typed settings、Workspace、Session 和 journal；
 - SQLite transaction 把 durable user-turn acceptance 与 Session state 作为一个提交边界；
-- 以 document revision 做乐观并发控制、以 OS lease 做 Session writer 与 provider-auth ownership；
+- 以 document revision 做乐观并发控制、以 OS lease 做 Session writer 与 ChatGPT cache ownership；
 - 不可变的 `ResolvedAgentRuntimeConfig`，由 App 在启动 runtime 前解析并注入 Agent；
 - 后台 Session 持续工作且不会抢走当前焦点。
 
@@ -75,7 +75,7 @@ BONE 当前已经拥有：
 - 正常用户从安装到长期使用都不需要打开任何持久化文件。
 - 不存在“只有手工编辑 JSON 才能完成”的公开设置。
 - SQLite 路径、内部 document key、schema 和 document revision 只可在技术诊断中出现。
-- 不提供手工配置文件这一开发者逃生通道；测试、portable embedding 与未来 host 通过显式 `StoreRoots` / `BoneStore::open_at(...)` 注入根路径。
+- 不提供手工配置文件这一开发者逃生通道；测试、portable embedding 与未来 host 通过 App composition 显式注入数据根路径。
 
 ### 3.2 TUI 始终是恢复入口
 
@@ -547,7 +547,7 @@ Diagnostics
 | ID | 优先级 | 需求 |
 | --- | --- | --- |
 | LIVE-001 | P0 | `SettingsService` 解析 typed Global/Workspace/Session values，生成完整的 immutable `ResolvedAgentRuntimeConfig` 和 fingerprint |
-| LIVE-002 | P0 | `/model` 的 scope mutation 通过 `BoneStore` 立即提交；success 只表示已持久化，Busy/CAS conflict 必须可见 |
+| LIVE-002 | P0 | `/model` 的 scope mutation 通过 App-owned durable service 立即提交；success 只表示已持久化，Busy/CAS conflict 必须可见 |
 | LIVE-003 | P0 | 已 attached runtime 不订阅设置变化，也不从磁盘重读配置；它始终使用启动时注入的完整 runtime config |
 | LIVE-004 | P0 | 新建或重建 runtime 解析当前覆盖链；Session override 的清除立即恢复 Workspace/User 继承 |
 | LIVE-005 | P0 | journal 记录实际 solver 与完整 resolved runtime fingerprint，避免接受消息与启动 runtime 读到不同配置 |
@@ -624,8 +624,8 @@ WorkspaceRegistry[platform namespace + canonical absolute path] = random UUID
 - 同一 Session 已被其他进程使用时，当前进程可以只读查看、返回该实例，或经明确确认请求接管，不能双写；
 - 当前 lease 是 ownership lock，不是 SQLite transaction 或通用文档写锁；其失效由进程退出释放，当前版本不实现 fencing-token 接管协议；
 - 同一 Workspace 的不同 Session 可以并发持有各自 journal lease；
-- Provider auth lease 在 `auth.lock` 上独占，Endpoint 与其派生 Model handle 存活期间一直持有；同 provider/root 的第二个连接立即返回 Busy，不同 provider 不共享 lock；
-- `/logout` 只能经 `ProviderAuthStore::clear` 删除本地 Rig OAuth cache。若仍有活跃 lease 则返回 Busy；成功只清除本地 cache，不宣称 revoke 远端会话。
+- `ChatGptAuthLease` 在 `auth.lock` 上独占，Endpoint 与其派生 Model handle 存活期间一直持有；同一 BONE cache 的第二个连接立即返回 Busy；
+- `/logout` 只能经 `ChatGptCredentials::clear` 删除本地 Rig OAuth cache。若仍有活跃 lease 则返回 Busy；成功只清除本地 cache，不宣称 revoke 远端会话。
 
 ### 8.7 持久化 Session
 
@@ -774,7 +774,7 @@ Busy 时：
 | --- | --- | --- |
 | AUTH-001 | P0 | `/login`、首次登录、重新认证和 device flow 全程在 TUI Overlay 内完成，取消、过期和失败均返回可操作状态且不丢草稿 |
 | AUTH-002 | P0 | Account/credential 是 User scope；登录或切换账号不得被伪装成当前 Session 私有设置 |
-| AUTH-003 | P0 | `/logout` 经 `ProviderAuthStore::clear(ChatGptSubscription)` 清除本地 Rig OAuth cache；若任何 Endpoint/Model 仍持有 `ProviderAuthLease`，返回 Busy 而不删除任何文件 |
+| AUTH-003 | P0 | `/logout` 经 `ChatGptCredentials::clear` 清除本地 Rig OAuth cache；若任何 Endpoint/Model 仍持有 `ChatGptAuthLease`，返回 Busy 而不删除任何文件 |
 | AUTH-004 | P0 | logout 成功不宣称 revoke 远端会话；已发出的请求由其现有连接语义完成或失败，不能在一次请求中静默换账号 |
 | AUTH-005 | P0 | SessionRecord、历史和草稿保持本地可见；新账号首次向旧 Session 发起 Turn 前再次确认数据将发送给新账号 |
 | AUTH-006 | P0 | device code、token 和 authorization header 不进入持久 transcript、普通日志、诊断导出或模型上下文 |
@@ -786,7 +786,7 @@ Busy 时：
 | ID | 优先级 | 需求 |
 | --- | --- | --- |
 | DIAG-001 | P0 | `/status` 展示 Workspace、当前 Session、已解析模型来源、attached runtime 的 pinned solver（如有）、认证与连接状态 |
-| DIAG-002 | P0 | 存储诊断检查 `BoneStore`、WorkspaceRegistry、SessionStore/lease、provider auth 私有目录权限和连接；`/config doctor` 是未来 Settings Center 的设计，不是当前命令 |
+| DIAG-002 | P0 | 存储诊断检查 SQLite store、WorkspaceRegistry、SessionStore/lease、ChatGPT cache 私有目录权限和连接；`/config doctor` 是未来 Settings Center 的设计，不是当前命令 |
 | DIAG-003 | P0 | 默认错误回答：发生了什么、用户数据是否安全、现在可以做什么 |
 | DIAG-004 | P0 | 技术路径、内部 document key、opaque revision 与错误链仅在“技术详情”中展示，且不得泄露 OAuth payload |
 | DIAG-005 | P1 | 可导出脱敏诊断，且不包含 Prompt、回复、token、文件内容或原始敏感路径 |
@@ -865,7 +865,7 @@ BONE App Shell
 - 本地控制命令和设置数据不进入模型上下文；
 - 诊断复制自动脱敏；
 - 配置损坏时安全相关设置 fail closed，且自动恢复不得扩大权限；
-- 模型默认不能自主修改用户设置。未来若开放设置工具，必须逐次显示 diff、scope 和影响并获得用户批准，并只能经 typed `BoneStore` domain service 修改；
+- 模型默认不能自主修改用户设置。未来若开放设置工具，必须逐次显示 diff、scope 和影响并获得用户批准，并只能经 App-owned typed domain service 修改；
 - 引入写工具前必须实现 Workspace 写协调、SQLite 事务/lease 冲突处理或可选 worktree 隔离。
 
 ### 10.5 存储、容量与锁
@@ -1493,7 +1493,7 @@ And B 中存在 Session override 的值不被覆盖
 | 已运行 runtime 行为 | 已实现且刻意 pinned | `ResolvedAgentRuntimeConfig` 在 runtime 创建时冻结；不做 runtime hot switch |
 | 多 Workspace / 多 Session | 已实现 | Workspace identity、Session records 和 journals 存于 SQLite 并按 Workspace 隔离 |
 | 同 Session writer ownership | 已实现 | fail-fast OS writer lease；冲突走 Busy/只读语义，不用 SQLite transaction 代替 ownership |
-| Provider OAuth | 已实现 | Rig-owned opaque `auth.json` 由 `ProviderAuthLease` 保护；logout 有活跃 lease 时 Busy |
+| Provider OAuth | 已实现 | Rig-owned opaque `auth.json` 由 App-owned `ChatGptAuthLease` 保护；logout 有活跃 lease 时 Busy |
 | 存储故障 | 已实现基础 | Busy、CAS conflict、权限、corruption、schema mismatch 不自动 reset；TUI 应进入 repair/error 状态 |
 | 完整 Settings Center / catalog | 后续 | 当前 `/model` 四种 scope 命令可用；`/config`、picker、catalog、watcher 与跨进程 notification 尚未实现 |
 | one-shot durable Session | 后续 | one-shot 不创建 `SessionRecord`；`--model` / `BONE_MODEL` 是本次调用的 ephemeral override；`--events` 仅观察导出 |

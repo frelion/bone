@@ -14,17 +14,22 @@ saved immediately.
 ```text
 bone-app ──────────┬─► bone-agent ──┬─► bone-llm ──► rig-core
                    │                 └─► bone-tools ──► bone-llm
-                   └─► bone-store ◄──────────────────────┘
+                   └─► bone-store
 ```
 
 - `bone-app` is the composition root: the `bone` binary, Workspace/Session
   domain, settings policy, and the terminal UI.
-- `bone-store` is BONE's concrete local persistence service. It owns typed
-  SQLite documents, journals, and runtime leases; it is not a generic KV API.
+- `bone-store` is a small generic SQLite backend: keyed documents, journals,
+  short transactions, and file leases. It has no Workspace, settings, or
+  provider knowledge.
+- `bone-app` defines the durable keys and typed records, then injects storage
+  into its settings and Workspace/Session services. No other product crate
+  depends on `bone-store`.
 - `bone-agent` receives an already-resolved, immutable runtime configuration.
   It never opens user storage or reads settings while a runtime is working.
-- `bone-llm` owns protocol adapters. Its ChatGPT subscription adapter receives
-  a provider-auth lease rather than a credential directory.
+- `bone-llm` owns protocol adapters. Its ChatGPT subscription adapter accepts
+  a narrow, application-owned OAuth-cache capability rather than discovering a
+  credential directory or depending on storage.
 - `bone-tools` provides workspace-local tools and their validated limits.
 
 The TUI has a unidirectional presentation flow:
@@ -114,10 +119,10 @@ $XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/auth.json
 # fallback: ~/.config/bone/store-v1/providers/chatgpt-subscription/auth.json
 ```
 
-`bone-store` validates private roots and files, uses SQLite WAL with fail-fast
-write contention, and keeps Session writer ownership and provider auth
-ownership as separate OS leases. OAuth payloads never enter SQLite, a journal,
-debug output, or model-visible tool output.
+`bone-app` chooses the SQLite data root and owns the private ChatGPT cache
+location. `bone-store` owns WAL, fail-fast write contention, and generic lease
+files. OAuth payloads never enter SQLite, a journal, debug output, or
+model-visible tool output.
 
 Older BONE JSON/JSONL/config data is intentionally neither read nor migrated.
 It is left untouched; this release starts from the separate `store-v1` root.
