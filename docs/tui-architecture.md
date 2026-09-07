@@ -85,6 +85,7 @@ struct App {
     sessions: Vec<SessionUi>,
     current: usize,
     workspace: String,
+    focus: Focus, // Composer or Sessions
     viewport: Viewport,
 }
 
@@ -93,6 +94,7 @@ struct SessionUi {
     conversation: Conversation,
     background_unread: bool,
     state: SessionState, // Opening, Live, or Offline(reason)
+    pending_post: Option<String>,
 }
 
 struct Conversation {
@@ -142,7 +144,7 @@ loop {
             Action::Stop { id, .. } => accept_or_mark_offline(id, session(id).stop().await),
             Action::NewSession => {
                 let id = next_id();
-                app.begin_session(id);       // immediately owns focus and a draft
+                app.begin_session(id);       // immediately selected with its own draft
                 pending.push(open(host.clone(), id));
             }
             Action::Quit => break,
@@ -160,11 +162,11 @@ loop {
 
 The first implementation redraws after each delivered terminal or Agent event. It has no frame timer or animation loop. Agent Runtime already coalesces progress.
 
-`Ctrl-N` always inserts and selects a new `Opening` placeholder with its own composer, then starts the Agent asynchronously. The result carries the preassigned `SessionId`, so out-of-order completions bind to the right placeholder without stealing focus. Input typed while it opens stays in that draft; Enter begins routing only after the session becomes `Live`. A start or observation failure leaves that placeholder visibly `Offline` while other sessions keep running. Authentication happened before raw terminal mode, so new sessions reuse the connected host.
+`Ctrl-N` always inserts and selects a new `Opening` placeholder with its own composer, then starts the Agent asynchronously. The result carries the preassigned `SessionId`, so out-of-order completions bind to the right placeholder without stealing selection. A submitted message is held as one explicit pending post while the session opens; ordinary typing remains a separate draft. Attach sends the pending post, but removes it only after `post` returns its receipt. A start, observation, or post failure restores that text to the composer before marking the placeholder `Offline`, so accepted-looking input is never lost. Authentication happened before raw terminal mode, so new sessions reuse the connected host.
 
 ## Projection
 
-`Projection` is a display cache rather than another Agent model. It stores immutable timeline items, active Work/Review/Tool jobs, a display status, and the tool names needed to join `JobStarted` with `JobFinished`. The session owns only three frontend lifecycle states: `Opening`, `Live`, and `Offline(reason)`.
+`Projection` is a display cache rather than another Agent model. It stores immutable timeline items, active Work/Review/Tool jobs, a display status, and the `ToolCall` needed to join `JobStarted` with `JobFinished`. The session owns only three frontend lifecycle states: `Opening`, `Live`, and `Offline(reason)`.
 
 Reset rebuilds it from `Snapshot.record`. A normal Step applies only `StepEvent.records`. The normal view does not also consume Publish effects because every Notice is already recorded and would otherwise appear twice.
 
@@ -172,30 +174,39 @@ The timeline contains:
 
 - user messages and Agent replies;
 - one compact immutable row for each completed tool;
-- errors and Paused, Stopped, or Finished transitions.
+- errors and Paused or Stopped transitions.
 
-Work and input review appear only in the live activity line. Successful tool rows obey `show_progress`; failures and unknown external effects always remain visible. An unknown external effect is tracked by Job ID and disappears from the warning state only when that same job receives a conclusive result. Ordinary cancellation is neutral. Raw tool artifacts and JSON arguments do not enter the chat.
+Work and input review appear only in the mutable live tail. Tool calls become short semantic descriptions such as `Reading src/main.rs` or `Searched "Projection" · 17 matches`; raw artifacts and JSON do not enter the chat. Successful tool rows obey `show_progress`; failures and unknown external effects always remain visible. An unknown external effect is tracked by Job ID and disappears from the warning state only when that same job receives a conclusive result. Ordinary cancellation is neutral. `Finished` changes the session badge without adding runtime-log noise to the transcript, and still raises attention when it occurs in a background session.
 
 `RecordEntry.cursor` identifies timeline items. A scroll anchor adds a wrapped-line offset within that item, so every part of one long reply remains reachable. Resize keeps the same timeline item and clamps its row after rewrapping; it does not promise to keep the same character at the top. New items follow the live tail unless the user is reading history; in that case the anchor stays and a simple unread marker appears. Tail rendering measures backward from the newest items, so normal typing does not remeasure the complete history.
 
 ## Layout and interaction
 
-At 72 columns or wider, the left 22 columns form a read-only session rail followed by a one-column divider. Its header shows the current position and total count. Each row shows a title plus a compact opening, working, waiting, complete, unread, unresolved-effect, or offline badge and never receives focus.
+At 110 columns or wider, a 28-column session rail appears beside a two-column gutter. Each session uses two rows: a stable number and title, followed by its opening, working, waiting, complete, unread, unresolved-effect, or offline state. An accent edge marks the selected row while the rail owns keyboard focus. Persistent risk has priority over ordinary unread activity.
 
-Below 72 columns the rail disappears. The header carries the context as `BONE  2/4 * · current title`: `*` means a background conversation has new content, `!` means one is offline or has an unresolved external effect, and `…` means one is opening. New content has priority over the persistent warning. At 40x12, session help and conversation help use separate footer rows so the composer remains clear.
+Below 110 columns the conversation uses the full terminal width and a single header carries `BONE  2/4 · current title`. Background `!`, `●`, and `…` markers keep unresolved, unread, and opening sessions visible. `Ctrl-Left` replaces the conversation with the full-screen session list; `Ctrl-Right` returns. This is the same `Sessions` focus and the same `Up`/`Down` selection used by the wide rail.
+
+The wide main region has only the transcript, bordered composer, and one contextual footer; the rail already supplies its session context, so there is no second header. Narrow mode adds the one-line header above them. The workspace appears only in the footer. User turns use an accent edge; Agent replies use one accent marker. Active work is rendered as the transcript's mutable live tail, so `Thinking` and `Reading view.rs 68%` stay attached to the current turn. It is hidden while the user reads older history. The composer remains usable while work continues.
 
 ```text
+Composer focus
 Ctrl-N          new conversation
-Alt-Up/Down     previous or next conversation
+Ctrl-Left       focus the wide rail or open the narrow session list
 Enter           send
 Ctrl-J          insert newline
 PageUp/Down     move through history
 Ctrl-Home/End   oldest item or live tail
 Esc             stop the current session
+
+Sessions focus
+Up/Down         select a session
+Ctrl-Right      show its composer
+Enter/Esc       show its composer
+
 Ctrl-C          exit and close all sessions
 ```
 
-The composer always has focus. There is no sidebar mode, overlay, mouse input, box border, or animated spinner. The terminal keeps its default background; cyan, green, yellow, and red are reserved for accent and semantic status.
+Focus has only two values, `Composer` and `Sessions`; it routes keys and changes the existing selection edge or composer border. The only session-switching path is `Ctrl-Left`, bare `Up`/`Down`, then `Ctrl-Right`. Wide mode presents `Sessions` as the side rail; narrow mode presents it as a full-screen list. There is no second navigation state, generic focus tree, overlay, mouse input, or animation timer. A restrained blue accent marks focus and active work, while yellow and red are reserved for attention and errors.
 
 Until a message is sent, a session title uses the first non-empty draft line. It then comes from the first non-empty line of the first user message and is clipped to the available width. Naming a session never invokes a model.
 
@@ -258,7 +269,7 @@ There are no component traits or generic frontend protocols. A type is split out
 - Each observer reports events for exactly one `SessionId`.
 - Inactive sessions continue executing and being observed.
 - A sequence gap replaces only that session's Agent projection.
-- Opening owns a composer immediately; completion binds by ID and never changes selection.
+- Opening owns a composer immediately; one submitted message waits for attach, remains pending until `post` succeeds, and is restored to the draft on failure.
 - A local start, observe, post, or stop failure takes down only its session.
 - Reset never replaces a composer, scroll anchor, or another session.
 - Presentation consumes records and never duplicates Publish effects.
@@ -272,18 +283,18 @@ There are no component traits or generic frontend protocols. A type is split out
 - Two sessions from one host have independent records/jobs, share one endpoint, and read fresh session configuration.
 - Tagged A/B updates change only the matching projection.
 - Switching preserves each draft and background updates raise attention only on their own session.
-- A background completion updates its marker without changing the active composer; selecting it clears background unread.
-- Opening sessions retain typed drafts and attaching a background session never steals focus.
+- A background completion raises attention and updates its marker without adding a `Finished` timeline row or changing the active composer; selecting it clears background unread.
+- Opening sessions retain drafts, queue one explicitly submitted message until its receipt, restore it on failure, and attach without stealing selection.
 - A long, automatically wrapped Chinese reply can be paged through line by line.
 - Lag resets only the affected session and retains local interaction state.
-- [Ratatui TestBackend] proves that 80x24 shows the 22-column rail and 40x12 hides it while retaining title, session position, activity, composer, and help.
+- [Ratatui TestBackend] proves that 120x28 shows the focused 28-column rail without a duplicate main header, while 80x24 and 40x12 use one compact conversation header and present the same session list full-screen when focused.
 - Paste normalization, key repeat, multiline input, and combining characters stay intact.
 - Quiet mode hides successful tool noise but keeps failures, cancelled writes with unknown outcomes, and later resolutions.
 - Pure reasoning that chooses to wait no longer appears as active work, and current progress messages replace earlier ones without entering history.
 
 ## First-version boundary
 
-Sessions live only for the process and share the startup workspace and task settings. Individual close, persistence, restored history, workspace browsing, rename/reorder/search, mouse control, Markdown rendering, streaming text, approvals, and inline rendering remain outside this version.
+Sessions live only for the process and share the startup workspace and task settings. Individual close, persistence, restored history, workspace browsing, rename/reorder/search, mouse control, Markdown rendering, streaming text, approvals, and rich artifact rendering remain outside this version.
 
 The Agent currently exposes read-only workspace tools. Shell, patch, write, approval, and question protocols belong in `bone-agent`, never as frontend improvisations.
 

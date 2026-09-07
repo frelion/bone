@@ -38,10 +38,13 @@ cargo run -p bone-tui
 ```
 
 The full-screen frontend keeps several independent conversations running at
-once. `Ctrl-N` creates one, `Alt-Up` and `Alt-Down` switch the session rail,
-`Esc` stops work in the current conversation, and `Ctrl-C` exits. Every session
-keeps its own draft, history, jobs, and unread state while background work
-continues. Initial ChatGPT authorization is displayed before full-screen mode.
+once. `Ctrl-N` creates one. On wide screens, press `Ctrl-Left` from the composer
+to focus the session rail, use `Up`/`Down` to select a conversation, then press
+`Ctrl-Right` to return to the composer. On narrow screens, `Ctrl-Left` opens the
+same session list full-screen and `Ctrl-Right` returns to the conversation.
+`Esc` stops current work and `Ctrl-C` exits. Every session keeps its own draft,
+history, jobs, and unread state while background work continues. Initial
+ChatGPT authorization is displayed before full-screen mode.
 
 For one request, pass its text:
 

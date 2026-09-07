@@ -304,11 +304,12 @@ Usage:
 
 Interactive commands:
   Ctrl-N                       Create a conversation
-  Alt-Up / Alt-Down            Switch conversations
-  Enter                        Send the current message
+  Ctrl-Left / Ctrl-Right       Move between the session rail and composer
+  Up / Down                    Switch while the session rail is focused
+  Enter                        Send, or return from the session rail
   Ctrl-J                       Insert a newline
   PageUp / PageDown            Read conversation history
-  Esc or /stop                 Stop work; keep the conversation open
+  Esc or /stop                 Stop work; Esc also leaves the session rail
   Ctrl-C or /exit              Shut down and exit
 
 System configuration:

@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bone_agent::{
-    ExternalEffect, JobErrorKind, JobId, JobProgress, JobRequest, Notice, RecordEntry, RecordKind,
-    Snapshot, StepEvent,
+    ExternalEffect, JobErrorKind, JobId, JobOutput, JobProgress, JobRequest, Notice, RecordEntry,
+    RecordKind, Snapshot, StepEvent, ToolCall,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -18,6 +18,7 @@ pub(crate) struct App {
     pub(crate) sessions: Vec<SessionUi>,
     pub(crate) current: usize,
     pub(crate) workspace: String,
+    pub(crate) focus: Focus,
     viewport: Viewport,
 }
 
@@ -27,6 +28,7 @@ impl App {
             sessions: Vec::new(),
             current: 0,
             workspace,
+            focus: Focus::Composer,
             viewport: Viewport::default(),
         }
     }
@@ -37,8 +39,10 @@ impl App {
             conversation: Conversation::new(snapshot, show_progress),
             background_unread: false,
             state: SessionState::Live,
+            pending_post: None,
         });
         self.current = self.sessions.len() - 1;
+        self.focus = Focus::Composer;
     }
 
     pub(crate) fn begin_session(&mut self, id: SessionId, show_progress: bool) {
@@ -47,14 +51,40 @@ impl App {
             conversation: Conversation::empty(show_progress),
             background_unread: false,
             state: SessionState::Opening,
+            pending_post: None,
         });
         self.current = self.sessions.len() - 1;
+        self.focus = Focus::Composer;
     }
 
-    pub(crate) fn attach(&mut self, id: SessionId, snapshot: &Snapshot) {
+    pub(crate) fn attach(&mut self, id: SessionId, snapshot: &Snapshot) -> Option<String> {
         if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) {
             session.conversation.reset(snapshot);
             session.state = SessionState::Live;
+            return session.pending_post.clone();
+        }
+        None
+    }
+
+    pub(crate) fn acknowledge_pending_post(&mut self, id: SessionId) {
+        if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) {
+            session.pending_post = None;
+        }
+    }
+
+    pub(crate) fn restore_pending_post(&mut self, id: SessionId) {
+        let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) else {
+            return;
+        };
+        let Some(pending) = session.pending_post.take() else {
+            return;
+        };
+        let draft = session.conversation.composer.lines().join("\n");
+        session.conversation.clear_composer();
+        session.conversation.composer.insert_str(pending);
+        if !draft.trim().is_empty() {
+            session.conversation.composer.insert_str("\n\n");
+            session.conversation.composer.insert_str(draft);
         }
     }
 
@@ -63,7 +93,7 @@ impl App {
             return;
         };
         let attention = self.sessions[index].conversation.apply(step);
-        if index != self.current {
+        if index != self.current || self.focus == Focus::Sessions {
             self.sessions[index].background_unread |= attention;
         }
     }
@@ -73,7 +103,7 @@ impl App {
             return;
         };
         let attention = self.sessions[index].conversation.reset(snapshot);
-        if index != self.current {
+        if index != self.current || self.focus == Focus::Sessions {
             self.sessions[index].background_unread |= attention;
         }
     }
@@ -95,20 +125,57 @@ impl App {
             && key.kind == KeyEventKind::Press
         {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            let alt = key.modifiers.contains(KeyModifiers::ALT);
-            match (key.code, ctrl, alt) {
-                (KeyCode::Char('c'), true, _) => return Action::Quit,
-                (KeyCode::Char('n'), true, _) => return Action::NewSession,
-                (KeyCode::Up, _, true) => {
-                    self.select_previous();
+            match (key.code, ctrl) {
+                (KeyCode::Char('c'), true) => return Action::Quit,
+                (KeyCode::Char('n'), true) => return Action::NewSession,
+                (KeyCode::Left, true) if self.focus == Focus::Composer => {
+                    self.focus = Focus::Sessions;
                     return Action::None;
                 }
-                (KeyCode::Down, _, true) => {
-                    self.select_next();
+                (KeyCode::Right, true) if self.focus == Focus::Sessions => {
+                    self.focus_composer();
                     return Action::None;
                 }
                 _ => {}
             }
+        }
+
+        if self.focus == Focus::Sessions {
+            if let Event::Key(key) = &event
+                && key.kind == KeyEventKind::Press
+                && key.modifiers == KeyModifiers::NONE
+            {
+                match key.code {
+                    KeyCode::Up => {
+                        self.select_previous();
+                        return Action::None;
+                    }
+                    KeyCode::Down => {
+                        self.select_next();
+                        return Action::None;
+                    }
+                    KeyCode::Enter | KeyCode::Esc | KeyCode::Right => {
+                        self.focus_composer();
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
+
+            let resumes_composing = matches!(&event, Event::Paste(_))
+                || matches!(
+                    &event,
+                    Event::Key(key)
+                        if key.kind != KeyEventKind::Release
+                            && matches!(
+                                key.code,
+                                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+                            )
+                );
+            if !resumes_composing {
+                return Action::None;
+            }
+            self.focus_composer();
         }
 
         let session = &mut self.sessions[self.current];
@@ -118,6 +185,13 @@ impl App {
                 id: session.id,
                 text,
             },
+            ConversationAction::Post(text)
+                if session.state == SessionState::Opening && session.pending_post.is_none() =>
+            {
+                session.pending_post = Some(text);
+                session.conversation.clear_composer();
+                Action::None
+            }
             ConversationAction::Stop { clear } if session.state == SessionState::Live => {
                 Action::Stop {
                     id: session.id,
@@ -140,21 +214,32 @@ impl App {
     }
 
     fn select_previous(&mut self) {
-        if self.current > 0 {
-            self.select(self.current - 1);
+        if self.sessions.len() > 1 {
+            self.select((self.current + self.sessions.len() - 1) % self.sessions.len());
         }
     }
 
     fn select_next(&mut self) {
-        if self.current + 1 < self.sessions.len() {
-            self.select(self.current + 1);
+        if self.sessions.len() > 1 {
+            self.select((self.current + 1) % self.sessions.len());
         }
     }
 
     fn select(&mut self, index: usize) {
         self.current = index;
-        self.sessions[index].background_unread = false;
     }
+
+    fn focus_composer(&mut self) {
+        self.focus = Focus::Composer;
+        self.sessions[self.current].background_unread = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Focus {
+    Sessions,
+    #[default]
+    Composer,
 }
 
 pub(crate) struct SessionUi {
@@ -162,6 +247,7 @@ pub(crate) struct SessionUi {
     pub(crate) conversation: Conversation,
     pub(crate) background_unread: bool,
     pub(crate) state: SessionState,
+    pub(crate) pending_post: Option<String>,
 }
 
 impl SessionUi {
@@ -169,6 +255,11 @@ impl SessionUi {
         self.conversation
             .projection
             .title()
+            .or_else(|| {
+                self.pending_post
+                    .as_deref()
+                    .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
+            })
             .or_else(|| {
                 self.conversation
                     .composer
@@ -224,7 +315,7 @@ impl Conversation {
         if self.anchor.is_some() && !added.is_empty() {
             self.unread = true;
         }
-        added.iter().any(|item| item.attention)
+        added.iter().any(|item| item.attention) || step.records.iter().any(is_finished_notice)
     }
 
     fn reset(&mut self, snapshot: &Snapshot) -> bool {
@@ -237,7 +328,11 @@ impl Conversation {
             .timeline
             .partition_point(|item| item.cursor <= latest);
         let new_items = &self.projection.timeline[first..];
-        let attention = new_items.iter().any(|item| item.attention);
+        let attention = new_items.iter().any(|item| item.attention)
+            || snapshot
+                .record
+                .iter()
+                .any(|entry| entry.cursor > latest && is_finished_notice(entry));
 
         if let Some(anchor) = self.anchor {
             self.anchor = self
@@ -361,6 +456,10 @@ impl Conversation {
     }
 }
 
+fn is_finished_notice(entry: &RecordEntry) -> bool {
+    matches!(entry.kind, RecordKind::Notice(Notice::Finished { .. }))
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Viewport {
     pub(crate) width: u16,
@@ -439,7 +538,7 @@ impl<'a> TimelineLayout<'a> {
 fn composer() -> TextArea<'static> {
     let mut composer = TextArea::default();
     composer.set_wrap_mode(WrapMode::WordOrGlyph);
-    composer.set_placeholder_text("Tell BONE what to do…");
+    composer.set_placeholder_text("Ask BONE…");
     composer.set_placeholder_style(Style::default().dim());
     composer.set_cursor_line_style(Style::default());
     composer
@@ -468,7 +567,7 @@ pub(crate) struct Projection {
     pub(crate) active: BTreeMap<JobId, ActiveJob>,
     pub(crate) status: SessionStatus,
     show_progress: bool,
-    tool_names: BTreeMap<JobId, String>,
+    tool_calls: BTreeMap<JobId, ToolCall>,
     unknown_tools: BTreeSet<JobId>,
 }
 
@@ -479,7 +578,7 @@ impl Projection {
             active: BTreeMap::new(),
             status: SessionStatus::Ready,
             show_progress,
-            tool_names: BTreeMap::new(),
+            tool_calls: BTreeMap::new(),
             unknown_tools: BTreeSet::new(),
         }
     }
@@ -536,8 +635,9 @@ impl Projection {
                     JobRequest::Work { .. } => ActiveKind::Work,
                     JobRequest::ReviewInput { .. } => ActiveKind::Review,
                     JobRequest::Tool(call) => {
-                        self.tool_names.insert(*id, call.name.clone());
-                        ActiveKind::Tool(call.name.clone())
+                        let active = active_tool(call);
+                        self.tool_calls.insert(*id, call.clone());
+                        ActiveKind::Tool(active)
                     }
                 };
                 self.active.insert(*id, ActiveJob::new(kind));
@@ -553,14 +653,14 @@ impl Projection {
                 if self.active.is_empty() && self.status == SessionStatus::Working {
                     self.status = SessionStatus::Waiting;
                 }
-                let Some(name) = self.tool_names.get(id).cloned() else {
+                let Some(call) = self.tool_calls.get(id).cloned() else {
                     return;
                 };
                 let resolved = self.unknown_tools.remove(id);
                 if outcome.external_effect == ExternalEffect::Unknown {
                     self.unknown_tools.insert(*id);
                 } else {
-                    self.tool_names.remove(id);
+                    self.tool_calls.remove(id);
                 }
                 if !resolved
                     && outcome.external_effect == ExternalEffect::None
@@ -571,7 +671,7 @@ impl Projection {
                 {
                     return;
                 }
-                let (text, tone, attention) = tool_result(&name, outcome, resolved);
+                let (text, tone, attention) = tool_result(&call, outcome, resolved);
                 if self.show_progress || attention {
                     self.timeline.push(TimelineItem {
                         cursor,
@@ -607,12 +707,6 @@ impl Projection {
             }
             Notice::Finished { .. } => {
                 self.status = SessionStatus::Complete;
-                self.timeline.push(TimelineItem::status(
-                    cursor,
-                    "✓ task complete",
-                    Tone::Success,
-                    true,
-                ));
             }
         }
     }
@@ -674,7 +768,7 @@ impl Projection {
 }
 
 fn tool_result(
-    name: &str,
+    call: &ToolCall,
     outcome: &bone_agent::JobOutcome,
     resolved: bool,
 ) -> (String, Tone, bool) {
@@ -684,7 +778,7 @@ fn tool_result(
             Ok(_) => String::new(),
         };
         return (
-            format!("! {name} · outcome unknown{detail}"),
+            format!("! {} · outcome unknown{detail}", tool_subject(call)),
             Tone::Warning,
             true,
         );
@@ -694,8 +788,8 @@ fn tool_result(
     match &outcome.result {
         Ok(_) => (
             match resolution {
-                Some(detail) => format!("✓ {name} · {detail}"),
-                None => format!("✓ {name}"),
+                Some(detail) => format!("✓ {} · {detail}", completed_tool(call, outcome)),
+                None => format!("✓ {}", completed_tool(call, outcome)),
             },
             Tone::Success,
             resolved,
@@ -716,7 +810,7 @@ fn tool_result(
                 "×"
             };
             (
-                format!("{symbol} {name} · {detail}"),
+                format!("{symbol} {} · {detail}", tool_subject(call)),
                 if error.kind == JobErrorKind::Cancelled {
                     Tone::Warning
                 } else {
@@ -725,6 +819,122 @@ fn tool_result(
                 resolved || error.kind != JobErrorKind::Cancelled,
             )
         }
+    }
+}
+
+fn tool_subject(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "read" => display_argument(call, "path").unwrap_or_else(|| "file".to_owned()),
+        "grep" => match (
+            display_argument(call, "pattern"),
+            display_argument(call, "path"),
+        ) {
+            (Some(pattern), Some(path)) => format!("search {pattern:?} in {path}"),
+            (Some(pattern), None) => format!("search {pattern:?}"),
+            _ => "grep".to_owned(),
+        },
+        "glob" => match (
+            display_argument(call, "pattern"),
+            display_argument(call, "path"),
+        ) {
+            (Some(pattern), Some(path)) => format!("find {pattern} in {path}"),
+            (Some(pattern), None) => format!("find {pattern}"),
+            _ => "find files".to_owned(),
+        },
+        name => humanized_tool_name(name),
+    }
+}
+
+fn active_tool(call: &ToolCall) -> String {
+    let subject = tool_subject(call);
+    match call.name.as_str() {
+        "read" => format!("Reading {subject}"),
+        "grep" => format!(
+            "Searching {}",
+            subject.strip_prefix("search ").unwrap_or(&subject)
+        ),
+        "glob" => format!(
+            "Finding {}",
+            subject.strip_prefix("find ").unwrap_or(&subject)
+        ),
+        _ => subject,
+    }
+}
+
+fn completed_tool(call: &ToolCall, outcome: &bone_agent::JobOutcome) -> String {
+    let artifact = match &outcome.result {
+        Ok(JobOutput::Artifact(value)) => Some(value),
+        _ => None,
+    };
+    match call.name.as_str() {
+        "read" => {
+            let path = display_argument(call, "path").unwrap_or_else(|| "file".to_owned());
+            match artifact.and_then(|value| {
+                Some((
+                    value.get("start_line")?.as_u64()?,
+                    value.get("end_line")?.as_u64()?,
+                ))
+            }) {
+                Some((start, end)) => format!("Read {path} · lines {start}–{end}"),
+                None => format!("Read {path}"),
+            }
+        }
+        "grep" => {
+            let subject = tool_subject(call);
+            match artifact
+                .and_then(|value| value.get("match_count"))
+                .and_then(|value| value.as_u64())
+            {
+                Some(count) => format!(
+                    "Searched {} · {count} matches",
+                    subject.trim_start_matches("search ")
+                ),
+                None => format!("Searched {}", subject.trim_start_matches("search ")),
+            }
+        }
+        "glob" => {
+            let subject = tool_subject(call);
+            match artifact
+                .and_then(|value| value.get("paths"))
+                .and_then(|value| value.as_array())
+            {
+                Some(paths) => format!(
+                    "Found {} · {} paths",
+                    subject.trim_start_matches("find "),
+                    paths.len()
+                ),
+                None => format!("Found {}", subject.trim_start_matches("find ")),
+            }
+        }
+        _ => tool_subject(call),
+    }
+}
+
+fn display_argument(call: &ToolCall, key: &str) -> Option<String> {
+    let value = call.arguments.get(key)?.as_str()?;
+    let value = normalize_and_shorten(value);
+    (!value.is_empty()).then_some(value)
+}
+
+fn humanized_tool_name(name: &str) -> String {
+    let name = name.replace(['_', '-'], " ");
+    let name = normalize_and_shorten(&name);
+    if name.is_empty() {
+        "tool".to_owned()
+    } else {
+        name
+    }
+}
+
+fn normalize_and_shorten(text: &str) -> String {
+    const LIMIT: usize = 48;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let short = chars.by_ref().take(LIMIT).collect::<String>();
+    if chars.next().is_some() {
+        format!("{short}…")
+    } else {
+        short
     }
 }
 
@@ -758,7 +968,7 @@ impl TimelineItem {
     pub(crate) fn line_count(&self, width: u16) -> usize {
         Paragraph::new(self.text())
             .wrap(Wrap { trim: false })
-            .line_count(width)
+            .line_count(width.saturating_sub(2).max(1))
             .max(1)
     }
 
@@ -811,13 +1021,13 @@ impl ActiveJob {
 
     fn summary(&self) -> String {
         let label = match &self.kind {
-            ActiveKind::Work => "thinking",
-            ActiveKind::Review => "reading your update",
-            ActiveKind::Tool(name) => name,
+            ActiveKind::Work => "Thinking".to_owned(),
+            ActiveKind::Review => "Reading your update".to_owned(),
+            ActiveKind::Tool(label) => label.clone(),
         };
         match self.progress.as_ref().and_then(|progress| progress.percent) {
             Some(percent) => format!("{label} {percent}%"),
-            None => label.to_owned(),
+            None => label,
         }
     }
 
@@ -855,18 +1065,6 @@ pub(crate) enum SessionStatus {
     Complete,
 }
 
-impl SessionStatus {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::Working => "working",
-            Self::Waiting => "waiting",
-            Self::Stopped => "stopped",
-            Self::Complete => "complete",
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -878,8 +1076,8 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     use super::{
-        Action, App, Projection, ScrollAnchor, SessionId, SessionState, SessionStatus, Speaker,
-        TimelineKind, Viewport,
+        Action, App, Focus, Projection, ScrollAnchor, SessionId, SessionState, SessionStatus,
+        Speaker, TimelineKind, Viewport, active_tool,
     };
 
     #[test]
@@ -996,13 +1194,72 @@ mod tests {
         assert_eq!(app.sessions[1].conversation.composer.lines(), ["draft two"]);
 
         app.on_event(Event::Key(key(
+            KeyCode::Left,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        app.on_event(Event::Key(key(
             KeyCode::Up,
-            KeyModifiers::ALT,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(app.current().id, SessionId(1));
+        assert!(app.current().background_unread);
+        app.on_event(Event::Key(key(
+            KeyCode::Right,
+            KeyModifiers::CONTROL,
             KeyEventKind::Press,
         )));
         assert_eq!(app.current().id, SessionId(1));
         assert!(!app.current().background_unread);
         assert_eq!(app.current().conversation.composer.lines(), ["draft one"]);
+    }
+
+    #[test]
+    fn session_focus_keeps_new_activity_unread_until_returning_to_composer() {
+        let mut app = App::new("workspace".into());
+        app.add_session(SessionId(1), &snapshot(vec![user(1, "first")]), true);
+
+        app.on_event(Event::Key(key(
+            KeyCode::Left,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        app.apply(SessionId(1), &step(vec![reply(2, "arrived in the list")]));
+        assert!(app.current().background_unread);
+
+        app.on_event(Event::Key(key(
+            KeyCode::Right,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        assert!(!app.current().background_unread);
+    }
+
+    #[test]
+    fn background_finish_is_unread_without_becoming_a_timeline_row() {
+        let mut app = App::new("workspace".into());
+        app.add_session(SessionId(1), &snapshot(vec![user(1, "first")]), true);
+        app.add_session(SessionId(2), &snapshot(vec![user(2, "second")]), true);
+        let timeline_len = app.sessions[0].conversation.projection.timeline.len();
+
+        app.apply(
+            SessionId(1),
+            &step(vec![RecordEntry {
+                cursor: 2,
+                kind: RecordKind::Notice(Notice::Finished { cleanup: vec![] }),
+            }]),
+        );
+
+        assert!(app.sessions[0].background_unread);
+        assert_eq!(
+            app.sessions[0].conversation.projection.status,
+            SessionStatus::Complete
+        );
+        assert_eq!(
+            app.sessions[0].conversation.projection.timeline.len(),
+            timeline_len
+        );
     }
 
     #[test]
@@ -1105,18 +1362,26 @@ mod tests {
         );
 
         app.on_event(Event::Key(key(
-            KeyCode::Up,
-            KeyModifiers::ALT,
+            KeyCode::Left,
+            KeyModifiers::CONTROL,
             KeyEventKind::Press,
         )));
-        app.attach(SessionId(2), &snapshot(vec![]));
+        app.on_event(Event::Key(key(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        app.on_event(Event::Key(key(
+            KeyCode::Right,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        let pending = app.attach(SessionId(2), &snapshot(vec![]));
 
         assert_eq!(app.current().id, SessionId(1));
         assert_eq!(app.sessions[1].state, SessionState::Live);
-        assert_eq!(
-            app.sessions[1].conversation.composer.lines(),
-            ["draft for two"]
-        );
+        assert_eq!(pending.as_deref(), Some("draft for two"));
+        assert_eq!(app.sessions[1].conversation.composer.lines(), [""]);
 
         app.mark_offline(SessionId(2), "connection closed");
         assert_eq!(app.sessions[0].state, SessionState::Live);
@@ -1124,6 +1389,212 @@ mod tests {
             app.sessions[1].state,
             SessionState::Offline("connection closed".into())
         );
+    }
+
+    #[test]
+    fn pending_post_is_kept_until_acknowledged() {
+        let mut app = App::new("workspace".into());
+        app.begin_session(SessionId(1), true);
+        app.on_event(Event::Paste("send after opening".into()));
+        app.on_event(Event::Key(key(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+
+        assert_eq!(
+            app.attach(SessionId(1), &snapshot(vec![])).as_deref(),
+            Some("send after opening")
+        );
+        assert_eq!(
+            app.sessions[0].pending_post.as_deref(),
+            Some("send after opening")
+        );
+
+        app.acknowledge_pending_post(SessionId(1));
+        assert_eq!(app.sessions[0].pending_post, None);
+    }
+
+    #[test]
+    fn failed_pending_post_is_restored_before_the_new_draft() {
+        let mut app = App::new("workspace".into());
+        app.begin_session(SessionId(1), true);
+        app.on_event(Event::Paste("failed message".into()));
+        app.on_event(Event::Key(key(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        app.on_event(Event::Paste("draft written while opening".into()));
+        assert_eq!(
+            app.attach(SessionId(1), &snapshot(vec![])).as_deref(),
+            Some("failed message")
+        );
+
+        app.restore_pending_post(SessionId(1));
+
+        assert_eq!(app.sessions[0].pending_post, None);
+        assert_eq!(
+            app.sessions[0].conversation.composer.lines(),
+            ["failed message", "", "draft written while opening"]
+        );
+    }
+
+    #[test]
+    fn session_focus_selects_and_returns_typed_input_to_the_composer() {
+        let mut app = App::new("workspace".into());
+        app.add_session(SessionId(1), &snapshot(vec![user(1, "first")]), true);
+        app.add_session(SessionId(2), &snapshot(vec![user(2, "second")]), true);
+        app.sessions[0].background_unread = true;
+        app.set_viewport(Viewport {
+            width: 80,
+            height: 20,
+            spacing: 1,
+        });
+
+        app.on_event(Event::Key(key(
+            KeyCode::Left,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(app.focus, Focus::Sessions);
+
+        app.on_event(Event::Key(key(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(app.current().id, SessionId(1));
+        assert!(app.current().background_unread);
+
+        app.on_event(Event::Key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(!app.current().background_unread);
+        assert_eq!(app.current().conversation.composer.lines(), ["a"]);
+
+        app.on_event(Event::Key(key(
+            KeyCode::Left,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        app.on_event(Event::Paste("bc".into()));
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.current().conversation.composer.lines(), ["abc"]);
+
+        app.on_event(Event::Key(key(
+            KeyCode::Left,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        app.on_event(Event::Key(key(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.current().conversation.composer.lines(), ["ab"]);
+
+        app.on_event(Event::Key(key(
+            KeyCode::Left,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        app.on_event(Event::Key(key(
+            KeyCode::Right,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(app.focus, Focus::Composer);
+        app.on_event(Event::Paste(" kept".into()));
+        assert_eq!(app.current().conversation.composer.lines(), ["ab kept"]);
+
+        app.on_event(Event::Key(key(
+            KeyCode::Left,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        app.on_event(Event::Key(key(
+            KeyCode::Left,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        app.on_event(Event::Key(key(
+            KeyCode::Delete,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.current().conversation.composer.lines(), ["ab kep"]);
+    }
+
+    #[test]
+    fn narrow_view_still_enters_the_full_screen_session_list() {
+        let mut app = App::new("workspace".into());
+        app.add_session(SessionId(1), &snapshot(vec![user(1, "first")]), true);
+        app.add_session(SessionId(2), &snapshot(vec![user(2, "second")]), true);
+        app.set_viewport(Viewport {
+            width: 40,
+            height: 12,
+            spacing: 1,
+        });
+
+        for (code, modifiers) in [
+            (KeyCode::Up, KeyModifiers::CONTROL),
+            (KeyCode::Up, KeyModifiers::ALT),
+            (KeyCode::Char('1'), KeyModifiers::ALT),
+        ] {
+            app.on_event(Event::Key(key(code, modifiers, KeyEventKind::Press)));
+            assert_eq!(app.current().id, SessionId(2));
+        }
+
+        app.on_event(Event::Key(key(
+            KeyCode::Left,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(app.focus, Focus::Sessions);
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            app.on_event(Event::Key(key(KeyCode::Up, modifiers, KeyEventKind::Press)));
+            assert_eq!(app.current().id, SessionId(2));
+        }
+        app.on_event(Event::Key(key(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(app.current().id, SessionId(1));
+        app.on_event(Event::Key(key(
+            KeyCode::Right,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(app.focus, Focus::Composer);
+    }
+
+    #[test]
+    fn control_right_in_the_composer_is_forwarded_to_the_textarea() {
+        let mut app = App::new("workspace".into());
+        app.add_session(SessionId(1), &snapshot(vec![]), true);
+        app.on_event(Event::Paste("one two".into()));
+        app.on_event(Event::Key(key(
+            KeyCode::Home,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        )));
+        assert_eq!(app.current().conversation.composer.cursor(), (0, 0));
+
+        app.on_event(Event::Key(key(
+            KeyCode::Right,
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )));
+
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(app.current().conversation.composer.cursor().1 > 0);
     }
 
     #[test]
@@ -1196,7 +1667,7 @@ mod tests {
         }];
         let projection = Projection::from_snapshot(&snapshot(records), true);
         assert!(projection.timeline.is_empty());
-        assert_eq!(projection.activity().as_deref(), Some("thinking"));
+        assert_eq!(projection.activity().as_deref(), Some("Thinking"));
     }
 
     #[test]
@@ -1254,13 +1725,40 @@ mod tests {
         let projection = Projection::from_snapshot(&snapshot(records.clone()), true);
         assert_eq!(
             projection.activity().as_deref(),
-            Some("read 42% · reading workspace")
+            Some("Reading file 42% · reading workspace")
         );
         assert!(projection.timeline.is_empty());
         assert_eq!(
             Projection::from_snapshot(&snapshot(records), false).activity(),
             None
         );
+    }
+
+    #[test]
+    fn tool_labels_normalize_and_bound_displayed_arguments() {
+        let grep = ToolCall::new(
+            "grep",
+            serde_json::json!({
+                "pattern": "  agent\n   loop  ",
+                "path": "  crates/ bone-agent  "
+            }),
+        );
+        assert_eq!(
+            active_tool(&grep),
+            "Searching \"agent loop\" in crates/ bone-agent"
+        );
+
+        let read = ToolCall::new(
+            "read",
+            serde_json::json!({"path": format!("  src/{}  ", "x".repeat(80))}),
+        );
+        let label = active_tool(&read);
+        assert!(!label.contains("  "));
+        assert!(label.ends_with('…'));
+        assert_eq!(label.chars().count(), "Reading ".chars().count() + 49);
+
+        let extension = ToolCall::new("future_tool-name", serde_json::json!({}));
+        assert_eq!(active_tool(&extension), "future tool name");
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> KeyEvent {

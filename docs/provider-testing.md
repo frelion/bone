@@ -50,9 +50,11 @@ cargo run -p bone-tui -- "Reply with exactly: ok"
 cargo run -p bone-tui
 ```
 
-In the full-screen form, use `Ctrl-N` to create a conversation,
-`Alt-Up`/`Alt-Down` to switch, `Esc` to stop the current session, and `Ctrl-C`
-to exit. The first run may require device authorization.
+In the full-screen form, use `Ctrl-N` to create a conversation. Press
+`Ctrl-Left` from the composer and use `Up`/`Down` to select a conversation;
+`Ctrl-Right` returns to the composer. The session list is a side rail on wide
+screens and takes the full screen on narrow ones. `Esc` stops the current
+session and `Ctrl-C` exits. The first run may require device authorization.
 `llm.system.credential_root` can select an independent credential directory;
 omitting it retains BONE's conventional directory.
 

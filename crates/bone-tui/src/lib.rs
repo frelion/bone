@@ -115,16 +115,28 @@ pub async fn run(
                     let (id, opened) = opened.expect("a pending session start exists");
                     match opened {
                         Ok((agent, observation)) => {
-                            app.attach(id, &observation.snapshot);
+                            let pending = app.attach(id, &observation.snapshot);
                             let observer = tokio::spawn(observe_session(
                                 id,
                                 agent.clone(),
                                 observation,
                                 updates.clone(),
                             ));
+                            if let Some(text) = pending {
+                                match agent.post(text).await {
+                                    Ok(_) => app.acknowledge_pending_post(id),
+                                    Err(error) => {
+                                        app.restore_pending_post(id);
+                                        app.mark_offline(id, format!("send failed: {error}"));
+                                    }
+                                }
+                            }
                             sessions.push(LiveSession { id, agent, observer });
                         }
-                        Err(error) => app.mark_offline(id, format!("could not open: {error}")),
+                        Err(error) => {
+                            app.restore_pending_post(id);
+                            app.mark_offline(id, format!("could not open: {error}"));
+                        }
                     }
                 }
                 update = update_rx.recv() => match update {
