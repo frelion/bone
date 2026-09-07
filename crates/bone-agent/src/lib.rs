@@ -1,8 +1,8 @@
 //! A complete agent session, with models and tools executed as ordinary jobs.
 //!
-//! Frontends register settings with [`config_builder`], [`connect`] an
-//! [`AgentHost`], and start independent sessions from it. [`start`] remains a
-//! convenience for one session. Each session keeps its startup configuration
+//! Product code authenticates a provider endpoint, resolves settings into a
+//! [`ResolvedAgentRuntimeConfig`], creates an [`AgentHost`], and starts
+//! independent runtimes from it. Each runtime keeps its supplied configuration
 //! snapshot.
 //!
 //! [`Kernel::step`] records observations and returns [`Effect`]s. [`Runtime`]
@@ -23,9 +23,12 @@ mod tools;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub use app::{AgentHost, StartError, config_builder, connect, start};
-pub use bone_llm::service::chatgpt_subscription::DeviceCodePrompt as LoginPrompt;
-pub use config::{Effort, ModelSettings, SystemConfig, TaskConfig};
+pub use app::{AgentHost, StartError};
+pub use config::{
+    Effort, ModelSettings, ModelSettingsError, ResolvedAgentRuntimeConfig,
+    ResolvedAgentRuntimeConfigError, RuntimeConfigFingerprint, RuntimeDeadlines, SystemConfig,
+    SystemConfigError,
+};
 pub use kernel::{Kernel, KernelConfig, KernelError};
 pub use model::ModelAdapter;
 pub use ports::*;

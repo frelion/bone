@@ -14,23 +14,21 @@ mod settings;
 pub mod tui;
 
 pub use durable::{
-    CanonicalPath, JournalEntry, JournalError, JournalFact, JournalRead, JournalRecoveryIssue,
-    JournalSequence, RecordError, RegistryError, RuntimeAttachment, SessionAttention,
-    SessionAvailability, SessionDraft, SessionExecution, SessionId, SessionJournal,
-    SessionLeaseError, SessionLifecycle, SessionListing, SessionMetadata, SessionRecord,
-    SessionRevision, SessionStatus, SessionStore, SessionStoreError, SessionStoreIssue,
-    SessionWriterLease, StorageError, TurnOutcome, UnixMillis, WorkspaceContext, WorkspaceError,
-    WorkspaceId, WorkspaceRegistry,
+    CanonicalPath, JournalEntry, JournalError, JournalFact, JournalRead, JournalSequence,
+    RecordError, RegistryError, RuntimeAttachment, SessionAttention, SessionAvailability,
+    SessionDraft, SessionExecution, SessionId, SessionJournal, SessionLeaseError, SessionLifecycle,
+    SessionListing, SessionMetadata, SessionRecord, SessionStatus, SessionStore, SessionStoreError,
+    SessionStoreIssue, SessionWriterLease, TurnOutcome, UnixMillis, WorkspaceContext,
+    WorkspaceError, WorkspaceId, WorkspaceRegistry,
 };
 
 pub use product_workspace::{
-    DraftDisposition, OpenDraft, OpenWriterDraft, StateRoot, StateRootEnvironment, StateRootError,
-    StateRootSource, WorkspaceApplication, WorkspaceApplicationError, resolve_state_root,
+    DraftDisposition, OpenDraft, OpenWriterDraft, WorkspaceApplication, WorkspaceApplicationError,
 };
 pub use settings::{
-    ApplyBoundary, ApplyState, EffectiveRevision, ModelChange, ModelOverrides, ModelResolution,
-    ModelSelection, ModelSelectionError, PUBLIC_SETTINGS, ResolvedModel, RevisionError, Scope,
-    ScopeKind, SettingDescriptor, SettingKey, SettingKeyError, SettingSource, SettingsError,
-    SettingsService, TuiDisplaySettings, TurnConfig, TurnConfigError, model_apply_state,
+    ApplyBoundary, GlobalAgentSettings, GlobalSettings, ModelChange, ModelResolution,
+    ModelSelection, ModelSelectionError, PUBLIC_SETTINGS, ResolvedModel, Scope, ScopeKind,
+    SettingDescriptor, SettingKey, SettingKeyError, SettingSource, SettingsError, SettingsService,
+    TuiDisplaySettings, WorkspaceSettings,
 };
-pub use tui::{TuiConfig, TuiError, run_workspace, write_events};
+pub use tui::{TuiError, run_storage_repair, run_workspace, write_events};

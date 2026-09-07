@@ -1,133 +1,164 @@
-# Configuration
+# Configuration and local storage
 
-`bone-config` is the shared configuration store. Each module defines its own
-`ConfigSection`; the store handles registration, validation, snapshots, and
-atomic writes without depending on those modules.
+BONE has no user-editable configuration file. The terminal UI is the normal
+configuration surface; it writes typed settings immediately and reports the
+result through the same event flow as every other TUI effect.
 
-## One file, module-owned sections
+The implementation is deliberately not a generic configuration registry or a
+generic key/value database. `bone-store` is a concrete local SQLite service
+with a small, typed port used by the product domain.
 
-| Section | Owner | Settings |
+## What is stored where
+
+All BONE-owned durable data has one source of truth:
+
+```text
+$XDG_DATA_HOME/bone/store-v1/bone.sqlite3
+# or ~/.local/share/bone/store-v1/bone.sqlite3 when XDG_DATA_HOME is unset
+```
+
+The database contains only four internal schema concepts:
+
+| Storage concept | Product use |
+| --- | --- |
+| `schema_meta` | Store schema version. |
+| typed documents | Global settings, Workspace registry/settings, Session records, drafts, and summaries. |
+| journals | Strictly ordered Session event facts. |
+| OS sidecar leases | Session writer ownership; these are not database tables. |
+
+Document keys are constructed only by domain capabilities. Current product
+locations include `settings/global`, the Workspace registry, Workspace
+settings, and a Session record/journal under that Workspace. The TUI, model
+input, and ordinary crates never construct storage paths or run SQL.
+
+Rig's ChatGPT OAuth cache is the one intentional exception because Rig owns
+its JSON schema and refresh-token lifecycle:
+
+```text
+$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/auth.json
+# or ~/.config/bone/store-v1/providers/chatgpt-subscription/auth.json
+```
+
+`bone-store` owns the safe directory/path checks and a fail-fast `auth.lock`.
+It never reads, serializes, prints, or stores OAuth payloads in SQLite.
+
+There is no `BONE_CONFIG`, `BONE_STATE_DIR`, `credential_root`, JSON settings
+file, JSONL Session transcript, legacy import, or automatic migration. Older
+local BONE data is not touched; `store-v1` is a separate clean root.
+
+## Settings users see
+
+`bone-app` owns fixed typed settings rather than independently registered
+sections:
+
+```text
+GlobalSettings
+  agent.coordinator                 optional model selection
+  agent.default_solver              optional user-wide default
+  agent.soft_deadline_seconds
+  agent.shutdown_grace_seconds
+  tool_limits
+  tui.show_progress
+
+WorkspaceSettings
+  default_solver
+
+SessionRecord.metadata
+  solver_model_override
+```
+
+The solver resolves in the following order:
+
+```text
+Session override > Workspace default > User default
+```
+
+There is deliberately no guessed model. A new store opens normally with a
+Workspace, Session, and editable draft, but reports `NeedsModel` until the user
+chooses one.
+
+Use the TUI commands below:
+
+| Command | Durable target | Runtime boundary |
 | --- | --- | --- |
-| `agent.system` | `bone-agent` | Coordinator, default solver, model deadlines, tool reminder, shutdown grace. |
-| `llm.system` | `bone-llm` | Optional `credential_root` for the current ChatGPT connection. |
-| `tools.local` | `bone-tools` | `ToolLimits`, including output, read, search, and shell limits. |
-| `tui.display` | `bone-app` | `show_progress`, default true. |
+| `/model <id>` | current Session override | next newly created/recreated runtime |
+| `/model default <id>` | current Workspace default | next newly created/recreated runtime |
+| `/model global <id>` | user's global default | next newly created/recreated runtime |
+| `/model inherit` | removes current Session override | restores Workspace/User inheritance |
+| `/config doctor` | read-only storage health check | no runtime change |
 
-See the [complete example](../crates/bone-app/config.example.json). Only
-`agent.system` is required; the other sections and individual tool limits use
-defaults when omitted. Model IDs must be selected explicitly.
+Saving a model setting is live: other Sessions in the same process immediately
+recompute their readiness. A runtime that is already attached remains pinned.
+BONE resolves a fresh immutable runtime config before accepting a later user
+turn; it does not reread settings during Agent execution.
 
-`bone_config::default_path()` resolves `BONE_CONFIG`, then
-`$XDG_CONFIG_HOME/bone/config.json`, then `$HOME/.config/bone/config.json`.
-Selected paths must be absolute. `ConfigManagerBuilder::build(path)` still
-accepts an explicit path for embedded applications and tests.
+## Runtime configuration and durable turns
 
-```rust,ignore
-let config = bone_agent::config_builder()?
-    .register::<bone_app::TuiConfig>()?
-    .build(bone_config::default_path()?)?;
+Before a user turn is accepted, `SettingsService` overlays global, Workspace,
+and Session values into one `ResolvedAgentRuntimeConfig`:
+
+```text
+coordinator model
+solver model
+validated tool limits
+soft deadline and shutdown grace
+SHA-256 runtime fingerprint
 ```
 
-Agent's builder registers Agent, LLM, and Tools settings. `bone-app` adds its
-presentation settings. Registration is complete before `build`; each manager
-then has a fixed set of known types and schemas.
+The journal records the exact solver and `runtime_fingerprint` from that
+resolved object. `UserTurnAccepted` and the Session summary update are written
+inside the same SQLite `BEGIN IMMEDIATE` transaction. Only after it commits may
+the TUI clear the composer or schedule `AgentHandle::post`.
 
-## Reading and writing
+If storage rejects the transaction—Busy, a revision conflict, a permission
+problem, or corruption—the composer remains unchanged and the Agent receives
+nothing. SQLite write contention is fail-fast; it is surfaced as `Busy` rather
+than blocking the TUI indefinitely.
 
-A snapshot contains one complete file revision. Registered sections are
-validated through Serde and the module's `validate()` function. JSON Schema is
-available for editors; it does not replace those checks.
+## Store API and composition
 
-Unregistered sections remain in the snapshot and are preserved during writes.
-Their values have not been validated by this manager. They can be listed with
-`unrecognized_sections()`; the terminal reports their names. Typed reads and
-mutations require registration, so one component cannot silently edit an
-unknown section. Misspelled required section names still produce a missing
-configuration error.
+The app opens one `BoneStore` at startup and injects scoped capabilities:
 
 ```rust,ignore
-let snapshot = config.snapshot()?;
-let settings = snapshot.get::<bone_app::TuiConfig>()?.unwrap_or_default();
-let change = config.set(&settings, snapshot.revision())?;
+let store = BoneStore::open_default()?;
+let settings = SettingsService::open(store.clone())?;
+let workspace = WorkspaceApplication::open_with_store(launch_dir, store.clone())?;
+
+let global = store.settings().global::<GlobalSettings>();
+let state = store.workspace_state();
+let auth = store.provider_auth();
 ```
 
-Writes replace one complete section. The store locks, rereads the whole file,
-checks the expected revision, and atomically replaces it. A stale writer gets
-`RevisionConflict`; lock contention returns `Busy`. Unknown sections and other
-modules' values survive the operation. There is no implicit merge or retry.
+For tests, portable embedding, and future desktop hosts, supply explicit
+absolute roots through `StoreRoots` and `BoneStore::open_at`. This is the only
+path injection point; it is not a hidden environment-variable setting.
 
-## When settings take effect
+`Document<T>` supplies missing/read/compare-and-swap replace/remove through a
+`Revision`. `Journal<E>` supplies ordered append/read. Coupled Session summary
+and event changes use the restricted workspace transaction API, which exposes
+typed document/journal operations but not raw SQL or arbitrary keys.
 
-`bone_agent::connect()` reads `credential_root` and fixes that OAuth connection
-for the returned `AgentHost`'s lifetime. Each `AgentHost::start()` reads a fresh
-snapshot for Agent, tool, and runtime settings; existing sessions retain their
-captured settings. One Host can run several independent sessions concurrently.
-A separate live Host or process cannot connect the same credential root and
-receives `CredentialStoreBusy` until the original connection is released.
-Changing `credential_root` therefore takes effect on the next `connect`, while
-other saved settings take effect on the next session.
+Session writer leases and provider-auth leases are separate, long-lived OS
+locks. They identify which process owns a runtime resource; SQLite itself
+serializes ordinary document writes.
 
-`bone_agent::start()` remains the single-session convenience. It reads one
-snapshot, validates settings and local paths, then connects and starts Runtime.
+## Reliability and privacy policy
 
-Coordinator selection is system-level. `TaskConfig` can override only the
-solver model, effort, and deadline. The terminal resolves `--model`, then
-`BONE_MODEL`, then the system default; overrides do not write back to the file.
+WAL is a database-wide persisted mode established when the store opens. Every
+connection uses foreign keys and a zero busy timeout; every writer configures
+`synchronous = FULL` before its short `BEGIN IMMEDIATE` transaction. Read-only
+connections deliberately do not apply that write-durability pragma, so a
+concurrent TUI read does not spuriously contend with an active writer. Database
+files, WAL/SHM sidecars, lock sidecars, and private directories are validated
+on Unix for ownership, permissions, symlinks, and hard links. BONE does not
+reset, delete, or overwrite a corrupt/unsafe store. The TUI instead enters a
+repair/error state.
 
-Agent's `soft_deadline_seconds` defaults to 30 and `shutdown_grace_seconds` to
-5. Model `timeout_seconds` defaults to 120. Tool durations are persisted as
-integer `default_bash_timeout_seconds` and `max_bash_timeout_seconds`; the Rust
-API still uses `Duration`. Saving a fractional second value is rejected rather
-than rounded.
+`/logout` is the only product entry point for deleting the local ChatGPT cache.
+It does not revoke an upstream account. If an Endpoint or Model still holds the
+provider-auth lease, logout returns Busy and deletes nothing; stop/exit the
+owning BONE process before retrying.
 
-`llm.system.credential_root` selects the existing OAuth storage directory; it
-is not a credential value. Omitting it retains BONE's existing login path.
-The model library's protocol constructors remain available; this application
-entrypoint currently connects the ChatGPT subscription service.
-
-TUI reads display preferences at frontend startup. The store returns a
-`ConfigChange` with the saved revision; it does not send reload events or mutate
-running model/tool instances.
-
-## Credentials
-
-Secret values are not configuration values. Configuration contains only a
-credential key such as `github.work`; a separate `CredentialStore` resolves
-that key to a redacted `SecretLease`. Secret values and leases are not
-serializable and never expose their contents through `Debug`.
-
-The credential store uses a separate private JSON file, a fail-fast exclusive
-lock, and same-directory atomic replacement. On Unix it also verifies
-ownership, file type, link count, and private permissions. A future UI or CLI
-may call the credential API directly. Secret values must never pass through an
-agent tool argument, result, transcript, or model-visible error. The host must
-supply a trusted parent directory; on non-Unix systems it is also responsible
-for choosing a directory protected by the platform's ACLs. The store resolves
-the supplied parent to a stable absolute path once and revalidates that parent
-before every operation; it is not a sandbox against a malicious process
-running as the same operating-system user.
-
-## Agent tool
-
-The single `config` tool has five closed actions:
-
-- `list`: list registered section names, descriptions, and whether configured.
-- `get`: return one configured non-secret section and the current revision.
-- `schema`: return the declared JSON Schema for one section.
-- `set`: validate and replace one complete section using an expected revision.
-- `remove`: remove one complete section using an expected revision.
-
-Calls use a stable root object, for example
-`{"request":{"action":"get","section":"tools.forge"}}`. Keeping the
-action union below that root makes the definition portable across strict model
-provider schemas. Tool results have a host-selectable byte ceiling (50 KiB by
-default); oversized JSON is rejected as a whole rather than truncated.
-
-`set` and `remove` are configuration writes. Approval and authorization happen
-in the future runtime before dispatch, just as they do for file writes and
-shell execution; they are not hidden inside the storage service. The tool
-cannot read or write credential values. The host should register only sections
-that may be shown to the agent and must enforce per-call policy before
-dispatch. Once a write reaches blocking storage, cancelling the async caller
-does not imply rollback; the caller should read again after an uncertain
-outcome.
+Secrets, device codes, refresh tokens, and OAuth payloads never enter global
+settings, SQLite documents, Session journals, debug output, notices, or
+model-visible tool output.

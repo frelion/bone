@@ -10,25 +10,16 @@ publish = false
 test-utils = []
 
 [dependencies]
+bone-store = { path = "../bone-store" }
 futures-util.workspace = true
 rig-core = { workspace = true, features = ["reqwest", "rustls"] }
 schemars.workspace = true
 serde_json.workspace = true
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-bone-config = { path = "../bone-config" }
-serde.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-fs2.workspace = true
-libc.workspace = true
-rustix.workspace = true
-
 [dev-dependencies]
 bytes.workspace = true
 http.workspace = true
 rig-core = { workspace = true, features = ["test-utils"] }
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [[test]]

@@ -125,7 +125,7 @@ const COMMANDS: &[CommandDescriptor] = &[
         name: "logout",
         aliases: &[],
         title: "Log out",
-        description: "Disconnect the current account after confirmation.",
+        description: "Remove the local ChatGPT sign-in cache when no runtime owns it.",
     },
     CommandDescriptor {
         name: "workspace",

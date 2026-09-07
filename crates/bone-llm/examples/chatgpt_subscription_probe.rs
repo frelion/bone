@@ -4,6 +4,7 @@ use bone_llm::{
     InputItem, InputSource, Request, StreamEvent, ToolChoice, ToolDefinition,
     service::chatgpt_subscription,
 };
+use bone_store::{BoneStore, ProviderId};
 use futures_util::StreamExt;
 use serde_json::json;
 
@@ -17,14 +18,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })?;
     let tool_mode = matches!(env::args().nth(1).as_deref(), Some("tool"));
     println!("first use may require ChatGPT device authorization");
-    let credential_root = chatgpt_subscription::default_credential_root()?;
-    let endpoint =
-        chatgpt_subscription::connect("chatgpt-subscription", credential_root, |prompt| {
-            println!("Sign in at {}", prompt.verification_uri);
-            println!("Enter code: {}", prompt.user_code);
-            println!("Do not share this device code.");
-        })
-        .await?;
+    let auth = BoneStore::open_default()?
+        .provider_auth()
+        .acquire(ProviderId::ChatGptSubscription)?;
+    let endpoint = chatgpt_subscription::connect("chatgpt-subscription", auth, |prompt| {
+        println!("Sign in at {}", prompt.verification_uri);
+        println!("Enter code: {}", prompt.user_code);
+        println!("Do not share this device code.");
+    })
+    .await?;
     let model = endpoint.model(&model_id)?;
     let mut request = Request::new([InputItem::external(
         InputSource::User,

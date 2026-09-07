@@ -1,0 +1,2010 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="BONE bone-agent 当前实现的技术审批材料：架构边界、双层循环、并发调度、历史事务、错误与取消语义。">
+  <meta name="color-scheme" content="light dark">
+  <title>BONE Agent Runtime · 技术架构审批</title>
+  <style>
+    :root {
+      --bg: #f2f6f8;
+      --grid: rgba(25, 76, 102, .055);
+      --surface: #ffffff;
+      --surface-2: #f7fafb;
+      --ink: #10212c;
+      --muted: #4f6573;
+      --faint: #5f737f;
+      --line: #d5e0e6;
+      --line-strong: #afc2ce;
+      --cyan: #087e92;
+      --blue: #2e62c4;
+      --teal: #087f69;
+      --amber: #99630b;
+      --red: #b83f36;
+      --violet: #7247ad;
+      --green-bg: rgba(8, 127, 105, .08);
+      --amber-bg: rgba(153, 99, 11, .08);
+      --red-bg: rgba(184, 63, 54, .08);
+      --cyan-bg: rgba(8, 126, 146, .07);
+      --shadow: 0 16px 45px rgba(26, 60, 78, .09);
+      --radius: 12px;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    html[data-theme="dark"] {
+      --bg: #071018;
+      --grid: rgba(122, 174, 209, .045);
+      --surface: #0c1722;
+      --surface-2: #101e2b;
+      --ink: #e9f2f8;
+      --muted: #9db0bd;
+      --faint: #738895;
+      --line: #223747;
+      --line-strong: #38566a;
+      --cyan: #5ed5e8;
+      --blue: #75a7ff;
+      --teal: #51d6b3;
+      --amber: #f2bd62;
+      --red: #ff8178;
+      --violet: #c7a0ff;
+      --green-bg: rgba(81, 214, 179, .1);
+      --amber-bg: rgba(242, 189, 98, .1);
+      --red-bg: rgba(255, 129, 120, .1);
+      --cyan-bg: rgba(94, 213, 232, .09);
+      --shadow: 0 18px 55px rgba(0, 0, 0, .24);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--ink);
+      background-color: var(--bg);
+      background-image:
+        linear-gradient(var(--grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+      background-size: 32px 32px;
+      font: 16px/1.66 var(--sans);
+      text-rendering: optimizeLegibility;
+    }
+
+    a { color: var(--cyan); }
+    a:hover { color: var(--teal); }
+    a:focus-visible, button:focus-visible, summary:focus-visible {
+      outline: 3px solid var(--amber);
+      outline-offset: 3px;
+    }
+    .diagram:focus-visible, .table-wrap:focus-visible {
+      outline: 3px solid var(--amber);
+      outline-offset: 3px;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    button { font: inherit; }
+    .skip-link {
+      position: fixed;
+      top: 8px;
+      left: 8px;
+      z-index: 100;
+      padding: 8px 12px;
+      color: var(--bg);
+      background: var(--amber);
+      transform: translateY(-150%);
+    }
+    .skip-link:focus { transform: translateY(0); }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      border-bottom: 1px solid var(--line);
+      background: var(--bg);
+      background: color-mix(in srgb, var(--bg) 90%, transparent);
+      backdrop-filter: blur(16px);
+    }
+    .topbar-inner {
+      width: min(1480px, calc(100% - 36px));
+      min-height: 60px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      color: var(--ink);
+      font-weight: 800;
+      letter-spacing: .02em;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .brand-mark {
+      width: 25px;
+      height: 25px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--cyan);
+      color: var(--cyan);
+      font: 700 .75rem/1 var(--mono);
+      transform: rotate(45deg);
+    }
+    .brand-mark span { transform: rotate(-45deg); }
+    .top-actions { display: flex; align-items: center; gap: 8px; }
+    .action-button {
+      min-height: 35px;
+      padding: 7px 11px;
+      border: 1px solid var(--line-strong);
+      border-radius: 7px;
+      color: var(--muted);
+      background: var(--surface);
+      cursor: pointer;
+    }
+    .action-button:hover { color: var(--ink); border-color: var(--cyan); }
+
+    .page {
+      width: min(1480px, calc(100% - 36px));
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 230px minmax(0, 1fr);
+      gap: 34px;
+      align-items: start;
+    }
+    .sidebar {
+      position: sticky;
+      top: 80px;
+      height: calc(100vh - 96px);
+      padding: 28px 0 42px;
+      overflow-y: auto;
+    }
+    .sidebar-label {
+      margin: 0 0 10px 12px;
+      color: var(--faint);
+      font: 700 .72rem/1.3 var(--mono);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .toc { display: grid; gap: 2px; }
+    .toc a {
+      padding: 7px 11px;
+      border-left: 2px solid transparent;
+      color: var(--muted);
+      font-size: .88rem;
+      text-decoration: none;
+    }
+    .toc a:hover, .toc a[aria-current="true"] {
+      color: var(--ink);
+      border-left-color: var(--cyan);
+      background: var(--cyan-bg);
+    }
+    .sidebar-note {
+      margin: 22px 10px 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      color: var(--faint);
+      font-size: .78rem;
+      line-height: 1.5;
+      background: var(--surface);
+    }
+
+    main { min-width: 0; padding: 38px 0 100px; }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(290px, .6fr);
+      gap: 18px;
+      align-items: stretch;
+      margin-bottom: 20px;
+    }
+    .hero-main, .approval-summary {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .hero-main {
+      position: relative;
+      overflow: hidden;
+      padding: clamp(26px, 4vw, 44px);
+    }
+    .hero-main::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 3px;
+      background: linear-gradient(90deg, var(--cyan), var(--teal), var(--blue), transparent 82%);
+    }
+    .kicker, .section-index, .eyebrow {
+      display: block;
+      color: var(--cyan);
+      font: 750 .74rem/1.3 var(--mono);
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .kicker { margin: 0 0 12px; }
+    h1, h2, h3, h4 { margin: 0; color: var(--ink); line-height: 1.2; }
+    h1 { font-size: clamp(2.15rem, 4.2vw, 3.8rem); letter-spacing: -.04em; }
+    h2 { font-size: clamp(1.55rem, 2.8vw, 2.3rem); letter-spacing: -.025em; }
+    h3 { font-size: 1.08rem; }
+    h4 { font-size: .98rem; }
+    .lede { max-width: 850px; margin: 18px 0 0; color: var(--muted); font-size: 1.03rem; }
+    .meta-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 23px; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 27px;
+      padding: 4px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      background: var(--surface-2);
+      font: 650 .76rem/1.2 var(--mono);
+    }
+    .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+    .pill.ok::before { background: var(--teal); }
+    .pill.info::before { background: var(--cyan); }
+    .pill.warn::before { background: var(--amber); }
+
+    .approval-summary {
+      padding: 23px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 22px;
+    }
+    .approval-status {
+      display: inline-flex;
+      width: fit-content;
+      margin-bottom: 14px;
+      padding: 5px 9px;
+      border: 1px solid var(--teal);
+      border-radius: 5px;
+      color: var(--teal);
+      background: var(--green-bg);
+      font: 750 .73rem/1.2 var(--mono);
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    .approval-summary p { margin: 8px 0 0; color: var(--muted); font-size: .92rem; }
+    .approval-summary dl {
+      margin: 0;
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px 13px;
+      font-size: .82rem;
+    }
+    .approval-summary dt { color: var(--faint); }
+    .approval-summary dd { margin: 0; color: var(--ink); font-family: var(--mono); overflow-wrap: anywhere; }
+
+    .section {
+      scroll-margin-top: 76px;
+      padding: 54px 0 8px;
+      border-top: 1px solid var(--line);
+    }
+    .section-heading {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(240px, .52fr);
+      gap: 28px;
+      align-items: end;
+      margin-bottom: 22px;
+    }
+    .section-index { margin-bottom: 8px; }
+    .section-heading p { margin: 0; color: var(--muted); font-size: .93rem; }
+
+    .grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px; }
+    .span-3 { grid-column: span 3; }
+    .span-4 { grid-column: span 4; }
+    .span-5 { grid-column: span 5; }
+    .span-6 { grid-column: span 6; }
+    .span-7 { grid-column: span 7; }
+    .span-8 { grid-column: span 8; }
+    .span-12 { grid-column: span 12; }
+
+    .card, .diagram, .code-panel, .table-wrap, details {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+    .card { padding: 19px; }
+    .card.accent-cyan { border-top: 3px solid var(--cyan); }
+    .card.accent-teal { border-top: 3px solid var(--teal); }
+    .card.accent-amber { border-top: 3px solid var(--amber); }
+    .card.accent-blue { border-top: 3px solid var(--blue); }
+    .card.accent-violet { border-top: 3px solid var(--violet); }
+    .card.accent-red { border-top: 3px solid var(--red); }
+    .card p { margin: 8px 0 0; color: var(--muted); font-size: .91rem; }
+    .eyebrow { margin-bottom: 8px; color: var(--faint); font-size: .69rem; }
+    .metric { display: block; margin-bottom: 8px; color: var(--cyan); font: 760 1.35rem/1 var(--mono); }
+
+    .callout {
+      padding: 16px 18px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--cyan);
+      border-radius: 9px;
+      color: var(--muted);
+      background: var(--cyan-bg);
+    }
+    .callout strong { color: var(--ink); }
+    .callout.warning { border-left-color: var(--amber); background: var(--amber-bg); }
+    .callout.danger { border-left-color: var(--red); background: var(--red-bg); }
+    .callout.success { border-left-color: var(--teal); background: var(--green-bg); }
+
+    .decision-list, .plain-list, .check-list { margin: 0; padding: 0; list-style: none; }
+    .decision-list { display: grid; gap: 9px; }
+    .decision-list li, .check-list li {
+      display: grid;
+      grid-template-columns: 23px minmax(0, 1fr);
+      gap: 9px;
+      color: var(--muted);
+    }
+    .decision-list li::before {
+      content: "D";
+      width: 19px;
+      height: 19px;
+      display: grid;
+      place-items: center;
+      border: 1px solid var(--cyan);
+      border-radius: 4px;
+      color: var(--cyan);
+      font: 750 .65rem/1 var(--mono);
+    }
+    .check-list li::before { content: "✓"; color: var(--teal); font-weight: 900; }
+    .plain-list { display: grid; gap: 8px; color: var(--muted); }
+    .plain-list li { position: relative; padding-left: 16px; }
+    .plain-list li::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: .72em;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--cyan);
+    }
+
+    code, .mono { font-family: var(--mono); }
+    :not(pre) > code {
+      padding: .08em .32em;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      color: var(--cyan);
+      background: var(--surface-2);
+      font-size: .88em;
+    }
+    .code-panel { overflow: hidden; background: #10212c; color: #e5f0f4; }
+    html[data-theme="dark"] .code-panel { background: #07131c; color: #d9edf3; }
+    .code-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 14px;
+      border-bottom: 1px solid #274050;
+      color: #8da8b6;
+      font: 700 .71rem/1.3 var(--mono);
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+    pre { margin: 0; padding: 17px; overflow: auto; font: .83rem/1.6 var(--mono); tab-size: 2; }
+    .kw { color: #ffad93; }
+    .ty { color: #78dce8; }
+    .fn { color: #a9dc76; }
+    .cm { color: #78909c; }
+    .st { color: #ffd866; }
+
+    .diagram { padding: 17px; overflow: auto; box-shadow: var(--shadow); }
+    .diagram-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 14px;
+    }
+    .diagram-title span {
+      color: var(--faint);
+      font: 700 .71rem/1.3 var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    svg { display: block; width: 100%; height: auto; min-width: 760px; }
+    .svg-box { fill: var(--surface-2); stroke: var(--line-strong); stroke-width: 1.5; }
+    .svg-box.controller { stroke: var(--cyan); }
+    .svg-box.action { stroke: var(--blue); }
+    .svg-box.tool { stroke: var(--teal); }
+    .svg-box.warning { stroke: var(--amber); }
+    .svg-box.failure { stroke: var(--red); }
+    .svg-text { fill: var(--ink); font: 650 15px var(--sans); }
+    .svg-small { fill: var(--muted); font: 13px var(--sans); }
+    .svg-mono { fill: var(--cyan); font: 12px var(--mono); }
+    .svg-line { fill: none; stroke: var(--line-strong); stroke-width: 2; }
+    .svg-line.cyan { stroke: var(--cyan); }
+    .svg-line.teal { stroke: var(--teal); }
+    .svg-line.amber { stroke: var(--amber); }
+    .svg-dash { stroke-dasharray: 7 6; }
+    .svg-label-bg { fill: var(--surface); stroke: var(--line); }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 740px; font-size: .87rem; }
+    caption { padding: 13px 15px; color: var(--muted); text-align: left; font-weight: 650; }
+    th, td { padding: 11px 13px; border-top: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th {
+      color: var(--ink);
+      background: var(--surface-2);
+      font: 720 .75rem/1.35 var(--mono);
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    td { color: var(--muted); }
+    td strong { color: var(--ink); }
+    tbody tr:hover { background: var(--cyan-bg); }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 7px;
+      border: 1px solid currentColor;
+      border-radius: 999px;
+      font: 720 .69rem/1.35 var(--mono);
+      white-space: nowrap;
+    }
+    .status.ok { color: var(--teal); background: var(--green-bg); }
+    .status.warn { color: var(--amber); background: var(--amber-bg); }
+    .status.fail { color: var(--red); background: var(--red-bg); }
+    .status.info { color: var(--cyan); background: var(--cyan-bg); }
+
+    .timeline {
+      min-width: 900px;
+      display: grid;
+      grid-template-columns: 120px repeat(11, minmax(70px, 1fr));
+      gap: 5px;
+      align-items: center;
+    }
+    .timeline .tick { color: var(--faint); font: .69rem/1 var(--mono); text-align: center; }
+    .lane-label { color: var(--ink); font: 700 .79rem/1.3 var(--mono); }
+    .segment {
+      min-height: 36px;
+      display: grid;
+      place-items: center;
+      padding: 5px 7px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      color: var(--ink);
+      background: var(--surface-2);
+      font: 650 .69rem/1.25 var(--mono);
+      text-align: center;
+    }
+    .segment.model { border-color: var(--blue); background: var(--cyan-bg); background: color-mix(in srgb, var(--blue) 11%, var(--surface)); }
+    .segment.tool { border-color: var(--teal); background: var(--green-bg); background: color-mix(in srgb, var(--teal) 10%, var(--surface)); }
+    .segment.wait { border-color: var(--amber); border-style: dashed; color: var(--amber); background: var(--amber-bg); }
+    .segment.done { border-color: var(--cyan); color: var(--cyan); background: var(--cyan-bg); }
+    .segment.parent { border-color: var(--violet); background: var(--cyan-bg); background: color-mix(in srgb, var(--violet) 9%, var(--surface)); }
+
+    details { overflow: hidden; }
+    summary { padding: 13px 16px; color: var(--ink); background: var(--surface-2); cursor: pointer; font-weight: 700; }
+    details[open] summary { border-bottom: 1px solid var(--line); }
+    .details-body { padding: 16px; }
+    .details-body > :first-child { margin-top: 0; }
+    .details-body > :last-child { margin-bottom: 0; }
+
+    .file-map {
+      display: grid;
+      grid-template-columns: 190px 1fr;
+      gap: 1px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      overflow: hidden;
+      background: var(--line);
+    }
+    .file-map dt, .file-map dd { margin: 0; padding: 10px 12px; background: var(--surface); }
+    .file-map dt { color: var(--cyan); font: 700 .79rem/1.4 var(--mono); }
+    .file-map dd { color: var(--muted); font-size: .86rem; }
+    .source-link { color: inherit; text-decoration-color: var(--line-strong); text-underline-offset: 3px; }
+    .footnote { color: var(--faint); font-size: .79rem; }
+    footer { margin-top: 66px; padding-top: 24px; border-top: 1px solid var(--line); color: var(--faint); font-size: .81rem; }
+
+    @media (max-width: 1120px) {
+      .page { grid-template-columns: 1fr; }
+      .sidebar { position: static; height: auto; padding: 17px 0 0; }
+      .sidebar-label, .sidebar-note { display: none; }
+      .toc { display: flex; gap: 3px; overflow-x: auto; padding-bottom: 8px; }
+      .toc a { flex: 0 0 auto; border-left: 0; border-bottom: 2px solid transparent; }
+      .toc a:hover, .toc a[aria-current="true"] {
+        border-left-color: transparent;
+        border-bottom-color: var(--cyan);
+      }
+      main { padding-top: 18px; }
+    }
+    @media (max-width: 900px) {
+      .hero, .section-heading { grid-template-columns: 1fr; }
+      .span-3, .span-4, .span-5, .span-6, .span-7, .span-8 { grid-column: span 12; }
+      .hero-main { padding: 28px; }
+    }
+    @media (max-width: 620px) {
+      body { font-size: 15px; }
+      .topbar-inner, .page { width: min(100% - 22px, 1480px); }
+      .topbar-inner { min-height: 54px; }
+      .brand { font-size: .86rem; }
+      .action-button .wide-label { display: none; }
+      main { padding-bottom: 55px; }
+      .hero-main, .approval-summary, .card, .diagram { border-radius: 9px; }
+      .hero-main { padding: 23px 19px; }
+      .approval-summary, .card { padding: 16px; }
+      .section { padding-top: 42px; }
+      .file-map { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 520px) {
+      .brand-label { display: none; }
+      .topbar-inner { gap: 8px; }
+      .top-actions { gap: 5px; }
+      .action-button { padding-inline: 8px; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+    @media print {
+      :root, html[data-theme="light"], html[data-theme="dark"] {
+        --bg: #ffffff; --grid: transparent; --surface: #ffffff; --surface-2: #f5f7f8;
+        --ink: #101820; --muted: #394b57; --faint: #5d6d77;
+        --line: #cad4da; --line-strong: #9fb0ba; --cyan: #086c7d; --blue: #315fae;
+        --teal: #08715e; --amber: #875808; --red: #a53b34; --violet: #624195;
+        --green-bg: #edf8f5; --amber-bg: #fff7e9; --red-bg: #fff0ef;
+        --cyan-bg: #edf7f9; --shadow: none;
+      }
+      @page { size: A4 landscape; margin: 12mm; }
+      body { background: #fff; font-size: 10pt; print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+      .topbar, .sidebar, .skip-link { display: none !important; }
+      .page { display: block; width: 100%; }
+      main { padding: 0; }
+      .hero { grid-template-columns: 1.4fr .6fr; gap: 10px; }
+      .hero-main, .approval-summary, .card, .diagram, .table-wrap, details { box-shadow: none; }
+      .diagram, .approval-summary, .print-keep { break-inside: avoid; }
+      .table-wrap, details, .card { break-inside: auto; }
+      thead { display: table-header-group; }
+      tr { break-inside: avoid; }
+      h2, h3, caption, .section-heading { break-after: avoid-page; }
+      .hero-main { padding: 22px; }
+      h1 { font-size: 28pt; }
+      h2 { font-size: 18pt; }
+      .section { padding-top: 24px; }
+      .section-heading { margin-bottom: 13px; }
+      .diagram { overflow: visible; }
+      svg, .timeline, table { min-width: 0; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#content">跳到正文</a>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#top" aria-label="BONE Agent Runtime Review，返回页面顶部"><span class="brand-mark" aria-hidden="true"><span>B</span></span><span class="brand-label">BONE / AGENT RUNTIME REVIEW</span></a>
+      <div class="top-actions" aria-label="文档操作">
+        <button class="action-button" id="expand-all" type="button" aria-expanded="false" aria-label="展开全部细节"><span class="wide-label">展开全部</span>细节</button>
+        <button class="action-button" id="theme-toggle" type="button" aria-label="切换主题" aria-pressed="false">深色</button>
+        <button class="action-button" id="print-page" type="button"><span class="wide-label">打印 / </span>PDF</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="page" id="top">
+    <aside class="sidebar" aria-label="页面目录">
+      <p class="sidebar-label">Review map</p>
+      <nav class="toc">
+        <a href="#summary">审批摘要</a>
+        <a href="#boundary">系统边界</a>
+        <a href="#controller-loop">Agent Loop</a>
+        <a href="#action-loop">Action Loop</a>
+        <a href="#timeline">并发时间线</a>
+        <a href="#state">数据与状态</a>
+        <a href="#protocol">协议与历史</a>
+        <a href="#failure">失败与取消</a>
+        <a href="#api">公开 API</a>
+        <a href="#evidence">证据与审批</a>
+      </nav>
+      <div class="sidebar-note">
+        <strong>实现快照</strong><br>
+        commit <span class="mono">e86f21c5</span><br>
+        branch <span class="mono">main</span><br>
+        2026-09-04
+      </div>
+    </aside>
+
+    <main id="content">
+      <div class="hero">
+        <header class="hero-main">
+          <p class="kicker">Technical approval packet · implemented architecture</p>
+          <h1>bone-agent 运行时架构</h1>
+          <p class="lede">
+            当前实现由一个父 Agent 决策循环和一个中央 Action 调度循环组成。Agent 自己决定是否创建 Action；
+            Action 以 Turn 为原子推进；工具异步并发，模型请求串行；所有对外返回的 Action 都已经结算。
+          </p>
+          <div class="meta-row" aria-label="实现状态">
+            <span class="pill ok">Luna manual live smoke</span>
+            <span class="pill ok">187 tests passed</span>
+            <span class="pill info">Production Rig boundary: bone-llm</span>
+            <span class="pill warn">v1 batch barrier</span>
+          </div>
+        </header>
+        <aside class="approval-summary" aria-labelledby="approval-title">
+          <div>
+            <span class="approval-status">Ready for review</span>
+            <h2 id="approval-title">建议批准</h2>
+            <p>核心边界和调度不变量已经实现、测试并完成真实 Provider 冒烟。首要取舍是父批次屏障；串行模型、终态-only API 和 cooperative cancellation 也是明确的 v1 约束。</p>
+          </div>
+          <dl>
+            <dt>Scope</dt><dd>bone-agent core</dd>
+            <dt>Snapshot</dt><dd>e86f21c5</dd>
+            <dt>Model</dt><dd>gpt-5.6-luna</dd>
+            <dt>Open issue</dt><dd>partial return deferred</dd>
+          </dl>
+        </aside>
+      </div>
+
+      <section class="section" id="summary" aria-labelledby="summary-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">01 / approval summary</span>
+            <h2 id="summary-title">先批准六个核心判断</h2>
+          </div>
+          <p>这六条不是未来规划，而是当前实现的结构性事实。技术审批的重点，是确认这些语义足够小、足够稳，能作为后续能力的底座。</p>
+        </div>
+
+        <div class="grid">
+          <article class="card accent-cyan span-4">
+            <span class="eyebrow">Authority</span>
+            <h3>Agent 自主产生 Action</h3>
+            <p>调用方只提交用户输入；父模型决定直接回答，还是通过私有 <code>start_action</code> 创建一个或多个 Action。不存在公开的“提交 Action”入口。</p>
+          </article>
+          <article class="card accent-blue span-4">
+            <span class="eyebrow">Isolation</span>
+            <h3>每个 Action 拥有独立上下文</h3>
+            <p>兄弟 Action 不共享内部 Turn，也不会读取彼此的中间工具结果。它们只在整个批次结算后，各自以一个终态结果回到父 Agent。</p>
+          </article>
+          <article class="card accent-violet span-4">
+            <span class="eyebrow">Atomic unit</span>
+            <h3>Turn 包含完整工具批次</h3>
+            <p>一个 Turn 是一次 Action 模型响应，加上该响应产生的全部工具调用及其结果。批次未完全结算，Action 不会进入下一 Turn。</p>
+          </article>
+          <article class="card accent-teal span-4">
+            <span class="eyebrow">Concurrency</span>
+            <h3>工具并发，模型串行</h3>
+            <p>同一 Turn 的工具并发；不同 Action 的工具也能重叠运行。整个 Agent 同一时刻最多只有一个模型请求在飞。</p>
+          </article>
+          <article class="card accent-amber span-4">
+            <span class="eyebrow">Barrier</span>
+            <h3>父 Agent 等待整批 Action</h3>
+            <p>一个快 Action 可以先完成，但父循环只有在本轮所有 Action 都完成或失败后，才获得整批结果并作下一次决策。</p>
+          </article>
+          <article class="card accent-red span-4">
+            <span class="eyebrow">Settlement</span>
+            <h3>公开 trace 永远已结算</h3>
+            <p><code>AgentReply::actions()</code> 中不会出现 pending 工具。成功、失败、超限、截断都先落成确定状态，再跨越公开边界。</p>
+          </article>
+        </div>
+
+        <div class="callout success" style="margin-top: 14px;">
+          <strong>审批建议：</strong>
+          批准当前“双层循环 + 中央调度器 + 整批屏障”作为 v1。它保持了 Action 的语义完整性，也已经解决“长工具阻塞所有其他 Action”的问题。
+          如果未来要求父 Agent 消费部分结果，应单独设计事件、历史和取消协议，而不是在现有循环上加一个布尔开关。
+        </div>
+      </section>
+
+      <section class="section" id="boundary" aria-labelledby="boundary-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">02 / system boundary</span>
+            <h2 id="boundary-title">每个 crate 只承担一个边界</h2>
+          </div>
+          <p><code>bone-agent</code> 是编排者，不重新实现模型协议，也不拥有具体工具。复杂度沿稳定接口向外收敛。</p>
+        </div>
+
+        <div class="diagram" tabindex="0" role="region" aria-labelledby="crate-diagram-heading">
+          <div class="diagram-title">
+            <h3 id="crate-diagram-heading">Agent 运行截面的 crate 关系</h3>
+            <span>solid: composition/call · dashed: interface/dependency</span>
+          </div>
+          <svg viewBox="0 0 1180 500" role="img" aria-labelledby="crate-svg-title crate-svg-desc">
+            <title id="crate-svg-title">BONE crate 依赖和注入关系</title>
+            <desc id="crate-svg-desc">bone-cli 是组合根，选择 bone-llm 模型，构造 bone-tools 环境并注入 bone-agent。bone-agent 通过 bone-llm 请求模型。bone-tools 实现 bone-agent Tool 接口并使用 bone-llm 协议值。</desc>
+            <defs>
+              <marker id="arrow-crate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--cyan)"></path>
+              </marker>
+              <marker id="arrow-crate-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--teal)"></path>
+              </marker>
+            </defs>
+
+            <rect class="svg-box" x="420" y="25" width="340" height="105" rx="10"></rect>
+            <text class="svg-mono" x="590" y="59" text-anchor="middle">bone-cli</text>
+            <text class="svg-text" x="590" y="84" text-anchor="middle">产品组合根 + 用户交互</text>
+            <text class="svg-small" x="590" y="109" text-anchor="middle">选择 Model、构造工具、调用 Agent</text>
+
+            <rect class="svg-box controller" x="80" y="220" width="350" height="112" rx="10"></rect>
+            <text class="svg-mono" x="255" y="254" text-anchor="middle">bone-agent</text>
+            <text class="svg-text" x="255" y="280" text-anchor="middle">编排与生命周期 owner</text>
+            <text class="svg-small" x="255" y="307" text-anchor="middle">Agent · Action · Turn · Scheduler · Trace</text>
+
+            <rect class="svg-box tool" x="750" y="220" width="350" height="112" rx="10"></rect>
+            <text class="svg-mono" x="925" y="254" text-anchor="middle">bone-tools</text>
+            <text class="svg-text" x="925" y="280" text-anchor="middle">具体能力实现</text>
+            <text class="svg-small" x="925" y="307" text-anchor="middle">read · glob · grep · bash · patch · config</text>
+
+            <rect class="svg-box action" x="415" y="385" width="350" height="92" rx="10"></rect>
+            <text class="svg-mono" x="590" y="419" text-anchor="middle">bone-llm</text>
+            <text class="svg-text" x="590" y="445" text-anchor="middle">统一模型与 Provider 协议边界</text>
+
+            <path class="svg-line cyan" d="M500 130 L310 220" marker-end="url(#arrow-crate)"></path>
+            <rect class="svg-label-bg" x="328" y="155" width="126" height="27" rx="5"></rect>
+            <text class="svg-small" x="391" y="174" text-anchor="middle">构造 + chat</text>
+
+            <path class="svg-line cyan" d="M680 130 L870 220" marker-end="url(#arrow-crate)"></path>
+            <rect class="svg-label-bg" x="725" y="155" width="130" height="27" rx="5"></rect>
+            <text class="svg-small" x="790" y="174" text-anchor="middle">构造环境</text>
+
+            <path class="svg-line teal svg-dash" d="M750 276 H430" marker-end="url(#arrow-crate-teal)"></path>
+            <rect class="svg-label-bg" x="515" y="260" width="150" height="31" rx="5"></rect>
+            <text class="svg-small" x="590" y="281" text-anchor="middle">implements Tool</text>
+
+            <path class="svg-line cyan" d="M315 332 L480 385" marker-end="url(#arrow-crate)"></path>
+            <rect class="svg-label-bg" x="333" y="342" width="140" height="27" rx="5"></rect>
+            <text class="svg-small" x="403" y="361" text-anchor="middle">Model::complete</text>
+
+            <path class="svg-line teal svg-dash" d="M865 332 L700 385" marker-end="url(#arrow-crate-teal)"></path>
+            <rect class="svg-label-bg" x="705" y="342" width="154" height="27" rx="5"></rect>
+            <text class="svg-small" x="782" y="361" text-anchor="middle">protocol values</text>
+
+          </svg>
+          <p class="footnote" style="margin: 10px 0 0;">这里只展示 Agent 运行截面；<code>bone-config</code> 等 workspace 依赖不在本图范围内。实线表示组合/运行时调用，虚线表示接口实现或协议依赖。</p>
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <article class="card span-7">
+            <span class="eyebrow">Capability visibility</span>
+            <h3>父模型与 Action 模型看到不同工具面</h3>
+            <div class="diagram" tabindex="0" style="margin-top: 14px; box-shadow: none;">
+              <svg viewBox="0 0 940 290" role="img" aria-labelledby="capability-title capability-desc">
+                <title id="capability-title">父模型与 Action 模型的工具可见性</title>
+                <desc id="capability-desc">父模型只能调用私有 start_action。Action 模型只能看到应用注册的业务工具。</desc>
+                <defs>
+                  <marker id="arrow-boundary" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                    <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--cyan)"></path>
+                  </marker>
+                  <marker id="arrow-boundary-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                    <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--teal)"></path>
+                  </marker>
+                </defs>
+                <rect class="svg-box controller" x="35" y="35" width="240" height="92" rx="10"></rect>
+                <text class="svg-text" x="155" y="70" text-anchor="middle">父 Agent 模型</text>
+                <text class="svg-small" x="155" y="96" text-anchor="middle">决定回答或委派</text>
+
+                <rect class="svg-box warning" x="350" y="35" width="240" height="92" rx="10"></rect>
+                <text class="svg-mono" x="470" y="70" text-anchor="middle">start_action(intent)</text>
+                <text class="svg-small" x="470" y="96" text-anchor="middle">bone-agent 私有控制命令</text>
+
+                <rect class="svg-box action" x="665" y="35" width="240" height="92" rx="10"></rect>
+                <text class="svg-text" x="785" y="70" text-anchor="middle">Action 模型</text>
+                <text class="svg-small" x="785" y="96" text-anchor="middle">完成单一语义任务</text>
+
+                <path class="svg-line cyan" d="M275 81 H350" marker-end="url(#arrow-boundary)"></path>
+                <path class="svg-line cyan" d="M590 81 H665" marker-end="url(#arrow-boundary)"></path>
+
+                <rect class="svg-box tool" x="350" y="185" width="240" height="70" rx="10"></rect>
+                <text class="svg-text" x="470" y="215" text-anchor="middle">注册业务工具</text>
+                <text class="svg-small" x="470" y="238" text-anchor="middle">read · glob · grep · …</text>
+                <path class="svg-line teal" d="M785 127 V220 H590" marker-end="url(#arrow-boundary-teal)"></path>
+                <text class="svg-small" x="785" y="166" text-anchor="middle">真实工具只注入这里</text>
+
+                <path class="svg-line amber svg-dash" d="M155 127 V220 H350"></path>
+                <text class="svg-small" x="155" y="166" text-anchor="middle">不可见 / 不可直接调用</text>
+              </svg>
+            </div>
+          </article>
+
+          <article class="card accent-amber span-5">
+            <span class="eyebrow">Reserved namespace</span>
+            <h3><code>start_action</code> 不是业务工具</h3>
+            <p>它只是父模型向运行时表达“创建 Action”意图的控制协议。注册同名业务工具会被拒绝，避免控制面和能力面产生两种解释。</p>
+            <ul class="plain-list" style="margin-top: 14px;">
+              <li>不会出现在 Action 的工具列表中</li>
+              <li>不会成为 Action 的一条 ToolExecution</li>
+              <li>调用参数只承载 Action intent</li>
+              <li>非法控制调用被转成安全 ToolOutput</li>
+            </ul>
+          </article>
+
+          <div class="span-12">
+            <details>
+              <summary>源码责任地图</summary>
+              <div class="details-body">
+                <dl class="file-map">
+                  <dt><a class="source-link" href="../crates/bone-agent/src/agent.rs">agent.rs</a></dt>
+                  <dd><code>Agent</code> 公共入口、父决策循环、控制调用解析、Action 结果回灌。</dd>
+                  <dt><a class="source-link" href="../crates/bone-agent/src/runtime.rs">runtime.rs</a></dt>
+                  <dd>中央 Action 驱动器、ready/running 调度、模型超时、工具批次并发和结算。</dd>
+                  <dt><a class="source-link" href="../crates/bone-agent/src/action.rs">action.rs</a></dt>
+                  <dd><code>Action</code>、<code>Turn</code>、<code>ToolExecution</code> 的数据结构与只读查询。</dd>
+                  <dt><a class="source-link" href="../crates/bone-agent/src/tools.rs">tools.rs</a></dt>
+                  <dd>面向用户的 <code>Tool</code> 接口、ToolFailure / ToolOutcome、类型擦除注册表，以及 <code>start_action</code> 保留名称的注册保护。</dd>
+                  <dt><a class="source-link" href="../crates/bone-llm/src/lib.rs">bone-llm</a></dt>
+                  <dd>Provider 无关的模型、消息和工具协议；<code>bone-agent</code> 不感知 Rig 细节。</dd>
+                </dl>
+              </div>
+            </details>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="controller-loop" aria-labelledby="controller-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">03 / parent controller</span>
+            <h2 id="controller-title">Agent Loop：决定回答，还是创建工作</h2>
+          </div>
+          <p>父循环是用户会话的唯一控制者。它不执行真实工具，只把清晰的 intent 变成隔离 Action，并消费其终态结果。</p>
+        </div>
+
+        <div class="diagram" tabindex="0" role="region" aria-labelledby="controller-diagram-heading">
+          <div class="diagram-title">
+            <h3 id="controller-diagram-heading">一次 <code>Agent::chat</code> 的控制流</h3>
+            <span>max 32 decisions</span>
+          </div>
+          <svg viewBox="0 0 1180 660" role="img" aria-labelledby="controller-svg-title controller-svg-desc">
+            <title id="controller-svg-title">Agent 父决策循环</title>
+            <desc id="controller-svg-desc">用户输入进入工作历史，父模型选择最终回答或创建 Action。Action 整批完成后结果写回工作历史，再进行下一次决策。只有最终回答会提交历史。</desc>
+            <defs>
+              <marker id="arrow-controller" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--cyan)"></path>
+              </marker>
+              <marker id="arrow-controller-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--teal)"></path>
+              </marker>
+              <marker id="arrow-controller-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--amber)"></path>
+              </marker>
+            </defs>
+
+            <rect class="svg-box controller" x="40" y="55" width="205" height="84" rx="10"></rect>
+            <text class="svg-text" x="142" y="88" text-anchor="middle">Agent::chat(input)</text>
+            <text class="svg-small" x="142" y="113" text-anchor="middle">clone 已提交历史</text>
+
+            <rect class="svg-box" x="315" y="55" width="220" height="84" rx="10"></rect>
+            <text class="svg-text" x="425" y="88" text-anchor="middle">工作历史</text>
+            <text class="svg-small" x="425" y="113" text-anchor="middle">append 用户输入</text>
+
+            <rect class="svg-box controller" x="605" y="55" width="245" height="84" rx="10"></rect>
+            <text class="svg-text" x="727" y="87" text-anchor="middle">父模型决策</text>
+            <text class="svg-small" x="727" y="112" text-anchor="middle">tools = [start_action]</text>
+
+            <path class="svg-line cyan" d="M245 97 H315" marker-end="url(#arrow-controller)"></path>
+            <path class="svg-line cyan" d="M535 97 H605" marker-end="url(#arrow-controller)"></path>
+
+            <polygon class="svg-box warning" points="1000,47 1110,97 1000,147 890,97"></polygon>
+            <text class="svg-text" x="1000" y="91" text-anchor="middle">有 tool call？</text>
+            <text class="svg-small" x="1000" y="115" text-anchor="middle">calls 优先于 text</text>
+            <path class="svg-line cyan" d="M850 97 H890" marker-end="url(#arrow-controller)"></path>
+
+            <rect class="svg-box action" x="795" y="245" width="285" height="96" rx="10"></rect>
+            <text class="svg-text" x="937" y="279" text-anchor="middle">解析并创建 Action 批次</text>
+            <text class="svg-small" x="937" y="304" text-anchor="middle">0…8 accepted + rejected calls</text>
+            <text class="svg-small" x="937" y="326" text-anchor="middle">context 取自创建响应之前</text>
+            <path class="svg-line cyan" d="M1000 147 V245" marker-end="url(#arrow-controller)"></path>
+            <text class="svg-mono" x="1015" y="195">yes</text>
+
+            <rect class="svg-box action" x="795" y="405" width="285" height="92" rx="10"></rect>
+            <text class="svg-text" x="937" y="438" text-anchor="middle">drive(actions)</text>
+            <text class="svg-small" x="937" y="463" text-anchor="middle">等待整批 Action 进入终态</text>
+            <text class="svg-small" x="937" y="484" text-anchor="middle">内部工具仍可并发推进</text>
+            <path class="svg-line cyan" d="M937 341 V405" marker-end="url(#arrow-controller)"></path>
+
+            <rect class="svg-box tool" x="390" y="405" width="300" height="92" rx="10"></rect>
+            <text class="svg-text" x="540" y="438" text-anchor="middle">Action 结果 → ToolOutput</text>
+            <text class="svg-small" x="540" y="463" text-anchor="middle">completed / failed JSON</text>
+            <text class="svg-small" x="540" y="484" text-anchor="middle">保持原控制调用顺序</text>
+            <path class="svg-line teal" d="M795 451 H690" marker-end="url(#arrow-controller-teal)"></path>
+
+            <rect class="svg-box" x="40" y="405" width="250" height="92" rx="10"></rect>
+            <text class="svg-text" x="165" y="438" text-anchor="middle">写回工作历史</text>
+            <text class="svg-small" x="165" y="463" text-anchor="middle">response + tool results</text>
+            <text class="svg-small" x="165" y="484" text-anchor="middle">进入下一次父决策</text>
+            <path class="svg-line teal" d="M390 451 H290" marker-end="url(#arrow-controller-teal)"></path>
+            <path class="svg-line cyan" d="M165 405 V190 H727 V139" marker-end="url(#arrow-controller)"></path>
+
+            <rect class="svg-box tool" x="875" y="565" width="250" height="66" rx="10"></rect>
+            <text class="svg-text" x="1000" y="592" text-anchor="middle">最终文本</text>
+            <text class="svg-small" x="1000" y="615" text-anchor="middle">commit history + AgentReply</text>
+            <path class="svg-line teal" d="M1110 97 H1150 V598 H1125" marker-end="url(#arrow-controller-teal)"></path>
+            <text class="svg-mono" x="1118" y="86">no</text>
+
+            <rect class="svg-box failure" x="395" y="565" width="295" height="66" rx="10"></rect>
+            <text class="svg-text" x="542" y="592" text-anchor="middle">AgentError</text>
+            <text class="svg-small" x="542" y="615" text-anchor="middle">不提交工作历史</text>
+            <path class="svg-line amber svg-dash" d="M727 139 V598 H690" marker-end="url(#arrow-controller-amber)"></path>
+          </svg>
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <article class="card span-6">
+            <span class="eyebrow">Pseudo code</span>
+            <h3>父循环的最小形状</h3>
+            <div class="code-panel" style="margin-top: 13px;">
+              <div class="code-head"><span>conceptual Rust</span><span>agent.rs</span></div>
+              <pre><code><span class="kw">async fn</span> <span class="fn">chat</span>(&amp;<span class="kw">mut</span> self, user_input) {
+  <span class="kw">let mut</span> working = self.history.clone();
+  working.push_user(user_input);
+  <span class="kw">let mut</span> completed_actions = Vec::new();
+
+  <span class="kw">for</span> _ <span class="kw">in</span> 0..MAX_DECISIONS {
+    <span class="kw">let</span> response = parent_model(&amp;working.input).await?;
+    validate_response(&amp;response)?;
+    <span class="kw">let</span> calls = response.tool_calls().collect();
+
+    <span class="kw">if</span> calls.is_empty() {
+      <span class="kw">let</span> text = require_text(&amp;response)?;
+      working.push_response(&amp;response);
+      <span class="kw">let</span> reply = AgentReply { text, actions: completed_actions };
+      self.history = working;       <span class="cm">// 唯一提交点</span>
+      <span class="kw">return</span> Ok(reply);
+    }
+
+    ensure(calls.len() &lt;= MAX_ACTIONS_PER_DECISION)?;
+
+    <span class="cm">// 先按旧 action_context 创建 Action / rejection；</span>
+    <span class="cm">// 当前 parent response 此时还不在 context 中。</span>
+    <span class="kw">let</span> starts = parse_calls(&amp;calls, &amp;working.action_context);
+    working.push_response(&amp;response);
+
+    <span class="kw">let</span> actions = drive(accepted_actions(&amp;starts)).await;
+    <span class="kw">for</span> start <span class="kw">in</span> starts_in_original_order {
+      working.push_tool_result(
+          start.call, accepted_result_or_rejection(start, &amp;actions));
+    }
+    completed_actions.extend(actions);
+  }
+
+  Err(DecisionLimit)
+}</code></pre>
+            </div>
+          </article>
+
+          <article class="card accent-cyan span-6">
+            <span class="eyebrow">Important semantics</span>
+            <h3>四个容易忽略的控制规则</h3>
+            <ul class="decision-list" style="margin-top: 15px;">
+              <li><span><strong>调用优先：</strong>响应同时含文本和 <code>start_action</code> 时，文本不是最终回复；进入 Action 分支。</span></li>
+              <li><span><strong>快照先于创建响应：</strong>新 Action 继承创建它之前的 <code>action_context</code>，不会把自己的创建指令重复塞入上下文。</span></li>
+              <li><span><strong>拒绝可恢复：</strong>错误工具名、畸形参数或空 intent 不创建 Action，而是以控制工具结果反馈给下一次父决策。</span></li>
+              <li><span><strong>错误是事务边界：</strong>父模型失败、超时、不完整或超限时，当前 <code>chat</code> 的工作历史整体丢弃。</span></li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="action-loop" aria-labelledby="action-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">04 / action scheduler</span>
+            <h2 id="action-title">Action Loop：一个中央调度器推进全部 Action</h2>
+          </div>
+          <p>当前实现没有“一 Action 一任务/Actor”。一个 <code>drive()</code> 持有 ready 队列和 running 工具集合，以最少的显式状态让 ready Action 依次、交错推进。</p>
+        </div>
+
+        <div class="callout">
+          <strong>准确抽象：</strong>
+          <code>ready: VecDeque&lt;ActionId&gt;</code> 表示可以请求下一次模型决策的 Action；
+          <code>running: FuturesUnordered&lt;FinishedTool&gt;</code> 表示所有正在执行的工具。
+          Action 本身只是数据，调度权集中在一个循环里。
+        </div>
+
+        <div class="diagram" tabindex="0" role="region" aria-labelledby="action-diagram-heading" style="margin-top: 14px;">
+          <div class="diagram-title">
+            <h3 id="action-diagram-heading"><code>runtime::drive()</code></h3>
+            <span>serial model / concurrent tools</span>
+          </div>
+          <svg viewBox="0 0 1180 720" role="img" aria-labelledby="action-svg-title action-svg-desc">
+            <title id="action-svg-title">Action 中央调度循环</title>
+            <desc id="action-svg-desc">ready 队列中的 Action 依次请求模型。若产生工具调用，整批工具加入 running 并发集合；只有全部完成后该 Action 才回到 ready 队列。最终文本或错误使 Action 终止。</desc>
+            <defs>
+              <marker id="arrow-action" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--cyan)"></path>
+              </marker>
+              <marker id="arrow-action-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--teal)"></path>
+              </marker>
+              <marker id="arrow-action-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--amber)"></path>
+              </marker>
+            </defs>
+
+            <rect class="svg-box action" x="40" y="55" width="245" height="96" rx="10"></rect>
+            <text class="svg-text" x="162" y="87" text-anchor="middle">ready 队列</text>
+            <text class="svg-mono" x="162" y="112" text-anchor="middle">[A, B, C, …]</text>
+            <text class="svg-small" x="162" y="135" text-anchor="middle">pop_front()</text>
+
+            <rect class="svg-box controller" x="370" y="55" width="250" height="96" rx="10"></rect>
+            <text class="svg-text" x="495" y="87" text-anchor="middle">Action 模型请求</text>
+            <text class="svg-small" x="495" y="112" text-anchor="middle">整个 Agent 最多 1 个在飞</text>
+            <text class="svg-small" x="495" y="135" text-anchor="middle">timeout = 120s default</text>
+            <path class="svg-line cyan" d="M285 103 H370" marker-end="url(#arrow-action)"></path>
+
+            <rect class="svg-box tool" x="705" y="55" width="285" height="96" rx="10"></rect>
+            <text class="svg-text" x="847" y="87" text-anchor="middle">等待模型期间 select!</text>
+            <text class="svg-small" x="847" y="112" text-anchor="middle">model response OR finished tool</text>
+            <text class="svg-small" x="847" y="135" text-anchor="middle">持续结算已运行工具</text>
+            <path class="svg-line cyan" d="M620 103 H705" marker-end="url(#arrow-action)"></path>
+
+            <rect class="svg-box tool" x="1005" y="205" width="145" height="82" rx="10"></rect>
+            <text class="svg-text" x="1077" y="237" text-anchor="middle">settle_tool</text>
+            <text class="svg-small" x="1077" y="262" text-anchor="middle">继续等当前模型</text>
+            <path class="svg-line teal" d="M990 82 H1077 V205" marker-end="url(#arrow-action-teal)"></path>
+            <text class="svg-mono" x="1091" y="164">tool</text>
+            <path class="svg-line teal svg-dash" d="M1150 246 H1165 V122 H990" marker-end="url(#arrow-action-teal)"></path>
+
+            <polygon class="svg-box warning" points="847,215 977,275 847,335 717,275"></polygon>
+            <text class="svg-text" x="847" y="268" text-anchor="middle">模型响应类型</text>
+            <text class="svg-small" x="847" y="292" text-anchor="middle">terminal / calls / invalid</text>
+            <path class="svg-line cyan" d="M847 151 V215" marker-end="url(#arrow-action)"></path>
+            <text class="svg-mono" x="862" y="187">model</text>
+
+            <rect class="svg-box tool" x="390" y="245" width="235" height="84" rx="10"></rect>
+            <text class="svg-text" x="507" y="277" text-anchor="middle">最终文本</text>
+            <text class="svg-small" x="507" y="302" text-anchor="middle">Action = Completed</text>
+            <path class="svg-line teal" d="M717 275 H625" marker-end="url(#arrow-action-teal)"></path>
+            <text class="svg-mono" x="660" y="263">text</text>
+
+            <rect class="svg-box failure" x="40" y="245" width="260" height="84" rx="10"></rect>
+            <text class="svg-text" x="170" y="277" text-anchor="middle">错误 / 空响应 / 超限</text>
+            <text class="svg-small" x="170" y="302" text-anchor="middle">Action = Failed</text>
+            <path class="svg-line amber" d="M717 305 H665 V390 H170 V329" marker-end="url(#arrow-action-amber)"></path>
+            <text class="svg-mono" x="573" y="380">invalid / error</text>
+
+            <rect class="svg-box action" x="720" y="405" width="255" height="92" rx="10"></rect>
+            <text class="svg-text" x="847" y="438" text-anchor="middle">创建 Turn</text>
+            <text class="svg-small" x="847" y="463" text-anchor="middle">记录 response + N calls</text>
+            <text class="svg-small" x="847" y="484" text-anchor="middle">N ≤ 16 default</text>
+            <path class="svg-line cyan" d="M847 335 V405" marker-end="url(#arrow-action)"></path>
+            <text class="svg-mono" x="862" y="377">calls</text>
+
+            <rect class="svg-box tool" x="350" y="405" width="270" height="92" rx="10"></rect>
+            <text class="svg-text" x="485" y="438" text-anchor="middle">running 工具集合</text>
+            <text class="svg-small" x="485" y="463" text-anchor="middle">一次性 start 整个批次</text>
+            <text class="svg-small" x="485" y="484" text-anchor="middle">不同 Action 的工具批次可重叠</text>
+            <path class="svg-line teal" d="M720 451 H620" marker-end="url(#arrow-action-teal)"></path>
+
+            <rect class="svg-box warning" x="350" y="565" width="270" height="100" rx="10"></rect>
+            <text class="svg-text" x="485" y="598" text-anchor="middle">本 Turn 全部 settled？</text>
+            <text class="svg-small" x="485" y="624" text-anchor="middle">success / failure 都算结算</text>
+            <text class="svg-small" x="485" y="648" text-anchor="middle">未齐：继续留在 running</text>
+            <path class="svg-line teal" d="M485 497 V565" marker-end="url(#arrow-action-teal)"></path>
+
+            <path class="svg-line cyan" d="M350 615 H162 V151" marker-end="url(#arrow-action)"></path>
+            <text class="svg-mono" x="212" y="603">yes → push_back(Action)</text>
+
+            <rect class="svg-box" x="775" y="565" width="270" height="100" rx="10"></rect>
+            <text class="svg-text" x="910" y="598" text-anchor="middle">批次结果成为下一轮输入</text>
+            <text class="svg-small" x="910" y="624" text-anchor="middle">严格保持原 ToolCall 身份/顺序</text>
+            <text class="svg-small" x="910" y="648" text-anchor="middle">Action 可观察失败并恢复</text>
+            <path class="svg-line teal svg-dash" d="M620 615 H775" marker-end="url(#arrow-action-teal)"></path>
+          </svg>
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <article class="card accent-teal span-4">
+            <span class="metric">N tools</span>
+            <h3>一个 Turn 内同时启动</h3>
+            <p>模型一次返回的有效工具调用全部立即进入 <code>FuturesUnordered</code>；返回顺序不影响 trace 的原始索引。</p>
+          </article>
+          <article class="card accent-blue span-4">
+            <span class="metric">1 model</span>
+            <h3>Agent 级串行请求</h3>
+            <p>调度器不会同时请求两个 Action 模型。这压低 Provider 并发和历史竞态，但慢模型会推迟其他 Action 的下一次模型决策。</p>
+          </article>
+          <article class="card accent-amber span-4">
+            <span class="metric">100% batch</span>
+            <h3>Turn 级完整屏障</h3>
+            <p>即使某个工具先失败或先成功，也必须等同 Turn 其他工具全部结算，才把完整观察交给下一次模型请求。</p>
+          </article>
+        </div>
+
+        <details open style="margin-top: 14px;">
+          <summary>响应分支的精确行为</summary>
+          <div class="details-body">
+            <div class="table-wrap" tabindex="0">
+              <table>
+                <caption class="sr-only">Action 模型响应的分类与精确运行时行为</caption>
+                <thead>
+                  <tr><th scope="col">模型响应</th><th scope="col">是否记录 Turn</th><th scope="col">是否执行工具</th><th scope="col">Action 结果</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>模型错误 / 120s 超时</td><td>否</td><td>否</td><td><span class="status fail">Failed</span> Model / ModelTimeout</td></tr>
+                  <tr><td>空 items</td><td>是</td><td>否</td><td><span class="status fail">Failed</span> Incomplete</td></tr>
+                  <tr><td>截断响应，含或不含 calls</td><td>是；calls 标记 Skipped</td><td><strong>绝不执行</strong></td><td><span class="status fail">Failed</span> Incomplete</td></tr>
+                  <tr><td>calls 超过每 Turn 限制</td><td>是；全部标记 Skipped</td><td><strong>绝不执行</strong></td><td><span class="status fail">Failed</span> ToolCallLimit</td></tr>
+                  <tr><td>无 calls 且有文本</td><td>是</td><td>否</td><td><span class="status ok">Completed</span> 文本成为 Action output</td></tr>
+                  <tr><td>1…N 个有效 calls</td><td>立即记录</td><td>整批并发</td><td><span class="status info">Waiting</span> 全部结算后再推进</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="footnote"><strong>关键：</strong>Skipped 只保留在公开 trace 中，随后 Action 立即失败；不存在“下一次 Action 模型读取 skipped 原因”的回合。</p>
+          </div>
+        </details>
+      </section>
+
+      <section class="section" id="timeline" aria-labelledby="timeline-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">05 / concurrency timeline</span>
+            <h2 id="timeline-title">长工具不会冻结其他 Action，但父批次仍有屏障</h2>
+          </div>
+          <p>这是当前并发语义最重要的例子：Action A 跑一个很长的测试，Action B 仍能继续读文件、形成结论并完成。</p>
+        </div>
+
+        <div class="diagram" tabindex="0" role="region" aria-labelledby="timeline-diagram-heading" aria-describedby="timeline-a11y">
+          <div class="diagram-title">
+            <h3 id="timeline-diagram-heading">示例：A 运行长测试，B 快速检查配置</h3>
+            <span>time →</span>
+          </div>
+          <p class="sr-only" id="timeline-a11y">父 Agent 先创建 Action A 和 B，然后等待整个批次。A 的第一 Turn 启动长时间测试。A 等待时，B 完成模型 Turn、read 工具和第二 Turn，先进入终态。A 的测试稍后完成，A 再进行第二 Turn 并进入终态。只有 A 和 B 都完成后，父 Agent 才开始下一次决策并回复用户。两个模型请求不重叠，但不同 Action 的工具可以重叠。</p>
+          <div class="timeline" aria-hidden="true">
+            <span class="tick" style="grid-column: 1; grid-row: 1;"></span>
+            <span class="tick" style="grid-column: 2; grid-row: 1;">t0</span>
+            <span class="tick" style="grid-column: 3; grid-row: 1;">t1</span>
+            <span class="tick" style="grid-column: 4; grid-row: 1;">t2</span>
+            <span class="tick" style="grid-column: 5; grid-row: 1;">t3</span>
+            <span class="tick" style="grid-column: 6; grid-row: 1;">t4</span>
+            <span class="tick" style="grid-column: 7; grid-row: 1;">t5</span>
+            <span class="tick" style="grid-column: 8; grid-row: 1;">t6</span>
+            <span class="tick" style="grid-column: 9; grid-row: 1;">t7</span>
+            <span class="tick" style="grid-column: 10; grid-row: 1;">t8</span>
+            <span class="tick" style="grid-column: 11; grid-row: 1;">t9</span>
+            <span class="tick" style="grid-column: 12; grid-row: 1;">t10</span>
+
+            <span class="lane-label" style="grid-column: 1; grid-row: 2;">父 Agent</span>
+            <span class="segment parent" style="grid-column: 2 / span 2; grid-row: 2;">创建 A + B</span>
+            <span class="segment wait" style="grid-column: 4 / span 7; grid-row: 2;">等待整个 Action 批次</span>
+            <span class="segment parent" style="grid-column: 11; grid-row: 2;">再决策</span>
+            <span class="segment done" style="grid-column: 12; grid-row: 2;">回复用户</span>
+
+            <span class="lane-label" style="grid-column: 1; grid-row: 3;">Action A</span>
+            <span class="segment model" style="grid-column: 3; grid-row: 3;">模型 Turn 1</span>
+            <span class="segment tool" style="grid-column: 4 / span 5; grid-row: 3;">run_tests · 长时间执行</span>
+            <span class="segment model" style="grid-column: 9; grid-row: 3;">模型 Turn 2</span>
+            <span class="segment done" style="grid-column: 10; grid-row: 3;">完成</span>
+
+            <span class="lane-label" style="grid-column: 1; grid-row: 4;">Action B</span>
+            <span class="segment model" style="grid-column: 4; grid-row: 4;">模型 Turn 1</span>
+            <span class="segment tool" style="grid-column: 5; grid-row: 4;">read</span>
+            <span class="segment model" style="grid-column: 6; grid-row: 4;">模型 Turn 2</span>
+            <span class="segment done" style="grid-column: 7; grid-row: 4;">已完成</span>
+
+            <span class="lane-label" style="grid-column: 1; grid-row: 5;">Scheduler</span>
+            <span class="segment" style="grid-column: 3; grid-row: 5;">pop A</span>
+            <span class="segment" style="grid-column: 4; grid-row: 5;">pop B</span>
+            <span class="segment" style="grid-column: 5 / span 4; grid-row: 5;">settle B；同时轮询 A</span>
+            <span class="segment" style="grid-column: 9; grid-row: 5;">A → ready</span>
+          </div>
+          <p class="footnote" style="margin: 14px 0 0;">示意图表达顺序与屏障，不按真实耗时比例绘制。模型调用不与另一模型调用重叠；工具调用可跨 Action 重叠。</p>
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <article class="card accent-teal span-4">
+            <span class="eyebrow">Non-blocking guarantee</span>
+            <h3>A 的工具等待不占用推进权</h3>
+            <p>A 启动工具后离开 ready 队列。调度器继续 pop B；B 可以经历多个 Turn 并先终止。</p>
+          </article>
+          <article class="card accent-amber span-4">
+            <span class="eyebrow">Parent barrier</span>
+            <h3>B 完成不等于父 Agent 可见</h3>
+            <p>父循环等待 <code>drive()</code> 返回整批 Action。B 的结果会保留，但必须等 A 也进入终态才整体回灌。</p>
+          </article>
+          <article class="card accent-blue span-4">
+            <span class="eyebrow">Model caveat</span>
+            <h3>慢模型仍会短暂阻塞调度</h3>
+            <p>请求 A 的模型期间，会继续结算已运行工具，却不会启动 B 的模型请求。最坏受单次模型超时 120 秒约束。</p>
+          </article>
+        </div>
+
+        <div class="callout warning" style="margin-top: 14px;">
+          <strong>精确回答“长测试会不会 hung”：</strong>
+          默认 900 秒后该工具变为 <code>ToolFailureKind::Timeout</code>；完整批次结算且仍有 Turn budget 时，其 Action 可以在下一 Turn 尝试恢复；
+          其他 Action 在这期间可继续推进。当前没有“把仍运行的 Action 放到后台并提前返回父 Agent”的语义。
+        </div>
+      </section>
+
+      <section class="section" id="state" aria-labelledby="state-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">06 / data &amp; state</span>
+            <h2 id="state-title">状态不是新抽象，而是数据结构自然导出的事实</h2>
+          </div>
+          <p>实现刻意没有 <code>ActionState</code> 枚举、Actor mailbox 或任务句柄。已有字段已经足够判定“可推进、等待中、已终止”。</p>
+        </div>
+
+        <div class="diagram" tabindex="0" role="region" aria-labelledby="state-diagram-heading">
+          <div class="diagram-title">
+            <h3 id="state-diagram-heading">概念状态机</h3>
+            <span>derived, not stored</span>
+          </div>
+          <svg viewBox="0 0 1160 390" role="img" aria-labelledby="state-svg-title state-svg-desc">
+            <title id="state-svg-title">Action 的派生状态与分支</title>
+            <desc id="state-svg-desc">Ready Action 进入 Deciding。最终文本或模型错误直接进入 Terminal；工具调用进入 Waiting，完整批次结算后回到 Ready，再次 Deciding。若进入 Ready 时已达到 Turn limit，也直接进入 Terminal。</desc>
+            <defs>
+              <marker id="arrow-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--cyan)"></path>
+              </marker>
+              <marker id="arrow-state-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--amber)"></path>
+              </marker>
+              <marker id="arrow-state-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--teal)"></path>
+              </marker>
+            </defs>
+
+            <rect class="svg-box action" x="40" y="100" width="220" height="88" rx="10"></rect>
+            <text class="svg-text" x="150" y="134" text-anchor="middle">Ready</text>
+            <text class="svg-small" x="150" y="160" text-anchor="middle">在 ready queue</text>
+
+            <rect class="svg-box controller" x="365" y="100" width="230" height="88" rx="10"></rect>
+            <text class="svg-text" x="480" y="134" text-anchor="middle">Deciding</text>
+            <text class="svg-small" x="480" y="160" text-anchor="middle">当前 Action 模型请求</text>
+
+            <rect class="svg-box tool" x="365" y="270" width="230" height="88" rx="10"></rect>
+            <text class="svg-text" x="480" y="304" text-anchor="middle">Waiting</text>
+            <text class="svg-small" x="480" y="330" text-anchor="middle">存在 pending ToolExecution</text>
+
+            <rect class="svg-box action" x="690" y="270" width="230" height="88" rx="10"></rect>
+            <text class="svg-text" x="805" y="304" text-anchor="middle">Ready again</text>
+            <text class="svg-small" x="805" y="330" text-anchor="middle">整批 outcomes 已写入</text>
+
+            <rect class="svg-box warning" x="900" y="100" width="220" height="88" rx="10"></rect>
+            <text class="svg-text" x="1010" y="134" text-anchor="middle">Terminal</text>
+            <text class="svg-small" x="1010" y="160" text-anchor="middle">result = Some(Ok | Err)</text>
+
+            <path class="svg-line cyan" d="M260 144 H365" marker-end="url(#arrow-state)"></path>
+            <path class="svg-line cyan" d="M595 144 H900" marker-end="url(#arrow-state)"></path>
+            <text class="svg-mono" x="747" y="132" text-anchor="middle">final text / model error</text>
+
+            <path class="svg-line cyan" d="M480 188 V270" marker-end="url(#arrow-state)"></path>
+            <text class="svg-mono" x="494" y="234">tool calls</text>
+            <path class="svg-line teal" d="M595 314 H690" marker-end="url(#arrow-state-teal)"></path>
+            <text class="svg-mono" x="642" y="301" text-anchor="middle">batch settled</text>
+            <path class="svg-line cyan svg-dash" d="M805 270 V224 H535 V188" marker-end="url(#arrow-state)"></path>
+
+            <path class="svg-line amber svg-dash" d="M150 100 V45 H1010 V100" marker-end="url(#arrow-state-amber)"></path>
+            <text class="svg-mono" x="580" y="34" text-anchor="middle">Turn limit reached before model request</text>
+          </svg>
+          <p class="footnote" style="margin: 14px 0 0;">纯思考 Action 可从 Deciding 直接进入 Terminal；只有产生工具调用时才经过 Waiting。上述状态全部由现有字段推导，没有重复存储。</p>
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <article class="card span-7">
+            <span class="eyebrow">Ownership model</span>
+            <h3>四层数据，各自回答一个问题</h3>
+            <div class="table-wrap" tabindex="0" style="margin-top: 13px;">
+              <table>
+                <caption class="sr-only">Agent、Action、Turn 与 ToolExecution 的数据所有权</caption>
+                <thead>
+                  <tr><th scope="col">结构</th><th scope="col">持有</th><th scope="col">回答的问题</th><th scope="col">可变时机</th></tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><strong>Agent</strong></td>
+                    <td>Model、instructions、Tools、history、Limits</td>
+                    <td>“这个会话如何继续？”</td>
+                    <td>构建时配置；成功 chat 时提交历史</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Action</strong></td>
+                    <td>intent、context、Turns、terminal result</td>
+                    <td>“这件独立工作做到哪里？”</td>
+                    <td>仅由中央 runtime 推进</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Turn</strong></td>
+                    <td>一次 Response、按原序排列的 ToolExecution</td>
+                    <td>“模型这一步决定了什么？”</td>
+                    <td>创建时写 response；随后只结算 outcomes</td>
+                  </tr>
+                  <tr>
+                    <td><strong>ToolExecution</strong></td>
+                    <td>精确 ToolCall、一个 eventual ToolOutcome</td>
+                    <td>“这次调用实际发生了什么？”</td>
+                    <td>outcome 从 None 精确写入一次</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="card accent-violet span-5">
+            <span class="eyebrow">Why this is enough</span>
+            <h3>三个不变量替代复杂状态机</h3>
+            <ul class="decision-list" style="margin-top: 15px;">
+              <li><span><strong>终态唯一：</strong><code>Action.result</code> 只从 None 变成一次 Some。</span></li>
+              <li><span><strong>结果唯一：</strong><code>ToolExecution.outcome</code> 只从 None 写入一次，并通过 action/turn/tool 三重索引定位。</span></li>
+              <li><span><strong>重排唯一：</strong>仅当一个 Turn 的所有工具结算后，Action 才重新进入 ready 队列。</span></li>
+            </ul>
+            <div class="callout" style="margin-top: 16px;">
+              <strong>公开边界：</strong>调用方拿到 Action 时，<code>result()</code> 和每个 ToolExecution 的查询都不会遇到 pending。
+            </div>
+          </article>
+
+          <article class="card span-12">
+            <span class="eyebrow">Data shape</span>
+            <h3>实现结构，去掉无关细节后只有这些</h3>
+            <div class="code-panel" style="margin-top: 13px;">
+              <div class="code-head"><span>actual shape</span><span>action.rs + runtime.rs</span></div>
+              <pre><code><span class="kw">struct</span> <span class="ty">Action</span> {
+  intent: String,
+  context: Vec&lt;InputItem&gt;,
+  turns: Vec&lt;Turn&gt;,
+  result: Option&lt;Result&lt;String, ActionError&gt;&gt;,
+}
+
+<span class="kw">struct</span> <span class="ty">Turn</span> {
+  response: Response,
+  tools: Vec&lt;ToolExecution&gt;,
+}
+
+<span class="kw">struct</span> <span class="ty">ToolExecution</span> {
+  call: ToolCall,
+  outcome: Option&lt;ToolOutcome&gt;,
+}
+
+<span class="cm">// 调度状态只在 drive() 局部存在</span>
+ready: VecDeque&lt;ActionId&gt;
+running: FuturesUnordered&lt;FinishedTool&gt;</code></pre>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="protocol" aria-labelledby="protocol-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">07 / protocol &amp; history</span>
+            <h2 id="protocol-title">三条信息通道，各自服务一个观察者</h2>
+          </div>
+          <p>父 Agent、Action 模型和调用方 trace 不共享一条万能消息数组。它们保留的细节不同，但转换点集中且可追踪。</p>
+        </div>
+
+        <div class="grid">
+          <article class="card accent-cyan span-4">
+            <span class="eyebrow">Controller transcript</span>
+            <h3><code>AgentHistory.input</code></h3>
+            <p>父模型看到的协议级会话：用户输入、父模型 Response、与原 ToolCall 精确关联的 Action 结果。它负责保持 Provider 工具调用配对合法。</p>
+          </article>
+          <article class="card accent-blue span-4">
+            <span class="eyebrow">Action context</span>
+            <h3><code>AgentHistory.action_context</code></h3>
+            <p>新 Action 的可读背景：用户消息，以及来源标为 <code>parent-agent</code> 的父响应/工具结果文本化记录。它不携带其他 Action 的内部 Turn。</p>
+          </article>
+          <article class="card accent-teal span-4">
+            <span class="eyebrow">Public evidence</span>
+            <h3><code>AgentReply.actions</code></h3>
+            <p>调用方审计轨迹：intent、所有 Turn、原始模型 Response、每个 settled ToolExecution 以及最终 Result。</p>
+          </article>
+        </div>
+
+        <div class="diagram" tabindex="0" role="region" aria-labelledby="history-diagram-heading" style="margin-top: 14px;">
+          <div class="diagram-title">
+            <h3 id="history-diagram-heading">创建 Action 时的上下文切片</h3>
+            <span>information flow</span>
+          </div>
+          <svg viewBox="0 0 1180 590" role="img" aria-labelledby="history-svg-title history-svg-desc">
+            <title id="history-svg-title">父历史、Action 上下文和结果回灌</title>
+            <desc id="history-svg-desc">父会话维护 Provider 级历史和用于 Action 的可读上下文。创建 Action 时复制此前上下文并追加 intent。Action 内部生成自己的回合；只有单个终态结果回到父会话。</desc>
+            <defs>
+              <marker id="arrow-history" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--cyan)"></path>
+              </marker>
+              <marker id="arrow-history-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--teal)"></path>
+              </marker>
+            </defs>
+
+            <rect class="svg-box controller" x="40" y="45" width="315" height="190" rx="10"></rect>
+            <text class="svg-text" x="197" y="78" text-anchor="middle">父 AgentHistory</text>
+            <text class="svg-mono" x="70" y="112">input</text>
+            <text class="svg-small" x="135" y="112">Provider 精确消息/调用配对</text>
+            <text class="svg-mono" x="70" y="145">action_context</text>
+            <text class="svg-small" x="198" y="145">用户 + parent-agent 可读记录</text>
+            <line class="svg-line svg-dash" x1="70" y1="167" x2="325" y2="167"></line>
+            <text class="svg-small" x="70" y="195">创建响应尚未写入 context</text>
+            <text class="svg-small" x="70" y="218">先复制快照，再 push_response</text>
+
+            <rect class="svg-box action" x="445" y="45" width="295" height="190" rx="10"></rect>
+            <text class="svg-text" x="592" y="78" text-anchor="middle">Action 初始输入</text>
+            <text class="svg-small" x="475" y="112">① context 快照</text>
+            <text class="svg-small" x="475" y="145">② Named(parent-agent, intent)</text>
+            <line class="svg-line svg-dash" x1="475" y1="167" x2="710" y2="167"></line>
+            <text class="svg-small" x="475" y="195">没有兄弟 Action 的内部消息</text>
+            <text class="svg-small" x="475" y="218">没有自己的创建 control call</text>
+            <path class="svg-line cyan" d="M355 140 H445" marker-end="url(#arrow-history)"></path>
+
+            <rect class="svg-box action" x="830" y="45" width="310" height="190" rx="10"></rect>
+            <text class="svg-text" x="985" y="78" text-anchor="middle">Action 私有 transcript</text>
+            <text class="svg-small" x="860" y="112">assistant Response #1</text>
+            <text class="svg-small" x="860" y="145">exact ToolCall → ToolOutput</text>
+            <text class="svg-small" x="860" y="178">assistant Response #2 …</text>
+            <text class="svg-small" x="860" y="211">terminal Result&lt;String, ActionError&gt;</text>
+            <path class="svg-line cyan" d="M740 140 H830" marker-end="url(#arrow-history)"></path>
+
+            <rect class="svg-box tool" x="800" y="350" width="340" height="150" rx="10"></rect>
+            <text class="svg-text" x="970" y="384" text-anchor="middle">封装为父控制结果</text>
+            <text class="svg-mono" x="835" y="420">{ "status": "completed", "output": "…" }</text>
+            <text class="svg-mono" x="835" y="455">{ "status": "failed", "error": "…" }</text>
+            <text class="svg-small" x="835" y="482">不回灌 Action 内部 Turn / 原始工具数据</text>
+            <path class="svg-line teal" d="M985 235 V350" marker-end="url(#arrow-history-teal)"></path>
+
+            <rect class="svg-box controller" x="40" y="350" width="520" height="150" rx="10"></rect>
+            <text class="svg-text" x="300" y="384" text-anchor="middle">父历史继续</text>
+            <text class="svg-small" x="75" y="420">input：ToolCall identity + JSON ToolOutput</text>
+            <text class="svg-small" x="75" y="453">action_context：Named(parent-agent, “Tool `start_action` returned: …”)</text>
+            <text class="svg-small" x="75" y="482">下一父决策可以回答、恢复，或创建另一批 Action</text>
+            <path class="svg-line teal" d="M800 425 H560" marker-end="url(#arrow-history-teal)"></path>
+            <path class="svg-line cyan svg-dash" d="M300 350 V275 H197 V235" marker-end="url(#arrow-history)"></path>
+          </svg>
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <article class="card span-6">
+            <span class="eyebrow">Parent control protocol</span>
+            <h3>父模型唯一可调用命令</h3>
+            <div class="code-panel" style="margin-top: 13px;">
+              <div class="code-head"><span>tool definition</span><span>private</span></div>
+              <pre><code>{
+  <span class="st">"name"</span>: <span class="st">"start_action"</span>,
+  <span class="st">"arguments"</span>: {
+    <span class="st">"intent"</span>: <span class="st">"读取 Cargo.toml，给出 workspace 结构"</span>
+  }
+}</code></pre>
+            </div>
+            <p>schema 拒绝额外字段；intent 必须是去空白后非空字符串。一个父响应最多包含 8 个 ToolCall，非法调用同样计数；超过时整次 chat 返回 <code>ActionLimit</code>，不做部分接受。</p>
+          </article>
+
+          <article class="card span-6">
+            <span class="eyebrow">Return protocol</span>
+            <h3>Action 只向父 Agent 返回一个终态</h3>
+            <div class="code-panel" style="margin-top: 13px;">
+              <div class="code-head"><span>ToolOutput::json</span><span>current private envelope</span></div>
+              <pre><code><span class="cm">// success</span>
+{ <span class="st">"status"</span>: <span class="st">"completed"</span>, <span class="st">"output"</span>: <span class="st">"…"</span> }
+
+<span class="cm">// action-level failure</span>
+{ <span class="st">"status"</span>: <span class="st">"failed"</span>, <span class="st">"error"</span>: <span class="st">"…"</span> }</code></pre>
+            </div>
+            <p>父模型消费 Action 的终态结果，调用方则可从 <code>AgentReply</code> 检查完整 trace。两种观察粒度不会互相污染。</p>
+          </article>
+        </div>
+
+        <details style="margin-top: 14px;">
+          <summary>长期会话到底保留什么？</summary>
+          <div class="details-body">
+            <ul class="plain-list">
+              <li>成功提交后，父 <code>input</code> 保留用户输入、每次父 Response、每个 <code>start_action</code> 结果和最终父回复。</li>
+              <li><code>action_context</code> 保留用户输入以及父模型内容/调用/控制结果的文本化表示，作为以后 Action 的背景。</li>
+              <li>在 BONE 提交的长期父历史中，不保留 Action 的内部模型响应、业务工具参数和原始输出；成功 chat 后，调用方可在本次 <code>AgentReply.actions()</code> trace 中查看它们。Provider、工具自身或外部系统的日志与保留策略不属于此保证。</li>
+              <li>上下文目前只增长：没有持久化、压缩、token 窗口治理或敏感字段裁剪策略。</li>
+            </ul>
+          </div>
+        </details>
+      </section>
+
+      <section class="section" id="failure" aria-labelledby="failure-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">08 / failure &amp; cancellation</span>
+            <h2 id="failure-title">错误分层：谁能恢复，错误就返回给谁</h2>
+          </div>
+          <p>模型、Action、工具和安全阀没有被压成一个字符串错误。每层只处理自己有能力恢复的失败。</p>
+        </div>
+
+        <div class="table-wrap" tabindex="0">
+          <table>
+            <caption>错误传播与恢复责任</caption>
+            <thead>
+              <tr><th scope="col">发生层</th><th scope="col">表示</th><th scope="col">下一观察者</th><th scope="col">是否可继续</th><th scope="col">历史语义</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>父 Agent 决策</strong></td>
+                <td><code>AgentError</code></td>
+                <td><code>Agent::chat</code> 调用方</td>
+                <td><span class="status fail">本次结束</span></td>
+                <td>工作历史不提交</td>
+              </tr>
+              <tr>
+                <td><strong>Action 模型/上限</strong></td>
+                <td><code>ActionError</code></td>
+                <td>父 Agent，JSON failed</td>
+                <td><span class="status warn">父层可恢复</span></td>
+                <td>父层记录终态结果</td>
+              </tr>
+              <tr>
+                <td><strong>业务工具</strong></td>
+                <td><code>ToolFailure</code></td>
+                <td>同一 Action 的下一 Turn（若仍有 Turn budget）；否则只保留于 trace</td>
+                <td><span class="status ok">通常可恢复</span> 受 Turn limit 约束</td>
+                <td>完整批次结算后进入输入</td>
+              </tr>
+              <tr>
+                <td><strong>截断/调用过多</strong></td>
+                <td><code>ToolOutcome::Skipped</code> + <code>ActionError</code></td>
+                <td>公开 trace；父 Agent 收到 failed</td>
+                <td><span class="status fail">Action 结束</span></td>
+                <td>工具零副作用，不再有下一 Turn</td>
+              </tr>
+              <tr>
+                <td><strong>控制调用非法</strong></td>
+                <td>文本 <code>ToolOutput</code></td>
+                <td>父 Agent 下一决策</td>
+                <td><span class="status ok">父层可恢复</span></td>
+                <td>作为原 call 的结果写入</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <article class="card accent-red span-6">
+            <span class="eyebrow">Failure privacy</span>
+            <h3>操作员信息与模型信息分离</h3>
+            <p><code>ToolFailure</code> 同时保存稳定分类、operator message、可选 source error，以及唯一允许回给模型的 <code>model_output</code>。</p>
+            <div class="code-panel" style="margin-top: 13px;">
+              <div class="code-head"><span>failure boundary</span><span>tools.rs</span></div>
+              <pre><code><span class="kw">pub struct</span> <span class="ty">ToolFailure</span> {
+  kind: ToolFailureKind,
+  message: String,          <span class="cm">// operator-facing</span>
+  model_output: ToolOutput, <span class="cm">// model-facing</span>
+  source: Option&lt;Error&gt;,   <span class="cm">// diagnostics only</span>
+}</code></pre>
+            </div>
+          </article>
+
+          <article class="card accent-cyan span-6">
+            <span class="eyebrow">Transactional conversation</span>
+            <h3><code>chat</code> 的历史只有一个提交点</h3>
+            <ul class="decision-list" style="margin-top: 15px;">
+              <li><span>进入时 clone 上一次已提交 <code>AgentHistory</code>。</span></li>
+              <li><span>用户输入、父响应和 Action 结果只写临时 working copy。</span></li>
+              <li><span>只有父模型产生最终文本后，working copy 才替换正式历史。</span></li>
+              <li><span>任何 <code>AgentError</code> 或 future 被 drop，都保留调用前历史。</span></li>
+            </ul>
+            <p>这是会话历史事务，不是外部世界事务：已执行的文件写入、命令或网络副作用无法回滚。</p>
+          </article>
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <article class="card accent-amber span-7">
+            <span class="eyebrow">Cancellation contract</span>
+            <h3>当前取消方式是 drop <code>chat</code> future</h3>
+            <p>没有公开 CancelHandle 或后台 Action 句柄。future 被 drop 时，运行时持有的模型/工具 future 一并被 drop；单次模型或工具超时也会 drop 对应 future。</p>
+            <ul class="plain-list" style="margin-top: 13px;">
+              <li><code>Tool::call</code> 必须是异步友好的，不能阻塞 executor 线程。</li>
+              <li>清理不能依赖 future 一定运行到结束。</li>
+              <li>工具若自行 spawn 脱离 runtime 的任务，取消和副作用收口由工具实现负责。</li>
+              <li>超时或取消后，工具不得留下会与后续 Turn 冲突的未管理状态。</li>
+            </ul>
+          </article>
+
+          <article class="card accent-teal span-5">
+            <span class="eyebrow">Tool failure kinds</span>
+            <h3>稳定分类，保留扩展空间</h3>
+            <ul class="plain-list" style="margin-top: 13px;">
+              <li><code>InvalidArguments</code> — 参数无法按 schema 反序列化</li>
+              <li><code>Timeout</code> — 超过单工具期限</li>
+              <li><code>NotFound</code> — 模型请求未注册工具</li>
+              <li><code>PermissionDenied</code> — 工具策略拒绝</li>
+              <li><code>Other</code> — 具体工具自定义失败</li>
+            </ul>
+            <p><code>#[non_exhaustive]</code> 允许后续增加稳定类别，而不让调用方穷举绑定内部实现。</p>
+          </article>
+        </div>
+
+        <div class="callout danger" style="margin-top: 14px;">
+          <strong>安全不变量：</strong>
+          Provider 标记截断，或一 Turn 请求超过允许数量时，调用即便看起来语法完整也不会执行。
+          trace 会保留 <code>Skipped</code> 证据，Action 随后终止，避免半截参数产生真实副作用。
+        </div>
+      </section>
+
+      <section class="section" id="api" aria-labelledby="api-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">09 / public API</span>
+            <h2 id="api-title">对人和 AI 都只有一条主路径</h2>
+          </div>
+          <p>构造 Agent、注入能力、发送用户消息、读取结果。内部调度不泄露成调用方必须拼装的对象。</p>
+        </div>
+
+        <div class="grid">
+          <article class="card span-7">
+            <span class="eyebrow">Canonical usage</span>
+            <h3>产品装配面</h3>
+            <div class="code-panel" style="margin-top: 13px;">
+              <div class="code-head"><span>one construction path</span><span>Rust</span></div>
+              <pre><code><span class="kw">use</span> bone_agent::Agent;
+<span class="kw">use</span> bone_tools::ToolEnvironment;
+
+<span class="kw">let</span> tools = ToolEnvironment::<span class="fn">new</span>(workspace)?;
+<span class="kw">let mut</span> agent = Agent::<span class="fn">new</span>(model)
+    .<span class="fn">instructions</span>(<span class="st">"Inspect facts before making claims."</span>)
+    .<span class="fn">tool</span>(tools.read())?
+    .<span class="fn">tool</span>(tools.glob())?
+    .<span class="fn">tool</span>(tools.grep())?
+    .<span class="fn">model_timeout</span>(Duration::from_secs(120))?
+    .<span class="fn">tool_timeout</span>(Duration::from_secs(900))?;
+
+<span class="kw">let</span> reply = agent
+    .<span class="fn">chat</span>(<span class="st">"Read Cargo.toml and explain the workspace."</span>)
+    .await?;
+
+println!(<span class="st">"{}"</span>, reply.text());
+<span class="kw">for</span> action <span class="kw">in</span> reply.actions() {
+    println!(<span class="st">"{} → {:?}"</span>, action.intent(), action.result());
+}</code></pre>
+            </div>
+          </article>
+
+          <article class="card accent-cyan span-5">
+            <span class="eyebrow">One thing, one way</span>
+            <h3>API 收敛原则</h3>
+            <ul class="decision-list" style="margin-top: 15px;">
+              <li><span><strong>一个模型入口：</strong><code>Agent::new(Model)</code>，Provider 复杂度已由 <code>bone-llm</code> 隐藏。</span></li>
+              <li><span><strong>一个能力入口：</strong><code>Agent::tool(Tool)</code>；没有第二套 dynamic/provider tool API。</span></li>
+              <li><span><strong>一个交互入口：</strong><code>Agent::chat(&amp;mut self, input)</code>；用户不创建 Action 或 Turn。</span></li>
+              <li><span><strong>一个 Action 终态：</strong><code>result() -&gt; Result&lt;&amp;str, &amp;ActionError&gt;</code>。</span></li>
+              <li><span><strong>一个工具观察：</strong><code>ToolExecution</code> 直接暴露 call、状态、failure、model_output。</span></li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <article class="card span-6">
+            <span class="eyebrow">Custom capability</span>
+            <h3>自定义工具保持强类型</h3>
+            <div class="code-panel" style="margin-top: 13px;">
+              <div class="code-head"><span>bone_agent::Tool</span><span>contract shape</span></div>
+              <pre><code><span class="kw">pub trait</span> <span class="ty">Tool</span>: Send + Sync {
+  <span class="kw">type</span> Args: DeserializeOwned + Send + <span class="st">'static</span>;
+  <span class="kw">type</span> Output: Serialize + Send + <span class="st">'static</span>;
+  <span class="kw">type</span> Error: Error + Send + Sync + <span class="st">'static</span>;
+
+  <span class="kw">fn</span> <span class="fn">definition</span>(&amp;self) -&gt; ToolDefinition;
+  <span class="kw">fn</span> <span class="fn">call</span>(&amp;self, args: Self::Args)
+      -&gt; impl Future&lt;Output = Result&lt;Self::Output, Self::Error&gt;&gt; + Send;
+  <span class="kw">fn</span> <span class="fn">map_error</span>(&amp;self, error: Self::Error) -&gt; ToolFailure {
+    <span class="cm">// bone-agent 提供模型安全的默认映射；工具可覆盖</span>
+  }
+}</code></pre>
+            </div>
+            <p>类型擦除只发生在私有 registry 内。输出被统一转换一次：字符串成为 text，其余可序列化值成为 JSON。</p>
+          </article>
+
+          <article class="card span-6">
+            <span class="eyebrow">Observation surface</span>
+            <h3>调用方看到结果，也能看到证据</h3>
+            <div class="table-wrap" tabindex="0" style="margin-top: 13px;">
+              <table>
+                <caption class="sr-only">bone-agent 公开结果观察 API</caption>
+                <thead><tr><th scope="col">API</th><th scope="col">含义</th></tr></thead>
+                <tbody>
+                  <tr><td><code>AgentReply::text()</code></td><td>唯一用户可见的最终回答</td></tr>
+                  <tr><td><code>AgentReply::actions()</code></td><td>促成回答的所有已结算 Action</td></tr>
+                  <tr><td><code>Action::{intent, turns, result}</code></td><td>工作意图、过程和一个终态</td></tr>
+                  <tr><td><code>Turn::{response, tools}</code></td><td>一次模型决策与完整工具批次</td></tr>
+                  <tr><td><code>ToolExecution::{call, is_success, is_skipped}</code></td><td>调用身份和简明状态</td></tr>
+                  <tr><td><code>ToolExecution::{failure, model_output}</code></td><td>operator 失败对象和模型侧 ToolOutput；Skipped 时仅供 trace 审计，不会被下一模型请求消费</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+        </div>
+
+        <h3 style="margin: 24px 0 12px;">当前安全阀与默认并发推导</h3>
+        <div class="table-wrap" tabindex="0">
+          <table>
+            <caption class="sr-only">bone-agent 默认限制、配置入口与触发结果</caption>
+            <thead>
+              <tr><th scope="col">边界</th><th scope="col">默认值</th><th scope="col">作用域</th><th scope="col">是否可配置</th><th scope="col">触发结果</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><strong>父决策次数</strong></td><td class="mono">32</td><td>一次 chat</td><td>否，内部常量</td><td><code>AgentError::DecisionLimit</code></td></tr>
+              <tr><td><strong>父 ToolCall / Action-start 请求数</strong></td><td class="mono">8</td><td>一次父响应的全部 ToolCall</td><td>否，内部常量</td><td>超量整次失败；非法调用也计数</td></tr>
+              <tr><td><strong>Turn 数</strong></td><td class="mono">32</td><td>一个 Action</td><td><code>max_turns</code></td><td><code>ActionError::TurnLimit</code></td></tr>
+              <tr><td><strong>工具调用数</strong></td><td class="mono">16</td><td>一个 Turn</td><td><code>max_tool_calls_per_turn</code></td><td>整批 Skipped + <code>ToolCallLimit</code></td></tr>
+              <tr><td><strong>模型期限</strong></td><td class="mono">120s</td><td>每次模型请求</td><td><code>model_timeout</code></td><td>父层或 Action 层 timeout</td></tr>
+              <tr><td><strong>工具期限</strong></td><td class="mono">900s</td><td>每次工具调用</td><td><code>tool_timeout</code></td><td>普通 <code>ToolFailure::Timeout</code></td></tr>
+              <tr><td><strong>pending 工具理论峰值</strong></td><td class="mono">128 default</td><td>一个父 Action 批次</td><td>8 × 每 Turn limit；可随配置增大</td><td>不是硬上界或 semaphore</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">所有公开的 limit / timeout setter 都拒绝零值。同一个 <code>Agent</code> 的 <code>chat</code> 要求 <code>&amp;mut self</code>，因此一个会话实例不会并发处理两条用户消息。</p>
+
+        <div class="grid" style="margin-top: 18px;">
+          <article class="card accent-amber span-7">
+            <span class="eyebrow">Explicitly absent from v1</span>
+            <h3>现在没有，而且不应偷偷补进去</h3>
+            <ul class="plain-list" style="margin-top: 13px;">
+              <li>Exchange / Task / Plan / Team / Actor / mailbox 等生命周期抽象</li>
+              <li>Action 进度流、partial result、后台继续、暂停/恢复、显式 CancelHandle</li>
+              <li>全局工具 semaphore、每会话 wall-clock deadline、token/cost/tool 总预算</li>
+              <li>历史持久化、上下文压缩、跨进程恢复和多 Agent 共享历史</li>
+              <li>Action 专属 Model、instructions、tools、limits 或结构化输出 schema</li>
+              <li>多 block / 图片 /音频等富工具输出</li>
+            </ul>
+          </article>
+
+          <article class="card accent-blue span-5">
+            <span class="eyebrow">Product composition</span>
+            <h3>当前可运行截面</h3>
+            <p><code>bone-cli</code> 注入 ChatGPT subscription Model 和 workspace-bound <code>read / glob / grep</code>，然后直接进入这个 Agent API。</p>
+            <div class="code-panel" style="margin-top: 13px;">
+              <div class="code-head"><span>terminal smoke</span><span>gpt-5.6-luna</span></div>
+              <pre><code>BONE_MODEL=<span class="st">'gpt-5.6-luna'</span> \
+  cargo run -p bone-cli -- \
+  <span class="st">"Read Cargo.toml and list the workspace crates"</span>
+
+<span class="cm"># 不带消息则进入多轮交互；/exit 退出</span>
+BONE_MODEL=<span class="st">'gpt-5.6-luna'</span> cargo run -p bone-cli</code></pre>
+            </div>
+            <p>首次使用可能触发设备登录；凭据由 <code>bone-llm</code> subscription adapter 的独立缓存处理，不进入 Agent。</p>
+          </article>
+        </div>
+
+        <details open style="margin-top: 14px;">
+          <summary>已知容量与产品限制</summary>
+          <div class="details-body">
+            <div class="table-wrap" tabindex="0">
+              <table>
+                <caption class="sr-only">当前产品限制、影响与升级抽象的触发条件</caption>
+                <thead><tr><th scope="col">限制</th><th scope="col">当前影响</th><th scope="col">何时需要升级抽象</th></tr></thead>
+                <tbody>
+                  <tr><td>父层只接收整批 Action 结果</td><td>一个超长 Action 推迟最终回复</td><td>需要 progressive UI、后台工作或部分决策时</td></tr>
+                  <tr><td>所有模型调用串行</td><td>慢模型请求推迟其他 ready Action</td><td>Provider 并发收益经测量明显时</td></tr>
+                  <tr><td>没有全局工具并发阀</td><td>默认配置下，一个父批次理论上可同时 pending 8 × 16 = 128 个业务工具；调高每 Turn limit 后还会增加</td><td>引入昂贵、写入型或外部限流工具前</td></tr>
+                  <tr><td>没有 chat 总期限/总预算</td><td>上限有限但总耗时与费用仍可能很大</td><td>进入无人值守或成本敏感生产环境前</td></tr>
+                  <tr><td>历史仅驻内存并持续增长</td><td>长会话受 Provider context window 制约</td><td>会话要跨重启或长时间运行时</td></tr>
+                  <tr><td>Action 共享 Agent 配置</td><td>无法为某个 Action 单独选模型/工具/额度</td><td>出现经验证的异构工作负载时</td></tr>
+                  <tr><td>Action output 只有 String</td><td>父模型需从文本消费业务结构</td><td>出现稳定的机器消费协议时</td></tr>
+                  <tr><td>chat 是不透明 await</td><td>调用方只能等待或 drop；无法订阅过程</td><td>CLI 之外出现实时 UX 需求时</td></tr>
+                  <tr><td>父失败不返回已完成 trace</td><td>本次已有 Action 证据对调用方不可见</td><td>需要失败审计/断点恢复时</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section class="section" id="evidence" aria-labelledby="evidence-title">
+        <div class="section-heading">
+          <div>
+            <span class="section-index">10 / evidence &amp; decision</span>
+            <h2 id="evidence-title">审批结论、证据与下一道门</h2>
+          </div>
+          <p>当前截面已经可运行、可通过终态 trace 审计、可测试；它尚不提供实时过程观察。批准不等于宣称功能完备，而是确认边界正确，后续扩展有清晰触发条件。</p>
+        </div>
+
+        <div class="grid">
+          <article class="card accent-teal span-3">
+            <span class="metric">25</span>
+            <h3>bone-agent tests</h3>
+            <p>核心循环、并发、超时、失败、隐私、安全上限和配置边界。</p>
+          </article>
+          <article class="card accent-cyan span-3">
+            <span class="metric">187</span>
+            <h3>workspace passed</h3>
+            <p><code>cargo test --workspace --all-targets --all-features --locked</code>；另有 4 个 live credential/network tests 和 1 个 subprocess-only helper 按设计 ignored。</p>
+          </article>
+          <article class="card accent-blue span-3">
+            <span class="metric">1 slice</span>
+            <h3>跨 crate 集成测试</h3>
+            <p>OpenAI Responses adapter → Agent → Action → concrete ReadTool → 多轮历史；HTTP transport 为可控 mock。</p>
+          </article>
+          <article class="card accent-violet span-3">
+            <span class="metric">Luna</span>
+            <h3>Manual live smoke</h3>
+            <p>2026-09-04：<code>bone-cli</code> 使用 <code>gpt-5.6-luna</code> 完成真实对话与工具调用验证。</p>
+          </article>
+        </div>
+
+        <div class="callout success" style="margin-top: 14px;">
+          <strong>静态质量门：</strong>
+          <code>cargo fmt --all -- --check</code>、
+          <code>cargo clippy --workspace --all-targets --all-features -- -D warnings</code>、
+          <code>RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps</code>，
+          以及 <code>cargo check -p bone-agent --target wasm32-unknown-unknown</code> 均通过。
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <article class="card span-7">
+            <span class="eyebrow">High-value behavior tests</span>
+            <h3>测试直接钉住架构不变量</h3>
+            <div class="table-wrap" tabindex="0" style="margin-top: 13px;">
+              <table>
+                <caption class="sr-only">核心运行时不变量与对应测试</caption>
+                <thead><tr><th scope="col">行为</th><th scope="col">测试证据</th></tr></thead>
+                <tbody>
+                  <tr><td>Agent 自己创建工具型 Action 后再回复</td><td><code>agent_creates_a_tool_using_action_before_it_replies</code></td></tr>
+                  <tr><td>Action 可以只思考而不调用工具</td><td><code>an_action_can_be_pure_reasoning</code></td></tr>
+                  <tr><td>等待中的 A 不阻塞 B</td><td><code>a_waiting_action_does_not_block_the_next_action</code></td></tr>
+                  <tr><td>同 Turn 工具并发且等待整批</td><td><code>one_turn_runs_tools_concurrently_and_waits_for_the_whole_batch</code></td></tr>
+                  <tr><td>一个失败工具仍等待同批其他工具</td><td><code>a_failed_tool_still_waits_for_the_rest_of_its_batch</code></td></tr>
+                  <tr><td>工具 timeout 是可恢复观察</td><td><code>a_tool_timeout_is_an_observation_the_action_can_recover_from</code></td></tr>
+                  <tr><td>模型 timeout 不饿死下一个 Action</td><td><code>model_timeout_does_not_starve_the_next_action</code></td></tr>
+                  <tr><td>过多/重复/截断调用零副作用</td><td><code>too_many_tool_calls_start_none_of_them</code> 等</td></tr>
+                  <tr><td>中止 runtime drive 会 drop 全部 pending 工具 future</td><td><code>dropping_the_run_drops_every_pending_tool</code></td></tr>
+                  <tr><td>Provider、Agent、工具、会话历史贯通</td><td><code>openai_responses_adapter_and_read_tool_cross_the_agent_slice</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="card accent-cyan span-5">
+            <span class="eyebrow">Approval checklist</span>
+            <h3>本次建议通过的内容</h3>
+            <ul class="check-list" style="margin-top: 15px;">
+              <li><span>Agent 是唯一用户交互入口，Action 由它自主产生</span></li>
+              <li><span>Action / Turn / ToolExecution 的职责和所有权清晰</span></li>
+              <li><span>中央调度器足以实现非阻塞工具等待，无需 Actor</span></li>
+              <li><span>模型串行与工具并发的行为被明确写入契约</span></li>
+              <li><span>父层整批屏障作为 v1 取舍被显式接受</span></li>
+              <li><span>历史提交、错误恢复和副作用边界有确定语义</span></li>
+              <li><span>bone-llm / bone-tools / bone-agent 的依赖边界稳定</span></li>
+              <li><span>新抽象只在出现真实产品需求后引入</span></li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="callout success" style="margin-top: 14px;">
+          <strong>建议决议：</strong>
+          批准当前 bone-agent core 进入下一阶段集成。保留整批屏障、串行模型请求和内存历史作为明确的 v1 约束；
+          不在本轮引入 Exchange、后台 Action 或事件流。
+        </div>
+
+        <div class="grid" style="margin-top: 14px;">
+          <article class="card accent-amber span-7">
+            <span class="eyebrow">Next validation gates</span>
+            <h3>进入更高风险工具前补齐</h3>
+            <ul class="plain-list" style="margin-top: 13px;">
+              <li>直接测试 <code>Agent::chat</code> 失败和 drop 后，已提交历史保持不变。</li>
+              <li>覆盖父模型 timeout、32 次 decision limit、每决策 8 Action limit。</li>
+              <li>覆盖错误控制工具名、畸形 <code>start_action</code> 参数和空 intent 的父层恢复。</li>
+              <li>覆盖所有零值 limit setter，并加入默认 8 × 16 pending 工具的结构压力测试。</li>
+              <li>写工具接入前，定义幂等、取消、重试和外部副作用审计契约。</li>
+            </ul>
+          </article>
+
+          <article class="card accent-red span-5">
+            <span class="eyebrow">Architecture trigger</span>
+            <h3>什么时候才重新讨论 Exchange？</h3>
+            <p>只有当产品明确要求“父 Agent 在 Action 未结束时先返回/继续决策”，才需要新的生命周期边界。</p>
+            <ul class="plain-list" style="margin-top: 13px;">
+              <li>部分结果如何进入 Provider 合法历史</li>
+              <li>未完成 Action 的身份、所有权和持久化</li>
+              <li>事件顺序、背压、重连和重复投递</li>
+              <li>用户取消与工具副作用如何传播</li>
+            </ul>
+            <p><strong>那会是新的产品协议，不是调度器小改。</strong></p>
+          </article>
+        </div>
+
+        <details style="margin-top: 14px;">
+          <summary>审批会上建议追问的五个问题</summary>
+          <div class="details-body">
+            <ol>
+              <li>v1 是否接受：任意一个 Action 很慢时，父 Agent 等整批结束才继续？</li>
+              <li>默认理论峰值 128（且可配置增大）是否要求当前阶段加入全局 semaphore？</li>
+              <li>未来第一批写工具是否具备可证明的 drop/timeout/重试语义？</li>
+              <li>调用方是否已经需要实时进度，还是最终 trace 足够？</li>
+              <li>何种量化指标会触发模型并发、历史压缩或结构化 Action output？</li>
+            </ol>
+          </div>
+        </details>
+      </section>
+
+      <footer>
+        <p><strong>BONE Agent Runtime Architecture Review</strong> · snapshot <span class="mono">e86f21c5</span> · 2026-09-04</p>
+        <p>本页是单文件离线技术材料，无外部字体、脚本、CDN 或运行时依赖。打印时自动使用高对比浅色版式。</p>
+      </footer>
+    </main>
+  </div>
+
+  <script>
+    (function () {
+      var root = document.documentElement;
+      var themeButton = document.getElementById("theme-toggle");
+      var expandButton = document.getElementById("expand-all");
+      var printButton = document.getElementById("print-page");
+      var details = Array.prototype.slice.call(document.querySelectorAll("details"));
+      var navLinks = Array.prototype.slice.call(document.querySelectorAll(".toc a"));
+      var sections = navLinks.map(function (link) {
+        return document.querySelector(link.getAttribute("href"));
+      }).filter(Boolean);
+
+      var storedTheme = null;
+      try { storedTheme = localStorage.getItem("bone-agent-architecture-theme"); } catch (_) {}
+      if (storedTheme === "light" || storedTheme === "dark") {
+        root.setAttribute("data-theme", storedTheme);
+      }
+
+      function updateThemeLabel() {
+        var isDark = root.getAttribute("data-theme") === "dark";
+        themeButton.setAttribute("aria-label", isDark ? "切换到浅色主题" : "切换到深色主题");
+        themeButton.setAttribute("aria-pressed", String(isDark));
+        themeButton.textContent = isDark ? "浅色" : "深色";
+      }
+
+      themeButton.addEventListener("click", function () {
+        var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+        root.setAttribute("data-theme", next);
+        try { localStorage.setItem("bone-agent-architecture-theme", next); } catch (_) {}
+        updateThemeLabel();
+      });
+      updateThemeLabel();
+
+      function updateExpandState() {
+        var allOpen = details.length > 0 && details.every(function (item) { return item.open; });
+        expandButton.setAttribute("aria-expanded", String(allOpen));
+        expandButton.setAttribute("aria-label", allOpen ? "折叠全部细节" : "展开全部细节");
+        expandButton.innerHTML = allOpen
+          ? '<span class="wide-label">折叠全部</span>细节'
+          : '<span class="wide-label">展开全部</span>细节';
+      }
+
+      expandButton.addEventListener("click", function () {
+        var shouldOpen = details.some(function (item) { return !item.open; });
+        details.forEach(function (item) { item.open = shouldOpen; });
+        updateExpandState();
+      });
+      details.forEach(function (item) {
+        item.addEventListener("toggle", updateExpandState);
+      });
+      updateExpandState();
+
+      printButton.addEventListener("click", function () { window.print(); });
+
+      if ("IntersectionObserver" in window) {
+        var observer = new IntersectionObserver(function (entries) {
+          entries.forEach(function (entry) {
+            if (!entry.isIntersecting) return;
+            navLinks.forEach(function (link) {
+              var active = link.getAttribute("href") === "#" + entry.target.id;
+              if (active) link.setAttribute("aria-current", "true");
+              else link.removeAttribute("aria-current");
+            });
+          });
+        }, { rootMargin: "-18% 0px -72% 0px", threshold: 0 });
+        sections.forEach(function (section) { observer.observe(section); });
+      }
+
+      var printState = [];
+      window.addEventListener("beforeprint", function () {
+        printState = details.map(function (item) { return item.open; });
+        details.forEach(function (item) { item.open = true; });
+      });
+      window.addEventListener("afterprint", function () {
+        details.forEach(function (item, index) { item.open = printState[index]; });
+        updateExpandState();
+      });
+    }());
+  </script>
+</body>
+</html>

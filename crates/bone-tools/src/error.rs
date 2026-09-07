@@ -1,12 +1,14 @@
 use std::io;
 
-use crate::{ToolFailure, ToolFailureKind};
+use crate::{ToolFailure, ToolFailureKind, ToolLimitsError};
 use bone_llm::ToolOutput;
 use thiserror::Error;
 
 /// Concrete failures produced by built-in tools.
 #[derive(Debug, Error)]
 pub enum ToolError {
+    #[error(transparent)]
+    InvalidLimits(#[from] ToolLimitsError),
     #[error("invalid arguments: {0}")]
     InvalidArgs(String),
     #[error("path not found: {path}")]
@@ -61,7 +63,8 @@ impl ToolError {
     pub(crate) fn into_tool_failure(self) -> ToolFailure {
         let message = self.to_string();
         let (kind, model_output) = match &self {
-            Self::InvalidArgs(_)
+            Self::InvalidLimits(_)
+            | Self::InvalidArgs(_)
             | Self::InvalidGlob(_)
             | Self::InvalidRegex(_)
             | Self::Patch(_) => (ToolFailureKind::InvalidArguments, message.clone()),

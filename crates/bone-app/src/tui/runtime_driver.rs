@@ -11,8 +11,12 @@ use std::{
     sync::Arc,
 };
 
-use crate::{SettingsService, WorkspaceApplication};
-use bone_agent::{AgentHandle, AgentHost, Observation, Snapshot, StepEvent, TaskConfig};
+use crate::WorkspaceApplication;
+use bone_agent::{
+    AgentHandle, AgentHost, Observation, ResolvedAgentRuntimeConfig, Snapshot, StepEvent,
+};
+use bone_llm::service::chatgpt_subscription::{self, DeviceCodePrompt};
+use bone_store::{BoneStore, ProviderId};
 use futures_util::stream::FuturesUnordered;
 use tokio::{
     sync::{broadcast::error::RecvError, mpsc},
@@ -116,16 +120,20 @@ pub(super) async fn observe_session(
 
 pub(super) fn enqueue_connection(
     connecting: &mut FuturesUnordered<ConnectionTask>,
-    settings: &SettingsService,
-    login_tx: mpsc::UnboundedSender<bone_agent::LoginPrompt>,
+    store: BoneStore,
+    login_tx: mpsc::UnboundedSender<DeviceCodePrompt>,
 ) {
-    let manager = settings.config_manager().clone();
     connecting.push(tokio::spawn(async move {
-        bone_agent::connect(&manager, move |prompt| {
+        let auth = store
+            .provider_auth()
+            .acquire(ProviderId::ChatGptSubscription)
+            .map_err(|error| error.to_string())?;
+        let endpoint = chatgpt_subscription::connect("bone-agent", auth, move |prompt| {
             let _ = login_tx.send(prompt);
         })
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        Ok(AgentHost::new(endpoint))
     }));
 }
 
@@ -134,10 +142,10 @@ fn enqueue_start(
     host: AgentHost,
     workspace: PathBuf,
     id: UiSessionId,
-    task: TaskConfig,
+    runtime: ResolvedAgentRuntimeConfig,
 ) {
     starting.push(tokio::spawn(async move {
-        let opened = match host.start(workspace, task).await {
+        let opened = match host.start(workspace, runtime) {
             Ok(agent) => match agent.observe().await {
                 Ok(observation) => Ok((agent, observation)),
                 Err(error) => Err(error.to_string()),
@@ -175,7 +183,7 @@ pub(super) fn enqueue_pending_starts(
                 host.clone(),
                 workspace.to_path_buf(),
                 *id,
-                pending.task.clone(),
+                pending.runtime.clone(),
             );
         }
     }
@@ -194,10 +202,6 @@ pub(super) fn apply_enqueued_pending_starts(app: &mut App, started: EnqueuedPend
     for notice in started.notices {
         report_notice(app, notice);
     }
-}
-
-pub(super) fn task_model(task: &TaskConfig) -> &str {
-    task.model.as_deref().unwrap_or("the configured default")
 }
 
 pub(super) fn persist_pending_retryable_statuses(

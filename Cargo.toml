@@ -2,8 +2,8 @@
 members = [
     "crates/bone-app",
     "crates/bone-agent",
-    "crates/bone-config",
     "crates/bone-llm",
+    "crates/bone-store",
     "crates/bone-tools",
 ]
 exclude = ["third_party/rig-core-0.42.0"]
@@ -28,7 +28,7 @@ libc = "0.2"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 ratatui-textarea = "0.9.2"
 rig-core = { version = "=0.42.0", path = "third_party/rig-core-0.42.0", default-features = false }
-rustix = { version = "1", features = ["process"] }
+rusqlite = "0.40.2"
 schemars = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

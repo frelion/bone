@@ -263,26 +263,28 @@ Compatible base URLs must be absolute HTTP(S) URLs without embedded
 credentials or query strings. Authentication and routing configuration are
 injected while constructing the endpoint.
 
-For native sessions, `LlmConfig` registers the `llm.system` section with
-`bone-config`. Its only setting is optional `credential_root`, an absolute
-directory for BONE's independent subscription credentials. An empty section
-uses the existing default credential directory. `bone-agent::connect` reads
-this setting once for the returned `AgentHost`; changing it requires a new
-Host. The single-session `bone-agent::start` convenience reads it before
-connecting.
+The ChatGPT subscription connector accepts a
+`bone_store::ProviderAuthLease`, acquired by the product composition root:
 
-The ChatGPT subscription connector receives an explicit application-owned
-credential root. `default_credential_root()` is an opt-in convenience, while
-`connect` owns authorization, locking, secure credential storage, and refresh.
+```rust,ignore
+let auth = store
+    .provider_auth()
+    .acquire(ProviderId::ChatGptSubscription)?;
+let endpoint = chatgpt_subscription::connect("bone-agent", auth, show_device_code).await?;
+```
+
+The lease holds an exclusive, verified `auth.json` path for Rig's OAuth cache.
+Rig remains the sole owner of that file's JSON schema and token refresh
+lifecycle. `bone-llm` never discovers a credential root, reads OAuth bytes, or
+deletes the file. The resulting `Endpoint` and every selected `Model` retain
+the lease; a second same-provider connection under the same store root returns
+Busy until all existing endpoint/model handles are dropped.
+
 The backend does not honor `max_output_tokens` or structured-output schemas,
 so BONE rejects those options locally instead of pretending they were applied.
-A credential root supports one live subscription connection. That connection's
-`Endpoint` may be cloned, and one `AgentHost` uses those clones to run several
-independent sessions concurrently. A different live Host or process connecting
-the same root receives `CredentialStoreBusy` until the existing Endpoint and
-model handles are released.
 
-`bone-agent` composes the models, tools, and runtime. The terminal application
-is `bone-app`, which owns the `bone` binary and depends on `bone-agent` and
-`bone-config`; run it with `cargo run -p bone-app --bin bone` after
-[configuring the agent](configuration.md).
+`bone-app` is the composition root: it opens `BoneStore`, resolves typed
+global/Workspace/Session settings into `ResolvedAgentRuntimeConfig`, acquires
+provider auth, creates `AgentHost::new(endpoint)`, and starts a runtime with
+that immutable config. `bone-agent` performs no storage/configuration read at
+runtime. See [configuration and storage](configuration.md).

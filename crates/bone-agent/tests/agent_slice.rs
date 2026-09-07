@@ -4,9 +4,9 @@ use bone_agent::{
     AgentHandle, Autonomy, JobRequest, KernelConfig, Next, Notice, Operation, Runtime,
     RuntimeConfig, ToolCall, WorkResult,
 };
-use bone_agent::{Effort, ModelAdapter, SystemConfig, TaskConfig, read_only_tools};
+use bone_agent::{Effort, ModelAdapter, ModelSettings, SystemConfig, read_only_tools};
 use bone_llm::{Model, testing};
-use bone_tools::ToolEnvironment;
+use bone_tools::{ToolEnvironment, ToolLimits};
 use rig_core::{
     providers::openai as rig_openai,
     test_utils::{MockHttpResponse, SequencedHttpClient},
@@ -126,11 +126,17 @@ async fn task_selection_routes_work_to_the_solver_and_never_reconfigures_review(
     .unwrap();
     for selected in ["solver-a", "solver-b", "system-reviewer"] {
         let solver = system
-            .solver_for(&TaskConfig {
-                model: Some(selected.into()),
-                ..Default::default()
-            })
-            .unwrap();
+            .resolve(
+                ToolLimits::default(),
+                Some(ModelSettings {
+                    model: selected.into(),
+                    effort: system.default_solver.effort,
+                    timeout_seconds: system.default_solver.timeout_seconds,
+                }),
+            )
+            .unwrap()
+            .solver()
+            .clone();
         let (reviewer, coordination) = model_transport(&system.coordinator.model, []);
         let (worker, solving) = model_transport(
             &solver.model,

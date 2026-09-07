@@ -4,6 +4,7 @@ use bone_llm::{
     FinishReason, InputItem, InputSource, Protocol, Request, StreamEvent, ToolChoice,
     ToolDefinition, ToolOutput, service::chatgpt_subscription,
 };
+use bone_store::{BoneStore, ProviderId};
 use futures_util::StreamExt;
 use serde_json::json;
 
@@ -18,15 +19,17 @@ async fn chatgpt_subscription_live_text_tool_and_replay_certification() {
 async fn run_live_certification() {
     let model_id = std::env::var("BONE_CHATGPT_MODEL")
         .expect("set BONE_CHATGPT_MODEL before running the ignored live test");
-    let credential_root = chatgpt_subscription::default_credential_root()
-        .expect("default BONE credential root should resolve");
-    let endpoint =
-        chatgpt_subscription::connect("chatgpt-subscription-live", credential_root, |prompt| {
-            println!("Authorize at {}", prompt.verification_uri);
-            println!("Device code: {}", prompt.user_code);
-        })
-        .await
-        .expect("ChatGPT subscription endpoint should build");
+    let auth = BoneStore::open_default()
+        .expect("default BONE store should open")
+        .provider_auth()
+        .acquire(ProviderId::ChatGptSubscription)
+        .expect("BONE provider-auth lease should be available");
+    let endpoint = chatgpt_subscription::connect("chatgpt-subscription-live", auth, |prompt| {
+        println!("Authorize at {}", prompt.verification_uri);
+        println!("Device code: {}", prompt.user_code);
+    })
+    .await
+    .expect("ChatGPT subscription endpoint should build");
     let model = endpoint
         .model(model_id)
         .expect("ChatGPT subscription model should build");

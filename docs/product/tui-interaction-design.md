@@ -2,15 +2,25 @@
 
 | 字段 | 内容 |
 | --- | --- |
-| 文档状态 | Ready for product & engineering review |
+| 文档状态 | 当前实现基线 + 后续交互设计参考 |
 | 对应 PRD | [TUI 配置、Workspace 与多 Session PRD](tui-workspace-prd.md) |
 | 目标终端 | 40、80、120 列代表性布局 |
 | 主要输入 | 键盘；鼠标为未来增强，不作为主流程依赖 |
 | 最后更新 | 2026-09-07 |
 
+> **当前实现优先级（2026-09-07）**
+>
+> 本节是当前 TUI 的生效交互/架构边界，优先于后文保留的 Settings Center 与高级交互草图。设置、Workspace、Session、草稿、状态和 event history 都通过一个 SQLite `BoneStore` 保存：`$XDG_DATA_HOME/bone/store-v1/bone.sqlite3`，无 XDG 时为 `~/.local/share/bone/store-v1/bone.sqlite3`。普通用户不查看、编辑或恢复持久化文件；BONE 不再有 `bone-config`、`ConfigManager`、`ConfigSection`、`ConfigTool`、`BONE_CONFIG`、`BONE_STATE_DIR` 或 `credential_root`。
+>
+> 当前 TUI 的设置入口是 `/model <id>`、`/model default <id>`、`/model global <id>` 与 `/model inherit`。它们分别写入 Session override、Workspace default、User default，解析顺序为 **Session > Workspace > User**。写入成功代表 SQLite 已保存；已经 attached 的 runtime 仍使用它启动时的 immutable `ResolvedAgentRuntimeConfig`，直到新建或重建 runtime 才采用新值。不要把后文的 `/config`、Settings Center、`Desired/Effective/LKG`、`TurnConfig revision`、watcher、apply acknowledgement 或热切换描述为当前功能。
+>
+> 每个 accepted user turn 在同一个 SQLite transaction 中写入 `UserTurnAccepted` event 与 Session summary/state；commit 失败不能清 Composer 或启动 Agent。Session writer ownership 用 fail-fast OS lease，冲突 Session 只读/Busy。SQLite corruption、权限错误或 schema mismatch 不自动 reset。ChatGPT OAuth 是唯一 JSON 例外，位于 `$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/store-v1/providers/chatgpt-subscription/`），由 Rig 管理 payload，BONE 仅持有 `ProviderAuthLease`。有活跃 Endpoint/Model lease 时 `/logout` 返回 Busy。
+>
+> one-shot 的 `--model` / `BONE_MODEL` 是仅本次调用的 ephemeral override，不创建或持久化 `SessionRecord`；`--events` JSONL 仅作观察导出。后文涉及 one-shot durable Session 的内容是未来设计。
+
 ## 1. 设计结论
 
-BONE 的主界面始终是当前工作目录的多 Session 工作台。配置、认证、模型选择和错误修复都是工作台中的界面状态，不是进入工作台之前的门槛。
+BONE 的主界面始终是当前工作目录的多 Session 工作台。设置、认证、模型选择和存储错误修复都是工作台中的界面状态，不是进入工作台之前的门槛。
 
 面向用户统一使用：
 
@@ -26,27 +36,27 @@ BONE 的主界面始终是当前工作目录的多 Session 工作台。配置、
 - `workspace_id`；
 - `SessionRuntime`；
 - `agent.system`；
-- `ConfigSection`；
-- `ConfigRevision`；
-- `credential_root`；
+- SQLite document key；
+- document revision；
+- OAuth cache path；
 - `Provider error`。
 
 这些术语只允许出现在用户主动打开的技术详情中。
 
 ## 2. 体验原则
 
-1. **首帧优先**：TUI 首帧不等待配置、认证、模型目录或网络。
-2. **配置不可见**：`/config` 是设置中心，不是 JSON 查看器。
-3. **一次选择就是一次提交**：没有总保存按钮，没有“保存并重启”；提交仍须经过校验、准备、持久化和运行时确认。
-4. **状态真实**：只有 Effective revision 被对应运行时确认后才显示“已应用”，文件写入成功不等于运行时生效。
-5. **安全边界明确**：一个 User Turn 锁定一份 TurnConfig；进行中的 Turn 不换模型或 Agent 行为，显示“下一条消息生效”。权限收紧是例外，可立即阻止尚未开始的危险操作。
-6. **范围默认保守**：模型选择默认只影响当前对话；设置中心默认修改当前工作目录。
-7. **后台不抢焦点**：Session 完成、模型验证完成、配置刷新都只提示，不切换当前页面。
+1. **首帧优先**：TUI 首帧不等待模型选择、认证、未来 catalog 或网络。
+2. **持久化不可见**：`/model` 是当前模型设置入口，不是 SQLite/JSON 查看器；完整 `/config` 是后续设计。
+3. **一次选择就是一次提交**：没有总保存按钮；成功表示 typed document 已写入 SQLite，失败保留用户输入并给出可重试状态。
+4. **状态真实**：写入成功不等于已 attached runtime 已切换。状态文案必须说明“新建或重建 runtime 使用此选择”。
+5. **安全边界明确**：runtime 使用创建时锁定的完整 `ResolvedAgentRuntimeConfig`；进行中的 runtime 不换模型或 Agent 行为。
+6. **范围默认保守**：模型选择默认只影响当前对话；Workspace/User scope 必须由 `/model default` / `/model global` 显式选择。
+7. **后台不抢焦点**：Session 完成、连接状态变化和保存结果都只提示，不切换当前页面。
 8. **关闭 Overlay 不停止任务**：`Esc` 永远先关闭最上层界面；在 Sessions surface 时返回 Composer；只有栈为空且 Workbench/Composer 聚焦时才是当前 Session 的停止键。
-9. **失败保留成果**：草稿、历史和旧的有效设置永远优先保留。
+9. **失败保留成果**：草稿、历史和已成功提交的 settings 永远优先保留。
 10. **颜色不是唯一信息**：所有状态同时使用符号和文字。
 
-## 3. 信息架构
+## 3. 信息架构（当前可用面；Settings Center / Model Picker 是后续 placeholder）
 
 ```text
 BONE App Shell
@@ -89,12 +99,12 @@ BONE App Shell
 
 ```text
 Shell phase:       Bootstrapping | Interactive | TerminalUnavailable
-Setup state:       Unconfigured | Authenticating | LoadingModels | Ready
+Setup state:       NeedsModel | Authenticating | Connecting | Ready
 Connection health: Disconnected | Connecting | Connected | Degraded
 Storage health:    Initializing | Writable | ReadOnly | RepairNeeded | Unavailable
 ```
 
-这些轴可以组合。例如 `Interactive + Unconfigured + Writable` 是正常的未配置工作台；`Interactive + Ready + Degraded` 仍允许查看历史、写草稿和修复连接。`Storage.Unavailable` 是 TUI 内的阻断页：它阻止接受新消息，但不能在首帧前把用户丢回 Shell。只有终端本身无法初始化时才允许首帧前退出。
+这些轴可以组合。例如 `Interactive + NeedsModel + Writable` 是正常的未选模型工作台；`Interactive + Ready + Degraded` 仍允许查看历史、写草稿和修复连接。`Storage.Unavailable` 是 TUI 内的阻断页：它阻止接受新消息，但不能在首帧前把用户丢回 Shell。SQLite corruption、权限错误或 schema mismatch 不得以自动 reset 伪装成健康存储。
 
 ### 4.2 逻辑 Session 与惰性 Runtime
 
@@ -103,8 +113,9 @@ Storage health:    Initializing | Writable | ReadOnly | RepairNeeded | Unavailab
 ```text
 SessionRecord（可持久化）               AgentRuntime（不跨进程）
 ├── session_id / workspace_id           ├── None / Attaching / Attached
-├── 标题、历史、草稿、滚动位置           ├── 当前 AgentHandle 与任务
-├── Session 配置覆盖与 revision          ├── Runtime lease
+├── 标题、journal history、草稿、滚动位置  ├── 当前 AgentHandle 与任务
+├── solver model override                 ├── 启动时冻结的 resolved config
+├── opaque document revision（仅存储 CAS） ├── Session writer lease
 ├── 中断与风险恢复数据                   └── 可按需释放并再次创建
 └── 不依赖账号、模型或连接即可存在
 ```
@@ -119,7 +130,7 @@ Execution:          Opening | Ready | Working | WaitingForUser
                     | Stopping | Complete | Interrupted
 Runtime attachment: Detached | Attaching | Attached
 Availability:       Local | ReadOnlyElsewhere | Offline | Corrupt
-Attention flags:    Unread | UnresolvedEffect | ConfigPending | RecoveryNeeded
+Attention flags:    Unread | UnresolvedEffect | RecoveryNeeded
 ```
 
 Rail 的单行徽标只是这些维度的派生视图，展示优先级为：
@@ -157,7 +168,9 @@ Push Overlay 时保存当前 `FocusToken`；Pop 时先恢复该 token。若原�
 
 `Esc` 只 pop 栈顶；因此从 Settings 打开的 Model Picker 按一次 `Esc` 回到原设置字段，再按一次才关闭 Settings。Confirmation 和 Recovery 也是普通 OverlayFrame，不拥有绕过栈的第二套焦点规则。
 
-## 5. 主工作台
+## 5. 主工作台与后续交互草图
+
+> 本节至第 21 节保留为未来 UI 设计素材。除非第 0 节或当前命令实现明确说明，否则其中的 Settings Center、Model Picker、catalog、`Desired/Effective/LKG`、自动 apply、跨进程刷新、one-shot durable Session 和接管流程均不是当前功能。当前实现只承诺 `/model` 的三层持久化、pinned runtime、SQLite repair/error 和 provider-lease Busy 语义。
 
 ### 5.1 宽屏：终端宽度 ≥ 110 列
 
@@ -221,7 +234,7 @@ Push Overlay 时保存当前 `FocusToken`；Pop 时先恢复该 token。若原�
 
  ● 当前需要把配置读取从启动前置条件中移开。
 
- ✓ Read crates/bone-config/src/manager.rs
+ ✓ Read crates/bone-store/src/lib.rs
 
  • Thinking · Designing settings flow
 
@@ -272,7 +285,7 @@ Ready：
 ```text
                  连接模型账号后即可开始
 
-               [Enter 连接 ChatGPT]   [/config 设置]
+               [Enter 连接 ChatGPT]   [/model <id> 设置模型]
 
  ╭────────────────────────────────────────────────────────────╮
  │ 你仍然可以先写下任务…                                      │
@@ -282,16 +295,16 @@ Ready：
 
 Composer 必须一直存在，用户可以在设置完成前形成草稿。
 
-### 5.4 未配置工作台
+### 5.4 未选模型工作台
 
-没有用户配置、账号或模型时，BONE 仍先显示完整 App Shell，而不是用欢迎页替代工作台。后台自动创建最小的用户配置目录、数据目录、WorkspaceRegistry 项和 Draft SessionRecord；不会在当前工作目录创建 `.bone/`，也不会要求用户知道这些文件的位置。
+没有模型、账号或 provider 连接时，BONE 仍先显示完整 App Shell，而不是用欢迎页替代工作台。后台自动创建 SQLite store、WorkspaceRegistry 项和 Draft SessionRecord；不会在当前工作目录创建 `.bone/`，也不会要求用户知道持久化文件的位置。
 
 ```text
  BONE  1/1  ·  新对话                              未连接
 
                  先描述任务，也可以先完成设置
 
-          Enter 连接 ChatGPT      /config 打开设置
+          Enter 连接 ChatGPT      /model <id> 选择模型
 
  ╭────────────────────────────────────────────────────────────╮
  │ 修复当前项目的启动配置…                                    │
@@ -303,7 +316,7 @@ Composer 必须一直存在，用户可以在设置完成前形成草稿。
 
 - 可查看当前 Workspace、历史 Session、诊断和帮助；
 - 可新建逻辑 Session、编辑并持久化草稿；
-- `/config`、`/status`、`/workspace`、`/sessions`、`/login`、`/help`、`/exit` 可用；
+- `/model`、`/status`、`/workspace`、`/sessions`、`/login`、`/help`、`/exit` 可用；完整 `/config` 是后续设计；
 - 不创建 `AgentHost`，不附着任何 Agent Runtime；
 - 用户提交消息时才进入“先连接，再发送”的明确流程；
 - SessionStore 不可写时 Composer 可保留内存草稿，但发送被禁用并显示恢复动作，不能让未落盘消息开始执行。
@@ -351,7 +364,7 @@ Composer 必须一直存在，用户可以在设置完成前形成草稿。
 
 - 不展示“创建配置文件”；
 - 不要求选择文件路径；
-- 不要求手工输入模型；
+- 当前由用户以 `/model <id>` 提供模型；catalog/picker 是后续设计；
 - 不展示冗长多步向导；
 - 主要操作只有“连接 ChatGPT”；
 - “稍后设置”允许查看历史和设置，但不能假装模型已可用；
@@ -387,8 +400,7 @@ Composer 必须一直存在，用户可以在设置完成前形成草稿。
 - `Esc` 立即 pop 当前 Overlay、恢复原焦点并撤销本次 `attempt_id`。后台取消异步进行；该 attempt 的迟到成功、迟到失败和 credential 响应一律丢弃且不得提交；
 - Device code、token 和 authorization header 只存在于认证任务所需的最短生命周期，不进入普通配置、Session journal、transcript、诊断导出或日志；
 - 代码过期后停止轮询并原地提供 `[Enter 获取新代码]`；只有用户确认才创建新的 attempt，旧 code 立即清除；
-- 登录成功后自动加载模型，不强迫用户额外完成模型向导；
-- 用户随时可通过 `/model` 修改推荐值。
+- 登录成功不会猜测或自动保存模型；用户仍可通过 `/model <id>` 保存选择。
 
 ### 6.4 未登录时发送
 
@@ -422,13 +434,12 @@ Composer 必须一直存在，用户可以在设置完成前形成草稿。
 
 ### 6.6 退出账号与切换账号
 
-`/logout` 是用户级高影响操作，先显示受影响的当前和后台 Session 数量。它不会删除 SessionRecord、历史或草稿。
+`/logout` 不删除 SessionRecord、历史或草稿。当前它只有一个受控存储入口：`ProviderAuthStore::clear(ChatGptSubscription)`。
 
-- 没有在途请求时：停止创建新请求，释放连接，安全删除凭据，再广播“需要登录”；
-- 有在途请求时：提供“等待请求完成后退出”“停止请求并退出”“取消”三个明确选项；
-- credential 删除失败时保持当前连接和有效状态，显示失败原因与重试；不能先把 UI 画成“已退出”；
-- 退出或账号 revision 变化后，其他进程不得静默继续用旧账号创建新请求；已发出的请求按连接语义完成或失败，并给出可见状态；
-- 重新登录或切换账号必须建立新连接并完成预检后才原子替换旧连接。
+- 若没有活跃 Endpoint/Model 持有 `ProviderAuthLease`：删除本地 Rig OAuth cache；这不宣称 revoke 远端会话；
+- 若有活跃 lease：返回 Busy，不删除任何文件。UI 提示用户先停止或退出持有连接的实例后再试；
+- 不使用 credential revision 广播、后台 broker 或强制切换已有连接；这些是后续设计；
+- 重新登录会取得新的 provider lease 和新的连接，不能把 OAuth payload 放进 SQLite 或普通 TUI 状态。
 
 ## 7. Command Palette
 
@@ -554,7 +565,9 @@ Help
 /archive    当前对话仍在运行；停止后可以归档
 ```
 
-## 8. Settings Center
+## 8. 后续：Settings Center
+
+> 当前没有 `/config` 或通用 descriptor registry。本节的 picker、scope 矩阵与 `Desired/Effective/LKG` 流程必须基于 typed `BoneStore` domain service 重新实现，不能恢复 JSON 文件配置或旧 Config API。
 
 ### 8.1 打开与作用范围
 
@@ -747,7 +760,9 @@ Candidate（仅 UI）
 - 远程验证可在 Overlay 关闭后继续，结果以 Toast 返回；
 - 设置中心打开时 Session 继续运行。
 
-## 9. Model Picker
+## 9. 后续：Model Picker 与 catalog
+
+> 当前 `/model` 不打开 picker，也没有 authoritative catalog。它只持久化用户给出的模型 ID，已 attached runtime 保持 pinned。以下搜索、验证缓存和“下一条消息”文案均是未来设计，当前应改为“新建或重建 runtime 使用新选择”。
 
 ### 9.1 默认界面
 
@@ -873,7 +888,9 @@ new-model · High
 
 不得用一次会计费的普通生成请求伪装成模型 listing。无 authoritative listing 时，版本化 catalog 只能提供候选，提交前仍走 Provider 支持的能力检查。
 
-## 10. 实时配置反馈规范
+## 10. 后续：实时设置反馈规范
+
+> 当前“实时”只指 SQLite mutation 立即完成或报错；不包括 runtime 热切换、`Desired/Effective/LKG`、apply acknowledgement 或 watcher。以下状态机不可被当作当前 reducer/effect contract。
 
 产品定义：
 
@@ -928,7 +945,9 @@ new-model · High
 
 连接切换失败时新凭据或连接 profile 不得成为 Effective。若 Desired 已持久化，UI 保持可见的“待修复”状态，并提供 `[R 重试] [K 恢复原设置] [D 诊断]`；选择恢复原设置走补偿事务。旧连接不可用时不能使用“继续使用原连接”，而要准确进入 `未连接` 并保留 Session 数据。
 
-## 11. 配置错误恢复
+## 11. 后续：详细设置错误恢复
+
+> 当前错误恢复的权威行为是：SQLite corruption、权限错误或 schema mismatch 保留数据库/WAL/SHM 并进入 repair/error；Busy/CAS conflict 只报告当前 mutation 失败；不自动 reset、迁移、备份恢复或使用 LKG。以下旧 ConfigStore 文案是未来 UX 素材。
 
 ### 11.1 单字段无效
 
@@ -1207,20 +1226,20 @@ Steer 或排队消息不会改变正在运行 User Turn 的 TurnConfig。只有�
 | 调用 | 模式 | 契约 |
 | --- | --- | --- |
 | `bone` 且 stdin/stdout 是 TTY | Full-screen TUI | 使用本文 App Shell、Overlay 与 slash command |
-| `bone <message>` | One-shot | 不进入 raw/full-screen TUI；创建当前 Workspace 的持久 SessionRecord 后执行一次任务 |
-| `bone --model <id> <message>` | One-shot + Session override | `<id>` 必须精确；只 materialize 为该 Session override，不修改 Workspace/User 默认 |
-| `bone --events <path> <message>` | One-shot + event export | durable journal 仍是事实来源；events 只是外部导出 |
+| `bone <message>` | One-shot | 不进入 raw/full-screen TUI；不创建或持久化 `SessionRecord` |
+| `bone --model <id> <message>` | One-shot + ephemeral override | `<id>` 仅作用于该次调用，不修改 Session/Workspace/User 默认 |
+| `bone --events <path> <message>` | One-shot + event export | JSONL events 只是外部观察导出，不是 durable journal |
 | `bone` 且不是 TTY、也没有 message | 非交互错误 | 不启动 TUI、不猜测 stdin prompt；提示显式传入 message |
 
 兼容要求：
 
-- one-shot、TUI 共用 cwd canonicalization、WorkspaceRegistry、配置解析、ModelCatalog、SessionStore 和安全策略；
-- one-shot 先把 SessionRecord 与用户消息 durable，再附着 Runtime；创建的对话会出现在以后从同一 Workspace 打开的 TUI 中；
+- one-shot、TUI 共用 cwd canonicalization、provider auth、全局 settings 解析和安全策略；one-shot 不使用 Workspace SessionStore 作为 durable transcript；
+- **未来设计，不是当前实现：**one-shot 先把 SessionRecord 与用户消息 durable，再附着 Runtime，并在以后从同一 Workspace 打开的 TUI 中恢复它；
 - 缺少账号或模型时不内嵌半套登录向导。TTY 输出简洁提示 `请先运行不带消息的 bone，在 TUI 中完成连接` 并非零退出；非 TTY 输出稳定、可解析的错误类别到 stderr；
 - 非 TTY 禁止设备登录、浏览器 opener、Overlay、ANSI 控制序列和 secret/code 输出；
 - one-shot 参数中以 `/` 开头的 message 是普通 Prompt，不解析本地 slash command；需要传递以 `-` 开头的文本时遵循 CLI 的 `--` 参数分隔规则；
-- `BONE_MODEL` 若保留，和 `--model` 一样只生成带来源的初始 Session override，之后可在 TUI 中替换或恢复继承，不能形成隐藏的永久优先级；
-- 错误退出必须说明消息是否已 durable、Session ID 是否已创建及能否在 TUI 恢复，但默认不输出内部路径、credential 信息或原始错误链。
+- `BONE_MODEL` 和 `--model` 一样只是本次调用的 ephemeral override，不能形成隐藏的持久优先级；
+- 错误退出必须说明消息是否已发送；当前无需报告 Session ID 或 TUI 恢复能力，且默认不输出内部路径、credential 信息或原始错误链。
 
 ## 14. 键盘交互矩阵
 
@@ -1426,9 +1445,9 @@ ABCD-EFGH
 
 失败发生在非当前 Session 或被关闭的 Overlay 时，只更新对应 Session flag、持续 Banner 或 Toast；不得切换当前 Session或重新打开 Overlay。用户从通知进入详情后，关闭详情必须回到通知前的焦点。
 
-## 18. 前端事件与状态建议
+## 18. 当前单向事件流边界与后续状态建议
 
-当前单 UI loop 可以保留。新增异步服务都将结果汇入同一个事件循环：
+当前单向 UI loop 保持：reducer 只变更展示状态，所有 SQLite、provider 和 runtime I/O 都在 effect 层完成后以结果事件回流。一个概念性事件面如下（不要求与 Rust enum 同名）：
 
 ```text
 UiEvent
@@ -1438,15 +1457,16 @@ UiEvent
 ├── AgentUpdate { session_id, runtime_generation, update }
 ├── RuntimeAttachmentUpdate { session_id, state, lease }
 ├── BootstrapUpdate
-├── ConfigUpdate { desired_revision, effective_revision, scope, diff, apply_state }
+├── ModelSelectionSaved { session_id, scope, resolved_source }
+├── StoreMutationFailed { operation, busy_or_conflict_or_error }
+├── StorageHealthUpdate { writable_or_repair_error }
 ├── AuthenticationUpdate { attempt_id, state }
-├── ConnectionUpdate { connection_revision, state }
-├── ModelCatalogUpdate
+├── ConnectionUpdate { state }
 ├── SessionStoreUpdate
 └── ToastExpired
 ```
 
-`attempt_id`、`runtime_generation` 和 revision 用于丢弃取消后或被新操作替代的迟到事件。事件循环是唯一能修改展示状态的 writer；observer、ConfigService、认证轮询和 Runtime task 不能直接改焦点、push Overlay 或绘制。
+`attempt_id`、`runtime_generation` 和 mutation identity 用于丢弃取消后或被新操作替代的迟到事件。SQLite document revision 只由 domain/store 层用于 CAS，普通 UI 不将其用作“已应用”状态。事件循环是唯一能修改展示状态的 writer；storage effect、认证轮询和 Runtime task 不能直接改焦点、push Overlay 或绘制。
 
 本地控制反馈使用独立的 `LocalSessionEvent` 流：
 
@@ -1497,13 +1517,15 @@ SessionPresentation
 - `SessionRecord`/`SessionStore` 与 `RuntimeAttachment` 的清晰边界；
 - `OverlayFrame`、`OverlayStack` 与 `FocusToken`；
 - `CommandRegistry`；
-- `SettingsState`；
-- `ModelPickerState`；
+- 当前 `/model` command state；
 - `NotificationState`；
-- `ConfigApplyState`（Desired/Effective/LKG + revision）；
-- 用于 auth、runtime 和 config 的 stale-event rejection。
+- 用于 auth、runtime 和 storage mutation 的 stale-event rejection。
 
-## 19. 前端验收清单
+`SettingsState`、`ModelPickerState` 和 `ConfigApplyState`（Desired/Effective/LKG + revision）是后续设计，不是本轮 TUI state 的依赖。
+
+## 19. 后续前端验收清单
+
+本清单是未来全功能 Settings Center / catalog / runtime-apply 版本的设计检查表。当前验收以第 0 节为准：模型三层存储与继承、pinned runtime 文案、SQLite transaction durable acceptance、storage repair/error，以及 provider auth Busy 行为。
 
 - [ ] 零配置执行 `bone` 会先看到 TUI，而不是 Shell 错误。
 - [ ] 配置/数据目录不存在时由后台自动创建，不要求用户寻找文件，也不向 Workspace 写 `.bone/`。
@@ -1546,21 +1568,23 @@ SessionPresentation
 - [ ] 状态不只依赖颜色，所有主流程可用方向键/Tab/Enter 完成，单字母快捷键不劫持文本输入。
 - [ ] 异常矩阵中每个异步状态都有成功、失败、取消或可操作等待终点，且关闭详情能恢复原焦点。
 
-## 20. 设计评审需确认的决策
+## 20. 后续设计评审需确认的决策
 
-以下决策不改变本稿已经固定的用户契约，但需要工程或产品在对应阶段选型：
+这些决策不得改变第 0 节的 SQLite `BoneStore`、opaque provider auth lease 或 pinned runtime 契约。
 
-1. `/doctor` 是否保留为 `/config doctor` 的公开别名；无论别名与否，后者必须可用；
+以下是后续 UX 版本需要重新确认的决策：
+
+1. 将来是否提供 `/doctor` 或 `/config doctor`；当前不承诺二者之一；
 2. 哪些终端可靠传递 `Ctrl-,`、`Ctrl-Left/Right` 与 bracketed paste；探测失败时必须使用本文 slash/Enter fallback；
-3. 多进程 credential 协调采用常驻 broker 还是短时 refresh lock；用户侧仍必须支持多个 Workspace 并行且不能泄露 secret；
+3. 将来若放宽当前 provider-auth exclusive lease，采用何种多进程 OAuth 协调；不得泄露 secret 或绕过 `ProviderAuthStore`；
 4. Session archive 的默认保留周期、可恢复删除窗口和存储配额；
 5. 当前 Provider 能否提供 authoritative model listing；不能时使用带“尚未验证”标签的版本化 catalog 与提交前能力检查；
 6. 引入写工具前，首次 Workspace 信任确认的内容和触发时机；当前只读能力不显示虚假写入承诺；
-7. 写工具上线时采用 Workspace 单写者、文件 revision 冲突检测、可选 worktree，或三者组合；
+7. 写工具上线时采用 Workspace 单写者、SQLite transaction/lease 冲突处理、可选 worktree，或三者组合；
 8. 支持“请求接管”所需的跨进程通知机制；不能安全实现的平台保持只读。
 
-已在本文固定、不得再由实现自行选择的行为包括：恢复上次选中 Session、一个 User Turn 锁定 TurnConfig、`//` 转义、粘贴保守策略、Overlay stack 返回焦点，以及 vNext 禁止跨 Workspace Fork/rebind。
+已由当前实现固定、不得再由实现自行选择的行为包括：Session/Workspace 的 SQLite 隔离、一个 runtime 使用冻结的 `ResolvedAgentRuntimeConfig`、`/model` 的三层继承、`//` 转义、pinned runtime 文案，以及 vNext 禁止跨 Workspace Fork/rebind。其余交互仍须按本稿的 future 标签重新确认。
 
 ## 21. 原型数据说明
 
-交互原型中的模型名、账号和任务内容仅用于展示布局与状态，不是硬编码产品数据。正式实现必须从认证状态、ModelCatalog、SessionStore 和 capability registry 中读取。
+交互原型中的模型名、账号和任务内容仅用于展示布局与状态，不是硬编码产品数据。当前实现从认证状态、typed `SettingsService`、`BoneStore` 与 SessionStore 读取；未来 catalog/capability registry 出现时再扩展来源。

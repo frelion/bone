@@ -2,26 +2,42 @@
 
 | 字段 | 内容 |
 | --- | --- |
-| 文档状态 | Ready for product & engineering review |
-| 目标版本 | BONE TUI vNext |
+| 文档状态 | 当前实现基线 + 后续体验设计参考 |
+| 目标版本 | SQLite `BoneStore` 重构完成后的 BONE TUI |
 | 产品优先级 | P0 |
 | 最后更新 | 2026-09-07 |
 | 产品范围 | 启动体验、TUI 配置、实时配置、Workspace、Session、Slash Command |
-| 核心原则 | 配置文件是内部持久化格式，不是用户界面 |
+| 核心原则 | 持久化对用户不可见；SQLite 是 BONE 自有数据的唯一真相来源 |
+
+> **当前实现优先级（2026-09-07）**
+>
+> 本节是当前工程与产品的生效契约，优先于本文后面保留的较早体验草案。BONE 不再有用户可编辑的配置文件、`bone-config`、`ConfigManager`、`ConfigSection`、`ConfigTool`、`BONE_CONFIG`、`BONE_STATE_DIR` 或 `credential_root`。不要将本文中较早的 JSON、JSONL、文件锁、`ConfigService`、`Desired/Effective/LKG`、配置 revision 或运行时热切换文字理解为当前实现行为；它们仅保留为未来产品设计素材，须重新设计后才可实现。
+>
+> 当前持久化与运行时边界如下：
+>
+> - BONE 自有设置、Workspace、Session、草稿、状态和会话事件历史只写入一个 SQLite 数据库。默认路径为 `$XDG_DATA_HOME/bone/store-v1/bone.sqlite3`，未设置 XDG 时为 `~/.local/share/bone/store-v1/bone.sqlite3`。数据库使用 WAL、`synchronous = FULL`、foreign keys 和 fail-fast Busy 语义；它不是用户设置入口，也不应手工编辑。
+> - `BoneStore` 在 App 启动时只打开一次，并按 `SettingsStore`、`WorkspaceStateStore`、`ProviderAuthStore` 的职责注入。`documents` 和 `journal_entries` 是存储内部表；业务代码仅使用 typed `Document<T>`、`Journal<E>`、受限 transaction 与 lease，不能自行拼 SQL、路径或任意 key。
+> - `GlobalSettings` 保存用户默认 Solver；`WorkspaceSettings` 保存工作目录默认 Solver；`SessionRecord` 保存当前会话 override。解析顺序固定为 **Session override > Workspace default > User default**。没有模型时正常进入 `NeedsModel`，不会猜测模型。
+> - `/model` 的保存立即持久化到其选择的 scope。已 attached 的 runtime 保持原来的不可变 `ResolvedAgentRuntimeConfig`；只有新建或重建 runtime 才解析新值。本轮没有 `/config` Settings Center、文件 watcher、跨进程设置通知或运行中热切换。
+> - 交互 TUI 启动时传入的初始模型会写入其打开的 Session override；one-shot 的 `--model` / `BONE_MODEL` 仅对该次调用生效，不创建或持久化 `SessionRecord`。
+> - 每个已接受的用户消息在同一个 SQLite transaction 中写入 `UserTurnAccepted` journal fact 与 Session summary/state。提交失败时不得清空 Composer 或启动 Agent。SQLite document revision 只是不透明的乐观并发 token，不是面向用户的“配置版本”。Session writer lease 是 fail-fast OS lock；其他进程可只读打开该 Session。
+> - ChatGPT OAuth 是唯一的 JSON 例外：Rig 持有 schema 和 refresh 生命周期，BONE 只提供经权限检查的 `ProviderAuthLease`。其私有 cache 默认在 `$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/store-v1/providers/chatgpt-subscription/`）。secret 永不进入 SQLite、journal、诊断或 TUI。活跃 Endpoint/Model 仍持有 lease 时，`/logout` 必须返回 Busy，不能删除 cache。
+>
+> 历史本地数据不会被读取、迁移、覆盖或删除；新版本从新的 `store-v1` 根开始。`--events` 的 JSONL 是 one-shot 观察导出，不是 BONE 的 durable store，也不得被拿来恢复 Session。
 
 ## 1. 执行摘要
 
-用户在任意目录执行 `bone` 后，必须直接进入一个可操作、可诊断、可恢复的 TUI。用户无需预先创建配置文件，无需复制示例 JSON，也无需知道模型 ID、配置 section 或配置文件路径。
+用户在任意目录执行 `bone` 后，直接进入一个可操作、可诊断、可恢复的 TUI。用户无需预先创建或查看任何设置文件，无需复制示例 JSON，也无需知道内部 document key、SQLite 路径或配置 section。
 
-启动时的精确当前目录，经规范化后成为本次 BONE 实例不可变的 Workspace。一个 Workspace 可以拥有多个相互独立、并发运行、可跨重启恢复的 Session。所有正式设置均可在 TUI 内通过选择器、表单或 slash command 完成，修改自动持久化，并在明确的安全边界实时生效。模型、推理强度和 Agent 行为在下一次用户轮次生效，不能在一个正在执行的用户任务中途换模型。
+启动时的精确当前目录，经规范化后成为本次 BONE 实例不可变的 Workspace。一个 Workspace 可以拥有多个相互独立、并发运行、可跨重启恢复的 Session。当前 `/model` 可在 TUI 内持久化模型选择；模型、推理强度和 Agent 行为在 runtime 创建时冻结，不能在一个正在执行的用户任务中途换模型。完整 Settings Center 与更广泛的设置命令是后续工作，不是本轮实现承诺。
 
 一句话产品定义：
 
-> 精确启动目录定义不可变 Workspace；Workspace 包含多个持久化 Session；BONE 在零配置、未登录或配置异常时仍可进入 TUI；所有正式配置通过 TUI 完成并实时响应。
+> 精确启动目录定义不可变 Workspace；Workspace 包含多个持久化 Session；BONE 在未选择模型、未登录或存储异常时仍可进入 TUI；当前模型选择由 TUI 完成，已运行任务保持其启动时冻结的配置。
 
 ## 2. 背景与问题
 
-### 2.1 当前已经具备的基础
+### 2.1 当前实现基础
 
 BONE 当前已经拥有：
 
@@ -29,20 +45,22 @@ BONE 当前已经拥有：
 - 一个 `AgentHost` 共享认证连接，多个 Session 独立运行；
 - 每个 Session 独立的草稿、历史、任务、滚动位置与未读状态；
 - 基于启动 `cwd` 的工具访问边界；
-- 类型化配置、JSON Schema、字段校验、revision、文件锁与原子写入；
+- 一个 App 生命周期内共享的 `BoneStore`，以 SQLite 保存 typed settings、Workspace、Session 和 journal；
+- SQLite transaction 把 durable user-turn acceptance 与 Session state 作为一个提交边界；
+- 以 document revision 做乐观并发控制、以 OS lease 做 Session writer 与 provider-auth ownership；
+- 不可变的 `ResolvedAgentRuntimeConfig`，由 App 在启动 runtime 前解析并注入 Agent；
 - 后台 Session 持续工作且不会抢走当前焦点。
 
-### 2.2 当前用户问题
+### 2.2 已解决的历史用户问题与后续缺口
 
-当前流程仍要求用户手动准备配置。交互模式会在进入 TUI 之前读取配置、要求 `agent.system`、完成认证、连接服务并创建第一个 Session。因此配置缺失、配置损坏、登录失败或模型不可用时，用户会在看到 TUI 前被阻断。
+旧流程曾要求用户手动准备配置，并会在进入 TUI 前读取 `agent.system`、认证和连接服务。这一阻断路径已被 SQLite `BoneStore` 与 `NeedsModel` 状态取代：没有模型也能打开 Workspace、Session 与草稿。存储损坏、权限错误或 schema 不匹配不会自动重置数据，而应进入 TUI 的 repair/error 状态。
 
-同时：
+下列条目是旧架构的问题，其中一部分已通过本轮实现解决，其他部分仍是后续体验工作：
 
-- 正常用户必须理解和编辑 JSON；
+- 正常用户曾必须理解和编辑 JSON；现在不再有这一产品路径；
 - 示例模型 ID 只是占位字符串，却可能通过本地校验；
 - 登录信息显示在全屏 TUI 之外；
-- 配置只在启动或 Session 创建时读取；
-- 已运行 Session 不响应设置修改；
+- 已运行 Session 不会热切换；这是当前刻意的 pinned-runtime 语义，而非文件读取缺陷；
 - 模型实例在 Session 创建时固定；
 - slash command 只有硬编码的 `/stop` 和 `/exit`；
 - Session ID 只在当前进程内有效，退出后无法恢复；
@@ -50,22 +68,22 @@ BONE 当前已经拥有：
 
 因此，本项目不是“增加一份默认配置”和“补几个命令”，而是建立 BONE 的产品级 App Shell、响应式设置系统、Workspace 身份和持久化 Session 模型。
 
-## 3. 产品愿景与体验原则
+## 3. 产品愿景与体验原则（第 0 节当前实现基线优先）
 
-### 3.1 配置文件对普通用户隐形
+### 3.1 持久化对普通用户隐形
 
-- 正常用户从安装到长期使用都不需要打开配置文件。
+- 正常用户从安装到长期使用都不需要打开任何持久化文件。
 - 不存在“只有手工编辑 JSON 才能完成”的公开设置。
-- 配置路径、内部 key、schema 和 revision 只出现在高级诊断中。
-- 手工配置可以保留为开发者逃生通道，但不进入正常文档路径。
+- SQLite 路径、内部 document key、schema 和 document revision 只可在技术诊断中出现。
+- 不提供手工配置文件这一开发者逃生通道；测试、portable embedding 与未来 host 通过显式 `StoreRoots` / `BoneStore::open_at(...)` 注入根路径。
 
 ### 3.2 TUI 始终是恢复入口
 
 以下情况不能阻止 TUI 启动：
 
-- 配置不存在；
-- 配置部分无效；
-- 配置文件整体损坏；
+- store 尚不存在；
+- 尚未选择模型；
+- SQLite store 损坏、权限异常或 schema 不匹配；
 - 尚未登录或登录过期；
 - 网络不可用；
 - 模型列表暂时不可用；
@@ -79,14 +97,12 @@ BONE 当前已经拥有：
 - 内部默认值由代码或版本化 catalog 提供，而不是复制示例文件。
 - 如果无法确定真实模型，进入 `NeedsModel`，不伪装成已就绪。
 
-### 3.4 修改即保存，状态必须真实
+### 3.4 当前修改即保存，状态必须真实
 
 - 设置项不需要“保存全部”按钮。
-- 用户确认一个值后立即形成候选值并开始校验、准备、持久化和应用流程。
-- UI 必须区分用户想保存的 `Desired`、当前运行时使用的 `Effective` 和可回退的 `Last Known Good`，不能把“已保存”写成“已应用”。
-- UI 只有在运行时确认 `effective_revision` 后才能显示“已应用”。
-- 应用失败时继续使用 Last Known Good，并给出重试、放弃候选值或查看详情的明确动作。
-- 不能出现“界面显示新值，底层仍使用旧值”的分裂状态。
+- 当前 `/model` 成功后立即作为 typed document 写入 SQLite；CAS conflict 或 Busy 会返回可见错误，不能冒充成功。
+- 已 attached runtime 保持启动时冻结的完整 `ResolvedAgentRuntimeConfig`。界面应说明新模型用于下一次 runtime 创建或重建，而不是宣称已经改变正在运行的任务。
+- `Desired/Effective/Last Known Good` 三阶段设置状态、运行时 apply acknowledgement 和热切换不是当前行为；后续实现必须在不破坏上述 pinned-runtime 语义的前提下重新设计。
 
 ### 3.5 作用范围用人话表达
 
@@ -100,7 +116,7 @@ BONE 当前已经拥有：
 
 ### 3.6 实时不破坏进行中的工作
 
-实时配置指无需退出、重启、新建 Session 或手工 reload。一次用户消息触发的完整 Agent 工作周期称为一个 User Turn。Turn 开始时锁定一份 `TurnConfig`；模型、推理强度、Coordinator 和 Agent 行为设置在整个 Turn 内保持一致。Turn 执行期间修改这些设置时，立即保存并显示为“下一条用户消息生效”，从下一条用户消息启动的新 Turn 起使用。展示设置即时生效，权限收紧可作为安全例外立即约束当前 Turn 后续尚未开始的工具调度。
+本轮的“实时保存”只表示 mutation 立即提交 SQLite，不表示热切换。一次用户消息触发的完整 Agent 工作周期称为一个 User Turn；Agent 使用 App 在启动 runtime 前解析的不可变 `ResolvedAgentRuntimeConfig`。正在执行的 runtime 不更换模型；新建或重建 runtime 才使用当前 Session/Workspace/User 覆盖后的值。展示设置可以在下一帧更新，但不能用它推断运行时已经切换。
 
 ### 3.7 不丢用户工作
 
@@ -160,7 +176,7 @@ BONE 当前已经拥有：
 
 > 当登录、网络、模型或设置出现问题时，我希望仍能进入 TUI，知道数据是否安全，并在界面中完成恢复。
 
-## 6. 核心概念与产品边界
+## 6. 核心概念与产品边界（当前存储/运行时规则以第 0 节为准）
 
 ### 6.1 Workspace
 
@@ -231,7 +247,7 @@ title
 created_at / updated_at / last_opened_at
 status
 solver model override
-effective config revision
+opaque document revision（仅并发控制，不在普通 UI 展示）
 message and event history
 draft
 scroll and UI recovery state
@@ -249,11 +265,11 @@ Runtime attachment: Detached | Attaching | Attached
 Attention flags: Unread | UnresolvedEffect | ConfigPending | RecoveryNeeded
 ```
 
-### 6.3 User Turn 与 TurnConfig
+### 6.3 User Turn 与不可变 Runtime Config
 
 一条已持久化并被接受的用户消息启动一个 User Turn。Turn 可以包含多次模型调用、工具调用和 Coordinator 判断，直到完成、等待用户、停止或中断。
 
-Turn 开始时从当前 `effective_revision` 解析并锁定 `TurnConfig`：
+App 在接受用户消息前解析完整配置，并在启动/重建 runtime 时锁定 `ResolvedAgentRuntimeConfig`：
 
 ```text
 solver model and effort
@@ -263,11 +279,9 @@ model deadlines
 model-visible tool definitions
 ```
 
-上述值在同一 Turn 内不变化。Turn 进行时产生的新配置 revision 可以立即保存，但在该 Session 中标记为 `PendingNextTurn`。工具权限收紧和凭据失效属于安全例外：它们可以立即阻止后续尚未开始的操作，但不能伪装成已经改变了正在执行的模型请求。
+上述值在同一 runtime/Turn 内不变化。Turn 进行时的 `/model` 可以立即保存到 SQLite，但不得改变已 attached runtime；新建或重建 runtime 才解析该值。本轮不维护 `PendingNextTurn`、`Effective` 或 Last Known Good 的用户可见状态。
 
-`Effective` 表示配置解析器已经接受、下一项符合生效边界的新工作将使用的值；它不追溯修改已经创建的 TurnConfig。因而 Working Session 可以同时显示 `TurnConfig revision A` 与 `Effective revision B / Next turn`，这是一种可解释的 pending 状态，不是运行时分裂。
-
-### 6.4 配置作用域与 descriptor
+### 6.4 当前模型设置作用域
 
 有效优先级：
 
@@ -275,12 +289,11 @@ model-visible tool definitions
 Current Session override
 > Workspace settings
 > User settings
-> BONE built-in defaults
 ```
 
-`--model` 在创建 Session 时 materialize 为普通 Session override，并记录 `source=cli`；它不是额外的长期优先级，也不是不可修改的锁。用户可用 `/model` 替换，或用 `/model inherit` 删除 Session override、重新跟随 Workspace/User 默认值。`BONE_MODEL` 若保留，也必须 materialize 为带来源的初始值，不得成为 TUI 无法覆盖的隐藏层。
+`GlobalSettings.agent.default_solver` 是用户默认值；`WorkspaceSettings.default_solver` 是工作目录默认值；`SessionRecord.solver_model_override` 是当前对话覆盖。`/model` 可写入这三个 scope；`/model inherit` 删除 Session override 并恢复 Workspace/User 继承。没有隐式环境变量层，也不会猜一个内建模型。
 
-每个公开设置必须注册一个 descriptor，而不是由设置中心猜测作用域：
+下面的 descriptor/Settings Center 设计是后续产品工作，不是当前存储 API：
 
 ```text
 key and user-facing label
@@ -304,22 +317,18 @@ sensitivity and model visibility
 | Account、credential、当前 Provider 连接 | User | User | 全局影响需摘要和确认 |
 | Workspace root | 无可写作用域 | 不适用 | 当前实例不可修改 |
 
-每个解析后的值至少包含：
+当前解析结果仅需包含：
 
 ```text
-value
-source
-scope
-revision
-is_inherited
-validation_state
-apply_boundary
-runtime_state
+solver/coordinator 模型与 effort
+tool limits 与 runtime deadlines
+完整 resolved runtime fingerprint
+来源 scope（仅诊断）
 ```
 
-### 6.5 Desired、Effective 与 Last Known Good
+### 6.5 已取代的 Desired、Effective 与 Last Known Good 设计
 
-配置服务维护三个明确概念：
+以下三阶段是保留的未来 UX 设计，不是当前 `BoneStore` 或 TUI 的行为：
 
 ```text
 Desired          用户刚确认、希望采用的候选配置
@@ -360,19 +369,17 @@ Create candidate Desired
 → 后台创建最小内部存储
 → 显示当前工作目录
 → 创建可持久化的 Draft SessionRecord
-→ 在 TUI 内连接 ChatGPT
-→ 获取真实可用模型
-→ 在没有既有 User 默认值时，明确显示并保存 Provider 推荐模型为 User 默认；无法可靠推荐时让用户选择
-→ 设置自动保存
-→ 惰性附着 Agent Runtime
+→ 无模型时显示 `NeedsModel`
+→ 用户在 TUI 内执行 `/model <id>`、`/model default <id>` 或 `/model global <id>`
+→ 在需要工作时连接 ChatGPT 并惰性附着 Agent Runtime
 → 发出第一条任务
 ```
 
 要求：
 
-- 不出现配置文件步骤；
-- 不要求用户输入模型 ID；
-- 首次推荐模型的“所有工作目录”作用范围必须可见，不能静默覆盖既有 User/Workspace 设置；
+- 不出现设置文件步骤；
+- 当前需要用户提供模型 ID；catalog/picker 与推荐模型是后续工作；
+- `/model` 的 scope 必须明确，不得静默覆盖既有 User/Workspace 值；
 - TUI 首帧不等待网络；
 - 用户可以先写草稿；
 - 如果用户确认发送，登录成功后才自动提交；
@@ -381,27 +388,21 @@ Create candidate Desired
 ### 7.2 切换当前 Session 模型
 
 ```text
-/model
-→ 打开真实模型选择器
+/model <id>
 → 默认范围为“仅当前对话”
-→ 用户选择
-→ 验证能力
+→ 校验模型选择格式
 → 持久化 Session override
-→ 显示生效边界
-→ 当前 User Turn 保持原 TurnConfig
-→ 下一条用户消息启动的 User Turn 使用新模型
+→ 显示“已 attached runtime 保持 pinned；新建或重建 runtime 使用此模型”
 ```
 
 ### 7.3 修改当前 Workspace 默认值
 
 ```text
-/config
-→ Models
+/model default <id>
 → 修改“当前工作目录”的默认模型
-→ 原子保存
-→ 继承 Workspace 设置的 Session 在下一个 User Turn 更新
+→ SQLite transaction 保存
+→ 继承 Workspace 设置的 Session 在下一次 runtime 创建时解析新值
 → 有独立覆盖的 Session 保持不变
-→ UI 汇总受影响 Session 数量
 ```
 
 ### 7.4 恢复多个 Session
@@ -416,20 +417,20 @@ Create candidate Desired
 → 用户决定继续、重新提交或保留历史
 ```
 
-### 7.5 配置损坏
+### 7.5 Store 故障
 
 ```text
 执行 bone
 → TUI 仍然出现
-→ 显示“设置需要修复”
-→ 保留原始损坏数据
-→ 优先使用 Last Known Good；没有 LKG 时权限与工具 fail closed
-→ 用户选择自动修复、临时继续或查看诊断
+→ 显示“存储需要修复”
+→ 保留 SQLite database、WAL 和 SHM
+→ 不自动 reset、删除、覆盖、迁移或猜测替代设置
+→ 用户可以查看诊断、重试或安全退出
 ```
 
 ### 7.6 One-shot CLI
 
-本 PRD 的 App Shell 和 Overlay 交互仅适用于无消息参数的交互模式，但 one-shot 命令必须复用相同的 Workspace、配置解析、模型目录和 SessionStore 语义：
+本 PRD 的 App Shell 和 Overlay 交互仅适用于无消息参数的交互模式。当前 one-shot 只复用 Store 中的全局设置解析、provider auth 与 Agent runtime 接线；它不创建或持久化 Session：
 
 ```text
 bone <message>
@@ -437,14 +438,14 @@ bone --model <id> <message>
 bone --events <path> <message>
 ```
 
-- `bone <message>` 从当前精确 `cwd` 创建一个持久 SessionRecord，消息 durable 后才启动 Runtime；
-- `--model` materialize 为该 Session 的初始 override，不写 Workspace/User 默认值；
+- `bone <message>` 不创建 `SessionRecord`；
+- `--model` / `BONE_MODEL` 是该次调用的 ephemeral override，不写 Session/Workspace/User 默认值；
 - 已有有效认证和模型时直接执行；
 - 首次使用且 stdin/stdout 为 TTY 时，提示用户先运行无参数 `bone` 完成 TUI 设置，不降级为手改文件；
 - 非 TTY 且缺少认证或模型时，以结构清楚、可执行的错误退出，不尝试设备登录，不打印 secret；
-- `--events` 仍是外部观察导出，不替代 durable Session journal；
-- one-shot 创建的 Session 默认出现在当前 Workspace 的 Session 列表中，并可在 TUI 中继续；
-- CLI/环境来源必须在 `/status` 的技术详情中可解释，TUI 设置仍可覆盖 Session 值。
+- `--events` 是外部观察导出，不替代 SQLite 内的 durable Session journal；
+- **未来设计，不是当前实现：**让 one-shot 创建可在 TUI 中继续的 durable Session；
+- 交互 TUI 启动的初始模型可写入打开的 Session override；TUI 后续设置可以覆盖它。
 
 ## 8. 功能需求
 
@@ -479,40 +480,39 @@ FatalStorageError
 
 `FatalStorageError` 是 TUI 内可诊断的阻断页，不是首帧前的 stderr 退出。它必须说明哪些数据尚未持久化，并保留当前进程仍持有的草稿。
 
-### 8.2 配置存储与迁移
+### 8.2 当前存储架构与故障语义
 
 | ID | 优先级 | 需求 |
 | --- | --- | --- |
-| CFG-001 | P0 | 自动创建的用户配置仅包含 schema/version 等稳定字段，不包含假模型或 secret |
-| CFG-002 | P0 | 内部配置具有 schema version 和幂等迁移机制 |
-| CFG-003 | P0 | 配置服务按 Desired → 预检/准备 → 持久化 → 原子应用 → Effective/LKG 的事务契约处理修改 |
-| CFG-004 | P0 | 任一步失败时保留 Last Known Good 为 Effective，并显示 Desired 是否已保存、为何未应用 |
-| CFG-005 | P0 | 损坏配置的原始内容必须保留或备份，不得静默覆盖 |
-| CFG-006 | P0 | 合法 section 尽可能继续工作，单字段错误不拖垮整份配置 |
-| CFG-007 | P0 | token、OAuth code、API key 与普通配置、Session 日志完全隔离 |
-| CFG-008 | P0 | 多进程修改使用 revision/CAS；不同字段可安全重放，同字段冲突提供人类化选择，不允许静默 last-write-wins |
-| CFG-009 | P1 | 高级用户外部修改配置时，运行中的 BONE 可监听并走相同校验/应用流程 |
-| CFG-010 | P0 | 权限、工具、shell、network 等安全设置损坏或不可解析时使用 LKG；无 LKG 时按最小权限 fail closed，自动修复不得扩大权限 |
-| CFG-011 | P0 | 磁盘满、权限丢失、文件锁超时和迁移失败均进入可恢复状态，不得把未持久化内容标记为已保存 |
+| ID | 优先级 | 当前实现契约 |
+| --- | --- | --- |
+| STORE-001 | P0 | 首次交互式启动自动创建 SQLite store、schema、全局 settings 与 Workspace/Session record；不猜模型、不自动登录 |
+| STORE-002 | P0 | BONE 自有业务数据只有 `bone.sqlite3` 一个 source of truth；没有 JSON/JSONL 双写、session index 文件或用户设置文件 |
+| STORE-003 | P0 | typed `Document<T>` 以 revision CAS 更新；短 `BEGIN IMMEDIATE` 写 transaction 遇到竞争立即返回 Busy，TUI 不得阻塞 reducer |
+| STORE-004 | P0 | 同一 transaction 内写入 accepted user-turn journal fact、Session summary 和 active-turn state；任一步失败整体 rollback |
+| STORE-005 | P0 | 数据库损坏、权限异常或 schema 版本不匹配不得自动 reset、删除、迁移或覆盖旧数据；TUI 进入 storage repair/error 状态 |
+| STORE-006 | P0 | Session writer lease 与 provider auth lease 是 fail-fast OS lock，不承担普通 document 写入锁；lease 冲突有可见 Busy/只读状态 |
+| STORE-007 | P0 | token、OAuth code、API key 与 ordinary SQLite documents、journal、日志和诊断完全隔离 |
+| STORE-008 | P0 | 历史文件格式、外部手改持久化文件、自动 backup/recovery/import 和跨进程 watcher 都不属于本轮 |
 
-内部建议存储职责：
+当前物理存储职责：
 
 ```text
-User config directory
-  └── user settings and migrations
-
 User data directory
-  ├── workspace registry
-  └── per-workspace settings, session index, journals, snapshots, UI state
+  └── `bone/store-v1/bone.sqlite3`
+      ├── global settings, workspace registry and workspace settings
+      └── session records, drafts, state and journals
 
-Secure credential store
-  └── access token, refresh token and credential metadata
+Private provider config directory
+  └── `bone/store-v1/providers/chatgpt-subscription/auth.json` (Rig-owned opaque cache)
 
 Workspace directory
   └── no implicit BONE internal data
 ```
 
-### 8.3 TUI 设置中心
+### 8.3 后续：TUI 设置中心
+
+> 本节是保留的交互设计，不是当前命令面。当前可用的设置入口是 `/model`、`/model default <id>`、`/model global <id>` 和 `/model inherit`；不得将 `/config`、descriptor registry 或 JSON 设置编辑器视为已实现功能。
 
 | ID | 优先级 | 需求 |
 | --- | --- | --- |
@@ -542,55 +542,46 @@ Diagnostics
 
 设置只展示当前注册且真实可用的能力；例如当前没有写工具时，不显示一个可开启但无效的“文件写入”开关。
 
-### 8.4 响应式实时配置
+### 8.4 当前模型保存与 runtime 生效边界
 
 | ID | 优先级 | 需求 |
 | --- | --- | --- |
-| LIVE-001 | P0 | 所有配置读写经过统一 `ConfigService`，并发布带 revision、diff、scope 与生效边界的事件 |
-| LIVE-002 | P0 | TUI、ModelRouter、ConnectionManager、ToolPolicy 和 SessionRuntime 订阅配置事件 |
-| LIVE-003 | P0 | Session 不得只持有一份永不更新的完整配置快照 |
-| LIVE-004 | P0 | 每个 User Turn 锁定 TurnConfig；同一 Turn 内全部模型调用使用同一 Agent 配置 revision |
-| LIVE-005 | P0 | UI 明确区分 Validating、Preparing、Saved、Pending next turn、Applied、Failed/LKG active |
-| LIVE-006 | P0 | Workspace/User 设置更新所有仍处于继承状态的 Session，从各自下一个 User Turn 生效，不覆盖 Session override |
-| LIVE-007 | P0 | 新连接成功前旧连接保持可用；失败时不破坏旧连接和旧设置 |
-| LIVE-008 | P1 | 每个 turn、模型调用和工具调用记录实际使用的配置 revision，默认仅诊断可见 |
-| LIVE-009 | P0 | runtime apply acknowledgement 必须携带 effective revision；UI 不得仅根据文件 revision 宣称已应用 |
-| LIVE-010 | P0 | TUI 内产生的 Workspace/User 配置变更通过跨进程通知或文件 revision watcher 同步到其他运行实例，并按同一安全边界应用；任意外部手改文件的自动监听仍为 P1 |
+| LIVE-001 | P0 | `SettingsService` 解析 typed Global/Workspace/Session values，生成完整的 immutable `ResolvedAgentRuntimeConfig` 和 fingerprint |
+| LIVE-002 | P0 | `/model` 的 scope mutation 通过 `BoneStore` 立即提交；success 只表示已持久化，Busy/CAS conflict 必须可见 |
+| LIVE-003 | P0 | 已 attached runtime 不订阅设置变化，也不从磁盘重读配置；它始终使用启动时注入的完整 runtime config |
+| LIVE-004 | P0 | 新建或重建 runtime 解析当前覆盖链；Session override 的清除立即恢复 Workspace/User 继承 |
+| LIVE-005 | P0 | journal 记录实际 solver 与完整 resolved runtime fingerprint，避免接受消息与启动 runtime 读到不同配置 |
+| LIVE-006 | P1 | Settings Center、运行时 apply acknowledgement、跨进程设置通知、watcher 和 runtime hot switch 另行设计，不得借旧文件 revision 旁路 `BoneStore` |
 
-安全生效边界：
+当前生效边界：
 
 | 设置 | 生效时间 |
 | --- | --- |
-| 主题、布局、语言、进度显示 | 当前或下一帧 |
-| 当前 Session 模型、推理强度 | 当前 Turn 结束后，下一条用户消息启动的新 Turn |
-| Workspace/User 模型默认值 | 继承该值的 Session 下一 User Turn；新 Session 首个 Turn 立即继承 |
-| Coordinator 模型和 Agent 行为 | 下一 User Turn，避免一个任务中途混用两套行为 |
-| 模型超时 | 下一 User Turn 中的模型 job |
-| 模型可见工具集合与 schema | 下一 User Turn，保持 TurnConfig 一致 |
-| Host 侧工具执行限制 | 下一次尚未开始的工具调用 |
-| 权限收紧 | 当前任务后续工具调度立即受限 |
-| 权限放宽 | Host policy 可立即准备；新增模型可见能力从下一 User Turn 使用 |
-| 当前 ChatGPT 账号认证与连接 | 新连接准备完成后原子切换；当前 Turn 中已发出的请求不变 |
+| `/model` Session / Workspace / User mutation | SQLite commit 后立即成为下一次 runtime 解析的输入 |
+| 已 attached runtime 的 solver、coordinator、limits、deadline | 保持启动时的 `ResolvedAgentRuntimeConfig`，不热切换 |
+| 新建或重建 runtime | 使用当时解析的覆盖链并计算新 fingerprint |
+| ChatGPT auth cache | Endpoint/Model 持有 provider lease；活跃 lease 存在时 logout 返回 Busy |
 | Workspace root | 当前实例不可修改 |
 
 ### 8.5 模型选择
 
+当前命令面不依赖 catalog 或 Settings Center。`/model` 不带参数时只说明可用语法；调用方提供的模型 ID 做领域格式校验，Provider 能力的最终验证发生在建立 runtime/请求时。本节后面的 catalog、picker 和缓存要求是未来体验设计。
+
 | ID | 优先级 | 需求 |
 | --- | --- | --- |
-| MODEL-001 | P0 | `/model` 打开来自当前账号真实能力目录的模型选择器 |
-| MODEL-002 | P0 | 默认作用于当前 Session，避免意外影响其他对话 |
-| MODEL-003 | P0 | `/model <id>` 修改当前 Session Solver；Idle 时用于下一 Turn，Working 时标记 PendingNextTurn |
+| MODEL-001 | P0 | `/model` 无参数说明当前可用语法；Model Picker / provider catalog 是后续工作 |
+| MODEL-002 | P0 | `/model <id>` 默认作用于当前 Session，避免意外影响其他对话 |
+| MODEL-003 | P0 | `/model <id>` 修改当前 Session Solver；已 attached runtime 保持 pinned，新建或重建 runtime 使用保存的选择 |
 | MODEL-004 | P0 | `/model default <id>` 修改当前 Workspace 的默认 Solver |
 | MODEL-005 | P0 | `/model global <id>` 修改用户级默认 Solver |
 | MODEL-005A | P0 | `/model inherit` 删除当前 Session override，使其重新继承 Workspace/User 默认模型 |
 | MODEL-006 | P0 | 普通 `/model` 不修改 Coordinator；Coordinator 位于 Models 的高级设置 |
-| MODEL-007 | P0 | 提交前验证账号、Provider、模型和 reasoning effort 兼容性 |
-| MODEL-008 | P0 | 错误需区分登录过期、模型不存在、账号不可用、限流、网络和服务故障 |
-| MODEL-009 | P0 | 模型目录刷新失败时可使用最近成功缓存，并明确显示缓存时间和验证状态 |
-| MODEL-010 | P1 | 高级入口允许手工模型 ID，但不得标记为“已验证可用” |
-| MODEL-011 | P0 | P0 仅支持当前 ChatGPT Provider 内选择模型和重连，不展示尚未实现的 Provider/endpoint 切换 |
+| MODEL-007 | P0 | 本地仅验证模型选择的领域格式；Provider/账号兼容性在连接/runtime 请求时由实际结果报告 |
+| MODEL-008 | P0 | 失败不得清空草稿或伪造已切换；错误应保持可操作 |
+| MODEL-009 | P1 | authoritative model catalog、缓存 freshness、搜索和 picker 另行设计 |
+| MODEL-010 | P0 | 当前只支持 ChatGPT subscription Provider，不展示未实现的 Provider/endpoint 切换 |
 
-模型目录的来源和可信度必须可解释：
+以下 model catalog 来源与可信度规则是未来设计，不是当前 `/model` 实现：
 
 | 来源 | UI 标记 | 可否直接称为当前账号可用 |
 | --- | --- | --- |
@@ -599,7 +590,7 @@ Diagnostics
 | BONE 版本化兼容 catalog | 尚未验证 | 不可以，只能作为候选并在提交前做 Provider 能力验证 |
 | 用户手工输入 | 未验证 | 不可以，且只在高级入口出现 |
 
-P0 必须提供 `ModelCatalog` 端口。若当前 ChatGPT 服务没有 authoritative listing，则使用版本化 catalog 提供无需记 ID 的候选项，并在应用前通过 Provider 支持的能力检查验证；不得通过一次会计费的普通生成请求伪装成 listing。刷新失败时：
+未来 P0 若提供 `ModelCatalog`，必须遵循以下规则；当前不得通过一次会计费的普通生成请求伪装成 listing。刷新失败时：
 
 - 已存在成功使用的 Effective/LKG 模型时可继续使用，并标记目录信息是否过期；
 - 没有任何已验证模型时进入 `NeedsModel`，说明无法验证的原因并提供重试/重新登录；
@@ -628,14 +619,13 @@ WorkspaceRegistry[platform namespace + canonical absolute path] = random UUID
 
 存储和锁契约：
 
-- 用户设置和 WorkspaceRegistry 使用短时文件锁、revision/CAS 和原子替换，不能在整个 BONE 进程生命周期内持锁；
-- Session journal 每个 Session 只有一个 writer，获得可写 Runtime lease 后才能接受新消息；
+- 用户设置、WorkspaceRegistry、Workspace settings、Session records 与 journals 通过 SQLite 的短 `BEGIN IMMEDIATE` transaction 和 document revision/CAS 更新；遇到并发写立即返回 Busy，不在 TUI reducer 中等待；
+- Session journal 每个 Session 只有一个 writer，获得 fail-fast OS Session writer lease 后才能接受新消息；
 - 同一 Session 已被其他进程使用时，当前进程可以只读查看、返回该实例，或经明确确认请求接管，不能双写；
-- Runtime lease 带单调递增 fencing token；接管必须原子增加 token，使旧 writer 的后续写入被存储层拒绝并促使旧 Runtime 停止，不能只依赖 PID 或超时避免双写；
+- 当前 lease 是 ownership lock，不是 SQLite transaction 或通用文档写锁；其失效由进程退出释放，当前版本不实现 fencing-token 接管协议；
 - 同一 Workspace 的不同 Session 可以并发持有各自 journal lease；
-- credential 由用户级 `CredentialBroker` 协调，连接只获取可撤销的 token snapshot/lease；refresh 由 broker 串行化，不能让每个 `AgentHost` 长期独占 credential 文件；
-- 如果 CredentialBroker 进程不可用，实现可以使用短时跨进程 refresh lock，但普通 token 读取和既有连接不得被长锁阻塞；
-- logout/account switch 由 broker 广播 credential revision，所有进程停止创建新请求并进入明确的重新认证状态；已发出的请求按其连接语义完成或失败，不能静默换账号。
+- Provider auth lease 在 `auth.lock` 上独占，Endpoint 与其派生 Model handle 存活期间一直持有；同 provider/root 的第二个连接立即返回 Busy，不同 provider 不共享 lock；
+- `/logout` 只能经 `ProviderAuthStore::clear` 删除本地 Rig OAuth cache。若仍有活跃 lease 则返回 Busy；成功只清除本地 cache，不宣称 revoke 远端会话。
 
 ### 8.7 持久化 Session
 
@@ -652,7 +642,7 @@ WorkspaceRegistry[platform namespace + canonical absolute path] = random UUID
 | SES-009 | P0 | `/new`、`/sessions`、`/resume`、`/rename`、`/archive` 只默认作用于当前 Workspace |
 | SES-010 | P0 | 其他 Workspace 的 Session 恢复请求必须拒绝并显示其原目录 |
 | SES-011 | P1 | `/delete` 使用可恢复删除或二次确认，不与 archive 混淆 |
-| SES-012 | P0 | 用户消息只有在 journal durable append 成功后才显示 Accepted、清空 Composer 并启动 Agent Turn |
+| SES-012 | P0 | 用户消息只有在同一个 SQLite transaction 中写入 `UserTurnAccepted`、Session summary/state 并成功 commit 后才显示 Accepted、清空 Composer 并启动 Agent Turn |
 | SES-013 | P0 | 启动仅加载 Session index；历史按需 hydrate，Runtime 按需 attach，不为全部历史 Session 建立模型运行时 |
 | SES-014 | P0 | 同一 Session 的可写 Runtime lease 互斥；锁冲突时只读打开、定位已有实例或显式接管 |
 | SES-015 | P0 | 恢复后提交的新消息必须获得已完成历史的模型可见上下文，而不仅是恢复 UI timeline |
@@ -666,8 +656,10 @@ WorkspaceRegistry[platform namespace + canonical absolute path] = random UUID
 
 ```text
 Composer text
-→ append complete UserMessage record to per-session journal
-→ flush according to durable store contract
+→ begin SQLite write transaction
+→ append `UserTurnAccepted` to per-session journal
+→ update Session summary / active-turn state
+→ commit according to durable store contract
 → return durable acknowledgement
 → clear Composer and mark Accepted
 → start User Turn
@@ -675,7 +667,7 @@ Composer text
 
 规则：
 
-- durable acknowledgement 至少发生在 journal/database transaction commit 并完成平台可用的同步落盘屏障之后；RPO 0 的故障域覆盖正常退出、进程崩溃和强制终止，不承诺存储硬件损毁；
+- durable acknowledgement 只发生在 journal 与 Session state 的同一个 SQLite transaction commit 后；SQLite 使用 WAL 与 `synchronous = FULL`。RPO 0 的故障域覆盖正常退出、进程崩溃和强制终止，不承诺存储硬件损毁；
 - journal 写入失败、磁盘满或 writer lease 丢失时，不清空 Composer、不启动 Agent；
 - clean shutdown 下已展示的完整草稿、已确认消息和完成事件 RPO 为 0；
 - abnormal crash 下已确认消息 RPO 为 0；
@@ -694,7 +686,7 @@ approved compaction summaries and their source range
 interrupted-turn boundary
 agent protocol/system-prompt version
 tool-schema version
-historical model/config revision metadata
+historical actual solver and resolved runtime fingerprint metadata
 ```
 
 恢复语义：
@@ -702,7 +694,7 @@ historical model/config revision metadata
 - 已完成 Turn 可进入后续模型上下文；
 - 未完成 Turn 以明确的 Interrupted boundary 结束，只保留可证明完成的消息和工具结果；
 - 不重新执行历史工具或副作用；
-- 新 Turn 使用当前 Effective 配置并创建新的 TurnConfig，历史仍保留其原模型/revision 元数据；
+- 新建或重建 runtime 时使用当前已解析的配置；历史保留其实际 solver 与 runtime fingerprint 元数据；
 - 历史超出上下文窗口时使用已持久化且可追溯的 compaction summary；
 - 协议或 system prompt 版本不兼容时，Session 可以只读打开，但在完成迁移或用户确认新的 continuation boundary 前不能伪装成可无损继续；
 - 可视 timeline 不是恢复上下文的唯一数据源。
@@ -782,21 +774,21 @@ Busy 时：
 | --- | --- | --- |
 | AUTH-001 | P0 | `/login`、首次登录、重新认证和 device flow 全程在 TUI Overlay 内完成，取消、过期和失败均返回可操作状态且不丢草稿 |
 | AUTH-002 | P0 | Account/credential 是 User scope；登录或切换账号不得被伪装成当前 Session 私有设置 |
-| AUTH-003 | P0 | `/logout` 显示所有受影响的本地 BONE 实例/Session 摘要并确认，由 CredentialBroker 删除或吊销本地 credential、发布新 credential revision |
-| AUTH-004 | P0 | logout/account switch 后停止创建新模型请求；已发出的请求使用原 credential 完成或明确失败，不能在一次请求中静默换账号 |
+| AUTH-003 | P0 | `/logout` 经 `ProviderAuthStore::clear(ChatGptSubscription)` 清除本地 Rig OAuth cache；若任何 Endpoint/Model 仍持有 `ProviderAuthLease`，返回 Busy 而不删除任何文件 |
+| AUTH-004 | P0 | logout 成功不宣称 revoke 远端会话；已发出的请求由其现有连接语义完成或失败，不能在一次请求中静默换账号 |
 | AUTH-005 | P0 | SessionRecord、历史和草稿保持本地可见；新账号首次向旧 Session 发起 Turn 前再次确认数据将发送给新账号 |
 | AUTH-006 | P0 | device code、token 和 authorization header 不进入持久 transcript、普通日志、诊断导出或模型上下文 |
 
-`/logout` 不删除 Session。若当前有 Working Session，确认页必须说明：新模型请求将停止，当前请求可能完成或失败，草稿与历史仍保留。用户取消确认时不得改变 credential 或连接状态。
+`/logout` 不删除 Session。若当前有 Working Session，provider lease 使 logout 直接失败为 Busy；界面必须说明先停止或退出持有连接的实例后再试，草稿与历史仍保留。用户取消确认时不得改变 credential 或连接状态。
 
 ### 8.10 状态、诊断与恢复
 
 | ID | 优先级 | 需求 |
 | --- | --- | --- |
-| DIAG-001 | P0 | `/status` 展示 Workspace、当前 Session、当前 TurnConfig、下一 Turn Effective 值、配置来源/待生效变更、认证与连接状态 |
-| DIAG-002 | P0 | `/config doctor` 检查 Desired/Effective/LKG、WorkspaceRegistry、SessionStore/lease、CredentialBroker、目录权限和模型目录/连接 |
+| DIAG-001 | P0 | `/status` 展示 Workspace、当前 Session、已解析模型来源、attached runtime 的 pinned solver（如有）、认证与连接状态 |
+| DIAG-002 | P0 | 存储诊断检查 `BoneStore`、WorkspaceRegistry、SessionStore/lease、provider auth 私有目录权限和连接；`/config doctor` 是未来 Settings Center 的设计，不是当前命令 |
 | DIAG-003 | P0 | 默认错误回答：发生了什么、用户数据是否安全、现在可以做什么 |
-| DIAG-004 | P0 | 技术路径、内部 key、revision 与错误链仅在“技术详情”中展示 |
+| DIAG-004 | P0 | 技术路径、内部 document key、opaque revision 与错误链仅在“技术详情”中展示，且不得泄露 OAuth payload |
 | DIAG-005 | P1 | 可导出脱敏诊断，且不包含 Prompt、回复、token、文件内容或原始敏感路径 |
 
 ## 9. 前端信息架构
@@ -829,7 +821,7 @@ BONE App Shell
 
 同一时刻最多一个阻塞式 Overlay。Overlay 捕获按键的优先级高于 Composer；关闭 Overlay 的 `Esc` 不能同时停止 Agent。
 
-状态展示必须区分配置意图与实际运行值：设置字段可以显示 Desired 候选和验证进度；会话状态栏始终显示 Effective/TurnConfig；待下一 Turn 生效时同时显示 `Current: A` 与 `Next turn: B`。失败横幅必须说明 Last Known Good 仍在使用，不能只给一个通用错误 toast。
+当前状态展示必须区分已持久化的模型选择与已 attached runtime 的 pinned 值：新值写入成功后可提示“新建或重建 runtime 时使用”，不能显示为已热切换。`Desired/Effective/Last Known Good`、`Current/Next turn` 双版本状态属于后续 Settings Center 设计。
 
 ## 10. 非功能需求
 
@@ -848,11 +840,11 @@ BONE App Shell
 - 已确认用户消息在正常退出和可恢复异常崩溃后的丢失率为 0；
 - 异常崩溃下草稿最新输入的 RPO ≤ 1 秒，正常退出 RPO 为 0；
 - 最终回复与完成边界未 durable 前不得显示 Session Complete；
-- UI 宣称已应用但 Runtime 仍使用旧 revision 的已知事件为 0；
+- UI 把 SQLite 保存误称为 runtime 热切换的已知事件为 0；
 - 未知副作用自动重放次数为 0；
 - 跨 Workspace 静默重新绑定次数为 0；
 - 同一个 Session 同时出现两个 journal writer 的次数为 0；
-- 同一账号打开第二个 Workspace 因长生命周期 credential 文件锁失败的次数为 0。
+- 同一账号打开第二个 Workspace 因 provider auth lease 冲突失败的次数按当前 lease 语义可见报告，不得静默等待或损坏 auth cache。
 
 ### 10.3 可访问性与终端兼容性
 
@@ -873,20 +865,22 @@ BONE App Shell
 - 本地控制命令和设置数据不进入模型上下文；
 - 诊断复制自动脱敏；
 - 配置损坏时安全相关设置 fail closed，且自动恢复不得扩大权限；
-- 模型默认不能自主修改用户设置。未来若开放配置工具，必须逐次显示 diff、scope 和影响并获得用户批准，且必须走同一 ConfigService 事务；
-- 引入写工具前必须实现 Workspace 写协调、文件 revision 检查或可选 worktree 隔离。
+- 模型默认不能自主修改用户设置。未来若开放设置工具，必须逐次显示 diff、scope 和影响并获得用户批准，并只能经 typed `BoneStore` domain service 修改；
+- 引入写工具前必须实现 Workspace 写协调、SQLite 事务/lease 冲突处理或可选 worktree 隔离。
 
 ### 10.5 存储、容量与锁
 
-- WorkspaceRegistry、配置和 Session index 使用短时锁与原子更新，不持有进程生命周期文件锁；
-- Session journal 使用有边界、可校验的记录格式，尾部部分写入可安全截断，单 Session 损坏不扩散；
-- Session snapshot/compaction 不得在成功替换前删除其来源 journal；
+- WorkspaceRegistry、settings、Session records 和 journal 都在同一个 SQLite source of truth 中；普通写用短 transaction，不持有进程生命周期文件锁；
+- Session journal 以严格 sequence 的 SQLite rows 保存；transaction rollback 后不得留下半条 event，单个 logical Session 的错误不得污染其他 Workspace；
+- SQLite corruption、权限错误或 schema mismatch 不得自动删除、reset 或迁移数据库；
 - 磁盘不足时提前显示持久警告；一旦无法 durable append，不接受新消息、不清空 Composer；
 - Archive 只改变可见性，不等同于释放空间；
 - P1 设置页提供存储占用、导出、可恢复删除和 compact 管理；P0 不得自动删除用户 Session；
-- stale Runtime lease 必须通过持有者身份和 heartbeat/进程存活校验判断，不能仅凭超时偷锁；显式接管前显示可能的运行中任务和副作用风险。
+- Session/provider lease 是 OS lock；当前版本不通过超时偷锁，也不实现自动接管。显式接管作为后续协议必须先展示可能的运行中任务和副作用风险。
 
-## 11. 成功指标
+## 11. 历史成功指标草案（后续 UX 版本重审）
+
+以下指标引用 `/config`、Effective revision、catalog 或热切换时，均描述未来体验目标，不能作为当前 SQLite `BoneStore` 行为或发布承诺。
 
 ### 11.1 北极星指标
 
@@ -940,7 +934,11 @@ connection_swap_started / completed / failed
 
 产品指标只能在适用的隐私政策和用户遥测选择下采集。没有遥测授权时，通过本地集成测试、故障注入和用户研究验证，不得为了计算指标扩大采集范围。Workspace 相关埋点只使用每安装随机 salt 派生的匿名标识，不能上传 canonical path、本地 workspace UUID 或可跨安装关联的稳定 ID。
 
-## 12. 验收标准
+## 12. 历史验收草案（非当前实现契约）
+
+本节保留原始产品验收素材，便于后续 Settings Center、catalog、跨进程通知与热切换重新立项时使用。它不覆盖第 0 节，尤其是其中涉及配置文件、JSON、`/config`、`Desired/Effective/LKG`、配置 revision、文件 watcher、自动迁移、one-shot durable Session 或 runtime 热切换的场景均不是当前行为。
+
+当前存储重构的验收要点是：干净 store 自动创建且不猜模型；`/model` 三层继承正确；Session user-turn 与 journal/state 原子提交；失败不清 Composer/不启动 Agent；不同 Workspace 隔离；Session writer/provider auth lease Busy 语义正确；OAuth secret 不进入 SQLite；SQLite 错误进入 repair/error 而不 reset 数据。
 
 ### AC-01：零配置首次启动
 
@@ -1404,7 +1402,7 @@ And Agent 设置按 B 的下一 User Turn 更新
 And B 中存在 Session override 的值不被覆盖
 ```
 
-## 13. 风险与缓解
+## 13. 历史风险与缓解素材（第 0 节优先）
 
 | 风险 | 影响 | 缓解 |
 | --- | --- | --- |
@@ -1425,7 +1423,9 @@ And B 中存在 Session override 的值不被覆盖
 | 多 Workspace 进程争用 credential | 第二个实例不能连接 | CredentialBroker 或短时 refresh lock，禁止连接生命周期长锁 |
 | 登出或切换账号静默影响旧 Session | 数据发给错误账号或后台任务异常 | 全局影响确认、credential revision 广播、新账号首个 Turn 再确认 |
 
-## 14. 分阶段交付
+## 14. 历史分阶段交付草案（不描述当前完成状态）
+
+下列 roadmap 保留为未来产品拆分参考。涉及旧文件配置、`ConfigService`、CredentialBroker、Desired/Effective/LKG、ModelCatalog 或 runtime hot switch 的条目必须以 `BoneStore` 和 pinned runtime 为基础重新设计，不可按原文直接实施。
 
 阶段用于降低实现风险，不代表允许发布一个仍需手工配置的正式版本。
 
@@ -1482,38 +1482,31 @@ And B 中存在 Session override 的值不被覆盖
 
 退出条件：全部 P0 验收标准通过，关键可靠性与隐私指标达到目标。
 
-## 15. 当前实现差距
+## 15. 当前实现快照
 
-| 产品能力 | 当前状态 | 现有基础与缺口 |
+| 产品能力 | 当前状态 | 已实现边界 / 后续缺口 |
 | --- | --- | --- |
-| TUI 先于配置启动 | 不满足 | [`main.rs`](../../crates/bone-app/src/main.rs) 在 TUI 前读取配置并连接 |
-| 无配置可用 | 部分满足 | `bone-config` 缺文件按空对象读取，但 `agent.system` 仍必填 |
-| 原子配置写入 | 已有基础 | ConfigManager 已有锁、CAS revision 与原子替换 |
-| 配置事务与变更事件 | 不满足 | 当前没有 Desired/Effective/LKG、watch/channel 或 runtime apply acknowledgement |
-| 当前 Session 响应配置 | 不满足 | Session 创建时读取快照并固定依赖，没有 User Turn/TurnConfig 边界 |
-| 模型热切换 | 不满足 | `ModelAdapter` 在 Session 创建时固定 solver/coordinator |
-| 多 Session 并发 | 已有基础 | 共享 Host/Endpoint，独立 Kernel、Runtime、record 与 UI 状态 |
-| Workspace 工具边界 | 已有基础 | `bone-tools` 已 canonicalize 并阻止路径逃逸 |
-| Workspace 稳定身份 | 不满足 | 只有路径字符串，没有跨平台 WorkspaceRegistry 与持久 UUID |
-| Session 跨重启恢复 | 不满足 | Session ID 是进程内递增整数，没有 SessionStore、durable ack 或 continuation context |
-| Session 进程并发 | 不满足 | 没有 per-session writer/Runtime lease，也没有只读打开和接管语义 |
-| Slash Command registry | 不满足 | Composer 仅字符串识别 `/stop`、`/exit` |
-| 配置损坏 TUI 修复 | 不满足 | build/snapshot/connect 错误在 TUI 前返回 |
-| 凭据独立存储 | 部分满足 | credential 与普通配置已分离，但连接生命周期独占锁阻止多 Workspace 并发，需要 CredentialBroker/短时 refresh lock |
-| 真实模型目录 | 不满足 | Endpoint 能按 ID 创建模型，但没有模型 listing 接口 |
-| One-shot 共用 SessionStore | 不满足 | 当前 one-shot 可导出观察日志，但不会创建可在 TUI 继续的 durable SessionRecord |
+| TUI-first 与未选模型 | 已实现 | Store、Workspace、Session 和草稿可在 `NeedsModel` 下打开；不猜模型、不自动登录 |
+| BONE 自有持久化 | 已实现 | 一份 bundled SQLite `BoneStore`；没有 user-visible config JSON、JSONL durable transcript 或第二份 session index |
+| 原子 durable acceptance | 已实现 | `UserTurnAccepted` 与 Session summary/state 在同一 SQLite transaction 中 commit；失败不清 Composer/不发 Agent |
+| 模型三层继承 | 已实现 | Session override > Workspace default > User default；`/model inherit` 清除 Session override |
+| 已运行 runtime 行为 | 已实现且刻意 pinned | `ResolvedAgentRuntimeConfig` 在 runtime 创建时冻结；不做 runtime hot switch |
+| 多 Workspace / 多 Session | 已实现 | Workspace identity、Session records 和 journals 存于 SQLite 并按 Workspace 隔离 |
+| 同 Session writer ownership | 已实现 | fail-fast OS writer lease；冲突走 Busy/只读语义，不用 SQLite transaction 代替 ownership |
+| Provider OAuth | 已实现 | Rig-owned opaque `auth.json` 由 `ProviderAuthLease` 保护；logout 有活跃 lease 时 Busy |
+| 存储故障 | 已实现基础 | Busy、CAS conflict、权限、corruption、schema mismatch 不自动 reset；TUI 应进入 repair/error 状态 |
+| 完整 Settings Center / catalog | 后续 | 当前 `/model` 四种 scope 命令可用；`/config`、picker、catalog、watcher 与跨进程 notification 尚未实现 |
+| one-shot durable Session | 后续 | one-shot 不创建 `SessionRecord`；`--model` / `BONE_MODEL` 是本次调用的 ephemeral override；`--events` 仅观察导出 |
 
-## 16. 发布门禁
+## 16. 当前发布门禁
 
-以下任一情况存在时，不得宣称完成本产品目标：
+以下任一情况存在时，不得宣称完成当前 SQLite 存储重构；后续 UX 目标应另立版本门禁：
 
-- 首次使用仍要求复制 `config.example.json`；
-- 缺少或损坏配置仍会在 TUI 前退出；
-- 存在公开设置只能手工编辑 JSON；
-- `/model` 只写配置但运行时不更新；
-- 模型设置在一个 User Turn 中途生效，导致同一任务混用 TurnConfig；
-- 修改设置后仍要求 restart、reload 或重建 Session；
-- UI 无法区分 Desired、Effective、Last Known Good 或 PendingNextTurn；
+- 首次使用仍要求复制或手工编辑设置文件；
+- store 不存在、未选择模型、未登录时 TUI 在首帧前退出；
+- BONE 自有数据出现 JSON/JSONL 双写或第二份 Session index source of truth；
+- `/model` 未按 Session > Workspace > User 存储/解析，或声称热切换已 attached runtime；
+- Agent 在启动时重新从用户存储读取配置，导致 accepted turn 的 attribution 与 runtime 配置漂移；
 - 设置范围不清楚或静默覆盖其他 Session；
 - Session override 没有“恢复继承”能力；
 - Session 在退出 BONE 后丢失；
@@ -1522,13 +1515,13 @@ And B 中存在 Session override 的值不被覆盖
 - 恢复只显示 UI 历史但后续模型没有 continuation context；
 - 不同 Workspace 的 Session 会混在一起；
 - 同一 Session 可被两个进程同时写入；
-- 第二个 Workspace 因第一个进程持有 credential 长锁而无法运行；
+- provider auth lease、Session writer lease 或 SQLite Busy 被静默吞掉、无限等待或用于错误的并发语义；
 - slash command 意外进入模型上下文；
 - 用户无法安全发送 `/` 开头的普通消息或 paste 会触发命令；
-- UI 显示“已应用”但底层使用旧 revision；
-- 安全配置损坏后自动采用更宽松权限；
-- 尚无 authoritative listing 的 catalog 候选被标记为“当前账号可用”；
-- 失败会清空草稿、历史或旧的有效设置。
+- store 损坏、权限异常或 schema mismatch 自动删除、reset、覆盖或迁移旧数据；
+- OAuth secret 写入 SQLite、journal、debug output、TUI notice 或 model-visible output；
+- failed storage mutation 清空草稿、历史或启动 Agent；
+- `/logout` 在活跃 Endpoint/Model 仍持有 lease 时删除 OAuth cache。
 
 ## 17. 参考产品决策
 

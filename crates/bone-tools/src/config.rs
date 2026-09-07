@@ -1,101 +1,76 @@
+//! Validated, immutable-at-use limits for BONE's local tools.
+//!
+//! This module deliberately contains no storage, section registration, or
+//! schema policy. A product settings layer may serialize this value however it
+//! chooses, then must validate it before constructing a [`ToolEnvironment`].
+
 use std::time::Duration;
 
-use bone_config::ConfigSection;
-use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-
-use crate::ToolError;
+use thiserror::Error;
 
 /// Hard limits shared by the built-in tools.
 ///
-/// The `tools.local` configuration section uses these defaults for omitted
-/// fields. Bash deadlines are persisted as integer `*_seconds` fields; the
-/// direct Rust API continues to accept subsecond durations.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Persisted values use integer seconds for Bash deadlines. The direct Rust
+/// API intentionally continues to support sub-second `Duration` values; such
+/// values are valid for an in-process environment but cannot be serialized by
+/// this representation without an explicit product-level policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ToolLimits {
     /// Maximum retained UTF-8 bytes in each tool-defined textual output budget.
-    #[schemars(range(min = 1))]
     pub max_output_bytes: usize,
     /// Maximum lines returned by one `read` call.
-    #[schemars(range(min = 1))]
     pub max_read_lines: usize,
     /// Maximum size of one file read or scanned by `read`.
-    #[schemars(range(min = 1))]
     pub max_read_file_bytes: u64,
     /// Maximum paths returned by one `glob` call.
-    #[schemars(range(min = 1))]
     pub max_glob_results: usize,
     /// Maximum matches returned by one `grep` call.
-    #[schemars(range(min = 1))]
     pub max_grep_matches: usize,
     /// Maximum UTF-8 bytes accepted in one grep pattern.
-    #[schemars(range(min = 1))]
     pub max_grep_pattern_bytes: usize,
     /// Maximum characters retained from one grep line.
-    #[schemars(range(min = 1))]
     pub max_grep_line_chars: usize,
     /// Maximum size of one file inspected by filesystem search tools.
-    #[schemars(range(min = 1))]
     pub max_search_file_bytes: u64,
     /// Maximum combined file bytes inspected by one grep call.
-    #[schemars(range(min = 1))]
     pub max_search_total_bytes: u64,
     /// Maximum size of one workspace-local ignore file loaded during search.
-    #[schemars(range(min = 1))]
     pub max_ignore_file_bytes: u64,
     /// Maximum combined ignore-file bytes loaded during one search call.
-    #[schemars(range(min = 1))]
     pub max_ignore_total_bytes: u64,
     /// Maximum filesystem entries inspected by one search call.
-    #[schemars(range(min = 1))]
     pub max_walk_entries: usize,
     /// Maximum UTF-8 bytes accepted in one patch document.
-    #[schemars(range(min = 1))]
     pub max_patch_bytes: usize,
     /// Maximum file operations accepted in one patch document.
-    #[schemars(range(min = 1))]
     pub max_patch_files: usize,
     /// Maximum size of one existing file read while planning a patch.
-    #[schemars(range(min = 1))]
     pub max_patch_file_bytes: u64,
     /// Maximum combined bytes retained from existing files while planning a patch.
-    #[schemars(range(min = 1))]
     pub max_patch_total_bytes: u64,
     /// Maximum UTF-8 bytes accepted in one Bash command.
-    #[schemars(range(min = 1))]
     pub max_bash_command_bytes: usize,
-    /// Default shell deadline; configuration stores a positive whole-second count.
+    /// Default shell deadline.
     #[serde(rename = "default_bash_timeout_seconds", with = "duration_seconds")]
-    #[schemars(with = "u64", range(min = 1))]
     pub default_bash_timeout: Duration,
-    /// Largest shell deadline; must be at least the default deadline.
+    /// Largest shell deadline.
     #[serde(rename = "max_bash_timeout_seconds", with = "duration_seconds")]
-    #[schemars(with = "u64", range(min = 1))]
     pub max_bash_timeout: Duration,
 }
 
-impl ConfigSection for ToolLimits {
-    const KEY: &'static str = "tools.local";
-
-    fn description() -> &'static str {
-        "Local tool limits. Loaded when a session starts."
-    }
-
-    fn schema() -> Value {
-        schema_for!(Self).to_value()
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        ToolLimits::validate(self).map_err(|error| error.to_string())?;
-        if self.default_bash_timeout.subsec_nanos() != 0
-            || self.max_bash_timeout.subsec_nanos() != 0
-        {
-            return Err("configured Bash timeouts must use whole seconds".to_owned());
-        }
-        Ok(())
-    }
+/// A semantic validation failure in [`ToolLimits`].
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum ToolLimitsError {
+    #[error("{field} must be greater than zero")]
+    NonPositive { field: &'static str },
+    #[error("max_bash_timeout must be at least default_bash_timeout")]
+    BashTimeoutOrder,
+    #[error(
+        "max_bash_timeout must be at least one second because Bash arguments use whole seconds"
+    )]
+    BashTimeoutTooShort,
 }
 
 mod duration_seconds {
@@ -150,8 +125,9 @@ impl Default for ToolLimits {
 }
 
 impl ToolLimits {
-    pub(crate) fn validate(&self) -> Result<(), ToolError> {
-        let positive = [
+    /// Validate limits before binding them into a [`ToolEnvironment`].
+    pub fn validate(&self) -> Result<(), ToolLimitsError> {
+        for (field, value) in [
             ("max_output_bytes", self.max_output_bytes),
             ("max_read_lines", self.max_read_lines),
             ("max_glob_results", self.max_glob_results),
@@ -162,62 +138,34 @@ impl ToolLimits {
             ("max_patch_bytes", self.max_patch_bytes),
             ("max_patch_files", self.max_patch_files),
             ("max_bash_command_bytes", self.max_bash_command_bytes),
-        ];
-        if let Some((name, _)) = positive.into_iter().find(|(_, value)| *value == 0) {
-            return Err(ToolError::InvalidArgs(format!(
-                "{name} must be greater than zero"
-            )));
+        ] {
+            if value == 0 {
+                return Err(ToolLimitsError::NonPositive { field });
+            }
         }
-        if self.max_search_file_bytes == 0 {
-            return Err(ToolError::InvalidArgs(
-                "max_search_file_bytes must be greater than zero".to_owned(),
-            ));
-        }
-        if self.max_search_total_bytes == 0 {
-            return Err(ToolError::InvalidArgs(
-                "max_search_total_bytes must be greater than zero".to_owned(),
-            ));
-        }
-        if self.max_ignore_file_bytes == 0 {
-            return Err(ToolError::InvalidArgs(
-                "max_ignore_file_bytes must be greater than zero".to_owned(),
-            ));
-        }
-        if self.max_ignore_total_bytes == 0 {
-            return Err(ToolError::InvalidArgs(
-                "max_ignore_total_bytes must be greater than zero".to_owned(),
-            ));
-        }
-        if self.max_read_file_bytes == 0 {
-            return Err(ToolError::InvalidArgs(
-                "max_read_file_bytes must be greater than zero".to_owned(),
-            ));
-        }
-        if self.max_patch_file_bytes == 0 {
-            return Err(ToolError::InvalidArgs(
-                "max_patch_file_bytes must be greater than zero".to_owned(),
-            ));
-        }
-        if self.max_patch_total_bytes == 0 {
-            return Err(ToolError::InvalidArgs(
-                "max_patch_total_bytes must be greater than zero".to_owned(),
-            ));
+        for (field, value) in [
+            ("max_read_file_bytes", self.max_read_file_bytes),
+            ("max_search_file_bytes", self.max_search_file_bytes),
+            ("max_search_total_bytes", self.max_search_total_bytes),
+            ("max_ignore_file_bytes", self.max_ignore_file_bytes),
+            ("max_ignore_total_bytes", self.max_ignore_total_bytes),
+            ("max_patch_file_bytes", self.max_patch_file_bytes),
+            ("max_patch_total_bytes", self.max_patch_total_bytes),
+        ] {
+            if value == 0 {
+                return Err(ToolLimitsError::NonPositive { field });
+            }
         }
         if self.default_bash_timeout.is_zero() {
-            return Err(ToolError::InvalidArgs(
-                "default_bash_timeout must be greater than zero".to_owned(),
-            ));
+            return Err(ToolLimitsError::NonPositive {
+                field: "default_bash_timeout",
+            });
         }
         if self.max_bash_timeout < self.default_bash_timeout {
-            return Err(ToolError::InvalidArgs(
-                "max_bash_timeout must be at least default_bash_timeout".to_owned(),
-            ));
+            return Err(ToolLimitsError::BashTimeoutOrder);
         }
         if self.max_bash_timeout < Duration::from_secs(1) {
-            return Err(ToolError::InvalidArgs(
-                "max_bash_timeout must be at least one second because Bash arguments use whole seconds"
-                    .to_owned(),
-            ));
+            return Err(ToolLimitsError::BashTimeoutTooShort);
         }
         Ok(())
     }
@@ -233,18 +181,31 @@ mod tests {
             max_ignore_file_bytes: 0,
             ..ToolLimits::default()
         };
-        assert!(matches!(
+        assert_eq!(
             limits.validate(),
-            Err(ToolError::InvalidArgs(message))
-                if message.contains("max_ignore_file_bytes")
-        ));
+            Err(ToolLimitsError::NonPositive {
+                field: "max_ignore_file_bytes"
+            })
+        );
 
         limits.max_ignore_file_bytes = 1;
         limits.max_ignore_total_bytes = 0;
-        assert!(matches!(
+        assert_eq!(
             limits.validate(),
-            Err(ToolError::InvalidArgs(message))
-                if message.contains("max_ignore_total_bytes")
-        ));
+            Err(ToolLimitsError::NonPositive {
+                field: "max_ignore_total_bytes"
+            })
+        );
+    }
+
+    #[test]
+    fn direct_runtime_limits_can_use_subsecond_deadlines() {
+        let limits = ToolLimits {
+            default_bash_timeout: Duration::from_millis(500),
+            max_bash_timeout: Duration::from_secs(1),
+            ..ToolLimits::default()
+        };
+        assert!(limits.validate().is_ok());
+        assert!(serde_json::to_value(limits).is_err());
     }
 }

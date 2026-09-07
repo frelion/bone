@@ -1,271 +1,211 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
-    path::{Path, PathBuf},
-    sync::Arc,
 };
 
+use bone_store::{StoreError, WorkspaceStateStore};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    CanonicalPath, RegistryError, WorkspaceId,
-    storage::{
-        MAX_REGISTRY_BYTES, StoreLock, ensure_private_directory, lock_path, private_file_path,
-        read_json, write_json,
-    },
-};
+use super::{CanonicalPath, RegistryError, WorkspaceId};
 
-const REGISTRY_FORMAT_VERSION: u32 = 1;
-const MAX_WORKSPACES: usize = 100_000;
+const REGISTRY_RETRY_LIMIT: usize = 8;
+const MAX_WORKSPACES: usize = 10_000;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RegistryDocument {
-    format_version: u32,
-    #[serde(default)]
+/// The single typed document behind the workspace registry. It is deliberately
+/// private: product code receives a `WorkspaceRegistry`, not a generic map.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct WorkspaceRegistryDocument {
     workspaces: BTreeMap<String, WorkspaceId>,
 }
 
-impl RegistryDocument {
-    fn empty() -> Self {
-        Self {
-            format_version: REGISTRY_FORMAT_VERSION,
-            workspaces: BTreeMap::new(),
-        }
-    }
-
+impl WorkspaceRegistryDocument {
     fn validate(&self) -> Result<(), RegistryError> {
-        if self.format_version != REGISTRY_FORMAT_VERSION {
-            return Err(RegistryError::UnsupportedFormat {
-                version: self.format_version,
-            });
-        }
         if self.workspaces.len() > MAX_WORKSPACES {
             return Err(RegistryError::TooManyWorkspaces {
                 maximum_entries: MAX_WORKSPACES,
             });
         }
+
+        let mut ids = BTreeSet::new();
         for (key, id) in &self.workspaces {
-            if id.is_nil() || !key.starts_with("workspace/v1/") {
+            if id.is_nil() {
                 return Err(RegistryError::InvalidWorkspaceId { key: key.clone() });
+            }
+            if CanonicalPath::from_storage_encoding(key).is_err() {
+                return Err(RegistryError::InvalidWorkspaceKey { key: key.clone() });
+            }
+            if !ids.insert(*id) {
+                return Err(RegistryError::DuplicateWorkspaceId { id: *id });
             }
         }
         Ok(())
     }
 }
 
-/// Stable, private mapping from canonical workspace roots to opaque UUIDs.
-///
-/// The registry is global user data. Its path is explicit and it never creates
-/// files under a project workspace.
+/// Stable identities for the exact canonical directories where users launch
+/// BONE. The registry is global BONE state, while all session documents stay
+/// inside their own workspace namespace.
 #[derive(Clone)]
 pub struct WorkspaceRegistry {
-    path: Arc<PathBuf>,
-    lock_path: Arc<PathBuf>,
+    state: WorkspaceStateStore,
 }
 
 impl fmt::Debug for WorkspaceRegistry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WorkspaceRegistry")
-            .field("path", &self.path)
             .finish_non_exhaustive()
     }
 }
 
 impl WorkspaceRegistry {
-    /// Open `state_root/workspaces.json`, creating `state_root` with private
-    /// permissions if it does not yet exist.
-    pub fn open_in(state_root: impl AsRef<Path>) -> Result<Self, RegistryError> {
-        let state_root = ensure_private_directory(state_root.as_ref())?;
-        Self::open(state_root.join("workspaces.json"))
+    pub(crate) fn new(state: WorkspaceStateStore) -> Self {
+        Self { state }
     }
 
-    /// Open an explicit registry document at an absolute private path.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, RegistryError> {
-        let path = private_file_path(path.as_ref())?;
-        let registry = Self {
-            lock_path: Arc::new(lock_path(&path)),
-            path: Arc::new(path),
-        };
-        let _lock = registry.acquire_lock()?;
-        let _ = registry.read_document()?;
-        Ok(registry)
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Look up an already-known canonical root without allocating a new ID.
-    ///
-    /// Callers must pass the canonical absolute directory that defines their
-    /// workspace. [`crate::WorkspaceContext::discover`] guarantees this.
+    /// Look up an already allocated workspace ID without creating state.
     pub fn lookup_canonical(
         &self,
-        canonical_root: &CanonicalPath,
+        canonical_path: &CanonicalPath,
     ) -> Result<Option<WorkspaceId>, RegistryError> {
-        let key = WorkspaceKey::from_canonical(canonical_root);
-        let _lock = self.acquire_lock()?;
-        let document = self.read_document()?;
-        Ok(document.workspaces.get(key.as_str()).copied())
+        let document = self.state.workspace_registry::<WorkspaceRegistryDocument>();
+        let snapshot = document.read()?;
+        let registry = snapshot.value.unwrap_or_default();
+        registry.validate()?;
+        Ok(registry
+            .workspaces
+            .get(&canonical_path.storage_encoding())
+            .copied())
     }
 
-    /// Return a stable ID for a canonical root, allocating it under a short
-    /// cross-process lock on first use.
+    /// Return the stable ID for a canonical workspace, allocating it in the
+    /// registry document exactly once with optimistic concurrency.
     pub fn resolve_or_create_canonical(
         &self,
-        canonical_root: &CanonicalPath,
+        canonical_path: &CanonicalPath,
     ) -> Result<WorkspaceId, RegistryError> {
-        let key = WorkspaceKey::from_canonical(canonical_root);
-        let _lock = self.acquire_lock()?;
-        let mut document = self.read_document()?;
-        if let Some(id) = document.workspaces.get(key.as_str()) {
-            return Ok(*id);
+        let document = self.state.workspace_registry::<WorkspaceRegistryDocument>();
+        let key = canonical_path.storage_encoding();
+        for _ in 0..REGISTRY_RETRY_LIMIT {
+            let snapshot = document.read()?;
+            let mut registry = snapshot.value.unwrap_or_default();
+            registry.validate()?;
+            if let Some(id) = registry.workspaces.get(&key) {
+                return Ok(*id);
+            }
+            if registry.workspaces.len() >= MAX_WORKSPACES {
+                return Err(RegistryError::TooManyWorkspaces {
+                    maximum_entries: MAX_WORKSPACES,
+                });
+            }
+            let id = WorkspaceId::new();
+            registry.workspaces.insert(key.clone(), id);
+            registry.validate()?;
+            match document.replace(&registry, snapshot.revision) {
+                Ok(_) => return Ok(id),
+                Err(StoreError::RevisionConflict { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
         }
-        if document.workspaces.len() >= MAX_WORKSPACES {
-            return Err(RegistryError::TooManyWorkspaces {
-                maximum_entries: MAX_WORKSPACES,
-            });
-        }
-
-        let id = WorkspaceId::new();
-        document.workspaces.insert(key.into_inner(), id);
-        self.write_document(&document)?;
-        Ok(id)
-    }
-
-    fn acquire_lock(&self) -> Result<StoreLock, RegistryError> {
-        StoreLock::acquire(&self.lock_path).map_err(RegistryError::from)
-    }
-
-    fn read_document(&self) -> Result<RegistryDocument, RegistryError> {
-        let document =
-            read_json(&self.path, MAX_REGISTRY_BYTES)?.unwrap_or_else(RegistryDocument::empty);
-        document.validate()?;
-        Ok(document)
-    }
-
-    fn write_document(&self, document: &RegistryDocument) -> Result<(), RegistryError> {
-        document.validate()?;
-        write_json(&self.path, document, MAX_REGISTRY_BYTES)?;
-        Ok(())
-    }
-}
-
-/// Internal lossless, platform-namespaced registry key. It intentionally has
-/// no `Display` implementation so a path-derived key is not casually emitted
-/// into logs or telemetry.
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
-struct WorkspaceKey(String);
-
-impl WorkspaceKey {
-    fn from_canonical(path: &CanonicalPath) -> Self {
-        Self(format!("workspace/v1/{}", path.storage_encoding()))
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    fn into_inner(self) -> String {
-        self.0
+        // Repeated CAS contention is equivalent to a non-blocking store busy
+        // result for this user-facing operation.
+        Err(StoreError::Busy.into())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use bone_store::{BoneStore, Revision, StoreRoots};
 
     use super::*;
-    use crate::{CanonicalPath, StorageError};
 
-    fn private_data() -> tempfile::TempDir {
-        let directory = tempfile::tempdir().unwrap();
+    fn store() -> (tempfile::TempDir, BoneStore) {
+        let temporary = tempfile::tempdir().unwrap();
         #[cfg(unix)]
-        fs::set_permissions(
-            directory.path(),
+        std::fs::set_permissions(
+            temporary.path(),
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
-        directory
+        let roots = StoreRoots::new(
+            temporary.path().join("data"),
+            temporary.path().join("config"),
+        )
+        .unwrap();
+        let store = BoneStore::open_at(roots).unwrap();
+        (temporary, store)
     }
 
     #[test]
-    fn registry_persists_workspace_ids_across_reopen() {
-        let data = private_data();
-        let workspace = tempfile::tempdir().unwrap();
-        let path = data.path().join("workspaces.json");
-        let canonical = CanonicalPath::new(fs::canonicalize(workspace.path()).unwrap()).unwrap();
-
-        let initial = WorkspaceRegistry::open(&path).unwrap();
-        let id = initial.resolve_or_create_canonical(&canonical).unwrap();
-        drop(initial);
-
-        let reopened = WorkspaceRegistry::open(&path).unwrap();
-        assert_eq!(reopened.lookup_canonical(&canonical).unwrap(), Some(id));
-        assert_eq!(
-            reopened.resolve_or_create_canonical(&canonical).unwrap(),
-            id
-        );
+    fn maps_one_canonical_path_to_one_stable_id() {
+        let (_temporary, store) = store();
+        let registry = WorkspaceRegistry::new(store.workspace_state());
+        let path = CanonicalPath::new("/tmp/bone-registry-test").unwrap();
+        let first = registry.resolve_or_create_canonical(&path).unwrap();
+        assert_eq!(registry.resolve_or_create_canonical(&path).unwrap(), first);
+        assert_eq!(registry.lookup_canonical(&path).unwrap(), Some(first));
     }
 
     #[test]
-    fn registry_assigns_distinct_ids_to_distinct_canonical_roots() {
-        let data = private_data();
-        let left = tempfile::tempdir().unwrap();
-        let right = tempfile::tempdir().unwrap();
-        let registry = WorkspaceRegistry::open_in(data.path()).unwrap();
-        let left = CanonicalPath::new(fs::canonicalize(left.path()).unwrap()).unwrap();
-        let right = CanonicalPath::new(fs::canonicalize(right.path()).unwrap()).unwrap();
+    fn rejects_malformed_registry_keys_before_lookup_or_allocation() {
+        let (_temporary, store) = store();
+        let document = store
+            .workspace_state()
+            .workspace_registry::<WorkspaceRegistryDocument>();
+        let mut workspaces = BTreeMap::new();
+        workspaces.insert("not-a-canonical-path".to_owned(), WorkspaceId::new());
+        document
+            .replace(
+                &WorkspaceRegistryDocument { workspaces },
+                Revision::default(),
+            )
+            .unwrap();
 
-        assert_ne!(
-            registry.resolve_or_create_canonical(&left).unwrap(),
-            registry.resolve_or_create_canonical(&right).unwrap()
-        );
-    }
-
-    #[test]
-    fn registry_rejects_bad_document_without_allocating_a_new_id() {
-        let data = private_data();
-        let path = data.path().join("workspaces.json");
-        fs::write(&path, "{ not-json").unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
-
+        let registry = WorkspaceRegistry::new(store.workspace_state());
+        let path = CanonicalPath::new("/tmp/bone-registry-test").unwrap();
         assert!(matches!(
-            WorkspaceRegistry::open(&path),
-            Err(RegistryError::Storage(StorageError::InvalidDocument { .. }))
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn registry_rejects_symlink_documents() {
-        use std::os::unix::fs::symlink;
-
-        let data = private_data();
-        let target = data.path().join("target.json");
-        let path = data.path().join("workspaces.json");
-        fs::write(&target, "{}").unwrap();
-        fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
-        symlink(&target, &path).unwrap();
-
-        assert!(matches!(
-            WorkspaceRegistry::open(&path),
-            Err(RegistryError::Storage(StorageError::UnsafeStorage { .. }))
+            registry.lookup_canonical(&path),
+            Err(RegistryError::InvalidWorkspaceKey { .. })
         ));
     }
 
     #[test]
-    fn state_root_never_creates_a_workspace_dot_directory() {
-        let data = private_data();
-        let registry = WorkspaceRegistry::open_in(data.path()).unwrap();
-        assert!(registry.path().starts_with(data.path()));
-        assert!(!data.path().join(".bone").exists());
-        assert_eq!(
-            registry.path(),
-            PathBuf::from(data.path()).join("workspaces.json")
+    fn rejects_nil_or_duplicated_workspace_ids() {
+        let (_temporary, store) = store();
+        let document = store
+            .workspace_state()
+            .workspace_registry::<WorkspaceRegistryDocument>();
+        let left = CanonicalPath::new("/tmp/bone-registry-left").unwrap();
+        let right = CanonicalPath::new("/tmp/bone-registry-right").unwrap();
+        let mut workspaces = BTreeMap::new();
+        workspaces.insert(
+            left.storage_encoding(),
+            WorkspaceId::parse_str("00000000-0000-0000-0000-000000000000").unwrap(),
         );
+        let first_revision = document
+            .replace(
+                &WorkspaceRegistryDocument { workspaces },
+                Revision::default(),
+            )
+            .unwrap();
+
+        let registry = WorkspaceRegistry::new(store.workspace_state());
+        assert!(matches!(
+            registry.lookup_canonical(&left),
+            Err(RegistryError::InvalidWorkspaceId { .. })
+        ));
+
+        let mut workspaces = BTreeMap::new();
+        let id = WorkspaceId::new();
+        workspaces.insert(left.storage_encoding(), id);
+        workspaces.insert(right.storage_encoding(), id);
+        document
+            .replace(&WorkspaceRegistryDocument { workspaces }, first_revision)
+            .unwrap();
+        assert!(matches!(
+            registry.lookup_canonical(&left),
+            Err(RegistryError::DuplicateWorkspaceId { .. })
+        ));
     }
 }

@@ -6,8 +6,6 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(not(target_arch = "wasm32"))]
-mod config;
 mod endpoint;
 mod error;
 mod item;
@@ -22,8 +20,6 @@ pub mod protocol;
 
 pub mod service;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub use config::LlmConfig;
 pub use endpoint::Endpoint;
 pub use error::{ConfigError, Error, ErrorKind};
 pub use item::{InputItem, InputSource};

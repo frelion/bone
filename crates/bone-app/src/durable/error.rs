@@ -1,8 +1,9 @@
 use std::{io, path::PathBuf};
 
+use bone_store::{Revision, StoreError};
 use thiserror::Error;
 
-use super::{SessionId, SessionRevision, WorkspaceId};
+use super::{SessionId, WorkspaceId};
 
 /// Failures while resolving the directory that defines a BONE workspace.
 #[derive(Debug, Error)]
@@ -21,53 +22,19 @@ pub enum WorkspaceError {
     Registry(#[from] RegistryError),
 }
 
-/// Failures in the private file primitives used by registries and sessions.
-#[derive(Debug, Error)]
-pub enum StorageError {
-    #[error("storage path must be absolute: {path}")]
-    RelativePath { path: PathBuf },
-    #[error("storage path has no parent directory: {path}")]
-    MissingParent { path: PathBuf },
-    #[error("storage path has no file name: {path}")]
-    MissingFileName { path: PathBuf },
-    #[error("storage is busy: {path}")]
-    Busy { path: PathBuf },
-    #[error("unsafe private storage at {path}: {reason}")]
-    UnsafeStorage { path: PathBuf, reason: String },
-    #[error("storage document at {path} exceeds the {maximum_bytes}-byte limit")]
-    DocumentTooLarge { path: PathBuf, maximum_bytes: usize },
-    #[error("storage document at {path} is invalid: {message}")]
-    InvalidDocument { path: PathBuf, message: String },
-    #[error("failed to {operation} storage at {path}: {source}")]
-    Io {
-        operation: &'static str,
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-}
-
-impl StorageError {
-    pub(crate) fn io(operation: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Self {
-        Self::Io {
-            operation,
-            path: path.into(),
-            source,
-        }
-    }
-}
-
-/// Failures while resolving or persisting a canonical workspace-to-ID mapping.
+/// Failures while resolving or persisting the canonical workspace-to-ID map.
 #[derive(Debug, Error)]
 pub enum RegistryError {
-    #[error("workspace registry has an unsupported format version: {version}")]
-    UnsupportedFormat { version: u32 },
     #[error("workspace registry contains an invalid workspace ID for key {key}")]
     InvalidWorkspaceId { key: String },
+    #[error("workspace registry contains an invalid canonical path key {key}")]
+    InvalidWorkspaceKey { key: String },
+    #[error("workspace registry maps more than one canonical path to workspace {id}")]
+    DuplicateWorkspaceId { id: WorkspaceId },
     #[error("workspace registry is too large; it may contain at most {maximum_entries} workspaces")]
     TooManyWorkspaces { maximum_entries: usize },
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Store(#[from] StoreError),
 }
 
 /// Invalid user-visible session metadata or durable session state.
@@ -82,6 +49,8 @@ pub enum RecordError {
     },
     #[error("draft cursor must be a UTF-8 character boundary within the draft")]
     InvalidDraftCursor,
+    #[error("session solver model override is invalid")]
+    InvalidModelOverride,
     #[error("session timestamp must not be before the Unix epoch")]
     InvalidTimestamp,
     #[error("session timestamps must not move backwards")]
@@ -96,21 +65,26 @@ pub enum RecordError {
     ClockBeforeUnixEpoch,
     #[error("system clock cannot be represented as Unix milliseconds")]
     ClockOutOfRange,
-    #[error("session revision cannot be incremented further")]
-    RevisionExhausted,
 }
 
-/// Failures from the per-workspace durable session metadata store.
+/// Failures from the workspace-bound logical-session repository.
 #[derive(Debug, Error)]
 pub enum SessionStoreError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Store(#[from] StoreError),
     #[error(transparent)]
     Record(#[from] RecordError),
     #[error("session does not exist: {0}")]
     NotFound(SessionId),
     #[error("session already exists: {0}")]
     AlreadyExists(SessionId),
+    #[error("session document key {key_id} does not match stored record ID {record_id}")]
+    RecordKeyMismatch {
+        key_id: SessionId,
+        record_id: SessionId,
+    },
+    #[error("workspace session list contains duplicate stored session ID {0}")]
+    DuplicateSessionId(SessionId),
     #[error("could not allocate a unique session ID after several attempts")]
     IdAllocationExhausted,
     #[error(
@@ -126,29 +100,28 @@ pub enum SessionStoreError {
     )]
     RevisionConflict {
         session_id: SessionId,
-        expected: SessionRevision,
-        actual: SessionRevision,
+        expected: Revision,
+        actual: Revision,
+    },
+    #[error(
+        "writer lease for conversation {lease_session_id} does not grant write ownership for conversation {session_id}"
+    )]
+    WriterLeaseMismatch {
+        session_id: SessionId,
+        lease_session_id: SessionId,
     },
     #[error("session {session_id} attempted to change immutable field {field}")]
     ImmutableField {
         session_id: SessionId,
         field: &'static str,
     },
-    #[error("session {session_id} is corrupt at {path}: {message}")]
-    CorruptSession {
-        session_id: SessionId,
-        path: PathBuf,
-        message: String,
-    },
+    #[error("session turn cannot be persisted: {message}")]
+    InvalidTurn { message: String },
 }
 
 /// Failures while acquiring the process-lifetime writer lease for one
-/// logical session.
-///
-/// A writer lease is deliberately distinct from the short metadata/journal
-/// locks. The latter serialize one filesystem operation; this lease grants a
-/// single BONE process ownership of runtime attachment and durable turn
-/// writes for the lifetime of an active conversation.
+/// logical session. A lease is deliberately distinct from SQLite document
+/// writes: it represents runtime ownership, not ordinary mutation locking.
 #[derive(Debug, Error)]
 pub enum SessionLeaseError {
     #[error("session does not exist: {0}")]
@@ -158,17 +131,16 @@ pub enum SessionLeaseError {
     #[error("could not inspect a conversation before acquiring its writer lease: {0}")]
     Session(#[from] SessionStoreError),
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Store(#[from] StoreError),
 }
 
-/// A journal exists beside each durable session record and holds ordered
-/// conversation facts. A journal failure is deliberately distinct from a
-/// metadata-store failure: callers must not clear a composer or retry an
-/// external effect merely because the journal could not confirm a fact.
+/// A journal is SQLite-backed and append-only. Failure to append is separate
+/// from a record mutation because the UI must not clear a composer or send an
+/// Agent message until its durable acceptance fact exists.
 #[derive(Debug, Error)]
 pub enum JournalError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Store(#[from] StoreError),
     #[error(transparent)]
     Session(#[from] SessionStoreError),
     #[error("journal belongs to a session that does not exist: {0}")]
@@ -180,13 +152,6 @@ pub enum JournalError {
         session_id: SessionId,
         expected_next: crate::JournalSequence,
         actual_next: crate::JournalSequence,
-    },
-    #[error(
-        "journal for session {session_id} needs recovery at {path}; append is disabled until the incomplete or corrupt tail is repaired"
-    )]
-    NeedsRecovery {
-        session_id: SessionId,
-        path: PathBuf,
     },
     #[error("journal entry is invalid: {message}")]
     InvalidEntry { message: String },

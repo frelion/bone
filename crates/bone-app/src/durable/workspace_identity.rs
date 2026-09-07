@@ -92,6 +92,17 @@ impl CanonicalPath {
     pub(crate) fn storage_encoding(&self) -> String {
         encode_os_path(&self.0)
     }
+
+    /// Decode the private registry representation back into an absolute path.
+    ///
+    /// This stays crate-private because registry keys are an implementation
+    /// detail, but it lets the registry reject malformed persisted keys before
+    /// treating them as workspace identities.
+    pub(crate) fn from_storage_encoding(encoded: &str) -> Result<Self, String> {
+        let path = decode_os_path(encoded)?;
+        CanonicalPath::new(path)
+            .map_err(|_| "canonical workspace path encoding is not absolute".to_owned())
+    }
 }
 
 impl fmt::Debug for CanonicalPath {
@@ -118,8 +129,7 @@ impl<'de> Deserialize<'de> for CanonicalPath {
         D: Deserializer<'de>,
     {
         let encoded = String::deserialize(deserializer)?;
-        let path = decode_os_path(&encoded).map_err(de::Error::custom)?;
-        CanonicalPath::new(path).map_err(de::Error::custom)
+        CanonicalPath::from_storage_encoding(&encoded).map_err(de::Error::custom)
     }
 }
 
@@ -313,10 +323,12 @@ fn hex_decode(encoded: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use std::{fs, path::Path};
 
+    use bone_store::{BoneStore, StoreRoots};
+
     use super::*;
     use crate::WorkspaceRegistry;
 
-    fn private_data() -> tempfile::TempDir {
+    fn registry() -> (tempfile::TempDir, WorkspaceRegistry) {
         let directory = tempfile::tempdir().unwrap();
         #[cfg(unix)]
         fs::set_permissions(
@@ -324,7 +336,15 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
-        directory
+        let store = BoneStore::open_at(
+            StoreRoots::new(
+                directory.path().join("data"),
+                directory.path().join("config"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        (directory, WorkspaceRegistry::new(store.workspace_state()))
     }
 
     #[test]
@@ -338,11 +358,10 @@ mod tests {
 
     #[test]
     fn discovery_uses_exact_directory_and_preserves_display_path() {
-        let data = private_data();
+        let (_data, registry) = registry();
         let workspace = tempfile::tempdir().unwrap();
         let nested = workspace.path().join("nested");
         fs::create_dir(&nested).unwrap();
-        let registry = WorkspaceRegistry::open_in(data.path()).unwrap();
 
         let context = WorkspaceContext::discover(&nested, &registry).unwrap();
         assert_eq!(context.display_root(), nested);
@@ -352,11 +371,10 @@ mod tests {
 
     #[test]
     fn discovery_rejects_file_roots() {
-        let data = private_data();
+        let (_data, registry) = registry();
         let workspace = tempfile::tempdir().unwrap();
         let file = workspace.path().join("not-a-directory");
         fs::write(&file, "x").unwrap();
-        let registry = WorkspaceRegistry::open_in(data.path()).unwrap();
 
         assert!(matches!(
             WorkspaceContext::discover(&file, &registry),
@@ -369,12 +387,11 @@ mod tests {
     fn symlink_spellings_resolve_to_one_workspace_id() {
         use std::os::unix::fs::symlink;
 
-        let data = private_data();
+        let (_data, registry) = registry();
         let workspace = tempfile::tempdir().unwrap();
         let link_parent = tempfile::tempdir().unwrap();
         let link = link_parent.path().join("workspace-link");
         symlink(workspace.path(), &link).unwrap();
-        let registry = WorkspaceRegistry::open_in(data.path()).unwrap();
 
         let direct = WorkspaceContext::discover(workspace.path(), &registry).unwrap();
         let through_link = WorkspaceContext::discover(&link, &registry).unwrap();

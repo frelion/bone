@@ -33,8 +33,9 @@ The interactive CLI follows this product path:
 
 ```text
 launch directory
-  → WorkspaceApplication::open
-  → SettingsService::open_default
+  → BoneStore::open_default
+  → WorkspaceApplication::open_with_store
+  → SettingsService::open(same store)
   → bone_app::run_workspace
 ```
 
@@ -173,10 +174,11 @@ to acquire its lease and then refreshes its durable state. Idle leases can be
 released after a switch; a Session with active work, a pending turn, or a
 startup task remains owned until it reaches a safe boundary.
 
-`SessionStore::replace` uses revision compare-and-swap for individual record
-writes. On a normal cross-process conflict, the product runner reloads once
-and reapplies only fields owned by the current effect. The lease prevents
-competing normal writers; CAS remains the narrow file-level integrity check.
+`SessionStore::replace` uses SQLite document revision compare-and-swap for
+individual record writes. On a normal cross-process conflict, the product
+runner reloads once and reapplies only fields owned by the current effect. The
+lease prevents competing normal writers; SQLite CAS remains the narrow
+document-level integrity check.
 
 ## Durable input and recovery
 
@@ -184,13 +186,13 @@ The durable acceptance boundary for a user turn is:
 
 ```text
 draft
-  → resolve effective configuration and model
-  → append + fsync UserTurnAccepted { turn, text, revision, model }
+  → resolve complete immutable runtime config and model
+  → one SQLite transaction: Session summary + UserTurnAccepted { turn, text, runtime_fingerprint, model }
   → AppEvent::TurnAccepted clears the composer and shows the message
   → attach runtime / AgentHandle::post
 ```
 
-If the journal append fails, the composer remains intact and the Agent never
+If that transaction fails, the composer remains intact and the Agent never
 receives that message. Once the fact is accepted, the message is visible and a
 runtime receipt is tracked separately. A connection/start/post failure leaves
 the turn in a truthful retryable or interrupted state; it is not silently
@@ -222,7 +224,7 @@ implementation details; first use creates safe storage automatically.
 The model resolution order is:
 
 ```text
-Session override > Workspace default > User default > agent.system default
+Session override > Workspace default > User default
 ```
 
 Settings writes are immediate and durable. An already attached Agent runtime
@@ -321,7 +323,6 @@ crates/bone-app/src/
     ├── commands.rs           command parsing and suggestions
     ├── view.rs               pure responsive rendering
     ├── terminal.rs           terminal lifetime guard
-    ├── config.rs             display settings surface
     └── events.rs             JSONL observation export
 ```
 

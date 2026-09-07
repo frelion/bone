@@ -1,11 +1,10 @@
 //! Provider-independent built-in tools for coding agents.
 //!
 //! Every tool implements [`Tool`]. Local coding tools
-//! capture an immutable workspace boundary plus execution limits; Bash also
-//! captures its sanitized or explicitly configured child environment. The
-//! config tool instead captures a registered [`bone_config::ConfigManager`]
-//! and a model-output limit. Registration, authorization, approval, lifecycle
-//! state, and provider translation remain outside this crate.
+//! capture an immutable workspace boundary plus validated execution limits;
+//! Bash also captures its sanitized or explicitly configured child
+//! environment. Settings storage, authorization, approval, lifecycle state,
+//! and provider translation remain outside this crate.
 //! Native tool calls require an active Tokio runtime; [`Tool`]
 //! describes BONE's execution contract, not executor independence.
 //!
@@ -16,7 +15,6 @@
 
 mod bash;
 mod config;
-mod config_tool;
 mod environment;
 mod error;
 mod glob;
@@ -28,8 +26,7 @@ mod tool;
 mod workspace;
 
 pub use bash::{BashArgs, BashOutput, BashTool};
-pub use config::ToolLimits;
-pub use config_tool::{ConfigArgs, ConfigListEntry, ConfigOutput, ConfigTool, ConfigToolError};
+pub use config::{ToolLimits, ToolLimitsError};
 pub use environment::ToolEnvironment;
 pub use error::ToolError;
 pub use glob::{GlobArgs, GlobOutput, GlobTool};

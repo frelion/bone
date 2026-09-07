@@ -13,7 +13,7 @@ use crate::{
     SessionLifecycle, SessionRecord, SessionStatus, SessionStoreError, SessionWriterLease,
     SettingsService, TurnOutcome, WorkspaceApplication,
 };
-use bone_agent::{RecordEntry, ShutdownReport, TaskConfig};
+use bone_agent::{RecordEntry, ResolvedAgentRuntimeConfig, ShutdownReport};
 
 use super::{
     app::{App, AppEvent, UiSessionId},
@@ -40,8 +40,22 @@ pub(super) struct DurableUiSession {
 }
 
 pub(super) struct PreparedPost {
-    pub(super) task: TaskConfig,
-    pub(super) effective_config_revision: String,
+    pub(super) runtime: ResolvedAgentRuntimeConfig,
+    pub(super) runtime_fingerprint: String,
+}
+
+impl PreparedPost {
+    /// Freeze the exact runtime configuration that will receive the accepted
+    /// turn. This is also used for an already-attached runtime: its adapter
+    /// cannot hot-swap after `/model`, so subsequent turns must retain the
+    /// old runtime's truthful attribution until it is recreated.
+    pub(super) fn for_runtime(runtime: ResolvedAgentRuntimeConfig) -> Self {
+        let runtime_fingerprint = runtime.fingerprint().to_string();
+        Self {
+            runtime,
+            runtime_fingerprint,
+        }
+    }
 }
 
 /// The immutable execution choice for a durable turn awaiting a runtime
@@ -50,27 +64,26 @@ pub(super) struct PreparedPost {
 #[derive(Clone)]
 pub(super) struct PendingRuntimeTurn {
     pub(super) turn: u64,
-    pub(super) task: TaskConfig,
-    pub(super) effective_config_revision: String,
+    pub(super) runtime: ResolvedAgentRuntimeConfig,
+    pub(super) runtime_fingerprint: String,
     pub(super) solver_model: String,
 }
 
 pub(super) struct AcceptedPost {
-    pub(super) task: TaskConfig,
+    pub(super) runtime: ResolvedAgentRuntimeConfig,
     pub(super) text: String,
     pub(super) entry: crate::JournalEntry,
     pub(super) turn: u64,
-    pub(super) effective_config_revision: String,
+    pub(super) runtime_fingerprint: String,
     pub(super) solver_model: String,
-    pub(super) record_persistence_error: Option<String>,
 }
 
 impl AcceptedPost {
     pub(super) fn pending_runtime_turn(&self) -> PendingRuntimeTurn {
         PendingRuntimeTurn {
             turn: self.turn,
-            task: self.task.clone(),
-            effective_config_revision: self.effective_config_revision.clone(),
+            runtime: self.runtime.clone(),
+            runtime_fingerprint: self.runtime_fingerprint.clone(),
             solver_model: self.solver_model.clone(),
         }
     }
@@ -119,10 +132,14 @@ fn mutate_durable_record(
         if record == session.record {
             return Ok(());
         }
-        match application
-            .sessions()
-            .replace(record, session.record.revision)
-        {
+        match application.sessions().replace(
+            session
+                .writer_lease
+                .as_ref()
+                .expect("writer lease was required"),
+            record,
+            session.record.revision,
+        ) {
             Ok(record) => {
                 session.record = record;
                 return Ok(());
@@ -207,7 +224,7 @@ pub(super) fn persist_runtime_receipt(
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
     turn: u64,
-    effective_config_revision: &str,
+    runtime_fingerprint: &str,
     solver_model: &str,
 ) -> Result<(), String> {
     let session = durable
@@ -221,11 +238,17 @@ pub(super) fn persist_runtime_receipt(
         "Conversation history is unavailable; the runtime receipt was not recorded".to_owned()
     })?;
     journal
-        .append(JournalFact::TurnStarted {
-            turn,
-            effective_config_revision: effective_config_revision.to_owned(),
-            solver_model: solver_model.to_owned(),
-        })
+        .append(
+            session
+                .writer_lease
+                .as_ref()
+                .expect("writer lease was required"),
+            JournalFact::TurnStarted {
+                turn,
+                runtime_fingerprint: runtime_fingerprint.to_owned(),
+                solver_model: solver_model.to_owned(),
+            },
+        )
         .map_err(|error| format!("Could not save runtime receipt: {error}"))?;
     persist_status(application, durable, id, |status| {
         status.execution = SessionExecution::Working;
@@ -309,9 +332,10 @@ fn persist_runtime_observation_status(
     })
 }
 
-pub(super) fn model_is_ready(settings: Option<&SettingsService>, record: &SessionRecord) -> bool {
+pub(super) fn model_is_ready(settings: &SettingsService, record: &SessionRecord) -> bool {
     settings
-        .and_then(|service| service.resolve_model(record.workspace_id, record.id).ok())
+        .resolve_model(record.workspace_id, record.id)
+        .ok()
         .is_some_and(|resolution| matches!(resolution, ModelResolution::Ready { .. }))
 }
 
@@ -322,7 +346,7 @@ pub(super) fn model_is_ready(settings: Option<&SettingsService>, record: &Sessio
 /// conversation and contend with another BONE instance.
 pub(super) fn activate_writer_session(
     application: &WorkspaceApplication,
-    settings: Option<&SettingsService>,
+    settings: &SettingsService,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     app: &mut App,
     id: UiSessionId,
@@ -430,8 +454,7 @@ pub(super) fn activate_writer_session(
     } else {
         false
     };
-    let journal_needs_recovery =
-        journal_problem.is_some() || journal_read.recovery_issue.is_some() || delivery_unconfirmed;
+    let journal_needs_recovery = journal_problem.is_some() || delivery_unconfirmed;
     if journal_problem.is_none()
         && let Err(error) = reconcile_journal_summary(application, durable, id, &journal_read)
     {
@@ -517,25 +540,21 @@ pub(super) fn persist_draft(
 }
 
 pub(super) fn prepare_post(
-    settings: Option<&SettingsService>,
+    settings: &SettingsService,
     durable: &HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
 ) -> Result<PreparedPost, String> {
     let session = durable
         .get(&id)
         .ok_or_else(|| "This conversation is not backed by durable storage".to_owned())?;
-    let settings =
-        settings.ok_or_else(|| "Settings need repair before this message can start".to_owned())?;
     let resolution = settings
         .resolve_model(session.record.workspace_id, session.record.id)
         .map_err(|error| error.to_string())?;
-    let task = resolution
-        .task_config()
+    let runtime = resolution
+        .runtime_config()
+        .cloned()
         .ok_or_else(|| "Choose a model with /model <id> before sending work".to_owned())?;
-    Ok(PreparedPost {
-        task,
-        effective_config_revision: resolution.effective_revision().to_string(),
-    })
+    Ok(PreparedPost::for_runtime(runtime))
 }
 
 /// Commit one complete durable turn acceptance before the UI changes or an
@@ -554,40 +573,15 @@ pub(super) fn accept_post(
             .get_mut(&id)
             .ok_or_else(|| "This conversation is not backed by durable storage".to_owned())?;
         require_writer_lease(session)?;
-        let journal = session.journal.as_ref().ok_or_else(|| {
+        let _journal = session.journal.as_ref().ok_or_else(|| {
             "Conversation history is unavailable; BONE will not risk losing this message".to_owned()
         })?;
         let turn = session.next_turn;
-        let solver_model = prepared
-            .task
-            .model
-            .clone()
-            .expect("a resolved model always materializes a solver task config");
-        let entry = journal
-            .append(JournalFact::UserTurnAccepted {
-                turn,
-                text: text.clone(),
-                effective_config_revision: prepared.effective_config_revision.clone(),
-                solver_model: solver_model.clone(),
-            })
-            .map_err(|error| {
-                format!("message was not accepted because its turn could not be saved: {error}")
-            })?;
-        // The one atomic append above is the point at which a user-visible
-        // message becomes accepted. The effect executor returns the entry to
-        // the reducer rather than mutating the transcript or composer itself.
-        session.active_turn = Some(turn);
-        session.next_turn = session.next_turn.saturating_add(1);
-        (entry, turn, solver_model)
-    };
-    // The one atomic append above is the point at which a user-visible message
-    // becomes accepted. Its durable summary is intentionally updated in the
-    // same CAS replacement as the cleared draft: a restart can then describe
-    // this logical session as queued/working rather than an unrelated draft.
-    let record_persistence_error = mutate_durable_record(application, durable, id, |record| {
+        let solver_model = prepared.runtime.solver().model.clone();
+        let mut record = session.record.clone();
         record.draft = SessionDraft::empty();
-        // A journal acceptance is not a runtime receipt. Even an already
-        // attached agent has not necessarily accepted this exact text yet.
+        // Durable acceptance is not a runtime receipt. Even an attached agent
+        // has not necessarily accepted this exact text yet.
         record.status.execution = SessionExecution::QueuedForRuntime;
         record.status.attachment = if queue_runtime {
             RuntimeAttachment::Detached
@@ -599,16 +593,39 @@ pub(super) fn accept_post(
             .status
             .attention
             .remove(&SessionAttention::ConfigPending);
-    })
-    .err();
+        let (record, entry) = application
+            .sessions()
+            .replace_and_append(
+                session
+                    .writer_lease
+                    .as_ref()
+                    .expect("writer lease was required"),
+                record,
+                session.record.revision,
+                JournalFact::UserTurnAccepted {
+                    turn,
+                    text: text.clone(),
+                    runtime_fingerprint: prepared.runtime_fingerprint.clone(),
+                    solver_model: solver_model.clone(),
+                },
+            )
+            .map_err(|error| {
+                format!("message was not accepted because its turn could not be saved: {error}")
+            })?;
+        // The session summary and journal fact committed together. Only now
+        // may this local projection advance or the reducer clear composer.
+        session.record = record;
+        session.active_turn = Some(turn);
+        session.next_turn = session.next_turn.saturating_add(1);
+        (entry, turn, solver_model)
+    };
     Ok(AcceptedPost {
-        task: prepared.task,
+        runtime: prepared.runtime,
         text,
         entry,
         turn,
-        effective_config_revision: prepared.effective_config_revision,
+        runtime_fingerprint: prepared.runtime_fingerprint,
         solver_model,
-        record_persistence_error,
     })
 }
 
@@ -618,43 +635,28 @@ pub(super) fn create_session(
     app: &mut App,
     show_progress: bool,
     next_ui_id: &mut u64,
-    settings: Option<&SettingsService>,
+    settings: &SettingsService,
 ) {
-    match application.sessions().create("New conversation") {
-        Ok(record) => {
+    match application.sessions().create_writer("New conversation") {
+        Ok((record, lease)) => {
             let id = UiSessionId(*next_ui_id);
             *next_ui_id = next_ui_id.saturating_add(1);
-            let writer_lease = match application.sessions().try_acquire_writer_lease(record.id) {
-                Ok(lease) => Some(lease),
-                Err(error) => {
-                    report_notice(
-                        app,
-                        format!(
-                            "Conversation was created, but another process owns its editing access: {error}"
-                        ),
-                    );
-                    None
-                }
-            };
             match application.sessions().journal(record.id) {
                 Ok(journal) => {
                     let ready = model_is_ready(settings, &record);
-                    let writer_available = writer_lease.is_some();
                     let empty_journal = JournalRead::default();
                     durable.insert(
                         id,
                         DurableUiSession {
                             record,
                             journal: Some(journal),
-                            writer_lease,
+                            writer_lease: Some(lease),
                             next_turn: 1,
                             active_turn: None,
                             runtime_record_cursor: 0,
                         },
                     );
-                    if writer_available
-                        && let Err(error) = persist_model_readiness(application, durable, id, ready)
-                    {
+                    if let Err(error) = persist_model_readiness(application, durable, id, ready) {
                         report_notice(
                             app,
                             format!("Could not save this conversation's model readiness: {error}"),
@@ -670,7 +672,7 @@ pub(super) fn create_session(
                         journal: &empty_journal,
                         show_progress,
                         ready_to_attach: ready,
-                        writer_available,
+                        writer_available: true,
                         select: true,
                     });
                 }
@@ -744,7 +746,13 @@ pub(super) fn persist_runtime_records(
                 _ => None,
             };
             if let Some(fact) = fact
-                && let Err(error) = journal.append(fact)
+                && let Err(error) = journal.append(
+                    session
+                        .writer_lease
+                        .as_ref()
+                        .expect("writer lease was required"),
+                    fact,
+                )
             {
                 journal_error = Some(format!(
                     "Live output is visible but history was not saved: {error}"
@@ -811,9 +819,15 @@ pub(super) fn persist_interruption(
     let mut interruption_error = None;
     let interrupted = if had_active_turn {
         match journal {
-            Some(journal) => match journal.append(JournalFact::RuntimeInterrupted {
-                reason: reason.to_owned(),
-            }) {
+            Some(journal) => match journal.append(
+                session
+                    .writer_lease
+                    .as_ref()
+                    .expect("writer lease was required"),
+                JournalFact::RuntimeInterrupted {
+                    reason: reason.to_owned(),
+                },
+            ) {
                 Ok(_) => {
                     if let Some(session) = durable.get_mut(&id) {
                         session.active_turn = None;
@@ -869,12 +883,18 @@ pub(super) fn persist_unresolved_shutdown_effects(
         .iter()
         .filter(|job| job.external_write)
     {
-        if let Err(error) = journal.append(JournalFact::UnresolvedExternalEffect {
-            summary: format!(
-                "external job {} was unresolved when BONE shut down",
-                job.id.0
-            ),
-        }) {
+        if let Err(error) = journal.append(
+            session
+                .writer_lease
+                .as_ref()
+                .expect("writer lease was required"),
+            JournalFact::UnresolvedExternalEffect {
+                summary: format!(
+                    "external job {} was unresolved when BONE shut down",
+                    job.id.0
+                ),
+            },
+        ) {
             if wrote_unresolved_effect
                 && let Err(status_error) =
                     persist_runtime_observation_status(application, durable, id, None, true)

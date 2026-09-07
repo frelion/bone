@@ -7,9 +7,15 @@ use std::{
 };
 
 use bone_agent::{
-    AgentHandle, JobRequest, Notice, Observation, RecordEntry, RecordKind, TaskConfig,
+    AgentHandle, AgentHost, JobRequest, Notice, Observation, RecordEntry, RecordKind,
 };
-use bone_app::{SettingsService, TuiConfig, WorkspaceApplication, run_workspace, write_events};
+use bone_app::{
+    ModelSelection, SettingsError, SettingsService, TuiDisplaySettings, TuiError,
+    WorkspaceApplication, WorkspaceApplicationError, WorkspaceError, run_storage_repair,
+    run_workspace, write_events,
+};
+use bone_llm::service::chatgpt_subscription::{self, DeviceCodePrompt};
+use bone_store::{BoneStore, ProviderId, StoreError};
 use tokio::sync::broadcast::error::RecvError;
 
 #[tokio::main]
@@ -53,11 +59,55 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .into());
         }
         // Workspace/session boot intentionally precedes settings, login, and
-        // Agent connection. A damaged or absent config enters the TUI repair
-        // state instead of terminating before the terminal is restored.
-        let application = WorkspaceApplication::open(&workspace)?;
-        let settings = SettingsService::open_default().map_err(|error| error.to_string());
-        let reports = run_workspace(application, settings, selected_model).await?;
+        // Agent connection. If the sole SQLite store cannot open, keep an
+        // interactive user in an explicit no-reset repair screen rather than
+        // dropping them back to a raw startup error.
+        let reports = loop {
+            let store = loop {
+                match BoneStore::open_default() {
+                    Ok(store) => break store,
+                    Err(error) if run_storage_repair(storage_repair_reason(&error)).await? => {}
+                    Err(_) => return Ok(()),
+                }
+            };
+            let application = match WorkspaceApplication::open_with_store(&workspace, store.clone())
+            {
+                Ok(application) => application,
+                Err(error) => {
+                    let Some(reason) = workspace_repair_reason(&error) else {
+                        return Err(error.into());
+                    };
+                    if run_storage_repair(reason).await? {
+                        continue;
+                    }
+                    return Ok(());
+                }
+            };
+            // Settings are durable state too. Do not stringify an initialization
+            // failure and let the Workspace TUI pretend it can run without
+            // settings: malformed or invalid settings must follow the same
+            // no-reset repair path as every other SQLite-backed startup read.
+            let settings = match SettingsService::open(store) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    if run_storage_repair(settings_repair_reason(&error)).await? {
+                        continue;
+                    }
+                    return Ok(());
+                }
+            };
+            match run_workspace(application, settings, selected_model.clone()).await {
+                Ok(reports) => break reports,
+                Err(error) => {
+                    let Some(reason) = tui_storage_repair_reason(&error) else {
+                        return Err(error.into());
+                    };
+                    if !run_storage_repair(reason).await? {
+                        return Ok(());
+                    }
+                }
+            }
+        };
         report_unresolved(
             reports
                 .iter()
@@ -71,19 +121,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // auto-created settings document, but an unconfigured model is reported
     // as an ordinary startup error rather than starting an interactive repair
     // shell on a non-terminal stream.
-    let settings = SettingsService::open_default()?;
-    let config = settings.config_manager();
-    let display = settings.display_settings()?.0;
-    let snapshot = config.snapshot()?;
-    for section in snapshot.unrecognized_sections() {
-        eprintln!("[unrecognized configuration section: {section}]");
-    }
-    let task = TaskConfig {
-        model: selected_model,
-        ..TaskConfig::default()
-    };
-
-    let agent = bone_agent::start(config, &workspace, task, show_login).await?;
+    let store = BoneStore::open_default()?;
+    let settings = SettingsService::open(store.clone())?;
+    let display = settings.display_settings()?;
+    let explicit_solver = selected_model
+        .map(|model| ModelSelection::new(model, None, None))
+        .transpose()?;
+    let runtime = settings.resolve_one_shot(explicit_solver)?;
+    let auth = store
+        .provider_auth()
+        .acquire(ProviderId::ChatGptSubscription)?;
+    let endpoint = chatgpt_subscription::connect("bone-agent", auth, show_login).await?;
+    let agent = AgentHost::new(endpoint).start(&workspace, runtime)?;
     let event_log = match arguments.events {
         Some(path) => {
             let file = match tokio::fs::OpenOptions::new()
@@ -120,7 +169,62 @@ async fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn show_login(prompt: bone_agent::LoginPrompt) {
+fn settings_repair_reason(_error: &SettingsError) -> &'static str {
+    // This function is deliberately used only for `SettingsService::open`.
+    // At that boundary every variant means BONE could not safely initialize
+    // its one durable settings document (store access, decode, or validation),
+    // rather than an ordinary runtime/model command failure.
+    "The saved BONE settings could not be opened, decoded, or validated safely."
+}
+
+fn storage_repair_reason(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::Busy => "Another BONE process is using the local store.",
+        StoreError::Corrupt { .. } => {
+            "The local BONE SQLite database may be damaged or is not a SQLite database."
+        }
+        StoreError::UnsupportedSchema { .. } => {
+            "This BONE store uses an unsupported schema version."
+        }
+        StoreError::UnsafeStorage { .. } => {
+            "The local BONE storage location did not pass its privacy and safety checks."
+        }
+        _ => "BONE could not safely open its local storage.",
+    }
+}
+
+fn workspace_repair_reason(error: &WorkspaceApplicationError) -> Option<&'static str> {
+    match error {
+        WorkspaceApplicationError::Store(_)
+        | WorkspaceApplicationError::Registry(_)
+        | WorkspaceApplicationError::Sessions(_)
+        | WorkspaceApplicationError::Lease(_) => {
+            Some("The local Workspace and conversation state could not be opened safely.")
+        }
+        WorkspaceApplicationError::Workspace(WorkspaceError::Registry(_)) => {
+            Some("The local Workspace registry could not be opened safely.")
+        }
+        WorkspaceApplicationError::ConcurrentDraftOpen => {
+            Some("BONE could not safely select a writable saved conversation.")
+        }
+        WorkspaceApplicationError::Workspace(_) => None,
+    }
+}
+
+fn tui_storage_repair_reason(error: &TuiError) -> Option<&'static str> {
+    match error {
+        TuiError::Workspace(error) => workspace_repair_reason(error),
+        TuiError::SessionStore(_) => {
+            Some("The local conversation data could not be read or updated safely.")
+        }
+        TuiError::Settings(_) => {
+            Some("The saved BONE settings could not be opened, decoded, or validated safely.")
+        }
+        TuiError::Io(_) | TuiError::Agent(_) | TuiError::Start(_) | TuiError::Input(_) => None,
+    }
+}
+
+fn show_login(prompt: DeviceCodePrompt) {
     eprintln!(
         "ChatGPT authorization required.\nOpen: {}\nCode: {}\nDo not share this code.\n",
         prompt.verification_uri, prompt.user_code
@@ -137,7 +241,7 @@ async fn one_shot(
     agent: &AgentHandle,
     mut observation: Observation,
     input: String,
-    display: &TuiConfig,
+    display: &TuiDisplaySettings,
 ) -> Result<(), Box<dyn Error>> {
     let mut record_cursor = observation.snapshot.record_cursor;
     agent.post(input).await?;
@@ -180,7 +284,7 @@ fn consume_records(
     records: &[RecordEntry],
     cursor: &mut u64,
     last_error: &mut Option<String>,
-    display: &TuiConfig,
+    display: &TuiDisplaySettings,
 ) -> Option<Result<(), io::Error>> {
     for entry in records {
         *cursor = entry.cursor;
@@ -203,7 +307,7 @@ fn consume_records(
     None
 }
 
-fn show(notice: &Notice, display: &TuiConfig) {
+fn show(notice: &Notice, display: &TuiDisplaySettings) {
     match notice {
         Notice::Reply { text, .. } => println!("\nagent> {text}\n"),
         Notice::JobStarted { id, request } if display.show_progress => {
@@ -347,18 +451,19 @@ Keyboard:
 
 Authentication:
   /login starts the ChatGPT device authorization flow when needed. Keep its code
-  private. BONE stores credentials in its own private user-data area.
+  private. BONE stores its SQLite data in a private user-data area and Rig's
+  provider-managed ChatGPT cache in a separate private config area.
 
 Configuration application:
   Settings are persisted immediately and model selection follows Session >
-  Workspace > User > system default. An Agent runtime pins its model when it is
+  Workspace > User. An Agent runtime pins its complete resolved configuration when it is
   created, so an already attached runtime keeps its model. New conversations and
   future recreated runtimes use the saved selection; per-turn hot switching is
   not claimed by this version.
 
-  BONE_CONFIG may select an absolute configuration path for advanced or
-  automation use. One-shot mode remains strict and requires a valid Agent system
-  configuration; use interactive setup for the normal no-file-editing path.
+  No BONE configuration file needs to be created or edited. The first launch
+  creates the private store automatically; choose a model in the TUI before
+  starting work. One-shot mode can use --model or a saved user default.
 
 The Agent exposes read, glob, and grep tools. Run it from the intended workspace;
 content read by tools is sent to the model. Input remains available while jobs run.
@@ -377,11 +482,16 @@ Event observation:
 mod tests {
     use std::{future::Future, pin::Pin, sync::Arc};
 
-    use super::{Arguments, TuiConfig, one_shot};
+    use super::{
+        Arguments, TuiDisplaySettings, TuiError, one_shot, settings_repair_reason,
+        tui_storage_repair_reason, workspace_repair_reason,
+    };
     use bone_agent::{
         Autonomy, JobContext, JobOutcome, ModelInput, ModelPort, Next, Notice, RecordKind, Runtime,
         WorkResult,
     };
+    use bone_app::SettingsError;
+    use bone_app::{SessionId, SessionStoreError, WorkspaceApplicationError, WorkspaceError};
 
     struct ClarifyingModel;
 
@@ -418,7 +528,7 @@ mod tests {
             &agent,
             observation,
             "Inspect the file".into(),
-            &TuiConfig::default(),
+            &TuiDisplaySettings::default(),
         )
         .await
         .unwrap();
@@ -480,5 +590,30 @@ mod tests {
         ] {
             assert!(Arguments::parse(args.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    #[test]
+    fn durable_startup_failures_route_to_the_safe_storage_repair_screen() {
+        let session_error =
+            WorkspaceApplicationError::Sessions(SessionStoreError::NotFound(SessionId::new()));
+        assert!(workspace_repair_reason(&session_error).is_some());
+
+        let workspace_error = WorkspaceApplicationError::Workspace(WorkspaceError::NotDirectory {
+            path: std::path::PathBuf::from("/not-a-directory"),
+        });
+        assert!(workspace_repair_reason(&workspace_error).is_none());
+
+        let tui_error = TuiError::SessionStore(SessionStoreError::NotFound(SessionId::new()));
+        assert!(tui_storage_repair_reason(&tui_error).is_some());
+    }
+
+    #[test]
+    fn settings_startup_failures_route_to_the_safe_storage_repair_screen() {
+        assert!(
+            !settings_repair_reason(&SettingsError::NonPositive {
+                field: "soft_deadline_seconds",
+            })
+            .is_empty()
+        );
     }
 }

@@ -944,22 +944,13 @@ impl Conversation {
         for entry in &journal.entries {
             conversation.apply_journal_entry(entry);
         }
-        if let Some(issue) = &journal.recovery_issue {
-            conversation.projection.timeline.push(TimelineItem::status(
-                conversation.cursor.saturating_add(1),
-                format!("— history needs recovery: {}", issue.message),
-                Tone::Error,
-                true,
-            ));
-        }
         conversation
     }
 
     fn apply_journal_entry(&mut self, entry: &JournalEntry) -> bool {
         self.cursor = self.cursor.max(entry.sequence.value());
         match &entry.fact {
-            JournalFact::UserTurnAccepted { text, .. }
-            | JournalFact::UserMessageAccepted { text, .. } => {
+            JournalFact::UserTurnAccepted { text, .. } => {
                 self.projection.timeline.push(TimelineItem::message(
                     entry.sequence.value(),
                     Speaker::User,
@@ -2442,13 +2433,12 @@ mod tests {
     fn accepted_turn_entry(sequence: u64, text: &str) -> JournalEntry {
         assert_eq!(sequence, 1, "test helper only needs the first journal fact");
         JournalEntry {
-            format_version: 2,
             sequence: JournalSequence::first(),
             occurred_at: UnixMillis::from_millis(1).expect("epoch timestamp is valid"),
             fact: JournalFact::UserTurnAccepted {
                 turn: sequence,
                 text: text.into(),
-                effective_config_revision: "test-revision".into(),
+                runtime_fingerprint: "test-fingerprint".into(),
                 solver_model: "test-model".into(),
             },
         }

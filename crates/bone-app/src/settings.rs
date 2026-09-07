@@ -1,22 +1,31 @@
-use std::{collections::BTreeMap, fmt, path::Path};
+//! Typed BONE product settings.
+//!
+//! The user never has to edit a configuration file: this service reads and
+//! writes one SQLite-backed `GlobalSettings` document plus the Workspace and
+//! Session documents that naturally own model inheritance. No dynamic section
+//! registry, JSON schema registry, raw config revision, or arbitrary setting
+//! map leaks into the TUI or Agent.
 
-use crate::{SessionId, WorkspaceId};
-use bone_agent::{Effort, ModelSettings, SystemConfig, TaskConfig};
-use bone_config::{ConfigError, ConfigManager, ConfigSection};
-use schemars::JsonSchema;
+use std::{fmt, time::Duration};
+
+use bone_agent::{
+    Effort, ModelSettings, ResolvedAgentRuntimeConfig, ResolvedAgentRuntimeConfigError,
+};
+use bone_store::{BoneStore, SettingsStore, StoreError, WorkspaceStateStore};
+use bone_tools::{ToolLimits, ToolLimitsError};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::{RecordError, SessionId, SessionRecord, WorkspaceId};
+
 const MAX_MODEL_ID_BYTES: usize = 256;
-const MAX_REVISION_BYTES: usize = 512;
-const CONFIG_RETRY_LIMIT: usize = 4;
+const SETTINGS_RETRY_LIMIT: usize = 4;
 const DEFAULT_MODEL_TIMEOUT_SECONDS: u32 = 120;
 const DEFAULT_SOFT_DEADLINE_SECONDS: u32 = 30;
 const DEFAULT_SHUTDOWN_GRACE_SECONDS: u32 = 5;
 
-/// A public settings key. Product code uses typed constants or validated keys
-/// instead of ad-hoc JSON paths.
+/// A public setting name used by the command/UI descriptor layer. Storage is
+/// still typed; these labels are not database paths.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SettingKey(String);
@@ -59,8 +68,8 @@ impl fmt::Display for SettingKey {
 #[error("invalid setting key: {0}")]
 pub struct SettingKeyError(String);
 
-/// The scope category a descriptor permits. The type deliberately excludes a
-/// mutable WorkspaceRoot scope: a running BONE process has one fixed root.
+/// The scope category a descriptor permits. A running process has exactly one
+/// Workspace, so there is no mutable path-like scope in the public API.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScopeKind {
     User,
@@ -68,9 +77,7 @@ pub enum ScopeKind {
     Session,
 }
 
-/// A concrete setting scope. Values resolve in Session > Workspace > User >
-/// built-in order; CLI choices are materialized into Session scope instead of
-/// becoming a hidden fifth layer.
+/// A concrete model setting scope. Values resolve Session > Workspace > User.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum Scope {
     User,
@@ -88,11 +95,9 @@ impl Scope {
     }
 }
 
-/// The source which supplied an effective value. A value set with `--model`
-/// is represented as `Session`, not as an opaque process override.
+/// The source which supplied an effective value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SettingSource {
-    BuiltIn,
     User,
     Workspace,
     Session,
@@ -101,17 +106,12 @@ pub enum SettingSource {
 /// When a validated desired value may affect execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplyBoundary {
-    /// Safe display-only values can change in the current/next frame.
     Immediate,
-    /// Solver, effort and agent behavior apply only to a new user turn.
     NextUserTurn,
-    /// Connection-like resources require successful preparation before swap.
-    PrepareAndSwap,
 }
 
-/// A descriptor is the shared product contract for settings UI, command
-/// registry and runtime consumers. It prevents the UI from inventing settings
-/// that have no validation or apply consumer.
+/// Descriptor shared by command help and a future settings UI. It intentionally
+/// includes only controls with a real typed persistence/application contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SettingDescriptor {
     pub key: &'static str,
@@ -125,9 +125,6 @@ pub struct SettingDescriptor {
 const USER_ONLY: &[ScopeKind] = &[ScopeKind::User];
 const MODEL_SCOPES: &[ScopeKind] = &[ScopeKind::Session, ScopeKind::Workspace, ScopeKind::User];
 
-/// Descriptors currently backed by a real product contract. More settings are
-/// intentionally not listed until they have a validator and application
-/// consumer, so the future Settings Center cannot show dead controls.
 pub const PUBLIC_SETTINGS: &[SettingDescriptor] = &[
     SettingDescriptor {
         key: SettingKey::MODEL_SOLVER,
@@ -147,13 +144,10 @@ pub const PUBLIC_SETTINGS: &[SettingDescriptor] = &[
     },
 ];
 
-/// Immediate terminal presentation preferences. This lives in the application
-/// settings service instead of being a startup-only TUI struct, so changing it
-/// can update the current frame without restarting BONE.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// Immediate terminal presentation preferences stored inside `GlobalSettings`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TuiDisplaySettings {
-    /// Show model/tool starts, completions, and intermediate progress.
     pub show_progress: bool,
 }
 
@@ -165,53 +159,11 @@ impl Default for TuiDisplaySettings {
     }
 }
 
-impl ConfigSection for TuiDisplaySettings {
-    const KEY: &'static str = "tui.display";
-
-    fn description() -> &'static str {
-        "Terminal display preferences. Applied immediately by the active frontend."
-    }
-
-    fn schema() -> Value {
-        schemars::schema_for!(Self).to_value()
-    }
-}
-
-/// An opaque, immutable revision of the resolved (not merely persisted)
-/// configuration. The persistence service will derive it from the scope
-/// revisions it has actually validated and applied.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct EffectiveRevision(String);
-
-impl EffectiveRevision {
-    pub fn new(value: impl Into<String>) -> Result<Self, RevisionError> {
-        let value = value.into();
-        if value.is_empty() || value.len() > MAX_REVISION_BYTES {
-            return Err(RevisionError);
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for EffectiveRevision {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error(
-    "effective configuration revision must be non-empty and at most {MAX_REVISION_BYTES} bytes"
-)]
-pub struct RevisionError;
-
-/// Validated solver parameters which can be pinned into a user turn.
+/// Validated solver parameters which can live at User, Workspace, or Session
+/// scope. The Agent receives the fully materialized `ModelSettings` only when
+/// a runtime is started.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelSelection {
     pub model: String,
     pub effort: Option<Effort>,
@@ -224,18 +176,36 @@ impl ModelSelection {
         effort: Option<Effort>,
         timeout_seconds: Option<u32>,
     ) -> Result<Self, ModelSelectionError> {
-        let model = model.into();
-        if model.trim().is_empty() || model.trim() != model || model.len() > MAX_MODEL_ID_BYTES {
-            return Err(ModelSelectionError::InvalidModel);
-        }
-        if timeout_seconds == Some(0) {
-            return Err(ModelSelectionError::ZeroTimeout);
-        }
-        Ok(Self {
-            model,
+        let selection = Self {
+            model: model.into(),
             effort,
             timeout_seconds,
-        })
+        };
+        selection.validate()?;
+        Ok(selection)
+    }
+
+    pub fn validate(&self) -> Result<(), ModelSelectionError> {
+        if self.model.trim().is_empty()
+            || self.model.trim() != self.model
+            || self.model.len() > MAX_MODEL_ID_BYTES
+        {
+            return Err(ModelSelectionError::InvalidModel);
+        }
+        if self.timeout_seconds == Some(0) {
+            return Err(ModelSelectionError::ZeroTimeout);
+        }
+        Ok(())
+    }
+
+    pub fn as_model_settings(&self) -> ModelSettings {
+        ModelSettings {
+            model: self.model.clone(),
+            effort: self.effort,
+            timeout_seconds: self
+                .timeout_seconds
+                .unwrap_or(DEFAULT_MODEL_TIMEOUT_SECONDS),
+        }
     }
 }
 
@@ -248,342 +218,215 @@ pub enum ModelSelectionError {
 }
 
 /// Effective model value together with the inheritance source which supplied
-/// it. UI can therefore say "inherited from this workspace" without parsing
-/// raw config files.
+/// it. UI can truthfully say where the selected model comes from.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedModel {
     pub selection: ModelSelection,
     pub source: SettingSource,
 }
 
-/// The product-level inheritance layer for solver selection. It is stored as
-/// one typed private config section; values are still semantically scoped by
-/// their workspace/session IDs rather than by a configuration-file path.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Agent defaults persisted in the typed global settings document. The two
+/// model values stay optional on first launch: BONE never guesses a model.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct ModelOverrides {
-    user: Option<ModelSelection>,
-    workspaces: BTreeMap<WorkspaceId, ModelSelection>,
-    sessions: BTreeMap<SessionId, ModelSelection>,
+pub struct GlobalAgentSettings {
+    pub coordinator: Option<ModelSelection>,
+    pub default_solver: Option<ModelSelection>,
+    pub soft_deadline_seconds: u32,
+    pub shutdown_grace_seconds: u32,
 }
 
-impl ConfigSection for ModelOverrides {
-    const KEY: &'static str = "app.models";
-
-    fn description() -> &'static str {
-        "BONE solver-model overrides resolved as session, workspace, user, then system default."
-    }
-
-    fn schema() -> Value {
-        // IDs are opaque local UUIDs and are deliberately described as map
-        // keys rather than paths. Runtime validation below remains the source
-        // of truth for model values and inherited scopes.
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "user": { "$ref": "#/$defs/model_selection" },
-                "workspaces": {
-                    "type": "object",
-                    "additionalProperties": { "$ref": "#/$defs/model_selection" }
-                },
-                "sessions": {
-                    "type": "object",
-                    "additionalProperties": { "$ref": "#/$defs/model_selection" }
-                }
-            },
-            "$defs": {
-                "model_selection": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["model"],
-                    "properties": {
-                        "model": { "type": "string", "minLength": 1, "maxLength": MAX_MODEL_ID_BYTES },
-                        "effort": { "type": ["string", "null"] },
-                        "timeout_seconds": { "type": ["integer", "null"], "minimum": 1 }
-                    }
-                }
-            }
-        })
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        let validate = |selection: &ModelSelection| {
-            ModelSelection::new(
-                selection.model.clone(),
-                selection.effort,
-                selection.timeout_seconds,
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-        };
-        if let Some(selection) = &self.user {
-            validate(selection)?;
+impl Default for GlobalAgentSettings {
+    fn default() -> Self {
+        Self {
+            coordinator: None,
+            default_solver: None,
+            soft_deadline_seconds: DEFAULT_SOFT_DEADLINE_SECONDS,
+            shutdown_grace_seconds: DEFAULT_SHUTDOWN_GRACE_SECONDS,
         }
-        for selection in self.workspaces.values().chain(self.sessions.values()) {
-            validate(selection)?;
+    }
+}
+
+impl GlobalAgentSettings {
+    fn validate(&self) -> Result<(), SettingsError> {
+        self.coordinator
+            .as_ref()
+            .map(ModelSelection::validate)
+            .transpose()?;
+        self.default_solver
+            .as_ref()
+            .map(ModelSelection::validate)
+            .transpose()?;
+        if self.soft_deadline_seconds == 0 {
+            return Err(SettingsError::NonPositive {
+                field: "soft_deadline_seconds",
+            });
+        }
+        if self.shutdown_grace_seconds == 0 {
+            return Err(SettingsError::NonPositive {
+                field: "shutdown_grace_seconds",
+            });
         }
         Ok(())
     }
 }
 
-impl ModelOverrides {
-    pub fn set(&mut self, scope: Scope, selection: ModelSelection) {
-        match scope {
-            Scope::User => self.user = Some(selection),
-            Scope::Workspace(id) => {
-                self.workspaces.insert(id, selection);
-            }
-            Scope::Session(id) => {
-                self.sessions.insert(id, selection);
-            }
-        }
-    }
+/// The one typed BONE global settings document. Secrets and OAuth payloads are
+/// intentionally excluded: they never enter SQLite settings or journal JSON.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlobalSettings {
+    pub agent: GlobalAgentSettings,
+    pub tool_limits: ToolLimits,
+    pub tui: TuiDisplaySettings,
+}
 
-    /// Clear the current session override and let it inherit from Workspace,
-    /// then User, then the built-in fallback.
-    pub fn inherit_session(&mut self, session: SessionId) -> bool {
-        self.sessions.remove(&session).is_some()
-    }
-
-    pub fn resolve(
-        &self,
-        workspace: WorkspaceId,
-        session: SessionId,
-        built_in: &ModelSelection,
-    ) -> ResolvedModel {
-        if let Some(selection) = self.sessions.get(&session) {
-            return ResolvedModel {
-                selection: selection.clone(),
-                source: SettingSource::Session,
-            };
-        }
-        if let Some(selection) = self.workspaces.get(&workspace) {
-            return ResolvedModel {
-                selection: selection.clone(),
-                source: SettingSource::Workspace,
-            };
-        }
-        if let Some(selection) = &self.user {
-            return ResolvedModel {
-                selection: selection.clone(),
-                source: SettingSource::User,
-            };
-        }
-        ResolvedModel {
-            selection: built_in.clone(),
-            source: SettingSource::BuiltIn,
-        }
+impl GlobalSettings {
+    pub fn validate(&self) -> Result<(), SettingsError> {
+        self.agent.validate()?;
+        self.tool_limits.validate()?;
+        Ok(())
     }
 }
 
-/// A concrete configuration choice frozen at the beginning of one user turn.
-/// It is immutable by construction: later Settings changes can become
-/// effective for the next turn but cannot mutate this value.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TurnConfig {
-    pub effective_revision: EffectiveRevision,
-    pub solver: ModelSelection,
-    pub coordinator: ModelSelection,
-    pub agent_protocol_version: u32,
-    pub tool_schema_version: u32,
+/// Settings owned by one Workspace. There is no global map keyed by a UUID;
+/// each value naturally lives with the Workspace it affects.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkspaceSettings {
+    pub default_solver: Option<ModelSelection>,
 }
 
-impl TurnConfig {
-    pub fn new(
-        effective_revision: EffectiveRevision,
-        solver: ModelSelection,
-        coordinator: ModelSelection,
-        agent_protocol_version: u32,
-        tool_schema_version: u32,
-    ) -> Result<Self, TurnConfigError> {
-        if agent_protocol_version == 0 || tool_schema_version == 0 {
-            return Err(TurnConfigError);
-        }
-        Ok(Self {
-            effective_revision,
-            solver,
-            coordinator,
-            agent_protocol_version,
-            tool_schema_version,
-        })
+impl WorkspaceSettings {
+    fn validate(&self) -> Result<(), ModelSelectionError> {
+        self.default_solver
+            .as_ref()
+            .map(ModelSelection::validate)
+            .transpose()
+            .map(|_| ())
     }
 }
 
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("agent and tool schema versions must be greater than zero")]
-pub struct TurnConfigError;
-
-/// Human-visible application status after a settings transaction. "Saved" is
-/// deliberately not conflated with "Applied": the SettingsService should only
-/// construct `Applied` after its runtime consumer acknowledges the revision.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ApplyState {
-    Validating,
-    Preparing,
-    Applied {
-        effective_revision: EffectiveRevision,
-    },
-    PendingNextTurn {
-        desired_revision: EffectiveRevision,
-        current_turn_revision: EffectiveRevision,
-    },
-    FailedUsingLastKnownGood {
-        desired_revision: Option<EffectiveRevision>,
-        last_known_good_revision: EffectiveRevision,
-        reason: String,
-    },
-}
-
-/// Determine the truthful UX state for a model change after it has been
-/// validated, durably saved, and accepted as the next effective revision. A
-/// caller still needs to persist / apply it; this function ensures a Working
-/// turn cannot be misrepresented as hot-switched.
-pub fn model_apply_state(
-    desired_revision: EffectiveRevision,
-    active_turn: Option<&TurnConfig>,
-) -> ApplyState {
-    match active_turn {
-        Some(turn) => ApplyState::PendingNextTurn {
-            desired_revision,
-            current_turn_revision: turn.effective_revision.clone(),
-        },
-        None => ApplyState::Applied {
-            effective_revision: desired_revision,
-        },
-    }
-}
-
-/// The model state the frontend can truthfully present after resolving every
-/// supported scope. `NeedsModel` is a normal first-run state, not a terminal
-/// configuration error: the shell can remain usable for browsing sessions,
-/// draft editing, and opening the model picker.
+/// Model resolution returned to the frontend. `NeedsModel` is a normal
+/// first-run state, not a broken store: Workspace/session browsing and drafts
+/// remain fully usable until the user invokes `/model`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelResolution {
-    NeedsModel {
-        effective_revision: EffectiveRevision,
-    },
+    NeedsModel,
     Ready {
         resolved: ResolvedModel,
-        effective_revision: EffectiveRevision,
+        runtime: Box<ResolvedAgentRuntimeConfig>,
     },
 }
 
 impl ModelResolution {
-    pub fn effective_revision(&self) -> &EffectiveRevision {
+    pub fn runtime_config(&self) -> Option<&ResolvedAgentRuntimeConfig> {
         match self {
-            Self::NeedsModel { effective_revision }
-            | Self::Ready {
-                effective_revision, ..
-            } => effective_revision,
+            Self::NeedsModel => None,
+            Self::Ready { runtime, .. } => Some(runtime.as_ref()),
         }
-    }
-
-    /// Materialize a resolved solver choice into the existing Agent startup
-    /// API. The choice is session-local task input rather than a hidden
-    /// process-wide override.
-    pub fn task_config(&self) -> Option<TaskConfig> {
-        let Self::Ready { resolved, .. } = self else {
-            return None;
-        };
-        Some(TaskConfig {
-            model: Some(resolved.selection.model.clone()),
-            effort: resolved.selection.effort,
-            timeout_seconds: resolved.selection.timeout_seconds,
-        })
     }
 }
 
-/// Result of a durable model mutation. The caller combines this revision with
-/// the current turn to choose `Applied` versus `PendingNextTurn`; the settings
-/// service itself never pretends an existing runtime hot-switched model.
+/// Result of a durable model mutation. Existing runtimes are not modified;
+/// the returned resolution applies to a future/new runtime boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelChange {
     pub scope: Scope,
     pub resolved: ResolvedModel,
-    pub desired_revision: EffectiveRevision,
 }
 
-/// Durable application settings backed by the existing typed ConfigManager.
-///
-/// The manager supplies validation, cross-process CAS, private atomic writes,
-/// and an immutable content revision. This service adds BONE-specific
-/// initialization, scope resolution, and the first-run `NeedsModel` state.
+/// Typed settings service backed by one injected `BoneStore`.
 #[derive(Clone, Debug)]
 pub struct SettingsService {
-    manager: ConfigManager,
+    settings: SettingsStore,
+    state: WorkspaceStateStore,
 }
 
 impl SettingsService {
-    /// Open the normal user configuration path and create the non-secret
-    /// BONE settings document on first use. No model is guessed or connected.
-    pub fn open_default() -> Result<Self, SettingsError> {
-        Self::open_at(bone_config::default_path()?)
-    }
-
-    /// Open an explicit absolute configuration path. This injection point is
-    /// used by tests, portable installs, and the eventual Settings Center.
-    pub fn open_at(path: impl AsRef<Path>) -> Result<Self, SettingsError> {
-        let manager = bone_agent::config_builder()?
-            .register::<ModelOverrides>()?
-            .register::<TuiDisplaySettings>()?
-            .build(path)?;
-        let service = Self { manager };
-        service.ensure_section::<ModelOverrides>()?;
-        service.ensure_section::<TuiDisplaySettings>()?;
+    /// Open / initialize the global document inside an already-open BONE
+    /// store. App composition opens `BoneStore` once, then injects it here.
+    pub fn open(store: BoneStore) -> Result<Self, SettingsError> {
+        let service = Self {
+            settings: store.settings(),
+            state: store.workspace_state(),
+        };
+        service.ensure_global()?;
         Ok(service)
     }
 
-    /// The low-level manager remains exposed only for connection/startup code;
-    /// interactive callers should use the typed methods below instead of
-    /// editing JSON sections directly.
-    pub fn config_manager(&self) -> &ConfigManager {
-        &self.manager
+    pub fn display_settings(&self) -> Result<TuiDisplaySettings, SettingsError> {
+        Ok(self.read_global()?.tui)
     }
 
-    pub fn display_settings(
-        &self,
-    ) -> Result<(TuiDisplaySettings, EffectiveRevision), SettingsError> {
-        let snapshot = self.manager.snapshot()?;
-        let display = snapshot.get::<TuiDisplaySettings>()?.unwrap_or_default();
-        Ok((display, revision_of(&snapshot)?))
+    pub fn set_show_progress(&self, show_progress: bool) -> Result<(), SettingsError> {
+        self.update_global(|settings| settings.tui.show_progress = show_progress)
     }
 
-    pub fn set_show_progress(
-        &self,
-        show_progress: bool,
-    ) -> Result<EffectiveRevision, SettingsError> {
-        for _ in 0..CONFIG_RETRY_LIMIT {
-            let snapshot = self.manager.snapshot()?;
-            let mut display = snapshot.get::<TuiDisplaySettings>()?.unwrap_or_default();
-            display.show_progress = show_progress;
-            match self.manager.set(&display, snapshot.revision()) {
-                Ok(change) => {
-                    return EffectiveRevision::new(change.revision.to_string()).map_err(Into::into);
-                }
-                Err(ConfigError::RevisionConflict) => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(SettingsError::Contention)
-    }
-
-    /// Resolve a solver model for exactly one logical session. The fallback is
-    /// the system default needed by the Agent's coordinator; there is no
-    /// unvalidated hard-coded model ID hidden in BONE.
+    /// Resolve a complete immutable Agent runtime snapshot for a logical
+    /// Session. The precedence is Session > Workspace > User; coordinator and
+    /// tool/deadline values always come from typed global settings.
     pub fn resolve_model(
         &self,
         workspace: WorkspaceId,
         session: SessionId,
     ) -> Result<ModelResolution, SettingsError> {
-        let snapshot = self.manager.snapshot()?;
-        resolution_from_snapshot(&snapshot, workspace, session)
+        let global = self.read_global()?;
+        let workspace_document = self
+            .state
+            .workspace_settings::<WorkspaceSettings>(workspace)?;
+        let workspace_snapshot = workspace_document.read()?;
+        let workspace_settings = workspace_snapshot.value.unwrap_or_default();
+        workspace_settings.validate()?;
+        let session_document = self.state.session::<SessionRecord>(workspace, session)?;
+        let session_snapshot = session_document.read()?;
+        let session_record = session_snapshot
+            .value
+            .ok_or(SettingsError::SessionNotFound(session))?;
+        if session_record.workspace_id != workspace || session_record.id != session {
+            return Err(SettingsError::ScopeMismatch);
+        }
+        session_record.validate()?;
+
+        let selected = if let Some(selection) = session_record.metadata.solver_model_override {
+            Some((selection, SettingSource::Session))
+        } else if let Some(selection) = workspace_settings.default_solver {
+            Some((selection, SettingSource::Workspace))
+        } else {
+            global
+                .agent
+                .default_solver
+                .clone()
+                .map(|selection| (selection, SettingSource::User))
+        };
+        let Some((selection, source)) = selected else {
+            return Ok(ModelResolution::NeedsModel);
+        };
+        let runtime = resolved_runtime(&global, &selection)?;
+        Ok(ModelResolution::Ready {
+            resolved: ResolvedModel { selection, source },
+            runtime: Box::new(runtime),
+        })
     }
 
-    /// Persist a model selection at User, Workspace, or Session scope. A
-    /// first selection also creates a valid `agent.system` baseline so later
-    /// runtime attachment has a coordinator. It does not start a connection
-    /// or mutate a running turn.
+    /// Resolve a one-shot CLI runtime. An explicit CLI model is an ephemeral
+    /// input and is never written as a hidden fourth storage scope.
+    pub fn resolve_one_shot(
+        &self,
+        explicit_solver: Option<ModelSelection>,
+    ) -> Result<ResolvedAgentRuntimeConfig, SettingsError> {
+        let global = self.read_global()?;
+        let solver = explicit_solver
+            .or_else(|| global.agent.default_solver.clone())
+            .ok_or(SettingsError::NeedsModel)?;
+        resolved_runtime(&global, &solver)
+    }
+
+    /// Write a User or Workspace model selection at its natural lifecycle
+    /// object. Session overrides intentionally go through `SessionStore` with
+    /// that Session's writer lease; this service only resolves their overlay.
+    /// A missing coordinator resolves to the selected solver at runtime; only
+    /// a user-wide solver choice may initialize the user-wide coordinator.
     pub fn set_solver_model(
         &self,
         workspace: WorkspaceId,
@@ -591,100 +434,89 @@ impl SettingsService {
         scope: Scope,
         selection: ModelSelection,
     ) -> Result<ModelChange, SettingsError> {
-        // Reconstructing validates callers that obtained a model selection
-        // through serde or another frontend rather than `ModelSelection::new`.
-        let selection =
-            ModelSelection::new(selection.model, selection.effort, selection.timeout_seconds)?;
+        selection.validate()?;
         validate_scope_target(scope, workspace, session)?;
-
-        for _ in 0..CONFIG_RETRY_LIMIT {
-            let snapshot = self.manager.snapshot()?;
-            let system = snapshot.get::<SystemConfig>()?;
-            let required_system = match (scope, system) {
-                (Scope::User, Some(mut system)) => {
-                    let solver = agent_model_settings(&selection);
-                    if system.default_solver == solver {
-                        None
-                    } else {
-                        system.default_solver = solver;
-                        Some(system)
+        match scope {
+            Scope::User => {
+                self.update_global(|settings| {
+                    settings.agent.default_solver = Some(selection.clone());
+                    if settings.agent.coordinator.is_none() {
+                        settings.agent.coordinator = Some(selection.clone());
                     }
-                }
-                (_, Some(_)) => None,
-                (_, None) => Some(first_system_config(&selection)),
-            };
-
-            if let Some(system) = required_system {
-                match self.manager.set(&system, snapshot.revision()) {
-                    Ok(_) => continue,
-                    Err(ConfigError::RevisionConflict) => continue,
-                    Err(error) => return Err(error.into()),
-                }
+                })?;
             }
-
-            // The snapshot still has a system section whenever one was needed
-            // above: either it existed already or the next retry observes the
-            // newly written one.
-            let snapshot = self.manager.snapshot()?;
-            let mut overrides = snapshot.get::<ModelOverrides>()?.unwrap_or_default();
-            overrides.set(scope, selection.clone());
-            match self.manager.set(&overrides, snapshot.revision()) {
-                Ok(_) => {
-                    let resolution = self.resolve_model(workspace, session)?;
-                    let ModelResolution::Ready {
-                        resolved,
-                        effective_revision,
-                    } = resolution
-                    else {
-                        return Err(SettingsError::MissingSystemAfterWrite);
-                    };
-                    return Ok(ModelChange {
-                        scope,
-                        resolved,
-                        desired_revision: effective_revision,
-                    });
-                }
-                Err(ConfigError::RevisionConflict) => continue,
-                Err(error) => return Err(error.into()),
+            Scope::Workspace(_) => {
+                self.update_workspace(workspace, |settings| {
+                    settings.default_solver = Some(selection.clone());
+                })?;
             }
+            Scope::Session(_) => return Err(SettingsError::SessionScopeRequiresWriterLease),
         }
-        Err(SettingsError::Contention)
+        let ModelResolution::Ready { resolved, .. } = self.resolve_model(workspace, session)?
+        else {
+            return Err(SettingsError::NeedsModel);
+        };
+        Ok(ModelChange { scope, resolved })
     }
 
-    /// Delete only one Session model override. Workspace and user defaults
-    /// remain intact, so `/model inherit` has an unsurprising scope.
-    pub fn inherit_session_model(
-        &self,
-        workspace: WorkspaceId,
-        session: SessionId,
-    ) -> Result<ModelResolution, SettingsError> {
-        for _ in 0..CONFIG_RETRY_LIMIT {
-            let snapshot = self.manager.snapshot()?;
-            let mut overrides = snapshot.get::<ModelOverrides>()?.unwrap_or_default();
-            if !overrides.inherit_session(session) {
-                return resolution_from_snapshot(&snapshot, workspace, session);
-            }
-            match self.manager.set(&overrides, snapshot.revision()) {
-                Ok(_) => return self.resolve_model(workspace, session),
-                Err(ConfigError::RevisionConflict) => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(SettingsError::Contention)
-    }
-
-    fn ensure_section<T>(&self) -> Result<(), SettingsError>
-    where
-        T: ConfigSection + Default,
-    {
-        for _ in 0..CONFIG_RETRY_LIMIT {
-            let snapshot = self.manager.snapshot()?;
-            if snapshot.get::<T>()?.is_some() {
+    fn ensure_global(&self) -> Result<(), SettingsError> {
+        let document = self.settings.global::<GlobalSettings>();
+        for _ in 0..SETTINGS_RETRY_LIMIT {
+            let snapshot = document.read()?;
+            if let Some(settings) = snapshot.value {
+                settings.validate()?;
                 return Ok(());
             }
-            match self.manager.set(&T::default(), snapshot.revision()) {
+            let defaults = GlobalSettings::default();
+            match document.replace(&defaults, snapshot.revision) {
                 Ok(_) => return Ok(()),
-                Err(ConfigError::RevisionConflict) => continue,
+                Err(StoreError::RevisionConflict { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(SettingsError::Contention)
+    }
+
+    fn read_global(&self) -> Result<GlobalSettings, SettingsError> {
+        self.ensure_global()?;
+        let snapshot = self.settings.global::<GlobalSettings>().read()?;
+        let settings = snapshot.value.ok_or(SettingsError::MissingGlobalSettings)?;
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    fn update_global(&self, mutate: impl Fn(&mut GlobalSettings)) -> Result<(), SettingsError> {
+        let document = self.settings.global::<GlobalSettings>();
+        for _ in 0..SETTINGS_RETRY_LIMIT {
+            let snapshot = document.read()?;
+            let mut settings = snapshot.value.unwrap_or_default();
+            mutate(&mut settings);
+            settings.validate()?;
+            match document.replace(&settings, snapshot.revision) {
+                Ok(_) => return Ok(()),
+                Err(StoreError::RevisionConflict { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(SettingsError::Contention)
+    }
+
+    fn update_workspace(
+        &self,
+        workspace: WorkspaceId,
+        mutate: impl Fn(&mut WorkspaceSettings),
+    ) -> Result<(), SettingsError> {
+        let document = self
+            .state
+            .workspace_settings::<WorkspaceSettings>(workspace)?;
+        for _ in 0..SETTINGS_RETRY_LIMIT {
+            let snapshot = document.read()?;
+            let mut settings = snapshot.value.unwrap_or_default();
+            mutate(&mut settings);
+            settings.validate()?;
+            match document.replace(&settings, snapshot.revision) {
+                Ok(_) => return Ok(()),
+                Err(StoreError::RevisionConflict { .. }) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -692,72 +524,58 @@ impl SettingsService {
     }
 }
 
-/// Errors from typed application setting operations. A damaged configuration
-/// is deliberately surfaced here; a TUI shell can render repair state without
-/// treating it as a reason to lose workspace/session access.
+/// Settings errors intentionally distinguish a normal first-run `NeedsModel`
+/// state from a damaged/busy SQLite store.
 #[derive(Debug, Error)]
 pub enum SettingsError {
     #[error(transparent)]
-    Config(#[from] ConfigError),
+    Store(#[from] StoreError),
     #[error(transparent)]
     Model(#[from] ModelSelectionError),
     #[error(transparent)]
-    Revision(#[from] RevisionError),
-    #[error("configuration changed repeatedly while applying this setting; please retry")]
+    Runtime(#[from] ResolvedAgentRuntimeConfigError),
+    #[error(transparent)]
+    ToolLimits(#[from] ToolLimitsError),
+    #[error(transparent)]
+    Record(#[from] RecordError),
+    #[error("session-scoped model settings require that conversation's writer lease")]
+    SessionScopeRequiresWriterLease,
+    #[error("{field} must be greater than zero")]
+    NonPositive { field: &'static str },
+    #[error("settings changed repeatedly; please retry")]
     Contention,
-    #[error("agent system configuration was still missing after a model was saved")]
-    MissingSystemAfterWrite,
-    #[error("setting scope {scope:?} does not belong to the current workspace/session")]
-    ScopeTargetMismatch { scope: Scope },
+    #[error("global settings document is missing after initialization")]
+    MissingGlobalSettings,
+    #[error("session does not exist: {0}")]
+    SessionNotFound(SessionId),
+    #[error("setting scope does not belong to the current workspace/session")]
+    ScopeMismatch,
+    #[error("choose a model with /model <id> before starting work")]
+    NeedsModel,
 }
 
-fn revision_of(snapshot: &bone_config::ConfigSnapshot) -> Result<EffectiveRevision, SettingsError> {
-    Ok(EffectiveRevision::new(snapshot.revision().to_string())?)
-}
-
-fn resolution_from_snapshot(
-    snapshot: &bone_config::ConfigSnapshot,
-    workspace: WorkspaceId,
-    session: SessionId,
-) -> Result<ModelResolution, SettingsError> {
-    let effective_revision = revision_of(snapshot)?;
-    let Some(system) = snapshot.get::<SystemConfig>()? else {
-        return Ok(ModelResolution::NeedsModel { effective_revision });
-    };
-    let fallback = model_selection_from_agent(&system.default_solver)?;
-    let overrides = snapshot.get::<ModelOverrides>()?.unwrap_or_default();
-    Ok(ModelResolution::Ready {
-        resolved: overrides.resolve(workspace, session, &fallback),
-        effective_revision,
-    })
-}
-
-fn model_selection_from_agent(settings: &ModelSettings) -> Result<ModelSelection, SettingsError> {
-    Ok(ModelSelection::new(
-        settings.model.clone(),
-        settings.effort,
-        Some(settings.timeout_seconds),
-    )?)
-}
-
-fn agent_model_settings(selection: &ModelSelection) -> ModelSettings {
-    ModelSettings {
-        model: selection.model.clone(),
-        effort: selection.effort,
-        timeout_seconds: selection
-            .timeout_seconds
-            .unwrap_or(DEFAULT_MODEL_TIMEOUT_SECONDS),
-    }
-}
-
-fn first_system_config(selection: &ModelSelection) -> SystemConfig {
-    let model = agent_model_settings(selection);
-    SystemConfig {
-        coordinator: model.clone(),
-        default_solver: model,
-        soft_deadline_seconds: DEFAULT_SOFT_DEADLINE_SECONDS,
-        shutdown_grace_seconds: DEFAULT_SHUTDOWN_GRACE_SECONDS,
-    }
+fn resolved_runtime(
+    global: &GlobalSettings,
+    solver: &ModelSelection,
+) -> Result<ResolvedAgentRuntimeConfig, SettingsError> {
+    global.validate()?;
+    let solver = solver.as_model_settings();
+    let coordinator = global
+        .agent
+        .coordinator
+        .as_ref()
+        .map(ModelSelection::as_model_settings)
+        // A user-selected solver is a valid first-run coordinator fallback.
+        // It is a resolution rule, not a guessed persisted model.
+        .unwrap_or_else(|| solver.clone());
+    ResolvedAgentRuntimeConfig::new(
+        coordinator,
+        solver,
+        global.tool_limits.clone(),
+        Duration::from_secs(u64::from(global.agent.soft_deadline_seconds)),
+        Duration::from_secs(u64::from(global.agent.shutdown_grace_seconds)),
+    )
+    .map_err(Into::into)
 }
 
 fn validate_scope_target(
@@ -769,253 +587,196 @@ fn validate_scope_target(
         Scope::User => Ok(()),
         Scope::Workspace(scope_workspace) if scope_workspace == workspace => Ok(()),
         Scope::Session(scope_session) if scope_session == session => Ok(()),
-        _ => Err(SettingsError::ScopeTargetMismatch { scope }),
+        _ => Err(SettingsError::ScopeMismatch),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use bone_store::StoreRoots;
+
     use super::*;
+    use crate::WorkspaceApplication;
 
-    fn model(value: &str) -> ModelSelection {
-        ModelSelection::new(value, Some(Effort::Medium), Some(90)).unwrap()
-    }
-
-    fn revision(value: &str) -> EffectiveRevision {
-        EffectiveRevision::new(value).unwrap()
-    }
-
-    #[test]
-    fn public_descriptors_have_real_unique_keys_and_valid_default_scopes() {
-        let mut seen = std::collections::BTreeSet::new();
-        for descriptor in PUBLIC_SETTINGS {
-            assert!(SettingKey::new(descriptor.key).is_ok());
-            assert!(seen.insert(descriptor.key));
-            assert!(
-                descriptor
-                    .allowed_scopes
-                    .contains(&descriptor.default_scope)
-            );
-        }
-    }
-
-    #[test]
-    fn model_resolution_follows_session_workspace_user_builtin_order() {
-        let workspace = WorkspaceId::new();
-        let session = SessionId::new();
-        let mut overrides = ModelOverrides::default();
-        let built_in = model("built-in");
-        assert_eq!(
-            overrides.resolve(workspace, session, &built_in).source,
-            SettingSource::BuiltIn
-        );
-
-        overrides.set(Scope::User, model("user"));
-        assert_eq!(
-            overrides.resolve(workspace, session, &built_in),
-            ResolvedModel {
-                selection: model("user"),
-                source: SettingSource::User,
-            }
-        );
-
-        overrides.set(Scope::Workspace(workspace), model("workspace"));
-        assert_eq!(
-            overrides.resolve(workspace, session, &built_in).source,
-            SettingSource::Workspace
-        );
-
-        overrides.set(Scope::Session(session), model("session"));
-        assert_eq!(
-            overrides.resolve(workspace, session, &built_in).selection,
-            model("session")
-        );
-    }
-
-    #[test]
-    fn inherit_removes_only_the_session_override() {
-        let workspace = WorkspaceId::new();
-        let session = SessionId::new();
-        let mut overrides = ModelOverrides::default();
-        let built_in = model("built-in");
-        overrides.set(Scope::Workspace(workspace), model("workspace"));
-        overrides.set(Scope::Session(session), model("session"));
-
-        assert!(overrides.inherit_session(session));
-        assert_eq!(
-            overrides.resolve(workspace, session, &built_in).selection,
-            model("workspace")
-        );
-        assert!(!overrides.inherit_session(session));
-    }
-
-    #[test]
-    fn changing_model_in_running_turn_is_pending_next_turn() {
-        let current = TurnConfig::new(
-            revision("effective-a"),
-            model("solver-a"),
-            model("coordinator-a"),
-            1,
-            1,
+    fn app() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        WorkspaceApplication,
+        SettingsService,
+    ) {
+        let data = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            data.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .unwrap();
-
-        assert_eq!(
-            model_apply_state(revision("effective-b"), Some(&current)),
-            ApplyState::PendingNextTurn {
-                desired_revision: revision("effective-b"),
-                current_turn_revision: revision("effective-a"),
-            }
-        );
-        assert_eq!(
-            model_apply_state(revision("effective-b"), None),
-            ApplyState::Applied {
-                effective_revision: revision("effective-b"),
-            }
-        );
+        let project = tempfile::tempdir().unwrap();
+        let store = BoneStore::open_at(
+            StoreRoots::new(data.path().join("data"), data.path().join("config")).unwrap(),
+        )
+        .unwrap();
+        let application =
+            WorkspaceApplication::open_with_store(project.path(), store.clone()).unwrap();
+        let settings = SettingsService::open(store).unwrap();
+        (data, project, application, settings)
     }
 
     #[test]
-    fn rejects_invalid_model_and_turn_values() {
-        assert_eq!(
-            ModelSelection::new(" ", None, None),
-            Err(ModelSelectionError::InvalidModel)
-        );
-        assert_eq!(
-            ModelSelection::new("model", None, Some(0)),
-            Err(ModelSelectionError::ZeroTimeout)
-        );
-        assert!(TurnConfig::new(revision("r"), model("a"), model("b"), 0, 1).is_err());
-    }
-
-    #[test]
-    fn settings_service_creates_a_safe_document_but_never_guesses_a_model() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.json");
-        let service = SettingsService::open_at(&path).unwrap();
-        let workspace = WorkspaceId::new();
-        let session = SessionId::new();
-
-        assert!(path.exists());
+    fn empty_store_is_usable_but_needs_a_model() {
+        let (_data, _project, application, settings) = app();
+        let opened = application.open_or_create_draft().unwrap();
         assert!(matches!(
-            service.resolve_model(workspace, session).unwrap(),
-            ModelResolution::NeedsModel { .. }
+            settings
+                .resolve_model(application.workspace().id(), opened.record.id)
+                .unwrap(),
+            ModelResolution::NeedsModel
         ));
-        let (display, _) = service.display_settings().unwrap();
-        assert!(display.show_progress);
-        assert!(
-            service
-                .config_manager()
-                .snapshot()
-                .unwrap()
-                .get::<ModelOverrides>()
-                .unwrap()
-                .is_some()
-        );
     }
 
     #[test]
-    fn first_session_model_creates_agent_baseline_and_persists_scope() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.json");
-        let service = SettingsService::open_at(&path).unwrap();
-        let workspace = WorkspaceId::new();
-        let session = SessionId::new();
-        let desired = model("session-solver");
+    fn settings_service_refuses_session_scope_without_a_writer_lease() {
+        let (_data, _project, application, settings) = app();
+        let opened = application.open_or_create_draft().unwrap();
+        let record = opened.record;
 
-        let change = service
-            .set_solver_model(workspace, session, Scope::Session(session), desired.clone())
-            .unwrap();
-        assert_eq!(change.scope, Scope::Session(session));
-        assert_eq!(change.resolved.selection, desired);
-        assert_eq!(change.resolved.source, SettingSource::Session);
-        assert_eq!(change.desired_revision.as_str().chars().count(), 64);
-
-        let snapshot = service.config_manager().snapshot().unwrap();
-        let system = snapshot.get::<SystemConfig>().unwrap().unwrap();
-        assert_eq!(system.default_solver.model, "session-solver");
-        assert_eq!(system.coordinator.model, "session-solver");
-        let reopened = SettingsService::open_at(&path).unwrap();
-        let resolved = reopened.resolve_model(workspace, session).unwrap();
+        assert!(matches!(
+            settings.set_solver_model(
+                record.workspace_id,
+                record.id,
+                Scope::Session(record.id),
+                ModelSelection::new("must-not-write", None, None).unwrap(),
+            ),
+            Err(SettingsError::SessionScopeRequiresWriterLease)
+        ));
         assert_eq!(
-            resolved.task_config().unwrap().model.as_deref(),
-            Some("session-solver")
+            application.sessions().get(record.id).unwrap().unwrap(),
+            record
         );
     }
 
     #[test]
-    fn persisted_scopes_resolve_in_order_and_inherit_is_session_local() {
-        let directory = tempfile::tempdir().unwrap();
-        let service = SettingsService::open_at(directory.path().join("config.json")).unwrap();
-        let workspace = WorkspaceId::new();
-        let session = SessionId::new();
+    fn malformed_or_invalid_saved_settings_refuse_to_open() {
+        let data = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            data.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let roots = StoreRoots::new(data.path().join("data"), data.path().join("config")).unwrap();
 
-        service
-            .set_solver_model(workspace, session, Scope::User, model("user"))
+        let store = BoneStore::open_at(roots.clone()).unwrap();
+        let document = store.settings().global::<serde_json::Value>();
+        let snapshot = document.read().unwrap();
+        document
+            .replace(
+                &serde_json::json!({"agent": {"soft_deadline_seconds": 0}}),
+                snapshot.revision,
+            )
             .unwrap();
-        service
+        assert!(matches!(
+            SettingsService::open(store),
+            Err(SettingsError::NonPositive {
+                field: "soft_deadline_seconds"
+            })
+        ));
+
+        let store = BoneStore::open_at(roots).unwrap();
+        let document = store.settings().global::<serde_json::Value>();
+        let snapshot = document.read().unwrap();
+        document
+            .replace(
+                &serde_json::json!({"agent": "not an object"}),
+                snapshot.revision,
+            )
+            .unwrap();
+        assert!(matches!(
+            SettingsService::open(store),
+            Err(SettingsError::Store(_))
+        ));
+    }
+
+    #[test]
+    fn model_inheritance_follows_session_workspace_user() {
+        let (_data, _project, application, settings) = app();
+        let opened = application.open_or_create_writer_draft().unwrap();
+        let workspace = application.workspace().id();
+        let session = opened.draft.record.id;
+        let lease = opened.lease;
+        let user = ModelSelection::new("user", None, None).unwrap();
+        let workspace_selection = ModelSelection::new("workspace", None, None).unwrap();
+        let session_selection = ModelSelection::new("session", None, None).unwrap();
+        settings
+            .set_solver_model(workspace, session, Scope::User, user)
+            .unwrap();
+        settings
             .set_solver_model(
                 workspace,
                 session,
                 Scope::Workspace(workspace),
-                model("workspace"),
+                workspace_selection,
             )
             .unwrap();
-        service
-            .set_solver_model(
-                workspace,
+        let session_record = application
+            .sessions()
+            .set_solver_model_override(
+                &lease,
                 session,
-                Scope::Session(session),
-                model("session"),
-            )
-            .unwrap();
-        assert_eq!(
-            service.resolve_model(workspace, session).unwrap(),
-            ModelResolution::Ready {
-                resolved: ResolvedModel {
-                    selection: model("session"),
-                    source: SettingSource::Session,
-                },
-                effective_revision: service
-                    .resolve_model(workspace, session)
+                application
+                    .sessions()
+                    .get(session)
                     .unwrap()
-                    .effective_revision()
-                    .clone(),
-            }
-        );
-
-        let inherited = service.inherit_session_model(workspace, session).unwrap();
-        let ModelResolution::Ready { resolved, .. } = inherited else {
-            panic!("a configured workspace must resolve a model");
-        };
-        assert_eq!(resolved.selection, model("workspace"));
-        assert_eq!(resolved.source, SettingSource::Workspace);
-    }
-
-    #[test]
-    fn rejects_scope_ids_that_do_not_belong_to_the_open_session() {
-        let directory = tempfile::tempdir().unwrap();
-        let service = SettingsService::open_at(directory.path().join("config.json")).unwrap();
-        let workspace = WorkspaceId::new();
-        let session = SessionId::new();
-        let error = service
-            .set_solver_model(
-                workspace,
-                session,
-                Scope::Session(SessionId::new()),
-                model("not-current"),
+                    .unwrap()
+                    .revision,
+                Some(session_selection),
             )
-            .unwrap_err();
-        assert!(matches!(error, SettingsError::ScopeTargetMismatch { .. }));
+            .unwrap();
+        let ModelResolution::Ready { resolved, .. } =
+            settings.resolve_model(workspace, session).unwrap()
+        else {
+            panic!("model should resolve");
+        };
+        assert_eq!(resolved.selection.model, "session");
+        application
+            .sessions()
+            .set_solver_model_override(&lease, session, session_record.revision, None)
+            .unwrap();
+        let ModelResolution::Ready { resolved, .. } =
+            settings.resolve_model(workspace, session).unwrap()
+        else {
+            panic!("model should resolve");
+        };
+        assert_eq!(resolved.selection.model, "workspace");
     }
 
     #[test]
-    fn display_setting_is_saved_with_an_immediate_revision() {
-        let directory = tempfile::tempdir().unwrap();
-        let service = SettingsService::open_at(directory.path().join("config.json")).unwrap();
-        let before = service.display_settings().unwrap().1;
-        let after = service.set_show_progress(false).unwrap();
-        assert_ne!(after, before);
-        assert!(!service.display_settings().unwrap().0.show_progress);
+    fn session_model_selection_does_not_mutate_user_defaults() {
+        let (_data, _project, application, settings) = app();
+        let opened = application.open_or_create_writer_draft().unwrap();
+        let workspace = application.workspace().id();
+        let session = opened.draft.record.id;
+        let lease = opened.lease;
+
+        let record = application.sessions().get(session).unwrap().unwrap();
+        application
+            .sessions()
+            .set_solver_model_override(
+                &lease,
+                session,
+                record.revision,
+                Some(ModelSelection::new("session-only", None, None).unwrap()),
+            )
+            .unwrap();
+
+        let global = settings.read_global().unwrap();
+        assert!(global.agent.default_solver.is_none());
+        assert!(global.agent.coordinator.is_none());
+        let ModelResolution::Ready { runtime, .. } =
+            settings.resolve_model(workspace, session).unwrap()
+        else {
+            panic!("session model should resolve");
+        };
+        assert_eq!(runtime.coordinator().model, "session-only");
     }
 }
