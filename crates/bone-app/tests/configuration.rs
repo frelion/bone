@@ -21,8 +21,15 @@ fn cli_requires_system_configuration_even_when_a_solver_is_selected() {
         "failed startup must not leave an empty event log"
     );
     assert!(
-        !path.exists(),
-        "startup must not create a default system configuration"
+        path.exists(),
+        "BONE should initialize its private settings file"
+    );
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(saved.get("app.models").is_some());
+    assert!(saved.get("tui.display").is_some());
+    assert!(
+        saved.get("agent.system").is_none(),
+        "BONE must never invent a model or system configuration on behalf of the user"
     );
 }
 

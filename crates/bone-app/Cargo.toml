@@ -1,9 +1,9 @@
 [package]
-name = "bone-tui"
+name = "bone-app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Terminal frontend for BONE"
+description = "BONE product application, durable workspace state, and terminal UI"
 publish = false
 
 [[bin]]
@@ -14,15 +14,20 @@ path = "src/main.rs"
 bone-agent = { path = "../bone-agent" }
 bone-config = { path = "../bone-config" }
 crossterm = { workspace = true, features = ["event-stream", "bracketed-paste"] }
+fs2.workspace = true
 futures-util.workspace = true
 ratatui.workspace = true
 ratatui-textarea.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+uuid.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

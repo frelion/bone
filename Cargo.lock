@@ -165,6 +165,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "bone-app"
+version = "0.1.0"
+dependencies = [
+ "bone-agent",
+ "bone-config",
+ "crossterm",
+ "fs2",
+ "futures-util",
+ "libc",
+ "ratatui",
+ "ratatui-textarea",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "bone-config"
 version = "0.1.0"
 dependencies = [
@@ -215,24 +236,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "walkdir",
-]
-
-[[package]]
-name = "bone-tui"
-version = "0.1.0"
-dependencies = [
- "bone-agent",
- "bone-config",
- "crossterm",
- "futures-util",
- "ratatui",
- "ratatui-textarea",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
 ]
 
 [[package]]
@@ -3160,6 +3163,7 @@ dependencies = [
  "atomic",
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

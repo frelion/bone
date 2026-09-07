@@ -9,7 +9,7 @@ use std::{
 use bone_agent::{
     AgentHandle, JobRequest, Notice, Observation, RecordEntry, RecordKind, TaskConfig,
 };
-use bone_tui::{TuiConfig, write_events};
+use bone_app::{SettingsService, TuiConfig, WorkspaceApplication, run_workspace, write_events};
 use tokio::sync::broadcast::error::RecvError;
 
 #[tokio::main]
@@ -35,24 +35,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let config = bone_agent::config_builder()?
-        .register::<TuiConfig>()?
-        .build(bone_config::default_path()?)?;
-    let snapshot = config.snapshot()?;
-    let display = snapshot.get::<TuiConfig>()?.unwrap_or_default();
-    for section in snapshot.unrecognized_sections() {
-        eprintln!("[unrecognized configuration section: {section}]");
-    }
-    let task = TaskConfig {
-        model: match arguments.model {
-            Some(model) => Some(model),
-            None => match env::var("BONE_MODEL") {
-                Ok(model) => Some(model.trim().to_owned()),
-                Err(env::VarError::NotPresent) => None,
-                Err(_) => return Err(invalid_input("BONE_MODEL must be valid Unicode").into()),
-            },
+    let selected_model = match arguments.model {
+        Some(model) => Some(model),
+        None => match env::var("BONE_MODEL") {
+            Ok(model) => Some(model.trim().to_owned()),
+            Err(env::VarError::NotPresent) => None,
+            Err(_) => return Err(invalid_input("BONE_MODEL must be valid Unicode").into()),
         },
-        ..TaskConfig::default()
     };
     let workspace = env::current_dir()?;
     let input = arguments.message;
@@ -63,8 +52,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
-        let host = bone_agent::connect(&config, show_login).await?;
-        let reports = bone_tui::run(&host, workspace, task, &display).await?;
+        // Workspace/session boot intentionally precedes settings, login, and
+        // Agent connection. A damaged or absent config enters the TUI repair
+        // state instead of terminating before the terminal is restored.
+        let application = WorkspaceApplication::open(&workspace)?;
+        let settings = SettingsService::open_default().map_err(|error| error.to_string());
+        let reports = run_workspace(application, settings, selected_model).await?;
         report_unresolved(
             reports
                 .iter()
@@ -74,7 +67,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let agent = bone_agent::start(&config, &workspace, task, show_login).await?;
+    // One-shot mode remains a strict automation surface. It uses the same
+    // auto-created settings document, but an unconfigured model is reported
+    // as an ordinary startup error rather than starting an interactive repair
+    // shell on a non-terminal stream.
+    let settings = SettingsService::open_default()?;
+    let config = settings.config_manager();
+    let display = settings.display_settings()?.0;
+    let snapshot = config.snapshot()?;
+    for section in snapshot.unrecognized_sections() {
+        eprintln!("[unrecognized configuration section: {section}]");
+    }
+    let task = TaskConfig {
+        model: selected_model,
+        ..TaskConfig::default()
+    };
+
+    let agent = bone_agent::start(config, &workspace, task, show_login).await?;
     let event_log = match arguments.events {
         Some(path) => {
             let file = match tokio::fs::OpenOptions::new()
@@ -293,16 +302,40 @@ fn invalid_input(message: impl Into<String>) -> std::io::Error {
 fn print_help() {
     println!(
         "\
-Run the BONE agent in the current workspace.
+Run BONE in the current launch-directory workspace.
 
 Usage:
   bone                         Start the multi-session terminal workspace
   bone <message>               Complete one request, then shut down
-  bone --model <id> [message]  Select the solver for this session
+  bone --model <id>            Select the first interactive session's solver
+  bone --model <id> <message>  Select the one-shot solver
   bone --events <path> <message>  Write one session's live events as JSON Lines
   bone -- <message>            Treat the remaining arguments as task text
 
-Interactive commands:
+Interactive use:
+  Start BONE from the directory you intend to work in. That exact directory is
+  the Workspace boundary. BONE creates private user-data/configuration state
+  automatically; normal users never need to create or edit a configuration file.
+  No .bone directory is created in your project.
+
+  First choose a model in the TUI:
+    /model <id>                current conversation
+    /model default <id>        current Workspace default
+    /model global <id>         user-wide default
+    /model inherit             remove current conversation override
+
+  A typed one-line /command is local. Pasted or multiline text is always a
+  normal model-visible message. Write //text to send slash-prefixed text.
+
+Session and setup commands:
+  /help                        List the primary commands
+  /status, /workspace          Inspect this session and Workspace
+  /new, /sessions, /resume     Create or navigate saved conversations
+  /rename <title>, /archive    Organize the current conversation
+  /login                       Connect or retry model authorization
+  /config, /config doctor      Open settings guidance or inspect storage state
+
+Keyboard:
   Ctrl-N                       Create a conversation
   Ctrl-Left / Ctrl-Right       Move between the session rail and composer
   Up / Down                    Switch while the session rail is focused
@@ -312,47 +345,20 @@ Interactive commands:
   Esc or /stop                 Stop work; Esc also leaves the session rail
   Ctrl-C or /exit              Shut down and exit
 
-System configuration:
-  Read $XDG_CONFIG_HOME/bone/config.json, or $HOME/.config/bone/config.json.
-  BONE_CONFIG may select another absolute system configuration path.
-  Create this JSON with model IDs available to your subscription:
-
-  {{
-    \"agent.system\": {{
-      \"coordinator\": {{\"model\": \"your-coordinator-model\", \"timeout_seconds\": 120}},
-      \"default_solver\": {{\"model\": \"your-solver-model\", \"timeout_seconds\": 120}}
-    }}
-  }}
-
-  Each model accepts optional effort: none, minimal, low, medium, high, xhigh, max.
-  Omit effort to use the provider default. Unsupported settings report an error.
-  The coordinator is selected only by system configuration. Task input and
-  solver selection cannot change it. Agent configuration is fixed per session.
-  The solver owns normal work. The coordinator only classifies input received
-  while a solver decision is still outstanding; it cannot choose tools or solve.
-
-Solver selection, in priority order:
-  --model <id>                 Task/session override
-  BONE_MODEL                   Solver override for this invocation
-  agent.system.default_solver  System default
-
-  Overrides do not modify the configuration file. Both purposes may use the
-  same model. Omitting timeout_seconds uses 120 seconds for that purpose.
-
-Other configuration sections (all optional):
-  llm.system      credential_root: absolute OAuth storage directory
-  tools.local     workspace tool limits, such as max_read_lines
-  tui.display     show_progress: true or false
-
-  Agent and tool settings use a new snapshot when each session starts. Saved
-  changes apply to the next session; credential_root applies on the next BONE
-  connection. Display settings are read when this frontend starts.
-  Unrecognized sections are preserved and reported.
-
 Authentication:
-  Uses the experimental ChatGPT subscription connector on Unix. First use may
-  show a device login URL and code; later runs reuse BONE's independent cache.
-  The first-run code is written to stderr; do not redirect it to persistent logs.
+  /login starts the ChatGPT device authorization flow when needed. Keep its code
+  private. BONE stores credentials in its own private user-data area.
+
+Configuration application:
+  Settings are persisted immediately and model selection follows Session >
+  Workspace > User > system default. An Agent runtime pins its model when it is
+  created, so an already attached runtime keeps its model. New conversations and
+  future recreated runtimes use the saved selection; per-turn hot switching is
+  not claimed by this version.
+
+  BONE_CONFIG may select an absolute configuration path for advanced or
+  automation use. One-shot mode remains strict and requires a valid Agent system
+  configuration; use interactive setup for the normal no-file-editing path.
 
 The Agent exposes read, glob, and grep tools. Run it from the intended workspace;
 content read by tools is sent to the model. Input remains available while jobs run.

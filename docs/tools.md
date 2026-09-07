@@ -10,7 +10,7 @@ implementations. The boundary has one owner at each layer:
 - `bone-agent` owns asynchronous job execution through its `ToolPort`.
 
 `bone-agent` is the composition root: it configures coordinator and solver
-models and concrete tools, then starts the runtime. `bone-tui` uses only
+models and concrete tools, then starts the runtime. `bone-app` uses
 `bone-agent` and `bone-config` from the workspace. In production code, Rig is
 confined to `bone-llm`.
 

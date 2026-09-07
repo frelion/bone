@@ -1,305 +1,350 @@
 # BONE TUI architecture
 
-Status: implementation contract for the first full-screen, multi-session TUI.
+The full-screen BONE product has one interactive entry point:
+`bone_app::run_workspace`. The `bone` executable opens the directory from
+which the user launched it as a durable Workspace, opens or creates a logical
+Session, and then starts the TUI.
 
-## Purpose
+There is no separate in-memory frontend API or compatibility execution path.
+The TUI is a product surface for durable Workspace and Session state, not a
+thin wrapper around one process-local Agent runtime.
 
-`bone-tui` is a presentation layer for `bone-agent`. One terminal can keep several independent conversations alive, switch between them instantly, and accept input while every session continues running models and tools.
+## Start BONE
 
-The implementation has four parts:
+For normal use, start from the directory BONE should work in:
 
-1. `AgentHost` shares one authenticated model connection.
-2. Each `AgentHandle` owns one independent Agent session.
-3. One UI loop owns all terminal and presentation state.
-4. One observer per session forwards tagged Agent updates to that loop.
-
-There is no frontend Agent state machine, session framework, command bus, or component system.
-
-## Technology
-
-```toml
-ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
-crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
-ratatui-textarea = "0.9.2"
-futures-util.workspace = true
+```sh
+cd ~/code/my-project
+bone
 ```
 
-[Ratatui] is immediate-mode: BONE retains its state and event loop, while Ratatui provides layout, terminal-buffer diffing, and a test backend. [Crossterm EventStream] supplies asynchronous terminal events. [ratatui-textarea] handles Unicode-aware multiline editing, wrapping, selection, and undo without adding another application runtime.
+During development from this repository:
 
-The workspace declares and explicitly inherits the Rust version required by these dependencies.
+```sh
+cd ~/code/my-project
+cargo run --manifest-path /path/to/bone/Cargo.toml -p bone-app --bin bone
+```
 
-## System shape
+The exact launch directory is the Workspace boundary. BONE canonicalizes it
+for stable identity, but retains the user's spelling for display. It does not
+walk up to a Git root and does not create `.bone/` in the project.
+
+The interactive CLI follows this product path:
+
+```text
+launch directory
+  → WorkspaceApplication::open
+  → SettingsService::open_default
+  → bone_app::run_workspace
+```
+
+Settings failure does not prevent the terminal from opening. The shell shows
+the durable sessions and a truthful repair/setup state instead of hiding the
+user's history. Normal configuration is performed through supported TUI
+commands rather than by editing an internal file by hand.
+
+One-shot `bone <message>` and `--events` are CLI automation/export surfaces.
+They do not replace the full-screen Workspace/Session lifecycle described in
+this document.
+
+## Product shape
 
 ```mermaid
 flowchart LR
-    Config[bone-config] --> Host[AgentHost]
-    Host --> A[Agent A]
-    Host --> B[Agent B]
-    A --> OA[observer A]
-    B --> OB[observer B]
-    OA --> Q[bounded updates]
-    OB --> Q
-    Keys[terminal events] --> Loop[one UI loop]
-    Q --> Loop
-    Loop --> State[App]
-    State --> View[pure view]
-    View --> Terminal
-    Loop -->|post / stop| A
-    Loop -->|post / stop| B
+    Directory[Launch directory] --> Bootstrap[WorkspaceApplication]
+    Bootstrap --> Durable[Durable Workspace + Session store]
+    Settings[SettingsService] --> Shell[Workspace TUI runner]
+    Durable --> Shell
+
+    Keys[Terminal input] --> Loop[One TUI event loop]
+    Runtime[Agent runtime observers] --> Loop
+    Effects[Completed product effects] --> Loop
+
+    Loop --> Event[AppEvent]
+    Event --> Reducer[App::reduce]
+    Reducer --> Action[Action]
+    Action --> Shell
+    Shell --> Controller[Session controller]
+    Shell --> Commands[Command effects]
+    Shell --> Driver[Runtime driver]
+    Controller --> Durable
+    Commands --> Settings
+    Driver --> AgentHost[AgentHost / AgentHandle]
+    Shell --> Render[Pure Ratatui view]
 ```
 
-The boundary is strict:
+The essential boundary is:
 
-> `bone-agent` decides what a session does. `bone-tui` decides which session is visible, how its records look, and which user command to send.
+> `bone-agent` decides what an attached runtime does. `bone-app` owns durable
+> Workspace/Session identity, user configuration, terminal interaction, and
+> presentation state.
 
-The TUI never calls a model or tool, starts work itself, checks plan freshness, or reconstructs Kernel policy.
+The terminal never implements model or tool policy. Conversely, the Agent
+runtime never assigns product session identity, writes Session journals, or
+chooses what the TUI displays.
 
-## AgentHost and sessions
+## Ownership and module boundaries
 
-The ChatGPT credential store permits one live endpoint for a credential root. Repeated calls to the single-session `bone_agent::start` would compete for that lease, so multi-session frontends connect once:
+`bone-app` deliberately contains the product-only durable and terminal code in
+one package. The important boundaries are modules, not publishable crates.
 
-```rust,ignore
-let host = bone_agent::connect(&config, on_login).await?;
-let first = host.start(&workspace, task.clone()).await?;
-let second = host.start(&workspace, task.clone()).await?;
+| Area | Owner | Responsibility | Does not own |
+| --- | --- | --- | --- |
+| Workspace identity | `durable/workspace_identity.rs` and `registry.rs` | Canonical launch directory → stable Workspace ID | Git-root discovery, Agent handles |
+| Session facts | `durable/session.rs` and `journal.rs` | `SessionRecord`, drafts, writer leases, append-only history | Presentation state, live runtime futures |
+| Product bootstrap | `product_workspace.rs` | Open Workspace, select/create initial Session, locate private state | Terminal input, Agent policy |
+| TUI reducer | `tui/app.rs` | `AppEvent`, `App::reduce`, local UI state and projection | File I/O, Settings persistence, Agent lifecycle |
+| Durable session control | `tui/session_controller.rs` | Hydration, writer leases, recovery, record/journal mutation, accepted-turn boundary | Terminal polling, Agent handles |
+| Typed commands | `tui/command_effects.rs` | `/model`, `/new`, `/resume`, `/archive`, `/status`, and settings-facing effects | Raw key handling, journal recovery |
+| Runtime attachment | `tui/runtime_driver.rs` | `AgentHost`, `AgentHandle`, tagged observers, reset after broadcast gaps | Durable Session identity and persistence |
+| Product runner | `tui/workspace.rs` | Dependency assembly, event loop, effect dispatch, orderly shutdown | Direct mutation of `App` fields |
+| Rendering | `tui/view.rs` | Pure `&App → Ratatui frame` projection | I/O, Agent calls, durable writes |
+| Terminal lifetime | `tui/terminal.rs` | Raw mode, alternate screen, bracketed paste, restoration | Product state |
+
+This organization prevents a future feature such as a model picker, session
+search, permissions prompt, or diagnostics panel from turning `App` into a
+storage or runtime coordinator.
+
+## Three different identities
+
+BONE keeps process-local UI routing separate from durable product identity:
+
+| Identity | Meaning | Lifetime |
+| --- | --- | --- |
+| `WorkspaceId` | Canonical launch-directory identity | Stable across launches |
+| durable `SessionId` | Logical conversation identity | Stable across launches and processes |
+| `UiSessionId` | TUI reducer/observer routing ID | Current BONE process only |
+
+`UiSessionId` is never persisted and must not be confused with a Session ID in
+a journal, lease, configuration scope, or CLI-visible session reference.
+
+## Presentation data flow
+
+The TUI follows a reducer/effect loop:
+
+```text
+terminal event / runtime update / completed I/O
+                 ↓
+              AppEvent
+                 ↓
+           App::reduce()
+                 ↓
+          Action (effect request)
+                 ↓
+session controller / command effects / runtime driver
+                 ↓
+     result, failure, or notice as a new AppEvent
+                 ↓
+           App::reduce() → pure view
 ```
 
-`AgentHost` owns the cloneable `Endpoint` and configuration manager. It does not store sessions or assign session IDs.
+`App::reduce` is the only writer of presentation fields. Product effects may
+read durable state and perform I/O, but they do not set composer text, session
+selection, timeline rows, badges, or render flags directly. They route the
+observable outcome back through the reducer, including user-facing notices.
 
-Every `AgentHost::start` creates a fresh workspace tool environment, model selection, Kernel, Runtime, record, and job registry. Agent and tool settings come from a new configuration snapshot. The endpoint and credential lease are shared. The credential root is connection-level configuration and changes on the next `connect`.
+The runner currently performs some SessionStore, journal, and SettingsService
+work on the TUI task. The data-flow boundary is already strict; moving those
+blocking operations behind workers is a future responsiveness improvement, not
+a reason to add a second presentation-state writer.
 
-The free `bone_agent::start` remains the convenience API for a single session.
+## Workspace and Session lifecycle
 
-## Ownership in bone-tui
+Opening BONE performs the following product sequence:
 
-Runtime resources and presentation data stay separate:
-
-```rust,ignore
-struct LiveSession {
-    id: SessionId,
-    agent: AgentHandle,
-    observer: JoinHandle<()>,
-}
-
-struct App {
-    sessions: Vec<SessionUi>,
-    current: usize,
-    workspace: String,
-    focus: Focus, // Composer or Sessions
-    viewport: Viewport,
-}
-
-struct SessionUi {
-    id: SessionId,
-    conversation: Conversation,
-    background_unread: bool,
-    state: SessionState, // Opening, Live, or Offline(reason)
-    pending_post: Option<String>,
-}
-
-struct Conversation {
-    projection: Projection,
-    composer: TextArea<'static>,
-    anchor: Option<ScrollAnchor>, // record cursor + wrapped-line offset
-    unread: bool,
-    cursor: u64,
-}
+```text
+open launch-directory Workspace
+  → list active logical Sessions
+  → open or create the selected Session
+  → obtain its writer lease before changing durable facts
+  → hydrate draft and journal into App
+  → resolve saved settings/model readiness
+  → attach an Agent runtime only when user work requires it
 ```
 
-Each conversation owns its draft and scroll position. Switching changes only `App.current`; it never moves text between composers, restarts work, or unsubscribes a background session.
+A Workspace may contain many durable Sessions. Background Sessions remain
+visible even if they are not logged in, lack a model, have no live runtime, or
+are currently held for writing by another BONE process.
 
-`SessionId` is private to `bone-tui`. It routes events within the current process and is not part of the Agent protocol.
+Each logical Session has an OS-backed writer lease. A process without that
+lease presents the session as read-only and the reducer blocks draft edits,
+local commands, posting, and stop requests. Switching to a Session attempts
+to acquire its lease and then refreshes its durable state. Idle leases can be
+released after a switch; a Session with active work, a pending turn, or a
+startup task remains owned until it reaches a safe boundary.
 
-## Observation fan-in
+`SessionStore::replace` uses revision compare-and-swap for individual record
+writes. On a normal cross-process conflict, the product runner reloads once
+and reapplies only fields owned by the current effect. The lease prevents
+competing normal writers; CAS remains the narrow file-level integrity check.
 
-Every session begins with `AgentHandle::observe()`. It atomically returns a Snapshot, its sequence, and a receiver containing only later steps.
+## Durable input and recovery
 
-A small Tokio task follows each receiver and sends tagged updates through one bounded channel, currently sized at 256:
+The durable acceptance boundary for a user turn is:
 
-```rust,ignore
-enum SessionUpdate {
-    Step { id: SessionId, step: Arc<StepEvent> },
-    Reset { id: SessionId, snapshot: Snapshot },
-    Closed { id: SessionId },
-}
+```text
+draft
+  → resolve effective configuration and model
+  → append + fsync UserTurnAccepted { turn, text, revision, model }
+  → AppEvent::TurnAccepted clears the composer and shows the message
+  → attach runtime / AgentHandle::post
 ```
 
-The observer accepts only the next sequence. A different sequence or `RecvError::Lagged` makes it call `observe()` again and send `Reset`. A closed Agent stream produces `Closed` and ends the observer.
+If the journal append fails, the composer remains intact and the Agent never
+receives that message. Once the fact is accepted, the message is visible and a
+runtime receipt is tracked separately. A connection/start/post failure leaves
+the turn in a truthful retryable or interrupted state; it is not silently
+discarded or automatically replayed.
 
-The bounded channel prevents a slow terminal from turning Agent traffic into unbounded memory. Backpressure may make an observer lag; [Tokio broadcast] reports that gap explicitly, and the atomic reset path makes it safe.
+On a cold restart, BONE reads the journal before trusting the Session summary.
+It repairs the last-known summary from durable facts, marks unconfirmed work
+as interrupted or requiring recovery, and never guesses that an external model
+or tool request did not happen. Automatic replay requires an end-to-end,
+idempotent durable turn receipt protocol and is intentionally not inferred by
+the TUI.
 
-Observers only move observations. They never mutate `App`, draw, post, stop, or shut down a session.
+## Settings and slash commands
 
-## The UI loop
+Users configure the product inside the TUI. Configuration files are product
+implementation details; first use creates safe storage automatically.
 
-The UI loop is the sole writer of `App` and the terminal:
-
-```rust,ignore
-loop {
-    terminal.draw(|frame| view::render(frame, &app))?;
-
-    tokio::select! {
-        input = terminal_events.next() => match app.on_event(input?) {
-            Action::Post { id, text } => accept_or_mark_offline(id, session(id).post(text).await),
-            Action::Stop { id, .. } => accept_or_mark_offline(id, session(id).stop().await),
-            Action::NewSession => {
-                let id = next_id();
-                app.begin_session(id);       // immediately selected with its own draft
-                pending.push(open(host.clone(), id));
-            }
-            Action::Quit => break,
-            Action::None => {}
-        },
-        opened = pending.next(), if !pending.is_empty() => {
-            attach_or_mark_offline(opened); // never changes the current selection
-        },
-        update = updates.recv() => app.apply(update?),
-    }
-}
+```text
+/model <id>             save a model for the current Session
+/model default <id>     save a Workspace model default
+/model global <id>      save a user model default
+/model inherit          remove the current Session override
+/login                  connect or retry the model service
+/new /sessions /resume  create and navigate Workspace Sessions
+/rename /archive        organize a Session
+/status /workspace      inspect current product state
 ```
 
-`post`, `stop`, and `observe` wait only for the Runtime actor to accept a command and execute synchronous `Kernel::step`; they never wait for a model or tool. Direct calls preserve message order without a command worker, while every Agent continues long-running work independently. A command failure marks only its session offline; it does not close the workspace.
+The model resolution order is:
 
-The first implementation redraws after each delivered terminal or Agent event. It has no frame timer or animation loop. Agent Runtime already coalesces progress.
+```text
+Session override > Workspace default > User default > agent.system default
+```
 
-`Ctrl-N` always inserts and selects a new `Opening` placeholder with its own composer, then starts the Agent asynchronously. The result carries the preassigned `SessionId`, so out-of-order completions bind to the right placeholder without stealing selection. A submitted message is held as one explicit pending post while the session opens; ordinary typing remains a separate draft. Attach sends the pending post, but removes it only after `post` returns its receipt. A start, observation, or post failure restores that text to the composer before marking the placeholder `Offline`, so accepted-looking input is never lost. Authentication happened before raw terminal mode, so new sessions reuse the connected host.
+Settings writes are immediate and durable. An already attached Agent runtime
+keeps its pinned model; a new or recreated runtime resolves the newly saved
+selection. The UI describes this as saved/pending-next-runtime rather than
+claiming a live runtime hot-swapped its model.
 
-## Projection
+Only a typed, single-line slash command becomes a local command. Pasted or
+multi-line slash text remains normal model-visible input. `//text` explicitly
+sends slash-prefixed text to the model.
 
-`Projection` is a display cache rather than another Agent model. It stores immutable timeline items, active Work/Review/Tool jobs, a display status, and the `ToolCall` needed to join `JobStarted` with `JobFinished`. The session owns only three frontend lifecycle states: `Opening`, `Live`, and `Offline(reason)`.
+## Runtime attachment and observation
 
-Reset rebuilds it from `Snapshot.record`. A normal Step applies only `StepEvent.records`. The normal view does not also consume Publish effects because every Notice is already recorded and would otherwise appear twice.
+`AgentHost` connects the model service once for the TUI process and can start
+independent `AgentHandle` runtimes. A durable Session is not itself an Agent
+runtime: its title, draft, journal, and identity survive even when no handle is
+attached.
 
-The timeline contains:
+For every attached runtime, the runtime driver:
 
-- user messages and Agent replies;
-- one compact immutable row for each completed tool;
-- errors and Paused or Stopped transitions.
+1. calls `AgentHandle::observe()` for an atomic Snapshot and sequence;
+2. follows later steps through the runtime broadcast receiver;
+3. forwards tagged `Step`, `Reset`, or `Closed` updates to the TUI loop;
+4. reacquires a Snapshot after a sequence gap or broadcast lag.
 
-Work and input review appear only in the mutable live tail. Tool calls become short semantic descriptions such as `Reading src/main.rs` or `Searched "Projection" · 17 matches`; raw artifacts and JSON do not enter the chat. Successful tool rows obey `show_progress`; failures and unknown external effects always remain visible. An unknown external effect is tracked by Job ID and disappears from the warning state only when that same job receives a conclusive result. Ordinary cancellation is neutral. `Finished` changes the session badge without adding runtime-log noise to the transcript, and still raises attention when it occurs in a background session.
+Observers never mutate `App`, draw the terminal, append a journal entry, or
+choose a model. A broadcast gap rebuilds only the affected Session's runtime
+projection; drafts, scroll anchors, other Sessions, and durable history remain
+unchanged.
 
-`RecordEntry.cursor` identifies timeline items. A scroll anchor adds a wrapped-line offset within that item, so every part of one long reply remains reachable. Resize keeps the same timeline item and clamps its row after rewrapping; it does not promise to keep the same character at the top. New items follow the live tail unless the user is reading history; in that case the anchor stays and a simple unread marker appears. Tail rendering measures backward from the newest items, so normal typing does not remeasure the complete history.
+## Interaction and rendering
 
-## Layout and interaction
-
-At 110 columns or wider, a 28-column session rail appears beside a two-column gutter. Each session uses two rows: a stable number and title, followed by its opening, working, waiting, complete, unread, unresolved-effect, or offline state. An accent edge marks the selected row while the rail owns keyboard focus. Persistent risk has priority over ordinary unread activity.
-
-Below 110 columns the conversation uses the full terminal width and a single header carries `BONE  2/4 · current title`. Background `!`, `●`, and `…` markers keep unresolved, unread, and opening sessions visible. `Ctrl-Left` replaces the conversation with the full-screen session list; `Ctrl-Right` returns. This is the same `Sessions` focus and the same `Up`/`Down` selection used by the wide rail.
-
-The wide main region has only the transcript, bordered composer, and one contextual footer; the rail already supplies its session context, so there is no second header. Narrow mode adds the one-line header above them. The workspace appears only in the footer. User turns use an accent edge; Agent replies use one accent marker. Active work is rendered as the transcript's mutable live tail, so `Thinking` and `Reading view.rs 68%` stay attached to the current turn. It is hidden while the user reads older history. The composer remains usable while work continues.
+At a wide terminal width, BONE shows a Session rail beside the conversation.
+At narrow widths it replaces that rail with a full-screen Session list while
+keeping the same selection and keyboard semantics.
 
 ```text
 Composer focus
-Ctrl-N          new conversation
-Ctrl-Left       focus the wide rail or open the narrow session list
+Ctrl-N          new Session
+Ctrl-Left       focus the rail or open the narrow Session list
 Enter           send
 Ctrl-J          insert newline
 PageUp/Down     move through history
 Ctrl-Home/End   oldest item or live tail
-Esc             stop the current session
+Esc             stop the selected Session
 
-Sessions focus
-Up/Down         select a session
-Ctrl-Right      show its composer
-Enter/Esc       show its composer
+Session focus
+Up/Down         select a Session
+Ctrl-Right      return to its composer
+Enter/Esc       return to its composer
 
-Ctrl-C          exit and close all sessions
+Ctrl-C          exit BONE
 ```
 
-Focus has only two values, `Composer` and `Sessions`; it routes keys and changes the existing selection edge or composer border. The only session-switching path is `Ctrl-Left`, bare `Up`/`Down`, then `Ctrl-Right`. Wide mode presents `Sessions` as the side rail; narrow mode presents it as a full-screen list. There is no second navigation state, generic focus tree, overlay, mouse input, or animation timer. A restrained blue accent marks focus and active work, while yellow and red are reserved for attention and errors.
+Each Session owns its draft, scroll anchor, visible timeline, unread state,
+and model/readiness state. Switching Session changes selection only: it does
+not move composer text, restart background work, unsubscribe its observer, or
+mutate another Session's durable facts.
 
-Until a message is sent, a session title uses the first non-empty draft line. It then comes from the first non-empty line of the first user message and is clipped to the available width. Naming a session never invokes a model.
+The view is an immediate-mode Ratatui projection. It renders immutable user
+and Agent timeline records plus a compact mutable activity tail for ongoing
+work. Successful tool activity honors `show_progress`; errors and unresolved
+external effects remain visible. Rendering reads `App` only and never performs
+I/O or runtime work.
 
-## Runtime flows
+## Exit and failure behavior
 
-### Background completion
+Terminal restoration happens before slow shutdown. On `Ctrl-C`, terminal EOF,
+or a TUI error, BONE leaves raw/alternate-screen mode and restores bracketed
+paste and the cursor first. It then requests shutdown for live Agent handles
+concurrently and waits for their reports.
 
-```text
-A starts a tool -> user switches to B -> observer A keeps forwarding
--> App updates A and its unread marker -> switching back reveals the result
-```
-
-The switch does not pause A and cannot disturb B's composer.
-
-### Observer gap
-
-```text
-observer B detects a gap -> B.observe() -> Reset(B, fresh Snapshot)
-```
-
-Only B's Projection is rebuilt. Its record cursor makes newly recovered visible items raise attention correctly. Its draft and scroll anchor, every other session, and all live Agents remain intact.
-
-### Stop
-
-`Esc` targets the current `SessionId`. The Kernel records Stop and revokes autonomous work in that session. Other sessions continue.
-
-### Exit
-
-`Ctrl-C`, terminal EOF, or UI failure leaves the inner terminal scope first. `TerminalSession` disables bracketed paste and restores the cursor, alternate screen, and raw mode.
-
-After the shell is restored, `run` requests shutdown on every `AgentHandle` concurrently. Cleanup time is therefore bounded by the slowest session rather than the sum of their grace periods. Observer tasks finish as their streams close, and `run` returns every `ShutdownReport`.
-
-`LiveSession::drop` aborts its observer. This is normally a no-op after graceful shutdown, and ensures that cancelling the public `run()` future cannot leave a detached observer holding an Agent alive.
-
-## Plain execution and event output
-
-`bone <message>` remains a plain single-session path. It observes before posting and tracks the last printed record cursor. On lag or sequence gap it observes again and prints only newer Snapshot records, so Finished, Paused, and Stopped are neither lost nor duplicated.
-
-The JSONL writer remains an independent consumer of the public observation port. It is diagnostic output, not the TUI's state source.
+An observer task is cancelled with its process-local runtime attachment. A
+durable Session is not deleted merely because its runtime closes. Any accepted
+but unresolved turn remains recorded for the next product startup to explain
+and reconcile.
 
 ## Code map
 
 ```text
-crates/bone-tui/src/
-├── main.rs       arguments, config, login, mode selection
-├── lib.rs        live sessions, observers, UI loop, shutdown
-├── app.rs        App, Conversation, Projection, input actions
-├── view.rs       pure responsive rendering
-├── terminal.rs   raw/alternate/paste lifetime guard
-├── config.rs     presentation settings
-└── events.rs     JSONL observation export
+crates/bone-app/src/
+├── main.rs                  CLI: interactive and one-shot mode selection
+├── product_workspace.rs     Workspace bootstrap policy
+├── durable/
+│   ├── workspace_identity.rs canonical directory identity
+│   ├── registry.rs           private Workspace registry
+│   ├── session.rs            SessionStore, drafts, writer leases
+│   └── journal.rs            append-only recovery facts
+└── tui/
+    ├── mod.rs                product TUI facade and public exports
+    ├── workspace.rs          runner composition and event/effect loop
+    ├── session_controller.rs durable Session lifecycle and recovery
+    ├── command_effects.rs    typed local command effects
+    ├── runtime_driver.rs     Agent attachment and observer fan-in
+    ├── app.rs                AppEvent, reducer, conversation presentation
+    ├── commands.rs           command parsing and suggestions
+    ├── view.rs               pure responsive rendering
+    ├── terminal.rs           terminal lifetime guard
+    ├── config.rs             display settings surface
+    └── events.rs             JSONL observation export
 ```
-
-There are no component traits or generic frontend protocols. A type is split out only when the current implementation gives it an independent job.
 
 ## Invariants
 
-- One `AgentHandle` is one independent session; one `AgentHost` may create many.
-- Only the UI loop mutates `App` or draws.
-- Each observer reports events for exactly one `SessionId`.
-- Inactive sessions continue executing and being observed.
-- A sequence gap replaces only that session's Agent projection.
-- Opening owns a composer immediately; one submitted message waits for attach, remains pending until `post` succeeds, and is restored to the draft on failure.
-- A local start, observe, post, or stop failure takes down only its session.
-- Reset never replaces a composer, scroll anchor, or another session.
-- Presentation consumes records and never duplicates Publish effects.
-- The TUI never makes Agent validity or completion decisions.
-- Terminal restoration precedes slow Agent cleanup.
-- All shutdowns run concurrently and all reports remain observable.
-- Cancelling the frontend future cannot detach an observer that keeps a session alive.
+- The launch directory maps to one durable Workspace; BONE never creates
+  project-local hidden state.
+- Durable `SessionId` and process-local `UiSessionId` have different jobs and
+  never substitute for one another.
+- A Session's writer lease is required before any local durable mutation.
+- A user turn is durable before the reducer clears its composer or the runtime
+  receives it.
+- Journal facts are the recovery authority; Session summary is a repairable
+  last-known status.
+- All presentation changes cross `AppEvent → App::reduce`; effects never write
+  UI fields directly.
+- A runtime observer is tagged to one UI Session and a broadcast reset changes
+  only that Session's runtime projection.
+- Rendering is pure and terminal restoration precedes slow runtime shutdown.
+- BONE never claims an action, model switch, or external effect that the
+  underlying durable/runtime boundary has not confirmed.
 
-## Verification covered
-
-- Two sessions from one host have independent records/jobs, share one endpoint, and read fresh session configuration.
-- Tagged A/B updates change only the matching projection.
-- Switching preserves each draft and background updates raise attention only on their own session.
-- A background completion raises attention and updates its marker without adding a `Finished` timeline row or changing the active composer; selecting it clears background unread.
-- Opening sessions retain drafts, queue one explicitly submitted message until its receipt, restore it on failure, and attach without stealing selection.
-- A long, automatically wrapped Chinese reply can be paged through line by line.
-- Lag resets only the affected session and retains local interaction state.
-- [Ratatui TestBackend] proves that 120x28 shows the focused 28-column rail without a duplicate main header, while 80x24 and 40x12 use one compact conversation header and present the same session list full-screen when focused.
-- Paste normalization, key repeat, multiline input, and combining characters stay intact.
-- Quiet mode hides successful tool noise but keeps failures, cancelled writes with unknown outcomes, and later resolutions.
-- Pure reasoning that chooses to wait no longer appears as active work, and current progress messages replace earlier ones without entering history.
-
-## First-version boundary
-
-Sessions live only for the process and share the startup workspace and task settings. Individual close, persistence, restored history, workspace browsing, rename/reorder/search, mouse control, Markdown rendering, streaming text, approvals, and rich artifact rendering remain outside this version.
-
-The Agent currently exposes read-only workspace tools. Shell, patch, write, approval, and question protocols belong in `bone-agent`, never as frontend improvisations.
-
-[Ratatui]: https://ratatui.rs/concepts/rendering/
-[Crossterm EventStream]: https://docs.rs/crossterm/0.29.0/crossterm/event/struct.EventStream.html
-[Ratatui TestBackend]: https://docs.rs/ratatui/latest/ratatui/backend/struct.TestBackend.html
-[ratatui-textarea]: https://docs.rs/ratatui-textarea/0.9.2/ratatui_textarea/
-[Tokio broadcast]: https://docs.rs/tokio/latest/tokio/sync/broadcast/
+For product requirements and detailed screen behavior, read the
+[TUI workspace PRD](product/tui-workspace-prd.md),
+[interaction design](product/tui-interaction-design.md), and
+[product runtime architecture](product/tui-runtime-architecture.md).

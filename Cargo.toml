@@ -1,7 +1,7 @@
 [workspace]
 members = [
+    "crates/bone-app",
     "crates/bone-agent",
-    "crates/bone-tui",
     "crates/bone-config",
     "crates/bone-llm",
     "crates/bone-tools",
@@ -36,4 +36,5 @@ sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
 tokio = "1"
+uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2"

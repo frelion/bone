@@ -11,9 +11,9 @@ atomic writes without depending on those modules.
 | `agent.system` | `bone-agent` | Coordinator, default solver, model deadlines, tool reminder, shutdown grace. |
 | `llm.system` | `bone-llm` | Optional `credential_root` for the current ChatGPT connection. |
 | `tools.local` | `bone-tools` | `ToolLimits`, including output, read, search, and shell limits. |
-| `tui.display` | `bone-tui` | `show_progress`, default true. |
+| `tui.display` | `bone-app` | `show_progress`, default true. |
 
-See the [complete example](../crates/bone-tui/config.example.json). Only
+See the [complete example](../crates/bone-app/config.example.json). Only
 `agent.system` is required; the other sections and individual tool limits use
 defaults when omitted. Model IDs must be selected explicitly.
 
@@ -24,11 +24,11 @@ accepts an explicit path for embedded applications and tests.
 
 ```rust,ignore
 let config = bone_agent::config_builder()?
-    .register::<bone_tui::TuiConfig>()?
+    .register::<bone_app::TuiConfig>()?
     .build(bone_config::default_path()?)?;
 ```
 
-Agent's builder registers Agent, LLM, and Tools settings. TUI adds only its
+Agent's builder registers Agent, LLM, and Tools settings. `bone-app` adds its
 presentation settings. Registration is complete before `build`; each manager
 then has a fixed set of known types and schemas.
 
@@ -47,7 +47,7 @@ configuration error.
 
 ```rust,ignore
 let snapshot = config.snapshot()?;
-let settings = snapshot.get::<bone_tui::TuiConfig>()?.unwrap_or_default();
+let settings = snapshot.get::<bone_app::TuiConfig>()?.unwrap_or_default();
 let change = config.set(&settings, snapshot.revision())?;
 ```
 

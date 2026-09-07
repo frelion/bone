@@ -282,6 +282,7 @@ independent sessions concurrently. A different live Host or process connecting
 the same root receives `CredentialStoreBusy` until the existing Endpoint and
 model handles are released.
 
-`bone-agent` composes the models, tools, and runtime. The terminal frontend is
-`bone-tui`, which depends on `bone-agent` and `bone-config`; run it with
-`cargo run -p bone-tui` after [configuring the agent](configuration.md).
+`bone-agent` composes the models, tools, and runtime. The terminal application
+is `bone-app`, which owns the `bone` binary and depends on `bone-agent` and
+`bone-config`; run it with `cargo run -p bone-app --bin bone` after
+[configuring the agent](configuration.md).

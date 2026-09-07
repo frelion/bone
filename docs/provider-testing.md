@@ -45,9 +45,9 @@ then run the terminal frontend. `bone-agent` constructs the subscription
 models, tools, and runtime from a shared configuration snapshot:
 
 ```sh
-cargo run -p bone-tui -- "Reply with exactly: ok"
+cargo run -p bone-app --bin bone -- "Reply with exactly: ok"
 
-cargo run -p bone-tui
+cargo run -p bone-app --bin bone
 ```
 
 In the full-screen form, use `Ctrl-N` to create a conversation. Press

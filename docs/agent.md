@@ -57,9 +57,10 @@ same credential directory receives `CredentialStoreBusy`. Single-session
 programs may use the `bone_agent::start` convenience, which validates settings
 and local paths before it requests authorization.
 
-`bone-tui` depends only on `bone-agent` and `bone-config` among BONE crates.
-It owns terminal input, display preferences, and JSONL export. Model prompts,
-input-review projection, and native-tool adaptation are in `bone-agent`.
+`bone-app` owns terminal input, display preferences, JSONL export, and durable
+Workspace/Session state. It depends on `bone-agent` and `bone-config`; model
+prompts, input-review projection, and native-tool adaptation are in
+`bone-agent`.
 
 `SystemConfig.coordinator` selects the interruption reviewer; `TaskConfig`
 overrides only the solver. Runtime settings and tool limits come from the same
@@ -98,7 +99,7 @@ records remain available, but missed raw steps are not replayed. Ordinary
 progress is coalesced per job. Observers act through explicit handle commands.
 
 ```sh
-cargo run -p bone-tui -- --events session.jsonl "Inspect the workspace"
+cargo run -p bone-app --bin bone -- --events session.jsonl "Inspect the workspace"
 ```
 
 This independent consumer writes a new JSONL file: baseline `snapshot`, live

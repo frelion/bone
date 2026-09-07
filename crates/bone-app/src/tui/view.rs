@@ -6,9 +6,9 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 
-use crate::app::{
-    App, Focus, ScrollAnchor, SessionState, SessionStatus, SessionUi, Speaker, TimelineItem,
-    TimelineKind, Tone, Viewport,
+use super::{
+    agent_projection::{SessionStatus, Speaker, TimelineItem, TimelineKind, Tone},
+    app::{App, Focus, ScrollAnchor, SessionState, SessionUi, Viewport},
 };
 
 const RAIL_WIDTH: u16 = 28;
@@ -209,6 +209,9 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn live_activity(session: &SessionUi, compact: bool) -> Option<(String, Tone)> {
     match &session.state {
+        SessionState::NeedsSetup(reason) => Some((reason.clone(), Tone::Warning)),
+        SessionState::Detached(reason) => Some((reason.clone(), Tone::Success)),
+        SessionState::ReadOnlyElsewhere(reason) => Some((reason.clone(), Tone::Warning)),
         SessionState::Opening if session.pending_post.is_some() => Some((
             "Message queued · opening conversation".to_owned(),
             Tone::Success,
@@ -410,7 +413,9 @@ fn render_composer(
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, narrow: bool) {
     let session = app.current();
     let compact = narrow && area.width < 60;
-    let help = if app.focus == Focus::Sessions {
+    let help = if let Some(notice) = app.notice() {
+        notice.to_owned()
+    } else if app.focus == Focus::Sessions {
         "↑↓ select · Enter compose · Ctrl→".to_owned()
     } else if session.conversation.anchor.is_some() {
         if compact && session.conversation.unread {
@@ -424,6 +429,16 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, narrow: bool) {
         }
     } else {
         match (&session.state, compact) {
+            (SessionState::NeedsSetup(_), true) => "/model <id> configure · Ctrl← sessions",
+            (SessionState::NeedsSetup(_), false) => {
+                "/model <id> configure · ^N new · Ctrl← sessions"
+            }
+            (SessionState::ReadOnlyElsewhere(_), true) => "Read-only · Ctrl← sessions",
+            (SessionState::ReadOnlyElsewhere(_), false) => {
+                "Read-only in another BONE · ^N new · Ctrl← sessions"
+            }
+            (SessionState::Detached(_), true) => "Enter start · Ctrl← sessions",
+            (SessionState::Detached(_), false) => "Enter start · ^N new · Ctrl← sessions",
             (SessionState::Opening, true) if session.pending_post.is_some() => {
                 "Queued · Ctrl← sessions"
             }
@@ -472,6 +487,9 @@ fn session_cue(session: &SessionUi) -> (&'static str, String, Style) {
         return ("●", "New activity".to_owned(), warning());
     }
     match &session.state {
+        SessionState::NeedsSetup(_) => ("!", "Setup needed".to_owned(), warning()),
+        SessionState::Detached(_) => ("·", "Ready to start".to_owned(), muted()),
+        SessionState::ReadOnlyElsewhere(_) => ("⊘", "Read-only elsewhere".to_owned(), warning()),
         SessionState::Opening if session.pending_post.is_some() => {
             ("•", "Message queued".to_owned(), accent())
         }
@@ -589,7 +607,7 @@ mod tests {
     use serde_json::json;
 
     use super::render;
-    use crate::app::{App, Focus, SessionId, Viewport};
+    use crate::tui::app::{App, Focus, UiSessionId, Viewport};
 
     #[test]
     fn wide_layout_has_a_session_rail_and_semantic_live_tail() {
@@ -607,7 +625,9 @@ mod tests {
         assert!(screen.contains("┃ 实现多 session TUI"));
         assert!(screen.contains("● 已经建立独立 session"));
         assert!(screen.contains("✓ Searched \"Projection\" in crates · 3 matches"));
-        assert!(screen.contains("• 2 active · Thinking · Reading crates/bone-tui/src/view.rs 68%"));
+        assert!(
+            screen.contains("• 2 active · Thinking · Reading crates/bone-app/src/tui/view.rs 68%")
+        );
         assert!(screen.contains("继续打磨交互和代码结构"));
         assert!(screen.contains("Esc stop · Ctrl← sessions"));
         assert_eq!(buffer[(32, 0)].symbol(), "┃");
@@ -680,7 +700,7 @@ mod tests {
     fn unresolved_effect_outranks_background_unread() {
         let mut app = App::new("workspace".into());
         app.add_session(
-            SessionId(1),
+            UiSessionId(1),
             &snapshot(vec![
                 RecordEntry {
                     cursor: 1,
@@ -703,7 +723,7 @@ mod tests {
             false,
         );
         app.sessions[0].background_unread = true;
-        app.mark_offline(SessionId(1), "agent runtime closed");
+        app.mark_offline(UiSessionId(1), "agent runtime closed");
 
         let screen = screen(&draw(&app, 120, 20));
         assert!(screen.contains("! Unresolved effect"));
@@ -714,7 +734,7 @@ mod tests {
     #[test]
     fn empty_session_has_a_calm_starting_point() {
         let mut app = App::new("/work/BONE".into());
-        app.add_session(SessionId(1), &snapshot(vec![]), true);
+        app.add_session(UiSessionId(1), &snapshot(vec![]), true);
         let screen = screen(&draw(&app, 80, 18));
 
         assert!(screen.contains("What should we work on?"));
@@ -725,7 +745,7 @@ mod tests {
     fn example_app() -> App {
         let mut app = App::new("/Users/zzhang/Documents/ChatGPT/BONE".into());
         app.add_session(
-            SessionId(1),
+            UiSessionId(1),
             &snapshot(vec![RecordEntry {
                 cursor: 1,
                 kind: RecordKind::UserMessage(Message {
@@ -738,7 +758,7 @@ mod tests {
         app.sessions[0].background_unread = true;
 
         app.add_session(
-            SessionId(2),
+            UiSessionId(2),
             &snapshot(vec![
                 RecordEntry {
                     cursor: 1,
@@ -785,7 +805,7 @@ mod tests {
                         id: JobId(3),
                         request: JobRequest::Tool(ToolCall::new(
                             "read",
-                            json!({"path": "crates/bone-tui/src/view.rs"}),
+                            json!({"path": "crates/bone-app/src/tui/view.rs"}),
                         )),
                     }),
                 },

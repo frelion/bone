@@ -168,7 +168,7 @@ loop {
 终端前端可写出同一端口的事件：
 
 ```sh
-cargo run -p bone-tui -- --events session.jsonl "Inspect the workspace"
+cargo run -p bone-app --bin bone -- --events session.jsonl "Inspect the workspace"
 ```
 
 文件必须不存在。JSONL 先写 `snapshot`，随后 `step`，落后时写 `gap`。
