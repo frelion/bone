@@ -26,7 +26,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::{ConfigError, Endpoint, Protocol, error::validate_endpoint_id, model::RequestSupport};
+use crate::{
+    ConfigError, Endpoint, Protocol, error::validate_endpoint_id, model::RequestSupport,
+    protocol::no_redirect_http_client,
+};
 
 /// A redacted ChatGPT subscription service failure.
 ///
@@ -129,6 +132,7 @@ where
         .default_instructions("")
         .originator("bone")
         .user_agent(user_agent())
+        .http_client(no_redirect_http_client().map_err(|_| Error::InvalidClientConfiguration)?)
         .build()
         .map_err(|_| Error::InvalidClientConfiguration)?;
 
@@ -146,6 +150,7 @@ where
         .default_instructions("")
         .originator("bone")
         .user_agent(user_agent())
+        .http_client(no_redirect_http_client().map_err(|_| Error::InvalidClientConfiguration)?)
         .build()
         .map_err(|_| Error::InvalidClientConfiguration)?;
 

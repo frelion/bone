@@ -11,11 +11,9 @@ use std::{
     sync::Arc,
 };
 
-use crate::{ChatGptCredentials, WorkspaceApplication};
-use bone_agent::{
-    AgentHandle, AgentHost, Observation, ResolvedAgentRuntimeConfig, Snapshot, StepEvent,
-};
-use bone_llm::service::chatgpt_subscription::{self, DeviceCodePrompt};
+use crate::{LlmProfile, ProviderConnector, ResolvedRuntime, WorkspaceApplication};
+use bone_agent::{AgentHandle, Observation, Snapshot, StepEvent};
+use bone_llm::service::chatgpt_subscription::DeviceCodePrompt;
 use futures_util::stream::FuturesUnordered;
 use tokio::{
     sync::{broadcast::error::RecvError, mpsc},
@@ -30,8 +28,18 @@ use super::{
     },
 };
 
-pub(super) type ConnectionTask = JoinHandle<Result<AgentHost, String>>;
 pub(super) type StartTask = JoinHandle<(UiSessionId, Result<(AgentHandle, Observation), String>)>;
+pub(super) type AuthenticationTask = JoinHandle<Result<(), String>>;
+
+/// Immutable dependencies shared by runtime-start effects in one TUI process.
+/// Keeping these together leaves the scheduling function responsible only for
+/// the mutable session/task collections it actually changes.
+pub(super) struct RuntimeStartContext<'a> {
+    pub(super) application: &'a WorkspaceApplication,
+    pub(super) connector: &'a ProviderConnector,
+    pub(super) login_tx: &'a mpsc::UnboundedSender<DeviceCodePrompt>,
+    pub(super) workspace: &'a Path,
+}
 
 pub(super) struct EnqueuedPendingStarts {
     ids: Vec<UiSessionId>,
@@ -117,33 +125,26 @@ pub(super) async fn observe_session(
     }
 }
 
-pub(super) fn enqueue_connection(
-    connecting: &mut FuturesUnordered<ConnectionTask>,
-    credentials: ChatGptCredentials,
-    login_tx: mpsc::UnboundedSender<DeviceCodePrompt>,
-) {
-    connecting.push(tokio::spawn(async move {
-        let auth = credentials.acquire().map_err(|error| error.to_string())?;
-        let endpoint = chatgpt_subscription::connect("bone-agent", auth, move |prompt| {
-            let _ = login_tx.send(prompt);
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-        Ok(AgentHost::new(endpoint))
-    }));
-}
-
 fn enqueue_start(
     starting: &mut FuturesUnordered<StartTask>,
-    host: AgentHost,
+    connector: ProviderConnector,
+    login_tx: mpsc::UnboundedSender<DeviceCodePrompt>,
     workspace: PathBuf,
     id: UiSessionId,
-    runtime: ResolvedAgentRuntimeConfig,
+    runtime: ResolvedRuntime,
 ) {
     starting.push(tokio::spawn(async move {
-        let opened = match host.start(workspace, runtime) {
-            Ok(agent) => match agent.observe().await {
-                Ok(observation) => Ok((agent, observation)),
+        let host = connector
+            .connect_agent(&runtime, move |prompt| {
+                let _ = login_tx.send(prompt);
+            })
+            .await;
+        let opened = match host {
+            Ok(host) => match host.start(workspace, runtime.agent.clone()) {
+                Ok(agent) => match agent.observe().await {
+                    Ok(observation) => Ok((agent, observation)),
+                    Err(error) => Err(error.to_string()),
+                },
                 Err(error) => Err(error.to_string()),
             },
             Err(error) => Err(error.to_string()),
@@ -152,36 +153,53 @@ fn enqueue_start(
     }));
 }
 
-/// Start every accepted-but-not-yet-delivered turn exactly once for the
-/// current connection attempt. Failed starts stay in `pending_tasks` and are
-/// retried only after the user explicitly invokes `/login` again.
-pub(super) fn enqueue_pending_starts(
-    application: &WorkspaceApplication,
+/// Begin the explicit ChatGPT login flow without attaching an Agent runtime.
+/// The UI receives device-code prompts through its existing event channel.
+pub(super) fn start_chatgpt_authentication(
+    connector: ProviderConnector,
+    profile: LlmProfile,
+    login_tx: mpsc::UnboundedSender<DeviceCodePrompt>,
+) -> AuthenticationTask {
+    tokio::spawn(async move {
+        connector
+            .authenticate_chatgpt(&profile, move |prompt| {
+                let _ = login_tx.send(prompt);
+            })
+            .await
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// Start one accepted-but-not-yet-delivered turn exactly once. A task resolves
+/// its own frozen profile plan, so sessions may use independent providers;
+/// failures remain retryable until that conversation's user invokes `/login`.
+/// It deliberately accepts one ID rather than scanning every pending task:
+/// one conversation must never cause another conversation's text to be sent.
+pub(super) fn enqueue_pending_start(
+    context: &RuntimeStartContext<'_>,
     durable: &mut HashMap<UiSessionId, DurableUiSession>,
     starting: &mut FuturesUnordered<StartTask>,
     starting_ids: &mut HashSet<UiSessionId>,
-    host: &AgentHost,
-    workspace: &Path,
-    pending_tasks: &HashMap<UiSessionId, PendingRuntimeTurn>,
+    id: UiSessionId,
+    pending: &PendingRuntimeTurn,
 ) -> EnqueuedPendingStarts {
     let mut ids = Vec::new();
     let mut notices = Vec::new();
-    for (id, pending) in pending_tasks {
-        if starting_ids.insert(*id) {
-            ids.push(*id);
-            if let Err(error) = persist_runtime_starting(application, durable, *id) {
-                notices.push(format!(
-                    "Saved message is starting, but its durable status could not be updated: {error}"
-                ));
-            }
-            enqueue_start(
-                starting,
-                host.clone(),
-                workspace.to_path_buf(),
-                *id,
-                pending.runtime.clone(),
-            );
+    if starting_ids.insert(id) {
+        ids.push(id);
+        if let Err(error) = persist_runtime_starting(context.application, durable, id) {
+            notices.push(format!(
+                "Saved message is starting, but its durable status could not be updated: {error}"
+            ));
         }
+        enqueue_start(
+            starting,
+            context.connector.clone(),
+            context.login_tx.clone(),
+            context.workspace.to_path_buf(),
+            id,
+            pending.runtime.clone(),
+        );
     }
     EnqueuedPendingStarts { ids, notices }
 }

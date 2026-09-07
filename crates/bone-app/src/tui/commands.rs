@@ -5,6 +5,10 @@
 //! model-visible message? Executing a command belongs to the application
 //! effect layer, not to the composer or renderer.
 
+use bone_llm::protocol::openai_responses::{
+    ReasoningContext, ReasoningEffort, ReasoningMode, ReasoningSummary,
+};
+
 /// How the current composer value was produced.
 ///
 /// A paste must never gain the authority to execute a local command merely
@@ -25,6 +29,7 @@ pub enum LocalCommand {
     Help,
     Status,
     Config(ConfigCommand),
+    Provider(ProviderCommand),
     Model(ModelCommand),
     Login,
     Logout,
@@ -44,18 +49,79 @@ pub enum ConfigCommand {
     Doctor,
 }
 
+/// Explicit profile-catalog commands.  The parser recognizes only BONE's
+/// current public LLM connection surface; there is no arbitrary provider
+/// plugin or JSON configuration escape hatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderCommand {
+    List,
+    Add {
+        id: String,
+        protocol: ProviderProtocol,
+        base_url: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderProtocol {
+    OpenAiResponses,
+    OpenAiChatCompletions,
+    AnthropicMessages,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelCommand {
     /// Open the current-session model picker, optionally pre-filtered.
     Open { query: Option<String> },
     /// Save a current-session solver override.
-    SetSession { model: String },
+    SetSession {
+        profile: Option<String>,
+        model: String,
+        tuning: ModelTuning,
+    },
     /// Save the current workspace's default solver.
-    SetWorkspaceDefault { model: String },
+    SetWorkspaceDefault {
+        profile: Option<String>,
+        model: String,
+        tuning: ModelTuning,
+    },
     /// Save the user's global default solver.
-    SetUserDefault { model: String },
+    SetUserDefault {
+        profile: Option<String>,
+        model: String,
+        tuning: ModelTuning,
+    },
+    /// Save the user-wide coordinator model.
+    SetCoordinator {
+        profile: Option<String>,
+        model: String,
+        tuning: ModelTuning,
+    },
     /// Remove the current-session override and resume inheritance.
     Inherit,
+}
+
+/// Explicit optional controls for one saved model selection.
+///
+/// These map one-for-one to persistable `bone_llm` request controls; they are
+/// not an untyped `key=value` escape hatch. A protocol that does not support a
+/// selected control is rejected before the setting is saved.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelTuning {
+    pub(crate) timeout_seconds: Option<u32>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) reasoning_summary: Option<ReasoningSummary>,
+    pub(crate) reasoning_mode: Option<ReasoningMode>,
+    pub(crate) reasoning_context: Option<ReasoningContext>,
+}
+
+impl ModelTuning {
+    pub(crate) fn has_reasoning(&self) -> bool {
+        self.reasoning_effort.is_some()
+            || self.reasoning_summary.is_some()
+            || self.reasoning_mode.is_some()
+            || self.reasoning_context.is_some()
+    }
 }
 
 /// A command descriptor drives discoverability and parsing; future palette and
@@ -108,6 +174,12 @@ const COMMANDS: &[CommandDescriptor] = &[
         aliases: &[],
         title: "Settings",
         description: "Open settings, or run /config doctor.",
+    },
+    CommandDescriptor {
+        name: "provider",
+        aliases: &[],
+        title: "Providers",
+        description: "List or add a saved LLM connection profile.",
     },
     CommandDescriptor {
         name: "model",
@@ -264,6 +336,7 @@ fn parse_known(raw: &str, name: &str, arguments: &str) -> Submission {
                 message: "use /config or /config doctor.",
             },
         },
+        "provider" => parse_provider(raw, arguments),
         "model" => parse_model(raw, arguments),
         "resume" => Submission::Command(LocalCommand::Resume(
             (!arguments.is_empty()).then(|| arguments.to_owned()),
@@ -286,26 +359,162 @@ fn parse_model(raw: &str, arguments: &str) -> Submission {
     if arguments == "inherit" {
         return Submission::Command(LocalCommand::Model(ModelCommand::Inherit));
     }
-    let (scope, model) = split_command(arguments);
+    let (scope, target) = split_command(arguments);
     match scope {
-        "default" if !model.is_empty() => {
-            Submission::Command(LocalCommand::Model(ModelCommand::SetWorkspaceDefault {
-                model: model.to_owned(),
-            }))
-        }
-        "global" if !model.is_empty() => {
-            Submission::Command(LocalCommand::Model(ModelCommand::SetUserDefault {
-                model: model.to_owned(),
-            }))
-        }
-        "default" | "global" => Submission::Invalid {
-            raw: raw.to_owned(),
-            message: "provide a model identifier after the scope.",
-        },
-        _ => Submission::Command(LocalCommand::Model(ModelCommand::SetSession {
-            model: arguments.to_owned(),
-        })),
+        "coordinator" => parse_model_target(raw, target, |profile, model, tuning| {
+            ModelCommand::SetCoordinator {
+                profile,
+                model,
+                tuning,
+            }
+        }),
+        "default" => parse_model_target(raw, target, |profile, model, tuning| {
+            ModelCommand::SetWorkspaceDefault {
+                profile,
+                model,
+                tuning,
+            }
+        }),
+        "global" => parse_model_target(raw, target, |profile, model, tuning| {
+            ModelCommand::SetUserDefault {
+                profile,
+                model,
+                tuning,
+            }
+        }),
+        _ => parse_model_target(raw, arguments, |profile, model, tuning| {
+            ModelCommand::SetSession {
+                profile,
+                model,
+                tuning,
+            }
+        }),
     }
+}
+
+fn parse_model_target(
+    raw: &str,
+    value: &str,
+    construct: impl FnOnce(Option<String>, String, ModelTuning) -> ModelCommand,
+) -> Submission {
+    let mut parts = Vec::new();
+    let mut tuning = ModelTuning::default();
+    let mut values = value.split_whitespace();
+    while let Some(part) = values.next() {
+        let Some(flag) = part.strip_prefix("--") else {
+            parts.push(part);
+            continue;
+        };
+        let Some(argument) = values.next() else {
+            return invalid_model_target(raw);
+        };
+        let parsed = match flag {
+            "timeout" => argument
+                .parse::<u32>()
+                .ok()
+                .filter(|seconds| *seconds > 0)
+                .map(|seconds| tuning.timeout_seconds.replace(seconds).is_none()),
+            "reasoning-effort" => parse_reasoning_effort(argument)
+                .map(|effort| tuning.reasoning_effort.replace(effort).is_none()),
+            "reasoning-summary" => parse_reasoning_summary(argument)
+                .map(|summary| tuning.reasoning_summary.replace(summary).is_none()),
+            "reasoning-mode" => parse_reasoning_mode(argument)
+                .map(|mode| tuning.reasoning_mode.replace(mode).is_none()),
+            "reasoning-context" => parse_reasoning_context(argument)
+                .map(|context| tuning.reasoning_context.replace(context).is_none()),
+            _ => None,
+        };
+        if parsed != Some(true) {
+            return invalid_model_target(raw);
+        }
+    }
+    let (profile, model) = match parts.as_slice() {
+        [model] => (None, (*model).to_owned()),
+        [profile, model] => (Some((*profile).to_owned()), (*model).to_owned()),
+        _ => return invalid_model_target(raw),
+    };
+    Submission::Command(LocalCommand::Model(construct(profile, model, tuning)))
+}
+
+fn invalid_model_target(raw: &str) -> Submission {
+    Submission::Invalid {
+        raw: raw.to_owned(),
+        message: "use <model> or <profile> <model>, followed by optional --timeout and --reasoning-* controls.",
+    }
+}
+
+fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
+    Some(match value {
+        "none" => ReasoningEffort::None,
+        "minimal" => ReasoningEffort::Minimal,
+        "low" => ReasoningEffort::Low,
+        "medium" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        "xhigh" => ReasoningEffort::Xhigh,
+        "max" => ReasoningEffort::Max,
+        _ => return None,
+    })
+}
+
+fn parse_reasoning_summary(value: &str) -> Option<ReasoningSummary> {
+    Some(match value {
+        "auto" => ReasoningSummary::Auto,
+        "concise" => ReasoningSummary::Concise,
+        "detailed" => ReasoningSummary::Detailed,
+        _ => return None,
+    })
+}
+
+fn parse_reasoning_mode(value: &str) -> Option<ReasoningMode> {
+    (value == "pro").then_some(ReasoningMode::Pro)
+}
+
+fn parse_reasoning_context(value: &str) -> Option<ReasoningContext> {
+    Some(match value {
+        "auto" => ReasoningContext::Auto,
+        "all_turns" => ReasoningContext::AllTurns,
+        "current_turn" => ReasoningContext::CurrentTurn,
+        _ => return None,
+    })
+}
+
+fn parse_provider(raw: &str, arguments: &str) -> Submission {
+    if arguments.is_empty() || arguments == "list" {
+        return Submission::Command(LocalCommand::Provider(ProviderCommand::List));
+    }
+    let parts = arguments.split_whitespace().collect::<Vec<_>>();
+    let ["add", id, protocol, tail @ ..] = parts.as_slice() else {
+        return Submission::Invalid {
+            raw: raw.to_owned(),
+            message: "use /provider, or /provider add <id> <responses|chat|anthropic> [base-url].",
+        };
+    };
+    let protocol = match *protocol {
+        "responses" => ProviderProtocol::OpenAiResponses,
+        "chat" => ProviderProtocol::OpenAiChatCompletions,
+        "anthropic" => ProviderProtocol::AnthropicMessages,
+        _ => {
+            return Submission::Invalid {
+                raw: raw.to_owned(),
+                message: "provider protocol must be responses, chat, or anthropic.",
+            };
+        }
+    };
+    let base_url = match tail {
+        [] => None,
+        [base_url] => Some((*base_url).to_owned()),
+        _ => {
+            return Submission::Invalid {
+                raw: raw.to_owned(),
+                message: "an API-key protocol may include one base URL.",
+            };
+        }
+    };
+    Submission::Command(LocalCommand::Provider(ProviderCommand::Add {
+        id: (*id).to_owned(),
+        protocol,
+        base_url,
+    }))
 }
 
 fn suggestions(name: &str) -> Vec<&'static CommandDescriptor> {
@@ -402,25 +611,96 @@ mod tests {
         assert_eq!(
             parse_submission("/model gpt-5.6".into(), InputProvenance::TypedOnly),
             Submission::Command(LocalCommand::Model(ModelCommand::SetSession {
+                profile: None,
                 model: "gpt-5.6".into(),
+                tuning: ModelTuning::default(),
             }))
         );
         assert_eq!(
             parse_submission("/model default gpt-5.6".into(), InputProvenance::TypedOnly),
             Submission::Command(LocalCommand::Model(ModelCommand::SetWorkspaceDefault {
+                profile: None,
                 model: "gpt-5.6".into(),
+                tuning: ModelTuning::default(),
             }))
         );
         assert_eq!(
             parse_submission("/model global gpt-5.6".into(), InputProvenance::TypedOnly),
             Submission::Command(LocalCommand::Model(ModelCommand::SetUserDefault {
+                profile: None,
                 model: "gpt-5.6".into(),
+                tuning: ModelTuning::default(),
+            }))
+        );
+        assert_eq!(
+            parse_submission(
+                "/model coordinator anthropic claude-test".into(),
+                InputProvenance::TypedOnly
+            ),
+            Submission::Command(LocalCommand::Model(ModelCommand::SetCoordinator {
+                profile: Some("anthropic".into()),
+                model: "claude-test".into(),
+                tuning: ModelTuning::default(),
             }))
         );
         assert_eq!(
             parse_submission("/model inherit".into(), InputProvenance::TypedOnly),
             Submission::Command(LocalCommand::Model(ModelCommand::Inherit))
         );
+    }
+
+    #[test]
+    fn parses_typed_responses_controls_without_an_untyped_escape_hatch() {
+        assert_eq!(
+            parse_submission(
+                "/model openai gpt-5 --timeout 90 --reasoning-effort high --reasoning-summary concise --reasoning-mode pro --reasoning-context current_turn".into(),
+                InputProvenance::TypedOnly,
+            ),
+            Submission::Command(LocalCommand::Model(ModelCommand::SetSession {
+                profile: Some("openai".into()),
+                model: "gpt-5".into(),
+                tuning: ModelTuning {
+                    timeout_seconds: Some(90),
+                    reasoning_effort: Some(ReasoningEffort::High),
+                    reasoning_summary: Some(ReasoningSummary::Concise),
+                    reasoning_mode: Some(ReasoningMode::Pro),
+                    reasoning_context: Some(ReasoningContext::CurrentTurn),
+                },
+            }))
+        );
+        assert!(matches!(
+            parse_submission(
+                "/model gpt-5 --reasoning-effort unknown".into(),
+                InputProvenance::TypedOnly,
+            ),
+            Submission::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_explicit_provider_profiles_without_treating_urls_as_messages() {
+        assert_eq!(
+            parse_submission("/provider".into(), InputProvenance::TypedOnly),
+            Submission::Command(LocalCommand::Provider(ProviderCommand::List))
+        );
+        assert_eq!(
+            parse_submission(
+                "/provider add work responses https://gateway.example/v1".into(),
+                InputProvenance::TypedOnly
+            ),
+            Submission::Command(LocalCommand::Provider(ProviderCommand::Add {
+                id: "work".into(),
+                protocol: ProviderProtocol::OpenAiResponses,
+                base_url: Some("https://gateway.example/v1".into()),
+            }))
+        );
+        assert!(matches!(
+            parse_submission(
+                "/provider add work chatgpt https://gateway.example".into(),
+                InputProvenance::TypedOnly
+            ),
+            Submission::Invalid { .. }
+        ));
     }
 
     #[test]

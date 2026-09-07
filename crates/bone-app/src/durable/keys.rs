@@ -14,6 +14,10 @@ pub(crate) fn global_settings() -> DocumentKey {
     DocumentKey::new(SETTINGS_NAMESPACE, "global")
 }
 
+pub(crate) fn llm_profiles() -> DocumentKey {
+    DocumentKey::new(SETTINGS_NAMESPACE, "llm-profiles")
+}
+
 pub(crate) fn workspace_registry() -> DocumentKey {
     DocumentKey::new(STATE_NAMESPACE, "workspace-registry")
 }

@@ -1,9 +1,9 @@
 //! A complete agent session, with models and tools executed as ordinary jobs.
 //!
-//! Product code authenticates a provider endpoint, resolves settings into a
-//! [`ResolvedAgentRuntimeConfig`], creates an [`AgentHost`], and starts
-//! independent runtimes from it. Each runtime keeps its supplied configuration
-//! snapshot.
+//! Product code resolves Agent execution settings into a
+//! [`ResolvedAgentRuntimeConfig`], constructs [`AgentModels`], creates an
+//! [`AgentHost`], and starts independent runtimes from it. Each runtime keeps
+//! its supplied configuration snapshot.
 //!
 //! [`Kernel::step`] records observations and returns [`Effect`]s. [`Runtime`]
 //! executes them without waiting in the inbox loop. The solver owns task
@@ -23,12 +23,8 @@ mod tools;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub use app::{AgentHost, StartError};
-pub use config::{
-    Effort, ModelSettings, ModelSettingsError, ResolvedAgentRuntimeConfig,
-    ResolvedAgentRuntimeConfigError, RuntimeConfigFingerprint, RuntimeDeadlines, SystemConfig,
-    SystemConfigError,
-};
+pub use app::{AgentHost, AgentModels, ConfiguredModel, ConfiguredModelError, StartError};
+pub use config::{ResolvedAgentRuntimeConfig, ResolvedAgentRuntimeConfigError, RuntimeDeadlines};
 pub use kernel::{Kernel, KernelConfig, KernelError};
 pub use model::ModelAdapter;
 pub use ports::*;

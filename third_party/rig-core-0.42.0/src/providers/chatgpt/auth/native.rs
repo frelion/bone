@@ -215,7 +215,7 @@ impl PlatformAuthenticator {
     }
 
     async fn login_device_flow(&self) -> Result<AuthRecord, AuthError> {
-        let client = reqwest::Client::new();
+        let client = no_redirect_client()?;
         let device = client
             .post(CHATGPT_DEVICE_CODE_URL)
             .json(&serde_json::json!({ "client_id": CHATGPT_CLIENT_ID }))
@@ -301,7 +301,7 @@ impl PlatformAuthenticator {
     }
 
     async fn refresh_tokens(&self, refresh_token: &str) -> Result<AuthRecord, RefreshTokensError> {
-        let client = reqwest::Client::new();
+        let client = no_redirect_client().map_err(RefreshTokensError::Auth)?;
         let form = [
             ("client_id", CHATGPT_CLIENT_ID),
             ("grant_type", "refresh_token"),
@@ -350,6 +350,16 @@ impl PlatformAuthenticator {
             format_refresh_error(status, oauth_error.as_ref(), &body),
         )))
     }
+}
+
+/// OAuth form bodies can contain one-time codes or refresh tokens.  Treat a
+/// redirect as an authorization failure instead of forwarding those values to
+/// a different authority.
+fn no_redirect_client() -> Result<reqwest::Client, AuthError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(Into::into)
 }
 
 fn build_auth_record(

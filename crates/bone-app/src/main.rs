@@ -1,21 +1,28 @@
 use std::{
     env,
     error::Error,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
     process::ExitCode,
 };
 
-use bone_agent::{
-    AgentHandle, AgentHost, JobRequest, Notice, Observation, RecordEntry, RecordKind,
-};
+use bone_agent::{AgentHandle, JobRequest, Notice, Observation, RecordEntry, RecordKind};
 use bone_app::{
-    AppStorageError, ChatGptCredentials, ModelSelection, SettingsError, SettingsService,
-    TuiDisplaySettings, TuiError, WorkspaceApplication, WorkspaceApplicationError, WorkspaceError,
-    open_default_store, run_storage_repair, run_workspace, write_events,
+    ApiKey, ApiKeyCredentialError, ApiKeyCredentials, AppStorageError, LlmProfile, LlmProfileId,
+    ModelSelection, ProviderConnector, SettingsError, SettingsService, TuiDisplaySettings,
+    TuiError, WorkspaceApplication, WorkspaceApplicationError, WorkspaceError, open_default_store,
+    run_storage_repair, run_workspace, write_events,
 };
-use bone_llm::service::chatgpt_subscription::{self, DeviceCodePrompt};
+use bone_llm::{EndpointConfig, service::chatgpt_subscription::DeviceCodePrompt};
 use bone_store::StoreError;
+use crossterm::{
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
+    },
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use tokio::sync::broadcast::error::RecvError;
 
 #[tokio::main]
@@ -35,6 +42,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
         print_help();
         return Ok(());
     }
+    if let Some(command) = arguments.credentials.as_ref() {
+        return run_credentials(command);
+    }
+    if let Some(command) = arguments.provider.as_ref() {
+        return run_provider(command);
+    }
     if arguments.message.is_empty() && arguments.events.is_some() {
         return Err(
             invalid_input("--events is currently available only with one-shot messages").into(),
@@ -49,8 +62,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
             Err(_) => return Err(invalid_input("BONE_MODEL must be valid Unicode").into()),
         },
     };
+    let selected_profile = match arguments.profile {
+        Some(profile) => Some(profile),
+        None => match env::var("BONE_PROFILE") {
+            Ok(profile) => Some(profile.trim().to_owned()),
+            Err(env::VarError::NotPresent) => None,
+            Err(_) => return Err(invalid_input("BONE_PROFILE must be valid Unicode").into()),
+        },
+    };
+    let initial_model = initial_model_selection(selected_model, selected_profile)?;
     let workspace = env::current_dir()?;
-    let credentials = ChatGptCredentials::default_for_current_user()?;
     let input = arguments.message;
     if input.is_empty() {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -98,14 +119,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     return Ok(());
                 }
             };
-            match run_workspace(
-                application,
-                settings,
-                credentials.clone(),
-                selected_model.clone(),
-            )
-            .await
-            {
+            if let Some(selection) = initial_model.as_ref() {
+                match settings.validate_model_selection(selection) {
+                    Ok(()) => {}
+                    Err(SettingsError::UnknownLlmProfile(_)) => {
+                        return Err(
+                            invalid_input("selected provider profile does not exist").into()
+                        );
+                    }
+                    Err(error) => {
+                        if run_storage_repair(settings_repair_reason(&error)).await? {
+                            continue;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            match run_workspace(application, settings, initial_model.clone()).await {
                 Ok(reports) => break reports,
                 Err(error) => {
                     let Some(reason) = tui_storage_repair_reason(&error) else {
@@ -133,13 +163,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let store = open_default_store()?;
     let settings = SettingsService::open(store.clone())?;
     let display = settings.display_settings()?;
-    let explicit_solver = selected_model
-        .map(|model| ModelSelection::new(model, None, None))
-        .transpose()?;
-    let runtime = settings.resolve_one_shot(explicit_solver)?;
-    let auth = credentials.acquire()?;
-    let endpoint = chatgpt_subscription::connect("bone-agent", auth, show_login).await?;
-    let agent = AgentHost::new(endpoint).start(&workspace, runtime)?;
+    let runtime = settings.resolve_one_shot(initial_model)?;
+    let connector = ProviderConnector::new();
+    let host = connector.connect_agent(&runtime, show_login).await?;
+    let agent = host.start(&workspace, runtime.agent.clone())?;
     let event_log = match arguments.events {
         Some(path) => {
             let file = match tokio::fs::OpenOptions::new()
@@ -174,6 +201,232 @@ async fn run() -> Result<(), Box<dyn Error>> {
     result?;
     logged?;
     Ok(())
+}
+
+fn initial_model_selection(
+    model: Option<String>,
+    profile: Option<String>,
+) -> io::Result<Option<ModelSelection>> {
+    if profile.is_some() && model.is_none() {
+        return Err(invalid_input(
+            "--profile or BONE_PROFILE requires --model or BONE_MODEL",
+        ));
+    }
+    model
+        .map(|model| {
+            let profile = profile
+                .map(|profile| {
+                    LlmProfileId::new(profile)
+                        .map_err(|_| invalid_input("--profile requires a valid profile ID"))
+                })
+                .transpose()?
+                .unwrap_or_else(LlmProfileId::chatgpt);
+            ModelSelection::new(profile, model, None, None)
+                .map_err(|_| invalid_input("--model requires a model ID"))
+        })
+        .transpose()
+}
+
+fn run_credentials(command: &CredentialsCommand) -> Result<(), Box<dyn Error>> {
+    let profile_id = LlmProfileId::new(command.profile.clone())
+        .map_err(|_| invalid_input("credentials requires a valid profile ID"))?;
+    let store = open_default_store()
+        .map_err(|_| io::Error::other("provider profile settings are unavailable"))?;
+    let settings = SettingsService::open(store).map_err(credential_settings_error)?;
+    let profile = settings
+        .llm_profile(&profile_id)
+        .map_err(credential_settings_error)?;
+    if matches!(&profile.endpoint, EndpointConfig::ChatGptSubscription) {
+        return Err(
+            invalid_input("ChatGPT subscription profiles use /login, not an API key").into(),
+        );
+    }
+    let credentials = ApiKeyCredentials::for_profile(&profile).map_err(credential_store_error)?;
+
+    match command.action {
+        CredentialsAction::Set => {
+            require_credential_terminal()?;
+            let api_key = prompt_for_api_key()?;
+            credentials.save(&api_key).map_err(credential_store_error)?;
+            eprintln!("API key saved for profile `{}`.", profile.id);
+        }
+        CredentialsAction::Clear => {
+            credentials.clear().map_err(credential_store_error)?;
+            eprintln!("API key cleared for profile `{}`.", profile.id);
+        }
+    }
+    Ok(())
+}
+
+/// Manage the non-secret endpoint profile catalog from a shell. API keys stay
+/// out of this path and must still be entered through the masked credential
+/// prompt.
+fn run_provider(command: &ProviderCliCommand) -> Result<(), Box<dyn Error>> {
+    let store = open_default_store()
+        .map_err(|_| io::Error::other("provider profile settings are unavailable"))?;
+    let settings = SettingsService::open(store)
+        .map_err(|_| io::Error::other("provider profile settings are unavailable"))?;
+    match &command.action {
+        ProviderCliAction::List => {
+            for profile in settings.llm_profiles()?.profiles {
+                println!("{}\t{}", profile.id, profile_description(&profile.endpoint));
+            }
+        }
+        ProviderCliAction::Add {
+            id,
+            protocol,
+            base_url,
+        } => {
+            let id =
+                LlmProfileId::new(id.clone()).map_err(|error| invalid_input(error.to_string()))?;
+            let endpoint = match protocol {
+                ProviderCliProtocol::OpenAiResponses => EndpointConfig::OpenAiResponses {
+                    base_url: base_url.clone(),
+                },
+                ProviderCliProtocol::OpenAiChatCompletions => {
+                    EndpointConfig::OpenAiChatCompletions {
+                        base_url: base_url.clone(),
+                    }
+                }
+                ProviderCliProtocol::AnthropicMessages => EndpointConfig::AnthropicMessages {
+                    base_url: base_url.clone(),
+                },
+            };
+            let profile = LlmProfile::new(id.clone(), id.as_str(), endpoint)
+                .map_err(|error| invalid_input(error.to_string()))?;
+            settings
+                .add_llm_profile(profile)
+                .map_err(|error| invalid_input(error.to_string()))?;
+            println!(
+                "Saved provider profile `{id}`. Set its API key with `bone credentials set {id}`."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn profile_description(endpoint: &EndpointConfig) -> &'static str {
+    match endpoint {
+        EndpointConfig::ChatGptSubscription => "chatgpt-subscription",
+        EndpointConfig::OpenAiResponses { .. } => "openai-responses",
+        EndpointConfig::OpenAiChatCompletions { .. } => "openai-chat-completions",
+        EndpointConfig::AnthropicMessages { .. } => "anthropic-messages",
+    }
+}
+
+fn credential_settings_error(error: SettingsError) -> io::Error {
+    match error {
+        SettingsError::UnknownLlmProfile(_) => invalid_input("provider profile does not exist"),
+        _ => io::Error::other("provider profile settings are unavailable"),
+    }
+}
+
+fn credential_store_error(_error: ApiKeyCredentialError) -> io::Error {
+    io::Error::other("API-key credential storage is unavailable")
+}
+
+fn require_credential_terminal() -> io::Result<()> {
+    if io::stdin().is_terminal() && io::stderr().is_terminal() {
+        Ok(())
+    } else {
+        Err(invalid_input(
+            "credentials set requires an interactive terminal; API keys are never accepted as arguments",
+        ))
+    }
+}
+
+fn prompt_for_api_key() -> io::Result<ApiKey> {
+    let mut stderr = io::stderr();
+    write!(stderr, "API key: ")?;
+    stderr.flush()?;
+
+    let terminal_input = match TerminalInput::enable(&mut stderr) {
+        Ok(terminal_input) => terminal_input,
+        Err(error) => {
+            writeln!(stderr)?;
+            return Err(error);
+        }
+    };
+    let input = read_masked_api_key(&mut stderr);
+    drop(terminal_input);
+    writeln!(stderr)?;
+    stderr.flush()?;
+
+    let input = input?;
+    ApiKey::new(input).map_err(|_| invalid_input("API key must not be empty"))
+}
+
+fn read_masked_api_key(stderr: &mut impl Write) -> io::Result<String> {
+    let mut input = String::new();
+    loop {
+        match event::read()? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                match key.code {
+                    KeyCode::Enter => return Ok(input),
+                    KeyCode::Esc => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "API-key input cancelled",
+                        ));
+                    }
+                    KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "API-key input cancelled",
+                        ));
+                    }
+                    KeyCode::Backspace => {
+                        if input.pop().is_some() {
+                            write!(stderr, "\x08 \x08")?;
+                            stderr.flush()?;
+                        }
+                    }
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        input.push(character);
+                        write!(stderr, "*")?;
+                        stderr.flush()?;
+                    }
+                    _ => {}
+                }
+            }
+            Event::Paste(text) => {
+                for character in text
+                    .chars()
+                    .filter(|character| !matches!(character, '\r' | '\n'))
+                {
+                    input.push(character);
+                    write!(stderr, "*")?;
+                }
+                stderr.flush()?;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Restores both input modes even when reading or validating the key fails.
+struct TerminalInput;
+
+impl TerminalInput {
+    fn enable(stderr: &mut impl Write) -> io::Result<Self> {
+        enable_raw_mode()?;
+        if let Err(error) = execute!(stderr, EnableBracketedPaste) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalInput {
+    fn drop(&mut self) {
+        let _ = execute!(io::stderr(), DisableBracketedPaste);
+        let _ = disable_raw_mode();
+    }
 }
 
 fn settings_repair_reason(_error: &SettingsError) -> &'static str {
@@ -358,14 +611,62 @@ fn show(notice: &Notice, display: &TuiDisplaySettings) {
 struct Arguments {
     help: bool,
     model: Option<String>,
+    profile: Option<String>,
     events: Option<PathBuf>,
     message: String,
+    credentials: Option<CredentialsCommand>,
+    provider: Option<ProviderCliCommand>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CredentialsAction {
+    Set,
+    Clear,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CredentialsCommand {
+    action: CredentialsAction,
+    profile: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderCliProtocol {
+    OpenAiResponses,
+    OpenAiChatCompletions,
+    AnthropicMessages,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProviderCliAction {
+    List,
+    Add {
+        id: String,
+        protocol: ProviderCliProtocol,
+        base_url: Option<String>,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ProviderCliCommand {
+    action: ProviderCliAction,
 }
 
 impl Arguments {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, std::io::Error> {
+        let mut args = args.into_iter().peekable();
+        if args
+            .peek()
+            .is_some_and(|argument| argument == "credentials")
+        {
+            args.next();
+            return Self::parse_credentials(args);
+        }
+        if args.peek().is_some_and(|argument| argument == "provider") {
+            args.next();
+            return Self::parse_provider(args);
+        }
         let mut parsed = Self::default();
-        let mut args = args.into_iter();
         while let Some(argument) = args.next() {
             match argument.as_str() {
                 "-h" | "--help" => {
@@ -383,6 +684,18 @@ impl Arguments {
                         return Err(invalid_input("--model requires a model ID"));
                     }
                     parsed.model = Some(model.trim().to_owned());
+                }
+                "--profile" => {
+                    if parsed.profile.is_some() {
+                        return Err(invalid_input("--profile may be provided only once"));
+                    }
+                    let profile = args
+                        .next()
+                        .ok_or_else(|| invalid_input("--profile requires a profile ID"))?;
+                    if profile.trim().is_empty() || profile.starts_with('-') {
+                        return Err(invalid_input("--profile requires a profile ID"));
+                    }
+                    parsed.profile = Some(profile.trim().to_owned());
                 }
                 "--events" => {
                     if parsed.events.is_some() {
@@ -414,6 +727,108 @@ impl Arguments {
         }
         Ok(parsed)
     }
+
+    fn parse_credentials(mut args: impl Iterator<Item = String>) -> Result<Self, std::io::Error> {
+        let Some(action) = args.next() else {
+            return Err(invalid_input(
+                "credentials requires `set <profile>` or `clear <profile>`",
+            ));
+        };
+        if matches!(action.as_str(), "-h" | "--help") {
+            if args.next().is_some() {
+                return Err(invalid_input("credentials help does not accept arguments"));
+            }
+            return Ok(Self {
+                help: true,
+                ..Self::default()
+            });
+        }
+        let action = match action.as_str() {
+            "set" => CredentialsAction::Set,
+            "clear" => CredentialsAction::Clear,
+            _ => {
+                return Err(invalid_input(
+                    "credentials requires `set <profile>` or `clear <profile>`",
+                ));
+            }
+        };
+        let profile = args
+            .next()
+            .ok_or_else(|| invalid_input("credentials requires a profile ID"))?;
+        if profile.trim().is_empty() || profile.starts_with('-') || args.next().is_some() {
+            return Err(invalid_input(
+                "credentials accepts only an action and profile; API keys are entered interactively",
+            ));
+        }
+        Ok(Self {
+            credentials: Some(CredentialsCommand {
+                action,
+                profile: profile.trim().to_owned(),
+            }),
+            ..Self::default()
+        })
+    }
+
+    fn parse_provider(mut args: impl Iterator<Item = String>) -> Result<Self, std::io::Error> {
+        let Some(action) = args.next() else {
+            return Err(invalid_input(
+                "provider requires `list` or `add <id> <responses|chat|anthropic> [https-url]`",
+            ));
+        };
+        if matches!(action.as_str(), "-h" | "--help") {
+            if args.next().is_some() {
+                return Err(invalid_input("provider help does not accept arguments"));
+            }
+            return Ok(Self {
+                help: true,
+                ..Self::default()
+            });
+        }
+        let command = match action.as_str() {
+            "list" if args.next().is_none() => ProviderCliCommand {
+                action: ProviderCliAction::List,
+            },
+            "add" => {
+                let id = args.next().ok_or_else(|| {
+                    invalid_input(
+                        "provider add requires <id> <responses|chat|anthropic> [https-url]",
+                    )
+                })?;
+                let protocol = match args.next().as_deref() {
+                    Some("responses") => ProviderCliProtocol::OpenAiResponses,
+                    Some("chat") => ProviderCliProtocol::OpenAiChatCompletions,
+                    Some("anthropic") => ProviderCliProtocol::AnthropicMessages,
+                    _ => {
+                        return Err(invalid_input(
+                            "provider protocol must be responses, chat, or anthropic",
+                        ));
+                    }
+                };
+                let base_url = args.next();
+                if args.next().is_some() {
+                    return Err(invalid_input(
+                        "provider add accepts one optional HTTPS base URL",
+                    ));
+                }
+                ProviderCliCommand {
+                    action: ProviderCliAction::Add {
+                        id,
+                        protocol,
+                        base_url,
+                    },
+                }
+            }
+            _ => {
+                return Err(invalid_input(
+                    "provider requires `list` or `add <id> <responses|chat|anthropic> [https-url]`",
+                ));
+            }
+        };
+        Ok(Self {
+            provider: Some(command),
+            ..Self::default()
+        })
+    }
 }
 
 fn invalid_input(message: impl Into<String>) -> std::io::Error {
@@ -428,10 +843,17 @@ Run BONE in the current launch-directory workspace.
 Usage:
   bone                         Start the multi-session terminal workspace
   bone <message>               Complete one request, then shut down
-  bone --model <id>            Select the first interactive session's solver
+  bone --model <id>            Select the first interactive session's solver from the default profile
+  bone --profile <id> --model <id>  Select a saved provider profile and model
   bone --model <id> <message>  Select the one-shot solver
+  bone --profile <id> --model <id> <message>  Select a saved provider in one-shot mode
   bone --events <path> <message>  Write one session's live events as JSON Lines
   bone -- <message>            Treat the remaining arguments as task text
+  bone provider list            List saved provider profiles
+  bone provider add <id> <responses|chat|anthropic> [https-url]
+                                Save a non-secret API-key provider profile
+  bone credentials set <profile>    Prompt for an API key and save it securely
+  bone credentials clear <profile>  Remove a saved API key
 
 Interactive use:
   Start BONE from the directory you intend to work in. That exact directory is
@@ -440,10 +862,22 @@ Interactive use:
   No .bone directory is created in your project.
 
   First choose a model in the TUI:
-    /model <id>                current conversation
-    /model default <id>        current Workspace default
-    /model global <id>         user-wide default
+    /provider                 list saved profiles
+    /provider add <id> <responses|chat|anthropic> [https-url]
+    /model [profile] <id> [controls]
+                               current conversation
+    /model default [profile] <id> [controls]
+                               current Workspace default
+    /model global [profile] <id> [controls]
+                               user-wide default
+    /model coordinator [profile] <id> [controls]
+                               user-wide coordinator
     /model inherit             remove current conversation override
+
+  Controls: --timeout <seconds>; for OpenAI Responses profiles only,
+  --reasoning-effort <none|minimal|low|medium|high|xhigh|max>,
+  --reasoning-summary <auto|concise|detailed>, --reasoning-mode pro, and
+  --reasoning-context <auto|all_turns|current_turn>.
 
   A typed one-line /command is local. Pasted or multiline text is always a
   normal model-visible message. Write //text to send slash-prefixed text.
@@ -454,6 +888,7 @@ Session and setup commands:
   /new, /sessions, /resume     Create or navigate saved conversations
   /rename <title>, /archive    Organize the current conversation
   /login                       Connect or retry model authorization
+  /logout                      Remove the local ChatGPT login cache when unused
   /config, /config doctor      Open settings guidance or inspect storage state
 
 Keyboard:
@@ -468,8 +903,12 @@ Keyboard:
 
 Authentication:
   /login starts the ChatGPT device authorization flow when needed. Keep its code
-  private. BONE stores its SQLite data in a private user-data area and Rig's
-  provider-managed ChatGPT cache in a separate private config area.
+  private. For a saved API-key profile, first create it with `bone provider add`
+  (or `/provider add` in the TUI), then use `bone credentials set <profile>`;
+  BONE prompts without echoing the key and stores it in the operating system's
+  credential manager, not SQLite. BONE stores its SQLite data in a private
+  user-data area and Rig's provider-managed ChatGPT cache in a separate private
+  config area.
 
 Configuration application:
   Settings are persisted immediately and model selection follows Session >
@@ -477,6 +916,8 @@ Configuration application:
   created, so an already attached runtime keeps its model. New conversations and
   future recreated runtimes use the saved selection; per-turn hot switching is
   not claimed by this version.
+  --profile and --model override BONE_PROFILE and BONE_MODEL independently;
+  a profile always requires a model.
 
   No BONE configuration file needs to be created or edited. The first launch
   creates the private store automatically; choose a model in the TUI before
@@ -500,8 +941,9 @@ mod tests {
     use std::{future::Future, pin::Pin, sync::Arc};
 
     use super::{
-        Arguments, TuiDisplaySettings, TuiError, one_shot, settings_repair_reason,
-        tui_storage_repair_reason, workspace_repair_reason,
+        Arguments, CredentialsAction, CredentialsCommand, ProviderCliAction, ProviderCliCommand,
+        ProviderCliProtocol, TuiDisplaySettings, TuiError, initial_model_selection, one_shot,
+        settings_repair_reason, tui_storage_repair_reason, workspace_repair_reason,
     };
     use bone_agent::{
         Autonomy, JobContext, JobOutcome, ModelInput, ModelPort, Next, Notice, RecordKind, Runtime,
@@ -579,6 +1021,110 @@ mod tests {
             Arguments::parse(["--", "--model", "task-text-model"].map(str::to_owned)).unwrap();
         assert!(args.model.is_none());
         assert_eq!(args.message, "--model task-text-model");
+    }
+
+    #[test]
+    fn credentials_commands_accept_only_an_action_and_profile() {
+        let arguments =
+            Arguments::parse(["credentials", "set", "openai"].map(str::to_owned)).unwrap();
+        assert_eq!(
+            arguments.credentials,
+            Some(CredentialsCommand {
+                action: CredentialsAction::Set,
+                profile: "openai".into(),
+            })
+        );
+        assert!(arguments.message.is_empty());
+
+        let clear =
+            Arguments::parse(["credentials", "clear", "anthropic"].map(str::to_owned)).unwrap();
+        assert_eq!(
+            clear.credentials,
+            Some(CredentialsCommand {
+                action: CredentialsAction::Clear,
+                profile: "anthropic".into(),
+            })
+        );
+
+        for arguments in [
+            vec!["credentials"],
+            vec!["credentials", "set"],
+            vec!["credentials", "unknown", "openai"],
+            vec!["credentials", "set", "openai", "never-an-api-key-argument"],
+        ] {
+            assert!(Arguments::parse(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_commands_create_a_headless_profile_setup_path() {
+        let list = Arguments::parse(["provider", "list"].map(str::to_owned)).unwrap();
+        assert_eq!(
+            list.provider,
+            Some(ProviderCliCommand {
+                action: ProviderCliAction::List,
+            })
+        );
+
+        let add = Arguments::parse(
+            [
+                "provider",
+                "add",
+                "work-openai",
+                "responses",
+                "https://gateway.example/v1",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            add.provider,
+            Some(ProviderCliCommand {
+                action: ProviderCliAction::Add {
+                    id: "work-openai".into(),
+                    protocol: ProviderCliProtocol::OpenAiResponses,
+                    base_url: Some("https://gateway.example/v1".into()),
+                },
+            })
+        );
+
+        for arguments in [
+            vec!["provider"],
+            vec!["provider", "list", "extra"],
+            vec!["provider", "add", "openai"],
+            vec!["provider", "add", "openai", "unknown"],
+            vec!["provider", "add", "openai", "responses", "one", "two"],
+        ] {
+            assert!(Arguments::parse(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn profile_selection_is_explicit_and_defaults_to_chatgpt() {
+        let arguments = Arguments::parse(
+            ["--profile", "openai", "--model", "gpt-5.4", "Investigate"].map(str::to_owned),
+        )
+        .unwrap();
+        let selection = initial_model_selection(arguments.model, arguments.profile)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection.profile.as_str(), "openai");
+        assert_eq!(selection.model, "gpt-5.4");
+
+        let default = initial_model_selection(Some("gpt-5.4".into()), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(default.profile.as_str(), "chatgpt");
+        assert!(initial_model_selection(None, Some("openai".into())).is_err());
+    }
+
+    #[test]
+    fn only_the_first_positional_credentials_word_selects_the_credential_utility() {
+        let arguments =
+            Arguments::parse(["Describe", "credentials", "set", "openai"].map(str::to_owned))
+                .unwrap();
+        assert!(arguments.credentials.is_none());
+        assert_eq!(arguments.message, "Describe credentials set openai");
     }
 
     #[test]

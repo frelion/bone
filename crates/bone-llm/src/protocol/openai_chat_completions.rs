@@ -10,7 +10,10 @@ use rig_core::{
     client::CompletionClient, http_client::HttpClientExt, providers::openai as rig_openai,
 };
 
-use crate::{ConfigError, Endpoint, Protocol, protocol::validate_base_url};
+use crate::{
+    ConfigError, Endpoint, Protocol,
+    protocol::{no_redirect_http_client, validate_base_url},
+};
 
 /// Configure the official OpenAI Chat Completions endpoint.
 pub fn official(
@@ -20,8 +23,11 @@ pub fn official(
     let api_key = api_key.into();
     validate_api_key(&api_key)?;
 
-    let client =
-        rig_openai::CompletionsClient::new(api_key).map_err(|_| ConfigError::InvalidApiKey)?;
+    let client = rig_openai::CompletionsClient::builder()
+        .api_key(api_key)
+        .http_client(no_redirect_http_client()?)
+        .build()
+        .map_err(|_| ConfigError::InvalidApiKey)?;
     from_client(endpoint_id, client)
 }
 
@@ -31,12 +37,7 @@ pub fn compatible(
     api_key: impl Into<String>,
     base_url: impl Into<String>,
 ) -> Result<Endpoint, ConfigError> {
-    compatible_with_http_client(
-        endpoint_id,
-        api_key,
-        base_url,
-        rig_core::http_client::ReqwestClient::default(),
-    )
+    compatible_with_http_client(endpoint_id, api_key, base_url, no_redirect_http_client()?)
 }
 
 fn compatible_with_http_client<H>(

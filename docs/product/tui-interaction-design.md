@@ -12,11 +12,11 @@
 >
 > 本节是当前 TUI 的生效交互/架构边界，优先于后文保留的 Settings Center 与高级交互草图。设置、Workspace、Session、草稿、状态和 event history 都通过一个 SQLite `BoneStore` 保存：`$XDG_DATA_HOME/bone/store-v1/bone.sqlite3`，无 XDG 时为 `~/.local/share/bone/store-v1/bone.sqlite3`。普通用户不查看、编辑或恢复持久化文件；BONE 不再有 `bone-config`、`ConfigManager`、`ConfigSection`、`ConfigTool`、`BONE_CONFIG`、`BONE_STATE_DIR` 或 `credential_root`。
 >
-> 当前 TUI 的设置入口是 `/model <id>`、`/model default <id>`、`/model global <id>` 与 `/model inherit`。它们分别写入 Session override、Workspace default、User default，解析顺序为 **Session > Workspace > User**。写入成功代表 SQLite 已保存；已经 attached 的 runtime 仍使用它启动时的 immutable `ResolvedAgentRuntimeConfig`，直到新建或重建 runtime 才采用新值。不要把后文的 `/config`、Settings Center、`Desired/Effective/LKG`、`TurnConfig revision`、watcher、apply acknowledgement 或热切换描述为当前功能。
+> 当前 TUI 的设置入口是 `/provider`、`/provider add`、`/model [profile] <id>`、`/model default`、`/model global`、`/model coordinator` 与 `/model inherit`。Profile 目录只保存 ID、协议和 HTTPS endpoint；API key 位于系统 credential manager，内建 `chatgpt` profile 使用 ChatGPT OAuth。Solver 分别写入 Session override、Workspace default、User default，解析顺序为 **Session > Workspace > User**；未显式设置 Coordinator 时跟随有效 Solver。省略 profile 明确选择 built-in `chatgpt`。写入成功代表 SQLite 已保存；已经 attached 的 runtime 仍使用它启动时的 immutable `ResolvedAgentRuntimeConfig`，直到新建或重建 runtime 才采用新值。不要把后文的 `/config`、Settings Center、`Desired/Effective/LKG`、`TurnConfig revision`、watcher、apply acknowledgement 或热切换描述为当前功能。
 >
 > 每个 accepted user turn 在同一个 SQLite transaction 中写入 `UserTurnAccepted` event 与 Session summary/state；commit 失败不能清 Composer 或启动 Agent。Session writer ownership 用 fail-fast OS lease，冲突 Session 只读/Busy。SQLite corruption、权限错误或 schema mismatch 不自动 reset。ChatGPT OAuth 是唯一 JSON 例外，位于 `$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/store-v1/providers/chatgpt-subscription/`），由 Rig 管理 payload，App 仅持有 `ChatGptAuthLease`。有活跃 Endpoint/Model lease 时 `/logout` 返回 Busy。
 >
-> one-shot 的 `--model` / `BONE_MODEL` 是仅本次调用的 ephemeral override，不创建或持久化 `SessionRecord`；`--events` JSONL 仅作观察导出。后文涉及 one-shot durable Session 的内容是未来设计。
+> one-shot 的 `--profile` / `--model` / `BONE_PROFILE` / `BONE_MODEL` 是仅本次调用的 ephemeral override；显式 selection 同时供应 coordinator 和 solver，不创建或持久化 `SessionRecord`；`--events` JSONL 仅作观察导出。后文涉及 one-shot durable Session 的内容是未来设计。
 
 ## 1. 设计结论
 
@@ -170,7 +170,7 @@ Push Overlay 时保存当前 `FocusToken`；Pop 时先恢复该 token。若原�
 
 ## 5. 主工作台与后续交互草图
 
-> 本节至第 21 节保留为未来 UI 设计素材。除非第 0 节或当前命令实现明确说明，否则其中的 Settings Center、Model Picker、catalog、`Desired/Effective/LKG`、自动 apply、跨进程刷新、one-shot durable Session 和接管流程均不是当前功能。当前实现只承诺 `/model` 的三层持久化、pinned runtime、SQLite repair/error 和 provider-lease Busy 语义。
+> 本节至第 21 节保留为未来 UI 设计素材。除非第 0 节或当前命令实现明确说明，否则其中的 Settings Center、Model Picker、catalog、`Desired/Effective/LKG`、自动 apply、跨进程刷新、one-shot durable Session 和接管流程均不是当前功能。当前实现只承诺 profile catalog、`/model` 的三层持久化、pinned runtime、SQLite repair/error 和 provider-lease Busy 语义；下方 ChatGPT-only 文案仅是未来 OAuth overlay 的示例，不代表唯一 provider。
 
 ### 5.1 宽屏：终端宽度 ≥ 110 列
 
@@ -285,7 +285,7 @@ Ready：
 ```text
                  连接模型账号后即可开始
 
-               [Enter 连接 ChatGPT]   [/model <id> 设置模型]
+               [Enter 连接已选模型]   [/provider 添加连接]
 
  ╭────────────────────────────────────────────────────────────╮
  │ 你仍然可以先写下任务…                                      │
@@ -304,7 +304,7 @@ Composer 必须一直存在，用户可以在设置完成前形成草稿。
 
                  先描述任务，也可以先完成设置
 
-          Enter 连接 ChatGPT      /model <id> 选择模型
+          Enter 连接已选模型      /provider 添加连接
 
  ╭────────────────────────────────────────────────────────────╮
  │ 修复当前项目的启动配置…                                    │
@@ -349,12 +349,12 @@ Composer 必须一直存在，用户可以在设置完成前形成草稿。
 │ 可用文件操作取决于你启用的工具和权限。                       │
 │ 每个对话都会固定绑定到这里。                                 │
 │                                                              │
-│ 开始前，请连接你的模型账号                                   │
+│ 开始前，请配置并连接模型服务                                 │
 │                                                              │
-│   ChatGPT                                                    │
-│   使用浏览器安全登录                                         │
+│   ChatGPT subscription 或已保存的 API-key profile            │
+│   使用 /provider、/model 和 /login 完成准备                  │
 │                                                              │
-│                 [ Enter  连接 ChatGPT ]                       │
+│                 [ Enter  连接已选模型 ]                       │
 │                                                              │
 │ /help 帮助      S 稍后设置      Ctrl-C 退出                  │
 └──────────────────────────────────────────────────────────────┘
@@ -364,9 +364,9 @@ Composer 必须一直存在，用户可以在设置完成前形成草稿。
 
 - 不展示“创建配置文件”；
 - 不要求选择文件路径；
-- 当前由用户以 `/model <id>` 提供模型；catalog/picker 是后续设计；
+- 当前由用户以 `/provider` 和 `/model [profile] <id>` 提供连接与模型；catalog/picker 是后续设计；
 - 不展示冗长多步向导；
-- 主要操作只有“连接 ChatGPT”；
+- 主要操作是“连接已选模型”；ChatGPT profile 需要设备登录，API-key profile 需要先通过 `bone credentials set <profile>` 保存 key；
 - “稍后设置”允许查看历史和设置，但不能假装模型已可用；
 - 当前工作目录清晰可见；
 - 只有已注册的工具能力可以出现在说明里；只读版本不能宣称会修改文件。
@@ -670,7 +670,7 @@ Agent 行为
   复制脱敏诊断
 ```
 
-P0 只有当前 ChatGPT Provider 时，Provider 与 Endpoint 在诊断中只读展示，不提供一个无效的切换控件。未来只有 ConnectionManager 注册了“可准备、验证、原子替换”的连接 profile descriptor 后，才可在高级设置中显示可编辑 Provider/Endpoint。未实现的写工具、主题或权限模式同理：隐藏或明确标记为不可用，不能保存一个没有消费者的值。
+当前 profile catalog 支持内建 ChatGPT subscription，以及通过 `/provider add` 创建的 OpenAI Responses、Chat Completions 和 Anthropic Messages API-key profile。Provider/endpoint 的创建是 create-only，避免把已保存 key 重定向到新 host；未来 Settings Center 若提供可视化编辑，必须复用同一 profile/credential 边界，不能引入第二套连接管理器。未实现的写工具、主题或权限模式同理：隐藏或明确标记为不可用，不能保存一个没有消费者的值。
 
 ### 8.3 窄屏
 

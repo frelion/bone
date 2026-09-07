@@ -2,12 +2,12 @@
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
+use bone_agent::ModelAdapter;
 use bone_agent::{
     AgentHandle, Autonomy, InputDisposition, InputReview, JobContext, JobOutcome, JobRequest,
     KernelConfig, Next, Notice, Operation, RecordKind, Runtime, RuntimeConfig, ToolCall,
     ToolEffect, ToolPort, ToolSpec, WorkResult,
 };
-use bone_agent::{Effort, ModelAdapter};
 use bone_llm::{Model, Protocol, testing};
 use rig_core::{
     completion::{
@@ -162,13 +162,7 @@ async fn keep_answers_busy_input_without_restarting_work_for_shared_or_separate_
         } else {
             separate_solver
         };
-        let agent = spawn(
-            Arc::new(
-                ModelAdapter::new(reviewer, solver)
-                    .with_efforts(Some(Effort::Low), Some(Effort::High)),
-            ),
-            vec![],
-        );
+        let agent = spawn(Arc::new(ModelAdapter::new(reviewer, solver)), vec![]);
         let mut notices = agent.subscribe();
         agent
             .post("Investigate the original requirement A")
@@ -180,20 +174,14 @@ async fn keep_answers_busy_input_without_restarting_work_for_shared_or_separate_
             receive(&mut work).await
         };
         assert_eq!(held.request.tools[0].name, "submit_work");
-        assert_eq!(
-            held.request.additional_params.as_ref().unwrap()["reasoning"]["effort"],
-            "high"
-        );
+        assert!(held.request.additional_params.is_none());
         let original = agent.snapshot().await.unwrap().work.unwrap();
         for question in ["status one", "status two", "status three"] {
             agent.post(question).await.unwrap();
             let review = receive(&mut reviews).await;
             assert_eq!(review.request.tools.len(), 1);
             assert_eq!(review.request.tools[0].name, "submit_input_review");
-            assert_eq!(
-                review.request.additional_params.as_ref().unwrap()["reasoning"]["effort"],
-                "low"
-            );
+            assert!(review.request.additional_params.is_none());
             let payload = review.payload();
             assert_eq!(payload["messages"][0]["text"], question);
             assert_eq!(

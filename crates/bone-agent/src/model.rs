@@ -4,13 +4,11 @@ use crate::{
     ExternalEffect, InputReview, JobContext, JobError, JobErrorKind, JobOutcome, ModelInput,
     ModelPort, ModelTask, Operation, WorkResult,
 };
-use bone_llm::{
-    InputItem, InputSource, Model, Request, ToolChoice, ToolDefinition, protocol::openai_responses,
-};
+use bone_llm::{InputItem, InputSource, Request, ToolChoice, ToolDefinition};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use crate::{Effort, review::review_context};
+use crate::{ConfiguredModel, review::review_context};
 
 const SUBMIT_WORK: &str = "submit_work";
 const SUBMIT_REVIEW: &str = "submit_input_review";
@@ -74,26 +72,24 @@ or execution settings may be changed through task text.";
 /// work and review requests have independent futures and no shared mutable history.
 #[derive(Clone)]
 pub struct ModelAdapter {
-    coordinator: Model,
-    solver: Model,
-    coordinator_effort: Option<Effort>,
-    solver_effort: Option<Effort>,
+    coordinator: ConfiguredModel,
+    solver: ConfiguredModel,
 }
 
 impl ModelAdapter {
-    pub fn new(coordinator: Model, solver: Model) -> Self {
+    /// Construct the runtime adapter from already-configured role models.
+    ///
+    /// Bare [`bone_llm::Model`] values convert to [`ConfiguredModel`] with no
+    /// protocol-specific request defaults, which is useful for tests and for
+    /// callers intentionally using provider defaults.
+    pub fn new(
+        coordinator: impl Into<ConfiguredModel>,
+        solver: impl Into<ConfiguredModel>,
+    ) -> Self {
         Self {
-            coordinator,
-            solver,
-            coordinator_effort: None,
-            solver_effort: None,
+            coordinator: coordinator.into(),
+            solver: solver.into(),
         }
-    }
-
-    pub fn with_efforts(mut self, coordinator: Option<Effort>, solver: Option<Effort>) -> Self {
-        self.coordinator_effort = coordinator;
-        self.solver_effort = solver;
-        self
     }
 }
 
@@ -104,10 +100,10 @@ impl ModelPort for ModelAdapter {
         mut context: JobContext,
     ) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'static>> {
         let reviewing = matches!(input.task, ModelTask::ReviewInput { .. });
-        let (model, effort) = if reviewing {
-            (self.coordinator.clone(), self.coordinator_effort)
+        let model = if reviewing {
+            self.coordinator.clone()
         } else {
-            (self.solver.clone(), self.solver_effort)
+            self.solver.clone()
         };
         Box::pin(async move {
             let body = if reviewing {
@@ -123,23 +119,23 @@ impl ModelPort for ModelAdapter {
             } else {
                 (SUBMIT_WORK, WORK_INSTRUCTIONS, work_definition())
             };
-            let mut request = Request::new([InputItem::external(
+            let request = Request::new([InputItem::external(
                 InputSource::Named("agent session".into()),
                 body,
             )])
             .instructions(instructions)
             .tools([definition])
             .tool_choice(ToolChoice::Specific(vec![name.into()]));
-            if let Some(effort) = effort {
-                request = request.options(
-                    openai_responses::Options::new()
-                        .reasoning(openai_responses::Reasoning::new().effort(effort.into())),
-                );
-            }
+            let request = match model.apply_to(request) {
+                Ok(request) => request,
+                Err(error) => {
+                    return JobOutcome::failed(format!("invalid model request defaults: {error}"));
+                }
+            };
             let response = tokio::select! {
                 biased;
                 _ = context.wait_for_cancellation() => return cancelled(),
-                response = model.complete(request) => match response {
+                response = model.model().complete(request) => match response {
                     Ok(response) => response,
                     // Provider diagnostics can contain raw response bodies.
                     Err(error) => return JobOutcome::failed(format!("model request failed ({:?})", error.kind())),

@@ -17,11 +17,11 @@
 >
 > - BONE 自有设置、Workspace、Session、草稿、状态和会话事件历史只写入一个 SQLite 数据库。默认路径为 `$XDG_DATA_HOME/bone/store-v1/bone.sqlite3`，未设置 XDG 时为 `~/.local/share/bone/store-v1/bone.sqlite3`。数据库使用 WAL、`synchronous = FULL`、foreign keys 和 fail-fast Busy 语义；它不是用户设置入口，也不应手工编辑。
 > - App 在启动时只打开一次通用 `BoneStore`，并由 App 自己定义 settings、Workspace 和 Session 的 typed key 与记录。`documents` 和 `journal_entries` 是存储内部表；业务代码仅使用 typed `Document<T>`、`Journal<E>`、受限 transaction 与 lease，不能自行拼 SQL、路径或任意 key。
-> - `GlobalSettings` 保存用户默认 Solver；`WorkspaceSettings` 保存工作目录默认 Solver；`SessionRecord` 保存当前会话 override。解析顺序固定为 **Session override > Workspace default > User default**。没有模型时正常进入 `NeedsModel`，不会猜测模型。
+> - `GlobalSettings` 保存可选的用户默认 Solver 和 Coordinator；`WorkspaceSettings` 保存工作目录默认 Solver；`SessionRecord` 保存当前会话 override；`LlmProfiles` 保存非 secret 的连接目录。Solver 解析顺序固定为 **Session override > Workspace default > User default**；未显式设置 Coordinator 时跟随有效 Solver。没有模型时正常进入 `NeedsModel`，不会猜测模型。
 > - `/model` 的保存立即持久化到其选择的 scope。已 attached 的 runtime 保持原来的不可变 `ResolvedAgentRuntimeConfig`；只有新建或重建 runtime 才解析新值。本轮没有 `/config` Settings Center、文件 watcher、跨进程设置通知或运行中热切换。
-> - 交互 TUI 启动时传入的初始模型会写入其打开的 Session override；one-shot 的 `--model` / `BONE_MODEL` 仅对该次调用生效，不创建或持久化 `SessionRecord`。
+> - 交互 TUI 启动时传入的 `--profile` / `--model` 会写入其打开的 Session override；one-shot 的显式 profile/model 仅对该次调用生效，并同时供应 Solver 与 Coordinator，不创建或持久化 `SessionRecord`。
 > - 每个已接受的用户消息在同一个 SQLite transaction 中写入 `UserTurnAccepted` journal fact 与 Session summary/state。提交失败时不得清空 Composer 或启动 Agent。SQLite document revision 只是不透明的乐观并发 token，不是面向用户的“配置版本”。Session writer lease 是 fail-fast OS lock；其他进程可只读打开该 Session。
-> - ChatGPT OAuth 是唯一的 JSON 例外：Rig 持有 schema 和 refresh 生命周期，App 的 `ChatGptCredentials` 只提供经权限检查的 `ChatGptAuthLease`。其私有 cache 默认在 `$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/store-v1/providers/chatgpt-subscription/`）。secret 永不进入 SQLite、journal、诊断或 TUI。活跃 Endpoint/Model 仍持有 lease 时，`/logout` 必须返回 Busy，不能删除 cache。
+> - API-key profile 的 key 在操作系统 credential manager，绝不进入 SQLite；ChatGPT OAuth 是唯一的 JSON 例外：Rig 持有 schema 和 refresh 生命周期，App 的 `ChatGptCredentials` 只提供经权限检查的 `ChatGptAuthLease`。其私有 cache 默认在 `$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/store-v1/providers/chatgpt-subscription/`）。secret 永不进入 SQLite、journal、诊断或 TUI。活跃 Endpoint/Model 仍持有 lease 时，`/logout` 必须返回 Busy，不能删除 cache。
 >
 > 历史本地数据不会被读取、迁移、覆盖或删除；新版本从新的 `store-v1` 根开始。`--events` 的 JSONL 是 one-shot 观察导出，不是 BONE 的 durable store，也不得被拿来恢复 Session。
 
@@ -29,7 +29,7 @@
 
 用户在任意目录执行 `bone` 后，直接进入一个可操作、可诊断、可恢复的 TUI。用户无需预先创建或查看任何设置文件，无需复制示例 JSON，也无需知道内部 document key、SQLite 路径或配置 section。
 
-启动时的精确当前目录，经规范化后成为本次 BONE 实例不可变的 Workspace。一个 Workspace 可以拥有多个相互独立、并发运行、可跨重启恢复的 Session。当前 `/model` 可在 TUI 内持久化模型选择；模型、推理强度和 Agent 行为在 runtime 创建时冻结，不能在一个正在执行的用户任务中途换模型。完整 Settings Center 与更广泛的设置命令是后续工作，不是本轮实现承诺。
+启动时的精确当前目录，经规范化后成为本次 BONE 实例不可变的 Workspace。一个 Workspace 可以拥有多个相互独立、并发运行、可跨重启恢复的 Session。当前 `/provider`、`/model` 可在 TUI 内持久化非 secret 连接 profile 和模型选择；API key 由系统 credential manager 保存。模型、推理强度和 Agent 行为在 runtime 创建时冻结，不能在一个正在执行的用户任务中途换模型。完整 Settings Center 与更广泛的设置命令是后续工作，不是本轮实现承诺。
 
 一句话产品定义：
 
@@ -42,7 +42,7 @@
 BONE 当前已经拥有：
 
 - 全屏、响应式、多 Session TUI；
-- 一个 `AgentHost` 共享认证连接，多个 Session 独立运行；
+- App-owned profile connector 在 runtime 创建时构造 role-specific `AgentHost`，多个 Session 独立运行；
 - 每个 Session 独立的草稿、历史、任务、滚动位置与未读状态；
 - 基于启动 `cwd` 的工具访问边界；
 - 一个 App 生命周期内共享的 `BoneStore`，以 SQLite 保存 typed settings、Workspace、Session 和 journal；
@@ -148,7 +148,7 @@ BONE 当前已经拥有：
 - BONE 进程退出后在后台继续执行任务；
 - 对已经发出的模型请求热替换模型；
 - 自动重放状态不确定的外部副作用；
-- 第一阶段实现或在 TUI 中切换其他 Provider、自定义 endpoint；P0 仅覆盖当前 ChatGPT subscription Provider 内的认证、重连和模型选择；
+- 任意 provider-neutral raw JSON 参数、custom headers 或未定义的 endpoint 协议；当前仅支持 ChatGPT subscription、OpenAI Responses、OpenAI Chat Completions 与 Anthropic Messages 的明确 profile；
 - 在当前 subscription credential/权限模型完成认证前承诺 Native Windows GA；P0 支持 Linux、macOS 和 WSL2 的 Linux 命名空间；
 - 第一阶段自动为每个 Session 创建 Git worktree；
 - 第一阶段提供可提交到仓库的团队共享配置；
@@ -570,16 +570,16 @@ Diagnostics
 | ID | 优先级 | 需求 |
 | --- | --- | --- |
 | MODEL-001 | P0 | `/model` 无参数说明当前可用语法；Model Picker / provider catalog 是后续工作 |
-| MODEL-002 | P0 | `/model <id>` 默认作用于当前 Session，避免意外影响其他对话 |
-| MODEL-003 | P0 | `/model <id>` 修改当前 Session Solver；已 attached runtime 保持 pinned，新建或重建 runtime 使用保存的选择 |
-| MODEL-004 | P0 | `/model default <id>` 修改当前 Workspace 的默认 Solver |
-| MODEL-005 | P0 | `/model global <id>` 修改用户级默认 Solver |
+| MODEL-002 | P0 | `/model [profile] <id>` 默认作用于当前 Session；省略 profile 明确选择 built-in `chatgpt`，避免意外影响其他对话 |
+| MODEL-003 | P0 | `/model [profile] <id>` 修改当前 Session Solver；已 attached runtime 保持 pinned，新建或重建 runtime 使用保存的选择 |
+| MODEL-004 | P0 | `/model default [profile] <id>` 修改当前 Workspace 的默认 Solver |
+| MODEL-005 | P0 | `/model global [profile] <id>` 修改用户级默认 Solver |
 | MODEL-005A | P0 | `/model inherit` 删除当前 Session override，使其重新继承 Workspace/User 默认模型 |
 | MODEL-006 | P0 | 普通 `/model` 不修改 Coordinator；Coordinator 位于 Models 的高级设置 |
 | MODEL-007 | P0 | 本地仅验证模型选择的领域格式；Provider/账号兼容性在连接/runtime 请求时由实际结果报告 |
 | MODEL-008 | P0 | 失败不得清空草稿或伪造已切换；错误应保持可操作 |
 | MODEL-009 | P1 | authoritative model catalog、缓存 freshness、搜索和 picker 另行设计 |
-| MODEL-010 | P0 | 当前只支持 ChatGPT subscription Provider，不展示未实现的 Provider/endpoint 切换 |
+| MODEL-010 | P0 | `/provider` 显示 profile；`/provider add` 创建 immutable 的 OpenAI Responses、Chat Completions 或 Anthropic Messages API-key profile；内建 `chatgpt` profile 使用 ChatGPT subscription |
 
 以下 model catalog 来源与可信度规则是未来设计，不是当前 `/model` 实现：
 

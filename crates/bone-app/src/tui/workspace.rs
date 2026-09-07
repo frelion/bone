@@ -7,10 +7,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    ChatGptCredentials, JournalRead, ModelSelection, SessionDraft, SessionLifecycle,
-    SessionStoreError, SettingsService, WorkspaceApplication,
+    CredentialError, JournalRead, ModelSelection, ProviderConnector, ResolvedRuntime, SessionDraft,
+    SessionLifecycle, SessionStoreError, SettingsService, WorkspaceApplication,
 };
-use bone_agent::{AgentHost, ResolvedAgentRuntimeConfig, ShutdownReport};
+use bone_agent::ShutdownReport;
+use bone_llm::EndpointConfig;
 use crossterm::event::EventStream;
 use futures_util::{StreamExt, future::join_all, stream::FuturesUnordered};
 use tokio::sync::mpsc;
@@ -18,12 +19,12 @@ use tokio::sync::mpsc;
 use super::{
     TuiError,
     app::{Action, App, AppEvent, UiSessionId},
-    command_effects::{CommandContext, handle_command},
+    command_effects::{CommandContext, CommandRuntimeEffect, handle_command},
     report_notice,
     runtime_driver::{
-        ConnectionTask, LiveSession, SessionUpdate, StartTask, apply_enqueued_pending_starts,
-        busy_session_ids, enqueue_connection, enqueue_pending_starts, observe_session,
-        persist_pending_retryable_statuses,
+        AuthenticationTask, LiveSession, RuntimeStartContext, SessionUpdate, StartTask,
+        apply_enqueued_pending_starts, busy_session_ids, enqueue_pending_start, observe_session,
+        persist_pending_retryable_statuses, start_chatgpt_authentication,
     },
     session_controller::{
         DurableUiSession, PendingRuntimeTurn, PreparedPost, accept_post, activate_writer_session,
@@ -39,8 +40,7 @@ use super::{
 pub async fn run_workspace(
     application: WorkspaceApplication,
     settings: SettingsService,
-    credentials: ChatGptCredentials,
-    initial_model: Option<String>,
+    initial_model: Option<ModelSelection>,
 ) -> Result<Vec<ShutdownReport>, TuiError> {
     // This is the product startup boundary for the selected conversation. The
     // writer stays in `durable` for the full runtime lifetime; it is not a
@@ -48,26 +48,25 @@ pub async fn run_workspace(
     let opened = application.open_or_create_writer_draft()?;
     let mut opened_writer = Some(opened.writer);
     let mut opened = opened.draft;
-    if let Some(model) = initial_model {
-        match ModelSelection::new(model, None, None) {
-            Ok(selection) => match opened_writer
-                .as_mut()
-                .expect("opened writer is retained")
-                .set_solver_model_override(Some(selection))
-            {
-                Ok(()) => {
-                    opened.record = opened_writer
-                        .as_ref()
-                        .expect("opened writer is retained")
-                        .record()
-                        .clone();
-                }
-                Err(error) => return Err(TuiError::SessionStore(error)),
-            },
-            Err(error) => return Err(TuiError::Input(error)),
+    if let Some(selection) = initial_model {
+        settings
+            .validate_model_selection(&selection)
+            .map_err(TuiError::Settings)?;
+        match opened_writer
+            .as_mut()
+            .expect("opened writer is retained")
+            .set_solver_model_override(Some(selection))
+        {
+            Ok(()) => {
+                opened.record = opened_writer
+                    .as_ref()
+                    .expect("opened writer is retained")
+                    .record()
+                    .clone();
+            }
+            Err(error) => return Err(TuiError::SessionStore(error)),
         }
     }
-
     let show_progress = settings.display_settings()?.show_progress;
     let listing = application.sessions().list()?;
     let mut app = App::new(application.workspace().display_root().display().to_string());
@@ -190,13 +189,20 @@ pub async fn run_workspace(
     // The complete resolved config used to construct each live runtime. A
     // current runtime cannot hot-swap its ModelAdapter, so this prevents us
     // from recording a new model while silently sending work to the old one.
-    let mut live_tasks = HashMap::<UiSessionId, ResolvedAgentRuntimeConfig>::new();
+    let mut live_tasks = HashMap::<UiSessionId, ResolvedRuntime>::new();
     let mut pending_tasks = HashMap::<UiSessionId, PendingRuntimeTurn>::new();
-    let mut host = None::<AgentHost>;
-    let mut connecting = FuturesUnordered::<ConnectionTask>::new();
+    let connector = ProviderConnector::new();
     let mut starting = FuturesUnordered::<StartTask>::new();
     let mut starting_ids = HashSet::<UiSessionId>::new();
+    let mut authentication = None::<AuthenticationTask>;
+    let mut authentication_retries = HashSet::<UiSessionId>::new();
     let workspace = application.workspace().canonical_root().to_path_buf();
+    let start_context = RuntimeStartContext {
+        application: &application,
+        connector: &connector,
+        login_tx: &login_tx,
+        workspace: &workspace,
+    };
 
     let ui_result: Result<(), TuiError> = async {
         let mut update_rx = update_rx;
@@ -362,7 +368,7 @@ pub async fn run_workspace(
                                                 let _ = app.reduce(AppEvent::RuntimeStartFailed {
                                                     id,
                                                     reason: format!(
-                                                        "Saved message was not delivered: {error}. Use /login to retry."
+                                                        "Saved message was not delivered: {error}. Check the selected profile credentials/settings, then use /login to retry."
                                                     ),
                                                 });
                                                 drop(live_sessions.swap_remove(index));
@@ -372,21 +378,19 @@ pub async fn run_workspace(
                                         pending_tasks
                                             .insert(id, accepted.pending_runtime_turn());
 
-                                        if let Some(host) = host.as_ref() {
-                                            let started = enqueue_pending_starts(
-                                                &application,
-                                                &mut durable,
-                                                &mut starting,
-                                                &mut starting_ids,
-                                                host,
-                                                &workspace,
-                                                &pending_tasks,
-                                            );
-                                            apply_enqueued_pending_starts(&mut app, started);
-                                        } else if connecting.is_empty() {
-                                            let _ = app.reduce(AppEvent::ConnectionStarting);
-                                            enqueue_connection(&mut connecting, credentials.clone(), login_tx.clone());
-                                        }
+                                        let pending = pending_tasks
+                                            .get(&id)
+                                            .expect("accepted turn was just made pending");
+                                        let _ = app.reduce(AppEvent::ConnectionStarting);
+                                        let started = enqueue_pending_start(
+                                            &start_context,
+                                            &mut durable,
+                                            &mut starting,
+                                            &mut starting_ids,
+                                            id,
+                                            pending,
+                                        );
+                                        apply_enqueued_pending_starts(&mut app, started);
                                     }
                                 }
                                 Err(message) => {
@@ -430,14 +434,13 @@ pub async fn run_workspace(
                             let _ = app.reduce(AppEvent::ComposerCleared { id });
                             let mut command_context = CommandContext {
                                 application: &application,
-                                credentials: &credentials,
                                 settings: &settings,
                                 durable: &mut durable,
                                 show_progress,
                                 next_ui_id: &mut next_ui_id,
                                 app: &mut app,
                             };
-                            let connect = handle_command(&mut command_context, id, command);
+                            let effect = handle_command(&mut command_context, id, command);
                             // `/resume` changes selection inside the command
                             // executor rather than the terminal reducer. Make
                             // its target writable (or visibly read-only)
@@ -460,27 +463,86 @@ pub async fn run_workspace(
                                     &busy_ids,
                                 );
                             }
-                            if connect {
-                                if let Some(host) = host.as_ref() {
-                                    let started = enqueue_pending_starts(
-                                        &application,
+                            match effect {
+                                CommandRuntimeEffect::None => {}
+                                CommandRuntimeEffect::RetryPending { id } => {
+                                    let Some(pending) = pending_tasks.get(&id) else {
+                                        report_notice(
+                                            &mut app,
+                                            "There is no saved message in this conversation to retry",
+                                        );
+                                        continue;
+                                    };
+                                    let _ = app.reduce(AppEvent::ConnectionStarting);
+                                    let started = enqueue_pending_start(
+                                        &start_context,
                                         &mut durable,
                                         &mut starting,
                                         &mut starting_ids,
-                                        host,
-                                        &workspace,
-                                        &pending_tasks,
+                                        id,
+                                        pending,
                                     );
                                     apply_enqueued_pending_starts(&mut app, started);
-                                } else if connecting.is_empty() {
-                                    let _ = app.reduce(AppEvent::ConnectionStarting);
-                                    enqueue_connection(&mut connecting, credentials.clone(), login_tx.clone());
+                                }
+                                CommandRuntimeEffect::AuthenticateChatGpt { id, profile } => {
+                                    authentication_retries.insert(id);
+                                    if authentication.is_none() {
+                                        let _ = app.reduce(AppEvent::ConnectionStarting);
+                                        authentication = Some(start_chatgpt_authentication(
+                                            connector.clone(),
+                                            profile,
+                                            login_tx.clone(),
+                                        ));
+                                    } else {
+                                        report_notice(
+                                            &mut app,
+                                            "ChatGPT authorization is already in progress; this conversation will retry when it completes",
+                                        );
+                                    }
+                                }
+                                CommandRuntimeEffect::LogoutChatGpt => {
+                                    let chatgpt_starting = authentication.is_some()
+                                        || starting_ids.iter().any(|id| {
+                                            pending_tasks
+                                                .get(id)
+                                                .is_some_and(|pending| {
+                                                    runtime_uses_chatgpt(&pending.runtime)
+                                                })
+                                        });
+                                    if chatgpt_starting {
+                                        report_notice(
+                                            &mut app,
+                                            "ChatGPT authorization or connection is still starting. Wait for it to finish, then run /logout again; other provider starts are unchanged.",
+                                        );
+                                    } else {
+                                        match connector.logout_chatgpt() {
+                                            Ok(()) => report_notice(
+                                                &mut app,
+                                                "Local ChatGPT sign-in cache removed. The next ChatGPT connection will require login.",
+                                            ),
+                                            Err(CredentialError::Busy) => report_notice(
+                                                &mut app,
+                                                "Cannot log out while an active runtime owns the ChatGPT connection. Stop it or exit BONE, then retry.",
+                                            ),
+                                            Err(CredentialError::Unavailable) => report_notice(
+                                                &mut app,
+                                                "Could not access the local ChatGPT sign-in cache. Run /config doctor and repair storage before retrying.",
+                                            ),
+                                        }
+                                    }
                                 }
                             }
                         }
                         Action::NewSession => {
                             let selected_before_new = app.current_id();
-                            create_session(&application, &mut durable, &mut app, show_progress, &mut next_ui_id, &settings);
+                            create_session(
+                                &application,
+                                &mut durable,
+                                &mut app,
+                                show_progress,
+                                &mut next_ui_id,
+                                &settings,
+                            );
                             let selected_after_new = app.current_id();
                             let acquired = durable
                                 .get(&selected_after_new)
@@ -498,59 +560,12 @@ pub async fn run_workspace(
                         Action::Quit => return Ok(()),
                     }
                 }
-                joined = connecting.next(), if !connecting.is_empty() => {
-                    let joined = joined.expect("a pending connection exists");
-                    match joined {
-                        Ok(Ok(connected)) => {
-                            let _ = app.reduce(AppEvent::ConnectionSucceeded);
-                            report_notice(&mut app, "Connected. Saved messages are starting now.");
-                            host = Some(connected.clone());
-                            let started = enqueue_pending_starts(
-                                &application,
-                                &mut durable,
-                                &mut starting,
-                                &mut starting_ids,
-                                &connected,
-                                &workspace,
-                                &pending_tasks,
-                            );
-                            apply_enqueued_pending_starts(&mut app, started);
-                        }
-                        Ok(Err(error)) => {
-                            let _ = app.reduce(AppEvent::ConnectionFailed {
-                                reason: format!(
-                                    "{error}. Saved messages are waiting for a connection; use /login to retry."
-                                ),
-                                affected: pending_tasks.keys().copied().collect(),
-                            });
-                            persist_pending_retryable_statuses(
-                                &application,
-                                &mut durable,
-                                &mut app,
-                                &pending_tasks,
-                            );
-                        }
-                        Err(error) => {
-                            let _ = app.reduce(AppEvent::ConnectionFailed {
-                                reason: format!(
-                                    "Connection task stopped: {error}. Saved messages are waiting for a connection; use /login to retry."
-                                ),
-                                affected: pending_tasks.keys().copied().collect(),
-                            });
-                            persist_pending_retryable_statuses(
-                                &application,
-                                &mut durable,
-                                &mut app,
-                                &pending_tasks,
-                            );
-                        }
-                    }
-                }
                 opened = starting.next(), if !starting.is_empty() => {
                     let joined = opened.expect("a pending runtime start exists");
                     match joined {
                         Ok((id, Ok((agent, observation)))) => {
                             starting_ids.remove(&id);
+                            let _ = app.reduce(AppEvent::ConnectionSucceeded);
                             let Some(pending_turn) = pending_tasks.get(&id).cloned() else {
                                 let _ = agent.shutdown().await;
                                 continue;
@@ -631,7 +646,7 @@ pub async fn run_workspace(
                                         let _ = app.reduce(AppEvent::RuntimeStartFailed {
                                             id,
                                             reason: format!(
-                                                "Saved message was not delivered: {error}. Use /login to retry."
+                                                "Saved message was not delivered: {error}. Complete the indicated credential setup, then use /login to retry."
                                             ),
                                         });
                                     }
@@ -647,10 +662,14 @@ pub async fn run_workspace(
                         }
                         Ok((id, Err(error))) => {
                             starting_ids.remove(&id);
+                            let _ = app.reduce(AppEvent::ConnectionFailed {
+                                reason: error.to_string(),
+                                affected: vec![id],
+                            });
                             let _ = app.reduce(AppEvent::RuntimeStartFailed {
                                 id,
                                 reason: format!(
-                                    "Saved message could not start: {error}. Use /login to retry."
+                                    "Saved message could not start: {error}. Complete the indicated credential setup, then use /login to retry."
                                 ),
                             });
                             if let Err(status_error) =
@@ -671,7 +690,7 @@ pub async fn run_workspace(
                             // /login and never changes durable turn facts.
                             starting_ids.clear();
                             let reason = format!(
-                                "Runtime startup task stopped: {error}. Use /login to retry."
+                                "Runtime startup task stopped: {error}. Complete the indicated credential setup, then use /login to retry."
                             );
                             for id in pending_tasks.keys().copied().collect::<Vec<_>>() {
                                 let _ = app.reduce(AppEvent::RuntimeStartFailed {
@@ -686,6 +705,64 @@ pub async fn run_workspace(
                                 &pending_tasks,
                             );
                             report_notice(&mut app, reason);
+                        }
+                    }
+                }
+                authentication_result = async {
+                    authentication
+                        .as_mut()
+                        .expect("authentication task exists while its select branch is enabled")
+                        .await
+                }, if authentication.is_some() => {
+                    let targets = std::mem::take(&mut authentication_retries);
+                    authentication = None;
+                    match authentication_result {
+                        Ok(Ok(())) => {
+                            let _ = app.reduce(AppEvent::ConnectionSucceeded);
+                            let mut retrying = false;
+                            for id in targets {
+                                let Some(pending) = pending_tasks.get(&id) else {
+                                    continue;
+                                };
+                                retrying = true;
+                                let started = enqueue_pending_start(
+                                    &start_context,
+                                    &mut durable,
+                                    &mut starting,
+                                    &mut starting_ids,
+                                    id,
+                                    pending,
+                                );
+                                apply_enqueued_pending_starts(&mut app, started);
+                            }
+                            if retrying {
+                                report_notice(
+                                    &mut app,
+                                    "ChatGPT authorization is ready; retrying the requested saved message",
+                                );
+                            } else {
+                                report_notice(&mut app, "ChatGPT authorization is ready");
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            let affected = targets
+                                .into_iter()
+                                .filter(|id| pending_tasks.contains_key(id))
+                                .collect();
+                            let _ = app.reduce(AppEvent::ConnectionFailed {
+                                reason: error,
+                                affected,
+                            });
+                        }
+                        Err(error) => {
+                            let affected = targets
+                                .into_iter()
+                                .filter(|id| pending_tasks.contains_key(id))
+                                .collect();
+                            let _ = app.reduce(AppEvent::ConnectionFailed {
+                                reason: format!("ChatGPT authorization task stopped: {error}"),
+                                affected,
+                            });
                         }
                     }
                 }
@@ -740,6 +817,17 @@ pub async fn run_workspace(
             }
         }
     }
+    .await;
+
+    // Tokio detaches a task when its JoinHandle is dropped. These starts and
+    // the device flow own credentials or a newly made runtime, so cancel and
+    // reap them before this TUI releases its live sessions and returns.
+    let _ = cancel_pending_connection_tasks(
+        &mut authentication,
+        &mut authentication_retries,
+        &mut starting,
+        &mut starting_ids,
+    )
     .await;
 
     // The runtime cannot survive this process. Snapshot each actor before
@@ -803,12 +891,44 @@ fn prepare_post_for_delivery(
     settings: &SettingsService,
     durable: &HashMap<UiSessionId, DurableUiSession>,
     id: UiSessionId,
-    live_runtime: Option<&ResolvedAgentRuntimeConfig>,
+    live_runtime: Option<&ResolvedRuntime>,
 ) -> Result<PreparedPost, String> {
     match live_runtime {
         Some(runtime) => Ok(PreparedPost::for_runtime(runtime.clone())),
         None => prepare_post(settings, durable, id),
     }
+}
+
+/// Abort and reap process-local connection effects. A task must not recreate
+/// `auth.json` after this TUI exits, and dropping a Tokio JoinHandle alone
+/// would detach it instead of cancelling it. Returns the saved turns whose
+/// start was cancelled so the caller can leave them explicitly retryable.
+async fn cancel_pending_connection_tasks(
+    authentication: &mut Option<AuthenticationTask>,
+    authentication_retries: &mut HashSet<UiSessionId>,
+    starting: &mut FuturesUnordered<StartTask>,
+    starting_ids: &mut HashSet<UiSessionId>,
+) -> Vec<UiSessionId> {
+    let cancelled = starting_ids.drain().collect();
+    authentication_retries.clear();
+    if let Some(task) = authentication.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    for task in &*starting {
+        task.abort();
+    }
+    while starting.next().await.is_some() {}
+    cancelled
+}
+
+fn runtime_uses_chatgpt(runtime: &ResolvedRuntime) -> bool {
+    [
+        &runtime.coordinator.profile.endpoint,
+        &runtime.solver.profile.endpoint,
+    ]
+    .into_iter()
+    .any(|endpoint| matches!(endpoint, EndpointConfig::ChatGptSubscription))
 }
 
 #[cfg(test)]
@@ -824,13 +944,12 @@ mod tests {
         reconcile_journal_summary, release_idle_writers_after_switch,
     };
     use crate::{
-        JournalFact, JournalRead, ModelSelection, RuntimeAttachment, SessionAttention,
-        SessionAvailability, SessionDraft, SessionExecution, SessionRecord, SettingsService,
-        TurnOutcome, WorkspaceApplication,
+        JournalFact, JournalRead, LlmProfile, ModelSelection, ResolvedModel, RuntimeAttachment,
+        SessionAttention, SessionAvailability, SessionDraft, SessionExecution, SessionRecord,
+        SettingSource, SettingsService, TurnOutcome, WorkspaceApplication,
     };
     use bone_agent::{
-        JobId, JobOutcome, ModelSettings, Notice, RecordEntry, RecordKind,
-        ResolvedAgentRuntimeConfig,
+        JobId, JobOutcome, Notice, RecordEntry, RecordKind, ResolvedAgentRuntimeConfig,
     };
     use bone_store::{BoneStore, StoreRoots};
     use bone_tools::ToolLimits;
@@ -903,23 +1022,29 @@ mod tests {
             .unwrap()
     }
 
-    fn test_runtime() -> ResolvedAgentRuntimeConfig {
-        ResolvedAgentRuntimeConfig::new(
-            ModelSettings {
-                model: "gpt-test".into(),
-                effort: None,
-                timeout_seconds: 120,
+    fn test_runtime() -> ResolvedRuntime {
+        let profile = LlmProfile::chatgpt_subscription();
+        let selection = ModelSelection::chatgpt("gpt-test", None).unwrap();
+        ResolvedRuntime {
+            coordinator: ResolvedModel {
+                selection: selection.clone(),
+                profile: profile.clone(),
+                source: SettingSource::User,
             },
-            ModelSettings {
-                model: "gpt-test".into(),
-                effort: None,
-                timeout_seconds: 120,
+            solver: ResolvedModel {
+                selection,
+                profile,
+                source: SettingSource::User,
             },
-            ToolLimits::default(),
-            std::time::Duration::from_secs(30),
-            std::time::Duration::from_secs(5),
-        )
-        .unwrap()
+            agent: ResolvedAgentRuntimeConfig::new(
+                ToolLimits::default(),
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(120),
+                std::time::Duration::from_secs(120),
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap(),
+        }
     }
 
     fn expected_runtime_fingerprint() -> String {
@@ -1061,14 +1186,14 @@ mod tests {
             .as_mut()
             .expect("fixture owns the writer")
             .set_solver_model_override(Some(
-                ModelSelection::new("newly-saved-model", None, None).unwrap(),
+                ModelSelection::chatgpt("newly-saved-model", None).unwrap(),
             ))
             .unwrap();
         session.record = session.writer.as_ref().unwrap().record().clone();
 
         let fresh =
             prepare_post_for_delivery(&fixture.settings, &fixture.durable, UI_ID, None).unwrap();
-        assert_eq!(fresh.runtime.solver().model, "newly-saved-model");
+        assert_eq!(fresh.runtime.solver.selection.model, "newly-saved-model");
         let pinned_fingerprint = pinned.fingerprint().to_string();
         let pinned_prepared =
             prepare_post_for_delivery(&fixture.settings, &fixture.durable, UI_ID, Some(&pinned))

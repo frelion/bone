@@ -8,12 +8,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    JournalFact, JournalRead, ModelResolution, RuntimeAttachment, SessionAttention,
-    SessionAvailability, SessionDraft, SessionExecution, SessionJournal, SessionLeaseError,
-    SessionLifecycle, SessionRecord, SessionStatus, SessionWriter, SettingsService, TurnOutcome,
-    WorkspaceApplication,
+    JournalFact, JournalRead, ModelResolution, ResolvedRuntime, RuntimeAttachment,
+    SessionAttention, SessionAvailability, SessionDraft, SessionExecution, SessionJournal,
+    SessionLeaseError, SessionLifecycle, SessionRecord, SessionStatus, SessionWriter,
+    SettingsService, TurnOutcome, WorkspaceApplication,
 };
-use bone_agent::{RecordEntry, ResolvedAgentRuntimeConfig, ShutdownReport};
+use bone_agent::{RecordEntry, ShutdownReport};
 
 use super::{
     app::{App, AppEvent, UiSessionId},
@@ -40,7 +40,7 @@ pub(super) struct DurableUiSession {
 }
 
 pub(super) struct PreparedPost {
-    pub(super) runtime: ResolvedAgentRuntimeConfig,
+    pub(super) runtime: ResolvedRuntime,
     pub(super) runtime_fingerprint: String,
 }
 
@@ -49,8 +49,8 @@ impl PreparedPost {
     /// turn. This is also used for an already-attached runtime: its adapter
     /// cannot hot-swap after `/model`, so subsequent turns must retain the
     /// old runtime's truthful attribution until it is recreated.
-    pub(super) fn for_runtime(runtime: ResolvedAgentRuntimeConfig) -> Self {
-        let runtime_fingerprint = runtime.fingerprint().to_string();
+    pub(super) fn for_runtime(runtime: ResolvedRuntime) -> Self {
+        let runtime_fingerprint = runtime.fingerprint();
         Self {
             runtime,
             runtime_fingerprint,
@@ -64,13 +64,13 @@ impl PreparedPost {
 #[derive(Clone)]
 pub(super) struct PendingRuntimeTurn {
     pub(super) turn: u64,
-    pub(super) runtime: ResolvedAgentRuntimeConfig,
+    pub(super) runtime: ResolvedRuntime,
     pub(super) runtime_fingerprint: String,
     pub(super) solver_model: String,
 }
 
 pub(super) struct AcceptedPost {
-    pub(super) runtime: ResolvedAgentRuntimeConfig,
+    pub(super) runtime: ResolvedRuntime,
     pub(super) text: String,
     pub(super) entry: crate::JournalEntry,
     pub(super) turn: u64,
@@ -302,7 +302,7 @@ pub(super) fn model_is_ready(settings: &SettingsService, record: &SessionRecord)
     settings
         .resolve_model(record)
         .ok()
-        .is_some_and(|resolution| matches!(resolution, ModelResolution::Ready { .. }))
+        .is_some_and(|resolution| matches!(resolution, ModelResolution::Ready(_)))
 }
 
 /// Lazily acquire a session writer, then rerun the same cold-start
@@ -503,7 +503,7 @@ pub(super) fn prepare_post(
         .resolve_model(&session.record)
         .map_err(|error| error.to_string())?;
     let runtime = resolution
-        .runtime_config()
+        .runtime()
         .cloned()
         .ok_or_else(|| "Choose a model with /model <id> before sending work".to_owned())?;
     Ok(PreparedPost::for_runtime(runtime))
@@ -529,7 +529,7 @@ pub(super) fn accept_post(
             "Conversation history is unavailable; BONE will not risk losing this message".to_owned()
         })?;
         let turn = session.next_turn;
-        let solver_model = prepared.runtime.solver().model.clone();
+        let solver_model = prepared.runtime.solver.selection.model.clone();
         let mut record = session.record.clone();
         record.draft = SessionDraft::empty();
         // Durable acceptance is not a runtime receipt. Even an attached agent

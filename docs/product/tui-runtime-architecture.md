@@ -43,25 +43,25 @@ nor background tasks mutate presentation state directly.
 | --- | --- | --- |
 | `bone-store` | one SQLite database, generic keyed documents/journals/leases | product models, key layout, OAuth payloads |
 | `bone-app::durable` | Workspace identity, Session records, journal facts, writer lease policy | JSON/JSONL files, a second session index |
-| `SettingsService` | typed settings validation and model overlay | runtime storage reads or provider credentials |
+| `SettingsService` | typed settings/profile validation and model overlay | runtime storage reads or provider credentials |
 | TUI reducer | deterministic presentation state | persistence, runtime handles, locks |
 | TUI effect driver | durable commands, login connection, runtime lifecycle | direct UI mutation |
-| `bone-agent` | immutable resolved runtime configuration and execution | user settings documents or local storage |
-| `bone-llm` / Rig | provider endpoint and OAuth refresh behavior | provider-root selection or cache deletion policy |
+| `bone-agent` | immutable Agent limits/deadlines and execution of injected role models | user settings documents, profiles, or local storage |
+| `bone-llm` / Rig | protocol adapters, endpoint construction, and OAuth refresh behavior | provider-profile persistence or cache deletion policy |
 
 ## Startup and composition
 
 The binary opens exactly one `BoneStore` for the application instance. It
 passes clones only to its Workspace and settings services; those App-owned
-services define the keys and typed records. It separately constructs the
-App-owned ChatGPT credential manager rather than letting feature crates
-discover a storage root.
+services define the keys and typed records. `ProviderConnector` opens the
+App-owned ChatGPT credential manager lazily only when a selected profile needs
+it, rather than letting feature crates discover a storage root.
 
 ```rust,ignore
 let store = open_default_store()?;
 let application = WorkspaceApplication::open_with_store(current_dir, store.clone())?;
 let settings = SettingsService::open(store.clone())?;
-let credentials = ChatGptCredentials::default_for_current_user()?;
+let connector = ProviderConnector::new();
 ```
 
 `bone-app::open_default_store` uses the XDG data root for BONE data:
@@ -120,9 +120,9 @@ following in one short SQLite `BEGIN IMMEDIATE` transaction:
 4. commit all changes together.
 
 The journal event records both the actual solver model and the SHA-256
-`runtime_fingerprint` from the same `ResolvedAgentRuntimeConfig` passed to the
-Agent. There is no raw whole-config hash and no later runtime-time reread that
-can drift from the durable fact.
+`runtime_fingerprint` from the same non-secret `ResolvedRuntime` plan that is
+used to construct its Agent models/configuration. There is no raw whole-config
+hash and no later runtime-time reread that can drift from the durable fact.
 
 Only after a successful commit does the effect report `TurnAccepted`; the
 reducer then projects the user message and clears the matching composer. If
@@ -151,8 +151,10 @@ fixed typed ownership:
 
 ```text
 GlobalSettings.agent.default_solver       user-wide default
+GlobalSettings.agent.coordinator          user-wide coordinator
 WorkspaceSettings.default_solver          Workspace default
 SessionRecord.solver_model_override       Session override
+LlmProfiles                               non-secret provider catalog
 ```
 
 Resolution is deterministic:
@@ -161,40 +163,64 @@ Resolution is deterministic:
 Session override > Workspace default > User default
 ```
 
-`/model <id>` saves the current Session override. `/model default <id>` saves
-the current Workspace default. `/model global <id>` saves the user default;
+`/provider add <id> <protocol> [https-url]` creates a non-secret profile.
+`/model [profile] <id> [controls]` saves the current Session solver override;
+`/model default` and `/model global` save the corresponding solver defaults;
+`/model coordinator [profile] <id>` saves the user-wide coordinator;
 `/model inherit` removes the current Session override. The UI refreshes its
-readiness immediately after each successful save. These settings govern a
-newly created or recreated runtime; an already attached runtime remains pinned
-to its existing immutable configuration. Runtime hot-switching is deliberately
+readiness immediately after each successful save. These settings govern a new
+or recreated runtime; an already attached runtime remains pinned to its
+existing immutable configuration. Runtime hot-switching is deliberately
 outside this architecture.
 
+For one-shot CLI use, an explicit `--profile` plus `--model` is a complete
+ephemeral role selection: it supplies both solver and coordinator, so it never
+silently requires a separately saved provider credential. Without an explicit
+selection, the normal saved coordinator/default-solver resolution applies.
+
+`[controls]` is intentionally typed: every profile accepts `--timeout`, while
+OpenAI Responses profiles accept the supported `--reasoning-*` controls. The
+App persists `ModelOptions` and validates its protocol before a runtime is
+created; it does not carry an arbitrary provider parameter map.
+
 Before an Agent starts, `SettingsService` overlays the settings into a complete
-`ResolvedAgentRuntimeConfig`: coordinator and solver models, validated tool
-limits, deadlines, and fingerprint. `AgentHost::start(workspace, runtime)`
-receives that value directly. The Agent never receives a `BoneStore` or reads
-settings from disk.
+non-secret `ResolvedRuntime`: coordinator/solver profile selections, validated
+tool limits, deadlines, and fingerprint. The App connector turns each selected
+profile into an in-memory `ConfiguredModel`, then passes `AgentModels` and the
+Agent-only `ResolvedAgentRuntimeConfig` to `AgentHost`. The Agent never
+receives a `BoneStore`, profile, or credential.
 
 ## Provider connection and logout
 
-ChatGPT subscription OAuth is the intentional exception to SQLite because Rig
-owns its `auth.json` schema and refresh lifecycle. The cache lives under the
-private XDG config root:
+Profiles (ID, protocol, optional HTTPS base URL) live as non-secret typed
+SQLite settings. API keys live in the operating system credential manager and
+are read only while constructing an endpoint. ChatGPT subscription OAuth is a
+separate exception because Rig owns its `auth.json` schema and refresh
+lifecycle. The cache lives under the private XDG config root:
 
 ```text
 $XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/auth.json
 # or ~/.config/bone/store-v1/providers/chatgpt-subscription/auth.json
 ```
 
-The connection effect acquires `ChatGptAuthLease` before calling Rig. The
-lease holds a fail-fast exclusive `auth.lock`; it is retained by the endpoint
-and all derived model handles, preventing a second process from concurrently
-owning the same provider cache. The lease exposes only a previously validated
-path. It never parses, logs, or serializes OAuth data.
+The connection effect acquires a `ChatGptAuthLease` before calling Rig and
+serializes OAuth connection/refresh within the process. The lease holds a
+fail-fast exclusive `auth.lock`; it is retained by derived model handles and
+prevents a second process from concurrently owning the same provider cache.
+The lease exposes only a previously validated path. It never parses, logs, or
+serializes OAuth data.
 
 `/logout` calls `ChatGptCredentials::clear`. If any endpoint/model still
 holds the lease, it reports Busy and changes nothing. A successful logout only
 removes the local OAuth cache; it does not claim to revoke an upstream account.
+The TUI also leaves an in-progress ChatGPT startup intact and asks the user to
+retry logout when it finishes; starts for API-key profiles are never cancelled
+by a ChatGPT logout.
+
+Before `/login` starts OAuth or retries a turn, the TUI checks every selected
+API-key profile. It reports missing keys with the exact `bone credentials set
+<profile>` command first; a mixed profile plan cannot complete ChatGPT login
+only to fail immediately on an unchecked API key.
 
 ## Failure and observation behavior
 
@@ -223,7 +249,7 @@ background observer therefore cannot make an unsynchronized UI change.
 - A Session writer lease governs long-lived runtime ownership; SQLite governs
   short durable writes.
 - A turn's journal attribution and Agent runtime derive from the same frozen
-  configuration object.
-- Secrets, OAuth payloads, device codes, and refresh tokens never enter
+  non-secret runtime plan.
+- API keys, OAuth payloads, device codes, and refresh tokens never enter
   documents, journals, notices, debug output, or model-visible tool output.
 - Persistence failures preserve user input and never silently dispatch work.

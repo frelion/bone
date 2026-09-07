@@ -11,11 +11,16 @@
 mod credentials;
 pub mod durable;
 mod product_workspace;
+mod profiles;
+mod providers;
 mod settings;
 mod storage;
 pub mod tui;
 
-pub use credentials::{ChatGptAuthLease, ChatGptCredentials, CredentialError};
+pub use credentials::{
+    ApiKey, ApiKeyCredentialError, ApiKeyCredentials, ChatGptAuthLease, ChatGptCredentials,
+    CredentialError,
+};
 pub use durable::{
     CanonicalPath, JournalEntry, JournalError, JournalFact, JournalRead, JournalSequence,
     RecordError, RegistryError, RuntimeAttachment, SessionAttention, SessionAvailability,
@@ -28,11 +33,16 @@ pub use durable::{
 pub use product_workspace::{
     DraftDisposition, OpenDraft, OpenWriterDraft, WorkspaceApplication, WorkspaceApplicationError,
 };
+pub use profiles::{
+    CHATGPT_PROFILE_ID, LlmProfile, LlmProfileError, LlmProfileId, LlmProfileIdError, LlmProfiles,
+    LlmProfilesError,
+};
+pub use providers::{ProviderConnectError, ProviderConnector};
 pub use settings::{
     ApplyBoundary, GlobalAgentSettings, GlobalSettings, ModelResolution, ModelSelection,
-    ModelSelectionError, PUBLIC_SETTINGS, ResolvedModel, Scope, ScopeKind, SettingDescriptor,
-    SettingKey, SettingKeyError, SettingSource, SettingsError, SettingsService, TuiDisplaySettings,
-    WorkspaceSettings,
+    ModelSelectionError, PUBLIC_SETTINGS, ResolvedModel, ResolvedRuntime, Scope, ScopeKind,
+    SettingDescriptor, SettingKey, SettingKeyError, SettingSource, SettingsError, SettingsService,
+    TuiDisplaySettings, WorkspaceSettings,
 };
 pub use storage::{AppStorageError, open_default_store};
 pub use tui::{TuiError, run_storage_repair, run_workspace, write_events};

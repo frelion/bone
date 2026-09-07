@@ -243,6 +243,12 @@ A control belongs in a protocol-specific typed option only when the adapter can
 faithfully send it. An accepted option is either honored or rejected before
 network I/O; it is never silently dropped.
 
+For persistence outside this crate, use `EndpointConfig` and `ModelOptions`.
+They contain protocol/base-URL and protocol-scoped request controls only—not
+an endpoint ID, API key, OAuth cache, or storage handle. App code validates a
+`ModelOptions` value against the selected endpoint protocol before constructing
+an in-memory `Endpoint` and applying it through a configured model.
+
 Automatic tool selection is expressed only by omitting `tool_choice`; every
 explicit choice requires at least one tool definition. OpenAI Chat Completions
 cannot enforce a JSON schema on an initial request that also advertises tools,
@@ -263,6 +269,10 @@ Compatible base URLs must be absolute HTTP(S) URLs without embedded
 credentials or query strings. Authentication and routing configuration are
 injected while constructing the endpoint.
 
+`bone-llm` permits HTTP compatible URLs for controlled embedding and test
+environments. The BONE App profile layer is stricter: it requires HTTPS before
+it will retrieve and send an API key.
+
 The ChatGPT subscription connector accepts a narrow OAuth-cache capability,
 acquired by the product composition root:
 
@@ -276,14 +286,14 @@ The lease holds an exclusive, verified `auth.json` path for Rig's OAuth cache.
 Rig remains the sole owner of that file's JSON schema and token refresh
 lifecycle. `bone-llm` never discovers a credential root, reads OAuth bytes, or
 deletes the file. The resulting `Endpoint` and every selected `Model` retain
-the capability; a second same-provider connection returns Busy until all
-existing endpoint/model handles are dropped.
+the capability. The caller decides how to share or serialize an acquired
+lease; `bone-llm` never discovers or manages the credential location itself.
 
 The backend does not honor `max_output_tokens` or structured-output schemas,
 so BONE rejects those options locally instead of pretending they were applied.
 
 `bone-app` is the composition root: it opens `BoneStore`, resolves typed
-global/Workspace/Session settings into `ResolvedAgentRuntimeConfig`, acquires
-the provider credential capability, creates `AgentHost::new(endpoint)`, and
-starts a runtime with that immutable config. `bone-agent` performs no
+global/Workspace/Session settings into a non-secret runtime plan, acquires a
+provider credential capability, constructs coordinator/solver models, and
+creates `AgentHost::new(AgentModels)`. `bone-agent` performs no
 storage/configuration read at runtime. See [configuration and storage](configuration.md).

@@ -16,16 +16,16 @@ cannot hide a second agent loop.
 
 ## Start a pinned runtime
 
-The host authenticates an endpoint and resolves all persistent settings before
+The product resolves persistent settings and authenticates role models before
 constructing an Agent runtime:
 
 ```rust,ignore
-use bone_agent::{AgentHost, ResolvedAgentRuntimeConfig};
-use bone_llm::Endpoint;
+use bone_agent::{AgentHost, AgentModels, ConfiguredModel, ResolvedAgentRuntimeConfig};
 
-let endpoint: Endpoint = connect_provider_with_an_app_owned_auth_cache().await?;
+let coordinator = ConfiguredModel::new(connect_coordinator_model().await?, None)?;
+let solver = ConfiguredModel::new(connect_solver_model().await?, None)?;
 let config: ResolvedAgentRuntimeConfig = resolve_settings_for_this_session()?;
-let host = AgentHost::new(endpoint);
+let host = AgentHost::new(AgentModels::new(coordinator, solver));
 let agent = host.start(workspace, config)?;
 
 let receipt = agent.post("Investigate the failing test").await?;
@@ -34,27 +34,26 @@ let report = agent.shutdown().await?;
 ```
 
 `AgentHost::start(workspace, config)` is synchronous because it only builds
-local tools, models, Kernel, and Runtime. It does not read disk settings or
-initiate login. The supplied `ResolvedAgentRuntimeConfig` is complete and
-immutable:
+local tools, Kernel, and Runtime. It does not read disk settings or initiate
+login. The supplied `ResolvedAgentRuntimeConfig` is complete and immutable,
+but owns only Agent execution policy:
 
 ```text
-coordinator model and effort
-solver model and effort
 validated ToolLimits
 soft deadline, review timeout, work timeout, shutdown grace
-SHA-256 runtime fingerprint
 ```
 
+`ConfiguredModel` fixes a selected `bone_llm::Model` and its validated
+protocol-specific `ModelOptions`; it rejects options for another protocol.
 Later settings changes cannot mutate an attached runtime. Product code resolves
-a new config and starts/recreates a runtime at an explicit lifecycle boundary.
-`bone-app` records that same runtime fingerprint and solver in the durable
-Session journal before delivering a user turn.
+a new non-secret runtime plan and starts/recreates a runtime at an explicit
+lifecycle boundary. `bone-app` records its own plan fingerprint and solver in
+the durable Session journal before delivering a user turn.
 
-The ChatGPT endpoint itself is connected by `bone-app` with its
-`ChatGptCredentials` manager. The resulting endpoint and models retain the
-narrow `ChatGptAuthLease` cache capability for their lifetime. `bone-agent`
-never sees an OAuth path, credential root, or token payload.
+Endpoints are connected by `bone-app` from its saved profile plus a Keychain
+API key or `ChatGptCredentials` lease. The resulting models retain only their
+in-memory client/lease. `bone-agent` never sees a profile, OAuth path,
+credential root, API key, or token payload.
 
 For controlled ports and embedded custom execution,
 `Runtime::spawn(model, tools, kernel_config, runtime_config)` remains

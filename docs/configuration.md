@@ -27,9 +27,10 @@ The database contains only four internal schema concepts:
 | OS sidecar leases | Session writer ownership; these are not database tables. |
 
 Document keys are constructed only by domain capabilities. Current product
-locations include `settings/global`, the Workspace registry, Workspace
-settings, and a Session record/journal under that Workspace. The TUI, model
-input, and ordinary crates never construct storage paths or run SQL.
+locations include `settings/global`, `settings/llm-profiles`, the Workspace
+registry, Workspace settings, and a Session record/journal under that
+Workspace. The TUI, model input, and ordinary crates never construct storage
+paths or run SQL.
 
 Rig's ChatGPT OAuth cache is the one intentional exception because Rig owns
 its JSON schema and refresh-token lifecycle:
@@ -42,6 +43,22 @@ $XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/auth.json
 `bone-app` owns the safe credential directory/path checks and a fail-fast
 `auth.lock`. It never reads, serializes, prints, or stores OAuth payloads in
 SQLite.
+
+API-key profiles use the operating system credential manager instead of a
+file. On macOS this is Keychain Services; BONE binds the credential account to
+the stable profile ID and a SHA-256 identity of its immutable endpoint config.
+The database holds only a profile's ID, label, protocol, and optional HTTPS
+compatible base URL—never an API key. This prevents a same-named profile in a
+different store from redirecting a saved key to another endpoint. Use
+`bone credentials set <profile>` for masked terminal entry or
+`bone credentials clear <profile>` to remove it. Keys are never accepted as a
+slash-command argument, environment setting, or normal configuration field.
+
+For a headless first-time setup, `bone provider add <id>
+<responses|chat|anthropic> [https-url]` creates the same non-secret profile as
+`/provider add`; `bone provider list` prints the saved catalog. The key prompt
+remains terminal-only. Profile IDs cannot be `default`, `global`,
+`coordinator`, or `inherit`, because those words are `/model` scopes.
 
 There is no `BONE_CONFIG`, `BONE_STATE_DIR`, `credential_root`, JSON settings
 file, JSONL Session transcript, legacy import, or automatic migration. Older
@@ -66,6 +83,9 @@ WorkspaceSettings
 
 SessionRecord.metadata
   solver_model_override
+
+LlmProfiles
+  profiles[] { id, label, endpoint }  non-secret provider catalog
 ```
 
 The solver resolves in the following order:
@@ -78,15 +98,46 @@ There is deliberately no guessed model. A new store opens normally with a
 Workspace, Session, and editable draft, but reports `NeedsModel` until the user
 chooses one.
 
+Each model selection contains a profile ID, model ID, optional
+protocol-specific model options, and optional timeout. Existing selections
+without a profile migrate naturally to the built-in `chatgpt` profile; legacy
+Responses `effort` becomes typed OpenAI Responses options.
+
 Use the TUI commands below:
 
 | Command | Durable target | Runtime boundary |
 | --- | --- | --- |
-| `/model <id>` | current Session override | next newly created/recreated runtime |
-| `/model default <id>` | current Workspace default | next newly created/recreated runtime |
-| `/model global <id>` | user's global default | next newly created/recreated runtime |
+| `/provider` | read profile catalog | no runtime change |
+| `/provider add <id> <responses\|chat\|anthropic> [https-url]` | create an immutable API-key profile | no runtime change |
+| `/model [profile] <id> [controls]` | current Session solver override | next newly created/recreated runtime |
+| `/model default [profile] <id> [controls]` | current Workspace solver default | next newly created/recreated runtime |
+| `/model global [profile] <id> [controls]` | user's global solver default | next newly created/recreated runtime |
+| `/model coordinator [profile] <id> [controls]` | user-wide coordinator | next newly created/recreated runtime |
 | `/model inherit` | removes current Session override | restores Workspace/User inheritance |
 | `/config doctor` | read-only storage health check | no runtime change |
+
+The built-in `chatgpt` profile is the ChatGPT subscription connection and is
+logged into with `/login`. `responses`, `chat`, and `anthropic` name the three
+wire protocols currently exposed by `bone-llm`. App profiles require HTTPS for
+compatible endpoints, so an existing API key cannot be sent over plaintext
+HTTP. A profile ID is create-only: changing an endpoint requires a new ID and
+a deliberate new API-key entry, preventing an existing credential from being
+redirected to another host.
+
+When a selected coordinator/solver pair includes API-key profiles, `/login`
+checks that all of their keys are available before it starts ChatGPT OAuth or
+retries a saved turn. A missing key is reported with its exact `bone
+credentials set <profile>` repair command instead of being hidden behind a
+second connection failure.
+
+`[controls]` is a small typed surface: `--timeout <seconds>` applies to every
+profile; OpenAI Responses profiles additionally accept
+`--reasoning-effort <none|minimal|low|medium|high|xhigh|max>`,
+`--reasoning-summary <auto|concise|detailed>`, `--reasoning-mode pro`, and
+`--reasoning-context <auto|all_turns|current_turn>`. BONE persists these as
+`bone_llm::ModelOptions` and rejects them for Chat Completions or Anthropic
+profiles before saving. It deliberately has no provider-neutral raw JSON or
+arbitrary key/value configuration field.
 
 Saving a model setting is live: other Sessions in the same process immediately
 recompute their readiness. A runtime that is already attached remains pinned.
@@ -96,14 +147,13 @@ turn; it does not reread settings during Agent execution.
 ## Runtime configuration and durable turns
 
 Before a user turn is accepted, `SettingsService` overlays global, Workspace,
-and Session values into one `ResolvedAgentRuntimeConfig`:
+and Session values into one non-secret `ResolvedRuntime` plan:
 
 ```text
-coordinator model
-solver model
-validated tool limits
-soft deadline and shutdown grace
-SHA-256 runtime fingerprint
+coordinator profile/model/options
+solver profile/model/options
+validated Agent tool limits and deadlines
+SHA-256 runtime-plan fingerprint
 ```
 
 The journal records the exact solver and `runtime_fingerprint` from that
@@ -125,7 +175,7 @@ services. It separately constructs its credential manager:
 let store = open_default_store()?;
 let settings = SettingsService::open(store.clone())?;
 let workspace = WorkspaceApplication::open_with_store(launch_dir, store.clone())?;
-let credentials = ChatGptCredentials::default_for_current_user()?;
+let connector = ProviderConnector::new();
 ```
 
 `bone-app::open_default_store` owns the XDG/default-path policy. For tests,
@@ -158,8 +208,10 @@ repair/error state.
 `/logout` is the only product entry point for deleting the local ChatGPT cache.
 It does not revoke an upstream account. If an Endpoint or Model still holds the
 ChatGPT cache lease, logout returns Busy and deletes nothing; stop/exit the
-owning BONE process before retrying.
+owning BONE process before retrying. If this TUI still has a ChatGPT login or
+runtime start in progress, it asks the user to wait rather than cancelling that
+work or unrelated API-key provider starts.
 
-Secrets, device codes, refresh tokens, and OAuth payloads never enter global
+API keys, device codes, refresh tokens, and OAuth payloads never enter global
 settings, SQLite documents, Session journals, debug output, notices, or
 model-visible tool output.

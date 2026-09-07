@@ -25,11 +25,12 @@ bone-app ──────────┬─► bone-agent ──┬─► bone
 - `bone-app` defines the durable keys and typed records, then injects storage
   into its settings and Workspace/Session services. No other product crate
   depends on `bone-store`.
-- `bone-agent` receives an already-resolved, immutable runtime configuration.
-  It never opens user storage or reads settings while a runtime is working.
-- `bone-llm` owns protocol adapters. Its ChatGPT subscription adapter accepts
-  a narrow, application-owned OAuth-cache capability rather than discovering a
-  credential directory or depending on storage.
+- `bone-agent` receives two already-connected role models plus immutable Agent
+  limits/deadlines. It never opens user storage, selects a provider, or reads
+  settings while a runtime is working.
+- `bone-llm` owns protocol adapters and non-secret wire configuration. Its
+  ChatGPT subscription adapter accepts a narrow application-owned OAuth-cache
+  capability rather than discovering a credential directory or storage.
 - `bone-tools` provides workspace-local tools and their validated limits.
 
 The TUI has a unidirectional presentation flow:
@@ -59,12 +60,21 @@ global settings. It deliberately does **not** guess a model or start a login.
 You can browse Sessions and edit a draft while the UI shows the normal
 `NeedsModel` state.
 
-Choose a model directly in the TUI:
+The built-in `chatgpt` profile uses a ChatGPT subscription. Add an API-key
+profile before selecting a model from it:
 
 ```text
-/model gpt-5.6             set this Session's solver override
-/model default gpt-5.6     set this Workspace's default solver
-/model global gpt-5.6      set the user's default solver
+/provider                  list saved connection profiles
+/provider add openai responses
+/provider add gateway chat https://gateway.example/v1
+/provider add anthropic anthropic
+
+/model gpt-5.6                     use the built-in ChatGPT profile
+/model openai gpt-5.6              set this Session's solver profile/model
+/model default gateway my-model    set this Workspace's solver default
+/model global anthropic claude     set the user-wide solver default
+/model coordinator openai gpt-5.6  set the user-wide coordinator
+/model openai gpt-5 --timeout 90 --reasoning-effort high --reasoning-summary concise
 /model inherit             remove this Session override
 /login                     connect or retry ChatGPT subscription login
 /logout                    remove the local login cache when no runtime owns it
@@ -72,6 +82,29 @@ Choose a model directly in the TUI:
 /rename <title>  /archive  organize the current Session
 /status  /workspace        inspect the current state
 /config doctor             check whether settings storage is usable
+```
+
+`responses`, `chat`, and `anthropic` select OpenAI Responses, OpenAI Chat
+Completions, and Anthropic Messages respectively. An optional compatible base
+URL must be HTTPS. Profile IDs are create-only: use a new ID when changing an
+endpoint, then explicitly enter a key for that new profile.
+
+`/model` accepts an optional `--timeout <seconds>` for every profile. The
+currently implemented OpenAI Responses controls are explicit too:
+`--reasoning-effort <none|minimal|low|medium|high|xhigh|max>`,
+`--reasoning-summary <auto|concise|detailed>`, `--reasoning-mode pro`, and
+`--reasoning-context <auto|all_turns|current_turn>`. They work with the
+Responses protocol (including `chatgpt`) and are rejected for other protocols;
+there is no generic raw-JSON parameter escape hatch.
+
+Set an API key outside the TUI so it never becomes command text, SQLite data,
+or shell history:
+
+```sh
+# This also works before the first interactive TUI launch:
+bone provider add openai responses
+bone credentials set openai
+bone credentials clear openai
 ```
 
 Model precedence is:
@@ -92,12 +125,14 @@ commands stay local and show suggestions.
 For one request, pass its text:
 
 ```sh
-cargo run -p bone-app --bin bone -- --model gpt-5.6 "Read Cargo.toml and list the workspace crates"
+cargo run -p bone-app --bin bone -- --profile openai --model gpt-5.6 "Read Cargo.toml and list the workspace crates"
 ```
 
-In interactive mode, `--model` (or `BONE_MODEL`) saves an override on the
-Session opened for that launch. In one-shot mode it is an ephemeral input for
-that invocation. Neither form creates a hidden fourth settings scope.
+In interactive mode, `--model` (or `BONE_MODEL`) and optional `--profile` (or
+`BONE_PROFILE`) save an override on the Session opened for that launch. In
+one-shot mode they are ephemeral inputs for that invocation; an explicit
+profile/model pins both coordinator and solver to that one selection. Omitting
+a profile uses `chatgpt`. Neither form creates a hidden fourth settings scope.
 `--events session.jsonl` is an explicit new-file export of runtime
 observations; it is not BONE's Session database.
 
@@ -111,18 +146,21 @@ $XDG_DATA_HOME/bone/store-v1/bone.sqlite3
 # fallback: ~/.local/share/bone/store-v1/bone.sqlite3
 ```
 
-The only exception is Rig's ChatGPT OAuth cache, because Rig owns its schema
-and token-refresh lifecycle:
+Connection profiles (ID, protocol, and HTTPS base URL) are non-secret typed
+SQLite settings. API keys are stored in the operating system credential
+manager under a profile-and-endpoint-bound slot and are never written to
+SQLite. Rig's ChatGPT OAuth cache is separately stored because Rig owns its
+schema and token-refresh lifecycle:
 
 ```text
 $XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/auth.json
 # fallback: ~/.config/bone/store-v1/providers/chatgpt-subscription/auth.json
 ```
 
-`bone-app` chooses the SQLite data root and owns the private ChatGPT cache
-location. `bone-store` owns WAL, fail-fast write contention, and generic lease
-files. OAuth payloads never enter SQLite, a journal, debug output, or
-model-visible tool output.
+`bone-app` chooses the SQLite data root, the OS credential slot, and the
+private ChatGPT cache location. `bone-store` owns WAL, fail-fast write
+contention, and generic lease files. API keys and OAuth payloads never enter
+SQLite, a journal, debug output, or model-visible tool output.
 
 Older BONE JSON/JSONL/config data is intentionally neither read nor migrated.
 It is left untouched; this release starts from the separate `store-v1` root.

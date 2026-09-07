@@ -17,6 +17,8 @@ pub enum ConfigError {
     EmptyBaseUrl,
     /// The base URL is not an absolute HTTP(S) URL without embedded credentials or a query string.
     InvalidBaseUrl,
+    /// The credential-carrying HTTP transport could not be initialized.
+    HttpClientInitialization,
     /// The selected model identity is empty.
     EmptyModelId,
 }
@@ -31,6 +33,7 @@ impl fmt::Display for ConfigError {
             Self::InvalidBaseUrl => {
                 "endpoint base URL must be an absolute HTTP(S) URL without embedded credentials or a query string"
             }
+            Self::HttpClientInitialization => "credential HTTP transport could not be initialized",
             Self::EmptyModelId => "model identifier is empty",
         })
     }

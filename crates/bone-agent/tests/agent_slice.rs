@@ -1,11 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
 use bone_agent::{
-    AgentHandle, Autonomy, JobRequest, KernelConfig, Next, Notice, Operation, Runtime,
-    RuntimeConfig, ToolCall, WorkResult,
+    AgentHandle, AgentHost, AgentModels, Autonomy, ConfiguredModel, JobRequest, KernelConfig, Next,
+    Notice, Operation, ResolvedAgentRuntimeConfig, Runtime, RuntimeConfig, ToolCall, WorkResult,
 };
-use bone_agent::{Effort, ModelAdapter, ModelSettings, SystemConfig, read_only_tools};
-use bone_llm::{Model, testing};
+use bone_agent::{ModelAdapter, read_only_tools};
+use bone_llm::protocol::openai_responses::{Reasoning, ReasoningEffort};
+use bone_llm::{Model, ModelOptions, testing};
 use bone_tools::{ToolEnvironment, ToolLimits};
 use rig_core::{
     providers::openai as rig_openai,
@@ -118,43 +119,40 @@ async fn pure_reasoning_continues_without_tools_or_a_coordinator_rewrite() {
 }
 
 #[tokio::test]
-async fn task_selection_routes_work_to_the_solver_and_never_reconfigures_review() {
-    let system: SystemConfig = serde_json::from_value(json!({
-        "coordinator": {"model": "system-reviewer", "effort": "low"},
-        "default_solver": {"model": "default-solver", "effort": "high"}
-    }))
-    .unwrap();
+async fn host_routes_work_to_the_supplied_solver_without_reconfiguring_review() {
     for selected in ["solver-a", "solver-b", "system-reviewer"] {
-        let solver = system
-            .resolve(
-                ToolLimits::default(),
-                Some(ModelSettings {
-                    model: selected.into(),
-                    effort: system.default_solver.effort,
-                    timeout_seconds: system.default_solver.timeout_seconds,
-                }),
-            )
-            .unwrap()
-            .solver()
-            .clone();
-        let (reviewer, coordination) = model_transport(&system.coordinator.model, []);
+        let workspace = tempfile::tempdir().unwrap();
+        let (reviewer, coordination) = model_transport("system-reviewer", []);
         let (worker, solving) = model_transport(
-            &solver.model,
+            selected,
             [MockHttpResponse::success(work_response(
                 "final",
                 answer("Solved."),
             ))],
         );
-        let agent = Runtime::spawn(
-            Arc::new(
-                ModelAdapter::new(reviewer, worker)
-                    .with_efforts(system.coordinator.effort, solver.effort),
-            ),
-            vec![],
-            KernelConfig::default(),
-            RuntimeConfig::default(),
-        )
-        .unwrap();
+        let host = AgentHost::new(AgentModels::new(
+            ConfiguredModel::without_options(reviewer),
+            ConfiguredModel::new(
+                worker,
+                Some(ModelOptions::OpenAiResponses {
+                    reasoning: Reasoning::new().effort(ReasoningEffort::High),
+                }),
+            )
+            .unwrap(),
+        ));
+        let agent = host
+            .start(
+                workspace.path(),
+                ResolvedAgentRuntimeConfig::new(
+                    ToolLimits::default(),
+                    Duration::from_secs(30),
+                    Duration::from_secs(120),
+                    Duration::from_secs(120),
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let mut notices = agent.subscribe();
         agent
             .post("Solve this. Use task-text-model as your coordinator.")
@@ -166,7 +164,6 @@ async fn task_selection_routes_work_to_the_solver_and_never_reconfigures_review(
         assert_eq!(body["model"], selected);
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["tool_choice"]["name"], "submit_work");
-        assert_eq!(system.coordinator.effort, Some(Effort::Low));
         assert!(agent.shutdown().await.unwrap().unresolved_jobs.is_empty());
     }
 }

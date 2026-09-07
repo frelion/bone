@@ -96,8 +96,8 @@ one package. The important boundaries are modules, not publishable crates.
 | Product bootstrap | `product_workspace.rs` | Open Workspace, select/create initial Session, locate private state | Terminal input, Agent policy |
 | TUI reducer | `tui/app.rs` | `AppEvent`, `App::reduce`, local UI state and projection | File I/O, Settings persistence, Agent lifecycle |
 | Durable session control | `tui/session_controller.rs` | Hydration, writer leases, recovery, record/journal mutation, accepted-turn boundary | Terminal polling, Agent handles |
-| Typed commands | `tui/command_effects.rs` | `/model`, `/new`, `/resume`, `/archive`, `/status`, and settings-facing effects | Raw key handling, journal recovery |
-| Runtime attachment | `tui/runtime_driver.rs` | `AgentHost`, `AgentHandle`, tagged observers, reset after broadcast gaps | Durable Session identity and persistence |
+| Typed commands | `tui/command_effects.rs` | `/provider`, `/model`, `/new`, `/resume`, `/archive`, `/status`, and settings-facing effects | Raw key handling, journal recovery |
+| Runtime attachment | `tui/runtime_driver.rs` | construct a profile-resolved `AgentHost`, `AgentHandle`, tagged observers, reset after broadcast gaps | Durable Session identity and persistence |
 | Product runner | `tui/workspace.rs` | Dependency assembly, event loop, effect dispatch, orderly shutdown | Direct mutation of `App` fields |
 | Rendering | `tui/view.rs` | Pure `&App → Ratatui frame` projection | I/O, Agent calls, durable writes |
 | Terminal lifetime | `tui/terminal.rs` | Raw mode, alternate screen, bracketed paste, restoration | Product state |
@@ -169,10 +169,13 @@ are currently held for writing by another BONE process.
 
 Each logical Session has an OS-backed writer lease. A process without that
 lease presents the session as read-only and the reducer blocks draft edits,
-local commands, posting, and stop requests. Switching to a Session attempts
-to acquire its lease and then refreshes its durable state. Idle leases can be
-released after a switch; a Session with active work, a pending turn, or a
-startup task remains owned until it reaches a safe boundary.
+posting, stop requests, and session-scoped commands. Typed app/user/Workspace
+commands (for example `/provider`, `/login`, `/logout`, and global model
+defaults) remain available without inheriting that Session's writer lease.
+Switching to a Session attempts to acquire its lease and then refreshes its
+durable state. Idle leases can be released after a switch; a Session with
+active work, a pending turn, or a startup task remains owned until it reaches a
+safe boundary.
 
 `SessionStore::replace` uses SQLite document revision compare-and-swap for
 individual record writes. On a normal cross-process conflict, the product
@@ -211,11 +214,19 @@ Users configure the product inside the TUI. Configuration files are product
 implementation details; first use creates safe storage automatically.
 
 ```text
-/model <id>             save a model for the current Session
-/model default <id>     save a Workspace model default
-/model global <id>      save a user model default
+/provider               list saved connection profiles
+/provider add <id> <protocol> [https-url]
+/model [profile] <id> [controls]
+                        save a solver model for the current Session
+/model default [profile] <id> [controls]
+                        save a Workspace solver default
+/model global [profile] <id> [controls]
+                        save a user solver default
+/model coordinator [profile] <id> [controls]
+                        save the user-wide coordinator
 /model inherit          remove the current Session override
-/login                  connect or retry the model service
+/login                  connect or retry ChatGPT subscription authorization
+/logout                 clear the unused local ChatGPT cache
 /new /sessions /resume  create and navigate Workspace Sessions
 /rename /archive        organize a Session
 /status /workspace      inspect current product state
@@ -226,6 +237,15 @@ The model resolution order is:
 ```text
 Session override > Workspace default > User default
 ```
+
+`[controls]` means `--timeout <seconds>` and, only for OpenAI Responses,
+typed `--reasoning-effort`, `--reasoning-summary`, `--reasoning-mode`, and
+`--reasoning-context` values. The parser does not expose raw provider JSON;
+the saved option is validated against the selected profile protocol.
+
+Omitting `[profile]` selects the built-in `chatgpt` profile. For a mixed role
+plan, `/login` first reports any missing API key with its `bone credentials set
+<profile>` command rather than starting OAuth that cannot complete the plan.
 
 Settings writes are immediate and durable. An already attached Agent runtime
 keeps its pinned model; a new or recreated runtime resolves the newly saved
@@ -238,10 +258,13 @@ sends slash-prefixed text to the model.
 
 ## Runtime attachment and observation
 
-`AgentHost` connects the model service once for the TUI process and can start
-independent `AgentHandle` runtimes. A durable Session is not itself an Agent
-runtime: its title, draft, journal, and identity survive even when no handle is
-attached.
+For every pending runtime, App resolves the saved profile/model plan, reads an
+API key from the OS credential manager or obtains the ChatGPT OAuth lease, then
+constructs an `AgentHost` from its coordinator and solver models. API-key
+endpoints are rebuilt for each new runtime so a later start sees the current
+profile/key; the ChatGPT OAuth lease is shared only for safe cache access. A
+durable Session is not itself an Agent runtime: its title, draft, journal, and
+identity survive even when no handle is attached.
 
 For every attached runtime, the runtime driver:
 

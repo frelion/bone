@@ -6,9 +6,13 @@ use rig_core::{
     client::CompletionClient, completion::CompletionModel, http_client::HttpClientExt,
     providers::openai as rig_openai,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{ConfigError, Endpoint, Protocol, protocol::validate_base_url};
+use crate::{
+    ConfigError, Endpoint, Protocol,
+    protocol::{no_redirect_http_client, validate_base_url},
+};
 
 /// Typed controls supported only by the OpenAI Responses protocol.
 #[derive(Clone, Debug, Default)]
@@ -37,11 +41,16 @@ impl Options {
 }
 
 /// Reasoning controls for OpenAI Responses models.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Reasoning {
+    #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<ReasoningSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<ReasoningMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<ReasoningContext>,
 }
 
@@ -70,7 +79,7 @@ impl Reasoning {
         self
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.effort.is_none()
             && self.summary.is_none()
             && self.mode.is_none()
@@ -106,7 +115,8 @@ impl Reasoning {
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
         pub enum $name { $($variant),+ }
 
         impl $name {
@@ -146,7 +156,11 @@ pub fn official(
     let api_key = api_key.into();
     validate_api_key(&api_key)?;
 
-    let client = rig_openai::Client::new(api_key).map_err(|_| ConfigError::InvalidApiKey)?;
+    let client = rig_openai::Client::builder()
+        .api_key(api_key)
+        .http_client(no_redirect_http_client()?)
+        .build()
+        .map_err(|_| ConfigError::InvalidApiKey)?;
     from_client(endpoint_id, client)
 }
 
@@ -156,12 +170,7 @@ pub fn compatible(
     api_key: impl Into<String>,
     base_url: impl Into<String>,
 ) -> Result<Endpoint, ConfigError> {
-    compatible_with_http_client(
-        endpoint_id,
-        api_key,
-        base_url,
-        rig_core::http_client::ReqwestClient::default(),
-    )
+    compatible_with_http_client(endpoint_id, api_key, base_url, no_redirect_http_client()?)
 }
 
 fn compatible_with_http_client<H>(

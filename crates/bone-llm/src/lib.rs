@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod config;
 mod endpoint;
 mod error;
 mod item;
@@ -20,6 +21,7 @@ pub mod protocol;
 
 pub mod service;
 
+pub use config::{EndpointConfig, ModelOptions, ModelRequestOptions, ModelRequestOptionsError};
 pub use endpoint::Endpoint;
 pub use error::{ConfigError, Error, ErrorKind};
 pub use item::{InputItem, InputSource};

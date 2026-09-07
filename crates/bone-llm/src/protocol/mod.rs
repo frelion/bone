@@ -54,8 +54,29 @@ pub(crate) fn validate_base_url(base_url: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Build the transport used by endpoints that attach credentials to requests.
+///
+/// Redirects are deliberately rejected. A redirect changes the authority that
+/// received the locally validated request, and a provider-specific credential
+/// header must never follow it to a different origin.
+pub(crate) fn no_redirect_http_client() -> Result<rig_core::http_client::ReqwestClient, ConfigError>
+{
+    rig_core::http_client::ReqwestClient::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| ConfigError::HttpClientInitialization)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
     use super::*;
 
     #[test]
@@ -88,5 +109,62 @@ mod tests {
         assert_eq!(error, ConfigError::InvalidBaseUrl);
         assert!(!error.to_string().contains("secret"));
         assert_eq!(validate_base_url("https://gateway.example/v1"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn credential_transport_does_not_follow_redirects() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_address = target.local_addr().unwrap();
+        let (target_seen_sender, target_seen_receiver) = mpsc::channel();
+        let target_server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match target.accept() {
+                    Ok(_) => {
+                        target_seen_sender.send(true).unwrap();
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            target_seen_sender.send(false).unwrap();
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("target server failed: {error}"),
+                }
+            }
+        });
+
+        let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_address = redirect.local_addr().unwrap();
+        let redirect_server = thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_address}/credential\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let response = no_redirect_http_client()
+            .unwrap()
+            .get(format!("http://{redirect_address}/request"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), http::StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            !target_seen_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+        );
+        redirect_server.join().unwrap();
+        target_server.join().unwrap();
     }
 }

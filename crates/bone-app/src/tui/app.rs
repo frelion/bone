@@ -492,12 +492,15 @@ impl App {
             }
             AppEvent::ConnectionFailed { reason, affected } => {
                 self.connection = ConnectionState::Failed(reason.clone());
+                let has_affected_turns = !affected.is_empty();
                 for id in affected {
                     self.mark_runtime_start_failed(id, reason.clone());
                 }
-                self.notice = Some(format!(
-                    "Connection failed; saved messages remain queued: {reason}"
-                ));
+                self.notice = Some(if has_affected_turns {
+                    format!("Connection failed; saved messages remain queued: {reason}")
+                } else {
+                    format!("Connection failed: {reason}")
+                });
                 Action::None
             }
             AppEvent::Notice { message } => {
@@ -688,8 +691,41 @@ impl App {
 
         let session = &mut self.sessions[self.current];
         if let SessionState::ReadOnlyElsewhere(message) = &session.state {
+            let readonly_message = message.clone();
+            // A read-only conversation cannot mutate its durable draft or
+            // turn, but application/user/workspace commands must not inherit
+            // that session lease. Permit a typed slash command in the local
+            // composer without emitting `DraftChanged`; command execution
+            // still checks the writer only for session-scoped mutations.
+            let draft = session.conversation.draft();
+            let command_candidate = draft.text.starts_with('/')
+                || (draft.text.is_empty()
+                    && matches!(
+                        &event,
+                        Event::Key(key)
+                            if key.kind != KeyEventKind::Release
+                                && key.code == KeyCode::Char('/')
+                    ));
+            if command_candidate {
+                return match session.conversation.on_event(event, self.viewport) {
+                    ConversationAction::Command(command) => Action::Command {
+                        id: session.id,
+                        command,
+                    },
+                    ConversationAction::Quit => Action::Quit,
+                    ConversationAction::Feedback(reason) => {
+                        self.notice = Some(reason);
+                        Action::None
+                    }
+                    ConversationAction::Post(_) | ConversationAction::Stop { .. } => {
+                        self.notice = Some(readonly_message.clone());
+                        Action::None
+                    }
+                    ConversationAction::None => Action::None,
+                };
+            }
             // Scrolling remains useful for a read-only transcript, but no
-            // composer edit, command, send, or stop action may escape the
+            // ordinary composer edit, send, or stop action may escape the
             // reducer. This prevents an unsaved ghost draft if the effect
             // executor cannot obtain the writer.
             let navigation = matches!(
@@ -702,7 +738,7 @@ impl App {
                         )
             );
             if !navigation {
-                self.notice = Some(message.clone());
+                self.notice = Some(readonly_message);
                 return Action::None;
             }
         }
@@ -1439,6 +1475,7 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     use super::super::agent_projection::{Projection, SessionStatus, Speaker, TimelineKind};
+    use super::super::commands::LocalCommand;
     use super::{
         Action, App, AppEvent, ConnectionState, DraftPersistenceState, Focus, ScrollAnchor,
         SessionState, UiSessionId, Viewport,
@@ -1510,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_elsewhere_blocks_drafts_posts_and_local_commands_in_the_reducer() {
+    fn read_only_elsewhere_blocks_turns_but_allows_typed_app_commands() {
         let mut app = App::new("workspace".into());
         app.add_session(UiSessionId(1), &snapshot(vec![]), true);
         let _ = app.reduce(AppEvent::SessionReadOnlyElsewhere {
@@ -1528,23 +1565,28 @@ mod tests {
         );
         assert_eq!(app.current().conversation.composer.lines(), [""]);
 
-        // This simulates an already-visible slash command at the exact
-        // reducer boundary. It must not escape as Action::Command or clear
-        // the text just because the session became read-only concurrently.
-        app.sessions[app.current]
-            .conversation
-            .composer
-            .insert_str("/status");
+        for character in "/status".chars() {
+            assert_eq!(
+                app.reduce(AppEvent::Terminal(Event::Key(key(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Press,
+                )))),
+                Action::None
+            );
+        }
         assert_eq!(
             app.reduce(AppEvent::Terminal(Event::Key(key(
                 KeyCode::Enter,
                 KeyModifiers::NONE,
                 KeyEventKind::Press,
             )))),
-            Action::None
+            Action::Command {
+                id: UiSessionId(1),
+                command: LocalCommand::Status,
+            }
         );
         assert_eq!(app.current().conversation.composer.lines(), ["/status"]);
-        assert_eq!(app.notice(), Some("Open in another BONE process"));
         assert!(matches!(
             app.current().state,
             SessionState::ReadOnlyElsewhere(_)

@@ -12,7 +12,9 @@ test-utils = []
 [dependencies]
 futures-util.workspace = true
 rig-core = { workspace = true, features = ["reqwest", "rustls"] }
+reqwest.workspace = true
 schemars.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
