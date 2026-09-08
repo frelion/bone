@@ -1,198 +1,117 @@
-//! Validated Agent execution limits, model deadlines, and scheduler capacity.
-
 use std::time::Duration;
 
-use bone_tools::{ToolLimits, ToolLimitsError};
-use thiserror::Error;
-
-use crate::KernelConfig;
-
-/// The active deadlines captured by one runtime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RuntimeDeadlines {
-    kernel_timeout: Duration,
-    work_timeout: Duration,
-    shutdown_grace_period: Duration,
-}
-
-impl RuntimeDeadlines {
-    pub fn kernel_timeout(self) -> Duration {
-        self.kernel_timeout
-    }
-
-    pub fn work_timeout(self) -> Duration {
-        self.work_timeout
-    }
-
-    pub fn shutdown_grace_period(self) -> Duration {
-        self.shutdown_grace_period
-    }
-}
-
-/// A validated, immutable snapshot of all Agent execution settings.
+/// The finite resources and deadlines of one agent runtime.
 ///
-/// The supplied Kernel configuration determines both model timeouts and all
-/// scheduler capacities. Model selection and credentials live in AgentModels.
+/// Start from [`AgentLimits::default`], change the fields that matter to the
+/// host, then call [`AgentLimits::validate`] before displaying configuration
+/// errors. The runtime performs the same validation when it starts.
 #[derive(Clone, Debug)]
-pub struct ResolvedAgentRuntimeConfig {
-    tool_limits: ToolLimits,
-    kernel_config: KernelConfig,
-    shutdown_grace_period: Duration,
+pub struct AgentLimits {
+    pub coordination_timeout: Duration,
+    pub work_timeout: Duration,
+    pub tool_timeout: Duration,
+    pub shutdown_grace: Duration,
+    pub background_workers: usize,
+    pub tool_slots: usize,
+    pub active_jobs: usize,
+    pub job_depth: usize,
+    pub pending_inputs: usize,
+    pub inquiries: usize,
+    /// Maximum serialized context DTO size for one model call.
+    ///
+    /// Provider instructions, tool schemas and output allowance are outside this
+    /// count, so hosts must leave suitable model-window headroom.
+    pub context_bytes: usize,
+    pub item_bytes: usize,
+    pub tool_output_bytes: usize,
 }
 
-impl ResolvedAgentRuntimeConfig {
-    /// Validate explicit tool limits, Kernel settings, and shutdown grace.
-    /// AgentHost forwards these settings without substituting scheduler defaults.
-    pub fn new(
-        tool_limits: ToolLimits,
-        kernel_config: KernelConfig,
-        shutdown_grace_period: Duration,
-    ) -> Result<Self, ResolvedAgentRuntimeConfigError> {
-        tool_limits.validate()?;
-        for (field, duration) in [
-            ("kernel_timeout", kernel_config.kernel_timeout),
-            ("work_timeout", kernel_config.work_timeout),
-            ("shutdown_grace_period", shutdown_grace_period),
+impl AgentLimits {
+    pub fn validate(&self) -> Result<(), AgentLimitsError> {
+        for (name, value) in [
+            ("coordination_timeout", self.coordination_timeout),
+            ("work_timeout", self.work_timeout),
+            ("tool_timeout", self.tool_timeout),
+            ("shutdown_grace", self.shutdown_grace),
         ] {
-            if duration.is_zero() {
-                return Err(ResolvedAgentRuntimeConfigError::NonPositiveDeadline { field });
+            if value.is_zero() {
+                return Err(AgentLimitsError::Zero(name));
             }
         }
-        for (field, capacity) in [
-            (
-                "background_concurrency",
-                kernel_config.background_concurrency,
-            ),
-            ("input_capacity", kernel_config.input_capacity),
-            ("tool_concurrency", kernel_config.tool_concurrency),
+        for (name, value) in [
+            ("background_workers", self.background_workers),
+            ("tool_slots", self.tool_slots),
+            ("active_jobs", self.active_jobs),
+            ("job_depth", self.job_depth),
+            ("pending_inputs", self.pending_inputs),
+            ("inquiries", self.inquiries),
+            ("context_bytes", self.context_bytes),
+            ("item_bytes", self.item_bytes),
+            ("tool_output_bytes", self.tool_output_bytes),
         ] {
-            if capacity == 0 {
-                return Err(ResolvedAgentRuntimeConfigError::NonPositiveCapacity { field });
+            if value == 0 {
+                return Err(AgentLimitsError::Zero(name));
             }
         }
-        Ok(Self {
-            tool_limits,
-            kernel_config,
-            shutdown_grace_period,
-        })
+        if self.item_bytes > self.context_bytes {
+            return Err(AgentLimitsError::ItemExceedsContext);
+        }
+        Ok(())
     }
 
-    pub fn tool_limits(&self) -> &ToolLimits {
-        &self.tool_limits
+    pub(crate) fn worker_slots(&self) -> usize {
+        self.background_workers + 1
     }
+}
 
-    pub fn kernel_config(&self) -> &KernelConfig {
-        &self.kernel_config
-    }
-
-    pub fn deadlines(&self) -> RuntimeDeadlines {
-        RuntimeDeadlines {
-            kernel_timeout: self.kernel_config.kernel_timeout,
-            work_timeout: self.kernel_config.work_timeout,
-            shutdown_grace_period: self.shutdown_grace_period,
+impl Default for AgentLimits {
+    fn default() -> Self {
+        Self {
+            coordination_timeout: Duration::from_secs(30),
+            work_timeout: Duration::from_secs(300),
+            tool_timeout: Duration::from_secs(120),
+            shutdown_grace: Duration::from_secs(5),
+            background_workers: 2,
+            tool_slots: 8,
+            active_jobs: 64,
+            job_depth: 8,
+            pending_inputs: 32,
+            inquiries: 32,
+            context_bytes: 96 * 1024,
+            item_bytes: 16 * 1024,
+            tool_output_bytes: 1024 * 1024,
         }
     }
 }
 
-/// A failure while validating Agent execution settings.
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum ResolvedAgentRuntimeConfigError {
-    #[error(transparent)]
-    ToolLimits(#[from] ToolLimitsError),
-    #[error("{field} must be greater than zero")]
-    NonPositiveDeadline { field: &'static str },
-    #[error("{field} must be greater than zero")]
-    NonPositiveCapacity { field: &'static str },
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AgentLimitsError {
+    #[error("{0} must be greater than zero")]
+    Zero(&'static str),
+    #[error("item_bytes cannot exceed context_bytes")]
+    ItemExceedsContext,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn kernel_config() -> KernelConfig {
-        KernelConfig {
-            kernel_timeout: Duration::from_secs(15),
-            work_timeout: Duration::from_secs(17),
-            background_concurrency: 3,
-            input_capacity: 7,
-            tool_concurrency: 4,
-        }
-    }
-
     #[test]
-    fn captures_explicit_deadlines_and_capacity_without_sharing_mutable_settings() {
-        let mut kernel = kernel_config();
-        let config = ResolvedAgentRuntimeConfig::new(
-            ToolLimits::default(),
-            kernel.clone(),
-            Duration::from_secs(2),
-        )
-        .unwrap();
-        kernel.kernel_timeout = Duration::from_secs(100);
-        kernel.background_concurrency = 99;
-        assert_ne!(config.kernel_config().kernel_timeout, kernel.kernel_timeout);
-        assert_ne!(
-            config.kernel_config().background_concurrency,
-            kernel.background_concurrency
-        );
-        assert_eq!(config.deadlines().kernel_timeout(), Duration::from_secs(15));
-        assert_eq!(config.deadlines().work_timeout(), Duration::from_secs(17));
-        assert_eq!(
-            config.deadlines().shutdown_grace_period(),
-            Duration::from_secs(2)
-        );
-        assert_eq!(config.kernel_config().background_concurrency, 3);
-        assert_eq!(config.kernel_config().input_capacity, 7);
-        assert_eq!(config.kernel_config().tool_concurrency, 4);
-    }
-
-    #[test]
-    fn rejects_each_zero_deadline_and_capacity() {
-        for field in ["kernel_timeout", "work_timeout", "shutdown_grace_period"] {
-            let mut kernel = kernel_config();
-            let mut grace = Duration::from_secs(2);
-            match field {
-                "kernel_timeout" => kernel.kernel_timeout = Duration::ZERO,
-                "work_timeout" => kernel.work_timeout = Duration::ZERO,
-                _ => grace = Duration::ZERO,
-            }
-            assert_eq!(
-                ResolvedAgentRuntimeConfig::new(ToolLimits::default(), kernel, grace).unwrap_err(),
-                ResolvedAgentRuntimeConfigError::NonPositiveDeadline { field },
-            );
-        }
-        for field in [
-            "background_concurrency",
-            "input_capacity",
-            "tool_concurrency",
-        ] {
-            let mut kernel = kernel_config();
-            match field {
-                "background_concurrency" => kernel.background_concurrency = 0,
-                "input_capacity" => kernel.input_capacity = 0,
-                _ => kernel.tool_concurrency = 0,
-            }
-            assert_eq!(
-                ResolvedAgentRuntimeConfig::new(
-                    ToolLimits::default(),
-                    kernel,
-                    Duration::from_secs(2)
-                )
-                .unwrap_err(),
-                ResolvedAgentRuntimeConfigError::NonPositiveCapacity { field },
-            );
-        }
-    }
-
-    #[test]
-    fn validates_tool_limits_before_starting_a_runtime() {
-        let limits = ToolLimits {
-            max_read_lines: 0,
-            ..ToolLimits::default()
+    fn validates_each_kind_of_limit() {
+        let mut limits = AgentLimits {
+            context_bytes: 0,
+            ..AgentLimits::default()
         };
-        assert!(matches!(
-            ResolvedAgentRuntimeConfig::new(limits, kernel_config(), Duration::from_secs(2)),
-            Err(ResolvedAgentRuntimeConfigError::ToolLimits(_)),
-        ));
+        assert_eq!(
+            limits.validate(),
+            Err(AgentLimitsError::Zero("context_bytes"))
+        );
+
+        limits.context_bytes = 1;
+        assert_eq!(limits.validate(), Err(AgentLimitsError::ItemExceedsContext));
+
+        limits.item_bytes = 1;
+        assert_eq!(limits.validate(), Ok(()));
+        assert_eq!(limits.worker_slots(), 3);
     }
 }

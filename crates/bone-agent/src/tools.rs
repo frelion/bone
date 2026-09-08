@@ -1,10 +1,8 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::sync::Arc;
 
-use crate::{CallContext, CallOutcome, ToolEffect, ToolPort, ToolSpec};
+use crate::{CallContext, PortFuture, ToolEffect, ToolOutcome, ToolPort, ToolSpec};
 use bone_tools::{Tool, ToolEnvironment};
 use serde_json::Value;
-
-use crate::model::cancelled;
 
 /// The agent's initial tool set. Classification belongs to the adapter, never to
 /// model-supplied arguments. Write tools need their own effect-aware adapter.
@@ -39,37 +37,31 @@ impl<T: Tool + 'static> ToolPort for ReadOnlyTool<T> {
         }
     }
 
-    fn run(
-        &self,
-        arguments: Value,
-        mut context: CallContext,
-    ) -> Pin<Box<dyn Future<Output = CallOutcome> + Send + 'static>> {
+    fn run(&self, arguments: Value, _context: CallContext) -> PortFuture<ToolOutcome> {
         let tool = Arc::clone(&self.tool);
         Box::pin(async move {
             let arguments = match serde_json::from_value::<T::Args>(arguments) {
                 Ok(arguments) => arguments,
                 Err(_) => {
-                    return CallOutcome::failed("tool arguments do not match the declared schema");
+                    return ToolOutcome::failed("tool arguments do not match the declared schema");
                 }
             };
-            let output = tokio::select! {
-                biased;
-                _ = context.wait_for_cancellation() => return cancelled(),
-                result = tool.call(arguments) => match result {
-                    Ok(output) => output,
-                    Err(error) => {
-                        let failure = tool.map_error(error);
-                        let message = failure.model_output().as_text()
-                            .map(str::to_owned)
-                            .or_else(|| failure.model_output().as_json().map(Value::to_string))
-                            .unwrap_or_else(|| "tool execution failed".into());
-                        return CallOutcome::failed(message);
-                    }
-                },
+            let output = match tool.call(arguments).await {
+                Ok(output) => output,
+                Err(error) => {
+                    let failure = tool.map_error(error);
+                    let message = failure
+                        .model_output()
+                        .as_text()
+                        .map(str::to_owned)
+                        .or_else(|| failure.model_output().as_json().map(Value::to_string))
+                        .unwrap_or_else(|| "tool execution failed".into());
+                    return ToolOutcome::failed(message);
+                }
             };
             match serde_json::to_value(output) {
-                Ok(value) => CallOutcome::artifact(value),
-                Err(_) => CallOutcome::failed("tool output could not be serialized"),
+                Ok(value) => ToolOutcome::value(value),
+                Err(_) => ToolOutcome::failed("tool output could not be serialized"),
             }
         })
     }

@@ -11,7 +11,7 @@ publish = false
 bone-llm = { path = "../bone-llm" }
 bone-tools = { path = "../bone-tools" }
 futures-util.workspace = true
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

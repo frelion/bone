@@ -1,76 +1,133 @@
 # Agent API
 
-bone-agent is an in-process event-driven core. The Kernel model assigns semantic jobs, full workers solve them, and the code Kernel is the sole state owner. Model and tool ports execute one call; they do not contain private agent loops.
+`bone-agent` 对宿主只提供一个运行中对象：`Agent`。它可克隆，所有副本都向同一个 Runtime Actor 发送输入或控制；Actor 内只有一个 Rust `Kernel` 写状态。
 
-**This rewrite intentionally breaks the old API. bone-app has not been migrated.** Settings storage, credentials, product history and future restart recovery remain outside this crate.
+## 启动
 
-## Construct a runtime
-
-The host connects models before passing them in. The two roles can use the same model instance or independent providers, with separate invocation contexts.
+产品接入通常使用 `Agent::start`：
 
 ```rust,ignore
-use std::time::Duration;
-use bone_agent::{
-    AgentHost, AgentModels, ConfiguredModel, Input, InputId,
-    KernelConfig, ResolvedAgentRuntimeConfig,
-};
+use bone_agent::{Agent, AgentLimits, ConfiguredModel};
 use bone_tools::ToolLimits;
 
-let models = AgentModels::new(
-    ConfiguredModel::without_options(kernel_model),
-    ConfiguredModel::without_options(worker_model),
-);
-let config = ResolvedAgentRuntimeConfig::new(
+let agent = Agent::start(
+    workspace,
+    ConfiguredModel::new(coordinator_model, coordinator_options)?,
+    ConfiguredModel::new(worker_model, worker_options)?,
+    AgentLimits::default(),
     ToolLimits::default(),
-    KernelConfig::default(),
-    Duration::from_secs(5),
 )?;
-let agent = AgentHost::new(models).start(workspace, config)?;
-let receipt = agent.post(Input::new(InputId(1), "Investigate the failure")).await?;
 ```
 
-ConfiguredModel validates protocol-specific options. AgentHost binds the supplied immutable configuration and installs the existing read/glob/grep tools. It does not read saved settings or initiate authentication.
+`ConfiguredModel` 只做一件事：保证 `ModelOptions` 属于同一种 provider protocol。`Agent::start` 安装现有的 read、glob、grep 工具。它不读取保存的设置，不处理登录，也不持久化对话。
 
-For custom adapters, use `Runtime::spawn(model_port, tools, kernel_config, runtime_config)`. Adapters must yield while waiting and release local resources when dropped. Tool effect classification comes from the registered adapter, never the model.
+自定义宿主可以实现：
 
-## Input, work and execution identities
+```rust,ignore
+use bone_agent::{Agent, AgentLimits, ModelPort, ToolPort};
 
-- InputId is supplied by the host and unique within a runtime. Same ID and identical content return the original receipt; conflicting content is rejected. IDs do not determine chronological order.
-- JobId identifies persistent semantic work. One input can affect many jobs, and later inputs can modify an existing job.
-- CallId identifies an actual model or tool invocation. EffectId identifies its logical action. This version does not automatically retry business writes or claim universal exactly-once behavior.
-
-A receipt means the Kernel accepted the input in memory, not that it was persisted or completed. Busy inputs are not accepted; the host retains them. A failed interpretation is observable and can be retried with `retry_input(id)`. A clarification or correction uses `Input::new(new_id, text).replying_to(original_id)` and may enter through the reserved path while ordinary admission is closed.
-
-New input combines with still-unresolved original words in acceptance order. The new fixed batch owns interpretation; a late investigation cannot reopen its superseded batch.
-
-## Role boundaries
-
-A `ModelTask::Kernel` returns exactly one `KernelDecision`: changes, optional session constraints, and Apply/Investigate/Clarify. It has no business tools and produces no substantive user answer.
-
-A `ModelTask::Work` returns exactly one `WorkProposal`: public material, optional reply, optional registered tool call, and a next step. Continue uses the background queue; Wait waits for tools or a timer; AskUser exposes a clarification; WaitForResult and WaitForJob express different dependencies. Coordinate requests semantic work-tree changes without acquiring new user authority.
-
-Kernel-model routing is not repeated for ordinary tool results, progress, timers or worker answers. Role contexts preserve raw assigned user text; workers receive their own material and explicit references, not every unrelated job's history.
-
-Session constraints are model-readable instructions. They are not a general machine-enforced authorization language. Only the host and effect-aware adapters can enforce concrete access, data-egress and resource policies.
-
-## Observe, stop and reconcile
-
-`observe().await` atomically returns the snapshot, sequence and a bounded stream of StepEvent. Each step contains its Event, new records and Effect summaries. A slow observer cannot block execution or keep a runtime alive; after Lagged, obtain a new baseline.
-
-Replies carry JobId, input attribution and an as-of cursor. InputHandled means interpretation was committed; InputFinished means all required deliveries reached terminal outcomes. JobFinished is local to that job, not the end of the runtime. Waiting or routing failure has its own notice.
-
-`stop()` revokes previously accepted work and pending routing without waiting for inference. It does not promise that externally authorized work was undone, and it does not revoke input still owned by a caller outside the runtime. Later accepted input may create new work but cannot revive cancelled jobs.
-
-Read-only calls can be abandoned locally. Writes retain None/Applied/Unknown independently of cancellation or Job state. After an Unknown result, only the host may call `resolve_write(call_id, verified_outcome)`. Identical confirmation is idempotent; conflicting confirmation is rejected. Related pending work reconsiders the newly established fact.
-
-`shutdown()` waits for local cleanup within its grace period and returns unresolved_calls, including unknown writes. It is not persistence or remote rollback.
-
-## Verify without a product app
-
-```sh
-cargo run -p bone-agent --example walkthrough --locked
-cargo run -p bone-agent --example interleaving --locked
-cargo test -p bone-agent --all-targets --all-features --locked
+let agent = Agent::with_ports(model_port, tool_ports, AgentLimits::default())?;
 ```
 
-The examples and controlled-provider tests use the actual Kernel, Runtime and model adapter without a live service or credentials. See the [crate guide](../crates/bone-agent/README.md), [design](agent-realtime-os-design.md) and [scenario map](agent-realtime-os-validation.md). Historical certifications describe their dated implementations, not this rewrite.
+`ModelPort` 有三个有类型的方法：`coordinate`、`work`、`compact`。`ToolPort::run` 执行一次注册工具调用。每个方法只代表一次 Call，不拥有私有工作队列或另一套 Agent 生命周期。
+
+`AgentLimits` 是一个普通配置值。以 default 开始，只修改需要的字段：
+
+```rust,ignore
+let limits = AgentLimits {
+    background_workers: 4,
+    context_bytes: 128 * 1024,
+    ..AgentLimits::default()
+};
+limits.validate()?;
+```
+
+Runtime 启动时会再执行同一个 `validate`，非法配置不会进入 Kernel。
+
+## 输入
+
+```rust,ignore
+let receipt = agent
+    .post(Input::new(InputId(turn), text))
+    .await?;
+```
+
+`InputId` 由宿主提供，在一个 Agent 生命周期内保持稳定。相同 ID 与相同内容重投会返回原 receipt，不增加 Record；相同 ID 与不同内容会返回 `AdmissionError::ConflictingInput`。
+
+receipt 表示输入已经被进程内 Kernel 接受，不表示工作完成或内容已经持久化。容量已满时 `post` 返回 Busy，宿主仍拥有原输入，可以稍后用同一 ID 重投。
+
+用户回答澄清问题时，创建新 ID，并引用当前处于 WaitingForUser 的那条输入：
+
+```rust,ignore
+agent
+    .post(Input::new(InputId(next_turn), answer).replying_to(waiting_input))
+    .await?;
+```
+
+路由失败不会自动重复模型调用。宿主确认要重试时调用 `agent.retry(input_id).await`。
+
+## 身份边界
+
+- `InputId` 标识宿主提交的一条原话。
+- `JobId` 标识一项有 owner、Spec、Context、revision 和唯一终态的语义工作。
+- `CallId` 标识一次实际模型或工具调用，也作为外部写入的幂等操作标识。
+- `Seq` 标识权威 Record 和它们的顺序。
+
+没有 EffectId、WakeId 或 generation。Job revision 足以判定模型提交是否仍然有效；CallId 足以对真实执行结果去重。
+
+## 观察
+
+```rust,ignore
+let mut observation = agent.observe().await?;
+render(&observation.baseline);
+
+while let Ok(record) = observation.records.recv().await {
+    if record.seq == Seq(observation.after.0 + 1) {
+        render_record(&record);
+        observation.after = record.seq;
+    }
+}
+```
+
+`observe().await` 由 Runtime Actor 原子完成两件事：先订阅后续 Record，再生成同一时刻的 `AgentView` baseline。Runtime 不在每个事件后复制完整快照。
+
+baseline 包含全部当前 Input、Job、保留的 Record，以及仍运行、请求取消或外部效果 Unknown 的 Call。后续流只发送语义事实：输入、路由、Job 创建/改约、工作 Note/Report、工具结果、进度、Inquiry、Delivery、Outcome 和控制结果。内部 Event、Effect 与调度队列不是宿主协议。
+
+广播是有界的，慢观察者不会阻塞 Agent。收到 `Lagged` 或发现 Seq gap 后重新调用 `observe().await`，用新 baseline 恢复并替换旧 receiver。Record 可能包含用户文字和工具输出，宿主决定显示、审计及持久化策略。
+
+宿主判断一次输入结束时应等待对应 `RecordBody::InputFinished`，或查看 `InputView.status == Finished(_)`。`Clarification` 是 WaitingForUser 边界，`InputRoutingFailed` 是可重试失败边界；两者都不是 Input 终态。一条 Reply、一个 Worker Call 完成或一个 child Outcome 都不等于输入已经结束。
+
+## 控制与终态
+
+```rust,ignore
+agent.pause(job).await?;
+agent.resume(job).await?;
+agent.cancel(job).await?;
+agent.stop().await?;
+let report = agent.shutdown().await?;
+```
+
+- Pause 保留 Job 和 Context，撤销当前调用资格；Resume 重新排队。
+- Cancel 封存该 Job 及其拥有子树，迟到模型结果不能改变终态。
+- Stop 取消当前森林、未完成路由和 Input，但 Runtime 仍可接受后续新输入。
+- Shutdown 先执行 Stop，再等待本地 Call 清理到 grace deadline，然后关闭 Actor。
+
+工具调用的实际外部效果独立于 Job 终态。`ExternalEffect::Unknown` 表示调用可能已经影响远端；本地取消不能把它改成未执行。宿主取得权威结果后调用：
+
+```rust,ignore
+agent.resolve_write(call_id, verified_tool_outcome).await?;
+```
+
+Unknown 不会自动重发。`ShutdownReport::unresolved_writes` 列出关闭时仍需核对的写入。
+
+## Job 与 Context
+
+协调模型可以建议 root Job，Worker 可以建议直属 child；模型不能填写 ID、owner 或 revision，也不能直接改变 Kernel 表。每份决定和每个 Delegate 批次都先整体校验，再一次提交。
+
+Worker 每次只看到一个冻结 `WorkInput`：当前 Spec、会话约束、自己的 checkpoint 与获准 Record、直属 child 的公开卡片、交给自己的 Inquiry、自己的 Calls 和注册工具。其他并行 Job 的私有上下文不会混入。
+
+`context_bytes` 计算序列化的 Agent context DTO，不计算模型适配器随后加入的 instructions、tool schema 或输出余量。默认 Worker 投影只列活跃直属 child 和运行中或 Unknown 的 Call；历史事实通过 Record 与 `Read` 访问。当前 Kernel 保留本进程的完整权威历史，尚未实现物理 GC，因此这个限制不等于进程总内存上限。
+
+`WorkProposal` 由可选 Note、可选 Report、已收到 Inquiry 的 answers，以及恰好一个 `WorkStep` 组成。Tool、Delegate、Reply 与 Finish 因而不能在同一提案里形成含糊的执行顺序。
+
+`JobStatus::Finished` 直接携带终态 `Arc<JobOutcome>`；没有另一份可冲突的 `outcome: Option<_>`。正常 Finish 仍需经过 Kernel 门禁。详细规则见 [Job 与 Context 设计](agent-job-context-design.md)和[实现设计](agent-job-context-implementation.md)。

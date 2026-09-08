@@ -1,67 +1,105 @@
 # bone-agent
 
-**Kernel 模型管工作，主力模型做工作，代码 Kernel 维护真实状态。**
+`bone-agent` 是一个进程内的实时 Agent OS。多个 Job 可以同时存在；Rust Kernel 是唯一状态写入者，模型只提交有类型的建议，Runtime 只执行 Kernel 已批准的调用。
 
-这是进程内的实时 Agent 内核。多个持续 Job 可以并存，模型调用有界并行；新消息不是后台工作完成后才能处理的“下一轮”。
+```text
+                        typed result
+  host ──> Agent ──> Runtime Actor ───────────────┐
+              │          │                         │
+              │          ├── ModelPort             │
+              │          └── ToolPort              │
+              │                                    ▼
+              └── observe <── Record <── Kernel::step
+                                           │
+                                           ├── Job forest
+                                           ├── scoped Context
+                                           ├── Routing / Inquiry
+                                           └── Call truth
+```
 
-当前只重写 bone-agent，**bone-app 尚未迁移到新 API**。这里不提供旧接口兼容层，也不接管配置存储、认证或数据库。
+协调模型属于 Agent Kernel 的决策路径，但它不是状态内核本身。代码 Kernel 决定何时需要协调，Runtime 执行这次模型调用，模型返回 `KernelDecision`，代码 Kernel 完整校验后才改变 Job。这样模型可以理解自然语言，Rust 仍然掌握并发、权限、生命周期和终态。
 
-## 先跑起来看
+## 最小入口
+
+```rust,ignore
+use bone_agent::{Agent, AgentLimits, ConfiguredModel, Input, InputId};
+use bone_tools::ToolLimits;
+
+let agent = Agent::start(
+    workspace,
+    ConfiguredModel::without_options(coordinator_model),
+    ConfiguredModel::without_options(worker_model),
+    AgentLimits::default(),
+    ToolLimits::default(),
+)?;
+
+let receipt = agent
+    .post(Input::new(InputId(1), "investigate the failing build"))
+    .await?;
+let observation = agent.observe().await?;
+```
+
+需要自定义模型或工具时，实现根模块导出的 `ModelPort`、`ToolPort`，然后调用 `Agent::with_ports`。Port 的一次方法调用就是一次 Call；Port 内不再运行另一套 Agent loop。
+
+可执行的无网络示例：
 
 ```sh
 cargo run -p bone-agent --example walkthrough --locked
-cargo run -p bone-agent --example interleaving --locked
 ```
 
-两个例子都执行真实 Kernel/Runtime，但使用受控模型结果，不访问模型服务。[walkthrough](examples/walkthrough.rs) 演示 A、B 并行及目标变更；[interleaving](examples/interleaving.rs) 演示异步工具、取消、定时和观察。
+## Job 生命周期
 
-## 五个核心抽象
+1. `post` 先把用户原话写成权威 Record，并创建一个 Routing。
+2. 协调模型返回一个 `KernelDecision`。它可以建议创建或更新 Job、读取公开事实、定向询问，或请求用户澄清。
+3. Kernel 原子校验整份决定，再创建 Job。Worker 也可以用一个 `Delegate` step 原子创建多个直属 child。
+4. Ready Job 获得一次冻结的 `WorkInput`。每个 Job 同时最多只有一个有提交资格的 Worker Call。
+5. Worker 返回可选 Note、Report、Inquiry answers，以及恰好一个 `WorkStep`。
+6. `Finish` 只有在必要消息已读、询问已结算、工具和直属 children 已结束、整个子树没有未知写入时才提交。
+7. `finish_job` 写入唯一 `JobOutcome`，把同一个 `Arc<JobOutcome>` 放入终态和 Record，再向仍活跃的 owner 投递引用。
+8. 一个输入关联的 required roots 全部终态后，Kernel 单独写入 `InputFinished`。
 
-- **Event**：用户原话、调用结果、进度、定时与宿主控制的统一入口。
-- **Kernel**：唯一状态写入者。`step(event) -> Vec<Effect>` 不做 I/O、不等待模型。
-- **Effect**：获准启动、取消、定时或发布的执行指令，不是成功证明。
-- **Runtime**：监督一次模型或工具调用，将真实结果送回 Kernel。
-- **Job**：一项持续工作，保存目标、状态、成果、原始输入和关系。一次调用另记为 Call。
+模型会建议创建 Job，但不能直接创建。协调模型只能通过 `KernelDecision::Apply` 提议 root 或更新；Worker 只能通过 `WorkStep::Delegate` 提议 child。ID、owner、revision、Context 和执行资格都由 Kernel 填写。
 
-自然语言先交给 Kernel 模型短分派：创建、更新或控制明确的 Job。主力随后拿到原文并深入求解；工具结果直接回到所属工作，答案不再经过 Kernel 模型审批。复杂输入可以委派调查或请求澄清。
+## Context
 
-`KernelDecision` 只表达工作调整；`WorkProposal` 只表达本 Job 的材料、回复、工具和下一步。工作证据不是新用户授权：worker 发起的协调不能重写已有目标、解除暂停或改会话约束，只能在自己的工作树内行动。
+事实正文只保存在 `BTreeMap<Seq, Arc<Record>>` 一次。每个 Job 的 Context 只保存：
 
-## 运行规则
+- 属于它的 Record 序号队列；
+- 已读水位；
+- 一个可选 checkpoint。
 
-- 默认 1 个 Kernel 槽、1 个交互主力槽、2 个后台主力槽、8 个工具槽。新用户工作优先交互槽，也可使用空闲后台容量；后台工作不能挤占交互保留槽。
-- 每 Job 至多一个有提交资格的主力。旧调用撤销资格后可以尚未结束，但仍计入实际容量。后台轮转，等待不占模型槽，工具候选按到达顺序轮转。
-- 目标和控制变化只撤销相关调用；普通进度和追加材料不让全部答案重新计算。
-- 拥有的子工作随父工作取消；引用关系不传播取消。等待“成果可用”和等待“整个工作完成”是两件事。
-- 未解释输入暂扣新的业务写入与可能过时的旧最终答案，计算和许可内的调查继续。候选等待时排空有限输入，避免不停接收消息导致永远不能交付。
-- 默认接受 32 个未解释普通输入，另保留一个定向澄清信封。Busy 没有接收消息；宿主保留并重试。Stop、显式重试和关联澄清走独立控制入口。
-- 路由失败不自行重试。显式重试保留原 ID；新用户输入则与尚未解决的原话按接收顺序组成新批次，接管解释权，旧调查只能留下材料。
-- Stop 同时撤销未完成分派与工作资格。已授权的外部行动只能尽力取消；本地取消不等于远端未执行。
+Worker 不接收全局聊天快照。`prepare_work` 只展开本 Job 获准读取的输入、投递、工具事实和查询结果，并附带仍活跃的直属 child 卡片以及仍运行或外部效果 Unknown 的 Call。其他 Job 的私有 Note、工具输出和中间推理不会进入它的输入。协调模型默认只收有界的活跃 root 页，其余目录通过 `Read` 继续读取。
 
-写入最多一个结果未决的调用。`None / Applied / Unknown` 独立于 Job 生命周期，Unknown 只能通过宿主的 `resolve_write(CallId, outcome)` 确证，不自动重发。确证后相关工作重新考虑旧提案。这里没有跨工具 exactly-once、权限 DSL 或任意外部资源的事务保证；宿主与工具适配器负责实际授权、隔离及条件写。
+`AgentLimits::context_bytes` 限制序列化后的 `WorkInput`、`CoordinateInput` 或 `CompactInput`，不包含模型适配器随后加入的 instructions、tool schema 和输出预留；宿主需要为真实模型窗口留出余量。当 Worker payload 超限时，Kernel 固定一个已经读过的前缀交给 `compact`。新消息留在后缀；checkpoint 不推进已读水位，也不会被再次作为普通 Record 展开。完成后的 Job 只能作为新 Job 的受限 seed 使用，旧 Job 不会重开。
 
-## 接入
+当前实现保证单次模型 payload、活跃 Job、并发 Call、待处理 Input/Inquiry、单项正文和工具输出的局部边界。为了保持证据引用与输入幂等，Kernel 尚未物理回收 `records/jobs/inputs/calls/routings`；完整会话历史随本次进程生命周期保留。进程内长期存储上限需要后续单独定义引用闭包与保留策略，不能简单按 checkpoint 水位删记录。
 
-通过 `AgentHost` 注入两个已连接模型和执行配置，或直接用 `Runtime::spawn` 注入受控端口。完整入口见 [Agent API](../../docs/agent.md)。
+## 并发与取消
 
-`post(Input::new(InputId(1), text))` 返回接受收据。同 ID 同内容重投幂等；改内容会拒绝。`Input::replying_to` 可澄清或纠正未决输入，也可回答工作正在等待的问题。
+- 交互 root 有一个保留 Worker 槽；后台 Job 使用有界并发。
+- 等待计时、Job、成果、询问或工具时不占模型槽。
+- Pause、Cancel、Spec revision、全局 constraints 改变和 Stop 会撤销受影响的旧模型提交资格。
+- 迟到模型结果只留下审计，不会复活 Job。
+- 迟到工具结果仍然是真实执行事实；外部写入的 `Unknown` 只能由宿主通过 `resolve_write` 确证，不能自动重发。
+- `stop` 终结当前工作森林；`shutdown` 再等待本地调用清理，并返回仍未知的外部写入。
 
-要求主力处理的新输入会撤销旧调用的交付资格，即使目标文字没变；所有原话按实际接收顺序提供。Keep 保留已有暂停状态，只有用户触发的 Resume 才能恢复暂停工作。
+## 代码阅读顺序
 
-输入已处理、Job 完成、整个请求交付、Runtime 关闭有独立通知。一个输入可能关联多个交付 Job；宿主应等待对应 `InputFinished`，不能凭一条 Reply 或某个 Call 结束判断请求完成。
+1. [`job.rs`](src/job.rs)：Job 契约、proposal、step、公开终态。
+2. [`context.rs`](src/context.rs)：权威 Record 和三种纯上下文投影。
+3. [`kernel/mod.rs`](src/kernel/mod.rs)：状态词汇与唯一事件入口。
+4. [`kernel/scheduler.rs`](src/kernel/scheduler.rs)、[`work.rs`](src/kernel/work.rs)、[`routing.rs`](src/kernel/routing.rs)、[`exchange.rs`](src/kernel/exchange.rs)：调度、工作事务、协调和消息交换。
+5. [`runtime.rs`](src/runtime.rs)：一个 Tokio Actor，只负责调用、取消、时间和观察。
+6. [`model.rs`](src/model.rs)：协调、工作和压缩的精确结构化协议。
 
-`observe()` 原子返回快照、序号和后续事件。慢观察者不阻塞执行；收到 Lagged 后重新 observe。事件与快照包含用户和工具材料，宿主负责隐私与保存策略；它们不是跨重启恢复协议。
+整体理由见 [Job 与 Context 设计](../../docs/agent-job-context-design.md)，代码不变量见 [实现设计](../../docs/agent-job-context-implementation.md)，宿主 API 见 [Agent API](../../docs/agent.md)。
 
-## 阅读与验证
-
-从 [lib.rs](src/lib.rs) 的事件和效果读起，然后看 [ports.rs](src/ports.rs) 的协议、[kernel.rs](src/kernel.rs) 的 `step / advance`、[runtime.rs](src/runtime.rs) 的执行循环。模型提示及协议在 [model.rs](src/model.rs)，角色上下文在 [context.rs](src/context.rs)。
+## 验证
 
 ```sh
-cargo fmt -p bone-agent --check
+cargo fmt --all --check
 cargo clippy -p bone-agent --all-targets --all-features --locked -- -D warnings
 cargo test -p bone-agent --all-targets --all-features --locked
 cargo test -p bone-agent --doc --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc -p bone-agent --no-deps --all-features --locked
 ```
-
-[设计](../../docs/agent-realtime-os-design.md)记录取舍，[场景验证](../../docs/agent-realtime-os-validation.md)区分自动化测试与明确不覆盖的场景。首版不承诺持久续跑、浏览器共享资源管理、多租户隔离或硬实时控制。

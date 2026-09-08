@@ -1,144 +1,77 @@
-//! An event-driven agent OS: semantic jobs, one state owner, asynchronous effects.
+//! A real-time agent kernel built around owned jobs and scoped context.
 //!
-//! The Kernel model assigns work; full-capability workers solve it. Both return
-//! proposals to [`Kernel::step`]. Only the kernel changes authoritative state;
-//! [`Runtime`] executes effects and feeds observations back into the same loop.
+//! [`Agent`] is the host API. A single runtime executes model and tool
+//! calls while a plain Rust kernel owns every state transition.
 #![forbid(unsafe_code)]
+
 mod app;
 mod config;
 mod context;
+mod job;
 mod kernel;
 mod model;
 mod ports;
 mod runtime;
 mod tools;
 
-pub use app::{AgentHost, AgentModels, ConfiguredModel, ConfiguredModelError, StartError};
-pub use config::{ResolvedAgentRuntimeConfig, ResolvedAgentRuntimeConfigError, RuntimeDeadlines};
-pub use kernel::{Kernel, KernelConfig, KernelError};
-pub use model::ModelAdapter;
-pub use ports::*;
-pub use runtime::{
-    AgentHandle, HandleError, Observation, Runtime, RuntimeConfig, RuntimeError, ShutdownReport,
+#[cfg(test)]
+mod tests;
+
+pub use app::{ConfiguredModel, ConfiguredModelError, StartError};
+pub use config::{AgentLimits, AgentLimitsError};
+pub use context::{
+    Checkpoint, CheckpointDraft, CompactInput, CoordinateInput, DeliveryKind, DeliveryTarget,
+    InquiryResult, JobCard, Origin, Record, RecordBody, RecordRange, RecordView, WorkInput,
 };
+pub use job::*;
+pub(crate) use model::ModelAdapter;
+pub use ports::*;
+pub use runtime::{Agent, AgentError, Observation, RuntimeError, ShutdownReport, UnresolvedWrite};
+pub(crate) use tools::read_only_tools;
+
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-pub use tools::read_only_tools;
+use std::{fmt, time::Duration};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct InputId(pub u64);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct JobId(pub u64);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct CallId(pub u64);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct EffectId(pub u64);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct WakeId(pub u64);
+macro_rules! id {
+    ($name:ident) => {
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            Default,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Serialize,
+            Deserialize,
+        )]
+        pub struct $name(pub u64);
 
-/// All input, including host controls and execution observations, enters here.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Event {
-    Input(Input),
-    RetryInput {
-        id: InputId,
-    },
-    CallFinished {
-        id: CallId,
-        outcome: CallOutcome,
-    },
-    CallProgress {
-        id: CallId,
-        progress: CallProgress,
-    },
-    /// Host-verified reconciliation, never a model's claim about a write.
-    WriteResolved {
-        id: CallId,
-        outcome: CallOutcome,
-    },
-    Wake {
-        id: WakeId,
-    },
-    Stop,
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+    };
 }
 
-/// Permission to start is not proof that an operation has happened.
-#[derive(Clone, Debug)]
-pub enum Effect {
-    Start {
-        id: CallId,
-        call: Call,
-        timeout: Option<Duration>,
-    },
-    RequestCancel {
-        id: CallId,
-    },
-    WakeAfter {
-        id: WakeId,
-        delay: Duration,
-    },
-    CancelWake {
-        id: WakeId,
-    },
-    Publish(Notice),
+id!(InputId);
+id!(JobId);
+id!(CallId);
+id!(Seq);
+
+impl Seq {
+    pub const ZERO: Self = Self(0);
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Notice {
-    InputHandled {
-        inputs: Vec<InputId>,
-        required_jobs: Vec<JobId>,
-    },
-    InputFinished {
-        id: InputId,
-        outcome: InputOutcome,
-    },
-    InputRoutingFailed {
-        inputs: Vec<InputId>,
-        message: String,
-    },
-    Clarification {
-        inputs: Vec<InputId>,
-        job: Option<JobId>,
-        question: String,
-    },
-    Reply {
-        job: JobId,
-        text: String,
-        reply_to: Vec<InputId>,
-        as_of: u64,
-    },
-    JobChanged {
-        job: JobSnapshot,
-    },
-    JobFinished {
-        id: JobId,
-        state: JobState,
-    },
-    CallStarted {
-        id: CallId,
-        job: Option<JobId>,
-        request: CallRequest,
-    },
-    CallProgress {
-        id: CallId,
-        job: Option<JobId>,
-        progress: CallProgress,
-    },
-    CallFinished {
-        id: CallId,
-        job: Option<JobId>,
-        outcome: CallOutcome,
-    },
-    Error {
-        message: String,
-    },
-    Stopped,
-}
+/// Monotonic time elapsed since one runtime started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MonoTime(pub Duration);
 
-/// Receipt of acceptance into this runtime, not durable storage or completion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InputReceipt {
-    pub id: InputId,
-    pub record_cursor: u64,
+impl MonoTime {
+    pub fn after(self, duration: Duration) -> Self {
+        Self(self.0.saturating_add(duration))
+    }
 }
