@@ -1,5 +1,9 @@
 # Model API
 
+> The `bone-llm` contract and examples remain current. Product assembly notes
+> from the former TUI application are superseded by the
+> [headless App architecture](bone-app-design.md).
+
 `bone-llm` is BONE's provider-independent model library. Provider clients and
 wire DTOs are implementation details; callers use BONE types from request
 construction through response replay.
@@ -262,8 +266,8 @@ Supported public endpoint constructors are:
 - `openai_responses::official` / `compatible`;
 - `openai_chat_completions::official` / `compatible`;
 - `anthropic_messages::official` / `compatible`;
-- `chatgpt_subscription::connect` for the experimental ChatGPT subscription
-  service.
+- `chatgpt_subscription::connect` and `connect_cached` for interactive and
+  non-interactive ChatGPT subscription connection.
 
 Compatible base URLs must be absolute HTTP(S) URLs without embedded
 credentials or query strings. Authentication and routing configuration are
@@ -292,8 +296,9 @@ lease; `bone-llm` never discovers or manages the credential location itself.
 The backend does not honor `max_output_tokens` or structured-output schemas,
 so BONE rejects those options locally instead of pretending they were applied.
 
-`bone-app` is the composition root: it opens `BoneStore`, resolves typed
-global/Workspace/Session settings into a non-secret runtime plan, acquires a
-provider credential capability, constructs coordinator/solver models, and
-creates `AgentHost::new(AgentModels)`. `bone-agent` performs no
-storage/configuration read at runtime. See [configuration and storage](configuration.md).
+`bone-app` is the composition root: it opens its private storage, resolves
+typed User/Workspace/Session settings into a non-secret `RuntimeConfig`,
+acquires provider credentials, builds a `ModelAdapter`, assembles tools and
+history background, then starts `Agent::with_ports_and_background`.
+`bone-agent` performs no storage or configuration read while the Runtime is
+working. See the [App architecture](bone-app-design.md).

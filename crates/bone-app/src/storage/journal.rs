@@ -3,13 +3,13 @@ use std::{fmt, marker::PhantomData, sync::Arc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{
+use super::{
     StoreError,
     document::{decode_payload, encode_payload, unix_millis},
     sqlite::StoreInner,
 };
 
-pub(crate) const MAX_JOURNAL_ENTRY_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_JOURNAL_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 
 /// The durable address of one append-only journal.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -45,9 +45,12 @@ pub struct JournalEntry<E> {
 pub struct JournalRead<E> {
     pub entries: Vec<JournalEntry<E>>,
     pub next_sequence: u64,
+    pub last_sequence: u64,
+    pub has_more: bool,
 }
 
 impl<E> JournalRead<E> {
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -84,6 +87,7 @@ impl<E> Journal<E> {
         &self.key
     }
 
+    #[cfg(test)]
     pub fn read(&self) -> Result<JournalRead<E>, StoreError>
     where
         E: DeserializeOwned,
@@ -92,7 +96,30 @@ impl<E> Journal<E> {
         read_journal(&connection, &self.key)
     }
 
+    pub fn read_after(&self, after: u64, limit: usize) -> Result<JournalRead<E>, StoreError>
+    where
+        E: DeserializeOwned,
+    {
+        let connection = self.inner.connection()?;
+        read_journal_after(&connection, &self.key, after, limit)
+    }
+
+    #[cfg(test)]
+    pub fn read_entry(&self, sequence: u64) -> Result<Option<JournalEntry<E>>, StoreError>
+    where
+        E: DeserializeOwned,
+    {
+        let connection = self.inner.connection()?;
+        read_journal_entry(&connection, &self.key, sequence)
+    }
+
+    pub fn last_sequence(&self) -> Result<u64, StoreError> {
+        let connection = self.inner.connection()?;
+        read_last_journal_sequence(&connection, &self.key)
+    }
+
     /// Append one event under a short `BEGIN IMMEDIATE` transaction.
+    #[cfg(test)]
     pub fn append(&self, event: &E) -> Result<JournalAppend, StoreError>
     where
         E: Serialize,
@@ -114,6 +141,7 @@ pub(crate) fn same_store<E>(journal: &Journal<E>, store: &Arc<StoreInner>) -> bo
     Arc::ptr_eq(&journal.inner, store)
 }
 
+#[cfg(test)]
 pub(crate) fn read_journal<E>(
     connection: &Connection,
     key: &JournalKey,
@@ -121,18 +149,33 @@ pub(crate) fn read_journal<E>(
 where
     E: DeserializeOwned,
 {
+    read_journal_after(connection, key, 0, usize::MAX)
+}
+
+pub(crate) fn read_journal_after<E>(
+    connection: &Connection,
+    key: &JournalKey,
+    after: u64,
+    limit: usize,
+) -> Result<JournalRead<E>, StoreError>
+where
+    E: DeserializeOwned,
+{
+    let after_sql = i64::try_from(after).map_err(|_| StoreError::RevisionExhausted)?;
+    let limit_sql = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
     let mut statement = connection
         .prepare(
             "
                 SELECT sequence, occurred_at, payload_json
                 FROM journal_entries
-                WHERE journal_key = ?1
+                WHERE journal_key = ?1 AND sequence > ?2
                 ORDER BY sequence ASC
+                LIMIT ?3
             ",
         )
         .map_err(|error| StoreError::sqlite("prepare journal read", error))?;
     let rows = statement
-        .query_map([key.as_str()], |row| {
+        .query_map(params![key.as_str(), after_sql, limit_sql], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -141,43 +184,130 @@ where
         })
         .map_err(|error| StoreError::sqlite("read journal", error))?;
     let mut entries = Vec::new();
-    let mut expected = 1_u64;
+    let mut expected = after.checked_add(1).ok_or(StoreError::RevisionExhausted)?;
+    let mut has_more = false;
     for row in rows {
         let (sequence, occurred_at, payload_json) =
             row.map_err(|error| StoreError::sqlite("read journal", error))?;
-        let sequence = u64::try_from(sequence)
-            .ok()
-            .filter(|sequence| *sequence > 0)
-            .ok_or(StoreError::Corrupt {
-                message: "journal sequence is invalid",
-            })?;
+        if entries.len() == limit {
+            has_more = true;
+            break;
+        }
+        let entry = decode_entry(sequence, occurred_at, payload_json)?;
+        let sequence = entry.sequence;
         if sequence != expected {
             return Err(StoreError::Corrupt {
                 message: "journal sequence is not contiguous",
             });
         }
-        if occurred_at < 0 {
-            return Err(StoreError::Corrupt {
-                message: "journal timestamp is invalid",
-            });
-        }
-        if payload_json.len() > MAX_JOURNAL_ENTRY_BYTES {
-            return Err(StoreError::Corrupt {
-                message: "journal payload exceeds its maximum size",
-            });
-        }
-        entries.push(JournalEntry {
-            sequence,
-            occurred_at,
-            event: decode_payload(&payload_json)?,
-        });
+        entries.push(entry);
         expected = expected
             .checked_add(1)
             .ok_or(StoreError::RevisionExhausted)?;
     }
+    let last_sequence = entries.last().map_or(after, |entry| entry.sequence);
     Ok(JournalRead {
         entries,
         next_sequence: expected,
+        last_sequence,
+        has_more,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn read_journal_entry<E>(
+    connection: &Connection,
+    key: &JournalKey,
+    sequence: u64,
+) -> Result<Option<JournalEntry<E>>, StoreError>
+where
+    E: DeserializeOwned,
+{
+    if sequence == 0 {
+        return Ok(None);
+    }
+    let sequence_sql = i64::try_from(sequence).map_err(|_| StoreError::RevisionExhausted)?;
+    let row = connection
+        .query_row(
+            "
+                SELECT sequence, occurred_at, payload_json
+                FROM journal_entries
+                WHERE journal_key = ?1 AND sequence = ?2
+            ",
+            params![key.as_str(), sequence_sql],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| StoreError::sqlite("read journal entry", error))?;
+    row.map(|(sequence, occurred_at, payload_json)| {
+        decode_entry(sequence, occurred_at, payload_json)
+    })
+    .transpose()
+}
+
+pub(crate) fn read_last_journal_sequence(
+    connection: &Connection,
+    key: &JournalKey,
+) -> Result<u64, StoreError> {
+    let sequence = connection
+        .query_row(
+            "
+                SELECT sequence
+                FROM journal_entries
+                WHERE journal_key = ?1
+                ORDER BY sequence DESC
+                LIMIT 1
+            ",
+            [key.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::sqlite("read journal tail", error))?;
+    match sequence {
+        None => Ok(0),
+        Some(sequence) => u64::try_from(sequence)
+            .ok()
+            .filter(|sequence| *sequence > 0)
+            .ok_or(StoreError::Corrupt {
+                message: "journal sequence is invalid",
+            }),
+    }
+}
+
+fn decode_entry<E>(
+    sequence: i64,
+    occurred_at: i64,
+    payload_json: String,
+) -> Result<JournalEntry<E>, StoreError>
+where
+    E: DeserializeOwned,
+{
+    let sequence = u64::try_from(sequence)
+        .ok()
+        .filter(|sequence| *sequence > 0)
+        .ok_or(StoreError::Corrupt {
+            message: "journal sequence is invalid",
+        })?;
+    if occurred_at < 0 {
+        return Err(StoreError::Corrupt {
+            message: "journal timestamp is invalid",
+        });
+    }
+    if payload_json.len() > MAX_JOURNAL_ENTRY_BYTES {
+        return Err(StoreError::Corrupt {
+            message: "journal payload exceeds its maximum size",
+        });
+    }
+    Ok(JournalEntry {
+        sequence,
+        occurred_at,
+        event: decode_payload(&payload_json)?,
     })
 }
 
@@ -248,7 +378,7 @@ fn next_journal_sequence(
 mod tests {
     use serde::Serialize;
 
-    use crate::{BoneStore, JournalKey, StoreRoots};
+    use super::super::{BoneStore, JournalKey, StoreRoots};
 
     #[derive(Serialize)]
     struct WriteOnlyEvent {
@@ -271,6 +401,66 @@ mod tests {
         assert_eq!(first.sequence, 1);
         assert_eq!(second.sequence, 2);
         assert_eq!(journal.read().unwrap().next_sequence, 3);
+    }
+
+    #[test]
+    fn journal_pages_in_sql_sequence_order() {
+        let (_temporary, store) = store();
+        let journal = store.journal::<String>(JournalKey::new("test/pages"));
+        for value in ["one", "two", "three", "four", "five"] {
+            journal.append(&value.to_owned()).unwrap();
+        }
+
+        let first = journal.read_after(0, 2).unwrap();
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| (entry.sequence, entry.event.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "one"), (2, "two")]
+        );
+        assert_eq!(first.next_sequence, 3);
+        assert_eq!(first.last_sequence, 2);
+        assert!(first.has_more);
+
+        let second = journal.read_after(2, 2).unwrap();
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| (entry.sequence, entry.event.as_str()))
+                .collect::<Vec<_>>(),
+            [(3, "three"), (4, "four")]
+        );
+        assert_eq!(second.next_sequence, 5);
+        assert_eq!(second.last_sequence, 4);
+        assert!(second.has_more);
+
+        let last = journal.read_after(4, 2).unwrap();
+        assert_eq!(last.entries[0].sequence, 5);
+        assert_eq!(last.next_sequence, 6);
+        assert_eq!(last.last_sequence, 5);
+        assert!(!last.has_more);
+        let empty = journal.read_after(5, 2).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.last_sequence, 5);
+        assert!(!empty.has_more);
+        assert_eq!(journal.last_sequence().unwrap(), 5);
+    }
+
+    #[test]
+    fn journal_reads_one_exact_sequence() {
+        let (_temporary, store) = store();
+        let journal = store.journal::<String>(JournalKey::new("test/by-sequence"));
+        journal.append(&"one".to_owned()).unwrap();
+        journal.append(&"two".to_owned()).unwrap();
+
+        let entry = journal.read_entry(2).unwrap().unwrap();
+        assert_eq!(entry.sequence, 2);
+        assert_eq!(entry.event, "two");
+        assert!(journal.read_entry(0).unwrap().is_none());
+        assert!(journal.read_entry(3).unwrap().is_none());
     }
 
     #[test]

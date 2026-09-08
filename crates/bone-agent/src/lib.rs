@@ -20,14 +20,15 @@ mod tests;
 pub use app::{ConfiguredModel, ConfiguredModelError, StartError};
 pub use config::{AgentLimits, AgentLimitsError};
 pub use context::{
-    Checkpoint, CheckpointDraft, CompactInput, CoordinateInput, DeliveryKind, DeliveryTarget,
-    InquiryResult, JobCard, Origin, Record, RecordBody, RecordRange, RecordView, WorkInput,
+    BackgroundEntry, BootstrapContext, Checkpoint, CheckpointDraft, CompactInput, CoordinateInput,
+    DeliveryKind, DeliveryTarget, InquiryResult, JobCard, Origin, Record, RecordBody, RecordRange,
+    RecordView, WorkInput,
 };
 pub use job::*;
-pub(crate) use model::ModelAdapter;
+pub use model::ModelAdapter;
 pub use ports::*;
 pub use runtime::{Agent, AgentError, Observation, RuntimeError, ShutdownReport, UnresolvedWrite};
-pub(crate) use tools::read_only_tools;
+pub use tools::read_only_tools;
 
 use serde::{Deserialize, Serialize};
 use std::{fmt, time::Duration};

@@ -1,193 +1,117 @@
 # BONE
 
-BONE is a Rust coding agent with a full-screen terminal interface. Start it in
-the directory where you want to work: that exact directory is the Workspace.
-BONE does not walk up to a Git root and never creates a `.bone` directory in
-the project.
+BONE is a Rust workspace for building coding agents. The current product layer
+is headless: `bone-app` assembles models, tools, persistence, and `bone-agent`
+behind a frontend-neutral Rust API.
 
-The product is designed so normal users never need to locate or edit a
-configuration file. The terminal is the settings surface, and changes are
-saved immediately.
+The previous terminal UI and `bone` CLI have been removed. A new TUI can be
+built as a separate frontend crate over the same `App` and `Session` API used
+by future desktop, web, or automation clients.
 
 ## Architecture
 
 ```text
-bone-app ──────────┬─► bone-agent ──┬─► bone-llm ──► rig-core
-                   │                 └─► bone-tools ──► bone-llm
-                   └─► bone-store
+future frontends
+      │
+      ▼
+  bone-app ───────► bone-agent
+      ├───────────► bone-llm
+      ├───────────► bone-tools
+      └───────────► private storage/ (SQLite, journals, leases)
 ```
 
-- `bone-app` is the composition root: the `bone` binary, Workspace/Session
-  domain, settings policy, and the terminal UI.
-- `bone-store` is a small generic SQLite backend: keyed documents, journals,
-  short transactions, and file leases. It has no Workspace, settings, or
-  provider knowledge.
-- `bone-app` defines the durable keys and typed records, then injects storage
-  into its settings and Workspace/Session services. No other product crate
-  depends on `bone-store`.
-- `bone-agent` receives two already-connected role models plus immutable Agent
-  limits/deadlines. It never opens user storage, selects a provider, or reads
-  settings while a runtime is working.
-- `bone-llm` owns protocol adapters and non-secret wire configuration. Its
-  ChatGPT subscription adapter accepts a narrow application-owned OAuth-cache
-  capability rather than discovering a credential directory or storage.
-- `bone-tools` provides workspace-local tools and their validated limits.
+- `bone-app` owns configuration, profiles and credentials, durable workspaces
+  and sessions, Agent assembly, write-effect tracking, and runtime lifecycle.
+- `bone-agent` owns input routing, Job state, scoped context, model/tool calls,
+  control, and structured records.
+- `bone-llm` owns provider-independent model requests and wire adapters.
+- `bone-tools` owns workspace-local read, search, patch, and process tools.
 
-The TUI has a unidirectional presentation flow:
+The former `bone-store` crate now lives in `bone-app`'s private `storage/`
+module. Frontends see product objects and errors rather than documents,
+journal keys, transactions, or SQLite types.
+
+## Application API
+
+`App` is the composition root. It opens workspaces, creates and retrieves
+sessions, manages configuration and credentials, and shuts down live
+runtimes. `Session` is the execution handle a frontend retains.
+
+```rust,no_run
+use bone_app::{App, AppOptions, SessionSeq, SubmitInput};
+
+# async fn example() -> bone_app::Result<()> {
+let app = App::open(AppOptions::new("/absolute/path/to/app-data")).await?;
+let workspace = app.open_workspace("/absolute/path/to/workspace").await?;
+let session = app.create_session(workspace.id, "New session").await?;
+
+let mut view = session.observe();
+let receipt = session.submit(SubmitInput::new("Inspect this workspace")).await?;
+let history = session.history(SessionSeq(0), 100).await?;
+
+# let _ = (&mut view, receipt, history);
+app.shutdown().await?;
+# Ok(())
+# }
+```
+
+Submitting succeeds once the input is durable. Execution may remain queued
+with a configuration problem until a frontend saves a model selection or
+finishes login, then calls `Session::retry`. Asynchronous startup failures are
+published as typed `AppProblem` values, so a frontend can react to
+`LoginRequired(ProfileId)` without parsing display text.
+
+Current state arrives through `Session::observe`, a Tokio `watch` receiver.
+Durable events come from `Session::history(after, limit)`. Clients keep the
+returned cursor and can recover after disconnecting without relying on an
+in-memory event stream. Runtime-local Job and Call IDs are wrapped with a
+`RuntimeId`, so stale control requests cannot affect a replacement runtime.
+
+Configuration is typed and resolves in this order:
 
 ```text
-terminal / runtime event → App::reduce → typed effect → result AppEvent → App::reduce → render
+Session override > Workspace override > User setting
 ```
 
-Reducers do not access storage or the network. Durable writes happen in the
-effect layer, and rendering is a pure projection of `App` state.
+`App::update_config(scope, change)` saves one explicit change. A running
+runtime keeps its frozen configuration; the next runtime uses the newly
+resolved value.
 
-## Run
+## Persistence
 
-For interactive use, launch BONE from the desired Workspace:
+The host chooses an absolute data directory through `AppOptions`. `bone-app`
+stores its SQLite database at `<data_dir>/bone.sqlite3`; it does not impose an
+XDG or project-local path.
 
-```sh
-cd ~/code/my-project
-bone
+SQLite stores workspace and session records, input idempotency, runtime
+configuration snapshots, durable Agent records, history, and write attempts.
+API keys remain in the operating-system credential manager. A write remains
+blocking until its result is durably acknowledged by the matching Agent fact;
+after a crash, the host resolves any unacknowledged write explicitly.
+`App::unresolved_writes` is the authoritative cross-Session query.
 
-# During development from this repository:
-cd ~/code/my-project
-cargo run --manifest-path /path/to/bone/Cargo.toml -p bone-app --bin bone
-```
+Process restart restores product state and marks work lost with its runtime as
+interrupted. It does not restore in-memory Job futures or replay uncertain
+external writes.
 
-The first launch creates a Workspace record, a draft Session, and default
-global settings. It deliberately does **not** guess a model or start a login.
-You can browse Sessions and edit a draft while the UI shows the normal
-`NeedsModel` state.
-
-The built-in `chatgpt` profile uses a ChatGPT subscription. Add an API-key
-profile before selecting a model from it:
-
-```text
-/provider                  list saved connection profiles
-/provider add openai responses
-/provider add gateway chat https://gateway.example/v1
-/provider add anthropic anthropic
-
-/model gpt-5.6                     use the built-in ChatGPT profile
-/model openai gpt-5.6              set this Session's solver profile/model
-/model default gateway my-model    set this Workspace's solver default
-/model global anthropic claude     set the user-wide solver default
-/model coordinator openai gpt-5.6  set the user-wide coordinator
-/model openai gpt-5 --timeout 90 --reasoning-effort high --reasoning-summary concise
-/model inherit             remove this Session override
-/login                     connect or retry ChatGPT subscription login
-/logout                    remove the local login cache when no runtime owns it
-/new  /sessions  /resume   manage Sessions in this Workspace
-/rename <title>  /archive  organize the current Session
-/status  /workspace        inspect the current state
-/config doctor             check whether settings storage is usable
-```
-
-`responses`, `chat`, and `anthropic` select OpenAI Responses, OpenAI Chat
-Completions, and Anthropic Messages respectively. An optional compatible base
-URL must be HTTPS. Profile IDs are create-only: use a new ID when changing an
-endpoint, then explicitly enter a key for that new profile.
-
-`/model` accepts an optional `--timeout <seconds>` for every profile. The
-currently implemented OpenAI Responses controls are explicit too:
-`--reasoning-effort <none|minimal|low|medium|high|xhigh|max>`,
-`--reasoning-summary <auto|concise|detailed>`, `--reasoning-mode pro`, and
-`--reasoning-context <auto|all_turns|current_turn>`. They work with the
-Responses protocol (including `chatgpt`) and are rejected for other protocols;
-there is no generic raw-JSON parameter escape hatch.
-
-Set an API key outside the TUI so it never becomes command text, SQLite data,
-or shell history:
-
-```sh
-# This also works before the first interactive TUI launch:
-bone provider add openai responses
-bone credentials set openai
-bone credentials clear openai
-```
-
-Model precedence is:
-
-```text
-Session override > Workspace default > User default
-```
-
-Saved settings are immediately visible. A currently attached Agent runtime is
-pinned to the immutable configuration it started with; a new or recreated
-runtime uses a newly resolved configuration. BONE does not claim runtime hot
-switching where it has not implemented one.
-
-Only a typed single-line slash command is local. Pasted or multiline text is
-always model-visible; use `//text` to send a slash-prefixed message. Unknown
-commands stay local and show suggestions.
-
-For one request, pass its text:
-
-```sh
-cargo run -p bone-app --bin bone -- --profile openai --model gpt-5.6 "Read Cargo.toml and list the workspace crates"
-```
-
-In interactive mode, `--model` (or `BONE_MODEL`) and optional `--profile` (or
-`BONE_PROFILE`) save an override on the Session opened for that launch. In
-one-shot mode they are ephemeral inputs for that invocation; an explicit
-profile/model pins both coordinator and solver to that one selection. Omitting
-a profile uses `chatgpt`. Neither form creates a hidden fourth settings scope.
-`--events session.jsonl` is an explicit new-file export of runtime
-observations; it is not BONE's Session database.
-
-## Local data and privacy
-
-All BONE-owned settings, Workspace records, Sessions, drafts, status summaries,
-and event histories live in one bundled-SQLite database:
-
-```text
-$XDG_DATA_HOME/bone/store-v1/bone.sqlite3
-# fallback: ~/.local/share/bone/store-v1/bone.sqlite3
-```
-
-Connection profiles (ID, protocol, and HTTPS base URL) are non-secret typed
-SQLite settings. API keys are stored in the operating system credential
-manager under a profile-and-endpoint-bound slot and are never written to
-SQLite. Rig's ChatGPT OAuth cache is separately stored because Rig owns its
-schema and token-refresh lifecycle:
-
-```text
-$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/auth.json
-# fallback: ~/.config/bone/store-v1/providers/chatgpt-subscription/auth.json
-```
-
-`bone-app` chooses the SQLite data root, the OS credential slot, and the
-private ChatGPT cache location. `bone-store` owns WAL, fail-fast write
-contention, and generic lease files. API keys and OAuth payloads never enter
-SQLite, a journal, debug output, or model-visible tool output.
-
-Older BONE JSON/JSONL/config data is intentionally neither read nor migrated.
-It is left untouched; this release starts from the separate `store-v1` root.
-See [configuration and storage](docs/configuration.md) for the complete
-contract.
-
-## Develop
-
-Start with [the Agent API](docs/agent.md), [configuration and storage]
-(docs/configuration.md), [the model API](docs/model-api.md), and the
-[TUI architecture](docs/tui-architecture.md).
+## Validation
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace --all-features --offline
-cargo clippy --workspace --all-targets --all-features --offline -- -D warnings
-cargo run -p bone-app --bin bone --offline -- --help
+cargo test -p bone-app --lib --locked
+cargo test --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+There is currently no `cargo run -p bone-app` command because `bone-app` has
+no binary target.
+
+Start with the [App architecture](docs/bone-app-design.md),
+[Agent API](docs/agent.md), [model API](docs/model-api.md), and
+[built-in tools](docs/tools.md). Documents under `docs/product/` and the old
+TUI architecture describe the removed frontend and are retained as historical
+design input for its future standalone replacement.
+
 The active implementation is in [`crates/`](crates/). [`legacy/`](legacy/)
-contains historical material and is deliberately not part of the current
-workspace build. [`third_party/`](third_party/) contains the pinned Rig patch.
-
-## Product design
-
-The current product contract is in the [Workspace PRD]
-(docs/product/tui-workspace-prd.md), [interaction design]
-(docs/product/tui-interaction-design.md), and [runtime architecture]
-(docs/product/tui-runtime-architecture.md). A static visual review is available
-in the [TUI design](docs/product/bone-tui-design.html).
+contains historical material and is not part of the workspace build.
+[`third_party/`](third_party/) contains the pinned Rig patch.

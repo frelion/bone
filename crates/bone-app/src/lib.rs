@@ -1,48 +1,36 @@
-//! The product application for BONE's terminal UI and one-shot CLI.
+//! Headless application layer for BONE.
 //!
-//! `bone-agent` remains the execution engine. This crate owns the durable
-//! workspace/session domain, the setting policies that span it, and the
-//! terminal presentation that turns those facts into a product. The durable
-//! and TUI implementations stay in separate modules so the package boundary
-//! stays small without merging unrelated responsibilities.
-
+//! [`App`] owns configuration, credentials, persistence, and live sessions.
+//! [`Session`] is the only execution handle a frontend needs. Terminal, web,
+//! and one-shot clients consume the same snapshots and durable history.
 #![forbid(unsafe_code)]
 
+mod api;
+mod app;
+mod config;
 mod credentials;
-pub mod durable;
-mod product_workspace;
-mod profiles;
+mod error;
+mod persistence;
 mod providers;
-mod settings;
+mod session;
 mod storage;
-pub mod tui;
+mod tools;
 
-pub use credentials::{
-    ApiKey, ApiKeyCredentialError, ApiKeyCredentials, ChatGptAuthLease, ChatGptCredentials,
-    CredentialError,
-};
-pub use durable::{
-    CanonicalPath, JournalEntry, JournalError, JournalFact, JournalRead, JournalSequence,
-    RecordError, RegistryError, RuntimeAttachment, SessionAttention, SessionAvailability,
-    SessionDraft, SessionExecution, SessionId, SessionJournal, SessionLeaseError, SessionLifecycle,
-    SessionListing, SessionMetadata, SessionRecord, SessionStatus, SessionStore, SessionStoreError,
-    SessionStoreIssue, SessionWriter, TurnOutcome, UnixMillis, WorkspaceContext, WorkspaceError,
-    WorkspaceId, WorkspaceRegistry,
-};
+pub use api::*;
+pub use app::{App, LoginAttempt};
+pub use config::*;
+pub use credentials::{ApiKey, ApiKeyCredentialError};
+pub use error::{Error, Result};
+pub use session::Session;
 
-pub use product_workspace::{
-    DraftDisposition, OpenDraft, OpenWriterDraft, WorkspaceApplication, WorkspaceApplicationError,
+pub use bone_agent::{
+    AgentLimits, CallError, CallErrorKind, ExternalEffect, InputOutcome, OutcomeKind, ToolOutcome,
 };
-pub use profiles::{
-    CHATGPT_PROFILE_ID, LlmProfile, LlmProfileError, LlmProfileId, LlmProfileIdError, LlmProfiles,
-    LlmProfilesError,
-};
-pub use providers::{ProviderConnectError, ProviderConnector};
-pub use settings::{
-    ApplyBoundary, GlobalAgentSettings, GlobalSettings, ModelResolution, ModelSelection,
-    ModelSelectionError, PUBLIC_SETTINGS, ResolvedModel, ResolvedRuntime, Scope, ScopeKind,
-    SettingDescriptor, SettingKey, SettingKeyError, SettingSource, SettingsError, SettingsService,
-    TuiDisplaySettings, WorkspaceSettings,
-};
-pub use storage::{AppStorageError, open_default_store};
-pub use tui::{TuiError, run_storage_repair, run_workspace, write_events};
+pub use bone_llm::{EndpointConfig, ModelOptions};
+pub use bone_tools::ToolLimits;
+
+pub(crate) use persistence::{DataStore, SavedRuntime, SavedSession};
+pub(crate) use providers::ProviderConnector;
+
+#[cfg(test)]
+mod tests;

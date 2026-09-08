@@ -6,7 +6,7 @@ use std::{
 
 use fs2::FileExt;
 
-use crate::StoreError;
+use super::StoreError;
 
 /// Create a private directory if it is absent, then return its canonical path.
 ///
@@ -159,8 +159,7 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), StoreError> {
 
 #[cfg(unix)]
 fn effective_uid() -> u32 {
-    // SAFETY: `geteuid` reads process metadata only.
-    unsafe { libc::geteuid() }
+    rustix::process::geteuid().as_raw()
 }
 
 fn unsafe_storage(path: &Path, reason: &'static str) -> StoreError {

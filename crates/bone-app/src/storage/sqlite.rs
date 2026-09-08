@@ -8,7 +8,7 @@ use std::{
 
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
-use crate::{
+use super::{
     StoreError, StoreRoots, schema,
     security::{
         FileDisposition, ensure_private_directory, ensure_private_file, validate_private_directory,
@@ -16,13 +16,15 @@ use crate::{
     },
 };
 
+const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+
 #[derive(Debug)]
 pub(crate) struct StoreInner {
     roots: StoreRoots,
     database_path: PathBuf,
-    // Keeping one configured connection alive prevents a quiet store from
-    // repeatedly tearing down and recovering its WAL between short reads.
-    _anchor: Mutex<Connection>,
+    // One connection serializes this App's short write transactions and keeps
+    // a quiet store from repeatedly tearing down and recovering its WAL.
+    writer: Mutex<Connection>,
 }
 
 impl StoreInner {
@@ -50,7 +52,7 @@ impl StoreInner {
         Ok(Arc::new(Self {
             roots,
             database_path,
-            _anchor: Mutex::new(connection),
+            writer: Mutex::new(connection),
         }))
     }
 
@@ -70,8 +72,7 @@ impl StoreInner {
         self: &Arc<Self>,
         operation: impl FnOnce(&Transaction<'_>) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
-        let mut connection = open_connection(&self.roots, &self.database_path)?;
-        configure_writer(&connection)?;
+        let mut connection = self.writer.lock().expect("store writer mutex poisoned");
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| StoreError::sqlite("begin write transaction", error))?;
@@ -113,7 +114,7 @@ fn open_connection(roots: &StoreRoots, database_path: &Path) -> Result<Connectio
     )
     .map_err(|error| StoreError::sqlite("open database", error))?;
     connection
-        .busy_timeout(Duration::ZERO)
+        .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| StoreError::sqlite("configure busy timeout", error))?;
     Ok(connection)
 }

@@ -8,7 +8,7 @@ use keyring::{Entry, Error as KeyringError};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::profiles::LlmProfile;
+use crate::config::Profile;
 
 const SERVICE: &str = "bone-api-key";
 
@@ -65,7 +65,7 @@ pub struct ApiKeyCredentials {
 
 impl ApiKeyCredentials {
     /// Opens the credential slot associated with a stable App profile ID.
-    pub fn for_profile(profile: &LlmProfile) -> Result<Self, ApiKeyCredentialError> {
+    pub fn for_profile(profile: &Profile) -> Result<Self, ApiKeyCredentialError> {
         profile
             .validate()
             .map_err(|_| ApiKeyCredentialError::Unavailable)?;
@@ -103,7 +103,7 @@ fn map_read_error(error: KeyringError) -> ApiKeyCredentialError {
     }
 }
 
-fn credential_account(profile: &LlmProfile) -> Result<String, ApiKeyCredentialError> {
+fn credential_account(profile: &Profile) -> Result<String, ApiKeyCredentialError> {
     let endpoint =
         serde_json::to_vec(&profile.endpoint).map_err(|_| ApiKeyCredentialError::Unavailable)?;
     let mut hasher = Sha256::new();
@@ -123,10 +123,10 @@ mod tests {
 
     use bone_llm::EndpointConfig;
 
-    use super::{ApiKey, ApiKeyCredentialError, ApiKeyCredentials, LlmProfile};
+    use super::{ApiKey, ApiKeyCredentialError, ApiKeyCredentials, Profile};
 
-    fn profile(id: &str, endpoint: EndpointConfig) -> LlmProfile {
-        LlmProfile::new(crate::LlmProfileId::new(id).unwrap(), id, endpoint).unwrap()
+    fn profile(id: &str, endpoint: EndpointConfig) -> Profile {
+        Profile::new(crate::config::ProfileId::new(id).unwrap(), id, endpoint).unwrap()
     }
 
     fn install_mock_keyring() {

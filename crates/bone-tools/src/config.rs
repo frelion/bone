@@ -125,7 +125,7 @@ impl Default for ToolLimits {
 }
 
 impl ToolLimits {
-    /// Validate limits before binding them into a [`ToolEnvironment`].
+    /// Validate limits before binding them into a [`crate::ToolEnvironment`].
     pub fn validate(&self) -> Result<(), ToolLimitsError> {
         for (field, value) in [
             ("max_output_bytes", self.max_output_bytes),

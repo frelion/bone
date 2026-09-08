@@ -8,9 +8,10 @@ use tokio::{
 };
 
 use crate::{
-    AdmissionError, AgentLimits, AgentView, Call, CallContext, CallError, CallErrorKind, CallId,
-    Effect, Event, ExternalEffect, Input, InputId, InputReceipt, JobId, ModelPort, MonoTime,
-    Record, Seq, ToolEffect, ToolOutcome, ToolPort, kernel::Kernel,
+    AdmissionError, AgentLimits, AgentView, BootstrapContext, Call, CallContext, CallError,
+    CallErrorKind, CallId, ControlOutcome, Effect, Event, ExternalEffect, Input, InputId,
+    InputReceipt, JobId, ModelPort, MonoTime, Record, Seq, ToolEffect, ToolOutcome, ToolPort,
+    kernel::{Kernel, KernelControl},
 };
 
 const INPUT_QUEUE: usize = 64;
@@ -43,9 +44,10 @@ pub struct UnresolvedWrite {
     pub tool: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShutdownReport {
     pub unresolved_writes: Vec<UnresolvedWrite>,
+    pub final_view: Arc<AgentView>,
 }
 
 pub struct Observation {
@@ -71,27 +73,31 @@ impl Agent {
         result.await.map_err(|_| AgentError::Closed)?
     }
 
-    pub async fn retry(&self, input: InputId) -> Result<(), AgentError> {
+    pub async fn retry(&self, input: InputId) -> Result<ControlOutcome, AgentError> {
         self.control(ControlKind::Retry(input)).await
     }
 
-    pub async fn pause(&self, job: JobId) -> Result<(), AgentError> {
+    pub async fn pause(&self, job: JobId) -> Result<ControlOutcome, AgentError> {
         self.control(ControlKind::Pause(job)).await
     }
 
-    pub async fn resume(&self, job: JobId) -> Result<(), AgentError> {
+    pub async fn resume(&self, job: JobId) -> Result<ControlOutcome, AgentError> {
         self.control(ControlKind::Resume(job)).await
     }
 
-    pub async fn cancel(&self, job: JobId) -> Result<(), AgentError> {
+    pub async fn cancel(&self, job: JobId) -> Result<ControlOutcome, AgentError> {
         self.control(ControlKind::Cancel(job)).await
     }
 
-    pub async fn stop(&self) -> Result<(), AgentError> {
+    pub async fn stop(&self) -> Result<ControlOutcome, AgentError> {
         self.control(ControlKind::Stop).await
     }
 
-    pub async fn resolve_write(&self, call: CallId, result: ToolOutcome) -> Result<(), AgentError> {
+    pub async fn resolve_write(
+        &self,
+        call: CallId,
+        result: ToolOutcome,
+    ) -> Result<ControlOutcome, AgentError> {
         self.control(ControlKind::ResolveWrite { call, result })
             .await
     }
@@ -118,7 +124,7 @@ impl Agent {
         }
     }
 
-    async fn control(&self, kind: ControlKind) -> Result<(), AgentError> {
+    async fn control(&self, kind: ControlKind) -> Result<ControlOutcome, AgentError> {
         let (reply, result) = oneshot::channel();
         self.controls
             .send(Control::Command { kind, reply })
@@ -134,6 +140,15 @@ impl Agent {
         tools: Vec<Arc<dyn ToolPort>>,
         limits: AgentLimits,
     ) -> Result<Self, RuntimeError> {
+        Self::with_ports_and_background(model, tools, limits, BootstrapContext::default())
+    }
+
+    pub fn with_ports_and_background(
+        model: Arc<dyn ModelPort>,
+        tools: Vec<Arc<dyn ToolPort>>,
+        limits: AgentLimits,
+        background: BootstrapContext,
+    ) -> Result<Self, RuntimeError> {
         let executor =
             tokio::runtime::Handle::try_current().map_err(|_| RuntimeError::NoTokioRuntime)?;
         let mut ports = BTreeMap::new();
@@ -143,7 +158,7 @@ impl Agent {
             specifications.push(spec.clone());
             ports.insert(spec.name, (tool, spec.effect));
         }
-        let kernel = Kernel::new(limits, specifications)
+        let kernel = Kernel::with_background(limits, specifications, background)
             .map_err(|error| RuntimeError::InvalidConfiguration(error.to_string()))?;
         let (inputs, input_rx) = mpsc::channel(INPUT_QUEUE);
         let (controls, control_rx) = mpsc::channel(CONTROL_QUEUE);
@@ -186,7 +201,7 @@ struct InputCommand {
 enum Control {
     Command {
         kind: ControlKind,
-        reply: oneshot::Sender<Result<(), AgentError>>,
+        reply: oneshot::Sender<Result<ControlOutcome, AgentError>>,
     },
     Observe(oneshot::Sender<Observation>),
     Shutdown,
@@ -229,15 +244,17 @@ impl Actor {
         let mut controls_open = true;
         loop {
             if self.shutdown_complete() {
+                let final_view = Arc::new(self.kernel.view());
                 self.shutdown.send_replace(Some(ShutdownReport {
                     unresolved_writes: self.kernel.unresolved_writes(),
+                    final_view,
                 }));
                 return;
             }
             let deadline = earliest(
                 self.kernel
                     .next_deadline()
-                    .map(|time| self.started + time.0),
+                    .and_then(|time| self.started.checked_add(time.0)),
                 self.shutdown_at,
             );
             tokio::select! {
@@ -286,17 +303,19 @@ impl Actor {
                 let _ = reply.send(Err(AgentError::ShuttingDown));
             }
             Control::Command { kind, reply } => {
-                self.apply(match kind {
-                    ControlKind::Retry(input) => Event::Retry(input),
-                    ControlKind::Pause(job) => Event::Pause(job),
-                    ControlKind::Resume(job) => Event::Resume(job),
-                    ControlKind::Cancel(job) => Event::Cancel(job),
-                    ControlKind::Stop => Event::Stop,
+                let command = match kind {
+                    ControlKind::Retry(input) => KernelControl::Retry(input),
+                    ControlKind::Pause(job) => KernelControl::Pause(job),
+                    ControlKind::Resume(job) => KernelControl::Resume(job),
+                    ControlKind::Cancel(job) => KernelControl::Cancel(job),
+                    ControlKind::Stop => KernelControl::Stop,
                     ControlKind::ResolveWrite { call, result } => {
-                        Event::WriteResolved { call, result }
+                        KernelControl::ResolveWrite { call, result }
                     }
-                });
-                let _ = reply.send(Ok(()));
+                };
+                let (outcome, effects) = self.kernel.control(self.now(), command);
+                self.dispatch(effects);
+                let _ = reply.send(Ok(outcome));
             }
             Control::Shutdown => self.begin_shutdown(),
         }
@@ -390,8 +409,9 @@ impl Actor {
         }
         self.shutting_down = true;
         self.inputs.close();
-        self.shutdown_at = Some(Instant::now() + self.kernel.limits.shutdown_grace);
-        self.apply(Event::Stop);
+        self.shutdown_at = Instant::now().checked_add(self.kernel.limits.shutdown_grace);
+        let (_, effects) = self.kernel.control(self.now(), KernelControl::Stop);
+        self.dispatch(effects);
     }
 
     fn shutdown_complete(&self) -> bool {
@@ -529,8 +549,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        CheckpointDraft, CompactInput, CoordinateInput, PortFuture, ToolSpec, WorkInput,
-        WorkProposal,
+        Assignment, Await, CheckpointDraft, CompactInput, CoordinateInput, JobChange, JobSpec,
+        PortFuture, ToolSpec, WorkInput, WorkProposal, WorkStep,
     };
 
     struct PanicOnceModel {
@@ -716,8 +736,133 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(*shutdown.borrow(), Some(ShutdownReport::default()));
+        let report = shutdown.borrow().clone().unwrap();
+        assert!(report.unresolved_writes.is_empty());
+        assert!(matches!(
+            report.final_view.inputs[0].status,
+            crate::InputStatus::Finished(crate::InputOutcome::Cancelled)
+        ));
         assert!(retained_model.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn controls_report_state_changes_and_shutdown_returns_the_final_view() {
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let agent = Agent::with_ports(
+            Arc::new(PendingModel { started }),
+            Vec::new(),
+            AgentLimits::default(),
+        )
+        .unwrap();
+        agent.post(Input::new(InputId(1), "wait")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(agent.stop().await.unwrap(), ControlOutcome::Applied);
+        assert_eq!(agent.stop().await.unwrap(), ControlOutcome::Unchanged);
+        assert_eq!(
+            agent.pause(JobId(999)).await.unwrap(),
+            ControlOutcome::Unchanged
+        );
+
+        let report = agent.shutdown().await.unwrap();
+        assert!(matches!(
+            report.final_view.inputs[0].status,
+            crate::InputStatus::Finished(crate::InputOutcome::Cancelled)
+        ));
+        assert!(report.final_view.records.iter().any(|record| {
+            matches!(
+                record.body,
+                crate::RecordBody::InputFinished {
+                    input: InputId(1),
+                    outcome: crate::InputOutcome::Cancelled,
+                }
+            )
+        }));
+    }
+
+    struct MaxWaitModel;
+
+    impl ModelPort for MaxWaitModel {
+        fn coordinate(
+            &self,
+            input: CoordinateInput,
+            _: CallContext,
+        ) -> PortFuture<Result<crate::KernelDecision, CallError>> {
+            let mut assignment = Assignment::new(JobSpec::new("wait", "wait", "wait"));
+            assignment.inputs = input.inputs.into_iter().map(|input| input.id).collect();
+            Box::pin(async move {
+                Ok(crate::KernelDecision::Apply {
+                    changes: vec![JobChange::Create(assignment)],
+                    constraints: None,
+                })
+            })
+        }
+
+        fn work(
+            &self,
+            _: WorkInput,
+            _: CallContext,
+        ) -> PortFuture<Result<WorkProposal, CallError>> {
+            Box::pin(async {
+                Ok(WorkProposal::new(WorkStep::Wait(Await::After(
+                    Duration::MAX,
+                ))))
+            })
+        }
+
+        fn compact(
+            &self,
+            _: CompactInput,
+            _: CallContext,
+        ) -> PortFuture<Result<CheckpointDraft, CallError>> {
+            panic!("unexpected compact call")
+        }
+    }
+
+    #[tokio::test]
+    async fn maximum_wait_duration_does_not_kill_the_runtime() {
+        let agent =
+            Agent::with_ports(Arc::new(MaxWaitModel), Vec::new(), AgentLimits::default()).unwrap();
+        agent.post(Input::new(InputId(1), "wait")).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let observation = agent.observe().await.unwrap();
+                if observation.baseline.jobs.iter().any(|job| {
+                    matches!(
+                        job.status,
+                        crate::JobStatus::Waiting(crate::WaitView::Until(_))
+                    )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        agent.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn maximum_shutdown_grace_does_not_kill_the_runtime() {
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let limits = AgentLimits {
+            shutdown_grace: Duration::MAX,
+            ..AgentLimits::default()
+        };
+        let agent =
+            Agent::with_ports(Arc::new(PendingModel { started }), Vec::new(), limits).unwrap();
+        agent.post(Input::new(InputId(1), "wait")).await.unwrap();
+        starts.recv().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), agent.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

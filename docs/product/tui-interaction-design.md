@@ -1,5 +1,7 @@
 # BONE TUI 前端交互设计稿
 
+> **历史设计（2026-09-09）。** 旧 TUI 已随 `bone-app` headless 重写移除；本文只作为重做前端时的体验素材，不描述当前可运行接口。当前后端契约见 [bone-app-design.md](../bone-app-design.md)，未来 TUI 只能经由 `bone-app` API 接入。
+
 | 字段 | 内容 |
 | --- | --- |
 | 文档状态 | 当前实现基线 + 后续交互设计参考 |

@@ -117,7 +117,6 @@ where
 {
     let endpoint_id = endpoint_id.into();
     validate_endpoint_id(&endpoint_id)?;
-    let auth: Arc<dyn ChatGptAuthCache> = Arc::new(auth);
     let auth_file = auth.auth_file().to_path_buf();
     let interactive_client = rig_chatgpt::Client::builder()
         .oauth()
@@ -141,6 +140,23 @@ where
         .await
         .map_err(|_| Error::AuthorizationFailed)?;
 
+    connect_cached(endpoint_id, auth).await
+}
+
+/// Connect using the existing OAuth cache, refreshing tokens when necessary.
+///
+/// This entry point never begins a device-code login. Missing or unusable
+/// authorization returns [`Error::AuthorizationFailed`], so applications can
+/// expose an explicit sign-in action before retrying runtime creation.
+pub async fn connect_cached<A>(endpoint_id: impl Into<String>, auth: A) -> Result<Endpoint, Error>
+where
+    A: ChatGptAuthCache,
+{
+    let endpoint_id = endpoint_id.into();
+    validate_endpoint_id(&endpoint_id)?;
+    let auth: Arc<dyn ChatGptAuthCache> = Arc::new(auth);
+    let auth_file = auth.auth_file().to_path_buf();
+
     // Runtime requests must fail instead of unexpectedly starting an
     // interactive device-code flow.
     let client = rig_chatgpt::Client::builder()
@@ -153,6 +169,11 @@ where
         .http_client(no_redirect_http_client().map_err(|_| Error::InvalidClientConfiguration)?)
         .build()
         .map_err(|_| Error::InvalidClientConfiguration)?;
+
+    client
+        .authorize()
+        .await
+        .map_err(|_| Error::AuthorizationFailed)?;
 
     Endpoint::from_model_factory_with_support(
         endpoint_id,

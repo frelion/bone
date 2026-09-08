@@ -3,7 +3,7 @@ use std::{io, path::PathBuf};
 use rusqlite::{Error as SqliteError, ErrorCode};
 use thiserror::Error;
 
-use crate::Revision;
+use super::Revision;
 
 /// Failures from the local durable store.
 ///

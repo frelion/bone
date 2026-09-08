@@ -1,22 +1,20 @@
 use super::*;
 
 impl Kernel {
-    pub(super) fn reply_target(&self, input: InputId) -> Option<ReplyTarget> {
+    pub(super) fn reply_target(&self, input: InputId) -> Option<(ReplyTarget, Seq)> {
         let entry = self.inputs.get(&input)?;
-        if matches!(
-            self.routings[&entry.routing].state,
-            RoutingState::WaitingForUser(_)
-        ) {
-            return Some(ReplyTarget::Routing(entry.routing));
+        if let RoutingState::WaitingForUser(question) = self.routings[&entry.routing].state {
+            return Some((ReplyTarget::Routing(entry.routing), question));
         }
         let job = self.user_question?;
-        (entry.finished.is_none()
+        if entry.finished.is_none()
             && self.jobs[&job].inputs.contains(&input)
-            && matches!(
-                self.jobs[&job].state,
-                JobState::Waiting(WaitState::User { .. })
-            ))
-        .then_some(ReplyTarget::Job(job))
+            && let JobState::Waiting(WaitState::User { question }) = self.jobs[&job].state
+        {
+            Some((ReplyTarget::Job(job), question))
+        } else {
+            None
+        }
     }
 
     pub(super) fn supersede_input_routings(
@@ -188,6 +186,7 @@ impl Kernel {
                 {
                     return Err("invalid routing inquiry".into());
                 }
+                self.validate_model_text("routing inquiry", &question)?;
                 self.open_inquiry(
                     DeliveryTarget::Routing(routing),
                     job,
@@ -219,6 +218,7 @@ impl Kernel {
                 if !matches!(route.requester, Requester::Inputs) || question.trim().is_empty() {
                     return Err("only user input routing may ask for clarification".into());
                 }
+                self.validate_model_text("clarification question", &question)?;
                 self.clarify_routing(routing, question, effects);
             }
         }
@@ -233,6 +233,9 @@ impl Kernel {
     ) -> Result<(), String> {
         if constraints.is_some() && !matches!(route.requester, Requester::Inputs) {
             return Err("worker coordination cannot change session constraints".into());
+        }
+        if let Some(constraints) = constraints {
+            self.validate_model_text("session constraints", constraints)?;
         }
         let creates = changes
             .iter()
@@ -356,7 +359,7 @@ impl Kernel {
         {
             Err("job goal, scope and done_when must be non-empty".into())
         } else {
-            Ok(())
+            self.validate_model_item("job spec", spec)
         }
     }
 
@@ -416,9 +419,15 @@ impl Kernel {
                 }
                 match action {
                     JobAction::Keep => {}
-                    JobAction::Pause => self.pause(job, effects),
-                    JobAction::Resume => self.resume(job, effects),
-                    JobAction::Cancel => self.cancel(job, effects),
+                    JobAction::Pause => {
+                        let _ = self.pause(job, effects);
+                    }
+                    JobAction::Resume => {
+                        let _ = self.resume(job, effects);
+                    }
+                    JobAction::Cancel => {
+                        let _ = self.cancel(job, effects);
+                    }
                 }
                 if !matches!(self.jobs[&job].state, JobState::Finished(_)) {
                     self.enqueue_job(job);
@@ -760,18 +769,19 @@ impl Kernel {
         });
     }
 
-    pub(super) fn retry(&mut self, input: InputId) {
+    pub(super) fn retry(&mut self, input: InputId) -> bool {
         let Some(entry) = self.inputs.get(&input) else {
-            return;
+            return false;
         };
         let routing = entry.routing;
         let RoutingState::Failed(failure) = self.routings[&routing].state else {
-            return;
+            return false;
         };
         let route = self.routings.get_mut(&routing).expect("routing exists");
         route.active_call = None;
         route.records.push(failure);
         self.make_routing_ready(routing);
+        true
     }
 
     pub(super) fn finish_inputs(&mut self, effects: &mut Vec<Effect>) {

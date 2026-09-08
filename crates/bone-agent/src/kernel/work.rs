@@ -82,14 +82,18 @@ impl Kernel {
         if proposal
             .note
             .as_ref()
-            .is_some_and(|note| note.trim().is_empty() || note.len() > self.limits.item_bytes)
+            .is_some_and(|note| note.trim().is_empty())
         {
-            return Err("work note is empty or too large".into());
+            return Err("work note is empty".into());
+        }
+        if let Some(note) = &proposal.note {
+            self.validate_model_text("work note", note)?;
         }
         if let Some(report) = &proposal.report {
             self.validate_report(job, report)?;
         }
         for answer in &proposal.answers {
+            self.validate_model_item("inquiry answer", answer)?;
             if !delivered_inquiries.contains(&answer.inquiry) {
                 return Err(format!(
                     "inquiry {} was not delivered to this call",
@@ -98,6 +102,11 @@ impl Kernel {
             }
             if let InquiryResponse::Answer(report) = &answer.response {
                 self.validate_report(job, report)?;
+            }
+            if let InquiryResponse::NeedsWork(reason) | InquiryResponse::Unavailable(reason) =
+                &answer.response
+            {
+                self.validate_model_text("inquiry answer", reason)?;
             }
             if let Some(inquiry) = self.inquiries.get(&answer.inquiry)
                 && inquiry.target != job
@@ -111,6 +120,7 @@ impl Kernel {
                 if !tool.arguments.is_object() {
                     return Err("tool arguments must be an object".into());
                 }
+                self.validate_model_item("tool call", tool)?;
                 let Some(spec) = self.tools.get(&tool.name) else {
                     return Err(format!("unknown tool: {}", tool.name));
                 };
@@ -134,6 +144,7 @@ impl Kernel {
                 {
                     return Err("only a user-owned job may ask a non-empty user question".into());
                 }
+                self.validate_model_text("user question", question)?;
                 Ok(())
             }
             WorkStep::Inquire {
@@ -147,13 +158,14 @@ impl Kernel {
                 {
                     return Err("invalid job inquiry".into());
                 }
+                self.validate_model_text("job inquiry", question)?;
                 Ok(())
             }
             WorkStep::Coordinate(request) => {
                 if request.trim().is_empty() {
                     Err("coordination request cannot be empty".into())
                 } else {
-                    Ok(())
+                    self.validate_model_text("coordination request", request)
                 }
             }
             WorkStep::Read(query) => self.validate_read(DeliveryTarget::Job(job), query),
@@ -162,7 +174,7 @@ impl Kernel {
                 if text.trim().is_empty() || !matches!(self.jobs[&job].owner, Owner::User) {
                     Err("only a user-owned job may send a non-empty reply".into())
                 } else {
-                    Ok(())
+                    self.validate_model_text("reply", text)
                 }
             }
             WorkStep::Finish(completion) | WorkStep::Fail(completion) => {
@@ -172,9 +184,10 @@ impl Kernel {
     }
 
     fn validate_report(&self, job: JobId, report: &ReportDraft) -> Result<(), String> {
-        if report.summary.trim().is_empty() || report.summary.len() > self.limits.item_bytes {
-            return Err("report summary is empty or too large".into());
+        if report.summary.trim().is_empty() {
+            return Err("report summary is empty".into());
         }
+        self.validate_model_item("report", report)?;
         if report
             .evidence
             .iter()
@@ -187,10 +200,10 @@ impl Kernel {
     }
 
     fn validate_completion(&self, job: JobId, completion: &Completion) -> Result<(), String> {
-        if completion.summary.trim().is_empty() || completion.summary.len() > self.limits.item_bytes
-        {
-            return Err("completion summary is empty or too large".into());
+        if completion.summary.trim().is_empty() {
+            return Err("completion summary is empty".into());
         }
+        self.validate_model_item("completion", completion)?;
         if completion
             .evidence
             .iter()
@@ -640,16 +653,16 @@ impl Kernel {
         }
     }
 
-    pub(super) fn pause(&mut self, job: JobId, effects: &mut Vec<Effect>) {
+    pub(super) fn pause(&mut self, job: JobId, effects: &mut Vec<Effect>) -> bool {
         if self
             .jobs
             .get(&job)
             .is_none_or(|entry| matches!(entry.state, JobState::Finished(_)))
         {
-            return;
+            return false;
         }
         if self.jobs[&job].local_paused {
-            return;
+            return false;
         }
         self.jobs.get_mut(&job).expect("job exists").local_paused = true;
         self.record(
@@ -679,14 +692,15 @@ impl Kernel {
                 effects,
             );
         }
+        true
     }
 
-    pub(super) fn resume(&mut self, job: JobId, effects: &mut Vec<Effect>) {
+    pub(super) fn resume(&mut self, job: JobId, effects: &mut Vec<Effect>) -> bool {
         let Some(entry) = self.jobs.get_mut(&job) else {
-            return;
+            return false;
         };
         if matches!(entry.state, JobState::Finished(_)) || !entry.local_paused {
-            return;
+            return false;
         }
         entry.local_paused = false;
         self.record(
@@ -697,17 +711,24 @@ impl Kernel {
         for member in self.subtree(job) {
             self.enqueue_job(member);
         }
+        true
     }
 
-    pub(super) fn cancel(&mut self, job: JobId, effects: &mut Vec<Effect>) {
-        if self.jobs.contains_key(&job) {
-            self.finish_job(
-                job,
-                OutcomeKind::Cancelled,
-                Completion::new("cancelled by the host"),
-                effects,
-            );
+    pub(super) fn cancel(&mut self, job: JobId, effects: &mut Vec<Effect>) -> bool {
+        if self
+            .jobs
+            .get(&job)
+            .is_none_or(|entry| matches!(entry.state, JobState::Finished(_)))
+        {
+            return false;
         }
+        self.finish_job(
+            job,
+            OutcomeKind::Cancelled,
+            Completion::new("cancelled by the host"),
+            effects,
+        );
+        true
     }
 
     pub(super) fn change_spec(&mut self, job: JobId, spec: JobSpec, effects: &mut Vec<Effect>) {
@@ -817,7 +838,24 @@ impl Kernel {
             .collect()
     }
 
-    pub(super) fn stop(&mut self, effects: &mut Vec<Effect>) {
+    pub(super) fn stop(&mut self, effects: &mut Vec<Effect>) -> bool {
+        let active = self
+            .calls
+            .values()
+            .any(|call| matches!(call.state, CallState::Running))
+            || !self.inquiries.is_empty()
+            || self
+                .routings
+                .values()
+                .any(|routing| !matches!(routing.state, RoutingState::Closed))
+            || self
+                .jobs
+                .values()
+                .any(|job| !matches!(job.state, JobState::Finished(_)))
+            || self.inputs.values().any(|input| input.finished.is_none());
+        if !active {
+            return false;
+        }
         let calls = self
             .calls
             .iter()
@@ -877,5 +915,6 @@ impl Kernel {
             );
         }
         self.record(Origin::Kernel, RecordBody::Stopped, effects);
+        true
     }
 }

@@ -1,5 +1,9 @@
 # Built-in tools
 
+> The concrete tool behavior in this document remains current. References to
+> the removed TUI, `AgentHost`, and old settings types are superseded by the
+> [headless App architecture](bone-app-design.md).
+
 `bone-tools` contains BONE's provider-independent, workspace-local tool
 implementations. Ownership stays explicit:
 
@@ -8,8 +12,8 @@ implementations. Ownership stays explicit:
 - `bone-tools` owns the typed native `Tool` interface and its filesystem and
   process implementations.
 - `bone-agent` owns asynchronous job execution through `ToolPort`.
-- `bone-app` resolves persisted `ToolLimits` from `GlobalSettings` and includes
-  them in an immutable `ResolvedAgentRuntimeConfig` before starting an Agent.
+- `bone-app` resolves persisted `ToolSettings` into an immutable
+  `RuntimeConfig` before starting an Agent.
 
 Rig is confined to `bone-llm`. Tools do not read BONE settings, SQLite, OAuth
 paths, or credential data themselves.
@@ -28,13 +32,23 @@ The first tool set is deliberately small:
 - `bash`: one-shot, non-interactive `bash -c` execution with bounded output,
   deadlines, structured non-zero exits, and Unix process-group cleanup.
 
-There is no model-facing configuration tool. Settings are a user-owned TUI
-surface, and OAuth data is never exposed to the model.
+There is no model-facing configuration tool. Frontends change settings through
+the App API, and OAuth data is never exposed to the model.
 
-Every built-in implements `bone_tools::Tool`. `bone-agent` currently adapts
-`read`, `glob`, and `grep` to `ToolPort`, converting validated JSON arguments
-and typed outputs at that boundary. An adapter supplies trusted external-effect
-metadata.
+Every built-in implements `bone_tools::Tool`. `bone-agent` exposes the
+read-only `ToolPort` adapters; `bone-app` adds `session_history` and, when
+enabled, its write-tracked `apply_patch` and `bash` adapters.
+
+`session_history` takes an `after` cursor and scans one durable Session journal
+position per call. Public events are returned intact. If a public event alone
+would exceed the Runtime's complete tool-output budget, and that budget can
+hold the fixed omission envelope, the call still succeeds with an `omitted`
+marker and advances `next_cursor` past that event; the adapter neither
+truncates the stored fact nor poisons all later pages. An absurdly small budget
+that cannot hold even the envelope falls back to the Agent's fixed diagnostic.
+Filtered internal positions can likewise produce an empty page with an
+advanced cursor, so callers continue according to `has_more` rather than the
+last visible event.
 
 The local coding tools capture an immutable workspace root and immutable hard
 limits:
@@ -83,12 +97,10 @@ authorization, sandboxing, and audit policy remain host responsibilities.
 
 ## Limits and runtime lifecycle
 
-`ToolLimits` is a validated domain value embedded in `GlobalSettings`; it is
-not an independently registered settings section. Omitted fields use its typed
-defaults. `SettingsService` resolves it into each new
-`ResolvedAgentRuntimeConfig`, and `AgentHost::start` passes a by-value copy to
-`ToolEnvironment::with_limits`. Later saved changes affect future/new runtimes,
-not an already attached runtime.
+`ToolLimits` is a validated value inside App `ToolSettings`. Omitted fields use
+typed defaults. Each new Runtime receives a by-value copy through
+`ToolEnvironment::with_limits`; later saved changes affect the next Runtime,
+not one already attached.
 
 The serialized fields `default_bash_timeout_seconds` and
 `max_bash_timeout_seconds` use positive integer seconds. The direct Rust API
@@ -100,6 +112,11 @@ Model-requested limits can only narrow their corresponding hard limits.
 summaries are bounded indirectly by `max_patch_bytes` and `max_patch_files`.
 All text limits apply before JSON encoding; JSON field overhead and escaping are
 the Agent host's final context-budget responsibility.
+
+When App enables `WorkspaceWrite`, `AgentLimits::tool_timeout` must be greater
+than `ToolLimits::max_bash_timeout` so Bash cleanup and result recording have
+time after the child deadline. Read-only mode does not install Bash and does
+not require this cross-setting relation.
 
 ## Safety contract
 

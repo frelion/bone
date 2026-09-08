@@ -3,14 +3,16 @@ use std::{
     sync::Arc,
 };
 
+use serde::Serialize;
+
 use crate::{
-    AdmissionError, AgentLimits, AgentLimitsError, AgentView, Assignment, Await, Call, CallError,
-    CallId, CallKind, CallProgress, CallStatus, CallView, Completion, DeliveryKind, DeliveryTarget,
-    Effect, Event, ExternalEffect, Input, InputId, InputOutcome, InputReceipt, InputStatus,
-    InputView, InquiryResponse, InquiryResult, JobAction, JobChange, JobId, JobOutcome, JobSpec,
-    JobStatus, JobView, KernelDecision, MonoTime, Origin, OutcomeKind, Owner, ReadQuery, Record,
-    RecordBody, RecordRange, ReportDraft, Seq, ToolEffect, ToolOutcome, ToolSpec, WorkProposal,
-    WorkStep,
+    AdmissionError, AgentLimits, AgentLimitsError, AgentView, Assignment, Await, BootstrapContext,
+    Call, CallError, CallId, CallKind, CallProgress, CallStatus, CallView, Completion,
+    ControlOutcome, DeliveryKind, DeliveryTarget, Effect, Event, ExternalEffect, Input, InputId,
+    InputOutcome, InputReceipt, InputStatus, InputView, InquiryResponse, InquiryResult, JobAction,
+    JobChange, JobId, JobOutcome, JobSpec, JobStatus, JobView, KernelDecision, MonoTime, Origin,
+    OutcomeKind, Owner, ReadQuery, Record, RecordBody, RecordRange, ReportDraft, Seq, ToolEffect,
+    ToolOutcome, ToolSpec, WorkProposal, WorkStep,
     context::{self, PreparedWork},
     job::{Job, JobContext, JobState, PendingStep, WaitState},
 };
@@ -32,6 +34,15 @@ pub(crate) struct InputEntry {
 pub(crate) enum Requester {
     Inputs,
     Job { job: JobId, revision: u64 },
+}
+
+pub(crate) enum KernelControl {
+    Retry(InputId),
+    Pause(JobId),
+    Resume(JobId),
+    Cancel(JobId),
+    Stop,
+    ResolveWrite { call: CallId, result: ToolOutcome },
 }
 
 #[derive(Clone, Debug)]
@@ -209,6 +220,7 @@ impl CallEntry {
 
 pub(crate) struct Kernel {
     pub limits: AgentLimits,
+    pub background: Arc<BootstrapContext>,
     pub jobs: BTreeMap<JobId, Job>,
     pub inputs: BTreeMap<InputId, InputEntry>,
     pub calls: BTreeMap<CallId, CallEntry>,
@@ -227,8 +239,21 @@ pub(crate) struct Kernel {
 }
 
 impl Kernel {
+    #[cfg(test)]
     pub fn new(limits: AgentLimits, tools: Vec<ToolSpec>) -> Result<Self, KernelError> {
+        Self::with_background(limits, tools, BootstrapContext::default())
+    }
+
+    pub fn with_background(
+        limits: AgentLimits,
+        tools: Vec<ToolSpec>,
+        background: BootstrapContext,
+    ) -> Result<Self, KernelError> {
         limits.validate()?;
+        if serde_json::to_vec(&background).map_or(true, |value| value.len() > limits.context_bytes)
+        {
+            return Err(KernelError::BackgroundTooLarge);
+        }
         let mut registry = BTreeMap::new();
         for tool in tools {
             if tool.name.trim().is_empty() {
@@ -241,6 +266,7 @@ impl Kernel {
         }
         Ok(Self {
             limits,
+            background: Arc::new(background),
             jobs: BTreeMap::new(),
             inputs: BTreeMap::new(),
             calls: BTreeMap::new(),
@@ -277,10 +303,21 @@ impl Kernel {
             return Err(AdmissionError::ConflictingInput);
         }
         let reply = match input.reply_to {
-            Some(reply_to) => self
-                .reply_target(reply_to)
-                .ok_or(AdmissionError::InvalidReply)?
-                .into(),
+            Some(reply_to) => {
+                let (target, question) = self
+                    .reply_target(reply_to)
+                    .ok_or(AdmissionError::InvalidReply)?;
+                if input
+                    .expected_question
+                    .is_some_and(|expected| expected != question)
+                {
+                    return Err(AdmissionError::StaleReply);
+                }
+                Some(target)
+            }
+            None if input.expected_question.is_some() => {
+                return Err(AdmissionError::InvalidReply);
+            }
             None => None,
         };
         let pending = self
@@ -376,49 +413,87 @@ impl Kernel {
         self.expire(now, &mut effects);
         match event {
             Event::CoordinateFinished { call, result } => {
+                let result = self.bound_model_result(result);
                 self.coordinate_finished(now, call, result, &mut effects)
             }
             Event::WorkFinished { call, result } => {
+                let result = self.bound_model_result(result);
                 self.work_finished(now, call, result, &mut effects)
             }
             Event::CompactFinished { call, result } => {
+                let result = self.bound_model_result(result);
                 self.compact_finished(call, result, &mut effects)
             }
             Event::ToolFinished { call, result } => self.tool_finished(call, result, &mut effects),
             Event::Progress { call, progress } => {
-                let job = self
+                let running = self
                     .calls
                     .get(&call)
-                    .filter(|entry| matches!(entry.state, CallState::Running))
-                    .and_then(CallEntry::job);
-                if let Some(entry) = self.calls.get_mut(&call).filter(|entry| {
-                    matches!(entry.state, CallState::Running)
-                        && entry.progress.as_ref() != Some(&progress)
-                }) {
-                    entry.progress = Some(progress.clone());
+                    .is_some_and(|entry| matches!(entry.state, CallState::Running));
+                if running
+                    && self
+                        .validate_model_item("call progress", &progress)
+                        .is_err()
+                {
                     self.record(
                         Origin::Call(call),
-                        RecordBody::CallProgress {
-                            call,
-                            job,
-                            progress,
+                        RecordBody::Audit {
+                            message: "discarded call progress that exceeds item_bytes".into(),
                         },
                         &mut effects,
                     );
+                } else if running {
+                    let job = self.calls.get(&call).and_then(CallEntry::job);
+                    if let Some(entry) = self
+                        .calls
+                        .get_mut(&call)
+                        .filter(|entry| entry.progress.as_ref() != Some(&progress))
+                    {
+                        entry.progress = Some(progress.clone());
+                        self.record(
+                            Origin::Call(call),
+                            RecordBody::CallProgress {
+                                call,
+                                job,
+                                progress,
+                            },
+                            &mut effects,
+                        );
+                    }
                 }
             }
-            Event::WriteResolved { call, result } => {
-                self.write_resolved(call, result, &mut effects)
-            }
-            Event::Pause(job) => self.pause(job, &mut effects),
-            Event::Resume(job) => self.resume(job, &mut effects),
-            Event::Cancel(job) => self.cancel(job, &mut effects),
-            Event::Retry(input) => self.retry(input),
-            Event::Stop => self.stop(&mut effects),
             Event::Tick => {}
         }
         self.advance(now, &mut effects);
         effects
+    }
+
+    pub(crate) fn control(
+        &mut self,
+        now: MonoTime,
+        command: KernelControl,
+    ) -> (ControlOutcome, Vec<Effect>) {
+        let mut effects = Vec::new();
+        self.expire(now, &mut effects);
+        let applied = match command {
+            KernelControl::Retry(input) => self.retry(input),
+            KernelControl::Pause(job) => self.pause(job, &mut effects),
+            KernelControl::Resume(job) => self.resume(job, &mut effects),
+            KernelControl::Cancel(job) => self.cancel(job, &mut effects),
+            KernelControl::Stop => self.stop(&mut effects),
+            KernelControl::ResolveWrite { call, result } => {
+                self.write_resolved(call, result, &mut effects)
+            }
+        };
+        self.advance(now, &mut effects);
+        (
+            if applied {
+                ControlOutcome::Applied
+            } else {
+                ControlOutcome::Unchanged
+            },
+            effects,
+        )
     }
 
     pub fn next_deadline(&self) -> Option<MonoTime> {
@@ -475,11 +550,14 @@ impl Kernel {
         }
         if let Some(job) = self.user_question
             && self.jobs[&job].inputs.contains(&id)
-            && let JobState::Waiting(WaitState::User { question }) = self.jobs[&job].state
+            && let JobState::Waiting(WaitState::User {
+                question: question_seq,
+            }) = self.jobs[&job].state
         {
-            return match &self.records[&question].body {
+            return match &self.records[&question_seq].body {
                 RecordBody::Clarification { question, .. } => InputStatus::WaitingForUser {
                     question: question.clone(),
+                    question_seq,
                 },
                 _ => unreachable!("a user wait points to its clarification"),
             };
@@ -488,6 +566,7 @@ impl Kernel {
             RoutingState::WaitingForUser(record) => match &self.records[&record].body {
                 RecordBody::Clarification { question, .. } => InputStatus::WaitingForUser {
                     question: question.clone(),
+                    question_seq: record,
                 },
                 _ => unreachable!("waiting routing points to its clarification"),
             },
@@ -590,6 +669,35 @@ impl Kernel {
         effects.push(Effect::Notify(record.clone()));
         record
     }
+
+    fn bound_model_result<T: Serialize>(
+        &self,
+        result: Result<T, CallError>,
+    ) -> Result<T, CallError> {
+        if serde_json::to_vec(&result)
+            .is_ok_and(|encoded| encoded.len() <= self.limits.context_bytes)
+        {
+            result
+        } else {
+            Err(CallError::failed("model result exceeds context_bytes"))
+        }
+    }
+
+    fn validate_model_item(&self, name: &str, item: &impl Serialize) -> Result<(), String> {
+        if serde_json::to_vec(item).is_ok_and(|encoded| encoded.len() <= self.limits.item_bytes) {
+            Ok(())
+        } else {
+            Err(format!("{name} exceeds item_bytes"))
+        }
+    }
+
+    fn validate_model_text(&self, name: &str, text: &str) -> Result<(), String> {
+        if serde_json::to_vec(text).is_ok_and(|encoded| encoded.len() <= self.limits.item_bytes) {
+            Ok(())
+        } else {
+            Err(format!("{name} exceeds item_bytes"))
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -600,4 +708,6 @@ pub(crate) enum KernelError {
     InvalidToolName,
     #[error("duplicate tool: {0}")]
     DuplicateTool(String),
+    #[error("bootstrap context exceeds context_bytes")]
+    BackgroundTooLarge,
 }

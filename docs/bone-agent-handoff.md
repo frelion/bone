@@ -1,12 +1,12 @@
 # bone-agent 重写 handoff
 
-状态：2026-09-08，Job / Context / Kernel / Runtime 重写及本轮设计审阅问题已收口。当前契约见 [实现设计](agent-job-context-implementation.md)、[crate guide](../crates/bone-agent/README.md) 和 [Agent API](agent.md)。本文件记录交接状态，不替代对应提交的验证记录。
+状态：2026-09-09，Job / Context / Kernel / Runtime 重写及本轮设计审阅问题已收口。当前契约见 [实现设计](agent-job-context-implementation.md)、[crate guide](../crates/bone-agent/README.md) 和 [Agent API](agent.md)。本文件记录交接状态，不替代对应提交的验证记录。
 
 ## 范围与结构
 
 `crates/bone-agent` 使用新的破坏性 API，没有旧兼容层。Kernel 是唯一业务状态写入者，Runtime 执行异步调用，模型返回有类型的建议。Kernel 按 routing、work、scheduler、exchange 拆分内部模块；没有新增 repository trait、事件总线包装或另一套 Agent 生命周期。
 
-`crates/bone-app` 的重写仍是独立工作，当前设计入口为 [bone-app 架构设计初稿](bone-app-design.md)，[旧迁移笔记](bone-app-agent-migration-plan.md) 保留作 Agent API 行为参考。bone-agent 的收口不表示整个 workspace 或产品链路已经完成迁移。
+`crates/bone-app` 的 headless 重写现已落地，当前实现与契约入口见 [bone-app 架构设计](bone-app-design.md)；[旧迁移笔记](bone-app-agent-migration-plan.md) 只保留作历史 Agent API 行为参考。独立前端、TUI/CLI 和完整产品链路验证仍是后续工作，bone-agent 的收口不代表这些工作已经完成。
 
 ## 已落实的核心契约
 
@@ -49,4 +49,4 @@ git diff --check
 
 当前模型 payload、活跃 Job、并发调用和待处理输入等有局部容量边界；`records/jobs/inputs/calls/routings` 仍按 Runtime 生命周期保留，尚无物理 GC 或跨重启续跑。后续 retention 必须先定义输入幂等、未决写、Delivery 和 evidence 的引用保留闭包，不能直接按 checkpoint 水位删除 Record。
 
-真实模型对拆分、证据选择、摘要和交付质量的效果评估，以及 bone-app 迁移、产品长期运行验证，作为独立后续工作继续开展。
+真实模型对拆分、证据选择、摘要和交付质量的效果评估，以及 headless bone-app 的长期运行、独立前端和完整产品链路验证，作为后续工作继续开展。

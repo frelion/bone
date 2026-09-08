@@ -1,6 +1,6 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
-use crate::StoreError;
+use super::StoreError;
 
 pub(crate) const VERSION: i64 = 1;
 

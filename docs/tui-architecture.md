@@ -1,5 +1,11 @@
 # BONE TUI architecture
 
+> **Historical document (2026-09-09).** The TUI and `bone` binary described
+> below were removed when `bone-app` became a headless application API. This is
+> retained only as product input for the future frontend rewrite. The current
+> contract is [bone-app-design.md](bone-app-design.md); a future TUI must depend
+> on that API rather than storage or `bone-agent` directly.
+
 The full-screen BONE product has one interactive entry point:
 `bone_app::run_workspace`. The `bone` executable opens the directory from
 which the user launched it as a durable Workspace, opens or creates a logical

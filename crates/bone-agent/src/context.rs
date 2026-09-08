@@ -223,6 +223,34 @@ pub struct InquiryView {
     pub deadline: MonoTimeView,
 }
 
+/// Read-only history supplied by the host when a runtime starts.
+///
+/// Entries are descriptive context, not commands or facts produced by the
+/// current runtime. The host chooses and orders complete entries before start.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapContext {
+    pub entries: Vec<BackgroundEntry>,
+    pub omitted: bool,
+}
+
+/// One host-selected item in [`BootstrapContext`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundEntry {
+    pub label: String,
+    pub content: String,
+}
+
+impl BackgroundEntry {
+    pub fn new(label: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            content: content.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoordinateInput {
     pub routing: Seq,
@@ -230,6 +258,7 @@ pub struct CoordinateInput {
     pub source: Option<JobId>,
     pub request: Option<String>,
     pub constraints: String,
+    pub background: Arc<BootstrapContext>,
     pub jobs: Vec<JobCard>,
     /// Pass this value as `ReadQuery::Jobs.after` to continue the root directory.
     pub next_job: Option<JobId>,
@@ -242,6 +271,7 @@ pub struct WorkInput {
     pub revision: u64,
     pub spec: JobSpec,
     pub constraints: String,
+    pub background: Arc<BootstrapContext>,
     pub waiting: Option<WaitView>,
     pub checkpoint: Option<Arc<Checkpoint>>,
     pub children: Vec<JobCard>,
@@ -308,6 +338,7 @@ pub(crate) fn prepare_work(kernel: &Kernel, job_id: JobId) -> Result<PreparedWor
         revision: job.revision,
         spec: job.spec.clone(),
         constraints: kernel.constraints.clone(),
+        background: kernel.background.clone(),
         waiting: match &job.state {
             JobState::Waiting(wait) => Some(wait.view()),
             _ => None,
@@ -463,6 +494,7 @@ fn coordinate_input(
         },
         request: routing.request.clone(),
         constraints: kernel.constraints.clone(),
+        background: kernel.background.clone(),
         jobs: Vec::new(),
         next_job: None,
         records,

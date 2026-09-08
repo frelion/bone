@@ -1,6 +1,11 @@
 # TUI runtime architecture
 
-> **Current implementation contract.** This document describes the runtime
+> **Historical document (2026-09-09).** The implementation described below was
+> removed with the old TUI. The current backend contract is
+> [bone-app-design.md](../bone-app-design.md); the replacement TUI has not been
+> implemented and will be a frontend over `bone-app` only.
+
+> **Former implementation contract.** This document describes the runtime
 > architecture shipped with the SQLite-backed `bone-store` design. Earlier
 > product sketches that mention editable config files, `bone-config`, JSONL
 > transcripts, configuration revisions, or a credential-root setting are

@@ -60,7 +60,7 @@ Job 的 `revision: u64` 只在契约改变时递增。暂停、Stop 和其他使
 
 第一版不自动重试业务操作，CallId 同时作为工具适配器可用的本次操作标识；不保留与 CallId 永久一一对应的 EffectId。`CallContext::id()` 只在本 Runtime 内唯一，外部幂等键必须组合宿主提供的 Runtime 或 Session 标识。重复完成事件按 CallId 去重。Unknown 写入只能由宿主确证，不能自动换一个 CallId 重发。
 
-时间由 `Kernel::step(now, event)` 注入。Job 定时与询问期限保存绝对 MonoTime，Runtime 等待 `next_deadline()`；不为每次等待创建独立 timer actor 或 WakeId。
+时间由 `Kernel::step(now, event)` 和 `Kernel::control(now, command)` 注入。Job 定时与询问期限保存绝对 MonoTime，Runtime 等待 `next_deadline()`；不为每次等待创建独立 timer actor 或 WakeId。控制单独返回 `Applied/Unchanged`，两条入口仍修改同一个普通 Kernel 对象。
 
 ## 4. Job：终态只存一次，Running 与 Paused 从事实派生
 
@@ -275,6 +275,7 @@ struct WorkInput {
     revision: u64,
     spec: JobSpec,
     constraints: String,
+    background: Arc<BootstrapContext>,
     waiting: Option<WaitView>,
     checkpoint: Option<Arc<Checkpoint>>,
     children: Vec<JobCard>,
@@ -303,6 +304,8 @@ struct RecordView {
 
 RecordView 是一次冻结的读取范围；它携带来源序号、Origin、该段正文和后续偏移，不直接序列化整个 Record。Kernel 中的权威正文仍只保存一次，冻结输入只复制本次有界片段。
 
+`BootstrapContext` 是 Runtime 构造时由宿主选出的有序历史条目。Kernel 只持有一个 Arc，并把它作为只读 `background` 放入 CoordinateInput 和 WorkInput；它不创建当前 Runtime 的 ID、Record 或交付关系。宿主负责按完整条目选择内容并标记是否省略了更早历史，Kernel 拒绝背景自身已超过 `context_bytes` 的启动配置。
+
 CoordinateInput 只含本次路由原话、约束、相关材料和一个当前查询视图。没有本路由 Read 结果时默认展示活跃根工作第一页；显式 Read 后，最新查询页替换默认首页。JobCard 从 Spec、真实状态及当前有效 Report 派生，不保存另一份可变目录。默认页与显式目录页都受 16 条及完整 CoordinateInput 的 `context_bytes` 约束；`next_job` 给出继续读取的游标。历史查询页仍留在权威 Record 中，但模型投影只显示本 routing 最新查询页，不随翻页持续累积旧页。合并输入时继承的旧路由查询页也不会替代新路由的默认首页。
 
 所有模型输入在发出 Start Effect 前冻结；Runtime 不再按引用查询“最新 Report”。Arc 只共享不可变记录，不能出现 `Arc<Mutex<Job>>`。WorkInput 不携带全局 Snapshot、全局 calls 或其他 Job 的私有记录。
@@ -324,18 +327,18 @@ enum PreparedWork {
 
 ### 投影算法
 
-1. 放入当前 Spec、当前约束、活跃直属子工作，以及仍运行或外部效果 Unknown 的本 Job Call。
+1. 放入启动背景、当前 Spec、当前约束、活跃直属子工作，以及仍运行或外部效果 Unknown 的本 Job Call。
 2. 放入未读的必要投递、所有未结算询问及其关联信息。
 3. 放入最新 checkpoint 和它之后的有效近期记录。
 4. 自动附着的 Record、Delivery 及其 source 完整展开；ReadResult 回执也完整展开，只有它指向的显式 Record range 按 `item_bytes` 分页。按 `(Seq, offset)` 去重，完整正文不再与它的分页预览重复展开。
-5. 工具输出在进入权威 ToolFinished 前按 `tool_output_bytes` 截成带原长度的预览；Record 分段按需续读。
+5. 完整序列化后的原始 ToolOutcome 在进入权威 ToolFinished 前受 `tool_output_bytes` 限制；超限时换成固定错误并保留 external-effect 判定，不生成可能再次 JSON 膨胀的预览；Record 分段按需续读。
 6. WorkInput 超预算时压缩 checkpoint 之后、`read_through` 以内的连续前缀。没有可压缩前缀或必要 payload 仍放不下时返回 ContextError，不静默删当前要求。
 
 seen_through 是本次实际提供的本地记录末端水位。有效 WorkProposal 提交后才推进 `read_through`；读取不等于回答 Inquiry。当前用户要求和未决问题不能用空引用代替。第一版要求本次投影整体装得下，否则压缩已读前缀或明确失败，不实现部分消费确认协议。已完成 child 和已知终态 Call 不进入默认卡片；其事实通过 Record 与 Read 保留。
 
 ### 预算与压缩
 
-`AgentLimits::context_bytes` 计算序列化后的 `WorkInput`、`CoordinateInput` 或 `CompactInput` UTF-8 字节数；它是 Agent context payload 上限。`model.rs` 随后才加入 instructions、tool schema 和 provider options，也没有在这个数中预留输出，因此宿主必须依据真实模型窗口留出余量。超出 provider 限制时返回调用错误，不偷偷截断协议。
+`AgentLimits::context_bytes` 计算序列化后的 `WorkInput`、`CoordinateInput` 或 `CompactInput` UTF-8 字节数，也限制一次完整原始 `ModelPort` 终态返回。`model.rs` 随后才加入 instructions、tool schema 和 provider options，因此宿主仍须依据真实模型窗口留出余量。完整原始返回超限会被拒绝并换成固定调用错误。可能进入单条 Record 的模型产物另受 `item_bytes` 限制；嵌套产物超限会拒绝整份决定或提案并产生固定的小型失败/Audit，CallProgress 超限则只丢弃并写固定 Audit。两条路径都不截断协议或保存半份模型事实。byte limit 只要求大于零，因此这些替代诊断虽有实现固定的全局小上界，却不承诺继续小于任意荒谬的小配置值。
 
 压缩用 worker 模型执行 Compact，仍走同一个 Call/Effect/Event 路径、占同一个 Worker 槽。同 Job 不同时运行 Work 和 Compact。模型仅返回 `CheckpointDraft { summary, evidence }`，覆盖水位来自 Kernel 在启动前选择的固定已读前缀。
 
@@ -442,32 +445,36 @@ Finish 候选出现后拒绝普通新询问，排空有限已接受问题。当�
 
 新的普通 Input 通过接收检查后，与所有未关闭输入路由的原话按 accepted_at 顺序合并成新批次，包括 Failed、WaitingForUser、WaitingInquiry、WaitingJob 和仍有在途 Coordinate 的路由。旧路由关闭并清除 active_call，旧 inquiry 与调查树被取消；旧 Call 的迟到结果只记事实，不能恢复解释权。原 InputEntry 改关联到新路由，finished 与 required_jobs 保留，不因批次取代生成 InputFinished；已关闭路由中等待业务 Job 交付的输入不重新解释。Retry 只查看 Input 当前关联的路由，不能重开被取代的旧批次。已发生的工具效果仍记账。
 
-用户问题由 `Kernel.user_question: Option<JobId>` 全局串行。Job 状态中的 `WaitState::User { question }` 指向权威 Clarification Record；回答必须用新的 InputId 和 `reply_to` 明确关联。当前 Job 可以在没有开放输入路由时替换自己的问题；输入解释进行中则继续保留旧问题，不进入不可回复的 Commit。
+用户问题由 `Kernel.user_question: Option<JobId>` 全局串行。Job 状态中的 `WaitState::User { question }` 指向权威 Clarification Record；回答必须用新的 InputId 和 `reply_to` 明确关联。持久化宿主同时提交 `expected_question: Seq`，Kernel 在写入回答前原子核对当前 Clarification；简单宿主可以省略该字段并回答当时的当前问题。当前 Job 可以在没有开放输入路由时替换自己的问题；输入解释进行中则继续保留旧问题，不进入不可回复的 Commit。
 
 ## 11. 主循环与调度顺序
 
 ```rust
 loop {
-    let event = tokio::select! {
-        control = controls.recv() => control_event(control),
-        input = inputs.recv() => input_event(input),
-        result = tasks.join_next(), if !tasks.is_empty() => completion_event(result),
-        _ = sleep_until(next_deadline) => Event::Tick,
-    };
-    let effects = kernel.step(elapsed(), event);
-    for effect in effects {
-        dispatch(effect); // 启动、请求取消、通知；不等待模型或工具结束。
+    tokio::select! {
+        control = controls.recv() => {
+            let (outcome, effects) = kernel.control(elapsed(), control);
+            reply(outcome);
+            dispatch(effects);
+        }
+        input = inputs.recv() => dispatch(kernel.accept(elapsed(), input)?.1),
+        result = tasks.join_next(), if !tasks.is_empty() => {
+            dispatch(kernel.step(elapsed(), completion_event(result)));
+        }
+        _ = sleep_until(next_deadline) => {
+            dispatch(kernel.step(elapsed(), Event::Tick));
+        }
     }
 }
 ```
 
-代码为简图；实际处理通道关闭和没有 deadline 的分支。Kernel 只输出 Start、Cancel、Notify 三类 Effect；内部 Read 直接处理记录，不需要启动 future。调用超时由 Runtime 的 future 监督，Tick 只处理 Job 定时与询问期限。
+代码为简图；`dispatch` 启动、请求取消或通知，不等待模型或工具结束。实际代码还处理通道关闭和没有 deadline 的分支。Kernel 只输出 Start、Cancel、Notify 三类 Effect；内部 Read 直接处理记录，不需要启动 future。调用超时由 Runtime 的 future 监督，Tick 只处理 Job 定时与询问期限。
 
-`step(now, event)` 顺序固定：
+`step(now, event)` 与 `control(now, command)` 顺序固定：
 
 1. 结算 `deadline <= now` 的询问和定时等待；同一时刻到达的超时优先于回答。
 2. 处理本次事实；CallFinished 先记实际结束，再判断模型输出是否仍可提交。
-3. 应用合法模型提案、控制和投递，唤醒受影响的等待者。
+3. 应用合法模型提案或控制及投递，唤醒受影响的等待者。
 4. 处理本轮开始时已有的候选与可结算 Input，各队列至多扫描一次。
 5. 按容量安排协调、Worker 或 Compact 调用，冻结输入并产生 Start。
 
@@ -477,7 +484,7 @@ loop {
 
 Worker 的就绪条件只写在 `runnable`：未终态、未暂停、无有效模型调用、不是 Commit，并且状态为 Ready 或存在未读必要投递。定时、工具、依赖、Inquiry 和 Coordination 的结算路径负责把相应等待改成 Ready；必要投递也能在保留真实等待原因时临时唤醒 Worker。Running/CancelRequested 仍是本地未结束工具；已经结束但效果 Unknown 的调用只走写入/Finish 门禁，不能阻塞必要推理与只读核对。
 
-Stop 把当时全部非终态 Job 封存为 Cancelled，关闭旧 Routing 和询问，清除相应候选与就绪项，并发出取消指令；不是仅清 active_call 后把旧 Ready 工作留下。随后接受的新输入可以创建新工作，旧 CallId 永远不能成为新 active_call，晚到事实不重新激活终态。shutdown 再停止接收新输入，等待本地清理期限，并返回仍未确定的调用。
+Stop 把当时全部非终态 Job 封存为 Cancelled，关闭旧 Routing 和询问，清除相应候选与就绪项，并发出取消指令；不是仅清 active_call 后把旧 Ready 工作留下。随后接受的新输入可以创建新工作，旧 CallId 永远不能成为新 active_call，晚到事实不重新激活终态。shutdown 再停止接收新输入，等待本地清理期限，并返回仍未确定的调用与退出前冻结的最终 AgentView。
 
 最后一个 Agent handle 被丢弃后，宿主通道关闭，Actor 自动执行 Stop 并进入 shutdown 清理。它不因内部 progress sender 仍存在而继续保留无人持有的工作。丢弃单个 clone 不影响其他 handle；需要取得 ShutdownReport 时使用显式 shutdown。
 
@@ -505,9 +512,9 @@ Spec 改变则增加目标 Job revision、记录 JobChanged、取消其活跃拥
 
 AgentLimits 是带公开字段的普通配置值，以 `Default` 配合 struct update 修改，并由一个 `validate` 检查。`Agent::with_ports` 创建 Kernel 时执行这一次验证，不由模型适配器拼装或暗改默认值。
 
-当前实现的硬边界只有：模型/工具/关机超时、后台 Worker 与工具并发、活跃 Job 数和深度、普通 pending Input、未决 Inquiry、单次 context payload、单项 summary/note/checkpoint 及工具输出。普通输入满时仍保留一个正在等待的 clarification reply 信封；Delegate 在活跃 Job 容量不足时整批拒绝。相同 CallProgress 值不重复记录，不同进度仍是独立事实。
+当前实现的硬边界只有：模型/工具/关机超时、后台 Worker 与工具并发、活跃 Job 数和深度、普通 pending Input、未决 Inquiry、单次 context payload 与完整原始模型返回、单项原始模型产物及完整原始工具结果。原始结果超限时不进入权威记录，改写为固定诊断；这个诊断不随原 payload 增长，但配置只要求 byte limit 为正，因此不保证诊断仍小于任意荒谬的小配置值。普通输入满时仍保留一个正在等待的 clarification reply 信封；Delegate 在活跃 Job 容量不足时整批拒绝。相同 CallProgress 值不重复记录，不同进度仍是独立事实。
 
-`context_bytes` 只限制序列化的 Agent context DTO。Worker 默认不投影已完成 child 和已知终态 Call；协调者默认只投影活跃 root 的有界页；checkpoint 替代模型输入中已经读过的 Record 前缀。这些规则控制每次模型看到的内容，不回收 Kernel 的权威历史。
+`context_bytes` 限制序列化的 Agent context DTO 和完整原始模型返回。Worker 默认不投影已完成 child 和已知终态 Call；协调者默认只投影活跃 root 的有界页；checkpoint 替代模型输入中已经读过的 Record 前缀。这些规则控制每次模型调用的局部内容，不回收 Kernel 的权威历史。
 
 当前 `records`、`jobs`、`inputs`、`calls`、`routings` 与每个 Job 的记录序号随进程生命周期保留；没有记录总预算、容量预留或 GC。这样保住了 InputId 幂等、Delivery 读取授权、Outcome/evidence 引用和 Unknown 写入真相，但意味着本版本不承诺进程总内存有界。
 

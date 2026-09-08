@@ -39,7 +39,21 @@ let receipt = agent
 let observation = agent.observe().await?;
 ```
 
-需要自定义模型或工具时，实现根模块导出的 `ModelPort`、`ToolPort`，然后调用 `Agent::with_ports`。Port 的一次方法调用就是一次 Call；Port 内不再运行另一套 Agent loop。
+需要自定义模型或工具时，实现根模块导出的 `ModelPort`、`ToolPort`，然后调用 `Agent::with_ports`。现成的 `ModelAdapter` 和 `read_only_tools` 也公开导出，宿主可以组合已有模型协议和自己的工具，无需复制适配代码。Port 的一次方法调用就是一次 Call；Port 内不再运行另一套 Agent loop。
+
+新 Runtime 需要读取已保存历史时，宿主传入有界的只读背景：
+
+```rust,ignore
+use bone_agent::{Agent, BackgroundEntry, BootstrapContext};
+
+let background = BootstrapContext {
+    entries: vec![BackgroundEntry::new("previous outcome", summary)],
+    omitted: older_history_exists,
+};
+let agent = Agent::with_ports_and_background(model, tools, limits, background)?;
+```
+
+同一个 `Arc<BootstrapContext>` 会出现在 `CoordinateInput` 和 `WorkInput` 中，并计入 `context_bytes`。背景本身超过预算时启动失败；其中内容只作为历史资料，不进入当前 Runtime 的 ID 和 Record 空间。
 
 可执行的无网络示例：
 
@@ -72,7 +86,19 @@ Worker 不接收全局聊天快照。`prepare_work` 只展开本 Job 获准读�
 
 协调模型默认只收活跃 root 的有界首页，其余目录通过 `Read` 继续读取。查询页同时受 16 条和完整 `CoordinateInput` 的 `context_bytes` 预算限制；最新查询页替换默认首页。旧页仍保留在权威记录中，模型投影只保留本路由最新查询页，避免翻页时不断累积正文。
 
-`AgentLimits::context_bytes` 限制序列化后的 `WorkInput`、`CoordinateInput` 或 `CompactInput`，不包含模型适配器随后加入的 instructions、tool schema 和输出预留；宿主需要为真实模型窗口留出余量。自动进入 Context 的必要事实完整投影，放不下时明确失败；只有显式 `ReadQuery::Record` 按 UTF-8 offset 分页。当 Worker payload 超限时，Kernel 可以固定一个已经读过的前缀交给 `compact`。新消息留在后缀；checkpoint 不推进已读水位，也不会被再次作为普通 Record 展开。
+`AgentLimits::context_bytes` 限制序列化后的 `WorkInput`、`CoordinateInput`、`CompactInput` 以及一次完整原始 `ModelPort` 返回，不包含模型适配器随后加入的 instructions 和 tool schema；宿主仍需为真实模型窗口留出余量。完整返回超限会被拒绝并换成固定 `CallError`。可能写入单条 Record 的模型产物（例如 ToolCall、JobSpec、Report、Completion、问题和回复）另受 `item_bytes` 限制；嵌套产物超限会拒绝整份决定或提案并产生固定的小型失败/Audit，不保存超限事实。超限 CallProgress 只丢弃并写固定 Audit。自动进入 Context 的必要事实完整投影，放不下时明确失败；只有显式 `ReadQuery::Record` 按 UTF-8 offset 分页。当 Worker payload 超限时，Kernel 可以固定一个已经读过的前缀交给 `compact`。新消息留在后缀；checkpoint 不推进已读水位，也不会被再次作为普通 Record 展开。
+
+完整序列化后的原始 `ToolOutcome` 受 `tool_output_bytes` 限制。超限结果换成固定的小错误，但保留 `external_effect`，因此不会因丢弃大正文而把已发生或未知的外部写入误报为未发生。byte limit 只要求为正数；这些替代诊断的大小由实现固定、不随不可信 payload 增长，但不承诺适配任意荒谬的小配置值。
+
+用户问题的 `InputStatus::WaitingForUser` 同时给出文字和 `question_seq`。持久化宿主应把该序号放回回答，Kernel 会在接受 Input 的同一步核对问题仍是当前问题：
+
+```rust,ignore
+agent
+    .post(Input::new(next_input, answer).answering(waiting_input, question_seq))
+    .await?;
+```
+
+只需要回答当前问题的简单调用仍可使用 `replying_to(waiting_input)`。
 
 Completed Job 可以作为新 Job 的受限 seed，旧 Job 不会重开。导入记忆始终以最终 Outcome summary 为权威，并开放该 Outcome 和最终 evidence 的定向读取；checkpoint evidence 可以补充背景，较早 checkpoint summary 不覆盖最终结论。
 
@@ -86,7 +112,8 @@ Completed Job 可以作为新 Job 的受限 seed，旧 Job 不会重开。导入
 - 迟到模型结果只留下审计，不会复活 Job。
 - 被新输入取代的旧路由及其调查树失去执行资格；旧 Coordinate 结果和 Retry 不能恢复旧解释权。
 - 迟到工具结果仍然是真实执行事实；外部写入的 `Unknown` 只能由宿主通过 `resolve_write` 确证，不能自动重发。
-- `stop` 终结当前工作森林；`shutdown` 再等待本地调用清理，并返回仍未知的外部写入。
+- `pause`、`resume`、`cancel`、`stop`、`retry` 和 `resolve_write` 返回 `ControlOutcome::Applied` 或 `Unchanged`，宿主无需通过前后快照猜测控制是否生效。
+- `stop` 终结当前工作森林；`shutdown` 再等待本地调用清理，并返回仍未知的外部写入以及冻结的 `final_view`。
 - 最后一个 `Agent` handle 被丢弃时，Runtime 自动执行 Stop 并进入 shutdown 清理。需要取得清理报告的宿主应显式调用 `shutdown`。
 - `CallContext::id()` 只在当前 Runtime 内唯一；外部幂等键需要组合宿主提供的 Runtime 或 Session 标识。
 

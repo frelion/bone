@@ -17,6 +17,13 @@ pub struct Input {
     pub id: InputId,
     pub text: String,
     pub reply_to: Option<InputId>,
+    /// The clarification record this input answers.
+    ///
+    /// Hosts that expose durable question IDs should set this field with
+    /// [`Input::answering`]. [`Input::replying_to`] remains available when the
+    /// caller only needs the current question for an input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_question: Option<Seq>,
 }
 
 impl Input {
@@ -25,11 +32,19 @@ impl Input {
             id,
             text: text.into(),
             reply_to: None,
+            expected_question: None,
         }
     }
 
     pub fn replying_to(mut self, input: InputId) -> Self {
         self.reply_to = Some(input);
+        self.expected_question = None;
+        self
+    }
+
+    pub fn answering(mut self, input: InputId, expected_question: Seq) -> Self {
+        self.reply_to = Some(input);
+        self.expected_question = Some(expected_question);
         self
     }
 }
@@ -43,7 +58,7 @@ pub struct InputReceipt {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputStatus {
     Routing,
-    WaitingForUser { question: String },
+    WaitingForUser { question: String, question_seq: Seq },
     RoutingFailed { message: String },
     Handled,
     Finished(InputOutcome),
@@ -190,6 +205,26 @@ pub struct AgentView {
     pub records: Vec<Arc<crate::Record>>,
 }
 
+impl Default for AgentView {
+    fn default() -> Self {
+        Self {
+            sequence: Seq::ZERO,
+            constraints: String::new(),
+            inputs: Vec::new(),
+            jobs: Vec::new(),
+            calls: Vec::new(),
+            records: Vec::new(),
+        }
+    }
+}
+
+/// Whether a host control changed agent state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlOutcome {
+    Applied,
+    Unchanged,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AdmissionError {
     #[error("the agent is at input capacity")]
@@ -198,6 +233,8 @@ pub enum AdmissionError {
     ConflictingInput,
     #[error("the referenced input is not waiting for a reply")]
     InvalidReply,
+    #[error("the referenced question is no longer current")]
+    StaleReply,
 }
 
 /// Cancellation and best-effort progress for one external call.
@@ -302,15 +339,6 @@ pub(crate) enum Event {
         call: CallId,
         progress: CallProgress,
     },
-    WriteResolved {
-        call: CallId,
-        result: ToolOutcome,
-    },
-    Pause(JobId),
-    Resume(JobId),
-    Cancel(JobId),
-    Retry(InputId),
-    Stop,
     Tick,
 }
 

@@ -1,5 +1,7 @@
 # BONE TUI 配置、Workspace 与多 Session PRD
 
+> **历史 PRD（2026-09-09）。** 旧 TUI 与其中的直接 Store/SettingsService 契约已经移除；本文保留为产品素材，不是当前实现说明。当前后端契约见 [bone-app-design.md](../bone-app-design.md)，替代 TUI 尚未实现。
+
 | 字段 | 内容 |
 | --- | --- |
 | 文档状态 | 当前实现基线 + 后续体验设计参考 |

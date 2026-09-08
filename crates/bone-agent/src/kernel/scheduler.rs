@@ -503,11 +503,11 @@ impl Kernel {
     ) {
         let (revision, through) = call_entry.compact_context();
         if draft.summary.trim().is_empty()
-            || draft.summary.len() > self.limits.item_bytes
             || !draft
                 .evidence
                 .iter()
                 .all(|seq| self.can_read_record(job, *seq))
+            || self.validate_model_item("checkpoint", &draft).is_err()
         {
             self.finish_job(
                 job,
@@ -577,26 +577,16 @@ impl Kernel {
         }
     }
 
-    fn limit_tool_outcome(&self, mut outcome: ToolOutcome) -> ToolOutcome {
-        let Ok(value) = outcome.result.as_ref() else {
-            return outcome;
-        };
-        let Ok(text) = serde_json::to_string(value) else {
-            return outcome;
-        };
-        if text.len() <= self.limits.tool_output_bytes {
+    fn limit_tool_outcome(&self, outcome: ToolOutcome) -> ToolOutcome {
+        if serde_json::to_vec(&outcome)
+            .is_ok_and(|encoded| encoded.len() <= self.limits.tool_output_bytes)
+        {
             return outcome;
         }
-        let mut end = self.limits.tool_output_bytes.min(text.len());
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
+        ToolOutcome {
+            result: Err(CallError::failed("tool outcome exceeds tool_output_bytes")),
+            external_effect: outcome.external_effect,
         }
-        outcome.result = Ok(serde_json::json!({
-            "truncated": true,
-            "preview": &text[..end],
-            "original_bytes": text.len(),
-        }));
-        outcome
     }
 
     pub(super) fn write_resolved(
@@ -604,14 +594,14 @@ impl Kernel {
         call: CallId,
         result: ToolOutcome,
         effects: &mut Vec<Effect>,
-    ) {
+    ) -> bool {
         let Some(entry) = self.calls.get(&call).cloned() else {
-            return;
+            return false;
         };
         if entry.external_effect() != ExternalEffect::Unknown
             || result.external_effect == ExternalEffect::Unknown
         {
-            return;
+            return false;
         }
         let CallTask::Tool {
             job,
@@ -620,7 +610,7 @@ impl Kernel {
             effect: _,
         } = entry.task
         else {
-            return;
+            return false;
         };
         let result = Arc::new(self.limit_tool_outcome(result));
         let call_entry = self.calls.get_mut(&call).expect("call exists");
@@ -637,6 +627,7 @@ impl Kernel {
         );
         self.attach(job, record.seq);
         self.enqueue_job(job);
+        true
     }
 
     pub(super) fn cancel_call(&mut self, call: CallId, effects: &mut Vec<Effect>) {

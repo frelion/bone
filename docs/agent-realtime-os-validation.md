@@ -1,6 +1,6 @@
 # bone-agent 场景验证
 
-范围是进程内 bone-agent。下面区分已有自动化回归、示例入口、实现边界与延期能力；32 个场景不是 32 项已完成的端到端认证。bone-app 迁移和整个 workspace 构建不在本文件的验收结论中。
+范围是进程内 bone-agent。下面区分已有自动化回归、示例入口、实现边界与延期能力；32 个场景不是 32 项已完成的端到端认证。后来落地的 headless bone-app 及整个 workspace 构建不在这份 Agent 验收结论中。
 
 ## 自动化验收入口
 
@@ -13,7 +13,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p bone-agent --no-deps --all-features --lo
 cargo run -p bone-agent --example walkthrough --locked
 ```
 
-2026-09-08，本轮最终工作树已实际通过上述全部命令：51 个单元测试通过，doctest 当前为 0，Clippy 与 rustdoc 零警告，walkthrough 输出 `1 job completed; 11 records retained`。同时执行了 `git diff --check`，并确认 `crates/bone-app` 无改动；未据此声称整个 workspace 已完成迁移或验证。
+2026-09-08，该轮 Agent 工作树实际通过上述全部命令：51 个单元测试通过，doctest 当时为 0，Clippy 与 rustdoc 零警告，walkthrough 输出 `1 job completed; 11 records retained`。当时同时执行了 `git diff --check`，且 `crates/bone-app` 尚未改动。这是该轮的历史验证记录，不描述后来 headless App 重写后的当前测试数量或 workspace 验证状态。
 
 实际测试布局：
 

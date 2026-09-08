@@ -4,7 +4,7 @@
 
 ## 启动
 
-产品接入通常使用 `Agent::start`：
+最小示例或不需要持久化的独立宿主可以使用 `Agent::start`：
 
 ```rust,ignore
 use bone_agent::{Agent, AgentLimits, ConfiguredModel};
@@ -19,7 +19,7 @@ let agent = Agent::start(
 )?;
 ```
 
-`ConfiguredModel` 只做一件事：保证 `ModelOptions` 属于同一种 provider protocol。`Agent::start` 安装现有的 read、glob、grep 工具。它不读取保存的设置，不处理登录，也不持久化对话。
+`ConfiguredModel` 只做一件事：保证 `ModelOptions` 属于同一种 provider protocol。`Agent::start` 安装现有的 read、glob、grep 工具。它不读取保存的设置，不处理登录，也不持久化对话。BONE 产品路径由 `bone-app` 解析已保存配置、连接模型并装配历史与写工具，最终调用 `Agent::with_ports_and_background`；前端不直接构造 Agent。
 
 自定义宿主可以实现：
 
@@ -30,6 +30,18 @@ let agent = Agent::with_ports(model_port, tool_ports, AgentLimits::default())?;
 ```
 
 `ModelPort` 有三个有类型的方法：`coordinate`、`work`、`compact`。`ToolPort::run` 执行一次注册工具调用。每个方法只代表一次 Call，不拥有私有工作队列或另一套 Agent 生命周期。
+
+`ModelAdapter` 和 `read_only_tools` 也从 crate 根导出。需要复用现成模型协议并加入宿主工具时，可以直接组合它们。新 Runtime 需要旧会话背景时使用 `with_ports_and_background`：
+
+```rust,ignore
+let background = BootstrapContext {
+    entries: vec![BackgroundEntry::new("previous outcome", summary)],
+    omitted: older_history_exists,
+};
+let agent = Agent::with_ports_and_background(model, tools, limits, background)?;
+```
+
+背景是宿主选出的完整只读条目，同一个 `Arc<BootstrapContext>` 会进入 `CoordinateInput` 和 `WorkInput`。它计入现有 `context_bytes`，不创建当前 Runtime 的 Input、Job、Call 或 Record。背景自身已超过预算时，Runtime 拒绝启动。
 
 `AgentLimits` 是一个普通配置值。以 default 开始，只修改需要的字段：
 
@@ -58,13 +70,15 @@ receipt 表示输入已经被进程内 Kernel 接受，不表示工作完成或�
 
 新的普通输入会与所有未关闭输入路由中的原话按接收顺序组成新批次，包括解释失败、等待澄清、等待询问或调查的路由。旧路由及其调查树失去执行资格；原 Input 改关联到新路由，交付义务继续保留，不因批次取代而提前产生 InputFinished。已经解释完毕、仅在等待 required Job 交付的输入不重新路由。
 
-用户回答澄清问题时，创建新 ID，并引用当前处于 WaitingForUser 的那条输入：
+用户回答澄清问题时，创建新 ID，并引用当前处于 WaitingForUser 的那条输入。`InputStatus::WaitingForUser` 同时返回问题文字和 `question_seq`；持久化宿主把该序号作为问题身份带回：
 
 ```rust,ignore
 agent
-    .post(Input::new(InputId(next_turn), answer).replying_to(waiting_input))
+    .post(Input::new(InputId(next_turn), answer).answering(waiting_input, question_seq))
     .await?;
 ```
+
+Kernel 在接受 Input 的同一步验证 `expected_question`，所以被替换或已经回答的问题会返回 `AdmissionError::StaleReply`，不会先写入一条无效 Input。无需持久问题身份的简单调用仍可使用 `replying_to(waiting_input)`，它回答该输入当前的问题。
 
 路由失败不会自动重复模型调用。宿主确认要重试时调用 `agent.retry(input_id).await`。Retry 只作用于该输入当前关联的失败路由；输入已合并到新批次时，旧 ID 不会恢复旧批次的决定权。迟到的旧 Coordinate 结果同样不能提交。
 
@@ -102,12 +116,15 @@ baseline 包含全部当前 Input、Job、保留的 Record，以及仍运行、�
 ## 控制与终态
 
 ```rust,ignore
-agent.pause(job).await?;
+assert_eq!(agent.pause(job).await?, ControlOutcome::Applied);
+assert_eq!(agent.pause(job).await?, ControlOutcome::Unchanged);
 agent.resume(job).await?;
 agent.cancel(job).await?;
 agent.stop().await?;
 let report = agent.shutdown().await?;
 ```
+
+`pause`、`resume`、`cancel`、`stop`、`retry` 和 `resolve_write` 都返回 `ControlOutcome::Applied` 或 `Unchanged`。回执由 Kernel 执行该控制时产生；宿主不需要先读状态再猜测调用有没有改变状态。
 
 - Pause 保留 Job 和 Context，撤销当前调用资格；Resume 重新排队。
 - Cancel 封存该 Job 及其拥有子树，迟到模型结果不能改变终态。
@@ -122,7 +139,7 @@ let report = agent.shutdown().await?;
 agent.resolve_write(call_id, verified_tool_outcome).await?;
 ```
 
-Unknown 不会自动重发。`ShutdownReport::unresolved_writes` 列出关闭时仍需核对的写入。
+Unknown 不会自动重发。`ShutdownReport::unresolved_writes` 列出关闭时仍需核对的写入，`final_view` 是 Actor 退出前冻结的最终 `AgentView`，可用于补齐有界广播中遗漏的尾部事实。
 
 ## Job 与 Context
 
@@ -134,7 +151,7 @@ Worker 每次只看到一个冻结 `WorkInput`：当前 Spec、会话约束、�
 
 显式 Report、Published、Outcome 和 Inquiry Answer 的 evidence 向相应接收者开放定向读取，未列出的私有记录仍隔离。Completed Job 的 seed 始终使用最终 Outcome summary，并允许读取最终 Outcome 与 evidence；checkpoint evidence 可以补充背景，旧 checkpoint 不覆盖最终结论或授予整个来源 Context 的权限。
 
-`context_bytes` 计算序列化的 Agent context DTO，不计算模型适配器随后加入的 instructions、tool schema 或输出余量。默认 Worker 投影只列活跃直属 child 和运行中或 Unknown 的 Call；历史事实通过 Record 与 `Read` 访问。当前 Kernel 保留本进程的完整权威历史，尚未实现物理 GC，因此这个限制不等于进程总内存上限。
+`context_bytes` 计算序列化的 Agent context DTO，并限制一次完整原始 `ModelPort` 返回；它不计算模型适配器随后加入的 instructions 或 tool schema。原始完整返回超限会被拒绝，改写成固定的 `CallError`。`item_bytes` 限制可能进入单条 Record 的模型产物，包括 ToolCall、JobSpec、报告、完成结果、问题、回复和约束；嵌套产物超限会拒绝整份决定或提案并产生固定的小型失败/Audit，不保存超限事实。超限 CallProgress 只丢弃并写固定 Audit，不终止正在进行的调用。完整原始 `ToolOutcome` 按 `tool_output_bytes` 计量，超限时换成固定错误并保留 external-effect 判定。这些配置值只要求大于零，因此替代诊断不承诺仍小于任意荒谬的小 limit；其大小由实现固定，不随不可信 payload 增长。默认 Worker 投影只列活跃直属 child 和运行中或 Unknown 的 Call；历史事实通过 Record 与 `Read` 访问。当前 Kernel 保留本进程的完整权威历史，尚未实现物理 GC，因此这些限制不等于进程总内存上限。
 
 Coordinator 的目录页同时受 16 条和完整 `CoordinateInput` 字节预算限制。显式 Read 查询页替换默认首页，模型投影只保留本 routing 最新查询页；旧页继续保留为权威记录。自动投影的必要事实必须完整容纳，只有显式 `ReadQuery::Record` 允许按 UTF-8 offset 分页。
 

@@ -8,9 +8,9 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{StoreError, sqlite::StoreInner};
+use super::{StoreError, sqlite::StoreInner};
 
-pub(crate) const MAX_DOCUMENT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_DOCUMENT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
 /// The durable address of one document.
 ///
@@ -64,6 +64,7 @@ pub struct DocumentSnapshot<T> {
 }
 
 impl<T> DocumentSnapshot<T> {
+    #[cfg(test)]
     pub fn is_missing(&self) -> bool {
         self.value.is_none()
     }
@@ -75,6 +76,7 @@ impl<T> DocumentSnapshot<T> {
 /// healthy records from the same namespace.
 #[derive(Debug)]
 pub struct DocumentListEntry<T> {
+    #[cfg(test)]
     pub key: DocumentKey,
     pub snapshot: Result<DocumentSnapshot<T>, StoreError>,
 }
@@ -204,7 +206,7 @@ where
         .next()
         .map_err(|error| StoreError::sqlite("read document list", error))?
     {
-        let key = row
+        let _key = row
             .get::<_, String>(0)
             .map_err(|error| StoreError::sqlite("read listed document key", error))?;
         let snapshot = (|| {
@@ -221,7 +223,8 @@ where
             })
         })();
         documents.push(DocumentListEntry {
-            key: DocumentKey::new(namespace, key),
+            #[cfg(test)]
+            key: DocumentKey::new(namespace, _key),
             snapshot,
         });
     }
@@ -313,6 +316,28 @@ where
         }
     }
     Ok(revision)
+}
+
+pub(crate) fn delete_document(
+    transaction: &Transaction<'_>,
+    key: &DocumentKey,
+    expected: Revision,
+) -> Result<(), StoreError> {
+    let actual = read_raw_document(transaction, key)?
+        .map_or_else(Revision::default, |document| document.revision);
+    if actual != expected {
+        return Err(StoreError::RevisionConflict { expected, actual });
+    }
+    if actual == Revision::default() {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "DELETE FROM documents WHERE namespace = ?1 AND key = ?2",
+            params![key.namespace(), key.key()],
+        )
+        .map_err(|error| StoreError::sqlite("delete document", error))?;
+    Ok(())
 }
 
 pub(crate) fn encode_payload<T: Serialize>(

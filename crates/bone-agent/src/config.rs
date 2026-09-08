@@ -1,11 +1,14 @@
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// The finite resources and deadlines of one agent runtime.
 ///
 /// Start from [`AgentLimits::default`], change the fields that matter to the
 /// host, then call [`AgentLimits::validate`] before displaying configuration
 /// errors. The runtime performs the same validation when it starts.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentLimits {
     pub coordination_timeout: Duration,
     pub work_timeout: Duration,
@@ -17,12 +20,24 @@ pub struct AgentLimits {
     pub job_depth: usize,
     pub pending_inputs: usize,
     pub inquiries: usize,
-    /// Maximum serialized context DTO size for one model call.
+    /// Acceptance ceiling for a serialized context DTO or complete original
+    /// model result.
     ///
-    /// Provider instructions, tool schemas and output allowance are outside this
-    /// count, so hosts must leave suitable model-window headroom.
+    /// Provider instructions and tool schemas are outside the context-side
+    /// count, so hosts must leave suitable model-window headroom. An oversized
+    /// untrusted model result is replaced by a fixed diagnostic. That
+    /// diagnostic is globally bounded but is not guaranteed to fit an
+    /// arbitrarily tiny configured value.
     pub context_bytes: usize,
+    /// Acceptance ceiling for one original model-authored item stored by the
+    /// kernel.
     pub item_bytes: usize,
+    /// Acceptance ceiling for a complete original successful or failed tool
+    /// outcome.
+    ///
+    /// An oversized outcome becomes a fixed failure while preserving its
+    /// external-effect classification. The replacement is globally bounded
+    /// but is not guaranteed to fit an arbitrarily tiny configured value.
     pub tool_output_bytes: usize,
 }
 
@@ -60,7 +75,7 @@ impl AgentLimits {
     }
 
     pub(crate) fn worker_slots(&self) -> usize {
-        self.background_workers + 1
+        self.background_workers.saturating_add(1)
     }
 }
 
@@ -113,5 +128,18 @@ mod tests {
         limits.item_bytes = 1;
         assert_eq!(limits.validate(), Ok(()));
         assert_eq!(limits.worker_slots(), 3);
+
+        limits.background_workers = usize::MAX;
+        assert_eq!(limits.worker_slots(), usize::MAX);
+    }
+
+    #[test]
+    fn limits_round_trip_through_json() {
+        let limits = AgentLimits::default();
+        let encoded = serde_json::to_string(&limits).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentLimits>(&encoded).unwrap(),
+            limits
+        );
     }
 }

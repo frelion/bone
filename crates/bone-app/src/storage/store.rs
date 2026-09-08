@@ -1,34 +1,17 @@
-//! Local SQLite persistence primitives.
-//!
-//! This crate owns one SQLite database, typed documents and journals, short
-//! transactions, and process-lifetime file leases. Applications define their
-//! own keys, persistent types, and business rules.
-
-mod document;
-mod error;
-mod journal;
-mod lease;
-mod roots;
-mod schema;
-mod security;
-mod sqlite;
+//! Typed operations over BONE's private SQLite store.
 
 use std::{path::Path, sync::Arc};
 
 use serde::{Serialize, de::DeserializeOwned};
 
-pub use document::{Document, DocumentKey, DocumentListEntry, DocumentSnapshot, Revision};
-pub use error::StoreError;
-pub use journal::{Journal, JournalAppend, JournalEntry, JournalKey, JournalRead};
-pub use lease::{Lease, LeaseKey};
-pub use roots::StoreRoots;
-
-use crate::{
+use super::{
+    Document, DocumentKey, DocumentListEntry, DocumentSnapshot, Journal, JournalAppend, JournalKey,
+    Lease, LeaseKey, Revision, StoreError, StoreRoots,
     document::{
-        document, read_document, read_documents_with_prefix, replace_document,
+        delete_document, document, read_document, read_documents_with_prefix, replace_document,
         same_store as same_document_store,
     },
-    journal::{append_journal, journal, read_journal, same_store as same_journal_store},
+    journal::{append_journal, journal, same_store as same_journal_store},
     lease::lease_file_name,
     security::{ensure_private_directory, try_acquire_private_lock},
     sqlite::StoreInner,
@@ -36,8 +19,8 @@ use crate::{
 
 /// Thread-safe handle to one locally opened SQLite store.
 ///
-/// Clones share store roots while each operation opens its own short-lived
-/// connection. SQLite serializes writers across threads and processes.
+/// Clones share one writer connection; reads use short-lived WAL connections.
+/// SQLite provides the remaining serialization across App processes.
 #[derive(Clone)]
 pub struct BoneStore {
     inner: Arc<StoreInner>,
@@ -48,10 +31,6 @@ impl BoneStore {
         Ok(Self {
             inner: StoreInner::open(roots)?,
         })
-    }
-
-    pub fn roots(&self) -> &StoreRoots {
-        self.inner.roots()
     }
 
     pub fn database_path(&self) -> &Path {
@@ -142,12 +121,9 @@ impl WriteTransaction<'_, '_> {
         replace_document(self.transaction, document.key(), value, expected)
     }
 
-    pub fn read_journal<E>(&self, journal: &Journal<E>) -> Result<JournalRead<E>, StoreError>
-    where
-        E: DeserializeOwned,
-    {
-        self.assert_journal_store(journal)?;
-        read_journal(self.transaction, journal.key())
+    pub fn delete<T>(&self, document: &Document<T>, expected: Revision) -> Result<(), StoreError> {
+        self.assert_document_store(document)?;
+        delete_document(self.transaction, document.key(), expected)
     }
 
     pub fn append<E>(&self, journal: &Journal<E>, event: &E) -> Result<JournalAppend, StoreError>
@@ -257,6 +233,29 @@ mod tests {
         assert!(failed.is_err());
         assert!(document.read().unwrap().is_missing());
         assert!(journal.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn transaction_deletes_a_document_with_revision_checking() {
+        let (_temporary, store) = store();
+        let document = store.document::<Settings>(settings_key("temporary"));
+        let revision = document
+            .replace(
+                &Settings {
+                    name: "temporary".to_owned(),
+                },
+                Revision::default(),
+            )
+            .unwrap();
+
+        store
+            .transaction(|transaction| transaction.delete(&document, revision))
+            .unwrap();
+        assert!(document.read().unwrap().is_missing());
+        assert!(matches!(
+            store.transaction(|transaction| transaction.delete(&document, revision)),
+            Err(StoreError::RevisionConflict { .. })
+        ));
     }
 
     #[test]

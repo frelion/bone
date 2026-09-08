@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::StoreError;
+use super::StoreError;
 
 /// The directory that contains one local SQLite database and its lease files.
 ///
