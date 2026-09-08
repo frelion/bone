@@ -1,152 +1,174 @@
-//! Inspect the real synchronous kernel with prepared events and model results.
-//! No I/O runs here. Use --json to export each input, state change, and effect.
-
-use bone_agent::{
-    Autonomy, Call, Effect, Event, InputDisposition, InputReview, JobId, JobOutcome, Kernel,
-    KernelConfig, MessageId, Next, Notice, RecordKind, WorkResult,
-};
+//! A deterministic walkthrough of routing, parallel work, and stale-result rejection.
+//! Use --json to print the transitions as structured data.
+use bone_agent::*;
 use serde_json::{Value, json};
 
 fn main() {
     let mut kernel = Kernel::new(KernelConfig::default(), vec![]).unwrap();
-    // These IDs describe this fixed scenario; scheduling is performed by Kernel.
-    let events = [
-        ("用户要求研究 A；直接启动主力 #1", message(1, "研究 A")),
-        (
-            "主力仍在推理；状态询问单独交给协调 #2",
-            message(2, "进度如何？"),
-        ),
-        (
-            "协调只回复已有状态；主力 #1 不重启",
-            finished(
-                2,
-                JobOutcome::review(InputReview {
-                    disposition: InputDisposition::Keep,
-                    reply: Some("A 的推理仍在进行".into()),
-                    note: "这批消息只询问进度".into(),
-                }),
-            ),
-        ),
-        (
-            "用户改为 B；协调 #3 解释插话",
-            message(3, "不要 A，改研究 B"),
-        ),
-        (
-            "旧主力 #1 先返回；整个答案暂存，不能抢先发布",
-            finished(
-                1,
-                JobOutcome::work(WorkResult {
-                    note: "A 的计算产物仍可作为参考材料".into(),
-                    reply: Some("这是旧 A 的答案，不能发布".into()),
-                    requirement: Some("研究 A".into()),
-                    autonomy: Autonomy::Run,
-                    next: Next::Finish,
-                    ..Default::default()
-                }),
-            ),
-        ),
-        (
-            "协调只要求重想；主力 #4 拿到 B 的原话",
-            finished(
-                3,
-                JobOutcome::review(InputReview {
-                    disposition: InputDisposition::Reconsider,
-                    reply: None,
-                    note: "用户否定了原方向；B 的方案由主力决定".into(),
-                }),
-            ),
-        ),
-        (
-            "主力 #4 直接交付 B；无需协调再审批",
-            finished(
-                4,
-                JobOutcome::work(WorkResult {
-                    note: "结合原话与已有材料完成 B".into(),
-                    reply: Some("B 的结论是……".into()),
-                    requirement: Some("研究 B".into()),
-                    autonomy: Autonomy::Run,
-                    next: Next::Finish,
-                    ..Default::default()
-                }),
-            ),
-        ),
-    ];
-
-    let mut frames = Vec::new();
-    for (title, event) in events {
-        let before = kernel.snapshot();
-        let received = event.clone();
-        let effects = kernel.step(event);
-        let after = kernel.snapshot();
-        frames.push(json!({
-            "title": title,
-            "event": received,
-            "record_added": &after.record[before.record.len()..],
-            "before": before,
-            "after": after,
-            "effects": effects.iter().map(effect_json).collect::<Vec<_>>(),
-        }));
-    }
-    let final_state = kernel.snapshot();
-    assert_eq!(final_state.requirement.as_deref(), Some("研究 B"));
-    assert!(!final_state.autonomous);
-    assert!(
-        final_state
-            .record
-            .iter()
-            .any(|entry| matches!(entry.kind, RecordKind::WorkHeld { job: JobId(1), .. }))
+    let mut frames = vec![];
+    let effects = step(
+        &mut kernel,
+        &mut frames,
+        "接收 A，先短路由",
+        Event::Input(Input::new(InputId(1), "研究 A")),
     );
-    assert!(!final_state.record.iter().any(|entry| matches!(&entry.kind,
-        RecordKind::Notice(Notice::Reply { text, .. }) if text.contains("不能发布"))));
-
-    if std::env::args().any(|arg| arg == "--json") {
+    let route = model(&effects, true);
+    let effects = step(
+        &mut kernel,
+        &mut frames,
+        "Kernel 分派 A，主力拿原文",
+        done(route, create("研究 A", 1)),
+    );
+    let first = model(&effects, false);
+    let a = kernel.snapshot().jobs[0].id;
+    let effects = step(
+        &mut kernel,
+        &mut frames,
+        "A 进入后台继续深入求解",
+        done(
+            first,
+            CallOutcome::work(WorkProposal {
+                next: Next::Continue,
+                ..Default::default()
+            }),
+        ),
+    );
+    let old_a = model(&effects, false);
+    let effects = step(
+        &mut kernel,
+        &mut frames,
+        "A 继续计算，B 输入交给 Kernel",
+        Event::Input(Input::new(InputId(2), "独立分析 B")),
+    );
+    let route = model(&effects, true);
+    let effects = step(
+        &mut kernel,
+        &mut frames,
+        "B 获得完整主力，A 不取消",
+        done(route, create("分析 B", 2)),
+    );
+    let b = model(&effects, false);
+    step(
+        &mut kernel,
+        &mut frames,
+        "B 局部交付，A 仍在运行",
+        done(b, answer("B 的分析完成")),
+    );
+    assert_eq!(
+        kernel
+            .snapshot()
+            .jobs
+            .iter()
+            .find(|job| job.id == a)
+            .unwrap()
+            .active_call,
+        Some(old_a)
+    );
+    let effects = step(
+        &mut kernel,
+        &mut frames,
+        "用户改 A 为 C",
+        Event::Input(Input::new(InputId(3), "不要 A，改研究 C")),
+    );
+    let route = model(&effects, true);
+    let held = step(
+        &mut kernel,
+        &mut frames,
+        "旧 A 答案暂扣",
+        done(old_a, answer("OBSOLETE A")),
+    );
+    assert!(
+        !held
+            .iter()
+            .any(|effect| matches!(effect, Effect::Publish(Notice::Reply { .. })))
+    );
+    let effects = step(
+        &mut kernel,
+        &mut frames,
+        "更新目标，撤销旧候选，分派 C",
+        done(
+            route,
+            CallOutcome::kernel(KernelDecision {
+                changes: vec![JobChange::Update {
+                    job: a,
+                    goal: Some("研究 C".into()),
+                    action: JobAction::Keep,
+                    inputs: vec![InputId(3)],
+                    required: true,
+                }],
+                ..Default::default()
+            }),
+        ),
+    );
+    let c = model(&effects, false);
+    step(
+        &mut kernel,
+        &mut frames,
+        "C 由主力直接交付",
+        done(c, answer("C 的结论是……")),
+    );
+    let snapshot = kernel.snapshot();
+    assert!(
+        snapshot
+            .jobs
+            .iter()
+            .all(|job| job.state == JobState::Completed)
+    );
+    assert!(!snapshot.record.iter().any(|entry| matches!(&entry.kind, RecordKind::Notice(Notice::Reply { text, .. }) if text == "OBSOLETE A")));
+    if std::env::args().any(|argument| argument == "--json") {
         println!("{}", serde_json::to_string_pretty(&frames).unwrap());
     } else {
         for (index, frame) in frames.iter().enumerate() {
-            println!("\n{}. {}", index + 1, frame["title"].as_str().unwrap());
             println!(
-                "   主力={} 协调={} 暂存={}",
-                frame["after"]["work"], frame["after"]["review"], frame["after"]["candidate"]
+                "{}. {}；Jobs={} Calls={}",
+                index + 1,
+                frame["title"].as_str().unwrap(),
+                frame["jobs"],
+                frame["calls"]
             );
-            for effect in frame["effects"].as_array().unwrap() {
-                if let Some(start) = effect.get("Start") {
-                    println!("   启动 #{}：{}", start["id"], start["call"]);
-                } else {
-                    println!("   {effect}");
-                }
-            }
         }
-        println!("\n验收通过：状态询问不重启主力，旧 A 没有发布，B 由主力直接交付。");
+        println!("验收通过：B 独立交付，A 的旧答案未发布，C 由完整主力交付。");
     }
 }
 
-fn message(id: u64, text: &str) -> Event {
-    Event::UserMessage {
-        id: MessageId(id),
-        text: text.into(),
-    }
+fn create(goal: &str, input: u64) -> CallOutcome {
+    CallOutcome::kernel(KernelDecision {
+        changes: vec![JobChange::Create(JobSpec {
+            goal: goal.into(),
+            inputs: vec![InputId(input)],
+            parent: None,
+            references: vec![],
+        })],
+        ..Default::default()
+    })
 }
-
-fn finished(id: u64, outcome: JobOutcome) -> Event {
-    Event::JobFinished {
-        id: JobId(id),
-        outcome,
-    }
+fn answer(text: &str) -> CallOutcome {
+    CallOutcome::work(WorkProposal {
+        reply: Some(text.into()),
+        next: Next::Finish,
+        ..Default::default()
+    })
 }
-
-fn effect_json(effect: &Effect) -> Value {
-    match effect {
-        Effect::Start { id, call, timeout } => match call {
-            Call::Model(input) => json!({"Start": {
-                "id": id, "call": input.task, "input": input, "timeout": timeout,
-            }}),
-            Call::Tool(call) => json!({"Start": {
-                "id": id, "call": {"Tool": call}, "timeout": timeout,
-            }}),
-        },
-        Effect::RequestCancel { id } => json!({"RequestCancel": id}),
-        Effect::WakeAfter { id, delay } => json!({"WakeAfter": {"id": id, "delay": delay}}),
-        Effect::CancelWake { id } => json!({"CancelWake": id}),
-        Effect::Publish(notice) => json!({"Publish": notice}),
-    }
+fn done(id: CallId, outcome: CallOutcome) -> Event {
+    Event::CallFinished { id, outcome }
+}
+fn model(effects: &[Effect], kernel: bool) -> CallId {
+    effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Start {
+                id,
+                call: Call::Model(input),
+                ..
+            } if matches!(input.task, ModelTask::Kernel { .. }) == kernel => Some(*id),
+            _ => None,
+        })
+        .expect("the expected model call")
+}
+fn step(kernel: &mut Kernel, frames: &mut Vec<Value>, title: &str, event: Event) -> Vec<Effect> {
+    let before = kernel.record_cursor();
+    let effects = kernel.step(event.clone());
+    let after = kernel.snapshot();
+    frames.push(json!({"title":title,"event":event,"jobs":after.jobs.len(),"calls":after.calls.len(),"records":after.record.iter().filter(|entry| entry.cursor > before).collect::<Vec<_>>()}));
+    effects
 }

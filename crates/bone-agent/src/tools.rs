@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use crate::{JobContext, JobOutcome, ToolEffect, ToolPort, ToolSpec};
+use crate::{CallContext, CallOutcome, ToolEffect, ToolPort, ToolSpec};
 use bone_tools::{Tool, ToolEnvironment};
 use serde_json::Value;
 
@@ -42,14 +42,14 @@ impl<T: Tool + 'static> ToolPort for ReadOnlyTool<T> {
     fn run(
         &self,
         arguments: Value,
-        mut context: JobContext,
-    ) -> Pin<Box<dyn Future<Output = JobOutcome> + Send + 'static>> {
+        mut context: CallContext,
+    ) -> Pin<Box<dyn Future<Output = CallOutcome> + Send + 'static>> {
         let tool = Arc::clone(&self.tool);
         Box::pin(async move {
             let arguments = match serde_json::from_value::<T::Args>(arguments) {
                 Ok(arguments) => arguments,
                 Err(_) => {
-                    return JobOutcome::failed("tool arguments do not match the declared schema");
+                    return CallOutcome::failed("tool arguments do not match the declared schema");
                 }
             };
             let output = tokio::select! {
@@ -63,13 +63,13 @@ impl<T: Tool + 'static> ToolPort for ReadOnlyTool<T> {
                             .map(str::to_owned)
                             .or_else(|| failure.model_output().as_json().map(Value::to_string))
                             .unwrap_or_else(|| "tool execution failed".into());
-                        return JobOutcome::failed(message);
+                        return CallOutcome::failed(message);
                     }
                 },
             };
             match serde_json::to_value(output) {
-                Ok(value) => JobOutcome::artifact(value),
-                Err(_) => JobOutcome::failed("tool output could not be serialized"),
+                Ok(value) => CallOutcome::artifact(value),
+                Err(_) => CallOutcome::failed("tool output could not be serialized"),
             }
         })
     }

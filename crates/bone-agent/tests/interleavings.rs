@@ -1,87 +1,72 @@
-//! Independent ordering checks: the same observations arrive in every order.
-//! These assertions describe authority and user-visible behavior, not private state.
-
+//! Explore callback orders independently of the Tokio scheduler.
+mod support;
 use bone_agent::*;
 use serde_json::json;
+use support::*;
 
 #[test]
-fn changed_input_prevents_old_work_from_acting_in_every_callback_order() {
+fn target_change_stop_tool_result_and_old_worker_are_safe_in_every_order() {
     for order in permutations() {
-        for old_result in old_results() {
-            let mut kernel = Kernel::new(
-                KernelConfig::default(),
-                vec![
-                    tool("read", ToolEffect::ReadOnly),
-                    tool("write", ToolEffect::ExternalWrite),
-                ],
-            )
-            .unwrap();
-            let start = kernel.step(message(1, "Investigate A"));
-            let first = model_id(&start, false);
-            let running = kernel.step(finished(
-                first,
-                JobOutcome::work(WorkResult {
-                    autonomy: Autonomy::Run,
-                    operation: Some(Operation::Tool(ToolCall::new("read", json!({})))),
-                    next: Next::Continue,
-                    ..Default::default()
+        for old in [
+            CallOutcome::work(WorkProposal {
+                operation: Some(ToolCall::new("write", json!({}))),
+                next: Next::Continue,
+                ..Default::default()
+            }),
+            CallOutcome::work(answer("OLD ANSWER")),
+            CallOutcome::failed("old failure"),
+            CallOutcome {
+                result: Err(CallError {
+                    kind: CallErrorKind::TimedOut,
+                    message: "old timeout".into(),
                 }),
-            ));
-            let old_work = model_id(&running, false);
-            let read = kernel
-                .snapshot()
-                .jobs
-                .iter()
-                .find_map(|job| matches!(job.request, JobRequest::Tool(_)).then_some(job.id))
-                .unwrap();
-            let review = model_id(&kernel.step(message(2, "Do not use A; reconsider B")), true);
+                external_effect: ExternalEffect::None,
+            },
+            cancelled(),
+        ] {
+            let mut s = Scenario::new();
+            let (job, initial) = s.create(1, "Investigate A");
+            let effects = s.work(
+                initial,
+                WorkProposal {
+                    next: Next::Continue,
+                    ..operation("lookup")
+                },
+            );
+            let read = tool(&effects, "lookup");
+            let work = worker(&effects, job).0;
+            let route = routing(&s.say(2, "Stop using A; use B")).0;
             let events = [
-                finished(old_work, old_result),
+                finished(work, old),
                 finished(
-                    review,
-                    JobOutcome::review(InputReview {
-                        disposition: InputDisposition::Reconsider,
-                        reply: None,
-                        note: "The original words need the solver".into(),
-                    }),
+                    route,
+                    decision(vec![update(
+                        job,
+                        Some("B"),
+                        JobAction::Keep,
+                        vec![InputId(2)],
+                        true,
+                    )]),
                 ),
-                finished(read, JobOutcome::artifact("new facts")),
+                finished(read, CallOutcome::artifact("new material")),
                 Event::Stop,
             ];
             let mut stopped = false;
             for index in order {
                 stopped |= index == 3;
-                kernel.step(events[index].clone());
-                let snapshot = kernel.snapshot();
-                assert!(
-                    !snapshot.jobs.iter().any(|job| matches!(&job.request,
-                    JobRequest::Tool(call) if call.name == "write")),
-                    "order={order:?}"
-                );
-                assert!(
-                    !snapshot.record.iter().any(|entry| matches!(&entry.kind,
-                    RecordKind::Notice(Notice::Reply { text, .. }) if text == "OLD ANSWER")),
-                    "order={order:?}"
-                );
-                let redirected = snapshot.record.iter().any(|entry| {
-                    matches!(
-                        entry.kind,
-                        RecordKind::InputReviewed {
-                            disposition: InputDisposition::Reconsider,
-                            ..
-                        }
-                    )
-                });
-                if redirected && !stopped {
-                    assert!(
-                        snapshot.autonomous,
-                        "an old callback paused its replacement: {order:?}"
-                    );
-                }
+                s.kernel.step(events[index].clone());
+                let snapshot = s.kernel.snapshot();
+                assert!(!snapshot.calls.iter().any(|call| matches!(&call.request, CallRequest::Tool(tool) if tool.name == "write")), "order={order:?}");
+                assert!(!snapshot.record.iter().any(|entry| matches!(&entry.kind, RecordKind::Notice(Notice::Reply { text, .. }) if text == "OLD ANSWER")), "order={order:?}");
                 if stopped {
                     assert!(
-                        !snapshot.autonomous,
-                        "a callback resumed stopped work: {order:?}"
+                        snapshot.jobs.iter().all(|job| job.active_call.is_none()),
+                        "late callback revived a stopped job: {order:?}"
+                    );
+                } else if s.job(job).goal == "B" {
+                    assert!(
+                        !matches!(s.job(job).state, JobState::Failed { .. } | JobState::Paused),
+                        "old failure damaged replacement: {order:?}"
                     );
                 }
             }
@@ -89,37 +74,29 @@ fn changed_input_prevents_old_work_from_acting_in_every_callback_order() {
     }
 }
 
-fn old_results() -> Vec<JobOutcome> {
-    let mut results = vec![JobOutcome::work(WorkResult {
-        reply: Some("OLD ANSWER".into()),
-        operation: Some(Operation::Tool(ToolCall::new("write", json!({})))),
-        next: Next::Continue,
-        ..Default::default()
-    })];
-    for kind in [
-        JobErrorKind::Failed,
-        JobErrorKind::Cancelled,
-        JobErrorKind::TimedOut,
-    ] {
-        results.push(JobOutcome {
-            result: Err(JobError {
-                kind,
-                message: "old call ended".into(),
-            }),
-            external_effect: ExternalEffect::None,
-        });
+#[test]
+fn duplicate_real_results_never_republish_after_a_job_is_finished() {
+    let mut s = Scenario::new();
+    let (_, call) = s.create(1, "answer");
+    s.work(call, answer("once"));
+    let baseline = s.kernel.snapshot();
+    for _ in 0..3 {
+        let effects = s.work(call, answer("once"));
+        no_start(&effects);
+        assert!(replies(&effects).is_empty());
+        assert_eq!(s.kernel.snapshot(), baseline);
     }
-    results
 }
 
 fn permutations() -> Vec<[usize; 4]> {
-    let mut result = Vec::new();
+    let mut result = vec![];
     for a in 0..4 {
         for b in 0..4 {
             for c in 0..4 {
                 for d in 0..4 {
                     let order = [a, b, c, d];
-                    if (0..4).all(|value| order.iter().filter(|&&item| item == value).count() == 1)
+                    if (0..4)
+                        .all(|value| order.iter().filter(|&&entry| entry == value).count() == 1)
                     {
                         result.push(order);
                     }
@@ -128,38 +105,4 @@ fn permutations() -> Vec<[usize; 4]> {
         }
     }
     result
-}
-
-fn tool(name: &str, effect: ToolEffect) -> ToolSpec {
-    ToolSpec {
-        name: name.into(),
-        description: name.into(),
-        parameters: json!({"type":"object"}),
-        effect,
-    }
-}
-
-fn model_id(effects: &[Effect], review: bool) -> JobId {
-    effects
-        .iter()
-        .find_map(|effect| match effect {
-            Effect::Start {
-                id,
-                call: Call::Model(input),
-                ..
-            } if matches!(input.task, ModelTask::ReviewInput { .. }) == review => Some(*id),
-            _ => None,
-        })
-        .expect("the expected model request should start")
-}
-
-fn message(id: u64, text: &str) -> Event {
-    Event::UserMessage {
-        id: MessageId(id),
-        text: text.into(),
-    }
-}
-
-fn finished(id: JobId, outcome: JobOutcome) -> Event {
-    Event::JobFinished { id, outcome }
 }

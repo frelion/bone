@@ -44,17 +44,14 @@ fn host_accepts_independently_constructed_role_models() {
         )),
     );
 
+    assert_eq!(models.kernel().model().endpoint_id(), "review-provider");
     assert_eq!(
-        models.coordinator().model().endpoint_id(),
-        "review-provider"
-    );
-    assert_eq!(
-        models.coordinator().model().protocol(),
+        models.kernel().model().protocol(),
         Protocol::OpenAiChatCompletions
     );
-    assert_eq!(models.solver().model().endpoint_id(), "solver-provider");
+    assert_eq!(models.worker().model().endpoint_id(), "solver-provider");
     assert_eq!(
-        models.solver().model().protocol(),
+        models.worker().model().protocol(),
         Protocol::AnthropicMessages
     );
 }
@@ -77,4 +74,51 @@ fn configured_model_rejects_options_for_another_protocol() {
             model_protocol: Protocol::AnthropicMessages,
         }
     );
+}
+
+#[test]
+fn scheduling_defaults_are_bounded_independently() {
+    let config = bone_agent::KernelConfig::default();
+    assert_eq!(config.background_concurrency, 2);
+    assert_eq!(config.input_capacity, 32);
+    assert_eq!(config.tool_concurrency, 8);
+    assert!(!config.kernel_timeout.is_zero());
+    assert!(!config.work_timeout.is_zero());
+}
+
+#[test]
+fn zero_limits_and_duplicate_tool_registrations_are_rejected() {
+    use bone_agent::{Kernel, KernelConfig, ToolEffect, ToolSpec};
+    use std::time::Duration;
+    for config in [
+        KernelConfig {
+            kernel_timeout: Duration::ZERO,
+            ..Default::default()
+        },
+        KernelConfig {
+            work_timeout: Duration::ZERO,
+            ..Default::default()
+        },
+        KernelConfig {
+            background_concurrency: 0,
+            ..Default::default()
+        },
+        KernelConfig {
+            input_capacity: 0,
+            ..Default::default()
+        },
+        KernelConfig {
+            tool_concurrency: 0,
+            ..Default::default()
+        },
+    ] {
+        assert!(Kernel::new(config, vec![]).is_err());
+    }
+    let spec = ToolSpec {
+        name: "duplicate".into(),
+        description: "tool".into(),
+        parameters: serde_json::json!({"type":"object"}),
+        effect: ToolEffect::ReadOnly,
+    };
+    assert!(Kernel::new(KernelConfig::default(), vec![spec.clone(), spec]).is_err());
 }

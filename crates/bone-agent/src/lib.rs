@@ -1,27 +1,17 @@
-//! A complete agent session, with models and tools executed as ordinary jobs.
+//! An event-driven agent OS: semantic jobs, one state owner, asynchronous effects.
 //!
-//! Product code resolves Agent execution settings into a
-//! [`ResolvedAgentRuntimeConfig`], constructs [`AgentModels`], creates an
-//! [`AgentHost`], and starts independent runtimes from it. Each runtime keeps
-//! its supplied configuration snapshot.
-//!
-//! [`Kernel::step`] records observations and returns [`Effect`]s. [`Runtime`]
-//! executes them without waiting in the inbox loop. The solver owns task
-//! decisions; a separate, limited model call can interpret interruptions.
-
+//! The Kernel model assigns work; full-capability workers solve it. Both return
+//! proposals to [`Kernel::step`]. Only the kernel changes authoritative state;
+//! [`Runtime`] executes effects and feeds observations back into the same loop.
 #![forbid(unsafe_code)]
-
 mod app;
 mod config;
+mod context;
 mod kernel;
 mod model;
 mod ports;
-mod review;
 mod runtime;
 mod tools;
-
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 pub use app::{AgentHost, AgentModels, ConfiguredModel, ConfiguredModelError, StartError};
 pub use config::{ResolvedAgentRuntimeConfig, ResolvedAgentRuntimeConfigError, RuntimeDeadlines};
@@ -31,37 +21,57 @@ pub use ports::*;
 pub use runtime::{
     AgentHandle, HandleError, Observation, Runtime, RuntimeConfig, RuntimeError, ShutdownReport,
 };
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 pub use tools::read_only_tools;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct MessageId(pub u64);
-
+pub struct InputId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct JobId(pub u64);
-
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct CallId(pub u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EffectId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WakeId(pub u64);
 
-/// Observations, never instructions from a running job to start another job.
+/// All input, including host controls and execution observations, enters here.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Event {
-    UserMessage { id: MessageId, text: String },
-    JobFinished { id: JobId, outcome: JobOutcome },
-    JobProgress { id: JobId, progress: JobProgress },
-    Wake { id: WakeId },
+    Input(Input),
+    RetryInput {
+        id: InputId,
+    },
+    CallFinished {
+        id: CallId,
+        outcome: CallOutcome,
+    },
+    CallProgress {
+        id: CallId,
+        progress: CallProgress,
+    },
+    /// Host-verified reconciliation, never a model's claim about a write.
+    WriteResolved {
+        id: CallId,
+        outcome: CallOutcome,
+    },
+    Wake {
+        id: WakeId,
+    },
     Stop,
 }
 
-/// Every call uses the same execution path. A deadline belongs to the invocation.
+/// Permission to start is not proof that an operation has happened.
 #[derive(Clone, Debug)]
 pub enum Effect {
     Start {
-        id: JobId,
+        id: CallId,
         call: Call,
         timeout: Option<Duration>,
     },
     RequestCancel {
-        id: JobId,
+        id: CallId,
     },
     WakeAfter {
         id: WakeId,
@@ -75,41 +85,60 @@ pub enum Effect {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Notice {
-    /// Reply to a fixed batch, based on a particular record position.
-    /// Execution acknowledgements come from JobStarted / JobFinished instead.
+    InputHandled {
+        inputs: Vec<InputId>,
+        required_jobs: Vec<JobId>,
+    },
+    InputFinished {
+        id: InputId,
+        outcome: InputOutcome,
+    },
+    InputRoutingFailed {
+        inputs: Vec<InputId>,
+        message: String,
+    },
+    Clarification {
+        inputs: Vec<InputId>,
+        job: Option<JobId>,
+        question: String,
+    },
     Reply {
+        job: JobId,
         text: String,
-        reply_to: Vec<MessageId>,
+        reply_to: Vec<InputId>,
         as_of: u64,
     },
-    JobStarted {
-        id: JobId,
-        request: JobRequest,
-    },
-    JobProgress {
-        id: JobId,
-        progress: JobProgress,
+    JobChanged {
+        job: JobSnapshot,
     },
     JobFinished {
         id: JobId,
-        outcome: JobOutcome,
+        state: JobState,
+    },
+    CallStarted {
+        id: CallId,
+        job: Option<JobId>,
+        request: CallRequest,
+    },
+    CallProgress {
+        id: CallId,
+        job: Option<JobId>,
+        progress: CallProgress,
+    },
+    CallFinished {
+        id: CallId,
+        job: Option<JobId>,
+        outcome: CallOutcome,
     },
     Error {
         message: String,
     },
-    Paused,
-    /// The task was delivered. Remaining read-only calls are being cancelled;
-    /// local cleanup is separate from proof that remote work stopped.
-    Finished {
-        cleanup: Vec<JobId>,
-    },
     Stopped,
 }
 
-/// Receipt of a message, independent of completion of the work it starts.
+/// Receipt of acceptance into this runtime, not durable storage or completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MessageReceipt {
-    pub id: MessageId,
-    /// Position of this UserMessage entry in the shared record (one-based).
+pub struct InputReceipt {
+    pub id: InputId,
     pub record_cursor: u64,
 }

@@ -1,237 +1,67 @@
 # bone-agent
 
-一个同步内核，外接异步执行器。**主力决定怎么做，代码管理执行，协调只解释主力忙碌时的插话。**
+**Kernel 模型管工作，主力模型做工作，代码 Kernel 维护真实状态。**
 
-```text
-用户要求 → 主力 → 工具 → 主力 → …… → 答案
-主力忙碌时的插话 → 协调：保持 / 重想 / 暂停
-```
+这是进程内的实时 Agent 内核。多个持续 Job 可以并存，模型调用有界并行；新消息不是后台工作完成后才能处理的“下一轮”。
 
-没有插话，协调调用为零。主力空闲时用户原话直接交给主力；工具结果、失败和软提醒也直接回到主力。
-协调不选择工具、不重写要求、不制定方案、不审批专业答案。
+当前只重写 bone-agent，**bone-app 尚未迁移到新 API**。这里不提供旧接口兼容层，也不接管配置存储、认证或数据库。
 
-## 从一次运行开始
+## 先跑起来看
 
 ```sh
-cargo run -p bone-agent --example walkthrough
-cargo run -p bone-agent --example interleaving
+cargo run -p bone-agent --example walkthrough --locked
+cargo run -p bone-agent --example interleaving --locked
 ```
 
-[walkthrough](examples/walkthrough.rs) 直接向真实 Kernel 喂事件，演示研究 A、询问进度、改 B、
-旧答案暂存、主力交付 B。加 `-- --json` 导出每一步的完整输入、状态和指令。
-修改一个预设 `WorkResult` 或 `InputReview`，即可观察规则如何处理不同选择。
+两个例子都执行真实 Kernel/Runtime，但使用受控模型结果，不访问模型服务。[walkthrough](examples/walkthrough.rs) 演示 A、B 并行及目标变更；[interleaving](examples/interleaving.rs) 演示异步工具、取消、定时和观察。
 
-[interleaving](examples/interleaving.rs) 接上真实 Runtime、可控端口和虚拟时间，演示工具卡住、
-30 秒软提醒、两种模型并发、旧建议被撤销，以及卡住的只读调用如何结束本地等待。
-模型输出是预设数据，状态变化、调度、取消和事件流都由实际实现完成。
+## 五个核心抽象
 
-## 三个模块
+- **Event**：用户原话、调用结果、进度、定时与宿主控制的统一入口。
+- **Kernel**：唯一状态写入者。`step(event) -> Vec<Effect>` 不做 I/O、不等待模型。
+- **Effect**：获准启动、取消、定时或发布的执行指令，不是成功证明。
+- **Runtime**：监督一次模型或工具调用，将真实结果送回 Kernel。
+- **Job**：一项持续工作，保存目标、状态、成果、原始输入和关系。一次调用另记为 Call。
 
-```mermaid
-flowchart LR
-    U[用户] -->|输入或停止| R[Runtime]
-    R -->|Event| K[Kernel.step]
-    K -->|Effect| R
-    R -->|启动，不等待| J[模型或工具]
-    J -->|结果与进度| R
-    R --> O[回复与观察事件]
-```
+自然语言先交给 Kernel 模型短分派：创建、更新或控制明确的 Job。主力随后拿到原文并深入求解；工具结果直接回到所属工作，答案不再经过 Kernel 模型审批。复杂输入可以委派调查或请求澄清。
 
-| 模块 | 职责 |
-| --- | --- |
-| [kernel.rs](src/kernel.rs) | 唯一持有会话状态；记录事件、检查建议、返回执行指令。 |
-| [runtime.rs](src/runtime.rs) | 收件、启动异步作业、保管句柄、监督取消与截止时间。 |
-| [ports.rs](src/ports.rs) | 模型与工具接口，以及输入、结果、快照和观察数据。 |
+`KernelDecision` 只表达工作调整；`WorkProposal` 只表达本 Job 的材料、回复、工具和下一步。工作证据不是新用户授权：worker 发起的协调不能重写已有目标、解除暂停或改会话约束，只能在自己的工作树内行动。
 
-```rust,ignore
-Kernel::step(event) -> Vec<Effect>
-```
+## 运行规则
 
-`step` 不调用模型或工具、不等待 I/O、不读取系统时间。
-Runtime 分发 Effect 后继续收件，完成结果作为事件返回。
-模型和工具共用启动、进度、完成、取消机制，端口内部不能再隐藏一个 Agent 循环。
+- 默认 1 个 Kernel 槽、1 个交互主力槽、2 个后台主力槽、8 个工具槽。新用户工作优先交互槽，也可使用空闲后台容量；后台工作不能挤占交互保留槽。
+- 每 Job 至多一个有提交资格的主力。旧调用撤销资格后可以尚未结束，但仍计入实际容量。后台轮转，等待不占模型槽，工具候选按到达顺序轮转。
+- 目标和控制变化只撤销相关调用；普通进度和追加材料不让全部答案重新计算。
+- 拥有的子工作随父工作取消；引用关系不传播取消。等待“成果可用”和等待“整个工作完成”是两件事。
+- 未解释输入暂扣新的业务写入与可能过时的旧最终答案，计算和许可内的调查继续。候选等待时排空有限输入，避免不停接收消息导致永远不能交付。
+- 默认接受 32 个未解释普通输入，另保留一个定向澄清信封。Busy 没有接收消息；宿主保留并重试。Stop、显式重试和关联澄清走独立控制入口。
+- 路由失败不自行重试。显式重试保留原 ID；新用户输入则与尚未解决的原话按接收顺序组成新批次，接管解释权，旧调查只能留下材料。
+- Stop 同时撤销未完成分派与工作资格。已授权的外部行动只能尽力取消；本地取消不等于远端未执行。
 
-## 两种模型用途，求解权属于主力
+写入最多一个结果未决的调用。`None / Applied / Unknown` 独立于 Job 生命周期，Unknown 只能通过宿主的 `resolve_write(CallId, outcome)` 确证，不自动重发。确证后相关工作重新考虑旧提案。这里没有跨工具 exactly-once、权限 DSL 或任意外部资源的事务保证；宿主与工具适配器负责实际授权、隔离及条件写。
 
-| 用途 | 输入与权限 |
-| --- | --- |
-| `Work` | 最新快照和固定用户批次。返回 `WorkResult`，决定工具、取消、回复和下一步。 |
-| `ReviewInput` | 主力忙碌时的固定插话批次。只返回 `Keep / Reconsider / Pause`、简短交流和判断理由。 |
+## 接入
 
-`WorkResult` 的六个字段：
+通过 `AgentHost` 注入两个已连接模型和执行配置，或直接用 `Runtime::spawn` 注入受控端口。完整入口见 [Agent API](../../docs/agent.md)。
 
-| 字段 | 含义 |
-| --- | --- |
-| `note` | 明确返回的结论或材料，可供后续主力使用。 |
-| `reply` | 要发布的用户回复。 |
-| `requirement` | 主力根据本批原话更新的可选要求摘要，不能替代原话。 |
-| `autonomy` | `Keep / Run / Pause`，保持、开启或暂停自主推进。 |
-| `operation` | 最多一个 `Tool` 或 `Cancel`；也可以为空。 |
-| `next` | `Continue / Wait / Finish`，继续推理、等待或交付。 |
+`post(Input::new(InputId(1), text))` 返回接受收据。同 ID 同内容重投幂等；改内容会拒绝。`Input::replying_to` 可澄清或纠正未决输入，也可回答工作正在等待的问题。
 
-`Continue` 立即开始下一次推理，可以完全没有工具；它不会等刚启动的工具。
-下一步依赖工具结果时应选 `Wait`，结果到达后自动唤醒主力。工具等待不占住主力请求槽。
-每次主力或协调各最多一个本地请求；主力返回但尚未提交时保存一份结果。
-所有调用读取同一份会话记录的不可变快照，没有第二套聊天历史。
+要求主力处理的新输入会撤销旧调用的交付资格，即使目标文字没变；所有原话按实际接收顺序提供。Keep 保留已有暂停状态，只有用户触发的 Resume 才能恢复暂停工作。
 
-协调只在主力推理中或结果等待提交时解释插话：
+输入已处理、Job 完成、整个请求交付、Runtime 关闭有独立通知。一个输入可能关联多个交付 Job；宿主应等待对应 `InputFinished`，不能凭一条 Reply 或某个 Call 结束判断请求完成。
 
-- `Keep`：明确不影响当前任务，原推理继续；例如只询问进度。
-- `Reconsider`：新增要求、改方向、专业追问或含义不明确，原话转给主力。
-- `Pause`：本批输入要求暂停；保留此批之后的消息。
+`observe()` 原子返回快照、序号和后续事件。慢观察者不阻塞执行；收到 Lagged 后重新 observe。事件与快照包含用户和工具材料，宿主负责隐私与保存策略；它们不是跨重启恢复协议。
 
-“进度如何，顺便不要 A”必须交回主力。协调对语言可能判断错误；类型和代码检查不能证明语义正确。
-真实适配器给协调一个小视图，不包含工具定义、文件结果或完整分析产物。
+## 阅读与验证
 
-## 插话与旧结果怎样交错
-
-```text
-主力 W1 正在推理 A
-收到“不要 A，改 B” → 协调 C1 开始解释
-W1 先返回 → 暂存，答案和工具建议都不发布
-C1 返回 Reconsider → 撤销 W1，把原批次和新原话交给 W2
-W2 自己研究 B → 检查通过 → 直接交付
-```
-
-协调尚未处理完时又收到新消息，新消息进入下一批，不能被当前批次误标为已处理。
-`Reconsider` 完成的是分类，原消息仍需明确交给下一次 Work；单纯留在历史里不算移交。
-
-主力整份 `reply / requirement / autonomy / operation / next` 提交前检查：
-
-1. 请求与运行代次仍有效。
-2. 没有尚未解释的新增输入，自己的固定输入批次除外。
-3. 决定依据没有变化。
-4. 工具及运行规则允许操作。
-
-记录位置随新信息增长；依据版本只在实质变化时增长。普通进度和 `Keep` 不使推理过时。
-工具实质结果会改变依据：工具先结束、旧建议后到达时，即使写入名额已空也不能执行旧建议。
-过时或被规则阻止的结果作为材料保留，由主力重新考虑；不会排队等待条件满足后自动执行。
-
-## 停止、取消与完成
-
-`stop()` 立即撤销旧模型的执行资格。旧回调不能恢复或发布旧回复，真实工具结果仍被记录。
-暂停不关闭对话。新输入由主力理解后才可能恢复，不能把“谢谢”写成自动恢复。
-自然语言暂停的边界是它所属批次的记录位置：先收到“暂停”、后收到“继续 B”，B 不能被清空。
-
-只读调用由 Runtime 在 Future 外层响应取消，即使端口不主动检查信号也能结束本地等待。
-本地结束事件到达后才释放主力槽，启动替代请求。丢弃 Future 不证明服务商停止计算，
-只保证已经收到的旧结果能保留；端口必须异步让出线程并正确管理自己的资源。
-
-写操作继续采用保守规则：最多一个结果未明的写入，查询和取消仍允许。
-取消、超时和传输错误不能当作“没有发生写入”；`Unknown` 继续占住写入名额，直到获得明确结果。
-调用已返回后，宿主可用 `resolve_write(id, outcome)` 递交外部确证，经同一事件入口更新原作业。
-只接受未知写入的明确工具结果；相同确证重复提交幂等，不同的再次改写会被拒绝。
-该接口不自动查询，也不让模型凭文字确认成功。对本地已结束的未知写入请求取消会明确报错。
-
-`Finish` 交付当前任务并停止自主推进，不能申请新工具调用。
-未决写入阻止成功完成；废弃的只读调用可以进入清理阶段，通过 `Finished { cleanup }` 明确列出。
-之后的完成通知不重复交付。任务完成、取消请求、远端确认停止是不同的事实。
-
-当前有效模型失败或超时会释放槽、发布错误并暂停，不自动无限重试。
-旧请求的取消或超时只记录，不能误停替代工作。
-默认工具软提醒 30 秒，主力与协调截止时间各 120 秒，关闭清理时间 5 秒，均可配置。
-
-## 观察真实运行
-
-`AgentHandle::observe().await` 原子返回快照、当前序号和后续事件流，避免先查状态再订阅的间隙。
-每个 `StepEvent` 对应一次完整 `Kernel.step()`：
-
-| 字段 | 含义 |
-| --- | --- |
-| `sequence` | 会话内递增的处理序号。 |
-| `elapsed` | Runtime 提供的单调运行时长。 |
-| `event` | 输入、作业结果、进度、提醒或停止。 |
-| `records` | 新增记录，包括 `InputReviewed`、`WorkHeld`、`PlanAccepted / PlanDiscarded`。 |
-| `effects` | 实际发出的启动、取消、提醒和发布指令。 |
-
-`Start` 摘要包含用途、输入消息 ID、记录位置、依据版本和运行代次，不递归嵌套快照。
-`PlanAccepted` 表示主力整份建议通过代码检查；`Start` 仍只是指令，执行结果须看 `JobFinished`。
-只暴露返回的结论和处理理由，不读取模型内部思考。
-
-```rust,ignore
-use tokio::sync::broadcast::error::RecvError;
-
-let mut observation = agent.observe().await?;
-loop {
-    match observation.events.recv().await {
-        Ok(step) => println!("{step:?}"),
-        Err(RecvError::Lagged(_)) => observation = agent.observe().await?,
-        Err(RecvError::Closed) => break,
-    }
-}
-```
-
-实时缓冲保留最近 256 步，订阅者独立接收。慢观察者不会阻塞 Kernel 或延长 Runtime 生命。
-遗漏通过 `Lagged` 暴露，可重新获取一致快照；不会补发错过的原始步骤。进度按作业合并。
-观察者需要改变工作时，仍使用显式 `post()`、`stop()`，不能在回调里直接执行操作。
-
-终端前端可写出同一端口的事件：
+从 [lib.rs](src/lib.rs) 的事件和效果读起，然后看 [ports.rs](src/ports.rs) 的协议、[kernel.rs](src/kernel.rs) 的 `step / advance`、[runtime.rs](src/runtime.rs) 的执行循环。模型提示及协议在 [model.rs](src/model.rs)，角色上下文在 [context.rs](src/context.rs)。
 
 ```sh
-cargo run -p bone-app --bin bone -- --events session.jsonl "Inspect the workspace"
+cargo fmt -p bone-agent --check
+cargo clippy -p bone-agent --all-targets --all-features --locked -- -D warnings
+cargo test -p bone-agent --all-targets --all-features --locked
+cargo test -p bone-agent --doc --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc -p bone-agent --no-deps --all-features --locked
 ```
 
-文件必须不存在。JSONL 先写 `snapshot`，随后 `step`，落后时写 `gap`。
-内容包含会话输入、明确返回的决定及工具数据；不收集登录通信或内部思考。
-写出由独立消费者完成，关闭时等待它结束。这是观察接口，不是持久化恢复协议。
-
-## 模型配置的归属
-
-产品层可以为每个新 Runtime 独立选择协调和主力。`bone-agent` 不读取文件、不管理登录、
-不选择配置后端，也不认识 profile、凭据或 Store。产品层先构造两个 `ConfiguredModel`，再将
-它们配对成 `AgentModels`；工具限制和四个 Agent deadline 则解析为
-`ResolvedAgentRuntimeConfig`。
-
-`ConfiguredModel` 把已选的 `bone_llm::Model` 与可选的、协议化 `ModelOptions` 固定在一起。
-构造时会拒绝错误的组合，例如把 OpenAI Responses reasoning 传给 Anthropic。`AgentHost::start`
-同步接收这两类不可变输入，构造独立的工具、Kernel 和 Runtime；不会重新选择模型或修改
-请求选项。一个已经运行的 Agent 永远保持它启动时的模型、选项、工具限制和 deadline；要应用
-新设置，产品层必须构造新 Host 和新配置并创建新 Runtime。
-
-协调和主力截止分别传入 `KernelConfig::review_timeout / work_timeout`；软 deadline 与关闭宽限
-同样属于 `ResolvedAgentRuntimeConfig`。模型协议特有的 controls 属于 `bone-llm::ModelOptions`，
-而不是 Agent 的通用配置。
-
-## 接入与源码阅读
-
-```rust,ignore
-let coordinator = bone_agent::ConfiguredModel::new(
-    product_connect_coordinator_model().await?,
-    coordinator_options,
-)?;
-let solver = bone_agent::ConfiguredModel::new(
-    product_connect_solver_model().await?,
-    solver_options,
-)?;
-let host = bone_agent::AgentHost::new(bone_agent::AgentModels::new(coordinator, solver));
-
-let first_config = bone_agent::ResolvedAgentRuntimeConfig::new(
-    tool_limits.clone(), soft_deadline, review_timeout, work_timeout, shutdown_grace,
-)?;
-let first = host.start(workspace_a, first_config)?;
-
-let second_config = bone_agent::ResolvedAgentRuntimeConfig::new(
-    tool_limits, soft_deadline, review_timeout, work_timeout, shutdown_grace,
-)?;
-let second = host.start(workspace_b, second_config)?;
-```
-
-一个 Host 的两组已配置模型可以同时支撑多个相互独立的会话。认证、凭据租约、profile
-解析和跨进程连接协调都属于产品层，而不是 Agent runtime。
-
-| 方法 | 完成意味着什么 |
-| --- | --- |
-| `post(text).await` | 内核已接收，返回消息位置；不等待整项任务完成。 |
-| `stop().await` | 旧自主工作的执行资格被撤销。 |
-| `snapshot().await` | 获取状态和完整内存记录。 |
-| `resolve_write(id, outcome).await` | 宿主核实后确认一个已结束的未知写入；不自行查询或从停止中恢复。 |
-| `observe().await` | 原子获取快照和后续处理事件。 |
-| `subscribe()` | 独立接收回复、进度、结果与错误。 |
-| `shutdown().await` | 清理后返回未解决作业；并发或重复调用共享最终报告。 |
-
-所有 Handle 丢弃也会触发关闭。第一版只处理单进程内存状态，不提供外部操作恰好一次的保证。
-
-阅读顺序：先看 [walkthrough](examples/walkthrough.rs)，再看 [Kernel 的 step](src/kernel.rs)、
-[协议类型](src/ports.rs) 和 [Runtime 的 dispatch](src/runtime.rs)。
-完整反例、设计取舍和开源依据见[模型职责设计](../../docs/agent-model-responsibilities.md)。
-本轮测试与真实模型事件见[重构验收记录](../../docs/certifications/bone-agent-2026-09-06-solver-loop.md)。
+[设计](../../docs/agent-realtime-os-design.md)记录取舍，[场景验证](../../docs/agent-realtime-os-validation.md)区分自动化测试与明确不覆盖的场景。首版不承诺持久续跑、浏览器共享资源管理、多租户隔离或硬实时控制。

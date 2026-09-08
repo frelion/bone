@@ -1,5 +1,7 @@
 # 主力推进任务，协调只判断插话
 
+> 历史设计（2026-09-06），已被[双模型实时内核设计](agent-realtime-os-design.md)取代。当前 API 与源码以 [bone-agent guide](../crates/bone-agent/README.md) 为准；以下内容保留用于追溯。
+
 状态：2026-09-06 已实现主力驱动与插话审阅，使用同一套事件内核和异步作业执行器。
 本文固定当前架构的权限、交错规则与验收要求；旧 `Decide / Analyze` 路径已移除。
 可以通过 `walkthrough`、`interleaving` 和事件观察接口检查真实实现。

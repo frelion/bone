@@ -1,33 +1,23 @@
-//! Validated Agent runtime configuration.
-//!
-//! This module contains only the Agent's own execution limits and deadlines.
-//! Product code resolves its settings, constructs role models, and supplies a
-//! [`ResolvedAgentRuntimeConfig`] to [`crate::AgentHost`] at runtime startup.
+//! Validated Agent execution limits, model deadlines, and scheduler capacity.
 
 use std::time::Duration;
 
 use bone_tools::{ToolLimits, ToolLimitsError};
 use thiserror::Error;
 
-/// All timeouts captured by one runtime.
-///
-/// The type is immutable so an attached runtime cannot observe later product
-/// settings changes.
+use crate::KernelConfig;
+
+/// The active deadlines captured by one runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeDeadlines {
-    soft_deadline: Duration,
-    review_timeout: Duration,
+    kernel_timeout: Duration,
     work_timeout: Duration,
     shutdown_grace_period: Duration,
 }
 
 impl RuntimeDeadlines {
-    pub fn soft_deadline(self) -> Duration {
-        self.soft_deadline
-    }
-
-    pub fn review_timeout(self) -> Duration {
-        self.review_timeout
+    pub fn kernel_timeout(self) -> Duration {
+        self.kernel_timeout
     }
 
     pub fn work_timeout(self) -> Duration {
@@ -39,48 +29,51 @@ impl RuntimeDeadlines {
     }
 }
 
-/// A complete, validated, immutable snapshot of Agent-owned runtime settings.
+/// A validated, immutable snapshot of all Agent execution settings.
 ///
-/// Model choice, provider protocol options, credentials, and persisted
-/// settings locations deliberately do not appear here. They are resolved by
-/// the product into the [`crate::AgentModels`] supplied to [`crate::AgentHost`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The supplied Kernel configuration determines both model timeouts and all
+/// scheduler capacities. Model selection and credentials live in AgentModels.
+#[derive(Clone, Debug)]
 pub struct ResolvedAgentRuntimeConfig {
     tool_limits: ToolLimits,
-    deadlines: RuntimeDeadlines,
+    kernel_config: KernelConfig,
+    shutdown_grace_period: Duration,
 }
 
 impl ResolvedAgentRuntimeConfig {
-    /// Construct a complete runtime snapshot from already-resolved Agent
-    /// execution settings.
+    /// Validate explicit tool limits, Kernel settings, and shutdown grace.
+    /// AgentHost forwards these settings without substituting scheduler defaults.
     pub fn new(
         tool_limits: ToolLimits,
-        soft_deadline: Duration,
-        review_timeout: Duration,
-        work_timeout: Duration,
+        kernel_config: KernelConfig,
         shutdown_grace_period: Duration,
     ) -> Result<Self, ResolvedAgentRuntimeConfigError> {
-        tool_limits
-            .validate()
-            .map_err(ResolvedAgentRuntimeConfigError::ToolLimits)?;
+        tool_limits.validate()?;
         for (field, duration) in [
-            ("soft_deadline", soft_deadline),
-            ("review_timeout", review_timeout),
-            ("work_timeout", work_timeout),
+            ("kernel_timeout", kernel_config.kernel_timeout),
+            ("work_timeout", kernel_config.work_timeout),
             ("shutdown_grace_period", shutdown_grace_period),
         ] {
             if duration.is_zero() {
                 return Err(ResolvedAgentRuntimeConfigError::NonPositiveDeadline { field });
             }
         }
+        for (field, capacity) in [
+            (
+                "background_concurrency",
+                kernel_config.background_concurrency,
+            ),
+            ("input_capacity", kernel_config.input_capacity),
+            ("tool_concurrency", kernel_config.tool_concurrency),
+        ] {
+            if capacity == 0 {
+                return Err(ResolvedAgentRuntimeConfigError::NonPositiveCapacity { field });
+            }
+        }
         Ok(Self {
             tool_limits,
-            deadlines: RuntimeDeadlines {
-                soft_deadline,
-                review_timeout,
-                work_timeout,
-                shutdown_grace_period,
-            },
+            kernel_config,
+            shutdown_grace_period,
         })
     }
 
@@ -88,80 +81,118 @@ impl ResolvedAgentRuntimeConfig {
         &self.tool_limits
     }
 
+    pub fn kernel_config(&self) -> &KernelConfig {
+        &self.kernel_config
+    }
+
     pub fn deadlines(&self) -> RuntimeDeadlines {
-        self.deadlines
+        RuntimeDeadlines {
+            kernel_timeout: self.kernel_config.kernel_timeout,
+            work_timeout: self.kernel_config.work_timeout,
+            shutdown_grace_period: self.shutdown_grace_period,
+        }
     }
 }
 
-/// A failure while converting product settings into Agent runtime settings.
+/// A failure while validating Agent execution settings.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ResolvedAgentRuntimeConfigError {
     #[error(transparent)]
     ToolLimits(#[from] ToolLimitsError),
     #[error("{field} must be greater than zero")]
     NonPositiveDeadline { field: &'static str },
+    #[error("{field} must be greater than zero")]
+    NonPositiveCapacity { field: &'static str },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn config() -> ResolvedAgentRuntimeConfig {
-        ResolvedAgentRuntimeConfig::new(
-            ToolLimits::default(),
-            Duration::from_secs(3),
-            Duration::from_secs(15),
-            Duration::from_secs(17),
-            Duration::from_secs(2),
-        )
-        .unwrap()
+    fn kernel_config() -> KernelConfig {
+        KernelConfig {
+            kernel_timeout: Duration::from_secs(15),
+            work_timeout: Duration::from_secs(17),
+            background_concurrency: 3,
+            input_capacity: 7,
+            tool_concurrency: 4,
+        }
     }
 
     #[test]
-    fn captures_only_agent_execution_settings() {
-        let config = config();
-        assert_eq!(config.deadlines().soft_deadline(), Duration::from_secs(3));
-        assert_eq!(config.deadlines().review_timeout(), Duration::from_secs(15));
+    fn captures_explicit_deadlines_and_capacity_without_sharing_mutable_settings() {
+        let mut kernel = kernel_config();
+        let config = ResolvedAgentRuntimeConfig::new(
+            ToolLimits::default(),
+            kernel.clone(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        kernel.kernel_timeout = Duration::from_secs(100);
+        kernel.background_concurrency = 99;
+        assert_ne!(config.kernel_config().kernel_timeout, kernel.kernel_timeout);
+        assert_ne!(
+            config.kernel_config().background_concurrency,
+            kernel.background_concurrency
+        );
+        assert_eq!(config.deadlines().kernel_timeout(), Duration::from_secs(15));
         assert_eq!(config.deadlines().work_timeout(), Duration::from_secs(17));
         assert_eq!(
             config.deadlines().shutdown_grace_period(),
             Duration::from_secs(2)
         );
+        assert_eq!(config.kernel_config().background_concurrency, 3);
+        assert_eq!(config.kernel_config().input_capacity, 7);
+        assert_eq!(config.kernel_config().tool_concurrency, 4);
     }
 
     #[test]
-    fn rejects_each_non_positive_deadline() {
+    fn rejects_each_zero_deadline_and_capacity() {
+        for field in ["kernel_timeout", "work_timeout", "shutdown_grace_period"] {
+            let mut kernel = kernel_config();
+            let mut grace = Duration::from_secs(2);
+            match field {
+                "kernel_timeout" => kernel.kernel_timeout = Duration::ZERO,
+                "work_timeout" => kernel.work_timeout = Duration::ZERO,
+                _ => grace = Duration::ZERO,
+            }
+            assert_eq!(
+                ResolvedAgentRuntimeConfig::new(ToolLimits::default(), kernel, grace).unwrap_err(),
+                ResolvedAgentRuntimeConfigError::NonPositiveDeadline { field },
+            );
+        }
         for field in [
-            "soft_deadline",
-            "review_timeout",
-            "work_timeout",
-            "shutdown_grace_period",
+            "background_concurrency",
+            "input_capacity",
+            "tool_concurrency",
         ] {
-            let mut values = [
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-            ];
-            values[[
-                "soft_deadline",
-                "review_timeout",
-                "work_timeout",
-                "shutdown_grace_period",
-            ]
-            .iter()
-            .position(|candidate| *candidate == field)
-            .unwrap()] = Duration::ZERO;
+            let mut kernel = kernel_config();
+            match field {
+                "background_concurrency" => kernel.background_concurrency = 0,
+                "input_capacity" => kernel.input_capacity = 0,
+                _ => kernel.tool_concurrency = 0,
+            }
             assert_eq!(
                 ResolvedAgentRuntimeConfig::new(
                     ToolLimits::default(),
-                    values[0],
-                    values[1],
-                    values[2],
-                    values[3],
-                ),
-                Err(ResolvedAgentRuntimeConfigError::NonPositiveDeadline { field })
+                    kernel,
+                    Duration::from_secs(2)
+                )
+                .unwrap_err(),
+                ResolvedAgentRuntimeConfigError::NonPositiveCapacity { field },
             );
         }
+    }
+
+    #[test]
+    fn validates_tool_limits_before_starting_a_runtime() {
+        let limits = ToolLimits {
+            max_read_lines: 0,
+            ..ToolLimits::default()
+        };
+        assert!(matches!(
+            ResolvedAgentRuntimeConfig::new(limits, kernel_config(), Duration::from_secs(2)),
+            Err(ResolvedAgentRuntimeConfigError::ToolLimits(_)),
+        ));
     }
 }
