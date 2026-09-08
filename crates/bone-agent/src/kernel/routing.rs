@@ -19,17 +19,64 @@ impl Kernel {
         .then_some(ReplyTarget::Job(job))
     }
 
+    pub(super) fn supersede_input_routings(
+        &mut self,
+        effects: &mut Vec<Effect>,
+    ) -> (Vec<InputId>, Vec<Seq>) {
+        let routings = self
+            .routings
+            .iter()
+            .filter_map(|(id, route)| {
+                (matches!(route.requester, Requester::Inputs)
+                    && !matches!(route.state, RoutingState::Closed))
+                .then_some(*id)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut inputs = self
+            .inputs
+            .iter()
+            .filter_map(|(id, entry)| {
+                (entry.finished.is_none() && routings.contains(&entry.routing))
+                    .then_some((entry.accepted_at, *id))
+            })
+            .collect::<Vec<_>>();
+        inputs.sort_unstable();
+
+        let mut records = routings
+            .iter()
+            .flat_map(|routing| {
+                let route = &self.routings[routing];
+                route.records.iter().copied().chain(match route.state {
+                    RoutingState::WaitingForUser(record) | RoutingState::Failed(record) => {
+                        Some(record)
+                    }
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>();
+        records.sort_unstable();
+        records.dedup();
+
+        for routing in routings {
+            self.invalidate_routing(routing, effects);
+        }
+        (
+            inputs.into_iter().map(|(_, input)| input).collect(),
+            records,
+        )
+    }
+
     pub(super) fn open_input_routing(
         &mut self,
-        input: InputId,
-        source: Seq,
+        inputs: Vec<InputId>,
+        records: Vec<Seq>,
         effects: &mut Vec<Effect>,
     ) -> Seq {
         let routing = self.peek_seq();
         let record = self.record(
             Origin::Kernel,
             RecordBody::RoutingStarted {
-                inputs: vec![input],
+                inputs: inputs.clone(),
                 source: None,
             },
             effects,
@@ -39,9 +86,9 @@ impl Kernel {
             routing,
             Routing {
                 requester: Requester::Inputs,
-                inputs: vec![input],
+                inputs,
                 request: None,
-                records: vec![source],
+                records,
                 active_call: None,
                 state: RoutingState::Ready,
             },
@@ -132,7 +179,7 @@ impl Kernel {
             }
             KernelDecision::Read(query) => {
                 self.validate_read(DeliveryTarget::Routing(routing), &query)?;
-                self.read(DeliveryTarget::Routing(routing), query, effects);
+                self.read(DeliveryTarget::Routing(routing), query, effects)?;
             }
             KernelDecision::Inquire { job, question } => {
                 if question.trim().is_empty()
@@ -159,6 +206,9 @@ impl Kernel {
                     &route.inputs,
                     std::slice::from_ref(&assignment),
                 )?;
+                if self.active_jobs() >= self.limits.active_jobs {
+                    return Err("job capacity is full".into());
+                }
                 let job = self.create_job(Owner::Routing(routing), assignment, effects);
                 self.routings
                     .get_mut(&routing)
@@ -271,9 +321,6 @@ impl Kernel {
         if assignments.is_empty() {
             return Err("delegate requires at least one assignment".into());
         }
-        if self.active_jobs() + assignments.len() > self.limits.active_jobs {
-            return Err("job capacity is full".into());
-        }
         let depth = source.map_or(1, |job| self.job_depth(job) + 1);
         if depth > self.limits.job_depth {
             return Err("job tree is too deep".into());
@@ -370,7 +417,7 @@ impl Kernel {
                 match action {
                     JobAction::Keep => {}
                     JobAction::Pause => self.pause(job, effects),
-                    JobAction::Resume => self.resume(job),
+                    JobAction::Resume => self.resume(job, effects),
                     JobAction::Cancel => self.cancel(job, effects),
                 }
                 if !matches!(self.jobs[&job].state, JobState::Finished(_)) {
@@ -440,14 +487,14 @@ impl Kernel {
                 JobState::Finished(outcome) => outcome,
                 _ => unreachable!("seed validation requires a terminal job"),
             };
-            let summary = source.context.checkpoint.as_ref().map_or_else(
-                || outcome.completion.summary.clone(),
-                |item| item.summary.clone(),
-            );
-            let record_refs = source.context.checkpoint.as_ref().map_or_else(
-                || outcome.completion.evidence.clone(),
-                |item| item.evidence.clone(),
-            );
+            let summary = outcome.completion.summary.clone();
+            let mut record_refs = vec![outcome.as_of];
+            record_refs.extend(outcome.completion.evidence.iter().copied());
+            if let Some(checkpoint) = &source.context.checkpoint {
+                record_refs.extend(checkpoint.evidence.iter().copied());
+            }
+            record_refs.sort_unstable();
+            record_refs.dedup();
             let memory = self.record(
                 Origin::Kernel,
                 RecordBody::ImportedMemory {
@@ -538,7 +585,7 @@ impl Kernel {
         let Some(route) = self.routings.get(&routing).cloned() else {
             return;
         };
-        if matches!(route.state, RoutingState::Closed | RoutingState::Failed(_)) {
+        if matches!(route.state, RoutingState::Closed) {
             return;
         }
         if let Some(call) = route.active_call {
@@ -643,6 +690,11 @@ impl Kernel {
             .get_mut(&routing)
             .expect("routing exists")
             .state = RoutingState::WaitingForUser(clarification.seq);
+        self.routings
+            .get_mut(&routing)
+            .expect("routing exists")
+            .records
+            .push(clarification.seq);
     }
 
     pub(super) fn open_coordination(

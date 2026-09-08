@@ -119,6 +119,266 @@ fn finished_as(kernel: &Kernel, job: crate::JobId, kind: OutcomeKind) -> bool {
 }
 
 #[test]
+fn a_routing_investigation_can_finish_while_its_routing_waits() {
+    let mut kernel = kernel();
+    let input = Input::new(InputId(100), "locate the work that needs this correction");
+    let (_, effects) = kernel.accept(NOW, input.clone()).unwrap();
+    let effects = kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call: coordinate_call(&effects),
+            result: Ok(KernelDecision::Investigate(assignment(
+                "read-only routing investigation",
+                &[input.id],
+            ))),
+        },
+    );
+    let (call, investigation) = work_calls(&effects).pop().unwrap();
+
+    let effects = work(
+        &mut kernel,
+        call,
+        WorkStep::Finish(Completion::new("investigation complete")),
+    );
+
+    assert!(finished_as(
+        &kernel,
+        investigation.job,
+        OutcomeKind::Completed
+    ));
+    assert!(starts(&effects).any(|(_, call)| matches!(call, Call::Coordinate(_))));
+}
+
+#[test]
+fn parent_finish_waits_for_a_cancelled_child_external_write() {
+    let mut kernel = kernel_with(ToolSpec {
+        name: "write".into(),
+        description: "external write".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ExternalWrite,
+    });
+    let input = Input::new(InputId(101), "finish only after the child write settles");
+    let (parent_call, parent) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("parent", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    let calls = calls_by_goal(work_calls(&work(
+        &mut kernel,
+        parent_call,
+        WorkStep::Delegate(vec![assignment("child", &[])]),
+    )));
+    let (child_call, child) = calls["child"].clone();
+    work(
+        &mut kernel,
+        calls["parent"].0,
+        WorkStep::Wait(Await::Job(child.job)),
+    );
+    let write_call = tool_call(&work(
+        &mut kernel,
+        child_call,
+        WorkStep::Tool(ToolCall::new("write", json!({}))),
+    ));
+
+    let effects = kernel.step(NOW, Event::Cancel(child.job));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Cancel(call) if *call == write_call))
+    );
+    let parent_call = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == parent.job)
+        .unwrap()
+        .0;
+    work(
+        &mut kernel,
+        parent_call,
+        WorkStep::Finish(Completion::new("child was cancelled")),
+    );
+    assert!(!finished_as(&kernel, parent.job, OutcomeKind::Completed));
+
+    kernel.step(
+        NOW,
+        Event::ToolFinished {
+            call: write_call,
+            result: ToolOutcome {
+                result: Ok(json!({ "written": true })),
+                external_effect: ExternalEffect::Applied,
+            },
+        },
+    );
+    assert!(finished_as(&kernel, parent.job, OutcomeKind::Completed));
+}
+
+#[test]
+fn delegate_capacity_rejection_is_returned_to_the_parent_worker() {
+    let mut kernel = Kernel::new(
+        AgentLimits {
+            active_jobs: 1,
+            ..AgentLimits::default()
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    let input = Input::new(InputId(102), "work locally if delegation is full");
+    let (call, parent) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("parent", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+
+    let effects = work(
+        &mut kernel,
+        call,
+        WorkStep::Delegate(vec![assignment("child", &[])]),
+    );
+
+    assert!(!finished_as(&kernel, parent.job, OutcomeKind::Failed));
+    assert_eq!(kernel.jobs.len(), 1);
+    let (retry, context) = work_calls(&effects).pop().unwrap();
+    assert!(context.records.iter().any(|view| {
+        matches!(
+            &kernel.records[&view.source].body,
+            RecordBody::Audit { message }
+                if message == "delegation was not accepted: job capacity is full"
+        )
+    }));
+    work(
+        &mut kernel,
+        retry,
+        WorkStep::Finish(Completion::new("completed locally")),
+    );
+    assert!(finished_as(&kernel, parent.job, OutcomeKind::Completed));
+}
+
+#[test]
+fn a_new_input_supersedes_an_in_flight_routing_and_discards_its_late_result() {
+    let mut kernel = kernel();
+    let old = Input::new(InputId(201), "use implementation A");
+    let (_, old_effects) = kernel.accept(NOW, old.clone()).unwrap();
+    let old_call = coordinate_call(&old_effects);
+
+    let new = Input::new(InputId(202), "correction: use implementation B");
+    let (_, superseding) = kernel.accept(NOW, new.clone()).unwrap();
+    assert!(
+        superseding
+            .iter()
+            .any(|effect| matches!(effect, Effect::Cancel(call) if *call == old_call))
+    );
+    assert!(!starts(&superseding).any(|(_, call)| matches!(call, Call::Coordinate(_))));
+
+    let effects = kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call: old_call,
+            result: Ok(KernelDecision::Apply {
+                changes: vec![JobChange::Create(assignment("implementation A", &[old.id]))],
+                constraints: None,
+            }),
+        },
+    );
+    assert!(kernel.jobs.is_empty());
+    let (current_call, current) = starts(&effects)
+        .find_map(|(call, effect)| match effect {
+            Call::Coordinate(input) => Some((call, input)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        current
+            .inputs
+            .iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        vec![old.id, new.id]
+    );
+
+    kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call: current_call,
+            result: Ok(KernelDecision::Apply {
+                changes: vec![JobChange::Create(assignment(
+                    "implementation B",
+                    &[old.id, new.id],
+                ))],
+                constraints: None,
+            }),
+        },
+    );
+    assert_eq!(
+        kernel.jobs.values().next().unwrap().spec.goal,
+        "implementation B"
+    );
+    let retry = kernel.step(NOW, Event::Retry(old.id));
+    assert!(!starts(&retry).any(|(_, call)| matches!(call, Call::Coordinate(_))));
+}
+
+#[test]
+fn retrying_an_old_failed_input_uses_the_newest_combined_batch() {
+    let mut kernel = kernel();
+    let old = Input::new(InputId(203), "use implementation A");
+    let (_, effects) = kernel.accept(NOW, old.clone()).unwrap();
+    kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call: coordinate_call(&effects),
+            result: Err(crate::CallError::failed("temporary failure")),
+        },
+    );
+    assert!(matches!(
+        input_status(&kernel, old.id),
+        InputStatus::RoutingFailed { .. }
+    ));
+
+    let new = Input::new(InputId(204), "correction: use implementation B");
+    let (_, effects) = kernel.accept(NOW, new.clone()).unwrap();
+    let (call, combined) = starts(&effects)
+        .find_map(|(call, effect)| match effect {
+            Call::Coordinate(input) => Some((call, input)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        combined
+            .inputs
+            .iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        vec![old.id, new.id]
+    );
+    assert!(combined.records.iter().any(|view| matches!(
+        kernel.records[&view.source].body,
+        RecordBody::InputRoutingFailed { .. }
+    )));
+
+    kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call,
+            result: Ok(KernelDecision::Apply {
+                changes: vec![JobChange::Create(assignment(
+                    "implementation B",
+                    &[old.id, new.id],
+                ))],
+                constraints: None,
+            }),
+        },
+    );
+    let retry = kernel.step(NOW, Event::Retry(old.id));
+    assert!(!starts(&retry).any(|(_, call)| matches!(call, Call::Coordinate(_))));
+    assert_eq!(
+        kernel.jobs.values().next().unwrap().spec.goal,
+        "implementation B"
+    );
+}
+
+#[test]
 fn accepting_the_same_input_twice_is_idempotent() {
     let mut kernel = kernel();
     let input = Input::new(InputId(7), "ship it");
@@ -224,6 +484,148 @@ fn each_worker_receives_only_its_own_record_stream() {
 }
 
 #[test]
+fn automatic_context_keeps_required_input_records_whole() {
+    let limits = AgentLimits {
+        context_bytes: 8_000,
+        item_bytes: 32,
+        ..AgentLimits::default()
+    };
+    let mut kernel = Kernel::new(limits, Vec::new()).unwrap();
+    let input = Input::new(InputId(1), "atomic-input-".repeat(20));
+    let (work_call, work_input) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("reader", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    let source = kernel.inputs[&input.id].accepted_at;
+    let view = work_input
+        .records
+        .iter()
+        .find(|view| view.source == source)
+        .expect("input source is expanded from its delivery");
+
+    assert!(
+        work_input
+            .records
+            .iter()
+            .all(|view| view.next_offset.is_none())
+    );
+    assert!(view.content.len() > kernel.limits.item_bytes);
+    assert_eq!(view.offset, 0);
+    assert_eq!(view.next_offset, None);
+    assert_eq!(
+        view.content,
+        serde_json::to_string(&RecordBody::Input(input)).unwrap()
+    );
+
+    let effects = work(
+        &mut kernel,
+        work_call,
+        WorkStep::Read(ReadQuery::Record {
+            id: source,
+            offset: 0,
+        }),
+    );
+    let (after_read_call, _) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, input)| input.job == work_input.job)
+        .expect("the record read wakes the job");
+    work(&mut kernel, after_read_call, WorkStep::Continue);
+
+    let compact = context::prepare_compact(&kernel, work_input.job).unwrap();
+    let source_views = compact
+        .records
+        .iter()
+        .filter(|view| view.source == source && view.offset == 0)
+        .collect::<Vec<_>>();
+    assert_eq!(source_views.len(), 1);
+    assert_eq!(source_views[0].next_offset, None);
+}
+
+#[test]
+fn record_paging_always_advances_across_multibyte_utf8() {
+    let record = crate::Record {
+        seq: Seq(1),
+        origin: crate::Origin::Kernel,
+        body: RecordBody::Audit {
+            message: "🙂".into(),
+        },
+    };
+    let content = serde_json::to_string(&record.body).unwrap();
+    let offset = content.find('🙂').unwrap();
+
+    let page = context::view(&record, offset, 1).unwrap();
+
+    assert_eq!(page.content, "🙂");
+    assert_eq!(page.next_offset, Some(offset + "🙂".len()));
+}
+
+#[test]
+fn an_unread_required_input_that_exceeds_context_fails_before_work_starts() {
+    let limits = AgentLimits {
+        context_bytes: 2_000,
+        item_bytes: 64,
+        ..AgentLimits::default()
+    };
+    let mut kernel = Kernel::new(limits, Vec::new()).unwrap();
+    let original = Input::new(InputId(1), "ask before continuing");
+    let (work_call, work_input) = create_roots(
+        &mut kernel,
+        original.clone(),
+        vec![assignment("reader", &[original.id])],
+    )
+    .pop()
+    .unwrap();
+    let job = work_input.job;
+    work(
+        &mut kernel,
+        work_call,
+        WorkStep::AskUser("provide the full material".into()),
+    );
+    let read_before_answer = kernel.jobs[&job].context.read_through;
+
+    let oversized =
+        Input::new(InputId(2), "oversized-required-input-".repeat(200)).replying_to(original.id);
+    let (_, effects) = kernel.accept(NOW, oversized).unwrap();
+    assert!(
+        !work_calls(&effects)
+            .iter()
+            .any(|(_, input)| input.job == job)
+    );
+    let (compact_call, _) =
+        compact_call(&effects).expect("only the already-read prefix is compacted");
+
+    let effects = kernel.step(
+        NOW,
+        Event::CompactFinished {
+            call: compact_call,
+            result: Ok(CheckpointDraft {
+                summary: "initial request read".into(),
+                evidence: Vec::new(),
+            }),
+        },
+    );
+
+    assert!(!starts(&effects).any(|(_, call)| {
+        matches!(call, Call::Work(input) if input.job == job)
+            || matches!(call, Call::Compact(input) if input.job == job)
+    }));
+    let JobStatus::Finished(outcome) = kernel.job_status(job) else {
+        panic!("oversized job must fail while preparing its context");
+    };
+    assert_eq!(outcome.kind, OutcomeKind::Failed);
+    assert!(
+        outcome
+            .completion
+            .summary
+            .contains("required context exceeds the configured model input budget")
+    );
+    assert_eq!(kernel.jobs[&job].context.read_through, read_before_answer);
+}
+
+#[test]
 fn finish_waits_for_children_and_requires_their_delivery_to_be_read() {
     let mut kernel = kernel();
     let input = Input::new(InputId(1), "finish a tree");
@@ -307,6 +709,11 @@ fn pause_discards_a_late_model_turn() {
             .iter()
             .any(|effect| matches!(effect, Effect::Cancel(id) if *id == call))
     );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Notify(record)
+            if matches!(record.body, RecordBody::JobControlChanged { job: changed, paused: true } if changed == job)
+    )));
     let proposal = WorkProposal {
         note: Some("late-note".into()),
         report: None,
@@ -330,6 +737,11 @@ fn pause_discards_a_late_model_turn() {
     ));
 
     let effects = kernel.step(NOW, Event::Resume(job));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Notify(record)
+            if matches!(record.body, RecordBody::JobControlChanged { job: changed, paused: false } if changed == job)
+    )));
     assert!(
         work_calls(&effects)
             .iter()
@@ -400,8 +812,13 @@ fn cancellation_records_late_tool_truth_without_reviving_the_job() {
 }
 
 #[test]
-fn a_completed_child_can_seed_its_follow_up() {
-    let mut kernel = kernel();
+fn a_completed_child_seeds_only_its_explicit_paginated_evidence() {
+    let limits = AgentLimits {
+        context_bytes: 8_000,
+        item_bytes: 64,
+        ..AgentLimits::default()
+    };
+    let mut kernel = Kernel::new(limits, Vec::new()).unwrap();
     let input = Input::new(InputId(1), "reuse completed research");
     let mut calls = create_roots(
         &mut kernel,
@@ -419,11 +836,61 @@ fn a_completed_child_can_seed_its_follow_up() {
     let (stale_parent_call, _) = &calls["parent"];
     let (child_call, child_input) = &calls["research"];
     let child = child_input.job;
-    work(
-        &mut kernel,
-        *child_call,
-        WorkStep::Finish(crate::Completion::new("facts worth reusing")),
+    let evidence_text = "evidence-note-".repeat(4);
+    let effects = kernel.step(
+        NOW,
+        Event::WorkFinished {
+            call: *child_call,
+            result: Ok(WorkProposal {
+                note: Some(evidence_text.clone()),
+                report: None,
+                answers: Vec::new(),
+                step: WorkStep::Continue,
+            }),
+        },
     );
+    let evidence = kernel
+        .records
+        .values()
+        .find(|record| {
+            matches!(&record.body, RecordBody::Note { text, .. } if text == &evidence_text)
+        })
+        .unwrap()
+        .seq;
+    let child_call = work_calls(&effects)
+        .into_iter()
+        .find(|(_, input)| input.job == child)
+        .expect("child continues after recording evidence")
+        .0;
+    let unlisted_text = "unlisted-note-".repeat(4);
+    kernel.step(
+        NOW,
+        Event::WorkFinished {
+            call: child_call,
+            result: Ok(WorkProposal {
+                note: Some(unlisted_text.clone()),
+                report: None,
+                answers: Vec::new(),
+                step: WorkStep::Finish(Completion {
+                    summary: "facts worth reusing".into(),
+                    evidence: vec![evidence],
+                    remaining: Vec::new(),
+                }),
+            }),
+        },
+    );
+    let unlisted = kernel
+        .records
+        .values()
+        .find(|record| {
+            matches!(&record.body, RecordBody::Note { text, .. } if text == &unlisted_text)
+        })
+        .unwrap()
+        .seq;
+    let source_outcome = match kernel.job_status(child) {
+        JobStatus::Finished(outcome) => outcome.as_of,
+        _ => panic!("seed source must be finished"),
+    };
 
     let effects = work(&mut kernel, *stale_parent_call, WorkStep::Continue);
     let (fresh_parent_call, _) = work_calls(&effects)
@@ -432,7 +899,7 @@ fn a_completed_child_can_seed_its_follow_up() {
         .unwrap();
     let mut follow_up = assignment("follow-up", &[]);
     follow_up.seed = Some(child);
-    work(
+    let effects = work(
         &mut kernel,
         fresh_parent_call,
         WorkStep::Delegate(vec![follow_up]),
@@ -450,11 +917,318 @@ fn a_completed_child_can_seed_its_follow_up() {
             RecordBody::ImportedMemory {
                 source_job,
                 summary,
+                record_refs,
                 ..
-            } => Some((*source_job, summary.as_str())),
+            } => Some((*source_job, summary.as_str(), record_refs.as_slice())),
             _ => None,
         });
-    assert_eq!(memory, Some((child, "facts worth reusing")));
+    assert_eq!(
+        memory,
+        Some((
+            child,
+            "facts worth reusing",
+            [evidence, source_outcome].as_slice()
+        ))
+    );
+
+    let (follow_up_call, initial) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, input)| input.job == follow_up)
+        .expect("follow-up starts with imported memory");
+    assert!(!initial.records.iter().any(|view| view.source == evidence));
+    assert!(!initial.records.iter().any(|view| view.source == unlisted));
+    let memory_view = initial
+        .records
+        .iter()
+        .find(|view| {
+            matches!(
+                kernel.records[&view.source].body,
+                RecordBody::ImportedMemory { .. }
+            )
+        })
+        .unwrap();
+    assert_eq!(memory_view.next_offset, None);
+    assert!(memory_view.content.len() > kernel.limits.item_bytes);
+
+    let effects = work(
+        &mut kernel,
+        follow_up_call,
+        WorkStep::Read(ReadQuery::Record {
+            id: evidence,
+            offset: 0,
+        }),
+    );
+    let (after_read_call, after_read) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, input)| input.job == follow_up)
+        .expect("record read immediately wakes the follow-up");
+    let page = after_read
+        .records
+        .iter()
+        .find(|view| view.source == evidence)
+        .expect("read result expands the requested evidence page");
+    let read_result = after_read
+        .records
+        .iter()
+        .find(|view| {
+            matches!(
+                kernel.records[&view.source].body,
+                RecordBody::ReadResult { .. }
+            )
+        })
+        .expect("the read result itself is included");
+    assert_eq!(read_result.next_offset, None);
+    assert!(read_result.content.len() > kernel.limits.item_bytes);
+    assert_eq!(page.offset, 0);
+    assert_eq!(page.content.len(), kernel.limits.item_bytes);
+    let next_offset = page.next_offset.expect("the evidence has another page");
+
+    let effects = work(
+        &mut kernel,
+        after_read_call,
+        WorkStep::Read(ReadQuery::Record {
+            id: evidence,
+            offset: next_offset,
+        }),
+    );
+    let (after_second_read_call, after_second_read) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, input)| input.job == follow_up)
+        .expect("the next evidence page wakes the follow-up");
+    let second_page = after_second_read
+        .records
+        .iter()
+        .find(|view| view.source == evidence && view.offset == next_offset)
+        .expect("the requested offset selects the next evidence page");
+    assert!(!second_page.content.is_empty());
+
+    work(
+        &mut kernel,
+        after_second_read_call,
+        WorkStep::Read(ReadQuery::Record {
+            id: unlisted,
+            offset: 0,
+        }),
+    );
+    assert!(finished_as(&kernel, follow_up, OutcomeKind::Failed));
+    assert!(!kernel.records.values().any(|record| {
+        matches!(
+            record.body,
+            RecordBody::ReadResult {
+                query: ReadQuery::Record { id, .. },
+                ..
+            } if id == unlisted
+        )
+    }));
+    assert!(kernel.records.values().any(|record| {
+        matches!(
+            &record.body,
+            RecordBody::Audit { message } if message == "worker cannot read that record"
+        )
+    }));
+}
+
+#[test]
+fn a_parent_can_read_only_evidence_explicitly_shared_by_a_child_outcome() {
+    let mut kernel = kernel();
+    let input = Input::new(InputId(11), "verify delegated evidence");
+    let (parent_call, parent) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("parent", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    let calls = calls_by_goal(work_calls(&work(
+        &mut kernel,
+        parent_call,
+        WorkStep::Delegate(vec![assignment("child", &[])]),
+    )));
+    let child = calls["child"].1.job;
+    work(
+        &mut kernel,
+        calls["parent"].0,
+        WorkStep::Wait(Await::Job(child)),
+    );
+
+    let effects = kernel.step(
+        NOW,
+        Event::WorkFinished {
+            call: calls["child"].0,
+            result: Ok(WorkProposal {
+                note: Some("shared verification output".into()),
+                report: None,
+                answers: Vec::new(),
+                step: WorkStep::Continue,
+            }),
+        },
+    );
+    let shared = kernel
+        .records
+        .values()
+        .find(|record| {
+            matches!(&record.body, RecordBody::Note { text, .. } if text == "shared verification output")
+        })
+        .unwrap()
+        .seq;
+    let child_call = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == child)
+        .unwrap()
+        .0;
+    let effects = kernel.step(
+        NOW,
+        Event::WorkFinished {
+            call: child_call,
+            result: Ok(WorkProposal {
+                note: Some("private scratch note".into()),
+                report: None,
+                answers: Vec::new(),
+                step: WorkStep::Finish(Completion {
+                    summary: "verified".into(),
+                    evidence: vec![shared],
+                    remaining: Vec::new(),
+                }),
+            }),
+        },
+    );
+    let private = kernel
+        .records
+        .values()
+        .find(|record| {
+            matches!(&record.body, RecordBody::Note { text, .. } if text == "private scratch note")
+        })
+        .unwrap()
+        .seq;
+    let parent_call = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == parent.job)
+        .unwrap()
+        .0;
+
+    let effects = work(
+        &mut kernel,
+        parent_call,
+        WorkStep::Read(ReadQuery::Record {
+            id: shared,
+            offset: 0,
+        }),
+    );
+    let (parent_call, context) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == parent.job)
+        .expect("explicit completion evidence is readable by the parent");
+    assert!(context.records.iter().any(|view| view.source == shared));
+    assert!(!finished_as(&kernel, parent.job, OutcomeKind::Failed));
+
+    work(
+        &mut kernel,
+        parent_call,
+        WorkStep::Read(ReadQuery::Record {
+            id: private,
+            offset: 0,
+        }),
+    );
+    assert!(finished_as(&kernel, parent.job, OutcomeKind::Failed));
+}
+
+#[test]
+fn seed_uses_the_final_outcome_after_an_older_checkpoint() {
+    let mut kernel = Kernel::new(
+        AgentLimits {
+            context_bytes: 3_000,
+            item_bytes: 512,
+            ..AgentLimits::default()
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    let input = Input::new(InputId(12), "correct an earlier research hypothesis");
+    let (mut call, original) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("investigator", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    let (compact, _) = loop {
+        let effects = kernel.step(
+            NOW,
+            Event::WorkFinished {
+                call,
+                result: Ok(WorkProposal {
+                    note: Some("x".repeat(480)),
+                    report: None,
+                    answers: Vec::new(),
+                    step: WorkStep::Continue,
+                }),
+            },
+        );
+        if let Some(compact) = compact_call(&effects) {
+            break compact;
+        }
+        call = work_calls(&effects).pop().unwrap().0;
+    };
+    let effects = kernel.step(
+        NOW,
+        Event::CompactFinished {
+            call: compact,
+            result: Ok(CheckpointDraft {
+                summary: "old hypothesis: endpoint A".into(),
+                evidence: Vec::new(),
+            }),
+        },
+    );
+    let call = work_calls(&effects).pop().unwrap().0;
+    work(
+        &mut kernel,
+        call,
+        WorkStep::Finish(Completion::new(
+            "final verified conclusion: endpoint B; A was disproven",
+        )),
+    );
+    let source_outcome = match kernel.job_status(original.job) {
+        JobStatus::Finished(outcome) => outcome.as_of,
+        _ => panic!("source should be complete"),
+    };
+
+    let follow_up_input = Input::new(InputId(13), "follow up on the verified conclusion");
+    let mut follow_up = assignment("follow-up", &[follow_up_input.id]);
+    follow_up.seed = Some(original.job);
+    let (call, context) = create_roots(&mut kernel, follow_up_input, vec![follow_up])
+        .pop()
+        .unwrap();
+    let memory =
+        context.records.iter().find_map(|view| {
+            match serde_json::from_str::<RecordBody>(&view.content).ok()? {
+                RecordBody::ImportedMemory {
+                    summary,
+                    record_refs,
+                    ..
+                } => Some((summary, record_refs)),
+                _ => None,
+            }
+        });
+    assert_eq!(
+        memory,
+        Some((
+            "final verified conclusion: endpoint B; A was disproven".into(),
+            vec![source_outcome]
+        ))
+    );
+
+    let effects = work(
+        &mut kernel,
+        call,
+        WorkStep::Read(ReadQuery::Record {
+            id: source_outcome,
+            offset: 0,
+        }),
+    );
+    let (_, context) = work_calls(&effects).pop().unwrap();
+    assert!(context.records.iter().any(|view| {
+        view.source == source_outcome && view.content.contains("final verified conclusion")
+    }));
 }
 
 #[test]
@@ -782,6 +1556,95 @@ fn inquiry_to_a_finished_job_returns_its_outcome_without_stale_delivery() {
         )
     }));
     assert!(matches!(kernel.job_status(parent.job), JobStatus::Running));
+}
+
+#[test]
+fn inquiry_answer_explicitly_grants_its_evidence_to_the_requester() {
+    let mut kernel = kernel();
+    let input = Input::new(InputId(21), "ask a child for evidence");
+    let (parent_call, parent) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("parent", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    let calls = calls_by_goal(work_calls(&work(
+        &mut kernel,
+        parent_call,
+        WorkStep::Delegate(vec![assignment("child", &[])]),
+    )));
+    let child = calls["child"].1.job;
+    work(
+        &mut kernel,
+        calls["parent"].0,
+        WorkStep::Inquire {
+            job: child,
+            question: "show the verification".into(),
+        },
+    );
+    let effects = kernel.step(
+        NOW,
+        Event::WorkFinished {
+            call: calls["child"].0,
+            result: Ok(WorkProposal {
+                note: Some("inquiry verification evidence".into()),
+                report: None,
+                answers: Vec::new(),
+                step: WorkStep::Continue,
+            }),
+        },
+    );
+    let evidence = kernel
+        .records
+        .values()
+        .find(|record| {
+            matches!(&record.body, RecordBody::Note { text, .. } if text == "inquiry verification evidence")
+        })
+        .unwrap()
+        .seq;
+    let (child_call, child_context) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == child)
+        .unwrap();
+    let inquiry = child_context.inquiries[0].id;
+    let effects = kernel.step(
+        NOW,
+        Event::WorkFinished {
+            call: child_call,
+            result: Ok(WorkProposal {
+                note: None,
+                report: None,
+                answers: vec![InquiryAnswer {
+                    inquiry,
+                    response: InquiryResponse::Answer(ReportDraft {
+                        summary: "verified answer".into(),
+                        evidence: vec![evidence],
+                    }),
+                }],
+                step: WorkStep::Continue,
+            }),
+        },
+    );
+    let parent_call = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == parent.job)
+        .unwrap()
+        .0;
+
+    let effects = work(
+        &mut kernel,
+        parent_call,
+        WorkStep::Read(ReadQuery::Record {
+            id: evidence,
+            offset: 0,
+        }),
+    );
+    let (_, context) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == parent.job)
+        .expect("the inquiry requester can inspect explicitly cited evidence");
+    assert!(context.records.iter().any(|view| view.source == evidence));
 }
 
 #[test]
@@ -1382,4 +2245,581 @@ fn coordinator_root_directory_is_bounded_and_uses_an_exclusive_cursor() {
             .iter()
             .all(|job| job.id > cursor && job.id != finished)
     );
+}
+
+#[test]
+fn coordinator_directory_pages_obey_context_budget_without_accumulating_old_pages() {
+    let limits = AgentLimits {
+        context_bytes: 3_000,
+        item_bytes: 512,
+        ..AgentLimits::default()
+    };
+    let mut kernel = Kernel::new(limits.clone(), Vec::new()).unwrap();
+    let input = Input::new(InputId(301), "create independent work");
+    let assignments = (0..18)
+        .map(|index| {
+            assignment(
+                &format!("root {index} {}", "directory-card-padding-".repeat(10)),
+                &[input.id],
+            )
+        })
+        .collect();
+    create_roots(&mut kernel, input, assignments);
+
+    let (_, effects) = kernel
+        .accept(NOW, Input::new(InputId(302), "inspect the full directory"))
+        .unwrap();
+    let (mut call, first) = starts(&effects)
+        .find_map(|(call, effect)| match effect {
+            Call::Coordinate(input) => Some((call, input.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert!(first.jobs.len() < context::DIRECTORY_PAGE);
+    assert!(serde_json::to_vec(&first).unwrap().len() <= limits.context_bytes);
+    let mut seen = first.jobs.iter().map(|job| job.id).collect::<Vec<_>>();
+    let mut cursor = first.next_job;
+    let mut pages = 1;
+
+    while let Some(after) = cursor {
+        assert!(pages <= 18, "directory cursor did not advance");
+        let effects = kernel.step(
+            NOW,
+            Event::CoordinateFinished {
+                call,
+                result: Ok(KernelDecision::Read(ReadQuery::Jobs {
+                    parent: None,
+                    after: Some(after),
+                })),
+            },
+        );
+        let (next_call, coordinate) = starts(&effects)
+            .find_map(|(call, effect)| match effect {
+                Call::Coordinate(input) => Some((call, input.clone())),
+                _ => None,
+            })
+            .expect("a legal directory page starts the next coordination call");
+        assert!(serde_json::to_vec(&coordinate).unwrap().len() <= limits.context_bytes);
+        let visible_results = coordinate
+            .records
+            .iter()
+            .filter(|view| {
+                matches!(
+                    kernel.records[&view.source].body,
+                    RecordBody::ReadResult { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible_results.len(),
+            1,
+            "only the newest page is projected"
+        );
+        let (jobs, next) = match &kernel.records[&visible_results[0].source].body {
+            RecordBody::ReadResult { jobs, next_job, .. } => (jobs, *next_job),
+            _ => unreachable!(),
+        };
+        assert!(!jobs.is_empty());
+        assert!(jobs.iter().all(|job| job.id > after));
+        seen.extend(jobs.iter().map(|job| job.id));
+        cursor = next;
+        call = next_call;
+        pages += 1;
+    }
+
+    let mut unique = seen.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(seen, unique);
+    assert_eq!(seen.len(), 18);
+    assert!(!kernel.records.values().any(|record| matches!(
+        &record.body,
+        RecordBody::InputRoutingFailed { inputs, .. } if inputs.contains(&InputId(302))
+    )));
+}
+
+#[test]
+fn coordinator_read_preflight_deduplicates_existing_record_views() {
+    let mut kernel = Kernel::new(
+        AgentLimits {
+            item_bytes: 128,
+            ..AgentLimits::default()
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    let (receipt, effects) = kernel
+        .accept(
+            NOW,
+            Input::new(InputId(401), "existing context input ".repeat(6)),
+        )
+        .unwrap();
+    let call = coordinate_call(&effects);
+    let effects = kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call,
+            result: Ok(KernelDecision::Read(ReadQuery::Record {
+                id: receipt.accepted_at,
+                offset: 0,
+            })),
+        },
+    );
+    let (call, coordinate) = starts(&effects)
+        .find_map(|(call, effect)| match effect {
+            Call::Coordinate(input) => Some((call, input.clone())),
+            _ => None,
+        })
+        .unwrap();
+    let full_size = serde_json::to_vec(&coordinate).unwrap().len();
+    kernel.limits.context_bytes = full_size + 1;
+    assert!(kernel.limits.validate().is_ok());
+
+    let effects = kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call,
+            result: Ok(KernelDecision::Read(ReadQuery::Record {
+                id: receipt.accepted_at,
+                offset: 0,
+            })),
+        },
+    );
+    let (_, projected) = starts(&effects)
+        .find_map(|(call, effect)| match effect {
+            Call::Coordinate(input) => Some((call, input)),
+            _ => None,
+        })
+        .expect("the deduplicated projection fits");
+    assert!(serde_json::to_vec(projected).unwrap().len() <= kernel.limits.context_bytes);
+    assert_eq!(
+        projected
+            .records
+            .iter()
+            .filter(|view| view.source == receipt.accepted_at)
+            .count(),
+        1
+    );
+    assert!(
+        !kernel
+            .records
+            .values()
+            .any(|record| matches!(&record.body, RecordBody::InputRoutingFailed { .. }))
+    );
+}
+
+#[test]
+fn coordinator_last_directory_page_accounts_for_null_cursor_bytes() {
+    let mut kernel = Kernel::new(
+        AgentLimits {
+            item_bytes: 128,
+            ..AgentLimits::default()
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    let input = Input::new(InputId(501), "two roots");
+    create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![
+            assignment("first", &[input.id]),
+            assignment("second", &[input.id]),
+        ],
+    );
+    let (_, effects) = kernel
+        .accept(NOW, Input::new(InputId(502), "read all roots"))
+        .unwrap();
+    let call = coordinate_call(&effects);
+    let effects = kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call,
+            result: Ok(KernelDecision::Read(ReadQuery::Jobs {
+                parent: None,
+                after: None,
+            })),
+        },
+    );
+    let (call, coordinate) = starts(&effects)
+        .find_map(|(call, effect)| match effect {
+            Call::Coordinate(input) => Some((call, input.clone())),
+            _ => None,
+        })
+        .unwrap();
+    let full_size = serde_json::to_vec(&coordinate).unwrap().len();
+    kernel.limits.context_bytes = full_size - 1;
+
+    let effects = kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call,
+            result: Ok(KernelDecision::Read(ReadQuery::Jobs {
+                parent: None,
+                after: None,
+            })),
+        },
+    );
+    let (call, projected) = starts(&effects)
+        .find_map(|(call, effect)| match effect {
+            Call::Coordinate(input) => Some((call, input)),
+            _ => None,
+        })
+        .expect("the page falls back to one card");
+    assert!(serde_json::to_vec(projected).unwrap().len() <= kernel.limits.context_bytes);
+    let page = projected
+        .records
+        .iter()
+        .find_map(|view| match &kernel.records[&view.source].body {
+            RecordBody::ReadResult { jobs, next_job, .. } => Some((jobs, *next_job)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(page.0.len(), 1);
+    assert_eq!(page.1, Some(page.0[0].id));
+
+    let effects = kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call,
+            result: Ok(KernelDecision::Read(ReadQuery::Jobs {
+                parent: None,
+                after: page.1,
+            })),
+        },
+    );
+    let (_, projected) = starts(&effects)
+        .find_map(|(call, effect)| match effect {
+            Call::Coordinate(input) => Some((call, input)),
+            _ => None,
+        })
+        .expect("the last card fits its final page");
+    assert!(serde_json::to_vec(projected).unwrap().len() <= kernel.limits.context_bytes);
+    let page = projected
+        .records
+        .iter()
+        .find_map(|view| match &kernel.records[&view.source].body {
+            RecordBody::ReadResult { jobs, next_job, .. } => Some((jobs, *next_job)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(page.0.len(), 1);
+    assert_eq!(page.1, None);
+    assert!(
+        !kernel
+            .records
+            .values()
+            .any(|record| matches!(&record.body, RecordBody::InputRoutingFailed { .. }))
+    );
+    assert!(full_size > kernel.limits.item_bytes);
+}
+
+#[test]
+fn a_new_input_supersedes_a_clarification_and_preserves_its_context() {
+    let mut kernel = kernel();
+    let old = Input::new(InputId(701), "old ambiguous request");
+    let (_, effects) = kernel.accept(NOW, old.clone()).unwrap();
+    kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call: coordinate_call(&effects),
+            result: Ok(KernelDecision::Clarify("which target?".into())),
+        },
+    );
+
+    let new = Input::new(InputId(702), "new correction");
+    let (_, effects) = kernel.accept(NOW, new.clone()).unwrap();
+    let (call, coordinate) = starts(&effects)
+        .find_map(|(call, effect)| match effect {
+            Call::Coordinate(input) => Some((call, input)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        coordinate
+            .inputs
+            .iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        vec![old.id, new.id]
+    );
+    assert!(coordinate.records.iter().any(|view| matches!(
+        kernel.records[&view.source].body,
+        RecordBody::Clarification { .. }
+    )));
+
+    let effects = kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call,
+            result: Ok(KernelDecision::Apply {
+                changes: Vec::new(),
+                constraints: None,
+            }),
+        },
+    );
+    assert!(starts(&effects).next().is_none());
+    assert_eq!(
+        input_status(&kernel, old.id),
+        InputStatus::Finished(InputOutcome::Completed)
+    );
+    assert_eq!(
+        input_status(&kernel, new.id),
+        InputStatus::Finished(InputOutcome::Completed)
+    );
+    assert!(matches!(
+        kernel.accept(
+            NOW,
+            Input::new(InputId(703), "late reply").replying_to(old.id)
+        ),
+        Err(AdmissionError::InvalidReply)
+    ));
+}
+
+#[test]
+fn a_new_input_cancels_a_waiting_routing_inquiry_and_ignores_its_late_answer() {
+    let mut kernel = kernel();
+    let root_input = Input::new(InputId(711), "create target");
+    let (target_call, target) = create_roots(
+        &mut kernel,
+        root_input.clone(),
+        vec![assignment("target", &[root_input.id])],
+    )
+    .pop()
+    .unwrap();
+    work(
+        &mut kernel,
+        target_call,
+        WorkStep::Wait(Await::After(Duration::from_secs(10))),
+    );
+
+    let old = Input::new(InputId(712), "ask target");
+    let (_, effects) = kernel.accept(NOW, old.clone()).unwrap();
+    let effects = kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call: coordinate_call(&effects),
+            result: Ok(KernelDecision::Inquire {
+                job: target.job,
+                question: "status?".into(),
+            }),
+        },
+    );
+    let (target_call, target_context) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == target.job)
+        .unwrap();
+    let inquiry = target_context.inquiries[0].id;
+
+    let new = Input::new(InputId(713), "replace inquiry");
+    let (_, effects) = kernel.accept(NOW, new.clone()).unwrap();
+    assert!(starts(&effects).any(|(_, effect)| matches!(effect, Call::Coordinate(_))));
+    assert!(!kernel.inquiries.contains_key(&inquiry));
+
+    let effects = kernel.step(
+        NOW,
+        Event::WorkFinished {
+            call: target_call,
+            result: Ok(WorkProposal {
+                note: None,
+                report: None,
+                answers: vec![InquiryAnswer {
+                    inquiry,
+                    response: InquiryResponse::Answer(ReportDraft {
+                        summary: "late".into(),
+                        evidence: Vec::new(),
+                    }),
+                }],
+                step: WorkStep::Continue,
+            }),
+        },
+    );
+    assert!(kernel.records.values().any(|record| matches!(
+        &record.body,
+        RecordBody::Audit { message } if message.contains("ignored a settled inquiry answer")
+    )));
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Notify(record)
+            if matches!(
+                record.body,
+                RecordBody::Delivery {
+                    to: DeliveryTarget::Routing(_),
+                    kind: crate::DeliveryKind::InquiryResult,
+                    ..
+                }
+            )
+    )));
+    assert_eq!(input_status(&kernel, old.id), InputStatus::Routing);
+    assert_eq!(input_status(&kernel, new.id), InputStatus::Routing);
+}
+
+#[test]
+fn a_new_input_cancels_a_waiting_routing_investigation_and_its_late_finish() {
+    let mut kernel = kernel();
+    let old = Input::new(InputId(721), "investigate old");
+    let (_, effects) = kernel.accept(NOW, old.clone()).unwrap();
+    let effects = kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call: coordinate_call(&effects),
+            result: Ok(KernelDecision::Investigate(assignment(
+                "old investigation",
+                &[old.id],
+            ))),
+        },
+    );
+    let (old_work, investigation) = work_calls(&effects).pop().unwrap();
+
+    let new = Input::new(InputId(722), "replace investigation");
+    let (_, effects) = kernel.accept(NOW, new.clone()).unwrap();
+    let coordinate = starts(&effects)
+        .find_map(|(_, effect)| match effect {
+            Call::Coordinate(input) => Some(input),
+            _ => None,
+        })
+        .unwrap();
+    assert!(finished_as(
+        &kernel,
+        investigation.job,
+        OutcomeKind::Cancelled
+    ));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Cancel(call) if *call == old_work))
+    );
+    assert_eq!(
+        coordinate
+            .inputs
+            .iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        vec![old.id, new.id]
+    );
+
+    let effects = work(
+        &mut kernel,
+        old_work,
+        WorkStep::Finish(Completion::new("late stale finding")),
+    );
+    assert!(starts(&effects).next().is_none());
+    assert!(finished_as(
+        &kernel,
+        investigation.job,
+        OutcomeKind::Cancelled
+    ));
+    assert!(kernel.records.values().any(|record| matches!(
+        &record.body,
+        RecordBody::Audit { message } if message.contains("discarded a model result")
+    )));
+}
+
+#[test]
+fn parent_finish_waits_until_an_unknown_descendant_write_is_resolved() {
+    let mut kernel = kernel_with(ToolSpec {
+        name: "write".into(),
+        description: "write".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ExternalWrite,
+    });
+    let input = Input::new(InputId(731), "nested write");
+    let (parent_call, parent) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("parent", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    let calls = calls_by_goal(work_calls(&work(
+        &mut kernel,
+        parent_call,
+        WorkStep::Delegate(vec![assignment("child", &[])]),
+    )));
+    let (child_call, child) = calls["child"].clone();
+    work(
+        &mut kernel,
+        calls["parent"].0,
+        WorkStep::Wait(Await::Job(child.job)),
+    );
+    let write_call = tool_call(&work(
+        &mut kernel,
+        child_call,
+        WorkStep::Tool(ToolCall::new("write", json!({}))),
+    ));
+
+    let effects = kernel.step(NOW, Event::Cancel(child.job));
+    let parent_call = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == parent.job)
+        .unwrap()
+        .0;
+    work(
+        &mut kernel,
+        parent_call,
+        WorkStep::Finish(Completion::new("done after truth")),
+    );
+    kernel.step(
+        NOW,
+        Event::ToolFinished {
+            call: write_call,
+            result: ToolOutcome {
+                result: Err(crate::CallError::failed("unknown")),
+                external_effect: ExternalEffect::Unknown,
+            },
+        },
+    );
+    assert!(!finished_as(&kernel, parent.job, OutcomeKind::Completed));
+
+    kernel.step(
+        NOW,
+        Event::WriteResolved {
+            call: write_call,
+            result: ToolOutcome {
+                result: Ok(json!({ "resolved": true })),
+                external_effect: ExternalEffect::None,
+            },
+        },
+    );
+    assert!(finished_as(&kernel, parent.job, OutcomeKind::Completed));
+}
+
+#[test]
+fn coordinator_initial_directory_accounts_for_null_cursor_bytes() {
+    let mut kernel = Kernel::new(
+        AgentLimits {
+            item_bytes: 128,
+            ..AgentLimits::default()
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    let input = Input::new(InputId(601), "two roots");
+    create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![
+            assignment("first", &[input.id]),
+            assignment("second", &[input.id]),
+        ],
+    );
+    let (_, effects) = kernel
+        .accept(NOW, Input::new(InputId(602), "show the root directory"))
+        .unwrap();
+    let coordinate = starts(&effects)
+        .find_map(|(_, effect)| match effect {
+            Call::Coordinate(input) => Some(input.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(coordinate.jobs.len(), 2);
+    assert_eq!(coordinate.next_job, None);
+    let full_size = serde_json::to_vec(&coordinate).unwrap().len();
+    kernel.limits.context_bytes = full_size - 1;
+
+    let projected = context::prepare_coordinate(&kernel, coordinate.routing)
+        .expect("the initial directory falls back to one card");
+    assert!(serde_json::to_vec(&projected).unwrap().len() <= kernel.limits.context_bytes);
+    assert_eq!(projected.jobs.len(), 1);
+    assert_eq!(projected.next_job, Some(projected.jobs[0].id));
 }

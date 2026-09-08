@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,12 @@ pub enum RecordBody {
         job: JobId,
         spec: JobSpec,
         revision: u64,
+    },
+    /// The job's local pause flag changed. An unpaused child may still be
+    /// effectively paused by one of its owners.
+    JobControlChanged {
+        job: JobId,
+        paused: bool,
     },
     Note {
         job: JobId,
@@ -336,19 +342,110 @@ pub(crate) fn prepare_work(kernel: &Kernel, job_id: JobId) -> Result<PreparedWor
             seen_through,
         });
     }
-    prepare_compact(kernel, job_id).map(PreparedWork::Compact)
+    match prepare_compact(kernel, job_id) {
+        Ok(input) => Ok(PreparedWork::Compact(input)),
+        Err(ContextError::NothingToCompact) => Err(ContextError::TooLarge),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn prepare_coordinate(
     kernel: &Kernel,
     routing_id: Seq,
 ) -> Result<CoordinateInput, ContextError> {
+    let (mut input, has_read_result) = coordinate_input(kernel, routing_id, None)?;
+    if encoded_len(&input) > kernel.limits.context_bytes {
+        return Err(ContextError::TooLarge);
+    }
+    if has_read_result {
+        return Ok(input);
+    }
+
+    let roots = kernel
+        .jobs
+        .keys()
+        .copied()
+        .filter(|id| {
+            matches!(kernel.jobs[id].owner, Owner::User)
+                && !matches!(kernel.jobs[id].state, JobState::Finished(_))
+        })
+        .collect::<Vec<_>>();
+    for (index, id) in roots.iter().take(DIRECTORY_PAGE).enumerate() {
+        let mut candidate = input.clone();
+        candidate.jobs.push(card(kernel, *id));
+        candidate.next_job = (index + 1 < roots.len()).then_some(*id);
+        if encoded_len(&candidate) > kernel.limits.context_bytes {
+            break;
+        }
+        input = candidate;
+    }
+    if input.jobs.is_empty() && !roots.is_empty() {
+        return Err(ContextError::TooLarge);
+    }
+    Ok(input)
+}
+
+pub(crate) fn coordinate_read_fits(
+    kernel: &Kernel,
+    routing_id: Seq,
+    candidate: &Record,
+) -> Result<bool, ContextError> {
+    let (input, _) = coordinate_input(kernel, routing_id, Some(candidate))?;
+    Ok(encoded_len(&input) <= kernel.limits.context_bytes)
+}
+
+fn coordinate_input(
+    kernel: &Kernel,
+    routing_id: Seq,
+    read_override: Option<&Record>,
+) -> Result<(CoordinateInput, bool), ContextError> {
     let routing = kernel
         .routings
         .get(&routing_id)
         .ok_or(ContextError::MissingRouting(routing_id))?;
-    let records = expand_records(kernel, &routing.records)?;
-    let mut input = CoordinateInput {
+    let latest_read = read_override.is_none().then(|| {
+        routing.records.iter().rev().find(|seq| {
+            **seq > routing_id
+                && kernel
+                    .records
+                    .get(seq)
+                    .is_some_and(|record| matches!(record.body, RecordBody::ReadResult { .. }))
+        })
+    });
+    let latest_read = latest_read.flatten().copied();
+    let projected = routing
+        .records
+        .iter()
+        .copied()
+        .filter(|seq| {
+            !kernel
+                .records
+                .get(seq)
+                .is_some_and(|record| matches!(record.body, RecordBody::ReadResult { .. }))
+                || Some(*seq) == latest_read
+        })
+        .collect::<Vec<_>>();
+    let mut positions = BTreeMap::new();
+    let mut records = Vec::new();
+    expand_into(kernel, &projected, &mut positions, &mut records)?;
+    if let Some(candidate) = read_override {
+        push_record_view(candidate, 0, usize::MAX, &mut positions, &mut records)?;
+        if let RecordBody::ReadResult {
+            record: Some(range),
+            ..
+        } = &candidate.body
+        {
+            push_view(
+                kernel,
+                range.source,
+                range.offset,
+                kernel.limits.item_bytes,
+                &mut positions,
+                &mut records,
+            )?;
+        }
+    }
+    let input = CoordinateInput {
         routing: routing_id,
         inputs: routing
             .inputs
@@ -370,35 +467,7 @@ pub(crate) fn prepare_coordinate(
         next_job: None,
         records,
     };
-    if encoded_len(&input) > kernel.limits.context_bytes {
-        return Err(ContextError::TooLarge);
-    }
-
-    let roots = kernel
-        .jobs
-        .keys()
-        .copied()
-        .filter(|id| {
-            matches!(kernel.jobs[id].owner, Owner::User)
-                && !matches!(kernel.jobs[id].state, JobState::Finished(_))
-        })
-        .collect::<Vec<_>>();
-    for id in roots.iter().take(DIRECTORY_PAGE) {
-        input.jobs.push(card(kernel, *id));
-        input.next_job = Some(*id);
-        if encoded_len(&input) > kernel.limits.context_bytes {
-            input.jobs.pop();
-            break;
-        }
-    }
-    if input.jobs.len() == roots.len() {
-        input.next_job = None;
-    } else if input.jobs.is_empty() {
-        return Err(ContextError::TooLarge);
-    } else {
-        input.next_job = input.jobs.last().map(|job| job.id);
-    }
-    Ok(input)
+    Ok((input, read_override.is_some() || latest_read.is_some()))
 }
 
 pub(crate) fn prepare_compact(
@@ -421,12 +490,13 @@ pub(crate) fn prepare_compact(
         .copied()
         .filter(|seq| *seq > after && *seq <= job.context.read_through);
     let mut records = Vec::new();
+    let mut positions = BTreeMap::new();
     let mut through = after;
     for seq in candidates {
-        let mut next = expand_records(kernel, &[seq])?;
         let next_through = seq;
         let mut trial = records.clone();
-        trial.append(&mut next);
+        let mut trial_positions = positions.clone();
+        expand_into(kernel, &[seq], &mut trial_positions, &mut trial)?;
         let input = CompactInput {
             job: job_id,
             revision: job.revision,
@@ -438,6 +508,7 @@ pub(crate) fn prepare_compact(
             break;
         }
         records = trial;
+        positions = trial_positions;
         through = next_through;
     }
     if through == after {
@@ -466,45 +537,78 @@ pub(crate) fn card(kernel: &Kernel, id: JobId) -> JobCard {
 }
 
 fn expand_records(kernel: &Kernel, ids: &[Seq]) -> Result<Vec<RecordView>, ContextError> {
-    let mut seen = BTreeSet::new();
+    let mut positions = BTreeMap::new();
     let mut views = Vec::new();
+    expand_into(kernel, ids, &mut positions, &mut views)?;
+    Ok(views)
+}
+
+fn expand_into(
+    kernel: &Kernel,
+    ids: &[Seq],
+    positions: &mut BTreeMap<(Seq, usize), usize>,
+    views: &mut Vec<RecordView>,
+) -> Result<(), ContextError> {
     for id in ids {
-        push_view(kernel, *id, 0, &mut seen, &mut views)?;
+        push_view(kernel, *id, 0, usize::MAX, positions, views)?;
         let record = kernel
             .records
             .get(id)
             .ok_or(ContextError::MissingRecord(*id))?;
         match &record.body {
             RecordBody::Delivery { source, .. } => {
-                push_view(kernel, *source, 0, &mut seen, &mut views)?;
+                push_view(kernel, *source, 0, usize::MAX, positions, views)?;
             }
             RecordBody::ReadResult {
                 record: Some(range),
                 ..
             } => {
-                push_view(kernel, range.source, range.offset, &mut seen, &mut views)?;
+                push_view(
+                    kernel,
+                    range.source,
+                    range.offset,
+                    kernel.limits.item_bytes,
+                    positions,
+                    views,
+                )?;
             }
             _ => {}
         }
     }
-    Ok(views)
+    Ok(())
 }
 
 fn push_view(
     kernel: &Kernel,
     id: Seq,
     offset: usize,
-    seen: &mut BTreeSet<(Seq, usize)>,
+    limit: usize,
+    positions: &mut BTreeMap<(Seq, usize), usize>,
     views: &mut Vec<RecordView>,
 ) -> Result<(), ContextError> {
-    if !seen.insert((id, offset)) {
-        return Ok(());
-    }
     let record = kernel
         .records
         .get(&id)
         .ok_or(ContextError::MissingRecord(id))?;
-    views.push(view(record, offset, kernel.limits.item_bytes)?);
+    push_record_view(record, offset, limit, positions, views)
+}
+
+fn push_record_view(
+    record: &Record,
+    offset: usize,
+    limit: usize,
+    positions: &mut BTreeMap<(Seq, usize), usize>,
+    views: &mut Vec<RecordView>,
+) -> Result<(), ContextError> {
+    let next = view(record, offset, limit)?;
+    if let Some(position) = positions.get(&(record.seq, offset)).copied() {
+        if views[position].next_offset.is_some() && next.next_offset.is_none() {
+            views[position] = next;
+        }
+        return Ok(());
+    }
+    positions.insert((record.seq, offset), views.len());
+    views.push(next);
     Ok(())
 }
 
@@ -520,6 +624,13 @@ pub(crate) fn view(
     let mut end = offset.saturating_add(limit).min(content.len());
     while end > offset && !content.is_char_boundary(end) {
         end -= 1;
+    }
+    if end == offset && offset < content.len() {
+        end += content[offset..]
+            .chars()
+            .next()
+            .expect("a non-empty string has a first character")
+            .len_utf8();
     }
     Ok(RecordView {
         source: record.seq,

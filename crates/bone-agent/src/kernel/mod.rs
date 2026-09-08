@@ -327,7 +327,19 @@ impl Kernel {
             Some(ReplyTarget::Job(job)) => {
                 self.accept_user_reply(job, input.id, input_record.seq, &mut effects)
             }
-            None => self.open_input_routing(input.id, input_record.seq, &mut effects),
+            None => {
+                let (mut inputs, mut records) = self.supersede_input_routings(&mut effects);
+                inputs.push(input.id);
+                records.push(input_record.seq);
+                let routing = self.open_input_routing(inputs.clone(), records, &mut effects);
+                for pending in inputs.into_iter().filter(|id| *id != input.id) {
+                    self.inputs
+                        .get_mut(&pending)
+                        .expect("a superseded input is still pending")
+                        .routing = routing;
+                }
+                routing
+            }
         };
         let required_jobs = match reply {
             Some(ReplyTarget::Job(job)) => BTreeSet::from([job]),
@@ -399,7 +411,7 @@ impl Kernel {
                 self.write_resolved(call, result, &mut effects)
             }
             Event::Pause(job) => self.pause(job, &mut effects),
-            Event::Resume(job) => self.resume(job),
+            Event::Resume(job) => self.resume(job, &mut effects),
             Event::Cancel(job) => self.cancel(job, &mut effects),
             Event::Retry(input) => self.retry(input),
             Event::Stop => self.stop(&mut effects),

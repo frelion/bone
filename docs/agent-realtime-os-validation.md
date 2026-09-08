@@ -1,73 +1,80 @@
 # bone-agent 场景验证
 
-本轮只验证进程内 bone-agent；bone-app 不迁移。场景推演、受控执行测试和真实外部系统能力分别标注，不把未实现的能力写成“已通过”。
+范围是进程内 bone-agent。下面区分已有自动化回归、示例入口、实现边界与延期能力；32 个场景不是 32 项已完成的端到端认证。bone-app 迁移和整个 workspace 构建不在本文件的验收结论中。
 
 ## 自动化验收入口
 
 ```sh
-cargo fmt -p bone-agent --check
+cargo fmt --all -- --check
 cargo clippy -p bone-agent --all-targets --all-features --locked -- -D warnings
 cargo test -p bone-agent --all-targets --all-features --locked
 cargo test -p bone-agent --doc --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc -p bone-agent --no-deps --all-features --locked
 cargo run -p bone-agent --example walkthrough --locked
-cargo run -p bone-agent --example interleaving --locked
 ```
 
-Kernel 测试直接驱动真实状态机；Runtime 测试使用受控模型、假工具和 Tokio 暂停时钟；agent_slice 使用实际 ModelAdapter、受控 provider 和真实 read 工具。没有新增测试框架，没有使用真实账号执行外部写入。
+2026-09-08，本轮最终工作树已实际通过上述全部命令：51 个单元测试通过，doctest 当前为 0，Clippy 与 rustdoc 零警告，walkthrough 输出 `1 job completed; 11 records retained`。同时执行了 `git diff --check`，并确认 `crates/bone-app` 无改动；未据此声称整个 workspace 已完成迁移或验证。
 
-2026-09-08 本轮结果：133 项测试全部通过，其中 Kernel 回归 69 项；格式检查、Clippy 零警告、Rustdoc 零警告和两个可执行示例均通过。文档测试命令通过，但当前没有 doctest。未验证 bone-app 或整个 workspace 的构建。
+实际测试布局：
+
+- [src/tests.rs](../crates/bone-agent/src/tests.rs)：直接给 Kernel 输入事件，检查状态、Record、Effect、Context 与读取权限。
+- [src/runtime.rs](../crates/bone-agent/src/runtime.rs)：模块内 Tokio 测试，使用受控 ModelPort、ToolPort 和取消信号，检查同步 panic 的槽释放、最后一个 handle 释放清理、取消外部写后的真实 Applied 结果。当前测试不使用暂停时钟。
+- [src/model.rs](../crates/bone-agent/src/model.rs)：模块内结构协议测试，覆盖 WorkProposal 往返编码及多余、缺失字段拒绝；不是连接真实 provider 的模型认证。
+- [src/config.rs](../crates/bone-agent/src/config.rs)：模块内 AgentLimits 校验测试。
+- [examples/walkthrough.rs](../crates/bone-agent/examples/walkthrough.rs)：唯一示例，用确定性 ModelPort 演示输入、根 Job、Outcome、观察和 shutdown；不连接真实模型或业务工具。
 
 ## 32 个场景的覆盖边界
 
-| 场景 | 验证方式或首版边界 |
+“回归”指当前源码中有对应自动化检查；“局部回归”只覆盖所列部分；“实现边界”说明已有机制及未单独验证的部分，不等同于场景验收通过。
+
+| 场景 | 当前覆盖方式或边界 |
 | --- | --- |
-| S01 简单问答 | Kernel 短分派后完整主力回答，不经过额外审批。 |
-| S02 A 重活中启动 B 重活 | Kernel 与主力并行；B 可以用工具，A 不取消。 |
-| S03 多工作进度 | Job/Call 独立快照和进度；主力只看到公开状态，不推测隐藏推理。 |
-| S04 大量等待与就绪工作 | 有界槽位、后台轮转及工具候选公平性；不为等待常驻模型。 |
-| S05 单个模型失败 | 所属 Job 失败，不误伤别的工作；路由失败显式重试。 |
-| S06 等待用户时来新消息 | AskUser 与关联补充；旧未决解释与新原话有序合批。 |
-| S07 答案交付前更正要求 | 暂扣候选、撤销旧资格；首版不流式发布未提交答案。 |
-| S08 B 完成，A/C 继续 | 局部 JobFinished，不取消其他工作或定时器。 |
-| S09 修改已有目标 | 撤销旧 Call，迟到成功/失败/进度不能覆盖新版本。 |
-| S10 一条输入改变多个 Job | 整组控制校验、父子冲突拒绝，无部分应用。 |
-| S11 停止期间分派迟到 | Stop 撤销已接收批次；新输入可创建新工作。 |
-| S12 未来工作共享要求 | constraints 进入后续模型上下文；不声称任意自然语言可硬性强制。 |
-| S13 含糊目标 | Investigate/Clarify；调查有明确续接或失效，不默认为无影响。 |
-| S14 暂停后恢复 | 用户输入顺序与版本；source 不能自行解除用户暂停。 |
-| S15 材料影响相关工作 | 明确引用和等待；普通追加材料不全局作废，确证 Unknown 则重新考虑相关提案。 |
-| S16 子工作与成果复用 | 取消归属、引用不取消、成果等待和终态等待、循环拒绝。 |
-| S17 并发改同一文件 | 工具边界要求隔离或条件写；未接入写文件工具，不宣称已实现。 |
-| S18 共用浏览器 | 明确延期，不制造假浏览器验收。 |
-| S19 用户同时改外部文档 | 具体适配器的版本/ETag 前置条件；非当前内核提供的事务。 |
-| S20 跨 Job 共享金额预算 | 未实现通用预算预留/核销；不把自然语言 constraints 当硬预算。 |
-| S21 撤销权限或切换账号 | 配置不可漂移、Stop 与宿主权限边界；动态账号交接不在首版。 |
-| S22 工具/子模型伪造授权 | 模型角色和工具结果不能互相冒充；source 不能修改目标/解除暂停/越出工作树。 |
-| S23 多租户保密 | 首版单宿主会话边界；没有通用多租户隔离系统。 |
-| S24 只读请求的数据出境 | 注册适配器和宿主负责；ReadOnly 不是无泄密证明。 |
-| S25 先接收“不要发送” | 未决输入阻止新业务写的开始授权。 |
-| S26 先授权发送再停止 | 受控写工具可拒绝取消并报告真实 Applied，不伪造撤回。 |
-| S27 写结果 Unknown | 保留许可、禁止自动重发、宿主幂等确证与相关提案重算。 |
-| S28 重复及迟到回调 | 不重复回复或执行，不覆盖替代工作。 |
-| S29 进程内定时跟进 | 等待不占模型，唤醒只作用所属 Job，旧定时不复活停止工作。 |
-| S30 重启后的次日跟进 | 明确延期；shutdown 报告未决调用，不自动重放。 |
-| S31 输入/进度洪流 | 普通容量、澄清保留入口、Stop 独立入口、进度合并、Lagged 基线恢复。 |
-| S32 20ms 物理急停 | 明确不支持硬实时；必须依赖独立确定性控制系统。 |
+| S01 简单问答 | 示例入口：walkthrough 用确定性 ModelPort 完成一次根 Job 生命周期；自然语言答案质量未做真实模型认证。 |
+| S02 A 重活中启动 B 重活 | 局部回归：多个 root 的 Worker Context 隔离、目录分页；没有真实模型和工具共同负载下的并发性能验收。 |
+| S03 多工作进度 | 局部回归：Job 私有记录隔离。Job/Call 状态和进度由观察接口提供；完整进度展示和隐藏推理推断不是测试结论。 |
+| S04 大量等待与就绪工作 | 局部回归：Delegate 容量不足后父 Worker 收到 Audit 并继续执行。并发槽和两条 FIFO 是实现边界；未承诺按根工作或工具候选公平调度，未做负载压测。 |
+| S05 单个模型失败 | 回归：同步 coordinate panic 释放槽，失败输入可重试且服从最新合并批次。所有 provider 错误与并行失败组合未穷举。 |
+| S06 等待用户时来新消息 | 回归：澄清回复预留信封、Job 问题的直接回复、开放路由期间保留旧问题，以及新输入取代在途路由和失败批次合并。 |
+| S07 答案交付前更正要求 | 回归：constraints 改变丢弃旧 Finish 候选和在途模型资格；新输入令旧 Coordinate 结果失效。自然语言更正的解释质量仍由模型承担。 |
+| S08 B 完成，A/C 继续 | 局部回归：父工作收到 child Outcome 后重新判断，Outcome 只投递一次。更广的多个无关 root 与定时器交错没有单独场景验收。 |
+| S09 修改已有目标 | 回归：依赖契约变更投递新 revision，暂停后迟到 Worker 提案不提交。迟到成功、错误、进度的全部排列没有穷举。 |
+| S10 一条输入改变多个 Job | 回归：同一协调决定同时更新 owner 与 descendant 被整组拒绝，无部分应用。 |
+| S11 停止期间分派迟到 | 回归：Stop 终结森林和调查树，迟到 Worker 或工具事实不复活 Job；新输入取代在途 Coordinate 后旧结果不获提交权。 |
+| S12 未来工作共享要求 | 局部回归：constraints 改变撤销旧模型、Finish 与工具资格。后续投影携带当前 constraints；不证明任意自然语言约束可被硬性强制。 |
+| S13 含糊目标 | 回归：调查可在所属输入路由等待期间完成；协调失效取消调查树；澄清问题有明确回复入口。 |
+| S14 暂停后恢复 | 回归：Pause 丢弃旧模型提案，Resume 重新调度，两次控制变更都有 JobControlChanged；暂停同时撤销协调权。继承暂停的所有树形组合未穷举。 |
+| S15 材料影响相关工作 | 回归：child Outcome 和 Inquiry Answer 的显式 evidence 定向可读，未列私有记录仍隔离；必要输入完整投影、超预算明确失败。材料语义相关性不由这些测试证明。 |
+| S16 子工作与成果复用 | 回归：父子完成门禁、单次 Outcome 投递、最终 Outcome seed、显式证据授权和依赖 revision。PublishResult/Result 等待及环检测属于实现机制，尚无专门事件交错回归。 |
+| S17 并发改同一文件 | 外部边界：内置工具为 read/glob/grep，没有写文件适配器验收；隔离或条件写应由具体工具实现。 |
+| S18 共用浏览器 | 延期：未实现共享浏览器租约或会话协调。 |
+| S19 用户同时改外部文档 | 外部边界：版本或 ETag 前置条件依赖具体适配器；当前 Kernel 不提供外部文档事务。 |
+| S20 跨 Job 共享金额预算 | 延期：没有通用预算预留或核销，constraints 不是硬预算。 |
+| S21 撤销权限或切换账号 | 外部边界：宿主负责账号与权限，Kernel 提供 Stop 和调用资格撤销；动态账号交接没有实现或认证。 |
+| S22 工具/子模型伪造授权 | 局部回归：无效委派输入整批拒绝、精确 schema 拒绝多余字段、私有证据隔离。owner 和控制权限由 Kernel 验证；未做真实提示注入攻防认证。 |
+| S23 多租户保密 | 范围边界：当前是单宿主会话内的 Job Context 隔离，没有通用多租户保密系统。 |
+| S24 只读请求的数据出境 | 外部边界：数据出境由宿主与适配器控制；ReadOnly 仅表示工具效果分类，不是无泄密证明。 |
+| S25 先接收“不要发送” | 实现边界：未关闭输入路由暂扣新 ExternalWrite。尚无真实发送适配器或该自然语言顺序的端到端验收。 |
+| S26 先授权发送再停止 | 回归：受控 ExternalWrite 收到取消后仍可返回 Applied，Kernel 保留事实且不复活已取消 Job；父 Finish 等待已取消 child 的在途外部写结束。 |
+| S27 写结果 Unknown | 实现边界：Unknown 保留在 Call 事实中，阻止后续写入及相关成功交付，宿主通过 resolve_write 确证。当前回归没有完整覆盖 Unknown 确证、旧候选和重复写入的组合。 |
+| S28 重复及迟到回调 | 回归：Input 幂等，重复迟到 ToolFinished 只记录一次，暂停、Stop、批次取代后的旧模型结果不恢复资格。不是对所有回调排列的穷举。 |
+| S29 进程内定时跟进 | 实现边界：Await::After、next_deadline 和 Tick 支持进程内等待；当前没有暂停时钟的专门定时交错回归，不承诺持久定时。 |
+| S30 重启后的次日跟进 | 延期：没有跨重启恢复或自动重放。当前回归覆盖最后一个 handle 释放时的空闲端口清理和在途模型取消，不覆盖重启续跑。 |
+| S31 输入/进度洪流 | 局部回归：普通输入容量满时保留澄清回复信封。进度去重、有界广播及 Lagged 后重取 baseline 是接口机制；尚无输入/进度洪流或慢观察者专门压测。 |
+| S32 20ms 物理急停 | 不支持：Runtime 不提供硬实时物理急停保证，应由独立确定性控制系统承担。 |
 
-## 交叉审判转成回归
+## 本轮新增反例回归
 
-重点反例不是“架构看起来可行”，而是具体顺序下不允许发生的动作：
+当前 [Kernel 回归](../crates/bone-agent/src/tests.rs) 包含这些明确事件序列：
 
-- 旧工作与新目标交错，旧成功、错误和进度都不能夺回提交权。
-- 停止发生在 Kernel 模型返回前，不能从迟到分派创建工作。
-- 较早解释失败后接收较新要求，旧批次不能经重试覆盖新要求。
-- 调查已被取代、取消或源目标改变，迟到材料不能重开旧批次或误停新工作。
-- 两个被扣住的候选在放行时形成互等，提交时必须拒绝循环。
-- 工具容量为一时，低 ID 的快速循环不能饿死先等待的另一工作。
-- Unknown 被确证为已执行后，旧重试候选不能自动变成第二次写入。
-- 一个输入需要多项交付，一条 Reply 或单个 Job 结束不能提前结束请求。
+- `a_routing_investigation_can_finish_while_its_routing_waits`：调查 Outcome 不被它正在协助解释的用户输入挡住。
+- `parent_finish_waits_for_a_cancelled_child_external_write`：child 已取消而外部写仍在途时，父不能成功完成。
+- `delegate_capacity_rejection_is_returned_to_the_parent_worker`：容量拒绝进入父 Context，父可以改为本地完成。
+- 在途、Failed、WaitingForUser、WaitingInquiry 和 WaitingJob 路由的批次取代回归分别检查旧结果、旧 Input ID 重试、迟到澄清、迟到 Inquiry answer 和迟到调查 Finish 都不能恢复旧解释权。
+- `seed_uses_the_final_outcome_after_an_older_checkpoint`：后继工作读取最终 Outcome，而不是被旧 checkpoint 摘要覆盖。
+- Outcome、Inquiry Answer 和 seed 的 evidence 回归同时检查已分享记录可读、未分享私有记录不可读。
+- 子树外部写回归同时覆盖在途写结束为 Applied，以及 Unknown 在宿主 `WriteResolved` 前持续阻止父 Finish。
+- 目录回归检查 16 条上限、完整 context_bytes 预算、独占游标、只投影最新页、预检去重，以及默认首页和显式末页空游标的序列化字节数。
 
-测试分别位于 [kernel](../crates/bone-agent/tests/kernel.rs)、[runtime](../crates/bone-agent/tests/runtime.rs)、[interleavings](../crates/bone-agent/tests/interleavings.rs)、[模型并发](../crates/bone-agent/tests/model_concurrency.rs)和[完整切片](../crates/bone-agent/tests/agent_slice.rs)。配置、上下文投影、协议结构、取消和诊断脱敏另有单元测试。
+[Runtime 回归](../crates/bone-agent/src/runtime.rs) 还检查最后一个 Agent handle 释放后的清理；[控制回归](../crates/bone-agent/src/tests.rs) 检查 Pause/Resume 的 JobControlChanged。
 
-没有进行新的真实模型认证；这些验证不证明模型永远理解正确，也不证明尚未接入的外部适配器满足条件写、权限或幂等契约。
+没有新的真实模型或外部账号认证。这些测试证明所列受控序列中的状态和协议行为，不证明模型永远正确拆分、选择证据、满足目标，也不替尚未接入的外部适配器证明权限、条件写或跨 Runtime 幂等。

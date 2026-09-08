@@ -159,8 +159,12 @@ impl Kernel {
                 .ok_or_else(|| "routing cannot read that job".into()),
             (DeliveryTarget::Routing(routing), ReadQuery::Record { id, offset }) => {
                 let route = &self.routings[&routing];
-                let allowed = route.records.contains(id)
+                let allowed = route
+                    .records
+                    .iter()
+                    .any(|record| *record == *id || self.attached_record_grants(*record, *id))
                     || self.public_record(*id)
+                    || self.public_evidence(*id)
                     || matches!(route.requester, Requester::Job { job, .. } if self.can_read_record(job, *id));
                 if !allowed {
                     return Err("routing cannot read that record".into());
@@ -177,13 +181,13 @@ impl Kernel {
         requester: DeliveryTarget,
         query: ReadQuery,
         effects: &mut Vec<Effect>,
-    ) {
+    ) -> Result<(), String> {
         let mut jobs = Vec::new();
         let mut record_range = None;
         let mut next_job = None;
         match &query {
             ReadQuery::Jobs { parent, after } => {
-                let mut ids = self
+                let ids = self
                     .jobs
                     .iter()
                     .filter_map(|(id, job)| {
@@ -206,11 +210,45 @@ impl Kernel {
                     })
                     .take(context::DIRECTORY_PAGE + 1)
                     .collect::<Vec<_>>();
-                if ids.len() > context::DIRECTORY_PAGE {
-                    ids.pop();
-                    next_job = ids.last().copied();
+                match requester {
+                    DeliveryTarget::Job(_) => {
+                        let mut page = ids;
+                        if page.len() > context::DIRECTORY_PAGE {
+                            page.pop();
+                            next_job = page.last().copied();
+                        }
+                        jobs = page.into_iter().map(|id| context::card(self, id)).collect();
+                    }
+                    DeliveryTarget::Routing(routing) => {
+                        for (index, id) in ids.iter().take(context::DIRECTORY_PAGE).enumerate() {
+                            jobs.push(context::card(self, *id));
+                            let has_more = index + 1 < ids.len();
+                            let candidate = Record {
+                                seq: self.peek_seq(),
+                                origin: Origin::Kernel,
+                                body: RecordBody::ReadResult {
+                                    requester,
+                                    query: query.clone(),
+                                    next_job: has_more.then_some(*id),
+                                    jobs: jobs.clone(),
+                                    record: None,
+                                },
+                            };
+                            if !context::coordinate_read_fits(self, routing, &candidate)
+                                .map_err(|error| error.to_string())?
+                            {
+                                jobs.pop();
+                                break;
+                            }
+                        }
+                        if jobs.is_empty() && !ids.is_empty() {
+                            return Err(context::ContextError::TooLarge.to_string());
+                        }
+                        if jobs.len() < ids.len() {
+                            next_job = jobs.last().map(|job| job.id);
+                        }
+                    }
                 }
-                jobs = ids.into_iter().map(|id| context::card(self, id)).collect();
             }
             ReadQuery::Job(job) => jobs.push(context::card(self, *job)),
             ReadQuery::Record { id, offset } => {
@@ -220,17 +258,26 @@ impl Kernel {
                 });
             }
         }
-        let record = self.record(
-            Origin::Kernel,
-            RecordBody::ReadResult {
-                requester,
-                query,
-                next_job,
-                jobs,
-                record: record_range,
-            },
-            effects,
-        );
+        let body = RecordBody::ReadResult {
+            requester,
+            query,
+            next_job,
+            jobs,
+            record: record_range,
+        };
+        if let DeliveryTarget::Routing(routing) = requester {
+            let candidate = Record {
+                seq: self.peek_seq(),
+                origin: Origin::Kernel,
+                body: body.clone(),
+            };
+            if !context::coordinate_read_fits(self, routing, &candidate)
+                .map_err(|error| error.to_string())?
+            {
+                return Err(context::ContextError::TooLarge.to_string());
+            }
+        }
+        let record = self.record(Origin::Kernel, body, effects);
         match requester {
             DeliveryTarget::Job(job) => {
                 self.attach(job, record.seq);
@@ -245,6 +292,7 @@ impl Kernel {
                 self.make_routing_ready(routing);
             }
         }
+        Ok(())
     }
 
     pub(super) fn attach(&mut self, job: JobId, record: Seq) {
@@ -397,20 +445,94 @@ impl Kernel {
         {
             return true;
         }
-        if self.jobs[&job].context.records.iter().any(|delivery| {
-            self.records.get(delivery).is_some_and(|record| {
-                matches!(record.body, RecordBody::Delivery { source, .. } if source == seq)
-                    || matches!(record.body, RecordBody::ReadResult { record: Some(RecordRange { source, .. }), .. } if source == seq)
-            })
-        }) {
+        if self.jobs[&job]
+            .context
+            .records
+            .iter()
+            .any(|attached| self.attached_record_grants(*attached, seq))
+        {
             return true;
         }
-        match &record.body {
+        if match &record.body {
             RecordBody::Report { job: owner, .. }
             | RecordBody::Published { job: owner, .. }
             | RecordBody::Outcome { job: owner, .. } => self.owns(job, *owner),
             _ => false,
+        } {
+            return true;
         }
+        self.records.values().any(|record| {
+            let owner = match &record.body {
+                RecordBody::Report { job, .. }
+                | RecordBody::Published { job, .. }
+                | RecordBody::Outcome { job, .. } => Some(*job),
+                _ => None,
+            };
+            owner.is_some_and(|owner| self.owns(job, owner))
+                && self.artifact_grants(&record.body, seq)
+        })
+    }
+
+    fn attached_record_grants(&self, attached: Seq, target: Seq) -> bool {
+        let Some(record) = self.records.get(&attached) else {
+            return false;
+        };
+        match &record.body {
+            RecordBody::Delivery { source, .. } => {
+                *source == target
+                    || self
+                        .records
+                        .get(source)
+                        .is_some_and(|record| self.artifact_grants(&record.body, target))
+            }
+            RecordBody::ReadResult { jobs, record, .. } => {
+                record.is_some_and(|range| {
+                    range.source == target
+                        || self
+                            .records
+                            .get(&range.source)
+                            .is_some_and(|record| self.artifact_grants(&record.body, target))
+                }) || jobs.iter().any(|card| self.card_grants(card, target))
+            }
+            RecordBody::ImportedMemory { record_refs, .. } => record_refs.contains(&target),
+            _ => false,
+        }
+    }
+
+    fn artifact_grants(&self, body: &RecordBody, target: Seq) -> bool {
+        match body {
+            RecordBody::Report { report, .. } => report.evidence.contains(&target),
+            RecordBody::Published { result, .. } => result.evidence.contains(&target),
+            RecordBody::Outcome { outcome, .. } => outcome.completion.evidence.contains(&target),
+            RecordBody::InquirySettled {
+                result: InquiryResult::Answer(report),
+                ..
+            } => report.evidence.contains(&target),
+            RecordBody::InquirySettled {
+                result: InquiryResult::Finished(outcome),
+                ..
+            } => {
+                *outcome == target
+                    || self
+                        .records
+                        .get(outcome)
+                        .is_some_and(|record| self.artifact_grants(&record.body, target))
+            }
+            _ => false,
+        }
+    }
+
+    fn card_grants(&self, card: &crate::JobCard, target: Seq) -> bool {
+        card.report
+            .as_ref()
+            .is_some_and(|report| report.evidence.contains(&target))
+            || matches!(&card.status, JobStatus::Finished(outcome) if outcome.as_of == target || outcome.completion.evidence.contains(&target))
+    }
+
+    fn public_evidence(&self, target: Seq) -> bool {
+        self.records.iter().any(|(source, record)| {
+            self.public_record(*source) && self.artifact_grants(&record.body, target)
+        })
     }
 
     pub(super) fn public_record(&self, seq: Seq) -> bool {

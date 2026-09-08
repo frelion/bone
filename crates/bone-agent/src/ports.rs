@@ -225,7 +225,11 @@ impl CallContext {
         self.progress.try_send((self.id, progress)).is_ok()
     }
 
-    pub(crate) fn id(&self) -> CallId {
+    /// Identifies this invocation within its agent runtime.
+    ///
+    /// IDs are unique only within one runtime. External tools using this ID for
+    /// idempotency must combine it with a host-provided runtime or session key.
+    pub fn id(&self) -> CallId {
         self.id
     }
 

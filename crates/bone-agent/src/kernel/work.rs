@@ -272,8 +272,19 @@ impl Kernel {
             }
             WorkStep::Tool(tool) => self.start_tool(job, pending, tool, effects),
             WorkStep::Delegate(assignments) => {
-                for assignment in assignments {
-                    self.create_job(Owner::Job(job), assignment, effects);
+                if self.active_jobs() + assignments.len() > self.limits.active_jobs {
+                    let rejected = self.record(
+                        Origin::Call(pending.call),
+                        RecordBody::Audit {
+                            message: "delegation was not accepted: job capacity is full".into(),
+                        },
+                        effects,
+                    );
+                    self.attach(job, rejected.seq);
+                } else {
+                    for assignment in assignments {
+                        self.create_job(Owner::Job(job), assignment, effects);
+                    }
                 }
                 self.make_ready(job);
             }
@@ -297,12 +308,16 @@ impl Kernel {
                 question,
             } => self.open_inquiry(DeliveryTarget::Job(job), target, question, now, effects),
             WorkStep::Coordinate(request) => self.open_coordination(job, request, effects),
-            WorkStep::Read(query) => {
-                self.read(DeliveryTarget::Job(job), query, effects);
-                if matches!(self.jobs[&job].state, JobState::Ready) {
-                    self.enqueue_job(job);
+            WorkStep::Read(query) => match self.read(DeliveryTarget::Job(job), query, effects) {
+                Ok(()) => {
+                    if matches!(self.jobs[&job].state, JobState::Ready) {
+                        self.enqueue_job(job);
+                    }
                 }
-            }
+                Err(message) => {
+                    self.finish_job(job, OutcomeKind::Failed, Completion::new(message), effects)
+                }
+            },
             WorkStep::PublishResult(result) => {
                 let record = self.record(
                     Origin::Call(pending.call),
@@ -488,20 +503,21 @@ impl Kernel {
     }
 
     fn finish_blocked(&self, job: JobId) -> bool {
-        self.has_open_input_routing()
+        (!self.is_investigation(job) && self.has_open_input_routing())
             || self.has_unread_required(job)
             || self.inquiries.values().any(|inquiry| inquiry.target == job)
             || self.job_has_running_tool(job)
             || self
                 .children_of(job)
                 .any(|child| !matches!(self.jobs[&child].state, JobState::Finished(_)))
-            || self.subtree_has_unknown_write(job)
+            || self.subtree_has_unresolved_write(job)
     }
 
-    fn subtree_has_unknown_write(&self, root: JobId) -> bool {
+    fn subtree_has_unresolved_write(&self, root: JobId) -> bool {
         self.calls.values().any(|call| {
             call.job().is_some_and(|job| self.owns(root, job))
-                && call.external_effect() == ExternalEffect::Unknown
+                && call.tool_effect() == Some(ToolEffect::ExternalWrite)
+                && (call.running() || call.external_effect() == ExternalEffect::Unknown)
         })
     }
 
@@ -632,7 +648,15 @@ impl Kernel {
         {
             return;
         }
+        if self.jobs[&job].local_paused {
+            return;
+        }
         self.jobs.get_mut(&job).expect("job exists").local_paused = true;
+        self.record(
+            Origin::Kernel,
+            RecordBody::JobControlChanged { job, paused: true },
+            effects,
+        );
         let subtree = self.subtree(job);
         for member in &subtree {
             self.invalidate_job_calls(*member, effects);
@@ -657,14 +681,19 @@ impl Kernel {
         }
     }
 
-    pub(super) fn resume(&mut self, job: JobId) {
+    pub(super) fn resume(&mut self, job: JobId, effects: &mut Vec<Effect>) {
         let Some(entry) = self.jobs.get_mut(&job) else {
             return;
         };
-        if matches!(entry.state, JobState::Finished(_)) {
+        if matches!(entry.state, JobState::Finished(_)) || !entry.local_paused {
             return;
         }
         entry.local_paused = false;
+        self.record(
+            Origin::Kernel,
+            RecordBody::JobControlChanged { job, paused: false },
+            effects,
+        );
         for member in self.subtree(job) {
             self.enqueue_job(member);
         }

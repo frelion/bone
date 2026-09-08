@@ -226,6 +226,7 @@ struct Actor {
 
 impl Actor {
     async fn run(mut self) {
+        let mut controls_open = true;
         loop {
             if self.shutdown_complete() {
                 self.shutdown.send_replace(Some(ShutdownReport {
@@ -240,7 +241,16 @@ impl Actor {
                 self.shutdown_at,
             );
             tokio::select! {
-                Some(control) = self.controls.recv() => self.handle_control(control),
+                control = self.controls.recv(), if controls_open => {
+                    match control {
+                        Some(control) => self.handle_control(control),
+                        None => {
+                            // The last Agent handle has released both host channels.
+                            controls_open = false;
+                            self.begin_shutdown();
+                        }
+                    }
+                }
                 Some(command) = self.inputs.recv(), if !self.shutting_down => {
                     self.handle_input(command);
                 }
@@ -257,7 +267,6 @@ impl Actor {
                     }
                 }
                 _ = wait_until(deadline) => self.apply(Event::Tick),
-                else => self.begin_shutdown(),
             }
         }
     }
@@ -628,6 +637,87 @@ mod tests {
                 }
             })
         }
+    }
+
+    struct PendingModel {
+        started: mpsc::UnboundedSender<()>,
+    }
+
+    impl ModelPort for PendingModel {
+        fn coordinate(
+            &self,
+            _: CoordinateInput,
+            _: CallContext,
+        ) -> PortFuture<Result<crate::KernelDecision, CallError>> {
+            let _ = self.started.send(());
+            Box::pin(future::pending())
+        }
+
+        fn work(
+            &self,
+            _: WorkInput,
+            _: CallContext,
+        ) -> PortFuture<Result<WorkProposal, CallError>> {
+            panic!("unexpected work call")
+        }
+
+        fn compact(
+            &self,
+            _: CompactInput,
+            _: CallContext,
+        ) -> PortFuture<Result<CheckpointDraft, CallError>> {
+            panic!("unexpected compact call")
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_handle_releases_idle_model_and_tool_ports() {
+        let model = Arc::new(PendingModel {
+            started: mpsc::unbounded_channel().0,
+        });
+        let tool = Arc::new(AppliedWrite);
+        let retained_model = Arc::downgrade(&model);
+        let retained_tool = Arc::downgrade(&tool);
+        let agent = Agent::with_ports(model, vec![tool], AgentLimits::default()).unwrap();
+        let remaining = agent.clone();
+        let mut shutdown = agent.shutdown.clone();
+
+        drop(agent);
+        remaining.observe().await.unwrap();
+        assert!(shutdown.borrow().is_none());
+        assert!(retained_model.upgrade().is_some());
+        assert!(retained_tool.upgrade().is_some());
+
+        drop(remaining);
+        tokio::time::timeout(Duration::from_secs(1), shutdown.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*shutdown.borrow(), Some(ShutdownReport::default()));
+        assert!(retained_model.upgrade().is_none());
+        assert!(retained_tool.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_handle_cancels_a_running_model_call() {
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let model = Arc::new(PendingModel { started });
+        let retained_model = Arc::downgrade(&model);
+        let agent = Agent::with_ports(model, vec![], AgentLimits::default()).unwrap();
+        let mut shutdown = agent.shutdown.clone();
+        agent.post(Input::new(InputId(1), "wait")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        drop(agent);
+        tokio::time::timeout(Duration::from_secs(1), shutdown.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*shutdown.borrow(), Some(ShutdownReport::default()));
+        assert!(retained_model.upgrade().is_none());
     }
 
     #[tokio::test]

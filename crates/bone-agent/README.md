@@ -49,12 +49,12 @@ cargo run -p bone-agent --example walkthrough --locked
 
 ## Job 生命周期
 
-1. `post` 先把用户原话写成权威 Record，并创建一个 Routing。
+1. `post` 先把用户原话写成权威 Record。新的普通输入与所有未关闭输入路由中的原话按接收顺序合并，创建新 Routing 并撤销旧路由的解释权；旧 Input 的交付义务保留。
 2. 协调模型返回一个 `KernelDecision`。它可以建议创建或更新 Job、读取公开事实、定向询问，或请求用户澄清。
-3. Kernel 原子校验整份决定，再创建 Job。Worker 也可以用一个 `Delegate` step 原子创建多个直属 child。
+3. Kernel 原子校验整份决定，再创建 Job。Worker 也可以用一个 `Delegate` step 原子创建多个直属 child；容量不足时整批拒绝，把 Audit 写入父 Context 并重新调度父 Worker，不把父 Job 判为 Failed。
 4. Ready Job 获得一次冻结的 `WorkInput`。每个 Job 同时最多只有一个有提交资格的 Worker Call。
 5. Worker 返回可选 Note、Report、Inquiry answers，以及恰好一个 `WorkStep`。
-6. `Finish` 只有在必要消息已读、询问已结算、工具和直属 children 已结束、整个子树没有未知写入时才提交。
+6. `Finish` 只有在必要消息已读、询问已结算、本 Job 工具和直属 children 已结束、整个拥有子树没有 Running、CancelRequested 或 Unknown 的 ExternalWrite 时才提交。调查及其子树的内部 Outcome 可以穿过用户交付门禁，返回所属路由。
 7. `finish_job` 写入唯一 `JobOutcome`，把同一个 `Arc<JobOutcome>` 放入终态和 Record，再向仍活跃的 owner 投递引用。
 8. 一个输入关联的 required roots 全部终态后，Kernel 单独写入 `InputFinished`。
 
@@ -68,9 +68,13 @@ cargo run -p bone-agent --example walkthrough --locked
 - 已读水位；
 - 一个可选 checkpoint。
 
-Worker 不接收全局聊天快照。`prepare_work` 只展开本 Job 获准读取的输入、投递、工具事实和查询结果，并附带仍活跃的直属 child 卡片以及仍运行或外部效果 Unknown 的 Call。其他 Job 的私有 Note、工具输出和中间推理不会进入它的输入。协调模型默认只收有界的活跃 root 页，其余目录通过 `Read` 继续读取。
+Worker 不接收全局聊天快照。`prepare_work` 只展开本 Job 获准读取的输入、投递、工具事实和查询结果，并附带仍活跃的直属 child 卡片以及仍运行或外部效果 Unknown 的 Call。Report、Published、Outcome 和 Inquiry Answer 中显式分享的 evidence 可以定向读取；未列出的私有 Note 和工具历史仍隔离，不因引用一个 Job 而开放其全部 Context。
 
-`AgentLimits::context_bytes` 限制序列化后的 `WorkInput`、`CoordinateInput` 或 `CompactInput`，不包含模型适配器随后加入的 instructions、tool schema 和输出预留；宿主需要为真实模型窗口留出余量。当 Worker payload 超限时，Kernel 固定一个已经读过的前缀交给 `compact`。新消息留在后缀；checkpoint 不推进已读水位，也不会被再次作为普通 Record 展开。完成后的 Job 只能作为新 Job 的受限 seed 使用，旧 Job 不会重开。
+协调模型默认只收活跃 root 的有界首页，其余目录通过 `Read` 继续读取。查询页同时受 16 条和完整 `CoordinateInput` 的 `context_bytes` 预算限制；最新查询页替换默认首页。旧页仍保留在权威记录中，模型投影只保留本路由最新查询页，避免翻页时不断累积正文。
+
+`AgentLimits::context_bytes` 限制序列化后的 `WorkInput`、`CoordinateInput` 或 `CompactInput`，不包含模型适配器随后加入的 instructions、tool schema 和输出预留；宿主需要为真实模型窗口留出余量。自动进入 Context 的必要事实完整投影，放不下时明确失败；只有显式 `ReadQuery::Record` 按 UTF-8 offset 分页。当 Worker payload 超限时，Kernel 可以固定一个已经读过的前缀交给 `compact`。新消息留在后缀；checkpoint 不推进已读水位，也不会被再次作为普通 Record 展开。
+
+Completed Job 可以作为新 Job 的受限 seed，旧 Job 不会重开。导入记忆始终以最终 Outcome summary 为权威，并开放该 Outcome 和最终 evidence 的定向读取；checkpoint evidence 可以补充背景，较早 checkpoint summary 不覆盖最终结论。
 
 当前实现保证单次模型 payload、活跃 Job、并发 Call、待处理 Input/Inquiry、单项正文和工具输出的局部边界。为了保持证据引用与输入幂等，Kernel 尚未物理回收 `records/jobs/inputs/calls/routings`；完整会话历史随本次进程生命周期保留。进程内长期存储上限需要后续单独定义引用闭包与保留策略，不能简单按 checkpoint 水位删记录。
 
@@ -78,10 +82,13 @@ Worker 不接收全局聊天快照。`prepare_work` 只展开本 Job 获准读�
 
 - 交互 root 有一个保留 Worker 槽；后台 Job 使用有界并发。
 - 等待计时、Job、成果、询问或工具时不占模型槽。
-- Pause、Cancel、Spec revision、全局 constraints 改变和 Stop 会撤销受影响的旧模型提交资格。
+- Pause、Cancel、Spec revision、全局 constraints 改变和 Stop 会撤销受影响的旧模型提交资格。Pause/Resume 的状态变更写入 `JobControlChanged`，观察者可以从记录流更新界面。
 - 迟到模型结果只留下审计，不会复活 Job。
+- 被新输入取代的旧路由及其调查树失去执行资格；旧 Coordinate 结果和 Retry 不能恢复旧解释权。
 - 迟到工具结果仍然是真实执行事实；外部写入的 `Unknown` 只能由宿主通过 `resolve_write` 确证，不能自动重发。
 - `stop` 终结当前工作森林；`shutdown` 再等待本地调用清理，并返回仍未知的外部写入。
+- 最后一个 `Agent` handle 被丢弃时，Runtime 自动执行 Stop 并进入 shutdown 清理。需要取得清理报告的宿主应显式调用 `shutdown`。
+- `CallContext::id()` 只在当前 Runtime 内唯一；外部幂等键需要组合宿主提供的 Runtime 或 Session 标识。
 
 ## 代码阅读顺序
 
@@ -97,7 +104,7 @@ Worker 不接收全局聊天快照。`prepare_work` 只展开本 Job 获准读�
 ## 验证
 
 ```sh
-cargo fmt --all --check
+cargo fmt --all -- --check
 cargo clippy -p bone-agent --all-targets --all-features --locked -- -D warnings
 cargo test -p bone-agent --all-targets --all-features --locked
 cargo test -p bone-agent --doc --all-features --locked
