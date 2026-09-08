@@ -1,6 +1,6 @@
 # bone-app 迁移到新 Agent API
 
-状态：实施指导；本轮不修改 `bone-app`。
+状态：历史迁移笔记。2026-09-08 起，目标调整为 headless App 与独立 TUI 的完整重写，新的设计入口是 [bone-app 架构设计初稿](bone-app-design.md)。本文保留 Agent API 行为核对价值；其中保留 TUI 业务控制和旧 turn 结构的安排不再作为目标架构。
 
 ## 目标边界
 

@@ -6,7 +6,7 @@
 
 `crates/bone-agent` 使用新的破坏性 API，没有旧兼容层。Kernel 是唯一业务状态写入者，Runtime 执行异步调用，模型返回有类型的建议。Kernel 按 routing、work、scheduler、exchange 拆分内部模块；没有新增 repository trait、事件总线包装或另一套 Agent 生命周期。
 
-`crates/bone-app` 的旧 API 迁移仍是独立工作，参考 [bone-app 迁移计划](bone-app-agent-migration-plan.md)。bone-agent 的收口不表示整个 workspace 或产品链路已经完成迁移。
+`crates/bone-app` 的重写仍是独立工作，当前设计入口为 [bone-app 架构设计初稿](bone-app-design.md)，[旧迁移笔记](bone-app-agent-migration-plan.md) 保留作 Agent API 行为参考。bone-agent 的收口不表示整个 workspace 或产品链路已经完成迁移。
 
 ## 已落实的核心契约
 
