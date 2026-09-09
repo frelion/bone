@@ -23,11 +23,13 @@ pub use credentials::{ApiKey, ApiKeyCredentialError};
 pub use error::{Error, Result};
 pub use session::Session;
 
-pub use bone_agent::{
+pub use bone_adapters::{
+    llm::{EndpointConfig, ModelOptions},
+    tools::ToolLimits,
+};
+pub use bone_core::{
     AgentLimits, CallError, CallErrorKind, ExternalEffect, InputOutcome, OutcomeKind, ToolOutcome,
 };
-pub use bone_llm::{EndpointConfig, ModelOptions};
-pub use bone_tools::ToolLimits;
 
 pub(crate) use persistence::{DataStore, SavedRuntime, SavedSession};
 pub(crate) use providers::ProviderConnector;

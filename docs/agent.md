@@ -1,37 +1,42 @@
 # Agent API
 
-`bone-agent` 对宿主只提供一个运行中对象：`Agent`。它可克隆，所有副本都向同一个 Runtime Actor 发送输入或控制；Actor 内只有一个 Rust `Kernel` 写状态。
+`bone-core` 对宿主只提供一个运行中对象：`Agent`。它可克隆，所有副本都向同一个 Runtime Actor 发送输入或控制；Actor 内只有一个 Rust `Kernel` 写状态。
 
 ## 启动
 
-最小示例或不需要持久化的独立宿主可以使用 `Agent::start`：
+`bone-core` 只接受宿主提供的执行端口。最小示例或不需要持久化的独立宿主显式组合 `bone-adapters`：
 
 ```rust,ignore
-use bone_agent::{Agent, AgentLimits, ConfiguredModel};
-use bone_tools::ToolLimits;
+use std::sync::Arc;
+use bone_adapters::{ConfiguredModel, ModelAdapter, read_only_tools};
+use bone_adapters::tools::{ToolEnvironment, ToolLimits};
+use bone_core::{Agent, AgentLimits};
 
-let agent = Agent::start(
-    workspace,
+let environment = ToolEnvironment::with_limits(workspace, ToolLimits::default())?;
+let model = ModelAdapter::new(
     ConfiguredModel::new(coordinator_model, coordinator_options)?,
     ConfiguredModel::new(worker_model, worker_options)?,
+);
+let agent = Agent::with_ports(
+    Arc::new(model),
+    read_only_tools(&environment),
     AgentLimits::default(),
-    ToolLimits::default(),
 )?;
 ```
 
-`ConfiguredModel` 只做一件事：保证 `ModelOptions` 属于同一种 provider protocol。`Agent::start` 安装现有的 read、glob、grep 工具。它不读取保存的设置，不处理登录，也不持久化对话。BONE 产品路径由 `bone-app` 解析已保存配置、连接模型并装配历史与写工具，最终调用 `Agent::with_ports_and_background`；前端不直接构造 Agent。
+`ConfiguredModel` 保证 `ModelOptions` 属于同一种 provider protocol；`read_only_tools` 安装 read、glob、grep。Core 不读取工作区、保存设置或凭据，也不创建任何具体 adapter。BONE 产品路径由 `bone-app` 解析已保存配置、连接模型并装配历史与写工具，最终调用 `Agent::with_ports_and_background`；前端不直接构造 Agent。
 
 自定义宿主可以实现：
 
 ```rust,ignore
-use bone_agent::{Agent, AgentLimits, ModelPort, ToolPort};
+use bone_core::{Agent, AgentLimits, ModelPort, ToolPort};
 
 let agent = Agent::with_ports(model_port, tool_ports, AgentLimits::default())?;
 ```
 
 `ModelPort` 有三个有类型的方法：`coordinate`、`work`、`compact`。`ToolPort::run` 执行一次注册工具调用。每个方法只代表一次 Call，不拥有私有工作队列或另一套 Agent 生命周期。
 
-`ModelAdapter` 和 `read_only_tools` 也从 crate 根导出。需要复用现成模型协议并加入宿主工具时，可以直接组合它们。新 Runtime 需要旧会话背景时使用 `with_ports_and_background`：
+`ModelAdapter` 和 `read_only_tools` 从 `bone-adapters` 根导出。需要复用现成模型协议并加入宿主工具时，可以直接组合它们。新 Runtime 需要旧会话背景时使用 `with_ports_and_background`：
 
 ```rust,ignore
 let background = BootstrapContext {
@@ -55,6 +60,18 @@ limits.validate()?;
 ```
 
 Runtime 启动时会再执行同一个 `validate`，非法配置不会进入 Kernel。
+
+## 模型行为契约
+
+`bone_core::model_contract` 为三种 `ModelPort` 调用分别生成一个
+`ModelCall<T>`。这个不可拆分的值绑定角色 instructions、序列化输入、唯一
+submission 名称与 JSON Schema，以及对应结果类型的严格 decoder。具体
+adapter 只能读取这些内容、调用 provider，再把不可信 arguments 交回
+`ModelCall::decode`；它不拥有或复制 Agent prompt。
+
+Prompt 负责行为引导，Schema 和 exact decode 负责结构合法性，Kernel
+负责所有权、权限与状态迁移的最终语义校验。Provider 是否截断、返回多少个
+submission call，以及网络错误如何转换，仍属于 `bone-adapters` 的传输边界。
 
 ## 输入
 

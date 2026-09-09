@@ -1,0 +1,18 @@
+[package]
+name = "bone-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Trusted agent kernel, domain model, and asynchronous runtime"
+readme = "README.md"
+publish = false
+
+[dependencies]
+futures-util.workspace = true
+serde = { workspace = true, features = ["rc"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

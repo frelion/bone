@@ -6,11 +6,11 @@ use std::{
     time::Duration,
 };
 
-use bone_agent::{
+use bone_adapters::llm::EndpointConfig;
+use bone_core::{
     Assignment, CallContext, CallError, CheckpointDraft, CompactInput, Completion, CoordinateInput,
     JobChange, JobSpec, KernelDecision, ModelPort, PortFuture, WorkInput, WorkProposal, WorkStep,
 };
-use bone_llm::EndpointConfig;
 use tokio::sync::Notify;
 
 use crate::*;

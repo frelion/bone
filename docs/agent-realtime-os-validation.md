@@ -1,5 +1,7 @@
 # bone-agent 场景验证
 
+> **历史验证记录（2026-09-08）。** 本文中的 `bone-agent` 包名、命令和测试数量描述当时的实现，不是当前 `bone-core` 验收入口；当前命令见 [bone-core handoff](bone-core-handoff.md)。
+
 范围是进程内 bone-agent。下面区分已有自动化回归、示例入口、实现边界与延期能力；32 个场景不是 32 项已完成的端到端认证。后来落地的 headless bone-app 及整个 workspace 构建不在这份 Agent 验收结论中。
 
 ## 自动化验收入口

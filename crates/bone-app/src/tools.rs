@@ -1,10 +1,13 @@
 use std::{collections::VecDeque, sync::Arc};
 
-use bone_agent::{
-    BackgroundEntry, BootstrapContext, CallContext, CallError, ExternalEffect, PortFuture,
-    ToolEffect, ToolOutcome, ToolPort, ToolSpec, read_only_tools,
+use bone_adapters::{
+    read_only_tools,
+    tools::{BashOutput, Tool, ToolEnvironment, ToolFailureKind},
 };
-use bone_tools::{BashOutput, Tool, ToolEnvironment, ToolFailureKind};
+use bone_core::{
+    BackgroundEntry, BootstrapContext, CallContext, CallError, ExternalEffect, PortFuture,
+    ToolEffect, ToolOutcome, ToolPort, ToolSpec,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, watch};
@@ -89,7 +92,7 @@ pub(crate) struct ToolContext {
 pub(crate) fn assemble(
     config: &RuntimeConfig,
     context: ToolContext,
-) -> Result<Vec<Arc<dyn ToolPort>>, bone_tools::ToolError> {
+) -> Result<Vec<Arc<dyn ToolPort>>, bone_adapters::tools::ToolError> {
     let environment = ToolEnvironment::with_limits(&config.workspace, config.tools.limits.clone())?;
     let mut tools = read_only_tools(&environment);
     tools.push(Arc::new(SessionHistory {

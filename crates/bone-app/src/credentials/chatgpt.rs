@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
 };
 
-use bone_llm::service::chatgpt_subscription::ChatGptAuthCache;
+use bone_adapters::llm::service::chatgpt_subscription::ChatGptAuthCache;
 use fs2::FileExt;
 use tempfile::NamedTempFile;
 use thiserror::Error;

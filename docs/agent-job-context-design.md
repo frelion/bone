@@ -1,6 +1,6 @@
 # Job 与上下文：一个工作单元，两种信息视图
 
-状态：2026-09-08，核心设计已落入 `bone-agent`。本文记录当前架构及仍需用真实模型评估的效果假设；可执行行为以 [Agent API](agent.md)和源码为准。
+状态：2026-09-08，核心设计已落入 `bone-core`。本文记录当前架构及仍需用真实模型评估的效果假设；可执行行为以 [Agent API](agent.md)和源码为准。
 
 具体类型、所有权、函数边界和实现顺序见[代码实现设计](agent-job-context-implementation.md)。实现可以重写旧结构，不承担旧 API 兼容要求。
 
@@ -193,7 +193,7 @@ inbox、近期记录与选中证据是同一记录的不同入口，构造器按
 
 如果保留 provider 原生 replay，只保存模型真实返回的消息，并为实际的 `submit_work` 调用配对 Kernel 对提案的处理回执。业务工具藏在 proposal 的 step 内；它不是模型直接发出的原生工具调用，不能伪造成某个 provider tool_call 的返回值。
 
-`bone-llm` 已有带来源限制的 replay/tool-result 类型，按其真实协议使用。跨模型或从完成工作建立新上下文时，优先使用可迁移的 checkpoint、外部材料与来源引用；不复制不兼容的 provider 私有状态。不得把同一笔工具结果同时完整放进历史、results 和材料三处。
+`bone_adapters::llm` 已有带来源限制的 replay/tool-result 类型，按其真实协议使用。跨模型或从完成工作建立新上下文时，优先使用可迁移的 checkpoint、外部材料与来源引用；不复制不兼容的 provider 私有状态。不得把同一笔工具结果同时完整放进历史、results 和材料三处。
 
 ### 7.3 最少的版本规则
 
@@ -305,4 +305,4 @@ Cancelled/Failed 后若外部写结果后来被确证，更新 Call 的真实事
 - [Kimi CLI 的 Agent 协议，固定提交 86f1364](https://github.com/MoonshotAI/kimi-cli/blob/86f136422a0aae6b217ea49e7ea1d2e8a1defcd2/src/kimi_cli/tools/agent/description.md)：优先向已有背景的实例继续提问。本设计将终态后的继续表达为复用记忆的新工作。
 - [Anthropic 上下文工程](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)：局部压缩、工作笔记、上下文隔离和按需读取相互补充。本设计分别处理 Worker 恢复记忆与面向协调者的报告。
 
-以上是设计参考，不代表这些产品采用 BONE 的 Job 协议。当前实现可从 [ports.rs](../crates/bone-agent/src/ports.rs)、[context.rs](../crates/bone-agent/src/context.rs)、[kernel](../crates/bone-agent/src/kernel/mod.rs)和 [model.rs](../crates/bone-agent/src/model.rs)核对。
+以上是设计参考，不代表这些产品采用 BONE 的 Job 协议。当前实现可从 [ports.rs](../crates/bone-core/src/ports.rs)、[context.rs](../crates/bone-core/src/context.rs)、[kernel](../crates/bone-core/src/kernel/mod.rs)和 [model_contract.rs](../crates/bone-core/src/model_contract.rs)核对。

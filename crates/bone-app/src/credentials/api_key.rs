@@ -121,7 +121,7 @@ fn credential_account(profile: &Profile) -> Result<String, ApiKeyCredentialError
 mod tests {
     use std::sync::Once;
 
-    use bone_llm::EndpointConfig;
+    use bone_adapters::llm::EndpointConfig;
 
     use super::{ApiKey, ApiKeyCredentialError, ApiKeyCredentials, Profile};
 

@@ -2,14 +2,17 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use bone_agent::{
-    CallContext, CallError, CheckpointDraft, CompactInput, ConfiguredModel, CoordinateInput,
-    KernelDecision, ModelAdapter, ModelPort, PortFuture, WorkInput, WorkProposal,
+use bone_adapters::{
+    ConfiguredModel, ModelAdapter,
+    llm::{
+        Endpoint, EndpointConfig,
+        protocol::{anthropic_messages, openai_chat_completions, openai_responses},
+        service::chatgpt_subscription::{self, DeviceCodePrompt},
+    },
 };
-use bone_llm::{
-    Endpoint, EndpointConfig,
-    protocol::{anthropic_messages, openai_chat_completions, openai_responses},
-    service::chatgpt_subscription::{self, DeviceCodePrompt},
+use bone_core::{
+    CallContext, CallError, CheckpointDraft, CompactInput, CoordinateInput, KernelDecision,
+    ModelPort, PortFuture, WorkInput, WorkProposal,
 };
 use tokio::sync::{Mutex, RwLock};
 
@@ -431,8 +434,8 @@ fn chatgpt_error(error: CredentialError) -> ProviderConnectError {
 mod tests {
     use std::{future::Future, task::Poll};
 
-    use bone_llm::Protocol;
-    use bone_llm::service::chatgpt_subscription::ChatGptAuthCache;
+    use bone_adapters::llm::Protocol;
+    use bone_adapters::llm::service::chatgpt_subscription::ChatGptAuthCache;
 
     use super::*;
 
@@ -562,7 +565,7 @@ mod tests {
         let runtime = RuntimeConfig {
             coordinator: resolved.clone(),
             worker: resolved,
-            limits: bone_agent::AgentLimits::default(),
+            limits: bone_core::AgentLimits::default(),
             tools: crate::config::ToolSettings::default(),
             workspace: directory.path().to_path_buf(),
         };

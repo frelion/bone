@@ -1,12 +1,12 @@
 # Model API
 
-> The `bone-llm` contract and examples remain current. Product assembly notes
+> The `bone_adapters::llm` contract and examples remain current. Product assembly notes
 > from the former TUI application are superseded by the
 > [headless App architecture](bone-app-design.md).
 
-`bone-llm` is BONE's provider-independent model library. Provider clients and
-wire DTOs are implementation details; callers use BONE types from request
-construction through response replay.
+`bone_adapters::llm` is BONE's provider-independent model module. Provider
+clients and wire DTOs are implementation details; callers use BONE types from
+request construction through response replay.
 
 ```text
 Protocol                 Endpoint                  Model
@@ -20,7 +20,7 @@ Request ───────────────► complete ────�
 There is one model selection path and two execution modes:
 
 ```rust,no_run
-use bone_llm::{InputItem, InputSource, Request, protocol::openai_responses};
+use bone_adapters::llm::{InputItem, InputSource, Request, protocol::openai_responses};
 
 # async fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = openai_responses::official("openai-primary", api_key)?;
@@ -69,7 +69,7 @@ response is assistant history. Another agent's output is named external input,
 not assistant history:
 
 ```rust
-use bone_llm::{InputItem, InputSource};
+use bone_adapters::llm::{InputItem, InputSource};
 
 let human = InputItem::external(InputSource::User, "Please review this.");
 let researcher = InputItem::external(
@@ -86,9 +86,9 @@ Never reconstruct assistant history from display text or response IDs. The
 response owns the exact replayable state:
 
 ```rust,no_run
-use bone_llm::{InputItem, InputSource, Model, Request};
+use bone_adapters::llm::{InputItem, InputSource, Model, Request};
 
-# async fn example(model: Model) -> Result<(), bone_llm::Error> {
+# async fn example(model: Model) -> Result<(), bone_adapters::llm::Error> {
 let user = InputItem::external(InputSource::User, "Remember the number 7.");
 let first = model.complete(Request::new([user.clone()])).await?;
 let assistant = first
@@ -124,7 +124,7 @@ external input.
 Definitions and results are BONE types:
 
 ```rust,no_run
-use bone_llm::{
+use bone_adapters::llm::{
     InputItem, InputSource, Request, ToolChoice, ToolDefinition, ToolOutput,
 };
 
@@ -149,7 +149,7 @@ let request = Request::new([InputItem::external(
 # fn next_request(
 #     original_user: InputItem,
 #     assistant: InputItem,
-#     call: &bone_llm::ToolCall,
+#     call: &bone_adapters::llm::ToolCall,
 # ) -> Request {
 Request::new([
     original_user,
@@ -162,11 +162,11 @@ Request::new([
 # }
 ```
 
-These are model-protocol values, not an execution framework. `bone-llm` never
-registers or runs a tool. `bone-agent` adapts built-in tools to its `ToolPort`
-and uses these values to advertise tools, dispatch calls, and return results;
-`bone-tools` owns the native `Tool` interface and built-in implementations.
-Provider and Rig tool types do not cross the `bone-llm` boundary.
+These are model-protocol values, not an execution framework. The
+`bone_adapters::llm` module never registers or runs a tool. The sibling
+`bone_adapters::tools` module owns the native `Tool` interface and built-in
+implementations, while the crate's Core adapter maps them to `ToolPort`.
+Provider and Rig tool types do not cross the `bone-adapters` boundary.
 
 `InputItem::tool_result` accepts the complete `ToolCall`, not a loose string
 ID, so protocol-specific correlation data cannot be accidentally discarded.
@@ -180,10 +180,10 @@ never executes a tool call with reused identity.
 Streaming exposes display deltas and one canonical terminal response:
 
 ```rust,no_run
-use bone_llm::{InputItem, InputSource, Model, Request, StreamEvent};
+use bone_adapters::llm::{InputItem, InputSource, Model, Request, StreamEvent};
 use futures_util::StreamExt;
 
-# async fn example(model: Model) -> Result<(), bone_llm::Error> {
+# async fn example(model: Model) -> Result<(), bone_adapters::llm::Error> {
 let mut stream = model
     .stream(Request::new([InputItem::external(
         InputSource::User,
@@ -228,7 +228,7 @@ Portable controls stay on `Request`:
 Protocol-only controls live in that protocol's typed `Options`:
 
 ```rust
-use bone_llm::{Request, protocol::openai_responses};
+use bone_adapters::llm::{Request, protocol::openai_responses};
 
 # fn configure(request: Request) -> Request {
 request.options(
@@ -273,7 +273,7 @@ Compatible base URLs must be absolute HTTP(S) URLs without embedded
 credentials or query strings. Authentication and routing configuration are
 injected while constructing the endpoint.
 
-`bone-llm` permits HTTP compatible URLs for controlled embedding and test
+`bone-adapters` permits HTTP compatible URLs for controlled embedding and test
 environments. The BONE App profile layer is stricter: it requires HTTPS before
 it will retrieve and send an API key.
 
@@ -283,15 +283,15 @@ acquired by the product composition root:
 ```rust,ignore
 let credentials = ChatGptCredentials::default_for_current_user()?;
 let auth = credentials.acquire()?;
-let endpoint = chatgpt_subscription::connect("bone-agent", auth, show_device_code).await?;
+let endpoint = chatgpt_subscription::connect("bone-app", auth, show_device_code).await?;
 ```
 
 The lease holds an exclusive, verified `auth.json` path for Rig's OAuth cache.
 Rig remains the sole owner of that file's JSON schema and token refresh
-lifecycle. `bone-llm` never discovers a credential root, reads OAuth bytes, or
+lifecycle. `bone-adapters` never discovers a credential root, reads OAuth bytes, or
 deletes the file. The resulting `Endpoint` and every selected `Model` retain
 the capability. The caller decides how to share or serialize an acquired
-lease; `bone-llm` never discovers or manages the credential location itself.
+lease; `bone-adapters` never discovers or manages the credential location itself.
 
 The backend does not honor `max_output_tokens` or structured-output schemas,
 so BONE rejects those options locally instead of pretending they were applied.
@@ -300,5 +300,5 @@ so BONE rejects those options locally instead of pretending they were applied.
 typed User/Workspace/Session settings into a non-secret `RuntimeConfig`,
 acquires provider credentials, builds a `ModelAdapter`, assembles tools and
 history background, then starts `Agent::with_ports_and_background`.
-`bone-agent` performs no storage or configuration read while the Runtime is
+`bone-core` performs no storage or configuration read while the Runtime is
 working. See the [App architecture](bone-app-design.md).

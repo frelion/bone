@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use bone_agent::{
+use bone_core::{
     Agent, AgentError, AgentView, CallError, CallKind, CallStatus, ControlOutcome, ExternalEffect,
     Input as AgentInput, InputId as AgentInputId, InputStatus as AgentInputStatus, JobId,
     JobStatus, Owner, Record, RecordBody, Seq, ToolOutcome, WaitView,
@@ -311,7 +311,7 @@ struct StartingRuntime {
 struct RuntimeReady {
     id: RuntimeId,
     config: RuntimeConfig,
-    result: Result<(Agent, bone_agent::Observation)>,
+    result: Result<(Agent, bone_core::Observation)>,
 }
 
 struct SessionTask {
@@ -634,7 +634,7 @@ impl SessionTask {
         target: CallRef,
         resolution: WriteResolution,
     ) -> Result<CommandReceipt> {
-        if resolution.external_effect == bone_agent::ExternalEffect::Unknown {
+        if resolution.external_effect == bone_core::ExternalEffect::Unknown {
             return Err(Error::InvalidState(
                 "a write resolution must decide whether the effect occurred".into(),
             ));
@@ -667,7 +667,7 @@ impl SessionTask {
             runtime
                 .agent
                 .resolve_write(
-                    bone_agent::CallId(target.id),
+                    bone_core::CallId(target.id),
                     host_resolution_outcome(external_effect),
                 )
                 .await
@@ -777,7 +777,7 @@ impl SessionTask {
                 self.refresh_runtime().await?;
                 Ok(true)
             }
-            Err(AgentError::Admission(bone_agent::AdmissionError::Busy)) => {
+            Err(AgentError::Admission(bone_core::AdmissionError::Busy)) => {
                 let (queued, _) = self.store.update_input(
                     self.info.id,
                     id,
@@ -989,7 +989,7 @@ impl SessionTask {
         &self,
         config: &RuntimeConfig,
         runtime: RuntimeId,
-    ) -> Result<Vec<Arc<dyn bone_agent::ToolPort>>> {
+    ) -> Result<Vec<Arc<dyn bone_core::ToolPort>>> {
         let commands = self.command_tx.clone();
         let notify = Arc::new(move |call| {
             if let Some(commands) = commands.upgrade() {
@@ -1199,7 +1199,7 @@ impl SessionTask {
         if unresolved {
             runtime
                 .agent
-                .resolve_write(bone_agent::CallId(call.id), outcome)
+                .resolve_write(bone_core::CallId(call.id), outcome)
                 .await
                 .map_err(agent_error)?;
         }

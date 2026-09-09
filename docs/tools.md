@@ -4,19 +4,19 @@
 > the removed TUI, `AgentHost`, and old settings types are superseded by the
 > [headless App architecture](bone-app-design.md).
 
-`bone-tools` contains BONE's provider-independent, workspace-local tool
+`bone-adapters` contains BONE's provider-independent, workspace-local tool
 implementations. Ownership stays explicit:
 
-- `bone-llm` owns the model-facing tool definition, call, output, and replay
-  protocol.
-- `bone-tools` owns the typed native `Tool` interface and its filesystem and
-  process implementations.
-- `bone-agent` owns asynchronous job execution through `ToolPort`.
+- `bone_adapters::llm` owns the model-facing tool definition, call, output, and
+  replay protocol.
+- `bone_adapters::tools` owns the typed native `Tool` interface and its
+  filesystem and process implementations.
+- `bone-core` owns asynchronous job execution through `ToolPort`.
 - `bone-app` resolves persisted `ToolSettings` into an immutable
   `RuntimeConfig` before starting an Agent.
 
-Rig is confined to `bone-llm`. Tools do not read BONE settings, SQLite, OAuth
-paths, or credential data themselves.
+Rig is confined to `bone_adapters::llm`. Native tools do not read BONE
+settings, SQLite, OAuth paths, or credential data themselves.
 
 The first tool set is deliberately small:
 
@@ -35,8 +35,8 @@ The first tool set is deliberately small:
 There is no model-facing configuration tool. Frontends change settings through
 the App API, and OAuth data is never exposed to the model.
 
-Every built-in implements `bone_tools::Tool`. `bone-agent` exposes the
-read-only `ToolPort` adapters; `bone-app` adds `session_history` and, when
+Every built-in implements `bone_adapters::tools::Tool`. `bone-adapters` exposes
+the read-only `ToolPort` adapters; `bone-app` adds `session_history` and, when
 enabled, its write-tracked `apply_patch` and `bash` adapters.
 
 `session_history` takes an `after` cursor and scans one durable Session journal
@@ -54,9 +54,9 @@ The local coding tools capture an immutable workspace root and immutable hard
 limits:
 
 ```rust,no_run
-use bone_tools::ToolEnvironment;
+use bone_adapters::tools::ToolEnvironment;
 
-# fn example() -> Result<(), bone_tools::ToolError> {
+# fn example() -> Result<(), bone_adapters::tools::ToolError> {
 let tools = ToolEnvironment::new("/workspace/project")?;
 let read = tools.read();
 let glob = tools.glob();
@@ -70,16 +70,16 @@ let bash = tools.bash();
 
 Native tool calls must run inside an active Tokio runtime. The BONE `Tool`
 interface does not make filesystem/process implementations executor-agnostic:
-`bone-agent` schedules calls and sends cooperative cancellation, while each
+`bone-core` schedules calls and sends cooperative cancellation, while each
 implementation may enforce a domain-specific deadline. The Agent soft reminder
 prompts reconsideration without declaring a tool failed. Bash uses a sanitized
 default child environment. A host that needs a fully explicit replacement can
 construct it separately:
 
 ```rust,no_run
-use bone_tools::{BashTool, ToolEnvironment};
+use bone_adapters::tools::{BashTool, ToolEnvironment};
 
-# fn example() -> Result<(), bone_tools::ToolError> {
+# fn example() -> Result<(), bone_adapters::tools::ToolError> {
 let tools = ToolEnvironment::new("/workspace/project")?;
 let bash = BashTool::with_process_environment(
     tools,
@@ -91,9 +91,9 @@ let bash = BashTool::with_process_environment(
 ```
 
 Tool registration, execution outcomes, timeouts, and scheduling belong to
-`bone-agent`; provider translation and opaque tool-call correlation remain in
-`bone-llm`; concrete behavior belongs to `bone-tools`. Approvals,
-authorization, sandboxing, and audit policy remain host responsibilities.
+`bone-core`; provider translation, opaque tool-call correlation, and concrete
+native behavior remain in `bone-adapters`. Approvals, authorization,
+sandboxing, and audit policy remain host responsibilities.
 
 ## Limits and runtime lifecycle
 

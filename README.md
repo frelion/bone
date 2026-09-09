@@ -1,8 +1,8 @@
 # BONE
 
 BONE is a Rust workspace for building coding agents. The current product layer
-is headless: `bone-app` assembles models, tools, persistence, and `bone-agent`
-behind a frontend-neutral Rust API.
+is headless: `bone-app` assembles the trusted `bone-core`, concrete
+`bone-adapters`, and persistence behind a frontend-neutral Rust API.
 
 The previous terminal UI and `bone` CLI have been removed. A new TUI can be
 built as a separate frontend crate over the same `App` and `Session` API used
@@ -14,18 +14,24 @@ by future desktop, web, or automation clients.
 future frontends
       │
       ▼
-  bone-app ───────► bone-agent
-      ├───────────► bone-llm
-      ├───────────► bone-tools
-      └───────────► private storage/ (SQLite, journals, leases)
+  bone-app ─────────► bone-core
+      │                  ▲
+      ├──► bone-adapters ┘
+      └──► private storage/ (SQLite, journals, leases)
 ```
 
 - `bone-app` owns configuration, profiles and credentials, durable workspaces
   and sessions, Agent assembly, write-effect tracking, and runtime lifecycle.
-- `bone-agent` owns input routing, Job state, scoped context, model/tool calls,
-  control, and structured records.
-- `bone-llm` owns provider-independent model requests and wire adapters.
-- `bone-tools` owns workspace-local read, search, patch, and process tools.
+- `bone-core` owns input routing, Job state, scoped context, model/tool ports,
+  model behavior contracts, control, and structured records.
+- `bone-adapters` owns provider-independent LLM requests and wire adapters,
+  workspace-local read/search/patch/process tools, and the concrete adapters
+  that implement Core's ports.
+
+The dependency direction is deliberate: `bone-adapters` depends on
+`bone-core`; Core never depends on concrete providers or native tools. Models
+and tools share an infrastructure crate, but retain the distinct `ModelPort`
+and `ToolPort` roles inside the Agent runtime.
 
 The former `bone-store` crate now lives in `bone-app`'s private `storage/`
 module. Frontends see product objects and errors rather than documents,

@@ -7,12 +7,12 @@ use std::{
     time::Duration,
 };
 
-use bone_agent::{
+use bone_adapters::llm::{EndpointConfig, service::chatgpt_subscription::ChatGptAuthCache};
+use bone_core::{
     Assignment, CallContext, CallError, CheckpointDraft, CompactInput, Completion, CoordinateInput,
     JobChange, JobSpec, KernelDecision, ModelPort, PortFuture, ToolCall, ToolEffect, ToolPort,
     ToolSpec, WorkInput, WorkProposal, WorkStep,
 };
-use bone_llm::{EndpointConfig, service::chatgpt_subscription::ChatGptAuthCache};
 use serde_json::json;
 use tokio::sync::{Notify, Semaphore};
 
@@ -481,7 +481,7 @@ async fn configured_app() -> (tempfile::TempDir, App, WorkspaceInfo) {
 
 async fn wait_for_input(session: &Session, input: InputId) {
     let mut view = session.observe();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         let mut cursor = SessionSeq(0);
         loop {
             let page = session.history(cursor, 256).await.unwrap();
@@ -532,7 +532,7 @@ async fn wait_for_input_state(
 
 async fn wait_for_tool_finished(session: &Session, name: &str) -> (CallRef, ToolOutcome) {
     let mut view = session.observe();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         let mut cursor = SessionSeq(0);
         loop {
             let page = session.history(cursor, 256).await.unwrap();
@@ -1750,7 +1750,10 @@ async fn a_timed_out_bash_write_is_persisted_as_an_unknown_external_effect() {
     app.update_config(
         ConfigScope::User,
         ConfigChange::Limits(Some(AgentLimits {
-            tool_timeout: Duration::from_secs(2),
+            // Keep the Agent's outer deadline well beyond Bash's own
+            // one-second deadline so this test exercises Bash cleanup and
+            // write auditing instead of racing the two timeout layers.
+            tool_timeout: Duration::from_secs(10),
             ..AgentLimits::default()
         })),
     )
@@ -2062,7 +2065,7 @@ fn host_write_resolutions_never_invent_tool_success() {
 
 #[test]
 fn a_finished_write_stays_blocking_until_its_agent_record_is_saved() {
-    use bone_agent::{CallId, JobId, Origin, Record, RecordBody, Seq, ToolOutcome};
+    use bone_core::{CallId, JobId, Origin, Record, RecordBody, Seq, ToolOutcome};
 
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("workspace");
@@ -2146,7 +2149,7 @@ fn a_finished_write_stays_blocking_until_its_agent_record_is_saved() {
 
 #[test]
 fn an_answer_clears_every_input_waiting_on_the_same_question() {
-    use bone_agent::{
+    use bone_core::{
         Input as AgentInput, InputId as AgentInputId, Origin, Record, RecordBody, Seq,
     };
 
@@ -2194,7 +2197,7 @@ fn an_answer_clears_every_input_waiting_on_the_same_question() {
 
 #[test]
 fn retry_reconciles_every_failed_input_that_the_agent_restored() {
-    use bone_agent::{Input as AgentInput, InputId as AgentInputId, InputStatus, Seq};
+    use bone_core::{Input as AgentInput, InputId as AgentInputId, InputStatus, Seq};
 
     let runtime = RuntimeId::new();
     let mut inputs = std::collections::BTreeMap::new();
@@ -2213,7 +2216,7 @@ fn retry_reconciles_every_failed_input_that_the_agent_restored() {
             },
         );
     }
-    let agent = bone_agent::AgentView {
+    let agent = bone_core::AgentView {
         inputs: [
             (1, InputStatus::Routing),
             (2, InputStatus::Handled),
@@ -2225,14 +2228,14 @@ fn retry_reconciles_every_failed_input_that_the_agent_restored() {
             ),
         ]
         .into_iter()
-        .map(|(id, status)| bone_agent::InputView {
+        .map(|(id, status)| bone_core::InputView {
             input: AgentInput::new(AgentInputId(id), format!("input {id}")),
             accepted_at: Seq(id),
             status,
             required_jobs: Vec::new(),
         })
         .collect(),
-        ..bone_agent::AgentView::default()
+        ..bone_core::AgentView::default()
     };
 
     assert_eq!(

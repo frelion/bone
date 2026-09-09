@@ -55,15 +55,15 @@ export OPENAI_API_KEY='...'
 export BONE_OPENAI_MODEL='...'
 # Optional:
 export OPENAI_BASE_URL='https://gateway.example/v1'
-cargo test -p bone-llm --test live_openai_responses -- --ignored --nocapture
+cargo test -p bone-adapters --test live_openai_responses -- --ignored --nocapture
 
 export OPENAI_API_KEY='...'
 export BONE_OPENAI_CHAT_MODEL='...'
-cargo test -p bone-llm --test live_openai_chat_completions -- --ignored --nocapture
+cargo test -p bone-adapters --test live_openai_chat_completions -- --ignored --nocapture
 
 export ANTHROPIC_API_KEY='...'
 export BONE_ANTHROPIC_MODEL='...'
-cargo test -p bone-llm --test live_anthropic_messages -- --ignored --nocapture
+cargo test -p bone-adapters --test live_anthropic_messages -- --ignored --nocapture
 
 ```
 

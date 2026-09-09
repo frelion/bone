@@ -1,9 +1,8 @@
 [workspace]
 members = [
     "crates/bone-app",
-    "crates/bone-agent",
-    "crates/bone-llm",
-    "crates/bone-tools",
+    "crates/bone-core",
+    "crates/bone-adapters",
 ]
 exclude = ["third_party/rig-core-0.42.0"]
 resolver = "3"

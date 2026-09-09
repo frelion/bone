@@ -1,0 +1,56 @@
+[package]
+name = "bone-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "LLM and native tool adapters for BONE"
+publish = false
+
+[features]
+test-utils = []
+
+[dependencies]
+bone-core = { path = "../bone-core" }
+futures-util.workspace = true
+globset.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+ignore.workspace = true
+rig-core = { workspace = true, features = ["reqwest", "rustls"] }
+reqwest.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "time"] }
+walkdir.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+http.workspace = true
+rig-core = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[[test]]
+name = "anthropic_messages_contract"
+required-features = ["test-utils"]
+
+[[test]]
+name = "chatgpt_subscription_contract"
+required-features = ["test-utils"]
+
+[[test]]
+name = "model_contract"
+required-features = ["test-utils"]
+
+[[test]]
+name = "openai_chat_completions_contract"
+required-features = ["test-utils"]
+
+[[test]]
+name = "openai_responses_contract"
+required-features = ["test-utils"]

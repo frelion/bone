@@ -6,8 +6,8 @@ use std::{
     },
 };
 
-use bone_agent::{ModelPort, ToolPort};
-use bone_llm::service::chatgpt_subscription::DeviceCodePrompt;
+use bone_adapters::llm::service::chatgpt_subscription::DeviceCodePrompt;
+use bone_core::{ModelPort, ToolPort};
 use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::{

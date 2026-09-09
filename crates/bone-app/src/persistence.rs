@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use bone_agent::{ExternalEffect, Record, ToolOutcome};
+use bone_core::{ExternalEffect, Record, ToolOutcome};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -562,7 +562,7 @@ impl DataStore {
                 input.state = state.clone();
                 transaction.replace(&document, &input, input_snapshot.revision)?;
             }
-            if let bone_agent::RecordBody::ToolFinished { call, outcome, .. } = &record.body
+            if let bone_core::RecordBody::ToolFinished { call, outcome, .. } = &record.body
                 && outcome.external_effect != ExternalEffect::Unknown
             {
                 let write_document = self.store.document::<WriteAttempt>(write_key(
@@ -1078,7 +1078,7 @@ pub(crate) enum AcceptError {
 }
 
 fn public_agent_event(runtime: RuntimeId, record: &Record) -> Option<SessionEvent> {
-    use bone_agent::RecordBody;
+    use bone_core::RecordBody;
     match &record.body {
         RecordBody::Reply { job, inputs, text } => Some(SessionEvent::Reply {
             job: crate::JobRef { runtime, id: job.0 },
@@ -1210,7 +1210,7 @@ mod tests {
 
     use super::*;
     use crate::{ModelSelection, ProfileId};
-    use bone_tools::BashOutput;
+    use bone_adapters::tools::BashOutput;
 
     fn selection(model: &str) -> ModelSelection {
         ModelSelection::new(ProfileId::new("test").unwrap(), model).unwrap()

@@ -1,6 +1,6 @@
-# bone-agent：双模型，一个内核
+# bone-core：双模型，一个内核
 
-状态：2026-09-09，核心重写与设计审阅问题已收口。本文范围是 bone-agent，没有旧 Agent API 兼容层；headless `bone-app` 已另行完成当前 Agent 的装配与持久化。本文件说明当前内核实现，取代此前“可选协调模型”草案。
+状态：2026-09-09，核心重写与设计审阅问题已收口。本文范围是 bone-core，没有旧 Agent API 兼容层；headless `bone-app` 已另行完成当前 Agent 的装配与持久化。本文件说明当前内核实现，取代此前“可选协调模型”草案。
 
 ## 1. 最终分工
 
@@ -60,4 +60,4 @@ Pause/Resume 的实际状态变更写入 JobControlChanged，便于增量观察�
 
 不实现跨重启续跑、共享浏览器或桌面租约、多租户治理、通用预算系统、分布式一致性、硬实时控制及任意资源的事务隔离。内存事件记录不代表持久恢复。
 
-当前 API、源码入口与运行示例见 [crate guide](../crates/bone-agent/README.md)；自动化场景和边界见[验证文档](agent-realtime-os-validation.md)。旧模型职责文档与历史认证只供追溯，不是当前实现规范。
+当前 API、源码入口与运行示例见 [crate guide](../crates/bone-core/README.md)；自动化场景和边界见[验证文档](agent-realtime-os-validation.md)。旧模型职责文档与历史认证只供追溯，不是当前实现规范。

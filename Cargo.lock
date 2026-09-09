@@ -246,28 +246,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "bone-agent"
+name = "bone-adapters"
 version = "0.1.0"
 dependencies = [
- "bone-llm",
- "bone-tools",
+ "bone-core",
  "bytes",
  "futures-util",
+ "globset",
+ "grep-regex",
+ "grep-searcher",
+ "http",
+ "ignore",
+ "reqwest",
  "rig-core",
+ "rustix",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "walkdir",
 ]
 
 [[package]]
 name = "bone-app"
 version = "0.1.0"
 dependencies = [
- "bone-agent",
- "bone-llm",
- "bone-tools",
+ "bone-adapters",
+ "bone-core",
  "fs2",
  "keyring",
  "libc",
@@ -283,36 +290,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "bone-llm"
+name = "bone-core"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "futures-util",
- "http",
- "reqwest",
- "rig-core",
- "schemars",
  "serde",
  "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "bone-tools"
-version = "0.1.0"
-dependencies = [
- "bone-llm",
- "globset",
- "grep-regex",
- "grep-searcher",
- "ignore",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
  "thiserror",
  "tokio",
- "walkdir",
 ]
 
 [[package]]

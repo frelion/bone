@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
-use bone_agent::AgentLimits;
-use bone_llm::{EndpointConfig, ModelOptions};
-use bone_tools::ToolLimits;
+use bone_adapters::{
+    llm::{EndpointConfig, ModelOptions},
+    tools::ToolLimits,
+};
+use bone_core::AgentLimits;
 use serde::{Deserialize, Serialize};
 
 use crate::{SessionId, WorkspaceId};

@@ -25,7 +25,7 @@
 | 写工具 | 具体的 Patch/Bash 适配器，加执行前后落盘；同一 Workspace 的写调用在 App 内串行 |
 | 扩展方式 | 具体模块和普通函数；沿用已有 `ModelPort`、`ToolPort` 扩展点 |
 
-App 不参与拆分 Job、调度 Worker、压缩 Job 上下文或判断 Job 能否提交。这些继续由 `bone-agent` 负责。
+App 不参与拆分 Job、调度 Worker、压缩 Job 上下文或判断 Job 能否提交。这些继续由 `bone-core` 负责。
 
 ## 2. Crate 与依赖
 
@@ -33,17 +33,15 @@ App 不参与拆分 Job、调度 Worker、压缩 Job 上下文或判断 Job 能�
 flowchart TB
     TUI[未来 bone-tui：终端交互与 bone 二进制] --> APP[bone-app：应用 API]
     OTHER[后续桌面 / Web / 自动化调用方] --> APP
-    APP --> AGENT[bone-agent：执行与状态内核]
-    APP --> LLM[bone-llm：模型连接与协议]
-    APP --> TOOLS[bone-tools：文件与命令执行]
+    APP --> CORE[bone-core：执行、状态与模型行为契约]
+    APP --> ADAPTERS[bone-adapters：模型连接、协议、文件与命令执行]
+    ADAPTERS --> CORE
     APP --> STORE[内部 storage 模块：SQLite]
-    AGENT --> LLM
-    AGENT --> TOOLS
 ```
 
 第一版只实现进程内 Rust API。以后需要 HTTP、SSE 或桌面 IPC 时，在 API 外加传输适配，不把网络路由、连接或终端事件传进 App。
 
-当前 workspace 尚无 `bone-tui` 或 `bone` 二进制。重建时，`bone-tui` 只依赖 `bone-app`，不直接依赖 `bone-agent` 或数据库；one-shot 入口也调用同一 App API。
+当前 workspace 尚无 `bone-tui` 或 `bone` 二进制。重建时，`bone-tui` 只依赖 `bone-app`，不直接依赖 `bone-core` 或数据库；one-shot 入口也调用同一 App API。
 
 原 `bone-store` 的 SQLite 连接、事务、journal、lease 和相关测试已经搬入私有 `bone_app::storage`，独立 crate 已从 workspace 删除。Agent、LLM、Tools 都不依赖 App 存储。
 
@@ -333,32 +331,32 @@ SessionTask 保存当前 Runtime 的 `agent_through`。收到 Agent 记录或 La
 struct Profile {
     id: ProfileId,
     label: String,
-    endpoint: bone_llm::EndpointConfig,
+    endpoint: bone_adapters::llm::EndpointConfig,
 }
 
 struct ModelSelection {
     profile: ProfileId,
     model: String,
-    options: Option<bone_llm::ModelOptions>,
+    options: Option<bone_adapters::llm::ModelOptions>,
 }
 
 struct RuntimeSettings {
     worker: Option<ModelSelection>,
     coordinator: Option<ModelSelection>,
-    limits: bone_agent::AgentLimits,
+    limits: bone_core::AgentLimits,
     tools: ToolSettings,
 }
 
 struct RuntimeOverrides {
     worker: Option<ModelSelection>,
     coordinator: Option<ModelSelection>,
-    limits: Option<bone_agent::AgentLimits>,
+    limits: Option<bone_core::AgentLimits>,
     tools: Option<ToolSettings>,
 }
 
 struct ToolSettings {
     mode: ToolMode,                 // ReadOnly / WorkspaceWrite
-    limits: bone_tools::ToolLimits,
+    limits: bone_adapters::tools::ToolLimits,
 }
 ```
 
@@ -415,13 +413,15 @@ SessionTask 在需要创建 Runtime 时执行一个普通的具体装配函数�
 
 首次启动的连接异步执行；完成结果回到 SessionTask 后再核对是否仍需要启动。配置变更则作为 Session mailbox 中的显式屏障串行处理。一个 Session 同时只有一次启动操作，多个排队输入共享它。
 
-`ModelAdapter` 和只读工具适配入口已经由 `bone-agent` 公开。App 直接组合它们，不复制 coordinate/work/compact 协议。
+`bone-adapters` 公开 `ModelAdapter` 和只读工具适配入口。模型的
+coordinate/work/compact prompt、submission schema 与严格解码由
+`bone-core::model_contract` 定义；App 只负责选择配置并组合两侧。
 
 ### 8.2 工具组成
 
 | 工具 | 效果分类 | 装配方式 |
 | --- | --- | --- |
-| read / glob / grep | ReadOnly | 复用 bone-tools 和已有适配器 |
+| read / glob / grep | ReadOnly | 复用 `bone-adapters` 的 native tools 和已有适配器 |
 | session_history | ReadOnly | 具体 App ToolPort，按 `after` 游标逐个持久化位置读取本 Session 历史 |
 | apply_patch | ExternalWrite | 具体 PatchPort，理解补丁执行及回滚结果 |
 | bash | ExternalWrite | 具体 BashPort，记录命令实际结束状态 |
@@ -464,7 +464,7 @@ struct WriteAttempt {
 
 `LoginAttempt` 是一个短期具体句柄，提供 `watch<LoginState>` 和 cancel。状态包括 Connecting、DeviceCode、Succeeded、Failed、Cancelled。DeviceCode 只放在这段临时状态中，不进入普通 Session 历史。
 
-运行时启动只使用已有授权，授权不可用时返回 LoginRequired。显式 login 才允许交互式 device flow；`bone-llm` 已提供只读缓存的非交互连接入口。
+运行时启动只使用已有授权，授权不可用时返回 LoginRequired。显式 login 才允许交互式 device flow；`bone_adapters::llm` 已提供只读缓存的非交互连接入口。
 
 API key 继续由系统 credential manager 保存。Profile 和 RuntimeConfig 不包含 key。每个新 Runtime 按当前 profile/key 构造 API-key endpoint。
 
@@ -604,9 +604,9 @@ crates/bone-app/src/
 
 | Crate | 已落地改动 |
 | --- | --- |
-| bone-agent | 公开 ModelAdapter/只读工具装配；BootstrapContext；控制回执；问题 Seq；shutdown final View |
+| bone-core | Agent/Kernel/Runtime、Ports、模型行为契约、BootstrapContext、控制回执、问题 Seq、shutdown final View |
 | App 内部 storage | 从 bone-store 内移；提供 journal 分页、tail、定位读取及明确的单条记录边界 |
-| bone-llm | ChatGPT 缓存非交互连接入口；显式登录保留 device flow |
+| bone-adapters | ModelAdapter、只读工具装配、ChatGPT 缓存非交互连接入口；显式登录保留 device flow |
 | bone-app | App/Session、配置、持久化、Provider、读写工具装配及未决写核查 |
 
 这些改动服务于实际装配，不重做 Agent 调度和上下文内核。
@@ -644,9 +644,9 @@ App 记录使用 `app` namespace。数据库只接受当前 schema，不设计�
 
 ## 14. 当前实现入口
 
-- [Agent 输入、控制和观察](../crates/bone-agent/src/runtime.rs)：公开 Agent 句柄、快照与 broadcast 的真实边界。
-- [Input / ModelPort / ToolPort](../crates/bone-agent/src/ports.rs)：当前输入为文本，端口支持取消和进度。
-- [Record 定义](../crates/bone-agent/src/context.rs)：Reply、Outcome、InputFinished 的不同语义。
+- [Agent 输入、控制和观察](../crates/bone-core/src/runtime.rs)：公开 Agent 句柄、快照与 broadcast 的真实边界。
+- [Input / ModelPort / ToolPort](../crates/bone-core/src/ports.rs)：当前输入为文本，端口支持取消和进度。
+- [Record 定义](../crates/bone-core/src/context.rs)：Reply、Outcome、InputFinished 的不同语义。
 - [App](../crates/bone-app/src/app.rs) 与 [Session](../crates/bone-app/src/session.rs)：公开应用入口、会话 actor 与 Agent 生命周期。
 - [公共 DTO](../crates/bone-app/src/api.rs) 与 [配置](../crates/bone-app/src/config.rs)：前端契约和 Runtime 解析。
 - [持久化](../crates/bone-app/src/persistence.rs) 与 [私有 storage](../crates/bone-app/src/storage/mod.rs)：业务记录、事务、journal、SQLite 和 lease。

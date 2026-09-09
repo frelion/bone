@@ -1,6 +1,6 @@
 use std::{fmt, path::PathBuf, sync::Arc};
 
-use bone_agent::{ExternalEffect, InputOutcome, OutcomeKind, ToolOutcome};
+use bone_core::{ExternalEffect, InputOutcome, OutcomeKind, ToolOutcome};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

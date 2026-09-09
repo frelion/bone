@@ -30,7 +30,7 @@ an error; the App never resets the database automatically. Records use the
 ## Profiles and credentials
 
 A `Profile` contains only a stable `ProfileId`, display label, and
-`bone_llm::EndpointConfig`. The built-in `chatgpt` profile uses the ChatGPT
+`bone_adapters::llm::EndpointConfig`. The built-in `chatgpt` profile uses the ChatGPT
 subscription protocol. Other profiles can select OpenAI Responses, OpenAI Chat
 Completions, or Anthropic Messages, with an optional validated HTTPS-compatible
 base URL.
@@ -79,7 +79,7 @@ Session override > Workspace override > User setting
 
 - Worker model selection;
 - optional Coordinator model selection;
-- `bone_agent::AgentLimits`;
+- `bone_core::AgentLimits`;
 - `ToolSettings` (`ReadOnly` or `WorkspaceWrite` plus `ToolLimits`).
 
 If no scope selects a Coordinator, it follows the resolved Worker. If no scope

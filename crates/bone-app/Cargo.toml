@@ -7,9 +7,8 @@ description = "Headless application, assembly, and durable sessions for BONE"
 publish = false
 
 [dependencies]
-bone-agent = { path = "../bone-agent" }
-bone-llm = { path = "../bone-llm" }
-bone-tools = { path = "../bone-tools" }
+bone-adapters = { path = "../bone-adapters" }
+bone-core = { path = "../bone-core" }
 fs2.workspace = true
 keyring.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
