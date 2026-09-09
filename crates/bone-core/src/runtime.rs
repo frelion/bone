@@ -76,23 +76,23 @@ impl Agent {
     }
 
     pub async fn retry(&self, input: InputId) -> Result<ControlOutcome, AgentError> {
-        self.control(ControlKind::Retry(input)).await
+        self.control(KernelControl::Retry(input)).await
     }
 
     pub async fn pause(&self, job: JobId) -> Result<ControlOutcome, AgentError> {
-        self.control(ControlKind::Pause(job)).await
+        self.control(KernelControl::Pause(job)).await
     }
 
     pub async fn resume(&self, job: JobId) -> Result<ControlOutcome, AgentError> {
-        self.control(ControlKind::Resume(job)).await
+        self.control(KernelControl::Resume(job)).await
     }
 
     pub async fn cancel(&self, job: JobId) -> Result<ControlOutcome, AgentError> {
-        self.control(ControlKind::Cancel(job)).await
+        self.control(KernelControl::Cancel(job)).await
     }
 
     pub async fn stop(&self) -> Result<ControlOutcome, AgentError> {
-        self.control(ControlKind::Stop).await
+        self.control(KernelControl::Stop).await
     }
 
     /// Pause scheduling without discarding the current job graph. Running
@@ -123,7 +123,7 @@ impl Agent {
         call: CallId,
         result: ToolOutcome,
     ) -> Result<ControlOutcome, AgentError> {
-        self.control(ControlKind::ResolveWrite { call, result })
+        self.control(KernelControl::ResolveWrite { call, result })
             .await
     }
 
@@ -182,7 +182,7 @@ impl Agent {
         }
     }
 
-    async fn control(&self, kind: ControlKind) -> Result<ControlOutcome, AgentError> {
+    async fn control(&self, kind: KernelControl) -> Result<ControlOutcome, AgentError> {
         let (reply, result) = oneshot::channel();
         self.controls
             .send(Control::Command { kind, reply })
@@ -258,7 +258,7 @@ struct InputCommand {
 
 enum Control {
     Command {
-        kind: ControlKind,
+        kind: KernelControl,
         reply: oneshot::Sender<Result<ControlOutcome, AgentError>>,
     },
     Reconfigure {
@@ -272,15 +272,6 @@ enum Control {
     ResumeScheduling(oneshot::Sender<Result<(), AgentError>>),
     Observe(oneshot::Sender<Observation>),
     Shutdown,
-}
-
-enum ControlKind {
-    Retry(InputId),
-    Pause(JobId),
-    Resume(JobId),
-    Cancel(JobId),
-    Stop,
-    ResolveWrite { call: CallId, result: ToolOutcome },
 }
 
 struct RunningCall {
@@ -406,17 +397,7 @@ impl Actor {
                 }
             },
             Control::Command { kind, reply } => {
-                let command = match kind {
-                    ControlKind::Retry(input) => KernelControl::Retry(input),
-                    ControlKind::Pause(job) => KernelControl::Pause(job),
-                    ControlKind::Resume(job) => KernelControl::Resume(job),
-                    ControlKind::Cancel(job) => KernelControl::Cancel(job),
-                    ControlKind::Stop => KernelControl::Stop,
-                    ControlKind::ResolveWrite { call, result } => {
-                        KernelControl::ResolveWrite { call, result }
-                    }
-                };
-                let (outcome, effects) = self.kernel.control(self.now(), command);
+                let (outcome, effects) = self.kernel.control(self.now(), kind);
                 self.dispatch(effects);
                 let _ = reply.send(Ok(outcome));
             }

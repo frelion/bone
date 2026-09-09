@@ -278,6 +278,7 @@ dependencies = [
  "fs2",
  "keyring",
  "libc",
+ "rig-core",
  "rusqlite",
  "rustix",
  "serde",

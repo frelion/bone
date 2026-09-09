@@ -87,7 +87,7 @@ impl Kernel {
             return Err("work note is empty".into());
         }
         if let Some(note) = &proposal.note {
-            self.validate_model_text("work note", note)?;
+            self.validate_model_item("work note", note)?;
         }
         if let Some(report) = &proposal.report {
             self.validate_report(job, report)?;
@@ -106,7 +106,7 @@ impl Kernel {
             if let InquiryResponse::NeedsWork(reason) | InquiryResponse::Unavailable(reason) =
                 &answer.response
             {
-                self.validate_model_text("inquiry answer", reason)?;
+                self.validate_model_item("inquiry answer", reason)?;
             }
             if let Some(inquiry) = self.inquiries.get(&answer.inquiry)
                 && inquiry.target != job
@@ -144,7 +144,7 @@ impl Kernel {
                 {
                     return Err("only a user-owned job may ask a non-empty user question".into());
                 }
-                self.validate_model_text("user question", question)?;
+                self.validate_model_item("user question", question)?;
                 Ok(())
             }
             WorkStep::Inquire {
@@ -154,18 +154,17 @@ impl Kernel {
                 if question.trim().is_empty()
                     || *target == job
                     || !self.can_access_job(job, *target)
-                    || self.would_cycle(job, *target)
                 {
                     return Err("invalid job inquiry".into());
                 }
-                self.validate_model_text("job inquiry", question)?;
+                self.validate_model_item("job inquiry", question)?;
                 Ok(())
             }
             WorkStep::Coordinate(request) => {
                 if request.trim().is_empty() {
                     Err("coordination request cannot be empty".into())
                 } else {
-                    self.validate_model_text("coordination request", request)
+                    self.validate_model_item("coordination request", request)
                 }
             }
             WorkStep::Read(query) => self.validate_read(DeliveryTarget::Job(job), query),
@@ -174,7 +173,7 @@ impl Kernel {
                 if text.trim().is_empty() || !matches!(self.jobs[&job].owner, Owner::User) {
                     Err("only a user-owned job may send a non-empty reply".into())
                 } else {
-                    self.validate_model_text("reply", text)
+                    self.validate_model_item("reply", text)
                 }
             }
             WorkStep::Finish(completion) | WorkStep::Fail(completion) => {
@@ -184,43 +183,46 @@ impl Kernel {
     }
 
     fn validate_report(&self, job: JobId, report: &ReportDraft) -> Result<(), String> {
-        if report.summary.trim().is_empty() {
-            return Err("report summary is empty".into());
-        }
-        self.validate_model_item("report", report)?;
-        if report
-            .evidence
-            .iter()
-            .all(|seq| self.can_read_record(job, *seq))
-        {
-            Ok(())
-        } else {
-            Err("report cites inaccessible evidence".into())
-        }
+        self.validate_artifact(job, "report", &report.summary, &report.evidence, report)
     }
 
     fn validate_completion(&self, job: JobId, completion: &Completion) -> Result<(), String> {
-        if completion.summary.trim().is_empty() {
-            return Err("completion summary is empty".into());
+        self.validate_artifact(
+            job,
+            "completion",
+            &completion.summary,
+            &completion.evidence,
+            completion,
+        )
+    }
+
+    fn validate_artifact<T: serde::Serialize + ?Sized>(
+        &self,
+        job: JobId,
+        name: &str,
+        summary: &str,
+        evidence: &[Seq],
+        artifact: &T,
+    ) -> Result<(), String> {
+        if summary.trim().is_empty() {
+            return Err(format!("{name} summary is empty"));
         }
-        self.validate_model_item("completion", completion)?;
-        if completion
-            .evidence
-            .iter()
-            .all(|seq| self.can_read_record(job, *seq))
-        {
+        self.validate_model_item(name, artifact)?;
+        if evidence.iter().all(|seq| self.can_read_record(job, *seq)) {
             Ok(())
         } else {
-            Err("completion cites inaccessible evidence".into())
+            Err(format!("{name} cites inaccessible evidence"))
         }
     }
 
     fn validate_wait(&self, job: JobId, wait: &Await) -> Result<(), String> {
         match wait {
             Await::Tool(call) => {
-                if self.calls.get(call).is_some_and(|entry| {
-                    entry.kind() == CallKind::Tool && entry.job() == Some(job) && entry.running()
-                }) {
+                if self
+                    .calls
+                    .get(call)
+                    .is_some_and(|entry| entry.kind() == CallKind::Tool && entry.job() == Some(job))
+                {
                     Ok(())
                 } else {
                     Err("job cannot wait for that tool call".into())
@@ -228,10 +230,10 @@ impl Kernel {
             }
             Await::After(_) => Ok(()),
             Await::Job(target) | Await::Result { job: target, .. } => {
-                if *target != job
-                    && self.can_access_job(job, *target)
-                    && !self.would_cycle(job, *target)
-                {
+                // Workers can depend only on strict descendants. Every such
+                // edge increases ownership depth, so a dependency cycle cannot
+                // be formed.
+                if *target != job && self.can_access_job(job, *target) {
                     Ok(())
                 } else {
                     Err("invalid job dependency".into())
@@ -449,7 +451,13 @@ impl Kernel {
 
     fn install_wait(&mut self, now: MonoTime, job: JobId, wait: Await, effects: &mut Vec<Effect>) {
         let state = match wait {
-            Await::Tool(call) => WaitState::Tool(call),
+            Await::Tool(call) => {
+                if !self.calls[&call].running() {
+                    self.make_ready(job);
+                    return;
+                }
+                WaitState::Tool(call)
+            }
             Await::After(duration) => {
                 if duration.is_zero() {
                     self.make_ready(job);

@@ -22,6 +22,8 @@ tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thr
 uuid.workspace = true
 
 [dev-dependencies]
+bone-adapters = { path = "../bone-adapters", features = ["test-utils"] }
+rig-core = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]

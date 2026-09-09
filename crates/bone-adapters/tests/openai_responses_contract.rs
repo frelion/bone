@@ -3,9 +3,9 @@ mod support;
 use std::error::Error as _;
 
 use bone_adapters::llm::{
-    ErrorKind, FinishReason, InputItem, InputSource, OutputItem, Protocol, Request, StreamEvent,
-    ToolChoice, ToolDefinition, ToolOutput,
-    protocol::openai_responses::{Options, Reasoning, ReasoningEffort, ReasoningSummary},
+    ErrorKind, FinishReason, InputItem, InputSource, ModelOptions, OutputItem, Protocol, Request,
+    StreamEvent, ToolChoice, ToolDefinition, ToolOutput,
+    protocol::openai_responses::{Reasoning, ReasoningEffort, ReasoningSummary},
     testing::openai_responses_endpoint,
 };
 use futures_util::StreamExt;
@@ -205,13 +205,11 @@ async fn sends_reasoning_controls_and_replays_encrypted_state_opaquely() {
         .complete(
             Request::new([user("reason about this")])
                 .max_output_tokens(64)
-                .options(
-                    Options::new().reasoning(
-                        Reasoning::new()
-                            .effort(ReasoningEffort::Low)
-                            .summary(ReasoningSummary::Auto),
-                    ),
-                ),
+                .options(ModelOptions::OpenAiResponses {
+                    reasoning: Reasoning::new()
+                        .effort(ReasoningEffort::Low)
+                        .summary(ReasoningSummary::Auto),
+                }),
         )
         .await
         .expect("reasoning fixture should parse");

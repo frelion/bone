@@ -1,9 +1,9 @@
 use std::{env, error::Error, io};
 
 use bone_adapters::llm::{
-    InputItem, InputSource, Request, Response, StreamEvent, ToolCallDelta, ToolChoice,
-    ToolDefinition,
-    protocol::openai_responses::{self, Options, Reasoning, ReasoningEffort, ReasoningSummary},
+    InputItem, InputSource, ModelOptions, Request, Response, StreamEvent, ToolCallDelta,
+    ToolChoice, ToolDefinition,
+    protocol::openai_responses::{self, Reasoning, ReasoningEffort, ReasoningSummary},
 };
 use futures_util::StreamExt;
 use serde_json::json;
@@ -34,13 +34,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut request = Request::new([InputItem::external(InputSource::User, mode.prompt())])
         .instructions("This is a protocol-boundary probe. Follow the user request exactly.")
         .max_output_tokens(1_024)
-        .options(
-            Options::new().reasoning(
-                Reasoning::new()
-                    .effort(ReasoningEffort::Low)
-                    .summary(ReasoningSummary::Auto),
-            ),
-        );
+        .options(ModelOptions::OpenAiResponses {
+            reasoning: Reasoning::new()
+                .effort(ReasoningEffort::Low)
+                .summary(ReasoningSummary::Auto),
+        });
 
     if matches!(mode, Mode::Tool) {
         request = request

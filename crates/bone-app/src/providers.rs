@@ -29,6 +29,8 @@ use crate::{
 pub(crate) struct ProviderConnector {
     chatgpt: Arc<Mutex<ChatGptState>>,
     chatgpt_operation: Arc<RwLock<()>>,
+    #[cfg(test)]
+    test_endpoints: HashMap<ProfileId, Endpoint>,
 }
 
 #[derive(Default)]
@@ -73,6 +75,14 @@ impl ProviderConnector {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_endpoints(endpoints: HashMap<ProfileId, Endpoint>) -> Self {
+        Self {
+            test_endpoints: endpoints,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_chatgpt_credentials(credentials: ChatGptCredentials) -> Self {
         Self {
             chatgpt: Arc::new(Mutex::new(ChatGptState {
@@ -80,7 +90,7 @@ impl ProviderConnector {
                 connection: None,
                 closed: false,
             })),
-            chatgpt_operation: Arc::new(RwLock::new(())),
+            ..Self::default()
         }
     }
 
@@ -118,6 +128,8 @@ impl ProviderConnector {
             None
         };
         let mut endpoints = HashMap::new();
+        #[cfg(test)]
+        endpoints.extend(self.test_endpoints.clone());
         let coordinator = self
             .configured_model(&runtime.coordinator, chatgpt.as_deref(), &mut endpoints)
             .await?;

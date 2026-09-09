@@ -4,7 +4,9 @@ use bone_app::{
 };
 
 #[test]
-fn agent_semantics_used_by_public_dtos_are_reexported() {
+fn public_api_reexports_frontend_configuration_and_agent_semantics() {
+    fn exported<T>() {}
+
     let resolution = WriteResolution {
         external_effect: ExternalEffect::Applied,
         evidence: "checked".into(),
@@ -13,12 +15,6 @@ fn agent_semantics_used_by_public_dtos_are_reexported() {
     let _ = InputOutcome::Completed;
     let _ = OutcomeKind::Completed;
     let _ = ToolOutcome::value("visible");
-}
-
-#[test]
-fn public_configuration_types_are_selectively_reexported() {
-    fn exported<T>() {}
-
     exported::<AgentLimits>();
     exported::<EndpointConfig>();
     exported::<ModelOptions>();

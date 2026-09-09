@@ -8,7 +8,7 @@ use crate::{
     Input, InputId, InputOutcome, InputStatus, InquiryAnswer, InquiryResponse, JobAction,
     JobChange, JobSpec, JobStatus, KernelDecision, MonoTime, OutcomeKind, ReadQuery, RecordBody,
     ReportDraft, Seq, ToolCall, ToolEffect, ToolOutcome, ToolSpec, WorkInput, WorkProposal,
-    WorkStep,
+    WorkStep, WorkerRole,
     context::{self, PreparedWork},
     kernel::{Kernel, KernelControl},
     ports::{Call, Effect, Event},
@@ -547,6 +547,62 @@ fn a_routing_investigation_can_finish_while_its_routing_waits() {
         OutcomeKind::Completed
     ));
     assert!(starts(&effects).any(|(_, call)| matches!(call, Call::Coordinate(_))));
+}
+
+#[test]
+fn investigation_workers_and_their_children_receive_only_read_authority() {
+    let read = ToolSpec {
+        name: "read".into(),
+        description: "inspect state".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ReadOnly,
+    };
+    let write = ToolSpec {
+        name: "write".into(),
+        description: "change state".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ExternalWrite,
+    };
+    let mut kernel = Kernel::new(AgentLimits::default(), vec![read, write]).unwrap();
+    let input = Input::new(InputId(91), "find the cause");
+    let (_, effects) = kernel.accept(NOW, input.clone()).unwrap();
+    let effects = kernel.step(
+        NOW,
+        Event::CoordinateFinished {
+            call: coordinate_call(&effects),
+            result: Ok(KernelDecision::Investigate(assignment(
+                "investigate",
+                &[input.id],
+            ))),
+        },
+    );
+    let (call, investigation) = work_calls(&effects).pop().unwrap();
+
+    assert_eq!(investigation.role, WorkerRole::Investigation);
+    assert!(!investigation.can_ask_user);
+    assert_eq!(
+        investigation
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["read"]
+    );
+
+    let effects = work(
+        &mut kernel,
+        call,
+        WorkStep::Delegate(vec![assignment("child investigation", &[])]),
+    );
+    let child = work_calls(&effects)
+        .into_iter()
+        .find(|(_, input)| input.spec.goal == "child investigation")
+        .expect("the investigation child starts")
+        .1;
+    assert_eq!(child.role, WorkerRole::Investigation);
+    assert!(!child.can_ask_user);
+    assert_eq!(child.tools.len(), 1);
+    assert_eq!(child.tools[0].effect, ToolEffect::ReadOnly);
 }
 
 #[test]
@@ -1327,6 +1383,103 @@ fn cancellation_records_late_tool_truth_without_reviving_the_job() {
 }
 
 #[test]
+fn a_completed_tool_is_a_valid_wait_target_for_an_earlier_worker_snapshot() {
+    let tool = ToolSpec {
+        name: "read".into(),
+        description: "read once".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ReadOnly,
+    };
+    let mut kernel = kernel_with(tool);
+    let input = Input::new(InputId(81), "coordinate a parent and child");
+    let (parent_call, parent) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("parent", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    assert_eq!(parent.role, WorkerRole::User);
+    assert!(parent.can_ask_user);
+    let calls = calls_by_goal(work_calls(&work(
+        &mut kernel,
+        parent_call,
+        WorkStep::Delegate(vec![assignment("child", &[])]),
+    )));
+    let (parent_call, _) = &calls["parent"];
+    let (child_call, child) = &calls["child"];
+    assert_eq!(child.role, WorkerRole::Delegated);
+    assert!(!child.can_ask_user);
+    let effects = work(
+        &mut kernel,
+        *child_call,
+        WorkStep::Tool(ToolCall::new("read", json!({}))),
+    );
+    let tool_call = tool_call(&effects);
+    let effects = work(
+        &mut kernel,
+        *parent_call,
+        WorkStep::Inquire {
+            job: child.job,
+            question: "is the read complete?".into(),
+        },
+    );
+    let (answer_call, answer_input) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == child.job)
+        .expect("the inquiry starts a worker while the tool is running");
+    let inquiry = answer_input.inquiries[0].id;
+    assert_eq!(answer_input.waiting, Some(crate::WaitView::Tool(tool_call)));
+
+    let effects = kernel.step(
+        NOW,
+        Event::ToolFinished {
+            call: tool_call,
+            result: ToolOutcome::value(json!({ "value": 42 })),
+        },
+    );
+    assert!(
+        work_calls(&effects).is_empty(),
+        "the in-flight worker still owns the next proposal"
+    );
+
+    let effects = kernel.step(
+        NOW,
+        Event::WorkFinished {
+            call: answer_call,
+            result: Ok(WorkProposal {
+                note: None,
+                report: None,
+                answers: vec![InquiryAnswer {
+                    inquiry,
+                    response: InquiryResponse::NeedsWork(
+                        "the tool was running in this worker's snapshot".into(),
+                    ),
+                }],
+                step: WorkStep::Wait(Await::Tool(tool_call)),
+            }),
+        },
+    );
+
+    assert!(!matches!(
+        kernel.job_status(child.job),
+        JobStatus::Finished(_)
+    ));
+    let resumed = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == child.job)
+        .expect("an already completed wait resumes immediately")
+        .1;
+    assert!(resumed.records.iter().any(|view| {
+        matches!(
+            kernel.records[&view.source].body,
+            RecordBody::ToolFinished { call, .. } if call == tool_call
+        )
+    }));
+    assert!(!finished_as(&kernel, parent.job, OutcomeKind::Failed));
+}
+
+#[test]
 fn oversized_tool_outcomes_become_small_errors_without_losing_effect_truth() {
     let oversized_error = ToolOutcome {
         result: Err(crate::CallError::failed("x".repeat(9 * 1024 * 1024))),
@@ -1391,6 +1544,164 @@ fn oversized_tool_outcomes_become_small_errors_without_losing_effect_truth() {
         ));
         assert!(serde_json::to_vec(record).unwrap().len() < 1_024);
     }
+}
+
+#[test]
+fn a_large_tool_result_is_authoritative_and_pages_within_the_work_context_budget() {
+    let limits = AgentLimits {
+        context_bytes: 8 * 1024,
+        item_bytes: 7 * 1024,
+        tool_output_bytes: 128 * 1024,
+        ..AgentLimits::default()
+    };
+    let tool = ToolSpec {
+        name: "read".into(),
+        description: "return a large document".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ReadOnly,
+    };
+    let mut kernel = Kernel::new(limits.clone(), vec![tool]).unwrap();
+    let input = Input::new(InputId(82), "read the document");
+    let (work_call, job) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("reader", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    let effects = work(
+        &mut kernel,
+        work_call,
+        WorkStep::Tool(ToolCall::new("read", json!({}))),
+    );
+    let call = tool_call(&effects);
+    let outcome = ToolOutcome::value(json!({
+        "document": "\0\"\\🙂".repeat(5_000)
+    }));
+    assert!(serde_json::to_vec(&outcome).unwrap().len() > limits.context_bytes);
+    assert!(serde_json::to_vec(&outcome).unwrap().len() < limits.tool_output_bytes);
+
+    let effects = kernel.step(
+        NOW,
+        Event::ToolFinished {
+            call,
+            result: outcome.clone(),
+        },
+    );
+    let record = kernel
+        .records
+        .values()
+        .find(
+            |record| matches!(record.body, RecordBody::ToolFinished { call: id, .. } if id == call),
+        )
+        .expect("the full tool result is retained")
+        .clone();
+    let RecordBody::ToolFinished {
+        outcome: stored, ..
+    } = &record.body
+    else {
+        unreachable!();
+    };
+    assert_eq!(stored.as_ref(), &outcome);
+    let authoritative = serde_json::to_string(&record.body).unwrap();
+    assert!(authoritative.len() > limits.context_bytes);
+
+    let (next_call, projected) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, input)| input.job == job.job)
+        .expect("the large result starts another worker without failing the job");
+    assert!(serde_json::to_vec(&projected).unwrap().len() <= limits.context_bytes);
+    let preview = projected
+        .records
+        .iter()
+        .find(|view| view.source == record.seq && view.offset == 0)
+        .expect("the worker receives a result preview");
+    let next_offset = preview
+        .next_offset
+        .expect("the result is larger than its preview");
+    assert_eq!(preview.content, authoritative[..next_offset]);
+    assert!(authoritative.is_char_boundary(next_offset));
+
+    let effects = work(&mut kernel, next_call, WorkStep::Continue);
+    let (stale_call, _) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, input)| input.job == job.job)
+        .expect("the worker can continue after acknowledging the preview");
+
+    let previous_through = kernel.jobs[&job.job]
+        .context
+        .records
+        .iter()
+        .copied()
+        .filter(|seq| *seq < record.seq)
+        .max()
+        .unwrap();
+    kernel.jobs.get_mut(&job.job).unwrap().context.checkpoint =
+        Some(std::sync::Arc::new(crate::Checkpoint {
+            job: job.job,
+            revision: job.revision,
+            through: previous_through,
+            summary: "x".repeat(6 * 1024),
+            evidence: Vec::new(),
+        }));
+    let compact = context::prepare_compact(&kernel, job.job).unwrap();
+    assert_eq!(compact.through, record.seq);
+    assert!(serde_json::to_vec(&compact).unwrap().len() <= limits.context_bytes);
+    let compact_preview = compact
+        .records
+        .iter()
+        .find(|view| view.source == record.seq)
+        .expect("compaction retains the tool result reference and preview");
+    assert!(compact_preview.next_offset.is_some());
+    assert!(compact_preview.content.len() < limits.context_bytes / 4);
+    let (_, pause_effects) = kernel.control(NOW, KernelControl::Pause(job.job));
+    assert!(
+        pause_effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Cancel(call) if *call == stale_call))
+    );
+    kernel.jobs.get_mut(&job.job).unwrap().context.checkpoint =
+        Some(std::sync::Arc::new(crate::Checkpoint {
+            job: job.job,
+            revision: job.revision,
+            through: compact.through,
+            summary: "the tool result remains available by source".into(),
+            evidence: Vec::new(),
+        }));
+    let (_, effects) = kernel.control(NOW, KernelControl::Resume(job.job));
+    let (read_after_checkpoint, _) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, input)| input.job == job.job)
+        .expect("the resumed worker starts from the checkpoint");
+
+    let effects = work(
+        &mut kernel,
+        read_after_checkpoint,
+        WorkStep::Read(ReadQuery::Record {
+            id: record.seq,
+            offset: next_offset,
+        }),
+    );
+    let (finish_call, after_checkpoint) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, input)| input.job == job.job)
+        .expect("checkpointing a preview does not revoke paged access");
+    assert!(serde_json::to_vec(&after_checkpoint).unwrap().len() <= limits.context_bytes);
+    let page = after_checkpoint
+        .records
+        .iter()
+        .find(|view| view.source == record.seq && view.offset == next_offset)
+        .expect("the original preview cursor remains readable after checkpointing");
+    let end = page.next_offset.unwrap_or(authoritative.len());
+    assert_eq!(page.content, authoritative[next_offset..end]);
+    assert!(authoritative.is_char_boundary(end));
+
+    work(
+        &mut kernel,
+        finish_call,
+        WorkStep::Finish(Completion::new("the preview was sufficient")),
+    );
+    assert!(finished_as(&kernel, job.job, OutcomeKind::Completed));
 }
 
 #[test]

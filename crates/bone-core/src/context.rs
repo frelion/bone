@@ -202,7 +202,10 @@ pub struct CheckpointDraft {
 pub struct RecordView {
     pub source: Seq,
     pub origin: Origin,
+    /// UTF-8 byte offset in the authoritative serialized [`RecordBody`].
     pub offset: usize,
+    /// The offset for [`ReadQuery::Record`], or `None` when this view reaches
+    /// the end of the authoritative body.
     pub next_offset: Option<usize>,
     pub content: String,
 }
@@ -265,10 +268,21 @@ pub struct CoordinateInput {
     pub records: Vec<RecordView>,
 }
 
+/// The authority carried by one worker call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkerRole {
+    User,
+    Delegated,
+    Investigation,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkInput {
     pub job: JobId,
     pub revision: u64,
+    pub role: WorkerRole,
+    /// Whether `AskUser` is available for this particular user-owned turn.
+    pub can_ask_user: bool,
     pub spec: JobSpec,
     pub constraints: String,
     pub background: Arc<BootstrapContext>,
@@ -315,6 +329,42 @@ pub(crate) enum ContextError {
 }
 
 pub(crate) fn prepare_work(kernel: &Kernel, job_id: JobId) -> Result<PreparedWork, ContextError> {
+    let mut page_bytes = initial_page_bytes(kernel);
+    let (input, seen_through) = work_input(kernel, job_id, page_bytes)?;
+    if encoded_len(&input) <= kernel.limits.context_bytes {
+        return Ok(PreparedWork::Work {
+            input: Box::new(input),
+            seen_through,
+        });
+    }
+    match prepare_compact(kernel, job_id) {
+        Ok(input) => return Ok(PreparedWork::Compact(input)),
+        Err(ContextError::NothingToCompact) => {}
+        Err(error) => return Err(error),
+    }
+
+    // A newly required record cannot be compacted before a worker has seen it.
+    // Tool outcomes and explicit record reads are pageable, so reduce their
+    // projection until the complete DTO fits. The authoritative record remains
+    // unchanged and the next byte offset is carried by RecordView.
+    while page_bytes > 1 {
+        page_bytes = (page_bytes / 2).max(1);
+        let (input, seen_through) = work_input(kernel, job_id, page_bytes)?;
+        if encoded_len(&input) <= kernel.limits.context_bytes {
+            return Ok(PreparedWork::Work {
+                input: Box::new(input),
+                seen_through,
+            });
+        }
+    }
+    Err(ContextError::TooLarge)
+}
+
+fn work_input(
+    kernel: &Kernel,
+    job_id: JobId,
+    page_bytes: usize,
+) -> Result<(WorkInput, Seq), ContextError> {
     let job = kernel
         .jobs
         .get(&job_id)
@@ -331,11 +381,24 @@ pub(crate) fn prepare_work(kernel: &Kernel, job_id: JobId) -> Result<PreparedWor
         .copied()
         .filter(|seq| *seq > checkpoint_through)
         .collect::<Vec<_>>();
-    let records = expand_records(kernel, &local)?;
+    let records = expand_records(kernel, &local, page_bytes)?;
     let seen_through = local.last().copied().unwrap_or(job.context.read_through);
+    let role = if kernel.is_investigation(job_id) {
+        WorkerRole::Investigation
+    } else if matches!(job.owner, Owner::User) {
+        WorkerRole::User
+    } else {
+        WorkerRole::Delegated
+    };
     let input = WorkInput {
         job: job_id,
         revision: job.revision,
+        role,
+        can_ask_user: role == WorkerRole::User
+            && job
+                .inputs
+                .iter()
+                .any(|input| kernel.inputs[input].finished.is_none()),
         spec: job.spec.clone(),
         constraints: kernel.constraints.clone(),
         background: kernel.background.clone(),
@@ -365,19 +428,16 @@ pub(crate) fn prepare_work(kernel: &Kernel, job_id: JobId) -> Result<PreparedWor
             .collect(),
         calls: kernel.calls_for(job_id),
         records,
-        tools: kernel.tools.values().cloned().collect(),
+        tools: kernel
+            .tools
+            .values()
+            .filter(|tool| {
+                role != WorkerRole::Investigation || tool.effect == crate::ToolEffect::ReadOnly
+            })
+            .cloned()
+            .collect(),
     };
-    if encoded_len(&input) <= kernel.limits.context_bytes {
-        return Ok(PreparedWork::Work {
-            input: Box::new(input),
-            seen_through,
-        });
-    }
-    match prepare_compact(kernel, job_id) {
-        Ok(input) => Ok(PreparedWork::Compact(input)),
-        Err(ContextError::NothingToCompact) => Err(ContextError::TooLarge),
-        Err(error) => Err(error),
-    }
+    Ok((input, seen_through))
 }
 
 pub(crate) fn prepare_coordinate(
@@ -458,7 +518,13 @@ fn coordinate_input(
         .collect::<Vec<_>>();
     let mut positions = BTreeMap::new();
     let mut records = Vec::new();
-    expand_into(kernel, &projected, &mut positions, &mut records)?;
+    expand_into(
+        kernel,
+        &projected,
+        kernel.limits.item_bytes,
+        &mut positions,
+        &mut records,
+    )?;
     if let Some(candidate) = read_override {
         push_record_view(candidate, 0, usize::MAX, &mut positions, &mut records)?;
         if let RecordBody::ReadResult {
@@ -524,24 +590,31 @@ pub(crate) fn prepare_compact(
     let mut records = Vec::new();
     let mut positions = BTreeMap::new();
     let mut through = after;
-    for seq in candidates {
+    'records: for seq in candidates {
         let next_through = seq;
-        let mut trial = records.clone();
-        let mut trial_positions = positions.clone();
-        expand_into(kernel, &[seq], &mut trial_positions, &mut trial)?;
-        let input = CompactInput {
-            job: job_id,
-            revision: job.revision,
-            previous: job.context.checkpoint.clone(),
-            through: next_through,
-            records: trial.clone(),
-        };
-        if encoded_len(&input) > kernel.limits.context_bytes {
-            break;
+        let mut page_bytes = initial_page_bytes(kernel);
+        loop {
+            let mut trial = records.clone();
+            let mut trial_positions = positions.clone();
+            expand_into(kernel, &[seq], page_bytes, &mut trial_positions, &mut trial)?;
+            let input = CompactInput {
+                job: job_id,
+                revision: job.revision,
+                previous: job.context.checkpoint.clone(),
+                through: next_through,
+                records: trial.clone(),
+            };
+            if encoded_len(&input) <= kernel.limits.context_bytes {
+                records = trial;
+                positions = trial_positions;
+                through = next_through;
+                break;
+            }
+            if through != after || page_bytes == 1 || !pageable(kernel, seq)? {
+                break 'records;
+            }
+            page_bytes = (page_bytes / 2).max(1);
         }
-        records = trial;
-        positions = trial_positions;
-        through = next_through;
     }
     if through == after {
         return Err(ContextError::NothingToCompact);
@@ -552,6 +625,24 @@ pub(crate) fn prepare_compact(
         previous: job.context.checkpoint.clone(),
         through,
         records,
+    })
+}
+
+fn pageable(kernel: &Kernel, seq: Seq) -> Result<bool, ContextError> {
+    let record = kernel
+        .records
+        .get(&seq)
+        .ok_or(ContextError::MissingRecord(seq))?;
+    Ok(match &record.body {
+        RecordBody::ToolFinished { .. }
+        | RecordBody::ReadResult {
+            record: Some(_), ..
+        } => true,
+        RecordBody::Delivery { source, .. } => kernel
+            .records
+            .get(source)
+            .is_some_and(|record| matches!(record.body, RecordBody::ToolFinished { .. })),
+        _ => false,
     })
 }
 
@@ -568,28 +659,52 @@ pub(crate) fn card(kernel: &Kernel, id: JobId) -> JobCard {
     }
 }
 
-fn expand_records(kernel: &Kernel, ids: &[Seq]) -> Result<Vec<RecordView>, ContextError> {
+fn expand_records(
+    kernel: &Kernel,
+    ids: &[Seq],
+    page_bytes: usize,
+) -> Result<Vec<RecordView>, ContextError> {
     let mut positions = BTreeMap::new();
     let mut views = Vec::new();
-    expand_into(kernel, ids, &mut positions, &mut views)?;
+    expand_into(kernel, ids, page_bytes, &mut positions, &mut views)?;
     Ok(views)
 }
 
 fn expand_into(
     kernel: &Kernel,
     ids: &[Seq],
+    page_bytes: usize,
     positions: &mut BTreeMap<(Seq, usize), usize>,
     views: &mut Vec<RecordView>,
 ) -> Result<(), ContextError> {
     for id in ids {
-        push_view(kernel, *id, 0, usize::MAX, positions, views)?;
         let record = kernel
             .records
             .get(id)
             .ok_or(ContextError::MissingRecord(*id))?;
+        // A tool result is an immutable authority that may be larger than one
+        // model context. A worker consumes this bounded notification page; a
+        // non-null cursor means the body remains available through explicit
+        // ReadQuery::Record calls. The job's Seq read watermark tracks the
+        // notification, not full consumption of every referenced byte.
+        let limit = if matches!(record.body, RecordBody::ToolFinished { .. }) {
+            page_bytes
+        } else {
+            usize::MAX
+        };
+        push_record_view(record, 0, limit, positions, views)?;
         match &record.body {
             RecordBody::Delivery { source, .. } => {
-                push_view(kernel, *source, 0, usize::MAX, positions, views)?;
+                let source_record = kernel
+                    .records
+                    .get(source)
+                    .ok_or(ContextError::MissingRecord(*source))?;
+                let limit = if matches!(source_record.body, RecordBody::ToolFinished { .. }) {
+                    page_bytes
+                } else {
+                    usize::MAX
+                };
+                push_record_view(source_record, 0, limit, positions, views)?;
             }
             RecordBody::ReadResult {
                 record: Some(range),
@@ -599,7 +714,7 @@ fn expand_into(
                     kernel,
                     range.source,
                     range.offset,
-                    kernel.limits.item_bytes,
+                    page_bytes,
                     positions,
                     views,
                 )?;
@@ -675,4 +790,11 @@ pub(crate) fn view(
 
 fn encoded_len(value: &impl Serialize) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+fn initial_page_bytes(kernel: &Kernel) -> usize {
+    kernel
+        .limits
+        .item_bytes
+        .min((kernel.limits.context_bytes / 4).max(1))
 }

@@ -309,6 +309,8 @@ pub(crate) struct PendingStep {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct JobContext {
     pub records: VecDeque<Seq>,
+    /// Greatest local record sequence supplied to an accepted worker turn.
+    /// Paged RecordView bodies can still have unread bytes after this sequence.
     pub read_through: Seq,
     pub checkpoint: Option<Arc<crate::Checkpoint>>,
 }

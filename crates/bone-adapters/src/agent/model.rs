@@ -4,7 +4,7 @@ use bone_core::{
 };
 
 use crate::llm::{
-    InputItem, InputSource, Model, ModelOptions, Protocol, Request, Response, ToolChoice,
+    InputItem, InputSource, Model, ModelOptions, ModelOptionsError, Request, Response, ToolChoice,
     ToolDefinition,
 };
 
@@ -16,15 +16,9 @@ pub struct ConfiguredModel {
 }
 
 impl ConfiguredModel {
-    pub fn new(model: Model, options: Option<ModelOptions>) -> Result<Self, ConfiguredModelError> {
+    pub fn new(model: Model, options: Option<ModelOptions>) -> Result<Self, ModelOptionsError> {
         if let Some(options) = options.as_ref() {
-            options.validate()?;
-            if options.protocol() != model.protocol() {
-                return Err(ConfiguredModelError::Protocol {
-                    model: model.protocol(),
-                    options: options.protocol(),
-                });
-            }
+            options.validate_for_protocol(model.protocol())?;
         }
         Ok(Self { model, options })
     }
@@ -40,10 +34,10 @@ impl ConfiguredModel {
         &self.model
     }
 
-    fn apply_to(&self, request: Request) -> Result<Request, ConfiguredModelError> {
-        match self.options.clone() {
-            Some(options) => Ok(options.apply_to(request)?),
-            None => Ok(request),
+    fn apply_to(&self, request: Request) -> Request {
+        match &self.options {
+            Some(options) => request.options(options.clone()),
+            None => request,
         }
     }
 }
@@ -52,14 +46,6 @@ impl From<Model> for ConfiguredModel {
     fn from(model: Model) -> Self {
         Self::without_options(model)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ConfiguredModelError {
-    #[error(transparent)]
-    Options(#[from] crate::llm::ModelRequestOptionsError),
-    #[error("{options} options do not belong to a {model} model")]
-    Protocol { model: Protocol, options: Protocol },
 }
 
 /// Adapts configured provider models to the core's typed model port.
@@ -154,9 +140,7 @@ where
         submission_schema.clone(),
     )])
     .tool_choice(ToolChoice::Specific(vec![submission_name.clone()]));
-    let request = model
-        .apply_to(request)
-        .map_err(|error| CallError::failed(format!("invalid model options: {error}")))?;
+    let request = model.apply_to(request);
     let response =
         model.model().complete(request).await.map_err(|error| {
             CallError::failed(format!("model request failed ({:?})", error.kind()))
@@ -216,7 +200,7 @@ mod tests {
 
     use super::*;
     use crate::llm::{
-        ModelRequestOptions, RequestOrigin, RequestSupport, ToolCallIdentities,
+        ModelOptions, Protocol, RequestOrigin, RequestSupport, ToolCallIdentities,
         protocol::openai_responses::{Reasoning, ReasoningEffort},
     };
 
@@ -367,7 +351,7 @@ mod tests {
 
     #[test]
     fn configured_model_rejects_options_for_another_protocol() {
-        let options = ModelRequestOptions::OpenAiResponses {
+        let options = ModelOptions::OpenAiResponses {
             reasoning: Reasoning::new().effort(ReasoningEffort::High),
         };
 
@@ -375,9 +359,9 @@ mod tests {
             .expect_err("OpenAI options must not reach an Anthropic model");
         assert_eq!(
             error,
-            ConfiguredModelError::Protocol {
-                model: Protocol::AnthropicMessages,
-                options: Protocol::OpenAiResponses,
+            ModelOptionsError::UnsupportedProtocol {
+                options_protocol: Protocol::OpenAiResponses,
+                endpoint_protocol: Protocol::AnthropicMessages,
             }
         );
     }
@@ -424,7 +408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_carries_the_bound_contract_and_specific_choice() {
+    async fn request_carries_the_bound_contract_specific_choice_and_configured_options() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let decision = KernelDecision::Clarify("which parser?".into());
         let input = coordinate_input();
@@ -441,6 +425,13 @@ mod tests {
             Arc::clone(&requests),
             submission("submit_coordination", json!(decision)),
         );
+        let model = ConfiguredModel::new(
+            model.model().clone(),
+            Some(ModelOptions::OpenAiResponses {
+                reasoning: Reasoning::new().effort(ReasoningEffort::High),
+            }),
+        )
+        .unwrap();
 
         let result = execute(model, false, move || model_contract::coordinate(input))
             .await
@@ -450,6 +441,10 @@ mod tests {
         let mut requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         let request = requests.pop().unwrap();
+        assert_eq!(
+            request.additional_params,
+            Some(json!({"reasoning": {"effort": "high"}}))
+        );
         assert_eq!(request.tools.len(), 1);
         assert_eq!(request.tools[0].name, expected_name);
         assert_eq!(request.tools[0].description, expected_description);
@@ -515,20 +510,5 @@ mod tests {
             .expect_err("truncated or filtered output must fail");
             assert_eq!(error.message, "model output was truncated or filtered");
         }
-    }
-
-    #[test]
-    fn response_decodes_the_bound_core_contract() {
-        let decision = KernelDecision::Clarify("which parser?".into());
-        let response = response([("submit_coordination", json!(decision))]);
-
-        assert_eq!(
-            decode_response(
-                model_contract::coordinate(coordinate_input()).unwrap(),
-                response,
-            )
-            .unwrap(),
-            decision
-        );
     }
 }

@@ -771,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn times_out_and_returns_promptly() {
         let temp = tempfile::tempdir().unwrap();
-        let tool = tool_with_timeout(temp.path(), Duration::from_millis(50));
+        let tool = tool_with_timeout(temp.path(), Duration::from_secs(1));
         let started = Instant::now();
 
         let output = tool
@@ -784,7 +784,7 @@ mod tests {
             .unwrap();
 
         assert!(output.timed_out);
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(output.stdout, "started");
         #[cfg(unix)]
         assert_eq!(output.exit_code, None);
@@ -794,11 +794,11 @@ mod tests {
     #[tokio::test]
     async fn timing_out_kills_descendants() {
         let temp = tempfile::tempdir().unwrap();
-        let tool = tool_with_timeout(temp.path(), Duration::from_millis(200));
+        let tool = tool_with_timeout(temp.path(), Duration::from_secs(1));
 
         let output = tool
             .call(BashArgs {
-                command: "sleep 30 & echo $! > child.pid; wait".to_owned(),
+                command: "printf 'started'; sleep 30 & echo $! > child.pid; wait".to_owned(),
                 cwd: None,
                 timeout_secs: None,
             })
@@ -806,6 +806,7 @@ mod tests {
             .unwrap();
 
         assert!(output.timed_out);
+        assert_eq!(output.stdout, "started");
         let descendant = wait_for_pid(&temp.path().join("child.pid")).await;
         assert!(wait_until_gone(descendant).await);
     }

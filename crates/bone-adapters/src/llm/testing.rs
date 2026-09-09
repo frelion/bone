@@ -15,19 +15,6 @@ pub fn error(kind: ErrorKind, message: impl Into<String>) -> Error {
     Error::new(kind, message)
 }
 
-pub fn model<M>(
-    endpoint_id: impl Into<String>,
-    protocol: Protocol,
-    model_id: impl Into<String>,
-    inner: M,
-) -> Result<Model, ConfigError>
-where
-    M: CompletionModel + Clone + Send + Sync + 'static,
-{
-    let endpoint = Endpoint::from_model_factory(endpoint_id, protocol, move |_| inner.clone())?;
-    endpoint.model(model_id)
-}
-
 pub fn openai_responses_endpoint<H>(
     endpoint_id: impl Into<String>,
     client: rig_openai::Client<H>,

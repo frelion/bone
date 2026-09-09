@@ -236,8 +236,11 @@ mod tests {
 
         let error = model(Arc::clone(&calls))
             .complete(
-                Request::new([InputItem::external(InputSource::User, "hello")])
-                    .options(crate::llm::protocol::openai_responses::Options::new()),
+                Request::new([InputItem::external(InputSource::User, "hello")]).options(
+                    crate::llm::ModelOptions::OpenAiResponses {
+                        reasoning: crate::llm::protocol::openai_responses::Reasoning::new(),
+                    },
+                ),
             )
             .await
             .unwrap_err();

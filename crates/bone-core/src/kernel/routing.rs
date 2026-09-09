@@ -186,7 +186,7 @@ impl Kernel {
                 {
                     return Err("invalid routing inquiry".into());
                 }
-                self.validate_model_text("routing inquiry", &question)?;
+                self.validate_model_item("routing inquiry", &question)?;
                 self.open_inquiry(
                     DeliveryTarget::Routing(routing),
                     job,
@@ -218,7 +218,7 @@ impl Kernel {
                 if !matches!(route.requester, Requester::Inputs) || question.trim().is_empty() {
                     return Err("only user input routing may ask for clarification".into());
                 }
-                self.validate_model_text("clarification question", &question)?;
+                self.validate_model_item("clarification question", &question)?;
                 self.clarify_routing(routing, question, effects);
             }
         }
@@ -235,7 +235,7 @@ impl Kernel {
             return Err("worker coordination cannot change session constraints".into());
         }
         if let Some(constraints) = constraints {
-            self.validate_model_text("session constraints", constraints)?;
+            self.validate_model_item("session constraints", constraints)?;
         }
         let creates = changes
             .iter()

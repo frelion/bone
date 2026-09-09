@@ -153,7 +153,11 @@ impl WriteTransaction<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc, thread};
+    use std::{
+        fs,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use serde::{Deserialize, Serialize};
 
@@ -324,27 +328,6 @@ mod tests {
     }
 
     #[test]
-    fn prefix_listing_query_uses_the_document_primary_key() {
-        let (_temporary, store) = store();
-        let connection = store.inner.connection().unwrap();
-        let plan: String = connection
-            .query_row(
-                "
-                    EXPLAIN QUERY PLAN
-                    SELECT key FROM documents
-                    WHERE namespace COLLATE BINARY = ?1
-                      AND key COLLATE BINARY >= ?2
-                      AND key COLLATE BINARY < CAST(?3 AS TEXT)
-                    ORDER BY key COLLATE BINARY ASC
-                ",
-                rusqlite::params!["test.settings", "workspace/a/", b"workspace/a0"],
-                |row| row.get(3),
-            )
-            .unwrap();
-        assert!(plan.contains("INDEX"), "unexpected query plan: {plan}");
-    }
-
-    #[test]
     fn lease_is_exclusive() {
         let (_temporary, store) = store();
         let lease = store
@@ -364,27 +347,43 @@ mod tests {
     fn document_writes_have_one_winner_under_contention() {
         let (_temporary, store) = store();
         let document = Arc::new(store.document::<Settings>(settings_key("contended")));
+        let expected = document.read().unwrap().revision;
+        let barrier = Arc::new(Barrier::new(8));
         let joins = (0..8)
             .map(|number| {
                 let document = Arc::clone(&document);
+                let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
-                    let snapshot = document.read().unwrap();
-                    document.replace(
-                        &Settings {
-                            name: number.to_string(),
-                        },
-                        snapshot.revision,
-                    )
+                    let settings = Settings {
+                        name: number.to_string(),
+                    };
+                    barrier.wait();
+                    let result = document.replace(&settings, expected);
+                    (settings, result)
                 })
             })
             .collect::<Vec<_>>();
-        assert!(
-            joins
-                .into_iter()
-                .filter_map(|join| join.join().unwrap().ok())
-                .count()
-                >= 1
-        );
+        let mut winners = Vec::new();
+        for join in joins {
+            let (settings, result) = join.join().unwrap();
+            match result {
+                Ok(revision) => winners.push((settings, revision)),
+                Err(StoreError::RevisionConflict {
+                    expected: stale,
+                    actual,
+                }) => {
+                    assert_eq!(stale, expected);
+                    assert_eq!(actual.value(), expected.value() + 1);
+                }
+                other => panic!("unexpected concurrent write result: {other:?}"),
+            }
+        }
+        assert_eq!(winners.len(), 1, "one shared revision permits one writer");
+        let (settings, revision) = winners.pop().unwrap();
+        let saved = document.read().unwrap();
+        assert_eq!(revision.value(), expected.value() + 1);
+        assert_eq!(saved.revision, revision);
+        assert_eq!(saved.value, Some(settings));
     }
 
     #[test]

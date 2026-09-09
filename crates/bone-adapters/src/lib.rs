@@ -11,4 +11,4 @@ mod agent;
 pub mod llm;
 pub mod tools;
 
-pub use agent::{ConfiguredModel, ConfiguredModelError, ModelAdapter, read_only_tools};
+pub use agent::{ConfiguredModel, ModelAdapter, read_only_tools};

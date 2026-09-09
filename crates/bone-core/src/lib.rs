@@ -19,7 +19,7 @@ pub use config::{AgentLimits, AgentLimitsError};
 pub use context::{
     BackgroundEntry, BootstrapContext, Checkpoint, CheckpointDraft, CompactInput, CoordinateInput,
     DeliveryKind, DeliveryTarget, InquiryResult, JobCard, Origin, Record, RecordBody, RecordRange,
-    RecordView, WorkInput,
+    RecordView, WorkInput, WorkerRole,
 };
 pub use job::*;
 pub use ports::*;
