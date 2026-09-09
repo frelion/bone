@@ -1,0 +1,288 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "BONE Context Lifecycle v1",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "layout": {
+    "mode": "grid",
+    "cols": 5,
+    "origin": [42, 82],
+    "gapX": 32,
+    "gapY": 50,
+    "cellW": 140,
+    "cellH": 76
+  },
+  "components": [
+    {
+      "id": "input",
+      "type": "external",
+      "label": "Input I",
+      "sublabel": "durable RequestId",
+      "tag": "P0",
+      "row": 2,
+      "col": 0
+    },
+    {
+      "id": "session-journal",
+      "type": "database",
+      "label": "Session Journal",
+      "sublabel": "durable facts / SessionSeq",
+      "tag": "APP",
+      "row": 2,
+      "col": 1
+    },
+    {
+      "id": "session-checkpoint",
+      "type": "database",
+      "label": "SessionCheckpoint",
+      "sublabel": "public cognition + CAS head",
+      "tag": "APP",
+      "row": 0,
+      "col": 1
+    },
+    {
+      "id": "effect-overlay",
+      "type": "security",
+      "label": "Effect Overlay",
+      "sublabel": "Pending / Unknown",
+      "tag": "APP",
+      "row": 0,
+      "col": 2
+    },
+    {
+      "id": "session-snapshot",
+      "type": "cloud",
+      "label": "SessionSnapshot(W)",
+      "sublabel": "head + tail + overlay",
+      "tag": "APP",
+      "row": 1,
+      "col": 2
+    },
+    {
+      "id": "coordinator",
+      "type": "backend",
+      "label": "Coordinator",
+      "sublabel": "only Session reader",
+      "tag": "CORE",
+      "row": 1,
+      "col": 3
+    },
+    {
+      "id": "job-context",
+      "type": "backend",
+      "label": "JobContext / Record",
+      "sublabel": "JobSpec + revision + policy",
+      "tag": "CORE",
+      "row": 2,
+      "col": 3
+    },
+    {
+      "id": "job-checkpoint",
+      "type": "database",
+      "label": "JobCheckpoint",
+      "sublabel": "evidence + raw tail + cursor",
+      "tag": "CORE",
+      "row": 3,
+      "col": 3
+    },
+    {
+      "id": "prompt-contract",
+      "type": "cloud",
+      "label": "PromptContract",
+      "sublabel": "window + reserve + schema",
+      "tag": "ADAPTER",
+      "row": 0,
+      "col": 4
+    },
+    {
+      "id": "exact-seal",
+      "type": "backend",
+      "label": "Exact Seal",
+      "sublabel": "final render + token admission",
+      "tag": "ADAPTER",
+      "row": 2,
+      "col": 4
+    },
+    {
+      "id": "provider",
+      "type": "external",
+      "label": "Model Provider",
+      "sublabel": "unary completion",
+      "tag": "EXTERNAL",
+      "row": 3,
+      "col": 4
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "App · durable Session plane",
+      "wraps": [
+        "session-journal",
+        "session-checkpoint",
+        "effect-overlay",
+        "session-snapshot"
+      ],
+      "pad": 26
+    },
+    {
+      "kind": "region",
+      "label": "Core · live Runtime plane",
+      "wraps": [
+        "coordinator",
+        "job-context",
+        "job-checkpoint"
+      ],
+      "pad": 26
+    },
+    {
+      "kind": "region",
+      "label": "Adapter · provider boundary",
+      "wraps": [
+        "prompt-contract",
+        "exact-seal"
+      ],
+      "pad": 26
+    }
+  ],
+  "connections": [
+    {
+      "id": "persist-input",
+      "from": "input",
+      "to": "session-journal",
+      "label": "durable Input I",
+      "variant": "emphasis",
+      "labelDy": 54
+    },
+    {
+      "id": "checkpoint-source",
+      "from": "session-journal",
+      "to": "session-checkpoint",
+      "label": "freeze W · compact public facts",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "checkpoint-to-snapshot",
+      "from": "session-checkpoint",
+      "to": "session-snapshot",
+      "label": "head H",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "effect-to-snapshot",
+      "from": "effect-overlay",
+      "to": "session-snapshot",
+      "label": "must overlay",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "input-envelope",
+      "from": "session-snapshot",
+      "to": "coordinator",
+      "label": "InputEnvelope { I, Snapshot(W) }",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": 54
+    },
+    {
+      "id": "coordinate-job",
+      "from": "coordinator",
+      "to": "job-context",
+      "label": "create / update Job",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "job-compaction",
+      "from": "job-context",
+      "to": "job-checkpoint",
+      "label": "compact read prefix",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "context-view",
+      "from": "job-context",
+      "to": "exact-seal",
+      "label": "typed ContextView",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": 54
+    },
+    {
+      "id": "prompt-contract-to-seal",
+      "from": "prompt-contract",
+      "to": "exact-seal",
+      "label": "budget + tool schema",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "sealed-provider-call",
+      "from": "exact-seal",
+      "to": "provider",
+      "label": "SealedPrompt",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "archive-core-facts",
+      "from": "job-context",
+      "to": "session-journal",
+      "label": "archive published facts",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "right"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Session contract",
+      "items": [
+        "每条顶层输入冻结一次 W；最新 checkpoint 加 W 之后的 durable tail 构成 Snapshot。",
+        "SessionCheckpoint 只恢复已提交认知；旧 Job、旧 approval 与旧 action eligibility 不会复活。"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Job contract",
+      "items": [
+        "JobCheckpoint 只压已读、冻结的 Record 前缀；JobSpec、constraints、raw tail 与未读 cursor 不能静默丢失。",
+        "Worker 不拥有 Session history；只有 Coordinator 显式投递必要的 grounded context。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Provider contract",
+      "items": [
+        "Adapter 在最终 wire render 后做 token seal，不在此层删内容或总结。",
+        "一次精确重规划仍超限时返回 ContextCapacity，禁止无限 compaction loop。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Crash contract",
+      "items": [
+        "active Job → Interrupted；in-flight model → Abandoned；write effect → Unknown → reconcile。",
+        "Runtime 仅在 quiescent barrier 轮换：没有 active Job、running tool 或 unresolved write effect。"
+      ]
+    }
+  ]
+}

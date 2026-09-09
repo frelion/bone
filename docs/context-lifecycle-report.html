@@ -1,0 +1,1044 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="description"
+      content="Bone 上下文管理与膨胀压缩设计审计：现状、风险、目标架构、决策与实施路线。"
+    />
+    <title>Bone · 上下文生命周期设计报告</title>
+    <style>
+      :root {
+        --ink: #172033;
+        --muted: #5d6980;
+        --paper: #f8fafc;
+        --panel: #ffffff;
+        --line: #d9e2ef;
+        --navy: #172c50;
+        --blue: #2d68c4;
+        --blue-soft: #eaf2ff;
+        --teal: #087f78;
+        --teal-soft: #e7f8f5;
+        --amber: #9a5a00;
+        --amber-soft: #fff4dc;
+        --rose: #ae3451;
+        --rose-soft: #fff0f3;
+        --violet: #6b48a8;
+        --violet-soft: #f3efff;
+        --shadow: 0 18px 55px rgba(23, 44, 80, 0.10);
+        --radius-lg: 24px;
+        --radius-md: 16px;
+        --radius-sm: 10px;
+        --content: 1160px;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --ink: #edf3ff;
+          --muted: #aebbd0;
+          --paper: #0d1523;
+          --panel: #142034;
+          --line: #2a3b55;
+          --navy: #b8d0ff;
+          --blue: #8cb8ff;
+          --blue-soft: #172d50;
+          --teal: #79ded5;
+          --teal-soft: #133b3a;
+          --amber: #ffc46e;
+          --amber-soft: #493618;
+          --rose: #ff9aae;
+          --rose-soft: #4e2030;
+          --violet: #c4adff;
+          --violet-soft: #30264c;
+          --shadow: none;
+        }
+      }
+
+      * { box-sizing: border-box; }
+
+      html { scroll-behavior: smooth; }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 8% -5%, rgba(64, 126, 220, 0.16), transparent 30rem),
+          radial-gradient(circle at 92% 0%, rgba(8, 127, 120, 0.13), transparent 27rem),
+          var(--paper);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        line-height: 1.65;
+      }
+
+      a { color: inherit; }
+
+      .skip-link {
+        position: fixed;
+        left: 1rem;
+        top: -4rem;
+        z-index: 10;
+        padding: 0.55rem 0.9rem;
+        color: #fff;
+        background: var(--navy);
+        border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+      }
+
+      .skip-link:focus { top: 0; }
+
+      .shell {
+        width: min(calc(100% - 2rem), var(--content));
+        margin: 0 auto;
+      }
+
+      .hero {
+        padding: clamp(2.8rem, 7vw, 6.2rem) 0 2.4rem;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        margin: 0 0 0.95rem;
+        color: var(--blue);
+        font-size: 0.76rem;
+        font-weight: 780;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .eyebrow::before {
+        width: 0.55rem;
+        height: 0.55rem;
+        content: "";
+        background: currentColor;
+        border-radius: 999px;
+      }
+
+      h1, h2, h3, p { margin-top: 0; }
+
+      h1 {
+        max-width: 11ch;
+        margin-bottom: 1.15rem;
+        color: var(--navy);
+        font-size: clamp(2.25rem, 6vw, 4.7rem);
+        line-height: 1.06;
+        letter-spacing: -0.058em;
+      }
+
+      .lede {
+        max-width: 52rem;
+        margin-bottom: 1.55rem;
+        color: var(--muted);
+        font-size: clamp(1.04rem, 2.1vw, 1.27rem);
+      }
+
+      .hero-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.6rem;
+      }
+
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.35rem 0.66rem;
+        color: var(--muted);
+        font-size: 0.82rem;
+        font-weight: 650;
+        background: color-mix(in srgb, var(--panel) 85%, transparent);
+        border: 1px solid var(--line);
+        border-radius: 999px;
+      }
+
+      .hero-rule {
+        height: 1px;
+        margin-top: 2.3rem;
+        background: linear-gradient(90deg, var(--blue), var(--teal), transparent 80%);
+      }
+
+      .toc {
+        position: sticky;
+        top: 0;
+        z-index: 4;
+        display: flex;
+        gap: 0.4rem 1.15rem;
+        padding: 0.8rem 0;
+        overflow-x: auto;
+        color: var(--muted);
+        font-size: 0.84rem;
+        white-space: nowrap;
+        background: color-mix(in srgb, var(--paper) 90%, transparent);
+        backdrop-filter: blur(12px);
+      }
+
+      .toc a {
+        text-decoration: none;
+        border-bottom: 1px solid transparent;
+      }
+
+      .toc a:hover,
+      .toc a:focus-visible {
+        color: var(--blue);
+        border-bottom-color: currentColor;
+      }
+
+      main { padding-bottom: 5rem; }
+
+      main:focus { outline: none; }
+
+      section { padding: clamp(2.6rem, 6vw, 5.4rem) 0; }
+
+      section + section { border-top: 1px solid var(--line); }
+
+      .section-kicker {
+        margin-bottom: 0.5rem;
+        color: var(--blue);
+        font-size: 0.76rem;
+        font-weight: 760;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+
+      h2 {
+        max-width: 28ch;
+        margin-bottom: 1rem;
+        color: var(--navy);
+        font-size: clamp(1.75rem, 3.5vw, 2.6rem);
+        line-height: 1.16;
+        letter-spacing: -0.035em;
+      }
+
+      h3 {
+        margin-bottom: 0.5rem;
+        color: var(--navy);
+        font-size: 1.05rem;
+        line-height: 1.35;
+      }
+
+      .section-intro {
+        max-width: 61rem;
+        color: var(--muted);
+        font-size: 1.02rem;
+      }
+
+      .verdict {
+        display: grid;
+        grid-template-columns: minmax(0, 1.1fr) minmax(18rem, 0.9fr);
+        overflow: hidden;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        box-shadow: var(--shadow);
+      }
+
+      .verdict-main { padding: clamp(1.5rem, 4vw, 2.8rem); }
+
+      .verdict-main h2 { margin-bottom: 0.7rem; }
+
+      .verdict-side {
+        display: grid;
+        align-content: center;
+        gap: 1rem;
+        padding: clamp(1.5rem, 4vw, 2.8rem);
+        color: #fff;
+        background: linear-gradient(145deg, #193a70, #10656c);
+      }
+
+      .verdict-side strong {
+        display: block;
+        margin-bottom: 0.25rem;
+        font-size: 1.65rem;
+        line-height: 1.1;
+      }
+
+      .verdict-side p {
+        margin: 0;
+        color: rgba(255, 255, 255, 0.82);
+        font-size: 0.91rem;
+      }
+
+      .grid { display: grid; gap: 1rem; }
+      .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+      .card {
+        padding: 1.25rem;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-md);
+      }
+
+      .card p:last-child { margin-bottom: 0; }
+
+      .number {
+        display: grid;
+        width: 2rem;
+        height: 2rem;
+        margin-bottom: 0.85rem;
+        color: var(--blue);
+        font-size: 0.84rem;
+        font-weight: 800;
+        place-items: center;
+        background: var(--blue-soft);
+        border-radius: 999px;
+      }
+
+      .state-card:nth-child(1) .number { color: var(--blue); background: var(--blue-soft); }
+      .state-card:nth-child(2) .number { color: var(--teal); background: var(--teal-soft); }
+      .state-card:nth-child(3) .number { color: var(--violet); background: var(--violet-soft); }
+
+      .callout {
+        margin-top: 1.4rem;
+        padding: 1rem 1.1rem;
+        color: var(--ink);
+        background: var(--amber-soft);
+        border-left: 4px solid var(--amber);
+        border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+      }
+
+      .callout strong { color: var(--amber); }
+
+      .flow {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 0.65rem;
+        margin-top: 1.6rem;
+      }
+
+      .flow-step {
+        position: relative;
+        min-height: 10.5rem;
+        padding: 1.1rem;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-md);
+      }
+
+      .flow-step:not(:last-child)::after {
+        position: absolute;
+        top: 50%;
+        right: -0.66rem;
+        z-index: 1;
+        width: 0.66rem;
+        height: 2px;
+        content: "";
+        background: var(--blue);
+      }
+
+      .flow-step:not(:last-child)::before {
+        position: absolute;
+        top: calc(50% - 0.24rem);
+        right: -0.66rem;
+        z-index: 2;
+        width: 0.5rem;
+        height: 0.5rem;
+        content: "";
+        background: var(--blue);
+        clip-path: polygon(0 0, 100% 50%, 0 100%);
+      }
+
+      .flow-step small {
+        display: block;
+        margin-bottom: 0.45rem;
+        color: var(--blue);
+        font-size: 0.73rem;
+        font-weight: 790;
+        letter-spacing: 0.08em;
+      }
+
+      .flow-step p {
+        margin-bottom: 0;
+        color: var(--muted);
+        font-size: 0.89rem;
+      }
+
+      .risk-list {
+        display: grid;
+        gap: 0.75rem;
+        margin-top: 1.4rem;
+      }
+
+      .risk {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: 1rem;
+        padding: 1.08rem 1.15rem;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-md);
+      }
+
+      .risk-badge {
+        align-self: start;
+        padding: 0.22rem 0.48rem;
+        color: var(--rose);
+        font-size: 0.72rem;
+        font-weight: 820;
+        letter-spacing: 0.06em;
+        background: var(--rose-soft);
+        border-radius: 999px;
+      }
+
+      .risk h3 { margin-bottom: 0.2rem; }
+      .risk p { margin: 0; color: var(--muted); }
+
+      .architecture {
+        display: grid;
+        gap: 0.75rem;
+        margin-top: 1.7rem;
+      }
+
+      .layer {
+        display: grid;
+        grid-template-columns: 12rem minmax(0, 1fr) minmax(11rem, 0.7fr);
+        gap: 1rem;
+        align-items: center;
+        padding: 1rem 1.1rem;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-md);
+      }
+
+      .layer-name {
+        font-weight: 800;
+        letter-spacing: -0.015em;
+      }
+
+      .layer p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+
+      .layer-tag {
+        justify-self: start;
+        padding: 0.22rem 0.52rem;
+        font-size: 0.77rem;
+        font-weight: 740;
+        border-radius: 999px;
+      }
+
+      .authority { color: var(--teal); background: var(--teal-soft); }
+      .derived { color: var(--blue); background: var(--blue-soft); }
+      .optional { color: var(--violet); background: var(--violet-soft); }
+      .physical { color: var(--amber); background: var(--amber-soft); }
+
+      .planner {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(18rem, 0.8fr);
+        gap: 1.2rem;
+        margin-top: 1.6rem;
+      }
+
+      .planner-panel {
+        padding: 1.35rem;
+        background: var(--navy);
+        border-radius: var(--radius-md);
+      }
+
+      .planner-panel h3 { color: #fff; }
+      .planner-panel p { color: rgba(255, 255, 255, 0.75); }
+
+      pre {
+        margin: 0;
+        padding: 1rem;
+        overflow-x: auto;
+        color: #e7f0ff;
+        font: 0.82rem/1.55 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        background: rgba(0, 0, 0, 0.18);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: var(--radius-sm);
+      }
+
+      .sequence {
+        display: grid;
+        gap: 0.65rem;
+        counter-reset: policy;
+      }
+
+      .sequence li {
+        position: relative;
+        min-height: 2.5rem;
+        padding: 0.55rem 0.6rem 0.55rem 3rem;
+        list-style: none;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+      }
+
+      .sequence li::before {
+        position: absolute;
+        left: 0.7rem;
+        top: 0.55rem;
+        width: 1.55rem;
+        height: 1.55rem;
+        color: var(--blue);
+        font-size: 0.75rem;
+        font-weight: 800;
+        line-height: 1.55rem;
+        text-align: center;
+        content: counter(policy);
+        counter-increment: policy;
+        background: var(--blue-soft);
+        border-radius: 999px;
+      }
+
+      .decision-table, .test-table {
+        width: 100%;
+        margin-top: 1.35rem;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-collapse: separate;
+        border-spacing: 0;
+        border-radius: var(--radius-md);
+      }
+
+      th, td {
+        padding: 0.92rem 1rem;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        color: var(--navy);
+        font-size: 0.79rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        background: color-mix(in srgb, var(--blue-soft) 56%, var(--panel));
+      }
+
+      tr:last-child td { border-bottom: 0; }
+      td { color: var(--muted); }
+      td:first-child { color: var(--ink); font-weight: 720; }
+
+      .roadmap {
+        display: grid;
+        gap: 0;
+        margin-top: 1.4rem;
+      }
+
+      .phase {
+        display: grid;
+        grid-template-columns: 4.4rem minmax(0, 1fr);
+        gap: 1.1rem;
+        padding: 0 0 1.35rem;
+      }
+
+      .phase:last-child { padding-bottom: 0; }
+
+      .phase-index {
+        position: relative;
+        display: grid;
+        width: 2.4rem;
+        height: 2.4rem;
+        color: var(--blue);
+        font-size: 0.85rem;
+        font-weight: 850;
+        place-items: center;
+        background: var(--blue-soft);
+        border-radius: 999px;
+      }
+
+      .phase:not(:last-child) .phase-index::after {
+        position: absolute;
+        top: 2.4rem;
+        width: 2px;
+        height: calc(100% - 2.4rem);
+        content: "";
+        background: var(--line);
+      }
+
+      .phase h3 { margin-bottom: 0.18rem; }
+      .phase p { margin: 0; color: var(--muted); }
+
+      .source-list {
+        columns: 2 18rem;
+        gap: 1.2rem 2rem;
+        margin: 1.15rem 0 0;
+        padding-left: 1.2rem;
+        color: var(--muted);
+        font-size: 0.88rem;
+      }
+
+      .source-list li { margin-bottom: 0.52rem; }
+      .source-list code { color: var(--blue); }
+
+      .footer {
+        padding: 2.2rem 0 3.1rem;
+        color: var(--muted);
+        font-size: 0.86rem;
+        border-top: 1px solid var(--line);
+      }
+
+      .footer strong { color: var(--ink); }
+
+      @media (max-width: 850px) {
+        .verdict, .planner { grid-template-columns: 1fr; }
+        .grid-3, .flow { grid-template-columns: 1fr; }
+        .grid-2 { grid-template-columns: 1fr; }
+        .flow-step { min-height: auto; }
+        .flow-step:not(:last-child)::after {
+          top: auto;
+          right: auto;
+          bottom: -0.66rem;
+          left: 1.55rem;
+          width: 2px;
+          height: 0.66rem;
+        }
+        .flow-step:not(:last-child)::before {
+          top: auto;
+          right: auto;
+          bottom: -0.66rem;
+          left: calc(1.55rem - 0.24rem);
+          width: 0.5rem;
+          height: 0.5rem;
+          clip-path: polygon(0 0, 100% 0, 50% 100%);
+        }
+        .layer { grid-template-columns: 1fr; gap: 0.35rem; }
+      }
+
+      @media (max-width: 620px) {
+        .shell { width: min(calc(100% - 1.25rem), var(--content)); }
+        .toc { margin: 0 -0.625rem; padding-left: 0.625rem; padding-right: 0.625rem; }
+        .decision-table, .test-table { display: block; overflow-x: auto; white-space: normal; }
+        th, td { min-width: 12.5rem; }
+      }
+
+      @media print {
+        :root { --paper: #fff; --panel: #fff; --ink: #111827; --muted: #42516a; }
+        body { background: #fff; }
+        .toc, .skip-link { display: none; }
+        .hero { padding-top: 1.2rem; }
+        section { padding: 1.8rem 0; }
+        .card, .risk, .layer, .verdict, .flow-step, .phase {
+          break-inside: avoid;
+          box-shadow: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <a class="skip-link" href="#report">跳到报告正文</a>
+
+    <header class="shell hero">
+      <p class="eyebrow">Architecture review · 2026-09-09</p>
+      <h1>Bone 的上下文，不该只是“越长越摘要”。</h1>
+      <p class="lede">
+        这份报告审视现有 Runtime checkpoint、Session bootstrap 与持久化边界，提出一套从单次模型调用到跨 Runtime 连续性的上下文生命周期设计。
+      </p>
+      <div class="hero-meta" aria-label="报告标签">
+        <span class="chip">只读设计审计</span>
+        <span class="chip">范围：Core · Adapter · App · Storage</span>
+        <span class="chip">建议优先级：连续性 → 预算 → 边界 → 持久化</span>
+      </div>
+      <div class="hero-rule" aria-hidden="true"></div>
+    </header>
+
+    <nav class="shell toc" aria-label="报告目录">
+      <a href="#verdict">结论</a>
+      <a href="#today">今天已有的基座</a>
+      <a href="#risks">必须先修的断点</a>
+      <a href="#architecture">目标架构</a>
+      <a href="#planner">压缩策略</a>
+      <a href="#decisions">产品语义</a>
+      <a href="#roadmap">实施路线</a>
+      <a href="#tests">验收门槛</a>
+    </nav>
+
+    <main id="report" class="shell" tabindex="-1">
+      <section id="verdict" aria-labelledby="verdict-title">
+        <div class="verdict">
+          <div class="verdict-main">
+            <p class="section-kicker">Executive verdict</p>
+            <h2 id="verdict-title">基座已具备；缺的是完整的上下文生命周期。</h2>
+            <p>
+              Bone 已经避开了传统 transcript 回放的主要陷阱：它将权威事实保存为不可变 Record，按 Job
+              投影模型输入，并只压缩已读前缀。这个方向应当保留。
+            </p>
+            <p>
+              但目前它仍是<strong>局部的 Runtime 内压缩骨架</strong>，尚未形成稳定的跨 turn、跨 Runtime
+              连续性。最紧急的风险不是摘要文笔，而是：新回合看不到刚完成的结果、Core 字节预算不等于真实模型窗口、分页正文可失联，以及 history 绕过 Job 边界。
+            </p>
+          </div>
+          <aside class="verdict-side" aria-label="报告结论摘要">
+            <div>
+              <strong>保留</strong>
+              <p>不可变事实、Job 隔离、evidence、分页、已读前缀压缩。</p>
+            </div>
+            <div>
+              <strong>补齐</strong>
+              <p>统一 ContextPlanner、结构化 Working Memory、Session Capsule 与物理增长治理。</p>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="today" aria-labelledby="today-title">
+        <p class="section-kicker">Current foundation</p>
+        <h2 id="today-title">现在的实现不是没有上下文管理，而是两套尚未闭环的机制。</h2>
+        <p class="section-intro">
+          Runtime 内，Core 以 Job 为边界重建 WorkInput；跨 Runtime，App 从 durable public events 中摘取近期 background。
+          两者各自有价值，但还没有共同的连续性与预算契约。
+        </p>
+
+        <div class="flow" aria-label="当前上下文数据流">
+          <article class="flow-step">
+            <small>01 · AUTHORITY</small>
+            <h3>不可变事实</h3>
+            <p>已被 Agent 接受的输入及其工具结果、回复、Outcome 进入不可变 Record / agent journal；App 输入生命周期另以 SessionEvent 持久化。两者共同构成可审计事实。</p>
+          </article>
+          <article class="flow-step">
+            <small>02 · RUNTIME</small>
+            <h3>按 Job 投影</h3>
+            <p>每轮 Worker 组装 spec、constraints、checkpoint、records、calls 与 tools，而非回放完整聊天。</p>
+          </article>
+          <article class="flow-step">
+            <small>03 · COMPACTION</small>
+            <h3>已读前缀 checkpoint</h3>
+            <p>超限时将已成功交给模型的旧 records 压成 summary + evidence，未读后缀保持原样。</p>
+          </article>
+          <article class="flow-step">
+            <small>04 · RESTART</small>
+            <h3>近期 public bootstrap</h3>
+            <p>新 Runtime 从 session history 取最近事件作为只读 background；它不是稳定的 Session 记忆。</p>
+          </article>
+        </div>
+
+        <div class="grid grid-3" style="margin-top: 1.3rem">
+          <article class="card state-card">
+            <div class="number">1</div>
+            <h3>模型输入膨胀</h3>
+            <p>单次请求能否真正装进 provider window，并留出输出空间。摘要只能部分解决它。</p>
+          </article>
+          <article class="card state-card">
+            <div class="number">2</div>
+            <h3>Runtime 热状态膨胀</h3>
+            <p>records、jobs、calls 与全量 AgentView 持续增长，影响内存和 observe 成本。</p>
+          </article>
+          <article class="card state-card">
+            <div class="number">3</div>
+            <h3>持久历史膨胀</h3>
+            <p>append-only journal、启动扫描和历史读取需要索引、快照、冷热分层与 retention 协议。</p>
+          </article>
+        </div>
+
+        <aside class="callout">
+          <strong>关键判断：</strong>一个 summary 机制无法同时解决这三种增长。必须分别处理“模型投影”“热状态”和“耐久历史”。
+        </aside>
+      </section>
+
+      <section id="risks" aria-labelledby="risks-title">
+        <p class="section-kicker">P0 risks</p>
+        <h2 id="risks-title">先修这些断点，再谈更聪明的摘要。</h2>
+        <p class="section-intro">
+          以下问题会直接造成遗忘、越界、不可恢复的失败或上下文自我放大。它们都是架构不变量问题，而不是 prompt 调优问题。
+        </p>
+
+        <div class="risk-list">
+          <article class="risk">
+            <span class="risk-badge">P0 · 连续性</span>
+            <div>
+              <h3>普通追问可能看不到刚完成的结论</h3>
+              <p>bootstrap 只在 Runtime 创建时生成；新的 Coordinator 自动投影只含当前输入、constraints、冻结 bootstrap 与未完成 root。用户说“按上面的方案实现”时，刚完成的 Reply / Outcome 不会自动进入下一回合。</p>
+            </div>
+          </article>
+          <article class="risk">
+            <span class="risk-badge">P0 · 预算</span>
+            <div>
+              <h3><code>context_bytes</code> 不等于真实 provider 窗口</h3>
+              <p>Core 预算的是 DTO 字节；Adapter 之后还追加 instructions、外层包装和 tool schema，且没有统一 output reserve。Core 合规并不能保证请求真的可发、可输出。</p>
+            </div>
+          </article>
+          <article class="risk">
+            <span class="risk-badge">P0 · 隔离</span>
+            <div>
+              <h3><code>session_history</code> 混淆了 UI 历史、模型记忆与 Job 权限</h3>
+              <p>worker 可读取 session-global 的公开 history；由于当前 ToolFinished 会投影为公开事件，它可能看到未通过 Job delivery / evidence 链路进入的 sibling 工具结果。其返回又可形成 ToolFinished，存在 history-of-history 的递归放大路径。</p>
+            </div>
+          </article>
+          <article class="risk">
+            <span class="risk-badge">P0 · 分页</span>
+            <div>
+              <h3>checkpoint 后，大正文的下一页可能失去可发现性</h3>
+              <p><code>read_through</code> 表示模型见过通知，不表示已读完整 body；checkpoint 没有结构化保存未完成的 source / offset / cursor。</p>
+            </div>
+          </article>
+          <article class="risk">
+            <span class="risk-badge">P0 · 可表示性</span>
+            <div>
+              <h3>合法状态也可能完全无法构造下一次调用</h3>
+              <p>children、inquiries、calls、background、tools 等固定区块不可分页，records 即使全部压缩，仍可能因合法对象数量增长而 TooLarge。</p>
+            </div>
+          </article>
+          <article class="risk">
+            <span class="risk-badge">P0 · 可靠性</span>
+            <div>
+              <h3>内部 compaction 失败有机会直接终止用户 Job</h3>
+              <p>provider 临时故障、超时、截断或不合格摘要应是可恢复的维护状态；它们不能天然拥有结束业务任务的权限，也不能引发重复副作用。</p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="architecture" aria-labelledby="architecture-title">
+        <p class="section-kicker">Target model</p>
+        <h2 id="architecture-title">用分层代替一个万能的 ContextManager。</h2>
+        <p class="section-intro">
+          权威事实、单 Job 工作记忆、跨 Runtime 会话记忆、检索和物理回收的职责不同。混在一个对象里，最终会让摘要拥有不该有的权威，也让 retention 变得不可验证。
+        </p>
+
+        <div class="architecture" aria-label="建议的上下文层级">
+          <article class="layer">
+            <div class="layer-name">Raw Records / Journal</div>
+            <p>输入、工具调用与结果、回复、Outcome、记录证据。它是审计、恢复与重建的唯一权威来源。</p>
+            <span class="layer-tag authority">权威 · 不可变</span>
+          </article>
+          <article class="layer">
+            <div class="layer-name">ContextPlanner</div>
+            <p>按 Coordinate / Work / Compact 的真实预算，纯函数式地选择 pinned、checkpoint、recent tail、retrieved 与 omitted manifest。</p>
+            <span class="layer-tag derived">派生 · 可重放</span>
+          </article>
+          <article class="layer">
+            <div class="layer-name">Job Working Memory</div>
+            <p>单个 Job 的决定、完成项、失败尝试、open loops、artifact 状态与未读 cursor；控制当前 Runtime 的工作窗口。</p>
+            <span class="layer-tag derived">派生 · Runtime-local</span>
+          </article>
+          <article class="layer">
+            <div class="layer-name">Session Memory Capsule</div>
+            <p>跨 turn、跨 Runtime 的用户可见连续性。由 App 拥有、版本化、带 stable provenance，且可从原始事实重建。</p>
+            <span class="layer-tag derived">派生 · 耐久</span>
+          </article>
+          <article class="layer">
+            <div class="layer-name">Retrieval Index</div>
+            <p>用于很久以前或跨 Session 的按需召回。embedding / vector 索引永远是可重建的辅助层，不是事实源。</p>
+            <span class="layer-tag optional">可选 · 可重建</span>
+          </article>
+          <article class="layer">
+            <div class="layer-name">Retention / GC</div>
+            <p>热数据、冷数据、归档与真正删除。必须在 evidence、cursor、artifact lineage 和 history cursor 的引用闭包定义之后实施。</p>
+            <span class="layer-tag physical">物理生命周期</span>
+          </article>
+        </div>
+
+        <aside class="callout">
+          <strong>不可妥协的权威规则：</strong>memory 与 checkpoint 都是“带出处的派生视图”。它们可以帮助模型回忆，不能覆盖 raw facts，更不能凭自身扩大权限或重新授权行动。
+        </aside>
+      </section>
+
+      <section id="planner" aria-labelledby="planner-title">
+        <p class="section-kicker">Planning &amp; compaction</p>
+        <h2 id="planner-title">把“能不能塞进模型”变成可验证的规划问题。</h2>
+        <p class="section-intro">
+          ContextPlanner 应在完整请求形式上闭合预算；字节上限继续用于内部安全，但模型调用必须以 token window 为准。不同 consumer 有不同模型、工具和输出需求，应分别规划。
+        </p>
+
+        <div class="planner">
+          <article class="planner-panel">
+            <h3>最终请求预算</h3>
+            <pre>available_input_tokens =
+    model_context_window
+  - reserved_output_tokens
+  - instructions_tokens
+  - tool_schema_tokens
+  - provider_envelope_tokens
+  - safety_margin</pre>
+            <p>最后一跳由 Adapter 对完整 messages + tools 验证。Provider usage 应回传给 Planner，用于成本、真实余量与策略观测。</p>
+          </article>
+
+          <ol class="sequence" aria-label="上下文装配与压缩顺序">
+            <li><strong>Pinned：</strong>当前输入、contract、constraints、未回答 inquiry、active/unknown side effect、waiting state、未完成 cursor。</li>
+            <li><strong>Working memory：</strong>结构化 checkpoint，含完成项、决定、失败尝试、open loops 与按 claim 绑定的 evidence。</li>
+            <li><strong>Recent raw tail：</strong>保留近期原始语义尾部，避免只剩摘要导致漂移与因果断裂。</li>
+            <li><strong>Retrieved：</strong>按需引入长历史；明确标注为低权威的检索内容与出处。</li>
+            <li><strong>Optional：</strong>最后才丢生命周期噪声、重复状态和完整旧日志；pinned 本身超限时返回 typed overflow，而非静默篡改。</li>
+          </ol>
+        </div>
+
+        <div class="grid grid-2" style="margin-top: 1.2rem">
+          <article class="card">
+            <h3>压缩必须有 liveness 证明</h3>
+            <p>触发可采用约 75–80% 高水位，目标压回 50–60%，保留约 20–25% 原始尾部。更重要的是每次压缩必须证明尺寸实质下降、达到最小节省量，并为下一条 mandatory item 留出空间。</p>
+          </article>
+          <article class="card">
+            <h3>cursor 是 Kernel 状态，不是摘要文案</h3>
+            <p>维护 <code>{ source, next_offset, state }</code> 的消费账本。模型可以确认某页已满足，但不能仅依赖自然语言 summary 记住“还有第二页”。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="decisions" aria-labelledby="decisions-title">
+        <p class="section-kicker">Product contract</p>
+        <h2 id="decisions-title">这几条语义，需要在实现前先由产品定下来。</h2>
+        <p class="section-intro">
+          你最值得参与的不是“摘要 prompt 怎么写”，而是哪些历史应连续、哪些事实可忘、哪些权限绝不能由记忆恢复。这些选择决定后续数据模型和测试边界。
+        </p>
+
+        <table class="decision-table">
+          <thead>
+            <tr>
+              <th scope="col">决策</th>
+              <th scope="col">建议默认值</th>
+              <th scope="col">原因</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>同一 Session 的普通追问</td>
+              <td>跨 turn、跨 Runtime 保持认知连续性</td>
+              <td>此前目标、决定、结果、产物状态、未决项应可见，否则自然追问会断裂。</td>
+            </tr>
+            <tr>
+              <td>重启与副作用</td>
+              <td>恢复状态，不自动恢复行动</td>
+              <td>memory 可以说“此前运行到哪”，但不能重新发送、写入、执行或扩大曾经的授权。</td>
+            </tr>
+            <tr>
+              <td>跨 Session 召回</td>
+              <td>第一版默认关闭；以后显式 opt-in</td>
+              <td>先把单 Session 的确定性、隐私和可解释性做稳，再引入长时或 Workspace 记忆。</td>
+            </tr>
+            <tr>
+              <td>超大当前输入</td>
+              <td>转不可变 attachment + 分页 ingestion，或明确拒绝</td>
+              <td>当前用户授权不能被静默摘要。不能出现“App 接受了输入、Coordinator 注定装不下”的灰区。</td>
+            </tr>
+            <tr>
+              <td>长期记忆中的工具信息</td>
+              <td>保留脱敏摘要、稳定 ref、参数 provenance；正文按页读取</td>
+              <td>只记工具名与结果会丢失 command/path/query 上下文；整段原始输出又会污染 bootstrap。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="roadmap" aria-labelledby="roadmap-title">
+        <p class="section-kicker">Delivery order</p>
+        <h2 id="roadmap-title">按不变量推进，而不是按“摘要功能”推进。</h2>
+        <div class="roadmap" aria-label="建议实施阶段">
+          <article class="phase">
+            <div class="phase-index">0</div>
+            <div>
+              <h3>先写 RFC 与边界测试</h3>
+              <p>固定 Session continuity、authority、privacy、restart、overflow 与 retention 的语义。先让不变量可读、可争论、可测试。</p>
+            </div>
+          </article>
+          <article class="phase">
+            <div class="phase-index">1</div>
+            <div>
+              <h3>闭合真实模型预算</h3>
+              <p>Provider window 元数据、完整 envelope 计数、output reserve、usage 回传、typed overflow，以及最多一次 compact → retry。</p>
+            </div>
+          </article>
+          <article class="phase">
+            <div class="phase-index">2</div>
+            <div>
+              <h3>修复连续性与 history 边界</h3>
+              <p>每次输入接受时创建冻结的 Session Context snapshot；将 UI/audit history 与 model memory 分离；消除 history 自我递归。</p>
+            </div>
+          </article>
+          <article class="phase">
+            <div class="phase-index">3</div>
+            <div>
+              <h3>升级 Job Working Memory</h3>
+              <p>结构化 decisions、failures、open loops、artifact state、frozen evidence boundary、cursor ledger 和 recent raw tail。</p>
+            </div>
+          </article>
+          <article class="phase">
+            <div class="phase-index">4</div>
+            <div>
+              <h3>实现耐久 Session Memory Capsule</h3>
+              <p>App-owned、版本化、可重建；raw facts 耐久后再原子更新 checkpoint head，新 Runtime 用 capsule + recent tail 启动。</p>
+            </div>
+          </article>
+          <article class="phase">
+            <div class="phase-index">5</div>
+            <div>
+              <h3>治理物理增长，最后才做 retrieval</h3>
+              <p>增量 observation、热点索引、body 冷存储、schema migration、retention 协议；向量检索永远保持为可重建派生层。</p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="tests" aria-labelledby="tests-title">
+        <p class="section-kicker">Acceptance gates</p>
+        <h2 id="tests-title">第一阶段的完成标准，应该是这些失败模式被锁死。</h2>
+        <p class="section-intro">
+          若第一期只能投入五组架构测试，建议优先锁住能否调用、压缩是否越界、分页是否连续、历史是否隔离、重启是否安全续上这五条基本生命线。
+        </p>
+
+        <table class="test-table">
+          <thead>
+            <tr>
+              <th scope="col">测试</th>
+              <th scope="col">场景</th>
+              <th scope="col">必须成立的不变量</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>A · 真实窗口预算</td>
+              <td>Coordinate / Work / Compact；ASCII、中文、emoji、大 schema</td>
+              <td>完整 provider request 的输入 token + output reserve 不超过实际模型窗口。</td>
+            </tr>
+            <tr>
+              <td>C · 冻结边界</td>
+              <td>checkpoint 冻结于 T；T+1 在 compaction 中抵达；同时变更 contract</td>
+              <td>T+1 不可作为旧 checkpoint evidence；新数据保持 unread；旧 revision checkpoint 被丢弃。</td>
+            </tr>
+            <tr>
+              <td>D · 分页连续性</td>
+              <td>关键事实只在第 2/3 页；连续执行 20 次 checkpoint</td>
+              <td>无测试私有 offset 提示时，模型仍可从结构化 cursor 发现并读取余页。</td>
+            </tr>
+            <tr>
+              <td>F · history 隔离与非递归</td>
+              <td>sibling A/B 分别产生工具结果；连续读取 history 100 次</td>
+              <td>未 publish 的 sibling 内容不可见；history 不嵌套 history；增长斜率有明确上界。</td>
+            </tr>
+            <tr>
+              <td>G · 重启恢复</td>
+              <td>checkpoint durable 后、Outcome 前模拟崩溃</td>
+              <td>重启保留目标、进度、失败、open loops、evidence 与 cursor；绝不自动重复副作用。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="sources" aria-labelledby="sources-title">
+        <p class="section-kicker">Evidence trail</p>
+        <h2 id="sources-title">本报告基于当前代码与文档的只读审计。</h2>
+        <p class="section-intro">
+          下列定位点覆盖 Record / checkpoint、调度、模型请求、Session bootstrap、公开事件投影、持久化恢复和存储边界。报告没有修改任何实现文件。
+        </p>
+        <ul class="source-list">
+          <li><code>crates/bone-core/src/context.rs:22, 185, 331, 363, 571, 762</code></li>
+          <li><code>crates/bone-core/src/job.rs:309</code></li>
+          <li><code>crates/bone-core/src/kernel/scheduler.rs:383, 498</code></li>
+          <li><code>crates/bone-core/src/kernel/exchange.rs:189</code></li>
+          <li><code>crates/bone-core/src/kernel/work.rs:594</code></li>
+          <li><code>crates/bone-core/src/kernel/mod.rs:589</code></li>
+          <li><code>crates/bone-core/src/config.rs:23, 83</code></li>
+          <li><code>crates/bone-adapters/src/agent/model.rs:114, 132</code></li>
+          <li><code>crates/bone-adapters/src/llm/response.rs:42</code></li>
+          <li><code>crates/bone-app/src/session.rs:63, 926</code></li>
+          <li><code>crates/bone-app/src/tools.rs:118, 190, 220</code></li>
+          <li><code>crates/bone-app/src/persistence.rs:524, 614, 1080</code></li>
+          <li><code>crates/bone-app/src/api.rs:374</code></li>
+          <li><code>crates/bone-app/src/storage/schema.rs:44</code></li>
+          <li><code>crates/bone-app/src/storage/journal.rs:155</code></li>
+          <li><code>docs/core.md:111, 123, 172</code></li>
+          <li><code>docs/app.md:179, 187</code></li>
+        </ul>
+      </section>
+    </main>
+
+    <footer class="shell footer">
+      <strong>Bone · 上下文生命周期设计报告</strong><br />
+      结论：优先建立连续性与权威边界，再提高摘要能力；优先保证可验证地续上，再追求更长的记忆。
+    </footer>
+  </body>
+</html>
