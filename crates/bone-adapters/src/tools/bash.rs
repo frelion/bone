@@ -776,7 +776,7 @@ mod tests {
 
         let output = tool
             .call(BashArgs {
-                command: "printf 'started'; sleep 30".to_owned(),
+                command: "sleep 30".to_owned(),
                 cwd: None,
                 timeout_secs: None,
             })
@@ -785,9 +785,49 @@ mod tests {
 
         assert!(output.timed_out);
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(output.stdout, "started");
         #[cfg(unix)]
         assert_eq!(output.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn timing_out_preserves_stdout_from_a_ready_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = Command::new(SHELL);
+        command
+            .arg("-c")
+            .arg("printf 'started'; printf 'ready' >&2; read -r reply")
+            .current_dir(temp.path())
+            .env_clear()
+            .envs(sanitized_process_environment())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = ChildGuard::new(command.spawn().unwrap());
+        // Keep stdin open outside Child so wait() cannot close it and release read.
+        let stdin = child.child_mut().stdin.take().unwrap();
+        let mut ready_pipe = child.child_mut().stderr.take().unwrap();
+        let stdout = CaptureTask::spawn(child.child_mut().stdout.take().unwrap(), 1024);
+
+        let mut ready = [0; 5];
+        tokio::time::timeout(Duration::from_secs(5), ready_pipe.read_exact(&mut ready))
+            .await
+            .expect("Bash did not signal readiness")
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+
+        let (_, timed_out) = child
+            .wait_with_timeout(Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(timed_out);
+        child.disarm();
+        drop(stdin);
+
+        let stdout = stdout.finish("stdout").await.unwrap().into_text(1024);
+        assert_eq!(stdout, ("started".into(), false));
     }
 
     #[cfg(unix)]
