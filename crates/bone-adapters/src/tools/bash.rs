@@ -792,22 +792,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn timing_out_kills_descendants() {
+    async fn timing_out_kills_ready_descendants_and_preserves_captured_stdout() {
         let temp = tempfile::tempdir().unwrap();
-        let tool = tool_with_timeout(temp.path(), Duration::from_secs(1));
+        let child = Command::new(SHELL)
+            .arg("-c")
+            .arg("printf 'started'; sleep 30 & echo $! > child.pid; wait")
+            .current_dir(temp.path())
+            .env_clear()
+            .envs(sanitized_process_environment())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard::new(child);
+        let stdout = CaptureTask::spawn(child.child_mut().stdout.take().unwrap(), 1024);
 
-        let output = tool
-            .call(BashArgs {
-                command: "printf 'started'; sleep 30 & echo $! > child.pid; wait".to_owned(),
-                cwd: None,
-                timeout_secs: None,
-            })
+        // Start the production timeout only after the descendant exists and
+        // stdout has been written; startup cannot consume the timeout under test.
+        let descendant = wait_for_pid(&temp.path().join("child.pid")).await;
+        let (status, timed_out) = child
+            .wait_with_timeout(Duration::from_millis(50))
             .await
             .unwrap();
+        assert!(timed_out);
+        assert_eq!(status.code(), None);
+        child.disarm();
 
-        assert!(output.timed_out);
-        assert_eq!(output.stdout, "started");
-        let descendant = wait_for_pid(&temp.path().join("child.pid")).await;
+        let stdout = stdout.finish("stdout").await.unwrap().into_text(1024);
+        assert_eq!(stdout, ("started".into(), false));
         assert!(wait_until_gone(descendant).await);
     }
 

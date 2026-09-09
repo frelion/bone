@@ -158,7 +158,7 @@ Patch path 必须是相对路径，不得包含 `..`，也不得穿过已有 sym
 - concurrent-change validation；
 - replacement temporary files 与 rollback backup。
 
-内部每个 `StagedAction` variant 自己携带提交和回滚所需的路径、snapshot、replacement 或 backup，不使用两个平行数组再依赖位置配对，因此计划与暂存不可能产生类型错配。
+内部每个 `StagedAction` variant 自己携带该动作提交和回滚所需的路径、snapshot、replacement 或 backup，不使用两个平行数组再依赖位置配对，因此计划与暂存不可能产生类型错配。
 
 提交尽可能使用 same-directory atomic replacement。后续 action 失败时，工具按相反顺序回滚已经提交的 action。它不是文件系统事务：创建过的空 parent directory 可能留下，极端 rollback failure 可能留下变更；错误会报告受影响的 workspace-relative path，并在可能时保留 recovery copy。
 

@@ -59,7 +59,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features --locked
-      - run: cargo test -p bone-app --lib storage:: --locked
+      - run: 'cargo test -p bone-app --lib storage:: --locked'
 
   windows:
     name: Windows checks
@@ -70,4 +70,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features --locked
-      - run: cargo test -p bone-app --lib storage:: --locked
+      - run: 'cargo test -p bone-app --lib storage:: --locked'

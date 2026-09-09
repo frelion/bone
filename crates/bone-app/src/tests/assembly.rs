@@ -151,7 +151,10 @@ async fn provider_assembly_completes_an_input_and_preserves_history_after_reopen
         } else {
             "offline assembly"
         };
-        assert!(context.contains(expected_context));
+        assert!(
+            context.contains(expected_context),
+            "{role} context omitted `{expected_context}`"
+        );
     }
 
     let history = session.history(SessionSeq(0), 256).await.unwrap();

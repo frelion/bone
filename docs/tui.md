@@ -131,7 +131,7 @@ Composer 始终存在，即使没有模型、尚未登录或 Session 暂时不�
 4. 如果调用方丢失回执，用相同 RequestId 和内容重试；
 5. Storage / validation 失败时原文留在 composer；配置或登录问题发生在 durable submit 之后时，输入显示 Queued 而不是回到未保存草稿。
 
-收到 `WaitingForUser` 时，composer 标明问题上下文。发送回答必须用 `SubmitInput::answer(question_id)`；如果回答随后因 stale question 进入 `Rejected`，恢复并保留回答文本，让用户选择作为普通新输入发送。
+收到 `WaitingForUser` 时，composer 标明问题上下文。发送回答必须用 `SubmitInput::answer(question_id)`；`Session::submit` 仍会先返回 durable `SubmissionReceipt`，回答随后可能因 stale question 进入 `InputState::Rejected`。前端此时恢复回答文本，让用户选择作为普通新输入发送。
 
 运行中继续输入是正常路径，不要求先 Stop。Esc 在没有 overlay 时发出当前 Session stop intent；有 overlay 时只关闭栈顶，绝不能同时停止 Agent。
 
