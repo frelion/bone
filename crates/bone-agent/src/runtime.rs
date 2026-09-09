@@ -33,6 +33,8 @@ pub enum AgentError {
     Closed,
     #[error("the agent runtime is shutting down")]
     ShuttingDown,
+    #[error("invalid agent configuration: {0}")]
+    InvalidConfiguration(String),
     #[error(transparent)]
     Admission(#[from] AdmissionError),
 }
@@ -93,6 +95,29 @@ impl Agent {
         self.control(ControlKind::Stop).await
     }
 
+    /// Pause scheduling without discarding the current job graph. Running
+    /// model calls are revoked; running tools are allowed to finish. The state
+    /// persists across reconfiguration until [`Agent::resume_scheduling`].
+    pub async fn suspend(&self) -> Result<(), AgentError> {
+        let (reply, result) = oneshot::channel();
+        self.controls
+            .send(Control::Suspend(reply))
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)?
+    }
+
+    /// Resume global scheduling after [`Agent::suspend`]. Configuration
+    /// installed while suspended becomes active at this boundary.
+    pub async fn resume_scheduling(&self) -> Result<(), AgentError> {
+        let (reply, result) = oneshot::channel();
+        self.controls
+            .send(Control::ResumeScheduling(reply))
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)?
+    }
+
     pub async fn resolve_write(
         &self,
         call: CallId,
@@ -100,6 +125,39 @@ impl Agent {
     ) -> Result<ControlOutcome, AgentError> {
         self.control(ControlKind::ResolveWrite { call, result })
             .await
+    }
+
+    /// Atomically replace execution ports and limits without replacing the
+    /// current job graph or changing whether scheduling is suspended. In an
+    /// active Agent, model calls restart immediately. Running tools finish on
+    /// the ports with which they started.
+    pub async fn reconfigure(
+        &self,
+        model: Arc<dyn ModelPort>,
+        tools: Vec<Arc<dyn ToolPort>>,
+        limits: AgentLimits,
+    ) -> Result<(), AgentError> {
+        let mut ports = BTreeMap::new();
+        let specifications = tools
+            .into_iter()
+            .map(|tool| {
+                let specification = tool.specification();
+                ports.insert(specification.name.clone(), (tool, specification.effect));
+                specification
+            })
+            .collect();
+        let (reply, result) = oneshot::channel();
+        self.controls
+            .send(Control::Reconfigure {
+                model,
+                tools: ports,
+                specifications,
+                limits,
+                reply,
+            })
+            .await
+            .map_err(|_| AgentError::Closed)?;
+        result.await.map_err(|_| AgentError::Closed)?
     }
 
     pub async fn observe(&self) -> Result<Observation, AgentError> {
@@ -203,6 +261,15 @@ enum Control {
         kind: ControlKind,
         reply: oneshot::Sender<Result<ControlOutcome, AgentError>>,
     },
+    Reconfigure {
+        model: Arc<dyn ModelPort>,
+        tools: BTreeMap<String, (Arc<dyn ToolPort>, ToolEffect)>,
+        specifications: Vec<crate::ToolSpec>,
+        limits: AgentLimits,
+        reply: oneshot::Sender<Result<(), AgentError>>,
+    },
+    Suspend(oneshot::Sender<Result<(), AgentError>>),
+    ResumeScheduling(oneshot::Sender<Result<(), AgentError>>),
     Observe(oneshot::Sender<Observation>),
     Shutdown,
 }
@@ -302,6 +369,42 @@ impl Actor {
             Control::Command { reply, .. } if self.shutting_down => {
                 let _ = reply.send(Err(AgentError::ShuttingDown));
             }
+            Control::Reconfigure { reply, .. } if self.shutting_down => {
+                let _ = reply.send(Err(AgentError::ShuttingDown));
+            }
+            Control::Suspend(reply) if self.shutting_down => {
+                let _ = reply.send(Err(AgentError::ShuttingDown));
+            }
+            Control::ResumeScheduling(reply) if self.shutting_down => {
+                let _ = reply.send(Err(AgentError::ShuttingDown));
+            }
+            Control::Suspend(reply) => {
+                let effects = self.kernel.suspend(self.now());
+                self.dispatch(effects);
+                let _ = reply.send(Ok(()));
+            }
+            Control::ResumeScheduling(reply) => {
+                let effects = self.kernel.resume_scheduling(self.now());
+                self.dispatch(effects);
+                let _ = reply.send(Ok(()));
+            }
+            Control::Reconfigure {
+                model,
+                tools,
+                specifications,
+                limits,
+                reply,
+            } => match self.kernel.reconfigure(self.now(), limits, specifications) {
+                Ok(effects) => {
+                    self.model = model;
+                    self.tools = tools;
+                    self.dispatch(effects);
+                    let _ = reply.send(Ok(()));
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(AgentError::InvalidConfiguration(error.to_string())));
+                }
+            },
             Control::Command { kind, reply } => {
                 let command = match kind {
                     ControlKind::Retry(input) => KernelControl::Retry(input),
@@ -743,6 +846,116 @@ mod tests {
             crate::InputStatus::Finished(crate::InputOutcome::Cancelled)
         ));
         assert!(retained_model.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn reconfigure_moves_pending_coordination_to_the_new_model() {
+        let (old_started, mut old_starts) = mpsc::unbounded_channel();
+        let agent = Agent::with_ports(
+            Arc::new(PendingModel {
+                started: old_started,
+            }),
+            Vec::new(),
+            AgentLimits::default(),
+        )
+        .unwrap();
+        agent
+            .post(Input::new(InputId(1), "switch models"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), old_starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (new_started, mut new_starts) = mpsc::unbounded_channel();
+        agent
+            .reconfigure(
+                Arc::new(PanicOnceModel {
+                    attempts: AtomicUsize::new(1),
+                    started: new_started,
+                }),
+                Vec::new(),
+                AgentLimits::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), new_starts.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let view = agent.observe().await.unwrap().baseline;
+        assert_eq!(
+            view.records
+                .iter()
+                .filter(|record| matches!(record.body, crate::RecordBody::CallStarted { .. }))
+                .count(),
+            2
+        );
+        assert!(view.records.iter().any(|record| matches!(
+            &record.body,
+            crate::RecordBody::CallFinished {
+                error: Some(CallError {
+                    kind: CallErrorKind::Cancelled,
+                    ..
+                }),
+                ..
+            }
+        )));
+        agent.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn suspended_reconfigure_needs_an_explicit_scheduling_resume() {
+        let (old_started, mut old_starts) = mpsc::unbounded_channel();
+        let agent = Agent::with_ports(
+            Arc::new(PendingModel {
+                started: old_started,
+            }),
+            Vec::new(),
+            AgentLimits::default(),
+        )
+        .unwrap();
+        agent
+            .post(Input::new(InputId(1), "switch while suspended"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), old_starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        agent.suspend().await.unwrap();
+        let (new_started, mut new_starts) = mpsc::unbounded_channel();
+        agent
+            .reconfigure(
+                Arc::new(PendingModel {
+                    started: new_started,
+                }),
+                Vec::new(),
+                AgentLimits::default(),
+            )
+            .await
+            .unwrap();
+
+        let view = agent.observe().await.unwrap().baseline;
+        assert_eq!(
+            view.records
+                .iter()
+                .filter(|record| matches!(record.body, crate::RecordBody::CallStarted { .. }))
+                .count(),
+            1
+        );
+
+        agent.resume_scheduling().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), new_starts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        agent.shutdown().await.unwrap();
     }
 
     #[tokio::test]

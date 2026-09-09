@@ -1,10 +1,10 @@
 # BONE TUI 配置、Workspace 与多 Session PRD
 
-> **历史 PRD（2026-09-09）。** 旧 TUI 与其中的直接 Store/SettingsService 契约已经移除；本文保留为产品素材，不是当前实现说明。当前后端契约见 [bone-app-design.md](../bone-app-design.md)，替代 TUI 尚未实现。
+> **历史 PRD（2026-09-09）。** 旧 TUI 与其中的直接 Store/SettingsService 契约已经移除。本文全文只保留为产品素材；下文即使标为“当前实现”或“生效契约”，也只描述已经退役的实现，不能覆盖当前行为。当前 App 契约以 [bone-app-design.md](../bone-app-design.md) 和 [configuration.md](../configuration.md) 为准；替代 TUI 尚未实现。
 
 | 字段 | 内容 |
 | --- | --- |
-| 文档状态 | 当前实现基线 + 后续体验设计参考 |
+| 文档状态 | 退役 TUI PRD，仅作未来产品参考 |
 | 目标版本 | SQLite `BoneStore` 重构完成后的 BONE TUI |
 | 产品优先级 | P0 |
 | 最后更新 | 2026-09-07 |
@@ -17,15 +17,15 @@
 >
 > 当前持久化与运行时边界如下：
 >
-> - BONE 自有设置、Workspace、Session、草稿、状态和会话事件历史只写入一个 SQLite 数据库。默认路径为 `$XDG_DATA_HOME/bone/store-v1/bone.sqlite3`，未设置 XDG 时为 `~/.local/share/bone/store-v1/bone.sqlite3`。数据库使用 WAL、`synchronous = FULL`、foreign keys 和 fail-fast Busy 语义；它不是用户设置入口，也不应手工编辑。
+> - BONE 自有设置、Workspace、Session、草稿、状态和会话事件历史只写入一个 SQLite 数据库。默认路径为 `$XDG_DATA_HOME/bone/bone.sqlite3`，未设置 XDG 时为 `~/.local/share/bone/bone.sqlite3`。数据库使用 WAL、`synchronous = FULL`、foreign keys 和 fail-fast Busy 语义；它不是用户设置入口，也不应手工编辑。
 > - App 在启动时只打开一次通用 `BoneStore`，并由 App 自己定义 settings、Workspace 和 Session 的 typed key 与记录。`documents` 和 `journal_entries` 是存储内部表；业务代码仅使用 typed `Document<T>`、`Journal<E>`、受限 transaction 与 lease，不能自行拼 SQL、路径或任意 key。
 > - `GlobalSettings` 保存可选的用户默认 Solver 和 Coordinator；`WorkspaceSettings` 保存工作目录默认 Solver；`SessionRecord` 保存当前会话 override；`LlmProfiles` 保存非 secret 的连接目录。Solver 解析顺序固定为 **Session override > Workspace default > User default**；未显式设置 Coordinator 时跟随有效 Solver。没有模型时正常进入 `NeedsModel`，不会猜测模型。
 > - `/model` 的保存立即持久化到其选择的 scope。已 attached 的 runtime 保持原来的不可变 `ResolvedAgentRuntimeConfig`；只有新建或重建 runtime 才解析新值。本轮没有 `/config` Settings Center、文件 watcher、跨进程设置通知或运行中热切换。
 > - 交互 TUI 启动时传入的 `--profile` / `--model` 会写入其打开的 Session override；one-shot 的显式 profile/model 仅对该次调用生效，并同时供应 Solver 与 Coordinator，不创建或持久化 `SessionRecord`。
 > - 每个已接受的用户消息在同一个 SQLite transaction 中写入 `UserTurnAccepted` journal fact 与 Session summary/state。提交失败时不得清空 Composer 或启动 Agent。SQLite document revision 只是不透明的乐观并发 token，不是面向用户的“配置版本”。Session writer lease 是 fail-fast OS lock；其他进程可只读打开该 Session。
-> - API-key profile 的 key 在操作系统 credential manager，绝不进入 SQLite；ChatGPT OAuth 是唯一的 JSON 例外：Rig 持有 schema 和 refresh 生命周期，App 的 `ChatGptCredentials` 只提供经权限检查的 `ChatGptAuthLease`。其私有 cache 默认在 `$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/store-v1/providers/chatgpt-subscription/`）。secret 永不进入 SQLite、journal、诊断或 TUI。活跃 Endpoint/Model 仍持有 lease 时，`/logout` 必须返回 Busy，不能删除 cache。
+> - API-key profile 的 key 在操作系统 credential manager，绝不进入 SQLite；ChatGPT OAuth 是唯一的 JSON 例外：Rig 持有 schema 和 refresh 生命周期，App 的 `ChatGptCredentials` 只提供经权限检查的 `ChatGptAuthLease`。其私有 cache 默认在 `$XDG_CONFIG_HOME/bone/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/providers/chatgpt-subscription/`）。secret 永不进入 SQLite、journal、诊断或 TUI。活跃 Endpoint/Model 仍持有 lease 时，`/logout` 必须返回 Busy，不能删除 cache。
 >
-> 历史本地数据不会被读取、迁移、覆盖或删除；新版本从新的 `store-v1` 根开始。`--events` 的 JSONL 是 one-shot 观察导出，不是 BONE 的 durable store，也不得被拿来恢复 Session。
+> 数据库只接受当前结构，不实现旧结构导入或双轨读写。`--events` 的 JSONL 是 one-shot 观察导出，不是 BONE 的 durable store，也不得被拿来恢复 Session。
 
 ## 1. 执行摘要
 
@@ -501,12 +501,12 @@ FatalStorageError
 
 ```text
 User data directory
-  └── `bone/store-v1/bone.sqlite3`
+  └── `bone/bone.sqlite3`
       ├── global settings, workspace registry and workspace settings
       └── session records, drafts, state and journals
 
 Private provider config directory
-  └── `bone/store-v1/providers/chatgpt-subscription/auth.json` (Rig-owned opaque cache)
+  └── `bone/providers/chatgpt-subscription/auth.json` (Rig-owned opaque cache)
 
 Workspace directory
   └── no implicit BONE internal data

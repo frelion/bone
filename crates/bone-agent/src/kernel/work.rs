@@ -437,6 +437,7 @@ impl Kernel {
                 revision,
                 effect: spec.effect,
                 request: request.clone(),
+                output_bytes: self.limits.tool_output_bytes,
             },
             Call::Tool(request),
             self.limits.tool_timeout,

@@ -98,9 +98,11 @@ authorization, sandboxing, and audit policy remain host responsibilities.
 ## Limits and runtime lifecycle
 
 `ToolLimits` is a validated value inside App `ToolSettings`. Omitted fields use
-typed defaults. Each new Runtime receives a by-value copy through
-`ToolEnvironment::with_limits`; later saved changes affect the next Runtime,
-not one already attached.
+typed defaults. Runtime creation passes a by-value copy through
+`ToolEnvironment::with_limits`; App configuration changes assemble replacement
+ports and atomically reconfigure an attached Agent. Calls already in progress
+finish against the old port they started with; calls after the update barrier
+use the new limits.
 
 The serialized fields `default_bash_timeout_seconds` and
 `max_bash_timeout_seconds` use positive integer seconds. The direct Rust API

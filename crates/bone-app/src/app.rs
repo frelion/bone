@@ -28,6 +28,8 @@ struct AppInner {
     store: DataStore,
     backend: RuntimeBackend,
     providers: ProviderConnector,
+    /// Orders durable configuration writes through live Session acknowledgement.
+    config_updates: Mutex<()>,
     sessions: Mutex<BTreeMap<SessionId, Session>>,
     write_gates: Mutex<BTreeMap<WorkspaceId, Arc<crate::tools::WriteGate>>>,
     shutdown: Mutex<Shutdown>,
@@ -140,12 +142,26 @@ impl App {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) async fn with_provider_connector(
+        options: AppOptions,
+        providers: ProviderConnector,
+    ) -> Result<Self> {
+        let store = DataStore::open(options.data_dir)?;
+        Ok(Self::from_parts(
+            store,
+            RuntimeBackend::Providers(providers.clone()),
+            providers,
+        ))
+    }
+
     fn from_parts(store: DataStore, backend: RuntimeBackend, providers: ProviderConnector) -> Self {
         Self {
             inner: Arc::new(AppInner {
                 store,
                 backend,
                 providers,
+                config_updates: Mutex::new(()),
                 sessions: Mutex::new(BTreeMap::new()),
                 write_gates: Mutex::new(BTreeMap::new()),
                 shutdown: Mutex::new(Shutdown::Idle),
@@ -228,13 +244,15 @@ impl App {
         self.inner.store.config(scope).map_err(Into::into)
     }
 
+    /// Persist one override and wait for every affected open Session. Success
+    /// means all applied it; a failure does not roll back Sessions that did.
+    /// Once dispatched, cancelling the future stops waiting but does not revoke
+    /// the update.
     pub async fn update_config(
         &self,
         scope: ConfigScope,
         change: ConfigChange,
     ) -> Result<RuntimeOverrides> {
-        self.ensure_open()?;
-        self.ensure_scope(scope)?;
         match &change {
             ConfigChange::Worker(value) => {
                 if let Some(value) = value {
@@ -263,13 +281,44 @@ impl App {
                 }
             }
         }
-        self.inner
-            .store
-            .update_config(scope, change)
-            .map_err(Into::into)
+
+        let app = self.clone();
+        await_app_task(tokio::spawn(async move {
+            app.apply_config_update(scope, change).await
+        }))
+        .await
     }
 
+    async fn apply_config_update(
+        &self,
+        scope: ConfigScope,
+        change: ConfigChange,
+    ) -> Result<RuntimeOverrides> {
+        let _update = self.inner.config_updates.lock().await;
+        let sessions = self.inner.sessions.lock().await;
+        self.ensure_open()?;
+        self.ensure_scope(scope)?;
+        let saved = self
+            .inner
+            .store
+            .update_config(scope, change)
+            .map_err(Error::from)?;
+
+        let targets = sessions
+            .values()
+            .filter(|session| config_affects(scope, session))
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(sessions);
+        reload_sessions(&targets).await?;
+        Ok(saved)
+    }
+
+    /// Return the durable desired configuration and the last configuration
+    /// installed in this App instance's live Runtime.
     pub async fn resolved_config(&self, session: SessionId) -> Result<ResolvedConfig> {
+        let _update = self.inner.config_updates.lock().await;
+        let sessions = self.inner.sessions.lock().await;
         self.ensure_open()?;
         let saved = self
             .inner
@@ -294,7 +343,7 @@ impl App {
             &self.inner.store.profiles()?,
             workspace.root,
         );
-        let live = self.inner.sessions.lock().await.get(&session).cloned();
+        let live = sessions.get(&session).cloned();
         let running = live.and_then(|session| {
             let view = session.observe();
             match &view.borrow().runtime {
@@ -310,12 +359,29 @@ impl App {
         self.inner.store.profiles().map_err(Into::into)
     }
 
+    /// Save a profile and apply its resolved value to open Sessions. A failure
+    /// does not roll back Sessions that already applied it.
+    /// Once dispatched, cancelling the future stops waiting but does not revoke
+    /// the update.
     pub async fn save_profile(&self, profile: Profile) -> Result<()> {
-        self.ensure_open()?;
         profile
             .validate()
             .map_err(|error| Error::InvalidState(error.to_string()))?;
-        self.inner.store.save_profile(profile).map_err(Into::into)
+        let app = self.clone();
+        await_app_task(tokio::spawn(
+            async move { app.apply_profile(profile).await },
+        ))
+        .await
+    }
+
+    async fn apply_profile(&self, profile: Profile) -> Result<()> {
+        let _update = self.inner.config_updates.lock().await;
+        let sessions = self.inner.sessions.lock().await;
+        self.ensure_open()?;
+        self.inner.store.save_profile(profile)?;
+        let targets = sessions.values().cloned().collect::<Vec<_>>();
+        drop(sessions);
+        reload_sessions(&targets).await
     }
 
     pub async fn set_api_key(&self, profile: ProfileId, key: ApiKey) -> Result<()> {
@@ -377,6 +443,7 @@ impl App {
             match &mut *shutdown {
                 Shutdown::Complete(report) => return Ok(report.clone()),
                 Shutdown::Idle => {
+                    let _update = self.inner.config_updates.lock().await;
                     let sessions = self.inner.sessions.lock().await;
                     self.inner.closed.store(true, Ordering::Release);
                     drop(sessions);
@@ -573,4 +640,41 @@ fn validate_title(title: &str) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn config_affects(scope: ConfigScope, session: &Session) -> bool {
+    match scope {
+        ConfigScope::User => true,
+        ConfigScope::Workspace(workspace) => session.workspace() == workspace,
+        ConfigScope::Session(id) => session.id() == id,
+    }
+}
+
+async fn reload_sessions(sessions: &[Session]) -> Result<()> {
+    let reloads = sessions
+        .iter()
+        .cloned()
+        .map(|session| tokio::spawn(async move { session.reload_config().await }))
+        .collect::<Vec<_>>();
+
+    let mut first_error = None;
+    for reload in reloads {
+        let result = reload.await;
+        match result {
+            Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
+            Err(error) if first_error.is_none() => {
+                first_error = Some(Error::InvalidState(format!(
+                    "session configuration task failed: {error}"
+                )));
+            }
+            _ => {}
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+async fn await_app_task<T>(task: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
+    task.await.map_err(|error| {
+        Error::InvalidState(format!("application configuration task failed: {error}"))
+    })?
 }

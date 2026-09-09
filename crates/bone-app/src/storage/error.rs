@@ -35,8 +35,6 @@ pub enum StoreError {
     Corrupt { message: &'static str },
     #[error("system time cannot be represented as Unix milliseconds")]
     Clock,
-    #[error("store schema version {found} is unsupported")]
-    UnsupportedSchema { found: i64 },
     #[error("failed to encode persistent data")]
     Encode(#[source] serde_json::Error),
     #[error("failed to decode persistent data")]

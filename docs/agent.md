@@ -131,6 +131,12 @@ let report = agent.shutdown().await?;
 - Stop 取消当前森林、未完成路由和 Input，但 Runtime 仍可接受后续新输入。
 - Shutdown 先执行 Stop，再等待本地 Call 清理到 grace deadline，然后关闭 Actor。
 
+### 运行中装配
+
+`agent.reconfigure(model, tools, limits).await` 原子安装一组与启动时同形的新端口和限额，保留现有 Input、Job DAG、ID、等待关系、Record 以及全局调度状态。Agent 原本活跃时，已有模型调用先失去提交资格，新模型立即从相同 Job 继续；Agent 原本 suspended 时，只安装配置，不启动调用或待提交动作。已开始的工具始终按 dispatch 时捕获的端口、effect、timeout 和输出上限完成。无效配置在改变任何状态前返回错误。
+
+`agent.suspend().await` 暂停调度而不销毁 DAG：模型调用被取消，待提交动作不启动，在途工具仍可收尾。`agent.resume_scheduling().await` 是唯一对应的全局恢复边界。需要安全安装并持久化新配置的宿主按 `suspend → reconfigure → 持久化 → resume_scheduling` 执行；任一步失败都可保持 suspended，修复后继续。`stop` 仍表示终结整棵工作森林。
+
 最后一个 `Agent` handle 被丢弃时，Runtime 自动执行 Stop 并进入同样的 shutdown 清理。丢弃单个 clone 不会停止其他 handle 使用的 Agent；需要取得 `ShutdownReport` 时仍应显式调用 `shutdown`。
 
 工具调用的实际外部效果独立于 Job 终态。`ExternalEffect::Unknown` 表示调用可能已经影响远端；本地取消不能把它改成未执行。宿主取得权威结果后调用：

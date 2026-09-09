@@ -44,9 +44,11 @@ impl Kernel {
     }
 
     pub(super) fn advance(&mut self, now: MonoTime, effects: &mut Vec<Effect>) {
-        self.process_candidates(now, effects);
-        self.schedule_routing(effects);
-        self.schedule_workers(effects);
+        if !self.suspended {
+            self.process_candidates(now, effects);
+            self.schedule_routing(effects);
+            self.schedule_workers(effects);
+        }
         self.finish_inputs(effects);
     }
 
@@ -550,10 +552,16 @@ impl Kernel {
         if !entry.running() {
             return;
         }
-        let CallTask::Tool { job, request, .. } = entry.task else {
+        let CallTask::Tool {
+            job,
+            request,
+            output_bytes,
+            ..
+        } = entry.task
+        else {
             return;
         };
-        let result = Arc::new(self.limit_tool_outcome(result));
+        let result = Arc::new(Self::limit_tool_outcome(result, output_bytes));
         let call_entry = self.calls.get_mut(&call).expect("call exists");
         call_entry.state = CallState::ToolFinished(result.clone());
         call_entry.progress = None;
@@ -577,10 +585,8 @@ impl Kernel {
         }
     }
 
-    fn limit_tool_outcome(&self, outcome: ToolOutcome) -> ToolOutcome {
-        if serde_json::to_vec(&outcome)
-            .is_ok_and(|encoded| encoded.len() <= self.limits.tool_output_bytes)
-        {
+    fn limit_tool_outcome(outcome: ToolOutcome, output_bytes: usize) -> ToolOutcome {
+        if serde_json::to_vec(&outcome).is_ok_and(|encoded| encoded.len() <= output_bytes) {
             return outcome;
         }
         ToolOutcome {
@@ -606,13 +612,14 @@ impl Kernel {
         let CallTask::Tool {
             job,
             request,
+            output_bytes,
             revision: _,
             effect: _,
         } = entry.task
         else {
             return false;
         };
-        let result = Arc::new(self.limit_tool_outcome(result));
+        let result = Arc::new(Self::limit_tool_outcome(result, output_bytes));
         let call_entry = self.calls.get_mut(&call).expect("call exists");
         call_entry.state = CallState::ToolFinished(result.clone());
         let record = self.record(

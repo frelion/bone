@@ -107,7 +107,7 @@ fn credential_account(profile: &Profile) -> Result<String, ApiKeyCredentialError
     let endpoint =
         serde_json::to_vec(&profile.endpoint).map_err(|_| ApiKeyCredentialError::Unavailable)?;
     let mut hasher = Sha256::new();
-    hasher.update(b"bone-api-key-slot.v1");
+    hasher.update(b"bone-api-key-slot");
     hasher.update(endpoint);
     let digest = hasher.finalize();
     let fingerprint = digest

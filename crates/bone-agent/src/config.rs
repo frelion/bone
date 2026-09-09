@@ -38,6 +38,7 @@ pub struct AgentLimits {
     /// An oversized outcome becomes a fixed failure while preserving its
     /// external-effect classification. The replacement is globally bounded
     /// but is not guaranteed to fit an arbitrarily tiny configured value.
+    /// The limit is captured when each tool call is dispatched.
     pub tool_output_bytes: usize,
 }
 

@@ -45,6 +45,21 @@ impl Session {
         self.id
     }
 
+    pub(crate) fn workspace(&self) -> crate::WorkspaceId {
+        self.view.borrow().session.workspace
+    }
+
+    /// Reapply the currently persisted desired configuration.
+    ///
+    /// Frontends can call this after repairing an external prerequisite such
+    /// as provider credentials; it does not write another configuration value.
+    /// A running Runtime is fully reconfigured before this returns. A detached
+    /// Session may only have scheduled asynchronous startup, whose result is
+    /// reported through [`Session::observe`].
+    pub async fn reload_config(&self) -> Result<()> {
+        self.request(|reply| Command::ConfigChanged { reply }).await
+    }
+
     pub async fn submit(&self, input: SubmitInput) -> Result<SubmissionReceipt> {
         if input.text.len() > MAX_PERSISTED_VALUE_BYTES {
             return Err(Error::InvalidState("input exceeds 1 MiB".into()));
@@ -170,6 +185,7 @@ impl Session {
                 starting: None,
                 runtime_state: RuntimeState::Detached,
                 problem: None,
+                config_blocked: false,
                 execution_blocked: false,
                 write_gate,
                 view: view_tx,
@@ -267,6 +283,9 @@ enum Command {
     CloseRuntime {
         reply: oneshot::Sender<Result<CloseReport>>,
     },
+    ConfigChanged {
+        reply: oneshot::Sender<Result<()>>,
+    },
     RuntimeDirty(RuntimeId),
     WriteCompleted(CallRef),
     RuntimeReady(RuntimeId),
@@ -305,6 +324,7 @@ struct SessionTask {
     starting: Option<StartingRuntime>,
     runtime_state: RuntimeState,
     problem: Option<AppProblem>,
+    config_blocked: bool,
     execution_blocked: bool,
     write_gate: Arc<tools::WriteGate>,
     view: watch::Sender<Arc<SessionView>>,
@@ -441,6 +461,13 @@ impl SessionTask {
             }
             Command::CloseRuntime { reply } => {
                 let result = self.close_runtime().await;
+                if let Err(error) = &result {
+                    self.record_execution_error(error).await;
+                }
+                let _ = reply.send(result);
+            }
+            Command::ConfigChanged { reply } => {
+                let result = self.apply_config().await;
                 if let Err(error) = &result {
                     self.record_execution_error(error).await;
                 }
@@ -675,9 +702,17 @@ impl SessionTask {
         if self.execution_blocked {
             return Ok(());
         }
+        if self.config_blocked {
+            if let Some(AppProblem::Configuration(problem)) = &self.problem {
+                self.set_queued_problem(Some(problem.clone()))?;
+                self.publish()?;
+            }
+            return Ok(());
+        }
         if let Err(error) = self.ensure_runtime().await {
             if let Error::Configuration(problem) = &error {
-                self.mark_queued_problem(problem.clone())?;
+                self.set_queued_problem(Some(problem.clone()))?;
+                self.publish()?;
             }
             return Err(error);
         }
@@ -695,7 +730,6 @@ impl SessionTask {
                 break;
             }
         }
-        self.problem = None;
         self.publish()
     }
 
@@ -789,7 +823,7 @@ impl SessionTask {
         Ok(())
     }
 
-    fn mark_queued_problem(&mut self, problem: ConfigProblem) -> Result<()> {
+    fn set_queued_problem(&mut self, problem: Option<ConfigProblem>) -> Result<()> {
         let queued = self
             .inputs
             .values()
@@ -797,17 +831,96 @@ impl SessionTask {
             .map(|input| input.id)
             .collect::<Vec<_>>();
         for id in queued {
+            if matches!(
+                &self.inputs[&id].state,
+                InputState::Queued { problem: current } if current == &problem
+            ) {
+                continue;
+            }
             let (input, _) = self.store.update_input(
                 self.info.id,
                 id,
                 InputState::Queued {
-                    problem: Some(problem.clone()),
+                    problem: problem.clone(),
                 },
                 None,
             )?;
             self.inputs.insert(id, input);
         }
+        Ok(())
+    }
+
+    async fn apply_config(&mut self) -> Result<()> {
+        let config = match self.resolve_config() {
+            Ok(config) => config,
+            Err(Error::Configuration(problem)) => {
+                let _ = self.cancel_start().await;
+                self.suspend_for_config().await?;
+                self.set_queued_problem(Some(problem.clone()))?;
+                return if self.runtime.is_some() {
+                    Err(Error::Configuration(problem))
+                } else {
+                    self.problem = Some(AppProblem::Configuration(problem));
+                    self.publish()
+                };
+            }
+            Err(error) => {
+                let _ = self.cancel_start().await;
+                self.suspend_for_config().await?;
+                return Err(error);
+            }
+        };
+
+        if let Some(runtime) = &self.runtime {
+            let current = match &self.runtime_state {
+                RuntimeState::Running { config, .. } => config.as_ref(),
+                _ => return Err(Error::InvalidState("running runtime has no config".into())),
+            };
+            if current == &config && !self.config_blocked {
+                self.set_queued_problem(None)?;
+                return self.publish();
+            }
+
+            let id = runtime.id;
+            let agent = runtime.agent.clone();
+            self.suspend_for_config().await?;
+            self.set_queued_problem(None)?;
+            let ports = self.runtime_tools(&config, id)?;
+            let model = self.backend.connect(&config).await?;
+            agent
+                .reconfigure(model, ports, config.limits.clone())
+                .await
+                .map_err(reconfigure_error)?;
+            self.store
+                .reconfigure_runtime(self.info.id, id, config.clone())?;
+            self.runtime_state = RuntimeState::Running {
+                id,
+                config: Box::new(config),
+            };
+            self.refresh_runtime().await?;
+            agent.resume_scheduling().await.map_err(agent_error)?;
+            self.config_blocked = false;
+            self.problem = None;
+            self.deliver_queued().await?;
+            return self.publish();
+        }
+
+        if self.starting.is_some() {
+            self.cancel_start().await;
+        }
+        self.config_blocked = false;
+        self.problem = None;
+        self.set_queued_problem(None)?;
+        self.deliver_queued().await?;
         self.publish()
+    }
+
+    async fn suspend_for_config(&mut self) -> Result<()> {
+        self.config_blocked = true;
+        if let Some(runtime) = &self.runtime {
+            runtime.agent.suspend().await.map_err(agent_error)?;
+        }
+        Ok(())
     }
 
     async fn ensure_runtime(&mut self) -> Result<()> {
@@ -816,26 +929,7 @@ impl SessionTask {
         }
         let config = self.resolve_config()?;
         let runtime_id = RuntimeId::new();
-        let commands = self.command_tx.clone();
-        let notify = Arc::new(move |call| {
-            if let Some(commands) = commands.upgrade() {
-                tokio::spawn(async move {
-                    let _ = commands.send(Command::WriteCompleted(call)).await;
-                });
-            }
-        });
-        let ports = self.backend.tools(
-            &config,
-            tools::ToolContext {
-                store: self.store.clone(),
-                workspace: self.info.workspace,
-                session: self.info.id,
-                runtime: runtime_id,
-                write_gate: Arc::clone(&self.write_gate),
-                lease: Arc::clone(&self.lease),
-                notify,
-            },
-        )?;
+        let ports = self.runtime_tools(&config, runtime_id)?;
         let pending = self
             .inputs
             .values()
@@ -889,6 +983,33 @@ impl SessionTask {
             ready,
         });
         self.publish()
+    }
+
+    fn runtime_tools(
+        &self,
+        config: &RuntimeConfig,
+        runtime: RuntimeId,
+    ) -> Result<Vec<Arc<dyn bone_agent::ToolPort>>> {
+        let commands = self.command_tx.clone();
+        let notify = Arc::new(move |call| {
+            if let Some(commands) = commands.upgrade() {
+                tokio::spawn(async move {
+                    let _ = commands.send(Command::WriteCompleted(call)).await;
+                });
+            }
+        });
+        self.backend.tools(
+            config,
+            tools::ToolContext {
+                store: self.store.clone(),
+                workspace: self.info.workspace,
+                session: self.info.id,
+                runtime,
+                write_gate: Arc::clone(&self.write_gate),
+                lease: Arc::clone(&self.lease),
+                notify,
+            },
+        )
     }
 
     async fn runtime_ready(&mut self, runtime: RuntimeId) {
@@ -1089,6 +1210,7 @@ impl SessionTask {
         let _ = self.cancel_start().await;
         let Some(runtime) = &self.runtime else {
             self.runtime_state = RuntimeState::Detached;
+            self.config_blocked = false;
             self.publish()?;
             return Ok(CloseReport {
                 unresolved_writes: tools::unresolved_after_write_gate(
@@ -1122,6 +1244,7 @@ impl SessionTask {
         self.store.close_runtime(self.info.id, id)?;
         self.runtime = None;
         self.runtime_state = RuntimeState::Detached;
+        self.config_blocked = false;
         self.publish()?;
         Ok(CloseReport {
             unresolved_writes: tools::unresolved_after_write_gate(
@@ -1145,7 +1268,9 @@ impl SessionTask {
         self.sync_runtime().await?;
         if self.execution_blocked {
             self.execution_blocked = false;
-            self.problem = None;
+            if !self.config_blocked {
+                self.problem = None;
+            }
         }
         Ok(())
     }
@@ -1155,7 +1280,8 @@ impl SessionTask {
             return;
         };
         self.problem = Some(problem);
-        if matches!(error, Error::Storage(_) | Error::Agent(_))
+        if !self.config_blocked
+            && matches!(error, Error::Storage(_) | Error::Agent(_))
             && !self.execution_blocked
             && let Some(runtime) = &self.runtime
         {
@@ -1469,4 +1595,13 @@ fn map_accept_error(error: AcceptError) -> Error {
 
 fn agent_error(error: AgentError) -> Error {
     Error::Agent(error.to_string())
+}
+
+fn reconfigure_error(error: AgentError) -> Error {
+    match error {
+        AgentError::InvalidConfiguration(message) => {
+            Error::Configuration(ConfigProblem::Invalid(message))
+        }
+        error => agent_error(error),
+    }
 }

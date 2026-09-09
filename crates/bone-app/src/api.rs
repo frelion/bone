@@ -338,6 +338,10 @@ pub enum SessionEvent {
         runtime: RuntimeId,
         config: Box<RuntimeConfig>,
     },
+    RuntimeReconfigured {
+        runtime: RuntimeId,
+        config: Box<RuntimeConfig>,
+    },
     RuntimeClosed {
         runtime: RuntimeId,
     },

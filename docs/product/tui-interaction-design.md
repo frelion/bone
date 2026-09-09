@@ -1,10 +1,10 @@
 # BONE TUI 前端交互设计稿
 
-> **历史设计（2026-09-09）。** 旧 TUI 已随 `bone-app` headless 重写移除；本文只作为重做前端时的体验素材，不描述当前可运行接口。当前后端契约见 [bone-app-design.md](../bone-app-design.md)，未来 TUI 只能经由 `bone-app` API 接入。
+> **历史设计（2026-09-09）。** 旧 TUI 已随 `bone-app` headless 重写移除。本文全文只作为重做前端时的体验素材；下文即使标为“当前实现”或“生效契约”，也只描述已经退役的实现，不能覆盖当前行为。当前 App 契约以 [bone-app-design.md](../bone-app-design.md) 和 [configuration.md](../configuration.md) 为准；未来 TUI 只能经由 `bone-app` API 接入。
 
 | 字段 | 内容 |
 | --- | --- |
-| 文档状态 | 当前实现基线 + 后续交互设计参考 |
+| 文档状态 | 退役 TUI 设计稿，仅作未来交互参考 |
 | 对应 PRD | [TUI 配置、Workspace 与多 Session PRD](tui-workspace-prd.md) |
 | 目标终端 | 40、80、120 列代表性布局 |
 | 主要输入 | 键盘；鼠标为未来增强，不作为主流程依赖 |
@@ -12,11 +12,11 @@
 
 > **当前实现优先级（2026-09-07）**
 >
-> 本节是当前 TUI 的生效交互/架构边界，优先于后文保留的 Settings Center 与高级交互草图。设置、Workspace、Session、草稿、状态和 event history 都通过一个 SQLite `BoneStore` 保存：`$XDG_DATA_HOME/bone/store-v1/bone.sqlite3`，无 XDG 时为 `~/.local/share/bone/store-v1/bone.sqlite3`。普通用户不查看、编辑或恢复持久化文件；BONE 不再有 `bone-config`、`ConfigManager`、`ConfigSection`、`ConfigTool`、`BONE_CONFIG`、`BONE_STATE_DIR` 或 `credential_root`。
+> 本节是当前 TUI 的生效交互/架构边界，优先于后文保留的 Settings Center 与高级交互草图。设置、Workspace、Session、草稿、状态和 event history 都通过一个 SQLite `BoneStore` 保存：`$XDG_DATA_HOME/bone/bone.sqlite3`，无 XDG 时为 `~/.local/share/bone/bone.sqlite3`。普通用户不查看、编辑或恢复持久化文件；BONE 不再有 `bone-config`、`ConfigManager`、`ConfigSection`、`ConfigTool`、`BONE_CONFIG`、`BONE_STATE_DIR` 或 `credential_root`。
 >
 > 当前 TUI 的设置入口是 `/provider`、`/provider add`、`/model [profile] <id>`、`/model default`、`/model global`、`/model coordinator` 与 `/model inherit`。Profile 目录只保存 ID、协议和 HTTPS endpoint；API key 位于系统 credential manager，内建 `chatgpt` profile 使用 ChatGPT OAuth。Solver 分别写入 Session override、Workspace default、User default，解析顺序为 **Session > Workspace > User**；未显式设置 Coordinator 时跟随有效 Solver。省略 profile 明确选择 built-in `chatgpt`。写入成功代表 SQLite 已保存；已经 attached 的 runtime 仍使用它启动时的 immutable `ResolvedAgentRuntimeConfig`，直到新建或重建 runtime 才采用新值。不要把后文的 `/config`、Settings Center、`Desired/Effective/LKG`、`TurnConfig revision`、watcher、apply acknowledgement 或热切换描述为当前功能。
 >
-> 每个 accepted user turn 在同一个 SQLite transaction 中写入 `UserTurnAccepted` event 与 Session summary/state；commit 失败不能清 Composer 或启动 Agent。Session writer ownership 用 fail-fast OS lease，冲突 Session 只读/Busy。SQLite corruption、权限错误或 schema mismatch 不自动 reset。ChatGPT OAuth 是唯一 JSON 例外，位于 `$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/store-v1/providers/chatgpt-subscription/`），由 Rig 管理 payload，App 仅持有 `ChatGptAuthLease`。有活跃 Endpoint/Model lease 时 `/logout` 返回 Busy。
+> 每个 accepted user turn 在同一个 SQLite transaction 中写入 `UserTurnAccepted` event 与 Session summary/state；commit 失败不能清 Composer 或启动 Agent。Session writer ownership 用 fail-fast OS lease，冲突 Session 只读/Busy。SQLite corruption、权限错误或 schema mismatch 不自动 reset。ChatGPT OAuth 是唯一 JSON 例外，位于 `$XDG_CONFIG_HOME/bone/providers/chatgpt-subscription/`（无 XDG 时 `~/.config/bone/providers/chatgpt-subscription/`），由 Rig 管理 payload，App 仅持有 `ChatGptAuthLease`。有活跃 Endpoint/Model lease 时 `/logout` 返回 Busy。
 >
 > one-shot 的 `--profile` / `--model` / `BONE_PROFILE` / `BONE_MODEL` 是仅本次调用的 ephemeral override；显式 selection 同时供应 coordinator 和 solver，不创建或持久化 `SessionRecord`；`--events` JSONL 仅作观察导出。后文涉及 one-shot durable Session 的内容是未来设计。
 
@@ -1130,7 +1130,7 @@ Session rail 中的数字只是当前 UI 快捷索引，不作为持久 Session 
 └──────────────────────────────────────────────────────────────┘
 ```
 
-复制内容由平台安全引用器生成，语义仅为“切换到原目录并启动 `bone`”；不包含 secret，不自动执行，也不改变当前进程 cwd。剪贴板不可用时显示可选择的命令文本。vNext 不提供跨 Workspace Fork、rebind 或复制成当前目录的新对话；这些能力在定义消息、工具摘要、附件和未知副作用的迁移契约前不得以快捷键隐藏上线。
+复制内容由平台安全引用器生成，语义仅为“切换到原目录并启动 `bone`”；不包含 secret，不自动执行，也不改变当前进程 cwd。剪贴板不可用时显示可选择的命令文本。本历史草案不提供跨 Workspace Fork、rebind 或复制成当前目录的新对话；这些能力在定义消息、工具摘要、附件和未知副作用的迁移契约前不得以快捷键隐藏上线。
 
 ## 13. 忙碌与并发交互
 
@@ -1585,7 +1585,7 @@ SessionPresentation
 7. 写工具上线时采用 Workspace 单写者、SQLite transaction/lease 冲突处理、可选 worktree，或三者组合；
 8. 支持“请求接管”所需的跨进程通知机制；不能安全实现的平台保持只读。
 
-已由当前实现固定、不得再由实现自行选择的行为包括：Session/Workspace 的 SQLite 隔离、一个 runtime 使用冻结的 `ResolvedAgentRuntimeConfig`、`/model` 的三层继承、`//` 转义、pinned runtime 文案，以及 vNext 禁止跨 Workspace Fork/rebind。其余交互仍须按本稿的 future 标签重新确认。
+在当时实现中固定的行为包括：Session/Workspace 的 SQLite 隔离、一个 runtime 使用冻结的 `ResolvedAgentRuntimeConfig`、`/model` 的三层继承、`//` 转义、pinned runtime 文案，以及该历史草案禁止跨 Workspace Fork/rebind。这些都不是当前 App 契约，未来前端需重新确认。
 
 ## 21. 原型数据说明
 

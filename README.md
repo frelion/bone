@@ -56,10 +56,12 @@ app.shutdown().await?;
 ```
 
 Submitting succeeds once the input is durable. Execution may remain queued
-with a configuration problem until a frontend saves a model selection or
-finishes login, then calls `Session::retry`. Asynchronous startup failures are
-published as typed `AppProblem` values, so a frontend can react to
-`LoginRequired(ProfileId)` without parsing display text.
+until a frontend saves a valid model selection; that configuration update
+reapplies automatically. After repairing an external prerequisite such as
+login, call `Session::reload_config` to reapply the already saved desired
+configuration. Asynchronous startup failures are published as typed
+`AppProblem` values, so a frontend can react to `LoginRequired(ProfileId)`
+without parsing display text.
 
 Current state arrives through `Session::observe`, a Tokio `watch` receiver.
 Durable events come from `Session::history(after, limit)`. Clients keep the
@@ -73,9 +75,12 @@ Configuration is typed and resolves in this order:
 Session override > Workspace override > User setting
 ```
 
-`App::update_config(scope, change)` saves one explicit change. A running
-runtime keeps its frozen configuration; the next runtime uses the newly
-resolved value.
+`App::update_config(scope, change)` saves one explicit change and returns only
+after every affected open Session has applied it. A running runtime keeps its
+`RuntimeId`, job graph, and in-flight tool calls while model work restarts on
+the new configuration. If the new configuration cannot be assembled, the
+Session stays suspended until a valid update arrives; it never falls back to
+the old configuration for new work.
 
 ## Persistence
 

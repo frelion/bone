@@ -212,3 +212,99 @@ async fn agent_record_failure_blocks_execution_and_recovers_the_partial_archive(
     )));
     app.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn failed_runtime_config_persistence_never_restarts_execution() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace_root = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
+    let model = Arc::new(GatedModel {
+        coordinate_calls: AtomicUsize::new(0),
+        work_calls: AtomicUsize::new(0),
+        first_coordinate_started: Arc::new(Notify::new()),
+        release_first_coordinate: Arc::new(Notify::new()),
+    });
+    let app = App::with_ports(
+        AppOptions::new(temporary.path().join("data")),
+        model.clone(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    let profile = Profile::new(
+        ProfileId::new("test").unwrap(),
+        "Test",
+        EndpointConfig::OpenAiResponses { base_url: None },
+    )
+    .unwrap();
+    app.save_profile(profile).await.unwrap();
+    app.update_config(
+        ConfigScope::User,
+        ConfigChange::Worker(Some(
+            ModelSelection::new(ProfileId::new("test").unwrap(), "test-model").unwrap(),
+        )),
+    )
+    .await
+    .unwrap();
+    let workspace = app.open_workspace(workspace_root).await.unwrap();
+    let session = app
+        .create_session(workspace.id, "Config persistence")
+        .await
+        .unwrap();
+    session.submit(SubmitInput::new("start")).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        model.first_coordinate_started.notified(),
+    )
+    .await
+    .expect("coordinator did not start");
+
+    let store = app.test_store();
+    store.fail_runtime_reconfigure(true);
+    let limits = AgentLimits {
+        background_workers: 5,
+        ..AgentLimits::default()
+    };
+    let result = app
+        .update_config(
+            ConfigScope::Session(session.id()),
+            ConfigChange::Limits(Some(limits.clone())),
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Storage(_))), "{result:?}");
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        model.coordinate_calls.load(Ordering::SeqCst),
+        1,
+        "new configuration must not run before its runtime boundary is durable"
+    );
+    assert_eq!(
+        store
+            .session(session.id())
+            .unwrap()
+            .unwrap()
+            .runtime
+            .unwrap()
+            .config
+            .limits,
+        AgentLimits::default()
+    );
+
+    store.fail_runtime_reconfigure(false);
+    app.update_config(
+        ConfigScope::Session(session.id()),
+        ConfigChange::Limits(Some(limits)),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while model.coordinate_calls.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("execution did not resume after the boundary became durable");
+    app.shutdown().await.unwrap();
+}

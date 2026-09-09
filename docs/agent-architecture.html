@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="BONE bone-agent 当前实现的技术审批材料：架构边界、双层循环、并发调度、历史事务、错误与取消语义。">
+  <meta name="description" content="BONE bone-agent 已退役实现的历史技术审批快照。当前架构以 docs/agent.md 为准。">
   <meta name="color-scheme" content="light dark">
-  <title>BONE Agent Runtime · 技术架构审批</title>
+  <title>BONE Agent Runtime · 历史架构快照</title>
   <style>
     :root {
       --bg: #f2f6f8;
@@ -591,6 +591,9 @@
 </head>
 <body>
   <a class="skip-link" href="#content">跳到正文</a>
+  <div role="note" style="padding: 12px 20px; color: #fff; background: #8a3b12; text-align: center; font-weight: 650;">
+    历史快照：本页描述的 Action / Turn 架构已退役，下文的“当前”和版本标记都只属于 2026-09-04 快照。当前接口与语义以 <a href="agent.md" style="color: inherit; text-decoration: underline;">docs/agent.md</a> 为准。
+  </div>
   <header class="topbar">
     <div class="topbar-inner">
       <a class="brand" href="#top" aria-label="BONE Agent Runtime Review，返回页面顶部"><span class="brand-mark" aria-hidden="true"><span>B</span></span><span class="brand-label">BONE / AGENT RUNTIME REVIEW</span></a>
@@ -638,14 +641,14 @@
             <span class="pill ok">Luna manual live smoke</span>
             <span class="pill ok">187 tests passed</span>
             <span class="pill info">Production Rig boundary: bone-llm</span>
-            <span class="pill warn">v1 batch barrier</span>
+            <span class="pill warn">当时首版的 batch barrier</span>
           </div>
         </header>
         <aside class="approval-summary" aria-labelledby="approval-title">
           <div>
             <span class="approval-status">Ready for review</span>
             <h2 id="approval-title">建议批准</h2>
-            <p>核心边界和调度不变量已经实现、测试并完成真实 Provider 冒烟。首要取舍是父批次屏障；串行模型、终态-only API 和 cooperative cancellation 也是明确的 v1 约束。</p>
+            <p>核心边界和调度不变量已经实现、测试并完成真实 Provider 冒烟。首要取舍是父批次屏障；串行模型、终态-only API 和 cooperative cancellation 也是当时首版的明确约束。</p>
           </div>
           <dl>
             <dt>Scope</dt><dd>bone-agent core</dd>
@@ -700,7 +703,7 @@
 
         <div class="callout success" style="margin-top: 14px;">
           <strong>审批建议：</strong>
-          批准当前“双层循环 + 中央调度器 + 整批屏障”作为 v1。它保持了 Action 的语义完整性，也已经解决“长工具阻塞所有其他 Action”的问题。
+          批准当时的“双层循环 + 中央调度器 + 整批屏障”作为首版方案。它保持了 Action 的语义完整性，也解决了“长工具阻塞所有其他 Action”的问题。
           如果未来要求父 Agent 消费部分结果，应单独设计事件、历史和取消协议，而不是在现有循环上加一个布尔开关。
         </div>
       </section>
@@ -1740,7 +1743,7 @@ println!(<span class="st">"{}"</span>, reply.text());
 
         <div class="grid" style="margin-top: 18px;">
           <article class="card accent-amber span-7">
-            <span class="eyebrow">Explicitly absent from v1</span>
+            <span class="eyebrow">Explicitly absent from that snapshot</span>
             <h3>现在没有，而且不应偷偷补进去</h3>
             <ul class="plain-list" style="margin-top: 13px;">
               <li>Exchange / Task / Plan / Team / Actor / mailbox 等生命周期抽象</li>
@@ -1865,7 +1868,7 @@ BONE_MODEL=<span class="st">'gpt-5.6-luna'</span> cargo run -p bone-cli</code></
               <li><span>Action / Turn / ToolExecution 的职责和所有权清晰</span></li>
               <li><span>中央调度器足以实现非阻塞工具等待，无需 Actor</span></li>
               <li><span>模型串行与工具并发的行为被明确写入契约</span></li>
-              <li><span>父层整批屏障作为 v1 取舍被显式接受</span></li>
+              <li><span>父层整批屏障作为当时首版取舍被显式接受</span></li>
               <li><span>历史提交、错误恢复和副作用边界有确定语义</span></li>
               <li><span>bone-llm / bone-tools / bone-agent 的依赖边界稳定</span></li>
               <li><span>新抽象只在出现真实产品需求后引入</span></li>
@@ -1875,7 +1878,7 @@ BONE_MODEL=<span class="st">'gpt-5.6-luna'</span> cargo run -p bone-cli</code></
 
         <div class="callout success" style="margin-top: 14px;">
           <strong>建议决议：</strong>
-          批准当前 bone-agent core 进入下一阶段集成。保留整批屏障、串行模型请求和内存历史作为明确的 v1 约束；
+          批准当时的 bone-agent core 进入下一阶段集成。保留整批屏障、串行模型请求和内存历史作为首版的明确约束；
           不在本轮引入 Exchange、后台 Action 或事件流。
         </div>
 
@@ -1910,7 +1913,7 @@ BONE_MODEL=<span class="st">'gpt-5.6-luna'</span> cargo run -p bone-cli</code></
           <summary>审批会上建议追问的五个问题</summary>
           <div class="details-body">
             <ol>
-              <li>v1 是否接受：任意一个 Action 很慢时，父 Agent 等整批结束才继续？</li>
+              <li>当时首版是否接受：任意一个 Action 很慢时，父 Agent 等整批结束才继续？</li>
               <li>默认理论峰值 128（且可配置增大）是否要求当前阶段加入全局 semaphore？</li>
               <li>未来第一批写工具是否具备可证明的 drop/timeout/重试语义？</li>
               <li>调用方是否已经需要实时进度，还是最终 trace 足够？</li>

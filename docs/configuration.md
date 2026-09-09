@@ -18,16 +18,14 @@ SQLite contains:
 - Workspace identities and canonical roots;
 - Session metadata, drafts, inputs, request-idempotency records, and history;
 - User, Workspace, and Session configuration;
-- non-secret provider profiles and frozen Runtime configurations;
+- non-secret provider profiles and Runtime configuration snapshots;
 - Agent records and external-write attempts.
 
 The private `storage` module owns SQLite documents, journals, transactions,
 schema validation, and OS file leases. These types are not part of the public
-App API. Existing unsafe permissions, corruption, or a future schema version
-produce an error; the App never resets the database automatically.
-
-New records use the `app.v2` namespace. There is no automatic import from the
-removed App/TUI model, and old records are not overwritten.
+App API. Unsafe permissions, corruption, or a non-current schema layout produce
+an error; the App never resets the database automatically. Records use the
+`app` namespace.
 
 ## Profiles and credentials
 
@@ -52,12 +50,22 @@ bound to both profile ID and endpoint identity, so changing an endpoint cannot
 silently redirect an existing key. API keys have no `Debug` or `Display`
 implementation and never enter SQLite or Session history.
 
+Saving a `Profile` reconfigures open Sessions whose resolved runtime uses it.
+Credential operations are deliberately separate from configuration: changing
+an API key or completing login does not replace an established connection.
+If a Session is suspended because credentials were missing, the frontend calls
+`session.reload_config().await` after repairing them; this reapplies the saved
+desired value without writing it again. Closing the Runtime remains the explicit
+way to replace a connection that is already established.
+
 ChatGPT OAuth remains in the credential cache owned by its provider adapter.
 `App::login` returns a short-lived `LoginAttempt` whose watch state exposes the
 device code, success, failure, or cancellation. Normal Runtime startup only
 uses cached authorization and reports `AppProblem::LoginRequired(profile)`;
 it never starts interactive login on its own. `logout` refuses while a live
-Runtime still holds that connection.
+Runtime still holds that connection. Interactive login owns an exclusive
+provider operation; concurrent Runtime connection, logout, or App shutdown
+returns `ProfileBusy` promptly instead of waiting for the device flow.
 
 ## Typed configuration
 
@@ -107,9 +115,43 @@ app.update_config(
 ```
 
 `resolved_config(session)` returns both the desired configuration and the
-configuration frozen into the live Runtime, if one exists. Saving new settings
-never changes a running Agent. Close that Runtime and retry/submit work to use
-the new settings.
+configuration currently installed in the live Runtime, if one exists.
+`update_config(...).await` returns successfully only after every affected open
+Session has acknowledged the new effective model, tools, and limits. Running
+model calls are superseded and restarted on the same job graph; running tool
+calls finish on the immutable ports with which they started. If live assembly
+fails, `desired` retains the saved value, `running` retains the previous value,
+and the update returns the concrete error. The old runtime snapshot remains
+visible, but its Agent is suspended: no new model call or pending tool action
+starts until a later successful update or `Session::reload_config` resumes the
+same job graph. A tool that was already running still finishes on its captured
+port and limits.
+
+For a detached Session, acknowledgement means the latest desired value owns any
+new startup and an older startup cannot win; provider readiness remains
+asynchronous. A frontend observes `SessionView` for that startup's eventual
+Running state or typed problem. No call can start on the superseded config.
+
+For a running Runtime, Session performs the boundary in one direction:
+`suspend → reconfigure → persist RuntimeReconfigured → resume`. Thus a new
+model or tool call cannot begin until the exact installed RuntimeConfig is
+durable. A persistence failure leaves the Agent suspended and retryable.
+
+Once an `update_config` or `save_profile` call has entered App, cancelling the
+future only stops that caller from waiting; it does not revoke the command.
+App owns the persist-to-Session-ack operation, and later updates,
+`resolved_config`, and shutdown line up behind it.
+
+Fan-out is not a rollback transaction. If one affected Session cannot assemble
+the desired RuntimeConfig, other Sessions that already applied it remain on the
+new configuration. The call waits for every target and returns the first error;
+each Session's View and `resolved_config` show its own desired/running result,
+and `reload_config` retries a blocked Session without rewriting the setting.
+
+This live barrier is process-local. It covers Sessions opened by the same App
+instance; there is no cross-process configuration watcher. Another process
+resolves durable changes when it next starts a Runtime or performs its own
+configuration operation.
 
 Configuration validation also preserves the persistence boundary: model
 context, individual model-originated Agent items, Agent tool results, and Patch
@@ -138,7 +180,7 @@ connections use a bounded busy timeout. Each open Session also holds a
 cross-process OS lease, so two App processes cannot execute the same Session.
 Writes from different Sessions in one Workspace share an in-process mutex.
 Cross-process serialization of different Sessions writing the same Workspace
-is deliberately not guaranteed in this version.
+is deliberately not guaranteed.
 
 An external write records `Pending` before execution. It remains visible and
 blocks later Workspace writes until a matching Agent record durably

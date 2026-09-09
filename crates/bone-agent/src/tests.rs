@@ -172,6 +172,353 @@ fn bootstrap_history_must_fit_the_model_context_budget() {
 }
 
 #[test]
+fn active_reconfigure_restarts_model_work_without_losing_the_job() {
+    let mut kernel = kernel();
+    let input = Input::new(InputId(2), "keep this job alive");
+    let (call, work_input) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("same job", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    let job = work_input.job;
+    let replacement_tool = ToolSpec {
+        name: "replacement".into(),
+        description: "new tool".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ReadOnly,
+    };
+
+    let effects = kernel
+        .reconfigure(NOW, AgentLimits::default(), vec![replacement_tool.clone()])
+        .unwrap();
+
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Cancel(id) if *id == call))
+    );
+    let (replacement, restarted) = work_calls(&effects).pop().unwrap();
+    assert_eq!(restarted.job, job);
+    assert_eq!(restarted.tools, vec![replacement_tool]);
+    assert_ne!(replacement, call);
+
+    let _ = work(
+        &mut kernel,
+        call,
+        WorkStep::Finish(Completion::new("late obsolete result")),
+    );
+    assert!(matches!(kernel.job_status(job), JobStatus::Running));
+    assert_eq!(kernel.jobs[&job].active_call, Some(replacement));
+}
+
+#[test]
+fn suspended_reconfigure_waits_for_an_explicit_scheduling_resume() {
+    let mut kernel = kernel();
+    let input = Input::new(InputId(20), "pause execution for configuration");
+    let (call, work_input) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("same job", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+
+    let effects = kernel.suspend(NOW);
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Cancel(id) if *id == call))
+    );
+    assert!(starts(&effects).next().is_none());
+
+    let effects = work(
+        &mut kernel,
+        call,
+        WorkStep::Finish(Completion::new("obsolete")),
+    );
+    assert!(starts(&effects).next().is_none());
+    assert_eq!(kernel.job_status(work_input.job), JobStatus::Ready);
+
+    let effects = kernel
+        .reconfigure(NOW, AgentLimits::default(), Vec::new())
+        .unwrap();
+    assert!(starts(&effects).next().is_none());
+    assert_eq!(kernel.job_status(work_input.job), JobStatus::Ready);
+
+    let effects = kernel.resume_scheduling(NOW);
+    let (_, restarted) = work_calls(&effects).pop().unwrap();
+    assert_eq!(restarted.job, work_input.job);
+}
+
+#[test]
+fn suspend_allows_a_running_tool_to_finish_without_starting_more_work() {
+    let tool = ToolSpec {
+        name: "read".into(),
+        description: "read data".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ReadOnly,
+    };
+    let mut kernel = Kernel::new(AgentLimits::default(), vec![tool.clone()]).unwrap();
+    let input = Input::new(InputId(21), "finish the in-flight read");
+    let (work_call, work_input) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("reader", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    let tool_call = tool_call(&work(
+        &mut kernel,
+        work_call,
+        WorkStep::Tool(ToolCall::new("read", json!({}))),
+    ));
+
+    let effects = kernel.suspend(NOW);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Cancel(id) if *id == tool_call))
+    );
+    let effects = kernel.step(
+        NOW,
+        Event::ToolFinished {
+            call: tool_call,
+            result: ToolOutcome::value(json!({ "value": 1 })),
+        },
+    );
+    assert!(starts(&effects).next().is_none());
+    assert_eq!(kernel.job_status(work_input.job), JobStatus::Ready);
+
+    let effects = kernel
+        .reconfigure(NOW, AgentLimits::default(), vec![tool])
+        .unwrap();
+    assert!(starts(&effects).next().is_none());
+
+    let effects = kernel.resume_scheduling(NOW);
+    let (_, restarted) = work_calls(&effects).pop().unwrap();
+    assert_eq!(restarted.job, work_input.job);
+}
+
+#[test]
+fn reconfigure_keeps_running_tools_and_discards_pending_model_decisions() {
+    let old_tool = ToolSpec {
+        name: "old".into(),
+        description: "old tool".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ExternalWrite,
+    };
+    let mut limits = AgentLimits {
+        tool_slots: 1,
+        ..AgentLimits::default()
+    };
+    let mut kernel = Kernel::new(limits.clone(), vec![old_tool]).unwrap();
+    let input = Input::new(InputId(3), "run both jobs");
+    let mut calls = calls_by_goal(create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![
+            assignment("first", &[input.id]),
+            assignment("second", &[input.id]),
+        ],
+    ));
+    let (first_call, first) = calls.remove("first").unwrap();
+    let (second_call, second) = calls.remove("second").unwrap();
+    let effects = work(
+        &mut kernel,
+        first_call,
+        WorkStep::Tool(ToolCall::new("old", json!({}))),
+    );
+    let running_tool = tool_call(&effects);
+    let _ = work(
+        &mut kernel,
+        second_call,
+        WorkStep::Tool(ToolCall::new("old", json!({}))),
+    );
+    assert!(matches!(
+        kernel.jobs[&second.job].state,
+        crate::job::JobState::Waiting(crate::job::WaitState::Commit(_))
+    ));
+
+    limits.tool_slots = 2;
+    let replacement_tool = ToolSpec {
+        name: "new".into(),
+        description: "new tool".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ReadOnly,
+    };
+    let effects = kernel
+        .reconfigure(NOW, limits, vec![replacement_tool.clone()])
+        .unwrap();
+
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Cancel(id) if *id == running_tool))
+    );
+    assert!(matches!(
+        kernel.job_status(first.job),
+        JobStatus::Waiting(crate::WaitView::Tool(id)) if id == running_tool
+    ));
+    let (_, restarted) = work_calls(&effects)
+        .into_iter()
+        .find(|(_, work)| work.job == second.job)
+        .unwrap();
+    assert_eq!(restarted.tools, vec![replacement_tool]);
+}
+
+#[test]
+fn reconfigure_keeps_the_output_limit_of_a_running_tool() {
+    let tool = ToolSpec {
+        name: "read".into(),
+        description: "read data".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ReadOnly,
+    };
+    let mut limits = AgentLimits {
+        tool_output_bytes: 1_024,
+        ..AgentLimits::default()
+    };
+    let mut kernel = Kernel::new(limits.clone(), vec![tool.clone()]).unwrap();
+    let input = Input::new(InputId(4), "read a value");
+    let (work_call, _) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("reader", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    let call = tool_call(&work(
+        &mut kernel,
+        work_call,
+        WorkStep::Tool(ToolCall::new("read", json!({}))),
+    ));
+    limits.tool_output_bytes = 128;
+    kernel.reconfigure(NOW, limits, vec![tool]).unwrap();
+    let result = ToolOutcome::value(json!({ "value": "x".repeat(256) }));
+    let encoded = serde_json::to_vec(&result).unwrap();
+    assert!(encoded.len() > 128 && encoded.len() <= 1_024);
+
+    kernel.step(
+        NOW,
+        Event::ToolFinished {
+            call,
+            result: result.clone(),
+        },
+    );
+
+    let recorded = kernel
+        .records
+        .values()
+        .find_map(|record| match &record.body {
+            RecordBody::ToolFinished {
+                call: finished,
+                outcome,
+                ..
+            } if *finished == call => Some(outcome.as_ref()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(recorded, &result);
+}
+
+#[test]
+fn reconfigure_keeps_the_output_limit_when_resolving_a_running_write() {
+    let tool = ToolSpec {
+        name: "write".into(),
+        description: "write data".into(),
+        parameters: json!({ "type": "object" }),
+        effect: ToolEffect::ExternalWrite,
+    };
+    let mut limits = AgentLimits {
+        tool_output_bytes: 1_024,
+        ..AgentLimits::default()
+    };
+    let mut kernel = Kernel::new(limits.clone(), vec![tool.clone()]).unwrap();
+    let input = Input::new(InputId(5), "write a value");
+    let (work_call, _) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("writer", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+    let call = tool_call(&work(
+        &mut kernel,
+        work_call,
+        WorkStep::Tool(ToolCall::new("write", json!({}))),
+    ));
+    limits.tool_output_bytes = 128;
+    kernel.reconfigure(NOW, limits, vec![tool]).unwrap();
+    kernel.step(
+        NOW,
+        Event::ToolFinished {
+            call,
+            result: ToolOutcome {
+                result: Err(crate::CallError::failed("unknown")),
+                external_effect: ExternalEffect::Unknown,
+            },
+        },
+    );
+    let resolution = ToolOutcome {
+        result: Ok(json!({ "value": "x".repeat(256) })),
+        external_effect: ExternalEffect::Applied,
+    };
+    let encoded = serde_json::to_vec(&resolution).unwrap();
+    assert!(encoded.len() > 128 && encoded.len() <= 1_024);
+
+    let (outcome, _) = kernel.control(
+        NOW,
+        KernelControl::ResolveWrite {
+            call,
+            result: resolution.clone(),
+        },
+    );
+
+    assert_eq!(outcome, ControlOutcome::Applied);
+    let recorded = kernel
+        .records
+        .values()
+        .filter_map(|record| match &record.body {
+            RecordBody::ToolFinished {
+                call: finished,
+                outcome,
+                ..
+            } if *finished == call => Some(outcome.as_ref()),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(recorded, &resolution);
+}
+
+#[test]
+fn reconfigure_trims_the_oldest_bootstrap_entries_to_the_new_budget() {
+    let newest = BackgroundEntry::new("new", "n".repeat(128));
+    let kept = BootstrapContext {
+        entries: vec![newest.clone()],
+        omitted: true,
+    };
+    let background = BootstrapContext {
+        entries: vec![BackgroundEntry::new("old", "o".repeat(128)), newest.clone()],
+        omitted: false,
+    };
+    let mut kernel =
+        Kernel::with_background(AgentLimits::default(), Vec::new(), background).unwrap();
+    let context_bytes = serde_json::to_vec(&kept).unwrap().len();
+    let limits = AgentLimits {
+        context_bytes,
+        item_bytes: context_bytes,
+        ..AgentLimits::default()
+    };
+
+    kernel.reconfigure(NOW, limits, Vec::new()).unwrap();
+
+    assert_eq!(kernel.background.as_ref(), &kept);
+}
+
+#[test]
 fn a_routing_investigation_can_finish_while_its_routing_waits() {
     let mut kernel = kernel();
     let input = Input::new(InputId(100), "locate the work that needs this correction");

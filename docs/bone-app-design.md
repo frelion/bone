@@ -17,7 +17,7 @@
 | 对外对象 | `App` 和 `Session` 两个句柄；其余主要是数据结构 |
 | 前端边界 | TUI 独立 crate，只调用 App API |
 | 执行单位 | 一个 Session 同时最多一个 Agent Runtime，多个 Job 在该 Runtime 内执行 |
-| 配置生效 | 创建 Runtime 时解析并固定；保存的新配置作用于下一 Runtime |
+| 配置生效 | 保存后重装受影响的活跃 Session；`update_config().await` 是生效屏障 |
 | 输入回执 | 返回成功表示输入已持久保存；Agent 接受、等待、完成分别表达 |
 | 输出 | 当前状态用 `watch`；历史用同一份 SQLite journal 分页读取 |
 | 持久化 | App 私有 `storage` 模块拥有 SQLite、journal、事务和 lease |
@@ -68,7 +68,7 @@ App
                  ├── watch<SessionView>
                  └── Option<RunningAgent>
                       ├── RuntimeId
-                      ├── 固定的 RuntimeConfig
+                      ├── 当前 RuntimeConfig
                       ├── Agent
                       └── Agent 观察水位
 ```
@@ -142,6 +142,7 @@ impl Session {
     fn id(&self) -> SessionId;
 
     async fn submit(&self, input: SubmitInput) -> Result<SubmissionReceipt>;
+    async fn reload_config(&self) -> Result<()>;
     async fn retry(&self, input: InputId) -> Result<CommandReceipt>;
     async fn control(&self, target: JobRef, action: JobControl)
         -> Result<CommandReceipt>;
@@ -234,7 +235,7 @@ Queued → Posting → Accepted → Finished(Completed / Failed / Cancelled)
 
 `WaitingForUser`、`RoutingFailed` 是可继续状态，完成后仍由对应 `InputFinished` 结算。`Interrupted` 是 App 对执行丢失的记录，不伪造 Agent 的 Failed 或 Cancelled。输入已保存后，Agent 仍可能因问题刚刚失效而返回 InvalidReply；此时写入 InputRejected 并结算为 Rejected，不能永久留在 Queued 或向已返回的 submit 再抛一次错误。Busy 属于暂时未接受，继续 Queued。
 
-保存配置缺失、登录未就绪等原因后，调用方可以先修正配置或登录，再显式 `retry(input)`。`retry` 只处理尚未投递的输入或同一 Runtime 的 RoutingFailed；已经 Finished/Interrupted 的输入不自动重做，要通过新的 submit 表达新工作。
+配置缺失、登录未就绪等原因会让输入保持 Queued。调用方修正已保存配置时，`update_config` 会直接重新应用；若只修复了凭据这类外部前置，调用 `reload_config()` 重试当前 desired，无需重写相同配置。`retry(input)` 处理普通 Queued 输入或同一 Runtime 的 RoutingFailed；已经 Finished/Interrupted 的输入不自动重做，要通过新的 submit 表达新工作。
 
 Agent 容量满时，已保存输入留在 Queued。SessionTask 按接收顺序投递，并在状态变化后再试，不为每条输入另建 timer 或 retry worker。Session 命令 channel 容量为 64；当前没有给已经持久化的 Queued 输入另设总量上限。
 
@@ -286,7 +287,7 @@ View 中的历史水位只指向已成功保存的事实。Agent 的进度 Recor
 | `JobFinished` | 某项工作结束，含摘要和剩余事项 |
 | `InputFinished` / `InputRejected` | 某条输入完成执行，或已保存但被明确拒绝执行 |
 | `ToolFinished` | 完整 `ToolOutcome`，保留成功/失败类别与副作用结论 |
-| `RuntimeStarted` / `RuntimeClosed` | 一段执行实例的生命周期 |
+| `RuntimeStarted` / `RuntimeReconfigured` / `RuntimeClosed` | 执行实例的生命周期与配置边界 |
 | `Interrupted` / `WriteResolved` | 中断和后续核查事实 |
 
 子 Job 的结果和面向用户的发言保持独立。当前 `JobFinished` 保存 JobRef、结果、摘要和剩余事项；输入是否结束只看对应的 `InputFinished`，不根据任意 Job Outcome 推断。Agent-local 证据序号仍完整保存在内部原始记录中，在证据读取 API 落地前不伪装成前端可操作的引用。
@@ -378,9 +379,19 @@ struct ResolvedConfig {
 }
 ```
 
-RuntimeConfig 包含已确定的两种模型、工具配置、AgentLimits 和 Workspace 路径。它没有 secret，在创建 Runtime 时保存一份；记录配置本身，不只保存一个无法还原的 hash。首次尚未选模型可以成功保存配置，desired 用 ConfigProblem::NeedsModel 表达未完整，不阻止打开 App。
+RuntimeConfig 包含已确定的两种模型、工具配置、AgentLimits 和 Workspace 路径。它没有 secret；记录配置本身，不只保存一个无法还原的 hash。首次尚未选模型可以成功保存配置，desired 用 ConfigProblem::NeedsModel 表达未完整，不阻止打开 App。
 
-保存配置成功后返回该 scope 的配置快照；`resolved_config` 随后返回新 desired 值。当前 Runtime 继续使用 running 值。用户关闭 Runtime 后再次执行，采用新配置并从历史构造启动背景。第一版不提供自动重启、模型热切换或工具热插拔。
+`update_config` 先在存储事务中修改一个字段，再通过各 Session 已有的命令队列通知受影响对象。它并发通知目标 Session、等待全部确认后才返回；返回成功意味着之后开始的模型调用、工具调用和调度都只能使用新配置。某个 Session 失败不会回滚其他已生效 Session；调用仍等完全部目标后返回首个错误，各自的 View 与 `resolved_config` 给出精确 desired/running 状态。配置调用一旦进入 App，取消 future 只停止调用方等待，不撤销这条命令；配置写入与生效确认由 App 自己持有，后续配置修改、`resolved_config` 和 shutdown 与同一屏障排序。User 作用于本 App 实例中全部已打开 Session，Workspace 和 Session scope 只通知自身覆盖范围。该实时屏障不跨进程广播；其他 App 实例在下次创建 Runtime 或由自身执行配置操作时解析持久值。未打开的 Session 在下次启动时直接解析最新值。
+
+`save_profile` 使用同一生效屏障，因为 Profile 是 RuntimeConfig 的组成部分。API key 与登录状态属于连接凭据而不是 RuntimeConfig；修改凭据不暗中替换已建立的连接。若 Session 正因凭据缺失而挂起，前端修复凭据后调用 `reload_config` 重新应用已持久化的 desired；需要替换已建立连接时显式关闭 Runtime。
+
+对运行中 Runtime，`update_config` / `reload_config` 的回执是完整重配屏障。对 Detached Session，回执表示新 desired 已接管后续启动、旧启动不可能胜出；Provider 连接结果仍是异步的，前端通过 SessionView 观察 Running 或 typed problem。
+
+运行中的 Session 按 `suspend → reconfigure → 持久化 RuntimeReconfigured → resume_scheduling` 原地更新 Agent，保留 RuntimeId、Job DAG、记录和等待关系。新模型、工具集合与 AgentLimits 先在挂起状态下安装，精确配置边界落盘后才恢复调度，因此新配置不可能先于持久化产生外部动作。正在执行的旧模型调用被撤权；已经开始的工具调用仍按启动时捕获的边界完成。启动中的 Runtime 被作废并按新配置重新启动；Detached Session 不创建空 Runtime，但已有 queued input 会在配置完整后继续启动。
+
+若活跃 Runtime 的新模型无法连接、工具无法装配、配置不完整或边界落盘失败，更新返回错误，`desired` 保留已经保存的新配置或具体 ConfigProblem，`running` 保留最后已持久化安装的配置快照，SessionView 同时给出可操作问题。此时 Agent 被 suspend：撤销旧模型调用、不再启动模型或待提交工具动作，但允许已经运行的工具按原调用边界收尾；新的输入只持久化为 Queued。修复配置后再次更新，或在仅修复凭据后调用 `reload_config`，会在同一 DAG 上恢复调度。
+
+这不需要跨 Agent 和 SQLite 的两阶段提交协议：Agent 在 resume 之前本来就不能产生新配置的调用。持久化失败只保持挂起和问题状态；恢复存储后可重试同一 desired，不丢失 Job DAG。
 
 角色调用超时由 AgentLimits 决定，删除旧 ModelSelection 中的另一套任务 timeout。Bash 的进程执行期限仍属于 ToolLimits；启用 `WorkspaceWrite` 时，运行时的 tool_timeout 必须大于最大 Bash timeout，给退出清理和结果归档留出时间。只读模式不会装配 Bash，因此不要求这两个值满足该关系。
 
@@ -391,7 +402,7 @@ RuntimeConfig 包含已确定的两种模型、工具配置、AgentLimits 和 Wo
 SessionTask 在需要创建 Runtime 时执行一个普通的具体装配函数：
 
 ```text
-解析并固定 RuntimeConfig
+解析初始 RuntimeConfig
   → 构造 Workspace ToolEnvironment
   → 安装 read/glob/grep + session_history
   → 按配置安装 apply_patch/bash
@@ -402,7 +413,7 @@ SessionTask 在需要创建 Runtime 时执行一个普通的具体装配函数�
   → 按顺序投递已保存输入
 ```
 
-连接操作不持有 Session 命令锁；完成结果回到 SessionTask 后再核对是否仍需要启动。一个 Session 同时只有一次启动操作，多个排队输入共享它。
+首次启动的连接异步执行；完成结果回到 SessionTask 后再核对是否仍需要启动。配置变更则作为 Session mailbox 中的显式屏障串行处理。一个 Session 同时只有一次启动操作，多个排队输入共享它。
 
 `ModelAdapter` 和只读工具适配入口已经由 `bone-agent` 公开。App 直接组合它们，不复制 coordinate/work/compact 协议。
 
@@ -524,7 +535,7 @@ Agent 的构造时只读 background 会作为历史资料进入 CoordinateInput 
 1. 前端打开 App 和 Workspace，创建 Session，立即能保存草稿和读取历史。
 2. 用户提交文本，App 保存输入并返回回执；View 显示 Queued / NeedsModel。
 3. 用户通过配置 API 选择模型，必要时通过 login 完成授权。
-4. 调用 retry，App 装配 Runtime，投递同一个尚未发送的 Input。
+4. 配置修改本身会重新投递 Queued Input；若之后才完成登录，调用 `reload_config`。
 5. 前端从 history 获取回复，从 View 获取进度，直到自己的输入终态。
 
 Shell 的存在与模型是否连接无关；这里不需要前端实现持久接受或 Runtime 启动逻辑。
@@ -543,9 +554,9 @@ App 不尝试取消所有旧 Job，也不在外层重新拆任务。两个输入
 
 ### 11.4 改模型
 
-执行中保存新 Worker 配置，resolved_config 同时返回新 desired 和旧 running。当前工作继续使用旧模型。用户 close_runtime 后再次提交，新 Runtime 使用新模型和有界历史背景。
+执行中保存新 Worker 配置时，App 通知该 Session 原地重配 Agent。模型旧调用先撤权，晚到结果不会进入 Kernel；仍未完成的 Job 保留原 ID 和依赖关系，由新模型继续调度。`update_config` 返回后，`resolved_config` 的 desired 和 running 都是新模型，RuntimeId 不变。
 
-前端无需自行销毁 Agent，也不用拼接聊天记录实现上下文迁移。
+前端无需自行销毁 Agent，也不用拼接聊天记录实现上下文迁移。若新 provider 无法连接，调用返回错误，此时 desired 显示已保存的新选择，running 显示最后成功安装的旧选择；旧 Agent 已暂停新调度，不会继续偷偷使用它。
 
 ### 11.5 写文件时进程退出
 
@@ -577,7 +588,7 @@ crates/bone-app/src/
     ├── mod.rs      crate-private 导出
     ├── sqlite.rs   连接与短事务
     ├── journal.rs  记录、分页和来源定位
-    ├── schema.rs   schema 与数据迁移
+    ├── schema.rs   当前 schema 创建与结构校验
     └── ...         复用的 document / lease / 路径与测试
 
 未来 crates/bone-tui/src/
@@ -608,11 +619,9 @@ crates/bone-app/src/
 
 每一步用实际 API 场景验收，不先建立一套无人调用的通用服务层。
 
-### 12.3 数据兼容
+### 12.3 数据边界
 
-新 App 记录使用 `app.v2` namespace。当前没有旧设置与会话的一次性转换；旧记录不会被读取或覆盖。
-
-不维护长期运行的两套 App 模型或双写协议。旧记录中缺失的 Runtime/Input 关联保留为旧历史，不凭空补出执行关系。
+App 记录使用 `app` namespace。数据库只接受当前 schema，不设计双读、双写或迁移分支。
 
 ## 13. 验收与规模约束
 
@@ -623,7 +632,7 @@ crates/bone-app/src/
 3. 多 Input、多 Job 的回复和终态关联正确；旧问题的回答被拒绝。
 4. stop 之后没有此前尚未投递的输入突然启动。
 5. 两个客户端观察同一 Session；慢消费者与重连能完整分页读取历史。
-6. 配置改变只作用于新 Runtime；新 Runtime 可读历史且不重放旧动作。
+6. 配置改变原地重配活跃 Runtime，保留 Job DAG，撤权旧模型调用且不重放在途工具动作。
 7. 同一 App 两个 ChatGPT Session 能共享凭据连接。
 8. 写入意图先于实际工具调用落盘；结果不确定时可定位、核查。
 9. 正常关闭保存最后结果；冷启动区分未投递、Interrupted 和未决写。
@@ -631,7 +640,7 @@ crates/bone-app/src/
 
 测试使用 crate-private ModelPort/ToolPort 注入与临时数据目录；原 bone-store 的事务、分页和跨进程 lease 测试已迁入 App。实现没有增加 AppApi、Repository 或 ProviderFactory trait。
 
-第一版不加入分布式执行、通用插件容器、工作流引擎、审批框架、动态配置 schema、自动补偿系统、模型热更新和自动执行恢复。也不主动加入一套端口、服务、适配器同名转发层。每个新增类型都应有独立的数据含义、所有权或调用职责。
+当前不加入分布式执行、通用插件容器、工作流引擎、审批框架、动态配置 schema、自动补偿系统和自动执行恢复。也不主动加入一套端口、服务、适配器同名转发层。每个新增类型都应有独立的数据含义、所有权或调用职责。
 
 ## 14. 当前实现入口
 

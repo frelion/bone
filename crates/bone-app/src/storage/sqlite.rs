@@ -173,12 +173,7 @@ mod tests {
         let (_temporary, roots) = roots();
         let store = StoreInner::open(roots).unwrap();
         let connection = store.connection().unwrap();
-        let version: i64 = connection
-            .query_row("SELECT schema_version FROM schema_meta", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(version, schema::VERSION);
+        schema::validate_existing(&connection).unwrap();
         #[cfg(unix)]
         assert_eq!(
             fs::metadata(store.database_path())
@@ -191,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn reopens_an_existing_v1_database() {
+    fn reopens_an_existing_database() {
         let (_temporary, roots) = roots();
         let store = StoreInner::open(roots.clone()).unwrap();
         let database_path = store.database_path().to_owned();
@@ -199,14 +194,7 @@ mod tests {
 
         let reopened = StoreInner::open(roots).unwrap();
         assert_eq!(reopened.database_path(), database_path);
-        let version: i64 = reopened
-            .connection()
-            .unwrap()
-            .query_row("SELECT schema_version FROM schema_meta", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(version, schema::VERSION);
+        schema::validate_existing(&reopened.connection().unwrap()).unwrap();
     }
 
     #[test]
@@ -216,10 +204,7 @@ mod tests {
         let database_path = data_root.join("bone.sqlite3");
         let connection = Connection::open(&database_path).unwrap();
         connection
-            .execute_batch(
-                "CREATE TABLE schema_meta (schema_version INTEGER NOT NULL);\
-                 INSERT INTO schema_meta (schema_version) VALUES (1);",
-            )
+            .execute_batch("CREATE TABLE documents (key TEXT NOT NULL);")
             .unwrap();
         drop(connection);
         #[cfg(unix)]
@@ -234,21 +219,24 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_future_schema_before_changing_journal_mode() {
+    fn refuses_a_non_current_layout_before_changing_journal_mode() {
         let (_temporary, roots) = roots();
-        let data_root = ensure_private_directory(roots.data_root()).unwrap();
-        let database_path = data_root.join("bone.sqlite3");
+        let store = StoreInner::open(roots.clone()).unwrap();
+        let database_path = store.database_path().to_owned();
+        drop(store);
+
         let connection = Connection::open(&database_path).unwrap();
         connection
-            .execute_batch("CREATE TABLE schema_meta (schema_version INTEGER NOT NULL); INSERT INTO schema_meta VALUES (2);")
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        connection
+            .execute_batch("CREATE TABLE unexpected (value TEXT NOT NULL);")
             .unwrap();
         drop(connection);
-        #[cfg(unix)]
-        fs::set_permissions(&database_path, fs::Permissions::from_mode(0o600)).unwrap();
 
         assert!(matches!(
             StoreInner::open(roots),
-            Err(StoreError::UnsupportedSchema { found: 2 })
+            Err(StoreError::Corrupt { .. })
         ));
         let connection = Connection::open(database_path).unwrap();
         let mode: String = connection

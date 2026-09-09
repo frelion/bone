@@ -1,14 +1,6 @@
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, TransactionBehavior};
 
 use super::StoreError;
-
-pub(crate) const VERSION: i64 = 1;
-
-const CREATE_SCHEMA_META: &str = "
-    CREATE TABLE schema_meta (
-        schema_version INTEGER NOT NULL
-    )
-";
 
 const CREATE_DOCUMENTS: &str = "
     CREATE TABLE documents (
@@ -38,21 +30,12 @@ pub(crate) fn initialize_new(connection: &mut Connection) -> Result<(), StoreErr
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| StoreError::sqlite("begin schema transaction", error))?;
     transaction
-        .execute_batch(CREATE_SCHEMA_META)
-        .map_err(|error| StoreError::sqlite("create schema metadata", error))?;
-    transaction
         .execute_batch(CREATE_DOCUMENTS)
         .map_err(|error| StoreError::sqlite("create documents table", error))?;
     transaction
         .execute_batch(CREATE_JOURNAL_ENTRIES)
         .map_err(|error| StoreError::sqlite("create journal table", error))?;
-    transaction
-        .execute(
-            "INSERT INTO schema_meta (schema_version) VALUES (?1)",
-            [VERSION],
-        )
-        .map_err(|error| StoreError::sqlite("write schema version", error))?;
-    validate_v1_layout(&transaction)?;
+    validate_layout(&transaction)?;
     transaction
         .commit()
         .map_err(|error| StoreError::sqlite("commit schema transaction", error))
@@ -60,33 +43,27 @@ pub(crate) fn initialize_new(connection: &mut Connection) -> Result<(), StoreErr
 
 /// Validate an existing database without changing its schema or journal mode.
 pub(crate) fn validate_existing(connection: &Connection) -> Result<(), StoreError> {
-    require_table(connection, "schema_meta")?;
-    let versions = read_schema_versions(connection)?;
-    let version = match versions.as_slice() {
-        [version] => *version,
-        [] => {
-            return Err(StoreError::Corrupt {
-                message: "schema metadata has no version row",
-            });
-        }
-        _ => {
-            return Err(StoreError::Corrupt {
-                message: "schema metadata has more than one version row",
-            });
-        }
-    };
-    if version != VERSION {
-        return Err(StoreError::UnsupportedSchema { found: version });
-    }
-    validate_v1_layout(connection)
+    validate_layout(connection)
 }
 
-fn validate_v1_layout(connection: &Connection) -> Result<(), StoreError> {
-    require_columns(
-        connection,
-        "schema_meta",
-        &[Column::new("schema_version", "INTEGER", true, 0)],
-    )?;
+fn validate_layout(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .map_err(|error| StoreError::sqlite("inspect schema tables", error))?;
+    let tables = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| StoreError::sqlite("inspect schema tables", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| StoreError::sqlite("inspect schema tables", error))?;
+    if tables != ["documents", "journal_entries"] {
+        return Err(StoreError::Corrupt {
+            message: "SQLite schema does not match the current layout",
+        });
+    }
+
     require_columns(
         connection,
         "documents",
@@ -111,30 +88,11 @@ fn validate_v1_layout(connection: &Connection) -> Result<(), StoreError> {
     )
 }
 
-fn require_table(connection: &Connection, table: &'static str) -> Result<(), StoreError> {
-    let object_type = connection
-        .query_row(
-            "SELECT type FROM sqlite_schema WHERE name = ?1",
-            [table],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| StoreError::sqlite("inspect schema table", error))?;
-    if object_type.as_deref() == Some("table") {
-        Ok(())
-    } else {
-        Err(StoreError::Corrupt {
-            message: "required schema table is missing or malformed",
-        })
-    }
-}
-
 fn require_columns(
     connection: &Connection,
     table: &'static str,
     expected: &[Column],
 ) -> Result<(), StoreError> {
-    require_table(connection, table)?;
     let quoted_table = quote_identifier(table);
     let mut statement = connection
         .prepare(&format!("PRAGMA table_info({quoted_table})"))
@@ -151,37 +109,21 @@ fn require_columns(
         .map_err(|error| StoreError::sqlite("inspect schema columns", error))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| StoreError::sqlite("inspect schema columns", error))?;
-    for required in expected {
-        let found = columns.iter().find(|column| column.name == required.name);
-        if !found.is_some_and(|actual| {
-            actual
-                .declared_type
-                .eq_ignore_ascii_case(&required.declared_type)
+    let matches = columns.len() == expected.len()
+        && columns.iter().zip(expected).all(|(actual, required)| {
+            actual.name == required.name
+                && actual
+                    .declared_type
+                    .eq_ignore_ascii_case(&required.declared_type)
                 && actual.not_null == required.not_null
                 && actual.primary_key_order == required.primary_key_order
-        }) {
-            return Err(StoreError::Corrupt {
-                message: "SQLite schema is missing a required column or key",
-            });
-        }
+        });
+    if !matches {
+        return Err(StoreError::Corrupt {
+            message: "SQLite schema does not match the current layout",
+        });
     }
     Ok(())
-}
-
-fn read_schema_versions(connection: &Connection) -> Result<Vec<i64>, StoreError> {
-    let result = (|| {
-        let mut statement = connection.prepare("SELECT schema_version FROM schema_meta")?;
-        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
-        rows.collect::<Result<Vec<_>, _>>()
-    })();
-    result.map_err(
-        |error| match StoreError::sqlite("read schema version", error) {
-            error @ (StoreError::Busy | StoreError::Corrupt { .. }) => error,
-            _ => StoreError::Corrupt {
-                message: "schema metadata table is malformed",
-            },
-        },
-    )
 }
 
 fn quote_identifier(identifier: &str) -> String {

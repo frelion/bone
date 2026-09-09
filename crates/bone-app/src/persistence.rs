@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use bone_agent::{ExternalEffect, Record, ToolOutcome};
@@ -20,7 +20,7 @@ use crate::{
     },
 };
 
-const NAMESPACE: &str = "app.v2";
+const NAMESPACE: &str = "app";
 
 #[derive(Clone)]
 pub(crate) struct DataStore {
@@ -36,6 +36,7 @@ const NO_AGENT_RECORD_FAILURE: usize = usize::MAX;
 struct TestFaults {
     agent_record_saves_before_failure: AtomicUsize,
     replayed_agent_record_saves: AtomicUsize,
+    runtime_reconfigure_failure: AtomicBool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -110,8 +111,16 @@ impl DataStore {
             faults: Arc::new(TestFaults {
                 agent_record_saves_before_failure: AtomicUsize::new(NO_AGENT_RECORD_FAILURE),
                 replayed_agent_record_saves: AtomicUsize::new(0),
+                runtime_reconfigure_failure: AtomicBool::new(false),
             }),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_runtime_reconfigure(&self, fail: bool) {
+        self.faults
+            .runtime_reconfigure_failure
+            .store(fail, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -445,10 +454,47 @@ impl DataStore {
             |saved| {
                 saved.runtime = Some(runtime.clone());
                 saved.agent_through = 0;
+                Ok(())
             },
             SessionEvent::RuntimeStarted {
                 runtime: runtime.id,
                 config: Box::new(runtime.config.clone()),
+            },
+        )
+    }
+
+    pub fn reconfigure_runtime(
+        &self,
+        session: SessionId,
+        runtime: RuntimeId,
+        config: RuntimeConfig,
+    ) -> Result<SessionSeq, StoreError> {
+        #[cfg(test)]
+        if self
+            .faults
+            .runtime_reconfigure_failure
+            .load(Ordering::Acquire)
+        {
+            return Err(StoreError::Corrupt {
+                message: "injected runtime reconfigure failure",
+            });
+        }
+        self.update_session_with_event(
+            session,
+            |saved| {
+                let current = saved
+                    .runtime
+                    .as_mut()
+                    .filter(|current| current.id == runtime)
+                    .ok_or(StoreError::Corrupt {
+                        message: "runtime is not current",
+                    })?;
+                current.config = config.clone();
+                Ok(())
+            },
+            SessionEvent::RuntimeReconfigured {
+                runtime,
+                config: Box::new(config.clone()),
             },
         )
     }
@@ -469,6 +515,7 @@ impl DataStore {
                     saved.runtime = None;
                     saved.agent_through = 0;
                 }
+                Ok(())
             },
             SessionEvent::RuntimeClosed { runtime },
         )
@@ -985,7 +1032,7 @@ impl DataStore {
     fn update_session_with_event(
         &self,
         session: SessionId,
-        update: impl FnOnce(&mut SavedSession),
+        update: impl FnOnce(&mut SavedSession) -> Result<(), StoreError>,
         event: SessionEvent,
     ) -> Result<SessionSeq, StoreError> {
         let document = self.store.document::<SavedSession>(session_key(session));
@@ -995,7 +1042,7 @@ impl DataStore {
             let mut saved = snapshot.value.ok_or(StoreError::Corrupt {
                 message: "session does not exist",
             })?;
-            update(&mut saved);
+            update(&mut saved)?;
             let append = transaction.append(&journal, &StoredEvent::App(event))?;
             transaction.replace(&document, &saved, snapshot.revision)?;
             Ok(SessionSeq(append.sequence))
@@ -1108,7 +1155,7 @@ fn request_key(session: SessionId, request: RequestId) -> DocumentKey {
 }
 
 fn journal_key(session: SessionId) -> JournalKey {
-    JournalKey::new(format!("app.v2/session/{session}"))
+    JournalKey::new(format!("app/session/{session}"))
 }
 
 fn global_config_key() -> DocumentKey {

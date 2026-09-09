@@ -36,14 +36,14 @@ pub struct ChatGptCredentials {
 }
 
 impl ChatGptCredentials {
-    /// Resolves `$XDG_CONFIG_HOME/bone/store-v1`, or `~/.config/bone/store-v1`.
+    /// Resolves `$XDG_CONFIG_HOME/bone`, or `~/.config/bone`.
     pub fn default_for_current_user() -> Result<Self, CredentialError> {
         let base = xdg_or_home(
             env::var_os("XDG_CONFIG_HOME"),
             env::var_os("HOME").as_ref(),
             ".config",
         )?;
-        Self::at(base.join("bone").join("store-v1"))
+        Self::at(base.join("bone"))
     }
 
     /// Uses an explicit BONE config root; useful for embedding and tests.

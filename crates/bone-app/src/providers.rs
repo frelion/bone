@@ -11,7 +11,7 @@ use bone_llm::{
     protocol::{anthropic_messages, openai_chat_completions, openai_responses},
     service::chatgpt_subscription::{self, DeviceCodePrompt},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     config::{Profile, ProfileId, ResolvedModel, RuntimeConfig},
@@ -25,6 +25,7 @@ use crate::{
 #[derive(Clone, Default)]
 pub(crate) struct ProviderConnector {
     chatgpt: Arc<Mutex<ChatGptState>>,
+    chatgpt_operation: Arc<RwLock<()>>,
 }
 
 #[derive(Default)]
@@ -76,6 +77,7 @@ impl ProviderConnector {
                 connection: None,
                 closed: false,
             })),
+            chatgpt_operation: Arc::new(RwLock::new(())),
         }
     }
 
@@ -139,6 +141,10 @@ impl ProviderConnector {
         if !matches!(profile.endpoint, EndpointConfig::ChatGptSubscription) {
             return Err(ProviderConnectError::InvalidProfile(profile.id.clone()));
         }
+        let _operation = self
+            .chatgpt_operation
+            .try_write()
+            .map_err(|_| ProviderConnectError::Busy(profile.id.clone()))?;
         let mut state = self
             .chatgpt
             .try_lock()
@@ -158,6 +164,10 @@ impl ProviderConnector {
     pub(crate) async fn logout(&self, profile: &Profile) -> Result<(), ProviderConnectError> {
         validate_profile(profile)?;
         if matches!(profile.endpoint, EndpointConfig::ChatGptSubscription) {
+            let _operation = self
+                .chatgpt_operation
+                .try_write()
+                .map_err(|_| ProviderConnectError::Busy(profile.id.clone()))?;
             let mut state = self
                 .chatgpt
                 .try_lock()
@@ -184,6 +194,10 @@ impl ProviderConnector {
     /// Release idle process-local connections during App shutdown without
     /// deleting credentials needed by the next App instance.
     pub(crate) async fn close(&self) -> Result<(), ProviderConnectError> {
+        let _operation = self
+            .chatgpt_operation
+            .try_write()
+            .map_err(|_| ProviderConnectError::Busy(ProfileId::chatgpt()))?;
         let mut state = self
             .chatgpt
             .try_lock()
@@ -212,6 +226,10 @@ impl ProviderConnector {
 
     async fn connect_chatgpt(&self) -> Result<Arc<ChatGptConnection>, ProviderConnectError> {
         let profile = ProfileId::chatgpt();
+        let _operation = self
+            .chatgpt_operation
+            .try_read()
+            .map_err(|_| ProviderConnectError::Busy(profile.clone()))?;
         let mut state = self.chatgpt.lock().await;
         if state.closed {
             return Err(ProviderConnectError::Closed);
@@ -411,6 +429,8 @@ fn chatgpt_error(error: CredentialError) -> ProviderConnectError {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, task::Poll};
+
     use bone_llm::Protocol;
     use bone_llm::service::chatgpt_subscription::ChatGptAuthCache;
 
@@ -455,6 +475,59 @@ mod tests {
             Err(ProviderConnectError::LoginRequired(_))
         ));
         credentials.clear().unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_connection_is_busy_while_interactive_login_owns_the_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let credentials = ChatGptCredentials::at(directory.path().join("credentials")).unwrap();
+        let connector = ProviderConnector::with_chatgpt_credentials(credentials);
+        let _interactive_login = connector.chatgpt_operation.write().await;
+
+        let result = connector.connect_chatgpt().await;
+
+        assert!(matches!(
+            result,
+            Err(ProviderConnectError::Busy(profile)) if profile == ProfileId::chatgpt()
+        ));
+        assert_eq!(
+            connector.close().await,
+            Err(ProviderConnectError::Busy(ProfileId::chatgpt()))
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_runtime_connections_wait_and_share_the_cached_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let credentials = ChatGptCredentials::at(directory.path().join("credentials")).unwrap();
+        let lease = credentials.acquire().unwrap();
+        std::fs::write(
+            lease.auth_file(),
+            br#"{"access_token":"offline-test-token","expires_at":4102444800,"account_id":"offline-account"}"#,
+        )
+        .unwrap();
+        drop(lease);
+        let connector = ProviderConnector::with_chatgpt_credentials(credentials);
+
+        let state = connector.chatgpt.lock().await;
+        let mut first = Box::pin(connector.connect_chatgpt());
+        std::future::poll_fn(|context| match first.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("the first connection did not contend on runtime state"),
+        })
+        .await;
+        let mut second = Box::pin(connector.connect_chatgpt());
+        std::future::poll_fn(|context| match second.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("the second connection did not contend on runtime state"),
+        })
+        .await;
+        drop(state);
+
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[tokio::test]

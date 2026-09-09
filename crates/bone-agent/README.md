@@ -114,6 +114,7 @@ Completed Job 可以作为新 Job 的受限 seed，旧 Job 不会重开。导入
 - 迟到工具结果仍然是真实执行事实；外部写入的 `Unknown` 只能由宿主通过 `resolve_write` 确证，不能自动重发。
 - `pause`、`resume`、`cancel`、`stop`、`retry` 和 `resolve_write` 返回 `ControlOutcome::Applied` 或 `Unchanged`，宿主无需通过前后快照猜测控制是否生效。
 - `stop` 终结当前工作森林；`shutdown` 再等待本地调用清理，并返回仍未知的外部写入以及冻结的 `final_view`。
+- `suspend` 撤销模型执行并冻结新调度但保留 DAG；在途工具继续按启动快照收尾。`reconfigure` 原子替换模型、工具和限额且保留当前调度状态；活跃 Agent 立即继续，suspended Agent 只有在 `resume_scheduling` 后恢复。
 - 最后一个 `Agent` handle 被丢弃时，Runtime 自动执行 Stop 并进入 shutdown 清理。需要取得清理报告的宿主应显式调用 `shutdown`。
 - `CallContext::id()` 只在当前 Runtime 内唯一；外部幂等键需要组合宿主提供的 Runtime 或 Session 标识。
 

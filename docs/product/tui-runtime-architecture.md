@@ -1,8 +1,11 @@
 # TUI runtime architecture
 
-> **Historical document (2026-09-09).** The implementation described below was
-> removed with the old TUI. The current backend contract is
-> [bone-app-design.md](../bone-app-design.md); the replacement TUI has not been
+> **Historical document (2026-09-09).** This entire document describes the
+> implementation removed with the old TUI. Labels such as “current” or
+> “contract” below refer only to that retired implementation and do not override
+> current behavior. The current App contract is
+> [bone-app-design.md](../bone-app-design.md) together with
+> [configuration.md](../configuration.md); the replacement TUI has not been
 > implemented and will be a frontend over `bone-app` only.
 
 > **Former implementation contract.** This document describes the runtime
@@ -72,8 +75,8 @@ let connector = ProviderConnector::new();
 `bone-app::open_default_store` uses the XDG data root for BONE data:
 
 ```text
-$XDG_DATA_HOME/bone/store-v1/bone.sqlite3
-# or ~/.local/share/bone/store-v1/bone.sqlite3
+$XDG_DATA_HOME/bone/bone.sqlite3
+# or ~/.local/share/bone/bone.sqlite3
 ```
 
 The first interactive launch initializes the SQLite schema and typed global
@@ -204,8 +207,8 @@ separate exception because Rig owns its `auth.json` schema and refresh
 lifecycle. The cache lives under the private XDG config root:
 
 ```text
-$XDG_CONFIG_HOME/bone/store-v1/providers/chatgpt-subscription/auth.json
-# or ~/.config/bone/store-v1/providers/chatgpt-subscription/auth.json
+$XDG_CONFIG_HOME/bone/providers/chatgpt-subscription/auth.json
+# or ~/.config/bone/providers/chatgpt-subscription/auth.json
 ```
 
 The connection effect acquires a `ChatGptAuthLease` before calling Rig and

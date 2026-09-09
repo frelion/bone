@@ -100,6 +100,7 @@ enum CallTask {
         revision: u64,
         effect: ToolEffect,
         request: Arc<crate::ToolCall>,
+        output_bytes: usize,
     },
 }
 
@@ -230,6 +231,7 @@ pub(crate) struct Kernel {
     pub tools: BTreeMap<String, ToolSpec>,
     pub constraints: String,
     pub user_question: Option<JobId>,
+    suspended: bool,
     interactive_ready: VecDeque<JobId>,
     background_ready: VecDeque<JobId>,
     routing_ready: VecDeque<Seq>,
@@ -254,16 +256,7 @@ impl Kernel {
         {
             return Err(KernelError::BackgroundTooLarge);
         }
-        let mut registry = BTreeMap::new();
-        for tool in tools {
-            if tool.name.trim().is_empty() {
-                return Err(KernelError::InvalidToolName);
-            }
-            let name = tool.name.clone();
-            if registry.insert(name.clone(), tool).is_some() {
-                return Err(KernelError::DuplicateTool(name));
-            }
-        }
+        let registry = tool_registry(tools)?;
         Ok(Self {
             limits,
             background: Arc::new(background),
@@ -276,6 +269,7 @@ impl Kernel {
             tools: registry,
             constraints: String::new(),
             user_question: None,
+            suspended: false,
             interactive_ready: VecDeque::new(),
             background_ready: VecDeque::new(),
             routing_ready: VecDeque::new(),
@@ -466,6 +460,93 @@ impl Kernel {
         }
         self.advance(now, &mut effects);
         effects
+    }
+
+    pub(crate) fn reconfigure(
+        &mut self,
+        now: MonoTime,
+        limits: AgentLimits,
+        tools: Vec<ToolSpec>,
+    ) -> Result<Vec<Effect>, KernelError> {
+        limits.validate()?;
+        let tools = tool_registry(tools)?;
+        let background = trim_background(&self.background, limits.context_bytes)?;
+
+        let mut effects = Vec::new();
+        self.expire(now, &mut effects);
+        self.limits = limits;
+        self.tools = tools;
+        self.background = background;
+
+        self.revoke_model_calls(&mut effects);
+
+        let pending = self
+            .jobs
+            .iter()
+            .filter_map(|(id, job)| {
+                matches!(job.state, JobState::Waiting(WaitState::Commit(_))).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for job in pending {
+            self.make_ready(job);
+        }
+        self.advance(now, &mut effects);
+        Ok(effects)
+    }
+
+    pub(crate) fn suspend(&mut self, now: MonoTime) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.expire(now, &mut effects);
+        self.suspended = true;
+        self.revoke_model_calls(&mut effects);
+        effects
+    }
+
+    pub(crate) fn resume_scheduling(&mut self, now: MonoTime) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        self.expire(now, &mut effects);
+        self.suspended = false;
+        self.advance(now, &mut effects);
+        effects
+    }
+
+    fn revoke_model_calls(&mut self, effects: &mut Vec<Effect>) {
+        let model_calls = self
+            .calls
+            .iter()
+            .filter_map(|(id, call)| {
+                (call.running() && call.kind() != CallKind::Tool).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for call in model_calls {
+            match &self.calls[&call].task {
+                CallTask::Coordinate { routing } => {
+                    if self
+                        .routings
+                        .get(routing)
+                        .is_some_and(|entry| entry.active_call == Some(call))
+                    {
+                        self.routings
+                            .get_mut(routing)
+                            .expect("routing exists")
+                            .active_call = None;
+                        self.enqueue_routing(*routing);
+                    }
+                }
+                CallTask::Work { job, .. } | CallTask::Compact { job, .. } => {
+                    if self
+                        .jobs
+                        .get(job)
+                        .is_some_and(|entry| entry.active_call == Some(call))
+                    {
+                        self.jobs.get_mut(job).expect("job exists").active_call = None;
+                        self.enqueue_job(*job);
+                    }
+                }
+                CallTask::Tool { .. } => unreachable!(),
+            }
+            self.cancel_call(call, effects);
+        }
     }
 
     pub(crate) fn control(
@@ -697,6 +778,41 @@ impl Kernel {
         } else {
             Err(format!("{name} exceeds item_bytes"))
         }
+    }
+}
+
+fn tool_registry(tools: Vec<ToolSpec>) -> Result<BTreeMap<String, ToolSpec>, KernelError> {
+    let mut registry = BTreeMap::new();
+    for tool in tools {
+        if tool.name.trim().is_empty() {
+            return Err(KernelError::InvalidToolName);
+        }
+        let name = tool.name.clone();
+        if registry.insert(name.clone(), tool).is_some() {
+            return Err(KernelError::DuplicateTool(name));
+        }
+    }
+    Ok(registry)
+}
+
+fn trim_background(
+    background: &Arc<BootstrapContext>,
+    context_bytes: usize,
+) -> Result<Arc<BootstrapContext>, KernelError> {
+    if serde_json::to_vec(background).is_ok_and(|value| value.len() <= context_bytes) {
+        return Ok(Arc::clone(background));
+    }
+    let mut background = background.as_ref().clone();
+    background.omitted = true;
+    while !background.entries.is_empty()
+        && serde_json::to_vec(&background).map_or(true, |value| value.len() > context_bytes)
+    {
+        background.entries.remove(0);
+    }
+    if serde_json::to_vec(&background).is_ok_and(|value| value.len() <= context_bytes) {
+        Ok(Arc::new(background))
+    } else {
+        Err(KernelError::BackgroundTooLarge)
     }
 }
 
