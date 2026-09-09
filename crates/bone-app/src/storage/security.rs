@@ -122,9 +122,22 @@ pub(crate) fn try_acquire_private_lock(path: &Path) -> Result<File, StoreError> 
     };
     match file.try_lock_exclusive() {
         Ok(()) => Ok(file),
-        Err(error) if error.kind() == ErrorKind::WouldBlock => Err(StoreError::Busy),
+        Err(error) if lock_is_contended(&error) => Err(StoreError::Busy),
         Err(error) => Err(StoreError::io("acquire lease", path, error)),
     }
+}
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    // Windows reports lock contention as ERROR_LOCK_VIOLATION, whose ErrorKind
+    // is Uncategorized. fs2 exposes the platform's exact contention code.
+    error.kind() == ErrorKind::WouldBlock
+        || matches!(
+            (
+                error.raw_os_error(),
+                fs2::lock_contended_error().raw_os_error()
+            ),
+            (Some(actual), Some(expected)) if actual == expected
+        )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -952,7 +952,7 @@ async fn commit_plan(
     if control.is_cancelled() {
         return Err(transaction_cancelled_error());
     }
-    let staged = stage_plan(environment, &plan).await?;
+    let staged = stage_plan(environment, plan).await?;
     if control.is_cancelled() {
         return Err(transaction_cancelled_error());
     }
@@ -960,23 +960,33 @@ async fn commit_plan(
     // Staging can take time and can create missing parent directories. Resolve and
     // validate once more immediately before commit so those changes cannot turn a
     // stale plan into a partially applied patch.
-    validate_plan(environment, &plan).await?;
+    validate_staged(environment, &staged).await?;
     if control.is_cancelled() {
         return Err(transaction_cancelled_error());
     }
-    commit_staged(environment, plan, staged, &control).await
+    commit_staged(environment, staged, &control).await
 }
 
-enum StagedFiles {
+enum StagedAction {
     Add {
+        target: ResolvedPath,
         replacement: NamedTempFile,
+        added_lines: usize,
     },
     Delete {
+        target: ResolvedPath,
+        expected: String,
         backup: NamedTempFile,
+        removed_lines: usize,
     },
     Update {
+        source: ResolvedPath,
+        destination: Option<ResolvedPath>,
+        expected: String,
         replacement: NamedTempFile,
         backup: NamedTempFile,
+        added_lines: usize,
+        removed_lines: usize,
     },
 }
 
@@ -1039,36 +1049,43 @@ async fn require_same_resolution(
 
 async fn stage_plan(
     environment: &ToolEnvironment,
-    plan: &[PlannedAction],
-) -> Result<Vec<StagedFiles>, ToolError> {
+    plan: Vec<PlannedAction>,
+) -> Result<Vec<StagedAction>, ToolError> {
     let mut staged = Vec::with_capacity(plan.len());
     for action in plan {
         let files = match action {
             PlannedAction::Add {
-                target, content, ..
+                target,
+                content,
+                added_lines,
             } => {
-                create_parent_directories(environment, target).await?;
-                StagedFiles::Add {
+                create_parent_directories(environment, &target).await?;
+                StagedAction::Add {
                     replacement: stage_content(
-                        target,
+                        &target,
                         content.as_bytes(),
                         None,
                         StagePurpose::Replacement,
                     )?,
+                    target,
+                    added_lines,
                 }
             }
             PlannedAction::Delete {
                 target,
                 expected,
                 permissions,
-                ..
-            } => StagedFiles::Delete {
+                removed_lines,
+            } => StagedAction::Delete {
                 backup: stage_content(
-                    target,
+                    &target,
                     expected.as_bytes(),
-                    Some(permissions),
+                    Some(&permissions),
                     StagePurpose::Recovery,
                 )?,
+                target,
+                expected,
+                removed_lines,
             },
             PlannedAction::Update {
                 source,
@@ -1076,29 +1093,35 @@ async fn stage_plan(
                 expected,
                 content,
                 permissions,
-                ..
+                added_lines,
+                removed_lines,
             } => {
-                let replacement_target = if let Some(destination) = destination {
+                let replacement_target = if let Some(destination) = &destination {
                     create_parent_directories(environment, destination).await?;
                     destination
                 } else {
-                    source
+                    &source
                 };
                 let replacement = stage_content(
                     replacement_target,
                     content.as_bytes(),
-                    Some(permissions),
+                    Some(&permissions),
                     StagePurpose::Replacement,
                 )?;
                 let backup = stage_content(
-                    source,
+                    &source,
                     expected.as_bytes(),
-                    Some(permissions),
+                    Some(&permissions),
                     StagePurpose::Recovery,
                 )?;
-                StagedFiles::Update {
+                StagedAction::Update {
+                    source,
+                    destination,
+                    expected,
                     replacement,
                     backup,
+                    added_lines,
+                    removed_lines,
                 }
             }
         };
@@ -1136,6 +1159,42 @@ fn stage_content(
             })?;
     }
     Ok(staged)
+}
+
+async fn validate_staged(
+    environment: &ToolEnvironment,
+    staged: &[StagedAction],
+) -> Result<(), ToolError> {
+    for action in staged {
+        match action {
+            StagedAction::Add { target, .. } => {
+                require_same_resolution(environment, target).await?;
+                require_missing(target, "add file").await?;
+            }
+            StagedAction::Delete {
+                target, expected, ..
+            } => {
+                require_same_resolution(environment, target).await?;
+                require_unchanged(target, expected, environment.limits.max_patch_file_bytes)
+                    .await?;
+            }
+            StagedAction::Update {
+                source,
+                destination,
+                expected,
+                ..
+            } => {
+                require_same_resolution(environment, source).await?;
+                require_unchanged(source, expected, environment.limits.max_patch_file_bytes)
+                    .await?;
+                if let Some(destination) = destination {
+                    require_same_resolution(environment, destination).await?;
+                    require_missing(destination, "move file").await?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1180,27 +1239,23 @@ fn create_stage_file(
 
 async fn commit_staged(
     environment: &ToolEnvironment,
-    plan: Vec<PlannedAction>,
-    staged: Vec<StagedFiles>,
+    staged: Vec<StagedAction>,
     control: &CommitControl,
 ) -> Result<ApplyPatchOutput, ToolError> {
-    let mut changes = Vec::with_capacity(plan.len());
-    let mut journal = Vec::with_capacity(plan.len());
+    let mut changes = Vec::with_capacity(staged.len());
+    let mut journal = Vec::with_capacity(staged.len());
 
     if control.is_cancelled() {
         return Err(transaction_cancelled_error());
     }
 
-    for (action, staged) in plan.into_iter().zip(staged) {
-        match (action, staged) {
-            (
-                PlannedAction::Add {
-                    target,
-                    added_lines,
-                    ..
-                },
-                StagedFiles::Add { replacement },
-            ) => {
+    for action in staged {
+        match action {
+            StagedAction::Add {
+                target,
+                replacement,
+                added_lines,
+            } => {
                 let change = ApplyPatchChange {
                     kind: "add".to_owned(),
                     path: target.display.clone(),
@@ -1214,14 +1269,12 @@ async fn commit_staged(
                 journal.push(RollbackEntry::Added { target });
                 changes.push(change);
             }
-            (
-                PlannedAction::Delete {
-                    target,
-                    removed_lines,
-                    ..
-                },
-                StagedFiles::Delete { backup },
-            ) => {
+            StagedAction::Delete {
+                target,
+                backup,
+                removed_lines,
+                ..
+            } => {
                 let change = ApplyPatchChange {
                     kind: "delete".to_owned(),
                     path: target.display.clone(),
@@ -1236,19 +1289,15 @@ async fn commit_staged(
                 journal.push(RollbackEntry::Deleted { target, backup });
                 changes.push(change);
             }
-            (
-                PlannedAction::Update {
-                    source,
-                    destination: None,
-                    added_lines,
-                    removed_lines,
-                    ..
-                },
-                StagedFiles::Update {
-                    replacement,
-                    backup,
-                },
-            ) => {
+            StagedAction::Update {
+                source,
+                destination: None,
+                replacement,
+                backup,
+                added_lines,
+                removed_lines,
+                ..
+            } => {
                 let change = ApplyPatchChange {
                     kind: "update".to_owned(),
                     path: source.display.clone(),
@@ -1265,19 +1314,15 @@ async fn commit_staged(
                 });
                 changes.push(change);
             }
-            (
-                PlannedAction::Update {
-                    source,
-                    destination: Some(destination),
-                    added_lines,
-                    removed_lines,
-                    ..
-                },
-                StagedFiles::Update {
-                    replacement,
-                    backup,
-                },
-            ) => {
+            StagedAction::Update {
+                source,
+                destination: Some(destination),
+                replacement,
+                backup,
+                added_lines,
+                removed_lines,
+                ..
+            } => {
                 let change = ApplyPatchChange {
                     kind: "move".to_owned(),
                     path: source.display.clone(),
@@ -1308,10 +1353,6 @@ async fn commit_staged(
                     *source_removed = true;
                 }
                 changes.push(change);
-            }
-            _ => {
-                let error = patch_error("internal staged patch plan mismatch");
-                return Err(error_after_rollback(environment, error, journal).await);
             }
         }
 
@@ -1757,6 +1798,40 @@ mod tests {
         assert!(!temp.path().join("created.txt").exists());
     }
 
+    #[tokio::test]
+    async fn changes_after_staging_are_rejected_before_any_target_is_committed() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        tokio::fs::write(&source, "original\n").await.unwrap();
+
+        let environment = ToolEnvironment::new(temp.path()).unwrap();
+        let operations = parse_patch(
+            "*** Begin Patch\n*** Add File: added.txt\n+added\n*** Update File: source.txt\n@@\n-original\n+replacement\n*** End Patch",
+        )
+        .unwrap();
+        let plan = build_plan(&environment, operations).await.unwrap();
+        validate_plan(&environment, &plan).await.unwrap();
+        let staged = stage_plan(&environment, plan).await.unwrap();
+
+        tokio::fs::write(&source, "changed externally\n")
+            .await
+            .unwrap();
+
+        let error = validate_staged(&environment, &staged)
+            .await
+            .expect_err("staged content must be checked against the current filesystem");
+        assert!(
+            matches!(&error, ToolError::Patch(message)
+                if message.contains("source.txt") && message.contains("changed while")),
+            "unexpected validation failure: {error}"
+        );
+        assert!(!temp.path().join("added.txt").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(&source).await.unwrap(),
+            "changed externally\n"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn staging_failure_does_not_commit_an_earlier_add() {
@@ -1821,8 +1896,8 @@ mod tests {
         .unwrap();
         let plan = build_plan(&environment, operations).await.unwrap();
         validate_plan(&environment, &plan).await.unwrap();
-        let staged = stage_plan(&environment, &plan).await.unwrap();
-        validate_plan(&environment, &plan).await.unwrap();
+        let staged = stage_plan(&environment, plan).await.unwrap();
+        validate_staged(&environment, &staged).await.unwrap();
 
         // Simulate a filesystem race after final validation: replacing a file
         // with a directory makes the final atomic rename fail only after every
@@ -1835,7 +1910,7 @@ mod tests {
             .unwrap();
 
         let control = commit_control();
-        let result = commit_staged(&environment, plan, staged, &control).await;
+        let result = commit_staged(&environment, staged, &control).await;
         assert!(result.is_err());
         assert!(!temp.path().join("added.txt").exists());
         assert_eq!(
@@ -1873,15 +1948,15 @@ mod tests {
         )
         .unwrap();
         let plan = build_plan(&environment, operations).await.unwrap();
-        let staged = stage_plan(&environment, &plan).await.unwrap();
+        let staged = stage_plan(&environment, plan).await.unwrap();
         let replacement_path = match &staged[0] {
-            StagedFiles::Update { replacement, .. } => replacement.path().to_owned(),
+            StagedAction::Update { replacement, .. } => replacement.path().to_owned(),
             _ => panic!("expected staged update"),
         };
         tokio::fs::remove_file(replacement_path).await.unwrap();
 
         let control = commit_control();
-        let result = commit_staged(&environment, plan, staged, &control).await;
+        let result = commit_staged(&environment, staged, &control).await;
         assert!(result.is_err());
         assert_eq!(
             tokio::fs::read_to_string(temp.path().join("source.txt"))

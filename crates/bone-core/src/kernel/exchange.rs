@@ -424,7 +424,7 @@ impl Kernel {
         false
     }
 
-    pub(super) fn is_investigation(&self, job: JobId) -> bool {
+    pub(crate) fn is_investigation(&self, job: JobId) -> bool {
         let mut current = job;
         loop {
             match self.jobs[&current].owner {
@@ -575,26 +575,5 @@ impl Kernel {
             .values()
             .filter(|job| !matches!(job.state, JobState::Finished(_)))
             .count()
-    }
-
-    pub(super) fn would_cycle(&self, source: JobId, target: JobId) -> bool {
-        let mut current = Some(target);
-        for _ in 0..self.limits.active_jobs {
-            let Some(job) = current else {
-                return false;
-            };
-            if job == source {
-                return true;
-            }
-            current = match &self.jobs[&job].state {
-                JobState::Waiting(WaitState::Job { job, .. })
-                | JobState::Waiting(WaitState::Result { job, .. }) => Some(*job),
-                JobState::Waiting(WaitState::Inquiry(inquiry)) => {
-                    self.inquiries.get(inquiry).map(|item| item.target)
-                }
-                _ => None,
-            };
-        }
-        true
     }
 }

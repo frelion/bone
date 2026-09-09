@@ -764,16 +764,12 @@ impl Kernel {
         }
     }
 
-    fn validate_model_item(&self, name: &str, item: &impl Serialize) -> Result<(), String> {
+    fn validate_model_item<T: Serialize + ?Sized>(
+        &self,
+        name: &str,
+        item: &T,
+    ) -> Result<(), String> {
         if serde_json::to_vec(item).is_ok_and(|encoded| encoded.len() <= self.limits.item_bytes) {
-            Ok(())
-        } else {
-            Err(format!("{name} exceeds item_bytes"))
-        }
-    }
-
-    fn validate_model_text(&self, name: &str, text: &str) -> Result<(), String> {
-        if serde_json::to_vec(text).is_ok_and(|encoded| encoded.len() <= self.limits.item_bytes) {
             Ok(())
         } else {
             Err(format!("{name} exceeds item_bytes"))

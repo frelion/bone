@@ -4,13 +4,10 @@ use std::error::Error as _;
 
 use bone_adapters::llm::{
     ErrorKind, FinishReason, InputItem, InputSource, OutputFormat, OutputItem, Protocol, Request,
-    StreamEvent, ToolChoice, ToolDefinition, ToolOutput,
-    testing::{model as test_model, openai_chat_completions_endpoint},
+    StreamEvent, ToolChoice, ToolDefinition, ToolOutput, testing::openai_chat_completions_endpoint,
 };
 use futures_util::StreamExt;
-use rig_core::{
-    client::CompletionClient, completion::CompletionError, providers::openai as rig_openai,
-};
+use rig_core::{completion::CompletionError, providers::openai as rig_openai};
 use serde_json::Value;
 use support::transport::ScriptedHttpClient;
 
@@ -213,47 +210,6 @@ async fn maps_tool_calls_and_replays_the_opaque_response_and_result() {
     );
     assert_eq!(tool_result["tool_call_id"], "call_chat_test_1");
     assert_eq!(tool_result["content"], "path is a directory");
-}
-
-#[tokio::test]
-async fn a_test_only_concrete_model_preserves_strict_tool_configuration() {
-    let transport = ScriptedHttpClient::unary_json(TEXT_RESPONSE);
-    let client = rig_openai::CompletionsClient::builder()
-        .api_key("test-only-key")
-        .http_client(transport.clone())
-        .build()
-        .expect("test client should build");
-    let inner = client
-        .completion_model("chat-test-model")
-        .with_strict_tools();
-    let model = test_model(
-        "chat-strict",
-        Protocol::OpenAiChatCompletions,
-        "chat-test-model",
-        inner,
-    )
-    .expect("strict model should build");
-
-    model
-        .complete(
-            Request::new([user("inspect the path")])
-                .max_output_tokens(64)
-                .tools([inspect_path()]),
-        )
-        .await
-        .expect("fixture should parse after request capture");
-
-    let requests = transport.unary_requests();
-    let body: Value = serde_json::from_slice(&requests[0].body)
-        .expect("strict request body should be valid JSON");
-    let function = &body["tools"][0]["function"];
-    assert_eq!(function["name"], "inspect_path");
-    assert_eq!(function["strict"], true);
-    assert_eq!(function["parameters"]["additionalProperties"], false);
-    assert_eq!(
-        function["parameters"]["required"],
-        serde_json::json!(["path"])
-    );
 }
 
 #[tokio::test]

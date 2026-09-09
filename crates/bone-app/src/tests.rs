@@ -1,9 +1,12 @@
 use std::{
+    future::{Future, poll_fn},
     path::Path,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
@@ -18,6 +21,7 @@ use tokio::sync::{Notify, Semaphore};
 
 use crate::{persistence::ResolveWriteResult, *};
 
+mod assembly;
 mod persistence_faults;
 
 struct CompletingModel {
@@ -460,41 +464,79 @@ async fn configured_app() -> (tempfile::TempDir, App, WorkspaceInfo) {
     )
     .await
     .unwrap();
-    let profile = Profile::new(
-        ProfileId::new("test").unwrap(),
-        "Test",
-        EndpointConfig::OpenAiResponses { base_url: None },
-    )
-    .unwrap();
-    app.save_profile(profile).await.unwrap();
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Worker(Some(
-            ModelSelection::new(ProfileId::new("test").unwrap(), "test-model").unwrap(),
-        )),
-    )
-    .await
-    .unwrap();
+    configure_test_model(&app).await;
     let workspace = app.open_workspace(workspace_root).await.unwrap();
     (temporary, app, workspace)
 }
 
-async fn wait_for_input(session: &Session, input: InputId) {
+async fn workspace_write_session() -> (tempfile::TempDir, App, WorkspaceInfo, Session) {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace_root = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
+    let (app, workspace) = app_with_model(
+        &temporary.path().join("data"),
+        &workspace_root,
+        Arc::new(PatchingModel {
+            work_calls: AtomicUsize::new(0),
+        }),
+    )
+    .await;
+    app.update_config(
+        ConfigScope::User,
+        ConfigChange::Limits(Some(AgentLimits {
+            tool_timeout: Duration::from_secs(601),
+            shutdown_grace: Duration::from_millis(10),
+            ..AgentLimits::default()
+        })),
+    )
+    .await
+    .unwrap();
+    app.update_config(
+        ConfigScope::User,
+        ConfigChange::Tools(Some(ToolSettings {
+            mode: ToolMode::WorkspaceWrite,
+            limits: ToolLimits::default(),
+        })),
+    )
+    .await
+    .unwrap();
+    let session = app
+        .create_session(workspace.id, "Write race")
+        .await
+        .unwrap();
+    (temporary, app, workspace, session)
+}
+
+async fn wait_for_input(session: &Session, input: InputId) -> InputState {
     let mut view = session.observe();
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut cursor = SessionSeq(0);
         loop {
             let page = session.history(cursor, 256).await.unwrap();
-            if page.items.iter().any(|entry| {
-                matches!(
-                    entry.event,
-                    SessionEvent::InputFinished { input: finished, .. }
-                        | SessionEvent::InputRejected { input: finished, .. }
-                        | SessionEvent::InputCancelled { input: finished }
-                        if finished == input
-                )
+            if let Some(state) = page.items.iter().find_map(|entry| match &entry.event {
+                SessionEvent::InputFinished {
+                    runtime,
+                    input: finished,
+                    outcome,
+                } if *finished == input => Some(InputState::Finished {
+                    runtime: *runtime,
+                    outcome: outcome.clone(),
+                }),
+                SessionEvent::InputRejected {
+                    input: rejected,
+                    message,
+                } if *rejected == input => Some(InputState::Rejected {
+                    message: message.clone(),
+                }),
+                SessionEvent::InputCancelled { input: cancelled } if *cancelled == input => {
+                    Some(InputState::Cancelled)
+                }
+                SessionEvent::Interrupted { runtime, inputs } if inputs.contains(&input) => {
+                    Some(InputState::Interrupted { runtime: *runtime })
+                }
+                _ => None,
             }) {
-                return;
+                return state;
             }
             cursor = page.next_cursor;
             if !page.has_more {
@@ -503,7 +545,45 @@ async fn wait_for_input(session: &Session, input: InputId) {
         }
     })
     .await
-    .unwrap();
+    .expect("input did not reach a durable terminal state")
+}
+
+fn assert_completed(state: InputState) {
+    assert!(
+        matches!(
+            state,
+            InputState::Finished {
+                outcome: InputOutcome::Completed,
+                ..
+            }
+        ),
+        "expected successful completion, got {state:?}"
+    );
+}
+
+async fn assert_pending(mut future: Pin<&mut impl Future>) {
+    poll_fn(|context| {
+        assert!(
+            future.as_mut().poll(context).is_pending(),
+            "operation crossed a closed gate"
+        );
+        Poll::Ready(())
+    })
+    .await;
+}
+
+async fn wait_for_runtime_detached(session: &Session) {
+    let mut view = session.observe();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(view.borrow().runtime, RuntimeState::Detached) {
+                return;
+            }
+            view.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("runtime did not reach the final write synchronization boundary");
 }
 
 async fn wait_for_input_state(
@@ -566,7 +646,7 @@ async fn headless_session_runs_and_persists_public_history() {
         .unwrap();
     let receipt = session.submit(SubmitInput::new("do it")).await.unwrap();
 
-    wait_for_input(&session, receipt.input).await;
+    assert_completed(wait_for_input(&session, receipt.input).await);
 
     let history = session.history(SessionSeq(0), 256).await.unwrap();
     assert!(history.items.iter().any(|entry| matches!(
@@ -719,7 +799,7 @@ async fn oversized_frontend_metadata_does_not_stop_a_runtime() {
     let (_temporary, app, workspace) = configured_app().await;
     let session = app.create_session(workspace.id, "Bounds").await.unwrap();
     let input = session.submit(SubmitInput::new("start")).await.unwrap();
-    wait_for_input(&session, input.input).await;
+    assert_completed(wait_for_input(&session, input.input).await);
     let before = session.snapshot().await.unwrap().runtime;
     assert!(matches!(before, RuntimeState::Running { .. }));
 
@@ -834,7 +914,7 @@ async fn config_changes_apply_to_the_running_runtime() {
     let (_temporary, app, workspace) = configured_app().await;
     let session = app.create_session(workspace.id, "Config").await.unwrap();
     let receipt = session.submit(SubmitInput::new("start")).await.unwrap();
-    wait_for_input(&session, receipt.input).await;
+    assert_completed(wait_for_input(&session, receipt.input).await);
     let RuntimeState::Running { id, .. } = session.snapshot().await.unwrap().runtime else {
         panic!("runtime did not start")
     };
@@ -900,8 +980,8 @@ async fn workspace_config_only_reconfigures_sessions_in_that_workspace() {
         .submit(SubmitInput::new("start second"))
         .await
         .unwrap();
-    wait_for_input(&first, first_input.input).await;
-    wait_for_input(&second, second_input.input).await;
+    assert_completed(wait_for_input(&first, first_input.input).await);
+    assert_completed(wait_for_input(&second, second_input.input).await);
 
     let limits = AgentLimits {
         background_workers: 5,
@@ -940,7 +1020,7 @@ async fn profile_changes_reconfigure_sessions_that_use_the_profile() {
     let (_temporary, app, workspace) = configured_app().await;
     let session = app.create_session(workspace.id, "Profile").await.unwrap();
     let input = session.submit(SubmitInput::new("start")).await.unwrap();
-    wait_for_input(&session, input.input).await;
+    assert_completed(wait_for_input(&session, input.input).await);
     let RuntimeState::Running { id, .. } = session.snapshot().await.unwrap().runtime else {
         panic!("runtime did not start")
     };
@@ -978,7 +1058,7 @@ async fn an_unusable_live_config_is_not_reported_as_applied() {
         .await
         .unwrap();
     let input = session.submit(SubmitInput::new("start")).await.unwrap();
-    wait_for_input(&session, input.input).await;
+    assert_completed(wait_for_input(&session, input.input).await);
     let running = app
         .resolved_config(session.id())
         .await
@@ -1035,7 +1115,7 @@ async fn an_unusable_live_config_is_not_reported_as_applied() {
     )
     .await
     .unwrap();
-    wait_for_input(&session, blocked.input).await;
+    assert_completed(wait_for_input(&session, blocked.input).await);
     assert_eq!(session.snapshot().await.unwrap().problem, None);
     app.shutdown().await.unwrap();
 }
@@ -1188,7 +1268,7 @@ async fn a_rejected_agent_limit_change_can_resume_the_same_job() {
     assert_eq!(session.snapshot().await.unwrap().jobs[0].id, job);
 
     barrier.release.add_permits(1);
-    wait_for_input(&session, input.input).await;
+    assert_completed(wait_for_input(&session, input.input).await);
     app.shutdown().await.unwrap();
 }
 
@@ -1207,7 +1287,7 @@ async fn closing_a_config_blocked_runtime_allows_a_clean_restart() {
     .await;
     let session = app.create_session(workspace.id, "Restart").await.unwrap();
     let first = session.submit(SubmitInput::new("start")).await.unwrap();
-    wait_for_input(&session, first.input).await;
+    assert_completed(wait_for_input(&session, first.input).await);
 
     std::fs::remove_dir(&workspace_root).unwrap();
     let result = app
@@ -1228,7 +1308,7 @@ async fn closing_a_config_blocked_runtime_allows_a_clean_restart() {
 
     session.close_runtime().await.unwrap();
     let second = session.submit(SubmitInput::new("restart")).await.unwrap();
-    wait_for_input(&session, second.input).await;
+    assert_completed(wait_for_input(&session, second.input).await);
     assert_eq!(session.snapshot().await.unwrap().problem, None);
     app.shutdown().await.unwrap();
 }
@@ -1302,7 +1382,7 @@ async fn archiving_a_session_does_not_close_its_running_runtime() {
     let (_temporary, app, workspace) = configured_app().await;
     let session = app.create_session(workspace.id, "Archive").await.unwrap();
     let receipt = session.submit(SubmitInput::new("start")).await.unwrap();
-    wait_for_input(&session, receipt.input).await;
+    assert_completed(wait_for_input(&session, receipt.input).await);
     let before = session.snapshot().await.unwrap();
     let RuntimeState::Running { id, .. } = before.runtime else {
         panic!("submitting an input should start the runtime")
@@ -1393,7 +1473,7 @@ async fn config_reload_reaches_idle_sessions_without_waiting_for_a_closing_sessi
         .await
         .unwrap();
     let idle_input = idle.submit(SubmitInput::new("idle")).await.unwrap();
-    wait_for_input(&idle, idle_input.input).await;
+    assert_completed(wait_for_input(&idle, idle_input.input).await);
 
     let closing_task = {
         let closing = closing.clone();
@@ -1431,24 +1511,14 @@ async fn config_reload_reaches_idle_sessions_without_waiting_for_a_closing_sessi
     .await
     .expect("an idle session should reload while another session is closing");
     assert!(!updating.is_finished());
-    let resolving = {
-        let app = app.clone();
-        let session = idle.id();
-        tokio::spawn(async move { app.resolved_config(session).await })
-    };
-    tokio::task::yield_now().await;
-    assert!(
-        !resolving.is_finished(),
-        "resolved_config must not cross an unfinished configuration barrier"
-    );
+    let mut resolving = Box::pin(app.resolved_config(idle.id()));
+    // Poll the query into the held configuration gate before testing that it waits.
+    assert_pending(resolving.as_mut()).await;
 
     updating.abort();
     assert!(updating.await.unwrap_err().is_cancelled());
-    tokio::task::yield_now().await;
-    assert!(
-        !resolving.is_finished(),
-        "cancelling the caller must not cancel an update that was already persisted"
-    );
+    // The persisted update owns the gate even after its caller has been cancelled.
+    assert_pending(resolving.as_mut()).await;
 
     barrier.release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(3), closing_task)
@@ -1459,7 +1529,6 @@ async fn config_reload_reaches_idle_sessions_without_waiting_for_a_closing_sessi
     let resolved = tokio::time::timeout(Duration::from_secs(3), resolving)
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
     assert_eq!(resolved.desired.unwrap().limits, limits);
     assert_eq!(resolved.running.unwrap().limits, limits);
@@ -1468,40 +1537,7 @@ async fn config_reload_reaches_idle_sessions_without_waiting_for_a_closing_sessi
 
 #[tokio::test]
 async fn app_shutdown_linearizes_with_a_write_waiting_to_record_its_intent() {
-    let temporary = tempfile::tempdir().unwrap();
-    let workspace_root = temporary.path().join("workspace");
-    std::fs::create_dir(&workspace_root).unwrap();
-    let (app, workspace) = app_with_model(
-        &temporary.path().join("data"),
-        &workspace_root,
-        Arc::new(PatchingModel {
-            work_calls: AtomicUsize::new(0),
-        }),
-    )
-    .await;
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Limits(Some(AgentLimits {
-            tool_timeout: Duration::from_secs(601),
-            shutdown_grace: Duration::from_millis(10),
-            ..AgentLimits::default()
-        })),
-    )
-    .await
-    .unwrap();
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Tools(Some(ToolSettings {
-            mode: ToolMode::WorkspaceWrite,
-            limits: ToolLimits::default(),
-        })),
-    )
-    .await
-    .unwrap();
-    let session = app
-        .create_session(workspace.id, "Write race")
-        .await
-        .unwrap();
+    let (_temporary, app, workspace, session) = workspace_write_session().await;
     let gate = app.test_write_gate(workspace.id).await;
     let guard = gate.lock.lock().await;
     session.submit(SubmitInput::new("write")).await.unwrap();
@@ -1522,60 +1558,22 @@ async fn app_shutdown_linearizes_with_a_write_waiting_to_record_its_intent() {
     .await
     .unwrap();
 
-    let closing = app.clone();
-    let mut shutdown = tokio::spawn(async move { closing.shutdown().await });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
-            .await
-            .is_err(),
-        "shutdown must synchronize with a write between cancellation and intent recording"
-    );
+    let mut shutdown = Box::pin(app.shutdown());
+    assert_pending(shutdown.as_mut()).await;
+    wait_for_runtime_detached(&session).await;
+    assert_pending(shutdown.as_mut()).await;
     drop(guard);
     let report = tokio::time::timeout(Duration::from_secs(3), shutdown)
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
     assert!(report.unresolved_writes.is_empty());
-    assert!(!workspace_root.join("result.txt").exists());
+    assert!(!workspace.root.join("result.txt").exists());
 }
 
 #[tokio::test]
 async fn close_runtime_linearizes_with_a_write_waiting_to_record_its_intent() {
-    let temporary = tempfile::tempdir().unwrap();
-    let workspace_root = temporary.path().join("workspace");
-    std::fs::create_dir(&workspace_root).unwrap();
-    let (app, workspace) = app_with_model(
-        &temporary.path().join("data"),
-        &workspace_root,
-        Arc::new(PatchingModel {
-            work_calls: AtomicUsize::new(0),
-        }),
-    )
-    .await;
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Limits(Some(AgentLimits {
-            tool_timeout: Duration::from_secs(601),
-            shutdown_grace: Duration::from_millis(10),
-            ..AgentLimits::default()
-        })),
-    )
-    .await
-    .unwrap();
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Tools(Some(ToolSettings {
-            mode: ToolMode::WorkspaceWrite,
-            limits: ToolLimits::default(),
-        })),
-    )
-    .await
-    .unwrap();
-    let session = app
-        .create_session(workspace.id, "Runtime close race")
-        .await
-        .unwrap();
+    let (_temporary, app, workspace, session) = workspace_write_session().await;
     let gate = app.test_write_gate(workspace.id).await;
     let guard = gate.lock.lock().await;
     session.submit(SubmitInput::new("write")).await.unwrap();
@@ -1596,22 +1594,17 @@ async fn close_runtime_linearizes_with_a_write_waiting_to_record_its_intent() {
     .await
     .unwrap();
 
-    let closing = session.clone();
-    let mut close = tokio::spawn(async move { closing.close_runtime().await });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut close)
-            .await
-            .is_err(),
-        "runtime close must synchronize with a write before intent recording"
-    );
+    let mut close = Box::pin(session.close_runtime());
+    assert_pending(close.as_mut()).await;
+    wait_for_runtime_detached(&session).await;
+    assert_pending(close.as_mut()).await;
     drop(guard);
     let report = tokio::time::timeout(Duration::from_secs(3), close)
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
     assert!(report.unresolved_writes.is_empty());
-    assert!(!workspace_root.join("result.txt").exists());
+    assert!(!workspace.root.join("result.txt").exists());
     app.shutdown().await.unwrap();
 }
 
@@ -1895,7 +1888,7 @@ async fn workspace_writes_are_recorded_by_the_app_tool_adapter() {
     let workspace = app.open_workspace(&workspace_root).await.unwrap();
     let session = app.create_session(workspace.id, "Write").await.unwrap();
     let receipt = session.submit(SubmitInput::new("write it")).await.unwrap();
-    wait_for_input(&session, receipt.input).await;
+    assert_completed(wait_for_input(&session, receipt.input).await);
     assert_eq!(
         std::fs::read_to_string(workspace_root.join("result.txt")).unwrap(),
         "written\n"

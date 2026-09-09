@@ -48,7 +48,7 @@ pub(crate) fn lease_file_name(key: &LeaseKey) -> String {
     encoded
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod cross_process_tests {
     use std::{
         env, fs,
@@ -98,10 +98,13 @@ mod cross_process_tests {
     }
 
     fn private_tempdir() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
-
         let temporary = tempfile::tempdir().unwrap();
-        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         temporary
     }
 

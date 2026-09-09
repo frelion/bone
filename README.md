@@ -1,128 +1,86 @@
 # BONE
 
-BONE is a Rust workspace for building coding agents. The current product layer
-is headless: `bone-app` assembles the trusted `bone-core`, concrete
-`bone-adapters`, and persistence behind a frontend-neutral Rust API.
-
-The previous terminal UI and `bone` CLI have been removed. A new TUI can be
-built as a separate frontend crate over the same `App` and `Session` API used
-by future desktop, web, or automation clients.
-
-## Architecture
+BONE 是一个用 Rust 编写的 coding agent 基座。当前 workspace 只有三个 crate，分别承载可信执行内核、基础设施适配器和 headless 应用层；终端界面尚未重建。
 
 ```text
-future frontends
-      │
-      ▼
-  bone-app ─────────► bone-core
-      │                  ▲
-      ├──► bone-adapters ┘
-      └──► private storage/ (SQLite, journals, leases)
+future TUI / desktop / web / automation
+                    │
+                    ▼
+                bone-app
+               ╱        ╲
+              ▼          ▼
+       bone-adapters ──► bone-core
 ```
 
-- `bone-app` owns configuration, profiles and credentials, durable workspaces
-  and sessions, Agent assembly, write-effect tracking, and runtime lifecycle.
-- `bone-core` owns input routing, Job state, scoped context, model/tool ports,
-  model behavior contracts, control, and structured records.
-- `bone-adapters` owns provider-independent LLM requests and wire adapters,
-  workspace-local read/search/patch/process tools, and the concrete adapters
-  that implement Core's ports.
+- [`bone-core`](crates/bone-core/) 是唯一的 Agent 状态机：解释输入、组织 Job、构造局部上下文、授权模型与工具调用，并裁决取消、完成和迟到结果。
+- [`bone-adapters`](crates/bone-adapters/) 实现 LLM 协议、模型端口和 workspace 内的读、搜索、补丁与命令工具。它依赖 Core 的端口，Core 不依赖任何 provider、文件系统或进程实现。
+- [`bone-app`](crates/bone-app/) 是 composition root：管理 Workspace、Session、配置、凭据、SQLite 持久化、外部写事实和 Runtime 生命周期，并向所有前端提供同一套 Rust API。
 
-The dependency direction is deliberate: `bone-adapters` depends on
-`bone-core`; Core never depends on concrete providers or native tools. Models
-and tools share an infrastructure crate, but retain the distinct `ModelPort`
-and `ToolPort` roles inside the Agent runtime.
+原来的 `bone-store` 已成为 `bone-app` 的私有模块。旧 TUI 和 `bone` 二进制已经删除；新的 TUI 将作为独立前端，只依赖 `bone-app`。
 
-The former `bone-store` crate now lives in `bone-app`'s private `storage/`
-module. Frontends see product objects and errors rather than documents,
-journal keys, transactions, or SQLite types.
+## 最小使用路径
 
-## Application API
-
-`App` is the composition root. It opens workspaces, creates and retrieves
-sessions, manages configuration and credentials, and shuts down live
-runtimes. `Session` is the execution handle a frontend retains.
+`App` 打开一份宿主指定的数据目录；Workspace 精确绑定到一个已经存在的目录；Session 是可持久恢复的用户工作单元。
 
 ```rust,no_run
 use bone_app::{App, AppOptions, SessionSeq, SubmitInput};
 
-# async fn example() -> bone_app::Result<()> {
+# async fn run() -> bone_app::Result<()> {
 let app = App::open(AppOptions::new("/absolute/path/to/app-data")).await?;
 let workspace = app.open_workspace("/absolute/path/to/workspace").await?;
-let session = app.create_session(workspace.id, "New session").await?;
+let session = app.create_session(workspace.id, "Investigate build").await?;
 
-let mut view = session.observe();
-let receipt = session.submit(SubmitInput::new("Inspect this workspace")).await?;
-let history = session.history(SessionSeq(0), 100).await?;
+let mut changes = session.observe();
+let receipt = session.submit(SubmitInput::new("Find the failing test")).await?;
+let page = session.history(SessionSeq(0), 100).await?;
 
-# let _ = (&mut view, receipt, history);
+# let _ = (&mut changes, receipt, page);
 app.shutdown().await?;
 # Ok(())
 # }
 ```
 
-Submitting succeeds once the input is durable. Execution may remain queued
-until a frontend saves a valid model selection; that configuration update
-reapplies automatically. After repairing an external prerequisite such as
-login, call `Session::reload_config` to reapply the already saved desired
-configuration. Asynchronous startup failures are published as typed
-`AppProblem` values, so a frontend can react to `LoginRequired(ProfileId)`
-without parsing display text.
+提交成功表示输入及其幂等键已经持久化，不表示 Agent 已经执行完成。未选模型、缺少凭据或 provider 暂时不可用时，输入保留在 Session 中等待恢复。当前状态通过 `Session::observe` / `snapshot` 获取，耐久历史通过 `Session::history` 按游标读取。
 
-Current state arrives through `Session::observe`, a Tokio `watch` receiver.
-Durable events come from `Session::history(after, limit)`. Clients keep the
-returned cursor and can recover after disconnecting without relying on an
-in-memory event stream. Runtime-local Job and Call IDs are wrapped with a
-`RuntimeId`, so stale control requests cannot affect a replacement runtime.
-
-Configuration is typed and resolves in this order:
+Runtime 配置按以下顺序解析：
 
 ```text
 Session override > Workspace override > User setting
 ```
 
-`App::update_config(scope, change)` saves one explicit change and returns only
-after every affected open Session has applied it. A running runtime keeps its
-`RuntimeId`, job graph, and in-flight tool calls while model work restarts on
-the new configuration. If the new configuration cannot be assembled, the
-Session stays suspended until a valid update arrives; it never falls back to
-the old configuration for new work.
+`App::update_config` 保存一项类型化变更，并等待所有受影响的已打开 Session 处理它。配置有效时，运行中的 Agent 保留 Runtime ID、Job 图和在途工具，撤销旧模型提交资格并使用新端口继续；配置无法装配时，Session 暂停新执行并暴露可匹配的问题，直到配置或凭据修复。
 
-## Persistence
+## 持久化边界
 
-The host chooses an absolute data directory through `AppOptions`. `bone-app`
-stores its SQLite database at `<data_dir>/bone.sqlite3`; it does not impose an
-XDG or project-local path.
+`AppOptions::data_dir` 必须由宿主明确提供。App 在其中保存 `bone.sqlite3`，记录 Workspace、Session、输入幂等、配置、Agent 事实、公开历史和写入意图；API key 保存在操作系统凭据管理器，ChatGPT OAuth cache 由受租约保护的 provider 能力管理。
 
-SQLite stores workspace and session records, input idempotency, runtime
-configuration snapshots, durable Agent records, history, and write attempts.
-API keys remain in the operating-system credential manager. A write remains
-blocking until its result is durably acknowledged by the matching Agent fact;
-after a crash, the host resolves any unacknowledged write explicitly.
-`App::unresolved_writes` is the authoritative cross-Session query.
+一次外部写在调用前记录意图，在结果被匹配的 Agent 事实确认前保持阻塞。进程退出后，App 恢复产品状态并把丢失 Runtime 的未完成输入标为 `Interrupted`，不会猜测或自动重放结果未知的外部写。`App::unresolved_writes` 是 Workspace 级的权威查询入口。
 
-Process restart restores product state and marks work lost with its runtime as
-interrupted. It does not restore in-memory Job futures or replay uncertain
-external writes.
+## 文档
 
-## Validation
+长期维护的设计文档只有以下六个入口：
+
+- [Core](docs/core.md)：Job、Context、调度、权限、并发和模型行为契约。
+- [App](docs/app.md)：Workspace / Session API、配置、持久化、恢复和外部写。
+- [Adapters](docs/adapters.md)：LLM 协议、模型适配器、内置工具和安全边界。
+- [Testing](docs/testing.md)：测试分层、替身规范、执行矩阵和 live certification。
+- [TUI](docs/tui.md)：下一阶段前端的产品边界、状态流和验收范围。
+- 本文件：项目定位、依赖方向和开发入口。
+
+公开 Rust 类型、字段和方法以 crate rustdoc 为准；上述文档只维护跨模块不变量和设计取舍。固定的 Rig 上游补丁边界记录在 [`patches/`](patches/) 中。
+
+## 验证
+
+普通变更应至少通过：
 
 ```sh
 cargo fmt --all -- --check
-cargo test -p bone-app --lib --locked
-cargo test --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+cargo test --workspace --doc --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 ```
 
-There is currently no `cargo run -p bone-app` command because `bone-app` has
-no binary target.
+`--all-features` 会启用只用于离线协议契约的 `test-utils`。真实 provider 测试是显式、可能收费的独立入口，详见 [Testing](docs/testing.md)。
 
-Start with the [App architecture](docs/bone-app-design.md),
-[Agent API](docs/agent.md), [model API](docs/model-api.md), and
-[built-in tools](docs/tools.md). Documents under `docs/product/` and the old
-TUI architecture describe the removed frontend and are retained as historical
-design input for its future standalone replacement.
-
-The active implementation is in [`crates/`](crates/). [`legacy/`](legacy/)
-contains historical material and is not part of the workspace build.
-[`third_party/`](third_party/) contains the pinned Rig patch.
+[`legacy/`](legacy/) 只保存历史材料，不属于 workspace build；[`third_party/`](third_party/) 保存固定版本的上游源码与本地补丁。

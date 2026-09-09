@@ -7,50 +7,11 @@ use rig_core::{
 use serde_json::Value;
 
 use crate::llm::{
-    Error, InputItem, Protocol, ToolChoice, ToolDefinition,
+    Error, InputItem, ModelOptions, Protocol, ToolChoice, ToolDefinition,
     item::{InputItemKind, InputSource},
     model::{RequestOrigin, RequestSupport},
     tool::ToolCallIdentities,
 };
-
-/// Provider-specific, typed request controls.
-#[derive(Clone, Debug)]
-pub struct Options {
-    inner: OptionsKind,
-}
-
-#[derive(Clone, Debug)]
-enum OptionsKind {
-    OpenAiResponses(crate::llm::protocol::openai_responses::Options),
-}
-
-impl From<crate::llm::protocol::openai_responses::Options> for Options {
-    fn from(value: crate::llm::protocol::openai_responses::Options) -> Self {
-        Self {
-            inner: OptionsKind::OpenAiResponses(value),
-        }
-    }
-}
-
-impl Options {
-    fn protocol(&self) -> Protocol {
-        match &self.inner {
-            OptionsKind::OpenAiResponses(_) => Protocol::OpenAiResponses,
-        }
-    }
-
-    fn into_json(self) -> Option<Value> {
-        match self.inner {
-            OptionsKind::OpenAiResponses(options) => options.into_json(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        match &self.inner {
-            OptionsKind::OpenAiResponses(options) => options.is_empty(),
-        }
-    }
-}
 
 /// Desired response representation.
 #[non_exhaustive]
@@ -73,7 +34,7 @@ pub struct Request {
     tool_choice: Option<ToolChoice>,
     output: OutputFormat,
     max_output_tokens: Option<u64>,
-    options: Option<Options>,
+    options: Option<ModelOptions>,
 }
 
 impl fmt::Debug for Request {
@@ -129,8 +90,8 @@ impl Request {
         self
     }
 
-    pub fn options(mut self, options: impl Into<Options>) -> Self {
-        self.options = Some(options.into());
+    pub fn options(mut self, options: ModelOptions) -> Self {
+        self.options = Some(options);
         self
     }
 
@@ -185,7 +146,7 @@ impl Request {
                 })?,
             ),
         };
-        let additional_params = self.options.and_then(Options::into_json);
+        let additional_params = self.options.map(ModelOptions::into_additional_params);
         let request = CompletionRequest {
             model: None,
             preamble: None,
@@ -254,19 +215,10 @@ impl Request {
                 "OpenAI Chat Completions cannot enforce structured output on an initial tool turn",
             ));
         }
-        if let Some(options) = &self.options
-            && options.protocol() != origin.protocol
-        {
-            return Err(Error::invalid(format!(
-                "{} options cannot be used with {}",
-                options.protocol(),
-                origin.protocol
-            )));
-        }
-        if self.options.as_ref().is_some_and(Options::is_empty) {
-            return Err(Error::invalid(
-                "protocol options are empty; omit options when no control is needed",
-            ));
+        if let Some(options) = &self.options {
+            options
+                .validate_for_protocol(origin.protocol)
+                .map_err(|error| Error::invalid(error.to_string()))?;
         }
 
         let mut tool_names = HashSet::new();

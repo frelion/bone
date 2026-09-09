@@ -4,13 +4,10 @@ use std::error::Error as _;
 
 use bone_adapters::llm::{
     ErrorKind, FinishReason, InputItem, InputSource, OutputItem, Protocol, Request, StreamEvent,
-    ToolChoice, ToolDefinition, ToolOutput,
-    testing::{anthropic_messages_endpoint, model as test_model},
+    ToolChoice, ToolDefinition, ToolOutput, testing::anthropic_messages_endpoint,
 };
 use futures_util::StreamExt;
-use rig_core::{
-    client::CompletionClient, completion::CompletionError, providers::anthropic as rig_anthropic,
-};
+use rig_core::{completion::CompletionError, providers::anthropic as rig_anthropic};
 use serde_json::Value;
 use support::transport::ScriptedHttpClient;
 
@@ -180,45 +177,6 @@ async fn maps_tools_and_replays_the_opaque_response_and_result() {
     assert_eq!(
         second_body["messages"][2]["content"][0]["tool_use_id"],
         "toolu_test_1"
-    );
-}
-
-#[tokio::test]
-async fn a_test_only_concrete_model_preserves_cache_and_strict_tool_options() {
-    let transport = ScriptedHttpClient::unary_json(TEXT_RESPONSE);
-    let client = rig_anthropic::Client::builder()
-        .api_key("test-only-key")
-        .http_client(transport.clone())
-        .build()
-        .expect("test client should build");
-    let inner = client
-        .completion_model("claude-test")
-        .with_automatic_caching()
-        .with_strict_tools();
-    let model = test_model(
-        "anthropic-cached",
-        Protocol::AnthropicMessages,
-        "claude-test",
-        inner,
-    )
-    .expect("model should build");
-
-    model
-        .complete(
-            Request::new([user("hello")])
-                .max_output_tokens(64)
-                .tools([inspect_path()]),
-        )
-        .await
-        .expect("fixture should parse");
-
-    let requests = transport.unary_requests();
-    let body: Value = serde_json::from_slice(&requests[0].body).expect("body should be JSON");
-    assert_eq!(body["cache_control"]["type"], "ephemeral");
-    assert_eq!(body["tools"][0]["strict"], true);
-    assert_eq!(
-        body["tools"][0]["input_schema"]["additionalProperties"],
-        false
     );
 }
 

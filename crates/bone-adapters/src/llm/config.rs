@@ -9,7 +9,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::llm::{
-    ConfigError, Options, Protocol,
+    ConfigError, Protocol,
     protocol::{openai_responses, validate_base_url},
 };
 
@@ -93,7 +93,7 @@ impl EndpointConfig {
 /// protocol.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ModelRequestOptions {
+pub enum ModelOptions {
     /// Controls supported by the OpenAI Responses wire protocol.
     #[serde(rename = "openai_responses")]
     OpenAiResponses {
@@ -102,7 +102,7 @@ pub enum ModelRequestOptions {
     },
 }
 
-impl ModelRequestOptions {
+impl ModelOptions {
     /// The only wire protocol that can receive these controls.
     pub const fn protocol(&self) -> Protocol {
         match self {
@@ -111,10 +111,10 @@ impl ModelRequestOptions {
     }
 
     /// Validate controls that are meaningful without knowing an endpoint.
-    pub fn validate(&self) -> Result<(), ModelRequestOptionsError> {
+    pub fn validate(&self) -> Result<(), ModelOptionsError> {
         match self {
             Self::OpenAiResponses { reasoning } if reasoning.is_empty() => {
-                Err(ModelRequestOptionsError::EmptyOpenAiResponses)
+                Err(ModelOptionsError::EmptyOpenAiResponses)
             }
             Self::OpenAiResponses { .. } => Ok(()),
         }
@@ -126,46 +126,36 @@ impl ModelRequestOptions {
     /// validation independently checks the selected model's actual protocol,
     /// so an option can never be silently ignored if configuration changes
     /// after it was validated.
-    pub fn validate_for(&self, endpoint: &EndpointConfig) -> Result<(), ModelRequestOptionsError> {
+    pub fn validate_for(&self, endpoint: &EndpointConfig) -> Result<(), ModelOptionsError> {
+        self.validate_for_protocol(endpoint.protocol())
+    }
+
+    pub(crate) fn validate_for_protocol(
+        &self,
+        endpoint_protocol: Protocol,
+    ) -> Result<(), ModelOptionsError> {
         self.validate()?;
         let options_protocol = self.protocol();
-        let endpoint_protocol = endpoint.protocol();
         if options_protocol == endpoint_protocol {
             Ok(())
         } else {
-            Err(ModelRequestOptionsError::UnsupportedProtocol {
+            Err(ModelOptionsError::UnsupportedProtocol {
                 options_protocol,
                 endpoint_protocol,
             })
         }
     }
 
-    /// Convert this persistable value into request-local protocol controls.
-    ///
-    /// Prefer [`Self::apply_to`] when building a request. Applications that
-    /// persist this value should first use [`Self::validate_for`] with the
-    /// selected endpoint configuration.
-    pub fn into_request_options(self) -> Result<Options, ModelRequestOptionsError> {
-        self.validate()?;
-        Ok(match self {
-            Self::OpenAiResponses { reasoning } => {
-                openai_responses::Options::new().reasoning(reasoning).into()
-            }
-        })
-    }
-
-    /// Apply these validated controls to a request.
-    pub fn apply_to(
-        self,
-        request: crate::llm::Request,
-    ) -> Result<crate::llm::Request, ModelRequestOptionsError> {
-        Ok(request.options(self.into_request_options()?))
+    pub(crate) fn into_additional_params(self) -> serde_json::Value {
+        match self {
+            Self::OpenAiResponses { reasoning } => serde_json::json!({ "reasoning": reasoning }),
+        }
     }
 }
 
 /// A local validation failure in persistable model request controls.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ModelRequestOptionsError {
+pub enum ModelOptionsError {
     /// OpenAI Responses options did not specify any actual control.
     EmptyOpenAiResponses,
     /// These controls belong to a different wire protocol than the endpoint.
@@ -175,7 +165,7 @@ pub enum ModelRequestOptionsError {
     },
 }
 
-impl fmt::Display for ModelRequestOptionsError {
+impl fmt::Display for ModelOptionsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyOpenAiResponses => {
@@ -192,13 +182,7 @@ impl fmt::Display for ModelRequestOptionsError {
     }
 }
 
-impl std::error::Error for ModelRequestOptionsError {}
-
-/// Short name for [`ModelRequestOptions`].
-///
-/// Kept as an alias because these values are model-level controls, not
-/// endpoint connection settings.
-pub type ModelOptions = ModelRequestOptions;
+impl std::error::Error for ModelOptionsError {}
 
 #[cfg(test)]
 mod tests {
@@ -253,7 +237,7 @@ mod tests {
 
     #[test]
     fn model_options_are_protocol_scoped_and_serialize_typed_effort() {
-        let options = ModelRequestOptions::OpenAiResponses {
+        let options = ModelOptions::OpenAiResponses {
             reasoning: Reasoning::new()
                 .effort(ReasoningEffort::High)
                 .summary(ReasoningSummary::Concise),
@@ -271,7 +255,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::from_value::<ModelRequestOptions>(serde_json::to_value(&options).unwrap())
+            serde_json::from_value::<ModelOptions>(serde_json::to_value(&options).unwrap())
                 .unwrap(),
             options
         );
@@ -279,7 +263,7 @@ mod tests {
 
     #[test]
     fn model_options_must_match_the_endpoint_protocol_and_contain_a_control() {
-        let options = ModelRequestOptions::OpenAiResponses {
+        let options = ModelOptions::OpenAiResponses {
             reasoning: Reasoning::new().effort(ReasoningEffort::Low),
         };
         assert_eq!(
@@ -288,18 +272,18 @@ mod tests {
         );
         assert_eq!(
             options.validate_for(&EndpointConfig::AnthropicMessages { base_url: None }),
-            Err(ModelRequestOptionsError::UnsupportedProtocol {
+            Err(ModelOptionsError::UnsupportedProtocol {
                 options_protocol: Protocol::OpenAiResponses,
                 endpoint_protocol: Protocol::AnthropicMessages,
             })
         );
 
-        let empty = ModelRequestOptions::OpenAiResponses {
+        let empty = ModelOptions::OpenAiResponses {
             reasoning: Reasoning::new(),
         };
         assert_eq!(
             empty.validate(),
-            Err(ModelRequestOptionsError::EmptyOpenAiResponses)
+            Err(ModelOptionsError::EmptyOpenAiResponses)
         );
     }
 }

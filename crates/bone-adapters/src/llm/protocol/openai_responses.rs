@@ -1,4 +1,4 @@
-//! OpenAI Responses endpoint construction and typed request options.
+//! OpenAI Responses endpoint construction and typed reasoning controls.
 
 use std::fmt::Debug;
 
@@ -7,38 +7,11 @@ use rig_core::{
     providers::openai as rig_openai,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 use crate::llm::{
     ConfigError, Endpoint, Protocol,
     protocol::{no_redirect_http_client, validate_base_url},
 };
-
-/// Typed controls supported only by the OpenAI Responses protocol.
-#[derive(Clone, Debug, Default)]
-pub struct Options {
-    reasoning: Option<Reasoning>,
-}
-
-impl Options {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn reasoning(mut self, reasoning: Reasoning) -> Self {
-        self.reasoning = Some(reasoning);
-        self
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.reasoning.as_ref().is_none_or(Reasoning::is_empty)
-    }
-
-    pub(crate) fn into_json(self) -> Option<Value> {
-        self.reasoning
-            .map(|reasoning| json!({ "reasoning": reasoning.into_json() }))
-    }
-}
 
 /// Reasoning controls for OpenAI Responses models.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,67 +58,35 @@ impl Reasoning {
             && self.mode.is_none()
             && self.context.is_none()
     }
-
-    fn into_json(self) -> Value {
-        let mut value = serde_json::Map::new();
-        if let Some(effort) = self.effort {
-            value.insert(
-                "effort".to_owned(),
-                Value::String(effort.as_str().to_owned()),
-            );
-        }
-        if let Some(summary) = self.summary {
-            value.insert(
-                "summary".to_owned(),
-                Value::String(summary.as_str().to_owned()),
-            );
-        }
-        if let Some(mode) = self.mode {
-            value.insert("mode".to_owned(), Value::String(mode.as_str().to_owned()));
-        }
-        if let Some(context) = self.context {
-            value.insert(
-                "context".to_owned(),
-                Value::String(context.as_str().to_owned()),
-            );
-        }
-        Value::Object(value)
-    }
 }
 
 macro_rules! string_enum {
-    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
+    ($name:ident { $($variant:ident),+ $(,)? }) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
         pub enum $name { $($variant),+ }
-
-        impl $name {
-            const fn as_str(self) -> &'static str {
-                match self { $(Self::$variant => $value),+ }
-            }
-        }
     };
 }
 
 string_enum!(ReasoningEffort {
-    None => "none",
-    Minimal => "minimal",
-    Low => "low",
-    Medium => "medium",
-    High => "high",
-    Xhigh => "xhigh",
-    Max => "max",
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
 });
 string_enum!(ReasoningSummary {
-    Auto => "auto",
-    Concise => "concise",
-    Detailed => "detailed",
+    Auto,
+    Concise,
+    Detailed,
 });
-string_enum!(ReasoningMode { Pro => "pro" });
+string_enum!(ReasoningMode { Pro });
 string_enum!(ReasoningContext {
-    Auto => "auto",
-    AllTurns => "all_turns",
-    CurrentTurn => "current_turn",
+    Auto,
+    AllTurns,
+    CurrentTurn,
 });
 
 /// Configure the official OpenAI Responses endpoint.
@@ -252,6 +193,7 @@ fn validate_api_key(api_key: &str) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use rig_core::test_utils::RecordingHttpClient;
+    use serde_json::json;
 
     use crate::llm::{InputItem, InputSource, Request};
 
@@ -378,24 +320,20 @@ mod tests {
 
     #[test]
     fn serializes_bone_typed_reasoning_controls() {
-        let params = Options::new()
-            .reasoning(
-                Reasoning::new()
-                    .effort(ReasoningEffort::Max)
-                    .mode(ReasoningMode::Pro)
-                    .context(ReasoningContext::AllTurns),
-            )
-            .into_json()
-            .unwrap();
+        let params = serde_json::to_value(
+            Reasoning::new()
+                .effort(ReasoningEffort::Max)
+                .mode(ReasoningMode::Pro)
+                .context(ReasoningContext::AllTurns),
+        )
+        .unwrap();
 
         assert_eq!(
             params,
             json!({
-                "reasoning": {
-                    "effort": "max",
-                    "mode": "pro",
-                    "context": "all_turns"
-                }
+                "effort": "max",
+                "mode": "pro",
+                "context": "all_turns"
             })
         );
     }

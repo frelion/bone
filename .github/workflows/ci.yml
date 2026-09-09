@@ -51,17 +51,18 @@ jobs:
           --locked --lib atomic_json_write_replaces_complete_private_record
 
   macos:
-    name: macOS compile
+    name: macOS checks
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p bone-core -p bone-adapters --all-targets --all-features --locked
+      - run: cargo check --workspace --all-targets --all-features --locked
+      - run: 'cargo test -p bone-app --lib storage:: --locked'
 
   windows:
-    name: Windows compile
+    name: Windows checks
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -69,3 +70,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features --locked
+      - run: 'cargo test -p bone-app --lib storage:: --locked'
