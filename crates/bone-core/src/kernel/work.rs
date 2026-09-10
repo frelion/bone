@@ -23,6 +23,11 @@ impl Kernel {
         }
 
         let (seen_through, _) = call_entry.work_context();
+        for input in self.inputs.values_mut() {
+            if input.pending_review_by == Some(job) && input.accepted_at <= seen_through {
+                input.pending_review_by = None;
+            }
+        }
         if let Some(entry) = self.jobs.get_mut(&job) {
             entry.context.read_through = entry.context.read_through.max(seen_through);
         }
@@ -160,12 +165,39 @@ impl Kernel {
                 self.validate_model_item("job inquiry", question)?;
                 Ok(())
             }
-            WorkStep::Coordinate(request) => {
-                if request.trim().is_empty() {
-                    Err("coordination request cannot be empty".into())
+            WorkStep::ControlOwned {
+                job: target,
+                action: _,
+            } => {
+                if self.is_investigation(job) || *target == job || !self.owns(job, *target) {
+                    Err("a worker may control only its active child tree".into())
+                } else if self
+                    .jobs
+                    .get(target)
+                    .is_none_or(|entry| matches!(entry.state, JobState::Finished(_)))
+                {
+                    Err("controlled job must be active".into())
                 } else {
-                    self.validate_model_item("coordination request", request)
+                    Ok(())
                 }
+            }
+            WorkStep::UpdateConstraints {
+                source,
+                expected_revision,
+                constraints,
+            } => {
+                let valid_source = self.jobs[&job].inputs.contains(source)
+                    && self
+                        .inputs
+                        .get(source)
+                        .is_some_and(|input| input.finished.is_none());
+                if !matches!(self.jobs[&job].owner, Owner::User)
+                    || !valid_source
+                    || *expected_revision != self.constraints_revision
+                {
+                    return Err("constraint update lacks current user authority".into());
+                }
+                self.validate_model_item("session constraints", constraints)
             }
             WorkStep::Read(query) => self.validate_read(DeliveryTarget::Job(job), query),
             WorkStep::PublishResult(report) => self.validate_report(job, report),
@@ -270,7 +302,9 @@ impl Kernel {
             WorkStep::Delegate(_)
             | WorkStep::AskUser(_)
             | WorkStep::Reply(_)
-            | WorkStep::Finish(_) => true,
+            | WorkStep::Finish(_)
+            | WorkStep::ControlOwned { .. }
+            | WorkStep::UpdateConstraints { .. } => true,
             WorkStep::Tool(tool) => self.tools[&tool.name].effect == ToolEffect::ExternalWrite,
             _ => false,
         };
@@ -322,7 +356,56 @@ impl Kernel {
                 job: target,
                 question,
             } => self.open_inquiry(DeliveryTarget::Job(job), target, question, now, effects),
-            WorkStep::Coordinate(request) => self.open_coordination(job, request, effects),
+            WorkStep::ControlOwned {
+                job: target,
+                action,
+            } => {
+                match action {
+                    OwnedAction::Pause => {
+                        let _ = self.pause(target, effects);
+                    }
+                    OwnedAction::Resume => {
+                        let _ = self.resume(target, effects);
+                    }
+                    OwnedAction::Cancel => {
+                        let _ = self.cancel(target, effects);
+                    }
+                }
+                self.make_ready(job);
+            }
+            WorkStep::UpdateConstraints {
+                source,
+                expected_revision: _,
+                constraints,
+            } => {
+                if self.constraints != constraints {
+                    self.constraints = constraints.clone();
+                    self.constraints_revision += 1;
+                    let changed = self.record(
+                        Origin::Call(pending.call),
+                        RecordBody::ConstraintsChanged {
+                            source,
+                            revision: self.constraints_revision,
+                            constraints,
+                        },
+                        effects,
+                    );
+                    self.attach(job, changed.seq);
+                    let jobs = self
+                        .jobs
+                        .iter()
+                        .filter_map(|(id, entry)| {
+                            (!matches!(entry.state, JobState::Finished(_))).then_some(*id)
+                        })
+                        .collect::<Vec<_>>();
+                    for active in jobs {
+                        self.invalidate_job_calls(active, effects);
+                        self.enqueue_job(active);
+                    }
+                } else {
+                    self.make_ready(job);
+                }
+            }
             WorkStep::Read(query) => match self.read(DeliveryTarget::Job(job), query, effects) {
                 Ok(()) => {
                     if matches!(self.jobs[&job].state, JobState::Ready) {
@@ -557,6 +640,25 @@ impl Kernel {
         {
             return;
         }
+        match kind {
+            OutcomeKind::Failed => {
+                self.fail_pending_reviews(job, completion.summary.clone(), effects)
+            }
+            OutcomeKind::Cancelled => self.clear_pending_reviews(job),
+            OutcomeKind::Completed => {
+                if self
+                    .inputs
+                    .values()
+                    .any(|input| input.pending_review_by == Some(job))
+                {
+                    self.fail_pending_reviews(
+                        job,
+                        "worker completed before reviewing its assigned input".into(),
+                        effects,
+                    );
+                }
+            }
+        }
         if self.user_question == Some(job) {
             self.user_question = None;
         }
@@ -740,78 +842,6 @@ impl Kernel {
         true
     }
 
-    pub(super) fn change_spec(&mut self, job: JobId, spec: JobSpec, effects: &mut Vec<Effect>) {
-        if self.user_question == Some(job) {
-            self.user_question = None;
-        }
-        let children = self.children_of(job).collect::<Vec<_>>();
-        for child in children {
-            if !matches!(self.jobs[&child].state, JobState::Finished(_)) {
-                self.finish_job(
-                    child,
-                    OutcomeKind::Cancelled,
-                    Completion::new("owner contract changed"),
-                    effects,
-                );
-            }
-        }
-        self.invalidate_job_calls(job, effects);
-        let revision = {
-            let entry = self.jobs.get_mut(&job).expect("job exists");
-            entry.spec = spec.clone();
-            entry.revision += 1;
-            entry.report = None;
-            entry.context.checkpoint = None;
-            entry.revision
-        };
-        let changed_record = self.record(
-            Origin::Kernel,
-            RecordBody::JobChanged {
-                job,
-                spec,
-                revision,
-            },
-            effects,
-        );
-        let waiters = self
-            .jobs
-            .iter()
-            .filter_map(|(id, entry)| match entry.state {
-                JobState::Waiting(WaitState::Job {
-                    job: target,
-                    revision: seen,
-                })
-                | JobState::Waiting(WaitState::Result {
-                    job: target,
-                    revision: seen,
-                    ..
-                }) if target == job && seen != revision => Some(*id),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        for waiter in waiters {
-            self.deliver(
-                DeliveryTarget::Job(waiter),
-                changed_record.seq,
-                DeliveryKind::DependencyChanged,
-                effects,
-            );
-            self.make_ready(waiter);
-        }
-        let changed = self
-            .inquiries
-            .iter()
-            .filter_map(|(id, inquiry)| {
-                (inquiry.target == job && inquiry.target_revision != self.jobs[&job].revision)
-                    .then_some(*id)
-            })
-            .collect::<Vec<_>>();
-        for inquiry in changed {
-            self.settle_inquiry(inquiry, InquiryResult::Changed, effects);
-        }
-        self.make_ready(job);
-    }
-
     pub(super) fn invalidate_job_call(&mut self, job: JobId, effects: &mut Vec<Effect>) {
         let call = self.jobs.get(&job).and_then(|entry| entry.active_call);
         if let Some(call) = call {
@@ -832,7 +862,12 @@ impl Kernel {
         let running = self
             .calls
             .iter()
-            .filter_map(|(id, call)| (call.job() == Some(job) && call.running()).then_some(*id))
+            .filter_map(|(id, call)| {
+                let requested = matches!(call.task, CallTask::SessionCompact {
+                    requester: DeliveryTarget::Job(requester), ..
+                } if requester == job);
+                ((call.job() == Some(job) || requested) && call.running()).then_some(*id)
+            })
             .collect::<Vec<_>>();
         for call in running {
             self.cancel_call(call, effects);

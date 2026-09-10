@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="BONE Context Engine 当前架构：从一条用户输入理解 Router、Worker、Kernel、Runtime、Session 与 Job 上下文。">
+  <title>BONE · Context Engine / Current Architecture</title>
+  <style>
+    :root {
+      --paper: #f4f1ea;
+      --paper-deep: #e9e4d9;
+      --ink: #182027;
+      --muted: #667078;
+      --line: #c9c4b9;
+      --navy: #132a3a;
+      --navy-2: #1e3c4f;
+      --orange: #e66d31;
+      --orange-soft: #f7d7c5;
+      --blue: #2f7295;
+      --blue-soft: #d6e7ef;
+      --green: #34765d;
+      --green-soft: #d8e9df;
+      --violet: #66558c;
+      --violet-soft: #e3ddef;
+      --red: #a6423c;
+      --red-soft: #f1d8d4;
+      --white: #fffefa;
+      --shadow: 0 14px 40px rgba(24, 32, 39, .09);
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 84px; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.7 var(--sans); }
+    button, a { font: inherit; }
+    button { color: inherit; }
+    a { color: inherit; text-decoration: none; }
+    a:hover { color: var(--orange); }
+    :focus-visible { outline: 3px solid var(--orange); outline-offset: 3px; }
+    ::selection { background: var(--orange-soft); }
+
+    .topbar {
+      position: sticky; top: 0; z-index: 20; height: 66px;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 28px; color: #eef5f7; background: rgba(19, 42, 58, .97);
+      border-bottom: 1px solid rgba(255,255,255,.12); backdrop-filter: blur(14px);
+    }
+    .brand { font: 700 14px/1 var(--mono); letter-spacing: .14em; }
+    .brand em { color: #ff925d; font-style: normal; }
+    .top-links { display: flex; align-items: center; gap: 20px; font-size: 13px; color: #b9c9d1; }
+    .state { display: inline-flex; align-items: center; gap: 7px; }
+    .state::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #79d6a3; box-shadow: 0 0 0 4px rgba(121,214,163,.12); }
+
+    .layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); max-width: 1540px; margin: auto; }
+    .rail {
+      position: sticky; top: 66px; height: calc(100vh - 66px); padding: 34px 22px;
+      border-right: 1px solid var(--line); overflow: auto;
+    }
+    .rail-label { margin: 0 0 12px 11px; color: var(--muted); font: 11px/1 var(--mono); letter-spacing: .13em; text-transform: uppercase; }
+    .rail a { display: block; padding: 9px 11px; border-left: 2px solid transparent; color: var(--muted); font-size: 14px; }
+    .rail a:hover, .rail a.active { color: var(--ink); border-left-color: var(--orange); background: rgba(255,255,255,.48); }
+    .rail a span { display: inline-block; width: 27px; color: var(--orange); font: 11px var(--mono); }
+    .rail-note { margin: 26px 10px 0; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.65; }
+
+    main { min-width: 0; padding: 54px clamp(24px, 5vw, 76px) 90px; }
+    .hero { max-width: 1120px; }
+    .kicker { color: var(--orange); font: 700 12px/1.2 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+    h1 { max-width: 900px; margin: 17px 0 18px; font-size: clamp(38px, 5.3vw, 72px); line-height: 1.06; letter-spacing: -.055em; }
+    .hero-copy { max-width: 760px; margin: 0 0 34px; color: var(--muted); font-size: 19px; line-height: 1.75; }
+    .one-line { display: grid; grid-template-columns: auto 1fr; max-width: 960px; border: 1px solid var(--navy); background: var(--white); box-shadow: var(--shadow); }
+    .one-line b { display: grid; place-items: center; padding: 20px 24px; color: white; background: var(--navy); font: 12px/1.3 var(--mono); letter-spacing: .08em; }
+    .one-line p { margin: 0; padding: 19px 24px; font-size: 17px; }
+
+    .section { max-width: 1120px; margin-top: 92px; scroll-margin-top: 84px; }
+    .section-head { display: grid; grid-template-columns: 48px minmax(0,1fr); gap: 16px; align-items: start; margin-bottom: 28px; }
+    .section-num { padding-top: 8px; color: var(--orange); font: 700 12px var(--mono); }
+    h2 { margin: 0; font-size: clamp(28px, 3vw, 42px); line-height: 1.2; letter-spacing: -.035em; }
+    .section-lead { max-width: 800px; margin: 9px 0 0; color: var(--muted); font-size: 17px; }
+
+    .layer-map { display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid var(--navy); background: var(--navy); gap: 1px; box-shadow: var(--shadow); }
+    .layer { min-height: 265px; padding: 24px; background: var(--white); }
+    .layer:nth-child(2) { background: #fdf8f2; }
+    .layer:nth-child(3) { background: #f3f8fa; }
+    .layer:nth-child(4) { background: #f1f5f4; }
+    .layer-owner { color: var(--muted); font: 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .layer h3 { margin: 35px 0 8px; font-size: 23px; letter-spacing: -.03em; }
+    .layer .verb { color: var(--orange); font-weight: 700; }
+    .layer p { margin: 10px 0 0; color: var(--muted); font-size: 14px; }
+    .layer code { display: inline-block; margin-top: 20px; padding: 3px 7px; color: var(--navy-2); background: var(--blue-soft); font: 12px var(--mono); }
+    .layer-rule { margin-top: 16px; padding: 14px 18px; border-left: 3px solid var(--orange); background: var(--orange-soft); font-size: 14px; }
+
+    .journey { border: 1px solid var(--line); background: var(--white); box-shadow: var(--shadow); }
+    .journey-tabs { display: grid; grid-template-columns: repeat(5,1fr); border-bottom: 1px solid var(--line); }
+    .journey-tab { border: 0; border-right: 1px solid var(--line); padding: 16px 12px; background: var(--paper-deep); cursor: pointer; text-align: left; }
+    .journey-tab:last-child { border-right: 0; }
+    .journey-tab small { display: block; color: var(--muted); font: 11px var(--mono); }
+    .journey-tab strong { display: block; margin-top: 5px; font-size: 14px; }
+    .journey-tab[aria-selected="true"] { color: white; background: var(--navy); }
+    .journey-tab[aria-selected="true"] small { color: #9fc3d4; }
+    .journey-panel { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(280px, .75fr); min-height: 360px; }
+    .journey-copy { padding: 38px 40px; }
+    .journey-copy .who { color: var(--orange); font: 700 12px var(--mono); letter-spacing: .1em; }
+    .journey-copy h3 { margin: 11px 0 12px; font-size: 27px; letter-spacing: -.03em; }
+    .journey-copy p { max-width: 620px; color: var(--muted); }
+    .journey-copy ul { margin: 24px 0 0; padding: 0; list-style: none; }
+    .journey-copy li { position: relative; margin-top: 11px; padding-left: 20px; }
+    .journey-copy li::before { content: "→"; position: absolute; left: 0; color: var(--orange); }
+    .journey-facts { padding: 34px; color: #e8f1f4; background: var(--navy); }
+    .journey-facts h4 { margin: 0 0 20px; color: #91b6c8; font: 11px var(--mono); letter-spacing: .11em; }
+    .fact { padding: 13px 0; border-top: 1px solid rgba(255,255,255,.13); }
+    .fact:first-of-type { border-top: 0; }
+    .fact b { display: block; color: white; font-size: 14px; }
+    .fact span { display: block; margin-top: 3px; color: #aebfc7; font-size: 13px; }
+
+    .memory-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .memory-card { position: relative; overflow: hidden; padding: 30px; border: 1px solid var(--line); background: var(--white); }
+    .memory-card.session { border-top: 5px solid var(--blue); }
+    .memory-card.job { border-top: 5px solid var(--violet); }
+    .memory-card h3 { margin: 0; font-size: 25px; }
+    .memory-card > p { color: var(--muted); }
+    .memory-flow { margin-top: 24px; }
+    .memory-row { display: grid; grid-template-columns: 122px 1fr; gap: 14px; padding: 13px 0; border-top: 1px solid var(--line); font-size: 14px; }
+    .memory-row b { font-size: 13px; }
+    .memory-row span { color: var(--muted); }
+    .memory-foot { margin-top: 24px; padding: 15px 17px; background: var(--paper); font-size: 14px; }
+    .clarify { margin-top: 18px; display: grid; grid-template-columns: auto 1fr auto 1fr; align-items: center; gap: 10px; font-size: 13px; }
+    .clarify b { padding: 7px 10px; background: var(--blue-soft); }
+    .clarify i { color: var(--orange); font-style: normal; }
+
+    .budget-shell { display: grid; grid-template-columns: 1fr 330px; border: 1px solid var(--line); background: var(--white); }
+    .budget-main { padding: 34px; }
+    .meter { display: flex; height: 66px; border: 1px solid var(--navy); }
+    .meter span { display: grid; place-items: center; min-width: 0; padding: 8px; color: white; font-size: 12px; text-align: center; }
+    .meter .session-part { flex: 4; background: var(--blue); }
+    .meter .job-part { flex: 3; background: var(--violet); }
+    .meter .required-part { flex: 2; background: var(--orange); }
+    .meter .reserve-part { flex: 2; color: var(--ink); background: repeating-linear-gradient(135deg,#fff 0,#fff 8px,#e6e1d7 8px,#e6e1d7 16px); }
+    .decision-flow { display: grid; grid-template-columns: repeat(4,1fr); margin-top: 28px; }
+    .decision-step { position: relative; padding: 18px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); border-left: 1px solid var(--line); }
+    .decision-step:last-child { border-right: 1px solid var(--line); }
+    .decision-step b { display: block; font-size: 14px; }
+    .decision-step small { color: var(--muted); font-size: 12px; }
+    .budget-aside { padding: 34px 27px; color: white; background: var(--navy); }
+    .budget-aside h3 { margin-top: 0; font-size: 20px; }
+    .budget-aside ol { padding-left: 20px; color: #b8c9d1; }
+    .budget-aside li + li { margin-top: 12px; }
+    .budget-aside strong { color: #ff9562; }
+
+    .durable { border: 1px solid var(--line); background: var(--white); box-shadow: var(--shadow); }
+    .durable-flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: stretch; padding: 34px; }
+    .durable-node { padding: 22px; border: 1px solid var(--line); background: var(--paper); }
+    .durable-node b { display: block; font-size: 18px; }
+    .durable-node span { display: block; margin-top: 7px; color: var(--muted); font-size: 13px; }
+    .durable-arrow { display: grid; place-items: center; padding: 0 12px; color: var(--orange); font: 22px var(--mono); }
+    .commit-rule { padding: 21px 34px; color: white; background: var(--navy); font-size: 16px; }
+    .commit-rule strong { color: #ff9562; }
+    .durable-details { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1px; background: var(--line); border-top: 1px solid var(--line); }
+    .durable-detail { padding: 24px; background: var(--white); }
+    .durable-detail b { display: block; }
+    .durable-detail p { margin: 7px 0 0; color: var(--muted); font-size: 13px; }
+
+    .edge-list { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .edge { padding: 24px; border: 1px solid var(--line); background: var(--white); }
+    .edge-head { display: flex; justify-content: space-between; gap: 20px; align-items: start; }
+    .edge h3 { margin: 0; font-size: 19px; }
+    .edge-status { padding: 4px 8px; color: var(--green); background: var(--green-soft); font: 11px var(--mono); white-space: nowrap; }
+    .edge p { margin: 11px 0 0; color: var(--muted); font-size: 14px; }
+    .edge code { color: var(--navy-2); font: 12px var(--mono); }
+
+    .truth-table { overflow: auto; border: 1px solid var(--line); background: var(--white); }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    th, td { padding: 16px 18px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--muted); background: var(--paper-deep); font-size: 13px; font-weight: 600; }
+    td { font-size: 14px; }
+    tr:last-child td { border-bottom: 0; }
+    .yes { color: var(--green); font-weight: 700; }
+    .later { color: var(--violet); font-weight: 700; }
+
+    .summary { margin-top: 86px; padding: 40px; color: white; background: var(--navy); }
+    .summary h2 { max-width: 740px; }
+    .summary-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 1px; margin-top: 30px; background: rgba(255,255,255,.15); }
+    .summary-grid div { padding: 22px; background: var(--navy); }
+    .summary-grid b { color: #ff9562; }
+    .summary-grid p { margin: 7px 0 0; color: #b9c9d1; font-size: 14px; }
+    footer { max-width: 1120px; display: flex; justify-content: space-between; gap: 20px; margin-top: 30px; padding-top: 22px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+    footer .links { display: flex; flex-wrap: wrap; gap: 18px; }
+
+    @media (max-width: 1080px) {
+      .layout { grid-template-columns: 180px minmax(0,1fr); }
+      .layer-map { grid-template-columns: 1fr 1fr; }
+      .budget-shell { grid-template-columns: 1fr; }
+      .journey-panel { grid-template-columns: 1fr; }
+      .durable-flow { grid-template-columns: 1fr; gap: 8px; }
+      .durable-arrow { transform: rotate(90deg); }
+    }
+    @media (max-width: 760px) {
+      .topbar { padding: 0 16px; }
+      .top-links a { display: none; }
+      .layout { display: block; }
+      .rail { position: static; width: 100%; height: auto; display: flex; gap: 3px; padding: 8px; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      .rail-label, .rail-note { display: none; }
+      .rail a { flex: 0 0 auto; border-left: 0; border-bottom: 2px solid transparent; }
+      .rail a:hover, .rail a.active { border-left-color: transparent; border-bottom-color: var(--orange); }
+      main { padding: 36px 17px 60px; }
+      .one-line { grid-template-columns: 1fr; }
+      .one-line b { place-items: start; }
+      .section { margin-top: 68px; }
+      .section-head { grid-template-columns: 1fr; gap: 2px; }
+      .layer-map, .memory-grid, .edge-list, .summary-grid { grid-template-columns: 1fr; }
+      .journey-tabs { grid-template-columns: 1fr; }
+      .journey-tab { border-right: 0; border-bottom: 1px solid var(--line); }
+      .journey-tab small, .journey-tab strong { display: inline; margin-right: 8px; }
+      .journey-copy, .journey-facts, .budget-main, .budget-aside { padding: 25px 20px; }
+      .decision-flow { grid-template-columns: 1fr 1fr; }
+      .decision-step:nth-child(2) { border-right: 1px solid var(--line); }
+      .clarify { grid-template-columns: auto 1fr; }
+      .durable-details { grid-template-columns: 1fr; }
+      footer { display: block; }
+      footer .links { margin-top: 12px; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    @media print {
+      .topbar, .rail { display: none; }
+      .layout { display: block; }
+      main { padding: 0; }
+      .journey-tabs { display: none; }
+      .journey-panel { min-height: 0; }
+      .section { break-inside: avoid; }
+      .summary, .journey-facts, .budget-aside, .commit-rule { color: var(--ink); background: var(--white); border: 1px solid var(--line); }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="index.html">BONE <em>/ CONTEXT ENGINE</em></a>
+    <div class="top-links">
+      <span class="state">当前实现</span>
+      <a href="../../docs/core.md">技术规格</a>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="rail" aria-label="页面目录">
+      <p class="rail-label">Understand from here</p>
+      <a href="#map"><span>01</span>四层结构</a>
+      <a href="#journey"><span>02</span>一条输入</a>
+      <a href="#memory"><span>03</span>两种记忆</a>
+      <a href="#compact"><span>04</span>压缩规则</a>
+      <a href="#durable"><span>05</span>重启恢复</a>
+      <a href="#edges"><span>06</span>关键边界</a>
+      <a href="#status"><span>07</span>现在与以后</a>
+      <p class="rail-note">这份图只描述当前实现。旧格式迁移、历史 bootstrap 和缺失字段猜测已经删除。</p>
+    </nav>
+
+    <main>
+      <section class="hero">
+        <div class="kicker">Current architecture · 2026.09</div>
+        <h1>Context 不是一包聊天记录，<br>而是 Core 对事实的有界投影。</h1>
+        <p class="hero-copy">App 管产品与存储，Runtime 管执行与提交，Kernel 管事实和规则，模型只提出建议。Session 记共同历史，Job 记局部工作；每次调用都从这两层重新组装上下文。</p>
+        <div class="one-line">
+          <b>一句话</b>
+          <p>原始事实只存一份；谁能看到什么、什么时候压缩、重启后如何恢复，都由 Core 的确定性规则决定。</p>
+        </div>
+      </section>
+
+      <section class="section" id="map">
+        <div class="section-head">
+          <div class="section-num">01 / MAP</div>
+          <div><h2>先把四层放回各自的位置</h2><p class="section-lead">最容易混淆的是 Kernel、Router 和 Runtime：一个是规则，一个是轻模型，一个是执行容器。</p></div>
+        </div>
+        <div class="layer-map">
+          <article class="layer">
+            <div class="layer-owner">Product shell</div>
+            <h3>App</h3>
+            <div class="verb">拥有产品 Session</div>
+            <p>配置、SQLite、UI 视图、Workspace 写门禁和外部写核查。</p>
+            <code>注入 ports</code>
+          </article>
+          <article class="layer">
+            <div class="layer-owner">Execution host · Core</div>
+            <h3>Runtime</h3>
+            <div class="verb">执行 Effect</div>
+            <p>调用模型和工具；等待 durable 提交成功后，才发布状态并启动后续动作。</p>
+            <code>async actor</code>
+          </article>
+          <article class="layer">
+            <div class="layer-owner">Authority · Core</div>
+            <h3>Kernel</h3>
+            <div class="verb">裁决所有状态</div>
+            <p>管理 Input、Routing、Job、Call、Record、权限、预算和提交资格。</p>
+            <code>deterministic</code>
+          </article>
+          <article class="layer">
+            <div class="layer-owner">Model roles</div>
+            <h3>Router / Worker</h3>
+            <div class="verb">提出建议</div>
+            <p>Router 轻量分配意图；Worker 理解、计划、执行、委派，也能纠正交付理解。</p>
+            <code>untrusted proposal</code>
+          </article>
+        </div>
+        <div class="layer-rule"><strong>真正的边界：</strong>模型不能直接改状态；App 不能替 Core 拼执行记忆；Runtime 不能在存储确认前发布候选状态。</div>
+      </section>
+
+      <section class="section" id="journey">
+        <div class="section-head">
+          <div class="section-num">02 / FLOW</div>
+          <div><h2>跟着一条输入走完整条链路</h2><p class="section-lead">点击阶段，看每一步由谁负责、产生什么事实，以及下一步为什么可以开始。</p></div>
+        </div>
+        <div class="journey">
+          <div class="journey-tabs" role="tablist" aria-label="输入处理阶段">
+            <button class="journey-tab" role="tab" aria-selected="true" data-step="0"><small>01</small><strong>接受原话</strong></button>
+            <button class="journey-tab" role="tab" aria-selected="false" data-step="1"><small>02</small><strong>Router 交付</strong></button>
+            <button class="journey-tab" role="tab" aria-selected="false" data-step="2"><small>03</small><strong>Worker 审阅</strong></button>
+            <button class="journey-tab" role="tab" aria-selected="false" data-step="3"><small>04</small><strong>执行与委派</strong></button>
+            <button class="journey-tab" role="tab" aria-selected="false" data-step="4"><small>05</small><strong>完成输入</strong></button>
+          </div>
+          <div class="journey-panel" aria-live="polite">
+            <div class="journey-copy">
+              <div class="who" id="journey-who">APP → RUNTIME → KERNEL</div>
+              <h3 id="journey-title">原话先成为不可丢失的 Input 事实</h3>
+              <p id="journey-desc">App 分配产品输入身份，Kernel 接受完整原文并建立 routing。相同 ID 和相同内容可重试；相同 ID 配不同内容会被拒绝。</p>
+              <ul id="journey-list"><li>保存原始 Input Record</li><li>建立全局提交屏障</li><li>合并仍未关闭的 routing 批次</li></ul>
+            </div>
+            <aside class="journey-facts">
+              <h4>AUTHORITATIVE FACTS</h4>
+              <div class="fact"><b id="fact-a-title">身份</b><span id="fact-a-copy">InputId + 接收 Seq</span></div>
+              <div class="fact"><b id="fact-b-title">当前责任</b><span id="fact-b-copy">等待 Router 分配 root Job</span></div>
+              <div class="fact"><b id="fact-c-title">安全条件</b><span id="fact-c-copy">旧 Worker 暂不能回复、完成或外部写</span></div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="memory">
+        <div class="section-head">
+          <div class="section-num">03 / MEMORY</div>
+          <div><h2>一份 Record，形成两种记忆</h2><p class="section-lead">Session 和 Job 不各存一套聊天记录。它们从同一事实账本选择不同范围，服务不同问题。</p></div>
+        </div>
+        <div class="memory-grid">
+          <article class="memory-card session">
+            <h3>Session Context</h3>
+            <p>“这段长期协作里，大家共同知道什么？”</p>
+            <div class="memory-flow">
+              <div class="memory-row"><b>进入</b><span>Input、公开 Reply、用户 Clarification、root Published / Outcome</span></div>
+              <div class="memory-row"><b>不自动进入</b><span>私有 Note、child 内部成果、工具全文</span></div>
+              <div class="memory-row"><b>压缩产物</b><span>独立 SessionCheckpoint + 最近公共原文</span></div>
+              <div class="memory-row"><b>给谁</b><span>之后的 Router 和 Worker 调用</span></div>
+            </div>
+            <div class="clarify"><b>问题</b><span>“选 A 还是 B？”</span><i>+</i><b>回答</b><span>“第二个”</span></div>
+            <div class="memory-foot">问题和回答一起保留，不能只留下脱离语境的“第二个”。</div>
+          </article>
+          <article class="memory-card job">
+            <h3>Job Context</h3>
+            <p>“为了完成这项工作，这个 Worker 被允许知道什么？”</p>
+            <div class="memory-flow">
+              <div class="memory-row"><b>进入</b><span>输入交付、工具结果、私有 Note、child Outcome、显式 evidence</span></div>
+              <div class="memory-row"><b>权限</b><span>由 owner 树和显式引用决定，不能横向偷看</span></div>
+              <div class="memory-row"><b>压缩产物</b><span>自己的 Checkpoint + 尚未处理的局部 Record</span></div>
+              <div class="memory-row"><b>给谁</b><span>这个 Job 下一轮具备资格的 Worker</span></div>
+            </div>
+            <div class="memory-foot">摘要不会推进“已读”水位；被摘要覆盖的输入仍需 Worker 真正审阅。</div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="compact">
+        <div class="section-head">
+          <div class="section-num">04 / BUDGET</div>
+          <div><h2>压缩不是定时清理，而是组装失败后的受控动作</h2><p class="section-lead">真正检查的是完整模型请求。Session 和 Job 单独看都没超限，相加后仍可能放不下。</p></div>
+        </div>
+        <div class="budget-shell">
+          <div class="budget-main">
+            <div class="meter" aria-label="模型上下文预算构成">
+              <span class="session-part">Session</span><span class="job-part">Job</span><span class="required-part">当前必需事实</span><span class="reserve-part">输出余量</span>
+            </div>
+            <div class="decision-flow">
+              <div class="decision-step"><b>1. 组装</b><small>生成完整 Core DTO</small></div>
+              <div class="decision-step"><b>2. 测量</b><small>按最终序列化字节</small></div>
+              <div class="decision-step"><b>3. 减负</b><small>先分页工具正文</small></div>
+              <div class="decision-step"><b>4. 压缩</b><small>选 Session 或 Job 前缀</small></div>
+            </div>
+          </div>
+          <aside class="budget-aside">
+            <h3>两层共用一种协议</h3>
+            <ol><li><strong>CompactScope</strong> 决定压哪一层</li><li>只压合法旧前缀，保留新尾部</li><li>草稿必须非空、限长、确实变小</li><li>无收益或关键事实本身过大，明确失败</li></ol>
+          </aside>
+        </div>
+      </section>
+
+      <section class="section" id="durable">
+        <div class="section-head">
+          <div class="section-num">05 / DURABLE</div>
+          <div><h2>重启恢复的是 Core 状态，不是一段旧模型对话</h2><p class="section-lead">App 提供存储实现，Core 定义必须保存什么以及怎样恢复。当前只接受一种严格协议。</p></div>
+        </div>
+        <div class="durable">
+          <div class="durable-flow">
+            <div class="durable-node"><b>Kernel 候选状态</b><span>新 Record + 结构化 Snapshot</span></div>
+            <div class="durable-arrow">→</div>
+            <div class="durable-node"><b>DurablePort 提交</b><span>commit_id 幂等 + expected_revision 冲突检查</span></div>
+            <div class="durable-arrow">→</div>
+            <div class="durable-node"><b>Runtime 发布</b><span>只有 ACK 后才能观察并启动依赖动作</span></div>
+          </div>
+          <div class="commit-rule"><strong>硬规则：</strong>“写入 future 被丢弃”不等于“数据库没有提交”。未确认提交必须显式报告，等事务结束后重新读取权威状态。</div>
+          <div class="durable-details">
+            <div class="durable-detail"><b>容量</b><p>Core 状态按 512 KiB UTF-8 分段，在一个 SQLite 事务中提交；累计历史不受单文档 8 MiB 上限卡死。</p></div>
+            <div class="durable-detail"><b>投影</b><p>App 用独立 core_through 记录产品视图进度，恢复后只补尚未投影的 Record。</p></div>
+            <div class="durable-detail"><b>来源</b><p>每条 Record 和 Call 的原始 Runtime 来源是必需字段；缺失就报错，不猜当前 Runtime。</p></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="edges">
+        <div class="section-head">
+          <div class="section-num">06 / EDGES</div>
+          <div><h2>这次重构专门封住的边界</h2><p class="section-lead">这些不是附加优化，而是 durable、取消和上下文语义能成立的前提。</p></div>
+        </div>
+        <div class="edge-list">
+          <article class="edge"><div class="edge-head"><h3>永久 pending 也能按时关闭</h3><span class="edge-status">FIXED</span></div><p>shutdown grace 到期后返回最后已确认状态，并标出 <code>pending_commit</code>；不会把候选状态冒充已保存。</p></article>
+          <article class="edge"><div class="edge-head"><h3>启动途中关闭不会错过 Runtime</h3><span class="edge-status">FIXED</span></div><p>关闭请求持续观察 Runtime 安装；即使请求发出时还没有 Agent，也会在安装后立即转发 shutdown。</p></article>
+          <article class="edge"><div class="edge-head"><h3>取消的压缩不能改写任务结果</h3><span class="edge-status">FIXED</span></div><p>暂停、取消或重配置后，迟到的 compact 成功/失败只结束调用记账，不提交摘要，也不终结 requester。</p></article>
+          <article class="edge"><div class="edge-head"><h3>恢复提交不会漏掉产品投影</h3><span class="edge-status">FIXED</span></div><p>即使 Core 已提交而 App 尚未登记新 Runtime 就再次崩溃，core_through 和来源索引也能补齐且只补一次。</p></article>
+          <article class="edge"><div class="edge-head"><h3>root 知道输入为何交给自己</h3><span class="edge-status">FIXED</span></div><p>root 卡片持有固定大小 latest_handoff，可沿 previous 链回读；目录不会无限累积输入列表。</p></article>
+          <article class="edge"><div class="edge-head"><h3>旧状态被明确拒绝</h3><span class="edge-status">STRICT</span></div><p>没有旧单文档迁移、bootstrap 注入或字段推断。已删除字段、未知字段和缺失必需来源都会报错。</p></article>
+        </div>
+      </section>
+
+      <section class="section" id="status">
+        <div class="section-head">
+          <div class="section-num">07 / STATUS</div>
+          <div><h2>现在已经是什么，未来才可能是什么</h2><p class="section-lead">把实现与想法分开，后续讨论才不会再次把提案误认为系统能力。</p></div>
+        </div>
+        <div class="truth-table">
+          <table>
+            <thead><tr><th>能力</th><th>状态</th><th>当前做法</th></tr></thead>
+            <tbody>
+              <tr><td>轻 Router + 强 Worker</td><td class="yes">已实现</td><td>Router 只 Assign / Read / Clarify；Worker 负责计划与执行</td></tr>
+              <tr><td>Session / Job 两层上下文</td><td class="yes">已实现</td><td>共同事实账本，不同权限投影，分别 checkpoint</td></tr>
+              <tr><td>组合预算与按需压缩</td><td class="yes">已实现</td><td>先分页，再选择合法前缀压缩，失败显式可见</td></tr>
+              <tr><td>Core durable 与严格恢复</td><td class="yes">已实现</td><td>提交后发布，分段存储，来源必需，旧协议拒绝</td></tr>
+              <tr><td>按任务选择不同 Worker 模型</td><td class="later">以后</td><td>当前所有 Worker 共用一个模型配置</td></tr>
+              <tr><td>误投后的原子负责人转交</td><td class="later">以后</td><td>Worker 可纠正理解和澄清，但没有 transfer 协议</td></tr>
+              <tr><td>后台预压缩、惰性加载与 GC</td><td class="later">以后</td><td>当前同步按需压缩；进程仍保留完整原始记录</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="summary">
+        <div class="kicker">The mental model</div>
+        <h2>把 Context Engine 看成“事实账本上的视图系统”。</h2>
+        <div class="summary-grid">
+          <div><b>事实</b><p>Kernel 记录发生了什么，模型不能直接改。</p></div>
+          <div><b>视图</b><p>Session 与 Job 按公开性、权限和预算选择事实。</p></div>
+          <div><b>连续性</b><p>Runtime 提交后再发布；重启从严格 durable 状态恢复。</p></div>
+        </div>
+      </section>
+
+      <footer>
+        <span>BONE Context Engine · current architecture</span>
+        <div class="links"><a href="../../docs/core-simple-design.md">最小架构</a><a href="../../docs/context-engine-v2.md">上下文说明</a><a href="../../docs/core.md">Core 规格</a><a href="context-engine-v2.html">上一版设计稿</a></div>
+      </footer>
+    </main>
+  </div>
+
+  <script>
+    const steps = [
+      {
+        who: "APP → RUNTIME → KERNEL",
+        title: "原话先成为不可丢失的 Input 事实",
+        desc: "App 分配产品输入身份，Kernel 接受完整原文并建立 routing。相同 ID 和相同内容可重试；相同 ID 配不同内容会被拒绝。",
+        items: ["保存原始 Input Record", "建立全局提交屏障", "合并仍未关闭的 routing 批次"],
+        facts: [["身份", "InputId + 接收 Seq"], ["当前责任", "等待 Router 分配 root Job"], ["安全条件", "旧 Worker 暂不能回复、完成或外部写"]]
+      },
+      {
+        who: "LIGHT ROUTER → KERNEL",
+        title: "Router 只决定把原话交给哪个 root",
+        desc: "轻模型看到原始输入、约束、Session Context 和 root 目录。它可以读取、澄清或完整分配，但不写计划、不拆任务、不调用工具。",
+        items: ["每个 Input 恰好分配一次", "handoff 只是一段短理解，不替代原话", "Kernel 原子校验整份分配"],
+        facts: [["建议", "Assign / Read / Clarify"], ["权威需求", "始终是原始 Input"], ["可纠错", "Worker 可以不同意 handoff 的理解"]]
+      },
+      {
+        who: "ROOT WORKER → KERNEL",
+        title: "Worker 真正读到输入后，审阅屏障才解除",
+        desc: "分配成功不等于任务已经理解。负责 Worker 的第一份有效提案必须基于这条 Input；在此之前，其他旧工作不能抢先对用户交付。",
+        items: ["读取原话和 latest_handoff", "自己形成计划，可写私有 Note", "必要时向用户提出 Clarification"],
+        facts: [["提交资格", "绑定 Job revision 与已见 Record"], ["门禁解除", "有效 Worker 提案确实看到 Input"], ["迟到结果", "失去资格，只保留审计事实"]]
+      },
+      {
+        who: "WORKER ↔ CHILDREN / TOOLS",
+        title: "计划、工具与子任务都在 Job 拥有树中推进",
+        desc: "Worker 可以执行工具、委派直属 child、读取证据或等待结果。Kernel 继续校验角色、owner、工具权限、预算和当前事实。",
+        items: ["child 只继承必要输入与显式 evidence", "工具全文存 Record，模型按页读取", "外部写 Unknown 必须由宿主核查"],
+        facts: [["局部记忆", "Job Context + checkpoint"], ["共享方式", "Report / Published / Outcome / Inquiry"], ["权限边界", "引用成果不会开放整个私有历史"]]
+      },
+      {
+        who: "WORKER → KERNEL → APP VIEW",
+        title: "Job 完成后，Kernel 单独结算 Input",
+        desc: "Job 的唯一 Outcome 通过完整性检查后提交；负责 root 进入终态，Kernel 再记录 InputFinished。Job 完成和用户输入完成是两个明确事实。",
+        items: ["检查未读投递、Inquiry、工具、child 与 Unknown 写", "同一个 Job 不会产生第二个终态", "公开结果进入之后的 Session Context"],
+        facts: [["Job 终态", "唯一 Outcome"], ["Input 终态", "独立 InputFinished"], ["产品视图", "App 按 core_through 精确投影"]]
+      }
+    ];
+
+    const tabs = [...document.querySelectorAll(".journey-tab")];
+    const fields = {
+      who: document.getElementById("journey-who"), title: document.getElementById("journey-title"),
+      desc: document.getElementById("journey-desc"), list: document.getElementById("journey-list"),
+      facts: [
+        [document.getElementById("fact-a-title"), document.getElementById("fact-a-copy")],
+        [document.getElementById("fact-b-title"), document.getElementById("fact-b-copy")],
+        [document.getElementById("fact-c-title"), document.getElementById("fact-c-copy")]
+      ]
+    };
+
+    function showStep(index) {
+      const step = steps[index];
+      tabs.forEach((tab, i) => tab.setAttribute("aria-selected", String(i === index)));
+      fields.who.textContent = step.who;
+      fields.title.textContent = step.title;
+      fields.desc.textContent = step.desc;
+      fields.list.replaceChildren(...step.items.map(item => Object.assign(document.createElement("li"), { textContent: item })));
+      step.facts.forEach((fact, i) => { fields.facts[i][0].textContent = fact[0]; fields.facts[i][1].textContent = fact[1]; });
+    }
+
+    tabs.forEach((tab, index) => {
+      tab.addEventListener("click", () => showStep(index));
+      tab.addEventListener("keydown", event => {
+        if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+        event.preventDefault();
+        const next = (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+        tabs[next].focus(); showStep(next);
+      });
+    });
+
+    const sections = [...document.querySelectorAll(".section")];
+    const links = [...document.querySelectorAll(".rail a")];
+    const observer = new IntersectionObserver(entries => {
+      const visible = entries.filter(entry => entry.isIntersecting).sort((a,b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (!visible) return;
+      links.forEach(link => link.classList.toggle("active", link.getAttribute("href") === `#${visible.target.id}`));
+    }, { rootMargin: "-20% 0px -65%", threshold: [0, .25, .6] });
+    sections.forEach(section => observer.observe(section));
+  </script>
+</body>
+</html>

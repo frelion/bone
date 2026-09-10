@@ -53,7 +53,6 @@ impl Kernel {
             Inquiry {
                 requester,
                 target,
-                target_revision: self.jobs[&target].revision,
                 deadline: now.after(self.limits.coordination_timeout),
             },
         );
@@ -163,7 +162,15 @@ impl Kernel {
                     .records
                     .iter()
                     .any(|record| *record == *id || self.attached_record_grants(*record, *id))
+                    || self
+                        .records
+                        .get(id)
+                        .is_some_and(|record| context::session_public(self, record))
                     || self.public_record(*id)
+                    || self.records.get(id).is_some_and(|record| {
+                        matches!(record.body, RecordBody::RoutingHandoff { job, .. }
+                            if self.jobs.get(&job).is_some_and(|entry| entry.owner == Owner::User))
+                    })
                     || self.public_evidence(*id)
                     || matches!(route.requester, Requester::Job { job, .. } if self.can_read_record(job, *id));
                 if !allowed {
@@ -439,6 +446,9 @@ impl Kernel {
         let Some(record) = self.records.get(&seq) else {
             return false;
         };
+        if context::session_public(self, record) {
+            return true;
+        }
         if self.jobs[&job].context.records.contains(&seq)
             || matches!(record.origin, Origin::Job { job: owner, .. } if owner == job)
             || matches!(record.origin, Origin::Call(call) if self.calls.get(&call).is_some_and(|entry| entry.job() == Some(job)))
