@@ -74,6 +74,21 @@ impl BoneStore {
         })
     }
 
+    /// Read multiple documents from one WAL snapshot without acquiring the writer.
+    pub fn read_transaction<R>(
+        &self,
+        operation: impl FnOnce(&WriteTransaction<'_, '_>) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let mut connection = self.inner.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| StoreError::sqlite("begin snapshot read", error))?;
+        operation(&WriteTransaction {
+            inner: Arc::clone(&self.inner),
+            transaction: &transaction,
+        })
+    }
+
     /// Acquire an exclusive process-lifetime lease for an application-defined
     /// logical key. The key is encoded into a safe filename under `leases/`.
     pub fn try_acquire_lease(&self, key: LeaseKey) -> Result<Lease, StoreError> {

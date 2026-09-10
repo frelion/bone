@@ -1,20 +1,19 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 
 use bone_adapters::{
     read_only_tools,
     tools::{BashOutput, Tool, ToolEnvironment, ToolFailureKind},
 };
 use bone_core::{
-    BackgroundEntry, BootstrapContext, CallContext, CallError, ExternalEffect, PortFuture,
-    ToolEffect, ToolOutcome, ToolPort, ToolSpec,
+    CallContext, CallError, ExternalEffect, PortFuture, ToolEffect, ToolOutcome, ToolPort, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, watch};
 
 use crate::{
-    CallRef, DataStore, InputId, RuntimeConfig, RuntimeId, SessionEvent, SessionId, SessionSeq,
-    ToolMode, UnresolvedWriteView, WorkspaceId,
+    CallRef, DataStore, RuntimeConfig, RuntimeId, SessionId, SessionSeq, ToolMode,
+    UnresolvedWriteView, WorkspaceId,
     storage::{Lease, StoreError},
 };
 
@@ -113,57 +112,6 @@ pub(crate) fn assemble(
         )));
     }
     Ok(tools)
-}
-
-pub(crate) fn background(
-    store: &DataStore,
-    session: SessionId,
-    context_bytes: usize,
-    pending: &[InputId],
-) -> Result<BootstrapContext, crate::storage::StoreError> {
-    let budget = context_bytes / 4;
-    let mut cursor = SessionSeq(0);
-    let mut bytes = 0;
-    let mut entries = VecDeque::<BackgroundEntry>::new();
-    let mut omitted = false;
-    loop {
-        let page = store.history(session, cursor, 64)?;
-        for item in page.items {
-            if matches!(
-                &item.event,
-                SessionEvent::InputSubmitted { input, .. } if pending.contains(input)
-            ) {
-                continue;
-            }
-            let label = format!("session event {}", item.sequence.0);
-            let content = serde_json::to_string(&item.event).map_err(|_| {
-                crate::storage::StoreError::Corrupt {
-                    message: "cannot encode session history",
-                }
-            })?;
-            let size = label.len() + content.len();
-            if size > budget {
-                omitted = true;
-                continue;
-            }
-            while bytes + size > budget {
-                if let Some(removed) = entries.pop_front() {
-                    bytes -= removed.label.len() + removed.content.len();
-                    omitted = true;
-                }
-            }
-            bytes += size;
-            entries.push_back(BackgroundEntry::new(label, content));
-        }
-        cursor = page.next_cursor;
-        if !page.has_more {
-            break;
-        }
-    }
-    Ok(BootstrapContext {
-        entries: entries.into(),
-        omitted,
-    })
 }
 
 #[derive(Deserialize)]

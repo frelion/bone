@@ -3,39 +3,46 @@ use std::{
     sync::Arc,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    AdmissionError, AgentLimits, AgentLimitsError, AgentView, Assignment, Await, BootstrapContext,
-    Call, CallError, CallId, CallKind, CallProgress, CallStatus, CallView, Completion,
-    ControlOutcome, DeliveryKind, DeliveryTarget, Effect, Event, ExternalEffect, Input, InputId,
-    InputOutcome, InputReceipt, InputStatus, InputView, InquiryResponse, InquiryResult, JobAction,
-    JobChange, JobId, JobOutcome, JobSpec, JobStatus, JobView, KernelDecision, MonoTime, Origin,
-    OutcomeKind, Owner, ReadQuery, Record, RecordBody, RecordRange, ReportDraft, Seq, ToolEffect,
-    ToolOutcome, ToolSpec, WorkProposal, WorkStep,
+    AdmissionError, AgentLimits, AgentLimitsError, AgentView, Assignment, Await, Call, CallError,
+    CallId, CallKind, CallProgress, CallStatus, CallView, Completion, ControlOutcome, DeliveryKind,
+    DeliveryTarget, Effect, Event, ExternalEffect, Input, InputId, InputOutcome, InputReceipt,
+    InputStatus, InputView, InquiryResponse, InquiryResult, JobId, JobOutcome, JobSpec, JobStatus,
+    JobView, KernelDecision, MonoTime, Origin, OutcomeKind, OwnedAction, Owner, ReadQuery, Record,
+    RecordBody, RecordRange, ReportDraft, Seq, ToolEffect, ToolOutcome, ToolSpec, WorkProposal,
+    WorkStep,
     context::{self, PreparedWork},
     job::{Job, JobContext, JobState, PendingStep, WaitState},
 };
 
+mod durable;
 mod exchange;
 mod routing;
 mod scheduler;
 mod work;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct InputEntry {
     pub accepted_at: Seq,
     pub finished: Option<InputOutcome>,
     pub required_jobs: BTreeSet<JobId>,
+    pub pending_review_by: Option<JobId>,
     pub routing: Seq,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Requester {
     Inputs,
-    Job { job: JobId, revision: u64 },
+    #[allow(dead_code)]
+    Job {
+        job: JobId,
+        revision: u64,
+    },
 }
 
+#[derive(Clone)]
 pub(crate) enum KernelControl {
     Retry(InputId),
     Pause(JobId),
@@ -45,7 +52,7 @@ pub(crate) enum KernelControl {
     ResolveWrite { call: CallId, result: ToolOutcome },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Routing {
     pub requester: Requester,
     pub inputs: Vec<InputId>,
@@ -55,31 +62,29 @@ pub(crate) struct Routing {
     pub state: RoutingState,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RoutingState {
     Ready,
     WaitingInquiry(Seq),
-    WaitingJob(JobId),
     WaitingForUser(Seq),
     Failed(Seq),
     Closed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum ReplyTarget {
     Routing(Seq),
     Job(JobId),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Inquiry {
     pub requester: DeliveryTarget,
     pub target: JobId,
-    pub target_revision: u64,
     pub deadline: MonoTime,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum CallTask {
     Coordinate {
         routing: Seq,
@@ -94,6 +99,13 @@ enum CallTask {
         job: JobId,
         revision: u64,
         through: Seq,
+        source_bytes: usize,
+    },
+    SessionCompact {
+        requester: DeliveryTarget,
+        through: Seq,
+        previous_through: Seq,
+        source_bytes: usize,
     },
     Tool {
         job: JobId,
@@ -104,7 +116,7 @@ enum CallTask {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum CallState {
     Running,
     CancelRequested,
@@ -112,7 +124,7 @@ enum CallState {
     ToolFinished(Arc<ToolOutcome>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CallEntry {
     task: CallTask,
     state: CallState,
@@ -154,14 +166,14 @@ impl CallEntry {
         match &self.task {
             CallTask::Coordinate { .. } => CallKind::Coordinate,
             CallTask::Work { .. } => CallKind::Work,
-            CallTask::Compact { .. } => CallKind::Compact,
+            CallTask::Compact { .. } | CallTask::SessionCompact { .. } => CallKind::Compact,
             CallTask::Tool { .. } => CallKind::Tool,
         }
     }
 
     fn job(&self) -> Option<JobId> {
         match &self.task {
-            CallTask::Coordinate { .. } => None,
+            CallTask::Coordinate { .. } | CallTask::SessionCompact { .. } => None,
             CallTask::Work { job, .. }
             | CallTask::Compact { job, .. }
             | CallTask::Tool { job, .. } => Some(*job),
@@ -170,7 +182,7 @@ impl CallEntry {
 
     fn revision(&self) -> u64 {
         match &self.task {
-            CallTask::Coordinate { .. } => 0,
+            CallTask::Coordinate { .. } | CallTask::SessionCompact { .. } => 0,
             CallTask::Work { revision, .. }
             | CallTask::Compact { revision, .. }
             | CallTask::Tool { revision, .. } => *revision,
@@ -219,21 +231,31 @@ impl CallEntry {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Kernel {
+    #[serde(skip)]
     pub limits: AgentLimits,
-    pub background: Arc<BootstrapContext>,
     pub jobs: BTreeMap<JobId, Job>,
     pub inputs: BTreeMap<InputId, InputEntry>,
     pub calls: BTreeMap<CallId, CallEntry>,
+    #[serde(skip)]
     pub records: BTreeMap<Seq, Arc<Record>>,
     pub inquiries: BTreeMap<Seq, Inquiry>,
     pub routings: BTreeMap<Seq, Routing>,
+    #[serde(skip)]
     pub tools: BTreeMap<String, ToolSpec>,
     pub constraints: String,
+    pub constraints_revision: u64,
+    pub epoch: u64,
     pub user_question: Option<JobId>,
+    #[serde(skip)]
     suspended: bool,
+    #[serde(skip)]
     interactive_ready: VecDeque<JobId>,
+    #[serde(skip)]
     background_ready: VecDeque<JobId>,
+    #[serde(skip)]
     routing_ready: VecDeque<Seq>,
     next_job: u64,
     next_call: u64,
@@ -241,25 +263,11 @@ pub(crate) struct Kernel {
 }
 
 impl Kernel {
-    #[cfg(test)]
     pub fn new(limits: AgentLimits, tools: Vec<ToolSpec>) -> Result<Self, KernelError> {
-        Self::with_background(limits, tools, BootstrapContext::default())
-    }
-
-    pub fn with_background(
-        limits: AgentLimits,
-        tools: Vec<ToolSpec>,
-        background: BootstrapContext,
-    ) -> Result<Self, KernelError> {
         limits.validate()?;
-        if serde_json::to_vec(&background).map_or(true, |value| value.len() > limits.context_bytes)
-        {
-            return Err(KernelError::BackgroundTooLarge);
-        }
         let registry = tool_registry(tools)?;
         Ok(Self {
             limits,
-            background: Arc::new(background),
             jobs: BTreeMap::new(),
             inputs: BTreeMap::new(),
             calls: BTreeMap::new(),
@@ -268,6 +276,8 @@ impl Kernel {
             routings: BTreeMap::new(),
             tools: registry,
             constraints: String::new(),
+            constraints_revision: 0,
+            epoch: 0,
             user_question: None,
             suspended: false,
             interactive_ready: VecDeque::new(),
@@ -326,9 +336,7 @@ impl Kernel {
                 && self.input(entry.accepted_at).reply_to.is_some()
                 && matches!(
                     self.routings[&entry.routing].state,
-                    RoutingState::Ready
-                        | RoutingState::WaitingInquiry(_)
-                        | RoutingState::WaitingJob(_)
+                    RoutingState::Ready | RoutingState::WaitingInquiry(_)
                 )
         });
         if reply.is_some() && pending_reply
@@ -376,6 +384,10 @@ impl Kernel {
             Some(ReplyTarget::Job(job)) => BTreeSet::from([job]),
             _ => BTreeSet::new(),
         };
+        let pending_review_by = match reply {
+            Some(ReplyTarget::Job(job)) => Some(job),
+            _ => None,
+        };
         let receipt = InputReceipt {
             id: input.id,
             accepted_at: input_record.seq,
@@ -386,6 +398,7 @@ impl Kernel {
                 accepted_at: input_record.seq,
                 finished: None,
                 required_jobs,
+                pending_review_by,
                 routing,
             },
         );
@@ -470,13 +483,11 @@ impl Kernel {
     ) -> Result<Vec<Effect>, KernelError> {
         limits.validate()?;
         let tools = tool_registry(tools)?;
-        let background = trim_background(&self.background, limits.context_bytes)?;
 
         let mut effects = Vec::new();
         self.expire(now, &mut effects);
         self.limits = limits;
         self.tools = tools;
-        self.background = background;
 
         self.revoke_model_calls(&mut effects);
 
@@ -543,6 +554,7 @@ impl Kernel {
                         self.enqueue_job(*job);
                     }
                 }
+                CallTask::SessionCompact { .. } => {}
                 CallTask::Tool { .. } => unreachable!(),
             }
             self.cancel_call(call, effects);
@@ -660,9 +672,7 @@ impl Kernel {
                 _ => unreachable!("failed routing points to its audit record"),
             },
             RoutingState::Closed => InputStatus::Handled,
-            RoutingState::Ready | RoutingState::WaitingInquiry(_) | RoutingState::WaitingJob(_) => {
-                InputStatus::Routing
-            }
+            RoutingState::Ready | RoutingState::WaitingInquiry(_) => InputStatus::Routing,
         }
     }
 
@@ -791,27 +801,6 @@ fn tool_registry(tools: Vec<ToolSpec>) -> Result<BTreeMap<String, ToolSpec>, Ker
     Ok(registry)
 }
 
-fn trim_background(
-    background: &Arc<BootstrapContext>,
-    context_bytes: usize,
-) -> Result<Arc<BootstrapContext>, KernelError> {
-    if serde_json::to_vec(background).is_ok_and(|value| value.len() <= context_bytes) {
-        return Ok(Arc::clone(background));
-    }
-    let mut background = background.as_ref().clone();
-    background.omitted = true;
-    while !background.entries.is_empty()
-        && serde_json::to_vec(&background).map_or(true, |value| value.len() > context_bytes)
-    {
-        background.entries.remove(0);
-    }
-    if serde_json::to_vec(&background).is_ok_and(|value| value.len() <= context_bytes) {
-        Ok(Arc::new(background))
-    } else {
-        Err(KernelError::BackgroundTooLarge)
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum KernelError {
     #[error(transparent)]
@@ -820,6 +809,4 @@ pub(crate) enum KernelError {
     InvalidToolName,
     #[error("duplicate tool: {0}")]
     DuplicateTool(String),
-    #[error("bootstrap context exceeds context_bytes")]
-    BackgroundTooLarge,
 }

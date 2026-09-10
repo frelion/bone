@@ -91,14 +91,13 @@ async fn provider_assembly_completes_an_input_and_preserves_history_after_reopen
         .submit(SubmitInput::new("complete this offline"))
         .await
         .unwrap();
-    let mut assignment = Assignment::new(JobSpec::new("offline assembly", "session", "finished"));
-    assignment.inputs = vec![bone_core::InputId(receipt.input.0)];
     transports[0].set_response(MockHttpResponse::success(submission_response(
         "submit_coordination",
-        json!(KernelDecision::Apply {
-            changes: vec![JobChange::Create(assignment)],
-            constraints: None,
-        }),
+        json!(KernelDecision::Assign(vec![RouteDelivery {
+            inputs: vec![bone_core::InputId(receipt.input.0)],
+            target: RouteTarget::New,
+            handoff: "offline assembly".into(),
+        }])),
     )));
 
     let selections = [
@@ -191,10 +190,34 @@ async fn provider_assembly_completes_an_input_and_preserves_history_after_reopen
             .count(),
         1
     );
+
+    let next_input = receipt.input.0 + 1;
+    transports[0].set_response(MockHttpResponse::success(submission_response(
+        "submit_coordination",
+        json!(KernelDecision::Assign(vec![RouteDelivery {
+            inputs: vec![bone_core::InputId(next_input)],
+            target: RouteTarget::New,
+            handoff: "continue after durable restart".into(),
+        }])),
+    )));
+    let second = session
+        .submit(SubmitInput::new("continue after reopening"))
+        .await
+        .unwrap();
+    assert_eq!(second.input.0, next_input);
+    assert_completed(wait_for_input(&session, second.input).await);
+
+    let coordinator_requests = transports[0].requests();
+    assert_eq!(coordinator_requests.len(), 2);
+    let body: Value = serde_json::from_slice(&coordinator_requests[1].body).unwrap();
+    let context = body["input"][0]["content"][0]["text"]
+        .as_str()
+        .expect("restored coordinator context should be text");
+    assert!(context.contains("continue after reopening"));
     assert!(
-        transports
-            .iter()
-            .all(|transport| transport.requests().len() == 1)
+        context.contains("offline assembly completed"),
+        "durable Session memory omitted the prior root outcome"
     );
+    assert_eq!(transports[1].requests().len(), 2);
     reopened.shutdown().await.unwrap();
 }

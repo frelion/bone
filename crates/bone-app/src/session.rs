@@ -35,6 +35,7 @@ const HISTORY_PAGE_LIMIT: usize = 32;
 pub struct Session {
     id: SessionId,
     commands: mpsc::Sender<Command>,
+    shutdown_target: watch::Receiver<Option<Agent>>,
     view: watch::Receiver<Arc<SessionView>>,
     closed: Arc<AtomicBool>,
     clean_shutdown: Arc<OnceLock<CloseReport>>,
@@ -173,6 +174,7 @@ impl Session {
         Arc::make_mut(&mut initial).history_through = store.history_through(id)?;
         let (view_tx, view) = watch::channel(initial);
         let (commands, receiver) = mpsc::channel(COMMAND_QUEUE);
+        let (shutdown_target_tx, shutdown_target) = watch::channel(None);
         let clean_shutdown = Arc::new(OnceLock::new());
         tokio::spawn(
             SessionTask {
@@ -190,6 +192,8 @@ impl Session {
                 write_gate,
                 view: view_tx,
                 commands: receiver,
+                shutdown_target: shutdown_target_tx,
+                durable_gate: Arc::new(tokio::sync::Mutex::new(())),
                 command_tx: commands.downgrade(),
                 clean_shutdown: Arc::clone(&clean_shutdown),
                 lease,
@@ -199,6 +203,7 @@ impl Session {
         Ok(Self {
             id,
             commands,
+            shutdown_target,
             view,
             closed,
             clean_shutdown,
@@ -230,11 +235,49 @@ impl Session {
         command: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
     ) -> Result<T> {
         let (reply, result) = oneshot::channel();
-        self.commands
-            .send(command(reply))
-            .await
-            .map_err(|_| Error::Closed)?;
-        result.await.map_err(|_| Error::Closed)?
+        let command = command(reply);
+        let closing = matches!(
+            command,
+            Command::CloseRuntime { .. } | Command::Shutdown { .. }
+        );
+        let request = async {
+            self.commands
+                .send(command)
+                .await
+                .map_err(|_| Error::Closed)?;
+            result.await.map_err(|_| Error::Closed)?
+        };
+        if closing {
+            with_shutdown_forwarding(self.shutdown_target.clone(), request).await
+        } else {
+            request.await
+        }
+    }
+}
+
+async fn with_shutdown_forwarding<T>(
+    mut targets: watch::Receiver<Option<Agent>>,
+    request: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    // RuntimeReady may install Core after the close request is queued, then
+    // block the session actor on a commit. Watch future installations as well
+    // as the current runtime; this forwarding future lives only as long as the
+    // request, and forwards once per watch update rather than spawning tasks.
+    let forward = async {
+        loop {
+            let agent = targets.borrow_and_update().clone();
+            if let Some(agent) = agent {
+                let _ = agent.shutdown().await;
+            }
+            if targets.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::pin!(request);
+    tokio::select! {
+        result = &mut request => result,
+        _ = forward => request.await,
     }
 }
 
@@ -311,6 +354,7 @@ struct StartingRuntime {
 struct RuntimeReady {
     id: RuntimeId,
     config: RuntimeConfig,
+    archive_from: u64,
     result: Result<(Agent, bone_core::Observation)>,
 }
 
@@ -329,6 +373,8 @@ struct SessionTask {
     write_gate: Arc<tools::WriteGate>,
     view: watch::Sender<Arc<SessionView>>,
     commands: mpsc::Receiver<Command>,
+    shutdown_target: watch::Sender<Option<Agent>>,
+    durable_gate: Arc<tokio::sync::Mutex<()>>,
     command_tx: mpsc::WeakSender<Command>,
     clean_shutdown: Arc<OnceLock<CloseReport>>,
     lease: Arc<Lease>,
@@ -344,6 +390,7 @@ impl SessionTask {
         if self.runtime.is_some() {
             let _ = self.close_runtime().await;
         }
+        self.shutdown_target.send_replace(None);
     }
 
     async fn handle(&mut self, command: Command) -> bool {
@@ -662,7 +709,10 @@ impl SessionTask {
         };
         drop(write_guard);
         if let Some(runtime) = &self.runtime
-            && runtime.id == target.runtime
+            && self
+                .store
+                .core_call_origin(self.info.id, bone_core::CallId(target.id))?
+                == Some(target)
         {
             runtime
                 .agent
@@ -930,18 +980,19 @@ impl SessionTask {
         let config = self.resolve_config()?;
         let runtime_id = RuntimeId::new();
         let ports = self.runtime_tools(&config, runtime_id)?;
-        let pending = self
-            .inputs
-            .values()
-            .filter(|input| matches!(input.state, InputState::Queued { .. }))
-            .map(|input| input.id)
-            .collect::<Vec<_>>();
-        let background = tools::background(
-            &self.store,
+        let commit_guard = self
+            .durable_gate
+            .try_lock()
+            .map_err(|_| Error::Agent("previous durable commit is still pending".into()))?;
+        let restore = self.store.load_core_restore(self.info.id)?;
+        let archive_from = self.store.core_projection_through(self.info.id)?;
+        let durable = self.store.core_durable_port(
             self.info.id,
-            config.limits.context_bytes,
-            &pending,
-        )?;
+            runtime_id,
+            Arc::clone(&self.lease),
+            Arc::clone(&self.durable_gate),
+        );
+        drop(commit_guard);
         self.runtime_state = RuntimeState::Starting;
         self.problem = None;
 
@@ -952,12 +1003,14 @@ impl SessionTask {
         let task = tokio::spawn(async move {
             let result = async {
                 let model = backend.connect(&ready_config).await?;
-                let agent = Agent::with_ports_and_background(
+                let agent = Agent::with_durable_ports(
                     model,
                     ports,
                     ready_config.limits.clone(),
-                    background,
+                    durable,
+                    restore,
                 )
+                .await
                 .map_err(|error| Error::Agent(error.to_string()))?;
                 let observation = agent.observe().await.map_err(agent_error)?;
                 Ok((agent, observation))
@@ -967,6 +1020,7 @@ impl SessionTask {
                 .send(RuntimeReady {
                     id: runtime_id,
                     config: ready_config,
+                    archive_from,
                     result,
                 })
                 .is_err()
@@ -1026,13 +1080,14 @@ impl SessionTask {
         };
         match ready.result {
             Ok((agent, observation)) => {
+                let agent_through = ready.archive_from;
                 let saved_runtime = SavedRuntime {
                     id: ready.id,
                     config: ready.config.clone(),
                 };
-                if let Err(error) = self
-                    .store
-                    .start_runtime(self.info.id, saved_runtime.clone())
+                if let Err(error) =
+                    self.store
+                        .start_runtime(self.info.id, saved_runtime.clone(), agent_through)
                 {
                     let _ = agent.shutdown().await;
                     self.runtime_state = RuntimeState::Detached;
@@ -1041,11 +1096,12 @@ impl SessionTask {
                 }
                 self.runtime = Some(RunningRuntime {
                     id: ready.id,
-                    agent,
-                    agent_through: 0,
+                    agent: agent.clone(),
+                    agent_through,
                     view: observation.baseline,
                     dirty: Arc::new(AtomicBool::new(false)),
                 });
+                self.shutdown_target.send_replace(Some(agent));
                 self.runtime_state = RuntimeState::Running {
                     id: ready.id,
                     config: Box::new(ready.config),
@@ -1058,6 +1114,10 @@ impl SessionTask {
                     self.command_tx.clone(),
                     dirty,
                 );
+                if let Err(error) = self.refresh_runtime().await {
+                    self.record_execution_error(&error).await;
+                    return;
+                }
                 if let Err(error) = self.deliver_queued().await {
                     self.record_execution_error(&error).await;
                 }
@@ -1129,9 +1189,13 @@ impl SessionTask {
             .cloned()
             .collect::<Vec<_>>();
         for record in records {
-            let changes = input_changes(runtime_id, &record, &self.inputs);
+            let record_runtime = self
+                .store
+                .core_record_origin(self.info.id, record.seq.0)?
+                .ok_or(Error::Agent("Core record has no runtime provenance".into()))?;
+            let changes = input_changes(record_runtime, &record, &self.inputs);
             self.store
-                .save_agent_record(self.info.id, runtime_id, &record, &changes)?;
+                .save_agent_record(self.info.id, record_runtime, &record, &changes)?;
             for (id, state) in changes {
                 if state.terminal() {
                     self.inputs.remove(&id);
@@ -1139,9 +1203,19 @@ impl SessionTask {
                     input.state = state;
                 }
             }
-            if let Some((call, job)) = write_job(runtime_id, &record) {
-                self.store
-                    .attach_write_job(self.info.workspace, call, job)?;
+            if let Some((call, job)) = write_job(runtime_id, &record)
+                && let Some(origin) = self
+                    .store
+                    .core_call_origin(self.info.id, bone_core::CallId(call.id))?
+            {
+                self.store.attach_write_job(
+                    self.info.workspace,
+                    origin,
+                    JobRef {
+                        runtime: origin.runtime,
+                        id: job.id,
+                    },
+                )?;
             }
             if let Some(runtime) = &mut self.runtime
                 && runtime.id == runtime_id
@@ -1162,12 +1236,9 @@ impl SessionTask {
                         external_effect: ExternalEffect::Unknown,
                         ..
                     }
-                ) {
-                    self.resolve_known_write(CallRef {
-                        runtime: runtime_id,
-                        id: call.id.0,
-                    })
-                    .await?;
+                ) && let Some(origin) = self.store.core_call_origin(self.info.id, call.id)?
+                {
+                    self.resolve_known_write(origin).await?;
                 }
             }
         }
@@ -1175,14 +1246,24 @@ impl SessionTask {
     }
 
     async fn resolve_known_write(&self, call: CallRef) -> Result<()> {
-        let Some(runtime) = self
-            .runtime
-            .as_ref()
-            .filter(|runtime| runtime.id == call.runtime)
-        else {
+        let Some(runtime) = self.runtime.as_ref() else {
             return Ok(());
         };
-        let Some(outcome) = self.store.finished_write(self.info.workspace, call)? else {
+        if self
+            .store
+            .core_call_origin(self.info.id, bone_core::CallId(call.id))?
+            != Some(call)
+        {
+            return Ok(());
+        }
+        let outcome = match self.store.finished_write(self.info.workspace, call)? {
+            Some(outcome) => Some(outcome),
+            None => self
+                .store
+                .resolved_write_effect(self.info.workspace, self.info.id, call)?
+                .map(host_resolution_outcome),
+        };
+        let Some(outcome) = outcome else {
             return Ok(());
         };
         let view = runtime.agent.observe().await.map_err(agent_error)?.baseline;
@@ -1209,8 +1290,22 @@ impl SessionTask {
     async fn close_runtime(&mut self) -> Result<CloseReport> {
         let _ = self.cancel_start().await;
         let Some(runtime) = &self.runtime else {
+            let guard = self.durable_gate.try_lock().map_err(|_| {
+                Error::Agent(
+                    "startup durable commit is still pending; close is not confirmed".into(),
+                )
+            })?;
+            let (_, inputs) = self.store.recover_session(self.info.id)?;
+            self.inputs = inputs
+                .into_iter()
+                .filter(|input| !input.state.terminal())
+                .map(|input| (input.id, input))
+                .collect();
+            drop(guard);
             self.runtime_state = RuntimeState::Detached;
             self.config_blocked = false;
+            self.execution_blocked = false;
+            self.problem = None;
             self.publish()?;
             return Ok(CloseReport {
                 unresolved_writes: tools::unresolved_after_write_gate(
@@ -1227,6 +1322,36 @@ impl SessionTask {
         self.runtime_state = RuntimeState::Closing { id };
         self.publish()?;
         let report = agent.shutdown().await.map_err(agent_error)?;
+        if let Some(commit) = &report.pending_commit {
+            let guard = self.durable_gate.try_lock().map_err(|_| {
+                Error::Agent(format!(
+                    "durable commit {commit} is still pending; close is not confirmed"
+                ))
+            })?;
+            let (_, inputs) = self.store.recover_session(self.info.id)?;
+            self.inputs = inputs
+                .into_iter()
+                .filter(|input| !input.state.terminal())
+                .map(|input| (input.id, input))
+                .collect();
+            self.runtime = None;
+            self.shutdown_target.send_replace(None);
+            self.runtime_state = RuntimeState::Detached;
+            self.config_blocked = false;
+            self.execution_blocked = false;
+            self.problem = None;
+            drop(guard);
+            self.publish()?;
+            return Ok(CloseReport {
+                unresolved_writes: tools::unresolved_after_write_gate(
+                    &self.store,
+                    &self.write_gate,
+                    self.info.workspace,
+                    Some(self.info.id),
+                )
+                .await?,
+            });
+        }
         self.archive_snapshot(report.final_view, false).await?;
         for write in report.unresolved_writes {
             self.store.attach_write_job(
@@ -1243,8 +1368,11 @@ impl SessionTask {
         }
         self.store.close_runtime(self.info.id, id)?;
         self.runtime = None;
+        self.shutdown_target.send_replace(None);
         self.runtime_state = RuntimeState::Detached;
         self.config_blocked = false;
+        self.execution_blocked = false;
+        self.problem = None;
         self.publish()?;
         Ok(CloseReport {
             unresolved_writes: tools::unresolved_after_write_gate(
@@ -1603,5 +1731,91 @@ fn reconfigure_error(error: AgentError) -> Error {
             Error::Configuration(ConfigProblem::Invalid(message))
         }
         error => agent_error(error),
+    }
+}
+
+#[cfg(test)]
+mod shutdown_forwarding_tests {
+    use super::*;
+    use bone_core::{
+        AgentLimits, CallContext, CheckpointDraft, CompactInput, CoordinateInput, KernelDecision,
+        ModelPort, PortFuture, WorkInput, WorkProposal,
+    };
+    use std::{future::pending, time::Duration};
+
+    struct PendingModel(mpsc::UnboundedSender<CallContext>);
+
+    impl ModelPort for PendingModel {
+        fn coordinate(
+            &self,
+            _: CoordinateInput,
+            context: CallContext,
+        ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
+            self.0.send(context).unwrap();
+            Box::pin(pending())
+        }
+
+        fn work(
+            &self,
+            _: WorkInput,
+            _: CallContext,
+        ) -> PortFuture<std::result::Result<WorkProposal, CallError>> {
+            Box::pin(pending())
+        }
+
+        fn compact(
+            &self,
+            _: CompactInput,
+            _: CallContext,
+        ) -> PortFuture<std::result::Result<CheckpointDraft, CallError>> {
+            Box::pin(pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn close_forwards_to_runtime_installed_after_request_and_releases_observer() {
+        let (targets, target) = watch::channel(None);
+        let (queued, queued_rx) = oneshot::channel();
+        let (reply, reply_rx) = oneshot::channel();
+        let request = tokio::spawn(with_shutdown_forwarding(target, async move {
+            let _ = queued.send(());
+            reply_rx.await.map_err(|_| Error::Closed)
+        }));
+        queued_rx.await.unwrap();
+        assert!(targets.borrow().is_none());
+
+        let (contexts, mut received) = mpsc::unbounded_channel();
+        let agent = Agent::with_ports(
+            Arc::new(PendingModel(contexts)),
+            vec![],
+            AgentLimits::default(),
+        )
+        .unwrap();
+        agent
+            .post(AgentInput::new(AgentInputId(1), "work"))
+            .await
+            .unwrap();
+        let mut context = received.recv().await.unwrap();
+        targets.send_replace(Some(agent));
+        tokio::time::timeout(Duration::from_secs(1), context.wait_for_cancellation())
+            .await
+            .expect("close must reach a runtime installed after it was queued");
+        assert!(!request.is_finished(), "App cleanup still owns the reply");
+        reply.send(()).unwrap();
+        request.await.unwrap().unwrap();
+        assert_eq!(
+            targets.receiver_count(),
+            0,
+            "forwarder must not outlive request"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_close_without_runtime_releases_observer() {
+        let (targets, target) = watch::channel(None);
+        with_shutdown_forwarding(target, async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(targets.receiver_count(), 0);
     }
 }

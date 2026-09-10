@@ -137,8 +137,19 @@ pub enum WorkStep {
     Delegate(Vec<Assignment>),
     Wait(Await),
     AskUser(String),
-    Inquire { job: JobId, question: String },
-    Coordinate(String),
+    Inquire {
+        job: JobId,
+        question: String,
+    },
+    ControlOwned {
+        job: JobId,
+        action: OwnedAction,
+    },
+    UpdateConstraints {
+        source: InputId,
+        expected_revision: u64,
+        constraints: String,
+    },
     Read(ReadQuery),
     PublishResult(ReportDraft),
     Reply(String),
@@ -167,36 +178,29 @@ pub enum ReadQuery {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteTarget {
+    Existing(JobId),
+    New,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteDelivery {
+    pub inputs: Vec<InputId>,
+    pub target: RouteTarget,
+    pub handoff: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum KernelDecision {
-    Apply {
-        changes: Vec<JobChange>,
-        constraints: Option<String>,
-    },
+    Assign(Vec<RouteDelivery>),
     Read(ReadQuery),
-    Inquire {
-        job: JobId,
-        question: String,
-    },
-    Investigate(Assignment),
     Clarify(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum JobChange {
-    Create(Assignment),
-    Update {
-        job: JobId,
-        spec: Option<JobSpec>,
-        action: JobAction,
-        inputs: Vec<InputId>,
-        required: bool,
-    },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JobAction {
-    Keep,
+pub enum OwnedAction {
     Pause,
     Resume,
     Cancel,
@@ -259,7 +263,7 @@ pub struct JobView {
     pub report: Option<Seq>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Job {
     pub spec: JobSpec,
     pub inputs: Vec<InputId>,
@@ -272,14 +276,14 @@ pub(crate) struct Job {
     pub report: Option<Seq>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum JobState {
     Ready,
     Waiting(WaitState),
     Finished(Arc<JobOutcome>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum WaitState {
     Tool(CallId),
     Until(MonoTime),
@@ -296,17 +300,18 @@ pub(crate) enum WaitState {
         after: Seq,
     },
     Inquiry(Seq),
+    #[allow(dead_code)]
     Coordination(Seq),
     Commit(PendingStep),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PendingStep {
     pub call: CallId,
     pub step: WorkStep,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct JobContext {
     pub records: VecDeque<Seq>,
     /// Greatest local record sequence supplied to an accepted worker turn.

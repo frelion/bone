@@ -1,5 +1,7 @@
 # BONE Context Engine 设计交接
 
+> 更新（2026-09-09）：本文是历史交接，App-owned Session compaction 等方向已被后续讨论取代。当前实施入口为 [下一次迭代计划](next-iteration-plan.md)，详细设计见 [Context Engine V2](context-engine-v2.md)。
+
 > 日期：2026-09-09
 >
 > 状态：设计尚未定稿；现有 HTML 已被明确否决为主设计稿

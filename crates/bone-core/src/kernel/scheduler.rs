@@ -120,12 +120,32 @@ impl Kernel {
                         .active_call = Some(call);
                     return;
                 }
-                Err(error) => self.fail_routing(routing, error.to_string(), effects),
+                Err(error) => {
+                    if context::session_can_help_coordinate(self, routing)
+                        && self.session_compacting()
+                    {
+                        self.enqueue_routing(routing);
+                        return;
+                    }
+                    if context::session_can_help_coordinate(self, routing)
+                        && let Ok(input) = context::prepare_session_compact(self)
+                    {
+                        self.start_session_compaction(
+                            input,
+                            DeliveryTarget::Routing(routing),
+                            effects,
+                        );
+                        self.enqueue_routing(routing);
+                        return;
+                    }
+                    self.fail_routing(routing, error.to_string(), effects);
+                }
             }
         }
     }
 
     fn schedule_workers(&mut self, effects: &mut Vec<Effect>) {
+        let mut deferred = Vec::new();
         while self.running_workers() < self.limits.worker_slots() {
             let job = self.take_runnable(true).or_else(|| {
                 (self.running_background_workers() < self.limits.background_workers)
@@ -156,10 +176,20 @@ impl Kernel {
                     self.jobs.get_mut(&job).expect("job exists").active_call = Some(call);
                 }
                 PreparedWork::Compact(input) => {
+                    if input.scope == crate::CompactScope::Session {
+                        if !self.session_compacting() {
+                            self.start_session_compaction(input, DeliveryTarget::Job(job), effects);
+                        }
+                        deferred.push(job);
+                        continue;
+                    }
                     let call = self.start_compaction(input, effects);
                     self.jobs.get_mut(&job).expect("job exists").active_call = Some(call);
                 }
             }
+        }
+        for job in deferred {
+            self.enqueue_job(job);
         }
     }
 
@@ -197,10 +227,21 @@ impl Kernel {
         input: crate::CompactInput,
         effects: &mut Vec<Effect>,
     ) -> CallId {
+        let crate::CompactScope::Job { job, revision } = input.scope else {
+            unreachable!()
+        };
+        let source_bytes = serde_json::to_vec(&input.records)
+            .expect("records serialize")
+            .len()
+            + input
+                .previous
+                .as_ref()
+                .map_or(0, |previous| previous.summary.len());
         let task = CallTask::Compact {
-            job: input.job,
-            revision: input.revision,
+            job,
+            revision,
             through: input.through,
+            source_bytes,
         };
         self.start_call(
             task,
@@ -208,6 +249,42 @@ impl Kernel {
             self.limits.work_timeout,
             effects,
         )
+    }
+
+    fn session_compacting(&self) -> bool {
+        self.calls
+            .values()
+            .any(|call| call.running() && matches!(call.task, CallTask::SessionCompact { .. }))
+    }
+
+    fn start_session_compaction(
+        &mut self,
+        input: crate::CompactInput,
+        requester: DeliveryTarget,
+        effects: &mut Vec<Effect>,
+    ) {
+        let source_bytes = serde_json::to_vec(&input.records)
+            .expect("records serialize")
+            .len()
+            + input
+                .previous
+                .as_ref()
+                .map_or(0, |previous| previous.summary.len());
+        let task = CallTask::SessionCompact {
+            requester,
+            through: input.through,
+            previous_through: input
+                .previous
+                .as_ref()
+                .map_or(Seq::ZERO, |previous| previous.through),
+            source_bytes,
+        };
+        self.start_call(
+            task,
+            Call::Compact(input),
+            self.limits.work_timeout,
+            effects,
+        );
     }
 
     pub(super) fn start_call(
@@ -386,6 +463,84 @@ impl Kernel {
         result: Result<crate::CheckpointDraft, CallError>,
         effects: &mut Vec<Effect>,
     ) {
+        if let Some(entry) = self.calls.get(&call).cloned()
+            && let CallTask::SessionCompact {
+                requester,
+                through,
+                previous_through,
+                source_bytes,
+            } = entry.task
+        {
+            if !entry.running() {
+                return;
+            }
+            let eligible = matches!(entry.state, CallState::Running);
+            self.finish_model_call(call, result.as_ref().err().cloned(), effects);
+            if !eligible {
+                self.discard_model_result::<()>(call, effects);
+                return;
+            }
+            if context::session_checkpoint(self)
+                .as_ref()
+                .map_or(Seq::ZERO, |cp| cp.through)
+                != previous_through
+            {
+                return;
+            }
+            let result = result.and_then(|draft| {
+                let bytes = serde_json::to_vec(&draft).expect("draft serializes").len();
+                if draft.summary.trim().is_empty()
+                    || bytes > context::compact_output_bytes(self)
+                    || bytes >= source_bytes
+                    || !draft.evidence.iter().all(|seq| {
+                        *seq <= through
+                            && self
+                                .records
+                                .get(seq)
+                                .is_some_and(|record| context::session_public(self, record))
+                    })
+                {
+                    Err(CallError::failed(
+                        "session checkpoint invalid or made no compression progress",
+                    ))
+                } else {
+                    Ok(draft)
+                }
+            });
+            match result {
+                Ok(draft) => {
+                    self.record(
+                        Origin::Call(call),
+                        RecordBody::SessionCheckpoint {
+                            checkpoint: Arc::new(crate::SessionCheckpoint {
+                                through,
+                                summary: draft.summary,
+                                evidence: draft.evidence,
+                            }),
+                        },
+                        effects,
+                    );
+                }
+                Err(error) => match requester {
+                    DeliveryTarget::Routing(routing) => {
+                        if self
+                            .routings
+                            .get(&routing)
+                            .is_some_and(|route| route.state != RoutingState::Closed)
+                        {
+                            self.fail_routing(routing, error.message, effects);
+                        }
+                    }
+                    DeliveryTarget::Job(job) => self.finish_job(
+                        job,
+                        OutcomeKind::Failed,
+                        Completion::new(error.message),
+                        effects,
+                    ),
+                },
+            }
+            return;
+        }
         let Some((job, entry)) = self.finish_job_call(
             call,
             CallKind::Compact,
@@ -504,11 +659,21 @@ impl Kernel {
         effects: &mut Vec<Effect>,
     ) {
         let (revision, through) = call_entry.compact_context();
-        if draft.summary.trim().is_empty()
+        let previous = self.jobs[&job].context.checkpoint.as_ref();
+        let after = previous.map_or(Seq::ZERO, |checkpoint| checkpoint.through);
+        let source_bytes = match call_entry.task {
+            CallTask::Compact { source_bytes, .. } => source_bytes,
+            _ => unreachable!(),
+        };
+        let draft_bytes = serde_json::to_vec(&draft).expect("draft serializes").len();
+        if through <= after
+            || draft_bytes >= source_bytes
+            || draft_bytes > context::compact_output_bytes(self)
+            || draft.summary.trim().is_empty()
             || !draft
                 .evidence
                 .iter()
-                .all(|seq| self.can_read_record(job, *seq))
+                .all(|seq| *seq <= through && self.can_read_record(job, *seq))
             || self.validate_model_item("checkpoint", &draft).is_err()
         {
             self.finish_job(

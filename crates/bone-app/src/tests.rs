@@ -12,9 +12,9 @@ use std::{
 
 use bone_adapters::llm::{EndpointConfig, service::chatgpt_subscription::ChatGptAuthCache};
 use bone_core::{
-    Assignment, CallContext, CallError, CheckpointDraft, CompactInput, Completion, CoordinateInput,
-    JobChange, JobSpec, KernelDecision, ModelPort, PortFuture, ToolCall, ToolEffect, ToolPort,
-    ToolSpec, WorkInput, WorkProposal, WorkStep,
+    CallContext, CallError, CheckpointDraft, CompactInput, Completion, CoordinateInput,
+    KernelDecision, ModelPort, PortFuture, RecordBody, RouteDelivery, RouteTarget, ToolCall,
+    ToolEffect, ToolPort, ToolSpec, WorkInput, WorkProposal, WorkStep,
 };
 use serde_json::json;
 use tokio::sync::{Notify, Semaphore};
@@ -23,6 +23,23 @@ use crate::{persistence::ResolveWriteResult, *};
 
 mod assembly;
 mod persistence_faults;
+
+fn route_input(input: &CoordinateInput, handoff: impl Into<String>) -> KernelDecision {
+    KernelDecision::Assign(vec![RouteDelivery {
+        inputs: input.inputs.iter().map(|input| input.id).collect(),
+        target: RouteTarget::New,
+        handoff: handoff.into(),
+    }])
+}
+
+fn has_routing_handoff(input: &WorkInput, expected: &str) -> bool {
+    input.records.iter().any(|record| {
+        matches!(
+            serde_json::from_str::<RecordBody>(&record.content),
+            Ok(RecordBody::RoutingHandoff { text, .. }) if text == expected
+        )
+    })
+}
 
 struct CompletingModel {
     work_calls: AtomicUsize,
@@ -34,15 +51,8 @@ impl ModelPort for CompletingModel {
         input: CoordinateInput,
         _: CallContext,
     ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let inputs = input.inputs.iter().map(|input| input.id).collect();
-        let mut assignment = Assignment::new(JobSpec::new("answer", "session", "answered"));
-        assignment.inputs = inputs;
-        Box::pin(async move {
-            Ok(KernelDecision::Apply {
-                changes: vec![JobChange::Create(assignment)],
-                constraints: None,
-            })
-        })
+        let decision = route_input(&input, "answer");
+        Box::pin(async move { Ok(decision) })
     }
 
     fn work(
@@ -79,14 +89,8 @@ impl ModelPort for PatchingModel {
         input: CoordinateInput,
         _: CallContext,
     ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let mut assignment = Assignment::new(JobSpec::new("patch", "workspace", "file exists"));
-        assignment.inputs = input.inputs.iter().map(|input| input.id).collect();
-        Box::pin(async move {
-            Ok(KernelDecision::Apply {
-                changes: vec![JobChange::Create(assignment)],
-                constraints: None,
-            })
-        })
+        let decision = route_input(&input, "patch");
+        Box::pin(async move { Ok(decision) })
     }
 
     fn work(
@@ -184,14 +188,8 @@ impl ModelPort for SelectiveBarrierModel {
         _: CallContext,
     ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
         let goal = input.inputs[0].text.clone();
-        let mut assignment = Assignment::new(JobSpec::new(goal, "session", "finished"));
-        assignment.inputs = input.inputs.iter().map(|input| input.id).collect();
-        Box::pin(async move {
-            Ok(KernelDecision::Apply {
-                changes: vec![JobChange::Create(assignment)],
-                constraints: None,
-            })
-        })
+        let decision = route_input(&input, goal);
+        Box::pin(async move { Ok(decision) })
     }
 
     fn work(
@@ -200,7 +198,7 @@ impl ModelPort for SelectiveBarrierModel {
         _: CallContext,
     ) -> PortFuture<std::result::Result<WorkProposal, CallError>> {
         Box::pin(async move {
-            let step = if input.spec.goal == "block" && input.calls.is_empty() {
+            let step = if has_routing_handoff(&input, "block") && input.calls.is_empty() {
                 WorkStep::Tool(ToolCall::new("shutdown_barrier", json!({})))
             } else {
                 WorkStep::Finish(Completion::new("finished"))
@@ -228,14 +226,8 @@ impl ModelPort for PausableWorkModel {
         input: CoordinateInput,
         _: CallContext,
     ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let mut assignment = Assignment::new(JobSpec::new("resume", "session", "finished"));
-        assignment.inputs = input.inputs.iter().map(|input| input.id).collect();
-        Box::pin(async move {
-            Ok(KernelDecision::Apply {
-                changes: vec![JobChange::Create(assignment)],
-                constraints: None,
-            })
-        })
+        let decision = route_input(&input, "resume");
+        Box::pin(async move { Ok(decision) })
     }
 
     fn work(
@@ -269,14 +261,8 @@ impl ModelPort for AlwaysToolModel {
         input: CoordinateInput,
         _: CallContext,
     ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let mut assignment = Assignment::new(JobSpec::new("wait", "session", "released"));
-        assignment.inputs = input.inputs.iter().map(|input| input.id).collect();
-        Box::pin(async move {
-            Ok(KernelDecision::Apply {
-                changes: vec![JobChange::Create(assignment)],
-                constraints: None,
-            })
-        })
+        let decision = route_input(&input, "wait");
+        Box::pin(async move { Ok(decision) })
     }
 
     fn work(
@@ -387,14 +373,8 @@ impl ModelPort for BlockingBashModel {
         input: CoordinateInput,
         _: CallContext,
     ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let mut assignment = Assignment::new(JobSpec::new("write", "workspace", "file exists"));
-        assignment.inputs = input.inputs.iter().map(|input| input.id).collect();
-        Box::pin(async move {
-            Ok(KernelDecision::Apply {
-                changes: vec![JobChange::Create(assignment)],
-                constraints: None,
-            })
-        })
+        let decision = route_input(&input, "write");
+        Box::pin(async move { Ok(decision) })
     }
 
     fn work(
@@ -591,8 +571,17 @@ async fn wait_for_input_state(
     input: InputId,
     matches: impl Fn(&InputState) -> bool,
 ) -> InputView {
+    wait_for_input_state_with_timeout(session, input, matches, Duration::from_secs(3)).await
+}
+
+async fn wait_for_input_state_with_timeout(
+    session: &Session,
+    input: InputId,
+    matches: impl Fn(&InputState) -> bool,
+    timeout: Duration,
+) -> InputView {
     let mut view = session.observe();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(timeout, async {
         loop {
             if let Some(input) = view
                 .borrow()
@@ -714,9 +703,14 @@ async fn input_limit_keeps_the_agent_record_inside_the_journal_envelope() {
         .submit(SubmitInput::new("\0".repeat(1024 * 1024)))
         .await
         .unwrap();
-    wait_for_input_state(&session, receipt.input, |state| {
-        matches!(state, InputState::RoutingFailed { .. })
-    })
+    // A maximum-size NUL input expands to 6 MiB of JSON and exercises multiple
+    // durable writes. This is a capacity check, not a latency requirement.
+    wait_for_input_state_with_timeout(
+        &session,
+        receipt.input,
+        |state| matches!(state, InputState::RoutingFailed { .. }),
+        Duration::from_secs(10),
+    )
     .await;
     assert!(
         app.test_store()
@@ -1218,7 +1212,7 @@ async fn reload_config_recovers_after_credentials_are_repaired() {
 }
 
 #[tokio::test]
-async fn a_rejected_agent_limit_change_can_resume_the_same_job() {
+async fn a_rejected_agent_limit_change_keeps_the_same_job_running() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace_root = temporary.path().join("workspace");
     std::fs::create_dir(&workspace_root).unwrap();
@@ -1248,23 +1242,13 @@ async fn a_rejected_agent_limit_change_can_resume_the_same_job() {
         app.update_config(
             ConfigScope::Session(session.id()),
             ConfigChange::Limits(Some(AgentLimits {
-                context_bytes: 1,
-                item_bytes: 1,
+                context_bytes: 0,
                 ..AgentLimits::default()
             })),
         )
         .await,
-        Err(Error::Configuration(ConfigProblem::Invalid(_)))
+        Err(Error::InvalidState(_))
     ));
-    app.update_config(
-        ConfigScope::Session(session.id()),
-        ConfigChange::Limits(Some(AgentLimits::default())),
-    )
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), barrier.wait_for_started(2))
-        .await
-        .expect("the suspended job should restart after valid limits are restored");
     assert_eq!(session.snapshot().await.unwrap().jobs[0].id, job);
 
     barrier.release.add_permits(1);
@@ -1357,6 +1341,7 @@ async fn resolved_config_does_not_report_a_crashed_runtime_as_live() {
                     id: RuntimeId::new(),
                     config,
                 },
+                0,
             )
             .unwrap();
         session.info.id
@@ -1726,6 +1711,167 @@ async fn a_detached_write_keeps_the_session_lease_until_execution_finishes() {
 }
 
 #[cfg(unix)]
+struct RecoveryWriteModel(std::sync::atomic::AtomicBool);
+
+#[cfg(unix)]
+impl ModelPort for RecoveryWriteModel {
+    fn coordinate(
+        &self,
+        input: CoordinateInput,
+        _: CallContext,
+    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
+        Box::pin(async move { Ok(route_input(&input, "write")) })
+    }
+    fn work(
+        &self,
+        input: WorkInput,
+        _: CallContext,
+    ) -> PortFuture<std::result::Result<WorkProposal, CallError>> {
+        let saw_result = input.records.iter().any(|record| {
+            matches!(
+                serde_json::from_str::<RecordBody>(&record.content),
+                Ok(RecordBody::ToolFinished { .. })
+            )
+        });
+        let step = if saw_result {
+            WorkStep::Finish(Completion::new("finished"))
+        } else {
+            let first = self.0.swap(false, Ordering::SeqCst);
+            WorkStep::Tool(ToolCall::new(
+                "bash",
+                json!({"command": if first { "printf effect > effect.txt; sleep 5" } else { "printf resumed > resumed.txt" }}),
+            ))
+        };
+        Box::pin(async move { Ok(WorkProposal::new(step)) })
+    }
+    fn compact(
+        &self,
+        _: CompactInput,
+        _: CallContext,
+    ) -> PortFuture<std::result::Result<CheckpointDraft, CallError>> {
+        panic!("no compaction expected")
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restored_unknown_write_resolves_against_original_runtime_ledger() {
+    for ledger_completed in [false, true] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let (app, workspace) = app_with_model(
+            &temporary.path().join("data"),
+            &root,
+            Arc::new(RecoveryWriteModel(std::sync::atomic::AtomicBool::new(true))),
+        )
+        .await;
+        app.update_config(
+            ConfigScope::User,
+            ConfigChange::Tools(Some(ToolSettings {
+                mode: ToolMode::WorkspaceWrite,
+                limits: ToolLimits {
+                    default_bash_timeout: Duration::from_secs(1),
+                    max_bash_timeout: Duration::from_secs(1),
+                    ..ToolLimits::default()
+                },
+            })),
+        )
+        .await
+        .unwrap();
+        let session = app
+            .create_session(workspace.id, "recover write identity")
+            .await
+            .unwrap();
+        session
+            .submit(SubmitInput::new("write once"))
+            .await
+            .unwrap();
+        let (original_call, outcome) = wait_for_tool_finished(&session, "bash").await;
+        assert_eq!(outcome.external_effect, ExternalEffect::Unknown);
+        let session_id = session.snapshot().await.unwrap().session.id;
+        session.close_runtime().await.unwrap();
+        if ledger_completed {
+            app.test_store()
+                .resolve_write(
+                    workspace.id,
+                    session_id,
+                    original_call,
+                    WriteResolution {
+                        external_effect: ExternalEffect::Applied,
+                        evidence: "verified while detached".into(),
+                    },
+                )
+                .unwrap();
+        }
+        let next = session
+            .submit(SubmitInput::new("continue after restart"))
+            .await
+            .unwrap();
+        let mut updates = session.observe();
+        let new_runtime = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let RuntimeState::Running { id, .. } = &updates.borrow().runtime {
+                    break *id;
+                }
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(new_runtime, original_call.runtime);
+        if !ledger_completed {
+            assert_eq!(
+                session
+                    .resolve_write(
+                        original_call,
+                        WriteResolution {
+                            external_effect: ExternalEffect::Applied,
+                            evidence: "verified effect.txt".into(),
+                        }
+                    )
+                    .await
+                    .unwrap(),
+                CommandReceipt::Applied
+            );
+        }
+        let finished = wait_for_input(&session, next.input).await;
+        assert!(matches!(
+            finished,
+            InputState::Finished {
+                outcome: bone_core::InputOutcome::Completed,
+                ..
+            }
+        ));
+        let stored = app
+            .test_store()
+            .load_core_restore(session_id)
+            .unwrap()
+            .unwrap();
+        assert!(stored.records.iter().any(|record| matches!(&record.body,
+            RecordBody::ToolFinished { call, outcome, .. } if call.0 == original_call.id && outcome.external_effect == ExternalEffect::Applied
+        )));
+        assert_eq!(
+            app.test_store()
+                .core_call_origin(session_id, bone_core::CallId(original_call.id))
+                .unwrap(),
+            Some(original_call)
+        );
+        assert!(
+            app.unresolved_writes(workspace.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("resumed.txt")).unwrap(),
+            "resumed"
+        );
+        app.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn a_timed_out_bash_write_is_persisted_as_an_unknown_external_effect() {
     let temporary = tempfile::tempdir().unwrap();
@@ -2056,8 +2202,8 @@ fn host_write_resolutions_never_invent_tool_success() {
     }
 }
 
-#[test]
-fn a_finished_write_stays_blocking_until_its_agent_record_is_saved() {
+#[tokio::test]
+async fn a_finished_write_stays_blocking_until_its_agent_record_is_saved() {
     use bone_core::{CallId, JobId, Origin, Record, RecordBody, Seq, ToolOutcome};
 
     let temporary = tempfile::tempdir().unwrap();
@@ -2092,6 +2238,7 @@ fn a_finished_write_stays_blocking_until_its_agent_record_is_saved() {
                 id: runtime,
                 config,
             },
+            0,
         )
         .unwrap();
     let call = CallRef { runtime, id: 7 };
@@ -2120,7 +2267,7 @@ fn a_finished_write_stays_blocking_until_its_agent_record_is_saved() {
     );
 
     let record = Record {
-        seq: Seq(1),
+        seq: Seq(2),
         origin: Origin::Kernel,
         body: RecordBody::ToolFinished {
             job: JobId(3),
@@ -2129,6 +2276,37 @@ fn a_finished_write_stays_blocking_until_its_agent_record_is_saved() {
             outcome: Arc::new(outcome),
         },
     };
+    let started = Arc::new(Record {
+        seq: Seq(1),
+        origin: Origin::Kernel,
+        body: RecordBody::CallStarted {
+            call: CallId(call.id),
+            kind: bone_core::CallKind::Tool,
+            job: Some(JobId(3)),
+            tool: Some(Arc::new(ToolCall::new("apply_patch", json!({})))),
+        },
+    });
+    let durable = store.core_durable_port(
+        session.info.id,
+        runtime,
+        Arc::new(store.claim_session(session.info.id).unwrap()),
+        Arc::new(tokio::sync::Mutex::new(())),
+    );
+    durable
+        .commit(bone_core::DurableCommit {
+            commit_id: "finished-write".into(),
+            expected_revision: 0,
+            snapshot: serde_json::from_value(
+                json!({ "version": 1, "epoch": 0, "through": 2, "payload": {} }),
+            )
+            .unwrap(),
+            records: vec![Arc::clone(&started), Arc::new(record.clone())],
+        })
+        .await
+        .unwrap();
+    store
+        .save_agent_record(session.info.id, runtime, &started, &[])
+        .unwrap();
     store
         .save_agent_record(session.info.id, runtime, &record, &[])
         .unwrap();

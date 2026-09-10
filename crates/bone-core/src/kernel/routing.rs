@@ -1,6 +1,27 @@
 use super::*;
 
 impl Kernel {
+    #[cfg(test)]
+    pub(crate) fn test_add_user_roots(
+        &mut self,
+        now: MonoTime,
+        assignments: Vec<Assignment>,
+        effects: &mut Vec<Effect>,
+    ) {
+        for assignment in assignments {
+            let inputs = assignment.inputs.clone();
+            let job = self.create_job(Owner::User, assignment, effects);
+            for input in inputs {
+                self.inputs
+                    .get_mut(&input)
+                    .expect("test input exists")
+                    .required_jobs
+                    .insert(job);
+            }
+        }
+        self.advance(now, effects);
+    }
+
     pub(super) fn reply_target(&self, input: InputId) -> Option<(ReplyTarget, Seq)> {
         let entry = self.inputs.get(&input)?;
         if let RoutingState::WaitingForUser(question) = self.routings[&entry.routing].state {
@@ -138,7 +159,7 @@ impl Kernel {
 
     pub(super) fn apply_decision(
         &mut self,
-        now: MonoTime,
+        _now: MonoTime,
         routing: Seq,
         decision: KernelDecision,
         effects: &mut Vec<Effect>,
@@ -149,70 +170,27 @@ impl Kernel {
             .cloned()
             .ok_or_else(|| format!("routing {routing} no longer exists"))?;
         match decision {
-            KernelDecision::Apply {
-                changes,
-                constraints,
-            } => {
-                self.validate_changes(&route, &changes, constraints.as_deref())?;
-                if let Some(constraints) = constraints
-                    && self.constraints != constraints
-                {
-                    self.constraints = constraints;
-                    let jobs = self
-                        .jobs
-                        .iter()
-                        .filter_map(|(id, job)| {
-                            (!matches!(job.state, JobState::Finished(_))).then_some(*id)
-                        })
-                        .collect::<Vec<_>>();
-                    for job in jobs {
-                        self.invalidate_job_calls(job, effects);
-                        self.enqueue_job(job);
-                    }
+            KernelDecision::Assign(mut deliveries) => {
+                self.validate_routes(&route, &deliveries)?;
+                for delivery in &mut deliveries {
+                    delivery
+                        .inputs
+                        .sort_by_key(|input| self.inputs[input].accepted_at);
                 }
-                for change in changes {
-                    self.apply_change(route.requester, change, effects);
+                deliveries.sort_by_key(|delivery| {
+                    delivery
+                        .inputs
+                        .first()
+                        .map(|input| self.inputs[input].accepted_at)
+                });
+                for delivery in deliveries {
+                    self.apply_route(delivery, effects);
                 }
                 self.close_routing(routing, effects);
             }
             KernelDecision::Read(query) => {
                 self.validate_read(DeliveryTarget::Routing(routing), &query)?;
                 self.read(DeliveryTarget::Routing(routing), query, effects)?;
-            }
-            KernelDecision::Inquire { job, question } => {
-                if question.trim().is_empty()
-                    || !self.routing_can_access(&route, job)
-                    || self.inquiries.len() >= self.limits.inquiries
-                {
-                    return Err("invalid routing inquiry".into());
-                }
-                self.validate_model_item("routing inquiry", &question)?;
-                self.open_inquiry(
-                    DeliveryTarget::Routing(routing),
-                    job,
-                    question,
-                    now,
-                    effects,
-                );
-            }
-            KernelDecision::Investigate(assignment) => {
-                let source = match route.requester {
-                    Requester::Inputs => None,
-                    Requester::Job { job, .. } => Some(job),
-                };
-                self.validate_assignments(
-                    source,
-                    &route.inputs,
-                    std::slice::from_ref(&assignment),
-                )?;
-                if self.active_jobs() >= self.limits.active_jobs {
-                    return Err("job capacity is full".into());
-                }
-                let job = self.create_job(Owner::Routing(routing), assignment, effects);
-                self.routings
-                    .get_mut(&routing)
-                    .expect("routing exists")
-                    .state = RoutingState::WaitingJob(job);
             }
             KernelDecision::Clarify(question) => {
                 if !matches!(route.requester, Requester::Inputs) || question.trim().is_empty() {
@@ -225,94 +203,113 @@ impl Kernel {
         Ok(())
     }
 
-    fn validate_changes(
+    fn validate_routes(
         &self,
         route: &Routing,
-        changes: &[JobChange],
-        constraints: Option<&str>,
+        deliveries: &[crate::RouteDelivery],
     ) -> Result<(), String> {
-        if constraints.is_some() && !matches!(route.requester, Requester::Inputs) {
-            return Err("worker coordination cannot change session constraints".into());
+        if !matches!(route.requester, Requester::Inputs) {
+            return Err("only user input routing may assign inputs".into());
         }
-        if let Some(constraints) = constraints {
-            self.validate_model_item("session constraints", constraints)?;
+        if deliveries.is_empty() {
+            return Err("routing must assign every input".into());
         }
-        let creates = changes
+        let creates = deliveries
             .iter()
-            .filter(|change| matches!(change, JobChange::Create(_)))
+            .filter(|delivery| matches!(delivery.target, crate::RouteTarget::New))
             .count();
         if self.active_jobs() + creates > self.limits.active_jobs {
             return Err("job capacity is full".into());
         }
-        let source = match route.requester {
-            Requester::Inputs => None,
-            Requester::Job { job, revision } => {
-                if self.jobs.get(&job).is_none_or(|entry| {
-                    entry.revision != revision || matches!(entry.state, JobState::Finished(_))
-                }) {
-                    return Err("coordination source changed".into());
-                }
-                Some(job)
+
+        let allowed = route.inputs.iter().copied().collect::<BTreeSet<_>>();
+        let mut assigned = BTreeSet::new();
+        for delivery in deliveries {
+            if delivery.inputs.is_empty() || delivery.handoff.trim().is_empty() {
+                return Err("each route needs inputs and a non-empty handoff".into());
             }
-        };
-        let mut updated = BTreeSet::new();
-        for change in changes {
-            match change {
-                JobChange::Create(assignment) => self.validate_assignments(
-                    source,
-                    &route.inputs,
-                    std::slice::from_ref(assignment),
-                )?,
-                JobChange::Update {
-                    job,
-                    spec,
-                    action,
-                    inputs,
-                    required,
-                } => {
-                    if !updated.insert(*job) {
-                        return Err(format!("job {job} is updated twice"));
-                    }
-                    let Some(target) = self.jobs.get(job) else {
-                        return Err(format!("job {job} does not exist"));
-                    };
-                    if matches!(target.state, JobState::Finished(_)) {
-                        return Err(format!("job {job} is already finished"));
-                    }
-                    if let Some(source) = source {
-                        if !self.owns(source, *job)
-                            || spec.is_some()
-                            || !inputs.is_empty()
-                            || *required
-                            || matches!(action, JobAction::Resume)
-                        {
-                            return Err("worker coordination exceeds its owned tree".into());
-                        }
-                    } else {
-                        if !inputs.iter().all(|id| route.inputs.contains(id)) {
-                            return Err("job update cites input outside this routing".into());
-                        }
-                        if (spec.is_some() || matches!(action, JobAction::Resume))
-                            && inputs.is_empty()
-                        {
-                            return Err("goal changes and resume require current user input".into());
-                        }
-                    }
-                    if let Some(spec) = spec {
-                        self.validate_spec(spec)?;
-                    }
+            self.validate_model_item("route handoff", &delivery.handoff)?;
+            for input in &delivery.inputs {
+                if !allowed.contains(input) {
+                    return Err("route cites input outside this routing".into());
+                }
+                if !assigned.insert(*input) {
+                    return Err(format!("input {input} is assigned twice"));
+                }
+            }
+            if let crate::RouteTarget::Existing(job) = delivery.target {
+                let Some(target) = self.jobs.get(&job) else {
+                    return Err(format!("job {job} does not exist"));
+                };
+                if target.owner != Owner::User
+                    || target.local_paused
+                    || matches!(target.state, JobState::Finished(_))
+                {
+                    return Err("routing target must be a schedulable user-owned root".into());
                 }
             }
         }
-        for ancestor in &updated {
-            if updated
-                .iter()
-                .any(|descendant| ancestor != descendant && self.owns(*ancestor, *descendant))
-            {
-                return Err("one decision cannot update both an owner and its descendant".into());
-            }
+        if assigned != allowed {
+            return Err("routing must assign every input exactly once".into());
         }
         Ok(())
+    }
+
+    fn apply_route(&mut self, delivery: crate::RouteDelivery, effects: &mut Vec<Effect>) {
+        let job = match delivery.target {
+            crate::RouteTarget::New => {
+                let mut assignment = Assignment::new(JobSpec::new(
+                    "Handle the assigned user request.",
+                    "Handle the assigned user input within its stated boundaries.",
+                    "The assigned user input is answered or completed.",
+                ));
+                assignment.inputs = delivery.inputs.clone();
+                self.create_job(Owner::User, assignment, effects)
+            }
+            crate::RouteTarget::Existing(job) => {
+                self.invalidate_job_call(job, effects);
+                for input in &delivery.inputs {
+                    if !self.jobs[&job].inputs.contains(input) {
+                        self.jobs
+                            .get_mut(&job)
+                            .expect("validated job exists")
+                            .inputs
+                            .push(*input);
+                        let source = self.inputs[input].accepted_at;
+                        self.deliver(
+                            DeliveryTarget::Job(job),
+                            source,
+                            DeliveryKind::Input,
+                            effects,
+                        );
+                    }
+                }
+                job
+            }
+        };
+        for input in &delivery.inputs {
+            self.inputs
+                .get_mut(input)
+                .expect("validated input exists")
+                .required_jobs
+                .insert(job);
+            self.inputs
+                .get_mut(input)
+                .expect("validated input exists")
+                .pending_review_by = Some(job);
+        }
+        let handoff = self.record(
+            Origin::Kernel,
+            RecordBody::RoutingHandoff {
+                job,
+                inputs: delivery.inputs,
+                text: delivery.handoff,
+                previous: context::latest_handoff(self, job),
+            },
+            effects,
+        );
+        self.attach(job, handoff.seq);
+        self.enqueue_job(job);
     }
 
     pub(super) fn validate_assignments(
@@ -360,79 +357,6 @@ impl Kernel {
             Err("job goal, scope and done_when must be non-empty".into())
         } else {
             self.validate_model_item("job spec", spec)
-        }
-    }
-
-    fn apply_change(&mut self, requester: Requester, change: JobChange, effects: &mut Vec<Effect>) {
-        match change {
-            JobChange::Create(assignment) => {
-                let owner = match requester {
-                    Requester::Inputs => Owner::User,
-                    Requester::Job { job, .. } => Owner::Job(job),
-                };
-                let inputs = assignment.inputs.clone();
-                let job = self.create_job(owner, assignment, effects);
-                if matches!(owner, Owner::User) {
-                    for input in inputs {
-                        self.inputs
-                            .get_mut(&input)
-                            .expect("validated input exists")
-                            .required_jobs
-                            .insert(job);
-                    }
-                }
-            }
-            JobChange::Update {
-                job,
-                spec,
-                action,
-                inputs,
-                required,
-            } => {
-                if let Some(spec) = spec {
-                    self.change_spec(job, spec, effects);
-                } else if !inputs.is_empty() {
-                    self.invalidate_job_call(job, effects);
-                }
-                for input in &inputs {
-                    if !self.jobs[&job].inputs.contains(input) {
-                        self.jobs
-                            .get_mut(&job)
-                            .expect("job exists")
-                            .inputs
-                            .push(*input);
-                        let source = self.inputs[input].accepted_at;
-                        self.deliver(
-                            DeliveryTarget::Job(job),
-                            source,
-                            DeliveryKind::Input,
-                            effects,
-                        );
-                    }
-                    if required {
-                        self.inputs
-                            .get_mut(input)
-                            .expect("validated input exists")
-                            .required_jobs
-                            .insert(job);
-                    }
-                }
-                match action {
-                    JobAction::Keep => {}
-                    JobAction::Pause => {
-                        let _ = self.pause(job, effects);
-                    }
-                    JobAction::Resume => {
-                        let _ = self.resume(job, effects);
-                    }
-                    JobAction::Cancel => {
-                        let _ = self.cancel(job, effects);
-                    }
-                }
-                if !matches!(self.jobs[&job].state, JobState::Finished(_)) {
-                    self.enqueue_job(job);
-                }
-            }
         }
     }
 
@@ -688,6 +612,44 @@ impl Kernel {
         }
     }
 
+    pub(super) fn fail_pending_reviews(
+        &mut self,
+        job: JobId,
+        message: String,
+        effects: &mut Vec<Effect>,
+    ) {
+        let mut inputs = self
+            .inputs
+            .iter()
+            .filter_map(|(id, input)| (input.pending_review_by == Some(job)).then_some(*id))
+            .collect::<Vec<_>>();
+        if inputs.is_empty() {
+            return;
+        }
+        inputs.sort_by_key(|input| self.inputs[input].accepted_at);
+
+        let routing = self.open_input_routing(inputs.clone(), Vec::new(), effects);
+        for input in inputs {
+            let entry = self.inputs.get_mut(&input).expect("pending input exists");
+            entry.routing = routing;
+            entry.pending_review_by = None;
+            entry.required_jobs.remove(&job);
+        }
+        self.fail_routing(
+            routing,
+            format!("assigned worker {job} could not review its new input: {message}"),
+            effects,
+        );
+    }
+
+    pub(super) fn clear_pending_reviews(&mut self, job: JobId) {
+        for input in self.inputs.values_mut() {
+            if input.pending_review_by == Some(job) {
+                input.pending_review_by = None;
+            }
+        }
+    }
+
     fn clarify_routing(&mut self, routing: Seq, question: String, effects: &mut Vec<Effect>) {
         let inputs = self.routings[&routing].inputs.clone();
         let clarification = self.record(
@@ -704,44 +666,6 @@ impl Kernel {
             .expect("routing exists")
             .records
             .push(clarification.seq);
-    }
-
-    pub(super) fn open_coordination(
-        &mut self,
-        job: JobId,
-        request: String,
-        effects: &mut Vec<Effect>,
-    ) {
-        let routing = self.peek_seq();
-        let record = self.record(
-            Origin::Job {
-                job,
-                revision: self.jobs[&job].revision,
-            },
-            RecordBody::RoutingStarted {
-                inputs: Vec::new(),
-                source: Some(job),
-            },
-            effects,
-        );
-        debug_assert_eq!(record.seq, routing);
-        self.routings.insert(
-            routing,
-            Routing {
-                requester: Requester::Job {
-                    job,
-                    revision: self.jobs[&job].revision,
-                },
-                inputs: Vec::new(),
-                request: Some(request),
-                records: Vec::new(),
-                active_call: None,
-                state: RoutingState::Ready,
-            },
-        );
-        self.jobs.get_mut(&job).expect("job exists").state =
-            JobState::Waiting(WaitState::Coordination(routing));
-        self.enqueue_routing(routing);
     }
 
     pub(super) fn ask_user(&mut self, job: JobId, question: String, effects: &mut Vec<Effect>) {
@@ -824,6 +748,9 @@ impl Kernel {
         self.routings.values().any(|routing| {
             matches!(routing.requester, Requester::Inputs)
                 && !matches!(routing.state, RoutingState::Closed)
-        })
+        }) || self
+            .inputs
+            .values()
+            .any(|input| input.pending_review_by.is_some())
     }
 }

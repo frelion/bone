@@ -3,9 +3,9 @@
 use std::{error::Error, sync::Arc};
 
 use bone_core::{
-    Agent, AgentLimits, Assignment, CallContext, CallError, CheckpointDraft, CompactInput,
-    CoordinateInput, Input, InputId, InputStatus, JobChange, JobSpec, KernelDecision, ModelPort,
-    PortFuture, WorkInput, WorkProposal, WorkStep,
+    Agent, AgentLimits, CallContext, CallError, CheckpointDraft, CompactInput, CoordinateInput,
+    Input, InputId, InputStatus, KernelDecision, ModelPort, PortFuture, RouteDelivery, RouteTarget,
+    WorkInput, WorkProposal, WorkStep,
 };
 
 struct DemoModel;
@@ -16,17 +16,13 @@ impl ModelPort for DemoModel {
         input: CoordinateInput,
         _: CallContext,
     ) -> PortFuture<Result<KernelDecision, CallError>> {
-        let mut assignment = Assignment::new(JobSpec::new(
-            "answer the request",
-            "the supplied user input",
-            "return a clear answer",
-        ));
-        assignment.inputs = input.inputs.iter().map(|input| input.id).collect();
+        let inputs = input.inputs.iter().map(|input| input.id).collect();
         Box::pin(async move {
-            Ok(KernelDecision::Apply {
-                changes: vec![JobChange::Create(assignment)],
-                constraints: None,
-            })
+            Ok(KernelDecision::Assign(vec![RouteDelivery {
+                inputs,
+                target: RouteTarget::New,
+                handoff: "answer the request".into(),
+            }]))
         })
     }
 

@@ -6,6 +6,7 @@
 
 mod config;
 mod context;
+mod durable;
 mod job;
 mod kernel;
 pub mod model_contract;
@@ -17,10 +18,11 @@ mod tests;
 
 pub use config::{AgentLimits, AgentLimitsError};
 pub use context::{
-    BackgroundEntry, BootstrapContext, Checkpoint, CheckpointDraft, CompactInput, CoordinateInput,
+    BackgroundEntry, Checkpoint, CheckpointDraft, CompactInput, CompactScope, CoordinateInput,
     DeliveryKind, DeliveryTarget, InquiryResult, JobCard, Origin, Record, RecordBody, RecordRange,
-    RecordView, WorkInput, WorkerRole,
+    RecordView, SessionCheckpoint, SessionContext, WorkInput, WorkerRole,
 };
+pub use durable::*;
 pub use job::*;
 pub use ports::*;
 pub use runtime::{Agent, AgentError, Observation, RuntimeError, ShutdownReport, UnresolvedWrite};
@@ -63,7 +65,7 @@ impl Seq {
 }
 
 /// Monotonic time elapsed since one runtime started.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MonoTime(pub Duration);
 
 impl MonoTime {

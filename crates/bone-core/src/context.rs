@@ -37,6 +37,13 @@ pub enum RecordBody {
     RoutingFinished {
         routing: Seq,
     },
+    RoutingHandoff {
+        job: JobId,
+        inputs: Vec<InputId>,
+        text: String,
+        #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+        previous: Option<Seq>,
+    },
     JobCreated {
         job: JobId,
         spec: JobSpec,
@@ -52,6 +59,11 @@ pub enum RecordBody {
     JobControlChanged {
         job: JobId,
         paused: bool,
+    },
+    ConstraintsChanged {
+        source: InputId,
+        revision: u64,
+        constraints: String,
     },
     Note {
         job: JobId,
@@ -101,6 +113,9 @@ pub enum RecordBody {
         source_revision: u64,
         summary: String,
         record_refs: Vec<Seq>,
+    },
+    SessionCheckpoint {
+        checkpoint: Arc<SessionCheckpoint>,
     },
     Checkpoint {
         job: JobId,
@@ -191,6 +206,20 @@ pub struct Checkpoint {
     pub evidence: Vec<Seq>,
 }
 
+/// A derived summary of the public session prefix. Raw records remain authoritative.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCheckpoint {
+    pub through: Seq,
+    pub summary: String,
+    pub evidence: Vec<Seq>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactScope {
+    Session,
+    Job { job: JobId, revision: u64 },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointDraft {
@@ -216,6 +245,9 @@ pub struct JobCard {
     pub spec: JobSpec,
     pub status: JobStatus,
     pub report: Option<ReportDraft>,
+    /// Read this record, then its `previous` links, for assigned inputs and intent.
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    pub latest_handoff: Option<Seq>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,18 +258,15 @@ pub struct InquiryView {
     pub deadline: MonoTimeView,
 }
 
-/// Read-only history supplied by the host when a runtime starts.
-///
-/// Entries are descriptive context, not commands or facts produced by the
-/// current runtime. The host chooses and orders complete entries before start.
+/// Read-only projection of the public session summary and record tail.
+/// Current input delivery and constraints remain separate.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BootstrapContext {
+pub struct SessionContext {
     pub entries: Vec<BackgroundEntry>,
-    pub omitted: bool,
 }
 
-/// One host-selected item in [`BootstrapContext`].
+/// One labeled historical item in [`SessionContext`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackgroundEntry {
@@ -261,7 +290,7 @@ pub struct CoordinateInput {
     pub source: Option<JobId>,
     pub request: Option<String>,
     pub constraints: String,
-    pub background: Arc<BootstrapContext>,
+    pub background: Arc<SessionContext>,
     pub jobs: Vec<JobCard>,
     /// Pass this value as `ReadQuery::Jobs.after` to continue the root directory.
     pub next_job: Option<JobId>,
@@ -285,7 +314,8 @@ pub struct WorkInput {
     pub can_ask_user: bool,
     pub spec: JobSpec,
     pub constraints: String,
-    pub background: Arc<BootstrapContext>,
+    pub constraints_revision: u64,
+    pub background: Arc<SessionContext>,
     pub waiting: Option<WaitView>,
     pub checkpoint: Option<Arc<Checkpoint>>,
     pub children: Vec<JobCard>,
@@ -297,9 +327,9 @@ pub struct WorkInput {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompactInput {
-    pub job: JobId,
-    pub revision: u64,
-    pub previous: Option<Arc<Checkpoint>>,
+    pub scope: CompactScope,
+    pub previous: Option<Arc<SessionCheckpoint>>,
+    pub output_bytes: usize,
     pub through: Seq,
     pub records: Vec<RecordView>,
 }
@@ -337,12 +367,6 @@ pub(crate) fn prepare_work(kernel: &Kernel, job_id: JobId) -> Result<PreparedWor
             seen_through,
         });
     }
-    match prepare_compact(kernel, job_id) {
-        Ok(input) => return Ok(PreparedWork::Compact(input)),
-        Err(ContextError::NothingToCompact) => {}
-        Err(error) => return Err(error),
-    }
-
     // A newly required record cannot be compacted before a worker has seen it.
     // Tool outcomes and explicit record reads are pageable, so reduce their
     // projection until the complete DTO fits. The authoritative record remains
@@ -356,6 +380,27 @@ pub(crate) fn prepare_work(kernel: &Kernel, job_id: JobId) -> Result<PreparedWor
                 seen_through,
             });
         }
+    }
+    // Compact only after shrinking pageable observations. Prefer the larger scope.
+    let (input, _) = work_input(kernel, job_id, 1)?;
+    let background_bytes = encoded_len(&input.background);
+    let mut without_background = input.clone();
+    without_background.background = Arc::new(SessionContext::default());
+    let background_can_help = encoded_len(&without_background) <= kernel.limits.context_bytes;
+    if background_can_help
+        && background_bytes > kernel.limits.context_bytes / 3
+        && let Ok(compact) = prepare_session_compact(kernel)
+    {
+        return Ok(PreparedWork::Compact(compact));
+    }
+    match prepare_compact(kernel, job_id) {
+        Ok(input) => return Ok(PreparedWork::Compact(input)),
+        Err(ContextError::NothingToCompact) => {}
+        Err(error) => return Err(error),
+    }
+
+    if background_can_help && let Ok(compact) = prepare_session_compact(kernel) {
+        return Ok(PreparedWork::Compact(compact));
     }
     Err(ContextError::TooLarge)
 }
@@ -401,7 +446,14 @@ fn work_input(
                 .any(|input| kernel.inputs[input].finished.is_none()),
         spec: job.spec.clone(),
         constraints: kernel.constraints.clone(),
-        background: kernel.background.clone(),
+        constraints_revision: kernel.constraints_revision,
+        background: session_background(
+            kernel,
+            &records
+                .iter()
+                .map(|record| record.source)
+                .collect::<Vec<_>>(),
+        ),
         waiting: match &job.state {
             JobState::Waiting(wait) => Some(wait.view()),
             _ => None,
@@ -474,6 +526,13 @@ pub(crate) fn prepare_coordinate(
         return Err(ContextError::TooLarge);
     }
     Ok(input)
+}
+
+pub(crate) fn session_can_help_coordinate(kernel: &Kernel, routing: Seq) -> bool {
+    coordinate_input(kernel, routing, None).is_ok_and(|(mut input, _)| {
+        input.background = Arc::new(SessionContext::default());
+        encoded_len(&input) <= kernel.limits.context_bytes
+    })
 }
 
 pub(crate) fn coordinate_read_fits(
@@ -560,7 +619,15 @@ fn coordinate_input(
         },
         request: routing.request.clone(),
         constraints: kernel.constraints.clone(),
-        background: kernel.background.clone(),
+        background: session_background(
+            kernel,
+            &routing
+                .inputs
+                .iter()
+                .filter_map(|id| kernel.inputs.get(id).map(|input| input.accepted_at))
+                .chain(records.iter().map(|record| record.source))
+                .collect::<Vec<_>>(),
+        ),
         jobs: Vec::new(),
         next_job: None,
         records,
@@ -598,9 +665,18 @@ pub(crate) fn prepare_compact(
             let mut trial_positions = positions.clone();
             expand_into(kernel, &[seq], page_bytes, &mut trial_positions, &mut trial)?;
             let input = CompactInput {
-                job: job_id,
-                revision: job.revision,
-                previous: job.context.checkpoint.clone(),
+                scope: CompactScope::Job {
+                    job: job_id,
+                    revision: job.revision,
+                },
+                previous: job.context.checkpoint.as_ref().map(|cp| {
+                    Arc::new(SessionCheckpoint {
+                        through: cp.through,
+                        summary: cp.summary.clone(),
+                        evidence: cp.evidence.clone(),
+                    })
+                }),
+                output_bytes: compact_output_bytes(kernel),
                 through: next_through,
                 records: trial.clone(),
             };
@@ -620,12 +696,110 @@ pub(crate) fn prepare_compact(
         return Err(ContextError::NothingToCompact);
     }
     Ok(CompactInput {
-        job: job_id,
-        revision: job.revision,
-        previous: job.context.checkpoint.clone(),
+        scope: CompactScope::Job {
+            job: job_id,
+            revision: job.revision,
+        },
+        previous: job.context.checkpoint.as_ref().map(|cp| {
+            Arc::new(SessionCheckpoint {
+                through: cp.through,
+                summary: cp.summary.clone(),
+                evidence: cp.evidence.clone(),
+            })
+        }),
+        output_bytes: compact_output_bytes(kernel),
         through,
         records,
     })
+}
+
+pub(crate) fn session_public(kernel: &Kernel, record: &Record) -> bool {
+    match &record.body {
+        RecordBody::Input(_) | RecordBody::Reply { .. } | RecordBody::Clarification { .. } => true,
+        RecordBody::Published { job, .. } | RecordBody::Outcome { job, .. } => kernel
+            .jobs
+            .get(job)
+            .is_some_and(|job| job.owner == Owner::User),
+        _ => false,
+    }
+}
+
+pub(crate) fn session_checkpoint(kernel: &Kernel) -> Option<Arc<SessionCheckpoint>> {
+    kernel
+        .records
+        .values()
+        .rev()
+        .find_map(|record| match &record.body {
+            RecordBody::SessionCheckpoint { checkpoint } => Some(checkpoint.clone()),
+            _ => None,
+        })
+}
+
+fn session_background(kernel: &Kernel, excluded: &[Seq]) -> Arc<SessionContext> {
+    let mut background = SessionContext::default();
+    let checkpoint = session_checkpoint(kernel);
+    let through = checkpoint
+        .as_ref()
+        .map_or(Seq::ZERO, |checkpoint| checkpoint.through);
+    if let Some(checkpoint) = checkpoint {
+        background.entries.push(BackgroundEntry::new(
+            format!(
+                "Session summary through {}; read source records for exact details",
+                checkpoint.through
+            ),
+            checkpoint.summary.clone(),
+        ));
+    }
+    for record in kernel.records.values().filter(|record| {
+        record.seq > through && !excluded.contains(&record.seq) && session_public(kernel, record)
+    }) {
+        background.entries.push(BackgroundEntry::new(
+            format!("Session record {}", record.seq),
+            serde_json::to_string(&record.body).expect("record is serializable"),
+        ));
+    }
+    Arc::new(background)
+}
+
+pub(crate) fn compact_output_bytes(kernel: &Kernel) -> usize {
+    (kernel.limits.context_bytes / 4).min(kernel.limits.item_bytes)
+}
+
+pub(crate) fn prepare_session_compact(kernel: &Kernel) -> Result<CompactInput, ContextError> {
+    let previous = session_checkpoint(kernel);
+    let after = previous
+        .as_ref()
+        .map_or(Seq::ZERO, |checkpoint| checkpoint.through);
+    let mut input = CompactInput {
+        scope: CompactScope::Session,
+        previous,
+        output_bytes: compact_output_bytes(kernel),
+        through: after,
+        records: Vec::new(),
+    };
+    let latest_public = kernel
+        .records
+        .values()
+        .rev()
+        .find(|record| session_public(kernel, record))
+        .map(|record| record.seq);
+    for record in kernel.records.values().filter(|record| {
+        record.seq > after && Some(record.seq) != latest_public && session_public(kernel, record)
+    }) {
+        let candidate = view(record, 0, usize::MAX)?;
+        input.records.push(candidate);
+        let old = input.through;
+        input.through = record.seq;
+        if encoded_len(&input) > kernel.limits.context_bytes {
+            input.records.pop();
+            input.through = old;
+            break;
+        }
+    }
+    if input.through == after {
+        return Err(ContextError::NothingToCompact);
+    }
+    Ok(input)
 }
 
 fn pageable(kernel: &Kernel, seq: Seq) -> Result<bool, ContextError> {
@@ -656,7 +830,15 @@ pub(crate) fn card(kernel: &Kernel, id: JobId) -> JobCard {
             RecordBody::Report { report, .. } => Some(report.clone()),
             _ => None,
         }),
+        latest_handoff: latest_handoff(kernel, id),
     }
+}
+
+pub(crate) fn latest_handoff(kernel: &Kernel, job: JobId) -> Option<Seq> {
+    kernel.records.values().rev().find_map(|record| {
+        matches!(record.body, RecordBody::RoutingHandoff { job: owner, .. } if owner == job)
+            .then_some(record.seq)
+    })
 }
 
 fn expand_records(

@@ -183,7 +183,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bone_core::{
-        BootstrapContext, CoordinateInput, Input, InputId, KernelDecision, Seq, model_contract,
+        CoordinateInput, Input, InputId, KernelDecision, Seq, SessionContext, model_contract,
     };
     use rig_core::{
         completion::{
@@ -309,7 +309,7 @@ mod tests {
             source: None,
             request: Some("create a focused job".into()),
             constraints: "read only".into(),
-            background: Arc::new(BootstrapContext::default()),
+            background: Arc::new(SessionContext::default()),
             jobs: Vec::new(),
             next_job: None,
             records: Vec::new(),
