@@ -181,6 +181,17 @@ impl Session {
         .await
     }
 
+    /// Replace the creation placeholder with a title derived from the first
+    /// submitted text. Returns false if the text is empty or the title has
+    /// already been finalized (including by a manual rename).
+    pub async fn title_from_first_input(&self, input: &str) -> Result<bool> {
+        let Some(title) = crate::app::title_from_first_input(input) else {
+            return Ok(false);
+        };
+        self.request(|reply| Command::RenameIfProvisional { title, reply })
+            .await
+    }
+
     pub async fn save_draft(&self, draft: impl Into<String>) -> Result<()> {
         let draft = draft.into();
         if draft.len() > MAX_PERSISTED_VALUE_BYTES {
@@ -394,6 +405,10 @@ enum Command {
     Rename {
         title: String,
         reply: oneshot::Sender<Result<()>>,
+    },
+    RenameIfProvisional {
+        title: String,
+        reply: oneshot::Sender<Result<bool>>,
     },
     SaveDraft {
         draft: String,
@@ -610,6 +625,10 @@ impl SessionTask {
                 if let Err(error) = &result {
                     self.record_execution_error(error).await;
                 }
+                let _ = reply.send(result);
+            }
+            Command::RenameIfProvisional { title, reply } => {
+                let result = self.rename_if_provisional(title);
                 let _ = reply.send(result);
             }
             Command::SaveDraft { draft, reply } => {
@@ -937,6 +956,21 @@ impl SessionTask {
         }
         self.info = self.store.rename_session(self.info.id, title)?;
         self.publish()
+    }
+
+    fn rename_if_provisional(&mut self, title: String) -> Result<bool> {
+        if title.trim().is_empty() || title.trim() != title || title.len() > 200 {
+            return Err(Error::InvalidState("invalid session title".into()));
+        }
+        let Some(info) = self
+            .store
+            .rename_session_if_provisional(self.info.id, title)?
+        else {
+            return Ok(false);
+        };
+        self.info = info;
+        self.publish()?;
+        Ok(true)
     }
 
     fn archive(&mut self, archived: bool) -> Result<()> {

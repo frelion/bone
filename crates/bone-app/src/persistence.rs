@@ -128,11 +128,21 @@ struct WorkspaceCatalog {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SavedSession {
     pub info: SessionInfo,
+    #[serde(default)]
+    pub title_is_provisional: bool,
     pub next_input: u64,
     pub runtime: Option<SavedRuntime>,
     pub agent_through: u64,
     pub core_through: u64,
     pub draft: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredCreateSessionRequest {
+    workspace: WorkspaceId,
+    title: String,
+    provisional: bool,
+    session: SessionId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1021,6 +1031,7 @@ impl DataStore {
                 title,
                 archived: false,
             },
+            title_is_provisional: false,
             next_input: 1,
             runtime: None,
             agent_through: 0,
@@ -1057,6 +1068,91 @@ impl DataStore {
         Ok(session)
     }
 
+    pub fn create_session_idempotent(
+        &self,
+        request_id: RequestId,
+        workspace: WorkspaceId,
+        title: String,
+        provisional: bool,
+    ) -> Result<Option<SavedSession>, StoreError> {
+        let request_document = self
+            .store
+            .document::<StoredCreateSessionRequest>(create_session_request_key(request_id));
+        self.store.transaction(|transaction| {
+            let request_snapshot = transaction.read(&request_document)?;
+            if let Some(prior) = request_snapshot.value {
+                if prior.workspace != workspace
+                    || prior.title != title
+                    || prior.provisional != provisional
+                {
+                    return Ok(None);
+                }
+                let saved = transaction
+                    .read(
+                        &self
+                            .store
+                            .document::<SavedSession>(session_key(prior.session)),
+                    )?
+                    .value
+                    .ok_or(StoreError::Corrupt {
+                        message: "create-session request points to a missing session",
+                    })?;
+                return Ok(Some(saved));
+            }
+
+            let session = SavedSession {
+                info: SessionInfo {
+                    id: SessionId::new(),
+                    workspace,
+                    title: title.clone(),
+                    archived: false,
+                },
+                title_is_provisional: provisional,
+                next_input: 1,
+                runtime: None,
+                agent_through: 0,
+                core_through: 0,
+                draft: String::new(),
+            };
+            transaction.replace(
+                &self.store.document(session_key(session.info.id)),
+                &session,
+                Revision::default(),
+            )?;
+            transaction.replace(
+                &self.store.document(result_projection_key(session.info.id)),
+                &ResultProjectionState {
+                    snapshot_through: SessionSeq(0),
+                    before: SessionSeq(1),
+                    complete: true,
+                },
+                Revision::default(),
+            )?;
+            transaction.replace(
+                &self
+                    .store
+                    .document(evidence_projection_key(session.info.id)),
+                &EvidenceProjectionState {
+                    snapshot_through: SessionSeq(0),
+                    before: SessionSeq(1),
+                    complete: true,
+                },
+                Revision::default(),
+            )?;
+            transaction.replace(
+                &request_document,
+                &StoredCreateSessionRequest {
+                    workspace,
+                    title,
+                    provisional,
+                    session: session.info.id,
+                },
+                request_snapshot.revision,
+            )?;
+            Ok(Some(session))
+        })
+    }
+
     pub fn session(&self, id: SessionId) -> Result<Option<SavedSession>, StoreError> {
         self.store
             .document(session_key(id))
@@ -1079,6 +1175,40 @@ impl DataStore {
         }
         sessions.sort_by_key(|session| session.id);
         Ok(sessions)
+    }
+
+    pub fn last_active_session(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<Option<SessionId>, StoreError> {
+        self.store
+            .document::<SessionId>(last_active_session_key(workspace))
+            .read()
+            .map(|snapshot| snapshot.value)
+    }
+
+    pub fn set_last_active_session(
+        &self,
+        workspace: WorkspaceId,
+        session: SessionId,
+    ) -> Result<bool, StoreError> {
+        let active = self
+            .store
+            .document::<SessionId>(last_active_session_key(workspace));
+        self.store.transaction(|transaction| {
+            let saved = transaction
+                .read(&self.store.document::<SavedSession>(session_key(session)))?
+                .value;
+            let Some(saved) = saved else {
+                return Ok(false);
+            };
+            if saved.info.workspace != workspace {
+                return Ok(false);
+            }
+            let snapshot = transaction.read(&active)?;
+            transaction.replace(&active, &session, snapshot.revision)?;
+            Ok(true)
+        })
     }
 
     /// Build a workspace navigation snapshot without acquiring a Session lease
@@ -1730,8 +1860,32 @@ impl DataStore {
     }
 
     pub fn rename_session(&self, id: SessionId, title: String) -> Result<SessionInfo, StoreError> {
-        self.update_session(id, |saved| saved.info.title = title)
-            .map(|saved| saved.info)
+        self.update_session(id, |saved| {
+            saved.info.title = title;
+            saved.title_is_provisional = false;
+        })
+        .map(|saved| saved.info)
+    }
+
+    pub fn rename_session_if_provisional(
+        &self,
+        id: SessionId,
+        title: String,
+    ) -> Result<Option<SessionInfo>, StoreError> {
+        let document = self.store.document::<SavedSession>(session_key(id));
+        self.store.transaction(|transaction| {
+            let snapshot = transaction.read(&document)?;
+            let mut saved = snapshot.value.ok_or(StoreError::Corrupt {
+                message: "session does not exist",
+            })?;
+            if !saved.title_is_provisional {
+                return Ok(None);
+            }
+            saved.info.title = title;
+            saved.title_is_provisional = false;
+            transaction.replace(&document, &saved, snapshot.revision)?;
+            Ok(Some(saved.info))
+        })
     }
 
     pub fn save_draft(&self, id: SessionId, draft: String) -> Result<(), StoreError> {
@@ -3101,6 +3255,14 @@ fn catalog_key() -> DocumentKey {
 
 fn session_key(id: SessionId) -> DocumentKey {
     DocumentKey::new(NAMESPACE, format!("session/{id}"))
+}
+
+fn create_session_request_key(id: RequestId) -> DocumentKey {
+    DocumentKey::new(NAMESPACE, format!("create-session-request/{id}"))
+}
+
+fn last_active_session_key(workspace: WorkspaceId) -> DocumentKey {
+    DocumentKey::new(NAMESPACE, format!("last-active-session/{workspace}"))
 }
 
 fn input_prefix(session: SessionId) -> String {

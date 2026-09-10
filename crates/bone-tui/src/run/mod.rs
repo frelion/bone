@@ -4,14 +4,14 @@ mod runtime;
 
 use std::{collections::VecDeque, env, future::Future, io, time::Duration};
 
-use bone_app::{App, AppOptions};
+use bone_app::{App, AppOptions, AttentionItem, WorkspaceOverview};
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::{
-    state::{Action, UiEvent, UiState, update},
+    state::{Action, SessionStatus, UiEvent, UiState, update},
     terminal::TerminalGuard,
 };
 
@@ -53,11 +53,17 @@ pub async fn run() -> Result<(), RunError> {
     let app = App::open(app_options).await?;
     let workspace = app.open_workspace(launch.workspace).await?;
     let overview = app.workspace_overview(workspace.id).await?;
-    let sessions = overview
-        .sessions
-        .iter()
-        .map(|summary| summary.session.clone())
-        .collect();
+    let last_active = app.last_active_session(workspace.id).await?;
+    let model_label = Some(
+        app.resolved_workspace_config(workspace.id)
+            .await?
+            .desired
+            .map_or_else(
+                |_| "model setup needed".to_owned(),
+                |config| config.coordinator.selection.model,
+            ),
+    );
+    let (sessions, statuses) = summarize_overview(&overview);
 
     let (tx, mut rx) = mpsc::channel(256);
     let (ready_tx, mut ready_rx) = mpsc::channel::<SessionReady>(16);
@@ -75,9 +81,9 @@ pub async fn run() -> Result<(), RunError> {
             id: workspace.id,
             label,
             sessions,
-            attention: overview.attention,
-            attention_projection_pending: overview.attention_projection_pending,
-            unresolved_writes: overview.unresolved_writes,
+            last_active,
+            model_label,
+            statuses,
         },
     ));
 
@@ -114,12 +120,11 @@ pub async fn run() -> Result<(), RunError> {
             .await;
             match result {
                 FlushWait::Completed(Ok(())) => break,
-                FlushWait::Completed(Err(error)) if !termination_received => {
+                FlushWait::Completed(Err(_)) if !termination_received => {
                     shutdown = false;
                     state.quitting = false;
-                    state.dialog = Some(crate::state::Dialog::Error(format!(
-                        "草稿未能保存，BONE 仍保持打开：{error}"
-                    )));
+                    state.status =
+                        Some("Your draft could not be saved; the session is still open".into());
                     state.dirty = true;
                 }
                 FlushWait::Completed(Err(error)) => {
@@ -129,9 +134,7 @@ pub async fn run() -> Result<(), RunError> {
                 FlushWait::TimedOut if !termination_received => {
                     shutdown = false;
                     state.quitting = false;
-                    state.dialog = Some(crate::state::Dialog::Error(
-                        "草稿保存超时，BONE 仍保持打开；可重试退出".into(),
-                    ));
+                    state.status = Some("Draft saving timed out; the session is still open".into());
                     state.dirty = true;
                 }
                 FlushWait::TimedOut => {
@@ -192,6 +195,41 @@ pub async fn run() -> Result<(), RunError> {
         return Err(RunError::Shutdown(error));
     }
     Ok(())
+}
+
+fn summarize_overview(
+    overview: &WorkspaceOverview,
+) -> (
+    Vec<bone_app::SessionInfo>,
+    std::collections::BTreeMap<bone_app::SessionId, SessionStatus>,
+) {
+    let mut statuses = overview
+        .sessions
+        .iter()
+        .map(|summary| {
+            let status = if summary.persisted_runtime.is_some() {
+                SessionStatus::Recoverable
+            } else if summary.has_draft {
+                SessionStatus::Draft
+            } else {
+                SessionStatus::Ready
+            };
+            (summary.session.id, status)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for item in &overview.attention {
+        let session = match item {
+            AttentionItem::WaitingForUser { session, .. }
+            | AttentionItem::UnresolvedWrite { session, .. } => *session,
+        };
+        statuses.insert(session, SessionStatus::NeedsAttention);
+    }
+    let sessions = overview
+        .sessions
+        .iter()
+        .map(|summary| summary.session.clone())
+        .collect();
+    (sessions, statuses)
 }
 
 async fn wait_for_draft_flush<T>(

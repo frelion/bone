@@ -12,13 +12,13 @@ use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::{
     AcceptanceCursor, AcceptancePage, ApiKey, AppOptions, AppShutdownReport, ConfigChange,
-    ConfigProblem, ConfigScope, DataStore, Error, EvidenceAvailability, EvidenceCursor,
-    EvidencePage, EvidenceRef, EvidenceSourcePage, HistoryCursor, LoginState, Profile, ProfileId,
-    ProviderConnector, ResolvedConfig, Result, ResultArtifact, ResultPage, ResultRef,
-    RuntimeConfig, RuntimeOverrides, Session, SessionId, SessionInfo, SessionReleaseReceipt,
-    SessionReleaseStatus, WorkspaceChangeCursor, WorkspaceChangePage, WorkspaceFileCursor,
-    WorkspaceFilePage, WorkspaceFileSource, WorkspaceFileView, WorkspaceId, WorkspaceInfo,
-    WorkspaceOverview,
+    ConfigProblem, ConfigScope, CreateSessionRequest, DataStore, Error, EvidenceAvailability,
+    EvidenceCursor, EvidencePage, EvidenceRef, EvidenceSourcePage, HistoryCursor, LoginState,
+    Profile, ProfileId, ProviderConnector, ResolvedConfig, Result, ResultArtifact, ResultPage,
+    ResultRef, RuntimeConfig, RuntimeOverrides, Session, SessionId, SessionInfo,
+    SessionReleaseReceipt, SessionReleaseStatus, WorkspaceChangeCursor, WorkspaceChangePage,
+    WorkspaceFileCursor, WorkspaceFilePage, WorkspaceFileSource, WorkspaceFileView, WorkspaceId,
+    WorkspaceInfo, WorkspaceOverview,
     config::{resolve_runtime, validate_agent_limits, validate_tool_settings},
     providers::ProviderConnectError,
 };
@@ -215,6 +215,38 @@ impl App {
         self.register_session(&mut sessions, saved).await
     }
 
+    /// Create a Session exactly once for a durable request identity.
+    ///
+    /// Retrying the same request returns the same Session, including after an
+    /// App restart. Reusing its identity with different content is rejected.
+    pub async fn create_session_idempotent(
+        &self,
+        request: CreateSessionRequest,
+    ) -> Result<Session> {
+        validate_title(&request.title)?;
+        let mut sessions = self.inner.sessions.lock().await;
+        self.ensure_open()?;
+        if self
+            .inner
+            .store
+            .workspace_by_id(request.workspace)?
+            .is_none()
+        {
+            return Err(Error::WorkspaceNotFound);
+        }
+        let saved = self
+            .inner
+            .store
+            .create_session_idempotent(
+                request.request_id,
+                request.workspace,
+                request.title,
+                request.provisional,
+            )?
+            .ok_or(Error::RequestConflict)?;
+        self.register_session(&mut sessions, saved).await
+    }
+
     pub async fn session(&self, id: SessionId) -> Result<Session> {
         let mut sessions = self.inner.sessions.lock().await;
         self.ensure_open()?;
@@ -299,6 +331,38 @@ impl App {
             return Err(Error::WorkspaceNotFound);
         }
         self.inner.store.sessions(workspace).map_err(Into::into)
+    }
+
+    /// Return the last Session explicitly selected in a workspace, if any.
+    pub async fn last_active_session(&self, workspace: WorkspaceId) -> Result<Option<SessionId>> {
+        self.ensure_open()?;
+        if self.inner.store.workspace_by_id(workspace)?.is_none() {
+            return Err(Error::WorkspaceNotFound);
+        }
+        self.inner
+            .store
+            .last_active_session(workspace)
+            .map_err(Into::into)
+    }
+
+    /// Persist the Session a frontend selected for the next startup.
+    pub async fn set_last_active_session(
+        &self,
+        workspace: WorkspaceId,
+        session: SessionId,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        if self.inner.store.workspace_by_id(workspace)?.is_none() {
+            return Err(Error::WorkspaceNotFound);
+        }
+        if !self
+            .inner
+            .store
+            .set_last_active_session(workspace, session)?
+        {
+            return Err(Error::SessionNotFound);
+        }
+        Ok(())
     }
 
     /// Returns durable workspace navigation and attention data without opening
@@ -677,6 +741,37 @@ impl App {
         Ok(ResolvedConfig { desired, running })
     }
 
+    /// Resolve the configuration inherited by a new Session in this workspace.
+    /// No Session is opened and `running` is always `None`.
+    pub async fn resolved_workspace_config(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<ResolvedConfig> {
+        let _update = self.inner.config_updates.lock().await;
+        self.ensure_open()?;
+        let workspace = self
+            .inner
+            .store
+            .workspace_by_id(workspace)?
+            .ok_or(Error::WorkspaceNotFound)?;
+        let global = self.inner.store.global_settings()?;
+        let workspace_config = self
+            .inner
+            .store
+            .config(ConfigScope::Workspace(workspace.id))?;
+        let desired = resolve_runtime(
+            &global,
+            Some(&workspace_config),
+            None,
+            &self.inner.store.profiles()?,
+            workspace.root,
+        );
+        Ok(ResolvedConfig {
+            desired,
+            running: None,
+        })
+    }
+
     pub async fn profiles(&self) -> Result<Vec<Profile>> {
         self.ensure_open()?;
         self.inner.store.profiles().map_err(Into::into)
@@ -976,6 +1071,27 @@ fn validate_title(title: &str) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+pub(crate) fn title_from_first_input(input: &str) -> Option<String> {
+    const MAX_CHARS: usize = 60;
+    const MAX_BYTES: usize = 200;
+    let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.chars().count() <= MAX_CHARS && normalized.len() <= MAX_BYTES {
+        return Some(normalized);
+    }
+    let mut title = String::new();
+    for character in normalized.chars().take(MAX_CHARS) {
+        if title.len() + character.len_utf8() + '…'.len_utf8() > MAX_BYTES {
+            break;
+        }
+        title.push(character);
+    }
+    title.push('…');
+    Some(title)
 }
 
 fn config_affects(scope: ConfigScope, session: &Session) -> bool {

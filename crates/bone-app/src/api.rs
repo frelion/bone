@@ -123,6 +123,22 @@ pub struct SessionInfo {
     pub archived: bool,
 }
 
+/// A retry-safe request to create one Session.
+///
+/// Reusing `request_id` with the same workspace and title returns the Session
+/// created by the first attempt. Reusing it with different content fails with
+/// [`crate::Error::RequestConflict`]. A provisional initial title may be
+/// replaced once by [`crate::Session::title_from_first_input`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateSessionRequest {
+    pub request_id: RequestId,
+    pub workspace: WorkspaceId,
+    pub title: String,
+    /// Whether `title_from_first_input` may replace the initial title once.
+    pub provisional: bool,
+}
+
 /// Durable, read-only facts needed to render one session in a workspace list.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {

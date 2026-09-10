@@ -6,7 +6,7 @@ use std::{
 
 use bone_app::{HistoryEntry, HistoryPage, SessionEvent, SessionId, SessionInfo, WorkspaceId};
 use bone_tui::{
-    state::{Action, DetailKind, DetailState, Focus, HISTORY_CACHE_BYTES, UiEvent, UiState},
+    state::{Action, Focus, HISTORY_CACHE_BYTES, UiEvent, UiState},
     view,
 };
 use ratatui::{Terminal, backend::TestBackend};
@@ -41,7 +41,7 @@ fn populated_state() -> UiState {
             .insert(info.id, bone_tui::state::SessionUi::new(info, 1));
     }
     state.selected = state.sessions.first().map(|session| session.id);
-    state.focus = Focus::Timeline;
+    state.focus = Focus::Conversation;
     state
 }
 
@@ -129,7 +129,10 @@ fn input_to_frame_sample(state: &mut UiState, samples: usize) -> Vec<Duration> {
                 UiEvent::Action(if index % 2 == 0 {
                     Action::ScrollDown(1)
                 } else {
-                    Action::ScrollUp(1)
+                    Action::ScrollUp {
+                        amount: 1,
+                        metrics: None,
+                    }
                 }),
             ));
             terminal
@@ -208,31 +211,6 @@ fn release_tui_performance_harness() {
     assert!(render_120_p95 <= Duration::from_millis(16));
     assert!(render_160_p95 <= Duration::from_millis(16));
     assert!(input_p95 <= Duration::from_millis(50));
-
-    let chinese = "中文\n".repeat((1024usize * 1024).div_ceil("中文\n".len()));
-    assert!(chinese.len() >= 1024 * 1024);
-    state.detail = Some(DetailState {
-        kind: DetailKind::Changes,
-        title: "工作区变更".into(),
-    });
-    state.focus = Focus::Detail;
-    state.detail_scroll = 100_000;
-    state.workspace_changes.file = Some(bone_app::WorkspaceFilePage {
-        baseline: bone_app::WorkspaceBaseline::NotGit,
-        path: "一兆中文正文.txt".into(),
-        source: bone_app::WorkspaceFileSource::WorkingTree,
-        media: bone_app::WorkspaceFileMedia::Text,
-        bytes_read: chinese.len() as u64,
-        total_bytes: Some(chinese.len() as u64),
-        text: Some(chinese),
-        offset: 0,
-        next_cursor: None,
-    });
-    let (_, deep_scroll_p95, _) = report(
-        "deep_scroll_1mib_chinese",
-        render_sample(&state, 160, 50, 1_000),
-    );
-    assert!(deep_scroll_p95 <= Duration::from_millis(16));
 
     let switch_started = Instant::now();
     for index in 0..10_000 {

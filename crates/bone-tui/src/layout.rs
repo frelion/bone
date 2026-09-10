@@ -1,67 +1,51 @@
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use std::{collections::BTreeMap, sync::Arc};
+
+use bone_app::SessionSeq;
+use ratatui::layout::Rect;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TranscriptMetrics {
+    pub total_rows: usize,
+    pub viewport_rows: usize,
+    pub event_rows: BTreeMap<SessionSeq, usize>,
+}
+
+impl TranscriptMetrics {
+    const PREFETCH_ROWS: usize = 10;
+
+    pub fn max_scroll(&self) -> usize {
+        self.total_rows.saturating_sub(self.viewport_rows)
+    }
+
+    pub fn near_start(&self, scroll_from_tail: usize) -> bool {
+        scroll_from_tail
+            .saturating_add(self.viewport_rows)
+            .saturating_add(Self::PREFETCH_ROWS)
+            >= self.total_rows
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutMode {
     Wide,
-    Medium,
-    Compact,
-    Narrow,
+    TwoColumn,
+    Single,
     TooSmall,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HitTarget {
-    Workbench,
+pub enum SinglePane {
     Sessions,
-    Attention,
-    Settings,
-    NewSession,
+    Conversation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HitTarget {
+    SessionRail,
     Session(usize),
-    RenameSession,
-    ArchiveSession,
-    CloseDetail,
+    Conversation,
     Composer,
-    Submit,
-    Stop,
-    Quit,
-    DialogConfirm,
-    Acceptance,
-    DetailWork,
-    DetailChanges,
-    DetailContext,
-    DetailArtifacts,
-    DetailRecords,
-    DetailAcceptance,
-    Accept,
-    PartiallyAccept,
-    AcceptWithRisk,
-    Reject,
-    OlderResults,
-    NewerResults,
-    OlderAcceptances,
-    NewerAcceptances,
-    SettingsProfile(usize),
-    ConfigureWorker,
-    ConfigureCoordinator,
-    Login,
-    Logout,
-    AttentionItem(usize),
-    WriteApplied,
-    WriteNotApplied,
-    WorkspaceChange(usize),
-    OlderWorkspaceChanges,
-    NewerWorkspaceChanges,
-    RefreshWorkspaceChanges,
-    CloseWorkspaceFile,
-    PreviousWorkspaceFile,
-    MoreWorkspaceFile,
-    Evidence(usize),
-    OlderEvidence,
-    NewerEvidence,
-    RefreshArtifact,
-    PreviousEvidenceSource,
-    MoreEvidenceSource,
-    CloseEvidenceSource,
+    SlashCommand(usize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,232 +58,167 @@ pub struct HitRegion {
 pub struct LayoutPlan {
     pub mode: LayoutMode,
     pub screen: Rect,
-    pub global_bar: Rect,
     pub session_rail: Option<Rect>,
-    pub main_surface: Rect,
-    pub detail_pane: Option<Rect>,
-    pub action_bar: Rect,
-    pub dialog_layer: Option<Rect>,
+    pub session_start: usize,
+    pub conversation: Option<Rect>,
+    pub extension_blank: Option<Rect>,
+    pub session_header: Option<Rect>,
+    pub transcript: Option<Rect>,
+    pub composer: Option<Rect>,
+    pub slash_palette: Option<Rect>,
+    pub transcript_metrics: Option<Arc<TranscriptMetrics>>,
     pub hit_regions: Vec<HitRegion>,
 }
 
 impl LayoutPlan {
-    pub fn calculate(screen: Rect, detail_open: bool, dialog_open: bool) -> Self {
+    pub fn calculate(
+        screen: Rect,
+        single_pane: SinglePane,
+        slash_items: usize,
+        session_count: usize,
+        selected_session: Option<usize>,
+    ) -> Self {
         let mode = mode_for(screen);
-        let (global_height, action_height) = match mode {
-            LayoutMode::TooSmall => (1, 1),
-            LayoutMode::Narrow => (2, 2),
-            _ => (2, 2),
-        };
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(global_height),
-                Constraint::Min(0),
-                Constraint::Length(action_height),
-            ])
-            .split(screen);
-        let global_bar = rows[0];
-        let body = rows[1];
-        let action_bar = rows[2];
-
-        let (session_rail, main_surface, detail_pane) = match mode {
+        let (session_rail, conversation, extension_blank) = match mode {
             LayoutMode::Wide => {
-                if detail_open {
-                    let columns = columns(body, &[24, body.width.saturating_sub(64), 40]);
-                    (Some(columns[0]), columns[1], Some(columns[2]))
-                } else {
-                    let columns = columns(body, &[24, body.width.saturating_sub(24)]);
-                    (Some(columns[0]), columns[1], None)
-                }
+                let rail = 24.min(screen.width);
+                let extension = 40.min(screen.width.saturating_sub(rail));
+                let center = screen.width.saturating_sub(rail).saturating_sub(extension);
+                (
+                    Some(Rect::new(screen.x, screen.y, rail, screen.height)),
+                    Some(Rect::new(screen.x + rail, screen.y, center, screen.height)),
+                    Some(Rect::new(
+                        screen.right().saturating_sub(extension),
+                        screen.y,
+                        extension,
+                        screen.height,
+                    )),
+                )
             }
-            LayoutMode::Medium => {
-                if detail_open {
-                    let columns = columns(body, &[body.width.saturating_sub(40), 40]);
-                    (None, columns[0], Some(columns[1]))
-                } else {
-                    let columns = columns(body, &[24, body.width.saturating_sub(24)]);
-                    (Some(columns[0]), columns[1], None)
-                }
+            LayoutMode::TwoColumn => {
+                let rail = 24.min(screen.width);
+                (
+                    Some(Rect::new(screen.x, screen.y, rail, screen.height)),
+                    Some(Rect::new(
+                        screen.x + rail,
+                        screen.y,
+                        screen.width.saturating_sub(rail),
+                        screen.height,
+                    )),
+                    None,
+                )
             }
-            LayoutMode::Compact | LayoutMode::Narrow if detail_open => {
-                (None, Rect::new(body.x, body.y, 0, body.height), Some(body))
-            }
-            LayoutMode::Compact | LayoutMode::Narrow | LayoutMode::TooSmall => (None, body, None),
+            LayoutMode::Single | LayoutMode::TooSmall => match single_pane {
+                SinglePane::Sessions => (Some(screen), None, None),
+                SinglePane::Conversation => (None, Some(screen), None),
+            },
         };
-
-        let dialog_layer =
-            dialog_open.then(|| centered(screen, 60.min(screen.width), 13.min(screen.height)));
-        let mut plan = Self {
+        let (session_header, transcript, composer, slash_palette) =
+            conversation.map_or((None, None, None, None), |area| {
+                let header_h = area.height.min(3);
+                let composer_h = area.height.saturating_sub(header_h).min(6);
+                let body_h = area
+                    .height
+                    .saturating_sub(header_h)
+                    .saturating_sub(composer_h);
+                let header = Rect::new(area.x, area.y, area.width, header_h);
+                let transcript = Rect::new(area.x, area.y + header_h, area.width, body_h);
+                let composer = Rect::new(
+                    area.x,
+                    area.bottom().saturating_sub(composer_h),
+                    area.width,
+                    composer_h,
+                );
+                let palette_h = (slash_items as u16).min(8).min(body_h);
+                let palette = (palette_h > 0).then_some(Rect::new(
+                    transcript.x,
+                    transcript.bottom().saturating_sub(palette_h),
+                    transcript.width,
+                    palette_h,
+                ));
+                (Some(header), Some(transcript), Some(composer), palette)
+            });
+        let mut hit_regions = Vec::new();
+        let mut session_start = 0;
+        if let Some(area) = session_rail {
+            hit_regions.push(HitRegion {
+                area,
+                target: HitTarget::SessionRail,
+            });
+            let first_y = area.y.saturating_add(3);
+            let list_bottom = area.bottom().saturating_sub(1);
+            let visible = list_bottom.saturating_sub(first_y) as usize / 2;
+            session_start = selected_session
+                .unwrap_or(0)
+                .saturating_sub(visible.saturating_sub(1))
+                .min(session_count.saturating_sub(visible));
+            for index in session_start..session_count.min(session_start + visible) {
+                hit_regions.push(HitRegion {
+                    area: Rect::new(
+                        area.x,
+                        first_y + (index - session_start) as u16 * 2,
+                        area.width,
+                        2,
+                    ),
+                    target: HitTarget::Session(index),
+                });
+            }
+        }
+        if let Some(area) = transcript {
+            hit_regions.push(HitRegion {
+                area,
+                target: HitTarget::Conversation,
+            });
+        }
+        if let Some(area) = composer {
+            hit_regions.push(HitRegion {
+                area,
+                target: HitTarget::Composer,
+            });
+        }
+        if let Some(area) = slash_palette {
+            for index in 0..slash_items.min(area.height as usize) {
+                hit_regions.push(HitRegion {
+                    area: Rect::new(area.x, area.y + index as u16, area.width, 1),
+                    target: HitTarget::SlashCommand(index),
+                });
+            }
+        }
+        Self {
             mode,
             screen,
-            global_bar,
             session_rail,
-            main_surface,
-            detail_pane,
-            action_bar,
-            dialog_layer,
-            hit_regions: Vec::new(),
-        };
-        plan.build_hit_regions();
-        plan
+            session_start,
+            conversation,
+            extension_blank,
+            session_header,
+            transcript,
+            composer,
+            slash_palette,
+            transcript_metrics: None,
+            hit_regions,
+        }
     }
 
     pub fn hit(&self, x: u16, y: u16) -> Option<HitTarget> {
         self.hit_regions
             .iter()
             .rev()
-            .find(|region| contains(region.area, x, y))
-            .map(|region| region.target)
+            .find(|r| contains(r.area, x, y))
+            .map(|r| r.target)
     }
-
-    fn build_hit_regions(&mut self) {
-        if self.mode == LayoutMode::TooSmall {
-            self.push_action_regions();
-            if let Some(area) = self.dialog_layer {
-                self.hit_regions.push(HitRegion {
-                    area: dialog_confirm_area(area),
-                    target: HitTarget::DialogConfirm,
-                });
-            }
-            return;
-        }
-
-        // These rectangles are also used by the renderer for the visible controls.
-        let nav_widths = match self.mode {
-            LayoutMode::Narrow => [10, 10, 10, 9],
-            _ => [12, 12, 14, 10],
-        };
-        let mut x = self.global_bar.x;
-        for (width, target) in nav_widths.into_iter().zip([
-            HitTarget::Workbench,
-            HitTarget::Sessions,
-            HitTarget::Attention,
-            HitTarget::Settings,
-        ]) {
-            let remaining = self.global_bar.right().saturating_sub(x);
-            if remaining == 0 {
-                break;
-            }
-            let area = Rect::new(
-                x,
-                self.global_bar.y,
-                width.min(remaining),
-                self.global_bar.height,
-            );
-            self.hit_regions.push(HitRegion { area, target });
-            x = x.saturating_add(width);
-        }
-        if let Some(area) = self.session_rail {
-            self.hit_regions.push(HitRegion {
-                area: bottom_row(area),
-                target: HitTarget::NewSession,
-            });
-        }
-        if let Some(area) = self.detail_pane {
-            self.hit_regions.push(HitRegion {
-                area: Rect::new(
-                    area.right().saturating_sub(6),
-                    area.y,
-                    6.min(area.width),
-                    2.min(area.height),
-                ),
-                target: HitTarget::CloseDetail,
-            });
-        }
-        if self.main_surface.width > 0 && self.main_surface.height > 0 {
-            self.hit_regions.push(HitRegion {
-                area: composer_area(self.main_surface),
-                target: HitTarget::Composer,
-            });
-        }
-        self.push_action_regions();
-        if let Some(area) = self.dialog_layer {
-            self.hit_regions.push(HitRegion {
-                area: dialog_confirm_area(area),
-                target: HitTarget::DialogConfirm,
-            });
-        }
-    }
-
-    fn push_action_regions(&mut self) {
-        let widths = [18, 12, 10, 10];
-        let targets = [
-            HitTarget::Acceptance,
-            HitTarget::Submit,
-            HitTarget::Stop,
-            HitTarget::Quit,
-        ];
-        let mut right = self.action_bar.right();
-        for (width, target) in widths.into_iter().zip(targets).rev() {
-            let actual = width.min(right.saturating_sub(self.action_bar.x));
-            right = right.saturating_sub(actual);
-            self.hit_regions.push(HitRegion {
-                area: Rect::new(right, self.action_bar.y, actual, self.action_bar.height),
-                target,
-            });
-        }
-    }
-}
-
-pub fn composer_area(main: Rect) -> Rect {
-    let height = main.height.min(5);
-    Rect::new(
-        main.x,
-        main.bottom().saturating_sub(height),
-        main.width,
-        height,
-    )
-}
-
-pub fn dialog_confirm_area(dialog: Rect) -> Rect {
-    let width = dialog.width.min(18);
-    Rect::new(
-        dialog.x + dialog.width.saturating_sub(width) / 2,
-        dialog.bottom().saturating_sub(3),
-        width,
-        dialog.height.min(2),
-    )
 }
 
 fn mode_for(area: Rect) -> LayoutMode {
     if area.width < 40 || area.height < 12 {
         LayoutMode::TooSmall
-    } else if area.width >= 160 {
+    } else if area.width >= 140 {
         LayoutMode::Wide
-    } else if area.width >= 120 {
-        LayoutMode::Medium
-    } else if area.width >= 80 {
-        LayoutMode::Compact
+    } else if area.width >= 100 {
+        LayoutMode::TwoColumn
     } else {
-        LayoutMode::Narrow
+        LayoutMode::Single
     }
-}
-
-fn columns(area: Rect, widths: &[u16]) -> Vec<Rect> {
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(widths.iter().copied().map(Constraint::Length))
-        .split(area)
-        .to_vec()
-}
-
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
-}
-
-fn bottom_row(area: Rect) -> Rect {
-    Rect::new(
-        area.x,
-        area.bottom().saturating_sub(2),
-        area.width,
-        area.height.min(2),
-    )
 }
 
 fn contains(area: Rect, x: u16, y: u16) -> bool {
@@ -311,64 +230,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn responsive_breakpoints_follow_the_product_contract() {
-        for (width, expected) in [
-            (160, LayoutMode::Wide),
-            (159, LayoutMode::Medium),
-            (120, LayoutMode::Medium),
-            (119, LayoutMode::Compact),
-            (80, LayoutMode::Compact),
-            (79, LayoutMode::Narrow),
-            (40, LayoutMode::Narrow),
-            (39, LayoutMode::TooSmall),
-        ] {
-            let plan = LayoutPlan::calculate(Rect::new(0, 0, width, 24), false, false);
-            assert_eq!(plan.mode, expected, "width {width}");
-        }
-        assert_eq!(
-            LayoutPlan::calculate(Rect::new(0, 0, 160, 11), false, false).mode,
-            LayoutMode::TooSmall
+    fn responsive_layout_removes_blank_extension_first() {
+        let wide = LayoutPlan::calculate(
+            Rect::new(0, 0, 160, 40),
+            SinglePane::Conversation,
+            0,
+            3,
+            None,
         );
-    }
-
-    #[test]
-    fn wide_has_three_columns_and_medium_trades_rail_for_detail() {
-        let wide = LayoutPlan::calculate(Rect::new(0, 0, 180, 30), true, false);
         assert_eq!(wide.session_rail.unwrap().width, 24);
-        assert_eq!(wide.detail_pane.unwrap().width, 40);
-        assert_eq!(wide.main_surface.width, 116);
-
-        let medium = LayoutPlan::calculate(Rect::new(0, 0, 140, 30), true, false);
-        assert!(medium.session_rail.is_none());
-        assert_eq!(medium.detail_pane.unwrap().width, 40);
-        assert_eq!(medium.main_surface.width, 100);
+        assert_eq!(wide.extension_blank.unwrap().width, 40);
+        assert_eq!(wide.conversation.unwrap().width, 96);
+        let medium = LayoutPlan::calculate(
+            Rect::new(0, 0, 120, 40),
+            SinglePane::Conversation,
+            0,
+            3,
+            None,
+        );
+        assert!(medium.extension_blank.is_none());
+        assert_eq!(medium.conversation.unwrap().width, 96);
     }
 
     #[test]
-    fn compact_detail_uses_the_single_available_surface() {
-        let plan = LayoutPlan::calculate(Rect::new(0, 0, 100, 24), true, false);
-        assert_eq!(plan.main_surface.width, 0);
-        assert_eq!(plan.detail_pane, Some(Rect::new(0, 2, 100, 20)));
+    fn composer_is_always_inside_conversation() {
+        for width in [40, 60, 99, 100, 139, 140, 180] {
+            let plan = LayoutPlan::calculate(
+                Rect::new(0, 0, width, 40),
+                SinglePane::Conversation,
+                5,
+                8,
+                None,
+            );
+            let center = plan.conversation.unwrap();
+            let composer = plan.composer.unwrap();
+            assert!(composer.x >= center.x && composer.right() <= center.right());
+            assert!(composer.y >= center.y && composer.bottom() <= center.bottom());
+        }
     }
 
     #[test]
-    fn hit_testing_uses_rendered_rectangles_and_respects_overlays() {
-        let plan = LayoutPlan::calculate(Rect::new(0, 0, 180, 30), true, true);
-        let close = plan
-            .hit_regions
-            .iter()
-            .find(|region| region.target == HitTarget::CloseDetail)
-            .unwrap();
-        assert_eq!(
-            plan.hit(close.area.x, close.area.y),
-            Some(HitTarget::CloseDetail)
+    fn blank_extension_has_no_hit_targets() {
+        let plan = LayoutPlan::calculate(
+            Rect::new(0, 0, 180, 40),
+            SinglePane::Conversation,
+            4,
+            4,
+            None,
         );
-        let dialog = plan.dialog_layer.unwrap();
-        let confirm = dialog_confirm_area(dialog);
-        assert_eq!(
-            plan.hit(confirm.x, confirm.y),
-            Some(HitTarget::DialogConfirm)
-        );
-        assert_eq!(plan.hit(dialog.x, dialog.y), None);
+        let blank = plan.extension_blank.unwrap();
+        assert_eq!(plan.hit(blank.x + 1, blank.y + 1), None);
     }
 }

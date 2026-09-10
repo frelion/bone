@@ -26,8 +26,6 @@ fn real_binary_restores_every_terminal_mode_after_visible_quit_flow() {
 
     process.wait_for_bytes(b"\x1b[?1049h");
     process.write(&[0x11]);
-    process.wait_for_text("确认退出");
-    process.write(b"\r");
     let status = process.wait_for_exit();
     assert!(status.success(), "bone exited with {status}");
     process.wait_for_bytes(b"\x1b[?1049l");
@@ -177,23 +175,6 @@ impl PtyBone {
             .any(|window| window == needle)
         {
             self.assert_before_deadline("expected terminal protocol was not emitted");
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn wait_for_text(&self, needle: &str) {
-        loop {
-            let captured = self.output.lock().expect("capture lock").clone();
-            let visible = terminal_visible_text(&captured);
-            if visible.contains(needle) {
-                return;
-            }
-            if Instant::now() >= self.deadline {
-                panic!(
-                    "PTY visible output never contained {needle:?}; visible: {visible}; raw: {}",
-                    String::from_utf8_lossy(&captured)
-                );
-            }
             thread::sleep(Duration::from_millis(10));
         }
     }

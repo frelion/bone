@@ -60,6 +60,10 @@ fn public_api_reexports_frontend_configuration_and_agent_semantics() {
     exported::<SessionReleaseStatus>();
     exported::<SessionRetentionReason>();
     let _ = bone_app::App::workspace_overview;
+    let _ = bone_app::App::resolved_workspace_config;
+    let _ = bone_app::App::create_session_idempotent;
+    let _ = bone_app::App::last_active_session;
+    let _ = bone_app::App::set_last_active_session;
     let _ = bone_app::App::workspace_changes;
     let _ = bone_app::App::results;
     let _ = bone_app::App::result_artifact;
@@ -69,4 +73,6 @@ fn public_api_reexports_frontend_configuration_and_agent_semantics() {
     let _ = bone_app::App::release_session;
     let _ = bone_app::Session::recent_history;
     let _ = bone_app::Session::submit_acceptance;
+    let _ = bone_app::Session::title_from_first_input;
+    exported::<bone_app::CreateSessionRequest>();
 }

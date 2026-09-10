@@ -1223,6 +1223,207 @@ async fn workspace_overview_rejects_an_unknown_workspace() {
     ));
 }
 
+#[tokio::test]
+async fn workspace_config_resolves_without_opening_a_session() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let resolved = app.resolved_workspace_config(workspace.id).await.unwrap();
+    assert!(resolved.desired.is_ok());
+    assert_eq!(resolved.running, None);
+    assert_eq!(app.test_open_session_count().await, 0);
+    assert!(matches!(
+        app.resolved_workspace_config(WorkspaceId::new()).await,
+        Err(Error::WorkspaceNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn last_active_session_is_durable_and_workspace_scoped() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let other_root = workspace.root.join("other");
+    std::fs::create_dir(&other_root).unwrap();
+    let other_workspace = app.open_workspace(other_root).await.unwrap();
+    let session = app.create_session(workspace.id, "Selected").await.unwrap();
+    let other = app
+        .create_session(other_workspace.id, "Other")
+        .await
+        .unwrap();
+
+    assert_eq!(app.last_active_session(workspace.id).await.unwrap(), None);
+    app.set_last_active_session(workspace.id, session.id())
+        .await
+        .unwrap();
+    assert_eq!(
+        app.last_active_session(workspace.id).await.unwrap(),
+        Some(session.id())
+    );
+    assert!(matches!(
+        app.set_last_active_session(workspace.id, other.id()).await,
+        Err(Error::SessionNotFound)
+    ));
+    assert!(matches!(
+        app.set_last_active_session(workspace.id, SessionId::new())
+            .await,
+        Err(Error::SessionNotFound)
+    ));
+    assert!(matches!(
+        app.last_active_session(WorkspaceId::new()).await,
+        Err(Error::WorkspaceNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn create_session_request_is_durable_and_idempotent() {
+    let (temporary, app, workspace) = configured_app().await;
+    let request_id = RequestId::new();
+    let request = CreateSessionRequest {
+        request_id,
+        workspace: workspace.id,
+        title: "New session".into(),
+        provisional: true,
+    };
+    let first = app
+        .create_session_idempotent(request.clone())
+        .await
+        .unwrap();
+    let retry = app
+        .create_session_idempotent(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(retry.id(), first.id());
+    assert_eq!(
+        app.workspace_overview(workspace.id)
+            .await
+            .unwrap()
+            .sessions
+            .len(),
+        1
+    );
+    assert!(matches!(
+        app.create_session_idempotent(CreateSessionRequest {
+            title: "Different".into(),
+            ..request.clone()
+        })
+        .await,
+        Err(Error::RequestConflict)
+    ));
+    assert!(matches!(
+        app.create_session_idempotent(CreateSessionRequest {
+            provisional: false,
+            ..request.clone()
+        })
+        .await,
+        Err(Error::RequestConflict)
+    ));
+
+    let id = first.id();
+    app.shutdown().await.unwrap();
+    let reopened = App::with_ports(
+        AppOptions::new(temporary.path().join("data")),
+        Arc::new(CompletingModel {
+            work_calls: AtomicUsize::new(0),
+        }),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    let retried_after_restart = reopened.create_session_idempotent(request).await.unwrap();
+    assert_eq!(retried_after_restart.id(), id);
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn automatic_title_only_replaces_a_provisional_title_once() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session_idempotent(CreateSessionRequest {
+            request_id: RequestId::new(),
+            workspace: workspace.id,
+            title: "New session".into(),
+            provisional: true,
+        })
+        .await
+        .unwrap();
+    assert!(!session.title_from_first_input(" \n\t ").await.unwrap());
+    assert!(session
+        .title_from_first_input(
+            "  Explain   why this behavior is deterministic and safely handles a very long first input  ",
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        session.snapshot().await.unwrap().session.title,
+        "Explain why this behavior is deterministic and safely handle…"
+    );
+    assert!(
+        !session
+            .title_from_first_input("Second input")
+            .await
+            .unwrap()
+    );
+
+    let unicode = app
+        .create_session_idempotent(CreateSessionRequest {
+            request_id: RequestId::new(),
+            workspace: workspace.id,
+            title: "New session".into(),
+            provisional: true,
+        })
+        .await
+        .unwrap();
+    assert!(
+        unicode
+            .title_from_first_input(&"😀".repeat(100))
+            .await
+            .unwrap()
+    );
+    assert!(unicode.snapshot().await.unwrap().session.title.len() <= 200);
+
+    let manually_named = app
+        .create_session_idempotent(CreateSessionRequest {
+            request_id: RequestId::new(),
+            workspace: workspace.id,
+            title: "New session".into(),
+            provisional: true,
+        })
+        .await
+        .unwrap();
+    manually_named.rename("My chosen title").await.unwrap();
+    assert!(
+        !manually_named
+            .title_from_first_input("This must not win")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        manually_named.snapshot().await.unwrap().session.title,
+        "My chosen title"
+    );
+
+    let explicit_request = CreateSessionRequest {
+        request_id: RequestId::new(),
+        workspace: workspace.id,
+        title: "Explicit title".into(),
+        provisional: false,
+    };
+    let explicitly_named = app
+        .create_session_idempotent(explicit_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        app.create_session_idempotent(explicit_request)
+            .await
+            .unwrap()
+            .id(),
+        explicitly_named.id()
+    );
+    assert!(
+        !explicitly_named
+            .title_from_first_input("This must also not win")
+            .await
+            .unwrap()
+    );
+}
+
 #[test]
 fn recent_history_pages_backward_from_a_stable_snapshot() {
     let temporary = tempfile::tempdir().unwrap();
