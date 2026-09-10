@@ -10,9 +10,11 @@ mod security;
 mod sqlite;
 mod store;
 
-pub(crate) use document::{Document, DocumentKey, DocumentListEntry, DocumentSnapshot, Revision};
+pub(crate) use document::{
+    Document, DocumentKey, DocumentListEntry, DocumentRecentPage, DocumentSnapshot, Revision,
+};
 pub(crate) use error::StoreError;
-pub(crate) use journal::{Journal, JournalAppend, JournalKey};
+pub(crate) use journal::{Journal, JournalAppend, JournalKey, JournalRecentRead};
 pub(crate) use lease::{Lease, LeaseKey};
 pub(crate) use roots::StoreRoots;
 pub(crate) use store::{BoneStore, WriteTransaction};

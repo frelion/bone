@@ -11,9 +11,14 @@ use bone_core::{ModelPort, ToolPort};
 use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::{
-    ApiKey, AppOptions, AppShutdownReport, ConfigChange, ConfigProblem, ConfigScope, DataStore,
-    Error, LoginState, Profile, ProfileId, ProviderConnector, ResolvedConfig, Result,
-    RuntimeConfig, RuntimeOverrides, Session, SessionId, SessionInfo, WorkspaceId, WorkspaceInfo,
+    AcceptanceCursor, AcceptancePage, ApiKey, AppOptions, AppShutdownReport, ConfigChange,
+    ConfigProblem, ConfigScope, DataStore, Error, EvidenceAvailability, EvidenceCursor,
+    EvidencePage, EvidenceRef, EvidenceSourcePage, HistoryCursor, LoginState, Profile, ProfileId,
+    ProviderConnector, ResolvedConfig, Result, ResultArtifact, ResultPage, ResultRef,
+    RuntimeConfig, RuntimeOverrides, Session, SessionId, SessionInfo, SessionReleaseReceipt,
+    SessionReleaseStatus, WorkspaceChangeCursor, WorkspaceChangePage, WorkspaceFileCursor,
+    WorkspaceFilePage, WorkspaceFileSource, WorkspaceFileView, WorkspaceId, WorkspaceInfo,
+    WorkspaceOverview,
     config::{resolve_runtime, validate_agent_limits, validate_tool_settings},
     providers::ProviderConnectError,
 };
@@ -30,10 +35,15 @@ struct AppInner {
     providers: ProviderConnector,
     /// Orders durable configuration writes through live Session acknowledgement.
     config_updates: Mutex<()>,
-    sessions: Mutex<BTreeMap<SessionId, Session>>,
+    sessions: Mutex<BTreeMap<SessionId, LiveSession>>,
     write_gates: Mutex<BTreeMap<WorkspaceId, Arc<crate::tools::WriteGate>>>,
     shutdown: Mutex<Shutdown>,
     closed: Arc<AtomicBool>,
+}
+
+struct LiveSession {
+    handle: Session,
+    releasing: bool,
 }
 
 #[derive(Default)]
@@ -101,6 +111,11 @@ impl App {
                 .get(&workspace)
                 .expect("workspace write gate exists"),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_open_session_count(&self) -> usize {
+        self.inner.sessions.lock().await.len()
     }
 
     pub async fn open(options: AppOptions) -> Result<Self> {
@@ -201,10 +216,16 @@ impl App {
     }
 
     pub async fn session(&self, id: SessionId) -> Result<Session> {
-        let sessions = self.inner.sessions.lock().await;
+        let mut sessions = self.inner.sessions.lock().await;
         self.ensure_open()?;
-        if let Some(session) = sessions.get(&id).cloned() {
-            return Ok(session);
+        if let Some(session) = sessions.get(&id) {
+            if session.releasing {
+                return Err(Error::SessionBusy(id));
+            }
+            if !session.handle.actor_closed() {
+                return Ok(session.handle.clone());
+            }
+            sessions.remove(&id);
         }
         drop(sessions);
         let saved = self
@@ -215,12 +236,312 @@ impl App {
         self.open_session(saved).await
     }
 
+    /// Release an idle Session actor and its exclusive writer lease. The App,
+    /// not the frontend, decides whether live execution and durable state make
+    /// release safe. A retained Session continues running in the background.
+    pub async fn release_session(&self, id: SessionId) -> Result<SessionReleaseReceipt> {
+        let app = self.clone();
+        tokio::spawn(async move { app.release_session_inner(id).await })
+            .await
+            .map_err(|error| Error::InvalidState(format!("session release task failed: {error}")))?
+    }
+
+    async fn release_session_inner(&self, id: SessionId) -> Result<SessionReleaseReceipt> {
+        let session = {
+            let mut sessions = self.inner.sessions.lock().await;
+            self.ensure_open()?;
+            let Some(session) = sessions.get_mut(&id) else {
+                return Ok(SessionReleaseReceipt {
+                    session: id,
+                    status: SessionReleaseStatus::NotOpen,
+                });
+            };
+            if session.releasing {
+                return Ok(SessionReleaseReceipt {
+                    session: id,
+                    status: SessionReleaseStatus::Retained(
+                        crate::SessionRetentionReason::ReleaseInProgress,
+                    ),
+                });
+            }
+            if session.handle.actor_closed() {
+                sessions.remove(&id);
+                return Ok(SessionReleaseReceipt {
+                    session: id,
+                    status: SessionReleaseStatus::NotOpen,
+                });
+            }
+            session.releasing = true;
+            session.handle.clone()
+        };
+        let result = session.release_if_idle().await;
+        let mut sessions = self.inner.sessions.lock().await;
+        match &result {
+            Ok(SessionReleaseStatus::Released) => {
+                sessions.remove(&id);
+            }
+            _ => {
+                if let Some(session) = sessions.get_mut(&id) {
+                    session.releasing = false;
+                }
+            }
+        }
+        let status = result?;
+        Ok(SessionReleaseReceipt {
+            session: id,
+            status,
+        })
+    }
+
     pub async fn list_sessions(&self, workspace: WorkspaceId) -> Result<Vec<SessionInfo>> {
         self.ensure_open()?;
         if self.inner.store.workspace_by_id(workspace)?.is_none() {
             return Err(Error::WorkspaceNotFound);
         }
         self.inner.store.sessions(workspace).map_err(Into::into)
+    }
+
+    /// Returns durable workspace navigation and attention data without opening
+    /// Sessions or acquiring their exclusive writer leases.
+    pub async fn workspace_overview(&self, workspace: WorkspaceId) -> Result<WorkspaceOverview> {
+        self.ensure_open()?;
+        let workspace = self
+            .inner
+            .store
+            .workspace_by_id(workspace)?
+            .ok_or(Error::WorkspaceNotFound)?;
+        let store = self.inner.store.clone();
+        tokio::task::spawn_blocking(move || {
+            store.workspace_overview(workspace).map_err(Error::from)
+        })
+        .await
+        .map_err(|error| Error::InvalidState(format!("workspace overview task failed: {error}")))?
+    }
+
+    /// Lists current workspace changes relative to Git HEAD. The returned
+    /// changes describe the whole workspace and are not attributed to a task.
+    pub async fn workspace_changes(
+        &self,
+        workspace: WorkspaceId,
+        cursor: Option<WorkspaceChangeCursor>,
+        limit: usize,
+    ) -> Result<WorkspaceChangePage> {
+        self.ensure_open()?;
+        let root = self
+            .inner
+            .store
+            .workspace_by_id(workspace)?
+            .ok_or(Error::WorkspaceNotFound)?
+            .root;
+        tokio::task::spawn_blocking(move || crate::workspace_changes::changes(&root, cursor, limit))
+            .await
+            .map_err(|error| {
+                Error::InvalidState(format!("workspace changes task failed: {error}"))
+            })?
+    }
+
+    /// Reads a strictly limited diff or working-tree body for one file in the
+    /// current change set. Paths are always workspace-relative.
+    pub async fn workspace_file(
+        &self,
+        workspace: WorkspaceId,
+        path: impl Into<String>,
+        source: WorkspaceFileSource,
+        max_bytes: usize,
+    ) -> Result<WorkspaceFileView> {
+        let page = self
+            .workspace_file_page(workspace, path, source, None, max_bytes)
+            .await?;
+        Ok(WorkspaceFileView {
+            baseline: page.baseline,
+            path: page.path,
+            source: page.source,
+            media: page.media,
+            text: page.text,
+            bytes_read: page.bytes_read,
+            total_bytes: page.total_bytes,
+            truncated: page.next_cursor.is_some(),
+        })
+    }
+
+    /// Reads one stable page of a changed file or diff. Continuations are
+    /// rejected when the HEAD, path, source, or observed content has changed.
+    pub async fn workspace_file_page(
+        &self,
+        workspace: WorkspaceId,
+        path: impl Into<String>,
+        source: WorkspaceFileSource,
+        cursor: Option<WorkspaceFileCursor>,
+        max_bytes: usize,
+    ) -> Result<WorkspaceFilePage> {
+        self.ensure_open()?;
+        let root = self
+            .inner
+            .store
+            .workspace_by_id(workspace)?
+            .ok_or(Error::WorkspaceNotFound)?
+            .root;
+        let path = path.into();
+        tokio::task::spawn_blocking(move || {
+            crate::workspace_changes::file_page(&root, &path, source, cursor, max_bytes)
+        })
+        .await
+        .map_err(|error| Error::InvalidState(format!("workspace file task failed: {error}")))?
+    }
+
+    pub async fn results(
+        &self,
+        session: SessionId,
+        cursor: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<ResultPage> {
+        self.ensure_open()?;
+        if cursor.is_some_and(|cursor| cursor.session() != session) {
+            return Err(Error::InvalidState(
+                "history cursor belongs to another session".into(),
+            ));
+        }
+        if self.inner.store.session(session)?.is_none() {
+            return Err(Error::SessionNotFound);
+        }
+        let store = self.inner.store.clone();
+        tokio::task::spawn_blocking(move || {
+            store
+                .results(session, cursor, limit.clamp(1, 32))
+                .map_err(Error::from)
+        })
+        .await
+        .map_err(|error| Error::InvalidState(format!("result query task failed: {error}")))?
+    }
+
+    /// Returns one completed result as a durable product artifact. Evidence
+    /// bodies remain separate so callers cannot accidentally fetch unbounded
+    /// tool output while rendering a result list.
+    pub async fn result_artifact(&self, result: ResultRef) -> Result<ResultArtifact> {
+        self.ensure_open()?;
+        let store = self.inner.store.clone();
+        tokio::task::spawn_blocking(move || {
+            store
+                .result_artifact(result)?
+                .ok_or_else(|| Error::InvalidState("result artifact not found".into()))
+        })
+        .await
+        .map_err(|error| Error::InvalidState(format!("result artifact task failed: {error}")))?
+    }
+
+    /// Pages only the sources explicitly cited by this exact result version.
+    pub async fn result_evidence(
+        &self,
+        result: ResultRef,
+        cursor: Option<EvidenceCursor>,
+        limit: usize,
+    ) -> Result<EvidencePage> {
+        self.ensure_open()?;
+        if cursor.is_some_and(|cursor| cursor.result() != result) {
+            return Err(Error::InvalidState(
+                "evidence cursor belongs to another result".into(),
+            ));
+        }
+        let store = self.inner.store.clone();
+        tokio::task::spawn_blocking(move || {
+            store
+                .result_evidence(result, cursor, limit.clamp(1, 32))?
+                .ok_or_else(|| Error::InvalidState("evidence result not found".into()))
+        })
+        .await
+        .map_err(|error| Error::InvalidState(format!("result evidence task failed: {error}")))?
+    }
+
+    /// Reads a byte-bounded UTF-8 page from an explicitly cited public source.
+    /// Private Core records are represented as `Private` without exposing
+    /// their title or body; tool arguments are never part of this projection.
+    pub async fn evidence_source(
+        &self,
+        result: ResultRef,
+        source: EvidenceRef,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<EvidenceSourcePage> {
+        self.ensure_open()?;
+        if source.session != result.session {
+            return Err(Error::InvalidState(
+                "evidence source belongs to another session".into(),
+            ));
+        }
+        let store = self.inner.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let projection_pending = store.evidence_projection_pending(result.session)?;
+            if !store.result_cites(result, source)? {
+                return Err(Error::InvalidState(
+                    "source is not cited by this result".into(),
+                ));
+            }
+            let projected =
+                store.evidence_source_page_record(source, offset, max_bytes.clamp(1, 64 * 1024))?;
+            let Some(projected) = projected else {
+                return Ok(EvidenceSourcePage {
+                    source,
+                    availability: EvidenceAvailability::Missing,
+                    text: None,
+                    offset: 0,
+                    next_offset: None,
+                    total_bytes: None,
+                    projection_pending,
+                });
+            };
+            match projected.metadata {
+                crate::persistence::StoredEvidenceMetadata::Private => Ok(EvidenceSourcePage {
+                    source,
+                    availability: EvidenceAvailability::Private,
+                    text: None,
+                    offset: 0,
+                    next_offset: None,
+                    total_bytes: None,
+                    projection_pending,
+                }),
+                crate::persistence::StoredEvidenceMetadata::Public {
+                    kind,
+                    title,
+                    byte_len,
+                    ..
+                } => Ok(EvidenceSourcePage {
+                    source,
+                    availability: EvidenceAvailability::Available { kind, title },
+                    text: projected.text,
+                    offset: projected.offset,
+                    next_offset: projected.next_offset,
+                    total_bytes: Some(byte_len),
+                    projection_pending,
+                }),
+            }
+        })
+        .await
+        .map_err(|error| Error::InvalidState(format!("evidence source task failed: {error}")))?
+    }
+
+    pub async fn acceptances(
+        &self,
+        result: ResultRef,
+        cursor: Option<AcceptanceCursor>,
+        limit: usize,
+    ) -> Result<AcceptancePage> {
+        self.ensure_open()?;
+        if cursor.is_some_and(|cursor| cursor.result() != result) {
+            return Err(Error::InvalidState(
+                "acceptance cursor belongs to another result".into(),
+            ));
+        }
+        let store = self.inner.store.clone();
+        tokio::task::spawn_blocking(move || {
+            if store.result(result)?.is_none() {
+                return Err(Error::InvalidState("acceptance result not found".into()));
+            }
+            store
+                .acceptances(result, cursor, limit.clamp(1, 32))
+                .map_err(Error::from)
+        })
+        .await
+        .map_err(|error| Error::InvalidState(format!("acceptance query task failed: {error}")))?
     }
 
     /// Returns the authoritative set of writes that still need inspection.
@@ -306,6 +627,8 @@ impl App {
 
         let targets = sessions
             .values()
+            .filter(|session| !session.releasing)
+            .map(|session| &session.handle)
             .filter(|session| config_affects(scope, session))
             .cloned()
             .collect::<Vec<_>>();
@@ -343,7 +666,7 @@ impl App {
             &self.inner.store.profiles()?,
             workspace.root,
         );
-        let live = sessions.get(&session).cloned();
+        let live = sessions.get(&session).map(|session| session.handle.clone());
         let running = live.and_then(|session| {
             let view = session.observe();
             match &view.borrow().runtime {
@@ -379,7 +702,11 @@ impl App {
         let sessions = self.inner.sessions.lock().await;
         self.ensure_open()?;
         self.inner.store.save_profile(profile)?;
-        let targets = sessions.values().cloned().collect::<Vec<_>>();
+        let targets = sessions
+            .values()
+            .filter(|session| !session.releasing)
+            .map(|session| session.handle.clone())
+            .collect::<Vec<_>>();
         drop(sessions);
         reload_sessions(&targets).await
     }
@@ -481,11 +808,14 @@ impl App {
 
     async fn register_session(
         &self,
-        sessions: &mut BTreeMap<SessionId, Session>,
+        sessions: &mut BTreeMap<SessionId, LiveSession>,
         saved: crate::SavedSession,
     ) -> Result<Session> {
         if let Some(session) = sessions.get(&saved.info.id) {
-            return Ok(session.clone());
+            if session.releasing {
+                return Err(Error::SessionBusy(saved.info.id));
+            }
+            return Ok(session.handle.clone());
         }
         let write_gate = {
             let mut gates = self.inner.write_gates.lock().await;
@@ -502,7 +832,13 @@ impl App {
             write_gate,
             Arc::clone(&self.inner.closed),
         )?;
-        sessions.insert(session.id(), session.clone());
+        sessions.insert(
+            session.id(),
+            LiveSession {
+                handle: session.clone(),
+                releasing: false,
+            },
+        );
         Ok(session)
     }
 
@@ -578,7 +914,7 @@ async fn finish_shutdown(inner: Arc<AppInner>) -> Result<AppShutdownReport> {
         .lock()
         .await
         .values()
-        .cloned()
+        .map(|session| session.handle.clone())
         .collect::<Vec<_>>();
 
     let mut shutdowns = tokio::task::JoinSet::new();

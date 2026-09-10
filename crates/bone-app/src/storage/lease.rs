@@ -38,6 +38,16 @@ impl fmt::Debug for Lease {
     }
 }
 
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // Make releasing the application writer lease an explicit synchronous
+        // linearization point. Relying only on closing the file descriptor can
+        // leave an observable contention window on some filesystems under
+        // parallel descriptor churn.
+        let _ = fs2::FileExt::unlock(&self._file);
+    }
+}
+
 pub(crate) fn lease_file_name(key: &LeaseKey) -> String {
     let mut encoded = String::with_capacity(key.as_str().len() * 2 + 5);
     for byte in key.as_str().bytes() {

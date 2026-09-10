@@ -49,6 +49,13 @@ pub struct JournalRead<E> {
     pub has_more: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct JournalRecentRead<E> {
+    pub entries: Vec<JournalEntry<E>>,
+    pub older_before: Option<u64>,
+    pub snapshot_through: u64,
+}
+
 impl<E> JournalRead<E> {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
@@ -104,7 +111,18 @@ impl<E> Journal<E> {
         read_journal_after(&connection, &self.key, after, limit)
     }
 
-    #[cfg(test)]
+    pub(crate) fn read_recent(
+        &self,
+        cursor: Option<(u64, u64)>,
+        limit: usize,
+    ) -> Result<JournalRecentRead<E>, StoreError>
+    where
+        E: DeserializeOwned,
+    {
+        let connection = self.inner.connection()?;
+        read_journal_recent(&connection, &self.key, cursor, limit)
+    }
+
     pub fn read_entry(&self, sequence: u64) -> Result<Option<JournalEntry<E>>, StoreError>
     where
         E: DeserializeOwned,
@@ -214,7 +232,87 @@ where
     })
 }
 
-#[cfg(test)]
+pub(crate) fn read_journal_recent<E>(
+    connection: &Connection,
+    key: &JournalKey,
+    cursor: Option<(u64, u64)>,
+    limit: usize,
+) -> Result<JournalRecentRead<E>, StoreError>
+where
+    E: DeserializeOwned,
+{
+    let snapshot_through = match cursor {
+        Some((_, through)) => through,
+        None => read_last_journal_sequence(connection, key)?,
+    };
+    let before = cursor
+        .map(|(before, _)| before)
+        .unwrap_or_else(|| snapshot_through.saturating_add(1));
+    let upper = before.saturating_sub(1).min(snapshot_through);
+    if upper == 0 || limit == 0 {
+        return Ok(JournalRecentRead {
+            entries: Vec::new(),
+            older_before: None,
+            snapshot_through,
+        });
+    }
+    let upper_sql = i64::try_from(upper).map_err(|_| StoreError::RevisionExhausted)?;
+    let limit_sql = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut statement = connection
+        .prepare(
+            "
+                SELECT sequence, occurred_at, payload_json
+                FROM journal_entries
+                WHERE journal_key = ?1 AND sequence <= ?2
+                ORDER BY sequence DESC
+                LIMIT ?3
+            ",
+        )
+        .map_err(|error| StoreError::sqlite("prepare recent journal read", error))?;
+    let rows = statement
+        .query_map(params![key.as_str(), upper_sql, limit_sql], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| StoreError::sqlite("read recent journal", error))?;
+    let mut entries = Vec::with_capacity(limit.saturating_add(1).min(1024));
+    for row in rows {
+        let (sequence, occurred_at, payload_json) =
+            row.map_err(|error| StoreError::sqlite("read recent journal", error))?;
+        entries.push(decode_entry(sequence, occurred_at, payload_json)?);
+    }
+    entries.reverse();
+    for pair in entries.windows(2) {
+        if pair[0].sequence.checked_add(1) != Some(pair[1].sequence) {
+            return Err(StoreError::Corrupt {
+                message: "journal sequence is not contiguous",
+            });
+        }
+    }
+    let has_older = entries.len() > limit;
+    if has_older {
+        entries.remove(0);
+    } else if entries.first().is_some_and(|entry| entry.sequence != 1) {
+        return Err(StoreError::Corrupt {
+            message: "journal sequence is not contiguous",
+        });
+    }
+    let older_before = has_older.then(|| {
+        entries
+            .first()
+            .expect("an extra row requires a full non-empty page")
+            .sequence
+    });
+    Ok(JournalRecentRead {
+        entries,
+        older_before,
+        snapshot_through,
+    })
+}
+
 pub(crate) fn read_journal_entry<E>(
     connection: &Connection,
     key: &JournalKey,
@@ -447,6 +545,59 @@ mod tests {
         assert_eq!(empty.last_sequence, 5);
         assert!(!empty.has_more);
         assert_eq!(journal.last_sequence().unwrap(), 5);
+    }
+
+    #[test]
+    fn recent_journal_pages_are_ascending_and_snapshot_stable() {
+        let (_temporary, store) = store();
+        let journal = store.journal::<String>(JournalKey::new("test/recent"));
+        for value in ["one", "two", "three", "four", "five"] {
+            journal.append(&value.to_owned()).unwrap();
+        }
+        let newest = journal.read_recent(None, 2).unwrap();
+        assert_eq!(
+            newest
+                .entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            [4, 5]
+        );
+        assert_eq!(newest.snapshot_through, 5);
+        journal.append(&"six".to_owned()).unwrap();
+        let older = journal
+            .read_recent(newest.older_before.map(|before| (before, 5)), 2)
+            .unwrap();
+        assert_eq!(
+            older
+                .entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert_eq!(older.snapshot_through, 5);
+    }
+
+    #[test]
+    fn recent_journal_read_detects_a_gap_across_the_page_boundary() {
+        let (_temporary, store) = store();
+        let journal = store.journal::<String>(JournalKey::new("test/recent-gap"));
+        for value in ["one", "two", "three", "four", "five"] {
+            journal.append(&value.to_owned()).unwrap();
+        }
+        let writer = rusqlite::Connection::open(store.database_path()).unwrap();
+        writer
+            .execute(
+                "DELETE FROM journal_entries WHERE journal_key = ?1 AND sequence = 3",
+                ["test/recent-gap"],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            journal.read_recent(None, 2),
+            Err(super::StoreError::Corrupt { .. })
+        ));
     }
 
     #[test]

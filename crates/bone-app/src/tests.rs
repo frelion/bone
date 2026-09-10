@@ -179,6 +179,76 @@ struct BlockingBashModel {
 
 struct AlwaysToolModel;
 
+struct EvidenceModel;
+
+impl ModelPort for EvidenceModel {
+    fn coordinate(
+        &self,
+        input: CoordinateInput,
+        _: CallContext,
+    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
+        let decision = route_input(&input, "produce cited evidence");
+        Box::pin(async move { Ok(decision) })
+    }
+
+    fn work(
+        &self,
+        input: WorkInput,
+        _: CallContext,
+    ) -> PortFuture<std::result::Result<WorkProposal, CallError>> {
+        Box::pin(async move {
+            let mut tool = None;
+            let mut note = None;
+            for view in &input.records {
+                match serde_json::from_str::<RecordBody>(&view.content) {
+                    Ok(RecordBody::ToolFinished { .. }) => tool = Some(view.source),
+                    Ok(RecordBody::Note { .. }) => note = Some(view.source),
+                    _ => {}
+                }
+            }
+            if tool.is_none() {
+                return Ok(WorkProposal::new(WorkStep::Tool(ToolCall::new(
+                    "evidence_tool",
+                    json!({"token": "ARGUMENT_SECRET"}),
+                ))));
+            }
+            if note.is_none() {
+                let mut proposal = WorkProposal::new(WorkStep::Continue);
+                proposal.note = Some("PRIVATE_PLANNING_NOTE".into());
+                return Ok(proposal);
+            }
+            let mut completion = Completion::new("evidence complete");
+            completion.evidence = vec![tool.unwrap(), note.unwrap()];
+            Ok(WorkProposal::new(WorkStep::Finish(completion)))
+        })
+    }
+
+    fn compact(
+        &self,
+        _: CompactInput,
+        _: CallContext,
+    ) -> PortFuture<std::result::Result<CheckpointDraft, CallError>> {
+        panic!("test does not compact")
+    }
+}
+
+struct EvidenceTool;
+
+impl ToolPort for EvidenceTool {
+    fn specification(&self) -> ToolSpec {
+        ToolSpec {
+            name: "evidence_tool".into(),
+            description: "Return deterministic evidence.".into(),
+            parameters: json!({"type": "object"}),
+            effect: ToolEffect::ReadOnly,
+        }
+    }
+
+    fn run(&self, _: serde_json::Value, _: CallContext) -> PortFuture<ToolOutcome> {
+        Box::pin(async { ToolOutcome::value(json!({"body": "产物内容-abcdefgh"})) })
+    }
+}
+
 struct SelectiveBarrierModel;
 
 impl ModelPort for SelectiveBarrierModel {
@@ -627,6 +697,608 @@ async fn wait_for_tool_finished(session: &Session, name: &str) -> (CallRef, Tool
 }
 
 #[tokio::test]
+async fn workspace_overview_reads_durable_summaries_and_attention_without_a_session_lease() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let store = app.test_store();
+    let saved = store
+        .create_session(workspace.id, "Overview".into())
+        .unwrap();
+    let initial = app.workspace_overview(workspace.id).await.unwrap();
+    assert!(!initial.attention_projection_pending);
+    assert!(initial.attention.is_empty());
+    store.save_draft(saved.info.id, "继续检查".into()).unwrap();
+
+    let desired = app
+        .resolved_config(saved.info.id)
+        .await
+        .unwrap()
+        .desired
+        .unwrap();
+    let runtime = RuntimeId::new();
+    store
+        .start_runtime(
+            saved.info.id,
+            SavedRuntime {
+                id: runtime,
+                config: desired,
+            },
+            0,
+        )
+        .unwrap();
+
+    let waiting = store
+        .accept_input(saved.info.id, &SubmitInput::new("需要目标"))
+        .unwrap()
+        .0;
+    let question = QuestionId {
+        runtime,
+        record: 12,
+        reply_to: waiting.input,
+    };
+    store
+        .update_input(
+            saved.info.id,
+            waiting.input,
+            InputState::WaitingForUser {
+                runtime,
+                question,
+                text: "请选择目标".into(),
+            },
+            Some(SessionEvent::QuestionAsked {
+                question,
+                inputs: vec![waiting.input],
+                text: "请选择目标".into(),
+            }),
+        )
+        .unwrap();
+
+    let related = store
+        .accept_input(saved.info.id, &SubmitInput::new("同一问题的另一项输入"))
+        .unwrap()
+        .0;
+    store
+        .update_input(
+            saved.info.id,
+            related.input,
+            InputState::WaitingForUser {
+                runtime,
+                question: QuestionId {
+                    reply_to: related.input,
+                    ..question
+                },
+                text: "请选择目标".into(),
+            },
+            None,
+        )
+        .unwrap();
+
+    let interrupted = store
+        .accept_input(saved.info.id, &SubmitInput::new("被中断的工作"))
+        .unwrap()
+        .0;
+    store
+        .update_input(
+            saved.info.id,
+            interrupted.input,
+            InputState::Interrupted { runtime },
+            Some(SessionEvent::Interrupted {
+                runtime,
+                inputs: vec![interrupted.input],
+            }),
+        )
+        .unwrap();
+
+    let call = CallRef { runtime, id: 9 };
+    assert!(
+        store
+            .begin_write(
+                workspace.id,
+                saved.info.id,
+                call,
+                "workspace_write",
+                json!({ "path": "result.txt" }),
+            )
+            .unwrap()
+    );
+
+    let _lease = store.claim_session(saved.info.id).unwrap();
+    assert!(matches!(
+        app.session(saved.info.id).await,
+        Err(Error::SessionBusy(id)) if id == saved.info.id
+    ));
+    let overview = app.workspace_overview(workspace.id).await.unwrap();
+
+    assert_eq!(overview.workspace, workspace);
+    assert_eq!(overview.sessions.len(), 1);
+    let summary = &overview.sessions[0];
+    assert_eq!(summary.session, saved.info);
+    assert!(summary.has_draft);
+    assert_eq!(summary.draft_bytes, "继续检查".len() as u64);
+    assert_eq!(summary.persisted_runtime, Some(runtime));
+    assert!(summary.history_through.0 >= 4);
+    assert_eq!(overview.unresolved_writes.len(), 1);
+    assert!(!overview.attention_projection_pending);
+    assert!(overview.attention.iter().any(|item| matches!(
+        item,
+        AttentionItem::WaitingForUser {
+            session,
+            inputs,
+            question: saved_question,
+            text,
+            ..
+        } if *session == saved.info.id
+            && inputs == &[waiting.input, related.input]
+            && *saved_question == question
+            && text == "请选择目标"
+    )));
+    assert!(overview.attention.iter().all(|item| !matches!(
+        item,
+        AttentionItem::WaitingForUser { inputs, .. } if inputs.contains(&interrupted.input)
+    )));
+    assert!(overview.attention.iter().any(|item| matches!(
+        item,
+        AttentionItem::UnresolvedWrite {
+            session,
+            call: saved_call,
+            status: UnresolvedWriteStatus::Pending,
+        } if *session == saved.info.id && *saved_call == call
+    )));
+
+    store
+        .finish_write(
+            workspace.id,
+            call,
+            ToolOutcome {
+                result: Err(CallError::failed("result unknown")),
+                external_effect: ExternalEffect::Unknown,
+            },
+        )
+        .unwrap();
+    let finished = app.workspace_overview(workspace.id).await.unwrap();
+    assert!(finished.attention.iter().any(|item| matches!(
+        item,
+        AttentionItem::UnresolvedWrite {
+            call: saved_call,
+            status: UnresolvedWriteStatus::Finished,
+            ..
+        } if *saved_call == call
+    )));
+    assert!(matches!(
+        store
+            .resolve_write(
+                workspace.id,
+                saved.info.id,
+                call,
+                WriteResolution {
+                    external_effect: ExternalEffect::None,
+                    evidence: "verified".into(),
+                },
+            )
+            .unwrap(),
+        ResolveWriteResult::Applied
+    ));
+    let resolved = app.workspace_overview(workspace.id).await.unwrap();
+    assert!(resolved.attention.iter().all(|item| !matches!(
+        item,
+        AttentionItem::UnresolvedWrite { call: saved_call, .. } if *saved_call == call
+    )));
+    assert!(resolved.unresolved_writes.is_empty());
+}
+
+#[tokio::test]
+async fn begin_write_rejects_a_workspace_that_does_not_own_the_session() {
+    let (temporary, app, first_workspace) = configured_app().await;
+    let second_root = temporary.path().join("second-workspace");
+    std::fs::create_dir(&second_root).unwrap();
+    let second_workspace = app.open_workspace(second_root).await.unwrap();
+    let store = app.test_store();
+    let session = store
+        .create_session(second_workspace.id, "Second workspace".into())
+        .unwrap();
+    let call = CallRef {
+        runtime: RuntimeId::new(),
+        id: 1,
+    };
+
+    assert!(matches!(
+        store.begin_write(
+            first_workspace.id,
+            session.info.id,
+            call,
+            "workspace_write",
+            json!({}),
+        ),
+        Err(crate::storage::StoreError::Corrupt {
+            message: "write attempt workspace does not match its session",
+        })
+    ));
+    assert!(
+        app.workspace_overview(first_workspace.id)
+            .await
+            .unwrap()
+            .unresolved_writes
+            .is_empty()
+    );
+    assert!(
+        app.workspace_overview(second_workspace.id)
+            .await
+            .unwrap()
+            .unresolved_writes
+            .is_empty()
+    );
+}
+
+fn run_git(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn workspace_changes_are_paginated_typed_and_strictly_bounded() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let non_git = app.workspace_changes(workspace.id, None, 16).await.unwrap();
+    assert_eq!(non_git.baseline, WorkspaceBaseline::NotGit);
+    assert!(non_git.files.is_empty());
+
+    run_git(&workspace.root, &["init", "--quiet"]);
+    run_git(
+        &workspace.root,
+        &["config", "user.email", "bone@example.invalid"],
+    );
+    run_git(&workspace.root, &["config", "user.name", "BONE test"]);
+    std::fs::write(workspace.root.join("tracked.txt"), "old\n").unwrap();
+    std::fs::write(workspace.root.join("binary.bin"), b"old\0binary").unwrap();
+    run_git(&workspace.root, &["add", "tracked.txt", "binary.bin"]);
+    run_git(&workspace.root, &["commit", "--quiet", "-m", "baseline"]);
+
+    std::fs::write(
+        workspace.root.join("tracked.txt"),
+        format!("new\n{}", "long changed line\n".repeat(512)),
+    )
+    .unwrap();
+    std::fs::write(workspace.root.join("untracked.txt"), "new file\n").unwrap();
+    std::fs::write(workspace.root.join("binary.bin"), b"new\0binary").unwrap();
+
+    let mut cursor = None;
+    let mut files = Vec::new();
+    loop {
+        let page = app
+            .workspace_changes(workspace.id, cursor, 1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            page.baseline,
+            WorkspaceBaseline::Git { head: Some(_) }
+        ));
+        files.extend(page.files);
+        let Some(next) = page.next_cursor else { break };
+        cursor = Some(next);
+    }
+    assert_eq!(files.len(), 3);
+    assert!(files.iter().any(|file| {
+        file.path == "untracked.txt"
+            && !file.tracked
+            && file.index == GitFileState::Untracked
+            && file.worktree == GitFileState::Untracked
+    }));
+    assert!(files.iter().any(|file| {
+        file.path == "tracked.txt" && file.tracked && file.worktree == GitFileState::Modified
+    }));
+
+    let diff = app
+        .workspace_file(
+            workspace.id,
+            "tracked.txt",
+            WorkspaceFileSource::DiffAgainstHead,
+            128,
+        )
+        .await
+        .unwrap();
+    assert_eq!(diff.media, WorkspaceFileMedia::Text);
+    assert!(diff.truncated);
+    assert!(diff.bytes_read <= 129);
+    assert!(diff.text.as_ref().unwrap().len() <= 128);
+
+    let mut continuation = None;
+    let mut complete_diff = String::new();
+    loop {
+        let page = app
+            .workspace_file_page(
+                workspace.id,
+                "tracked.txt",
+                WorkspaceFileSource::DiffAgainstHead,
+                continuation,
+                128,
+            )
+            .await
+            .unwrap();
+        complete_diff.push_str(page.text.as_deref().unwrap());
+        let Some(next) = page.next_cursor else { break };
+        continuation = Some(next);
+    }
+    assert!(complete_diff.contains("+long changed line"));
+
+    let first = app
+        .workspace_file_page(
+            workspace.id,
+            "tracked.txt",
+            WorkspaceFileSource::WorkingTree,
+            None,
+            64,
+        )
+        .await
+        .unwrap();
+    let continuation = first.next_cursor.unwrap();
+    std::fs::write(
+        workspace.root.join("tracked.txt"),
+        "changed between pages\n",
+    )
+    .unwrap();
+    assert!(
+        app.workspace_file_page(
+            workspace.id,
+            "tracked.txt",
+            WorkspaceFileSource::WorkingTree,
+            Some(continuation),
+            64,
+        )
+        .await
+        .is_err()
+    );
+
+    let untracked = app
+        .workspace_file(
+            workspace.id,
+            "untracked.txt",
+            WorkspaceFileSource::WorkingTree,
+            64,
+        )
+        .await
+        .unwrap();
+    assert_eq!(untracked.media, WorkspaceFileMedia::Text);
+    assert_eq!(untracked.text.as_deref(), Some("new file\n"));
+    assert!(!untracked.truncated);
+
+    let binary = app
+        .workspace_file(
+            workspace.id,
+            "binary.bin",
+            WorkspaceFileSource::DiffAgainstHead,
+            64,
+        )
+        .await
+        .unwrap();
+    assert_eq!(binary.media, WorkspaceFileMedia::Binary);
+    assert!(binary.text.is_none());
+
+    for unsafe_path in ["../outside", "/absolute", "control\u{1b}path", "dir\\file"] {
+        assert!(
+            app.workspace_file(
+                workspace.id,
+                unsafe_path,
+                WorkspaceFileSource::WorkingTree,
+                64,
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert!(
+        app.workspace_file(
+            workspace.id,
+            ".git/config",
+            WorkspaceFileSource::WorkingTree,
+            64,
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn workspace_changes_reject_a_control_character_in_a_git_path() {
+    let (_temporary, app, workspace) = configured_app().await;
+    run_git(&workspace.root, &["init", "--quiet"]);
+    std::fs::write(workspace.root.join("bad\u{1b}path"), "unsafe").unwrap();
+    assert!(app.workspace_changes(workspace.id, None, 16).await.is_err());
+}
+
+#[tokio::test]
+async fn legacy_attention_backfill_is_bounded_incremental_and_resumable() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let store = app.test_store();
+    let session = store
+        .create_session(workspace.id, "Legacy attention".into())
+        .unwrap();
+    let waiting = store
+        .accept_input(session.info.id, &SubmitInput::new("old question"))
+        .unwrap()
+        .0;
+    let runtime = RuntimeId::new();
+    let question = QuestionId {
+        runtime,
+        record: 77,
+        reply_to: waiting.input,
+    };
+    store
+        .update_input(
+            session.info.id,
+            waiting.input,
+            InputState::WaitingForUser {
+                runtime,
+                question,
+                text: "legacy question".into(),
+            },
+            None,
+        )
+        .unwrap();
+    for index in 0..512 {
+        store
+            .accept_input(
+                session.info.id,
+                &SubmitInput::new(format!("ordinary input {index}")),
+            )
+            .unwrap();
+    }
+    let call = CallRef { runtime, id: 78 };
+    assert!(
+        store
+            .begin_write(
+                workspace.id,
+                session.info.id,
+                call,
+                "legacy-write",
+                json!({"path": "legacy"}),
+            )
+            .unwrap()
+    );
+    store.reset_attention_projection_for_test().unwrap();
+    let decoded_before = store.attention_backfill_decode_count();
+
+    let first = app.workspace_overview(workspace.id).await.unwrap();
+    assert!(first.attention_projection_pending);
+    assert_eq!(
+        store.attention_backfill_decode_count() - decoded_before,
+        130,
+        "one overview decodes 128 inputs plus one boundary proof and one write"
+    );
+    assert_eq!(first.unresolved_writes.len(), 1);
+    assert!(first.attention.iter().all(|item| !matches!(
+        item,
+        AttentionItem::WaitingForUser { question: saved, .. } if *saved == question
+    )));
+
+    let mut recovered = false;
+    for _ in 0..5 {
+        let overview = app.workspace_overview(workspace.id).await.unwrap();
+        if overview.attention.iter().any(|item| {
+            matches!(
+                item,
+                AttentionItem::WaitingForUser { question: saved, .. } if *saved == question
+            )
+        }) {
+            recovered = true;
+            assert!(!overview.attention_projection_pending);
+            break;
+        }
+    }
+    assert!(
+        recovered,
+        "bounded refreshes must finish legacy attention backfill"
+    );
+    let decoded_after_backfill = store.attention_backfill_decode_count();
+    app.workspace_overview(workspace.id).await.unwrap();
+    assert_eq!(
+        store.attention_backfill_decode_count(),
+        decoded_after_backfill,
+        "a completed projection must not rescan business documents"
+    );
+
+    store
+        .update_input(session.info.id, waiting.input, InputState::Cancelled, None)
+        .unwrap();
+    let updated = app.workspace_overview(workspace.id).await.unwrap();
+    assert!(updated.attention.iter().all(|item| !matches!(
+        item,
+        AttentionItem::WaitingForUser { question: saved, .. } if *saved == question
+    )));
+}
+
+#[tokio::test]
+async fn workspace_overview_rejects_an_unknown_workspace() {
+    let (_temporary, app, _workspace) = configured_app().await;
+    assert!(matches!(
+        app.workspace_overview(WorkspaceId::new()).await,
+        Err(Error::WorkspaceNotFound)
+    ));
+}
+
+#[test]
+fn recent_history_pages_backward_from_a_stable_snapshot() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace_root = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
+    let store = DataStore::open(temporary.path().join("data")).unwrap();
+    let workspace = store.workspace(&workspace_root).unwrap();
+    let session = store
+        .create_session(workspace.id, "Recent history".into())
+        .unwrap();
+
+    let empty = store.recent_history(session.info.id, None, 2).unwrap();
+    assert!(empty.items.is_empty());
+    assert_eq!(empty.snapshot_through, SessionSeq(0));
+    assert!(empty.older_cursor.is_none());
+
+    for index in 1..=5 {
+        store
+            .accept_input(session.info.id, &SubmitInput::new(format!("input {index}")))
+            .unwrap();
+    }
+    let newest = store.recent_history(session.info.id, None, 2).unwrap();
+    assert_eq!(
+        newest
+            .items
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![SessionSeq(4), SessionSeq(5)]
+    );
+    assert_eq!(newest.snapshot_through, SessionSeq(5));
+    let first_cursor = newest.older_cursor.unwrap();
+    assert_eq!(first_cursor.before(), SessionSeq(4));
+    assert_eq!(first_cursor.snapshot_through(), SessionSeq(5));
+
+    store
+        .accept_input(session.info.id, &SubmitInput::new("concurrent append"))
+        .unwrap();
+    let middle = store
+        .recent_history(session.info.id, Some(first_cursor), 2)
+        .unwrap();
+    assert_eq!(
+        middle
+            .items
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![SessionSeq(2), SessionSeq(3)]
+    );
+    assert_eq!(middle.snapshot_through, SessionSeq(5));
+    let oldest = store
+        .recent_history(session.info.id, middle.older_cursor, 2)
+        .unwrap();
+    assert_eq!(
+        oldest
+            .items
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![SessionSeq(1)]
+    );
+    assert!(oldest.older_cursor.is_none());
+
+    let fresh = store.recent_history(session.info.id, None, 2).unwrap();
+    assert_eq!(fresh.snapshot_through, SessionSeq(6));
+    assert_eq!(
+        fresh
+            .items
+            .iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![SessionSeq(5), SessionSeq(6)]
+    );
+}
+
+#[tokio::test]
 async fn headless_session_runs_and_persists_public_history() {
     let (_temporary, app, workspace) = configured_app().await;
     let session = app
@@ -650,6 +1322,694 @@ async fn headless_session_runs_and_persists_public_history() {
         entry.event,
         SessionEvent::InputFinished { input, .. } if input == receipt.input
     )));
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn acceptance_is_versioned_idempotent_and_rejection_atomically_creates_rework() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session(workspace.id, "Acceptance")
+        .await
+        .unwrap();
+    let original = session
+        .submit(SubmitInput::new("produce result"))
+        .await
+        .unwrap();
+    assert_completed(wait_for_input(&session, original.input).await);
+    let result = app
+        .results(session.id(), None, 32)
+        .await
+        .unwrap()
+        .items
+        .pop()
+        .unwrap()
+        .result;
+
+    let accepted = AcceptanceSubmission {
+        request_id: AcceptanceRequestId::new(),
+        result,
+        decision: AcceptanceDecision::Accepted,
+        reason: String::new(),
+        rework: None,
+    };
+    let first = session.submit_acceptance(accepted.clone()).await.unwrap();
+    let retry = session.submit_acceptance(accepted.clone()).await.unwrap();
+    assert_eq!(retry, first);
+    assert!(matches!(
+        session
+            .submit_acceptance(AcceptanceSubmission {
+                decision: AcceptanceDecision::PartiallyAccepted,
+                reason: "changed".into(),
+                ..accepted
+            })
+            .await,
+        Err(Error::RequestConflict)
+    ));
+
+    session
+        .submit_acceptance(AcceptanceSubmission {
+            request_id: AcceptanceRequestId::new(),
+            result,
+            decision: AcceptanceDecision::AcceptedWithRisk,
+            reason: "manual verification remains".into(),
+            rework: None,
+        })
+        .await
+        .unwrap();
+
+    // Product pagination counts durable results, not intervening journal
+    // events. The most recent result must remain visible after acceptance
+    // records are appended above it.
+    let result_page_after_acceptance = app.results(session.id(), None, 1).await.unwrap();
+    assert_eq!(result_page_after_acceptance.items.len(), 1);
+    assert_eq!(result_page_after_acceptance.items[0].result, result);
+
+    let rework = SubmitInput::new("fix the remaining issue");
+    let rejected = AcceptanceSubmission {
+        request_id: AcceptanceRequestId::new(),
+        result,
+        decision: AcceptanceDecision::Rejected,
+        reason: "require another pass".into(),
+        rework: Some(rework.clone()),
+    };
+    let rejected_receipt = session.submit_acceptance(rejected.clone()).await.unwrap();
+    let rework_receipt = rejected_receipt.rework.unwrap();
+    assert_eq!(
+        session.submit_acceptance(rejected).await.unwrap(),
+        rejected_receipt
+    );
+    assert_completed(wait_for_input(&session, rework_receipt.input).await);
+
+    let recent_records = app.acceptances(result, None, 2).await.unwrap();
+    assert_eq!(recent_records.items.len(), 2);
+    assert_eq!(
+        recent_records.items[0].decision,
+        AcceptanceDecision::AcceptedWithRisk
+    );
+    assert_eq!(
+        recent_records.items[1].decision,
+        AcceptanceDecision::Rejected
+    );
+    assert_eq!(recent_records.items[1].rework, Some(rework_receipt));
+    let older_records = app
+        .acceptances(result, recent_records.older_cursor, 2)
+        .await
+        .unwrap();
+    assert_eq!(older_records.items.len(), 1);
+    assert_eq!(older_records.items[0].id, first.id);
+    assert!(older_records.older_cursor.is_none());
+
+    let mut result_cursor = None;
+    let mut paged_results = Vec::new();
+    loop {
+        let page = app.results(session.id(), result_cursor, 1).await.unwrap();
+        assert!(page.items.len() <= 1);
+        paged_results.extend(page.items.into_iter().map(|item| item.result));
+        let Some(older) = page.older_cursor else {
+            break;
+        };
+        result_cursor = Some(older);
+    }
+    assert!(paged_results.contains(&result));
+
+    let history = session.history(SessionSeq(0), 256).await.unwrap();
+    assert_eq!(
+        history
+            .items
+            .iter()
+            .filter(|entry| matches!(
+                &entry.event,
+                SessionEvent::InputSubmitted { request_id, .. }
+                    if *request_id == rework.request_id
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        history
+            .items
+            .iter()
+            .filter(|entry| matches!(
+                entry.event,
+                SessionEvent::AcceptanceRecorded { acceptance, .. }
+                    if acceptance == rejected_receipt.id
+            ))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn rejected_acceptance_requires_reason_and_rework() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session(workspace.id, "Validation")
+        .await
+        .unwrap();
+    let result = ResultRef {
+        session: session.id(),
+        job: JobRef {
+            runtime: RuntimeId::new(),
+            id: 1,
+        },
+        version: SessionSeq(1),
+    };
+    assert!(matches!(
+        session
+            .submit_acceptance(AcceptanceSubmission {
+                request_id: AcceptanceRequestId::new(),
+                result,
+                decision: AcceptanceDecision::Rejected,
+                reason: "missing rework".into(),
+                rework: None,
+            })
+            .await,
+        Err(Error::InvalidState(_))
+    ));
+}
+
+#[tokio::test]
+async fn legacy_result_projection_backfill_is_bounded_and_resumable() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session(workspace.id, "Legacy result projection")
+        .await
+        .unwrap();
+    let submitted = session
+        .submit(SubmitInput::new("produce the legacy result"))
+        .await
+        .unwrap();
+    assert_completed(wait_for_input(&session, submitted.input).await);
+    let expected = app
+        .results(session.id(), None, 1)
+        .await
+        .unwrap()
+        .items
+        .pop()
+        .unwrap()
+        .result;
+
+    let store = app.test_store();
+    for index in 0..1_024 {
+        store
+            .accept_input(
+                session.id(),
+                &SubmitInput::new(format!("ordinary legacy event {index}")),
+            )
+            .unwrap();
+    }
+    store
+        .reset_result_projection_for_test(session.id())
+        .unwrap();
+    let decoded_before = store.result_backfill_decode_count();
+
+    let first = app.results(session.id(), None, 1).await.unwrap();
+    assert!(first.items.is_empty());
+    assert!(first.projection_pending);
+    assert_eq!(
+        store.result_backfill_decode_count() - decoded_before,
+        257,
+        "one query must decode one fixed migration window plus its boundary proof, not the full sparse history"
+    );
+
+    let mut found = false;
+    for _ in 0..5 {
+        let page = app.results(session.id(), None, 1).await.unwrap();
+        if page.items.iter().any(|item| item.result == expected) {
+            found = true;
+            assert!(!page.projection_pending);
+            break;
+        }
+    }
+    assert!(
+        found,
+        "bounded refreshes must eventually finish legacy backfill"
+    );
+}
+
+#[tokio::test]
+async fn result_evidence_is_explicit_paged_limited_private_and_durable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let data = temporary.path().join("data");
+    let workspace_root = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
+    let app = App::with_ports(
+        AppOptions::new(&data),
+        Arc::new(EvidenceModel),
+        vec![Arc::new(EvidenceTool)],
+    )
+    .await
+    .unwrap();
+    configure_test_model(&app).await;
+    let workspace = app.open_workspace(&workspace_root).await.unwrap();
+    let session = app.create_session(workspace.id, "Evidence").await.unwrap();
+    let receipt = session
+        .submit(SubmitInput::new("produce an artifact"))
+        .await
+        .unwrap();
+    let input_state = wait_for_input(&session, receipt.input).await;
+    if !matches!(
+        input_state,
+        InputState::Finished {
+            outcome: InputOutcome::Completed,
+            ..
+        }
+    ) {
+        let history = session.history(SessionSeq(0), 256).await.unwrap();
+        panic!("expected evidence completion, got {input_state:?}; history={history:?}");
+    }
+    let result = app
+        .results(session.id(), None, 1)
+        .await
+        .unwrap()
+        .items
+        .pop()
+        .unwrap()
+        .result;
+
+    let artifact = app.result_artifact(result).await.unwrap();
+    assert_eq!(artifact.summary, "evidence complete");
+    assert_eq!(artifact.evidence_count, 2);
+
+    // Simulate an existing database whose result projection predates the
+    // independent evidence-source projection.
+    app.test_store()
+        .reset_evidence_projection_for_test(session.id())
+        .unwrap();
+    let first = app.result_evidence(result, None, 1).await.unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert!(!first.projection_pending);
+    let tool = first.items[0].source;
+    assert!(matches!(
+        first.items[0].availability,
+        EvidenceAvailability::Available {
+            kind: EvidenceSourceKind::ToolResult,
+            ..
+        }
+    ));
+    let second = app
+        .result_evidence(result, first.next_cursor, 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        second.items[0].availability,
+        EvidenceAvailability::Private
+    ));
+    let private = second.items[0].source;
+    assert!(second.next_cursor.is_none());
+
+    let mut offset = 0;
+    let mut body = String::new();
+    loop {
+        let page = app.evidence_source(result, tool, offset, 4).await.unwrap();
+        assert!(page.text.as_ref().is_none_or(|text| text.len() <= 4));
+        body.push_str(page.text.as_deref().unwrap_or_default());
+        let Some(next) = page.next_offset else { break };
+        assert!(next > offset);
+        offset = next;
+    }
+    assert!(body.contains("产物内容-abcdefgh"));
+    assert!(!body.contains("ARGUMENT_SECRET"));
+
+    let private_page = app
+        .evidence_source(result, private, 0, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(private_page.availability, EvidenceAvailability::Private);
+    assert!(private_page.text.is_none());
+    assert!(!format!("{private_page:?}").contains("PRIVATE_PLANNING_NOTE"));
+
+    app.test_store()
+        .delete_evidence_source_for_test(private)
+        .unwrap();
+    let after_missing = app.result_evidence(result, None, 8).await.unwrap();
+    assert!(matches!(
+        after_missing.items[1].availability,
+        EvidenceAvailability::Missing
+    ));
+    assert!(
+        app.evidence_source(
+            result,
+            EvidenceRef {
+                session: result.session,
+                record: 42,
+            },
+            0,
+            16,
+        )
+        .await
+        .is_err()
+    );
+
+    app.shutdown().await.unwrap();
+    drop(session);
+    drop(app);
+
+    let reopened = App::with_ports(
+        AppOptions::new(&data),
+        Arc::new(EvidenceModel),
+        vec![Arc::new(EvidenceTool)],
+    )
+    .await
+    .unwrap();
+    let reopened_artifact = reopened.result_artifact(result).await.unwrap();
+    assert_eq!(reopened_artifact, artifact);
+    let reopened_source = reopened
+        .evidence_source(result, tool, 0, 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        reopened_source
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("产物内容-abcdefgh")
+    );
+    assert!(!format!("{reopened_source:?}").contains("ARGUMENT_SECRET"));
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn evidence_list_does_not_read_large_source_bodies() {
+    const SOURCE_COUNT: usize = 32;
+    const BODY_BYTES: usize = 1024 * 1024 - 31;
+
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session(workspace.id, "Large evidence metadata")
+        .await
+        .unwrap();
+    let result = ResultRef {
+        session: session.id(),
+        job: JobRef {
+            runtime: RuntimeId::new(),
+            id: 7,
+        },
+        version: SessionSeq(9_999),
+    };
+    let sources = (0..SOURCE_COUNT)
+        .map(|index| {
+            (
+                EvidenceRef {
+                    session: session.id(),
+                    record: 10_000 + index as u64,
+                },
+                crate::persistence::StoredEvidenceSource::Public {
+                    kind: EvidenceSourceKind::ToolResult,
+                    title: format!("large tool output {index}"),
+                    body: "x".repeat(BODY_BYTES),
+                },
+            )
+        })
+        .collect();
+    app.test_store()
+        .seed_result_evidence_for_test(result, sources)
+        .unwrap();
+
+    assert_eq!(app.test_store().evidence_body_read_counts(), (0, 0));
+    let page = app
+        .result_evidence(result, None, SOURCE_COUNT)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), SOURCE_COUNT);
+    assert!(page.items.iter().all(|item| matches!(
+        item.availability,
+        EvidenceAvailability::Available {
+            kind: EvidenceSourceKind::ToolResult,
+            ..
+        }
+    )));
+    assert_eq!(
+        app.test_store().evidence_body_read_counts(),
+        (0, 0),
+        "metadata listing must neither deserialize body chunks nor consult legacy full-body documents"
+    );
+
+    let source = page.items[0].source;
+    let body_page = app.evidence_source(result, source, 0, 4096).await.unwrap();
+    assert_eq!(body_page.text.as_deref().map(str::len), Some(4096));
+    assert_eq!(app.test_store().evidence_body_read_counts(), (1, 0));
+}
+
+#[tokio::test]
+async fn legacy_evidence_metadata_is_backfilled_in_bounded_slices() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session(workspace.id, "Legacy evidence metadata")
+        .await
+        .unwrap();
+    let result = ResultRef {
+        session: session.id(),
+        job: JobRef {
+            runtime: RuntimeId::new(),
+            id: 8,
+        },
+        version: SessionSeq(10_001),
+    };
+    let sources = (0..6)
+        .map(|index| {
+            (
+                EvidenceRef {
+                    session: session.id(),
+                    record: 20_000 + index,
+                },
+                crate::persistence::StoredEvidenceSource::Public {
+                    kind: EvidenceSourceKind::ToolResult,
+                    title: format!("legacy source {index}"),
+                    body: format!("legacy body {index}"),
+                },
+            )
+        })
+        .collect();
+    app.test_store()
+        .seed_legacy_result_evidence_for_test(result, sources)
+        .unwrap();
+
+    let first = app.result_evidence(result, None, 6).await.unwrap();
+    assert!(first.projection_pending);
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .filter(|item| matches!(item.availability, EvidenceAvailability::Available { .. }))
+            .count(),
+        4
+    );
+    assert_eq!(app.test_store().evidence_body_read_counts(), (0, 4));
+
+    let second = app.result_evidence(result, None, 6).await.unwrap();
+    assert!(!second.projection_pending);
+    assert!(
+        second
+            .items
+            .iter()
+            .all(|item| matches!(item.availability, EvidenceAvailability::Available { .. }))
+    );
+    assert_eq!(app.test_store().evidence_body_read_counts(), (0, 6));
+}
+
+#[tokio::test]
+async fn idle_session_release_closes_external_handles_and_releases_cross_app_lease() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace_root = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
+    let data_dir = temporary.path().join("data");
+    let app = App::with_model(
+        AppOptions::new(data_dir.clone()),
+        Arc::new(CompletingModel {
+            work_calls: AtomicUsize::new(0),
+        }),
+    )
+    .await
+    .unwrap();
+    configure_test_model(&app).await;
+    let workspace = app.open_workspace(workspace_root).await.unwrap();
+    let session = app
+        .create_session(workspace.id, "Release idle")
+        .await
+        .unwrap();
+    let held_clone = session.clone();
+    let other = App::with_model(
+        AppOptions::new(data_dir),
+        Arc::new(CompletingModel {
+            work_calls: AtomicUsize::new(0),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        other.session(session.id()).await,
+        Err(Error::SessionBusy(id)) if id == session.id()
+    ));
+
+    assert_eq!(
+        app.release_session(session.id()).await.unwrap(),
+        SessionReleaseReceipt {
+            session: session.id(),
+            status: SessionReleaseStatus::Released,
+        }
+    );
+    assert!(held_clone.actor_closed());
+    assert!(matches!(held_clone.snapshot().await, Err(Error::Closed)));
+    let reopened_elsewhere = other.session(session.id()).await.unwrap();
+    reopened_elsewhere.snapshot().await.unwrap();
+    assert_eq!(app.test_open_session_count().await, 0);
+    other.shutdown().await.unwrap();
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn release_retains_running_work_then_evicts_after_completion() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace_root = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
+    let barrier = Arc::new(ShutdownBarrier::default());
+    let app = App::with_ports(
+        AppOptions::new(temporary.path().join("data")),
+        Arc::new(PausableWorkModel {
+            barrier: Arc::clone(&barrier),
+        }),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    configure_test_model(&app).await;
+    let workspace = app.open_workspace(workspace_root).await.unwrap();
+    let session = app
+        .create_session(workspace.id, "Keep working")
+        .await
+        .unwrap();
+    let input = session.submit(SubmitInput::new("continue")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), barrier.wait_for_started(1))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        app.release_session(session.id()).await.unwrap().status,
+        SessionReleaseStatus::Retained(
+            SessionRetentionReason::ActiveWork | SessionRetentionReason::PersistenceInFlight
+        )
+    ));
+    assert!(!session.actor_closed());
+    barrier.release.add_permits(1);
+    assert_completed(wait_for_input(&session, input.input).await);
+    assert_eq!(
+        app.release_session(session.id()).await.unwrap().status,
+        SessionReleaseStatus::Released
+    );
+    assert!(session.actor_closed());
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn release_retains_an_idle_session_with_an_unresolved_write() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session(workspace.id, "Unresolved write")
+        .await
+        .unwrap();
+    let call = CallRef {
+        runtime: RuntimeId::new(),
+        id: 41,
+    };
+    assert!(
+        app.test_store()
+            .begin_write(
+                workspace.id,
+                session.id(),
+                call,
+                "write",
+                json!({"path": "unknown"}),
+            )
+            .unwrap()
+    );
+
+    assert_eq!(
+        app.release_session(session.id()).await.unwrap().status,
+        SessionReleaseStatus::Retained(SessionRetentionReason::UnresolvedWrites)
+    );
+    assert!(!session.actor_closed());
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn release_is_idempotent_and_linearizes_with_open_and_shutdown() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session(workspace.id, "Release races")
+        .await
+        .unwrap();
+    assert_eq!(
+        app.release_session(session.id()).await.unwrap().status,
+        SessionReleaseStatus::Released
+    );
+    assert_eq!(
+        app.release_session(session.id()).await.unwrap().status,
+        SessionReleaseStatus::NotOpen
+    );
+    let reopened = app.session(session.id()).await.unwrap();
+    let release_app = app.clone();
+    let shutdown_app = app.clone();
+    let id = session.id();
+    let (release, shutdown) = tokio::join!(
+        async move { release_app.release_session(id).await },
+        async move { shutdown_app.shutdown().await }
+    );
+    shutdown.unwrap();
+    match release {
+        Ok(receipt) => assert!(matches!(
+            receipt.status,
+            SessionReleaseStatus::Released | SessionReleaseStatus::NotOpen
+        )),
+        Err(Error::Closed) => {}
+        other => panic!("unexpected release/shutdown race result: {other:?}"),
+    }
+    assert!(reopened.actor_closed());
+}
+
+#[tokio::test]
+async fn cancelled_release_still_evicts_the_actor_and_allows_reopen() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session(workspace.id, "Cancelled release")
+        .await
+        .unwrap();
+    let mut release = Box::pin(app.release_session(session.id()));
+    assert_pending(release.as_mut()).await;
+    drop(release);
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while app.test_open_session_count().await != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(session.actor_closed());
+    let reopened = app.session(session.id()).await.unwrap();
+    reopened.snapshot().await.unwrap();
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn releasing_many_idle_sessions_drops_every_cached_actor_and_lease() {
+    let (_temporary, app, workspace) = configured_app().await;
+    for index in 0..100 {
+        let id = app
+            .create_session(workspace.id, format!("Idle {index}"))
+            .await
+            .unwrap()
+            .id();
+        assert_eq!(
+            app.release_session(id).await.unwrap().status,
+            SessionReleaseStatus::Released
+        );
+        let lease = app.test_store().claim_session(id).unwrap();
+        drop(lease);
+        assert_eq!(app.test_open_session_count().await, 0);
+    }
+    assert_eq!(app.test_open_session_count().await, 0);
     app.shutdown().await.unwrap();
 }
 

@@ -46,6 +46,8 @@ uuid_id!(WorkspaceId);
 uuid_id!(SessionId);
 uuid_id!(RequestId);
 uuid_id!(RuntimeId);
+uuid_id!(AcceptanceRequestId);
+uuid_id!(AcceptanceId);
 
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
@@ -119,6 +121,149 @@ pub struct SessionInfo {
     pub workspace: WorkspaceId,
     pub title: String,
     pub archived: bool,
+}
+
+/// Durable, read-only facts needed to render one session in a workspace list.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session: SessionInfo,
+    pub has_draft: bool,
+    pub draft_bytes: u64,
+    pub persisted_runtime: Option<RuntimeId>,
+    pub history_through: SessionSeq,
+}
+
+/// A durable condition a frontend can route without interpreting display text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AttentionItem {
+    WaitingForUser {
+        session: SessionId,
+        inputs: Vec<InputId>,
+        runtime: RuntimeId,
+        question: QuestionId,
+        text: String,
+    },
+    UnresolvedWrite {
+        session: SessionId,
+        call: CallRef,
+        status: UnresolvedWriteStatus,
+    },
+}
+
+/// Read-only workspace state for navigation and global attention surfaces.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceOverview {
+    pub workspace: WorkspaceInfo,
+    pub sessions: Vec<SessionSummary>,
+    pub attention: Vec<AttentionItem>,
+    pub unresolved_writes: Vec<UnresolvedWriteView>,
+    /// A pre-projection database still has a bounded, resumable attention
+    /// backfill in progress. Current items are valid but may be incomplete.
+    pub attention_projection_pending: bool,
+}
+
+/// Source-control baseline used for a workspace change query. A Git workspace
+/// without a commit has no HEAD yet and therefore reports `head: None`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorkspaceBaseline {
+    NotGit,
+    Git { head: Option<String> },
+}
+
+/// One side of Git's two-column index/worktree status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum GitFileState {
+    Unchanged,
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Unmerged,
+    Untracked,
+    Unknown,
+}
+
+/// A workspace-relative file currently changed from Git HEAD.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceChangedFile {
+    pub path: String,
+    pub tracked: bool,
+    pub index: GitFileState,
+    pub worktree: GitFileState,
+}
+
+/// Opaque exclusive cursor for the next lexicographic changed-file page.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceChangeCursor {
+    pub(crate) after: String,
+    pub(crate) baseline: WorkspaceBaseline,
+    pub(crate) root_identity: String,
+}
+
+/// A bounded page of current workspace changes. These are workspace facts and
+/// are intentionally not attributed to a particular task or Session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceChangePage {
+    pub baseline: WorkspaceBaseline,
+    pub files: Vec<WorkspaceChangedFile>,
+    pub next_cursor: Option<WorkspaceChangeCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorkspaceFileSource {
+    DiffAgainstHead,
+    WorkingTree,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum WorkspaceFileMedia {
+    Text,
+    Binary,
+    Missing,
+}
+
+/// Strictly byte-limited content for one changed file. `truncated` means the
+/// caller must not interpret the returned text as the complete file or diff.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceFileView {
+    pub baseline: WorkspaceBaseline,
+    pub path: String,
+    pub source: WorkspaceFileSource,
+    pub media: WorkspaceFileMedia,
+    pub text: Option<String>,
+    pub bytes_read: u64,
+    pub total_bytes: Option<u64>,
+    pub truncated: bool,
+}
+
+/// Opaque continuation for a stable, byte-oriented workspace file read.
+///
+/// The cursor binds the Git baseline, path, source and observed content
+/// identity. A caller cannot use it to continue another file, and a changed
+/// working tree invalidates it instead of silently joining different versions.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkspaceFileCursor {
+    pub(crate) baseline: WorkspaceBaseline,
+    pub(crate) path: String,
+    pub(crate) source: WorkspaceFileSource,
+    pub(crate) offset: u64,
+    pub(crate) identity: String,
+}
+
+/// One byte-bounded page of a changed file or its diff against Git HEAD.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkspaceFilePage {
+    pub baseline: WorkspaceBaseline,
+    pub path: String,
+    pub source: WorkspaceFileSource,
+    pub media: WorkspaceFileMedia,
+    pub text: Option<String>,
+    pub offset: u64,
+    pub bytes_read: u64,
+    pub total_bytes: Option<u64>,
+    pub next_cursor: Option<WorkspaceFileCursor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -224,6 +369,182 @@ pub struct JobReport {
     pub summary: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ResultRef {
+    pub session: SessionId,
+    pub job: JobRef,
+    pub version: SessionSeq,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResultSummary {
+    pub result: ResultRef,
+    pub outcome: OutcomeKind,
+    pub summary: String,
+    pub remaining: Vec<String>,
+}
+
+/// Stable address of one session-scoped Core record explicitly cited by a
+/// result. Core sequence numbers remain durable across runtime replacements.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct EvidenceRef {
+    pub session: SessionId,
+    pub record: u64,
+}
+
+/// A result as a durable product artifact, including only the number of
+/// explicitly cited sources. Source bodies are read separately and bounded.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResultArtifact {
+    pub result: ResultRef,
+    pub outcome: OutcomeKind,
+    pub summary: String,
+    pub remaining: Vec<String>,
+    pub evidence_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EvidenceSourceKind {
+    ToolResult,
+    PublishedReport,
+    Reply,
+}
+
+/// Whether a cited source has a public product representation. Private Core
+/// records deliberately carry no title or body through this API.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EvidenceAvailability {
+    Available {
+        kind: EvidenceSourceKind,
+        title: String,
+    },
+    Private,
+    Missing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceSummary {
+    pub source: EvidenceRef,
+    pub availability: EvidenceAvailability,
+}
+
+/// Opaque result-bound cursor for the next explicit evidence reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct EvidenceCursor {
+    result: ResultRef,
+    offset: usize,
+}
+
+impl EvidenceCursor {
+    pub(crate) const fn new(result: ResultRef, offset: usize) -> Self {
+        Self { result, offset }
+    }
+
+    pub const fn result(self) -> ResultRef {
+        self.result
+    }
+
+    pub const fn offset(self) -> usize {
+        self.offset
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EvidencePage {
+    pub result: ResultRef,
+    pub items: Vec<EvidenceSummary>,
+    pub next_cursor: Option<EvidenceCursor>,
+    /// Legacy source projection is still advancing in bounded windows. A
+    /// `Missing` item is not authoritative until this becomes false.
+    pub projection_pending: bool,
+}
+
+/// One byte-bounded page of a source body. Offsets are byte offsets into the
+/// UTF-8 body and returned boundaries are always valid character boundaries.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EvidenceSourcePage {
+    pub source: EvidenceRef,
+    pub availability: EvidenceAvailability,
+    pub text: Option<String>,
+    pub offset: u64,
+    pub next_offset: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub projection_pending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ResultPage {
+    pub items: Vec<ResultSummary>,
+    pub older_cursor: Option<HistoryCursor>,
+    pub snapshot_through: SessionSeq,
+    /// Older results from a pre-projection database may still be discovered by
+    /// subsequent bounded refreshes. Frontends must not present an empty page
+    /// as authoritative while this is true.
+    pub projection_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AcceptanceDecision {
+    Accepted,
+    PartiallyAccepted,
+    AcceptedWithRisk,
+    Rejected,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceSubmission {
+    pub request_id: AcceptanceRequestId,
+    pub result: ResultRef,
+    pub decision: AcceptanceDecision,
+    pub reason: String,
+    pub rework: Option<SubmitInput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AcceptanceRecord {
+    pub id: AcceptanceId,
+    pub request_id: AcceptanceRequestId,
+    pub result: ResultRef,
+    pub decision: AcceptanceDecision,
+    pub reason: String,
+    pub saved_at: SessionSeq,
+    pub rework: Option<SubmissionReceipt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AcceptanceReceipt {
+    pub id: AcceptanceId,
+    pub saved_at: SessionSeq,
+    pub rework: Option<SubmissionReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct AcceptanceCursor {
+    result: ResultRef,
+    before: SessionSeq,
+}
+
+impl AcceptanceCursor {
+    pub(crate) const fn new(result: ResultRef, before: SessionSeq) -> Self {
+        Self { result, before }
+    }
+
+    pub const fn result(self) -> ResultRef {
+        self.result
+    }
+
+    pub const fn before(self) -> SessionSeq {
+        self.before
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AcceptancePage {
+    pub items: Vec<AcceptanceRecord>,
+    pub older_cursor: Option<AcceptanceCursor>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobView {
     pub id: JobRef,
@@ -315,6 +636,44 @@ pub struct HistoryPage {
     pub has_more: bool,
 }
 
+/// Opaque cursor for reading older history from a stable journal snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct HistoryCursor {
+    session: SessionId,
+    before: SessionSeq,
+    through: SessionSeq,
+}
+
+impl HistoryCursor {
+    pub(crate) const fn new(session: SessionId, before: SessionSeq, through: SessionSeq) -> Self {
+        Self {
+            session,
+            before,
+            through,
+        }
+    }
+
+    pub const fn session(self) -> SessionId {
+        self.session
+    }
+
+    pub const fn before(self) -> SessionSeq {
+        self.before
+    }
+
+    pub const fn snapshot_through(self) -> SessionSeq {
+        self.through
+    }
+}
+
+/// One ascending page from the most recent end of durable session history.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RecentHistoryPage {
+    pub items: Vec<HistoryEntry>,
+    pub older_cursor: Option<HistoryCursor>,
+    pub snapshot_through: SessionSeq,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SessionEvent {
     InputSubmitted {
@@ -366,6 +725,12 @@ pub enum SessionEvent {
         summary: String,
         remaining: Vec<String>,
     },
+    AcceptanceRecorded {
+        acceptance: AcceptanceId,
+        result: ResultRef,
+        decision: AcceptanceDecision,
+        reason: String,
+    },
     InputFinished {
         runtime: RuntimeId,
         input: InputId,
@@ -399,6 +764,31 @@ pub enum JobControl {
 pub enum CommandReceipt {
     Applied,
     Unchanged,
+}
+
+/// A durable or live condition that prevents releasing a Session actor and
+/// its exclusive writer lease without changing product behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SessionRetentionReason {
+    ReleaseInProgress,
+    Starting,
+    ActiveWork,
+    PersistenceInFlight,
+    UnresolvedWrites,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SessionReleaseStatus {
+    Released,
+    NotOpen,
+    Retained(SessionRetentionReason),
+}
+
+/// The authoritative result of one App-managed release attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionReleaseReceipt {
+    pub session: SessionId,
+    pub status: SessionReleaseStatus,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -435,6 +825,36 @@ impl AppOptions {
         Self {
             data_dir: data_dir.into(),
         }
+    }
+
+    /// Resolve BONE's platform user-data location inside the App boundary.
+    /// `BONE_DATA_DIR` is an explicit deployment override.
+    pub fn platform_default() -> crate::Result<Self> {
+        if let Some(path) = std::env::var_os("BONE_DATA_DIR") {
+            return Ok(Self::new(path));
+        }
+        #[cfg(target_os = "windows")]
+        let path = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|root| root.join("BONE"));
+        #[cfg(target_os = "macos")]
+        let path = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|root| root.join("Library/Application Support/BONE"));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let path = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .map(|root| root.join("bone"))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|root| root.join(".local/share/bone"))
+            });
+        path.map(Self::new).ok_or_else(|| {
+            crate::Error::InvalidState(
+                "cannot determine platform data directory; set BONE_DATA_DIR".into(),
+            )
+        })
     }
 }
 

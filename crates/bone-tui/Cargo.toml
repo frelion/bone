@@ -1,0 +1,28 @@
+[package]
+name = "bone-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Terminal frontend for BONE"
+publish = false
+
+[[bin]]
+name = "bone"
+path = "src/main.rs"
+
+[dependencies]
+bone-app = { path = "../bone-app" }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util.workspace = true
+ratatui = "0.29"
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+unicode-width = "0.2"
+unicode-segmentation = "1.12"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true

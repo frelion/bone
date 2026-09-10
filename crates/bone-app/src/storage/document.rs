@@ -76,9 +76,13 @@ impl<T> DocumentSnapshot<T> {
 /// healthy records from the same namespace.
 #[derive(Debug)]
 pub struct DocumentListEntry<T> {
-    #[cfg(test)]
     pub key: DocumentKey,
     pub snapshot: Result<DocumentSnapshot<T>, StoreError>,
+}
+
+pub struct DocumentRecentPage<T> {
+    pub entries: Vec<DocumentListEntry<T>>,
+    pub has_older: bool,
 }
 
 /// A typed handle for one document key.
@@ -122,6 +126,7 @@ impl<T> Document<T> {
 
     /// Replace this document only when its revision still equals `expected`.
     /// Use revision zero to create a missing document.
+    #[cfg(test)]
     pub fn replace(&self, value: &T, expected: Revision) -> Result<Revision, StoreError>
     where
         T: Serialize,
@@ -223,12 +228,71 @@ where
             })
         })();
         documents.push(DocumentListEntry {
-            #[cfg(test)]
             key: DocumentKey::new(namespace, _key),
             snapshot,
         });
     }
     Ok(documents)
+}
+
+pub(crate) fn read_recent_documents<T>(
+    connection: &Connection,
+    namespace: &str,
+    key_prefix: &str,
+    before: Option<&str>,
+    limit: usize,
+) -> Result<DocumentRecentPage<T>, StoreError>
+where
+    T: DeserializeOwned,
+{
+    let default_before;
+    let before = match before {
+        Some(before) => before,
+        None => {
+            default_before = format!("{key_prefix}\u{10ffff}");
+            &default_before
+        }
+    };
+    let limit_sql = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut statement = connection
+        .prepare(
+            "SELECT key, revision, payload_json FROM documents
+             WHERE namespace COLLATE BINARY = ?1
+               AND key COLLATE BINARY >= ?2
+               AND key COLLATE BINARY < ?3
+             ORDER BY key COLLATE BINARY DESC LIMIT ?4",
+        )
+        .map_err(|error| StoreError::sqlite("prepare recent document list", error))?;
+    let rows = statement
+        .query_map(params![namespace, key_prefix, before, limit_sql], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| StoreError::sqlite("read recent document list", error))?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let (_key, revision, payload) =
+            row.map_err(|error| StoreError::sqlite("read recent document list", error))?;
+        let snapshot = (|| {
+            let raw = validate_raw_document(revision, payload)?;
+            Ok(DocumentSnapshot {
+                value: Some(decode_payload(&raw.payload_json)?),
+                revision: raw.revision,
+            })
+        })();
+        entries.push(DocumentListEntry {
+            key: DocumentKey::new(namespace, _key),
+            snapshot,
+        });
+    }
+    let has_older = entries.len() > limit;
+    if has_older {
+        entries.pop();
+    }
+    Ok(DocumentRecentPage { entries, has_older })
 }
 
 // SQLite's BINARY collation compares TEXT as UTF-8 bytes. Binding the upper

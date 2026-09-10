@@ -14,13 +14,15 @@ use bone_core::{
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::{
-    ActivityKind, ActivityView, AppProblem, CallRef, CloseReport, CommandReceipt, ConfigProblem,
-    ConfigScope, DataStore, Error, HistoryPage, InputId, InputState, InputView, JobControl,
-    JobOwner, JobRef, JobReport, JobState, JobView, Result, RuntimeConfig, RuntimeId, RuntimeState,
-    SavedRuntime, SavedSession, SessionEvent, SessionId, SessionSeq, SessionView,
-    SubmissionReceipt, SubmitInput, WaitReason, WriteResolution,
+    AcceptanceDecision, AcceptanceReceipt, AcceptanceSubmission, ActivityKind, ActivityView,
+    AppProblem, CallRef, CloseReport, CommandReceipt, ConfigProblem, ConfigScope, DataStore, Error,
+    HistoryCursor, HistoryPage, InputId, InputState, InputView, JobControl, JobOwner, JobRef,
+    JobReport, JobState, JobView, RecentHistoryPage, Result, RuntimeConfig, RuntimeId,
+    RuntimeState, SavedRuntime, SavedSession, SessionEvent, SessionId, SessionReleaseStatus,
+    SessionRetentionReason, SessionSeq, SessionView, SubmissionReceipt, SubmitInput, WaitReason,
+    WriteResolution,
     config::{MAX_PERSISTED_VALUE_BYTES, resolve_runtime},
-    persistence::{AcceptError, ResolveWriteResult},
+    persistence::{AcceptError, AcceptanceError, ResolveWriteResult},
     storage::Lease,
     tools,
 };
@@ -68,6 +70,51 @@ impl Session {
         self.request(|reply| Command::Submit { input, reply }).await
     }
 
+    pub async fn submit_acceptance(
+        &self,
+        submission: AcceptanceSubmission,
+    ) -> Result<AcceptanceReceipt> {
+        if submission.result.session != self.id {
+            return Err(Error::InvalidState(
+                "acceptance result belongs to another session".into(),
+            ));
+        }
+        if submission.reason.len() > MAX_PERSISTED_VALUE_BYTES {
+            return Err(Error::InvalidState(
+                "acceptance reason exceeds 1 MiB".into(),
+            ));
+        }
+        if submission.decision != AcceptanceDecision::Accepted
+            && submission.reason.trim().is_empty()
+        {
+            return Err(Error::InvalidState(
+                "this acceptance decision requires a reason".into(),
+            ));
+        }
+        match (submission.decision, &submission.rework) {
+            (AcceptanceDecision::Rejected, Some(input))
+                if input.text.len() <= MAX_PERSISTED_VALUE_BYTES && input.reply_to.is_none() => {}
+            (AcceptanceDecision::Rejected, None) => {
+                return Err(Error::InvalidState(
+                    "rejected acceptance requires a new rework input".into(),
+                ));
+            }
+            (AcceptanceDecision::Rejected, Some(_)) => {
+                return Err(Error::InvalidState(
+                    "rework must be a new standalone input of at most 1 MiB".into(),
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(Error::InvalidState(
+                    "only a rejected result can include rework input".into(),
+                ));
+            }
+            (_, None) => {}
+        }
+        self.request(|reply| Command::SubmitAcceptance { submission, reply })
+            .await
+    }
+
     pub async fn retry(&self, input: InputId) -> Result<CommandReceipt> {
         self.request(|reply| Command::Retry { input, reply }).await
     }
@@ -93,7 +140,6 @@ impl Session {
         self.view.clone()
     }
 
-    #[cfg(test)]
     pub(crate) fn actor_closed(&self) -> bool {
         self.commands.is_closed()
     }
@@ -101,6 +147,26 @@ impl Session {
     pub async fn history(&self, after: SessionSeq, limit: usize) -> Result<HistoryPage> {
         self.request(|reply| Command::History {
             after,
+            limit,
+            reply,
+        })
+        .await
+    }
+
+    /// Read the newest durable history page, then page backward with the
+    /// returned cursor. Concurrent appends never enter an existing snapshot.
+    pub async fn recent_history(
+        &self,
+        cursor: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<RecentHistoryPage> {
+        if cursor.is_some_and(|cursor| cursor.session() != self.id()) {
+            return Err(Error::InvalidState(
+                "history cursor belongs to another session".into(),
+            ));
+        }
+        self.request(|reply| Command::RecentHistory {
+            cursor,
             limit,
             reply,
         })
@@ -196,7 +262,7 @@ impl Session {
                 durable_gate: Arc::new(tokio::sync::Mutex::new(())),
                 command_tx: commands.downgrade(),
                 clean_shutdown: Arc::clone(&clean_shutdown),
-                lease,
+                lease: Some(lease),
             }
             .run(),
         );
@@ -218,6 +284,16 @@ impl Session {
             Err(Error::Closed) => self.clean_shutdown.get().cloned().ok_or(Error::Closed),
             result => result,
         }
+    }
+
+    pub(crate) async fn release_if_idle(&self) -> Result<SessionReleaseStatus> {
+        let status = self
+            .request_unchecked(|reply| Command::ReleaseIfIdle { reply })
+            .await?;
+        if status == SessionReleaseStatus::Released {
+            self.commands.closed().await;
+        }
+        Ok(status)
     }
 
     async fn request<T>(
@@ -286,6 +362,10 @@ enum Command {
         input: SubmitInput,
         reply: oneshot::Sender<Result<SubmissionReceipt>>,
     },
+    SubmitAcceptance {
+        submission: AcceptanceSubmission,
+        reply: oneshot::Sender<Result<AcceptanceReceipt>>,
+    },
     Retry {
         input: InputId,
         reply: oneshot::Sender<Result<CommandReceipt>>,
@@ -305,6 +385,11 @@ enum Command {
         after: SessionSeq,
         limit: usize,
         reply: oneshot::Sender<Result<HistoryPage>>,
+    },
+    RecentHistory {
+        cursor: Option<HistoryCursor>,
+        limit: usize,
+        reply: oneshot::Sender<Result<RecentHistoryPage>>,
     },
     Rename {
         title: String,
@@ -334,6 +419,9 @@ enum Command {
     RuntimeReady(RuntimeId),
     Shutdown {
         reply: oneshot::Sender<Result<CloseReport>>,
+    },
+    ReleaseIfIdle {
+        reply: oneshot::Sender<Result<SessionReleaseStatus>>,
     },
 }
 
@@ -372,12 +460,14 @@ struct SessionTask {
     execution_blocked: bool,
     write_gate: Arc<tools::WriteGate>,
     view: watch::Sender<Arc<SessionView>>,
+    // Taken explicitly at the end of `run`, before the command receiver closes
+    // and wakes `Session::release_if_idle`.
+    lease: Option<Arc<Lease>>,
     commands: mpsc::Receiver<Command>,
     shutdown_target: watch::Sender<Option<Agent>>,
     durable_gate: Arc<tokio::sync::Mutex<()>>,
     command_tx: mpsc::WeakSender<Command>,
     clean_shutdown: Arc<OnceLock<CloseReport>>,
-    lease: Arc<Lease>,
 }
 
 impl SessionTask {
@@ -391,6 +481,11 @@ impl SessionTask {
             let _ = self.close_runtime().await;
         }
         self.shutdown_target.send_replace(None);
+        // `Session::release_if_idle` uses `Sender::closed()` as its completion
+        // acknowledgement. Release the actor-owned OS writer lease before that
+        // acknowledgement can fire; relying on async-generator field drop order
+        // leaves a small but observable Busy window under parallel load.
+        drop(self.lease.take());
     }
 
     async fn handle(&mut self, command: Command) -> bool {
@@ -413,6 +508,35 @@ impl SessionTask {
                     }
                     Err(error) => {
                         let error = map_accept_error(error);
+                        self.record_execution_error(&error).await;
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            Command::SubmitAcceptance { submission, reply } => {
+                match self.store.record_acceptance(&submission) {
+                    Ok((receipt, rework)) => {
+                        if let Some(saved) = rework
+                            && !saved.state.terminal()
+                        {
+                            self.inputs.insert(saved.id, saved);
+                        }
+                        if let Err(error) = self.publish() {
+                            self.record_execution_error(&error).await;
+                        }
+                        let _ = reply.send(Ok(receipt));
+                        if let Err(error) = self.deliver_queued().await {
+                            self.record_execution_error(&error).await;
+                        }
+                    }
+                    Err(error) => {
+                        let error = match error {
+                            AcceptanceError::ResultNotFound => {
+                                Error::InvalidState("acceptance result not found".into())
+                            }
+                            AcceptanceError::Conflict => Error::RequestConflict,
+                            AcceptanceError::Store(error) => error.into(),
+                        };
                         self.record_execution_error(&error).await;
                         let _ = reply.send(Err(error));
                     }
@@ -461,6 +585,20 @@ impl SessionTask {
                 let result = self
                     .store
                     .history(self.info.id, after, limit.clamp(1, HISTORY_PAGE_LIMIT))
+                    .map_err(Into::into);
+                if let Err(error) = &result {
+                    self.record_execution_error(error).await;
+                }
+                let _ = reply.send(result);
+            }
+            Command::RecentHistory {
+                cursor,
+                limit,
+                reply,
+            } => {
+                let result = self
+                    .store
+                    .recent_history(self.info.id, cursor, limit.clamp(1, HISTORY_PAGE_LIMIT))
                     .map_err(Into::into);
                 if let Err(error) = &result {
                     self.record_execution_error(error).await;
@@ -564,8 +702,73 @@ impl SessionTask {
                 }
                 let _ = reply.send(result);
             }
+            Command::ReleaseIfIdle { reply } => {
+                let result = self.release_if_idle().await;
+                if matches!(&result, Ok(SessionReleaseStatus::Released)) {
+                    let _ = self.clean_shutdown.set(CloseReport {
+                        unresolved_writes: Vec::new(),
+                    });
+                    shutdown = true;
+                } else if let Err(error) = &result {
+                    self.record_execution_error(error).await;
+                }
+                let _ = reply.send(result);
+            }
         }
         shutdown
+    }
+
+    async fn release_if_idle(&mut self) -> Result<SessionReleaseStatus> {
+        if self.starting.is_some() || matches!(self.runtime_state, RuntimeState::Starting) {
+            return Ok(SessionReleaseStatus::Retained(
+                SessionRetentionReason::Starting,
+            ));
+        }
+        if matches!(self.runtime_state, RuntimeState::Closing { .. }) {
+            return Ok(SessionReleaseStatus::Retained(
+                SessionRetentionReason::ActiveWork,
+            ));
+        }
+        if self.durable_gate.try_lock().is_err() {
+            return Ok(SessionReleaseStatus::Retained(
+                SessionRetentionReason::PersistenceInFlight,
+            ));
+        }
+        self.refresh_runtime().await?;
+        if let Some(runtime) = &self.runtime
+            && (runtime
+                .view
+                .jobs
+                .iter()
+                .any(|job| !matches!(job.status, JobStatus::Finished(_)))
+                || runtime
+                    .view
+                    .calls
+                    .iter()
+                    .any(|call| !matches!(call.status, CallStatus::Finished { .. })))
+        {
+            return Ok(SessionReleaseStatus::Retained(
+                SessionRetentionReason::ActiveWork,
+            ));
+        }
+        let unresolved = self
+            .store
+            .unresolved_writes(self.info.workspace, Some(self.info.id))?;
+        if !unresolved.is_empty() {
+            return Ok(SessionReleaseStatus::Retained(
+                SessionRetentionReason::UnresolvedWrites,
+            ));
+        }
+        if self.runtime.is_none() {
+            return Ok(SessionReleaseStatus::Released);
+        }
+        let report = self.close_runtime().await?;
+        if !report.unresolved_writes.is_empty() {
+            return Ok(SessionReleaseStatus::Retained(
+                SessionRetentionReason::UnresolvedWrites,
+            ));
+        }
+        Ok(SessionReleaseStatus::Released)
     }
 
     async fn retry(&mut self, input: InputId) -> Result<CommandReceipt> {
@@ -989,7 +1192,7 @@ impl SessionTask {
         let durable = self.store.core_durable_port(
             self.info.id,
             runtime_id,
-            Arc::clone(&self.lease),
+            Arc::clone(self.lease.as_ref().expect("live session owns its lease")),
             Arc::clone(&self.durable_gate),
         );
         drop(commit_guard);
@@ -1060,7 +1263,7 @@ impl SessionTask {
                 session: self.info.id,
                 runtime,
                 write_gate: Arc::clone(&self.write_gate),
-                lease: Arc::clone(&self.lease),
+                lease: Arc::clone(self.lease.as_ref().expect("live session owns its lease")),
                 notify,
             },
         )

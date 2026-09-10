@@ -5,13 +5,17 @@ use std::{path::Path, sync::Arc};
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::{
-    Document, DocumentKey, DocumentListEntry, DocumentSnapshot, Journal, JournalAppend, JournalKey,
-    Lease, LeaseKey, Revision, StoreError, StoreRoots,
+    Document, DocumentKey, DocumentListEntry, DocumentRecentPage, DocumentSnapshot, Journal,
+    JournalAppend, JournalKey, JournalRecentRead, Lease, LeaseKey, Revision, StoreError,
+    StoreRoots,
     document::{
-        delete_document, document, read_document, read_documents_with_prefix, replace_document,
-        same_store as same_document_store,
+        delete_document, document, read_document, read_documents_with_prefix,
+        read_recent_documents, replace_document, same_store as same_document_store,
     },
-    journal::{append_journal, journal, same_store as same_journal_store},
+    journal::{
+        append_journal, journal, read_journal_recent, read_last_journal_sequence,
+        same_store as same_journal_store,
+    },
     lease::lease_file_name,
     security::{ensure_private_directory, try_acquire_private_lock},
     sqlite::StoreInner,
@@ -59,6 +63,20 @@ impl BoneStore {
     {
         let connection = self.inner.connection()?;
         read_documents_with_prefix(&connection, namespace, prefix)
+    }
+
+    pub fn recent_documents<T>(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<DocumentRecentPage<T>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        let connection = self.inner.connection()?;
+        read_recent_documents(&connection, namespace, prefix, before, limit)
     }
 
     /// Run document and journal mutations in one short `BEGIN IMMEDIATE`
@@ -121,6 +139,48 @@ impl WriteTransaction<'_, '_> {
     {
         self.assert_document_store(document)?;
         read_document(self.transaction, document.key())
+    }
+
+    pub fn list_documents<T>(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> Result<Vec<DocumentListEntry<T>>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        read_documents_with_prefix(self.transaction, namespace, prefix)
+    }
+
+    pub(crate) fn recent_documents<T>(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<DocumentRecentPage<T>, StoreError>
+    where
+        T: DeserializeOwned,
+    {
+        read_recent_documents(self.transaction, namespace, prefix, before, limit)
+    }
+
+    pub fn journal_last_sequence<E>(&self, journal: &Journal<E>) -> Result<u64, StoreError> {
+        self.assert_journal_store(journal)?;
+        read_last_journal_sequence(self.transaction, journal.key())
+    }
+
+    pub(crate) fn read_recent<E>(
+        &self,
+        journal: &Journal<E>,
+        cursor: Option<(u64, u64)>,
+        limit: usize,
+    ) -> Result<JournalRecentRead<E>, StoreError>
+    where
+        E: DeserializeOwned,
+    {
+        self.assert_journal_store(journal)?;
+        read_journal_recent(self.transaction, journal.key(), cursor, limit)
     }
 
     pub fn replace<T>(

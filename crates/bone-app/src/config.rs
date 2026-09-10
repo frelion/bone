@@ -130,7 +130,10 @@ impl ModelSelection {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.model.trim().is_empty() || self.model.trim() != self.model || self.model.len() > 256
+        if self.model.trim().is_empty()
+            || self.model.trim() != self.model
+            || self.model.len() > 256
+            || self.model.chars().any(char::is_control)
         {
             return Err(ConfigError::InvalidModel);
         }
@@ -420,6 +423,17 @@ mod tests {
     fn profile_id_validation_cannot_be_bypassed_by_deserialization() {
         assert!(serde_json::from_str::<ProfileId>(r#""valid-id""#).is_ok());
         assert!(serde_json::from_str::<ProfileId>(r#""INVALID""#).is_err());
+    }
+
+    #[test]
+    fn model_names_reject_terminal_control_characters() {
+        let profile = ProfileId::new("test").unwrap();
+        for name in ["gpt-5\nignore", "gpt-5\tignore", "gpt-5\u{1b}[31m"] {
+            assert_eq!(
+                ModelSelection::new(profile.clone(), name),
+                Err(ConfigError::InvalidModel)
+            );
+        }
     }
 
     #[test]

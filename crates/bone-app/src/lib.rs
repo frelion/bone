@@ -15,6 +15,7 @@ mod providers;
 mod session;
 mod storage;
 mod tools;
+mod workspace_changes;
 
 pub use api::*;
 pub use app::{App, LoginAttempt};

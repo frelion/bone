@@ -15,11 +15,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CallRef, ConfigChange, ConfigScope, HistoryEntry, HistoryPage, InputId, InputState, InputView,
-    JobRef, Profile, QuestionId, RequestId, RuntimeConfig, RuntimeId, RuntimeOverrides,
-    RuntimeSettings, SessionEvent, SessionId, SessionInfo, SessionSeq, SubmissionReceipt,
+    AcceptanceCursor, AcceptanceId, AcceptancePage, AcceptanceReceipt, AcceptanceRecord,
+    AcceptanceRequestId, AcceptanceSubmission, AttentionItem, CallRef, ConfigChange, ConfigScope,
+    EvidenceAvailability, EvidenceCursor, EvidencePage, EvidenceRef, EvidenceSourceKind,
+    EvidenceSummary, HistoryCursor, HistoryEntry, HistoryPage, InputId, InputState, InputView,
+    JobRef, Profile, QuestionId, RecentHistoryPage, RequestId, ResultArtifact, ResultPage,
+    ResultRef, ResultSummary, RuntimeConfig, RuntimeId, RuntimeOverrides, RuntimeSettings,
+    SessionEvent, SessionId, SessionInfo, SessionSeq, SessionSummary, SubmissionReceipt,
     SubmitInput, UnresolvedWriteStatus, UnresolvedWriteView, WorkspaceId, WorkspaceInfo,
-    WriteResolution,
+    WorkspaceOverview, WriteResolution,
     storage::{
         BoneStore, DocumentKey, JournalKey, Lease, LeaseKey, Revision, StoreError, StoreRoots,
         WriteTransaction,
@@ -41,6 +45,8 @@ struct StoredCoreState {
 // The snapshot itself, as well as history and receipts, can exceed a document's
 // size limit. Read and replace all chunks under one SQLite transaction.
 const CORE_CHUNK_BYTES: usize = 512 * 1024;
+const EVIDENCE_BODY_CHUNK_BYTES: usize = 64 * 1024;
+const LEGACY_EVIDENCE_BACKFILL_LIMIT: usize = 4;
 
 #[derive(Serialize, Deserialize)]
 struct CoreDocument {
@@ -108,6 +114,10 @@ struct TestFaults {
     pause_core_commits: AtomicBool,
     core_commit_waiting: AtomicBool,
     fail_core_chunk: AtomicBool,
+    result_backfill_decodes: AtomicUsize,
+    attention_backfill_decodes: AtomicUsize,
+    evidence_body_reads: AtomicUsize,
+    legacy_evidence_reads: AtomicUsize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -146,6 +156,113 @@ struct RequestRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct AcceptanceRequestRecord {
+    submission: AcceptanceSubmission,
+    receipt: AcceptanceReceipt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ResultProjectionState {
+    snapshot_through: SessionSeq,
+    before: SessionSeq,
+    complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct EvidenceProjectionState {
+    snapshot_through: SessionSeq,
+    before: SessionSeq,
+    complete: bool,
+}
+
+/// Durable result projection. Its first four fields intentionally retain the
+/// old public `ResultSummary` JSON shape; `evidence` defaults empty when an
+/// existing database is opened.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct StoredResult {
+    result: ResultRef,
+    outcome: bone_core::OutcomeKind,
+    summary: String,
+    remaining: Vec<String>,
+    #[serde(default)]
+    evidence: Vec<EvidenceRef>,
+}
+
+impl StoredResult {
+    fn public(&self) -> ResultSummary {
+        ResultSummary {
+            result: self.result,
+            outcome: self.outcome,
+            summary: self.summary.clone(),
+            remaining: self.remaining.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum StoredEvidenceSource {
+    Public {
+        kind: EvidenceSourceKind,
+        title: String,
+        body: String,
+    },
+    /// Deliberately records only that the referenced Core record exists. Its
+    /// internal contents never enter the product-facing source projection.
+    Private,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum StoredEvidenceMetadata {
+    Public {
+        kind: EvidenceSourceKind,
+        title: String,
+        byte_len: u64,
+        chunks: Vec<EvidenceBodyChunk>,
+    },
+    Private,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct EvidenceBodyChunk {
+    start: u64,
+    end: u64,
+}
+
+pub(crate) struct StoredEvidencePage {
+    pub metadata: StoredEvidenceMetadata,
+    pub text: Option<String>,
+    pub offset: u64,
+    pub next_offset: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum AttentionProjectionRecord {
+    WaitingForUser {
+        workspace: WorkspaceId,
+        session: SessionId,
+        input: InputId,
+        runtime: RuntimeId,
+        question: QuestionId,
+        text: String,
+    },
+    UnresolvedWrite(UnresolvedWriteView),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct AttentionProjectionState {
+    input_before: Option<String>,
+    inputs_complete: bool,
+    write_before: Option<String>,
+    writes_complete: bool,
+}
+
+enum AcceptanceSaveOutcome {
+    Saved(AcceptanceReceipt, Option<InputView>),
+    Existing(AcceptanceReceipt, Option<InputView>),
+    Conflict,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct WriteAttempt {
     session: SessionId,
     call: CallRef,
@@ -175,6 +292,61 @@ pub(crate) enum ResolveWriteResult {
 }
 
 impl DataStore {
+    fn sync_evidence_source(
+        &self,
+        transaction: &WriteTransaction<'_, '_>,
+        source_ref: EvidenceRef,
+        source: &StoredEvidenceSource,
+    ) -> Result<(), StoreError> {
+        let metadata_document = self
+            .store
+            .document::<StoredEvidenceMetadata>(evidence_metadata_key(source_ref));
+        let existing = transaction.read(&metadata_document)?;
+        let metadata = match source {
+            StoredEvidenceSource::Private => StoredEvidenceMetadata::Private,
+            StoredEvidenceSource::Public { kind, title, body } => {
+                let mut chunks = Vec::new();
+                let mut start = 0;
+                while start < body.len() {
+                    let mut end = (start + EVIDENCE_BODY_CHUNK_BYTES).min(body.len());
+                    while end > start && !body.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let index = chunks.len();
+                    let document = self
+                        .store
+                        .document::<String>(evidence_body_chunk_key(source_ref, index));
+                    let snapshot = transaction.read(&document)?;
+                    transaction.replace(
+                        &document,
+                        &body[start..end].to_owned(),
+                        snapshot.revision,
+                    )?;
+                    chunks.push(EvidenceBodyChunk {
+                        start: start as u64,
+                        end: end as u64,
+                    });
+                    start = end;
+                }
+                StoredEvidenceMetadata::Public {
+                    kind: *kind,
+                    title: title.clone(),
+                    byte_len: body.len() as u64,
+                    chunks,
+                }
+            }
+        };
+        match existing.value {
+            Some(saved) if saved == metadata => Ok(()),
+            Some(_) => Err(StoreError::Corrupt {
+                message: "evidence source projection conflicts with durable history",
+            }),
+            None => transaction
+                .replace(&metadata_document, &metadata, existing.revision)
+                .map(|_| ()),
+        }
+    }
+
     fn read_core_in(
         &self,
         transaction: &WriteTransaction<'_, '_>,
@@ -509,6 +681,10 @@ impl DataStore {
                 pause_core_commits: AtomicBool::new(false),
                 core_commit_waiting: AtomicBool::new(false),
                 fail_core_chunk: AtomicBool::new(false),
+                result_backfill_decodes: AtomicUsize::new(0),
+                attention_backfill_decodes: AtomicUsize::new(0),
+                evidence_body_reads: AtomicUsize::new(0),
+                legacy_evidence_reads: AtomicUsize::new(0),
             }),
         })
     }
@@ -518,6 +694,222 @@ impl DataStore {
         self.faults
             .pause_core_commits
             .store(pause, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_result_projection_for_test(
+        &self,
+        session: SessionId,
+    ) -> Result<(), StoreError> {
+        let state = self
+            .store
+            .document::<ResultProjectionState>(result_projection_key(session));
+        self.store.transaction(|transaction| {
+            let snapshot = transaction.read(&state)?;
+            if snapshot.value.is_some() {
+                transaction.delete(&state, snapshot.revision)?;
+            }
+            for entry in
+                transaction.list_documents::<StoredResult>(NAMESPACE, &result_prefix(session))?
+            {
+                let snapshot = entry.snapshot?;
+                if snapshot.value.is_some() {
+                    transaction.delete(
+                        &self.store.document::<StoredResult>(entry.key),
+                        snapshot.revision,
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_evidence_source_for_test(
+        &self,
+        source: EvidenceRef,
+    ) -> Result<(), StoreError> {
+        let legacy = self
+            .store
+            .document::<StoredEvidenceSource>(evidence_source_key(source));
+        let metadata = self
+            .store
+            .document::<StoredEvidenceMetadata>(evidence_metadata_key(source));
+        self.store.transaction(|transaction| {
+            let snapshot = transaction.read(&legacy)?;
+            if snapshot.value.is_some() {
+                transaction.delete(&legacy, snapshot.revision)?;
+            }
+            let snapshot = transaction.read(&metadata)?;
+            if let Some(StoredEvidenceMetadata::Public { chunks, .. }) = &snapshot.value {
+                for index in 0..chunks.len() {
+                    let chunk = self
+                        .store
+                        .document::<String>(evidence_body_chunk_key(source, index));
+                    let saved = transaction.read(&chunk)?;
+                    if saved.value.is_some() {
+                        transaction.delete(&chunk, saved.revision)?;
+                    }
+                }
+            }
+            if snapshot.value.is_some() {
+                transaction.delete(&metadata, snapshot.revision)?;
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_evidence_projection_for_test(
+        &self,
+        session: SessionId,
+    ) -> Result<(), StoreError> {
+        let state = self
+            .store
+            .document::<EvidenceProjectionState>(evidence_projection_key(session));
+        self.store.transaction(|transaction| {
+            let snapshot = transaction.read(&state)?;
+            if snapshot.value.is_some() {
+                transaction.delete(&state, snapshot.revision)?;
+            }
+            for entry in transaction.list_documents::<StoredEvidenceSource>(
+                NAMESPACE,
+                &evidence_source_prefix(session),
+            )? {
+                let snapshot = entry.snapshot?;
+                if snapshot.value.is_some() {
+                    transaction.delete(
+                        &self.store.document::<StoredEvidenceSource>(entry.key),
+                        snapshot.revision,
+                    )?;
+                }
+            }
+            for entry in transaction.list_documents::<StoredEvidenceMetadata>(
+                NAMESPACE,
+                &evidence_metadata_prefix(session),
+            )? {
+                let snapshot = entry.snapshot?;
+                if snapshot.value.is_some() {
+                    transaction.delete(
+                        &self.store.document::<StoredEvidenceMetadata>(entry.key),
+                        snapshot.revision,
+                    )?;
+                }
+            }
+            for entry in
+                transaction.list_documents::<String>(NAMESPACE, &evidence_body_prefix(session))?
+            {
+                let snapshot = entry.snapshot?;
+                if snapshot.value.is_some() {
+                    transaction
+                        .delete(&self.store.document::<String>(entry.key), snapshot.revision)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn result_backfill_decode_count(&self) -> usize {
+        self.faults.result_backfill_decodes.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evidence_body_read_counts(&self) -> (usize, usize) {
+        (
+            self.faults.evidence_body_reads.load(Ordering::Acquire),
+            self.faults.legacy_evidence_reads.load(Ordering::Acquire),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_result_evidence_for_test(
+        &self,
+        result: ResultRef,
+        sources: Vec<(EvidenceRef, StoredEvidenceSource)>,
+    ) -> Result<(), StoreError> {
+        self.store.transaction(|transaction| {
+            for (source, projection) in &sources {
+                self.sync_evidence_source(transaction, *source, projection)?;
+            }
+            let document = self.store.document::<StoredResult>(result_key(result));
+            let snapshot = transaction.read(&document)?;
+            transaction.replace(
+                &document,
+                &StoredResult {
+                    result,
+                    outcome: bone_core::OutcomeKind::Completed,
+                    summary: "large evidence fixture".to_owned(),
+                    remaining: Vec::new(),
+                    evidence: sources.iter().map(|(source, _)| *source).collect(),
+                },
+                snapshot.revision,
+            )?;
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_legacy_result_evidence_for_test(
+        &self,
+        result: ResultRef,
+        sources: Vec<(EvidenceRef, StoredEvidenceSource)>,
+    ) -> Result<(), StoreError> {
+        self.store.transaction(|transaction| {
+            for (source, projection) in &sources {
+                let document = self
+                    .store
+                    .document::<StoredEvidenceSource>(evidence_source_key(*source));
+                let snapshot = transaction.read(&document)?;
+                transaction.replace(&document, projection, snapshot.revision)?;
+            }
+            let document = self.store.document::<StoredResult>(result_key(result));
+            let snapshot = transaction.read(&document)?;
+            transaction.replace(
+                &document,
+                &StoredResult {
+                    result,
+                    outcome: bone_core::OutcomeKind::Completed,
+                    summary: "legacy evidence fixture".to_owned(),
+                    remaining: Vec::new(),
+                    evidence: sources.iter().map(|(source, _)| *source).collect(),
+                },
+                snapshot.revision,
+            )?;
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_attention_projection_for_test(&self) -> Result<(), StoreError> {
+        let state = self
+            .store
+            .document::<AttentionProjectionState>(attention_projection_state_key());
+        self.store.transaction(|transaction| {
+            let snapshot = transaction.read(&state)?;
+            if snapshot.value.is_some() {
+                transaction.delete(&state, snapshot.revision)?;
+            }
+            for entry in
+                transaction.list_documents::<AttentionProjectionRecord>(NAMESPACE, "attention/")?
+            {
+                let snapshot = entry.snapshot?;
+                if snapshot.value.is_some() {
+                    transaction.delete(
+                        &self.store.document::<AttentionProjectionRecord>(entry.key),
+                        snapshot.revision,
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attention_backfill_decode_count(&self) -> usize {
+        self.faults
+            .attention_backfill_decodes
+            .load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -635,9 +1027,33 @@ impl DataStore {
             core_through: 0,
             draft: String::new(),
         };
-        self.store
-            .document(session_key(session.info.id))
-            .replace(&session, Revision::default())?;
+        let session_document = self.store.document(session_key(session.info.id));
+        let projection_document = self.store.document(result_projection_key(session.info.id));
+        let evidence_projection_document = self
+            .store
+            .document(evidence_projection_key(session.info.id));
+        self.store.transaction(|transaction| {
+            transaction.replace(&session_document, &session, Revision::default())?;
+            transaction.replace(
+                &projection_document,
+                &ResultProjectionState {
+                    snapshot_through: SessionSeq(0),
+                    before: SessionSeq(1),
+                    complete: true,
+                },
+                Revision::default(),
+            )?;
+            transaction.replace(
+                &evidence_projection_document,
+                &EvidenceProjectionState {
+                    snapshot_through: SessionSeq(0),
+                    before: SessionSeq(1),
+                    complete: true,
+                },
+                Revision::default(),
+            )?;
+            Ok(())
+        })?;
         Ok(session)
     }
 
@@ -663,6 +1079,254 @@ impl DataStore {
         }
         sessions.sort_by_key(|session| session.id);
         Ok(sessions)
+    }
+
+    /// Build a workspace navigation snapshot without acquiring a Session lease
+    /// or starting a Runtime. Legacy databases may first advance one bounded
+    /// derived-attention backfill window; business records remain read-only.
+    pub fn workspace_overview(
+        &self,
+        workspace: WorkspaceInfo,
+    ) -> Result<WorkspaceOverview, StoreError> {
+        let attention_projection_pending = self.backfill_attention_projection()?;
+        self.store.read_transaction(|transaction| {
+            let mut saved_sessions = Vec::new();
+            for entry in transaction.list_documents::<SavedSession>(NAMESPACE, "session/")? {
+                let Some(session) = entry.snapshot?.value else {
+                    continue;
+                };
+                if session.info.workspace == workspace.id {
+                    saved_sessions.push(session);
+                }
+            }
+            saved_sessions.sort_by_key(|session| session.info.id);
+
+            let mut sessions = Vec::with_capacity(saved_sessions.len());
+            for saved in saved_sessions {
+                let journal = self
+                    .store
+                    .journal::<StoredEvent>(journal_key(saved.info.id));
+                let history_through = SessionSeq(transaction.journal_last_sequence(&journal)?);
+                sessions.push(SessionSummary {
+                    session: saved.info,
+                    has_draft: !saved.draft.is_empty(),
+                    draft_bytes: saved.draft.len() as u64,
+                    persisted_runtime: saved.runtime.map(|runtime| runtime.id),
+                    history_through,
+                });
+            }
+
+            let mut questions =
+                BTreeMap::<(SessionId, RuntimeId, u64), (QuestionId, String, Vec<InputId>)>::new();
+            let mut unresolved_writes = Vec::new();
+            for entry in transaction.list_documents::<AttentionProjectionRecord>(
+                NAMESPACE,
+                &attention_workspace_prefix(workspace.id),
+            )? {
+                let Some(record) = entry.snapshot?.value else {
+                    continue;
+                };
+                match record {
+                    AttentionProjectionRecord::WaitingForUser {
+                        workspace: saved_workspace,
+                        session,
+                        input,
+                        runtime,
+                        question,
+                        text,
+                    } => {
+                        if saved_workspace != workspace.id {
+                            return Err(StoreError::Corrupt {
+                                message: "attention record is stored under the wrong workspace",
+                            });
+                        }
+                        let item = questions
+                            .entry((session, runtime, question.record))
+                            .or_insert_with(|| (question, text, Vec::new()));
+                        item.2.push(input);
+                    }
+                    AttentionProjectionRecord::UnresolvedWrite(write) => {
+                        if write.workspace != workspace.id {
+                            return Err(StoreError::Corrupt {
+                                message: "write attention is stored under the wrong workspace",
+                            });
+                        }
+                        unresolved_writes.push(write);
+                    }
+                }
+            }
+            let mut attention = questions
+                .into_iter()
+                .map(|((session, runtime, _), (question, text, mut inputs))| {
+                    inputs.sort();
+                    AttentionItem::WaitingForUser {
+                        session,
+                        inputs,
+                        runtime,
+                        question,
+                        text,
+                    }
+                })
+                .collect::<Vec<_>>();
+            unresolved_writes.sort_by_key(|write| write.call);
+            attention.extend(unresolved_writes.iter().map(|write| {
+                AttentionItem::UnresolvedWrite {
+                    session: write.session,
+                    call: write.call,
+                    status: write.status,
+                }
+            }));
+
+            Ok(WorkspaceOverview {
+                workspace,
+                sessions,
+                attention,
+                unresolved_writes,
+                attention_projection_pending,
+            })
+        })
+    }
+
+    /// Advance the legacy attention projection by one fixed document window.
+    /// Derived records and both cursors commit atomically, so cancellation can
+    /// only interrupt between durable windows.
+    fn backfill_attention_projection(&self) -> Result<bool, StoreError> {
+        const BACKFILL_WINDOW: usize = 128;
+        let state_document = self
+            .store
+            .document::<AttentionProjectionState>(attention_projection_state_key());
+        if state_document
+            .read()?
+            .value
+            .is_some_and(|state| state.inputs_complete && state.writes_complete)
+        {
+            return Ok(false);
+        }
+        self.store.transaction(|transaction| {
+            let snapshot = transaction.read(&state_document)?;
+            let original = snapshot.value.clone();
+            let mut state = snapshot.value.unwrap_or_default();
+            if !state.inputs_complete {
+                let page = transaction.recent_documents::<InputView>(
+                    NAMESPACE,
+                    "input/",
+                    state.input_before.as_deref(),
+                    BACKFILL_WINDOW,
+                )?;
+                #[cfg(test)]
+                self.faults.attention_backfill_decodes.fetch_add(
+                    page.entries.len() + usize::from(page.has_older),
+                    Ordering::AcqRel,
+                );
+                let next_before = page.entries.last().map(|entry| entry.key.key().to_owned());
+                for entry in page.entries {
+                    let session = session_from_input_key(entry.key.key())?;
+                    let Some(input) = entry.snapshot?.value else {
+                        continue;
+                    };
+                    let saved = transaction
+                        .read(&self.store.document::<SavedSession>(session_key(session)))?
+                        .value
+                        .ok_or(StoreError::Corrupt {
+                            message: "input belongs to a missing session",
+                        })?;
+                    self.sync_input_attention(transaction, saved.info.workspace, session, &input)?;
+                }
+                state.inputs_complete = !page.has_older;
+                state.input_before = next_before;
+            }
+            if !state.writes_complete {
+                let page = transaction.recent_documents::<WriteAttempt>(
+                    NAMESPACE,
+                    "write/",
+                    state.write_before.as_deref(),
+                    BACKFILL_WINDOW,
+                )?;
+                #[cfg(test)]
+                self.faults.attention_backfill_decodes.fetch_add(
+                    page.entries.len() + usize::from(page.has_older),
+                    Ordering::AcqRel,
+                );
+                let next_before = page.entries.last().map(|entry| entry.key.key().to_owned());
+                for entry in page.entries {
+                    let Some(attempt) = entry.snapshot?.value else {
+                        continue;
+                    };
+                    let saved = transaction
+                        .read(
+                            &self
+                                .store
+                                .document::<SavedSession>(session_key(attempt.session)),
+                        )?
+                        .value
+                        .ok_or(StoreError::Corrupt {
+                            message: "write attempt belongs to a missing session",
+                        })?;
+                    self.sync_write_attention(transaction, saved.info.workspace, &attempt)?;
+                }
+                state.writes_complete = !page.has_older;
+                state.write_before = next_before;
+            }
+            if original.as_ref() != Some(&state) {
+                transaction.replace(&state_document, &state, snapshot.revision)?;
+            }
+            Ok(!(state.inputs_complete && state.writes_complete))
+        })
+    }
+
+    fn sync_input_attention(
+        &self,
+        transaction: &WriteTransaction<'_, '_>,
+        workspace: WorkspaceId,
+        session: SessionId,
+        input: &InputView,
+    ) -> Result<(), StoreError> {
+        let document = self
+            .store
+            .document::<AttentionProjectionRecord>(attention_input_key(
+                workspace, session, input.id,
+            ));
+        let snapshot = transaction.read(&document)?;
+        if let InputState::WaitingForUser {
+            runtime,
+            question,
+            text,
+        } = &input.state
+        {
+            transaction.replace(
+                &document,
+                &AttentionProjectionRecord::WaitingForUser {
+                    workspace,
+                    session,
+                    input: input.id,
+                    runtime: *runtime,
+                    question: *question,
+                    text: text.clone(),
+                },
+                snapshot.revision,
+            )?;
+        } else if snapshot.value.is_some() {
+            transaction.delete(&document, snapshot.revision)?;
+        }
+        Ok(())
+    }
+
+    fn sync_write_attention(
+        &self,
+        transaction: &WriteTransaction<'_, '_>,
+        workspace: WorkspaceId,
+        attempt: &WriteAttempt,
+    ) -> Result<(), StoreError> {
+        let document = self
+            .store
+            .document::<AttentionProjectionRecord>(attention_write_key(workspace, attempt.call));
+        let snapshot = transaction.read(&document)?;
+        transaction.replace(
+            &document,
+            &AttentionProjectionRecord::UnresolvedWrite(write_view(workspace, attempt)),
+            snapshot.revision,
+        )?;
+        Ok(())
     }
 
     pub fn claim_session(&self, id: SessionId) -> Result<Lease, StoreError> {
@@ -796,8 +1460,15 @@ impl DataStore {
         event: Option<SessionEvent>,
     ) -> Result<(InputView, Option<SessionSeq>), StoreError> {
         let document = self.store.document::<InputView>(input_key(session, id));
+        let session_document = self.store.document::<SavedSession>(session_key(session));
         let journal = self.store.journal::<StoredEvent>(journal_key(session));
         self.store.transaction(|transaction| {
+            let saved = transaction
+                .read(&session_document)?
+                .value
+                .ok_or(StoreError::Corrupt {
+                    message: "input belongs to a missing session",
+                })?;
             let snapshot = transaction.read(&document)?;
             let mut input = snapshot.value.ok_or(StoreError::Corrupt {
                 message: "input does not exist",
@@ -808,6 +1479,7 @@ impl DataStore {
                 .transpose()?
                 .map(|append| SessionSeq(append.sequence));
             transaction.replace(&document, &input, snapshot.revision)?;
+            self.sync_input_attention(transaction, saved.info.workspace, session, &input)?;
             Ok((input, sequence))
         })
     }
@@ -819,6 +1491,12 @@ impl DataStore {
         runtime: RuntimeId,
     ) -> Result<Vec<InputView>, StoreError> {
         self.store.transaction(|transaction| {
+            let saved = transaction
+                .read(&self.store.document::<SavedSession>(session_key(session)))?
+                .value
+                .ok_or(StoreError::Corrupt {
+                    message: "input belongs to a missing session",
+                })?;
             let mut updated = Vec::with_capacity(inputs.len());
             for id in inputs {
                 let document = self.store.document::<InputView>(input_key(session, *id));
@@ -828,6 +1506,7 @@ impl DataStore {
                 })?;
                 input.state = InputState::Accepted { runtime };
                 transaction.replace(&document, &input, snapshot.revision)?;
+                self.sync_input_attention(transaction, saved.info.workspace, session, &input)?;
                 updated.push(input);
             }
             Ok(updated)
@@ -837,6 +1516,12 @@ impl DataStore {
     pub fn cancel_inputs(&self, session: SessionId, inputs: &[InputId]) -> Result<(), StoreError> {
         let journal = self.store.journal::<StoredEvent>(journal_key(session));
         self.store.transaction(|transaction| {
+            let saved = transaction
+                .read(&self.store.document::<SavedSession>(session_key(session)))?
+                .value
+                .ok_or(StoreError::Corrupt {
+                    message: "input belongs to a missing session",
+                })?;
             for id in inputs {
                 let document = self.store.document::<InputView>(input_key(session, *id));
                 let snapshot = transaction.read(&document)?;
@@ -845,6 +1530,7 @@ impl DataStore {
                 })?;
                 input.state = InputState::Cancelled;
                 transaction.replace(&document, &input, snapshot.revision)?;
+                self.sync_input_attention(transaction, saved.info.workspace, session, &input)?;
                 transaction.append(
                     &journal,
                     &StoredEvent::App(SessionEvent::InputCancelled { input: *id }),
@@ -990,6 +1676,7 @@ impl DataStore {
                 })?;
                 input.state = state.clone();
                 transaction.replace(&document, &input, input_snapshot.revision)?;
+                self.sync_input_attention(transaction, saved.info.workspace, session, &input)?;
             }
             if let bone_core::RecordBody::ToolFinished { outcome, .. } = &record.body
                 && outcome.external_effect != ExternalEffect::Unknown
@@ -1003,15 +1690,38 @@ impl DataStore {
                     && matches!(&attempt.state, WriteState::Finished(_))
                 {
                     transaction.delete(&write_document, write_snapshot.revision)?;
+                    let attention =
+                        self.store
+                            .document::<AttentionProjectionRecord>(attention_write_key(
+                                saved.info.workspace,
+                                origin,
+                            ));
+                    let attention_snapshot = transaction.read(&attention)?;
+                    if attention_snapshot.value.is_some() {
+                        transaction.delete(&attention, attention_snapshot.revision)?;
+                    }
                 }
             }
-            let append = transaction.append(
-                &journal,
-                &StoredEvent::Agent {
-                    runtime,
-                    record: record.clone(),
-                },
-            )?;
+            let stored = StoredEvent::Agent {
+                runtime,
+                record: record.clone(),
+            };
+            let source_ref = EvidenceRef {
+                session,
+                record: record.seq.0,
+            };
+            let source = evidence_source_projection(record);
+            self.sync_evidence_source(transaction, source_ref, &source)?;
+            let append = transaction.append(&journal, &stored)?;
+            if let Some(result) = result_summary(session, SessionSeq(append.sequence), &stored) {
+                transaction.replace(
+                    &self
+                        .store
+                        .document::<StoredResult>(result_key(result.result)),
+                    &result,
+                    Revision::default(),
+                )?;
+            }
             saved.agent_through = record.seq.0;
             saved.core_through = record.seq.0;
             transaction.replace(&session_document, &saved, snapshot.revision)?;
@@ -1094,6 +1804,7 @@ impl DataStore {
                     runtime: runtime.id,
                 };
                 transaction.replace(&input_document, &input, input_snapshot.revision)?;
+                self.sync_input_attention(transaction, saved.info.workspace, session, &input)?;
             }
             if !interrupted.is_empty() {
                 transaction.append(
@@ -1184,22 +1895,31 @@ impl DataStore {
             .store
             .document::<StoredWriteResolution>(write_resolution_key(workspace, call));
         self.store.transaction(|transaction| {
+            let saved = transaction
+                .read(&self.store.document::<SavedSession>(session_key(session)))?
+                .value
+                .ok_or(StoreError::Corrupt {
+                    message: "write attempt belongs to a missing session",
+                })?;
+            if saved.info.workspace != workspace {
+                return Err(StoreError::Corrupt {
+                    message: "write attempt workspace does not match its session",
+                });
+            }
             let snapshot = transaction.read(&document)?;
             if snapshot.value.is_some() || transaction.read(&resolution)?.value.is_some() {
                 return Ok(false);
             }
-            transaction.replace(
-                &document,
-                &WriteAttempt {
-                    session,
-                    call,
-                    job: None,
-                    tool: tool.to_owned(),
-                    arguments,
-                    state: WriteState::Pending,
-                },
-                snapshot.revision,
-            )?;
+            let attempt = WriteAttempt {
+                session,
+                call,
+                job: None,
+                tool: tool.to_owned(),
+                arguments,
+                state: WriteState::Pending,
+            };
+            transaction.replace(&document, &attempt, snapshot.revision)?;
+            self.sync_write_attention(transaction, workspace, &attempt)?;
             Ok(true)
         })
     }
@@ -1225,6 +1945,7 @@ impl DataStore {
             }
             attempt.state = WriteState::Finished(outcome);
             transaction.replace(&document, &attempt, snapshot.revision)?;
+            self.sync_write_attention(transaction, workspace, &attempt)?;
             Ok(())
         })
     }
@@ -1269,6 +1990,7 @@ impl DataStore {
             }
             attempt.job = Some(job);
             transaction.replace(&document, &attempt, snapshot.revision)?;
+            self.sync_write_attention(transaction, workspace, &attempt)?;
             Ok(())
         })
     }
@@ -1358,6 +2080,13 @@ impl DataStore {
                 resolution_snapshot.revision,
             )?;
             transaction.delete(&document, snapshot.revision)?;
+            let attention = self
+                .store
+                .document::<AttentionProjectionRecord>(attention_write_key(workspace, call));
+            let attention_snapshot = transaction.read(&attention)?;
+            if attention_snapshot.value.is_some() {
+                transaction.delete(&attention, attention_snapshot.revision)?;
+            }
             transaction.append(
                 &journal,
                 &StoredEvent::App(SessionEvent::WriteResolved {
@@ -1406,6 +2135,669 @@ impl DataStore {
             next_cursor,
             has_more: page.has_more,
         })
+    }
+
+    pub fn recent_history(
+        &self,
+        session: SessionId,
+        cursor: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<RecentHistoryPage, StoreError> {
+        let journal = self.store.journal::<StoredEvent>(journal_key(session));
+        let page = journal.read_recent(
+            cursor.map(|cursor| (cursor.before().0, cursor.snapshot_through().0)),
+            limit.max(1),
+        )?;
+        let mut items = Vec::new();
+        for entry in page.entries {
+            let event = match entry.event {
+                StoredEvent::App(event) => Some(event),
+                StoredEvent::Agent { runtime, record } => public_agent_event(runtime, &record),
+            };
+            if let Some(event) = event {
+                items.push(HistoryEntry {
+                    sequence: SessionSeq(entry.sequence),
+                    occurred_at: entry.occurred_at,
+                    event,
+                });
+            }
+        }
+        Ok(RecentHistoryPage {
+            items,
+            older_cursor: page.older_before.map(|before| {
+                HistoryCursor::new(
+                    session,
+                    SessionSeq(before),
+                    SessionSeq(page.snapshot_through),
+                )
+            }),
+            snapshot_through: SessionSeq(page.snapshot_through),
+        })
+    }
+
+    pub fn results(
+        &self,
+        session: SessionId,
+        cursor: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<ResultPage, StoreError> {
+        let projection_pending = self.backfill_result_projection(session)?;
+        let snapshot_through = match cursor {
+            Some(cursor) => cursor.snapshot_through(),
+            None => self.history_through(session)?,
+        };
+        let before_sequence = cursor.map_or_else(
+            || {
+                snapshot_through
+                    .0
+                    .checked_add(1)
+                    .map(SessionSeq)
+                    .ok_or(StoreError::RevisionExhausted)
+            },
+            |cursor| Ok(cursor.before()),
+        )?;
+        let prefix = result_prefix(session);
+        let before = format!("{}{:020}", prefix, before_sequence.0);
+        let page = self.store.recent_documents::<StoredResult>(
+            NAMESPACE,
+            &prefix,
+            Some(&before),
+            limit.max(1),
+        )?;
+        let mut items = Vec::with_capacity(page.entries.len());
+        for entry in page.entries {
+            if let Some(result) = entry.snapshot?.value {
+                if result.result.session != session
+                    || result.result.version.0 >= before_sequence.0
+                    || result.result.version.0 > snapshot_through.0
+                {
+                    return Err(StoreError::Corrupt {
+                        message: "result record is stored under the wrong key range",
+                    });
+                }
+                items.push(result.public());
+            }
+        }
+        items.sort_by_key(|item| item.result.version);
+        let older_cursor = page.has_older.then(|| {
+            HistoryCursor::new(
+                session,
+                items
+                    .first()
+                    .expect("an older result requires a non-empty page")
+                    .result
+                    .version,
+                snapshot_through,
+            )
+        });
+        Ok(ResultPage {
+            items,
+            older_cursor,
+            snapshot_through,
+            projection_pending,
+        })
+    }
+
+    /// Advance a legacy database's result projection by at most one fixed
+    /// journal window. The progress document and derived result records commit
+    /// atomically, so cancellation can only occur between complete windows.
+    fn backfill_result_projection(&self, session: SessionId) -> Result<bool, StoreError> {
+        const BACKFILL_WINDOW: usize = 256;
+        let state_document = self
+            .store
+            .document::<ResultProjectionState>(result_projection_key(session));
+        let journal = self.store.journal::<StoredEvent>(journal_key(session));
+        self.store.transaction(|transaction| {
+            let snapshot = transaction.read(&state_document)?;
+            let mut state = match snapshot.value {
+                Some(state) => state,
+                None => {
+                    let through = transaction.journal_last_sequence(&journal)?;
+                    ResultProjectionState {
+                        snapshot_through: SessionSeq(through),
+                        before: SessionSeq(
+                            through
+                                .checked_add(1)
+                                .ok_or(StoreError::RevisionExhausted)?,
+                        ),
+                        complete: through == 0,
+                    }
+                }
+            };
+            if state.complete {
+                return Ok(false);
+            }
+            let page = transaction.read_recent(
+                &journal,
+                Some((state.before.0, state.snapshot_through.0)),
+                BACKFILL_WINDOW,
+            )?;
+            #[cfg(test)]
+            self.faults.result_backfill_decodes.fetch_add(
+                page.entries.len() + usize::from(page.older_before.is_some()),
+                Ordering::AcqRel,
+            );
+            for entry in page.entries {
+                let Some(result) =
+                    result_summary(session, SessionSeq(entry.sequence), &entry.event)
+                else {
+                    continue;
+                };
+                let document = self
+                    .store
+                    .document::<StoredResult>(result_key(result.result));
+                let existing = transaction.read(&document)?;
+                match existing.value {
+                    Some(saved) if saved == result => {}
+                    Some(_) => {
+                        return Err(StoreError::Corrupt {
+                            message: "result projection conflicts with durable history",
+                        });
+                    }
+                    None => {
+                        transaction.replace(&document, &result, existing.revision)?;
+                    }
+                }
+            }
+            state.complete = page.older_before.is_none();
+            state.before = SessionSeq(page.older_before.unwrap_or(1));
+            transaction.replace(&state_document, &state, snapshot.revision)?;
+            Ok(!state.complete)
+        })
+    }
+
+    /// Advance the source projection independently from the older result
+    /// projection. Existing databases may have completed result backfill
+    /// before source documents existed.
+    fn backfill_evidence_projection(&self, session: SessionId) -> Result<bool, StoreError> {
+        const BACKFILL_WINDOW: usize = 256;
+        let state_document = self
+            .store
+            .document::<EvidenceProjectionState>(evidence_projection_key(session));
+        let journal = self.store.journal::<StoredEvent>(journal_key(session));
+        self.store.transaction(|transaction| {
+            let snapshot = transaction.read(&state_document)?;
+            let mut state = match snapshot.value {
+                Some(state) => state,
+                None => {
+                    let through = transaction.journal_last_sequence(&journal)?;
+                    EvidenceProjectionState {
+                        snapshot_through: SessionSeq(through),
+                        before: SessionSeq(
+                            through
+                                .checked_add(1)
+                                .ok_or(StoreError::RevisionExhausted)?,
+                        ),
+                        complete: through == 0,
+                    }
+                }
+            };
+            if state.complete {
+                return Ok(false);
+            }
+            let page = transaction.read_recent(
+                &journal,
+                Some((state.before.0, state.snapshot_through.0)),
+                BACKFILL_WINDOW,
+            )?;
+            for entry in page.entries {
+                let StoredEvent::Agent { record, .. } = entry.event else {
+                    continue;
+                };
+                let source_ref = EvidenceRef {
+                    session,
+                    record: record.seq.0,
+                };
+                let source = evidence_source_projection(&record);
+                self.sync_evidence_source(transaction, source_ref, &source)?;
+            }
+            state.complete = page.older_before.is_none();
+            state.before = SessionSeq(page.older_before.unwrap_or(1));
+            transaction.replace(&state_document, &state, snapshot.revision)?;
+            Ok(!state.complete)
+        })
+    }
+
+    pub fn acceptances(
+        &self,
+        result: ResultRef,
+        cursor: Option<AcceptanceCursor>,
+        limit: usize,
+    ) -> Result<AcceptancePage, StoreError> {
+        let prefix = acceptance_prefix(result);
+        let before = cursor.map(|cursor| format!("{}{:020}", prefix, cursor.before().0));
+        let page = self.store.recent_documents::<AcceptanceRecord>(
+            NAMESPACE,
+            &prefix,
+            before.as_deref(),
+            limit.max(1),
+        )?;
+        let mut records = Vec::with_capacity(page.entries.len());
+        for entry in page.entries {
+            if let Some(record) = entry.snapshot?.value {
+                if record.result != result {
+                    return Err(StoreError::Corrupt {
+                        message: "acceptance record is stored under the wrong result",
+                    });
+                }
+                records.push(record);
+            }
+        }
+        records.sort_by_key(|record| record.saved_at);
+        let older_cursor = page
+            .has_older
+            .then(|| {
+                records
+                    .first()
+                    .map(|record| AcceptanceCursor::new(result, record.saved_at))
+            })
+            .flatten();
+        Ok(AcceptancePage {
+            items: records,
+            older_cursor,
+        })
+    }
+
+    pub fn record_acceptance(
+        &self,
+        submission: &AcceptanceSubmission,
+    ) -> Result<(AcceptanceReceipt, Option<InputView>), AcceptanceError> {
+        let result = self
+            .result(submission.result)?
+            .ok_or(AcceptanceError::ResultNotFound)?;
+        if result.result != submission.result {
+            return Err(AcceptanceError::ResultNotFound);
+        }
+        let session_document = self
+            .store
+            .document::<SavedSession>(session_key(submission.result.session));
+        let request_document =
+            self.store
+                .document::<AcceptanceRequestRecord>(acceptance_request_key(
+                    submission.result.session,
+                    submission.request_id,
+                ));
+        let journal = self
+            .store
+            .journal::<StoredEvent>(journal_key(submission.result.session));
+        let acceptance = AcceptanceId::new();
+        let outcome = self.store.transaction(|transaction| {
+            let request_snapshot = transaction.read(&request_document)?;
+            if let Some(existing) = request_snapshot.value {
+                if existing.submission == *submission {
+                    let input = match existing.receipt.rework {
+                        Some(receipt) => Some(
+                            transaction
+                                .read(&self.store.document::<InputView>(input_key(
+                                    submission.result.session,
+                                    receipt.input,
+                                )))?
+                                .value
+                                .ok_or(StoreError::Corrupt {
+                                    message: "acceptance rework input is missing",
+                                })?,
+                        ),
+                        None => None,
+                    };
+                    return Ok(AcceptanceSaveOutcome::Existing(existing.receipt, input));
+                }
+                return Ok(AcceptanceSaveOutcome::Conflict);
+            }
+            let session_snapshot = transaction.read(&session_document)?;
+            let mut saved_session = session_snapshot.value.ok_or(StoreError::Corrupt {
+                message: "acceptance result belongs to a missing session",
+            })?;
+            let input_request = submission.rework.as_ref().map(|input| {
+                self.store.document::<RequestRecord>(request_key(
+                    submission.result.session,
+                    input.request_id,
+                ))
+            });
+            let input_request_snapshot = match &input_request {
+                Some(document) => {
+                    let snapshot = transaction.read(document)?;
+                    if snapshot.value.is_some() {
+                        return Ok(AcceptanceSaveOutcome::Conflict);
+                    }
+                    Some(snapshot)
+                }
+                None => None,
+            };
+            let accepted = transaction.append(
+                &journal,
+                &StoredEvent::App(SessionEvent::AcceptanceRecorded {
+                    acceptance,
+                    result: submission.result,
+                    decision: submission.decision,
+                    reason: submission.reason.clone(),
+                }),
+            )?;
+            let mut saved_input = None;
+            let rework = if let Some(input) = &submission.rework {
+                let id = InputId(saved_session.next_input);
+                saved_session.next_input = saved_session
+                    .next_input
+                    .checked_add(1)
+                    .ok_or(StoreError::RevisionExhausted)?;
+                let submitted = transaction.append(
+                    &journal,
+                    &StoredEvent::App(SessionEvent::InputSubmitted {
+                        input: id,
+                        request_id: input.request_id,
+                        text: input.text.clone(),
+                        reply_to: input.reply_to,
+                    }),
+                )?;
+                let receipt = SubmissionReceipt {
+                    input: id,
+                    saved_at: SessionSeq(submitted.sequence),
+                };
+                let view = InputView {
+                    id,
+                    request_id: input.request_id,
+                    text: input.text.clone(),
+                    reply_to: input.reply_to,
+                    state: InputState::Queued { problem: None },
+                };
+                transaction.replace(
+                    &self
+                        .store
+                        .document::<InputView>(input_key(submission.result.session, id)),
+                    &view,
+                    Revision::default(),
+                )?;
+                transaction.replace(
+                    input_request.as_ref().expect("rework request exists"),
+                    &RequestRecord {
+                        input: id,
+                        text: input.text.clone(),
+                        reply_to: input.reply_to,
+                        saved_at: receipt.saved_at,
+                    },
+                    input_request_snapshot
+                        .as_ref()
+                        .expect("rework request snapshot exists")
+                        .revision,
+                )?;
+                saved_input = Some(view);
+                Some(receipt)
+            } else {
+                None
+            };
+            let receipt = AcceptanceReceipt {
+                id: acceptance,
+                saved_at: SessionSeq(accepted.sequence),
+                rework,
+            };
+            let record = AcceptanceRecord {
+                id: acceptance,
+                request_id: submission.request_id,
+                result: submission.result,
+                decision: submission.decision,
+                reason: submission.reason.clone(),
+                saved_at: receipt.saved_at,
+                rework: receipt.rework,
+            };
+            transaction.replace(
+                &self
+                    .store
+                    .document::<AcceptanceRecord>(acceptance_key(&record)),
+                &record,
+                Revision::default(),
+            )?;
+            transaction.replace(
+                &request_document,
+                &AcceptanceRequestRecord {
+                    submission: submission.clone(),
+                    receipt: receipt.clone(),
+                },
+                request_snapshot.revision,
+            )?;
+            transaction.replace(&session_document, &saved_session, session_snapshot.revision)?;
+            Ok(AcceptanceSaveOutcome::Saved(receipt, saved_input))
+        })?;
+        match outcome {
+            AcceptanceSaveOutcome::Saved(receipt, input)
+            | AcceptanceSaveOutcome::Existing(receipt, input) => Ok((receipt, input)),
+            AcceptanceSaveOutcome::Conflict => Err(AcceptanceError::Conflict),
+        }
+    }
+
+    pub fn result(&self, result: ResultRef) -> Result<Option<ResultSummary>, StoreError> {
+        self.stored_result(result)
+            .map(|saved| saved.map(|saved| saved.public()))
+    }
+
+    fn stored_result(&self, result: ResultRef) -> Result<Option<StoredResult>, StoreError> {
+        if let Some(saved) = self
+            .store
+            .document::<StoredResult>(result_key(result))
+            .read()?
+            .value
+        {
+            return if saved.result == result {
+                Ok(Some(saved))
+            } else {
+                Err(StoreError::Corrupt {
+                    message: "result projection is stored under the wrong key",
+                })
+            };
+        }
+        let journal = self
+            .store
+            .journal::<StoredEvent>(journal_key(result.session));
+        let Some(entry) = journal.read_entry(result.version.0)? else {
+            return Ok(None);
+        };
+        Ok(result_summary(result.session, result.version, &entry.event)
+            .filter(|saved| saved.result == result))
+    }
+
+    pub fn result_artifact(&self, result: ResultRef) -> Result<Option<ResultArtifact>, StoreError> {
+        Ok(self.stored_result(result)?.map(|saved| ResultArtifact {
+            result: saved.result,
+            outcome: saved.outcome,
+            summary: saved.summary,
+            remaining: saved.remaining,
+            evidence_count: saved.evidence.len(),
+        }))
+    }
+
+    pub fn result_evidence(
+        &self,
+        result: ResultRef,
+        cursor: Option<EvidenceCursor>,
+        limit: usize,
+    ) -> Result<Option<EvidencePage>, StoreError> {
+        let mut projection_pending = self.backfill_result_projection(result.session)?
+            | self.backfill_evidence_projection(result.session)?;
+        let Some(saved) = self.stored_result(result)? else {
+            return Ok(None);
+        };
+        let start = cursor.map_or(0, EvidenceCursor::offset);
+        let end = start.saturating_add(limit.max(1)).min(saved.evidence.len());
+        projection_pending |=
+            self.prepare_evidence_metadata(saved.evidence.get(start..end).unwrap_or_default())?;
+        let mut items = Vec::with_capacity(end.saturating_sub(start));
+        for source in saved.evidence.get(start..end).unwrap_or_default() {
+            let projected = self
+                .store
+                .document::<StoredEvidenceMetadata>(evidence_metadata_key(*source))
+                .read()?
+                .value;
+            let availability = match projected {
+                Some(StoredEvidenceMetadata::Public { kind, title, .. }) => {
+                    EvidenceAvailability::Available { kind, title }
+                }
+                Some(StoredEvidenceMetadata::Private) => EvidenceAvailability::Private,
+                None => EvidenceAvailability::Missing,
+            };
+            items.push(EvidenceSummary {
+                source: *source,
+                availability,
+            });
+        }
+        Ok(Some(EvidencePage {
+            result,
+            items,
+            next_cursor: (end < saved.evidence.len()).then(|| EvidenceCursor::new(result, end)),
+            projection_pending,
+        }))
+    }
+
+    fn prepare_evidence_metadata(&self, sources: &[EvidenceRef]) -> Result<bool, StoreError> {
+        let mut pending = false;
+        let mut migrated = 0;
+        self.store.transaction(|transaction| {
+            for source in sources {
+                let metadata = self
+                    .store
+                    .document::<StoredEvidenceMetadata>(evidence_metadata_key(*source));
+                if transaction.read(&metadata)?.value.is_some() {
+                    continue;
+                }
+                if migrated >= LEGACY_EVIDENCE_BACKFILL_LIMIT {
+                    pending = true;
+                    continue;
+                }
+                #[cfg(test)]
+                self.faults
+                    .legacy_evidence_reads
+                    .fetch_add(1, Ordering::AcqRel);
+                let legacy = self
+                    .store
+                    .document::<StoredEvidenceSource>(evidence_source_key(*source));
+                if let Some(source_record) = transaction.read(&legacy)?.value {
+                    self.sync_evidence_source(transaction, *source, &source_record)?;
+                    migrated += 1;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(pending)
+    }
+
+    pub(crate) fn evidence_projection_pending(
+        &self,
+        session: SessionId,
+    ) -> Result<bool, StoreError> {
+        Ok(self.backfill_result_projection(session)?
+            | self.backfill_evidence_projection(session)?)
+    }
+
+    pub(crate) fn evidence_source_page_record(
+        &self,
+        source: EvidenceRef,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Option<StoredEvidencePage>, StoreError> {
+        self.prepare_evidence_metadata(&[source])?;
+        let Some(metadata) = self
+            .store
+            .document::<StoredEvidenceMetadata>(evidence_metadata_key(source))
+            .read()?
+            .value
+        else {
+            return Ok(None);
+        };
+        let StoredEvidenceMetadata::Public {
+            byte_len, chunks, ..
+        } = &metadata
+        else {
+            return Ok(Some(StoredEvidencePage {
+                metadata,
+                text: None,
+                offset: 0,
+                next_offset: None,
+            }));
+        };
+        let byte_len = *byte_len;
+        if offset > byte_len {
+            return Err(StoreError::Corrupt {
+                message: "evidence offset is out of range",
+            });
+        }
+        if offset == byte_len {
+            return Ok(Some(StoredEvidencePage {
+                metadata,
+                text: Some(String::new()),
+                offset,
+                next_offset: None,
+            }));
+        }
+        let budget = max_bytes.clamp(1, EVIDENCE_BODY_CHUNK_BYTES);
+        let mut text = String::new();
+        let mut position = offset;
+        let first_chunk = chunks.partition_point(|chunk| chunk.end <= position);
+        for (index, chunk) in chunks.iter().enumerate().skip(first_chunk) {
+            if position < chunk.start || chunk.end <= chunk.start || chunk.end > byte_len {
+                return Err(StoreError::Corrupt {
+                    message: "invalid evidence body manifest",
+                });
+            }
+            #[cfg(test)]
+            self.faults
+                .evidence_body_reads
+                .fetch_add(1, Ordering::AcqRel);
+            let body = self
+                .store
+                .document::<String>(evidence_body_chunk_key(source, index))
+                .read()?
+                .value
+                .ok_or(StoreError::Corrupt {
+                    message: "missing evidence body chunk",
+                })?;
+            if body.len() as u64 != chunk.end - chunk.start {
+                return Err(StoreError::Corrupt {
+                    message: "invalid evidence body chunk length",
+                });
+            }
+            let local =
+                usize::try_from(position - chunk.start).map_err(|_| StoreError::Corrupt {
+                    message: "invalid evidence body offset",
+                })?;
+            if !body.is_char_boundary(local) {
+                return Err(StoreError::Corrupt {
+                    message: "evidence offset is not a valid page boundary",
+                });
+            }
+            let remaining = budget - text.len();
+            let mut take = remaining.min(body.len() - local);
+            while take > 0 && !body.is_char_boundary(local + take) {
+                take -= 1;
+            }
+            if take == 0 {
+                return Err(StoreError::Corrupt {
+                    message: "evidence page budget cannot contain the next UTF-8 character",
+                });
+            }
+            text.push_str(&body[local..local + take]);
+            position += take as u64;
+            if text.len() == budget || position == byte_len {
+                break;
+            }
+        }
+        if text.is_empty() {
+            return Err(StoreError::Corrupt {
+                message: "evidence body manifest does not cover the requested offset",
+            });
+        }
+        Ok(Some(StoredEvidencePage {
+            metadata,
+            text: Some(text),
+            offset,
+            next_offset: (position < byte_len).then_some(position),
+        }))
+    }
+
+    pub(crate) fn result_cites(
+        &self,
+        result: ResultRef,
+        source: EvidenceRef,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .stored_result(result)?
+            .is_some_and(|saved| saved.evidence.contains(&source)))
     }
 
     pub fn history_through(&self, session: SessionId) -> Result<SessionSeq, StoreError> {
@@ -1561,6 +2953,16 @@ pub(crate) enum AcceptError {
     Store(#[from] StoreError),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AcceptanceError {
+    #[error("result not found")]
+    ResultNotFound,
+    #[error("acceptance request ID was reused with different content")]
+    Conflict,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
 fn public_agent_event(runtime: RuntimeId, record: &Record) -> Option<SessionEvent> {
     use bone_core::RecordBody;
     match &record.body {
@@ -1615,6 +3017,84 @@ fn public_agent_event(runtime: RuntimeId, record: &Record) -> Option<SessionEven
     }
 }
 
+fn result_summary(
+    session: SessionId,
+    version: SessionSeq,
+    stored: &StoredEvent,
+) -> Option<StoredResult> {
+    let (event, evidence) = match stored {
+        StoredEvent::App(event) => (event.clone(), Vec::new()),
+        StoredEvent::Agent { runtime, record } => {
+            let evidence = match &record.body {
+                bone_core::RecordBody::Outcome { outcome, .. } => outcome
+                    .completion
+                    .evidence
+                    .iter()
+                    .map(|record| EvidenceRef {
+                        session,
+                        record: record.0,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            (public_agent_event(*runtime, record)?, evidence)
+        }
+    };
+    let SessionEvent::JobFinished {
+        job,
+        outcome,
+        summary,
+        remaining,
+    } = event
+    else {
+        return None;
+    };
+    Some(StoredResult {
+        result: ResultRef {
+            session,
+            job,
+            version,
+        },
+        outcome,
+        summary,
+        remaining,
+        evidence,
+    })
+}
+
+fn evidence_source_projection(record: &Record) -> StoredEvidenceSource {
+    use bone_core::RecordBody;
+
+    match &record.body {
+        RecordBody::ToolFinished {
+            request, outcome, ..
+        } => {
+            let body = match &outcome.result {
+                Ok(value) => {
+                    serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_owned())
+                }
+                Err(error) => error.to_string(),
+            };
+            StoredEvidenceSource::Public {
+                kind: EvidenceSourceKind::ToolResult,
+                title: request.name.clone(),
+                body,
+            }
+        }
+        RecordBody::Published { result, .. } => StoredEvidenceSource::Public {
+            kind: EvidenceSourceKind::PublishedReport,
+            title: "Published report".to_owned(),
+            body: result.summary.clone(),
+        },
+        RecordBody::Reply { text, .. } => StoredEvidenceSource::Public {
+            kind: EvidenceSourceKind::Reply,
+            title: "Reply".to_owned(),
+            body: text.clone(),
+        },
+        _ => StoredEvidenceSource::Private,
+    }
+}
+
 fn catalog_key() -> DocumentKey {
     DocumentKey::new(NAMESPACE, "workspaces")
 }
@@ -1636,6 +3116,154 @@ fn input_key(session: SessionId, input: InputId) -> DocumentKey {
 
 fn request_key(session: SessionId, request: RequestId) -> DocumentKey {
     DocumentKey::new(NAMESPACE, format!("request/{session}/{request}"))
+}
+
+fn acceptance_request_key(session: SessionId, request: AcceptanceRequestId) -> DocumentKey {
+    DocumentKey::new(NAMESPACE, format!("acceptance-request/{session}/{request}"))
+}
+
+fn result_projection_key(session: SessionId) -> DocumentKey {
+    DocumentKey::new(NAMESPACE, format!("result-projection/{session}"))
+}
+
+fn evidence_projection_key(session: SessionId) -> DocumentKey {
+    DocumentKey::new(NAMESPACE, format!("evidence-projection/{session}"))
+}
+
+fn evidence_source_prefix(session: SessionId) -> String {
+    format!("evidence-source/{session}/")
+}
+
+fn evidence_metadata_prefix(session: SessionId) -> String {
+    format!("evidence-metadata/{session}/")
+}
+
+fn evidence_body_prefix(session: SessionId) -> String {
+    format!("evidence-body/{session}/")
+}
+
+fn result_prefix(session: SessionId) -> String {
+    format!("result/{session}/")
+}
+
+fn result_key(result: ResultRef) -> DocumentKey {
+    DocumentKey::new(
+        NAMESPACE,
+        format!("{}{:020}", result_prefix(result.session), result.version.0),
+    )
+}
+
+fn evidence_source_key(source: EvidenceRef) -> DocumentKey {
+    DocumentKey::new(
+        NAMESPACE,
+        format!(
+            "{}{}",
+            evidence_source_prefix(source.session),
+            source.record
+        ),
+    )
+}
+
+fn evidence_metadata_key(source: EvidenceRef) -> DocumentKey {
+    DocumentKey::new(
+        NAMESPACE,
+        format!(
+            "{}{}",
+            evidence_metadata_prefix(source.session),
+            source.record
+        ),
+    )
+}
+
+fn evidence_body_chunk_key(source: EvidenceRef, index: usize) -> DocumentKey {
+    DocumentKey::new(
+        NAMESPACE,
+        format!(
+            "{}{}:{index:06}",
+            evidence_body_prefix(source.session),
+            source.record
+        ),
+    )
+}
+
+fn attention_projection_state_key() -> DocumentKey {
+    DocumentKey::new(NAMESPACE, "attention-projection")
+}
+
+fn attention_workspace_prefix(workspace: WorkspaceId) -> String {
+    format!("attention/{workspace}/")
+}
+
+fn attention_input_key(workspace: WorkspaceId, session: SessionId, input: InputId) -> DocumentKey {
+    DocumentKey::new(
+        NAMESPACE,
+        format!(
+            "{}input/{session}/{:020}",
+            attention_workspace_prefix(workspace),
+            input.0
+        ),
+    )
+}
+
+fn attention_write_key(workspace: WorkspaceId, call: CallRef) -> DocumentKey {
+    DocumentKey::new(
+        NAMESPACE,
+        format!(
+            "{}write/{}/{:020}",
+            attention_workspace_prefix(workspace),
+            call.runtime,
+            call.id
+        ),
+    )
+}
+
+fn session_from_input_key(key: &str) -> Result<SessionId, StoreError> {
+    let mut parts = key.split('/');
+    if parts.next() != Some("input") {
+        return Err(StoreError::Corrupt {
+            message: "input document has an invalid key",
+        });
+    }
+    let session = parts.next().ok_or(StoreError::Corrupt {
+        message: "input document key has no session",
+    })?;
+    let parsed = uuid::Uuid::parse_str(session).map_err(|_| StoreError::Corrupt {
+        message: "input document key has an invalid session",
+    })?;
+    Ok(SessionId::from_uuid(parsed))
+}
+
+fn write_view(workspace: WorkspaceId, attempt: &WriteAttempt) -> UnresolvedWriteView {
+    let (status, outcome) = match &attempt.state {
+        WriteState::Pending => (UnresolvedWriteStatus::Pending, None),
+        WriteState::Finished(outcome) => (UnresolvedWriteStatus::Finished, Some(outcome.clone())),
+    };
+    UnresolvedWriteView {
+        workspace,
+        session: attempt.session,
+        call: attempt.call,
+        job: attempt.job,
+        status,
+        tool: attempt.tool.clone(),
+        arguments: attempt.arguments.clone(),
+        outcome,
+    }
+}
+
+fn acceptance_prefix(result: ResultRef) -> String {
+    format!("acceptance/{}/{:020}/", result.session, result.version.0)
+}
+
+fn acceptance_key(record: &AcceptanceRecord) -> DocumentKey {
+    DocumentKey::new(
+        NAMESPACE,
+        format!(
+            "{}{:020}/{}",
+            acceptance_prefix(record.result),
+            record.saved_at.0,
+            record.id
+        ),
+    )
 }
 
 fn journal_key(session: SessionId) -> JournalKey {
