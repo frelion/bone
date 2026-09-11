@@ -1,9 +1,9 @@
 //! The connection steps belong to the model picker and never own chat drafts.
-use super::{ACCENT, DANGER, INK, INPUT, MUTED, single_line_external};
+use super::{DANGER, INFO, INK, INPUT, MUTED, SELECTED, single_line_external};
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan},
     state::{ConnectionKind, Panel, SetupField, UiState},
-    ui::{caret, interaction::HitMap, theme},
+    ui::{caret, focus, interaction::HitMap, theme},
 };
 use ratatui::{
     Frame,
@@ -42,9 +42,12 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
             .as_ref()
             .map_or("Models / Connection", |form| form.kind.label())
     };
+    let title_band = Rect::new(area.x, area.y + inset, area.width, 1);
+    let title_background =
+        focus::paint_header(frame, title_band, state, focus::Region::Panel, INPUT);
     frame.render_widget(
-        Paragraph::new(title).style(theme::label(INK)),
-        Rect::new(x, area.y + inset, width, 1),
+        Paragraph::new(title).style(theme::label_on(INK, title_background)),
+        Rect::new(x, title_band.y, width, 1),
     );
     let back = Rect::new(x, area.bottom().saturating_sub(1 + inset), width, 1);
     frame.render_widget(
@@ -115,8 +118,17 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
             SetupField::Model => ("Model", form.model.as_str(), "model ID"),
         };
         let selected = form.field == *field;
+        let row_background = if selected { SELECTED } else { INPUT };
         frame.render_widget(
-            Paragraph::new(label).style(Style::default().fg(if selected { ACCENT } else { MUTED })),
+            Block::default().style(theme::surface(row_background)),
+            Rect::new(row.x, row.y, row.width, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(label).style(if selected {
+                theme::label_on(INK, row_background)
+            } else {
+                theme::body_on(MUTED, row_background)
+            }),
             Rect::new(row.x, row.y, 8.min(width), 1),
         );
         let input = Rect::new(row.x + 8.min(width), row.y, width.saturating_sub(8), 1);
@@ -125,15 +137,14 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
         let text = text.strip_prefix("> ").unwrap_or(&text);
         let cursor = cursor.saturating_sub(2).min(input.width.saturating_sub(1));
         frame.render_widget(
-            Paragraph::new(text).style(
-                Style::default()
-                    .fg(if value.is_empty() { MUTED } else { INK })
-                    .bg(INPUT),
-            ),
+            Paragraph::new(text).style(theme::body_on(
+                if value.is_empty() { MUTED } else { INK },
+                row_background,
+            )),
             input,
         );
         if selected && !form.saving && input.width > 2 {
-            caret::place(frame, (input.x + cursor, input.y));
+            caret::place(frame, (input.x + cursor, input.y), state.caret_visible);
         }
         hits.push(HitRegion {
             area: row,
@@ -148,10 +159,12 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
     } else {
         "enter save · tab next field"
     };
-    frame.render_widget(
-        Paragraph::new(label).style(Style::default().fg(ACCENT)),
-        action,
-    );
+    let action_style = if form.saving {
+        theme::label(INFO)
+    } else {
+        theme::label(INK)
+    };
+    frame.render_widget(Paragraph::new(label).style(action_style), action);
     if !form.saving {
         hits.push(HitRegion {
             area: action,
@@ -216,7 +229,14 @@ mod tests {
                     !field_text.contains('>'),
                     "fields do not repeat prompt glyphs: {field_text}"
                 );
-                assert_eq!(buffer[(hit.area.x + 6, hit.area.y)].bg, INPUT);
+                assert_eq!(
+                    buffer[(hit.area.x + 6, hit.area.y)].bg,
+                    if field == SetupField::Key {
+                        SELECTED
+                    } else {
+                        INPUT
+                    }
+                );
             }
             assert!(
                 layout

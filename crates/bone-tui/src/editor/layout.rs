@@ -127,6 +127,89 @@ pub(crate) fn stable_editor_viewport(
     )
 }
 
+/// Keep a one-line editor's insertion point visible without borrowing the
+/// composer's wrapping behavior. `origin` stores a grapheme-aligned byte
+/// offset, which also lets pointer input resolve against the same window.
+pub(crate) fn single_line_editor_viewport(
+    value: &str,
+    cursor: usize,
+    width: u16,
+    origin: &Cell<usize>,
+) -> (String, u16) {
+    let width = usize::from(width.max(1));
+    let cursor = super::floor_grapheme_boundary(value, cursor.min(value.len()));
+    let mut start = cursor;
+    let mut cursor_column: usize = 0;
+    for (offset, grapheme) in value[..cursor].grapheme_indices(true).rev() {
+        let cells = UnicodeWidthStr::width(display_grapheme(grapheme).as_ref()).max(1);
+        if cursor_column.saturating_add(cells) >= width {
+            break;
+        }
+        cursor_column += cells;
+        start = offset;
+    }
+    origin.set(start);
+
+    let mut shown = String::new();
+    let mut used: usize = 0;
+    for grapheme in value[start..].graphemes(true) {
+        let displayed = display_grapheme(grapheme);
+        let cells = UnicodeWidthStr::width(displayed.as_ref()).max(1);
+        if used.saturating_add(cells) > width {
+            break;
+        }
+        shown.push_str(&displayed);
+        used += cells;
+    }
+    (shown, cursor_column.min(width.saturating_sub(1)) as u16)
+}
+
+pub(crate) fn cursor_at_single_line(value: &str, origin: usize, column: u16) -> usize {
+    let origin = super::floor_grapheme_boundary(value, origin.min(value.len()));
+    let target = usize::from(column);
+    let mut used: usize = 0;
+    let mut nearest = origin;
+    for (offset, grapheme) in value[origin..].grapheme_indices(true) {
+        let cells = UnicodeWidthStr::width(display_grapheme(grapheme).as_ref()).max(1);
+        if target < used.saturating_add(cells).saturating_sub(cells / 2) {
+            break;
+        }
+        used += cells;
+        nearest = origin + offset + grapheme.len();
+        if used > target {
+            break;
+        }
+    }
+    nearest
+}
+
+/// Selected cells in the exact byte-origin window used by the one-line title
+/// editor. Keeping this beside pointer hit testing makes clipping, wide glyphs,
+/// emoji and combining clusters use one geometry.
+pub(crate) fn single_line_selection_cells(
+    value: &str,
+    origin: usize,
+    width: u16,
+    selection: std::ops::Range<usize>,
+) -> Vec<(u16, u16)> {
+    let origin = super::floor_grapheme_boundary(value, origin.min(value.len()));
+    let width = usize::from(width);
+    let mut used = 0usize;
+    let mut cells = Vec::new();
+    for (offset, grapheme) in value[origin..].grapheme_indices(true) {
+        let displayed = display_grapheme(grapheme);
+        let grapheme_cells = UnicodeWidthStr::width(displayed.as_ref()).max(1);
+        if used.saturating_add(grapheme_cells) > width {
+            break;
+        }
+        if selection.contains(&(origin + offset)) {
+            cells.push((used as u16, grapheme_cells as u16));
+        }
+        used += grapheme_cells;
+    }
+    cells
+}
+
 pub(crate) fn cursor_at_origin(value: &str, width: u16, origin: usize, x: u16, y: u16) -> usize {
     let layout = editor_layout(value, width);
     let target = (origin + usize::from(y)).min(layout.lines.len() - 1);
@@ -213,6 +296,59 @@ mod tests {
     #[test]
     fn full_line_end_has_its_own_insertion_cell() {
         assert_eq!(editor_viewport("abcd", 4, 4, 2), ("abcd\n".into(), 0, 1));
+    }
+
+    #[test]
+    fn one_line_viewport_reserves_a_real_caret_cell_at_exact_width() {
+        let origin = Cell::new(0);
+        let (shown, column) = single_line_editor_viewport("abcd", 4, 4, &origin);
+
+        assert_eq!(shown, "bcd");
+        assert_eq!(column, 3);
+        assert_eq!(origin.get(), 1);
+        assert_eq!(cursor_at_single_line("abcd", origin.get(), 0), 1);
+        assert_eq!(cursor_at_single_line("abcd", origin.get(), 3), 4);
+    }
+
+    #[test]
+    fn one_line_viewport_scrolls_only_at_grapheme_boundaries() {
+        let value = "Ae\u{301}👩‍💻Z";
+        let cursor = "Ae\u{301}👩‍💻".len();
+        let origin = Cell::new(usize::MAX);
+        let (shown, column) = single_line_editor_viewport(value, cursor, 4, &origin);
+
+        assert_eq!(shown, "e\u{301}👩‍💻Z");
+        assert_eq!(column, 3);
+        assert_eq!(origin.get(), 1);
+        assert!(value.is_char_boundary(origin.get()));
+        assert_eq!(cursor_at_single_line(value, origin.get(), column), cursor);
+
+        let cjk = "ab中文🙂z";
+        let (shown, column) = single_line_editor_viewport(cjk, cjk.len(), 5, &Cell::new(0));
+        assert_eq!(shown, "🙂z");
+        assert_eq!(column, 3);
+    }
+
+    #[test]
+    fn one_line_selection_uses_the_same_scrolled_unicode_cells_as_the_caret() {
+        let value = "ab中e\u{301}🙂zTAIL";
+        let origin = Cell::new(0);
+        let (shown, cursor) = single_line_editor_viewport(value, value.len(), 8, &origin);
+        let selected_from = value.find('z').unwrap();
+
+        assert_eq!(shown, "🙂zTAIL");
+        assert_eq!(cursor, 7);
+        assert_eq!(
+            single_line_selection_cells(value, origin.get(), 8, selected_from..value.len()),
+            vec![(2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
+        );
+        let emoji = value.find('🙂').unwrap();
+        assert_eq!(
+            single_line_selection_cells(value, origin.get(), 8, emoji..value.len()),
+            vec![(0, 2), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
+        );
+        assert!(value.is_char_boundary(origin.get()));
+        assert_eq!(cursor_at_single_line(value, origin.get(), 2), selected_from);
     }
 
     #[test]

@@ -7,16 +7,14 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::{
-    ACCENT, ATTENTION, CYAN, DANGER, GREEN, INK, MUTED, PURPLE, USER, primitives::wrap_text,
-};
+use super::{CYAN, DANGER, INK, MUTED, PURPLE, SUCCESS, USER, WARNING, primitives::wrap_text};
 
 pub(super) fn rows(event: &SessionEvent, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
     match event {
         SessionEvent::InputSubmitted { text, .. } => user_rows(text, width),
         SessionEvent::Reply { text, .. } => reply_rows(text, width),
-        SessionEvent::QuestionAsked { text, .. } => body_rows(text, width, ATTENTION),
+        SessionEvent::QuestionAsked { text, .. } => body_rows(text, width, WARNING),
         SessionEvent::ToolFinished { tool, outcome, .. } => {
             let mut lines = vec![compact(
                 "›",
@@ -30,7 +28,7 @@ pub(super) fn rows(event: &SessionEvent, width: u16) -> Vec<Line<'static>> {
                     }
                 ),
                 if outcome.result.is_ok() {
-                    GREEN
+                    SUCCESS
                 } else {
                     DANGER
                 },
@@ -47,14 +45,14 @@ pub(super) fn rows(event: &SessionEvent, width: u16) -> Vec<Line<'static>> {
         SessionEvent::RoutingFailed { message, .. }
         | SessionEvent::InputRejected { message, .. } => vec![compact("·", message, DANGER)],
         SessionEvent::JobFinished { summary, .. } => body_rows(summary, width, INK),
-        SessionEvent::AcceptanceRecorded { reason, .. } => vec![compact("·", reason, ACCENT)],
-        SessionEvent::Interrupted { .. } => vec![compact("·", "Execution interrupted.", ATTENTION)],
+        SessionEvent::AcceptanceRecorded { reason, .. } => vec![compact("·", reason, SUCCESS)],
+        SessionEvent::Interrupted { .. } => vec![compact("·", "Execution interrupted.", WARNING)],
         SessionEvent::InputAccepted { .. } => vec![compact("·", "Request received", MUTED)],
         SessionEvent::InputCancelled { .. } => vec![compact("·", "Request cancelled", MUTED)],
         SessionEvent::InputFinished { outcome, .. } => {
             vec![compact("·", &format!("Request {outcome:?}"), MUTED)]
         }
-        SessionEvent::WriteResolved { evidence, .. } => vec![compact("·", evidence, ACCENT)],
+        SessionEvent::WriteResolved { evidence, .. } => vec![compact("·", evidence, SUCCESS)],
         // Runtime lifecycle is transport plumbing, not conversation content.
         SessionEvent::RuntimeStarted { .. }
         | SessionEvent::RuntimeReconfigured { .. }
@@ -212,24 +210,15 @@ fn wrap_offsets(value: &str, width: usize) -> Vec<usize> {
 
 fn user_rows(value: &str, width: usize) -> Vec<Line<'static>> {
     let content_width = width.saturating_sub(4).max(1);
-    let blank = || {
-        Line::from(vec![
-            super::marks::span(MUTED, USER),
-            Span::styled(
-                " ".repeat(width.saturating_sub(1)),
-                Style::default().bg(USER),
-            ),
-        ])
-    };
+    let blank = || Line::from(Span::styled(" ".repeat(width), Style::default().bg(USER)));
     let mut lines = vec![blank()];
     lines.extend(wrap_text(value, content_width).into_iter().map(|content| {
         let used = UnicodeWidthStr::width(content.as_str()).min(content_width);
         Line::from(vec![
-            super::marks::span(MUTED, USER),
-            Span::raw(" "),
+            Span::styled("  ", Style::default().bg(USER)),
             Span::styled(
                 format!("{content}{}", " ".repeat(width.saturating_sub(2 + used))),
-                Style::default().fg(INK),
+                theme::body_on(INK, USER),
             ),
         ])
         .style(Style::default().bg(USER))
@@ -290,6 +279,41 @@ pub(super) fn compact(icon: &str, body: &str, tone: Color) -> Line<'static> {
 mod tests {
     use super::*;
     use bone_app::{InputId, RequestId, RuntimeId};
+
+    fn visible_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn conversation_messages_have_no_speaker_labels() {
+        let user = SessionEvent::InputSubmitted {
+            input: InputId(1),
+            request_id: RequestId::new(),
+            text: "UNIQUE_USER_BODY".into(),
+            reply_to: None,
+        };
+        let assistant = SessionEvent::Reply {
+            job: bone_app::JobRef {
+                runtime: RuntimeId::new(),
+                id: 1,
+            },
+            inputs: vec![InputId(1)],
+            text: "UNIQUE_ASSISTANT_BODY".into(),
+        };
+
+        let user_text = visible_text(&rows(&user, 80));
+        let assistant_text = visible_text(&rows(&assistant, 80));
+        assert!(user_text.contains("UNIQUE_USER_BODY"));
+        assert!(assistant_text.contains("UNIQUE_ASSISTANT_BODY"));
+        for speaker in ["YOU", "BONE"] {
+            assert!(!user_text.contains(speaker));
+            assert!(!assistant_text.contains(speaker));
+        }
+    }
 
     #[test]
     fn long_user_message_is_not_capped() {

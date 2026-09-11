@@ -56,6 +56,15 @@ pub(crate) struct JournalRecentRead<E> {
     pub snapshot_through: u64,
 }
 
+/// An ascending journal prefix bounded by both record count and encoded
+/// payload bytes. `payload_bytes` is the exact sum materialized into `entries`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct JournalBoundedRead<E> {
+    pub entries: Vec<JournalEntry<E>>,
+    pub payload_bytes: usize,
+    pub has_more: bool,
+}
+
 impl<E> JournalRead<E> {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
@@ -228,6 +237,94 @@ where
         entries,
         next_sequence: expected,
         last_sequence,
+        has_more,
+    })
+}
+
+pub(crate) fn read_journal_after_bounded<E>(
+    connection: &Connection,
+    key: &JournalKey,
+    after: u64,
+    maximum_entries: usize,
+    maximum_payload_bytes: usize,
+) -> Result<JournalBoundedRead<E>, StoreError>
+where
+    E: DeserializeOwned,
+{
+    let after_sql = i64::try_from(after).map_err(|_| StoreError::RevisionExhausted)?;
+    let limit_sql = i64::try_from(maximum_entries.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut statement = connection
+        .prepare(
+            "
+                SELECT sequence, occurred_at,
+                       length(CAST(payload_json AS BLOB)), payload_json
+                FROM journal_entries
+                WHERE journal_key = ?1 AND sequence > ?2
+                ORDER BY sequence ASC
+                LIMIT ?3
+            ",
+        )
+        .map_err(|error| StoreError::sqlite("prepare bounded journal read", error))?;
+    let mut rows = statement
+        .query(params![key.as_str(), after_sql, limit_sql])
+        .map_err(|error| StoreError::sqlite("read bounded journal", error))?;
+    let mut entries = Vec::with_capacity(maximum_entries.min(64));
+    let mut payload_bytes = 0usize;
+    let mut expected = after.checked_add(1).ok_or(StoreError::RevisionExhausted)?;
+    let mut has_more = false;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| StoreError::sqlite("read bounded journal", error))?
+    {
+        if entries.len() == maximum_entries {
+            has_more = true;
+            break;
+        }
+        let sequence = row
+            .get::<_, i64>(0)
+            .map_err(|error| StoreError::sqlite("read bounded journal sequence", error))?;
+        let occurred_at = row
+            .get::<_, i64>(1)
+            .map_err(|error| StoreError::sqlite("read bounded journal timestamp", error))?;
+        let encoded_bytes = row
+            .get::<_, i64>(2)
+            .map_err(|error| StoreError::sqlite("read bounded journal length", error))?;
+        let encoded_bytes = usize::try_from(encoded_bytes)
+            .ok()
+            .filter(|bytes| *bytes <= MAX_JOURNAL_ENTRY_BYTES)
+            .ok_or(StoreError::Corrupt {
+                message: "journal payload exceeds its maximum size",
+            })?;
+        if payload_bytes
+            .checked_add(encoded_bytes)
+            .is_none_or(|bytes| bytes > maximum_payload_bytes)
+        {
+            has_more = true;
+            break;
+        }
+        let payload_json = row
+            .get::<_, String>(3)
+            .map_err(|error| StoreError::sqlite("read bounded journal payload", error))?;
+        if payload_json.len() != encoded_bytes {
+            return Err(StoreError::Corrupt {
+                message: "journal payload length is invalid",
+            });
+        }
+        let entry = decode_entry(sequence, occurred_at, payload_json)?;
+        if entry.sequence != expected {
+            return Err(StoreError::Corrupt {
+                message: "journal sequence is not contiguous",
+            });
+        }
+        expected = expected
+            .checked_add(1)
+            .ok_or(StoreError::RevisionExhausted)?;
+        payload_bytes += encoded_bytes;
+        entries.push(entry);
+    }
+    Ok(JournalBoundedRead {
+        entries,
+        payload_bytes,
         has_more,
     })
 }

@@ -69,7 +69,7 @@ fn real_binary_keeps_the_caret_visible_with_slash_suggestions() {
     process.enable_keyboard_protocol();
     process.wait_for_bytes(b"\x1b[?25h");
     process.write(b"/");
-    process.wait_for_bytes(b" /new ");
+    process.wait_for_bytes(b"/new");
 
     let live = process.output.lock().expect("capture lock").clone();
     let last_show = live
@@ -118,6 +118,31 @@ fn real_binary_restores_every_terminal_mode_after_unix_termination_signals() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn detached_task_panic_stops_the_runner_and_restores_the_terminal() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace directory");
+    let mut process = PtyBone::spawn_with_background_panic(
+        &temporary.path().join("data"),
+        &workspace,
+        Duration::from_secs(15),
+    );
+
+    process.wait_for_bytes(b"\x1b[?1049h");
+    process.enable_keyboard_protocol();
+    let status = process.wait_for_exit();
+    assert!(!status.success(), "a detached-task panic must be fatal");
+    process.wait_for_bytes(b"\x1b[?1049l");
+    let output = process.finish_capture();
+    assert_terminal_protocol_restored(&output);
+    assert!(
+        terminal_visible_text(&output).contains("A background task panicked"),
+        "the restored shell should receive a concise fatal error"
+    );
+}
+
 #[test]
 fn real_binary_releases_the_terminal_while_suspended_and_reacquires_it_on_continue() {
     let temporary = tempfile::tempdir().expect("temporary workspace");
@@ -134,6 +159,7 @@ fn real_binary_releases_the_terminal_while_suspended_and_reacquires_it_on_contin
     process.signal(libc::SIGTSTP, "SIGTSTP");
     process.wait_for_sequence_count(b"\x1b[?1049l", 1);
     process.wait_until_stopped();
+    process.assert_terminal_attributes_restored();
 
     process.signal(libc::SIGCONT, "SIGCONT");
     process.wait_for_sequence_count(b"\x1b[?1049h", 2);
@@ -218,6 +244,26 @@ fn assert_terminal_protocol_restored(output: &[u8]) {
         pop < leave_screen,
         "the alternate-screen keyboard stack must be popped before leaving it"
     );
+    for (enable, disable) in [
+        (b"\x1b[?1049h".as_slice(), b"\x1b[?1049l".as_slice()),
+        (b"\x1b[>1u".as_slice(), b"\x1b[<1u".as_slice()),
+        (b"\x1b[?2004h".as_slice(), b"\x1b[?2004l".as_slice()),
+        (b"\x1b[?1000h".as_slice(), b"\x1b[?1000l".as_slice()),
+        (b"\x1b[?1002h".as_slice(), b"\x1b[?1002l".as_slice()),
+        (b"\x1b[?1003h".as_slice(), b"\x1b[?1003l".as_slice()),
+        (b"\x1b[?1015h".as_slice(), b"\x1b[?1015l".as_slice()),
+        (b"\x1b[?1006h".as_slice(), b"\x1b[?1006l".as_slice()),
+    ] {
+        assert_eq!(
+            sequence_count(output, enable),
+            sequence_count(output, disable),
+            "terminal mode must be balanced: {enable:?} / {disable:?}"
+        );
+        assert!(
+            find_last_sequence(output, enable) < find_last_sequence(output, disable),
+            "the final terminal mode operation must disable {enable:?}"
+        );
+    }
 }
 
 fn assert_no_decorative_terminal_mutations(output: &[u8]) {
@@ -273,11 +319,54 @@ fn find_sequence(output: &[u8], sequence: &[u8]) -> usize {
         .expect("terminal protocol sequence")
 }
 
+fn find_last_sequence(output: &[u8], sequence: &[u8]) -> usize {
+    output
+        .windows(sequence.len())
+        .rposition(|window| window == sequence)
+        .expect("terminal protocol sequence")
+}
+
 fn sequence_count(output: &[u8], sequence: &[u8]) -> usize {
     output
         .windows(sequence.len())
         .filter(|window| *window == sequence)
         .count()
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TerminalAttributes {
+    input_flags: libc::tcflag_t,
+    output_flags: libc::tcflag_t,
+    control_flags: libc::tcflag_t,
+    local_flags: libc::tcflag_t,
+    control_characters: Vec<libc::cc_t>,
+    input_speed: libc::speed_t,
+    output_speed: libc::speed_t,
+}
+
+impl TerminalAttributes {
+    fn read(file: &File) -> Self {
+        use std::{mem::MaybeUninit, os::fd::AsRawFd};
+
+        let mut attributes = MaybeUninit::<libc::termios>::uninit();
+        let result = unsafe { libc::tcgetattr(file.as_raw_fd(), attributes.as_mut_ptr()) };
+        assert_eq!(
+            result,
+            0,
+            "read PTY termios: {}",
+            std::io::Error::last_os_error()
+        );
+        let attributes = unsafe { attributes.assume_init() };
+        Self {
+            input_flags: attributes.c_iflag,
+            output_flags: attributes.c_oflag,
+            control_flags: attributes.c_cflag,
+            local_flags: attributes.c_lflag,
+            control_characters: attributes.c_cc.to_vec(),
+            input_speed: unsafe { libc::cfgetispeed(&attributes) },
+            output_speed: unsafe { libc::cfgetospeed(&attributes) },
+        }
+    }
 }
 
 struct PtyBone {
@@ -286,12 +375,32 @@ struct PtyBone {
     output: Arc<Mutex<Vec<u8>>>,
     stop_reader: Arc<AtomicBool>,
     read_task: Option<JoinHandle<()>>,
+    inherited_attributes: TerminalAttributes,
     deadline: Instant,
 }
 
 impl PtyBone {
     fn spawn(data: &std::path::Path, workspace: &std::path::Path, timeout: Duration) -> Self {
+        Self::spawn_with_test_panic(data, workspace, timeout, None)
+    }
+
+    #[cfg(debug_assertions)]
+    fn spawn_with_background_panic(
+        data: &std::path::Path,
+        workspace: &std::path::Path,
+        timeout: Duration,
+    ) -> Self {
+        Self::spawn_with_test_panic(data, workspace, timeout, Some(500))
+    }
+
+    fn spawn_with_test_panic(
+        data: &std::path::Path,
+        workspace: &std::path::Path,
+        timeout: Duration,
+        panic_after_ms: Option<u64>,
+    ) -> Self {
         let (master, slave) = open_pty(120, 40);
+        let inherited_attributes = TerminalAttributes::read(&master);
         let stdin = slave.try_clone().expect("clone PTY slave");
         let stdout = slave.try_clone().expect("clone PTY slave");
         let stderr = slave;
@@ -304,6 +413,10 @@ impl PtyBone {
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        command.env_remove("BONE_TUI_TEST_BACKGROUND_PANIC_AFTER_MS");
+        if let Some(delay) = panic_after_ms {
+            command.env("BONE_TUI_TEST_BACKGROUND_PANIC_AFTER_MS", delay.to_string());
+        }
         // A controlling terminal exercises the same crossterm path as a real
         // shell instead of three unrelated character streams.
         unsafe {
@@ -348,6 +461,7 @@ impl PtyBone {
             output,
             stop_reader,
             read_task: Some(read_task),
+            inherited_attributes,
             deadline: Instant::now() + timeout,
         }
     }
@@ -441,12 +555,21 @@ impl PtyBone {
     }
 
     fn finish_capture(&mut self) -> Vec<u8> {
+        self.assert_terminal_attributes_restored();
         self.stop_reader.store(true, Ordering::Release);
         self.master.take();
         if let Some(read_task) = self.read_task.take() {
             read_task.join().expect("PTY reader");
         }
         self.output.lock().expect("capture lock").clone()
+    }
+
+    fn assert_terminal_attributes_restored(&self) {
+        let current = TerminalAttributes::read(self.master.as_ref().expect("PTY master"));
+        assert_eq!(
+            current, self.inherited_attributes,
+            "BONE must restore the complete inherited termios state"
+        );
     }
 
     fn assert_before_deadline(&self, message: &str) {

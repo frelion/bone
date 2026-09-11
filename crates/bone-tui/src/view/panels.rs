@@ -1,8 +1,8 @@
-use super::{ACCENT, INK, INPUT, MUTED, PANEL, single_line_external};
+use super::{INK, INPUT, MUTED, single_line_external};
 use crate::{
-    layout::{HitRegion, HitTarget, LayoutPlan},
-    state::{COMMANDS, Panel, UiState},
-    ui::{caret, interaction::HitMap, theme},
+    layout::{HitRegion, HitTarget, LayoutPlan, floating_menu_stride, floating_panel_area},
+    state::{Panel, UiState},
+    ui::{focus, interaction::HitMap, theme},
 };
 use ratatui::{
     Frame,
@@ -13,6 +13,94 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+pub(super) struct FloatingPanel {
+    pub(super) area: Rect,
+    pub(super) inner: Rect,
+    pub(super) back: Rect,
+    pub(super) stride: u16,
+}
+
+// Secret/model setup fields currently append at the end. Keep that insertion
+// position visible without splitting a wide or combining grapheme.
+pub(super) fn input_query(value: &str, width: u16, placeholder: &str) -> (String, u16) {
+    if value.is_empty() {
+        return (format!("> {placeholder}"), 2.min(width.saturating_sub(1)));
+    }
+    let clean = single_line_external(value);
+    let available = usize::from(width.saturating_sub(3));
+    let mut cells = 0;
+    let mut suffix = Vec::new();
+    for grapheme in clean.graphemes(true).rev() {
+        let size = UnicodeWidthStr::width(grapheme);
+        if cells + size > available {
+            break;
+        }
+        suffix.push(grapheme);
+        cells += size;
+    }
+    suffix.reverse();
+    let truncated = suffix.iter().map(|part| part.len()).sum::<usize>() < clean.len();
+    (
+        format!("{} {}", if truncated { "…" } else { ">" }, suffix.concat()),
+        (2 + cells as u16).min(width.saturating_sub(1)),
+    )
+}
+
+/// Draw the one floating-panel shell used by dialogs and slash commands.
+/// Callers own only the body rows and stable hit targets inside `inner`.
+pub(super) fn render_shell(
+    frame: &mut Frame<'_>,
+    screen: Rect,
+    area: Rect,
+    title: &str,
+    active: bool,
+) -> FloatingPanel {
+    let spacious = crate::layout::comfortable(screen);
+    let chrome: u16 = if spacious { 4 } else { 0 };
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(theme::surface(INPUT)), area);
+    let inner = Rect::new(
+        area.x + 2,
+        area.y + 1 + chrome / 2,
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2 + chrome),
+    );
+    let title_y = area.y + u16::from(spacious);
+    let title_background = focus::paint_header_active(
+        frame,
+        Rect::new(area.x, title_y, area.width, 1),
+        active,
+        INPUT,
+    );
+    frame.render_widget(
+        Paragraph::new(title).style(theme::label_on(INK, title_background)),
+        Rect::new(inner.x, title_y, inner.width, 1),
+    );
+    if spacious {
+        frame.render_widget(
+            Paragraph::new("─".repeat(usize::from(inner.width)))
+                .style(theme::body_on(theme::STRUCTURE, INPUT)),
+            Rect::new(inner.x, area.y + 2, inner.width, 1),
+        );
+    }
+    let back = Rect::new(
+        inner.x,
+        area.bottom() - 1 - u16::from(spacious),
+        inner.width,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new("esc back").style(Style::default().fg(MUTED)),
+        back,
+    );
+    FloatingPanel {
+        area,
+        inner,
+        back,
+        stride: floating_menu_stride(screen),
+    }
+}
 
 pub(super) fn render(
     frame: &mut Frame<'_>,
@@ -55,13 +143,10 @@ pub(super) fn render(
     }
     let surface = plan.composer.unwrap_or(plan.screen);
     let spacious = crate::layout::comfortable(plan.screen);
-    let stride: u16 = if spacious { 2 } else { 1 };
-    let chrome: u16 = if spacious { 4 } else { 0 };
-    let height = (match panel {
+    let stride = floating_menu_stride(plan.screen);
+    let height = match panel {
         Panel::Help => 16,
         Panel::Login => 10,
-        Panel::Rename => 7,
-        Panel::Commands => COMMANDS.len() as u16 * stride + 3,
         Panel::Objects { choices, .. } => choices.len().clamp(1, 12) as u16 * stride + 3,
         Panel::Models => (state.model_row_count() * usize::from(stride)
             + state.model_configuration_summary().lines().count()
@@ -69,52 +154,17 @@ pub(super) fn render(
             + if state.status.is_some() { 2 } else { 0 })
         .clamp(5, if spacious { 22 } else { 14 }) as u16,
         _ => 0,
-    } + chrome)
-        .min(plan.screen.height.saturating_sub(2))
-        .max(3);
-    let area = Rect::new(
-        surface.x,
-        surface.y.saturating_sub(height + 1).max(plan.screen.y + 1),
-        surface.width,
-        height,
-    );
-    frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(theme::surface(INPUT)), area);
-    let mut inner = Rect::new(
-        area.x + 2,
-        area.y + 1 + chrome / 2,
-        area.width.saturating_sub(4),
-        area.height.saturating_sub(2 + chrome),
-    );
+    };
+    let area = floating_panel_area(plan.screen, surface, height);
     let title = match panel {
-        Panel::Commands => "Commands",
         Panel::Models => "Models & connections",
-        Panel::Rename => "Rename session",
         Panel::Objects { .. } => "Tasks & tools · enter open",
         Panel::Login => "Models / Account authorization",
         _ => "Keyboard help",
     };
-    frame.render_widget(
-        Paragraph::new(title).style(theme::label(INK)),
-        Rect::new(inner.x, area.y + u16::from(spacious), inner.width, 1),
-    );
-    if spacious {
-        frame.render_widget(
-            Paragraph::new("─".repeat(usize::from(inner.width)))
-                .style(Style::default().fg(super::DIVIDER)),
-            Rect::new(inner.x, area.y + 2, inner.width, 1),
-        );
-    }
-    let back = Rect::new(
-        inner.x,
-        area.bottom() - 1 - u16::from(spacious),
-        inner.width,
-        1,
-    );
-    frame.render_widget(
-        Paragraph::new("esc back").style(Style::default().fg(MUTED)),
-        back,
-    );
+    let shell = render_shell(frame, plan.screen, area, title, true);
+    let mut inner = shell.inner;
+    let back = shell.back;
     hits.push(HitRegion {
         area: back,
         target: HitTarget::Back,
@@ -124,7 +174,8 @@ pub(super) fn render(
             let mut inner = inner;
             if let Some(error) = &state.status {
                 frame.render_widget(
-                    Paragraph::new(single_line_external(error)).style(Style::default().fg(ACCENT)),
+                    Paragraph::new(single_line_external(error))
+                        .style(Style::default().fg(theme::DANGER)),
                     Rect::new(inner.x, inner.y, inner.width, 1),
                 );
                 inner.y = inner.y.saturating_add(1);
@@ -164,44 +215,13 @@ pub(super) fn render(
                 }
             }
         }
-        Panel::Commands => {
-            let start = state
-                .panel_selection
-                .saturating_sub(usize::from(inner.height / stride).saturating_sub(1));
-            for (index, command) in COMMANDS
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(usize::from(inner.height / stride))
-            {
-                let row = Rect::new(
-                    inner.x,
-                    inner.y + (index - start) as u16 * stride,
-                    inner.width,
-                    stride,
-                );
-                let label = if inner.width >= 52 {
-                    format!("/{:<12} {}", command.name, command.summary)
-                } else {
-                    format!("/{}", command.name)
-                };
-                frame.render_widget(
-                    Paragraph::new(label).style(menu_style(index == state.panel_selection)),
-                    row,
-                );
-                hits.push(HitRegion {
-                    area: row,
-                    target: HitTarget::SlashCommand(command.kind),
-                });
-            }
-        }
         Panel::Models => {
             if let Some(status) = &state.status {
                 let height = 2.min(inner.height.saturating_sub(1));
                 frame.render_widget(
                     Paragraph::new(single_line_external(status))
                         .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(ACCENT)),
+                        .style(Style::default().fg(theme::DANGER)),
                     Rect::new(inner.x, inner.y, inner.width, height),
                 );
                 inner.y += height;
@@ -276,33 +296,6 @@ pub(super) fn render(
             }
         }
 
-        Panel::Rename => {
-            let (text, cursor) = input_query(&state.rename_input, inner.width, "session title");
-            frame.render_widget(
-                Paragraph::new(text).style(Style::default().fg(ACCENT)),
-                Rect::new(inner.x, inner.y, inner.width, 1),
-            );
-            if inner.width > 2 {
-                caret::place(frame, (inner.x + cursor, inner.y));
-            }
-            frame.render_widget(
-                Paragraph::new("enter save title").style(Style::default().fg(MUTED)),
-                Rect::new(inner.x, inner.y + 1, inner.width, 1),
-            );
-            if let Some(error) = &state.status {
-                frame.render_widget(
-                    Paragraph::new(single_line_external(error))
-                        .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(super::DANGER)),
-                    Rect::new(
-                        inner.x,
-                        inner.y + 2,
-                        inner.width,
-                        inner.height.saturating_sub(2),
-                    ),
-                );
-            }
-        }
         Panel::Login => {
             let text = match &state.login_state {
                 bone_app::LoginState::Connecting => "Connecting…".to_owned(),
@@ -338,15 +331,15 @@ pub(super) fn render(
                 format!("Shift+Enter   Unavailable · {}", reason)
             };
             let lines = [
-                "Ctrl+arrows   Move focus".to_owned(),
+                "Ctrl+←/→/↑/↓  Spatial focus".to_owned(),
                 "Enter         Submit / choose".to_owned(),
                 shift_enter,
-                "Ctrl+P        Commands".to_owned(),
+                "Ctrl+C        Clear focused input".to_owned(),
+                "Ctrl+D        Save drafts and quit".to_owned(),
+                "Esc           Back, then stop".to_owned(),
+                "Ctrl+Z/Y      Undo / redo in input".to_owned(),
                 "/model        Model configuration".to_owned(),
                 "/details      Latest task / tool".to_owned(),
-                "Esc           Back, then stop".to_owned(),
-                "Ctrl+C        Clear input (Ctrl+Z undo)".to_owned(),
-                "Ctrl+D        Save drafts and quit".to_owned(),
             ];
             frame.render_widget(
                 Paragraph::new(lines.map(Line::from).to_vec())
@@ -359,45 +352,21 @@ pub(super) fn render(
     }
 }
 
-// Inline panel editing currently appends at the end. Keep that insertion position
-// visible without splitting a wide or combining grapheme at the left edge.
-pub(super) fn input_query(value: &str, width: u16, placeholder: &str) -> (String, u16) {
-    if value.is_empty() {
-        return (format!("> {placeholder}"), 2.min(width.saturating_sub(1)));
-    }
-    let clean = single_line_external(value);
-    let available = usize::from(width.saturating_sub(3));
-    let mut cells = 0;
-    let mut suffix = Vec::new();
-    for grapheme in clean.graphemes(true).rev() {
-        let size = UnicodeWidthStr::width(grapheme);
-        if cells + size > available {
-            break;
-        }
-        suffix.push(grapheme);
-        cells += size;
-    }
-    suffix.reverse();
-    let truncated = suffix.iter().map(|part| part.len()).sum::<usize>() < clean.len();
-    (
-        format!("{} {}", if truncated { "…" } else { ">" }, suffix.concat()),
-        (2 + cells as u16).min(width.saturating_sub(1)),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Modifier};
 
-    #[test]
-    fn model_query_keeps_graphemes_and_insertion_cell_visible() {
-        let (text, cursor) = input_query("very-long-profile 中文e\u{301}TAIL", 12, "");
-        assert!(text.ends_with("e\u{301}TAIL"));
-        assert_eq!(UnicodeWidthStr::width(text.as_str()), usize::from(cursor));
-        assert!(cursor < 12);
-        let (text, _) = input_query("prefix\u{1b}\nTAIL", 12, "");
-        assert!(!text.chars().any(char::is_control));
+    fn find_text(buffer: &Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in buffer.area.y..buffer.area.bottom() {
+            let line = (buffer.area.x..buffer.area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            if let Some(x) = line.find(needle) {
+                return Some((buffer.area.x + x as u16, y));
+            }
+        }
+        None
     }
 
     #[test]
@@ -405,8 +374,6 @@ mod tests {
         for (width, height) in [(40, 12), (80, 24), (140, 24), (160, 40)] {
             for panel in [
                 Panel::Models,
-                Panel::Rename,
-                Panel::Commands,
                 Panel::Help,
                 Panel::Login,
                 Panel::Objects {
@@ -421,10 +388,8 @@ mod tests {
                     )],
                 },
             ] {
-                let editable = matches!(panel, Panel::Rename);
                 let mut state = UiState::default();
                 state.panel = Some(panel);
-                state.rename_input = format!("{}TAIL", "汉e\u{301}".repeat(40));
                 state.status = Some("Invalid value".into());
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 let mut plan = None;
@@ -450,20 +415,73 @@ mod tests {
                     .find(|region| region.target == HitTarget::Back)
                     .unwrap();
                 assert_eq!(plan.hit(back.area.x, back.area.y), Some(HitTarget::Back));
-                if editable {
-                    let position = terminal.get_cursor_position().unwrap();
-                    assert!(position.x < width && position.y < back.area.y);
-                    let row: String = (0..width)
-                        .map(|x| terminal.backend().buffer()[(x, position.y)].symbol())
-                        .collect();
-                    assert!(row.contains("TAIL"), "panel input tail hidden: {row}");
-                    let screen: String = (0..height)
-                        .flat_map(|y| (0..width).map(move |x| (x, y)))
-                        .map(|position| terminal.backend().buffer()[position].symbol())
-                        .collect();
-                    assert!(screen.contains("Invalid value"), "panel error hidden");
-                }
             }
+        }
+    }
+
+    #[test]
+    fn panel_title_uses_a_neutral_active_surface_without_orange() {
+        let mut state = UiState::default();
+        state.panel = Some(Panel::Help);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::view::render(frame, &state);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let (title_x, title_y) =
+            find_text(buffer, "Keyboard help").expect("panel title is visible");
+        let mark_x = title_x - focus::GUTTER_WIDTH;
+        let mark = &buffer[(mark_x, title_y)];
+        assert_eq!(mark.symbol(), " ");
+        assert_eq!(mark.bg, theme::SELECTED);
+        assert_ne!(mark.bg, theme::FOCUS_MARK);
+        assert!(!mark.modifier.contains(Modifier::BOLD | Modifier::DIM));
+        assert_eq!(buffer[(mark_x + 1, title_y)].bg, theme::SELECTED);
+        let title = &buffer[(title_x, title_y)];
+        assert_eq!(title.fg, INK);
+        assert_eq!(title.bg, theme::SELECTED);
+        assert!(title.modifier.contains(Modifier::BOLD));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| cell.fg != theme::FOCUS_MARK && cell.bg != theme::FOCUS_MARK)
+        );
+    }
+
+    #[test]
+    fn help_names_only_the_declared_focus_and_editor_shortcuts() {
+        let mut state = UiState::default();
+        state.panel = Some(Panel::Help);
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::view::render(frame, &state);
+            })
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        for shortcut in [
+            "Ctrl+←/→/↑/↓",
+            "Enter",
+            "Shift+Enter",
+            "Ctrl+C",
+            "Ctrl+D",
+            "Ctrl+Z/Y",
+        ] {
+            assert!(screen.contains(shortcut), "missing shortcut: {shortcut}");
+        }
+        for alias in ["Ctrl+J", "Alt+Enter", "Ctrl+P"] {
+            assert!(!screen.contains(alias), "invented shortcut shown: {alias}");
         }
     }
 }
@@ -541,9 +559,11 @@ fn model_menu_rows(state: &UiState) -> Vec<ModelMenuRow> {
     rows
 }
 pub(super) fn menu_style(selected: bool) -> Style {
-    Style::default()
-        .fg(if selected { PANEL } else { INK })
-        .bg(if selected { ACCENT } else { INPUT })
+    if selected {
+        theme::label_on(INK, theme::SELECTED)
+    } else {
+        theme::body_on(INK, INPUT)
+    }
 }
 
 #[cfg(test)]
@@ -585,8 +605,9 @@ mod grouped_menu_tests {
                     Some(HitTarget::Model(selected))
                 );
                 let buffer = terminal.backend().buffer();
-                assert_eq!(buffer[(hit.area.x, hit.area.y)].bg, ACCENT);
-                assert_eq!(buffer[(hit.area.x, hit.area.y)].fg, PANEL);
+                assert_eq!(buffer[(hit.area.x, hit.area.y)].bg, theme::SELECTED);
+                assert_eq!(buffer[(hit.area.x, hit.area.y)].fg, INK);
+                assert_ne!(buffer[(hit.area.x, hit.area.y)].bg, theme::FOCUS_MARK);
                 for y in 0..height {
                     let line: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
                     if line.contains("Manage connections") {

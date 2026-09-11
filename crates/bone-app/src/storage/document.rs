@@ -77,6 +77,8 @@ impl<T> DocumentSnapshot<T> {
 #[derive(Debug)]
 pub struct DocumentListEntry<T> {
     pub key: DocumentKey,
+    /// Milliseconds since the Unix epoch when this document was first created.
+    pub created_at: i64,
     pub snapshot: Result<DocumentSnapshot<T>, StoreError>,
 }
 
@@ -178,7 +180,7 @@ where
     let (sql, upper_bound) = match binary_prefix_upper_bound(key_prefix) {
         Some(upper_bound) => (
             "
-                SELECT key, revision, payload_json
+                SELECT key, revision, payload_json, created_at
                 FROM documents
                 WHERE namespace COLLATE BINARY = ?1
                   AND key COLLATE BINARY >= ?2
@@ -189,7 +191,7 @@ where
         ),
         None => (
             "
-                SELECT key, revision, payload_json
+                SELECT key, revision, payload_json, created_at
                 FROM documents
                 WHERE namespace COLLATE BINARY = ?1
                 ORDER BY key COLLATE BINARY ASC
@@ -214,6 +216,14 @@ where
         let _key = row
             .get::<_, String>(0)
             .map_err(|error| StoreError::sqlite("read listed document key", error))?;
+        let created_at = row
+            .get::<_, i64>(3)
+            .map_err(|error| StoreError::sqlite("read listed document timestamp", error))?;
+        if created_at < 0 {
+            return Err(StoreError::Corrupt {
+                message: "document creation timestamp is invalid",
+            });
+        }
         let snapshot = (|| {
             let revision = row
                 .get::<_, i64>(1)
@@ -229,6 +239,7 @@ where
         })();
         documents.push(DocumentListEntry {
             key: DocumentKey::new(namespace, _key),
+            created_at,
             snapshot,
         });
     }
@@ -256,7 +267,7 @@ where
     let limit_sql = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
     let mut statement = connection
         .prepare(
-            "SELECT key, revision, payload_json FROM documents
+            "SELECT key, revision, payload_json, created_at FROM documents
              WHERE namespace COLLATE BINARY = ?1
                AND key COLLATE BINARY >= ?2
                AND key COLLATE BINARY < ?3
@@ -269,13 +280,19 @@ where
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })
         .map_err(|error| StoreError::sqlite("read recent document list", error))?;
     let mut entries = Vec::new();
     for row in rows {
-        let (_key, revision, payload) =
+        let (_key, revision, payload, created_at) =
             row.map_err(|error| StoreError::sqlite("read recent document list", error))?;
+        if created_at < 0 {
+            return Err(StoreError::Corrupt {
+                message: "document creation timestamp is invalid",
+            });
+        }
         let snapshot = (|| {
             let raw = validate_raw_document(revision, payload)?;
             Ok(DocumentSnapshot {
@@ -285,6 +302,7 @@ where
         })();
         entries.push(DocumentListEntry {
             key: DocumentKey::new(namespace, _key),
+            created_at,
             snapshot,
         });
     }

@@ -69,9 +69,49 @@ pub(super) fn action(
         {
             composer_pointer(mouse, snapshot, state)
         }
+        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+            if target == Some(HitTarget::SessionTitle) && state.panel.is_none() =>
+        {
+            title_pointer(mouse, snapshot, state)
+        }
         MouseEventKind::Down(MouseButton::Left) => hit_action(target),
         _ => None,
     }
+}
+
+fn title_pointer(
+    mouse: MouseEvent,
+    snapshot: Option<&FrameSnapshot>,
+    state: &UiState,
+) -> Option<Action> {
+    let area = snapshot.and_then(|frame| frame.layout.session_header)?;
+    let text = state.title_text()?;
+    let origin = state
+        .title_edit
+        .as_ref()
+        .filter(|edit| {
+            state
+                .selected_ui()
+                .is_some_and(|ui| edit.target == ui.info.id)
+        })
+        .map_or(0, |edit| edit.editor.viewport_origin());
+    let byte = crate::editor::cursor_at_single_line(
+        text,
+        origin,
+        mouse
+            .column
+            .saturating_sub(area.x)
+            .min(area.width.saturating_sub(1)),
+    );
+    Some(
+        if matches!(mouse.kind, MouseEventKind::Drag(_))
+            || mouse.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            Action::DragTitleCursor(byte)
+        } else {
+            Action::PlaceTitleCursor(byte)
+        },
+    )
 }
 
 fn composer_pointer(
@@ -111,11 +151,13 @@ fn hit_action(target: Option<HitTarget>) -> Option<Action> {
         Some(HitTarget::PaneDivider(divider)) => Some(Action::BeginPaneResize(divider)),
         Some(HitTarget::Session(session)) => Some(Action::SelectSession(session)),
         Some(HitTarget::SessionRail) => Some(Action::Focus(Focus::Sessions)),
-        Some(HitTarget::Conversation) => Some(Action::Focus(Focus::Conversation)),
+        Some(HitTarget::SessionTitle) => Some(Action::Focus(Focus::SessionTitle)),
+        Some(HitTarget::Conversation) => None,
         Some(HitTarget::Composer) => Some(Action::Focus(Focus::Composer)),
+        Some(HitTarget::RightRail) => Some(Action::Focus(Focus::RightRail)),
         Some(HitTarget::SlashCommand(command)) => Some(Action::ExecuteCommand(command)),
-        Some(HitTarget::NewSession) => Some(Action::NewSession),
-        Some(HitTarget::Commands) => Some(Action::OpenCommands),
+        Some(HitTarget::StartSlashCommand) => Some(Action::StartSlashCommand),
+        Some(HitTarget::CommandPalette) => None,
         Some(HitTarget::Models) => Some(Action::OpenModels),
         Some(HitTarget::ConnectionKind(index)) => Some(Action::ChooseConnectionKind(index)),
         Some(HitTarget::SetupField(field)) => Some(Action::SelectField(field)),

@@ -8,6 +8,13 @@ use super::{
 };
 
 pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
+    if matches!(event, UiEvent::CaretBlink) {
+        if state.blinking_caret_active() {
+            state.caret_visible = !state.caret_visible;
+            state.dirty = true;
+        }
+        return Vec::new();
+    }
     // Scheduling background work does not change the screen. In particular,
     // the 500ms draft timer must not continually re-show the native caret.
     if !matches!(
@@ -161,10 +168,12 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             last_active,
             model_label,
             statuses,
+            summaries,
         } => {
             state.workspace = Some((id, label));
             state.model_label = model_label;
             state.session_statuses = statuses;
+            state.session_summaries = summaries;
             state.sessions = sessions;
             let preferred = last_active.filter(|candidate| {
                 state
@@ -184,6 +193,13 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             snapshot,
             history,
         } => {
+            if state
+                .session_ui
+                .get(&session)
+                .is_some_and(|ui| ui.generation == generation)
+            {
+                merge_authoritative_session_title(state, session, &snapshot.session.title);
+            }
             if let Some(ui) = current_generation_mut(state, session, generation) {
                 if !ui.hydrated {
                     if ui.draft.is_empty() {
@@ -238,9 +254,18 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             {
                 content.refresh_job(&snapshot);
             }
+            if state
+                .session_ui
+                .get(&session)
+                .is_some_and(|ui| ui.generation == generation)
+            {
+                merge_authoritative_session_title(state, session, &snapshot.session.title);
+            }
             if let Some(ui) = current_generation_mut(state, session, generation) {
                 let through = snapshot.history_through;
+                let title = ui.info.title.clone();
                 ui.info = snapshot.session.clone();
+                ui.info.title = title;
                 ui.snapshot = Some(snapshot);
                 if through > ui.history_cursor && !ui.history_loading && !ui.newer_history_missing {
                     if ui.read_anchor.is_some() || ui.scroll_from_tail > 0 || ui.older_loading {
@@ -261,7 +286,15 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             if let Some(info) = state.session_ui.get(&session).map(|ui| ui.info.clone())
                 && let Some(listed) = state.sessions.iter_mut().find(|item| item.id == session)
             {
+                let protected_title = state
+                    .title_renames
+                    .get(&session)
+                    .and_then(TitleRenameQueue::desired)
+                    .map(str::to_owned);
                 *listed = info;
+                if let Some(title) = protected_title {
+                    listed.title = title;
+                }
             }
         }
         UiEvent::HistoryLoaded {
@@ -378,20 +411,33 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::OverviewLoaded {
             generation,
-            sessions,
+            mut sessions,
             statuses,
+            mut summaries,
         } => {
             if generation != state.overview_generation {
                 return effects;
             }
             state.overview_pending = false;
+            reconcile_overview_titles(state, &mut sessions, &mut summaries);
             state.sessions = sessions;
             state.session_statuses = statuses;
+            state.session_summaries = summaries;
             if state
                 .selected
                 .is_some_and(|id| !state.sessions.iter().any(|s| s.id == id && !s.archived))
             {
                 state.selected = None;
+                state.clear_title_edit();
+                if state.focus == Focus::SessionTitle {
+                    state.set_focus(Focus::Composer);
+                }
+                if state.panel_return == Focus::SessionTitle {
+                    state.panel_return = Focus::Composer;
+                }
+                if state.last_center == CenterFocus::SessionTitle {
+                    state.last_center = CenterFocus::Composer;
+                }
                 refresh_model_label(state, &mut effects);
             }
             if state.session_candidate.is_some_and(|id| {
@@ -454,11 +500,14 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                             text: String::new(),
                         });
                     }
-                    effects.push(Effect::AutoTitle {
-                        session,
-                        generation: ui.generation,
-                        first_input: pending.text,
-                    });
+                    if !state.title_manual_intent.contains(&session) {
+                        effects.push(Effect::AutoTitle {
+                            session,
+                            generation: ui.generation,
+                            request: next_title_request(&mut state.title_request),
+                            first_input: pending.text,
+                        });
+                    }
                 }
             }
         }
@@ -503,6 +552,26 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 if !state.sessions.iter().any(|session| session.id == info.id) {
                     state.sessions.insert(0, info.clone());
                 }
+                state.session_summaries.entry(info.id).or_insert_with(|| {
+                    bone_app::SessionSummary {
+                        session: info.clone(),
+                        created_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |duration| {
+                                i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+                            }),
+                        message_count: 0,
+                        latest_reply_preview: None,
+                        projection_pending: false,
+                        has_draft: false,
+                        draft_bytes: 0,
+                        persisted_runtime: None,
+                        history_through: bone_app::SessionSeq(0),
+                    }
+                });
+                if state.focus == Focus::SessionTitle {
+                    commit_title_edit(state, &mut effects);
+                }
                 select_session(state, info.id, &mut effects);
                 if let Some((text, cursor, revision, editor)) = transferred
                     && let Some(ui) = state.session_ui.get_mut(&info.id)
@@ -513,7 +582,6 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     ui.draft_revision = revision;
                     ui.bootstrap_submission = pending.first_input;
                 }
-                state.focus = Focus::Composer;
                 if matches!(
                     state.status.as_deref(),
                     Some(
@@ -539,15 +607,110 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::SessionRenamed {
             session,
-            generation,
+            request,
             title,
         } => {
-            if current_generation_mut(state, session, generation).is_some() {
-                if let Some(info) = state.sessions.iter_mut().find(|info| info.id == session) {
-                    info.title = title.clone();
+            let matches = state
+                .title_renames
+                .get(&session)
+                .is_some_and(|queue| queue.pending.contains_key(&request));
+            if !matches {
+                return effects;
+            }
+            let (completed, newest) = {
+                let queue = state
+                    .title_renames
+                    .get_mut(&session)
+                    .expect("matching rename queue");
+                let completed = queue
+                    .pending
+                    .remove(&request)
+                    .expect("matching rename request");
+                let newest = request > queue.applied;
+                if newest {
+                    queue.applied = request;
+                    queue.confirmed = Some(title.clone());
                 }
-                if let Some(ui) = state.session_ui.get_mut(&session) {
-                    ui.info.title = title;
+                (completed, newest)
+            };
+            if newest {
+                set_session_title(state, session, title.clone());
+                if let Some(edit) = state
+                    .title_edit
+                    .as_mut()
+                    .filter(|edit| edit.target == session)
+                {
+                    edit.original = title;
+                    if edit.text == completed {
+                        edit.text = edit.original.clone();
+                        edit.cursor = edit.text.len();
+                    }
+                }
+                clear_title_rename_error(state, session);
+            }
+            dispatch_queued_title(state, session, &mut effects);
+            finish_title_rename(state, session, &mut effects);
+        }
+        UiEvent::SessionRenameFailed {
+            session,
+            request,
+            message,
+        } => {
+            let Some(queue) = state.title_renames.get_mut(&session) else {
+                return effects;
+            };
+            let Some(failed) = queue.pending.remove(&request) else {
+                return effects;
+            };
+            let superseded =
+                request <= queue.applied || !queue.pending.is_empty() || queue.queued.is_some();
+            dispatch_queued_title(state, session, &mut effects);
+            if !superseded && !state.title_rename_pending(session) {
+                let committed = committed_session_title(state, session).unwrap_or_default();
+                set_session_title(state, session, committed.clone());
+                if let Some(edit) = state
+                    .title_edit
+                    .as_mut()
+                    .filter(|edit| edit.target == session)
+                {
+                    edit.original = committed.clone();
+                    if edit.text == failed {
+                        edit.text = committed;
+                        edit.cursor = edit.text.len();
+                        edit.revision = edit.revision.wrapping_add(1);
+                        edit.editor = Default::default();
+                    }
+                }
+                if state.selected == Some(session) && !state.quitting {
+                    set_title_rename_error(state, session, message);
+                }
+            }
+            finish_title_rename(state, session, &mut effects);
+        }
+        UiEvent::SessionAutoTitled {
+            session,
+            request: _,
+            title,
+        } => {
+            if state.title_manual_intent.contains(&session) {
+                return effects;
+            }
+            if state.session_ui.contains_key(&session)
+                || state.sessions.iter().any(|info| info.id == session)
+            {
+                state.title_renames.entry(session).or_default().confirmed = Some(title.clone());
+                set_session_title(state, session, title.clone());
+                let manual_pending = state.title_rename_pending(session);
+                if let Some(edit) = state
+                    .title_edit
+                    .as_mut()
+                    .filter(|edit| edit.target == session)
+                    && edit.revision == 0
+                    && !manual_pending
+                {
+                    edit.original = title.clone();
+                    edit.text = title;
+                    edit.cursor = edit.text.len();
                 }
             }
         }
@@ -609,9 +772,20 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 }
             }
         }
-        UiEvent::Resized => {
+        UiEvent::Resized { width, height } => {
             state.dragging_divider = None;
+            if !crate::layout::right_rail_available(width, height) {
+                let center = state.last_center_focus();
+                if state.focus == Focus::RightRail {
+                    state.set_focus(center);
+                    state.caret_visible = true;
+                }
+                if state.panel_return == Focus::RightRail {
+                    state.panel_return = center;
+                }
+            }
         }
+        UiEvent::CaretBlink => unreachable!("caret blink returns before event dispatch"),
     }
     trim_editor_history(state);
     trim_global_history(state);
@@ -619,10 +793,30 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
 }
 
 fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>) {
+    state.caret_visible = true;
+    let leaves_title = matches!(
+        action,
+        Action::OpenModels
+            | Action::OpenHelp
+            | Action::OpenLatest
+            | Action::OpenHistory(_)
+            | Action::OpenJob(_)
+            | Action::SelectSession(_)
+            | Action::OpenCandidate
+            | Action::Quit
+            | Action::Terminate
+    );
+    if state.focus == Focus::SessionTitle && leaves_title {
+        commit_title_edit(state, effects);
+    }
     if !matches!(action, Action::BeginPaneResize(_) | Action::DragPane { .. }) {
         state.dragging_divider = None;
     }
-    if !matches!(action, Action::Input(_)) {
+    if state.focus == Focus::SessionTitle {
+        if !matches!(action, Action::TitleInput(_)) && state.title_edit.is_some() {
+            state.title_editor_mut().stop_typing();
+        }
+    } else if !matches!(action, Action::Input(_)) {
         state.editor_mut().stop_typing();
     }
     if !matches!(
@@ -646,18 +840,104 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
             }
         }
         Action::EndPaneResize => {}
-        Action::RenameText(text) => {
-            state
-                .rename_input
-                .push_str(&text.replace(['\r', '\n'], " "));
-        }
-        Action::RenameBackspace => {
-            if let Some((start, _)) = state.rename_input.grapheme_indices(true).next_back() {
-                state.rename_input.truncate(start);
+        Action::TitleInput(ch) => {
+            if state.begin_title_edit() && !ch.is_control() {
+                state.title_editor_mut().insert(&ch.to_string(), true);
+                state.status = None;
             }
         }
-        Action::NewSession => run_palette_command(state, "new", effects),
-        Action::OpenCommands => open_panel(state, Panel::Commands),
+        Action::TitlePaste(text) => {
+            if state.begin_title_edit() {
+                let text: String = text
+                    .replace(['\r', '\n', '\t'], " ")
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .collect();
+                state.title_editor_mut().insert(&text, false);
+                state.status = None;
+            }
+        }
+        Action::TitleBackspace => {
+            if state.begin_title_edit() {
+                state.title_editor_mut().delete_before();
+                state.status = None;
+            }
+        }
+        Action::TitleDelete => {
+            if state.begin_title_edit() {
+                state.title_editor_mut().delete_after();
+                state.status = None;
+            }
+        }
+        Action::TitleMoveCursor {
+            direction,
+            select,
+            word,
+        } => {
+            if state.begin_title_edit() {
+                state
+                    .title_editor_mut()
+                    .move_cursor(direction, 1, select, word, &mut None);
+            }
+        }
+        Action::TitleHome | Action::TitleEnd => {
+            if state.begin_title_edit() {
+                state
+                    .title_editor_mut()
+                    .move_line_edge(matches!(action, Action::TitleEnd));
+            }
+        }
+        Action::TitleUndo | Action::TitleRedo => {
+            if state.begin_title_edit() {
+                state
+                    .title_editor_mut()
+                    .undo(matches!(action, Action::TitleRedo));
+                state.status = None;
+            }
+        }
+        Action::PlaceTitleCursor(byte) => {
+            if state.begin_title_edit() {
+                state.set_focus(Focus::SessionTitle);
+                state.title_editor_mut().begin_pointer_selection(byte);
+            }
+        }
+        Action::DragTitleCursor(byte) => {
+            if state.begin_title_edit() {
+                state.set_focus(Focus::SessionTitle);
+                state.title_editor_mut().extend_pointer_selection(byte);
+            }
+        }
+        Action::CommitTitle => commit_title_edit(state, effects),
+        Action::CancelTitle => {
+            let target = state.title_edit.as_ref().map(|edit| edit.target);
+            let baseline = state
+                .title_edit
+                .as_ref()
+                .and_then(|edit| intended_session_title(state, edit.target));
+            if let Some((target, baseline)) = target.zip(baseline.as_ref()) {
+                set_session_title(state, target, baseline.clone());
+            }
+            if let Some(edit) = &mut state.title_edit {
+                edit.text = baseline.unwrap_or_else(|| edit.original.clone());
+                edit.original = edit.text.clone();
+                edit.cursor = edit.text.len();
+                edit.revision = edit.revision.wrapping_add(1);
+                edit.editor = Default::default();
+            }
+            state.status = None;
+            state.set_focus(Focus::Composer);
+        }
+        Action::StartSlashCommand => {
+            if state.panel.is_none()
+                && state.draft().is_empty()
+                && state
+                    .selected_ui()
+                    .is_none_or(|ui| ui.selected_answer.is_none())
+            {
+                set_action_focus(state, Focus::Composer, effects);
+                insert_text(state, "/", true);
+            }
+        }
         Action::OpenModels => open_models(state, effects),
         Action::OpenHelp => open_panel(state, Panel::Help),
         Action::OpenLatest => open_latest(state),
@@ -670,20 +950,16 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 && let Some(entry) = ui.history.iter().find(|entry| entry.sequence == sequence)
                 && let Some(content) = super::reader::ReaderContent::from_history(ui.info.id, entry)
             {
-                state.panel_return = Focus::Conversation;
-                state.panel_scroll = 0;
                 pin_reading(state);
-                state.panel = Some(Panel::Reader(content));
+                open_panel(state, Panel::Reader(content));
             }
         }
         Action::OpenJob(job) => {
             if let Some(snapshot) = state.selected_ui().and_then(|ui| ui.snapshot.as_ref())
                 && let Some(content) = super::reader::ReaderContent::from_job(snapshot, job)
             {
-                state.panel_return = Focus::Conversation;
-                state.panel_scroll = 0;
                 pin_reading(state);
-                state.panel = Some(Panel::Reader(content));
+                open_panel(state, Panel::Reader(content));
             }
         }
         Action::PanelPrevious => {
@@ -691,7 +967,6 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         }
         Action::PanelNext => {
             let count = match &state.panel {
-                Some(Panel::Commands) => COMMANDS.len(),
                 Some(Panel::Objects { choices, .. }) => choices.len(),
                 Some(Panel::ModelAdd) => super::ConnectionKind::ALL.len(),
                 Some(Panel::Models) => state.model_row_count(),
@@ -752,18 +1027,12 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::ChooseConnectionKind(index) => choose_connection_kind(state, index),
         Action::SaveConnection => save_connection(state, effects),
         Action::ActivatePanel => {
-            if matches!(state.panel, Some(Panel::Commands)) {
-                if let Some(command) = COMMANDS.get(state.panel_selection) {
-                    run_palette_command(state, command.name, effects);
-                }
-            } else if matches!(state.panel, Some(Panel::Models)) {
+            if matches!(state.panel, Some(Panel::Models)) {
                 apply_model(state, effects);
             } else if matches!(state.panel, Some(Panel::ModelAdd)) {
                 choose_connection_kind(state, state.panel_selection);
             } else if matches!(state.panel, Some(Panel::ModelSetup)) {
                 save_connection(state, effects);
-            } else if matches!(state.panel, Some(Panel::Rename)) {
-                apply_rename(state, effects);
             } else if matches!(state.panel, Some(Panel::Objects { .. })) {
                 open_object(state);
             }
@@ -776,21 +1045,31 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 .min(max);
         }
 
-        Action::Focus(focus) => state.focus = focus,
-        Action::FocusLeft => state.focus = Focus::Sessions,
-        Action::FocusRight => {
-            if state.focus == Focus::Sessions {
-                state.focus = Focus::Conversation
-            }
+        Action::Focus(focus) => {
+            set_action_focus(state, focus, effects);
         }
+        Action::FocusLeft => match state.focus {
+            Focus::SessionTitle | Focus::Composer => {
+                set_action_focus(state, Focus::Sessions, effects)
+            }
+            Focus::RightRail => set_action_focus(state, state.last_center_focus(), effects),
+            Focus::Sessions => {}
+        },
+        Action::FocusRight => match state.focus {
+            Focus::Sessions => set_action_focus(state, state.last_center_focus(), effects),
+            Focus::SessionTitle | Focus::Composer => {
+                set_action_focus(state, Focus::RightRail, effects)
+            }
+            Focus::RightRail => {}
+        },
         Action::FocusUp => {
             if state.focus == Focus::Composer {
-                state.focus = Focus::Conversation
+                set_action_focus(state, Focus::SessionTitle, effects);
             }
         }
         Action::FocusDown => {
-            if state.focus == Focus::Conversation {
-                state.focus = Focus::Composer
+            if state.focus == Focus::SessionTitle {
+                set_action_focus(state, Focus::Composer, effects);
             }
         }
         Action::SelectPrevious => move_session(state, -1),
@@ -805,28 +1084,16 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                     .map(|info| info.id)
             }) {
                 select_session(state, session, effects);
-                if state.focus != Focus::Composer {
-                    state.focus = Focus::Conversation;
-                }
             }
         }
         Action::SelectSession(session) => {
             state.panel = None;
             select_session(state, session, effects);
-            if state.focus != Focus::Composer {
-                state.focus = Focus::Conversation;
-            }
         }
         Action::SelectSlashPrevious => move_slash(state, -1),
         Action::SelectSlashNext => move_slash(state, 1),
         Action::CompleteSlash => complete_slash(state),
         Action::ExecuteCommand(kind) => {
-            if matches!(state.panel, Some(Panel::Commands)) {
-                if let Some(command) = COMMANDS.iter().find(|command| command.kind == kind) {
-                    run_palette_command(state, command.name, effects);
-                }
-                return;
-            }
             if let Some(index) = state
                 .slash_matches()
                 .iter()
@@ -867,9 +1134,12 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 .move_cursor(direction, width, select, word, &mut preferred);
             state.preferred_column = preferred;
         }
-        Action::DragCursor(byte) => state.editor_mut().extend_pointer_selection(byte),
+        Action::DragCursor(byte) => {
+            set_action_focus(state, Focus::Composer, effects);
+            state.editor_mut().extend_pointer_selection(byte);
+        }
         Action::PlaceCursor(byte) => {
-            state.focus = Focus::Composer;
+            set_action_focus(state, Focus::Composer, effects);
             state.editor_mut().begin_pointer_selection(byte);
         }
         Action::CursorLeft => move_cursor(state, -1),
@@ -886,7 +1156,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::InsertNewline => insert_text(state, "\n", false),
         Action::Submit => submit(state, effects),
         Action::ClickSubmit => {
-            state.focus = Focus::Composer;
+            set_action_focus(state, Focus::Composer, effects);
             submit(state, effects);
         }
         Action::AnswerQuestion(question) => {
@@ -900,7 +1170,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                         .entry(question)
                         .or_insert_with(|| AnswerDraft::new(question));
                     ui.selected_answer = Some(question);
-                    state.focus = Focus::Composer;
+                    set_action_focus(state, Focus::Composer, effects);
                     state.status = None;
                 } else {
                     state.status = Some("This question is no longer active".into());
@@ -934,10 +1204,10 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
             if state.focus == Focus::Sessions {
                 state.session_candidate = state.selected;
                 state.session_scroll = None;
-                state.focus = Focus::Conversation;
+                state.set_focus(state.last_center_focus());
                 return;
             }
-            if !state.slash_matches().is_empty() {
+            if state.slash_palette_visible() {
                 state.slash_dismissed = Some(state.draft_identity());
                 state.status = None;
             } else if state
@@ -984,8 +1254,21 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::Stop => effects.extend(stop_selected(state)),
         Action::Quit | Action::Terminate => {
             prepare_exit(state);
+            dispatch_queued_titles_for_exit(state, effects);
             effects.push(Effect::Shutdown);
         }
+    }
+}
+
+/// Moves focus for a user action and commits the title exactly when that move
+/// leaves the title editor. Keeping this at the focus mutation point avoids
+/// persisting a title for unrelated scrolling or divider gestures.
+fn set_action_focus(state: &mut UiState, focus: Focus, effects: &mut Vec<Effect>) {
+    if state.focus == Focus::SessionTitle && focus != Focus::SessionTitle {
+        commit_title_edit(state, effects);
+    }
+    if focus != Focus::SessionTitle || state.begin_title_edit() {
+        state.set_focus(focus);
     }
 }
 
@@ -1019,7 +1302,7 @@ fn submit(state: &mut UiState, effects: &mut Vec<Effect>) {
         .selected_ui()
         .is_some_and(|ui| ui.selected_answer.is_some());
     if !answering && let Some(command) = text.trim_start().strip_prefix('/') {
-        execute_command(state, command, effects);
+        execute_command(state, command, CommandOrigin::Composer, effects);
         return;
     }
     if state.selected_ui().is_none() {
@@ -1174,6 +1457,10 @@ fn recover_input(
             state.status = Some("Retry requested for the saved input".into());
         }
         Some(RecoveryCandidate::Restore { text, reply_to, .. }) if !retry => {
+            set_action_focus(state, Focus::Composer, effects);
+            let Some(ui) = state.selected_ui_mut() else {
+                return;
+            };
             if let Some(question) = reply_to {
                 let answer = ui
                     .answer_drafts
@@ -1193,7 +1480,6 @@ fn recover_input(
                 ui.selected_answer = None;
                 state.status = Some("Input restored to your draft; review before sending".into());
             }
-            state.focus = Focus::Composer;
             state.preferred_column = None;
         }
         _ => {
@@ -1225,7 +1511,18 @@ fn retry_submission(state: &mut UiState, effects: &mut Vec<Effect>) {
     state.status = Some("Confirming the original submission; newer draft is preserved".into());
 }
 
-fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandOrigin {
+    Composer,
+    Direct,
+}
+
+fn execute_command(
+    state: &mut UiState,
+    raw: &str,
+    origin: CommandOrigin,
+    effects: &mut Vec<Effect>,
+) {
     let trimmed = raw.trim();
     let mut parts = trimmed.splitn(2, char::is_whitespace);
     let typed = parts.next().unwrap_or_default();
@@ -1248,7 +1545,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
     };
     match selected.kind {
         CommandKind::Answer if argument.is_empty() => {
-            clear_current_draft(state, effects);
+            clear_current_draft(state, origin, effects);
             let question = state
                 .selected_ui()
                 .and_then(|ui| ui.snapshot.as_ref())
@@ -1264,7 +1561,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             }
         }
         CommandKind::Recover if argument.is_empty() => {
-            clear_current_draft(state, effects);
+            clear_current_draft(state, origin, effects);
             let input = state.selected_ui().and_then(|ui| {
                 ui.snapshot.as_ref().and_then(|snapshot| {
                     super::answer::recoverable_inputs(snapshot, &ui.history)
@@ -1283,7 +1580,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             }
         }
         CommandKind::Retry if argument.is_empty() => {
-            clear_current_draft(state, effects);
+            clear_current_draft(state, origin, effects);
             if state
                 .selected_ui()
                 .is_some_and(|ui| ui.submitting.as_ref().is_some_and(|pending| pending.failed))
@@ -1312,12 +1609,12 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
         CommandKind::Model => {
             let parts: Vec<_> = argument.split_whitespace().collect();
             if parts.is_empty() {
-                clear_current_draft(state, effects);
+                clear_current_draft(state, origin, effects);
                 open_models(state, effects);
             } else if parts.len() == 2 {
                 let profile = parts[0].to_owned();
                 let model = parts[1].to_owned();
-                clear_current_draft(state, effects);
+                clear_current_draft(state, origin, effects);
                 open_models(state, effects);
                 effects.push(Effect::SetNamedModel {
                     session: state.selected,
@@ -1330,7 +1627,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             }
         }
         CommandKind::Details if argument.is_empty() => {
-            clear_current_draft(state, effects);
+            clear_current_draft(state, origin, effects);
             open_objects(state);
         }
 
@@ -1338,7 +1635,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             if let Some(pending) = &state.pending_create {
                 let retry = pending.failed
                     && (argument == "--retry"
-                        || state.command_from_palette
+                        || origin == CommandOrigin::Direct
                         || create_source_matches(state, &pending.source));
                 if retry {
                     effects.push(Effect::CreateSession {
@@ -1361,7 +1658,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
                 return;
             }
             let request_id = RequestId::new();
-            let source = if state.command_from_palette {
+            let source = if origin == CommandOrigin::Direct {
                 DraftSource::None
             } else {
                 state.selected_ui().map_or_else(
@@ -1398,38 +1695,41 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             });
         }
         CommandKind::Sessions if argument.is_empty() => {
-            state.focus = Focus::Sessions;
-            clear_current_draft(state, effects);
+            state.set_focus(Focus::Sessions);
+            clear_current_draft(state, origin, effects);
         }
         CommandKind::Rename if argument.is_empty() => {
-            if let Some(ui) = state.selected_ui() {
-                state.rename_input = ui.info.title.clone();
-                state.rename_target = state.selected_ui().map(|ui| (ui.info.id, ui.generation));
-                clear_current_draft(state, effects);
-                open_panel(state, Panel::Rename);
+            if state.selected_ui().is_some() {
+                clear_current_draft(state, origin, effects);
+                state.begin_title_edit();
+                state.set_focus(Focus::SessionTitle);
+                state.caret_visible = true;
             } else {
                 state.status = Some("There is no session to rename".into());
             }
         }
         CommandKind::Rename if !argument.is_empty() => {
-            if let Some(ui) = state.selected_ui() {
-                effects.push(Effect::RenameSession {
-                    session: ui.info.id,
-                    generation: ui.generation,
-                    title: argument.into(),
-                });
-                clear_current_draft(state, effects);
+            if state.begin_title_edit() {
+                clear_current_draft(state, origin, effects);
+                if let Some(edit) = &mut state.title_edit {
+                    edit.editor.checkpoint(&edit.text, edit.cursor);
+                    edit.text = argument.into();
+                    edit.cursor = edit.text.len();
+                    edit.revision = edit.revision.wrapping_add(1);
+                }
+                commit_title_edit(state, effects);
             } else {
                 state.status = Some("There is no session to rename".into());
             }
         }
         CommandKind::Help if argument.is_empty() => {
-            clear_current_draft(state, effects);
+            clear_current_draft(state, origin, effects);
             open_panel(state, Panel::Help);
         }
         CommandKind::Quit if argument.is_empty() => {
-            clear_current_draft(state, effects);
+            clear_current_draft(state, origin, effects);
             prepare_exit(state);
+            dispatch_queued_titles_for_exit(state, effects);
             effects.push(Effect::Shutdown);
         }
         _ => state.status = Some(format!("Usage: /{} {}", selected.name, selected.usage)),
@@ -1460,8 +1760,8 @@ fn create_source_matches(state: &UiState, source: &DraftSource) -> bool {
     }
 }
 
-fn clear_current_draft(state: &mut UiState, effects: &mut Vec<Effect>) {
-    if state.command_from_palette {
+fn clear_current_draft(state: &mut UiState, origin: CommandOrigin, effects: &mut Vec<Effect>) {
+    if origin == CommandOrigin::Direct {
         return;
     }
     if let Some(ui) = state.selected_ui_mut() {
@@ -1629,6 +1929,7 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
         && let Some(ui) = state.session_ui.get(&previous)
         && ui.draft_revision <= ui.saved_draft_revision
         && ui.submitting.is_none()
+        && !state.title_rename_pending(previous)
     {
         effects.push(Effect::ReleaseSession {
             session: previous,
@@ -1636,6 +1937,7 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
         });
     }
     state.selected = Some(id);
+    clear_title_rename_error_for_other_session(state, id);
     refresh_model_label(state, effects);
     state.slash_dismissed = None;
     let generation = state.generation();
@@ -1655,6 +1957,12 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
             workspace,
             session: id,
         });
+    }
+    // Opening another Session changes content, not the user's chosen region.
+    // If the title already owned focus, prepare the new title editor without
+    // moving focus there from any other region.
+    if state.focus == Focus::SessionTitle {
+        state.begin_title_edit();
     }
 }
 
@@ -1917,6 +2225,21 @@ mod tests {
     }
 
     #[test]
+    fn command_hint_starts_slash_only_for_an_empty_composer() {
+        let mut state = UiState::default();
+        state.set_focus(Focus::Sessions);
+        update(&mut state, UiEvent::Action(Action::StartSlashCommand));
+        assert_eq!(state.draft(), "/");
+        assert_eq!(state.focus, Focus::Composer);
+        assert!(state.slash_palette_visible());
+
+        update(&mut state, UiEvent::Action(Action::Paste("keep".into())));
+        let draft = state.draft().to_owned();
+        update(&mut state, UiEvent::Action(Action::StartSlashCommand));
+        assert_eq!(state.draft(), draft);
+    }
+
+    #[test]
     fn orphan_text_is_kept_until_new_session_exists() {
         let mut state = UiState::default();
         update(&mut state, UiEvent::Action(Action::Paste("keep me".into())));
@@ -1945,7 +2268,7 @@ fn close_panel(state: &mut UiState) {
     state.connection_form = None;
     state.login_request = None;
     state.panel = None;
-    state.focus = state.panel_return;
+    state.set_focus(state.panel_return);
 }
 fn open_models(state: &mut UiState, effects: &mut Vec<Effect>) {
     open_panel(state, Panel::Models);
@@ -1960,12 +2283,6 @@ fn apply_model(state: &mut UiState, effects: &mut Vec<Effect>) {
     select_model_row(state, state.panel_selection, effects);
 }
 
-fn run_palette_command(state: &mut UiState, command: &str, effects: &mut Vec<Effect>) {
-    close_panel(state);
-    state.command_from_palette = true;
-    execute_command(state, command, effects);
-    state.command_from_palette = false;
-}
 fn open_latest(state: &mut UiState) {
     let content = state.selected_ui().and_then(|ui| {
         ui.snapshot
@@ -1984,10 +2301,8 @@ fn open_latest(state: &mut UiState) {
             })
     });
     if let Some(content) = content {
-        state.panel_return = Focus::Conversation;
-        state.panel_scroll = 0;
         pin_reading(state);
-        state.panel = Some(Panel::Reader(content));
+        open_panel(state, Panel::Reader(content));
     } else {
         state.status = Some("No task or tool result to open yet".into());
     }
@@ -2014,7 +2329,7 @@ mod async_identity_tests {
         open_models(&mut state, &mut effects);
         let request = state.model_request;
         update(&mut state, UiEvent::Action(Action::Escape));
-        update(&mut state, UiEvent::Action(Action::OpenCommands));
+        update(&mut state, UiEvent::Action(Action::OpenHelp));
         state.panel_selection = 4;
         update(
             &mut state,
@@ -2036,7 +2351,7 @@ mod async_identity_tests {
                 error: None,
             },
         );
-        assert!(matches!(state.panel, Some(Panel::Commands)));
+        assert!(matches!(state.panel, Some(Panel::Help)));
         assert_eq!(state.panel_selection, 4);
         assert_eq!(state.model_label.as_deref(), Some("saved-model"));
     }
@@ -2158,30 +2473,319 @@ mod async_identity_tests {
     }
 }
 
-fn apply_rename(state: &mut UiState, effects: &mut Vec<Effect>) {
-    let title = state.rename_input.trim().to_owned();
-    if title.is_empty() || title.len() > 200 {
-        state.status = Some("Use a nonempty title of at most 200 bytes".into());
-        return;
-    }
-    let Some((session, generation)) = state.rename_target else {
+fn commit_title_edit(state: &mut UiState, effects: &mut Vec<Effect>) {
+    let Some(target) = state.title_edit.as_ref().map(|edit| edit.target) else {
         return;
     };
-    if state
-        .session_ui
-        .get(&session)
-        .is_none_or(|ui| ui.generation != generation)
-    {
-        state.status = Some("The session changed; reopen Rename".into());
+    if !state.session_ui.contains_key(&target) {
         return;
     }
+
+    let fallback = intended_session_title(state, target);
+    let title = {
+        let edit = state
+            .title_edit
+            .as_mut()
+            .expect("title target was read above");
+        let title = edit.text.trim().to_owned();
+        if title.is_empty() || title.len() > 200 {
+            edit.text = fallback.unwrap_or_else(|| edit.original.clone());
+            edit.cursor = edit.text.len();
+            edit.revision = edit.revision.wrapping_add(1);
+            edit.editor = Default::default();
+            state.status = Some("Use a nonempty title of at most 200 bytes".into());
+            return;
+        }
+        if edit.text != title {
+            edit.text = title.clone();
+            edit.cursor = edit.text.len();
+            edit.revision = edit.revision.wrapping_add(1);
+            edit.editor = Default::default();
+        }
+        title
+    };
+    let committed = committed_session_title(state, target).unwrap_or_default();
+    let queue = state.title_renames.entry(target).or_default();
+    let current = queue
+        .pending
+        .last_key_value()
+        .map_or(committed.as_str(), |(_, pending)| pending.as_str());
+    let changed = current != title;
+    queue.queued = changed.then_some(title);
+    if changed {
+        state.title_manual_intent.insert(target);
+    }
+    clear_title_rename_error(state, target);
+    dispatch_queued_title(state, target, effects);
     state.status = None;
+}
+
+fn dispatch_queued_title(state: &mut UiState, session: SessionId, effects: &mut Vec<Effect>) {
+    let title = {
+        let Some(queue) = state.title_renames.get_mut(&session) else {
+            return;
+        };
+        if !queue.pending.is_empty() {
+            return;
+        }
+        queue.queued.take()
+    };
+    let Some(title) = title else {
+        return;
+    };
+    if committed_session_title(state, session).as_deref() == Some(title.as_str()) {
+        return;
+    }
+    enqueue_title_rename(state, session, title, effects);
+}
+
+fn dispatch_queued_titles_for_exit(state: &mut UiState, effects: &mut Vec<Effect>) {
+    let sessions = state
+        .title_renames
+        .iter()
+        .filter_map(|(session, queue)| queue.queued.as_ref().map(|_| *session))
+        .collect::<Vec<_>>();
+    for session in sessions {
+        let title = state
+            .title_renames
+            .get_mut(&session)
+            .and_then(|queue| queue.queued.take())
+            .expect("only queues with a title were collected");
+        let already_last = state
+            .title_renames
+            .get(&session)
+            .and_then(|queue| queue.pending.last_key_value())
+            .is_some_and(|(_, pending)| pending == &title);
+        if !already_last {
+            enqueue_title_rename(state, session, title, effects);
+        }
+    }
+}
+
+fn enqueue_title_rename(
+    state: &mut UiState,
+    session: SessionId,
+    title: String,
+    effects: &mut Vec<Effect>,
+) {
+    let request = next_title_request(&mut state.title_request);
+    state
+        .title_renames
+        .entry(session)
+        .or_default()
+        .pending
+        .insert(request, title.clone());
     effects.push(Effect::RenameSession {
         session,
-        generation,
+        request,
         title,
     });
-    close_panel(state);
+}
+
+fn next_title_request(request: &mut u64) -> u64 {
+    *request = request.wrapping_add(1).max(1);
+    *request
+}
+
+fn committed_session_title(state: &UiState, session: SessionId) -> Option<String> {
+    state
+        .session_ui
+        .get(&session)
+        .map(|ui| ui.info.title.clone())
+        .or_else(|| {
+            state
+                .sessions
+                .iter()
+                .find(|info| info.id == session)
+                .map(|info| info.title.clone())
+        })
+}
+
+fn intended_session_title(state: &UiState, session: SessionId) -> Option<String> {
+    state
+        .title_renames
+        .get(&session)
+        .and_then(TitleRenameQueue::desired)
+        .map(str::to_owned)
+        .or_else(|| committed_session_title(state, session))
+}
+
+fn set_session_title(state: &mut UiState, session: SessionId, title: String) {
+    if let Some(info) = state.sessions.iter_mut().find(|info| info.id == session) {
+        info.title = title.clone();
+    }
+    if let Some(summary) = state.session_summaries.get_mut(&session) {
+        summary.session.title = title.clone();
+    }
+    if let Some(ui) = state.session_ui.get_mut(&session) {
+        ui.info.title = title;
+    }
+}
+
+fn local_title_override(
+    state: &mut UiState,
+    session: SessionId,
+    authoritative: &str,
+) -> Option<String> {
+    if state
+        .title_renames
+        .get(&session)
+        .and_then(|queue| queue.confirmed.as_deref())
+        == Some(authoritative)
+    {
+        state
+            .title_renames
+            .get_mut(&session)
+            .expect("confirmed title was found above")
+            .confirmed = None;
+    }
+    let pending = state
+        .title_renames
+        .get(&session)
+        .and_then(TitleRenameQueue::desired)
+        .map(str::to_owned);
+    if state
+        .title_renames
+        .get(&session)
+        .is_some_and(|queue| !queue.pending() && queue.confirmed.is_none())
+    {
+        state.title_renames.remove(&session);
+    }
+    pending
+}
+
+fn merge_authoritative_session_title(state: &mut UiState, session: SessionId, authoritative: &str) {
+    if let Some(local) = local_title_override(state, session, authoritative) {
+        if let Some(info) = state.sessions.iter_mut().find(|info| info.id == session) {
+            info.title = local.clone();
+        }
+        if let Some(summary) = state.session_summaries.get_mut(&session) {
+            summary.session.title = local;
+        }
+        return;
+    }
+    set_session_title(state, session, authoritative.to_owned());
+    if let Some(edit) = state
+        .title_edit
+        .as_mut()
+        .filter(|edit| edit.target == session)
+    {
+        let clean = edit.text == edit.original;
+        edit.original = authoritative.to_owned();
+        if clean {
+            edit.text = edit.original.clone();
+            edit.cursor = edit.text.len();
+            edit.editor = Default::default();
+        }
+    }
+}
+
+fn reconcile_overview_titles(
+    state: &mut UiState,
+    sessions: &mut [bone_app::SessionInfo],
+    summaries: &mut std::collections::BTreeMap<SessionId, bone_app::SessionSummary>,
+) {
+    for info in sessions {
+        let authoritative = info.title.clone();
+        let local = local_title_override(state, info.id, &authoritative);
+        if let Some(local) = local {
+            info.title = local.clone();
+            if let Some(summary) = summaries.get_mut(&info.id) {
+                summary.session.title = local;
+            }
+            if let Some(ui) = state.session_ui.get_mut(&info.id) {
+                let preserved = ui.info.title.clone();
+                ui.info = info.clone();
+                ui.info.title = preserved;
+            }
+            continue;
+        }
+        if let Some(ui) = state.session_ui.get_mut(&info.id) {
+            ui.info = info.clone();
+        }
+        if let Some(edit) = state
+            .title_edit
+            .as_mut()
+            .filter(|edit| edit.target == info.id)
+        {
+            let clean = edit.text == edit.original;
+            edit.original = authoritative;
+            if clean {
+                edit.text = edit.original.clone();
+                edit.cursor = edit.text.len();
+                edit.editor = Default::default();
+            }
+        }
+    }
+}
+
+fn set_title_rename_error(state: &mut UiState, session: SessionId, message: String) {
+    state.status = Some(message.clone());
+    state.title_rename_error = Some((session, message));
+}
+
+fn clear_title_rename_error(state: &mut UiState, session: SessionId) {
+    let Some((owner, message)) = state.title_rename_error.as_ref() else {
+        return;
+    };
+    if *owner != session {
+        return;
+    }
+    if state.status.as_deref() == Some(message.as_str()) {
+        state.status = None;
+    }
+    state.title_rename_error = None;
+}
+
+fn clear_title_rename_error_for_other_session(state: &mut UiState, selected: SessionId) {
+    if state
+        .title_rename_error
+        .as_ref()
+        .is_some_and(|(owner, _)| *owner != selected)
+    {
+        let owner = state
+            .title_rename_error
+            .as_ref()
+            .expect("rename error was checked above")
+            .0;
+        clear_title_rename_error(state, owner);
+    }
+}
+
+fn finish_title_rename(state: &mut UiState, session: SessionId, effects: &mut Vec<Effect>) {
+    if state.title_rename_pending(session) {
+        return;
+    }
+    if state
+        .title_renames
+        .get(&session)
+        .is_some_and(|queue| queue.confirmed.is_none())
+    {
+        state.title_renames.remove(&session);
+    }
+    if !state.quitting {
+        release_inactive_session(state, session, effects);
+    }
+}
+
+fn release_inactive_session(state: &UiState, session: SessionId, effects: &mut Vec<Effect>) {
+    if state.selected == Some(session) || state.title_rename_pending(session) {
+        return;
+    }
+    let Some(ui) = state.session_ui.get(&session) else {
+        return;
+    };
+    if ui.draft_revision <= ui.saved_draft_revision
+        && ui.submitting.is_none()
+        && !effects.iter().any(
+            |effect| matches!(effect, Effect::ReleaseSession { session: queued, .. } if *queued == session),
+        )
+    {
+        effects.push(Effect::ReleaseSession {
+            session,
+            generation: ui.generation,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2591,15 +3195,15 @@ mod panel_draft_tests {
     }
 
     #[test]
-    fn command_model_and_detail_round_trips_preserve_both_drafts() {
+    fn model_detail_and_help_panels_preserve_both_drafts() {
         let (mut state, question) = fixture();
-        for command in ["model", "details", "help"] {
-            update(&mut state, UiEvent::Action(Action::OpenCommands));
-            state.panel_selection = COMMANDS
-                .iter()
-                .position(|spec| spec.name == command)
-                .unwrap();
-            let effects = update(&mut state, UiEvent::Action(Action::ActivatePanel));
+        for panel in ["model", "details", "help"] {
+            let action = match panel {
+                "model" => Action::OpenModels,
+                "details" => Action::OpenLatest,
+                _ => Action::OpenHelp,
+            };
+            let effects = update(&mut state, UiEvent::Action(action));
             assert!(
                 effects.iter().all(|effect| !matches!(
                     effect,
@@ -2607,7 +3211,7 @@ mod panel_draft_tests {
                 ))
             );
             assert!(state.panel.is_some());
-            if command == "model" {
+            if panel == "model" {
                 state.models_loading = false;
                 let add = state.model_row_count() - 1;
                 update(&mut state, UiEvent::Action(Action::SelectModel(add)));
@@ -2631,59 +3235,81 @@ mod panel_draft_tests {
     }
 
     #[test]
-    fn rename_menu_uses_its_own_buffer_and_existing_success_failure_events() {
+    fn inline_title_editor_serializes_renames_without_touching_composer_drafts() {
         let (mut state, question) = fixture();
-        update(&mut state, UiEvent::Action(Action::OpenCommands));
-        state.panel_selection = COMMANDS
-            .iter()
-            .position(|spec| spec.name == "rename")
-            .unwrap();
-        update(&mut state, UiEvent::Action(Action::ActivatePanel));
-        assert!(matches!(state.panel, Some(Panel::Rename)));
-        assert_eq!(state.rename_input, "Existing title");
-        state.rename_input.clear();
-        assert!(update(&mut state, UiEvent::Action(Action::ActivatePanel)).is_empty());
-        assert!(matches!(state.panel, Some(Panel::Rename)));
-        update(
-            &mut state,
-            UiEvent::Action(Action::RenameText("New e\u{301}".into())),
+        let target = state.selected_ui().unwrap().info.id;
+
+        assert!(
+            update(
+                &mut state,
+                UiEvent::Action(Action::Focus(Focus::SessionTitle))
+            )
+            .is_empty()
         );
-        update(&mut state, UiEvent::Action(Action::RenameBackspace));
-        assert_eq!(state.rename_input, "New ");
-        let effects = update(&mut state, UiEvent::Action(Action::ActivatePanel));
+        assert_eq!(state.focus, Focus::SessionTitle);
+        {
+            let edit = state.title_edit.as_mut().unwrap();
+            edit.text = "  New title  ".into();
+            edit.cursor = edit.text.len();
+            edit.revision = edit.revision.wrapping_add(1);
+        }
+        let effects = update(&mut state, UiEvent::Action(Action::CommitTitle));
         let [
             Effect::RenameSession {
                 session,
-                generation,
+                request,
                 title,
             },
         ] = effects.as_slice()
         else {
             panic!("expected rename effect")
         };
-        assert_eq!(title, "New");
-        assert!(state.panel.is_none());
+        assert_eq!(*session, target);
+        assert_eq!(*request, 1);
+        assert_eq!(title, "New title");
         assert_drafts(&state, question);
+
+        update(&mut state, UiEvent::Action(Action::TitleEnd));
         update(
             &mut state,
-            UiEvent::OperationFailed {
-                kind: OperationKind::RenameSession,
-                session: Some(*session),
-                generation: Some(*generation),
+            UiEvent::Action(Action::TitlePaste(" v2".into())),
+        );
+        assert!(update(&mut state, UiEvent::Action(Action::CommitTitle)).is_empty());
+        assert_eq!(state.title_text(), Some("New title v2"));
+
+        let effects = update(
+            &mut state,
+            UiEvent::SessionRenamed {
+                session: *session,
+                request: *request,
+                title: title.clone(),
+            },
+        );
+        let [
+            Effect::RenameSession {
+                request: second_request,
+                title: second_title,
+                ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("queued title should start after the first write")
+        };
+        assert_eq!(*second_request, 2);
+        assert_eq!(second_title, "New title v2");
+        assert_eq!(state.title_text(), Some("New title v2"));
+
+        update(
+            &mut state,
+            UiEvent::SessionRenameFailed {
+                session: *session,
+                request: *second_request,
                 message: "Could not save title".into(),
             },
         );
         assert_eq!(state.status.as_deref(), Some("Could not save title"));
-        assert_drafts(&state, question);
-        update(
-            &mut state,
-            UiEvent::SessionRenamed {
-                session: *session,
-                generation: *generation,
-                title: title.clone(),
-            },
-        );
-        assert_eq!(state.selected_ui().unwrap().info.title, "New");
+        assert_eq!(state.selected_ui().unwrap().info.title, "New title");
+        assert_eq!(state.title_text(), Some("New title"));
         assert_drafts(&state, question);
     }
 }
@@ -2741,7 +3367,7 @@ mod session_browsing_tests {
             .collect();
         let mut effects = Vec::new();
         select_session(&mut state, ids[0], &mut effects);
-        state.focus = Focus::Sessions;
+        state.set_focus(Focus::Sessions);
         state.selected_ui_mut().unwrap().draft = "unsent original".into();
         (state, ids)
     }
@@ -2757,23 +3383,44 @@ mod session_browsing_tests {
             |effect| matches!(effect, Effect::OpenSession { session, .. } if *session == ids[1])
         ));
         assert_eq!(state.selected, Some(ids[1]));
-        assert_eq!(state.focus, Focus::Conversation);
+        assert_eq!(state.focus, Focus::Sessions);
         assert_eq!(state.session_ui[&ids[0]].draft, "unsent original");
         update(&mut state, UiEvent::Action(Action::SelectSession(ids[2])));
         assert_eq!(state.selected, Some(ids[2]));
         assert_eq!(state.session_candidate, Some(ids[2]));
-        assert_eq!(state.focus, Focus::Conversation);
+        assert_eq!(state.focus, Focus::Sessions);
     }
 
     #[test]
-    fn session_switch_preserves_an_existing_composer_focus() {
-        let (mut state, ids) = fixture();
-        state.focus = Focus::Composer;
+    fn session_switch_preserves_every_workspace_focus_region() {
+        for focus in [
+            Focus::Sessions,
+            Focus::SessionTitle,
+            Focus::Composer,
+            Focus::RightRail,
+        ] {
+            let (mut state, ids) = fixture();
+            if focus == Focus::SessionTitle {
+                update(
+                    &mut state,
+                    UiEvent::Action(Action::Focus(Focus::SessionTitle)),
+                );
+            } else {
+                state.set_focus(focus);
+            }
 
-        update(&mut state, UiEvent::Action(Action::SelectSession(ids[1])));
+            update(&mut state, UiEvent::Action(Action::SelectSession(ids[1])));
 
-        assert_eq!(state.selected, Some(ids[1]));
-        assert_eq!(state.focus, Focus::Composer);
+            assert_eq!(state.selected, Some(ids[1]));
+            assert_eq!(state.focus, focus);
+            if focus == Focus::SessionTitle {
+                let ui = state.selected_ui().unwrap();
+                assert_eq!(
+                    state.title_edit.as_ref().map(|edit| edit.target),
+                    Some(ui.info.id)
+                );
+            }
+        }
     }
 
     #[test]
@@ -2793,7 +3440,7 @@ mod session_browsing_tests {
         assert!(update(&mut state, UiEvent::Action(Action::Escape)).is_empty());
         assert_eq!(state.selected, Some(ids[0]));
         assert_eq!(state.session_candidate, Some(ids[0]));
-        assert_eq!(state.focus, Focus::Conversation);
+        assert_eq!(state.focus, Focus::Composer);
         assert_eq!(state.single_pane(), crate::layout::SinglePane::Conversation);
         assert_eq!(state.session_scroll, None);
     }
@@ -2888,7 +3535,7 @@ mod final_integration_regressions {
         let mut state = UiState::default();
         state.orphan_draft = "send this".into();
         state.orphan_cursor = state.orphan_draft.len();
-        state.focus = Focus::Conversation;
+        state.set_focus(Focus::SessionTitle);
         assert!(update(&mut state, UiEvent::Action(Action::Submit)).is_empty());
         assert!(state.pending_create.is_none());
         let effects = update(&mut state, UiEvent::Action(Action::ClickSubmit));
@@ -3467,5 +4114,935 @@ mod connection_tests {
         form.key.take();
         form.kind = ConnectionKind::AnthropicMessages;
         assert!(form.validated().is_err());
+    }
+}
+
+#[cfg(test)]
+mod focus_state_tests {
+    use super::*;
+
+    fn act(state: &mut UiState, action: Action) {
+        assert!(update(state, UiEvent::Action(action)).is_empty());
+    }
+
+    fn state_with_session() -> UiState {
+        let info = bone_app::SessionInfo {
+            id: SessionId::new(),
+            workspace: bone_app::WorkspaceId::new(),
+            title: "focus target".into(),
+            archived: false,
+        };
+        let mut state = UiState::default();
+        state.sessions.push(info.clone());
+        state.selected = Some(info.id);
+        state.session_ui.insert(info.id, SessionUi::new(info, 1));
+        state
+    }
+
+    #[test]
+    fn session_rail_returns_to_the_center_region_it_came_from() {
+        for center in [Focus::SessionTitle, Focus::Composer] {
+            let mut state = state_with_session();
+            act(&mut state, Action::Focus(center));
+            act(&mut state, Action::FocusLeft);
+            assert_eq!(state.focus, Focus::Sessions);
+            assert_eq!(state.last_center_focus(), center);
+
+            act(&mut state, Action::FocusLeft);
+            assert_eq!(state.last_center_focus(), center);
+
+            act(&mut state, Action::FocusRight);
+            assert_eq!(state.focus, center);
+        }
+    }
+
+    #[test]
+    fn leaving_center_repairs_a_direct_public_focus_assignment() {
+        let mut state = state_with_session();
+        assert_eq!(state.last_center_focus(), Focus::Composer);
+
+        // External callers can still write this public compatibility field.
+        state.focus = Focus::SessionTitle;
+        act(&mut state, Action::FocusLeft);
+        act(&mut state, Action::FocusRight);
+
+        assert_eq!(state.focus, Focus::SessionTitle);
+    }
+
+    #[test]
+    fn vertical_navigation_updates_the_remembered_center_region() {
+        let mut state = state_with_session();
+
+        act(&mut state, Action::FocusUp);
+        assert_eq!(state.focus, Focus::SessionTitle);
+        act(&mut state, Action::FocusLeft);
+        act(&mut state, Action::FocusRight);
+        assert_eq!(state.focus, Focus::SessionTitle);
+
+        act(&mut state, Action::FocusDown);
+        assert_eq!(state.focus, Focus::Composer);
+        act(&mut state, Action::FocusLeft);
+        act(&mut state, Action::FocusRight);
+        assert_eq!(state.focus, Focus::Composer);
+    }
+
+    #[test]
+    fn dragging_a_selection_focuses_the_composer() {
+        let mut state = UiState::default();
+        state.orphan_draft = "abc".into();
+        state.orphan_cursor = state.orphan_draft.len();
+        state.set_focus(Focus::SessionTitle);
+
+        act(&mut state, Action::DragCursor(1));
+
+        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.editor().selection(state.draft_cursor()), Some(1..3));
+    }
+
+    #[test]
+    fn session_created_does_not_steal_focus_after_the_request_started() {
+        for focus in [Focus::Sessions, Focus::RightRail] {
+            let mut state = UiState::default();
+            act(&mut state, Action::Paste("first input".into()));
+            let effects = update(&mut state, UiEvent::Action(Action::Submit));
+            assert!(matches!(effects.as_slice(), [Effect::CreateSession { .. }]));
+            let request_id = state.pending_create.as_ref().unwrap().request_id;
+            act(&mut state, Action::Focus(focus));
+
+            let info = bone_app::SessionInfo {
+                id: SessionId::new(),
+                workspace: bone_app::WorkspaceId::new(),
+                title: "new session".into(),
+                archived: false,
+            };
+            update(
+                &mut state,
+                UiEvent::SessionCreated {
+                    request_id,
+                    info: info.clone(),
+                },
+            );
+
+            assert_eq!(state.selected, Some(info.id));
+            assert_eq!(state.focus, focus);
+        }
+    }
+
+    #[test]
+    fn slash_new_focuses_composer_before_async_completion() {
+        let mut state = UiState::default();
+        state.set_focus(Focus::Sessions);
+        state.panel_return = Focus::Sessions;
+
+        act(&mut state, Action::StartSlashCommand);
+        act(&mut state, Action::Paste("new".into()));
+        let effects = update(&mut state, UiEvent::Action(Action::Submit));
+
+        assert!(matches!(effects.as_slice(), [Effect::CreateSession { .. }]));
+        assert_eq!(state.focus, Focus::Composer);
+    }
+
+    fn state_with_reader_history(focus: Focus) -> (UiState, bone_app::SessionSeq) {
+        let sequence = bone_app::SessionSeq(1);
+        let runtime = bone_app::RuntimeId::new();
+        let info = bone_app::SessionInfo {
+            id: SessionId::new(),
+            workspace: bone_app::WorkspaceId::new(),
+            title: "reader focus".into(),
+            archived: false,
+        };
+        let mut ui = SessionUi::new(info.clone(), 1);
+        ui.history.push_back(bone_app::HistoryEntry {
+            sequence,
+            occurred_at: 0,
+            event: bone_app::SessionEvent::JobFinished {
+                job: bone_app::JobRef { runtime, id: 1 },
+                outcome: bone_app::OutcomeKind::Completed,
+                summary: "done".into(),
+                remaining: vec![],
+            },
+        });
+        let mut state = UiState::default();
+        state.sessions.push(info.clone());
+        state.selected = Some(info.id);
+        state.session_ui.insert(info.id, ui);
+        state.set_focus(focus);
+        (state, sequence)
+    }
+
+    #[test]
+    fn reader_restores_the_exact_workspace_focus() {
+        for focus in [
+            Focus::Sessions,
+            Focus::SessionTitle,
+            Focus::Composer,
+            Focus::RightRail,
+        ] {
+            let (mut state, sequence) = state_with_reader_history(focus);
+
+            act(&mut state, Action::OpenHistory(sequence));
+            assert!(matches!(state.panel, Some(Panel::Reader(_))));
+            assert_eq!(state.panel_return, focus);
+
+            act(&mut state, Action::Escape);
+            assert!(state.panel.is_none());
+            assert_eq!(state.focus, focus);
+        }
+    }
+
+    #[test]
+    fn title_focus_requires_a_selected_session() {
+        let mut state = UiState::default();
+
+        act(&mut state, Action::FocusUp);
+        assert_eq!(state.focus, Focus::Composer);
+        act(&mut state, Action::Focus(Focus::SessionTitle));
+        assert_eq!(state.focus, Focus::Composer);
+    }
+
+    #[test]
+    fn overview_removal_repairs_an_orphaned_title_focus() {
+        let mut state = state_with_session();
+        act(&mut state, Action::Focus(Focus::SessionTitle));
+        assert!(state.title_edit.is_some());
+
+        update(
+            &mut state,
+            UiEvent::OverviewLoaded {
+                generation: 0,
+                sessions: vec![],
+                statuses: std::collections::BTreeMap::new(),
+                summaries: std::collections::BTreeMap::new(),
+            },
+        );
+
+        assert_eq!(state.selected, None);
+        assert_eq!(state.focus, Focus::Composer);
+        assert!(state.title_edit.is_none());
+    }
+
+    #[test]
+    fn overview_removal_repairs_hidden_title_return_targets() {
+        for focus_state in [Focus::Sessions, Focus::RightRail] {
+            let mut state = state_with_session();
+            state.set_focus(Focus::SessionTitle);
+            state.set_focus(focus_state);
+            assert_eq!(state.last_center, CenterFocus::SessionTitle);
+
+            update(
+                &mut state,
+                UiEvent::OverviewLoaded {
+                    generation: 0,
+                    sessions: vec![],
+                    statuses: std::collections::BTreeMap::new(),
+                    summaries: std::collections::BTreeMap::new(),
+                },
+            );
+
+            assert_eq!(state.focus, focus_state);
+            assert_eq!(state.last_center, CenterFocus::Composer);
+            act(
+                &mut state,
+                if focus_state == Focus::Sessions {
+                    Action::FocusRight
+                } else {
+                    Action::FocusLeft
+                },
+            );
+            assert_eq!(state.focus, Focus::Composer);
+        }
+
+        let mut state = state_with_session();
+        act(&mut state, Action::Focus(Focus::SessionTitle));
+        act(&mut state, Action::OpenHelp);
+        assert_eq!(state.panel_return, Focus::SessionTitle);
+
+        update(
+            &mut state,
+            UiEvent::OverviewLoaded {
+                generation: 0,
+                sessions: vec![],
+                statuses: std::collections::BTreeMap::new(),
+                summaries: std::collections::BTreeMap::new(),
+            },
+        );
+
+        assert_eq!(state.panel_return, Focus::Composer);
+        assert_eq!(state.last_center, CenterFocus::Composer);
+        act(&mut state, Action::Escape);
+        assert_eq!(state.focus, Focus::Composer);
+    }
+
+    #[test]
+    fn resize_repairs_a_hidden_right_rail_behind_an_open_panel() {
+        let mut state = state_with_session();
+        state.set_focus(Focus::RightRail);
+        act(&mut state, Action::OpenHelp);
+        assert_eq!(state.panel_return, Focus::RightRail);
+
+        update(
+            &mut state,
+            UiEvent::Resized {
+                width: 100,
+                height: 24,
+            },
+        );
+        assert_eq!(state.panel_return, Focus::Composer);
+        act(&mut state, Action::Escape);
+        assert_eq!(state.focus, Focus::Composer);
+    }
+
+    #[test]
+    fn attached_slash_command_keeps_composer_as_the_panel_return_focus() {
+        let mut state = UiState::default();
+        state.panel_return = Focus::Sessions;
+        act(&mut state, Action::Paste("/help".into()));
+
+        act(&mut state, Action::Submit);
+
+        assert!(matches!(state.panel, Some(Panel::Help)));
+        assert_eq!(state.panel_return, Focus::Composer);
+        act(&mut state, Action::Escape);
+        assert_eq!(state.focus, Focus::Composer);
+    }
+}
+
+#[cfg(test)]
+mod title_rename_tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use super::*;
+
+    fn session_info(
+        workspace: bone_app::WorkspaceId,
+        id: SessionId,
+        title: impl Into<String>,
+    ) -> bone_app::SessionInfo {
+        bone_app::SessionInfo {
+            id,
+            workspace,
+            title: title.into(),
+            archived: false,
+        }
+    }
+
+    fn summary(info: bone_app::SessionInfo) -> bone_app::SessionSummary {
+        bone_app::SessionSummary {
+            session: info,
+            created_at: 1,
+            message_count: 0,
+            latest_reply_preview: None,
+            projection_pending: false,
+            has_draft: false,
+            draft_bytes: 0,
+            persisted_runtime: None,
+            history_through: bone_app::SessionSeq(0),
+        }
+    }
+
+    fn fixture() -> (UiState, bone_app::SessionInfo, bone_app::SessionInfo) {
+        let workspace = bone_app::WorkspaceId::new();
+        let first = session_info(workspace, SessionId::new(), "Alpha");
+        let second = session_info(workspace, SessionId::new(), "Beta");
+        let mut state = UiState::default();
+        let generation = state.generation();
+        state.sessions = vec![first.clone(), second.clone()];
+        state
+            .session_summaries
+            .insert(first.id, summary(first.clone()));
+        state
+            .session_summaries
+            .insert(second.id, summary(second.clone()));
+        state
+            .session_ui
+            .insert(first.id, SessionUi::new(first.clone(), generation));
+        state
+            .session_ui
+            .insert(second.id, SessionUi::new(second.clone(), generation));
+        state.selected = Some(first.id);
+        state.session_candidate = Some(first.id);
+        (state, first, second)
+    }
+
+    fn dirty_title(state: &mut UiState, title: &str) {
+        update(state, UiEvent::Action(Action::Focus(Focus::SessionTitle)));
+        let edit = state.title_edit.as_mut().expect("selected title editor");
+        edit.editor.checkpoint(&edit.text, edit.cursor);
+        edit.text = title.into();
+        edit.cursor = edit.text.len();
+        edit.revision = edit.revision.wrapping_add(1);
+    }
+
+    fn rename_effect(effects: &[Effect]) -> (SessionId, u64, String) {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::RenameSession {
+                    session,
+                    request,
+                    title,
+                } => Some((*session, *request, title.clone())),
+                _ => None,
+            })
+            .expect("rename effect")
+    }
+
+    fn title_in_rail(state: &UiState, session: SessionId) -> &str {
+        &state
+            .sessions
+            .iter()
+            .find(|info| info.id == session)
+            .expect("listed session")
+            .title
+    }
+
+    fn overview(
+        state: &mut UiState,
+        first: &bone_app::SessionInfo,
+        second: &bone_app::SessionInfo,
+    ) -> Vec<Effect> {
+        let sessions = vec![first.clone(), second.clone()];
+        let summaries = sessions
+            .iter()
+            .cloned()
+            .map(|info| (info.id, summary(info)))
+            .collect();
+        update(
+            state,
+            UiEvent::OverviewLoaded {
+                generation: state.overview_generation,
+                sessions,
+                statuses: BTreeMap::new(),
+                summaries,
+            },
+        )
+    }
+
+    fn snapshot(info: bone_app::SessionInfo) -> Arc<bone_app::SessionView> {
+        Arc::new(bone_app::SessionView {
+            session: info,
+            runtime: bone_app::RuntimeState::Detached,
+            draft: String::new(),
+            inputs: vec![],
+            jobs: vec![],
+            activity: vec![],
+            history_through: bone_app::SessionSeq(0),
+            problem: None,
+        })
+    }
+
+    #[test]
+    fn scrolling_and_resizing_do_not_commit_a_dirty_title() {
+        let (mut state, _, _) = fixture();
+        dirty_title(&mut state, "Local edit");
+
+        for action in [
+            Action::ScrollUp {
+                amount: 3,
+                metrics: None,
+            },
+            Action::ScrollSessions { start: 1 },
+            Action::BeginPaneResize(crate::layout::PaneDivider::Left),
+        ] {
+            let effects = update(&mut state, UiEvent::Action(action));
+            assert!(
+                effects
+                    .iter()
+                    .all(|effect| !matches!(effect, Effect::RenameSession { .. }))
+            );
+            assert!(state.title_renames.is_empty());
+            assert_eq!(state.title_text(), Some("Local edit"));
+        }
+    }
+
+    #[test]
+    fn title_home_and_end_extend_selection_without_splitting_graphemes() {
+        let (mut state, first, _) = fixture();
+        let title = "中e\u{301}🙂";
+        set_session_title(&mut state, first.id, title.into());
+        update(
+            &mut state,
+            UiEvent::Action(Action::Focus(Focus::SessionTitle)),
+        );
+
+        update(
+            &mut state,
+            UiEvent::Action(Action::TitleMoveCursor {
+                direction: -3,
+                select: true,
+                word: false,
+            }),
+        );
+        let edit = state.title_edit.as_ref().unwrap();
+        assert_eq!(edit.cursor, 0);
+        assert_eq!(edit.editor.selection(edit.cursor), Some(0..title.len()));
+
+        update(&mut state, UiEvent::Action(Action::TitleHome));
+        update(
+            &mut state,
+            UiEvent::Action(Action::TitleMoveCursor {
+                direction: 3,
+                select: true,
+                word: false,
+            }),
+        );
+        let edit = state.title_edit.as_ref().unwrap();
+        assert_eq!(edit.cursor, title.len());
+        assert_eq!(edit.editor.selection(edit.cursor), Some(0..title.len()));
+    }
+
+    #[test]
+    fn every_user_move_out_of_the_title_commits_before_focus_changes() {
+        for action in [
+            Action::FocusLeft,
+            Action::FocusDown,
+            Action::Focus(Focus::Composer),
+            Action::PlaceCursor(0),
+            Action::DragCursor(0),
+            Action::ClickSubmit,
+        ] {
+            let (mut state, first, _) = fixture();
+            dirty_title(&mut state, "Committed on leave");
+            let effects = update(&mut state, UiEvent::Action(action));
+            assert_eq!(
+                rename_effect(&effects),
+                (first.id, 1, "Committed on leave".into())
+            );
+            assert_ne!(state.focus, Focus::SessionTitle);
+        }
+
+        let (mut state, first, second) = fixture();
+        dirty_title(&mut state, "Committed on switch");
+        let effects = update(
+            &mut state,
+            UiEvent::Action(Action::SelectSession(second.id)),
+        );
+        assert_eq!(
+            rename_effect(&effects),
+            (first.id, 1, "Committed on switch".into())
+        );
+        assert_eq!(state.selected, Some(second.id));
+
+        let (mut state, first, _) = fixture();
+        dirty_title(&mut state, "Committed on quit");
+        let effects = update(&mut state, UiEvent::Action(Action::Quit));
+        assert_eq!(
+            rename_effect(&effects),
+            (first.id, 1, "Committed on quit".into())
+        );
+        let rename = effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::RenameSession { .. }))
+            .unwrap();
+        let shutdown = effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::Shutdown))
+            .unwrap();
+        assert!(
+            rename < shutdown,
+            "title is handed to Runtime before shutdown"
+        );
+    }
+
+    #[test]
+    fn switch_keeps_inflight_and_queued_titles_until_the_final_write_finishes() {
+        let (mut state, first, second) = fixture();
+        dirty_title(&mut state, "First write");
+        let (_, first_request, _) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        dirty_title(&mut state, "Queued write");
+        assert!(update(&mut state, UiEvent::Action(Action::CommitTitle)).is_empty());
+
+        let switched = update(
+            &mut state,
+            UiEvent::Action(Action::SelectSession(second.id)),
+        );
+        assert!(switched.iter().all(|effect| {
+            !matches!(effect, Effect::ReleaseSession { session, .. } if *session == first.id)
+        }));
+
+        let retry = update(
+            &mut state,
+            UiEvent::SessionRenameFailed {
+                session: first.id,
+                request: first_request,
+                message: "old write failed".into(),
+            },
+        );
+        let (_, second_request, title) = rename_effect(&retry);
+        assert_eq!(title, "Queued write");
+        assert!(
+            state.status.is_none(),
+            "background failure stays with its Session"
+        );
+
+        let finished = update(
+            &mut state,
+            UiEvent::SessionRenamed {
+                session: first.id,
+                request: second_request,
+                title,
+            },
+        );
+        assert_eq!(title_in_rail(&state, first.id), "Queued write");
+        assert!(finished.iter().any(|effect| {
+            matches!(effect, Effect::ReleaseSession { session, .. } if *session == first.id)
+        }));
+    }
+
+    #[test]
+    fn exit_flushes_the_latest_queued_title_and_ignores_reversed_callbacks() {
+        let (mut state, first, _) = fixture();
+        dirty_title(&mut state, "First write");
+        let (_, first_request, first_title) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        dirty_title(&mut state, "Final write");
+        assert!(update(&mut state, UiEvent::Action(Action::CommitTitle)).is_empty());
+
+        let exit = update(&mut state, UiEvent::Action(Action::Quit));
+        let (_, final_request, final_title) = rename_effect(&exit);
+        assert!(final_request > first_request);
+        assert!(matches!(exit.last(), Some(Effect::Shutdown)));
+
+        update(
+            &mut state,
+            UiEvent::SessionRenamed {
+                session: first.id,
+                request: final_request,
+                title: final_title,
+            },
+        );
+        update(
+            &mut state,
+            UiEvent::SessionRenamed {
+                session: first.id,
+                request: first_request,
+                title: first_title,
+            },
+        );
+        assert_eq!(title_in_rail(&state, first.id), "Final write");
+        assert_eq!(state.session_ui[&first.id].info.title, "Final write");
+        assert_eq!(state.title_text(), Some("Final write"));
+    }
+
+    #[test]
+    fn session_created_commits_the_old_title_before_replacing_its_editor() {
+        let (mut state, first, _) = fixture();
+        let ui = state.session_ui.get_mut(&first.id).unwrap();
+        ui.draft = "/new".into();
+        ui.draft_cursor = ui.draft.len();
+        let create = update(&mut state, UiEvent::Action(Action::Submit));
+        assert!(
+            create
+                .iter()
+                .any(|effect| matches!(effect, Effect::CreateSession { .. }))
+        );
+        let request_id = state.pending_create.as_ref().unwrap().request_id;
+        dirty_title(&mut state, "Old title while /new waits");
+
+        let created = session_info(first.workspace, SessionId::new(), "New conversation");
+        let effects = update(
+            &mut state,
+            UiEvent::SessionCreated {
+                request_id,
+                info: created.clone(),
+            },
+        );
+        assert_eq!(
+            rename_effect(&effects),
+            (first.id, 1, "Old title while /new waits".into())
+        );
+        assert_eq!(state.selected, Some(created.id));
+        assert_eq!(
+            state.title_edit.as_ref().map(|edit| edit.target),
+            Some(created.id)
+        );
+        assert!(state.title_rename_pending(first.id));
+    }
+
+    #[test]
+    fn release_generation_changes_do_not_replace_the_session_scoped_editor() {
+        let (mut state, first, _) = fixture();
+        update(
+            &mut state,
+            UiEvent::Action(Action::Focus(Focus::SessionTitle)),
+        );
+        update(&mut state, UiEvent::Action(Action::TitleEnd));
+        update(
+            &mut state,
+            UiEvent::Action(Action::TitlePaste(" changed".into())),
+        );
+        let edited = state.title_text().unwrap().to_owned();
+        let old_generation = state.session_ui[&first.id].generation;
+
+        let reopen = update(
+            &mut state,
+            UiEvent::SessionReleased {
+                generation: old_generation,
+                receipt: bone_app::SessionReleaseReceipt {
+                    session: first.id,
+                    status: bone_app::SessionReleaseStatus::Released,
+                },
+            },
+        );
+        assert!(matches!(reopen.as_slice(), [Effect::OpenSession { .. }]));
+        assert_ne!(state.session_ui[&first.id].generation, old_generation);
+        assert_eq!(state.title_text(), Some(edited.as_str()));
+
+        update(&mut state, UiEvent::Action(Action::TitleUndo));
+        assert_eq!(state.title_text(), Some("Alpha"));
+        update(&mut state, UiEvent::Action(Action::TitleRedo));
+        assert_eq!(state.title_text(), Some(edited.as_str()));
+        let effects = update(&mut state, UiEvent::Action(Action::CommitTitle));
+        assert_eq!(rename_effect(&effects).0, first.id);
+    }
+
+    #[test]
+    fn manual_intent_wins_before_or_after_an_auto_title_receipt() {
+        let (mut state, first, _) = fixture();
+        state.session_ui.get_mut(&first.id).unwrap().draft = "first input".into();
+        state.session_ui.get_mut(&first.id).unwrap().draft_cursor = "first input".len();
+        let submitted = update(&mut state, UiEvent::Action(Action::Submit));
+        let request_id = submitted
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Submit { input, .. } => Some(input.request_id),
+                _ => None,
+            })
+            .unwrap();
+        dirty_title(&mut state, "Manual title");
+        let (_, manual_request, manual_title) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        let receipt_effects = update(
+            &mut state,
+            UiEvent::Submitted {
+                session: first.id,
+                generation: 1,
+                request_id,
+                receipt: bone_app::SubmissionReceipt {
+                    input: bone_app::InputId(1),
+                    saved_at: bone_app::SessionSeq(1),
+                },
+            },
+        );
+        assert!(
+            receipt_effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::AutoTitle { .. }))
+        );
+        update(
+            &mut state,
+            UiEvent::SessionRenamed {
+                session: first.id,
+                request: manual_request,
+                title: manual_title,
+            },
+        );
+        update(
+            &mut state,
+            UiEvent::SessionAutoTitled {
+                session: first.id,
+                request: manual_request.wrapping_add(10),
+                title: "Late automatic title".into(),
+            },
+        );
+        assert_eq!(title_in_rail(&state, first.id), "Manual title");
+
+        let (mut state, first, _) = fixture();
+        state.session_ui.get_mut(&first.id).unwrap().submitting = Some(PendingSubmission {
+            request_id: RequestId::new(),
+            text: "first input".into(),
+            draft_revision: 0,
+            failed: false,
+            reply_to: None,
+        });
+        let submission = state.session_ui[&first.id]
+            .submitting
+            .as_ref()
+            .unwrap()
+            .request_id;
+        let auto = update(
+            &mut state,
+            UiEvent::Submitted {
+                session: first.id,
+                generation: 1,
+                request_id: submission,
+                receipt: bone_app::SubmissionReceipt {
+                    input: bone_app::InputId(2),
+                    saved_at: bone_app::SessionSeq(2),
+                },
+            },
+        );
+        let auto_request = auto
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::AutoTitle { request, .. } => Some(*request),
+                _ => None,
+            })
+            .expect("auto title was already scheduled");
+        dirty_title(&mut state, "Manual after submit");
+        let (_, manual_request, manual_title) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        update(
+            &mut state,
+            UiEvent::SessionRenamed {
+                session: first.id,
+                request: manual_request,
+                title: manual_title,
+            },
+        );
+        update(
+            &mut state,
+            UiEvent::SessionAutoTitled {
+                session: first.id,
+                request: auto_request,
+                title: "Older automatic title".into(),
+            },
+        );
+        assert_eq!(title_in_rail(&state, first.id), "Manual after submit");
+    }
+
+    #[test]
+    fn auto_title_receipt_survives_a_session_generation_change() {
+        let (mut state, first, _) = fixture();
+        update(
+            &mut state,
+            UiEvent::SessionReleased {
+                generation: 1,
+                receipt: bone_app::SessionReleaseReceipt {
+                    session: first.id,
+                    status: bone_app::SessionReleaseStatus::Released,
+                },
+            },
+        );
+        assert_ne!(state.session_ui[&first.id].generation, 1);
+
+        update(
+            &mut state,
+            UiEvent::SessionAutoTitled {
+                session: first.id,
+                request: 7,
+                title: "Durable automatic title".into(),
+            },
+        );
+        assert_eq!(title_in_rail(&state, first.id), "Durable automatic title");
+        assert_eq!(
+            state.session_ui[&first.id].info.title,
+            "Durable automatic title"
+        );
+    }
+
+    #[test]
+    fn authoritative_titles_update_the_baseline_without_publishing_dirty_editor_text() {
+        for authoritative in ["Alpha", "External title"] {
+            let (mut state, first, mut second) = fixture();
+            dirty_title(&mut state, "Uncommitted editor text");
+            let mut changed = first.clone();
+            changed.title = authoritative.into();
+            second.title = "Beta".into();
+            overview(&mut state, &changed, &second);
+
+            assert_eq!(title_in_rail(&state, first.id), authoritative);
+            assert_eq!(state.session_ui[&first.id].info.title, authoritative);
+            let edit = state.title_edit.as_ref().unwrap();
+            assert_eq!(edit.text, "Uncommitted editor text");
+            assert_eq!(edit.original, authoritative);
+
+            update(&mut state, UiEvent::Action(Action::CancelTitle));
+            assert_eq!(title_in_rail(&state, first.id), authoritative);
+            assert_eq!(state.title_text(), Some(authoritative));
+        }
+    }
+
+    #[test]
+    fn pending_and_confirmed_titles_protect_against_stale_metadata_then_reconcile() {
+        let (mut state, first, second) = fixture();
+        dirty_title(&mut state, "Durable local title");
+        let (_, request, title) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        overview(&mut state, &first, &second);
+        assert_eq!(title_in_rail(&state, first.id), "Durable local title");
+        assert_eq!(state.session_ui[&first.id].info.title, "Alpha");
+
+        update(
+            &mut state,
+            UiEvent::SessionRenamed {
+                session: first.id,
+                request,
+                title,
+            },
+        );
+        overview(&mut state, &first, &second);
+        assert_eq!(title_in_rail(&state, first.id), "Durable local title");
+
+        let mut authoritative = first.clone();
+        authoritative.title = "Durable local title".into();
+        overview(&mut state, &authoritative, &second);
+        assert_eq!(
+            state.session_ui[&first.id].info.title,
+            "Durable local title"
+        );
+        assert!(
+            state
+                .title_renames
+                .get(&first.id)
+                .is_none_or(|queue| queue.confirmed.is_none())
+        );
+    }
+
+    #[test]
+    fn session_snapshot_title_merges_into_ui_and_respects_a_pending_override() {
+        let (mut state, first, _) = fixture();
+        let mut external = first.clone();
+        external.title = "Snapshot title".into();
+        update(
+            &mut state,
+            UiEvent::SessionChanged {
+                session: first.id,
+                generation: 1,
+                snapshot: snapshot(external),
+            },
+        );
+        assert_eq!(title_in_rail(&state, first.id), "Snapshot title");
+        assert_eq!(state.session_ui[&first.id].info.title, "Snapshot title");
+
+        dirty_title(&mut state, "Pending local title");
+        let effects = update(&mut state, UiEvent::Action(Action::CommitTitle));
+        assert!(matches!(effects.as_slice(), [Effect::RenameSession { .. }]));
+        let mut stale = first.clone();
+        stale.title = "Stale snapshot".into();
+        update(
+            &mut state,
+            UiEvent::SessionChanged {
+                session: first.id,
+                generation: 1,
+                snapshot: snapshot(stale),
+            },
+        );
+        assert_eq!(title_in_rail(&state, first.id), "Pending local title");
+        assert_eq!(state.title_text(), Some("Pending local title"));
+    }
+
+    #[test]
+    fn final_failure_restores_header_and_rail_to_the_committed_baseline() {
+        let (mut state, first, second) = fixture();
+        dirty_title(&mut state, "Failed title");
+        let (_, request, _) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        overview(&mut state, &first, &second);
+        assert_eq!(title_in_rail(&state, first.id), "Failed title");
+
+        update(
+            &mut state,
+            UiEvent::SessionRenameFailed {
+                session: first.id,
+                request,
+                message: "Could not save title".into(),
+            },
+        );
+        assert_eq!(title_in_rail(&state, first.id), "Alpha");
+        assert_eq!(state.session_ui[&first.id].info.title, "Alpha");
+        assert_eq!(state.title_text(), Some("Alpha"));
+        assert_eq!(state.status.as_deref(), Some("Could not save title"));
     }
 }

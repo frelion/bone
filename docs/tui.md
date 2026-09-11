@@ -6,7 +6,7 @@
 
 `bone` 是 coding agent 的终端前端，不是 Dashboard、管理后台或功能目录。常态界面只让用户完成三件事：切换 Session、与 Agent 对话、在需要时深入查看一个对象。
 
-视觉采用纯黑侧栏、炭黑主画布、中性灰编辑面和鲜橘黄强调色。代码和结果使用青、紫、绿辅助表达语义；层级来自留白、明度和明确的状态，不复制其他产品的品牌视觉。
+视觉采用纯黑侧栏、炭黑主画布和中性灰编辑面。橙色只用于当前 Session 左侧的身份条，以及处于可见相位的应用内 caret；它不承担区域焦点、列表候选、运行状态或分隔条语义。层级来自留白、明度、中性表面和统一 label 字重，不复制其他产品的品牌视觉。
 
 ## 稳定三栏
 
@@ -16,16 +16,16 @@
 └───────────────┴─────────────────────────┴────────────────┘
 ```
 
-- 左栏固定负责 Session 切换。普通会话只显示标题，草稿加小标记；需要处理或正在工作的会话增加一行短状态，不重复显示“就绪”；状态来自 App 的 workspace overview，本地 live snapshot 只补充实时运行状态。
-- 中栏固定负责对话。标题、历史、临时活动和输入框都在这里；Composer 绝不横跨三栏。
-- 右栏默认留空；打开 Job 或工具结果详情时用于阅读当前对象，Esc 返回来源。窄屏详情使用中栏。材料、架构图、Git 等尚未实现，不放占位功能。
+- 左栏固定负责 Session 切换。每个 Session 固定三行内容：标题、最近一条 Agent 回复预览、消息数与相对时间或日期；下一行是 Session 间分隔，不因草稿或运行状态改变行高。状态使用标题旁的紧凑语义点。当前 Session 始终以左侧橙色身份条标识；只有 Sessions 区域拥有焦点时，键盘候选才使用浅中性的 `SELECTED` 背景。摘要投影尚未追上历史时，回复行显示 `Loading history…`，计数显示 `… msgs`，不把部分值伪装成完整事实。
+- 中栏固定负责对话。可直接编辑的 Session 标题、历史、临时活动和 Composer 都在这里；Composer 绝不横跨三栏。
+- 右栏默认显示中性详情表面；打开 Job 或工具结果详情时用于阅读当前对象，Esc 返回来源。窄屏详情使用中栏。材料、架构图、Git 等尚未实现，不放占位功能。
 - 不存在全局顶栏、动作栏、Dashboard 首页、设置页、详情 tab 或创建 Session 对话框。
 
 响应式规则：`>=140` 列显示三栏（默认左 32、右 40、中间取余，可拖动分隔条调整）；`100–139` 列显示左中两栏；`40–99` 列显示当前单区；小于 40 列或高度小于 12 行显示过小提示并保留草稿和退出能力。
 
 ## 对话视觉
 
-- 用户消息用低对比背景加一条细竖线表达来源，不显示 `YOU` 前缀。
+- 用户消息只用低对比背景和上下留白形成独立组，不显示 `YOU` 前缀，也不增加细竖线或说话者标签。
 - Agent 回复直接生长在主画布上，不显示 `BONE` 前缀，也不套消息卡片。
 - 工具、问题、状态和活动使用紧凑行；Runtime started/reconfigured/closed 等传输生命周期不进入对话。
 - 长回复必须完整可达，按真实终端视觉行滚动。渲染产生的换行 metrics 同时驱动键盘/鼠标滚动、历史预取和缓存淘汰补偿，不能用事件数量猜视觉行数。
@@ -35,9 +35,9 @@
 
 键盘是第一公民，鼠标是同等正式入口，但不要求用户背一张快捷键表。
 
-- `Ctrl+←/→/↑/↓` 在左栏、对话与 Composer 之间做空间焦点移动；详情打开时单独处理滚动和返回。
-- Session 列表用方向键浏览候选，Enter 打开，点击直接打开；滚轮只滚列表，Esc 返回原对话。对话区用方向键或 PageUp/PageDown 阅读。
-- Composer 正文上下各留一行，模型与快捷键放在框外 status baseline；按视觉行增长，小窗口优先保留至少三行历史。BONE 在插入位置绘制稳定的 accent Cell，并把原生 caret 定位到同一位置供 IME 与辅助功能使用；它不设置宿主光标的颜色、形状或闪烁方式。
+- Workspace 有且只有四个焦点区域：`Sessions`、`SessionTitle`、`Composer`、`RightRail`。`Ctrl+←/→` 在侧栏与上次使用的中栏编辑区之间移动，`Ctrl+↑/↓` 在 `SessionTitle` 与 `Composer` 之间移动；到达边界不循环，窄屏未显示右栏时也不会把焦点移入隐藏区域。Conversation transcript 是可滚动内容，不是第五个焦点区域。详情和普通面板打开时独占焦点作用域，关闭后恢复准确的 workspace 焦点；附着于 Composer 的 `/` 命令面板保留 Composer 焦点。
+- Session 列表用方向键浏览候选，Enter 打开，点击直接打开；滚轮只滚列表，Esc 返回当前 Session。切换 Session 保留切换前的四区域焦点，`SessionTitle` 焦点会转到新 Session 的内联标题编辑器。`SessionTitle` 与 `Composer` 聚焦时均可用 PageUp/PageDown 阅读 transcript；鼠标滚轮也可直接滚动 transcript。
+- Composer 正文上下各留一行，模型与快捷键放在框外 status baseline；按视觉行增长，小窗口优先保留至少三行历史。`SessionTitle` 和 Composer 都只用 caret 表达编辑焦点，不绘制焦点 gutter、橙色短轨或 active 标题色。caret 每 500 ms 切换一次可见相位，完整闪烁周期为 1 秒；输入、焦点变化和 resize 会从可见相位重新开始。可见时，BONE 绘制 `FOCUS_MARK` Cell，并把原生 cursor 定位到同一 Cell 供 IME 与辅助功能使用。
 - 上下方向键按视觉行移动输入光标，连续移动保留首选列；软换行、中文、组合字符和 CRLF 共用文本几何。
 - Shift+方向/Home/End 选择文字，鼠标点击定位及拖选；Alt+左右按 Unicode 词边界移动，Ctrl+Z/Y 撤销重做。普通、问题回答和未建会话草稿各自保留编辑历史；撤销也递增 revision，旧提交回执不能清空撤回后的文字。
 - `Enter` 发送；`Shift+Enter` 换行。Unix/WSL 启动时查询键盘增强能力，只在确认支持后于本次运行期间 push CSI-u/Kitty 模式；原生 Windows 使用带修饰键的控制台事件。能力不足时，status baseline 将换行提示标为 unavailable，帮助面板显示原因；不增加 `Alt+Enter`、`Ctrl+J` 或其他隐藏别名。
@@ -46,11 +46,11 @@
 - `Ctrl+D` 是唯一退出快捷键，安全退出并保留普通未提交草稿。
 - 粘贴只插入文本，不直接执行命令。
 
-全局动作可从 slash command 或 `Ctrl+P` 命令菜单进入。命令菜单不占用普通草稿；左栏新建和底部模型、命令文字也可点击。已实现：
+全局动作统一从 Composer 的 `/` 命令面板进入，没有 `Ctrl+P` 快捷键。面板随命令前缀过滤，保持 Composer 的输入焦点和 caret；底部模型入口也可点击。已实现：
 
 - `/new [title]`：直接创建 Session，无确认框；省略标题时，App 在首次提交后生成标题。
 - `/sessions`：聚焦 Session rail。
-- `/rename <title>`：修改当前 Session 标题。
+- `/rename`：进入当前 Session 的单行内联标题编辑；`/rename <title>` 直接写入并提交标题。
 - `/model`：统一模型选择、添加/编辑接入、API 密钥与账号授权。模型列表中选择已有配置、编辑接入或添加接入；表单支持 Tab/上下切字段、Ctrl+U 清空和鼠标操作。API 支持 Responses、Chat Completions、Anthropic Messages 及自定义 HTTPS 地址；密钥遮罩、退出清空、不进草稿和 Debug。账号授权也在此流程内返回模型列表，不再提供独立 `/login` 或 `/connect`。兼容 `/model <profile> <model>` 快捷参数；`/model <profile> <model>` 设置当前 Session（尚无 Session 时设置 workspace）的 Worker。列表不是服务端模型目录。运行模型与保存配置分别显示，比较完整 profile/model/options；保存成功不等同运行已应用。
 - `/answer`：回答当前仍有效的问题，使用独立缓冲和完整 QuestionId；过期答案只能明确转为普通草稿，不会自动当新请求发送。
 - `/details`：列出当前任务及已加载历史中的工具/任务结果，选择后读取完整对象；鼠标也可从可见对象行进入。
@@ -81,17 +81,19 @@ keyboard / mouse / resize
 
 TUI 只拥有终端生命周期、当前焦点、选择、每 Session 的草稿编辑缓冲、阅读位置和有界渲染缓存。它不得直接读取 SQLite、项目文件、Git、配置文件、凭据或 provider，不得依赖 Core/Adapter，也不得从日志文字推断完成、验收或证据。
 
-当前为 TUI 补齐的 App 契约包括：幂等 Session 创建、最后活动 Session、workspace 配置解析、首次输入自动标题。Session rail 的 Draft / Needs you / Can resume 等状态也来自 App 的只读 overview；浏览列表不取得每个 Session 的 writer lease。
+当前为 TUI 补齐的 App 契约包括：幂等 Session 创建、最后活动 Session、workspace 配置解析、首次输入自动标题，以及供 Session rail 使用的 durable `SessionSummary`。摘要包含创建时间、消息计数、最近 Agent 回复的有界预览和 `projection_pending`；App 以持久 cursor 增量推进投影，每次 overview 只处理有界数量与字节量，TUI 不扫描每个 Session 的完整历史。Draft / Needs you / Can resume 等状态也来自 App 的只读 overview；浏览列表不取得每个 Session 的 writer lease。
 
 ## 正确性与性能
 
 - 视图刷新以 Session 和 generation 限制归属；提交回执以 Session 和 RequestId 核销，允许提交期间切走再切回。旧回执不能清掉新编辑。
 - 草稿按 revision 保存；提交回执只清除对应版本，用户随后输入的文字不得丢失。
 - history 是持久事实，watch 是可合并快照。历史分页按 sequence 去重并保持 cursor 单调。
+- `SessionSummary` 是 history 的 durable、bounded、incremental projection。新写入在投影已追平时与 history append 同事务推进；旧数据或落后投影由后续 overview 从持久 cursor 继续，每个 workspace overview 最多推进 64 条记录和 8 MiB payload。`projection_pending` 表示计数与预览仍只覆盖已投影前缀，Session rail 必须显示 pending，而不能把它们标成最终值。
 - 阅读旧内容时，新尾部不会抢焦点；满缓存向前补读时按真实视觉行补偿阅读锚点。
 - 共享缓存预算按用途分配：所有 Session 历史共 16 MiB，全部编辑撤销历史共 8 MiB，当前详情排版及投影缓存准入 8 MiB；当前草稿不参与淘汰。结构化结果使用紧凑无损 JSON；任务关联输入只借用当前 snapshot 的可见 ID 切片，完整列表可滚动读取，不拼接整表。超预算排版不准入缓存；不能据此宣称进程 RSS 始终不超过 32 MiB。
-- 仅 dirty 时绘制；每次状态变脏后，在接收下一个输入或运行时事件前立即提交新帧，不保留固定 ticker。渲染路径不做产品 I/O。
+- 仅 dirty 时绘制；每次状态变脏后，在接收下一个输入或运行时事件前立即提交新帧。没有常驻帧率 ticker；只有编辑焦点活跃时运行 500 ms caret 相位计时，组成 1 秒完整闪烁周期。后台草稿与 overview 计时本身不强制重绘。渲染路径不做产品 I/O。
 - raw mode、alternate screen、鼠标捕获、bracketed paste、键盘增强和光标可见性由 `TerminalSession` 与模式账本统一管理。恢复动作在尝试修改终端前登记，按逆序 best-effort 执行；失败动作保留在账本中供下一次恢复重试。可捕获的退出信号先恢复终端再进入有界 shutdown；Unix suspend 前恢复，continue 后重新进入、重新协商键盘能力并强制整帧重绘。
+- BONE 不写宿主配置，也不设置宿主字体、字号、cursor 颜色、cursor 形状、terminal title 或 palette。这些属性在应用退出后不应因 BONE 留下变化。
 
 详细自动化、PTY、性能与平台门禁见 [tui-quality-gates.md](tui-quality-gates.md)。
 
@@ -101,16 +103,16 @@ TUI 只拥有终端生命周期、当前焦点、选择、每 Session 的草稿�
 
 最新宽度调整：左栏默认 32 格；对话与 Composer 共用中栏左右各 4 格边距，不再限制 84 格最大宽度，随中栏一同拉伸。
 
-本轮视觉细化（2026-09-11）：保留 #505050 分栏线，侧栏与空详情区 #090909，主画布 #121212；正文与次要文字分级。输入正文、模型和命令提示改为内容区内缩两格，与会话标题及回复正文对齐。详见 design/tui-redesign/quiet-layout/REVIEW.md。
+本轮视觉细化（2026-09-11）：分栏使用 #282828 的连续整格背景，拖动时临时提升为 #707070；侧栏与空详情区为 #090909，主画布为 #121212。正文与次要文字分级，输入正文、模型和命令提示内缩两格，与会话标题及回复正文对齐。详见 design/tui-redesign/quiet-layout/REVIEW.md。
 
-组件尺寸更新（2026-09-11）：终端高度至少 24 行时启用舒展布局：会话条目上下各一行内边距，新建会话三行高，输入正文最少两行；标题下有横向分隔，菜单和接入字段使用两行步长。低于 24 行保持紧凑布局。用户消息、回复、标题与输入统一文字左边缘；选中会话和聚焦输入使用竖向强调线。终端字体大小由宿主终端控制，本轮未修改。详见 design/tui-redesign/comfortable-layout/REVIEW.md。
+组件尺寸更新（2026-09-11）：Session 条目固定为标题、最近回复、消息数与时间三行，条目之间另有一行分隔。终端高度至少 24 行时，输入正文最少两行，菜单和接入字段使用两行步长；低于 24 行保持紧凑布局。用户消息、回复、标题与输入统一文字左边缘。终端字体与字号由宿主终端控制，BONE 不修改。详见 design/tui-redesign/comfortable-layout/REVIEW.md。
 
-跨平台可读性：正文 #eeeeee，次要文字 #aeaeae；普通会话标题不再降为次要文字亮度。输入、用户消息和选中项共用四分之一格标记。字体与实际字号由宿主终端负责；BONE 通过 Cell 密度、显式颜色和语义层级保持一致，不把修改宿主字体作为前提。
+跨平台可读性：正文 #eeeeee，次要文字 #aeaeae；普通会话标题不再降为次要文字亮度。所有正文和辅助信息使用宿主终端的同一 Cell 字号，不制造“小字”层；只有短结构标签使用统一 label 粗度，正文不使用 DIM。字体像素仍由宿主终端负责；BONE 通过 Cell 密度、显式颜色和语义层级保持一致，不把修改宿主字体作为前提。
 
-连续栏界与字重更新：左右栏界改为一列 #282828 背景色单元格，覆盖完整行高，不依赖 │ 字形拼接。正文保持 regular；产品名、面板标题和当前 selection 统一使用语义 label 粗度，并同时依赖亮度、背景或间距形成层级。输入正文仍默认两行。
+连续栏界与字重更新：左右栏界改为一列背景色单元格，覆盖完整行高，不依赖 `│` 字形拼接。正文保持 regular；区域标题、面板标题、输入提示和快捷键 chord 使用同一个语义 label 粗度，并同时依赖亮度、背景或间距形成层级。输入正文默认两行，下面只有一行 status baseline。
 
-栏宽拖动：按住左右分隔条并拖动，调整对应侧栏；拖动中以橙色标记，松开结束。左右侧栏各至少 24 列，对话区至少 56 列（含内边距）。窗口缩小时临时约束显示宽度，放大后恢复用户偏好；切换会话或面板保留栏宽。宽度目前保存在本次运行的 UI 状态中，重启恢复默认。Esc 或窗口尺寸变化结束拖动；拖动经过编辑区不修改草稿。两栏模式只提供左分隔条，单栏不显示拖动入口。
+栏宽拖动：按住左右分隔条并拖动，调整对应侧栏；拖动中使用明亮中性结构色，松开结束。左右侧栏各至少 24 列，对话区至少 56 列（含内边距）。窗口缩小时临时约束显示宽度，放大后恢复用户偏好；切换会话或面板保留栏宽。宽度目前保存在本次运行的 UI 状态中，重启恢复默认。Esc 或窗口尺寸变化结束拖动；拖动经过编辑区不修改草稿。面板打开时分隔条保持可见但不接收鼠标。两栏模式只提供左分隔条，单栏不显示拖动入口。
 
-输入区细化：输入框和用户消息左侧使用统一的四分之一格标记，输入框沿用现有焦点配色，用户消息使用中性灰。模型及运行/保存状态移到输入框外的统一 status baseline；Shift+Enter、Ctrl+C、Ctrl+D 的可见提示直接来自正式 keymap，并按可用宽度省略；发送提示保持右对齐。slash 建议保持 Composer caret；切换 Session 时若 Composer 原本聚焦则继续聚焦，键盘 Session 导航和其他焦点规则保持原语义。
+输入区细化：Composer 与内联 Session 标题编辑器只在可见相位绘制应用 caret，没有焦点 gutter 或橙色短轨；用户消息不复用焦点色。模型及运行/保存状态位于输入框外的统一 status baseline；Shift+Enter、Ctrl+C、Ctrl+D 的可见提示直接来自正式 keymap，并按可用宽度省略；发送提示保持右对齐。输入 `/` 打开的命令面板与其他面板使用同一套中性表面、标题、分隔和选中样式，同时仍附着于 Composer 并保留 caret。切换 Session 会保留 `Sessions`、`SessionTitle`、`Composer` 或 `RightRail` 中当前所在的区域。
 
-标记粗度统一：输入框、用户消息与左栏选中项共用四分之一字符格的 ▎ 标记，显式移除标记上的 BOLD 属性；正文保持 regular，只有短结构标签使用统一 label 粗度。左右可拖动栏界仍采用连续背景色分隔。
+焦点表达统一：`Sessions` 通过浅中性的 `SELECTED` 候选背景表达键盘位置，当前 Session 另用始终可见的左侧橙色身份条；`SessionTitle` 与 `Composer` 只通过 1 秒周期的 caret 表达焦点；`RightRail` 与独占面板使用中性背景层级。Conversation 没有独立 focus，任何区域都不使用焦点 gutter 或橙色短轨。橙色只可能出现在当前 Session 身份条和当前可见 caret 上。

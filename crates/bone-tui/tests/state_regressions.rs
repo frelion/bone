@@ -266,14 +266,33 @@ fn edited_failed_new_does_not_replay_and_explicit_retry_reuses_identity() {
 
 #[test]
 fn escape_dismisses_slash_palette_without_destroying_its_draft() {
+    for draft in ["/n", "/does-not-exist"] {
+        let mut state = UiState::default();
+        paste(&mut state, draft);
+        assert!(state.slash_palette_visible());
+        let identity = state.draft_identity();
+        assert!(update(&mut state, UiEvent::Action(Action::Escape)).is_empty());
+        assert_eq!(state.orphan_draft, draft);
+        assert_eq!(state.slash_dismissed, Some(identity));
+        assert!(!state.slash_palette_visible());
+        assert!(state.slash_matches().is_empty());
+        assert_eq!(state.focus, Focus::Composer);
+    }
+}
+
+#[test]
+fn a_slash_draft_does_not_capture_escape_after_focus_leaves_the_composer() {
     let mut state = UiState::default();
-    paste(&mut state, "/n");
-    assert!(!state.slash_matches().is_empty());
-    let identity = state.draft_identity();
-    assert!(update(&mut state, UiEvent::Action(Action::Escape)).is_empty());
-    assert_eq!(state.orphan_draft, "/n");
-    assert_eq!(state.slash_dismissed, Some(identity));
-    assert!(state.slash_matches().is_empty());
+    paste(&mut state, "/");
+    assert!(state.slash_palette_visible());
+    update(&mut state, UiEvent::Action(Action::FocusLeft));
+    assert_eq!(state.focus, Focus::Sessions);
+    assert!(!state.slash_palette_visible());
+
+    update(&mut state, UiEvent::Action(Action::Escape));
+
+    assert_eq!(state.orphan_draft, "/");
+    assert_eq!(state.slash_dismissed, None);
 }
 
 #[test]
@@ -443,7 +462,7 @@ fn rail_viewport_keeps_selection_visible_and_footer_hits_the_rail() {
         Rect::new(0, 0, 120, 14),
         SinglePane::Conversation,
         0,
-        &[2; 20],
+        &[4; 20],
         Some(17),
         1,
     );
@@ -467,7 +486,7 @@ fn rail_viewport_keeps_selection_visible_and_footer_hits_the_rail() {
     update(&mut state, UiEvent::Action(Action::SelectSession(target)));
     assert_eq!(state.selected, Some(target));
     assert_eq!(state.session_candidate, Some(target));
-    assert_eq!(state.focus, Focus::Conversation);
+    assert_eq!(state.focus, Focus::Sessions);
     let rendered = render_plan(&state, 120, 14);
     let rail = rendered.session_rail.unwrap();
     assert_eq!(
@@ -502,18 +521,25 @@ fn session_rail_renders_draft_attention_and_recoverable_statuses() {
             view::render(frame, &state);
         })
         .expect("render session statuses");
-    let screen: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect();
-    for expected in ["· draft session", "Needs you", "Can resume"] {
+    let buffer = terminal.backend().buffer();
+    let screen: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+    for expected in ["draft session", "attention session", "recoverable session"] {
         assert!(
             screen.contains(expected),
             "missing {expected:?} in {screen:?}"
         );
+    }
+    assert_eq!(
+        buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == "•")
+            .count(),
+        3,
+        "each semantic Session status should remain visible without replacing the fixed three-line content"
+    );
+    for obsolete_label in ["Needs you", "Can resume"] {
+        assert!(!screen.contains(obsolete_label));
     }
 }
 

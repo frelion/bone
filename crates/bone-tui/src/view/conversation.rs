@@ -10,11 +10,8 @@ use ratatui::{
 use crate::{
     layout::{HitRegion, HitTarget, LayoutMode, LayoutPlan, TranscriptMetrics},
     state::{CommandSpec, UiState},
-    ui::{interaction::HitMap, theme},
-    view::{
-        ACCENT, ATTENTION, INK, MUTED, PANEL, composer, message, single_line_external,
-        slash_palette,
-    },
+    ui::{caret, focus, interaction::HitMap, theme},
+    view::{INK, MUTED, PANEL, SELECTED, composer, message, single_line_external, slash_palette},
 };
 
 pub(super) fn render(
@@ -23,7 +20,6 @@ pub(super) fn render(
     hits: &mut HitMap,
     state: &UiState,
     slash_matches: &[&CommandSpec],
-    slash_start: usize,
 ) -> Option<TranscriptMetrics> {
     if plan.mode == LayoutMode::TooSmall {
         render_too_small(frame, plan.conversation.unwrap_or(plan.screen), state);
@@ -36,10 +32,10 @@ pub(super) fn render(
     };
     render_header(frame, header, state);
     if crate::layout::comfortable(plan.screen) {
-        frame.render_widget(
-            Paragraph::new("─".repeat(usize::from(transcript.width)))
-                .style(Style::default().fg(super::DIVIDER)),
+        paint_rule(
+            frame,
             Rect::new(transcript.x, header.y + 2, transcript.width, 1),
+            theme::STRUCTURE,
         );
     }
     let metrics = render_transcript(frame, transcript, state, hits);
@@ -64,6 +60,7 @@ pub(super) fn render(
                 })
         })
         .unwrap_or_default();
+    let status_tone = status_tone(state);
     let status_area = Rect::new(
         composer_area.x + 2,
         composer_area
@@ -74,7 +71,7 @@ pub(super) fn render(
     );
     if state.panel.is_none() {
         frame.render_widget(
-            Paragraph::new(single_line_external(&status)).style(Style::default().fg(ACCENT)),
+            Paragraph::new(single_line_external(&status)).style(theme::body(status_tone)),
             status_area,
         );
     }
@@ -91,7 +88,7 @@ pub(super) fn render(
             ("Question ended · keep as draft", HitTarget::ConvertAnswer)
         };
         frame.render_widget(
-            Paragraph::new(label).style(Style::default().fg(ACCENT).bg(PANEL)),
+            Paragraph::new(label).style(theme::body_on(theme::WARNING, PANEL)),
             status_area,
         );
         hits.push(HitRegion {
@@ -101,7 +98,7 @@ pub(super) fn render(
     }
     composer::render(frame, composer_area, state);
     if let Some(area) = plan.slash_palette {
-        slash_palette::render(frame, area, state, slash_matches, slash_start);
+        slash_palette::render(frame, plan.screen, area, hits, state, slash_matches);
     }
     metrics
 }
@@ -113,6 +110,30 @@ fn problem_hint(problem: &bone_app::AppProblem, width: u16) -> &'static str {
         bone_app::AppProblem::LoginRequired(_) if width >= 20 => "Needs login · /model",
         bone_app::AppProblem::LoginRequired(_) => "Login: /model",
         _ => super::session_rail::problem_status(problem).0,
+    }
+}
+
+fn status_tone(state: &UiState) -> ratatui::style::Color {
+    if state.status.is_some() {
+        return MUTED;
+    }
+    let Some(ui) = state.selected_ui() else {
+        return MUTED;
+    };
+    let Some(snapshot) = &ui.snapshot else {
+        return MUTED;
+    };
+    if let Some(problem) = &snapshot.problem {
+        super::session_rail::problem_status(problem).1
+    } else if ui.read_anchor.is_some()
+        || matches!(
+            snapshot.runtime,
+            RuntimeState::Starting | RuntimeState::Running { .. }
+        )
+    {
+        theme::INFO
+    } else {
+        MUTED
     }
 }
 
@@ -131,20 +152,79 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 " Draft preserved."
             }
         ))
-        .style(Style::default().fg(ATTENTION))
+        .style(theme::body(theme::WARNING))
         .wrap(Wrap { trim: false }),
         area,
     );
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let title = state
-        .selected_ui()
-        .map_or("New conversation", |ui| ui.info.title.as_str());
+    let focused = focus::is_active(state, focus::Region::SessionTitle) && state.selected.is_some();
+    let fallback = state.title_text().unwrap_or("New conversation");
+    let (title, cursor, selection_cells) = if focused {
+        state
+            .title_edit
+            .as_ref()
+            .filter(|edit| {
+                state
+                    .selected_ui()
+                    .is_some_and(|ui| edit.target == ui.info.id)
+            })
+            .map_or_else(
+                || (single_line_external(fallback), 0, Vec::new()),
+                |edit| {
+                    let viewport = crate::editor::single_line_editor_viewport(
+                        &edit.text,
+                        edit.cursor,
+                        area.width,
+                        edit.editor.viewport(),
+                    );
+                    let selection_cells =
+                        edit.editor
+                            .selection(edit.cursor)
+                            .map_or_else(Vec::new, |selection| {
+                                crate::editor::single_line_selection_cells(
+                                    &edit.text,
+                                    edit.editor.viewport_origin(),
+                                    area.width,
+                                    selection,
+                                )
+                            });
+                    (viewport.0, viewport.1, selection_cells)
+                },
+            )
+    } else {
+        (single_line_external(fallback), 0, Vec::new())
+    };
+    frame.render_widget(Block::default().style(theme::surface(PANEL)), area);
     frame.render_widget(
-        Paragraph::new(single_line_external(title)).style(theme::label_on(INK, PANEL)),
+        Paragraph::new(title).style(theme::label_on(INK, PANEL)),
         area,
     );
+    for (x, width) in selection_cells {
+        for dx in 0..width {
+            frame.buffer_mut()[(area.x + x + dx, area.y)]
+                .set_bg(SELECTED)
+                .set_fg(INK);
+        }
+    }
+    if focused && area.width > 0 {
+        caret::place(
+            frame,
+            (area.x + cursor.min(area.width.saturating_sub(1)), area.y),
+            state.caret_visible,
+        );
+    }
+}
+
+fn paint_rule(frame: &mut Frame<'_>, area: Rect, tone: ratatui::style::Color) {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            frame.buffer_mut()[(x, y)]
+                .set_symbol("─")
+                .set_style(theme::body_on(tone, PANEL));
+        }
+    }
 }
 
 fn reader_selects(state: &UiState, source: crate::state::reader::ReaderSource) -> bool {
@@ -251,7 +331,7 @@ fn render_transcript(
             }
             if matches!(job.state, JobState::Running | JobState::Waiting(_)) {
                 let mut line =
-                    message::compact("›", &format!("{}  [details]", job.goal), ATTENTION);
+                    message::compact("›", &format!("{}  [details]", job.goal), theme::INFO);
                 if reader_selects(state, crate::state::reader::ReaderSource::Job(job.id)) {
                     line.style = line.style.bg(super::SELECTED);
                 }
@@ -305,14 +385,14 @@ fn render_transcript(
                     rows.extend(message::body_rows(
                         question.text,
                         usize::from(inner.width),
-                        ATTENTION,
+                        theme::WARNING,
                     ));
                 }
                 links.push((rows.len(), HitTarget::Answer(question.id)));
                 rows.push(message::compact(
                     "?",
                     &format!("[answer] {}", question.text),
-                    ATTENTION,
+                    theme::WARNING,
                 ));
             }
             for candidate in crate::state::answer::recoverable_inputs(snapshot, &session.history) {
@@ -327,7 +407,7 @@ fn render_transcript(
                     ),
                 };
                 links.push((rows.len(), target));
-                rows.push(message::compact("↳", &label, ACCENT));
+                rows.push(message::compact("↳", &label, theme::INFO));
             }
         }
         if session
@@ -339,7 +419,7 @@ fn render_transcript(
             rows.push(message::compact(
                 "↳",
                 "Retry original submission",
-                ATTENTION,
+                theme::DANGER,
             ));
         }
     }
@@ -451,6 +531,104 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn title_focus_uses_only_the_blinking_caret_and_keeps_the_rule_neutral() {
+        let header = Rect::new(4, 1, 30, 1);
+        let rule = Rect::new(2, 3, 32, 1);
+        for (focus_state, panel, caret_visible, expected_orange_cells) in [
+            (crate::state::Focus::SessionTitle, None, true, 1),
+            (crate::state::Focus::SessionTitle, None, false, 0),
+            (crate::state::Focus::Composer, None, true, 0),
+            (
+                crate::state::Focus::SessionTitle,
+                Some(crate::state::Panel::Help),
+                true,
+                0,
+            ),
+        ] {
+            let (mut state, _) = fixture();
+            state.focus = focus_state;
+            state.panel = panel;
+            state.caret_visible = caret_visible;
+            assert!(state.begin_title_edit());
+            let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_header(frame, header, &state);
+                    paint_rule(frame, rule, theme::STRUCTURE);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for x in rule.x..rule.right() {
+                assert_eq!(buffer[(x, rule.y)].symbol(), "─");
+                assert_eq!(buffer[(x, rule.y)].fg, theme::STRUCTURE);
+                assert_eq!(buffer[(x, rule.y)].bg, PANEL);
+            }
+            assert_eq!(buffer[(header.x, header.y)].symbol(), "t");
+            let orange_cells = buffer
+                .content()
+                .iter()
+                .filter(|cell| cell.fg == theme::FOCUS_MARK || cell.bg == theme::FOCUS_MARK)
+                .count();
+            assert_eq!(orange_cells, expected_orange_cells);
+        }
+    }
+
+    #[test]
+    fn title_selection_uses_neutral_cells_in_the_scrolled_unicode_viewport() {
+        let (mut state, _) = fixture();
+        let title = "ab中e\u{301}🙂zTAIL";
+        let selected_from = title.find('z').unwrap();
+        let session = state.selected.unwrap();
+        state
+            .sessions
+            .iter_mut()
+            .find(|info| info.id == session)
+            .unwrap()
+            .title = title.into();
+        state.session_ui.get_mut(&session).unwrap().info.title = title.into();
+        state.focus = crate::state::Focus::SessionTitle;
+        state.caret_visible = true;
+        assert!(state.begin_title_edit());
+        {
+            let mut editor = state.title_editor_mut();
+            editor.begin_pointer_selection(selected_from);
+            editor.extend_pointer_selection(title.len());
+        }
+
+        let header = Rect::new(2, 1, 8, 1);
+        let mut terminal = Terminal::new(TestBackend::new(12, 3)).unwrap();
+        terminal
+            .draw(|frame| render_header(frame, header, &state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer[(header.x, header.y)].symbol(), "🙂");
+        assert_eq!(buffer[(header.x, header.y)].bg, PANEL);
+        // Ratatui deliberately resets and skips the hidden continuation cell of
+        // a wide grapheme. The leading cell's style paints both terminal columns.
+        assert_eq!(buffer[(header.x + 1, header.y)].symbol(), " ");
+        assert_eq!(
+            buffer[(header.x + 1, header.y)].bg,
+            ratatui::style::Color::Reset
+        );
+        for x in 2..7 {
+            let cell = &buffer[(header.x + x, header.y)];
+            assert_eq!(cell.bg, SELECTED);
+            assert_eq!(cell.fg, INK);
+        }
+        assert_eq!(buffer[(header.x + 7, header.y)].bg, theme::FOCUS_MARK);
+        assert_ne!(SELECTED, theme::FOCUS_MARK);
+        assert_eq!(
+            buffer
+                .content()
+                .iter()
+                .filter(|cell| cell.fg == theme::FOCUS_MARK || cell.bg == theme::FOCUS_MARK)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn configuration_and_login_hints_keep_the_next_command_visible() {
         let configuration =
             bone_app::AppProblem::Configuration(bone_app::ConfigProblem::NeedsModel);
@@ -462,6 +640,27 @@ mod tests {
                 assert!(unicode_width::UnicodeWidthStr::width(label) <= usize::from(width));
             }
         }
+    }
+
+    #[test]
+    fn status_tone_uses_typed_state_and_keeps_untyped_text_neutral() {
+        let (mut state, _) = fixture();
+        assert_eq!(status_tone(&state), theme::INFO);
+
+        state.status = Some("opaque external status".into());
+        assert_eq!(status_tone(&state), MUTED);
+        state.status = None;
+
+        Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap()).problem = Some(
+            bone_app::AppProblem::Configuration(bone_app::ConfigProblem::NeedsModel),
+        );
+        assert_eq!(status_tone(&state), theme::WARNING);
+        assert_ne!(status_tone(&state), theme::FOCUS_MARK);
+
+        Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap()).problem =
+            Some(bone_app::AppProblem::Provider("offline".into()));
+        assert_eq!(status_tone(&state), theme::DANGER);
+        assert_ne!(status_tone(&state), theme::FOCUS_MARK);
     }
 
     fn fixture() -> (UiState, QuestionId) {

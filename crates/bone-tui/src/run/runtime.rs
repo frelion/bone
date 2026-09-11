@@ -1,6 +1,7 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use bone_app::{App, CreateSessionRequest, Session, SessionId};
+use futures_util::{FutureExt, future::Shared};
 use tokio::{sync::mpsc, task::AbortHandle};
 
 use crate::state::{Effect, OperationKind, UiEvent, UiState};
@@ -10,6 +11,28 @@ use super::{RunError, summarize_overview};
 const HISTORY_PAGE: usize = 32;
 const DRAFT_DEBOUNCE: Duration = Duration::from_millis(250);
 
+#[derive(Clone, Debug)]
+enum SessionOperationOutcome {
+    Renamed(Result<String, Arc<str>>),
+    AutoTitled(Result<Option<String>, Arc<str>>),
+    Released(Result<bone_app::SessionReleaseReceipt, Arc<str>>),
+}
+
+type SharedSessionOperation =
+    Shared<futures_util::future::BoxFuture<'static, SessionOperationOutcome>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionOperationToken {
+    Rename(u64),
+    AutoTitle(u64),
+    Release(u64),
+}
+
+struct PendingSessionOperation {
+    token: SessionOperationToken,
+    future: SharedSessionOperation,
+}
+
 pub(super) struct Runtime {
     login: Option<AbortHandle>,
     app: App,
@@ -17,6 +40,7 @@ pub(super) struct Runtime {
     sessions: BTreeMap<SessionId, Session>,
     observers: BTreeMap<SessionId, AbortHandle>,
     draft_saves: BTreeMap<SessionId, AbortHandle>,
+    session_operations: BTreeMap<SessionId, PendingSessionOperation>,
     // Kept across failed or timed-out exit flushes, including late create receipts.
     exit_draft_request: Option<CreateSessionRequest>,
     tx: mpsc::Sender<UiEvent>,
@@ -53,6 +77,7 @@ impl Runtime {
             sessions: BTreeMap::new(),
             observers: BTreeMap::new(),
             draft_saves: BTreeMap::new(),
+            session_operations: BTreeMap::new(),
             exit_draft_request: None,
             tx,
             ready_tx,
@@ -339,41 +364,62 @@ impl Runtime {
             }
             Effect::RenameSession {
                 session,
-                generation,
+                request,
                 title,
             } => {
-                let handle = self.sessions.get(&session).cloned();
                 let app = self.app.clone();
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
+                let previous = self
+                    .session_operations
+                    .get(&session)
+                    .map(|operation| operation.future.clone());
+                let future = async move {
+                    if let Some(previous) = previous {
+                        let _ = previous.await;
+                    }
                     let result = async {
-                        let handle = match handle {
-                            Some(value) => value,
-                            None => app.session(session).await?,
-                        };
+                        // Resolve after the per-Session barrier. A release ahead
+                        // of this operation may have closed the cached actor.
+                        let handle = app.session(session).await?;
                         handle.rename(title.clone()).await?;
                         Ok::<_, bone_app::Error>(title)
                     }
-                    .await;
-                    match result {
-                        Ok(title) => {
+                    .await
+                    .map_err(|error| Arc::<str>::from(error.to_string()));
+                    SessionOperationOutcome::Renamed(result)
+                }
+                .boxed()
+                .shared();
+                self.session_operations.insert(
+                    session,
+                    PendingSessionOperation {
+                        token: SessionOperationToken::Rename(request),
+                        future: future.clone(),
+                    },
+                );
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    match future.await {
+                        SessionOperationOutcome::Renamed(Ok(title)) => {
                             let _ = tx
                                 .send(UiEvent::SessionRenamed {
                                     session,
-                                    generation,
+                                    request,
                                     title,
                                 })
                                 .await;
                         }
-                        Err(_) => {
-                            send_failure(
-                                &tx,
-                                OperationKind::RenameSession,
-                                Some(session),
-                                Some(generation),
-                                "Unable to rename the session".into(),
-                            )
-                            .await
+                        SessionOperationOutcome::Renamed(Err(_)) => {
+                            let _ = tx
+                                .send(UiEvent::SessionRenameFailed {
+                                    session,
+                                    request,
+                                    message: "Unable to rename the session".into(),
+                                })
+                                .await;
+                        }
+                        SessionOperationOutcome::AutoTitled(_)
+                        | SessionOperationOutcome::Released(_) => {
+                            unreachable!("manual title future returned an auto-title outcome")
                         }
                     }
                 });
@@ -381,36 +427,53 @@ impl Runtime {
             Effect::AutoTitle {
                 session,
                 generation,
+                request,
                 first_input,
             } => {
-                let handle = self.sessions.get(&session).cloned();
                 let app = self.app.clone();
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
+                let previous = self
+                    .session_operations
+                    .get(&session)
+                    .map(|operation| operation.future.clone());
+                let future = async move {
+                    if let Some(previous) = previous {
+                        let _ = previous.await;
+                    }
                     let result = async {
-                        let handle = match handle {
-                            Some(value) => value,
-                            None => app.session(session).await?,
-                        };
+                        let handle = app.session(session).await?;
                         if handle.title_from_first_input(&first_input).await? {
                             Ok::<_, bone_app::Error>(Some(handle.snapshot().await?.session.title))
                         } else {
                             Ok(None)
                         }
                     }
-                    .await;
-                    match result {
-                        Ok(Some(title)) => {
+                    .await
+                    .map_err(|error| Arc::<str>::from(error.to_string()));
+                    SessionOperationOutcome::AutoTitled(result)
+                }
+                .boxed()
+                .shared();
+                self.session_operations.insert(
+                    session,
+                    PendingSessionOperation {
+                        token: SessionOperationToken::AutoTitle(request),
+                        future: future.clone(),
+                    },
+                );
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    match future.await {
+                        SessionOperationOutcome::AutoTitled(Ok(Some(title))) => {
                             let _ = tx
-                                .send(UiEvent::SessionRenamed {
+                                .send(UiEvent::SessionAutoTitled {
                                     session,
-                                    generation,
+                                    request,
                                     title,
                                 })
                                 .await;
                         }
-                        Ok(None) => {}
-                        Err(_) => {
+                        SessionOperationOutcome::AutoTitled(Ok(None)) => {}
+                        SessionOperationOutcome::AutoTitled(Err(_)) => {
                             send_failure(
                                 &tx,
                                 OperationKind::AutoTitle,
@@ -419,6 +482,10 @@ impl Runtime {
                                 "The session title could not be updated".into(),
                             )
                             .await
+                        }
+                        SessionOperationOutcome::Renamed(_)
+                        | SessionOperationOutcome::Released(_) => {
+                            unreachable!("auto-title future returned a manual title outcome")
                         }
                     }
                 });
@@ -665,12 +732,13 @@ impl Runtime {
                 tokio::spawn(async move {
                     match app.workspace_overview(workspace).await {
                         Ok(overview) => {
-                            let (sessions, statuses) = summarize_overview(&overview);
+                            let (sessions, statuses, summaries) = summarize_overview(&overview);
                             let _ = tx
                                 .send(UiEvent::OverviewLoaded {
                                     generation,
                                     sessions,
                                     statuses,
+                                    summaries,
                                 })
                                 .await;
                         }
@@ -692,10 +760,33 @@ impl Runtime {
                 generation,
             } => {
                 let app = self.app.clone();
+                let previous = self
+                    .session_operations
+                    .get(&session)
+                    .map(|operation| operation.future.clone());
+                let future = async move {
+                    if let Some(previous) = previous {
+                        let _ = previous.await;
+                    }
+                    SessionOperationOutcome::Released(
+                        app.release_session(session)
+                            .await
+                            .map_err(|error| Arc::<str>::from(error.to_string())),
+                    )
+                }
+                .boxed()
+                .shared();
+                self.session_operations.insert(
+                    session,
+                    PendingSessionOperation {
+                        token: SessionOperationToken::Release(generation),
+                        future: future.clone(),
+                    },
+                );
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
-                    match app.release_session(session).await {
-                        Ok(receipt) => {
+                    match future.await {
+                        SessionOperationOutcome::Released(Ok(receipt)) => {
                             let _ = tx
                                 .send(UiEvent::SessionReleased {
                                     generation,
@@ -703,7 +794,7 @@ impl Runtime {
                                 })
                                 .await;
                         }
-                        Err(_) => {
+                        SessionOperationOutcome::Released(Err(_)) => {
                             send_failure(
                                 &tx,
                                 OperationKind::ReleaseSession,
@@ -712,6 +803,10 @@ impl Runtime {
                                 "Unable to release the session".into(),
                             )
                             .await
+                        }
+                        SessionOperationOutcome::Renamed(_)
+                        | SessionOperationOutcome::AutoTitled(_) => {
+                            unreachable!("release future returned a title outcome")
                         }
                     }
                 });
@@ -836,6 +931,36 @@ impl Runtime {
     }
 
     pub(super) fn accept_event(&mut self, event: &UiEvent, _state: &UiState) {
+        let completed_operation = match event {
+            UiEvent::SessionRenamed {
+                session, request, ..
+            }
+            | UiEvent::SessionRenameFailed {
+                session, request, ..
+            } => Some((*session, SessionOperationToken::Rename(*request))),
+            UiEvent::SessionAutoTitled {
+                session, request, ..
+            } => Some((*session, SessionOperationToken::AutoTitle(*request))),
+            UiEvent::SessionReleased {
+                generation,
+                receipt,
+            } => Some((receipt.session, SessionOperationToken::Release(*generation))),
+            UiEvent::OperationFailed {
+                kind: OperationKind::ReleaseSession,
+                session: Some(session),
+                generation: Some(generation),
+                ..
+            } => Some((*session, SessionOperationToken::Release(*generation))),
+            _ => None,
+        };
+        if let Some((session, token)) = completed_operation
+            && self
+                .session_operations
+                .get(&session)
+                .is_some_and(|operation| operation.token == token)
+        {
+            self.session_operations.remove(&session);
+        }
         if let UiEvent::SessionReleased { receipt, .. } = event
             && matches!(
                 receipt.status,
@@ -852,10 +977,7 @@ impl Runtime {
         }
     }
 
-    pub(super) async fn flush_drafts(
-        &mut self,
-        state: &mut UiState,
-    ) -> Result<(), bone_app::Error> {
+    pub(super) async fn flush_drafts(&mut self, state: &mut UiState) -> Result<(), String> {
         for task in self.draft_saves.values() {
             task.abort();
         }
@@ -889,7 +1011,7 @@ impl Runtime {
             None
         };
 
-        let mut first_error = None;
+        let mut first_error = self.flush_title_writes().await.err();
         for (id, ui) in &state.session_ui {
             if ui.draft_revision > ui.saved_draft_revision {
                 let session = match self.sessions.get(id).cloned() {
@@ -899,11 +1021,11 @@ impl Runtime {
                 match session {
                     Ok(session) => {
                         if let Err(error) = session.save_draft(ui.draft.clone()).await {
-                            first_error.get_or_insert(error);
+                            first_error.get_or_insert_with(|| error.to_string());
                         }
                     }
                     Err(error) => {
-                        first_error.get_or_insert(error);
+                        first_error.get_or_insert_with(|| error.to_string());
                     }
                 }
             }
@@ -912,9 +1034,19 @@ impl Runtime {
             return Err(error);
         }
         if let Some(request) = exit_request {
-            let session = self.app.create_session_idempotent(request.clone()).await?;
-            let snapshot = session.snapshot().await?;
-            session.save_draft(state.orphan_draft.clone()).await?;
+            let session = self
+                .app
+                .create_session_idempotent(request.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            let snapshot = session
+                .snapshot()
+                .await
+                .map_err(|error| error.to_string())?;
+            session
+                .save_draft(state.orphan_draft.clone())
+                .await
+                .map_err(|error| error.to_string())?;
             let info = snapshot.session;
             let ui = state
                 .session_ui
@@ -943,6 +1075,21 @@ impl Runtime {
             self.exit_draft_request = None;
         }
         Ok(())
+    }
+
+    async fn flush_title_writes(&self) -> Result<(), String> {
+        let futures = self
+            .session_operations
+            .values()
+            .map(|operation| operation.future.clone())
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for outcome in futures_util::future::join_all(futures).await {
+            if let SessionOperationOutcome::Renamed(Err(error)) = outcome {
+                first_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub(super) async fn shutdown(mut self) -> Result<(), bone_app::Error> {
@@ -997,6 +1144,185 @@ async fn model_applied(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    async fn runtime_with_provisional_session() -> (
+        tempfile::TempDir,
+        App,
+        Session,
+        Runtime,
+        mpsc::Receiver<UiEvent>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
+            .await
+            .unwrap();
+        let workspace = app.open_workspace(root.path()).await.unwrap();
+        let session = app
+            .create_session_idempotent(CreateSessionRequest {
+                request_id: bone_app::RequestId::new(),
+                workspace: workspace.id,
+                title: "New conversation".into(),
+                provisional: true,
+            })
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        let (ready_tx, _ready_rx) = mpsc::channel(1);
+        let runtime = Runtime::new(app.clone(), workspace.id, tx, ready_tx);
+        (root, app, session, runtime, rx)
+    }
+
+    fn gated_operation(gate: Arc<tokio::sync::Notify>) -> SharedSessionOperation {
+        async move {
+            gate.notified().await;
+            SessionOperationOutcome::AutoTitled(Ok(None))
+        }
+        .boxed()
+        .shared()
+    }
+
+    #[tokio::test]
+    async fn auto_title_then_manual_rename_are_durable_in_effect_order() {
+        let (_root, app, session, mut runtime, _rx) = runtime_with_provisional_session().await;
+        let id = session.snapshot().await.unwrap().session.id;
+
+        runtime
+            .apply(Effect::AutoTitle {
+                session: id,
+                generation: 1,
+                request: 1,
+                first_input: "Automatic title from this first input".into(),
+            })
+            .await
+            .unwrap();
+        runtime
+            .apply(Effect::RenameSession {
+                session: id,
+                request: 2,
+                title: "Manual title".into(),
+            })
+            .await
+            .unwrap();
+
+        runtime.flush_title_writes().await.unwrap();
+        assert_eq!(
+            app.session(id)
+                .await
+                .unwrap()
+                .snapshot()
+                .await
+                .unwrap()
+                .session
+                .title,
+            "Manual title"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn title_after_release_waits_for_release_and_reopens_the_actor() {
+        let (_root, app, session, mut runtime, _rx) = runtime_with_provisional_session().await;
+        let id = session.snapshot().await.unwrap().session.id;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        runtime.session_operations.insert(
+            id,
+            PendingSessionOperation {
+                token: SessionOperationToken::AutoTitle(99),
+                future: gated_operation(gate.clone()),
+            },
+        );
+
+        runtime
+            .apply(Effect::ReleaseSession {
+                session: id,
+                generation: 2,
+            })
+            .await
+            .unwrap();
+        runtime
+            .apply(Effect::RenameSession {
+                session: id,
+                request: 3,
+                title: "Rename after release".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), runtime.flush_title_writes())
+                .await
+                .is_err(),
+            "the outer exit deadline may stop waiting without cancelling the write chain"
+        );
+        assert_eq!(
+            session.snapshot().await.unwrap().session.title,
+            "New conversation"
+        );
+        gate.notify_one();
+        runtime.flush_title_writes().await.unwrap();
+        assert_eq!(
+            app.session(id)
+                .await
+                .unwrap()
+                .snapshot()
+                .await
+                .unwrap()
+                .session
+                .title,
+            "Rename after release"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_after_title_waits_until_the_title_is_durable() {
+        let (_root, app, session, mut runtime, _rx) = runtime_with_provisional_session().await;
+        let id = session.snapshot().await.unwrap().session.id;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        runtime.session_operations.insert(
+            id,
+            PendingSessionOperation {
+                token: SessionOperationToken::AutoTitle(99),
+                future: gated_operation(gate.clone()),
+            },
+        );
+
+        runtime
+            .apply(Effect::RenameSession {
+                session: id,
+                request: 3,
+                title: "Rename before release".into(),
+            })
+            .await
+            .unwrap();
+        runtime
+            .apply(Effect::ReleaseSession {
+                session: id,
+                generation: 4,
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            session.snapshot().await.unwrap().session.title,
+            "New conversation"
+        );
+
+        gate.notify_one();
+        runtime.flush_title_writes().await.unwrap();
+        assert_eq!(
+            app.session(id)
+                .await
+                .unwrap()
+                .snapshot()
+                .await
+                .unwrap()
+                .session
+                .title,
+            "Rename before release"
+        );
+        runtime.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn exit_saves_orphan_to_existing_create_identity_without_submitting() {

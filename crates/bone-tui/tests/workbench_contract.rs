@@ -220,7 +220,7 @@ fn drafts_and_submission_receipts_remain_bound_to_their_session_and_identity() {
 }
 
 #[test]
-fn public_horizontal_focus_actions_cross_the_left_center_boundary() {
+fn public_focus_actions_restore_the_center_region_the_user_left() {
     let workspace = WorkspaceId::new();
     let info = session(workspace, "focus");
     let mut state = opened_state(&[info]);
@@ -229,11 +229,16 @@ fn public_horizontal_focus_actions_cross_the_left_center_boundary() {
     update(&mut state, UiEvent::Action(Action::FocusLeft));
     assert_eq!(state.focus, Focus::Sessions);
     update(&mut state, UiEvent::Action(Action::FocusRight));
-    assert_eq!(state.focus, Focus::Conversation);
+    assert_eq!(state.focus, Focus::Composer);
+
+    update(&mut state, UiEvent::Action(Action::FocusUp));
+    assert_eq!(state.focus, Focus::SessionTitle);
+    update(&mut state, UiEvent::Action(Action::FocusLeft));
+    assert_eq!(state.focus, Focus::Sessions);
+    update(&mut state, UiEvent::Action(Action::FocusRight));
+    assert_eq!(state.focus, Focus::SessionTitle);
     update(&mut state, UiEvent::Action(Action::FocusDown));
     assert_eq!(state.focus, Focus::Composer);
-    update(&mut state, UiEvent::Action(Action::FocusUp));
-    assert_eq!(state.focus, Focus::Conversation);
 }
 
 #[test]
@@ -254,7 +259,7 @@ fn composer_geometry_is_contained_by_the_center_surface() {
 }
 
 #[test]
-fn blank_space_has_no_phantom_hit_targets() {
+fn right_rail_is_an_explicit_focus_target_without_phantom_actions() {
     let (_, plan) = render(&UiState::default(), 180, 44);
     let blank = plan.extension_blank.expect("wide layout blank extension");
     assert_eq!(
@@ -265,8 +270,8 @@ fn blank_space_has_no_phantom_hit_targets() {
         for x in blank.x.saturating_add(1)..blank.right() {
             assert_eq!(
                 plan.hit(x, y),
-                None,
-                "the intentionally blank right column must be inert at ({x}, {y})"
+                Some(HitTarget::RightRail),
+                "the visible right rail must have one stable focus target at ({x}, {y})"
             );
         }
     }
@@ -431,7 +436,7 @@ fn comfortable_session_targets_include_padding_but_exclude_inter_item_gaps() {
             .iter()
             .find(|hit| hit.target == HitTarget::Session(first))
             .unwrap();
-        assert_eq!(row.area.height, if height >= 24 { 3 } else { 1 });
+        assert_eq!(row.area.height, 3);
         for y in row.area.y..row.area.bottom() {
             assert_eq!(plan.hit(row.area.x + 2, y), Some(HitTarget::Session(first)));
         }
@@ -439,15 +444,6 @@ fn comfortable_session_targets_include_padding_but_exclude_inter_item_gaps() {
             plan.hit(row.area.x + 2, row.area.bottom()),
             Some(HitTarget::SessionRail)
         );
-        let new = plan
-            .hit_regions()
-            .iter()
-            .find(|hit| hit.target == HitTarget::NewSession)
-            .unwrap();
-        assert!(new.area.bottom() <= row.area.y);
-        for y in new.area.y..new.area.bottom() {
-            assert_eq!(plan.hit(new.area.x + 2, y), Some(HitTarget::NewSession));
-        }
         if height >= 24 {
             assert_eq!(plan.composer.unwrap().height, 6);
         }

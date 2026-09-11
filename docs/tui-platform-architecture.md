@@ -36,14 +36,14 @@ BONE 无法在通用 TUI 内保证相同的字体家族、字号、真实字重�
 | --- | --- | --- |
 | 区域宽度、高度、留白、边框 | BONE | Full Profile 中逐 Cell 一致 |
 | 颜色值和层级 | BONE + 终端色彩能力 | Full Profile 发送相同 RGB；低色彩档位尚未认证 |
-| 字体、字号、具体粗细 | 宿主终端 | 不修改；通过密度和颜色弥补视觉差异 |
+| 字体、字号、具体粗细 | 宿主终端 | 不读取、不设置、不写配置；通过 Cell 密度和颜色弥补视觉差异 |
 | 中文、emoji、组合字符宽度 | Unicode 策略 + 终端 | 使用统一测量模块并在认证矩阵验证 |
 | `Enter` / `Shift+Enter` | 键盘协议 + BONE | Full Profile 精确区分；不支持时明确报告 |
 | `Ctrl+C` / `Ctrl+D` | BONE 命令系统 | 按产品契约执行，不注入额外别名 |
 | 鼠标点击、滚动、拖动 | 终端鼠标协议 + BONE | Full Profile 一致；同一布局树负责绘制和命中 |
 | raw mode、鼠标、粘贴、键盘协议 | BONE 运行期 | 只临时启用；尝试修改前先登记对应恢复动作，退出逆序恢复 |
 | profile、settings.json、shell rc | 用户 | BONE 永不自动修改 |
-| 光标颜色、终端标题、palette | 宿主会话状态 | 默认完全不设置 |
+| 光标颜色与形状、终端标题、palette | 宿主会话状态 | 完全不设置；BONE 只控制 viewport 内的 Cell 和原生 cursor 位置/可见性 |
 
 Full Profile 的最低能力定义为：
 
@@ -140,14 +140,15 @@ Termina 是 Helix 团队开发的跨平台 VT 层，目标就是让新终端扩�
 当前 `bone-tui` 使用 Ratatui 0.29、Crossterm 0.28.1、`unicode-width` 和 `unicode-segmentation`。本轮重构已经形成以下边界：
 
 - [`terminal/`](../crates/bone-tui/src/terminal/) 内的 `TerminalSession`、`ModeLease` 和 `ModeLedger` 统一拥有 renderer、能力协商、临时模式、panic/signal 恢复与 resume；
-- [`input/`](../crates/bone-tui/src/input/) 把终端事件转换为可忽略事件或语义动作；composer 的提交、换行、清空与退出严格使用 `Enter`、`Shift+Enter`、`Ctrl+C`、`Ctrl+D`，不含隐藏别名；
+- [`input/`](../crates/bone-tui/src/input/) 把终端事件转换为可忽略事件或语义动作；composer 的提交、换行、清空与退出严格使用 `Enter`、`Shift+Enter`、`Ctrl+C`、`Ctrl+D`，不含隐藏别名，`Ctrl+P` 不绑定命令面板；
 - [`editor/`](../crates/bone-tui/src/editor/) 统一维护 grapheme、CJK/emoji 宽度、CRLF、软换行、viewport、指针定位和 selection 几何；
-- [`ui/`](../crates/bone-tui/src/ui/) 集中语义 theme、`HitMap` 与 `FrameSnapshot`；[`layout.rs`](../crates/bone-tui/src/layout.rs) 提供纯 `LayoutPlan`，[view/](../crates/bone-tui/src/view/) 返回本帧真实几何和命中结果；
-- [`state/model.rs`](../crates/bone-tui/src/state/model.rs) 仍使用全局 `Focus` 枚举；焦点产品规则按用户要求留待后续单独设计。
+- [`ui/`](../crates/bone-tui/src/ui/) 集中语义 theme、active-scope 判定、应用 caret、`HitMap` 与 `FrameSnapshot`；[`layout.rs`](../crates/bone-tui/src/layout.rs) 提供纯 `LayoutPlan`，[view/](../crates/bone-tui/src/view/) 返回本帧真实几何和命中结果；
+- [`state/model.rs`](../crates/bone-tui/src/state/model.rs) 使用四个 workspace `Focus`：`Sessions`、`SessionTitle`、`Composer`、`RightRail`。`last_center` 只记录 `SessionTitle` 或 `Composer`，让左右侧栏返回用户上次使用的中栏编辑区；面板保留准确的 workspace 返回焦点，切换 Session 保留当前四区域焦点。
+- [`bone-app::SessionSummary`](../crates/bone-app/src/api.rs) 提供 Session rail 所需的 durable read model；持久化层按 record 与 payload 双预算增量推进摘要投影，TUI 不为列表加载完整历史。
 
 左右栏鼠标调整、连续全高分隔、稳定 SessionId/CommandKind 命中和即时重绘已经证明 Ratatui 能承载当前交互。继续演进时仍要控制 reducer 体量和焦点复杂度，但没有证据要求额外 crate 或另一套运行时。
 
-装饰性光标颜色与形状修改已经删除。BONE 在编辑位置绘制主题化 caret Cell，并把原生 cursor 定位到同一 Cell 以保留 IME 与辅助功能锚点；不发送终端标题、palette、字体、窗口尺寸或 cursor color/shape 修改。
+装饰性光标颜色与形状修改已经删除。BONE 在 `SessionTitle`、Composer 或连接表单的可见 caret 相位绘制主题化 Cell，并把原生 cursor 定位到同一 Cell 以保留 IME 与辅助功能锚点。它不发送终端标题、palette、字体或字号、窗口尺寸、cursor color 或 cursor shape 修改。
 
 ## 5. 当前架构与后续边界
 
@@ -170,6 +171,8 @@ crates/bone-tui/src/
 │   └── layout.rs
 ├── ui/
 │   ├── mod.rs
+│   ├── caret.rs
+│   ├── focus.rs
 │   ├── frame.rs
 │   ├── interaction.rs
 │   └── theme.rs
@@ -207,7 +210,7 @@ flowchart TB
 
 ### 5.1 `terminal` 模块
 
-`terminal` 是唯一允许改变终端模式的模块。`TerminalSession` 同时持有 Ratatui renderer、`ModeLease`、`TerminalCapabilities` 和 panic hook；`ModeLedger` 通过私有 backend 执行 raw mode、alternate screen、mouse capture、bracketed paste、键盘增强和最终显示光标。它不设置 focus reporting、synchronized output、terminal identity、palette、标题、字体、窗口尺寸或装饰性光标属性。
+`terminal` 是唯一允许改变终端模式的模块。`TerminalSession` 同时持有 Ratatui renderer、`ModeLease`、`TerminalCapabilities` 和 panic hook；`ModeLedger` 通过私有 backend 执行 raw mode、alternate screen、mouse capture、bracketed paste、键盘增强和最终显示光标。它不设置 focus reporting、synchronized output、terminal identity、palette、标题、字体、字号、窗口尺寸或装饰性光标属性。
 
 `run` 持有异步 `EventStream`，但不直接写终端模式。启动时 `ModeLease` 在创建 EventStream 之前完成键盘能力查询；Unix 查询成功才 push Kitty/CSI-u，原生 Windows 直接使用控制台修饰键事件，查询错误或不支持则记录 Compatibility 原因。
 
@@ -242,13 +245,21 @@ Crossterm Event
 
 鼠标拖动状态由 reducer 持有，拖动经过 composer 仍继续调整对应 splitter，pointer up、Esc 或 resize 结束拖动。每次 dirty 状态在接收下一事件前立即绘制，因此下一次 pointer 解析不会继续使用旧帧几何。
 
-当前没有 `NodeId` 组件树、capture/bubble 路由、通用 `OverlayStack` 或 Taffy。随着 dialog、autocomplete、diff 和任务树增长，可以在现有 `LayoutPlan` / `FrameSnapshot` 边界后逐步引入所需原语。焦点仍由现有状态模型管理；具体焦点规则按用户要求另行讨论。
+当前没有 `NodeId` 组件树、capture/bubble 路由、通用 `OverlayStack` 或 Taffy。现有 workspace focus controller 明确定义 `Sessions`、`SessionTitle`、`Composer`、`RightRail` 的空间邻接：上下只在两个中栏编辑区之间移动，左右侧栏通过 `last_center` 返回上次使用的中栏区域，边界不循环，右栏隐藏时拒绝进入。Conversation transcript 仍有独立绘制与鼠标滚动命中，但不属于键盘焦点枚举。切换 Session 保留当前 workspace focus；若焦点是 `SessionTitle`，内联编辑目标随新 Session 更新。单个普通面板作为独占 scope 保存和恢复 workspace 焦点；输入 `/` 打开的命令面板使用统一的中性 panel 表面，但在交互语义上仍是 Composer 的附属层。随着可嵌套 dialog、autocomplete、diff 和任务树增长，可以在现有 `LayoutPlan` / `FrameSnapshot` 边界后逐步引入所需原语。
 
 ### 5.4 `editor` 模块
 
 `EditBuffer` 提供语义编辑操作；`editor::layout` 是 composer 绘制、软换行、上下移动、viewport、鼠标定位与 selection 共用的文本几何。它统一处理 UTF-8、extended grapheme cluster、CJK/emoji 显示宽度、组合字符和 CRLF，避免按字节或 `char` 重复计算。
 
 Unicode UAX #29 定义 extended grapheme cluster；UAX #11 说明 East Asian Width 中 ambiguous 字符需要上下文策略。[^22][^23] per-session draft、revision 和 undo/redo 仍由产品状态持有，并调用 editor 语义操作。IME composition 的中间状态尚未建立跨平台抽象，必须经过原生 Windows、macOS 和 Linux 中文输入法真机验证后才能承诺。
+
+### 5.5 Session rail 的 durable summary projection
+
+`SessionSummary` 是 App 提供给 workspace overview 的持久只读摘要，不是 TUI 从标题或日志文字推断出的缓存。它包含 Session 身份与标题、创建时间、用户输入加 Agent 回复的消息计数、最近一条 Agent 回复最多 1024 UTF-8 bytes 的预览，以及 `projection_pending`。空 Session 返回 `0`、无预览且不 pending。
+
+持久化层为每个 Session 保存 projection cursor。正常 append 在投影已追平时于同一事务推进摘要；旧版本数据、缺失投影或落后投影由后续 overview 从 durable cursor 恢复。一次 workspace overview 在所有 Session 之间共享最多 64 条 journal record 和 8 MiB payload 的推进预算，因此工作量不会随完整历史无界增长。
+
+overview 返回时以 projection cursor 是否追上 `history_through` 计算 `projection_pending`。pending 为 true 时，消息计数与回复预览只描述已物化前缀，前端不能把它们呈现为完整事实。Session rail 的回复行显示 `Loading history…`，第三行计数显示 `… msgs`；后续 overview tick 继续推进，完成后才显示最终的回复预览和消息计数。
 
 ## 6. 零宿主污染契约
 
@@ -263,7 +274,7 @@ Unicode UAX #29 定义 extended grapheme cluster；UAX #11 说明 East Asian Wid
 | focus reporting | 当前不启用 | 若未来启用，必须在退出、suspend 前关闭 |
 | Kitty keyboard push | Unix 查询确认支持 | **离开 alternate screen 前 pop** |
 | synchronized output | 当前不启用 | 若未来启用，`Begin` 后任何错误路径都必须 `End` |
-| cursor show/hide/position | 绘制和编辑需要 | 最终 show；不改颜色与形状 |
+| cursor show/hide/position | 绘制和编辑需要 | 最终 show；只改位置与可见性，不改颜色与形状 |
 
 xterm 对 alternate screen、bracketed paste 和临时键盘模式的定义，以及 Kitty 协议的 screen-local stack，都要求模式成对处理。[^18][^19] 当前账本只登记实际启用的模式。Synchronized output 是后续减少半帧和闪烁的候选，采用时必须保证 DEC private mode 2026 成对结束。[^20]
 
@@ -297,7 +308,7 @@ pop keyboard enhancement
 
 恢复路径覆盖正常返回、初始化失败、业务错误、Rust panic，以及 Unix 的 `SIGINT`、`SIGTERM`、`SIGHUP`、`SIGQUIT` 和 suspend/resume。可捕获的终止信号在草稿有界保存前先恢复终端。Suspend 前完整交还终端；进程 continue 后复用同一账本重新进入临时模式、重新协商键盘能力、重建 renderer 并强制整帧重绘。Linux PTY 自动化覆盖这些协议和恢复路径；macOS 与原生 Windows 生命周期仍需 CI 与真机认证。
 
-`SIGKILL`、断电和终端自身崩溃无法执行进程清理，这是操作系统边界。BONE 通过不设置 title / cursor color / palette、使用 alternate-screen-local keyboard stack 和最小状态集合，将不可恢复残留降到最低。若以后需要进一步降低 Rust abort / native crash 的风险，可以让一个很小的父 supervisor 持有原始终端状态并监控 UI 子进程；它仍然无法对父进程自身的 `SIGKILL` 或断电作出承诺。
+`SIGKILL`、断电和终端自身崩溃无法执行进程清理，这是操作系统边界。BONE 通过不设置字体、字号、title、cursor color/shape 或 palette，使用 alternate-screen-local keyboard stack 和最小状态集合，将不可恢复残留降到最低。若以后需要进一步降低 Rust abort / native crash 的风险，可以让一个很小的父 supervisor 持有原始终端状态并监控 UI 子进程；它仍然无法对父进程自身的 `SIGKILL` 或断电作出承诺。
 
 ## 7. `Shift+Enter` 的正式方案
 
@@ -319,7 +330,7 @@ Ctrl+C       → composer.clear
 Ctrl+D       → app.exit
 ```
 
-不默认增加 `Ctrl+J`、`Ctrl+Return`、`Alt+Return`，也不修改用户终端快捷键。keymap 可以做成命令系统，但默认映射必须来自一处，status baseline 必须从最终解析后的 keymap 生成，不能手写出与实际行为不一致的提示。
+不默认增加 `Ctrl+J`、`Ctrl+Return`、`Alt+Return`，`Ctrl+P` 也没有命令面板绑定；全局动作从 Composer 的 `/` 命令面板进入。BONE 不修改用户终端快捷键。keymap 可以做成命令系统，但默认映射必须来自一处，status baseline 必须从最终解析后的 keymap 生成，不能手写出与实际行为不一致的提示。
 
 启动协商流程：
 
@@ -344,20 +355,24 @@ TUI 不能设置 point size，但可以控制每个组件占多少行列。BONE 
 - 相邻内容组之间 1 行；
 - 终端高度至少 24 行时，输入 editor 最少 2 个正文行；更矮窗口进入紧凑布局；
 - status baseline 固定 1 行，输入框不制造空白“伪内容行”；
-- Session 条目在舒展布局中上下各留一行，新建 Session 入口为 3 行；
+- 每个 Session 固定三行内容：标题、最近 Agent 回复、消息数与相对时间或日期；下一行固定为条目分隔，草稿和状态不会改变行高；
 - 高度不足时先减少外围 padding，再减少辅助信息，不能缩小正文。
 
 用户感受到的“字体小”往往是低对比正文、过多一行塞入信息、没有 surface、没有留白共同造成。增加组件体量与对比度能跨终端稳定生效。
 
 ### 8.2 固定 surface 与语义 token
 
-当前 `ui::theme` 集中定义显式 RGB 与四个样式角色，生产视图不能自行选择裸 RGB 或字重：
+当前 `ui::theme` 集中定义显式 RGB 与样式角色，生产视图不能自行选择裸 RGB 或字重：
 
 ```text
 colors: INK, MUTED, PANEL, RAIL, INPUT, USER, SELECTED,
-        DIVIDER, PANE_BOUNDARY, ACCENT, DANGER, GREEN, CYAN, PURPLE
-styles: surface, body, label, regular
+        STRUCTURE, STRUCTURE_ACTIVE, FOCUS_MARK, FOCUS_SURFACE,
+        INFO, SUCCESS, WARNING, DANGER,
+        CYAN, PURPLE
+styles: surface, body, body_on, label, label_on
 ```
+
+`FOCUS_MARK` 虽沿用历史名称，当前只用于当前 Session 左侧身份条和处于可见相位的 caret。`SELECTED` 是浅中性的键盘候选与选中表面，`FOCUS_SURFACE` 是 RightRail 等只读活动区域的中性层级；状态使用 `INFO`、`SUCCESS`、`WARNING`、`DANGER`。`CYAN` 只是内联代码迁移期兼容别名，`PURPLE` 仍用于代码语义。
 
 当前没有 `ThemeCompiler`，也没有宣称 ANSI 256/16 或 monochrome 已认证。键盘 Compatibility 状态只表示 `Shift+Enter` 能力，不代表颜色自动降级。若后续支持低色彩 profile，应在 `ui::theme` 内统一映射并单独认证。
 
@@ -366,8 +381,8 @@ styles: surface, body, label, regular
 终端的 bold 最终会映射到宿主字体，实际粗度不可能完全相同。因此：
 
 - 正文、长消息和 metadata 使用 regular；
-- 产品名、面板标题和当前 selection 使用统一 `label`；
-- 输入框、用户消息和左栏选中项的竖向标记显式移除 bold；
+- 区域标题、面板标题、输入提示和快捷键 chord 使用统一 `label`；
+- 用户消息没有说话者标签或竖向标记；区域焦点也不绘制 gutter 或橙色短轨；
 - 粗体只作为加成，关键层级还必须有亮度、背景或空间差；
 - muted 表达次要信息，不能大面积用于正文；
 - 图标、边框和中文正文不做全局 bold。
@@ -382,13 +397,13 @@ styles: surface, body, label, regular
 
 ### 8.5 动效和状态
 
-当前渲染完全由事件和 dirty 状态驱动，没有固定 tick 或通用动画 scheduler。输入、resize、拖拽和运行时更新使状态变脏，runner 在接收下一事件前立即绘制。以后若加入 spinner 或短暂 toast，应由明确的 live-frame 请求驱动，并在状态结束时释放。
+当前渲染由事件和 dirty 状态驱动，没有固定 30/60 FPS ticker 或通用动画 scheduler。`SessionTitle`、Composer 和可编辑连接字段共享一个按需启用的 caret 相位计时器：每 500 ms 翻转可见性，构成 1 秒完整周期；输入、焦点变化和 resize 将它重置到可见相位。没有可编辑焦点时该计时器不驱动帧。以后若加入 spinner 或短暂 toast，应由明确的 live-frame 请求驱动，并在状态结束时释放。
 
 ## 9. 鼠标、浮层与未来丰富交互
 
 当前鼠标分栏用明确的 drag state 实现：pointer down 命中分隔条后记录拖动目标，后续 move 即使经过 conversation 或 composer 仍调整同一侧栏；pointer up、Esc 或 resize 清除拖动。绘制后的 `FrameSnapshot` 是下一次点击和滚动的几何依据。
 
-当前 overlay 在绘制时覆盖或清除底层 hit region，但还没有通用 `OverlayStack`、focus scope、tooltip anchor 或 capture/bubble 事件树。这些是 dialog、autocomplete、context menu 和任务树增长后的候选原语，应按真实交互需求加入同一 crate。
+当前普通 overlay 打开时独占键盘焦点并清除底层 workspace 与 divider hit region，关闭时恢复进入前的准确 workspace 焦点；面板和 RightRail 用中性背景层级表达活动状态，不使用橙色。附着式 `/` 命令面板继续由 Composer caret 表达焦点。当前只有单层 panel scope，还没有通用 `OverlayStack`、tooltip anchor 或 capture/bubble 事件树；这些是出现可嵌套 dialog、context menu 和任务树后按真实需求加入同一 crate 的候选原语。
 
 未来的可折叠工具调用、详情页、文件 diff、搜索、选择复制、命令面板和任务树应继续复用 `LayoutPlan`、`FrameSnapshot`、`HitMap` 与语义 Action，避免重新维护一套绘制坐标和一套鼠标坐标。
 
@@ -414,7 +429,7 @@ styles: surface, body, label, regular
 当前全屏渲染采用：
 
 - dirty 驱动的即时重绘，在接收下一输入或运行时事件前提交；
-- 没有 30 FPS/60 FPS ticker，没有动画时不主动刷新；
+- 没有 30 FPS/60 FPS ticker；只有编辑焦点活跃时，500 ms caret 相位计时器会请求重绘；
 - Ratatui buffer diff；
 - `FrameSnapshot` 保存本帧 layout、hit map、transcript metrics 与 reader scroll 上限；
 - 稳定阅读锚点，后台追加不改变用户正在阅读的位置；
@@ -448,7 +463,7 @@ Synchronized output、完整 transcript virtualization 和跨平台帧预算尚�
 5. **PTY lifecycle test**：正常退出、部分初始化、panic、catchable signal、suspend/resume、重复 restore；比较进入前后的终端模式。
 6. **输出策略 test**：扫描 TUI 输出，禁止 OSC、装饰性 cursor style 和窗口 resize；验证每个 enable 都有对应 disable。
 
-当前自动化已经覆盖 exact keymap、editor/Unicode 几何、`LayoutPlan`/`HitMap`、栏宽拖动、Linux PTY 下的键盘协议支持与降级、正常/信号/suspend-resume 恢复、重复 restore，以及 OSC/光标形状/窗口 resize 禁止输出。它是 Linux PTY 证据，不等于 macOS 或原生 Windows 认证。
+当前自动化已经覆盖 exact keymap、四区域 focus 状态机、caret 可见/隐藏相位、editor/Unicode 几何、`LayoutPlan`/`HitMap`、栏宽拖动、Linux PTY 下的键盘协议支持与降级、正常/信号/suspend-resume 恢复、重复 restore，以及 OSC/光标形状/窗口 resize 禁止输出。它是 Linux PTY 证据，不等于 macOS 或原生 Windows 认证。
 
 ### 12.2 真机矩阵
 
@@ -486,11 +501,11 @@ Windows 的 Ctrl+C、Ctrl+Break、Close、Logoff 和 Shutdown listener 会在进
 
 ### 阶段 3：建立 `ui` 模块 — 基础切片已完成
 
-[`ui/`](../crates/bone-tui/src/ui/) 已加入语义 theme、应用 caret、`HitMap` 和 `FrameSnapshot`；纯 `LayoutPlan` 与实际 render 结果共同驱动命中，Session/slash command 使用稳定身份，左右栏支持鼠标拖动。slash 建议不夺 Composer caret，Session 激活会保留已存在的 Composer 焦点；完整焦点语义仍留待单独设计。当前没有 `NodeId`、通用 interaction tree、`OverlayStack` 或 Taffy。
+[`ui/`](../crates/bone-tui/src/ui/) 已加入语义 theme、应用 caret、focus ownership、`HitMap` 和 `FrameSnapshot`；纯 `LayoutPlan` 与实际 render 结果共同驱动命中，Session 和 `/` 命令使用稳定身份，左右栏支持鼠标拖动。workspace 明确定义四区域焦点；命令面板不夺 Composer caret；当前 Session 身份、键盘候选和区域焦点分离；独占面板准确恢复 workspace 焦点。当前没有 `NodeId`、通用 interaction tree、`OverlayStack` 或 Taffy。
 
 ### 阶段 4：视觉系统与组件迁移 — 基础切片已完成
 
-生产视图使用 `ui::theme` 的显式颜色和 `body`/`label`/`regular` 角色；主分隔条全高连续，舒展密度、status baseline 和两行输入正文已接入。当前没有 `ThemeCompiler` 或低色彩 profile 认证。
+生产视图使用 `ui::theme` 的显式颜色和 `body`/`label` 角色；主分隔条全高连续，Session 固定三行加分隔、status baseline 和两行输入正文已接入。橙色只用于当前 Session 身份条和可见 caret；Sessions 候选、RightRail 与面板均使用中性表面。当前没有 `ThemeCompiler` 或低色彩 profile 认证。
 
 ### 阶段 5：性能与正式认证 — 未完成
 
@@ -511,7 +526,7 @@ BONE 已经把终端模式、输入 keymap、editor 几何、帧事实和视觉 
 5. **`Enter / Shift+Enter / Ctrl+C / Ctrl+D` 按既定契约，不增加隐藏 fallback。**
 6. **只有 `bone-tui::terminal` 私有模块可以产生终端状态副作用。**
 7. **视觉必须通过语义 token、surface、spacing 和统一 emphasis 表达。**
-8. **`LayoutPlan`、`FrameSnapshot` 与 `HitMap` 是绘制和命中的共同帧事实；焦点规则另行设计。**
+8. **`LayoutPlan`、`FrameSnapshot` 与 `HitMap` 是绘制和命中的共同帧事实；workspace 焦点按显式空间邻接移动，overlay 独占作用域并恢复来源。**
 9. **真实终端认证是发布条件，OS 编译通过不等于 TUI 兼容。**
 
 按这条路线，BONE 可以继续提高接近 OpenCode 的精致感和复杂交互能力，同时保持零宿主配置写入、Rust 单二进制和现有业务代码资产。当前 Linux PTY 门禁证明了实现方向，完整跨平台承诺仍取决于后续认证。

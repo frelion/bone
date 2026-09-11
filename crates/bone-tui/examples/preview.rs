@@ -2,10 +2,10 @@
 //! cargo run -p bone-tui --example preview -- 160 40 > preview.svg
 use bone_app::{
     HistoryEntry, InputId, JobRef, RequestId, RuntimeId, RuntimeState, SessionEvent, SessionId,
-    SessionInfo, SessionSeq, SessionView, WorkspaceId,
+    SessionInfo, SessionSeq, SessionSummary, SessionView, WorkspaceId,
 };
 use bone_tui::{
-    state::{SessionStatus, SessionUi, UiState},
+    state::{Action, Effect, Focus, SessionStatus, SessionUi, UiEvent, UiState, update},
     view,
 };
 use ratatui::{
@@ -13,7 +13,7 @@ use ratatui::{
     backend::TestBackend,
     style::{Color, Modifier},
 };
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 fn escaped(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -56,6 +56,54 @@ fn main() {
     state
         .session_statuses
         .insert(state.sessions[2].id, SessionStatus::Draft);
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        });
+    let previews = [
+        (4, Some("我会把输入定位按实际字符宽度一起验证。")),
+        (
+            18,
+            Some("The projection now resumes from its durable cursor."),
+        ),
+        (7, Some("已定位启动阶段的终端恢复顺序。")),
+        (11, Some("Retry preserves the original request identity.")),
+        (6, Some("权限确认只在真正需要时出现。")),
+        (3, None),
+    ];
+    let summaries = state
+        .sessions
+        .iter()
+        .cloned()
+        .zip(previews)
+        .enumerate()
+        .map(|(index, (session, (message_count, preview)))| {
+            let summary = SessionSummary {
+                session,
+                created_at: now - i64::try_from(index + 1).unwrap() * 5 * 60_000,
+                message_count,
+                latest_reply_preview: preview.map(str::to_owned),
+                projection_pending: false,
+                has_draft: index == 2,
+                draft_bytes: if index == 2 { 24 } else { 0 },
+                persisted_runtime: None,
+                history_through: SessionSeq(message_count),
+            };
+            (summary.session.id, summary)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let overview_sessions = state.sessions.clone();
+    let overview_statuses = state.session_statuses.clone();
+    update(
+        &mut state,
+        UiEvent::OverviewLoaded {
+            generation: 0,
+            sessions: overview_sessions,
+            statuses: overview_statuses,
+            summaries,
+        },
+    );
     let info = state.sessions[0].clone();
     state.selected = Some(info.id);
     let mut ui = SessionUi::new(info.clone(), 1);
@@ -87,10 +135,11 @@ fn main() {
         });
     }
     state.session_ui.insert(ui.info.id, ui);
-    use bone_tui::state::{Action, Effect, UiEvent, update};
     let scenario = args.get(3).map(String::as_str).unwrap_or("conversation");
     if scenario == "commands" {
-        update(&mut state, UiEvent::Action(Action::OpenCommands));
+        let ui = state.selected_ui_mut().expect("preview session");
+        ui.draft = "/".into();
+        ui.draft_cursor = ui.draft.len();
     } else if matches!(scenario, "models" | "connection" | "form") {
         let effects = update(&mut state, UiEvent::Action(Action::OpenModels));
         for effect in effects {
@@ -129,6 +178,20 @@ fn main() {
             }),
         );
     }
+    match scenario {
+        "sessions" => {
+            state.focus = Focus::Sessions;
+            state.session_candidate = state.sessions.get(1).map(|session| session.id);
+        }
+        "title" => {
+            update(
+                &mut state,
+                UiEvent::Action(Action::Focus(Focus::SessionTitle)),
+            );
+        }
+        "right" => state.focus = Focus::RightRail,
+        _ => {}
+    }
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal
         .draw(|frame| {
@@ -158,16 +221,7 @@ fn main() {
     for y in 0..h {
         for x in 0..w {
             let cell = &terminal.backend().buffer()[(x, y)];
-            if cell.symbol() == "▎" {
-                // Block elements represent fractions of the cell, not text line boxes.
-                // This is a grid preview; native terminal font fallback can differ.
-                println!(
-                    "<rect x=\"{}\" y=\"{}\" width=\"2.25\" height=\"20\" fill=\"{}\"/>",
-                    x * 9,
-                    y * 20,
-                    color(cell.fg)
-                );
-            } else if cell.symbol() != " " {
+            if cell.symbol() != " " {
                 println!(
                     "<text x=\"{}\" y=\"{}\" fill=\"{}\" font-family=\"DejaVu Sans Mono,WenQuanYi Zen Hei Mono,monospace\" font-size=\"14\" font-weight=\"{}\">{}</text>",
                     x * 9,

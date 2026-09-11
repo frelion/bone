@@ -1,13 +1,12 @@
 use crate::{
     input::{BindingHint, status_baseline_bindings},
-    state::{Focus, UiState},
-    ui::{caret, theme},
-    view::{ACCENT, INK, INPUT, MUTED, single_line_external},
+    state::UiState,
+    ui::{caret, focus, theme},
+    view::{INK, INPUT, MUTED, single_line_external},
 };
 use ratatui::{
     Frame,
     layout::Rect,
-    style::Style,
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
@@ -15,16 +14,10 @@ use ratatui::{
 pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let draft = state.draft();
     let cursor = state.draft_cursor();
-    // Slash suggestions are attached to the editor and must not steal its caret.
-    let focused = state.focus == Focus::Composer && state.panel.is_none();
+    // Slash commands keep editor focus and the same application-owned caret.
+    let focused = focus::is_active(state, focus::Region::Composer);
     let surface = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(2));
-    frame.render_widget(Block::default().style(Style::default().bg(INPUT)), surface);
-    super::marks::paint(
-        frame,
-        surface,
-        if focused { ACCENT } else { super::DIVIDER },
-        INPUT,
-    );
+    frame.render_widget(Block::default().style(theme::surface(INPUT)), surface);
     let input = crate::layout::composer_text_area(area);
     let (value, cursor_x, cursor_y) = crate::editor::stable_editor_viewport(
         draft,
@@ -39,11 +32,10 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         } else {
             &value
         })
-        .style(
-            Style::default()
-                .fg(if draft.is_empty() { MUTED } else { INK })
-                .bg(INPUT),
-        ),
+        .style(theme::body_on(
+            if draft.is_empty() { MUTED } else { INK },
+            INPUT,
+        )),
         input,
     );
     if focused && let Some(selection) = state.editor().selection(cursor) {
@@ -82,14 +74,19 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         && let Some(commands) = geometry.commands
     {
         frame.render_widget(
-            Paragraph::new("/ commands").style(Style::default().fg(MUTED)),
+            Paragraph::new("/ commands").style(theme::body(MUTED)),
             commands,
         );
     }
     if state.panel.is_none() {
+        let actionable = !draft.trim().is_empty()
+            && state
+                .selected_ui()
+                .and_then(|ui| ui.submitting.as_ref())
+                .is_none_or(|pending| pending.failed);
         frame.render_widget(
-            Paragraph::new(action).style(if focused {
-                theme::label(ACCENT)
+            Paragraph::new(action).style(if actionable {
+                theme::label(INK)
             } else {
                 theme::body(MUTED)
             }),
@@ -97,7 +94,11 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         );
     }
     if focused && input.width > 0 && input.height > 0 {
-        caret::place(frame, (input.x + cursor_x, input.y + cursor_y));
+        caret::place(
+            frame,
+            (input.x + cursor_x, input.y + cursor_y),
+            state.caret_visible,
+        );
     }
 }
 
@@ -156,13 +157,17 @@ pub(super) fn footer_areas(area: Rect, state: &UiState) -> FooterAreas {
         }
     }
 
-    let commands =
-        (right.saturating_sub(footer.x) >= minimum_model.saturating_add(12)).then(|| {
-            right = right.saturating_sub(10);
-            let area = Rect::new(right, footer.y, 10, 1);
-            right = right.saturating_sub(2).max(footer.x);
-            area
-        });
+    let commands = (state.draft().is_empty()
+        && state
+            .selected_ui()
+            .is_none_or(|ui| ui.selected_answer.is_none())
+        && right.saturating_sub(footer.x) >= minimum_model.saturating_add(12))
+    .then(|| {
+        right = right.saturating_sub(10);
+        let area = Rect::new(right, footer.y, 10, 1);
+        right = right.saturating_sub(2).max(footer.x);
+        area
+    });
 
     FooterAreas {
         model: Rect::new(footer.x, footer.y, right.saturating_sub(footer.x), 1),
@@ -295,8 +300,55 @@ mod tests {
         let position = ratatui::layout::Position::new(input.x + cursor_x, input.y + cursor_y);
         assert_eq!(terminal.get_cursor_position().unwrap(), position);
         let cell = &terminal.backend().buffer()[position];
-        assert_eq!(cell.bg, ACCENT);
+        assert_eq!(cell.bg, theme::FOCUS_MARK);
         assert_eq!(cell.fg, INPUT);
+    }
+
+    #[test]
+    fn composer_focus_uses_only_the_blinking_caret() {
+        let area = Rect::new(0, 0, 72, 6);
+        for (focus_state, panel, caret_visible, expected_orange_cells) in [
+            (crate::state::Focus::Composer, None, true, 1),
+            (crate::state::Focus::Composer, None, false, 0),
+            (crate::state::Focus::SessionTitle, None, true, 0),
+            (
+                crate::state::Focus::Composer,
+                Some(crate::state::Panel::Help),
+                true,
+                0,
+            ),
+        ] {
+            let mut state = UiState::default();
+            state.focus = focus_state;
+            state.panel = panel;
+            state.caret_visible = caret_visible;
+            state.orphan_draft = "draft".into();
+            state.orphan_cursor = state.orphan_draft.len();
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal.draw(|frame| render(frame, area, &state)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let input = crate::layout::composer_text_area(area);
+
+            for y in input.y..input.bottom() {
+                assert_eq!(buffer[(area.x, y)].bg, INPUT);
+            }
+            assert_eq!(buffer[(area.x + 1, area.y)].bg, INPUT);
+            assert_eq!(buffer[(area.x + 1, input.bottom())].bg, INPUT);
+
+            let orange_cells = buffer
+                .content()
+                .iter()
+                .filter(|cell| cell.fg == theme::FOCUS_MARK || cell.bg == theme::FOCUS_MARK)
+                .count();
+            assert_eq!(orange_cells, expected_orange_cells);
+
+            let action_area = action(area, &state).0;
+            for x in action_area.x..action_area.right() {
+                let cell = &buffer[(x, action_area.y)];
+                assert_ne!(cell.fg, theme::FOCUS_MARK);
+                assert_ne!(cell.bg, theme::FOCUS_MARK);
+            }
+        }
     }
 
     #[test]
@@ -337,7 +389,6 @@ mod tests {
             let plan = plan.unwrap();
             let area = plan.composer.unwrap();
             let geometry = footer_areas(area, &state);
-            let buffer = terminal.backend().buffer();
             for offset in 0.."Select model".len().min(usize::from(geometry.model.width)) {
                 assert_eq!(
                     plan.hit(geometry.model.x + offset as u16, geometry.model.y),
@@ -345,33 +396,50 @@ mod tests {
                     "width {width}"
                 );
             }
-            if let Some(commands) = geometry.commands {
+            assert!(geometry.commands.is_none());
+            assert!(
+                !plan
+                    .hit_regions()
+                    .iter()
+                    .any(|region| region.target == HitTarget::StartSlashCommand)
+            );
+            let submit = action(area, &state).0;
+            assert_eq!(plan.hit(submit.x, submit.y), Some(HitTarget::Submit));
+
+            let empty = UiState::default();
+            let mut empty_terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let mut empty_plan = None;
+            empty_terminal
+                .draw(|frame| empty_plan = Some(crate::view::render(frame, &empty)))
+                .unwrap();
+            let empty_plan = empty_plan.unwrap();
+            let empty_area = empty_plan.composer.unwrap();
+            let empty_geometry = footer_areas(empty_area, &empty);
+            if let Some(commands) = empty_geometry.commands {
                 let painted: String = (commands.x..commands.x + 10)
-                    .map(|x| buffer[(x, commands.y)].symbol())
+                    .map(|x| empty_terminal.backend().buffer()[(x, commands.y)].symbol())
                     .collect();
                 assert_eq!(painted, "/ commands");
                 for x in commands.x..commands.x + 10 {
                     assert_eq!(
-                        plan.hit(x, commands.y),
-                        Some(HitTarget::Commands),
+                        empty_plan.hit(x, commands.y),
+                        Some(HitTarget::StartSlashCommand),
                         "width {width}"
                     );
                 }
                 assert_ne!(
-                    plan.hit(commands.x + 11, commands.y),
-                    Some(HitTarget::Commands)
+                    empty_plan.hit(commands.x + 11, commands.y),
+                    Some(HitTarget::StartSlashCommand)
                 );
             } else {
                 assert!(
-                    !plan
+                    !empty_plan
                         .hit_regions()
                         .iter()
-                        .any(|region| region.target == HitTarget::Commands),
+                        .any(|region| region.target == HitTarget::StartSlashCommand),
                     "hidden commands at width {width}"
                 );
             }
-            let submit = action(area, &state).0;
-            assert_eq!(plan.hit(submit.x, submit.y), Some(HitTarget::Submit));
         }
     }
 

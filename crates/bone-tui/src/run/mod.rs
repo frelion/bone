@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     input::terminal_event,
-    state::{Action, SessionStatus, UiEvent, UiState, update},
-    terminal::TerminalSession,
+    state::{Action, Effect, SessionStatus, UiEvent, UiState, update},
+    terminal::{PanicSignal, TerminalSession},
 };
 
 use self::{
@@ -23,11 +23,13 @@ use self::{
 
 const DRAFT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const CARET_PHASE: Duration = Duration::from_millis(500);
 
 enum FlushWait<T> {
     Completed(T),
     TimedOut,
     Process(ProcessSignal),
+    Panic,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,7 +68,7 @@ pub async fn run() -> Result<(), RunError> {
         .desired
         .ok()
         .map(|config| config.worker.selection.model);
-    let (sessions, statuses) = summarize_overview(&overview);
+    let (sessions, statuses, summaries) = summarize_overview(&overview);
 
     let (tx, mut rx) = mpsc::channel(256);
     let (ready_tx, mut ready_rx) = mpsc::channel::<SessionReady>(16);
@@ -87,6 +89,7 @@ pub async fn run() -> Result<(), RunError> {
             last_active,
             model_label,
             statuses,
+            summaries,
         },
     ));
 
@@ -95,8 +98,18 @@ pub async fn run() -> Result<(), RunError> {
     // can terminate the process without allowing `TerminalSession` to restore.
     let mut process_signals = process_signals()?;
     let mut terminal = TerminalSession::enter()?;
+    let panic_signal = terminal.panic_signal();
     state.terminal_capabilities = terminal.capabilities().clone();
+    let viewport = terminal.terminal().size()?;
+    effects.extend(update(
+        &mut state,
+        UiEvent::Resized {
+            width: viewport.width,
+            height: viewport.height,
+        },
+    ));
     let mut events = Some(EventStream::new());
+    schedule_test_background_panic();
     let mut overview_ticker = tokio::time::interval(Duration::from_secs(5));
     overview_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Startup already loaded the authoritative overview.
@@ -104,26 +117,94 @@ pub async fn run() -> Result<(), RunError> {
     let mut draft_ticker = tokio::time::interval(Duration::from_millis(500));
     draft_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     draft_ticker.tick().await;
+    let caret_sleep = tokio::time::sleep(CARET_PHASE);
+    tokio::pin!(caret_sleep);
     let mut frame_snapshot = None;
     let mut shutdown = false;
     let mut termination_received = false;
+    let mut panic_handled = false;
     let mut shutdown_error = None;
 
     'run: while !shutdown {
+        if panic_signal.is_tripped() {
+            begin_background_panic_shutdown(
+                &mut terminal,
+                &mut state,
+                &mut effects,
+                &mut termination_received,
+                &mut panic_handled,
+                &mut shutdown_error,
+            );
+        }
         if !termination_received {
             render_dirty(&mut terminal, &mut state, &mut frame_snapshot)?;
+            if panic_signal.is_tripped() {
+                begin_background_panic_shutdown(
+                    &mut terminal,
+                    &mut state,
+                    &mut effects,
+                    &mut termination_received,
+                    &mut panic_handled,
+                    &mut shutdown_error,
+                );
+            }
         }
         while let Some(effect) = effects.pop_front() {
-            shutdown |= runtime.apply(effect).await?;
+            let applied = tokio::select! {
+                result = runtime.apply(effect) => Some(result),
+                _ = panic_signal.notified(), if !panic_handled => None,
+            };
+            if let Some(result) = applied {
+                shutdown |= result?;
+            } else {
+                // Dropping the in-flight effect future prevents a synchronous
+                // persistence call from pinning the terminal after another
+                // task has already panicked.
+                begin_background_panic_shutdown(
+                    &mut terminal,
+                    &mut state,
+                    &mut effects,
+                    &mut termination_received,
+                    &mut panic_handled,
+                    &mut shutdown_error,
+                );
+            }
+            if panic_signal.is_tripped() {
+                begin_background_panic_shutdown(
+                    &mut terminal,
+                    &mut state,
+                    &mut effects,
+                    &mut termination_received,
+                    &mut panic_handled,
+                    &mut shutdown_error,
+                );
+            }
         }
         if shutdown {
             loop {
                 let result = wait_for_draft_flush(
                     runtime.flush_drafts(&mut state),
                     &mut process_signals,
+                    &panic_signal,
+                    !panic_handled,
                     DRAFT_FLUSH_TIMEOUT,
                 )
                 .await;
+                if panic_signal.is_tripped() && !panic_handled {
+                    begin_background_panic_shutdown(
+                        &mut terminal,
+                        &mut state,
+                        &mut effects,
+                        &mut termination_received,
+                        &mut panic_handled,
+                        &mut shutdown_error,
+                    );
+                    // The selected flush future may have completed at the same
+                    // instant as the panic notification. Retry once under the
+                    // fatal-shutdown policy so no ready-branch race can swallow
+                    // the panic.
+                    continue;
+                }
                 match result {
                     FlushWait::Completed(Ok(())) => break 'run,
                     FlushWait::Completed(Err(_)) if !termination_received => {
@@ -135,7 +216,8 @@ pub async fn run() -> Result<(), RunError> {
                         break;
                     }
                     FlushWait::Completed(Err(error)) => {
-                        shutdown_error = Some(format!("终止时草稿未能保存：{error}"));
+                        shutdown_error
+                            .get_or_insert_with(|| format!("终止时草稿未能保存：{error}"));
                         break 'run;
                     }
                     FlushWait::TimedOut if !termination_received => {
@@ -147,11 +229,12 @@ pub async fn run() -> Result<(), RunError> {
                         break;
                     }
                     FlushWait::TimedOut => {
-                        shutdown_error = Some("终止时草稿保存超时".into());
+                        shutdown_error.get_or_insert_with(|| "终止时草稿保存超时".into());
                         break 'run;
                     }
                     FlushWait::Process(ProcessSignal::Terminate) if termination_received => {
-                        shutdown_error = Some("收到第二次终止信号；已停止等待草稿保存".into());
+                        shutdown_error
+                            .get_or_insert_with(|| "收到第二次终止信号；已停止等待草稿保存".into());
                         break 'run;
                     }
                     FlushWait::Process(ProcessSignal::Terminate) => {
@@ -159,6 +242,19 @@ pub async fn run() -> Result<(), RunError> {
                         // A signal makes exit final. Restore before restarting the
                         // bounded flush so no await holds the user's terminal.
                         let _ = terminal.restore();
+                        continue;
+                    }
+                    FlushWait::Panic => {
+                        begin_background_panic_shutdown(
+                            &mut terminal,
+                            &mut state,
+                            &mut effects,
+                            &mut termination_received,
+                            &mut panic_handled,
+                            &mut shutdown_error,
+                        );
+                        // `flush_drafts` is idempotent. The interrupted future
+                        // is retried after the terminal has been restored.
                         continue;
                     }
                     #[cfg(unix)]
@@ -192,6 +288,18 @@ pub async fn run() -> Result<(), RunError> {
             },
             _ = overview_ticker.tick() => Some(UiEvent::RefreshOverviewRequested),
             _ = draft_ticker.tick() => Some(UiEvent::PersistDraftsRequested),
+            _ = &mut caret_sleep, if state.blinking_caret_active() => Some(UiEvent::CaretBlink),
+            _ = panic_signal.notified(), if !panic_handled => {
+                begin_background_panic_shutdown(
+                    &mut terminal,
+                    &mut state,
+                    &mut effects,
+                    &mut termination_received,
+                    &mut panic_handled,
+                    &mut shutdown_error,
+                );
+                None
+            },
             signal = process_signals.recv() => {
                 match signal {
                     Some(ProcessSignal::Terminate) => {
@@ -209,6 +317,7 @@ pub async fn run() -> Result<(), RunError> {
                             &mut state,
                             &mut frame_snapshot,
                         )?;
+                        caret_sleep.as_mut().reset(tokio::time::Instant::now() + CARET_PHASE);
                         events = Some(EventStream::new());
                         None
                     }
@@ -217,12 +326,28 @@ pub async fn run() -> Result<(), RunError> {
             },
         };
         if let Some(event) = next {
+            let caret_was_active = state.blinking_caret_active();
+            let reset_caret = matches!(
+                event,
+                UiEvent::Action(_) | UiEvent::CaretBlink | UiEvent::Resized { .. }
+            );
             runtime.accept_event(&event, &state);
             effects.extend(update(&mut state, event));
+            if reset_caret || !caret_was_active && state.blinking_caret_active() {
+                caret_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + CARET_PHASE);
+            }
         }
     }
 
     terminal.restore()?;
+    // `restore` removes the process-wide hook. Its synchronization point also
+    // closes the last race where a detached panic and a completed flush become
+    // ready together just before the loop exits.
+    if panic_signal.is_tripped() && !panic_handled {
+        shutdown_error = Some("A background task panicked; BONE stopped safely".into());
+    }
     match tokio::time::timeout(APP_SHUTDOWN_TIMEOUT, runtime.shutdown()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(error.into()),
@@ -237,6 +362,43 @@ pub async fn run() -> Result<(), RunError> {
     }
     Ok(())
 }
+
+fn begin_background_panic_shutdown(
+    terminal: &mut TerminalSession,
+    state: &mut UiState,
+    effects: &mut VecDeque<Effect>,
+    termination_received: &mut bool,
+    panic_handled: &mut bool,
+    shutdown_error: &mut Option<String>,
+) {
+    if *panic_handled {
+        return;
+    }
+    *panic_handled = true;
+    *termination_received = true;
+    // The hook never performs terminal I/O. Once the owner observes its fatal
+    // flag, stop rendering and restore before any bounded persistence work.
+    let _ = terminal.restore();
+    effects.clear();
+    effects.extend(update(state, UiEvent::Action(Action::Terminate)));
+    *shutdown_error = Some("A background task panicked; BONE stopped safely".into());
+}
+
+#[cfg(debug_assertions)]
+fn schedule_test_background_panic() {
+    const DELAY: &str = "BONE_TUI_TEST_BACKGROUND_PANIC_AFTER_MS";
+    let Some(delay) = env::var_os(DELAY).and_then(|value| value.to_str()?.parse::<u64>().ok())
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        panic!("injected detached-task panic for terminal lifecycle testing");
+    });
+}
+
+#[cfg(not(debug_assertions))]
+fn schedule_test_background_panic() {}
 
 /// Draw every state change before accepting another input or runtime event.
 ///
@@ -270,6 +432,7 @@ fn summarize_overview(
 ) -> (
     Vec<bone_app::SessionInfo>,
     std::collections::BTreeMap<bone_app::SessionId, SessionStatus>,
+    std::collections::BTreeMap<bone_app::SessionId, bone_app::SessionSummary>,
 ) {
     let mut statuses = overview
         .sessions
@@ -297,18 +460,27 @@ fn summarize_overview(
         .iter()
         .map(|summary| summary.session.clone())
         .collect();
-    (sessions, statuses)
+    let summaries = overview
+        .sessions
+        .iter()
+        .cloned()
+        .map(|summary| (summary.session.id, summary))
+        .collect();
+    (sessions, statuses, summaries)
 }
 
 async fn wait_for_draft_flush<T>(
     flush: impl Future<Output = T>,
     process_signals: &mut mpsc::UnboundedReceiver<ProcessSignal>,
+    panic_signal: &PanicSignal,
+    watch_for_panic: bool,
     timeout: Duration,
 ) -> FlushWait<T> {
     tokio::pin!(flush);
     tokio::select! {
         result = &mut flush => FlushWait::Completed(result),
         _ = tokio::time::sleep(timeout) => FlushWait::TimedOut,
+        _ = panic_signal.notified(), if watch_for_panic => FlushWait::Panic,
         signal = process_signals.recv() => {
             FlushWait::Process(signal.expect("process signal forwarders remain alive"))
         },
@@ -417,6 +589,15 @@ fn suspend_and_resume(
     suspend_process()?;
     terminal.resume()?;
     state.terminal_capabilities = terminal.capabilities().clone();
+    let viewport = terminal.terminal().size()?;
+    let _ = update(
+        state,
+        UiEvent::Resized {
+            width: viewport.width,
+            height: viewport.height,
+        },
+    );
+    state.caret_visible = true;
     *frame_snapshot = None;
     state.dirty = true;
     Ok(())
@@ -440,6 +621,8 @@ mod tests {
         let result = wait_for_draft_flush(
             std::future::pending::<()>(),
             &mut rx,
+            &PanicSignal::new(),
+            true,
             Duration::from_secs(60),
         )
         .await;
@@ -452,12 +635,33 @@ mod tests {
     #[tokio::test]
     async fn draft_flush_has_a_strict_deadline() {
         let (_tx, mut rx) = mpsc::unbounded_channel();
+        let panic_signal = PanicSignal::new();
         let result = wait_for_draft_flush(
             std::future::pending::<()>(),
             &mut rx,
+            &panic_signal,
+            true,
             Duration::from_millis(1),
         )
         .await;
         assert!(matches!(result, FlushWait::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn detached_panic_interrupts_a_pending_draft_flush() {
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let panic_signal = PanicSignal::new();
+        panic_signal.trip();
+
+        let result = wait_for_draft_flush(
+            std::future::pending::<()>(),
+            &mut rx,
+            &panic_signal,
+            true,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(matches!(result, FlushWait::Panic));
     }
 }

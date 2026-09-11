@@ -143,6 +143,19 @@ pub struct CreateSessionRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session: SessionInfo,
+    /// Milliseconds since the Unix epoch when the session was created.
+    #[serde(default)]
+    pub created_at: i64,
+    /// Number of user inputs and assistant replies in the projected history prefix.
+    #[serde(default)]
+    pub message_count: u64,
+    /// A bounded UTF-8 prefix of the most recent assistant reply in that prefix.
+    #[serde(default)]
+    pub latest_reply_preview: Option<String>,
+    /// Whether the message fields are still catching up and must be presented
+    /// as unavailable rather than as complete session facts.
+    #[serde(default)]
+    pub projection_pending: bool,
     pub has_draft: bool,
     pub draft_bytes: u64,
     pub persisted_runtime: Option<RuntimeId>,

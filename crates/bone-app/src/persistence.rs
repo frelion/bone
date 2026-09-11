@@ -25,8 +25,8 @@ use crate::{
     SubmitInput, UnresolvedWriteStatus, UnresolvedWriteView, WorkspaceId, WorkspaceInfo,
     WorkspaceOverview, WriteResolution,
     storage::{
-        BoneStore, DocumentKey, JournalKey, Lease, LeaseKey, Revision, StoreError, StoreRoots,
-        WriteTransaction,
+        BoneStore, DocumentKey, Journal, JournalAppend, JournalKey, Lease, LeaseKey,
+        MAX_JOURNAL_ENTRY_BYTES, Revision, StoreError, StoreRoots, WriteTransaction,
     },
 };
 
@@ -47,6 +47,9 @@ struct StoredCoreState {
 const CORE_CHUNK_BYTES: usize = 512 * 1024;
 const EVIDENCE_BODY_CHUNK_BYTES: usize = 64 * 1024;
 const LEGACY_EVIDENCE_BACKFILL_LIMIT: usize = 4;
+const SESSION_SUMMARY_BACKFILL_RECORDS: usize = 64;
+const SESSION_SUMMARY_BACKFILL_BYTES: usize = MAX_JOURNAL_ENTRY_BYTES;
+const LATEST_REPLY_PREVIEW_BYTES: usize = 1024;
 
 #[derive(Serialize, Deserialize)]
 struct CoreDocument {
@@ -143,6 +146,22 @@ struct StoredCreateSessionRequest {
     title: String,
     provisional: bool,
     session: SessionId,
+}
+
+/// Durable projection used by workspace navigation. `through` refers to the
+/// raw session journal, including records that do not produce a visible
+/// message, so a missing legacy projection can be caught up exactly once.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct SessionSummaryProjection {
+    through: SessionSeq,
+    message_count: u64,
+    latest_reply_preview: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SessionSummaryProjectionWork {
+    records: usize,
+    payload_bytes: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1039,12 +1058,20 @@ impl DataStore {
             draft: String::new(),
         };
         let session_document = self.store.document(session_key(session.info.id));
+        let summary_document = self
+            .store
+            .document(session_summary_projection_key(session.info.id));
         let projection_document = self.store.document(result_projection_key(session.info.id));
         let evidence_projection_document = self
             .store
             .document(evidence_projection_key(session.info.id));
         self.store.transaction(|transaction| {
             transaction.replace(&session_document, &session, Revision::default())?;
+            transaction.replace(
+                &summary_document,
+                &SessionSummaryProjection::default(),
+                Revision::default(),
+            )?;
             transaction.replace(
                 &projection_document,
                 &ResultProjectionState {
@@ -1117,6 +1144,13 @@ impl DataStore {
             transaction.replace(
                 &self.store.document(session_key(session.info.id)),
                 &session,
+                Revision::default(),
+            )?;
+            transaction.replace(
+                &self
+                    .store
+                    .document(session_summary_projection_key(session.info.id)),
+                &SessionSummaryProjection::default(),
                 Revision::default(),
             )?;
             transaction.replace(
@@ -1212,33 +1246,51 @@ impl DataStore {
     }
 
     /// Build a workspace navigation snapshot without acquiring a Session lease
-    /// or starting a Runtime. Legacy databases may first advance one bounded
-    /// derived-attention backfill window; business records remain read-only.
+    /// or starting a Runtime. Legacy databases advance one bounded navigation
+    /// slice and one bounded attention backfill window; business records remain
+    /// read-only. Incomplete navigation fields are marked on each summary.
     pub fn workspace_overview(
         &self,
         workspace: WorkspaceInfo,
     ) -> Result<WorkspaceOverview, StoreError> {
+        self.advance_session_summary_projections(workspace.id)?;
         let attention_projection_pending = self.backfill_attention_projection()?;
         self.store.read_transaction(|transaction| {
             let mut saved_sessions = Vec::new();
             for entry in transaction.list_documents::<SavedSession>(NAMESPACE, "session/")? {
+                let created_at = entry.created_at;
                 let Some(session) = entry.snapshot?.value else {
                     continue;
                 };
                 if session.info.workspace == workspace.id {
-                    saved_sessions.push(session);
+                    saved_sessions.push((session, created_at));
                 }
             }
-            saved_sessions.sort_by_key(|session| session.info.id);
+            saved_sessions.sort_by_key(|(session, _)| session.info.id);
 
             let mut sessions = Vec::with_capacity(saved_sessions.len());
-            for saved in saved_sessions {
+            for (saved, created_at) in saved_sessions {
                 let journal = self
                     .store
                     .journal::<StoredEvent>(journal_key(saved.info.id));
                 let history_through = SessionSeq(transaction.journal_last_sequence(&journal)?);
+                let projection = transaction
+                    .read(&self.store.document::<SessionSummaryProjection>(
+                        session_summary_projection_key(saved.info.id),
+                    ))?
+                    .value
+                    .unwrap_or_default();
+                if projection.through > history_through {
+                    return Err(StoreError::Corrupt {
+                        message: "session summary projection is ahead of its journal",
+                    });
+                }
                 sessions.push(SessionSummary {
                     session: saved.info,
+                    created_at,
+                    message_count: projection.message_count,
+                    latest_reply_preview: projection.latest_reply_preview,
+                    projection_pending: projection.through != history_through,
                     has_draft: !saved.draft.is_empty(),
                     draft_bytes: saved.draft.len() as u64,
                     persisted_runtime: saved.runtime.map(|runtime| runtime.id),
@@ -1315,6 +1367,113 @@ impl DataStore {
                 attention_projection_pending,
             })
         })
+    }
+
+    /// Advance at most one globally bounded slice of legacy or mixed-version
+    /// history. A later overview resumes from each projection's durable cursor.
+    fn advance_session_summary_projections(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<(), StoreError> {
+        let mut sessions = Vec::new();
+        for entry in self
+            .store
+            .list_documents::<SavedSession>(NAMESPACE, "session/")?
+        {
+            let Some(saved) = entry.snapshot?.value else {
+                continue;
+            };
+            if saved.info.workspace == workspace {
+                sessions.push(saved.info.id);
+            }
+        }
+        let mut records = SESSION_SUMMARY_BACKFILL_RECORDS;
+        let mut payload_bytes = SESSION_SUMMARY_BACKFILL_BYTES;
+        for session in sessions {
+            if records == 0 || payload_bytes == 0 {
+                break;
+            }
+            let work = self.advance_session_summary_projection(session, records, payload_bytes)?;
+            records = records.saturating_sub(work.records);
+            payload_bytes = payload_bytes.saturating_sub(work.payload_bytes);
+        }
+        Ok(())
+    }
+
+    fn advance_session_summary_projection(
+        &self,
+        session: SessionId,
+        maximum_records: usize,
+        maximum_payload_bytes: usize,
+    ) -> Result<SessionSummaryProjectionWork, StoreError> {
+        let document = self
+            .store
+            .document::<SessionSummaryProjection>(session_summary_projection_key(session));
+        let journal = self.store.journal::<StoredEvent>(journal_key(session));
+        let current = self.store.read_transaction(|transaction| {
+            let projection = transaction.read(&document)?.value.unwrap_or_default();
+            let history_through = transaction.journal_last_sequence(&journal)?;
+            if projection.through.0 > history_through {
+                return Err(StoreError::Corrupt {
+                    message: "session summary projection is ahead of its journal",
+                });
+            }
+            Ok(projection.through.0 == history_through)
+        })?;
+        if current {
+            return Ok(SessionSummaryProjectionWork::default());
+        }
+        self.store.transaction(|transaction| {
+            let snapshot = transaction.read(&document)?;
+            let prior = snapshot.value;
+            let mut projection = prior.clone().unwrap_or_default();
+            let work = advance_session_summary_projection(
+                transaction,
+                &journal,
+                &mut projection,
+                maximum_records,
+                maximum_payload_bytes,
+            )?;
+            if prior.as_ref() != Some(&projection) {
+                transaction.replace(&document, &projection, snapshot.revision)?;
+            }
+            Ok(work)
+        })
+    }
+
+    /// Keep ordinary writes constant-time. A current projection advances in
+    /// the same transaction; a missing or stale projection remains a durable
+    /// prefix and is resumed by later overview calls.
+    fn append_session_event(
+        &self,
+        transaction: &WriteTransaction<'_, '_>,
+        session: SessionId,
+        journal: &Journal<StoredEvent>,
+        event: &StoredEvent,
+    ) -> Result<JournalAppend, StoreError> {
+        let document = self
+            .store
+            .document::<SessionSummaryProjection>(session_summary_projection_key(session));
+        let snapshot = transaction.read(&document)?;
+        let history_through = transaction.journal_last_sequence(journal)?;
+        if snapshot
+            .value
+            .as_ref()
+            .is_some_and(|projection| projection.through.0 > history_through)
+        {
+            return Err(StoreError::Corrupt {
+                message: "session summary projection is ahead of its journal",
+            });
+        }
+        let mut projection = snapshot
+            .value
+            .filter(|projection| projection.through.0 == history_through);
+        let append = transaction.append(journal, event)?;
+        if let Some(projection) = &mut projection {
+            apply_session_summary_event(projection, append.sequence, event)?;
+            transaction.replace(&document, projection, snapshot.revision)?;
+        }
+        Ok(append)
     }
 
     /// Advance the legacy attention projection by one fixed document window.
@@ -1542,7 +1701,12 @@ impl DataStore {
                     text: input.text.clone(),
                     reply_to: input.reply_to,
                 };
-                let append = transaction.append(&journal, &StoredEvent::App(event))?;
+                let append = self.append_session_event(
+                    transaction,
+                    session,
+                    &journal,
+                    &StoredEvent::App(event),
+                )?;
                 let saved_at = SessionSeq(append.sequence);
                 let saved = InputView {
                     id,
@@ -1605,7 +1769,14 @@ impl DataStore {
             })?;
             input.state = state;
             let sequence = event
-                .map(|event| transaction.append(&journal, &StoredEvent::App(event)))
+                .map(|event| {
+                    self.append_session_event(
+                        transaction,
+                        session,
+                        &journal,
+                        &StoredEvent::App(event),
+                    )
+                })
                 .transpose()?
                 .map(|append| SessionSeq(append.sequence));
             transaction.replace(&document, &input, snapshot.revision)?;
@@ -1661,7 +1832,9 @@ impl DataStore {
                 input.state = InputState::Cancelled;
                 transaction.replace(&document, &input, snapshot.revision)?;
                 self.sync_input_attention(transaction, saved.info.workspace, session, &input)?;
-                transaction.append(
+                self.append_session_event(
+                    transaction,
+                    session,
                     &journal,
                     &StoredEvent::App(SessionEvent::InputCancelled { input: *id }),
                 )?;
@@ -1842,7 +2015,7 @@ impl DataStore {
             };
             let source = evidence_source_projection(record);
             self.sync_evidence_source(transaction, source_ref, &source)?;
-            let append = transaction.append(&journal, &stored)?;
+            let append = self.append_session_event(transaction, session, &journal, &stored)?;
             if let Some(result) = result_summary(session, SessionSeq(append.sequence), &stored) {
                 transaction.replace(
                     &self
@@ -1961,7 +2134,9 @@ impl DataStore {
                 self.sync_input_attention(transaction, saved.info.workspace, session, &input)?;
             }
             if !interrupted.is_empty() {
-                transaction.append(
+                self.append_session_event(
+                    transaction,
+                    session,
                     &journal,
                     &StoredEvent::App(SessionEvent::Interrupted {
                         runtime: runtime.id,
@@ -1969,7 +2144,9 @@ impl DataStore {
                     }),
                 )?;
             }
-            transaction.append(
+            self.append_session_event(
+                transaction,
+                session,
                 &journal,
                 &StoredEvent::App(SessionEvent::RuntimeClosed {
                     runtime: runtime.id,
@@ -2241,7 +2418,9 @@ impl DataStore {
             if attention_snapshot.value.is_some() {
                 transaction.delete(&attention, attention_snapshot.revision)?;
             }
-            transaction.append(
+            self.append_session_event(
+                transaction,
+                session,
                 &journal,
                 &StoredEvent::App(SessionEvent::WriteResolved {
                     call,
@@ -2617,7 +2796,9 @@ impl DataStore {
                 }
                 None => None,
             };
-            let accepted = transaction.append(
+            let accepted = self.append_session_event(
+                transaction,
+                submission.result.session,
                 &journal,
                 &StoredEvent::App(SessionEvent::AcceptanceRecorded {
                     acceptance,
@@ -2633,14 +2814,17 @@ impl DataStore {
                     .next_input
                     .checked_add(1)
                     .ok_or(StoreError::RevisionExhausted)?;
-                let submitted = transaction.append(
+                let submitted_event = StoredEvent::App(SessionEvent::InputSubmitted {
+                    input: id,
+                    request_id: input.request_id,
+                    text: input.text.clone(),
+                    reply_to: input.reply_to,
+                });
+                let submitted = self.append_session_event(
+                    transaction,
+                    submission.result.session,
                     &journal,
-                    &StoredEvent::App(SessionEvent::InputSubmitted {
-                        input: id,
-                        request_id: input.request_id,
-                        text: input.text.clone(),
-                        reply_to: input.reply_to,
-                    }),
+                    &submitted_event,
                 )?;
                 let receipt = SubmissionReceipt {
                     input: id,
@@ -3073,7 +3257,12 @@ impl DataStore {
                 message: "session does not exist",
             })?;
             update(&mut saved)?;
-            let append = transaction.append(&journal, &StoredEvent::App(event))?;
+            let append = self.append_session_event(
+                transaction,
+                session,
+                &journal,
+                &StoredEvent::App(event),
+            )?;
             transaction.replace(&document, &saved, snapshot.revision)?;
             Ok(SessionSeq(append.sequence))
         })
@@ -3171,6 +3360,94 @@ fn public_agent_event(runtime: RuntimeId, record: &Record) -> Option<SessionEven
     }
 }
 
+fn advance_session_summary_projection(
+    transaction: &WriteTransaction<'_, '_>,
+    journal: &Journal<StoredEvent>,
+    projection: &mut SessionSummaryProjection,
+    maximum_records: usize,
+    maximum_payload_bytes: usize,
+) -> Result<SessionSummaryProjectionWork, StoreError> {
+    let history_through = transaction.journal_last_sequence(journal)?;
+    if projection.through.0 > history_through {
+        return Err(StoreError::Corrupt {
+            message: "session summary projection is ahead of its journal",
+        });
+    }
+    if projection.through.0 == history_through {
+        return Ok(SessionSummaryProjectionWork::default());
+    }
+    let page = transaction.read_after_bounded(
+        journal,
+        projection.through.0,
+        maximum_records,
+        maximum_payload_bytes,
+    )?;
+    let work = SessionSummaryProjectionWork {
+        records: page.entries.len(),
+        payload_bytes: page.payload_bytes,
+    };
+    let has_more = page.has_more;
+    for entry in page.entries {
+        apply_session_summary_event(projection, entry.sequence, &entry.event)?;
+    }
+    debug_assert_eq!(has_more, projection.through.0 < history_through);
+    Ok(work)
+}
+
+fn apply_session_summary_event(
+    projection: &mut SessionSummaryProjection,
+    sequence: u64,
+    event: &StoredEvent,
+) -> Result<(), StoreError> {
+    let expected = projection
+        .through
+        .0
+        .checked_add(1)
+        .ok_or(StoreError::RevisionExhausted)?;
+    if sequence != expected {
+        return Err(StoreError::Corrupt {
+            message: "session summary projection is not contiguous",
+        });
+    }
+    match event {
+        StoredEvent::App(SessionEvent::InputSubmitted { .. }) => {
+            projection.message_count = projection
+                .message_count
+                .checked_add(1)
+                .ok_or(StoreError::RevisionExhausted)?;
+        }
+        StoredEvent::App(SessionEvent::Reply { text, .. })
+        | StoredEvent::Agent {
+            record:
+                Record {
+                    body: bone_core::RecordBody::Reply { text, .. },
+                    ..
+                },
+            ..
+        } => {
+            projection.message_count = projection
+                .message_count
+                .checked_add(1)
+                .ok_or(StoreError::RevisionExhausted)?;
+            projection.latest_reply_preview = Some(bounded_reply_preview(text));
+        }
+        _ => {}
+    }
+    projection.through = SessionSeq(sequence);
+    Ok(())
+}
+
+fn bounded_reply_preview(text: &str) -> String {
+    if text.len() <= LATEST_REPLY_PREVIEW_BYTES {
+        return text.to_owned();
+    }
+    let mut end = LATEST_REPLY_PREVIEW_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
 fn result_summary(
     session: SessionId,
     version: SessionSeq,
@@ -3255,6 +3532,10 @@ fn catalog_key() -> DocumentKey {
 
 fn session_key(id: SessionId) -> DocumentKey {
     DocumentKey::new(NAMESPACE, format!("session/{id}"))
+}
+
+fn session_summary_projection_key(id: SessionId) -> DocumentKey {
+    DocumentKey::new(NAMESPACE, format!("session-summary-projection/{id}"))
 }
 
 fn create_session_request_key(id: RequestId) -> DocumentKey {
@@ -3506,6 +3787,289 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn delete_session_summary_projection(store: &DataStore, session: SessionId) {
+        let projection = store
+            .store
+            .document::<SessionSummaryProjection>(session_summary_projection_key(session));
+        store
+            .store
+            .transaction(|transaction| {
+                let snapshot = transaction.read(&projection)?;
+                transaction.delete(&projection, snapshot.revision)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn workspace_overview_backfills_exact_navigation_summaries_for_legacy_sessions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let store = DataStore::open(temporary.path().join("data")).unwrap();
+        let workspace = store.workspace(&root).unwrap();
+        let active = store.create_session(workspace.id, "active".into()).unwrap();
+        let empty = store.create_session(workspace.id, "empty".into()).unwrap();
+
+        for session in [active.info.id, empty.info.id] {
+            delete_session_summary_projection(&store, session);
+        }
+
+        let journal = store
+            .store
+            .journal::<StoredEvent>(journal_key(active.info.id));
+        let runtime = RuntimeId::new();
+        journal
+            .append(&StoredEvent::App(SessionEvent::InputSubmitted {
+                input: InputId(1),
+                request_id: RequestId::new(),
+                text: "question".into(),
+                reply_to: None,
+            }))
+            .unwrap();
+        journal
+            .append(&StoredEvent::Agent {
+                runtime,
+                record: Record {
+                    seq: bone_core::Seq(1),
+                    origin: bone_core::Origin::Kernel,
+                    body: bone_core::RecordBody::Reply {
+                        job: bone_core::JobId(1),
+                        inputs: vec![bone_core::InputId(1)],
+                        text: "older reply".into(),
+                    },
+                },
+            })
+            .unwrap();
+        let latest = "界".repeat(400);
+        journal
+            .append(&StoredEvent::Agent {
+                runtime,
+                record: Record {
+                    seq: bone_core::Seq(2),
+                    origin: bone_core::Origin::Kernel,
+                    body: bone_core::RecordBody::Reply {
+                        job: bone_core::JobId(1),
+                        inputs: vec![bone_core::InputId(1)],
+                        text: latest.clone(),
+                    },
+                },
+            })
+            .unwrap();
+
+        let overview = store.workspace_overview(workspace.clone()).unwrap();
+        let active_summary = overview
+            .sessions
+            .iter()
+            .find(|summary| summary.session.id == active.info.id)
+            .unwrap();
+        assert!(active_summary.created_at > 0);
+        assert_eq!(active_summary.message_count, 3);
+        assert!(!active_summary.projection_pending);
+        assert_eq!(
+            active_summary.latest_reply_preview.as_deref(),
+            Some(bounded_reply_preview(&latest).as_str())
+        );
+        assert!(
+            active_summary.latest_reply_preview.as_ref().unwrap().len()
+                <= LATEST_REPLY_PREVIEW_BYTES
+        );
+
+        let empty_summary = overview
+            .sessions
+            .iter()
+            .find(|summary| summary.session.id == empty.info.id)
+            .unwrap();
+        assert!(empty_summary.created_at > 0);
+        assert_eq!(empty_summary.message_count, 0);
+        assert_eq!(empty_summary.latest_reply_preview, None);
+        assert!(!empty_summary.projection_pending);
+
+        let persisted = store
+            .store
+            .document::<SessionSummaryProjection>(session_summary_projection_key(active.info.id))
+            .read()
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!(persisted.through, SessionSeq(3));
+        assert_eq!(persisted.message_count, 3);
+
+        drop(store);
+        let reopened = DataStore::open(temporary.path().join("data")).unwrap();
+        let second = reopened.workspace_overview(workspace).unwrap();
+        assert_eq!(overview.sessions, second.sessions);
+    }
+
+    #[test]
+    fn session_summary_backfill_is_globally_record_bounded_and_resumable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let data = temporary.path().join("data");
+        let store = DataStore::open(&data).unwrap();
+        let workspace = store.workspace(&root).unwrap();
+        let sessions = [
+            store.create_session(workspace.id, "first".into()).unwrap(),
+            store.create_session(workspace.id, "second".into()).unwrap(),
+        ];
+        for session in &sessions {
+            delete_session_summary_projection(&store, session.info.id);
+            let journal = store
+                .store
+                .journal::<StoredEvent>(journal_key(session.info.id));
+            for input in 1..=40 {
+                journal
+                    .append(&StoredEvent::App(SessionEvent::InputSubmitted {
+                        input: InputId(input),
+                        request_id: RequestId::new(),
+                        text: format!("message {input}"),
+                        reply_to: None,
+                    }))
+                    .unwrap();
+            }
+        }
+
+        let first = store.workspace_overview(workspace.clone()).unwrap();
+        assert_eq!(
+            first
+                .sessions
+                .iter()
+                .map(|summary| summary.message_count)
+                .sum::<u64>(),
+            SESSION_SUMMARY_BACKFILL_RECORDS as u64
+        );
+        assert!(
+            first
+                .sessions
+                .iter()
+                .any(|summary| summary.projection_pending)
+        );
+
+        drop(store);
+        let reopened = DataStore::open(&data).unwrap();
+        let second = reopened.workspace_overview(workspace.clone()).unwrap();
+        assert_eq!(
+            second
+                .sessions
+                .iter()
+                .map(|summary| summary.message_count)
+                .sum::<u64>(),
+            80
+        );
+        assert!(
+            second
+                .sessions
+                .iter()
+                .all(|summary| !summary.projection_pending)
+        );
+
+        let stable = reopened.workspace_overview(workspace).unwrap();
+        assert_eq!(second.sessions, stable.sessions);
+    }
+
+    #[test]
+    fn stale_summary_projection_does_not_expand_append_work_and_obeys_byte_budget() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let data = temporary.path().join("data");
+        let store = DataStore::open(&data).unwrap();
+        let workspace = store.workspace(&root).unwrap();
+        let session = store
+            .create_session(workspace.id, "large legacy history".into())
+            .unwrap();
+        delete_session_summary_projection(&store, session.info.id);
+
+        let journal = store
+            .store
+            .journal::<StoredEvent>(journal_key(session.info.id));
+        let large_body = "x".repeat(1024 * 1024);
+        let runtime = RuntimeId::new();
+        let mut encoded_sizes = Vec::new();
+        let mut latest_reply = String::new();
+        for sequence in 1..=12 {
+            latest_reply = format!("reply {sequence} {large_body}");
+            let event = StoredEvent::Agent {
+                runtime,
+                record: Record {
+                    seq: bone_core::Seq(sequence),
+                    origin: bone_core::Origin::Kernel,
+                    body: bone_core::RecordBody::Reply {
+                        job: bone_core::JobId(1),
+                        inputs: vec![bone_core::InputId(1)],
+                        text: latest_reply.clone(),
+                    },
+                },
+            };
+            encoded_sizes.push(serde_json::to_vec(&event).unwrap().len());
+            journal.append(&event).unwrap();
+        }
+
+        store
+            .accept_input(session.info.id, &SubmitInput::new("new message"))
+            .unwrap();
+        assert!(
+            store
+                .store
+                .document::<SessionSummaryProjection>(session_summary_projection_key(
+                    session.info.id
+                ))
+                .read()
+                .unwrap()
+                .value
+                .is_none(),
+            "an ordinary append must not migrate stale history while holding the writer"
+        );
+
+        let first = store.workspace_overview(workspace.clone()).unwrap();
+        let summary = first
+            .sessions
+            .iter()
+            .find(|summary| summary.session.id == session.info.id)
+            .unwrap();
+        assert!(summary.projection_pending);
+        let projection = store
+            .store
+            .document::<SessionSummaryProjection>(session_summary_projection_key(session.info.id))
+            .read()
+            .unwrap()
+            .value
+            .unwrap();
+        let processed = projection.through.0 as usize;
+        assert!(processed > 0 && processed < encoded_sizes.len());
+        let materialized = encoded_sizes[..processed].iter().sum::<usize>();
+        assert!(materialized <= SESSION_SUMMARY_BACKFILL_BYTES);
+        assert!(
+            materialized + encoded_sizes[processed] > SESSION_SUMMARY_BACKFILL_BYTES,
+            "the next payload, rather than a record-count boundary, must stop this slice"
+        );
+
+        drop(store);
+        let reopened = DataStore::open(&data).unwrap();
+        let mut overview = first;
+        for _ in 0..4 {
+            if overview
+                .sessions
+                .iter()
+                .all(|summary| !summary.projection_pending)
+            {
+                break;
+            }
+            overview = reopened.workspace_overview(workspace.clone()).unwrap();
+        }
+        let summary = overview
+            .sessions
+            .iter()
+            .find(|summary| summary.session.id == session.info.id)
+            .unwrap();
+        assert!(!summary.projection_pending);
+        assert_eq!(summary.message_count, 13);
+        assert_eq!(
+            summary.latest_reply_preview.as_deref(),
+            Some(bounded_reply_preview(&latest_reply).as_str())
+        );
     }
 
     #[test]

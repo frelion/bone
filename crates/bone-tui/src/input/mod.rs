@@ -36,20 +36,29 @@ pub(crate) fn terminal_event(
         Event::Key(key) if key.kind == KeyEventKind::Press => key_action(key, state),
         Event::FocusLost => Some(Action::EndPaneResize),
         Event::Mouse(mouse) => pointer::action(mouse, snapshot, state),
-        Event::Resize(_, _) => return Some(UiEvent::Resized),
+        Event::Resize(width, height) => return Some(UiEvent::Resized { width, height }),
         Event::Paste(text) if matches!(state.panel, Some(crate::state::Panel::ModelSetup)) => {
             Some(Action::SetupText(text.into()))
         }
-        Event::Paste(text) if matches!(state.panel, Some(crate::state::Panel::Rename)) => {
-            Some(Action::RenameText(text))
-        }
         Event::Paste(_) if state.panel.is_some() => None,
+        Event::Paste(text) if state.focus == crate::state::Focus::SessionTitle => {
+            Some(Action::TitlePaste(text))
+        }
         Event::Paste(text) => Some(Action::Paste(text)),
         _ => None,
     }?;
 
     if snapshot.is_some_and(|frame| frame.layout.mode == LayoutMode::TooSmall)
         && !matches!(action, Action::Quit | Action::Terminate)
+    {
+        return None;
+    }
+    if matches!(action, Action::FocusRight)
+        && matches!(
+            state.focus,
+            crate::state::Focus::SessionTitle | crate::state::Focus::Composer
+        )
+        && snapshot.is_none_or(|frame| frame.layout.extension_blank.is_none())
     {
         return None;
     }
@@ -116,10 +125,22 @@ fn frame_for_layout(layout: LayoutPlan) -> FrameSnapshot {
             target: HitTarget::Conversation,
         });
     }
+    if let Some(area) = layout.session_header {
+        hits.push(HitRegion {
+            area,
+            target: HitTarget::SessionTitle,
+        });
+    }
     if let Some(area) = layout.composer {
         hits.push(HitRegion {
             area,
             target: HitTarget::Composer,
+        });
+    }
+    if let Some(area) = layout.extension_blank {
+        hits.push(HitRegion {
+            area,
+            target: HitTarget::RightRail,
         });
     }
     FrameSnapshot::new(layout, hits, None, 0)
@@ -148,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_pages_read_history_and_conversation_end_follows_tail() {
+    fn center_editors_page_history_and_keep_their_own_end_key() {
         let mut state = UiState::default();
         assert!(matches!(
             mapped_key_action(key(KeyCode::PageUp, KeyModifiers::NONE), &state),
@@ -158,33 +179,53 @@ mod tests {
             mapped_key_action(key(KeyCode::PageDown, KeyModifiers::NONE), &state),
             Action::ScrollDown(10)
         ));
-        state.focus = Focus::Conversation;
         assert!(matches!(
             mapped_key_action(key(KeyCode::End, KeyModifiers::NONE), &state),
-            Action::FollowTail
+            Action::CursorEnd
+        ));
+        state.focus = Focus::SessionTitle;
+        assert!(matches!(
+            mapped_key_action(key(KeyCode::PageUp, KeyModifiers::NONE), &state),
+            Action::ScrollUp { .. }
+        ));
+        assert!(matches!(
+            mapped_key_action(key(KeyCode::PageDown, KeyModifiers::NONE), &state),
+            Action::ScrollDown(10)
+        ));
+        assert!(matches!(
+            mapped_key_action(key(KeyCode::End, KeyModifiers::NONE), &state),
+            Action::TitleEnd
         ));
     }
 
     #[test]
     fn ctrl_arrows_are_the_only_spatial_focus_keys() {
-        let state = UiState::default();
-        assert!(matches!(
-            mapped_key_action(key(KeyCode::Left, KeyModifiers::CONTROL), &state),
-            Action::FocusLeft
-        ));
-        assert!(matches!(
-            mapped_key_action(key(KeyCode::Right, KeyModifiers::CONTROL), &state),
-            Action::FocusRight
-        ));
-        assert!(matches!(
-            mapped_key_action(key(KeyCode::Up, KeyModifiers::CONTROL), &state),
-            Action::FocusUp
-        ));
-        assert!(matches!(
-            mapped_key_action(key(KeyCode::Down, KeyModifiers::CONTROL), &state),
-            Action::FocusDown
-        ));
-        assert!(key_action(key(KeyCode::Tab, KeyModifiers::NONE), &state).is_none());
+        for focus in [
+            Focus::Sessions,
+            Focus::SessionTitle,
+            Focus::Composer,
+            Focus::RightRail,
+        ] {
+            let mut state = UiState::default();
+            state.focus = focus;
+            assert!(matches!(
+                mapped_key_action(key(KeyCode::Left, KeyModifiers::CONTROL), &state),
+                Action::FocusLeft
+            ));
+            assert!(matches!(
+                mapped_key_action(key(KeyCode::Right, KeyModifiers::CONTROL), &state),
+                Action::FocusRight
+            ));
+            assert!(matches!(
+                mapped_key_action(key(KeyCode::Up, KeyModifiers::CONTROL), &state),
+                Action::FocusUp
+            ));
+            assert!(matches!(
+                mapped_key_action(key(KeyCode::Down, KeyModifiers::CONTROL), &state),
+                Action::FocusDown
+            ));
+            assert!(key_action(key(KeyCode::Tab, KeyModifiers::NONE), &state).is_none());
+        }
     }
 }
 
@@ -229,7 +270,10 @@ mod small_window_tests {
         );
         assert!(matches!(
             mapped_terminal_event(Event::Resize(80, 24), Some(&snapshot), &state),
-            UiEvent::Resized
+            UiEvent::Resized {
+                width: 80,
+                height: 24
+            }
         ));
     }
 }
@@ -239,29 +283,33 @@ mod model_keyboard_tests {
     use super::*;
 
     #[test]
-    fn rename_editing_and_paste_stay_in_the_panel() {
+    fn inline_title_editor_uses_title_specific_key_and_paste_actions() {
         let mut state = UiState::default();
-        state.panel = Some(crate::state::Panel::Rename);
-        assert!(
-            matches!(mapped_key_action(KeyEvent::new(KeyCode::Char('名'), KeyModifiers::NONE), &state), Action::RenameText(text) if text == "名")
-        );
+        state.focus = Focus::SessionTitle;
+        assert!(matches!(
+            mapped_key_action(
+                KeyEvent::new(KeyCode::Char('名'), KeyModifiers::NONE),
+                &state
+            ),
+            Action::TitleInput('名')
+        ));
         assert!(matches!(
             mapped_key_action(
                 KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
                 &state
             ),
-            Action::RenameBackspace
+            Action::TitleBackspace
         ));
         assert!(matches!(
             mapped_key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state),
-            Action::ActivatePanel
+            Action::CommitTitle
         ));
         assert!(
-            matches!(mapped_terminal_event(Event::Paste("新标题".into()), None, &state), UiEvent::Action(Action::RenameText(text)) if text == "新标题")
+            matches!(mapped_terminal_event(Event::Paste("新标题".into()), None, &state), UiEvent::Action(Action::TitlePaste(text)) if text == "新标题")
         );
         assert!(matches!(
             mapped_key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &state),
-            Action::Escape
+            Action::CancelTitle
         ));
     }
 
@@ -314,7 +362,7 @@ mod model_keyboard_tests {
         let mut state = UiState::default();
         state.orphan_draft = "ab中文".into();
         state.orphan_cursor = state.orphan_draft.len();
-        state.focus = Focus::Conversation;
+        state.focus = Focus::SessionTitle;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let mut plan = None;
@@ -455,6 +503,140 @@ mod selection_tests {
         crate::state::update(&mut state, UiEvent::Action(Action::Undo));
         assert_eq!(state.draft(), "中e\u{301}🙂");
     }
+
+    #[test]
+    fn title_shift_home_and_end_keep_the_editor_selection_anchor() {
+        for focus in [Focus::SessionTitle, Focus::Composer] {
+            let mut state = UiState::default();
+            state.focus = focus;
+            for (key, expected) in [(KeyCode::Home, -3), (KeyCode::End, 3)] {
+                let action = mapped_key_action(KeyEvent::new(key, KeyModifiers::SHIFT), &state);
+                assert!(match (focus, action) {
+                    (
+                        Focus::SessionTitle,
+                        Action::TitleMoveCursor {
+                            direction,
+                            select: true,
+                            word: false,
+                        },
+                    ) => direction == expected,
+                    (
+                        Focus::Composer,
+                        Action::MoveCursor {
+                            direction,
+                            select: true,
+                            word: false,
+                            ..
+                        },
+                    ) => direction == expected,
+                    _ => false,
+                });
+                for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT | KeyModifiers::ALT] {
+                    assert!(
+                        key_action(KeyEvent::new(key, modifiers), &state).is_none(),
+                        "{focus:?} must leave {modifiers:?}+{key:?} unbound"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn title_down_drag_and_shift_click_share_scrolled_single_line_geometry() {
+        let title = format!("{}中e\u{301}🙂zTAIL", "0123456789".repeat(12));
+        let info = bone_app::SessionInfo {
+            id: bone_app::SessionId::new(),
+            workspace: bone_app::WorkspaceId::new(),
+            title: title.clone(),
+            archived: false,
+        };
+        let mut state = UiState::default();
+        state.sessions.push(info.clone());
+        state.selected = Some(info.id);
+        state
+            .session_ui
+            .insert(info.id, crate::state::SessionUi::new(info, 1));
+        state.focus = Focus::SessionTitle;
+        assert!(state.begin_title_edit());
+
+        let draw = |state: &UiState| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+            let mut snapshot = None;
+            terminal
+                .draw(|frame| snapshot = Some(crate::view::render(frame, state)))
+                .unwrap();
+            snapshot.unwrap()
+        };
+
+        let snapshot = draw(&state);
+        let header = snapshot.layout.session_header.unwrap();
+        let origin = state.title_edit.as_ref().unwrap().editor.viewport_origin();
+        let expected_down = crate::editor::cursor_at_single_line(&title, origin, 1);
+        let down = mapped_terminal_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: header.x + 1,
+                row: header.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Some(&snapshot),
+            &state,
+        );
+        assert!(
+            matches!(&down, UiEvent::Action(Action::PlaceTitleCursor(byte)) if *byte == expected_down)
+        );
+        crate::state::update(&mut state, down);
+        let edit = state.title_edit.as_ref().unwrap();
+        assert_eq!(edit.cursor, expected_down);
+        assert_eq!(edit.editor.selection(edit.cursor), None);
+
+        let snapshot = draw(&state);
+        let origin = state.title_edit.as_ref().unwrap().editor.viewport_origin();
+        let expected_drag = crate::editor::cursor_at_single_line(&title, origin, 6);
+        let drag = mapped_terminal_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: header.x + 6,
+                row: header.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Some(&snapshot),
+            &state,
+        );
+        assert!(
+            matches!(&drag, UiEvent::Action(Action::DragTitleCursor(byte)) if *byte == expected_drag)
+        );
+        crate::state::update(&mut state, drag);
+        let edit = state.title_edit.as_ref().unwrap();
+        assert_eq!(
+            edit.editor.selection(edit.cursor),
+            Some(expected_down.min(expected_drag)..expected_down.max(expected_drag))
+        );
+
+        let snapshot = draw(&state);
+        let origin = state.title_edit.as_ref().unwrap().editor.viewport_origin();
+        let expected_shift = crate::editor::cursor_at_single_line(&title, origin, 0);
+        let shift_click = mapped_terminal_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: header.x,
+                row: header.y,
+                modifiers: KeyModifiers::SHIFT,
+            }),
+            Some(&snapshot),
+            &state,
+        );
+        assert!(
+            matches!(&shift_click, UiEvent::Action(Action::DragTitleCursor(byte)) if *byte == expected_shift)
+        );
+        crate::state::update(&mut state, shift_click);
+        let edit = state.title_edit.as_ref().unwrap();
+        assert_eq!(
+            edit.editor.selection(edit.cursor),
+            Some(expected_down.min(expected_shift)..expected_down.max(expected_shift))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -464,9 +646,9 @@ mod pointer_submit_tests {
     fn visible_submit_click_is_distinct_from_reading_enter() {
         let mut state = UiState::default();
         state.orphan_draft = "send this".into();
-        state.focus = Focus::Conversation;
+        state.focus = Focus::RightRail;
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
         let mut plan = None;
         terminal
             .draw(|frame| plan = Some(crate::view::render(frame, &state)))
@@ -609,8 +791,16 @@ mod pane_resize_tests {
         );
         assert_eq!(state.pane_widths.left, 64);
         assert_eq!(draw(&state, 160).conversation.unwrap().width, 56);
-        update(&mut state, UiEvent::Resized);
+        state.focus = Focus::RightRail;
+        update(
+            &mut state,
+            UiEvent::Resized {
+                width: 80,
+                height: 40,
+            },
+        );
         assert_eq!(state.dragging_divider, None);
+        assert_eq!(state.focus, Focus::Composer);
         let narrow = draw(&state, 80);
         assert!(
             !narrow
@@ -660,10 +850,16 @@ mod pane_resize_tests {
     }
 
     #[test]
-    fn escape_ends_resize_without_closing_the_open_panel() {
+    fn an_open_panel_owns_pointer_input_and_escape_closes_that_scope() {
         let mut state = UiState::default();
-        update(&mut state, UiEvent::Action(Action::OpenCommands));
+        update(&mut state, UiEvent::Action(Action::OpenHelp));
         let plan = draw(&state, 160);
+        assert!(
+            !plan
+                .hit_regions()
+                .iter()
+                .any(|hit| matches!(hit.target, HitTarget::PaneDivider(_)))
+        );
         mouse(
             &mut state,
             &plan,
@@ -671,6 +867,7 @@ mod pane_resize_tests {
             31,
             0,
         );
+        assert_eq!(state.dragging_divider, None);
         let event = mapped_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Some(&plan),
@@ -678,7 +875,7 @@ mod pane_resize_tests {
         );
         update(&mut state, event);
         assert_eq!(state.dragging_divider, None);
-        assert!(matches!(state.panel, Some(crate::state::Panel::Commands)));
+        assert!(state.panel.is_none());
     }
 }
 
@@ -705,17 +902,12 @@ mod input_chord_tests {
         update(&mut state, UiEvent::Action(Action::Undo));
         assert_eq!(state.draft(), original);
         assert!(state.orphan_revision > revision);
-        for focus in [Focus::Sessions, Focus::Conversation] {
+        for focus in [Focus::Sessions, Focus::SessionTitle, Focus::RightRail] {
             state.focus = focus;
             assert!(key_action(clear, &state).is_none());
         }
         state.focus = Focus::Composer;
-        for panel in [
-            Panel::Commands,
-            Panel::Models,
-            Panel::Rename,
-            Panel::ModelSetup,
-        ] {
+        for panel in [Panel::Models, Panel::Help, Panel::ModelSetup] {
             state.panel = Some(panel);
             assert!(key_action(clear, &state).is_none());
             assert!(matches!(
@@ -755,6 +947,13 @@ mod input_chord_tests {
             )
             .is_none()
         );
+        assert!(
+            key_action(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                &state
+            )
+            .is_none()
+        );
         assert!(matches!(
             mapped_key_action(
                 KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -767,19 +966,14 @@ mod input_chord_tests {
     #[test]
     fn modified_enter_never_leaks_into_other_focuses_or_panels() {
         let mut state = UiState::default();
-        for focus in [Focus::Sessions, Focus::Conversation] {
+        for focus in [Focus::Sessions, Focus::SessionTitle, Focus::RightRail] {
             state.focus = focus;
             assert!(
                 key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &state).is_none()
             );
         }
         state.focus = Focus::Composer;
-        for panel in [
-            Panel::Commands,
-            Panel::Models,
-            Panel::Rename,
-            Panel::ModelSetup,
-        ] {
+        for panel in [Panel::Models, Panel::Help, Panel::ModelSetup] {
             state.panel = Some(panel);
             for modifiers in [
                 KeyModifiers::SHIFT,
@@ -792,9 +986,14 @@ mod input_chord_tests {
     }
 
     #[test]
-    fn ctrl_d_is_global_and_ctrl_q_never_exits() {
+    fn ctrl_d_is_global_and_ctrl_p_and_ctrl_q_remain_unbound() {
         let mut state = UiState::default();
-        for focus in [Focus::Composer, Focus::Sessions, Focus::Conversation] {
+        for focus in [
+            Focus::Composer,
+            Focus::Sessions,
+            Focus::SessionTitle,
+            Focus::RightRail,
+        ] {
             state.focus = focus;
             state.panel = None;
             assert!(matches!(
@@ -811,13 +1010,15 @@ mod input_chord_tests {
                 )
                 .is_none()
             );
+            assert!(
+                key_action(
+                    KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                    &state
+                )
+                .is_none()
+            );
         }
-        for panel in [
-            Panel::Commands,
-            Panel::Models,
-            Panel::Rename,
-            Panel::ModelSetup,
-        ] {
+        for panel in [Panel::Models, Panel::Help, Panel::ModelSetup] {
             state.panel = Some(panel);
             assert!(matches!(
                 mapped_key_action(
@@ -829,6 +1030,13 @@ mod input_chord_tests {
             assert!(
                 key_action(
                     KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                    &state
+                )
+                .is_none()
+            );
+            assert!(
+                key_action(
+                    KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
                     &state
                 )
                 .is_none()

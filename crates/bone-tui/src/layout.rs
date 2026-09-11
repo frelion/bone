@@ -97,16 +97,7 @@ pub(crate) fn comfortable(area: Rect) -> bool {
 }
 
 pub(crate) fn session_list_top(area: Rect) -> u16 {
-    area.y + if comfortable(area) { 7 } else { 4 }
-}
-
-pub(crate) fn new_session_area(area: Rect) -> Rect {
-    Rect::new(
-        area.x + 1,
-        area.y + if comfortable(area) { 3 } else { 2 },
-        area.width.saturating_sub(3),
-        if comfortable(area) { 3 } else { 1 },
-    )
+    area.y + if comfortable(area) { 4 } else { 3 }
 }
 
 pub(crate) fn composer_text_area(area: Rect) -> Rect {
@@ -324,6 +315,43 @@ pub struct LayoutPlan {
     pub slash_palette: Option<Rect>,
 }
 
+/// Vertical rhythm shared by floating menus. Comfortable terminals give each
+/// choice a blank row; compact terminals keep every choice one row tall.
+pub(crate) fn floating_menu_stride(screen: Rect) -> u16 {
+    if comfortable(screen) { 2 } else { 1 }
+}
+
+/// Place a floating surface immediately above the Composer. `body_height`
+/// includes the title, choices and footer, while this function adds the shared
+/// comfortable-layout breathing room. Panels and the attached slash palette
+/// use this exact geometry so their shells cannot drift apart.
+pub(crate) fn floating_panel_area(screen: Rect, composer: Rect, body_height: u16) -> Rect {
+    let chrome = if comfortable(screen) { 4 } else { 0 };
+    let height = body_height
+        .saturating_add(chrome)
+        .min(screen.height.saturating_sub(2))
+        .max(3);
+    Rect::new(
+        composer.x,
+        composer.y.saturating_sub(height + 1).max(screen.y + 1),
+        composer.width,
+        height,
+    )
+}
+
+/// Composer-owned overlays use the same panel geometry but never paint over
+/// the editor that continues to receive text and display its caret.
+pub(crate) fn attached_floating_panel_area(screen: Rect, composer: Rect, body_height: u16) -> Rect {
+    let area = floating_panel_area(screen, composer, body_height);
+    Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        area.height
+            .min(composer.y.saturating_sub(1).saturating_sub(area.y)),
+    )
+}
+
 impl LayoutPlan {
     pub fn calculate(
         screen: Rect,
@@ -423,14 +451,16 @@ impl LayoutPlan {
                     width,
                     composer.y.saturating_sub(area.y + top + status_gap),
                 );
-                let body_h = transcript.height;
-                let palette_h = (slash_items as u16).min(8).min(body_h);
-                let palette = (palette_h > 0).then_some(Rect::new(
-                    transcript.x,
-                    transcript.bottom().saturating_sub(palette_h),
-                    transcript.width,
-                    palette_h,
-                ));
+                let palette = (slash_items > 0).then(|| {
+                    let stride = floating_menu_stride(screen);
+                    attached_floating_panel_area(
+                        screen,
+                        composer,
+                        (slash_items as u16)
+                            .saturating_mul(stride)
+                            .saturating_add(3),
+                    )
+                });
                 (Some(header), Some(transcript), Some(composer), palette)
             });
         let mut visible_session_rows = Vec::new();
@@ -519,6 +549,10 @@ impl LayoutPlan {
     pub fn content_width(screen: Rect) -> u16 {
         PaneWidths::default().content_width(screen)
     }
+}
+
+pub(crate) fn right_rail_available(width: u16, height: u16) -> bool {
+    mode_for(Rect::new(0, 0, width, height)) == LayoutMode::Wide
 }
 
 fn mode_for(area: Rect) -> LayoutMode {
@@ -616,6 +650,25 @@ mod tests {
     }
 
     #[test]
+    fn slash_panel_uses_floating_panel_geometry_without_covering_the_composer() {
+        for (width, height) in [(40, 12), (80, 24), (100, 24), (160, 40)] {
+            let plan = LayoutPlan::calculate(
+                Rect::new(0, 0, width, height),
+                SinglePane::Conversation,
+                10,
+                &[],
+                None,
+                1,
+            );
+            let composer = plan.composer.unwrap();
+            let palette = plan.slash_palette.unwrap();
+            assert_eq!((palette.x, palette.width), (composer.x, composer.width));
+            assert!(palette.bottom() < composer.y);
+            assert!(palette.y > plan.screen.y);
+        }
+    }
+
+    #[test]
     fn blank_extension_has_no_session_geometry() {
         let plan = LayoutPlan::calculate(
             Rect::new(0, 0, 180, 40),
@@ -650,12 +703,12 @@ mod session_scroll_tests {
             plan.session_rows.first(),
             Some(&SessionRow {
                 index: 3,
-                area: Rect::new(1, 4, 77, 1),
+                area: Rect::new(1, 3, 77, 1),
             })
         );
         plan.scroll_sessions(&rows, usize::MAX);
         assert_eq!(plan.session_start, 13);
         assert_eq!(plan.session_rows.last().map(|row| row.index), Some(19));
-        assert_eq!(plan.session_rows.last().map(|row| row.area.y), Some(16));
+        assert_eq!(plan.session_rows.last().map(|row| row.area.y), Some(15));
     }
 }

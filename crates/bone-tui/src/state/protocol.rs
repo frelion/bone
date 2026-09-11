@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bone_app::{
     HistoryCursor, HistoryPage, InputId, QuestionId, RecentHistoryPage, RequestId, SessionId,
-    SessionInfo, SessionView, SubmissionReceipt, SubmitInput, WorkspaceId,
+    SessionInfo, SessionSummary, SessionView, SubmissionReceipt, SubmitInput, WorkspaceId,
 };
 
 use std::collections::BTreeMap;
@@ -27,10 +27,24 @@ pub enum Action {
     SelectField(super::SetupField),
     SaveConnection,
     ChooseConnectionKind(usize),
-    RenameText(String),
-    RenameBackspace,
-    NewSession,
-    OpenCommands,
+    TitleInput(char),
+    TitlePaste(String),
+    TitleBackspace,
+    TitleDelete,
+    TitleMoveCursor {
+        direction: i8,
+        select: bool,
+        word: bool,
+    },
+    TitleHome,
+    TitleEnd,
+    TitleUndo,
+    TitleRedo,
+    PlaceTitleCursor(usize),
+    DragTitleCursor(usize),
+    CommitTitle,
+    CancelTitle,
+    StartSlashCommand,
     OpenModels,
     OpenHelp,
     OpenLatest,
@@ -150,6 +164,7 @@ pub enum UiEvent {
         last_active: Option<SessionId>,
         model_label: Option<String>,
         statuses: BTreeMap<SessionId, SessionStatus>,
+        summaries: BTreeMap<SessionId, SessionSummary>,
     },
     SessionOpened {
         session: SessionId,
@@ -183,6 +198,7 @@ pub enum UiEvent {
         generation: u64,
         sessions: Vec<SessionInfo>,
         statuses: BTreeMap<SessionId, SessionStatus>,
+        summaries: BTreeMap<SessionId, SessionSummary>,
     },
     DraftSaved {
         session: SessionId,
@@ -212,7 +228,17 @@ pub enum UiEvent {
     },
     SessionRenamed {
         session: SessionId,
-        generation: u64,
+        request: u64,
+        title: String,
+    },
+    SessionRenameFailed {
+        session: SessionId,
+        request: u64,
+        message: String,
+    },
+    SessionAutoTitled {
+        session: SessionId,
+        request: u64,
         title: String,
     },
     SessionReleased {
@@ -225,7 +251,11 @@ pub enum UiEvent {
         generation: Option<u64>,
         message: String,
     },
-    Resized,
+    CaretBlink,
+    Resized {
+        width: u16,
+        height: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,12 +321,13 @@ pub enum Effect {
     },
     RenameSession {
         session: SessionId,
-        generation: u64,
+        request: u64,
         title: String,
     },
     AutoTitle {
         session: SessionId,
         generation: u64,
+        request: u64,
         first_input: String,
     },
     SaveDraft {

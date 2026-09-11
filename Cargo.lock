@@ -313,6 +313,7 @@ version = "0.1.0"
 dependencies = [
  "bone-app",
  "crossterm",
+ "crossterm_winapi",
  "futures-util",
  "libc",
  "ratatui",

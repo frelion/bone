@@ -86,6 +86,23 @@ fn terminal_state_changes_stay_inside_the_terminal_module() {
     });
 }
 
+#[test]
+fn native_windows_terminal_state_has_an_exact_snapshot_boundary() {
+    let source = include_str!("../src/terminal/modes.rs");
+    for required in [
+        "ConsoleMode",
+        "Handle::input_handle",
+        "Handle::output_handle",
+        "ENABLE_VIRTUAL_TERMINAL_PROCESSING",
+        "RestoreAction::HostConsole",
+    ] {
+        assert!(
+            source.contains(required),
+            "native Windows terminal ownership must include {required}"
+        );
+    }
+}
+
 fn production_before_test_modules(source: &str) -> &str {
     source
         .match_indices("#[cfg(test)]")

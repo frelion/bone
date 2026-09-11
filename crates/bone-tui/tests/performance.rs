@@ -41,7 +41,7 @@ fn populated_state() -> UiState {
             .insert(info.id, bone_tui::state::SessionUi::new(info, 1));
     }
     state.selected = state.sessions.first().map(|session| session.id);
-    state.focus = Focus::Conversation;
+    state.focus = Focus::SessionTitle;
     state
 }
 

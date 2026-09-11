@@ -8,9 +8,15 @@ use ratatui::Frame;
 
 use super::theme;
 
-pub(crate) fn place(frame: &mut Frame<'_>, position: (u16, u16)) {
+pub(crate) fn place(frame: &mut Frame<'_>, position: (u16, u16), visible: bool) {
+    if !visible {
+        return;
+    }
+    // Set only the colors. A title keeps its label weight while the insertion
+    // cell is lit, and no terminal cursor shape or color command is emitted.
     frame.buffer_mut()[position]
-        .set_style(theme::regular(theme::body_on(theme::INPUT, theme::ACCENT)));
+        .set_fg(theme::INPUT)
+        .set_bg(theme::FOCUS_MARK);
     frame.set_cursor_position(position);
 }
 
@@ -25,14 +31,28 @@ mod tests {
         terminal
             .draw(|frame| {
                 frame.buffer_mut()[(1, 0)].set_symbol("x");
-                place(frame, (1, 0));
+                place(frame, (1, 0), true);
             })
             .unwrap();
 
         let cell = &terminal.backend().buffer()[(1, 0)];
         assert_eq!(cell.symbol(), "x");
         assert_eq!(cell.fg, theme::INPUT);
-        assert_eq!(cell.bg, theme::ACCENT);
+        assert_eq!(cell.bg, theme::FOCUS_MARK);
         assert_eq!(terminal.get_cursor_position().unwrap(), Position::new(1, 0));
+    }
+
+    #[test]
+    fn hidden_phase_does_not_paint_or_show_the_native_cursor() {
+        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.buffer_mut()[(1, 0)].set_symbol("x");
+                place(frame, (1, 0), false);
+            })
+            .unwrap();
+        let cell = &terminal.backend().buffer()[(1, 0)];
+        assert_eq!(cell.symbol(), "x");
+        assert_ne!(cell.bg, theme::FOCUS_MARK);
     }
 }

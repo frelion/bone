@@ -13,8 +13,8 @@ use super::{
         read_recent_documents, replace_document, same_store as same_document_store,
     },
     journal::{
-        append_journal, journal, read_journal_recent, read_last_journal_sequence,
-        same_store as same_journal_store,
+        append_journal, journal, read_journal_after_bounded, read_journal_recent,
+        read_last_journal_sequence, same_store as same_journal_store,
     },
     lease::lease_file_name,
     security::{ensure_private_directory, try_acquire_private_lock},
@@ -181,6 +181,26 @@ impl WriteTransaction<'_, '_> {
     {
         self.assert_journal_store(journal)?;
         read_journal_recent(self.transaction, journal.key(), cursor, limit)
+    }
+
+    pub(crate) fn read_after_bounded<E>(
+        &self,
+        journal: &Journal<E>,
+        after: u64,
+        maximum_entries: usize,
+        maximum_payload_bytes: usize,
+    ) -> Result<super::JournalBoundedRead<E>, StoreError>
+    where
+        E: DeserializeOwned,
+    {
+        self.assert_journal_store(journal)?;
+        read_journal_after_bounded(
+            self.transaction,
+            journal.key(),
+            after,
+            maximum_entries,
+            maximum_payload_bytes,
+        )
     }
 
     pub fn replace<T>(

@@ -11,41 +11,28 @@ use ratatui::{Frame, style::Style, widgets::Block};
 mod composer;
 mod connection;
 mod conversation;
-mod marks;
 mod message;
 use crate::text as primitives;
 mod panels;
+mod right_rail;
 mod session_rail;
 mod slash_palette;
 
 pub(super) use theme::{
-    ACCENT, ATTENTION, CYAN, DANGER, DIVIDER, GREEN, INK, INPUT, MUTED, PANE_BOUNDARY, PANEL,
-    PURPLE, RAIL, SELECTED, USER,
+    CYAN, DANGER, INFO, INK, INPUT, MUTED, PANEL, PURPLE, RAIL, SELECTED, STRUCTURE,
+    STRUCTURE_ACTIVE, SUCCESS, USER, WARNING,
 };
 
 /// Render the conversational shell and return its exact pointer hit map.
 pub fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
-    let slash_matches = if state.focus == crate::state::Focus::Composer && state.panel.is_none() {
+    let slash_visible = state.slash_palette_visible();
+    let slash_matches = if slash_visible {
         state.slash_matches()
     } else {
         Vec::new()
     };
-    let session_rows: Vec<u16> = (0..state.sessions.len())
-        .map(|index| {
-            let content = if session_rail::status(state, index).is_some() {
-                2
-            } else {
-                1
-            };
-            content
-                + 1
-                + if crate::layout::comfortable(frame.area()) {
-                    2
-                } else {
-                    0
-                }
-        })
-        .collect();
+    // Three content rows plus one separator row, at every terminal height.
+    let session_rows = vec![4; state.sessions.len()];
     let input_width = state
         .pane_widths
         .content_width(frame.area())
@@ -58,7 +45,11 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
     let mut plan = LayoutPlan::calculate_with_widths(
         frame.area(),
         state.single_pane(),
-        slash_matches.len(),
+        if slash_visible {
+            slash_matches.len().max(1)
+        } else {
+            0
+        },
         &session_rows,
         selected_session,
         draft_lines,
@@ -67,26 +58,20 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
     if let Some(start) = state.session_scroll {
         plan.scroll_sessions(&session_rows, start);
     }
-    let slash_start = plan.slash_palette.map_or(0, |area| {
-        state
-            .slash_selection
-            .saturating_sub(usize::from(area.height).saturating_sub(1))
-    });
-    let mut hits = base_hits(&plan, state, &slash_matches, slash_start);
+    let mut hits = base_hits(&plan, state);
     frame.render_widget(Block::default().style(theme::surface(PANEL)), plan.screen);
     session_rail::render(frame, &plan, state);
     if let Some(area) = plan.extension_blank {
-        frame.render_widget(Block::default().style(Style::default().bg(RAIL)), area);
+        right_rail::render(frame, area, state);
     }
-    let transcript_metrics =
-        conversation::render(frame, &plan, &mut hits, state, &slash_matches, slash_start)
-            .map(std::sync::Arc::new);
+    let transcript_metrics = conversation::render(frame, &plan, &mut hits, state, &slash_matches)
+        .map(std::sync::Arc::new);
     if plan.mode == crate::layout::LayoutMode::TooSmall {
         hits.clear();
         return FrameSnapshot::new(plan, hits, transcript_metrics, 0);
     }
     if state.panel.is_none()
-        && slash_matches.is_empty()
+        && !slash_visible
         && let Some(area) = plan.composer
     {
         if !state.draft().trim().is_empty()
@@ -136,12 +121,6 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
             });
         }
     }
-    if let Some(area) = plan.session_rail {
-        hits.push(HitRegion {
-            area: crate::layout::new_session_area(area),
-            target: HitTarget::NewSession,
-        });
-    }
     if let Some(area) = plan.composer {
         let footer = composer::footer_areas(area, state);
         hits.push(HitRegion {
@@ -151,22 +130,19 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
         if let Some(commands) = footer.commands {
             hits.push(HitRegion {
                 area: ratatui::layout::Rect::new(commands.x, commands.y, 10, 1),
-                target: HitTarget::Commands,
+                target: HitTarget::StartSlashCommand,
             });
         }
     }
     let mut reader_max_scroll = 0;
     panels::render(frame, &plan, &mut hits, &mut reader_max_scroll, state);
-    render_dividers(frame, &plan, &mut hits, state);
+    // Overlays own the pointer scope. Pane boundaries remain visible behind a
+    // panel, but they cannot be grabbed until the panel has closed.
+    render_dividers(frame, &plan, &mut hits, state, state.panel.is_none());
     FrameSnapshot::new(plan, hits, transcript_metrics, reader_max_scroll)
 }
 
-fn base_hits(
-    plan: &LayoutPlan,
-    state: &UiState,
-    slash_matches: &[&crate::state::CommandSpec],
-    slash_start: usize,
-) -> HitMap {
+fn base_hits(plan: &LayoutPlan, state: &UiState) -> HitMap {
     let mut hits = HitMap::default();
     if let Some(area) = plan.session_rail {
         hits.push(HitRegion {
@@ -188,26 +164,34 @@ fn base_hits(
             target: HitTarget::Conversation,
         });
     }
+    if let Some(area) = plan.session_header {
+        hits.push(HitRegion {
+            area,
+            target: HitTarget::SessionTitle,
+        });
+    }
     if let Some(area) = plan.composer {
         hits.push(HitRegion {
             area,
             target: HitTarget::Composer,
         });
     }
-    if let Some(area) = plan.slash_palette {
-        for offset in 0..slash_matches.len().min(usize::from(area.height)) {
-            if let Some(command) = slash_matches.get(slash_start + offset) {
-                hits.push(HitRegion {
-                    area: ratatui::layout::Rect::new(area.x, area.y + offset as u16, area.width, 1),
-                    target: HitTarget::SlashCommand(command.kind),
-                });
-            }
-        }
+    if let Some(area) = plan.extension_blank {
+        hits.push(HitRegion {
+            area,
+            target: HitTarget::RightRail,
+        });
     }
     hits
 }
 
-fn render_dividers(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap, state: &UiState) {
+fn render_dividers(
+    frame: &mut Frame<'_>,
+    plan: &LayoutPlan,
+    hits: &mut HitMap,
+    state: &UiState,
+    interactive: bool,
+) {
     // Reserve existing edge whitespace; never take width from the reading or input area.
     let left = plan
         .session_rail
@@ -221,14 +205,16 @@ fn render_dividers(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap, 
         let Some(x) = position else {
             continue;
         };
-        hits.push(HitRegion {
-            area: ratatui::layout::Rect::new(x, plan.screen.y, 1, plan.screen.height),
-            target: HitTarget::PaneDivider(divider),
-        });
-        let color = if state.dragging_divider == Some(divider) {
-            ACCENT
+        if interactive {
+            hits.push(HitRegion {
+                area: ratatui::layout::Rect::new(x, plan.screen.y, 1, plan.screen.height),
+                target: HitTarget::PaneDivider(divider),
+            });
+        }
+        let color = if interactive && state.dragging_divider == Some(divider) {
+            STRUCTURE_ACTIVE
         } else {
-            PANE_BOUNDARY
+            STRUCTURE
         };
         for y in plan.screen.y..plan.screen.bottom() {
             frame.buffer_mut()[(x, y)]
@@ -280,15 +266,56 @@ mod region_tests {
                 );
                 for x in 0..width {
                     let cell = &buffer[(x, 0)];
-                    assert_eq!(cell.bg == PANE_BOUNDARY, boundaries.contains(&x));
+                    assert_eq!(cell.bg == STRUCTURE, boundaries.contains(&x));
                 }
                 for x in &boundaries {
                     for y in 0..40 {
                         assert_eq!(buffer[(*x, y)].symbol(), " ");
-                        assert_eq!(buffer[(*x, y)].bg, PANE_BOUNDARY);
+                        assert_eq!(buffer[(*x, y)].bg, STRUCTURE);
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn overlays_keep_boundaries_visual_but_remove_their_pointer_targets() {
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let mut state = UiState::default();
+        state.panel = Some(crate::state::Panel::Models);
+        state.dragging_divider = Some(crate::layout::PaneDivider::Left);
+        let mut snapshot = None;
+        terminal
+            .draw(|frame| snapshot = Some(render(frame, &state)))
+            .unwrap();
+
+        let snapshot = snapshot.unwrap();
+        assert!(snapshot.hit_regions().iter().all(|hit| {
+            !matches!(hit.target, HitTarget::PaneDivider(_))
+                && !matches!(
+                    hit.target,
+                    HitTarget::SessionRail
+                        | HitTarget::Session(_)
+                        | HitTarget::Conversation
+                        | HitTarget::Composer
+                )
+        }));
+        for y in 0..40 {
+            assert_eq!(terminal.backend().buffer()[(31, y)].bg, STRUCTURE);
+        }
+    }
+
+    #[test]
+    fn divider_drag_uses_neutral_structure_color_instead_of_focus_orange() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut state = UiState::default();
+        state.dragging_divider = Some(crate::layout::PaneDivider::Left);
+        terminal.draw(|frame| _ = render(frame, &state)).unwrap();
+
+        for y in 0..40 {
+            let cell = &terminal.backend().buffer()[(31, y)];
+            assert_eq!(cell.bg, STRUCTURE_ACTIVE);
+            assert_ne!(cell.bg, theme::FOCUS_MARK);
         }
     }
 }

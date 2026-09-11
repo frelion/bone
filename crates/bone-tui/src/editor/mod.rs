@@ -8,4 +8,7 @@ mod buffer;
 mod layout;
 
 pub(crate) use buffer::{EditBuffer, EditorState, floor_grapheme_boundary};
-pub(crate) use layout::{cursor_at_origin, editor_rows, selection_cells, stable_editor_viewport};
+pub(crate) use layout::{
+    cursor_at_origin, cursor_at_single_line, editor_rows, selection_cells,
+    single_line_editor_viewport, single_line_selection_cells, stable_editor_viewport,
+};

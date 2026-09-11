@@ -3,4 +3,4 @@ mod modes;
 mod session;
 
 pub(crate) use capabilities::TerminalCapabilities;
-pub(crate) use session::TerminalSession;
+pub(crate) use session::{PanicSignal, TerminalSession};

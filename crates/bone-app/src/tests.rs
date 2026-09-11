@@ -623,8 +623,10 @@ async fn assert_pending(mut future: Pin<&mut impl Future>) {
 }
 
 async fn wait_for_runtime_detached(session: &Session) {
+    const FINAL_WRITE_BOUNDARY_DEADLINE: Duration = Duration::from_secs(10);
+
     let mut view = session.observe();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(FINAL_WRITE_BOUNDARY_DEADLINE, async {
         loop {
             if matches!(view.borrow().runtime, RuntimeState::Detached) {
                 return;
@@ -706,6 +708,11 @@ async fn workspace_overview_reads_durable_summaries_and_attention_without_a_sess
     let initial = app.workspace_overview(workspace.id).await.unwrap();
     assert!(!initial.attention_projection_pending);
     assert!(initial.attention.is_empty());
+    let initial_summary = &initial.sessions[0];
+    assert!(initial_summary.created_at > 0);
+    assert_eq!(initial_summary.message_count, 0);
+    assert_eq!(initial_summary.latest_reply_preview, None);
+    assert!(!initial_summary.projection_pending);
     store.save_draft(saved.info.id, "继续检查".into()).unwrap();
 
     let desired = app
@@ -812,6 +819,10 @@ async fn workspace_overview_reads_durable_summaries_and_attention_without_a_sess
     assert_eq!(overview.sessions.len(), 1);
     let summary = &overview.sessions[0];
     assert_eq!(summary.session, saved.info);
+    assert_eq!(summary.created_at, initial_summary.created_at);
+    assert_eq!(summary.message_count, 3);
+    assert_eq!(summary.latest_reply_preview, None);
+    assert!(!summary.projection_pending);
     assert!(summary.has_draft);
     assert_eq!(summary.draft_bytes, "继续检查".len() as u64);
     assert_eq!(summary.persisted_runtime, Some(runtime));
@@ -1523,6 +1534,16 @@ async fn headless_session_runs_and_persists_public_history() {
         entry.event,
         SessionEvent::InputFinished { input, .. } if input == receipt.input
     )));
+    let overview = app.workspace_overview(workspace.id).await.unwrap();
+    let summary = overview
+        .sessions
+        .iter()
+        .find(|summary| summary.session.id == session.id())
+        .unwrap();
+    assert!(summary.created_at > 0);
+    assert_eq!(summary.message_count, 2);
+    assert_eq!(summary.latest_reply_preview.as_deref(), Some("the answer"));
+    assert!(!summary.projection_pending);
     app.shutdown().await.unwrap();
 }
 

@@ -1,7 +1,4 @@
-use std::{
-    io,
-    sync::{Arc, Mutex, TryLockError},
-};
+use std::io;
 
 use crossterm::{
     cursor::Show,
@@ -25,12 +22,21 @@ enum TerminalMode {
 enum RestoreAction {
     Mode(TerminalMode),
     ShowCursor,
+    /// Reapply the exact host console modes after all portable cleanup.
+    ///
+    /// Crossterm's native Windows raw-mode cleanup enables a fixed set of
+    /// input flags, and its ANSI detection may enable VT output processing.
+    /// Neither operation is an exact inverse of the state inherited from the
+    /// parent process, so Windows keeps an explicit snapshot as the final
+    /// cleanup barrier.
+    HostConsole,
 }
 
 trait ModeBackend {
     fn enable(&mut self, mode: TerminalMode) -> io::Result<()>;
     fn disable(&mut self, mode: TerminalMode) -> io::Result<()>;
     fn show_cursor(&mut self) -> io::Result<()>;
+    fn restore_host_console(&mut self) -> io::Result<()>;
 }
 
 /// Records every terminal mutation before it is attempted.
@@ -69,6 +75,17 @@ impl<B: ModeBackend> ModeLedger<B> {
         self.restore.push(RestoreAction::ShowCursor);
     }
 
+    #[cfg(any(windows, test))]
+    fn restore_host_console_on_exit(&mut self) {
+        debug_assert!(
+            !self.restore.contains(&RestoreAction::HostConsole),
+            "the inherited console modes must have one owner"
+        );
+        // Register this before any portable mode. Reverse cleanup therefore
+        // reapplies the inherited state only after every other compensation.
+        self.restore.push(RestoreAction::HostConsole);
+    }
+
     fn restore(&mut self) -> io::Result<()> {
         let mut first_error = None;
         let mut failed = Vec::new();
@@ -76,11 +93,17 @@ impl<B: ModeBackend> ModeLedger<B> {
             let result = match action {
                 RestoreAction::Mode(mode) => self.backend.disable(mode),
                 RestoreAction::ShowCursor => self.backend.show_cursor(),
+                RestoreAction::HostConsole => self.backend.restore_host_console(),
             };
             if let Err(error) = result {
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
+                failed.push(action);
+            } else if action == RestoreAction::HostConsole && !failed.is_empty() {
+                // A later retry of an earlier compensation may mutate console
+                // state again. Keep the exact snapshot as a final barrier until
+                // every dependent cleanup action has succeeded.
                 failed.push(action);
             }
         }
@@ -94,16 +117,44 @@ impl<B: ModeBackend> ModeLedger<B> {
     }
 }
 
-#[derive(Default)]
-struct CrosstermModes;
+struct CrosstermModes {
+    #[cfg(windows)]
+    inherited_console: WindowsConsoleModes,
+}
+
+impl CrosstermModes {
+    fn capture() -> io::Result<Self> {
+        Ok(Self {
+            #[cfg(windows)]
+            inherited_console: WindowsConsoleModes::capture()?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn prepare_ansi_output(&self) -> io::Result<()> {
+        self.inherited_console.enable_vt_output()
+    }
+}
 
 impl ModeBackend for CrosstermModes {
     fn enable(&mut self, mode: TerminalMode) -> io::Result<()> {
         match mode {
             TerminalMode::Raw => enable_raw_mode(),
-            TerminalMode::AlternateScreen => execute!(io::stdout(), EnterAlternateScreen),
-            TerminalMode::MouseCapture => execute!(io::stdout(), EnableMouseCapture),
-            TerminalMode::BracketedPaste => execute!(io::stdout(), EnableBracketedPaste),
+            TerminalMode::AlternateScreen => {
+                #[cfg(windows)]
+                self.prepare_ansi_output()?;
+                execute!(io::stdout(), EnterAlternateScreen)
+            }
+            TerminalMode::MouseCapture => {
+                #[cfg(windows)]
+                self.prepare_ansi_output()?;
+                execute!(io::stdout(), EnableMouseCapture)
+            }
+            TerminalMode::BracketedPaste => {
+                #[cfg(windows)]
+                self.prepare_ansi_output()?;
+                execute!(io::stdout(), EnableBracketedPaste)
+            }
             TerminalMode::KeyboardEnhancement => {
                 #[cfg(unix)]
                 {
@@ -125,9 +176,21 @@ impl ModeBackend for CrosstermModes {
     fn disable(&mut self, mode: TerminalMode) -> io::Result<()> {
         match mode {
             TerminalMode::Raw => disable_raw_mode(),
-            TerminalMode::AlternateScreen => execute!(io::stdout(), LeaveAlternateScreen),
-            TerminalMode::MouseCapture => execute!(io::stdout(), DisableMouseCapture),
-            TerminalMode::BracketedPaste => execute!(io::stdout(), DisableBracketedPaste),
+            TerminalMode::AlternateScreen => {
+                #[cfg(windows)]
+                self.prepare_ansi_output()?;
+                execute!(io::stdout(), LeaveAlternateScreen)
+            }
+            TerminalMode::MouseCapture => {
+                #[cfg(windows)]
+                self.prepare_ansi_output()?;
+                execute!(io::stdout(), DisableMouseCapture)
+            }
+            TerminalMode::BracketedPaste => {
+                #[cfg(windows)]
+                self.prepare_ansi_output()?;
+                execute!(io::stdout(), DisableBracketedPaste)
+            }
             TerminalMode::KeyboardEnhancement => {
                 #[cfg(unix)]
                 {
@@ -142,58 +205,104 @@ impl ModeBackend for CrosstermModes {
     }
 
     fn show_cursor(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        self.prepare_ansi_output()?;
         execute!(io::stdout(), Show)
+    }
+
+    fn restore_host_console(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        return self.inherited_console.restore();
+        #[cfg(not(windows))]
+        Ok(())
     }
 }
 
-type SharedLedger = Arc<Mutex<ModeLedger<CrosstermModes>>>;
-
-#[derive(Clone)]
-pub(super) struct ModeRestorer {
-    ledger: SharedLedger,
+#[cfg(windows)]
+struct WindowsConsoleModes {
+    input: crossterm_winapi::ConsoleMode,
+    input_mode: u32,
+    output: crossterm_winapi::ConsoleMode,
+    output_mode: u32,
 }
 
-impl ModeRestorer {
-    pub(super) fn restore(&self) -> io::Result<()> {
-        let mut ledger = match self.ledger.try_lock() {
-            Ok(ledger) => ledger,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "terminal mode cleanup is already in progress",
-                ));
+#[cfg(windows)]
+impl WindowsConsoleModes {
+    fn capture() -> io::Result<Self> {
+        use crossterm_winapi::{ConsoleMode, Handle};
+
+        // The wrapper makes the underlying GetStdHandle/GetConsoleMode calls
+        // without weakening this crate's process-wide `forbid(unsafe_code)`
+        // boundary.
+        let input = ConsoleMode::from(Handle::input_handle()?);
+        let output = ConsoleMode::from(Handle::output_handle()?);
+        Ok(Self {
+            input_mode: input.mode()?,
+            output_mode: output.mode()?,
+            input,
+            output,
+        })
+    }
+
+    fn enable_vt_output(&self) -> io::Result<()> {
+        // https://learn.microsoft.com/windows/console/setconsolemode
+        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+        let current = self.output.mode()?;
+        if current & ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0 {
+            self.output
+                .set_mode(current | ENABLE_VIRTUAL_TERMINAL_PROCESSING)?;
+        }
+        Ok(())
+    }
+
+    fn restore(&self) -> io::Result<()> {
+        let mut first_error = None;
+        for (console, mode) in [
+            (&self.input, self.input_mode),
+            (&self.output, self.output_mode),
+        ] {
+            // ConsoleMode::set_mode is the safe SetConsoleMode boundary.
+            if let Err(error) = console.set_mode(mode)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
             }
-        };
-        ledger.restore()
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
 /// Owns the temporary terminal modes independently of the renderer.
 ///
 /// Keeping this lease separate lets initialization failures clean themselves
-/// up before a `TerminalSession` exists, while the shared ledger gives the
-/// panic hook access to exactly the same idempotent restoration path.
+/// up before a `TerminalSession` exists. The ledger has one owner; panic hooks
+/// only notify that owner and never lock or write to the terminal themselves.
 pub(super) struct ModeLease {
-    ledger: SharedLedger,
+    ledger: ModeLedger<CrosstermModes>,
 }
 
 impl ModeLease {
     pub(super) fn enter() -> io::Result<(Self, TerminalCapabilities)> {
-        let lease = Self {
-            ledger: Arc::new(Mutex::new(ModeLedger::new(CrosstermModes))),
+        let mut lease = Self {
+            ledger: ModeLedger::new(CrosstermModes::capture()?),
         };
         let capabilities = lease.acquire()?;
         Ok((lease, capabilities))
     }
 
     /// Reacquire the same temporary modes after a successful suspension
-    /// restore. The shared ledger keeps the panic restorer valid.
-    pub(super) fn resume(&self) -> io::Result<TerminalCapabilities> {
+    /// restore.
+    pub(super) fn resume(&mut self) -> io::Result<TerminalCapabilities> {
         self.acquire()
     }
 
-    fn acquire(&self) -> io::Result<TerminalCapabilities> {
+    fn acquire(&mut self) -> io::Result<TerminalCapabilities> {
+        #[cfg(windows)]
+        self.ledger.restore_host_console_on_exit();
         self.enable(TerminalMode::Raw)?;
         self.enable(TerminalMode::AlternateScreen)?;
         self.enable(TerminalMode::MouseCapture)?;
@@ -209,38 +318,17 @@ impl ModeLease {
 
         // Ratatui owns cursor visibility while drawing. We do not change its
         // color or shape, but always return visibility to the user's terminal.
-        self.with_ledger(|ledger| ledger.restore_cursor_on_exit());
+        self.ledger.restore_cursor_on_exit();
         Ok(capabilities)
     }
 
-    pub(super) fn panic_restorer(&self) -> ModeRestorer {
-        ModeRestorer {
-            ledger: Arc::clone(&self.ledger),
-        }
+    pub(super) fn restore(&mut self) -> io::Result<()> {
+        self.ledger.restore()
     }
 
-    pub(super) fn restore(&self) -> io::Result<()> {
-        restore_shared(&self.ledger)
+    fn enable(&mut self, mode: TerminalMode) -> io::Result<()> {
+        self.ledger.enable(mode)
     }
-
-    fn enable(&self, mode: TerminalMode) -> io::Result<()> {
-        self.with_ledger(|ledger| ledger.enable(mode))
-    }
-
-    fn with_ledger<T>(&self, operation: impl FnOnce(&mut ModeLedger<CrosstermModes>) -> T) -> T {
-        let mut ledger = self
-            .ledger
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        operation(&mut ledger)
-    }
-}
-
-fn restore_shared(ledger: &SharedLedger) -> io::Result<()> {
-    let mut ledger = ledger
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    ledger.restore()
 }
 
 impl Drop for ModeLease {
@@ -281,6 +369,7 @@ mod tests {
         Enable(TerminalMode),
         Disable(TerminalMode),
         ShowCursor,
+        RestoreHostConsole,
     }
 
     #[derive(Default)]
@@ -289,6 +378,7 @@ mod tests {
         enable_failure: Option<TerminalMode>,
         disable_failures: Vec<TerminalMode>,
         cursor_failure: bool,
+        host_restore_failure: bool,
     }
 
     impl ModeBackend for RecordingBackend {
@@ -314,6 +404,15 @@ mod tests {
             self.calls.push(Call::ShowCursor);
             if self.cursor_failure {
                 Err(io::Error::other("could not show cursor"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn restore_host_console(&mut self) -> io::Result<()> {
+            self.calls.push(Call::RestoreHostConsole);
+            if self.host_restore_failure {
+                Err(io::Error::other("could not restore host console"))
             } else {
                 Ok(())
             }
@@ -406,15 +505,33 @@ mod tests {
     }
 
     #[test]
-    fn panic_restorer_never_waits_on_a_busy_ledger() {
-        let ledger = Arc::new(Mutex::new(ModeLedger::new(CrosstermModes)));
-        let restorer = ModeRestorer {
-            ledger: Arc::clone(&ledger),
+    fn exact_host_restore_remains_a_barrier_until_dependent_cleanup_succeeds() {
+        let backend = RecordingBackend {
+            disable_failures: vec![TerminalMode::Raw],
+            ..RecordingBackend::default()
         };
-        let _busy = ledger.lock().unwrap();
+        let mut ledger = ModeLedger::new(backend);
+        ledger.restore_host_console_on_exit();
+        ledger.enable(TerminalMode::Raw).unwrap();
+        ledger.enable(TerminalMode::AlternateScreen).unwrap();
 
-        let error = restorer.restore().unwrap_err();
+        assert!(ledger.restore().is_err());
+        assert!(ledger.backend.calls.ends_with(&[
+            Call::Disable(TerminalMode::AlternateScreen),
+            Call::Disable(TerminalMode::Raw),
+            Call::RestoreHostConsole,
+        ]));
 
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        ledger.backend.disable_failures.clear();
+        ledger.restore().unwrap();
+        assert!(
+            ledger
+                .backend
+                .calls
+                .ends_with(&[Call::Disable(TerminalMode::Raw), Call::RestoreHostConsole])
+        );
+        let calls_after_retry = ledger.backend.calls.clone();
+        ledger.restore().unwrap();
+        assert_eq!(ledger.backend.calls, calls_after_retry);
     }
 }

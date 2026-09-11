@@ -2,7 +2,10 @@
 //!
 //! The caller owns selection, loading, focus and scroll. This module performs no
 //! App calls and never interprets tool text as a status or a command.
-use crate::{state::reader::ReaderContent, ui::theme};
+use crate::{
+    state::reader::ReaderContent,
+    ui::{focus, theme},
+};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -11,7 +14,7 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use super::{ACCENT, INK, MUTED, RAIL};
+use super::{INK, MUTED, RAIL};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ReaderMetrics {
@@ -48,10 +51,21 @@ pub(crate) fn render(
     let back = Rect::new(inner.x, area.bottom() - 1, inner.width, 1);
     if inner.height > 1 {
         let title = super::single_line_external(&content.title);
+        let title_row = Rect::new(inner.x, inner.y, inner.width, 1);
+        let title_background = if focused { theme::SELECTED } else { RAIL };
         frame.render_widget(
-            Paragraph::new(format!("{}{title}", if focused { "› " } else { "" }))
-                .style(theme::label(if focused { ACCENT } else { INK })),
-            Rect::new(inner.x, inner.y, inner.width, 1),
+            Block::default().style(theme::surface(title_background)),
+            title_row,
+        );
+        let gutter_width = focus::GUTTER_WIDTH.min(title_row.width);
+        frame.render_widget(
+            Paragraph::new(title).style(theme::label_on(INK, title_background)),
+            Rect::new(
+                title_row.x + gutter_width,
+                title_row.y,
+                title_row.width.saturating_sub(gutter_width),
+                1,
+            ),
         );
     }
     let body = Rect::new(
@@ -148,7 +162,19 @@ mod tests {
         RuntimeId, RuntimeState, SessionEvent, SessionId, SessionInfo, SessionSeq, SessionView,
         ToolOutcome, WorkspaceId,
     };
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Modifier};
+
+    fn find_text(buffer: &Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in buffer.area.y..buffer.area.bottom() {
+            let line = (buffer.area.x..buffer.area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            if let Some(x) = line.find(needle) {
+                return Some((buffer.area.x + x as u16, y));
+            }
+        }
+        None
+    }
 
     #[test]
     fn input_id_fragments_preserve_every_u64_digit_at_all_widths() {
@@ -160,6 +186,74 @@ mod tests {
                 assert_eq!(rendered.trim_end(), id.to_string());
             }
         }
+    }
+
+    #[test]
+    fn reader_focus_uses_a_neutral_surface_without_moving_its_title() {
+        let content = ReaderContent {
+            layout_cache: Default::default(),
+            session: SessionId::new(),
+            source: ReaderSource::History(SessionSeq(1)),
+            title: "Reader title".into(),
+            text: "body".into(),
+        };
+        let render = |focused| {
+            let mut terminal = Terminal::new(TestBackend::new(48, 12)).unwrap();
+            terminal
+                .draw(|frame| {
+                    super::render(frame, frame.area(), &content, None, 0, focused);
+                })
+                .unwrap();
+            terminal
+        };
+        let active = render(true);
+        let inactive = render(false);
+        let active_buffer = active.backend().buffer();
+        let inactive_buffer = inactive.backend().buffer();
+        let active_title = find_text(active_buffer, "Reader title").expect("active title");
+        let inactive_title = find_text(inactive_buffer, "Reader title").expect("inactive title");
+
+        assert_eq!(active_title, inactive_title);
+        assert_eq!(
+            active_buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>(),
+            inactive_buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        );
+        let (title_x, title_y) = active_title;
+        let mark_x = title_x - focus::GUTTER_WIDTH;
+        let active_mark = &active_buffer[(mark_x, title_y)];
+        assert_eq!(active_mark.symbol(), " ");
+        assert_eq!(active_mark.bg, theme::SELECTED);
+        assert_ne!(active_mark.bg, theme::FOCUS_MARK);
+        assert!(
+            !active_mark
+                .modifier
+                .contains(Modifier::BOLD | Modifier::DIM)
+        );
+        assert_eq!(active_buffer[(mark_x + 1, title_y)].bg, theme::SELECTED);
+        assert_eq!(active_buffer[(title_x, title_y)].bg, theme::SELECTED);
+        assert_eq!(inactive_buffer[(mark_x, title_y)].bg, RAIL);
+        assert_eq!(inactive_buffer[(title_x, title_y)].bg, RAIL);
+        assert_eq!(active_buffer[(title_x, title_y)].fg, INK);
+        assert!(
+            active_buffer[(title_x, title_y)]
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            active_buffer
+                .content()
+                .iter()
+                .chain(inactive_buffer.content())
+                .all(|cell| cell.fg != theme::FOCUS_MARK && cell.bg != theme::FOCUS_MARK)
+        );
     }
 
     #[test]
