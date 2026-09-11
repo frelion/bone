@@ -1,4 +1,5 @@
 use crate::{
+    layout::AnchorPart,
     text::wrap_text,
     ui::theme::{self, CODE_LABEL, DANGER, INK, MUTED, SUCCESS, USER, WARNING},
 };
@@ -10,50 +11,74 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-pub(super) fn rows(event: &SessionEvent, width: u16) -> Vec<Line<'static>> {
+pub(super) struct MessageRow {
+    pub line: Line<'static>,
+    pub byte: usize,
+    pub part: AnchorPart,
+}
+
+pub(super) fn render(event: &SessionEvent, width: u16) -> Vec<MessageRow> {
     let width = usize::from(width.max(1));
     match event {
-        SessionEvent::InputSubmitted { text, .. } => user_rows(text, width),
-        SessionEvent::Reply { text, .. } => reply_rows(text, width),
-        SessionEvent::QuestionAsked { text, .. } => body_rows(text, width, WARNING),
+        SessionEvent::InputSubmitted { text, .. } => user_message(text, width),
+        SessionEvent::Reply { text, .. } => reply_message(text, width),
+        SessionEvent::QuestionAsked { text, .. } => message_body(text, width, WARNING),
         SessionEvent::ToolFinished { tool, outcome, .. } => {
-            let mut lines = vec![compact(
-                "›",
-                &format!(
-                    "{}  {}",
-                    tool,
+            let mut rows = vec![MessageRow::text(
+                compact(
+                    "›",
+                    &format!(
+                        "{}  {}",
+                        tool,
+                        if outcome.result.is_ok() {
+                            "done"
+                        } else {
+                            "failed"
+                        }
+                    ),
                     if outcome.result.is_ok() {
-                        "done"
+                        SUCCESS
                     } else {
-                        "failed"
-                    }
+                        DANGER
+                    },
                 ),
-                if outcome.result.is_ok() {
-                    SUCCESS
-                } else {
-                    DANGER
-                },
+                0,
             )];
             if let Err(error) = &outcome.result {
-                lines.extend(
-                    error_preview(&error.message, width)
-                        .into_iter()
-                        .map(|(_, text)| Line::styled(text, Style::default().fg(DANGER))),
-                );
+                rows.extend(error_preview(&error.message, width).into_iter().map(
+                    |(byte, text)| {
+                        MessageRow::text(Line::styled(text, Style::default().fg(DANGER)), byte + 1)
+                    },
+                ));
             }
-            lines
+            rows
         }
         SessionEvent::RoutingFailed { message, .. }
-        | SessionEvent::InputRejected { message, .. } => vec![compact("·", message, DANGER)],
-        SessionEvent::JobFinished { summary, .. } => body_rows(summary, width, INK),
-        SessionEvent::AcceptanceRecorded { reason, .. } => vec![compact("·", reason, SUCCESS)],
-        SessionEvent::Interrupted { .. } => vec![compact("·", "Execution interrupted.", WARNING)],
-        SessionEvent::InputAccepted { .. } => vec![compact("·", "Request received", MUTED)],
-        SessionEvent::InputCancelled { .. } => vec![compact("·", "Request cancelled", MUTED)],
-        SessionEvent::InputFinished { outcome, .. } => {
-            vec![compact("·", &format!("Request {outcome:?}"), MUTED)]
+        | SessionEvent::InputRejected { message, .. } => {
+            vec![MessageRow::text(compact("·", message, DANGER), 0)]
         }
-        SessionEvent::WriteResolved { evidence, .. } => vec![compact("·", evidence, SUCCESS)],
+        SessionEvent::JobFinished { summary, .. } => message_body(summary, width, INK),
+        SessionEvent::AcceptanceRecorded { reason, .. } => {
+            vec![MessageRow::text(compact("·", reason, SUCCESS), 0)]
+        }
+        SessionEvent::Interrupted { .. } => vec![MessageRow::text(
+            compact("·", "Execution interrupted.", WARNING),
+            0,
+        )],
+        SessionEvent::InputAccepted { .. } => {
+            vec![MessageRow::text(compact("·", "Request received", MUTED), 0)]
+        }
+        SessionEvent::InputCancelled { .. } => vec![MessageRow::text(
+            compact("·", "Request cancelled", MUTED),
+            0,
+        )],
+        SessionEvent::InputFinished { outcome, .. } => vec![MessageRow::text(
+            compact("·", &format!("Request {outcome:?}"), MUTED),
+            0,
+        )],
+        SessionEvent::WriteResolved { evidence, .. } => {
+            vec![MessageRow::text(compact("·", evidence, SUCCESS), 0)]
+        }
         // Runtime lifecycle is transport plumbing, not conversation content.
         SessionEvent::RuntimeStarted { .. }
         | SessionEvent::RuntimeReconfigured { .. }
@@ -61,59 +86,13 @@ pub(super) fn rows(event: &SessionEvent, width: u16) -> Vec<Line<'static>> {
     }
 }
 
-/// Original UTF-8 offsets, one per visual row, including user-message padding.
-/// These do not depend on terminal coordinates and survive different wrap widths.
-pub(super) fn row_offsets(event: &SessionEvent, width: u16) -> Vec<usize> {
-    let width = usize::from(width.max(1));
-    match event {
-        SessionEvent::InputSubmitted { text, .. } => {
-            let mut offsets = vec![0];
-            offsets.extend(wrap_offsets(text, width.saturating_sub(4).max(1)));
-            offsets.push(text.len());
-            offsets
+impl MessageRow {
+    fn text(line: Line<'static>, byte: usize) -> Self {
+        Self {
+            line,
+            byte,
+            part: AnchorPart::Text,
         }
-        SessionEvent::Reply { text, .. } => {
-            let mut offsets = Vec::new();
-            let mut base = 0;
-            let mut code = false;
-            for line in text.split_inclusive('\n') {
-                let source = line.trim_end_matches('\n').trim_end_matches('\r');
-                let clean = super::sanitize_external(source);
-                if clean.trim_start().starts_with("```") {
-                    code = !code;
-                    if code && !clean.trim_start().trim_start_matches('`').trim().is_empty() {
-                        offsets.push(base);
-                    }
-                } else {
-                    offsets.extend(
-                        wrap_offsets(source, width.saturating_sub(4).max(1))
-                            .into_iter()
-                            .map(|offset| base + offset),
-                    );
-                }
-                base += line.len();
-            }
-            offsets
-        }
-        SessionEvent::ToolFinished { outcome, .. } => {
-            let mut offsets = vec![0];
-            if let Err(error) = &outcome.result {
-                // Reserve zero for the tool heading; the preview uses original
-                // error byte offsets after that virtual heading byte.
-                offsets.extend(
-                    error_preview(&error.message, width)
-                        .into_iter()
-                        .map(|(byte, _)| byte + 1),
-                );
-            }
-            offsets
-        }
-        SessionEvent::QuestionAsked { text, .. } => wrap_offsets(text, width),
-        SessionEvent::JobFinished { summary, .. } => wrap_offsets(summary, width),
-        SessionEvent::RuntimeStarted { .. }
-        | SessionEvent::RuntimeReconfigured { .. }
-        | SessionEvent::RuntimeClosed { .. } => Vec::new(),
-        _ => vec![0],
     }
 }
 
@@ -135,32 +114,29 @@ fn error_preview(message: &str, width: usize) -> Vec<(usize, String)> {
     let prefix = &message[..end];
     let indent = if width >= 4 { "  " } else { "" };
     let content_width = width.saturating_sub(indent.len()).max(1);
-    let lines = wrap_text(prefix, content_width);
-    let offsets = wrap_offsets(prefix, content_width);
-    let mut preview: Vec<_> = lines
+    let mut preview: Vec<_> = wrapped_source(prefix, content_width)
         .into_iter()
-        .zip(offsets)
-        .filter(|(line, _)| !line.trim().is_empty())
+        .filter(|(_, line)| !line.trim().is_empty())
         .take(4)
         .collect();
     let truncated = end < message.len() || preview.len() > 3;
     preview.truncate(3);
     if preview.is_empty() {
         preview.push((
+            0,
             if message.is_empty() {
                 "(empty error)".into()
             } else {
                 String::new()
             },
-            0,
         ));
     }
     if truncated
         || preview
             .last()
-            .is_some_and(|(line, _)| UnicodeWidthStr::width(line.as_str()) > content_width)
+            .is_some_and(|(_, line)| UnicodeWidthStr::width(line.as_str()) > content_width)
     {
-        let line = &mut preview.last_mut().unwrap().0;
+        let line = &mut preview.last_mut().unwrap().1;
         while UnicodeWidthStr::width(line.as_str()) >= content_width {
             let Some((byte, _)) = line.grapheme_indices(true).next_back() else {
                 break;
@@ -171,7 +147,7 @@ fn error_preview(message: &str, width: usize) -> Vec<(usize, String)> {
     }
     preview
         .into_iter()
-        .map(|(mut text, byte)| {
+        .map(|(byte, mut text)| {
             if UnicodeWidthStr::width(text.as_str()) > content_width {
                 while UnicodeWidthStr::width(text.as_str()) >= content_width {
                     let Some((start, _)) = text.grapheme_indices(true).next_back() else {
@@ -186,80 +162,132 @@ fn error_preview(message: &str, width: usize) -> Vec<(usize, String)> {
         .collect()
 }
 
-fn wrap_offsets(value: &str, width: usize) -> Vec<usize> {
-    let mut offsets = vec![0];
+/// Wrap display text and retain the original UTF-8 byte at each visual row.
+fn wrapped_source(value: &str, width: usize) -> Vec<(usize, String)> {
+    let width = width.max(1);
+    let mut clean = String::new();
+    let mut source_map = Vec::new();
+    for (byte, character) in value.char_indices() {
+        let mut encoded = [0; 4];
+        let displayed = crate::text::display_grapheme(character.encode_utf8(&mut encoded));
+        let displayed = if displayed == "\t" {
+            "    "
+        } else {
+            displayed.as_ref()
+        };
+        if !displayed.is_empty() {
+            source_map.push((clean.len(), byte));
+            clean.push_str(displayed);
+        }
+    }
+
+    let mut rows = vec![(0, String::new())];
     let mut column = 0;
-    for (byte, grapheme) in value.grapheme_indices(true) {
-        if grapheme == "\n" || grapheme == "\r\n" {
-            offsets.push(byte + grapheme.len());
+    for (clean_byte, grapheme) in clean.grapheme_indices(true) {
+        let source_byte = source_map
+            [source_map.partition_point(|(display_byte, _)| *display_byte <= clean_byte) - 1]
+            .1;
+        if grapheme == "\n" {
+            rows.push((source_byte + 1, String::new()));
             column = 0;
             continue;
         }
-        let clean = crate::text::display_grapheme(grapheme);
-        // Tabs are expanded before wrapping, so they may span multiple rows.
-        for displayed in clean.graphemes(true) {
-            let cells = UnicodeWidthStr::width(displayed);
-            if column > 0 && column + cells > width {
-                offsets.push(byte);
-                column = 0;
-            }
-            column += cells;
+        let cells = UnicodeWidthStr::width(grapheme);
+        if column > 0 && column + cells > width {
+            rows.push((source_byte, String::new()));
+            column = 0;
         }
+        rows.last_mut().unwrap().1.push_str(grapheme);
+        column += cells;
     }
-    offsets
+    rows
 }
 
-fn user_rows(value: &str, width: usize) -> Vec<Line<'static>> {
+fn user_message(value: &str, width: usize) -> Vec<MessageRow> {
     let content_width = width.saturating_sub(4).max(1);
     let blank = || Line::from(Span::styled(" ".repeat(width), Style::default().bg(USER)));
-    let mut lines = vec![blank()];
-    lines.extend(wrap_text(value, content_width).into_iter().map(|content| {
-        let used = UnicodeWidthStr::width(content.as_str()).min(content_width);
-        Line::from(vec![
-            Span::styled("  ", Style::default().bg(USER)),
-            Span::styled(
-                format!("{content}{}", " ".repeat(width.saturating_sub(2 + used))),
-                theme::body_on(INK, USER),
-            ),
-        ])
-        .style(Style::default().bg(USER))
-    }));
-    lines.push(blank());
-    lines
+    let mut rows = vec![MessageRow {
+        line: blank(),
+        byte: 0,
+        part: AnchorPart::UserTop,
+    }];
+    rows.extend(
+        wrapped_source(value, content_width)
+            .into_iter()
+            .map(|(byte, content)| {
+                let used = UnicodeWidthStr::width(content.as_str()).min(content_width);
+                MessageRow::text(
+                    Line::from(vec![
+                        Span::styled("  ", Style::default().bg(USER)),
+                        Span::styled(
+                            format!("{content}{}", " ".repeat(width.saturating_sub(2 + used))),
+                            theme::body_on(INK, USER),
+                        ),
+                    ])
+                    .style(Style::default().bg(USER)),
+                    byte,
+                )
+            }),
+    );
+    rows.push(MessageRow {
+        line: blank(),
+        byte: value.len(),
+        part: AnchorPart::UserBottom,
+    });
+    rows
 }
 
 // Preserve source text and code indentation; fenced code stays on the open canvas.
-fn reply_rows(value: &str, width: usize) -> Vec<Line<'static>> {
+fn reply_message(value: &str, width: usize) -> Vec<MessageRow> {
     let mut code = false;
     let mut rows = Vec::new();
-    for source in super::sanitize_external(value).lines() {
-        if source.trim_start().starts_with("```") {
+    let mut base = 0;
+    for source_line in value.split_inclusive('\n') {
+        let source = source_line.trim_end_matches('\n').trim_end_matches('\r');
+        let clean = super::sanitize_external(source);
+        // `str::lines` omits a final fragment that sanitizes to empty.
+        if !source_line.ends_with('\n') && clean.is_empty() {
+            break;
+        }
+        if clean.trim_start().starts_with("```") {
             code = !code;
             if code {
-                let language = source.trim_start().trim_start_matches('`').trim();
+                let language = clean.trim_start().trim_start_matches('`').trim();
                 if !language.is_empty() {
-                    rows.push(Line::styled(
-                        format!("  {language}"),
-                        Style::default().fg(CODE_LABEL),
+                    rows.push(MessageRow::text(
+                        Line::styled(format!("  {language}"), Style::default().fg(CODE_LABEL)),
+                        base,
                     ));
                 }
             }
+            base += source_line.len();
             continue;
         }
-        let heading = !code && source.starts_with("# ");
-        for text in wrap_text(source, width.saturating_sub(4)) {
+        let heading = !code && clean.starts_with("# ");
+        for (byte, text) in wrapped_source(source, width.saturating_sub(4)) {
             let tone = if code { theme::INFO } else { INK };
-            rows.push(Line::styled(
-                format!("  {text}"),
-                if heading {
-                    theme::label(tone)
-                } else {
-                    theme::body(tone)
-                },
+            rows.push(MessageRow::text(
+                Line::styled(
+                    format!("  {text}"),
+                    if heading {
+                        theme::label(tone)
+                    } else {
+                        theme::body(tone)
+                    },
+                ),
+                base + byte,
             ));
         }
+        base += source_line.len();
     }
     rows
+}
+
+fn message_body(value: &str, width: usize, tone: Color) -> Vec<MessageRow> {
+    wrapped_source(value, width)
+        .into_iter()
+        .map(|(byte, text)| MessageRow::text(Line::styled(text, Style::default().fg(tone)), byte))
+        .collect()
 }
 
 pub(super) fn body_rows(value: &str, width: usize, tone: Color) -> Vec<Line<'static>> {
@@ -289,6 +317,76 @@ mod tests {
             .collect()
     }
 
+    fn rendered_lines(event: &SessionEvent, width: u16) -> Vec<Line<'static>> {
+        render(event, width)
+            .into_iter()
+            .map(|row| row.line)
+            .collect()
+    }
+
+    #[test]
+    fn source_rows_preserve_sanitized_unicode_wrapping() {
+        for value in [
+            "",
+            "\u{1b}",
+            "a\r\nb",
+            "\t中e\u{301}",
+            "🇺\u{200e}🇸 tail",
+            "a\n",
+            "\n\n",
+        ] {
+            for width in [1, 2, 5, 12] {
+                let rows = wrapped_source(value, width);
+                assert_eq!(
+                    rows.iter().map(|(_, text)| text).collect::<Vec<_>>(),
+                    wrap_text(value, width).iter().collect::<Vec<_>>()
+                );
+                assert!(rows.iter().all(|(byte, _)| value.is_char_boundary(*byte)));
+                assert!(rows.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+            }
+        }
+    }
+
+    #[test]
+    fn user_rows_own_padding_and_text_anchor_identity() {
+        let text = "ab中cd";
+        let event = SessionEvent::InputSubmitted {
+            input: InputId(1),
+            request_id: RequestId::new(),
+            text: text.into(),
+            reply_to: None,
+        };
+        let rows = render(&event, 6);
+        assert_eq!(
+            rows.iter().map(|row| row.part).collect::<Vec<_>>(),
+            [
+                AnchorPart::UserTop,
+                AnchorPart::Text,
+                AnchorPart::Text,
+                AnchorPart::Text,
+                AnchorPart::UserBottom,
+            ]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.byte).collect::<Vec<_>>(),
+            [0, 0, 2, 5, text.len()]
+        );
+    }
+
+    #[test]
+    fn reply_omits_a_sanitized_empty_final_fragment() {
+        let reply = |text: &str| SessionEvent::Reply {
+            job: bone_app::JobRef {
+                runtime: RuntimeId::new(),
+                id: 1,
+            },
+            inputs: vec![InputId(1)],
+            text: text.into(),
+        };
+        assert!(render(&reply("\u{1b}"), 80).is_empty());
+        assert_eq!(render(&reply("body\n\u{200e}"), 80).len(), 1);
+    }
+
     #[test]
     fn conversation_messages_have_no_speaker_labels() {
         let user = SessionEvent::InputSubmitted {
@@ -306,8 +404,8 @@ mod tests {
             text: "UNIQUE_ASSISTANT_BODY".into(),
         };
 
-        let user_text = visible_text(&rows(&user, 80));
-        let assistant_text = visible_text(&rows(&assistant, 80));
+        let user_text = visible_text(&rendered_lines(&user, 80));
+        let assistant_text = visible_text(&rendered_lines(&assistant, 80));
         assert!(user_text.contains("UNIQUE_USER_BODY"));
         assert!(assistant_text.contains("UNIQUE_ASSISTANT_BODY"));
         for speaker in ["YOU", "BONE"] {
@@ -324,7 +422,7 @@ mod tests {
             text: "一二三四五六七八九十".repeat(20),
             reply_to: None,
         };
-        assert!(rows(&event, 12).len() > 12);
+        assert!(render(&event, 12).len() > 12);
     }
 
     #[test]
@@ -332,7 +430,7 @@ mod tests {
         let event = SessionEvent::RuntimeClosed {
             runtime: RuntimeId::new(),
         };
-        assert!(rows(&event, 80).is_empty());
+        assert!(render(&event, 80).is_empty());
     }
 }
 
@@ -353,12 +451,11 @@ mod tool_error_tests {
         let message = "\u{1b}权限 e\u{301}错误\r\n第二行\t详细信息\n第三行\nTAIL";
         let event = failure(message);
         for width in [1, 4, 12, 40, 160] {
-            let lines = rows(&event, width);
-            let offsets = row_offsets(&event, width);
-            assert!(lines.len() >= 2 && lines.len() <= 4);
-            assert_eq!(lines.len(), offsets.len());
-            for line in lines.iter().skip(1) {
-                let text: String = line
+            let rows = render(&event, width);
+            assert!(rows.len() >= 2 && rows.len() <= 4);
+            for row in rows.iter().skip(1) {
+                let text: String = row
+                    .line
                     .spans
                     .iter()
                     .map(|span| span.content.as_ref())
@@ -367,13 +464,13 @@ mod tool_error_tests {
                 assert!(UnicodeWidthStr::width(text.as_str()) <= usize::from(width));
                 assert!(!text.contains("TAIL"));
             }
-            assert_eq!(offsets[0], 0);
+            assert_eq!(rows[0].byte, 0);
             assert!(
-                offsets[1..]
+                rows[1..]
                     .iter()
-                    .all(|byte| message.is_char_boundary(byte - 1))
+                    .all(|row| message.is_char_boundary(row.byte - 1))
             );
-            assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+            assert!(rows.windows(2).all(|pair| pair[0].byte <= pair[1].byte));
         }
     }
     #[test]
@@ -384,15 +481,13 @@ mod tool_error_tests {
             format!("e{}TAIL", "\u{301}".repeat(512 * 1024)),
         ] {
             let event = failure(message);
-            let lines = rows(&event, 40);
-            assert!(lines.len() <= 4);
-            let offsets = row_offsets(&event, 40);
-            assert_eq!(lines.len(), offsets.len());
-            assert!(offsets.into_iter().all(|offset| offset <= 4097));
+            let rows = render(&event, 40);
+            assert!(rows.len() <= 4);
+            assert!(rows.iter().all(|row| row.byte <= 4097));
             assert!(
-                lines
-                    .last()
+                rows.last()
                     .unwrap()
+                    .line
                     .spans
                     .iter()
                     .any(|span| span.content.contains('…'))
@@ -403,14 +498,18 @@ mod tool_error_tests {
     fn short_empty_and_exact_boundary_errors_do_not_add_extra_rows() {
         for message in ["", "one", "中e\u{301}", "one\ntwo\nthree"] {
             let event = failure(message);
-            assert_eq!(rows(&event, 40).len(), row_offsets(&event, 40).len());
-            let text: String = rows(&event, 40)
+            let text: String = render(&event, 40)
                 .into_iter()
                 .skip(1)
-                .flat_map(|row| row.spans.into_iter().map(|span| span.content.into_owned()))
+                .flat_map(|row| {
+                    row.line
+                        .spans
+                        .into_iter()
+                        .map(|span| span.content.into_owned())
+                })
                 .collect();
             assert!(!text.contains('…'));
         }
-        assert_eq!(rows(&failure("one\ntwo\nthree"), 40).len(), 4);
+        assert_eq!(render(&failure("one\ntwo\nthree"), 40).len(), 4);
     }
 }

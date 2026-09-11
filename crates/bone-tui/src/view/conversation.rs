@@ -267,13 +267,13 @@ fn render_transcript(
     let mut links = Vec::new();
     let mut anchors = Vec::new();
     for entry in &session.history {
-        let mut rendered = message::rows(&entry.event, area.width);
+        let mut rendered = message::render(&entry.event, area.width);
         if reader_selects(
             state,
             crate::state::reader::ReaderSource::History(entry.sequence),
         ) {
-            for line in &mut rendered {
-                line.style = line.style.bg(theme::SELECTED);
+            for row in &mut rendered {
+                row.line.style = row.line.style.bg(theme::SELECTED);
             }
         }
         if rendered.is_empty() {
@@ -305,28 +305,12 @@ fn render_transcript(
         if let Some(target) = target {
             links.push((source_row, target));
         }
-        let offsets = message::row_offsets(&entry.event, area.width);
-        anchors.extend((0..rendered.len()).map(|row| {
-            crate::layout::ContentAnchor {
-                sequence: entry.sequence,
-                part: if matches!(entry.event, bone_app::SessionEvent::InputSubmitted { .. })
-                    && row == 0
-                {
-                    crate::layout::AnchorPart::UserTop
-                } else if matches!(entry.event, bone_app::SessionEvent::InputSubmitted { .. })
-                    && row + 1 == rendered.len()
-                {
-                    crate::layout::AnchorPart::UserBottom
-                } else {
-                    crate::layout::AnchorPart::Text
-                },
-                byte: offsets
-                    .get(row)
-                    .copied()
-                    .unwrap_or_else(|| offsets.last().copied().unwrap_or(0)),
-            }
+        anchors.extend(rendered.iter().map(|row| crate::layout::ContentAnchor {
+            sequence: entry.sequence,
+            part: row.part,
+            byte: row.byte,
         }));
-        rows.extend(rendered);
+        rows.extend(rendered.into_iter().map(|row| row.line));
     }
 
     if session.scroll_from_tail == 0
