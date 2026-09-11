@@ -11,15 +11,8 @@ use super::summarize_overview;
 const HISTORY_PAGE: usize = 32;
 const DRAFT_DEBOUNCE: Duration = Duration::from_millis(250);
 
-#[derive(Clone, Debug)]
-enum SessionOperationOutcome {
-    Renamed(Result<String, Arc<str>>),
-    AutoTitled(Result<Option<String>, Arc<str>>),
-    Released(Result<bone_app::SessionReleaseReceipt, Arc<str>>),
-}
-
-type SharedSessionOperation =
-    Shared<futures_util::future::BoxFuture<'static, SessionOperationOutcome>>;
+type SharedSessionOperationBarrier =
+    Shared<futures_util::future::BoxFuture<'static, Option<Arc<str>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionOperationToken {
@@ -30,7 +23,7 @@ enum SessionOperationToken {
 
 struct PendingSessionOperation {
     token: SessionOperationToken,
-    future: SharedSessionOperation,
+    barrier: SharedSessionOperationBarrier,
 }
 
 #[derive(Default)]
@@ -372,12 +365,12 @@ impl Runtime {
                 let previous = self
                     .session_operations
                     .get(&session)
-                    .map(|operation| operation.future.clone());
+                    .map(|operation| operation.barrier.clone());
                 let future = async move {
                     if let Some(previous) = previous {
                         let _ = previous.await;
                     }
-                    let result = async {
+                    async {
                         // Resolve after the per-Session barrier. A release ahead
                         // of this operation may have closed the cached actor.
                         let handle = app.session(session).await?;
@@ -385,22 +378,22 @@ impl Runtime {
                         Ok::<_, bone_app::Error>(title)
                     }
                     .await
-                    .map_err(|error| Arc::<str>::from(error.to_string()));
-                    SessionOperationOutcome::Renamed(result)
+                    .map_err(|error| Arc::<str>::from(error.to_string()))
                 }
                 .boxed()
                 .shared();
+                let barrier = future.clone().map(Result::err).boxed().shared();
                 self.session_operations.insert(
                     session,
                     PendingSessionOperation {
                         token: SessionOperationToken::Rename(request),
-                        future: future.clone(),
+                        barrier,
                     },
                 );
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
                     match future.await {
-                        SessionOperationOutcome::Renamed(Ok(title)) => {
+                        Ok(title) => {
                             let _ = tx
                                 .send(UiEvent::SessionRenamed {
                                     session,
@@ -409,7 +402,7 @@ impl Runtime {
                                 })
                                 .await;
                         }
-                        SessionOperationOutcome::Renamed(Err(_)) => {
+                        Err(_) => {
                             let _ = tx
                                 .send(UiEvent::SessionRenameFailed {
                                     session,
@@ -417,10 +410,6 @@ impl Runtime {
                                     message: "Unable to rename the session".into(),
                                 })
                                 .await;
-                        }
-                        SessionOperationOutcome::AutoTitled(_)
-                        | SessionOperationOutcome::Released(_) => {
-                            unreachable!("manual title future returned an auto-title outcome")
                         }
                     }
                 });
@@ -435,12 +424,12 @@ impl Runtime {
                 let previous = self
                     .session_operations
                     .get(&session)
-                    .map(|operation| operation.future.clone());
+                    .map(|operation| operation.barrier.clone());
                 let future = async move {
                     if let Some(previous) = previous {
                         let _ = previous.await;
                     }
-                    let result = async {
+                    async {
                         let handle = app.session(session).await?;
                         if handle.title_from_first_input(&first_input).await? {
                             Ok::<_, bone_app::Error>(Some(handle.snapshot().await?.session.title))
@@ -449,22 +438,22 @@ impl Runtime {
                         }
                     }
                     .await
-                    .map_err(|error| Arc::<str>::from(error.to_string()));
-                    SessionOperationOutcome::AutoTitled(result)
+                    .map_err(|error| Arc::<str>::from(error.to_string()))
                 }
                 .boxed()
                 .shared();
+                let barrier = future.clone().map(|_| None).boxed().shared();
                 self.session_operations.insert(
                     session,
                     PendingSessionOperation {
                         token: SessionOperationToken::AutoTitle(request),
-                        future: future.clone(),
+                        barrier,
                     },
                 );
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
                     match future.await {
-                        SessionOperationOutcome::AutoTitled(Ok(Some(title))) => {
+                        Ok(Some(title)) => {
                             let _ = tx
                                 .send(UiEvent::SessionAutoTitled {
                                     session,
@@ -473,8 +462,8 @@ impl Runtime {
                                 })
                                 .await;
                         }
-                        SessionOperationOutcome::AutoTitled(Ok(None)) => {}
-                        SessionOperationOutcome::AutoTitled(Err(_)) => {
+                        Ok(None) => {}
+                        Err(_) => {
                             send_failure(
                                 &tx,
                                 OperationKind::AutoTitle,
@@ -483,10 +472,6 @@ impl Runtime {
                                 "The session title could not be updated".into(),
                             )
                             .await
-                        }
-                        SessionOperationOutcome::Renamed(_)
-                        | SessionOperationOutcome::Released(_) => {
-                            unreachable!("auto-title future returned a manual title outcome")
                         }
                     }
                 });
@@ -719,7 +704,7 @@ impl Runtime {
                             Err(_) => {
                                 send_failure(
                                     &tx,
-                                    OperationKind::LoadHistory,
+                                    OperationKind::ReloadRecentHistory,
                                     Some(session),
                                     Some(generation),
                                     "Unable to return to recent activity".into(),
@@ -768,30 +753,29 @@ impl Runtime {
                 let previous = self
                     .session_operations
                     .get(&session)
-                    .map(|operation| operation.future.clone());
+                    .map(|operation| operation.barrier.clone());
                 let future = async move {
                     if let Some(previous) = previous {
                         let _ = previous.await;
                     }
-                    SessionOperationOutcome::Released(
-                        app.release_session(session)
-                            .await
-                            .map_err(|error| Arc::<str>::from(error.to_string())),
-                    )
+                    app.release_session(session)
+                        .await
+                        .map_err(|error| Arc::<str>::from(error.to_string()))
                 }
                 .boxed()
                 .shared();
+                let barrier = future.clone().map(|_| None).boxed().shared();
                 self.session_operations.insert(
                     session,
                     PendingSessionOperation {
                         token: SessionOperationToken::Release(generation),
-                        future: future.clone(),
+                        barrier,
                     },
                 );
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
                     match future.await {
-                        SessionOperationOutcome::Released(Ok(receipt)) => {
+                        Ok(receipt) => {
                             let _ = tx
                                 .send(UiEvent::SessionReleased {
                                     generation,
@@ -799,7 +783,7 @@ impl Runtime {
                                 })
                                 .await;
                         }
-                        SessionOperationOutcome::Released(Err(_)) => {
+                        Err(_) => {
                             send_failure(
                                 &tx,
                                 OperationKind::ReleaseSession,
@@ -808,10 +792,6 @@ impl Runtime {
                                 "Unable to release the session".into(),
                             )
                             .await
-                        }
-                        SessionOperationOutcome::Renamed(_)
-                        | SessionOperationOutcome::AutoTitled(_) => {
-                            unreachable!("release future returned a title outcome")
                         }
                     }
                 });
@@ -1105,12 +1085,16 @@ impl Runtime {
         let futures = self
             .session_operations
             .values()
-            .map(|operation| operation.future.clone())
+            .map(|operation| operation.barrier.clone())
             .collect::<Vec<_>>();
         let mut first_error = None;
-        for outcome in futures_util::future::join_all(futures).await {
-            if let SessionOperationOutcome::Renamed(Err(error)) = outcome {
-                first_error.get_or_insert_with(|| error.to_string());
+        for error in futures_util::future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            if first_error.is_none() {
+                first_error = Some(error.to_string());
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -1196,10 +1180,10 @@ mod lifecycle_tests {
         (root, app, session, runtime, rx)
     }
 
-    fn gated_operation(gate: Arc<tokio::sync::Notify>) -> SharedSessionOperation {
+    fn gated_operation(gate: Arc<tokio::sync::Notify>) -> SharedSessionOperationBarrier {
         async move {
             gate.notified().await;
-            SessionOperationOutcome::AutoTitled(Ok(None))
+            None
         }
         .boxed()
         .shared()
@@ -1250,7 +1234,7 @@ mod lifecycle_tests {
             id,
             PendingSessionOperation {
                 token: SessionOperationToken::AutoTitle(99),
-                future: gated_operation(gate.clone()),
+                barrier: gated_operation(gate.clone()),
             },
         );
 
@@ -1303,7 +1287,7 @@ mod lifecycle_tests {
             id,
             PendingSessionOperation {
                 token: SessionOperationToken::AutoTitle(99),
-                future: gated_operation(gate.clone()),
+                barrier: gated_operation(gate.clone()),
             },
         );
 

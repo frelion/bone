@@ -763,6 +763,8 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                         }
                         OperationKind::LoadHistory => {
                             ui.history_loading = false;
+                        }
+                        OperationKind::ReloadRecentHistory => {
                             ui.recent_loading = false;
                         }
                         _ => {}
@@ -3596,6 +3598,7 @@ mod final_integration_regressions {
             failed: false,
         });
         ui.history_loading = true;
+        ui.recent_loading = true;
         update(
             &mut state,
             UiEvent::SubmitFailed {
@@ -3623,6 +3626,17 @@ mod final_integration_regressions {
             },
         );
         assert!(!state.session_ui[&background].history_loading);
+        assert!(state.session_ui[&background].recent_loading);
+        update(
+            &mut state,
+            UiEvent::OperationFailed {
+                kind: OperationKind::ReloadRecentHistory,
+                session: Some(background),
+                generation: Some(1),
+                message: "background recent history failed".into(),
+            },
+        );
+        assert!(!state.session_ui[&background].recent_loading);
         assert_eq!(state.status.as_deref(), Some("current status"));
         update(
             &mut state,
