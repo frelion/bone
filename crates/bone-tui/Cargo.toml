@@ -24,5 +24,8 @@ unicode-segmentation = "1.12"
 [dev-dependencies]
 tempfile.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true

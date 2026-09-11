@@ -8,9 +8,6 @@ use super::{
 };
 
 pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
-    if matches!(event, UiEvent::Tick | UiEvent::Action(Action::Noop)) {
-        return Vec::new();
-    }
     // Scheduling background work does not change the screen. In particular,
     // the 500ms draft timer must not continually re-show the native caret.
     if !matches!(
@@ -612,8 +609,9 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 }
             }
         }
-        UiEvent::Resized => {}
-        UiEvent::Tick => unreachable!(),
+        UiEvent::Resized => {
+            state.dragging_divider = None;
+        }
     }
     trim_editor_history(state);
     trim_global_history(state);
@@ -621,8 +619,11 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
 }
 
 fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>) {
+    if !matches!(action, Action::BeginPaneResize(_) | Action::DragPane { .. }) {
+        state.dragging_divider = None;
+    }
     if !matches!(action, Action::Input(_)) {
-        state.editor_mut().3.typing = false;
+        state.editor_mut().stop_typing();
     }
     if !matches!(
         action,
@@ -631,11 +632,20 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 direction: -2 | 2,
                 ..
             }
-            | Action::Noop
     ) {
         state.preferred_column = None;
     }
     match action {
+        Action::BeginPaneResize(divider) => state.dragging_divider = Some(divider),
+        Action::DragPane { widths, finish } => {
+            if state.dragging_divider.is_some() {
+                state.pane_widths = widths;
+                if finish {
+                    state.dragging_divider = None;
+                }
+            }
+        }
+        Action::EndPaneResize => {}
         Action::RenameText(text) => {
             state
                 .rename_input
@@ -766,7 +776,6 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 .min(max);
         }
 
-        Action::Noop => {}
         Action::Focus(focus) => state.focus = focus,
         Action::FocusLeft => state.focus = Focus::Sessions,
         Action::FocusRight => {
@@ -796,27 +805,44 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                     .map(|info| info.id)
             }) {
                 select_session(state, session, effects);
-                state.focus = Focus::Conversation;
+                if state.focus != Focus::Composer {
+                    state.focus = Focus::Conversation;
+                }
             }
         }
         Action::SelectSession(session) => {
             state.panel = None;
             select_session(state, session, effects);
-            state.focus = Focus::Conversation;
+            if state.focus != Focus::Composer {
+                state.focus = Focus::Conversation;
+            }
         }
         Action::SelectSlashPrevious => move_slash(state, -1),
         Action::SelectSlashNext => move_slash(state, 1),
         Action::CompleteSlash => complete_slash(state),
-        Action::ExecuteSlash(index) => {
+        Action::ExecuteCommand(kind) => {
             if matches!(state.panel, Some(Panel::Commands)) {
-                state.panel_selection = index;
-                if let Some(command) = COMMANDS.get(index) {
+                if let Some(command) = COMMANDS.iter().find(|command| command.kind == kind) {
                     run_palette_command(state, command.name, effects);
                 }
                 return;
             }
-            state.slash_selection = index;
-            submit(state, effects);
+            if let Some(index) = state
+                .slash_matches()
+                .iter()
+                .position(|command| command.kind == kind)
+            {
+                state.slash_selection = index;
+                submit(state, effects);
+            }
+        }
+        Action::ClearInput => {
+            if state.focus == Focus::Composer && state.panel.is_none() {
+                state.editor_mut().clear();
+                state.slash_selection = 0;
+                state.slash_dismissed = None;
+                state.status = None;
+            }
         }
         Action::Input(value) => insert_text(state, &value.to_string(), true),
         Action::Paste(text) => insert_text(state, &text, false),
@@ -824,8 +850,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::Delete => delete_after_cursor(state),
         Action::Undo | Action::Redo => {
             let redo = matches!(action, Action::Redo);
-            let (text, cursor, revision, editor) = state.editor_mut();
-            editor.undo(text, cursor, revision, redo);
+            state.editor_mut().undo(redo);
             state.status = None;
             state.slash_selection = 0;
             state.slash_dismissed = None;
@@ -837,45 +862,23 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
             word,
         } => {
             let mut preferred = state.preferred_column;
-            let (text, cursor, _, editor) = state.editor_mut();
-            if select {
-                editor.anchor.get_or_insert(*cursor);
-            } else {
-                editor.anchor = None;
-            }
-            *cursor = match direction {
-                -1 | 1 if word => crate::text::word_cursor(text, *cursor, direction > 0),
-                -1 | 1 => moved_cursor(text, *cursor, direction as isize),
-                -2 | 2 => crate::text::vertical_cursor(
-                    text,
-                    *cursor,
-                    width,
-                    direction > 0,
-                    &mut preferred,
-                ),
-                -3 | 3 => line_edge(text, *cursor, direction > 0),
-                _ => *cursor,
-            };
+            state
+                .editor_mut()
+                .move_cursor(direction, width, select, word, &mut preferred);
             state.preferred_column = preferred;
         }
-        Action::DragCursor(byte) => {
-            let (text, cursor, _, editor) = state.editor_mut();
-            editor.anchor.get_or_insert(*cursor);
-            *cursor = grapheme_boundary(text, byte);
-        }
+        Action::DragCursor(byte) => state.editor_mut().extend_pointer_selection(byte),
         Action::PlaceCursor(byte) => {
             state.focus = Focus::Composer;
-            let (text, cursor, _, editor) = state.editor_mut();
-            *cursor = grapheme_boundary(text, byte);
-            editor.anchor = Some(*cursor);
+            state.editor_mut().begin_pointer_selection(byte);
         }
         Action::CursorLeft => move_cursor(state, -1),
         Action::CursorRight => move_cursor(state, 1),
         Action::CursorVertical { down, width } => {
             let mut preferred = state.preferred_column;
-            let (text, cursor, _, editor) = state.editor_mut();
-            editor.anchor = None;
-            *cursor = crate::text::vertical_cursor(text, *cursor, width, down, &mut preferred);
+            state
+                .editor_mut()
+                .move_vertical(width, down, &mut preferred);
             state.preferred_column = preferred;
         }
         Action::CursorHome => set_cursor_line_edge(state, false),
@@ -955,22 +958,14 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                         .unwrap_or(metrics.start_row)
                         .saturating_add(amount)
                 });
-                let follow_tail = ui
+                let reaches_tail = ui
                     .transcript_metrics
                     .as_ref()
                     .zip(target)
                     .is_some_and(|(metrics, target)| target >= metrics.max_scroll());
-                if follow_tail || ui.scroll_from_tail <= amount && ui.transcript_metrics.is_none() {
-                    ui.read_anchor = None;
-                    ui.scroll_from_tail = 0;
-                    ui.unread = 0;
-                    if ui.newer_history_missing && !ui.recent_loading {
-                        ui.recent_loading = true;
-                        effects.push(Effect::ReloadRecentHistory {
-                            session: ui.info.id,
-                            generation: ui.generation,
-                        });
-                    }
+                if reaches_tail || ui.scroll_from_tail <= amount && ui.transcript_metrics.is_none()
+                {
+                    follow_transcript_tail(ui, effects);
                 } else {
                     ui.scroll_from_tail = ui.scroll_from_tail.saturating_sub(amount);
                     ui.read_anchor = ui
@@ -979,6 +974,11 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                         .zip(target)
                         .and_then(|(metrics, target)| metrics.anchor_at_start(target));
                 }
+            }
+        }
+        Action::FollowTail => {
+            if let Some(ui) = state.selected_ui_mut() {
+                follow_transcript_tail(ui, effects);
             }
         }
         Action::Stop => effects.extend(stop_selected(state)),
@@ -1531,104 +1531,29 @@ fn insert_text(state: &mut UiState, text: &str, typing: bool) {
     state.status = None;
     state.slash_selection = 0;
     state.slash_dismissed = None;
-    let (draft, cursor, revision, editor) = state.editor_mut();
-    if text.is_empty() {
-        return;
-    }
-    let selection = editor.selection(*cursor);
-    if !typing || !editor.typing || selection.is_some() {
-        editor.checkpoint(draft, *cursor);
-    }
-    editor.typing = typing;
-    if let Some(range) = selection {
-        *cursor = range.start;
-        draft.replace_range(range, "");
-    }
-    draft.insert_str(*cursor, text);
-    *cursor = next_grapheme_boundary(draft, *cursor + text.len());
-    *revision = revision.wrapping_add(1);
+    state.editor_mut().insert(text, typing);
 }
 
 fn delete_before_cursor(state: &mut UiState) {
     state.status = None;
     state.slash_selection = 0;
     state.slash_dismissed = None;
-    let (draft, cursor, revision, editor) = state.editor_mut();
-    if let Some(range) = editor.selection(*cursor) {
-        editor.checkpoint(draft, *cursor);
-        *cursor = range.start;
-        draft.replace_range(range, "");
-        *cursor = next_grapheme_boundary(draft, *cursor);
-        *revision = revision.wrapping_add(1);
-    } else if let Some((index, _)) = draft[..*cursor].grapheme_indices(true).next_back() {
-        editor.checkpoint(draft, *cursor);
-        draft.drain(index..*cursor);
-        *cursor = next_grapheme_boundary(draft, index);
-        *revision = revision.wrapping_add(1);
-        state.status = None;
-        state.slash_selection = 0;
-        state.slash_dismissed = None;
-    }
+    state.editor_mut().delete_before();
 }
 
 fn delete_after_cursor(state: &mut UiState) {
     state.status = None;
     state.slash_selection = 0;
     state.slash_dismissed = None;
-    let (draft, cursor, revision, editor) = state.editor_mut();
-    if let Some(range) = editor.selection(*cursor) {
-        editor.checkpoint(draft, *cursor);
-        *cursor = range.start;
-        draft.replace_range(range, "");
-        *cursor = next_grapheme_boundary(draft, *cursor);
-        *revision = revision.wrapping_add(1);
-    } else if let Some(len) = draft[*cursor..].graphemes(true).next().map(str::len) {
-        editor.checkpoint(draft, *cursor);
-        draft.drain(*cursor..*cursor + len);
-        *cursor = next_grapheme_boundary(draft, *cursor);
-        *revision = revision.wrapping_add(1);
-        state.status = None;
-        state.slash_selection = 0;
-        state.slash_dismissed = None;
-    }
+    state.editor_mut().delete_after();
 }
 
 fn move_cursor(state: &mut UiState, delta: isize) {
-    let (draft, cursor, _, editor) = state.editor_mut();
-    *cursor = if let Some(range) = editor.selection(*cursor) {
-        if delta < 0 { range.start } else { range.end }
-    } else {
-        moved_cursor(draft, *cursor, delta)
-    };
-    editor.anchor = None;
-}
-
-fn moved_cursor(text: &str, cursor: usize, delta: isize) -> usize {
-    if delta < 0 {
-        text[..cursor]
-            .grapheme_indices(true)
-            .next_back()
-            .map_or(cursor, |(index, _)| index)
-    } else {
-        text[cursor..]
-            .graphemes(true)
-            .next()
-            .map_or(cursor, |value| cursor + value.len())
-    }
+    state.editor_mut().move_horizontal(delta);
 }
 
 fn set_cursor_line_edge(state: &mut UiState, end: bool) {
-    let (draft, cursor, _, editor) = state.editor_mut();
-    editor.anchor = None;
-    *cursor = line_edge(draft, *cursor, end);
-}
-
-fn line_edge(text: &str, cursor: usize, end: bool) -> usize {
-    if end {
-        cursor + text[cursor..].find('\n').unwrap_or(text.len() - cursor)
-    } else {
-        text[..cursor].rfind('\n').map_or(0, |index| index + 1)
-    }
+    state.editor_mut().move_line_edge(end);
 }
 
 fn complete_slash(state: &mut UiState) {
@@ -1729,6 +1654,19 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
         effects.push(Effect::RememberSession {
             workspace,
             session: id,
+        });
+    }
+}
+
+fn follow_transcript_tail(ui: &mut SessionUi, effects: &mut Vec<Effect>) {
+    ui.read_anchor = None;
+    ui.scroll_from_tail = 0;
+    ui.unread = 0;
+    if ui.newer_history_missing && !ui.recent_loading {
+        ui.recent_loading = true;
+        effects.push(Effect::ReloadRecentHistory {
+            session: ui.info.id,
+            generation: ui.generation,
         });
     }
 }
@@ -2296,6 +2234,21 @@ mod panel_draft_tests {
     }
 
     #[test]
+    fn clear_answer_preserves_ordinary_draft_and_question_binding() {
+        let (mut state, question) = fixture();
+        let revision = state.selected_ui().unwrap().answer_drafts[&question].revision;
+        assert!(update(&mut state, UiEvent::Action(Action::ClearInput)).is_empty());
+        assert_eq!(state.draft(), "");
+        let ui = state.selected_ui().unwrap();
+        assert_eq!(ui.draft, "ordinary draft");
+        assert_eq!(ui.selected_answer, Some(question));
+        assert!(ui.answer_drafts[&question].revision > revision);
+        update(&mut state, UiEvent::Action(Action::Undo));
+        assert_eq!(state.draft(), "answer draft");
+        assert_eq!(state.selected_ui().unwrap().draft, "ordinary draft");
+    }
+
+    #[test]
     fn editor_history_isolated_between_orphan_session_and_answer() {
         let (mut state, question) = fixture();
         let session = state.selected;
@@ -2735,22 +2688,6 @@ mod panel_draft_tests {
     }
 }
 
-fn grapheme_boundary(text: &str, byte: usize) -> usize {
-    text.grapheme_indices(true)
-        .map(|(at, _)| at)
-        .chain(std::iter::once(text.len()))
-        .take_while(|at| *at <= byte)
-        .last()
-        .unwrap_or(0)
-}
-fn next_grapheme_boundary(text: &str, byte: usize) -> usize {
-    text.grapheme_indices(true)
-        .map(|(at, _)| at)
-        .chain(std::iter::once(text.len()))
-        .find(|at| *at >= byte)
-        .unwrap_or(text.len())
-}
-
 // Editing history has a separate 8 MiB global budget. Inactive buffers are
 // trimmed first; current text and revisions are never part of eviction.
 fn trim_editor_history(state: &mut UiState) {
@@ -2826,6 +2763,17 @@ mod session_browsing_tests {
         assert_eq!(state.selected, Some(ids[2]));
         assert_eq!(state.session_candidate, Some(ids[2]));
         assert_eq!(state.focus, Focus::Conversation);
+    }
+
+    #[test]
+    fn session_switch_preserves_an_existing_composer_focus() {
+        let (mut state, ids) = fixture();
+        state.focus = Focus::Composer;
+
+        update(&mut state, UiEvent::Action(Action::SelectSession(ids[1])));
+
+        assert_eq!(state.selected, Some(ids[1]));
+        assert_eq!(state.focus, Focus::Composer);
     }
 
     #[test]

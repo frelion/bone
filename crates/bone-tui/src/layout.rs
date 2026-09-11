@@ -1,17 +1,119 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use bone_app::SessionSeq;
 use ratatui::layout::Rect;
+
+pub use crate::ui::interaction::{HitRegion, HitTarget};
 
 const SESSION_RAIL_WIDTH: u16 = 32;
 const EXTENSION_WIDTH: u16 = 40;
 const CONTENT_INSET: u16 = 4;
 
+const MIN_SIDE_WIDTH: u16 = 24;
+const MIN_CENTER_WIDTH: u16 = 56;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaneDivider {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaneWidths {
+    pub left: u16,
+    pub right: u16,
+}
+
+impl Default for PaneWidths {
+    fn default() -> Self {
+        Self {
+            left: SESSION_RAIL_WIDTH,
+            right: EXTENSION_WIDTH,
+        }
+    }
+}
+
+impl PaneWidths {
+    /// Clamp displayed sizes without discarding the user's preferred widths on resize.
+    pub fn fitted(self, screen: Rect) -> Self {
+        match mode_for(screen) {
+            LayoutMode::Wide => {
+                let left = self.left.clamp(
+                    MIN_SIDE_WIDTH,
+                    screen.width - MIN_CENTER_WIDTH - MIN_SIDE_WIDTH,
+                );
+                let right = self
+                    .right
+                    .clamp(MIN_SIDE_WIDTH, screen.width - MIN_CENTER_WIDTH - left);
+                Self { left, right }
+            }
+            LayoutMode::TwoColumn => Self {
+                left: self
+                    .left
+                    .clamp(MIN_SIDE_WIDTH, screen.width - MIN_CENTER_WIDTH),
+                right: 0,
+            },
+            _ => Self { left: 0, right: 0 },
+        }
+    }
+
+    pub fn dragged(self, plan: &LayoutPlan, divider: PaneDivider, column: u16) -> Self {
+        let mut widths = self;
+        match divider {
+            PaneDivider::Left if plan.session_rail.is_some() && plan.conversation.is_some() => {
+                let right = plan.extension_blank.map_or(0, |area| area.width);
+                if plan.extension_blank.is_some() {
+                    widths.right = right;
+                }
+                widths.left = column
+                    .saturating_sub(plan.screen.x)
+                    .saturating_add(1)
+                    .clamp(MIN_SIDE_WIDTH, plan.screen.width - MIN_CENTER_WIDTH - right);
+            }
+            PaneDivider::Right if plan.extension_blank.is_some() => {
+                let left = plan.session_rail.map_or(0, |area| area.width);
+                widths.left = left;
+                widths.right = plan
+                    .screen
+                    .right()
+                    .saturating_sub(column)
+                    .clamp(MIN_SIDE_WIDTH, plan.screen.width - MIN_CENTER_WIDTH - left);
+            }
+            _ => {}
+        }
+        widths
+    }
+
+    pub fn content_width(self, screen: Rect) -> u16 {
+        let widths = self.fitted(screen);
+        screen
+            .width
+            .saturating_sub(widths.left + widths.right + CONTENT_INSET * 2)
+    }
+}
+
+pub(crate) fn comfortable(area: Rect) -> bool {
+    area.height >= 24
+}
+
+pub(crate) fn session_list_top(area: Rect) -> u16 {
+    area.y + if comfortable(area) { 7 } else { 4 }
+}
+
+pub(crate) fn new_session_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x + 1,
+        area.y + if comfortable(area) { 3 } else { 2 },
+        area.width.saturating_sub(3),
+        if comfortable(area) { 3 } else { 1 },
+    )
+}
+
 pub(crate) fn composer_text_area(area: Rect) -> Rect {
     Rect::new(
-        area.x + 4,
+        area.x + 2,
         area.y + 1,
-        area.width.saturating_sub(6),
+        area.width.saturating_sub(4),
         area.height.saturating_sub(4),
     )
 }
@@ -201,38 +303,9 @@ pub enum SinglePane {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HitTarget {
-    ConnectionKind(usize),
-    SetupField(crate::state::SetupField),
-    SaveConnection,
-    SessionRail,
-    NewSession,
-    Commands,
-    Models,
-    Back,
-    Reader,
-    Model(usize),
-    Object(usize),
-    History(bone_app::SessionSeq),
-    Job(bone_app::JobRef),
-    Answer(bone_app::QuestionId),
-    LeaveAnswer,
-    ConvertAnswer,
-    Restore(bone_app::InputId),
-    Retry(bone_app::InputId),
-    RetrySubmission,
-    Session(usize),
-    Conversation,
-    Composer,
-    SlashCommand(usize),
-    Submit,
-    Stop,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HitRegion {
+pub struct SessionRow {
+    pub index: usize,
     pub area: Rect,
-    pub target: HitTarget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,16 +315,13 @@ pub struct LayoutPlan {
     pub session_rail: Option<Rect>,
     pub session_start: usize,
     pub session_max_start: usize,
+    pub session_rows: Vec<SessionRow>,
     pub conversation: Option<Rect>,
     pub extension_blank: Option<Rect>,
     pub session_header: Option<Rect>,
     pub transcript: Option<Rect>,
     pub composer: Option<Rect>,
     pub slash_palette: Option<Rect>,
-    pub slash_start: usize,
-    pub transcript_metrics: Option<Arc<TranscriptMetrics>>,
-    pub hit_regions: Vec<HitRegion>,
-    pub reader_max_scroll: usize,
 }
 
 impl LayoutPlan {
@@ -263,11 +333,32 @@ impl LayoutPlan {
         selected_session: Option<usize>,
         draft_lines: u16,
     ) -> Self {
+        Self::calculate_with_widths(
+            screen,
+            single_pane,
+            slash_items,
+            session_rows,
+            selected_session,
+            draft_lines,
+            PaneWidths::default(),
+        )
+    }
+
+    pub fn calculate_with_widths(
+        screen: Rect,
+        single_pane: SinglePane,
+        slash_items: usize,
+        session_rows: &[u16],
+        selected_session: Option<usize>,
+        draft_lines: u16,
+        widths: PaneWidths,
+    ) -> Self {
+        let widths = widths.fitted(screen);
         let mode = mode_for(screen);
         let (session_rail, conversation, extension_blank) = match mode {
             LayoutMode::Wide => {
-                let rail = SESSION_RAIL_WIDTH.min(screen.width);
-                let extension = EXTENSION_WIDTH.min(screen.width.saturating_sub(rail));
+                let rail = widths.left;
+                let extension = widths.right;
                 let center = screen.width.saturating_sub(rail).saturating_sub(extension);
                 (
                     Some(Rect::new(screen.x, screen.y, rail, screen.height)),
@@ -281,7 +372,7 @@ impl LayoutPlan {
                 )
             }
             LayoutMode::TwoColumn => {
-                let rail = SESSION_RAIL_WIDTH.min(screen.width);
+                let rail = widths.left;
                 (
                     Some(Rect::new(screen.x, screen.y, rail, screen.height)),
                     Some(Rect::new(
@@ -301,18 +392,25 @@ impl LayoutPlan {
         let (session_header, transcript, composer, slash_palette) =
             conversation.map_or((None, None, None, None), |area| {
                 let inset = CONTENT_INSET;
-                let width = Self::content_width(screen);
+                let width = area.width.saturating_sub(CONTENT_INSET * 2);
                 let x = area.x + inset;
                 let header = Rect::new(x + 2, area.y + 1, width.saturating_sub(2), 1);
                 let compact = area.height < 18;
-                let top = if compact { 2 } else { 3 };
+                let top = if comfortable(area) {
+                    5
+                } else if compact {
+                    2
+                } else {
+                    3
+                };
                 let bottom = if compact { 0 } else { 2 };
                 let status_gap = if compact { 1 } else { 2 };
                 let max_lines = area
                     .height
                     .saturating_sub(top + bottom + status_gap + 7)
                     .clamp(1, 5);
-                let composer_h = draft_lines.clamp(1, max_lines) + 4;
+                let min_lines = if comfortable(area) { 2 } else { 1 };
+                let composer_h = draft_lines.clamp(min_lines.min(max_lines), max_lines) + 4;
                 let composer = Rect::new(
                     x,
                     area.bottom().saturating_sub(composer_h + bottom),
@@ -335,15 +433,11 @@ impl LayoutPlan {
                 ));
                 (Some(header), Some(transcript), Some(composer), palette)
             });
-        let mut hit_regions = Vec::new();
+        let mut visible_session_rows = Vec::new();
         let mut session_start = 0;
         let mut session_max_start = 0;
         if let Some(area) = session_rail {
-            hit_regions.push(HitRegion {
-                area,
-                target: HitTarget::SessionRail,
-            });
-            let first_y = area.y.saturating_add(4);
+            let first_y = session_list_top(area);
             let list_bottom = area.bottom().saturating_sub(2);
             let available = list_bottom.saturating_sub(first_y);
             session_max_start = session_rows.len().saturating_sub(1);
@@ -368,32 +462,16 @@ impl LayoutPlan {
                 if y + height > list_bottom {
                     break;
                 }
-                hit_regions.push(HitRegion {
-                    area: Rect::new(area.x + 1, y, area.width.saturating_sub(2), height),
-                    target: HitTarget::Session(index),
+                visible_session_rows.push(SessionRow {
+                    index,
+                    area: Rect::new(
+                        area.x + 1,
+                        y,
+                        area.width.saturating_sub(3),
+                        height.saturating_sub(1),
+                    ),
                 });
                 y += height;
-            }
-        }
-
-        if let Some(area) = transcript {
-            hit_regions.push(HitRegion {
-                area,
-                target: HitTarget::Conversation,
-            });
-        }
-        if let Some(area) = composer {
-            hit_regions.push(HitRegion {
-                area,
-                target: HitTarget::Composer,
-            });
-        }
-        if let Some(area) = slash_palette {
-            for index in 0..slash_items.min(area.height as usize) {
-                hit_regions.push(HitRegion {
-                    area: Rect::new(area.x, area.y + index as u16, area.width, 1),
-                    target: HitTarget::SlashCommand(index),
-                });
             }
         }
         Self {
@@ -402,16 +480,13 @@ impl LayoutPlan {
             session_rail,
             session_start,
             session_max_start,
+            session_rows: visible_session_rows,
             conversation,
             extension_blank,
             session_header,
             transcript,
             composer,
             slash_palette,
-            slash_start: 0,
-            transcript_metrics: None,
-            hit_regions,
-            reader_max_scroll: 0,
         }
     }
 
@@ -421,37 +496,28 @@ impl LayoutPlan {
             return;
         };
         self.session_start = start.min(self.session_max_start);
-        self.hit_regions
-            .retain(|region| !matches!(region.target, HitTarget::Session(_)));
-        let mut y = area.y.saturating_add(4);
+        self.session_rows.clear();
+        let mut y = session_list_top(area);
         let bottom = area.bottom().saturating_sub(2);
         for (index, &height) in rows.iter().enumerate().skip(self.session_start) {
             if y.saturating_add(height) > bottom {
                 break;
             }
-            self.hit_regions.push(HitRegion {
-                area: Rect::new(area.x + 1, y, area.width.saturating_sub(2), height),
-                target: HitTarget::Session(index),
+            self.session_rows.push(SessionRow {
+                index,
+                area: Rect::new(
+                    area.x + 1,
+                    y,
+                    area.width.saturating_sub(3),
+                    height.saturating_sub(1),
+                ),
             });
             y += height;
         }
     }
 
     pub fn content_width(screen: Rect) -> u16 {
-        let center = match mode_for(screen) {
-            LayoutMode::Wide => screen.width - SESSION_RAIL_WIDTH - EXTENSION_WIDTH,
-            LayoutMode::TwoColumn => screen.width - SESSION_RAIL_WIDTH,
-            _ => screen.width,
-        };
-        center.saturating_sub(CONTENT_INSET * 2)
-    }
-
-    pub fn hit(&self, x: u16, y: u16) -> Option<HitTarget> {
-        self.hit_regions
-            .iter()
-            .rev()
-            .find(|r| contains(r.area, x, y))
-            .map(|r| r.target)
+        PaneWidths::default().content_width(screen)
     }
 }
 
@@ -465,10 +531,6 @@ fn mode_for(area: Rect) -> LayoutMode {
     } else {
         LayoutMode::Single
     }
-}
-
-fn contains(area: Rect, x: u16, y: u16) -> bool {
-    x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
 }
 
 #[cfg(test)]
@@ -554,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn blank_extension_has_no_hit_targets() {
+    fn blank_extension_has_no_session_geometry() {
         let plan = LayoutPlan::calculate(
             Rect::new(0, 0, 180, 40),
             SinglePane::Conversation,
@@ -564,7 +626,7 @@ mod tests {
             1,
         );
         let blank = plan.extension_blank.unwrap();
-        assert_eq!(plan.hit(blank.x + 1, blank.y + 1), None);
+        assert!(plan.session_rows.iter().all(|row| row.area.x < blank.x));
     }
 }
 
@@ -572,7 +634,7 @@ mod tests {
 mod session_scroll_tests {
     use super::*;
     #[test]
-    fn manual_scroll_updates_pointer_rows_and_clamps_to_last_full_page() {
+    fn manual_scroll_updates_visible_rows_and_clamps_to_last_full_page() {
         let rows = vec![2; 20];
         let mut plan = LayoutPlan::calculate(
             Rect::new(0, 0, 80, 20),
@@ -584,9 +646,16 @@ mod session_scroll_tests {
         );
         plan.scroll_sessions(&rows, 3);
         assert_eq!(plan.session_start, 3);
-        assert_eq!(plan.hit(2, 4), Some(HitTarget::Session(3)));
+        assert_eq!(
+            plan.session_rows.first(),
+            Some(&SessionRow {
+                index: 3,
+                area: Rect::new(1, 4, 77, 1),
+            })
+        );
         plan.scroll_sessions(&rows, usize::MAX);
         assert_eq!(plan.session_start, 13);
-        assert_eq!(plan.hit(2, 16), Some(HitTarget::Session(19)));
+        assert_eq!(plan.session_rows.last().map(|row| row.index), Some(19));
+        assert_eq!(plan.session_rows.last().map(|row| row.area.y), Some(16));
     }
 }

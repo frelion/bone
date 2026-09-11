@@ -25,7 +25,8 @@ fn real_binary_restores_every_terminal_mode_after_visible_quit_flow() {
     );
 
     process.wait_for_bytes(b"\x1b[?1049h");
-    process.write(&[0x11]);
+    process.enable_keyboard_protocol();
+    process.write(&[0x04]);
     let status = process.wait_for_exit();
     assert!(status.success(), "bone exited with {status}");
     process.wait_for_bytes(b"\x1b[?1049l");
@@ -34,7 +35,7 @@ fn real_binary_restores_every_terminal_mode_after_visible_quit_flow() {
 }
 
 #[test]
-fn cursor_blinks_when_idle_but_stays_visible_while_typing() {
+fn real_binary_never_changes_the_users_cursor_appearance() {
     let temporary = tempfile::tempdir().expect("temporary workspace");
     let workspace = temporary.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -43,26 +44,50 @@ fn cursor_blinks_when_idle_but_stays_visible_while_typing() {
         &workspace,
         Duration::from_secs(15),
     );
-    process.wait_for_bytes(b"\x1b[1 q");
-    process.output.lock().unwrap().clear();
-    process.write(b"a");
-    process.wait_for_bytes(b"\x1b[2 q");
-    for _ in 0..4 {
-        thread::sleep(Duration::from_millis(250));
-        process.write(b"b");
-        assert!(
-            !process
-                .output
-                .lock()
-                .unwrap()
-                .windows(5)
-                .any(|w| w == b"\x1b[1 q")
-        );
-    }
-    process.wait_for_bytes(b"\x1b[1 q");
-    process.write(&[0x11]);
+    process.wait_for_bytes(b"\x1b[?1049h");
+    process.enable_keyboard_protocol();
+    process.write(b"draft");
+    process.write(&[0x04]);
     assert!(process.wait_for_exit().success());
-    process.wait_for_bytes(b"\x1b]112\x07");
+    process.wait_for_bytes(b"\x1b[?1049l");
+    let output = process.finish_capture();
+    assert_no_decorative_terminal_mutations(&output);
+}
+
+#[test]
+fn real_binary_keeps_the_caret_visible_with_slash_suggestions() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut process = PtyBone::spawn(
+        &temporary.path().join("data"),
+        &workspace,
+        Duration::from_secs(15),
+    );
+
+    process.wait_for_bytes(b"\x1b[?1049h");
+    process.enable_keyboard_protocol();
+    process.wait_for_bytes(b"\x1b[?25h");
+    process.write(b"/");
+    process.wait_for_bytes(b" /new ");
+
+    let live = process.output.lock().expect("capture lock").clone();
+    let last_show = live
+        .windows(b"\x1b[?25h".len())
+        .rposition(|window| window == b"\x1b[?25h")
+        .expect("focused composer shows the native cursor");
+    let last_hide = live
+        .windows(b"\x1b[?25l".len())
+        .rposition(|window| window == b"\x1b[?25l");
+    assert!(
+        last_hide.is_none_or(|hide| last_show > hide),
+        "slash suggestions must not leave the composer cursor hidden"
+    );
+
+    process.write(&[0x04]);
+    assert!(process.wait_for_exit().success());
+    let output = process.finish_capture();
+    assert_terminal_protocol_restored(&output);
 }
 
 #[test]
@@ -71,6 +96,7 @@ fn real_binary_restores_every_terminal_mode_after_unix_termination_signals() {
         ("SIGINT", libc::SIGINT),
         ("SIGHUP", libc::SIGHUP),
         ("SIGTERM", libc::SIGTERM),
+        ("SIGQUIT", libc::SIGQUIT),
     ] {
         let temporary = tempfile::tempdir().expect("temporary workspace");
         let workspace = temporary.path().join("workspace");
@@ -82,6 +108,7 @@ fn real_binary_restores_every_terminal_mode_after_unix_termination_signals() {
         );
 
         process.wait_for_bytes(b"\x1b[?1049h");
+        process.enable_keyboard_protocol();
         process.signal(signal, name);
         let status = process.wait_for_exit();
         assert!(status.success(), "{name} shutdown exited with {status}");
@@ -91,16 +118,86 @@ fn real_binary_restores_every_terminal_mode_after_unix_termination_signals() {
     }
 }
 
-fn assert_terminal_protocol_restored(output: &[u8]) {
+#[test]
+fn real_binary_releases_the_terminal_while_suspended_and_reacquires_it_on_continue() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace directory");
+    let mut process = PtyBone::spawn(
+        &temporary.path().join("data"),
+        &workspace,
+        Duration::from_secs(15),
+    );
+
+    process.wait_for_bytes(b"\x1b[?1049h");
+    process.enable_keyboard_protocol_round(1);
+    process.signal(libc::SIGTSTP, "SIGTSTP");
+    process.wait_for_sequence_count(b"\x1b[?1049l", 1);
+    process.wait_until_stopped();
+
+    process.signal(libc::SIGCONT, "SIGCONT");
+    process.wait_for_sequence_count(b"\x1b[?1049h", 2);
+    process.enable_keyboard_protocol_round(2);
+    process.write(&[0x04]);
+
+    let status = process.wait_for_exit();
+    assert!(status.success(), "continued BONE exited with {status}");
+    process.wait_for_sequence_count(b"\x1b[?1049l", 2);
+    let output = process.finish_capture();
+    assert_terminal_protocol_restored(&output);
     for sequence in [
         b"\x1b[?1049h".as_slice(),
+        b"\x1b[>1u".as_slice(),
+        b"\x1b[<1u".as_slice(),
+        b"\x1b[?1049l".as_slice(),
+    ] {
+        assert_eq!(
+            sequence_count(&output, sequence),
+            2,
+            "suspend/resume must balance terminal sequence {sequence:?}"
+        );
+    }
+}
+
+#[test]
+fn real_binary_reports_a_terminal_that_cannot_distinguish_shift_enter() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace directory");
+    let mut process = PtyBone::spawn(
+        &temporary.path().join("data"),
+        &workspace,
+        Duration::from_secs(15),
+    );
+
+    process.wait_for_bytes(b"\x1b[?1049h");
+    process.disable_keyboard_protocol();
+    process.wait_for_bytes(b"unavailable");
+    process.write(&[0x04]);
+    assert!(process.wait_for_exit().success());
+    let output = process.finish_capture();
+    assert!(
+        !output.windows(5).any(|window| window == b"\x1b[>1u"),
+        "compatibility mode must not push an unsupported keyboard protocol"
+    );
+    assert!(
+        !output.windows(5).any(|window| window == b"\x1b[<1u"),
+        "compatibility mode must not pop a protocol it did not push"
+    );
+    assert_no_decorative_terminal_mutations(&output);
+}
+
+fn assert_terminal_protocol_restored(output: &[u8]) {
+    assert_no_decorative_terminal_mutations(output);
+    for sequence in [
+        b"\x1b[?1049h".as_slice(),
+        b"\x1b[>1u".as_slice(),
+        b"\x1b[<1u".as_slice(),
         b"\x1b[?2004h".as_slice(),
         b"\x1b[?2004l".as_slice(),
+        b"\x1b[?1000l".as_slice(),
         b"\x1b[?1049l".as_slice(),
         b"\x1b[?25h".as_slice(),
-        b"\x1b[2 q".as_slice(),
-        b"\x1b]12;#ff9d24\x07".as_slice(),
-        b"\x1b]112\x07".as_slice(),
     ] {
         assert!(
             output
@@ -109,6 +206,78 @@ fn assert_terminal_protocol_restored(output: &[u8]) {
             "missing terminal protocol sequence {sequence:?}"
         );
     }
+
+    let push = find_sequence(output, b"\x1b[>1u");
+    let pop = find_sequence(output, b"\x1b[<1u");
+    let leave_screen = find_sequence(output, b"\x1b[?1049l");
+    assert!(
+        push < pop,
+        "keyboard enhancement must be popped after it is pushed"
+    );
+    assert!(
+        pop < leave_screen,
+        "the alternate-screen keyboard stack must be popped before leaving it"
+    );
+}
+
+fn assert_no_decorative_terminal_mutations(output: &[u8]) {
+    for sequence in [
+        b"\x1b]".as_slice(),
+        b"\x9d".as_slice(),
+        b"\x1b[0 q".as_slice(),
+        b"\x1b[1 q".as_slice(),
+        b"\x1b[2 q".as_slice(),
+        b"\x1b[3 q".as_slice(),
+        b"\x1b[4 q".as_slice(),
+        b"\x1b[5 q".as_slice(),
+        b"\x1b[6 q".as_slice(),
+    ] {
+        assert!(
+            !output
+                .windows(sequence.len())
+                .any(|window| window == sequence),
+            "BONE must not emit host-persistent or decorative terminal mutations: {sequence:?}"
+        );
+    }
+    assert!(
+        !contains_window_resize(output),
+        "BONE must not resize the host terminal window"
+    );
+}
+
+fn contains_window_resize(output: &[u8]) -> bool {
+    for start in 0..output.len().saturating_sub(3) {
+        if !output[start..].starts_with(b"\x1b[8;") {
+            continue;
+        }
+        let mut separator = false;
+        for &byte in &output[start + 4..] {
+            match byte {
+                b'0'..=b'9' => {}
+                b';' => separator = true,
+                b't' => return separator,
+                // Any other CSI final byte, such as H for cursor position,
+                // proves this was not a window resize.
+                0x40..=0x7e => break,
+                _ => break,
+            }
+        }
+    }
+    false
+}
+
+fn find_sequence(output: &[u8], sequence: &[u8]) -> usize {
+    output
+        .windows(sequence.len())
+        .position(|window| window == sequence)
+        .expect("terminal protocol sequence")
+}
+
+fn sequence_count(output: &[u8], sequence: &[u8]) -> usize {
+    output
+        .windows(sequence.len())
+        .filter(|window| *window == sequence)
+        .count()
 }
 
 struct PtyBone {
@@ -191,6 +360,23 @@ impl PtyBone {
             .expect("write PTY input");
     }
 
+    fn enable_keyboard_protocol(&mut self) {
+        self.enable_keyboard_protocol_round(1);
+    }
+
+    fn enable_keyboard_protocol_round(&mut self, round: usize) {
+        self.wait_for_sequence_count(b"\x1b[?u", round);
+        self.write(b"\x1b[?1u\x1b[?1;2c");
+        self.wait_for_sequence_count(b"\x1b[>1u", round);
+    }
+
+    fn disable_keyboard_protocol(&mut self) {
+        self.wait_for_bytes(b"\x1b[?u");
+        // A primary-device-attributes response arriving without a keyboard
+        // flags response is the protocol-defined negative capability answer.
+        self.write(b"\x1b[?1;2c");
+    }
+
     fn signal(&self, signal: libc::c_int, name: &str) {
         let result = unsafe { libc::kill(self.child.0.id() as libc::pid_t, signal) };
         assert_eq!(
@@ -201,13 +387,43 @@ impl PtyBone {
         );
     }
 
+    fn wait_until_stopped(&self) {
+        loop {
+            let mut status = 0;
+            let result = unsafe {
+                libc::waitpid(
+                    self.child.0.id() as libc::pid_t,
+                    &mut status,
+                    libc::WNOHANG | libc::WUNTRACED,
+                )
+            };
+            assert_ne!(
+                result,
+                -1,
+                "wait for BONE to suspend: {}",
+                std::io::Error::last_os_error()
+            );
+            if result > 0 && libc::WIFSTOPPED(status) {
+                return;
+            }
+            self.assert_before_deadline("BONE did not suspend after restoring the terminal");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn wait_for_bytes(&self, needle: &[u8]) {
+        self.wait_for_sequence_count(needle, 1);
+    }
+
+    fn wait_for_sequence_count(&self, needle: &[u8], expected: usize) {
         while !self
             .output
             .lock()
             .expect("capture lock")
             .windows(needle.len())
-            .any(|window| window == needle)
+            .filter(|window| *window == needle)
+            .count()
+            .ge(&expected)
         {
             self.assert_before_deadline("expected terminal protocol was not emitted");
             thread::sleep(Duration::from_millis(10));
@@ -272,7 +488,7 @@ fn set_nonblocking(file: &File) {
 fn open_pty(width: u16, height: u16) -> (File, File) {
     let mut master = -1;
     let mut slave = -1;
-    let mut size = libc::winsize {
+    let size = libc::winsize {
         ws_row: height,
         ws_col: width,
         ws_xpixel: 0,
@@ -284,7 +500,7 @@ fn open_pty(width: u16, height: u16) -> (File, File) {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            &size,
         )
     };
     assert_eq!(
@@ -364,4 +580,45 @@ fn visible_text_ignores_cursor_and_string_sequences_between_wide_characters() {
     )
     .as_bytes();
     assert_eq!(terminal_visible_text(bytes), "确认退出");
+}
+
+#[test]
+fn clear_modified_enter_and_ctrl_d_preserve_the_exact_unsent_draft() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    let data = temporary.path().join("data");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut process = PtyBone::spawn(&data, &workspace, Duration::from_secs(15));
+    process.wait_for_bytes(b"\x1b[?1049h");
+    process.enable_keyboard_protocol();
+    process.write(b"discard this\x03first\x1b[13;2usecond\x04");
+    assert!(process.wait_for_exit().success());
+    process.wait_for_bytes(b"\x1b[?1049l");
+    let output = process.finish_capture();
+    assert_terminal_protocol_restored(&output);
+    assert_eq!(
+        output
+            .windows(5)
+            .filter(|bytes| *bytes == b"\x1b[<1u")
+            .count(),
+        1
+    );
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let app = bone_app::App::open(bone_app::AppOptions::new(&data))
+            .await
+            .unwrap();
+        let workspace = app.open_workspace(&workspace).await.unwrap();
+        let sessions = app.list_sessions(workspace.id).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        let snapshot = app
+            .session(sessions[0].id)
+            .await
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.draft, "first\nsecond");
+        assert!(snapshot.inputs.is_empty(), "Shift+Enter must not submit");
+        app.shutdown().await.unwrap();
+    });
 }

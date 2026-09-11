@@ -1,16 +1,16 @@
 use crate::{
-    layout::{HitTarget, LayoutPlan},
+    layout::LayoutPlan,
     state::{SessionStatus, UiState},
+    ui::theme,
     view::{ACCENT, DANGER, INK, MUTED, RAIL, SELECTED, single_line_external},
 };
 use bone_app::{InputState, RuntimeState};
-use ratatui::style::Stylize;
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{Block, Padding, Paragraph},
 };
 
 // A single status projection drives both row height and rendering.
@@ -65,17 +65,22 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, state: &UiState) 
         .map(|(_, name)| single_line_external(name))
         .unwrap_or_else(|| "BONE".into());
     frame.render_widget(
-        Paragraph::new(project).style(Style::default().fg(INK).bold()),
+        Paragraph::new(project).style(theme::label(INK)),
         Rect::new(area.x + 3, area.y + 1, area.width.saturating_sub(6), 1),
     );
+    let spacious = crate::layout::comfortable(area);
     frame.render_widget(
-        Paragraph::new("/new  New session").style(Style::default().fg(MUTED)),
-        Rect::new(area.x + 3, area.y + 2, area.width.saturating_sub(6), 1),
+        Paragraph::new("+ New session")
+            .style(Style::default().fg(INK))
+            .block(
+                Block::default()
+                    .style(Style::default().bg(super::INPUT))
+                    .padding(Padding::new(2, 1, u16::from(spacious), u16::from(spacious))),
+            ),
+        crate::layout::new_session_area(area),
     );
-    for region in &plan.hit_regions {
-        let HitTarget::Session(index) = region.target else {
-            continue;
-        };
+    for row in &plan.session_rows {
+        let index = row.index;
         let info = &state.sessions[index];
         let selected = state.selected == Some(info.id);
         let highlighted = if state.focus == crate::state::Focus::Sessions {
@@ -92,17 +97,14 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, state: &UiState) 
             title = format!("· {title}");
         }
         let mut lines = vec![Line::from(vec![
-            Span::styled(
-                if selected { "▏ " } else { "  " },
-                Style::default().fg(ACCENT),
-            ),
+            Span::raw("  "),
             Span::styled(
                 title,
-                Style::default().fg(INK).add_modifier(if selected {
-                    Modifier::BOLD
+                if selected {
+                    theme::label(INK)
                 } else {
-                    Modifier::empty()
-                }),
+                    theme::body(INK)
+                },
             ),
         ])];
         if let Some((label, tone)) = status(state, index) {
@@ -114,10 +116,26 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, state: &UiState) 
         if highlighted {
             frame.render_widget(
                 Block::default().style(Style::default().bg(SELECTED)),
-                Rect::new(region.area.x, region.area.y, region.area.width, 1),
+                row.area,
             );
         }
-        frame.render_widget(Paragraph::new(lines), region.area);
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::default().padding(Padding::new(
+                0,
+                1,
+                u16::from(spacious),
+                u16::from(spacious),
+            ))),
+            row.area,
+        );
+        if selected {
+            super::marks::paint(
+                frame,
+                row.area,
+                ACCENT,
+                if highlighted { SELECTED } else { RAIL },
+            );
+        }
     }
     if state.focus == crate::state::Focus::Sessions {
         frame.render_widget(

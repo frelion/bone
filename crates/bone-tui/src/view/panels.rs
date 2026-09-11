@@ -2,6 +2,7 @@ use super::{ACCENT, INK, INPUT, MUTED, PANEL, single_line_external};
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan},
     state::{COMMANDS, Panel, UiState},
+    ui::{caret, interaction::HitMap, theme},
 };
 use ratatui::{
     Frame,
@@ -13,11 +14,17 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiState) {
+pub(super) fn render(
+    frame: &mut Frame<'_>,
+    plan: &LayoutPlan,
+    hits: &mut HitMap,
+    reader_max_scroll: &mut usize,
+    state: &UiState,
+) {
     let Some(panel) = &state.panel else {
         return;
     };
-    plan.hit_regions.clear();
+    hits.clear();
     if let Panel::Reader(content) = panel {
         let area = plan
             .extension_blank
@@ -31,37 +38,40 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
             state.panel_scroll,
             true,
         );
-        plan.reader_max_scroll = metrics.max_scroll;
-        plan.hit_regions.push(HitRegion {
+        *reader_max_scroll = metrics.max_scroll;
+        hits.push(HitRegion {
             area: metrics.body,
             target: HitTarget::Reader,
         });
-        plan.hit_regions.push(HitRegion {
+        hits.push(HitRegion {
             area: metrics.back,
             target: HitTarget::Back,
         });
         return;
     }
     if matches!(panel, Panel::ModelAdd | Panel::ModelSetup) {
-        super::connection::render(frame, plan, state);
+        super::connection::render(frame, plan, hits, state);
         return;
     }
     let surface = plan.composer.unwrap_or(plan.screen);
-    let height = match panel {
+    let spacious = crate::layout::comfortable(plan.screen);
+    let stride: u16 = if spacious { 2 } else { 1 };
+    let chrome: u16 = if spacious { 4 } else { 0 };
+    let height = (match panel {
         Panel::Help => 16,
         Panel::Login => 10,
         Panel::Rename => 7,
-        Panel::Commands => COMMANDS.len() as u16 + 3,
-        Panel::Objects { choices, .. } => choices.len().clamp(1, 12) as u16 + 3,
-        Panel::Models => (state.model_row_count()
+        Panel::Commands => COMMANDS.len() as u16 * stride + 3,
+        Panel::Objects { choices, .. } => choices.len().clamp(1, 12) as u16 * stride + 3,
+        Panel::Models => (state.model_row_count() * usize::from(stride)
             + state.model_configuration_summary().lines().count()
             + 4
             + if state.status.is_some() { 2 } else { 0 })
-        .clamp(5, 14) as u16,
+        .clamp(5, if spacious { 22 } else { 14 }) as u16,
         _ => 0,
-    }
-    .min(plan.screen.height.saturating_sub(2))
-    .max(3);
+    } + chrome)
+        .min(plan.screen.height.saturating_sub(2))
+        .max(3);
     let area = Rect::new(
         surface.x,
         surface.y.saturating_sub(height + 1).max(plan.screen.y + 1),
@@ -69,12 +79,12 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
         height,
     );
     frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(Style::default().bg(INPUT)), area);
+    frame.render_widget(Block::default().style(theme::surface(INPUT)), area);
     let mut inner = Rect::new(
         area.x + 2,
-        area.y + 1,
+        area.y + 1 + chrome / 2,
         area.width.saturating_sub(4),
-        area.height.saturating_sub(2),
+        area.height.saturating_sub(2 + chrome),
     );
     let title = match panel {
         Panel::Commands => "Commands",
@@ -85,15 +95,27 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
         _ => "Keyboard help",
     };
     frame.render_widget(
-        Paragraph::new(title).style(Style::default().fg(INK)),
-        Rect::new(inner.x, area.y, inner.width, 1),
+        Paragraph::new(title).style(theme::label(INK)),
+        Rect::new(inner.x, area.y + u16::from(spacious), inner.width, 1),
     );
-    let back = Rect::new(inner.x, area.bottom() - 1, inner.width, 1);
+    if spacious {
+        frame.render_widget(
+            Paragraph::new("─".repeat(usize::from(inner.width)))
+                .style(Style::default().fg(super::DIVIDER)),
+            Rect::new(inner.x, area.y + 2, inner.width, 1),
+        );
+    }
+    let back = Rect::new(
+        inner.x,
+        area.bottom() - 1 - u16::from(spacious),
+        inner.width,
+        1,
+    );
     frame.render_widget(
         Paragraph::new("esc back").style(Style::default().fg(MUTED)),
         back,
     );
-    plan.hit_regions.push(HitRegion {
+    hits.push(HitRegion {
         area: back,
         target: HitTarget::Back,
     });
@@ -117,20 +139,25 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
             } else {
                 let start = state
                     .panel_selection
-                    .saturating_sub(usize::from(inner.height).saturating_sub(1));
+                    .saturating_sub(usize::from(inner.height / stride).saturating_sub(1));
                 for (index, (_, label)) in choices
                     .iter()
                     .enumerate()
                     .skip(start)
-                    .take(usize::from(inner.height))
+                    .take(usize::from(inner.height / stride))
                 {
-                    let row = Rect::new(inner.x, inner.y + (index - start) as u16, inner.width, 1);
+                    let row = Rect::new(
+                        inner.x,
+                        inner.y + (index - start) as u16 * stride,
+                        inner.width,
+                        stride,
+                    );
                     frame.render_widget(
                         Paragraph::new(single_line_external(label))
                             .style(menu_style(index == state.panel_selection)),
                         row,
                     );
-                    plan.hit_regions.push(HitRegion {
+                    hits.push(HitRegion {
                         area: row,
                         target: HitTarget::Object(index),
                     });
@@ -140,14 +167,19 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
         Panel::Commands => {
             let start = state
                 .panel_selection
-                .saturating_sub(usize::from(inner.height).saturating_sub(1));
+                .saturating_sub(usize::from(inner.height / stride).saturating_sub(1));
             for (index, command) in COMMANDS
                 .iter()
                 .enumerate()
                 .skip(start)
-                .take(usize::from(inner.height))
+                .take(usize::from(inner.height / stride))
             {
-                let row = Rect::new(inner.x, inner.y + (index - start) as u16, inner.width, 1);
+                let row = Rect::new(
+                    inner.x,
+                    inner.y + (index - start) as u16 * stride,
+                    inner.width,
+                    stride,
+                );
                 let label = if inner.width >= 52 {
                     format!("/{:<12} {}", command.name, command.summary)
                 } else {
@@ -157,9 +189,9 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
                     Paragraph::new(label).style(menu_style(index == state.panel_selection)),
                     row,
                 );
-                plan.hit_regions.push(HitRegion {
+                hits.push(HitRegion {
                     area: row,
-                    target: HitTarget::SlashCommand(index),
+                    target: HitTarget::SlashCommand(command.kind),
                 });
             }
         }
@@ -198,18 +230,19 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
             } else {
                 let menu = model_menu_rows(state);
                 let selected = menu.iter().position(|row| matches!(row, ModelMenuRow::Choice(index) if *index == state.panel_selection)).unwrap_or(0);
-                let start = selected.saturating_sub(usize::from(inner.height).saturating_sub(1));
+                let start =
+                    selected.saturating_sub(usize::from(inner.height / stride).saturating_sub(1));
                 for (visual_index, item) in menu
                     .iter()
                     .enumerate()
                     .skip(start)
-                    .take(usize::from(inner.height))
+                    .take(usize::from(inner.height / stride))
                 {
                     let row = Rect::new(
                         inner.x,
-                        inner.y + (visual_index - start) as u16,
+                        inner.y + (visual_index - start) as u16 * stride,
                         inner.width,
-                        1,
+                        stride,
                     );
                     let index = match item {
                         ModelMenuRow::Heading(label) => {
@@ -235,7 +268,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
                             .style(menu_style(index == state.panel_selection)),
                         row,
                     );
-                    plan.hit_regions.push(HitRegion {
+                    hits.push(HitRegion {
                         area: row,
                         target: HitTarget::Model(index),
                     });
@@ -250,7 +283,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
                 Rect::new(inner.x, inner.y, inner.width, 1),
             );
             if inner.width > 2 {
-                frame.set_cursor_position((inner.x + cursor, inner.y));
+                caret::place(frame, (inner.x + cursor, inner.y));
             }
             frame.render_widget(
                 Paragraph::new("enter save title").style(Style::default().fg(MUTED)),
@@ -293,15 +326,27 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
             );
         }
         Panel::Help => {
+            let shift_enter = if state.terminal_capabilities.shift_enter_supported() {
+                "Shift+Enter   New line in input".to_owned()
+            } else {
+                let reason = single_line_external(
+                    state
+                        .terminal_capabilities
+                        .keyboard_limitation()
+                        .unwrap_or("terminal cannot distinguish the modifier"),
+                );
+                format!("Shift+Enter   Unavailable · {}", reason)
+            };
             let lines = [
-                "Ctrl+arrows   Move focus",
-                "Enter         Submit / choose",
-                "Alt+Enter     New line",
-                "Ctrl+P        Commands",
-                "/model        Model configuration",
-                "/details      Latest task / tool",
-                "Esc           Back, then stop",
-                "Ctrl+Q        Save drafts and quit",
+                "Ctrl+arrows   Move focus".to_owned(),
+                "Enter         Submit / choose".to_owned(),
+                shift_enter,
+                "Ctrl+P        Commands".to_owned(),
+                "/model        Model configuration".to_owned(),
+                "/details      Latest task / tool".to_owned(),
+                "Esc           Back, then stop".to_owned(),
+                "Ctrl+C        Clear input (Ctrl+Z undo)".to_owned(),
+                "Ctrl+D        Save drafts and quit".to_owned(),
             ];
             frame.render_widget(
                 Paragraph::new(lines.map(Line::from).to_vec())
@@ -389,7 +434,7 @@ mod tests {
                     })
                     .unwrap();
                 let plan = plan.unwrap();
-                for region in &plan.hit_regions {
+                for region in plan.hit_regions() {
                     assert!(
                         region.area.right() <= width && region.area.bottom() <= height,
                         "{region:?} in {width}x{height}"
@@ -400,7 +445,7 @@ mod tests {
                     ));
                 }
                 let back = plan
-                    .hit_regions
+                    .hit_regions()
                     .iter()
                     .find(|region| region.target == HitTarget::Back)
                     .unwrap();
@@ -531,7 +576,7 @@ mod grouped_menu_tests {
                     .unwrap();
                 let plan = plan.unwrap();
                 let hit = plan
-                    .hit_regions
+                    .hit_regions()
                     .iter()
                     .find(|hit| hit.target == HitTarget::Model(selected))
                     .expect("selected action remains visible");
@@ -545,7 +590,7 @@ mod grouped_menu_tests {
                 for y in 0..height {
                     let line: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
                     if line.contains("Manage connections") {
-                        assert!(!plan.hit_regions.iter().any(
+                        assert!(!plan.hit_regions().iter().any(
                             |hit| hit.area.y == y && matches!(hit.target, HitTarget::Model(_))
                         ));
                     }
@@ -559,7 +604,7 @@ mod grouped_menu_tests {
                 .draw(|frame| {
                     let plan = crate::view::render(frame, &state);
                     assert!(
-                        plan.hit_regions
+                        plan.hit_regions()
                             .iter()
                             .any(|hit| hit.target == HitTarget::Model(0))
                     );

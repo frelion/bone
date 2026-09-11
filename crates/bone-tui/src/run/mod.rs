@@ -1,4 +1,3 @@
-mod input;
 mod launch;
 pub(crate) mod models;
 mod runtime;
@@ -6,30 +5,36 @@ mod runtime;
 use std::{collections::VecDeque, env, future::Future, io, time::Duration};
 
 use bone_app::{App, AppOptions, AttentionItem, WorkspaceOverview};
-use crossterm::event::EventStream;
+use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::{
+    input::terminal_event,
     state::{Action, SessionStatus, UiEvent, UiState, update},
-    terminal::TerminalGuard,
+    terminal::TerminalSession,
 };
 
 use self::{
-    input::terminal_event,
     launch::LaunchOptions,
     runtime::{Runtime, SessionReady},
 };
 
-const FRAME_INTERVAL: Duration = Duration::from_millis(34);
 const DRAFT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum FlushWait<T> {
     Completed(T),
     TimedOut,
-    Forced,
+    Process(ProcessSignal),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessSignal {
+    Terminate,
+    #[cfg(unix)]
+    Suspend,
 }
 
 #[derive(Debug, Error)]
@@ -85,13 +90,13 @@ pub async fn run() -> Result<(), RunError> {
         },
     ));
 
-    // Install Unix handlers before changing terminal modes. Registering inside
+    // Install process signal handlers before changing terminal modes. Registering inside
     // the spawned forwarding tasks leaves a window where the OS default action
-    // can terminate the process without allowing `TerminalGuard` to restore.
-    let mut terminations = termination_events()?;
-    let mut terminal = TerminalGuard::enter()?;
-    let mut events = EventStream::new();
-    let mut ticker = tokio::time::interval(FRAME_INTERVAL);
+    // can terminate the process without allowing `TerminalSession` to restore.
+    let mut process_signals = process_signals()?;
+    let mut terminal = TerminalSession::enter()?;
+    state.terminal_capabilities = terminal.capabilities().clone();
+    let mut events = Some(EventStream::new());
     let mut overview_ticker = tokio::time::interval(Duration::from_secs(5));
     overview_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Startup already loaded the authoritative overview.
@@ -99,111 +104,125 @@ pub async fn run() -> Result<(), RunError> {
     let mut draft_ticker = tokio::time::interval(Duration::from_millis(500));
     draft_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     draft_ticker.tick().await;
-    let mut layout = None;
+    let mut frame_snapshot = None;
     let mut shutdown = false;
     let mut termination_received = false;
     let mut shutdown_error = None;
 
-    while !shutdown {
+    'run: while !shutdown {
+        if !termination_received {
+            render_dirty(&mut terminal, &mut state, &mut frame_snapshot)?;
+        }
         while let Some(effect) = effects.pop_front() {
             shutdown |= runtime.apply(effect).await?;
         }
         if shutdown {
-            let result = wait_for_draft_flush(
-                runtime.flush_drafts(&mut state),
-                &mut terminations,
-                termination_received,
-                DRAFT_FLUSH_TIMEOUT,
-            )
-            .await;
-            match result {
-                FlushWait::Completed(Ok(())) => break,
-                FlushWait::Completed(Err(_)) if !termination_received => {
-                    shutdown = false;
-                    state.quitting = false;
-                    state.status =
-                        Some("Your draft could not be saved; the session is still open".into());
-                    state.dirty = true;
-                }
-                FlushWait::Completed(Err(error)) => {
-                    shutdown_error = Some(format!("终止时草稿未能保存：{error}"));
-                    break;
-                }
-                FlushWait::TimedOut if !termination_received => {
-                    shutdown = false;
-                    state.quitting = false;
-                    state.status = Some("Draft saving timed out; the session is still open".into());
-                    state.dirty = true;
-                }
-                FlushWait::TimedOut => {
-                    shutdown_error = Some("终止时草稿保存超时".into());
-                    break;
-                }
-                FlushWait::Forced => {
-                    shutdown_error = Some("收到第二次终止信号；已停止等待草稿保存".into());
-                    break;
+            loop {
+                let result = wait_for_draft_flush(
+                    runtime.flush_drafts(&mut state),
+                    &mut process_signals,
+                    DRAFT_FLUSH_TIMEOUT,
+                )
+                .await;
+                match result {
+                    FlushWait::Completed(Ok(())) => break 'run,
+                    FlushWait::Completed(Err(_)) if !termination_received => {
+                        shutdown = false;
+                        state.quitting = false;
+                        state.status =
+                            Some("Your draft could not be saved; the session is still open".into());
+                        state.dirty = true;
+                        break;
+                    }
+                    FlushWait::Completed(Err(error)) => {
+                        shutdown_error = Some(format!("终止时草稿未能保存：{error}"));
+                        break 'run;
+                    }
+                    FlushWait::TimedOut if !termination_received => {
+                        shutdown = false;
+                        state.quitting = false;
+                        state.status =
+                            Some("Draft saving timed out; the session is still open".into());
+                        state.dirty = true;
+                        break;
+                    }
+                    FlushWait::TimedOut => {
+                        shutdown_error = Some("终止时草稿保存超时".into());
+                        break 'run;
+                    }
+                    FlushWait::Process(ProcessSignal::Terminate) if termination_received => {
+                        shutdown_error = Some("收到第二次终止信号；已停止等待草稿保存".into());
+                        break 'run;
+                    }
+                    FlushWait::Process(ProcessSignal::Terminate) => {
+                        termination_received = true;
+                        // A signal makes exit final. Restore before restarting the
+                        // bounded flush so no await holds the user's terminal.
+                        let _ = terminal.restore();
+                        continue;
+                    }
+                    #[cfg(unix)]
+                    FlushWait::Process(ProcessSignal::Suspend) => {
+                        if termination_received {
+                            suspend_process()?;
+                        } else {
+                            events.take();
+                            suspend_and_resume(&mut terminal, &mut state, &mut frame_snapshot)?;
+                            events = Some(EventStream::new());
+                        }
+                        // The interrupted flush future was dropped. Retry it after
+                        // continuation; draft persistence is idempotent.
+                        continue;
+                    }
                 }
             }
         }
 
-        let (next, frame_due) = tokio::select! {
-            event = events.next() => {
-                let event = event.transpose()?;
-                if let Some(event) = &event
-                    && matches!(event,
-                        crossterm::event::Event::Key(_)
-                        | crossterm::event::Event::Paste(_)
-                        | crossterm::event::Event::Resize(..)
-                        | crossterm::event::Event::FocusGained
-                        | crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
-                            kind: crossterm::event::MouseEventKind::Down(_)
-                                | crossterm::event::MouseEventKind::Drag(_), ..
-                        }))
-                {
-                    terminal.note_input();
-                }
-                (event.map(|event| terminal_event(event, layout.as_ref(), &state)), false)
+        let next = tokio::select! {
+            event = events
+                .as_mut()
+                .expect("terminal event stream is active")
+                .next() => {
+                let event = require_terminal_event(event)?;
+                terminal_event(event, frame_snapshot.as_ref(), &state)
             },
-            event = rx.recv() => (event, false),
-            ready = ready_rx.recv() => (
-                ready.and_then(|ready| runtime.accept_ready(ready, &state)),
-                false
-            ),
-            _ = ticker.tick() => (None, true),
-            _ = overview_ticker.tick() => (Some(UiEvent::RefreshOverviewRequested), false),
-            _ = draft_ticker.tick() => (Some(UiEvent::PersistDraftsRequested), false),
-            signal = terminations.recv() => {
-                if signal.is_none() {
-                    continue;
+            event = rx.recv() => event,
+            ready = ready_rx.recv() => {
+                ready.and_then(|ready| runtime.accept_ready(ready, &state))
+            },
+            _ = overview_ticker.tick() => Some(UiEvent::RefreshOverviewRequested),
+            _ = draft_ticker.tick() => Some(UiEvent::PersistDraftsRequested),
+            signal = process_signals.recv() => {
+                match signal {
+                    Some(ProcessSignal::Terminate) => {
+                        termination_received = true;
+                        // An OS termination request is final. Return the terminal to
+                        // the shell before any draft or application shutdown await.
+                        let _ = terminal.restore();
+                        Some(UiEvent::Action(Action::Terminate))
+                    }
+                    #[cfg(unix)]
+                    Some(ProcessSignal::Suspend) => {
+                        events.take();
+                        suspend_and_resume(
+                            &mut terminal,
+                            &mut state,
+                            &mut frame_snapshot,
+                        )?;
+                        events = Some(EventStream::new());
+                        None
+                    }
+                    None => continue,
                 }
-                termination_received = true;
-                (Some(UiEvent::Action(Action::Terminate)), false)
             },
         };
         if let Some(event) = next {
             runtime.accept_event(&event, &state);
             effects.extend(update(&mut state, event));
         }
-        if frame_due {
-            terminal.update_cursor()?;
-        }
-        if frame_due && state.dirty {
-            terminal.terminal().draw(|frame| {
-                layout = Some(crate::view::render(frame, &state));
-            })?;
-            if let Some(metrics) = layout
-                .as_ref()
-                .and_then(|plan| plan.transcript_metrics.clone())
-                && !crate::state::retain_transcript(&mut state, metrics)
-                && let Some(plan) = &mut layout
-            {
-                plan.transcript_metrics = None;
-            }
-            state.dirty = false;
-        }
     }
 
-    terminal.suspend()?;
+    terminal.restore()?;
     match tokio::time::timeout(APP_SHUTDOWN_TIMEOUT, runtime.shutdown()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(error.into()),
@@ -216,6 +235,33 @@ pub async fn run() -> Result<(), RunError> {
     if let Some(error) = shutdown_error {
         return Err(RunError::Shutdown(error));
     }
+    Ok(())
+}
+
+/// Draw every state change before accepting another input or runtime event.
+///
+/// Keeping the visible frame and its hit map together prevents a click from an
+/// old panel being interpreted against a newer state.
+fn render_dirty(
+    terminal: &mut TerminalSession,
+    state: &mut UiState,
+    frame_snapshot: &mut Option<crate::view::FrameSnapshot>,
+) -> io::Result<()> {
+    if !state.dirty {
+        return Ok(());
+    }
+    terminal.terminal().draw(|frame| {
+        *frame_snapshot = Some(crate::view::render(frame, state));
+    })?;
+    if let Some(metrics) = frame_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.transcript_metrics.clone())
+        && !crate::state::retain_transcript(state, metrics)
+        && let Some(snapshot) = frame_snapshot
+    {
+        snapshot.transcript_metrics = None;
+    }
+    state.dirty = false;
     Ok(())
 }
 
@@ -256,31 +302,49 @@ fn summarize_overview(
 
 async fn wait_for_draft_flush<T>(
     flush: impl Future<Output = T>,
-    terminations: &mut mpsc::UnboundedReceiver<()>,
-    allow_force: bool,
+    process_signals: &mut mpsc::UnboundedReceiver<ProcessSignal>,
     timeout: Duration,
 ) -> FlushWait<T> {
     tokio::pin!(flush);
     tokio::select! {
         result = &mut flush => FlushWait::Completed(result),
         _ = tokio::time::sleep(timeout) => FlushWait::TimedOut,
-        _ = terminations.recv(), if allow_force => FlushWait::Forced,
+        signal = process_signals.recv() => {
+            FlushWait::Process(signal.expect("process signal forwarders remain alive"))
+        },
     }
 }
 
-fn termination_events() -> io::Result<mpsc::UnboundedReceiver<()>> {
+fn process_signals() -> io::Result<mpsc::UnboundedReceiver<ProcessSignal>> {
     let (tx, rx) = mpsc::unbounded_channel();
     #[cfg(unix)]
-    for kind in [
-        tokio::signal::unix::SignalKind::interrupt(),
-        tokio::signal::unix::SignalKind::hangup(),
-        tokio::signal::unix::SignalKind::terminate(),
+    for (kind, event) in [
+        (
+            tokio::signal::unix::SignalKind::interrupt(),
+            ProcessSignal::Terminate,
+        ),
+        (
+            tokio::signal::unix::SignalKind::hangup(),
+            ProcessSignal::Terminate,
+        ),
+        (
+            tokio::signal::unix::SignalKind::terminate(),
+            ProcessSignal::Terminate,
+        ),
+        (
+            tokio::signal::unix::SignalKind::from_raw(signal_hook::consts::signal::SIGQUIT),
+            ProcessSignal::Terminate,
+        ),
+        (
+            tokio::signal::unix::SignalKind::from_raw(signal_hook::consts::signal::SIGTSTP),
+            ProcessSignal::Suspend,
+        ),
     ] {
         let mut signal = tokio::signal::unix::signal(kind)?;
         let signal_tx = tx.clone();
         tokio::spawn(async move {
             while signal.recv().await.is_some() {
-                if signal_tx.send(()).is_err() {
+                if signal_tx.send(event).is_err() {
                     break;
                 }
             }
@@ -288,30 +352,101 @@ fn termination_events() -> io::Result<mpsc::UnboundedReceiver<()>> {
     }
     #[cfg(unix)]
     drop(tx);
-    #[cfg(not(unix))]
-    tokio::spawn(async move {
-        std::future::pending::<()>().await;
+    #[cfg(windows)]
+    {
+        // Construct every listener synchronously, before `TerminalSession::enter`.
+        // Tokio registers the process-wide console handler during construction;
+        // spawning first would leave a startup window with the OS default action.
+        let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+        let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
+        let mut ctrl_close = tokio::signal::windows::ctrl_close()?;
+        let mut ctrl_logoff = tokio::signal::windows::ctrl_logoff()?;
+        let mut ctrl_shutdown = tokio::signal::windows::ctrl_shutdown()?;
+
+        macro_rules! forward_termination {
+            ($listener:ident) => {{
+                let signal_tx = tx.clone();
+                tokio::spawn(async move {
+                    while $listener.recv().await.is_some() {
+                        if signal_tx.send(ProcessSignal::Terminate).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }};
+        }
+
+        forward_termination!(ctrl_c);
+        forward_termination!(ctrl_break);
+        forward_termination!(ctrl_close);
+        forward_termination!(ctrl_logoff);
+        forward_termination!(ctrl_shutdown);
         drop(tx);
+    }
+    #[cfg(not(any(unix, windows)))]
+    tokio::spawn(async move {
+        while tokio::signal::ctrl_c().await.is_ok() {
+            if tx.send(ProcessSignal::Terminate).is_err() {
+                break;
+            }
+        }
     });
     Ok(rx)
+}
+
+fn require_terminal_event(event: Option<io::Result<Event>>) -> io::Result<Event> {
+    event
+        .transpose()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "terminal event stream ended"))
+}
+
+#[cfg(unix)]
+fn suspend_process() -> io::Result<()> {
+    // SIGSTOP cannot be intercepted, so the process is guaranteed to stop
+    // after the terminal has been restored. The call returns after SIGCONT.
+    signal_hook::low_level::raise(signal_hook::consts::signal::SIGSTOP)
+}
+
+#[cfg(unix)]
+fn suspend_and_resume(
+    terminal: &mut TerminalSession,
+    state: &mut UiState,
+    frame_snapshot: &mut Option<crate::view::FrameSnapshot>,
+) -> io::Result<()> {
+    terminal.restore()?;
+    suspend_process()?;
+    terminal.resume()?;
+    state.terminal_capabilities = terminal.capabilities().clone();
+    *frame_snapshot = None;
+    state.dirty = true;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn terminal_event_stream_eof_is_an_error_instead_of_a_busy_loop() {
+        let error = require_terminal_event(None).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
     #[tokio::test]
     async fn second_termination_stops_waiting_for_a_stuck_draft_flush() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(()).unwrap();
+        tx.send(ProcessSignal::Terminate).unwrap();
         let result = wait_for_draft_flush(
             std::future::pending::<()>(),
             &mut rx,
-            true,
             Duration::from_secs(60),
         )
         .await;
-        assert!(matches!(result, FlushWait::Forced));
+        assert!(matches!(
+            result,
+            FlushWait::Process(ProcessSignal::Terminate)
+        ));
     }
 
     #[tokio::test]
@@ -320,7 +455,6 @@ mod tests {
         let result = wait_for_draft_flush(
             std::future::pending::<()>(),
             &mut rx,
-            false,
             Duration::from_millis(1),
         )
         .await;

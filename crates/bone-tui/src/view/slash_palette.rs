@@ -1,13 +1,14 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
 
 use crate::{
     state::{CommandSpec, UiState},
+    ui::theme,
     view::{ACCENT, MUTED, PANEL, RAIL},
 };
 
@@ -19,7 +20,7 @@ pub(super) fn render(
     start: usize,
 ) {
     frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(Style::default().bg(RAIL)), area);
+    frame.render_widget(Block::default().style(theme::surface(RAIL)), area);
     for (index, command) in matches
         .iter()
         .enumerate()
@@ -31,9 +32,7 @@ pub(super) fn render(
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     format!(" /{} {}", command.name, command.usage),
-                    Style::default()
-                        .fg(if selected { PANEL } else { ACCENT })
-                        .add_modifier(Modifier::BOLD),
+                    theme::label(if selected { PANEL } else { ACCENT }),
                 ),
                 Span::styled(
                     format!("  {}", command.summary),

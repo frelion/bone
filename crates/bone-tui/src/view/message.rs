@@ -1,5 +1,5 @@
+use crate::ui::theme;
 use bone_app::SessionEvent;
-use ratatui::style::Stylize;
 use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
@@ -69,7 +69,7 @@ pub(super) fn row_offsets(event: &SessionEvent, width: u16) -> Vec<usize> {
     match event {
         SessionEvent::InputSubmitted { text, .. } => {
             let mut offsets = vec![0];
-            offsets.extend(wrap_offsets(text, width.saturating_sub(6).max(1)));
+            offsets.extend(wrap_offsets(text, width.saturating_sub(4).max(1)));
             offsets.push(text.len());
             offsets
         }
@@ -211,15 +211,24 @@ fn wrap_offsets(value: &str, width: usize) -> Vec<usize> {
 }
 
 fn user_rows(value: &str, width: usize) -> Vec<Line<'static>> {
-    let content_width = width.saturating_sub(6).max(1);
-    let blank = || Line::styled(" ".repeat(width), Style::default().bg(USER));
+    let content_width = width.saturating_sub(4).max(1);
+    let blank = || {
+        Line::from(vec![
+            super::marks::span(MUTED, USER),
+            Span::styled(
+                " ".repeat(width.saturating_sub(1)),
+                Style::default().bg(USER),
+            ),
+        ])
+    };
     let mut lines = vec![blank()];
     lines.extend(wrap_text(value, content_width).into_iter().map(|content| {
         let used = UnicodeWidthStr::width(content.as_str()).min(content_width);
         Line::from(vec![
-            Span::styled(" │  ", Style::default().fg(MUTED)),
+            super::marks::span(MUTED, USER),
+            Span::raw(" "),
             Span::styled(
-                format!("{content}{}", " ".repeat(width.saturating_sub(4 + used))),
+                format!("{content}{}", " ".repeat(width.saturating_sub(2 + used))),
                 Style::default().fg(INK),
             ),
         ])
@@ -249,10 +258,14 @@ fn reply_rows(value: &str, width: usize) -> Vec<Line<'static>> {
         }
         let heading = !code && source.starts_with("# ");
         for text in wrap_text(source, width.saturating_sub(4)) {
-            let style = Style::default().fg(if code { CYAN } else { INK });
+            let tone = if code { CYAN } else { INK };
             rows.push(Line::styled(
                 format!("  {text}"),
-                if heading { style.bold() } else { style },
+                if heading {
+                    theme::label(tone)
+                } else {
+                    theme::body(tone)
+                },
             ));
         }
     }

@@ -121,13 +121,16 @@ PTY 测试必须启动真实 `bone` binary，并为其提供临时 App data dire
 必测场景：
 
 - 启动进入 alternate screen、raw mode、mouse capture 和 bracketed paste；正常退出后依次禁用并显示光标；
-- 初始化中途失败、App open 失败、render I/O 失败、panic、`SIGINT` / `SIGHUP` / `SIGTERM`（平台支持处）及慢 App shutdown 后，shell 可回显、换行、光标可见且不残留鼠标协议；
+- Unix 能力查询成功时才 push Kitty keyboard enhancement，失败时不 push，并在界面明确显示 `Shift+Enter` unavailable；
+- 初始化中途失败、App open 失败、render I/O 失败、panic、`SIGINT` / `SIGHUP` / `SIGTERM` / `SIGQUIT`（平台支持处）及慢 App shutdown 后，shell 可回显、换行、光标可见且不残留鼠标协议；
+- `SIGTSTP` 前完整恢复终端并真正停止；`SIGCONT` 后重新进入模式、重新协商能力、重建唯一事件流并强制整帧绘制；
 - 快速 resize 到每个布局阈值、宽高为最小值、连续鼠标滚动和点击后不 panic、不误触发；
 - bracketed paste 中包含换行、快捷键字符和终端转义序列时只插入文本；
-- 中文、组合字符和 emoji 的输入、退格、换行、滚动与光标位置在真实终端中一致；
-- 退出时有未落盘草稿，先完成有界 flush 和终端恢复；App shutdown 很慢时终端不能保持在 raw/alternate 状态。
+- 中文、组合字符和 emoji 的输入、退格、换行、滚动与光标位置在真实终端中一致；应用 caret 保留原 Cell 字符，并与原生 cursor 坐标一致；
+- slash 建议打开以及从 Composer 切换 Session 后 caret 仍可见，退出后的最终 cursor 状态为 show；
+- `Ctrl+D` 退出时先有界保存草稿，失败或超时则回到仍可用的界面；一旦收到 OS 终止信号，先恢复终端再执行有界 flush 与 App shutdown。
 
-PTY 断言以协议序列和可观察 shell 行为为主，不能依赖某个 terminal emulator 的私有像素或配色。测试设置总 deadline，并在失败时保存经过脱敏的 PTY transcript、终端尺寸和退出状态。
+PTY 断言以协议序列和可观察 shell 行为为主，不能依赖某个 terminal emulator 的私有像素或配色。输出扫描拒绝 OSC、装饰性 cursor shape 和窗口 resize；测试设置总 deadline，并在失败时保存经过脱敏的 PTY transcript、终端尺寸和退出状态。
 
 ## 性能基准
 
@@ -138,7 +141,7 @@ PTY 断言以协议序列和可观察 shell 行为为主，不能依赖某个 te
 | 无网络首帧 | p95 `<=500 ms` | 进程启动至首次完整 draw |
 | `120×40`、`160×50` 纯 layout + render | p95 `<=16 ms` | 已 hydrate 状态，`TestBackend` draw |
 | 输入到可见帧 | p95 `<=50 ms` | 正常与持续活动更新两种负载 |
-| redraw 频率 | `<=30 FPS` | burst 中合并 dirty 更新，空闲时不持续 draw |
+| redraw 调度 | 无固定 ticker | dirty 状态在接收下一事件前绘制；未来流式合并需单独测量 |
 | 历史读取 | 首屏和上滚均分页 | 不允许为了打开 Session 读取全部历史 |
 | TUI 缓存 | `<=32 MiB` | 历史与正文缓存；不含 App/Core 权威记录与草稿 |
 | 长时内存 | 稳态后无持续增长 | 反复切换、打开详情和滚动 30 分钟 |

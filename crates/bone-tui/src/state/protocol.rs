@@ -12,6 +12,13 @@ use crate::layout::TranscriptMetrics;
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    ClearInput,
+    BeginPaneResize(crate::layout::PaneDivider),
+    DragPane {
+        widths: crate::layout::PaneWidths,
+        finish: bool,
+    },
+    EndPaneResize,
     SetupText(super::SecretText),
     SetupBackspace,
     SetupClear,
@@ -39,7 +46,6 @@ pub enum Action {
         max: usize,
     },
 
-    Noop,
     Focus(Focus),
     FocusLeft,
     FocusRight,
@@ -55,7 +61,7 @@ pub enum Action {
     SelectSlashPrevious,
     SelectSlashNext,
     CompleteSlash,
-    ExecuteSlash(usize),
+    ExecuteCommand(super::CommandKind),
     Input(char),
     Paste(String),
     Backspace,
@@ -93,6 +99,7 @@ pub enum Action {
         metrics: Option<Arc<TranscriptMetrics>>,
     },
     ScrollDown(usize),
+    FollowTail,
     Stop,
     Quit,
     Terminate,
@@ -219,7 +226,6 @@ pub enum UiEvent {
         message: String,
     },
     Resized,
-    Tick,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

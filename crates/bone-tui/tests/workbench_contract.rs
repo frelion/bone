@@ -49,7 +49,7 @@ fn snapshot(info: &SessionInfo, draft: &str) -> Arc<SessionView> {
     })
 }
 
-fn render(state: &UiState, width: u16, height: u16) -> (String, LayoutPlan) {
+fn render(state: &UiState, width: u16, height: u16) -> (String, view::FrameSnapshot) {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     let mut plan = None;
@@ -250,29 +250,19 @@ fn composer_geometry_is_contained_by_the_center_surface() {
         let center = plan.conversation.expect("conversation area");
         let composer = plan.composer.expect("composer area");
         assert!(contained_by(composer, center));
-        let region = plan
-            .hit_regions
-            .iter()
-            .find(|region| region.target == HitTarget::Composer)
-            .expect("visible center has a composer target");
-        assert_eq!(region.area, composer);
-        assert!(contained_by(region.area, center));
     }
 }
 
 #[test]
 fn blank_space_has_no_phantom_hit_targets() {
-    let plan = LayoutPlan::calculate(
-        Rect::new(0, 0, 180, 44),
-        SinglePane::Conversation,
-        4,
-        &[2; 4],
-        None,
-        1,
-    );
+    let (_, plan) = render(&UiState::default(), 180, 44);
     let blank = plan.extension_blank.expect("wide layout blank extension");
+    assert_eq!(
+        plan.hit(blank.x, blank.y),
+        Some(HitTarget::PaneDivider(bone_tui::layout::PaneDivider::Right))
+    );
     for y in blank.y..blank.bottom() {
-        for x in blank.x..blank.right() {
+        for x in blank.x.saturating_add(1)..blank.right() {
             assert_eq!(
                 plan.hit(x, y),
                 None,
@@ -359,11 +349,12 @@ fn minimum_menu_scrolls_to_selected_command_and_hits_it() {
     for index in 0..state.slash_matches().len() {
         state.slash_selection = index;
         let (screen, plan) = render(&state, 40, 12);
-        assert!(screen.contains(state.slash_matches()[index].name));
+        let command = state.slash_matches()[index];
+        assert!(screen.contains(command.name));
         assert!(
-            plan.hit_regions
+            plan.hit_regions()
                 .iter()
-                .any(|r| r.target == HitTarget::SlashCommand(index))
+                .any(|r| r.target == HitTarget::SlashCommand(command.kind))
         );
     }
 }
@@ -424,6 +415,42 @@ fn too_small_has_no_invisible_pointer_actions() {
     for (w, h) in [(39, 12), (40, 11)] {
         let (screen, plan) = render(&state, w, h);
         assert!(screen.contains("Window too small"));
-        assert!(plan.hit_regions.is_empty());
+        assert!(plan.hit_regions().is_empty());
+    }
+}
+
+#[test]
+fn comfortable_session_targets_include_padding_but_exclude_inter_item_gaps() {
+    let workspace = WorkspaceId::new();
+    let state = opened_state(&[session(workspace, "first"), session(workspace, "second")]);
+    let first = state.sessions[0].id;
+    for height in [12, 23, 24, 40] {
+        let (_, plan) = render(&state, 120, height);
+        let row = plan
+            .hit_regions()
+            .iter()
+            .find(|hit| hit.target == HitTarget::Session(first))
+            .unwrap();
+        assert_eq!(row.area.height, if height >= 24 { 3 } else { 1 });
+        for y in row.area.y..row.area.bottom() {
+            assert_eq!(plan.hit(row.area.x + 2, y), Some(HitTarget::Session(first)));
+        }
+        assert_eq!(
+            plan.hit(row.area.x + 2, row.area.bottom()),
+            Some(HitTarget::SessionRail)
+        );
+        let new = plan
+            .hit_regions()
+            .iter()
+            .find(|hit| hit.target == HitTarget::NewSession)
+            .unwrap();
+        assert!(new.area.bottom() <= row.area.y);
+        for y in new.area.y..new.area.bottom() {
+            assert_eq!(plan.hit(new.area.x + 2, y), Some(HitTarget::NewSession));
+        }
+        if height >= 24 {
+            assert_eq!(plan.composer.unwrap().height, 6);
+        }
+        assert!(plan.transcript.unwrap().height >= 3);
     }
 }

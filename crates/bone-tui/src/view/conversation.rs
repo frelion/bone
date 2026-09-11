@@ -2,14 +2,15 @@ use bone_app::{ActivityKind, JobState, RuntimeState};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::Line,
     widgets::{Block, Padding, Paragraph, Wrap},
 };
 
 use crate::{
-    layout::{LayoutMode, LayoutPlan, TranscriptMetrics},
+    layout::{HitRegion, HitTarget, LayoutMode, LayoutPlan, TranscriptMetrics},
     state::{CommandSpec, UiState},
+    ui::{interaction::HitMap, theme},
     view::{
         ACCENT, ATTENTION, INK, MUTED, PANEL, composer, message, single_line_external,
         slash_palette,
@@ -18,9 +19,11 @@ use crate::{
 
 pub(super) fn render(
     frame: &mut Frame<'_>,
-    plan: &mut LayoutPlan,
+    plan: &LayoutPlan,
+    hits: &mut HitMap,
     state: &UiState,
     slash_matches: &[&CommandSpec],
+    slash_start: usize,
 ) -> Option<TranscriptMetrics> {
     if plan.mode == LayoutMode::TooSmall {
         render_too_small(frame, plan.conversation.unwrap_or(plan.screen), state);
@@ -32,7 +35,14 @@ pub(super) fn render(
         return None;
     };
     render_header(frame, header, state);
-    let metrics = render_transcript(frame, transcript, state, &mut plan.hit_regions);
+    if crate::layout::comfortable(plan.screen) {
+        frame.render_widget(
+            Paragraph::new("─".repeat(usize::from(transcript.width)))
+                .style(Style::default().fg(super::DIVIDER)),
+            Rect::new(transcript.x, header.y + 2, transcript.width, 1),
+        );
+    }
+    let metrics = render_transcript(frame, transcript, state, hits);
     let status = state
         .status
         .clone()
@@ -76,28 +86,22 @@ pub(super) fn render(
             crate::state::answer::active_question(snapshot, answer.question).is_some()
         });
         let (label, target) = if active {
-            (
-                "Answering · back to draft",
-                crate::layout::HitTarget::LeaveAnswer,
-            )
+            ("Answering · back to draft", HitTarget::LeaveAnswer)
         } else {
-            (
-                "Question ended · keep as draft",
-                crate::layout::HitTarget::ConvertAnswer,
-            )
+            ("Question ended · keep as draft", HitTarget::ConvertAnswer)
         };
         frame.render_widget(
             Paragraph::new(label).style(Style::default().fg(ACCENT).bg(PANEL)),
             status_area,
         );
-        plan.hit_regions.push(crate::layout::HitRegion {
+        hits.push(HitRegion {
             area: status_area,
             target,
         });
     }
     composer::render(frame, composer_area, state);
     if let Some(area) = plan.slash_palette {
-        slash_palette::render(frame, area, state, slash_matches, plan.slash_start);
+        slash_palette::render(frame, area, state, slash_matches, slash_start);
     }
     metrics
 }
@@ -138,12 +142,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         .selected_ui()
         .map_or("New conversation", |ui| ui.info.title.as_str());
     frame.render_widget(
-        Paragraph::new(single_line_external(title)).style(
-            Style::default()
-                .fg(INK)
-                .add_modifier(Modifier::BOLD)
-                .bg(PANEL),
-        ),
+        Paragraph::new(single_line_external(title)).style(theme::label_on(INK, PANEL)),
         area,
     );
 }
@@ -157,7 +156,7 @@ fn render_transcript(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &UiState,
-    hits: &mut Vec<crate::layout::HitRegion>,
+    hits: &mut HitMap,
 ) -> Option<TranscriptMetrics> {
     let inner = Rect::new(area.x, area.y, area.width, area.height);
     let Some(session) = state.selected_ui() else {
@@ -201,14 +200,14 @@ fn render_transcript(
         let target = match entry.event {
             bone_app::SessionEvent::ToolFinished { .. }
             | bone_app::SessionEvent::JobFinished { .. } => {
-                Some(crate::layout::HitTarget::History(entry.sequence))
+                Some(HitTarget::History(entry.sequence))
             }
             bone_app::SessionEvent::QuestionAsked { question, .. }
                 if session.snapshot.as_ref().is_some_and(|snapshot| {
                     crate::state::answer::active_question(snapshot, question).is_some()
                 }) =>
             {
-                Some(crate::layout::HitTarget::Answer(question))
+                Some(HitTarget::Answer(question))
             }
             _ => None,
         };
@@ -256,7 +255,7 @@ fn render_transcript(
                 if reader_selects(state, crate::state::reader::ReaderSource::Job(job.id)) {
                     line.style = line.style.bg(super::SELECTED);
                 }
-                ephemeral.push((line, Some(crate::layout::HitTarget::Job(job.id))));
+                ephemeral.push((line, Some(HitTarget::Job(job.id))));
             }
         }
         for activity in snapshot.activity.iter().rev() {
@@ -309,7 +308,7 @@ fn render_transcript(
                         ATTENTION,
                     ));
                 }
-                links.push((rows.len(), crate::layout::HitTarget::Answer(question.id)));
+                links.push((rows.len(), HitTarget::Answer(question.id)));
                 rows.push(message::compact(
                     "?",
                     &format!("[answer] {}", question.text),
@@ -319,11 +318,11 @@ fn render_transcript(
             for candidate in crate::state::answer::recoverable_inputs(snapshot, &session.history) {
                 let (target, label) = match candidate {
                     crate::state::answer::RecoveryCandidate::Retry { input } => (
-                        crate::layout::HitTarget::Retry(input),
+                        HitTarget::Retry(input),
                         format!("Retry saved input #{}", input.0),
                     ),
                     crate::state::answer::RecoveryCandidate::Restore { input, .. } => (
-                        crate::layout::HitTarget::Restore(input),
+                        HitTarget::Restore(input),
                         format!("Restore input #{} to draft", input.0),
                     ),
                 };
@@ -336,7 +335,7 @@ fn render_transcript(
             .as_ref()
             .is_some_and(|pending| pending.failed)
         {
-            links.push((rows.len(), crate::layout::HitTarget::RetrySubmission));
+            links.push((rows.len(), HitTarget::RetrySubmission));
             rows.push(message::compact(
                 "↳",
                 "Retry original submission",
@@ -390,7 +389,7 @@ fn render_transcript(
     let visible = rows[start..end].to_vec();
     for (row, target) in links {
         if row >= start && row < end {
-            hits.push(crate::layout::HitRegion {
+            hits.push(HitRegion {
                 area: Rect::new(inner.x, inner.y + (row - start) as u16, inner.width, 1),
                 target,
             });
@@ -533,7 +532,7 @@ mod tests {
         height: u16,
     ) -> (String, Vec<HitRegion>, TranscriptMetrics) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let mut hits = vec![];
+        let mut hits = HitMap::default();
         let mut metrics = None;
         terminal
             .draw(|frame| {
@@ -549,7 +548,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        (text, hits, metrics.unwrap())
+        (text, hits.regions().to_vec(), metrics.unwrap())
     }
 
     #[test]
@@ -705,7 +704,7 @@ mod tests {
         let (_, _, metrics) = render_width(&state, 40, 12);
         assert_eq!(metrics.anchor_at_start(metrics.start_row).unwrap(), anchor);
         state.selected_ui_mut().unwrap().transcript_metrics = Some(Arc::new(metrics));
-        let effects = update(&mut state, UiEvent::Action(Action::ScrollDown(usize::MAX)));
+        let effects = update(&mut state, UiEvent::Action(Action::FollowTail));
         assert!(state.selected_ui().unwrap().read_anchor.is_none());
         assert!(
             effects

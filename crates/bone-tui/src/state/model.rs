@@ -141,7 +141,7 @@ pub struct SessionUi {
     pub newer_history_missing: bool,
     pub draft: String,
     pub draft_cursor: usize,
-    pub editor: crate::text::EditorState,
+    pub editor: crate::editor::EditorState,
     pub draft_revision: u64,
     pub saved_draft_revision: u64,
     pub saved_draft: String,
@@ -258,6 +258,8 @@ pub(crate) enum Panel {
 
 #[derive(Clone, Debug)]
 pub struct UiState {
+    pub(crate) pane_widths: crate::layout::PaneWidths,
+    pub(crate) dragging_divider: Option<crate::layout::PaneDivider>,
     pub(crate) panel: Option<Panel>,
     pub(crate) login_request: Option<u64>,
     pub(crate) model_label_request: u64,
@@ -273,6 +275,7 @@ pub struct UiState {
     pub(crate) models_loading: bool,
     pub(crate) model_request: u64,
     pub(crate) command_from_palette: bool,
+    pub(crate) terminal_capabilities: crate::terminal::TerminalCapabilities,
 
     pub workspace: Option<(WorkspaceId, String)>,
     pub model_label: Option<String>,
@@ -286,7 +289,7 @@ pub struct UiState {
     pub focus: Focus,
     pub orphan_draft: String,
     pub orphan_cursor: usize,
-    pub orphan_editor: crate::text::EditorState,
+    pub orphan_editor: crate::editor::EditorState,
     pub preferred_column: Option<usize>,
     pub orphan_revision: u64,
     pub pending_create: Option<PendingCreate>,
@@ -303,6 +306,8 @@ pub struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self {
+            pane_widths: Default::default(),
+            dragging_divider: None,
             panel: None,
             login_state: bone_app::LoginState::Connecting,
             login_request: None,
@@ -318,6 +323,7 @@ impl Default for UiState {
             models_loading: false,
             model_request: 0,
             command_from_palette: false,
+            terminal_capabilities: Default::default(),
             workspace: None,
             model_label: None,
             model_facts: None,
@@ -452,7 +458,7 @@ impl UiState {
         })
     }
 
-    pub fn editor(&self) -> &crate::text::EditorState {
+    pub(crate) fn editor(&self) -> &crate::editor::EditorState {
         self.selected_ui().map_or(&self.orphan_editor, |ui| {
             ui.active_answer()
                 .map_or(&ui.editor, |answer| &answer.editor)
@@ -461,34 +467,27 @@ impl UiState {
 
     /// Mutable editor for the active answer, ordinary session draft, or orphan.
     /// Ordinary draft persistence deliberately continues to read SessionUi.draft.
-    pub fn editor_mut(
-        &mut self,
-    ) -> (
-        &mut String,
-        &mut usize,
-        &mut u64,
-        &mut crate::text::EditorState,
-    ) {
+    pub(crate) fn editor_mut(&mut self) -> crate::editor::EditBuffer<'_> {
         if let Some(ui) = self.selected.and_then(|id| self.session_ui.get_mut(&id)) {
             if let Some(answer) = ui
                 .selected_answer
                 .and_then(|id| ui.answer_drafts.get_mut(&id))
             {
-                return (
+                return crate::editor::EditBuffer::new(
                     &mut answer.text,
                     &mut answer.cursor,
                     &mut answer.revision,
                     &mut answer.editor,
                 );
             }
-            (
+            crate::editor::EditBuffer::new(
                 &mut ui.draft,
                 &mut ui.draft_cursor,
                 &mut ui.draft_revision,
                 &mut ui.editor,
             )
         } else {
-            (
+            crate::editor::EditBuffer::new(
                 &mut self.orphan_draft,
                 &mut self.orphan_cursor,
                 &mut self.orphan_revision,

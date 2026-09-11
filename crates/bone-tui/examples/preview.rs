@@ -8,7 +8,11 @@ use bone_tui::{
     state::{SessionStatus, SessionUi, UiState},
     view,
 };
-use ratatui::{Terminal, backend::TestBackend, style::Color};
+use ratatui::{
+    Terminal,
+    backend::TestBackend,
+    style::{Color, Modifier},
+};
 use std::sync::Arc;
 fn escaped(value: &str) -> String {
     value
@@ -83,13 +87,54 @@ fn main() {
         });
     }
     state.session_ui.insert(ui.info.id, ui);
+    use bone_tui::state::{Action, Effect, UiEvent, update};
+    let scenario = args.get(3).map(String::as_str).unwrap_or("conversation");
+    if scenario == "commands" {
+        update(&mut state, UiEvent::Action(Action::OpenCommands));
+    } else if matches!(scenario, "models" | "connection" | "form") {
+        let effects = update(&mut state, UiEvent::Action(Action::OpenModels));
+        for effect in effects {
+            if let Effect::LoadModels { session, request } = effect {
+                update(
+                    &mut state,
+                    UiEvent::ModelsLoaded {
+                        session,
+                        request,
+                        choices: vec![],
+                        profiles: vec![],
+                    },
+                );
+            }
+        }
+        if matches!(scenario, "connection" | "form") {
+            update(&mut state, UiEvent::Action(Action::ActivatePanel));
+        }
+        if scenario == "form" {
+            update(&mut state, UiEvent::Action(Action::ActivatePanel));
+        }
+    }
+    if scenario == "resized" {
+        update(
+            &mut state,
+            UiEvent::Action(Action::BeginPaneResize(bone_tui::layout::PaneDivider::Left)),
+        );
+        update(
+            &mut state,
+            UiEvent::Action(Action::DragPane {
+                widths: bone_tui::layout::PaneWidths {
+                    left: 44,
+                    right: 32,
+                },
+                finish: true,
+            }),
+        );
+    }
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal
         .draw(|frame| {
             view::render(frame, &state);
         })
         .unwrap();
-    let cursor = terminal.get_cursor_position().unwrap();
     println!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\"><rect width=\"100%\" height=\"100%\" fill=\"#101010\"/>",
         w * 9,
@@ -113,24 +158,30 @@ fn main() {
     for y in 0..h {
         for x in 0..w {
             let cell = &terminal.backend().buffer()[(x, y)];
-            if cell.symbol() != " " {
+            if cell.symbol() == "▎" {
+                // Block elements represent fractions of the cell, not text line boxes.
+                // This is a grid preview; native terminal font fallback can differ.
                 println!(
-                    "<text x=\"{}\" y=\"{}\" fill=\"{}\" font-family=\"Menlo,monospace\" font-size=\"14\">{}</text>",
+                    "<rect x=\"{}\" y=\"{}\" width=\"2.25\" height=\"20\" fill=\"{}\"/>",
+                    x * 9,
+                    y * 20,
+                    color(cell.fg)
+                );
+            } else if cell.symbol() != " " {
+                println!(
+                    "<text x=\"{}\" y=\"{}\" fill=\"{}\" font-family=\"DejaVu Sans Mono,WenQuanYi Zen Hei Mono,monospace\" font-size=\"14\" font-weight=\"{}\">{}</text>",
                     x * 9,
                     y * 20 + 15,
                     color(cell.fg),
+                    if cell.modifier.contains(Modifier::BOLD) {
+                        700
+                    } else {
+                        400
+                    },
                     escaped(cell.symbol())
                 );
             }
         }
-    }
-    {
-        let pos = cursor;
-        println!(
-            "<rect x=\"{}\" y=\"{}\" width=\"9\" height=\"20\" fill=\"#ff9d24\"/>",
-            pos.x * 9,
-            pos.y * 20
-        );
     }
     println!("</svg>");
 }

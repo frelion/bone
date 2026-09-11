@@ -1,37 +1,30 @@
 pub(crate) mod reader;
-use crate::{layout::LayoutPlan, state::UiState};
-use ratatui::{
-    Frame,
-    style::{Color, Style},
-    widgets::Block,
+pub use crate::ui::frame::FrameSnapshot;
+
+use crate::{
+    layout::{HitRegion, HitTarget, LayoutPlan},
+    state::UiState,
+    ui::{interaction::HitMap, theme},
 };
+use ratatui::{Frame, style::Style, widgets::Block};
 
 mod composer;
 mod connection;
 mod conversation;
+mod marks;
 mod message;
 use crate::text as primitives;
 mod panels;
 mod session_rail;
 mod slash_palette;
 
-const INK: Color = Color::Rgb(245, 245, 245);
-const MUTED: Color = Color::Rgb(171, 171, 171);
-const PANEL: Color = Color::Rgb(9, 9, 9);
-const RAIL: Color = PANEL;
-const INPUT: Color = Color::Rgb(34, 34, 34);
-const USER: Color = Color::Rgb(25, 25, 25);
-const SELECTED: Color = Color::Rgb(37, 37, 37);
-const DIVIDER: Color = Color::Rgb(80, 80, 80);
-const ACCENT: Color = Color::Rgb(255, 157, 36);
-const ATTENTION: Color = ACCENT;
-const DANGER: Color = Color::Rgb(255, 102, 122);
-const GREEN: Color = Color::Rgb(120, 224, 143);
-const CYAN: Color = Color::Rgb(81, 214, 232);
-const PURPLE: Color = Color::Rgb(202, 140, 255);
+pub(super) use theme::{
+    ACCENT, ATTENTION, CYAN, DANGER, DIVIDER, GREEN, INK, INPUT, MUTED, PANE_BOUNDARY, PANEL,
+    PURPLE, RAIL, SELECTED, USER,
+};
 
 /// Render the conversational shell and return its exact pointer hit map.
-pub fn render(frame: &mut Frame<'_>, state: &UiState) -> LayoutPlan {
+pub fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
     let slash_matches = if state.focus == crate::state::Focus::Composer && state.panel.is_none() {
         state.slash_matches()
     } else {
@@ -39,59 +32,58 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) -> LayoutPlan {
     };
     let session_rows: Vec<u16> = (0..state.sessions.len())
         .map(|index| {
-            if session_rail::status(state, index).is_some() {
-                3
-            } else {
+            let content = if session_rail::status(state, index).is_some() {
                 2
-            }
+            } else {
+                1
+            };
+            content
+                + 1
+                + if crate::layout::comfortable(frame.area()) {
+                    2
+                } else {
+                    0
+                }
         })
         .collect();
-    let input_width = LayoutPlan::content_width(frame.area()).saturating_sub(6);
-    let draft_lines = primitives::editor_rows(state.draft(), input_width);
+    let input_width = state
+        .pane_widths
+        .content_width(frame.area())
+        .saturating_sub(4);
+    let draft_lines = crate::editor::editor_rows(state.draft(), input_width);
     let selected_session = state
         .session_candidate
         .or(state.selected)
         .and_then(|id| state.sessions.iter().position(|session| session.id == id));
-    let mut plan = LayoutPlan::calculate(
+    let mut plan = LayoutPlan::calculate_with_widths(
         frame.area(),
         state.single_pane(),
         slash_matches.len(),
         &session_rows,
         selected_session,
         draft_lines,
+        state.pane_widths,
     );
     if let Some(start) = state.session_scroll {
         plan.scroll_sessions(&session_rows, start);
     }
-    for region in &mut plan.hit_regions {
-        if matches!(region.target, crate::layout::HitTarget::Session(_)) {
-            // The final layout row is a gap, not a clickable part of the session.
-            region.area.height -= 1;
-        }
-    }
-    if let Some(area) = plan.slash_palette {
-        plan.slash_start = state
+    let slash_start = plan.slash_palette.map_or(0, |area| {
+        state
             .slash_selection
-            .saturating_sub(usize::from(area.height).saturating_sub(1));
-        for region in &mut plan.hit_regions {
-            if let crate::layout::HitTarget::SlashCommand(index) = &mut region.target {
-                *index += plan.slash_start;
-            }
-        }
-    }
-    frame.render_widget(
-        Block::default().style(Style::default().bg(PANEL)),
-        plan.screen,
-    );
+            .saturating_sub(usize::from(area.height).saturating_sub(1))
+    });
+    let mut hits = base_hits(&plan, state, &slash_matches, slash_start);
+    frame.render_widget(Block::default().style(theme::surface(PANEL)), plan.screen);
     session_rail::render(frame, &plan, state);
     if let Some(area) = plan.extension_blank {
         frame.render_widget(Block::default().style(Style::default().bg(RAIL)), area);
     }
-    plan.transcript_metrics =
-        conversation::render(frame, &mut plan, state, &slash_matches).map(std::sync::Arc::new);
+    let transcript_metrics =
+        conversation::render(frame, &plan, &mut hits, state, &slash_matches, slash_start)
+            .map(std::sync::Arc::new);
     if plan.mode == crate::layout::LayoutMode::TooSmall {
-        plan.hit_regions.clear();
-        return plan;
+        hits.clear();
+        return FrameSnapshot::new(plan, hits, transcript_metrics, 0);
     }
     if state.panel.is_none()
         && slash_matches.is_empty()
@@ -103,9 +95,9 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) -> LayoutPlan {
                 .and_then(|ui| ui.submitting.as_ref())
                 .is_none_or(|pending| pending.failed)
         {
-            plan.hit_regions.push(crate::layout::HitRegion {
+            hits.push(HitRegion {
                 area: composer::action(area, state).0,
-                target: crate::layout::HitTarget::Submit,
+                target: HitTarget::Submit,
             });
         }
         if state.focus == crate::state::Focus::Composer
@@ -138,54 +130,111 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) -> LayoutPlan {
                 ratatui::widgets::Paragraph::new(label).style(Style::default().fg(MUTED).bg(PANEL)),
                 stop,
             );
-            plan.hit_regions.push(crate::layout::HitRegion {
+            hits.push(HitRegion {
                 area: stop,
-                target: crate::layout::HitTarget::Stop,
+                target: HitTarget::Stop,
             });
         }
     }
     if let Some(area) = plan.session_rail {
-        plan.hit_regions.push(crate::layout::HitRegion {
-            area: ratatui::layout::Rect::new(
-                area.x + 3,
-                area.y + 2,
-                area.width.saturating_sub(6),
-                1,
-            ),
-            target: crate::layout::HitTarget::NewSession,
+        hits.push(HitRegion {
+            area: crate::layout::new_session_area(area),
+            target: HitTarget::NewSession,
         });
     }
     if let Some(area) = plan.composer {
         let footer = composer::footer_areas(area, state);
-        plan.hit_regions.push(crate::layout::HitRegion {
+        hits.push(HitRegion {
             area: footer.model,
-            target: crate::layout::HitTarget::Models,
+            target: HitTarget::Models,
         });
         if let Some(commands) = footer.commands {
-            plan.hit_regions.push(crate::layout::HitRegion {
+            hits.push(HitRegion {
                 area: ratatui::layout::Rect::new(commands.x, commands.y, 10, 1),
-                target: crate::layout::HitTarget::Commands,
+                target: HitTarget::Commands,
             });
         }
     }
-    panels::render(frame, &mut plan, state);
-    render_dividers(frame, &plan);
-    plan
+    let mut reader_max_scroll = 0;
+    panels::render(frame, &plan, &mut hits, &mut reader_max_scroll, state);
+    render_dividers(frame, &plan, &mut hits, state);
+    FrameSnapshot::new(plan, hits, transcript_metrics, reader_max_scroll)
 }
 
-fn render_dividers(frame: &mut Frame<'_>, plan: &LayoutPlan) {
+fn base_hits(
+    plan: &LayoutPlan,
+    state: &UiState,
+    slash_matches: &[&crate::state::CommandSpec],
+    slash_start: usize,
+) -> HitMap {
+    let mut hits = HitMap::default();
+    if let Some(area) = plan.session_rail {
+        hits.push(HitRegion {
+            area,
+            target: HitTarget::SessionRail,
+        });
+        for row in &plan.session_rows {
+            if let Some(session) = state.sessions.get(row.index) {
+                hits.push(HitRegion {
+                    area: row.area,
+                    target: HitTarget::Session(session.id),
+                });
+            }
+        }
+    }
+    if let Some(area) = plan.transcript {
+        hits.push(HitRegion {
+            area,
+            target: HitTarget::Conversation,
+        });
+    }
+    if let Some(area) = plan.composer {
+        hits.push(HitRegion {
+            area,
+            target: HitTarget::Composer,
+        });
+    }
+    if let Some(area) = plan.slash_palette {
+        for offset in 0..slash_matches.len().min(usize::from(area.height)) {
+            if let Some(command) = slash_matches.get(slash_start + offset) {
+                hits.push(HitRegion {
+                    area: ratatui::layout::Rect::new(area.x, area.y + offset as u16, area.width, 1),
+                    target: HitTarget::SlashCommand(command.kind),
+                });
+            }
+        }
+    }
+    hits
+}
+
+fn render_dividers(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap, state: &UiState) {
     // Reserve existing edge whitespace; never take width from the reading or input area.
     let left = plan
         .session_rail
         .filter(|_| plan.conversation.is_some())
         .map(|area| area.right() - 1);
     let right = plan.extension_blank.map(|area| area.x);
-    for x in [left, right].into_iter().flatten() {
+    for (position, divider) in [
+        (left, crate::layout::PaneDivider::Left),
+        (right, crate::layout::PaneDivider::Right),
+    ] {
+        let Some(x) = position else {
+            continue;
+        };
+        hits.push(HitRegion {
+            area: ratatui::layout::Rect::new(x, plan.screen.y, 1, plan.screen.height),
+            target: HitTarget::PaneDivider(divider),
+        });
+        let color = if state.dragging_divider == Some(divider) {
+            ACCENT
+        } else {
+            PANE_BOUNDARY
+        };
         for y in plan.screen.y..plan.screen.bottom() {
             frame.buffer_mut()[(x, y)]
-                .set_symbol("│")
-                .set_fg(DIVIDER)
-                .set_bg(PANEL);
+                .set_symbol(" ")
+                .set_fg(color)
+                .set_bg(color);
         }
     }
 }
@@ -199,7 +248,7 @@ fn single_line_external(value: &str) -> String {
 #[cfg(test)]
 mod region_tests {
     use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, style::Modifier};
 
     #[test]
     fn pane_boundaries_survive_overlays_and_disappear_with_hidden_panes() {
@@ -214,14 +263,29 @@ mod region_tests {
                     })
                     .unwrap();
                 let buffer = terminal.backend().buffer();
+                let text_cells: Vec<_> = buffer
+                    .content
+                    .iter()
+                    .filter(|cell| cell.symbol().chars().any(char::is_alphanumeric))
+                    .collect();
+                assert!(
+                    text_cells
+                        .iter()
+                        .any(|cell| cell.modifier.contains(Modifier::BOLD))
+                );
+                assert!(
+                    text_cells
+                        .iter()
+                        .any(|cell| !cell.modifier.contains(Modifier::BOLD))
+                );
                 for x in 0..width {
                     let cell = &buffer[(x, 0)];
-                    assert_eq!(cell.symbol() == "│", boundaries.contains(&x));
+                    assert_eq!(cell.bg == PANE_BOUNDARY, boundaries.contains(&x));
                 }
                 for x in &boundaries {
                     for y in 0..40 {
-                        assert_eq!(buffer[(*x, y)].symbol(), "│");
-                        assert_eq!(buffer[(*x, y)].fg, DIVIDER);
+                        assert_eq!(buffer[(*x, y)].symbol(), " ");
+                        assert_eq!(buffer[(*x, y)].bg, PANE_BOUNDARY);
                     }
                 }
             }

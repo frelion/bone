@@ -2,11 +2,11 @@
 //!
 //! The caller owns selection, loading, focus and scroll. This module performs no
 //! App calls and never interprets tool text as a status or a command.
-use crate::state::reader::ReaderContent;
+use crate::{state::reader::ReaderContent, ui::theme};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::Line,
     widgets::{Block, Paragraph},
 };
@@ -49,11 +49,8 @@ pub(crate) fn render(
     if inner.height > 1 {
         let title = super::single_line_external(&content.title);
         frame.render_widget(
-            Paragraph::new(format!("{}{title}", if focused { "› " } else { "" })).style(
-                Style::default()
-                    .fg(if focused { ACCENT } else { INK })
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Paragraph::new(format!("{}{title}", if focused { "› " } else { "" }))
+                .style(theme::label(if focused { ACCENT } else { INK })),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
     }

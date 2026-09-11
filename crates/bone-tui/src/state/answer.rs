@@ -6,7 +6,6 @@ use bone_app::{
     HistoryEntry, InputId, InputState, InputView, QuestionId, RequestId, RuntimeId, RuntimeState,
     SessionEvent, SessionView, SubmitInput,
 };
-use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnswerDraft {
@@ -14,7 +13,7 @@ pub struct AnswerDraft {
     pub text: String,
     pub cursor: usize,
     pub revision: u64,
-    pub editor: crate::text::EditorState,
+    pub editor: crate::editor::EditorState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,13 +44,7 @@ impl AnswerDraft {
         if self.text != text {
             self.editor.checkpoint(&self.text, self.cursor);
         }
-        self.cursor = text
-            .grapheme_indices(true)
-            .map(|(at, _)| at)
-            .chain(std::iter::once(text.len()))
-            .take_while(|at| *at <= cursor)
-            .last()
-            .unwrap_or(0);
+        self.cursor = crate::editor::floor_grapheme_boundary(&text, cursor);
         if self.text != text {
             self.revision = self.revision.wrapping_add(1);
             self.text = text;

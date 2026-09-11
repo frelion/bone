@@ -3,6 +3,7 @@ use super::{ACCENT, DANGER, INK, INPUT, MUTED, single_line_external};
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan},
     state::{ConnectionKind, Panel, SetupField, UiState},
+    ui::{caret, interaction::HitMap, theme},
 };
 use ratatui::{
     Frame,
@@ -11,12 +12,17 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph, Wrap},
 };
 
-pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiState) {
+pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap, state: &UiState) {
     let surface = plan.composer.unwrap_or(plan.screen);
+    let spacious = crate::layout::comfortable(plan.screen);
+    let stride: u16 = if spacious { 2 } else { 1 };
+    let inset = u16::from(spacious);
     let height = state
         .connection_form
         .as_ref()
-        .map_or(8, |form| form.fields().len() as u16 + 6)
+        .map_or(if spacious { 13 } else { 8 }, |form| {
+            form.fields().len() as u16 * stride + 6 + inset * 3
+        })
         .min(plan.screen.height.saturating_sub(2));
     let area = Rect::new(
         surface.x,
@@ -25,7 +31,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
         height,
     );
     frame.render_widget(Clear, area);
-    frame.render_widget(Block::default().style(Style::default().bg(INPUT)), area);
+    frame.render_widget(Block::default().style(theme::surface(INPUT)), area);
     let x = area.x + 2;
     let width = area.width.saturating_sub(4);
     let title = if matches!(state.panel, Some(Panel::ModelAdd)) {
@@ -37,27 +43,32 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
             .map_or("Models / Connection", |form| form.kind.label())
     };
     frame.render_widget(
-        Paragraph::new(title).style(Style::default().fg(INK)),
-        Rect::new(x, area.y, width, 1),
+        Paragraph::new(title).style(theme::label(INK)),
+        Rect::new(x, area.y + inset, width, 1),
     );
-    let back = Rect::new(x, area.bottom().saturating_sub(1), width, 1);
+    let back = Rect::new(x, area.bottom().saturating_sub(1 + inset), width, 1);
     frame.render_widget(
         Paragraph::new("esc back").style(Style::default().fg(MUTED)),
         back,
     );
-    plan.hit_regions.push(HitRegion {
+    hits.push(HitRegion {
         area: back,
         target: HitTarget::Back,
     });
     if matches!(state.panel, Some(Panel::ModelAdd)) {
         for (index, kind) in ConnectionKind::ALL.iter().enumerate() {
-            let row = Rect::new(x, area.y + 2 + index as u16, width, 1);
+            let row = Rect::new(
+                x,
+                area.y + 2 + inset * 2 + index as u16 * stride,
+                width,
+                stride,
+            );
             frame.render_widget(
                 Paragraph::new(kind.label())
                     .style(super::panels::menu_style(state.panel_selection == index)),
                 row,
             );
-            plan.hit_regions.push(HitRegion {
+            hits.push(HitRegion {
                 area: row,
                 target: HitTarget::ConnectionKind(index),
             });
@@ -79,10 +90,10 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
             } else {
                 MUTED
             })),
-        Rect::new(x, area.y + 1, width, 2),
+        Rect::new(x, area.y + 1 + inset, width, 2),
     );
     for (index, field) in form.fields().iter().enumerate() {
-        let row = Rect::new(x, area.y + 3 + index as u16, width, 1);
+        let row = Rect::new(x, area.y + 3 + inset + index as u16 * stride, width, stride);
         let (label, value, placeholder) = match field {
             SetupField::Label => ("Name", form.label.as_str(), "connection name"),
             SetupField::BaseUrl => ("URL", form.base_url.as_str(), "official URL if blank"),
@@ -106,9 +117,9 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
         let selected = form.field == *field;
         frame.render_widget(
             Paragraph::new(label).style(Style::default().fg(if selected { ACCENT } else { MUTED })),
-            Rect::new(row.x, row.y, 6.min(width), 1),
+            Rect::new(row.x, row.y, 8.min(width), 1),
         );
-        let input = Rect::new(row.x + 6.min(width), row.y, width.saturating_sub(6), 1);
+        let input = Rect::new(row.x + 8.min(width), row.y, width.saturating_sub(8), 1);
         let (text, cursor) =
             super::panels::input_query(value, input.width.saturating_add(2), placeholder);
         let text = text.strip_prefix("> ").unwrap_or(&text);
@@ -122,14 +133,14 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
             input,
         );
         if selected && !form.saving && input.width > 2 {
-            frame.set_cursor_position((input.x + cursor, input.y));
+            caret::place(frame, (input.x + cursor, input.y));
         }
-        plan.hit_regions.push(HitRegion {
+        hits.push(HitRegion {
             area: row,
             target: HitTarget::SetupField(*field),
         });
     }
-    let action = Rect::new(x, area.bottom().saturating_sub(2), width, 1);
+    let action = Rect::new(x, area.bottom().saturating_sub(2 + inset), width, 1);
     let label = if form.saving {
         "Saving…"
     } else if form.kind == ConnectionKind::ChatGptSubscription {
@@ -142,7 +153,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &mut LayoutPlan, state: &UiSta
         action,
     );
     if !form.saving {
-        plan.hit_regions.push(HitRegion {
+        hits.push(HitRegion {
             area: action,
             target: HitTarget::SaveConnection,
         });
@@ -189,7 +200,7 @@ mod tests {
                 SetupField::Model,
             ] {
                 let hit = layout
-                    .hit_regions
+                    .hit_regions()
                     .iter()
                     .find(|hit| hit.target == HitTarget::SetupField(field))
                     .unwrap();
@@ -209,7 +220,7 @@ mod tests {
             }
             assert!(
                 layout
-                    .hit_regions
+                    .hit_regions()
                     .iter()
                     .any(|hit| hit.target == HitTarget::SaveConnection)
             );
@@ -259,7 +270,7 @@ mod tests {
                 let layout = crate::view::render(frame, &state);
                 for index in 0..4 {
                     let region = layout
-                        .hit_regions
+                        .hit_regions()
                         .iter()
                         .find(|r| r.target == HitTarget::ConnectionKind(index))
                         .unwrap();

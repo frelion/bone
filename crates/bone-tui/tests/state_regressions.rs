@@ -448,25 +448,14 @@ fn rail_viewport_keeps_selection_visible_and_footer_hits_the_rail() {
         1,
     );
     assert!(plan.session_start > 0);
-    assert!(
-        plan.hit_regions
-            .iter()
-            .any(|region| region.target == HitTarget::Session(17))
-    );
+    assert!(plan.session_rows.iter().any(|row| row.index == 17));
     let selected = plan
-        .hit_regions
+        .session_rows
         .iter()
-        .find(|region| region.target == HitTarget::Session(17))
+        .find(|row| row.index == 17)
         .unwrap();
-    assert_eq!(
-        plan.hit(selected.area.x + 1, selected.area.y),
-        Some(HitTarget::Session(17))
-    );
     let rail = plan.session_rail.unwrap();
-    assert_eq!(
-        plan.hit(rail.x + 1, rail.bottom() - 1),
-        Some(HitTarget::SessionRail)
-    );
+    assert!(selected.area.x >= rail.x && selected.area.right() <= rail.right());
 
     let workspace = WorkspaceId::new();
     let sessions: Vec<_> = (0..20)
@@ -479,6 +468,12 @@ fn rail_viewport_keeps_selection_visible_and_footer_hits_the_rail() {
     assert_eq!(state.selected, Some(target));
     assert_eq!(state.session_candidate, Some(target));
     assert_eq!(state.focus, Focus::Conversation);
+    let rendered = render_plan(&state, 120, 14);
+    let rail = rendered.session_rail.unwrap();
+    assert_eq!(
+        rendered.hit(rail.x + 1, rail.bottom() - 1),
+        Some(HitTarget::SessionRail)
+    );
 }
 
 #[test]
@@ -609,7 +604,7 @@ fn evicting_newer_messages_compensates_the_visual_scroll_anchor() {
     assert!(state.session_ui[&session.id].newer_history_missing);
 }
 
-fn render_plan(state: &UiState, width: u16, height: u16) -> LayoutPlan {
+fn render_plan(state: &UiState, width: u16, height: u16) -> view::FrameSnapshot {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     let mut plan = None;
