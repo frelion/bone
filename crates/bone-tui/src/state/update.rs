@@ -355,7 +355,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 if let Some(metrics) = metrics {
                     let evicted_rows = evicted
                         .iter()
-                        .filter_map(|sequence| metrics.event_rows.get(sequence))
+                        .map(|sequence| metrics.anchors.row_count(*sequence))
                         .sum::<usize>();
                     ui.scroll_from_tail = ui.scroll_from_tail.saturating_sub(evicted_rows);
                 }
@@ -3657,6 +3657,21 @@ mod transcript_budget_tests {
     use crate::layout::{AnchorPart, ContentAnchor, TranscriptMetrics};
     use std::sync::Arc;
 
+    fn metrics(sequences: impl IntoIterator<Item = u64>) -> Arc<TranscriptMetrics> {
+        Arc::new(TranscriptMetrics {
+            anchors: sequences
+                .into_iter()
+                .map(|sequence| ContentAnchor {
+                    sequence: bone_app::SessionSeq(sequence),
+                    byte: 0,
+                    part: AnchorPart::Text,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            ..TranscriptMetrics::default()
+        })
+    }
+
     fn fixture() -> UiState {
         let mut state = UiState::default();
         let info = bone_app::SessionInfo {
@@ -3689,10 +3704,7 @@ mod transcript_budget_tests {
     fn individually_oversized_metrics_are_rejected_without_evicting_history_or_anchor() {
         let mut state = fixture();
         let anchor = state.selected_ui().unwrap().read_anchor;
-        let metrics = Arc::new(TranscriptMetrics {
-            event_rows: (1..=8).map(|seq| (bone_app::SessionSeq(seq), 1)).collect(),
-            ..TranscriptMetrics::default()
-        });
+        let metrics = metrics(1..=8);
         let limit = metrics.allocated_bytes() - 1;
         assert!(state.selected_ui().unwrap().history_bytes < limit);
         assert!(!retain_transcript_with_limit(&mut state, metrics, limit));
@@ -3707,14 +3719,8 @@ mod transcript_budget_tests {
     fn combined_metrics_overflow_drops_old_layout_before_current_or_history() {
         let mut state = fixture();
         let anchor = state.selected_ui().unwrap().read_anchor;
-        let current = Arc::new(TranscriptMetrics {
-            event_rows: [(bone_app::SessionSeq(1), 1)].into(),
-            ..TranscriptMetrics::default()
-        });
-        let older = Arc::new(TranscriptMetrics {
-            event_rows: [(bone_app::SessionSeq(2), 1)].into(),
-            ..TranscriptMetrics::default()
-        });
+        let current = metrics([1]);
+        let older = metrics([2]);
         let limit = state.selected_ui().unwrap().history_bytes + current.allocated_bytes();
         assert!(current.allocated_bytes() < limit && older.allocated_bytes() < limit);
         state.selected_ui_mut().unwrap().older_metrics = Some(older);

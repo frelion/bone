@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use bone_app::SessionSeq;
 use ratatui::layout::Rect;
 
@@ -114,7 +112,6 @@ pub(crate) fn composer_text_area(area: Rect) -> Rect {
 pub struct TranscriptMetrics {
     pub total_rows: usize,
     pub viewport_rows: usize,
-    pub event_rows: BTreeMap<SessionSeq, usize>,
     pub anchors: AnchorRows,
     pub start_row: usize,
     pub scroll_from_tail: usize,
@@ -145,19 +142,14 @@ pub struct AnchorRows {
 struct AnchorRun {
     sequence: SessionSeq,
     start: usize,
-    small: Box<[u32]>,
-    large: Box<[u64]>,
+    packed: Box<[u32]>,
 }
 impl AnchorRun {
     fn len(&self) -> usize {
-        self.small.len().max(self.large.len())
+        self.packed.len()
     }
-    fn packed(&self, index: usize) -> u64 {
-        if self.small.is_empty() {
-            self.large[index]
-        } else {
-            u64::from(self.small[index])
-        }
+    fn packed(&self, index: usize) -> u32 {
+        self.packed[index]
     }
 }
 impl From<Vec<ContentAnchor>> for AnchorRows {
@@ -171,29 +163,21 @@ impl From<Vec<ContentAnchor>> for AnchorRows {
                     .iter()
                     .take_while(|anchor| anchor.sequence == sequence)
                     .count();
-            let pack = |anchor: &ContentAnchor| (anchor.byte as u64) << 2 | anchor.part as u64;
-            let (small, large) = if anchors[start..end]
+            let packed = anchors[start..end]
                 .iter()
-                .all(|anchor| anchor.byte <= (u32::MAX >> 2) as usize)
-            {
-                (
-                    anchors[start..end]
-                        .iter()
-                        .map(|anchor| pack(anchor) as u32)
-                        .collect(),
-                    Box::default(),
-                )
-            } else {
-                (
-                    Box::default(),
-                    anchors[start..end].iter().map(pack).collect(),
-                )
-            };
+                .map(|anchor| {
+                    anchor
+                        .byte
+                        .checked_mul(4)
+                        .and_then(|byte| byte.checked_add(anchor.part as usize))
+                        .and_then(|value| u32::try_from(value).ok())
+                        .expect("transcript source offset exceeds the bounded App event size")
+                })
+                .collect();
             runs.push(AnchorRun {
                 sequence,
                 start,
-                small,
-                large,
+                packed,
             });
             start = end;
         }
@@ -238,23 +222,30 @@ impl AnchorRows {
         (0..run.len())
             .rfind(|&index| {
                 let packed = run.packed(index);
-                packed & 3 == anchor.part as u64 && packed >> 2 <= anchor.byte as u64
+                packed & 3 == anchor.part as u32 && (packed >> 2) as usize <= anchor.byte
             })
             .map(|index| run.start + index)
+    }
+    pub fn row_count(&self, sequence: SessionSeq) -> usize {
+        self.runs
+            .iter()
+            .filter(|run| run.sequence == sequence)
+            .map(AnchorRun::len)
+            .sum()
     }
     pub fn allocated_bytes(&self) -> usize {
         self.runs.capacity() * std::mem::size_of::<AnchorRun>()
             + self
                 .runs
                 .iter()
-                .map(|run| std::mem::size_of_val(&*run.small) + std::mem::size_of_val(&*run.large))
+                .map(|run| std::mem::size_of_val(&*run.packed))
                 .sum::<usize>()
     }
 }
 
 impl TranscriptMetrics {
     pub fn allocated_bytes(&self) -> usize {
-        self.anchors.allocated_bytes() + self.event_rows.len() * 64
+        self.anchors.allocated_bytes()
     }
     pub fn row_for_anchor(&self, anchor: ContentAnchor) -> Option<usize> {
         self.anchors.row_for_anchor(anchor)
@@ -538,6 +529,8 @@ mod tests {
             .collect::<Vec<_>>()
             .into();
         assert!(rows.allocated_bytes() <= count * 4 + 512);
+        assert_eq!(rows.row_count(SessionSeq(42)), count);
+        assert_eq!(rows.row_count(SessionSeq(7)), 0);
         assert_eq!(
             rows.get(count - 1),
             Some(ContentAnchor {
@@ -546,13 +539,6 @@ mod tests {
                 part: AnchorPart::Text
             })
         );
-        let wide = ContentAnchor {
-            sequence: SessionSeq(u64::MAX),
-            byte: u32::MAX as usize,
-            part: AnchorPart::UserBottom,
-        };
-        let rows: AnchorRows = vec![wide].into();
-        assert_eq!(rows.get(0), Some(wide));
     }
 
     #[test]

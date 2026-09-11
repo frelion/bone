@@ -265,7 +265,6 @@ fn render_transcript(
 
     let mut rows = Vec::<Line<'static>>::new();
     let mut links = Vec::new();
-    let mut event_rows = std::collections::BTreeMap::new();
     let mut anchors = Vec::new();
     for entry in &session.history {
         let mut rendered = message::rows(&entry.event, area.width);
@@ -280,7 +279,6 @@ fn render_transcript(
         if rendered.is_empty() {
             continue;
         }
-        let mut row_count = rendered.len();
         if !rows.is_empty() {
             rows.push(Line::default());
             anchors.push(crate::layout::ContentAnchor {
@@ -288,7 +286,6 @@ fn render_transcript(
                 byte: 0,
                 part: crate::layout::AnchorPart::Separator,
             });
-            row_count += 1;
         }
         let source_row = rows.len();
         let target = match entry.event {
@@ -330,7 +327,6 @@ fn render_transcript(
             }
         }));
         rows.extend(rendered);
-        event_rows.insert(entry.sequence, row_count);
     }
 
     if session.scroll_from_tail == 0
@@ -446,7 +442,6 @@ fn render_transcript(
         return Some(TranscriptMetrics {
             total_rows: 0,
             viewport_rows: usize::from(area.height),
-            event_rows,
             ..TranscriptMetrics::default()
         });
     }
@@ -494,7 +489,6 @@ fn render_transcript(
     Some(TranscriptMetrics {
         total_rows: rows.len(),
         viewport_rows: viewport,
-        event_rows,
         anchors: anchors.into(),
         start_row: start,
         scroll_from_tail: rows.len().saturating_sub(end),

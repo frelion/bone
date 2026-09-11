@@ -32,42 +32,18 @@ pub(crate) struct ReaderLayout {
 #[derive(Debug)]
 pub(crate) struct ReaderRows {
     text: String,
-    ends: ReaderOffsets,
-}
-#[derive(Debug)]
-enum ReaderOffsets {
-    Compact(Box<[u32]>),
-    Wide(Box<[usize]>),
-}
-impl ReaderOffsets {
-    fn len(&self) -> usize {
-        match self {
-            Self::Compact(v) => v.len(),
-            Self::Wide(v) => v.len(),
-        }
-    }
-    fn at(&self, index: usize) -> usize {
-        match self {
-            Self::Compact(v) => v[index] as usize,
-            Self::Wide(v) => v[index],
-        }
-    }
-    fn allocated_bytes(&self) -> usize {
-        match self {
-            Self::Compact(v) => std::mem::size_of_val(&**v),
-            Self::Wide(v) => std::mem::size_of_val(&**v),
-        }
-    }
+    ends: Box<[u32]>,
 }
 impl ReaderRows {
     pub fn len(&self) -> usize {
         self.ends.len().saturating_sub(1)
     }
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> {
-        (0..self.len()).map(|index| &self.text[self.ends.at(index)..self.ends.at(index + 1)])
+        (0..self.len())
+            .map(|index| &self.text[self.ends[index] as usize..self.ends[index + 1] as usize])
     }
     pub fn allocated_bytes(&self) -> usize {
-        self.text.capacity() + self.ends.allocated_bytes()
+        self.text.capacity() + std::mem::size_of_val(&*self.ends)
     }
 }
 
@@ -99,12 +75,13 @@ impl ReaderContent {
             text.push_str(&row);
             ends.push(text.len());
         }
-        let ends = if u32::try_from(text.len()).is_ok() {
-            ReaderOffsets::Compact(ends.into_iter().map(|offset| offset as u32).collect())
-        } else {
-            // Preserve exceptionally large content without narrowing its offsets.
-            ReaderOffsets::Wide(ends.into_boxed_slice())
-        };
+        let ends = ends
+            .into_iter()
+            .map(|offset| {
+                u32::try_from(offset)
+                    .expect("reader row offset exceeds the current App projection limits")
+            })
+            .collect();
         let rows = std::sync::Arc::new(ReaderRows { text, ends });
         // Charge both the Reader's projected source and the packed display copy.
         // The Arc identity key shares that source allocation; it is not a third copy.

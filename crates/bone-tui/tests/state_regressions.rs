@@ -605,7 +605,7 @@ fn evicting_newer_messages_compensates_the_visual_scroll_anchor() {
         .transcript_metrics
         .expect("rendered transcript metrics");
     let evicted_rows = (1_480..1_512)
-        .filter_map(|sequence| metrics.event_rows.get(&bone_app::SessionSeq(sequence)))
+        .map(|sequence| metrics.anchors.row_count(bone_app::SessionSeq(sequence)))
         .sum::<usize>();
     assert!(evicted_rows > 32, "wrapped messages occupy multiple rows");
     let ui = state.session_ui.get_mut(&session.id).unwrap();
