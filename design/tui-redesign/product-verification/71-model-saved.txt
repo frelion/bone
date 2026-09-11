@@ -1,0 +1,40 @@
+                                                                                                                                                                
+   history-verify                     新会话                                                                                                                    
+   /new  New session                                                                                                                                            
+                                      Start with a clear request.                                                                                               
+   消息1 段000：长正文检查中文                                                                                                                                  
+ │ 新会话                                                                                                                                                       
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                      › Write a request…                                                                                                        
+                                                                                                                                                                
+                                        gpt-5.5 · saved             / commands   alt+enter newline      enter send                                              
+                                                                                                                                                                
+                                                                                                                                                                

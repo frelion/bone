@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use bone_app::{
-    HistoryCursor, HistoryPage, RecentHistoryPage, RequestId, SessionId, SessionInfo, SessionView,
-    SubmissionReceipt, SubmitInput, WorkspaceId,
+    HistoryCursor, HistoryPage, InputId, QuestionId, RecentHistoryPage, RequestId, SessionId,
+    SessionInfo, SessionView, SubmissionReceipt, SubmitInput, WorkspaceId,
 };
 
 use std::collections::BTreeMap;
@@ -12,6 +12,33 @@ use crate::layout::TranscriptMetrics;
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    SetupText(super::SecretText),
+    SetupBackspace,
+    SetupClear,
+    NextField,
+    PreviousField,
+    SelectField(super::SetupField),
+    SaveConnection,
+    ChooseConnectionKind(usize),
+    RenameText(String),
+    RenameBackspace,
+    NewSession,
+    OpenCommands,
+    OpenModels,
+    OpenHelp,
+    OpenLatest,
+    SelectObject(usize),
+    OpenHistory(bone_app::SessionSeq),
+    OpenJob(bone_app::JobRef),
+    PanelPrevious,
+    PanelNext,
+    ActivatePanel,
+    SelectModel(usize),
+    ScrollPanel {
+        amount: isize,
+        max: usize,
+    },
+
     Noop,
     Focus(Focus),
     FocusLeft,
@@ -21,6 +48,10 @@ pub enum Action {
     SelectPrevious,
     SelectNext,
     SelectSession(SessionId),
+    OpenCandidate,
+    ScrollSessions {
+        start: usize,
+    },
     SelectSlashPrevious,
     SelectSlashNext,
     CompleteSlash,
@@ -29,12 +60,33 @@ pub enum Action {
     Paste(String),
     Backspace,
     Delete,
+    PlaceCursor(usize),
+    DragCursor(usize),
+    Undo,
+    Redo,
+    MoveCursor {
+        direction: i8,
+        width: u16,
+        select: bool,
+        word: bool,
+    },
     CursorLeft,
     CursorRight,
+    CursorVertical {
+        down: bool,
+        width: u16,
+    },
     CursorHome,
     CursorEnd,
     InsertNewline,
     Submit,
+    ClickSubmit,
+    AnswerQuestion(QuestionId),
+    LeaveAnswer,
+    ConvertAnswer,
+    RestoreInput(InputId),
+    RetryInput(InputId),
+    RetrySubmission,
     Escape,
     ScrollUp {
         amount: usize,
@@ -48,6 +100,41 @@ pub enum Action {
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
+    ConnectionSaved {
+        request: u64,
+        session: Option<SessionId>,
+        error: Option<String>,
+        notice: Option<String>,
+    },
+    LoginChanged {
+        request: u64,
+        state: bone_app::LoginState,
+    },
+    ModelLabelLoaded {
+        session: Option<SessionId>,
+        request: u64,
+        label: Option<String>,
+        facts: Option<super::ModelFacts>,
+    },
+    ModelsFailed {
+        session: Option<SessionId>,
+        request: u64,
+        error: String,
+    },
+    ModelsLoaded {
+        session: Option<SessionId>,
+        request: u64,
+        choices: Vec<super::ModelChoice>,
+        profiles: Vec<bone_app::Profile>,
+    },
+    ModelApplied {
+        session: Option<SessionId>,
+        request: u64,
+        label: Option<String>,
+        facts: Option<super::ModelFacts>,
+        error: Option<String>,
+    },
+
     Action(Action),
     WorkspaceOpened {
         id: WorkspaceId,
@@ -141,6 +228,7 @@ pub enum OperationKind {
     CreateSession,
     SaveDraft,
     Submit,
+    RetryInput,
     Stop,
     LoadHistory,
     LoadOlderHistory,
@@ -154,6 +242,38 @@ pub enum OperationKind {
 
 #[derive(Clone, Debug)]
 pub enum Effect {
+    SaveConnection {
+        request: u64,
+        session: Option<SessionId>,
+        profile: bone_app::Profile,
+        key: Option<super::SecretText>,
+        selection: Option<bone_app::ModelSelection>,
+    },
+    Login {
+        profile: bone_app::ProfileId,
+        request: u64,
+    },
+    LoadModelLabel {
+        session: Option<SessionId>,
+        request: u64,
+    },
+    CancelLogin,
+    LoadModels {
+        session: Option<SessionId>,
+        request: u64,
+    },
+    SetModel {
+        session: Option<SessionId>,
+        request: u64,
+        selection: bone_app::ModelSelection,
+    },
+    SetNamedModel {
+        session: Option<SessionId>,
+        request: u64,
+        profile: String,
+        model: String,
+    },
+
     OpenSession {
         session: SessionId,
         generation: u64,
@@ -183,6 +303,11 @@ pub enum Effect {
         session: SessionId,
         generation: u64,
         input: SubmitInput,
+    },
+    RetryInput {
+        session: SessionId,
+        generation: u64,
+        input: InputId,
     },
     Stop {
         session: SessionId,

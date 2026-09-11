@@ -1,0 +1,40 @@
+                                                                                                                                                                
+   workspace                          检查中文 é 和组合字符。 第二行保留光标。 · 布局验收                                                                       
+   /new  New session                                                                                                                                            
+                                                                                                                                                                
+ │ · 检查中文 é 和组合字符。 第      │  检查中文 é 和组合字符。                                                                                                 
+                                     │  第二行保留光标。                                                                                                        
+                                                                                                                                                                
+                                    ↳ Retry saved input #1                                                                                                      
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                      Commands                                                                                                                  
+                                      /new          Create a session                                                                                            
+                                      /sessions     Focus sessions                                                                                              
+                                      /model        Choose a configured model                                                                                   
+                                      /answer       Answer the current question                                                                                 
+                                      /details      Choose a task or tool result                                                                                
+                                      /recover      Restore the latest cancelled input                                                                          
+                                      /retry        Retry the original request                                                                                  
+                                      /login        Connect a subscription profile                                                                              
+                                      /rename       Rename this session                                                                                         
+                                      /help         Show available commands                                                                                     
+                                      /quit         Save drafts and quit                                                                                        
+                                                                                                                                                                
+                                      esc back                                                                                                                  
+                                                                                                                                                                
+                                                                                                                                                                
+                                      › 正在编辑的草稿[<0;41;38Mchatgpt 测试模型名称中文末尾-é                                                                  
+                                                                                                                                                                
+                                        gpt-5.5 · saved             / commands   alt+enter newline      enter send                                              
+                                                                                                                                                                
+                                                                                                                                                                

@@ -34,6 +34,38 @@ fn real_binary_restores_every_terminal_mode_after_visible_quit_flow() {
 }
 
 #[test]
+fn cursor_blinks_when_idle_but_stays_visible_while_typing() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut process = PtyBone::spawn(
+        &temporary.path().join("data"),
+        &workspace,
+        Duration::from_secs(15),
+    );
+    process.wait_for_bytes(b"\x1b[1 q");
+    process.output.lock().unwrap().clear();
+    process.write(b"a");
+    process.wait_for_bytes(b"\x1b[2 q");
+    for _ in 0..4 {
+        thread::sleep(Duration::from_millis(250));
+        process.write(b"b");
+        assert!(
+            !process
+                .output
+                .lock()
+                .unwrap()
+                .windows(5)
+                .any(|w| w == b"\x1b[1 q")
+        );
+    }
+    process.wait_for_bytes(b"\x1b[1 q");
+    process.write(&[0x11]);
+    assert!(process.wait_for_exit().success());
+    process.wait_for_bytes(b"\x1b]112\x07");
+}
+
+#[test]
 fn real_binary_restores_every_terminal_mode_after_unix_termination_signals() {
     for (name, signal) in [
         ("SIGINT", libc::SIGINT),
@@ -66,6 +98,9 @@ fn assert_terminal_protocol_restored(output: &[u8]) {
         b"\x1b[?2004l".as_slice(),
         b"\x1b[?1049l".as_slice(),
         b"\x1b[?25h".as_slice(),
+        b"\x1b[2 q".as_slice(),
+        b"\x1b]12;#ff9d24\x07".as_slice(),
+        b"\x1b]112\x07".as_slice(),
     ] {
         assert!(
             output
@@ -107,7 +142,7 @@ impl PtyBone {
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1 {
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -237,7 +272,7 @@ fn set_nonblocking(file: &File) {
 fn open_pty(width: u16, height: u16) -> (File, File) {
     let mut master = -1;
     let mut slave = -1;
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: height,
         ws_col: width,
         ws_xpixel: 0,
@@ -248,8 +283,8 @@ fn open_pty(width: u16, height: u16) -> (File, File) {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &size,
+            std::ptr::null_mut(),
+            &mut size,
         )
     };
     assert_eq!(

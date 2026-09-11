@@ -1,0 +1,40 @@
+                                                                                                                                                                
+   authorization                      New conversation                                                                                                          
+   /new  New session                                                                                                                                            
+                                                                                                                                                                
+                                      Start with a clear request.                                                                                               
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                      OpenAI Responses                                                                                                          
+                                      tab fields · ctrl+u clear field                                                                                           
+                                                                                                                                                                
+                                      Name  > Custom gateway                                                                                                    
+                                      URL   > http://example.invalid                                                                                            
+                                      Key   > ********                                                                                                          
+                                      Model > model-demo                                                                                                        
+                                                                                                                                                                
+                                      enter save · tab next field                                                                                               
+                                      esc back                                                                                                                  
+                                                                                                                                                                
+                                                                                                                                                                
+                                      › Write a request…                                                                                                        
+                                                                                                                                                                
+                                        Select model                / commands   alt+enter newline      enter save                                              
+                                                                                                                                                                
+                                                                                                                                                                

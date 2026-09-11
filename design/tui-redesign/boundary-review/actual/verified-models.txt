@@ -1,0 +1,40 @@
+                               │                                                                                        │                                       
+   workspace                   │      New conversation                                                                  │                                       
+   /new  New session           │                                                                                        │                                       
+                               │      Start with a clear request.                                                       │                                       
+ ▏ · New conversation          │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │      Models & connections                                                              │                                       
+                               │      Saved: api-verification/verification-model                                        │                                       
+                               │      Available models                                                                  │                                       
+                               │      verification-model · API verification edited                                      │                                       
+                               │                                                                                        │                                       
+                               │      Manage connections                                                                │                                       
+                               │      Edit connection · ChatGPT subscription                                            │                                       
+                               │      Edit connection · API verification edited                                         │                                       
+                               │      esc back                                                                          │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │        draft survives model setup                                                      │                                       
+                               │                                                                                        │                                       
+                               │        verification-model · saved                                                      │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       

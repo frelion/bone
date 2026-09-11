@@ -1,0 +1,40 @@
+                                                                                                                                                                
+   history-verify                     新会话                                                                                                                    
+   /new  New session                                                                                                                                            
+                                      Start with a clear request.                                                                                               
+   消息1 段000：长正文检查中文                                                                                                                                  
+ │ 新会话                                                                                                                                                       
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                      Configured models                                                                                                         
+                                      Saved configuration needs attention                                                                                       
+                                      No saved model.                                                                                                           
+                                      /model <profile> <model>                                                                                                  
+                                      Profiles: chatgpt · ChatGPT subscription                                                                                  
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                      > profile model                                                                                                           
+                                      esc back                                                                                                                  
+                                                                                                                                                                
+                                                                                                                                                                
+                                      › Write a request…                                                                                                        
+                                                                                                                                                                
+                                        Select model                / commands   alt+enter newline      enter save                                              
+                                                                                                                                                                
+                                                                                                                                                                

@@ -1,5 +1,6 @@
 mod input;
 mod launch;
+pub(crate) mod models;
 mod runtime;
 
 use std::{collections::VecDeque, env, future::Future, io, time::Duration};
@@ -54,15 +55,12 @@ pub async fn run() -> Result<(), RunError> {
     let workspace = app.open_workspace(launch.workspace).await?;
     let overview = app.workspace_overview(workspace.id).await?;
     let last_active = app.last_active_session(workspace.id).await?;
-    let model_label = Some(
-        app.resolved_workspace_config(workspace.id)
-            .await?
-            .desired
-            .map_or_else(
-                |_| "model setup needed".to_owned(),
-                |config| config.coordinator.selection.model,
-            ),
-    );
+    let model_label = app
+        .resolved_workspace_config(workspace.id)
+        .await?
+        .desired
+        .ok()
+        .map(|config| config.worker.selection.model);
     let (sessions, statuses) = summarize_overview(&overview);
 
     let (tx, mut rx) = mpsc::channel(256);
@@ -112,7 +110,7 @@ pub async fn run() -> Result<(), RunError> {
         }
         if shutdown {
             let result = wait_for_draft_flush(
-                runtime.flush_drafts(&state),
+                runtime.flush_drafts(&mut state),
                 &mut terminations,
                 termination_received,
                 DRAFT_FLUSH_TIMEOUT,
@@ -149,10 +147,23 @@ pub async fn run() -> Result<(), RunError> {
         }
 
         let (next, frame_due) = tokio::select! {
-            event = events.next() => (
-                event.transpose()?.map(|event| terminal_event(event, layout.as_ref(), &state)),
-                false
-            ),
+            event = events.next() => {
+                let event = event.transpose()?;
+                if let Some(event) = &event
+                    && matches!(event,
+                        crossterm::event::Event::Key(_)
+                        | crossterm::event::Event::Paste(_)
+                        | crossterm::event::Event::Resize(..)
+                        | crossterm::event::Event::FocusGained
+                        | crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+                            kind: crossterm::event::MouseEventKind::Down(_)
+                                | crossterm::event::MouseEventKind::Drag(_), ..
+                        }))
+                {
+                    terminal.note_input();
+                }
+                (event.map(|event| terminal_event(event, layout.as_ref(), &state)), false)
+            },
             event = rx.recv() => (event, false),
             ready = ready_rx.recv() => (
                 ready.and_then(|ready| runtime.accept_ready(ready, &state)),
@@ -173,10 +184,21 @@ pub async fn run() -> Result<(), RunError> {
             runtime.accept_event(&event, &state);
             effects.extend(update(&mut state, event));
         }
+        if frame_due {
+            terminal.update_cursor()?;
+        }
         if frame_due && state.dirty {
             terminal.terminal().draw(|frame| {
                 layout = Some(crate::view::render(frame, &state));
             })?;
+            if let Some(metrics) = layout
+                .as_ref()
+                .and_then(|plan| plan.transcript_metrics.clone())
+                && !crate::state::retain_transcript(&mut state, metrics)
+                && let Some(plan) = &mut layout
+            {
+                plan.transcript_metrics = None;
+            }
             state.dirty = false;
         }
     }

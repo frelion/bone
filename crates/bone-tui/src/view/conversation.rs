@@ -2,14 +2,14 @@ use bone_app::{ActivityKind, JobState, RuntimeState};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph, Wrap},
+    style::{Modifier, Style},
+    text::Line,
+    widgets::{Block, Padding, Paragraph, Wrap},
 };
 
 use crate::{
     layout::{LayoutMode, LayoutPlan, TranscriptMetrics},
-    state::{CommandSpec, Focus, UiState},
+    state::{CommandSpec, UiState},
     view::{
         ACCENT, ATTENTION, INK, MUTED, PANEL, composer, message, single_line_external,
         slash_palette,
@@ -18,7 +18,7 @@ use crate::{
 
 pub(super) fn render(
     frame: &mut Frame<'_>,
-    plan: &LayoutPlan,
+    plan: &mut LayoutPlan,
     state: &UiState,
     slash_matches: &[&CommandSpec],
 ) -> Option<TranscriptMetrics> {
@@ -32,12 +32,84 @@ pub(super) fn render(
         return None;
     };
     render_header(frame, header, state);
-    let metrics = render_transcript(frame, transcript, state);
+    let metrics = render_transcript(frame, transcript, state, &mut plan.hit_regions);
+    let status = state
+        .status
+        .clone()
+        .or_else(|| {
+            state
+                .selected_ui()
+                .and_then(|ui| ui.snapshot.as_ref())
+                .map(|snapshot| {
+                    if let Some(problem) = &snapshot.problem {
+                        problem_hint(problem, composer_area.width.saturating_sub(4)).into()
+                    } else if state
+                        .selected_ui()
+                        .is_some_and(|ui| ui.read_anchor.is_some())
+                    {
+                        "Reading history · PgDn for latest".into()
+                    } else {
+                        runtime_label(&snapshot.runtime).into()
+                    }
+                })
+        })
+        .unwrap_or_default();
+    let status_area = Rect::new(
+        composer_area.x + 2,
+        composer_area
+            .y
+            .saturating_sub(if plan.screen.height < 18 { 1 } else { 2 }),
+        composer_area.width.saturating_sub(4),
+        1,
+    );
+    if state.panel.is_none() {
+        frame.render_widget(
+            Paragraph::new(single_line_external(&status)).style(Style::default().fg(ACCENT)),
+            status_area,
+        );
+    }
+    if state.panel.is_none()
+        && let Some(ui) = state.selected_ui()
+        && let Some(answer) = ui.active_answer()
+    {
+        let active = ui.snapshot.as_ref().is_some_and(|snapshot| {
+            crate::state::answer::active_question(snapshot, answer.question).is_some()
+        });
+        let (label, target) = if active {
+            (
+                "Answering · back to draft",
+                crate::layout::HitTarget::LeaveAnswer,
+            )
+        } else {
+            (
+                "Question ended · keep as draft",
+                crate::layout::HitTarget::ConvertAnswer,
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(ACCENT).bg(PANEL)),
+            status_area,
+        );
+        plan.hit_regions.push(crate::layout::HitRegion {
+            area: status_area,
+            target,
+        });
+    }
     composer::render(frame, composer_area, state);
     if let Some(area) = plan.slash_palette {
-        slash_palette::render(frame, area, state, slash_matches);
+        slash_palette::render(frame, area, state, slash_matches, plan.slash_start);
     }
     metrics
+}
+
+fn problem_hint(problem: &bone_app::AppProblem, width: u16) -> &'static str {
+    match problem {
+        bone_app::AppProblem::Configuration(_) if width >= 28 => "Needs configuration · /model",
+        bone_app::AppProblem::Configuration(_) => "Configure: /model",
+        bone_app::AppProblem::LoginRequired(_) if width >= 20 => "Needs login · /model",
+        bone_app::AppProblem::LoginRequired(_) => "Login: /model",
+        _ => super::session_rail::problem_status(problem).0,
+    }
 }
 
 fn render_too_small(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
@@ -62,82 +134,114 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let (title, runtime) = state
+    let title = state
         .selected_ui()
-        .map_or(("New conversation", "Ready"), |session| {
-            let runtime = session
-                .snapshot
-                .as_ref()
-                .map(|snapshot| runtime_label(&snapshot.runtime))
-                .unwrap_or("Loading");
-            (session.info.title.as_str(), runtime)
-        });
-    let focused = state.focus == Focus::Conversation;
-    let status = state.status.as_deref().map(single_line_external);
+        .map_or("New conversation", |ui| ui.info.title.as_str());
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                single_line_external(title),
-                Style::default().fg(INK).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {}", status.as_deref().unwrap_or(runtime)),
-                Style::default().fg(MUTED),
-            ),
-        ]))
-        .style(Style::default().bg(PANEL))
-        .block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(if focused {
-                    ACCENT
-                } else {
-                    Color::Rgb(47, 54, 63)
-                }))
-                .padding(Padding::horizontal(2)),
+        Paragraph::new(single_line_external(title)).style(
+            Style::default()
+                .fg(INK)
+                .add_modifier(Modifier::BOLD)
+                .bg(PANEL),
         ),
         area,
     );
+}
+
+fn reader_selects(state: &UiState, source: crate::state::reader::ReaderSource) -> bool {
+    matches!(&state.panel, Some(crate::state::Panel::Reader(content))
+        if Some(content.session) == state.selected && content.source == source)
 }
 
 fn render_transcript(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &UiState,
+    hits: &mut Vec<crate::layout::HitRegion>,
 ) -> Option<TranscriptMetrics> {
-    let inner = Rect::new(
-        area.x.saturating_add(2),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(4),
-        area.height.saturating_sub(2),
-    );
+    let inner = Rect::new(area.x, area.y, area.width, area.height);
     let Some(session) = state.selected_ui() else {
         frame.render_widget(
             Paragraph::new("Start with a clear request.")
                 .style(Style::default().fg(MUTED))
-                .block(Block::default().padding(Padding::new(1, 1, 1, 0))),
+                .block(Block::default().padding(Padding::new(2, 2, 1, 0))),
             inner,
         );
         return None;
     };
 
     let mut rows = Vec::<Line<'static>>::new();
+    let mut links = Vec::new();
     let mut event_rows = std::collections::BTreeMap::new();
+    let mut anchors = Vec::new();
     for entry in &session.history {
-        let rendered = message::rows(&entry.event, inner.width);
+        let mut rendered = message::rows(&entry.event, inner.width);
+        if reader_selects(
+            state,
+            crate::state::reader::ReaderSource::History(entry.sequence),
+        ) {
+            for line in &mut rendered {
+                line.style = line.style.bg(super::SELECTED);
+            }
+        }
         if rendered.is_empty() {
             continue;
         }
         let mut row_count = rendered.len();
         if !rows.is_empty() {
             rows.push(Line::default());
+            anchors.push(crate::layout::ContentAnchor {
+                sequence: entry.sequence,
+                byte: 0,
+                part: crate::layout::AnchorPart::Separator,
+            });
             row_count += 1;
         }
+        let source_row = rows.len();
+        let target = match entry.event {
+            bone_app::SessionEvent::ToolFinished { .. }
+            | bone_app::SessionEvent::JobFinished { .. } => {
+                Some(crate::layout::HitTarget::History(entry.sequence))
+            }
+            bone_app::SessionEvent::QuestionAsked { question, .. }
+                if session.snapshot.as_ref().is_some_and(|snapshot| {
+                    crate::state::answer::active_question(snapshot, question).is_some()
+                }) =>
+            {
+                Some(crate::layout::HitTarget::Answer(question))
+            }
+            _ => None,
+        };
+        if let Some(target) = target {
+            links.push((source_row, target));
+        }
+        let offsets = message::row_offsets(&entry.event, inner.width);
+        anchors.extend((0..rendered.len()).map(|row| {
+            crate::layout::ContentAnchor {
+                sequence: entry.sequence,
+                part: if matches!(entry.event, bone_app::SessionEvent::InputSubmitted { .. })
+                    && row == 0
+                {
+                    crate::layout::AnchorPart::UserTop
+                } else if matches!(entry.event, bone_app::SessionEvent::InputSubmitted { .. })
+                    && row + 1 == rendered.len()
+                {
+                    crate::layout::AnchorPart::UserBottom
+                } else {
+                    crate::layout::AnchorPart::Text
+                },
+                byte: offsets
+                    .get(row)
+                    .copied()
+                    .unwrap_or_else(|| offsets.last().copied().unwrap_or(0)),
+            }
+        }));
         rows.extend(rendered);
         event_rows.insert(entry.sequence, row_count);
     }
 
     if session.scroll_from_tail == 0
+        && session.read_anchor.is_none()
         && let Some(snapshot) = &session.snapshot
     {
         let mut ephemeral = Vec::new();
@@ -147,7 +251,12 @@ fn render_transcript(
                 break;
             }
             if matches!(job.state, JobState::Running | JobState::Waiting(_)) {
-                ephemeral.push(message::compact("↳", &job.goal, ATTENTION));
+                let mut line =
+                    message::compact("›", &format!("{}  [details]", job.goal), ATTENTION);
+                if reader_selects(state, crate::state::reader::ReaderSource::Job(job.id)) {
+                    line.style = line.style.bg(super::SELECTED);
+                }
+                ephemeral.push((line, Some(crate::layout::HitTarget::Job(job.id))));
             }
         }
         for activity in snapshot.activity.iter().rev() {
@@ -170,29 +279,124 @@ fn render_transcript(
                     )
                 },
             );
-            ephemeral.push(message::compact("·", &body, MUTED));
+            ephemeral.push((message::compact("·", &body, MUTED), None));
         }
         ephemeral.reverse();
         if !ephemeral.is_empty() && !rows.is_empty() {
             rows.push(Line::default());
         }
-        rows.extend(ephemeral);
+        for (line, target) in ephemeral {
+            if let Some(target) = target {
+                links.push((rows.len(), target));
+            }
+            rows.push(line);
+        }
     }
 
+    // Snapshot-only actions also exist before history loads. They belong to the
+    // live tail and must not be inserted into the user's older reading window.
+    if session.scroll_from_tail == 0 && session.read_anchor.is_none() {
+        if let Some(snapshot) = &session.snapshot {
+            for question in crate::state::answer::active_questions(snapshot) {
+                let in_history = session.history.iter().any(|entry| {
+                    matches!(entry.event,
+                    bone_app::SessionEvent::QuestionAsked { question: id, .. } if id == question.id)
+                });
+                if !in_history {
+                    rows.extend(message::body_rows(
+                        question.text,
+                        usize::from(inner.width),
+                        ATTENTION,
+                    ));
+                }
+                links.push((rows.len(), crate::layout::HitTarget::Answer(question.id)));
+                rows.push(message::compact(
+                    "?",
+                    &format!("[answer] {}", question.text),
+                    ATTENTION,
+                ));
+            }
+            for candidate in crate::state::answer::recoverable_inputs(snapshot, &session.history) {
+                let (target, label) = match candidate {
+                    crate::state::answer::RecoveryCandidate::Retry { input } => (
+                        crate::layout::HitTarget::Retry(input),
+                        format!("Retry saved input #{}", input.0),
+                    ),
+                    crate::state::answer::RecoveryCandidate::Restore { input, .. } => (
+                        crate::layout::HitTarget::Restore(input),
+                        format!("Restore input #{} to draft", input.0),
+                    ),
+                };
+                links.push((rows.len(), target));
+                rows.push(message::compact("↳", &label, ACCENT));
+            }
+        }
+        if session
+            .submitting
+            .as_ref()
+            .is_some_and(|pending| pending.failed)
+        {
+            links.push((rows.len(), crate::layout::HitTarget::RetrySubmission));
+            rows.push(message::compact(
+                "↳",
+                "Retry original submission",
+                ATTENTION,
+            ));
+        }
+    }
     if rows.is_empty() {
         frame.render_widget(
-            Paragraph::new("Start with a clear request.").style(Style::default().fg(MUTED)),
+            Paragraph::new("  Start with a clear request.").style(Style::default().fg(MUTED)),
             inner,
         );
         return Some(TranscriptMetrics {
             total_rows: 0,
             viewport_rows: usize::from(inner.height),
             event_rows,
+            ..TranscriptMetrics::default()
         });
     }
     let viewport = usize::from(inner.height);
-    let visible = visible_rows(&rows, viewport, session.scroll_from_tail);
-    let top_padding = viewport.saturating_sub(visible.len()) as u16;
+    let start = session
+        .read_anchor
+        .and_then(|anchor| {
+            anchors
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| {
+                    candidate.sequence == anchor.sequence
+                        && candidate.part == anchor.part
+                        && candidate.byte <= anchor.byte
+                })
+                .map(|(row, _)| row)
+                .next_back()
+                .or_else(|| {
+                    anchors
+                        .iter()
+                        .position(|candidate| candidate.sequence >= anchor.sequence)
+                })
+        })
+        .unwrap_or_else(|| {
+            rows.len()
+                .saturating_sub(session.scroll_from_tail)
+                .saturating_sub(viewport)
+        });
+    let start = start.min(if session.read_anchor.is_some() {
+        rows.len().saturating_sub(1)
+    } else {
+        rows.len().saturating_sub(viewport)
+    });
+    let end = (start + viewport).min(rows.len());
+    let visible = rows[start..end].to_vec();
+    for (row, target) in links {
+        if row >= start && row < end {
+            hits.push(crate::layout::HitRegion {
+                area: Rect::new(inner.x, inner.y + (row - start) as u16, inner.width, 1),
+                target,
+            });
+        }
+    }
+    let top_padding = 0;
     frame.render_widget(
         Paragraph::new(visible),
         Rect::new(
@@ -206,9 +410,13 @@ fn render_transcript(
         total_rows: rows.len(),
         viewport_rows: viewport,
         event_rows,
+        anchors: anchors.into(),
+        start_row: start,
+        scroll_from_tail: rows.len().saturating_sub(end),
     })
 }
 
+#[cfg(test)]
 fn visible_rows(
     rows: &[Line<'static>],
     viewport: usize,
@@ -220,9 +428,9 @@ fn visible_rows(
 
 fn runtime_label(runtime: &RuntimeState) -> &'static str {
     match runtime {
-        RuntimeState::Detached => "Ready",
+        RuntimeState::Detached => "",
         RuntimeState::Starting => "Starting",
-        RuntimeState::Running { .. } => "Working",
+        RuntimeState::Running { .. } => "",
         RuntimeState::Closing { .. } => "Stopping",
     }
 }
@@ -230,6 +438,490 @@ fn runtime_label(runtime: &RuntimeState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::{
+        layout::{HitRegion, HitTarget},
+        state::{PendingSubmission, SessionUi},
+    };
+    use bone_app::{
+        HistoryEntry, InputId, InputState, InputView, JobOwner, JobRef, JobView, ModelSelection,
+        Profile, ProfileId, QuestionId, RequestId, ResolvedModel, RuntimeConfig, RuntimeId,
+        SessionEvent, SessionId, SessionInfo, SessionSeq, SessionView, WorkspaceId,
+    };
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::sync::Arc;
+
+    #[test]
+    fn configuration_and_login_hints_keep_the_next_command_visible() {
+        let configuration =
+            bone_app::AppProblem::Configuration(bone_app::ConfigProblem::NeedsModel);
+        let login = bone_app::AppProblem::LoginRequired(ProfileId::new("chatgpt").unwrap());
+        for (problem, command) in [(configuration, "/model"), (login, "/model")] {
+            for width in [18, 24, 36, 80] {
+                let label = problem_hint(&problem, width);
+                assert!(label.contains(command));
+                assert!(unicode_width::UnicodeWidthStr::width(label) <= usize::from(width));
+            }
+        }
+    }
+
+    fn fixture() -> (UiState, QuestionId) {
+        let info = SessionInfo {
+            id: SessionId::new(),
+            workspace: WorkspaceId::new(),
+            title: "test".into(),
+            archived: false,
+        };
+        let q = QuestionId {
+            runtime: RuntimeId::new(),
+            record: 1,
+            reply_to: InputId(1),
+        };
+        let model = ResolvedModel {
+            selection: ModelSelection::new(ProfileId::chatgpt(), "test").unwrap(),
+            profile: Profile::chatgpt(),
+        };
+        let snapshot = SessionView {
+            session: info.clone(),
+            runtime: RuntimeState::Running {
+                id: q.runtime,
+                config: Box::new(RuntimeConfig {
+                    coordinator: model.clone(),
+                    worker: model,
+                    limits: Default::default(),
+                    tools: Default::default(),
+                    workspace: Default::default(),
+                }),
+            },
+            draft: String::new(),
+            inputs: vec![],
+            jobs: vec![],
+            activity: vec![],
+            history_through: SessionSeq(0),
+            problem: None,
+        };
+        let mut ui = SessionUi::new(info.clone(), 1);
+        ui.snapshot = Some(Arc::new(snapshot));
+        let mut state = UiState::default();
+        state.selected = Some(info.id);
+        state.sessions.push(info.clone());
+        state.session_ui.insert(info.id, ui);
+        (state, q)
+    }
+
+    fn active_input(q: QuestionId) -> InputView {
+        InputView {
+            id: q.reply_to,
+            request_id: RequestId::new(),
+            text: "request".into(),
+            reply_to: None,
+            state: InputState::WaitingForUser {
+                runtime: q.runtime,
+                question: q,
+                text: "Which scope?".into(),
+            },
+        }
+    }
+
+    fn render_rows(state: &UiState, height: u16) -> (String, Vec<HitRegion>, TranscriptMetrics) {
+        render_width(state, 80, height)
+    }
+
+    fn render_width(
+        state: &UiState,
+        width: u16,
+        height: u16,
+    ) -> (String, Vec<HitRegion>, TranscriptMetrics) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut hits = vec![];
+        let mut metrics = None;
+        terminal
+            .draw(|frame| {
+                metrics = render_transcript(frame, frame.area(), state, &mut hits);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, hits, metrics.unwrap())
+    }
+
+    #[test]
+    fn original_byte_anchor_survives_chinese_code_reflow_and_history_growth() {
+        for kind in 0..3 {
+            let (mut state, question) = fixture();
+            let source = format!(
+                "标题\n```rust\n    {}锚{}\n```\n结束",
+                "中文变量".repeat(67),
+                "连续中文代码".repeat(120)
+            );
+            let anchor = crate::layout::ContentAnchor {
+                sequence: SessionSeq(20),
+                byte: source.find('锚').unwrap(),
+                part: crate::layout::AnchorPart::Text,
+            };
+            let event = match kind {
+                0 => SessionEvent::InputSubmitted {
+                    input: InputId(1),
+                    request_id: RequestId::new(),
+                    text: source,
+                    reply_to: None,
+                },
+                1 => SessionEvent::Reply {
+                    job: JobRef {
+                        runtime: question.runtime,
+                        id: 1,
+                    },
+                    inputs: vec![],
+                    text: source,
+                },
+                _ => SessionEvent::QuestionAsked {
+                    question,
+                    inputs: vec![],
+                    text: source,
+                },
+            };
+            let ui = state.selected_ui_mut().unwrap();
+            ui.history.push_back(HistoryEntry {
+                sequence: SessionSeq(20),
+                occurred_at: 0,
+                event,
+            });
+            ui.read_anchor = Some(anchor);
+            for width in [160, 40, 120, 80, 40, 160] {
+                let (rendered, _, metrics) = render_width(&state, width, 12);
+                assert!(
+                    rendered.lines().next().unwrap().contains('锚'),
+                    "kind={kind} width={width}: {rendered}"
+                );
+                assert_eq!(
+                    metrics.anchor_at_start(metrics.start_row).unwrap().sequence,
+                    SessionSeq(20)
+                );
+                assert_eq!(state.selected_ui().unwrap().read_anchor, Some(anchor));
+            }
+            let ui = state.selected_ui_mut().unwrap();
+            for (sequence, front) in [(10, true), (30, false)] {
+                let entry = HistoryEntry {
+                    sequence: SessionSeq(sequence),
+                    occurred_at: 0,
+                    event: SessionEvent::InputSubmitted {
+                        input: InputId(sequence),
+                        request_id: RequestId::new(),
+                        text: "other history".repeat(100),
+                        reply_to: None,
+                    },
+                };
+                if front {
+                    ui.history.push_front(entry);
+                } else {
+                    ui.history.push_back(entry);
+                }
+            }
+            let (rendered, _, _) = render_width(&state, 40, 12);
+            assert!(rendered.lines().next().unwrap().contains('锚'));
+        }
+    }
+
+    #[test]
+    fn detail_return_keeps_original_reading_position_until_explicit_tail() {
+        use crate::state::{Action, UiEvent, update};
+        let (mut state, question) = fixture();
+        let session = state.selected.unwrap();
+        let ui = state.selected_ui_mut().unwrap();
+        ui.draft = "keep my draft".into();
+        ui.history.push_back(HistoryEntry {
+            sequence: SessionSeq(1),
+            occurred_at: 0,
+            event: SessionEvent::Reply {
+                job: JobRef {
+                    runtime: question.runtime,
+                    id: 1,
+                },
+                inputs: vec![],
+                text: "长中文与代码内容\n".repeat(50),
+            },
+        });
+        ui.history.push_back(HistoryEntry {
+            sequence: SessionSeq(2),
+            occurred_at: 0,
+            event: SessionEvent::JobFinished {
+                job: JobRef {
+                    runtime: question.runtime,
+                    id: 1,
+                },
+                outcome: bone_app::OutcomeKind::Completed,
+                summary: "done".into(),
+                remaining: vec![],
+            },
+        });
+        let (_, _, metrics) = render_width(&state, 80, 12);
+        state.selected_ui_mut().unwrap().transcript_metrics = Some(Arc::new(metrics));
+        update(
+            &mut state,
+            UiEvent::Action(Action::OpenHistory(SessionSeq(2))),
+        );
+        let anchor = state.selected_ui().unwrap().read_anchor.unwrap();
+        let mut snapshot = (**state.selected_ui().unwrap().snapshot.as_ref().unwrap()).clone();
+        snapshot.history_through = SessionSeq(3);
+        update(
+            &mut state,
+            UiEvent::SessionChanged {
+                session,
+                generation: 1,
+                snapshot: Arc::new(snapshot),
+            },
+        );
+        update(
+            &mut state,
+            UiEvent::HistoryLoaded {
+                session,
+                generation: 1,
+                page: bone_app::HistoryPage {
+                    items: vec![HistoryEntry {
+                        sequence: SessionSeq(3),
+                        occurred_at: 0,
+                        event: SessionEvent::InputSubmitted {
+                            input: InputId(3),
+                            request_id: RequestId::new(),
+                            text: "new background input".into(),
+                            reply_to: None,
+                        },
+                    }],
+                    next_cursor: SessionSeq(3),
+                    has_more: false,
+                },
+            },
+        );
+        update(&mut state, UiEvent::Action(Action::Escape));
+        assert_eq!(state.selected_ui().unwrap().read_anchor, Some(anchor));
+        assert_eq!(state.selected_ui().unwrap().draft, "keep my draft");
+        let (_, _, metrics) = render_width(&state, 40, 12);
+        assert_eq!(metrics.anchor_at_start(metrics.start_row).unwrap(), anchor);
+        state.selected_ui_mut().unwrap().transcript_metrics = Some(Arc::new(metrics));
+        let effects = update(&mut state, UiEvent::Action(Action::ScrollDown(usize::MAX)));
+        assert!(state.selected_ui().unwrap().read_anchor.is_none());
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, crate::state::Effect::ReloadRecentHistory { .. }))
+        );
+    }
+
+    #[test]
+    fn user_padding_and_first_text_row_have_distinct_stable_anchors() {
+        let (mut state, _) = fixture();
+        state
+            .selected_ui_mut()
+            .unwrap()
+            .history
+            .push_back(HistoryEntry {
+                sequence: SessionSeq(1),
+                occurred_at: 0,
+                event: SessionEvent::InputSubmitted {
+                    input: InputId(1),
+                    request_id: RequestId::new(),
+                    text: "first body line\nrest".into(),
+                    reply_to: None,
+                },
+            });
+        for part in [
+            crate::layout::AnchorPart::UserTop,
+            crate::layout::AnchorPart::Text,
+        ] {
+            let anchor = crate::layout::ContentAnchor {
+                sequence: SessionSeq(1),
+                byte: 0,
+                part,
+            };
+            state.selected_ui_mut().unwrap().read_anchor = Some(anchor);
+            for width in [40, 120, 80] {
+                let (rendered, _, metrics) = render_width(&state, width, 4);
+                assert_eq!(metrics.anchor_at_start(metrics.start_row).unwrap(), anchor);
+                assert_eq!(
+                    rendered.lines().next().unwrap().contains("first body line"),
+                    part == crate::layout::AnchorPart::Text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn active_question_is_visible_and_clickable_before_history_loads() {
+        let (mut state, q) = fixture();
+        Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap())
+            .inputs
+            .push(active_input(q));
+        let (text, hits, metrics) = render_rows(&state, 8);
+        assert!(text.contains("[answer] Which scope?"));
+        assert!(!text.contains("Start with a clear request"));
+        assert!(hits.iter().any(|h| h.target == HitTarget::Answer(q)));
+        assert!(metrics.total_rows > 0);
+    }
+
+    #[test]
+    fn recovery_and_unknown_submission_are_visible_without_history() {
+        let (mut state, _) = fixture();
+        let ui = state.selected_ui_mut().unwrap();
+        Arc::make_mut(ui.snapshot.as_mut().unwrap()).inputs.extend([
+            InputView {
+                id: InputId(2),
+                request_id: RequestId::new(),
+                text: "queued".into(),
+                reply_to: None,
+                state: InputState::Queued { problem: None },
+            },
+            InputView {
+                id: InputId(3),
+                request_id: RequestId::new(),
+                text: "rejected".into(),
+                reply_to: None,
+                state: InputState::Rejected {
+                    message: "invalid".into(),
+                },
+            },
+        ]);
+        ui.submitting = Some(PendingSubmission {
+            request_id: RequestId::new(),
+            text: "unconfirmed".into(),
+            draft_revision: 0,
+            failed: true,
+            reply_to: None,
+        });
+        let (text, hits, _) = render_rows(&state, 8);
+        assert!(text.contains("Retry saved input #2"));
+        assert!(text.contains("Restore input #3 to draft"));
+        assert!(text.contains("Retry original submission"));
+        for target in [
+            HitTarget::Retry(InputId(2)),
+            HitTarget::Restore(InputId(3)),
+            HitTarget::RetrySubmission,
+        ] {
+            assert!(hits.iter().any(|h| h.target == target));
+        }
+    }
+
+    #[test]
+    fn older_history_does_not_receive_live_actions_or_jobs() {
+        let (mut state, q) = fixture();
+        let ui = state.selected_ui_mut().unwrap();
+        let snapshot = Arc::make_mut(ui.snapshot.as_mut().unwrap());
+        snapshot.inputs.push(active_input(q));
+        snapshot.inputs.push(InputView {
+            id: InputId(2),
+            request_id: RequestId::new(),
+            text: "queued".into(),
+            reply_to: None,
+            state: InputState::Queued { problem: None },
+        });
+        snapshot.jobs.push(JobView {
+            id: JobRef {
+                runtime: q.runtime,
+                id: 9,
+            },
+            owner: JobOwner::User,
+            inputs: vec![InputId(1)],
+            goal: "Live job".into(),
+            scope: String::new(),
+            done_when: String::new(),
+            state: JobState::Running,
+            report: None,
+        });
+        ui.submitting = Some(PendingSubmission {
+            request_id: RequestId::new(),
+            text: "unconfirmed".into(),
+            draft_revision: 0,
+            failed: true,
+            reply_to: None,
+        });
+        ui.history.push_back(HistoryEntry {
+            sequence: SessionSeq(1),
+            occurred_at: 0,
+            event: SessionEvent::Reply {
+                job: JobRef {
+                    runtime: q.runtime,
+                    id: 1,
+                },
+                inputs: vec![InputId(1)],
+                text: (0..30).map(|i| format!("History row {i}\n")).collect(),
+            },
+        });
+        ui.scroll_from_tail = 1;
+        let (text, hits, _) = render_rows(&state, 8);
+        assert!(!text.contains("Live job"));
+        assert!(!text.contains("[answer]"));
+        assert!(!text.contains("Retry"));
+        assert!(
+            hits.is_empty(),
+            "live action links must not move into old history"
+        );
+    }
+
+    #[test]
+    fn expired_historical_questions_have_no_answer_hit() {
+        let (mut state, q) = fixture();
+        let ui = state.selected_ui_mut().unwrap();
+        ui.history.push_back(HistoryEntry {
+            sequence: SessionSeq(1),
+            occurred_at: 0,
+            event: SessionEvent::QuestionAsked {
+                question: q,
+                inputs: vec![InputId(1)],
+                text: "Old scope question".into(),
+            },
+        });
+        let (text, hits, _) = render_rows(&state, 8);
+        assert!(text.contains("Old scope question"));
+        assert!(
+            !hits
+                .iter()
+                .any(|h| matches!(h.target, HitTarget::Answer(_)))
+        );
+        Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap())
+            .inputs
+            .push(active_input(q));
+        let (_, hits, _) = render_rows(&state, 8);
+        assert!(hits.iter().any(|h| h.target == HitTarget::Answer(q)));
+    }
+
+    #[test]
+    fn active_job_detail_hit_tracks_the_visible_job_row() {
+        let (mut state, q) = fixture();
+        let job = JobRef {
+            runtime: q.runtime,
+            id: 42,
+        };
+        Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap())
+            .jobs
+            .push(JobView {
+                id: job,
+                owner: JobOwner::User,
+                inputs: vec![InputId(1)],
+                goal: "Check draft recovery".into(),
+                scope: String::new(),
+                done_when: String::new(),
+                state: JobState::Running,
+                report: None,
+            });
+        let (text, hits, _) = render_rows(&state, 4);
+        let hit = hits
+            .iter()
+            .find(|h| h.target == HitTarget::Job(job))
+            .expect("job details hit");
+        assert!(
+            text.lines()
+                .nth(usize::from(hit.area.y))
+                .unwrap()
+                .contains("Check draft recovery")
+        );
+        assert!(hit.area.bottom() <= 4);
+    }
 
     #[test]
     fn every_row_of_a_long_message_is_reachable() {

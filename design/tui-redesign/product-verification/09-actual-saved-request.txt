@@ -1,0 +1,40 @@
+                                                                                                                                                                
+   workspace                          检查中文 é 和组合字符。 第二行保留光标。                                                                                  
+   /new  New session                                                                                                                                            
+                                                                                                                                                                
+ │ 检查中文 é 和组合字符。 第二      │  检查中文 é 和组合字符。                                                                                                 
+   Needs configuration               │  第二行保留光标。                                                                                                        
+                                                                                                                                                                
+                                    ↳ Retry saved input                                                                                                         
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                      Needs configuration                                                                                                       
+                                                                                                                                                                
+                                                                                                                                                                
+                                      › Write a request…                                                                                                        
+                                                                                                                                                                
+                                        Select model                / commands   alt+enter newline      enter save                                              
+                                                                                                                                                                
+                                                                                                                                                                

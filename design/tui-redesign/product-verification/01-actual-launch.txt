@@ -1,0 +1,40 @@
+                                                                                                                                                                
+   workspace                  New conversation                                                                                                                  
+   /new  New session                                                                                                                                            
+                                                                                                                                                                
+                             Start with a clear request.                                                                                                        
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                              › Write a request…                                                                                                                
+                                                                                                                                                                
+                                model setup needed          / commands   alt+enter newline          enter send                                                  
+                                                                                                                                                                
+                                                                                                                                                                

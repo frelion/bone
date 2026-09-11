@@ -1,0 +1,24 @@
+  Design review  Ready
+
+────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
+ /new [title]  Create a session
+ /sessions   Focus sessions
+ /rename <title>  Rename this session
+ /help   Show available commands
+ /quit   Save drafts and quit
+│
+│ /
+│
+│
+│
+│ model setup needed                shift+enter newline  enter send  / commands

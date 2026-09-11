@@ -809,9 +809,22 @@ impl App {
     pub async fn set_api_key(&self, profile: ProfileId, key: ApiKey) -> Result<()> {
         self.ensure_open()?;
         let profile = self.profile(&profile)?;
+        self.set_api_key_for_profile(profile, key).await
+    }
+
+    /// Save credentials only for the caller's observed profile and endpoint.
+    /// A later profile edit cannot redirect this key: the provider uses the
+    /// captured expected endpoint to choose its credential slot.
+    pub async fn set_api_key_for_profile(&self, expected: Profile, key: ApiKey) -> Result<()> {
+        self.ensure_open()?;
+        if self.profile(&expected.id)? != expected {
+            return Err(Error::InvalidState(
+                "profile changed before credentials were saved".into(),
+            ));
+        }
         self.inner
             .providers
-            .set_api_key(&profile, key)
+            .set_api_key(&expected, key)
             .await
             .map_err(Into::into)
     }
@@ -1129,4 +1142,32 @@ async fn await_app_task<T>(task: tokio::task::JoinHandle<Result<T>>) -> Result<T
     task.await.map_err(|error| {
         Error::InvalidState(format!("application configuration task failed: {error}"))
     })?
+}
+
+#[cfg(test)]
+mod expected_profile_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_profile_is_rejected_before_credential_work() {
+        let root = tempfile::tempdir().unwrap();
+        let app = App::open(AppOptions::new(root.path().join("data")))
+            .await
+            .unwrap();
+        // Both profiles use subscription transport, which cannot reach API-key
+        // storage even if this regression accidentally reaches the provider.
+        let expected = Profile::chatgpt();
+        app.save_profile(expected.clone()).await.unwrap();
+        let mut current = expected.clone();
+        current.label = "Changed label".into();
+        app.save_profile(current.clone()).await.unwrap();
+        let result = app
+            .set_api_key_for_profile(expected, ApiKey::new("unused-test-value".into()).unwrap())
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidState(message)) if message == "profile changed before credentials were saved")
+        );
+        assert!(app.profiles().await.unwrap().contains(&current));
+        app.shutdown().await.unwrap();
+    }
 }

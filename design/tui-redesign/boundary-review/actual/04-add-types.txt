@@ -1,0 +1,40 @@
+                               │                                                                                        │                                       
+   workspace                   │      New conversation                                                                  │                                       
+   /new  New session           │                                                                                        │                                       
+                               │      Start with a clear request.                                                       │                                       
+ ▏ · New conversation          │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │      Models / Add connection                                                           │                                       
+                               │                                                                                        │                                       
+                               │      ChatGPT subscription                                                              │                                       
+                               │      OpenAI Responses                                                                  │                                       
+                               │      OpenAI Chat Completions                                                           │                                       
+                               │      Anthropic Messages                                                                │                                       
+                               │                                                                                        │                                       
+                               │      esc back                                                                          │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │        draft survives model setup                                                      │                                       
+                               │                                                                                        │                                       
+                               │        verification-model · saved                                                      │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       
+                               │                                                                                        │                                       

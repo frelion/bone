@@ -1,0 +1,40 @@
+                                                                                                                                                                
+   first-request-workspace            这是首次请求，检查自动创建会话。                                                                                          
+   /new  New session                                                                                                                                            
+                                                                                                                                                                
+ │ 这是首次请求，检查自动创建会      │  这是首次请求，检查自动创建会话。                                                                                        
+   Needs configuration                                                                                                                                          
+                                    ↳ Retry saved input #1                                                                                                      
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                      Creating session; your input is preserved                                                                                 
+                                                                                                                                                                
+                                                                                                                                                                
+                                      › Write a request…                                                                                                        
+                                                                                                                                                                
+                                        Select model                / commands   alt+enter newline      enter save                                              
+                                                                                                                                                                
+                                                                                                                                                                

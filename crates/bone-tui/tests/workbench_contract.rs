@@ -243,8 +243,9 @@ fn composer_geometry_is_contained_by_the_center_surface() {
             Rect::new(0, 0, width, height),
             SinglePane::Conversation,
             0,
-            2,
+            &[2; 2],
             None,
+            1,
         );
         let center = plan.conversation.expect("conversation area");
         let composer = plan.composer.expect("composer area");
@@ -265,8 +266,9 @@ fn blank_space_has_no_phantom_hit_targets() {
         Rect::new(0, 0, 180, 44),
         SinglePane::Conversation,
         4,
-        4,
+        &[2; 4],
         None,
+        1,
     );
     let blank = plan.extension_blank.expect("wide layout blank extension");
     for y in blank.y..blank.bottom() {
@@ -337,4 +339,91 @@ fn contained_by(inner: Rect, outer: Rect) -> bool {
         && inner.y >= outer.y
         && inner.right() <= outer.right()
         && inner.bottom() <= outer.bottom()
+}
+
+#[test]
+fn large_drafts_preserve_history_space_and_padding() {
+    for (w, h) in [(40, 12), (80, 24), (120, 30), (160, 40)] {
+        let mut state = UiState::default();
+        state.orphan_draft = "中文草稿\n".repeat(100);
+        state.orphan_cursor = state.orphan_draft.len();
+        let (_, plan) = render(&state, w, h);
+        assert!(plan.transcript.unwrap().height >= 3);
+        assert!(plan.composer.unwrap().height <= 9);
+    }
+}
+#[test]
+fn minimum_menu_scrolls_to_selected_command_and_hits_it() {
+    let mut state = UiState::default();
+    state.orphan_draft = "/".into();
+    for index in 0..state.slash_matches().len() {
+        state.slash_selection = index;
+        let (screen, plan) = render(&state, 40, 12);
+        assert!(screen.contains(state.slash_matches()[index].name));
+        assert!(
+            plan.hit_regions
+                .iter()
+                .any(|r| r.target == HitTarget::SlashCommand(index))
+        );
+    }
+}
+#[test]
+fn submission_receipt_survives_leaving_and_reopening_its_session() {
+    let workspace = WorkspaceId::new();
+    let first = session(workspace, "first");
+    let second = session(workspace, "second");
+    let mut state = opened_state(&[first.clone(), second.clone()]);
+    update(
+        &mut state,
+        UiEvent::Action(Action::Paste("original".into())),
+    );
+    let effects = update(&mut state, UiEvent::Action(Action::Submit));
+    let (generation, request_id) = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::Submit {
+                generation, input, ..
+            } => Some((*generation, input.request_id)),
+            _ => None,
+        })
+        .unwrap();
+    update(
+        &mut state,
+        UiEvent::Action(Action::SelectSession(second.id)),
+    );
+    update(&mut state, UiEvent::Action(Action::SelectSession(first.id)));
+    update(&mut state, UiEvent::Action(Action::Focus(Focus::Composer)));
+    update(
+        &mut state,
+        UiEvent::Action(Action::Paste(" plus new edit".into())),
+    );
+    update(
+        &mut state,
+        UiEvent::Submitted {
+            session: first.id,
+            generation,
+            request_id,
+            receipt: SubmissionReceipt {
+                input: bone_app::InputId(1),
+                saved_at: bone_app::SessionSeq(1),
+            },
+        },
+    );
+    assert!(state.selected_ui().unwrap().submitting.is_none());
+    assert_eq!(state.draft(), "original plus new edit");
+    assert!(
+        update(&mut state, UiEvent::Action(Action::Submit))
+            .iter()
+            .any(|e| matches!(e, Effect::Submit { .. }))
+    );
+}
+#[test]
+fn too_small_has_no_invisible_pointer_actions() {
+    let mut state = UiState::default();
+    state.orphan_draft = "unsent text".into();
+    for (w, h) in [(39, 12), (40, 11)] {
+        let (screen, plan) = render(&state, w, h);
+        assert!(screen.contains("Window too small"));
+        assert!(plan.hit_regions.is_empty());
+    }
 }

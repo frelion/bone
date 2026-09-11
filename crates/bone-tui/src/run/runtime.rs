@@ -11,11 +11,14 @@ const HISTORY_PAGE: usize = 32;
 const DRAFT_DEBOUNCE: Duration = Duration::from_millis(250);
 
 pub(super) struct Runtime {
+    login: Option<AbortHandle>,
     app: App,
     workspace: bone_app::WorkspaceId,
     sessions: BTreeMap<SessionId, Session>,
     observers: BTreeMap<SessionId, AbortHandle>,
     draft_saves: BTreeMap<SessionId, AbortHandle>,
+    // Kept across failed or timed-out exit flushes, including late create receipts.
+    exit_draft_request: Option<CreateSessionRequest>,
     tx: mpsc::Sender<UiEvent>,
     ready_tx: mpsc::Sender<SessionReady>,
 }
@@ -44,11 +47,13 @@ impl Runtime {
         ready_tx: mpsc::Sender<SessionReady>,
     ) -> Self {
         Self {
+            login: None,
             app,
             workspace,
             sessions: BTreeMap::new(),
             observers: BTreeMap::new(),
             draft_saves: BTreeMap::new(),
+            exit_draft_request: None,
             tx,
             ready_tx,
         }
@@ -56,6 +61,193 @@ impl Runtime {
 
     pub(super) async fn apply(&mut self, effect: Effect) -> Result<bool, RunError> {
         match effect {
+            Effect::SaveConnection {
+                request,
+                session,
+                profile,
+                key,
+                selection,
+            } => {
+                let app = self.app.clone();
+                let workspace = self.workspace;
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let key = key
+                            .map(|mut key| bone_app::ApiKey::new(key.take()))
+                            .transpose()
+                            .map_err(|_| "Invalid API key; nothing was saved")?;
+                        super::models::save_connection(
+                            &app, workspace, session, profile, key, selection,
+                        )
+                        .await
+                    }
+                    .await;
+                    let _ = tx
+                        .send(UiEvent::ConnectionSaved {
+                            request,
+                            session,
+                            notice: result.as_ref().ok().copied().flatten().map(str::to_owned),
+                            error: result.err().map(str::to_owned),
+                        })
+                        .await;
+                });
+            }
+            Effect::CancelLogin => {
+                if let Some(login) = self.login.take() {
+                    login.abort();
+                }
+            }
+            Effect::Login { profile, request } => {
+                if let Some(login) = self.login.take() {
+                    login.abort();
+                }
+                let app = self.app.clone();
+                let tx = self.tx.clone();
+                self.login = Some(
+                    tokio::spawn(async move {
+                        match app.login(profile).await {
+                            Ok(attempt) => {
+                                let mut changes = attempt.observe();
+                                loop {
+                                    let state = changes.borrow_and_update().as_ref().clone();
+                                    let done = matches!(
+                                        state,
+                                        bone_app::LoginState::Succeeded
+                                            | bone_app::LoginState::Failed { .. }
+                                            | bone_app::LoginState::Cancelled
+                                    );
+                                    if tx
+                                        .send(UiEvent::LoginChanged { request, state })
+                                        .await
+                                        .is_err()
+                                        || done
+                                    {
+                                        break;
+                                    }
+                                    if changes.changed().await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = tx
+                                    .send(UiEvent::LoginChanged {
+                                        request,
+                                        state: bone_app::LoginState::Failed {
+                                            message: error.to_string(),
+                                        },
+                                    })
+                                    .await;
+                            }
+                        }
+                    })
+                    .abort_handle(),
+                );
+            }
+
+            Effect::LoadModelLabel { session, request } => {
+                let app = self.app.clone();
+                let workspace = self.workspace;
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let facts = super::models::facts(&app, workspace, session).await;
+                    let label = facts
+                        .as_ref()
+                        .and_then(|facts| facts.saved.as_ref().ok())
+                        .map(|model| model.selection.model.clone());
+                    let _ = tx
+                        .send(UiEvent::ModelLabelLoaded {
+                            session,
+                            request,
+                            label,
+                            facts,
+                        })
+                        .await;
+                });
+            }
+            Effect::LoadModels { session, request } => {
+                let app = self.app.clone();
+                let workspace = self.workspace;
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        Ok::<_, bone_app::Error>((
+                            super::models::load(&app, workspace, session).await?,
+                            super::models::profiles(&app).await?,
+                        ))
+                    }
+                    .await;
+                    let event = match result {
+                        Ok((choices, profiles)) => UiEvent::ModelsLoaded {
+                            session,
+                            request,
+                            choices,
+                            profiles,
+                        },
+                        Err(error) => UiEvent::ModelsFailed {
+                            session,
+                            request,
+                            error: error.to_string(),
+                        },
+                    };
+                    let _ = tx.send(event).await;
+                });
+            }
+            Effect::SetModel {
+                session,
+                request,
+                selection,
+            } => {
+                let app = self.app.clone();
+                let workspace = self.workspace;
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let choice = super::models::ModelChoice {
+                        selection,
+                        profile_label: String::new(),
+                    };
+                    let result = match session {
+                        Some(session) => super::models::apply(&app, session, &choice).await,
+                        None => {
+                            app.update_config(
+                                bone_app::ConfigScope::Workspace(workspace),
+                                bone_app::ConfigChange::Worker(Some(choice.selection)),
+                            )
+                            .await
+                        }
+                    };
+                    model_applied(&app, workspace, &tx, session, request, result.err()).await;
+                });
+            }
+            Effect::SetNamedModel {
+                session,
+                request,
+                profile,
+                model,
+            } => {
+                let app = self.app.clone();
+                let workspace = self.workspace;
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let choice = super::models::explicit(&app, &profile, &model).await?;
+                        match session {
+                            Some(session) => super::models::apply(&app, session, &choice).await,
+                            None => {
+                                app.update_config(
+                                    bone_app::ConfigScope::Workspace(workspace),
+                                    bone_app::ConfigChange::Worker(Some(choice.selection)),
+                                )
+                                .await
+                            }
+                        }
+                    }
+                    .await;
+                    model_applied(&app, workspace, &tx, session, request, result.err()).await;
+                });
+            }
+
             Effect::OpenSession {
                 session,
                 generation,
@@ -322,6 +514,35 @@ impl Runtime {
                     }
                 });
             }
+            Effect::RetryInput {
+                session,
+                generation,
+                input,
+            } => {
+                let handle = self.sessions.get(&session).cloned();
+                let app = self.app.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let retried = async {
+                        let handle = match handle {
+                            Some(handle) => handle,
+                            None => app.session(session).await?,
+                        };
+                        handle.retry(input).await
+                    }
+                    .await;
+                    if let Err(error) = retried {
+                        send_failure(
+                            &tx,
+                            OperationKind::RetryInput,
+                            Some(session),
+                            Some(generation),
+                            error.to_string(),
+                        )
+                        .await;
+                    }
+                });
+            }
             Effect::Stop {
                 session,
                 generation,
@@ -557,10 +778,10 @@ impl Runtime {
                 snapshot,
                 history,
             } => {
-                if !state
+                if state
                     .session_ui
                     .get(&id)
-                    .is_some_and(|ui| ui.generation == generation)
+                    .is_none_or(|ui| ui.generation != generation)
                 {
                     // A newer open for the same selected session may already be in flight.
                     // Releasing by id here would tear down that newer lease as well.
@@ -586,10 +807,20 @@ impl Runtime {
                 session,
                 info,
             } => {
-                if !state
+                if self
+                    .exit_draft_request
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == request_id)
+                {
+                    // A timed-out exit can receive the original create callback later.
+                    // Keep the orphan editor and pending identity until its save succeeds.
+                    self.sessions.insert(info.id, session);
+                    return None;
+                }
+                if state
                     .pending_create
                     .as_ref()
-                    .is_some_and(|pending| pending.request_id == request_id)
+                    .is_none_or(|pending| pending.request_id != request_id)
                 {
                     let app = self.app.clone();
                     let id = info.id;
@@ -621,11 +852,43 @@ impl Runtime {
         }
     }
 
-    pub(super) async fn flush_drafts(&mut self, state: &UiState) -> Result<(), bone_app::Error> {
+    pub(super) async fn flush_drafts(
+        &mut self,
+        state: &mut UiState,
+    ) -> Result<(), bone_app::Error> {
         for task in self.draft_saves.values() {
             task.abort();
         }
         self.draft_saves.clear();
+        let exit_request = if !state.orphan_draft.is_empty() {
+            Some(
+                self.exit_draft_request
+                    .get_or_insert_with(|| {
+                        if let Some(pending) = &mut state.pending_create {
+                            // Exiting preserves this text as a draft, never a bootstrap submission.
+                            pending.first_input = None;
+                            pending.source = crate::state::DraftSource::None;
+                            CreateSessionRequest {
+                                request_id: pending.request_id,
+                                workspace: self.workspace,
+                                title: pending.title.clone(),
+                                provisional: pending.provisional,
+                            }
+                        } else {
+                            CreateSessionRequest {
+                                request_id: bone_app::RequestId::new(),
+                                workspace: self.workspace,
+                                title: "New conversation".into(),
+                                provisional: true,
+                            }
+                        }
+                    })
+                    .clone(),
+            )
+        } else {
+            None
+        };
+
         let mut first_error = None;
         for (id, ui) in &state.session_ui {
             if ui.draft_revision > ui.saved_draft_revision {
@@ -645,10 +908,47 @@ impl Runtime {
                 }
             }
         }
-        first_error.map_or(Ok(()), Err)
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if let Some(request) = exit_request {
+            let session = self.app.create_session_idempotent(request.clone()).await?;
+            let snapshot = session.snapshot().await?;
+            session.save_draft(state.orphan_draft.clone()).await?;
+            let info = snapshot.session;
+            let ui = state
+                .session_ui
+                .entry(info.id)
+                .or_insert_with(|| crate::state::SessionUi::new(info.clone(), 0));
+            ui.draft = std::mem::take(&mut state.orphan_draft);
+            ui.draft_cursor = state.orphan_cursor;
+            ui.draft_revision = ui.draft_revision.wrapping_add(1);
+            ui.saved_draft_revision = ui.draft_revision;
+            ui.saved_draft = ui.draft.clone();
+            // Prevent an in-flight hydration from replacing this just-saved buffer.
+            ui.hydrated = true;
+            state.orphan_cursor = 0;
+            state.orphan_revision = state.orphan_revision.wrapping_add(1);
+            if state
+                .pending_create
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == request.request_id)
+            {
+                state.pending_create = None;
+            }
+            if !state.sessions.iter().any(|known| known.id == info.id) {
+                state.sessions.insert(0, info.clone());
+            }
+            self.sessions.insert(info.id, session);
+            self.exit_draft_request = None;
+        }
+        Ok(())
     }
 
-    pub(super) async fn shutdown(self) -> Result<(), bone_app::Error> {
+    pub(super) async fn shutdown(mut self) -> Result<(), bone_app::Error> {
+        if let Some(login) = self.login.take() {
+            login.abort();
+        }
         self.app.shutdown().await.map(|_| ())
     }
 }
@@ -668,4 +968,121 @@ async fn send_failure(
             message,
         })
         .await;
+}
+
+async fn model_applied(
+    app: &App,
+    workspace: bone_app::WorkspaceId,
+    tx: &mpsc::Sender<UiEvent>,
+    session: Option<SessionId>,
+    request: u64,
+    error: Option<bone_app::Error>,
+) {
+    let facts = super::models::facts(app, workspace, session).await;
+    let label = facts
+        .as_ref()
+        .and_then(|facts| facts.saved.as_ref().ok())
+        .map(|model| model.selection.model.clone());
+    let _ = tx
+        .send(UiEvent::ModelApplied {
+            session,
+            request,
+            label,
+            facts,
+            error: error.map(|error| error.to_string()),
+        })
+        .await;
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exit_saves_orphan_to_existing_create_identity_without_submitting() {
+        let root = tempfile::tempdir().unwrap();
+        let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
+            .await
+            .unwrap();
+        let workspace = app.open_workspace(root.path()).await.unwrap();
+        let request = CreateSessionRequest {
+            request_id: bone_app::RequestId::new(),
+            workspace: workspace.id,
+            title: "New conversation".into(),
+            provisional: true,
+        };
+        // Creation committed, but the UI has not yet received its acknowledgement.
+        let original = app
+            .create_session_idempotent(request.clone())
+            .await
+            .unwrap();
+        let original_id = original.snapshot().await.unwrap().session.id;
+        let (tx, _rx) = mpsc::channel(1);
+        let (ready_tx, _ready_rx) = mpsc::channel(1);
+        let mut runtime = Runtime::new(app.clone(), workspace.id, tx, ready_tx);
+        let mut state = UiState::default();
+        state.orphan_draft = "未发送的草稿\nsecond line".into();
+        state.pending_create = Some(crate::state::PendingCreate {
+            request_id: request.request_id,
+            title: request.title,
+            provisional: true,
+            first_input: None,
+            failed: true,
+            source: crate::state::DraftSource::None,
+        });
+        runtime.flush_drafts(&mut state).await.unwrap();
+        runtime.flush_drafts(&mut state).await.unwrap();
+        let sessions = app.list_sessions(workspace.id).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, original_id);
+        let saved = original.snapshot().await.unwrap();
+        assert_eq!(saved.draft, "未发送的草稿\nsecond line");
+        assert!(saved.inputs.is_empty());
+        assert!(
+            original
+                .history(bone_app::SessionSeq(0), 100)
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .all(|entry| !matches!(entry.event, bone_app::SessionEvent::InputSubmitted { .. }))
+        );
+        assert!(state.orphan_draft.is_empty());
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_exit_retains_orphan_and_request_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (ready_tx, _ready_rx) = mpsc::channel(1);
+        // An absent workspace makes App reject creation without changing the draft.
+        let mut runtime = Runtime::new(app, bone_app::WorkspaceId::new(), tx, ready_tx);
+        let mut state = UiState::default();
+        state.orphan_draft = "keep me".into();
+        assert!(runtime.flush_drafts(&mut state).await.is_err());
+        let request = runtime.exit_draft_request.clone().unwrap();
+        assert!(runtime.flush_drafts(&mut state).await.is_err());
+        assert_eq!(runtime.exit_draft_request.as_ref(), Some(&request));
+        assert_eq!(state.orphan_draft, "keep me");
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_login_observer() {
+        let root = tempfile::tempdir().unwrap();
+        let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (ready_tx, _ready_rx) = mpsc::channel(1);
+        let mut runtime = Runtime::new(app, bone_app::WorkspaceId::new(), tx, ready_tx);
+        let observer = tokio::spawn(std::future::pending::<()>());
+        runtime.login = Some(observer.abort_handle());
+        runtime.shutdown().await.unwrap();
+        assert!(observer.await.unwrap_err().is_cancelled());
+    }
 }

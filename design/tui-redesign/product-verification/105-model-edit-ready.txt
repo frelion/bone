@@ -1,0 +1,12 @@
+                                        
+      OpenAI Responses                  
+      tab fields · ctrl+u clear         
+      field                             
+      Name  > verification edited       
+      URL   > /example.invalid/v1       
+      Key   > blank: keep key unch      
+      Model > verification-model        
+                                        
+      enter save · tab next field       
+      esc back                          
+                                        

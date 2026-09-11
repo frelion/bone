@@ -1,0 +1,30 @@
+                               │                                                                                        
+   workspace                   │      New conversation                                                                  
+   /new  New session           │                                                                                        
+                               │      Start with a clear request.                                                       
+ ▏ · New conversation          │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │                                                                                        
+                               │      › draft survives model setup                                                      
+                               │                                                                                        
+                               │        verification-model · saved                                                      
+                               │        / commands   alt+enter newline                                  enter send      
+                               │                                                                                        
+                               │                                                                                        

@@ -1,0 +1,12 @@
+                                        
+      OpenAI Responses                  
+      compatible endpoint URLs          
+      must use HTTPS                    
+      Name  > Custom gateway            
+      URL   … p://example.invalid       
+      Key   > ********                  
+      Model > model-demo                
+                                        
+      enter save · tab next field       
+      esc back                          
+                                        

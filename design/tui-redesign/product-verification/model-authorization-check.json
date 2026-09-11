@@ -1,0 +1,57 @@
+[
+  {
+    "step": "slash-model",
+    "models_panel": true,
+    "subscription_form": false,
+    "authorization_panel": false,
+    "device_prompt": false,
+    "connecting": false,
+    "failed": false,
+    "exit": null,
+    "binary_sha256": "053dd2fcf0a8b82675da4555d78cfb0bf292546740e2327c6706af09928525a9"
+  },
+  {
+    "step": "subscription-form",
+    "models_panel": false,
+    "subscription_form": true,
+    "authorization_panel": false,
+    "device_prompt": false,
+    "connecting": false,
+    "failed": false,
+    "exit": null,
+    "binary_sha256": "053dd2fcf0a8b82675da4555d78cfb0bf292546740e2327c6706af09928525a9"
+  },
+  {
+    "step": "authorization",
+    "models_panel": true,
+    "subscription_form": false,
+    "authorization_panel": true,
+    "device_prompt": true,
+    "connecting": false,
+    "failed": false,
+    "exit": null,
+    "binary_sha256": "053dd2fcf0a8b82675da4555d78cfb0bf292546740e2327c6706af09928525a9"
+  },
+  {
+    "step": "cancel-authorization",
+    "models_panel": true,
+    "subscription_form": false,
+    "authorization_panel": false,
+    "device_prompt": false,
+    "connecting": false,
+    "failed": false,
+    "exit": null,
+    "binary_sha256": "053dd2fcf0a8b82675da4555d78cfb0bf292546740e2327c6706af09928525a9"
+  },
+  {
+    "step": "exit",
+    "models_panel": true,
+    "subscription_form": false,
+    "authorization_panel": false,
+    "device_prompt": false,
+    "connecting": false,
+    "failed": false,
+    "exit": 0,
+    "binary_sha256": "053dd2fcf0a8b82675da4555d78cfb0bf292546740e2327c6706af09928525a9"
+  }
+]

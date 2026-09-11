@@ -1,9 +1,14 @@
-use std::{io, panic, sync::Arc};
+use std::{
+    io, panic,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crossterm::{
-    cursor::Show,
+    cursor::{SetCursorStyle, Show},
     event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
+    style::Print,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -14,6 +19,8 @@ pub type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 pub struct TerminalGuard {
     terminal: Option<TuiTerminal>,
     previous_hook: Option<Arc<PanicHook>>,
+    cursor_active_until: Instant,
+    cursor_blinking: bool,
 }
 
 type PanicHook = dyn for<'a> Fn(&panic::PanicHookInfo<'a>) + Send + Sync + 'static;
@@ -26,7 +33,10 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            SetCursorStyle::SteadyBlock,
+            // OSC 12 sets the text cursor independently of text/selection colors.
+            Print("\x1b]12;#ff9d24\x07")
         ) {
             let _ = restore_terminal();
             return Err(error);
@@ -48,6 +58,8 @@ impl TerminalGuard {
         Ok(Self {
             terminal: Some(terminal),
             previous_hook: Some(previous_hook),
+            cursor_active_until: Instant::now() + Duration::from_millis(700),
+            cursor_blinking: false,
         })
     }
 
@@ -55,6 +67,28 @@ impl TerminalGuard {
         self.terminal
             .as_mut()
             .expect("terminal guard remains active while borrowed")
+    }
+
+    pub fn note_input(&mut self) {
+        self.cursor_active_until = Instant::now() + Duration::from_millis(700);
+    }
+
+    /// Keep the caret visible during editing; only idle input uses native blinking.
+    /// Background redraws deliberately do not restart this timer.
+    pub fn update_cursor(&mut self) -> io::Result<()> {
+        let blinking = Instant::now() >= self.cursor_active_until;
+        if blinking != self.cursor_blinking {
+            execute!(
+                io::stdout(),
+                if blinking {
+                    SetCursorStyle::BlinkingBlock
+                } else {
+                    SetCursorStyle::SteadyBlock
+                }
+            )?;
+            self.cursor_blinking = blinking;
+        }
+        Ok(())
     }
 
     pub fn suspend(&mut self) -> io::Result<()> {
@@ -92,6 +126,9 @@ fn restore_terminal() -> io::Result<()> {
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
+        SetCursorStyle::DefaultUserShape,
+        // Restore the terminal's configured cursor color (OSC 112).
+        Print("\x1b]112\x07"),
         Show
     );
     raw_result.and(screen_result)

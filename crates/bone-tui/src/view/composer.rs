@@ -1,85 +1,279 @@
-use bone_app::JobState;
+use crate::{
+    state::{Focus, UiState},
+    view::{ACCENT, INK, INPUT, MUTED, single_line_external},
+};
 use ratatui::{
     Frame,
     layout::Rect,
     style::Style,
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
-};
-use unicode_width::UnicodeWidthStr;
-
-use crate::{
-    state::{Focus, UiState},
-    view::{ACCENT, INK, MUTED, RAIL, primitives::editor_viewport, single_line_external},
+    widgets::{Block, Paragraph},
 };
 
 pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let session = state.selected_ui();
-    let (draft, cursor) = session
-        .map_or((state.orphan_draft.as_str(), state.orphan_cursor), |ui| {
-            (ui.draft.as_str(), ui.draft_cursor)
-        });
-    let focused = state.focus == Focus::Composer;
+    let draft = state.draft();
+    let cursor = state.draft_cursor();
+    let focused =
+        state.focus == Focus::Composer && state.slash_matches().is_empty() && state.panel.is_none();
+    let surface = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+    frame.render_widget(Block::default().style(Style::default().bg(INPUT)), surface);
+    let input = crate::layout::composer_text_area(area);
+    let (value, cursor_x, cursor_y) = crate::text::stable_editor_viewport(
+        draft,
+        cursor,
+        input.width,
+        input.height,
+        &state.editor().viewport,
+    );
     frame.render_widget(
-        Block::default()
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(if focused { ACCENT } else { MUTED }))
-            .style(Style::default().bg(RAIL)),
-        area,
+        Paragraph::new(if draft.is_empty() {
+            "Write a request…"
+        } else {
+            &value
+        })
+        .style(
+            Style::default()
+                .fg(if draft.is_empty() { MUTED } else { INK })
+                .bg(INPUT),
+        ),
+        input,
     );
-    let input = Rect::new(
-        area.x.saturating_add(2),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(3),
-        area.height.saturating_sub(3),
-    );
-    let (value, cursor_x, cursor_y) = editor_viewport(draft, cursor, input.width, input.height);
-    let text = if draft.is_empty() {
-        Text::styled("Type a message…", Style::default().fg(MUTED))
-    } else {
-        Text::styled(value, Style::default().fg(INK))
-    };
-    frame.render_widget(Paragraph::new(text).style(Style::default().bg(RAIL)), input);
-
-    let busy = session
-        .and_then(|ui| ui.snapshot.as_ref())
-        .is_some_and(|snapshot| {
-            snapshot
-                .jobs
-                .iter()
-                .any(|job| matches!(job.state, JobState::Running | JobState::Waiting(_)))
-        });
-    let footer = Rect::new(
-        area.x.saturating_add(2),
-        area.bottom().saturating_sub(1),
-        area.width.saturating_sub(3),
-        1,
-    );
-    let model = state
-        .model_label
-        .as_deref()
-        .map(single_line_external)
-        .unwrap_or_default();
-    let action = if busy { "esc stop" } else { "enter send" };
-    let hints = format!("shift+enter newline  {action}  / commands");
-    let spacing = usize::from(footer.width)
-        .saturating_sub(UnicodeWidthStr::width(model.as_str()))
-        .saturating_sub(UnicodeWidthStr::width(hints.as_str()));
+    if focused && let Some(selection) = state.editor().selection(cursor) {
+        for (x, y, width) in crate::text::selection_cells(
+            draft,
+            input.width,
+            input.height,
+            state.editor().viewport.get(),
+            selection,
+        ) {
+            for dx in 0..width {
+                frame.buffer_mut()[(input.x + x + dx, input.y + y)]
+                    .set_bg(super::SELECTED)
+                    .set_fg(INK);
+            }
+        }
+    }
+    let model = single_line_external(&state.model_footer());
+    let geometry = footer_areas(area, state);
+    let (action_area, action) = action(area, state);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(model, Style::default().fg(MUTED)),
-            Span::raw(" ".repeat(spacing)),
-            Span::styled("shift+enter newline  ", Style::default().fg(MUTED)),
-            Span::styled(
-                action,
-                Style::default().fg(if focused { ACCENT } else { MUTED }),
-            ),
-            Span::styled("  / commands", Style::default().fg(MUTED)),
-        ]))
-        .style(Style::default().bg(RAIL)),
-        footer,
+        Paragraph::new(model).style(Style::default().fg(MUTED).bg(INPUT)),
+        geometry.model,
     );
+    if state.panel.is_none()
+        && let Some(commands) = geometry.commands
+    {
+        frame.render_widget(
+            Paragraph::new(if commands.width >= 29 {
+                "/ commands   alt+enter newline"
+            } else {
+                "/ commands"
+            })
+            .style(Style::default().fg(MUTED)),
+            commands,
+        );
+    }
+    if state.panel.is_none() {
+        frame.render_widget(
+            Paragraph::new(action).style(Style::default().fg(if focused { ACCENT } else { MUTED })),
+            action_area,
+        );
+    }
     if focused && input.width > 0 && input.height > 0 {
         frame.set_cursor_position((input.x + cursor_x, input.y + cursor_y));
+    }
+}
+
+/// Shared by paint and pointer registration, including intermediate pane widths.
+pub(super) struct FooterAreas {
+    pub model: Rect,
+    pub commands: Option<Rect>,
+}
+
+pub(super) fn footer_areas(area: Rect, state: &UiState) -> FooterAreas {
+    let footer = Rect::new(
+        area.x + 4,
+        area.bottom().saturating_sub(1),
+        area.width.saturating_sub(6),
+        1,
+    );
+    let left_width = footer.width.saturating_sub(action(area, state).0.width + 2);
+    FooterAreas {
+        model: Rect::new(footer.x, footer.y.saturating_sub(1), footer.width, 1),
+        commands: (left_width >= 10).then(|| Rect::new(footer.x, footer.y, left_width, 1)),
+    }
+}
+
+pub(super) fn action(area: Rect, state: &UiState) -> (Rect, &'static str) {
+    let session = state.selected_ui();
+    let pending = session
+        .and_then(|ui| ui.submitting.as_ref())
+        .is_some_and(|pending| !pending.failed);
+    let answering = session.is_some_and(|ui| ui.selected_answer.is_some());
+    let label = if pending {
+        "Saving…"
+    } else if answering {
+        if session.is_some_and(|ui| {
+            ui.active_answer().is_some_and(|answer| {
+                ui.snapshot.as_ref().is_none_or(|snapshot| {
+                    crate::state::answer::active_question(snapshot, answer.question).is_none()
+                })
+            })
+        }) {
+            "answer ended"
+        } else {
+            "enter answer"
+        }
+    } else if state.model_label.is_none() && state.running_model().is_none() {
+        "enter save"
+    } else if session.is_some_and(|ui| ui.working()) {
+        "enter append"
+    } else {
+        "enter send"
+    };
+    let width = unicode_width::UnicodeWidthStr::width(label) as u16;
+    (
+        Rect::new(
+            area.right().saturating_sub(2 + width),
+            area.bottom() - 1,
+            width,
+            1,
+        ),
+        label,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::HitTarget;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn input_padding_model_and_shortcuts_have_separate_rows() {
+        for (width, height) in [(40, 12), (80, 24), (120, 30), (160, 40)] {
+            for lines in [1, 2, 20] {
+                let mut state = UiState::default();
+                state.orphan_draft = vec!["draft"; lines].join("\n");
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let plan = crate::view::render(frame, &state);
+                        let area = plan.composer.unwrap();
+                        let input = crate::layout::composer_text_area(area);
+                        let footer = footer_areas(area, &state);
+                        assert_eq!(input.y, area.y + 1);
+                        assert_eq!(footer.model.y, input.bottom() + 1);
+                        assert_eq!(action(area, &state).0.y, footer.model.y + 1);
+                        assert!(plan.transcript.unwrap().height >= 3);
+                        assert!(area.height <= 9);
+                        for y in [area.y, input.bottom()] {
+                            for x in area.x..area.right() {
+                                assert_eq!(frame.buffer_mut()[(x, y)].symbol(), " ");
+                                assert_eq!(frame.buffer_mut()[(x, y)].bg, INPUT);
+                            }
+                        }
+                        assert_eq!(
+                            frame.buffer_mut()[(footer.model.x, footer.model.y)].bg,
+                            INPUT
+                        );
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn minimum_screen_keeps_full_width_draft_visible_at_end_cursor() {
+        let mut state = UiState::default();
+        state.orphan_draft = "draft survives model setup".into();
+        state.orphan_cursor = state.orphan_draft.len();
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::view::render(frame, &state);
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("draft survives model setup"));
+    }
+
+    #[test]
+    fn inactive_composer_preserves_text_without_action_hints() {
+        let mut state = UiState::default();
+        state.orphan_draft = "preserved draft".into();
+        state.panel = Some(crate::state::Panel::Models);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| render(frame, Rect::new(0, 0, 72, 5), &state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..5)
+            .flat_map(|y| (0..72).map(move |x| (x, y)))
+            .map(|position| buffer[position].symbol())
+            .collect();
+        assert!(text.contains("preserved draft"));
+        assert!(text.contains("Select model"));
+        assert!(!text.contains("enter save"));
+        assert!(!text.contains("/ commands"));
+        assert!(!text.contains('›'));
+    }
+
+    #[test]
+    fn visible_footer_actions_share_exact_pointer_geometry_at_breakpoints() {
+        for width in [40, 60, 80, 100, 120, 140, 144, 160, 220] {
+            let mut state = UiState::default();
+            state.orphan_draft = "hello".into();
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            let mut plan = None;
+            terminal
+                .draw(|frame| {
+                    plan = Some(crate::view::render(frame, &state));
+                })
+                .unwrap();
+            let plan = plan.unwrap();
+            let area = plan.composer.unwrap();
+            let geometry = footer_areas(area, &state);
+            let buffer = terminal.backend().buffer();
+            for offset in 0.."Select model".len().min(usize::from(geometry.model.width)) {
+                assert_eq!(
+                    plan.hit(geometry.model.x + offset as u16, geometry.model.y),
+                    Some(HitTarget::Models),
+                    "width {width}"
+                );
+            }
+            if let Some(commands) = geometry.commands {
+                let painted: String = (commands.x..commands.x + 10)
+                    .map(|x| buffer[(x, commands.y)].symbol())
+                    .collect();
+                assert_eq!(painted, "/ commands");
+                for x in commands.x..commands.x + 10 {
+                    assert_eq!(
+                        plan.hit(x, commands.y),
+                        Some(HitTarget::Commands),
+                        "width {width}"
+                    );
+                }
+                assert_ne!(
+                    plan.hit(commands.x + 11, commands.y),
+                    Some(HitTarget::Commands)
+                );
+            } else {
+                assert!(
+                    !plan
+                        .hit_regions
+                        .iter()
+                        .any(|region| region.target == HitTarget::Commands),
+                    "hidden commands at width {width}"
+                );
+            }
+            let submit = action(area, &state).0;
+            assert_eq!(plan.hit(submit.x, submit.y), Some(HitTarget::Submit));
+        }
     }
 }

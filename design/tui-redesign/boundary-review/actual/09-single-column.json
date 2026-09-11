@@ -1,0 +1,14 @@
+{
+  "binary_sha256": "621cdd0b22f75c2af75f39f9b1ac4575f699d2fc9e8e3371fec703b084950b1a",
+  "screen": "                                                                                \n      New conversation                                                          \n                                                                                \n      Start with a clear request.                                               \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n      › draft survives model setup                                              \n                                                                                \n        verification-model · saved                                              \n        / commands   alt+enter newline                          enter send      \n                                                                                \n                                                                                ",
+  "cursor": [
+    34,
+    18
+  ],
+  "exit": null,
+  "dimensions": [
+    80,
+    24
+  ],
+  "cursor_hidden": false
+}

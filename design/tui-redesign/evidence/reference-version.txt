@@ -1,0 +1,4 @@
+BONE: 9870ed3
+Local OpenCode: 1.18.29
+Upstream dev reference: b3f1a96c6dd7adeb28b36dd11add1998fc84d67b
+Inspected 2026-09-10; source version may differ from installed binary.

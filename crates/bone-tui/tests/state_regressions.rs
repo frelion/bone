@@ -443,8 +443,9 @@ fn rail_viewport_keeps_selection_visible_and_footer_hits_the_rail() {
         Rect::new(0, 0, 120, 14),
         SinglePane::Conversation,
         0,
-        20,
+        &[2; 20],
         Some(17),
+        1,
     );
     assert!(plan.session_start > 0);
     assert!(
@@ -476,7 +477,8 @@ fn rail_viewport_keeps_selection_visible_and_footer_hits_the_rail() {
     state.focus = Focus::Sessions;
     update(&mut state, UiEvent::Action(Action::SelectSession(target)));
     assert_eq!(state.selected, Some(target));
-    assert_eq!(state.focus, Focus::Sessions);
+    assert_eq!(state.session_candidate, Some(target));
+    assert_eq!(state.focus, Focus::Conversation);
 }
 
 #[test]
@@ -512,7 +514,7 @@ fn session_rail_renders_draft_attention_and_recoverable_statuses() {
         .iter()
         .map(|cell| cell.symbol())
         .collect();
-    for expected in ["Draft", "Needs you", "Can resume"] {
+    for expected in ["· draft session", "Needs you", "Can resume"] {
         assert!(
             screen.contains(expected),
             "missing {expected:?} in {screen:?}"

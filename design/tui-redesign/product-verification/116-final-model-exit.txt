@@ -1,0 +1,12 @@
+                                        
+      Models                            
+      Edit connection · ChatGPT su      
+      Edit connection · API verifi      
+      + Add model / connection          
+      esc back                          
+                                        
+                                        
+      › Write a request…                
+                                        
+        Select model    enter save      
+                                        

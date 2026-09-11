@@ -1,0 +1,14 @@
+{
+  "binary_sha256": "b6690b10986c3b3a10eb3eebaff9d41a4214d5c72c228fec4544e7021f09ff6a",
+  "screen": "                                        \n      New conversation                  \n      Start with a clear request.       \n                                        \n                                        \n                                        \n                                        \n      ›                                 \n                                        \n        verification-model · saved      \n        / commands      enter send      \n                                        ",
+  "cursor": [
+    8,
+    7
+  ],
+  "exit": null,
+  "dimensions": [
+    40,
+    12
+  ],
+  "cursor_hidden": false
+}

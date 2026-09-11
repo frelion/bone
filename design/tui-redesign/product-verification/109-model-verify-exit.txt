@@ -1,0 +1,40 @@
+                                                                                                                                                                
+   workspace                          New conversation                                                                                                          
+   /new  New session                                                                                                                                            
+                                                                                                                                                                
+                                      Start with a clear request.                                                                                               
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                                                                                                                                                
+                                      Commands                                                                                                                  
+                                      /new          Create a session                                                                                            
+                                      /sessions     Focus sessions                                                                                              
+                                      /model        Choose a configured model                                                                                   
+                                      /answer       Answer the current question                                                                                 
+                                      /details      Choose a task or tool result                                                                                
+                                      /recover      Restore the latest cancelled input                                                                          
+                                      /retry        Retry the original request                                                                                  
+                                      /rename       Rename this session                                                                                         
+                                      /help         Show available commands                                                                                     
+                                      /quit         Save drafts and quit                                                                                        
+                                                                                                                                                                
+                                      esc back                                                                                                                  
+                                                                                                                                                                
+                                                                                                                                                                
+                                      › draft survives model setup                                                                                              
+                                                                                                                                                                
+                                        verification-model · saved  / commands   alt+enter newline      enter send                                              
+                                                                                                                                                                
+                                                                                                                                                                

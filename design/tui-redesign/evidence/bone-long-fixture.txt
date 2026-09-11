@@ -1,0 +1,40 @@
+                       │  Investigate draft recovery  Loading                                                           │                                       
+  SESSIONS             │                                                                                                │                                       
+                       │────────────────────────────────────────────────────────────────────────────────────────────────│                                       
+│ Investigate draft reco                                                                                                │                                       
+  Ready                │  - Preserve pending text                                                                       │                                       
+                       │  - Restore the reading position                                                                │                                       
+                       │                                                                                                │                                       
+                       │                                                                                                │                                       
+                       │  ## Finding 3                                                                                  │                                       
+                       │                                                                                                │                                       
+                       │  The draft needs to remain attached to its session.                                            │                                       
+                       │                                                                                                │                                       
+                       │  ```rust                                                                                       │                                       
+                       │  let draft = session.draft();                                                                  │                                       
+                       │  save(draft).await?;                                                                           │                                       
+                       │  ```                                                                                           │                                       
+                       │                                                                                                │                                       
+                       │  - Preserve pending text                                                                       │                                       
+                       │  - Restore the reading position                                                                │                                       
+                       │                                                                                                │                                       
+                       │                                                                                                │                                       
+                       │  ## Finding 4                                                                                  │                                       
+                       │                                                                                                │                                       
+                       │  The draft needs to remain attached to its session.                                            │                                       
+                       │                                                                                                │                                       
+                       │  ```rust                                                                                       │                                       
+                       │  let draft = session.draft();                                                                  │                                       
+                       │  save(draft).await?;                                                                           │                                       
+                       │  ```                                                                                           │                                       
+                       │                                                                                                │                                       
+                       │  - Preserve pending text                                                                       │                                       
+                       │  - Restore the reading position                                                                │                                       
+                       │                                                                                                │                                       
+                       │                                                                                                │                                       
+                       ││                                                                                               │                                       
+                       ││ Type a message…                                                                               │                                       
+                       ││                                                                                               │                                       
+                       ││                                                                                               │                                       
+                       ││                                                                                               │                                       
+  Opening workspace    ││                                                   shift+enter newline  enter send  / commands │                                       

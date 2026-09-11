@@ -1,0 +1,12 @@
+  Design review  Ready
+
+────────────────────────────────────────
+ /new [title]  Create a session
+ /sessions   Focus sessions
+ /rename <title>  Rename this session
+│
+│ /
+│
+│
+│
+│ model setup neededshift+enter newline

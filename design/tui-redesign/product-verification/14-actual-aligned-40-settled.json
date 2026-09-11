@@ -1,0 +1,13 @@
+{
+  "screen": "                                        \n      检查中文 é 和组合字符。 第二行    \n     │  检查中文 é 和组合字符。         \n     │  第二行保留光标。                \n                                        \n    ↳ Retry saved input                 \n      Needs login                       \n                                        \n      › Write a request…                \n                                        \n        gpt-5.5         enter send      \n                                        ",
+  "cursor": [
+    8,
+    8
+  ],
+  "exit": null,
+  "dimensions": [
+    40,
+    12
+  ],
+  "cursor_hidden": false
+}

@@ -1,0 +1,14 @@
+{
+  "binary_sha256": "2efb159d2880d796ece62a2569d09fc55cd61c5443ea4b4afbb031de69815e25",
+  "screen": "                                        \n      OpenAI Responses                  \n      tab fields · ctrl+u clear         \n      field                             \n      Name  > verification edited       \n      URL   > /example.invalid/v1       \n      Key   > blank: keep key unch      \n      Model > verification-model        \n                                        \n      enter save · tab next field       \n      esc back                          \n                                        ",
+  "cursor": [
+    32,
+    7
+  ],
+  "exit": null,
+  "dimensions": [
+    40,
+    12
+  ],
+  "cursor_hidden": false
+}

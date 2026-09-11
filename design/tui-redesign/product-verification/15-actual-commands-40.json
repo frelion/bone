@@ -1,0 +1,13 @@
+{
+  "screen": "                                        \n      Commands                          \n      /login                            \n      /answer                           \n      /recover                          \n      /retry                            \n      /model                            \n      /details                          \n      /new                              \n      /sessions                         \n      esc back                          \n                                        ",
+  "cursor": [
+    36,
+    10
+  ],
+  "exit": null,
+  "dimensions": [
+    40,
+    12
+  ],
+  "cursor_hidden": true
+}

@@ -1,0 +1,12 @@
+                                        
+      检查中文 é 和组合字符。 第二行    
+     │  第二行保留光标。                
+                                        
+    ↳ Retry saved input #1              
+                                        
+                                        
+      › atgpt 测试模型名称中文末尾      
+        -é                              
+                                        
+        gpt-5.5 · save  enter send      
+                                        
