@@ -6,22 +6,16 @@ use crate::{
     state::UiState,
     ui::{interaction::HitMap, theme},
 };
-use ratatui::{Frame, style::Style, widgets::Block};
+use ratatui::{Frame, widgets::Block};
 
 mod composer;
 mod connection;
 mod conversation;
 mod message;
-use crate::text as primitives;
 mod panels;
 mod right_rail;
 mod session_rail;
 mod slash_palette;
-
-pub(super) use theme::{
-    CYAN, DANGER, INFO, INK, INPUT, MUTED, PANEL, PURPLE, RAIL, SELECTED, STRUCTURE,
-    STRUCTURE_ACTIVE, SUCCESS, USER, WARNING,
-};
 
 /// Render the conversational shell and return its exact pointer hit map.
 pub fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
@@ -31,8 +25,6 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
     } else {
         Vec::new()
     };
-    // Three content rows plus one separator row, at every terminal height.
-    let session_rows = vec![4; state.sessions.len()];
     let input_width = state
         .pane_widths
         .content_width(frame.area())
@@ -42,27 +34,23 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
         .session_candidate
         .or(state.selected)
         .and_then(|id| state.sessions.iter().position(|session| session.id == id));
-    let mut plan = LayoutPlan::calculate_with_widths(
+    let plan = LayoutPlan::calculate_with_widths(
         frame.area(),
         state.single_pane(),
-        if slash_visible {
-            slash_matches.len().max(1)
-        } else {
-            0
-        },
-        &session_rows,
+        state.sessions.len(),
         selected_session,
+        state.session_scroll,
         draft_lines,
         state.pane_widths,
     );
-    if let Some(start) = state.session_scroll {
-        plan.scroll_sessions(&session_rows, start);
-    }
-    let mut hits = base_hits(&plan, state);
-    frame.render_widget(Block::default().style(theme::surface(PANEL)), plan.screen);
-    session_rail::render(frame, &plan, state);
+    let mut hits = HitMap::default();
+    frame.render_widget(
+        Block::default().style(theme::surface(theme::PANEL)),
+        plan.screen,
+    );
+    session_rail::render(frame, &plan, &mut hits, state);
     if let Some(area) = plan.extension_blank {
-        right_rail::render(frame, area, state);
+        right_rail::render(frame, area, &mut hits, state);
     }
     let transcript_metrics = conversation::render(frame, &plan, &mut hits, state, &slash_matches)
         .map(std::sync::Arc::new);
@@ -70,119 +58,12 @@ pub fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
         hits.clear();
         return FrameSnapshot::new(plan, hits, transcript_metrics, 0);
     }
-    if state.panel.is_none()
-        && !slash_visible
-        && let Some(area) = plan.composer
-    {
-        if !state.draft().trim().is_empty()
-            && state
-                .selected_ui()
-                .and_then(|ui| ui.submitting.as_ref())
-                .is_none_or(|pending| pending.failed)
-        {
-            hits.push(HitRegion {
-                area: composer::action(area, state).0,
-                target: HitTarget::Submit,
-            });
-        }
-        if state.focus == crate::state::Focus::Composer
-            && state
-                .selected_ui()
-                .is_some_and(|ui| ui.working() && ui.selected_answer.is_none())
-        {
-            let label = if state
-                .selected_ui()
-                .and_then(|ui| ui.snapshot.as_ref())
-                .is_some_and(|snapshot| {
-                    snapshot
-                        .inputs
-                        .iter()
-                        .any(|input| matches!(input.state, bone_app::InputState::Queued { .. }))
-                }) {
-                "esc stop all"
-            } else {
-                "esc stop"
-            };
-            let stop_width = label.len() as u16;
-            let stop = ratatui::layout::Rect::new(
-                area.right().saturating_sub(stop_width + 2),
-                area.y
-                    .saturating_sub(if plan.screen.height < 18 { 1 } else { 2 }),
-                stop_width.min(area.width),
-                1,
-            );
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new(label).style(Style::default().fg(MUTED).bg(PANEL)),
-                stop,
-            );
-            hits.push(HitRegion {
-                area: stop,
-                target: HitTarget::Stop,
-            });
-        }
-    }
-    if let Some(area) = plan.composer {
-        let footer = composer::footer_areas(area, state);
-        hits.push(HitRegion {
-            area: footer.model,
-            target: HitTarget::Models,
-        });
-        if let Some(commands) = footer.commands {
-            hits.push(HitRegion {
-                area: ratatui::layout::Rect::new(commands.x, commands.y, 10, 1),
-                target: HitTarget::StartSlashCommand,
-            });
-        }
-    }
     let mut reader_max_scroll = 0;
     panels::render(frame, &plan, &mut hits, &mut reader_max_scroll, state);
     // Overlays own the pointer scope. Pane boundaries remain visible behind a
     // panel, but they cannot be grabbed until the panel has closed.
     render_dividers(frame, &plan, &mut hits, state, state.panel.is_none());
     FrameSnapshot::new(plan, hits, transcript_metrics, reader_max_scroll)
-}
-
-fn base_hits(plan: &LayoutPlan, state: &UiState) -> HitMap {
-    let mut hits = HitMap::default();
-    if let Some(area) = plan.session_rail {
-        hits.push(HitRegion {
-            area,
-            target: HitTarget::SessionRail,
-        });
-        for row in &plan.session_rows {
-            if let Some(session) = state.sessions.get(row.index) {
-                hits.push(HitRegion {
-                    area: row.area,
-                    target: HitTarget::Session(session.id),
-                });
-            }
-        }
-    }
-    if let Some(area) = plan.transcript {
-        hits.push(HitRegion {
-            area,
-            target: HitTarget::Conversation,
-        });
-    }
-    if let Some(area) = plan.session_header {
-        hits.push(HitRegion {
-            area,
-            target: HitTarget::SessionTitle,
-        });
-    }
-    if let Some(area) = plan.composer {
-        hits.push(HitRegion {
-            area,
-            target: HitTarget::Composer,
-        });
-    }
-    if let Some(area) = plan.extension_blank {
-        hits.push(HitRegion {
-            area,
-            target: HitTarget::RightRail,
-        });
-    }
-    hits
 }
 
 fn render_dividers(
@@ -212,9 +93,9 @@ fn render_dividers(
             });
         }
         let color = if interactive && state.dragging_divider == Some(divider) {
-            STRUCTURE_ACTIVE
+            theme::STRUCTURE_ACTIVE
         } else {
-            STRUCTURE
+            theme::STRUCTURE
         };
         for y in plan.screen.y..plan.screen.bottom() {
             frame.buffer_mut()[(x, y)]
@@ -266,12 +147,12 @@ mod region_tests {
                 );
                 for x in 0..width {
                     let cell = &buffer[(x, 0)];
-                    assert_eq!(cell.bg == STRUCTURE, boundaries.contains(&x));
+                    assert_eq!(cell.bg == theme::STRUCTURE, boundaries.contains(&x));
                 }
                 for x in &boundaries {
                     for y in 0..40 {
                         assert_eq!(buffer[(*x, y)].symbol(), " ");
-                        assert_eq!(buffer[(*x, y)].bg, STRUCTURE);
+                        assert_eq!(buffer[(*x, y)].bg, theme::STRUCTURE);
                     }
                 }
             }
@@ -301,7 +182,7 @@ mod region_tests {
                 )
         }));
         for y in 0..40 {
-            assert_eq!(terminal.backend().buffer()[(31, y)].bg, STRUCTURE);
+            assert_eq!(terminal.backend().buffer()[(31, y)].bg, theme::STRUCTURE);
         }
     }
 
@@ -314,7 +195,7 @@ mod region_tests {
 
         for y in 0..40 {
             let cell = &terminal.backend().buffer()[(31, y)];
-            assert_eq!(cell.bg, STRUCTURE_ACTIVE);
+            assert_eq!(cell.bg, theme::STRUCTURE_ACTIVE);
             assert_ne!(cell.bg, theme::FOCUS_MARK);
         }
     }

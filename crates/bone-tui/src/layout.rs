@@ -8,6 +8,7 @@ pub use crate::ui::interaction::{HitRegion, HitTarget};
 const SESSION_RAIL_WIDTH: u16 = 32;
 const EXTENSION_WIDTH: u16 = 40;
 const CONTENT_INSET: u16 = 4;
+const SESSION_ROW_HEIGHT: u16 = 4;
 
 const MIN_SIDE_WIDTH: u16 = 24;
 const MIN_CENTER_WIDTH: u16 = 56;
@@ -203,11 +204,8 @@ impl From<Vec<ContentAnchor>> for AnchorRows {
     }
 }
 impl AnchorRows {
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.len
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
     pub fn get(&self, row: usize) -> Option<ContentAnchor> {
         let index = self
@@ -312,7 +310,6 @@ pub struct LayoutPlan {
     pub session_header: Option<Rect>,
     pub transcript: Option<Rect>,
     pub composer: Option<Rect>,
-    pub slash_palette: Option<Rect>,
 }
 
 /// Vertical rhythm shared by floating menus. Comfortable terminals give each
@@ -356,7 +353,7 @@ impl LayoutPlan {
     pub fn calculate(
         screen: Rect,
         single_pane: SinglePane,
-        slash_items: usize,
+        _slash_items: usize,
         session_rows: &[u16],
         selected_session: Option<usize>,
         draft_lines: u16,
@@ -364,9 +361,9 @@ impl LayoutPlan {
         Self::calculate_with_widths(
             screen,
             single_pane,
-            slash_items,
-            session_rows,
+            session_rows.len(),
             selected_session,
+            None,
             draft_lines,
             PaneWidths::default(),
         )
@@ -375,9 +372,9 @@ impl LayoutPlan {
     pub fn calculate_with_widths(
         screen: Rect,
         single_pane: SinglePane,
-        slash_items: usize,
-        session_rows: &[u16],
+        session_count: usize,
         selected_session: Option<usize>,
+        requested_session_start: Option<usize>,
         draft_lines: u16,
         widths: PaneWidths,
     ) -> Self {
@@ -417,8 +414,8 @@ impl LayoutPlan {
                 SinglePane::Conversation => (None, Some(screen), None),
             },
         };
-        let (session_header, transcript, composer, slash_palette) =
-            conversation.map_or((None, None, None, None), |area| {
+        let (session_header, transcript, composer) =
+            conversation.map_or((None, None, None), |area| {
                 let inset = CONTENT_INSET;
                 let width = area.width.saturating_sub(CONTENT_INSET * 2);
                 let x = area.x + inset;
@@ -451,59 +448,17 @@ impl LayoutPlan {
                     width,
                     composer.y.saturating_sub(area.y + top + status_gap),
                 );
-                let palette = (slash_items > 0).then(|| {
-                    let stride = floating_menu_stride(screen);
-                    attached_floating_panel_area(
-                        screen,
-                        composer,
-                        (slash_items as u16)
-                            .saturating_mul(stride)
-                            .saturating_add(3),
-                    )
-                });
-                (Some(header), Some(transcript), Some(composer), palette)
+                (Some(header), Some(transcript), Some(composer))
             });
-        let mut visible_session_rows = Vec::new();
-        let mut session_start = 0;
-        let mut session_max_start = 0;
-        if let Some(area) = session_rail {
-            let first_y = session_list_top(area);
-            let list_bottom = area.bottom().saturating_sub(2);
-            let available = list_bottom.saturating_sub(first_y);
-            session_max_start = session_rows.len().saturating_sub(1);
-            let mut tail_height = session_rows.last().copied().unwrap_or(0);
-            while session_max_start > 0
-                && tail_height.saturating_add(session_rows[session_max_start - 1]) <= available
-            {
-                session_max_start -= 1;
-                tail_height += session_rows[session_max_start];
-            }
-            let selected = selected_session
-                .unwrap_or(0)
-                .min(session_rows.len().saturating_sub(1));
-            let mut used = session_rows.get(selected).copied().unwrap_or(0);
-            session_start = selected;
-            while session_start > 0 && used + session_rows[session_start - 1] <= available {
-                session_start -= 1;
-                used += session_rows[session_start];
-            }
-            let mut y = first_y;
-            for (index, &height) in session_rows.iter().enumerate().skip(session_start) {
-                if y + height > list_bottom {
-                    break;
-                }
-                visible_session_rows.push(SessionRow {
-                    index,
-                    area: Rect::new(
-                        area.x + 1,
-                        y,
-                        area.width.saturating_sub(3),
-                        height.saturating_sub(1),
-                    ),
-                });
-                y += height;
-            }
-        }
+        let (session_start, session_max_start, visible_session_rows) =
+            session_rail.map_or((0, 0, Vec::new()), |area| {
+                session_window(
+                    area,
+                    session_count,
+                    selected_session,
+                    requested_session_start,
+                )
+            });
         Self {
             mode,
             screen,
@@ -516,39 +471,39 @@ impl LayoutPlan {
             session_header,
             transcript,
             composer,
-            slash_palette,
         }
     }
+}
 
-    /// Manual list scrolling does not change the current conversation or candidate.
-    pub fn scroll_sessions(&mut self, rows: &[u16], start: usize) {
-        let Some(area) = self.session_rail else {
-            return;
-        };
-        self.session_start = start.min(self.session_max_start);
-        self.session_rows.clear();
-        let mut y = session_list_top(area);
-        let bottom = area.bottom().saturating_sub(2);
-        for (index, &height) in rows.iter().enumerate().skip(self.session_start) {
-            if y.saturating_add(height) > bottom {
-                break;
-            }
-            self.session_rows.push(SessionRow {
-                index,
-                area: Rect::new(
-                    area.x + 1,
-                    y,
-                    area.width.saturating_sub(3),
-                    height.saturating_sub(1),
-                ),
-            });
-            y += height;
-        }
-    }
-
-    pub fn content_width(screen: Rect) -> u16 {
-        PaneWidths::default().content_width(screen)
-    }
+fn session_window(
+    area: Rect,
+    session_count: usize,
+    selected_session: Option<usize>,
+    requested_start: Option<usize>,
+) -> (usize, usize, Vec<SessionRow>) {
+    let first_y = session_list_top(area);
+    let bottom = area.bottom().saturating_sub(2);
+    let capacity = usize::from(bottom.saturating_sub(first_y) / SESSION_ROW_HEIGHT);
+    let max_start = session_count.saturating_sub(capacity.max(1));
+    let selected = selected_session
+        .unwrap_or(0)
+        .min(session_count.saturating_sub(1));
+    let selected_start = selected.saturating_sub(capacity.saturating_sub(1));
+    let start = requested_start.unwrap_or(selected_start).min(max_start);
+    let rows = (start..session_count)
+        .take(capacity)
+        .enumerate()
+        .map(|(offset, index)| SessionRow {
+            index,
+            area: Rect::new(
+                area.x + 1,
+                first_y + offset as u16 * SESSION_ROW_HEIGHT,
+                area.width.saturating_sub(3),
+                SESSION_ROW_HEIGHT - 1,
+            ),
+        })
+        .collect();
+    (start, max_start, rows)
 }
 
 pub(crate) fn right_rail_available(width: u16, height: u16) -> bool {
@@ -650,25 +605,6 @@ mod tests {
     }
 
     #[test]
-    fn slash_panel_uses_floating_panel_geometry_without_covering_the_composer() {
-        for (width, height) in [(40, 12), (80, 24), (100, 24), (160, 40)] {
-            let plan = LayoutPlan::calculate(
-                Rect::new(0, 0, width, height),
-                SinglePane::Conversation,
-                10,
-                &[],
-                None,
-                1,
-            );
-            let composer = plan.composer.unwrap();
-            let palette = plan.slash_palette.unwrap();
-            assert_eq!((palette.x, palette.width), (composer.x, composer.width));
-            assert!(palette.bottom() < composer.y);
-            assert!(palette.y > plan.screen.y);
-        }
-    }
-
-    #[test]
     fn blank_extension_has_no_session_geometry() {
         let plan = LayoutPlan::calculate(
             Rect::new(0, 0, 180, 40),
@@ -688,27 +624,34 @@ mod session_scroll_tests {
     use super::*;
     #[test]
     fn manual_scroll_updates_visible_rows_and_clamps_to_last_full_page() {
-        let rows = vec![2; 20];
-        let mut plan = LayoutPlan::calculate(
+        let plan = LayoutPlan::calculate_with_widths(
             Rect::new(0, 0, 80, 20),
             SinglePane::Sessions,
-            0,
-            &rows,
+            20,
             Some(0),
+            Some(3),
             1,
+            PaneWidths::default(),
         );
-        plan.scroll_sessions(&rows, 3);
         assert_eq!(plan.session_start, 3);
         assert_eq!(
             plan.session_rows.first(),
             Some(&SessionRow {
                 index: 3,
-                area: Rect::new(1, 3, 77, 1),
+                area: Rect::new(1, 3, 77, 3),
             })
         );
-        plan.scroll_sessions(&rows, usize::MAX);
-        assert_eq!(plan.session_start, 13);
+        let plan = LayoutPlan::calculate_with_widths(
+            Rect::new(0, 0, 80, 20),
+            SinglePane::Sessions,
+            20,
+            Some(0),
+            Some(usize::MAX),
+            1,
+            PaneWidths::default(),
+        );
+        assert_eq!(plan.session_start, 17);
         assert_eq!(plan.session_rows.last().map(|row| row.index), Some(19));
-        assert_eq!(plan.session_rows.last().map(|row| row.area.y), Some(15));
+        assert_eq!(plan.session_rows.last().map(|row| row.area.y), Some(11));
     }
 }

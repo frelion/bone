@@ -1,8 +1,12 @@
 use crate::{
-    layout::LayoutPlan,
-    state::{SessionStatus, UiState},
-    ui::{focus, theme},
-    view::{DANGER, INK, MUTED, RAIL, SELECTED, single_line_external},
+    layout::{HitRegion, HitTarget, LayoutPlan},
+    state::{Focus, SessionStatus, UiState},
+    ui::{
+        focus,
+        interaction::HitMap,
+        theme::{self, DANGER, INK, MUTED, RAIL, SELECTED},
+    },
+    view::single_line_external,
 };
 use bone_app::{InputState, RuntimeState};
 use ratatui::{
@@ -15,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // Status is deliberately a compact semantic dot in the fixed three-line row;
 // it must never displace the reply preview or message/time metadata.
-pub(super) fn status(state: &UiState, index: usize) -> Option<(&'static str, Color)> {
+pub(super) fn status_tone(state: &UiState, index: usize) -> Option<Color> {
     let info = &state.sessions[index];
     if let Some(snapshot) = state
         .session_ui
@@ -23,23 +27,23 @@ pub(super) fn status(state: &UiState, index: usize) -> Option<(&'static str, Col
         .and_then(|ui| ui.snapshot.as_ref())
     {
         if let Some(problem) = &snapshot.problem {
-            return Some(problem_status(problem));
+            return Some(problem_status(problem).1);
         }
         for input in snapshot.inputs.iter().rev() {
             match input.state {
                 InputState::WaitingForUser { .. } => {
-                    return Some(("Needs your answer", theme::WARNING));
+                    return Some(theme::WARNING);
                 }
                 InputState::RoutingFailed { .. } | InputState::Rejected { .. } => {
-                    return Some(("Failed", DANGER));
+                    return Some(DANGER);
                 }
                 _ => {}
             }
         }
         match snapshot.runtime {
             RuntimeState::Running { .. } => {}
-            RuntimeState::Starting => return Some(("Starting", theme::INFO)),
-            RuntimeState::Closing { .. } => return Some(("Stopping", MUTED)),
+            RuntimeState::Starting => return Some(theme::INFO),
+            RuntimeState::Closing { .. } => return Some(MUTED),
             RuntimeState::Detached => {}
         }
     }
@@ -48,21 +52,25 @@ pub(super) fn status(state: &UiState, index: usize) -> Option<(&'static str, Col
         .get(&info.id)
         .is_some_and(|ui| ui.working())
     {
-        return (state.selected != Some(info.id)).then_some(("Working", theme::INFO));
+        return (state.selected != Some(info.id)).then_some(theme::INFO);
     }
     match state.session_statuses.get(&info.id) {
-        Some(SessionStatus::NeedsAttention) => Some(("Needs you", theme::WARNING)),
-        Some(SessionStatus::Recoverable) => Some(("Can resume", theme::INFO)),
+        Some(SessionStatus::NeedsAttention) => Some(theme::WARNING),
+        Some(SessionStatus::Recoverable) => Some(theme::INFO),
         _ => None,
     }
 }
 
-pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, state: &UiState) {
+pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap, state: &UiState) {
     let Some(area) = plan.session_rail else {
         return;
     };
+    hits.push(HitRegion {
+        area,
+        target: HitTarget::SessionRail,
+    });
     frame.render_widget(Block::default().style(theme::surface(RAIL)), area);
-    let active = focus::is_active(state, focus::Region::Sessions);
+    let active = focus::workspace_focused(state, Focus::Sessions);
     let project = state
         .workspace
         .as_ref()
@@ -88,6 +96,12 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, state: &UiState) 
         .map_or(0, |duration| duration.as_millis() as i64);
     for row in &plan.session_rows {
         render_session_row(frame, plan, state, row.index, row.area, active, now);
+        if let Some(session) = state.sessions.get(row.index) {
+            hits.push(HitRegion {
+                area: row.area,
+                target: HitTarget::Session(session.id),
+            });
+        }
     }
 
     if active {
@@ -184,9 +198,7 @@ fn render_session_row(
         },
         |ui| !ui.draft.is_empty(),
     );
-    let tone = status(state, index)
-        .map(|(_, tone)| tone)
-        .or(draft.then_some(MUTED));
+    let tone = status_tone(state, index).or(draft.then_some(MUTED));
     if let Some(tone) = tone
         && area.width > 1
         && area.height > 0
@@ -330,7 +342,9 @@ mod tests {
     fn rows_are_three_lines_with_dividers_and_distinct_identity_and_selection() {
         let (state, plan) = fixture();
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        terminal.draw(|frame| render(frame, &plan, &state)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &plan, &mut HitMap::default(), &state))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let current = plan.session_rows.iter().find(|row| row.index == 0).unwrap();
         let candidate = plan.session_rows.iter().find(|row| row.index == 1).unwrap();
@@ -386,7 +400,9 @@ mod tests {
             .unwrap()
             .projection_pending = true;
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        terminal.draw(|frame| render(frame, &plan, &state)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &plan, &mut HitMap::default(), &state))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let row = plan.session_rows.iter().find(|row| row.index == 1).unwrap();
         let text: String = (row.area.y..row.area.bottom())
@@ -414,7 +430,9 @@ mod tests {
             1,
         );
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        terminal.draw(|frame| render(frame, &plan, &state)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &plan, &mut HitMap::default(), &state))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let header = (plan.session_rail.unwrap().x + 3, 1);
         let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();

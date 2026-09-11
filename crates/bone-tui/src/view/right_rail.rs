@@ -1,7 +1,11 @@
 use crate::{
-    state::UiState,
-    ui::{focus, theme},
-    view::{INK, MUTED, RAIL, SELECTED},
+    layout::{HitRegion, HitTarget},
+    state::{Focus, UiState},
+    ui::{
+        focus,
+        interaction::HitMap,
+        theme::{self, INK, MUTED, RAIL, SELECTED},
+    },
 };
 use ratatui::{
     Frame,
@@ -9,8 +13,12 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let active = focus::is_active(state, focus::Region::RightRail);
+pub(super) fn render(frame: &mut Frame<'_>, area: Rect, hits: &mut HitMap, state: &UiState) {
+    hits.push(HitRegion {
+        area,
+        target: HitTarget::RightRail,
+    });
+    let active = focus::workspace_focused(state, Focus::RightRail);
     let surface = if active { theme::FOCUS_SURFACE } else { RAIL };
     frame.render_widget(Block::default().style(theme::surface(surface)), area);
 
@@ -57,7 +65,14 @@ mod tests {
         state.focus = crate::state::Focus::RightRail;
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal
-            .draw(|frame| render(frame, Rect::new(0, 0, 40, 12), &state))
+            .draw(|frame| {
+                render(
+                    frame,
+                    Rect::new(0, 0, 40, 12),
+                    &mut HitMap::default(),
+                    &state,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(3, 1)].bg, SELECTED);

@@ -1,4 +1,7 @@
-use crate::ui::theme;
+use crate::{
+    text::wrap_text,
+    ui::theme::{self, CODE_LABEL, DANGER, INK, MUTED, SUCCESS, USER, WARNING},
+};
 use bone_app::SessionEvent;
 use ratatui::{
     style::{Color, Style},
@@ -6,8 +9,6 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-
-use super::{CYAN, DANGER, INK, MUTED, PURPLE, SUCCESS, USER, WARNING, primitives::wrap_text};
 
 pub(super) fn rows(event: &SessionEvent, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
@@ -239,7 +240,7 @@ fn reply_rows(value: &str, width: usize) -> Vec<Line<'static>> {
                 if !language.is_empty() {
                     rows.push(Line::styled(
                         format!("  {language}"),
-                        Style::default().fg(PURPLE),
+                        Style::default().fg(CODE_LABEL),
                     ));
                 }
             }
@@ -247,7 +248,7 @@ fn reply_rows(value: &str, width: usize) -> Vec<Line<'static>> {
         }
         let heading = !code && source.starts_with("# ");
         for text in wrap_text(source, width.saturating_sub(4)) {
-            let tone = if code { CYAN } else { INK };
+            let tone = if code { theme::INFO } else { INK };
             rows.push(Line::styled(
                 format!("  {text}"),
                 if heading {

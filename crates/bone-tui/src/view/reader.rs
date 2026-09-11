@@ -1,11 +1,8 @@
-//! Pure reader rendering, shared by the right rail and narrow view.
+//! Pure reader panel rendering.
 //!
 //! The caller owns selection, loading, focus and scroll. This module performs no
 //! App calls and never interprets tool text as a status or a command.
-use crate::{
-    state::reader::ReaderContent,
-    ui::{focus, theme},
-};
+use crate::{state::reader::ReaderContent, ui::theme};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -14,14 +11,11 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use super::{INK, MUTED, RAIL};
+const TITLE_INSET: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ReaderMetrics {
-    /// Scroll offsets count wrapped terminal rows, not bytes or source lines.
-    pub scroll: usize,
     pub max_scroll: usize,
-    pub total_rows: usize,
     pub body: Rect,
     /// The caller can register a pointer target for returning to the source.
     pub back: Rect,
@@ -35,12 +29,14 @@ pub(crate) fn render(
     content: &ReaderContent,
     snapshot: Option<&bone_app::SessionView>,
     scroll: usize,
-    focused: bool,
 ) -> ReaderMetrics {
     if area.is_empty() {
         return ReaderMetrics::default();
     }
-    frame.render_widget(Block::default().style(Style::default().bg(RAIL)), area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme::RAIL)),
+        area,
+    );
     let padding = u16::from(area.width >= 8) * 3;
     let inner = Rect::new(
         area.x + padding,
@@ -52,14 +48,14 @@ pub(crate) fn render(
     if inner.height > 1 {
         let title = super::single_line_external(&content.title);
         let title_row = Rect::new(inner.x, inner.y, inner.width, 1);
-        let title_background = if focused { theme::SELECTED } else { RAIL };
+        let title_background = theme::SELECTED;
         frame.render_widget(
             Block::default().style(theme::surface(title_background)),
             title_row,
         );
-        let gutter_width = focus::GUTTER_WIDTH.min(title_row.width);
+        let gutter_width = TITLE_INSET.min(title_row.width);
         frame.render_widget(
-            Paragraph::new(title).style(theme::label_on(INK, title_background)),
+            Paragraph::new(title).style(theme::label_on(theme::INK, title_background)),
             Rect::new(
                 title_row.x + gutter_width,
                 title_row.y,
@@ -119,7 +115,7 @@ pub(crate) fn render(
         }
     }
     frame.render_widget(
-        Paragraph::new(visible).style(Style::default().fg(INK)),
+        Paragraph::new(visible).style(Style::default().fg(theme::INK)),
         body,
     );
     let footer = if inner.width >= 30 && max_scroll > 0 {
@@ -133,13 +129,11 @@ pub(crate) fn render(
         "esc back".to_owned()
     };
     frame.render_widget(
-        Paragraph::new(footer).style(Style::default().fg(MUTED)),
+        Paragraph::new(footer).style(Style::default().fg(theme::MUTED)),
         back,
     );
     ReaderMetrics {
-        scroll,
         max_scroll,
-        total_rows,
         body,
         back,
     }
@@ -189,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_focus_uses_a_neutral_surface_without_moving_its_title() {
+    fn reader_title_uses_a_neutral_surface_without_orange() {
         let content = ReaderContent {
             layout_cache: Default::default(),
             session: SessionId::new(),
@@ -197,37 +191,16 @@ mod tests {
             title: "Reader title".into(),
             text: "body".into(),
         };
-        let render = |focused| {
-            let mut terminal = Terminal::new(TestBackend::new(48, 12)).unwrap();
-            terminal
-                .draw(|frame| {
-                    super::render(frame, frame.area(), &content, None, 0, focused);
-                })
-                .unwrap();
-            terminal
-        };
-        let active = render(true);
-        let inactive = render(false);
+        let mut active = Terminal::new(TestBackend::new(48, 12)).unwrap();
+        active
+            .draw(|frame| {
+                super::render(frame, frame.area(), &content, None, 0);
+            })
+            .unwrap();
         let active_buffer = active.backend().buffer();
-        let inactive_buffer = inactive.backend().buffer();
         let active_title = find_text(active_buffer, "Reader title").expect("active title");
-        let inactive_title = find_text(inactive_buffer, "Reader title").expect("inactive title");
-
-        assert_eq!(active_title, inactive_title);
-        assert_eq!(
-            active_buffer
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>(),
-            inactive_buffer
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-        );
         let (title_x, title_y) = active_title;
-        let mark_x = title_x - focus::GUTTER_WIDTH;
+        let mark_x = title_x - TITLE_INSET;
         let active_mark = &active_buffer[(mark_x, title_y)];
         assert_eq!(active_mark.symbol(), " ");
         assert_eq!(active_mark.bg, theme::SELECTED);
@@ -239,9 +212,7 @@ mod tests {
         );
         assert_eq!(active_buffer[(mark_x + 1, title_y)].bg, theme::SELECTED);
         assert_eq!(active_buffer[(title_x, title_y)].bg, theme::SELECTED);
-        assert_eq!(inactive_buffer[(mark_x, title_y)].bg, RAIL);
-        assert_eq!(inactive_buffer[(title_x, title_y)].bg, RAIL);
-        assert_eq!(active_buffer[(title_x, title_y)].fg, INK);
+        assert_eq!(active_buffer[(title_x, title_y)].fg, theme::INK);
         assert!(
             active_buffer[(title_x, title_y)]
                 .modifier
@@ -251,7 +222,6 @@ mod tests {
             active_buffer
                 .content()
                 .iter()
-                .chain(inactive_buffer.content())
                 .all(|cell| cell.fg != theme::FOCUS_MARK && cell.bg != theme::FOCUS_MARK)
         );
     }
@@ -300,17 +270,13 @@ mod tests {
         let mut metrics = ReaderMetrics::default();
         terminal
             .draw(|frame| {
-                metrics = render(
-                    frame,
-                    frame.area(),
-                    &content,
-                    Some(&snapshot),
-                    usize::MAX,
-                    true,
-                )
+                metrics = render(frame, frame.area(), &content, Some(&snapshot), usize::MAX)
             })
             .unwrap();
-        assert_eq!(metrics.total_rows, cached.len() + 2 + 1_000_000);
+        assert_eq!(
+            metrics.max_scroll,
+            (cached.len() + 2 + 1_000_000).saturating_sub(usize::from(metrics.body.height))
+        );
         let visible: String = terminal
             .backend()
             .buffer()
@@ -325,17 +291,13 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&cached, &content.wrapped_rows(74)));
         terminal
             .draw(|frame| {
-                metrics = render(
-                    frame,
-                    frame.area(),
-                    &content,
-                    Some(&snapshot),
-                    usize::MAX,
-                    true,
-                )
+                metrics = render(frame, frame.area(), &content, Some(&snapshot), usize::MAX)
             })
             .unwrap();
-        assert_eq!(metrics.total_rows, cached.len() + 2 + 1_000_001);
+        assert_eq!(
+            metrics.max_scroll,
+            (cached.len() + 2 + 1_000_001).saturating_sub(usize::from(metrics.body.height))
+        );
         assert_eq!(
             content.job_inputs(Some(&snapshot)).unwrap().last(),
             Some(&bone_app::InputId(0))
@@ -347,66 +309,47 @@ mod tests {
         assert!(content.text.contains("no longer in the current snapshot"));
         terminal
             .draw(|frame| {
-                metrics = render(
-                    frame,
-                    frame.area(),
-                    &content,
-                    Some(&snapshot),
-                    usize::MAX,
-                    true,
-                )
+                metrics = render(frame, frame.area(), &content, Some(&snapshot), usize::MAX)
             })
             .unwrap();
-        assert!(metrics.total_rows < 20);
+        assert!(metrics.max_scroll < 20);
         snapshot.jobs[0].id = id;
         snapshot.jobs[0].inputs.clear();
         content.refresh_job(&snapshot);
         let body_rows = content.wrapped_rows(74).len();
         terminal
             .draw(|frame| {
-                metrics = render(
-                    frame,
-                    frame.area(),
-                    &content,
-                    Some(&snapshot),
-                    usize::MAX,
-                    true,
-                )
+                metrics = render(frame, frame.area(), &content, Some(&snapshot), usize::MAX)
             })
             .unwrap();
-        assert_eq!(metrics.total_rows, body_rows + 2);
+        assert_eq!(
+            metrics.max_scroll,
+            (body_rows + 2).saturating_sub(usize::from(metrics.body.height))
+        );
         terminal
-            .draw(|frame| metrics = render(frame, frame.area(), &content, None, usize::MAX, true))
+            .draw(|frame| metrics = render(frame, frame.area(), &content, None, usize::MAX))
             .unwrap();
-        assert_eq!(metrics.total_rows, body_rows);
+        assert_eq!(
+            metrics.max_scroll,
+            body_rows.saturating_sub(usize::from(metrics.body.height))
+        );
         snapshot.jobs[0].inputs.push(bone_app::InputId(u64::MAX));
         snapshot.session.id = SessionId::new();
         terminal
             .draw(|frame| {
-                metrics = render(
-                    frame,
-                    frame.area(),
-                    &content,
-                    Some(&snapshot),
-                    usize::MAX,
-                    true,
-                )
+                metrics = render(frame, frame.area(), &content, Some(&snapshot), usize::MAX)
             })
             .unwrap();
-        assert_eq!(metrics.total_rows, body_rows);
+        assert_eq!(
+            metrics.max_scroll,
+            body_rows.saturating_sub(usize::from(metrics.body.height))
+        );
         snapshot.session.id = content.session;
         for width in [1, 2, 8, 40] {
             let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
             terminal
                 .draw(|frame| {
-                    render(
-                        frame,
-                        frame.area(),
-                        &content,
-                        Some(&snapshot),
-                        usize::MAX,
-                        true,
-                    );
+                    render(frame, frame.area(), &content, Some(&snapshot), usize::MAX);
                 })
                 .unwrap();
             let visible: String = terminal
@@ -453,7 +396,7 @@ mod tests {
         let first = std::time::Instant::now();
         terminal
             .draw(|frame| {
-                render(frame, frame.area(), &content, None, 0, true);
+                render(frame, frame.area(), &content, None, 0);
             })
             .unwrap();
         let first = first.elapsed();
@@ -469,7 +412,7 @@ mod tests {
         for scroll in 1..=30 {
             terminal
                 .draw(|frame| {
-                    render(frame, frame.area(), &content, None, scroll, true);
+                    render(frame, frame.area(), &content, None, scroll);
                 })
                 .unwrap();
         }
@@ -498,7 +441,7 @@ mod tests {
         let first = std::time::Instant::now();
         terminal
             .draw(|frame| {
-                render(frame, frame.area(), &content, None, 0, true);
+                render(frame, frame.area(), &content, None, 0);
             })
             .unwrap();
         let first = first.elapsed();
@@ -514,7 +457,7 @@ mod tests {
         for scroll in 1..=30 {
             terminal
                 .draw(|frame| {
-                    render(frame, frame.area(), &content, None, scroll, true);
+                    render(frame, frame.area(), &content, None, scroll);
                 })
                 .unwrap();
         }
@@ -645,9 +588,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
         let mut metrics = ReaderMetrics::default();
         terminal
-            .draw(|frame| metrics = render(frame, frame.area(), &content, None, usize::MAX, true))
+            .draw(|frame| metrics = render(frame, frame.area(), &content, None, usize::MAX))
             .unwrap();
-        assert!(metrics.scroll > usize::from(u16::MAX));
+        assert!(metrics.max_scroll > usize::from(u16::MAX));
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -656,15 +599,14 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(rendered.contains("THE END"));
-        assert_eq!(metrics.scroll, metrics.max_scroll);
         let short = ReaderContent {
             text: "short".into(),
             ..content
         };
         terminal
-            .draw(|frame| metrics = render(frame, frame.area(), &short, None, metrics.scroll, true))
+            .draw(|frame| metrics = render(frame, frame.area(), &short, None, metrics.max_scroll))
             .unwrap();
-        assert_eq!(metrics.scroll, 0);
+        assert_eq!(metrics.max_scroll, 0);
     }
 
     #[test]
@@ -680,7 +622,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {
-                    render(frame, frame.area(), &content, None, 0, true);
+                    render(frame, frame.area(), &content, None, 0);
                 })
                 .unwrap();
             for cell in &terminal.backend().buffer().content {

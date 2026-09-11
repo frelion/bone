@@ -28,9 +28,7 @@ pub(crate) const SUCCESS: Color = Color::Rgb(120, 204, 140);
 pub(crate) const WARNING: Color = Color::Rgb(224, 196, 92);
 pub(crate) const DANGER: Color = Color::Rgb(255, 102, 122);
 
-// Compatibility name for inline code rendering while it moves to semantic roles.
-pub(crate) const CYAN: Color = INFO;
-pub(crate) const PURPLE: Color = Color::Rgb(202, 140, 255);
+pub(crate) const CODE_LABEL: Color = Color::Rgb(202, 140, 255);
 
 /// A surface never changes the weight inherited by content drawn over it.
 pub(crate) fn surface(background: Color) -> Style {

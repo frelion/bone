@@ -1,23 +1,38 @@
 use crate::{
     input::{BindingHint, status_baseline_bindings},
-    state::UiState,
-    ui::{caret, focus, theme},
-    view::{INK, INPUT, MUTED, single_line_external},
+    layout::{HitRegion, HitTarget},
+    state::{Focus, UiState},
+    ui::{caret, focus, interaction::HitMap, theme},
+    view::single_line_external,
 };
 use ratatui::{
     Frame,
     layout::Rect,
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
 
-pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+pub(super) fn render(
+    frame: &mut Frame<'_>,
+    screen: Rect,
+    area: Rect,
+    hits: &mut HitMap,
+    state: &UiState,
+) {
     let draft = state.draft();
     let cursor = state.draft_cursor();
     // Slash commands keep editor focus and the same application-owned caret.
-    let focused = focus::is_active(state, focus::Region::Composer);
+    let focused = focus::workspace_focused(state, Focus::Composer);
+    hits.push(HitRegion {
+        area,
+        target: HitTarget::Composer,
+    });
     let surface = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(2));
-    frame.render_widget(Block::default().style(theme::surface(INPUT)), surface);
+    frame.render_widget(
+        Block::default().style(theme::surface(theme::INPUT)),
+        surface,
+    );
     let input = crate::layout::composer_text_area(area);
     let (value, cursor_x, cursor_y) = crate::editor::stable_editor_viewport(
         draft,
@@ -33,8 +48,12 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             &value
         })
         .style(theme::body_on(
-            if draft.is_empty() { MUTED } else { INK },
-            INPUT,
+            if draft.is_empty() {
+                theme::MUTED
+            } else {
+                theme::INK
+            },
+            theme::INPUT,
         )),
         input,
     );
@@ -48,8 +67,8 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         ) {
             for dx in 0..width {
                 frame.buffer_mut()[(input.x + x + dx, input.y + y)]
-                    .set_bg(super::SELECTED)
-                    .set_fg(INK);
+                    .set_bg(theme::SELECTED)
+                    .set_fg(theme::INK);
             }
         }
     }
@@ -57,7 +76,7 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let geometry = footer_areas(area, state);
     let (action_area, action) = action(area, state);
     frame.render_widget(
-        Paragraph::new(model).style(theme::body_on(MUTED, super::PANEL)),
+        Paragraph::new(model).style(theme::body_on(theme::MUTED, theme::PANEL)),
         geometry.model,
     );
     if state.panel.is_none()
@@ -66,7 +85,7 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         let hints = status_baseline_bindings(state.terminal_capabilities.shift_enter_supported());
         frame.render_widget(
             Paragraph::new(binding_line(&hints, geometry.binding_count))
-                .style(theme::surface(super::PANEL)),
+                .style(theme::surface(theme::PANEL)),
             bindings,
         );
     }
@@ -74,7 +93,7 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         && let Some(commands) = geometry.commands
     {
         frame.render_widget(
-            Paragraph::new("/ commands").style(theme::body(MUTED)),
+            Paragraph::new("/ commands").style(theme::body(theme::MUTED)),
             commands,
         );
     }
@@ -86,12 +105,64 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 .is_none_or(|pending| pending.failed);
         frame.render_widget(
             Paragraph::new(action).style(if actionable {
-                theme::label(INK)
+                theme::label(theme::INK)
             } else {
-                theme::body(MUTED)
+                theme::body(theme::MUTED)
             }),
             action_area,
         );
+        if actionable && !state.slash_palette_visible() {
+            hits.push(HitRegion {
+                area: action_area,
+                target: HitTarget::Submit,
+            });
+        }
+        hits.push(HitRegion {
+            area: geometry.model,
+            target: HitTarget::Models,
+        });
+        if let Some(commands) = geometry.commands {
+            hits.push(HitRegion {
+                area: Rect::new(commands.x, commands.y, 10, 1),
+                target: HitTarget::StartSlashCommand,
+            });
+        }
+    }
+    if focused
+        && !state.slash_palette_visible()
+        && state
+            .selected_ui()
+            .is_some_and(|ui| ui.working() && ui.selected_answer.is_none())
+    {
+        let label = if state
+            .selected_ui()
+            .and_then(|ui| ui.snapshot.as_ref())
+            .is_some_and(|snapshot| {
+                snapshot
+                    .inputs
+                    .iter()
+                    .any(|input| matches!(input.state, bone_app::InputState::Queued { .. }))
+            }) {
+            "esc stop all"
+        } else {
+            "esc stop"
+        };
+        let stop_width = label.len() as u16;
+        let stop = Rect::new(
+            area.right().saturating_sub(stop_width + 2),
+            area.y
+                .saturating_sub(if screen.height < 18 { 1 } else { 2 }),
+            stop_width.min(area.width),
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(theme::MUTED).bg(theme::PANEL)),
+            stop,
+        );
+        hits.push(HitRegion {
+            area: stop,
+            target: HitTarget::Stop,
+        });
     }
     if focused && input.width > 0 && input.height > 0 {
         caret::place(
@@ -103,11 +174,11 @@ pub(super) fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 }
 
 /// Shared by paint and pointer registration, including intermediate pane widths.
-pub(super) struct FooterAreas {
-    pub model: Rect,
-    pub commands: Option<Rect>,
-    pub bindings: Option<Rect>,
-    pub binding_count: usize,
+struct FooterAreas {
+    model: Rect,
+    commands: Option<Rect>,
+    bindings: Option<Rect>,
+    binding_count: usize,
 }
 
 fn binding_width(hints: &[BindingHint]) -> u16 {
@@ -124,14 +195,14 @@ fn binding_line(hints: &[BindingHint], count: usize) -> Line<'static> {
         if index > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(hint.chord, theme::label(INK)));
+        spans.push(Span::styled(hint.chord, theme::label(theme::INK)));
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(hint.label, theme::body(MUTED)));
+        spans.push(Span::styled(hint.label, theme::body(theme::MUTED)));
     }
     Line::from(spans)
 }
 
-pub(super) fn footer_areas(area: Rect, state: &UiState) -> FooterAreas {
+fn footer_areas(area: Rect, state: &UiState) -> FooterAreas {
     let footer = Rect::new(
         area.x + 2,
         area.bottom().saturating_sub(1),
@@ -177,7 +248,7 @@ pub(super) fn footer_areas(area: Rect, state: &UiState) -> FooterAreas {
     }
 }
 
-pub(super) fn action(area: Rect, state: &UiState) -> (Rect, &'static str) {
+fn action(area: Rect, state: &UiState) -> (Rect, &'static str) {
     let session = state.selected_ui();
     let pending = session
         .and_then(|ui| ui.submitting.as_ref())
@@ -222,6 +293,10 @@ mod tests {
     use crate::layout::HitTarget;
     use ratatui::{Terminal, backend::TestBackend};
 
+    fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+        super::render(frame, frame.area(), area, &mut HitMap::default(), state);
+    }
+
     #[test]
     fn input_padding_model_and_shortcuts_have_separate_rows() {
         for (width, height) in [(40, 12), (80, 24), (120, 30), (160, 40)] {
@@ -243,12 +318,12 @@ mod tests {
                         for y in [area.y, input.bottom()] {
                             for x in area.x + 1..area.right() {
                                 assert_eq!(frame.buffer_mut()[(x, y)].symbol(), " ");
-                                assert_eq!(frame.buffer_mut()[(x, y)].bg, INPUT);
+                                assert_eq!(frame.buffer_mut()[(x, y)].bg, theme::INPUT);
                             }
                         }
                         assert_eq!(
                             frame.buffer_mut()[(footer.model.x, footer.model.y)].bg,
-                            super::super::PANEL
+                            theme::PANEL
                         );
                     })
                     .unwrap();
@@ -301,7 +376,7 @@ mod tests {
         assert_eq!(terminal.get_cursor_position().unwrap(), position);
         let cell = &terminal.backend().buffer()[position];
         assert_eq!(cell.bg, theme::FOCUS_MARK);
-        assert_eq!(cell.fg, INPUT);
+        assert_eq!(cell.fg, theme::INPUT);
     }
 
     #[test]
@@ -330,10 +405,10 @@ mod tests {
             let input = crate::layout::composer_text_area(area);
 
             for y in input.y..input.bottom() {
-                assert_eq!(buffer[(area.x, y)].bg, INPUT);
+                assert_eq!(buffer[(area.x, y)].bg, theme::INPUT);
             }
-            assert_eq!(buffer[(area.x + 1, area.y)].bg, INPUT);
-            assert_eq!(buffer[(area.x + 1, input.bottom())].bg, INPUT);
+            assert_eq!(buffer[(area.x + 1, area.y)].bg, theme::INPUT);
+            assert_eq!(buffer[(area.x + 1, input.bottom())].bg, theme::INPUT);
 
             let orange_cells = buffer
                 .content()

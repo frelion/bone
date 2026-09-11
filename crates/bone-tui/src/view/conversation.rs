@@ -9,9 +9,9 @@ use ratatui::{
 
 use crate::{
     layout::{HitRegion, HitTarget, LayoutMode, LayoutPlan, TranscriptMetrics},
-    state::{CommandSpec, UiState},
+    state::{CommandSpec, Focus, UiState},
     ui::{caret, focus, interaction::HitMap, theme},
-    view::{INK, MUTED, PANEL, SELECTED, composer, message, single_line_external, slash_palette},
+    view::{composer, message, single_line_external, slash_palette},
 };
 
 pub(super) fn render(
@@ -30,6 +30,14 @@ pub(super) fn render(
     else {
         return None;
     };
+    hits.push(HitRegion {
+        area: header,
+        target: HitTarget::SessionTitle,
+    });
+    hits.push(HitRegion {
+        area: transcript,
+        target: HitTarget::Conversation,
+    });
     render_header(frame, header, state);
     if crate::layout::comfortable(plan.screen) {
         paint_rule(
@@ -88,7 +96,7 @@ pub(super) fn render(
             ("Question ended · keep as draft", HitTarget::ConvertAnswer)
         };
         frame.render_widget(
-            Paragraph::new(label).style(theme::body_on(theme::WARNING, PANEL)),
+            Paragraph::new(label).style(theme::body_on(theme::WARNING, theme::PANEL)),
             status_area,
         );
         hits.push(HitRegion {
@@ -96,9 +104,16 @@ pub(super) fn render(
             target,
         });
     }
-    composer::render(frame, composer_area, state);
-    if let Some(area) = plan.slash_palette {
-        slash_palette::render(frame, plan.screen, area, hits, state, slash_matches);
+    composer::render(frame, plan.screen, composer_area, hits, state);
+    if state.slash_palette_visible() {
+        slash_palette::render(
+            frame,
+            plan.screen,
+            composer_area,
+            hits,
+            state,
+            slash_matches,
+        );
     }
     metrics
 }
@@ -115,13 +130,13 @@ fn problem_hint(problem: &bone_app::AppProblem, width: u16) -> &'static str {
 
 fn status_tone(state: &UiState) -> ratatui::style::Color {
     if state.status.is_some() {
-        return MUTED;
+        return theme::MUTED;
     }
     let Some(ui) = state.selected_ui() else {
-        return MUTED;
+        return theme::MUTED;
     };
     let Some(snapshot) = &ui.snapshot else {
-        return MUTED;
+        return theme::MUTED;
     };
     if let Some(problem) = &snapshot.problem {
         super::session_rail::problem_status(problem).1
@@ -133,7 +148,7 @@ fn status_tone(state: &UiState) -> ratatui::style::Color {
     {
         theme::INFO
     } else {
-        MUTED
+        theme::MUTED
     }
 }
 
@@ -159,7 +174,7 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let focused = focus::is_active(state, focus::Region::SessionTitle) && state.selected.is_some();
+    let focused = focus::workspace_focused(state, Focus::SessionTitle) && state.selected.is_some();
     let fallback = state.title_text().unwrap_or("New conversation");
     let (title, cursor, selection_cells) = if focused {
         state
@@ -196,16 +211,16 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     } else {
         (single_line_external(fallback), 0, Vec::new())
     };
-    frame.render_widget(Block::default().style(theme::surface(PANEL)), area);
+    frame.render_widget(Block::default().style(theme::surface(theme::PANEL)), area);
     frame.render_widget(
-        Paragraph::new(title).style(theme::label_on(INK, PANEL)),
+        Paragraph::new(title).style(theme::label_on(theme::INK, theme::PANEL)),
         area,
     );
     for (x, width) in selection_cells {
         for dx in 0..width {
             frame.buffer_mut()[(area.x + x + dx, area.y)]
-                .set_bg(SELECTED)
-                .set_fg(INK);
+                .set_bg(theme::SELECTED)
+                .set_fg(theme::INK);
         }
     }
     if focused && area.width > 0 {
@@ -222,7 +237,7 @@ fn paint_rule(frame: &mut Frame<'_>, area: Rect, tone: ratatui::style::Color) {
         for x in area.x..area.right() {
             frame.buffer_mut()[(x, y)]
                 .set_symbol("─")
-                .set_style(theme::body_on(tone, PANEL));
+                .set_style(theme::body_on(tone, theme::PANEL));
         }
     }
 }
@@ -238,13 +253,12 @@ fn render_transcript(
     state: &UiState,
     hits: &mut HitMap,
 ) -> Option<TranscriptMetrics> {
-    let inner = Rect::new(area.x, area.y, area.width, area.height);
     let Some(session) = state.selected_ui() else {
         frame.render_widget(
             Paragraph::new("Start with a clear request.")
-                .style(Style::default().fg(MUTED))
+                .style(Style::default().fg(theme::MUTED))
                 .block(Block::default().padding(Padding::new(2, 2, 1, 0))),
-            inner,
+            area,
         );
         return None;
     };
@@ -254,13 +268,13 @@ fn render_transcript(
     let mut event_rows = std::collections::BTreeMap::new();
     let mut anchors = Vec::new();
     for entry in &session.history {
-        let mut rendered = message::rows(&entry.event, inner.width);
+        let mut rendered = message::rows(&entry.event, area.width);
         if reader_selects(
             state,
             crate::state::reader::ReaderSource::History(entry.sequence),
         ) {
             for line in &mut rendered {
-                line.style = line.style.bg(super::SELECTED);
+                line.style = line.style.bg(theme::SELECTED);
             }
         }
         if rendered.is_empty() {
@@ -294,7 +308,7 @@ fn render_transcript(
         if let Some(target) = target {
             links.push((source_row, target));
         }
-        let offsets = message::row_offsets(&entry.event, inner.width);
+        let offsets = message::row_offsets(&entry.event, area.width);
         anchors.extend((0..rendered.len()).map(|row| {
             crate::layout::ContentAnchor {
                 sequence: entry.sequence,
@@ -324,7 +338,7 @@ fn render_transcript(
         && let Some(snapshot) = &session.snapshot
     {
         let mut ephemeral = Vec::new();
-        let limit = usize::from(inner.height);
+        let limit = usize::from(area.height);
         for job in snapshot.jobs.iter().rev() {
             if ephemeral.len() >= limit {
                 break;
@@ -333,7 +347,7 @@ fn render_transcript(
                 let mut line =
                     message::compact("›", &format!("{}  [details]", job.goal), theme::INFO);
                 if reader_selects(state, crate::state::reader::ReaderSource::Job(job.id)) {
-                    line.style = line.style.bg(super::SELECTED);
+                    line.style = line.style.bg(theme::SELECTED);
                 }
                 ephemeral.push((line, Some(HitTarget::Job(job.id))));
             }
@@ -358,7 +372,7 @@ fn render_transcript(
                     )
                 },
             );
-            ephemeral.push((message::compact("·", &body, MUTED), None));
+            ephemeral.push((message::compact("·", &body, theme::MUTED), None));
         }
         ephemeral.reverse();
         if !ephemeral.is_empty() && !rows.is_empty() {
@@ -384,7 +398,7 @@ fn render_transcript(
                 if !in_history {
                     rows.extend(message::body_rows(
                         question.text,
-                        usize::from(inner.width),
+                        usize::from(area.width),
                         theme::WARNING,
                     ));
                 }
@@ -425,17 +439,18 @@ fn render_transcript(
     }
     if rows.is_empty() {
         frame.render_widget(
-            Paragraph::new("  Start with a clear request.").style(Style::default().fg(MUTED)),
-            inner,
+            Paragraph::new("  Start with a clear request.")
+                .style(Style::default().fg(theme::MUTED)),
+            area,
         );
         return Some(TranscriptMetrics {
             total_rows: 0,
-            viewport_rows: usize::from(inner.height),
+            viewport_rows: usize::from(area.height),
             event_rows,
             ..TranscriptMetrics::default()
         });
     }
-    let viewport = usize::from(inner.height);
+    let viewport = usize::from(area.height);
     let start = session
         .read_anchor
         .and_then(|anchor| {
@@ -470,21 +485,12 @@ fn render_transcript(
     for (row, target) in links {
         if row >= start && row < end {
             hits.push(HitRegion {
-                area: Rect::new(inner.x, inner.y + (row - start) as u16, inner.width, 1),
+                area: Rect::new(area.x, area.y + (row - start) as u16, area.width, 1),
                 target,
             });
         }
     }
-    let top_padding = 0;
-    frame.render_widget(
-        Paragraph::new(visible),
-        Rect::new(
-            inner.x,
-            inner.y.saturating_add(top_padding),
-            inner.width,
-            inner.height.saturating_sub(top_padding),
-        ),
-    );
+    frame.render_widget(Paragraph::new(visible), area);
     Some(TranscriptMetrics {
         total_rows: rows.len(),
         viewport_rows: viewport,
@@ -561,7 +567,7 @@ mod tests {
             for x in rule.x..rule.right() {
                 assert_eq!(buffer[(x, rule.y)].symbol(), "─");
                 assert_eq!(buffer[(x, rule.y)].fg, theme::STRUCTURE);
-                assert_eq!(buffer[(x, rule.y)].bg, PANEL);
+                assert_eq!(buffer[(x, rule.y)].bg, theme::PANEL);
             }
             assert_eq!(buffer[(header.x, header.y)].symbol(), "t");
             let orange_cells = buffer
@@ -603,7 +609,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         assert_eq!(buffer[(header.x, header.y)].symbol(), "🙂");
-        assert_eq!(buffer[(header.x, header.y)].bg, PANEL);
+        assert_eq!(buffer[(header.x, header.y)].bg, theme::PANEL);
         // Ratatui deliberately resets and skips the hidden continuation cell of
         // a wide grapheme. The leading cell's style paints both terminal columns.
         assert_eq!(buffer[(header.x + 1, header.y)].symbol(), " ");
@@ -613,11 +619,11 @@ mod tests {
         );
         for x in 2..7 {
             let cell = &buffer[(header.x + x, header.y)];
-            assert_eq!(cell.bg, SELECTED);
-            assert_eq!(cell.fg, INK);
+            assert_eq!(cell.bg, theme::SELECTED);
+            assert_eq!(cell.fg, theme::INK);
         }
         assert_eq!(buffer[(header.x + 7, header.y)].bg, theme::FOCUS_MARK);
-        assert_ne!(SELECTED, theme::FOCUS_MARK);
+        assert_ne!(theme::SELECTED, theme::FOCUS_MARK);
         assert_eq!(
             buffer
                 .content()
@@ -648,7 +654,7 @@ mod tests {
         assert_eq!(status_tone(&state), theme::INFO);
 
         state.status = Some("opaque external status".into());
-        assert_eq!(status_tone(&state), MUTED);
+        assert_eq!(status_tone(&state), theme::MUTED);
         state.status = None;
 
         Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap()).problem = Some(

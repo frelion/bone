@@ -1,8 +1,11 @@
-use super::{INK, INPUT, MUTED, single_line_external};
+use super::single_line_external;
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan, floating_menu_stride, floating_panel_area},
     state::{Panel, UiState},
-    ui::{focus, interaction::HitMap, theme},
+    ui::{
+        interaction::HitMap,
+        theme::{self, INK, INPUT, MUTED},
+    },
 };
 use ratatui::{
     Frame,
@@ -11,40 +14,13 @@ use ratatui::{
     text::Line,
     widgets::{Block, Clear, Paragraph, Wrap},
 };
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+
+const TITLE_INSET: u16 = 2;
 
 pub(super) struct FloatingPanel {
-    pub(super) area: Rect,
     pub(super) inner: Rect,
     pub(super) back: Rect,
     pub(super) stride: u16,
-}
-
-// Secret/model setup fields currently append at the end. Keep that insertion
-// position visible without splitting a wide or combining grapheme.
-pub(super) fn input_query(value: &str, width: u16, placeholder: &str) -> (String, u16) {
-    if value.is_empty() {
-        return (format!("> {placeholder}"), 2.min(width.saturating_sub(1)));
-    }
-    let clean = single_line_external(value);
-    let available = usize::from(width.saturating_sub(3));
-    let mut cells = 0;
-    let mut suffix = Vec::new();
-    for grapheme in clean.graphemes(true).rev() {
-        let size = UnicodeWidthStr::width(grapheme);
-        if cells + size > available {
-            break;
-        }
-        suffix.push(grapheme);
-        cells += size;
-    }
-    suffix.reverse();
-    let truncated = suffix.iter().map(|part| part.len()).sum::<usize>() < clean.len();
-    (
-        format!("{} {}", if truncated { "…" } else { ">" }, suffix.concat()),
-        (2 + cells as u16).min(width.saturating_sub(1)),
-    )
 }
 
 /// Draw the one floating-panel shell used by dialogs and slash commands.
@@ -54,24 +30,22 @@ pub(super) fn render_shell(
     screen: Rect,
     area: Rect,
     title: &str,
-    active: bool,
 ) -> FloatingPanel {
     let spacious = crate::layout::comfortable(screen);
     let chrome: u16 = if spacious { 4 } else { 0 };
     frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(theme::surface(INPUT)), area);
     let inner = Rect::new(
-        area.x + 2,
+        area.x + TITLE_INSET,
         area.y + 1 + chrome / 2,
-        area.width.saturating_sub(4),
+        area.width.saturating_sub(TITLE_INSET * 2),
         area.height.saturating_sub(2 + chrome),
     );
     let title_y = area.y + u16::from(spacious);
-    let title_background = focus::paint_header_active(
-        frame,
+    let title_background = theme::SELECTED;
+    frame.render_widget(
+        Block::default().style(theme::surface(title_background)),
         Rect::new(area.x, title_y, area.width, 1),
-        active,
-        INPUT,
     );
     frame.render_widget(
         Paragraph::new(title).style(theme::label_on(INK, title_background)),
@@ -95,7 +69,6 @@ pub(super) fn render_shell(
         back,
     );
     FloatingPanel {
-        area,
         inner,
         back,
         stride: floating_menu_stride(screen),
@@ -124,7 +97,6 @@ pub(super) fn render(
             content,
             state.selected_ui().and_then(|ui| ui.snapshot.as_deref()),
             state.panel_scroll,
-            true,
         );
         *reader_max_scroll = metrics.max_scroll;
         hits.push(HitRegion {
@@ -153,16 +125,17 @@ pub(super) fn render(
             + 4
             + if state.status.is_some() { 2 } else { 0 })
         .clamp(5, if spacious { 22 } else { 14 }) as u16,
-        _ => 0,
+        Panel::Reader(_) | Panel::ModelAdd | Panel::ModelSetup => unreachable!(),
     };
     let area = floating_panel_area(plan.screen, surface, height);
     let title = match panel {
         Panel::Models => "Models & connections",
         Panel::Objects { .. } => "Tasks & tools · enter open",
         Panel::Login => "Models / Account authorization",
-        _ => "Keyboard help",
+        Panel::Help => "Keyboard help",
+        Panel::Reader(_) | Panel::ModelAdd | Panel::ModelSetup => unreachable!(),
     };
-    let shell = render_shell(frame, plan.screen, area, title, true);
+    let shell = render_shell(frame, plan.screen, area, title);
     let mut inner = shell.inner;
     let back = shell.back;
     hits.push(HitRegion {
@@ -433,7 +406,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let (title_x, title_y) =
             find_text(buffer, "Keyboard help").expect("panel title is visible");
-        let mark_x = title_x - focus::GUTTER_WIDTH;
+        let mark_x = title_x - TITLE_INSET;
         let mark = &buffer[(mark_x, title_y)];
         assert_eq!(mark.symbol(), " ");
         assert_eq!(mark.bg, theme::SELECTED);

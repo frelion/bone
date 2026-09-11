@@ -1,9 +1,13 @@
 //! The connection steps belong to the model picker and never own chat drafts.
-use super::{DANGER, INFO, INK, INPUT, MUTED, SELECTED, single_line_external};
+use super::single_line_external;
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan},
     state::{ConnectionKind, Panel, SetupField, UiState},
-    ui::{caret, focus, interaction::HitMap, theme},
+    ui::{
+        caret,
+        interaction::HitMap,
+        theme::{self, DANGER, INFO, INK, INPUT, MUTED, SELECTED},
+    },
 };
 use ratatui::{
     Frame,
@@ -11,6 +15,8 @@ use ratatui::{
     style::Style,
     widgets::{Block, Clear, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap, state: &UiState) {
     let surface = plan.composer.unwrap_or(plan.screen);
@@ -43,8 +49,11 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
             .map_or("Models / Connection", |form| form.kind.label())
     };
     let title_band = Rect::new(area.x, area.y + inset, area.width, 1);
-    let title_background =
-        focus::paint_header(frame, title_band, state, focus::Region::Panel, INPUT);
+    let title_background = SELECTED;
+    frame.render_widget(
+        Block::default().style(theme::surface(title_background)),
+        title_band,
+    );
     frame.render_widget(
         Paragraph::new(title).style(theme::label_on(INK, title_background)),
         Rect::new(x, title_band.y, width, 1),
@@ -132,8 +141,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
             Rect::new(row.x, row.y, 8.min(width), 1),
         );
         let input = Rect::new(row.x + 8.min(width), row.y, width.saturating_sub(8), 1);
-        let (text, cursor) =
-            super::panels::input_query(value, input.width.saturating_add(2), placeholder);
+        let (text, cursor) = input_query(value, input.width.saturating_add(2), placeholder);
         let text = text.strip_prefix("> ").unwrap_or(&text);
         let cursor = cursor.saturating_sub(2).min(input.width.saturating_sub(1));
         frame.render_widget(
@@ -171,6 +179,32 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
             target: HitTarget::SaveConnection,
         });
     }
+}
+
+// Setup fields append at the end. Keep that position visible without splitting
+// a wide or combining grapheme.
+fn input_query(value: &str, width: u16, placeholder: &str) -> (String, u16) {
+    if value.is_empty() {
+        return (format!("> {placeholder}"), 2.min(width.saturating_sub(1)));
+    }
+    let clean = single_line_external(value);
+    let available = usize::from(width.saturating_sub(3));
+    let mut cells = 0;
+    let mut suffix = Vec::new();
+    for grapheme in clean.graphemes(true).rev() {
+        let size = UnicodeWidthStr::width(grapheme);
+        if cells + size > available {
+            break;
+        }
+        suffix.push(grapheme);
+        cells += size;
+    }
+    suffix.reverse();
+    let truncated = suffix.iter().map(|part| part.len()).sum::<usize>() < clean.len();
+    (
+        format!("{} {}", if truncated { "…" } else { ">" }, suffix.concat()),
+        (2 + cells as u16).min(width.saturating_sub(1)),
+    )
 }
 
 #[cfg(test)]
