@@ -1,6 +1,9 @@
-/// The transport BONE uses to distinguish a modified Enter key.
+/// The keyboard capability negotiated for this terminal session.
+///
+/// This value describes runtime I/O only. It never changes terminal, shell, or
+/// multiplexer configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum KeyboardProtocol {
+pub(crate) enum TerminalCapabilities {
     #[cfg(windows)]
     /// Native Windows console events carry modifiers without a VT extension.
     NativeWindows,
@@ -10,51 +13,37 @@ pub(crate) enum KeyboardProtocol {
     Compatibility { reason: String },
 }
 
-/// Capabilities negotiated for this terminal session.
-///
-/// This value describes runtime I/O only. It never changes terminal, shell, or
-/// multiplexer configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TerminalCapabilities {
-    keyboard: KeyboardProtocol,
-}
-
 impl TerminalCapabilities {
     #[cfg(windows)]
     pub(crate) fn native_windows() -> Self {
-        Self {
-            keyboard: KeyboardProtocol::NativeWindows,
-        }
+        Self::NativeWindows
     }
 
     pub(crate) fn kitty() -> Self {
-        Self {
-            keyboard: KeyboardProtocol::Kitty,
-        }
+        Self::Kitty
     }
 
     pub(crate) fn compatibility(reason: impl Into<String>) -> Self {
-        Self {
-            keyboard: KeyboardProtocol::Compatibility {
-                reason: reason.into(),
-            },
+        Self::Compatibility {
+            reason: reason.into(),
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn uses_keyboard_enhancement(&self) -> bool {
-        matches!(self.keyboard, KeyboardProtocol::Kitty)
+        matches!(self, Self::Kitty)
     }
 
     pub(crate) fn shift_enter_supported(&self) -> bool {
-        !matches!(self.keyboard, KeyboardProtocol::Compatibility { .. })
+        !matches!(self, Self::Compatibility { .. })
     }
 
     pub(crate) fn keyboard_limitation(&self) -> Option<&str> {
-        match &self.keyboard {
-            KeyboardProtocol::Compatibility { reason } => Some(reason),
-            KeyboardProtocol::Kitty => None,
+        match self {
+            Self::Compatibility { reason } => Some(reason),
+            Self::Kitty => None,
             #[cfg(windows)]
-            KeyboardProtocol::NativeWindows => None,
+            Self::NativeWindows => None,
         }
     }
 }

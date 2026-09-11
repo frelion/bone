@@ -109,6 +109,7 @@ pub async fn run() -> Result<(), RunError> {
         },
     ));
     let mut events = Some(EventStream::new());
+    #[cfg(debug_assertions)]
     schedule_test_background_panic();
     let mut overview_ticker = tokio::time::interval(Duration::from_secs(5));
     overview_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -155,7 +156,7 @@ pub async fn run() -> Result<(), RunError> {
                 _ = panic_signal.notified(), if !panic_handled => None,
             };
             if let Some(result) = applied {
-                shutdown |= result?;
+                shutdown |= result;
             } else {
                 // Dropping the in-flight effect future prevents a synchronous
                 // persistence call from pinning the terminal after another
@@ -331,7 +332,7 @@ pub async fn run() -> Result<(), RunError> {
                 event,
                 UiEvent::Action(_) | UiEvent::CaretBlink | UiEvent::Resized { .. }
             );
-            runtime.accept_event(&event, &state);
+            runtime.accept_event(&event);
             effects.extend(update(&mut state, event));
             if reset_caret || !caret_was_active && state.blinking_caret_active() {
                 caret_sleep
@@ -396,9 +397,6 @@ fn schedule_test_background_panic() {
         panic!("injected detached-task panic for terminal lifecycle testing");
     });
 }
-
-#[cfg(not(debug_assertions))]
-fn schedule_test_background_panic() {}
 
 /// Draw every state change before accepting another input or runtime event.
 ///
@@ -555,14 +553,6 @@ fn process_signals() -> io::Result<mpsc::UnboundedReceiver<ProcessSignal>> {
         forward_termination!(ctrl_shutdown);
         drop(tx);
     }
-    #[cfg(not(any(unix, windows)))]
-    tokio::spawn(async move {
-        while tokio::signal::ctrl_c().await.is_ok() {
-            if tx.send(ProcessSignal::Terminate).is_err() {
-                break;
-            }
-        }
-    });
     Ok(rx)
 }
 

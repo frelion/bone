@@ -9,12 +9,16 @@ use crossterm::{
 
 use super::capabilities::TerminalCapabilities;
 
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+compile_error!("bone-tui supports Windows, Linux/WSL, and macOS");
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalMode {
     Raw,
     AlternateScreen,
     MouseCapture,
     BracketedPaste,
+    #[cfg(unix)]
     KeyboardEnhancement,
 }
 
@@ -146,8 +150,6 @@ impl ModeBackend for CrosstermModes {
                 execute!(io::stdout(), EnterAlternateScreen)
             }
             TerminalMode::MouseCapture => {
-                #[cfg(windows)]
-                self.prepare_ansi_output()?;
                 execute!(io::stdout(), EnableMouseCapture)
             }
             TerminalMode::BracketedPaste => {
@@ -155,20 +157,14 @@ impl ModeBackend for CrosstermModes {
                 self.prepare_ansi_output()?;
                 execute!(io::stdout(), EnableBracketedPaste)
             }
+            #[cfg(unix)]
             TerminalMode::KeyboardEnhancement => {
-                #[cfg(unix)]
-                {
-                    execute!(
-                        io::stdout(),
-                        crossterm::event::PushKeyboardEnhancementFlags(
-                            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        )
+                execute!(
+                    io::stdout(),
+                    crossterm::event::PushKeyboardEnhancementFlags(
+                        crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     )
-                }
-                #[cfg(not(unix))]
-                {
-                    Ok(())
-                }
+                )
             }
         }
     }
@@ -182,8 +178,6 @@ impl ModeBackend for CrosstermModes {
                 execute!(io::stdout(), LeaveAlternateScreen)
             }
             TerminalMode::MouseCapture => {
-                #[cfg(windows)]
-                self.prepare_ansi_output()?;
                 execute!(io::stdout(), DisableMouseCapture)
             }
             TerminalMode::BracketedPaste => {
@@ -191,15 +185,9 @@ impl ModeBackend for CrosstermModes {
                 self.prepare_ansi_output()?;
                 execute!(io::stdout(), DisableBracketedPaste)
             }
+            #[cfg(unix)]
             TerminalMode::KeyboardEnhancement => {
-                #[cfg(unix)]
-                {
-                    execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags)
-                }
-                #[cfg(not(unix))]
-                {
-                    Ok(())
-                }
+                execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags)
             }
         }
     }
@@ -303,17 +291,18 @@ impl ModeLease {
     fn acquire(&mut self) -> io::Result<TerminalCapabilities> {
         #[cfg(windows)]
         self.ledger.restore_host_console_on_exit();
-        self.enable(TerminalMode::Raw)?;
-        self.enable(TerminalMode::AlternateScreen)?;
-        self.enable(TerminalMode::MouseCapture)?;
-        self.enable(TerminalMode::BracketedPaste)?;
+        self.ledger.enable(TerminalMode::Raw)?;
+        self.ledger.enable(TerminalMode::AlternateScreen)?;
+        self.ledger.enable(TerminalMode::MouseCapture)?;
+        self.ledger.enable(TerminalMode::BracketedPaste)?;
 
         // Probe before EventStream becomes the process's only input reader.
         // Crossterm preserves unrelated input while it waits for the protocol
         // reply, so keys typed during startup are replayed to the app.
         let capabilities = detect_capabilities();
+        #[cfg(unix)]
         if capabilities.uses_keyboard_enhancement() {
-            self.enable(TerminalMode::KeyboardEnhancement)?;
+            self.ledger.enable(TerminalMode::KeyboardEnhancement)?;
         }
 
         // Ratatui owns cursor visibility while drawing. We do not change its
@@ -324,10 +313,6 @@ impl ModeLease {
 
     pub(super) fn restore(&mut self) -> io::Result<()> {
         self.ledger.restore()
-    }
-
-    fn enable(&mut self, mode: TerminalMode) -> io::Result<()> {
-        self.ledger.enable(mode)
     }
 }
 
@@ -353,11 +338,6 @@ fn detect_capabilities() -> TerminalCapabilities {
             TerminalCapabilities::compatibility(format!("keyboard protocol probe failed: {error}"))
         }
     }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn detect_capabilities() -> TerminalCapabilities {
-    TerminalCapabilities::compatibility("this platform does not expose modified Enter events")
 }
 
 #[cfg(test)]

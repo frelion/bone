@@ -6,7 +6,7 @@ use tokio::{sync::mpsc, task::AbortHandle};
 
 use crate::state::{Effect, OperationKind, UiEvent, UiState};
 
-use super::{RunError, summarize_overview};
+use super::summarize_overview;
 
 const HISTORY_PAGE: usize = 32;
 const DRAFT_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -33,13 +33,18 @@ struct PendingSessionOperation {
     future: SharedSessionOperation,
 }
 
+#[derive(Default)]
+struct SessionResources {
+    handle: Option<Session>,
+    observer: Option<AbortHandle>,
+    draft_save: Option<AbortHandle>,
+}
+
 pub(super) struct Runtime {
     login: Option<AbortHandle>,
     app: App,
     workspace: bone_app::WorkspaceId,
-    sessions: BTreeMap<SessionId, Session>,
-    observers: BTreeMap<SessionId, AbortHandle>,
-    draft_saves: BTreeMap<SessionId, AbortHandle>,
+    sessions: BTreeMap<SessionId, SessionResources>,
     session_operations: BTreeMap<SessionId, PendingSessionOperation>,
     // Kept across failed or timed-out exit flushes, including late create receipts.
     exit_draft_request: Option<CreateSessionRequest>,
@@ -49,7 +54,6 @@ pub(super) struct Runtime {
 
 pub(super) enum SessionReady {
     Opened {
-        id: SessionId,
         generation: u64,
         session: Session,
         views: tokio::sync::watch::Receiver<std::sync::Arc<bone_app::SessionView>>,
@@ -75,8 +79,6 @@ impl Runtime {
             app,
             workspace,
             sessions: BTreeMap::new(),
-            observers: BTreeMap::new(),
-            draft_saves: BTreeMap::new(),
             session_operations: BTreeMap::new(),
             exit_draft_request: None,
             tx,
@@ -84,7 +86,7 @@ impl Runtime {
         }
     }
 
-    pub(super) async fn apply(&mut self, effect: Effect) -> Result<bool, RunError> {
+    pub(super) async fn apply(&mut self, effect: Effect) -> bool {
         match effect {
             Effect::SaveConnection {
                 request,
@@ -294,7 +296,6 @@ impl Runtime {
                         Ok((handle, views, snapshot, history)) => {
                             let _ = ready_tx
                                 .send(SessionReady::Opened {
-                                    id: session,
                                     generation,
                                     session: handle,
                                     views,
@@ -496,10 +497,14 @@ impl Runtime {
                 revision,
                 text,
             } => {
-                if let Some(previous) = self.draft_saves.remove(&session) {
+                if let Some(previous) = self
+                    .sessions
+                    .get_mut(&session)
+                    .and_then(|resources| resources.draft_save.take())
+                {
                     previous.abort();
                 }
-                let handle = self.sessions.get(&session).cloned();
+                let handle = self.session(session);
                 let app = self.app.clone();
                 let tx = self.tx.clone();
                 let task = tokio::spawn(async move {
@@ -536,14 +541,14 @@ impl Runtime {
                         }
                     }
                 });
-                self.draft_saves.insert(session, task.abort_handle());
+                self.sessions.entry(session).or_default().draft_save = Some(task.abort_handle());
             }
             Effect::Submit {
                 session,
                 generation,
                 input,
             } => {
-                let handle = self.sessions.get(&session).cloned();
+                let handle = self.session(session);
                 let app = self.app.clone();
                 let tx = self.tx.clone();
                 let request_id = input.request_id;
@@ -586,7 +591,7 @@ impl Runtime {
                 generation,
                 input,
             } => {
-                let handle = self.sessions.get(&session).cloned();
+                let handle = self.session(session);
                 let app = self.app.clone();
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
@@ -614,7 +619,7 @@ impl Runtime {
                 session,
                 generation,
             } => {
-                if let Some(handle) = self.sessions.get(&session).cloned() {
+                if let Some(handle) = self.session(session) {
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         if handle.stop().await.is_err() {
@@ -635,7 +640,7 @@ impl Runtime {
                 generation,
                 after,
             } => {
-                if let Some(handle) = self.sessions.get(&session).cloned() {
+                if let Some(handle) = self.session(session) {
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         match handle.history(after, HISTORY_PAGE).await {
@@ -667,7 +672,7 @@ impl Runtime {
                 generation,
                 cursor,
             } => {
-                if let Some(handle) = self.sessions.get(&session).cloned() {
+                if let Some(handle) = self.session(session) {
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         match handle.recent_history(Some(cursor), HISTORY_PAGE).await {
@@ -698,7 +703,7 @@ impl Runtime {
                 session,
                 generation,
             } => {
-                if let Some(handle) = self.sessions.get(&session).cloned() {
+                if let Some(handle) = self.session(session) {
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         match handle.recent_history(None, HISTORY_PAGE).await {
@@ -829,9 +834,9 @@ impl Runtime {
                         .await;
                 }
             }
-            Effect::Shutdown => return Ok(true),
+            Effect::Shutdown => return true,
         }
-        Ok(false)
+        false
     }
 
     fn observe(
@@ -840,7 +845,11 @@ impl Runtime {
         generation: u64,
         mut views: tokio::sync::watch::Receiver<std::sync::Arc<bone_app::SessionView>>,
     ) {
-        if let Some(previous) = self.observers.remove(&id) {
+        if let Some(previous) = self
+            .sessions
+            .get_mut(&id)
+            .and_then(|resources| resources.observer.take())
+        {
             previous.abort();
         }
         let tx = self.tx.clone();
@@ -860,19 +869,33 @@ impl Runtime {
                 }
             }
         });
-        self.observers.insert(id, task.abort_handle());
+        self.sessions
+            .get_mut(&id)
+            .expect("a session handle is retained before observation")
+            .observer = Some(task.abort_handle());
+    }
+
+    fn retain_session(&mut self, session: Session) {
+        let id = session.id();
+        self.sessions.entry(id).or_default().handle = Some(session);
+    }
+
+    fn session(&self, id: SessionId) -> Option<Session> {
+        self.sessions
+            .get(&id)
+            .and_then(|resources| resources.handle.clone())
     }
 
     pub(super) fn accept_ready(&mut self, ready: SessionReady, state: &UiState) -> Option<UiEvent> {
         match ready {
             SessionReady::Opened {
-                id,
                 generation,
                 session,
                 views,
                 snapshot,
                 history,
             } => {
+                let id = session.id();
                 if state
                     .session_ui
                     .get(&id)
@@ -888,7 +911,7 @@ impl Runtime {
                     }
                     return None;
                 }
-                self.sessions.insert(id, session);
+                self.retain_session(session);
                 self.observe(id, generation, views);
                 Some(UiEvent::SessionOpened {
                     session: id,
@@ -909,7 +932,7 @@ impl Runtime {
                 {
                     // A timed-out exit can receive the original create callback later.
                     // Keep the orphan editor and pending identity until its save succeeds.
-                    self.sessions.insert(info.id, session);
+                    self.retain_session(session);
                     return None;
                 }
                 if state
@@ -924,13 +947,13 @@ impl Runtime {
                     });
                     return None;
                 }
-                self.sessions.insert(info.id, session);
+                self.retain_session(session);
                 Some(UiEvent::SessionCreated { request_id, info })
             }
         }
     }
 
-    pub(super) fn accept_event(&mut self, event: &UiEvent, _state: &UiState) {
+    pub(super) fn accept_event(&mut self, event: &UiEvent) {
         let completed_operation = match event {
             UiEvent::SessionRenamed {
                 session, request, ..
@@ -966,22 +989,23 @@ impl Runtime {
                 receipt.status,
                 bone_app::SessionReleaseStatus::Released | bone_app::SessionReleaseStatus::NotOpen
             )
+            && let Some(resources) = self.sessions.remove(&receipt.session)
         {
-            self.sessions.remove(&receipt.session);
-            if let Some(task) = self.observers.remove(&receipt.session) {
+            if let Some(task) = resources.observer {
                 task.abort();
             }
-            if let Some(task) = self.draft_saves.remove(&receipt.session) {
+            if let Some(task) = resources.draft_save {
                 task.abort();
             }
         }
     }
 
     pub(super) async fn flush_drafts(&mut self, state: &mut UiState) -> Result<(), String> {
-        for task in self.draft_saves.values() {
-            task.abort();
+        for resources in self.sessions.values_mut() {
+            if let Some(task) = resources.draft_save.take() {
+                task.abort();
+            }
         }
-        self.draft_saves.clear();
         let exit_request = if !state.orphan_draft.is_empty() {
             Some(
                 self.exit_draft_request
@@ -1014,7 +1038,7 @@ impl Runtime {
         let mut first_error = self.flush_title_writes().await.err();
         for (id, ui) in &state.session_ui {
             if ui.draft_revision > ui.saved_draft_revision {
-                let session = match self.sessions.get(id).cloned() {
+                let session = match self.session(*id) {
                     Some(session) => Ok(session),
                     None => self.app.session(*id).await,
                 };
@@ -1071,7 +1095,7 @@ impl Runtime {
             if !state.sessions.iter().any(|known| known.id == info.id) {
                 state.sessions.insert(0, info.clone());
             }
-            self.sessions.insert(info.id, session);
+            self.retain_session(session);
             self.exit_draft_request = None;
         }
         Ok(())
@@ -1193,16 +1217,14 @@ mod lifecycle_tests {
                 request: 1,
                 first_input: "Automatic title from this first input".into(),
             })
-            .await
-            .unwrap();
+            .await;
         runtime
             .apply(Effect::RenameSession {
                 session: id,
                 request: 2,
                 title: "Manual title".into(),
             })
-            .await
-            .unwrap();
+            .await;
 
         runtime.flush_title_writes().await.unwrap();
         assert_eq!(
@@ -1237,16 +1259,14 @@ mod lifecycle_tests {
                 session: id,
                 generation: 2,
             })
-            .await
-            .unwrap();
+            .await;
         runtime
             .apply(Effect::RenameSession {
                 session: id,
                 request: 3,
                 title: "Rename after release".into(),
             })
-            .await
-            .unwrap();
+            .await;
 
         assert!(
             tokio::time::timeout(Duration::from_millis(10), runtime.flush_title_writes())
@@ -1293,15 +1313,13 @@ mod lifecycle_tests {
                 request: 3,
                 title: "Rename before release".into(),
             })
-            .await
-            .unwrap();
+            .await;
         runtime
             .apply(Effect::ReleaseSession {
                 session: id,
                 generation: 4,
             })
-            .await
-            .unwrap();
+            .await;
         tokio::task::yield_now().await;
         assert_eq!(
             session.snapshot().await.unwrap().session.title,
