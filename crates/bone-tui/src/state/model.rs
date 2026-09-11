@@ -362,7 +362,6 @@ pub struct UiState {
     pub(crate) title_renames: BTreeMap<SessionId, TitleRenameQueue>,
     pub(crate) title_manual_intent: BTreeSet<SessionId>,
     pub(crate) title_rename_error: Option<(SessionId, String)>,
-    pub(crate) title_request: u64,
     pub(crate) models_loading: bool,
     pub(crate) model_request: u64,
     pub(crate) terminal_capabilities: crate::terminal::TerminalCapabilities,
@@ -391,8 +390,7 @@ pub struct UiState {
     pub status: Option<String>,
     pub dirty: bool,
     pub quitting: bool,
-    pub(crate) overview_generation: u64,
-    pub(crate) overview_pending: bool,
+    pub(crate) overview_request: Option<u64>,
     next_generation: u64,
 }
 
@@ -415,7 +413,6 @@ impl Default for UiState {
             title_renames: BTreeMap::new(),
             title_manual_intent: BTreeSet::new(),
             title_rename_error: None,
-            title_request: 0,
             models_loading: false,
             model_request: 0,
             terminal_capabilities: Default::default(),
@@ -443,8 +440,7 @@ impl Default for UiState {
             status: None,
             dirty: true,
             quitting: false,
-            overview_generation: 0,
-            overview_pending: false,
+            overview_request: None,
             next_generation: 0,
         }
     }

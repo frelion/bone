@@ -852,7 +852,8 @@ mod pane_resize_tests {
     #[test]
     fn an_open_panel_owns_pointer_input_and_escape_closes_that_scope() {
         let mut state = UiState::default();
-        update(&mut state, UiEvent::Action(Action::OpenHelp));
+        update(&mut state, UiEvent::Action(Action::Paste("/help".into())));
+        update(&mut state, UiEvent::Action(Action::Submit));
         let plan = draw(&state, 160);
         assert!(
             !plan
