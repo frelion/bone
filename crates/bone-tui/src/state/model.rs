@@ -6,7 +6,7 @@ use std::{
 
 use bone_app::{
     HistoryCursor, HistoryEntry, QuestionId, RequestId, SessionId, SessionInfo, SessionSummary,
-    SessionView, WorkspaceId,
+    SessionView,
 };
 
 use crate::layout::{SinglePane, TranscriptMetrics};
@@ -255,7 +255,6 @@ pub struct SessionUi {
     pub newer_history_missing: bool,
     pub(crate) draft: crate::editor::EditorBuffer,
     pub saved_draft_revision: u64,
-    pub saved_draft: String,
     pub answer_drafts: BTreeMap<QuestionId, super::answer::AnswerDraft>,
     pub selected_answer: Option<QuestionId>,
     pub hydrated: bool,
@@ -314,7 +313,6 @@ impl SessionUi {
             newer_history_missing: false,
             draft: Default::default(),
             saved_draft_revision: 0,
-            saved_draft: String::new(),
             answer_drafts: BTreeMap::new(),
             selected_answer: None,
             hydrated: false,
@@ -389,7 +387,7 @@ pub struct UiState {
     pub(crate) model_request: u64,
     pub(crate) terminal_capabilities: crate::terminal::TerminalCapabilities,
 
-    pub workspace: Option<(WorkspaceId, String)>,
+    pub workspace_label: Option<String>,
     pub model_label: Option<String>,
     pub model_facts: Option<ModelFacts>,
     pub(crate) session_rows: Vec<SessionNavRow>,
@@ -433,7 +431,7 @@ impl Default for UiState {
             models_loading: false,
             model_request: 0,
             terminal_capabilities: Default::default(),
-            workspace: None,
+            workspace_label: None,
             model_label: None,
             model_facts: None,
             session_rows: Vec::new(),

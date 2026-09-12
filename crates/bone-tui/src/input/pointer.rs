@@ -32,10 +32,16 @@ pub(super) fn action(
     let target = snapshot.and_then(|frame| frame.hit(mouse.column, mouse.row));
     match mouse.kind {
         MouseEventKind::ScrollUp if target == Some(HitTarget::Reader) => {
-            Some(Action::ScrollPanel { amount: -3, max: 0 })
+            snapshot.map(|frame| Action::ScrollPanel {
+                amount: -3,
+                max: frame.reader_max_scroll,
+            })
         }
         MouseEventKind::ScrollDown if target == Some(HitTarget::Reader) => {
-            Some(Action::ScrollPanel { amount: 3, max: 0 })
+            snapshot.map(|frame| Action::ScrollPanel {
+                amount: 3,
+                max: frame.reader_max_scroll,
+            })
         }
         MouseEventKind::ScrollUp
             if matches!(target, Some(HitTarget::SessionRail | HitTarget::Session(_))) =>
@@ -56,10 +62,7 @@ pub(super) fn action(
             })
         }
         MouseEventKind::ScrollUp if target == Some(HitTarget::Conversation) => {
-            Some(Action::ScrollUp {
-                amount: 3,
-                metrics: snapshot.and_then(|frame| frame.transcript_metrics.clone()),
-            })
+            Some(Action::ScrollUp(3))
         }
         MouseEventKind::ScrollDown if target == Some(HitTarget::Conversation) => {
             Some(Action::ScrollDown(3))
@@ -138,34 +141,14 @@ fn composer_pointer(
 
 fn hit_action(target: Option<HitTarget>) -> Option<Action> {
     match target {
+        Some(HitTarget::Action(action)) => Some(action),
         Some(HitTarget::PaneDivider(divider)) => Some(Action::BeginPaneResize(divider)),
         Some(HitTarget::Session(session)) => Some(Action::SelectSession(session)),
         Some(HitTarget::SessionRail) => Some(Action::Focus(Focus::Sessions)),
         Some(HitTarget::SessionTitle) => Some(Action::Focus(Focus::SessionTitle)),
         Some(HitTarget::Conversation) => None,
         Some(HitTarget::Composer) => Some(Action::Focus(Focus::Composer)),
-        Some(HitTarget::RightRail) => Some(Action::Focus(Focus::RightRail)),
-        Some(HitTarget::SlashCommand(command)) => Some(Action::ExecuteCommand(command)),
-        Some(HitTarget::StartSlashCommand) => Some(Action::StartSlashCommand),
-        Some(HitTarget::CommandPalette) => None,
-        Some(HitTarget::Models) => Some(Action::OpenModels),
-        Some(HitTarget::ConnectionKind(index)) => Some(Action::ChooseConnectionKind(index)),
-        Some(HitTarget::SetupField(field)) => Some(Action::SelectField(field)),
-        Some(HitTarget::SaveConnection) => Some(Action::SaveConnection),
-        Some(HitTarget::Back) => Some(Action::Escape),
-        Some(HitTarget::Reader) => None,
-        Some(HitTarget::Model(index)) => Some(Action::SelectModel(index)),
-        Some(HitTarget::Object(index)) => Some(Action::SelectObject(index)),
-        Some(HitTarget::History(sequence)) => Some(Action::OpenHistory(sequence)),
-        Some(HitTarget::Job(job)) => Some(Action::OpenJob(job)),
-        Some(HitTarget::Answer(question)) => Some(Action::AnswerQuestion(question)),
-        Some(HitTarget::LeaveAnswer) => Some(Action::LeaveAnswer),
-        Some(HitTarget::ConvertAnswer) => Some(Action::ConvertAnswer),
-        Some(HitTarget::Restore(input)) => Some(Action::RestoreInput(input)),
-        Some(HitTarget::Retry(input)) => Some(Action::RetryInput(input)),
-        Some(HitTarget::RetrySubmission) => Some(Action::RetrySubmission),
-        Some(HitTarget::Submit) => Some(Action::ClickSubmit),
-        Some(HitTarget::Stop) => Some(Action::Stop),
+        Some(HitTarget::Capture | HitTarget::Reader) => None,
         None => None,
     }
 }

@@ -11,20 +11,28 @@ use crossterm::event::{Event, KeyCode, KeyEventKind};
 
 use crate::{
     layout::LayoutMode,
-    state::{Action, CursorMove, EditCommand, EditorTarget, UiEvent, UiState},
+    state::{Action, EditCommand, EditorTarget, UiEvent, UiState},
     view::FrameSnapshot,
 };
 
 #[cfg(test)]
 use keymap::STATUS_BASELINE_BINDINGS;
-use keymap::key_action;
 pub(crate) use keymap::{BindingHint, status_baseline_bindings};
+use keymap::{KeyGeometry, key_action};
 
 pub(crate) fn terminal_event(
     event: Event,
     snapshot: Option<&FrameSnapshot>,
     state: &UiState,
 ) -> Option<UiEvent> {
+    let key_geometry = KeyGeometry {
+        composer_width: snapshot
+            .and_then(|frame| frame.layout.composer)
+            .map(crate::layout::composer_text_area)
+            .map(|area| area.width),
+        reader_max_scroll: snapshot.map(|frame| frame.reader_max_scroll),
+        right_rail_visible: snapshot.is_some_and(|frame| frame.layout.extension_blank.is_some()),
+    };
     let action = match event {
         Event::Key(key)
             if key.kind == KeyEventKind::Press
@@ -33,8 +41,8 @@ pub(crate) fn terminal_event(
         {
             Some(Action::EndPaneResize)
         }
-        Event::Key(key) if key.kind == KeyEventKind::Press => key_action(key, state),
-        Event::FocusLost => Some(Action::EndPaneResize),
+        Event::Key(key) if key.kind == KeyEventKind::Press => key_action(key, state, key_geometry),
+        Event::FocusLost if state.dragging_divider.is_some() => Some(Action::EndPaneResize),
         Event::Mouse(mouse) => pointer::action(mouse, snapshot, state),
         Event::Resize(width, height) => return Some(UiEvent::Resized { width, height }),
         Event::Paste(text) if matches!(state.panel, Some(crate::state::Panel::ModelSetup)) => {
@@ -65,75 +73,13 @@ pub(crate) fn terminal_event(
     {
         return None;
     }
-    if matches!(action, Action::FocusRight)
-        && matches!(
-            state.focus,
-            crate::state::Focus::SessionTitle | crate::state::Focus::Composer
-        )
-        && snapshot.is_none_or(|frame| frame.layout.extension_blank.is_none())
-    {
-        return None;
-    }
-
-    let action = match action {
-        Action::ScrollPanel { amount, .. } => Action::ScrollPanel {
-            amount,
-            max: snapshot.map_or(0, |frame| frame.reader_max_scroll),
-        },
-        Action::Edit {
-            target: EditorTarget::Composer,
-            command:
-                EditCommand::Move {
-                    cursor: CursorMove::Up { .. },
-                    select,
-                },
-        } => Action::Edit {
-            target: EditorTarget::Composer,
-            command: EditCommand::Move {
-                cursor: CursorMove::Up {
-                    width: composer_width(snapshot),
-                },
-                select,
-            },
-        },
-        Action::Edit {
-            target: EditorTarget::Composer,
-            command:
-                EditCommand::Move {
-                    cursor: CursorMove::Down { .. },
-                    select,
-                },
-        } => Action::Edit {
-            target: EditorTarget::Composer,
-            command: EditCommand::Move {
-                cursor: CursorMove::Down {
-                    width: composer_width(snapshot),
-                },
-                select,
-            },
-        },
-        Action::ScrollUp {
-            amount,
-            metrics: None,
-        } => Action::ScrollUp {
-            amount,
-            metrics: snapshot.and_then(|frame| frame.transcript_metrics.clone()),
-        },
-        action => action,
-    };
     Some(UiEvent::Action(action))
-}
-
-fn composer_width(snapshot: Option<&FrameSnapshot>) -> u16 {
-    snapshot
-        .and_then(|frame| frame.layout.composer)
-        .map_or(1, |area| crate::layout::composer_text_area(area).width)
 }
 
 #[cfg(test)]
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan},
-    state::Focus,
+    state::{CursorMove, Focus},
     ui::interaction::HitMap,
 };
 #[cfg(test)]
@@ -169,7 +115,7 @@ fn frame_for_layout(layout: LayoutPlan) -> FrameSnapshot {
     if let Some(area) = layout.extension_blank {
         hits.push(HitRegion {
             area,
-            target: HitTarget::RightRail,
+            target: HitTarget::Action(Action::Focus(Focus::RightRail)),
         });
     }
     FrameSnapshot::new(layout, hits, None, 0, Some(0), Some(0))
@@ -184,8 +130,21 @@ fn composer_edit(command: EditCommand) -> Action {
 }
 
 #[cfg(test)]
+fn test_key_action(key: KeyEvent, state: &UiState) -> Option<Action> {
+    key_action(
+        key,
+        state,
+        KeyGeometry {
+            composer_width: Some(37),
+            reader_max_scroll: Some(29),
+            right_rail_visible: true,
+        },
+    )
+}
+
+#[cfg(test)]
 fn mapped_key_action(key: KeyEvent, state: &UiState) -> Action {
-    key_action(key, state).expect("key should map to an action")
+    test_key_action(key, state).expect("key should map to an action")
 }
 
 #[cfg(test)]
@@ -210,7 +169,7 @@ mod tests {
         let mut state = UiState::default();
         assert!(matches!(
             mapped_key_action(key(KeyCode::PageUp, KeyModifiers::NONE), &state),
-            Action::ScrollUp { .. }
+            Action::ScrollUp(10)
         ));
         assert!(matches!(
             mapped_key_action(key(KeyCode::PageDown, KeyModifiers::NONE), &state),
@@ -229,7 +188,7 @@ mod tests {
         state.focus = Focus::SessionTitle;
         assert!(matches!(
             mapped_key_action(key(KeyCode::PageUp, KeyModifiers::NONE), &state),
-            Action::ScrollUp { .. }
+            Action::ScrollUp(10)
         ));
         assert!(matches!(
             mapped_key_action(key(KeyCode::PageDown, KeyModifiers::NONE), &state),
@@ -273,8 +232,118 @@ mod tests {
                 mapped_key_action(key(KeyCode::Down, KeyModifiers::CONTROL), &state),
                 Action::FocusDown
             ));
-            assert!(key_action(key(KeyCode::Tab, KeyModifiers::NONE), &state).is_none());
+            assert!(test_key_action(key(KeyCode::Tab, KeyModifiers::NONE), &state).is_none());
         }
+    }
+
+    #[test]
+    fn terminal_keys_use_the_completed_frame_geometry() {
+        let mut state = UiState::default();
+        let layout = LayoutPlan::calculate_with_widths(
+            ratatui::layout::Rect::new(0, 0, 100, 30),
+            crate::layout::SinglePane::Conversation,
+            0,
+            None,
+            None,
+            1,
+            crate::layout::PaneWidths::default(),
+        );
+        assert!(layout.extension_blank.is_none());
+        let width = crate::layout::composer_text_area(layout.composer.unwrap()).width;
+        let snapshot = frame_for_layout(layout);
+
+        assert!(matches!(
+            mapped_terminal_event(
+                Event::Key(key(KeyCode::Down, KeyModifiers::NONE)),
+                Some(&snapshot),
+                &state,
+            ),
+            UiEvent::Action(Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Move {
+                    cursor: CursorMove::Down { width: actual },
+                    select: false,
+                },
+            }) if actual == width
+        ));
+        assert!(
+            terminal_event(
+                Event::Key(key(KeyCode::Down, KeyModifiers::NONE)),
+                None,
+                &state,
+            )
+            .is_none()
+        );
+        assert!(
+            terminal_event(
+                Event::Key(key(KeyCode::Right, KeyModifiers::CONTROL)),
+                Some(&snapshot),
+                &state,
+            )
+            .is_none()
+        );
+
+        let wide = frame_for_layout(LayoutPlan::calculate_with_widths(
+            ratatui::layout::Rect::new(0, 0, 160, 30),
+            crate::layout::SinglePane::Conversation,
+            0,
+            None,
+            None,
+            1,
+            crate::layout::PaneWidths::default(),
+        ));
+        assert!(matches!(
+            mapped_terminal_event(
+                Event::Key(key(KeyCode::Right, KeyModifiers::CONTROL)),
+                Some(&wide),
+                &state,
+            ),
+            UiEvent::Action(Action::FocusRight)
+        ));
+
+        state.focus = Focus::Sessions;
+        assert!(matches!(
+            mapped_terminal_event(
+                Event::Key(key(KeyCode::Right, KeyModifiers::CONTROL)),
+                Some(&snapshot),
+                &state,
+            ),
+            UiEvent::Action(Action::FocusRight)
+        ));
+    }
+
+    #[test]
+    fn reader_wheel_uses_the_completed_frame_scroll_limit() {
+        let layout = LayoutPlan::calculate_with_widths(
+            ratatui::layout::Rect::new(0, 0, 100, 30),
+            crate::layout::SinglePane::Conversation,
+            0,
+            None,
+            None,
+            1,
+            crate::layout::PaneWidths::default(),
+        );
+        let area = layout.transcript.unwrap();
+        let mut hits = HitMap::default();
+        hits.push(HitRegion {
+            area,
+            target: HitTarget::Reader,
+        });
+        let snapshot = FrameSnapshot::new(layout, hits, None, 47, None, None);
+
+        assert!(matches!(
+            mapped_terminal_event(
+                Event::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                Some(&snapshot),
+                &UiState::default(),
+            ),
+            UiEvent::Action(Action::ScrollPanel { amount: 3, max: 47 })
+        ));
     }
 }
 
@@ -374,10 +443,12 @@ mod model_keyboard_tests {
         let mut state = UiState::default();
         state.panel = Some(crate::state::Panel::Models);
         for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
-            assert!(key_action(KeyEvent::new(KeyCode::Char('a'), modifiers), &state).is_none());
+            assert!(
+                test_key_action(KeyEvent::new(KeyCode::Char('a'), modifiers), &state).is_none()
+            );
         }
         assert!(
-            key_action(
+            test_key_action(
                 KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
                 &state
             )
@@ -559,7 +630,7 @@ mod selection_tests {
         let mut state = UiState::default();
         for (key, expected) in [
             (KeyCode::Left, CursorMove::Left),
-            (KeyCode::Down, CursorMove::Down { width: 1 }),
+            (KeyCode::Down, CursorMove::Down { width: 37 }),
             (KeyCode::Home, CursorMove::LineStart),
         ] {
             assert!(
@@ -663,7 +734,7 @@ mod selection_tests {
                 );
                 for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT | KeyModifiers::ALT] {
                     assert!(
-                        key_action(KeyEvent::new(key, modifiers), &state).is_none(),
+                        test_key_action(KeyEvent::new(key, modifiers), &state).is_none(),
                         "{focus:?} must leave {modifiers:?}+{key:?} unbound"
                     );
                 }
@@ -789,7 +860,7 @@ mod pointer_submit_tests {
         let submit = plan
             .hit_regions()
             .iter()
-            .find(|region| region.target == HitTarget::Submit)
+            .find(|region| region.target == HitTarget::Action(Action::ClickSubmit))
             .unwrap();
         assert!(matches!(
             mapped_terminal_event(
@@ -804,7 +875,9 @@ mod pointer_submit_tests {
             ),
             UiEvent::Action(Action::ClickSubmit)
         ));
-        assert!(key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state).is_none());
+        assert!(
+            test_key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state).is_none()
+        );
     }
 }
 
@@ -846,6 +919,18 @@ mod pane_resize_tests {
                 "pane resizing must not issue product operations"
             );
         }
+    }
+
+    #[test]
+    fn focus_loss_only_releases_an_active_divider_drag() {
+        let mut state = UiState::default();
+        assert!(terminal_event(Event::FocusLost, None, &state).is_none());
+
+        state.dragging_divider = Some(PaneDivider::Left);
+        assert!(matches!(
+            terminal_event(Event::FocusLost, None, &state),
+            Some(UiEvent::Action(Action::EndPaneResize))
+        ));
     }
 
     #[test]
@@ -1066,12 +1151,12 @@ mod input_chord_tests {
         assert!(state.orphan_draft.revision() > revision);
         for focus in [Focus::Sessions, Focus::SessionTitle, Focus::RightRail] {
             state.focus = focus;
-            assert!(key_action(clear, &state).is_none());
+            assert!(test_key_action(clear, &state).is_none());
         }
         state.focus = Focus::Composer;
         for panel in [Panel::Models, Panel::Help, Panel::ModelSetup] {
             state.panel = Some(panel);
-            assert!(key_action(clear, &state).is_none());
+            assert!(test_key_action(clear, &state).is_none());
             assert!(matches!(
                 mapped_key_action(
                     KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -1097,23 +1182,25 @@ mod input_chord_tests {
                 command: EditCommand::Insert { ref text, typing: false }
             } if text == "\n"
         ));
-        assert!(key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &state).is_none());
         assert!(
-            key_action(
+            test_key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &state).is_none()
+        );
+        assert!(
+            test_key_action(
                 KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
                 &state
             )
             .is_none()
         );
         assert!(
-            key_action(
+            test_key_action(
                 KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
                 &state
             )
             .is_none()
         );
         assert!(
-            key_action(
+            test_key_action(
                 KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
                 &state
             )
@@ -1134,7 +1221,8 @@ mod input_chord_tests {
         for focus in [Focus::Sessions, Focus::SessionTitle, Focus::RightRail] {
             state.focus = focus;
             assert!(
-                key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &state).is_none()
+                test_key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &state)
+                    .is_none()
             );
         }
         state.focus = Focus::Composer;
@@ -1145,7 +1233,9 @@ mod input_chord_tests {
                 KeyModifiers::ALT,
                 KeyModifiers::CONTROL,
             ] {
-                assert!(key_action(KeyEvent::new(KeyCode::Enter, modifiers), &state).is_none());
+                assert!(
+                    test_key_action(KeyEvent::new(KeyCode::Enter, modifiers), &state).is_none()
+                );
             }
         }
     }
@@ -1169,14 +1259,14 @@ mod input_chord_tests {
                 Action::Quit
             ));
             assert!(
-                key_action(
+                test_key_action(
                     KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
                     &state
                 )
                 .is_none()
             );
             assert!(
-                key_action(
+                test_key_action(
                     KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
                     &state
                 )
@@ -1193,14 +1283,14 @@ mod input_chord_tests {
                 Action::Quit
             ));
             assert!(
-                key_action(
+                test_key_action(
                     KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
                     &state
                 )
                 .is_none()
             );
             assert!(
-                key_action(
+                test_key_action(
                     KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
                     &state
                 )

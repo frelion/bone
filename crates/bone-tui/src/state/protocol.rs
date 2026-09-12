@@ -2,12 +2,10 @@ use std::sync::Arc;
 
 use bone_app::{
     HistoryCursor, HistoryPage, InputId, QuestionId, RecentHistoryPage, RequestId, SessionId,
-    SessionInfo, SessionView, SubmitInput, WorkspaceId,
+    SessionInfo, SessionView, SubmitInput,
 };
 
 use super::model::{Focus, SessionNavRow};
-use crate::layout::TranscriptMetrics;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EditorTarget {
     Composer,
@@ -39,7 +37,7 @@ pub enum EditCommand {
     Redo,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     BeginPaneResize(crate::layout::PaneDivider),
     DragPane {
@@ -100,10 +98,7 @@ pub enum Action {
     RetryInput(InputId),
     RetrySubmission,
     Escape,
-    ScrollUp {
-        amount: usize,
-        metrics: Option<Arc<TranscriptMetrics>>,
-    },
+    ScrollUp(usize),
     ScrollDown(usize),
     Stop,
     Quit,
@@ -149,7 +144,6 @@ pub enum UiEvent {
 
     Action(Action),
     WorkspaceOpened {
-        id: WorkspaceId,
         label: String,
         rows: Vec<SessionNavRow>,
         last_active: Option<SessionId>,
@@ -191,7 +185,6 @@ pub enum UiEvent {
         session: SessionId,
         generation: u64,
         revision: u64,
-        text: String,
     },
     Submitted {
         session: SessionId,
@@ -352,7 +345,6 @@ pub enum Effect {
         generation: u64,
     },
     RememberSession {
-        workspace: WorkspaceId,
         session: SessionId,
     },
     Shutdown,

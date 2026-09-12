@@ -2,7 +2,7 @@ use ratatui::{Frame, layout::Rect, widgets::Paragraph};
 
 use crate::{
     layout::{HitRegion, HitTarget, attached_floating_panel_area, floating_menu_stride},
-    state::{CommandSpec, UiState},
+    state::{Action, CommandSpec, UiState},
     ui::{interaction::HitMap, theme},
 };
 
@@ -28,11 +28,11 @@ pub(super) fn render(
     // blank rows cannot fall through to the conversation underneath it.
     hits.push(HitRegion {
         area,
-        target: HitTarget::CommandPalette,
+        target: HitTarget::Capture,
     });
     hits.push(HitRegion {
         area: shell.back,
-        target: HitTarget::Back,
+        target: HitTarget::Action(Action::Escape),
     });
 
     let capacity = usize::from(shell.inner.height / shell.stride).max(1);
@@ -66,7 +66,7 @@ pub(super) fn render(
         );
         hits.push(HitRegion {
             area: row,
-            target: HitTarget::SlashCommand(command.kind),
+            target: HitTarget::Action(Action::ExecuteCommand(command.kind)),
         });
     }
 }
@@ -91,7 +91,7 @@ mod tests {
             let palette = snapshot
                 .hit_regions()
                 .iter()
-                .find(|hit| hit.target == HitTarget::CommandPalette)
+                .find(|hit| hit.target == HitTarget::Capture)
                 .expect("slash panel")
                 .area;
             assert_eq!((palette.x, palette.width), (composer.x, composer.width));
@@ -114,7 +114,7 @@ mod tests {
         let area = plan
             .hit_regions()
             .iter()
-            .find(|hit| hit.target == HitTarget::CommandPalette)
+            .find(|hit| hit.target == HitTarget::Capture)
             .expect("slash panel")
             .area;
         let buffer = terminal.backend().buffer();
@@ -134,7 +134,7 @@ mod tests {
         let selected = plan
             .hit_regions()
             .iter()
-            .find(|hit| matches!(hit.target, HitTarget::SlashCommand(_)))
+            .find(|hit| matches!(hit.target, HitTarget::Action(Action::ExecuteCommand(_))))
             .expect("selected command row")
             .area;
         for x in selected.x..selected.right() {
@@ -144,7 +144,7 @@ mod tests {
         assert!(
             plan.hit_regions()
                 .iter()
-                .any(|hit| hit.target == HitTarget::CommandPalette && hit.area == area)
+                .any(|hit| hit.target == HitTarget::Capture && hit.area == area)
         );
     }
 
@@ -161,7 +161,7 @@ mod tests {
         let area = snapshot
             .hit_regions()
             .iter()
-            .find(|hit| hit.target == HitTarget::CommandPalette)
+            .find(|hit| hit.target == HitTarget::Capture)
             .expect("slash panel")
             .area;
         let screen = terminal
@@ -172,9 +172,6 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("No matching commands"));
-        assert_eq!(
-            snapshot.hit(area.x + 1, area.y),
-            Some(HitTarget::CommandPalette)
-        );
+        assert_eq!(snapshot.hit(area.x + 1, area.y), Some(HitTarget::Capture));
     }
 }

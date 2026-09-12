@@ -1,7 +1,7 @@
 use crate::{
     input::{BindingHint, status_baseline_bindings},
     layout::{HitRegion, HitTarget},
-    state::{Focus, UiState},
+    state::{Action, Focus, UiState},
     ui::{caret, focus, interaction::HitMap, theme},
     view::single_line_external,
 };
@@ -115,17 +115,17 @@ pub(super) fn render(
         if actionable && !state.slash_palette_visible() {
             hits.push(HitRegion {
                 area: action_area,
-                target: HitTarget::Submit,
+                target: HitTarget::Action(Action::ClickSubmit),
             });
         }
         hits.push(HitRegion {
             area: geometry.model,
-            target: HitTarget::Models,
+            target: HitTarget::Action(Action::OpenModels),
         });
         if let Some(commands) = geometry.commands {
             hits.push(HitRegion {
                 area: Rect::new(commands.x, commands.y, 10, 1),
-                target: HitTarget::StartSlashCommand,
+                target: HitTarget::Action(Action::StartSlashCommand),
             });
         }
     }
@@ -162,7 +162,7 @@ pub(super) fn render(
         );
         hits.push(HitRegion {
             area: stop,
-            target: HitTarget::Stop,
+            target: HitTarget::Action(Action::Stop),
         });
     }
     if focused && input.width > 0 && input.height > 0 {
@@ -469,7 +469,7 @@ mod tests {
             for offset in 0.."Select model".len().min(usize::from(geometry.model.width)) {
                 assert_eq!(
                     plan.hit(geometry.model.x + offset as u16, geometry.model.y),
-                    Some(HitTarget::Models),
+                    Some(HitTarget::Action(Action::OpenModels)),
                     "width {width}"
                 );
             }
@@ -478,10 +478,13 @@ mod tests {
                 !plan
                     .hit_regions()
                     .iter()
-                    .any(|region| region.target == HitTarget::StartSlashCommand)
+                    .any(|region| region.target == HitTarget::Action(Action::StartSlashCommand))
             );
             let submit = action(area, &state).0;
-            assert_eq!(plan.hit(submit.x, submit.y), Some(HitTarget::Submit));
+            assert_eq!(
+                plan.hit(submit.x, submit.y),
+                Some(HitTarget::Action(Action::ClickSubmit))
+            );
 
             let empty = UiState::default();
             let mut empty_terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
@@ -500,20 +503,20 @@ mod tests {
                 for x in commands.x..commands.x + 10 {
                     assert_eq!(
                         empty_plan.hit(x, commands.y),
-                        Some(HitTarget::StartSlashCommand),
+                        Some(HitTarget::Action(Action::StartSlashCommand)),
                         "width {width}"
                     );
                 }
                 assert_ne!(
                     empty_plan.hit(commands.x + 11, commands.y),
-                    Some(HitTarget::StartSlashCommand)
+                    Some(HitTarget::Action(Action::StartSlashCommand))
                 );
             } else {
                 assert!(
                     !empty_plan
                         .hit_regions()
                         .iter()
-                        .any(|region| region.target == HitTarget::StartSlashCommand),
+                        .any(|region| region.target == HitTarget::Action(Action::StartSlashCommand)),
                     "hidden commands at width {width}"
                 );
             }

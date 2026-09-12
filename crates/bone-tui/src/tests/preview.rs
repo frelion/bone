@@ -60,7 +60,7 @@ fn render_preview_artifact() {
         env::var("BONE_TUI_PREVIEW_SCENARIO").unwrap_or_else(|_| "conversation".to_owned());
     let workspace = WorkspaceId::new();
     let mut state = UiState::default();
-    state.workspace = Some((workspace, "BONE".into()));
+    state.workspace_label = Some("BONE".into());
     state.model_label = Some("Worker · GPT-5.5".into());
     let sessions = [
         "草稿恢复",

@@ -162,13 +162,12 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::Action(action) => handle_action(state, action, &mut effects),
         UiEvent::WorkspaceOpened {
-            id,
             label,
             rows,
             last_active,
             model_label,
         } => {
-            state.workspace = Some((id, label));
+            state.workspace_label = Some(label);
             state.model_label = model_label;
             state.session_rows = rows;
             let preferred = last_active.filter(|candidate| {
@@ -212,7 +211,6 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                         let cursor = merged.len();
                         ui.draft.reconcile(merged, cursor);
                     }
-                    ui.saved_draft = snapshot.draft.clone();
                     ui.hydrated = true;
                 }
                 ui.snapshot = Some(snapshot);
@@ -433,13 +431,11 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             session,
             generation,
             revision,
-            text,
         } => {
             if let Some(ui) = current_generation_mut(state, session, generation)
                 && revision >= ui.saved_draft_revision
             {
                 ui.saved_draft_revision = revision;
-                ui.saved_draft = text;
             }
         }
         UiEvent::Submitted {
@@ -1069,7 +1065,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 effects.extend(stop_selected(state));
             }
         }
-        Action::ScrollUp { amount, metrics } => scroll_up(state, amount, metrics, effects),
+        Action::ScrollUp(amount) => scroll_up(state, amount, effects),
         Action::ScrollDown(amount) => {
             if let Some(ui) = state.selected_ui_mut() {
                 let target = ui.transcript_metrics.as_ref().map(|metrics| {
@@ -1769,11 +1765,8 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
         session: id,
         generation,
     });
-    if let Some((workspace, _)) = state.workspace {
-        effects.push(Effect::RememberSession {
-            workspace,
-            session: id,
-        });
+    if state.workspace_label.is_some() {
+        effects.push(Effect::RememberSession { session: id });
     }
     // Opening another Session changes content, not the user's chosen region.
     // If the title already owned focus, prepare the new title editor without
@@ -1796,14 +1789,9 @@ fn follow_transcript_tail(ui: &mut SessionUi, effects: &mut Vec<Effect>) {
     }
 }
 
-fn scroll_up(
-    state: &mut UiState,
-    amount: usize,
-    metrics: Option<std::sync::Arc<crate::layout::TranscriptMetrics>>,
-    effects: &mut Vec<Effect>,
-) {
+fn scroll_up(state: &mut UiState, amount: usize, effects: &mut Vec<Effect>) {
     if let Some(ui) = state.selected_ui_mut() {
-        let metrics = metrics.or_else(|| ui.transcript_metrics.clone());
+        let metrics = ui.transcript_metrics.clone();
         if let Some(metrics) = &metrics {
             let start = ui
                 .read_anchor
@@ -2203,7 +2191,6 @@ mod owned_editor_lifecycle_tests {
                 session: first.id,
                 generation: 1,
                 revision: 8,
-                text: "x".into(),
             },
         );
         let effects = update(
@@ -4521,10 +4508,7 @@ mod title_rename_tests {
         dirty_title(&mut state, "Local edit");
 
         for action in [
-            Action::ScrollUp {
-                amount: 3,
-                metrics: None,
-            },
+            Action::ScrollUp(3),
             Action::ScrollSessions { start: 1 },
             Action::BeginPaneResize(crate::layout::PaneDivider::Left),
         ] {

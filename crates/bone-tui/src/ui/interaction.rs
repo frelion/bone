@@ -1,40 +1,21 @@
 use ratatui::layout::Rect;
 
-use crate::layout::PaneDivider;
+use crate::{layout::PaneDivider, state::Action};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HitTarget {
+    Action(Action),
     PaneDivider(PaneDivider),
-    ConnectionKind(usize),
-    SetupField(crate::state::SetupField),
-    SaveConnection,
     SessionRail,
-    StartSlashCommand,
-    CommandPalette,
-    Models,
-    Back,
+    Capture,
     Reader,
-    Model(usize),
-    Object(usize),
-    History(bone_app::SessionSeq),
-    Job(bone_app::JobRef),
-    Answer(bone_app::QuestionId),
-    LeaveAnswer,
-    ConvertAnswer,
-    Restore(bone_app::InputId),
-    Retry(bone_app::InputId),
-    RetrySubmission,
     Session(bone_app::SessionId),
     SessionTitle,
     Conversation,
     Composer,
-    RightRail,
-    SlashCommand(crate::state::CommandKind),
-    Submit,
-    Stop,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HitRegion {
     pub area: Rect,
     pub target: HitTarget,
@@ -64,7 +45,7 @@ impl HitMap {
             .iter()
             .rev()
             .find(|region| contains(region.area, x, y))
-            .map(|region| region.target)
+            .map(|region| region.target.clone())
     }
 }
 

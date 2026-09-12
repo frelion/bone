@@ -89,7 +89,6 @@ pub async fn run() -> Result<(), RunError> {
     let mut effects = VecDeque::from(update(
         &mut state,
         UiEvent::WorkspaceOpened {
-            id: workspace.id,
             label,
             rows,
             last_active,

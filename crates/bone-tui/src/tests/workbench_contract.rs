@@ -25,9 +25,7 @@ fn session(workspace: WorkspaceId, title: &str) -> SessionInfo {
 
 fn opened_state(infos: &[SessionInfo]) -> UiState {
     let mut state = UiState::default();
-    state.workspace = infos
-        .first()
-        .map(|info| (info.workspace, "contract workspace".into()));
+    state.workspace_label = infos.first().map(|_| "contract workspace".into());
     state.session_rows = infos
         .iter()
         .cloned()
@@ -117,7 +115,7 @@ fn slash_new_creates_directly_without_a_dialog_and_cannot_be_submitted_twice() {
 #[test]
 fn text_typed_before_any_session_exists_is_kept_visible() {
     let mut state = UiState::default();
-    state.workspace = Some((WorkspaceId::new(), "empty workspace".into()));
+    state.workspace_label = Some("empty workspace".into());
     update(
         &mut state,
         UiEvent::Action(insert("a normal first request")),
@@ -273,7 +271,7 @@ fn right_rail_is_an_explicit_focus_target_without_phantom_actions() {
         for x in blank.x.saturating_add(1)..blank.right() {
             assert_eq!(
                 plan.hit(x, y),
-                Some(HitTarget::RightRail),
+                Some(HitTarget::Action(Action::Focus(Focus::RightRail))),
                 "the visible right rail must have one stable focus target at ({x}, {y})"
             );
         }
@@ -364,7 +362,7 @@ fn minimum_menu_scrolls_to_selected_command_and_hits_it() {
         assert!(
             plan.hit_regions()
                 .iter()
-                .any(|r| r.target == HitTarget::SlashCommand(command.kind))
+                .any(|r| r.target == HitTarget::Action(Action::ExecuteCommand(command.kind)))
         );
     }
 }

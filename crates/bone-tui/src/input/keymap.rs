@@ -4,6 +4,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::state::{Action, CursorMove, EditCommand, EditorTarget, Focus, Panel, UiState};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct KeyGeometry {
+    pub(super) composer_width: Option<u16>,
+    pub(super) reader_max_scroll: Option<usize>,
+    pub(super) right_rail_visible: bool,
+}
+
 /// One shortcut rendered in the composer's status baseline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BindingHint {
@@ -36,7 +43,7 @@ pub(crate) fn status_baseline_bindings(shift_enter_supported: bool) -> [BindingH
     bindings
 }
 
-pub(super) fn key_action(key: KeyEvent, state: &UiState) -> Option<Action> {
+pub(super) fn key_action(key: KeyEvent, state: &UiState, geometry: KeyGeometry) -> Option<Action> {
     // Exit is global, including modal panels and the too-small fallback screen.
     if exact(&key, KeyCode::Char('d'), KeyModifiers::CONTROL) {
         return Some(Action::Quit);
@@ -60,7 +67,7 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState) -> Option<Action> {
     }
 
     if let Some(panel) = &state.panel {
-        return panel_action(key, panel);
+        return panel_action(key, panel, geometry);
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -71,7 +78,12 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState) -> Option<Action> {
         }
         return match key.code {
             KeyCode::Left => Some(Action::FocusLeft),
-            KeyCode::Right => Some(Action::FocusRight),
+            KeyCode::Right
+                if !matches!(state.focus, Focus::SessionTitle | Focus::Composer)
+                    || geometry.right_rail_visible =>
+            {
+                Some(Action::FocusRight)
+            }
             KeyCode::Up => Some(Action::FocusUp),
             KeyCode::Down => Some(Action::FocusDown),
             KeyCode::Char('c') if state.focus == Focus::Composer => {
@@ -101,10 +113,12 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState) -> Option<Action> {
             }
             KeyCode::Left => Some(CursorMove::Left),
             KeyCode::Right => Some(CursorMove::Right),
-            KeyCode::Up if target == EditorTarget::Composer => Some(CursorMove::Up { width: 1 }),
-            KeyCode::Down if target == EditorTarget::Composer => {
-                Some(CursorMove::Down { width: 1 })
-            }
+            KeyCode::Up if target == EditorTarget::Composer => geometry
+                .composer_width
+                .map(|width| CursorMove::Up { width }),
+            KeyCode::Down if target == EditorTarget::Composer => geometry
+                .composer_width
+                .map(|width| CursorMove::Down { width }),
             KeyCode::Home if key.modifiers == KeyModifiers::SHIFT => Some(CursorMove::LineStart),
             KeyCode::End if key.modifiers == KeyModifiers::SHIFT => Some(CursorMove::LineEnd),
             _ => None,
@@ -134,16 +148,13 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState) -> Option<Action> {
         KeyCode::Up if state.focus == Focus::Sessions => Some(Action::SelectPrevious),
         KeyCode::Down if state.focus == Focus::Sessions => Some(Action::SelectNext),
         KeyCode::Enter if state.focus == Focus::Sessions => Some(Action::OpenCandidate),
-        KeyCode::PageUp if editor_target.is_some() => Some(Action::ScrollUp {
-            amount: 10,
-            metrics: None,
-        }),
+        KeyCode::PageUp if editor_target.is_some() => Some(Action::ScrollUp(10)),
         KeyCode::PageDown if editor_target.is_some() => Some(Action::ScrollDown(10)),
         KeyCode::Enter if state.focus == Focus::SessionTitle => Some(Action::CommitTitle),
         KeyCode::Enter if state.focus == Focus::Composer => Some(Action::Submit),
         _ => None,
     };
-    action.or_else(|| editor_key_action(key, editor_target?))
+    action.or_else(|| editor_key_action(key, editor_target?, geometry))
 }
 
 fn editor_target(focus: Focus) -> Option<EditorTarget> {
@@ -154,7 +165,7 @@ fn editor_target(focus: Focus) -> Option<EditorTarget> {
     }
 }
 
-fn editor_key_action(key: KeyEvent, target: EditorTarget) -> Option<Action> {
+fn editor_key_action(key: KeyEvent, target: EditorTarget, geometry: KeyGeometry) -> Option<Action> {
     let command = match key.code {
         KeyCode::Backspace => EditCommand::DeleteBefore,
         KeyCode::Delete => EditCommand::DeleteAfter,
@@ -163,10 +174,14 @@ fn editor_key_action(key: KeyEvent, target: EditorTarget) -> Option<Action> {
         KeyCode::Home => return Some(move_editor(target, CursorMove::LineStart)),
         KeyCode::End => return Some(move_editor(target, CursorMove::LineEnd)),
         KeyCode::Up if target == EditorTarget::Composer => {
-            return Some(move_editor(target, CursorMove::Up { width: 1 }));
+            return geometry
+                .composer_width
+                .map(|width| move_editor(target, CursorMove::Up { width }));
         }
         KeyCode::Down if target == EditorTarget::Composer => {
-            return Some(move_editor(target, CursorMove::Down { width: 1 }));
+            return geometry
+                .composer_width
+                .map(|width| move_editor(target, CursorMove::Down { width }));
         }
         KeyCode::Char(value) => EditCommand::Insert {
             text: value.to_string(),
@@ -195,7 +210,7 @@ fn exact(key: &KeyEvent, code: KeyCode, modifiers: KeyModifiers) -> bool {
     key.code == code && key.modifiers == modifiers
 }
 
-fn panel_action(key: KeyEvent, panel: &Panel) -> Option<Action> {
+fn panel_action(key: KeyEvent, panel: &Panel, geometry: KeyGeometry) -> Option<Action> {
     if matches!(panel, Panel::ModelSetup) {
         if exact(&key, KeyCode::Char('u'), KeyModifiers::CONTROL) {
             return Some(Action::SetupClear);
@@ -232,15 +247,15 @@ fn panel_action(key: KeyEvent, panel: &Panel) -> Option<Action> {
     match key.code {
         KeyCode::Esc => Some(Action::Escape),
         KeyCode::Up | KeyCode::PageUp if matches!(panel, Panel::Reader(_)) => {
-            Some(Action::ScrollPanel {
+            geometry.reader_max_scroll.map(|max| Action::ScrollPanel {
                 amount: if key.code == KeyCode::PageUp { -10 } else { -1 },
-                max: 0,
+                max,
             })
         }
         KeyCode::Down | KeyCode::PageDown if matches!(panel, Panel::Reader(_)) => {
-            Some(Action::ScrollPanel {
+            geometry.reader_max_scroll.map(|max| Action::ScrollPanel {
                 amount: if key.code == KeyCode::PageDown { 10 } else { 1 },
-                max: 0,
+                max,
             })
         }
         KeyCode::Up => Some(Action::PanelPrevious),
@@ -258,18 +273,40 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
+    fn action_for_key(key: KeyEvent, state: &UiState) -> Option<Action> {
+        key_action(
+            key,
+            state,
+            KeyGeometry {
+                composer_width: Some(37),
+                reader_max_scroll: Some(29),
+                right_rail_visible: true,
+            },
+        )
+    }
+
+    fn reader_panel() -> Panel {
+        Panel::Reader(crate::state::reader::ReaderContent {
+            session: bone_app::SessionId::new(),
+            source: crate::state::reader::ReaderSource::History(bone_app::SessionSeq(1)),
+            title: "reader".into(),
+            text: "content".into(),
+            layout_cache: std::cell::RefCell::new(None),
+        })
+    }
+
     #[test]
     fn spatial_focus_requires_exact_control() {
         let state = UiState::default();
         for code in [KeyCode::Left, KeyCode::Right, KeyCode::Up, KeyCode::Down] {
-            assert!(key_action(key(code, KeyModifiers::CONTROL), &state).is_some());
+            assert!(action_for_key(key(code, KeyModifiers::CONTROL), &state).is_some());
             for extra in [
                 KeyModifiers::SHIFT,
                 KeyModifiers::ALT,
                 KeyModifiers::SHIFT | KeyModifiers::ALT,
             ] {
                 assert!(
-                    key_action(key(code, KeyModifiers::CONTROL | extra), &state).is_none(),
+                    action_for_key(key(code, KeyModifiers::CONTROL | extra), &state).is_none(),
                     "{code:?} with {extra:?} must not move focus"
                 );
             }
@@ -282,11 +319,11 @@ mod tests {
         state.panel = Some(Panel::ModelSetup);
 
         assert!(matches!(
-            key_action(key(KeyCode::Char('u'), KeyModifiers::CONTROL), &state),
+            action_for_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL), &state),
             Some(Action::SetupClear)
         ));
         assert!(
-            key_action(
+            action_for_key(
                 key(
                     KeyCode::Char('u'),
                     KeyModifiers::CONTROL | KeyModifiers::SHIFT
@@ -296,9 +333,9 @@ mod tests {
             .is_none()
         );
         for code in [KeyCode::Up, KeyCode::Down] {
-            assert!(key_action(key(code, KeyModifiers::CONTROL), &state).is_none());
+            assert!(action_for_key(key(code, KeyModifiers::CONTROL), &state).is_none());
             assert!(
-                key_action(
+                action_for_key(
                     key(code, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
                     &state
                 )
@@ -306,11 +343,11 @@ mod tests {
             );
         }
         assert!(matches!(
-            key_action(key(KeyCode::Up, KeyModifiers::NONE), &state),
+            action_for_key(key(KeyCode::Up, KeyModifiers::NONE), &state),
             Some(Action::PreviousField)
         ));
         assert!(matches!(
-            key_action(key(KeyCode::Down, KeyModifiers::NONE), &state),
+            action_for_key(key(KeyCode::Down, KeyModifiers::NONE), &state),
             Some(Action::NextField)
         ));
     }
@@ -319,25 +356,25 @@ mod tests {
     fn documented_input_chords_remain_exact_without_aliases() {
         let state = UiState::default();
         assert!(matches!(
-            key_action(key(KeyCode::Enter, KeyModifiers::NONE), &state),
+            action_for_key(key(KeyCode::Enter, KeyModifiers::NONE), &state),
             Some(Action::Submit)
         ));
         assert!(matches!(
-            key_action(key(KeyCode::Enter, KeyModifiers::SHIFT), &state),
+            action_for_key(key(KeyCode::Enter, KeyModifiers::SHIFT), &state),
             Some(Action::Edit {
                 target: EditorTarget::Composer,
                 command: EditCommand::Insert { ref text, typing: false }
             }) if text == "\n"
         ));
         assert!(matches!(
-            key_action(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state),
+            action_for_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state),
             Some(Action::Edit {
                 target: EditorTarget::Composer,
                 command: EditCommand::Clear
             })
         ));
         assert!(matches!(
-            key_action(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &state),
+            action_for_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &state),
             Some(Action::Quit)
         ));
 
@@ -356,7 +393,7 @@ mod tests {
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             ),
         ] {
-            assert!(key_action(key, &state).is_none());
+            assert!(action_for_key(key, &state).is_none());
         }
     }
 
@@ -367,12 +404,59 @@ mod tests {
         assert!(state.slash_palette_visible());
         assert!(state.slash_matches().is_empty());
         assert!(matches!(
-            key_action(key(KeyCode::Up, KeyModifiers::NONE), &state),
+            action_for_key(key(KeyCode::Up, KeyModifiers::NONE), &state),
             Some(Action::SelectSlashPrevious)
         ));
         assert!(matches!(
-            key_action(key(KeyCode::Down, KeyModifiers::NONE), &state),
+            action_for_key(key(KeyCode::Down, KeyModifiers::NONE), &state),
             Some(Action::SelectSlashNext)
         ));
+    }
+
+    #[test]
+    fn geometry_bound_keys_do_not_invent_measurements() {
+        let mut state = UiState::default();
+        let measured = KeyGeometry {
+            composer_width: Some(51),
+            reader_max_scroll: Some(73),
+            right_rail_visible: false,
+        };
+        let unavailable = KeyGeometry {
+            composer_width: None,
+            reader_max_scroll: None,
+            right_rail_visible: false,
+        };
+
+        assert!(matches!(
+            key_action(key(KeyCode::Down, KeyModifiers::NONE), &state, measured),
+            Some(Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Move {
+                    cursor: CursorMove::Down { width: 51 },
+                    select: false,
+                },
+            })
+        ));
+        assert!(key_action(key(KeyCode::Down, KeyModifiers::NONE), &state, unavailable,).is_none());
+        assert!(
+            key_action(key(KeyCode::Right, KeyModifiers::CONTROL), &state, measured,).is_none()
+        );
+
+        state.panel = Some(reader_panel());
+        assert!(matches!(
+            key_action(key(KeyCode::PageDown, KeyModifiers::NONE), &state, measured),
+            Some(Action::ScrollPanel {
+                amount: 10,
+                max: 73,
+            })
+        ));
+        assert!(
+            key_action(
+                key(KeyCode::PageDown, KeyModifiers::NONE),
+                &state,
+                unavailable,
+            )
+            .is_none()
+        );
     }
 }

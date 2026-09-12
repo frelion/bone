@@ -2,7 +2,7 @@
 use super::single_line_external;
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan},
-    state::{ConnectionKind, Panel, SetupField, UiState},
+    state::{Action, ConnectionKind, Panel, SetupField, UiState},
     ui::{
         caret,
         interaction::HitMap,
@@ -65,7 +65,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
     );
     hits.push(HitRegion {
         area: back,
-        target: HitTarget::Back,
+        target: HitTarget::Action(Action::Escape),
     });
     if matches!(state.panel, Some(Panel::ModelAdd)) {
         for (index, kind) in ConnectionKind::ALL.iter().enumerate() {
@@ -82,7 +82,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
             );
             hits.push(HitRegion {
                 area: row,
-                target: HitTarget::ConnectionKind(index),
+                target: HitTarget::Action(Action::ChooseConnectionKind(index)),
             });
         }
         return;
@@ -156,7 +156,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
         }
         hits.push(HitRegion {
             area: row,
-            target: HitTarget::SetupField(*field),
+            target: HitTarget::Action(Action::SelectField(*field)),
         });
     }
     let action = Rect::new(x, area.bottom().saturating_sub(2 + inset), width, 1);
@@ -176,7 +176,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
     if !form.saving {
         hits.push(HitRegion {
             area: action,
-            target: HitTarget::SaveConnection,
+            target: HitTarget::Action(Action::SaveConnection),
         });
     }
 }
@@ -249,12 +249,12 @@ mod tests {
                 let hit = layout
                     .hit_regions()
                     .iter()
-                    .find(|hit| hit.target == HitTarget::SetupField(field))
+                    .find(|hit| hit.target == HitTarget::Action(Action::SelectField(field)))
                     .unwrap();
                 assert!(hit.area.right() <= width && hit.area.bottom() <= height);
                 assert_eq!(
                     layout.hit(hit.area.x, hit.area.y),
-                    Some(HitTarget::SetupField(field))
+                    Some(HitTarget::Action(Action::SelectField(field)))
                 );
                 let field_text: String = (hit.area.x..hit.area.right())
                     .map(|x| buffer[(x, hit.area.y)].symbol())
@@ -276,7 +276,7 @@ mod tests {
                 layout
                     .hit_regions()
                     .iter()
-                    .any(|hit| hit.target == HitTarget::SaveConnection)
+                    .any(|hit| hit.target == HitTarget::Action(Action::SaveConnection))
             );
             assert_eq!(state.orphan_draft.text(), "untouched chat draft");
         }
@@ -326,11 +326,13 @@ mod tests {
                     let region = layout
                         .hit_regions()
                         .iter()
-                        .find(|r| r.target == HitTarget::ConnectionKind(index))
+                        .find(|r| {
+                            r.target == HitTarget::Action(Action::ChooseConnectionKind(index))
+                        })
                         .unwrap();
                     assert_eq!(
                         layout.hit(region.area.x, region.area.y),
-                        Some(HitTarget::ConnectionKind(index))
+                        Some(HitTarget::Action(Action::ChooseConnectionKind(index)))
                     );
                 }
             })

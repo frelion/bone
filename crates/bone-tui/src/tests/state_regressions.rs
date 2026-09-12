@@ -38,9 +38,7 @@ fn snapshot(info: &SessionInfo, through: u64) -> Arc<SessionView> {
 
 fn opened(infos: &[SessionInfo]) -> UiState {
     let mut state = UiState::default();
-    state.workspace = infos
-        .first()
-        .map(|item| (item.workspace, "regression workspace".into()));
+    state.workspace_label = infos.first().map(|_| "regression workspace".into());
     state.session_rows = infos
         .iter()
         .cloned()
@@ -519,7 +517,7 @@ fn session_rail_renders_draft_attention_and_recoverable_statuses() {
     let attention = info(workspace, "attention session");
     let recoverable = info(workspace, "recoverable session");
     let mut state = UiState::default();
-    state.workspace = Some((workspace, "status workspace".into()));
+    state.workspace_label = Some("status workspace".into());
     let mut draft = SessionNavRow::provisional(draft);
     draft.summary.has_draft = true;
     let mut attention = SessionNavRow::provisional(attention);
@@ -624,14 +622,9 @@ fn visual_row_metrics_prevent_early_older_history_prefetch() {
         .transcript_metrics
         .expect("rendered transcript metrics");
     assert!(metrics.total_rows > metrics.viewport_rows + 10);
+    assert!(crate::state::retain_transcript(&mut state, metrics));
 
-    let effects = update(
-        &mut state,
-        UiEvent::Action(Action::ScrollUp {
-            amount: 1,
-            metrics: Some(metrics),
-        }),
-    );
+    let effects = update(&mut state, UiEvent::Action(Action::ScrollUp(1)));
     assert_eq!(state.session_ui[&session.id].scroll_from_tail, 1);
     assert!(
         !effects

@@ -9,7 +9,7 @@ use ratatui::{
 
 use crate::{
     layout::{HitRegion, HitTarget, LayoutMode, LayoutPlan, TranscriptMetrics},
-    state::{CommandSpec, Focus, UiState},
+    state::{Action, CommandSpec, Focus, UiState},
     ui::{caret, focus, interaction::HitMap, theme},
     view::{composer, message, single_line_external, slash_palette},
 };
@@ -106,9 +106,15 @@ pub(super) fn render(
             crate::state::answer::active_question(snapshot, answer.question).is_some()
         });
         let (label, target) = if active {
-            ("Answering · back to draft", HitTarget::LeaveAnswer)
+            (
+                "Answering · back to draft",
+                HitTarget::Action(Action::LeaveAnswer),
+            )
         } else {
-            ("Question ended · keep as draft", HitTarget::ConvertAnswer)
+            (
+                "Question ended · keep as draft",
+                HitTarget::Action(Action::ConvertAnswer),
+            )
         };
         frame.render_widget(
             Paragraph::new(label).style(theme::body_on(theme::WARNING, theme::PANEL)),
@@ -316,14 +322,14 @@ fn render_transcript(
         let target = match entry.event {
             bone_app::SessionEvent::ToolFinished { .. }
             | bone_app::SessionEvent::JobFinished { .. } => {
-                Some(HitTarget::History(entry.sequence))
+                Some(HitTarget::Action(Action::OpenHistory(entry.sequence)))
             }
             bone_app::SessionEvent::QuestionAsked { question, .. }
                 if session.snapshot.as_ref().is_some_and(|snapshot| {
                     crate::state::answer::active_question(snapshot, question).is_some()
                 }) =>
             {
-                Some(HitTarget::Answer(question))
+                Some(HitTarget::Action(Action::AnswerQuestion(question)))
             }
             _ => None,
         };
@@ -354,7 +360,7 @@ fn render_transcript(
                 if reader_selects(state, crate::state::reader::ReaderSource::Job(job.id)) {
                     line.style = line.style.bg(theme::SELECTED);
                 }
-                ephemeral.push((line, Some(HitTarget::Job(job.id))));
+                ephemeral.push((line, Some(HitTarget::Action(Action::OpenJob(job.id)))));
             }
         }
         for activity in snapshot.activity.iter().rev() {
@@ -407,7 +413,10 @@ fn render_transcript(
                         theme::WARNING,
                     ));
                 }
-                links.push((rows.len(), HitTarget::Answer(question.id)));
+                links.push((
+                    rows.len(),
+                    HitTarget::Action(Action::AnswerQuestion(question.id)),
+                ));
                 rows.push(message::compact(
                     "?",
                     &format!("[answer] {}", question.text),
@@ -417,11 +426,11 @@ fn render_transcript(
             for candidate in crate::state::answer::recoverable_inputs(snapshot, &session.history) {
                 let (target, label) = match candidate {
                     crate::state::answer::RecoveryCandidate::Retry { input } => (
-                        HitTarget::Retry(input),
+                        HitTarget::Action(Action::RetryInput(input)),
                         format!("Retry saved input #{}", input.0),
                     ),
                     crate::state::answer::RecoveryCandidate::Restore { input, .. } => (
-                        HitTarget::Restore(input),
+                        HitTarget::Action(Action::RestoreInput(input)),
                         format!("Restore input #{} to draft", input.0),
                     ),
                 };
@@ -434,7 +443,7 @@ fn render_transcript(
             .as_ref()
             .is_some_and(|pending| pending.failed)
         {
-            links.push((rows.len(), HitTarget::RetrySubmission));
+            links.push((rows.len(), HitTarget::Action(Action::RetrySubmission)));
             rows.push(message::compact(
                 "↳",
                 "Retry original submission",
@@ -979,7 +988,10 @@ mod tests {
         let (text, hits, metrics) = render_rows(&state, 8);
         assert!(text.contains("[answer] Which scope?"));
         assert!(!text.contains("Start with a clear request"));
-        assert!(hits.iter().any(|h| h.target == HitTarget::Answer(q)));
+        assert!(
+            hits.iter()
+                .any(|h| h.target == HitTarget::Action(Action::AnswerQuestion(q)))
+        );
         assert!(metrics.total_rows > 0);
     }
 
@@ -1017,9 +1029,9 @@ mod tests {
         assert!(text.contains("Restore input #3 to draft"));
         assert!(text.contains("Retry original submission"));
         for target in [
-            HitTarget::Retry(InputId(2)),
-            HitTarget::Restore(InputId(3)),
-            HitTarget::RetrySubmission,
+            HitTarget::Action(Action::RetryInput(InputId(2))),
+            HitTarget::Action(Action::RestoreInput(InputId(3))),
+            HitTarget::Action(Action::RetrySubmission),
         ] {
             assert!(hits.iter().any(|h| h.target == target));
         }
@@ -1099,13 +1111,16 @@ mod tests {
         assert!(
             !hits
                 .iter()
-                .any(|h| matches!(h.target, HitTarget::Answer(_)))
+                .any(|h| matches!(h.target, HitTarget::Action(Action::AnswerQuestion(_))))
         );
         Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap())
             .inputs
             .push(active_input(q));
         let (_, hits, _) = render_rows(&state, 8);
-        assert!(hits.iter().any(|h| h.target == HitTarget::Answer(q)));
+        assert!(
+            hits.iter()
+                .any(|h| h.target == HitTarget::Action(Action::AnswerQuestion(q)))
+        );
     }
 
     #[test]
@@ -1130,7 +1145,7 @@ mod tests {
         let (text, hits, _) = render_rows(&state, 4);
         let hit = hits
             .iter()
-            .find(|h| h.target == HitTarget::Job(job))
+            .find(|h| h.target == HitTarget::Action(Action::OpenJob(job)))
             .expect("job details hit");
         assert!(
             text.lines()

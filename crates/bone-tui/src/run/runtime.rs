@@ -499,18 +499,16 @@ impl Runtime {
                             Some(value) => value,
                             None => app.session(session).await?,
                         };
-                        handle.save_draft(text.clone()).await?;
-                        Ok::<_, bone_app::Error>(text)
+                        handle.save_draft(text).await
                     }
                     .await;
                     match saved {
-                        Ok(text) => {
+                        Ok(()) => {
                             let _ = tx
                                 .send(UiEvent::DraftSaved {
                                     session,
                                     generation,
                                     revision,
-                                    text,
                                 })
                                 .await;
                         }
@@ -782,10 +780,10 @@ impl Runtime {
                     }
                 });
             }
-            Effect::RememberSession { workspace, session } => {
+            Effect::RememberSession { session } => {
                 if self
                     .app
-                    .set_last_active_session(workspace, session)
+                    .set_last_active_session(self.workspace, session)
                     .await
                     .is_err()
                 {
@@ -1046,7 +1044,6 @@ impl Runtime {
             state.orphan_draft.revision = editor.revision().wrapping_add(1);
             ui.draft = editor;
             ui.saved_draft_revision = ui.draft.revision();
-            ui.saved_draft = ui.draft.text().to_owned();
             // Prevent an in-flight hydration from replacing this just-saved buffer.
             ui.hydrated = true;
             if state

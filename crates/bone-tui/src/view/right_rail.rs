@@ -1,6 +1,6 @@
 use crate::{
     layout::{HitRegion, HitTarget},
-    state::{Focus, UiState},
+    state::{Action, Focus, UiState},
     ui::{
         focus,
         interaction::HitMap,
@@ -16,7 +16,7 @@ use ratatui::{
 pub(super) fn render(frame: &mut Frame<'_>, area: Rect, hits: &mut HitMap, state: &UiState) {
     hits.push(HitRegion {
         area,
-        target: HitTarget::RightRail,
+        target: HitTarget::Action(Action::Focus(Focus::RightRail)),
     });
     let active = focus::workspace_focused(state, Focus::RightRail);
     let surface = if active { theme::FOCUS_SURFACE } else { RAIL };

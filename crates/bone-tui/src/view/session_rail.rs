@@ -75,9 +75,9 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
     frame.render_widget(Block::default().style(theme::surface(RAIL)), area);
     let active = focus::workspace_focused(state, Focus::Sessions);
     let project = state
-        .workspace
+        .workspace_label
         .as_ref()
-        .map(|(_, name)| single_line_external(name))
+        .map(|name| single_line_external(name))
         .unwrap_or_else(|| "BONE".into());
     let header = Rect::new(area.x + 3, area.y + 1, area.width.saturating_sub(6), 1);
     let header_background = if active && state.session_rows.iter().all(|row| row.info().archived) {
@@ -327,7 +327,7 @@ mod tests {
         state.selected = Some(current.id);
         state.session_candidate = Some(candidate.id);
         state.focus = Focus::Sessions;
-        state.workspace = Some((workspace, "Workspace".into()));
+        state.workspace_label = Some("Workspace".into());
         let plan = LayoutPlan::calculate_with_widths(
             Rect::new(0, 0, 120, 24),
             SinglePane::Conversation,
@@ -417,7 +417,7 @@ mod tests {
     fn an_empty_focused_rail_uses_its_header_without_a_new_session_button() {
         let mut state = UiState::default();
         state.focus = Focus::Sessions;
-        state.workspace = Some((WorkspaceId::new(), "Workspace".into()));
+        state.workspace_label = Some("Workspace".into());
         let plan = LayoutPlan::calculate_with_widths(
             Rect::new(0, 0, 120, 24),
             SinglePane::Conversation,

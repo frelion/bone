@@ -1,7 +1,7 @@
 use super::single_line_external;
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan, floating_menu_stride, floating_panel_area},
-    state::{Panel, UiState},
+    state::{Action, Panel, UiState},
     ui::{
         interaction::HitMap,
         theme::{self, INK, INPUT, MUTED},
@@ -105,7 +105,7 @@ pub(super) fn render(
         });
         hits.push(HitRegion {
             area: metrics.back,
-            target: HitTarget::Back,
+            target: HitTarget::Action(Action::Escape),
         });
         return;
     }
@@ -140,7 +140,7 @@ pub(super) fn render(
     let back = shell.back;
     hits.push(HitRegion {
         area: back,
-        target: HitTarget::Back,
+        target: HitTarget::Action(Action::Escape),
     });
     match panel {
         Panel::Objects { choices, .. } => {
@@ -183,7 +183,7 @@ pub(super) fn render(
                     );
                     hits.push(HitRegion {
                         area: row,
-                        target: HitTarget::Object(index),
+                        target: HitTarget::Action(Action::SelectObject(index)),
                     });
                 }
             }
@@ -263,7 +263,7 @@ pub(super) fn render(
                     );
                     hits.push(HitRegion {
                         area: row,
-                        target: HitTarget::Model(index),
+                        target: HitTarget::Action(Action::SelectModel(index)),
                     });
                 }
             }
@@ -379,15 +379,18 @@ mod tests {
                     );
                     assert!(!matches!(
                         region.target,
-                        HitTarget::Composer | HitTarget::Submit
+                        HitTarget::Composer | HitTarget::Action(Action::ClickSubmit)
                     ));
                 }
                 let back = plan
                     .hit_regions()
                     .iter()
-                    .find(|region| region.target == HitTarget::Back)
+                    .find(|region| region.target == HitTarget::Action(Action::Escape))
                     .unwrap();
-                assert_eq!(plan.hit(back.area.x, back.area.y), Some(HitTarget::Back));
+                assert_eq!(
+                    plan.hit(back.area.x, back.area.y),
+                    Some(HitTarget::Action(Action::Escape))
+                );
             }
         }
     }
@@ -571,11 +574,11 @@ mod grouped_menu_tests {
                 let hit = plan
                     .hit_regions()
                     .iter()
-                    .find(|hit| hit.target == HitTarget::Model(selected))
+                    .find(|hit| hit.target == HitTarget::Action(Action::SelectModel(selected)))
                     .expect("selected action remains visible");
                 assert_eq!(
                     plan.hit(hit.area.x, hit.area.y),
-                    Some(HitTarget::Model(selected))
+                    Some(HitTarget::Action(Action::SelectModel(selected)))
                 );
                 let buffer = terminal.backend().buffer();
                 assert_eq!(buffer[(hit.area.x, hit.area.y)].bg, theme::SELECTED);
@@ -584,9 +587,8 @@ mod grouped_menu_tests {
                 for y in 0..height {
                     let line: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
                     if line.contains("Manage connections") {
-                        assert!(!plan.hit_regions().iter().any(
-                            |hit| hit.area.y == y && matches!(hit.target, HitTarget::Model(_))
-                        ));
+                        assert!(!plan.hit_regions().iter().any(|hit| hit.area.y == y
+                            && matches!(hit.target, HitTarget::Action(Action::SelectModel(_)))));
                     }
                 }
             }
@@ -600,7 +602,7 @@ mod grouped_menu_tests {
                     assert!(
                         plan.hit_regions()
                             .iter()
-                            .any(|hit| hit.target == HitTarget::Model(0))
+                            .any(|hit| hit.target == HitTarget::Action(Action::SelectModel(0)))
                     );
                 })
                 .unwrap();

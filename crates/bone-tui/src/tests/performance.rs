@@ -27,7 +27,7 @@ fn history_entry(sequence: u64) -> HistoryEntry {
 fn populated_state() -> UiState {
     let workspace = WorkspaceId::new();
     let mut state = UiState::default();
-    state.workspace = Some((workspace, "performance-fixture".into()));
+    state.workspace_label = Some("performance-fixture".into());
     for index in 0..SESSION_COUNT {
         let info = SessionInfo {
             id: SessionId::new(),
@@ -131,10 +131,7 @@ fn input_to_frame_sample(state: &mut UiState, samples: usize) -> Vec<Duration> {
                 UiEvent::Action(if index % 2 == 0 {
                     Action::ScrollDown(1)
                 } else {
-                    Action::ScrollUp {
-                        amount: 1,
-                        metrics: None,
-                    }
+                    Action::ScrollUp(1)
                 }),
             ));
             terminal
