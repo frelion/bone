@@ -120,12 +120,13 @@ PTY 测试必须启动真实 `bone` binary，并为其提供临时 App data dire
 
 必测场景：
 
-- 启动进入 alternate screen、raw mode、mouse capture 和 bracketed paste；正常退出后依次禁用并显示光标；
+- 启动进入 alternate screen、raw mode、mouse capture，并在 Unix 启用 bracketed paste；正常退出前先 stop 并 join 唯一输入 worker，再依次禁用模式并显示光标；
 - Unix 能力查询成功时才 push Kitty keyboard enhancement，失败时不 push，并在界面明确显示 `Shift+Enter` unavailable；
-- 初始化中途失败、App open 失败、render I/O 失败、panic、`SIGINT` / `SIGHUP` / `SIGTERM` / `SIGQUIT`（平台支持处）及慢 App shutdown 后，shell 可回显、换行、光标可见且不残留鼠标协议；
-- `SIGTSTP` 前完整恢复终端并真正停止；`SIGCONT` 后重新进入模式、重新协商能力、重建唯一事件流并强制整帧绘制；
+- 初始化中途失败、App open 失败、render I/O 失败、panic、`SIGINT` / `SIGHUP` / `SIGTERM` / `SIGQUIT`（平台支持处）及慢 App shutdown 后，shell 可回显、换行、光标可见且不残留鼠标协议；delegated panic hook 的输出必须晚于终端恢复；
+- `SIGTSTP` 前完整恢复终端并真正停止；`SIGCONT` 后重新进入模式、重新协商能力、重建唯一输入 worker 并强制整帧绘制；
 - 快速 resize 到每个布局阈值、宽高为最小值、连续鼠标滚动和点击后不 panic、不误触发；
 - bracketed paste 中包含换行、快捷键字符和终端转义序列时只插入文本；
+- 原生 Windows 不宣称 Crossterm 0.28 的 `Event::Paste` 能力，也不启用 bracketed-paste mode；在新的 input transport 能提供可验证 paste 边界前，该平台的含换行 paste 门禁视为未通过；
 - 中文、组合字符和 emoji 的输入、退格、换行、滚动与光标位置在真实终端中一致；应用 caret 保留原 Cell 字符，并与原生 cursor 坐标一致；
 - slash 建议打开以及从 Composer 切换 Session 后 caret 仍可见，退出后的最终 cursor 状态为 show；
 - `Ctrl+D` 退出时先有界保存草稿，失败或超时则回到仍可用的界面；一旦收到 OS 终止信号，先恢复终端再执行有界 flush 与 App shutdown。

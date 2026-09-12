@@ -1,10 +1,12 @@
 use std::io;
 
 #[cfg(unix)]
-use crossterm::event::{DisableFocusChange, EnableFocusChange};
+use crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+};
 use crossterm::{
     cursor::Show,
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -21,6 +23,7 @@ enum TerminalMode {
     MouseCapture,
     #[cfg(unix)]
     FocusChange,
+    #[cfg(unix)]
     BracketedPaste,
     #[cfg(unix)]
     KeyboardEnhancement,
@@ -160,9 +163,8 @@ impl ModeBackend for CrosstermModes {
             TerminalMode::FocusChange => {
                 execute!(io::stdout(), EnableFocusChange)
             }
+            #[cfg(unix)]
             TerminalMode::BracketedPaste => {
-                #[cfg(windows)]
-                self.prepare_ansi_output()?;
                 execute!(io::stdout(), EnableBracketedPaste)
             }
             #[cfg(unix)]
@@ -192,9 +194,8 @@ impl ModeBackend for CrosstermModes {
             TerminalMode::FocusChange => {
                 execute!(io::stdout(), DisableFocusChange)
             }
+            #[cfg(unix)]
             TerminalMode::BracketedPaste => {
-                #[cfg(windows)]
-                self.prepare_ansi_output()?;
                 execute!(io::stdout(), DisableBracketedPaste)
             }
             #[cfg(unix)]
@@ -278,29 +279,22 @@ impl WindowsConsoleModes {
 
 /// Owns the temporary terminal modes independently of the renderer.
 ///
-/// Keeping this lease separate lets initialization failures clean themselves
-/// up before a `TerminalSession` exists. The ledger has one owner; panic hooks
-/// only notify that owner and never lock or write to the terminal themselves.
+/// Keeping this lease separate lets `TerminalSession` install its quiet panic
+/// hook before any temporary mode becomes observable. The session remains the
+/// sole owner and restores the ledger after its input worker has joined.
 pub(super) struct ModeLease {
     ledger: ModeLedger<CrosstermModes>,
 }
 
 impl ModeLease {
-    pub(super) fn enter() -> io::Result<(Self, TerminalCapabilities)> {
-        let mut lease = Self {
+    pub(super) fn prepare() -> io::Result<Self> {
+        Ok(Self {
             ledger: ModeLedger::new(CrosstermModes::capture()?),
-        };
-        let capabilities = lease.acquire()?;
-        Ok((lease, capabilities))
+        })
     }
 
-    /// Reacquire the same temporary modes after a successful suspension
-    /// restore.
-    pub(super) fn resume(&mut self) -> io::Result<TerminalCapabilities> {
-        self.acquire()
-    }
-
-    fn acquire(&mut self) -> io::Result<TerminalCapabilities> {
+    /// Acquire the temporary modes for initial entry or after suspension.
+    pub(super) fn acquire(&mut self) -> io::Result<TerminalCapabilities> {
         #[cfg(windows)]
         self.ledger.restore_host_console_on_exit();
         self.ledger.enable(TerminalMode::Raw)?;
@@ -311,9 +305,13 @@ impl ModeLease {
         // console snapshot as the only focus-related host contract.
         #[cfg(unix)]
         self.ledger.enable(TerminalMode::FocusChange)?;
+        // Crossterm 0.28 parses bracketed paste only in its Unix event backend.
+        // Native Windows uses console key records, so enabling DECSET 2004 there
+        // would advertise an Event::Paste capability that the reader cannot emit.
+        #[cfg(unix)]
         self.ledger.enable(TerminalMode::BracketedPaste)?;
 
-        // Probe before EventStream becomes the process's only input reader.
+        // Probe before the input worker becomes the process's only reader.
         // Crossterm preserves unrelated input while it waits for the protocol
         // reply, so keys typed during startup are replayed to the app.
         let capabilities = detect_capabilities();
@@ -421,7 +419,7 @@ mod tests {
         let mut ledger = ModeLedger::new(RecordingBackend::default());
         ledger.enable(TerminalMode::Raw).unwrap();
         ledger.enable(TerminalMode::AlternateScreen).unwrap();
-        ledger.enable(TerminalMode::BracketedPaste).unwrap();
+        ledger.enable(TerminalMode::MouseCapture).unwrap();
         ledger.restore_cursor_on_exit();
 
         ledger.restore().unwrap();
@@ -431,9 +429,9 @@ mod tests {
             [
                 Call::Enable(TerminalMode::Raw),
                 Call::Enable(TerminalMode::AlternateScreen),
-                Call::Enable(TerminalMode::BracketedPaste),
+                Call::Enable(TerminalMode::MouseCapture),
                 Call::ShowCursor,
-                Call::Disable(TerminalMode::BracketedPaste),
+                Call::Disable(TerminalMode::MouseCapture),
                 Call::Disable(TerminalMode::AlternateScreen),
                 Call::Disable(TerminalMode::Raw),
             ]
@@ -499,14 +497,14 @@ mod tests {
     #[test]
     fn cleanup_continues_after_errors_and_is_idempotent() {
         let backend = RecordingBackend {
-            disable_failures: vec![TerminalMode::BracketedPaste],
+            disable_failures: vec![TerminalMode::MouseCapture],
             cursor_failure: true,
             ..RecordingBackend::default()
         };
         let mut ledger = ModeLedger::new(backend);
         ledger.enable(TerminalMode::Raw).unwrap();
         ledger.enable(TerminalMode::AlternateScreen).unwrap();
-        ledger.enable(TerminalMode::BracketedPaste).unwrap();
+        ledger.enable(TerminalMode::MouseCapture).unwrap();
         ledger.restore_cursor_on_exit();
 
         let error = ledger.restore().unwrap_err();
@@ -518,14 +516,16 @@ mod tests {
         ledger.restore().unwrap();
         assert!(calls_after_first_restore.ends_with(&[
             Call::ShowCursor,
-            Call::Disable(TerminalMode::BracketedPaste),
+            Call::Disable(TerminalMode::MouseCapture),
             Call::Disable(TerminalMode::AlternateScreen),
             Call::Disable(TerminalMode::Raw),
         ]));
-        assert!(ledger.backend.calls.ends_with(&[
-            Call::ShowCursor,
-            Call::Disable(TerminalMode::BracketedPaste),
-        ]));
+        assert!(
+            ledger
+                .backend
+                .calls
+                .ends_with(&[Call::ShowCursor, Call::Disable(TerminalMode::MouseCapture),])
+        );
         let calls_after_retry = ledger.backend.calls.clone();
         ledger.restore().unwrap();
         assert_eq!(ledger.backend.calls, calls_after_retry);

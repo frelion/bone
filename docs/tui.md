@@ -92,7 +92,7 @@ TUI 只拥有终端生命周期、当前焦点、选择、每 Session 的草稿�
 - 阅读旧内容时，新尾部不会抢焦点；满缓存向前补读时按真实视觉行补偿阅读锚点。
 - 共享缓存预算按用途分配：所有 Session 历史共 16 MiB，全部编辑撤销历史共 8 MiB，当前详情排版及投影缓存准入 8 MiB；当前草稿不参与淘汰。结构化结果使用紧凑无损 JSON；任务关联输入只借用当前 snapshot 的可见 ID 切片，完整列表可滚动读取，不拼接整表。超预算排版不准入缓存；不能据此宣称进程 RSS 始终不超过 32 MiB。
 - 仅 dirty 时绘制；每次状态变脏后，在接收下一个输入或运行时事件前立即提交新帧。没有常驻帧率 ticker；只有编辑焦点活跃时运行 500 ms caret 相位计时，组成 1 秒完整闪烁周期。后台草稿与 overview 计时本身不强制重绘。渲染路径不做产品 I/O。
-- raw mode、alternate screen、鼠标捕获、bracketed paste、键盘增强和光标可见性由 `TerminalSession` 与模式账本统一管理。恢复动作在尝试修改终端前登记，按逆序 best-effort 执行；失败动作保留在账本中供下一次恢复重试。可捕获的退出信号先恢复终端再进入有界 shutdown；Unix suspend 前恢复，continue 后重新进入、重新协商键盘能力并强制整帧重绘。
+- raw mode、alternate screen、鼠标捕获、Unix bracketed paste、键盘增强和光标可见性由 `TerminalSession` 与模式账本统一管理。唯一输入 worker 在同一线程调用 Crossterm `poll/read`；每次恢复先请求停止并等待该线程 `join`，再按逆序 best-effort 释放模式。后台 panic hook 只通知 runner 并等待独立恢复屏障，终端恢复后才调用既有 hook；runner 或输入线程自身 panic 则在 unwind 恢复后输出有限简报。可捕获的退出信号先恢复终端再进入有界 shutdown；Unix suspend 前恢复，continue 后重新进入、重新协商键盘能力并创建新 reader。Crossterm 0.28 的原生 Windows reader 不会产生 `Event::Paste`，因此该路径不启用 bracketed paste，也不宣称能区分粘贴换行与物理 `Enter`；既定的 `Enter` 提交、`Shift+Enter` 换行契约保持不变，原生 Windows 的安全多行粘贴仍是发布前待解决的输入 transport 限制。
 - BONE 不写宿主配置，也不设置宿主字体、字号、cursor 颜色、cursor 形状、terminal title 或 palette。这些属性在应用退出后不应因 BONE 留下变化。
 
 详细自动化、PTY、性能与平台门禁见 [tui-quality-gates.md](tui-quality-gates.md)。

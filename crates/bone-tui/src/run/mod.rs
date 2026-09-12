@@ -11,15 +11,14 @@ use std::{
 };
 
 use bone_app::{App, AppOptions, AttentionItem, WorkspaceOverview};
-use crossterm::event::{Event, EventStream};
-use futures_util::StreamExt;
+use crossterm::event::Event;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::{
     input::terminal_event,
     state::{Action, Effect, SessionNavRow, UiEvent, UiState, update},
-    terminal::{PanicSignal, TerminalSession},
+    terminal::{PanicSignal, TerminalEvents, TerminalSession},
 };
 
 use self::{
@@ -95,7 +94,7 @@ pub async fn run() -> Result<(), RunError> {
     // the spawned forwarding tasks leaves a window where the OS default action
     // can terminate the process without allowing `TerminalSession` to restore.
     let mut process_signals = process_signals()?;
-    let mut terminal = TerminalSession::enter()?;
+    let (mut terminal, mut events): (TerminalSession, TerminalEvents) = TerminalSession::enter()?;
     let panic_signal = terminal.panic_signal();
     state.terminal_capabilities = terminal.capabilities().clone();
     let viewport = terminal.terminal().size()?;
@@ -106,7 +105,6 @@ pub async fn run() -> Result<(), RunError> {
             height: viewport.height,
         },
     ));
-    let mut events = Some(EventStream::new());
     #[cfg(debug_assertions)]
     schedule_test_background_panic();
     let mut overview_ticker = tokio::time::interval(Duration::from_secs(5));
@@ -246,7 +244,12 @@ pub async fn run() -> Result<(), RunError> {
                         termination_received = true;
                         // A signal makes exit final. Restore before restarting the
                         // bounded flush so no await holds the user's terminal.
-                        let _ = terminal.restore();
+                        if let Err(error) = terminal.restore() {
+                            record_shutdown_error(
+                                &mut shutdown_error,
+                                format!("Terminal cleanup after a signal failed: {error}"),
+                            );
+                        }
                         continue;
                     }
                     FlushWait::Panic => {
@@ -267,9 +270,13 @@ pub async fn run() -> Result<(), RunError> {
                         if termination_received {
                             suspend_process()?;
                         } else {
-                            events.take();
-                            suspend_and_resume(&mut terminal, &mut state, &mut frame_snapshot)?;
-                            events = Some(EventStream::new());
+                            suspend_and_resume(
+                                &mut terminal,
+                                &mut events,
+                                &panic_signal,
+                                &mut state,
+                                &mut frame_snapshot,
+                            )?;
                         }
                         // The interrupted flush future was dropped. Retry it after
                         // continuation; draft persistence is idempotent.
@@ -280,12 +287,21 @@ pub async fn run() -> Result<(), RunError> {
         }
 
         let next = tokio::select! {
-            event = events
-                .as_mut()
-                .expect("terminal event stream is active")
-                .next() => {
-                let event = require_terminal_event(event)?;
-                terminal_event(event, frame_snapshot.as_ref(), &state)
+            event = events.next() => {
+                if panic_signal.is_tripped() {
+                    begin_background_panic_shutdown(
+                        &mut terminal,
+                        &mut state,
+                        &mut effects,
+                        &mut termination_received,
+                        &mut panic_handled,
+                        &mut shutdown_error,
+                    );
+                    None
+                } else {
+                    let event = require_terminal_event(event)?;
+                    terminal_event(event, frame_snapshot.as_ref(), &state)
+                }
             },
             event = rx.recv() => event,
             ready = ready_rx.recv() => {
@@ -311,19 +327,24 @@ pub async fn run() -> Result<(), RunError> {
                         termination_received = true;
                         // An OS termination request is final. Return the terminal to
                         // the shell before any draft or application shutdown await.
-                        let _ = terminal.restore();
+                        if let Err(error) = terminal.restore() {
+                            record_shutdown_error(
+                                &mut shutdown_error,
+                                format!("Terminal cleanup after a signal failed: {error}"),
+                            );
+                        }
                         Some(UiEvent::Action(Action::Quit))
                     }
                     #[cfg(unix)]
                     Some(ProcessSignal::Suspend) => {
-                        events.take();
                         suspend_and_resume(
                             &mut terminal,
+                            &mut events,
+                            &panic_signal,
                             &mut state,
                             &mut frame_snapshot,
                         )?;
                         caret_sleep.as_mut().reset(tokio::time::Instant::now() + CARET_PHASE);
-                        events = Some(EventStream::new());
                         None
                     }
                     None => continue,
@@ -346,26 +367,58 @@ pub async fn run() -> Result<(), RunError> {
         }
     }
 
-    terminal.restore()?;
-    // `restore` removes the process-wide hook. Its synchronization point also
-    // closes the last race where a detached panic and a completed flush become
-    // ready together just before the loop exits.
+    let restore_error = terminal.restore().err();
+    // Joining the reader and opening the restore barrier closes the last race
+    // where a detached panic and a completed flush become ready together just
+    // before the loop exits.
     if panic_signal.is_tripped() && !panic_handled {
-        shutdown_error = Some("A background task panicked; BONE stopped safely".into());
+        record_shutdown_error(
+            &mut shutdown_error,
+            "A background task panicked; BONE stopped safely",
+        );
     }
-    match tokio::time::timeout(APP_SHUTDOWN_TIMEOUT, runtime.shutdown()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return Err(error.into()),
-        Err(_) => {
-            return Err(RunError::Shutdown(
+    let app_shutdown_error =
+        match tokio::time::timeout(APP_SHUTDOWN_TIMEOUT, runtime.shutdown()).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(RunError::App(error)),
+            Err(_) => Some(RunError::Shutdown(
                 "App shutdown timed out after terminal restoration".into(),
+            )),
+        };
+
+    if let Some(mut error) = shutdown_error {
+        if let Some(app_error) = app_shutdown_error {
+            error.push_str(&format!("; app shutdown also failed: {app_error}"));
+        }
+        if let Some(restore_error) = restore_error {
+            error.push_str(&format!(
+                "; final terminal cleanup also failed: {restore_error}"
             ));
         }
-    }
-    if let Some(error) = shutdown_error {
         return Err(RunError::Shutdown(error));
     }
+    if let Some(app_error) = app_shutdown_error {
+        if let Some(restore_error) = restore_error {
+            return Err(RunError::Shutdown(format!(
+                "{app_error}; final terminal cleanup also failed: {restore_error}"
+            )));
+        }
+        return Err(app_error);
+    }
+    if let Some(restore_error) = restore_error {
+        return Err(RunError::Io(restore_error));
+    }
     Ok(())
+}
+
+fn record_shutdown_error(target: &mut Option<String>, message: impl AsRef<str>) {
+    let message = message.as_ref();
+    if let Some(existing) = target {
+        existing.push_str("; ");
+        existing.push_str(message);
+    } else {
+        *target = Some(message.to_owned());
+    }
 }
 
 fn begin_background_panic_shutdown(
@@ -381,12 +434,22 @@ fn begin_background_panic_shutdown(
     }
     *panic_handled = true;
     *termination_received = true;
-    // The hook never performs terminal I/O. Once the owner observes its fatal
-    // flag, stop rendering and restore before any bounded persistence work.
-    let _ = terminal.restore();
+    // A detached panic hook waits without touching terminal state. Finish any
+    // synchronous draw, join the input reader, and restore modes here; the
+    // restore barrier then lets the delegated hook print to the shell.
+    let restore_error = terminal.restore().err();
     effects.clear();
     effects.extend(update(state, UiEvent::Action(Action::Quit)));
-    *shutdown_error = Some("A background task panicked; BONE stopped safely".into());
+    record_shutdown_error(
+        shutdown_error,
+        "A background task panicked; BONE stopped safely",
+    );
+    if let Some(error) = restore_error {
+        record_shutdown_error(
+            shutdown_error,
+            format!("Terminal cleanup after the panic also failed: {error}"),
+        );
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -544,9 +607,12 @@ fn process_signals() -> io::Result<mpsc::UnboundedReceiver<ProcessSignal>> {
 }
 
 fn require_terminal_event(event: Option<io::Result<Event>>) -> io::Result<Event> {
-    event
-        .transpose()?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "terminal event stream ended"))
+    event.transpose()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "terminal input channel closed",
+        )
+    })
 }
 
 #[cfg(unix)]
@@ -559,12 +625,25 @@ fn suspend_process() -> io::Result<()> {
 #[cfg(unix)]
 fn suspend_and_resume(
     terminal: &mut TerminalSession,
+    events: &mut TerminalEvents,
+    panic_signal: &PanicSignal,
     state: &mut UiState,
     frame_snapshot: &mut Option<crate::view::FrameSnapshot>,
 ) -> io::Result<()> {
-    terminal.restore()?;
+    terminal.suspend()?;
+    events.discard();
+    if panic_signal.is_tripped() {
+        return Err(io::Error::other(
+            "a background task panicked while the terminal was suspending",
+        ));
+    }
     suspend_process()?;
-    terminal.resume()?;
+    if panic_signal.is_tripped() {
+        return Err(io::Error::other(
+            "a background task panicked while the terminal was suspended",
+        ));
+    }
+    *events = terminal.resume()?;
     state.terminal_capabilities = terminal.capabilities().clone();
     let viewport = terminal.terminal().size()?;
     let _ = update(
@@ -585,7 +664,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_event_stream_eof_is_an_error_instead_of_a_busy_loop() {
+    fn terminal_input_channel_eof_is_an_error_instead_of_a_busy_loop() {
         let error = require_terminal_event(None).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);

@@ -50,13 +50,13 @@ Full Profile 的最低能力定义为：
 - UTF-8；
 - 至少 24-bit RGB；
 - alternate screen；
-- bracketed paste；
+- 可识别的 paste 边界；当前 Unix 路径使用 bracketed paste；
 - SGR mouse；
 - synchronized output 可作为可选优化，不能影响交互语义；
 - 能可靠区分修饰键的输入通道：Kitty keyboard / CSI-u，或 native Windows key events；
 - 经过 BONE 实测的 Unicode width profile。
 
-Windows、macOS、Linux 都可以满足这组能力，但并非每一个旧终端、IDE 内嵌终端和未配置的 multiplexer 都满足。正确的支持声明是“跨三个操作系统支持认证终端”，不是“任意终端模拟器都完全相同”。Kitty keyboard 协议的目标正是消除传统终端输入的歧义，它采用查询和 push/pop 的渐进增强方式，并把 main screen 与 alternate screen 的键盘模式栈分开。[^18]
+Windows、macOS、Linux 都是目标平台，但并非当前每条 transport 都满足这组能力。Crossterm 0.28.1 的原生 Windows event backend 只解析 console key、mouse、focus 和 resize records，没有 bracketed-paste parser；`Event::Paste` 的 parser 只编译在 Unix backend。[^30] 因而原生 Windows 当前不宣称具备可识别的 paste 边界，安全多行粘贴仍是发布前限制。Kitty keyboard 协议采用查询和 push/pop 的渐进增强方式，并把 main screen 与 alternate screen 的键盘模式栈分开。[^18]
 
 ## 2. 主流产品实际上怎样做
 
@@ -192,7 +192,7 @@ flowchart TB
     Host[Terminal / ConPTY / PTY / tmux / SSH]
     subgraph TUI[single crate: bone-tui]
         TS[terminal\nTerminalSession + capabilities + ModeLedger]
-        EV[run\nCrossterm EventStream]
+        EV[run\nTerminalEvents]
         IN[input\nkeymap + pointer normalization]
         ST[state\nreducer + typed effects]
         ED[editor\nbuffer + grapheme layout]
@@ -210,24 +210,26 @@ flowchart TB
 
 ### 5.1 `terminal` 模块
 
-`terminal` 是唯一允许改变终端模式的模块。`TerminalSession` 同时持有 Ratatui renderer、`ModeLease`、`TerminalCapabilities` 和 panic hook；`ModeLedger` 通过私有 backend 执行 raw mode、alternate screen、mouse capture、bracketed paste、键盘增强和最终显示光标。它不设置 focus reporting、synchronized output、terminal identity、palette、标题、字体、字号、窗口尺寸或装饰性光标属性。
+`terminal` 是唯一允许改变终端模式的模块。`TerminalSession` 同时持有 Ratatui renderer、独占的 `ModeLease`、唯一可 join 输入 worker、`TerminalCapabilities` 和 panic hook；`ModeLedger` 通过私有 backend 执行 raw mode、alternate screen、mouse capture、Unix bracketed paste、键盘增强和最终显示光标。它不设置 focus reporting、synchronized output、terminal identity、palette、标题、字体、字号、窗口尺寸或装饰性光标属性。
 
-`run` 持有异步 `EventStream`，但不直接写终端模式。启动时 `ModeLease` 在创建 EventStream 之前完成键盘能力查询；Unix 查询成功才 push Kitty/CSI-u，原生 Windows 直接使用控制台修饰键事件，查询错误或不支持则记录 Compatibility 原因。
+`run` 持有 bounded channel 的异步 `TerminalEvents` receiver，但不直接写终端模式。能力查询完成后，BONE 启动唯一标准线程，在该线程内以有限 timeout 调用 Crossterm `poll/read`；队列满时保留当前事件并等待容量或 stop，不使用无限期 `blocking_send`。最终 restore、signal、panic 和 suspend 都先 stop 并 join 该线程，再交还 tty。
 
 当前核心关系是：
 
 ```text
 TerminalSession
   ├─ Ratatui Terminal<CrosstermBackend>
-  ├─ ModeLease → shared ModeLedger<RestoreAction>
+  ├─ ModeLease → ModeLedger<RestoreAction>
+  ├─ TerminalInputWorker → one poll/read thread
+  ├─ TerminalEvents → bounded receiver
   └─ TerminalCapabilities → KeyboardProtocol
 ```
 
-能力模型当前只描述区分 `Shift+Enter` 所需的键盘通道。transport、terminal identity、颜色档位、multiplexer 和 synchronized output 可在有真实需求与平台证据后扩展，不能把尚未探测的字段写成当前保证。
+能力模型当前只描述区分 `Shift+Enter` 所需的键盘通道。paste transport、terminal identity、颜色档位、multiplexer 和 synchronized output 可在有真实需求与平台证据后扩展，不能把尚未探测的字段写成当前保证。
 
 ### 5.2 `input` 模块
 
-当前进程只有 Crossterm 的一个 `EventStream`。键盘能力探测在它启动前使用 Crossterm 的查询接口，并由 Crossterm 保留查询期间到达的无关输入。之后的路径是：
+当前进程只有一个 BONE 输入 worker。键盘能力探测在启动它之前使用 Crossterm 的查询接口，并由 Crossterm 保留查询期间到达的无关输入。之后的路径是：
 
 ```text
 Crossterm Event
@@ -269,7 +271,7 @@ overview 返回时以 projection cursor 是否追上 `history_through` 计算 `p
 | --- | --- | --- |
 | raw mode | TUI 活跃 | 恢复进入前精确 termios / console mode |
 | alternate screen | TUI 活跃 | 最后离开，并保留主屏内容 |
-| bracketed paste | TUI 活跃 | 退出、suspend 前关闭 |
+| bracketed paste | Unix TUI 活跃；原生 Windows 0.28 不启用 | 退出、suspend 前关闭 |
 | SGR mouse | TUI 活跃 | 退出、suspend 前关闭 |
 | focus reporting | 当前不启用 | 若未来启用，必须在退出、suspend 前关闭 |
 | Kitty keyboard push | Unix 查询确认支持 | **离开 alternate screen 前 pop** |
@@ -299,14 +301,15 @@ xterm 对 alternate screen、bracketed paste 和临时键盘模式的定义，�
 每次尝试修改终端前，先登记对应的逆操作。原因是终端写入可能已经发送部分字节后才返回错误；即使 enable 报错，也需要尝试 matching disable。初始化中途失败会根据账本回滚；恢复按逆序 best-effort 执行所有动作，返回第一个错误，同时把失败动作按原清理顺序保留在账本中供下一次重试。已经成功的动作被移除，所以重复恢复保持幂等。
 
 ```text
+请求停止并 join 输入 worker
 显示光标
 pop keyboard enhancement
-关闭 bracketed paste / mouse capture
+关闭 Unix bracketed paste / mouse capture
 离开 alternate screen
 恢复原始 termios / Windows console mode
 ```
 
-恢复路径覆盖正常返回、初始化失败、业务错误、Rust panic，以及 Unix 的 `SIGINT`、`SIGTERM`、`SIGHUP`、`SIGQUIT` 和 suspend/resume。可捕获的终止信号在草稿有界保存前先恢复终端。Suspend 前完整交还终端；进程 continue 后复用同一账本重新进入临时模式、重新协商键盘能力、重建 renderer 并强制整帧重绘。Linux PTY 自动化覆盖这些协议和恢复路径；macOS 与原生 Windows 生命周期仍需 CI 与真机认证。
+恢复路径覆盖正常返回、初始化失败、业务错误、Rust panic，以及 Unix 的 `SIGINT`、`SIGTERM`、`SIGHUP`、`SIGQUIT` 和 suspend/resume。每次恢复先 stop 并 join 输入 worker，建立 reader 退出早于模式恢复的 happens-before 关系。Active panic hook 不获取 input、mode 或 renderer 锁，也不执行终端 I/O；普通后台 panic 等待该次 activation 的一次性恢复屏障，runner 完成当前同步绘制、join reader 并恢复模式后才调用进入 TUI 前的 hook。runner 或输入 worker 自身 panic 不等待屏障，交由 unwind/runner 清理后用无 panic 的 stderr 写入输出有限简报。可捕获的终止信号在草稿有界保存前先恢复终端。Suspend 前完整交还终端、丢弃 BONE channel 的旧 generation 并打开当前 gate，session hook 保持安装；本层不尝试清空 Crossterm 或 OS transport 的内部缓冲。进程 continue 后建立新 gate generation、重新协商键盘能力、重建 renderer 与输入 worker并强制整帧重绘。Linux PTY 自动化覆盖这些协议和恢复路径；macOS 与原生 Windows 生命周期仍需 CI 与真机认证。
 
 `SIGKILL`、断电和终端自身崩溃无法执行进程清理，这是操作系统边界。BONE 通过不设置字体、字号、title、cursor color/shape 或 palette，使用 alternate-screen-local keyboard stack 和最小状态集合，将不可恢复残留降到最低。若以后需要进一步降低 Rust abort / native crash 的风险，可以让一个很小的父 supervisor 持有原始终端状态并监控 UI 子进程；它仍然无法对父进程自身的 `SIGKILL` 或断电作出承诺。
 
@@ -330,15 +333,15 @@ Ctrl+C       → composer.clear
 Ctrl+D       → app.exit
 ```
 
-不默认增加 `Ctrl+J`、`Ctrl+Return`、`Alt+Return`，`Ctrl+P` 也没有命令面板绑定；全局动作从 Composer 的 `/` 命令面板进入。BONE 不修改用户终端快捷键。keymap 可以做成命令系统，但默认映射必须来自一处，status baseline 必须从最终解析后的 keymap 生成，不能手写出与实际行为不一致的提示。
+原生 Windows 的 Crossterm 0.28 console backend 无 paste 边界，普通 `Enter` 与粘贴产生的换行在 `KeyEvent` 层不可区分。在保持上述按键契约时，事件进入 keymap 后已无法可靠避免把粘贴换行当作提交；时间窗口或输入突发猜测也不能构成能力证明。当前实现因此不在 Windows 发送无效的 bracketed-paste mode，也不虚假宣称安全多行粘贴。完整方案需要换用能交付 paste 边界的 Windows input transport，或经过产品明确批准后修改提交契约；本轮不擅自增加 `Ctrl+J`、`Ctrl+Return`、`Alt+Return` 等 fallback。BONE 不修改用户终端快捷键。
 
 启动协商流程：
 
-1. `ModeLease` 依次进入 raw mode、alternate screen、mouse capture 和 bracketed paste，并在每次尝试前登记逆操作；
-2. Unix 在创建异步 `EventStream` 前调用 Crossterm keyboard enhancement query；Crossterm 用 primary device attributes 划定查询边界并保留无关输入；
+1. `ModeLease` 依次进入 raw mode、alternate screen、mouse capture，并仅在 Unix 启用 bracketed paste；每次尝试前登记逆操作；
+2. Unix 在启动输入 worker 前调用 Crossterm keyboard enhancement query；Crossterm 用 primary device attributes 划定查询边界并保留无关输入；
 3. 查询成功时记录 Kitty 能力，并 push 最小的 `DISAMBIGUATE_ESCAPE_CODES` flags；
 4. 查询不支持或失败时记录 Compatibility 原因，不 push 键盘模式；
-5. 原生 Windows 使用控制台事件携带的 modifier，不发送 Unix 查询；
+5. 原生 Windows 使用控制台事件携带的 modifier，不发送 Unix 查询或 bracketed-paste mode；该路径不宣称 paste 边界；
 6. runner 在首帧前把能力写入 UI state；退出时按账本逆序先 pop keyboard enhancement，再关闭输入模式并离开 alternate screen。
 
 Windows Terminal 1.25 于 2026 年加入 Kitty keyboard protocol；此前版本的 WSL 路径不能承诺物理 `Shift+Enter`。[^21] Native Windows 程序可以从 console key event 获得 modifier，但 WSL 收到的是 VT 字节流，两条路径要由 `TerminalCapabilities.keyboard` 统一抽象。
@@ -459,8 +462,8 @@ Synchronized output、完整 transcript virtualization 和跨平台帧预算尚�
 1. **纯状态机测试**：command resolution、editor、selection、scroll anchor、splitter clamp。
 2. **Cell/frame test**：固定 theme 与宽高下比较字符、前景、背景、attributes、layout 和 hit map。
 3. **Unicode property / corpus**：编辑不越过 grapheme，wrap 与 pointer offset 一致，宽字符不产生孤立 continuation cell。
-4. **输入能力测试**：Kitty 支持/不支持、native Windows modifiers、mouse、paste、查询 timeout 和 input replay。
-5. **PTY lifecycle test**：正常退出、部分初始化、panic、catchable signal、suspend/resume、重复 restore；比较进入前后的终端模式。
+4. **输入能力测试**：Kitty 支持/不支持、native Windows modifiers、各 transport 的 paste 边界、mouse、查询 timeout 和 input replay。
+5. **PTY lifecycle test**：正常退出、部分初始化、panic、catchable signal、suspend/resume、重复 restore；比较进入前后的终端模式，并验证 delegated panic hook 在恢复后才输出。
 6. **输出策略 test**：扫描 TUI 输出，禁止 OSC、装饰性 cursor style 和窗口 resize；验证每个 enable 都有对应 disable。
 
 当前自动化已经覆盖 exact keymap、四区域 focus 状态机、caret 可见/隐藏相位、editor/Unicode 几何、`LayoutPlan`/`HitMap`、栏宽拖动、Linux PTY 下的键盘协议支持与降级、正常/信号/suspend-resume 恢复、重复 restore，以及 OSC/光标形状/窗口 resize 禁止输出。它是 Linux PTY 证据，不等于 macOS 或原生 Windows 认证。
@@ -479,7 +482,7 @@ Synchronized output、完整 transcript virtualization 和跨平台帧预算尚�
 | IDE | VS Code / xterm.js | capability 与已知差异，不先承诺 Full |
 | Remote | SSH | identity、latency、resize、能力归属 |
 
-每个 Full 候选都实际按物理键验证 `Enter`、`Shift+Enter`、`Ctrl+C`、`Ctrl+D`；验证中文输入法、paste、mouse drag、focus、resize、panic、SIGTERM、suspend/resume，以及退出后 shell 的回显、光标、鼠标和快捷键状态。
+每个 Full 候选都实际按物理键验证 `Enter`、`Shift+Enter`、`Ctrl+C`、`Ctrl+D`，并验证含换行的 paste 绝不触发提交。原生 Windows 在具备可验证的 paste 边界前不能通过这一门禁。还需验证中文输入法、mouse drag、focus、resize、panic、SIGTERM、suspend/resume，以及退出后 shell 的回显、光标、鼠标和快捷键状态。
 
 macOS 和原生 Windows 目前均未完成 CI 或真机认证；WSL 开发环境也不能替代原生 Windows console 路径。当前运行时诊断只在 status baseline 与帮助面板报告 `Shift+Enter` 可用性和失败原因。更完整的只读 transport/profile 诊断尚未实现。
 
@@ -493,11 +496,11 @@ macOS 和原生 Windows 目前均未完成 CI 或真机认证；WSL 开发环境
 
 [`terminal/`](../crates/bone-tui/src/terminal/) 已建立 `TerminalSession`、`ModeLease`、`ModeLedger` 与 `TerminalCapabilities`；[`input/`](../crates/bone-tui/src/input/) 已建立 keymap 和 pointer 语义边界。装饰性 cursor color/style/title 副作用已删除，恢复动作采用尝试前登记、失败保留重试。可捕获 signal 与 Unix suspend/resume 走同一恢复路径，Linux PTY 已覆盖能力协商和污染门禁。
 
-Windows 的 Ctrl+C、Ctrl+Break、Close、Logoff 和 Shutdown listener 会在进入终端模式前同步注册；终端事件流异常结束会作为 I/O 错误退出，不会空转。本轮没有建立自定义 `EventBroker`，也没有把 Crossterm 升到 0.29。macOS 与原生 Windows lifecycle smoke 仍未完成，因此这里只声明实现边界，不把本地 WSL 测试当成真机认证。
+Windows 的 Ctrl+C、Ctrl+Break、Close、Logoff 和 Shutdown listener 会在进入终端模式前同步注册；终端输入 channel 异常结束会作为 I/O 错误退出，不会空转。原生 Windows 不宣称 Crossterm 0.28 未提供的 paste event。本轮没有建立自定义 `EventBroker`，也没有把 Crossterm 升到 0.29。macOS 与原生 Windows lifecycle smoke 仍未完成，因此这里只声明实现边界，不把本地 WSL 测试当成真机认证。
 
 ### 阶段 2：建立 `editor` 与 command system — 基础切片已完成
 
-[`editor/`](../crates/bone-tui/src/editor/) 已统一 buffer 与文本几何；物理事件先经 `input` 映射为语义 Action。status baseline 从正式 keymap 生成；composer 的提交、换行、清空与退出严格对应 `Enter`、`Shift+Enter`、`Ctrl+C`、`Ctrl+D`。真实物理键与 IME 仍需平台认证。
+[`editor/`](../crates/bone-tui/src/editor/) 已统一 buffer 与文本几何；物理事件先经 `input` 映射为语义 Action。status baseline 从正式 keymap 生成；composer 的提交、换行、清空与退出严格对应 `Enter`、`Shift+Enter`、`Ctrl+C`、`Ctrl+D`。真实物理键、paste transport 与 IME 仍需平台认证。
 
 ### 阶段 3：建立 `ui` 模块 — 基础切片已完成
 
@@ -523,7 +526,7 @@ BONE 已经把终端模式、输入 keymap、editor 几何、帧事实和视觉 
 2. **全屏 alternate screen 是 BONE 主形态。**
 3. **Full Profile 定义 Cell 与交互一致，不承诺宿主字体像素一致；未经真机矩阵不得宣称某平台已认证。**
 4. **不修改任何终端、multiplexer、IDE 或 shell 配置。**
-5. **`Enter / Shift+Enter / Ctrl+C / Ctrl+D` 按既定契约，不增加隐藏 fallback。**
+5. **`Enter / Shift+Enter / Ctrl+C / Ctrl+D` 按既定契约，不增加隐藏 fallback；不能区分 paste 边界的平台不得宣称安全多行粘贴。**
 6. **只有 `bone-tui::terminal` 私有模块可以产生终端状态副作用。**
 7. **视觉必须通过语义 token、surface、spacing 和统一 emphasis 表达。**
 8. **`LayoutPlan`、`FrameSnapshot` 与 `HitMap` 是绘制和命中的共同帧事实；workspace 焦点按显式空间邻接移动，overlay 独占作用域并恢复来源。**
@@ -562,3 +565,4 @@ BONE 已经把终端模式、输入 keymap、editor 几何、帧事实和视觉 
 [^27]: Textual 组件框架：[Textualize/textual](https://github.com/Textualize/textual)。
 [^28]: Ink 的 React / Yoga TUI 模型：[vadimdemedes/ink](https://github.com/vadimdemedes/ink)；iocraft 的 Rust 声明式模型：[ccbrown/iocraft](https://github.com/ccbrown/iocraft)。
 [^29]: Ratatui 最终 Cell buffer 测试：[TestBackend 官方文档](https://docs.rs/ratatui/latest/ratatui/backend/struct.TestBackend.html)。
+[^30]: Crossterm 0.28.1 的 [`Event::Paste` 与 Windows command fallback](https://github.com/crossterm-rs/crossterm/blob/0.28.1/src/event.rs)，以及只产生 key/mouse 等事件的 [Windows parser](https://github.com/crossterm-rs/crossterm/blob/0.28.1/src/event/sys/windows/parse.rs)。

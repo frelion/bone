@@ -118,6 +118,30 @@ fn real_binary_restores_every_terminal_mode_after_unix_termination_signals() {
     }
 }
 
+#[test]
+fn saturated_terminal_input_cannot_delay_signal_restoration() {
+    let temporary = tempfile::tempdir().expect("temporary workspace");
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace directory");
+    let mut process = PtyBone::spawn(
+        &temporary.path().join("data"),
+        &workspace,
+        Duration::from_secs(15),
+    );
+
+    process.wait_for_bytes(b"\x1b[?1049h");
+    process.enable_keyboard_protocol();
+    // Rendering each key is slower than the reader, forcing bounded-channel
+    // backpressure while the signal asks the reader to stop and join.
+    process.write(&vec![b'x'; 2_048]);
+    process.signal(libc::SIGTERM, "SIGTERM with saturated input");
+
+    assert!(process.wait_for_exit().success());
+    process.wait_for_bytes(b"\x1b[?1049l");
+    let output = process.finish_capture();
+    assert_terminal_protocol_restored(&output);
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn detached_task_panic_stops_the_runner_and_restores_the_terminal() {
@@ -137,6 +161,16 @@ fn detached_task_panic_stops_the_runner_and_restores_the_terminal() {
     process.wait_for_bytes(b"\x1b[?1049l");
     let output = process.finish_capture();
     assert_terminal_protocol_restored(&output);
+    let leave_screen = find_sequence(&output, b"\x1b[?1049l");
+    let restored_output = &output[leave_screen + b"\x1b[?1049l".len()..];
+    assert!(
+        !restored_output.contains(&0x1b),
+        "no TUI ANSI frame bytes may be written after leaving the alternate screen"
+    );
+    assert!(
+        leave_screen < find_sequence(&output, b"injected detached-task panic"),
+        "the delegated panic hook must write only after leaving the TUI screen"
+    );
     assert!(
         terminal_visible_text(&output).contains("A background task panicked"),
         "the restored shell should receive a concise fatal error"
