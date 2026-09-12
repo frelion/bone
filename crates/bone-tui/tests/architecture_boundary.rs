@@ -43,6 +43,8 @@ fn terminal_state_changes_stay_inside_the_terminal_module() {
         "LeaveAlternateScreen",
         "EnableMouseCapture",
         "DisableMouseCapture",
+        "EnableFocusChange",
+        "DisableFocusChange",
         "EnableBracketedPaste",
         "DisableBracketedPaste",
         "PushKeyboardEnhancementFlags",

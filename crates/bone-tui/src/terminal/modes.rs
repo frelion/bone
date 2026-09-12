@@ -1,5 +1,7 @@
 use std::io;
 
+#[cfg(unix)]
+use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use crossterm::{
     cursor::Show,
     event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
@@ -17,6 +19,8 @@ enum TerminalMode {
     Raw,
     AlternateScreen,
     MouseCapture,
+    #[cfg(unix)]
+    FocusChange,
     BracketedPaste,
     #[cfg(unix)]
     KeyboardEnhancement,
@@ -152,6 +156,10 @@ impl ModeBackend for CrosstermModes {
             TerminalMode::MouseCapture => {
                 execute!(io::stdout(), EnableMouseCapture)
             }
+            #[cfg(unix)]
+            TerminalMode::FocusChange => {
+                execute!(io::stdout(), EnableFocusChange)
+            }
             TerminalMode::BracketedPaste => {
                 #[cfg(windows)]
                 self.prepare_ansi_output()?;
@@ -179,6 +187,10 @@ impl ModeBackend for CrosstermModes {
             }
             TerminalMode::MouseCapture => {
                 execute!(io::stdout(), DisableMouseCapture)
+            }
+            #[cfg(unix)]
+            TerminalMode::FocusChange => {
+                execute!(io::stdout(), DisableFocusChange)
             }
             TerminalMode::BracketedPaste => {
                 #[cfg(windows)]
@@ -294,6 +306,11 @@ impl ModeLease {
         self.ledger.enable(TerminalMode::Raw)?;
         self.ledger.enable(TerminalMode::AlternateScreen)?;
         self.ledger.enable(TerminalMode::MouseCapture)?;
+        // Native Windows consoles report focus changes without a mode toggle.
+        // Restricting this ANSI protocol to Unix also keeps the exact Windows
+        // console snapshot as the only focus-related host contract.
+        #[cfg(unix)]
+        self.ledger.enable(TerminalMode::FocusChange)?;
         self.ledger.enable(TerminalMode::BracketedPaste)?;
 
         // Probe before EventStream becomes the process's only input reader.
@@ -442,6 +459,36 @@ mod tests {
                 Call::Enable(TerminalMode::Raw),
                 Call::Enable(TerminalMode::AlternateScreen),
                 Call::Enable(TerminalMode::MouseCapture),
+                Call::Disable(TerminalMode::MouseCapture),
+                Call::Disable(TerminalMode::AlternateScreen),
+                Call::Disable(TerminalMode::Raw),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_focus_enable_is_still_compensated() {
+        let backend = RecordingBackend {
+            enable_failure: Some(TerminalMode::FocusChange),
+            ..RecordingBackend::default()
+        };
+        let mut ledger = ModeLedger::new(backend);
+        ledger.enable(TerminalMode::Raw).unwrap();
+        ledger.enable(TerminalMode::AlternateScreen).unwrap();
+        ledger.enable(TerminalMode::MouseCapture).unwrap();
+
+        assert!(ledger.enable(TerminalMode::FocusChange).is_err());
+        ledger.restore().unwrap();
+
+        assert_eq!(
+            ledger.backend.calls,
+            [
+                Call::Enable(TerminalMode::Raw),
+                Call::Enable(TerminalMode::AlternateScreen),
+                Call::Enable(TerminalMode::MouseCapture),
+                Call::Enable(TerminalMode::FocusChange),
+                Call::Disable(TerminalMode::FocusChange),
                 Call::Disable(TerminalMode::MouseCapture),
                 Call::Disable(TerminalMode::AlternateScreen),
                 Call::Disable(TerminalMode::Raw),

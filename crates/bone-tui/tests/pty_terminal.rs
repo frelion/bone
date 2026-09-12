@@ -175,6 +175,8 @@ fn real_binary_releases_the_terminal_while_suspended_and_reacquires_it_on_contin
         b"\x1b[?1049h".as_slice(),
         b"\x1b[>1u".as_slice(),
         b"\x1b[<1u".as_slice(),
+        b"\x1b[?1004h".as_slice(),
+        b"\x1b[?1004l".as_slice(),
         b"\x1b[?1049l".as_slice(),
     ] {
         assert_eq!(
@@ -248,6 +250,7 @@ fn assert_terminal_protocol_restored(output: &[u8]) {
         (b"\x1b[?1049h".as_slice(), b"\x1b[?1049l".as_slice()),
         (b"\x1b[>1u".as_slice(), b"\x1b[<1u".as_slice()),
         (b"\x1b[?2004h".as_slice(), b"\x1b[?2004l".as_slice()),
+        (b"\x1b[?1004h".as_slice(), b"\x1b[?1004l".as_slice()),
         (b"\x1b[?1000h".as_slice(), b"\x1b[?1000l".as_slice()),
         (b"\x1b[?1002h".as_slice(), b"\x1b[?1002l".as_slice()),
         (b"\x1b[?1003h".as_slice(), b"\x1b[?1003l".as_slice()),
