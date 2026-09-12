@@ -317,7 +317,7 @@ pub async fn run() -> Result<(), RunError> {
                         // An OS termination request is final. Return the terminal to
                         // the shell before any draft or application shutdown await.
                         let _ = terminal.restore();
-                        Some(UiEvent::Action(Action::Terminate))
+                        Some(UiEvent::Action(Action::Quit))
                     }
                     #[cfg(unix)]
                     Some(ProcessSignal::Suspend) => {
@@ -390,7 +390,7 @@ fn begin_background_panic_shutdown(
     // flag, stop rendering and restore before any bounded persistence work.
     let _ = terminal.restore();
     effects.clear();
-    effects.extend(update(state, UiEvent::Action(Action::Terminate)));
+    effects.extend(update(state, UiEvent::Action(Action::Quit)));
     *shutdown_error = Some("A background task panicked; BONE stopped safely".into());
 }
 

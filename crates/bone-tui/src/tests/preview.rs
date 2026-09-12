@@ -5,9 +5,9 @@
 use std::{env, fmt::Write as _, fs, path::PathBuf, sync::Arc, time::SystemTime};
 
 use crate::{
+    editor::EditCommand,
     state::{
-        Action, EditCommand, EditorTarget, Effect, Focus, SessionNavRow, SessionUi, UiEvent,
-        UiState, update,
+        Action, EditorTarget, Effect, Focus, SessionNavRow, SessionUi, UiEvent, UiState, update,
     },
     view,
 };

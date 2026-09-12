@@ -5,36 +5,13 @@ use bone_app::{
     SessionInfo, SessionView, SubmitInput,
 };
 
+use crate::editor::EditCommand;
+
 use super::model::{Focus, SessionNavRow};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EditorTarget {
     Composer,
     SessionTitle,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CursorMove {
-    Left,
-    Right,
-    Up { width: u16 },
-    Down { width: u16 },
-    WordLeft,
-    WordRight,
-    LineStart,
-    LineEnd,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EditCommand {
-    Insert { text: String, typing: bool },
-    Replace { text: String },
-    DeleteBefore,
-    DeleteAfter,
-    Move { cursor: CursorMove, select: bool },
-    Point { byte: usize, extend: bool },
-    Clear,
-    Undo,
-    Redo,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,10 +79,9 @@ pub enum Action {
     ScrollDown(usize),
     Stop,
     Quit,
-    Terminate,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum UiEvent {
     ConnectionSaved {
         request: u64,
@@ -250,7 +226,7 @@ pub enum OperationKind {
     RememberSession,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Effect {
     SaveConnection {
         request: u64,

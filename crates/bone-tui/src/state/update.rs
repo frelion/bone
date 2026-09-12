@@ -1,5 +1,7 @@
 use bone_app::{RequestId, SessionId, SubmitInput};
 
+use crate::editor::{CursorMove, EditCommand};
+
 use super::{
     HISTORY_CACHE_BYTES,
     answer::{self, AnswerDraft, RecoveryCandidate},
@@ -579,7 +581,6 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
             | Action::SelectSession(_)
             | Action::OpenCandidate
             | Action::Quit
-            | Action::Terminate
     );
     if state.focus == Focus::SessionTitle && leaves_title {
         commit_title_edit(state, effects);
@@ -796,7 +797,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
             }
         }
         Action::Stop => effects.extend(stop_selected(state)),
-        Action::Quit | Action::Terminate => {
+        Action::Quit => {
             prepare_exit(state);
             dispatch_queued_titles_for_exit(state, effects);
             effects.push(Effect::Shutdown);

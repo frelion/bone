@@ -10,8 +10,9 @@ mod pointer;
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 
 use crate::{
+    editor::EditCommand,
     layout::LayoutMode,
-    state::{Action, EditCommand, EditorTarget, UiEvent, UiState},
+    state::{Action, EditorTarget, UiEvent, UiState},
     view::FrameSnapshot,
 };
 
@@ -75,7 +76,7 @@ pub(crate) fn terminal_event(
     }?;
 
     if snapshot.is_some_and(|frame| frame.layout.mode == LayoutMode::TooSmall)
-        && !matches!(action, Action::Quit | Action::Terminate)
+        && !matches!(action, Action::Quit)
     {
         return None;
     }
@@ -84,8 +85,9 @@ pub(crate) fn terminal_event(
 
 #[cfg(test)]
 use crate::{
+    editor::CursorMove,
     layout::{HitRegion, HitTarget, LayoutPlan},
-    state::{CursorMove, Focus},
+    state::Focus,
     ui::interaction::HitMap,
 };
 #[cfg(test)]

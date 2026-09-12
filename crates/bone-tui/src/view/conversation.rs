@@ -613,11 +613,11 @@ mod tests {
         assert!(state.begin_title_edit());
         {
             let editor = state.title_editor_mut();
-            editor.apply(crate::state::EditCommand::Point {
+            editor.apply(crate::editor::EditCommand::Point {
                 byte: selected_from,
                 extend: false,
             });
-            editor.apply(crate::state::EditCommand::Point {
+            editor.apply(crate::editor::EditCommand::Point {
                 byte: title.len(),
                 extend: true,
             });

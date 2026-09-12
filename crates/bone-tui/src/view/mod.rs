@@ -180,7 +180,10 @@ fn single_line_external(value: &str) -> String {
 #[cfg(test)]
 mod editor_view_state_tests {
     use super::*;
-    use crate::state::{CursorMove, EditCommand, SessionNavRow, SessionUi};
+    use crate::{
+        editor::{CursorMove, EditCommand},
+        state::{SessionNavRow, SessionUi},
+    };
     use ratatui::{Terminal, backend::TestBackend};
 
     fn draw(state: &UiState, view_state: &mut ViewState, width: u16, height: u16) -> FrameSnapshot {

@@ -2,8 +2,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::state::{
-    Action, CursorMove, EditCommand, EditorTarget, Focus, ModelScreen, Panel, UiState,
+use crate::{
+    editor::{CursorMove, EditCommand},
+    state::{Action, EditorTarget, Focus, ModelScreen, Panel, UiState},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use crate::{
+    editor::{CursorMove, EditCommand},
     layout::{HitTarget, SinglePane},
     state::{
-        Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, SessionNavRow, SessionUi,
-        UiEvent, UiState, update,
+        Action, EditorTarget, Effect, Focus, SessionNavRow, SessionUi, UiEvent, UiState, update,
     },
     view,
 };

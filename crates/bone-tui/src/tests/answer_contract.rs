@@ -1,6 +1,8 @@
-use crate::state::{
-    Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, SessionNavRow, SessionUi,
-    UiEvent, UiState, update,
+use crate::{
+    editor::{CursorMove, EditCommand},
+    state::{
+        Action, EditorTarget, Effect, Focus, SessionNavRow, SessionUi, UiEvent, UiState, update,
+    },
 };
 use bone_app::{
     HistoryEntry, InputId, InputState, InputView, ModelSelection, Profile, ProfileId, QuestionId,

@@ -3,8 +3,9 @@
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::{
+    editor::EditCommand,
     layout::{HitTarget, composer_text_area},
-    state::{Action, EditCommand, EditorTarget, Focus, UiState},
+    state::{Action, EditorTarget, Focus, UiState},
     view::FrameSnapshot,
 };
 

@@ -609,6 +609,15 @@ impl Runtime {
                             .await;
                         }
                     });
+                } else {
+                    send_failure(
+                        &self.tx,
+                        OperationKind::Stop,
+                        Some(session),
+                        Some(generation),
+                        "Unable to stop the current work because the session is not open".into(),
+                    )
+                    .await;
                 }
             }
             Effect::LoadHistory {
@@ -1201,7 +1210,7 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn missing_history_handle_returns_failures_for_every_loading_latch() {
+    async fn missing_cached_handle_never_swallows_session_operations() {
         let (_root, _app, session, mut runtime, mut rx) = runtime_with_provisional_session().await;
         let id = session.id();
         for text in ["history cursor one", "history cursor two"] {
@@ -1218,6 +1227,10 @@ mod lifecycle_tests {
             .expect("two submitted inputs create a backward history cursor");
 
         for effect in [
+            Effect::Stop {
+                session: id,
+                generation: 7,
+            },
             Effect::LoadHistory {
                 session: id,
                 generation: 7,
@@ -1237,6 +1250,7 @@ mod lifecycle_tests {
         }
 
         for expected in [
+            OperationKind::Stop,
             OperationKind::LoadHistory,
             OperationKind::LoadOlderHistory,
             OperationKind::ReloadRecentHistory,

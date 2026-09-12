@@ -66,7 +66,7 @@ pub enum SetupField {
     Model,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ConnectionForm {
     pub kind: ConnectionKind,
     pub label: String,

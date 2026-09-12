@@ -51,7 +51,7 @@ impl ViewState {
 }
 
 /// Geometry and interactions produced by one completed render.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct FrameSnapshot {
     pub layout: LayoutPlan,
     hits: HitMap,

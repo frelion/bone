@@ -1,7 +1,6 @@
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::layout::vertical_cursor;
-use crate::state::{CursorMove, EditCommand};
+use super::{CursorMove, EditCommand, layout::vertical_cursor};
 
 /// One complete editable document. Text, cursor identity and interaction
 /// history move together when a draft changes owner.
