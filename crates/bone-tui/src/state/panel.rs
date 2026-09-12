@@ -133,21 +133,20 @@ fn load_models(state: &mut UiState, session: Option<SessionId>, effects: &mut Ve
     effects.push(Effect::LoadModels { session, request });
 }
 
-pub(super) fn refresh_model_label(state: &mut UiState, effects: &mut Vec<Effect>) {
-    state.model_label = None;
+pub(super) fn refresh_model_facts(state: &mut UiState, effects: &mut Vec<Effect>) {
     state.model_facts = None;
-    request_model_label(state, effects);
+    request_model_facts(state, effects);
 }
 
-fn reconcile_model_label(state: &mut UiState, effects: &mut Vec<Effect>) {
-    request_model_label(state, effects);
+fn reconcile_model_facts(state: &mut UiState, effects: &mut Vec<Effect>) {
+    request_model_facts(state, effects);
 }
 
-fn request_model_label(state: &mut UiState, effects: &mut Vec<Effect>) {
-    state.model_label_request = state.generation();
-    effects.push(Effect::LoadModelLabel {
+fn request_model_facts(state: &mut UiState, effects: &mut Vec<Effect>) {
+    state.model_facts_request = state.generation();
+    effects.push(Effect::LoadModelFacts {
         session: state.selected,
-        request: state.model_label_request,
+        request: state.model_facts_request,
     });
 }
 
@@ -211,7 +210,6 @@ pub(super) fn model_applied(
     state: &mut UiState,
     session: Option<SessionId>,
     request: u64,
-    label: Option<String>,
     facts: Option<ModelFacts>,
     error: Option<String>,
     effects: &mut Vec<Effect>,
@@ -221,14 +219,14 @@ pub(super) fn model_applied(
         .is_some_and(|operation| operation.matches(session, request, ModelOperationKind::Apply));
     if !current {
         if state.selected == session || session.is_none() {
-            reconcile_model_label(state, effects);
+            reconcile_model_facts(state, effects);
         }
         return;
     }
     state.model_operation = None;
     if state.selected != session {
         if session.is_none() {
-            reconcile_model_label(state, effects);
+            reconcile_model_facts(state, effects);
         }
         return;
     }
@@ -238,8 +236,7 @@ pub(super) fn model_applied(
             if models.session == session && matches!(models.screen, ModelScreen::List { .. })
     );
     let failed = error.is_some();
-    state.model_label_request = state.generation();
-    state.model_label = label;
+    state.model_facts_request = state.generation();
     state.model_facts = facts;
     if matching_list || state.panel.is_none() {
         if let Some(error) = error {
@@ -285,8 +282,7 @@ pub(super) fn connection_saved(
     };
     if state.selected != session
         || models.session != session
-        || !form.saving
-        || form.request != request
+        || form.pending_request != Some(request)
     {
         state.panel = Some(Panel::Models(models));
         reconcile_connection_save(state, effects);
@@ -294,7 +290,7 @@ pub(super) fn connection_saved(
     }
 
     if let Some(error) = error {
-        form.saving = false;
+        form.pending_request = None;
         state.status = Some(Status::panel_request(
             session,
             request,
@@ -305,7 +301,7 @@ pub(super) fn connection_saved(
             },
         ));
         state.panel = Some(Panel::Models(models));
-        reconcile_model_label(state, effects);
+        reconcile_model_facts(state, effects);
         return;
     }
 
@@ -351,7 +347,7 @@ fn reconcile_connection_save(state: &mut UiState, effects: &mut Vec<Effect>) {
     {
         load_models(state, current, effects);
     }
-    reconcile_model_label(state, effects);
+    reconcile_model_facts(state, effects);
 }
 
 pub(super) fn login_changed(
@@ -610,7 +606,7 @@ pub(super) fn setup_text(state: &mut UiState, mut value: SecretText) {
     else {
         return;
     };
-    if form.saving {
+    if form.pending_request.is_some() {
         return;
     }
     let text = form.text_mut();
@@ -657,7 +653,7 @@ fn setup_mut(state: &mut UiState) -> Option<&mut ConnectionForm> {
         Some(Panel::Models(ModelPanel {
             screen: ModelScreen::Setup(form),
             ..
-        })) if !form.saving => Some(form),
+        })) if form.pending_request.is_none() => Some(form),
         _ => None,
     }
 }
@@ -762,7 +758,7 @@ pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
         state.panel = Some(Panel::Models(models));
         return;
     };
-    if form.saving {
+    if form.pending_request.is_some() {
         state.panel = Some(Panel::Models(models));
         return;
     }
@@ -775,8 +771,7 @@ pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
         }
     };
     let request = state.generation();
-    form.saving = true;
-    form.request = request;
+    form.pending_request = Some(request);
     form.key_was_sent = !form.key.is_empty();
     let key = (!form.key.is_empty()).then(|| SecretText::from(form.key.take()));
     let session = models.session;
@@ -798,7 +793,7 @@ fn return_to_models(state: &mut UiState, effects: &mut Vec<Effect>) {
     models.screen = ModelScreen::List { selected: 0 };
     let session = models.session;
     load_models(state, session, effects);
-    refresh_model_label(state, effects);
+    refresh_model_facts(state, effects);
 }
 
 fn return_to_model_list(state: &mut UiState) {
@@ -870,6 +865,17 @@ mod tests {
             selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), model)
                 .unwrap(),
             profile_label: "ChatGPT".into(),
+        }
+    }
+
+    fn facts(model: &str) -> ModelFacts {
+        ModelFacts {
+            saved: Ok(bone_app::ResolvedModel {
+                selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), model)
+                    .unwrap(),
+                profile: bone_app::Profile::chatgpt(),
+            }),
+            running: None,
         }
     }
 
@@ -1050,14 +1056,13 @@ mod tests {
         open_models(&mut state, &mut effects);
         let current_load = request(&state, ModelOperationKind::Load);
         state.status = Some("new panel status".into());
-        state.model_label = Some("visible model".into());
+        state.model_facts = Some(facts("visible model"));
         effects.clear();
 
         model_applied(
             &mut state,
             None,
             old_apply,
-            Some("stale model".into()),
             None,
             Some("stale error".into()),
             &mut effects,
@@ -1065,14 +1070,14 @@ mod tests {
 
         assert_eq!(request(&state, ModelOperationKind::Load), current_load);
         assert_eq!(state.status_text(), Some("new panel status"));
-        assert_eq!(state.model_label.as_deref(), Some("visible model"));
+        assert_eq!(state.model_label(), Some("visible model"));
         assert!(matches!(
             &state.panel,
             Some(Panel::Models(models)) if models.choices.is_empty()
         ));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::LoadModelLabel { .. }]
+            [Effect::LoadModelFacts { .. }]
         ));
     }
 
@@ -1082,7 +1087,7 @@ mod tests {
         let mut state = UiState::default();
         state.selected = Some(session);
         state.panel = Some(Panel::Models(ModelPanel::new(Some(session))));
-        state.model_label = Some("visible model".into());
+        state.model_facts = Some(facts("visible model"));
         let mut effects = Vec::new();
         load_models(&mut state, Some(session), &mut effects);
         let operation = state.model_operation.expect("current load");
@@ -1092,17 +1097,16 @@ mod tests {
             &mut state,
             None,
             operation.request.wrapping_add(1),
-            Some("stale workspace model".into()),
             None,
             None,
             &mut effects,
         );
 
         assert_eq!(state.model_operation, Some(operation));
-        assert_eq!(state.model_label.as_deref(), Some("visible model"));
+        assert_eq!(state.model_label(), Some("visible model"));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::LoadModelLabel {
+            [Effect::LoadModelFacts {
                 session: Some(current),
                 ..
             }] if *current == session
@@ -1110,11 +1114,11 @@ mod tests {
     }
 
     #[test]
-    fn matching_apply_invalidates_older_label_reads_and_only_closes_its_list() {
+    fn matching_apply_invalidates_older_facts_reads_and_only_closes_its_list() {
         let mut state = UiState::default();
         let mut effects = Vec::new();
-        refresh_model_label(&mut state, &mut effects);
-        let stale_label = state.model_label_request;
+        refresh_model_facts(&mut state, &mut effects);
+        let stale_facts = state.model_facts_request;
         ready_models(&mut state, vec![choice("new")]);
         select_model(&mut state, 0, &mut Vec::new());
         let apply = request(&state, ModelOperationKind::Apply);
@@ -1123,25 +1127,23 @@ mod tests {
             &mut state,
             None,
             apply,
-            Some("new".into()),
-            None,
+            Some(facts("new")),
             None,
             &mut Vec::new(),
         );
         assert!(state.panel.is_none());
-        assert_eq!(state.model_label.as_deref(), Some("new"));
-        assert_ne!(state.model_label_request, stale_label);
+        assert_eq!(state.model_label(), Some("new"));
+        assert_ne!(state.model_facts_request, stale_facts);
 
         update(
             &mut state,
-            UiEvent::ModelLabelLoaded {
+            UiEvent::ModelFactsLoaded {
                 session: None,
-                request: stale_label,
-                label: Some("old".into()),
-                facts: None,
+                request: stale_facts,
+                facts: Some(facts("old")),
             },
         );
-        assert_eq!(state.model_label.as_deref(), Some("new"));
+        assert_eq!(state.model_label(), Some("new"));
     }
 
     #[test]
@@ -1156,8 +1158,7 @@ mod tests {
             &mut state,
             None,
             apply,
-            Some("new".into()),
-            None,
+            Some(facts("new")),
             None,
             &mut Vec::new(),
         );
@@ -1184,7 +1185,6 @@ mod tests {
             &mut state,
             None,
             apply,
-            Some("new-saved".into()),
             Some(ModelFacts {
                 saved: Ok(saved),
                 running: Some(running),
@@ -1226,7 +1226,6 @@ mod tests {
             None,
             apply,
             None,
-            None,
             Some("apply failed".into()),
             &mut effects,
         );
@@ -1264,7 +1263,7 @@ mod tests {
         assert!(
             effects
                 .iter()
-                .any(|effect| matches!(effect, Effect::LoadModelLabel { .. }))
+                .any(|effect| matches!(effect, Effect::LoadModelFacts { .. }))
         );
         assert!(matches!(
             &state.panel,
@@ -1311,6 +1310,16 @@ mod tests {
         assert_eq!(key.as_str(), secret);
         let request = *request;
         let session = *session;
+        assert!(matches!(
+            &state.panel,
+            Some(Panel::Models(ModelPanel {
+                screen: ModelScreen::Setup(form),
+                ..
+            })) if form.pending_request == Some(request)
+        ));
+        let mut duplicate = Vec::new();
+        save_connection(&mut state, &mut duplicate);
+        assert!(duplicate.is_empty());
         connection_saved(
             &mut state,
             request,
@@ -1326,7 +1335,7 @@ mod tests {
             Some(Panel::Models(ModelPanel {
                 screen: ModelScreen::Setup(form),
                 ..
-            })) if !form.saving && form.key.is_empty()
+            })) if form.pending_request.is_none() && form.key.is_empty()
         ));
         assert_eq!(state.orphan_draft.text(), "ordinary draft");
         assert!(state.model_operation.is_none());
@@ -1404,7 +1413,7 @@ mod tests {
         ));
         assert_eq!(effects.len(), 2);
         assert!(matches!(effects[0], Effect::LoadModels { .. }));
-        assert!(matches!(effects[1], Effect::LoadModelLabel { .. }));
+        assert!(matches!(effects[1], Effect::LoadModelFacts { .. }));
     }
 
     #[test]
@@ -1458,11 +1467,22 @@ mod tests {
         let old_request = *request;
         let old_session = *session;
 
-        setup_panel(
-            &mut state,
-            ConnectionForm::new(ConnectionKind::AnthropicMessages),
-        );
-        state.status = Some("new validation".into());
+        let mut replacement = ConnectionForm::new(ConnectionKind::AnthropicMessages);
+        replacement.key = SecretText::from(String::from("replacement-secret"));
+        setup_panel(&mut state, replacement);
+        let mut replacement_effects = Vec::new();
+        save_connection(&mut state, &mut replacement_effects);
+        let [
+            Effect::SaveConnection {
+                request: replacement_request,
+                ..
+            },
+        ] = replacement_effects.as_slice()
+        else {
+            panic!("replacement save effect")
+        };
+        let replacement_request = *replacement_request;
+        state.status = Some("new pending status".into());
         let mut receipts = Vec::new();
         connection_saved(
             &mut state,
@@ -1473,17 +1493,18 @@ mod tests {
             &mut receipts,
         );
 
-        assert_eq!(state.status_text(), Some("new validation"));
+        assert_eq!(state.status_text(), Some("new pending status"));
         assert!(matches!(
             &state.panel,
             Some(Panel::Models(ModelPanel {
                 screen: ModelScreen::Setup(form),
                 ..
             })) if form.kind == ConnectionKind::AnthropicMessages
+                && form.pending_request == Some(replacement_request)
         ));
         assert!(matches!(
             receipts.as_slice(),
-            [Effect::LoadModelLabel { .. }]
+            [Effect::LoadModelFacts { .. }]
         ));
     }
 

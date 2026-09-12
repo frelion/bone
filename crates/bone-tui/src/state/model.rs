@@ -246,13 +246,12 @@ pub struct UiState {
     pub(crate) pane_widths: crate::layout::PaneWidths,
     pub(crate) dragging_divider: Option<crate::layout::PaneDivider>,
     pub(crate) panel: Option<Panel>,
-    pub(crate) model_label_request: u64,
+    pub(crate) model_facts_request: u64,
     pub(crate) model_operation: Option<ModelOperation>,
     pub(super) titles: TitleState,
     pub(crate) terminal_capabilities: crate::terminal::TerminalCapabilities,
 
     pub workspace_label: Option<String>,
-    pub model_label: Option<String>,
     pub model_facts: Option<ModelFacts>,
     pub(crate) session_rows: Vec<SessionNavRow>,
     pub selected: Option<SessionId>,
@@ -279,12 +278,11 @@ impl Default for UiState {
             pane_widths: Default::default(),
             dragging_divider: None,
             panel: None,
-            model_label_request: 0,
+            model_facts_request: 0,
             model_operation: None,
             titles: TitleState::default(),
             terminal_capabilities: Default::default(),
             workspace_label: None,
-            model_label: None,
             model_facts: None,
             session_rows: Vec::new(),
             selected: None,
@@ -349,7 +347,13 @@ impl UiState {
 
     pub(crate) fn blinking_caret_active(&self) -> bool {
         match &self.panel {
-            Some(Panel::Models(models)) if models.setup().is_some_and(|form| !form.saving) => true,
+            Some(Panel::Models(models))
+                if models
+                    .setup()
+                    .is_some_and(|form| form.pending_request.is_none()) =>
+            {
+                true
+            }
             Some(_) => false,
             None => {
                 matches!(self.focus, Focus::SessionTitle | Focus::Composer)
@@ -422,6 +426,12 @@ impl UiState {
             .and_then(|facts| facts.running.as_ref())
     }
 
+    pub(crate) fn model_label(&self) -> Option<&str> {
+        self.model_facts
+            .as_ref()
+            .and_then(ModelFacts::saved_model_label)
+    }
+
     pub(crate) fn model_footer(&self) -> String {
         if let Some(running) = self.running_model() {
             let changed = self
@@ -438,8 +448,7 @@ impl UiState {
                 }
             );
         }
-        self.model_label
-            .as_ref()
+        self.model_label()
             .map_or_else(|| "Select model".into(), |label| format!("{label} · saved"))
     }
 
@@ -483,8 +492,6 @@ impl UiState {
             .is_some_and(|facts| facts.saved.is_err())
         {
             lines.push("Saved configuration needs attention".into());
-        } else if let Some(label) = &self.model_label {
-            lines.push(format!("Saved: {label}"));
         }
         lines.join("\n")
     }
@@ -611,7 +618,6 @@ mod model_fact_tests {
             };
             assert!(!facts.applied_to(Some(&running)));
             let state = UiState {
-                model_label: Some("same-name".into()),
                 model_facts: Some(facts),
                 ..UiState::default()
             };
@@ -628,7 +634,6 @@ mod model_fact_tests {
     fn detached_saved_model_is_neutral_and_runtime_snapshot_overrides_cached_running() {
         let running = model();
         let mut state = UiState {
-            model_label: Some("same-name".into()),
             model_facts: Some(ModelFacts {
                 saved: Ok(running.clone()),
                 running: None,

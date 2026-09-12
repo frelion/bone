@@ -124,7 +124,7 @@ pub(super) fn render(
                 },
                 if form.key_was_sent {
                     "Re-enter API key"
-                } else if form.existing.is_some() {
+                } else if form.edits_existing_connection() {
                     "blank: keep key unchanged"
                 } else {
                     "API key required"
@@ -157,7 +157,7 @@ pub(super) fn render(
             )),
             input,
         );
-        if selected && !form.saving && input.width > 2 {
+        if selected && form.pending_request.is_none() && input.width > 2 {
             caret::place(frame, (input.x + cursor, input.y), state.caret_visible);
         }
         hits.push(HitRegion {
@@ -166,20 +166,20 @@ pub(super) fn render(
         });
     }
     let action = Rect::new(x, area.bottom().saturating_sub(2 + inset), width, 1);
-    let label = if form.saving {
+    let label = if form.pending_request.is_some() {
         "Saving…"
     } else if form.kind == ConnectionKind::ChatGptSubscription {
         "enter save & authorize"
     } else {
         "enter save · tab next field"
     };
-    let action_style = if form.saving {
+    let action_style = if form.pending_request.is_some() {
         theme::label(INFO)
     } else {
         theme::label(INK)
     };
     frame.render_widget(Paragraph::new(label).style(action_style), action);
-    if !form.saving {
+    if form.pending_request.is_none() {
         hits.push(HitRegion {
             area: action,
             target: HitTarget::Action(Action::SaveConnection),
@@ -322,6 +322,37 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Re-enter API key"));
         assert!(!rendered.contains("keep key"));
+    }
+
+    #[test]
+    fn pending_save_shows_progress_without_an_action_or_caret() {
+        let mut form = ConnectionForm::new(ConnectionKind::ChatGptSubscription);
+        form.pending_request = Some(7);
+        let mut state = UiState::default();
+        state.panel = Some(connection_panel(ModelScreen::Setup(form)));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut layout = None;
+
+        terminal
+            .draw(|frame| layout = Some(crate::view::render(frame, &state)))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Saving…"));
+        assert!(
+            !layout
+                .unwrap()
+                .hit_regions()
+                .iter()
+                .any(|hit| { hit.target == HitTarget::Action(Action::SaveConnection) })
+        );
+        assert!(!state.blinking_caret_active());
     }
 
     #[test]

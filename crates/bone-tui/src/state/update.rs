@@ -43,14 +43,12 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             request,
             state: login,
         } => panel::login_changed(state, request, login, &mut effects),
-        UiEvent::ModelLabelLoaded {
+        UiEvent::ModelFactsLoaded {
             session,
             request,
-            label,
             facts,
         } => {
-            if state.selected == session && state.model_label_request == request {
-                state.model_label = label;
+            if state.selected == session && state.model_facts_request == request {
                 state.model_facts = facts;
             }
         }
@@ -68,19 +66,18 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
         UiEvent::ModelApplied {
             session,
             request,
-            label,
             facts,
             error,
-        } => panel::model_applied(state, session, request, label, facts, error, &mut effects),
+        } => panel::model_applied(state, session, request, facts, error, &mut effects),
         UiEvent::Action(action) => handle_action(state, action, &mut effects),
         UiEvent::WorkspaceOpened {
             label,
             rows,
             last_active,
-            model_label,
+            model_facts,
         } => {
             state.workspace_label = Some(label);
-            state.model_label = model_label;
+            state.model_facts = Some(model_facts);
             state.session_rows = rows;
             let preferred = last_active.filter(|candidate| {
                 state
@@ -256,7 +253,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 state.clear_title_edit();
                 panel::dismiss(state, &mut effects);
                 state.remove_title_focus();
-                panel::refresh_model_label(state, &mut effects);
+                panel::refresh_model_facts(state, &mut effects);
             }
             if state.session_candidate.is_some_and(|id| {
                 !state
@@ -1493,7 +1490,7 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
         });
     }
     state.selected = Some(id);
-    panel::refresh_model_label(state, effects);
+    panel::refresh_model_facts(state, effects);
     state.slash_dismissed = None;
     let generation = state.generation();
     let ui = state
@@ -1876,8 +1873,67 @@ mod owned_editor_lifecycle_tests {
 mod async_identity_tests {
     use super::*;
 
+    fn model_facts(model: &str) -> ModelFacts {
+        ModelFacts {
+            saved: Ok(bone_app::ResolvedModel {
+                selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), model)
+                    .unwrap(),
+                profile: bone_app::Profile::chatgpt(),
+            }),
+            running: None,
+        }
+    }
+
     #[test]
-    fn switching_sessions_clears_label_and_rejects_late_previous_selection() {
+    fn workspace_opened_keeps_model_facts_as_the_label_source() {
+        let mut state = UiState::default();
+
+        let effects = update(
+            &mut state,
+            UiEvent::WorkspaceOpened {
+                label: "workspace".into(),
+                rows: Vec::new(),
+                last_active: None,
+                model_facts: model_facts("workspace-model"),
+            },
+        );
+
+        assert!(effects.is_empty());
+        assert_eq!(state.model_label(), Some("workspace-model"));
+        assert_eq!(state.model_footer(), "workspace-model · saved");
+        assert_eq!(
+            state.model_configuration_summary(),
+            "Saved: chatgpt/workspace-model"
+        );
+    }
+
+    #[test]
+    fn workspace_opened_preserves_saved_configuration_problems() {
+        let mut state = UiState::default();
+
+        update(
+            &mut state,
+            UiEvent::WorkspaceOpened {
+                label: "workspace".into(),
+                rows: Vec::new(),
+                last_active: None,
+                model_facts: ModelFacts {
+                    saved: Err(bone_app::ConfigProblem::NeedsModel),
+                    running: None,
+                },
+            },
+        );
+
+        assert_eq!(state.model_label(), None);
+        assert_eq!(state.model_footer(), "Select model");
+        assert_eq!(
+            state.model_configuration_summary(),
+            "Saved configuration needs attention"
+        );
+    }
+
+    #[test]
+    fn switching_sessions_clears_facts_and_rejects_late_previous_selection() {
         let mut state = UiState::default();
         let workspace = bone_app::WorkspaceId::new();
         let a = SessionId::new();
@@ -1892,39 +1948,37 @@ mod async_identity_tests {
             })
             .map(test_session_row)
             .collect();
-        state.model_label = Some("workspace-model".into());
+        state.model_facts = Some(model_facts("workspace-model"));
         let mut effects = Vec::new();
         select_session(&mut state, a, &mut effects);
-        assert_eq!(state.model_label, None);
-        let first = state.model_label_request;
+        assert_eq!(state.model_label(), None);
+        let first = state.model_facts_request;
         select_session(&mut state, b, &mut effects);
         select_session(&mut state, a, &mut effects);
-        let current = state.model_label_request;
+        let current = state.model_facts_request;
         assert_ne!(first, current);
         update(
             &mut state,
-            UiEvent::ModelLabelLoaded {
+            UiEvent::ModelFactsLoaded {
                 session: Some(a),
                 request: first,
-                label: Some("stale".into()),
-                facts: None,
+                facts: Some(model_facts("stale")),
             },
         );
-        assert_eq!(state.model_label, None);
+        assert_eq!(state.model_label(), None);
         update(
             &mut state,
-            UiEvent::ModelLabelLoaded {
+            UiEvent::ModelFactsLoaded {
                 session: Some(a),
                 request: current,
-                label: Some("current".into()),
-                facts: None,
+                facts: Some(model_facts("current")),
             },
         );
-        assert_eq!(state.model_label.as_deref(), Some("current"));
+        assert_eq!(state.model_label(), Some("current"));
         assert_eq!(
             effects
                 .iter()
-                .filter(|effect| matches!(effect, Effect::LoadModelLabel { .. }))
+                .filter(|effect| matches!(effect, Effect::LoadModelFacts { .. }))
                 .count(),
             3
         );

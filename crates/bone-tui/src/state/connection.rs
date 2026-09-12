@@ -74,9 +74,7 @@ pub struct ConnectionForm {
     pub key: SecretText,
     pub model: String,
     pub field: SetupField,
-    pub saving: bool,
-    pub existing: Option<ProfileId>,
-    pub request: u64,
+    pub pending_request: Option<u64>,
     pub(crate) key_was_sent: bool,
     id: ProfileId,
     original_endpoint: Option<EndpointConfig>,
@@ -97,9 +95,7 @@ impl ConnectionForm {
             key: SecretText::default(),
             model: String::new(),
             field: SetupField::Label,
-            saving: false,
-            existing: None,
-            request: 0,
+            pending_request: None,
             key_was_sent: false,
             id,
             original_endpoint: None,
@@ -116,7 +112,6 @@ impl ConnectionForm {
         let mut form = Self::new(kind);
         form.original_endpoint = Some(profile.endpoint.clone());
         form.id = profile.id.clone();
-        form.existing = Some(profile.id.clone());
         form.label = profile.label.clone();
         form.base_url = profile.endpoint.base_url().unwrap_or_default().into();
         form.model = model;
@@ -166,7 +161,7 @@ impl ConnectionForm {
         if self.key_was_sent && self.key.is_empty() {
             return Err("Re-enter the API key before retrying this save".into());
         }
-        if !self.kind.subscription() && self.existing.is_none() && self.key.is_empty() {
+        if !self.kind.subscription() && self.original_endpoint.is_none() && self.key.is_empty() {
             return Err("Enter an API key for this new connection".into());
         }
         let base_url = (!self.base_url.trim().is_empty()).then(|| self.base_url.trim().to_owned());
@@ -198,5 +193,40 @@ impl ConnectionForm {
             )
         };
         Ok((profile, selection))
+    }
+
+    pub(crate) fn edits_existing_connection(&self) -> bool {
+        self.original_endpoint.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn original_endpoint_is_the_edit_identity_for_key_validation() {
+        let fresh = ConnectionForm::new(ConnectionKind::OpenAiResponses);
+        assert!(!fresh.edits_existing_connection());
+        assert_eq!(
+            fresh.validated().unwrap_err(),
+            "Enter an API key for this new connection"
+        );
+
+        let profile = Profile::new(
+            ProfileId::new("existing").unwrap(),
+            "Existing",
+            EndpointConfig::OpenAiResponses { base_url: None },
+        )
+        .unwrap();
+        let mut edited = ConnectionForm::edit(&profile, String::new());
+        assert!(edited.edits_existing_connection());
+        assert!(edited.validated().is_ok());
+
+        edited.base_url = "https://example.invalid".into();
+        assert_eq!(
+            edited.validated().unwrap_err(),
+            "Endpoint changed: enter an API key for the new endpoint"
+        );
     }
 }

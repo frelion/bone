@@ -61,7 +61,17 @@ fn render_preview_artifact() {
     let workspace = WorkspaceId::new();
     let mut state = UiState::default();
     state.workspace_label = Some("BONE".into());
-    state.model_label = Some("Worker · GPT-5.5".into());
+    state.model_facts = Some(crate::state::ModelFacts {
+        saved: Ok(bone_app::ResolvedModel {
+            selection: bone_app::ModelSelection::new(
+                bone_app::ProfileId::chatgpt(),
+                "Worker · GPT-5.5",
+            )
+            .unwrap(),
+            profile: bone_app::Profile::chatgpt(),
+        }),
+        running: None,
+    });
     let sessions = [
         "草稿恢复",
         "Context engine",

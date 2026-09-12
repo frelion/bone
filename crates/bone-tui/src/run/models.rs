@@ -28,6 +28,13 @@ impl From<bone_app::ResolvedConfig> for ModelFacts {
 }
 
 impl ModelFacts {
+    pub fn saved_model_label(&self) -> Option<&str> {
+        self.saved
+            .as_ref()
+            .ok()
+            .map(|model| model.selection.model.as_str())
+    }
+
     pub fn applied_to(&self, running: Option<&bone_app::ResolvedModel>) -> bool {
         matches!((&self.saved, running), (Ok(saved), Some(running)) if saved == running)
     }
@@ -241,24 +248,6 @@ pub(crate) async fn apply(
     .await
 }
 
-/// A label belongs to one selected scope; failures must not retain another scope's label.
-#[cfg(test)]
-pub(crate) async fn label(
-    app: &App,
-    workspace: WorkspaceId,
-    session: Option<SessionId>,
-) -> Option<String> {
-    let config = match session {
-        Some(id) => app.resolved_config(id).await,
-        None => app.resolved_workspace_config(workspace).await,
-    };
-    config
-        .ok()?
-        .desired
-        .ok()
-        .map(|config| config.worker.selection.model)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,7 +297,13 @@ mod tests {
             .unwrap();
         let workspace = app.open_workspace(root.path()).await.unwrap();
         assert!(load(&app, workspace.id, None).await.unwrap().is_empty());
-        assert_eq!(label(&app, workspace.id, None).await, None);
+        assert_eq!(
+            facts(&app, workspace.id, None)
+                .await
+                .as_ref()
+                .and_then(ModelFacts::saved_model_label),
+            None
+        );
         assert!(explicit(&app, "missing", "model").await.is_err());
         app.save_profile(Profile::chatgpt()).await.unwrap();
         assert!(explicit(&app, "chatgpt", " ").await.is_err());
@@ -337,13 +332,17 @@ mod tests {
         let saved = apply(&app, session.id(), &selected).await.unwrap();
         assert_eq!(saved.worker.as_ref(), Some(&selected.selection));
         assert_eq!(
-            label(&app, workspace.id, Some(session.id()))
+            facts(&app, workspace.id, Some(session.id()))
                 .await
-                .as_deref(),
+                .as_ref()
+                .and_then(ModelFacts::saved_model_label),
             Some("explicit-local")
         );
         assert_eq!(
-            label(&app, workspace.id, None).await.as_deref(),
+            facts(&app, workspace.id, None)
+                .await
+                .as_ref()
+                .and_then(ModelFacts::saved_model_label),
             Some("configured-global")
         );
         assert_eq!(saved.coordinator, Some(coordinator));

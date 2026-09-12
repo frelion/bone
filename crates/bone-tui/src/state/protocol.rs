@@ -93,10 +93,9 @@ pub enum UiEvent {
         request: u64,
         state: bone_app::LoginState,
     },
-    ModelLabelLoaded {
+    ModelFactsLoaded {
         session: Option<SessionId>,
         request: u64,
-        label: Option<String>,
         facts: Option<super::ModelFacts>,
     },
     ModelsFailed {
@@ -113,7 +112,6 @@ pub enum UiEvent {
     ModelApplied {
         session: Option<SessionId>,
         request: u64,
-        label: Option<String>,
         facts: Option<super::ModelFacts>,
         error: Option<String>,
     },
@@ -123,7 +121,7 @@ pub enum UiEvent {
         label: String,
         rows: Vec<SessionNavRow>,
         last_active: Option<SessionId>,
-        model_label: Option<String>,
+        model_facts: super::ModelFacts,
     },
     SessionOpened {
         session: SessionId,
@@ -245,7 +243,7 @@ pub enum Effect {
         profile: bone_app::ProfileId,
         request: u64,
     },
-    LoadModelLabel {
+    LoadModelFacts {
         session: Option<SessionId>,
         request: u64,
     },

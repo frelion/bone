@@ -166,21 +166,16 @@ impl Runtime {
                 );
             }
 
-            Effect::LoadModelLabel { session, request } => {
+            Effect::LoadModelFacts { session, request } => {
                 let app = self.app.clone();
                 let workspace = self.workspace;
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
                     let facts = super::models::facts(&app, workspace, session).await;
-                    let label = facts
-                        .as_ref()
-                        .and_then(|facts| facts.saved.as_ref().ok())
-                        .map(|model| model.selection.model.clone());
                     let _ = tx
-                        .send(UiEvent::ModelLabelLoaded {
+                        .send(UiEvent::ModelFactsLoaded {
                             session,
                             request,
-                            label,
                             facts,
                         })
                         .await;
@@ -1141,15 +1136,10 @@ async fn model_applied(
     error: Option<bone_app::Error>,
 ) {
     let facts = super::models::facts(app, workspace, session).await;
-    let label = facts
-        .as_ref()
-        .and_then(|facts| facts.saved.as_ref().ok())
-        .map(|model| model.selection.model.clone());
     let _ = tx
         .send(UiEvent::ModelApplied {
             session,
             request,
-            label,
             facts,
             error: error.map(|error| error.to_string()),
         })

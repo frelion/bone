@@ -270,7 +270,7 @@ fn action(area: Rect, state: &UiState) -> (Rect, &'static str) {
         } else {
             "enter answer"
         }
-    } else if state.model_label.is_none() && state.running_model().is_none() {
+    } else if state.model_label().is_none() && state.running_model().is_none() {
         "enter save"
     } else if session.is_some_and(|ui| ui.working()) {
         "enter append"

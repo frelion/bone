@@ -68,12 +68,7 @@ pub async fn run() -> Result<(), RunError> {
     let workspace = app.open_workspace(launch.workspace).await?;
     let overview = app.workspace_overview(workspace.id).await?;
     let last_active = app.last_active_session(workspace.id).await?;
-    let model_label = app
-        .resolved_workspace_config(workspace.id)
-        .await?
-        .desired
-        .ok()
-        .map(|config| config.worker.selection.model);
+    let model_facts = models::ModelFacts::from(app.resolved_workspace_config(workspace.id).await?);
     let rows = summarize_overview(&overview);
 
     let (tx, mut rx) = mpsc::channel(256);
@@ -92,7 +87,7 @@ pub async fn run() -> Result<(), RunError> {
             label,
             rows,
             last_active,
-            model_label,
+            model_facts,
         },
     ));
 
