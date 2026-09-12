@@ -416,7 +416,6 @@ impl Runtime {
             }
             Effect::AutoTitle {
                 session,
-                generation,
                 request,
                 first_input,
             } => {
@@ -452,28 +451,16 @@ impl Runtime {
                 );
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
-                    match future.await {
-                        Ok(Some(title)) => {
-                            let _ = tx
-                                .send(UiEvent::SessionAutoTitled {
-                                    session,
-                                    request,
-                                    title,
-                                })
-                                .await;
-                        }
-                        Ok(None) => {}
-                        Err(_) => {
-                            send_failure(
-                                &tx,
-                                OperationKind::AutoTitle,
-                                Some(session),
-                                Some(generation),
-                                "The session title could not be updated".into(),
-                            )
-                            .await
-                        }
-                    }
+                    let result = future
+                        .await
+                        .map_err(|_| "The session title could not be updated".into());
+                    let _ = tx
+                        .send(UiEvent::SessionAutoTitleFinished {
+                            session,
+                            request,
+                            result,
+                        })
+                        .await;
                 });
             }
             Effect::SaveDraft {
@@ -962,7 +949,7 @@ impl Runtime {
             | UiEvent::SessionRenameFailed {
                 session, request, ..
             } => Some((*session, SessionOperationToken::Rename(*request))),
-            UiEvent::SessionAutoTitled {
+            UiEvent::SessionAutoTitleFinished {
                 session, request, ..
             } => Some((*session, SessionOperationToken::AutoTitle(*request))),
             UiEvent::SessionReleased {
@@ -1209,6 +1196,17 @@ mod lifecycle_tests {
         .shared()
     }
 
+    fn ready_operation() -> SharedSessionOperationBarrier {
+        async { None }.boxed().shared()
+    }
+
+    async fn receive_event(rx: &mut mpsc::Receiver<UiEvent>) -> UiEvent {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Runtime completion event timed out")
+            .expect("Runtime completion channel closed")
+    }
+
     #[tokio::test]
     async fn missing_cached_handle_never_swallows_session_operations() {
         let (_root, _app, session, mut runtime, mut rx) = runtime_with_provisional_session().await;
@@ -1269,6 +1267,131 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
+    async fn auto_title_changed_completion_retires_its_runtime_tail() {
+        let (_root, _app, session, mut runtime, mut rx) = runtime_with_provisional_session().await;
+        let id = session.id();
+        runtime
+            .apply(Effect::AutoTitle {
+                session: id,
+                request: 11,
+                first_input: "Automatic title from this first input".into(),
+            })
+            .await;
+
+        let event = receive_event(&mut rx).await;
+        assert!(matches!(
+            &event,
+            UiEvent::SessionAutoTitleFinished {
+                session,
+                request: 11,
+                result: Ok(Some(_)),
+            } if *session == id
+        ));
+        assert!(matches!(
+            runtime.session_operations.get(&id),
+            Some(PendingSessionOperation {
+                token: SessionOperationToken::AutoTitle(11),
+                ..
+            })
+        ));
+        runtime.accept_event(&event);
+        assert!(!runtime.session_operations.contains_key(&id));
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_title_unchanged_completion_retires_its_runtime_tail() {
+        let (_root, _app, session, mut runtime, mut rx) = runtime_with_provisional_session().await;
+        let id = session.id();
+        session.rename("Manual title").await.unwrap();
+        runtime
+            .apply(Effect::AutoTitle {
+                session: id,
+                request: 12,
+                first_input: "Automatic title must not replace manual".into(),
+            })
+            .await;
+
+        let event = receive_event(&mut rx).await;
+        assert!(matches!(
+            &event,
+            UiEvent::SessionAutoTitleFinished {
+                session,
+                request: 12,
+                result: Ok(None),
+            } if *session == id
+        ));
+        runtime.accept_event(&event);
+        assert!(!runtime.session_operations.contains_key(&id));
+        assert_eq!(
+            session.snapshot().await.unwrap().session.title,
+            "Manual title"
+        );
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_title_failure_completes_and_does_not_fail_exit_flush() {
+        let (_root, _app, _session, mut runtime, mut rx) = runtime_with_provisional_session().await;
+        let missing = SessionId::new();
+        runtime
+            .apply(Effect::AutoTitle {
+                session: missing,
+                request: 13,
+                first_input: "Cannot title a missing session".into(),
+            })
+            .await;
+
+        runtime.flush_title_writes().await.unwrap();
+        let event = receive_event(&mut rx).await;
+        assert!(matches!(
+            &event,
+            UiEvent::SessionAutoTitleFinished {
+                session,
+                request: 13,
+                result: Err(message),
+            } if *session == missing && message == "The session title could not be updated"
+        ));
+        assert!(runtime.session_operations.contains_key(&missing));
+        runtime.accept_event(&event);
+        assert!(!runtime.session_operations.contains_key(&missing));
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_title_completion_clears_only_the_matching_runtime_tail() {
+        let (_root, _app, session, mut runtime, _rx) = runtime_with_provisional_session().await;
+        let id = session.id();
+        runtime.session_operations.insert(
+            id,
+            PendingSessionOperation {
+                token: SessionOperationToken::AutoTitle(22),
+                barrier: ready_operation(),
+            },
+        );
+
+        runtime.accept_event(&UiEvent::SessionAutoTitleFinished {
+            session: id,
+            request: 21,
+            result: Ok(None),
+        });
+        runtime.accept_event(&UiEvent::SessionAutoTitleFinished {
+            session: SessionId::new(),
+            request: 22,
+            result: Ok(None),
+        });
+        assert!(runtime.session_operations.contains_key(&id));
+
+        runtime.accept_event(&UiEvent::SessionAutoTitleFinished {
+            session: id,
+            request: 22,
+            result: Err("completed".into()),
+        });
+        assert!(!runtime.session_operations.contains_key(&id));
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn auto_title_then_manual_rename_are_durable_in_effect_order() {
         let (_root, app, session, mut runtime, _rx) = runtime_with_provisional_session().await;
         let id = session.snapshot().await.unwrap().session.id;
@@ -1276,7 +1399,6 @@ mod lifecycle_tests {
         runtime
             .apply(Effect::AutoTitle {
                 session: id,
-                generation: 1,
                 request: 1,
                 first_input: "Automatic title from this first input".into(),
             })

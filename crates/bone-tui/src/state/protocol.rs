@@ -189,10 +189,10 @@ pub enum UiEvent {
         request: u64,
         message: String,
     },
-    SessionAutoTitled {
+    SessionAutoTitleFinished {
         session: SessionId,
         request: u64,
-        title: String,
+        result: Result<Option<String>, String>,
     },
     SessionReleased {
         generation: u64,
@@ -221,7 +221,6 @@ pub enum OperationKind {
     LoadOlderHistory,
     ReloadRecentHistory,
     RefreshOverview,
-    AutoTitle,
     ReleaseSession,
     RememberSession,
 }
@@ -276,7 +275,6 @@ pub enum Effect {
     },
     AutoTitle {
         session: SessionId,
-        generation: u64,
         request: u64,
         first_input: String,
     },

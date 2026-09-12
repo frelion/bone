@@ -817,9 +817,9 @@ mod selection_tests {
             matches!(&down, UiEvent::Action(Action::Edit { target: EditorTarget::SessionTitle, command: EditCommand::Point { byte, extend: false } }) if *byte == expected_down)
         );
         crate::state::update(&mut state, down);
-        let edit = state.title_edit.as_ref().unwrap();
-        assert_eq!(edit.editor.cursor(), expected_down);
-        assert_eq!(edit.editor.selection(), None);
+        let editor = state.title_editor().unwrap();
+        assert_eq!(editor.cursor(), expected_down);
+        assert_eq!(editor.selection(), None);
 
         let snapshot = draw(&state);
         let origin = snapshot.title_byte_origin().unwrap();
@@ -838,9 +838,9 @@ mod selection_tests {
             matches!(&drag, UiEvent::Action(Action::Edit { target: EditorTarget::SessionTitle, command: EditCommand::Point { byte, extend: true } }) if *byte == expected_drag)
         );
         crate::state::update(&mut state, drag);
-        let edit = state.title_edit.as_ref().unwrap();
+        let editor = state.title_editor().unwrap();
         assert_eq!(
-            edit.editor.selection(),
+            editor.selection(),
             Some(expected_down.min(expected_drag)..expected_down.max(expected_drag))
         );
 
@@ -861,9 +861,9 @@ mod selection_tests {
             matches!(&shift_click, UiEvent::Action(Action::Edit { target: EditorTarget::SessionTitle, command: EditCommand::Point { byte, extend: true } }) if *byte == expected_shift)
         );
         crate::state::update(&mut state, shift_click);
-        let edit = state.title_edit.as_ref().unwrap();
+        let editor = state.title_editor().unwrap();
         assert_eq!(
-            edit.editor.selection(),
+            editor.selection(),
             Some(expected_down.min(expected_shift)..expected_down.max(expected_shift))
         );
     }

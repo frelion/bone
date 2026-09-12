@@ -5,6 +5,7 @@ mod model;
 mod panel;
 mod protocol;
 pub(crate) mod reader;
+mod title;
 mod transcript;
 mod update;
 

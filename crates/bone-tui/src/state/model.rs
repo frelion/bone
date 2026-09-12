@@ -1,8 +1,5 @@
 pub use crate::run::models::{ModelChoice, ModelFacts};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use bone_app::{QuestionId, RequestId, SessionId, SessionInfo, SessionSummary, SessionView};
 
@@ -11,6 +8,7 @@ use crate::layout::SinglePane;
 use super::{
     TranscriptState,
     panel::{ModelOperation, Panel},
+    title::TitleState,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -154,61 +152,6 @@ pub struct PendingSubmission {
     pub failed: bool,
 }
 
-/// Durable-write state is scoped to a Session rather than to the currently
-/// visible title editor. This queue survives focus and Session changes.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct TitleRenameQueue {
-    /// A successful local write kept until an authoritative read observes it.
-    /// This prevents an overview that started before the write from rolling the
-    /// visible title back after the callback has completed.
-    pub(crate) confirmed: Option<String>,
-    /// Requests already handed to the Runtime. More than one is possible only
-    /// during graceful exit, when the latest coalesced title is flushed behind
-    /// the request that was already running.
-    pub(crate) pending: BTreeMap<u64, String>,
-    /// Highest successful request already reflected in UI state. The Runtime
-    /// serializes writes, but their observer tasks may enqueue receipts out of
-    /// order after those writes complete.
-    pub(crate) applied: u64,
-    pub(crate) queued: Option<String>,
-}
-
-impl TitleRenameQueue {
-    pub(crate) fn desired(&self) -> Option<&str> {
-        self.queued
-            .as_deref()
-            .or_else(|| {
-                self.pending
-                    .last_key_value()
-                    .map(|(_, title)| title.as_str())
-            })
-            .or(self.confirmed.as_deref())
-    }
-
-    pub(crate) fn pending(&self) -> bool {
-        !self.pending.is_empty() || self.queued.is_some()
-    }
-}
-
-/// The center header's one-line editor. Async persistence is deliberately kept
-/// outside this transient UI state so replacing the editor cannot drop a write.
-#[derive(Clone, Debug)]
-pub(crate) struct TitleEdit {
-    pub(crate) target: SessionId,
-    pub(crate) original: String,
-    pub(crate) editor: crate::editor::EditorBuffer,
-}
-
-impl TitleEdit {
-    fn new(target: SessionId, title: String) -> Self {
-        Self {
-            target,
-            original: title.clone(),
-            editor: crate::editor::EditorBuffer::new(title),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct SessionUi {
     pub id: SessionId,
@@ -304,10 +247,7 @@ pub struct UiState {
     pub(crate) panel: Option<Panel>,
     pub(crate) model_label_request: u64,
     pub(crate) model_operation: Option<ModelOperation>,
-    pub(crate) title_edit: Option<TitleEdit>,
-    pub(crate) title_renames: BTreeMap<SessionId, TitleRenameQueue>,
-    pub(crate) title_manual_intent: BTreeSet<SessionId>,
-    pub(crate) title_rename_error: Option<(SessionId, String)>,
+    pub(super) titles: TitleState,
     pub(crate) terminal_capabilities: crate::terminal::TerminalCapabilities,
 
     pub workspace_label: Option<String>,
@@ -340,10 +280,7 @@ impl Default for UiState {
             panel: None,
             model_label_request: 0,
             model_operation: None,
-            title_edit: None,
-            title_renames: BTreeMap::new(),
-            title_manual_intent: BTreeSet::new(),
-            title_rename_error: None,
+            titles: TitleState::default(),
             terminal_capabilities: Default::default(),
             workspace_label: None,
             model_label: None,
@@ -408,25 +345,20 @@ impl UiState {
         let Some(session) = self.selected.filter(|id| self.session_row(*id).is_some()) else {
             return false;
         };
-        let target = session;
-        if self.title_edit.as_ref().map(|edit| edit.target) != Some(target) {
+        if self.titles.edit_target() != Some(session) {
             let title = self
                 .session_title(session)
                 .expect("selected Session has a navigation row")
                 .to_owned();
-            self.title_edit = Some(TitleEdit::new(target, title));
+            self.titles.begin_edit(session, title);
         }
         true
     }
 
     pub(crate) fn title_text(&self) -> Option<&str> {
         let selected = self.selected?;
-        if let Some(edit) = self
-            .title_edit
-            .as_ref()
-            .filter(|edit| edit.target == selected)
-        {
-            Some(edit.editor.text())
+        if let Some(editor) = self.titles.editor(selected) {
+            Some(editor.text())
         } else {
             self.session_title(selected)
         }
@@ -441,28 +373,22 @@ impl UiState {
     }
 
     pub(crate) fn session_title(&self, id: SessionId) -> Option<&str> {
-        self.title_renames
-            .get(&id)
-            .and_then(TitleRenameQueue::desired)
+        self.titles
+            .desired(id)
             .or_else(|| self.session_row(id).map(|row| row.info().title.as_str()))
     }
 
-    pub(crate) fn title_editor_mut(&mut self) -> &mut crate::editor::EditorBuffer {
-        &mut self
-            .title_edit
-            .as_mut()
-            .expect("title editor is prepared before title input")
-            .editor
+    pub(crate) fn title_editor(&self) -> Option<&crate::editor::EditorBuffer> {
+        self.selected
+            .and_then(|session| self.titles.editor(session))
     }
 
     pub(crate) fn clear_title_edit(&mut self) {
-        self.title_edit = None;
+        self.titles.clear_edit();
     }
 
     pub(crate) fn title_rename_pending(&self, session: SessionId) -> bool {
-        self.title_renames
-            .get(&session)
-            .is_some_and(TitleRenameQueue::pending)
+        self.titles.manual_pending(session)
     }
 
     pub(crate) fn running_model(&self) -> Option<&bone_app::ResolvedModel> {

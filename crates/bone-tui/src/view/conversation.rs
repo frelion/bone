@@ -209,35 +209,30 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) -> usize {
     let focused = focus::workspace_focused(state, Focus::SessionTitle) && state.selected.is_some();
     let fallback = state.title_text().unwrap_or("New conversation");
     let (title, cursor, selection_cells, byte_origin) = if focused {
-        state
-            .title_edit
-            .as_ref()
-            .filter(|edit| state.selected_ui().is_some_and(|ui| edit.target == ui.id))
-            .map_or_else(
-                || (single_line_external(fallback), 0, Vec::new(), 0),
-                |edit| {
-                    let viewport = crate::editor::single_line_editor_viewport(
-                        edit.editor.text(),
-                        edit.editor.cursor(),
-                        area.width,
-                    );
-                    let selection_cells =
-                        edit.editor.selection().map_or_else(Vec::new, |selection| {
-                            crate::editor::single_line_selection_cells(
-                                edit.editor.text(),
-                                viewport.byte_origin,
-                                area.width,
-                                selection,
-                            )
-                        });
-                    (
-                        viewport.text,
-                        viewport.cursor_x,
-                        selection_cells,
+        state.title_editor().map_or_else(
+            || (single_line_external(fallback), 0, Vec::new(), 0),
+            |editor| {
+                let viewport = crate::editor::single_line_editor_viewport(
+                    editor.text(),
+                    editor.cursor(),
+                    area.width,
+                );
+                let selection_cells = editor.selection().map_or_else(Vec::new, |selection| {
+                    crate::editor::single_line_selection_cells(
+                        editor.text(),
                         viewport.byte_origin,
+                        area.width,
+                        selection,
                     )
-                },
-            )
+                });
+                (
+                    viewport.text,
+                    viewport.cursor_x,
+                    selection_cells,
+                    viewport.byte_origin,
+                )
+            },
+        )
     } else {
         (single_line_external(fallback), 0, Vec::new(), 0)
     };
@@ -611,17 +606,26 @@ mod tests {
         state.focus = crate::state::Focus::SessionTitle;
         state.caret_visible = true;
         assert!(state.begin_title_edit());
-        {
-            let editor = state.title_editor_mut();
-            editor.apply(crate::editor::EditCommand::Point {
-                byte: selected_from,
-                extend: false,
-            });
-            editor.apply(crate::editor::EditCommand::Point {
-                byte: title.len(),
-                extend: true,
-            });
-        }
+        crate::state::update(
+            &mut state,
+            crate::state::UiEvent::Action(crate::state::Action::Edit {
+                target: crate::state::EditorTarget::SessionTitle,
+                command: crate::editor::EditCommand::Point {
+                    byte: selected_from,
+                    extend: false,
+                },
+            }),
+        );
+        crate::state::update(
+            &mut state,
+            crate::state::UiEvent::Action(crate::state::Action::Edit {
+                target: crate::state::EditorTarget::SessionTitle,
+                command: crate::editor::EditCommand::Point {
+                    byte: title.len(),
+                    extend: true,
+                },
+            }),
+        );
 
         let header = Rect::new(2, 1, 8, 1);
         let mut terminal = Terminal::new(TestBackend::new(12, 3)).unwrap();
