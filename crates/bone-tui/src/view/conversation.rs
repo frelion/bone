@@ -274,8 +274,8 @@ fn paint_rule(frame: &mut Frame<'_>, area: Rect, tone: ratatui::style::Color) {
 }
 
 fn reader_selects(state: &UiState, source: crate::state::reader::ReaderSource) -> bool {
-    matches!(&state.panel, Some(crate::state::Panel::Reader(content))
-        if Some(content.session) == state.selected && content.source == source)
+    matches!(&state.panel, Some(crate::state::Panel::Reader(reader))
+        if Some(reader.content.session) == state.selected && reader.content.source == source)
 }
 
 fn render_transcript(

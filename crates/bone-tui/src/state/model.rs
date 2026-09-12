@@ -11,6 +11,8 @@ use bone_app::{
 
 use crate::layout::{SinglePane, TranscriptMetrics};
 
+use super::panel::{ModelOperation, Panel};
+
 pub const HISTORY_CACHE_ITEMS: usize = 512;
 // Reserve the other half of the 32 MiB cache budget for editor history and reader layout.
 pub const HISTORY_CACHE_BYTES: usize = 16 * 1024 * 1024;
@@ -22,34 +24,6 @@ pub enum Focus {
     #[default]
     Composer,
     RightRail,
-}
-
-/// The focus to restore when leaving the session rail for the center column.
-///
-/// Keeping this separate from [`Focus`] makes the invariant explicit: the
-/// remembered destination can never point back to the session rail.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum CenterFocus {
-    SessionTitle,
-    #[default]
-    Composer,
-}
-
-impl CenterFocus {
-    pub(crate) const fn focus(self) -> Focus {
-        match self {
-            Self::SessionTitle => Focus::SessionTitle,
-            Self::Composer => Focus::Composer,
-        }
-    }
-
-    const fn from_focus(focus: Focus) -> Option<Self> {
-        match focus {
-            Focus::Sessions | Focus::RightRail => None,
-            Focus::SessionTitle => Some(Self::SessionTitle),
-            Focus::Composer => Some(Self::Composer),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -351,40 +325,17 @@ pub enum DraftSource {
     },
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum Panel {
-    Objects {
-        session: SessionId,
-        choices: Vec<(super::reader::ReaderSource, String)>,
-    },
-    Login,
-    Models,
-    ModelSetup,
-    ModelAdd,
-    Help,
-    Reader(super::reader::ReaderContent),
-}
-
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct UiState {
     pub(crate) pane_widths: crate::layout::PaneWidths,
     pub(crate) dragging_divider: Option<crate::layout::PaneDivider>,
     pub(crate) panel: Option<Panel>,
-    pub(crate) login_request: Option<u64>,
     pub(crate) model_label_request: u64,
-    pub(crate) login_state: bone_app::LoginState,
-    pub(crate) panel_return: Focus,
-    pub(crate) panel_selection: usize,
-    pub(crate) panel_scroll: usize,
-    pub(crate) model_choices: Vec<ModelChoice>,
-    pub(crate) model_profiles: Vec<bone_app::Profile>,
-    pub(crate) connection_form: Option<super::ConnectionForm>,
+    pub(crate) model_operation: Option<ModelOperation>,
     pub(crate) title_edit: Option<TitleEdit>,
     pub(crate) title_renames: BTreeMap<SessionId, TitleRenameQueue>,
     pub(crate) title_manual_intent: BTreeSet<SessionId>,
     pub(crate) title_rename_error: Option<(SessionId, String)>,
-    pub(crate) models_loading: bool,
-    pub(crate) model_request: u64,
     pub(crate) terminal_capabilities: crate::terminal::TerminalCapabilities,
 
     pub workspace_label: Option<String>,
@@ -395,8 +346,8 @@ pub struct UiState {
     pub session_candidate: Option<SessionId>,
     pub session_scroll: Option<usize>,
     pub session_ui: BTreeMap<SessionId, SessionUi>,
-    pub focus: Focus,
-    pub(crate) last_center: CenterFocus,
+    pub(crate) focus: Focus,
+    last_center: Focus,
     pub(crate) caret_visible: bool,
     pub(crate) orphan_draft: crate::editor::EditorBuffer,
     pub pending_create: Option<PendingCreate>,
@@ -415,21 +366,12 @@ impl Default for UiState {
             pane_widths: Default::default(),
             dragging_divider: None,
             panel: None,
-            login_state: bone_app::LoginState::Connecting,
-            login_request: None,
             model_label_request: 0,
-            panel_return: Focus::Composer,
-            panel_selection: 0,
-            panel_scroll: 0,
-            model_choices: Vec::new(),
-            model_profiles: Vec::new(),
-            connection_form: None,
+            model_operation: None,
             title_edit: None,
             title_renames: BTreeMap::new(),
             title_manual_intent: BTreeSet::new(),
             title_rename_error: None,
-            models_loading: false,
-            model_request: 0,
             terminal_capabilities: Default::default(),
             workspace_label: None,
             model_label: None,
@@ -440,7 +382,7 @@ impl Default for UiState {
             session_scroll: None,
             session_ui: BTreeMap::new(),
             focus: Focus::Composer,
-            last_center: CenterFocus::Composer,
+            last_center: Focus::Composer,
             caret_visible: true,
             orphan_draft: Default::default(),
             pending_create: None,
@@ -457,25 +399,29 @@ impl Default for UiState {
 
 impl UiState {
     /// Sets workspace focus while remembering the latest center-column target.
-    ///
-    /// When moving into the session rail, capture the current public `focus`
-    /// field first. This keeps round trips correct even if an embedding caller
-    /// assigned that compatibility field directly.
     pub(crate) fn set_focus(&mut self, focus: Focus) {
-        let center = CenterFocus::from_focus(focus).or_else(|| CenterFocus::from_focus(self.focus));
         self.focus = focus;
-        if let Some(center) = center {
-            self.last_center = center;
+        if matches!(focus, Focus::SessionTitle | Focus::Composer) {
+            self.last_center = focus;
         }
     }
 
     pub(crate) const fn last_center_focus(&self) -> Focus {
-        self.last_center.focus()
+        self.last_center
+    }
+
+    pub(crate) fn remove_title_focus(&mut self) {
+        if self.focus == Focus::SessionTitle {
+            self.set_focus(Focus::Composer);
+        }
+        if self.last_center == Focus::SessionTitle {
+            self.last_center = Focus::Composer;
+        }
     }
 
     pub(crate) fn blinking_caret_active(&self) -> bool {
-        match self.panel {
-            Some(Panel::ModelSetup) => true,
+        match &self.panel {
+            Some(Panel::Models(models)) if models.setup().is_some_and(|form| !form.saving) => true,
             Some(_) => false,
             None => {
                 matches!(self.focus, Focus::SessionTitle | Focus::Composer)
@@ -545,10 +491,6 @@ impl UiState {
         self.title_renames
             .get(&session)
             .is_some_and(TitleRenameQueue::pending)
-    }
-
-    pub(crate) fn model_row_count(&self) -> usize {
-        self.model_choices.len() + self.model_profiles.len() + 1
     }
 
     pub(crate) fn running_model(&self) -> Option<&bone_app::ResolvedModel> {
@@ -804,41 +746,5 @@ mod model_fact_tests {
         state.selected = Some(info.id);
         state.session_ui.insert(info.id, ui);
         assert_eq!(state.model_footer(), "same-name · saved");
-    }
-}
-
-#[cfg(test)]
-mod model_apply_failure_tests {
-    use super::*;
-    #[test]
-    fn saved_config_after_failed_apply_does_not_replace_running_footer() {
-        let running = bone_app::ResolvedModel {
-            selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), "old-running")
-                .unwrap(),
-            profile: bone_app::Profile::chatgpt(),
-        };
-        let mut saved = running.clone();
-        saved.selection.model = "new-saved".into();
-        let mut state = UiState::default();
-        crate::state::update(
-            &mut state,
-            crate::state::UiEvent::ModelApplied {
-                session: None,
-                request: 0,
-                label: Some("new-saved".into()),
-                facts: Some(ModelFacts {
-                    saved: Ok(saved),
-                    running: Some(running),
-                }),
-                error: Some("request failed".into()),
-            },
-        );
-        assert_eq!(state.model_footer(), "old-running · saved change");
-        assert!(
-            state
-                .model_configuration_summary()
-                .contains("Saved, not running: chatgpt/new-saved")
-        );
-        assert_eq!(state.status.as_deref(), Some("request failed"));
     }
 }

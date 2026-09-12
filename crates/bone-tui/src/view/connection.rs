@@ -2,7 +2,7 @@
 use super::single_line_external;
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan},
-    state::{Action, ConnectionKind, Panel, SetupField, UiState},
+    state::{Action, ConnectionKind, ModelPanel, ModelScreen, SetupField, UiState},
     ui::{
         caret,
         interaction::HitMap,
@@ -18,18 +18,29 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap, state: &UiState) {
+pub(super) fn render(
+    frame: &mut Frame<'_>,
+    plan: &LayoutPlan,
+    hits: &mut HitMap,
+    state: &UiState,
+    models: &ModelPanel,
+) {
     let surface = plan.composer.unwrap_or(plan.screen);
     let spacious = crate::layout::comfortable(plan.screen);
     let stride: u16 = if spacious { 2 } else { 1 };
     let inset = u16::from(spacious);
-    let height = state
-        .connection_form
-        .as_ref()
-        .map_or(if spacious { 13 } else { 8 }, |form| {
-            form.fields().len() as u16 * stride + 6 + inset * 3
-        })
-        .min(plan.screen.height.saturating_sub(2));
+    let height = match &models.screen {
+        ModelScreen::Setup(form) => form.fields().len() as u16 * stride + 6 + inset * 3,
+        ModelScreen::Add { .. } => {
+            if spacious {
+                13
+            } else {
+                8
+            }
+        }
+        ModelScreen::List { .. } | ModelScreen::Login { .. } => return,
+    }
+    .min(plan.screen.height.saturating_sub(2));
     let area = Rect::new(
         surface.x,
         surface.y.saturating_sub(height + 1).max(plan.screen.y + 1),
@@ -40,13 +51,10 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
     frame.render_widget(Block::default().style(theme::surface(INPUT)), area);
     let x = area.x + 2;
     let width = area.width.saturating_sub(4);
-    let title = if matches!(state.panel, Some(Panel::ModelAdd)) {
-        "Models / Add connection"
-    } else {
-        state
-            .connection_form
-            .as_ref()
-            .map_or("Models / Connection", |form| form.kind.label())
+    let title = match &models.screen {
+        ModelScreen::Add { .. } => "Models / Add connection",
+        ModelScreen::Setup(form) => form.kind.label(),
+        ModelScreen::List { .. } | ModelScreen::Login { .. } => return,
     };
     let title_band = Rect::new(area.x, area.y + inset, area.width, 1);
     let title_background = SELECTED;
@@ -67,7 +75,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
         area: back,
         target: HitTarget::Action(Action::Escape),
     });
-    if matches!(state.panel, Some(Panel::ModelAdd)) {
+    if let ModelScreen::Add { selected } = &models.screen {
         for (index, kind) in ConnectionKind::ALL.iter().enumerate() {
             let row = Rect::new(
                 x,
@@ -76,8 +84,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
                 stride,
             );
             frame.render_widget(
-                Paragraph::new(kind.label())
-                    .style(super::panels::menu_style(state.panel_selection == index)),
+                Paragraph::new(kind.label()).style(super::panels::menu_style(*selected == index)),
                 row,
             );
             hits.push(HitRegion {
@@ -87,7 +94,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
         }
         return;
     }
-    let Some(form) = &state.connection_form else {
+    let ModelScreen::Setup(form) = &models.screen else {
         return;
     };
     let hint = state
@@ -211,8 +218,14 @@ fn input_query(value: &str, width: u16, placeholder: &str) -> (String, u16) {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
-    use crate::state::{ConnectionForm, SecretText};
+    use crate::state::{ConnectionForm, ModelPanel, ModelScreen, Panel, SecretText};
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn connection_panel(screen: ModelScreen) -> Panel {
+        let mut models = ModelPanel::new(None);
+        models.screen = screen;
+        Panel::Models(models)
+    }
 
     #[test]
     fn connection_form_masks_key_and_keeps_all_fields_and_actions_inside_small_screens() {
@@ -222,8 +235,7 @@ mod tests {
             form.base_url = "https://example.invalid/long/address/for/viewport/checking".into();
             form.field = SetupField::Key;
             let mut state = UiState::default();
-            state.panel = Some(Panel::ModelSetup);
-            state.connection_form = Some(form);
+            state.panel = Some(connection_panel(ModelScreen::Setup(form)));
             state.orphan_draft = "untouched chat draft".into();
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut layout = None;
@@ -295,8 +307,7 @@ mod tests {
         );
         form.key_was_sent = true;
         let mut state = UiState::default();
-        state.panel = Some(Panel::ModelSetup);
-        state.connection_form = Some(form);
+        state.panel = Some(connection_panel(ModelScreen::Setup(form)));
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal
             .draw(|frame| {
@@ -317,7 +328,7 @@ mod tests {
     #[test]
     fn all_connection_types_are_visible_and_clickable_at_minimum_size() {
         let mut state = UiState::default();
-        state.panel = Some(Panel::ModelAdd);
+        state.panel = Some(connection_panel(ModelScreen::Add { selected: 0 }));
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal
             .draw(|frame| {

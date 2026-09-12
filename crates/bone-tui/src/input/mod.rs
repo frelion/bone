@@ -45,7 +45,13 @@ pub(crate) fn terminal_event(
         Event::FocusLost if state.dragging_divider.is_some() => Some(Action::EndPaneResize),
         Event::Mouse(mouse) => pointer::action(mouse, snapshot, state),
         Event::Resize(width, height) => return Some(UiEvent::Resized { width, height }),
-        Event::Paste(text) if matches!(state.panel, Some(crate::state::Panel::ModelSetup)) => {
+        Event::Paste(text)
+            if matches!(
+                &state.panel,
+                Some(crate::state::Panel::Models(models))
+                    if matches!(models.screen, crate::state::ModelScreen::Setup(_))
+            ) =>
+        {
             Some(Action::SetupText(text.into()))
         }
         Event::Paste(_) if state.panel.is_some() => None,
@@ -119,6 +125,25 @@ fn frame_for_layout(layout: LayoutPlan) -> FrameSnapshot {
         });
     }
     FrameSnapshot::new(layout, hits, None, 0, Some(0), Some(0))
+}
+
+#[cfg(test)]
+fn model_panel(screen: crate::state::ModelScreen) -> crate::state::Panel {
+    let mut models = crate::state::ModelPanel::new(None);
+    models.screen = screen;
+    crate::state::Panel::Models(models)
+}
+
+#[cfg(test)]
+fn model_list_panel() -> crate::state::Panel {
+    model_panel(crate::state::ModelScreen::List { selected: 0 })
+}
+
+#[cfg(test)]
+fn model_setup_panel() -> crate::state::Panel {
+    model_panel(crate::state::ModelScreen::Setup(
+        crate::state::ConnectionForm::new(crate::state::ConnectionKind::OpenAiResponses),
+    ))
 }
 
 #[cfg(test)]
@@ -441,7 +466,7 @@ mod model_keyboard_tests {
     #[test]
     fn command_chords_do_not_become_model_text() {
         let mut state = UiState::default();
-        state.panel = Some(crate::state::Panel::Models);
+        state.panel = Some(model_list_panel());
         for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
             assert!(
                 test_key_action(KeyEvent::new(KeyCode::Char('a'), modifiers), &state).is_none()
@@ -465,7 +490,7 @@ mod model_keyboard_tests {
     #[test]
     fn connection_form_keys_and_paste_use_secret_safe_actions() {
         let mut state = UiState::default();
-        state.panel = Some(crate::state::Panel::ModelSetup);
+        state.panel = Some(model_setup_panel());
         let event = mapped_terminal_event(Event::Paste("private-key-test".into()), None, &state);
         assert!(!format!("{event:?}").contains("private-key-test"));
         assert!(
@@ -1154,7 +1179,7 @@ mod input_chord_tests {
             assert!(test_key_action(clear, &state).is_none());
         }
         state.focus = Focus::Composer;
-        for panel in [Panel::Models, Panel::Help, Panel::ModelSetup] {
+        for panel in [model_list_panel(), Panel::Help, model_setup_panel()] {
             state.panel = Some(panel);
             assert!(test_key_action(clear, &state).is_none());
             assert!(matches!(
@@ -1226,7 +1251,7 @@ mod input_chord_tests {
             );
         }
         state.focus = Focus::Composer;
-        for panel in [Panel::Models, Panel::Help, Panel::ModelSetup] {
+        for panel in [model_list_panel(), Panel::Help, model_setup_panel()] {
             state.panel = Some(panel);
             for modifiers in [
                 KeyModifiers::SHIFT,
@@ -1273,7 +1298,7 @@ mod input_chord_tests {
                 .is_none()
             );
         }
-        for panel in [Panel::Models, Panel::Help, Panel::ModelSetup] {
+        for panel in [model_list_panel(), Panel::Help, model_setup_panel()] {
             state.panel = Some(panel);
             assert!(matches!(
                 mapped_key_action(

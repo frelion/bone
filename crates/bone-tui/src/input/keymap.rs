@@ -2,7 +2,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::state::{Action, CursorMove, EditCommand, EditorTarget, Focus, Panel, UiState};
+use crate::state::{
+    Action, CursorMove, EditCommand, EditorTarget, Focus, ModelScreen, Panel, UiState,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct KeyGeometry {
@@ -211,7 +213,10 @@ fn exact(key: &KeyEvent, code: KeyCode, modifiers: KeyModifiers) -> bool {
 }
 
 fn panel_action(key: KeyEvent, panel: &Panel, geometry: KeyGeometry) -> Option<Action> {
-    if matches!(panel, Panel::ModelSetup) {
+    if matches!(
+        panel,
+        Panel::Models(models) if matches!(models.screen, ModelScreen::Setup(_))
+    ) {
         if exact(&key, KeyCode::Char('u'), KeyModifiers::CONTROL) {
             return Some(Action::SetupClear);
         }
@@ -286,13 +291,24 @@ mod tests {
     }
 
     fn reader_panel() -> Panel {
-        Panel::Reader(crate::state::reader::ReaderContent {
-            session: bone_app::SessionId::new(),
-            source: crate::state::reader::ReaderSource::History(bone_app::SessionSeq(1)),
-            title: "reader".into(),
-            text: "content".into(),
-            layout_cache: std::cell::RefCell::new(None),
+        Panel::Reader(crate::state::ReaderPanel {
+            content: crate::state::reader::ReaderContent {
+                session: bone_app::SessionId::new(),
+                source: crate::state::reader::ReaderSource::History(bone_app::SessionSeq(1)),
+                title: "reader".into(),
+                text: "content".into(),
+                layout_cache: std::cell::RefCell::new(None),
+            },
+            scroll: 0,
         })
+    }
+
+    fn setup_panel() -> Panel {
+        let mut models = crate::state::ModelPanel::new(None);
+        models.screen = ModelScreen::Setup(crate::state::ConnectionForm::new(
+            crate::state::ConnectionKind::OpenAiResponses,
+        ));
+        Panel::Models(models)
     }
 
     #[test]
@@ -316,7 +332,7 @@ mod tests {
     #[test]
     fn model_setup_rejects_control_modified_navigation() {
         let mut state = UiState::default();
-        state.panel = Some(Panel::ModelSetup);
+        state.panel = Some(setup_panel());
 
         assert!(matches!(
             action_for_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL), &state),

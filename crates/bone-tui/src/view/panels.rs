@@ -1,7 +1,7 @@
 use super::single_line_external;
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan, floating_menu_stride, floating_panel_area},
-    state::{Action, Panel, UiState},
+    state::{Action, ModelPanel, ModelScreen, Panel, UiState},
     ui::{
         interaction::HitMap,
         theme::{self, INK, INPUT, MUTED},
@@ -86,7 +86,7 @@ pub(super) fn render(
         return;
     };
     hits.clear();
-    if let Panel::Reader(content) = panel {
+    if let Panel::Reader(reader) = panel {
         let area = plan
             .extension_blank
             .or(plan.conversation)
@@ -94,9 +94,9 @@ pub(super) fn render(
         let metrics = super::reader::render(
             frame,
             area,
-            content,
+            &reader.content,
             state.selected_ui().and_then(|ui| ui.snapshot.as_deref()),
-            state.panel_scroll,
+            reader.scroll,
         );
         *reader_max_scroll = metrics.max_scroll;
         hits.push(HitRegion {
@@ -109,42 +109,49 @@ pub(super) fn render(
         });
         return;
     }
-    if matches!(panel, Panel::ModelAdd | Panel::ModelSetup) {
-        super::connection::render(frame, plan, hits, state);
+    if let Panel::Models(models) = panel
+        && matches!(
+            models.screen,
+            ModelScreen::Add { .. } | ModelScreen::Setup(_)
+        )
+    {
+        super::connection::render(frame, plan, hits, state, models);
         return;
     }
+
     let surface = plan.composer.unwrap_or(plan.screen);
     let spacious = crate::layout::comfortable(plan.screen);
     let stride = floating_menu_stride(plan.screen);
-    let height = match panel {
-        Panel::Help => 16,
-        Panel::Login => 10,
-        Panel::Objects { choices, .. } => choices.len().clamp(1, 12) as u16 * stride + 3,
-        Panel::Models => (state.model_row_count() * usize::from(stride)
-            + state.model_configuration_summary().lines().count()
-            + 4
-            + if state.status.is_some() { 2 } else { 0 })
-        .clamp(5, if spacious { 22 } else { 14 }) as u16,
-        Panel::Reader(_) | Panel::ModelAdd | Panel::ModelSetup => unreachable!(),
+    let (height, title) = match panel {
+        Panel::Help => (16, "Keyboard help"),
+        Panel::Objects(objects) => (
+            objects.choices.len().clamp(1, 12) as u16 * stride + 3,
+            "Tasks & tools · enter open",
+        ),
+        Panel::Models(models) => match &models.screen {
+            ModelScreen::List { .. } => (
+                (models.row_count() * usize::from(stride)
+                    + state.model_configuration_summary().lines().count()
+                    + 4
+                    + if state.status.is_some() { 2 } else { 0 })
+                .clamp(5, if spacious { 22 } else { 14 }) as u16,
+                "Models & connections",
+            ),
+            ModelScreen::Login { .. } => (10, "Models / Account authorization"),
+            ModelScreen::Add { .. } | ModelScreen::Setup(_) => return,
+        },
+        Panel::Reader(_) => return,
     };
     let area = floating_panel_area(plan.screen, surface, height);
-    let title = match panel {
-        Panel::Models => "Models & connections",
-        Panel::Objects { .. } => "Tasks & tools · enter open",
-        Panel::Login => "Models / Account authorization",
-        Panel::Help => "Keyboard help",
-        Panel::Reader(_) | Panel::ModelAdd | Panel::ModelSetup => unreachable!(),
-    };
     let shell = render_shell(frame, plan.screen, area, title);
     let mut inner = shell.inner;
-    let back = shell.back;
     hits.push(HitRegion {
-        area: back,
+        area: shell.back,
         target: HitTarget::Action(Action::Escape),
     });
+
     match panel {
-        Panel::Objects { choices, .. } => {
-            let mut inner = inner;
+        Panel::Objects(objects) => {
             if let Some(error) = &state.status {
                 frame.render_widget(
                     Paragraph::new(single_line_external(error))
@@ -154,17 +161,18 @@ pub(super) fn render(
                 inner.y = inner.y.saturating_add(1);
                 inner.height = inner.height.saturating_sub(1);
             }
-            if choices.is_empty() {
+            if objects.choices.is_empty() {
                 frame.render_widget(
                     Paragraph::new("No loaded tasks or tool results")
                         .style(Style::default().fg(MUTED)),
                     inner,
                 );
             } else {
-                let start = state
-                    .panel_selection
+                let start = objects
+                    .selected
                     .saturating_sub(usize::from(inner.height / stride).saturating_sub(1));
-                for (index, (_, label)) in choices
+                for (index, (_, label)) in objects
+                    .choices
                     .iter()
                     .enumerate()
                     .skip(start)
@@ -178,7 +186,7 @@ pub(super) fn render(
                     );
                     frame.render_widget(
                         Paragraph::new(single_line_external(label))
-                            .style(menu_style(index == state.panel_selection)),
+                            .style(menu_style(index == objects.selected)),
                         row,
                     );
                     hits.push(HitRegion {
@@ -188,109 +196,118 @@ pub(super) fn render(
                 }
             }
         }
-        Panel::Models => {
-            if let Some(status) = &state.status {
-                let height = 2.min(inner.height.saturating_sub(1));
+        Panel::Models(models) => match &models.screen {
+            ModelScreen::List { selected } => {
+                if let Some(status) = &state.status {
+                    let height = 2.min(inner.height.saturating_sub(1));
+                    frame.render_widget(
+                        Paragraph::new(single_line_external(status))
+                            .wrap(Wrap { trim: false })
+                            .style(Style::default().fg(theme::DANGER)),
+                        Rect::new(inner.x, inner.y, inner.width, height),
+                    );
+                    inner.y += height;
+                    inner.height -= height;
+                }
+                let summary = state.model_configuration_summary();
+                let rows = (summary.lines().count() as u16).min(inner.height.saturating_sub(1));
+                if rows > 0 {
+                    frame.render_widget(
+                        Paragraph::new(super::sanitize_external(&summary))
+                            .style(Style::default().fg(MUTED)),
+                        Rect::new(inner.x, inner.y, inner.width, rows),
+                    );
+                }
+                let inner = Rect::new(
+                    inner.x,
+                    inner.y + rows,
+                    inner.width,
+                    inner.height.saturating_sub(rows),
+                );
+                if models.busy(state.model_operation) {
+                    frame.render_widget(
+                        Paragraph::new("Loading configuration…").style(Style::default().fg(MUTED)),
+                        inner,
+                    );
+                } else {
+                    let menu = model_menu_rows(models);
+                    let visual_selected = menu
+                        .iter()
+                        .position(
+                            |row| matches!(row, ModelMenuRow::Choice(index) if index == selected),
+                        )
+                        .unwrap_or(0);
+                    let start = visual_selected
+                        .saturating_sub(usize::from(inner.height / stride).saturating_sub(1));
+                    for (visual_index, item) in menu
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .take(usize::from(inner.height / stride))
+                    {
+                        let row = Rect::new(
+                            inner.x,
+                            inner.y + (visual_index - start) as u16 * stride,
+                            inner.width,
+                            stride,
+                        );
+                        let index = match item {
+                            ModelMenuRow::Heading(label) => {
+                                frame.render_widget(
+                                    Paragraph::new(*label).style(Style::default().fg(MUTED)),
+                                    row,
+                                );
+                                continue;
+                            }
+                            ModelMenuRow::Choice(index) => *index,
+                        };
+                        let label = if let Some(choice) = models.choices.get(index) {
+                            model_choice_label(choice)
+                        } else if let Some(profile) =
+                            models.profiles.get(index - models.choices.len())
+                        {
+                            format!("Edit connection · {}", profile.label)
+                        } else {
+                            "+ Add model / connection".to_owned()
+                        };
+                        frame.render_widget(
+                            Paragraph::new(single_line_external(&label))
+                                .style(menu_style(index == *selected)),
+                            row,
+                        );
+                        hits.push(HitRegion {
+                            area: row,
+                            target: HitTarget::Action(Action::SelectModel(index)),
+                        });
+                    }
+                }
+            }
+            ModelScreen::Login { state: login, .. } => {
+                let text = match login {
+                    bone_app::LoginState::Connecting => "Connecting…".to_owned(),
+                    bone_app::LoginState::DeviceCode {
+                        verification_uri,
+                        user_code,
+                    } => format!(
+                        "Open in your browser:\n{verification_uri}\n\nCode: {user_code}\nWaiting for sign-in…"
+                    ),
+                    bone_app::LoginState::Succeeded => {
+                        "Connected. Choose a model with /model, then retry saved input.".to_owned()
+                    }
+                    bone_app::LoginState::Failed { message } => {
+                        format!("Sign-in failed: {message}")
+                    }
+                    bone_app::LoginState::Cancelled => "Sign-in cancelled".to_owned(),
+                };
                 frame.render_widget(
-                    Paragraph::new(single_line_external(status))
+                    Paragraph::new(super::sanitize_external(&text))
                         .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(theme::DANGER)),
-                    Rect::new(inner.x, inner.y, inner.width, height),
-                );
-                inner.y += height;
-                inner.height -= height;
-            }
-            let summary = state.model_configuration_summary();
-            let rows = (summary.lines().count() as u16).min(inner.height.saturating_sub(1));
-            if rows > 0 {
-                frame.render_widget(
-                    Paragraph::new(super::sanitize_external(&summary))
-                        .style(Style::default().fg(MUTED)),
-                    Rect::new(inner.x, inner.y, inner.width, rows),
-                );
-            }
-            let inner = Rect::new(
-                inner.x,
-                inner.y + rows,
-                inner.width,
-                inner.height.saturating_sub(rows),
-            );
-            if state.models_loading {
-                frame.render_widget(
-                    Paragraph::new("Loading configuration…").style(Style::default().fg(MUTED)),
+                        .style(Style::default().fg(INK)),
                     inner,
                 );
-            } else {
-                let menu = model_menu_rows(state);
-                let selected = menu.iter().position(|row| matches!(row, ModelMenuRow::Choice(index) if *index == state.panel_selection)).unwrap_or(0);
-                let start =
-                    selected.saturating_sub(usize::from(inner.height / stride).saturating_sub(1));
-                for (visual_index, item) in menu
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .take(usize::from(inner.height / stride))
-                {
-                    let row = Rect::new(
-                        inner.x,
-                        inner.y + (visual_index - start) as u16 * stride,
-                        inner.width,
-                        stride,
-                    );
-                    let index = match item {
-                        ModelMenuRow::Heading(label) => {
-                            frame.render_widget(
-                                Paragraph::new(*label).style(Style::default().fg(MUTED)),
-                                row,
-                            );
-                            continue;
-                        }
-                        ModelMenuRow::Choice(index) => *index,
-                    };
-                    let label = if let Some(choice) = state.model_choices.get(index) {
-                        model_choice_label(choice)
-                    } else if let Some(profile) =
-                        state.model_profiles.get(index - state.model_choices.len())
-                    {
-                        format!("Edit connection · {}", profile.label)
-                    } else {
-                        "+ Add model / connection".to_owned()
-                    };
-                    frame.render_widget(
-                        Paragraph::new(single_line_external(&label))
-                            .style(menu_style(index == state.panel_selection)),
-                        row,
-                    );
-                    hits.push(HitRegion {
-                        area: row,
-                        target: HitTarget::Action(Action::SelectModel(index)),
-                    });
-                }
             }
-        }
-
-        Panel::Login => {
-            let text = match &state.login_state {
-                bone_app::LoginState::Connecting => "Connecting…".to_owned(),
-                bone_app::LoginState::DeviceCode {
-                    verification_uri,
-                    user_code,
-                } => format!(
-                    "Open in your browser:\n{verification_uri}\n\nCode: {user_code}\nWaiting for sign-in…"
-                ),
-                bone_app::LoginState::Succeeded => {
-                    "Connected. Choose a model with /model, then retry saved input.".to_owned()
-                }
-                bone_app::LoginState::Failed { message } => format!("Sign-in failed: {message}"),
-                bone_app::LoginState::Cancelled => "Sign-in cancelled".to_owned(),
-            };
-            frame.render_widget(
-                Paragraph::new(super::sanitize_external(&text))
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(INK)),
-                inner,
-            );
-        }
+            ModelScreen::Add { .. } | ModelScreen::Setup(_) => {}
+        },
         Panel::Help => {
             let shift_enter = if state.terminal_capabilities.shift_enter_supported() {
                 "Shift+Enter   New line in input".to_owned()
@@ -321,14 +338,28 @@ pub(super) fn render(
                 inner,
             );
         }
-        Panel::Reader(_) | Panel::ModelAdd | Panel::ModelSetup => unreachable!(),
+        Panel::Reader(_) => {}
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{ModelScreen, ObjectPanel};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Modifier};
+
+    fn models(screen: ModelScreen) -> Panel {
+        let mut models = ModelPanel::new(None);
+        models.screen = screen;
+        Panel::Models(models)
+    }
+
+    fn objects(choices: Vec<(crate::state::reader::ReaderSource, String)>) -> Panel {
+        Panel::Objects(ObjectPanel {
+            session: bone_app::SessionId::new(),
+            choices,
+            selected: 0,
+        })
+    }
 
     fn find_text(buffer: &Buffer, needle: &str) -> Option<(u16, u16)> {
         for y in buffer.area.y..buffer.area.bottom() {
@@ -346,20 +377,17 @@ mod tests {
     fn editable_panels_keep_cursor_and_actions_inside_small_screens() {
         for (width, height) in [(40, 12), (80, 24), (140, 24), (160, 40)] {
             for panel in [
-                Panel::Models,
+                models(ModelScreen::List { selected: 0 }),
                 Panel::Help,
-                Panel::Login,
-                Panel::Objects {
-                    session: bone_app::SessionId::new(),
-                    choices: vec![],
-                },
-                Panel::Objects {
-                    session: bone_app::SessionId::new(),
-                    choices: vec![(
-                        crate::state::reader::ReaderSource::History(bone_app::SessionSeq(7)),
-                        "Tool result 7".into(),
-                    )],
-                },
+                models(ModelScreen::Login {
+                    request: 1,
+                    state: bone_app::LoginState::Connecting,
+                }),
+                objects(vec![]),
+                objects(vec![(
+                    crate::state::reader::ReaderSource::History(bone_app::SessionSeq(7)),
+                    "Tool result 7".into(),
+                )]),
             ] {
                 let mut state = UiState::default();
                 state.panel = Some(panel);
@@ -521,17 +549,17 @@ enum ModelMenuRow {
     Heading(&'static str),
     Choice(usize),
 }
-fn model_menu_rows(state: &UiState) -> Vec<ModelMenuRow> {
-    let mut rows = Vec::with_capacity(state.model_row_count() + 2);
-    if !state.model_choices.is_empty() {
+fn model_menu_rows(models: &ModelPanel) -> Vec<ModelMenuRow> {
+    let mut rows = Vec::with_capacity(models.row_count() + 2);
+    if !models.choices.is_empty() {
         rows.push(ModelMenuRow::Heading("Available models"));
-        rows.extend((0..state.model_choices.len()).map(ModelMenuRow::Choice));
+        rows.extend((0..models.choices.len()).map(ModelMenuRow::Choice));
     }
     if !rows.is_empty() {
         rows.push(ModelMenuRow::Heading(""));
     }
     rows.push(ModelMenuRow::Heading("Manage connections"));
-    rows.extend((state.model_choices.len()..state.model_row_count()).map(ModelMenuRow::Choice));
+    rows.extend((models.choices.len()..models.row_count()).map(ModelMenuRow::Choice));
     rows
 }
 pub(super) fn menu_style(selected: bool) -> Style {
@@ -551,9 +579,9 @@ mod grouped_menu_tests {
     fn grouping_keeps_every_model_action_reachable_and_headers_inert() {
         for (width, height) in [(40, 12), (80, 24), (160, 40)] {
             let mut state = UiState::default();
-            state.panel = Some(Panel::Models);
+            let mut models = ModelPanel::new(None);
             for index in 0..4 {
-                state.model_choices.push(crate::state::ModelChoice {
+                models.choices.push(crate::state::ModelChoice {
                     selection: bone_app::ModelSelection::new(
                         bone_app::ProfileId::chatgpt(),
                         format!("model-{index}"),
@@ -562,9 +590,14 @@ mod grouped_menu_tests {
                     profile_label: "ChatGPT".into(),
                 });
             }
-            state.model_profiles = vec![bone_app::Profile::chatgpt(); 5];
-            for selected in 0..state.model_row_count() {
-                state.panel_selection = selected;
+            models.profiles = vec![bone_app::Profile::chatgpt(); 5];
+            let row_count = models.row_count();
+            state.panel = Some(Panel::Models(models));
+            for selected in 0..row_count {
+                let Some(Panel::Models(models)) = &mut state.panel else {
+                    unreachable!();
+                };
+                models.screen = ModelScreen::List { selected };
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 let mut plan = None;
                 terminal
@@ -592,9 +625,12 @@ mod grouped_menu_tests {
                     }
                 }
             }
-            state.model_choices.clear();
-            state.model_profiles.clear();
-            state.panel_selection = 0;
+            let Some(Panel::Models(models)) = &mut state.panel else {
+                unreachable!();
+            };
+            models.choices.clear();
+            models.profiles.clear();
+            models.screen = ModelScreen::List { selected: 0 };
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {

@@ -1,11 +1,14 @@
 use bone_app::{RequestId, SessionId, SubmitInput};
-use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
     answer::{self, AnswerDraft, RecoveryCandidate},
     model::*,
+    panel,
     protocol::*,
 };
+
+#[cfg(test)]
+use super::{ModelPanel, ModelScreen, Panel, ReaderPanel};
 
 pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
     if matches!(event, UiEvent::CaretBlink) {
@@ -30,68 +33,12 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             session,
             error,
             notice,
-        } => {
-            if state.selected == session
-                && matches!(state.panel, Some(Panel::ModelSetup))
-                && state
-                    .connection_form
-                    .as_ref()
-                    .is_some_and(|form| form.saving && form.request == request)
-            {
-                if let Some(error) = error {
-                    let form = state.connection_form.as_mut().unwrap();
-                    form.saving = false;
-                    state.status = Some(if form.key_was_sent {
-                        format!("{error} Re-enter the API key before retrying.")
-                    } else {
-                        error
-                    });
-                    // App writes may persist before a later live reload fails.
-                    // Refresh authoritative facts without leaving the failed form.
-                    refresh_model_label(state, &mut effects);
-                } else {
-                    let subscription = state.connection_form.as_ref().unwrap().kind.subscription();
-                    state.connection_form = None;
-                    state.status = None;
-                    if subscription {
-                        state.panel = Some(Panel::Login);
-                        state.login_state = bone_app::LoginState::Connecting;
-                        let request = state.generation();
-                        state.login_request = Some(request);
-                        effects.push(Effect::Login {
-                            profile: bone_app::ProfileId::chatgpt(),
-                            request,
-                        });
-                    } else {
-                        return_to_models(state, &mut effects);
-                    }
-                    state.status = notice;
-                }
-            } else if state.selected == session {
-                // A cancelled form can still finish a durable App write. Reload
-                // facts without reviving its panel, secret, error or authorization.
-                state.model_request = state.generation();
-                effects.push(Effect::LoadModels {
-                    session,
-                    request: state.model_request,
-                });
-                refresh_model_label(state, &mut effects);
-            }
-        }
+        } => panel::connection_saved(state, request, session, error, notice, &mut effects),
 
         UiEvent::LoginChanged {
             request,
             state: login,
-        } => {
-            if state.login_request == Some(request) && matches!(state.panel, Some(Panel::Login)) {
-                let succeeded = matches!(login, bone_app::LoginState::Succeeded);
-                state.login_state = login;
-                if succeeded {
-                    state.login_request = None;
-                    return_to_models(state, &mut effects);
-                }
-            }
-        }
+        } => panel::login_changed(state, request, login, &mut effects),
         UiEvent::ModelLabelLoaded {
             session,
             request,
@@ -107,59 +54,20 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             session,
             request,
             error,
-        } => {
-            if state.selected == session && state.model_request == request {
-                state.models_loading = false;
-                if matches!(state.panel, Some(Panel::Models)) {
-                    state.status = Some(error);
-                }
-            }
-        }
+        } => panel::models_failed(state, session, request, error),
         UiEvent::ModelsLoaded {
             session,
             request,
             choices,
             profiles,
-        } => {
-            if state.selected == session && state.model_request == request {
-                state.model_choices = choices;
-                state.model_profiles = profiles;
-                state.models_loading = false;
-                if matches!(state.panel, Some(Panel::Models)) {
-                    state.panel_selection = state
-                        .panel_selection
-                        .min(state.model_row_count().saturating_sub(1));
-                }
-            }
-        }
+        } => panel::models_loaded(state, session, request, choices, profiles),
         UiEvent::ModelApplied {
             session,
             request,
             label,
             facts,
             error,
-        } => {
-            if state.selected == session && state.model_request == request {
-                state.models_loading = false;
-                state.model_label_request = state.generation();
-                state.model_label = label;
-                state.model_facts = facts;
-                state.status = error;
-                if state.status.is_some() {
-                    effects.push(Effect::LoadModels { session, request });
-                } else if matches!(state.panel, Some(Panel::Models)) {
-                    close_panel(state);
-                }
-            } else if state.selected == session {
-                // The write outlived its panel. Query current App facts instead
-                // of accepting stale facts or changing the newer panel state.
-                state.model_label_request = state.generation();
-                effects.push(Effect::LoadModelLabel {
-                    session,
-                    request: state.model_label_request,
-                });
-            }
-        }
+        } => panel::model_applied(state, session, request, label, facts, error, &mut effects),
         UiEvent::Action(action) => handle_action(state, action, &mut effects),
         UiEvent::WorkspaceOpened {
             label,
@@ -247,9 +155,8 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     .session_ui
                     .get(&session)
                     .is_some_and(|ui| ui.generation == generation)
-                && let Some(Panel::Reader(content)) = &mut state.panel
             {
-                content.refresh_job(&snapshot);
+                panel::refresh_reader(state, &snapshot);
             }
             if state
                 .session_ui
@@ -406,16 +313,9 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             }) {
                 state.selected = None;
                 state.clear_title_edit();
-                if state.focus == Focus::SessionTitle {
-                    state.set_focus(Focus::Composer);
-                }
-                if state.panel_return == Focus::SessionTitle {
-                    state.panel_return = Focus::Composer;
-                }
-                if state.last_center == CenterFocus::SessionTitle {
-                    state.last_center = CenterFocus::Composer;
-                }
-                refresh_model_label(state, &mut effects);
+                panel::dismiss(state, &mut effects);
+                state.remove_title_focus();
+                panel::refresh_model_label(state, &mut effects);
             }
             if state.session_candidate.is_some_and(|id| {
                 !state
@@ -734,9 +634,6 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     state.set_focus(center);
                     state.caret_visible = true;
                 }
-                if state.panel_return == Focus::RightRail {
-                    state.panel_return = center;
-                }
             }
         }
         UiEvent::CaretBlink => unreachable!("caret blink returns before event dispatch"),
@@ -837,110 +734,24 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 });
             }
         }
-        Action::OpenModels => open_models(state, effects),
-        Action::SelectObject(index) => {
-            state.panel_selection = index;
-            open_object(state);
-        }
-        Action::OpenHistory(sequence) => {
-            if let Some(ui) = state.selected_ui()
-                && let Some(entry) = ui.history.iter().find(|entry| entry.sequence == sequence)
-                && let Some(content) = super::reader::ReaderContent::from_history(ui.id, entry)
-            {
-                pin_reading(state);
-                open_panel(state, Panel::Reader(content));
-            }
-        }
-        Action::OpenJob(job) => {
-            if let Some(snapshot) = state.selected_ui().and_then(|ui| ui.snapshot.as_ref())
-                && let Some(content) = super::reader::ReaderContent::from_job(snapshot, job)
-            {
-                pin_reading(state);
-                open_panel(state, Panel::Reader(content));
-            }
-        }
-        Action::PanelPrevious => {
-            state.panel_selection = state.panel_selection.saturating_sub(1);
-        }
-        Action::PanelNext => {
-            let count = match &state.panel {
-                Some(Panel::Objects { choices, .. }) => choices.len(),
-                Some(Panel::ModelAdd) => super::ConnectionKind::ALL.len(),
-                Some(Panel::Models) => state.model_row_count(),
-                _ => 0,
-            };
-            state.panel_selection = (state.panel_selection + 1).min(count.saturating_sub(1));
-        }
-        Action::SelectModel(index) => select_model_row(state, index, effects),
-        Action::SetupText(mut value) => {
-            if matches!(state.panel, Some(Panel::ModelSetup))
-                && let Some(form) = &mut state.connection_form
-                && !form.saving
-            {
-                let text = form.text_mut();
-                for ch in value.take().chars().filter(|ch| !ch.is_control()) {
-                    if text.len() + ch.len_utf8() <= 16 * 1024 {
-                        text.push(ch);
-                    }
-                }
-            }
-        }
-        Action::SetupClear => {
-            if matches!(state.panel, Some(Panel::ModelSetup))
-                && let Some(form) = &mut state.connection_form
-                && !form.saving
-            {
-                form.text_mut().clear();
-            }
-        }
-        Action::SetupBackspace => {
-            if matches!(state.panel, Some(Panel::ModelSetup))
-                && let Some(form) = &mut state.connection_form
-                && !form.saving
-            {
-                let text = form.text_mut();
-                if let Some((byte, _)) = text.grapheme_indices(true).next_back() {
-                    text.truncate(byte);
-                }
-            }
-        }
+        Action::OpenModels => panel::open_models(state, effects),
+        Action::SelectObject(index) => panel::select_object(state, index),
+        Action::OpenHistory(sequence) => panel::open_history(state, sequence),
+        Action::OpenJob(job) => panel::open_job(state, job),
+        Action::PanelPrevious => panel::panel_previous(state),
+        Action::PanelNext => panel::panel_next(state),
+        Action::SelectModel(index) => panel::select_model(state, index, effects),
+        Action::SetupText(value) => panel::setup_text(state, value),
+        Action::SetupClear => panel::setup_clear(state),
+        Action::SetupBackspace => panel::setup_backspace(state),
         Action::NextField | Action::PreviousField => {
-            if matches!(state.panel, Some(Panel::ModelSetup))
-                && let Some(form) = &mut state.connection_form
-                && !form.saving
-            {
-                form.move_field(matches!(action, Action::NextField));
-            }
+            panel::move_setup_field(state, matches!(action, Action::NextField));
         }
-        Action::SelectField(field) => {
-            if matches!(state.panel, Some(Panel::ModelSetup))
-                && let Some(form) = &mut state.connection_form
-                && !form.saving
-                && form.fields().contains(&field)
-            {
-                form.field = field;
-            }
-        }
-        Action::ChooseConnectionKind(index) => choose_connection_kind(state, index),
-        Action::SaveConnection => save_connection(state, effects),
-        Action::ActivatePanel => {
-            if matches!(state.panel, Some(Panel::Models)) {
-                select_model_row(state, state.panel_selection, effects);
-            } else if matches!(state.panel, Some(Panel::ModelAdd)) {
-                choose_connection_kind(state, state.panel_selection);
-            } else if matches!(state.panel, Some(Panel::ModelSetup)) {
-                save_connection(state, effects);
-            } else if matches!(state.panel, Some(Panel::Objects { .. })) {
-                open_object(state);
-            }
-        }
-        Action::ScrollPanel { amount, max } => {
-            state.panel_scroll = state
-                .panel_scroll
-                .min(max)
-                .saturating_add_signed(amount)
-                .min(max);
-        }
+        Action::SelectField(field) => panel::select_setup_field(state, field),
+        Action::ChooseConnectionKind(index) => panel::choose_connection_kind(state, index),
+        Action::SaveConnection => panel::save_connection(state, effects),
+        Action::ActivatePanel => panel::activate(state, effects),
+        Action::ScrollPanel { amount, max } => panel::scroll_reader(state, amount, max),
 
         Action::Focus(focus) => {
             set_action_focus(state, focus, effects);
@@ -983,10 +794,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 select_session(state, session, effects);
             }
         }
-        Action::SelectSession(session) => {
-            state.panel = None;
-            select_session(state, session, effects);
-        }
+        Action::SelectSession(session) => select_session(state, session, effects),
         Action::SelectSlashPrevious => move_slash(state, -1),
         Action::SelectSlashNext => move_slash(state, 1),
         Action::CompleteSlash => complete_slash(state),
@@ -1029,22 +837,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::RetryInput(input) => recover_input(state, input, true, effects),
         Action::RetrySubmission => retry_submission(state, effects),
         Action::Escape => {
-            if matches!(
-                state.panel,
-                Some(Panel::Login | Panel::ModelSetup | Panel::ModelAdd)
-            ) {
-                if matches!(state.panel, Some(Panel::Login)) {
-                    effects.push(Effect::CancelLogin);
-                }
-                state.login_request = None;
-                state.connection_form = None;
-                state.panel = Some(Panel::Models);
-                state.panel_selection = 0;
-                state.status = None;
-                return;
-            }
-            if state.panel.is_some() {
-                close_panel(state);
+            if panel::escape(state, effects) {
                 return;
             }
             if state.focus == Focus::Sessions {
@@ -1491,25 +1284,19 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             let parts: Vec<_> = argument.split_whitespace().collect();
             if parts.is_empty() {
                 clear_current_draft(state, effects);
-                open_models(state, effects);
+                panel::open_models(state, effects);
             } else if parts.len() == 2 {
                 let profile = parts[0].to_owned();
                 let model = parts[1].to_owned();
                 clear_current_draft(state, effects);
-                open_models(state, effects);
-                effects.push(Effect::SetNamedModel {
-                    session: state.selected,
-                    request: state.model_request,
-                    profile,
-                    model,
-                });
+                panel::set_named_model(state, profile, model, effects);
             } else {
                 state.status = Some("Usage: /model [profile model]".into());
             }
         }
         CommandKind::Details if argument.is_empty() => {
             clear_current_draft(state, effects);
-            open_objects(state);
+            panel::open_objects(state);
         }
 
         CommandKind::New => {
@@ -1596,7 +1383,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
         }
         CommandKind::Help if argument.is_empty() => {
             clear_current_draft(state, effects);
-            open_panel(state, Panel::Help);
+            panel::open_help(state);
         }
         CommandKind::Quit if argument.is_empty() => {
             clear_current_draft(state, effects);
@@ -1739,6 +1526,7 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
     if state.selected == Some(id) {
         return;
     }
+    panel::dismiss(state, effects);
     if let Some(previous) = state.selected
         && let Some(ui) = state.session_ui.get(&previous)
         && ui.draft.revision() <= ui.saved_draft_revision
@@ -1752,7 +1540,7 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
     }
     state.selected = Some(id);
     clear_title_rename_error_for_other_session(state, id);
-    refresh_model_label(state, effects);
+    panel::refresh_model_label(state, effects);
     state.slash_dismissed = None;
     let generation = state.generation();
     let ui = state
@@ -2235,119 +2023,9 @@ mod owned_editor_lifecycle_tests {
     }
 }
 
-fn open_panel(state: &mut UiState, panel: Panel) {
-    state.panel_return = state.focus;
-    state.panel = Some(panel);
-    state.panel_selection = 0;
-    state.panel_scroll = 0;
-}
-fn pin_reading(state: &mut UiState) {
-    if let Some(ui) = state.selected_ui_mut()
-        && ui.read_anchor.is_none()
-        && let Some(metrics) = &ui.transcript_metrics
-    {
-        ui.read_anchor = metrics.anchor_at_start(metrics.start_row);
-    }
-}
-
-fn close_panel(state: &mut UiState) {
-    state.connection_form = None;
-    state.login_request = None;
-    state.panel = None;
-    state.set_focus(state.panel_return);
-}
-fn open_models(state: &mut UiState, effects: &mut Vec<Effect>) {
-    open_panel(state, Panel::Models);
-    state.models_loading = true;
-    state.model_request = state.generation();
-    effects.push(Effect::LoadModels {
-        session: state.selected,
-        request: state.model_request,
-    });
-}
-fn refresh_model_label(state: &mut UiState, effects: &mut Vec<Effect>) {
-    state.model_label = None;
-    state.model_facts = None;
-    state.model_label_request = state.generation();
-    effects.push(Effect::LoadModelLabel {
-        session: state.selected,
-        request: state.model_label_request,
-    });
-}
-
 #[cfg(test)]
 mod async_identity_tests {
     use super::*;
-
-    #[test]
-    fn late_model_callbacks_do_not_change_another_open_panel() {
-        let mut state = UiState::default();
-        let mut effects = Vec::new();
-        open_models(&mut state, &mut effects);
-        let request = state.model_request;
-        update(&mut state, UiEvent::Action(Action::Escape));
-        update(&mut state, UiEvent::Action(test_insert("/help")));
-        update(&mut state, UiEvent::Action(Action::Submit));
-        state.panel_selection = 4;
-        update(
-            &mut state,
-            UiEvent::ModelsLoaded {
-                session: None,
-                request,
-                choices: vec![],
-                profiles: vec![],
-            },
-        );
-        assert_eq!(state.panel_selection, 4);
-        update(
-            &mut state,
-            UiEvent::ModelApplied {
-                session: None,
-                request,
-                label: Some("saved-model".into()),
-                facts: None,
-                error: None,
-            },
-        );
-        assert!(matches!(state.panel, Some(Panel::Help)));
-        assert_eq!(state.panel_selection, 4);
-        assert_eq!(state.model_label.as_deref(), Some("saved-model"));
-    }
-
-    #[test]
-    fn cancelled_login_cannot_overwrite_reopened_attempt() {
-        let mut state = UiState::default();
-        open_panel(&mut state, Panel::Login);
-        state.login_request = Some(1);
-        let effects = update(&mut state, UiEvent::Action(Action::Escape));
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::CancelLogin))
-        );
-        assert_eq!(state.login_request, None);
-        open_panel(&mut state, Panel::Login);
-        state.login_request = Some(2);
-        update(
-            &mut state,
-            UiEvent::LoginChanged {
-                request: 1,
-                state: bone_app::LoginState::Succeeded,
-            },
-        );
-        assert!(matches!(
-            state.login_state,
-            bone_app::LoginState::Connecting
-        ));
-        update(
-            &mut state,
-            UiEvent::LoginChanged {
-                request: 2,
-                state: bone_app::LoginState::Succeeded,
-            },
-        );
-        assert!(matches!(state.login_state, bone_app::LoginState::Succeeded));
-    }
 
     #[test]
     fn switching_sessions_clears_label_and_rejects_late_previous_selection() {
@@ -2401,34 +2079,6 @@ mod async_identity_tests {
                 .count(),
             3
         );
-    }
-
-    #[test]
-    fn model_apply_invalidates_earlier_label_read() {
-        let mut state = UiState::default();
-        let mut effects = Vec::new();
-        refresh_model_label(&mut state, &mut effects);
-        let stale = state.model_label_request;
-        update(
-            &mut state,
-            UiEvent::ModelApplied {
-                session: None,
-                request: 0,
-                label: Some("new".into()),
-                facts: None,
-                error: None,
-            },
-        );
-        update(
-            &mut state,
-            UiEvent::ModelLabelLoaded {
-                session: None,
-                request: stale,
-                label: Some("old".into()),
-                facts: None,
-            },
-        );
-        assert_eq!(state.model_label.as_deref(), Some("new"));
     }
 }
 
@@ -2987,10 +2637,11 @@ mod panel_draft_tests {
                 report: None,
             }],
         }));
-        open_objects(&mut state);
-        let Some(Panel::Objects { choices, .. }) = &state.panel else {
+        panel::open_objects(&mut state);
+        let Some(Panel::Objects(objects)) = &state.panel else {
             panic!("object menu")
         };
+        let choices = &objects.choices;
         assert_eq!(choices.len(), 3);
         assert!(choices.iter().map(|(_, label)| label.len()).sum::<usize>() < 300);
         let target = choices
@@ -2999,15 +2650,14 @@ mod panel_draft_tests {
             .unwrap();
         update(&mut state, UiEvent::Action(Action::SelectObject(target)));
         assert!(
-            matches!(&state.panel, Some(Panel::Reader(content)) if content.source == ReaderSource::History(SessionSeq(1)) && content.text.contains("Done"))
+            matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content.source == ReaderSource::History(SessionSeq(1)) && reader.content.text.contains("Done"))
         );
         assert_drafts(&state, question);
         update(&mut state, UiEvent::Action(Action::Escape));
-        open_objects(&mut state);
-        state.panel_selection = 0;
+        panel::open_objects(&mut state);
         update(&mut state, UiEvent::Action(Action::ActivatePanel));
         assert!(
-            matches!(&state.panel, Some(Panel::Reader(content)) if content.source == ReaderSource::Job(job))
+            matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content.source == ReaderSource::Job(job))
         );
         assert_drafts(&state, question);
     }
@@ -3015,10 +2665,10 @@ mod panel_draft_tests {
     #[test]
     fn expired_or_cross_session_object_menu_never_substitutes_another_object() {
         let (mut state, question) = fixture();
-        open_objects(&mut state);
+        panel::open_objects(&mut state);
         state.selected_ui_mut().unwrap().history.clear();
         update(&mut state, UiEvent::Action(Action::ActivatePanel));
-        assert!(matches!(state.panel, Some(Panel::Objects { .. })));
+        assert!(matches!(state.panel, Some(Panel::Objects(_))));
         assert!(
             state
                 .status
@@ -3029,7 +2679,7 @@ mod panel_draft_tests {
         assert_drafts(&state, question);
         state.selected = Some(SessionId::new());
         update(&mut state, UiEvent::Action(Action::SelectObject(0)));
-        assert!(matches!(state.panel, Some(Panel::Objects { .. })));
+        assert!(matches!(state.panel, Some(Panel::Objects(_))));
         assert!(state.status.as_deref().unwrap().contains("session changed"));
     }
 
@@ -3074,10 +2724,10 @@ mod panel_draft_tests {
                 report: None,
             }],
         };
-        state.panel = Some(Panel::Reader(
-            super::super::reader::ReaderContent::from_job(&snapshot, job).unwrap(),
-        ));
-        state.panel_scroll = 8;
+        state.panel = Some(Panel::Reader(ReaderPanel {
+            content: super::super::reader::ReaderContent::from_job(&snapshot, job).unwrap(),
+            scroll: 8,
+        }));
         let focus = state.focus;
         snapshot.jobs[0].state = bone_app::JobState::Finished {
             outcome: OutcomeKind::Completed,
@@ -3092,7 +2742,7 @@ mod panel_draft_tests {
             },
         );
         assert!(
-            matches!(&state.panel, Some(Panel::Reader(content)) if content.text.contains("Running"))
+            matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content.text.contains("Running"))
         );
         update(
             &mut state,
@@ -3103,7 +2753,7 @@ mod panel_draft_tests {
             },
         );
         assert!(
-            matches!(&state.panel, Some(Panel::Reader(content)) if content.text.contains("New result"))
+            matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content.text.contains("New result"))
         );
         // Same numeric ID in another runtime is a different job, never a substitute.
         snapshot.jobs[0].id.runtime = RuntimeId::new();
@@ -3116,9 +2766,9 @@ mod panel_draft_tests {
             },
         );
         assert!(
-            matches!(&state.panel, Some(Panel::Reader(content)) if content.source == super::super::reader::ReaderSource::Job(job) && content.text.contains("no longer in the current snapshot") && !content.text.contains("New result"))
+            matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content.source == super::super::reader::ReaderSource::Job(job) && reader.content.text.contains("no longer in the current snapshot") && !reader.content.text.contains("New result"))
         );
-        assert_eq!(state.panel_scroll, 8);
+        assert!(matches!(&state.panel, Some(Panel::Reader(reader)) if reader.scroll == 8));
         assert_eq!(state.focus, focus);
         assert_drafts(&state, question);
 
@@ -3127,7 +2777,10 @@ mod panel_draft_tests {
             &state.selected_ui().unwrap().history[0],
         )
         .unwrap();
-        state.panel = Some(Panel::Reader(original.clone()));
+        state.panel = Some(Panel::Reader(ReaderPanel {
+            content: original.clone(),
+            scroll: 0,
+        }));
         update(
             &mut state,
             UiEvent::SessionChanged {
@@ -3136,7 +2789,7 @@ mod panel_draft_tests {
                 snapshot: std::sync::Arc::new(snapshot),
             },
         );
-        assert!(matches!(&state.panel, Some(Panel::Reader(content)) if *content == original));
+        assert!(matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content == original));
     }
 
     #[test]
@@ -3145,9 +2798,9 @@ mod panel_draft_tests {
         for panel in ["model", "details", "help"] {
             let mut effects = Vec::new();
             match panel {
-                "model" => open_models(&mut state, &mut effects),
-                "details" => open_objects(&mut state),
-                _ => open_panel(&mut state, Panel::Help),
+                "model" => panel::open_models(&mut state, &mut effects),
+                "details" => panel::open_objects(&mut state),
+                _ => panel::open_help(&mut state),
             }
             assert!(
                 effects.iter().all(|effect| !matches!(
@@ -3157,8 +2810,18 @@ mod panel_draft_tests {
             );
             assert!(state.panel.is_some());
             if panel == "model" {
-                state.models_loading = false;
-                let add = state.model_row_count() - 1;
+                let request = state.model_operation.expect("model load").request;
+                let session = state.selected;
+                update(
+                    &mut state,
+                    UiEvent::ModelsLoaded {
+                        session,
+                        request,
+                        choices: vec![],
+                        profiles: vec![],
+                    },
+                );
+                let add = 0;
                 update(&mut state, UiEvent::Action(Action::SelectModel(add)));
                 update(&mut state, UiEvent::Action(Action::ChooseConnectionKind(0)));
                 update(&mut state, UiEvent::Action(Action::SetupClear));
@@ -3167,11 +2830,23 @@ mod panel_draft_tests {
                     UiEvent::Action(Action::SetupText("e\u{301}👩‍💻".to_owned().into())),
                 );
                 update(&mut state, UiEvent::Action(Action::SetupBackspace));
-                assert_eq!(state.connection_form.as_ref().unwrap().label, "e\u{301}");
+                assert!(matches!(
+                    &state.panel,
+                    Some(Panel::Models(ModelPanel {
+                        screen: ModelScreen::Setup(form),
+                        ..
+                    })) if form.label == "e\u{301}"
+                ));
                 update(&mut state, UiEvent::Action(Action::SetupBackspace));
-                assert!(state.connection_form.as_ref().unwrap().label.is_empty());
+                assert!(matches!(
+                    &state.panel,
+                    Some(Panel::Models(ModelPanel {
+                        screen: ModelScreen::Setup(form),
+                        ..
+                    })) if form.label.is_empty()
+                ));
                 update(&mut state, UiEvent::Action(Action::Escape));
-                assert!(matches!(state.panel, Some(Panel::Models)));
+                assert!(matches!(state.panel, Some(Panel::Models(_))));
             }
             update(&mut state, UiEvent::Action(Action::Escape));
             assert!(state.panel.is_none());
@@ -3402,73 +3077,6 @@ mod session_browsing_tests {
     }
 }
 
-fn open_objects(state: &mut UiState) {
-    use super::reader::ReaderSource;
-    let Some(ui) = state.selected_ui() else {
-        state.status = Some("There is no session to inspect".into());
-        return;
-    };
-    let session = ui.id;
-    let mut choices = Vec::new();
-    if let Some(snapshot) = &ui.snapshot {
-        for job in snapshot.jobs.iter().rev() {
-            let goal: String = job.goal.chars().take(64).collect();
-            choices.push((
-                ReaderSource::Job(job.id),
-                format!("Task {} · {goal}", job.id.id),
-            ));
-        }
-    }
-    for entry in ui.history.iter().rev() {
-        let label = match &entry.event {
-            bone_app::SessionEvent::ToolFinished { tool, .. } => {
-                let tool: String = tool.chars().take(64).collect();
-                format!("Tool {tool} · history {}", entry.sequence.0)
-            }
-            bone_app::SessionEvent::JobFinished { job, .. } => {
-                format!("Task {} result · history {}", job.id, entry.sequence.0)
-            }
-            _ => continue,
-        };
-        choices.push((ReaderSource::History(entry.sequence), label));
-    }
-    state.status = None;
-    open_panel(state, Panel::Objects { session, choices });
-}
-
-fn open_object(state: &mut UiState) {
-    use super::reader::{ReaderContent, ReaderSource};
-    let Some(Panel::Objects { session, choices }) = &state.panel else {
-        return;
-    };
-    let Some((source, _)) = choices.get(state.panel_selection) else {
-        return;
-    };
-    if state.selected != Some(*session) {
-        state.status = Some("The session changed; reopen /details".into());
-        return;
-    }
-    let content = state.selected_ui().and_then(|ui| match *source {
-        ReaderSource::Job(job) => ui
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| ReaderContent::from_job(snapshot, job)),
-        ReaderSource::History(sequence) => ui
-            .history
-            .iter()
-            .find(|entry| entry.sequence == sequence)
-            .and_then(|entry| ReaderContent::from_history(*session, entry)),
-    });
-    if let Some(content) = content {
-        state.panel_scroll = 0;
-        pin_reading(state);
-        state.panel = Some(Panel::Reader(content));
-        state.status = None;
-    } else {
-        state.status = Some("This object is no longer loaded; reopen /details".into());
-    }
-}
-
 #[cfg(test)]
 mod final_integration_regressions {
     use super::*;
@@ -3506,96 +3114,6 @@ mod final_integration_regressions {
                 .unwrap()
                 .text,
             "send this"
-        );
-    }
-
-    #[test]
-    fn activating_saved_model_preserves_ordinary_draft() {
-        let mut state = UiState::default();
-        state.panel = Some(Panel::Models);
-        state.orphan_draft = "missing foo".into();
-        let choice = ModelChoice {
-            selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), "gpt-5.5")
-                .unwrap(),
-            profile_label: "ChatGPT".into(),
-        };
-        state.model_choices.push(choice.clone());
-        let effects = update(&mut state, UiEvent::Action(Action::SelectModel(0)));
-        assert!(
-            matches!(effects.as_slice(), [Effect::SetModel { selection, .. }] if selection == &choice.selection)
-        );
-        assert_eq!(state.orphan_draft.text(), "missing foo");
-        assert!(update(&mut state, UiEvent::Action(Action::SelectModel(0))).is_empty());
-        state.models_loading = false;
-        let effects = update(&mut state, UiEvent::Action(Action::ActivatePanel));
-        assert!(
-            matches!(effects.as_slice(), [Effect::SetModel { selection, .. }] if selection == &choice.selection)
-        );
-    }
-
-    #[test]
-    fn old_model_write_refreshes_facts_without_touching_reopened_panel() {
-        let mut state = UiState::default();
-        update(&mut state, UiEvent::Action(Action::OpenModels));
-        let old = state.model_request;
-        update(&mut state, UiEvent::Action(Action::Escape));
-        update(&mut state, UiEvent::Action(Action::OpenModels));
-        let current = state.model_request;
-        state.model_label = Some("previous".into());
-        state.orphan_draft = "newer draft".into();
-        state.panel_selection = 3;
-        let effects = update(
-            &mut state,
-            UiEvent::ModelApplied {
-                session: None,
-                request: old,
-                label: Some("stale callback".into()),
-                facts: None,
-                error: None,
-            },
-        );
-        let [
-            Effect::LoadModelLabel {
-                session: None,
-                request,
-            },
-        ] = effects.as_slice()
-        else {
-            panic!("query fresh facts")
-        };
-        let refresh = *request;
-        assert_ne!(refresh, old);
-        assert_eq!(state.model_request, current);
-        assert!(state.models_loading);
-        assert!(matches!(state.panel, Some(Panel::Models)));
-        assert_eq!(state.panel_selection, 3);
-        assert_eq!(state.orphan_draft.text(), "newer draft");
-        assert_eq!(state.model_label.as_deref(), Some("previous"));
-        update(
-            &mut state,
-            UiEvent::ModelLabelLoaded {
-                session: None,
-                request: refresh,
-                label: Some("actual App value".into()),
-                facts: None,
-            },
-        );
-        assert_eq!(state.model_label.as_deref(), Some("actual App value"));
-        assert!(matches!(state.panel, Some(Panel::Models)));
-        let other = session(&mut state);
-        state.selected = Some(other);
-        assert!(
-            update(
-                &mut state,
-                UiEvent::ModelApplied {
-                    session: None,
-                    request: old,
-                    label: None,
-                    facts: None,
-                    error: None
-                }
-            )
-            .is_empty()
         );
     }
 
@@ -3758,337 +3276,6 @@ mod transcript_budget_tests {
     }
 }
 
-fn return_to_models(state: &mut UiState, effects: &mut Vec<Effect>) {
-    state.panel = Some(Panel::Models);
-    state.panel_selection = 0;
-    state.models_loading = true;
-    state.model_request = state.generation();
-    effects.push(Effect::LoadModels {
-        session: state.selected,
-        request: state.model_request,
-    });
-    refresh_model_label(state, effects);
-}
-
-fn select_model_row(state: &mut UiState, index: usize, effects: &mut Vec<Effect>) {
-    if state.models_loading || !matches!(state.panel, Some(Panel::Models)) {
-        return;
-    }
-    state.panel_selection = index;
-    if let Some(choice) = state.model_choices.get(index) {
-        state.models_loading = true;
-        effects.push(Effect::SetModel {
-            session: state.selected,
-            request: state.model_request,
-            selection: choice.selection.clone(),
-        });
-    } else if let Some(profile) = index
-        .checked_sub(state.model_choices.len())
-        .and_then(|index| state.model_profiles.get(index))
-    {
-        let selection = state
-            .model_choices
-            .iter()
-            .find(|choice| choice.selection.profile == profile.id)
-            .map(|choice| choice.selection.clone());
-        state.connection_form = Some(super::ConnectionForm::edit_selection(profile, selection));
-        state.panel = Some(Panel::ModelSetup);
-        state.status = None;
-    } else if index == state.model_row_count() - 1 {
-        state.panel = Some(Panel::ModelAdd);
-        state.panel_selection = 0;
-        state.status = None;
-    }
-}
-
-fn choose_connection_kind(state: &mut UiState, index: usize) {
-    if !matches!(state.panel, Some(Panel::ModelAdd)) {
-        return;
-    }
-    let Some(kind) = super::ConnectionKind::ALL.get(index).copied() else {
-        return;
-    };
-    let form = if kind.subscription() {
-        state
-            .model_profiles
-            .iter()
-            .find(|profile| profile.id == bone_app::ProfileId::chatgpt())
-            .map(|profile| super::ConnectionForm::edit(profile, String::new()))
-            .unwrap_or_else(|| super::ConnectionForm::new(kind))
-    } else {
-        super::ConnectionForm::new(kind)
-    };
-    state.connection_form = Some(form);
-    state.panel = Some(Panel::ModelSetup);
-    state.status = None;
-}
-
-fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
-    if !matches!(state.panel, Some(Panel::ModelSetup)) {
-        return;
-    }
-    let Some(form) = &state.connection_form else {
-        return;
-    };
-    if form.saving {
-        return;
-    }
-    let (profile, selection) = match form.validated() {
-        Ok(value) => value,
-        Err(error) => {
-            state.status = Some(error);
-            return;
-        }
-    };
-    let request = state.generation();
-    let form = state.connection_form.as_mut().unwrap();
-    form.saving = true;
-    form.request = request;
-    form.key_was_sent = !form.key.is_empty();
-    let key = (!form.key.is_empty()).then(|| super::SecretText::from(form.key.take()));
-    state.status = None;
-    effects.push(Effect::SaveConnection {
-        request,
-        session: state.selected,
-        profile,
-        key,
-        selection,
-    });
-}
-
-#[cfg(test)]
-mod connection_tests {
-    use super::*;
-    use crate::state::{ConnectionForm, ConnectionKind, SecretText, SetupField};
-
-    fn setup() -> UiState {
-        let mut state = UiState::default();
-        let info = bone_app::SessionInfo {
-            id: SessionId::new(),
-            workspace: bone_app::WorkspaceId::new(),
-            title: "connection test".into(),
-            archived: false,
-        };
-        let mut ui = SessionUi::new(info.id, 1);
-        ui.draft = "ordinary draft".into();
-        let question = bone_app::QuestionId {
-            runtime: bone_app::RuntimeId::new(),
-            record: 1,
-            reply_to: bone_app::InputId(1),
-        };
-        let mut answer = AnswerDraft::new(question);
-        answer.replace("answer draft".into(), 12);
-        ui.answer_drafts.insert(question, answer);
-        ui.selected_answer = Some(question);
-        state.selected = Some(info.id);
-        state.session_ui.insert(info.id, ui);
-        state.panel = Some(Panel::ModelSetup);
-        state.connection_form = Some(ConnectionForm::new(ConnectionKind::OpenAiResponses));
-        state
-    }
-    fn assert_drafts(state: &UiState) {
-        let ui = state.selected_ui().unwrap();
-        assert_eq!(ui.draft(), "ordinary draft");
-        assert_eq!(ui.active_answer().unwrap().text(), "answer draft");
-    }
-    fn act(state: &mut UiState, action: Action) -> Vec<Effect> {
-        update(state, UiEvent::Action(action))
-    }
-
-    #[test]
-    fn secret_input_save_failure_and_cancel_never_enter_debug_or_chat_drafts() {
-        let mut state = setup();
-        let secret = "secret-that-must-not-appear";
-        let action = Action::SetupText(SecretText::from(secret.to_owned()));
-        assert!(!format!("{action:?}").contains(secret));
-        act(&mut state, Action::SelectField(SetupField::Key));
-        act(&mut state, action);
-        assert!(!format!("{state:?}").contains(secret));
-        let effects = act(&mut state, Action::SaveConnection);
-        assert!(!format!("{effects:?}").contains(secret));
-        let [
-            Effect::SaveConnection {
-                request,
-                session,
-                key: Some(key),
-                ..
-            },
-        ] = effects.as_slice()
-        else {
-            panic!("save effect")
-        };
-        assert_eq!(key.as_str(), secret);
-        assert!(state.connection_form.as_ref().unwrap().key.is_empty());
-        assert!(act(&mut state, Action::SaveConnection).is_empty());
-        update(
-            &mut state,
-            UiEvent::ConnectionSaved {
-                request: *request,
-                session: *session,
-                error: Some("Could not save key".into()),
-                notice: None,
-            },
-        );
-        assert!(!state.connection_form.as_ref().unwrap().saving);
-        assert!(state.status.as_ref().unwrap().contains("Re-enter"));
-        assert!(act(&mut state, Action::SaveConnection).is_empty());
-        act(&mut state, Action::Escape);
-        assert!(state.connection_form.is_none());
-        assert!(matches!(state.panel, Some(Panel::Models)));
-        assert_drafts(&state);
-    }
-
-    #[test]
-    fn cancelled_save_receipt_cannot_replace_new_form_or_start_login() {
-        let mut state = setup();
-        state.connection_form = Some(ConnectionForm::new(ConnectionKind::ChatGptSubscription));
-        let effects = act(&mut state, Action::SaveConnection);
-        let [
-            Effect::SaveConnection {
-                request, session, ..
-            },
-        ] = effects.as_slice()
-        else {
-            panic!("save effect")
-        };
-        act(&mut state, Action::Escape);
-        state.panel = Some(Panel::ModelAdd);
-        act(&mut state, Action::ChooseConnectionKind(3));
-        state.status = Some("new form validation".into());
-        let effects = update(
-            &mut state,
-            UiEvent::ConnectionSaved {
-                request: *request,
-                session: *session,
-                error: None,
-                notice: None,
-            },
-        );
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::LoadModels { .. }))
-        );
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::LoadModelLabel { .. }))
-        );
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Login { .. }))
-        );
-        assert!(matches!(state.panel, Some(Panel::ModelSetup)));
-        assert_eq!(
-            state.connection_form.as_ref().unwrap().kind,
-            ConnectionKind::AnthropicMessages
-        );
-        assert_drafts(&state);
-        let reload = state.model_request;
-        let selected = state.selected;
-        update(
-            &mut state,
-            UiEvent::ModelsFailed {
-                session: selected,
-                request: reload,
-                error: "stale reload failure".into(),
-            },
-        );
-        assert_eq!(state.status.as_deref(), Some("new form validation"));
-    }
-
-    #[test]
-    fn model_rows_edit_profiles_and_subscription_authorization_returns_to_models() {
-        let mut state = setup();
-        state.panel = Some(Panel::Models);
-        state.connection_form = None;
-        state.model_profiles = vec![bone_app::Profile::chatgpt()];
-        assert_eq!(state.model_row_count(), 2);
-        act(&mut state, Action::SelectModel(0));
-        assert_eq!(
-            state.connection_form.as_ref().unwrap().existing,
-            Some(bone_app::ProfileId::chatgpt())
-        );
-        let effects = act(&mut state, Action::SaveConnection);
-        let [
-            Effect::SaveConnection {
-                request, session, ..
-            },
-        ] = effects.as_slice()
-        else {
-            panic!("save effect")
-        };
-        let effects = update(
-            &mut state,
-            UiEvent::ConnectionSaved {
-                request: *request,
-                session: *session,
-                error: None,
-                notice: None,
-            },
-        );
-        assert!(matches!(effects.as_slice(), [Effect::Login { .. }]));
-        assert!(matches!(state.panel, Some(Panel::Login)));
-        act(&mut state, Action::Escape);
-        assert!(matches!(state.panel, Some(Panel::Models)));
-        assert_drafts(&state);
-        assert!(!COMMANDS.iter().any(|command| command.name == "login"));
-    }
-
-    #[test]
-    fn editing_same_model_credentials_preserves_full_selection_options() {
-        let mut state = setup();
-        let profile = bone_app::Profile::new(
-            bone_app::ProfileId::new("api").unwrap(),
-            "API",
-            bone_app::EndpointConfig::OpenAiResponses { base_url: None },
-        )
-        .unwrap();
-        let mut selection = bone_app::ModelSelection::new(profile.id.clone(), "gpt-5.5").unwrap();
-        selection.options = Some(serde_json::from_value(serde_json::json!({ "type": "openai_responses", "reasoning": { "effort": "high" } })).unwrap());
-        state.panel = Some(Panel::Models);
-        state.model_profiles = vec![profile];
-        state.model_choices = vec![ModelChoice {
-            selection: selection.clone(),
-            profile_label: "API".into(),
-        }];
-        act(&mut state, Action::SelectModel(1));
-        let form = state.connection_form.as_mut().unwrap();
-        form.key = "rotated-key".to_owned().into();
-        form.label = "renamed connection".into();
-        assert_eq!(form.validated().unwrap().1.as_ref(), Some(&selection));
-        let mut changed = form.clone();
-        changed.model = "gpt-other".into();
-        assert!(changed.validated().unwrap().1.unwrap().options.is_none());
-        let effects = act(&mut state, Action::SaveConnection);
-        assert!(
-            matches!(effects.as_slice(), [Effect::SaveConnection { selection: Some(saved), .. }] if saved == &selection)
-        );
-        assert_drafts(&state);
-    }
-
-    #[test]
-    fn api_credentials_may_be_retained_only_for_the_unchanged_endpoint() {
-        let profile = bone_app::Profile::new(
-            bone_app::ProfileId::new("api").unwrap(),
-            "API",
-            bone_app::EndpointConfig::OpenAiResponses { base_url: None },
-        )
-        .unwrap();
-        let mut form = ConnectionForm::edit(&profile, String::new());
-        assert!(form.validated().is_ok());
-        form.base_url = "https://example.com/v1".into();
-        assert!(form.validated().is_err());
-        form.key = "new-secret".to_owned().into();
-        assert!(form.validated().is_ok());
-        form.base_url.clear();
-        form.key.take();
-        form.kind = ConnectionKind::AnthropicMessages;
-        assert!(form.validated().is_err());
-    }
-}
-
 #[cfg(test)]
 mod focus_state_tests {
     use super::*;
@@ -4126,19 +3313,6 @@ mod focus_state_tests {
             act(&mut state, Action::FocusRight);
             assert_eq!(state.focus, center);
         }
-    }
-
-    #[test]
-    fn leaving_center_repairs_a_direct_public_focus_assignment() {
-        let mut state = state_with_session();
-        assert_eq!(state.last_center_focus(), Focus::Composer);
-
-        // External callers can still write this public compatibility field.
-        state.focus = Focus::SessionTitle;
-        act(&mut state, Action::FocusLeft);
-        act(&mut state, Action::FocusRight);
-
-        assert_eq!(state.focus, Focus::SessionTitle);
     }
 
     #[test]
@@ -4209,7 +3383,6 @@ mod focus_state_tests {
     fn slash_new_focuses_composer_before_async_completion() {
         let mut state = UiState::default();
         state.set_focus(Focus::Sessions);
-        state.panel_return = Focus::Sessions;
 
         act(&mut state, Action::StartSlashCommand);
         act(&mut state, test_insert("new"));
@@ -4259,7 +3432,7 @@ mod focus_state_tests {
 
             act(&mut state, Action::OpenHistory(sequence));
             assert!(matches!(state.panel, Some(Panel::Reader(_))));
-            assert_eq!(state.panel_return, focus);
+            assert_eq!(state.focus, focus);
 
             act(&mut state, Action::Escape);
             assert!(state.panel.is_none());
@@ -4299,12 +3472,12 @@ mod focus_state_tests {
     }
 
     #[test]
-    fn overview_removal_repairs_hidden_title_return_targets() {
-        for focus_state in [Focus::Sessions, Focus::RightRail] {
+    fn overview_removal_repairs_the_remembered_title_region() {
+        for focus in [Focus::Sessions, Focus::RightRail] {
             let mut state = state_with_session();
             state.set_focus(Focus::SessionTitle);
-            state.set_focus(focus_state);
-            assert_eq!(state.last_center, CenterFocus::SessionTitle);
+            state.set_focus(focus);
+            assert_eq!(state.last_center_focus(), Focus::SessionTitle);
             let overview_request = state.generation();
             state.overview_request = Some(overview_request);
 
@@ -4316,11 +3489,11 @@ mod focus_state_tests {
                 },
             );
 
-            assert_eq!(state.focus, focus_state);
-            assert_eq!(state.last_center, CenterFocus::Composer);
+            assert_eq!(state.focus, focus);
+            assert_eq!(state.last_center_focus(), Focus::Composer);
             act(
                 &mut state,
-                if focus_state == Focus::Sessions {
+                if focus == Focus::Sessions {
                     Action::FocusRight
                 } else {
                     Action::FocusLeft
@@ -4328,34 +3501,13 @@ mod focus_state_tests {
             );
             assert_eq!(state.focus, Focus::Composer);
         }
-
-        let mut state = state_with_session();
-        act(&mut state, Action::Focus(Focus::SessionTitle));
-        open_panel(&mut state, Panel::Help);
-        assert_eq!(state.panel_return, Focus::SessionTitle);
-        let overview_request = state.generation();
-        state.overview_request = Some(overview_request);
-
-        update(
-            &mut state,
-            UiEvent::OverviewLoaded {
-                generation: overview_request,
-                rows: vec![],
-            },
-        );
-
-        assert_eq!(state.panel_return, Focus::Composer);
-        assert_eq!(state.last_center, CenterFocus::Composer);
-        act(&mut state, Action::Escape);
-        assert_eq!(state.focus, Focus::Composer);
     }
 
     #[test]
-    fn resize_repairs_a_hidden_right_rail_behind_an_open_panel() {
+    fn resize_repairs_the_real_focus_while_a_panel_is_open() {
         let mut state = state_with_session();
         state.set_focus(Focus::RightRail);
-        open_panel(&mut state, Panel::Help);
-        assert_eq!(state.panel_return, Focus::RightRail);
+        panel::open_help(&mut state);
 
         update(
             &mut state,
@@ -4364,21 +3516,21 @@ mod focus_state_tests {
                 height: 24,
             },
         );
-        assert_eq!(state.panel_return, Focus::Composer);
+        assert_eq!(state.focus, Focus::Composer);
+        assert!(matches!(state.panel, Some(Panel::Help)));
         act(&mut state, Action::Escape);
         assert_eq!(state.focus, Focus::Composer);
     }
 
     #[test]
-    fn attached_slash_command_keeps_composer_as_the_panel_return_focus() {
+    fn attached_slash_command_keeps_composer_focus() {
         let mut state = UiState::default();
-        state.panel_return = Focus::Sessions;
         act(&mut state, test_insert("/help"));
 
         act(&mut state, Action::Submit);
 
         assert!(matches!(state.panel, Some(Panel::Help)));
-        assert_eq!(state.panel_return, Focus::Composer);
+        assert_eq!(state.focus, Focus::Composer);
         act(&mut state, Action::Escape);
         assert_eq!(state.focus, Focus::Composer);
     }

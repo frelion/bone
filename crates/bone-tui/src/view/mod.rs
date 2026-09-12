@@ -325,7 +325,12 @@ mod region_tests {
     #[test]
     fn pane_boundaries_survive_overlays_and_disappear_with_hidden_panes() {
         for (width, boundaries) in [(160, vec![31, 120]), (120, vec![31]), (80, vec![])] {
-            for panel in [None, Some(crate::state::Panel::Models)] {
+            for panel in [
+                None,
+                Some(crate::state::Panel::Models(crate::state::ModelPanel::new(
+                    None,
+                ))),
+            ] {
                 let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
                 let mut state = UiState::default();
                 state.panel = panel;
@@ -368,7 +373,9 @@ mod region_tests {
     fn overlays_keep_boundaries_visual_but_remove_their_pointer_targets() {
         let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
         let mut state = UiState::default();
-        state.panel = Some(crate::state::Panel::Models);
+        state.panel = Some(crate::state::Panel::Models(crate::state::ModelPanel::new(
+            None,
+        )));
         state.dragging_divider = Some(crate::layout::PaneDivider::Left);
         let mut snapshot = None;
         terminal

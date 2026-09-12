@@ -432,7 +432,9 @@ mod tests {
     fn inactive_composer_preserves_text_without_action_hints() {
         let mut state = UiState::default();
         state.orphan_draft = "preserved draft".into();
-        state.panel = Some(crate::state::Panel::Models);
+        state.panel = Some(crate::state::Panel::Models(crate::state::ModelPanel::new(
+            None,
+        )));
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| render(frame, Rect::new(0, 0, 72, 5), &state))
