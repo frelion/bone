@@ -470,40 +470,48 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 });
             }
         }
-        UiEvent::OperationFailed {
+        UiEvent::SessionOperationFailed {
             kind,
             session,
             generation,
             message,
         } => {
-            if session.zip(generation).is_none_or(|(id, generation)| {
-                state
-                    .session_ui
-                    .get(&id)
-                    .is_some_and(|ui| ui.generation == generation)
-            }) {
-                if let Some(id) = session
-                    && let Some(ui) = state.session_ui.get_mut(&id)
-                {
-                    match kind {
-                        OperationKind::LoadOlderHistory => {
-                            ui.transcript.older_history_failed();
-                        }
-                        OperationKind::LoadHistory => {
-                            ui.transcript.history_failed();
-                        }
-                        OperationKind::ReloadRecentHistory => {
-                            ui.transcript.recent_history_failed();
-                        }
-                        _ => {}
+            if let Some(ui) = current_generation_mut(state, session, generation) {
+                match kind {
+                    SessionOperationKind::LoadOlderHistory => {
+                        ui.transcript.older_history_failed();
                     }
+                    SessionOperationKind::LoadHistory => {
+                        ui.transcript.history_failed();
+                    }
+                    SessionOperationKind::ReloadRecentHistory => {
+                        ui.transcript.recent_history_failed();
+                    }
+                    _ => {}
                 }
-                if kind == OperationKind::RefreshOverview {
-                    state.overview_request = None;
-                }
-                if session.is_none() || state.selected == session {
+                if state.selected == Some(session) {
                     state.status = Some(message);
                 }
+            }
+        }
+        UiEvent::OverviewFailed {
+            generation,
+            message,
+        } => {
+            if state.overview_request == Some(generation) {
+                state.overview_request = None;
+                state.status = Some(message);
+            }
+        }
+        UiEvent::RememberSessionFailed {
+            session,
+            generation,
+            message,
+        } => {
+            if state.selected == Some(session)
+                && current_generation_mut(state, session, generation).is_some()
+            {
+                state.status = Some(message);
             }
         }
         UiEvent::Resized { width, height } => {
@@ -1410,7 +1418,10 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
         generation,
     });
     if state.workspace_label.is_some() {
-        effects.push(Effect::RememberSession { session: id });
+        effects.push(Effect::RememberSession {
+            session: id,
+            generation,
+        });
     }
     // Opening another Session changes content, not the user's chosen region.
     // If the title already owned focus, prepare the new title editor without
@@ -2785,34 +2796,217 @@ mod final_integration_regressions {
         assert_eq!(state.status.as_deref(), Some("current status"));
         update(
             &mut state,
-            UiEvent::OperationFailed {
-                kind: OperationKind::LoadHistory,
-                session: Some(background),
-                generation: Some(1),
+            UiEvent::SessionOperationFailed {
+                kind: SessionOperationKind::LoadHistory,
+                session: background,
+                generation: 1,
                 message: "background history failed".into(),
             },
         );
         assert_eq!(state.status.as_deref(), Some("current status"));
         update(
             &mut state,
-            UiEvent::OperationFailed {
-                kind: OperationKind::ReloadRecentHistory,
-                session: Some(background),
-                generation: Some(1),
+            UiEvent::SessionOperationFailed {
+                kind: SessionOperationKind::ReloadRecentHistory,
+                session: background,
+                generation: 1,
                 message: "background recent history failed".into(),
             },
         );
         assert_eq!(state.status.as_deref(), Some("current status"));
         update(
             &mut state,
-            UiEvent::OperationFailed {
-                kind: OperationKind::SaveDraft,
-                session: Some(current),
-                generation: Some(1),
+            UiEvent::SessionOperationFailed {
+                kind: SessionOperationKind::SaveDraft,
+                session: current,
+                generation: 1,
                 message: "current save failed".into(),
             },
         );
         assert_eq!(state.status.as_deref(), Some("current save failed"));
+    }
+
+    #[test]
+    fn stale_overview_failure_does_not_clear_or_report_the_newer_request() {
+        let mut state = UiState::default();
+        let stale = state.generation();
+        let current = state.generation();
+        state.overview_request = Some(current);
+        state.status = Some("current status".into());
+
+        update(
+            &mut state,
+            UiEvent::OverviewFailed {
+                generation: stale,
+                message: "stale overview failed".into(),
+            },
+        );
+
+        assert_eq!(state.overview_request, Some(current));
+        assert_eq!(state.status.as_deref(), Some("current status"));
+
+        update(
+            &mut state,
+            UiEvent::OverviewFailed {
+                generation: current,
+                message: "current overview failed".into(),
+            },
+        );
+
+        assert_eq!(state.overview_request, None);
+        assert_eq!(state.status.as_deref(), Some("current overview failed"));
+    }
+
+    #[test]
+    fn session_failure_requires_the_current_generation_before_releasing_its_latch() {
+        let mut state = UiState::default();
+        let current = session(&mut state);
+        state.selected = Some(current);
+        state.status = Some("current status".into());
+        assert_eq!(
+            state
+                .session_ui
+                .get_mut(&current)
+                .unwrap()
+                .transcript
+                .session_changed(bone_app::SessionSeq(1)),
+            Some(bone_app::SessionSeq(0))
+        );
+
+        update(
+            &mut state,
+            UiEvent::SessionOperationFailed {
+                kind: SessionOperationKind::LoadHistory,
+                session: current,
+                generation: 0,
+                message: "stale history failed".into(),
+            },
+        );
+
+        assert_eq!(state.status.as_deref(), Some("current status"));
+        assert_eq!(
+            state
+                .session_ui
+                .get_mut(&current)
+                .unwrap()
+                .transcript
+                .session_changed(bone_app::SessionSeq(1)),
+            None,
+            "a stale failure must not release the current generation's history latch"
+        );
+
+        update(
+            &mut state,
+            UiEvent::SessionOperationFailed {
+                kind: SessionOperationKind::LoadHistory,
+                session: current,
+                generation: 1,
+                message: "current history failed".into(),
+            },
+        );
+
+        assert_eq!(state.status.as_deref(), Some("current history failed"));
+        assert_eq!(
+            state
+                .session_ui
+                .get_mut(&current)
+                .unwrap()
+                .transcript
+                .session_changed(bone_app::SessionSeq(1)),
+            Some(bone_app::SessionSeq(0)),
+            "the matching failure must make forward history retryable"
+        );
+    }
+
+    #[test]
+    fn selected_session_reports_open_save_retry_and_stop_failures() {
+        let mut state = UiState::default();
+        let current = session(&mut state);
+        state.selected = Some(current);
+
+        for (kind, message) in [
+            (SessionOperationKind::OpenSession, "open failed"),
+            (SessionOperationKind::SaveDraft, "save failed"),
+            (SessionOperationKind::RetryInput, "retry failed"),
+            (SessionOperationKind::Stop, "stop failed"),
+        ] {
+            update(
+                &mut state,
+                UiEvent::SessionOperationFailed {
+                    kind,
+                    session: current,
+                    generation: 1,
+                    message: message.into(),
+                },
+            );
+            assert_eq!(state.status.as_deref(), Some(message));
+        }
+    }
+
+    #[test]
+    fn remember_failure_requires_the_selected_session_generation() {
+        let mut state = UiState::default();
+        let previous = session(&mut state);
+        let current = session(&mut state);
+        state.workspace_label = Some("workspace".into());
+        let first_selection = update(&mut state, UiEvent::Action(Action::SelectSession(previous)));
+        let old_generation = first_selection
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::RememberSession {
+                    session,
+                    generation,
+                } if *session == previous => Some(*generation),
+                _ => None,
+            })
+            .expect("first selection is remembered");
+
+        update(&mut state, UiEvent::Action(Action::SelectSession(current)));
+        state.status = Some("current status".into());
+
+        update(
+            &mut state,
+            UiEvent::RememberSessionFailed {
+                session: previous,
+                generation: old_generation,
+                message: "stale selection failed".into(),
+            },
+        );
+        assert_eq!(state.status.as_deref(), Some("current status"));
+
+        let reselection = update(&mut state, UiEvent::Action(Action::SelectSession(previous)));
+        let current_generation = reselection
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::RememberSession {
+                    session,
+                    generation,
+                } if *session == previous => Some(*generation),
+                _ => None,
+            })
+            .expect("reselection is remembered with a new generation");
+        assert_ne!(current_generation, old_generation);
+        state.status = Some("current status".into());
+
+        update(
+            &mut state,
+            UiEvent::RememberSessionFailed {
+                session: previous,
+                generation: old_generation,
+                message: "old visit failed".into(),
+            },
+        );
+        assert_eq!(state.status.as_deref(), Some("current status"));
+
+        update(
+            &mut state,
+            UiEvent::RememberSessionFailed {
+                session: previous,
+                generation: current_generation,
+                message: "current selection failed".into(),
+            },
+        );
+        assert_eq!(state.status.as_deref(), Some("current selection failed"));
     }
 }
 

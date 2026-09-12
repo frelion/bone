@@ -198,10 +198,19 @@ pub enum UiEvent {
         generation: u64,
         receipt: bone_app::SessionReleaseReceipt,
     },
-    OperationFailed {
-        kind: OperationKind,
-        session: Option<SessionId>,
-        generation: Option<u64>,
+    SessionOperationFailed {
+        kind: SessionOperationKind,
+        session: SessionId,
+        generation: u64,
+        message: String,
+    },
+    OverviewFailed {
+        generation: u64,
+        message: String,
+    },
+    RememberSessionFailed {
+        session: SessionId,
+        generation: u64,
         message: String,
     },
     CaretBlink,
@@ -212,7 +221,7 @@ pub enum UiEvent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OperationKind {
+pub enum SessionOperationKind {
     OpenSession,
     SaveDraft,
     RetryInput,
@@ -220,9 +229,7 @@ pub enum OperationKind {
     LoadHistory,
     LoadOlderHistory,
     ReloadRecentHistory,
-    RefreshOverview,
     ReleaseSession,
-    RememberSession,
 }
 
 #[derive(Debug)]
@@ -320,6 +327,7 @@ pub enum Effect {
     },
     RememberSession {
         session: SessionId,
+        generation: u64,
     },
     Shutdown,
 }

@@ -4,7 +4,7 @@ use bone_app::{App, CreateSessionRequest, Session, SessionId};
 use futures_util::{FutureExt, future::Shared};
 use tokio::{sync::mpsc, task::AbortHandle};
 
-use crate::state::{Effect, OperationKind, UiEvent, UiState};
+use crate::state::{Effect, SessionOperationKind, UiEvent, UiState};
 
 use super::summarize_overview;
 
@@ -298,11 +298,11 @@ impl Runtime {
                                 .await;
                         }
                         Err(_) => {
-                            send_failure(
+                            send_session_failure(
                                 &tx,
-                                OperationKind::OpenSession,
-                                Some(session),
-                                Some(generation),
+                                SessionOperationKind::OpenSession,
+                                session,
+                                generation,
                                 "Unable to open the session".into(),
                             )
                             .await
@@ -500,11 +500,11 @@ impl Runtime {
                                 .await;
                         }
                         Err(_) => {
-                            send_failure(
+                            send_session_failure(
                                 &tx,
-                                OperationKind::SaveDraft,
-                                Some(session),
-                                Some(generation),
+                                SessionOperationKind::SaveDraft,
+                                session,
+                                generation,
                                 "Your draft could not be saved".into(),
                             )
                             .await
@@ -567,11 +567,11 @@ impl Runtime {
                     }
                     .await;
                     if let Err(error) = retried {
-                        send_failure(
+                        send_session_failure(
                             &tx,
-                            OperationKind::RetryInput,
-                            Some(session),
-                            Some(generation),
+                            SessionOperationKind::RetryInput,
+                            session,
+                            generation,
                             error.to_string(),
                         )
                         .await;
@@ -586,22 +586,22 @@ impl Runtime {
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         if handle.stop().await.is_err() {
-                            send_failure(
+                            send_session_failure(
                                 &tx,
-                                OperationKind::Stop,
-                                Some(session),
-                                Some(generation),
+                                SessionOperationKind::Stop,
+                                session,
+                                generation,
                                 "Unable to stop the current work".into(),
                             )
                             .await;
                         }
                     });
                 } else {
-                    send_failure(
+                    send_session_failure(
                         &self.tx,
-                        OperationKind::Stop,
-                        Some(session),
-                        Some(generation),
+                        SessionOperationKind::Stop,
+                        session,
+                        generation,
                         "Unable to stop the current work because the session is not open".into(),
                     )
                     .await;
@@ -626,11 +626,11 @@ impl Runtime {
                                     .await;
                             }
                             Err(_) => {
-                                send_failure(
+                                send_session_failure(
                                     &tx,
-                                    OperationKind::LoadHistory,
-                                    Some(session),
-                                    Some(generation),
+                                    SessionOperationKind::LoadHistory,
+                                    session,
+                                    generation,
                                     "Unable to load recent activity".into(),
                                 )
                                 .await
@@ -638,11 +638,11 @@ impl Runtime {
                         }
                     });
                 } else {
-                    send_failure(
+                    send_session_failure(
                         &self.tx,
-                        OperationKind::LoadHistory,
-                        Some(session),
-                        Some(generation),
+                        SessionOperationKind::LoadHistory,
+                        session,
+                        generation,
                         "Unable to load recent activity because the session is not open".into(),
                     )
                     .await;
@@ -667,11 +667,11 @@ impl Runtime {
                                     .await;
                             }
                             Err(_) => {
-                                send_failure(
+                                send_session_failure(
                                     &tx,
-                                    OperationKind::LoadOlderHistory,
-                                    Some(session),
-                                    Some(generation),
+                                    SessionOperationKind::LoadOlderHistory,
+                                    session,
+                                    generation,
                                     "Unable to load older activity".into(),
                                 )
                                 .await
@@ -679,11 +679,11 @@ impl Runtime {
                         }
                     });
                 } else {
-                    send_failure(
+                    send_session_failure(
                         &self.tx,
-                        OperationKind::LoadOlderHistory,
-                        Some(session),
-                        Some(generation),
+                        SessionOperationKind::LoadOlderHistory,
+                        session,
+                        generation,
                         "Unable to load older activity because the session is not open".into(),
                     )
                     .await;
@@ -707,11 +707,11 @@ impl Runtime {
                                     .await;
                             }
                             Err(_) => {
-                                send_failure(
+                                send_session_failure(
                                     &tx,
-                                    OperationKind::ReloadRecentHistory,
-                                    Some(session),
-                                    Some(generation),
+                                    SessionOperationKind::ReloadRecentHistory,
+                                    session,
+                                    generation,
                                     "Unable to return to recent activity".into(),
                                 )
                                 .await
@@ -719,11 +719,11 @@ impl Runtime {
                         }
                     });
                 } else {
-                    send_failure(
+                    send_session_failure(
                         &self.tx,
-                        OperationKind::ReloadRecentHistory,
-                        Some(session),
-                        Some(generation),
+                        SessionOperationKind::ReloadRecentHistory,
+                        session,
+                        generation,
                         "Unable to return to recent activity because the session is not open"
                             .into(),
                     )
@@ -741,14 +741,12 @@ impl Runtime {
                             let _ = tx.send(UiEvent::OverviewLoaded { generation, rows }).await;
                         }
                         Err(_) => {
-                            send_failure(
-                                &tx,
-                                OperationKind::RefreshOverview,
-                                None,
-                                None,
-                                "Unable to refresh the workspace".into(),
-                            )
-                            .await
+                            let _ = tx
+                                .send(UiEvent::OverviewFailed {
+                                    generation,
+                                    message: "Unable to refresh the workspace".into(),
+                                })
+                                .await;
                         }
                     }
                 });
@@ -792,11 +790,11 @@ impl Runtime {
                                 .await;
                         }
                         Err(_) => {
-                            send_failure(
+                            send_session_failure(
                                 &tx,
-                                OperationKind::ReleaseSession,
-                                Some(session),
-                                Some(generation),
+                                SessionOperationKind::ReleaseSession,
+                                session,
+                                generation,
                                 "Unable to release the session".into(),
                             )
                             .await
@@ -804,7 +802,10 @@ impl Runtime {
                     }
                 });
             }
-            Effect::RememberSession { session } => {
+            Effect::RememberSession {
+                session,
+                generation,
+            } => {
                 if self
                     .app
                     .set_last_active_session(self.workspace, session)
@@ -813,10 +814,9 @@ impl Runtime {
                 {
                     let _ = self
                         .tx
-                        .send(UiEvent::OperationFailed {
-                            kind: OperationKind::RememberSession,
-                            session: Some(session),
-                            generation: None,
+                        .send(UiEvent::RememberSessionFailed {
+                            session,
+                            generation,
                             message: "Unable to remember the active session".into(),
                         })
                         .await;
@@ -956,10 +956,10 @@ impl Runtime {
                 generation,
                 receipt,
             } => Some((receipt.session, SessionOperationToken::Release(*generation))),
-            UiEvent::OperationFailed {
-                kind: OperationKind::ReleaseSession,
-                session: Some(session),
-                generation: Some(generation),
+            UiEvent::SessionOperationFailed {
+                kind: SessionOperationKind::ReleaseSession,
+                session,
+                generation,
                 ..
             } => Some((*session, SessionOperationToken::Release(*generation))),
             _ => None,
@@ -1115,15 +1115,15 @@ impl Runtime {
     }
 }
 
-async fn send_failure(
+async fn send_session_failure(
     tx: &mpsc::Sender<UiEvent>,
-    kind: OperationKind,
-    session: Option<SessionId>,
-    generation: Option<u64>,
+    kind: SessionOperationKind,
+    session: SessionId,
+    generation: u64,
     message: String,
 ) {
     let _ = tx
-        .send(UiEvent::OperationFailed {
+        .send(UiEvent::SessionOperationFailed {
             kind,
             session,
             generation,
@@ -1248,17 +1248,17 @@ mod lifecycle_tests {
         }
 
         for expected in [
-            OperationKind::Stop,
-            OperationKind::LoadHistory,
-            OperationKind::LoadOlderHistory,
-            OperationKind::ReloadRecentHistory,
+            SessionOperationKind::Stop,
+            SessionOperationKind::LoadHistory,
+            SessionOperationKind::LoadOlderHistory,
+            SessionOperationKind::ReloadRecentHistory,
         ] {
             assert!(matches!(
                 rx.recv().await,
-                Some(UiEvent::OperationFailed {
+                Some(UiEvent::SessionOperationFailed {
                     kind,
-                    session: Some(session),
-                    generation: Some(7),
+                    session,
+                    generation: 7,
                     ..
                 }) if kind == expected && session == id
             ));
@@ -1386,6 +1386,36 @@ mod lifecycle_tests {
             session: id,
             request: 22,
             result: Err("completed".into()),
+        });
+        assert!(!runtime.session_operations.contains_key(&id));
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_failure_clears_only_the_matching_runtime_token() {
+        let (_root, _app, session, mut runtime, _rx) = runtime_with_provisional_session().await;
+        let id = session.id();
+        runtime.session_operations.insert(
+            id,
+            PendingSessionOperation {
+                token: SessionOperationToken::Release(8),
+                barrier: ready_operation(),
+            },
+        );
+
+        runtime.accept_event(&UiEvent::SessionOperationFailed {
+            kind: SessionOperationKind::ReleaseSession,
+            session: id,
+            generation: 7,
+            message: "stale release failure".into(),
+        });
+        assert!(runtime.session_operations.contains_key(&id));
+
+        runtime.accept_event(&UiEvent::SessionOperationFailed {
+            kind: SessionOperationKind::ReleaseSession,
+            session: id,
+            generation: 8,
+            message: "current release failure".into(),
         });
         assert!(!runtime.session_operations.contains_key(&id));
         runtime.shutdown().await.unwrap();
