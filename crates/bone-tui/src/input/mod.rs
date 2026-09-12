@@ -284,13 +284,14 @@ mod small_window_tests {
     #[test]
     fn only_exit_and_resize_are_available_when_content_is_hidden() {
         let state = UiState::default();
-        let plan = LayoutPlan::calculate(
+        let plan = LayoutPlan::calculate_with_widths(
             ratatui::layout::Rect::new(0, 0, 39, 12),
             crate::layout::SinglePane::Conversation,
             0,
-            &[],
+            None,
             None,
             1,
+            crate::layout::PaneWidths::default(),
         );
         let snapshot = frame_for_layout(plan);
         assert!(
@@ -424,7 +425,7 @@ mod model_keyboard_tests {
             .draw(|frame| plan = Some(crate::view::render(frame, &state)))
             .unwrap();
         let plan = plan.unwrap();
-        let text = crate::layout::composer_text_area(plan.composer.unwrap());
+        let text = crate::layout::composer_text_area(plan.layout.composer.unwrap());
         let event = mapped_terminal_event(
             Event::Mouse(crossterm::event::MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -458,13 +459,14 @@ mod session_navigation_tests {
             mapped_key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state),
             Action::OpenCandidate
         ));
-        let plan = LayoutPlan::calculate(
+        let plan = LayoutPlan::calculate_with_widths(
             ratatui::layout::Rect::new(0, 0, 80, 20),
             crate::layout::SinglePane::Sessions,
-            0,
-            &[1; 30],
+            30,
             Some(0),
+            None,
             1,
+            crate::layout::PaneWidths::default(),
         );
         let snapshot = frame_for_layout(plan);
         let event = Event::Mouse(crossterm::event::MouseEvent {
@@ -602,7 +604,7 @@ mod selection_tests {
             .draw(|frame| plan = Some(crate::view::render(frame, &state)))
             .unwrap();
         let plan = plan.unwrap();
-        let area = crate::layout::composer_text_area(plan.composer.unwrap());
+        let area = crate::layout::composer_text_area(plan.layout.composer.unwrap());
         for (kind, x) in [
             (MouseEventKind::Down(MouseButton::Left), 2),
             (MouseEventKind::Drag(MouseButton::Left), 5),
@@ -868,16 +870,18 @@ mod pane_resize_tests {
                 &plan,
                 MouseEventKind::Drag(MouseButton::Left),
                 end,
-                plan.composer.unwrap().y + 1,
+                plan.layout.composer.unwrap().y + 1,
             );
             assert_eq!(state.dragging_divider, Some(divider));
             let resized = draw(&state, 160);
             match divider {
-                PaneDivider::Left => assert_eq!(resized.session_rail.unwrap().width, 52),
-                PaneDivider::Right => assert_eq!(resized.extension_blank.unwrap().width, 60),
+                PaneDivider::Left => assert_eq!(resized.layout.session_rail.unwrap().width, 52),
+                PaneDivider::Right => {
+                    assert_eq!(resized.layout.extension_blank.unwrap().width, 60)
+                }
             }
-            assert_eq!(resized.conversation.unwrap().width, 68);
-            assert_eq!(resized.composer.unwrap().width, 60);
+            assert_eq!(resized.layout.conversation.unwrap().width, 68);
+            assert_eq!(resized.layout.composer.unwrap().width, 60);
             mouse(
                 &mut state,
                 &resized,
@@ -925,7 +929,7 @@ mod pane_resize_tests {
             0,
         );
         assert_eq!(state.pane_widths.left, 64);
-        assert_eq!(draw(&state, 160).conversation.unwrap().width, 56);
+        assert_eq!(draw(&state, 160).layout.conversation.unwrap().width, 56);
         state.focus = Focus::RightRail;
         update(
             &mut state,
@@ -943,13 +947,13 @@ mod pane_resize_tests {
                 .iter()
                 .any(|hit| matches!(hit.target, HitTarget::PaneDivider(_)))
         );
-        assert_eq!(draw(&state, 120).session_rail.unwrap().width, 64);
-        assert_eq!(draw(&state, 100).session_rail.unwrap().width, 44);
-        assert_eq!(draw(&state, 160).session_rail.unwrap().width, 64);
+        assert_eq!(draw(&state, 120).layout.session_rail.unwrap().width, 64);
+        assert_eq!(draw(&state, 100).layout.session_rail.unwrap().width, 44);
+        assert_eq!(draw(&state, 160).layout.session_rail.unwrap().width, 64);
         // Explicit dragging after a window clamp keeps the opposite visible edge stationary.
         let small = draw(&state, 140);
-        let right = small.extension_blank.unwrap().width;
-        let edge = small.session_rail.unwrap().right() - 1;
+        let right = small.layout.extension_blank.unwrap().width;
+        let edge = small.layout.session_rail.unwrap().right() - 1;
         mouse(
             &mut state,
             &small,
@@ -964,13 +968,16 @@ mod pane_resize_tests {
             39,
             0,
         );
-        assert_eq!(draw(&state, 140).extension_blank.unwrap().width, right);
+        assert_eq!(
+            draw(&state, 140).layout.extension_blank.unwrap().width,
+            right
+        );
         let plan = draw(&state, 160);
         mouse(
             &mut state,
             &plan,
             MouseEventKind::Down(MouseButton::Left),
-            plan.extension_blank.unwrap().x,
+            plan.layout.extension_blank.unwrap().x,
             0,
         );
         mouse(

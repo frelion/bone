@@ -4,6 +4,16 @@ use std::{
 };
 
 #[test]
+fn library_exports_only_the_runner_contract() {
+    let public_items = include_str!("../src/lib.rs")
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub "))
+        .collect::<Vec<_>>();
+    assert_eq!(public_items, ["pub use run::{RunError, run};"]);
+}
+
+#[test]
 fn tui_manifest_has_no_product_backend_dependencies_besides_bone_app() {
     let manifest = include_str!("../Cargo.toml");
     for forbidden in [
@@ -157,6 +167,9 @@ fn visit_rust_sources(root: &Path, visit: &mut impl FnMut(&Path)) {
     for entry in fs::read_dir(root).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
+            if path.file_name().is_some_and(|name| name == "tests") {
+                continue;
+            }
             visit_rust_sources(&path, visit);
         } else if path.extension().is_some_and(|extension| extension == "rs") {
             visit(&path);

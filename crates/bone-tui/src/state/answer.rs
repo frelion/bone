@@ -33,15 +33,18 @@ impl AnswerDraft {
         }
     }
 
-    pub fn text(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn text(&self) -> &str {
         self.editor.text()
     }
 
-    pub fn cursor(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn cursor(&self) -> usize {
         self.editor.cursor()
     }
 
-    pub fn revision(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn revision(&self) -> u64 {
         self.editor.revision()
     }
 

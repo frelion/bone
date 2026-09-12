@@ -1,22 +1,31 @@
-//! Render a deterministic fixture through the production renderer.
-//! cargo run -p bone-tui --example preview -- 160 40 > preview.svg
-use bone_app::{
-    HistoryEntry, InputId, JobRef, RequestId, RuntimeId, RuntimeState, SessionEvent, SessionId,
-    SessionInfo, SessionSeq, SessionSummary, SessionView, WorkspaceId,
+//! Ignored artifact generator for deterministic production-renderer previews.
+//!
+//! The output path and terminal dimensions are required environment variables,
+//! so the test never chooses an implicit destination in the worktree.
+use std::{
+    collections::BTreeMap, env, fmt::Write as _, fs, path::PathBuf, sync::Arc, time::SystemTime,
 };
-use bone_tui::{
+
+use crate::{
     state::{
         Action, EditCommand, EditorTarget, Effect, Focus, SessionStatus, SessionUi, UiEvent,
         UiState, update,
     },
     view,
 };
+use bone_app::{
+    HistoryEntry, InputId, JobRef, RequestId, RuntimeId, RuntimeState, SessionEvent, SessionId,
+    SessionInfo, SessionSeq, SessionSummary, SessionView, WorkspaceId,
+};
 use ratatui::{
     Terminal,
     backend::TestBackend,
     style::{Color, Modifier},
 };
-use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
+
+const CELL_WIDTH: u16 = 9;
+const CELL_HEIGHT: u16 = 20;
+
 fn escaped(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -30,10 +39,27 @@ fn color(value: Color) -> String {
         _ => "#101010".into(),
     }
 }
-fn main() {
-    let args: Vec<_> = std::env::args().collect();
-    let w = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(160);
-    let h = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(40);
+
+fn required_dimension(name: &str) -> u16 {
+    env::var(name)
+        .unwrap_or_else(|_| panic!("{name} must be set"))
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} must be a positive u16"))
+}
+
+#[test]
+#[ignore = "writes a requested SVG artifact; run explicitly with preview environment variables"]
+fn render_preview_artifact() {
+    let width = required_dimension("BONE_TUI_PREVIEW_WIDTH");
+    let height = required_dimension("BONE_TUI_PREVIEW_HEIGHT");
+    assert!(width > 0, "BONE_TUI_PREVIEW_WIDTH must be positive");
+    assert!(height > 0, "BONE_TUI_PREVIEW_HEIGHT must be positive");
+    let output = PathBuf::from(
+        env::var_os("BONE_TUI_PREVIEW_OUTPUT")
+            .expect("BONE_TUI_PREVIEW_OUTPUT must name the SVG artifact"),
+    );
+    let scenario =
+        env::var("BONE_TUI_PREVIEW_SCENARIO").unwrap_or_else(|_| "conversation".to_owned());
     let workspace = WorkspaceId::new();
     let mut state = UiState::default();
     state.workspace = Some((workspace, "BONE".into()));
@@ -135,6 +161,24 @@ fn main() {
             event,
         });
     }
+    if scenario == "long-reply" {
+        for number in 1..=4 {
+            ui.history.push_back(HistoryEntry {
+                sequence: SessionSeq(ui.history.len() as u64 + 1),
+                occurred_at: ui.history.len() as i64,
+                event: SessionEvent::Reply {
+                    job: JobRef {
+                        runtime,
+                        id: number + 2,
+                    },
+                    inputs: Vec::new(),
+                    text: format!(
+                        "## Finding {number}\n\nThe draft remains attached to its session.\n\n```rust\nlet draft = session.draft();\nsave(draft).await?;\n```\n\n- Preserve pending text\n- Restore the reading position\n"
+                    ),
+                },
+            });
+        }
+    }
     state.session_ui.insert(ui.info.id, ui);
     update(
         &mut state,
@@ -146,7 +190,6 @@ fn main() {
             },
         }),
     );
-    let scenario = args.get(3).map(String::as_str).unwrap_or("conversation");
     if scenario == "commands" {
         update(
             &mut state,
@@ -165,7 +208,7 @@ fn main() {
                 },
             }),
         );
-    } else if matches!(scenario, "models" | "connection" | "form") {
+    } else if matches!(scenario.as_str(), "models" | "connection" | "form") {
         let effects = update(&mut state, UiEvent::Action(Action::OpenModels));
         for effect in effects {
             if let Effect::LoadModels { session, request } = effect {
@@ -180,7 +223,7 @@ fn main() {
                 );
             }
         }
-        if matches!(scenario, "connection" | "form") {
+        if matches!(scenario.as_str(), "connection" | "form") {
             update(&mut state, UiEvent::Action(Action::ActivatePanel));
         }
         if scenario == "form" {
@@ -190,12 +233,12 @@ fn main() {
     if scenario == "resized" {
         update(
             &mut state,
-            UiEvent::Action(Action::BeginPaneResize(bone_tui::layout::PaneDivider::Left)),
+            UiEvent::Action(Action::BeginPaneResize(crate::layout::PaneDivider::Left)),
         );
         update(
             &mut state,
             UiEvent::Action(Action::DragPane {
-                widths: bone_tui::layout::PaneWidths {
+                widths: crate::layout::PaneWidths {
                     left: 44,
                     right: 32,
                 },
@@ -203,7 +246,7 @@ fn main() {
             }),
         );
     }
-    match scenario {
+    match scenario.as_str() {
         "sessions" => {
             state.focus = Focus::Sessions;
             state.session_candidate = state.sessions.get(1).map(|session| session.id);
@@ -217,40 +260,46 @@ fn main() {
         "right" => state.focus = Focus::RightRail,
         _ => {}
     }
-    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|frame| {
             view::render(frame, &state);
         })
         .unwrap();
-    println!(
+    let mut svg = String::new();
+    writeln!(
+        svg,
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\"><rect width=\"100%\" height=\"100%\" fill=\"#101010\"/>",
-        w * 9,
-        h * 20
-    );
-    for y in 0..h {
+        width * CELL_WIDTH,
+        height * CELL_HEIGHT
+    )
+    .unwrap();
+    for y in 0..height {
         let mut x = 0;
-        while x < w {
+        while x < width {
             let cell = &terminal.backend().buffer()[(x, y)];
             let cells = unicode_width::UnicodeWidthStr::width(cell.symbol()).max(1) as u16;
-            println!(
+            writeln!(
+                svg,
                 "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"20\" fill=\"{}\"/>",
-                x * 9,
-                y * 20,
-                cells * 9,
+                x * CELL_WIDTH,
+                y * CELL_HEIGHT,
+                cells * CELL_WIDTH,
                 color(cell.bg)
-            );
+            )
+            .unwrap();
             x += cells;
         }
     }
-    for y in 0..h {
-        for x in 0..w {
+    for y in 0..height {
+        for x in 0..width {
             let cell = &terminal.backend().buffer()[(x, y)];
             if cell.symbol() != " " {
-                println!(
+                writeln!(
+                    svg,
                     "<text x=\"{}\" y=\"{}\" fill=\"{}\" font-family=\"DejaVu Sans Mono,WenQuanYi Zen Hei Mono,monospace\" font-size=\"14\" font-weight=\"{}\">{}</text>",
-                    x * 9,
-                    y * 20 + 15,
+                    x * CELL_WIDTH,
+                    y * CELL_HEIGHT + 15,
                     color(cell.fg),
                     if cell.modifier.contains(Modifier::BOLD) {
                         700
@@ -258,9 +307,12 @@ fn main() {
                         400
                     },
                     escaped(cell.symbol())
-                );
+                )
+                .unwrap();
             }
         }
     }
-    println!("</svg>");
+    svg.push_str("</svg>\n");
+    fs::write(&output, svg).expect("write preview SVG");
+    println!("wrote {}", output.display());
 }

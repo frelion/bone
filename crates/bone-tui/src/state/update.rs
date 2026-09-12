@@ -233,11 +233,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                         reply_to: None,
                     };
                     ui.submitting = Some(pending);
-                    effects.push(Effect::Submit {
-                        session,
-                        generation: ui.generation,
-                        input,
-                    });
+                    effects.push(Effect::Submit { session, input });
                 }
             }
         }
@@ -466,9 +462,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::Submitted {
             session,
-            generation: _,
             request_id,
-            ..
         } => {
             let manual_title = state.title_manual_intent.contains(&session);
             let mut auto_title = None;
@@ -519,7 +513,6 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::SubmitFailed {
             session,
-            generation: _,
             request_id,
             message,
         } => {
@@ -1143,11 +1136,6 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 }
             }
         }
-        Action::FollowTail => {
-            if let Some(ui) = state.selected_ui_mut() {
-                follow_transcript_tail(ui, effects);
-            }
-        }
         Action::Stop => effects.extend(stop_selected(state)),
         Action::Quit | Action::Terminate => {
             prepare_exit(state);
@@ -1312,7 +1300,6 @@ fn submit(state: &mut UiState, effects: &mut Vec<Effect>) {
     });
     effects.push(Effect::Submit {
         session: ui.info.id,
-        generation: ui.generation,
         input,
     });
 }
@@ -1455,7 +1442,6 @@ fn retry_submission(state: &mut UiState, effects: &mut Vec<Effect>) {
     pending.failed = false;
     effects.push(Effect::Submit {
         session: ui.info.id,
-        generation: ui.generation,
         input,
     });
     state.status = Some("Confirming the original submission; newer draft is preserved".into());
@@ -2949,12 +2935,7 @@ mod panel_draft_tests {
                 &mut state,
                 UiEvent::Submitted {
                     session,
-                    generation: 1,
                     request_id,
-                    receipt: bone_app::SubmissionReceipt {
-                        input: InputId(7),
-                        saved_at: SessionSeq(7),
-                    },
                 },
             );
             assert_eq!(state.draft(), text);
@@ -3683,7 +3664,6 @@ mod final_integration_regressions {
             &mut state,
             UiEvent::SubmitFailed {
                 session: background,
-                generation: 1,
                 request_id: request,
                 message: "background submission failed".into(),
             },
@@ -4879,12 +4859,7 @@ mod title_rename_tests {
             &mut state,
             UiEvent::Submitted {
                 session: first.id,
-                generation: 1,
                 request_id,
-                receipt: bone_app::SubmissionReceipt {
-                    input: bone_app::InputId(1),
-                    saved_at: bone_app::SessionSeq(1),
-                },
             },
         );
         assert!(
@@ -4927,12 +4902,7 @@ mod title_rename_tests {
             &mut state,
             UiEvent::Submitted {
                 session: first.id,
-                generation: 1,
                 request_id: submission,
-                receipt: bone_app::SubmissionReceipt {
-                    input: bone_app::InputId(2),
-                    saved_at: bone_app::SessionSeq(2),
-                },
             },
         );
         let auto_request = auto

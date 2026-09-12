@@ -22,7 +22,8 @@ mod session_rail;
 mod slash_palette;
 
 /// Render the conversational shell and return its exact pointer hit map.
-pub fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
+#[cfg(test)]
+pub(crate) fn render(frame: &mut Frame<'_>, state: &UiState) -> FrameSnapshot {
     render_with_view_state(frame, state, &mut ViewState::default())
 }
 

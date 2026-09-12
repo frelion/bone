@@ -924,7 +924,7 @@ mod tests {
         let (_, _, metrics) = render_width(&state, 40, 12);
         assert_eq!(metrics.anchor_at_start(metrics.start_row).unwrap(), anchor);
         state.selected_ui_mut().unwrap().transcript_metrics = Some(Arc::new(metrics));
-        let effects = update(&mut state, UiEvent::Action(Action::FollowTail));
+        let effects = update(&mut state, UiEvent::Action(Action::ScrollDown(usize::MAX)));
         assert!(state.selected_ui().unwrap().read_anchor.is_none());
         assert!(
             effects

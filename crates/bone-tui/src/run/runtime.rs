@@ -528,11 +528,7 @@ impl Runtime {
                 });
                 self.sessions.entry(session).or_default().draft_save = Some(task.abort_handle());
             }
-            Effect::Submit {
-                session,
-                generation,
-                input,
-            } => {
+            Effect::Submit { session, input } => {
                 let handle = self.session(session);
                 let app = self.app.clone();
                 let tx = self.tx.clone();
@@ -547,13 +543,11 @@ impl Runtime {
                     }
                     .await;
                     match submitted {
-                        Ok(receipt) => {
+                        Ok(_) => {
                             let _ = tx
                                 .send(UiEvent::Submitted {
                                     session,
-                                    generation,
                                     request_id,
-                                    receipt,
                                 })
                                 .await;
                         }
@@ -561,7 +555,6 @@ impl Runtime {
                             let _ = tx
                                 .send(UiEvent::SubmitFailed {
                                     session,
-                                    generation,
                                     request_id,
                                     message: "Your request was not sent; the draft has been kept"
                                         .into(),

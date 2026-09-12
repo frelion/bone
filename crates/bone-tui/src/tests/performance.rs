@@ -4,11 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bone_app::{HistoryEntry, HistoryPage, SessionEvent, SessionId, SessionInfo, WorkspaceId};
-use bone_tui::{
+use crate::{
     state::{Action, Focus, HISTORY_CACHE_BYTES, UiEvent, UiState},
     view,
 };
+use bone_app::{HistoryEntry, HistoryPage, SessionEvent, SessionId, SessionInfo, WorkspaceId};
 use ratatui::{Terminal, backend::TestBackend};
 
 const SESSION_COUNT: usize = 100;
@@ -38,7 +38,7 @@ fn populated_state() -> UiState {
         state.sessions.push(info.clone());
         state
             .session_ui
-            .insert(info.id, bone_tui::state::SessionUi::new(info, 1));
+            .insert(info.id, crate::state::SessionUi::new(info, 1));
     }
     state.selected = state.sessions.first().map(|session| session.id);
     state.focus = Focus::SessionTitle;
@@ -59,7 +59,7 @@ fn load_app_shaped_history(state: &mut UiState) {
             next_cursor: bone_app::SessionSeq(HISTORY_PER_SESSION as u64),
             has_more: false,
         };
-        black_box(bone_tui::state::update(
+        black_box(crate::state::update(
             state,
             UiEvent::HistoryLoaded {
                 session,
@@ -88,13 +88,13 @@ fn hundred_sessions_and_hundred_thousand_app_records_stay_bounded() {
         state
             .session_ui
             .values()
-            .all(|session| session.history.len() <= bone_tui::state::HISTORY_CACHE_ITEMS)
+            .all(|session| session.history.len() <= crate::state::HISTORY_CACHE_ITEMS)
     );
     assert!(retained_history_bytes(&state) <= HISTORY_CACHE_BYTES);
 
     for index in 0..2_000 {
         let session = state.sessions[index % SESSION_COUNT].id;
-        black_box(bone_tui::state::update(
+        black_box(crate::state::update(
             &mut state,
             UiEvent::Action(Action::SelectSession(session)),
         ));
@@ -124,7 +124,7 @@ fn input_to_frame_sample(state: &mut UiState, samples: usize) -> Vec<Duration> {
     (0..samples)
         .map(|index| {
             let started = Instant::now();
-            black_box(bone_tui::state::update(
+            black_box(crate::state::update(
                 state,
                 UiEvent::Action(if index % 2 == 0 {
                     Action::ScrollDown(1)
@@ -215,7 +215,7 @@ fn release_tui_performance_harness() {
     let switch_started = Instant::now();
     for index in 0..10_000 {
         let session = state.sessions[index % SESSION_COUNT].id;
-        black_box(bone_tui::state::update(
+        black_box(crate::state::update(
             &mut state,
             UiEvent::Action(Action::SelectSession(session)),
         ));

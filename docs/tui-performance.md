@@ -4,7 +4,7 @@
 
 ## 固定数据集与门禁
 
-性能测试位于 `crates/bone-tui/tests/performance.rs`，正文排版复杂度测试位于 `crates/bone-tui/src/view/components/paged_reader.rs`。
+性能测试位于 crate 内私有的 `crates/bone-tui/src/tests/performance.rs`，正文排版复杂度测试位于 `crates/bone-tui/src/view/components/paged_reader.rs`。
 
 - 会话与历史：100 个会话，每个会话注入 1,000 条 `HistoryEntry`，合计 100,000 条。数据通过与 App 返回完全相同的 `UiEvent::HistoryLoaded` / `HistoryPage` 契约进入 reducer；测试不直接修改历史缓存。
 - 会话切换：默认测试连续切换 2,000 次；手工 release 测试连续切换 10,000 次。
@@ -29,14 +29,14 @@
 运行默认资源门禁：
 
 ```sh
-cargo test -p bone-tui --test performance
+cargo test -p bone-tui --lib tests::performance
 cargo test -p bone-tui --lib one_mib_chinese_deep_scroll
 ```
 
 运行受控墙钟测量：
 
 ```sh
-cargo test --release -p bone-tui --test performance release_tui_performance_harness -- --ignored --nocapture
+cargo test --release -p bone-tui --lib tests::performance::release_tui_performance_harness -- --ignored --exact --nocapture
 ```
 
 应在机器空闲、无并行 Cargo 构建时运行。测试会打印操作系统、Rust、提交、工作树状态、p50、p95、最大值、历史缓存字节数，以及 Linux 上可获得的进程 RSS。首次 release 编译时间不计入样本。

@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-pub mod layout;
-pub mod state;
-pub mod view;
+mod layout;
+mod state;
+mod view;
 
 mod editor;
 mod input;
@@ -12,3 +12,6 @@ mod text;
 mod ui;
 
 pub use run::{RunError, run};
+
+#[cfg(test)]
+mod tests;

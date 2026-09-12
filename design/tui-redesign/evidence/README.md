@@ -22,7 +22,7 @@ ANSI 文件来自 `tmux capture-pane -p -e`，是屏幕状态，不是全部输�
 
 ## 长回复实验
 
-`long-reply-harness.rs` 调用 bone-tui 的公开 UiState / render 和 Ratatui TestBackend，加入四段 Markdown 回复，160×40 输出至 bone-long-fixture.txt。依赖：bone-tui 与 bone-app 本仓库路径、ratatui 0.29；edition 2024。临时 Cargo 项目不在产品工作区。
+`bone-long-fixture.txt` 由 2026-09-10 的一次性外部 harness 通过 Ratatui TestBackend 生成，作为当时的历史证据保留。TUI 内部 API 收缩后，该 harness 源码已删除；当前同类场景由 crate 内私有的 `tests::preview::render_preview_artifact` 生成 SVG，使用 `BONE_TUI_PREVIEW_SCENARIO=long-reply`，尺寸和输出路径也必须显式指定。
 
 该实验观察到 `##` 与代码围栏原样显示。它是 renderer fixture，不是 provider 流式回归，也没有据此判断工具执行能力。
 

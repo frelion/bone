@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bone_app::{
     HistoryCursor, HistoryPage, InputId, QuestionId, RecentHistoryPage, RequestId, SessionId,
-    SessionInfo, SessionSummary, SessionView, SubmissionReceipt, SubmitInput, WorkspaceId,
+    SessionInfo, SessionSummary, SessionView, SubmitInput, WorkspaceId,
 };
 
 use std::collections::BTreeMap;
@@ -107,7 +107,6 @@ pub enum Action {
         metrics: Option<Arc<TranscriptMetrics>>,
     },
     ScrollDown(usize),
-    FollowTail,
     Stop,
     Quit,
     Terminate,
@@ -202,13 +201,10 @@ pub enum UiEvent {
     },
     Submitted {
         session: SessionId,
-        generation: u64,
         request_id: RequestId,
-        receipt: SubmissionReceipt,
     },
     SubmitFailed {
         session: SessionId,
-        generation: u64,
         request_id: RequestId,
         message: String,
     },
@@ -329,7 +325,6 @@ pub enum Effect {
     },
     Submit {
         session: SessionId,
-        generation: u64,
         input: SubmitInput,
     },
     RetryInput {

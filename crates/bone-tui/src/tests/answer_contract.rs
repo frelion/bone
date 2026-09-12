@@ -1,11 +1,11 @@
+use crate::state::{
+    Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, SessionUi, UiEvent, UiState,
+    update,
+};
 use bone_app::{
     HistoryEntry, InputId, InputState, InputView, ModelSelection, Profile, ProfileId, QuestionId,
     RecentHistoryPage, RequestId, ResolvedModel, RuntimeConfig, RuntimeId, RuntimeState,
-    SessionEvent, SessionId, SessionInfo, SessionSeq, SessionView, SubmissionReceipt, WorkspaceId,
-};
-use bone_tui::state::{
-    Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, SessionUi, UiEvent, UiState,
-    update,
+    SessionEvent, SessionId, SessionInfo, SessionSeq, SessionView, WorkspaceId,
 };
 use std::sync::Arc;
 
@@ -103,12 +103,7 @@ fn receipt(s: &mut UiState, session: SessionId, request_id: RequestId) -> Vec<Ef
         s,
         UiEvent::Submitted {
             session,
-            generation: 1,
             request_id,
-            receipt: SubmissionReceipt {
-                input: InputId(2),
-                saved_at: SessionSeq(2),
-            },
         },
     )
 }
@@ -258,7 +253,6 @@ fn uncertain_answer_retry_reuses_request_and_preserves_later_text() {
         &mut s,
         UiEvent::SubmitFailed {
             session: id,
-            generation: 1,
             request_id: original.request_id,
             message: "uncertain".into(),
         },
@@ -348,7 +342,7 @@ fn quitting_preserves_answer_and_ordinary_draft_once_without_submitting() {
     let (mut state, id, question) = setup();
     act(&mut state, insert("ordinary draft"));
     let ui = state.session_ui.get_mut(&id).unwrap();
-    let mut answer = bone_tui::state::answer::AnswerDraft::new(question);
+    let mut answer = crate::state::answer::AnswerDraft::new(question);
     answer.replace("answer text".into(), 11);
     ui.answer_drafts.insert(question, answer);
     for _ in 0..2 {
@@ -367,7 +361,7 @@ fn quitting_preserves_answer_and_ordinary_draft_once_without_submitting() {
 fn converted_answer_is_not_copied_again_on_quit() {
     let (mut state, id, question) = setup();
     let ui = state.session_ui.get_mut(&id).unwrap();
-    let mut answer = bone_tui::state::answer::AnswerDraft::new(question);
+    let mut answer = crate::state::answer::AnswerDraft::new(question);
     answer.replace("converted answer".into(), 16);
     ui.answer_drafts.insert(question, answer);
     ui.selected_answer = Some(question);

@@ -238,7 +238,8 @@ pub struct SessionUi {
 }
 
 impl SessionUi {
-    pub fn draft(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn draft(&self) -> &str {
         self.draft.text()
     }
 

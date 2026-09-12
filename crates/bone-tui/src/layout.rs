@@ -341,25 +341,6 @@ pub(crate) fn attached_floating_panel_area(screen: Rect, composer: Rect, body_he
 }
 
 impl LayoutPlan {
-    pub fn calculate(
-        screen: Rect,
-        single_pane: SinglePane,
-        _slash_items: usize,
-        session_rows: &[u16],
-        selected_session: Option<usize>,
-        draft_lines: u16,
-    ) -> Self {
-        Self::calculate_with_widths(
-            screen,
-            single_pane,
-            session_rows.len(),
-            selected_session,
-            None,
-            draft_lines,
-            PaneWidths::default(),
-        )
-    }
-
     pub fn calculate_with_widths(
         screen: Rect,
         single_pane: SinglePane,
@@ -543,24 +524,26 @@ mod tests {
 
     #[test]
     fn responsive_layout_removes_blank_extension_first() {
-        let wide = LayoutPlan::calculate(
+        let wide = LayoutPlan::calculate_with_widths(
             Rect::new(0, 0, 160, 40),
             SinglePane::Conversation,
-            0,
-            &[2; 3],
+            3,
+            None,
             None,
             1,
+            PaneWidths::default(),
         );
         assert_eq!(wide.session_rail.unwrap().width, 32);
         assert_eq!(wide.extension_blank.unwrap().width, 40);
         assert_eq!(wide.conversation.unwrap().width, 88);
-        let medium = LayoutPlan::calculate(
+        let medium = LayoutPlan::calculate_with_widths(
             Rect::new(0, 0, 120, 40),
             SinglePane::Conversation,
-            0,
-            &[2; 3],
+            3,
+            None,
             None,
             1,
+            PaneWidths::default(),
         );
         assert!(medium.extension_blank.is_none());
         assert_eq!(medium.conversation.unwrap().width, 88);
@@ -569,13 +552,14 @@ mod tests {
     #[test]
     fn composer_is_always_inside_conversation() {
         for width in [40, 60, 99, 100, 139, 140, 180] {
-            let plan = LayoutPlan::calculate(
+            let plan = LayoutPlan::calculate_with_widths(
                 Rect::new(0, 0, width, 40),
                 SinglePane::Conversation,
-                5,
-                &[2; 8],
+                8,
+                None,
                 None,
                 1,
+                PaneWidths::default(),
             );
             let center = plan.conversation.unwrap();
             let composer = plan.composer.unwrap();
@@ -592,13 +576,14 @@ mod tests {
 
     #[test]
     fn blank_extension_has_no_session_geometry() {
-        let plan = LayoutPlan::calculate(
+        let plan = LayoutPlan::calculate_with_widths(
             Rect::new(0, 0, 180, 40),
             SinglePane::Conversation,
             4,
-            &[2; 4],
+            None,
             None,
             1,
+            PaneWidths::default(),
         );
         let blank = plan.extension_blank.unwrap();
         assert!(plan.session_rows.iter().all(|row| row.area.x < blank.x));

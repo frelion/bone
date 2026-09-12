@@ -1,7 +1,7 @@
-use std::{ops::Deref, sync::Arc};
+use std::sync::Arc;
 
 use crate::{
-    layout::{HitRegion, HitTarget, LayoutPlan, TranscriptMetrics},
+    layout::{HitTarget, LayoutPlan, TranscriptMetrics},
     ui::interaction::HitMap,
 };
 
@@ -84,7 +84,8 @@ impl FrameSnapshot {
         self.hits.hit(x, y)
     }
 
-    pub fn hit_regions(&self) -> &[HitRegion] {
+    #[cfg(test)]
+    pub(crate) fn hit_regions(&self) -> &[crate::layout::HitRegion] {
         self.hits.regions()
     }
 
@@ -94,13 +95,5 @@ impl FrameSnapshot {
 
     pub(crate) fn title_byte_origin(&self) -> Option<usize> {
         self.title_byte_origin
-    }
-}
-
-impl Deref for FrameSnapshot {
-    type Target = LayoutPlan;
-
-    fn deref(&self) -> &Self::Target {
-        &self.layout
     }
 }

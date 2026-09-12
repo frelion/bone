@@ -327,13 +327,14 @@ mod tests {
         state.session_candidate = Some(candidate.id);
         state.focus = Focus::Sessions;
         state.workspace = Some((workspace, "Workspace".into()));
-        let plan = LayoutPlan::calculate(
+        let plan = LayoutPlan::calculate_with_widths(
             Rect::new(0, 0, 120, 24),
             SinglePane::Conversation,
-            0,
-            &[4, 4],
-            Some(1),
             2,
+            Some(1),
+            None,
+            2,
+            crate::layout::PaneWidths::default(),
         );
         (state, plan)
     }
@@ -421,13 +422,14 @@ mod tests {
         let mut state = UiState::default();
         state.focus = Focus::Sessions;
         state.workspace = Some((WorkspaceId::new(), "Workspace".into()));
-        let plan = LayoutPlan::calculate(
+        let plan = LayoutPlan::calculate_with_widths(
             Rect::new(0, 0, 120, 24),
             SinglePane::Conversation,
             0,
-            &[],
+            None,
             None,
             1,
+            crate::layout::PaneWidths::default(),
         );
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         terminal

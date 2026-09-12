@@ -309,13 +309,13 @@ mod tests {
                 terminal
                     .draw(|frame| {
                         let plan = crate::view::render(frame, &state);
-                        let area = plan.composer.unwrap();
+                        let area = plan.layout.composer.unwrap();
                         let input = crate::layout::composer_text_area(area);
                         let footer = footer_areas(area, &state);
                         assert_eq!(input.y, area.y + 1);
                         assert_eq!(footer.model.y, input.bottom() + 2);
                         assert_eq!(action(area, &state).0.y, footer.model.y);
-                        assert!(plan.transcript.unwrap().height >= 3);
+                        assert!(plan.layout.transcript.unwrap().height >= 3);
                         assert!(area.height <= 9);
                         for y in [area.y, input.bottom()] {
                             for x in area.x + 1..area.right() {
@@ -364,7 +364,7 @@ mod tests {
             .draw(|frame| plan = Some(crate::view::render(frame, &state)))
             .unwrap();
 
-        let input = crate::layout::composer_text_area(plan.unwrap().composer.unwrap());
+        let input = crate::layout::composer_text_area(plan.unwrap().layout.composer.unwrap());
         let viewport = crate::editor::stable_editor_viewport(
             state.draft(),
             state.draft_cursor(),
@@ -464,7 +464,7 @@ mod tests {
                 })
                 .unwrap();
             let plan = plan.unwrap();
-            let area = plan.composer.unwrap();
+            let area = plan.layout.composer.unwrap();
             let geometry = footer_areas(area, &state);
             for offset in 0.."Select model".len().min(usize::from(geometry.model.width)) {
                 assert_eq!(
@@ -490,7 +490,7 @@ mod tests {
                 .draw(|frame| empty_plan = Some(crate::view::render(frame, &empty)))
                 .unwrap();
             let empty_plan = empty_plan.unwrap();
-            let empty_area = empty_plan.composer.unwrap();
+            let empty_area = empty_plan.layout.composer.unwrap();
             let empty_geometry = footer_areas(empty_area, &empty);
             if let Some(commands) = empty_geometry.commands {
                 let painted: String = (commands.x..commands.x + 10)

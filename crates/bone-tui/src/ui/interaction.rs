@@ -54,6 +54,7 @@ impl HitMap {
         self.regions.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn regions(&self) -> &[HitRegion] {
         &self.regions
     }

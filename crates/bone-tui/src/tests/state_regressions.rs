@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use bone_app::{
-    HistoryEntry, HistoryPage, RecentHistoryPage, RequestId, SessionEvent, SessionId, SessionInfo,
-    SessionReleaseReceipt, SessionReleaseStatus, SessionView, WorkspaceId,
-};
-use bone_tui::{
-    layout::{HitTarget, LayoutPlan, SinglePane},
+use crate::{
+    layout::{HitTarget, SinglePane},
     state::{
         Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, OperationKind, SessionStatus,
         SessionUi, UiEvent, UiState, update,
     },
     view,
+};
+use bone_app::{
+    HistoryEntry, HistoryPage, RecentHistoryPage, RequestId, SessionEvent, SessionId, SessionInfo,
+    SessionReleaseReceipt, SessionReleaseStatus, SessionView, WorkspaceId,
 };
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
@@ -118,12 +118,10 @@ fn stale_submit_failure_identity_cannot_mark_another_sessions_request_failed() {
             )
         });
 
-    let b_generation = state.session_ui[&b.id].generation;
     update(
         &mut state,
         UiEvent::SubmitFailed {
             session: b.id,
-            generation: b_generation,
             request_id: a_request,
             message: "stale A failure".into(),
         },
@@ -420,7 +418,7 @@ fn older_history_stays_capped_and_failure_releases_the_loading_latch() {
         },
     );
     let ui = &state.session_ui[&session.id];
-    assert_eq!(ui.history.len(), bone_tui::state::HISTORY_CACHE_ITEMS);
+    assert_eq!(ui.history.len(), crate::state::HISTORY_CACHE_ITEMS);
     assert!(ui.newer_history_missing);
 
     state.session_ui.get_mut(&session.id).unwrap().older_loading = true;
@@ -465,20 +463,21 @@ fn total_history_bytes_are_bounded_across_sessions_with_large_replies() {
     }
     let total: usize = state.session_ui.values().map(|ui| ui.history_bytes).sum();
     assert!(
-        total <= bone_tui::state::HISTORY_CACHE_BYTES,
+        total <= crate::state::HISTORY_CACHE_BYTES,
         "retained {total} bytes"
     );
 }
 
 #[test]
 fn rail_viewport_keeps_selection_visible_and_footer_hits_the_rail() {
-    let plan = LayoutPlan::calculate(
+    let plan = crate::layout::LayoutPlan::calculate_with_widths(
         Rect::new(0, 0, 120, 14),
         SinglePane::Conversation,
-        0,
-        &[4; 20],
+        20,
         Some(17),
+        None,
         1,
+        crate::layout::PaneWidths::default(),
     );
     assert!(plan.session_start > 0);
     assert!(plan.session_rows.iter().any(|row| row.index == 17));
@@ -502,7 +501,7 @@ fn rail_viewport_keeps_selection_visible_and_footer_hits_the_rail() {
     assert_eq!(state.session_candidate, Some(target));
     assert_eq!(state.focus, Focus::Sessions);
     let rendered = render_plan(&state, 120, 14);
-    let rail = rendered.session_rail.unwrap();
+    let rail = rendered.layout.session_rail.unwrap();
     assert_eq!(
         rendered.hit(rail.x + 1, rail.bottom() - 1),
         Some(HitTarget::SessionRail)

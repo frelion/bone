@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
-use bone_app::{
-    HistoryEntry, RecentHistoryPage, RequestId, SessionEvent, SessionId, SessionInfo, SessionView,
-    SubmissionReceipt, WorkspaceId,
-};
-use bone_tui::{
-    layout::{HitTarget, LayoutPlan, SinglePane},
+use crate::{
+    layout::{HitTarget, SinglePane},
     state::{
         Action, EditCommand, EditorTarget, Effect, Focus, SessionUi, UiEvent, UiState, update,
     },
     view,
+};
+use bone_app::{
+    HistoryEntry, RecentHistoryPage, RequestId, SessionEvent, SessionId, SessionInfo, SessionView,
+    WorkspaceId,
 };
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
@@ -163,15 +163,12 @@ fn drafts_and_submission_receipts_remain_bound_to_their_session_and_identity() {
     );
     update(&mut state, UiEvent::Action(Action::Focus(Focus::Composer)));
     update(&mut state, UiEvent::Action(insert("second draft")));
+    let generation = state.session_ui[&second.id].generation;
     let submitted = update(&mut state, UiEvent::Action(Action::Submit));
-    let (generation, request_id) = submitted
+    let request_id = submitted
         .iter()
         .find_map(|effect| match effect {
-            Effect::Submit {
-                session,
-                generation,
-                input,
-            } if *session == second.id => Some((*generation, input.request_id)),
+            Effect::Submit { session, input } if *session == second.id => Some(input.request_id),
             _ => None,
         })
         .expect("second-session submit");
@@ -180,12 +177,7 @@ fn drafts_and_submission_receipts_remain_bound_to_their_session_and_identity() {
         &mut state,
         UiEvent::Submitted {
             session: second.id,
-            generation,
             request_id: RequestId::new(),
-            receipt: SubmissionReceipt {
-                input: bone_app::InputId(9),
-                saved_at: bone_app::SessionSeq(9),
-            },
         },
     );
     assert_eq!(state.session_ui[&first.id].draft(), "first draft");
@@ -195,12 +187,7 @@ fn drafts_and_submission_receipts_remain_bound_to_their_session_and_identity() {
         &mut state,
         UiEvent::Submitted {
             session: second.id,
-            generation,
             request_id,
-            receipt: SubmissionReceipt {
-                input: bone_app::InputId(10),
-                saved_at: bone_app::SessionSeq(10),
-            },
         },
     );
     assert_eq!(state.session_ui[&first.id].draft(), "first draft");
@@ -251,13 +238,14 @@ fn public_focus_actions_restore_the_center_region_the_user_left() {
 #[test]
 fn composer_geometry_is_contained_by_the_center_surface() {
     for (width, height) in [(180, 44), (125, 30), (100, 30), (90, 24)] {
-        let plan = LayoutPlan::calculate(
+        let plan = crate::layout::LayoutPlan::calculate_with_widths(
             Rect::new(0, 0, width, height),
             SinglePane::Conversation,
-            0,
-            &[2; 2],
+            2,
+            None,
             None,
             1,
+            crate::layout::PaneWidths::default(),
         );
         let center = plan.conversation.expect("conversation area");
         let composer = plan.composer.expect("composer area");
@@ -268,10 +256,13 @@ fn composer_geometry_is_contained_by_the_center_surface() {
 #[test]
 fn right_rail_is_an_explicit_focus_target_without_phantom_actions() {
     let (_, plan) = render(&UiState::default(), 180, 44);
-    let blank = plan.extension_blank.expect("wide layout blank extension");
+    let blank = plan
+        .layout
+        .extension_blank
+        .expect("wide layout blank extension");
     assert_eq!(
         plan.hit(blank.x, blank.y),
-        Some(HitTarget::PaneDivider(bone_tui::layout::PaneDivider::Right))
+        Some(HitTarget::PaneDivider(crate::layout::PaneDivider::Right))
     );
     for y in blank.y..blank.bottom() {
         for x in blank.x.saturating_add(1)..blank.right() {
@@ -352,8 +343,8 @@ fn large_drafts_preserve_history_space_and_padding() {
             UiEvent::Action(insert("中文草稿\n".repeat(100))),
         );
         let (_, plan) = render(&state, w, h);
-        assert!(plan.transcript.unwrap().height >= 3);
-        assert!(plan.composer.unwrap().height <= 9);
+        assert!(plan.layout.transcript.unwrap().height >= 3);
+        assert!(plan.layout.composer.unwrap().height <= 9);
     }
 }
 #[test]
@@ -380,12 +371,10 @@ fn submission_receipt_survives_leaving_and_reopening_its_session() {
     let mut state = opened_state(&[first.clone(), second.clone()]);
     update(&mut state, UiEvent::Action(insert("original")));
     let effects = update(&mut state, UiEvent::Action(Action::Submit));
-    let (generation, request_id) = effects
+    let request_id = effects
         .iter()
         .find_map(|e| match e {
-            Effect::Submit {
-                generation, input, ..
-            } => Some((*generation, input.request_id)),
+            Effect::Submit { input, .. } => Some(input.request_id),
             _ => None,
         })
         .unwrap();
@@ -400,12 +389,7 @@ fn submission_receipt_survives_leaving_and_reopening_its_session() {
         &mut state,
         UiEvent::Submitted {
             session: first.id,
-            generation,
             request_id,
-            receipt: SubmissionReceipt {
-                input: bone_app::InputId(1),
-                saved_at: bone_app::SessionSeq(1),
-            },
         },
     );
     assert!(state.selected_ui().unwrap().submitting.is_none());
@@ -448,8 +432,8 @@ fn comfortable_session_targets_include_padding_but_exclude_inter_item_gaps() {
             Some(HitTarget::SessionRail)
         );
         if height >= 24 {
-            assert_eq!(plan.composer.unwrap().height, 6);
+            assert_eq!(plan.layout.composer.unwrap().height, 6);
         }
-        assert!(plan.transcript.unwrap().height >= 3);
+        assert!(plan.layout.transcript.unwrap().height >= 3);
     }
 }

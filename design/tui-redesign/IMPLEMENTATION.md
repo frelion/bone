@@ -22,10 +22,10 @@
 
 - `cargo test -p bone-tui --all-targets --all-features --locked`
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
-- `cargo test -p bone-tui --test performance --release --locked -- --ignored --nocapture`
-- `cargo run -p bone-tui --example preview -- 160 40 > preview.svg`
+- `cargo test -p bone-tui --lib --release --locked tests::performance::release_tui_performance_harness -- --ignored --exact --nocapture`
+- `BONE_TUI_PREVIEW_WIDTH=160 BONE_TUI_PREVIEW_HEIGHT=40 BONE_TUI_PREVIEW_SCENARIO=conversation BONE_TUI_PREVIEW_OUTPUT=preview.svg cargo test -p bone-tui --lib --locked tests::preview::render_preview_artifact -- --ignored --exact --nocapture`
 
-preview 使用生产 renderer + Ratatui TestBackend 输出单元格，是确定性示例数据，不是模型真实运行记录。PTY 测试另行启动真实 binary，检查键盘与终端恢复。
+crate 内私有的 preview 测试使用生产 renderer + Ratatui TestBackend 输出单元格，是确定性示例数据，不是模型真实运行记录。尺寸与输出文件均由显式环境变量指定；PTY 测试另行启动真实 binary，检查键盘与终端恢复。
 
 ## 范围
 
