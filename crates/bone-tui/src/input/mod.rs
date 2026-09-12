@@ -681,11 +681,13 @@ mod selection_tests {
             archived: false,
         };
         let mut state = UiState::default();
-        state.sessions.push(info.clone());
+        state
+            .session_rows
+            .push(crate::state::SessionNavRow::provisional(info.clone()));
         state.selected = Some(info.id);
         state
             .session_ui
-            .insert(info.id, crate::state::SessionUi::new(info, 1));
+            .insert(info.id, crate::state::SessionUi::new(info.id, 1));
         state.focus = Focus::SessionTitle;
         assert!(state.begin_title_edit());
 

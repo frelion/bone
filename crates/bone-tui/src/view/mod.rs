@@ -46,11 +46,11 @@ pub(crate) fn render_with_view_state(
     let selected_session = state
         .session_candidate
         .or(state.selected)
-        .and_then(|id| state.sessions.iter().position(|session| session.id == id));
+        .and_then(|id| state.session_rows.iter().position(|row| row.id() == id));
     let plan = LayoutPlan::calculate_with_widths(
         frame.area(),
         state.single_pane(),
-        state.sessions.len(),
+        state.session_rows.len(),
         selected_session,
         state.session_scroll,
         draft_lines,
@@ -112,13 +112,11 @@ fn composer_identity(state: &UiState) -> ComposerIdentity {
     };
     if let Some(answer) = ui.active_answer() {
         ComposerIdentity::Answer {
-            session: ui.info.id,
+            session: ui.id,
             question: answer.question,
         }
     } else {
-        ComposerIdentity::Session {
-            session: ui.info.id,
-        }
+        ComposerIdentity::Session { session: ui.id }
     }
 }
 
@@ -182,7 +180,7 @@ fn single_line_external(value: &str) -> String {
 #[cfg(test)]
 mod editor_view_state_tests {
     use super::*;
-    use crate::state::{CursorMove, EditCommand, SessionUi};
+    use crate::state::{CursorMove, EditCommand, SessionNavRow, SessionUi};
     use ratatui::{Terminal, backend::TestBackend};
 
     fn draw(state: &UiState, view_state: &mut ViewState, width: u16, height: u16) -> FrameSnapshot {
@@ -218,12 +216,15 @@ mod editor_view_state_tests {
             title: "second".into(),
             archived: false,
         };
-        let mut first_ui = SessionUi::new(first.clone(), 1);
+        let mut first_ui = SessionUi::new(first.id, 1);
         first_ui.draft = long_draft("first");
-        let mut second_ui = SessionUi::new(second.clone(), 1);
+        let mut second_ui = SessionUi::new(second.id, 1);
         second_ui.draft = long_draft("second");
         let mut state = UiState::default();
-        state.sessions = vec![first.clone(), second.clone()];
+        state.session_rows = vec![
+            SessionNavRow::provisional(first.clone()),
+            SessionNavRow::provisional(second.clone()),
+        ];
         state.selected = Some(first.id);
         state.session_candidate = Some(first.id);
         state.session_ui.insert(first.id, first_ui);

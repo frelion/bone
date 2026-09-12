@@ -52,12 +52,42 @@ impl CenterFocus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionStatus {
-    Ready,
-    Draft,
-    NeedsAttention,
-    Recoverable,
+#[derive(Clone, Debug)]
+pub(crate) struct SessionNavRow {
+    pub(crate) summary: SessionSummary,
+    pub(crate) needs_attention: bool,
+}
+
+impl SessionNavRow {
+    pub(crate) fn provisional(info: SessionInfo) -> Self {
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+            });
+        Self {
+            summary: SessionSummary {
+                session: info,
+                created_at,
+                message_count: 0,
+                latest_reply_preview: None,
+                projection_pending: false,
+                has_draft: false,
+                draft_bytes: 0,
+                persisted_runtime: None,
+                history_through: bone_app::SessionSeq(0),
+            },
+            needs_attention: false,
+        }
+    }
+
+    pub(crate) fn id(&self) -> SessionId {
+        self.summary.session.id
+    }
+
+    pub(crate) fn info(&self) -> &SessionInfo {
+        &self.summary.session
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,7 +241,7 @@ impl TitleEdit {
 
 #[derive(Clone, Debug)]
 pub struct SessionUi {
-    pub info: SessionInfo,
+    pub id: SessionId,
     pub generation: u64,
     pub snapshot: Option<Arc<SessionView>>,
     pub history: VecDeque<HistoryEntry>,
@@ -268,9 +298,9 @@ impl SessionUi {
         })
     }
 
-    pub fn new(info: SessionInfo, generation: u64) -> Self {
+    pub fn new(id: SessionId, generation: u64) -> Self {
         Self {
-            info,
+            id,
             generation,
             snapshot: None,
             history: VecDeque::new(),
@@ -362,9 +392,7 @@ pub struct UiState {
     pub workspace: Option<(WorkspaceId, String)>,
     pub model_label: Option<String>,
     pub model_facts: Option<ModelFacts>,
-    pub sessions: Vec<SessionInfo>,
-    pub(crate) session_summaries: BTreeMap<SessionId, SessionSummary>,
-    pub session_statuses: BTreeMap<SessionId, SessionStatus>,
+    pub(crate) session_rows: Vec<SessionNavRow>,
     pub selected: Option<SessionId>,
     pub session_candidate: Option<SessionId>,
     pub session_scroll: Option<usize>,
@@ -408,9 +436,7 @@ impl Default for UiState {
             workspace: None,
             model_label: None,
             model_facts: None,
-            sessions: Vec::new(),
-            session_summaries: BTreeMap::new(),
-            session_statuses: BTreeMap::new(),
+            session_rows: Vec::new(),
             selected: None,
             session_candidate: None,
             session_scroll: None,
@@ -463,35 +489,46 @@ impl UiState {
     /// Prepare the selected Session's title as a one-line editor. Re-entering
     /// the same title keeps any text that has not been committed yet.
     pub(crate) fn begin_title_edit(&mut self) -> bool {
-        let Some((session, committed_title)) = self
-            .selected_ui()
-            .map(|ui| (ui.info.id, ui.info.title.clone()))
-        else {
+        let Some(session) = self.selected.filter(|id| self.session_row(*id).is_some()) else {
             return false;
         };
         let target = session;
         if self.title_edit.as_ref().map(|edit| edit.target) != Some(target) {
             let title = self
-                .title_renames
-                .get(&session)
-                .and_then(TitleRenameQueue::desired)
-                .map_or(committed_title, str::to_owned);
+                .session_title(session)
+                .expect("selected Session has a navigation row")
+                .to_owned();
             self.title_edit = Some(TitleEdit::new(target, title));
         }
         true
     }
 
     pub(crate) fn title_text(&self) -> Option<&str> {
-        let selected = self.selected_ui()?;
+        let selected = self.selected?;
         if let Some(edit) = self
             .title_edit
             .as_ref()
-            .filter(|edit| edit.target == selected.info.id)
+            .filter(|edit| edit.target == selected)
         {
             Some(edit.editor.text())
         } else {
-            Some(selected.info.title.as_str())
+            self.session_title(selected)
         }
+    }
+
+    pub(crate) fn session_row(&self, id: SessionId) -> Option<&SessionNavRow> {
+        self.session_rows.iter().find(|row| row.id() == id)
+    }
+
+    pub(crate) fn session_row_mut(&mut self, id: SessionId) -> Option<&mut SessionNavRow> {
+        self.session_rows.iter_mut().find(|row| row.id() == id)
+    }
+
+    pub(crate) fn session_title(&self, id: SessionId) -> Option<&str> {
+        self.title_renames
+            .get(&id)
+            .and_then(TitleRenameQueue::desired)
+            .or_else(|| self.session_row(id).map(|row| row.info().title.as_str()))
     }
 
     pub(crate) fn title_editor_mut(&mut self) -> &mut crate::editor::EditorBuffer {
@@ -680,7 +717,7 @@ impl UiState {
     pub fn draft_identity(&self) -> (Option<SessionId>, u64) {
         self.selected_ui()
             .map_or((None, self.orphan_draft.revision()), |ui| {
-                (Some(ui.info.id), ui.draft.revision())
+                (Some(ui.id), ui.draft.revision())
             })
     }
 
@@ -755,7 +792,7 @@ mod model_fact_tests {
             title: "test".into(),
             archived: false,
         };
-        let mut ui = SessionUi::new(info.clone(), 1);
+        let mut ui = SessionUi::new(info.id, 1);
         ui.snapshot = Some(std::sync::Arc::new(bone_app::SessionView {
             session: info.clone(),
             runtime: bone_app::RuntimeState::Detached,

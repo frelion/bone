@@ -2,13 +2,11 @@
 //!
 //! The output path and terminal dimensions are required environment variables,
 //! so the test never chooses an implicit destination in the worktree.
-use std::{
-    collections::BTreeMap, env, fmt::Write as _, fs, path::PathBuf, sync::Arc, time::SystemTime,
-};
+use std::{env, fmt::Write as _, fs, path::PathBuf, sync::Arc, time::SystemTime};
 
 use crate::{
     state::{
-        Action, EditCommand, EditorTarget, Effect, Focus, SessionStatus, SessionUi, UiEvent,
+        Action, EditCommand, EditorTarget, Effect, Focus, SessionNavRow, SessionUi, UiEvent,
         UiState, update,
     },
     view,
@@ -64,27 +62,22 @@ fn render_preview_artifact() {
     let mut state = UiState::default();
     state.workspace = Some((workspace, "BONE".into()));
     state.model_label = Some("Worker · GPT-5.5".into());
-    for title in [
+    let sessions = [
         "草稿恢复",
         "Context engine",
         "修复启动错误",
         "API 超时处理",
         "工具权限",
         "会话存储",
-    ] {
-        state.sessions.push(SessionInfo {
-            id: SessionId::new(),
-            workspace,
-            title: title.into(),
-            archived: false,
-        });
-    }
-    state
-        .session_statuses
-        .insert(state.sessions[1].id, SessionStatus::NeedsAttention);
-    state
-        .session_statuses
-        .insert(state.sessions[2].id, SessionStatus::Draft);
+    ]
+    .into_iter()
+    .map(|title| SessionInfo {
+        id: SessionId::new(),
+        workspace,
+        title: title.into(),
+        archived: false,
+    })
+    .collect::<Vec<_>>();
     let now = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -101,41 +94,30 @@ fn render_preview_artifact() {
         (6, Some("权限确认只在真正需要时出现。")),
         (3, None),
     ];
-    let summaries = state
-        .sessions
-        .iter()
-        .cloned()
+    state.session_rows = sessions
+        .into_iter()
         .zip(previews)
         .enumerate()
-        .map(|(index, (session, (message_count, preview)))| {
-            let summary = SessionSummary {
-                session,
-                created_at: now - i64::try_from(index + 1).unwrap() * 5 * 60_000,
-                message_count,
-                latest_reply_preview: preview.map(str::to_owned),
-                projection_pending: false,
-                has_draft: index == 2,
-                draft_bytes: if index == 2 { 24 } else { 0 },
-                persisted_runtime: None,
-                history_through: SessionSeq(message_count),
-            };
-            (summary.session.id, summary)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let overview_sessions = state.sessions.clone();
-    let overview_statuses = state.session_statuses.clone();
-    update(
-        &mut state,
-        UiEvent::OverviewLoaded {
-            generation: 0,
-            sessions: overview_sessions,
-            statuses: overview_statuses,
-            summaries,
-        },
-    );
-    let info = state.sessions[0].clone();
+        .map(
+            |(index, (session, (message_count, preview)))| SessionNavRow {
+                summary: SessionSummary {
+                    session,
+                    created_at: now - i64::try_from(index + 1).unwrap() * 5 * 60_000,
+                    message_count,
+                    latest_reply_preview: preview.map(str::to_owned),
+                    projection_pending: false,
+                    has_draft: index == 2,
+                    draft_bytes: if index == 2 { 24 } else { 0 },
+                    persisted_runtime: None,
+                    history_through: SessionSeq(message_count),
+                },
+                needs_attention: index == 1,
+            },
+        )
+        .collect();
+    let info = state.session_rows[0].info().clone();
     state.selected = Some(info.id);
-    let mut ui = SessionUi::new(info.clone(), 1);
+    let mut ui = SessionUi::new(info.id, 1);
     ui.hydrated = true;
     ui.snapshot = Some(Arc::new(SessionView {
         session: info,
@@ -179,7 +161,7 @@ fn render_preview_artifact() {
             });
         }
     }
-    state.session_ui.insert(ui.info.id, ui);
+    state.session_ui.insert(ui.id, ui);
     update(
         &mut state,
         UiEvent::Action(Action::Edit {
@@ -249,7 +231,7 @@ fn render_preview_artifact() {
     match scenario.as_str() {
         "sessions" => {
             state.focus = Focus::Sessions;
-            state.session_candidate = state.sessions.get(1).map(|session| session.id);
+            state.session_candidate = state.session_rows.get(1).map(SessionNavRow::id);
         }
         "title" => {
             update(

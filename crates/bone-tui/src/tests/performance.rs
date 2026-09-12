@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    state::{Action, Focus, HISTORY_CACHE_BYTES, UiEvent, UiState},
+    state::{Action, Focus, HISTORY_CACHE_BYTES, SessionNavRow, UiEvent, UiState},
     view,
 };
 use bone_app::{HistoryEntry, HistoryPage, SessionEvent, SessionId, SessionInfo, WorkspaceId};
@@ -35,21 +35,23 @@ fn populated_state() -> UiState {
             title: format!("性能会话 {index:03}"),
             archived: false,
         };
-        state.sessions.push(info.clone());
+        state
+            .session_rows
+            .push(SessionNavRow::provisional(info.clone()));
         state
             .session_ui
-            .insert(info.id, crate::state::SessionUi::new(info, 1));
+            .insert(info.id, crate::state::SessionUi::new(info.id, 1));
     }
-    state.selected = state.sessions.first().map(|session| session.id);
+    state.selected = state.session_rows.first().map(SessionNavRow::id);
     state.focus = Focus::SessionTitle;
     state
 }
 
 fn load_app_shaped_history(state: &mut UiState) {
     let sessions = state
-        .sessions
+        .session_rows
         .iter()
-        .map(|session| session.id)
+        .map(SessionNavRow::id)
         .collect::<Vec<_>>();
     for session in sessions {
         let page = HistoryPage {
@@ -83,7 +85,7 @@ fn hundred_sessions_and_hundred_thousand_app_records_stay_bounded() {
     let mut state = populated_state();
     load_app_shaped_history(&mut state);
 
-    assert_eq!(state.sessions.len(), SESSION_COUNT);
+    assert_eq!(state.session_rows.len(), SESSION_COUNT);
     assert!(
         state
             .session_ui
@@ -93,7 +95,7 @@ fn hundred_sessions_and_hundred_thousand_app_records_stay_bounded() {
     assert!(retained_history_bytes(&state) <= HISTORY_CACHE_BYTES);
 
     for index in 0..2_000 {
-        let session = state.sessions[index % SESSION_COUNT].id;
+        let session = state.session_rows[index % SESSION_COUNT].id();
         black_box(crate::state::update(
             &mut state,
             UiEvent::Action(Action::SelectSession(session)),
@@ -214,7 +216,7 @@ fn release_tui_performance_harness() {
 
     let switch_started = Instant::now();
     for index in 0..10_000 {
-        let session = state.sessions[index % SESSION_COUNT].id;
+        let session = state.session_rows[index % SESSION_COUNT].id();
         black_box(crate::state::update(
             &mut state,
             UiEvent::Action(Action::SelectSession(session)),

@@ -3,7 +3,8 @@ use std::sync::Arc;
 use crate::{
     layout::{HitTarget, SinglePane},
     state::{
-        Action, EditCommand, EditorTarget, Effect, Focus, SessionUi, UiEvent, UiState, update,
+        Action, EditCommand, EditorTarget, Effect, Focus, SessionNavRow, SessionUi, UiEvent,
+        UiState, update,
     },
     view,
 };
@@ -27,10 +28,14 @@ fn opened_state(infos: &[SessionInfo]) -> UiState {
     state.workspace = infos
         .first()
         .map(|info| (info.workspace, "contract workspace".into()));
-    state.sessions = infos.to_vec();
+    state.session_rows = infos
+        .iter()
+        .cloned()
+        .map(SessionNavRow::provisional)
+        .collect();
     state.selected = infos.first().map(|info| info.id);
     for info in infos {
-        let mut ui = SessionUi::new(info.clone(), 1);
+        let mut ui = SessionUi::new(info.id, 1);
         ui.snapshot = Some(snapshot(info, ""));
         ui.hydrated = true;
         state.session_ui.insert(info.id, ui);
@@ -415,7 +420,7 @@ fn too_small_has_no_invisible_pointer_actions() {
 fn comfortable_session_targets_include_padding_but_exclude_inter_item_gaps() {
     let workspace = WorkspaceId::new();
     let state = opened_state(&[session(workspace, "first"), session(workspace, "second")]);
-    let first = state.sessions[0].id;
+    let first = state.session_rows[0].id();
     for height in [12, 23, 24, 40] {
         let (_, plan) = render(&state, 120, height);
         let row = plan

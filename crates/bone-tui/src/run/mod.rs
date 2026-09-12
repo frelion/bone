@@ -2,7 +2,13 @@ mod launch;
 pub(crate) mod models;
 mod runtime;
 
-use std::{collections::VecDeque, env, future::Future, io, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    env,
+    future::Future,
+    io,
+    time::Duration,
+};
 
 use bone_app::{App, AppOptions, AttentionItem, WorkspaceOverview};
 use crossterm::event::{Event, EventStream};
@@ -12,7 +18,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     input::terminal_event,
-    state::{Action, Effect, SessionStatus, UiEvent, UiState, update},
+    state::{Action, Effect, SessionNavRow, UiEvent, UiState, update},
     terminal::{PanicSignal, TerminalSession},
 };
 
@@ -68,7 +74,7 @@ pub async fn run() -> Result<(), RunError> {
         .desired
         .ok()
         .map(|config| config.worker.selection.model);
-    let (sessions, statuses, summaries) = summarize_overview(&overview);
+    let rows = summarize_overview(&overview);
 
     let (tx, mut rx) = mpsc::channel(256);
     let (ready_tx, mut ready_rx) = mpsc::channel::<SessionReady>(16);
@@ -85,11 +91,9 @@ pub async fn run() -> Result<(), RunError> {
         UiEvent::WorkspaceOpened {
             id: workspace.id,
             label,
-            sessions,
+            rows,
             last_active,
             model_label,
-            statuses,
-            summaries,
         },
     ));
 
@@ -436,46 +440,24 @@ fn render_dirty(
     Ok(())
 }
 
-fn summarize_overview(
-    overview: &WorkspaceOverview,
-) -> (
-    Vec<bone_app::SessionInfo>,
-    std::collections::BTreeMap<bone_app::SessionId, SessionStatus>,
-    std::collections::BTreeMap<bone_app::SessionId, bone_app::SessionSummary>,
-) {
-    let mut statuses = overview
-        .sessions
+fn summarize_overview(overview: &WorkspaceOverview) -> Vec<SessionNavRow> {
+    let attention = overview
+        .attention
         .iter()
-        .map(|summary| {
-            let status = if summary.persisted_runtime.is_some() {
-                SessionStatus::Recoverable
-            } else if summary.has_draft {
-                SessionStatus::Draft
-            } else {
-                SessionStatus::Ready
-            };
-            (summary.session.id, status)
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    for item in &overview.attention {
-        let session = match item {
+        .map(|item| match item {
             AttentionItem::WaitingForUser { session, .. }
             | AttentionItem::UnresolvedWrite { session, .. } => *session,
-        };
-        statuses.insert(session, SessionStatus::NeedsAttention);
-    }
-    let sessions = overview
-        .sessions
-        .iter()
-        .map(|summary| summary.session.clone())
-        .collect();
-    let summaries = overview
+        })
+        .collect::<BTreeSet<_>>();
+    overview
         .sessions
         .iter()
         .cloned()
-        .map(|summary| (summary.session.id, summary))
-        .collect();
-    (sessions, statuses, summaries)
+        .map(|summary| SessionNavRow {
+            needs_attention: attention.contains(&summary.session.id),
+            summary,
+        })
+        .collect()
 }
 
 async fn wait_for_draft_flush<T>(

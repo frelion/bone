@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     layout::{HitTarget, SinglePane},
     state::{
-        Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, OperationKind, SessionStatus,
+        Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, OperationKind, SessionNavRow,
         SessionUi, UiEvent, UiState, update,
     },
     view,
@@ -41,10 +41,14 @@ fn opened(infos: &[SessionInfo]) -> UiState {
     state.workspace = infos
         .first()
         .map(|item| (item.workspace, "regression workspace".into()));
-    state.sessions = infos.to_vec();
+    state.session_rows = infos
+        .iter()
+        .cloned()
+        .map(SessionNavRow::provisional)
+        .collect();
     state.selected = infos.first().map(|item| item.id);
     for item in infos {
-        let mut ui = SessionUi::new(item.clone(), 1);
+        let mut ui = SessionUi::new(item.id, 1);
         ui.snapshot = Some(snapshot(item, 0));
         ui.hydrated = true;
         state.session_ui.insert(item.id, ui);
@@ -516,16 +520,13 @@ fn session_rail_renders_draft_attention_and_recoverable_statuses() {
     let recoverable = info(workspace, "recoverable session");
     let mut state = UiState::default();
     state.workspace = Some((workspace, "status workspace".into()));
-    state.sessions = vec![draft.clone(), attention.clone(), recoverable.clone()];
-    state
-        .session_statuses
-        .insert(draft.id, SessionStatus::Draft);
-    state
-        .session_statuses
-        .insert(attention.id, SessionStatus::NeedsAttention);
-    state
-        .session_statuses
-        .insert(recoverable.id, SessionStatus::Recoverable);
+    let mut draft = SessionNavRow::provisional(draft);
+    draft.summary.has_draft = true;
+    let mut attention = SessionNavRow::provisional(attention);
+    attention.needs_attention = true;
+    let mut recoverable = SessionNavRow::provisional(recoverable);
+    recoverable.summary.persisted_runtime = Some(bone_app::RuntimeId::new());
+    state.session_rows = vec![draft, attention, recoverable];
 
     let backend = TestBackend::new(120, 20);
     let mut terminal = Terminal::new(backend).expect("test terminal");

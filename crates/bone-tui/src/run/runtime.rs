@@ -715,15 +715,8 @@ impl Runtime {
                 tokio::spawn(async move {
                     match app.workspace_overview(workspace).await {
                         Ok(overview) => {
-                            let (sessions, statuses, summaries) = summarize_overview(&overview);
-                            let _ = tx
-                                .send(UiEvent::OverviewLoaded {
-                                    generation,
-                                    sessions,
-                                    statuses,
-                                    summaries,
-                                })
-                                .await;
+                            let rows = summarize_overview(&overview);
+                            let _ = tx.send(UiEvent::OverviewLoaded { generation, rows }).await;
                         }
                         Err(_) => {
                             send_failure(
@@ -1048,7 +1041,7 @@ impl Runtime {
             let ui = state
                 .session_ui
                 .entry(info.id)
-                .or_insert_with(|| crate::state::SessionUi::new(info.clone(), 0));
+                .or_insert_with(|| crate::state::SessionUi::new(info.id, 0));
             let editor = std::mem::take(&mut state.orphan_draft);
             state.orphan_draft.revision = editor.revision().wrapping_add(1);
             ui.draft = editor;
@@ -1063,8 +1056,10 @@ impl Runtime {
             {
                 state.pending_create = None;
             }
-            if !state.sessions.iter().any(|known| known.id == info.id) {
-                state.sessions.insert(0, info.clone());
+            if state.session_row(info.id).is_none() {
+                state
+                    .session_rows
+                    .insert(0, crate::state::SessionNavRow::provisional(info));
             }
             self.retain_session(session);
             self.exit_draft_request = None;

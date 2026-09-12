@@ -206,11 +206,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) -> usize {
         state
             .title_edit
             .as_ref()
-            .filter(|edit| {
-                state
-                    .selected_ui()
-                    .is_some_and(|ui| edit.target == ui.info.id)
-            })
+            .filter(|edit| state.selected_ui().is_some_and(|ui| edit.target == ui.id))
             .map_or_else(
                 || (single_line_external(fallback), 0, Vec::new(), 0),
                 |edit| {
@@ -593,12 +589,13 @@ mod tests {
         let selected_from = title.find('z').unwrap();
         let session = state.selected.unwrap();
         state
-            .sessions
+            .session_rows
             .iter_mut()
-            .find(|info| info.id == session)
+            .find(|row| row.id() == session)
             .unwrap()
+            .summary
+            .session
             .title = title.into();
-        state.session_ui.get_mut(&session).unwrap().info.title = title.into();
         state.focus = crate::state::Focus::SessionTitle;
         state.caret_visible = true;
         assert!(state.begin_title_edit());
@@ -719,11 +716,13 @@ mod tests {
             history_through: SessionSeq(0),
             problem: None,
         };
-        let mut ui = SessionUi::new(info.clone(), 1);
+        let mut ui = SessionUi::new(info.id, 1);
         ui.snapshot = Some(Arc::new(snapshot));
         let mut state = UiState::default();
         state.selected = Some(info.id);
-        state.sessions.push(info.clone());
+        state
+            .session_rows
+            .push(crate::state::SessionNavRow::provisional(info.clone()));
         state.session_ui.insert(info.id, ui);
         (state, q)
     }

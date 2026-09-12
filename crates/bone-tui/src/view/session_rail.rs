@@ -1,6 +1,6 @@
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan},
-    state::{Focus, SessionStatus, UiState},
+    state::{Focus, UiState},
     ui::{
         focus,
         interaction::HitMap,
@@ -20,10 +20,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // Status is deliberately a compact semantic dot in the fixed three-line row;
 // it must never displace the reply preview or message/time metadata.
 pub(super) fn status_tone(state: &UiState, index: usize) -> Option<Color> {
-    let info = &state.sessions[index];
+    let row = &state.session_rows[index];
+    let session = row.id();
     if let Some(snapshot) = state
         .session_ui
-        .get(&info.id)
+        .get(&session)
         .and_then(|ui| ui.snapshot.as_ref())
     {
         if let Some(problem) = &snapshot.problem {
@@ -49,15 +50,17 @@ pub(super) fn status_tone(state: &UiState, index: usize) -> Option<Color> {
     }
     if state
         .session_ui
-        .get(&info.id)
+        .get(&session)
         .is_some_and(|ui| ui.working())
     {
-        return (state.selected != Some(info.id)).then_some(theme::INFO);
+        return (state.selected != Some(session)).then_some(theme::INFO);
     }
-    match state.session_statuses.get(&info.id) {
-        Some(SessionStatus::NeedsAttention) => Some(theme::WARNING),
-        Some(SessionStatus::Recoverable) => Some(theme::INFO),
-        _ => None,
+    if row.needs_attention {
+        Some(theme::WARNING)
+    } else if row.summary.persisted_runtime.is_some() {
+        Some(theme::INFO)
+    } else {
+        None
     }
 }
 
@@ -77,7 +80,7 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
         .map(|(_, name)| single_line_external(name))
         .unwrap_or_else(|| "BONE".into());
     let header = Rect::new(area.x + 3, area.y + 1, area.width.saturating_sub(6), 1);
-    let header_background = if active && state.sessions.iter().all(|session| session.archived) {
+    let header_background = if active && state.session_rows.iter().all(|row| row.info().archived) {
         SELECTED
     } else {
         RAIL
@@ -96,10 +99,10 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
         .map_or(0, |duration| duration.as_millis() as i64);
     for row in &plan.session_rows {
         render_session_row(frame, plan, state, row.index, row.area, active, now);
-        if let Some(session) = state.sessions.get(row.index) {
+        if let Some(session) = state.session_rows.get(row.index) {
             hits.push(HitRegion {
                 area: row.area,
-                target: HitTarget::Session(session.id),
+                target: HitTarget::Session(session.id()),
             });
         }
     }
@@ -126,34 +129,31 @@ fn render_session_row(
     rail_active: bool,
     now: i64,
 ) {
-    let info = &state.sessions[index];
-    let current = state.selected == Some(info.id);
-    let candidate = rail_active && state.session_candidate.or(state.selected) == Some(info.id);
+    let row = &state.session_rows[index];
+    let info = row.info();
+    let current = state.selected == Some(row.id());
+    let candidate = rail_active && state.session_candidate.or(state.selected) == Some(row.id());
     let background = if candidate { SELECTED } else { RAIL };
     frame.render_widget(Block::default().style(theme::surface(background)), area);
 
-    let summary = state.session_summaries.get(&info.id);
-    let pending = summary.is_some_and(|summary| summary.projection_pending);
+    let summary = &row.summary;
+    let pending = summary.projection_pending;
     let preview = if pending {
         "Loading history…".into()
     } else {
         summary
-            .and_then(|summary| summary.latest_reply_preview.as_deref())
+            .latest_reply_preview
+            .as_deref()
             .map(single_line_external)
             .filter(|preview| !preview.trim().is_empty())
             .unwrap_or_else(|| "No replies yet".into())
     };
-    let created = summary.map_or(0, |summary| summary.created_at);
-    let count = summary.map_or_else(
-        || "0 msgs".to_owned(),
-        |summary| {
-            if pending {
-                "… msgs".to_owned()
-            } else {
-                format!("{} msgs", summary.message_count)
-            }
-        },
-    );
+    let created = summary.created_at;
+    let count = if pending {
+        "… msgs".to_owned()
+    } else {
+        format!("{} msgs", summary.message_count)
+    };
     let meta = format!("{count}  ·  {}", format_created_at(created, now));
     let content = Rect::new(
         area.x + 2,
@@ -163,8 +163,10 @@ fn render_session_row(
     );
     if content.height > 0 {
         frame.render_widget(
-            Paragraph::new(single_line_external(&info.title))
-                .style(theme::label_on(INK, background)),
+            Paragraph::new(single_line_external(
+                state.session_title(row.id()).unwrap_or(&info.title),
+            ))
+            .style(theme::label_on(INK, background)),
             Rect::new(content.x, content.y, content.width, 1),
         );
     }
@@ -188,16 +190,10 @@ fn render_session_row(
                 .set_style(theme::surface(theme::FOCUS_MARK));
         }
     }
-    let draft = state.session_ui.get(&info.id).map_or_else(
-        || {
-            summary.is_some_and(|summary| summary.has_draft)
-                || matches!(
-                    state.session_statuses.get(&info.id),
-                    Some(SessionStatus::Draft)
-                )
-        },
-        |ui| !ui.draft.is_empty(),
-    );
+    let draft = state
+        .session_ui
+        .get(&row.id())
+        .map_or(summary.has_draft, |ui| !ui.draft.is_empty());
     let tone = status_tone(state, index).or(draft.then_some(MUTED));
     if let Some(tone) = tone
         && area.width > 1
@@ -276,7 +272,10 @@ pub(super) fn problem_status(problem: &bone_app::AppProblem) -> (&'static str, C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{layout::SinglePane, state::Focus};
+    use crate::{
+        layout::SinglePane,
+        state::{Focus, SessionNavRow},
+    };
     use bone_app::{SessionId, SessionInfo, SessionSeq, SessionSummary, WorkspaceId};
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -295,8 +294,7 @@ mod tests {
             archived: false,
         };
         let mut state = UiState::default();
-        state.sessions = vec![current.clone(), candidate.clone()];
-        state.session_summaries = [
+        state.session_rows = [
             SessionSummary {
                 session: current.clone(),
                 created_at: 1_725_523_200_000,
@@ -321,7 +319,10 @@ mod tests {
             },
         ]
         .into_iter()
-        .map(|summary| (summary.session.id, summary))
+        .map(|summary| SessionNavRow {
+            summary,
+            needs_attention: false,
+        })
         .collect();
         state.selected = Some(current.id);
         state.session_candidate = Some(candidate.id);
@@ -394,12 +395,7 @@ mod tests {
     #[test]
     fn pending_projection_never_presents_partial_history_as_complete() {
         let (mut state, plan) = fixture();
-        let candidate = state.sessions[1].id;
-        state
-            .session_summaries
-            .get_mut(&candidate)
-            .unwrap()
-            .projection_pending = true;
+        state.session_rows[1].summary.projection_pending = true;
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         terminal
             .draw(|frame| render(frame, &plan, &mut HitMap::default(), &state))

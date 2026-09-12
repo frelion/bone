@@ -2,12 +2,10 @@ use std::sync::Arc;
 
 use bone_app::{
     HistoryCursor, HistoryPage, InputId, QuestionId, RecentHistoryPage, RequestId, SessionId,
-    SessionInfo, SessionSummary, SessionView, SubmitInput, WorkspaceId,
+    SessionInfo, SessionView, SubmitInput, WorkspaceId,
 };
 
-use std::collections::BTreeMap;
-
-use super::model::{Focus, SessionStatus};
+use super::model::{Focus, SessionNavRow};
 use crate::layout::TranscriptMetrics;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,11 +151,9 @@ pub enum UiEvent {
     WorkspaceOpened {
         id: WorkspaceId,
         label: String,
-        sessions: Vec<SessionInfo>,
+        rows: Vec<SessionNavRow>,
         last_active: Option<SessionId>,
         model_label: Option<String>,
-        statuses: BTreeMap<SessionId, SessionStatus>,
-        summaries: BTreeMap<SessionId, SessionSummary>,
     },
     SessionOpened {
         session: SessionId,
@@ -189,9 +185,7 @@ pub enum UiEvent {
     PersistDraftsRequested,
     OverviewLoaded {
         generation: u64,
-        sessions: Vec<SessionInfo>,
-        statuses: BTreeMap<SessionId, SessionStatus>,
-        summaries: BTreeMap<SessionId, SessionSummary>,
+        rows: Vec<SessionNavRow>,
     },
     DraftSaved {
         session: SessionId,

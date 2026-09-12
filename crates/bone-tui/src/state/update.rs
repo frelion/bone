@@ -164,26 +164,26 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
         UiEvent::WorkspaceOpened {
             id,
             label,
-            sessions,
+            rows,
             last_active,
             model_label,
-            statuses,
-            summaries,
         } => {
             state.workspace = Some((id, label));
             state.model_label = model_label;
-            state.session_statuses = statuses;
-            state.session_summaries = summaries;
-            state.sessions = sessions;
+            state.session_rows = rows;
             let preferred = last_active.filter(|candidate| {
                 state
-                    .sessions
+                    .session_rows
                     .iter()
-                    .any(|s| s.id == *candidate && !s.archived)
+                    .any(|row| row.id() == *candidate && !row.info().archived)
             });
-            if let Some(session) =
-                preferred.or_else(|| state.sessions.iter().find(|s| !s.archived).map(|s| s.id))
-            {
+            if let Some(session) = preferred.or_else(|| {
+                state
+                    .session_rows
+                    .iter()
+                    .find(|row| !row.info().archived)
+                    .map(SessionNavRow::id)
+            }) {
                 select_session(state, session, &mut effects);
             }
         }
@@ -198,7 +198,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 .get(&session)
                 .is_some_and(|ui| ui.generation == generation)
             {
-                merge_authoritative_session_title(state, session, &snapshot.session.title);
+                merge_authoritative_session_info(state, session, &snapshot.session);
             }
             if let Some(ui) = current_generation_mut(state, session, generation) {
                 if !ui.hydrated {
@@ -258,13 +258,10 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 .get(&session)
                 .is_some_and(|ui| ui.generation == generation)
             {
-                merge_authoritative_session_title(state, session, &snapshot.session.title);
+                merge_authoritative_session_info(state, session, &snapshot.session);
             }
             if let Some(ui) = current_generation_mut(state, session, generation) {
                 let through = snapshot.history_through;
-                let title = ui.info.title.clone();
-                ui.info = snapshot.session.clone();
-                ui.info.title = title;
                 ui.snapshot = Some(snapshot);
                 if through > ui.history_cursor && !ui.history_loading && !ui.newer_history_missing {
                     if ui.read_anchor.is_some() || ui.scroll_from_tail > 0 || ui.older_loading {
@@ -280,19 +277,6 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 }
                 if !selected {
                     ui.unread = ui.unread.saturating_add(1);
-                }
-            }
-            if let Some(info) = state.session_ui.get(&session).map(|ui| ui.info.clone())
-                && let Some(listed) = state.sessions.iter_mut().find(|item| item.id == session)
-            {
-                let protected_title = state
-                    .title_renames
-                    .get(&session)
-                    .and_then(TitleRenameQueue::desired)
-                    .map(str::to_owned);
-                *listed = info;
-                if let Some(title) = protected_title {
-                    listed.title = title;
                 }
             }
         }
@@ -391,7 +375,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             for ui in state.session_ui.values() {
                 if ui.hydrated && ui.draft.revision() > ui.saved_draft_revision {
                     effects.push(Effect::SaveDraft {
-                        session: ui.info.id,
+                        session: ui.id,
                         generation: ui.generation,
                         revision: ui.draft.revision(),
                         text: ui.draft.text().to_owned(),
@@ -408,22 +392,20 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::OverviewLoaded {
             generation,
-            mut sessions,
-            statuses,
-            mut summaries,
+            mut rows,
         } => {
             if state.overview_request != Some(generation) {
                 return effects;
             }
             state.overview_request = None;
-            reconcile_overview_titles(state, &mut sessions, &mut summaries);
-            state.sessions = sessions;
-            state.session_statuses = statuses;
-            state.session_summaries = summaries;
-            if state
-                .selected
-                .is_some_and(|id| !state.sessions.iter().any(|s| s.id == id && !s.archived))
-            {
+            reconcile_overview_rows(state, &mut rows);
+            state.session_rows = rows;
+            if state.selected.is_some_and(|id| {
+                !state
+                    .session_rows
+                    .iter()
+                    .any(|row| row.id() == id && !row.info().archived)
+            }) {
                 state.selected = None;
                 state.clear_title_edit();
                 if state.focus == Focus::SessionTitle {
@@ -439,9 +421,9 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             }
             if state.session_candidate.is_some_and(|id| {
                 !state
-                    .sessions
+                    .session_rows
                     .iter()
-                    .any(|info| info.id == id && !info.archived)
+                    .any(|row| row.id() == id && !row.info().archived)
             }) {
                 state.session_candidate = state.selected;
                 state.session_scroll = None;
@@ -544,26 +526,11 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 if transferred.is_none() {
                     clear_create_source(state, pending.source, &mut effects);
                 }
-                if !state.sessions.iter().any(|session| session.id == info.id) {
-                    state.sessions.insert(0, info.clone());
+                if state.session_row(info.id).is_none() {
+                    state
+                        .session_rows
+                        .insert(0, SessionNavRow::provisional(info.clone()));
                 }
-                state.session_summaries.entry(info.id).or_insert_with(|| {
-                    bone_app::SessionSummary {
-                        session: info.clone(),
-                        created_at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |duration| {
-                                i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-                            }),
-                        message_count: 0,
-                        latest_reply_preview: None,
-                        projection_pending: false,
-                        has_draft: false,
-                        draft_bytes: 0,
-                        persisted_runtime: None,
-                        history_through: bone_app::SessionSeq(0),
-                    }
-                });
                 if state.focus == Focus::SessionTitle {
                     commit_title_edit(state, &mut effects);
                 }
@@ -626,7 +593,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 (completed, newest)
             };
             if newest {
-                set_session_title(state, session, title.clone());
+                set_committed_session_title(state, session, title.clone());
                 if let Some(edit) = state
                     .title_edit
                     .as_mut()
@@ -661,7 +628,6 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             dispatch_queued_title(state, session, &mut effects);
             if !superseded && !state.title_rename_pending(session) {
                 let committed = committed_session_title(state, session).unwrap_or_default();
-                set_session_title(state, session, committed.clone());
                 if let Some(edit) = state
                     .title_edit
                     .as_mut()
@@ -688,11 +654,9 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             if state.title_manual_intent.contains(&session) {
                 return effects;
             }
-            if state.session_ui.contains_key(&session)
-                || state.sessions.iter().any(|info| info.id == session)
-            {
+            if state.session_ui.contains_key(&session) || state.session_row(session).is_some() {
                 state.title_renames.entry(session).or_default().confirmed = Some(title.clone());
-                set_session_title(state, session, title.clone());
+                set_committed_session_title(state, session, title.clone());
                 let manual_pending = state.title_rename_pending(session);
                 if let Some(edit) = state
                     .title_edit
@@ -849,14 +813,10 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::Edit { target, command } => edit(state, target, command, effects),
         Action::CommitTitle => commit_title_edit(state, effects),
         Action::CancelTitle => {
-            let target = state.title_edit.as_ref().map(|edit| edit.target);
             let baseline = state
                 .title_edit
                 .as_ref()
                 .and_then(|edit| intended_session_title(state, edit.target));
-            if let Some((target, baseline)) = target.zip(baseline.as_ref()) {
-                set_session_title(state, target, baseline.clone());
-            }
             if let Some(edit) = &mut state.title_edit {
                 let text = baseline.unwrap_or_else(|| edit.original.clone());
                 edit.original = text.clone();
@@ -889,7 +849,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::OpenHistory(sequence) => {
             if let Some(ui) = state.selected_ui()
                 && let Some(entry) = ui.history.iter().find(|entry| entry.sequence == sequence)
-                && let Some(content) = super::reader::ReaderContent::from_history(ui.info.id, entry)
+                && let Some(content) = super::reader::ReaderContent::from_history(ui.id, entry)
             {
                 pin_reading(state);
                 open_panel(state, Panel::Reader(content));
@@ -1019,10 +979,10 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::OpenCandidate => {
             if let Some(session) = state.session_candidate.or(state.selected).or_else(|| {
                 state
-                    .sessions
+                    .session_rows
                     .iter()
-                    .find(|info| !info.archived)
-                    .map(|info| info.id)
+                    .find(|row| !row.info().archived)
+                    .map(SessionNavRow::id)
             }) {
                 select_session(state, session, effects);
             }
@@ -1299,7 +1259,7 @@ fn submit(state: &mut UiState, effects: &mut Vec<Effect>) {
         reply_to,
     });
     effects.push(Effect::Submit {
-        session: ui.info.id,
+        session: ui.id,
         input,
     });
 }
@@ -1391,7 +1351,7 @@ fn recover_input(
     match candidate {
         Some(RecoveryCandidate::Retry { input }) if retry => {
             effects.push(Effect::RetryInput {
-                session: ui.info.id,
+                session: ui.id,
                 generation: ui.generation,
                 input,
             });
@@ -1441,7 +1401,7 @@ fn retry_submission(state: &mut UiState, effects: &mut Vec<Effect>) {
     };
     pending.failed = false;
     effects.push(Effect::Submit {
-        session: ui.info.id,
+        session: ui.id,
         input,
     });
     state.status = Some("Confirming the original submission; newer draft is preserved".into());
@@ -1587,7 +1547,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
                     text: state.orphan_draft.text().to_owned(),
                 },
                 |ui| DraftSource::Session {
-                    id: ui.info.id,
+                    id: ui.id,
                     generation: ui.generation,
                     revision: ui.draft.revision(),
                     text: ui.draft.text().to_owned(),
@@ -1680,7 +1640,7 @@ fn clear_current_draft(state: &mut UiState, effects: &mut Vec<Effect>) {
     if let Some(ui) = state.selected_ui_mut() {
         ui.draft.clear();
         effects.push(Effect::SaveDraft {
-            session: ui.info.id,
+            session: ui.id,
             generation: ui.generation,
             revision: ui.draft.revision(),
             text: String::new(),
@@ -1754,10 +1714,10 @@ fn move_slash(state: &mut UiState, delta: isize) {
 
 fn move_session(state: &mut UiState, delta: isize) {
     let available: Vec<_> = state
-        .sessions
+        .session_rows
         .iter()
-        .filter(|s| !s.archived)
-        .map(|s| s.id)
+        .filter(|row| !row.info().archived)
+        .map(SessionNavRow::id)
         .collect();
     if available.is_empty() {
         return;
@@ -1774,14 +1734,10 @@ fn move_session(state: &mut UiState, delta: isize) {
 }
 
 fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>) {
-    let Some(info) = state
-        .sessions
-        .iter()
-        .find(|s| s.id == id && !s.archived)
-        .cloned()
-    else {
+    let Some(row) = state.session_row(id).filter(|row| !row.info().archived) else {
         return;
     };
+    let id = row.id();
     state.session_candidate = Some(id);
     state.session_scroll = None;
     if state.selected == Some(id) {
@@ -1806,8 +1762,7 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
     let ui = state
         .session_ui
         .entry(id)
-        .or_insert_with(|| SessionUi::new(info.clone(), generation));
-    ui.info = info;
+        .or_insert_with(|| SessionUi::new(id, generation));
     ui.generation = generation;
     ui.unread = 0;
     effects.push(Effect::OpenSession {
@@ -1835,7 +1790,7 @@ fn follow_transcript_tail(ui: &mut SessionUi, effects: &mut Vec<Effect>) {
     if ui.newer_history_missing && !ui.recent_loading {
         ui.recent_loading = true;
         effects.push(Effect::ReloadRecentHistory {
-            session: ui.info.id,
+            session: ui.id,
             generation: ui.generation,
         });
     }
@@ -1872,7 +1827,7 @@ fn scroll_up(
             ui.older_loading = true;
             ui.older_metrics = metrics;
             effects.push(Effect::LoadOlderHistory {
-                session: ui.info.id,
+                session: ui.id,
                 generation: ui.generation,
                 cursor,
             });
@@ -1885,7 +1840,7 @@ fn stop_selected(state: &UiState) -> Vec<Effect> {
         .selected_ui()
         .filter(|ui| ui.working())
         .map(|ui| Effect::Stop {
-            session: ui.info.id,
+            session: ui.id,
             generation: ui.generation,
         })
         .into_iter()
@@ -2095,6 +2050,11 @@ fn test_type(character: char) -> Action {
 }
 
 #[cfg(test)]
+fn test_session_row(info: bone_app::SessionInfo) -> SessionNavRow {
+    SessionNavRow::provisional(info)
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn background_scheduling_does_not_redraw_or_clear_pending_paint() {
@@ -2192,12 +2152,12 @@ mod owned_editor_lifecycle_tests {
     #[test]
     fn hydration_reconcile_cannot_undo_away_the_persisted_prefix() {
         let info = info("hydrate");
-        let mut ui = SessionUi::new(info.clone(), 1);
+        let mut ui = SessionUi::new(info.id, 1);
         ui.draft.apply(EditCommand::Replace {
             text: "local".into(),
         });
         let mut state = UiState::default();
-        state.sessions.push(info.clone());
+        state.session_rows.push(test_session_row(info.clone()));
         state.selected = Some(info.id);
         state.session_ui.insert(info.id, ui);
 
@@ -2213,16 +2173,19 @@ mod owned_editor_lifecycle_tests {
     fn reopening_an_empty_saved_buffer_keeps_revision_identity() {
         let first = info("first");
         let second = info("second");
-        let mut first_ui = SessionUi::new(first.clone(), 1);
+        let mut first_ui = SessionUi::new(first.id, 1);
         first_ui.draft.reset_external(String::new(), 0, 7);
         first_ui.saved_draft_revision = 7;
         let mut state = UiState::default();
-        state.sessions = vec![first.clone(), second.clone()];
+        state.session_rows = vec![
+            test_session_row(first.clone()),
+            test_session_row(second.clone()),
+        ];
         state.selected = Some(first.id);
         state.session_ui.insert(first.id, first_ui);
         state
             .session_ui
-            .insert(second.id, SessionUi::new(second.clone(), 1));
+            .insert(second.id, SessionUi::new(second.id, 1));
 
         opened(&mut state, &first, 1, "");
         assert_eq!(state.editor().revision(), 7);
@@ -2405,7 +2368,7 @@ mod async_identity_tests {
         let workspace = bone_app::WorkspaceId::new();
         let a = SessionId::new();
         let b = SessionId::new();
-        state.sessions = [a, b]
+        state.session_rows = [a, b]
             .into_iter()
             .map(|id| bone_app::SessionInfo {
                 id,
@@ -2413,6 +2376,7 @@ mod async_identity_tests {
                 title: "test".into(),
                 archived: false,
             })
+            .map(test_session_row)
             .collect();
         state.model_label = Some("workspace-model".into());
         let mut effects = Vec::new();
@@ -2591,15 +2555,13 @@ fn enqueue_title_rename(
 
 fn committed_session_title(state: &UiState, session: SessionId) -> Option<String> {
     state
-        .session_ui
+        .title_renames
         .get(&session)
-        .map(|ui| ui.info.title.clone())
+        .and_then(|queue| queue.confirmed.clone())
         .or_else(|| {
             state
-                .sessions
-                .iter()
-                .find(|info| info.id == session)
-                .map(|info| info.title.clone())
+                .session_row(session)
+                .map(|row| row.info().title.clone())
         })
 }
 
@@ -2612,40 +2574,44 @@ fn intended_session_title(state: &UiState, session: SessionId) -> Option<String>
         .or_else(|| committed_session_title(state, session))
 }
 
-fn set_session_title(state: &mut UiState, session: SessionId, title: String) {
-    if let Some(info) = state.sessions.iter_mut().find(|info| info.id == session) {
-        info.title = title.clone();
-    }
-    if let Some(summary) = state.session_summaries.get_mut(&session) {
-        summary.session.title = title.clone();
-    }
-    if let Some(ui) = state.session_ui.get_mut(&session) {
-        ui.info.title = title;
+fn set_committed_session_title(state: &mut UiState, session: SessionId, title: String) {
+    if let Some(row) = state.session_row_mut(session) {
+        row.summary.session.title = title;
     }
 }
 
-fn local_title_override(
+fn reconcile_committed_title(
     state: &mut UiState,
     session: SessionId,
     authoritative: &str,
-) -> Option<String> {
-    if state
-        .title_renames
-        .get(&session)
-        .and_then(|queue| queue.confirmed.as_deref())
-        == Some(authoritative)
-    {
+    current: Option<&str>,
+) -> (String, bool) {
+    let (confirmation_observed, pending, confirmed) =
         state
             .title_renames
             .get_mut(&session)
-            .expect("confirmed title was found above")
-            .confirmed = None;
-    }
-    let pending = state
-        .title_renames
-        .get(&session)
-        .and_then(TitleRenameQueue::desired)
-        .map(str::to_owned);
+            .map_or((false, false, None), |queue| {
+                let confirmation_observed = queue.confirmed.as_deref() == Some(authoritative);
+                if confirmation_observed {
+                    queue.confirmed = None;
+                }
+                (
+                    confirmation_observed,
+                    queue.pending(),
+                    queue.confirmed.clone(),
+                )
+            });
+
+    let reconciled = if confirmation_observed {
+        (authoritative.to_owned(), !pending)
+    } else if let Some(confirmed) = confirmed {
+        (confirmed, false)
+    } else if pending {
+        (current.unwrap_or(authoritative).to_owned(), false)
+    } else {
+        (authoritative.to_owned(), true)
+    };
+
     if state
         .title_renames
         .get(&session)
@@ -2653,20 +2619,35 @@ fn local_title_override(
     {
         state.title_renames.remove(&session);
     }
-    pending
+    reconciled
 }
 
-fn merge_authoritative_session_title(state: &mut UiState, session: SessionId, authoritative: &str) {
-    if let Some(local) = local_title_override(state, session, authoritative) {
-        if let Some(info) = state.sessions.iter_mut().find(|info| info.id == session) {
-            info.title = local.clone();
-        }
-        if let Some(summary) = state.session_summaries.get_mut(&session) {
-            summary.session.title = local;
-        }
+fn merge_authoritative_session_info(
+    state: &mut UiState,
+    session: SessionId,
+    authoritative: &bone_app::SessionInfo,
+) {
+    let Some(current) = state
+        .session_row(session)
+        .map(|row| row.info().title.clone())
+    else {
         return;
+    };
+    let (title, update_editor) =
+        reconcile_committed_title(state, session, &authoritative.title, Some(&current));
+    let mut info = authoritative.clone();
+    info.title = title;
+    state
+        .session_row_mut(session)
+        .expect("the Session row was read above")
+        .summary
+        .session = info;
+    if update_editor {
+        update_title_editor_baseline(state, session, &authoritative.title);
     }
-    set_session_title(state, session, authoritative.to_owned());
+}
+
+fn update_title_editor_baseline(state: &mut UiState, session: SessionId, authoritative: &str) {
     if let Some(edit) = state
         .title_edit
         .as_mut()
@@ -2683,42 +2664,18 @@ fn merge_authoritative_session_title(state: &mut UiState, session: SessionId, au
     }
 }
 
-fn reconcile_overview_titles(
-    state: &mut UiState,
-    sessions: &mut [bone_app::SessionInfo],
-    summaries: &mut std::collections::BTreeMap<SessionId, bone_app::SessionSummary>,
-) {
-    for info in sessions {
-        let authoritative = info.title.clone();
-        let local = local_title_override(state, info.id, &authoritative);
-        if let Some(local) = local {
-            info.title = local.clone();
-            if let Some(summary) = summaries.get_mut(&info.id) {
-                summary.session.title = local;
-            }
-            if let Some(ui) = state.session_ui.get_mut(&info.id) {
-                let preserved = ui.info.title.clone();
-                ui.info = info.clone();
-                ui.info.title = preserved;
-            }
-            continue;
-        }
-        if let Some(ui) = state.session_ui.get_mut(&info.id) {
-            ui.info = info.clone();
-        }
-        if let Some(edit) = state
-            .title_edit
-            .as_mut()
-            .filter(|edit| edit.target == info.id)
-        {
-            let clean = edit.editor.text() == edit.original;
-            edit.original = authoritative;
-            if clean {
-                let revision = edit.editor.revision();
-                let cursor = edit.original.len();
-                edit.editor
-                    .reset_external(edit.original.clone(), cursor, revision);
-            }
+fn reconcile_overview_rows(state: &mut UiState, rows: &mut [SessionNavRow]) {
+    for row in rows {
+        let session = row.id();
+        let authoritative = row.info().title.clone();
+        let current = state
+            .session_row(session)
+            .map(|current| current.info().title.clone());
+        let (title, update_editor) =
+            reconcile_committed_title(state, session, &authoritative, current.as_deref());
+        row.summary.session.title = title;
+        if update_editor {
+            update_title_editor_baseline(state, session, &authoritative);
         }
     }
 }
@@ -2813,7 +2770,7 @@ mod panel_draft_tests {
             title: "Existing title".into(),
             archived: false,
         };
-        let mut ui = SessionUi::new(info.clone(), 1);
+        let mut ui = SessionUi::new(info.id, 1);
         ui.draft.reset_external("ordinary draft".into(), 4, 8);
         let mut answer = AnswerDraft::new(question);
         answer.replace("answer draft".into(), 3);
@@ -2833,7 +2790,7 @@ mod panel_draft_tests {
             },
         });
         let mut state = UiState::default();
-        state.sessions.push(info);
+        state.session_rows.push(test_session_row(info));
         state.selected = Some(id);
         state.session_ui.insert(id, ui);
         (state, question)
@@ -2927,7 +2884,7 @@ mod panel_draft_tests {
                 draft_revision: revision,
                 failed: false,
             });
-            let session = ui.info.id;
+            let session = ui.id;
             update(&mut state, UiEvent::Action(test_insert("later")));
             update(&mut state, UiEvent::Action(test_editor(EditCommand::Undo)));
             assert_eq!(state.draft(), text);
@@ -3002,6 +2959,11 @@ mod panel_draft_tests {
             runtime: question.runtime,
             id: 2,
         };
+        let info = state
+            .session_row(state.selected.expect("selected Session"))
+            .expect("selected Session row")
+            .info()
+            .clone();
         let ui = state.selected_ui_mut().unwrap();
         ui.history.push_back(HistoryEntry {
             sequence: SessionSeq(2),
@@ -3020,7 +2982,7 @@ mod panel_draft_tests {
             },
         });
         ui.snapshot = Some(std::sync::Arc::new(bone_app::SessionView {
-            session: ui.info.clone(),
+            session: info,
             runtime: bone_app::RuntimeState::Detached,
             draft: String::new(),
             inputs: vec![],
@@ -3107,7 +3069,7 @@ mod panel_draft_tests {
             id: 1,
         };
         let mut snapshot = bone_app::SessionView {
-            session: state.selected_ui().unwrap().info.clone(),
+            session: state.session_row(session).unwrap().info().clone(),
             runtime: bone_app::RuntimeState::Detached,
             draft: String::new(),
             inputs: vec![],
@@ -3233,7 +3195,7 @@ mod panel_draft_tests {
     #[test]
     fn inline_title_editor_serializes_renames_without_touching_composer_drafts() {
         let (mut state, question) = fixture();
-        let target = state.selected_ui().unwrap().info.id;
+        let target = state.selected_ui().unwrap().id;
 
         assert!(
             update(
@@ -3307,7 +3269,14 @@ mod panel_draft_tests {
             },
         );
         assert_eq!(state.status.as_deref(), Some("Could not save title"));
-        assert_eq!(state.selected_ui().unwrap().info.title, "New title");
+        assert_eq!(
+            state
+                .session_row(*session)
+                .expect("renamed Session row")
+                .info()
+                .title,
+            "New title"
+        );
         assert_eq!(state.title_text(), Some("New title"));
         assert_drafts(&state, question);
     }
@@ -3355,7 +3324,7 @@ mod session_browsing_tests {
         let ids = (0..3).map(|_| SessionId::new()).collect::<Vec<_>>();
         let workspace = bone_app::WorkspaceId::new();
         let mut state = UiState::default();
-        state.sessions = ids
+        state.session_rows = ids
             .iter()
             .map(|id| bone_app::SessionInfo {
                 id: *id,
@@ -3363,6 +3332,7 @@ mod session_browsing_tests {
                 title: "test".into(),
                 archived: false,
             })
+            .map(test_session_row)
             .collect();
         let mut effects = Vec::new();
         select_session(&mut state, ids[0], &mut effects);
@@ -3416,7 +3386,7 @@ mod session_browsing_tests {
                 let ui = state.selected_ui().unwrap();
                 assert_eq!(
                     state.title_edit.as_ref().map(|edit| edit.target),
-                    Some(ui.info.id)
+                    Some(ui.id)
                 );
             }
         }
@@ -3451,7 +3421,7 @@ fn open_objects(state: &mut UiState) {
         state.status = Some("There is no session to inspect".into());
         return;
     };
-    let session = ui.info.id;
+    let session = ui.id;
     let mut choices = Vec::new();
     if let Some(snapshot) = &ui.snapshot {
         for job in snapshot.jobs.iter().rev() {
@@ -3524,8 +3494,8 @@ mod final_integration_regressions {
             title: "session".into(),
             archived: false,
         };
-        state.sessions.push(info.clone());
-        state.session_ui.insert(id, SessionUi::new(info, 1));
+        state.session_rows.push(test_session_row(info.clone()));
+        state.session_ui.insert(id, SessionUi::new(info.id, 1));
         id
     }
 
@@ -3740,7 +3710,7 @@ mod transcript_budget_tests {
             title: "budget".into(),
             archived: false,
         };
-        let mut ui = SessionUi::new(info.clone(), 1);
+        let mut ui = SessionUi::new(info.id, 1);
         let entry = bone_app::HistoryEntry {
             sequence: bone_app::SessionSeq(1),
             occurred_at: 0,
@@ -3912,7 +3882,7 @@ mod connection_tests {
             title: "connection test".into(),
             archived: false,
         };
-        let mut ui = SessionUi::new(info.clone(), 1);
+        let mut ui = SessionUi::new(info.id, 1);
         ui.draft = "ordinary draft".into();
         let question = bone_app::QuestionId {
             runtime: bone_app::RuntimeId::new(),
@@ -4148,9 +4118,9 @@ mod focus_state_tests {
             archived: false,
         };
         let mut state = UiState::default();
-        state.sessions.push(info.clone());
+        state.session_rows.push(test_session_row(info.clone()));
         state.selected = Some(info.id);
-        state.session_ui.insert(info.id, SessionUi::new(info, 1));
+        state.session_ui.insert(info.id, SessionUi::new(info.id, 1));
         state
     }
 
@@ -4271,7 +4241,7 @@ mod focus_state_tests {
             title: "reader focus".into(),
             archived: false,
         };
-        let mut ui = SessionUi::new(info.clone(), 1);
+        let mut ui = SessionUi::new(info.id, 1);
         ui.history.push_back(bone_app::HistoryEntry {
             sequence,
             occurred_at: 0,
@@ -4283,7 +4253,7 @@ mod focus_state_tests {
             },
         });
         let mut state = UiState::default();
-        state.sessions.push(info.clone());
+        state.session_rows.push(test_session_row(info.clone()));
         state.selected = Some(info.id);
         state.session_ui.insert(info.id, ui);
         state.set_focus(focus);
@@ -4332,9 +4302,7 @@ mod focus_state_tests {
             &mut state,
             UiEvent::OverviewLoaded {
                 generation: overview_request,
-                sessions: vec![],
-                statuses: std::collections::BTreeMap::new(),
-                summaries: std::collections::BTreeMap::new(),
+                rows: vec![],
             },
         );
 
@@ -4357,9 +4325,7 @@ mod focus_state_tests {
                 &mut state,
                 UiEvent::OverviewLoaded {
                     generation: overview_request,
-                    sessions: vec![],
-                    statuses: std::collections::BTreeMap::new(),
-                    summaries: std::collections::BTreeMap::new(),
+                    rows: vec![],
                 },
             );
 
@@ -4387,9 +4353,7 @@ mod focus_state_tests {
             &mut state,
             UiEvent::OverviewLoaded {
                 generation: overview_request,
-                sessions: vec![],
-                statuses: std::collections::BTreeMap::new(),
-                summaries: std::collections::BTreeMap::new(),
+                rows: vec![],
             },
         );
 
@@ -4435,7 +4399,7 @@ mod focus_state_tests {
 
 #[cfg(test)]
 mod title_rename_tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::sync::Arc;
 
     use super::*;
 
@@ -4466,25 +4430,26 @@ mod title_rename_tests {
         }
     }
 
+    fn row(info: bone_app::SessionInfo) -> SessionNavRow {
+        SessionNavRow {
+            summary: summary(info),
+            needs_attention: false,
+        }
+    }
+
     fn fixture() -> (UiState, bone_app::SessionInfo, bone_app::SessionInfo) {
         let workspace = bone_app::WorkspaceId::new();
         let first = session_info(workspace, SessionId::new(), "Alpha");
         let second = session_info(workspace, SessionId::new(), "Beta");
         let mut state = UiState::default();
         let generation = state.generation();
-        state.sessions = vec![first.clone(), second.clone()];
-        state
-            .session_summaries
-            .insert(first.id, summary(first.clone()));
-        state
-            .session_summaries
-            .insert(second.id, summary(second.clone()));
+        state.session_rows = vec![row(first.clone()), row(second.clone())];
         state
             .session_ui
-            .insert(first.id, SessionUi::new(first.clone(), generation));
+            .insert(first.id, SessionUi::new(first.id, generation));
         state
             .session_ui
-            .insert(second.id, SessionUi::new(second.clone(), generation));
+            .insert(second.id, SessionUi::new(second.id, generation));
         state.selected = Some(first.id);
         state.session_candidate = Some(first.id);
         (state, first, second)
@@ -4512,11 +4477,14 @@ mod title_rename_tests {
     }
 
     fn title_in_rail(state: &UiState, session: SessionId) -> &str {
+        state.session_title(session).expect("listed Session")
+    }
+
+    fn committed_title_in_row(state: &UiState, session: SessionId) -> &str {
         &state
-            .sessions
-            .iter()
-            .find(|info| info.id == session)
-            .expect("listed session")
+            .session_row(session)
+            .expect("listed Session")
+            .info()
             .title
     }
 
@@ -4525,23 +4493,13 @@ mod title_rename_tests {
         first: &bone_app::SessionInfo,
         second: &bone_app::SessionInfo,
     ) -> Vec<Effect> {
-        let sessions = vec![first.clone(), second.clone()];
-        let summaries = sessions
-            .iter()
-            .cloned()
-            .map(|info| (info.id, summary(info)))
-            .collect();
+        overview_rows(state, vec![row(first.clone()), row(second.clone())])
+    }
+
+    fn overview_rows(state: &mut UiState, rows: Vec<SessionNavRow>) -> Vec<Effect> {
         let generation = state.generation();
         state.overview_request = Some(generation);
-        update(
-            state,
-            UiEvent::OverviewLoaded {
-                generation,
-                sessions,
-                statuses: BTreeMap::new(),
-                summaries,
-            },
-        )
+        update(state, UiEvent::OverviewLoaded { generation, rows })
     }
 
     fn snapshot(info: bone_app::SessionInfo) -> Arc<bone_app::SessionView> {
@@ -4585,7 +4543,7 @@ mod title_rename_tests {
     fn title_home_and_end_extend_selection_without_splitting_graphemes() {
         let (mut state, first, _) = fixture();
         let title = "中e\u{301}🙂";
-        set_session_title(&mut state, first.id, title.into());
+        set_committed_session_title(&mut state, first.id, title.into());
         update(
             &mut state,
             UiEvent::Action(Action::Focus(Focus::SessionTitle)),
@@ -4754,7 +4712,7 @@ mod title_rename_tests {
             },
         );
         assert_eq!(title_in_rail(&state, first.id), "Final write");
-        assert_eq!(state.session_ui[&first.id].info.title, "Final write");
+        assert_eq!(committed_title_in_row(&state, first.id), "Final write");
         assert_eq!(state.title_text(), Some("Final write"));
     }
 
@@ -4959,7 +4917,7 @@ mod title_rename_tests {
         );
         assert_eq!(title_in_rail(&state, first.id), "Durable automatic title");
         assert_eq!(
-            state.session_ui[&first.id].info.title,
+            committed_title_in_row(&state, first.id),
             "Durable automatic title"
         );
     }
@@ -4975,7 +4933,7 @@ mod title_rename_tests {
             overview(&mut state, &changed, &second);
 
             assert_eq!(title_in_rail(&state, first.id), authoritative);
-            assert_eq!(state.session_ui[&first.id].info.title, authoritative);
+            assert_eq!(committed_title_in_row(&state, first.id), authoritative);
             let edit = state.title_edit.as_ref().unwrap();
             assert_eq!(edit.editor.text(), "Uncommitted editor text");
             assert_eq!(edit.original, authoritative);
@@ -4994,7 +4952,7 @@ mod title_rename_tests {
             rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
         overview(&mut state, &first, &second);
         assert_eq!(title_in_rail(&state, first.id), "Durable local title");
-        assert_eq!(state.session_ui[&first.id].info.title, "Alpha");
+        assert_eq!(committed_title_in_row(&state, first.id), "Alpha");
 
         update(
             &mut state,
@@ -5011,7 +4969,7 @@ mod title_rename_tests {
         authoritative.title = "Durable local title".into();
         overview(&mut state, &authoritative, &second);
         assert_eq!(
-            state.session_ui[&first.id].info.title,
+            committed_title_in_row(&state, first.id),
             "Durable local title"
         );
         assert!(
@@ -5036,7 +4994,7 @@ mod title_rename_tests {
             },
         );
         assert_eq!(title_in_rail(&state, first.id), "Snapshot title");
-        assert_eq!(state.session_ui[&first.id].info.title, "Snapshot title");
+        assert_eq!(committed_title_in_row(&state, first.id), "Snapshot title");
 
         dirty_title(&mut state, "Pending local title");
         let effects = update(&mut state, UiEvent::Action(Action::CommitTitle));
@@ -5073,7 +5031,7 @@ mod title_rename_tests {
             },
         );
         assert_eq!(title_in_rail(&state, first.id), "Alpha");
-        assert_eq!(state.session_ui[&first.id].info.title, "Alpha");
+        assert_eq!(committed_title_in_row(&state, first.id), "Alpha");
         assert_eq!(state.title_text(), Some("Alpha"));
         assert_eq!(state.status.as_deref(), Some("Could not save title"));
 
@@ -5104,5 +5062,125 @@ mod title_rename_tests {
             },
         );
         assert_eq!(state.title_text(), Some("Alpha"));
+    }
+
+    #[test]
+    fn confirmed_title_survives_stale_summary_and_becomes_the_next_failure_baseline() {
+        let (mut state, first, second) = fixture();
+        dirty_title(&mut state, "Confirmed title");
+        let (_, request, title) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        update(
+            &mut state,
+            UiEvent::SessionRenamed {
+                session: first.id,
+                request,
+                title,
+            },
+        );
+
+        let mut stale = row(first.clone());
+        stale.summary.message_count = 41;
+        stale.summary.latest_reply_preview = Some("New reply on stale metadata".into());
+        overview_rows(&mut state, vec![stale, row(second.clone())]);
+        let refreshed = state.session_row(first.id).unwrap();
+        assert_eq!(refreshed.info().title, "Confirmed title");
+        assert_eq!(refreshed.summary.message_count, 41);
+        assert_eq!(
+            refreshed.summary.latest_reply_preview.as_deref(),
+            Some("New reply on stale metadata")
+        );
+
+        dirty_title(&mut state, "Next title");
+        let (_, request, _) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        update(
+            &mut state,
+            UiEvent::SessionRenameFailed {
+                session: first.id,
+                request,
+                message: "Could not save next title".into(),
+            },
+        );
+        assert_eq!(committed_title_in_row(&state, first.id), "Confirmed title");
+        assert_eq!(title_in_rail(&state, first.id), "Confirmed title");
+        assert_eq!(state.title_text(), Some("Confirmed title"));
+    }
+
+    #[test]
+    fn confirmed_title_survives_a_temporarily_missing_navigation_row() {
+        let (mut state, first, second) = fixture();
+        dirty_title(&mut state, "Confirmed title");
+        let (_, request, title) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        update(
+            &mut state,
+            UiEvent::SessionRenamed {
+                session: first.id,
+                request,
+                title,
+            },
+        );
+
+        overview_rows(&mut state, vec![row(second.clone())]);
+        assert!(state.session_row(first.id).is_none());
+        overview_rows(&mut state, vec![row(first.clone()), row(second.clone())]);
+        assert_eq!(committed_title_in_row(&state, first.id), "Confirmed title");
+        assert_eq!(title_in_rail(&state, first.id), "Confirmed title");
+
+        select_session(&mut state, first.id, &mut Vec::new());
+        dirty_title(&mut state, "Next title");
+        let (_, request, _) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        update(
+            &mut state,
+            UiEvent::SessionRenameFailed {
+                session: first.id,
+                request,
+                message: "Could not save next title".into(),
+            },
+        );
+        assert_eq!(committed_title_in_row(&state, first.id), "Confirmed title");
+        assert_eq!(title_in_rail(&state, first.id), "Confirmed title");
+        assert_eq!(state.title_text(), Some("Confirmed title"));
+    }
+
+    #[test]
+    fn stale_session_generation_cannot_mutate_navigation_or_title_state() {
+        let (mut state, first, _) = fixture();
+        dirty_title(&mut state, "Pending title");
+        let (_, request, _) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        state.session_ui.get_mut(&first.id).unwrap().generation = 2;
+        let before = state.title_edit.as_ref().unwrap();
+        let original = before.original.clone();
+        let text = before.editor.text().to_owned();
+        let revision = before.editor.revision();
+
+        let mut stale = first.clone();
+        stale.title = "Stale snapshot title".into();
+        stale.archived = true;
+        update(
+            &mut state,
+            UiEvent::SessionChanged {
+                session: first.id,
+                generation: 1,
+                snapshot: snapshot(stale),
+            },
+        );
+
+        let row = state.session_row(first.id).unwrap();
+        assert_eq!(row.info().title, "Alpha");
+        assert!(!row.info().archived);
+        let edit = state.title_edit.as_ref().unwrap();
+        assert_eq!(edit.original, original);
+        assert_eq!(edit.editor.text(), text);
+        assert_eq!(edit.editor.revision(), revision);
+        assert!(
+            state.title_renames[&first.id]
+                .pending
+                .contains_key(&request)
+        );
+        assert!(state.session_ui[&first.id].snapshot.is_none());
     }
 }

@@ -1,6 +1,6 @@
 use crate::state::{
-    Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, SessionUi, UiEvent, UiState,
-    update,
+    Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, SessionNavRow, SessionUi,
+    UiEvent, UiState, update,
 };
 use bone_app::{
     HistoryEntry, InputId, InputState, InputView, ModelSelection, Profile, ProfileId, QuestionId,
@@ -62,12 +62,12 @@ fn setup() -> (UiState, SessionId, QuestionId) {
         record: 10,
         reply_to: InputId(1),
     };
-    let mut ui = SessionUi::new(info.clone(), 1);
+    let mut ui = SessionUi::new(info.id, 1);
     ui.snapshot = Some(Arc::new(view(&info, Some(q))));
     ui.hydrated = true;
     let mut state = UiState::default();
     state.selected = Some(info.id);
-    state.sessions = vec![info.clone()];
+    state.session_rows = vec![SessionNavRow::provisional(info.clone())];
     state.session_ui.insert(info.id, ui);
     (state, info.id, q)
 }
@@ -150,7 +150,7 @@ fn escape_restores_ordinary_draft_and_expiry_requires_explicit_conversion() {
     assert!(act(&mut s, Action::Escape).is_empty());
     assert_eq!(s.draft(), "ordinary");
     act(&mut s, Action::AnswerQuestion(q));
-    let info = s.selected_ui().unwrap().info.clone();
+    let info = s.session_row(id).unwrap().info().clone();
     s.session_ui.get_mut(&id).unwrap().snapshot = Some(Arc::new(view(&info, None)));
     assert!(act(&mut s, Action::Submit).is_empty());
     assert_eq!(s.draft(), "answer");
