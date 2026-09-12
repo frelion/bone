@@ -735,9 +735,9 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
             }
         }
         Action::OpenModels => panel::open_models(state, effects),
-        Action::SelectObject(index) => panel::select_object(state, index),
-        Action::OpenHistory(sequence) => panel::open_history(state, sequence),
-        Action::OpenJob(job) => panel::open_job(state, job),
+        Action::SelectObject(index) => panel::select_object(state, index, effects),
+        Action::OpenHistory(sequence) => panel::open_history(state, sequence, effects),
+        Action::OpenJob(job) => panel::open_job(state, job, effects),
         Action::PanelPrevious => panel::panel_previous(state),
         Action::PanelNext => panel::panel_next(state),
         Action::SelectModel(index) => panel::select_model(state, index, effects),
@@ -1296,7 +1296,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
         }
         CommandKind::Details if argument.is_empty() => {
             clear_current_draft(state, effects);
-            panel::open_objects(state);
+            panel::open_objects(state, effects);
         }
 
         CommandKind::New => {
@@ -1383,7 +1383,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
         }
         CommandKind::Help if argument.is_empty() => {
             clear_current_draft(state, effects);
-            panel::open_help(state);
+            panel::open_help(state, effects);
         }
         CommandKind::Quit if argument.is_empty() => {
             clear_current_draft(state, effects);
@@ -2637,7 +2637,7 @@ mod panel_draft_tests {
                 report: None,
             }],
         }));
-        panel::open_objects(&mut state);
+        panel::open_objects(&mut state, &mut Vec::new());
         let Some(Panel::Objects(objects)) = &state.panel else {
             panic!("object menu")
         };
@@ -2654,7 +2654,7 @@ mod panel_draft_tests {
         );
         assert_drafts(&state, question);
         update(&mut state, UiEvent::Action(Action::Escape));
-        panel::open_objects(&mut state);
+        panel::open_objects(&mut state, &mut Vec::new());
         update(&mut state, UiEvent::Action(Action::ActivatePanel));
         assert!(
             matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content.source == ReaderSource::Job(job))
@@ -2665,7 +2665,7 @@ mod panel_draft_tests {
     #[test]
     fn expired_or_cross_session_object_menu_never_substitutes_another_object() {
         let (mut state, question) = fixture();
-        panel::open_objects(&mut state);
+        panel::open_objects(&mut state, &mut Vec::new());
         state.selected_ui_mut().unwrap().history.clear();
         update(&mut state, UiEvent::Action(Action::ActivatePanel));
         assert!(matches!(state.panel, Some(Panel::Objects(_))));
@@ -2799,8 +2799,8 @@ mod panel_draft_tests {
             let mut effects = Vec::new();
             match panel {
                 "model" => panel::open_models(&mut state, &mut effects),
-                "details" => panel::open_objects(&mut state),
-                _ => panel::open_help(&mut state),
+                "details" => panel::open_objects(&mut state, &mut effects),
+                _ => panel::open_help(&mut state, &mut effects),
             }
             assert!(
                 effects.iter().all(|effect| !matches!(
@@ -3507,7 +3507,7 @@ mod focus_state_tests {
     fn resize_repairs_the_real_focus_while_a_panel_is_open() {
         let mut state = state_with_session();
         state.set_focus(Focus::RightRail);
-        panel::open_help(&mut state);
+        panel::open_help(&mut state, &mut Vec::new());
 
         update(
             &mut state,

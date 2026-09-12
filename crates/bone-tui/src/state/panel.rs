@@ -92,7 +92,7 @@ impl ModelOperation {
 pub(super) fn open_models(state: &mut UiState, effects: &mut Vec<Effect>) {
     let session = state.selected;
     state.status = None;
-    state.panel = Some(Panel::Models(ModelPanel::new(session)));
+    replace(state, Panel::Models(ModelPanel::new(session)), effects);
     load_models(state, session, effects);
 }
 
@@ -104,7 +104,7 @@ pub(super) fn set_named_model(
 ) {
     let session = state.selected;
     state.status = None;
-    state.panel = Some(Panel::Models(ModelPanel::new(session)));
+    replace(state, Panel::Models(ModelPanel::new(session)), effects);
     let request = state.generation();
     state.model_operation = Some(ModelOperation {
         session,
@@ -119,8 +119,8 @@ pub(super) fn set_named_model(
     });
 }
 
-pub(super) fn open_help(state: &mut UiState) {
-    state.panel = Some(Panel::Help);
+pub(super) fn open_help(state: &mut UiState, effects: &mut Vec<Effect>) {
+    replace(state, Panel::Help, effects);
 }
 
 fn load_models(state: &mut UiState, session: Option<SessionId>, effects: &mut Vec<Effect>) {
@@ -249,7 +249,7 @@ pub(super) fn model_applied(
             load_models(state, session, effects);
         }
     } else if matching_list {
-        state.panel = None;
+        dismiss(state, effects);
     }
 }
 
@@ -361,7 +361,7 @@ pub(super) fn login_changed(
     }
 }
 
-pub(super) fn open_history(state: &mut UiState, sequence: SessionSeq) {
+pub(super) fn open_history(state: &mut UiState, sequence: SessionSeq, effects: &mut Vec<Effect>) {
     let Some(content) = state.selected_ui().and_then(|ui| {
         ui.history
             .iter()
@@ -371,10 +371,14 @@ pub(super) fn open_history(state: &mut UiState, sequence: SessionSeq) {
         return;
     };
     pin_reading(state);
-    state.panel = Some(Panel::Reader(ReaderPanel { content, scroll: 0 }));
+    replace(
+        state,
+        Panel::Reader(ReaderPanel { content, scroll: 0 }),
+        effects,
+    );
 }
 
-pub(super) fn open_job(state: &mut UiState, job: bone_app::JobRef) {
+pub(super) fn open_job(state: &mut UiState, job: bone_app::JobRef, effects: &mut Vec<Effect>) {
     let Some(content) = state
         .selected_ui()
         .and_then(|ui| ui.snapshot.as_ref())
@@ -383,7 +387,11 @@ pub(super) fn open_job(state: &mut UiState, job: bone_app::JobRef) {
         return;
     };
     pin_reading(state);
-    state.panel = Some(Panel::Reader(ReaderPanel { content, scroll: 0 }));
+    replace(
+        state,
+        Panel::Reader(ReaderPanel { content, scroll: 0 }),
+        effects,
+    );
 }
 
 pub(super) fn refresh_reader(state: &mut UiState, snapshot: &bone_app::SessionView) {
@@ -392,7 +400,7 @@ pub(super) fn refresh_reader(state: &mut UiState, snapshot: &bone_app::SessionVi
     }
 }
 
-pub(super) fn open_objects(state: &mut UiState) {
+pub(super) fn open_objects(state: &mut UiState, effects: &mut Vec<Effect>) {
     let Some(ui) = state.selected_ui() else {
         state.status = Some("There is no session to inspect".into());
         return;
@@ -422,14 +430,18 @@ pub(super) fn open_objects(state: &mut UiState) {
         choices.push((ReaderSource::History(entry.sequence), label));
     }
     state.status = None;
-    state.panel = Some(Panel::Objects(ObjectPanel {
-        session,
-        choices,
-        selected: 0,
-    }));
+    replace(
+        state,
+        Panel::Objects(ObjectPanel {
+            session,
+            choices,
+            selected: 0,
+        }),
+        effects,
+    );
 }
 
-pub(super) fn select_object(state: &mut UiState, index: usize) {
+pub(super) fn select_object(state: &mut UiState, index: usize, effects: &mut Vec<Effect>) {
     let Some(Panel::Objects(objects)) = &mut state.panel else {
         return;
     };
@@ -437,10 +449,10 @@ pub(super) fn select_object(state: &mut UiState, index: usize) {
         return;
     }
     objects.selected = index;
-    open_object(state);
+    open_object(state, effects);
 }
 
-fn open_object(state: &mut UiState) {
+fn open_object(state: &mut UiState, effects: &mut Vec<Effect>) {
     let Some((session, source)) = (match &state.panel {
         Some(Panel::Objects(objects)) => objects
             .choices
@@ -467,7 +479,11 @@ fn open_object(state: &mut UiState) {
     });
     if let Some(content) = content {
         pin_reading(state);
-        state.panel = Some(Panel::Reader(ReaderPanel { content, scroll: 0 }));
+        replace(
+            state,
+            Panel::Reader(ReaderPanel { content, scroll: 0 }),
+            effects,
+        );
         state.status = None;
     } else {
         state.status = Some("This object is no longer loaded; reopen /details".into());
@@ -521,7 +537,7 @@ pub(super) fn activate(state: &mut UiState, effects: &mut Vec<Effect>) {
     match &state.panel {
         Some(Panel::Objects(objects)) => {
             let selected = objects.selected;
-            select_object(state, selected);
+            select_object(state, selected, effects);
         }
         Some(Panel::Models(ModelPanel {
             screen: ModelScreen::List { selected },
@@ -744,17 +760,11 @@ pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
 }
 
 fn return_to_models(state: &mut UiState, effects: &mut Vec<Effect>) {
-    let session = match &mut state.panel {
-        Some(Panel::Models(models)) => {
-            models.screen = ModelScreen::List { selected: 0 };
-            models.session
-        }
-        _ => {
-            let session = state.selected;
-            state.panel = Some(Panel::Models(ModelPanel::new(session)));
-            session
-        }
+    let Some(Panel::Models(models)) = &mut state.panel else {
+        return;
     };
+    models.screen = ModelScreen::List { selected: 0 };
+    let session = models.session;
     state.status = None;
     load_models(state, session, effects);
     refresh_model_label(state, effects);
@@ -795,6 +805,16 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
 }
 
 pub(super) fn dismiss(state: &mut UiState, effects: &mut Vec<Effect>) {
+    cancel_login(state, effects);
+    state.panel = None;
+}
+
+fn replace(state: &mut UiState, panel: Panel, effects: &mut Vec<Effect>) {
+    cancel_login(state, effects);
+    state.panel = Some(panel);
+}
+
+fn cancel_login(state: &UiState, effects: &mut Vec<Effect>) {
     if matches!(
         &state.panel,
         Some(Panel::Models(ModelPanel {
@@ -804,7 +824,6 @@ pub(super) fn dismiss(state: &mut UiState, effects: &mut Vec<Effect>) {
     ) {
         effects.push(Effect::CancelLogin);
     }
-    state.panel = None;
 }
 
 #[cfg(test)]
@@ -895,11 +914,45 @@ mod tests {
     fn closing_a_panel_never_rewrites_workspace_focus() {
         let mut state = UiState::default();
         state.set_focus(Focus::Sessions);
-        open_help(&mut state);
+        open_help(&mut state, &mut Vec::new());
         dismiss(&mut state, &mut Vec::new());
         assert!(state.panel.is_none());
         assert_eq!(state.focus, Focus::Sessions);
         assert_eq!(state.last_center_focus(), Focus::Composer);
+    }
+
+    #[test]
+    fn replacement_cancels_login_once_before_starting_new_panel_work() {
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.screen = ModelScreen::Login {
+            request: 41,
+            state: LoginState::Connecting,
+        };
+        state.panel = Some(Panel::Models(models));
+        let mut effects = Vec::new();
+
+        open_models(&mut state, &mut effects);
+
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::CancelLogin,
+                Effect::LoadModels { session: None, .. }
+            ]
+        ));
+        assert!(matches!(
+            &state.panel,
+            Some(Panel::Models(ModelPanel {
+                screen: ModelScreen::List { .. },
+                ..
+            }))
+        ));
+
+        effects.clear();
+        open_help(&mut state, &mut effects);
+        assert!(effects.is_empty());
+        assert!(matches!(state.panel, Some(Panel::Help)));
     }
 
     #[test]
