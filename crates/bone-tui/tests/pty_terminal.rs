@@ -223,6 +223,8 @@ fn assert_terminal_protocol_restored(output: &[u8]) {
         b"\x1b[<1u".as_slice(),
         b"\x1b[?2004h".as_slice(),
         b"\x1b[?2004l".as_slice(),
+        b"\x1b[?1004h".as_slice(),
+        b"\x1b[?1004l".as_slice(),
         b"\x1b[?1000l".as_slice(),
         b"\x1b[?1049l".as_slice(),
         b"\x1b[?25h".as_slice(),
@@ -237,14 +239,18 @@ fn assert_terminal_protocol_restored(output: &[u8]) {
 
     let push = find_sequence(output, b"\x1b[>1u");
     let pop = find_sequence(output, b"\x1b[<1u");
+    let bracketed_paste_off = find_sequence(output, b"\x1b[?2004l");
+    let focus_change_off = find_sequence(output, b"\x1b[?1004l");
     let leave_screen = find_sequence(output, b"\x1b[?1049l");
     assert!(
         push < pop,
         "keyboard enhancement must be popped after it is pushed"
     );
     assert!(
-        pop < leave_screen,
-        "the alternate-screen keyboard stack must be popped before leaving it"
+        pop < bracketed_paste_off
+            && bracketed_paste_off < focus_change_off
+            && focus_change_off < leave_screen,
+        "temporary terminal modes must be released in reverse acquisition order"
     );
     for (enable, disable) in [
         (b"\x1b[?1049h".as_slice(), b"\x1b[?1049l".as_slice()),
