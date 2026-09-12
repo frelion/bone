@@ -5,6 +5,7 @@ mod model;
 mod panel;
 mod protocol;
 pub(crate) mod reader;
+mod status;
 mod title;
 mod transcript;
 mod update;
@@ -12,6 +13,7 @@ mod update;
 pub use model::*;
 pub(crate) use panel::*;
 pub use protocol::*;
+pub(crate) use status::Status;
 #[cfg(test)]
 pub(crate) use transcript::HISTORY_CACHE_ITEMS;
 pub(crate) use transcript::{HISTORY_CACHE_BYTES, TranscriptState};

@@ -63,8 +63,8 @@ pub(super) fn render(
     }
     let metrics = render_transcript(frame, transcript, state, hits);
     let status = state
-        .status
-        .clone()
+        .status_text()
+        .map(str::to_owned)
         .or_else(|| {
             state
                 .selected_ui()

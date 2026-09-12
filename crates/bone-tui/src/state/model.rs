@@ -8,6 +8,7 @@ use crate::layout::SinglePane;
 use super::{
     TranscriptState,
     panel::{ModelOperation, Panel},
+    status::Status,
     title::TitleState,
 };
 
@@ -265,7 +266,7 @@ pub struct UiState {
     pub pending_create: Option<PendingCreate>,
     pub slash_selection: usize,
     pub slash_dismissed: Option<(Option<SessionId>, u64)>,
-    pub status: Option<String>,
+    pub(crate) status: Option<Status>,
     pub dirty: bool,
     pub quitting: bool,
     pub(crate) overview_request: Option<u64>,
@@ -307,6 +308,24 @@ impl Default for UiState {
 }
 
 impl UiState {
+    pub(crate) fn status_text(&self) -> Option<&str> {
+        self.status.as_ref().map(Status::text)
+    }
+
+    pub(crate) fn clear_stale_session_status(&mut self) {
+        let selected_generation = self
+            .selected
+            .and_then(|session| self.session_ui.get(&session))
+            .map(|ui| ui.generation);
+        let current = self
+            .status
+            .as_ref()
+            .is_none_or(|status| status.is_current(self.selected, selected_generation));
+        if !current {
+            self.status = None;
+        }
+    }
+
     /// Sets workspace focus while remembering the latest center-column target.
     pub(crate) fn set_focus(&mut self, focus: Focus) {
         self.focus = focus;

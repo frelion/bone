@@ -98,8 +98,7 @@ pub(super) fn render(
         return;
     };
     let hint = state
-        .status
-        .as_deref()
+        .status_text()
         .unwrap_or("tab fields · ctrl+u clear field");
     frame.render_widget(
         Paragraph::new(single_line_external(hint))

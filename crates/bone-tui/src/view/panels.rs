@@ -154,7 +154,7 @@ pub(super) fn render(
         Panel::Objects(objects) => {
             if let Some(error) = &state.status {
                 frame.render_widget(
-                    Paragraph::new(single_line_external(error))
+                    Paragraph::new(single_line_external(error.text()))
                         .style(Style::default().fg(theme::DANGER)),
                     Rect::new(inner.x, inner.y, inner.width, 1),
                 );
@@ -201,7 +201,7 @@ pub(super) fn render(
                 if let Some(status) = &state.status {
                     let height = 2.min(inner.height.saturating_sub(1));
                     frame.render_widget(
-                        Paragraph::new(single_line_external(status))
+                        Paragraph::new(single_line_external(status.text()))
                             .wrap(Wrap { trim: false })
                             .style(Style::default().fg(theme::DANGER)),
                         Rect::new(inner.x, inner.y, inner.width, height),

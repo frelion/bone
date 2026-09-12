@@ -12,7 +12,6 @@ pub(super) struct TitleState {
     edit: Option<TitleEdit>,
     sessions: BTreeMap<SessionId, SessionTitleState>,
     next_request: u64,
-    rename_error: Option<TitleRenameError>,
 }
 
 #[derive(Debug, Default)]
@@ -31,6 +30,10 @@ struct SessionTitleState {
     manual_intent: bool,
     /// Generation is retained for failure visibility; request is the identity.
     auto_pending: BTreeMap<u64, u64>,
+    /// Suppresses an older failure after a newer automatic request has already
+    /// completed. Successful older results may still carry the only generated
+    /// title because runtime writes are serialized and later requests can be no-ops.
+    auto_completed: u64,
 }
 
 impl SessionTitleState {
@@ -79,12 +82,6 @@ impl TitleEdit {
     }
 }
 
-#[derive(Debug)]
-struct TitleRenameError {
-    session: SessionId,
-    message: String,
-}
-
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct TitleWrite {
     pub(super) session: SessionId,
@@ -112,7 +109,6 @@ pub(super) enum ManualTitleSettlement {
         row_title: Option<String>,
         next_write: Option<TitleWrite>,
         final_error: Option<String>,
-        cleared_error: Option<String>,
         drained: bool,
     },
 }
@@ -255,7 +251,6 @@ impl TitleState {
         if changed {
             session.manual_intent = true;
         }
-        self.take_error(target);
         let write = self.dispatch_queued(target, row_title);
         self.remove_if_disposable(target);
         Some(TitleCommit::Accepted(write))
@@ -277,7 +272,6 @@ impl TitleState {
 
         let mut published = None;
         let mut final_error = None;
-        let mut cleared_error = None;
         match result {
             Ok(title) => {
                 if request > queue.manual_applied {
@@ -292,7 +286,6 @@ impl TitleState {
                             edit.editor.reset_external(title, cursor, revision);
                         }
                     }
-                    cleared_error = self.take_error(session);
                 }
             }
             Err(message) => {
@@ -322,7 +315,6 @@ impl TitleState {
                     row_title: None,
                     next_write,
                     final_error,
-                    cleared_error: None,
                     drained,
                 };
             }
@@ -335,7 +327,6 @@ impl TitleState {
             row_title: published,
             next_write,
             final_error,
-            cleared_error,
             drained,
         }
     }
@@ -374,6 +365,8 @@ impl TitleState {
         let Some(generation) = queue.auto_pending.remove(&request) else {
             return AutoTitleSettlement::Ignored;
         };
+        let newer_completion_observed = request < queue.auto_completed;
+        queue.auto_completed = queue.auto_completed.max(request);
 
         let mut row_title = None;
         let mut failure = None;
@@ -392,12 +385,13 @@ impl TitleState {
                 }
             }
             Ok(Some(_)) | Ok(None) => {}
-            Err(message) => {
+            Err(message) if !queue.manual_intent && !newer_completion_observed => {
                 failure = Some(AutoTitleFailure {
                     generation,
                     message,
                 });
             }
+            Err(_) => {}
         }
         self.remove_if_disposable(session);
         AutoTitleSettlement::Finished { row_title, failure }
@@ -464,34 +458,6 @@ impl TitleState {
             }
         }
         writes
-    }
-
-    pub(super) fn record_error(&mut self, session: SessionId, message: String) {
-        self.rename_error = Some(TitleRenameError { session, message });
-    }
-
-    pub(super) fn take_error(&mut self, session: SessionId) -> Option<String> {
-        if self
-            .rename_error
-            .as_ref()
-            .is_some_and(|error| error.session == session)
-        {
-            self.rename_error.take().map(|error| error.message)
-        } else {
-            None
-        }
-    }
-
-    pub(super) fn take_error_for_other(&mut self, selected: SessionId) -> Option<String> {
-        if self
-            .rename_error
-            .as_ref()
-            .is_some_and(|error| error.session != selected)
-        {
-            self.rename_error.take().map(|error| error.message)
-        } else {
-            None
-        }
     }
 
     fn intended_title(&self, session: SessionId, row_title: Option<&str>) -> Option<String> {
@@ -662,6 +628,50 @@ mod tests {
             }
         );
         assert_eq!(titles.editor(id).unwrap().text(), "Manual");
+    }
+
+    #[test]
+    fn manual_intent_silences_a_late_auto_title_failure() {
+        let id = session();
+        let mut titles = TitleState::default();
+        titles.begin_edit(id, "Old".into());
+        let auto = titles.start_auto(id, 4, "first".into()).unwrap();
+        titles.replace_user("Manual".into(), 6);
+        assert!(matches!(
+            titles.commit(Some("Old")),
+            Some(TitleCommit::Accepted(Some(_)))
+        ));
+
+        assert_eq!(
+            titles.finish_auto(id, auto.request, Err("obsolete failure".into())),
+            AutoTitleSettlement::Finished {
+                row_title: None,
+                failure: None,
+            }
+        );
+    }
+
+    #[test]
+    fn older_auto_failure_is_silent_after_a_newer_completion() {
+        let id = session();
+        let mut titles = TitleState::default();
+        let older = titles.start_auto(id, 4, "first".into()).unwrap();
+        let newer = titles.start_auto(id, 4, "second".into()).unwrap();
+
+        assert_eq!(
+            titles.finish_auto(id, newer.request, Ok(None)),
+            AutoTitleSettlement::Finished {
+                row_title: None,
+                failure: None,
+            }
+        );
+        assert_eq!(
+            titles.finish_auto(id, older.request, Err("obsolete failure".into())),
+            AutoTitleSettlement::Finished {
+                row_title: None,
+                failure: None,
+            }
+        );
     }
 
     #[test]

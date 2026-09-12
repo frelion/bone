@@ -3,7 +3,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
     ConnectionForm, ConnectionKind, Effect, ModelChoice, ModelFacts, SecretText, SetupField,
-    UiState,
+    Status, UiState,
     reader::{ReaderContent, ReaderSource},
 };
 
@@ -203,7 +203,7 @@ pub(super) fn models_failed(
         && matches!(models.screen, ModelScreen::List { .. })
         && state.status.is_none()
     {
-        state.status = Some(error);
+        state.status = Some(Status::panel_request(session, request, error));
     }
 }
 
@@ -242,7 +242,15 @@ pub(super) fn model_applied(
     state.model_label = label;
     state.model_facts = facts;
     if matching_list || state.panel.is_none() {
-        state.status = error;
+        if let Some(error) = error {
+            state.status = Some(Status::panel_request(session, request, error));
+        } else if state
+            .status
+            .as_ref()
+            .is_some_and(|status| status.belongs_to_panel_request(session, request))
+        {
+            state.status = None;
+        }
     }
     if failed {
         if matching_list {
@@ -287,16 +295,27 @@ pub(super) fn connection_saved(
 
     if let Some(error) = error {
         form.saving = false;
-        state.status = Some(if form.key_was_sent {
-            format!("{error} Re-enter the API key before retrying.")
-        } else {
-            error
-        });
+        state.status = Some(Status::panel_request(
+            session,
+            request,
+            if form.key_was_sent {
+                format!("{error} Re-enter the API key before retrying.")
+            } else {
+                error
+            },
+        ));
         state.panel = Some(Panel::Models(models));
         reconcile_model_label(state, effects);
         return;
     }
 
+    if state
+        .status
+        .as_ref()
+        .is_some_and(|status| status.belongs_to_panel_request(session, request))
+    {
+        state.status = None;
+    }
     let subscription = form.kind.subscription();
     if subscription {
         let login_request = state.generation();
@@ -309,11 +328,15 @@ pub(super) fn connection_saved(
             profile: bone_app::ProfileId::chatgpt(),
             request: login_request,
         });
-        state.status = notice;
+        if let Some(notice) = notice {
+            state.status = Some(Status::panel_request(session, login_request, notice));
+        }
     } else {
         state.panel = Some(Panel::Models(models));
         return_to_models(state, effects);
-        state.status = notice;
+        if let Some(notice) = notice {
+            state.status = Some(Status::panel_request(session, request, notice));
+        }
     }
 }
 
@@ -357,6 +380,13 @@ pub(super) fn login_changed(
     let succeeded = matches!(login, LoginState::Succeeded);
     *current_state = login;
     if succeeded {
+        if state
+            .status
+            .as_ref()
+            .is_some_and(|status| status.belongs_to_panel_request(selected, request))
+        {
+            state.status = None;
+        }
         return_to_models(state, effects);
     }
 }
@@ -401,7 +431,7 @@ pub(super) fn refresh_reader(state: &mut UiState, snapshot: &bone_app::SessionVi
 
 pub(super) fn open_objects(state: &mut UiState, effects: &mut Vec<Effect>) {
     let Some(ui) = state.selected_ui() else {
-        state.status = Some("There is no session to inspect".into());
+        state.status = Some(Status::selection(None, "There is no session to inspect"));
         return;
     };
     let session = ui.id;
@@ -462,7 +492,10 @@ fn open_object(state: &mut UiState, effects: &mut Vec<Effect>) {
         return;
     };
     if state.selected != Some(session) {
-        state.status = Some("The session changed; reopen /details".into());
+        state.status = Some(Status::selection(
+            state.selected,
+            "The session changed; reopen /details",
+        ));
         return;
     }
     let content = state.selected_ui().and_then(|ui| match source {
@@ -484,7 +517,10 @@ fn open_object(state: &mut UiState, effects: &mut Vec<Effect>) {
         );
         state.status = None;
     } else {
-        state.status = Some("This object is no longer loaded; reopen /details".into());
+        state.status = Some(Status::selection(
+            state.selected,
+            "This object is no longer loaded; reopen /details",
+        ));
     }
 }
 
@@ -656,6 +692,7 @@ pub(super) fn select_model(state: &mut UiState, index: usize, effects: &mut Vec<
             request,
             kind: ModelOperationKind::Apply,
         });
+        state.status = None;
         effects.push(Effect::SetModel {
             session,
             request,
@@ -733,7 +770,7 @@ pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
         Ok(value) => value,
         Err(error) => {
             state.panel = Some(Panel::Models(models));
-            state.status = Some(error);
+            state.status = Some(Status::selection(state.selected, error));
             return;
         }
     };
@@ -760,7 +797,6 @@ fn return_to_models(state: &mut UiState, effects: &mut Vec<Effect>) {
     };
     models.screen = ModelScreen::List { selected: 0 };
     let session = models.session;
-    state.status = None;
     load_models(state, session, effects);
     refresh_model_label(state, effects);
 }
@@ -769,7 +805,6 @@ fn return_to_model_list(state: &mut UiState) {
     if let Some(Panel::Models(models)) = &mut state.panel {
         models.screen = ModelScreen::List { selected: 0 };
     }
-    state.status = None;
 }
 
 pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
@@ -782,12 +817,16 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
             ..
         }) => {
             effects.push(Effect::CancelLogin);
+            state.status = None;
             return_to_models(state, effects);
         }
         Panel::Models(ModelPanel {
             screen: ModelScreen::Add { .. } | ModelScreen::Setup(_),
             ..
-        }) => return_to_model_list(state),
+        }) => {
+            state.status = None;
+            return_to_model_list(state);
+        }
         Panel::Models(ModelPanel {
             screen: ModelScreen::List { .. },
             ..
@@ -966,7 +1005,7 @@ mod tests {
         models_failed(&mut state, None, old, "stale failure".into());
 
         assert_eq!(request(&state, ModelOperationKind::Load), current);
-        assert_eq!(state.status.as_deref(), Some("new panel status"));
+        assert_eq!(state.status_text(), Some("new panel status"));
         assert!(matches!(
             &state.panel,
             Some(Panel::Models(models)) if models.choices.is_empty()
@@ -1025,7 +1064,7 @@ mod tests {
         );
 
         assert_eq!(request(&state, ModelOperationKind::Load), current_load);
-        assert_eq!(state.status.as_deref(), Some("new panel status"));
+        assert_eq!(state.status_text(), Some("new panel status"));
         assert_eq!(state.model_label.as_deref(), Some("visible model"));
         assert!(matches!(
             &state.panel,
@@ -1106,6 +1145,27 @@ mod tests {
     }
 
     #[test]
+    fn successful_apply_does_not_clear_a_newer_unowned_status() {
+        let mut state = UiState::default();
+        ready_models(&mut state, vec![choice("new")]);
+        select_model(&mut state, 0, &mut Vec::new());
+        let apply = request(&state, ModelOperationKind::Apply);
+        state.status = Some("newer status".into());
+
+        model_applied(
+            &mut state,
+            None,
+            apply,
+            Some("new".into()),
+            None,
+            None,
+            &mut Vec::new(),
+        );
+
+        assert_eq!(state.status_text(), Some("newer status"));
+    }
+
+    #[test]
     fn failed_apply_keeps_authoritative_facts_and_its_error_during_reload() {
         let running = bone_app::ResolvedModel {
             selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), "old-running")
@@ -1145,9 +1205,9 @@ mod tests {
                 .model_configuration_summary()
                 .contains("Saved, not running: chatgpt/new-saved")
         );
-        assert_eq!(state.status.as_deref(), Some("request failed"));
+        assert_eq!(state.status_text(), Some("request failed"));
         models_failed(&mut state, None, reload, "catalogue failed".into());
-        assert_eq!(state.status.as_deref(), Some("request failed"));
+        assert_eq!(state.status_text(), Some("request failed"));
     }
 
     #[test]
@@ -1260,7 +1320,7 @@ mod tests {
             &mut Vec::new(),
         );
 
-        assert!(state.status.as_deref().unwrap().contains("Re-enter"));
+        assert!(state.status_text().unwrap().contains("Re-enter"));
         assert!(matches!(
             &state.panel,
             Some(Panel::Models(ModelPanel {
@@ -1273,7 +1333,7 @@ mod tests {
         let mut retry = Vec::new();
         save_connection(&mut state, &mut retry);
         assert!(retry.is_empty());
-        assert!(state.status.as_deref().unwrap().contains("Re-enter"));
+        assert!(state.status_text().unwrap().contains("Re-enter"));
     }
 
     #[test]
@@ -1348,6 +1408,31 @@ mod tests {
     }
 
     #[test]
+    fn successful_connection_save_does_not_clear_a_newer_unowned_status() {
+        let mut state = UiState::default();
+        let mut form = ConnectionForm::new(ConnectionKind::OpenAiResponses);
+        form.key = SecretText::from("secret".to_owned());
+        setup_panel(&mut state, form);
+        let mut effects = Vec::new();
+        save_connection(&mut state, &mut effects);
+        let [
+            Effect::SaveConnection {
+                request, session, ..
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("save effect")
+        };
+        let request = *request;
+        let session = *session;
+        state.status = Some("newer status".into());
+
+        connection_saved(&mut state, request, session, None, None, &mut Vec::new());
+
+        assert_eq!(state.status_text(), Some("newer status"));
+    }
+
+    #[test]
     fn late_connection_receipt_preserves_a_new_form_and_its_status() {
         let mut state = UiState::default();
         let mut old = ConnectionForm::new(ConnectionKind::OpenAiResponses);
@@ -1388,7 +1473,7 @@ mod tests {
             &mut receipts,
         );
 
-        assert_eq!(state.status.as_deref(), Some("new validation"));
+        assert_eq!(state.status_text(), Some("new validation"));
         assert!(matches!(
             &state.panel,
             Some(Panel::Models(ModelPanel {

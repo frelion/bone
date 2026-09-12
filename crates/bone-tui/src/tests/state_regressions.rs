@@ -137,7 +137,7 @@ fn stale_submit_failure_identity_cannot_mark_another_sessions_request_failed() {
         b_request
     );
     assert!(!state.session_ui[&b.id].submitting.as_ref().unwrap().failed);
-    assert!(state.status.as_deref() != Some("stale A failure"));
+    assert!(state.status_text() != Some("stale A failure"));
 }
 
 #[test]
@@ -264,8 +264,7 @@ fn edited_failed_new_does_not_replay_and_explicit_retry_reuses_identity() {
     assert!(pending.failed);
     assert!(
         state
-            .status
-            .as_deref()
+            .status_text()
             .is_some_and(|message| message.contains("--retry"))
     );
 

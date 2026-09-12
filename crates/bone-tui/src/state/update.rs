@@ -3,7 +3,7 @@ use bone_app::{RequestId, SessionId, SubmitInput};
 use crate::editor::{CursorMove, EditCommand};
 
 use super::{
-    HISTORY_CACHE_BYTES,
+    HISTORY_CACHE_BYTES, Status,
     answer::{self, AnswerDraft, RecoveryCandidate},
     model::*,
     panel,
@@ -140,6 +140,13 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     effects.push(Effect::Submit { session, input });
                 }
             }
+            if state
+                .status
+                .as_ref()
+                .is_some_and(|status| status.belongs_to_open(session, generation))
+            {
+                state.status = None;
+            }
         }
         UiEvent::SessionChanged {
             session,
@@ -260,6 +267,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 state.session_candidate = state.selected;
                 state.session_scroll = None;
             }
+            state.clear_stale_session_status();
         }
         UiEvent::DraftSaved {
             session,
@@ -277,6 +285,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             request_id,
         } => {
             let mut auto_title = None;
+            let mut submitted = false;
             if let Some(ui) = state.session_ui.get_mut(&session)
                 && ui
                     .submitting
@@ -284,6 +293,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     .is_some_and(|pending| pending.request_id == request_id)
                 && let Some(pending) = ui.submitting.take()
             {
+                submitted = true;
                 if let Some(question) = pending.reply_to {
                     if let Some(answer) = ui.answer_drafts.get_mut(&question) {
                         let cleared = answer.clear_if_submitted(
@@ -310,6 +320,14 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     auto_title = Some((ui.generation, pending.text));
                 }
             }
+            if submitted
+                && state
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.belongs_to_submission(session, request_id))
+            {
+                state.status = None;
+            }
             if let Some((generation, first_input)) = auto_title
                 && let Some(auto_title) = state.titles.start_auto(session, generation, first_input)
             {
@@ -331,7 +349,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             {
                 pending.failed = true;
                 if state.selected == Some(session) {
-                    state.status = Some(message);
+                    state.status = Some(Status::submission(session, request_id, message));
                 }
             }
         }
@@ -368,14 +386,11 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     ui.draft = editor;
                     ui.bootstrap_submission = pending.first_input;
                 }
-                if matches!(
-                    state.status.as_deref(),
-                    Some(
-                        "Creating session; your input is preserved"
-                            | "Confirming session creation; your input is preserved"
-                            | "Opening the new session; your input is preserved"
-                    )
-                ) {
+                if state
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.belongs_to_create(request_id))
+                {
                     state.status = None;
                 }
             }
@@ -388,7 +403,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 && pending.request_id == request_id
             {
                 pending.failed = true;
-                state.status = Some(message);
+                state.status = Some(Status::create(request_id, message));
             }
         }
         UiEvent::SessionRenamed {
@@ -432,6 +447,11 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
         } => match state.titles.finish_auto(session, request, result) {
             AutoTitleSettlement::Ignored => return effects,
             AutoTitleSettlement::Finished { row_title, failure } => {
+                if state.status.as_ref().is_some_and(|status| {
+                    status.belongs_to_auto_title_at_or_before(session, request)
+                }) {
+                    state.status = None;
+                }
                 if let Some(title) = row_title {
                     set_committed_session_title(state, session, title);
                 }
@@ -442,7 +462,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                         .is_some_and(|ui| ui.generation == failure.generation)
                     && state.selected == Some(session)
                 {
-                    state.status = Some(failure.message);
+                    state.status = Some(Status::auto_title(session, request, failure.message));
                 }
             }
         },
@@ -468,6 +488,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     session: receipt.session,
                     generation: next,
                 });
+                state.clear_stale_session_status();
             }
         }
         UiEvent::SessionOperationFailed {
@@ -490,7 +511,11 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     _ => {}
                 }
                 if state.selected == Some(session) {
-                    state.status = Some(message);
+                    state.status = Some(if kind == SessionOperationKind::OpenSession {
+                        Status::open(session, generation, message)
+                    } else {
+                        Status::session(session, generation, message)
+                    });
                 }
             }
         }
@@ -500,7 +525,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
         } => {
             if state.overview_request == Some(generation) {
                 state.overview_request = None;
-                state.status = Some(message);
+                state.status = Some(message.into());
             }
         }
         UiEvent::RememberSessionFailed {
@@ -511,7 +536,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             if state.selected == Some(session)
                 && current_generation_mut(state, session, generation).is_some()
             {
-                state.status = Some(message);
+                state.status = Some(Status::session(session, generation, message));
             }
         }
         UiEvent::Resized { width, height } => {
@@ -593,13 +618,21 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::Edit { target, command } => edit(state, target, command, effects),
         Action::CommitTitle => commit_title_edit(state, effects),
         Action::CancelTitle => {
+            let target = state.titles.edit_target();
             let row_title = state
                 .titles
                 .edit_target()
                 .and_then(|session| state.session_row(session))
                 .map(|row| row.info().title.clone());
             state.titles.cancel_edit(row_title.as_deref());
-            state.status = None;
+            if target.is_some_and(|session| {
+                state
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.belongs_to_title(session))
+            }) {
+                state.status = None;
+            }
             state.set_focus(Focus::Composer);
         }
         Action::StartSlashCommand => {
@@ -709,7 +742,10 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                     set_action_focus(state, Focus::Composer, effects);
                     state.status = None;
                 } else {
-                    state.status = Some("This question is no longer active".into());
+                    state.status = Some(Status::selection(
+                        Some(ui.id),
+                        "This question is no longer active",
+                    ));
                 }
             }
         }
@@ -814,7 +850,14 @@ fn edit(
                 };
             }
             state.titles.apply_edit(command);
-            if changes_text {
+            if changes_text
+                && state.titles.edit_target().is_some_and(|session| {
+                    state
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.belongs_to_title(session))
+                })
+            {
                 state.status = None;
             }
         }
@@ -871,7 +914,11 @@ fn submit(state: &mut UiState, effects: &mut Vec<Effect>) {
     }
     let ui = state.selected_ui_mut().expect("selected session checked");
     if ui.bootstrap_submission.is_some() {
-        state.status = Some("Opening the new session; your input is preserved".into());
+        state.status = Some(Status::open(
+            ui.id,
+            ui.generation,
+            "Opening the new session; your input is preserved",
+        ));
         return;
     }
     let reply_to = ui.selected_answer;
@@ -880,7 +927,10 @@ fn submit(state: &mut UiState, effects: &mut Vec<Effect>) {
             return;
         }
         if pending.text != text || pending.reply_to != reply_to {
-            state.status = Some("Confirm the previous submission before sending new text".into());
+            state.status = Some(Status::selection(
+                Some(ui.id),
+                "Confirm the previous submission before sending new text",
+            ));
             return;
         }
     }
@@ -898,7 +948,10 @@ fn submit(state: &mut UiState, effects: &mut Vec<Effect>) {
         match answer.submission(snapshot, request_id) {
             Ok(input) => (input, answer.editor.revision()),
             Err(_) => {
-                state.status = Some("This question has ended. Your answer is preserved; convert it explicitly to send ordinary text".into());
+                state.status = Some(Status::selection(
+                    Some(ui.id),
+                    "This question has ended. Your answer is preserved; convert it explicitly to send ordinary text",
+                ));
                 return;
             }
         }
@@ -928,10 +981,15 @@ fn create_for_first_input(state: &mut UiState, text: String, effects: &mut Vec<E
                 title: pending.title.clone(),
                 provisional: pending.provisional,
             });
-            state.status = Some("Confirming session creation; your input is preserved".into());
+            state.status = Some(Status::create(
+                pending.request_id,
+                "Confirming session creation; your input is preserved",
+            ));
         } else if pending.failed {
-            state.status =
-                Some("Previous session creation is unresolved; use /new --retry first".into());
+            state.status = Some(Status::create(
+                pending.request_id,
+                "Previous session creation is unresolved; use /new --retry first",
+            ));
         }
         return;
     }
@@ -959,7 +1017,10 @@ fn create_for_first_input(state: &mut UiState, text: String, effects: &mut Vec<E
         provisional: true,
     });
     state.pending_create = Some(pending);
-    state.status = Some("Creating session; your input is preserved".into());
+    state.status = Some(Status::create(
+        request_id,
+        "Creating session; your input is preserved",
+    ));
 }
 
 fn leave_answer(state: &mut UiState) {
@@ -981,7 +1042,10 @@ fn convert_answer(state: &mut UiState) {
         let cursor = restored.len();
         ui.draft.replace_user(restored, cursor);
         ui.selected_answer = None;
-        state.status = Some("Answer copied to ordinary draft; review before sending".into());
+        state.status = Some(Status::selection(
+            Some(ui.id),
+            "Answer copied to ordinary draft; review before sending",
+        ));
     }
 }
 
@@ -1010,7 +1074,10 @@ fn recover_input(
                 generation: ui.generation,
                 input,
             });
-            state.status = Some("Retry requested for the saved input".into());
+            state.status = Some(Status::selection(
+                Some(ui.id),
+                "Retry requested for the saved input",
+            ));
         }
         Some(RecoveryCandidate::Restore { text, reply_to, .. }) if !retry => {
             set_action_focus(state, Focus::Composer, effects);
@@ -1025,19 +1092,26 @@ fn recover_input(
                 let restored = answer::append_restored_text(answer.editor.text(), &text);
                 answer.replace(restored, usize::MAX);
                 ui.selected_answer = Some(question);
-                state.status = Some("Answer restored with its original question; an expired answer cannot be sent without explicit conversion".into());
+                state.status = Some(Status::selection(
+                    Some(ui.id),
+                    "Answer restored with its original question; an expired answer cannot be sent without explicit conversion",
+                ));
             } else {
                 let restored = answer::append_restored_text(ui.draft.text(), &text);
                 let cursor = restored.len();
                 ui.draft.replace_user(restored, cursor);
                 ui.selected_answer = None;
-                state.status = Some("Input restored to your draft; review before sending".into());
+                state.status = Some(Status::selection(
+                    Some(ui.id),
+                    "Input restored to your draft; review before sending",
+                ));
             }
         }
         _ => {
-            state.status = Some(
-                "This input has no matching recovery action; refresh or load its history".into(),
-            )
+            state.status = Some(Status::selection(
+                Some(ui.id),
+                "This input has no matching recovery action; refresh or load its history",
+            ))
         }
     }
 }
@@ -1059,7 +1133,11 @@ fn retry_submission(state: &mut UiState, effects: &mut Vec<Effect>) {
         session: ui.id,
         input,
     });
-    state.status = Some("Confirming the original submission; newer draft is preserved".into());
+    state.status = Some(Status::submission(
+        ui.id,
+        pending.request_id,
+        "Confirming the original submission; newer draft is preserved",
+    ));
 }
 
 fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
@@ -1080,7 +1158,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
         COMMANDS.iter().find(|spec| spec.name == typed).copied()
     };
     let Some(selected) = selected else {
-        state.status = Some(format!("Unknown command: /{typed}"));
+        set_selection_status(state, format!("Unknown command: /{typed}"));
         return;
     };
     match selected.kind {
@@ -1097,7 +1175,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             if let Some(question) = question {
                 handle_action(state, Action::AnswerQuestion(question), effects);
             } else {
-                state.status = Some("No active question".into());
+                set_selection_status(state, "No active question");
             }
         }
         CommandKind::Recover if argument.is_empty() => {
@@ -1116,7 +1194,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             if let Some(input) = input {
                 handle_action(state, Action::RestoreInput(input), effects);
             } else {
-                state.status = Some("No cancelled input to restore".into());
+                set_selection_status(state, "No cancelled input to restore");
             }
         }
         CommandKind::Retry if argument.is_empty() => {
@@ -1141,7 +1219,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
                 if let Some(input) = input {
                     handle_action(state, Action::RetryInput(input), effects);
                 } else {
-                    state.status = Some("No input needs retry".into());
+                    set_selection_status(state, "No input needs retry");
                 }
             }
         }
@@ -1157,7 +1235,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
                 clear_current_draft(state, effects);
                 panel::set_named_model(state, profile, model, effects);
             } else {
-                state.status = Some("Usage: /model [profile model]".into());
+                set_selection_status(state, "Usage: /model [profile model]");
             }
         }
         CommandKind::Details if argument.is_empty() => {
@@ -1175,10 +1253,15 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
                         title: pending.title.clone(),
                         provisional: pending.provisional,
                     });
+                    state.status = Some(Status::create(
+                        pending.request_id,
+                        "Confirming session creation; your input is preserved",
+                    ));
                 } else if pending.failed {
-                    state.status = Some(
-                        "Previous session creation is unresolved; use /new --retry first".into(),
-                    );
+                    state.status = Some(Status::create(
+                        pending.request_id,
+                        "Previous session creation is unresolved; use /new --retry first",
+                    ));
                 }
                 if retry {
                     state
@@ -1233,7 +1316,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
                 state.set_focus(Focus::SessionTitle);
                 state.caret_visible = true;
             } else {
-                state.status = Some("There is no session to rename".into());
+                set_selection_status(state, "There is no session to rename");
             }
         }
         CommandKind::Rename if !argument.is_empty() => {
@@ -1242,7 +1325,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
                 state.titles.replace_user(argument.into(), argument.len());
                 commit_title_edit(state, effects);
             } else {
-                state.status = Some("There is no session to rename".into());
+                set_selection_status(state, "There is no session to rename");
             }
         }
         CommandKind::Help if argument.is_empty() => {
@@ -1255,8 +1338,15 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             dispatch_title_writes(state.titles.flush_for_exit(), effects);
             effects.push(Effect::Shutdown);
         }
-        _ => state.status = Some(format!("Usage: /{} {}", selected.name, selected.usage)),
+        _ => set_selection_status(
+            state,
+            format!("Usage: /{} {}", selected.name, selected.usage),
+        ),
     }
+}
+
+fn set_selection_status(state: &mut UiState, text: impl Into<String>) {
+    state.status = Some(Status::selection(state.selected, text));
 }
 
 fn create_source_matches(state: &UiState, source: &DraftSource) -> bool {
@@ -1403,7 +1493,6 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
         });
     }
     state.selected = Some(id);
-    clear_title_rename_error_for_other_session(state, id);
     panel::refresh_model_label(state, effects);
     state.slash_dismissed = None;
     let generation = state.generation();
@@ -1413,6 +1502,7 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
         .or_insert_with(|| SessionUi::new(id, generation));
     ui.generation = generation;
     ui.transcript.start_generation();
+    state.clear_stale_session_status();
     effects.push(Effect::OpenSession {
         session: id,
         generation,
@@ -1854,13 +1944,22 @@ fn commit_title_edit(state: &mut UiState, effects: &mut Vec<Effect>) {
     match state.titles.commit(row_title.as_deref()) {
         None => {}
         Some(TitleCommit::Invalid) => {
-            state.status = Some("Use a nonempty title of at most 200 bytes".into());
+            state.status = Some(Status::title_edit(
+                target,
+                "Use a nonempty title of at most 200 bytes",
+            ));
         }
         Some(TitleCommit::Accepted(write)) => {
             if let Some(write) = write {
                 dispatch_title_write(write, effects);
             }
-            state.status = None;
+            if state
+                .status
+                .as_ref()
+                .is_some_and(|status| status.belongs_to_title(target))
+            {
+                state.status = None;
+            }
         }
     }
 }
@@ -1873,11 +1972,11 @@ fn settle_manual_title(
     row_title: Option<&str>,
     effects: &mut Vec<Effect>,
 ) {
+    let result_is_success = result.is_ok();
     let ManualTitleSettlement::Finished {
         row_title,
         next_write,
         final_error,
-        cleared_error,
         drained,
     } = state
         .titles
@@ -1888,8 +1987,11 @@ fn settle_manual_title(
     if let Some(title) = row_title {
         set_committed_session_title(state, session, title);
     }
-    if let Some(message) = cleared_error
-        && state.status.as_deref() == Some(message.as_str())
+    if result_is_success
+        && state
+            .status
+            .as_ref()
+            .is_some_and(|status| status.belongs_to_title_rename(session, request))
     {
         state.status = None;
     }
@@ -1900,7 +2002,7 @@ fn settle_manual_title(
         && state.selected == Some(session)
         && !state.quitting
     {
-        set_title_rename_error(state, session, message);
+        state.status = Some(Status::title_rename(session, request, message));
     }
     if drained && !state.quitting {
         release_inactive_session(state, session, effects);
@@ -1963,19 +2065,6 @@ fn reconcile_overview_rows(state: &mut UiState, rows: &mut [SessionNavRow]) {
             state
                 .titles
                 .reconcile_authoritative(session, &authoritative, current.as_deref());
-    }
-}
-
-fn set_title_rename_error(state: &mut UiState, session: SessionId, message: String) {
-    state.status = Some(message.clone());
-    state.titles.record_error(session, message);
-}
-
-fn clear_title_rename_error_for_other_session(state: &mut UiState, selected: SessionId) {
-    if let Some(message) = state.titles.take_error_for_other(selected)
-        && state.status.as_deref() == Some(message.as_str())
-    {
-        state.status = None;
     }
 }
 
@@ -2310,18 +2399,12 @@ mod panel_draft_tests {
             });
         update(&mut state, UiEvent::Action(Action::ActivatePanel));
         assert!(matches!(state.panel, Some(Panel::Objects(_))));
-        assert!(
-            state
-                .status
-                .as_deref()
-                .unwrap()
-                .contains("no longer loaded")
-        );
+        assert!(state.status_text().unwrap().contains("no longer loaded"));
         assert_drafts(&state, question);
         state.selected = Some(SessionId::new());
         update(&mut state, UiEvent::Action(Action::SelectObject(0)));
         assert!(matches!(state.panel, Some(Panel::Objects(_))));
-        assert!(state.status.as_deref().unwrap().contains("session changed"));
+        assert!(state.status_text().unwrap().contains("session changed"));
     }
 
     fn assert_drafts(state: &UiState, question: QuestionId) {
@@ -2574,7 +2657,7 @@ mod panel_draft_tests {
                 message: "Could not save title".into(),
             },
         );
-        assert_eq!(state.status.as_deref(), Some("Could not save title"));
+        assert_eq!(state.status_text(), Some("Could not save title"));
         assert_eq!(
             state
                 .session_row(*session)
@@ -2793,7 +2876,7 @@ mod final_integration_regressions {
                 .unwrap()
                 .failed
         );
-        assert_eq!(state.status.as_deref(), Some("current status"));
+        assert_eq!(state.status_text(), Some("current status"));
         update(
             &mut state,
             UiEvent::SessionOperationFailed {
@@ -2803,7 +2886,7 @@ mod final_integration_regressions {
                 message: "background history failed".into(),
             },
         );
-        assert_eq!(state.status.as_deref(), Some("current status"));
+        assert_eq!(state.status_text(), Some("current status"));
         update(
             &mut state,
             UiEvent::SessionOperationFailed {
@@ -2813,7 +2896,7 @@ mod final_integration_regressions {
                 message: "background recent history failed".into(),
             },
         );
-        assert_eq!(state.status.as_deref(), Some("current status"));
+        assert_eq!(state.status_text(), Some("current status"));
         update(
             &mut state,
             UiEvent::SessionOperationFailed {
@@ -2823,7 +2906,7 @@ mod final_integration_regressions {
                 message: "current save failed".into(),
             },
         );
-        assert_eq!(state.status.as_deref(), Some("current save failed"));
+        assert_eq!(state.status_text(), Some("current save failed"));
     }
 
     #[test]
@@ -2843,7 +2926,7 @@ mod final_integration_regressions {
         );
 
         assert_eq!(state.overview_request, Some(current));
-        assert_eq!(state.status.as_deref(), Some("current status"));
+        assert_eq!(state.status_text(), Some("current status"));
 
         update(
             &mut state,
@@ -2854,7 +2937,7 @@ mod final_integration_regressions {
         );
 
         assert_eq!(state.overview_request, None);
-        assert_eq!(state.status.as_deref(), Some("current overview failed"));
+        assert_eq!(state.status_text(), Some("current overview failed"));
     }
 
     #[test]
@@ -2883,7 +2966,7 @@ mod final_integration_regressions {
             },
         );
 
-        assert_eq!(state.status.as_deref(), Some("current status"));
+        assert_eq!(state.status_text(), Some("current status"));
         assert_eq!(
             state
                 .session_ui
@@ -2905,7 +2988,7 @@ mod final_integration_regressions {
             },
         );
 
-        assert_eq!(state.status.as_deref(), Some("current history failed"));
+        assert_eq!(state.status_text(), Some("current history failed"));
         assert_eq!(
             state
                 .session_ui
@@ -2939,7 +3022,7 @@ mod final_integration_regressions {
                     message: message.into(),
                 },
             );
-            assert_eq!(state.status.as_deref(), Some(message));
+            assert_eq!(state.status_text(), Some(message));
         }
     }
 
@@ -2972,7 +3055,7 @@ mod final_integration_regressions {
                 message: "stale selection failed".into(),
             },
         );
-        assert_eq!(state.status.as_deref(), Some("current status"));
+        assert_eq!(state.status_text(), Some("current status"));
 
         let reselection = update(&mut state, UiEvent::Action(Action::SelectSession(previous)));
         let current_generation = reselection
@@ -2996,7 +3079,7 @@ mod final_integration_regressions {
                 message: "old visit failed".into(),
             },
         );
-        assert_eq!(state.status.as_deref(), Some("current status"));
+        assert_eq!(state.status_text(), Some("current status"));
 
         update(
             &mut state,
@@ -3006,7 +3089,7 @@ mod final_integration_regressions {
                 message: "current selection failed".into(),
             },
         );
-        assert_eq!(state.status.as_deref(), Some("current selection failed"));
+        assert_eq!(state.status_text(), Some("current selection failed"));
     }
 }
 
@@ -3514,6 +3597,261 @@ mod title_rename_tests {
     }
 
     #[test]
+    fn title_receipts_clear_only_the_status_they_own() {
+        let (mut state, first, second) = fixture();
+        dirty_title(&mut state, "First write");
+        let (_, request, title) =
+            rename_effect(&update(&mut state, UiEvent::Action(Action::CommitTitle)));
+        dirty_title(&mut state, "   ");
+        update(&mut state, UiEvent::Action(Action::CommitTitle));
+        assert_eq!(
+            state.status_text(),
+            Some("Use a nonempty title of at most 200 bytes")
+        );
+
+        update(
+            &mut state,
+            UiEvent::SessionRenamed {
+                session: first.id,
+                request,
+                title,
+            },
+        );
+        assert_eq!(
+            state.status_text(),
+            Some("Use a nonempty title of at most 200 bytes")
+        );
+
+        state.status = Some("same text as a prior title error".into());
+        update(
+            &mut state,
+            UiEvent::Action(Action::SelectSession(second.id)),
+        );
+        assert_eq!(
+            state.status_text(),
+            Some("same text as a prior title error")
+        );
+    }
+
+    #[test]
+    fn selection_and_overview_remove_only_session_scoped_status() {
+        let (mut state, first, second) = fixture();
+        state.status = Some(Status::title_edit(first.id, "invalid title"));
+        update(
+            &mut state,
+            UiEvent::Action(Action::SelectSession(second.id)),
+        );
+        assert!(state.status.is_none());
+
+        let second_generation = state.session_ui[&second.id].generation;
+        state.status = Some(Status::session(
+            second.id,
+            second_generation,
+            "session failure",
+        ));
+        update(&mut state, UiEvent::Action(Action::SelectSession(first.id)));
+        assert!(state.status.is_none());
+
+        state.status = Some(Status::selection(Some(first.id), "selection status"));
+        update(
+            &mut state,
+            UiEvent::Action(Action::SelectSession(second.id)),
+        );
+        assert!(state.status.is_none());
+
+        state.status = Some(Status::open(
+            second.id,
+            state.session_ui[&second.id].generation,
+            "opening",
+        ));
+        overview_rows(&mut state, vec![row(first)]);
+        assert_eq!(state.selected, None);
+        assert!(state.status.is_none());
+    }
+
+    #[test]
+    fn automatic_title_status_obeys_request_order_and_manual_intent() {
+        let (mut state, first, _) = fixture();
+        let older = schedule_auto_title(&mut state, first.id);
+        let newer = schedule_auto_title(&mut state, first.id);
+        update(
+            &mut state,
+            UiEvent::SessionAutoTitleFinished {
+                session: first.id,
+                request: older,
+                result: Err("older failure".into()),
+            },
+        );
+        assert_eq!(state.status_text(), Some("older failure"));
+        update(
+            &mut state,
+            UiEvent::SessionAutoTitleFinished {
+                session: first.id,
+                request: newer,
+                result: Ok(None),
+            },
+        );
+        assert!(state.status.is_none());
+
+        let late = schedule_auto_title(&mut state, first.id);
+        dirty_title(&mut state, "Manual title");
+        update(&mut state, UiEvent::Action(Action::CommitTitle));
+        state.status = Some("newer status".into());
+        update(
+            &mut state,
+            UiEvent::SessionAutoTitleFinished {
+                session: first.id,
+                request: late,
+                result: Err("obsolete automatic failure".into()),
+            },
+        );
+        assert_eq!(state.status_text(), Some("newer status"));
+    }
+
+    #[test]
+    fn open_status_expires_on_generation_change_and_exact_completion() {
+        let (mut state, first, _) = fixture();
+        let generation = state.session_ui[&first.id].generation;
+        state.status = Some(Status::open(first.id, generation, "opening"));
+        update(
+            &mut state,
+            UiEvent::SessionReleased {
+                generation,
+                receipt: bone_app::SessionReleaseReceipt {
+                    session: first.id,
+                    status: bone_app::SessionReleaseStatus::Released,
+                },
+            },
+        );
+        assert!(state.status.is_none());
+
+        let current = state.session_ui[&first.id].generation;
+        state.status = Some(Status::open(first.id, current, "opening again"));
+        update(
+            &mut state,
+            UiEvent::SessionOpened {
+                session: first.id,
+                generation: current,
+                snapshot: snapshot(first),
+                history: bone_app::RecentHistoryPage {
+                    items: vec![],
+                    older_cursor: None,
+                    snapshot_through: bone_app::SessionSeq(0),
+                },
+            },
+        );
+        assert!(state.status.is_none());
+    }
+
+    #[test]
+    fn create_and_submit_owned_statuses_clear_on_exact_completion() {
+        let mut state = UiState::default();
+        state.orphan_draft = "first input".into();
+        update(&mut state, UiEvent::Action(Action::Submit));
+        let request = state.pending_create.as_ref().unwrap().request_id;
+        let created = session_info(
+            bone_app::WorkspaceId::new(),
+            SessionId::new(),
+            "New conversation",
+        );
+        update(
+            &mut state,
+            UiEvent::SessionCreated {
+                request_id: request,
+                info: created.clone(),
+            },
+        );
+        assert!(state.status.is_none());
+
+        let ui = state.session_ui.get_mut(&created.id).unwrap();
+        ui.bootstrap_submission = None;
+        ui.draft = "retry me".into();
+        let submit_request = update(&mut state, UiEvent::Action(Action::Submit))
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::Submit { input, .. } => Some(input.request_id),
+                _ => None,
+            })
+            .unwrap();
+        update(
+            &mut state,
+            UiEvent::SubmitFailed {
+                session: created.id,
+                request_id: submit_request,
+                message: "submit failed".into(),
+            },
+        );
+        update(&mut state, UiEvent::Action(Action::RetrySubmission));
+        update(
+            &mut state,
+            UiEvent::Submitted {
+                session: created.id,
+                request_id: submit_request,
+            },
+        );
+        assert!(state.status.is_none());
+    }
+
+    #[test]
+    fn create_and_submit_completions_preserve_newer_unowned_status() {
+        let mut state = UiState::default();
+        state.orphan_draft = "first input".into();
+        update(&mut state, UiEvent::Action(Action::Submit));
+        let request = state.pending_create.as_ref().unwrap().request_id;
+        let created = session_info(
+            bone_app::WorkspaceId::new(),
+            SessionId::new(),
+            "New conversation",
+        );
+        state.status = Some("Creating session; your input is preserved".into());
+        update(
+            &mut state,
+            UiEvent::SessionCreated {
+                request_id: request,
+                info: created.clone(),
+            },
+        );
+        assert_eq!(
+            state.status_text(),
+            Some("Creating session; your input is preserved")
+        );
+
+        let ui = state.session_ui.get_mut(&created.id).unwrap();
+        ui.bootstrap_submission = None;
+        ui.draft = "retry me".into();
+        let submit = update(&mut state, UiEvent::Action(Action::Submit));
+        let submit_request = submit
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Submit { input, .. } => Some(input.request_id),
+                _ => None,
+            })
+            .unwrap();
+        update(
+            &mut state,
+            UiEvent::SubmitFailed {
+                session: created.id,
+                request_id: submit_request,
+                message: "submit failed".into(),
+            },
+        );
+        update(&mut state, UiEvent::Action(Action::RetrySubmission));
+        assert_eq!(
+            state.status_text(),
+            Some("Confirming the original submission; newer draft is preserved")
+        );
+        state.status = Some("newer status".into());
+        update(
+            &mut state,
+            UiEvent::Submitted {
+                session: created.id,
+                request_id: submit_request,
+            },
+        );
+        assert_eq!(state.status_text(), Some("newer status"));
+    }
+
+    #[test]
     fn scrolling_and_resizing_do_not_commit_a_dirty_title() {
         let (mut state, _, _) = fixture();
         dirty_title(&mut state, "Local edit");
@@ -3956,7 +4294,7 @@ mod title_rename_tests {
                 result: Err("automatic title failed".into()),
             },
         );
-        assert_eq!(state.status.as_deref(), Some("automatic title failed"));
+        assert_eq!(state.status_text(), Some("automatic title failed"));
         update(
             &mut state,
             UiEvent::SessionAutoTitleFinished {
@@ -4160,7 +4498,7 @@ mod title_rename_tests {
         assert_eq!(title_in_rail(&state, first.id), "Alpha");
         assert_eq!(committed_title_in_row(&state, first.id), "Alpha");
         assert_eq!(state.title_text(), Some("Alpha"));
-        assert_eq!(state.status.as_deref(), Some("Could not save title"));
+        assert_eq!(state.status_text(), Some("Could not save title"));
 
         update(
             &mut state,
