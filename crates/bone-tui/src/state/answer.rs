@@ -154,7 +154,7 @@ pub fn recovery_candidate(input: &InputView) -> Option<RecoveryCandidate> {
 
 /// Cancelled inputs disappear from SessionView.inputs. Recover their original
 /// text from typed history events, not display strings or guessed runtime state.
-/// `history` must be ascending session history (e.g. SessionUi.history.iter()).
+/// `history` must be ascending session history from `TranscriptState::entries`.
 /// Missing InputSubmitted means no restore candidate until earlier history loads.
 /// Only live snapshot entries can offer Retry; partial history cannot invent it.
 pub fn recoverable_inputs<'a>(

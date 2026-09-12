@@ -641,6 +641,15 @@ impl Runtime {
                             }
                         }
                     });
+                } else {
+                    send_failure(
+                        &self.tx,
+                        OperationKind::LoadHistory,
+                        Some(session),
+                        Some(generation),
+                        "Unable to load recent activity because the session is not open".into(),
+                    )
+                    .await;
                 }
             }
             Effect::LoadOlderHistory {
@@ -673,6 +682,15 @@ impl Runtime {
                             }
                         }
                     });
+                } else {
+                    send_failure(
+                        &self.tx,
+                        OperationKind::LoadOlderHistory,
+                        Some(session),
+                        Some(generation),
+                        "Unable to load older activity because the session is not open".into(),
+                    )
+                    .await;
                 }
             }
             Effect::ReloadRecentHistory {
@@ -704,6 +722,16 @@ impl Runtime {
                             }
                         }
                     });
+                } else {
+                    send_failure(
+                        &self.tx,
+                        OperationKind::ReloadRecentHistory,
+                        Some(session),
+                        Some(generation),
+                        "Unable to return to recent activity because the session is not open"
+                            .into(),
+                    )
+                    .await;
                 }
             }
             Effect::RefreshOverview { generation } => {
@@ -1170,6 +1198,60 @@ mod lifecycle_tests {
         }
         .boxed()
         .shared()
+    }
+
+    #[tokio::test]
+    async fn missing_history_handle_returns_failures_for_every_loading_latch() {
+        let (_root, _app, session, mut runtime, mut rx) = runtime_with_provisional_session().await;
+        let id = session.id();
+        for text in ["history cursor one", "history cursor two"] {
+            session
+                .submit(bone_app::SubmitInput::new(text))
+                .await
+                .unwrap();
+        }
+        let cursor = session
+            .recent_history(None, 1)
+            .await
+            .unwrap()
+            .older_cursor
+            .expect("two submitted inputs create a backward history cursor");
+
+        for effect in [
+            Effect::LoadHistory {
+                session: id,
+                generation: 7,
+                after: bone_app::SessionSeq(0),
+            },
+            Effect::LoadOlderHistory {
+                session: id,
+                generation: 7,
+                cursor,
+            },
+            Effect::ReloadRecentHistory {
+                session: id,
+                generation: 7,
+            },
+        ] {
+            assert!(!runtime.apply(effect).await);
+        }
+
+        for expected in [
+            OperationKind::LoadHistory,
+            OperationKind::LoadOlderHistory,
+            OperationKind::ReloadRecentHistory,
+        ] {
+            assert!(matches!(
+                rx.recv().await,
+                Some(UiEvent::OperationFailed {
+                    kind,
+                    session: Some(session),
+                    generation: Some(7),
+                    ..
+                }) if kind == expected && session == id
+            ));
+        }
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]

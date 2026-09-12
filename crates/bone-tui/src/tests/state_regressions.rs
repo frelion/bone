@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::{
     layout::{HitTarget, SinglePane},
     state::{
-        Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, OperationKind, SessionNavRow,
-        SessionUi, UiEvent, UiState, update,
+        Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, SessionNavRow, SessionUi,
+        UiEvent, UiState, update,
     },
     view,
 };
@@ -395,18 +395,32 @@ fn live_history_load_is_deduplicated_and_cursor_never_moves_backwards() {
         },
     );
     let ui = &state.session_ui[&session.id];
-    assert_eq!(ui.history_cursor, bone_app::SessionSeq(5));
-    assert_eq!(ui.history.len(), 1);
+    assert_eq!(
+        ui.transcript
+            .entries()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>(),
+        vec![bone_app::SessionSeq(5)]
+    );
+    let next = update(
+        &mut state,
+        UiEvent::SessionChanged {
+            session: session.id,
+            generation,
+            snapshot: snapshot(&session, 6),
+        },
+    );
+    assert!(
+        matches!(next.as_slice(), [Effect::LoadHistory { after, .. }] if *after == bone_app::SessionSeq(5))
+    );
 }
 
 #[test]
-fn older_history_stays_capped_and_failure_releases_the_loading_latch() {
+fn older_history_stays_capped_and_records_the_live_tail_gap() {
     let workspace = WorkspaceId::new();
     let session = info(workspace, "older");
     let mut state = opened(std::slice::from_ref(&session));
     let generation = state.session_ui[&session.id].generation;
-    state.session_ui.get_mut(&session.id).unwrap().older_loading = true;
-
     update(
         &mut state,
         UiEvent::OlderHistoryLoaded {
@@ -420,20 +434,15 @@ fn older_history_stays_capped_and_failure_releases_the_loading_latch() {
         },
     );
     let ui = &state.session_ui[&session.id];
-    assert_eq!(ui.history.len(), crate::state::HISTORY_CACHE_ITEMS);
-    assert!(ui.newer_history_missing);
-
-    state.session_ui.get_mut(&session.id).unwrap().older_loading = true;
-    update(
-        &mut state,
-        UiEvent::OperationFailed {
-            kind: OperationKind::LoadOlderHistory,
-            session: Some(session.id),
-            generation: Some(generation),
-            message: "retryable".into(),
-        },
+    assert_eq!(
+        ui.transcript.entries().count(),
+        crate::state::HISTORY_CACHE_ITEMS
     );
-    assert!(!state.session_ui[&session.id].older_loading);
+    let effects = update(&mut state, UiEvent::Action(Action::ScrollDown(usize::MAX)));
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::ReloadRecentHistory { .. }]
+    ));
 }
 
 #[test]
@@ -463,7 +472,11 @@ fn total_history_bytes_are_bounded_across_sessions_with_large_replies() {
             },
         );
     }
-    let total: usize = state.session_ui.values().map(|ui| ui.history_bytes).sum();
+    let total: usize = state
+        .session_ui
+        .values()
+        .map(|ui| ui.transcript.allocated_bytes())
+        .sum();
     assert!(
         total <= crate::state::HISTORY_CACHE_BYTES,
         "retained {total} bytes"
@@ -617,7 +630,11 @@ fn visual_row_metrics_prevent_early_older_history_prefetch() {
     let session = info(workspace, "long reply");
     let mut state = opened(std::slice::from_ref(&session));
     let ui = state.session_ui.get_mut(&session.id).unwrap();
-    ui.history.push_back(large_reply(1, 20_000));
+    ui.transcript.open(RecentHistoryPage {
+        items: vec![large_reply(1, 20_000)],
+        older_cursor: None,
+        snapshot_through: bone_app::SessionSeq(1),
+    });
     let metrics = render_plan(&state, 120, 30)
         .transcript_metrics
         .expect("rendered transcript metrics");
@@ -625,7 +642,10 @@ fn visual_row_metrics_prevent_early_older_history_prefetch() {
     assert!(crate::state::retain_transcript(&mut state, metrics));
 
     let effects = update(&mut state, UiEvent::Action(Action::ScrollUp(1)));
-    assert_eq!(state.session_ui[&session.id].scroll_from_tail, 1);
+    assert_eq!(
+        state.session_ui[&session.id].transcript.scroll_from_tail(),
+        1
+    );
     assert!(
         !effects
             .iter()
@@ -635,15 +655,18 @@ fn visual_row_metrics_prevent_early_older_history_prefetch() {
 }
 
 #[test]
-fn evicting_newer_messages_compensates_the_visual_scroll_anchor() {
+fn rendered_metrics_count_wrapped_rows_per_history_entry() {
     let workspace = WorkspaceId::new();
     let session = info(workspace, "anchored history");
     let mut state = opened(std::slice::from_ref(&session));
     let ui = state.session_ui.get_mut(&session.id).unwrap();
-    ui.history = (1_000..1_512)
-        .map(|sequence| large_reply(sequence, 160))
-        .collect();
-    ui.history_bytes = ui.history.iter().map(history_bytes).sum();
+    ui.transcript.open(RecentHistoryPage {
+        items: (1_000..1_512)
+            .map(|sequence| large_reply(sequence, 160))
+            .collect(),
+        older_cursor: None,
+        snapshot_through: bone_app::SessionSeq(1_511),
+    });
 
     let metrics = render_plan(&state, 100, 24)
         .transcript_metrics
@@ -652,26 +675,6 @@ fn evicting_newer_messages_compensates_the_visual_scroll_anchor() {
         .map(|sequence| metrics.anchors.row_count(bone_app::SessionSeq(sequence)))
         .sum::<usize>();
     assert!(evicted_rows > 32, "wrapped messages occupy multiple rows");
-    let ui = state.session_ui.get_mut(&session.id).unwrap();
-    ui.scroll_from_tail = evicted_rows + 7;
-    ui.older_loading = true;
-    ui.older_metrics = Some(metrics);
-    let generation = ui.generation;
-
-    update(
-        &mut state,
-        UiEvent::OlderHistoryLoaded {
-            session: session.id,
-            generation,
-            page: RecentHistoryPage {
-                items: (1..=32).map(cancelled).collect(),
-                older_cursor: None,
-                snapshot_through: bone_app::SessionSeq(1_511),
-            },
-        },
-    );
-    assert_eq!(state.session_ui[&session.id].scroll_from_tail, 7);
-    assert!(state.session_ui[&session.id].newer_history_missing);
 }
 
 fn render_plan(state: &UiState, width: u16, height: u16) -> view::FrameSnapshot {
@@ -707,10 +710,6 @@ fn large_reply(sequence: u64, bytes: usize) -> HistoryEntry {
             text: "x".repeat(bytes),
         },
     }
-}
-
-fn history_bytes(entry: &HistoryEntry) -> usize {
-    serde_json::to_vec(entry).unwrap().len()
 }
 
 fn replace_orphan_draft(state: &mut UiState, text: &str) {

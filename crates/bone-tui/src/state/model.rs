@@ -1,21 +1,17 @@
 pub use crate::run::models::{ModelChoice, ModelFacts};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
 
-use bone_app::{
-    HistoryCursor, HistoryEntry, QuestionId, RequestId, SessionId, SessionInfo, SessionSummary,
-    SessionView,
+use bone_app::{QuestionId, RequestId, SessionId, SessionInfo, SessionSummary, SessionView};
+
+use crate::layout::SinglePane;
+
+use super::{
+    TranscriptState,
+    panel::{ModelOperation, Panel},
 };
-
-use crate::layout::{SinglePane, TranscriptMetrics};
-
-use super::panel::{ModelOperation, Panel};
-
-pub const HISTORY_CACHE_ITEMS: usize = 512;
-// Reserve the other half of the 32 MiB cache budget for editor history and reader layout.
-pub const HISTORY_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Focus {
@@ -218,15 +214,7 @@ pub struct SessionUi {
     pub id: SessionId,
     pub generation: u64,
     pub snapshot: Option<Arc<SessionView>>,
-    pub history: VecDeque<HistoryEntry>,
-    pub history_bytes: usize,
-    pub history_cursor: bone_app::SessionSeq,
-    pub older_cursor: Option<HistoryCursor>,
-    pub older_loading: bool,
-    pub older_metrics: Option<Arc<TranscriptMetrics>>,
-    pub history_loading: bool,
-    pub recent_loading: bool,
-    pub newer_history_missing: bool,
+    pub(crate) transcript: TranscriptState,
     pub(crate) draft: crate::editor::EditorBuffer,
     pub saved_draft_revision: u64,
     pub answer_drafts: BTreeMap<QuestionId, super::answer::AnswerDraft>,
@@ -234,10 +222,6 @@ pub struct SessionUi {
     pub hydrated: bool,
     pub submitting: Option<PendingSubmission>,
     pub bootstrap_submission: Option<PendingSubmission>,
-    pub scroll_from_tail: usize,
-    pub read_anchor: Option<crate::layout::ContentAnchor>,
-    pub transcript_metrics: Option<Arc<TranscriptMetrics>>,
-    pub unread: usize,
 }
 
 impl SessionUi {
@@ -276,15 +260,7 @@ impl SessionUi {
             id,
             generation,
             snapshot: None,
-            history: VecDeque::new(),
-            history_bytes: 0,
-            history_cursor: bone_app::SessionSeq(0),
-            older_cursor: None,
-            older_loading: false,
-            older_metrics: None,
-            history_loading: false,
-            recent_loading: false,
-            newer_history_missing: false,
+            transcript: TranscriptState::default(),
             draft: Default::default(),
             saved_draft_revision: 0,
             answer_drafts: BTreeMap::new(),
@@ -292,10 +268,6 @@ impl SessionUi {
             hydrated: false,
             submitting: None,
             bootstrap_submission: None,
-            scroll_from_tail: 0,
-            read_anchor: None,
-            transcript_metrics: None,
-            unread: 0,
         }
     }
 }
@@ -665,10 +637,6 @@ impl UiState {
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         self.next_generation
     }
-}
-
-pub(crate) fn history_entry_bytes(entry: &HistoryEntry) -> usize {
-    serde_json::to_vec(entry).map_or(0, |bytes| bytes.len())
 }
 
 #[cfg(test)]

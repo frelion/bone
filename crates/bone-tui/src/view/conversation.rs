@@ -74,7 +74,7 @@ pub(super) fn render(
                         problem_hint(problem, composer_area.width.saturating_sub(4)).into()
                     } else if state
                         .selected_ui()
-                        .is_some_and(|ui| ui.read_anchor.is_some())
+                        .is_some_and(|ui| ui.transcript.reading())
                     {
                         "Reading history · PgDn for latest".into()
                     } else {
@@ -172,7 +172,7 @@ fn status_tone(state: &UiState) -> ratatui::style::Color {
     };
     if let Some(problem) = &snapshot.problem {
         super::session_rail::problem_status(problem).1
-    } else if ui.read_anchor.is_some()
+    } else if ui.transcript.reading()
         || matches!(
             snapshot.runtime,
             RuntimeState::Starting | RuntimeState::Running { .. }
@@ -297,7 +297,7 @@ fn render_transcript(
     let mut rows = Vec::<Line<'static>>::new();
     let mut links = Vec::new();
     let mut anchors = Vec::new();
-    for entry in &session.history {
+    for entry in session.transcript.entries() {
         let mut rendered = message::render(&entry.event, area.width);
         if reader_selects(
             state,
@@ -344,8 +344,7 @@ fn render_transcript(
         rows.extend(rendered.into_iter().map(|row| row.line));
     }
 
-    if session.scroll_from_tail == 0
-        && session.read_anchor.is_none()
+    if session.transcript.at_tail()
         && let Some(snapshot) = &session.snapshot
     {
         let mut ephemeral = Vec::new();
@@ -399,10 +398,10 @@ fn render_transcript(
 
     // Snapshot-only actions also exist before history loads. They belong to the
     // live tail and must not be inserted into the user's older reading window.
-    if session.scroll_from_tail == 0 && session.read_anchor.is_none() {
+    if session.transcript.at_tail() {
         if let Some(snapshot) = &session.snapshot {
             for question in crate::state::answer::active_questions(snapshot) {
-                let in_history = session.history.iter().any(|entry| {
+                let in_history = session.transcript.entries().any(|entry| {
                     matches!(entry.event,
                     bone_app::SessionEvent::QuestionAsked { question: id, .. } if id == question.id)
                 });
@@ -423,7 +422,9 @@ fn render_transcript(
                     theme::WARNING,
                 ));
             }
-            for candidate in crate::state::answer::recoverable_inputs(snapshot, &session.history) {
+            for candidate in
+                crate::state::answer::recoverable_inputs(snapshot, session.transcript.entries())
+            {
                 let (target, label) = match candidate {
                     crate::state::answer::RecoveryCandidate::Retry { input } => (
                         HitTarget::Action(Action::RetryInput(input)),
@@ -465,7 +466,8 @@ fn render_transcript(
     }
     let viewport = usize::from(area.height);
     let start = session
-        .read_anchor
+        .transcript
+        .read_anchor()
         .and_then(|anchor| {
             anchors
                 .iter()
@@ -485,10 +487,10 @@ fn render_transcript(
         })
         .unwrap_or_else(|| {
             rows.len()
-                .saturating_sub(session.scroll_from_tail)
+                .saturating_sub(session.transcript.scroll_from_tail())
                 .saturating_sub(viewport)
         });
-    let start = start.min(if session.read_anchor.is_some() {
+    let start = start.min(if session.transcript.read_anchor().is_some() {
         rows.len().saturating_sub(1)
     } else {
         rows.len().saturating_sub(viewport)
@@ -541,9 +543,10 @@ mod tests {
         state::{PendingSubmission, SessionUi},
     };
     use bone_app::{
-        HistoryEntry, InputId, InputState, InputView, JobOwner, JobRef, JobView, ModelSelection,
-        Profile, ProfileId, QuestionId, RequestId, ResolvedModel, RuntimeConfig, RuntimeId,
-        SessionEvent, SessionId, SessionInfo, SessionSeq, SessionView, WorkspaceId,
+        HistoryEntry, HistoryPage, InputId, InputState, InputView, JobOwner, JobRef, JobView,
+        ModelSelection, Profile, ProfileId, QuestionId, RecentHistoryPage, RequestId,
+        ResolvedModel, RuntimeConfig, RuntimeId, SessionEvent, SessionId, SessionInfo, SessionSeq,
+        SessionView, WorkspaceId,
     };
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::Arc;
@@ -750,6 +753,24 @@ mod tests {
         }
     }
 
+    fn replace_history(ui: &mut SessionUi, items: Vec<HistoryEntry>) {
+        let snapshot_through = items.last().map_or(SessionSeq(0), |entry| entry.sequence);
+        ui.transcript.open(RecentHistoryPage {
+            items,
+            older_cursor: None,
+            snapshot_through,
+        });
+    }
+
+    fn append_history(ui: &mut SessionUi, items: Vec<HistoryEntry>) {
+        let next_cursor = items.last().map_or(SessionSeq(0), |entry| entry.sequence);
+        ui.transcript.history_loaded(HistoryPage {
+            items,
+            next_cursor,
+            has_more: false,
+        });
+    }
+
     fn render_rows(state: &UiState, height: u16) -> (String, Vec<HitRegion>, TranscriptMetrics) {
         render_width(state, 80, height)
     }
@@ -815,12 +836,15 @@ mod tests {
                 },
             };
             let ui = state.selected_ui_mut().unwrap();
-            ui.history.push_back(HistoryEntry {
-                sequence: SessionSeq(20),
-                occurred_at: 0,
-                event,
-            });
-            ui.read_anchor = Some(anchor);
+            replace_history(
+                ui,
+                vec![HistoryEntry {
+                    sequence: SessionSeq(20),
+                    occurred_at: 0,
+                    event,
+                }],
+            );
+            ui.transcript.begin_reading_at(anchor);
             for width in [160, 40, 120, 80, 40, 160] {
                 let (rendered, _, metrics) = render_width(&state, width, 12);
                 assert!(
@@ -831,7 +855,10 @@ mod tests {
                     metrics.anchor_at_start(metrics.start_row).unwrap().sequence,
                     SessionSeq(20)
                 );
-                assert_eq!(state.selected_ui().unwrap().read_anchor, Some(anchor));
+                assert_eq!(
+                    state.selected_ui().unwrap().transcript.read_anchor(),
+                    Some(anchor)
+                );
             }
             let ui = state.selected_ui_mut().unwrap();
             for (sequence, front) in [(10, true), (30, false)] {
@@ -846,9 +873,13 @@ mod tests {
                     },
                 };
                 if front {
-                    ui.history.push_front(entry);
+                    ui.transcript.older_history_loaded(RecentHistoryPage {
+                        items: vec![entry],
+                        older_cursor: None,
+                        snapshot_through: SessionSeq(30),
+                    });
                 } else {
-                    ui.history.push_back(entry);
+                    append_history(ui, vec![entry]);
                 }
             }
             let (rendered, _, _) = render_width(&state, 40, 12);
@@ -863,38 +894,52 @@ mod tests {
         let session = state.selected.unwrap();
         let ui = state.selected_ui_mut().unwrap();
         ui.draft = "keep my draft".into();
-        ui.history.push_back(HistoryEntry {
-            sequence: SessionSeq(1),
-            occurred_at: 0,
-            event: SessionEvent::Reply {
-                job: JobRef {
-                    runtime: question.runtime,
-                    id: 1,
+        replace_history(
+            ui,
+            vec![
+                HistoryEntry {
+                    sequence: SessionSeq(1),
+                    occurred_at: 0,
+                    event: SessionEvent::Reply {
+                        job: JobRef {
+                            runtime: question.runtime,
+                            id: 1,
+                        },
+                        inputs: vec![],
+                        text: "长中文与代码内容\n".repeat(50),
+                    },
                 },
-                inputs: vec![],
-                text: "长中文与代码内容\n".repeat(50),
-            },
-        });
-        ui.history.push_back(HistoryEntry {
-            sequence: SessionSeq(2),
-            occurred_at: 0,
-            event: SessionEvent::JobFinished {
-                job: JobRef {
-                    runtime: question.runtime,
-                    id: 1,
+                HistoryEntry {
+                    sequence: SessionSeq(2),
+                    occurred_at: 0,
+                    event: SessionEvent::JobFinished {
+                        job: JobRef {
+                            runtime: question.runtime,
+                            id: 1,
+                        },
+                        outcome: bone_app::OutcomeKind::Completed,
+                        summary: "done".into(),
+                        remaining: vec![],
+                    },
                 },
-                outcome: bone_app::OutcomeKind::Completed,
-                summary: "done".into(),
-                remaining: vec![],
-            },
-        });
+            ],
+        );
         let (_, _, metrics) = render_width(&state, 80, 12);
-        state.selected_ui_mut().unwrap().transcript_metrics = Some(Arc::new(metrics));
+        state
+            .selected_ui_mut()
+            .unwrap()
+            .transcript
+            .retain_metrics(Arc::new(metrics), usize::MAX);
         update(
             &mut state,
             UiEvent::Action(Action::OpenHistory(SessionSeq(2))),
         );
-        let anchor = state.selected_ui().unwrap().read_anchor.unwrap();
+        let anchor = state
+            .selected_ui()
+            .unwrap()
+            .transcript
+            .read_anchor()
+            .unwrap();
         let mut snapshot = (**state.selected_ui().unwrap().snapshot.as_ref().unwrap()).clone();
         snapshot.history_through = SessionSeq(3);
         update(
@@ -927,13 +972,27 @@ mod tests {
             },
         );
         update(&mut state, UiEvent::Action(Action::Escape));
-        assert_eq!(state.selected_ui().unwrap().read_anchor, Some(anchor));
+        assert_eq!(
+            state.selected_ui().unwrap().transcript.read_anchor(),
+            Some(anchor)
+        );
         assert_eq!(state.selected_ui().unwrap().draft(), "keep my draft");
         let (_, _, metrics) = render_width(&state, 40, 12);
         assert_eq!(metrics.anchor_at_start(metrics.start_row).unwrap(), anchor);
-        state.selected_ui_mut().unwrap().transcript_metrics = Some(Arc::new(metrics));
+        state
+            .selected_ui_mut()
+            .unwrap()
+            .transcript
+            .retain_metrics(Arc::new(metrics), usize::MAX);
         let effects = update(&mut state, UiEvent::Action(Action::ScrollDown(usize::MAX)));
-        assert!(state.selected_ui().unwrap().read_anchor.is_none());
+        assert!(
+            state
+                .selected_ui()
+                .unwrap()
+                .transcript
+                .read_anchor()
+                .is_none()
+        );
         assert!(
             effects
                 .iter()
@@ -944,11 +1003,9 @@ mod tests {
     #[test]
     fn user_padding_and_first_text_row_have_distinct_stable_anchors() {
         let (mut state, _) = fixture();
-        state
-            .selected_ui_mut()
-            .unwrap()
-            .history
-            .push_back(HistoryEntry {
+        replace_history(
+            state.selected_ui_mut().unwrap(),
+            vec![HistoryEntry {
                 sequence: SessionSeq(1),
                 occurred_at: 0,
                 event: SessionEvent::InputSubmitted {
@@ -957,7 +1014,8 @@ mod tests {
                     text: "first body line\nrest".into(),
                     reply_to: None,
                 },
-            });
+            }],
+        );
         for part in [
             crate::layout::AnchorPart::UserTop,
             crate::layout::AnchorPart::Text,
@@ -967,7 +1025,11 @@ mod tests {
                 byte: 0,
                 part,
             };
-            state.selected_ui_mut().unwrap().read_anchor = Some(anchor);
+            state
+                .selected_ui_mut()
+                .unwrap()
+                .transcript
+                .begin_reading_at(anchor);
             for width in [40, 120, 80] {
                 let (rendered, _, metrics) = render_width(&state, width, 4);
                 assert_eq!(metrics.anchor_at_start(metrics.start_row).unwrap(), anchor);
@@ -1070,19 +1132,22 @@ mod tests {
             failed: true,
             reply_to: None,
         });
-        ui.history.push_back(HistoryEntry {
-            sequence: SessionSeq(1),
-            occurred_at: 0,
-            event: SessionEvent::Reply {
-                job: JobRef {
-                    runtime: q.runtime,
-                    id: 1,
+        replace_history(
+            ui,
+            vec![HistoryEntry {
+                sequence: SessionSeq(1),
+                occurred_at: 0,
+                event: SessionEvent::Reply {
+                    job: JobRef {
+                        runtime: q.runtime,
+                        id: 1,
+                    },
+                    inputs: vec![InputId(1)],
+                    text: (0..30).map(|i| format!("History row {i}\n")).collect(),
                 },
-                inputs: vec![InputId(1)],
-                text: (0..30).map(|i| format!("History row {i}\n")).collect(),
-            },
-        });
-        ui.scroll_from_tail = 1;
+            }],
+        );
+        ui.transcript.scroll_up(1);
         let (text, hits, _) = render_rows(&state, 8);
         assert!(!text.contains("Live job"));
         assert!(!text.contains("[answer]"));
@@ -1097,15 +1162,18 @@ mod tests {
     fn expired_historical_questions_have_no_answer_hit() {
         let (mut state, q) = fixture();
         let ui = state.selected_ui_mut().unwrap();
-        ui.history.push_back(HistoryEntry {
-            sequence: SessionSeq(1),
-            occurred_at: 0,
-            event: SessionEvent::QuestionAsked {
-                question: q,
-                inputs: vec![InputId(1)],
-                text: "Old scope question".into(),
-            },
-        });
+        replace_history(
+            ui,
+            vec![HistoryEntry {
+                sequence: SessionSeq(1),
+                occurred_at: 0,
+                event: SessionEvent::QuestionAsked {
+                    question: q,
+                    inputs: vec![InputId(1)],
+                    text: "Old scope question".into(),
+                },
+            }],
+        );
         let (text, hits, _) = render_rows(&state, 8);
         assert!(text.contains("Old scope question"));
         assert!(

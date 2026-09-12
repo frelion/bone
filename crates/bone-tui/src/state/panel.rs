@@ -363,9 +363,8 @@ pub(super) fn login_changed(
 
 pub(super) fn open_history(state: &mut UiState, sequence: SessionSeq, effects: &mut Vec<Effect>) {
     let Some(content) = state.selected_ui().and_then(|ui| {
-        ui.history
-            .iter()
-            .find(|entry| entry.sequence == sequence)
+        ui.transcript
+            .find(sequence)
             .and_then(|entry| ReaderContent::from_history(ui.id, entry))
     }) else {
         return;
@@ -416,7 +415,7 @@ pub(super) fn open_objects(state: &mut UiState, effects: &mut Vec<Effect>) {
             ));
         }
     }
-    for entry in ui.history.iter().rev() {
+    for entry in ui.transcript.entries().rev() {
         let label = match &entry.event {
             bone_app::SessionEvent::ToolFinished { tool, .. } => {
                 let tool: String = tool.chars().take(64).collect();
@@ -472,9 +471,8 @@ fn open_object(state: &mut UiState, effects: &mut Vec<Effect>) {
             .as_ref()
             .and_then(|snapshot| ReaderContent::from_job(snapshot, job)),
         ReaderSource::History(sequence) => ui
-            .history
-            .iter()
-            .find(|entry| entry.sequence == sequence)
+            .transcript
+            .find(sequence)
             .and_then(|entry| ReaderContent::from_history(session, entry)),
     });
     if let Some(content) = content {
@@ -491,11 +489,8 @@ fn open_object(state: &mut UiState, effects: &mut Vec<Effect>) {
 }
 
 fn pin_reading(state: &mut UiState) {
-    if let Some(ui) = state.selected_ui_mut()
-        && ui.read_anchor.is_none()
-        && let Some(metrics) = &ui.transcript_metrics
-    {
-        ui.read_anchor = metrics.anchor_at_start(metrics.start_row);
+    if let Some(ui) = state.selected_ui_mut() {
+        ui.transcript.pin_reading();
     }
 }
 

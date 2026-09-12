@@ -221,20 +221,26 @@ fn saved_input_retry_and_cancelled_answer_restore_keep_identity() {
         }]
     ));
     let ui = s.session_ui.get_mut(&id).unwrap();
-    ui.history.push_back(HistoryEntry {
-        sequence: SessionSeq(1),
-        occurred_at: 0,
-        event: SessionEvent::InputSubmitted {
-            input: InputId(4),
-            request_id: RequestId::new(),
-            text: "cancelled answer".into(),
-            reply_to: Some(q),
-        },
-    });
-    ui.history.push_back(HistoryEntry {
-        sequence: SessionSeq(2),
-        occurred_at: 0,
-        event: SessionEvent::InputCancelled { input: InputId(4) },
+    ui.transcript.open(RecentHistoryPage {
+        items: vec![
+            HistoryEntry {
+                sequence: SessionSeq(1),
+                occurred_at: 0,
+                event: SessionEvent::InputSubmitted {
+                    input: InputId(4),
+                    request_id: RequestId::new(),
+                    text: "cancelled answer".into(),
+                    reply_to: Some(q),
+                },
+            },
+            HistoryEntry {
+                sequence: SessionSeq(2),
+                occurred_at: 0,
+                event: SessionEvent::InputCancelled { input: InputId(4) },
+            },
+        ],
+        older_cursor: None,
+        snapshot_through: SessionSeq(2),
     });
     act(&mut s, Action::RestoreInput(InputId(4)));
     assert_eq!(s.draft(), "cancelled answer");

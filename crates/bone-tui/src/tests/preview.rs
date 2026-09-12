@@ -12,8 +12,8 @@ use crate::{
     view,
 };
 use bone_app::{
-    HistoryEntry, InputId, JobRef, RequestId, RuntimeId, RuntimeState, SessionEvent, SessionId,
-    SessionInfo, SessionSeq, SessionSummary, SessionView, WorkspaceId,
+    HistoryEntry, InputId, JobRef, RecentHistoryPage, RequestId, RuntimeId, RuntimeState,
+    SessionEvent, SessionId, SessionInfo, SessionSeq, SessionSummary, SessionView, WorkspaceId,
 };
 use ratatui::{
     Terminal,
@@ -136,18 +136,20 @@ fn render_preview_artifact() {
         SessionEvent::InputSubmitted { input: InputId(2), request_id: RequestId::new(), text: "再检查中文和组合字符，别让光标跳位。".into(), reply_to: None },
         SessionEvent::Reply { job: JobRef { runtime, id: 2 }, inputs: vec![InputId(2)], text: "我会把输入定位按实际字符宽度一起验证。".into() }
     ];
-    for (i, event) in events.into_iter().enumerate() {
-        ui.history.push_back(HistoryEntry {
+    let mut history = events
+        .into_iter()
+        .enumerate()
+        .map(|(i, event)| HistoryEntry {
             sequence: SessionSeq(i as u64 + 1),
             occurred_at: i as i64,
             event,
-        });
-    }
+        })
+        .collect::<Vec<_>>();
     if scenario == "long-reply" {
         for number in 1..=4 {
-            ui.history.push_back(HistoryEntry {
-                sequence: SessionSeq(ui.history.len() as u64 + 1),
-                occurred_at: ui.history.len() as i64,
+            history.push(HistoryEntry {
+                sequence: SessionSeq(history.len() as u64 + 1),
+                occurred_at: history.len() as i64,
                 event: SessionEvent::Reply {
                     job: JobRef {
                         runtime,
@@ -161,6 +163,12 @@ fn render_preview_artifact() {
             });
         }
     }
+    let snapshot_through = history.last().map_or(SessionSeq(0), |entry| entry.sequence);
+    ui.transcript.open(RecentHistoryPage {
+        items: history,
+        older_cursor: None,
+        snapshot_through,
+    });
     state.session_ui.insert(ui.id, ui);
     update(
         &mut state,

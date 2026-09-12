@@ -284,30 +284,34 @@ fn conversation_rendering_has_no_bone_or_you_speaker_prefixes() {
     let info = session(workspace, "prefix contract");
     let mut state = opened_state(std::slice::from_ref(&info));
     let ui = state.session_ui.get_mut(&info.id).unwrap();
-    ui.history.extend([
-        HistoryEntry {
-            sequence: bone_app::SessionSeq(1),
-            occurred_at: 1,
-            event: SessionEvent::InputSubmitted {
-                input: bone_app::InputId(1),
-                request_id: RequestId::new(),
-                text: "UNIQUE_USER_BODY".into(),
-                reply_to: None,
-            },
-        },
-        HistoryEntry {
-            sequence: bone_app::SessionSeq(2),
-            occurred_at: 2,
-            event: SessionEvent::Reply {
-                job: bone_app::JobRef {
-                    runtime: bone_app::RuntimeId::new(),
-                    id: 1,
+    ui.transcript.open(RecentHistoryPage {
+        items: vec![
+            HistoryEntry {
+                sequence: bone_app::SessionSeq(1),
+                occurred_at: 1,
+                event: SessionEvent::InputSubmitted {
+                    input: bone_app::InputId(1),
+                    request_id: RequestId::new(),
+                    text: "UNIQUE_USER_BODY".into(),
+                    reply_to: None,
                 },
-                inputs: vec![bone_app::InputId(1)],
-                text: "UNIQUE_ASSISTANT_BODY".into(),
             },
-        },
-    ]);
+            HistoryEntry {
+                sequence: bone_app::SessionSeq(2),
+                occurred_at: 2,
+                event: SessionEvent::Reply {
+                    job: bone_app::JobRef {
+                        runtime: bone_app::RuntimeId::new(),
+                        id: 1,
+                    },
+                    inputs: vec![bone_app::InputId(1)],
+                    text: "UNIQUE_ASSISTANT_BODY".into(),
+                },
+            },
+        ],
+        older_cursor: None,
+        snapshot_through: bone_app::SessionSeq(2),
+    });
     let (screen, _) = render(&state, 160, 40);
     assert!(screen.contains("UNIQUE_USER_BODY"));
     assert!(screen.contains("UNIQUE_ASSISTANT_BODY"));

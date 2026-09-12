@@ -76,7 +76,7 @@ fn retained_history_bytes(state: &UiState) -> usize {
     state
         .session_ui
         .values()
-        .map(|session| session.history_bytes)
+        .map(|session| session.transcript.allocated_bytes())
         .sum()
 }
 
@@ -86,12 +86,9 @@ fn hundred_sessions_and_hundred_thousand_app_records_stay_bounded() {
     load_app_shaped_history(&mut state);
 
     assert_eq!(state.session_rows.len(), SESSION_COUNT);
-    assert!(
-        state
-            .session_ui
-            .values()
-            .all(|session| session.history.len() <= crate::state::HISTORY_CACHE_ITEMS)
-    );
+    assert!(state.session_ui.values().all(|session| {
+        session.transcript.entries().count() <= crate::state::HISTORY_CACHE_ITEMS
+    }));
     assert!(retained_history_bytes(&state) <= HISTORY_CACHE_BYTES);
 
     for index in 0..2_000 {

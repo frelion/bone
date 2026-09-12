@@ -1,6 +1,7 @@
 use bone_app::{RequestId, SessionId, SubmitInput};
 
 use super::{
+    HISTORY_CACHE_BYTES,
     answer::{self, AnswerDraft, RecoveryCandidate},
     model::*,
     panel,
@@ -122,16 +123,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     ui.hydrated = true;
                 }
                 ui.snapshot = Some(snapshot);
-                ui.history.clear();
-                ui.history_bytes = 0;
-                for entry in history.items {
-                    ui.history_bytes = ui.history_bytes.saturating_add(history_entry_bytes(&entry));
-                    ui.history.push_back(entry);
-                }
-                ui.history_cursor = history.snapshot_through;
-                ui.older_cursor = history.older_cursor;
-                ui.scroll_from_tail = 0;
-                trim_history_front(ui);
+                ui.transcript.open(history);
                 if let Some(pending) = ui.bootstrap_submission.take() {
                     let input = SubmitInput {
                         request_id: pending.request_id,
@@ -168,20 +160,12 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             if let Some(ui) = current_generation_mut(state, session, generation) {
                 let through = snapshot.history_through;
                 ui.snapshot = Some(snapshot);
-                if through > ui.history_cursor && !ui.history_loading && !ui.newer_history_missing {
-                    if ui.read_anchor.is_some() || ui.scroll_from_tail > 0 || ui.older_loading {
-                        ui.newer_history_missing = true;
-                    } else {
-                        ui.history_loading = true;
-                        effects.push(Effect::LoadHistory {
-                            session,
-                            generation,
-                            after: ui.history_cursor,
-                        });
-                    }
-                }
-                if !selected {
-                    ui.unread = ui.unread.saturating_add(1);
+                if let Some(after) = ui.transcript.session_changed(through) {
+                    effects.push(Effect::LoadHistory {
+                        session,
+                        generation,
+                        after,
+                    });
                 }
             }
         }
@@ -190,33 +174,14 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             generation,
             page,
         } => {
-            if let Some(ui) = current_generation_mut(state, session, generation) {
-                ui.history_loading = false;
-                if ui.read_anchor.is_some() || ui.scroll_from_tail > 0 || ui.older_loading {
-                    ui.newer_history_missing = true;
-                    return effects;
-                }
-                for entry in page.items {
-                    if ui
-                        .history
-                        .back()
-                        .is_none_or(|old| old.sequence < entry.sequence)
-                    {
-                        ui.history_bytes =
-                            ui.history_bytes.saturating_add(history_entry_bytes(&entry));
-                        ui.history.push_back(entry);
-                    }
-                }
-                ui.history_cursor = ui.history_cursor.max(page.next_cursor);
-                trim_history_front(ui);
-                if page.has_more {
-                    ui.history_loading = true;
-                    effects.push(Effect::LoadHistory {
-                        session,
-                        generation,
-                        after: ui.history_cursor,
-                    });
-                }
+            if let Some(ui) = current_generation_mut(state, session, generation)
+                && let Some(after) = ui.transcript.history_loaded(page)
+            {
+                effects.push(Effect::LoadHistory {
+                    session,
+                    generation,
+                    after,
+                });
             }
         }
         UiEvent::OlderHistoryLoaded {
@@ -225,28 +190,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             page,
         } => {
             if let Some(ui) = current_generation_mut(state, session, generation) {
-                ui.older_loading = false;
-                let metrics = ui.older_metrics.take();
-                ui.older_cursor = page.older_cursor;
-                for entry in page.items.into_iter().rev() {
-                    if ui
-                        .history
-                        .front()
-                        .is_none_or(|old| entry.sequence < old.sequence)
-                    {
-                        ui.history_bytes =
-                            ui.history_bytes.saturating_add(history_entry_bytes(&entry));
-                        ui.history.push_front(entry);
-                    }
-                }
-                let evicted = trim_history_back(ui);
-                if let Some(metrics) = metrics {
-                    let evicted_rows = evicted
-                        .iter()
-                        .map(|sequence| metrics.anchors.row_count(*sequence))
-                        .sum::<usize>();
-                    ui.scroll_from_tail = ui.scroll_from_tail.saturating_sub(evicted_rows);
-                }
+                ui.transcript.older_history_loaded(page);
             }
         }
         UiEvent::RecentHistoryReloaded {
@@ -255,25 +199,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             page,
         } => {
             if let Some(ui) = current_generation_mut(state, session, generation) {
-                if ui.read_anchor.is_some() {
-                    ui.recent_loading = false;
-                    ui.newer_history_missing = true;
-                    return effects;
-                }
-                ui.history.clear();
-                ui.history_bytes = 0;
-                for entry in page.items {
-                    ui.history_bytes = ui.history_bytes.saturating_add(history_entry_bytes(&entry));
-                    ui.history.push_back(entry);
-                }
-                ui.history_cursor = page.snapshot_through;
-                ui.older_cursor = page.older_cursor;
-                ui.scroll_from_tail = 0;
-                ui.read_anchor = None;
-                ui.transcript_metrics = None;
-                ui.recent_loading = false;
-                ui.newer_history_missing = false;
-                trim_history_front(ui);
+                ui.transcript.recent_history_reloaded(page);
             }
         }
         UiEvent::PersistDraftsRequested => {
@@ -582,6 +508,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 let next = state.generation();
                 if let Some(ui) = state.session_ui.get_mut(&receipt.session) {
                     ui.generation = next;
+                    ui.transcript.start_generation();
                 }
                 effects.push(Effect::OpenSession {
                     session: receipt.session,
@@ -606,14 +533,13 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 {
                     match kind {
                         OperationKind::LoadOlderHistory => {
-                            ui.older_loading = false;
-                            ui.older_metrics = None;
+                            ui.transcript.older_history_failed();
                         }
                         OperationKind::LoadHistory => {
-                            ui.history_loading = false;
+                            ui.transcript.history_failed();
                         }
                         OperationKind::ReloadRecentHistory => {
-                            ui.recent_loading = false;
+                            ui.transcript.recent_history_failed();
                         }
                         _ => {}
                     }
@@ -860,29 +786,13 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         }
         Action::ScrollUp(amount) => scroll_up(state, amount, effects),
         Action::ScrollDown(amount) => {
-            if let Some(ui) = state.selected_ui_mut() {
-                let target = ui.transcript_metrics.as_ref().map(|metrics| {
-                    ui.read_anchor
-                        .and_then(|anchor| metrics.row_for_anchor(anchor))
-                        .unwrap_or(metrics.start_row)
-                        .saturating_add(amount)
+            if let Some(ui) = state.selected_ui_mut()
+                && ui.transcript.scroll_down(amount)
+            {
+                effects.push(Effect::ReloadRecentHistory {
+                    session: ui.id,
+                    generation: ui.generation,
                 });
-                let reaches_tail = ui
-                    .transcript_metrics
-                    .as_ref()
-                    .zip(target)
-                    .is_some_and(|(metrics, target)| target >= metrics.max_scroll());
-                if reaches_tail || ui.scroll_from_tail <= amount && ui.transcript_metrics.is_none()
-                {
-                    follow_transcript_tail(ui, effects);
-                } else {
-                    ui.scroll_from_tail = ui.scroll_from_tail.saturating_sub(amount);
-                    ui.read_anchor = ui
-                        .transcript_metrics
-                        .as_ref()
-                        .zip(target)
-                        .and_then(|(metrics, target)| metrics.anchor_at_start(target));
-                }
             }
         }
         Action::Stop => effects.extend(stop_selected(state)),
@@ -1131,7 +1041,7 @@ fn recover_input(
     let Some(snapshot) = &ui.snapshot else {
         return;
     };
-    let candidate = answer::recoverable_inputs(snapshot, &ui.history)
+    let candidate = answer::recoverable_inputs(snapshot, ui.transcript.entries())
         .into_iter()
         .find(|candidate| match candidate {
             RecoveryCandidate::Retry { input: id }
@@ -1238,7 +1148,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             clear_current_draft(state, effects);
             let input = state.selected_ui().and_then(|ui| {
                 ui.snapshot.as_ref().and_then(|snapshot| {
-                    super::answer::recoverable_inputs(snapshot, &ui.history)
+                    super::answer::recoverable_inputs(snapshot, ui.transcript.entries())
                         .into_iter()
                         .rev()
                         .find_map(|candidate| match candidate {
@@ -1263,7 +1173,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             } else {
                 let input = state.selected_ui().and_then(|ui| {
                     ui.snapshot.as_ref().and_then(|snapshot| {
-                        super::answer::recoverable_inputs(snapshot, &ui.history)
+                        super::answer::recoverable_inputs(snapshot, ui.transcript.entries())
                             .into_iter()
                             .rev()
                             .find_map(|candidate| match candidate {
@@ -1548,7 +1458,7 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
         .entry(id)
         .or_insert_with(|| SessionUi::new(id, generation));
     ui.generation = generation;
-    ui.unread = 0;
+    ui.transcript.start_generation();
     effects.push(Effect::OpenSession {
         session: id,
         generation,
@@ -1564,50 +1474,15 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
     }
 }
 
-fn follow_transcript_tail(ui: &mut SessionUi, effects: &mut Vec<Effect>) {
-    ui.read_anchor = None;
-    ui.scroll_from_tail = 0;
-    ui.unread = 0;
-    if ui.newer_history_missing && !ui.recent_loading {
-        ui.recent_loading = true;
-        effects.push(Effect::ReloadRecentHistory {
+fn scroll_up(state: &mut UiState, amount: usize, effects: &mut Vec<Effect>) {
+    if let Some(ui) = state.selected_ui_mut()
+        && let Some(cursor) = ui.transcript.scroll_up(amount)
+    {
+        effects.push(Effect::LoadOlderHistory {
             session: ui.id,
             generation: ui.generation,
+            cursor,
         });
-    }
-}
-
-fn scroll_up(state: &mut UiState, amount: usize, effects: &mut Vec<Effect>) {
-    if let Some(ui) = state.selected_ui_mut() {
-        let metrics = ui.transcript_metrics.clone();
-        if let Some(metrics) = &metrics {
-            let start = ui
-                .read_anchor
-                .and_then(|anchor| metrics.row_for_anchor(anchor))
-                .unwrap_or(metrics.start_row)
-                .saturating_sub(amount);
-            ui.read_anchor = metrics.anchor_at_start(start);
-            ui.scroll_from_tail = metrics
-                .total_rows
-                .saturating_sub(start + metrics.viewport_rows);
-            ui.transcript_metrics = Some(metrics.clone());
-        } else {
-            ui.scroll_from_tail = ui.scroll_from_tail.saturating_add(amount);
-        }
-        if metrics
-            .as_ref()
-            .is_some_and(|metrics| metrics.near_start(ui.scroll_from_tail))
-            && !ui.older_loading
-            && let Some(cursor) = ui.older_cursor
-        {
-            ui.older_loading = true;
-            ui.older_metrics = metrics;
-            effects.push(Effect::LoadOlderHistory {
-                session: ui.id,
-                generation: ui.generation,
-                cursor,
-            });
-        }
     }
 }
 
@@ -1634,49 +1509,6 @@ fn current_generation_mut(
         .filter(|ui| ui.generation == generation)
 }
 
-fn trim_history_front(ui: &mut SessionUi) {
-    while ui.history.len() > HISTORY_CACHE_ITEMS || ui.history_bytes > HISTORY_CACHE_BYTES {
-        let preserve_front = ui.history.len() > 1
-            && ui.read_anchor.is_some_and(|anchor| {
-                ui.history
-                    .front()
-                    .is_some_and(|entry| entry.sequence == anchor.sequence)
-            });
-        let Some(entry) = (if preserve_front {
-            ui.newer_history_missing = true;
-            ui.history.pop_back()
-        } else {
-            ui.history.pop_front()
-        }) else {
-            break;
-        };
-        ui.history_bytes = ui.history_bytes.saturating_sub(history_entry_bytes(&entry));
-    }
-}
-
-fn trim_history_back(ui: &mut SessionUi) -> Vec<bone_app::SessionSeq> {
-    let mut evicted = Vec::new();
-    while ui.history.len() > HISTORY_CACHE_ITEMS || ui.history_bytes > HISTORY_CACHE_BYTES {
-        let preserve_back = ui.history.len() > 1
-            && ui.read_anchor.is_some_and(|anchor| {
-                ui.history
-                    .back()
-                    .is_some_and(|entry| entry.sequence == anchor.sequence)
-            });
-        let Some(entry) = (if preserve_back {
-            ui.history.pop_front()
-        } else {
-            ui.history.pop_back()
-        }) else {
-            break;
-        };
-        ui.history_bytes = ui.history_bytes.saturating_sub(history_entry_bytes(&entry));
-        evicted.push(entry.sequence);
-        ui.newer_history_missing = true;
-    }
-    evicted
-}
-
 pub(crate) fn retain_transcript(
     state: &mut UiState,
     metrics: std::sync::Arc<crate::layout::TranscriptMetrics>,
@@ -1690,43 +1522,26 @@ fn retain_transcript_with_limit(
     limit: usize,
 ) -> bool {
     if let Some(ui) = state.selected_ui_mut() {
-        if ui.read_anchor.is_some() {
-            ui.scroll_from_tail = metrics.scroll_from_tail;
-        }
-        ui.transcript_metrics = (metrics.allocated_bytes() <= limit).then_some(metrics);
+        ui.transcript.retain_metrics(metrics, limit);
     }
     trim_history_to_limit(state, limit);
     state
         .selected_ui()
-        .is_some_and(|ui| ui.transcript_metrics.is_some())
+        .is_some_and(|ui| ui.transcript.has_metrics())
 }
 
 fn retained_history_bytes(state: &UiState) -> usize {
     state
         .session_ui
         .values()
-        .map(|ui| {
-            ui.history_bytes
-                + ui.transcript_metrics
-                    .as_ref()
-                    .map_or(0, |metrics| metrics.allocated_bytes())
-                + ui.older_metrics
-                    .as_ref()
-                    .filter(|older| {
-                        ui.transcript_metrics
-                            .as_ref()
-                            .is_none_or(|current| !std::sync::Arc::ptr_eq(current, older))
-                    })
-                    .map_or(0, |metrics| metrics.allocated_bytes())
-        })
+        .map(|ui| ui.transcript.allocated_bytes())
         .sum()
 }
 
 fn trim_history_to_limit(state: &mut UiState, limit: usize) {
     for (id, ui) in &mut state.session_ui {
         if Some(*id) != state.selected {
-            ui.transcript_metrics = None;
-            ui.older_metrics = None;
+            ui.transcript.clear_layouts();
         }
     }
     let mut total = retained_history_bytes(state);
@@ -1734,13 +1549,13 @@ fn trim_history_to_limit(state: &mut UiState, limit: usize) {
     // an old or individually oversized layout cannot fit the cache budget.
     if total > limit {
         if let Some(ui) = state.selected_ui_mut() {
-            ui.older_metrics = None;
+            ui.transcript.clear_older_layout();
         }
         total = retained_history_bytes(state);
     }
     if total > limit {
         if let Some(ui) = state.selected_ui_mut() {
-            ui.transcript_metrics = None;
+            ui.transcript.clear_current_layout();
         }
         total = retained_history_bytes(state);
     }
@@ -1748,14 +1563,14 @@ fn trim_history_to_limit(state: &mut UiState, limit: usize) {
         let victim = state
             .session_ui
             .iter()
-            .find(|(id, ui)| Some(**id) != state.selected && !ui.history.is_empty())
+            .find(|(id, ui)| Some(**id) != state.selected && ui.transcript.has_entries())
             .map(|(id, _)| *id)
             .or_else(|| {
                 state.selected.filter(|id| {
                     state
                         .session_ui
                         .get(id)
-                        .is_some_and(|ui| !ui.history.is_empty())
+                        .is_some_and(|ui| ui.transcript.has_entries())
                 })
             });
         let Some(victim) = victim else {
@@ -1765,22 +1580,9 @@ fn trim_history_to_limit(state: &mut UiState, limit: usize) {
             .session_ui
             .get_mut(&victim)
             .expect("selected cache victim exists");
-        let preserve_front = ui.history.len() > 1
-            && ui.read_anchor.is_some_and(|anchor| {
-                ui.history
-                    .front()
-                    .is_some_and(|entry| entry.sequence == anchor.sequence)
-            });
-        let Some(entry) = (if preserve_front {
-            ui.newer_history_missing = true;
-            ui.history.pop_back()
-        } else {
-            ui.history.pop_front()
-        }) else {
+        let Some(bytes) = ui.transcript.evict_one() else {
             break;
         };
-        let bytes = history_entry_bytes(&entry);
-        ui.history_bytes = ui.history_bytes.saturating_sub(bytes);
         total = total.saturating_sub(bytes);
     }
 }
@@ -2390,8 +2192,8 @@ fn release_inactive_session(state: &UiState, session: SessionId, effects: &mut V
 mod panel_draft_tests {
     use super::*;
     use bone_app::{
-        HistoryEntry, InputId, JobRef, OutcomeKind, QuestionId, RuntimeId, SessionEvent,
-        SessionInfo, SessionSeq, WorkspaceId,
+        HistoryEntry, HistoryPage, InputId, JobRef, OutcomeKind, QuestionId, RecentHistoryPage,
+        RuntimeId, SessionEvent, SessionInfo, SessionSeq, WorkspaceId,
     };
 
     fn fixture() -> (UiState, QuestionId) {
@@ -2413,18 +2215,22 @@ mod panel_draft_tests {
         answer.replace("answer draft".into(), 3);
         ui.answer_drafts.insert(question, answer);
         ui.selected_answer = Some(question);
-        ui.history.push_back(HistoryEntry {
-            sequence: SessionSeq(1),
-            occurred_at: 0,
-            event: SessionEvent::JobFinished {
-                job: JobRef {
-                    runtime: question.runtime,
-                    id: 1,
+        ui.transcript.open(RecentHistoryPage {
+            items: vec![HistoryEntry {
+                sequence: SessionSeq(1),
+                occurred_at: 0,
+                event: SessionEvent::JobFinished {
+                    job: JobRef {
+                        runtime: question.runtime,
+                        id: 1,
+                    },
+                    outcome: OutcomeKind::Completed,
+                    summary: "Done".into(),
+                    remaining: vec![],
                 },
-                outcome: OutcomeKind::Completed,
-                summary: "Done".into(),
-                remaining: vec![],
-            },
+            }],
+            older_cursor: None,
+            snapshot_through: SessionSeq(1),
         });
         let mut state = UiState::default();
         state.session_rows.push(test_session_row(info));
@@ -2602,21 +2408,25 @@ mod panel_draft_tests {
             .info()
             .clone();
         let ui = state.selected_ui_mut().unwrap();
-        ui.history.push_back(HistoryEntry {
-            sequence: SessionSeq(2),
-            occurred_at: 0,
-            event: SessionEvent::ToolFinished {
-                call: bone_app::CallRef {
-                    runtime: question.runtime,
-                    id: 9,
+        ui.transcript.history_loaded(HistoryPage {
+            items: vec![HistoryEntry {
+                sequence: SessionSeq(2),
+                occurred_at: 0,
+                event: SessionEvent::ToolFinished {
+                    call: bone_app::CallRef {
+                        runtime: question.runtime,
+                        id: 9,
+                    },
+                    job,
+                    tool: "read_file".into(),
+                    outcome: bone_app::ToolOutcome {
+                        result: Ok(serde_json::json!("x".repeat(1024 * 1024))),
+                        external_effect: bone_app::ExternalEffect::None,
+                    },
                 },
-                job,
-                tool: "read_file".into(),
-                outcome: bone_app::ToolOutcome {
-                    result: Ok(serde_json::json!("x".repeat(1024 * 1024))),
-                    external_effect: bone_app::ExternalEffect::None,
-                },
-            },
+            }],
+            next_cursor: SessionSeq(2),
+            has_more: false,
         });
         ui.snapshot = Some(std::sync::Arc::new(bone_app::SessionView {
             session: info,
@@ -2666,7 +2476,15 @@ mod panel_draft_tests {
     fn expired_or_cross_session_object_menu_never_substitutes_another_object() {
         let (mut state, question) = fixture();
         panel::open_objects(&mut state, &mut Vec::new());
-        state.selected_ui_mut().unwrap().history.clear();
+        state
+            .selected_ui_mut()
+            .unwrap()
+            .transcript
+            .open(RecentHistoryPage {
+                items: vec![],
+                older_cursor: None,
+                snapshot_through: SessionSeq(0),
+            });
         update(&mut state, UiEvent::Action(Action::ActivatePanel));
         assert!(matches!(state.panel, Some(Panel::Objects(_))));
         assert!(
@@ -2774,7 +2592,13 @@ mod panel_draft_tests {
 
         let original = super::super::reader::ReaderContent::from_history(
             session,
-            &state.selected_ui().unwrap().history[0],
+            state
+                .selected_ui()
+                .unwrap()
+                .transcript
+                .entries()
+                .next()
+                .unwrap(),
         )
         .unwrap();
         state.panel = Some(Panel::Reader(ReaderPanel {
@@ -3133,8 +2957,6 @@ mod final_integration_regressions {
             draft_revision: 0,
             failed: false,
         });
-        ui.history_loading = true;
-        ui.recent_loading = true;
         update(
             &mut state,
             UiEvent::SubmitFailed {
@@ -3160,8 +2982,7 @@ mod final_integration_regressions {
                 message: "background history failed".into(),
             },
         );
-        assert!(!state.session_ui[&background].history_loading);
-        assert!(state.session_ui[&background].recent_loading);
+        assert_eq!(state.status.as_deref(), Some("current status"));
         update(
             &mut state,
             UiEvent::OperationFailed {
@@ -3171,7 +2992,6 @@ mod final_integration_regressions {
                 message: "background recent history failed".into(),
             },
         );
-        assert!(!state.session_ui[&background].recent_loading);
         assert_eq!(state.status.as_deref(), Some("current status"));
         update(
             &mut state,
@@ -3223,13 +3043,15 @@ mod transcript_budget_tests {
                 input: bone_app::InputId(1),
             },
         };
-        ui.history_bytes = history_entry_bytes(&entry);
-        ui.history.push_back(entry);
-        ui.read_anchor = Some(ContentAnchor {
-            sequence: bone_app::SessionSeq(1),
-            byte: 0,
-            part: AnchorPart::Text,
+        ui.transcript.open(bone_app::RecentHistoryPage {
+            items: vec![entry],
+            older_cursor: None,
+            snapshot_through: bone_app::SessionSeq(1),
         });
+        ui.transcript
+            .retain_metrics(metrics([1]), HISTORY_CACHE_BYTES);
+        ui.transcript.pin_reading();
+        ui.transcript.clear_current_layout();
         state.selected = Some(info.id);
         state.session_ui.insert(info.id, ui);
         state
@@ -3238,40 +3060,44 @@ mod transcript_budget_tests {
     #[test]
     fn individually_oversized_metrics_are_rejected_without_evicting_history_or_anchor() {
         let mut state = fixture();
-        let anchor = state.selected_ui().unwrap().read_anchor;
+        let anchor = state.selected_ui().unwrap().transcript.read_anchor();
         let metrics = metrics(1..=8);
         let limit = metrics.allocated_bytes() - 1;
-        assert!(state.selected_ui().unwrap().history_bytes < limit);
+        assert!(state.selected_ui().unwrap().transcript.allocated_bytes() < limit);
         assert!(!retain_transcript_with_limit(&mut state, metrics, limit));
         let ui = state.selected_ui().unwrap();
-        assert_eq!(ui.history.len(), 1);
-        assert_eq!(ui.read_anchor, anchor);
-        assert!(ui.transcript_metrics.is_none());
+        assert_eq!(ui.transcript.entries().count(), 1);
+        assert_eq!(ui.transcript.read_anchor(), anchor);
+        assert!(!ui.transcript.has_metrics());
         assert!(retained_history_bytes(&state) <= limit);
     }
 
     #[test]
-    fn combined_metrics_overflow_drops_old_layout_before_current_or_history() {
+    fn combined_metrics_overflow_drops_inactive_layout_before_selected_layout_or_history() {
         let mut state = fixture();
-        let anchor = state.selected_ui().unwrap().read_anchor;
+        let anchor = state.selected_ui().unwrap().transcript.read_anchor();
         let current = metrics([1]);
-        let older = metrics([2]);
-        let limit = state.selected_ui().unwrap().history_bytes + current.allocated_bytes();
-        assert!(current.allocated_bytes() < limit && older.allocated_bytes() < limit);
-        state.selected_ui_mut().unwrap().older_metrics = Some(older);
+        let source_bytes = state.selected_ui().unwrap().transcript.allocated_bytes();
+        let limit = source_bytes + current.allocated_bytes();
+
+        let background = SessionId::new();
+        let mut background_ui = SessionUi::new(background, 1);
+        background_ui
+            .transcript
+            .retain_metrics(metrics([2]), HISTORY_CACHE_BYTES);
+        state.session_ui.insert(background, background_ui);
+
         assert!(retain_transcript_with_limit(
             &mut state,
             current.clone(),
             limit
         ));
         let ui = state.selected_ui().unwrap();
-        assert!(ui.older_metrics.is_none());
-        assert!(Arc::ptr_eq(
-            ui.transcript_metrics.as_ref().unwrap(),
-            &current
-        ));
-        assert_eq!(ui.history.len(), 1);
-        assert_eq!(ui.read_anchor, anchor);
+        assert!(ui.transcript.has_metrics());
+        assert_eq!(ui.transcript.allocated_bytes(), limit);
+        assert_eq!(ui.transcript.entries().count(), 1);
+        assert_eq!(ui.transcript.read_anchor(), anchor);
+        assert!(!state.session_ui[&background].transcript.has_metrics());
         assert!(retained_history_bytes(&state) <= limit);
     }
 }
@@ -3402,15 +3228,19 @@ mod focus_state_tests {
             archived: false,
         };
         let mut ui = SessionUi::new(info.id, 1);
-        ui.history.push_back(bone_app::HistoryEntry {
-            sequence,
-            occurred_at: 0,
-            event: bone_app::SessionEvent::JobFinished {
-                job: bone_app::JobRef { runtime, id: 1 },
-                outcome: bone_app::OutcomeKind::Completed,
-                summary: "done".into(),
-                remaining: vec![],
-            },
+        ui.transcript.open(bone_app::RecentHistoryPage {
+            items: vec![bone_app::HistoryEntry {
+                sequence,
+                occurred_at: 0,
+                event: bone_app::SessionEvent::JobFinished {
+                    job: bone_app::JobRef { runtime, id: 1 },
+                    outcome: bone_app::OutcomeKind::Completed,
+                    summary: "done".into(),
+                    remaining: vec![],
+                },
+            }],
+            older_cursor: None,
+            snapshot_through: sequence,
         });
         let mut state = UiState::default();
         state.session_rows.push(test_session_row(info.clone()));
