@@ -278,7 +278,7 @@ mod tests {
                     .iter()
                     .any(|hit| hit.target == HitTarget::SaveConnection)
             );
-            assert_eq!(state.orphan_draft, "untouched chat draft");
+            assert_eq!(state.orphan_draft.text(), "untouched chat draft");
         }
     }
 

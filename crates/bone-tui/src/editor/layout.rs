@@ -1,5 +1,3 @@
-use std::cell::Cell;
-
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -10,6 +8,23 @@ use crate::text::display_grapheme;
 struct EditorLayout {
     lines: Vec<String>,
     positions: Vec<(usize, usize, usize)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EditorViewport {
+    pub(crate) text: String,
+    pub(crate) cursor_x: u16,
+    pub(crate) cursor_y: u16,
+    /// Visual row index in the fully wrapped document.
+    pub(crate) row_origin: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SingleLineViewport {
+    pub(crate) text: String,
+    pub(crate) cursor_x: u16,
+    /// Grapheme-aligned UTF-8 byte offset in the source document.
+    pub(crate) byte_origin: usize,
 }
 
 fn editor_layout(value: &str, width: u16) -> EditorLayout {
@@ -101,8 +116,8 @@ pub(crate) fn stable_editor_viewport(
     cursor: usize,
     width: u16,
     height: u16,
-    origin: &Cell<usize>,
-) -> (String, u16, u16) {
+    previous_row_origin: usize,
+) -> EditorViewport {
     let layout = editor_layout(value, width);
     let (_, row, column) = layout
         .positions
@@ -112,19 +127,19 @@ pub(crate) fn stable_editor_viewport(
         .copied()
         .unwrap();
     let height = usize::from(height.max(1));
-    let mut start = origin.get().min(layout.lines.len().saturating_sub(height));
+    let mut start = previous_row_origin.min(layout.lines.len().saturating_sub(height));
     if row < start {
         start = row;
     }
     if row >= start + height {
         start = row + 1 - height;
     }
-    origin.set(start);
-    (
-        layout.lines[start..(start + height).min(layout.lines.len())].join("\n"),
-        column.min(usize::from(width.saturating_sub(1))) as u16,
-        (row - start) as u16,
-    )
+    EditorViewport {
+        text: layout.lines[start..(start + height).min(layout.lines.len())].join("\n"),
+        cursor_x: column.min(usize::from(width.saturating_sub(1))) as u16,
+        cursor_y: (row - start) as u16,
+        row_origin: start,
+    }
 }
 
 /// Keep a one-line editor's insertion point visible without borrowing the
@@ -134,8 +149,7 @@ pub(crate) fn single_line_editor_viewport(
     value: &str,
     cursor: usize,
     width: u16,
-    origin: &Cell<usize>,
-) -> (String, u16) {
+) -> SingleLineViewport {
     let width = usize::from(width.max(1));
     let cursor = super::floor_grapheme_boundary(value, cursor.min(value.len()));
     let mut start = cursor;
@@ -148,8 +162,6 @@ pub(crate) fn single_line_editor_viewport(
         cursor_column += cells;
         start = offset;
     }
-    origin.set(start);
-
     let mut shown = String::new();
     let mut used: usize = 0;
     for grapheme in value[start..].graphemes(true) {
@@ -161,7 +173,11 @@ pub(crate) fn single_line_editor_viewport(
         shown.push_str(&displayed);
         used += cells;
     }
-    (shown, cursor_column.min(width.saturating_sub(1)) as u16)
+    SingleLineViewport {
+        text: shown,
+        cursor_x: cursor_column.min(width.saturating_sub(1)) as u16,
+        byte_origin: start,
+    }
 }
 
 pub(crate) fn cursor_at_single_line(value: &str, origin: usize, column: u16) -> usize {
@@ -253,7 +269,8 @@ pub(crate) fn selection_cells(
 
 #[cfg(test)]
 fn editor_viewport(value: &str, cursor: usize, width: u16, height: u16) -> (String, u16, u16) {
-    stable_editor_viewport(value, cursor, width, height, &Cell::new(0))
+    let viewport = stable_editor_viewport(value, cursor, width, height, 0);
+    (viewport.text, viewport.cursor_x, viewport.cursor_y)
 }
 
 #[cfg(test)]
@@ -284,13 +301,12 @@ mod tests {
             ("one\ntwo".into(), 3, 1)
         );
         let value = "one\ntwo\nthree\nfour\nfive";
-        let origin = Cell::new(0);
-        let first = stable_editor_viewport(value, value.len(), 20, 3, &origin);
-        assert_eq!(first.0, "three\nfour\nfive");
-        let cursor = cursor_at_origin(value, 20, origin.get(), 2, 0);
-        let second = stable_editor_viewport(value, cursor, 20, 3, &origin);
-        assert_eq!(second.0, first.0);
-        assert_eq!((second.1, second.2), (2, 0));
+        let first = stable_editor_viewport(value, value.len(), 20, 3, 0);
+        assert_eq!(first.text, "three\nfour\nfive");
+        let cursor = cursor_at_origin(value, 20, first.row_origin, 2, 0);
+        let second = stable_editor_viewport(value, cursor, 20, 3, first.row_origin);
+        assert_eq!(second.text, first.text);
+        assert_eq!((second.cursor_x, second.cursor_y), (2, 0));
     }
 
     #[test]
@@ -300,55 +316,58 @@ mod tests {
 
     #[test]
     fn one_line_viewport_reserves_a_real_caret_cell_at_exact_width() {
-        let origin = Cell::new(0);
-        let (shown, column) = single_line_editor_viewport("abcd", 4, 4, &origin);
+        let viewport = single_line_editor_viewport("abcd", 4, 4);
 
-        assert_eq!(shown, "bcd");
-        assert_eq!(column, 3);
-        assert_eq!(origin.get(), 1);
-        assert_eq!(cursor_at_single_line("abcd", origin.get(), 0), 1);
-        assert_eq!(cursor_at_single_line("abcd", origin.get(), 3), 4);
+        assert_eq!(viewport.text, "bcd");
+        assert_eq!(viewport.cursor_x, 3);
+        assert_eq!(viewport.byte_origin, 1);
+        assert_eq!(cursor_at_single_line("abcd", viewport.byte_origin, 0), 1);
+        assert_eq!(cursor_at_single_line("abcd", viewport.byte_origin, 3), 4);
     }
 
     #[test]
     fn one_line_viewport_scrolls_only_at_grapheme_boundaries() {
         let value = "Ae\u{301}👩‍💻Z";
         let cursor = "Ae\u{301}👩‍💻".len();
-        let origin = Cell::new(usize::MAX);
-        let (shown, column) = single_line_editor_viewport(value, cursor, 4, &origin);
+        let viewport = single_line_editor_viewport(value, cursor, 4);
 
-        assert_eq!(shown, "e\u{301}👩‍💻Z");
-        assert_eq!(column, 3);
-        assert_eq!(origin.get(), 1);
-        assert!(value.is_char_boundary(origin.get()));
-        assert_eq!(cursor_at_single_line(value, origin.get(), column), cursor);
+        assert_eq!(viewport.text, "e\u{301}👩‍💻Z");
+        assert_eq!(viewport.cursor_x, 3);
+        assert_eq!(viewport.byte_origin, 1);
+        assert!(value.is_char_boundary(viewport.byte_origin));
+        assert_eq!(
+            cursor_at_single_line(value, viewport.byte_origin, viewport.cursor_x),
+            cursor
+        );
 
         let cjk = "ab中文🙂z";
-        let (shown, column) = single_line_editor_viewport(cjk, cjk.len(), 5, &Cell::new(0));
-        assert_eq!(shown, "🙂z");
-        assert_eq!(column, 3);
+        let viewport = single_line_editor_viewport(cjk, cjk.len(), 5);
+        assert_eq!(viewport.text, "🙂z");
+        assert_eq!(viewport.cursor_x, 3);
     }
 
     #[test]
     fn one_line_selection_uses_the_same_scrolled_unicode_cells_as_the_caret() {
         let value = "ab中e\u{301}🙂zTAIL";
-        let origin = Cell::new(0);
-        let (shown, cursor) = single_line_editor_viewport(value, value.len(), 8, &origin);
+        let viewport = single_line_editor_viewport(value, value.len(), 8);
         let selected_from = value.find('z').unwrap();
 
-        assert_eq!(shown, "🙂zTAIL");
-        assert_eq!(cursor, 7);
+        assert_eq!(viewport.text, "🙂zTAIL");
+        assert_eq!(viewport.cursor_x, 7);
         assert_eq!(
-            single_line_selection_cells(value, origin.get(), 8, selected_from..value.len()),
+            single_line_selection_cells(value, viewport.byte_origin, 8, selected_from..value.len()),
             vec![(2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
         );
         let emoji = value.find('🙂').unwrap();
         assert_eq!(
-            single_line_selection_cells(value, origin.get(), 8, emoji..value.len()),
+            single_line_selection_cells(value, viewport.byte_origin, 8, emoji..value.len()),
             vec![(0, 2), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
         );
-        assert!(value.is_char_boundary(origin.get()));
-        assert_eq!(cursor_at_single_line(value, origin.get(), 2), selected_from);
+        assert!(value.is_char_boundary(viewport.byte_origin));
+        assert_eq!(
+            cursor_at_single_line(value, viewport.byte_origin, 2),
+            selected_from
+        );
     }
 
     #[test]

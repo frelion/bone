@@ -6,7 +6,9 @@ use bone_app::{
 };
 use bone_tui::{
     layout::{HitTarget, LayoutPlan, SinglePane},
-    state::{Action, Effect, Focus, SessionUi, UiEvent, UiState, update},
+    state::{
+        Action, EditCommand, EditorTarget, Effect, Focus, SessionUi, UiEvent, UiState, update,
+    },
     view,
 };
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
@@ -66,12 +68,22 @@ fn render(state: &UiState, width: u16, height: u16) -> (String, view::FrameSnaps
     (text, plan.expect("layout plan"))
 }
 
+fn insert(text: impl Into<String>) -> Action {
+    Action::Edit {
+        target: EditorTarget::Composer,
+        command: EditCommand::Insert {
+            text: text.into(),
+            typing: false,
+        },
+    }
+}
+
 #[test]
 fn slash_new_creates_directly_without_a_dialog_and_cannot_be_submitted_twice() {
     let workspace = WorkspaceId::new();
     let info = session(workspace, "existing");
     let mut state = opened_state(&[info]);
-    update(&mut state, UiEvent::Action(Action::Paste("/new".into())));
+    update(&mut state, UiEvent::Action(insert("/new")));
 
     let first = update(&mut state, UiEvent::Action(Action::Submit));
     assert!(
@@ -103,7 +115,7 @@ fn text_typed_before_any_session_exists_is_kept_visible() {
     state.workspace = Some((WorkspaceId::new(), "empty workspace".into()));
     update(
         &mut state,
-        UiEvent::Action(Action::Paste("a normal first request".into())),
+        UiEvent::Action(insert("a normal first request")),
     );
 
     let (screen, _) = render(&state, 140, 36);
@@ -120,7 +132,7 @@ fn unknown_slash_command_is_not_sent_as_a_product_request() {
     let mut state = opened_state(&[info]);
     update(
         &mut state,
-        UiEvent::Action(Action::Paste("/definitely-not-a-command".into())),
+        UiEvent::Action(insert("/definitely-not-a-command")),
     );
 
     let effects = update(&mut state, UiEvent::Action(Action::Submit));
@@ -131,7 +143,7 @@ fn unknown_slash_command_is_not_sent_as_a_product_request() {
         "unknown slash text must never silently become a normal submission"
     );
     assert_eq!(
-        state.selected_ui().expect("selected session").draft,
+        state.selected_ui().expect("selected session").draft(),
         "/definitely-not-a-command",
         "rejected command text remains recoverable"
     );
@@ -144,19 +156,13 @@ fn drafts_and_submission_receipts_remain_bound_to_their_session_and_identity() {
     let second = session(workspace, "second");
     let mut state = opened_state(&[first.clone(), second.clone()]);
 
-    update(
-        &mut state,
-        UiEvent::Action(Action::Paste("first draft".into())),
-    );
+    update(&mut state, UiEvent::Action(insert("first draft")));
     update(
         &mut state,
         UiEvent::Action(Action::SelectSession(second.id)),
     );
     update(&mut state, UiEvent::Action(Action::Focus(Focus::Composer)));
-    update(
-        &mut state,
-        UiEvent::Action(Action::Paste("second draft".into())),
-    );
+    update(&mut state, UiEvent::Action(insert("second draft")));
     let submitted = update(&mut state, UiEvent::Action(Action::Submit));
     let (generation, request_id) = submitted
         .iter()
@@ -182,8 +188,8 @@ fn drafts_and_submission_receipts_remain_bound_to_their_session_and_identity() {
             },
         },
     );
-    assert_eq!(state.session_ui[&first.id].draft, "first draft");
-    assert_eq!(state.session_ui[&second.id].draft, "second draft");
+    assert_eq!(state.session_ui[&first.id].draft(), "first draft");
+    assert_eq!(state.session_ui[&second.id].draft(), "second draft");
 
     update(
         &mut state,
@@ -197,8 +203,8 @@ fn drafts_and_submission_receipts_remain_bound_to_their_session_and_identity() {
             },
         },
     );
-    assert_eq!(state.session_ui[&first.id].draft, "first draft");
-    assert!(state.session_ui[&second.id].draft.is_empty());
+    assert_eq!(state.session_ui[&first.id].draft(), "first draft");
+    assert!(state.session_ui[&second.id].draft().is_empty());
 
     update(
         &mut state,
@@ -214,7 +220,8 @@ fn drafts_and_submission_receipts_remain_bound_to_their_session_and_identity() {
         },
     );
     assert_eq!(
-        state.session_ui[&first.id].draft, "first draft",
+        state.session_ui[&first.id].draft(),
+        "first draft",
         "a stale open response cannot overwrite a local per-session draft"
     );
 }
@@ -340,8 +347,10 @@ fn contained_by(inner: Rect, outer: Rect) -> bool {
 fn large_drafts_preserve_history_space_and_padding() {
     for (w, h) in [(40, 12), (80, 24), (120, 30), (160, 40)] {
         let mut state = UiState::default();
-        state.orphan_draft = "中文草稿\n".repeat(100);
-        state.orphan_cursor = state.orphan_draft.len();
+        update(
+            &mut state,
+            UiEvent::Action(insert("中文草稿\n".repeat(100))),
+        );
         let (_, plan) = render(&state, w, h);
         assert!(plan.transcript.unwrap().height >= 3);
         assert!(plan.composer.unwrap().height <= 9);
@@ -350,7 +359,7 @@ fn large_drafts_preserve_history_space_and_padding() {
 #[test]
 fn minimum_menu_scrolls_to_selected_command_and_hits_it() {
     let mut state = UiState::default();
-    state.orphan_draft = "/".into();
+    update(&mut state, UiEvent::Action(insert("/")));
     for index in 0..state.slash_matches().len() {
         state.slash_selection = index;
         let (screen, plan) = render(&state, 40, 12);
@@ -369,10 +378,7 @@ fn submission_receipt_survives_leaving_and_reopening_its_session() {
     let first = session(workspace, "first");
     let second = session(workspace, "second");
     let mut state = opened_state(&[first.clone(), second.clone()]);
-    update(
-        &mut state,
-        UiEvent::Action(Action::Paste("original".into())),
-    );
+    update(&mut state, UiEvent::Action(insert("original")));
     let effects = update(&mut state, UiEvent::Action(Action::Submit));
     let (generation, request_id) = effects
         .iter()
@@ -389,10 +395,7 @@ fn submission_receipt_survives_leaving_and_reopening_its_session() {
     );
     update(&mut state, UiEvent::Action(Action::SelectSession(first.id)));
     update(&mut state, UiEvent::Action(Action::Focus(Focus::Composer)));
-    update(
-        &mut state,
-        UiEvent::Action(Action::Paste(" plus new edit".into())),
-    );
+    update(&mut state, UiEvent::Action(insert(" plus new edit")));
     update(
         &mut state,
         UiEvent::Submitted {
@@ -416,7 +419,7 @@ fn submission_receipt_survives_leaving_and_reopening_its_session() {
 #[test]
 fn too_small_has_no_invisible_pointer_actions() {
     let mut state = UiState::default();
-    state.orphan_draft = "unsent text".into();
+    update(&mut state, UiEvent::Action(insert("unsent text")));
     for (w, h) in [(39, 12), (40, 11)] {
         let (screen, plan) = render(&state, w, h);
         assert!(screen.contains("Window too small"));

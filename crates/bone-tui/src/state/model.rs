@@ -196,21 +196,15 @@ impl TitleRenameQueue {
 pub(crate) struct TitleEdit {
     pub(crate) target: SessionId,
     pub(crate) original: String,
-    pub(crate) text: String,
-    pub(crate) cursor: usize,
-    pub(crate) revision: u64,
-    pub(crate) editor: crate::editor::EditorState,
+    pub(crate) editor: crate::editor::EditorBuffer,
 }
 
 impl TitleEdit {
     fn new(target: SessionId, title: String) -> Self {
         Self {
             target,
-            cursor: title.len(),
             original: title.clone(),
-            text: title,
-            revision: 0,
-            editor: Default::default(),
+            editor: crate::editor::EditorBuffer::new(title),
         }
     }
 }
@@ -229,10 +223,7 @@ pub struct SessionUi {
     pub history_loading: bool,
     pub recent_loading: bool,
     pub newer_history_missing: bool,
-    pub draft: String,
-    pub draft_cursor: usize,
-    pub editor: crate::editor::EditorState,
-    pub draft_revision: u64,
+    pub(crate) draft: crate::editor::EditorBuffer,
     pub saved_draft_revision: u64,
     pub saved_draft: String,
     pub answer_drafts: BTreeMap<QuestionId, super::answer::AnswerDraft>,
@@ -247,6 +238,10 @@ pub struct SessionUi {
 }
 
 impl SessionUi {
+    pub fn draft(&self) -> &str {
+        self.draft.text()
+    }
+
     pub fn active_answer(&self) -> Option<&super::answer::AnswerDraft> {
         self.selected_answer
             .and_then(|id| self.answer_drafts.get(&id))
@@ -286,10 +281,7 @@ impl SessionUi {
             history_loading: false,
             recent_loading: false,
             newer_history_missing: false,
-            draft: String::new(),
-            draft_cursor: 0,
-            editor: Default::default(),
-            draft_revision: 0,
+            draft: Default::default(),
             saved_draft_revision: 0,
             saved_draft: String::new(),
             answer_drafts: BTreeMap::new(),
@@ -379,11 +371,7 @@ pub struct UiState {
     pub focus: Focus,
     pub(crate) last_center: CenterFocus,
     pub(crate) caret_visible: bool,
-    pub orphan_draft: String,
-    pub orphan_cursor: usize,
-    pub orphan_editor: crate::editor::EditorState,
-    pub preferred_column: Option<usize>,
-    pub orphan_revision: u64,
+    pub(crate) orphan_draft: crate::editor::EditorBuffer,
     pub pending_create: Option<PendingCreate>,
     pub slash_selection: usize,
     pub slash_dismissed: Option<(Option<SessionId>, u64)>,
@@ -429,11 +417,7 @@ impl Default for UiState {
             focus: Focus::Composer,
             last_center: CenterFocus::Composer,
             caret_visible: true,
-            orphan_draft: String::new(),
-            orphan_cursor: 0,
-            orphan_editor: Default::default(),
-            preferred_column: None,
-            orphan_revision: 0,
+            orphan_draft: Default::default(),
             pending_create: None,
             slash_selection: 0,
             slash_dismissed: None,
@@ -503,23 +487,18 @@ impl UiState {
             .as_ref()
             .filter(|edit| edit.target == selected.info.id)
         {
-            Some(edit.text.as_str())
+            Some(edit.editor.text())
         } else {
             Some(selected.info.title.as_str())
         }
     }
 
-    pub(crate) fn title_editor_mut(&mut self) -> crate::editor::EditBuffer<'_> {
-        let edit = self
+    pub(crate) fn title_editor_mut(&mut self) -> &mut crate::editor::EditorBuffer {
+        &mut self
             .title_edit
             .as_mut()
-            .expect("title editor is prepared before title input");
-        crate::editor::EditBuffer::new(
-            &mut edit.text,
-            &mut edit.cursor,
-            &mut edit.revision,
-            &mut edit.editor,
-        )
+            .expect("title editor is prepared before title input")
+            .editor
     }
 
     pub(crate) fn clear_title_edit(&mut self) {
@@ -624,54 +603,38 @@ impl UiState {
     }
 
     pub fn draft(&self) -> &str {
-        self.selected_ui().map_or(self.orphan_draft.as_str(), |ui| {
+        self.selected_ui().map_or(self.orphan_draft.text(), |ui| {
             ui.active_answer()
-                .map_or(ui.draft.as_str(), |answer| answer.text.as_str())
+                .map_or(ui.draft.text(), |answer| answer.editor.text())
         })
     }
 
     pub fn draft_cursor(&self) -> usize {
-        self.selected_ui().map_or(self.orphan_cursor, |ui| {
+        self.selected_ui().map_or(self.orphan_draft.cursor(), |ui| {
             ui.active_answer()
-                .map_or(ui.draft_cursor, |answer| answer.cursor)
+                .map_or(ui.draft.cursor(), |answer| answer.editor.cursor())
         })
     }
 
-    pub(crate) fn editor(&self) -> &crate::editor::EditorState {
-        self.selected_ui().map_or(&self.orphan_editor, |ui| {
+    pub(crate) fn editor(&self) -> &crate::editor::EditorBuffer {
+        self.selected_ui().map_or(&self.orphan_draft, |ui| {
             ui.active_answer()
-                .map_or(&ui.editor, |answer| &answer.editor)
+                .map_or(&ui.draft, |answer| &answer.editor)
         })
     }
 
     /// Mutable editor for the active answer, ordinary session draft, or orphan.
-    /// Ordinary draft persistence deliberately continues to read SessionUi.draft.
-    pub(crate) fn editor_mut(&mut self) -> crate::editor::EditBuffer<'_> {
+    pub(crate) fn editor_mut(&mut self) -> &mut crate::editor::EditorBuffer {
         if let Some(ui) = self.selected.and_then(|id| self.session_ui.get_mut(&id)) {
             if let Some(answer) = ui
                 .selected_answer
                 .and_then(|id| ui.answer_drafts.get_mut(&id))
             {
-                return crate::editor::EditBuffer::new(
-                    &mut answer.text,
-                    &mut answer.cursor,
-                    &mut answer.revision,
-                    &mut answer.editor,
-                );
+                return &mut answer.editor;
             }
-            crate::editor::EditBuffer::new(
-                &mut ui.draft,
-                &mut ui.draft_cursor,
-                &mut ui.draft_revision,
-                &mut ui.editor,
-            )
+            &mut ui.draft
         } else {
-            crate::editor::EditBuffer::new(
-                &mut self.orphan_draft,
-                &mut self.orphan_cursor,
-                &mut self.orphan_revision,
-                &mut self.orphan_editor,
-            )
+            &mut self.orphan_draft
         }
     }
 
@@ -715,8 +678,8 @@ impl UiState {
 
     pub fn draft_identity(&self) -> (Option<SessionId>, u64) {
         self.selected_ui()
-            .map_or((None, self.orphan_revision), |ui| {
-                (Some(ui.info.id), ui.draft_revision)
+            .map_or((None, self.orphan_draft.revision()), |ui| {
+                (Some(ui.info.id), ui.draft.revision())
             })
     }
 

@@ -3,7 +3,10 @@ use bone_app::{
     RecentHistoryPage, RequestId, ResolvedModel, RuntimeConfig, RuntimeId, RuntimeState,
     SessionEvent, SessionId, SessionInfo, SessionSeq, SessionView, SubmissionReceipt, WorkspaceId,
 };
-use bone_tui::state::{Action, Effect, Focus, SessionUi, UiEvent, UiState, update};
+use bone_tui::state::{
+    Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, SessionUi, UiEvent, UiState,
+    update,
+};
 use std::sync::Arc;
 
 fn info(name: &str) -> SessionInfo {
@@ -71,6 +74,18 @@ fn setup() -> (UiState, SessionId, QuestionId) {
 fn act(s: &mut UiState, action: Action) -> Vec<Effect> {
     update(s, UiEvent::Action(action))
 }
+fn edit(command: EditCommand) -> Action {
+    Action::Edit {
+        target: EditorTarget::Composer,
+        command,
+    }
+}
+fn insert(text: impl Into<String>) -> Action {
+    edit(EditCommand::Insert {
+        text: text.into(),
+        typing: false,
+    })
+}
 fn submitted(effects: &[Effect]) -> bone_app::SubmitInput {
     effects
         .iter()
@@ -101,12 +116,9 @@ fn receipt(s: &mut UiState, session: SessionId, request_id: RequestId) -> Vec<Ef
 #[test]
 fn answer_buffer_is_separate_and_slash_answers_stay_answers() {
     let (mut s, id, q) = setup();
-    act(&mut s, Action::Paste("ordinary draft".into()));
+    act(&mut s, insert("ordinary draft"));
     act(&mut s, Action::AnswerQuestion(q));
-    act(
-        &mut s,
-        Action::Paste("/new is an answer, not a command".into()),
-    );
+    act(&mut s, insert("/new is an answer, not a command"));
     assert!(s.slash_matches().is_empty());
     let input = submitted(&act(&mut s, Action::Submit));
     assert_eq!(input.reply_to, Some(q));
@@ -124,22 +136,22 @@ fn answer_buffer_is_separate_and_slash_answers_stay_answers() {
 fn answer_receipt_survives_reopen_but_does_not_clear_new_answer_text() {
     let (mut s, id, q) = setup();
     act(&mut s, Action::AnswerQuestion(q));
-    act(&mut s, Action::Paste("first".into()));
+    act(&mut s, insert("first"));
     let input = submitted(&act(&mut s, Action::Submit));
-    act(&mut s, Action::Paste(" later".into()));
+    act(&mut s, insert(" later"));
     s.session_ui.get_mut(&id).unwrap().generation = 99;
     receipt(&mut s, id, input.request_id);
     assert_eq!(s.draft(), "first later");
     assert!(s.selected_ui().unwrap().submitting.is_none());
-    assert_eq!(s.selected_ui().unwrap().draft, "");
+    assert_eq!(s.selected_ui().unwrap().draft(), "");
 }
 
 #[test]
 fn escape_restores_ordinary_draft_and_expiry_requires_explicit_conversion() {
     let (mut s, id, q) = setup();
-    act(&mut s, Action::Paste("ordinary".into()));
+    act(&mut s, insert("ordinary"));
     act(&mut s, Action::AnswerQuestion(q));
-    act(&mut s, Action::Paste("answer".into()));
+    act(&mut s, insert("answer"));
     assert!(act(&mut s, Action::Escape).is_empty());
     assert_eq!(s.draft(), "ordinary");
     act(&mut s, Action::AnswerQuestion(q));
@@ -155,18 +167,24 @@ fn escape_restores_ordinary_draft_and_expiry_requires_explicit_conversion() {
 #[test]
 fn answer_editing_and_persistence_do_not_touch_the_ordinary_buffer() {
     let (mut s, _, q) = setup();
-    act(&mut s, Action::Paste("ordinary".into()));
+    act(&mut s, insert("ordinary"));
     act(&mut s, Action::AnswerQuestion(q));
-    act(&mut s, Action::Paste("中e\u{301}\nnext".into()));
-    act(&mut s, Action::CursorHome);
+    act(&mut s, insert("中e\u{301}\nnext"));
     act(
         &mut s,
-        Action::CursorVertical {
-            down: false,
-            width: 30,
-        },
+        edit(EditCommand::Move {
+            cursor: CursorMove::LineStart,
+            select: false,
+        }),
     );
-    act(&mut s, Action::Delete);
+    act(
+        &mut s,
+        edit(EditCommand::Move {
+            cursor: CursorMove::Up { width: 30 },
+            select: false,
+        }),
+    );
+    act(&mut s, edit(EditCommand::DeleteAfter));
     assert_eq!(s.draft(), "e\u{301}\nnext");
     let saves = update(&mut s, UiEvent::PersistDraftsRequested);
     assert!(
@@ -226,16 +244,16 @@ fn saved_input_retry_and_cancelled_answer_restore_keep_identity() {
     act(&mut s, Action::RestoreInput(InputId(4)));
     assert_eq!(s.draft(), "cancelled answer");
     assert_eq!(s.selected_ui().unwrap().selected_answer, Some(q));
-    assert!(s.selected_ui().unwrap().draft.is_empty());
+    assert!(s.selected_ui().unwrap().draft().is_empty());
 }
 
 #[test]
 fn uncertain_answer_retry_reuses_request_and_preserves_later_text() {
     let (mut s, id, q) = setup();
     act(&mut s, Action::AnswerQuestion(q));
-    act(&mut s, Action::Paste("first".into()));
+    act(&mut s, insert("first"));
     let original = submitted(&act(&mut s, Action::Submit));
-    act(&mut s, Action::Paste(" later".into()));
+    act(&mut s, insert(" later"));
     update(
         &mut s,
         UiEvent::SubmitFailed {
@@ -258,7 +276,7 @@ fn uncertain_answer_retry_reuses_request_and_preserves_later_text() {
 #[test]
 fn first_input_creates_then_submits_after_hydration_and_preserves_later_typing() {
     let mut s = UiState::default();
-    act(&mut s, Action::Paste("first request".into()));
+    act(&mut s, insert("first request"));
     let effects = act(&mut s, Action::Submit);
     let create_id = effects
         .iter()
@@ -271,7 +289,7 @@ fn first_input_creates_then_submits_after_hydration_and_preserves_later_typing()
         })
         .unwrap();
     assert!(act(&mut s, Action::Submit).is_empty());
-    act(&mut s, Action::Paste(" and later draft".into()));
+    act(&mut s, insert(" and later draft"));
     let info = info("new session");
     let effects = update(
         &mut s,
@@ -299,13 +317,14 @@ fn first_input_creates_then_submits_after_hydration_and_preserves_later_typing()
     assert_eq!(input.text, "first request");
     receipt(&mut s, info.id, input.request_id);
     assert_eq!(s.draft(), "first request and later draft");
-    assert!(s.orphan_draft.is_empty());
+    s.selected = None;
+    assert!(s.draft().is_empty());
 }
 
 #[test]
 fn first_input_create_failure_reuses_identity_and_keeps_text() {
     let mut s = UiState::default();
-    act(&mut s, Action::Paste("first request".into()));
+    act(&mut s, insert("first request"));
     act(&mut s, Action::Submit);
     let request_id = s.pending_create.as_ref().unwrap().request_id;
     update(
@@ -315,7 +334,7 @@ fn first_input_create_failure_reuses_identity_and_keeps_text() {
             message: "uncertain".into(),
         },
     );
-    act(&mut s, Action::Paste(" later".into()));
+    act(&mut s, insert(" later"));
     let retry = act(&mut s, Action::Submit);
     assert!(
         matches!(retry.as_slice(), [Effect::CreateSession { request_id: actual, .. }] if *actual == request_id)
@@ -327,8 +346,8 @@ fn first_input_create_failure_reuses_identity_and_keeps_text() {
 #[test]
 fn quitting_preserves_answer_and_ordinary_draft_once_without_submitting() {
     let (mut state, id, question) = setup();
+    act(&mut state, insert("ordinary draft"));
     let ui = state.session_ui.get_mut(&id).unwrap();
-    ui.draft = "ordinary draft".into();
     let mut answer = bone_tui::state::answer::AnswerDraft::new(question);
     answer.replace("answer text".into(), 11);
     ui.answer_drafts.insert(question, answer);
@@ -337,7 +356,7 @@ fn quitting_preserves_answer_and_ordinary_draft_once_without_submitting() {
         assert!(effects.iter().any(|e| matches!(e, Effect::Shutdown)));
         assert!(!effects.iter().any(|e| matches!(e, Effect::Submit { .. })));
     }
-    let draft = &state.session_ui[&id].draft;
+    let draft = state.session_ui[&id].draft();
     assert!(draft.starts_with("ordinary draft"));
     assert!(draft.contains("未发送回答"));
     assert_eq!(draft.matches("answer text").count(), 1);
@@ -354,6 +373,6 @@ fn converted_answer_is_not_copied_again_on_quit() {
     ui.selected_answer = Some(question);
     act(&mut state, Action::ConvertAnswer);
     act(&mut state, Action::Quit);
-    assert_eq!(state.session_ui[&id].draft, "converted answer");
+    assert_eq!(state.session_ui[&id].draft(), "converted answer");
     assert!(state.session_ui[&id].answer_drafts.is_empty());
 }

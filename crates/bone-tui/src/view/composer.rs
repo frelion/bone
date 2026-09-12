@@ -19,7 +19,8 @@ pub(super) fn render(
     area: Rect,
     hits: &mut HitMap,
     state: &UiState,
-) {
+    previous_row_origin: usize,
+) -> usize {
     let draft = state.draft();
     let cursor = state.draft_cursor();
     // Slash commands keep editor focus and the same application-owned caret.
@@ -34,18 +35,18 @@ pub(super) fn render(
         surface,
     );
     let input = crate::layout::composer_text_area(area);
-    let (value, cursor_x, cursor_y) = crate::editor::stable_editor_viewport(
+    let viewport = crate::editor::stable_editor_viewport(
         draft,
         cursor,
         input.width,
         input.height,
-        state.editor().viewport(),
+        previous_row_origin,
     );
     frame.render_widget(
         Paragraph::new(if draft.is_empty() {
             "Write a request…"
         } else {
-            &value
+            &viewport.text
         })
         .style(theme::body_on(
             if draft.is_empty() {
@@ -57,12 +58,12 @@ pub(super) fn render(
         )),
         input,
     );
-    if focused && let Some(selection) = state.editor().selection(cursor) {
+    if focused && let Some(selection) = state.editor().selection() {
         for (x, y, width) in crate::editor::selection_cells(
             draft,
             input.width,
             input.height,
-            state.editor().viewport_origin(),
+            viewport.row_origin,
             selection,
         ) {
             for dx in 0..width {
@@ -167,10 +168,11 @@ pub(super) fn render(
     if focused && input.width > 0 && input.height > 0 {
         caret::place(
             frame,
-            (input.x + cursor_x, input.y + cursor_y),
+            (input.x + viewport.cursor_x, input.y + viewport.cursor_y),
             state.caret_visible,
         );
     }
+    viewport.row_origin
 }
 
 /// Shared by paint and pointer registration, including intermediate pane widths.
@@ -294,7 +296,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-        super::render(frame, frame.area(), area, &mut HitMap::default(), state);
+        super::render(frame, frame.area(), area, &mut HitMap::default(), state, 0);
     }
 
     #[test]
@@ -302,7 +304,7 @@ mod tests {
         for (width, height) in [(40, 12), (80, 24), (120, 30), (160, 40)] {
             for lines in [1, 2, 20] {
                 let mut state = UiState::default();
-                state.orphan_draft = vec!["draft"; lines].join("\n");
+                state.orphan_draft = vec!["draft"; lines].join("\n").into();
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
                     .draw(|frame| {
@@ -335,7 +337,6 @@ mod tests {
     fn minimum_screen_keeps_full_width_draft_visible_at_end_cursor() {
         let mut state = UiState::default();
         state.orphan_draft = "draft survives model setup".into();
-        state.orphan_cursor = state.orphan_draft.len();
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal
             .draw(|frame| {
@@ -356,7 +357,6 @@ mod tests {
     fn slash_palette_keeps_the_composer_caret_visible() {
         let mut state = UiState::default();
         state.orphan_draft = "/".into();
-        state.orphan_cursor = state.orphan_draft.len();
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let mut plan = None;
 
@@ -365,14 +365,17 @@ mod tests {
             .unwrap();
 
         let input = crate::layout::composer_text_area(plan.unwrap().composer.unwrap());
-        let (_, cursor_x, cursor_y) = crate::editor::stable_editor_viewport(
+        let viewport = crate::editor::stable_editor_viewport(
             state.draft(),
             state.draft_cursor(),
             input.width,
             input.height,
-            state.editor().viewport(),
+            0,
         );
-        let position = ratatui::layout::Position::new(input.x + cursor_x, input.y + cursor_y);
+        let position = ratatui::layout::Position::new(
+            input.x + viewport.cursor_x,
+            input.y + viewport.cursor_y,
+        );
         assert_eq!(terminal.get_cursor_position().unwrap(), position);
         let cell = &terminal.backend().buffer()[position];
         assert_eq!(cell.bg, theme::FOCUS_MARK);
@@ -398,7 +401,6 @@ mod tests {
             state.panel = panel;
             state.caret_visible = caret_visible;
             state.orphan_draft = "draft".into();
-            state.orphan_cursor = state.orphan_draft.len();
             let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
             terminal.draw(|frame| render(frame, area, &state)).unwrap();
             let buffer = terminal.backend().buffer();

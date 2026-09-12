@@ -10,10 +10,7 @@ use bone_app::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnswerDraft {
     pub question: QuestionId,
-    pub text: String,
-    pub cursor: usize,
-    pub revision: u64,
-    pub editor: crate::editor::EditorState,
+    pub(crate) editor: crate::editor::EditorBuffer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,23 +29,25 @@ impl AnswerDraft {
     pub fn new(question: QuestionId) -> Self {
         Self {
             question,
-            text: String::new(),
-            cursor: 0,
-            revision: 0,
             editor: Default::default(),
         }
     }
 
+    pub fn text(&self) -> &str {
+        self.editor.text()
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.editor.cursor()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.editor.revision()
+    }
+
     /// Replace only this answer buffer, keeping the cursor on a grapheme boundary.
     pub fn replace(&mut self, text: String, cursor: usize) {
-        if self.text != text {
-            self.editor.checkpoint(&self.text, self.cursor);
-        }
-        self.cursor = crate::editor::floor_grapheme_boundary(&text, cursor);
-        if self.text != text {
-            self.revision = self.revision.wrapping_add(1);
-            self.text = text;
-        }
+        self.editor.replace_user(text, cursor);
     }
 
     /// The caller owns request-id reuse. Even slash-prefixed answers stay answers.
@@ -60,10 +59,10 @@ impl AnswerDraft {
         if active_question(snapshot, self.question).is_none() {
             return Err(AnswerError::QuestionExpired);
         }
-        if self.text.trim().is_empty() {
+        if self.editor.text.trim().is_empty() {
             return Err(AnswerError::Empty);
         }
-        let mut input = SubmitInput::new(self.text.clone()).answer(self.question);
+        let mut input = SubmitInput::new(self.editor.text.clone()).answer(self.question);
         input.request_id = request_id;
         Ok(input)
     }
@@ -71,14 +70,11 @@ impl AnswerDraft {
     /// Call only after matching the receipt's request_id to its pending submission.
     /// A receipt for an old question/revision cannot clear a newer answer.
     pub fn clear_if_submitted(&mut self, question: QuestionId, revision: u64, text: &str) -> bool {
-        if self.question != question || self.revision != revision || self.text != text {
+        if self.question != question || self.editor.revision != revision || self.editor.text != text
+        {
             return false;
         }
-        self.editor.checkpoint(&self.text, self.cursor);
-        self.text.clear();
-        self.cursor = 0;
-        self.revision = self.revision.wrapping_add(1);
-        true
+        self.editor.clear()
     }
 }
 
@@ -304,7 +300,7 @@ mod tests {
             answer.submission(&snapshot(vec![]), RequestId::new()),
             Err(AnswerError::QuestionExpired)
         ));
-        assert_eq!(answer.text, "/new is my answer");
+        assert_eq!(answer.text(), "/new is my answer");
     }
 
     #[test]
@@ -312,28 +308,28 @@ mod tests {
         let q = question();
         let mut answer = AnswerDraft::new(q);
         answer.replace("first".into(), 5);
-        let old_revision = answer.revision;
+        let old_revision = answer.revision();
         answer.replace("first plus later typing".into(), usize::MAX);
         assert!(!answer.clear_if_submitted(q, old_revision, "first"));
         assert!(!answer.clear_if_submitted(
             QuestionId { record: 8, ..q },
-            answer.revision,
+            answer.revision(),
             "first plus later typing"
         ));
-        assert!(answer.clear_if_submitted(q, answer.revision, "first plus later typing"));
-        assert_eq!((answer.text.as_str(), answer.cursor), ("", 0));
+        assert!(answer.clear_if_submitted(q, answer.revision(), "first plus later typing"));
+        assert_eq!((answer.text(), answer.cursor()), ("", 0));
     }
 
     #[test]
     fn replacing_answer_does_not_split_combining_clusters() {
         let mut answer = AnswerDraft::new(question());
         answer.replace("中e\u{301}文".into(), 4);
-        assert_eq!(answer.cursor, "中".len());
+        assert_eq!(answer.cursor(), "中".len());
         assert_eq!(
-            append_restored_text("ordinary draft", &answer.text),
+            append_restored_text("ordinary draft", answer.text()),
             "ordinary draft\n中e\u{301}文"
         );
-        assert_eq!(answer.text, "中e\u{301}文");
+        assert_eq!(answer.text(), "中e\u{301}文");
     }
 
     #[test]

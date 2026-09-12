@@ -81,7 +81,6 @@ mod tests {
         for (width, height) in [(40, 12), (80, 24), (100, 24), (160, 40)] {
             let mut state = UiState::default();
             state.orphan_draft = "/".into();
-            state.orphan_cursor = 1;
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut snapshot = None;
             terminal
@@ -105,7 +104,6 @@ mod tests {
     fn slash_commands_use_the_shared_panel_shell_and_neutral_selection() {
         let mut state = UiState::default();
         state.orphan_draft = "/".into();
-        state.orphan_cursor = 1;
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut snapshot = None;
         terminal
@@ -154,7 +152,6 @@ mod tests {
     fn empty_search_keeps_the_surface_open_and_captures_pointer_input() {
         let mut state = UiState::default();
         state.orphan_draft = "/does-not-exist".into();
-        state.orphan_cursor = state.orphan_draft.len();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut snapshot = None;
         terminal

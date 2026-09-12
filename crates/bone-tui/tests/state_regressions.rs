@@ -7,7 +7,8 @@ use bone_app::{
 use bone_tui::{
     layout::{HitTarget, LayoutPlan, SinglePane},
     state::{
-        Action, Effect, Focus, OperationKind, SessionStatus, SessionUi, UiEvent, UiState, update,
+        Action, CursorMove, EditCommand, EditorTarget, Effect, Focus, OperationKind, SessionStatus,
+        SessionUi, UiEvent, UiState, update,
     },
     view,
 };
@@ -52,7 +53,20 @@ fn opened(infos: &[SessionInfo]) -> UiState {
 }
 
 fn paste(state: &mut UiState, text: &str) {
-    update(state, UiEvent::Action(Action::Paste(text.into())));
+    update(
+        state,
+        UiEvent::Action(editor(EditCommand::Insert {
+            text: text.into(),
+            typing: false,
+        })),
+    );
+}
+
+fn editor(command: EditCommand) -> Action {
+    Action::Edit {
+        target: EditorTarget::Composer,
+        command,
+    }
 }
 
 fn create_effect(effects: &[Effect]) -> (RequestId, String, bool) {
@@ -180,7 +194,7 @@ fn new_from_existing_session_clears_only_the_unchanged_source_draft() {
             info: info(workspace, "named"),
         },
     );
-    assert!(unchanged.session_ui[&source.id].draft.is_empty());
+    assert!(unchanged.session_ui[&source.id].draft().is_empty());
 
     let mut edited = opened(std::slice::from_ref(&source));
     paste(&mut edited, "/new named");
@@ -195,7 +209,7 @@ fn new_from_existing_session_clears_only_the_unchanged_source_draft() {
         },
     );
     assert_eq!(
-        edited.session_ui[&source.id].draft,
+        edited.session_ui[&source.id].draft(),
         "/new named plus a newer edit"
     );
 }
@@ -272,7 +286,7 @@ fn escape_dismisses_slash_palette_without_destroying_its_draft() {
         assert!(state.slash_palette_visible());
         let identity = state.draft_identity();
         assert!(update(&mut state, UiEvent::Action(Action::Escape)).is_empty());
-        assert_eq!(state.orphan_draft, draft);
+        assert_eq!(state.draft(), draft);
         assert_eq!(state.slash_dismissed, Some(identity));
         assert!(!state.slash_palette_visible());
         assert!(state.slash_matches().is_empty());
@@ -291,7 +305,7 @@ fn a_slash_draft_does_not_capture_escape_after_focus_leaves_the_composer() {
 
     update(&mut state, UiEvent::Action(Action::Escape));
 
-    assert_eq!(state.orphan_draft, "/");
+    assert_eq!(state.draft(), "/");
     assert_eq!(state.slash_dismissed, None);
 }
 
@@ -302,7 +316,7 @@ fn slash_quit_clears_command_text_while_quit_action_preserves_normal_draft() {
     let mut slash = opened(std::slice::from_ref(&session));
     paste(&mut slash, "/quit");
     let effects = update(&mut slash, UiEvent::Action(Action::Submit));
-    assert!(slash.session_ui[&session.id].draft.is_empty());
+    assert!(slash.session_ui[&session.id].draft().is_empty());
     assert!(
         effects
             .iter()
@@ -318,7 +332,7 @@ fn slash_quit_clears_command_text_while_quit_action_preserves_normal_draft() {
     paste(&mut shortcut, "unsent normal draft");
     let effects = update(&mut shortcut, UiEvent::Action(Action::Quit));
     assert_eq!(
-        shortcut.session_ui[&session.id].draft,
+        shortcut.session_ui[&session.id].draft(),
         "unsent normal draft"
     );
     assert!(
@@ -547,19 +561,56 @@ fn session_rail_renders_draft_attention_and_recoverable_statuses() {
 fn grapheme_editor_supports_middle_insert_delete_and_per_line_home_end() {
     let mut state = UiState::default();
     paste(&mut state, "A👨‍👩‍👧‍👦B\n中文");
-    update(&mut state, UiEvent::Action(Action::CursorHome));
-    assert_eq!(state.orphan_cursor, "A👨‍👩‍👧‍👦B\n".len());
-    update(&mut state, UiEvent::Action(Action::CursorLeft));
-    update(&mut state, UiEvent::Action(Action::Input('!')));
-    assert_eq!(state.orphan_draft, "A👨‍👩‍👧‍👦B!\n中文");
-    update(&mut state, UiEvent::Action(Action::Backspace));
-    assert_eq!(state.orphan_draft, "A👨‍👩‍👧‍👦B\n中文");
-    update(&mut state, UiEvent::Action(Action::CursorLeft));
-    update(&mut state, UiEvent::Action(Action::CursorLeft));
-    update(&mut state, UiEvent::Action(Action::Delete));
-    assert_eq!(state.orphan_draft, "AB\n中文");
-    update(&mut state, UiEvent::Action(Action::CursorEnd));
-    assert_eq!(state.orphan_cursor, "AB".len());
+    update(
+        &mut state,
+        UiEvent::Action(editor(EditCommand::Move {
+            cursor: CursorMove::LineStart,
+            select: false,
+        })),
+    );
+    assert_eq!(state.draft_cursor(), "A👨‍👩‍👧‍👦B\n".len());
+    update(
+        &mut state,
+        UiEvent::Action(editor(EditCommand::Move {
+            cursor: CursorMove::Left,
+            select: false,
+        })),
+    );
+    update(
+        &mut state,
+        UiEvent::Action(editor(EditCommand::Insert {
+            text: "!".into(),
+            typing: true,
+        })),
+    );
+    assert_eq!(state.draft(), "A👨‍👩‍👧‍👦B!\n中文");
+    update(
+        &mut state,
+        UiEvent::Action(editor(EditCommand::DeleteBefore)),
+    );
+    assert_eq!(state.draft(), "A👨‍👩‍👧‍👦B\n中文");
+    for _ in 0..2 {
+        update(
+            &mut state,
+            UiEvent::Action(editor(EditCommand::Move {
+                cursor: CursorMove::Left,
+                select: false,
+            })),
+        );
+    }
+    update(
+        &mut state,
+        UiEvent::Action(editor(EditCommand::DeleteAfter)),
+    );
+    assert_eq!(state.draft(), "AB\n中文");
+    update(
+        &mut state,
+        UiEvent::Action(editor(EditCommand::Move {
+            cursor: CursorMove::LineEnd,
+            select: false,
+        })),
+    );
+    assert_eq!(state.draft_cursor(), "AB".len());
 }
 
 #[test]
@@ -670,8 +721,7 @@ fn history_bytes(entry: &HistoryEntry) -> usize {
 }
 
 fn replace_orphan_draft(state: &mut UiState, text: &str) {
-    state.orphan_draft = text.into();
-    state.orphan_cursor = state.orphan_draft.len();
-    state.orphan_revision = state.orphan_revision.wrapping_add(1);
+    update(state, UiEvent::Action(editor(EditCommand::Clear)));
+    paste(state, text);
     state.slash_dismissed = None;
 }

@@ -11,7 +11,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind};
 
 use crate::{
     layout::LayoutMode,
-    state::{Action, UiEvent, UiState},
+    state::{Action, CursorMove, EditCommand, EditorTarget, UiEvent, UiState},
     view::FrameSnapshot,
 };
 
@@ -42,9 +42,21 @@ pub(crate) fn terminal_event(
         }
         Event::Paste(_) if state.panel.is_some() => None,
         Event::Paste(text) if state.focus == crate::state::Focus::SessionTitle => {
-            Some(Action::TitlePaste(text))
+            Some(Action::Edit {
+                target: EditorTarget::SessionTitle,
+                command: EditCommand::Insert {
+                    text,
+                    typing: false,
+                },
+            })
         }
-        Event::Paste(text) => Some(Action::Paste(text)),
+        Event::Paste(text) if state.focus == crate::state::Focus::Composer => Some(Action::Edit {
+            target: EditorTarget::Composer,
+            command: EditCommand::Insert {
+                text,
+                typing: false,
+            },
+        }),
         _ => None,
     }?;
 
@@ -68,20 +80,37 @@ pub(crate) fn terminal_event(
             amount,
             max: snapshot.map_or(0, |frame| frame.reader_max_scroll),
         },
-        Action::MoveCursor {
-            direction,
-            select,
-            word,
-            ..
-        } => Action::MoveCursor {
-            direction,
-            select,
-            word,
-            width: composer_width(snapshot),
+        Action::Edit {
+            target: EditorTarget::Composer,
+            command:
+                EditCommand::Move {
+                    cursor: CursorMove::Up { .. },
+                    select,
+                },
+        } => Action::Edit {
+            target: EditorTarget::Composer,
+            command: EditCommand::Move {
+                cursor: CursorMove::Up {
+                    width: composer_width(snapshot),
+                },
+                select,
+            },
         },
-        Action::CursorVertical { down, .. } => Action::CursorVertical {
-            down,
-            width: composer_width(snapshot),
+        Action::Edit {
+            target: EditorTarget::Composer,
+            command:
+                EditCommand::Move {
+                    cursor: CursorMove::Down { .. },
+                    select,
+                },
+        } => Action::Edit {
+            target: EditorTarget::Composer,
+            command: EditCommand::Move {
+                cursor: CursorMove::Down {
+                    width: composer_width(snapshot),
+                },
+                select,
+            },
         },
         Action::ScrollUp {
             amount,
@@ -143,7 +172,15 @@ fn frame_for_layout(layout: LayoutPlan) -> FrameSnapshot {
             target: HitTarget::RightRail,
         });
     }
-    FrameSnapshot::new(layout, hits, None, 0)
+    FrameSnapshot::new(layout, hits, None, 0, Some(0), Some(0))
+}
+
+#[cfg(test)]
+fn composer_edit(command: EditCommand) -> Action {
+    Action::Edit {
+        target: EditorTarget::Composer,
+        command,
+    }
 }
 
 #[cfg(test)]
@@ -181,7 +218,13 @@ mod tests {
         ));
         assert!(matches!(
             mapped_key_action(key(KeyCode::End, KeyModifiers::NONE), &state),
-            Action::CursorEnd
+            Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Move {
+                    cursor: CursorMove::LineEnd,
+                    select: false,
+                }
+            }
         ));
         state.focus = Focus::SessionTitle;
         assert!(matches!(
@@ -194,7 +237,13 @@ mod tests {
         ));
         assert!(matches!(
             mapped_key_action(key(KeyCode::End, KeyModifiers::NONE), &state),
-            Action::TitleEnd
+            Action::Edit {
+                target: EditorTarget::SessionTitle,
+                command: EditCommand::Move {
+                    cursor: CursorMove::LineEnd,
+                    select: false,
+                }
+            }
         ));
     }
 
@@ -291,21 +340,27 @@ mod model_keyboard_tests {
                 KeyEvent::new(KeyCode::Char('名'), KeyModifiers::NONE),
                 &state
             ),
-            Action::TitleInput('名')
+            Action::Edit {
+                target: EditorTarget::SessionTitle,
+                command: EditCommand::Insert { ref text, typing: true }
+            } if text == "名"
         ));
         assert!(matches!(
             mapped_key_action(
                 KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
                 &state
             ),
-            Action::TitleBackspace
+            Action::Edit {
+                target: EditorTarget::SessionTitle,
+                command: EditCommand::DeleteBefore
+            }
         ));
         assert!(matches!(
             mapped_key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state),
             Action::CommitTitle
         ));
         assert!(
-            matches!(mapped_terminal_event(Event::Paste("新标题".into()), None, &state), UiEvent::Action(Action::TitlePaste(text)) if text == "新标题")
+            matches!(mapped_terminal_event(Event::Paste("新标题".into()), None, &state), UiEvent::Action(Action::Edit { target: EditorTarget::SessionTitle, command: EditCommand::Insert { text, typing: false } }) if text == "新标题")
         );
         assert!(matches!(
             mapped_key_action(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &state),
@@ -361,7 +416,6 @@ mod model_keyboard_tests {
     fn clicking_visible_composer_moves_insertion_without_editing_draft() {
         let mut state = UiState::default();
         state.orphan_draft = "ab中文".into();
-        state.orphan_cursor = state.orphan_draft.len();
         state.focus = Focus::SessionTitle;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -382,9 +436,9 @@ mod model_keyboard_tests {
             &state,
         );
         crate::state::update(&mut state, event);
-        assert_eq!(state.orphan_cursor, 5);
-        assert_eq!(state.orphan_draft, "ab中文");
-        assert_eq!(state.orphan_revision, 0);
+        assert_eq!(state.draft_cursor(), 5);
+        assert_eq!(state.draft(), "ab中文");
+        assert_eq!(state.orphan_draft.revision(), 0);
         assert_eq!(state.focus, Focus::Composer);
     }
 }
@@ -429,20 +483,95 @@ mod session_navigation_tests {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    #[test]
+    fn scrolled_composer_clicks_use_the_rendered_buffer_origin() {
+        let mut state = UiState::default();
+        state.orphan_draft = (0..20)
+            .map(|row| format!("row {row}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+        let mut view_state = crate::ui::frame::ViewState::default();
+        let draw = |state: &UiState, view_state: &mut crate::ui::frame::ViewState| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            let mut snapshot = None;
+            terminal
+                .draw(|frame| {
+                    snapshot = Some(crate::view::render_with_view_state(
+                        frame, state, view_state,
+                    ));
+                })
+                .unwrap();
+            snapshot.unwrap()
+        };
+
+        let snapshot = draw(&state, &mut view_state);
+        let origin = snapshot.composer_row_origin().unwrap();
+        assert!(origin > 0);
+        let area = crate::layout::composer_text_area(snapshot.layout.composer.unwrap());
+        let expected = crate::editor::cursor_at_origin(state.draft(), area.width, origin, 2, 0);
+        let click = mapped_terminal_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x + 2,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Some(&snapshot),
+            &state,
+        );
+        assert!(matches!(
+            &click,
+            UiEvent::Action(Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Point { byte, extend: false }
+            }) if *byte == expected
+        ));
+        crate::state::update(&mut state, click);
+        assert_eq!(state.draft_cursor(), expected);
+
+        let snapshot = draw(&state, &mut view_state);
+        assert_eq!(snapshot.composer_row_origin(), Some(origin));
+        let expected_end = crate::editor::cursor_at_origin(state.draft(), area.width, origin, 4, 1);
+        let shift_click = mapped_terminal_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x + 4,
+                row: area.y + 1,
+                modifiers: KeyModifiers::SHIFT,
+            }),
+            Some(&snapshot),
+            &state,
+        );
+        crate::state::update(&mut state, shift_click);
+        assert_eq!(
+            state.editor().selection(),
+            Some(expected.min(expected_end)..expected.max(expected_end))
+        );
+    }
+
     #[test]
     fn editor_shortcuts_and_drag_use_the_same_selected_buffer() {
         let mut state = UiState::default();
-        for (key, expected) in [(KeyCode::Left, -1), (KeyCode::Down, 2), (KeyCode::Home, -3)] {
+        for (key, expected) in [
+            (KeyCode::Left, CursorMove::Left),
+            (KeyCode::Down, CursorMove::Down { width: 1 }),
+            (KeyCode::Home, CursorMove::LineStart),
+        ] {
             assert!(
-                matches!(mapped_key_action(KeyEvent::new(key, KeyModifiers::SHIFT), &state), Action::MoveCursor { direction, select: true, .. } if direction == expected)
+                matches!(mapped_key_action(KeyEvent::new(key, KeyModifiers::SHIFT), &state), Action::Edit { target: EditorTarget::Composer, command: EditCommand::Move { cursor, select: true } } if cursor == expected)
             );
         }
         assert!(matches!(
             mapped_key_action(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT), &state),
-            Action::MoveCursor {
-                word: true,
-                select: false,
-                ..
+            Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Move {
+                    cursor: CursorMove::WordRight,
+                    select: false,
+                }
             }
         ));
         assert!(matches!(
@@ -450,17 +579,22 @@ mod selection_tests {
                 KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
                 &state
             ),
-            Action::Undo
+            Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Undo
+            }
         ));
         assert!(matches!(
             mapped_key_action(
                 KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
                 &state
             ),
-            Action::Redo
+            Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Redo
+            }
         ));
         state.orphan_draft = "中e\u{301}🙂".into();
-        state.orphan_cursor = state.orphan_draft.len();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let mut plan = None;
@@ -485,10 +619,7 @@ mod selection_tests {
             );
             crate::state::update(&mut state, event);
         }
-        assert_eq!(
-            state.editor().selection(state.draft_cursor()),
-            Some(3..state.draft().len())
-        );
+        assert_eq!(state.editor().selection(), Some(3..state.draft().len()));
         terminal
             .draw(|frame| {
                 crate::view::render(frame, &state);
@@ -498,9 +629,15 @@ mod selection_tests {
             terminal.backend().buffer()[(area.x + 2, area.y)].bg,
             terminal.backend().buffer()[(area.x, area.y)].bg
         );
-        crate::state::update(&mut state, UiEvent::Action(Action::Backspace));
+        crate::state::update(
+            &mut state,
+            UiEvent::Action(composer_edit(EditCommand::DeleteBefore)),
+        );
         assert_eq!(state.draft(), "中");
-        crate::state::update(&mut state, UiEvent::Action(Action::Undo));
+        crate::state::update(
+            &mut state,
+            UiEvent::Action(composer_edit(EditCommand::Undo)),
+        );
         assert_eq!(state.draft(), "中e\u{301}🙂");
     }
 
@@ -509,28 +646,19 @@ mod selection_tests {
         for focus in [Focus::SessionTitle, Focus::Composer] {
             let mut state = UiState::default();
             state.focus = focus;
-            for (key, expected) in [(KeyCode::Home, -3), (KeyCode::End, 3)] {
+            for (key, expected) in [
+                (KeyCode::Home, CursorMove::LineStart),
+                (KeyCode::End, CursorMove::LineEnd),
+            ] {
                 let action = mapped_key_action(KeyEvent::new(key, KeyModifiers::SHIFT), &state);
-                assert!(match (focus, action) {
-                    (
-                        Focus::SessionTitle,
-                        Action::TitleMoveCursor {
-                            direction,
-                            select: true,
-                            word: false,
-                        },
-                    ) => direction == expected,
-                    (
-                        Focus::Composer,
-                        Action::MoveCursor {
-                            direction,
-                            select: true,
-                            word: false,
-                            ..
-                        },
-                    ) => direction == expected,
-                    _ => false,
-                });
+                let target = if focus == Focus::SessionTitle {
+                    EditorTarget::SessionTitle
+                } else {
+                    EditorTarget::Composer
+                };
+                assert!(
+                    matches!(action, Action::Edit { target: actual, command: EditCommand::Move { cursor, select: true } } if actual == target && cursor == expected)
+                );
                 for modifiers in [KeyModifiers::ALT, KeyModifiers::SHIFT | KeyModifiers::ALT] {
                     assert!(
                         key_action(KeyEvent::new(key, modifiers), &state).is_none(),
@@ -571,7 +699,7 @@ mod selection_tests {
 
         let snapshot = draw(&state);
         let header = snapshot.layout.session_header.unwrap();
-        let origin = state.title_edit.as_ref().unwrap().editor.viewport_origin();
+        let origin = snapshot.title_byte_origin().unwrap();
         let expected_down = crate::editor::cursor_at_single_line(&title, origin, 1);
         let down = mapped_terminal_event(
             Event::Mouse(crossterm::event::MouseEvent {
@@ -584,15 +712,15 @@ mod selection_tests {
             &state,
         );
         assert!(
-            matches!(&down, UiEvent::Action(Action::PlaceTitleCursor(byte)) if *byte == expected_down)
+            matches!(&down, UiEvent::Action(Action::Edit { target: EditorTarget::SessionTitle, command: EditCommand::Point { byte, extend: false } }) if *byte == expected_down)
         );
         crate::state::update(&mut state, down);
         let edit = state.title_edit.as_ref().unwrap();
-        assert_eq!(edit.cursor, expected_down);
-        assert_eq!(edit.editor.selection(edit.cursor), None);
+        assert_eq!(edit.editor.cursor(), expected_down);
+        assert_eq!(edit.editor.selection(), None);
 
         let snapshot = draw(&state);
-        let origin = state.title_edit.as_ref().unwrap().editor.viewport_origin();
+        let origin = snapshot.title_byte_origin().unwrap();
         let expected_drag = crate::editor::cursor_at_single_line(&title, origin, 6);
         let drag = mapped_terminal_event(
             Event::Mouse(crossterm::event::MouseEvent {
@@ -605,17 +733,17 @@ mod selection_tests {
             &state,
         );
         assert!(
-            matches!(&drag, UiEvent::Action(Action::DragTitleCursor(byte)) if *byte == expected_drag)
+            matches!(&drag, UiEvent::Action(Action::Edit { target: EditorTarget::SessionTitle, command: EditCommand::Point { byte, extend: true } }) if *byte == expected_drag)
         );
         crate::state::update(&mut state, drag);
         let edit = state.title_edit.as_ref().unwrap();
         assert_eq!(
-            edit.editor.selection(edit.cursor),
+            edit.editor.selection(),
             Some(expected_down.min(expected_drag)..expected_down.max(expected_drag))
         );
 
         let snapshot = draw(&state);
-        let origin = state.title_edit.as_ref().unwrap().editor.viewport_origin();
+        let origin = snapshot.title_byte_origin().unwrap();
         let expected_shift = crate::editor::cursor_at_single_line(&title, origin, 0);
         let shift_click = mapped_terminal_event(
             Event::Mouse(crossterm::event::MouseEvent {
@@ -628,12 +756,12 @@ mod selection_tests {
             &state,
         );
         assert!(
-            matches!(&shift_click, UiEvent::Action(Action::DragTitleCursor(byte)) if *byte == expected_shift)
+            matches!(&shift_click, UiEvent::Action(Action::Edit { target: EditorTarget::SessionTitle, command: EditCommand::Point { byte, extend: true } }) if *byte == expected_shift)
         );
         crate::state::update(&mut state, shift_click);
         let edit = state.title_edit.as_ref().unwrap();
         assert_eq!(
-            edit.editor.selection(edit.cursor),
+            edit.editor.selection(),
             Some(expected_down.min(expected_shift)..expected_down.max(expected_shift))
         );
     }
@@ -721,8 +849,11 @@ mod pane_resize_tests {
         for (divider, start, end) in [(PaneDivider::Left, 31, 51), (PaneDivider::Right, 120, 100)] {
             let mut state = UiState::default();
             state.orphan_draft = "草稿 e\u{301} stays unchanged".into();
-            state.orphan_cursor = state.orphan_draft.len();
-            let original = (state.orphan_draft.clone(), state.orphan_cursor, state.focus);
+            let original = (
+                state.orphan_draft.clone(),
+                state.draft_cursor(),
+                state.focus,
+            );
             let plan = draw(&state, 160);
             assert_eq!(plan.hit(start, 0), Some(HitTarget::PaneDivider(divider)));
             mouse(
@@ -765,7 +896,11 @@ mod pane_resize_tests {
             );
             assert_eq!(state.pane_widths, saved);
             assert_eq!(
-                (state.orphan_draft.clone(), state.orphan_cursor, state.focus),
+                (
+                    state.orphan_draft.clone(),
+                    state.draft_cursor(),
+                    state.focus,
+                ),
                 original
             );
         }
@@ -852,7 +987,13 @@ mod pane_resize_tests {
     #[test]
     fn an_open_panel_owns_pointer_input_and_escape_closes_that_scope() {
         let mut state = UiState::default();
-        update(&mut state, UiEvent::Action(Action::Paste("/help".into())));
+        update(
+            &mut state,
+            UiEvent::Action(composer_edit(EditCommand::Insert {
+                text: "/help".into(),
+                typing: false,
+            })),
+        );
         update(&mut state, UiEvent::Action(Action::Submit));
         let plan = draw(&state, 160);
         assert!(
@@ -889,20 +1030,31 @@ mod input_chord_tests {
     fn clear_is_undoable_empty_clear_is_inert_and_panels_protect_the_draft() {
         let mut state = UiState::default();
         state.orphan_draft = "中文 e\u{301}\nkeep me".into();
-        state.orphan_cursor = state.orphan_draft.len();
-        let original = state.orphan_draft.clone();
+        let original = state.draft().to_owned();
         let clear = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let action = mapped_key_action(clear, &state);
-        assert!(matches!(action, Action::ClearInput));
+        assert!(matches!(
+            action,
+            Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Clear
+            }
+        ));
         assert!(update(&mut state, UiEvent::Action(action)).is_empty());
         assert!(state.draft().is_empty());
         assert!(!state.quitting);
-        let revision = state.orphan_revision;
-        update(&mut state, UiEvent::Action(Action::ClearInput));
-        assert_eq!(state.orphan_revision, revision);
-        update(&mut state, UiEvent::Action(Action::Undo));
+        let revision = state.orphan_draft.revision();
+        update(
+            &mut state,
+            UiEvent::Action(composer_edit(EditCommand::Clear)),
+        );
+        assert_eq!(state.orphan_draft.revision(), revision);
+        update(
+            &mut state,
+            UiEvent::Action(composer_edit(EditCommand::Undo)),
+        );
         assert_eq!(state.draft(), original);
-        assert!(state.orphan_revision > revision);
+        assert!(state.orphan_draft.revision() > revision);
         for focus in [Focus::Sessions, Focus::SessionTitle, Focus::RightRail] {
             state.focus = focus;
             assert!(key_action(clear, &state).is_none());
@@ -931,7 +1083,10 @@ mod input_chord_tests {
         ));
         assert!(matches!(
             mapped_key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &state),
-            Action::InsertNewline
+            Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Insert { ref text, typing: false }
+            } if text == "\n"
         ));
         assert!(key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), &state).is_none());
         assert!(

@@ -10,9 +10,39 @@ use std::collections::BTreeMap;
 use super::model::{Focus, SessionStatus};
 use crate::layout::TranscriptMetrics;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditorTarget {
+    Composer,
+    SessionTitle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CursorMove {
+    Left,
+    Right,
+    Up { width: u16 },
+    Down { width: u16 },
+    WordLeft,
+    WordRight,
+    LineStart,
+    LineEnd,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EditCommand {
+    Insert { text: String, typing: bool },
+    Replace { text: String },
+    DeleteBefore,
+    DeleteAfter,
+    Move { cursor: CursorMove, select: bool },
+    Point { byte: usize, extend: bool },
+    Clear,
+    Undo,
+    Redo,
+}
+
 #[derive(Clone, Debug)]
 pub enum Action {
-    ClearInput,
     BeginPaneResize(crate::layout::PaneDivider),
     DragPane {
         widths: crate::layout::PaneWidths,
@@ -27,21 +57,10 @@ pub enum Action {
     SelectField(super::SetupField),
     SaveConnection,
     ChooseConnectionKind(usize),
-    TitleInput(char),
-    TitlePaste(String),
-    TitleBackspace,
-    TitleDelete,
-    TitleMoveCursor {
-        direction: i8,
-        select: bool,
-        word: bool,
+    Edit {
+        target: EditorTarget,
+        command: EditCommand,
     },
-    TitleHome,
-    TitleEnd,
-    TitleUndo,
-    TitleRedo,
-    PlaceTitleCursor(usize),
-    DragTitleCursor(usize),
     CommitTitle,
     CancelTitle,
     StartSlashCommand,
@@ -74,29 +93,6 @@ pub enum Action {
     SelectSlashNext,
     CompleteSlash,
     ExecuteCommand(super::CommandKind),
-    Input(char),
-    Paste(String),
-    Backspace,
-    Delete,
-    PlaceCursor(usize),
-    DragCursor(usize),
-    Undo,
-    Redo,
-    MoveCursor {
-        direction: i8,
-        width: u16,
-        select: bool,
-        word: bool,
-    },
-    CursorLeft,
-    CursorRight,
-    CursorVertical {
-        down: bool,
-        width: u16,
-    },
-    CursorHome,
-    CursorEnd,
-    InsertNewline,
     Submit,
     ClickSubmit,
     AnswerQuestion(QuestionId),

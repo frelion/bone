@@ -2,7 +2,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::state::{Action, Focus, Panel, UiState};
+use crate::state::{Action, CursorMove, EditCommand, EditorTarget, Focus, Panel, UiState};
 
 /// One shortcut rendered in the composer's status baseline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,7 +48,15 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState) -> Option<Action> {
         return (state.panel.is_none()
             && state.focus == Focus::Composer
             && key.modifiers == KeyModifiers::SHIFT)
-            .then_some(Action::InsertNewline);
+            .then(|| {
+                edit(
+                    EditorTarget::Composer,
+                    EditCommand::Insert {
+                        text: "\n".into(),
+                        typing: false,
+                    },
+                )
+            });
     }
 
     if let Some(panel) = &state.panel {
@@ -66,60 +74,49 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState) -> Option<Action> {
             KeyCode::Right => Some(Action::FocusRight),
             KeyCode::Up => Some(Action::FocusUp),
             KeyCode::Down => Some(Action::FocusDown),
-            KeyCode::Char('c') if state.focus == Focus::Composer => Some(Action::ClearInput),
-            KeyCode::Char('z') if state.focus == Focus::Composer => Some(Action::Undo),
-            KeyCode::Char('y') if state.focus == Focus::Composer => Some(Action::Redo),
-            KeyCode::Char('z') if state.focus == Focus::SessionTitle => Some(Action::TitleUndo),
-            KeyCode::Char('y') if state.focus == Focus::SessionTitle => Some(Action::TitleRedo),
+            KeyCode::Char('c') if state.focus == Focus::Composer => {
+                Some(edit(EditorTarget::Composer, EditCommand::Clear))
+            }
+            KeyCode::Char('z') => {
+                editor_target(state.focus).map(|target| edit(target, EditCommand::Undo))
+            }
+            KeyCode::Char('y') => {
+                editor_target(state.focus).map(|target| edit(target, EditCommand::Redo))
+            }
             _ => None,
         };
     }
 
-    if state.focus == Focus::SessionTitle
+    if let Some(target) = editor_target(state.focus)
         && key
             .modifiers
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
     {
-        let direction = match key.code {
-            KeyCode::Left => -1,
-            KeyCode::Right => 1,
-            KeyCode::Home if key.modifiers == KeyModifiers::SHIFT => -3,
-            KeyCode::End if key.modifiers == KeyModifiers::SHIFT => 3,
-            _ => 0,
+        let cursor = match key.code {
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                Some(CursorMove::WordLeft)
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                Some(CursorMove::WordRight)
+            }
+            KeyCode::Left => Some(CursorMove::Left),
+            KeyCode::Right => Some(CursorMove::Right),
+            KeyCode::Up if target == EditorTarget::Composer => Some(CursorMove::Up { width: 1 }),
+            KeyCode::Down if target == EditorTarget::Composer => {
+                Some(CursorMove::Down { width: 1 })
+            }
+            KeyCode::Home if key.modifiers == KeyModifiers::SHIFT => Some(CursorMove::LineStart),
+            KeyCode::End if key.modifiers == KeyModifiers::SHIFT => Some(CursorMove::LineEnd),
+            _ => None,
         };
-        if direction != 0 {
-            return Some(Action::TitleMoveCursor {
-                direction,
-                select: key.modifiers.contains(KeyModifiers::SHIFT),
-                word: key.modifiers.contains(KeyModifiers::ALT),
-            });
-        }
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            return None;
-        }
-    }
-
-    if state.focus == Focus::Composer
-        && key
-            .modifiers
-            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-    {
-        let direction = match key.code {
-            KeyCode::Left => -1,
-            KeyCode::Right => 1,
-            KeyCode::Up => -2,
-            KeyCode::Down => 2,
-            KeyCode::Home if key.modifiers == KeyModifiers::SHIFT => -3,
-            KeyCode::End if key.modifiers == KeyModifiers::SHIFT => 3,
-            _ => 0,
-        };
-        if direction != 0 {
-            return Some(Action::MoveCursor {
-                direction,
-                width: 1,
-                select: key.modifiers.contains(KeyModifiers::SHIFT),
-                word: key.modifiers.contains(KeyModifiers::ALT),
-            });
+        if let Some(cursor) = cursor {
+            return Some(edit(
+                target,
+                EditCommand::Move {
+                    cursor,
+                    select: key.modifiers.contains(KeyModifiers::SHIFT),
+                },
+            ));
         }
         if key.modifiers.contains(KeyModifiers::ALT) {
             return None;
@@ -127,7 +124,8 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState) -> Option<Action> {
     }
 
     let slash_open = state.slash_palette_visible();
-    match key.code {
+    let editor_target = editor_target(state.focus);
+    let action = match key.code {
         KeyCode::Esc if state.focus == Focus::SessionTitle => Some(Action::CancelTitle),
         KeyCode::Esc => Some(Action::Escape),
         KeyCode::Up if slash_open => Some(Action::SelectSlashPrevious),
@@ -136,50 +134,61 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState) -> Option<Action> {
         KeyCode::Up if state.focus == Focus::Sessions => Some(Action::SelectPrevious),
         KeyCode::Down if state.focus == Focus::Sessions => Some(Action::SelectNext),
         KeyCode::Enter if state.focus == Focus::Sessions => Some(Action::OpenCandidate),
-        KeyCode::PageUp if state.focus == Focus::Composer => Some(Action::ScrollUp {
+        KeyCode::PageUp if editor_target.is_some() => Some(Action::ScrollUp {
             amount: 10,
             metrics: None,
         }),
-        KeyCode::PageDown if state.focus == Focus::Composer => Some(Action::ScrollDown(10)),
-        KeyCode::PageUp if state.focus == Focus::SessionTitle => Some(Action::ScrollUp {
-            amount: 10,
-            metrics: None,
-        }),
-        KeyCode::PageDown if state.focus == Focus::SessionTitle => Some(Action::ScrollDown(10)),
+        KeyCode::PageDown if editor_target.is_some() => Some(Action::ScrollDown(10)),
         KeyCode::Enter if state.focus == Focus::SessionTitle => Some(Action::CommitTitle),
-        KeyCode::Backspace if state.focus == Focus::SessionTitle => Some(Action::TitleBackspace),
-        KeyCode::Delete if state.focus == Focus::SessionTitle => Some(Action::TitleDelete),
-        KeyCode::Left if state.focus == Focus::SessionTitle => Some(Action::TitleMoveCursor {
-            direction: -1,
-            select: false,
-            word: false,
-        }),
-        KeyCode::Right if state.focus == Focus::SessionTitle => Some(Action::TitleMoveCursor {
-            direction: 1,
-            select: false,
-            word: false,
-        }),
-        KeyCode::Home if state.focus == Focus::SessionTitle => Some(Action::TitleHome),
-        KeyCode::End if state.focus == Focus::SessionTitle => Some(Action::TitleEnd),
-        KeyCode::Char(value) if state.focus == Focus::SessionTitle => {
-            Some(Action::TitleInput(value))
-        }
-        KeyCode::Up | KeyCode::Down if state.focus == Focus::Composer => {
-            Some(Action::CursorVertical {
-                down: key.code == KeyCode::Down,
-                width: 1,
-            })
-        }
         KeyCode::Enter if state.focus == Focus::Composer => Some(Action::Submit),
-        KeyCode::Backspace if state.focus == Focus::Composer => Some(Action::Backspace),
-        KeyCode::Delete if state.focus == Focus::Composer => Some(Action::Delete),
-        KeyCode::Left if state.focus == Focus::Composer => Some(Action::CursorLeft),
-        KeyCode::Right if state.focus == Focus::Composer => Some(Action::CursorRight),
-        KeyCode::Home if state.focus == Focus::Composer => Some(Action::CursorHome),
-        KeyCode::End if state.focus == Focus::Composer => Some(Action::CursorEnd),
-        KeyCode::Char(value) if state.focus == Focus::Composer => Some(Action::Input(value)),
         _ => None,
+    };
+    action.or_else(|| editor_key_action(key, editor_target?))
+}
+
+fn editor_target(focus: Focus) -> Option<EditorTarget> {
+    match focus {
+        Focus::Composer => Some(EditorTarget::Composer),
+        Focus::SessionTitle => Some(EditorTarget::SessionTitle),
+        Focus::Sessions | Focus::RightRail => None,
     }
+}
+
+fn editor_key_action(key: KeyEvent, target: EditorTarget) -> Option<Action> {
+    let command = match key.code {
+        KeyCode::Backspace => EditCommand::DeleteBefore,
+        KeyCode::Delete => EditCommand::DeleteAfter,
+        KeyCode::Left => return Some(move_editor(target, CursorMove::Left)),
+        KeyCode::Right => return Some(move_editor(target, CursorMove::Right)),
+        KeyCode::Home => return Some(move_editor(target, CursorMove::LineStart)),
+        KeyCode::End => return Some(move_editor(target, CursorMove::LineEnd)),
+        KeyCode::Up if target == EditorTarget::Composer => {
+            return Some(move_editor(target, CursorMove::Up { width: 1 }));
+        }
+        KeyCode::Down if target == EditorTarget::Composer => {
+            return Some(move_editor(target, CursorMove::Down { width: 1 }));
+        }
+        KeyCode::Char(value) => EditCommand::Insert {
+            text: value.to_string(),
+            typing: true,
+        },
+        _ => return None,
+    };
+    Some(edit(target, command))
+}
+
+fn edit(target: EditorTarget, command: EditCommand) -> Action {
+    Action::Edit { target, command }
+}
+
+fn move_editor(target: EditorTarget, cursor: CursorMove) -> Action {
+    edit(
+        target,
+        EditCommand::Move {
+            cursor,
+            select: false,
+        },
+    )
 }
 
 fn exact(key: &KeyEvent, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -315,11 +324,17 @@ mod tests {
         ));
         assert!(matches!(
             key_action(key(KeyCode::Enter, KeyModifiers::SHIFT), &state),
-            Some(Action::InsertNewline)
+            Some(Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Insert { ref text, typing: false }
+            }) if text == "\n"
         ));
         assert!(matches!(
             key_action(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state),
-            Some(Action::ClearInput)
+            Some(Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Clear
+            })
         ));
         assert!(matches!(
             key_action(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &state),
@@ -349,7 +364,6 @@ mod tests {
     fn an_unmatched_slash_query_still_owns_menu_navigation() {
         let mut state = UiState::default();
         state.orphan_draft = "/does-not-exist".into();
-        state.orphan_cursor = state.orphan_draft.len();
         assert!(state.slash_palette_visible());
         assert!(state.slash_matches().is_empty());
         assert!(matches!(

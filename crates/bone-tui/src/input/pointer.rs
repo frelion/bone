@@ -4,7 +4,7 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::{
     layout::{HitTarget, composer_text_area},
-    state::{Action, Focus, UiState},
+    state::{Action, EditCommand, EditorTarget, Focus, UiState},
     view::FrameSnapshot,
 };
 
@@ -86,15 +86,7 @@ fn title_pointer(
 ) -> Option<Action> {
     let area = snapshot.and_then(|frame| frame.layout.session_header)?;
     let text = state.title_text()?;
-    let origin = state
-        .title_edit
-        .as_ref()
-        .filter(|edit| {
-            state
-                .selected_ui()
-                .is_some_and(|ui| edit.target == ui.info.id)
-        })
-        .map_or(0, |edit| edit.editor.viewport_origin());
+    let origin = snapshot.and_then(FrameSnapshot::title_byte_origin)?;
     let byte = crate::editor::cursor_at_single_line(
         text,
         origin,
@@ -103,15 +95,14 @@ fn title_pointer(
             .saturating_sub(area.x)
             .min(area.width.saturating_sub(1)),
     );
-    Some(
-        if matches!(mouse.kind, MouseEventKind::Drag(_))
-            || mouse.modifiers.contains(KeyModifiers::SHIFT)
-        {
-            Action::DragTitleCursor(byte)
-        } else {
-            Action::PlaceTitleCursor(byte)
+    Some(Action::Edit {
+        target: EditorTarget::SessionTitle,
+        command: EditCommand::Point {
+            byte,
+            extend: matches!(mouse.kind, MouseEventKind::Drag(_))
+                || mouse.modifiers.contains(KeyModifiers::SHIFT),
         },
-    )
+    })
 }
 
 fn composer_pointer(
@@ -125,7 +116,7 @@ fn composer_pointer(
     let byte = crate::editor::cursor_at_origin(
         state.draft(),
         area.width,
-        state.editor().viewport_origin(),
+        snapshot.and_then(FrameSnapshot::composer_row_origin)?,
         mouse
             .column
             .saturating_sub(area.x)
@@ -135,15 +126,14 @@ fn composer_pointer(
             .saturating_sub(area.y)
             .min(area.height.saturating_sub(1)),
     );
-    Some(
-        if matches!(mouse.kind, MouseEventKind::Drag(_))
-            || mouse.modifiers.contains(KeyModifiers::SHIFT)
-        {
-            Action::DragCursor(byte)
-        } else {
-            Action::PlaceCursor(byte)
+    Some(Action::Edit {
+        target: EditorTarget::Composer,
+        command: EditCommand::Point {
+            byte,
+            extend: matches!(mouse.kind, MouseEventKind::Drag(_))
+                || mouse.modifiers.contains(KeyModifiers::SHIFT),
         },
-    )
+    })
 }
 
 fn hit_action(target: Option<HitTarget>) -> Option<Action> {

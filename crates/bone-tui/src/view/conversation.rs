@@ -14,21 +14,36 @@ use crate::{
     view::{composer, message, single_line_external, slash_palette},
 };
 
+pub(super) struct RenderedConversation {
+    pub(super) metrics: Option<TranscriptMetrics>,
+    pub(super) composer_row_origin: Option<usize>,
+    pub(super) title_byte_origin: Option<usize>,
+}
+
 pub(super) fn render(
     frame: &mut Frame<'_>,
     plan: &LayoutPlan,
     hits: &mut HitMap,
     state: &UiState,
     slash_matches: &[&CommandSpec],
-) -> Option<TranscriptMetrics> {
+    previous_composer_row: usize,
+) -> RenderedConversation {
     if plan.mode == LayoutMode::TooSmall {
         render_too_small(frame, plan.conversation.unwrap_or(plan.screen), state);
-        return None;
+        return RenderedConversation {
+            metrics: None,
+            composer_row_origin: None,
+            title_byte_origin: None,
+        };
     }
     let (Some(header), Some(transcript), Some(composer_area)) =
         (plan.session_header, plan.transcript, plan.composer)
     else {
-        return None;
+        return RenderedConversation {
+            metrics: None,
+            composer_row_origin: None,
+            title_byte_origin: None,
+        };
     };
     hits.push(HitRegion {
         area: header,
@@ -38,7 +53,7 @@ pub(super) fn render(
         area: transcript,
         target: HitTarget::Conversation,
     });
-    render_header(frame, header, state);
+    let title_byte_origin = render_header(frame, header, state);
     if crate::layout::comfortable(plan.screen) {
         paint_rule(
             frame,
@@ -104,7 +119,14 @@ pub(super) fn render(
             target,
         });
     }
-    composer::render(frame, plan.screen, composer_area, hits, state);
+    let composer_row_origin = composer::render(
+        frame,
+        plan.screen,
+        composer_area,
+        hits,
+        state,
+        previous_composer_row,
+    );
     if state.slash_palette_visible() {
         slash_palette::render(
             frame,
@@ -115,7 +137,11 @@ pub(super) fn render(
             slash_matches,
         );
     }
-    metrics
+    RenderedConversation {
+        metrics,
+        composer_row_origin: Some(composer_row_origin),
+        title_byte_origin: Some(title_byte_origin),
+    }
 }
 
 fn problem_hint(problem: &bone_app::AppProblem, width: u16) -> &'static str {
@@ -173,10 +199,10 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     );
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) -> usize {
     let focused = focus::workspace_focused(state, Focus::SessionTitle) && state.selected.is_some();
     let fallback = state.title_text().unwrap_or("New conversation");
-    let (title, cursor, selection_cells) = if focused {
+    let (title, cursor, selection_cells, byte_origin) = if focused {
         state
             .title_edit
             .as_ref()
@@ -186,30 +212,32 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                     .is_some_and(|ui| edit.target == ui.info.id)
             })
             .map_or_else(
-                || (single_line_external(fallback), 0, Vec::new()),
+                || (single_line_external(fallback), 0, Vec::new(), 0),
                 |edit| {
                     let viewport = crate::editor::single_line_editor_viewport(
-                        &edit.text,
-                        edit.cursor,
+                        edit.editor.text(),
+                        edit.editor.cursor(),
                         area.width,
-                        edit.editor.viewport(),
                     );
                     let selection_cells =
-                        edit.editor
-                            .selection(edit.cursor)
-                            .map_or_else(Vec::new, |selection| {
-                                crate::editor::single_line_selection_cells(
-                                    &edit.text,
-                                    edit.editor.viewport_origin(),
-                                    area.width,
-                                    selection,
-                                )
-                            });
-                    (viewport.0, viewport.1, selection_cells)
+                        edit.editor.selection().map_or_else(Vec::new, |selection| {
+                            crate::editor::single_line_selection_cells(
+                                edit.editor.text(),
+                                viewport.byte_origin,
+                                area.width,
+                                selection,
+                            )
+                        });
+                    (
+                        viewport.text,
+                        viewport.cursor_x,
+                        selection_cells,
+                        viewport.byte_origin,
+                    )
                 },
             )
     } else {
-        (single_line_external(fallback), 0, Vec::new())
+        (single_line_external(fallback), 0, Vec::new(), 0)
     };
     frame.render_widget(Block::default().style(theme::surface(theme::PANEL)), area);
     frame.render_widget(
@@ -230,6 +258,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             state.caret_visible,
         );
     }
+    byte_origin
 }
 
 fn paint_rule(frame: &mut Frame<'_>, area: Rect, tone: ratatui::style::Color) {
@@ -574,15 +603,23 @@ mod tests {
         state.caret_visible = true;
         assert!(state.begin_title_edit());
         {
-            let mut editor = state.title_editor_mut();
-            editor.begin_pointer_selection(selected_from);
-            editor.extend_pointer_selection(title.len());
+            let editor = state.title_editor_mut();
+            editor.apply(crate::state::EditCommand::Point {
+                byte: selected_from,
+                extend: false,
+            });
+            editor.apply(crate::state::EditCommand::Point {
+                byte: title.len(),
+                extend: true,
+            });
         }
 
         let header = Rect::new(2, 1, 8, 1);
         let mut terminal = Terminal::new(TestBackend::new(12, 3)).unwrap();
         terminal
-            .draw(|frame| render_header(frame, header, &state))
+            .draw(|frame| {
+                render_header(frame, header, &state);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
 
@@ -883,7 +920,7 @@ mod tests {
         );
         update(&mut state, UiEvent::Action(Action::Escape));
         assert_eq!(state.selected_ui().unwrap().read_anchor, Some(anchor));
-        assert_eq!(state.selected_ui().unwrap().draft, "keep my draft");
+        assert_eq!(state.selected_ui().unwrap().draft(), "keep my draft");
         let (_, _, metrics) = render_width(&state, 40, 12);
         assert_eq!(metrics.anchor_at_start(metrics.start_row).unwrap(), anchor);
         state.selected_ui_mut().unwrap().transcript_metrics = Some(Arc::new(metrics));

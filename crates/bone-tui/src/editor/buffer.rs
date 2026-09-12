@@ -1,15 +1,36 @@
-use std::cell::Cell;
-
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::layout::vertical_cursor;
+use crate::state::{CursorMove, EditCommand};
 
-/// Per-draft interaction state. The viewport is derived rendering state and is
-/// deliberately excluded from persisted drafts.
+/// One complete editable document. Text, cursor identity and interaction
+/// history move together when a draft changes owner.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct EditorState {
+pub(crate) struct EditorBuffer {
+    pub(crate) text: String,
+    pub(crate) cursor: usize,
+    pub(crate) revision: u64,
+    preferred_column: Option<usize>,
+    interaction: EditorInteraction,
+}
+
+#[cfg(test)]
+impl From<String> for EditorBuffer {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for EditorBuffer {
+    fn from(text: &str) -> Self {
+        Self::new(text.into())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct EditorInteraction {
     anchor: Option<usize>,
-    viewport: Cell<usize>,
     typing: bool,
     undo: Vec<EditSnapshot>,
     redo: Vec<EditSnapshot>,
@@ -21,42 +42,156 @@ struct EditSnapshot {
     cursor: usize,
 }
 
-impl EditorState {
-    pub(crate) fn viewport_origin(&self) -> usize {
-        self.viewport.get()
+impl EditorBuffer {
+    pub(crate) fn new(text: String) -> Self {
+        Self {
+            cursor: text.len(),
+            text,
+            ..Self::default()
+        }
     }
 
-    pub(crate) fn viewport(&self) -> &Cell<usize> {
-        &self.viewport
+    pub(crate) fn text(&self) -> &str {
+        &self.text
     }
 
-    pub(crate) fn selection(&self, cursor: usize) -> Option<std::ops::Range<usize>> {
-        self.anchor
-            .filter(|anchor| *anchor != cursor)
-            .map(|anchor| anchor.min(cursor)..anchor.max(cursor))
+    pub(crate) fn cursor(&self) -> usize {
+        self.cursor
     }
 
-    pub(crate) fn checkpoint(&mut self, text: &str, cursor: usize) {
-        self.typing = false;
-        self.redo.clear();
-        Self::push(&mut self.undo, text, cursor);
-        self.anchor = None;
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub(crate) fn selection(&self) -> Option<std::ops::Range<usize>> {
+        self.interaction
+            .anchor
+            .filter(|anchor| *anchor != self.cursor)
+            .map(|anchor| anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    pub(crate) fn break_interaction(&mut self) {
+        self.interaction.typing = false;
+        self.preferred_column = None;
+    }
+
+    pub(crate) fn checkpoint(&mut self) {
+        self.interaction.typing = false;
+        self.interaction.redo.clear();
+        Self::push(&mut self.interaction.undo, &self.text, self.cursor);
+        self.interaction.anchor = None;
+    }
+
+    pub(crate) fn replace_user(&mut self, text: String, cursor: usize) {
+        let cursor = floor_grapheme_boundary(&text, cursor);
+        if self.text != text {
+            self.replace_document(text, cursor);
+        } else {
+            self.cursor = cursor;
+            self.preferred_column = None;
+        }
+    }
+
+    /// Reconcile text supplied by durable state without making the replaced
+    /// local buffer an undo target. Undo must never remove an authoritative
+    /// prefix that arrived during hydration.
+    pub(crate) fn reconcile(&mut self, text: String, cursor: usize) {
+        let revision = if self.text == text {
+            self.revision
+        } else {
+            self.revision.wrapping_add(1)
+        };
+        self.reset_external(text, cursor, revision);
+    }
+
+    /// Replace non-user state while preserving the caller's revision meaning.
+    /// This deliberately clears selection, typing state, and both histories.
+    pub(crate) fn reset_external(&mut self, text: String, cursor: usize, revision: u64) {
+        let cursor = floor_grapheme_boundary(&text, cursor);
+        *self = Self {
+            text,
+            cursor,
+            revision,
+            ..Self::default()
+        };
+    }
+
+    pub(crate) fn clear(&mut self) -> bool {
+        if self.text.is_empty() {
+            return false;
+        }
+        self.checkpoint();
+        self.text.clear();
+        self.cursor = 0;
+        self.revision = self.revision.wrapping_add(1);
+        self.preferred_column = None;
+        true
+    }
+
+    pub(crate) fn apply(&mut self, command: EditCommand) -> bool {
+        if !matches!(
+            command,
+            EditCommand::Move {
+                cursor: CursorMove::Up { .. } | CursorMove::Down { .. },
+                ..
+            }
+        ) {
+            self.preferred_column = None;
+        }
+        match command {
+            EditCommand::Insert { text, typing } => self.insert(&text, typing),
+            EditCommand::Replace { text } => {
+                let cursor = text.len();
+                self.replace_document(text, cursor);
+                true
+            }
+            EditCommand::DeleteBefore => self.delete_before(),
+            EditCommand::DeleteAfter => self.delete_after(),
+            EditCommand::Move { cursor, select } => {
+                self.move_cursor(cursor, select);
+                false
+            }
+            EditCommand::Point { byte, extend } => {
+                if extend {
+                    self.extend_pointer_selection(byte);
+                } else {
+                    self.begin_pointer_selection(byte);
+                }
+                false
+            }
+            EditCommand::Clear => self.clear(),
+            EditCommand::Undo => self.undo(false),
+            EditCommand::Redo => self.undo(true),
+        }
+    }
+
+    fn replace_document(&mut self, text: String, cursor: usize) {
+        self.checkpoint();
+        self.text = text;
+        self.cursor = cursor;
+        self.revision = self.revision.wrapping_add(1);
+        self.preferred_column = None;
     }
 
     pub(crate) fn history_bytes(&self) -> usize {
-        self.undo
+        self.interaction
+            .undo
             .iter()
-            .chain(&self.redo)
+            .chain(&self.interaction.redo)
             .map(|item| item.text.len())
             .sum()
     }
 
     pub(crate) fn evict_oldest(&mut self) -> bool {
-        if !self.undo.is_empty() {
-            self.undo.remove(0);
+        if !self.interaction.undo.is_empty() {
+            self.interaction.undo.remove(0);
             true
-        } else if !self.redo.is_empty() {
-            self.redo.remove(0);
+        } else if !self.interaction.redo.is_empty() {
+            self.interaction.redo.remove(0);
             true
         } else {
             false
@@ -78,188 +213,134 @@ impl EditorState {
         }
     }
 
-    fn undo(&mut self, text: &mut String, cursor: &mut usize, revision: &mut u64, redo: bool) {
-        self.typing = false;
+    fn undo(&mut self, redo: bool) -> bool {
+        self.interaction.typing = false;
         let (source, target) = if redo {
-            (&mut self.redo, &mut self.undo)
+            (&mut self.interaction.redo, &mut self.interaction.undo)
         } else {
-            (&mut self.undo, &mut self.redo)
+            (&mut self.interaction.undo, &mut self.interaction.redo)
         };
-        if let Some(previous) = source.pop() {
-            Self::push(target, text, *cursor);
-            *text = previous.text;
-            *cursor = previous.cursor;
-            *revision = revision.wrapping_add(1);
-            self.anchor = None;
-        }
-    }
-}
-
-/// A short-lived mutable view over one orphan, session, or answer draft.
-pub(crate) struct EditBuffer<'a> {
-    text: &'a mut String,
-    cursor: &'a mut usize,
-    revision: &'a mut u64,
-    state: &'a mut EditorState,
-}
-
-impl<'a> EditBuffer<'a> {
-    pub(crate) fn new(
-        text: &'a mut String,
-        cursor: &'a mut usize,
-        revision: &'a mut u64,
-        state: &'a mut EditorState,
-    ) -> Self {
-        Self {
-            text,
-            cursor,
-            revision,
-            state,
-        }
-    }
-
-    pub(crate) fn stop_typing(&mut self) {
-        self.state.typing = false;
-    }
-
-    pub(crate) fn clear(&mut self) -> bool {
-        if self.text.is_empty() {
+        let Some(previous) = source.pop() else {
             return false;
-        }
-        self.state.checkpoint(self.text, *self.cursor);
-        self.text.clear();
-        *self.cursor = 0;
-        *self.revision = self.revision.wrapping_add(1);
+        };
+        Self::push(target, &self.text, self.cursor);
+        self.text = previous.text;
+        self.cursor = previous.cursor;
+        self.revision = self.revision.wrapping_add(1);
+        self.interaction.anchor = None;
         true
     }
 
-    pub(crate) fn undo(&mut self, redo: bool) {
-        self.state.undo(self.text, self.cursor, self.revision, redo);
-    }
-
-    pub(crate) fn insert(&mut self, value: &str, typing: bool) -> bool {
+    fn insert(&mut self, value: &str, typing: bool) -> bool {
         if value.is_empty() {
             return false;
         }
-        let selection = self.state.selection(*self.cursor);
-        if !typing || !self.state.typing || selection.is_some() {
-            self.state.checkpoint(self.text, *self.cursor);
+        let selection = self.selection();
+        if !typing || !self.interaction.typing || selection.is_some() {
+            self.checkpoint();
         }
-        self.state.typing = typing;
+        self.interaction.typing = typing;
         if let Some(range) = selection {
-            *self.cursor = range.start;
+            self.cursor = range.start;
             self.text.replace_range(range, "");
         }
-        self.text.insert_str(*self.cursor, value);
-        *self.cursor = ceil_grapheme_boundary(self.text, *self.cursor + value.len());
-        *self.revision = self.revision.wrapping_add(1);
+        self.text.insert_str(self.cursor, value);
+        self.cursor = ceil_grapheme_boundary(&self.text, self.cursor + value.len());
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
-    pub(crate) fn delete_before(&mut self) -> bool {
-        if let Some(range) = self.state.selection(*self.cursor) {
-            self.state.checkpoint(self.text, *self.cursor);
-            *self.cursor = range.start;
+    fn delete_before(&mut self) -> bool {
+        if let Some(range) = self.selection() {
+            self.checkpoint();
+            self.cursor = range.start;
             self.text.replace_range(range, "");
-            *self.cursor = ceil_grapheme_boundary(self.text, *self.cursor);
-        } else if let Some((index, _)) =
-            self.text[..*self.cursor].grapheme_indices(true).next_back()
+            self.cursor = ceil_grapheme_boundary(&self.text, self.cursor);
+        } else if let Some((index, _)) = self.text[..self.cursor].grapheme_indices(true).next_back()
         {
-            self.state.checkpoint(self.text, *self.cursor);
-            self.text.drain(index..*self.cursor);
-            *self.cursor = ceil_grapheme_boundary(self.text, index);
+            self.checkpoint();
+            self.text.drain(index..self.cursor);
+            self.cursor = ceil_grapheme_boundary(&self.text, index);
         } else {
             return false;
         }
-        *self.revision = self.revision.wrapping_add(1);
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
-    pub(crate) fn delete_after(&mut self) -> bool {
-        if let Some(range) = self.state.selection(*self.cursor) {
-            self.state.checkpoint(self.text, *self.cursor);
-            *self.cursor = range.start;
+    fn delete_after(&mut self) -> bool {
+        if let Some(range) = self.selection() {
+            self.checkpoint();
+            self.cursor = range.start;
             self.text.replace_range(range, "");
-            *self.cursor = ceil_grapheme_boundary(self.text, *self.cursor);
-        } else if let Some(len) = self.text[*self.cursor..]
+            self.cursor = ceil_grapheme_boundary(&self.text, self.cursor);
+        } else if let Some(len) = self.text[self.cursor..]
             .graphemes(true)
             .next()
             .map(str::len)
         {
-            self.state.checkpoint(self.text, *self.cursor);
-            self.text.drain(*self.cursor..*self.cursor + len);
-            *self.cursor = ceil_grapheme_boundary(self.text, *self.cursor);
+            self.checkpoint();
+            self.text.drain(self.cursor..self.cursor + len);
+            self.cursor = ceil_grapheme_boundary(&self.text, self.cursor);
         } else {
             return false;
         }
-        *self.revision = self.revision.wrapping_add(1);
+        self.revision = self.revision.wrapping_add(1);
         true
     }
 
-    /// Apply the reducer's rich cursor action while preserving its selection
-    /// semantics: an unmodified move clears the anchor before moving.
-    pub(crate) fn move_cursor(
-        &mut self,
-        direction: i8,
-        width: u16,
-        select: bool,
-        word: bool,
-        preferred_column: &mut Option<usize>,
-    ) {
+    fn move_cursor(&mut self, movement: CursorMove, select: bool) {
+        let selection = self.selection();
         if select {
-            self.state.anchor.get_or_insert(*self.cursor);
+            self.interaction.anchor.get_or_insert(self.cursor);
         } else {
-            self.state.anchor = None;
+            self.interaction.anchor = None;
+            if let Some(range) = selection {
+                match movement {
+                    CursorMove::Left => {
+                        self.cursor = range.start;
+                        return;
+                    }
+                    CursorMove::Right => {
+                        self.cursor = range.end;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
         }
-        *self.cursor = match direction {
-            -1 | 1 if word => word_cursor(self.text, *self.cursor, direction > 0),
-            -1 | 1 => moved_cursor(self.text, *self.cursor, direction as isize),
-            -2 | 2 => vertical_cursor(
-                self.text,
-                *self.cursor,
+        self.cursor = match movement {
+            CursorMove::Left => moved_cursor(&self.text, self.cursor, -1),
+            CursorMove::Right => moved_cursor(&self.text, self.cursor, 1),
+            CursorMove::Up { width } => vertical_cursor(
+                &self.text,
+                self.cursor,
                 width,
-                direction > 0,
-                preferred_column,
+                false,
+                &mut self.preferred_column,
             ),
-            -3 | 3 => line_edge(self.text, *self.cursor, direction > 0),
-            _ => *self.cursor,
+            CursorMove::Down { width } => vertical_cursor(
+                &self.text,
+                self.cursor,
+                width,
+                true,
+                &mut self.preferred_column,
+            ),
+            CursorMove::WordLeft => word_cursor(&self.text, self.cursor, false),
+            CursorMove::WordRight => word_cursor(&self.text, self.cursor, true),
+            CursorMove::LineStart => line_edge(&self.text, self.cursor, false),
+            CursorMove::LineEnd => line_edge(&self.text, self.cursor, true),
         };
     }
 
-    pub(crate) fn extend_pointer_selection(&mut self, byte: usize) {
-        self.state.anchor.get_or_insert(*self.cursor);
-        *self.cursor = floor_grapheme_boundary(self.text, byte);
+    fn extend_pointer_selection(&mut self, byte: usize) {
+        self.interaction.anchor.get_or_insert(self.cursor);
+        self.cursor = floor_grapheme_boundary(&self.text, byte);
     }
 
-    pub(crate) fn begin_pointer_selection(&mut self, byte: usize) {
-        *self.cursor = floor_grapheme_boundary(self.text, byte);
-        self.state.anchor = Some(*self.cursor);
-    }
-
-    /// Legacy horizontal actions collapse an existing selection toward the
-    /// requested side before moving by a grapheme.
-    pub(crate) fn move_horizontal(&mut self, delta: isize) {
-        *self.cursor = if let Some(range) = self.state.selection(*self.cursor) {
-            if delta < 0 { range.start } else { range.end }
-        } else {
-            moved_cursor(self.text, *self.cursor, delta)
-        };
-        self.state.anchor = None;
-    }
-
-    pub(crate) fn move_vertical(
-        &mut self,
-        width: u16,
-        down: bool,
-        preferred_column: &mut Option<usize>,
-    ) {
-        self.state.anchor = None;
-        *self.cursor = vertical_cursor(self.text, *self.cursor, width, down, preferred_column);
-    }
-
-    pub(crate) fn move_line_edge(&mut self, end: bool) {
-        self.state.anchor = None;
-        *self.cursor = line_edge(self.text, *self.cursor, end);
+    fn begin_pointer_selection(&mut self, byte: usize) {
+        self.cursor = floor_grapheme_boundary(&self.text, byte);
+        self.interaction.anchor = Some(self.cursor);
     }
 }
 
@@ -311,9 +392,16 @@ fn word_cursor(value: &str, cursor: usize, right: bool) -> usize {
 
 fn line_edge(text: &str, cursor: usize, end: bool) -> usize {
     if end {
-        cursor + text[cursor..].find('\n').unwrap_or(text.len() - cursor)
+        text[cursor..]
+            .grapheme_indices(true)
+            .find(|(_, grapheme)| matches!(*grapheme, "\r" | "\n" | "\r\n"))
+            .map_or(text.len(), |(offset, _)| cursor + offset)
     } else {
-        text[..cursor].rfind('\n').map_or(0, |index| index + 1)
+        text[..cursor]
+            .grapheme_indices(true)
+            .rev()
+            .find(|(_, grapheme)| matches!(*grapheme, "\r" | "\n" | "\r\n"))
+            .map_or(0, |(offset, grapheme)| offset + grapheme.len())
     }
 }
 
@@ -323,43 +411,46 @@ mod tests {
 
     #[test]
     fn typing_is_one_undo_step_and_never_splits_a_cluster() {
-        let mut text = String::new();
-        let mut cursor = 0;
-        let mut revision = 0;
-        let mut state = EditorState::default();
-        {
-            let mut buffer = EditBuffer::new(&mut text, &mut cursor, &mut revision, &mut state);
-            buffer.insert("e", true);
-            buffer.insert("\u{301}", true);
-            buffer.insert("🙂", true);
-            buffer.delete_before();
-            buffer.undo(false);
-        }
-        assert_eq!(text, "e\u{301}🙂");
-        assert_eq!(cursor, text.len());
-        {
-            let mut buffer = EditBuffer::new(&mut text, &mut cursor, &mut revision, &mut state);
-            buffer.undo(false);
-        }
-        assert_eq!(text, "");
-        assert_eq!(cursor, 0);
+        let mut buffer = EditorBuffer::default();
+        buffer.apply(EditCommand::Insert {
+            text: "e".into(),
+            typing: true,
+        });
+        buffer.apply(EditCommand::Insert {
+            text: "\u{301}".into(),
+            typing: true,
+        });
+        buffer.apply(EditCommand::Insert {
+            text: "🙂".into(),
+            typing: true,
+        });
+        buffer.apply(EditCommand::DeleteBefore);
+        buffer.apply(EditCommand::Undo);
+        assert_eq!(buffer.text, "e\u{301}🙂");
+        assert_eq!(buffer.cursor, buffer.text.len());
+        buffer.apply(EditCommand::Undo);
+        assert_eq!(buffer.text, "");
+        assert_eq!(buffer.cursor, 0);
     }
 
     #[test]
     fn selection_replacement_uses_grapheme_boundaries() {
-        let mut text = "A👨‍👩‍👧‍👦B".to_owned();
-        let mut cursor = text.len();
-        let mut revision = 0;
-        let mut state = EditorState::default();
-        {
-            let mut buffer = EditBuffer::new(&mut text, &mut cursor, &mut revision, &mut state);
-            buffer.begin_pointer_selection(2);
-            buffer.extend_pointer_selection("A👨‍👩‍👧‍👦".len());
-            buffer.insert("中", false);
-        }
-        assert_eq!(text, "A中B");
-        assert_eq!(cursor, "A中".len());
-        assert_eq!(revision, 1);
+        let mut buffer = EditorBuffer::new("A👨‍👩‍👧‍👦B".into());
+        buffer.apply(EditCommand::Point {
+            byte: 2,
+            extend: false,
+        });
+        buffer.apply(EditCommand::Point {
+            byte: "A👨‍👩‍👧‍👦".len(),
+            extend: true,
+        });
+        buffer.apply(EditCommand::Insert {
+            text: "中".into(),
+            typing: false,
+        });
+        assert_eq!(buffer.text, "A中B");
+        assert_eq!(buffer.cursor, "A中".len());
+        assert_eq!(buffer.revision, 1);
     }
 
     #[test]
@@ -368,5 +459,84 @@ mod tests {
         assert_eq!(word_cursor(value, 0, true), 3);
         assert_eq!(word_cursor(value, 3, true), 10);
         assert_eq!(word_cursor(value, 10, false), 5);
+    }
+
+    #[test]
+    fn crlf_line_edges_never_split_the_newline_cluster() {
+        let mut buffer = EditorBuffer::new("first\r\nsecond".into());
+        buffer.apply(EditCommand::Move {
+            cursor: CursorMove::LineStart,
+            select: false,
+        });
+        assert_eq!(buffer.cursor(), "first\r\n".len());
+        buffer.apply(EditCommand::Move {
+            cursor: CursorMove::LineEnd,
+            select: false,
+        });
+        assert_eq!(buffer.cursor(), buffer.text().len());
+        buffer.apply(EditCommand::Move {
+            cursor: CursorMove::LineStart,
+            select: false,
+        });
+        buffer.apply(EditCommand::DeleteBefore);
+        assert_eq!(buffer.text(), "firstsecond");
+        buffer.apply(EditCommand::Insert {
+            text: "!".into(),
+            typing: false,
+        });
+        assert_eq!(buffer.text(), "first!second");
+    }
+
+    #[test]
+    fn plain_left_and_right_collapse_a_selection_to_their_nearest_edge() {
+        let mut buffer = EditorBuffer::new("abc".into());
+        for movement in [CursorMove::Left, CursorMove::Right] {
+            buffer.apply(EditCommand::Point {
+                byte: 0,
+                extend: false,
+            });
+            buffer.apply(EditCommand::Point {
+                byte: 2,
+                extend: true,
+            });
+            buffer.apply(EditCommand::Move {
+                cursor: movement,
+                select: false,
+            });
+            assert_eq!(
+                buffer.cursor(),
+                if movement == CursorMove::Left { 0 } else { 2 }
+            );
+            assert!(buffer.selection().is_none());
+        }
+    }
+
+    #[test]
+    fn vertical_column_survives_a_run_and_resets_at_an_action_boundary() {
+        let text = "12345\nx\n12345";
+        let mut continuous = EditorBuffer::new(text.into());
+        continuous.reset_external(text.into(), 5, 0);
+        continuous.apply(EditCommand::Move {
+            cursor: CursorMove::Down { width: 20 },
+            select: false,
+        });
+        continuous.apply(EditCommand::Move {
+            cursor: CursorMove::Down { width: 20 },
+            select: false,
+        });
+        assert_eq!(continuous.cursor(), text.len());
+
+        let mut interrupted = EditorBuffer::new(text.into());
+        interrupted.reset_external(text.into(), 5, 0);
+        interrupted.apply(EditCommand::Move {
+            cursor: CursorMove::Down { width: 20 },
+            select: false,
+        });
+        interrupted.break_interaction();
+        interrupted.apply(EditCommand::Move {
+            cursor: CursorMove::Down { width: 20 },
+            select: false,
+        });
+        assert_eq!(interrupted.cursor(), "12345\nx\n1".len());
     }
 }

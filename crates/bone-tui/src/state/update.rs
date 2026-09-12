@@ -203,13 +203,16 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             if let Some(ui) = current_generation_mut(state, session, generation) {
                 if !ui.hydrated {
                     if ui.draft.is_empty() {
-                        ui.draft = snapshot.draft.clone();
-                    } else if !snapshot.draft.is_empty() && ui.draft != snapshot.draft {
-                        ui.draft = format!("{}\n{}", snapshot.draft, ui.draft);
-                        ui.draft_revision = ui.draft_revision.wrapping_add(1);
+                        let revision = ui.draft.revision();
+                        let cursor = snapshot.draft.len();
+                        ui.draft
+                            .reset_external(snapshot.draft.clone(), cursor, revision);
+                    } else if !snapshot.draft.is_empty() && ui.draft.text() != snapshot.draft {
+                        let merged = format!("{}\n{}", snapshot.draft, ui.draft.text());
+                        let cursor = merged.len();
+                        ui.draft.reconcile(merged, cursor);
                     }
                     ui.saved_draft = snapshot.draft.clone();
-                    ui.draft_cursor = ui.draft.len();
                     ui.hydrated = true;
                 }
                 ui.snapshot = Some(snapshot);
@@ -390,12 +393,12 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
         }
         UiEvent::PersistDraftsRequested => {
             for ui in state.session_ui.values() {
-                if ui.hydrated && ui.draft_revision > ui.saved_draft_revision {
+                if ui.hydrated && ui.draft.revision() > ui.saved_draft_revision {
                     effects.push(Effect::SaveDraft {
                         session: ui.info.id,
                         generation: ui.generation,
-                        revision: ui.draft_revision,
-                        text: ui.draft.clone(),
+                        revision: ui.draft.revision(),
+                        text: ui.draft.text().to_owned(),
                     });
                 }
             }
@@ -488,15 +491,14 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                         }
                     }
                 } else {
-                    if ui.draft_revision == pending.draft_revision && ui.draft == pending.text {
-                        ui.editor.checkpoint(&ui.draft, ui.draft_cursor);
+                    if ui.draft.revision() == pending.draft_revision
+                        && ui.draft.text() == pending.text
+                    {
                         ui.draft.clear();
-                        ui.draft_cursor = 0;
-                        ui.draft_revision = ui.draft_revision.wrapping_add(1);
                         effects.push(Effect::SaveDraft {
                             session,
                             generation: ui.generation,
-                            revision: ui.draft_revision,
+                            revision: ui.draft.revision(),
                             text: String::new(),
                         });
                     }
@@ -542,13 +544,9 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     .take()
                     .expect("matching pending create");
                 let transferred = pending.first_input.as_ref().map(|_| {
-                    let text = std::mem::take(&mut state.orphan_draft);
-                    let cursor = state.orphan_cursor;
-                    let revision = state.orphan_revision;
-                    state.orphan_cursor = 0;
-                    state.orphan_revision = state.orphan_revision.wrapping_add(1);
-                    let editor = std::mem::take(&mut state.orphan_editor);
-                    (text, cursor, revision, editor)
+                    let editor = std::mem::take(&mut state.orphan_draft);
+                    state.orphan_draft.revision = editor.revision().wrapping_add(1);
+                    editor
                 });
                 if transferred.is_none() {
                     clear_create_source(state, pending.source, &mut effects);
@@ -577,13 +575,10 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     commit_title_edit(state, &mut effects);
                 }
                 select_session(state, info.id, &mut effects);
-                if let Some((text, cursor, revision, editor)) = transferred
+                if let Some(editor) = transferred
                     && let Some(ui) = state.session_ui.get_mut(&info.id)
                 {
-                    ui.editor = editor;
-                    ui.draft = text;
-                    ui.draft_cursor = cursor;
-                    ui.draft_revision = revision;
+                    ui.draft = editor;
                     ui.bootstrap_submission = pending.first_input;
                 }
                 if matches!(
@@ -645,9 +640,11 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     .filter(|edit| edit.target == session)
                 {
                     edit.original = title;
-                    if edit.text == completed {
-                        edit.text = edit.original.clone();
-                        edit.cursor = edit.text.len();
+                    if edit.editor.text() == completed {
+                        let revision = edit.editor.revision();
+                        let cursor = edit.original.len();
+                        edit.editor
+                            .reset_external(edit.original.clone(), cursor, revision);
                     }
                 }
                 clear_title_rename_error(state, session);
@@ -678,11 +675,10 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     .filter(|edit| edit.target == session)
                 {
                     edit.original = committed.clone();
-                    if edit.text == failed {
-                        edit.text = committed;
-                        edit.cursor = edit.text.len();
-                        edit.revision = edit.revision.wrapping_add(1);
-                        edit.editor = Default::default();
+                    if edit.editor.text() == failed {
+                        let revision = edit.editor.revision().wrapping_add(1);
+                        edit.editor
+                            .reset_external(committed.clone(), committed.len(), revision);
                     }
                 }
                 if state.selected == Some(session) && !state.quitting {
@@ -709,12 +705,11 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     .title_edit
                     .as_mut()
                     .filter(|edit| edit.target == session)
-                    && edit.revision == 0
+                    && edit.editor.revision() == 0
                     && !manual_pending
                 {
                     edit.original = title.clone();
-                    edit.text = title;
-                    edit.cursor = edit.text.len();
+                    edit.editor = crate::editor::EditorBuffer::new(title);
                 }
             }
         }
@@ -816,22 +811,36 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
     if !matches!(action, Action::BeginPaneResize(_) | Action::DragPane { .. }) {
         state.dragging_divider = None;
     }
-    if state.focus == Focus::SessionTitle {
-        if !matches!(action, Action::TitleInput(_)) && state.title_edit.is_some() {
-            state.title_editor_mut().stop_typing();
+    let continuous = matches!(
+        (&action, state.focus),
+        (
+            Action::Edit {
+                target: EditorTarget::SessionTitle,
+                command: EditCommand::Insert { typing: true, .. }
+                    | EditCommand::Move {
+                        cursor: CursorMove::Up { .. } | CursorMove::Down { .. },
+                        ..
+                    },
+            },
+            Focus::SessionTitle,
+        ) | (
+            Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Insert { typing: true, .. }
+                    | EditCommand::Move {
+                        cursor: CursorMove::Up { .. } | CursorMove::Down { .. },
+                        ..
+                    },
+            },
+            Focus::Composer,
+        )
+    );
+    if !continuous {
+        if state.focus == Focus::SessionTitle && state.title_edit.is_some() {
+            state.title_editor_mut().break_interaction();
+        } else {
+            state.editor_mut().break_interaction();
         }
-    } else if !matches!(action, Action::Input(_)) {
-        state.editor_mut().stop_typing();
-    }
-    if !matches!(
-        action,
-        Action::CursorVertical { .. }
-            | Action::MoveCursor {
-                direction: -2 | 2,
-                ..
-            }
-    ) {
-        state.preferred_column = None;
     }
     match action {
         Action::BeginPaneResize(divider) => state.dragging_divider = Some(divider),
@@ -844,73 +853,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
             }
         }
         Action::EndPaneResize => {}
-        Action::TitleInput(ch) => {
-            if state.begin_title_edit() && !ch.is_control() {
-                state.title_editor_mut().insert(&ch.to_string(), true);
-                state.status = None;
-            }
-        }
-        Action::TitlePaste(text) => {
-            if state.begin_title_edit() {
-                let text: String = text
-                    .replace(['\r', '\n', '\t'], " ")
-                    .chars()
-                    .filter(|ch| !ch.is_control())
-                    .collect();
-                state.title_editor_mut().insert(&text, false);
-                state.status = None;
-            }
-        }
-        Action::TitleBackspace => {
-            if state.begin_title_edit() {
-                state.title_editor_mut().delete_before();
-                state.status = None;
-            }
-        }
-        Action::TitleDelete => {
-            if state.begin_title_edit() {
-                state.title_editor_mut().delete_after();
-                state.status = None;
-            }
-        }
-        Action::TitleMoveCursor {
-            direction,
-            select,
-            word,
-        } => {
-            if state.begin_title_edit() {
-                state
-                    .title_editor_mut()
-                    .move_cursor(direction, 1, select, word, &mut None);
-            }
-        }
-        Action::TitleHome | Action::TitleEnd => {
-            if state.begin_title_edit() {
-                state
-                    .title_editor_mut()
-                    .move_line_edge(matches!(action, Action::TitleEnd));
-            }
-        }
-        Action::TitleUndo | Action::TitleRedo => {
-            if state.begin_title_edit() {
-                state
-                    .title_editor_mut()
-                    .undo(matches!(action, Action::TitleRedo));
-                state.status = None;
-            }
-        }
-        Action::PlaceTitleCursor(byte) => {
-            if state.begin_title_edit() {
-                state.set_focus(Focus::SessionTitle);
-                state.title_editor_mut().begin_pointer_selection(byte);
-            }
-        }
-        Action::DragTitleCursor(byte) => {
-            if state.begin_title_edit() {
-                state.set_focus(Focus::SessionTitle);
-                state.title_editor_mut().extend_pointer_selection(byte);
-            }
-        }
+        Action::Edit { target, command } => edit(state, target, command, effects),
         Action::CommitTitle => commit_title_edit(state, effects),
         Action::CancelTitle => {
             let target = state.title_edit.as_ref().map(|edit| edit.target);
@@ -922,11 +865,11 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 set_session_title(state, target, baseline.clone());
             }
             if let Some(edit) = &mut state.title_edit {
-                edit.text = baseline.unwrap_or_else(|| edit.original.clone());
-                edit.original = edit.text.clone();
-                edit.cursor = edit.text.len();
-                edit.revision = edit.revision.wrapping_add(1);
-                edit.editor = Default::default();
+                let text = baseline.unwrap_or_else(|| edit.original.clone());
+                edit.original = text.clone();
+                let revision = edit.editor.revision().wrapping_add(1);
+                let cursor = text.len();
+                edit.editor.reset_external(text, cursor, revision);
             }
             state.status = None;
             state.set_focus(Focus::Composer);
@@ -939,7 +882,10 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                     .is_none_or(|ui| ui.selected_answer.is_none())
             {
                 set_action_focus(state, Focus::Composer, effects);
-                insert_text(state, "/", true);
+                state.editor_mut().apply(EditCommand::Insert {
+                    text: "/".into(),
+                    typing: true,
+                });
             }
         }
         Action::OpenModels => open_models(state, effects),
@@ -1105,57 +1051,6 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 submit(state, effects);
             }
         }
-        Action::ClearInput => {
-            if state.focus == Focus::Composer && state.panel.is_none() {
-                state.editor_mut().clear();
-                state.slash_selection = 0;
-                state.slash_dismissed = None;
-                state.status = None;
-            }
-        }
-        Action::Input(value) => insert_text(state, &value.to_string(), true),
-        Action::Paste(text) => insert_text(state, &text, false),
-        Action::Backspace => delete_before_cursor(state),
-        Action::Delete => delete_after_cursor(state),
-        Action::Undo | Action::Redo => {
-            let redo = matches!(action, Action::Redo);
-            state.editor_mut().undo(redo);
-            state.status = None;
-            state.slash_selection = 0;
-            state.slash_dismissed = None;
-        }
-        Action::MoveCursor {
-            direction,
-            width,
-            select,
-            word,
-        } => {
-            let mut preferred = state.preferred_column;
-            state
-                .editor_mut()
-                .move_cursor(direction, width, select, word, &mut preferred);
-            state.preferred_column = preferred;
-        }
-        Action::DragCursor(byte) => {
-            set_action_focus(state, Focus::Composer, effects);
-            state.editor_mut().extend_pointer_selection(byte);
-        }
-        Action::PlaceCursor(byte) => {
-            set_action_focus(state, Focus::Composer, effects);
-            state.editor_mut().begin_pointer_selection(byte);
-        }
-        Action::CursorLeft => state.editor_mut().move_horizontal(-1),
-        Action::CursorRight => state.editor_mut().move_horizontal(1),
-        Action::CursorVertical { down, width } => {
-            let mut preferred = state.preferred_column;
-            state
-                .editor_mut()
-                .move_vertical(width, down, &mut preferred);
-            state.preferred_column = preferred;
-        }
-        Action::CursorHome => state.editor_mut().move_line_edge(false),
-        Action::CursorEnd => state.editor_mut().move_line_edge(true),
-        Action::InsertNewline => insert_text(state, "\n", false),
         Action::Submit => submit(state, effects),
         Action::ClickSubmit => {
             set_action_focus(state, Focus::Composer, effects);
@@ -1262,6 +1157,67 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
     }
 }
 
+fn edit(
+    state: &mut UiState,
+    target: EditorTarget,
+    mut command: EditCommand,
+    effects: &mut Vec<Effect>,
+) {
+    if state.panel.is_some() {
+        return;
+    }
+    let points = matches!(&command, EditCommand::Point { .. });
+    let changes_text = matches!(
+        &command,
+        EditCommand::Insert { .. }
+            | EditCommand::Replace { .. }
+            | EditCommand::DeleteBefore
+            | EditCommand::DeleteAfter
+            | EditCommand::Clear
+            | EditCommand::Undo
+            | EditCommand::Redo
+    );
+    match target {
+        EditorTarget::Composer => {
+            if points {
+                set_action_focus(state, Focus::Composer, effects);
+            } else if state.focus != Focus::Composer {
+                return;
+            }
+            state.editor_mut().apply(command);
+            if changes_text {
+                state.status = None;
+                state.slash_selection = 0;
+                state.slash_dismissed = None;
+            }
+        }
+        EditorTarget::SessionTitle => {
+            if points {
+                set_action_focus(state, Focus::SessionTitle, effects);
+            } else if state.focus != Focus::SessionTitle {
+                return;
+            }
+            if !state.begin_title_edit() {
+                return;
+            }
+            if let EditCommand::Insert { text, typing } = command {
+                command = EditCommand::Insert {
+                    text: text
+                        .replace(['\r', '\n', '\t'], " ")
+                        .chars()
+                        .filter(|ch| !ch.is_control())
+                        .collect(),
+                    typing,
+                };
+            }
+            state.title_editor_mut().apply(command);
+            if changes_text {
+                state.status = None;
+            }
+        }
+    }
+}
+
 /// Moves focus for a user action and commits the title exactly when that move
 /// leaves the title editor. Keeping this at the focus mutation point avoids
 /// persisting a title for unrelated scrolling or divider gestures.
@@ -1277,14 +1233,13 @@ fn set_action_focus(state: &mut UiState, focus: Focus, effects: &mut Vec<Effect>
 fn prepare_exit(state: &mut UiState) {
     for ui in state.session_ui.values_mut() {
         for (_, answer) in std::mem::take(&mut ui.answer_drafts) {
-            if !answer.text.is_empty() {
-                ui.editor.checkpoint(&ui.draft, ui.draft_cursor);
-                ui.draft = answer::append_restored_text(
-                    &ui.draft,
-                    &format!("[Unsent answer / 未发送回答]\n{}", answer.text),
+            if !answer.editor.is_empty() {
+                let restored = answer::append_restored_text(
+                    ui.draft.text(),
+                    &format!("[Unsent answer / 未发送回答]\n{}", answer.editor.text()),
                 );
-                ui.draft_cursor = ui.draft.len();
-                ui.draft_revision = ui.draft_revision.wrapping_add(1);
+                let cursor = restored.len();
+                ui.draft.replace_user(restored, cursor);
             }
         }
         ui.selected_answer = None;
@@ -1338,14 +1293,14 @@ fn submit(state: &mut UiState, effects: &mut Vec<Effect>) {
             return;
         };
         match answer.submission(snapshot, request_id) {
-            Ok(input) => (input, answer.revision),
+            Ok(input) => (input, answer.editor.revision()),
             Err(_) => {
                 state.status = Some("This question has ended. Your answer is preserved; convert it explicitly to send ordinary text".into());
                 return;
             }
         }
     } else {
-        (SubmitInput::new(text.clone()), ui.draft_revision)
+        (SubmitInput::new(text.clone()), ui.draft.revision())
     };
     input.request_id = request_id;
     ui.submitting = Some(PendingSubmission {
@@ -1385,13 +1340,13 @@ fn create_for_first_input(state: &mut UiState, text: String, effects: &mut Vec<E
         provisional: true,
         failed: false,
         source: DraftSource::Orphan {
-            revision: state.orphan_revision,
+            revision: state.orphan_draft.revision(),
             text: text.clone(),
         },
         first_input: Some(PendingSubmission {
             request_id: RequestId::new(),
             text,
-            draft_revision: state.orphan_revision,
+            draft_revision: state.orphan_draft.revision(),
             failed: false,
             reply_to: None,
         }),
@@ -1409,7 +1364,6 @@ fn leave_answer(state: &mut UiState) {
     if let Some(ui) = state.selected_ui_mut() {
         ui.selected_answer = None;
     }
-    state.preferred_column = None;
     state.status = None;
 }
 
@@ -1421,13 +1375,11 @@ fn convert_answer(state: &mut UiState) {
         let Some(answer) = ui.answer_drafts.remove(&question) else {
             return;
         };
-        ui.editor.checkpoint(&ui.draft, ui.draft_cursor);
-        ui.draft = answer::append_restored_text(&ui.draft, &answer.text);
-        ui.draft_cursor = ui.draft.len();
-        ui.draft_revision = ui.draft_revision.wrapping_add(1);
+        let restored = answer::append_restored_text(ui.draft.text(), answer.editor.text());
+        let cursor = restored.len();
+        ui.draft.replace_user(restored, cursor);
         ui.selected_answer = None;
         state.status = Some("Answer copied to ordinary draft; review before sending".into());
-        state.preferred_column = None;
     }
 }
 
@@ -1468,21 +1420,17 @@ fn recover_input(
                     .answer_drafts
                     .entry(question)
                     .or_insert_with(|| AnswerDraft::new(question));
-                answer.replace(
-                    answer::append_restored_text(&answer.text, &text),
-                    usize::MAX,
-                );
+                let restored = answer::append_restored_text(answer.editor.text(), &text);
+                answer.replace(restored, usize::MAX);
                 ui.selected_answer = Some(question);
                 state.status = Some("Answer restored with its original question; an expired answer cannot be sent without explicit conversion".into());
             } else {
-                ui.editor.checkpoint(&ui.draft, ui.draft_cursor);
-                ui.draft = answer::append_restored_text(&ui.draft, &text);
-                ui.draft_cursor = ui.draft.len();
-                ui.draft_revision = ui.draft_revision.wrapping_add(1);
+                let restored = answer::append_restored_text(ui.draft.text(), &text);
+                let cursor = restored.len();
+                ui.draft.replace_user(restored, cursor);
                 ui.selected_answer = None;
                 state.status = Some("Input restored to your draft; review before sending".into());
             }
-            state.preferred_column = None;
         }
         _ => {
             state.status = Some(
@@ -1649,14 +1597,14 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             let request_id = RequestId::new();
             let source = state.selected_ui().map_or_else(
                 || DraftSource::Orphan {
-                    revision: state.orphan_revision,
-                    text: state.orphan_draft.clone(),
+                    revision: state.orphan_draft.revision(),
+                    text: state.orphan_draft.text().to_owned(),
                 },
                 |ui| DraftSource::Session {
                     id: ui.info.id,
                     generation: ui.generation,
-                    revision: ui.draft_revision,
-                    text: ui.draft.clone(),
+                    revision: ui.draft.revision(),
+                    text: ui.draft.text().to_owned(),
                 },
             );
             let title: String = if argument.is_empty() {
@@ -1697,10 +1645,7 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             if state.begin_title_edit() {
                 clear_current_draft(state, effects);
                 if let Some(edit) = &mut state.title_edit {
-                    edit.editor.checkpoint(&edit.text, edit.cursor);
-                    edit.text = argument.into();
-                    edit.cursor = edit.text.len();
-                    edit.revision = edit.revision.wrapping_add(1);
+                    edit.editor.replace_user(argument.into(), argument.len());
                 }
                 commit_title_edit(state, effects);
             } else {
@@ -1726,8 +1671,8 @@ fn create_source_matches(state: &UiState, source: &DraftSource) -> bool {
         DraftSource::None => false,
         DraftSource::Orphan { revision, text } => {
             state.selected.is_none()
-                && state.orphan_revision == *revision
-                && state.orphan_draft == *text
+                && state.orphan_draft.revision() == *revision
+                && state.orphan_draft.text() == *text
         }
         DraftSource::Session {
             id,
@@ -1738,8 +1683,8 @@ fn create_source_matches(state: &UiState, source: &DraftSource) -> bool {
             state.selected == Some(*id)
                 && state.session_ui.get(id).is_some_and(|ui| {
                     ui.generation == *generation
-                        && ui.draft_revision == *revision
-                        && ui.draft == *text
+                        && ui.draft.revision() == *revision
+                        && ui.draft.text() == *text
                 })
         }
     }
@@ -1747,23 +1692,15 @@ fn create_source_matches(state: &UiState, source: &DraftSource) -> bool {
 
 fn clear_current_draft(state: &mut UiState, effects: &mut Vec<Effect>) {
     if let Some(ui) = state.selected_ui_mut() {
-        ui.editor.checkpoint(&ui.draft, ui.draft_cursor);
         ui.draft.clear();
-        ui.draft_cursor = 0;
-        ui.draft_revision = ui.draft_revision.wrapping_add(1);
         effects.push(Effect::SaveDraft {
             session: ui.info.id,
             generation: ui.generation,
-            revision: ui.draft_revision,
+            revision: ui.draft.revision(),
             text: String::new(),
         });
     } else {
-        state
-            .orphan_editor
-            .checkpoint(&state.orphan_draft, state.orphan_cursor);
         state.orphan_draft.clear();
-        state.orphan_cursor = 0;
-        state.orphan_revision = state.orphan_revision.wrapping_add(1);
     }
     state.slash_selection = 0;
     state.slash_dismissed = None;
@@ -1773,14 +1710,9 @@ fn clear_create_source(state: &mut UiState, source: DraftSource, effects: &mut V
     match source {
         DraftSource::None => {}
         DraftSource::Orphan { revision, text }
-            if state.orphan_revision == revision && state.orphan_draft == text =>
+            if state.orphan_draft.revision() == revision && state.orphan_draft.text() == text =>
         {
-            state
-                .orphan_editor
-                .checkpoint(&state.orphan_draft, state.orphan_cursor);
             state.orphan_draft.clear();
-            state.orphan_cursor = 0;
-            state.orphan_revision = state.orphan_revision.wrapping_add(1);
         }
         DraftSource::Session {
             id,
@@ -1790,44 +1722,20 @@ fn clear_create_source(state: &mut UiState, source: DraftSource, effects: &mut V
         } => {
             if let Some(ui) = state.session_ui.get_mut(&id)
                 && ui.generation == generation
-                && ui.draft_revision == revision
-                && ui.draft == text
+                && ui.draft.revision() == revision
+                && ui.draft.text() == text
             {
-                ui.editor.checkpoint(&ui.draft, ui.draft_cursor);
                 ui.draft.clear();
-                ui.draft_cursor = 0;
-                ui.draft_revision = ui.draft_revision.wrapping_add(1);
                 effects.push(Effect::SaveDraft {
                     session: id,
                     generation,
-                    revision: ui.draft_revision,
+                    revision: ui.draft.revision(),
                     text: String::new(),
                 });
             }
         }
         DraftSource::Orphan { .. } => {}
     }
-}
-
-fn insert_text(state: &mut UiState, text: &str, typing: bool) {
-    state.status = None;
-    state.slash_selection = 0;
-    state.slash_dismissed = None;
-    state.editor_mut().insert(text, typing);
-}
-
-fn delete_before_cursor(state: &mut UiState) {
-    state.status = None;
-    state.slash_selection = 0;
-    state.slash_dismissed = None;
-    state.editor_mut().delete_before();
-}
-
-fn delete_after_cursor(state: &mut UiState) {
-    state.status = None;
-    state.slash_selection = 0;
-    state.slash_dismissed = None;
-    state.editor_mut().delete_after();
 }
 
 fn complete_slash(state: &mut UiState) {
@@ -1838,17 +1746,11 @@ fn complete_slash(state: &mut UiState) {
             if command.usage.is_empty() { "" } else { " " }
         );
         if let Some(ui) = state.selected_ui_mut() {
-            ui.editor.checkpoint(&ui.draft, ui.draft_cursor);
-            ui.draft = replacement;
-            ui.draft_cursor = ui.draft.len();
-            ui.draft_revision = ui.draft_revision.wrapping_add(1);
+            ui.draft.apply(EditCommand::Replace { text: replacement });
         } else {
             state
-                .orphan_editor
-                .checkpoint(&state.orphan_draft, state.orphan_cursor);
-            state.orphan_draft = replacement;
-            state.orphan_cursor = state.orphan_draft.len();
-            state.orphan_revision = state.orphan_revision.wrapping_add(1);
+                .orphan_draft
+                .apply(EditCommand::Replace { text: replacement });
         }
         state.slash_dismissed = None;
     }
@@ -1901,7 +1803,7 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
     }
     if let Some(previous) = state.selected
         && let Some(ui) = state.session_ui.get(&previous)
-        && ui.draft_revision <= ui.saved_draft_revision
+        && ui.draft.revision() <= ui.saved_draft_revision
         && ui.submitting.is_none()
         && !state.title_rename_pending(previous)
     {
@@ -2167,6 +2069,46 @@ fn trim_history_to_limit(state: &mut UiState, limit: usize) {
 }
 
 #[cfg(test)]
+fn test_editor(command: EditCommand) -> Action {
+    Action::Edit {
+        target: EditorTarget::Composer,
+        command,
+    }
+}
+
+#[cfg(test)]
+fn test_title_editor(command: EditCommand) -> Action {
+    Action::Edit {
+        target: EditorTarget::SessionTitle,
+        command,
+    }
+}
+
+#[cfg(test)]
+fn test_insert(text: impl Into<String>) -> Action {
+    test_editor(EditCommand::Insert {
+        text: text.into(),
+        typing: false,
+    })
+}
+
+#[cfg(test)]
+fn test_title_insert(text: impl Into<String>) -> Action {
+    test_title_editor(EditCommand::Insert {
+        text: text.into(),
+        typing: false,
+    })
+}
+
+#[cfg(test)]
+fn test_type(character: char) -> Action {
+    test_editor(EditCommand::Insert {
+        text: character.into(),
+        typing: true,
+    })
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn background_scheduling_does_not_redraw_or_clear_pending_paint() {
@@ -2185,13 +2127,10 @@ mod tests {
     #[test]
     fn unknown_slash_is_never_submitted() {
         let mut state = UiState::default();
-        update(
-            &mut state,
-            UiEvent::Action(Action::Paste("/does-not-exist".into())),
-        );
+        update(&mut state, UiEvent::Action(test_insert("/does-not-exist")));
         let effects = update(&mut state, UiEvent::Action(Action::Submit));
         assert!(effects.is_empty());
-        assert_eq!(state.orphan_draft, "/does-not-exist");
+        assert_eq!(state.orphan_draft.text(), "/does-not-exist");
     }
 
     #[test]
@@ -2203,7 +2142,7 @@ mod tests {
         assert_eq!(state.focus, Focus::Composer);
         assert!(state.slash_palette_visible());
 
-        update(&mut state, UiEvent::Action(Action::Paste("keep".into())));
+        update(&mut state, UiEvent::Action(test_insert("keep")));
         let draft = state.draft().to_owned();
         update(&mut state, UiEvent::Action(Action::StartSlashCommand));
         assert_eq!(state.draft(), draft);
@@ -2212,10 +2151,151 @@ mod tests {
     #[test]
     fn orphan_text_is_kept_until_new_session_exists() {
         let mut state = UiState::default();
-        update(&mut state, UiEvent::Action(Action::Paste("keep me".into())));
+        update(&mut state, UiEvent::Action(test_insert("keep me")));
         let effects = update(&mut state, UiEvent::Action(Action::Submit));
         assert!(matches!(effects.as_slice(), [Effect::CreateSession { .. }]));
-        assert_eq!(state.orphan_draft, "keep me");
+        assert_eq!(state.orphan_draft.text(), "keep me");
+    }
+}
+
+#[cfg(test)]
+mod owned_editor_lifecycle_tests {
+    use super::*;
+
+    fn info(title: &str) -> bone_app::SessionInfo {
+        bone_app::SessionInfo {
+            id: SessionId::new(),
+            workspace: bone_app::WorkspaceId::new(),
+            title: title.into(),
+            archived: false,
+        }
+    }
+
+    fn snapshot(
+        info: &bone_app::SessionInfo,
+        draft: &str,
+    ) -> std::sync::Arc<bone_app::SessionView> {
+        std::sync::Arc::new(bone_app::SessionView {
+            session: info.clone(),
+            runtime: bone_app::RuntimeState::Detached,
+            draft: draft.into(),
+            inputs: Vec::new(),
+            jobs: Vec::new(),
+            activity: Vec::new(),
+            history_through: bone_app::SessionSeq(0),
+            problem: None,
+        })
+    }
+
+    fn opened(state: &mut UiState, info: &bone_app::SessionInfo, generation: u64, draft: &str) {
+        update(
+            state,
+            UiEvent::SessionOpened {
+                session: info.id,
+                generation,
+                snapshot: snapshot(info, draft),
+                history: bone_app::RecentHistoryPage {
+                    items: Vec::new(),
+                    older_cursor: None,
+                    snapshot_through: bone_app::SessionSeq(0),
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn hydration_reconcile_cannot_undo_away_the_persisted_prefix() {
+        let info = info("hydrate");
+        let mut ui = SessionUi::new(info.clone(), 1);
+        ui.draft.apply(EditCommand::Replace {
+            text: "local".into(),
+        });
+        let mut state = UiState::default();
+        state.sessions.push(info.clone());
+        state.selected = Some(info.id);
+        state.session_ui.insert(info.id, ui);
+
+        opened(&mut state, &info, 1, "persisted");
+        assert_eq!(state.draft(), "persisted\nlocal");
+        let revision = state.editor().revision();
+        update(&mut state, UiEvent::Action(test_editor(EditCommand::Undo)));
+        assert_eq!(state.draft(), "persisted\nlocal");
+        assert_eq!(state.editor().revision(), revision);
+    }
+
+    #[test]
+    fn reopening_an_empty_saved_buffer_keeps_revision_identity() {
+        let first = info("first");
+        let second = info("second");
+        let mut first_ui = SessionUi::new(first.clone(), 1);
+        first_ui.draft.reset_external(String::new(), 0, 7);
+        first_ui.saved_draft_revision = 7;
+        let mut state = UiState::default();
+        state.sessions = vec![first.clone(), second.clone()];
+        state.selected = Some(first.id);
+        state.session_ui.insert(first.id, first_ui);
+        state
+            .session_ui
+            .insert(second.id, SessionUi::new(second.clone(), 1));
+
+        opened(&mut state, &first, 1, "");
+        assert_eq!(state.editor().revision(), 7);
+        update(&mut state, UiEvent::Action(test_insert("x")));
+        assert_eq!(state.editor().revision(), 8);
+        let saved = update(&mut state, UiEvent::PersistDraftsRequested);
+        assert!(matches!(
+            saved.as_slice(),
+            [Effect::SaveDraft { session, revision: 8, text, .. }]
+                if *session == first.id && text == "x"
+        ));
+        update(
+            &mut state,
+            UiEvent::DraftSaved {
+                session: first.id,
+                generation: 1,
+                revision: 8,
+                text: "x".into(),
+            },
+        );
+        let effects = update(
+            &mut state,
+            UiEvent::Action(Action::SelectSession(second.id)),
+        );
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::ReleaseSession { session, .. } if *session == first.id)
+        ));
+    }
+
+    #[test]
+    fn same_text_slash_completion_is_a_whole_document_edit_boundary() {
+        let mut state = UiState::default();
+        update(&mut state, UiEvent::Action(test_insert("/help")));
+        let end = state.draft().len();
+        update(
+            &mut state,
+            UiEvent::Action(test_editor(EditCommand::Point {
+                byte: end,
+                extend: false,
+            })),
+        );
+        update(
+            &mut state,
+            UiEvent::Action(test_editor(EditCommand::Point {
+                byte: 0,
+                extend: true,
+            })),
+        );
+        let revision = state.editor().revision();
+
+        update(&mut state, UiEvent::Action(Action::CompleteSlash));
+        assert_eq!(state.draft(), "/help");
+        assert_eq!(state.draft_cursor(), state.draft().len());
+        assert!(state.editor().selection().is_none());
+        assert_eq!(state.editor().revision(), revision.wrapping_add(1));
+
+        update(&mut state, UiEvent::Action(test_editor(EditCommand::Undo)));
+        assert_eq!(state.draft(), "/help");
+        assert_eq!(state.draft_cursor(), 0);
     }
 }
 
@@ -2270,7 +2350,7 @@ mod async_identity_tests {
         open_models(&mut state, &mut effects);
         let request = state.model_request;
         update(&mut state, UiEvent::Action(Action::Escape));
-        update(&mut state, UiEvent::Action(Action::Paste("/help".into())));
+        update(&mut state, UiEvent::Action(test_insert("/help")));
         update(&mut state, UiEvent::Action(Action::Submit));
         state.panel_selection = 4;
         update(
@@ -2429,20 +2509,19 @@ fn commit_title_edit(state: &mut UiState, effects: &mut Vec<Effect>) {
             .title_edit
             .as_mut()
             .expect("title target was read above");
-        let title = edit.text.trim().to_owned();
+        let title = edit.editor.text().trim().to_owned();
         if title.is_empty() || title.len() > 200 {
-            edit.text = fallback.unwrap_or_else(|| edit.original.clone());
-            edit.cursor = edit.text.len();
-            edit.revision = edit.revision.wrapping_add(1);
-            edit.editor = Default::default();
+            let text = fallback.unwrap_or_else(|| edit.original.clone());
+            let revision = edit.editor.revision().wrapping_add(1);
+            let cursor = text.len();
+            edit.editor.reset_external(text, cursor, revision);
             state.status = Some("Use a nonempty title of at most 200 bytes".into());
             return;
         }
-        if edit.text != title {
-            edit.text = title.clone();
-            edit.cursor = edit.text.len();
-            edit.revision = edit.revision.wrapping_add(1);
-            edit.editor = Default::default();
+        if edit.editor.text() != title {
+            let revision = edit.editor.revision().wrapping_add(1);
+            edit.editor
+                .reset_external(title.clone(), title.len(), revision);
         }
         title
     };
@@ -2607,12 +2686,13 @@ fn merge_authoritative_session_title(state: &mut UiState, session: SessionId, au
         .as_mut()
         .filter(|edit| edit.target == session)
     {
-        let clean = edit.text == edit.original;
+        let clean = edit.editor.text() == edit.original;
         edit.original = authoritative.to_owned();
         if clean {
-            edit.text = edit.original.clone();
-            edit.cursor = edit.text.len();
-            edit.editor = Default::default();
+            let revision = edit.editor.revision();
+            let cursor = edit.original.len();
+            edit.editor
+                .reset_external(edit.original.clone(), cursor, revision);
         }
     }
 }
@@ -2645,12 +2725,13 @@ fn reconcile_overview_titles(
             .as_mut()
             .filter(|edit| edit.target == info.id)
         {
-            let clean = edit.text == edit.original;
+            let clean = edit.editor.text() == edit.original;
             edit.original = authoritative;
             if clean {
-                edit.text = edit.original.clone();
-                edit.cursor = edit.text.len();
-                edit.editor = Default::default();
+                let revision = edit.editor.revision();
+                let cursor = edit.original.len();
+                edit.editor
+                    .reset_external(edit.original.clone(), cursor, revision);
             }
         }
     }
@@ -2712,7 +2793,7 @@ fn release_inactive_session(state: &UiState, session: SessionId, effects: &mut V
     let Some(ui) = state.session_ui.get(&session) else {
         return;
     };
-    if ui.draft_revision <= ui.saved_draft_revision
+    if ui.draft.revision() <= ui.saved_draft_revision
         && ui.submitting.is_none()
         && !effects.iter().any(
             |effect| matches!(effect, Effect::ReleaseSession { session: queued, .. } if *queued == session),
@@ -2747,9 +2828,7 @@ mod panel_draft_tests {
             archived: false,
         };
         let mut ui = SessionUi::new(info.clone(), 1);
-        ui.draft = "ordinary draft".into();
-        ui.draft_cursor = 4;
-        ui.draft_revision = 8;
+        ui.draft.reset_external("ordinary draft".into(), 4, 8);
         let mut answer = AnswerDraft::new(question);
         answer.replace("answer draft".into(), 3);
         ui.answer_drafts.insert(question, answer);
@@ -2777,16 +2856,16 @@ mod panel_draft_tests {
     #[test]
     fn clear_answer_preserves_ordinary_draft_and_question_binding() {
         let (mut state, question) = fixture();
-        let revision = state.selected_ui().unwrap().answer_drafts[&question].revision;
-        assert!(update(&mut state, UiEvent::Action(Action::ClearInput)).is_empty());
+        let revision = state.selected_ui().unwrap().answer_drafts[&question].revision();
+        assert!(update(&mut state, UiEvent::Action(test_editor(EditCommand::Clear))).is_empty());
         assert_eq!(state.draft(), "");
         let ui = state.selected_ui().unwrap();
-        assert_eq!(ui.draft, "ordinary draft");
+        assert_eq!(ui.draft(), "ordinary draft");
         assert_eq!(ui.selected_answer, Some(question));
-        assert!(ui.answer_drafts[&question].revision > revision);
-        update(&mut state, UiEvent::Action(Action::Undo));
+        assert!(ui.answer_drafts[&question].revision() > revision);
+        update(&mut state, UiEvent::Action(test_editor(EditCommand::Undo)));
         assert_eq!(state.draft(), "answer draft");
-        assert_eq!(state.selected_ui().unwrap().draft, "ordinary draft");
+        assert_eq!(state.selected_ui().unwrap().draft(), "ordinary draft");
     }
 
     #[test]
@@ -2794,22 +2873,22 @@ mod panel_draft_tests {
         let (mut state, question) = fixture();
         let session = state.selected;
         state.selected = None;
-        update(&mut state, UiEvent::Action(Action::Paste("orphan".into())));
+        update(&mut state, UiEvent::Action(test_insert("orphan")));
         state.selected = session;
-        update(&mut state, UiEvent::Action(Action::Paste("ANSWER".into())));
+        update(&mut state, UiEvent::Action(test_insert("ANSWER")));
         state.selected_ui_mut().unwrap().selected_answer = None;
-        update(&mut state, UiEvent::Action(Action::Paste("SESSION".into())));
-        update(&mut state, UiEvent::Action(Action::Undo));
+        update(&mut state, UiEvent::Action(test_insert("SESSION")));
+        update(&mut state, UiEvent::Action(test_editor(EditCommand::Undo)));
         assert_eq!(state.draft(), "ordinary draft");
         state.selected_ui_mut().unwrap().selected_answer = Some(question);
         assert!(state.draft().contains("ANSWER"));
-        update(&mut state, UiEvent::Action(Action::Undo));
+        update(&mut state, UiEvent::Action(test_editor(EditCommand::Undo)));
         assert_eq!(state.draft(), "answer draft");
         state.selected = None;
         assert_eq!(state.draft(), "orphan");
-        update(&mut state, UiEvent::Action(Action::Undo));
+        update(&mut state, UiEvent::Action(test_editor(EditCommand::Undo)));
         assert_eq!(state.draft(), "");
-        update(&mut state, UiEvent::Action(Action::Redo));
+        update(&mut state, UiEvent::Action(test_editor(EditCommand::Redo)));
         assert_eq!(state.draft(), "orphan");
     }
 
@@ -2817,29 +2896,24 @@ mod panel_draft_tests {
     fn unicode_selection_replacement_and_coalesced_typing_are_undoable() {
         let mut state = UiState::default();
         for ch in "中e\u{301}🙂".chars() {
-            update(&mut state, UiEvent::Action(Action::Input(ch)));
+            update(&mut state, UiEvent::Action(test_type(ch)));
         }
-        update(&mut state, UiEvent::Action(Action::Undo));
+        update(&mut state, UiEvent::Action(test_editor(EditCommand::Undo)));
         assert_eq!(state.draft(), "");
-        update(&mut state, UiEvent::Action(Action::Redo));
+        update(&mut state, UiEvent::Action(test_editor(EditCommand::Redo)));
         for _ in 0..2 {
             update(
                 &mut state,
-                UiEvent::Action(Action::MoveCursor {
-                    direction: -1,
+                UiEvent::Action(test_editor(EditCommand::Move {
+                    cursor: CursorMove::Left,
                     select: true,
-                    word: false,
-                    width: 8,
-                }),
+                })),
             );
         }
-        assert_eq!(
-            state.editor().selection(state.draft_cursor()),
-            Some(3.."中e\u{301}🙂".len())
-        );
-        update(&mut state, UiEvent::Action(Action::Paste("字".into())));
+        assert_eq!(state.editor().selection(), Some(3.."中e\u{301}🙂".len()));
+        update(&mut state, UiEvent::Action(test_insert("字")));
         assert_eq!(state.draft(), "中字");
-        update(&mut state, UiEvent::Action(Action::Undo));
+        update(&mut state, UiEvent::Action(test_editor(EditCommand::Undo)));
         assert_eq!(state.draft(), "中e\u{301}🙂");
     }
 
@@ -2850,14 +2924,14 @@ mod panel_draft_tests {
             let ui = state.selected_ui_mut().unwrap();
             ui.selected_answer = answer.then_some(question);
             let text = if answer {
-                ui.answer_drafts[&question].text.clone()
+                ui.answer_drafts[&question].text().to_owned()
             } else {
-                ui.draft.clone()
+                ui.draft.text().to_owned()
             };
             let revision = if answer {
-                ui.answer_drafts[&question].revision
+                ui.answer_drafts[&question].revision()
             } else {
-                ui.draft_revision
+                ui.draft.revision()
             };
             let request_id = RequestId::new();
             ui.submitting = Some(PendingSubmission {
@@ -2868,8 +2942,8 @@ mod panel_draft_tests {
                 failed: false,
             });
             let session = ui.info.id;
-            update(&mut state, UiEvent::Action(Action::Paste("later".into())));
-            update(&mut state, UiEvent::Action(Action::Undo));
+            update(&mut state, UiEvent::Action(test_insert("later")));
+            update(&mut state, UiEvent::Action(test_editor(EditCommand::Undo)));
             assert_eq!(state.draft(), text);
             update(
                 &mut state,
@@ -2897,36 +2971,40 @@ mod panel_draft_tests {
             .get_mut(&question)
             .unwrap();
         answer.replace(
-            answer::append_restored_text(&answer.text, "restored"),
+            answer::append_restored_text(answer.text(), "restored"),
             usize::MAX,
         );
-        update(&mut state, UiEvent::Action(Action::Undo));
+        update(&mut state, UiEvent::Action(test_editor(EditCommand::Undo)));
         assert_eq!(state.draft(), "answer draft");
-        assert_eq!(state.selected_ui().unwrap().draft, "ordinary draft");
+        assert_eq!(state.selected_ui().unwrap().draft(), "ordinary draft");
     }
 
     #[test]
     fn editor_history_budget_is_global_and_prefers_current_buffer() {
         let (mut state, question) = fixture();
         let text = "x".repeat(1024 * 1024);
+        state.orphan_draft = crate::editor::EditorBuffer::new(text.clone());
         for _ in 0..4 {
-            state.orphan_editor.checkpoint(&text, text.len());
+            state.orphan_draft.checkpoint();
         }
         let ui = state.selected_ui_mut().unwrap();
+        ui.draft = crate::editor::EditorBuffer::new(text.clone());
         for _ in 0..4 {
-            ui.editor.checkpoint(&text, text.len());
+            ui.draft.checkpoint();
         }
+        ui.answer_drafts.get_mut(&question).unwrap().editor =
+            crate::editor::EditorBuffer::new(text);
         for _ in 0..4 {
             ui.answer_drafts
                 .get_mut(&question)
                 .unwrap()
                 .editor
-                .checkpoint(&text, text.len());
+                .checkpoint();
         }
         trim_editor_history(&mut state);
         let ui = state.selected_ui().unwrap();
-        let total = state.orphan_editor.history_bytes()
-            + ui.editor.history_bytes()
+        let total = state.orphan_draft.history_bytes()
+            + ui.draft.history_bytes()
             + ui.answer_drafts[&question].editor.history_bytes();
         assert!(total <= 8 * 1024 * 1024);
         assert_eq!(
@@ -3028,13 +3106,13 @@ mod panel_draft_tests {
     fn assert_drafts(state: &UiState, question: QuestionId) {
         let ui = state.selected_ui().unwrap();
         assert_eq!(
-            (&*ui.draft, ui.draft_cursor, ui.draft_revision),
+            (ui.draft.text(), ui.draft.cursor(), ui.draft.revision()),
             ("ordinary draft", 4, 8)
         );
         assert_eq!(ui.selected_answer, Some(question));
         let answer = &ui.answer_drafts[&question];
         assert_eq!(
-            (&*answer.text, answer.cursor, answer.revision),
+            (answer.text(), answer.cursor(), answer.revision()),
             ("answer draft", 3, 1)
         );
     }
@@ -3186,9 +3264,9 @@ mod panel_draft_tests {
         assert_eq!(state.focus, Focus::SessionTitle);
         {
             let edit = state.title_edit.as_mut().unwrap();
-            edit.text = "  New title  ".into();
-            edit.cursor = edit.text.len();
-            edit.revision = edit.revision.wrapping_add(1);
+            edit.editor.apply(EditCommand::Replace {
+                text: "  New title  ".into(),
+            });
         }
         let effects = update(&mut state, UiEvent::Action(Action::CommitTitle));
         let [
@@ -3206,11 +3284,14 @@ mod panel_draft_tests {
         assert_eq!(title, "New title");
         assert_drafts(&state, question);
 
-        update(&mut state, UiEvent::Action(Action::TitleEnd));
         update(
             &mut state,
-            UiEvent::Action(Action::TitlePaste(" v2".into())),
+            UiEvent::Action(test_title_editor(EditCommand::Move {
+                cursor: CursorMove::LineEnd,
+                select: false,
+            })),
         );
+        update(&mut state, UiEvent::Action(test_title_insert(" v2")));
         assert!(update(&mut state, UiEvent::Action(Action::CommitTitle)).is_empty());
         assert_eq!(state.title_text(), Some("New title v2"));
 
@@ -3259,7 +3340,7 @@ fn trim_editor_history(state: &mut UiState) {
     for (id, ui) in &mut state.session_ui {
         editors.push((
             Some(*id) == selected && ui.selected_answer.is_none(),
-            &mut ui.editor,
+            &mut ui.draft,
         ));
         for (question, answer) in &mut ui.answer_drafts {
             editors.push((
@@ -3268,7 +3349,7 @@ fn trim_editor_history(state: &mut UiState) {
             ));
         }
     }
-    editors.push((selected.is_none(), &mut state.orphan_editor));
+    editors.push((selected.is_none(), &mut state.orphan_draft));
     editors.sort_by_key(|(active, _)| *active);
     let mut bytes: usize = editors
         .iter()
@@ -3321,7 +3402,7 @@ mod session_browsing_tests {
         ));
         assert_eq!(state.selected, Some(ids[1]));
         assert_eq!(state.focus, Focus::Sessions);
-        assert_eq!(state.session_ui[&ids[0]].draft, "unsent original");
+        assert_eq!(state.session_ui[&ids[0]].draft(), "unsent original");
         update(&mut state, UiEvent::Action(Action::SelectSession(ids[2])));
         assert_eq!(state.selected, Some(ids[2]));
         assert_eq!(state.session_candidate, Some(ids[2]));
@@ -3471,7 +3552,6 @@ mod final_integration_regressions {
     fn pointer_submission_focuses_composer_but_reading_submission_does_not() {
         let mut state = UiState::default();
         state.orphan_draft = "send this".into();
-        state.orphan_cursor = state.orphan_draft.len();
         state.set_focus(Focus::SessionTitle);
         assert!(update(&mut state, UiEvent::Action(Action::Submit)).is_empty());
         assert!(state.pending_create.is_none());
@@ -3506,7 +3586,7 @@ mod final_integration_regressions {
         assert!(
             matches!(effects.as_slice(), [Effect::SetModel { selection, .. }] if selection == &choice.selection)
         );
-        assert_eq!(state.orphan_draft, "missing foo");
+        assert_eq!(state.orphan_draft.text(), "missing foo");
         assert!(update(&mut state, UiEvent::Action(Action::SelectModel(0))).is_empty());
         state.models_loading = false;
         let effects = update(&mut state, UiEvent::Action(Action::ActivatePanel));
@@ -3551,7 +3631,7 @@ mod final_integration_regressions {
         assert!(state.models_loading);
         assert!(matches!(state.panel, Some(Panel::Models)));
         assert_eq!(state.panel_selection, 3);
-        assert_eq!(state.orphan_draft, "newer draft");
+        assert_eq!(state.orphan_draft.text(), "newer draft");
         assert_eq!(state.model_label.as_deref(), Some("previous"));
         update(
             &mut state,
@@ -3871,8 +3951,8 @@ mod connection_tests {
     }
     fn assert_drafts(state: &UiState) {
         let ui = state.selected_ui().unwrap();
-        assert_eq!(ui.draft, "ordinary draft");
-        assert_eq!(ui.active_answer().unwrap().text, "answer draft");
+        assert_eq!(ui.draft(), "ordinary draft");
+        assert_eq!(ui.active_answer().unwrap().text(), "answer draft");
     }
     fn act(state: &mut UiState, action: Action) -> Vec<Effect> {
         update(state, UiEvent::Action(action))
@@ -4145,20 +4225,25 @@ mod focus_state_tests {
     fn dragging_a_selection_focuses_the_composer() {
         let mut state = UiState::default();
         state.orphan_draft = "abc".into();
-        state.orphan_cursor = state.orphan_draft.len();
         state.set_focus(Focus::SessionTitle);
 
-        act(&mut state, Action::DragCursor(1));
+        act(
+            &mut state,
+            test_editor(EditCommand::Point {
+                byte: 1,
+                extend: true,
+            }),
+        );
 
         assert_eq!(state.focus, Focus::Composer);
-        assert_eq!(state.editor().selection(state.draft_cursor()), Some(1..3));
+        assert_eq!(state.editor().selection(), Some(1..3));
     }
 
     #[test]
     fn session_created_does_not_steal_focus_after_the_request_started() {
         for focus in [Focus::Sessions, Focus::RightRail] {
             let mut state = UiState::default();
-            act(&mut state, Action::Paste("first input".into()));
+            act(&mut state, test_insert("first input"));
             let effects = update(&mut state, UiEvent::Action(Action::Submit));
             assert!(matches!(effects.as_slice(), [Effect::CreateSession { .. }]));
             let request_id = state.pending_create.as_ref().unwrap().request_id;
@@ -4190,7 +4275,7 @@ mod focus_state_tests {
         state.panel_return = Focus::Sessions;
 
         act(&mut state, Action::StartSlashCommand);
-        act(&mut state, Action::Paste("new".into()));
+        act(&mut state, test_insert("new"));
         let effects = update(&mut state, UiEvent::Action(Action::Submit));
 
         assert!(matches!(effects.as_slice(), [Effect::CreateSession { .. }]));
@@ -4357,7 +4442,7 @@ mod focus_state_tests {
     fn attached_slash_command_keeps_composer_as_the_panel_return_focus() {
         let mut state = UiState::default();
         state.panel_return = Focus::Sessions;
-        act(&mut state, Action::Paste("/help".into()));
+        act(&mut state, test_insert("/help"));
 
         act(&mut state, Action::Submit);
 
@@ -4428,10 +4513,8 @@ mod title_rename_tests {
     fn dirty_title(state: &mut UiState, title: &str) {
         update(state, UiEvent::Action(Action::Focus(Focus::SessionTitle)));
         let edit = state.title_edit.as_mut().expect("selected title editor");
-        edit.editor.checkpoint(&edit.text, edit.cursor);
-        edit.text = title.into();
-        edit.cursor = edit.text.len();
-        edit.revision = edit.revision.wrapping_add(1);
+        edit.editor
+            .apply(EditCommand::Replace { text: title.into() });
     }
 
     fn rename_effect(effects: &[Effect]) -> (SessionId, u64, String) {
@@ -4530,28 +4613,32 @@ mod title_rename_tests {
 
         update(
             &mut state,
-            UiEvent::Action(Action::TitleMoveCursor {
-                direction: -3,
+            UiEvent::Action(test_title_editor(EditCommand::Move {
+                cursor: CursorMove::LineStart,
                 select: true,
-                word: false,
-            }),
+            })),
         );
         let edit = state.title_edit.as_ref().unwrap();
-        assert_eq!(edit.cursor, 0);
-        assert_eq!(edit.editor.selection(edit.cursor), Some(0..title.len()));
+        assert_eq!(edit.editor.cursor(), 0);
+        assert_eq!(edit.editor.selection(), Some(0..title.len()));
 
-        update(&mut state, UiEvent::Action(Action::TitleHome));
         update(
             &mut state,
-            UiEvent::Action(Action::TitleMoveCursor {
-                direction: 3,
+            UiEvent::Action(test_title_editor(EditCommand::Move {
+                cursor: CursorMove::LineStart,
+                select: false,
+            })),
+        );
+        update(
+            &mut state,
+            UiEvent::Action(test_title_editor(EditCommand::Move {
+                cursor: CursorMove::LineEnd,
                 select: true,
-                word: false,
-            }),
+            })),
         );
         let edit = state.title_edit.as_ref().unwrap();
-        assert_eq!(edit.cursor, title.len());
-        assert_eq!(edit.editor.selection(edit.cursor), Some(0..title.len()));
+        assert_eq!(edit.editor.cursor(), title.len());
+        assert_eq!(edit.editor.selection(), Some(0..title.len()));
     }
 
     #[test]
@@ -4560,8 +4647,14 @@ mod title_rename_tests {
             Action::FocusLeft,
             Action::FocusDown,
             Action::Focus(Focus::Composer),
-            Action::PlaceCursor(0),
-            Action::DragCursor(0),
+            test_editor(EditCommand::Point {
+                byte: 0,
+                extend: false,
+            }),
+            test_editor(EditCommand::Point {
+                byte: 0,
+                extend: true,
+            }),
             Action::ClickSubmit,
         ] {
             let (mut state, first, _) = fixture();
@@ -4690,7 +4783,6 @@ mod title_rename_tests {
         let (mut state, first, _) = fixture();
         let ui = state.session_ui.get_mut(&first.id).unwrap();
         ui.draft = "/new".into();
-        ui.draft_cursor = ui.draft.len();
         let create = update(&mut state, UiEvent::Action(Action::Submit));
         assert!(
             create
@@ -4729,11 +4821,14 @@ mod title_rename_tests {
             &mut state,
             UiEvent::Action(Action::Focus(Focus::SessionTitle)),
         );
-        update(&mut state, UiEvent::Action(Action::TitleEnd));
         update(
             &mut state,
-            UiEvent::Action(Action::TitlePaste(" changed".into())),
+            UiEvent::Action(test_title_editor(EditCommand::Move {
+                cursor: CursorMove::LineEnd,
+                select: false,
+            })),
         );
+        update(&mut state, UiEvent::Action(test_title_insert(" changed")));
         let edited = state.title_text().unwrap().to_owned();
         let old_generation = state.session_ui[&first.id].generation;
 
@@ -4751,9 +4846,15 @@ mod title_rename_tests {
         assert_ne!(state.session_ui[&first.id].generation, old_generation);
         assert_eq!(state.title_text(), Some(edited.as_str()));
 
-        update(&mut state, UiEvent::Action(Action::TitleUndo));
+        update(
+            &mut state,
+            UiEvent::Action(test_title_editor(EditCommand::Undo)),
+        );
         assert_eq!(state.title_text(), Some("Alpha"));
-        update(&mut state, UiEvent::Action(Action::TitleRedo));
+        update(
+            &mut state,
+            UiEvent::Action(test_title_editor(EditCommand::Redo)),
+        );
         assert_eq!(state.title_text(), Some(edited.as_str()));
         let effects = update(&mut state, UiEvent::Action(Action::CommitTitle));
         assert_eq!(rename_effect(&effects).0, first.id);
@@ -4763,7 +4864,6 @@ mod title_rename_tests {
     fn manual_intent_wins_before_or_after_an_auto_title_receipt() {
         let (mut state, first, _) = fixture();
         state.session_ui.get_mut(&first.id).unwrap().draft = "first input".into();
-        state.session_ui.get_mut(&first.id).unwrap().draft_cursor = "first input".len();
         let submitted = update(&mut state, UiEvent::Action(Action::Submit));
         let request_id = submitted
             .iter()
@@ -4907,7 +5007,7 @@ mod title_rename_tests {
             assert_eq!(title_in_rail(&state, first.id), authoritative);
             assert_eq!(state.session_ui[&first.id].info.title, authoritative);
             let edit = state.title_edit.as_ref().unwrap();
-            assert_eq!(edit.text, "Uncommitted editor text");
+            assert_eq!(edit.editor.text(), "Uncommitted editor text");
             assert_eq!(edit.original, authoritative);
 
             update(&mut state, UiEvent::Action(Action::CancelTitle));
@@ -5006,5 +5106,33 @@ mod title_rename_tests {
         assert_eq!(state.session_ui[&first.id].info.title, "Alpha");
         assert_eq!(state.title_text(), Some("Alpha"));
         assert_eq!(state.status.as_deref(), Some("Could not save title"));
+
+        update(
+            &mut state,
+            UiEvent::Action(test_title_editor(EditCommand::Undo)),
+        );
+        assert_eq!(state.title_text(), Some("Alpha"));
+    }
+
+    #[test]
+    fn cancelling_an_edit_keeps_a_late_auto_title_out_of_the_editor() {
+        let (mut state, first, _) = fixture();
+        dirty_title(&mut state, "Cancelled local edit");
+        let edited_revision = state.title_edit.as_ref().unwrap().editor.revision();
+
+        update(&mut state, UiEvent::Action(Action::CancelTitle));
+        let cancelled_revision = state.title_edit.as_ref().unwrap().editor.revision();
+        assert!(cancelled_revision > edited_revision);
+        assert_eq!(state.title_text(), Some("Alpha"));
+
+        update(
+            &mut state,
+            UiEvent::SessionAutoTitled {
+                session: first.id,
+                request: 99,
+                title: "Late automatic title".into(),
+            },
+        );
+        assert_eq!(state.title_text(), Some("Alpha"));
     }
 }

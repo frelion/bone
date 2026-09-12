@@ -121,6 +121,7 @@ pub async fn run() -> Result<(), RunError> {
     let caret_sleep = tokio::time::sleep(CARET_PHASE);
     tokio::pin!(caret_sleep);
     let mut frame_snapshot = None;
+    let mut view_state = crate::ui::frame::ViewState::default();
     let mut shutdown = false;
     let mut termination_received = false;
     let mut panic_handled = false;
@@ -138,7 +139,12 @@ pub async fn run() -> Result<(), RunError> {
             );
         }
         if !termination_received {
-            render_dirty(&mut terminal, &mut state, &mut frame_snapshot)?;
+            render_dirty(
+                &mut terminal,
+                &mut state,
+                &mut view_state,
+                &mut frame_snapshot,
+            )?;
             if panic_signal.is_tripped() {
                 begin_background_panic_shutdown(
                     &mut terminal,
@@ -405,14 +411,19 @@ fn schedule_test_background_panic() {
 fn render_dirty(
     terminal: &mut TerminalSession,
     state: &mut UiState,
+    view_state: &mut crate::ui::frame::ViewState,
     frame_snapshot: &mut Option<crate::view::FrameSnapshot>,
 ) -> io::Result<()> {
     if !state.dirty {
         return Ok(());
     }
+    let mut rendered = None;
     terminal.terminal().draw(|frame| {
-        *frame_snapshot = Some(crate::view::render(frame, state));
+        rendered = Some(crate::view::render_with_view_state(
+            frame, state, view_state,
+        ));
     })?;
+    *frame_snapshot = rendered;
     if let Some(metrics) = frame_snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.transcript_metrics.clone())

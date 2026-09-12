@@ -1017,14 +1017,14 @@ impl Runtime {
 
         let mut first_error = self.flush_title_writes().await.err();
         for (id, ui) in &state.session_ui {
-            if ui.draft_revision > ui.saved_draft_revision {
+            if ui.draft.revision() > ui.saved_draft_revision {
                 let session = match self.session(*id) {
                     Some(session) => Ok(session),
                     None => self.app.session(*id).await,
                 };
                 match session {
                     Ok(session) => {
-                        if let Err(error) = session.save_draft(ui.draft.clone()).await {
+                        if let Err(error) = session.save_draft(ui.draft.text()).await {
                             first_error.get_or_insert_with(|| error.to_string());
                         }
                     }
@@ -1048,7 +1048,7 @@ impl Runtime {
                 .await
                 .map_err(|error| error.to_string())?;
             session
-                .save_draft(state.orphan_draft.clone())
+                .save_draft(state.orphan_draft.text())
                 .await
                 .map_err(|error| error.to_string())?;
             let info = snapshot.session;
@@ -1056,15 +1056,13 @@ impl Runtime {
                 .session_ui
                 .entry(info.id)
                 .or_insert_with(|| crate::state::SessionUi::new(info.clone(), 0));
-            ui.draft = std::mem::take(&mut state.orphan_draft);
-            ui.draft_cursor = state.orphan_cursor;
-            ui.draft_revision = ui.draft_revision.wrapping_add(1);
-            ui.saved_draft_revision = ui.draft_revision;
-            ui.saved_draft = ui.draft.clone();
+            let editor = std::mem::take(&mut state.orphan_draft);
+            state.orphan_draft.revision = editor.revision().wrapping_add(1);
+            ui.draft = editor;
+            ui.saved_draft_revision = ui.draft.revision();
+            ui.saved_draft = ui.draft.text().to_owned();
             // Prevent an in-flight hydration from replacing this just-saved buffer.
             ui.hydrated = true;
-            state.orphan_cursor = 0;
-            state.orphan_revision = state.orphan_revision.wrapping_add(1);
             if state
                 .pending_create
                 .as_ref()
@@ -1395,7 +1393,7 @@ mod lifecycle_tests {
         let request = runtime.exit_draft_request.clone().unwrap();
         assert!(runtime.flush_drafts(&mut state).await.is_err());
         assert_eq!(runtime.exit_draft_request.as_ref(), Some(&request));
-        assert_eq!(state.orphan_draft, "keep me");
+        assert_eq!(state.orphan_draft.text(), "keep me");
         runtime.shutdown().await.unwrap();
     }
 

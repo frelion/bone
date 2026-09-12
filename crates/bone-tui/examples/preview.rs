@@ -5,7 +5,10 @@ use bone_app::{
     SessionInfo, SessionSeq, SessionSummary, SessionView, WorkspaceId,
 };
 use bone_tui::{
-    state::{Action, Effect, Focus, SessionStatus, SessionUi, UiEvent, UiState, update},
+    state::{
+        Action, EditCommand, EditorTarget, Effect, Focus, SessionStatus, SessionUi, UiEvent,
+        UiState, update,
+    },
     view,
 };
 use ratatui::{
@@ -108,8 +111,6 @@ fn main() {
     state.selected = Some(info.id);
     let mut ui = SessionUi::new(info.clone(), 1);
     ui.hydrated = true;
-    ui.draft = "组合字符之后继续输入时，\n也保留原来的光标位置。".into();
-    ui.draft_cursor = ui.draft.len();
     ui.snapshot = Some(Arc::new(SessionView {
         session: info,
         runtime: RuntimeState::Detached,
@@ -135,11 +136,35 @@ fn main() {
         });
     }
     state.session_ui.insert(ui.info.id, ui);
+    update(
+        &mut state,
+        UiEvent::Action(Action::Edit {
+            target: EditorTarget::Composer,
+            command: EditCommand::Insert {
+                text: "组合字符之后继续输入时，\n也保留原来的光标位置。".into(),
+                typing: false,
+            },
+        }),
+    );
     let scenario = args.get(3).map(String::as_str).unwrap_or("conversation");
     if scenario == "commands" {
-        let ui = state.selected_ui_mut().expect("preview session");
-        ui.draft = "/".into();
-        ui.draft_cursor = ui.draft.len();
+        update(
+            &mut state,
+            UiEvent::Action(Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Clear,
+            }),
+        );
+        update(
+            &mut state,
+            UiEvent::Action(Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Insert {
+                    text: "/".into(),
+                    typing: false,
+                },
+            }),
+        );
     } else if matches!(scenario, "models" | "connection" | "form") {
         let effects = update(&mut state, UiEvent::Action(Action::OpenModels));
         for effect in effects {
