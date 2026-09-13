@@ -51,7 +51,7 @@
 - `/new [title]`：直接创建 Session，无确认框；省略标题时，App 在首次提交后生成标题。
 - `/sessions`：聚焦 Session rail。
 - `/rename`：进入当前 Session 的单行内联标题编辑；`/rename <title>` 直接写入并提交标题。
-- `/model`：统一模型选择、添加/编辑接入、API 密钥与账号授权。模型列表中选择已有配置、编辑接入或添加接入；表单支持 Tab/上下切字段、Ctrl+U 清空和鼠标操作。API 支持 Responses、Chat Completions、Anthropic Messages 及自定义 HTTPS 地址；密钥遮罩、退出清空、不进草稿和 Debug。账号授权也在此流程内返回模型列表，不再提供独立 `/login` 或 `/connect`。兼容 `/model <profile> <model>` 快捷参数；`/model <profile> <model>` 设置当前 Session（尚无 Session 时设置 workspace）的 Worker。列表不是服务端模型目录。运行模型与保存配置分别显示，比较完整 profile/model/options；保存成功不等同运行已应用。
+- `/model`：唯一的模型入口，不接受隐藏的 profile/model 参数。首次缺模型时直接选择 ChatGPT 账号、OpenAI API、Anthropic API 或自定义服务，并把首次选择保存为 workspace 默认，之后的新 Session 直接继承；ChatGPT 会先检查缓存登录，缺失时打开浏览器授权，成功后自动重试同一次模型选择。官方 API 表单只要求密钥并选择推荐模型，自定义服务才显示协议、HTTPS 地址和模型 ID。普通列表展示各已保存连接的本地推荐目录，并明确标出 Current、Conversation、Workspace 或 Configured；它不冒充账号的远端可用模型目录。Manage 中的官方连接只更新密钥；自定义连接只有在用户显式修改 Model 字段时才切换模型。完成首次设置后，选中 Session 时的切换同时更新该 Session 的 worker/coordinator；未选中 Session 时更新 workspace。响应执行中禁止切换，密钥与设备码保持脱敏；不再提供独立 `/login`、`/connect` 或旧 `/model <profile> <model>` 语法。
 - `/answer`：回答当前仍有效的问题，使用独立缓冲和完整 QuestionId；过期答案只能明确转为普通草稿，不会自动当新请求发送。
 - `/details`：列出当前任务及已加载历史中的工具/任务结果，选择后读取完整对象；鼠标也可从可见对象行进入。
 - `/recover`：恢复最近可恢复输入的原文。

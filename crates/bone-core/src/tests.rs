@@ -166,6 +166,36 @@ fn finished_as(kernel: &Kernel, job: crate::JobId, kind: OutcomeKind) -> bool {
 }
 
 #[test]
+fn a_user_reply_is_visible_to_the_follow_up_call_before_finish() {
+    let mut kernel = kernel();
+    let input = Input::new(InputId(901), "answer once");
+    let (call, first) = create_roots(
+        &mut kernel,
+        input.clone(),
+        vec![assignment("answer once", &[input.id])],
+    )
+    .pop()
+    .unwrap();
+
+    let effects = work(&mut kernel, call, WorkStep::Reply("done".into()));
+    let (finish_call, follow_up) = work_calls(&effects).pop().unwrap();
+    assert_eq!(follow_up.job, first.job);
+    assert!(follow_up.records.iter().any(|record| {
+        matches!(
+            serde_json::from_str::<RecordBody>(&record.content),
+            Ok(RecordBody::Reply { text, .. }) if text == "done"
+        )
+    }));
+
+    let _ = work(
+        &mut kernel,
+        finish_call,
+        WorkStep::Finish(Completion::new("done")),
+    );
+    assert!(finished_as(&kernel, first.job, OutcomeKind::Completed));
+}
+
+#[test]
 fn active_reconfigure_restarts_model_work_without_losing_the_job() {
     let mut kernel = kernel();
     let input = Input::new(InputId(2), "keep this job alive");

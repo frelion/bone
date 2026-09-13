@@ -153,7 +153,7 @@ Session override > Workspace override > User setting
 
 运行中配置成功时保留 `RuntimeId`、Job 图和在途工具。旧模型调用失去提交资格并用新模型重新调度；已经开始的工具使用启动时捕获的端口和 limit 收尾。
 
-如果 desired 配置无法装配，保存值不回滚，旧 running config 仍可查询，但 Agent 保持 suspended，不再启动新模型或工具。修复配置后再次 `update_config`，或修复凭据后调用 `Session::reload_config`，会在同一 Job 图上重试。fan-out 不是跨 Session 回滚事务：已经成功应用的 Session 不因另一 Session 失败而倒退。
+如果普通 role/tool 配置无法装配，保存值不回滚，旧 running config 仍可查询，但 Agent 保持 suspended，不再启动新模型或工具。面向前端的 `ConfigChange::Model` 会先检查 ChatGPT cached auth，再以一个配置事务同时写 worker/coordinator；需要交互登录时返回 `LoginRequired` 且不改原选择。修复配置后再次 `update_config`，或修复凭据后调用 `Session::reload_config`，会在同一 Job 图上重试。API key 更新会强制刷新所有实际引用该 profile 的已打开 Session。fan-out 不是跨 Session 回滚事务：已经成功应用的 Session 不因另一 Session 失败而倒退。
 
 调用方取消 `update_config` / `save_profile` Future 只停止等待，不撤销已经交给 App 的变更。后续配置操作、`resolved_config` 与 shutdown 会在同一屏障后继续。
 

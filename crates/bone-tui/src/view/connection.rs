@@ -31,14 +31,17 @@ pub(super) fn render(
     let inset = u16::from(spacious);
     let height = match &models.screen {
         ModelScreen::Setup(form) => form.fields().len() as u16 * stride + 6 + inset * 3,
-        ModelScreen::Add { .. } => {
+        ModelScreen::Add { .. } | ModelScreen::Advanced { .. } => {
             if spacious {
                 13
             } else {
                 8
             }
         }
-        ModelScreen::List { .. } | ModelScreen::Login { .. } => return,
+        ModelScreen::List { .. }
+        | ModelScreen::Reasoning { .. }
+        | ModelScreen::Manage { .. }
+        | ModelScreen::Login { .. } => return,
     }
     .min(plan.screen.height.saturating_sub(2));
     let area = Rect::new(
@@ -53,11 +56,15 @@ pub(super) fn render(
     let width = area.width.saturating_sub(4);
     let title = match &models.screen {
         ModelScreen::Add { .. } => "Models / Add connection",
+        ModelScreen::Advanced { .. } => "Models / Custom connection",
         ModelScreen::Setup(form) => form.kind.label(),
-        ModelScreen::List { .. } | ModelScreen::Login { .. } => return,
+        ModelScreen::List { .. }
+        | ModelScreen::Reasoning { .. }
+        | ModelScreen::Manage { .. }
+        | ModelScreen::Login { .. } => return,
     };
     let title_band = Rect::new(area.x, area.y + inset, area.width, 1);
-    let title_background = SELECTED;
+    let title_background = theme::FOCUS_SURFACE;
     frame.render_widget(
         Block::default().style(theme::surface(title_background)),
         title_band,
@@ -76,7 +83,70 @@ pub(super) fn render(
         target: HitTarget::Action(Action::Escape),
     });
     if let ModelScreen::Add { selected } = &models.screen {
-        for (index, kind) in ConnectionKind::ALL.iter().enumerate() {
+        let has_openai = models
+            .profiles
+            .iter()
+            .any(|profile| profile.id.as_str() == "openai");
+        let has_anthropic = models
+            .profiles
+            .iter()
+            .any(|profile| profile.id.as_str() == "anthropic");
+        let options = [
+            (
+                "ChatGPT · sign in",
+                "Uses your subscription · opens a browser",
+            ),
+            (
+                if has_openai {
+                    "OpenAI API · update key"
+                } else {
+                    "OpenAI API · connect"
+                },
+                if has_openai {
+                    "Keeps the model you already selected"
+                } else {
+                    "API key only · uses the recommended model"
+                },
+            ),
+            (
+                if has_anthropic {
+                    "Anthropic API · update key"
+                } else {
+                    "Anthropic API · connect"
+                },
+                if has_anthropic {
+                    "Keeps the model you already selected"
+                } else {
+                    "API key only · uses the recommended model"
+                },
+            ),
+            ("Custom / advanced", "Compatible service URL and model ID"),
+        ];
+        for (index, (label, note)) in options.iter().enumerate() {
+            let row = Rect::new(
+                x,
+                area.y + 2 + inset * 2 + index as u16 * stride,
+                width,
+                stride,
+            );
+            frame.render_widget(
+                Paragraph::new(if spacious {
+                    format!("{label}\n{note}")
+                } else {
+                    (*label).into()
+                })
+                .style(super::panels::menu_style(*selected == index)),
+                row,
+            );
+            hits.push(HitRegion {
+                area: row,
+                target: HitTarget::Action(Action::ChooseConnection(index)),
+            });
+        }
+        return;
+    }
+    if let ModelScreen::Advanced { selected } = &models.screen {
+        for (index, kind) in ConnectionKind::ADVANCED.iter().enumerate() {
             let row = Rect::new(
                 x,
                 area.y + 2 + inset * 2 + index as u16 * stride,
@@ -89,7 +159,7 @@ pub(super) fn render(
             );
             hits.push(HitRegion {
                 area: row,
-                target: HitTarget::Action(Action::ChooseConnectionKind(index)),
+                target: HitTarget::Action(Action::ChooseConnection(index)),
             });
         }
         return;
@@ -103,10 +173,10 @@ pub(super) fn render(
     frame.render_widget(
         Paragraph::new(single_line_external(hint))
             .wrap(Wrap { trim: false })
-            .style(Style::default().fg(if state.status.is_some() {
-                DANGER
-            } else {
-                MUTED
+            .style(Style::default().fg(match &state.status {
+                Some(status) if status.is_error() => DANGER,
+                Some(_) => INFO,
+                None => MUTED,
             })),
         Rect::new(x, area.y + 1 + inset, width, 2),
     );
@@ -114,7 +184,7 @@ pub(super) fn render(
         let row = Rect::new(x, area.y + 3 + inset + index as u16 * stride, width, stride);
         let (label, value, placeholder) = match field {
             SetupField::Label => ("Name", form.label.as_str(), "connection name"),
-            SetupField::BaseUrl => ("URL", form.base_url.as_str(), "official URL if blank"),
+            SetupField::BaseUrl => ("URL", form.base_url.as_str(), "https://… (required)"),
             SetupField::Key => (
                 "Key",
                 if form.key.as_str().is_empty() {
@@ -168,10 +238,14 @@ pub(super) fn render(
     let action = Rect::new(x, area.bottom().saturating_sub(2 + inset), width, 1);
     let label = if form.pending_request.is_some() {
         "Saving…"
-    } else if form.kind == ConnectionKind::ChatGptSubscription {
-        "enter save & authorize"
+    } else if form.changes_model() {
+        "enter save & use changed model"
+    } else if form.edits_existing_connection() {
+        "enter save connection"
+    } else if form.kind.advanced() {
+        "enter save & use model · tab next field"
     } else {
-        "enter save · tab next field"
+        "enter save & use recommended model"
     };
     let action_style = if form.pending_request.is_some() {
         theme::label(INFO)
@@ -229,12 +303,12 @@ mod tests {
     #[test]
     fn connection_form_masks_key_and_keeps_all_fields_and_actions_inside_small_screens() {
         for (width, height) in [(40, 12), (80, 24), (120, 30), (160, 40)] {
-            let mut form = ConnectionForm::new(ConnectionKind::OpenAiResponses);
+            let mut form = ConnectionForm::new(ConnectionKind::CustomOpenAiResponses);
             form.key = SecretText::from("not-a-real-key-KEEP-PRIVATE".to_owned());
             form.base_url = "https://example.invalid/long/address/for/viewport/checking".into();
             form.field = SetupField::Key;
             let mut state = UiState::default();
-            state.panel = Some(connection_panel(ModelScreen::Setup(form)));
+            state.panel = Some(connection_panel(ModelScreen::Setup(Box::new(form))));
             state.orphan_draft = "untouched chat draft".into();
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut layout = None;
@@ -295,18 +369,19 @@ mod tests {
 
     #[test]
     fn failed_key_save_prompts_reentry_instead_of_suggesting_blank() {
-        let mut form = ConnectionForm::edit(
+        let mut form = ConnectionForm::edit_selection(
             &bone_app::Profile::new(
                 bone_app::ProfileId::new("test-api").unwrap(),
                 "test",
                 bone_app::EndpointConfig::OpenAiResponses { base_url: None },
             )
             .unwrap(),
-            String::new(),
-        );
+            None,
+        )
+        .unwrap();
         form.key_was_sent = true;
         let mut state = UiState::default();
-        state.panel = Some(connection_panel(ModelScreen::Setup(form)));
+        state.panel = Some(connection_panel(ModelScreen::Setup(Box::new(form))));
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal
             .draw(|frame| {
@@ -326,10 +401,10 @@ mod tests {
 
     #[test]
     fn pending_save_shows_progress_without_an_action_or_caret() {
-        let mut form = ConnectionForm::new(ConnectionKind::ChatGptSubscription);
+        let mut form = ConnectionForm::new(ConnectionKind::OpenAiApi);
         form.pending_request = Some(7);
         let mut state = UiState::default();
-        state.panel = Some(connection_panel(ModelScreen::Setup(form)));
+        state.panel = Some(connection_panel(ModelScreen::Setup(Box::new(form))));
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         let mut layout = None;
 
@@ -367,13 +442,11 @@ mod tests {
                     let region = layout
                         .hit_regions()
                         .iter()
-                        .find(|r| {
-                            r.target == HitTarget::Action(Action::ChooseConnectionKind(index))
-                        })
+                        .find(|r| r.target == HitTarget::Action(Action::ChooseConnection(index)))
                         .unwrap();
                     assert_eq!(
                         layout.hit(region.area.x, region.area.y),
-                        Some(HitTarget::Action(Action::ChooseConnectionKind(index)))
+                        Some(HitTarget::Action(Action::ChooseConnection(index)))
                     );
                 }
             })

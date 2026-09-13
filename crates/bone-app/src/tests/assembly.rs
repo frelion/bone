@@ -93,11 +93,13 @@ async fn provider_assembly_completes_an_input_and_preserves_history_after_reopen
         .unwrap();
     transports[0].set_response(MockHttpResponse::success(submission_response(
         "submit_coordination",
-        json!(KernelDecision::Assign(vec![RouteDelivery {
-            inputs: vec![bone_core::InputId(receipt.input.0)],
-            target: RouteTarget::New,
-            handoff: "offline assembly".into(),
-        }])),
+        json!({
+            "decision": KernelDecision::Assign(vec![RouteDelivery {
+                inputs: vec![bone_core::InputId(receipt.input.0)],
+                target: RouteTarget::New,
+                handoff: "offline assembly".into(),
+            }])
+        }),
     )));
 
     let selections = [
@@ -194,11 +196,13 @@ async fn provider_assembly_completes_an_input_and_preserves_history_after_reopen
     let next_input = receipt.input.0 + 1;
     transports[0].set_response(MockHttpResponse::success(submission_response(
         "submit_coordination",
-        json!(KernelDecision::Assign(vec![RouteDelivery {
-            inputs: vec![bone_core::InputId(next_input)],
-            target: RouteTarget::New,
-            handoff: "continue after durable restart".into(),
-        }])),
+        json!({
+            "decision": KernelDecision::Assign(vec![RouteDelivery {
+                inputs: vec![bone_core::InputId(next_input)],
+                target: RouteTarget::New,
+                handoff: "continue after durable restart".into(),
+            }])
+        }),
     )));
     let second = session
         .submit(SubmitInput::new("continue after reopening"))

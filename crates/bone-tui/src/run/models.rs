@@ -1,5 +1,4 @@
-//! Model choices come from saved App configuration, not a provider catalogue.
-//! A configured model is not a promise that credentials or remote access work.
+//! Model choices come from each saved connection's local provider catalogue.
 
 use bone_app::{
     App, ConfigChange, ConfigScope, ModelSelection, Profile, RuntimeOverrides, SessionId,
@@ -10,12 +9,30 @@ use bone_app::{
 pub struct ModelChoice {
     pub selection: ModelSelection,
     pub profile_label: String,
+    pub label: String,
+    pub note: String,
+    pub recommended: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelFacts {
     pub saved: Result<bone_app::ResolvedModel, bone_app::ConfigProblem>,
     pub running: Option<bone_app::ResolvedModel>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConnectionSaveError {
+    pub(crate) message: &'static str,
+    pub(crate) key_saved: bool,
+}
+
+impl ConnectionSaveError {
+    fn before_key(message: &'static str) -> Self {
+        Self {
+            message,
+            key_saved: false,
+        }
+    }
 }
 
 impl From<bone_app::ResolvedConfig> for ModelFacts {
@@ -62,91 +79,118 @@ pub(crate) async fn save_connection(
     app: &App,
     workspace: WorkspaceId,
     session: Option<SessionId>,
+    workspace_default: bool,
     profile: Profile,
     key: Option<bone_app::ApiKey>,
     selection: Option<ModelSelection>,
-) -> Result<Option<&'static str>, &'static str> {
-    let writes_key = key.is_some();
-    profile
-        .validate()
-        .map_err(|_| "Invalid connection settings; nothing was saved")?;
+) -> Result<(), ConnectionSaveError> {
+    profile.validate().map_err(|_| {
+        ConnectionSaveError::before_key("Invalid connection settings; nothing was saved")
+    })?;
     if key.is_some()
         && matches!(
             profile.endpoint,
             bone_app::EndpointConfig::ChatGptSubscription
         )
     {
-        return Err("Subscription connections do not accept API keys; nothing was saved");
+        return Err(ConnectionSaveError::before_key(
+            "Subscription connections do not accept API keys; nothing was saved",
+        ));
     }
     if let Some(selection) = &selection {
-        selection
-            .validate()
-            .map_err(|_| "Invalid model settings; nothing was saved")?;
+        selection.validate().map_err(|_| {
+            ConnectionSaveError::before_key("Invalid model settings; nothing was saved")
+        })?;
         if selection.profile != profile.id {
-            return Err("Model and connection identities differ; nothing was saved");
+            return Err(ConnectionSaveError::before_key(
+                "Model and connection identities differ; nothing was saved",
+            ));
         }
         if let Some(options) = &selection.options {
-            options
-                .validate_for(&profile.endpoint)
-                .map_err(|_| "Model options do not match the connection; nothing was saved")?;
+            options.validate_for(&profile.endpoint).map_err(|_| {
+                ConnectionSaveError::before_key(
+                    "Model options do not match the connection; nothing was saved",
+                )
+            })?;
         }
     }
-    let unchanged = profile_saved(app, &profile)
-        .await
-        .map_err(|_| "Unable to read connection settings; nothing was changed")?;
-    let reload_failed = !unchanged && app.save_profile(profile.clone()).await.is_err();
+    let unchanged = profile_saved(app, &profile).await.map_err(|_| {
+        ConnectionSaveError::before_key("Unable to read connection settings; nothing was changed")
+    })?;
+    if !unchanged {
+        // save_profile may report a reload failure after persisting the new
+        // endpoint. The key and final model application below are the recovery
+        // path, so verify the durable profile instead of treating that
+        // intermediate result as final.
+        let _ = app.save_profile(profile.clone()).await;
+    }
     // save_profile persists before reloading live sessions. Even Err can mean
     // the requested endpoint is saved, so inspect facts before touching keys.
-    if !profile_saved(app, &profile)
-        .await
-        .map_err(|_| "Unable to confirm saved connection; key and model were not changed")?
-    {
-        return Err("Connection was not saved as requested; key and model were not changed");
+    if !profile_saved(app, &profile).await.map_err(|_| {
+        ConnectionSaveError::before_key(
+            "Unable to confirm saved connection; key and model were not changed",
+        )
+    })? {
+        return Err(ConnectionSaveError::before_key(
+            "Connection was not saved as requested; key and model were not changed",
+        ));
     }
+    let mut key_saved = false;
+    let mut reload_failed = false;
     if let Some(key) = key {
-        app.set_api_key_for_profile(profile.clone(), key)
-            .await
-            .map_err(|_| "Connection saved, but API key storage failed; model was not changed")?;
+        match app.set_api_key_for_profile(profile.clone(), key).await {
+            Ok(()) => key_saved = true,
+            Err(bone_app::Error::CredentialsSaved { .. }) => {
+                key_saved = true;
+                reload_failed = true;
+            }
+            Err(_) => {
+                return Err(ConnectionSaveError::before_key(
+                    "Connection saved, but API key storage failed; model was not changed",
+                ));
+            }
+        }
         // A different App may have edited the profile during credential work.
-        if !profile_saved(app, &profile).await.map_err(
-            |_| "API key saved, but connection verification failed; model was not changed",
-        )? {
-            return Err(
-                "Connection changed while saving the API key; verify its endpoint before retrying",
-            );
+        if !profile_saved(app, &profile)
+            .await
+            .map_err(|_| ConnectionSaveError {
+                message: "API key saved, but connection verification failed; model was not changed",
+                key_saved,
+            })?
+        {
+            return Err(ConnectionSaveError {
+                message: "Connection changed while saving the API key; verify its endpoint before retrying",
+                key_saved,
+            });
         }
     }
     if let Some(selection) = selection {
-        let scope = session.map_or(ConfigScope::Workspace(workspace), ConfigScope::Session);
-        app.update_config(scope, ConfigChange::Worker(Some(selection))).await
-            .map_err(|_| "Connection saved; model configuration may be saved but could not be applied. Review current settings")?;
+        let scope = selection_scope(workspace, session, workspace_default);
+        app.update_config(scope, ConfigChange::Model(Some(selection))).await
+            .map_err(|_| ConnectionSaveError {
+                message: "Connection saved; the model could not be applied. Select it again to retry",
+                key_saved,
+            })?;
+        reload_failed = false;
     }
     if reload_failed {
-        Err(
-            "Connection saved, but an existing session could not reload it. Review current settings",
-        )
+        return Err(ConnectionSaveError {
+            message: "API key saved, but running conversations did not reload. Select the model again to retry",
+            key_saved: true,
+        });
+    }
+    Ok(())
+}
+
+fn selection_scope(
+    workspace: WorkspaceId,
+    session: Option<SessionId>,
+    workspace_default: bool,
+) -> ConfigScope {
+    if workspace_default {
+        ConfigScope::Workspace(workspace)
     } else {
-        let mut notice = None;
-        if writes_key {
-            // The TUI owns sessions in this workspace. A saved key does not
-            // rebuild existing clients when their RuntimeConfig is unchanged.
-            if let Ok(sessions) = app.list_sessions(workspace).await {
-                for session in sessions {
-                    if let Ok(config) = app.resolved_config(session.id).await
-                        && config.running.as_ref().is_some_and(|running| {
-                            running.worker.selection.profile == profile.id
-                                || running.coordinator.selection.profile == profile.id
-                        })
-                    {
-                        notice = Some(
-                            "Credentials saved; running connections may still use the previous key. Restart the app to reload them.",
-                        );
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(notice)
+        session.map_or(ConfigScope::Workspace(workspace), ConfigScope::Session)
     }
 }
 
@@ -158,27 +202,8 @@ async fn profile_saved(app: &App, expected: &Profile) -> bone_app::Result<bool> 
         .any(|profile| profile == expected))
 }
 
-/// Explicit model names are validated by App's public type. They are not
-/// advertised as remotely verified: App currently exposes no model catalogue.
-pub(crate) async fn explicit(
-    app: &App,
-    profile: &str,
-    model: &str,
-) -> bone_app::Result<ModelChoice> {
-    let profiles = profiles(app).await?;
-    let profile = profiles
-        .iter()
-        .find(|saved| saved.id.as_str() == profile)
-        .ok_or_else(|| bone_app::Error::InvalidState("unknown saved profile".into()))?;
-    let selection = ModelSelection::new(profile.id.clone(), model)
-        .map_err(|error| bone_app::Error::InvalidState(error.to_string()))?;
-    Ok(ModelChoice {
-        selection,
-        profile_label: profile.label.clone(),
-    })
-}
-
-/// Most local choices first; retain model options when selecting saved entries.
+/// Every saved connection contributes its known models. A configured custom
+/// model is retained even when it is outside that catalogue.
 pub(crate) async fn load(
     app: &App,
     workspace: WorkspaceId,
@@ -186,19 +211,37 @@ pub(crate) async fn load(
 ) -> bone_app::Result<Vec<ModelChoice>> {
     let profiles = profiles(app).await?;
     let mut choices = Vec::new();
+    for profile in &profiles {
+        for preset in profile.model_presets() {
+            let mut selection =
+                ModelSelection::new(profile.id.clone(), preset.id).expect("built-in model preset");
+            if let Some(effort) = preset.default_reasoning {
+                selection.options = Some(bone_app::ModelOptions::OpenAiResponses {
+                    reasoning: bone_app::Reasoning::new().effort(effort),
+                });
+            }
+            choices.push(ModelChoice {
+                selection,
+                profile_label: provider_label(profile),
+                label: preset.label.into(),
+                note: preset.note.into(),
+                recommended: preset.recommended,
+            });
+        }
+    }
     if let Some(session) = session {
-        append(
+        append_custom(
             &mut choices,
             app.config(ConfigScope::Session(session)).await?.worker,
             &profiles,
         );
     }
-    append(
+    append_custom(
         &mut choices,
         app.config(ConfigScope::Workspace(workspace)).await?.worker,
         &profiles,
     );
-    append(
+    append_custom(
         &mut choices,
         app.config(ConfigScope::User).await?.worker,
         &profiles,
@@ -206,7 +249,21 @@ pub(crate) async fn load(
     Ok(choices)
 }
 
-fn append(choices: &mut Vec<ModelChoice>, selection: Option<ModelSelection>, profiles: &[Profile]) {
+fn provider_label(profile: &Profile) -> String {
+    match profile.endpoint {
+        bone_app::EndpointConfig::ChatGptSubscription => "ChatGPT".into(),
+        bone_app::EndpointConfig::OpenAiResponses { base_url: None }
+        | bone_app::EndpointConfig::OpenAiChatCompletions { base_url: None } => "OpenAI API".into(),
+        bone_app::EndpointConfig::AnthropicMessages { base_url: None } => "Anthropic API".into(),
+        _ => profile.label.clone(),
+    }
+}
+
+fn append_custom(
+    choices: &mut Vec<ModelChoice>,
+    selection: Option<ModelSelection>,
+    profiles: &[Profile],
+) {
     let Some(selection) = selection else { return };
     let Some(profile) = profiles
         .iter()
@@ -214,28 +271,34 @@ fn append(choices: &mut Vec<ModelChoice>, selection: Option<ModelSelection>, pro
     else {
         return;
     };
+    if !profile.model_presets().is_empty() {
+        return;
+    }
     if choices.iter().any(|choice| choice.selection == selection) {
         return;
     }
     choices.push(ModelChoice {
+        label: selection.model.clone(),
         selection,
-        profile_label: profile.label.clone(),
+        profile_label: provider_label(profile),
+        note: "Custom model".into(),
+        recommended: false,
     });
 }
 
-/// Only override this Session's worker. App owns persistence and runtime reload.
+/// Apply one model to both roles in this Session. App owns persistence and runtime reload.
 /// An App error may occur after persistence; callers must reload configuration
 /// rather than interpreting an error as proof that nothing was saved.
 pub(crate) async fn apply(
     app: &App,
     session: SessionId,
-    choice: &ModelChoice,
+    selection: &ModelSelection,
 ) -> bone_app::Result<RuntimeOverrides> {
     // Recheck a possibly stale menu before persisting a missing profile.
     if !profiles(app)
         .await?
         .iter()
-        .any(|profile| profile.id == choice.selection.profile)
+        .any(|profile| profile.id == selection.profile)
     {
         return Err(bone_app::Error::InvalidState(
             "unknown saved profile".into(),
@@ -243,7 +306,7 @@ pub(crate) async fn apply(
     }
     app.update_config(
         ConfigScope::Session(session),
-        ConfigChange::Worker(Some(choice.selection.clone())),
+        ConfigChange::Model(Some(selection.clone())),
     )
     .await
 }
@@ -254,16 +317,16 @@ mod tests {
     use bone_app::{AppOptions, ProfileId};
 
     #[test]
-    fn deduplication_preserves_distinct_options_and_omits_missing_profiles() {
+    fn unknown_models_for_curated_and_missing_profiles_are_omitted() {
         let profile = Profile::chatgpt();
         let selection = ModelSelection::new(profile.id.clone(), "configured-model").unwrap();
         let mut choices = Vec::new();
-        append(
+        append_custom(
             &mut choices,
             Some(selection.clone()),
             std::slice::from_ref(&profile),
         );
-        append(
+        append_custom(
             &mut choices,
             Some(selection.clone()),
             std::slice::from_ref(&profile),
@@ -275,28 +338,30 @@ mod tests {
             }))
             .unwrap(),
         );
-        append(
+        append_custom(
             &mut choices,
             Some(with_options.clone()),
             std::slice::from_ref(&profile),
         );
-        append(
+        append_custom(
             &mut choices,
             Some(ModelSelection::new(ProfileId::new("missing").unwrap(), "model").unwrap()),
             &[profile],
         );
-        assert_eq!(choices.len(), 2);
-        assert_eq!(choices[1].selection, with_options);
+        assert!(choices.is_empty());
     }
 
     #[tokio::test]
-    async fn public_app_configuration_round_trip_is_scoped_and_has_no_fake_models() {
+    async fn load_combines_saved_connection_presets_with_the_selected_custom_model() {
         let root = tempfile::tempdir().unwrap();
         let app = App::open(AppOptions::new(root.path().join("data")))
             .await
             .unwrap();
         let workspace = app.open_workspace(root.path()).await.unwrap();
-        assert!(load(&app, workspace.id, None).await.unwrap().is_empty());
+        let initial = load(&app, workspace.id, None).await.unwrap();
+        assert!(initial.iter().any(|choice| {
+            choice.selection.profile == ProfileId::chatgpt() && choice.recommended
+        }));
         assert_eq!(
             facts(&app, workspace.id, None)
                 .await
@@ -304,56 +369,29 @@ mod tests {
                 .and_then(ModelFacts::saved_model_label),
             None
         );
-        assert!(explicit(&app, "missing", "model").await.is_err());
-        app.save_profile(Profile::chatgpt()).await.unwrap();
-        assert!(explicit(&app, "chatgpt", " ").await.is_err());
-        let global = explicit(&app, "chatgpt", "configured-global")
-            .await
-            .unwrap();
+        let custom = Profile::new(
+            ProfileId::new("custom-api").unwrap(),
+            "Custom API",
+            bone_app::EndpointConfig::OpenAiResponses {
+                base_url: Some("https://example.invalid/v1".into()),
+            },
+        )
+        .unwrap();
+        app.save_profile(custom.clone()).await.unwrap();
+        let selection = ModelSelection::new(custom.id, "private-model").unwrap();
         app.update_config(
-            ConfigScope::User,
-            ConfigChange::Worker(Some(global.selection.clone())),
+            ConfigScope::Workspace(workspace.id),
+            ConfigChange::Model(Some(selection.clone())),
         )
         .await
         .unwrap();
-        let session = app
-            .create_session(workspace.id, "model test")
-            .await
+        let choices = load(&app, workspace.id, None).await.unwrap();
+        let selected = choices
+            .iter()
+            .find(|choice| choice.selection == selection)
             .unwrap();
-        let coordinator =
-            ModelSelection::new(ProfileId::chatgpt(), "configured-coordinator").unwrap();
-        app.update_config(
-            ConfigScope::Session(session.id()),
-            ConfigChange::Coordinator(Some(coordinator.clone())),
-        )
-        .await
-        .unwrap();
-        let selected = explicit(&app, "chatgpt", "explicit-local").await.unwrap();
-        let saved = apply(&app, session.id(), &selected).await.unwrap();
-        assert_eq!(saved.worker.as_ref(), Some(&selected.selection));
-        assert_eq!(
-            facts(&app, workspace.id, Some(session.id()))
-                .await
-                .as_ref()
-                .and_then(ModelFacts::saved_model_label),
-            Some("explicit-local")
-        );
-        assert_eq!(
-            facts(&app, workspace.id, None)
-                .await
-                .as_ref()
-                .and_then(ModelFacts::saved_model_label),
-            Some("configured-global")
-        );
-        assert_eq!(saved.coordinator, Some(coordinator));
-        assert_eq!(
-            app.config(ConfigScope::User).await.unwrap().worker,
-            Some(global.selection.clone())
-        );
-        assert_eq!(
-            load(&app, workspace.id, Some(session.id())).await.unwrap(),
-            vec![selected, global]
-        );
+        assert_eq!(selected.label, "private-model");
+        assert_eq!(selected.note, "Custom model");
         app.shutdown().await.unwrap();
     }
 }
@@ -373,19 +411,35 @@ mod connection_tests {
         .unwrap()
     }
 
+    #[test]
+    fn first_model_uses_workspace_scope_even_when_a_conversation_is_open() {
+        let workspace = WorkspaceId::new();
+        let session = SessionId::new();
+        assert_eq!(
+            selection_scope(workspace, Some(session), true),
+            ConfigScope::Workspace(workspace)
+        );
+        assert_eq!(
+            selection_scope(workspace, Some(session), false),
+            ConfigScope::Session(session)
+        );
+    }
+
     #[tokio::test]
-    async fn secret_free_connection_round_trip_updates_only_requested_scope() {
+    async fn connection_round_trip_updates_only_requested_scope() {
         let root = tempfile::tempdir().unwrap();
         let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
             .await
             .unwrap();
         let workspace = app.open_workspace(root.path()).await.unwrap();
         let profile = profile();
+        app.save_profile(profile.clone()).await.unwrap();
         let selection = ModelSelection::new(profile.id.clone(), "user-entered-model").unwrap();
         save_connection(
             &app,
             workspace.id,
             None,
+            false,
             profile.clone(),
             None,
             Some(selection.clone()),
@@ -421,14 +475,15 @@ mod connection_tests {
             &app,
             workspace.id,
             None,
+            false,
             profile.clone(),
             None,
             Some(selection),
         )
         .await;
         assert_eq!(
-            result,
-            Err("Model and connection identities differ; nothing was saved")
+            result.unwrap_err().message,
+            "Model and connection identities differ; nothing was saved"
         );
         assert!(!profile_saved(&app, &profile).await.unwrap());
         app.shutdown().await.unwrap();
@@ -447,12 +502,13 @@ mod connection_tests {
             &app,
             workspace.id,
             Some(SessionId::new()),
+            false,
             profile.clone(),
             None,
             Some(selection),
         )
         .await;
-        assert!(result.unwrap_err().starts_with("Connection saved;"));
+        assert!(result.unwrap_err().message.starts_with("Connection saved;"));
         assert!(profile_saved(&app, &profile).await.unwrap());
         app.shutdown().await.unwrap();
     }

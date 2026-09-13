@@ -2538,6 +2538,189 @@ async fn config_changes_apply_to_the_running_runtime() {
 }
 
 #[tokio::test]
+async fn model_change_and_explicit_reload_reconnect_an_equal_runtime() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session(workspace.id, "Model reconnect")
+        .await
+        .unwrap();
+    let receipt = session.submit(SubmitInput::new("start")).await.unwrap();
+    assert_completed(wait_for_input(&session, receipt.input).await);
+    let RuntimeState::Running { id, config } = session.snapshot().await.unwrap().runtime else {
+        panic!("runtime did not start")
+    };
+    let selected = ModelSelection::new(ProfileId::new("test").unwrap(), "test-model").unwrap();
+    assert_eq!(config.worker.selection, selected);
+    assert_eq!(config.coordinator.selection, selected);
+
+    let saved = app
+        .update_config(
+            ConfigScope::Session(session.id()),
+            ConfigChange::Model(Some(selected.clone())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.worker, Some(selected.clone()));
+    assert_eq!(saved.coordinator, Some(selected));
+
+    session.reload_config().await.unwrap();
+    let reconfigurations = session
+        .history(SessionSeq(0), 32)
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.event,
+                SessionEvent::RuntimeReconfigured { runtime, config }
+                    if *runtime == id
+                        && config.worker.selection.model == "test-model"
+                        && config.coordinator.selection.model == "test-model"
+            )
+        })
+        .count();
+    assert_eq!(
+        reconfigurations, 2,
+        "both a model selection and explicit reload must cross the runtime connection boundary"
+    );
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn workspace_model_change_does_not_force_a_shadowed_session_to_reconnect() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session(workspace.id, "Shadowed model")
+        .await
+        .unwrap();
+    let selected = ModelSelection::new(ProfileId::new("test").unwrap(), "test-model").unwrap();
+    app.update_config(
+        ConfigScope::Session(session.id()),
+        ConfigChange::Model(Some(selected)),
+    )
+    .await
+    .unwrap();
+    let receipt = session.submit(SubmitInput::new("start")).await.unwrap();
+    assert_completed(wait_for_input(&session, receipt.input).await);
+    let before = session
+        .history(SessionSeq(0), 32)
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .filter(|entry| matches!(entry.event, SessionEvent::RuntimeReconfigured { .. }))
+        .count();
+
+    app.update_config(
+        ConfigScope::Workspace(workspace.id),
+        ConfigChange::Model(Some(
+            ModelSelection::new(ProfileId::new("test").unwrap(), "workspace-model").unwrap(),
+        )),
+    )
+    .await
+    .unwrap();
+
+    let after = session
+        .history(SessionSeq(0), 32)
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .filter(|entry| matches!(entry.event, SessionEvent::RuntimeReconfigured { .. }))
+        .count();
+    assert_eq!(after, before);
+    assert_eq!(
+        app.resolved_config(session.id())
+            .await
+            .unwrap()
+            .desired
+            .unwrap()
+            .worker
+            .selection
+            .model,
+        "test-model"
+    );
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn model_change_is_validated_before_either_role_is_persisted() {
+    let (_temporary, app, _workspace) = configured_app().await;
+    let before = app.config(ConfigScope::User).await.unwrap();
+    let invalid = ModelSelection {
+        profile: ProfileId::new("test").unwrap(),
+        model: "invalid\nmodel".into(),
+        options: None,
+    };
+
+    assert!(matches!(
+        app.update_config(ConfigScope::User, ConfigChange::Model(Some(invalid)))
+            .await,
+        Err(Error::InvalidState(_))
+    ));
+    assert_eq!(app.config(ConfigScope::User).await.unwrap(), before);
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn chatgpt_model_preflight_is_atomic_before_any_session_exists() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace_root = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace_root).unwrap();
+    let credentials =
+        crate::credentials::ChatGptCredentials::at(temporary.path().join("chatgpt-credentials"))
+            .unwrap();
+    let providers = ProviderConnector::with_chatgpt_credentials(credentials.clone());
+    let app =
+        App::with_provider_connector(AppOptions::new(temporary.path().join("data")), providers)
+            .await
+            .unwrap();
+    let workspace = app.open_workspace(workspace_root).await.unwrap();
+    let scope = ConfigScope::Workspace(workspace.id);
+
+    let old_worker = ModelSelection::new(ProfileId::chatgpt(), "old-worker").unwrap();
+    let old_coordinator = ModelSelection::new(ProfileId::chatgpt(), "old-coordinator").unwrap();
+    app.update_config(scope, ConfigChange::Worker(Some(old_worker.clone())))
+        .await
+        .unwrap();
+    app.update_config(
+        scope,
+        ConfigChange::Coordinator(Some(old_coordinator.clone())),
+    )
+    .await
+    .unwrap();
+    let before = app.config(scope).await.unwrap();
+
+    let selected = ModelSelection::new(ProfileId::chatgpt(), "gpt-5.4").unwrap();
+    assert!(matches!(
+        app.update_config(scope, ConfigChange::Model(Some(selected.clone())))
+            .await,
+        Err(Error::LoginRequired(profile)) if profile == ProfileId::chatgpt()
+    ));
+    assert_eq!(app.config(scope).await.unwrap(), before);
+    assert_eq!(before.worker, Some(old_worker));
+    assert_eq!(before.coordinator, Some(old_coordinator));
+
+    let auth = credentials.acquire().unwrap();
+    std::fs::write(
+        auth.auth_file(),
+        br#"{"access_token":"offline-test-token","expires_at":4102444800,"account_id":"offline-account"}"#,
+    )
+    .unwrap();
+    drop(auth);
+
+    let saved = app
+        .update_config(scope, ConfigChange::Model(Some(selected.clone())))
+        .await
+        .unwrap();
+    assert_eq!(saved.worker, Some(selected.clone()));
+    assert_eq!(saved.coordinator, Some(selected));
+    assert_eq!(app.config(scope).await.unwrap(), saved);
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn workspace_config_only_reconfigures_sessions_in_that_workspace() {
     let (temporary, app, first_workspace) = configured_app().await;
     let second_root = temporary.path().join("other-workspace");
@@ -2697,7 +2880,7 @@ async fn an_unusable_live_config_is_not_reported_as_applied() {
 }
 
 #[tokio::test]
-async fn reload_config_recovers_after_credentials_are_repaired() {
+async fn login_recovers_sessions_after_credentials_are_repaired() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace_root = temporary.path().join("workspace");
     std::fs::create_dir(&workspace_root).unwrap();
@@ -2760,7 +2943,20 @@ async fn reload_config_recovers_after_credentials_are_repaired() {
     )
     .unwrap();
     drop(auth);
-    session.reload_config().await.unwrap();
+    let login = app.login(profile_id.clone()).await.unwrap();
+    let mut login_states = login.observe();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match login_states.borrow().as_ref() {
+                LoginState::Succeeded => return,
+                LoginState::Failed { message } => panic!("login failed: {message}"),
+                _ => {}
+            }
+            login_states.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("login should refresh blocked sessions");
 
     let resumed = tokio::time::timeout(Duration::from_secs(3), async {
         let mut cursor = SessionSeq(0);
@@ -2782,7 +2978,7 @@ async fn reload_config_recovers_after_credentials_are_repaired() {
     .await;
     assert!(
         resumed.is_ok(),
-        "reloading the unchanged desired configuration should resume the input: {:?}",
+        "login should resume the unchanged desired configuration: {:?}",
         session.snapshot().await.unwrap()
     );
 

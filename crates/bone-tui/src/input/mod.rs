@@ -143,9 +143,9 @@ fn model_list_panel() -> crate::state::Panel {
 
 #[cfg(test)]
 fn model_setup_panel() -> crate::state::Panel {
-    model_panel(crate::state::ModelScreen::Setup(
-        crate::state::ConnectionForm::new(crate::state::ConnectionKind::OpenAiResponses),
-    ))
+    model_panel(crate::state::ModelScreen::Setup(Box::new(
+        crate::state::ConnectionForm::new(crate::state::ConnectionKind::OpenAiApi),
+    )))
 }
 
 #[cfg(test)]

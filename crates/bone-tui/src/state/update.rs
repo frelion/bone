@@ -36,8 +36,8 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             request,
             session,
             error,
-            notice,
-        } => panel::connection_saved(state, request, session, error, notice, &mut effects),
+            key_saved,
+        } => panel::connection_saved(state, request, session, error, key_saved, &mut effects),
 
         UiEvent::LoginChanged {
             request,
@@ -47,11 +47,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             session,
             request,
             facts,
-        } => {
-            if state.selected == session && state.model_facts_request == request {
-                state.model_facts = facts;
-            }
-        }
+        } => panel::model_facts_loaded(state, session, request, facts),
         UiEvent::ModelsFailed {
             session,
             request,
@@ -68,7 +64,16 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             request,
             facts,
             error,
-        } => panel::model_applied(state, session, request, facts, error, &mut effects),
+            login_required,
+        } => panel::model_applied(
+            state,
+            session,
+            request,
+            facts,
+            error,
+            login_required,
+            &mut effects,
+        ),
         UiEvent::Action(action) => handle_action(state, action, &mut effects),
         UiEvent::WorkspaceOpened {
             label,
@@ -660,7 +665,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
             panel::move_setup_field(state, matches!(action, Action::NextField));
         }
         Action::SelectField(field) => panel::select_setup_field(state, field),
-        Action::ChooseConnectionKind(index) => panel::choose_connection_kind(state, index),
+        Action::ChooseConnection(index) => panel::choose_connection(state, index, effects),
         Action::SaveConnection => panel::save_connection(state, effects),
         Action::ActivatePanel => panel::activate(state, effects),
         Action::ScrollPanel { amount, max } => panel::scroll_reader(state, amount, max),
@@ -1221,19 +1226,9 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             }
         }
 
-        CommandKind::Model => {
-            let parts: Vec<_> = argument.split_whitespace().collect();
-            if parts.is_empty() {
-                clear_current_draft(state, effects);
-                panel::open_models(state, effects);
-            } else if parts.len() == 2 {
-                let profile = parts[0].to_owned();
-                let model = parts[1].to_owned();
-                clear_current_draft(state, effects);
-                panel::set_named_model(state, profile, model, effects);
-            } else {
-                set_selection_status(state, "Usage: /model [profile model]");
-            }
+        CommandKind::Model if argument.is_empty() => {
+            clear_current_draft(state, effects);
+            panel::open_models(state, effects);
         }
         CommandKind::Details if argument.is_empty() => {
             clear_current_draft(state, effects);
@@ -1335,10 +1330,14 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             dispatch_title_writes(state.titles.flush_for_exit(), effects);
             effects.push(Effect::Shutdown);
         }
-        _ => set_selection_status(
-            state,
-            format!("Usage: /{} {}", selected.name, selected.usage),
-        ),
+        _ => {
+            let usage = if selected.usage.is_empty() {
+                format!("Usage: /{}", selected.name)
+            } else {
+                format!("Usage: /{} {}", selected.name, selected.usage)
+            };
+            set_selection_status(state, usage);
+        }
     }
 }
 
@@ -1702,6 +1701,37 @@ mod tests {
     }
 
     #[test]
+    fn model_command_has_one_argument_free_entry_point() {
+        let mut state = UiState::default();
+        update(&mut state, UiEvent::Action(test_insert("/model")));
+
+        let effects = update(&mut state, UiEvent::Action(Action::Submit));
+
+        assert!(matches!(state.panel, Some(Panel::Models(_))));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::LoadModelFacts { .. }, Effect::LoadModels { .. }]
+        ));
+        assert!(state.draft().is_empty());
+    }
+
+    #[test]
+    fn model_command_rejects_the_removed_named_model_grammar() {
+        let mut state = UiState::default();
+        update(
+            &mut state,
+            UiEvent::Action(test_insert("/model chatgpt hidden-id")),
+        );
+
+        let effects = update(&mut state, UiEvent::Action(Action::Submit));
+
+        assert!(effects.is_empty());
+        assert!(state.panel.is_none());
+        assert_eq!(state.status_text(), Some("Usage: /model"));
+        assert_eq!(state.draft(), "/model chatgpt hidden-id");
+    }
+
+    #[test]
     fn command_hint_starts_slash_only_for_an_empty_composer() {
         let mut state = UiState::default();
         state.set_focus(Focus::Sessions);
@@ -1900,10 +1930,10 @@ mod async_identity_tests {
 
         assert!(effects.is_empty());
         assert_eq!(state.model_label(), Some("workspace-model"));
-        assert_eq!(state.model_footer(), "workspace-model · saved");
+        assert_eq!(state.model_footer(), "workspace-model · workspace");
         assert_eq!(
             state.model_configuration_summary(),
-            "Saved: chatgpt/workspace-model"
+            "Workspace model: workspace-model"
         );
     }
 
@@ -1928,7 +1958,7 @@ mod async_identity_tests {
         assert_eq!(state.model_footer(), "Select model");
         assert_eq!(
             state.model_configuration_summary(),
-            "Saved configuration needs attention"
+            "Model setup needs attention"
         );
     }
 
@@ -2607,7 +2637,8 @@ mod panel_draft_tests {
                 );
                 let add = 0;
                 update(&mut state, UiEvent::Action(Action::SelectModel(add)));
-                update(&mut state, UiEvent::Action(Action::ChooseConnectionKind(0)));
+                update(&mut state, UiEvent::Action(Action::ChooseConnection(3)));
+                update(&mut state, UiEvent::Action(Action::ChooseConnection(0)));
                 update(&mut state, UiEvent::Action(Action::SetupClear));
                 update(
                     &mut state,
@@ -2629,6 +2660,8 @@ mod panel_draft_tests {
                         ..
                     })) if form.label.is_empty()
                 ));
+                update(&mut state, UiEvent::Action(Action::Escape));
+                update(&mut state, UiEvent::Action(Action::Escape));
                 update(&mut state, UiEvent::Action(Action::Escape));
                 assert!(matches!(state.panel, Some(Panel::Models(_))));
             }

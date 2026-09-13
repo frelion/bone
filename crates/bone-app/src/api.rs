@@ -835,7 +835,7 @@ pub struct AppOptions {
     pub data_dir: PathBuf,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum LoginState {
     Connecting,
     DeviceCode {
@@ -847,6 +847,27 @@ pub enum LoginState {
         message: String,
     },
     Cancelled,
+}
+
+impl std::fmt::Debug for LoginState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connecting => formatter.write_str("Connecting"),
+            Self::DeviceCode {
+                verification_uri, ..
+            } => formatter
+                .debug_struct("DeviceCode")
+                .field("verification_uri", verification_uri)
+                .field("user_code", &"[redacted]")
+                .finish(),
+            Self::Succeeded => formatter.write_str("Succeeded"),
+            Self::Failed { message } => formatter
+                .debug_struct("Failed")
+                .field("message", message)
+                .finish(),
+            Self::Cancelled => formatter.write_str("Cancelled"),
+        }
+    }
 }
 
 impl AppOptions {
@@ -898,4 +919,22 @@ pub(crate) fn default_view(info: SessionInfo) -> Arc<SessionView> {
         history_through: SessionSeq(0),
         problem: None,
     })
+}
+
+#[cfg(test)]
+mod login_state_tests {
+    use super::LoginState;
+
+    #[test]
+    fn device_code_debug_is_redacted() {
+        let state = LoginState::DeviceCode {
+            verification_uri: "https://example.test/device".into(),
+            user_code: "SECRET-CODE".into(),
+        };
+
+        let debug = format!("{state:?}");
+        assert!(debug.contains("https://example.test/device"));
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("SECRET-CODE"));
+    }
 }

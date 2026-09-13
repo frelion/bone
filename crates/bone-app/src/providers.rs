@@ -142,6 +142,36 @@ impl ProviderConnector {
         }))
     }
 
+    /// Prove that one model can be constructed from its saved connection
+    /// without starting a Session or an interactive sign-in flow.
+    pub(crate) async fn prepare_model(
+        &self,
+        model: &ResolvedModel,
+    ) -> Result<(), ProviderConnectError> {
+        validate_profile(&model.profile)?;
+        if model.selection.profile != model.profile.id {
+            return Err(ProviderConnectError::InvalidProfile(
+                model.profile.id.clone(),
+            ));
+        }
+        model
+            .selection
+            .validate()
+            .map_err(|_| ProviderConnectError::InvalidModel(model.profile.id.clone()))?;
+
+        let chatgpt = if matches!(model.profile.endpoint, EndpointConfig::ChatGptSubscription) {
+            Some(self.connect_chatgpt().await?)
+        } else {
+            None
+        };
+        let mut endpoints = HashMap::new();
+        #[cfg(test)]
+        endpoints.extend(self.test_endpoints.clone());
+        self.configured_model(model, chatgpt.as_deref(), &mut endpoints)
+            .await?;
+        Ok(())
+    }
+
     /// The caller owns cancellation by dropping this future and exposes the
     /// callback only through its short-lived login state.
     pub(crate) async fn login<F>(
@@ -166,6 +196,16 @@ impl ProviderConnector {
             .map_err(|_| ProviderConnectError::Busy(profile.id.clone()))?;
         if state.closed {
             return Err(ProviderConnectError::Closed);
+        }
+        if state
+            .connection
+            .as_ref()
+            .is_some_and(|connection| Arc::strong_count(connection) > 1)
+        {
+            // A live runtime already holds an authenticated connection. Login
+            // is idempotent in that state; replacing its credentials would
+            // invalidate work that still owns the connection.
+            return Ok(());
         }
         state.release_idle(&profile.id)?;
         let auth = acquire_chatgpt(&mut state).await?;
@@ -543,6 +583,39 @@ mod tests {
         let first = first.unwrap();
         let second = second.unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn model_preflight_reuses_a_live_chatgpt_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let credentials = ChatGptCredentials::at(directory.path().join("credentials")).unwrap();
+        let lease = credentials.acquire().unwrap();
+        std::fs::write(
+            lease.auth_file(),
+            br#"{"access_token":"offline-test-token","expires_at":4102444800,"account_id":"offline-account"}"#,
+        )
+        .unwrap();
+        drop(lease);
+        let connector = ProviderConnector::with_chatgpt_credentials(credentials);
+        let resolved = ResolvedModel {
+            selection: crate::config::ModelSelection::new(ProfileId::chatgpt(), "gpt-5.4").unwrap(),
+            profile: Profile::chatgpt(),
+        };
+        let runtime = RuntimeConfig {
+            coordinator: resolved.clone(),
+            worker: resolved.clone(),
+            limits: bone_core::AgentLimits::default(),
+            tools: crate::config::ToolSettings::default(),
+            workspace: directory.path().to_path_buf(),
+        };
+
+        let live_runtime = connector.connect(&runtime).await.unwrap();
+        connector.prepare_model(&resolved).await.unwrap();
+        connector.prepare_model(&resolved).await.unwrap();
+        connector.login(&Profile::chatgpt(), |_| {}).await.unwrap();
+
+        drop(live_runtime);
+        connector.close().await.unwrap();
     }
 
     #[tokio::test]

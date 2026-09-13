@@ -434,7 +434,7 @@ impl Kernel {
                         JobState::Waiting(WaitState::Commit(pending));
                 } else {
                     let inputs = self.jobs[&job].inputs.clone();
-                    self.record(
+                    let reply = self.record(
                         Origin::Job {
                             job,
                             revision: self.jobs[&job].revision,
@@ -442,6 +442,7 @@ impl Kernel {
                         RecordBody::Reply { job, inputs, text },
                         effects,
                     );
+                    self.attach(job, reply.seq);
                     self.make_ready(job);
                 }
             }

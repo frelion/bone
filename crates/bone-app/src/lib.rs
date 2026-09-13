@@ -25,7 +25,10 @@ pub use error::{Error, Result};
 pub use session::Session;
 
 pub use bone_adapters::{
-    llm::{EndpointConfig, ModelOptions},
+    llm::{
+        EndpointConfig, ModelOptions,
+        protocol::openai_responses::{Reasoning, ReasoningEffort},
+    },
     tools::ToolLimits,
 };
 pub use bone_core::{

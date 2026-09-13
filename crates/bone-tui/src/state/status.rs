@@ -4,6 +4,7 @@ use bone_app::{RequestId, SessionId};
 pub(crate) struct Status {
     text: String,
     owner: Owner,
+    error: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,11 +26,16 @@ impl Status {
         Self {
             text: text.into(),
             owner,
+            error: true,
         }
     }
 
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    pub(crate) fn is_error(&self) -> bool {
+        self.error
     }
 
     pub(crate) fn title_edit(session: SessionId, text: impl Into<String>) -> Self {
@@ -66,6 +72,12 @@ impl Status {
 
     pub(crate) fn selection(session: Option<SessionId>, text: impl Into<String>) -> Self {
         Self::owned(Owner::Selection(session), text)
+    }
+
+    pub(crate) fn selection_notice(session: Option<SessionId>, text: impl Into<String>) -> Self {
+        let mut status = Self::owned(Owner::Selection(session), text);
+        status.error = false;
+        status
     }
 
     pub(crate) fn create(request: RequestId, text: impl Into<String>) -> Self {

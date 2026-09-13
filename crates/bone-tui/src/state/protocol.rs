@@ -29,7 +29,7 @@ pub enum Action {
     PreviousField,
     SelectField(super::SetupField),
     SaveConnection,
-    ChooseConnectionKind(usize),
+    ChooseConnection(usize),
     Edit {
         target: EditorTarget,
         command: EditCommand,
@@ -87,7 +87,7 @@ pub enum UiEvent {
         request: u64,
         session: Option<SessionId>,
         error: Option<String>,
-        notice: Option<String>,
+        key_saved: bool,
     },
     LoginChanged {
         request: u64,
@@ -114,6 +114,7 @@ pub enum UiEvent {
         request: u64,
         facts: Option<super::ModelFacts>,
         error: Option<String>,
+        login_required: bool,
     },
 
     Action(Action),
@@ -235,6 +236,7 @@ pub enum Effect {
     SaveConnection {
         request: u64,
         session: Option<SessionId>,
+        workspace_default: bool,
         profile: bone_app::Profile,
         key: Option<super::SecretText>,
         selection: Option<bone_app::ModelSelection>,
@@ -255,15 +257,9 @@ pub enum Effect {
     SetModel {
         session: Option<SessionId>,
         request: u64,
+        workspace_default: bool,
         selection: bone_app::ModelSelection,
     },
-    SetNamedModel {
-        session: Option<SessionId>,
-        request: u64,
-        profile: String,
-        model: String,
-    },
-
     OpenSession {
         session: SessionId,
         generation: u64,

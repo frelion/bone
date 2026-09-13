@@ -303,6 +303,7 @@ async fn preserves_tool_calls_and_replays_their_provider_ids_opaquely() {
     let first_body: Value = serde_json::from_slice(&transport.requests()[0].body)
         .expect("tool request body should be JSON");
     assert_eq!(first_body["tools"][0]["name"], "inspect_path");
+    assert_eq!(first_body["tools"][0]["strict"], true);
     assert_eq!(first_body["tool_choice"]["name"], "inspect_path");
 
     let replay = response

@@ -306,9 +306,9 @@ mod tests {
 
     fn setup_panel() -> Panel {
         let mut models = crate::state::ModelPanel::new(None);
-        models.screen = ModelScreen::Setup(crate::state::ConnectionForm::new(
-            crate::state::ConnectionKind::OpenAiResponses,
-        ));
+        models.screen = ModelScreen::Setup(Box::new(crate::state::ConnectionForm::new(
+            crate::state::ConnectionKind::OpenAiApi,
+        )));
         Panel::Models(models)
     }
 

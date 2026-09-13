@@ -1,4 +1,4 @@
-use bone_app::{LoginState, Profile, SessionId, SessionSeq};
+use bone_app::{LoginState, ModelSelection, Profile, SessionId, SessionSeq};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
@@ -34,13 +34,17 @@ pub(crate) struct ModelPanel {
     pub(crate) choices: Vec<ModelChoice>,
     pub(crate) profiles: Vec<Profile>,
     pub(crate) screen: ModelScreen,
+    pub(crate) pending_selection: Option<ModelSelection>,
 }
 
 #[derive(Debug)]
 pub(crate) enum ModelScreen {
     List { selected: usize },
+    Reasoning { model: usize, selected: usize },
     Add { selected: usize },
-    Setup(ConnectionForm),
+    Advanced { selected: usize },
+    Manage { selected: usize },
+    Setup(Box<ConnectionForm>),
     Login { request: u64, state: LoginState },
 }
 
@@ -64,11 +68,34 @@ impl ModelPanel {
             choices: Vec::new(),
             profiles: Vec::new(),
             screen: ModelScreen::List { selected: 0 },
+            pending_selection: None,
         }
     }
 
     pub(crate) fn row_count(&self) -> usize {
-        self.choices.len() + self.profiles.len() + 1
+        match &self.screen {
+            ModelScreen::List { .. } => self.choices.len() + 2,
+            ModelScreen::Reasoning { model, .. } => self.reasoning_efforts(*model).len(),
+            ModelScreen::Add { .. } => 4,
+            ModelScreen::Advanced { .. } => ConnectionKind::ADVANCED.len(),
+            ModelScreen::Manage { .. } => self.profiles.len(),
+            ModelScreen::Setup(_) | ModelScreen::Login { .. } => 0,
+        }
+    }
+
+    pub(crate) fn preset(&self, choice: usize) -> Option<&'static bone_app::ModelPreset> {
+        let choice = self.choices.get(choice)?;
+        self.profiles
+            .iter()
+            .find(|profile| profile.id == choice.selection.profile)?
+            .model_presets()
+            .iter()
+            .find(|preset| preset.id == choice.selection.model)
+    }
+
+    pub(crate) fn reasoning_efforts(&self, choice: usize) -> &'static [bone_app::ReasoningEffort] {
+        self.preset(choice)
+            .map_or(&[], |preset| preset.supported_reasoning)
     }
 
     pub(crate) fn setup(&self) -> Option<&ConnectionForm> {
@@ -93,30 +120,10 @@ pub(super) fn open_models(state: &mut UiState, effects: &mut Vec<Effect>) {
     let session = state.selected;
     state.status = None;
     replace(state, Panel::Models(ModelPanel::new(session)), effects);
+    if state.model_facts.is_none() {
+        request_model_facts(state, effects);
+    }
     load_models(state, session, effects);
-}
-
-pub(super) fn set_named_model(
-    state: &mut UiState,
-    profile: String,
-    model: String,
-    effects: &mut Vec<Effect>,
-) {
-    let session = state.selected;
-    state.status = None;
-    replace(state, Panel::Models(ModelPanel::new(session)), effects);
-    let request = state.generation();
-    state.model_operation = Some(ModelOperation {
-        session,
-        request,
-        kind: ModelOperationKind::Apply,
-    });
-    effects.push(Effect::SetNamedModel {
-        session,
-        request,
-        profile,
-        model,
-    });
 }
 
 pub(super) fn open_help(state: &mut UiState, effects: &mut Vec<Effect>) {
@@ -150,6 +157,33 @@ fn request_model_facts(state: &mut UiState, effects: &mut Vec<Effect>) {
     });
 }
 
+pub(super) fn model_facts_loaded(
+    state: &mut UiState,
+    session: Option<SessionId>,
+    request: u64,
+    facts: Option<ModelFacts>,
+) {
+    if state.selected != session || state.model_facts_request != request {
+        return;
+    }
+    state.model_facts = facts;
+    let needs_model = matches!(
+        state.model_facts.as_ref().map(|facts| &facts.saved),
+        Some(Err(bone_app::ConfigProblem::NeedsModel))
+    );
+    let models_are_loading = state.model_operation.is_some_and(|operation| {
+        operation.session == session && operation.kind == ModelOperationKind::Load
+    });
+    if needs_model
+        && !models_are_loading
+        && let Some(Panel::Models(models)) = &mut state.panel
+        && models.session == session
+        && matches!(models.screen, ModelScreen::List { .. })
+    {
+        models.screen = ModelScreen::Add { selected: 0 };
+    }
+}
+
 pub(super) fn models_loaded(
     state: &mut UiState,
     session: Option<SessionId>,
@@ -167,6 +201,19 @@ pub(super) fn models_loaded(
     if state.selected != session {
         return;
     }
+    let first_use = matches!(
+        state.model_facts.as_ref().map(|facts| &facts.saved),
+        Some(Err(bone_app::ConfigProblem::NeedsModel))
+    );
+    let preferred = state
+        .running_model()
+        .or_else(|| {
+            state
+                .model_facts
+                .as_ref()
+                .and_then(|facts| facts.saved.as_ref().ok())
+        })
+        .map(|model| model.selection.clone());
     let Some(Panel::Models(models)) = &mut state.panel else {
         return;
     };
@@ -175,9 +222,21 @@ pub(super) fn models_loaded(
     }
     models.choices = choices;
     models.profiles = profiles;
+    if first_use && matches!(models.screen, ModelScreen::List { .. }) {
+        models.screen = ModelScreen::Add { selected: 0 };
+        return;
+    }
     let row_count = models.row_count();
     if let ModelScreen::List { selected } = &mut models.screen {
-        *selected = (*selected).min(row_count.saturating_sub(1));
+        *selected = preferred
+            .as_ref()
+            .and_then(|selection| {
+                models
+                    .choices
+                    .iter()
+                    .position(|choice| same_model(&choice.selection, selection))
+            })
+            .unwrap_or_else(|| (*selected).min(row_count.saturating_sub(1)));
     }
 }
 
@@ -212,6 +271,7 @@ pub(super) fn model_applied(
     request: u64,
     facts: Option<ModelFacts>,
     error: Option<String>,
+    login_required: bool,
     effects: &mut Vec<Effect>,
 ) {
     let current = state
@@ -230,17 +290,45 @@ pub(super) fn model_applied(
         }
         return;
     }
-    let matching_list = matches!(
+    let matching_panel = matches!(
         &state.panel,
         Some(Panel::Models(models))
-            if models.session == session && matches!(models.screen, ModelScreen::List { .. })
+            if models.session == session
     );
     let failed = error.is_some();
     state.model_facts_request = state.generation();
     state.model_facts = facts;
-    if matching_list || state.panel.is_none() {
+    if login_required && matching_panel {
+        let Some(panel) = state.panel.take() else {
+            return;
+        };
+        let Panel::Models(models) = panel else {
+            unreachable!()
+        };
+        if let Some(selection) = models.pending_selection.clone() {
+            start_model_login(state, models, selection, effects);
+        } else {
+            state.panel = Some(Panel::Models(models));
+            state.status = Some(Status::panel_request(
+                session,
+                request,
+                "ChatGPT needs authorization",
+            ));
+        }
+        return;
+    }
+    if matching_panel || state.panel.is_none() {
         if let Some(error) = error {
-            state.status = Some(Status::panel_request(session, request, error));
+            let message = format!("Model switch failed: {error}");
+            state.status = Some(Status::panel_request(session, request, message.clone()));
+            if let Some(Panel::Models(models)) = &mut state.panel
+                && matches!(models.screen, ModelScreen::Login { .. })
+            {
+                models.screen = ModelScreen::Login {
+                    request,
+                    state: LoginState::Failed { message },
+                };
+            }
         } else if state
             .status
             .as_ref()
@@ -249,11 +337,7 @@ pub(super) fn model_applied(
             state.status = None;
         }
     }
-    if failed {
-        if matching_list {
-            load_models(state, session, effects);
-        }
-    } else if matching_list {
+    if !failed && matching_panel {
         dismiss(state, effects);
     }
 }
@@ -263,7 +347,7 @@ pub(super) fn connection_saved(
     request: u64,
     session: Option<SessionId>,
     error: Option<String>,
-    notice: Option<String>,
+    key_saved: bool,
     effects: &mut Vec<Effect>,
 ) {
     let Some(panel) = state.panel.take() else {
@@ -291,15 +375,19 @@ pub(super) fn connection_saved(
 
     if let Some(error) = error {
         form.pending_request = None;
-        state.status = Some(Status::panel_request(
-            session,
-            request,
-            if form.key_was_sent {
-                format!("{error} Re-enter the API key before retrying.")
-            } else {
-                error
-            },
-        ));
+        let message = if form.key_was_sent && !key_saved {
+            format!("{error} Re-enter the API key before retrying.")
+        } else {
+            error
+        };
+        if key_saved {
+            form.key_was_sent = false;
+            state.panel = Some(Panel::Models(models));
+            state.status = Some(Status::panel_request(session, request, message));
+            return_to_models(state, effects);
+            return;
+        }
+        state.status = Some(Status::panel_request(session, request, message));
         state.panel = Some(Panel::Models(models));
         reconcile_model_facts(state, effects);
         return;
@@ -312,28 +400,9 @@ pub(super) fn connection_saved(
     {
         state.status = None;
     }
-    let subscription = form.kind.subscription();
-    if subscription {
-        let login_request = state.generation();
-        models.screen = ModelScreen::Login {
-            request: login_request,
-            state: LoginState::Connecting,
-        };
-        state.panel = Some(Panel::Models(models));
-        effects.push(Effect::Login {
-            profile: bone_app::ProfileId::chatgpt(),
-            request: login_request,
-        });
-        if let Some(notice) = notice {
-            state.status = Some(Status::panel_request(session, login_request, notice));
-        }
-    } else {
-        state.panel = Some(Panel::Models(models));
-        return_to_models(state, effects);
-        if let Some(notice) = notice {
-            state.status = Some(Status::panel_request(session, request, notice));
-        }
-    }
+    state.panel = Some(Panel::Models(models));
+    dismiss(state, effects);
+    refresh_model_facts(state, effects);
 }
 
 fn reconcile_connection_save(state: &mut UiState, effects: &mut Vec<Effect>) {
@@ -357,10 +426,15 @@ pub(super) fn login_changed(
     effects: &mut Vec<Effect>,
 ) {
     let selected = state.selected;
-    let Some(Panel::Models(models)) = state.panel.as_mut() else {
+    let Some(panel) = state.panel.take() else {
+        return;
+    };
+    let Panel::Models(mut models) = panel else {
+        state.panel = Some(panel);
         return;
     };
     if models.session != selected {
+        state.panel = Some(Panel::Models(models));
         return;
     }
     let ModelScreen::Login {
@@ -368,9 +442,11 @@ pub(super) fn login_changed(
         state: current_state,
     } = &mut models.screen
     else {
+        state.panel = Some(Panel::Models(models));
         return;
     };
     if *current != request {
+        state.panel = Some(Panel::Models(models));
         return;
     }
     let succeeded = matches!(login, LoginState::Succeeded);
@@ -383,7 +459,15 @@ pub(super) fn login_changed(
         {
             state.status = None;
         }
-        return_to_models(state, effects);
+        let Some(selection) = models.pending_selection.clone() else {
+            state.panel = Some(Panel::Models(models));
+            dismiss(state, effects);
+            refresh_model_facts(state, effects);
+            return;
+        };
+        apply_selection(state, models, selection, true, effects);
+    } else {
+        state.panel = Some(Panel::Models(models));
     }
 }
 
@@ -532,7 +616,12 @@ pub(super) fn panel_previous(state: &mut UiState) {
             objects.selected = objects.selected.saturating_sub(1);
         }
         Some(Panel::Models(ModelPanel {
-            screen: ModelScreen::List { selected } | ModelScreen::Add { selected },
+            screen:
+                ModelScreen::List { selected }
+                | ModelScreen::Reasoning { selected, .. }
+                | ModelScreen::Add { selected }
+                | ModelScreen::Advanced { selected }
+                | ModelScreen::Manage { selected },
             ..
         })) => *selected = selected.saturating_sub(1),
         _ => {}
@@ -547,11 +636,12 @@ pub(super) fn panel_next(state: &mut UiState) {
         Some(Panel::Models(models)) => {
             let row_count = models.row_count();
             match &mut models.screen {
-                ModelScreen::List { selected } => {
+                ModelScreen::List { selected }
+                | ModelScreen::Reasoning { selected, .. }
+                | ModelScreen::Add { selected }
+                | ModelScreen::Advanced { selected }
+                | ModelScreen::Manage { selected } => {
                     *selected = (*selected + 1).min(row_count.saturating_sub(1));
-                }
-                ModelScreen::Add { selected } => {
-                    *selected = (*selected + 1).min(ConnectionKind::ALL.len().saturating_sub(1));
                 }
                 ModelScreen::Setup(_) | ModelScreen::Login { .. } => {}
             }
@@ -574,16 +664,38 @@ pub(super) fn activate(state: &mut UiState, effects: &mut Vec<Effect>) {
             select_model(state, selected, effects);
         }
         Some(Panel::Models(ModelPanel {
-            screen: ModelScreen::Add { selected },
+            screen: ModelScreen::Reasoning { selected, .. },
             ..
         })) => {
             let selected = *selected;
-            choose_connection_kind(state, selected);
+            select_model(state, selected, effects);
+        }
+        Some(Panel::Models(ModelPanel {
+            screen: ModelScreen::Add { selected } | ModelScreen::Advanced { selected },
+            ..
+        })) => {
+            let selected = *selected;
+            choose_connection(state, selected, effects);
+        }
+        Some(Panel::Models(ModelPanel {
+            screen: ModelScreen::Manage { selected },
+            ..
+        })) => {
+            let selected = *selected;
+            select_model(state, selected, effects);
         }
         Some(Panel::Models(ModelPanel {
             screen: ModelScreen::Setup(_),
             ..
         })) => save_connection(state, effects),
+        Some(Panel::Models(ModelPanel {
+            screen:
+                ModelScreen::Login {
+                    state: LoginState::Failed { .. } | LoginState::Cancelled,
+                    ..
+                },
+            ..
+        })) => retry_login(state, effects),
         _ => {}
     }
 }
@@ -670,52 +782,106 @@ pub(super) fn select_model(state: &mut UiState, index: usize, effects: &mut Vec<
         state.panel = Some(Panel::Models(models));
         return;
     }
-    if index >= models.row_count() {
-        state.panel = Some(Panel::Models(models));
-        return;
-    }
-    let ModelScreen::List { selected } = &mut models.screen else {
-        state.panel = Some(Panel::Models(models));
-        return;
-    };
-    *selected = index;
-
-    if let Some(choice) = models.choices.get(index) {
-        let session = models.session;
-        let request = state.generation();
-        state.model_operation = Some(ModelOperation {
-            session,
-            request,
-            kind: ModelOperationKind::Apply,
-        });
-        state.status = None;
-        effects.push(Effect::SetModel {
-            session,
-            request,
-            selection: choice.selection.clone(),
-        });
-    } else if let Some(profile) = index
-        .checked_sub(models.choices.len())
-        .and_then(|profile_index| models.profiles.get(profile_index))
-    {
-        let selection = models
-            .choices
-            .iter()
-            .find(|choice| choice.selection.profile == profile.id)
-            .map(|choice| choice.selection.clone());
-        models.screen = ModelScreen::Setup(ConnectionForm::edit_selection(profile, selection));
-        state.status = None;
-    } else if index == models.row_count().saturating_sub(1) {
-        models.screen = ModelScreen::Add { selected: 0 };
-        state.status = None;
+    match models.screen {
+        ModelScreen::List { .. } => {
+            if index >= models.row_count() {
+                state.panel = Some(Panel::Models(models));
+                return;
+            }
+            models.screen = ModelScreen::List { selected: index };
+            if let Some(selection) = models
+                .choices
+                .get(index)
+                .map(|choice| choice.selection.clone())
+            {
+                let efforts = models.reasoning_efforts(index);
+                if !efforts.is_empty() {
+                    let current = state
+                        .model_facts
+                        .as_ref()
+                        .and_then(|facts| facts.saved.as_ref().ok())
+                        .map(|resolved| &resolved.selection)
+                        .filter(|current| same_model(current, &selection));
+                    let default = models
+                        .preset(index)
+                        .and_then(|preset| preset.default_reasoning);
+                    let selected = current
+                        .and_then(model_effort)
+                        .or(default)
+                        .and_then(|effort| efforts.iter().position(|item| *item == effort))
+                        .unwrap_or(0);
+                    models.pending_selection = None;
+                    models.screen = ModelScreen::Reasoning {
+                        model: index,
+                        selected,
+                    };
+                    state.panel = Some(Panel::Models(models));
+                    state.status = None;
+                    return;
+                }
+                if selection.profile == bone_app::ProfileId::chatgpt() {
+                    models.pending_selection = Some(selection.clone());
+                    apply_selection(state, models, selection, false, effects);
+                } else {
+                    models.pending_selection = None;
+                    apply_selection(state, models, selection, false, effects);
+                }
+                return;
+            }
+            if index == models.choices.len() {
+                models.screen = ModelScreen::Add { selected: 0 };
+            } else {
+                models.screen = ModelScreen::Manage { selected: 0 };
+            }
+        }
+        ModelScreen::Reasoning { model, .. } => {
+            let Some(choice) = models.choices.get(model) else {
+                state.panel = Some(Panel::Models(models));
+                return;
+            };
+            let Some(effort) = models.reasoning_efforts(model).get(index).copied() else {
+                state.panel = Some(Panel::Models(models));
+                return;
+            };
+            let mut selection = choice.selection.clone();
+            selection.options = Some(bone_app::ModelOptions::OpenAiResponses {
+                reasoning: bone_app::Reasoning::new().effort(effort),
+            });
+            if selection.profile == bone_app::ProfileId::chatgpt() {
+                models.pending_selection = Some(selection.clone());
+            } else {
+                models.pending_selection = None;
+            }
+            apply_selection(state, models, selection, false, effects);
+            return;
+        }
+        ModelScreen::Manage { .. } => {
+            let Some(profile) = models.profiles.get(index).cloned() else {
+                state.panel = Some(Panel::Models(models));
+                return;
+            };
+            models.screen = ModelScreen::Manage { selected: index };
+            let selection = current_or_recommended_selection(state, &models, &profile);
+            if profile.id == bone_app::ProfileId::chatgpt() {
+                models.pending_selection = None;
+                begin_login(state, models, effects);
+                return;
+            }
+            let Some(form) = ConnectionForm::edit_selection(&profile, selection) else {
+                unreachable!("ChatGPT handled above")
+            };
+            models.screen = ModelScreen::Setup(Box::new(form));
+        }
+        _ => {
+            state.panel = Some(Panel::Models(models));
+            return;
+        }
     }
     state.panel = Some(Panel::Models(models));
+    state.status = None;
 }
 
-pub(super) fn choose_connection_kind(state: &mut UiState, index: usize) {
-    let Some(kind) = ConnectionKind::ALL.get(index).copied() else {
-        return;
-    };
+pub(super) fn choose_connection(state: &mut UiState, index: usize, effects: &mut Vec<Effect>) {
     let Some(panel) = state.panel.take() else {
         return;
     };
@@ -723,23 +889,237 @@ pub(super) fn choose_connection_kind(state: &mut UiState, index: usize) {
         state.panel = Some(panel);
         return;
     };
-    if models.session != state.selected || !matches!(models.screen, ModelScreen::Add { .. }) {
+    if models.session != state.selected {
         state.panel = Some(Panel::Models(models));
         return;
     }
-    let form = if kind.subscription() {
-        models
-            .profiles
-            .iter()
-            .find(|profile| profile.id == bone_app::ProfileId::chatgpt())
-            .map(|profile| ConnectionForm::edit(profile, String::new()))
-            .unwrap_or_else(|| ConnectionForm::new(kind))
-    } else {
-        ConnectionForm::new(kind)
+    let kind = match models.screen {
+        ModelScreen::Add { .. } => match index {
+            0 => {
+                let profile = models
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == bone_app::ProfileId::chatgpt());
+                let selection = profile.and_then(|profile| recommended_selection(&models, profile));
+                let Some(selection) = selection else {
+                    state.panel = Some(Panel::Models(models));
+                    state.status = Some(Status::selection(
+                        state.selected,
+                        "ChatGPT has no recommended model",
+                    ));
+                    return;
+                };
+                models.pending_selection = Some(selection.clone());
+                apply_selection(state, models, selection, false, effects);
+                return;
+            }
+            1 | 2 => {
+                let (id, kind) = if index == 1 {
+                    (
+                        bone_app::ProfileId::new("openai").unwrap(),
+                        ConnectionKind::OpenAiApi,
+                    )
+                } else {
+                    (
+                        bone_app::ProfileId::new("anthropic").unwrap(),
+                        ConnectionKind::AnthropicApi,
+                    )
+                };
+                if let Some(profile) = models
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .cloned()
+                {
+                    let selection = current_or_recommended_selection(state, &models, &profile);
+                    models.screen = ModelScreen::Setup(Box::new(
+                        ConnectionForm::edit_selection(&profile, selection)
+                            .expect("API profiles have an editable connection form"),
+                    ));
+                    state.panel = Some(Panel::Models(models));
+                    state.status = None;
+                    return;
+                }
+                kind
+            }
+            3 => {
+                models.screen = ModelScreen::Advanced { selected: 0 };
+                state.panel = Some(Panel::Models(models));
+                state.status = None;
+                return;
+            }
+            _ => {
+                state.panel = Some(Panel::Models(models));
+                return;
+            }
+        },
+        ModelScreen::Advanced { .. } => {
+            let Some(kind) = ConnectionKind::ADVANCED.get(index).copied() else {
+                state.panel = Some(Panel::Models(models));
+                return;
+            };
+            kind
+        }
+        _ => {
+            state.panel = Some(Panel::Models(models));
+            return;
+        }
     };
-    models.screen = ModelScreen::Setup(form);
+    models.screen = ModelScreen::Setup(Box::new(ConnectionForm::new(kind)));
     state.panel = Some(Panel::Models(models));
     state.status = None;
+}
+
+fn recommended_selection(models: &ModelPanel, profile: &Profile) -> Option<ModelSelection> {
+    models
+        .choices
+        .iter()
+        .find(|choice| choice.selection.profile == profile.id && choice.recommended)
+        .or_else(|| {
+            models
+                .choices
+                .iter()
+                .find(|choice| choice.selection.profile == profile.id)
+        })
+        .map(|choice| choice.selection.clone())
+}
+
+fn same_model(left: &ModelSelection, right: &ModelSelection) -> bool {
+    left.profile == right.profile && left.model == right.model
+}
+
+fn model_effort(selection: &ModelSelection) -> Option<bone_app::ReasoningEffort> {
+    match selection.options.as_ref()? {
+        bone_app::ModelOptions::OpenAiResponses { reasoning } => reasoning.effort_level(),
+    }
+}
+
+fn current_or_recommended_selection(
+    state: &UiState,
+    models: &ModelPanel,
+    profile: &Profile,
+) -> Option<ModelSelection> {
+    state
+        .model_facts
+        .as_ref()
+        .and_then(|facts| facts.saved.as_ref().ok())
+        .filter(|resolved| resolved.selection.profile == profile.id)
+        .map(|resolved| resolved.selection.clone())
+        .or_else(|| recommended_selection(models, profile))
+}
+
+fn start_model_login(
+    state: &mut UiState,
+    mut models: ModelPanel,
+    selection: ModelSelection,
+    effects: &mut Vec<Effect>,
+) {
+    models.pending_selection = Some(selection);
+    begin_login(state, models, effects);
+}
+
+fn begin_login(state: &mut UiState, mut models: ModelPanel, effects: &mut Vec<Effect>) {
+    if connection_change_blocked(state) {
+        state.panel = Some(Panel::Models(models));
+        state.status = Some(Status::selection_notice(
+            state.selected,
+            "Wait for active conversations to finish before signing in",
+        ));
+        return;
+    }
+    let request = state.generation();
+    models.screen = ModelScreen::Login {
+        request,
+        state: LoginState::Connecting,
+    };
+    state.panel = Some(Panel::Models(models));
+    state.status = None;
+    effects.push(Effect::Login {
+        profile: bone_app::ProfileId::chatgpt(),
+        request,
+    });
+}
+
+fn retry_login(state: &mut UiState, effects: &mut Vec<Effect>) {
+    let Some(panel) = state.panel.take() else {
+        return;
+    };
+    let Panel::Models(models) = panel else {
+        state.panel = Some(panel);
+        return;
+    };
+    begin_login(state, models, effects);
+}
+
+fn apply_selection(
+    state: &mut UiState,
+    models: ModelPanel,
+    selection: ModelSelection,
+    force: bool,
+    effects: &mut Vec<Effect>,
+) {
+    let saved_is_selected = state
+        .model_facts
+        .as_ref()
+        .and_then(|facts| facts.saved.as_ref().ok())
+        .is_some_and(|current| current.selection == selection);
+    let running_is_selected = state
+        .running_model()
+        .is_some_and(|current| current.selection == selection);
+    if saved_is_selected && running_is_selected && !force {
+        state.panel = Some(Panel::Models(models));
+        dismiss(state, effects);
+        return;
+    }
+    if model_change_blocked(state) {
+        state.panel = Some(Panel::Models(models));
+        state.status = Some(Status::selection_notice(
+            state.selected,
+            "Wait for the conversation to finish loading or responding before switching models",
+        ));
+        return;
+    }
+    let session = models.session;
+    let request = state.generation();
+    state.model_operation = Some(ModelOperation {
+        session,
+        request,
+        kind: ModelOperationKind::Apply,
+    });
+    state.panel = Some(Panel::Models(models));
+    state.status = None;
+    effects.push(Effect::SetModel {
+        session,
+        request,
+        workspace_default: needs_workspace_default(state),
+        selection,
+    });
+}
+
+fn needs_workspace_default(state: &UiState) -> bool {
+    matches!(
+        state.model_facts.as_ref().map(|facts| &facts.saved),
+        Some(Err(bone_app::ConfigProblem::NeedsModel))
+    )
+}
+
+fn model_change_blocked(state: &UiState) -> bool {
+    match state.selected {
+        Some(_) => state
+            .selected_ui()
+            .is_none_or(|ui| ui.snapshot.is_none() || ui.working()),
+        None => state
+            .session_ui
+            .values()
+            .any(|ui| ui.snapshot.is_none() || ui.working()),
+    }
+}
+
+fn connection_change_blocked(state: &UiState) -> bool {
+    state
+        .session_ui
+        .values()
+        .any(|ui| ui.snapshot.is_none() || ui.working())
 }
 
 pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
@@ -770,6 +1150,14 @@ pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
             return;
         }
     };
+    if connection_change_blocked(state) {
+        state.panel = Some(Panel::Models(models));
+        state.status = Some(Status::selection_notice(
+            state.selected,
+            "Wait for active conversations to finish before changing a connection",
+        ));
+        return;
+    }
     let request = state.generation();
     form.pending_request = Some(request);
     form.key_was_sent = !form.key.is_empty();
@@ -780,6 +1168,7 @@ pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
     effects.push(Effect::SaveConnection {
         request,
         session,
+        workspace_default: needs_workspace_default(state),
         profile,
         key,
         selection,
@@ -791,6 +1180,7 @@ fn return_to_models(state: &mut UiState, effects: &mut Vec<Effect>) {
         return;
     };
     models.screen = ModelScreen::List { selected: 0 };
+    models.pending_selection = None;
     let session = models.session;
     load_models(state, session, effects);
     refresh_model_facts(state, effects);
@@ -799,6 +1189,7 @@ fn return_to_models(state: &mut UiState, effects: &mut Vec<Effect>) {
 fn return_to_model_list(state: &mut UiState) {
     if let Some(Panel::Models(models)) = &mut state.panel {
         models.screen = ModelScreen::List { selected: 0 };
+        models.pending_selection = None;
     }
 }
 
@@ -806,7 +1197,41 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
     let Some(panel) = &state.panel else {
         return false;
     };
+    let apply_pending = matches!(
+        (panel, state.model_operation),
+        (
+            Panel::Models(models),
+            Some(ModelOperation {
+                kind: ModelOperationKind::Apply,
+                ..
+            })
+        ) if models.session == state.selected
+    );
+    let save_pending = matches!(
+        panel,
+        Panel::Models(ModelPanel {
+            screen: ModelScreen::Setup(form),
+            ..
+        }) if form.pending_request.is_some()
+    );
+    if apply_pending || save_pending {
+        state.status = Some(Status::selection_notice(
+            state.selected,
+            "Finishing the model change…",
+        ));
+        return true;
+    }
     match panel {
+        Panel::Models(ModelPanel {
+            screen: ModelScreen::Reasoning { model, .. },
+            ..
+        }) => {
+            let model = *model;
+            state.status = None;
+            if let Some(Panel::Models(models)) = &mut state.panel {
+                models.screen = ModelScreen::List { selected: model };
+            }
+        }
         Panel::Models(ModelPanel {
             screen: ModelScreen::Login { .. },
             ..
@@ -816,7 +1241,33 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
             return_to_models(state, effects);
         }
         Panel::Models(ModelPanel {
-            screen: ModelScreen::Add { .. } | ModelScreen::Setup(_),
+            screen: ModelScreen::Setup(_),
+            ..
+        }) => {
+            state.status = None;
+            if let Some(Panel::Models(models)) = &mut state.panel
+                && let ModelScreen::Setup(form) = &models.screen
+            {
+                models.screen = if form.edits_existing_connection() {
+                    ModelScreen::Manage { selected: 0 }
+                } else if form.kind.advanced() {
+                    ModelScreen::Advanced { selected: 0 }
+                } else {
+                    ModelScreen::Add { selected: 0 }
+                };
+            }
+        }
+        Panel::Models(ModelPanel {
+            screen: ModelScreen::Advanced { .. },
+            ..
+        }) => {
+            state.status = None;
+            if let Some(Panel::Models(models)) = &mut state.panel {
+                models.screen = ModelScreen::Add { selected: 0 };
+            }
+        }
+        Panel::Models(ModelPanel {
+            screen: ModelScreen::Add { .. } | ModelScreen::Manage { .. },
             ..
         }) => {
             state.status = None;
@@ -862,9 +1313,15 @@ mod tests {
 
     fn choice(model: &str) -> ModelChoice {
         ModelChoice {
-            selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), model)
-                .unwrap(),
-            profile_label: "ChatGPT".into(),
+            selection: bone_app::ModelSelection::new(
+                bone_app::ProfileId::new("test-api").unwrap(),
+                model,
+            )
+            .unwrap(),
+            profile_label: "Test API".into(),
+            label: model.into(),
+            note: "Test model".into(),
+            recommended: false,
         }
     }
 
@@ -879,6 +1336,27 @@ mod tests {
         }
     }
 
+    fn choice_facts(model: &str, running: bool) -> ModelFacts {
+        let selection =
+            bone_app::ModelSelection::new(bone_app::ProfileId::new("test-api").unwrap(), model)
+                .unwrap();
+        let resolved = bone_app::ResolvedModel {
+            selection,
+            profile: bone_app::Profile::new(
+                bone_app::ProfileId::new("test-api").unwrap(),
+                "Test API",
+                bone_app::EndpointConfig::OpenAiResponses {
+                    base_url: Some("https://example.test/v1".into()),
+                },
+            )
+            .unwrap(),
+        };
+        ModelFacts {
+            saved: Ok(resolved.clone()),
+            running: running.then_some(resolved),
+        }
+    }
+
     fn request(state: &UiState, kind: ModelOperationKind) -> u64 {
         let operation = state.model_operation.expect("active model operation");
         assert_eq!(operation.kind, kind);
@@ -886,6 +1364,9 @@ mod tests {
     }
 
     fn ready_models(state: &mut UiState, choices: Vec<ModelChoice>) -> u64 {
+        if state.model_facts.is_none() {
+            state.model_facts = Some(facts("existing"));
+        }
         let mut effects = Vec::new();
         open_models(state, &mut effects);
         let load = request(state, ModelOperationKind::Load);
@@ -900,7 +1381,7 @@ mod tests {
 
     fn setup_panel(state: &mut UiState, form: ConnectionForm) {
         let mut models = ModelPanel::new(state.selected);
-        models.screen = ModelScreen::Setup(form);
+        models.screen = ModelScreen::Setup(Box::new(form));
         state.panel = Some(Panel::Models(models));
     }
 
@@ -978,6 +1459,7 @@ mod tests {
             effects.as_slice(),
             [
                 Effect::CancelLogin,
+                Effect::LoadModelFacts { session: None, .. },
                 Effect::LoadModels { session: None, .. }
             ]
         ));
@@ -1027,6 +1509,191 @@ mod tests {
     }
 
     #[test]
+    fn onboarding_requires_an_explicit_needs_model_fact() {
+        for (facts, expected_add) in [
+            (None, false),
+            (
+                Some(ModelFacts {
+                    saved: Err(bone_app::ConfigProblem::NeedsModel),
+                    running: None,
+                }),
+                true,
+            ),
+        ] {
+            let mut state = UiState::default();
+            state.model_facts = facts;
+            let mut effects = Vec::new();
+            open_models(&mut state, &mut effects);
+            let load = request(&state, ModelOperationKind::Load);
+            models_loaded(&mut state, None, load, vec![], vec![Profile::chatgpt()]);
+
+            assert_eq!(
+                matches!(
+                    state.panel,
+                    Some(Panel::Models(ModelPanel {
+                        screen: ModelScreen::Add { .. },
+                        ..
+                    }))
+                ),
+                expected_add
+            );
+        }
+    }
+
+    #[test]
+    fn late_model_facts_still_enter_first_use_setup() {
+        let mut state = UiState::default();
+        let mut effects = Vec::new();
+        open_models(&mut state, &mut effects);
+        let load = request(&state, ModelOperationKind::Load);
+        let facts_request = state.model_facts_request;
+
+        models_loaded(&mut state, None, load, vec![], vec![Profile::chatgpt()]);
+        assert!(matches!(
+            state.panel,
+            Some(Panel::Models(ModelPanel {
+                screen: ModelScreen::List { .. },
+                ..
+            }))
+        ));
+
+        model_facts_loaded(
+            &mut state,
+            None,
+            facts_request,
+            Some(ModelFacts {
+                saved: Err(bone_app::ConfigProblem::NeedsModel),
+                running: None,
+            }),
+        );
+        assert!(matches!(
+            state.panel,
+            Some(Panel::Models(ModelPanel {
+                screen: ModelScreen::Add { .. },
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn first_use_waits_for_the_model_catalog_before_opening_setup() {
+        let mut state = UiState::default();
+        let mut effects = Vec::new();
+        open_models(&mut state, &mut effects);
+        let load = request(&state, ModelOperationKind::Load);
+        let facts_request = state.model_facts_request;
+
+        model_facts_loaded(
+            &mut state,
+            None,
+            facts_request,
+            Some(ModelFacts {
+                saved: Err(bone_app::ConfigProblem::NeedsModel),
+                running: None,
+            }),
+        );
+        assert!(matches!(
+            state.panel,
+            Some(Panel::Models(ModelPanel {
+                screen: ModelScreen::List { .. },
+                ..
+            }))
+        ));
+
+        models_loaded(&mut state, None, load, vec![], vec![Profile::chatgpt()]);
+        assert!(matches!(
+            state.panel,
+            Some(Panel::Models(ModelPanel {
+                screen: ModelScreen::Add { .. },
+                ..
+            }))
+        ));
+        assert!(state.status.is_none());
+    }
+
+    #[test]
+    fn model_list_opens_on_the_applied_choice() {
+        let mut state = UiState::default();
+        state.model_facts = Some(choice_facts("second", true));
+        ready_models(&mut state, vec![choice("first"), choice("second")]);
+
+        assert!(matches!(
+            state.panel,
+            Some(Panel::Models(ModelPanel {
+                screen: ModelScreen::List { selected: 1 },
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn curated_model_selection_requires_and_persists_a_reasoning_depth() {
+        let mut state = UiState::default();
+        state.model_facts = Some(facts("existing"));
+        let mut effects = Vec::new();
+        open_models(&mut state, &mut effects);
+        let load = request(&state, ModelOperationKind::Load);
+        let selection =
+            bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), "gpt-5.6-terra").unwrap();
+        models_loaded(
+            &mut state,
+            None,
+            load,
+            vec![ModelChoice {
+                selection,
+                profile_label: "ChatGPT".into(),
+                label: "GPT-5.6 Terra".into(),
+                note: "Balanced".into(),
+                recommended: true,
+            }],
+            vec![bone_app::Profile::chatgpt()],
+        );
+
+        effects.clear();
+        select_model(&mut state, 0, &mut effects);
+        assert!(effects.is_empty());
+        assert!(matches!(
+            state.panel,
+            Some(Panel::Models(ModelPanel {
+                screen: ModelScreen::Reasoning {
+                    model: 0,
+                    selected: 2
+                },
+                ..
+            }))
+        ));
+
+        select_model(&mut state, 3, &mut effects);
+        let [Effect::SetModel { selection, .. }] = effects.as_slice() else {
+            panic!("reasoning choice must apply the model")
+        };
+        assert_eq!(
+            model_effort(selection),
+            Some(bone_app::ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn escape_from_reasoning_returns_to_the_same_model() {
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.screen = ModelScreen::Reasoning {
+            model: 4,
+            selected: 1,
+        };
+        state.panel = Some(Panel::Models(models));
+
+        assert!(escape(&mut state, &mut Vec::new()));
+        assert!(matches!(
+            state.panel,
+            Some(Panel::Models(ModelPanel {
+                screen: ModelScreen::List { selected: 4 },
+                ..
+            }))
+        ));
+    }
+
+    #[test]
     fn load_and_apply_have_distinct_identity_and_busy_blocks_repeat_apply() {
         let mut state = UiState::default();
         let load = ready_models(&mut state, vec![choice("gpt-test")]);
@@ -1036,13 +1703,110 @@ mod tests {
         assert_ne!(load, apply);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::SetModel { request, .. }] if *request == apply
+            [Effect::SetModel {
+                request,
+                workspace_default: false,
+                ..
+            }] if *request == apply
         ));
         effects.clear();
         select_model(&mut state, 0, &mut effects);
         activate(&mut state, &mut effects);
         assert!(effects.is_empty());
         assert_eq!(request(&state, ModelOperationKind::Apply), apply);
+    }
+
+    #[test]
+    fn escape_cannot_detach_an_in_flight_model_write() {
+        let mut state = UiState::default();
+        ready_models(&mut state, vec![choice("new")]);
+        select_model(&mut state, 0, &mut Vec::new());
+        let operation = state.model_operation;
+        let mut effects = Vec::new();
+
+        assert!(escape(&mut state, &mut effects));
+
+        assert!(effects.is_empty());
+        assert_eq!(state.model_operation, operation);
+        assert!(matches!(state.panel, Some(Panel::Models(_))));
+        assert_eq!(state.status_text(), Some("Finishing the model change…"));
+    }
+
+    #[test]
+    fn choosing_the_applied_model_is_a_no_op() {
+        let mut state = UiState::default();
+        state.model_facts = Some(choice_facts("same", true));
+        ready_models(&mut state, vec![choice("same")]);
+        let mut effects = Vec::new();
+
+        select_model(&mut state, 0, &mut effects);
+
+        assert!(effects.is_empty());
+        assert!(state.panel.is_none());
+        assert!(state.model_operation.is_none());
+    }
+
+    #[test]
+    fn choosing_a_saved_but_unapplied_model_retries_it() {
+        let mut state = UiState::default();
+        state.model_facts = Some(choice_facts("same", false));
+        ready_models(&mut state, vec![choice("same")]);
+        let mut effects = Vec::new();
+
+        select_model(&mut state, 0, &mut effects);
+
+        assert!(matches!(effects.as_slice(), [Effect::SetModel { .. }]));
+        assert_eq!(
+            state.model_operation.map(|operation| operation.kind),
+            Some(ModelOperationKind::Apply)
+        );
+    }
+
+    #[test]
+    fn active_work_blocks_a_real_model_switch() {
+        let session = SessionId::new();
+        let runtime = bone_app::RuntimeId::new();
+        let info = bone_app::SessionInfo {
+            id: session,
+            workspace: bone_app::WorkspaceId::new(),
+            title: "Working".into(),
+            archived: false,
+        };
+        let mut ui = crate::state::SessionUi::new(session, 1);
+        ui.snapshot = Some(std::sync::Arc::new(bone_app::SessionView {
+            session: info,
+            runtime: bone_app::RuntimeState::Detached,
+            draft: String::new(),
+            inputs: vec![bone_app::InputView {
+                id: bone_app::InputId(1),
+                request_id: bone_app::RequestId::new(),
+                text: "work".into(),
+                reply_to: None,
+                state: bone_app::InputState::Accepted { runtime },
+            }],
+            jobs: vec![],
+            activity: vec![],
+            history_through: SessionSeq(0),
+            problem: None,
+        }));
+        let mut state = UiState::default();
+        state.selected = Some(session);
+        state.model_facts = Some(choice_facts("old", false));
+        state.session_ui.insert(session, ui);
+        ready_models(&mut state, vec![choice("new")]);
+        let mut effects = Vec::new();
+
+        select_model(&mut state, 0, &mut effects);
+
+        assert!(effects.is_empty());
+        assert!(state.model_operation.is_none());
+        assert!(
+            state
+                .status_text()
+                .unwrap()
+                .contains("finish loading or responding")
+        );
+        assert!(matches!(state.panel, Some(Panel::Models(_))));
     }
 
     #[test]
@@ -1065,6 +1829,7 @@ mod tests {
             old_apply,
             None,
             Some("stale error".into()),
+            false,
             &mut effects,
         );
 
@@ -1099,6 +1864,7 @@ mod tests {
             operation.request.wrapping_add(1),
             None,
             None,
+            false,
             &mut effects,
         );
 
@@ -1129,6 +1895,7 @@ mod tests {
             apply,
             Some(facts("new")),
             None,
+            false,
             &mut Vec::new(),
         );
         assert!(state.panel.is_none());
@@ -1160,6 +1927,7 @@ mod tests {
             apply,
             Some(facts("new")),
             None,
+            false,
             &mut Vec::new(),
         );
 
@@ -1167,7 +1935,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_apply_keeps_authoritative_facts_and_its_error_during_reload() {
+    fn failed_apply_keeps_the_picker_open_with_authoritative_current_and_saved_models() {
         let running = bone_app::ResolvedModel {
             selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), "old-running")
                 .unwrap(),
@@ -1190,51 +1958,25 @@ mod tests {
                 running: Some(running),
             }),
             Some("request failed".into()),
+            false,
             &mut effects,
         );
 
-        let reload = request(&state, ModelOperationKind::Load);
-        assert_ne!(reload, apply);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::LoadModels { request, .. }] if *request == reload
-        ));
-        assert_eq!(state.model_footer(), "old-running · saved change");
+        assert!(state.model_operation.is_none());
+        assert!(effects.is_empty());
+        assert_eq!(
+            state.model_footer(),
+            "old-running · current · new-saved · configured"
+        );
         assert!(
             state
                 .model_configuration_summary()
-                .contains("Saved, not running: chatgpt/new-saved")
+                .contains("Configured: new-saved")
         );
-        assert_eq!(state.status_text(), Some("request failed"));
-        models_failed(&mut state, None, reload, "catalogue failed".into());
-        assert_eq!(state.status_text(), Some("request failed"));
-    }
-
-    #[test]
-    fn named_model_starts_only_an_apply_and_failure_uses_a_fresh_load() {
-        let mut state = UiState::default();
-        let mut effects = Vec::new();
-        set_named_model(&mut state, "profile".into(), "model".into(), &mut effects);
-        let apply = request(&state, ModelOperationKind::Apply);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::SetNamedModel { request, .. }] if *request == apply
-        ));
-        effects.clear();
-        model_applied(
-            &mut state,
-            None,
-            apply,
-            None,
-            Some("apply failed".into()),
-            &mut effects,
+        assert_eq!(
+            state.status_text(),
+            Some("Model switch failed: request failed")
         );
-        let reload = request(&state, ModelOperationKind::Load);
-        assert_ne!(reload, apply);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::LoadModels { request, .. }] if *request == reload
-        ));
     }
 
     #[test]
@@ -1288,7 +2030,7 @@ mod tests {
         let mut state = UiState::default();
         state.orphan_draft = "ordinary draft".into();
         let secret = "secret-that-must-not-appear";
-        let mut form = ConnectionForm::new(ConnectionKind::OpenAiResponses);
+        let mut form = ConnectionForm::new(ConnectionKind::OpenAiApi);
         form.key = SecretText::from(secret.to_owned());
         setup_panel(&mut state, form);
 
@@ -1325,7 +2067,7 @@ mod tests {
             request,
             session,
             Some("could not apply connection".into()),
-            None,
+            false,
             &mut Vec::new(),
         );
 
@@ -1346,12 +2088,11 @@ mod tests {
     }
 
     #[test]
-    fn subscription_save_and_login_success_follow_one_owned_screen_lifecycle() {
+    fn saved_key_failure_returns_to_models_without_requesting_the_secret_again() {
         let mut state = UiState::default();
-        setup_panel(
-            &mut state,
-            ConnectionForm::new(ConnectionKind::ChatGptSubscription),
-        );
+        let mut form = ConnectionForm::new(ConnectionKind::OpenAiApi);
+        form.key = SecretText::from("secret".to_owned());
+        setup_panel(&mut state, form);
         let mut effects = Vec::new();
         save_connection(&mut state, &mut effects);
         let [
@@ -1364,13 +2105,60 @@ mod tests {
         };
         let request = *request;
         let session = *session;
-        effects.clear();
+        let mut receipts = Vec::new();
+
         connection_saved(
             &mut state,
             request,
             session,
+            Some("API key saved, but reload failed".into()),
+            true,
+            &mut receipts,
+        );
+
+        assert!(matches!(
+            &state.panel,
+            Some(Panel::Models(ModelPanel {
+                screen: ModelScreen::List { .. },
+                ..
+            }))
+        ));
+        assert!(!state.status_text().unwrap().contains("Re-enter"));
+        assert!(
+            receipts
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadModels { .. }))
+        );
+    }
+
+    #[test]
+    fn chatgpt_onboarding_authorizes_then_applies_the_pending_model() {
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.screen = ModelScreen::Add { selected: 0 };
+        models.profiles.push(Profile::chatgpt());
+        models.choices.push(ModelChoice {
+            selection: ModelSelection::new(bone_app::ProfileId::chatgpt(), "gpt-test").unwrap(),
+            profile_label: "ChatGPT".into(),
+            label: "GPT Test".into(),
+            note: "Test".into(),
+            recommended: true,
+        });
+        state.panel = Some(Panel::Models(models));
+        let mut effects = Vec::new();
+        choose_connection(&mut state, 0, &mut effects);
+        let [Effect::SetModel { request: apply, .. }] = effects.as_slice() else {
+            panic!("initial model preflight")
+        };
+        let apply = *apply;
+        effects.clear();
+        model_applied(
+            &mut state,
             None,
-            Some("saved".into()),
+            apply,
+            None,
+            Some("profile chatgpt needs login".into()),
+            true,
             &mut effects,
         );
         let [Effect::Login { request: login, .. }] = effects.as_slice() else {
@@ -1407,19 +2195,119 @@ mod tests {
         assert!(matches!(
             &state.panel,
             Some(Panel::Models(ModelPanel {
-                screen: ModelScreen::List { selected: 0 },
+                screen: ModelScreen::Login {
+                    state: LoginState::Succeeded,
+                    ..
+                },
                 ..
             }))
         ));
-        assert_eq!(effects.len(), 2);
-        assert!(matches!(effects[0], Effect::LoadModels { .. }));
-        assert!(matches!(effects[1], Effect::LoadModelFacts { .. }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SetModel { selection, .. }] if selection.model == "gpt-test"
+        ));
+    }
+
+    #[test]
+    fn first_model_for_an_existing_conversation_becomes_the_workspace_default() {
+        let session = SessionId::new();
+        let workspace = bone_app::WorkspaceId::new();
+        let info = bone_app::SessionInfo {
+            id: session,
+            workspace,
+            title: "First conversation".into(),
+            archived: false,
+        };
+        let mut ui = crate::state::SessionUi::new(session, 1);
+        ui.snapshot = Some(std::sync::Arc::new(bone_app::SessionView {
+            session: info,
+            runtime: bone_app::RuntimeState::Detached,
+            draft: String::new(),
+            inputs: vec![],
+            jobs: vec![],
+            activity: vec![],
+            history_through: SessionSeq(0),
+            problem: None,
+        }));
+        let mut state = UiState::default();
+        state.selected = Some(session);
+        state.session_ui.insert(session, ui);
+        state.model_facts = Some(ModelFacts {
+            saved: Err(bone_app::ConfigProblem::NeedsModel),
+            running: None,
+        });
+        let mut models = ModelPanel::new(Some(session));
+        models.screen = ModelScreen::Add { selected: 0 };
+        models.profiles.push(Profile::chatgpt());
+        models.choices.push(ModelChoice {
+            selection: ModelSelection::new(bone_app::ProfileId::chatgpt(), "gpt-test").unwrap(),
+            profile_label: "ChatGPT".into(),
+            label: "GPT Test".into(),
+            note: "Test".into(),
+            recommended: true,
+        });
+        state.panel = Some(Panel::Models(models));
+        let mut effects = Vec::new();
+
+        choose_connection(&mut state, 0, &mut effects);
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SetModel {
+                session: Some(target),
+                workspace_default: true,
+                ..
+            }] if *target == session
+        ));
+    }
+
+    #[test]
+    fn add_routes_an_existing_official_connection_to_key_management() {
+        let profile = Profile::new(
+            bone_app::ProfileId::new("openai").unwrap(),
+            "OpenAI API",
+            bone_app::EndpointConfig::OpenAiResponses { base_url: None },
+        )
+        .unwrap();
+        let selection = ModelSelection::new(profile.id.clone(), "gpt-5.6-sol").unwrap();
+        let mut state = UiState::default();
+        state.model_facts = Some(ModelFacts {
+            saved: Ok(bone_app::ResolvedModel {
+                selection: selection.clone(),
+                profile: profile.clone(),
+            }),
+            running: None,
+        });
+        let mut models = ModelPanel::new(None);
+        models.screen = ModelScreen::Add { selected: 1 };
+        models.profiles.push(profile);
+        models.choices.push(ModelChoice {
+            selection,
+            profile_label: "OpenAI API".into(),
+            label: "GPT-5.6 Sol".into(),
+            note: "Recommended".into(),
+            recommended: true,
+        });
+        state.panel = Some(Panel::Models(models));
+        let mut effects = Vec::new();
+
+        choose_connection(&mut state, 1, &mut effects);
+
+        assert!(effects.is_empty());
+        assert!(matches!(
+            &state.panel,
+            Some(Panel::Models(ModelPanel {
+                screen: ModelScreen::Setup(form),
+                ..
+            })) if form.edits_existing_connection()
+                && form.fields() == [SetupField::Key]
+        ));
     }
 
     #[test]
     fn successful_connection_save_does_not_clear_a_newer_unowned_status() {
         let mut state = UiState::default();
-        let mut form = ConnectionForm::new(ConnectionKind::OpenAiResponses);
+        let mut form = ConnectionForm::new(ConnectionKind::OpenAiApi);
         form.key = SecretText::from("secret".to_owned());
         setup_panel(&mut state, form);
         let mut effects = Vec::new();
@@ -1436,7 +2324,7 @@ mod tests {
         let session = *session;
         state.status = Some("newer status".into());
 
-        connection_saved(&mut state, request, session, None, None, &mut Vec::new());
+        connection_saved(&mut state, request, session, None, false, &mut Vec::new());
 
         assert_eq!(state.status_text(), Some("newer status"));
     }
@@ -1444,7 +2332,7 @@ mod tests {
     #[test]
     fn late_connection_receipt_preserves_a_new_form_and_its_status() {
         let mut state = UiState::default();
-        let mut old = ConnectionForm::new(ConnectionKind::OpenAiResponses);
+        let mut old = ConnectionForm::new(ConnectionKind::OpenAiApi);
         old.key = SecretText::from(String::from("secret"));
         setup_panel(&mut state, old);
         let effects = {
@@ -1467,7 +2355,7 @@ mod tests {
         let old_request = *request;
         let old_session = *session;
 
-        let mut replacement = ConnectionForm::new(ConnectionKind::AnthropicMessages);
+        let mut replacement = ConnectionForm::new(ConnectionKind::AnthropicApi);
         replacement.key = SecretText::from(String::from("replacement-secret"));
         setup_panel(&mut state, replacement);
         let mut replacement_effects = Vec::new();
@@ -1489,7 +2377,7 @@ mod tests {
             old_request,
             old_session,
             None,
-            Some("old notice".into()),
+            false,
             &mut receipts,
         );
 
@@ -1499,7 +2387,7 @@ mod tests {
             Some(Panel::Models(ModelPanel {
                 screen: ModelScreen::Setup(form),
                 ..
-            })) if form.kind == ConnectionKind::AnthropicMessages
+            })) if form.kind == ConnectionKind::AnthropicApi
                 && form.pending_request == Some(replacement_request)
         ));
         assert!(matches!(

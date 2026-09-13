@@ -84,6 +84,7 @@ impl Runtime {
             Effect::SaveConnection {
                 request,
                 session,
+                workspace_default,
                 profile,
                 key,
                 selection,
@@ -96,9 +97,18 @@ impl Runtime {
                         let key = key
                             .map(|mut key| bone_app::ApiKey::new(key.take()))
                             .transpose()
-                            .map_err(|_| "Invalid API key; nothing was saved")?;
+                            .map_err(|_| super::models::ConnectionSaveError {
+                                message: "Invalid API key; nothing was saved",
+                                key_saved: false,
+                            })?;
                         super::models::save_connection(
-                            &app, workspace, session, profile, key, selection,
+                            &app,
+                            workspace,
+                            session,
+                            workspace_default,
+                            profile,
+                            key,
+                            selection,
                         )
                         .await
                     }
@@ -107,8 +117,8 @@ impl Runtime {
                         .send(UiEvent::ConnectionSaved {
                             request,
                             session,
-                            notice: result.as_ref().ok().copied().flatten().map(str::to_owned),
-                            error: result.err().map(str::to_owned),
+                            error: result.as_ref().err().map(|error| error.message.to_owned()),
+                            key_saved: result.is_err_and(|error| error.key_saved),
                         })
                         .await;
                 });
@@ -129,8 +139,18 @@ impl Runtime {
                         match app.login(profile).await {
                             Ok(attempt) => {
                                 let mut changes = attempt.observe();
+                                let mut opened_browser = false;
                                 loop {
                                     let state = changes.borrow_and_update().as_ref().clone();
+                                    if !opened_browser
+                                        && let bone_app::LoginState::DeviceCode {
+                                            verification_uri,
+                                            ..
+                                        } = &state
+                                    {
+                                        open_login_url(verification_uri);
+                                        opened_browser = true;
+                                    }
                                     let done = matches!(
                                         state,
                                         bone_app::LoginState::Succeeded
@@ -212,57 +232,34 @@ impl Runtime {
             Effect::SetModel {
                 session,
                 request,
+                workspace_default,
                 selection,
             } => {
                 let app = self.app.clone();
                 let workspace = self.workspace;
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
-                    let choice = super::models::ModelChoice {
-                        selection,
-                        profile_label: String::new(),
-                    };
-                    let result = match session {
-                        Some(session) => super::models::apply(&app, session, &choice).await,
-                        None => {
-                            app.update_config(
-                                bone_app::ConfigScope::Workspace(workspace),
-                                bone_app::ConfigChange::Worker(Some(choice.selection)),
-                            )
-                            .await
-                        }
-                    };
-                    model_applied(&app, workspace, &tx, session, request, result.err()).await;
-                });
-            }
-            Effect::SetNamedModel {
-                session,
-                request,
-                profile,
-                model,
-            } => {
-                let app = self.app.clone();
-                let workspace = self.workspace;
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    let result = async {
-                        let choice = super::models::explicit(&app, &profile, &model).await?;
+                    let result = if workspace_default {
+                        app.update_config(
+                            bone_app::ConfigScope::Workspace(workspace),
+                            bone_app::ConfigChange::Model(Some(selection)),
+                        )
+                        .await
+                    } else {
                         match session {
-                            Some(session) => super::models::apply(&app, session, &choice).await,
+                            Some(session) => super::models::apply(&app, session, &selection).await,
                             None => {
                                 app.update_config(
                                     bone_app::ConfigScope::Workspace(workspace),
-                                    bone_app::ConfigChange::Worker(Some(choice.selection)),
+                                    bone_app::ConfigChange::Model(Some(selection)),
                                 )
                                 .await
                             }
                         }
-                    }
-                    .await;
+                    };
                     model_applied(&app, workspace, &tx, session, request, result.err()).await;
                 });
             }
-
             Effect::OpenSession {
                 session,
                 generation,
@@ -1127,6 +1124,24 @@ async fn send_session_failure(
         .await;
 }
 
+fn open_login_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let command = ("open", vec![url]);
+    #[cfg(target_os = "linux")]
+    let command = ("xdg-open", vec![url]);
+    #[cfg(target_os = "windows")]
+    let command = ("cmd", vec!["/C", "start", "", url]);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let command: (&str, Vec<&str>) = return;
+
+    let _ = std::process::Command::new(command.0)
+        .args(command.1)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 async fn model_applied(
     app: &App,
     workspace: bone_app::WorkspaceId,
@@ -1135,6 +1150,11 @@ async fn model_applied(
     request: u64,
     error: Option<bone_app::Error>,
 ) {
+    let login_required = matches!(
+        &error,
+        Some(bone_app::Error::LoginRequired(profile))
+            if *profile == bone_app::ProfileId::chatgpt()
+    );
     let facts = super::models::facts(app, workspace, session).await;
     let _ = tx
         .send(UiEvent::ModelApplied {
@@ -1142,6 +1162,7 @@ async fn model_applied(
             request,
             facts,
             error: error.map(|error| error.to_string()),
+            login_required,
         })
         .await;
 }

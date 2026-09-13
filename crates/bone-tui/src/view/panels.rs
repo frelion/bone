@@ -1,17 +1,19 @@
 use super::single_line_external;
+#[cfg(test)]
+use crate::state::ModelPanel;
 use crate::{
     layout::{HitRegion, HitTarget, LayoutPlan, floating_menu_stride, floating_panel_area},
-    state::{Action, ModelPanel, ModelScreen, Panel, UiState},
+    state::{Action, ModelOperationKind, ModelScreen, Panel, UiState},
     ui::{
         interaction::HitMap,
-        theme::{self, INK, INPUT, MUTED},
+        theme::{self, INFO, INK, INPUT, MUTED},
     },
 };
 use ratatui::{
     Frame,
     layout::Rect,
     style::Style,
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
 
@@ -42,7 +44,7 @@ pub(super) fn render_shell(
         area.height.saturating_sub(2 + chrome),
     );
     let title_y = area.y + u16::from(spacious);
-    let title_background = theme::SELECTED;
+    let title_background = theme::FOCUS_SURFACE;
     frame.render_widget(
         Block::default().style(theme::surface(title_background)),
         Rect::new(area.x, title_y, area.width, 1),
@@ -112,7 +114,7 @@ pub(super) fn render(
     if let Panel::Models(models) = panel
         && matches!(
             models.screen,
-            ModelScreen::Add { .. } | ModelScreen::Setup(_)
+            ModelScreen::Add { .. } | ModelScreen::Advanced { .. } | ModelScreen::Setup(_)
         )
     {
         super::connection::render(frame, plan, hits, state, models);
@@ -135,10 +137,22 @@ pub(super) fn render(
                     + 4
                     + if state.status.is_some() { 2 } else { 0 })
                 .clamp(5, if spacious { 22 } else { 14 }) as u16,
-                "Models & connections",
+                "Choose model",
             ),
-            ModelScreen::Login { .. } => (10, "Models / Account authorization"),
-            ModelScreen::Add { .. } | ModelScreen::Setup(_) => return,
+            ModelScreen::Reasoning { model, .. } => (
+                (models.reasoning_efforts(*model).len() * usize::from(stride) + 6)
+                    .clamp(7, if spacious { 20 } else { 13 }) as u16,
+                "Choose reasoning depth",
+            ),
+            ModelScreen::Manage { .. } => (
+                (models.profiles.len().max(1) * usize::from(stride) + 4)
+                    .clamp(5, if spacious { 22 } else { 14 }) as u16,
+                "Manage connections",
+            ),
+            ModelScreen::Login { .. } => (10, "Sign in to ChatGPT"),
+            ModelScreen::Add { .. } | ModelScreen::Advanced { .. } | ModelScreen::Setup(_) => {
+                return;
+            }
         },
         Panel::Reader(_) => return,
     };
@@ -203,7 +217,11 @@ pub(super) fn render(
                     frame.render_widget(
                         Paragraph::new(single_line_external(status.text()))
                             .wrap(Wrap { trim: false })
-                            .style(Style::default().fg(theme::DANGER)),
+                            .style(Style::default().fg(if status.is_error() {
+                                theme::DANGER
+                            } else {
+                                INFO
+                            })),
                         Rect::new(inner.x, inner.y, inner.width, height),
                     );
                     inner.y += height;
@@ -224,22 +242,151 @@ pub(super) fn render(
                     inner.width,
                     inner.height.saturating_sub(rows),
                 );
-                if models.busy(state.model_operation) {
+                if let Some(operation) = state
+                    .model_operation
+                    .filter(|operation| operation.session == models.session)
+                {
+                    let label = match operation.kind {
+                        ModelOperationKind::Load => "Loading models…",
+                        ModelOperationKind::Apply => "Switching model…",
+                    };
                     frame.render_widget(
-                        Paragraph::new("Loading configuration…").style(Style::default().fg(MUTED)),
+                        Paragraph::new(label).style(Style::default().fg(MUTED)),
                         inner,
                     );
                 } else {
-                    let menu = model_menu_rows(models);
-                    let visual_selected = menu
-                        .iter()
-                        .position(
-                            |row| matches!(row, ModelMenuRow::Choice(index) if index == selected),
-                        )
-                        .unwrap_or(0);
-                    let start = visual_selected
+                    let action_stride = if spacious && inner.height >= 5 { 2 } else { 1 };
+                    let action_height = (1 + action_stride * 2).min(inner.height);
+                    let model_area = Rect::new(
+                        inner.x,
+                        inner.y,
+                        inner.width,
+                        inner.height.saturating_sub(action_height),
+                    );
+                    let choices_area = model_area;
+                    let capacity = usize::from(choices_area.height / stride);
+                    let cursor = (*selected).min(models.choices.len().saturating_sub(1));
+                    let start = cursor.saturating_sub(capacity.saturating_sub(1));
+                    for (index, choice) in
+                        models.choices.iter().enumerate().skip(start).take(capacity)
+                    {
+                        let row = Rect::new(
+                            choices_area.x,
+                            choices_area.y + (index - start) as u16 * stride,
+                            choices_area.width,
+                            stride,
+                        );
+                        render_model_choice(
+                            frame,
+                            row,
+                            state,
+                            choice,
+                            index == *selected,
+                            spacious,
+                        );
+                        hits.push(HitRegion {
+                            area: row,
+                            target: HitTarget::Action(Action::SelectModel(index)),
+                        });
+                    }
+                    if action_height > 0 {
+                        let action_y = inner.bottom().saturating_sub(action_height);
+                        frame.render_widget(
+                            Paragraph::new("Connections").style(Style::default().fg(MUTED)),
+                            Rect::new(inner.x, action_y, inner.width, 1),
+                        );
+                        for (offset, label) in ["+ Add account or API…", "Manage connections…"]
+                            .into_iter()
+                            .enumerate()
+                        {
+                            let index = models.choices.len() + offset;
+                            let row = Rect::new(
+                                inner.x,
+                                action_y + 1 + offset as u16 * action_stride,
+                                inner.width,
+                                action_stride,
+                            );
+                            frame.render_widget(
+                                Paragraph::new(label).style(model_menu_style(index == *selected)),
+                                row,
+                            );
+                            hits.push(HitRegion {
+                                area: row,
+                                target: HitTarget::Action(Action::SelectModel(index)),
+                            });
+                        }
+                    }
+                }
+            }
+            ModelScreen::Reasoning { model, selected } => {
+                let Some(choice) = models.choices.get(*model) else {
+                    return;
+                };
+                let preset = models.preset(*model);
+                let configured = state
+                    .model_facts
+                    .as_ref()
+                    .and_then(|facts| facts.saved.as_ref().ok())
+                    .filter(|resolved| {
+                        resolved.selection.profile == choice.selection.profile
+                            && resolved.selection.model == choice.selection.model
+                    })
+                    .and_then(|resolved| crate::state::model_effort(&resolved.selection));
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(&choice.label, theme::label(INK)),
+                        Span::styled(
+                            format!("  {}", choice.profile_label),
+                            Style::default().fg(MUTED),
+                        ),
+                    ])),
+                    Rect::new(inner.x, inner.y, inner.width, 1),
+                );
+                let hint_y = inner.y.saturating_add(1);
+                frame.render_widget(
+                    Paragraph::new("How much time should this model spend reasoning?")
+                        .style(Style::default().fg(MUTED)),
+                    Rect::new(inner.x, hint_y, inner.width, 1),
+                );
+                let choices = models.reasoning_efforts(*model);
+                let choices_y = hint_y.saturating_add(if spacious { 2 } else { 1 });
+                let choices_height = inner.bottom().saturating_sub(choices_y);
+                let capacity = usize::from(choices_height / stride);
+                let cursor = (*selected).min(choices.len().saturating_sub(1));
+                let start = cursor.saturating_sub(capacity.saturating_sub(1));
+                for (index, effort) in choices.iter().enumerate().skip(start).take(capacity) {
+                    let row = Rect::new(
+                        inner.x,
+                        choices_y + (index - start) as u16 * stride,
+                        inner.width,
+                        stride,
+                    );
+                    render_reasoning_choice(
+                        frame,
+                        row,
+                        *effort,
+                        index == *selected,
+                        configured == Some(*effort),
+                        preset.and_then(|preset| preset.default_reasoning) == Some(*effort),
+                        spacious,
+                    );
+                    hits.push(HitRegion {
+                        area: row,
+                        target: HitTarget::Action(Action::SelectModel(index)),
+                    });
+                }
+            }
+            ModelScreen::Manage { selected } => {
+                if models.profiles.is_empty() {
+                    frame.render_widget(
+                        Paragraph::new("No connections").style(Style::default().fg(MUTED)),
+                        inner,
+                    );
+                } else {
+                    let start = selected
                         .saturating_sub(usize::from(inner.height / stride).saturating_sub(1));
-                    for (visual_index, item) in menu
+                    for (index, profile) in models
+                        .profiles
                         .iter()
                         .enumerate()
                         .skip(start)
@@ -247,31 +394,33 @@ pub(super) fn render(
                     {
                         let row = Rect::new(
                             inner.x,
-                            inner.y + (visual_index - start) as u16 * stride,
+                            inner.y + (index - start) as u16 * stride,
                             inner.width,
                             stride,
                         );
-                        let index = match item {
-                            ModelMenuRow::Heading(label) => {
-                                frame.render_widget(
-                                    Paragraph::new(*label).style(Style::default().fg(MUTED)),
-                                    row,
-                                );
-                                continue;
+                        let (label, note) = match &profile.endpoint {
+                            bone_app::EndpointConfig::ChatGptSubscription => (
+                                "ChatGPT account · sign in".to_owned(),
+                                "Check or refresh sign-in",
+                            ),
+                            bone_app::EndpointConfig::OpenAiResponses { base_url: None } => {
+                                ("OpenAI API · update key".to_owned(), "Keeps your model")
                             }
-                            ModelMenuRow::Choice(index) => *index,
+                            bone_app::EndpointConfig::AnthropicMessages { base_url: None } => {
+                                ("Anthropic API · update key".to_owned(), "Keeps your model")
+                            }
+                            _ => (
+                                format!("{} · edit", profile.label),
+                                "Connection settings and model ID",
+                            ),
                         };
-                        let label = if let Some(choice) = models.choices.get(index) {
-                            model_choice_label(choice)
-                        } else if let Some(profile) =
-                            models.profiles.get(index - models.choices.len())
-                        {
-                            format!("Edit connection · {}", profile.label)
+                        let label = if spacious {
+                            format!("{label}\n{note}")
                         } else {
-                            "+ Add model / connection".to_owned()
+                            label
                         };
                         frame.render_widget(
-                            Paragraph::new(single_line_external(&label))
+                            Paragraph::new(super::sanitize_external(&label))
                                 .style(menu_style(index == *selected)),
                             row,
                         );
@@ -283,30 +432,50 @@ pub(super) fn render(
                 }
             }
             ModelScreen::Login { state: login, .. } => {
-                let text = match login {
-                    bone_app::LoginState::Connecting => "Connecting…".to_owned(),
+                let (text, retry) = match login {
+                    bone_app::LoginState::Connecting => ("Connecting…".to_owned(), false),
                     bone_app::LoginState::DeviceCode {
                         verification_uri,
                         user_code,
-                    } => format!(
-                        "Open in your browser:\n{verification_uri}\n\nCode: {user_code}\nWaiting for sign-in…"
+                    } => (
+                        format!(
+                            "Open in your browser:\n{verification_uri}\n\nCode: {user_code}\nWaiting for sign-in…"
+                        ),
+                        false,
                     ),
                     bone_app::LoginState::Succeeded => {
-                        "Connected. Choose a model with /model, then retry saved input.".to_owned()
+                        ("Connected. Applying model…".to_owned(), false)
                     }
                     bone_app::LoginState::Failed { message } => {
-                        format!("Sign-in failed: {message}")
+                        (format!("Sign-in failed: {message}"), true)
                     }
-                    bone_app::LoginState::Cancelled => "Sign-in cancelled".to_owned(),
+                    bone_app::LoginState::Cancelled => ("Sign-in cancelled".to_owned(), true),
                 };
+                let body = Rect::new(
+                    inner.x,
+                    inner.y,
+                    inner.width,
+                    inner.height.saturating_sub(u16::from(retry)),
+                );
                 frame.render_widget(
                     Paragraph::new(super::sanitize_external(&text))
                         .wrap(Wrap { trim: false })
                         .style(Style::default().fg(INK)),
-                    inner,
+                    body,
                 );
+                if retry && inner.height > 0 {
+                    let action = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
+                    frame.render_widget(
+                        Paragraph::new("Retry sign-in").style(menu_style(true)),
+                        action,
+                    );
+                    hits.push(HitRegion {
+                        area: action,
+                        target: HitTarget::Action(Action::ActivatePanel),
+                    });
+                }
             }
-            ModelScreen::Add { .. } | ModelScreen::Setup(_) => {}
+            ModelScreen::Add { .. } | ModelScreen::Advanced { .. } | ModelScreen::Setup(_) => {}
         },
         Panel::Help => {
             let shift_enter = if state.terminal_capabilities.shift_enter_supported() {
@@ -328,7 +497,7 @@ pub(super) fn render(
                 "Ctrl+D        Save drafts and quit".to_owned(),
                 "Esc           Back, then stop".to_owned(),
                 "Ctrl+Z/Y      Undo / redo in input".to_owned(),
-                "/model        Model configuration".to_owned(),
+                "/model        Models & connections".to_owned(),
                 "/details      Latest task / tool".to_owned(),
             ];
             frame.render_widget(
@@ -440,13 +609,13 @@ mod tests {
         let mark_x = title_x - TITLE_INSET;
         let mark = &buffer[(mark_x, title_y)];
         assert_eq!(mark.symbol(), " ");
-        assert_eq!(mark.bg, theme::SELECTED);
+        assert_eq!(mark.bg, theme::FOCUS_SURFACE);
         assert_ne!(mark.bg, theme::FOCUS_MARK);
         assert!(!mark.modifier.contains(Modifier::BOLD | Modifier::DIM));
-        assert_eq!(buffer[(mark_x + 1, title_y)].bg, theme::SELECTED);
+        assert_eq!(buffer[(mark_x + 1, title_y)].bg, theme::FOCUS_SURFACE);
         let title = &buffer[(title_x, title_y)];
         assert_eq!(title.fg, INK);
-        assert_eq!(title.bg, theme::SELECTED);
+        assert_eq!(title.bg, theme::FOCUS_SURFACE);
         assert!(title.modifier.contains(Modifier::BOLD));
         assert!(
             buffer
@@ -490,81 +659,111 @@ mod tests {
     }
 }
 
-fn model_choice_label(choice: &crate::state::ModelChoice) -> String {
-    let options = choice
-        .selection
-        .options
-        .as_ref()
-        .map(|options| match options {
-            bone_app::ModelOptions::OpenAiResponses { reasoning } => {
-                serde_json::to_value(reasoning)
-                    .ok()
-                    .and_then(|value| {
-                        value.as_object().map(|fields| {
-                            fields
-                                .iter()
-                                .map(|(key, value)| {
-                                    format!("{key} {}", value.as_str().unwrap_or_default())
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        })
-                    })
-                    .unwrap_or_default()
-            }
-        })
-        .unwrap_or_default();
-    if options.is_empty() {
-        format!("{} · {}", choice.selection.model, choice.profile_label)
-    } else {
-        format!(
-            "[{options}] {} · {}",
-            choice.selection.model, choice.profile_label
-        )
+fn model_choice_label(state: &UiState, choice: &crate::state::ModelChoice) -> String {
+    let mut parts = Vec::new();
+    if let Some(marker) = state.model_selection_marker(&choice.selection) {
+        parts.push(format!("✓ {marker}"));
+    }
+    parts.push(choice.label.clone());
+    if choice.recommended {
+        parts.push("Recommended".into());
+    }
+    parts.join(" · ")
+}
+
+fn render_model_choice(
+    frame: &mut Frame<'_>,
+    row: Rect,
+    state: &UiState,
+    choice: &crate::state::ModelChoice,
+    selected: bool,
+    spacious: bool,
+) {
+    let background = if selected { theme::PANEL } else { INPUT };
+    let pointer = if selected { "› " } else { "  " };
+    let pointer_tone = if selected { INFO } else { background };
+    let title = model_choice_label(state, choice);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(pointer, theme::label_on(pointer_tone, background)),
+        Span::styled(
+            super::single_line_external(&title),
+            theme::label_on(INK, background),
+        ),
+    ])];
+    if spacious {
+        lines.push(Line::from(vec![
+            Span::styled("  ", theme::body_on(MUTED, background)),
+            Span::styled(
+                super::single_line_external(&format!("{} · {}", choice.profile_label, choice.note)),
+                theme::body_on(MUTED, background),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme::surface(background)), row);
+}
+
+fn render_reasoning_choice(
+    frame: &mut Frame<'_>,
+    row: Rect,
+    effort: bone_app::ReasoningEffort,
+    selected: bool,
+    configured: bool,
+    recommended: bool,
+    spacious: bool,
+) {
+    let background = if selected { theme::PANEL } else { INPUT };
+    let (name, note) = reasoning_copy(effort);
+    let mut title = name.to_owned();
+    if configured {
+        title.push_str(" · ✓ Current");
+    } else if recommended {
+        title.push_str(" · Recommended");
+    }
+    let pointer = if selected { "› " } else { "  " };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            pointer,
+            theme::label_on(if selected { INFO } else { background }, background),
+        ),
+        Span::styled(title, theme::label_on(INK, background)),
+        Span::styled(
+            format!("  {}", effort.as_str()),
+            theme::body_on(MUTED, background),
+        ),
+    ])];
+    if spacious {
+        lines.push(Line::from(vec![
+            Span::styled("  ", theme::body_on(MUTED, background)),
+            Span::styled(note, theme::body_on(MUTED, background)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme::surface(background)), row);
+}
+
+fn reasoning_copy(effort: bone_app::ReasoningEffort) -> (&'static str, &'static str) {
+    use bone_app::ReasoningEffort;
+    match effort {
+        ReasoningEffort::None => ("Instant", "Lowest latency, without deliberate reasoning"),
+        ReasoningEffort::Minimal => ("Quick", "Minimal reasoning for very simple work"),
+        ReasoningEffort::Low => ("Fast", "Light reasoning for straightforward work"),
+        ReasoningEffort::Medium => ("Balanced", "A good default for everyday work"),
+        ReasoningEffort::High => ("Deep", "More reasoning for complex tasks"),
+        ReasoningEffort::Xhigh => ("Extra deep", "For hard problems; responses take longer"),
+        ReasoningEffort::Max => ("Maximum", "Use the maximum reasoning available"),
     }
 }
 
-#[test]
-fn same_model_with_distinct_reasoning_options_has_distinct_visible_labels() {
-    let label = |effort| {
-        let mut selection =
-            bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), "same-model").unwrap();
-        selection.options = Some(
-            serde_json::from_value(
-                serde_json::json!({"type":"openai_responses","reasoning":{"effort":effort}}),
-            )
-            .unwrap(),
-        );
-        model_choice_label(&crate::state::ModelChoice {
-            selection,
-            profile_label: "account".into(),
-        })
-    };
-    assert!(label("high").starts_with("[effort high]"));
-    assert!(label("low").starts_with("[effort low]"));
-}
-
-/// A group heading never consumes an action index or receives a pointer target.
-enum ModelMenuRow {
-    Heading(&'static str),
-    Choice(usize),
-}
-fn model_menu_rows(models: &ModelPanel) -> Vec<ModelMenuRow> {
-    let mut rows = Vec::with_capacity(models.row_count() + 2);
-    if !models.choices.is_empty() {
-        rows.push(ModelMenuRow::Heading("Available models"));
-        rows.extend((0..models.choices.len()).map(ModelMenuRow::Choice));
-    }
-    if !rows.is_empty() {
-        rows.push(ModelMenuRow::Heading(""));
-    }
-    rows.push(ModelMenuRow::Heading("Manage connections"));
-    rows.extend((models.choices.len()..models.row_count()).map(ModelMenuRow::Choice));
-    rows
-}
 pub(super) fn menu_style(selected: bool) -> Style {
     if selected {
         theme::label_on(INK, theme::SELECTED)
+    } else {
+        theme::body_on(INK, INPUT)
+    }
+}
+
+fn model_menu_style(selected: bool) -> Style {
+    if selected {
+        theme::label_on(INK, theme::PANEL)
     } else {
         theme::body_on(INK, INPUT)
     }
@@ -588,6 +787,9 @@ mod grouped_menu_tests {
                     )
                     .unwrap(),
                     profile_label: "ChatGPT".into(),
+                    label: format!("Model {index}"),
+                    note: "Test model".into(),
+                    recommended: index == 0,
                 });
             }
             models.profiles = vec![bone_app::Profile::chatgpt(); 5];
@@ -614,12 +816,11 @@ mod grouped_menu_tests {
                     Some(HitTarget::Action(Action::SelectModel(selected)))
                 );
                 let buffer = terminal.backend().buffer();
-                assert_eq!(buffer[(hit.area.x, hit.area.y)].bg, theme::SELECTED);
-                assert_eq!(buffer[(hit.area.x, hit.area.y)].fg, INK);
+                assert_eq!(buffer[(hit.area.x, hit.area.y)].bg, theme::PANEL);
                 assert_ne!(buffer[(hit.area.x, hit.area.y)].bg, theme::FOCUS_MARK);
                 for y in 0..height {
                     let line: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
-                    if line.contains("Manage connections") {
+                    if line.trim() == "Connections" {
                         assert!(!plan.hit_regions().iter().any(|hit| hit.area.y == y
                             && matches!(hit.target, HitTarget::Action(Action::SelectModel(_)))));
                     }
@@ -643,5 +844,80 @@ mod grouped_menu_tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn compact_error_state_keeps_the_selected_model_and_connection_actions_visible() {
+        let profile = bone_app::Profile::chatgpt();
+        let resolved = |model: &str| bone_app::ResolvedModel {
+            selection: bone_app::ModelSelection::new(profile.id.clone(), model).unwrap(),
+            profile: profile.clone(),
+        };
+        let mut state = UiState::default();
+        state.model_facts = Some(crate::state::ModelFacts {
+            saved: Ok(resolved("configured-model")),
+            running: Some(resolved("current-model")),
+        });
+        state.status = Some("Model switch failed".into());
+        let mut models = ModelPanel::new(None);
+        models.choices = ["current-model", "configured-model"]
+            .into_iter()
+            .map(|model| crate::state::ModelChoice {
+                selection: bone_app::ModelSelection::new(profile.id.clone(), model).unwrap(),
+                profile_label: "ChatGPT".into(),
+                label: model.into(),
+                note: "Test model".into(),
+                recommended: false,
+            })
+            .collect();
+        models.screen = ModelScreen::List { selected: 1 };
+        state.panel = Some(Panel::Models(models));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut plan = None;
+        terminal
+            .draw(|frame| plan = Some(crate::view::render(frame, &state)))
+            .unwrap();
+        let plan = plan.unwrap();
+
+        for index in [1, 2, 3] {
+            assert!(
+                plan.hit_regions()
+                    .iter()
+                    .any(|hit| { hit.target == HitTarget::Action(Action::SelectModel(index)) })
+            );
+        }
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("✓ Configured"));
+    }
+
+    #[test]
+    fn failed_login_has_a_pointer_retry_action() {
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.screen = ModelScreen::Login {
+            request: 1,
+            state: bone_app::LoginState::Failed {
+                message: "authorization expired".into(),
+            },
+        };
+        state.panel = Some(Panel::Models(models));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut plan = None;
+        terminal
+            .draw(|frame| plan = Some(crate::view::render(frame, &state)))
+            .unwrap();
+
+        assert!(
+            plan.unwrap()
+                .hit_regions()
+                .iter()
+                .any(|hit| { hit.target == HitTarget::Action(Action::ActivatePanel) })
+        );
     }
 }

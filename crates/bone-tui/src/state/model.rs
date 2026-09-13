@@ -97,8 +97,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         kind: CommandKind::Model,
         name: "model",
-        usage: "[profile model]",
-        summary: "Models, API keys & accounts",
+        usage: "",
+        summary: "Models & connections",
     },
     CommandSpec {
         kind: CommandKind::Answer,
@@ -433,37 +433,66 @@ impl UiState {
     }
 
     pub(crate) fn model_footer(&self) -> String {
+        let saved = self
+            .model_facts
+            .as_ref()
+            .and_then(|facts| facts.saved.as_ref().ok());
         if let Some(running) = self.running_model() {
-            let changed = self
-                .model_facts
-                .as_ref()
-                .is_some_and(|facts| !facts.applied_to(Some(running)));
-            return format!(
-                "{}{}",
-                running.selection.model,
-                if changed {
-                    " · saved change"
-                } else {
-                    " · running"
-                }
-            );
+            return saved
+                .filter(|saved| saved.selection != running.selection)
+                .map_or_else(
+                    || format!("{} · current", describe_model(&running.selection)),
+                    |saved| {
+                        format!(
+                            "{} · current · {} · configured",
+                            describe_model(&running.selection),
+                            describe_model(&saved.selection)
+                        )
+                    },
+                );
         }
-        self.model_label()
-            .map_or_else(|| "Select model".into(), |label| format!("{label} · saved"))
+        saved.map_or_else(
+            || "Select model".into(),
+            |saved| {
+                let state = if self.selected.is_some() {
+                    "conversation"
+                } else {
+                    "workspace"
+                };
+                format!("{} · {state}", describe_model(&saved.selection))
+            },
+        )
+    }
+
+    pub(crate) fn model_selection_marker(
+        &self,
+        selection: &bone_app::ModelSelection,
+    ) -> Option<&'static str> {
+        if self
+            .running_model()
+            .is_some_and(|running| same_model(&running.selection, selection))
+        {
+            return Some("Current");
+        }
+        let saved = self
+            .model_facts
+            .as_ref()
+            .and_then(|facts| facts.saved.as_ref().ok());
+        if saved.is_some_and(|saved| same_model(&saved.selection, selection)) {
+            return Some(if self.running_model().is_some() {
+                "Configured"
+            } else if self.selected.is_some() {
+                "Conversation"
+            } else {
+                "Workspace"
+            });
+        }
+        None
     }
 
     pub(crate) fn model_configuration_summary(&self) -> String {
         fn describe(model: &bone_app::ResolvedModel) -> String {
-            let options = model
-                .selection
-                .options
-                .as_ref()
-                .map(|options| format!(" · {}", serde_json::to_string(options).unwrap_or_default()))
-                .unwrap_or_default();
-            format!(
-                "{}/{}{options}",
-                model.selection.profile, model.selection.model
-            )
+            describe_model(&model.selection)
         }
         let running = self.running_model();
         let saved = self
@@ -472,26 +501,29 @@ impl UiState {
             .and_then(|facts| facts.saved.as_ref().ok());
         let mut lines = Vec::new();
         if let Some(running) = running {
-            lines.push(format!("Running: {}", describe(running)));
+            lines.push(format!("Current: {}", describe(running)));
         }
         if let Some(saved) = saved {
-            let label = if running.is_some()
-                && self
-                    .model_facts
-                    .as_ref()
-                    .is_some_and(|facts| !facts.applied_to(running))
+            if running.is_none() {
+                let label = if self.selected.is_some() {
+                    "Conversation"
+                } else {
+                    "Workspace model"
+                };
+                lines.push(format!("{label}: {}", describe(saved)));
+            } else if !self
+                .model_facts
+                .as_ref()
+                .is_some_and(|facts| facts.applied_to(running))
             {
-                "Saved, not running"
-            } else {
-                "Saved"
-            };
-            lines.push(format!("{label}: {}", describe(saved)));
+                lines.push(format!("Configured: {}", describe(saved)));
+            }
         } else if self
             .model_facts
             .as_ref()
             .is_some_and(|facts| facts.saved.is_err())
         {
-            lines.push("Saved configuration needs attention".into());
+            lines.push("Model setup needs attention".into());
         }
         lines.join("\n")
     }
@@ -591,6 +623,25 @@ impl UiState {
     }
 }
 
+fn same_model(left: &bone_app::ModelSelection, right: &bone_app::ModelSelection) -> bool {
+    left.profile == right.profile && left.model == right.model
+}
+
+pub(crate) fn model_effort(
+    selection: &bone_app::ModelSelection,
+) -> Option<bone_app::ReasoningEffort> {
+    match selection.options.as_ref()? {
+        bone_app::ModelOptions::OpenAiResponses { reasoning } => reasoning.effort_level(),
+    }
+}
+
+fn describe_model(selection: &bone_app::ModelSelection) -> String {
+    model_effort(selection).map_or_else(
+        || selection.model.clone(),
+        |effort| format!("{} · {}", selection.model, effort.as_str()),
+    )
+}
+
 #[cfg(test)]
 mod model_fact_tests {
     use super::*;
@@ -611,7 +662,16 @@ mod model_fact_tests {
         other_profile.profile.id = other_profile.selection.profile.clone();
         let mut other_options = running.clone();
         other_options.selection.options = Some(serde_json::from_value(serde_json::json!({ "type": "openai_responses", "reasoning": { "effort": "high" } })).unwrap());
-        for saved in [other_profile, other_options] {
+        for (saved, expected_footer) in [
+            (
+                other_profile,
+                "same-name · current · same-name · configured",
+            ),
+            (
+                other_options,
+                "same-name · current · same-name · high · configured",
+            ),
+        ] {
             let facts = ModelFacts {
                 saved: Ok(saved),
                 running: Some(running.clone()),
@@ -621,12 +681,8 @@ mod model_fact_tests {
                 model_facts: Some(facts),
                 ..UiState::default()
             };
-            assert_eq!(state.model_footer(), "same-name · saved change");
-            assert!(
-                state
-                    .model_configuration_summary()
-                    .contains("Saved, not running:")
-            );
+            assert_eq!(state.model_footer(), expected_footer);
+            assert!(state.model_configuration_summary().contains("Configured:"));
         }
     }
 
@@ -640,10 +696,13 @@ mod model_fact_tests {
             }),
             ..UiState::default()
         };
-        assert_eq!(state.model_footer(), "same-name · saved");
-        assert!(!state.model_configuration_summary().contains("not running"));
+        assert_eq!(state.model_footer(), "same-name · workspace");
+        assert_eq!(
+            state.model_configuration_summary(),
+            "Workspace model: same-name"
+        );
         state.model_facts.as_mut().unwrap().running = Some(running);
-        assert_eq!(state.model_footer(), "same-name · running");
+        assert_eq!(state.model_footer(), "same-name · current");
         let info = bone_app::SessionInfo {
             id: SessionId::new(),
             workspace: bone_app::WorkspaceId::new(),
@@ -663,6 +722,6 @@ mod model_fact_tests {
         }));
         state.selected = Some(info.id);
         state.session_ui.insert(info.id, ui);
-        assert_eq!(state.model_footer(), "same-name · saved");
+        assert_eq!(state.model_footer(), "same-name · conversation");
     }
 }

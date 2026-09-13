@@ -141,10 +141,12 @@ where
     )])
     .tool_choice(ToolChoice::Specific(vec![submission_name.clone()]));
     let request = model.apply_to(request);
-    let response =
-        model.model().complete(request).await.map_err(|error| {
-            CallError::failed(format!("model request failed ({:?})", error.kind()))
-        })?;
+    let response = model.model().complete(request).await.map_err(|error| {
+        CallError::failed(format!(
+            "model request failed ({:?}): {error}",
+            error.kind()
+        ))
+    })?;
 
     decode_response(contract, response)
 }
@@ -404,7 +406,10 @@ mod tests {
         .expect_err("provider failure must cross the port as a CallError");
 
         assert_eq!(error.kind, CallErrorKind::Failed);
-        assert_eq!(error.message, "model request failed (Provider)");
+        assert_eq!(
+            error.message,
+            "model request failed (Provider): request rejected"
+        );
     }
 
     #[tokio::test]
@@ -423,7 +428,7 @@ mod tests {
         let expected_schema = expected_schema.clone();
         let model = recording_model(
             Arc::clone(&requests),
-            submission("submit_coordination", json!(decision)),
+            submission("submit_coordination", json!({"decision": decision})),
         );
         let model = ConfiguredModel::new(
             model.model().clone(),
@@ -480,8 +485,14 @@ mod tests {
             response(std::iter::empty()),
             response([("wrong_submission", json!({"Clarify": "question"}))]),
             response([
-                ("submit_coordination", json!({"Clarify": "question"})),
-                ("submit_coordination", json!({"Clarify": "question"})),
+                (
+                    "submit_coordination",
+                    json!({"decision": {"Clarify": "question"}}),
+                ),
+                (
+                    "submit_coordination",
+                    json!({"decision": {"Clarify": "question"}}),
+                ),
             ]),
         ];
 
@@ -499,7 +510,10 @@ mod tests {
     fn response_rejects_truncation_and_filtering_before_decoding() {
         for finish_reason in [FinishReason::Length, FinishReason::ContentFilter] {
             let response = response_with_finish(
-                [("submit_coordination", json!({"Clarify": "question"}))],
+                [(
+                    "submit_coordination",
+                    json!({"decision": {"Clarify": "question"}}),
+                )],
                 Some(finish_reason),
             );
 

@@ -313,6 +313,8 @@ pub struct WorkInput {
     /// Whether `AskUser` is available for this particular user-owned turn.
     pub can_ask_user: bool,
     pub spec: JobSpec,
+    /// Input IDs this job may pass to a delegated child.
+    pub inputs: Vec<InputId>,
     pub constraints: String,
     pub constraints_revision: u64,
     pub background: Arc<SessionContext>,
@@ -445,6 +447,7 @@ fn work_input(
                 .iter()
                 .any(|input| kernel.inputs[input].finished.is_none()),
         spec: job.spec.clone(),
+        inputs: job.inputs.clone(),
         constraints: kernel.constraints.clone(),
         constraints_revision: kernel.constraints_revision,
         background: session_background(

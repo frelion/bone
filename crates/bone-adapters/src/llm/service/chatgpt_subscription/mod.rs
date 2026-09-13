@@ -180,7 +180,7 @@ where
         Protocol::OpenAiResponses,
         RequestSupport::CHATGPT_SUBSCRIPTION,
         move |model_id| LeasedModel {
-            inner: client.completion_model(model_id),
+            inner: client.completion_model(model_id).with_strict_tools(),
             _auth: auth.clone(),
         },
     )
@@ -208,7 +208,7 @@ where
         endpoint_id,
         Protocol::OpenAiResponses,
         RequestSupport::CHATGPT_SUBSCRIPTION,
-        move |model_id| client.completion_model(model_id),
+        move |model_id| client.completion_model(model_id).with_strict_tools(),
     )
 }
 

@@ -3186,6 +3186,10 @@ impl DataStore {
                     let snapshot = transaction.read(&document)?;
                     let mut settings = snapshot.value.unwrap_or_default();
                     match change {
+                        ConfigChange::Model(value) => {
+                            settings.worker = value.clone();
+                            settings.coordinator = value;
+                        }
                         ConfigChange::Worker(value) => settings.worker = value,
                         ConfigChange::Coordinator(value) => settings.coordinator = value,
                         ConfigChange::Limits(value) => settings.limits = value.unwrap_or_default(),
@@ -3207,6 +3211,10 @@ impl DataStore {
                     let snapshot = transaction.read(&document)?;
                     let mut values = snapshot.value.unwrap_or_default();
                     match change {
+                        ConfigChange::Model(value) => {
+                            values.worker = value.clone();
+                            values.coordinator = value;
+                        }
                         ConfigChange::Worker(value) => values.worker = value,
                         ConfigChange::Coordinator(value) => values.coordinator = value,
                         ConfigChange::Limits(value) => values.limits = value,
@@ -4396,6 +4404,49 @@ mod tests {
         let saved = store.config(ConfigScope::User).unwrap();
         assert_eq!(saved.worker, Some(worker));
         assert_eq!(saved.coordinator, Some(coordinator));
+    }
+
+    #[test]
+    fn model_config_change_replaces_both_roles_at_every_scope() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let store = DataStore::open(temporary.path().join("data")).unwrap();
+        let workspace = store.workspace(&root).unwrap();
+        let session = store
+            .create_session(workspace.id, "session".into())
+            .unwrap();
+
+        for scope in [
+            ConfigScope::User,
+            ConfigScope::Workspace(workspace.id),
+            ConfigScope::Session(session.info.id),
+        ] {
+            store
+                .update_config(scope, ConfigChange::Worker(Some(selection("old-worker"))))
+                .unwrap();
+            store
+                .update_config(
+                    scope,
+                    ConfigChange::Coordinator(Some(selection("old-coordinator"))),
+                )
+                .unwrap();
+
+            let selected = selection("selected");
+            let saved = store
+                .update_config(scope, ConfigChange::Model(Some(selected.clone())))
+                .unwrap();
+            assert_eq!(saved.worker, Some(selected.clone()));
+            assert_eq!(saved.coordinator, Some(selected.clone()));
+            assert_eq!(store.config(scope).unwrap(), saved);
+
+            let cleared = store
+                .update_config(scope, ConfigChange::Model(None))
+                .unwrap();
+            assert_eq!(cleared.worker, None);
+            assert_eq!(cleared.coordinator, None);
+            assert_eq!(store.config(scope).unwrap(), cleared);
+        }
     }
 
     #[test]

@@ -60,7 +60,12 @@ impl Session {
     /// Session may only have scheduled asynchronous startup, whose result is
     /// reported through [`Session::observe`].
     pub async fn reload_config(&self) -> Result<()> {
-        self.request(|reply| Command::ConfigChanged { reply }).await
+        self.apply_persisted_config(true).await
+    }
+
+    pub(crate) async fn apply_persisted_config(&self, force: bool) -> Result<()> {
+        self.request(|reply| Command::ConfigChanged { force, reply })
+            .await
     }
 
     pub async fn submit(&self, input: SubmitInput) -> Result<SubmissionReceipt> {
@@ -427,6 +432,7 @@ enum Command {
         reply: oneshot::Sender<Result<CloseReport>>,
     },
     ConfigChanged {
+        force: bool,
         reply: oneshot::Sender<Result<()>>,
     },
     RuntimeDirty(RuntimeId),
@@ -670,8 +676,8 @@ impl SessionTask {
                 }
                 let _ = reply.send(result);
             }
-            Command::ConfigChanged { reply } => {
-                let result = self.apply_config().await;
+            Command::ConfigChanged { force, reply } => {
+                let result = self.apply_config(force).await;
                 if let Err(error) = &result {
                     self.record_execution_error(error).await;
                 }
@@ -1137,7 +1143,7 @@ impl SessionTask {
         Ok(())
     }
 
-    async fn apply_config(&mut self) -> Result<()> {
+    async fn apply_config(&mut self, force: bool) -> Result<()> {
         let config = match self.resolve_config() {
             Ok(config) => config,
             Err(Error::Configuration(problem)) => {
@@ -1163,7 +1169,7 @@ impl SessionTask {
                 RuntimeState::Running { config, .. } => config.as_ref(),
                 _ => return Err(Error::InvalidState("running runtime has no config".into())),
             };
-            if current == &config && !self.config_blocked {
+            if current == &config && !self.config_blocked && !force {
                 self.set_queued_problem(None)?;
                 return self.publish();
             }

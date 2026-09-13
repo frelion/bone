@@ -127,7 +127,7 @@ mod tests {
             })
             .expect("Commands title");
         let marker = &buffer[(area.x, title.1)];
-        assert_eq!(marker.bg, theme::SELECTED);
+        assert_eq!(marker.bg, theme::FOCUS_SURFACE);
         assert_ne!(marker.bg, theme::FOCUS_MARK);
         assert!(buffer[title].modifier.contains(Modifier::BOLD));
 

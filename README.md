@@ -48,7 +48,7 @@ Runtime 配置按以下顺序解析：
 Session override > Workspace override > User setting
 ```
 
-`App::update_config` 保存一项类型化变更，并等待所有受影响的已打开 Session 处理它。配置有效时，运行中的 Agent 保留 Runtime ID、Job 图和在途工具，撤销旧模型提交资格并使用新端口继续；配置无法装配时，Session 暂停新执行并暴露可匹配的问题，直到配置或凭据修复。
+`App::update_config` 保存一项类型化变更，并等待所有受影响的已打开 Session 处理它。面向前端的 `ConfigChange::Model` 会校验模型选择，并在一个事务中同时选择 worker/coordinator；ChatGPT 还会先检查缓存登录，需要授权时不会覆盖原选择。配置有效时，运行中的 Agent 保留 Runtime ID、Job 图和在途工具，撤销旧模型提交资格并使用新端口继续；其他配置无法装配时，Session 暂停新执行并暴露可匹配的问题，直到配置或凭据修复。
 
 ## 持久化边界
 

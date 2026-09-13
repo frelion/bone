@@ -25,6 +25,10 @@ pub enum Error {
     LoginRequired(ProfileId),
     #[error("profile {0} is still in use")]
     ProfileBusy(ProfileId),
+    #[error(
+        "credentials for profile {profile} were saved, but running sessions did not reload: {message}"
+    )]
+    CredentialsSaved { profile: ProfileId, message: String },
     #[error("provider: {0}")]
     Provider(String),
     #[error("storage: {0}")]

@@ -32,6 +32,26 @@ pub(super) fn action(
 
     let target = snapshot.and_then(|frame| frame.hit(mouse.column, mouse.row));
     match mouse.kind {
+        MouseEventKind::ScrollUp
+            if matches!(
+                target,
+                Some(HitTarget::Action(
+                    Action::SelectModel(_) | Action::ChooseConnection(_)
+                ))
+            ) =>
+        {
+            Some(Action::PanelPrevious)
+        }
+        MouseEventKind::ScrollDown
+            if matches!(
+                target,
+                Some(HitTarget::Action(
+                    Action::SelectModel(_) | Action::ChooseConnection(_)
+                ))
+            ) =>
+        {
+            Some(Action::PanelNext)
+        }
         MouseEventKind::ScrollUp if target == Some(HitTarget::Reader) => {
             snapshot.map(|frame| Action::ScrollPanel {
                 amount: -3,
@@ -151,5 +171,55 @@ fn hit_action(target: Option<HitTarget>) -> Option<Action> {
         Some(HitTarget::Composer) => Some(Action::Focus(Focus::Composer)),
         Some(HitTarget::Capture | HitTarget::Reader) => None,
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        layout::{HitRegion, LayoutPlan, PaneWidths, SinglePane},
+        ui::interaction::HitMap,
+    };
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn model_actions_support_pointer_wheel_navigation() {
+        let layout = LayoutPlan::calculate_with_widths(
+            Rect::new(0, 0, 80, 24),
+            SinglePane::Conversation,
+            0,
+            None,
+            None,
+            1,
+            PaneWidths::default(),
+        );
+        let area = Rect::new(5, 5, 20, 2);
+        for target in [
+            HitTarget::Action(Action::SelectModel(3)),
+            HitTarget::Action(Action::ChooseConnection(2)),
+        ] {
+            let mut hits = HitMap::default();
+            hits.push(HitRegion { area, target });
+            let snapshot = FrameSnapshot::new(layout.clone(), hits, None, 0, None, None);
+            for (kind, expected) in [
+                (MouseEventKind::ScrollUp, Action::PanelPrevious),
+                (MouseEventKind::ScrollDown, Action::PanelNext),
+            ] {
+                assert_eq!(
+                    action(
+                        MouseEvent {
+                            kind,
+                            column: area.x,
+                            row: area.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        Some(&snapshot),
+                        &UiState::default(),
+                    ),
+                    Some(expected)
+                );
+            }
+        }
     }
 }

@@ -19,7 +19,7 @@ use crate::{
     SessionReleaseReceipt, SessionReleaseStatus, WorkspaceChangeCursor, WorkspaceChangePage,
     WorkspaceFileCursor, WorkspaceFilePage, WorkspaceFileSource, WorkspaceFileView, WorkspaceId,
     WorkspaceInfo, WorkspaceOverview,
-    config::{resolve_runtime, validate_agent_limits, validate_tool_settings},
+    config::{resolve_model, resolve_runtime, validate_agent_limits, validate_tool_settings},
     providers::ProviderConnectError,
 };
 
@@ -70,6 +70,14 @@ impl RuntimeBackend {
             Self::Providers(providers) => providers.connect(config).await.map_err(Into::into),
             #[cfg(test)]
             Self::Ports { model, .. } => Ok(Arc::clone(model)),
+        }
+    }
+
+    async fn prepare_model(&self, model: &crate::ResolvedModel) -> Result<()> {
+        match self {
+            Self::Providers(providers) => providers.prepare_model(model).await.map_err(Into::into),
+            #[cfg(test)]
+            Self::Ports { .. } => Ok(()),
         }
     }
 
@@ -639,14 +647,9 @@ impl App {
         change: ConfigChange,
     ) -> Result<RuntimeOverrides> {
         match &change {
-            ConfigChange::Worker(value) => {
-                if let Some(value) = value {
-                    value
-                        .validate()
-                        .map_err(|error| Error::InvalidState(error.to_string()))?;
-                }
-            }
-            ConfigChange::Coordinator(value) => {
+            ConfigChange::Model(value)
+            | ConfigChange::Worker(value)
+            | ConfigChange::Coordinator(value) => {
                 if let Some(value) = value {
                     value
                         .validate()
@@ -680,24 +683,47 @@ impl App {
         change: ConfigChange,
     ) -> Result<RuntimeOverrides> {
         let _update = self.inner.config_updates.lock().await;
-        let sessions = self.inner.sessions.lock().await;
         self.ensure_open()?;
         self.ensure_scope(scope)?;
+        if let ConfigChange::Model(Some(selection)) = &change {
+            let model = resolve_model(selection.clone(), &self.inner.store.profiles()?)
+                .map_err(Error::Configuration)?;
+            if matches!(
+                model.profile.endpoint,
+                bone_adapters::llm::EndpointConfig::ChatGptSubscription
+            ) {
+                self.inner.backend.prepare_model(&model).await?;
+            }
+        }
+        let sessions = self.inner.sessions.lock().await;
+        let force_model = matches!(&change, ConfigChange::Model(Some(_)));
         let saved = self
             .inner
             .store
             .update_config(scope, change)
             .map_err(Error::from)?;
 
-        let targets = sessions
+        let mut forced = Vec::new();
+        let mut ordinary = Vec::new();
+        for session in sessions
             .values()
             .filter(|session| !session.releasing)
             .map(|session| &session.handle)
             .filter(|session| config_affects(scope, session))
-            .cloned()
-            .collect::<Vec<_>>();
+        {
+            if force_model && model_scope_applies(&self.inner.store, scope, session)? {
+                forced.push(session.clone());
+            } else {
+                ordinary.push(session.clone());
+            }
+        }
         drop(sessions);
-        reload_sessions(&targets).await?;
+        let (forced_result, ordinary_result) = tokio::join!(
+            reload_sessions(&forced, true),
+            reload_sessions(&ordinary, false)
+        );
+        forced_result?;
+        ordinary_result?;
         Ok(saved)
     }
 
@@ -707,29 +733,7 @@ impl App {
         let _update = self.inner.config_updates.lock().await;
         let sessions = self.inner.sessions.lock().await;
         self.ensure_open()?;
-        let saved = self
-            .inner
-            .store
-            .session(session)?
-            .ok_or(Error::SessionNotFound)?;
-        let workspace = self
-            .inner
-            .store
-            .workspace_by_id(saved.info.workspace)?
-            .ok_or(Error::WorkspaceNotFound)?;
-        let global = self.inner.store.global_settings()?;
-        let workspace_config = self
-            .inner
-            .store
-            .config(ConfigScope::Workspace(workspace.id))?;
-        let session_config = self.inner.store.config(ConfigScope::Session(session))?;
-        let desired = resolve_runtime(
-            &global,
-            Some(&workspace_config),
-            Some(&session_config),
-            &self.inner.store.profiles()?,
-            workspace.root,
-        );
+        let desired = resolve_session_config(&self.inner.store, session)?;
         let live = sessions.get(&session).map(|session| session.handle.clone());
         let running = live.and_then(|session| {
             let view = session.observe();
@@ -803,7 +807,7 @@ impl App {
             .map(|session| session.handle.clone())
             .collect::<Vec<_>>();
         drop(sessions);
-        reload_sessions(&targets).await
+        reload_sessions(&targets, false).await
     }
 
     pub async fn set_api_key(&self, profile: ProfileId, key: ApiKey) -> Result<()> {
@@ -816,6 +820,7 @@ impl App {
     /// A later profile edit cannot redirect this key: the provider uses the
     /// captured expected endpoint to choose its credential slot.
     pub async fn set_api_key_for_profile(&self, expected: Profile, key: ApiKey) -> Result<()> {
+        let _update = self.inner.config_updates.lock().await;
         self.ensure_open()?;
         if self.profile(&expected.id)? != expected {
             return Err(Error::InvalidState(
@@ -826,23 +831,67 @@ impl App {
             .providers
             .set_api_key(&expected, key)
             .await
-            .map_err(Into::into)
+            .map_err(Error::from)?;
+
+        self.reload_profile_sessions_locked(&expected.id)
+            .await
+            .map_err(|error| Error::CredentialsSaved {
+                profile: expected.id,
+                message: error.to_string(),
+            })
+    }
+
+    async fn reload_profile_sessions(&self, profile: &ProfileId) -> Result<()> {
+        let _update = self.inner.config_updates.lock().await;
+        self.ensure_open()?;
+        self.reload_profile_sessions_locked(profile).await
+    }
+
+    async fn reload_profile_sessions_locked(&self, profile: &ProfileId) -> Result<()> {
+        let sessions = self.inner.sessions.lock().await;
+        let targets = sessions
+            .values()
+            .filter(|session| !session.releasing)
+            .map(|session| &session.handle)
+            .filter(|session| {
+                resolve_session_config(&self.inner.store, session.id()).is_ok_and(|config| {
+                    config.is_ok_and(|config| {
+                        config.worker.profile.id == *profile
+                            || config.coordinator.profile.id == *profile
+                    })
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(sessions);
+        reload_sessions(&targets, true).await
     }
 
     pub async fn login(&self, profile: ProfileId) -> Result<LoginAttempt> {
         self.ensure_open()?;
         let profile = self.profile(&profile)?;
         let providers = self.inner.providers.clone();
+        let app = self.clone();
+        let profile_id = profile.id.clone();
         let (state_tx, state) = watch::channel(Arc::new(LoginState::Connecting));
         let prompt_tx = state_tx.clone();
         let (cancel, cancellation) = oneshot::channel();
         tokio::spawn(async move {
-            let login = providers.login(&profile, move |prompt: DeviceCodePrompt| {
-                prompt_tx.send_replace(Arc::new(LoginState::DeviceCode {
-                    verification_uri: prompt.verification_uri,
-                    user_code: prompt.user_code,
-                }));
-            });
+            let login = async {
+                providers
+                    .login(&profile, move |prompt: DeviceCodePrompt| {
+                        prompt_tx.send_replace(Arc::new(LoginState::DeviceCode {
+                            verification_uri: prompt.verification_uri,
+                            user_code: prompt.user_code,
+                        }));
+                    })
+                    .await?;
+                // Authentication succeeded even if an unrelated invalid model
+                // prevents one Session from reloading. Each Session exposes
+                // that configuration problem through its normal state.
+                let _ = app.reload_profile_sessions(&profile_id).await;
+                Ok::<(), ProviderConnectError>(())
+            };
             tokio::select! {
                 result = login => {
                     let state = match result {
@@ -1115,11 +1164,48 @@ fn config_affects(scope: ConfigScope, session: &Session) -> bool {
     }
 }
 
-async fn reload_sessions(sessions: &[Session]) -> Result<()> {
+fn model_scope_applies(store: &DataStore, scope: ConfigScope, session: &Session) -> Result<bool> {
+    let session_config = store.config(ConfigScope::Session(session.id()))?;
+    match scope {
+        ConfigScope::Session(id) => Ok(session.id() == id),
+        ConfigScope::Workspace(workspace) => Ok(session.workspace() == workspace
+            && (session_config.worker.is_none() || session_config.coordinator.is_none())),
+        ConfigScope::User => {
+            let workspace_config = store.config(ConfigScope::Workspace(session.workspace()))?;
+            Ok(
+                (session_config.worker.is_none() && workspace_config.worker.is_none())
+                    || (session_config.coordinator.is_none()
+                        && workspace_config.coordinator.is_none()),
+            )
+        }
+    }
+}
+
+fn resolve_session_config(
+    store: &DataStore,
+    session: SessionId,
+) -> Result<std::result::Result<RuntimeConfig, ConfigProblem>> {
+    let saved = store.session(session)?.ok_or(Error::SessionNotFound)?;
+    let workspace = store
+        .workspace_by_id(saved.info.workspace)?
+        .ok_or(Error::WorkspaceNotFound)?;
+    let global = store.global_settings()?;
+    let workspace_config = store.config(ConfigScope::Workspace(workspace.id))?;
+    let session_config = store.config(ConfigScope::Session(session))?;
+    Ok(resolve_runtime(
+        &global,
+        Some(&workspace_config),
+        Some(&session_config),
+        &store.profiles()?,
+        workspace.root,
+    ))
+}
+
+async fn reload_sessions(sessions: &[Session], force: bool) -> Result<()> {
     let reloads = sessions
         .iter()
         .cloned()
-        .map(|session| tokio::spawn(async move { session.reload_config().await }))
+        .map(|session| tokio::spawn(async move { session.apply_persisted_config(force).await }))
         .collect::<Vec<_>>();
 
     let mut first_error = None;

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use bone_adapters::{
-    llm::{EndpointConfig, ModelOptions},
+    llm::{EndpointConfig, ModelOptions, protocol::openai_responses::ReasoningEffort},
     tools::ToolLimits,
 };
 use bone_core::AgentLimits;
@@ -13,6 +13,161 @@ const CHATGPT_PROFILE: &str = "chatgpt";
 pub(crate) const MAX_PERSISTED_VALUE_BYTES: usize = 1024 * 1024;
 // Bash retains stdout and stderr separately; JSON can escape each byte as six bytes.
 const MAX_TOOL_STREAM_BYTES: usize = 512 * 1024;
+
+/// A curated model choice for a first-party connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelPreset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub note: &'static str,
+    pub recommended: bool,
+    pub default_reasoning: Option<ReasoningEffort>,
+    pub supported_reasoning: &'static [ReasoningEffort],
+}
+
+const NONE_TO_MAX: &[ReasoningEffort] = &[
+    ReasoningEffort::None,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::Xhigh,
+    ReasoningEffort::Max,
+];
+const LOW_TO_MAX: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::Xhigh,
+    ReasoningEffort::Max,
+];
+const NONE_TO_XHIGH: &[ReasoningEffort] = &[
+    ReasoningEffort::None,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::Xhigh,
+];
+const LOW_TO_XHIGH: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::Xhigh,
+];
+
+// ChatGPT subscription access uses the Codex backend, so this picker follows
+// the current Codex product catalog rather than the general ChatGPT model list.
+const CHATGPT_MODEL_PRESETS: &[ModelPreset] = &[
+    ModelPreset {
+        id: "gpt-6-astra",
+        label: "GPT-6 Astra",
+        note: "Highest capability for difficult, long-running work",
+        recommended: false,
+        default_reasoning: Some(ReasoningEffort::Medium),
+        supported_reasoning: LOW_TO_MAX,
+    },
+    ModelPreset {
+        id: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        note: "Strong professional model for demanding work",
+        recommended: false,
+        default_reasoning: Some(ReasoningEffort::Medium),
+        supported_reasoning: NONE_TO_MAX,
+    },
+    ModelPreset {
+        id: "gpt-5.6-terra",
+        label: "GPT-5.6 Terra",
+        note: "Balanced capability and speed for everyday coding",
+        recommended: true,
+        default_reasoning: Some(ReasoningEffort::Medium),
+        supported_reasoning: NONE_TO_MAX,
+    },
+    ModelPreset {
+        id: "gpt-5.6-luna",
+        label: "GPT-5.6 Luna",
+        note: "Fast, efficient model for routine work",
+        recommended: false,
+        default_reasoning: Some(ReasoningEffort::Medium),
+        supported_reasoning: NONE_TO_MAX,
+    },
+    ModelPreset {
+        id: "gpt-5.5",
+        label: "GPT-5.5",
+        note: "Reliable previous-generation model",
+        recommended: false,
+        default_reasoning: Some(ReasoningEffort::Medium),
+        supported_reasoning: NONE_TO_XHIGH,
+    },
+    ModelPreset {
+        id: "gpt-5.3-codex-spark",
+        label: "GPT-5.3 Codex Spark",
+        note: "Fast coding model for short, focused tasks",
+        recommended: false,
+        default_reasoning: Some(ReasoningEffort::Medium),
+        supported_reasoning: LOW_TO_XHIGH,
+    },
+];
+
+const OPENAI_MODEL_PRESETS: &[ModelPreset] = &[
+    ModelPreset {
+        id: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        note: "Reliable model for demanding everyday work",
+        recommended: true,
+        default_reasoning: Some(ReasoningEffort::Medium),
+        supported_reasoning: NONE_TO_MAX,
+    },
+    ModelPreset {
+        id: "gpt-5.6-terra",
+        label: "GPT-5.6 Terra",
+        note: "Balanced model for everyday coding",
+        recommended: false,
+        default_reasoning: Some(ReasoningEffort::Medium),
+        supported_reasoning: NONE_TO_MAX,
+    },
+    ModelPreset {
+        id: "gpt-5.6-luna",
+        label: "GPT-5.6 Luna",
+        note: "Fast and affordable for routine work",
+        recommended: false,
+        default_reasoning: Some(ReasoningEffort::Medium),
+        supported_reasoning: NONE_TO_MAX,
+    },
+    ModelPreset {
+        id: "gpt-5.5",
+        label: "GPT-5.5",
+        note: "Proven previous-generation model",
+        recommended: false,
+        default_reasoning: Some(ReasoningEffort::Medium),
+        supported_reasoning: NONE_TO_XHIGH,
+    },
+];
+
+const ANTHROPIC_MODEL_PRESETS: &[ModelPreset] = &[
+    ModelPreset {
+        id: "claude-sonnet-4-6",
+        label: "Claude Sonnet 4.6",
+        note: "Balanced speed and capability",
+        recommended: true,
+        default_reasoning: None,
+        supported_reasoning: &[],
+    },
+    ModelPreset {
+        id: "claude-opus-4-8",
+        label: "Claude Opus 4.8",
+        note: "Most capable for complex work",
+        recommended: false,
+        default_reasoning: None,
+        supported_reasoning: &[],
+    },
+    ModelPreset {
+        id: "claude-haiku-4-5",
+        label: "Claude Haiku 4.5",
+        note: "Fastest and lowest-cost Claude model",
+        recommended: false,
+        default_reasoning: None,
+        supported_reasoning: &[],
+    },
+];
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -84,6 +239,22 @@ impl Profile {
             id: ProfileId::chatgpt(),
             label: "ChatGPT subscription".into(),
             endpoint: EndpointConfig::ChatGptSubscription,
+        }
+    }
+
+    /// Returns the curated choices for an official provider connection.
+    ///
+    /// Compatible services use their own model IDs, so profiles with a custom
+    /// base URL intentionally have no presets.
+    pub fn model_presets(&self) -> &'static [ModelPreset] {
+        match &self.endpoint {
+            EndpointConfig::ChatGptSubscription => CHATGPT_MODEL_PRESETS,
+            EndpointConfig::OpenAiResponses { base_url: None }
+            | EndpointConfig::OpenAiChatCompletions { base_url: None } => OPENAI_MODEL_PRESETS,
+            EndpointConfig::AnthropicMessages { base_url: None } => ANTHROPIC_MODEL_PRESETS,
+            EndpointConfig::OpenAiResponses { base_url: Some(_) }
+            | EndpointConfig::OpenAiChatCompletions { base_url: Some(_) }
+            | EndpointConfig::AnthropicMessages { base_url: Some(_) } => &[],
         }
     }
 
@@ -193,6 +364,7 @@ pub enum ConfigScope {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ConfigChange {
+    Model(Option<ModelSelection>),
     Worker(Option<ModelSelection>),
     Coordinator(Option<ModelSelection>),
     Limits(Option<AgentLimits>),
@@ -276,7 +448,7 @@ fn nearest<'a>(
     session.or(workspace).or(user)
 }
 
-fn resolve_model(
+pub(crate) fn resolve_model(
     selection: ModelSelection,
     profiles: &[Profile],
 ) -> Result<ResolvedModel, ConfigProblem> {
@@ -360,6 +532,7 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::providers::{anthropic, openai};
 
     fn model(name: &str) -> ModelSelection {
         ModelSelection::new(ProfileId::new("test").unwrap(), name).unwrap()
@@ -372,6 +545,10 @@ mod tests {
             EndpointConfig::OpenAiResponses { base_url: None },
         )
         .unwrap()
+    }
+
+    fn profile_for(endpoint: EndpointConfig) -> Profile {
+        Profile::new(ProfileId::new("test").unwrap(), "Test", endpoint).unwrap()
     }
 
     fn settings() -> RuntimeSettings {
@@ -446,6 +623,99 @@ mod tests {
             },
         );
         assert_eq!(profile, Err(ConfigError::InsecureEndpoint));
+    }
+
+    #[test]
+    fn official_profiles_offer_curated_provider_models() {
+        let chatgpt = Profile::chatgpt();
+        assert_eq!(
+            chatgpt
+                .model_presets()
+                .iter()
+                .map(|preset| preset.id)
+                .collect::<Vec<_>>(),
+            [
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.3-codex-spark",
+            ]
+        );
+        assert!(chatgpt.model_presets().iter().all(|preset| {
+            preset.default_reasoning == Some(ReasoningEffort::Medium)
+                && preset
+                    .supported_reasoning
+                    .contains(&ReasoningEffort::Medium)
+        }));
+
+        let openai_models = [
+            openai::GPT_5_6_SOL,
+            openai::GPT_5_6_TERRA,
+            openai::GPT_5_6_LUNA,
+            openai::GPT_5_5,
+        ];
+        for endpoint in [
+            EndpointConfig::OpenAiResponses { base_url: None },
+            EndpointConfig::OpenAiChatCompletions { base_url: None },
+        ] {
+            assert_eq!(
+                profile_for(endpoint)
+                    .model_presets()
+                    .iter()
+                    .map(|preset| preset.id)
+                    .collect::<Vec<_>>(),
+                openai_models
+            );
+        }
+
+        assert_eq!(
+            profile_for(EndpointConfig::AnthropicMessages { base_url: None })
+                .model_presets()
+                .iter()
+                .map(|preset| preset.id)
+                .collect::<Vec<_>>(),
+            [
+                anthropic::completion::CLAUDE_SONNET_4_6,
+                anthropic::completion::CLAUDE_OPUS_4_8,
+                anthropic::completion::CLAUDE_HAIKU_4_5,
+            ]
+        );
+    }
+
+    #[test]
+    fn every_official_catalog_has_one_clear_recommendation() {
+        for presets in [
+            Profile::chatgpt().model_presets(),
+            profile_for(EndpointConfig::OpenAiResponses { base_url: None }).model_presets(),
+            profile_for(EndpointConfig::AnthropicMessages { base_url: None }).model_presets(),
+        ] {
+            assert_eq!(
+                presets.iter().filter(|preset| preset.recommended).count(),
+                1
+            );
+            assert!(presets.iter().all(|preset| {
+                !preset.id.is_empty() && !preset.label.is_empty() && !preset.note.is_empty()
+            }));
+        }
+    }
+
+    #[test]
+    fn custom_endpoints_do_not_claim_provider_model_availability() {
+        for endpoint in [
+            EndpointConfig::OpenAiResponses {
+                base_url: Some("https://example.com/responses".into()),
+            },
+            EndpointConfig::OpenAiChatCompletions {
+                base_url: Some("https://example.com/chat".into()),
+            },
+            EndpointConfig::AnthropicMessages {
+                base_url: Some("https://example.com/messages".into()),
+            },
+        ] {
+            assert!(profile_for(endpoint).model_presets().is_empty());
+        }
     }
 
     #[test]

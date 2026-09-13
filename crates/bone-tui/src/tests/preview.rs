@@ -208,7 +208,32 @@ fn render_preview_artifact() {
                 },
             }),
         );
-    } else if matches!(scenario.as_str(), "models" | "connection" | "form") {
+    } else if matches!(
+        scenario.as_str(),
+        "models" | "reasoning" | "connection" | "form"
+    ) {
+        let choices = bone_app::Profile::chatgpt()
+            .model_presets()
+            .iter()
+            .map(|preset| {
+                let mut selection =
+                    bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), preset.id)
+                        .unwrap();
+                selection.options = preset.default_reasoning.map(|effort| {
+                    bone_app::ModelOptions::OpenAiResponses {
+                        reasoning: bone_app::Reasoning::new().effort(effort),
+                    }
+                });
+                crate::state::ModelChoice {
+                    selection,
+                    profile_label: "ChatGPT".into(),
+                    label: preset.label.into(),
+                    note: preset.note.into(),
+                    recommended: preset.recommended,
+                }
+            })
+            .collect::<Vec<_>>();
+        let model_count = choices.len();
         let effects = update(&mut state, UiEvent::Action(Action::OpenModels));
         for effect in effects {
             if let Effect::LoadModels { session, request } = effect {
@@ -217,17 +242,22 @@ fn render_preview_artifact() {
                     UiEvent::ModelsLoaded {
                         session,
                         request,
-                        choices: vec![],
-                        profiles: vec![],
+                        choices: choices.clone(),
+                        profiles: vec![bone_app::Profile::chatgpt()],
                     },
                 );
             }
         }
-        if matches!(scenario.as_str(), "connection" | "form") {
-            update(&mut state, UiEvent::Action(Action::ActivatePanel));
+        if scenario == "reasoning" {
+            update(&mut state, UiEvent::Action(Action::SelectModel(2)));
+        } else if matches!(scenario.as_str(), "connection" | "form") {
+            update(
+                &mut state,
+                UiEvent::Action(Action::SelectModel(model_count)),
+            );
         }
         if scenario == "form" {
-            update(&mut state, UiEvent::Action(Action::ActivatePanel));
+            update(&mut state, UiEvent::Action(Action::ChooseConnection(1)));
         }
     }
     if scenario == "resized" {

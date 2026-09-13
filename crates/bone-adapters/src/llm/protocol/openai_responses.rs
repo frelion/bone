@@ -52,6 +52,10 @@ impl Reasoning {
         self
     }
 
+    pub fn effort_level(&self) -> Option<ReasoningEffort> {
+        self.effort
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.effort.is_none()
             && self.summary.is_none()
@@ -77,6 +81,20 @@ string_enum!(ReasoningEffort {
     Xhigh,
     Max,
 });
+
+impl ReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
 string_enum!(ReasoningSummary {
     Auto,
     Concise,
@@ -150,7 +168,7 @@ where
     H: HttpClientExt + Clone + Default + Debug + Send + Sync + 'static,
 {
     from_model_factory(endpoint_id, move |model_id| {
-        client.completion_model(model_id)
+        client.completion_model(model_id).with_strict_tools()
     })
 }
 
