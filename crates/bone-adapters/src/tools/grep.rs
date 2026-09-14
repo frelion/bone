@@ -123,7 +123,8 @@ impl Tool for GrepTool {
         ToolDefinition::new(
             "grep",
             format!(
-                "Search text files inside the workspace with a Rust regular expression or literal string. The search respects bounded workspace-local ignore files at or below the selected search root (rules above an explicitly selected root are not inherited), skips binary and oversized files, never enters VCS metadata, and returns at most {} sorted matching lines. If truncated, the selected subset can depend on filesystem enumeration order.",
+                "Search text files inside workspace `{}` with a Rust regular expression or literal string. Relative paths use that workspace root. The search respects bounded workspace-local ignore files at or below the selected search root (rules above an explicitly selected root are not inherited), skips binary and oversized files, never enters VCS metadata, and returns at most {} sorted matching lines. If truncated, the selected subset can depend on filesystem enumeration order.",
+                self.environment.workspace_root().display(),
                 self.environment.limits.max_grep_matches,
             ),
             json!({

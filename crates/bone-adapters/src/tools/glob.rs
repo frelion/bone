@@ -75,8 +75,10 @@ impl Tool for GlobTool {
         ToolDefinition::new(
             "glob",
             format!(
-                "Find files inside the workspace using a root-relative glob. The search respects bounded workspace-local ignore files at or below the selected search root (rules above an explicitly selected root are not inherited), never enters VCS metadata, and returns at most {} sorted paths after scanning at most {} entries. If truncated, the selected subset can depend on filesystem enumeration order.",
-                self.environment.limits.max_glob_results, self.environment.limits.max_walk_entries,
+                "Find files inside workspace `{}` using a root-relative glob. Relative paths use that workspace root. The search respects bounded workspace-local ignore files at or below the selected search root (rules above an explicitly selected root are not inherited), never enters VCS metadata, and returns at most {} sorted paths after scanning at most {} entries. If truncated, the selected subset can depend on filesystem enumeration order.",
+                self.environment.workspace_root().display(),
+                self.environment.limits.max_glob_results,
+                self.environment.limits.max_walk_entries,
             ),
             json!({
                 "type": "object",

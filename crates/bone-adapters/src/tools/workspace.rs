@@ -66,7 +66,24 @@ impl Workspace {
     }
 
     pub(crate) async fn resolve_patch_path(&self, raw: &str) -> Result<ResolvedPath, ToolError> {
-        let relative = normalize_relative(raw)?;
+        if raw.trim().is_empty() {
+            return Err(ToolError::InvalidArgs(
+                "patch path must not be empty".to_owned(),
+            ));
+        }
+        reject_nul(raw)?;
+        let requested = Path::new(raw);
+        let relative = if requested.is_absolute() {
+            let inside =
+                requested
+                    .strip_prefix(self.root())
+                    .map_err(|_| ToolError::OutsideWorkspace {
+                        path: raw.to_owned(),
+                    })?;
+            normalize_relative_path(inside, raw)?
+        } else {
+            normalize_relative(raw)?
+        };
         let candidate = self.root.join(&relative);
 
         let mut inspected = self.root().to_path_buf();
@@ -151,6 +168,10 @@ fn normalize_relative(raw: &str) -> Result<PathBuf, ToolError> {
         });
     }
 
+    normalize_relative_path(path, raw)
+}
+
+fn normalize_relative_path(path: &Path, raw: &str) -> Result<PathBuf, ToolError> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -210,5 +231,33 @@ mod tests {
         assert!(normalize_relative("/tmp/secret").is_err());
         assert!(normalize_relative("C:\\tmp\\secret").is_err());
         assert!(normalize_relative("src/\0secret").is_err());
+    }
+
+    #[tokio::test]
+    async fn patch_path_accepts_absolute_path_inside_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+        let absolute = workspace.root().join("nested/file.txt");
+
+        let resolved = workspace
+            .resolve_patch_path(absolute.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.absolute, absolute);
+        assert_eq!(resolved.display, "nested/file.txt");
+    }
+
+    #[tokio::test]
+    async fn patch_path_rejects_absolute_path_outside_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(temp.path()).unwrap();
+
+        let result = workspace
+            .resolve_patch_path(outside.path().join("file.txt").to_str().unwrap())
+            .await;
+
+        assert!(matches!(result, Err(ToolError::OutsideWorkspace { .. })));
     }
 }

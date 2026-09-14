@@ -261,7 +261,7 @@ impl Kernel {
                 let mut assignment = Assignment::new(JobSpec::new(
                     "Handle the assigned user request.",
                     "Handle the assigned user input within its stated boundaries.",
-                    "The assigned user input is answered or completed.",
+                    "The requested outcome is delivered and checked against the original input, or concrete unmet requirements are reported.",
                 ));
                 assignment.inputs = delivery.inputs.clone();
                 self.create_job(Owner::User, assignment, effects)

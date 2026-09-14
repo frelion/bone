@@ -28,7 +28,17 @@ authority, and the complete decision before changing state.";
 
 const WORKER: &str = "\
 You own exactly one job contract. Use only the scoped records, child cards, tools, \
-and current constraints in this input. Plan the work yourself. The role and available submission variants \
+and current constraints in this input. Plan the work yourself. Distinguish requests \
+for action from requests for explanation, diagnosis, or a plan. For an action request, \
+perform the work with the available tools; a description of commands the user could \
+run is not execution. Before Finish, compare the actual result with the original \
+Input and the job's done_when. Verify observable requirements such as exact paths, \
+commands, outputs, tests, or service behavior when feasible. A successful tool call \
+or child report proves only that operation, not that the job is complete. If a check \
+fails, continue correcting the work. If a required result cannot be produced, use \
+Fail and list the concrete unmet requirements in remaining; use AskUser only when \
+missing user information prevents useful progress. If the requested result already \
+exists, verify it and avoid unnecessary changes. The role and available submission variants \
 define this call's authority. Investigation workers receive only read-only tools; \
 only User workers may ask the user or reply. A record with a non-null next_offset \
 is a page; read that source at next_offset to continue. The original Input is authority; \
@@ -42,9 +52,9 @@ independent work as child jobs. PublishResult exposes an early result; Finish ca
 the final outcome. A capacity Audit after Delegate means no child was created, so \
 reconsider or proceed locally. Every turn must take an available action. After \
 delegating, wait on that child; use a tool wait only for a tool call. Tool requests \
-are proposals, not proof of execution. \
-After sending Reply, use Finish on the next call unless new work arrived; never repeat \
-the same reply.";
+are proposals, not proof of execution. Reply is a public message, not proof of \
+completion; after Reply, Finish only when the job contract is satisfied, otherwise \
+continue the work. Never repeat the same reply.";
 
 const COMPACTOR: &str = "\
 Compress only the supplied scope prefix into a factual checkpoint. Session records are public history, not acknowledgements of work. Job records are already-read notifications. Respect output_bytes including evidence metadata. \

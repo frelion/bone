@@ -83,7 +83,8 @@ impl Tool for ApplyPatchTool {
         ToolDefinition::new(
             "apply_patch",
             format!(
-                "Apply file changes inside the workspace. Grammar: wrap operations in `{BEGIN_PATCH}` and `{END_PATCH}`; `*** Add File: PATH` is followed by `+` lines; `*** Delete File: PATH` deletes a file; `*** Update File: PATH` uses `@@` hunks with context lines prefixed by a space, removals by `-`, and additions by `+`; an optional `*** Move to: PATH` must immediately follow its Update header. Paths must be workspace-relative. Limits: {} UTF-8 patch bytes, {} file operations, {} bytes per existing file, and {} combined existing-file bytes.",
+                "Apply file changes inside workspace `{}`. Grammar: wrap operations in `{BEGIN_PATCH}` and `{END_PATCH}`; `*** Add File: PATH` is followed by `+` lines; `*** Delete File: PATH` deletes a file; `*** Update File: PATH` uses `@@` hunks with context lines prefixed by a space, removals by `-`, and additions by `+`; an optional `*** Move to: PATH` must immediately follow its Update header. Paths may be relative to that workspace or absolute paths inside it. Limits: {} UTF-8 patch bytes, {} file operations, {} bytes per existing file, and {} combined existing-file bytes.",
+                self.environment.workspace_root().display(),
                 self.environment.limits.max_patch_bytes,
                 self.environment.limits.max_patch_files,
                 self.environment.limits.max_patch_file_bytes,
@@ -1781,6 +1782,49 @@ mod tests {
         assert_eq!(
             output.changes[0].moved_to.as_deref(),
             Some("nested/new.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn absolute_workspace_paths_support_all_patch_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = tokio::fs::canonicalize(temp.path()).await.unwrap();
+        tokio::fs::write(root.join("update.txt"), "before\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("delete.txt"), "remove\n")
+            .await
+            .unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+added\n*** Update File: {}\n*** Move to: {}\n@@\n-before\n+after\n*** Delete File: {}\n*** End Patch",
+            root.join("add.txt").display(),
+            root.join("update.txt").display(),
+            root.join("moved.txt").display(),
+            root.join("delete.txt").display(),
+        );
+
+        let output = apply(&tool(&root), &patch).await;
+
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("add.txt"))
+                .await
+                .unwrap(),
+            "added\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("moved.txt"))
+                .await
+                .unwrap(),
+            "after\n"
+        );
+        assert!(!root.join("update.txt").exists());
+        assert!(!root.join("delete.txt").exists());
+        assert_eq!(output.changes.len(), 3);
+        assert!(
+            output
+                .changes
+                .iter()
+                .all(|change| !change.path.starts_with('/'))
         );
     }
 

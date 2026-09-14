@@ -290,7 +290,8 @@ impl Tool for BashTool {
         ToolDefinition::new(
             "bash",
             format!(
-                "Execute one non-interactive Bash command in the workspace with a sanitized child environment. Returns bounded stdout and stderr, exit code, timeout state, and truncation state. Commands are limited to {} UTF-8 bytes, each output stream to {} bytes, and at most {}. Unix timeout or cancellation kills the process group; on non-Unix only the direct Bash child is guaranteed to terminate and descendants may survive.",
+                "Execute one non-interactive Bash command in workspace `{}` with a sanitized child environment. The default working directory is that workspace root. Returns bounded stdout and stderr, exit code, timeout state, and truncation state. Commands are limited to {} UTF-8 bytes, each output stream to {} bytes, and at most {}. Unix timeout or cancellation kills the process group; on non-Unix only the direct Bash child is guaranteed to terminate and descendants may survive.",
+                self.environment.workspace_root().display(),
                 self.environment.limits.max_bash_command_bytes,
                 self.environment.limits.max_output_bytes,
                 display_duration(self.environment.limits.max_bash_timeout)

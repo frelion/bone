@@ -129,3 +129,41 @@ For every published number, retain the complete job directory and record:
 - every failed or interrupted attempt
 
 Compare changes on the same suite configuration. Use smoke for plumbing, regression for iteration, and the full suite sparingly; repeatedly tuning against the full public set weakens its value as a release check. A separate private held-out set can be added later for contamination-resistant product decisions.
+
+## Local behavior regression
+
+`benchmarks.behavior` checks BONE's execute-and-verify behavior separately from
+Terminal-Bench infrastructure. It runs five fixed cases serially in
+native-architecture Ubuntu 24.04 Podman containers and uses the existing BONE
+ChatGPT subscription cache. Provide Linux binaries for the candidate and,
+optionally, the baseline:
+
+```bash
+python3 -m benchmarks.behavior \
+  --binary target/linux/release/bone \
+  --baseline-binary target/linux-baseline/release/bone
+```
+
+Candidate cases run three times by default; baseline cases run once. Prompts,
+native results, trajectories, verifier logs, and the aggregate `summary.json`
+are written below `benchmarks/results/behavior/`. Credentials are mounted from
+the private BONE cache and are never copied into that directory. These results
+are local behavior regressions, not Terminal-Bench scores.
+
+## Aider Polyglot Python smoke
+
+`benchmarks.polyglot` runs five fixed Python exercises from Aider's public
+Polyglot benchmark. The source repository is pinned to an exact commit and
+cached below the ignored results directory. Each exercise runs in its own
+native-architecture Podman container. Solution files are writable under
+`/app`; independent tests are mounted read-only under `/tests`.
+
+```bash
+/opt/homebrew/bin/python3 -m benchmarks.polyglot \
+  --binary target/behavior-linux/candidate/release/bone
+```
+
+The default suite is `proverb`, `grade-school`, `phone-number`, `robot-name`,
+and `wordy`, with one attempt per task. Use repeated `--task` options for a
+smaller diagnostic run. This is a stable BONE smoke subset, not a claim of
+comparability with Aider's full multi-language leaderboard.

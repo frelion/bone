@@ -58,7 +58,8 @@ impl Tool for ReadTool {
         ToolDefinition::new(
             "read",
             format!(
-                "Read a UTF-8 text file inside the workspace with line numbers. Files are limited to {} bytes and output to {} lines or {} bytes; use offset and limit to continue. A truncated long-line tail is omitted.",
+                "Read a UTF-8 text file inside workspace `{}` with line numbers. Relative paths use that workspace root. Files are limited to {} bytes and output to {} lines or {} bytes; use offset and limit to continue. A truncated long-line tail is omitted.",
+                self.environment.workspace_root().display(),
                 self.environment.limits.max_read_file_bytes,
                 self.environment.limits.max_read_lines,
                 self.environment.limits.max_output_bytes
