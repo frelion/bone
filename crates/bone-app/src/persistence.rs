@@ -3317,6 +3317,54 @@ pub(crate) enum AcceptanceError {
 fn public_agent_event(runtime: RuntimeId, record: &Record) -> Option<SessionEvent> {
     use bone_core::RecordBody;
     match &record.body {
+        RecordBody::JobCreated { job, spec, owner } => Some(SessionEvent::JobCreated {
+            job: crate::JobRef { runtime, id: job.0 },
+            owner: match owner {
+                bone_core::Owner::User => crate::JobOwner::User,
+                bone_core::Owner::Job(parent) => crate::JobOwner::Job(crate::JobRef {
+                    runtime,
+                    id: parent.0,
+                }),
+                bone_core::Owner::Routing(_) => crate::JobOwner::Routing,
+            },
+            goal: spec.goal.clone(),
+            scope: spec.scope.clone(),
+            done_when: spec.done_when.clone(),
+        }),
+        RecordBody::CallStarted {
+            call,
+            kind,
+            job,
+            tool,
+        } => Some(SessionEvent::CallStarted {
+            call: crate::CallRef {
+                runtime,
+                id: call.0,
+            },
+            job: job.map(|job| crate::JobRef { runtime, id: job.0 }),
+            kind: match kind {
+                bone_core::CallKind::Coordinate => crate::ActivityKind::Coordinate,
+                bone_core::CallKind::Work => crate::ActivityKind::Work,
+                bone_core::CallKind::Compact => crate::ActivityKind::Compact,
+                bone_core::CallKind::Tool => crate::ActivityKind::Tool {
+                    name: tool
+                        .as_ref()
+                        .map_or_else(|| "tool".into(), |request| request.name.clone()),
+                },
+            },
+        }),
+        RecordBody::CallFinished {
+            call,
+            error,
+            external_effect,
+        } => Some(SessionEvent::CallFinished {
+            call: crate::CallRef {
+                runtime,
+                id: call.0,
+            },
+            error: error.clone(),
+            external_effect: *external_effect,
+        }),
         RecordBody::Reply { job, inputs, text } => Some(SessionEvent::Reply {
             job: crate::JobRef { runtime, id: job.0 },
             inputs: inputs.iter().map(|id| InputId(id.0)).collect(),
@@ -3772,8 +3820,75 @@ mod tests {
     };
 
     use super::*;
-    use crate::{ModelSelection, ProfileId};
+    use crate::{ActivityKind, JobOwner, ModelSelection, ProfileId};
     use bone_adapters::tools::BashOutput;
+
+    #[test]
+    fn public_history_projects_job_and_call_lifecycle_without_tool_arguments() {
+        let runtime = RuntimeId::new();
+        let job = bone_core::JobId(3);
+        let call = bone_core::CallId(7);
+        let spec = bone_core::JobSpec::new("inspect", "one file", "report findings");
+        let created = Record {
+            seq: bone_core::Seq(1),
+            origin: bone_core::Origin::Kernel,
+            body: bone_core::RecordBody::JobCreated {
+                job,
+                spec,
+                owner: bone_core::Owner::User,
+            },
+        };
+        assert!(matches!(
+            public_agent_event(runtime, &created),
+            Some(SessionEvent::JobCreated {
+                job: JobRef { id: 3, .. },
+                owner: JobOwner::User,
+                ..
+            })
+        ));
+
+        let started = Record {
+            seq: bone_core::Seq(2),
+            origin: bone_core::Origin::Call(call),
+            body: bone_core::RecordBody::CallStarted {
+                call,
+                kind: bone_core::CallKind::Tool,
+                job: Some(job),
+                tool: Some(Arc::new(bone_core::ToolCall::new(
+                    "bash",
+                    serde_json::json!({"command": "secret argument"}),
+                ))),
+            },
+        };
+        assert_eq!(
+            public_agent_event(runtime, &started),
+            Some(SessionEvent::CallStarted {
+                call: CallRef { runtime, id: 7 },
+                job: Some(JobRef { runtime, id: 3 }),
+                kind: ActivityKind::Tool {
+                    name: "bash".into()
+                },
+            })
+        );
+
+        let finished = Record {
+            seq: bone_core::Seq(3),
+            origin: bone_core::Origin::Call(call),
+            body: bone_core::RecordBody::CallFinished {
+                call,
+                error: None,
+                external_effect: ExternalEffect::Applied,
+            },
+        };
+        assert_eq!(
+            public_agent_event(runtime, &finished),
+            Some(SessionEvent::CallFinished {
+                call: CallRef { runtime, id: 7 },
+                error: None,
+                external_effect: ExternalEffect::Applied,
+            })
+        );
+    }
 
     fn core_commit(id: &str, revision: u64, from: u64, through: u64) -> DurableCommit {
         DurableCommit {

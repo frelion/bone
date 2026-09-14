@@ -24,7 +24,7 @@ Pull-request CI validates manifests, command generation, the Harbor adapter impo
 
 ## Prerequisites
 
-You need a running Docker daemon, [`uv`/`uvx`](https://docs.astral.sh/uv/), and an OpenAI API key. A ChatGPT subscription login on the host cannot be used by BONE inside Harbor's task containers.
+You need Python 3.11 or newer, a running Docker daemon, [`uv`/`uvx`](https://docs.astral.sh/uv/), and an OpenAI API key. A ChatGPT subscription login on the host cannot be used by BONE inside Harbor's task containers.
 
 Set the key only in your local shell. Do not paste it into a command argument, manifest, log, issue, or commit:
 
@@ -167,3 +167,8 @@ The default suite is `proverb`, `grade-school`, `phone-number`, `robot-name`,
 and `wordy`, with one attempt per task. Use repeated `--task` options for a
 smaller diagnostic run. This is a stable BONE smoke subset, not a claim of
 comparability with Aider's full multi-language leaderboard.
+
+Each trial also writes `efficiency-profile.json`. It reconstructs Job ownership,
+model and tool call durations, concurrent call activity, time outside calls,
+cross-Job duplicate reads, and the delay after the final successful test run.
+Profiles contain tool names and outcomes but never copy tool arguments.

@@ -120,7 +120,7 @@ Session command channel 有界。已经持久化的 Queued 输入当前没有单
 
 `observe` 使用 Tokio `watch`，立即返回最近 View，随后只通知“状态已经变化”。watch 允许合并通知，不是事件队列。`snapshot` 通过 SessionTask 取得一次新鲜 View。
 
-`history(after, limit)` 从 SQLite journal 返回公开 `SessionEvent`，包含下一游标和 `has_more`；当前每页最多 32 项。公开事件包括输入保存/接受/拒绝/完成、问题、回复、Job 终态、工具终态、Runtime 生命周期、中断和写核查。Agent progress 可以进入内部 journal 以保持归档水位连续，但公开 history 过滤它，View 只保留最新 activity。
+`history(after, limit)` 从 SQLite journal 返回公开 `SessionEvent`，包含下一游标和 `has_more`；当前每页最多 32 项。公开事件包括输入保存/接受/拒绝/完成、问题、回复、Job 创建/终态、模型与工具调用生命周期、Runtime 生命周期、中断和写核查。调用开始事件只公开类型、Job / Call 身份和工具名，不公开工具参数。Agent progress 可以进入内部 journal 以保持归档水位连续，但公开 history 过滤它，View 只保留最新 activity。
 
 前端的无丢失读取顺序固定为：
 

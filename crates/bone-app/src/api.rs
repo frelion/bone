@@ -1,6 +1,6 @@
 use std::{fmt, path::PathBuf, sync::Arc};
 
-use bone_core::{ExternalEffect, InputOutcome, OutcomeKind, ToolOutcome};
+use bone_core::{CallError, ExternalEffect, InputOutcome, OutcomeKind, ToolOutcome};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -732,6 +732,23 @@ pub enum SessionEvent {
     },
     RuntimeClosed {
         runtime: RuntimeId,
+    },
+    JobCreated {
+        job: JobRef,
+        owner: JobOwner,
+        goal: String,
+        scope: String,
+        done_when: String,
+    },
+    CallStarted {
+        call: CallRef,
+        job: Option<JobRef>,
+        kind: ActivityKind,
+    },
+    CallFinished {
+        call: CallRef,
+        error: Option<CallError>,
+        external_effect: ExternalEffect,
     },
     Reply {
         job: JobRef,

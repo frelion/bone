@@ -79,10 +79,13 @@ pub(super) fn render(event: &SessionEvent, width: u16) -> Vec<MessageRow> {
         SessionEvent::WriteResolved { evidence, .. } => {
             vec![MessageRow::text(compact("·", evidence, SUCCESS), 0)]
         }
-        // Runtime lifecycle is transport plumbing, not conversation content.
+        // Runtime and execution lifecycle are transport plumbing, not conversation content.
         SessionEvent::RuntimeStarted { .. }
         | SessionEvent::RuntimeReconfigured { .. }
-        | SessionEvent::RuntimeClosed { .. } => Vec::new(),
+        | SessionEvent::RuntimeClosed { .. }
+        | SessionEvent::JobCreated { .. }
+        | SessionEvent::CallStarted { .. }
+        | SessionEvent::CallFinished { .. } => Vec::new(),
     }
 }
 

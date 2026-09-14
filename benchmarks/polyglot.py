@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from benchmarks.behavior import IMAGE, auth_root, ensure_image, validate_binary
+from benchmarks.profile import build_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -158,6 +159,17 @@ def one_trial(
         (trial_dir / "agent.log").write_text(agent.stdout, encoding="utf-8")
         result_path = trial_dir / "bone-result.json"
         native = json.loads(result_path.read_text(encoding="utf-8")) if result_path.is_file() else {}
+        trajectory_path = trial_dir / "bone-trajectory.json"
+        if trajectory_path.is_file():
+            trajectory = json.loads(trajectory_path.read_text(encoding="utf-8"))
+            try:
+                profile = build_profile(trajectory)
+            except ValueError:
+                profile = None
+            if profile is not None:
+                (trial_dir / "efficiency-profile.json").write_text(
+                    json.dumps(profile, indent=2) + "\n", encoding="utf-8"
+                )
         verifier_run = run(
             [
                 "podman", "exec", container, "bash", "-lc",
