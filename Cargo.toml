@@ -9,7 +9,7 @@ exclude = ["third_party/rig-core-0.42.0"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.88"
 
@@ -22,7 +22,7 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 http = "1"
 ignore = "0.4"
-keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rig-core = { version = "=0.42.0", path = "third_party/rig-core-0.42.0", default-features = false }
@@ -37,3 +37,6 @@ thiserror = "2"
 tokio = "1"
 uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2"
+
+[profile.release]
+strip = "symbols"

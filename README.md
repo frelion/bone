@@ -1,9 +1,12 @@
 # BONE
 
-BONE 是一个用 Rust 编写的 coding agent 基座。当前 workspace 只有三个 crate，分别承载可信执行内核、基础设施适配器和 headless 应用层；终端界面尚未重建。
+BONE 是一个用 Rust 编写的 coding agent。当前 workspace 包含可信执行内核、基础设施适配器、headless 应用层和终端界面。
 
 ```text
-future TUI / desktop / web / automation
+future desktop / web / automation
+                    │
+                    ▼
+                bone-tui
                     │
                     ▼
                 bone-app
@@ -15,8 +18,30 @@ future TUI / desktop / web / automation
 - [`bone-core`](crates/bone-core/) 是唯一的 Agent 状态机：解释输入、组织 Job、构造局部上下文、授权模型与工具调用，并裁决取消、完成和迟到结果。
 - [`bone-adapters`](crates/bone-adapters/) 实现 LLM 协议、模型端口和 workspace 内的读、搜索、补丁与命令工具。它依赖 Core 的端口，Core 不依赖任何 provider、文件系统或进程实现。
 - [`bone-app`](crates/bone-app/) 是 composition root：管理 Workspace、Session、配置、凭据、SQLite 持久化、外部写事实和 Runtime 生命周期，并向所有前端提供同一套 Rust API。
+- [`bone-tui`](crates/bone-tui/) 提供可直接运行的 `bone` 终端程序。
 
-原来的 `bone-store` 已成为 `bone-app` 的私有模块。旧 TUI 和 `bone` 二进制已经删除；新的 TUI 将作为独立前端，只依赖 `bone-app`。
+原来的 `bone-store` 已成为 `bone-app` 的私有模块。新的 TUI 是独立前端，只依赖 `bone-app`。
+
+## 下载和运行
+
+从 [GitHub Releases](https://github.com/frelion/bone/releases/latest) 下载与你的系统匹配的文件：
+
+| 系统 | 文件 |
+| --- | --- |
+| Linux x86-64 | `bone-linux-x86_64` |
+| Linux ARM64 | `bone-linux-aarch64` |
+| macOS Intel | `bone-macos-x86_64` |
+| macOS Apple Silicon | `bone-macos-aarch64` |
+| Windows x86-64 | `bone-windows-x86_64.exe` |
+
+Linux 和 macOS 下载后赋予执行权限即可运行：
+
+```sh
+chmod +x ./bone-*
+./bone-linux-x86_64 # 按实际下载的文件名替换
+```
+
+Windows 可直接运行下载的 `.exe`。`SHA256SUMS` 可用于校验下载文件。
 
 ## 最小使用路径
 
