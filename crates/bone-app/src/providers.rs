@@ -29,6 +29,7 @@ use crate::{
 pub(crate) struct ProviderConnector {
     chatgpt: Arc<Mutex<ChatGptState>>,
     chatgpt_operation: Arc<RwLock<()>>,
+    volatile_api_keys: Arc<RwLock<HashMap<ProfileId, VolatileApiKey>>>,
     #[cfg(test)]
     test_endpoints: HashMap<ProfileId, Endpoint>,
 }
@@ -42,6 +43,11 @@ struct ChatGptState {
 
 struct ChatGptConnection {
     endpoint: Endpoint,
+}
+
+struct VolatileApiKey {
+    profile: Profile,
+    key: Arc<ApiKey>,
 }
 
 impl ChatGptState {
@@ -237,6 +243,7 @@ impl ProviderConnector {
             })
             .await;
         }
+        self.volatile_api_keys.write().await.remove(&profile.id);
         let profile = profile.clone();
         credential_task(profile.id.clone(), move || {
             ApiKeyCredentials::for_profile(&profile)
@@ -277,6 +284,29 @@ impl ProviderConnector {
                 .map_err(|error| api_key_error(profile.id, error))
         })
         .await
+    }
+
+    /// Keep an API key only for the lifetime of this App process.
+    ///
+    /// Headless clients use this path in containers that intentionally lack a
+    /// desktop credential service. The key is never persisted or serialized.
+    pub(crate) async fn set_volatile_api_key(
+        &self,
+        profile: &Profile,
+        key: ApiKey,
+    ) -> Result<(), ProviderConnectError> {
+        validate_profile(profile)?;
+        if matches!(profile.endpoint, EndpointConfig::ChatGptSubscription) {
+            return Err(ProviderConnectError::InvalidProfile(profile.id.clone()));
+        }
+        self.volatile_api_keys.write().await.insert(
+            profile.id.clone(),
+            VolatileApiKey {
+                profile: profile.clone(),
+                key: Arc::new(key),
+            },
+        );
+        Ok(())
     }
 
     async fn connect_chatgpt(&self) -> Result<Arc<ChatGptConnection>, ProviderConnectError> {
@@ -322,14 +352,26 @@ impl ProviderConnector {
                         .endpoint
                         .clone()
                 } else {
-                    let owned_profile = profile.clone();
-                    let key = credential_task(profile.id.clone(), move || {
-                        ApiKeyCredentials::for_profile(&owned_profile)
-                            .and_then(|credentials| credentials.read())
-                            .map_err(|error| api_key_error(owned_profile.id, error))
-                    })
-                    .await?;
-                    api_endpoint(profile, key)?
+                    let volatile = self
+                        .volatile_api_keys
+                        .read()
+                        .await
+                        .get(&profile.id)
+                        .filter(|saved| saved.profile == *profile)
+                        .map(|saved| Arc::clone(&saved.key));
+                    match volatile {
+                        Some(key) => api_endpoint(profile, key.as_ref())?,
+                        None => {
+                            let owned_profile = profile.clone();
+                            let key = credential_task(profile.id.clone(), move || {
+                                ApiKeyCredentials::for_profile(&owned_profile)
+                                    .and_then(|credentials| credentials.read())
+                                    .map_err(|error| api_key_error(owned_profile.id, error))
+                            })
+                            .await?;
+                            api_endpoint(profile, &key)?
+                        }
+                    }
                 };
                 endpoints.insert(profile.id.clone(), endpoint.clone());
                 endpoint
@@ -396,7 +438,7 @@ impl ModelPort for ConnectedModels {
     }
 }
 
-fn api_endpoint(profile: &Profile, key: ApiKey) -> Result<Endpoint, ProviderConnectError> {
+fn api_endpoint(profile: &Profile, key: &ApiKey) -> Result<Endpoint, ProviderConnectError> {
     let endpoint = match &profile.endpoint {
         EndpointConfig::OpenAiResponses { base_url } => match base_url {
             Some(url) => openai_responses::compatible(
@@ -508,7 +550,8 @@ mod tests {
             ),
         ] {
             let profile = Profile::new(ProfileId::new("test").unwrap(), "Test", config).unwrap();
-            let endpoint = api_endpoint(&profile, ApiKey::new("test-key".into()).unwrap()).unwrap();
+            let endpoint =
+                api_endpoint(&profile, &ApiKey::new("test-key".into()).unwrap()).unwrap();
             assert_eq!(endpoint.id(), "test");
             assert_eq!(endpoint.protocol(), protocol);
         }

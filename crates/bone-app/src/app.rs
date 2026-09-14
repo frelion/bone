@@ -816,6 +816,20 @@ impl App {
         self.set_api_key_for_profile(profile, key).await
     }
 
+    /// Configure an API key for this App process without writing it to the
+    /// platform credential store. Intended for headless and container clients.
+    pub async fn set_volatile_api_key(&self, profile: ProfileId, key: ApiKey) -> Result<()> {
+        let _update = self.inner.config_updates.lock().await;
+        self.ensure_open()?;
+        let expected = self.profile(&profile)?;
+        self.inner
+            .providers
+            .set_volatile_api_key(&expected, key)
+            .await
+            .map_err(Error::from)?;
+        self.reload_profile_sessions_locked(&profile).await
+    }
+
     /// Save credentials only for the caller's observed profile and endpoint.
     /// A later profile edit cannot redirect this key: the provider uses the
     /// captured expected endpoint to choose its credential slot.

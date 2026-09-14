@@ -43,6 +43,29 @@ chmod +x ./bone-*
 
 Windows 可直接运行下载的 `.exe`。`SHA256SUMS` 可用于校验下载文件。
 
+### 在项目里执行一次任务
+
+交互使用直接运行 `bone`。自动化、真实场景测试或 CI 使用同一个二进制的
+`bone run`，它不启动 TUI，完成后在 stdout 输出 JSON：
+
+```sh
+export OPENAI_API_KEY='你的 API key'
+bone run \
+  --workspace /path/to/project \
+  --prompt '修复失败的测试，并运行相关测试验证修改' \
+  --model gpt-5.6-sol \
+  --trajectory ./artifacts/bone-trajectory.json \
+  --result ./artifacts/bone-result.json
+```
+
+也可以用 `--prompt-file issue.md` 从文件读取任务。headless 模式默认允许修改
+workspace；只做调查时加 `--read-only`。API key 只在当前进程内存中使用，不写入
+Bone 数据库或系统密钥环。运行 `bone run --help` 可查看 provider、自定义 HTTPS
+endpoint、超时和退出码参数。
+
+权威 benchmark 的 Harbor 适配、公开测试集选择和结果留存规范见
+[`benchmarks/README.md`](benchmarks/README.md)。
+
 ## 最小使用路径
 
 `App` 打开一份宿主指定的数据目录；Workspace 精确绑定到一个已经存在的目录；Session 是可持久恢复的用户工作单元。
