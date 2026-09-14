@@ -7,9 +7,9 @@ use std::{
 };
 
 use bone_app::{
-    ApiKey, App, AppOptions, AppProblem, ConfigChange, ConfigScope, EndpointConfig, HistoryEntry,
-    InputId, InputOutcome, InputState, ModelSelection, Profile, ProfileId, Session, SessionEvent,
-    SessionSeq, SubmitInput, ToolLimits, ToolMode, ToolSettings,
+    AgentLimits, ApiKey, App, AppOptions, AppProblem, ConfigChange, ConfigScope, EndpointConfig,
+    HistoryEntry, InputId, InputOutcome, InputState, ModelSelection, Profile, ProfileId, Session,
+    SessionEvent, SessionSeq, SubmitInput, ToolLimits, ToolMode, ToolSettings,
 };
 use serde::Serialize;
 
@@ -198,6 +198,36 @@ async fn execute(options: Options) -> Result<u8, String> {
     if let Some(model) = &options.model {
         configure_model(&app, workspace.id, &options, model).await?;
     }
+    let tool_limits = ToolLimits::default();
+    if !options.read_only {
+        // A previous failed launch may have persisted write mode with limits that
+        // cannot be resolved together. Temporarily restoring read-only mode lets
+        // us preserve every effective agent limit except the incompatible timeout.
+        app.update_config(
+            ConfigScope::Workspace(workspace.id),
+            ConfigChange::Tools(Some(ToolSettings {
+                mode: ToolMode::ReadOnly,
+                limits: tool_limits.clone(),
+            })),
+        )
+        .await
+        .map_err(|error| format!("could not prepare workspace tools: {error}"))?;
+        let resolved = app
+            .resolved_workspace_config(workspace.id)
+            .await
+            .map_err(|error| format!("could not resolve workspace config: {error}"))?;
+        if let Ok(config) = resolved.desired {
+            let mut agent_limits = config.limits;
+            if raise_tool_timeout(&mut agent_limits, &tool_limits) {
+                app.update_config(
+                    ConfigScope::Workspace(workspace.id),
+                    ConfigChange::Limits(Some(agent_limits)),
+                )
+                .await
+                .map_err(|error| format!("could not configure agent limits: {error}"))?;
+            }
+        }
+    }
     app.update_config(
         ConfigScope::Workspace(workspace.id),
         ConfigChange::Tools(Some(ToolSettings {
@@ -206,7 +236,7 @@ async fn execute(options: Options) -> Result<u8, String> {
             } else {
                 ToolMode::WorkspaceWrite
             },
-            limits: ToolLimits::default(),
+            limits: tool_limits,
         })),
     )
     .await
@@ -263,6 +293,14 @@ async fn execute(options: Options) -> Result<u8, String> {
         .await
         .map_err(|error| format!("could not shut down cleanly: {error}"))?;
     Ok(exit_code)
+}
+
+fn raise_tool_timeout(agent: &mut AgentLimits, tools: &ToolLimits) -> bool {
+    if agent.tool_timeout > tools.max_bash_timeout {
+        return false;
+    }
+    agent.tool_timeout = tools.max_bash_timeout + Duration::from_secs(1);
+    true
 }
 
 async fn configure_model(
@@ -647,5 +685,21 @@ mod tests {
         assert_eq!((status, code), ("timeout", 124));
         let (status, code, _) = classify(Completion::NeedsInput("which file?".into()));
         assert_eq!((status, code), ("needs_input", 4));
+    }
+
+    #[test]
+    fn write_tools_only_raise_an_incompatible_agent_timeout() {
+        let tools = ToolLimits::default();
+        let mut limits = AgentLimits {
+            background_workers: 7,
+            ..AgentLimits::default()
+        };
+        assert!(raise_tool_timeout(&mut limits, &tools));
+        assert_eq!(
+            limits.tool_timeout,
+            tools.max_bash_timeout + Duration::from_secs(1)
+        );
+        assert_eq!(limits.background_workers, 7);
+        assert!(!raise_tool_timeout(&mut limits, &tools));
     }
 }

@@ -113,4 +113,8 @@ fn explicit_model_uses_a_process_only_key_and_redacts_it_from_output() {
     let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(result["status"], "failed");
     assert_ne!(result["message"], "Configuration(NeedsModel)");
+    assert_ne!(
+        result["message"],
+        "Configuration(Invalid(\"agent tool timeout must exceed the largest Bash timeout\"))"
+    );
 }
