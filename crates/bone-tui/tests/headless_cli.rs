@@ -34,7 +34,13 @@ fn missing_model_is_a_structured_failure_without_credentials() {
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stdout["schema_version"], 1);
     assert_eq!(stdout["status"], "failed");
@@ -93,7 +99,13 @@ fn explicit_model_uses_a_process_only_key_and_redacts_it_from_output() {
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(!stdout.contains(secret));
