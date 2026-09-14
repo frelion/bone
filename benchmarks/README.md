@@ -45,7 +45,7 @@ Start with a single real task and a pinned BONE version:
 harbor run \
   -d terminal-bench/terminal-bench-2 \
   --agent benchmarks.harbor.agent:BoneAgent \
-  --agent-kwarg version=0.3.0 \
+  --agent-kwarg version=0.3.1 \
   --model openai/gpt-5.6-sol \
   --agent-env OPENAI_API_KEY="$OPENAI_API_KEY" \
   --n-tasks 1 \
@@ -62,13 +62,13 @@ Recommended public suites:
 # Broad terminal/software-engineering behavior.
 harbor run -d terminal-bench/terminal-bench-2 \
   --agent benchmarks.harbor.agent:BoneAgent \
-  --agent-kwarg version=0.3.0 \
+  --agent-kwarg version=0.3.1 \
   --model openai/gpt-5.6-sol
 
 # Repository issue fixing with independent tests.
 harbor run -d swe-bench/swe-bench-verified \
   --agent benchmarks.harbor.agent:BoneAgent \
-  --agent-kwarg version=0.3.0 \
+  --agent-kwarg version=0.3.1 \
   --model openai/gpt-5.6-sol
 ```
 
