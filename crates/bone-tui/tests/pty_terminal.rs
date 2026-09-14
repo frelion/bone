@@ -133,7 +133,7 @@ fn saturated_terminal_input_cannot_delay_signal_restoration() {
     process.enable_keyboard_protocol();
     // Rendering each key is slower than the reader, forcing bounded-channel
     // backpressure while the signal asks the reader to stop and join.
-    process.write(&vec![b'x'; 2_048]);
+    process.saturate_input(b'x');
     process.signal(libc::SIGTERM, "SIGTERM with saturated input");
 
     assert!(process.wait_for_exit().success());
@@ -517,6 +517,26 @@ impl PtyBone {
             .expect("write PTY input");
     }
 
+    fn saturate_input(&mut self, byte: u8) {
+        let chunk = [byte; 4_096];
+        let mut written = 0;
+        loop {
+            let result = self.master.as_mut().expect("PTY master").write(&chunk);
+            match result {
+                Ok(0) => panic!("PTY input closed before its buffer became full"),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("write PTY input while saturating it: {error}"),
+            }
+            self.assert_before_deadline("PTY input did not apply backpressure");
+        }
+        assert!(
+            written > 0,
+            "PTY input buffer was full before the test wrote"
+        );
+    }
+
     fn enable_keyboard_protocol(&mut self) {
         self.enable_keyboard_protocol_round(1);
     }
@@ -654,7 +674,7 @@ fn set_nonblocking(file: &File) {
 fn open_pty(width: u16, height: u16) -> (File, File) {
     let mut master = -1;
     let mut slave = -1;
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: height,
         ws_col: width,
         ws_xpixel: 0,
@@ -666,7 +686,7 @@ fn open_pty(width: u16, height: u16) -> (File, File) {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &size,
+            &mut size,
         )
     };
     assert_eq!(
