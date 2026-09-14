@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "name": "terminal-bench-2-full",
+  "description": "All 89 tasks from the pinned Terminal-Bench 2.0 release.",
+  "harbor_version": "0.23.0",
+  "dataset": "terminal-bench@2.0",
+  "expected_task_count": 89,
+  "bone_version": "0.3.2",
+  "agent": "benchmarks.harbor.agent:BoneAgent",
+  "model": "openai/gpt-5.6-luna",
+  "attempts": 1,
+  "concurrency": 2,
+  "timeout_multiplier": 1.0,
+  "tasks": []
+}

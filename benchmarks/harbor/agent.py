@@ -39,12 +39,12 @@ class BoneAgent(BaseInstalledAgent):
 
     @override
     async def install(self, environment: BaseEnvironment) -> None:
-        await self.ensure_system_dependencies(environment, ("curl", "ca-certificates"))
+        await self.ensure_system_dependencies(
+            environment, ("curl", "ca-certificates", "git")
+        )
         version = self._version
         release = f"v{version.removeprefix('v')}" if version else "latest"
-        release_path = (
-            f"download/{release}" if version else "latest/download"
-        )
+        release_path = f"download/{release}" if version else "latest/download"
         base = f"https://github.com/{self._REPOSITORY}/releases/{release_path}"
         command = f"""
 set -euo pipefail
@@ -74,6 +74,11 @@ bone --version
         if not self.model_name:
             raise ValueError("BONE requires a Harbor model name")
         access = self.model_connection
+        if not access.api_key:
+            raise ValueError(
+                "BONE Harbor evaluations require a provider API key; "
+                "a host ChatGPT subscription login is not available inside task containers"
+            )
         model = self.model_name.split("/")[-1]
         provider_prefix = self.model_name.split("/", 1)[0].lower()
         if provider_prefix == "anthropic":
@@ -86,15 +91,14 @@ bone --version
         result_path = agent_dir / "bone-result.json"
         trajectory_path = agent_dir / "bone-trajectory.json"
         base_url = access.configured_base_url
-        base_url_arg = (
-            f" --base-url {shlex.quote(base_url)}" if base_url else ""
-        )
+        base_url_arg = f" --base-url {shlex.quote(base_url)}" if base_url else ""
         env = {"BONE_BENCHMARK_API_KEY": access.api_key or ""}
 
         await self.exec_as_agent(
             environment,
             command=(
                 f"mkdir -p {shlex.quote(agent_dir.as_posix())} /tmp/bone-data && "
+                "chmod 700 /tmp/bone-data && "
                 f"printf %s {shlex.quote(instruction)} > {shlex.quote(prompt_path.as_posix())}"
             ),
         )
@@ -135,4 +139,6 @@ bone --version
             "exit_code": result.get("exit_code"),
             "session_id": result.get("session_id"),
             "changed_files": result.get("changed_files", []),
+            "duration_ms": result.get("duration_ms"),
+            "message": result.get("message"),
         }

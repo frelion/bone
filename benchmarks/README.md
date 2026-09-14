@@ -1,108 +1,131 @@
-# BONE real-world evaluations
+# BONE real-world evaluation system
 
-This directory runs BONE against independently authored software-engineering
-tasks in isolated project containers. Success is decided by each task's hidden
-verifier, not by BONE's own completion message.
+This directory measures whether BONE can complete real software-engineering work in isolated project containers. Terminal-Bench 2 is the primary public benchmark. Each task is scored by its independent verifier, so BONE's own claim that it finished is never treated as success.
 
-## Evaluation ladder
+## What is pinned
 
-1. **Smoke:** 3 fixed tasks, one attempt each. Run before changing prompts,
-   tools, orchestration, or model adapters.
-2. **Regression:** 20 fixed tasks, three attempts each. Report pass rate,
-   pass@3, timeouts, crashes, and `needs_input` separately.
-3. **Full:** an immutable public dataset version plus a private held-out set.
-   Pin the BONE release, model ID, Harbor version, task digests, and attempt
-   count in the result record.
+Every suite manifest pins the boundaries needed for a comparable run:
 
-Do not put a paid-model run in ordinary pull-request CI. CI verifies the
-headless protocol without credentials; smoke/regression/full runs are explicit
-release-gate jobs.
+- Harbor `0.23.0`
+- dataset `terminal-bench@2.0` (89 tasks in the full suite)
+- BONE release `0.3.2`, installed from its checksummed GitHub release asset
+- model `openai/gpt-5.6-luna`
+- task selection, attempt count, concurrency, and timeout multiplier
+
+The checked-in suites are:
+
+| Suite | Tasks | Attempts | Purpose |
+| --- | ---: | ---: | --- |
+| `terminal-bench-2-smoke` | 3 fixed | 1 | Fast adapter and end-to-end health check |
+| `terminal-bench-2-regression` | 20 fixed | 3 | Routine product comparison and observed pass@3 |
+| `terminal-bench-2-full` | all 89 | 1 | Broad release-candidate measurement |
+
+Pull-request CI validates manifests, command generation, the Harbor adapter import, and the result summarizer. It deliberately does not spend model credits or require Docker. Paid benchmark runs are explicit release gates.
 
 ## Prerequisites
 
-- Docker
-- [uv](https://docs.astral.sh/uv/)
-- A provider API key
+You need a running Docker daemon, [`uv`/`uvx`](https://docs.astral.sh/uv/), and an OpenAI API key. A ChatGPT subscription login on the host cannot be used by BONE inside Harbor's task containers.
+
+Set the key only in your local shell. Do not paste it into a command argument, manifest, log, issue, or commit:
 
 ```bash
-uv tool install harbor
-export OPENAI_API_KEY='...'
-export PYTHONPATH="$PWD"
+export OPENAI_API_KEY='your-key-here'
 ```
 
-## Run BONE through Harbor
+The runner inherits this variable and never prints its value.
 
-The custom adapter downloads a checksummed BONE release into every task
-container, runs it in `/app`, and retains these artifacts under the Harbor job:
+## Validate before spending money
 
-- `bone-result.json` — stable status and changed-file summary
-- `bone-trajectory.json` — complete durable BONE session-event history
-- `bone-exit-code.txt` — native headless exit code
-
-Start with a single real task and a pinned BONE version:
+Run contract tests and validate all manifests:
 
 ```bash
-harbor run \
-  -d terminal-bench/terminal-bench-2 \
-  --agent benchmarks.harbor.agent:BoneAgent \
-  --agent-kwarg version=0.3.2 \
-  --model openai/gpt-5.6-sol \
-  --agent-env OPENAI_API_KEY="$OPENAI_API_KEY" \
-  --n-tasks 1 \
-  --n-attempts 1
+python3 -m unittest discover -s benchmarks/tests -v
+python3 -m benchmarks.suite validate --all
 ```
 
-Use `harbor run --help` to confirm flag names for the installed Harbor version;
-Harbor's Python import path is the stable integration boundary, while some CLI
-aliases have changed between releases.
-
-Recommended public suites:
+Ask the exact pinned Harbor version to resolve the smoke configuration:
 
 ```bash
-# Broad terminal/software-engineering behavior.
-harbor run -d terminal-bench/terminal-bench-2 \
-  --agent benchmarks.harbor.agent:BoneAgent \
-  --agent-kwarg version=0.3.2 \
-  --model openai/gpt-5.6-sol
-
-# Repository issue fixing with independent tests.
-harbor run -d swe-bench/swe-bench-verified \
-  --agent benchmarks.harbor.agent:BoneAgent \
-  --agent-kwarg version=0.3.2 \
-  --model openai/gpt-5.6-sol
+python3 -m benchmarks.suite validate terminal-bench-2-smoke --harbor
 ```
 
-SWE-bench Multilingual should be added as soon as its task package is available
-in the chosen Harbor registry. Its Rust slice is the best language-matched
-public suite for BONE; keep the selected task IDs fixed across comparisons.
-
-## Direct local scenario
-
-`bone run` can also execute any checked-out project without Harbor:
+Check Docker, Harbor, the API-key presence, and the published BONE binary:
 
 ```bash
-export OPENAI_API_KEY='...'
-bone run \
-  --workspace /path/to/project \
-  --prompt-file issue.md \
-  --model gpt-5.6-sol \
-  --trajectory artifacts/trajectory.json \
-  --result artifacts/result.json
+python3 -m benchmarks.suite preflight terminal-bench-2-smoke
 ```
 
-The JSON printed on stdout is the automation contract. Human progress goes to
-stderr. Exit codes are: `0` completed, `2` bad invocation, `3` agent/provider
-failure, `4` clarification required, `124` timeout, and `130` interruption.
+To inspect the exact command without running it:
 
-## Result discipline
+```bash
+python3 -m benchmarks.suite command terminal-bench-2-smoke
+```
 
-For every published number, retain:
+## Run the ladder
 
-- BONE commit and release asset checksum
-- model provider, exact model ID, and model parameters
-- Harbor version and dataset/task digests
-- per-task verifier reward, BONE status, exit code, duration, and trajectory
-- all attempts, including infrastructure failures and zero scores
+Start with smoke and do not proceed if the adapter or infrastructure is broken:
 
-Never tune on the private held-out set. Rotate it periodically and inspect task
-contamination before treating a score increase as product progress.
+```bash
+python3 -m benchmarks.suite run terminal-bench-2-smoke
+```
+
+After smoke is healthy, run the fixed regression suite:
+
+```bash
+python3 -m benchmarks.suite run terminal-bench-2-regression
+```
+
+Use the full suite for a release candidate after regression results have been inspected:
+
+```bash
+python3 -m benchmarks.suite run terminal-bench-2-full
+```
+
+Jobs are stored under `benchmarks/results/`, which is intentionally gitignored. Give a run a stable label when comparing versions:
+
+```bash
+python3 -m benchmarks.suite run terminal-bench-2-regression \
+  --job-name bone-0.3.2-luna-baseline
+```
+
+## Artifacts and summaries
+
+The Harbor adapter retains these BONE artifacts for each trial:
+
+- `bone-result.json`: native headless status, duration, exit code, and changed files
+- `bone-trajectory.json`: durable BONE session-event history
+- `bone-exit-code.txt`: native process exit code
+
+Harbor additionally writes `result.json` with verifier rewards and `lock.json` with the resolved task/configuration record. Generate the normalized JSON and human-readable report after a completed job:
+
+```bash
+python3 -m benchmarks.suite summarize \
+  benchmarks/results/bone-0.3.2-luna-baseline \
+  --suite terminal-bench-2-regression
+```
+
+This writes `bone-summary.json` and `bone-summary.md` beside Harbor's artifacts.
+
+## Metric rules
+
+The report keeps all attempts, including zero rewards and infrastructure errors:
+
+- **All-scheduled pass rate:** passing trials divided by every scheduled trial. Infrastructure failures and scheduled trials with no result remain failures here.
+- **Scored-only pass rate:** passing trials divided only by trials that produced a verifier reward. This diagnostic number must never replace the all-scheduled rate.
+- **Observed pass@k:** fraction of tasks that passed at least once among the attempts actually present in the job. For the regression manifest, `k=3` only when all three attempts completed.
+- **Failure categories:** verifier failure, infrastructure error, and missing verifier result are reported separately.
+- **BONE status:** `completed`, `failed`, `needs_input`, timeout, and other native states are counted independently of the verifier reward.
+
+Token and cost totals are included when Harbor receives them from the agent. The custom BONE adapter currently preserves execution artifacts but may not expose complete provider usage, so a missing cost value means “not reported,” not zero.
+
+## Comparison discipline
+
+For every published number, retain the complete job directory and record:
+
+- BONE commit, release version, and release checksum
+- exact model ID and provider configuration
+- Harbor version, dataset version, task selection, and task digests
+- attempt count, concurrency, timeouts, verifier rewards, native BONE status, and trajectories
+- every failed or interrupted attempt
+
+Compare changes on the same suite configuration. Use smoke for plumbing, regression for iteration, and the full suite sparingly; repeatedly tuning against the full public set weakens its value as a release check. A separate private held-out set can be added later for contamination-resistant product decisions.

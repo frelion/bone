@@ -13,6 +13,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  benchmark-contracts:
+    name: Benchmark contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v7
+      - run: python -m unittest discover -s benchmarks/tests -v
+      - run: python -m benchmarks.suite validate --all
+      - name: Import the adapter with pinned Harbor
+        run: >-
+          uv run --with harbor==0.23.0 python -c
+          "from benchmarks.harbor.agent import BoneAgent; assert BoneAgent.name() == 'bone'"
+      - name: Let pinned Harbor resolve the smoke configuration
+        run: python -m benchmarks.suite validate terminal-bench-2-smoke --harbor
+
   msrv:
     name: Rust 1.88 compatibility
     runs-on: ubuntu-latest
