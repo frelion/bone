@@ -57,7 +57,7 @@ jobs:
             echo "Configure at least one protocol model with its credential." >&2
             exit 1
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Certify OpenAI Responses
