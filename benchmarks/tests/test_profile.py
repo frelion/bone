@@ -1,6 +1,6 @@
 import unittest
 
-from benchmarks.profile import build_profile
+from benchmarks.profile import build_profile, successful_test_run
 
 
 RUNTIME = "00000000-0000-0000-0000-000000000001"
@@ -11,6 +11,15 @@ def entry(timestamp, event):
 
 
 class ProfileTests(unittest.TestCase):
+    def test_verification_requires_nonzero_tests_and_accepts_singular(self):
+        def result(output, exit_code=0):
+            return {"tool": "bash", "outcome": {"result": {"Ok": {"exit_code": exit_code, "stdout": output}}}}
+
+        self.assertFalse(successful_test_run(result("Ran 0 tests in 0s\n\nOK\n")))
+        self.assertTrue(successful_test_run(result("Ran 1 test in 0s\n\nOK\n")))
+        self.assertFalse(successful_test_run(result("Ran 2 tests in 0s\n\nOKAY\n")))
+        self.assertFalse(successful_test_run(result("Ran 2 tests in 0s\n\nOK\n", 1)))
+
     def test_profiles_overlapping_calls_jobs_verification_and_duplicate_reads(self):
         root = {"runtime": RUNTIME, "id": 1}
         child = {"runtime": RUNTIME, "id": 2}

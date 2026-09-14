@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -48,7 +49,8 @@ def successful_test_run(data: dict[str, Any]) -> bool:
     if result.get("exit_code") != 0:
         return False
     output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
-    return "Ran " in output and " tests in " in output and "\nOK" in output
+    count = re.search(r"(?m)^Ran ([1-9][0-9]*) tests? in ", output)
+    return count is not None and re.search(r"(?m)^OK(?: \([^\n]*\))?$", output) is not None
 
 
 def build_profile(entries: list[dict[str, Any]]) -> dict[str, Any]:

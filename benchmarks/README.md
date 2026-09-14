@@ -172,3 +172,35 @@ Each trial also writes `efficiency-profile.json`. It reconstructs Job ownership,
 model and tool call durations, concurrent call activity, time outside calls,
 cross-Job duplicate reads, and the delay after the final successful test run.
 Profiles contain tool names and outcomes but never copy tool arguments.
+
+## Job architecture experiments
+
+Prerequisites: Python 3.11+, a running Podman machine, the saved BONE ChatGPT
+subscription login, and a native Linux BONE binary. Run the small controlled
+workloads with the existing Podman image:
+
+```bash
+python3 -m benchmarks.architecture \
+  --binary target/behavior-linux/candidate/release/bone --attempts 2
+```
+
+This runs 14 fresh-container trials: a single-Job normalization task, plus
+independent and sequential workloads in single-Job, explicitly delegated, and
+autonomous-decomposition modes. Modes share fixtures and an independent verifier;
+alternate rounds reverse mode order. Use `--workload independent --mode delegated`
+to repeat one condition. Trials run sequentially to avoid cross-trial model load.
+`--case independent-auto` selects an exact condition; `--timeout-seconds` defaults
+to 120 for these small tasks. Each completed trial saves `trial-result.json`
+before container cleanup, so an interrupted cleanup cannot lose its result.
+
+`summary.json` separates task success from compliance with the requested Job
+structure. Profiles report child model-call overlap and parent model-call count.
+Call durations include provider and network latency; they are not inference-time
+measurements. Public history does not expose token usage, retries, or each chosen
+WorkStep. Cross-Job duplicate reads cover only the `read` tool. Verification timing
+is a heuristic for unittest output, not proof of complete acceptance coverage.
+These small workloads measure coordination overhead, not general coding ability
+or the usefulness of delegation on larger tasks.
+
+The initial investigation, failed optimization experiments, and architecture
+recommendations are recorded in [the study](../docs/job-efficiency-study.md).

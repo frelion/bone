@@ -1,0 +1,81 @@
+diff --git a/crates/bone-core/src/model_contract.rs b/crates/bone-core/src/model_contract.rs
+index 73d1a28..3f6f15d 100644
+--- a/crates/bone-core/src/model_contract.rs
++++ b/crates/bone-core/src/model_contract.rs
+@@ -50,8 +50,15 @@ answers only to inquiries present in this call (use an empty answers array when
+ and one mutually exclusive next step. Delegate \
+ independent work as child jobs. PublishResult exposes an early result; Finish carries \
+ the final outcome. A capacity Audit after Delegate means no child was created, so \
+-reconsider or proceed locally. Every turn must take an available action. After \
+-delegating, wait on that child; use a tool wait only for a tool call. Tool requests \
++reconsider or proceed locally. Every turn must take an available action. When \
++progress depends on a child completing, use Wait.Job with that unfinished child's \
++ID from the child cards. The host resumes you when it finishes; do not poll its \
++status using Wait.After, Continue, repeated reads, or shell sleeps. With multiple \
++children, wait on an unfinished child, then inspect the updated cards and wait on \
++any still unfinished dependency. Use Wait.Result only when you need an early \
++published result rather than completion. Wait.After is for an actual time-based \
++requirement, not for waiting on child jobs. Perform your own independent work \
++when available; use a tool wait only for a tool call. Tool requests \
+ are proposals, not proof of execution. Reply is a public message, not proof of \
+ completion; after Reply, Finish only when the job contract is satisfied, otherwise \
+ continue the work. Never repeat the same reply.";
+@@ -219,10 +226,13 @@ fn work_schema(input: &WorkInput) -> Value {
+     let read = read_schema();
+     let report = report_schema(evidence.clone());
+     let completion = completion_schema(evidence);
+-    let duration = object(json!({
++    let mut duration = object(json!({
+         "secs": {"type": "integer", "minimum": 0},
+         "nanos": {"type": "integer", "minimum": 0, "maximum": 999999999}
+     }));
++    duration["description"] = json!(
++        "Wait for an actual time-based requirement. Do not poll child jobs with this; use Wait.Job for their completion."
++    );
+     let child_ids = input
+         .children
+         .iter()
+@@ -239,7 +249,11 @@ fn work_schema(input: &WorkInput) -> Value {
+         waits.push(tagged("Tool", enum_id_schema(&tool_call_ids)));
+     }
+     if !child_ids.is_empty() {
+-        waits.push(tagged("Job", enum_id_schema(&child_ids)));
++        let mut job_wait = enum_id_schema(&child_ids);
++        job_wait["description"] = json!(
++            "Wait for this unfinished child to complete. The host wakes you on completion without polling."
++        );
++        waits.push(tagged("Job", job_wait));
+         waits.push(tagged(
+             "Result",
+             object(json!({
+@@ -263,7 +277,10 @@ fn work_schema(input: &WorkInput) -> Value {
+         ])
+     }));
+     let mut steps = vec![
+-        tagged("Delegate", json!({"type":"array", "items":assignment})),
++        tagged(
++            "Delegate",
++            json!({"type":"array", "minItems":1, "items":assignment}),
++        ),
+         tagged("Wait", wait),
+         tagged("Read", read),
+         tagged("PublishResult", report.clone()),
+@@ -861,6 +878,18 @@ mod tests {
+         assert_eq!(schema["properties"]["seed"], json!({"type": "null"}));
+     }
+
++    #[test]
++    fn delegate_schema_requires_a_nonempty_batch_like_the_kernel() {
++        let schema = work_schema(&work_input());
++        let delegate = schema["properties"]["step"]["anyOf"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .find_map(|step| step["properties"].get("Delegate"))
++            .unwrap();
++        assert_eq!(delegate["minItems"], json!(1));
++    }
++
+     #[test]
+     fn wait_schema_exposes_only_contextual_job_and_tool_ids() {
+         let mut input = work_input();

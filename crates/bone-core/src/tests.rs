@@ -2552,11 +2552,24 @@ fn a_parent_waiting_for_its_child_receives_one_outcome_delivery() {
         calls["parent"].0,
         WorkStep::Wait(Await::Job(child)),
     );
-    work(
-        &mut kernel,
-        calls["child"].0,
-        WorkStep::Finish(Completion::new("child complete")),
+    // Waiting for a Job is event-driven: elapsed time must not spend another
+    // parent model call while the child is still working.
+    for seconds in [1, 5, 60] {
+        let effects = kernel.step(MonoTime(Duration::from_secs(seconds)), Event::Tick);
+        assert!(work_calls(&effects).is_empty());
+    }
+    let effects = kernel.step(
+        MonoTime(Duration::from_secs(60)),
+        Event::WorkFinished {
+            call: calls["child"].0,
+            result: Ok(WorkProposal::new(WorkStep::Finish(Completion::new(
+                "child complete",
+            )))),
+        },
     );
+    let resumed = work_calls(&effects);
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].1.job, parent_input.job);
     let outcome = match kernel.job_status(child) {
         JobStatus::Finished(outcome) => outcome.as_of,
         _ => panic!("child must finish"),

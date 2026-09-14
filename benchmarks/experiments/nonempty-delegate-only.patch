@@ -1,0 +1,35 @@
+diff --git a/crates/bone-core/src/model_contract.rs b/crates/bone-core/src/model_contract.rs
+index 73d1a28..82033df 100644
+--- a/crates/bone-core/src/model_contract.rs
++++ b/crates/bone-core/src/model_contract.rs
+@@ -263,7 +263,10 @@ fn work_schema(input: &WorkInput) -> Value {
+         ])
+     }));
+     let mut steps = vec![
+-        tagged("Delegate", json!({"type":"array", "items":assignment})),
++        tagged(
++            "Delegate",
++            json!({"type":"array", "minItems":1, "items":assignment}),
++        ),
+         tagged("Wait", wait),
+         tagged("Read", read),
+         tagged("PublishResult", report.clone()),
+@@ -861,6 +864,18 @@ mod tests {
+         assert_eq!(schema["properties"]["seed"], json!({"type": "null"}));
+     }
+
++    #[test]
++    fn delegate_schema_requires_a_nonempty_batch_like_the_kernel() {
++        let schema = work_schema(&work_input());
++        let delegate = schema["properties"]["step"]["anyOf"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .find_map(|step| step["properties"].get("Delegate"))
++            .unwrap();
++        assert_eq!(delegate["minItems"], json!(1));
++    }
++
+     #[test]
+     fn wait_schema_exposes_only_contextual_job_and_tool_ids() {
+         let mut input = work_input();

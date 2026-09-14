@@ -29,6 +29,7 @@ class Case:
     setup: str = ":"
     read_only: bool = False
     expected_status: str = "completed"
+    timeout_seconds: int = 600
 
 
 CASES = (
@@ -155,6 +156,7 @@ def one_trial(binary: Path, model: str, case: Case, trial_dir: Path) -> dict[str
     started = datetime.now(timezone.utc)
     agent_output = ""
     verifier_output = ""
+    outcome: dict[str, object] | None = None
     try:
         run(command)
         run(
@@ -170,7 +172,7 @@ def one_trial(binary: Path, model: str, case: Case, trial_dir: Path) -> dict[str
         args = [
             "bone", "run", "--workspace", "/app", "--data-dir", "/tmp/bone-data",
             "--prompt-file", "/artifacts/prompt.txt", "--provider", "chatgpt", "--model", model,
-            "--timeout-seconds", "600", "--result", "/artifacts/bone-result.json",
+            "--timeout-seconds", str(case.timeout_seconds), "--result", "/artifacts/bone-result.json",
             "--trajectory", "/artifacts/bone-trajectory.json",
         ]
         if case.read_only:
@@ -183,7 +185,7 @@ def one_trial(binary: Path, model: str, case: Case, trial_dir: Path) -> dict[str
         verifier = run(["podman", "exec", container, "bash", "-lc", case.verifier], check=False)
         verifier_output = verifier.stdout
         passed = native.get("status") == case.expected_status and verifier.returncode == 0
-        return {
+        outcome = {
             "case": case.name,
             "passed": passed,
             "expected_status": case.expected_status,
@@ -192,17 +194,25 @@ def one_trial(binary: Path, model: str, case: Case, trial_dir: Path) -> dict[str
             "verifier_exit_code": verifier.returncode,
             "duration_seconds": (datetime.now(timezone.utc) - started).total_seconds(),
         }
+        return outcome
     except Exception as error:
-        return {
+        outcome = {
             "case": case.name,
             "passed": False,
             "error": f"{type(error).__name__}: {error}",
             "duration_seconds": (datetime.now(timezone.utc) - started).total_seconds(),
         }
+        return outcome
     finally:
-        if verifier_output:
-            (trial_dir / "verifier.log").write_text(verifier_output, encoding="utf-8")
-        run(["podman", "rm", "--force", container], check=False)
+        try:
+            if outcome is not None:
+                (trial_dir / "trial-result.json").write_text(
+                    json.dumps(outcome, indent=2) + "\n", encoding="utf-8"
+                )
+            if verifier_output:
+                (trial_dir / "verifier.log").write_text(verifier_output, encoding="utf-8")
+        finally:
+            run(["podman", "rm", "--force", container], check=False)
 
 
 def parse_args() -> argparse.Namespace:
