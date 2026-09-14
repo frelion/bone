@@ -154,7 +154,7 @@ pub(crate) fn file_page(
 }
 
 fn baseline(root: &Path) -> Result<WorkspaceBaseline> {
-    open_workspace_root(root)
+    validate_workspace_root(root)
         .map_err(|error| Error::InvalidState(format!("open workspace root: {error}")))?;
     let expected = root
         .canonicalize()
@@ -841,6 +841,11 @@ fn open_workspace_root(root: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(unix)]
+fn validate_workspace_root(root: &Path) -> std::io::Result<()> {
+    open_workspace_root(root).map(drop)
+}
+
+#[cfg(unix)]
 fn workspace_root_identity(root: &Path) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
 
@@ -858,8 +863,15 @@ fn open_workspace_file(root: &Path, relative: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(not(unix))]
-fn open_workspace_root(root: &Path) -> std::io::Result<File> {
-    File::open(root)
+fn validate_workspace_root(root: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workspace root must be a real directory",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
