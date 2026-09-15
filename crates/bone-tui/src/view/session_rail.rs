@@ -261,6 +261,13 @@ pub(super) fn problem_status(problem: &bone_app::AppProblem) -> (&'static str, C
     match problem {
         Configuration(_) => ("Needs configuration", theme::WARNING),
         LoginRequired(_) => ("Needs login", theme::WARNING),
+        Credential(problem) => match problem.kind {
+            bone_app::CredentialProblemKind::Missing => ("Needs API key", theme::WARNING),
+            bone_app::CredentialProblemKind::Unavailable => ("Credential error", DANGER),
+            bone_app::CredentialProblemKind::EndpointMismatch => {
+                ("Endpoint changed", theme::WARNING)
+            }
+        },
         ProfileBusy(_) => ("Profile busy", theme::WARNING),
         Provider(_) => ("Provider error", DANGER),
         Storage(_) => ("Storage error", DANGER),

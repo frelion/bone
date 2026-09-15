@@ -88,7 +88,7 @@ async fn agent_record_failure_blocks_execution_and_recovers_the_partial_archive(
     std::fs::create_dir(&workspace_root).unwrap();
     let model = Arc::new(GatedModel::default());
     let app = App::with_ports(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         model.clone(),
         Vec::new(),
     )
@@ -164,7 +164,7 @@ async fn failed_runtime_config_persistence_never_restarts_execution() {
     std::fs::create_dir(&workspace_root).unwrap();
     let model = Arc::new(GatedModel::default());
     let app = App::with_ports(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         model.clone(),
         Vec::new(),
     )
@@ -253,7 +253,7 @@ async fn closing_reaches_core_while_session_is_waiting_for_an_input_commit() {
     std::fs::create_dir(&workspace_root).unwrap();
     let model = Arc::new(GatedModel::default());
     let app = App::with_ports(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         model.clone(),
         Vec::new(),
     )
@@ -324,7 +324,7 @@ async fn closing_during_startup_reports_an_unresolved_commit() {
     std::fs::create_dir(&workspace_root).unwrap();
     let model = Arc::new(GatedModel::default());
     let app = App::with_ports(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         model.clone(),
         Vec::new(),
     )

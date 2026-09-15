@@ -495,7 +495,9 @@ async fn app_with_model(
     workspace: &Path,
     model: Arc<dyn ModelPort>,
 ) -> (App, WorkspaceInfo) {
-    let app = App::with_model(AppOptions::new(data), model).await.unwrap();
+    let app = App::with_model(AppOptions::isolated(data), model)
+        .await
+        .unwrap();
     configure_test_model(&app).await;
     let workspace = app.open_workspace(workspace).await.unwrap();
     (app, workspace)
@@ -506,7 +508,7 @@ async fn configured_app() -> (tempfile::TempDir, App, WorkspaceInfo) {
     let workspace_root = temporary.path().join("workspace");
     std::fs::create_dir(&workspace_root).unwrap();
     let app = App::with_ports(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         Arc::new(CompletingModel {
             work_calls: AtomicUsize::new(0),
         }),
@@ -1329,7 +1331,7 @@ async fn create_session_request_is_durable_and_idempotent() {
     let id = first.id();
     app.shutdown().await.unwrap();
     let reopened = App::with_ports(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         Arc::new(CompletingModel {
             work_calls: AtomicUsize::new(0),
         }),
@@ -1777,7 +1779,7 @@ async fn result_evidence_is_explicit_paged_limited_private_and_durable() {
     let workspace_root = temporary.path().join("workspace");
     std::fs::create_dir(&workspace_root).unwrap();
     let app = App::with_ports(
-        AppOptions::new(&data),
+        AppOptions::isolated(&data),
         Arc::new(EvidenceModel),
         vec![Arc::new(EvidenceTool)],
     )
@@ -1889,7 +1891,7 @@ async fn result_evidence_is_explicit_paged_limited_private_and_durable() {
     drop(app);
 
     let reopened = App::with_ports(
-        AppOptions::new(&data),
+        AppOptions::isolated(&data),
         Arc::new(EvidenceModel),
         vec![Arc::new(EvidenceTool)],
     )
@@ -2038,7 +2040,7 @@ async fn idle_session_release_closes_external_handles_and_releases_cross_app_lea
     std::fs::create_dir(&workspace_root).unwrap();
     let data_dir = temporary.path().join("data");
     let app = App::with_model(
-        AppOptions::new(data_dir.clone()),
+        AppOptions::isolated(data_dir.clone()),
         Arc::new(CompletingModel {
             work_calls: AtomicUsize::new(0),
         }),
@@ -2053,7 +2055,7 @@ async fn idle_session_release_closes_external_handles_and_releases_cross_app_lea
         .unwrap();
     let held_clone = session.clone();
     let other = App::with_model(
-        AppOptions::new(data_dir),
+        AppOptions::isolated(data_dir),
         Arc::new(CompletingModel {
             work_calls: AtomicUsize::new(0),
         }),
@@ -2088,7 +2090,7 @@ async fn release_retains_running_work_then_evicts_after_completion() {
     std::fs::create_dir(&workspace_root).unwrap();
     let barrier = Arc::new(ShutdownBarrier::default());
     let app = App::with_ports(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         Arc::new(PausableWorkModel {
             barrier: Arc::clone(&barrier),
         }),
@@ -2672,10 +2674,12 @@ async fn chatgpt_model_preflight_is_atomic_before_any_session_exists() {
         crate::credentials::ChatGptCredentials::at(temporary.path().join("chatgpt-credentials"))
             .unwrap();
     let providers = ProviderConnector::with_chatgpt_credentials(credentials.clone());
-    let app =
-        App::with_provider_connector(AppOptions::new(temporary.path().join("data")), providers)
-            .await
-            .unwrap();
+    let app = App::with_provider_connector(
+        AppOptions::isolated(temporary.path().join("data")),
+        providers,
+    )
+    .await
+    .unwrap();
     let workspace = app.open_workspace(workspace_root).await.unwrap();
     let scope = ConfigScope::Workspace(workspace.id);
 
@@ -2888,10 +2892,12 @@ async fn login_recovers_sessions_after_credentials_are_repaired() {
         crate::credentials::ChatGptCredentials::at(temporary.path().join("chatgpt-credentials"))
             .unwrap();
     let providers = ProviderConnector::with_chatgpt_credentials(credentials.clone());
-    let app =
-        App::with_provider_connector(AppOptions::new(temporary.path().join("data")), providers)
-            .await
-            .unwrap();
+    let app = App::with_provider_connector(
+        AppOptions::isolated(temporary.path().join("data")),
+        providers,
+    )
+    .await
+    .unwrap();
     let profile_id = ProfileId::chatgpt();
     app.save_profile(Profile::chatgpt()).await.unwrap();
     app.update_config(
@@ -2996,7 +3002,7 @@ async fn a_rejected_agent_limit_change_keeps_the_same_job_running() {
     std::fs::create_dir(&workspace_root).unwrap();
     let barrier = Arc::new(ShutdownBarrier::default());
     let app = App::with_ports(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         Arc::new(PausableWorkModel {
             barrier: Arc::clone(&barrier),
         }),
@@ -3125,7 +3131,7 @@ async fn resolved_config_does_not_report_a_crashed_runtime_as_live() {
         session.info.id
     };
     let app = App::with_ports(
-        AppOptions::new(data),
+        AppOptions::isolated(data),
         Arc::new(CompletingModel {
             work_calls: AtomicUsize::new(0),
         }),
@@ -3165,7 +3171,7 @@ async fn app_shutdown_is_dispatched_to_all_sessions_before_waiting_for_any_one()
     std::fs::create_dir(&workspace_root).unwrap();
     let barrier = Arc::new(ShutdownBarrier::default());
     let app = App::with_ports(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         Arc::new(AlwaysToolModel),
         vec![Arc::new(ShutdownBarrierTool {
             barrier: Arc::clone(&barrier),
@@ -3213,7 +3219,7 @@ async fn config_reload_reaches_idle_sessions_without_waiting_for_a_closing_sessi
     std::fs::create_dir(&workspace_root).unwrap();
     let barrier = Arc::new(ShutdownBarrier::default());
     let app = App::with_ports(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         Arc::new(SelectiveBarrierModel),
         vec![Arc::new(ShutdownBarrierTool {
             barrier: Arc::clone(&barrier),
@@ -3446,7 +3452,7 @@ async fn a_detached_write_keeps_the_session_lease_until_execution_finishes() {
     .unwrap();
 
     let contender = App::with_model(
-        AppOptions::new(&data),
+        AppOptions::isolated(&data),
         Arc::new(CompletingModel {
             work_calls: AtomicUsize::new(0),
         }),
@@ -3766,7 +3772,7 @@ async fn workspace_writes_are_recorded_by_the_app_tool_adapter() {
     let workspace_root = temporary.path().join("workspace");
     std::fs::create_dir(&workspace_root).unwrap();
     let app = App::with_model(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         Arc::new(PatchingModel {
             work_calls: AtomicUsize::new(0),
         }),
@@ -3895,7 +3901,7 @@ async fn app_queries_workspace_writes_authoritatively() {
     let root = temporary.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
     let app = App::with_ports(
-        AppOptions::new(temporary.path().join("data")),
+        AppOptions::isolated(temporary.path().join("data")),
         Arc::new(CompletingModel {
             work_calls: AtomicUsize::new(0),
         }),
@@ -3949,7 +3955,7 @@ async fn app_shutdown_reports_crash_writes_from_unopened_sessions() {
         (workspace.id, session.info.id, call)
     };
     let app = App::with_ports(
-        AppOptions::new(data),
+        AppOptions::isolated(data),
         Arc::new(CompletingModel {
             work_calls: AtomicUsize::new(0),
         }),

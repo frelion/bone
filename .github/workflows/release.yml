@@ -28,11 +28,11 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             asset: bone-linux-x86_64
             executable: bone
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             asset: bone-linux-aarch64
             executable: bone
           - runner: macos-15-intel
@@ -73,12 +73,25 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install musl build tools
+        if: ${{ contains(matrix.target, 'linux-musl') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --locked --release -p bone-tui --bin bone --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.target }}" == *-linux-musl ]]; then
+            CC=musl-gcc cargo build --locked --release -p bone-tui --bin bone --target "${{ matrix.target }}"
+          else
+            cargo build --locked --release -p bone-tui --bin bone --target "${{ matrix.target }}"
+          fi
 
       - name: Prepare release asset
         shell: bash
@@ -90,6 +103,25 @@ jobs:
             chmod +x "dist/${{ matrix.asset }}"
           fi
           test -s "dist/${{ matrix.asset }}"
+
+      - name: Verify static Linux binary
+        if: ${{ contains(matrix.target, 'linux-musl') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          file "dist/${{ matrix.asset }}"
+          if readelf -d "dist/${{ matrix.asset }}" | grep -q '(NEEDED)'; then
+            echo "musl release unexpectedly has dynamic dependencies" >&2
+            exit 1
+          fi
+          docker run --rm \
+            --volume "$PWD/dist:/dist:ro" \
+            alpine:3.22 \
+            "/dist/${{ matrix.asset }}" --help
+          docker run --rm \
+            --volume "$PWD/dist:/dist:ro" \
+            alpine:3.22 \
+            sh -c 'mkdir -p /tmp/workspace; /dist/${{ matrix.asset }} run --workspace /tmp/workspace --data-dir /tmp/data --prompt smoke --timeout-seconds 1 >/tmp/result.json; test "$?" -eq 3; grep -q '"status": "failed"' /tmp/result.json'
 
       - name: Upload binary
         uses: actions/upload-artifact@v7.0.1

@@ -83,6 +83,10 @@ pub enum Action {
 
 #[derive(Debug)]
 pub enum UiEvent {
+    ConfigOperationFinished {
+        action: &'static str,
+        error: Option<String>,
+    },
     ConnectionSaved {
         request: u64,
         session: Option<SessionId>,
@@ -233,6 +237,8 @@ pub enum SessionOperationKind {
 
 #[derive(Debug)]
 pub enum Effect {
+    ReloadConfig,
+    TrustProjectConfig,
     SaveConnection {
         request: u64,
         session: Option<SessionId>,

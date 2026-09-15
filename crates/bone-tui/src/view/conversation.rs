@@ -156,6 +156,16 @@ fn problem_hint(problem: &bone_app::AppProblem, width: u16) -> &'static str {
         bone_app::AppProblem::Configuration(_) => "Configure: /model",
         bone_app::AppProblem::LoginRequired(_) if width >= 20 => "Needs login · /model",
         bone_app::AppProblem::LoginRequired(_) => "Login: /model",
+        bone_app::AppProblem::Credential(problem)
+            if problem.kind == bone_app::CredentialProblemKind::Missing && width >= 24 =>
+        {
+            "Needs API key · /model"
+        }
+        bone_app::AppProblem::Credential(problem)
+            if problem.kind == bone_app::CredentialProblemKind::Missing =>
+        {
+            "API key: /model"
+        }
         _ => super::session_rail::problem_status(problem).0,
     }
 }

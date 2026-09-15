@@ -354,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn load_combines_saved_connection_presets_with_the_selected_custom_model() {
         let root = tempfile::tempdir().unwrap();
-        let app = App::open(AppOptions::new(root.path().join("data")))
+        let app = App::open(AppOptions::isolated(root.path().join("data")))
             .await
             .unwrap();
         let workspace = app.open_workspace(root.path()).await.unwrap();
@@ -428,7 +428,7 @@ mod connection_tests {
     #[tokio::test]
     async fn connection_round_trip_updates_only_requested_scope() {
         let root = tempfile::tempdir().unwrap();
-        let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
+        let app = App::open(bone_app::AppOptions::isolated(root.path().join("data")))
             .await
             .unwrap();
         let workspace = app.open_workspace(root.path()).await.unwrap();
@@ -461,7 +461,7 @@ mod connection_tests {
     #[tokio::test]
     async fn invalid_selection_is_rejected_before_any_profile_write() {
         let root = tempfile::tempdir().unwrap();
-        let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
+        let app = App::open(bone_app::AppOptions::isolated(root.path().join("data")))
             .await
             .unwrap();
         let workspace = app.open_workspace(root.path()).await.unwrap();
@@ -492,7 +492,7 @@ mod connection_tests {
     #[tokio::test]
     async fn failed_scope_application_does_not_claim_profile_rollback() {
         let root = tempfile::tempdir().unwrap();
-        let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
+        let app = App::open(bone_app::AppOptions::isolated(root.path().join("data")))
             .await
             .unwrap();
         let workspace = app.open_workspace(root.path()).await.unwrap();

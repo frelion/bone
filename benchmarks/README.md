@@ -34,7 +34,9 @@ Set the key only in your local shell. Do not paste it into a command argument, m
 export OPENAI_API_KEY='your-key-here'
 ```
 
-The runner inherits this variable and never prints its value.
+Harbor pipes this value to `bone credentials set`, so the Rust credential backend creates the
+private file and endpoint fingerprint. It then starts `bone run` with only `BONE_HOME`; that
+process does not receive or read the API-key environment variable.
 
 ## Validate before spending money
 

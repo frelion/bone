@@ -81,6 +81,47 @@ impl Runtime {
 
     pub(super) async fn apply(&mut self, effect: Effect) -> bool {
         match effect {
+            Effect::ReloadConfig => {
+                let app = self.app.clone();
+                let workspace = self.workspace;
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let status = app.reload_config(workspace).await?.project;
+                        if status.exists && !status.trusted {
+                            return Err(bone_app::Error::InvalidState(
+                                "project configuration changed and must be trusted again".into(),
+                            ));
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    let _ = tx
+                        .send(UiEvent::ConfigOperationFinished {
+                            action: "Configuration reload",
+                            error: result.err().map(|error| error.to_string()),
+                        })
+                        .await;
+                });
+            }
+            Effect::TrustProjectConfig => {
+                let app = self.app.clone();
+                let workspace = self.workspace;
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let error = app
+                        .trust_project_config(workspace)
+                        .await
+                        .err()
+                        .map(|error| error.to_string());
+                    let _ = tx
+                        .send(UiEvent::ConfigOperationFinished {
+                            action: "Project configuration trust",
+                            error,
+                        })
+                        .await;
+                });
+            }
             Effect::SaveConnection {
                 request,
                 session,
@@ -1179,7 +1220,7 @@ mod lifecycle_tests {
         mpsc::Receiver<UiEvent>,
     ) {
         let root = tempfile::tempdir().unwrap();
-        let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
+        let app = App::open(bone_app::AppOptions::isolated(root.path().join("data")))
             .await
             .unwrap();
         let workspace = app.open_workspace(root.path()).await.unwrap();
@@ -1571,7 +1612,7 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn exit_saves_orphan_to_existing_create_identity_without_submitting() {
         let root = tempfile::tempdir().unwrap();
-        let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
+        let app = App::open(bone_app::AppOptions::isolated(root.path().join("data")))
             .await
             .unwrap();
         let workspace = app.open_workspace(root.path()).await.unwrap();
@@ -1624,7 +1665,7 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn failed_exit_retains_orphan_and_request_identity() {
         let root = tempfile::tempdir().unwrap();
-        let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
+        let app = App::open(bone_app::AppOptions::isolated(root.path().join("data")))
             .await
             .unwrap();
         let (tx, _rx) = mpsc::channel(1);
@@ -1644,7 +1685,7 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn shutdown_aborts_login_observer() {
         let root = tempfile::tempdir().unwrap();
-        let app = App::open(bone_app::AppOptions::new(root.path().join("data")))
+        let app = App::open(bone_app::AppOptions::isolated(root.path().join("data")))
             .await
             .unwrap();
         let (tx, _rx) = mpsc::channel(1);

@@ -1,4 +1,4 @@
-use crate::{ConfigProblem, ProfileId, RuntimeId, SessionId};
+use crate::{ConfigProblem, CredentialProblem, ProfileId, RuntimeId, SessionId};
 
 /// Failures a frontend can act on without knowing App internals.
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +23,16 @@ pub enum Error {
     Configuration(ConfigProblem),
     #[error("profile {0} needs login")]
     LoginRequired(ProfileId),
+    #[error("{0}")]
+    Credential(CredentialProblem),
+    #[error("configuration schema version {actual} is unsupported; expected {expected}")]
+    ConfigVersion { expected: u32, actual: u32 },
+    #[error("configuration file is invalid: {0}")]
+    ConfigFile(String),
+    #[error("configuration file changed outside BONE: {0}")]
+    ConfigConflict(std::path::PathBuf),
+    #[error("project configuration is not trusted: {0}")]
+    ProjectConfigUntrusted(std::path::PathBuf),
     #[error("profile {0} is still in use")]
     ProfileBusy(ProfileId),
     #[error(
@@ -43,6 +53,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl From<crate::storage::StoreError> for Error {
     fn from(error: crate::storage::StoreError) -> Self {
-        Self::Storage(error.to_string())
+        match error {
+            crate::storage::StoreError::ConfigVersion { expected, actual } => {
+                Self::ConfigVersion { expected, actual }
+            }
+            crate::storage::StoreError::ConfigFile { message } => Self::ConfigFile(message),
+            crate::storage::StoreError::ConfigConflict { path } => Self::ConfigConflict(path),
+            crate::storage::StoreError::ProjectConfigUntrusted { path } => {
+                Self::ProjectConfigUntrusted(path)
+            }
+            error => Self::Storage(error.to_string()),
+        }
     }
 }

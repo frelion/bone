@@ -7,7 +7,7 @@ use std::{
 };
 
 use bone_app::{
-    AgentLimits, ApiKey, App, AppOptions, AppProblem, ConfigChange, ConfigScope, EndpointConfig,
+    AgentLimits, App, AppOptions, AppProblem, ConfigChange, ConfigScope, EndpointConfig,
     HistoryEntry, InputId, InputOutcome, InputState, ModelSelection, Profile, ProfileId, Session,
     SessionEvent, SessionSeq, SubmitInput, ToolLimits, ToolMode, ToolSettings,
 };
@@ -22,6 +22,7 @@ USAGE:\n\
 \n\
 COMMANDS:\n\
     run     Complete one task without the interactive UI\n\
+    credentials set  Save an API key read from stdin\n\
 \n\
 Run `bone run --help` for automation and benchmark options.\n";
 
@@ -51,11 +52,21 @@ MODEL OPTIONS:\n\
     --provider NAME           openai-responses (default), openai-chat, anthropic,\n\
                               or chatgpt (uses an existing subscription login)\n\
     --base-url URL            HTTPS URL for a compatible provider\n\
-    --api-key-env NAME        Environment variable containing the API key\n\
-                              (defaults to OPENAI_API_KEY or ANTHROPIC_API_KEY)\n\
+    --trust-project-config    Trust the current .bone/config.toml digest\n\
 \n\
 If --model is omitted, `run` uses the model already configured in BONE.\n\
 Exit codes: 0 completed, 2 usage, 3 failed, 4 needs input, 124 timeout, 130 interrupted.\n";
+
+const CREDENTIAL_HELP: &str = "\
+Save one API key using BONE's credential backend. The key is read from stdin.\n\
+\n\
+USAGE:\n\
+    printf '%s' \"$API_KEY\" | bone credentials set --provider NAME [OPTIONS]\n\
+\n\
+OPTIONS:\n\
+    --provider NAME    openai-responses, openai-chat, or anthropic\n\
+    --profile ID       Profile ID (default: headless provider profile)\n\
+    --base-url URL     HTTPS URL for a compatible provider\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Provider {
@@ -96,14 +107,6 @@ impl Provider {
         }
     }
 
-    fn default_key_env(self) -> &'static str {
-        match self {
-            Self::Anthropic => "ANTHROPIC_API_KEY",
-            Self::OpenAiResponses | Self::OpenAiChat => "OPENAI_API_KEY",
-            Self::ChatGpt => "",
-        }
-    }
-
     fn endpoint(self, base_url: Option<String>) -> EndpointConfig {
         match self {
             Self::OpenAiResponses => EndpointConfig::OpenAiResponses { base_url },
@@ -129,7 +132,7 @@ struct Options {
     model: Option<String>,
     provider: Provider,
     base_url: Option<String>,
-    api_key_env: Option<String>,
+    trust_project_config: bool,
 }
 
 #[derive(Debug)]
@@ -185,10 +188,88 @@ pub async fn run(args: &[OsString]) -> ExitCode {
     }
 }
 
+pub async fn credentials(args: &[OsString]) -> ExitCode {
+    match provision_credentials(args).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("bone credentials: {message}\n\n{CREDENTIAL_HELP}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+async fn provision_credentials(args: &[OsString]) -> Result<(), String> {
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--help" || arg == "-h")
+    {
+        print!("{CREDENTIAL_HELP}");
+        return Ok(());
+    }
+    if args.first().is_none_or(|arg| arg != "set") {
+        return Err("expected `set`".into());
+    }
+    let mut provider = None;
+    let mut profile = None;
+    let mut base_url = None;
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index]
+            .to_str()
+            .ok_or_else(|| "arguments must be UTF-8".to_owned())?;
+        index += 1;
+        let value = || {
+            args.get(index)
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| format!("{option} needs a value"))
+        };
+        match option {
+            "--provider" => provider = Some(Provider::parse(value()?)?),
+            "--profile" => profile = Some(value()?.to_owned()),
+            "--base-url" => base_url = Some(value()?.to_owned()),
+            "--help" | "-h" => {
+                print!("{CREDENTIAL_HELP}");
+                return Ok(());
+            }
+            other => return Err(format!("unknown option `{other}`")),
+        }
+        index += 1;
+    }
+    let provider = provider.ok_or_else(|| "--provider is required".to_owned())?;
+    if provider == Provider::ChatGpt {
+        return Err("chatgpt uses `bone` interactive login, not an API key".into());
+    }
+    let profile = Profile::new(
+        ProfileId::new(profile.unwrap_or_else(|| provider.profile_id().to_owned()))
+            .map_err(|error| error.to_string())?,
+        provider.label(),
+        provider.endpoint(base_url),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|error| format!("could not read API key from stdin: {error}"))?;
+    while input.ends_with(['\n', '\r']) {
+        input.pop();
+    }
+    let key = bone_app::ApiKey::new(input).map_err(|error| error.to_string())?;
+    App::provision_api_key(
+        AppOptions::default_bone_home().map_err(|error| error.to_string())?,
+        profile,
+        key,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 async fn execute(options: Options) -> Result<u8, String> {
     let started = Instant::now();
     let app_options = match &options.data_dir {
-        Some(path) => AppOptions::new(path),
+        Some(path) => AppOptions::with_paths(
+            path,
+            AppOptions::default_bone_home().map_err(|error| error.to_string())?,
+        ),
         None => AppOptions::platform_default().map_err(|error| error.to_string())?,
     };
     let app = App::open(app_options)
@@ -198,6 +279,20 @@ async fn execute(options: Options) -> Result<u8, String> {
         .open_workspace(&options.workspace)
         .await
         .map_err(|error| format!("could not open workspace: {error}"))?;
+
+    let project_status = app
+        .project_config_status(workspace.id)
+        .await
+        .map_err(|error| format!("could not inspect project configuration: {error}"))?;
+    if project_status.exists && !project_status.trusted {
+        if options.trust_project_config {
+            app.trust_project_config(workspace.id)
+                .await
+                .map_err(|error| format!("could not trust project configuration: {error}"))?;
+        } else {
+            return Err("project .bone/config.toml is not trusted; review it and rerun with --trust-project-config".into());
+        }
+    }
 
     if let Some(model) = &options.model {
         configure_model(&app, workspace.id, &options, model).await?;
@@ -336,22 +431,9 @@ async fn configure_model(
     options: &Options,
     model: &str,
 ) -> Result<(), String> {
-    if options.provider == Provider::ChatGpt
-        && (options.base_url.is_some() || options.api_key_env.is_some())
-    {
-        return Err("chatgpt does not accept --base-url or --api-key-env".into());
+    if options.provider == Provider::ChatGpt && options.base_url.is_some() {
+        return Err("chatgpt does not accept --base-url".into());
     }
-    let api_key = if options.provider == Provider::ChatGpt {
-        None
-    } else {
-        let key_env = options
-            .api_key_env
-            .as_deref()
-            .unwrap_or_else(|| options.provider.default_key_env());
-        let key = std::env::var(key_env)
-            .map_err(|_| format!("{key_env} is required when --model is specified"))?;
-        Some(ApiKey::new(key).map_err(|error| error.to_string())?)
-    };
     let profile_id = ProfileId::new(options.provider.profile_id()).map_err(|e| e.to_string())?;
     let profile = if options.provider == Provider::ChatGpt {
         Profile::chatgpt()
@@ -366,11 +448,6 @@ async fn configure_model(
     app.save_profile(profile)
         .await
         .map_err(|error| format!("could not save provider profile: {error}"))?;
-    if let Some(key) = api_key {
-        app.set_volatile_api_key(profile_id.clone(), key)
-            .await
-            .map_err(|error| format!("could not configure provider credential: {error}"))?;
-    }
     let selection = ModelSelection::new(profile_id, model)
         .map_err(|error| format!("invalid model: {error}"))?;
     app.update_config(
@@ -538,6 +615,24 @@ fn classify(completion: Completion) -> (&'static str, u8, Option<String>) {
             Some(format!("unexpected terminal state: {other:?}")),
         ),
         Completion::NeedsInput(question) => ("needs_input", 4, Some(question)),
+        Completion::Problem(AppProblem::Credential(problem)) => {
+            use bone_app::CredentialProblemKind::*;
+            let message = match problem.kind {
+                Missing => format!(
+                    "profile {} needs an API key in $BONE_HOME/credentials.toml; save it through the TUI first",
+                    problem.profile
+                ),
+                Unavailable => format!(
+                    "$BONE_HOME/credentials.toml is unavailable or unsafe for profile {}",
+                    problem.profile
+                ),
+                EndpointMismatch => format!(
+                    "the API key for profile {} belongs to a different endpoint; re-enter it through the TUI",
+                    problem.profile
+                ),
+            };
+            ("failed", 3, Some(message))
+        }
         Completion::Problem(problem) => ("failed", 3, Some(format!("{problem:?}"))),
         Completion::Timeout => ("timeout", 124, Some("task exceeded its time limit".into())),
         Completion::Interrupted => ("interrupted", 130, Some("interrupted by user".into())),
@@ -559,7 +654,7 @@ fn parse(args: &[OsString]) -> Result<ParseResult, String> {
     let mut model = None;
     let mut provider = Provider::OpenAiResponses;
     let mut base_url = None;
-    let mut api_key_env = None;
+    let mut trust_project_config = false;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index]
@@ -570,6 +665,11 @@ fn parse(args: &[OsString]) -> Result<ParseResult, String> {
         }
         if flag == "--read-only" {
             read_only = true;
+            index += 1;
+            continue;
+        }
+        if flag == "--trust-project-config" {
+            trust_project_config = true;
             index += 1;
             continue;
         }
@@ -614,7 +714,6 @@ fn parse(args: &[OsString]) -> Result<ParseResult, String> {
             "--model" => model = Some(value.to_owned()),
             "--provider" => provider = Provider::parse(value)?,
             "--base-url" => base_url = Some(value.to_owned()),
-            "--api-key-env" => api_key_env = Some(value.to_owned()),
             _ => return Err(format!("unknown option `{flag}`")),
         }
         index += 2;
@@ -631,8 +730,8 @@ fn parse(args: &[OsString]) -> Result<ParseResult, String> {
     if prompt.trim().is_empty() {
         return Err("task prompt cannot be empty".into());
     }
-    if (base_url.is_some() || api_key_env.is_some()) && model.is_none() {
-        return Err("--base-url and --api-key-env require --model".into());
+    if base_url.is_some() && model.is_none() {
+        return Err("--base-url requires --model".into());
     }
     let workspace = match workspace {
         Some(path) => path,
@@ -652,7 +751,7 @@ fn parse(args: &[OsString]) -> Result<ParseResult, String> {
         model,
         provider,
         base_url,
-        api_key_env,
+        trust_project_config,
     })))
 }
 

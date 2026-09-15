@@ -8,6 +8,9 @@ async fn main() -> ExitCode {
     if args.first().is_some_and(|value| value == "run") {
         return headless::run(&args[1..]).await;
     }
+    if args.first().is_some_and(|value| value == "credentials") {
+        return headless::credentials(&args[1..]).await;
+    }
     if args.len() == 1 && (args[0] == "--help" || args[0] == "-h") {
         print!("{}", headless::ROOT_HELP);
         return ExitCode::SUCCESS;

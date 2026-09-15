@@ -1837,6 +1837,7 @@ fn app_problem(error: &Error) -> Option<AppProblem> {
     match error {
         Error::Configuration(problem) => Some(AppProblem::Configuration(problem.clone())),
         Error::LoginRequired(profile) => Some(AppProblem::LoginRequired(profile.clone())),
+        Error::Credential(problem) => Some(AppProblem::Credential(problem.clone())),
         Error::ProfileBusy(profile) => Some(AppProblem::ProfileBusy(profile.clone())),
         Error::Provider(message) => Some(AppProblem::Provider(message.clone())),
         Error::Storage(message) => Some(AppProblem::Storage(message.clone())),

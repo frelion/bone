@@ -213,6 +213,7 @@ impl<'de> Deserialize<'de> for ProfileId {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
     pub id: ProfileId,
     pub label: String,
@@ -283,6 +284,7 @@ impl Profile {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelSelection {
     pub profile: ProfileId,
     pub model: String,
@@ -325,6 +327,7 @@ pub enum ToolMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolSettings {
     pub mode: ToolMode,
     pub limits: ToolLimits,
@@ -340,6 +343,7 @@ impl Default for ToolSettings {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeSettings {
     pub worker: Option<ModelSelection>,
     pub coordinator: Option<ModelSelection>,
@@ -348,6 +352,7 @@ pub(crate) struct RuntimeSettings {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeOverrides {
     pub worker: Option<ModelSelection>,
     pub coordinator: Option<ModelSelection>,

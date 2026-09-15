@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -127,8 +128,8 @@ impl App {
     }
 
     pub async fn open(options: AppOptions) -> Result<Self> {
-        let store = DataStore::open(options.data_dir)?;
-        let providers = ProviderConnector::new();
+        let store = DataStore::open_with_home(&options.data_dir, &options.bone_home)?;
+        let providers = ProviderConnector::new(options.bone_home);
         Ok(Self::from_parts(
             store,
             RuntimeBackend::Providers(providers.clone()),
@@ -142,8 +143,8 @@ impl App {
         model: Arc<dyn ModelPort>,
         tools: Vec<Arc<dyn ToolPort>>,
     ) -> Result<Self> {
-        let store = DataStore::open(options.data_dir)?;
-        let providers = ProviderConnector::new();
+        let store = DataStore::open_with_home(&options.data_dir, &options.bone_home)?;
+        let providers = ProviderConnector::new(options.bone_home);
         Ok(Self::from_parts(
             store,
             RuntimeBackend::Ports {
@@ -156,8 +157,8 @@ impl App {
 
     #[cfg(test)]
     pub(crate) async fn with_model(options: AppOptions, model: Arc<dyn ModelPort>) -> Result<Self> {
-        let store = DataStore::open(options.data_dir)?;
-        let providers = ProviderConnector::new();
+        let store = DataStore::open_with_home(&options.data_dir, &options.bone_home)?;
+        let providers = ProviderConnector::new(options.bone_home);
         Ok(Self::from_parts(
             store,
             RuntimeBackend::Ports { model, tools: None },
@@ -170,7 +171,7 @@ impl App {
         options: AppOptions,
         providers: ProviderConnector,
     ) -> Result<Self> {
-        let store = DataStore::open(options.data_dir)?;
+        let store = DataStore::open_with_home(&options.data_dir, &options.bone_home)?;
         Ok(Self::from_parts(
             store,
             RuntimeBackend::Providers(providers.clone()),
@@ -637,6 +638,85 @@ impl App {
         self.inner.store.config(scope).map_err(Into::into)
     }
 
+    pub async fn project_config_status(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<crate::ProjectConfigStatus> {
+        self.ensure_open()?;
+        if self.inner.store.workspace_by_id(workspace)?.is_none() {
+            return Err(Error::WorkspaceNotFound);
+        }
+        self.inner
+            .store
+            .project_config_status(workspace)
+            .map_err(Into::into)
+    }
+
+    pub async fn trust_project_config(&self, workspace: WorkspaceId) -> Result<()> {
+        let _update = self.inner.config_updates.lock().await;
+        self.ensure_open()?;
+        self.inner.store.trust_project_config(workspace)?;
+        let targets = self.active_sessions(Some(workspace)).await;
+        reload_sessions(&targets, false).await
+    }
+
+    pub async fn revoke_project_config_trust(&self, workspace: WorkspaceId) -> Result<()> {
+        let _update = self.inner.config_updates.lock().await;
+        self.ensure_open()?;
+        self.inner.store.revoke_project_config_trust(workspace)?;
+        let targets = self.active_sessions(Some(workspace)).await;
+        reload_sessions(&targets, false).await
+    }
+
+    pub async fn reload_user_config(&self) -> Result<()> {
+        let _update = self.inner.config_updates.lock().await;
+        self.ensure_open()?;
+        self.inner.store.reload_user_config()?;
+        let targets = self.active_sessions(None).await;
+        reload_sessions(&targets, false).await
+    }
+
+    pub async fn reload_workspace_config(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<crate::ProjectConfigStatus> {
+        let _update = self.inner.config_updates.lock().await;
+        self.ensure_open()?;
+        let status = self.inner.store.reload_workspace_config(workspace)?;
+        // An edited file loses trust immediately. Reload even in that state so
+        // a previously trusted write-tool override cannot remain live.
+        let targets = self.active_sessions(Some(workspace)).await;
+        reload_sessions(&targets, false).await?;
+        Ok(status)
+    }
+
+    /// Atomically reload user and project files, then reconfigure each open
+    /// Session once. Invalid input leaves the currently running snapshots intact.
+    pub async fn reload_config(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<crate::ReloadConfigOutcome> {
+        let _update = self.inner.config_updates.lock().await;
+        self.ensure_open()?;
+        let project = self.inner.store.reload_config(workspace)?;
+        let targets = self.active_sessions(None).await;
+        reload_sessions(&targets, false).await?;
+        Ok(crate::ReloadConfigOutcome { project })
+    }
+
+    async fn active_sessions(&self, workspace: Option<WorkspaceId>) -> Vec<Session> {
+        self.inner
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter(|entry| !entry.releasing)
+            .map(|entry| &entry.handle)
+            .filter(|session| workspace.is_none_or(|id| session.workspace() == id))
+            .cloned()
+            .collect()
+    }
+
     /// Persist one override and wait for every affected open Session. Success
     /// means all applied it; a failure does not roll back Sessions that did.
     /// Once dispatched, cancelling the future stops waiting but does not revoke
@@ -816,18 +896,43 @@ impl App {
         self.set_api_key_for_profile(profile, key).await
     }
 
-    /// Configure an API key for this App process without writing it to the
-    /// platform credential store. Intended for headless and container clients.
-    pub async fn set_volatile_api_key(&self, profile: ProfileId, key: ApiKey) -> Result<()> {
-        let _update = self.inner.config_updates.lock().await;
-        self.ensure_open()?;
-        let expected = self.profile(&profile)?;
-        self.inner
-            .providers
-            .set_volatile_api_key(&expected, key)
-            .await
-            .map_err(Error::from)?;
-        self.reload_profile_sessions_locked(&profile).await
+    /// Provision one API-key slot without opening SQLite or a Session.
+    /// Intended for installers and automation; the key should be read from stdin.
+    pub async fn provision_api_key(
+        bone_home: PathBuf,
+        profile: Profile,
+        key: ApiKey,
+    ) -> Result<()> {
+        let profile_id = profile.id.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::credentials::ApiKeyCredentials::for_profile(&bone_home, &profile)
+                .and_then(|credentials| credentials.save(&key))
+        })
+        .await
+        .map_err(|_| {
+            Error::Credential(crate::CredentialProblem {
+                profile: profile_id.clone(),
+                kind: crate::CredentialProblemKind::Unavailable,
+            })
+        })?
+        .map_err(|error| {
+            let kind = match error {
+                crate::ApiKeyCredentialError::MissingApiKey => {
+                    crate::CredentialProblemKind::Missing
+                }
+                crate::ApiKeyCredentialError::EndpointMismatch => {
+                    crate::CredentialProblemKind::EndpointMismatch
+                }
+                crate::ApiKeyCredentialError::InvalidApiKey
+                | crate::ApiKeyCredentialError::Unavailable => {
+                    crate::CredentialProblemKind::Unavailable
+                }
+            };
+            Error::Credential(crate::CredentialProblem {
+                profile: profile_id,
+                kind,
+            })
+        })
     }
 
     /// Save credentials only for the caller's observed profile and endpoint.
@@ -1135,6 +1240,7 @@ impl From<ProviderConnectError> for Error {
         match error {
             ProviderConnectError::Closed => Self::Closed,
             ProviderConnectError::LoginRequired(profile) => Self::LoginRequired(profile),
+            ProviderConnectError::Credential(problem) => Self::Credential(problem),
             ProviderConnectError::Busy(profile) => Self::ProfileBusy(profile),
             error => Self::Provider(error.to_string()),
         }
@@ -1251,7 +1357,7 @@ mod expected_profile_tests {
     #[tokio::test]
     async fn stale_profile_is_rejected_before_credential_work() {
         let root = tempfile::tempdir().unwrap();
-        let app = App::open(AppOptions::new(root.path().join("data")))
+        let app = App::open(AppOptions::isolated(root.path().join("data")))
             .await
             .unwrap();
         // Both profiles use subscription transport, which cannot reach API-key

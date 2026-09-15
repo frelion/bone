@@ -498,6 +498,8 @@ pub(super) fn render(
                 "Esc           Back, then stop".to_owned(),
                 "Ctrl+Z/Y      Undo / redo in input".to_owned(),
                 "/model        Models & connections".to_owned(),
+                "/reload-config Reload configuration files".to_owned(),
+                "/trust-config Trust current project config".to_owned(),
                 "/details      Latest task / tool".to_owned(),
             ];
             frame.render_widget(

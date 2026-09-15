@@ -61,10 +61,14 @@ pub async fn run() -> Result<(), RunError> {
     let app_options = launch
         .data_dir
         .map_or_else(AppOptions::platform_default, |path| {
-            Ok(AppOptions::new(path))
+            Ok(AppOptions::with_paths(
+                path,
+                AppOptions::default_bone_home()?,
+            ))
         })?;
     let app = App::open(app_options).await?;
     let workspace = app.open_workspace(launch.workspace).await?;
+    let project_config = app.project_config_status(workspace.id).await?;
     let overview = app.workspace_overview(workspace.id).await?;
     let last_active = app.last_active_session(workspace.id).await?;
     let model_facts = models::ModelFacts::from(app.resolved_workspace_config(workspace.id).await?);
@@ -89,6 +93,18 @@ pub async fn run() -> Result<(), RunError> {
             model_facts,
         },
     ));
+    if project_config.exists && !project_config.trusted {
+        let changes = summarize_project_config(&project_config.overrides);
+        effects.extend(update(
+            &mut state,
+            UiEvent::ConfigOperationFinished {
+                action: "Project configuration",
+                error: Some(format!(
+                    "not trusted ({changes}); review .bone/config.toml and run /trust-config to confirm"
+                )),
+            },
+        ));
+    }
 
     // Install process signal handlers before changing terminal modes. Registering inside
     // the spawned forwarding tasks leaves a window where the OS default action
@@ -409,6 +425,33 @@ pub async fn run() -> Result<(), RunError> {
         return Err(RunError::Io(restore_error));
     }
     Ok(())
+}
+
+fn summarize_project_config(overrides: &bone_app::RuntimeOverrides) -> String {
+    let mut changes = Vec::new();
+    if let Some(worker) = &overrides.worker {
+        changes.push(format!("worker {}/{}", worker.profile, worker.model));
+    }
+    if let Some(coordinator) = &overrides.coordinator {
+        changes.push(format!(
+            "coordinator {}/{}",
+            coordinator.profile, coordinator.model
+        ));
+    }
+    if let Some(tools) = &overrides.tools {
+        changes.push(format!("tools {:?}", tools.mode));
+    }
+    if let Some(limits) = &overrides.limits {
+        changes.push(format!(
+            "limits jobs={}, depth={}, tool-slots={}",
+            limits.job_budget, limits.job_depth, limits.tool_slots
+        ));
+    }
+    if changes.is_empty() {
+        "no runtime overrides".into()
+    } else {
+        changes.join(", ")
+    }
 }
 
 fn record_shutdown_error(target: &mut Option<String>, message: impl AsRef<str>) {

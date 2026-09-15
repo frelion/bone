@@ -22,7 +22,6 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 http = "1"
 ignore = "0.4"
-keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rig-core = { version = "=0.42.0", path = "third_party/rig-core-0.42.0", default-features = false }
@@ -34,7 +33,9 @@ serde_json = "1.0"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
+toml = "0.9"
 tokio = "1"
+url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2"
 

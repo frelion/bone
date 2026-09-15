@@ -9,7 +9,7 @@ async fn main() -> bone_app::Result<()> {
         args.len() == 4 && matches!(args[1].as_str(), "seed" | "inspect"),
         "expected seed|inspect DATA_DIR WORKSPACE"
     );
-    let app = App::open(AppOptions::new(&args[2])).await?;
+    let app = App::open(AppOptions::isolated(&args[2])).await?;
     let workspace = app.open_workspace(&args[3]).await?;
     if args[1] == "seed" {
         app.save_profile(

@@ -42,6 +42,7 @@ chmod +x ./bone-*
 ```
 
 Windows 可直接运行下载的 `.exe`。`SHA256SUMS` 可用于校验下载文件。
+两个 Linux 发布文件均以 musl 静态链接，不依赖目标系统的 glibc、DBus 或 Secret Service。
 
 ### 在项目里执行一次任务
 
@@ -49,7 +50,7 @@ Windows 可直接运行下载的 `.exe`。`SHA256SUMS` 可用于校验下载文�
 `bone run`，它不启动 TUI，完成后在 stdout 输出 JSON：
 
 ```sh
-export OPENAI_API_KEY='你的 API key'
+# 先运行 bone，在 Models & connections 中保存 API key
 bone run \
   --workspace /path/to/project \
   --prompt '修复失败的测试，并运行相关测试验证修改' \
@@ -59,9 +60,11 @@ bone run \
 ```
 
 也可以用 `--prompt-file issue.md` 从文件读取任务。headless 模式默认允许修改
-workspace；只做调查时加 `--read-only`。API key 只在当前进程内存中使用，不写入
-Bone 数据库或系统密钥环。运行 `bone run --help` 可查看 provider、自定义 HTTPS
-endpoint、超时和退出码参数。
+workspace；只做调查时加 `--read-only`。`bone run` 不读取 API-key 环境变量；API key
+必须已经由 TUI 保存，或通过 stdin 交给 `bone credentials set`，最终写入
+`$BONE_HOME/credentials.toml`（默认 `~/.bone/credentials.toml`）。
+运行 `bone run --help` 可查看 provider、自定义 HTTPS endpoint、项目配置授权、超时和
+退出码参数。
 
 权威 benchmark 的 Harbor 适配、公开测试集选择和结果留存规范见
 [`benchmarks/README.md`](benchmarks/README.md)。
@@ -74,7 +77,10 @@ endpoint、超时和退出码参数。
 use bone_app::{App, AppOptions, SessionSeq, SubmitInput};
 
 # async fn run() -> bone_app::Result<()> {
-let app = App::open(AppOptions::new("/absolute/path/to/app-data")).await?;
+let app = App::open(AppOptions::with_paths(
+    "/absolute/path/to/app-data",
+    "/absolute/path/to/bone-home",
+)).await?;
 let workspace = app.open_workspace("/absolute/path/to/workspace").await?;
 let session = app.create_session(workspace.id, "Investigate build").await?;
 
@@ -93,14 +99,18 @@ app.shutdown().await?;
 Runtime 配置按以下顺序解析：
 
 ```text
-Session override > Workspace override > User setting
+Session override > Project override > User setting
 ```
 
 `App::update_config` 保存一项类型化变更，并等待所有受影响的已打开 Session 处理它。面向前端的 `ConfigChange::Model` 会校验模型选择，并在一个事务中同时选择 worker/coordinator；ChatGPT 还会先检查缓存登录，需要授权时不会覆盖原选择。配置有效时，运行中的 Agent 保留 Runtime ID、Job 图和在途工具，撤销旧模型提交资格并使用新端口继续；其他配置无法装配时，Session 暂停新执行并暴露可匹配的问题，直到配置或凭据修复。
 
 ## 持久化边界
 
-`AppOptions::data_dir` 必须由宿主明确提供。App 在其中保存 `bone.sqlite3`，记录 Workspace、Session、输入幂等、配置、Agent 事实、公开历史和写入意图；API key 保存在操作系统凭据管理器，ChatGPT OAuth cache 由受租约保护的 provider 能力管理。
+`AppOptions` 分别携带 SQLite `data_dir` 与文件配置根目录 `bone_home`。平台默认的
+`bone_home` 是 `BONE_HOME` 指定的绝对目录，否则为 `~/.bone`。User 配置与 Profiles
+位于 `config.toml`，API key 位于权限受限的 `credentials.toml`，ChatGPT OAuth cache
+位于 `providers/`；SQLite 只保留 Session override、项目配置的摘要信任记录和其他运行
+状态。旧 SQLite User/Workspace 配置与系统 Keyring 不迁移，升级后需重新配置连接。
 
 一次外部写在调用前记录意图，在结果被匹配的 Agent 事实确认前保持阻塞。进程退出后，App 恢复产品状态并把丢失 Runtime 的未完成输入标为 `Interrupted`，不会猜测或自动重放结果未知的外部写。`App::unresolved_writes` 是 Workspace 级的权威查询入口。
 

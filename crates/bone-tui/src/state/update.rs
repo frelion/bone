@@ -32,6 +32,15 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
     }
     let mut effects = Vec::new();
     match event {
+        UiEvent::ConfigOperationFinished { action, error } => {
+            set_selection_status(
+                state,
+                error.map_or_else(
+                    || format!("{action} succeeded"),
+                    |error| format!("{action} failed: {error}"),
+                ),
+            );
+        }
         UiEvent::ConnectionSaved {
             request,
             session,
@@ -1229,6 +1238,16 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
         CommandKind::Model if argument.is_empty() => {
             clear_current_draft(state, effects);
             panel::open_models(state, effects);
+        }
+        CommandKind::ReloadConfig if argument.is_empty() => {
+            clear_current_draft(state, effects);
+            effects.push(Effect::ReloadConfig);
+            set_selection_status(state, "Reloading configuration…");
+        }
+        CommandKind::TrustConfig if argument.is_empty() => {
+            clear_current_draft(state, effects);
+            effects.push(Effect::TrustProjectConfig);
+            set_selection_status(state, "Trusting current project configuration…");
         }
         CommandKind::Details if argument.is_empty() => {
             clear_current_draft(state, effects);

@@ -74,6 +74,8 @@ pub enum CommandKind {
     Rename,
     Help,
     Model,
+    ReloadConfig,
+    TrustConfig,
     Details,
     Answer,
     Recover,
@@ -99,6 +101,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "model",
         usage: "",
         summary: "Models & connections",
+    },
+    CommandSpec {
+        kind: CommandKind::ReloadConfig,
+        name: "reload-config",
+        usage: "",
+        summary: "Reload user and project configuration",
+    },
+    CommandSpec {
+        kind: CommandKind::TrustConfig,
+        name: "trust-config",
+        usage: "",
+        summary: "Trust the current project configuration",
     },
     CommandSpec {
         kind: CommandKind::Answer,

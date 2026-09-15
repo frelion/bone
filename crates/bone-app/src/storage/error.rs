@@ -18,6 +18,14 @@ pub enum StoreError {
     UnsafeStorage { path: PathBuf, reason: &'static str },
     #[error("local storage is busy")]
     Busy,
+    #[error("configuration schema version {actual} is unsupported; expected {expected}")]
+    ConfigVersion { expected: u32, actual: u32 },
+    #[error("configuration file is invalid: {message}")]
+    ConfigFile { message: String },
+    #[error("configuration file changed outside BONE: {path}")]
+    ConfigConflict { path: PathBuf },
+    #[error("project configuration is not trusted: {path}")]
+    ProjectConfigUntrusted { path: PathBuf },
     #[error(
         "stored document changed since it was read (expected revision {expected}, actual {actual})"
     )]

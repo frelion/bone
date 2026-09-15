@@ -41,7 +41,10 @@ bone-app
 use bone_app::{App, AppOptions, SessionSeq, SubmitInput};
 
 # async fn run() -> bone_app::Result<()> {
-let app = App::open(AppOptions::new("/var/lib/my-bone")).await?;
+let app = App::open(AppOptions::with_paths(
+    "/var/lib/my-bone/data",
+    "/var/lib/my-bone/home",
+)).await?;
 let workspace = app.open_workspace("/workspace/project").await?;
 let session = app.create_session(workspace.id, "Investigate CI").await?;
 
@@ -139,9 +142,26 @@ SessionTask 观察 Core 时采用同一原则：broadcast 只负责唤醒；它�
 Session override > Workspace override > User setting
 ```
 
+持久化边界与作用域一致：User settings 和所有 Profiles 写入
+`$BONE_HOME/config.toml`，Workspace override 写入 `<workspace>/.bone/config.toml`，只有
+Session override 留在 SQLite。`BONE_HOME` 必须是绝对路径；平台默认值为 `~/.bone`。
+项目文件只能引用用户级 Profile ID，不能声明 Profile、Endpoint、凭据路径或 secret。
+两个 TOML 文件都带 `schema_version = 1`，未知字段和未知版本会被拒绝。
+
 `RuntimeOverrides` 包含 Worker、Coordinator、`AgentLimits` 和 `ToolSettings`。没有 Coordinator override 时它跟随最终 Worker；没有任何 Worker 时，resolved desired 为 `ConfigProblem::NeedsModel`。这不会阻止打开 Workspace、Session、历史或草稿。
 
-`ConfigChange` 每次只修改一个字段。传入 `None` 清除本作用域 override；User 的 limits / tools 清除后回到类型默认值。配置保存使用最新 revision 更新指定字段，避免两个独立字段的修改互相覆盖。
+`ConfigChange` 每次只修改一个字段。传入 `None` 清除本作用域 override；User 的 limits / tools 清除后回到类型默认值。文件写入在 App-owned advisory lock 内重新比较载入时的 SHA-256 摘要，因此并发 BONE 进程或外部编辑不会静默覆盖；成功写入使用同目录临时文件、同步和原子替换。项目 `.bone` 必须是真实目录，配置文件也不能是符号链接。
+
+配置只在 App 启动、打开 Workspace 或显式 reload 时读取，不使用 watcher。
+`reload_config(workspace)` 先完整解析并校验 User 与 Workspace 两个文件，再一起替换内存
+快照，并只重配一次已打开 Session；任一文件失败时两个快照都不变。返回的
+`ReloadConfigOutcome` 会明确给出项目文件是否存在、是否仍受信任。细粒度 embedder 仍可用
+`reload_user_config` / `reload_workspace_config`。TUI 的 `/reload-config` 使用组合接口。
+
+首次发现项目配置时，它不参与解析，也不能借此开启写工具。SQLite 以 canonical
+Workspace root 对应配置原始字节的 SHA-256 保存信任记录；内容一变就必须重新确认。
+TUI 用 `/trust-config` 明确认可当前摘要，headless 必须传
+`--trust-project-config`，否则明确失败。信任不涉及任何 secret，并可通过 App API 撤销。
 
 `App::update_config(scope, change).await` 是当前 App 进程内的生效屏障：
 
@@ -157,7 +177,8 @@ Session override > Workspace override > User setting
 
 调用方取消 `update_config` / `save_profile` Future 只停止等待，不撤销已经交给 App 的变更。后续配置操作、`resolved_config` 与 shutdown 会在同一屏障后继续。
 
-这个生效保证只覆盖同一 App 实例。没有跨进程配置 watcher；另一个进程在下次解析或执行自己的配置操作时读取 durable 值。
+这个生效保证只覆盖同一 App 实例。没有跨进程配置 watcher；外部修改要到显式 reload
+或下一次 App 启动才会载入，写操作发现摘要变化则返回冲突。
 
 ## Profiles、凭据与模型连接
 
@@ -170,9 +191,18 @@ Session override > Workspace override > User setting
 
 App 层只允许 HTTPS compatible URL，禁止把凭据嵌入 base URL。模型选择保存 profile ID、model ID 和与 endpoint protocol 匹配的类型化 `ModelOptions`。
 
-API key 保存在操作系统 credential manager，slot 同时绑定 profile 与 endpoint identity；改变 endpoint 不会把旧 key 静默发送到新服务。API key 不实现可泄漏内容的 `Debug` / `Display`，也不进入 SQLite、历史或模型上下文。
+API key 只保存在 `$BONE_HOME/credentials.toml`。目录在 Unix 上要求 `0700`，文件要求
+`0600`，且拒绝符号链接、额外硬链接和非普通文件；更新使用文件锁、私有临时文件、同步
+和原子替换。每项绑定 Profile ID 与“协议 + 规范化 base URL”的 SHA-256 Endpoint 指纹，
+改变协议或地址后旧 key 不会被发送到新服务。API key 不实现可泄漏内容的 `Debug` /
+`Display`，错误也不包含 secret，并且它不进入配置文件、项目目录、SQLite、历史或模型上下文。
+自动化可将 key 通过 stdin 交给 `bone credentials set`；该命令复用同一 Rust 后端，
+不在 shell 参数或 `bone run` 环境中传递 secret。
 
-ChatGPT subscription 使用 provider 管理的 OAuth cache。App 持有对 cache 的互斥 lease，但不解析或复制其 JSON。普通 Runtime 启动只尝试 cached auth；缺少登录时暴露 `LoginRequired(ProfileId)`，不会自行弹出设备流程。
+ChatGPT subscription 使用 `$BONE_HOME/providers/chatgpt-subscription/auth.json` 与
+`auth.lock`。App 持有对 cache 的互斥 lease，但不解析或复制其 JSON，也不把它与 API-key
+文件混合。普通 Runtime 启动只尝试 cached auth；缺少登录时暴露
+`LoginRequired(ProfileId)`，不会自行弹出设备流程。
 
 `App::login` 显式返回 `LoginAttempt`，其 watch 状态为 Connecting、DeviceCode、Succeeded、Failed 或 Cancelled。丢弃或调用 `cancel` 会结束本次交互等待。登录、连接、logout 和 App shutdown 在同一个 provider operation 边界协调；冲突返回 `ProfileBusy`。live Runtime 仍持有凭据能力时，logout 不会删除 cache。
 
@@ -220,11 +250,15 @@ App 在 `<data_dir>/bone.sqlite3` 和私有 `leases/` 下保存自己的数据�
 
 - canonical Workspace identity；
 - Session metadata、draft、input、RequestId index；
-- User / Workspace / Session 配置与非 secret Profile；
+- Session override 与项目配置的路径/摘要信任记录；
 - Runtime config snapshot、原始 Agent Record 和公开 Session journal；
 - 外部写入意图、结果和后续核查。
 
 私有 storage 模块拥有 schema、document CAS、journal、事务、SQLite 连接和 OS lease。损坏、权限不安全或未知 schema 直接返回错误；App 不自动 reset、删除或猜测迁移。SQLite 用一条 App writer 连接串行短事务，WAL 允许并发读；独立连接使用有界 busy timeout。
+
+这个版本不读取或迁移旧 SQLite 中的 User/Workspace settings 与 Profiles，也不读取、
+导出或删除旧系统 Keyring 项；Session override 沿用原 SQLite schema。升级后用户需要重新
+建立 Profile 并录入 API key，旧系统凭据由用户自行清理。
 
 每个打开 Session 取得一个跨进程 writer lease，第二个进程打开同一 Session 会得到 `SessionBusy`。archive 只改变组织状态，不隐式取消或关闭 Runtime。
 

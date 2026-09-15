@@ -10,8 +10,10 @@ mod app;
 mod config;
 mod credentials;
 mod error;
+mod file_config;
 mod persistence;
 mod providers;
+mod safe_file;
 mod session;
 mod storage;
 mod tools;
@@ -22,6 +24,7 @@ pub use app::{App, LoginAttempt};
 pub use config::*;
 pub use credentials::{ApiKey, ApiKeyCredentialError};
 pub use error::{Error, Result};
+pub use file_config::ProjectConfigStatus;
 pub use session::Session;
 
 pub use bone_adapters::{

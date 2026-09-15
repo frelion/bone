@@ -622,10 +622,46 @@ pub enum UnresolvedWriteStatus {
 }
 
 /// A runtime problem that a frontend can handle without parsing display text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CredentialProblemKind {
+    Missing,
+    Unavailable,
+    EndpointMismatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CredentialProblem {
+    pub profile: crate::ProfileId,
+    pub kind: CredentialProblemKind,
+}
+
+impl std::fmt::Display for CredentialProblem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            CredentialProblemKind::Missing => write!(
+                formatter,
+                "profile {} needs an API key in $BONE_HOME/credentials.toml",
+                self.profile
+            ),
+            CredentialProblemKind::Unavailable => write!(
+                formatter,
+                "credential file is unavailable or unsafe for profile {}",
+                self.profile
+            ),
+            CredentialProblemKind::EndpointMismatch => write!(
+                formatter,
+                "saved credential endpoint does not match profile {}",
+                self.profile
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AppProblem {
     Configuration(ConfigProblem),
     LoginRequired(crate::ProfileId),
+    Credential(CredentialProblem),
     ProfileBusy(crate::ProfileId),
     Provider(String),
     Storage(String),
@@ -851,6 +887,12 @@ pub struct AppShutdownReport {
 #[derive(Clone, Debug)]
 pub struct AppOptions {
     pub data_dir: PathBuf,
+    pub bone_home: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReloadConfigOutcome {
+    pub project: crate::ProjectConfigStatus,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -889,18 +931,47 @@ impl std::fmt::Debug for LoginState {
 }
 
 impl AppOptions {
-    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+    pub fn with_paths(data_dir: impl Into<PathBuf>, bone_home: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
+            bone_home: bone_home.into(),
         }
+    }
+
+    /// Create an explicitly isolated layout for tests and embedders.
+    pub fn isolated(data_dir: impl Into<PathBuf>) -> Self {
+        let data_dir = data_dir.into();
+        Self::with_paths(data_dir.clone(), data_dir.join(".bone"))
+    }
+
+    pub fn default_bone_home() -> crate::Result<PathBuf> {
+        let bone_home = std::env::var_os("BONE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".bone"))
+            })
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".bone"))
+            })
+            .ok_or_else(|| {
+                crate::Error::InvalidState("cannot determine BONE home; set BONE_HOME".into())
+            })?;
+        if !bone_home.is_absolute() {
+            return Err(crate::Error::InvalidState(
+                "BONE_HOME must be an absolute path".into(),
+            ));
+        }
+        Ok(bone_home)
     }
 
     /// Resolve BONE's platform user-data location inside the App boundary.
     /// `BONE_DATA_DIR` is an explicit deployment override.
     pub fn platform_default() -> crate::Result<Self> {
-        if let Some(path) = std::env::var_os("BONE_DATA_DIR") {
-            return Ok(Self::new(path));
-        }
+        let explicit_data = std::env::var_os("BONE_DATA_DIR").map(PathBuf::from);
         #[cfg(target_os = "windows")]
         let path = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -918,11 +989,13 @@ impl AppOptions {
                     .map(PathBuf::from)
                     .map(|root| root.join(".local/share/bone"))
             });
-        path.map(Self::new).ok_or_else(|| {
+        let data_dir = explicit_data.or(path).ok_or_else(|| {
             crate::Error::InvalidState(
                 "cannot determine platform data directory; set BONE_DATA_DIR".into(),
             )
-        })
+        })?;
+        let bone_home = Self::default_bone_home()?;
+        Ok(Self::with_paths(data_dir, bone_home))
     }
 }
 

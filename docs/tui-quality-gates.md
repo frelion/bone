@@ -22,7 +22,7 @@
 
 `bone-tui` 的生产依赖只能包含 `bone-app` 和通用前端库。以下任一情况均为阻断问题：
 
-- manifest 直接依赖 `bone-core`、`bone-adapters`、SQLite、Git、HTTP/provider、keyring 或项目文件访问库；
+- manifest 直接依赖 `bone-core`、`bone-adapters`、SQLite、Git、HTTP/provider、凭据文件或项目文件访问库；
 - TUI 生产代码导入 Core、Adapter 或 App 私有存储模块；
 - TUI 直接读取 SQLite、工作区文件、产物、配置或凭据，或直接执行 Git / provider 请求；
 - TUI 从自然语言、日志文本、文件名或 diff 猜测完成、采纳、证据、验收或未知写入状态；
@@ -33,7 +33,7 @@
 
 ```sh
 cargo tree -p bone-tui --edges normal
-rg -n 'bone_core|bone_adapters|rusqlite|Command::new|std::fs|tokio::fs|reqwest|keyring' \
+rg -n 'bone_core|bone_adapters|rusqlite|Command::new|std::fs|tokio::fs|reqwest|credentials.toml' \
   crates/bone-tui/src crates/bone-tui/Cargo.toml
 ```
 
@@ -183,7 +183,7 @@ cargo test -p bone-app --lib storage:: --locked
 
 平台 job 必须验证 Rust 1.88 MSRV，或另设同等的 MSRV job；stable 通过不能替代 MSRV。平台可用 PTY 时逐步启用真实 binary 测试；暂不支持的 signal、PTY 或鼠标断言必须显式 `cfg` 并在支持平台运行，不能用全局 ignore 掩盖。
 
-Windows 重点覆盖 ConPTY、路径前缀、CRLF、鼠标坐标、终端模式恢复和 SQLite/lease；macOS 重点覆盖终端模式、Unicode 宽度、路径、keyring 装配和进程退出。平台失败是发布阻断项，除非该平台已经从公开支持范围中明确移除。
+Windows 重点覆盖 ConPTY、路径前缀、CRLF、鼠标坐标、终端模式恢复和 SQLite/lease；macOS 重点覆盖终端模式、Unicode 宽度、路径、私有凭据文件装配和进程退出。平台失败是发布阻断项，除非该平台已经从公开支持范围中明确移除。
 
 当前平台限制需要保留在发布说明中：Unix 工作区读取使用目录句柄与逐级 `NOFOLLOW`，而非 Unix 的 continuation 文件身份目前只能组合 canonical path、长度与修改时间；恶意进程若能同长度改写并精确恢复时间，自动化 CI 尚不能证明旧 cursor 必然失效。非 Unix 的 Git deadline 会终止直接子进程并停止等待，但尚无 Job Object 等价实现来保证清理恶意包装器派生的所有后代。这两项不降低 Linux/WSL 的安全语义；在 Windows 完成人工对抗验证或平台能力实现前，必须标为“自动编译与常规行为受支持，强对抗文件身份/后代清理未验证”。
 

@@ -92,7 +92,9 @@ bone --version
         trajectory_path = agent_dir / "bone-trajectory.json"
         base_url = access.configured_base_url
         base_url_arg = f" --base-url {shlex.quote(base_url)}" if base_url else ""
-        env = {"BONE_BENCHMARK_API_KEY": access.api_key or ""}
+        setup_env = {
+            "BONE_BENCHMARK_API_KEY": access.api_key or "",
+        }
 
         await self.exec_as_agent(
             environment,
@@ -101,6 +103,17 @@ bone --version
                 "chmod 700 /tmp/bone-data && "
                 f"printf %s {shlex.quote(instruction)} > {shlex.quote(prompt_path.as_posix())}"
             ),
+        )
+        # Feed the secret over stdin to BONE's Rust credential backend. The
+        # actual `bone run` process receives no API-key environment variable.
+        await self.exec_as_agent(
+            environment,
+            command=(
+                'printf %s "$BONE_BENCHMARK_API_KEY" | '
+                "BONE_HOME=/tmp/bone-home bone credentials set "
+                f"--provider {provider} --profile headless-{provider}{base_url_arg}"
+            ),
+            env=setup_env,
         )
         # A task-level agent failure must still allow Harbor's verifier to score
         # any useful workspace changes. The native exit code is retained in the
@@ -112,7 +125,6 @@ bone --version
                 "bone run --workspace /app --data-dir /tmp/bone-data "
                 f"--prompt-file {shlex.quote(prompt_path.as_posix())} "
                 f"--model {shlex.quote(model)} --provider {provider} "
-                "--api-key-env BONE_BENCHMARK_API_KEY "
                 f"--timeout-seconds 1800{base_url_arg} "
                 f"--trajectory {shlex.quote(trajectory_path.as_posix())} "
                 f"--result {shlex.quote(result_path.as_posix())}; "
@@ -120,7 +132,7 @@ bone --version
                 f"printf '%s\\n' \"$code\" > {shlex.quote((agent_dir / 'bone-exit-code.txt').as_posix())}; "
                 "exit 0"
             ),
-            env=env,
+            env={"BONE_HOME": "/tmp/bone-home"},
         )
 
     @override

@@ -10,7 +10,6 @@ publish = false
 bone-adapters = { path = "../bone-adapters" }
 bone-core = { path = "../bone-core" }
 fs2.workspace = true
-keyring.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 rustix.workspace = true
 serde.workspace = true
@@ -18,7 +17,9 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thread", "sync", "time"] }
+url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

@@ -1,4 +1,7 @@
-use std::process::Command;
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
 
 #[test]
 fn run_help_documents_the_machine_contract() {
@@ -9,7 +12,51 @@ fn run_help_documents_the_machine_contract() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("--trajectory PATH"));
+    assert!(stdout.contains("--trust-project-config"));
+    assert!(!stdout.contains("--api-key-env"));
     assert!(stdout.contains("Exit codes: 0 completed"));
+}
+
+#[test]
+fn credentials_command_provisions_through_stdin() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bone"))
+        .args([
+            "credentials",
+            "set",
+            "--provider",
+            "openai-responses",
+            "--profile",
+            "headless-openai-responses",
+            "--base-url",
+            "https://example.test/v1/",
+        ])
+        .env("BONE_HOME", &home)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"stdin-only-secret\n")
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+
+    let credentials = home.join("credentials.toml");
+    let contents = std::fs::read_to_string(&credentials).unwrap();
+    assert!(contents.contains("headless-openai-responses"));
+    assert!(contents.contains("stdin-only-secret"));
+    assert!(contents.contains("endpoint_fingerprint"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(credentials).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
 
 #[test]
@@ -31,6 +78,7 @@ fn missing_model_is_a_structured_failure_without_credentials() {
         .arg(&result)
         .arg("--trajectory")
         .arg(&trajectory)
+        .env("BONE_HOME", temporary.path().join("home"))
         .output()
         .unwrap();
 
@@ -71,12 +119,10 @@ fn invalid_invocation_uses_the_usage_exit_code() {
 }
 
 #[test]
-fn explicit_model_uses_a_process_only_key_and_redacts_it_from_output() {
+fn explicit_model_uses_the_user_credential_file_contract() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace = temporary.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let secret = "headless-contract-secret";
-
     let output = Command::new(env!("CARGO_BIN_EXE_bone"))
         .arg("run")
         .arg("--workspace")
@@ -90,12 +136,10 @@ fn explicit_model_uses_a_process_only_key_and_redacts_it_from_output() {
             "offline-model",
             "--base-url",
             "https://127.0.0.1:1/v1",
-            "--api-key-env",
-            "BONE_HEADLESS_TEST_KEY",
             "--timeout-seconds",
             "10",
         ])
-        .env("BONE_HEADLESS_TEST_KEY", secret)
+        .env("BONE_HOME", temporary.path().join("home"))
         .output()
         .unwrap();
 
@@ -107,14 +151,71 @@ fn explicit_model_uses_a_process_only_key_and_redacts_it_from_output() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(!stdout.contains(secret));
-    assert!(!stderr.contains(secret));
     let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(result["status"], "failed");
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("$BONE_HOME/credentials.toml")
+    );
     assert_ne!(result["message"], "Configuration(NeedsModel)");
     assert_ne!(
         result["message"],
         "Configuration(Invalid(\"agent tool timeout must exceed the largest Bash timeout\"))"
+    );
+}
+
+#[test]
+fn project_config_requires_an_explicit_headless_trust_flag() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".bone")).unwrap();
+    std::fs::write(
+        workspace.join(".bone/config.toml"),
+        "schema_version = 1\n[overrides]\n",
+    )
+    .unwrap();
+    let data = temporary.path().join("data");
+    let home = temporary.path().join("home");
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_bone"))
+        .arg("run")
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--data-dir")
+        .arg(&data)
+        .args(["--prompt", "inspect", "--timeout-seconds", "1"])
+        .env("BONE_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(
+        String::from_utf8(rejected.stderr)
+            .unwrap()
+            .contains("--trust-project-config")
+    );
+
+    let trusted = Command::new(env!("CARGO_BIN_EXE_bone"))
+        .arg("run")
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--data-dir")
+        .arg(&data)
+        .args([
+            "--prompt",
+            "inspect",
+            "--timeout-seconds",
+            "1",
+            "--trust-project-config",
+        ])
+        .env("BONE_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(trusted.status.code(), Some(3));
+    assert!(
+        !String::from_utf8(trusted.stderr)
+            .unwrap()
+            .contains("not trusted")
     );
 }

@@ -790,7 +790,7 @@ fn clear_modified_enter_and_ctrl_d_preserve_the_exact_unsent_draft() {
         1
     );
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let app = bone_app::App::open(bone_app::AppOptions::new(&data))
+        let app = bone_app::App::open(bone_app::AppOptions::isolated(&data))
             .await
             .unwrap();
         let workspace = app.open_workspace(&workspace).await.unwrap();

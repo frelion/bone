@@ -37,6 +37,17 @@ fn tui_manifest_has_no_product_backend_dependencies_besides_bone_app() {
 }
 
 #[test]
+fn workspace_dependency_graph_has_no_system_keyring_or_dbus_stack() {
+    let lock = include_str!("../../../Cargo.lock");
+    for forbidden in ["keyring", "dbus-secret-service", "dbus", "libdbus-sys"] {
+        assert!(
+            !lock.contains(&format!("name = \"{forbidden}\"")),
+            "Cargo.lock must not contain the removed {forbidden} dependency"
+        );
+    }
+}
+
+#[test]
 fn terminal_state_changes_stay_inside_the_terminal_module() {
     const TERMINAL_COMMANDS: &[&str] = &[
         "EnterAlternateScreen",

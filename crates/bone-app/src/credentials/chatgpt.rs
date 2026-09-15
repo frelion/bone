@@ -5,18 +5,17 @@
 //! endpoint.
 
 use std::{
-    env,
-    ffi::OsString,
-    fs::{self, File, OpenOptions},
-    io::{ErrorKind, Write},
+    fs::{self, File},
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use bone_adapters::llm::service::chatgpt_subscription::ChatGptAuthCache;
 use fs2::FileExt;
-use tempfile::NamedTempFile;
 use thiserror::Error;
+
+use crate::safe_file::{self, SafeFileError};
 
 const SERVICE: &str = "chatgpt-subscription";
 
@@ -36,16 +35,6 @@ pub struct ChatGptCredentials {
 }
 
 impl ChatGptCredentials {
-    /// Resolves `$XDG_CONFIG_HOME/bone`, or `~/.config/bone`.
-    pub fn default_for_current_user() -> Result<Self, CredentialError> {
-        let base = xdg_or_home(
-            env::var_os("XDG_CONFIG_HOME"),
-            env::var_os("HOME").as_ref(),
-            ".config",
-        )?;
-        Self::at(base.join("bone"))
-    }
-
     /// Uses an explicit BONE config root; useful for embedding and tests.
     pub fn at(config_root: impl Into<PathBuf>) -> Result<Self, CredentialError> {
         let config_root = config_root.into();
@@ -99,7 +88,7 @@ impl ChatGptCredentials {
         let providers = self.config_root.join("providers");
         let directory = providers.join(SERVICE);
         for path in [&self.config_root, &providers, &directory] {
-            ensure_private_directory(path)?;
+            safe(safe_file::ensure_private_directory(path))?;
         }
         Ok(directory)
     }
@@ -108,7 +97,7 @@ impl ChatGptCredentials {
         let providers = self.config_root.join("providers");
         let directory = providers.join(SERVICE);
         for path in [&self.config_root, &providers, &directory] {
-            if !private_directory_exists(path)? {
+            if !safe(safe_file::private_directory_exists(path))? {
                 return Ok(None);
             }
         }
@@ -139,127 +128,11 @@ impl ChatGptAuthCache for ChatGptAuthLease {
     }
 }
 
-fn xdg_or_home(
-    xdg: Option<OsString>,
-    home: Option<&OsString>,
-    fallback: &str,
-) -> Result<PathBuf, CredentialError> {
-    if let Some(path) = xdg
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    {
-        return Ok(path);
-    }
-    home.filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .map(|home| home.join(fallback))
-        .ok_or(CredentialError::Unavailable)
-}
-
-fn ensure_private_directory(path: &Path) -> Result<(), CredentialError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => validate_private_directory(path),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            let parent = path.parent().ok_or(CredentialError::Unavailable)?;
-            fs::create_dir_all(parent).map_err(|_| CredentialError::Unavailable)?;
-            let mut builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-
-                builder.mode(0o700);
-            }
-            match builder.create(path) {
-                Ok(()) => set_private_permissions(path, 0o700)?,
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                Err(_) => return Err(CredentialError::Unavailable),
-            }
-            validate_private_directory(path)
-        }
-        Err(_) => Err(CredentialError::Unavailable),
-    }
-}
-
-fn private_directory_exists(path: &Path) -> Result<bool, CredentialError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => validate_private_directory(path).map(|()| true),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(CredentialError::Unavailable),
-    }
-}
-
-fn validate_private_directory(path: &Path) -> Result<(), CredentialError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| CredentialError::Unavailable)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(CredentialError::Unavailable);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(CredentialError::Unavailable);
-        }
-    }
-    Ok(())
-}
-
-fn set_private_permissions(path: &Path, mode: u32) -> Result<(), CredentialError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
-            .map_err(|_| CredentialError::Unavailable)?;
-    }
-    Ok(())
-}
-
 fn open_private_file(path: &Path, create_new: bool) -> Result<Option<File>, CredentialError> {
-    let parent = path.parent().ok_or(CredentialError::Unavailable)?;
-    validate_private_directory(parent)?;
-    if !create_new {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                return Err(CredentialError::Unavailable);
-            }
-            Ok(metadata) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-
-                    if metadata.permissions().mode() & 0o077 != 0 {
-                        return Err(CredentialError::Unavailable);
-                    }
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(CredentialError::Unavailable),
-        }
-    }
-
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create_new(create_new);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    }
-    match options.open(path) {
-        Ok(file) => {
-            if create_new {
-                set_private_permissions(path, 0o600)?;
-            }
-            Ok(Some(file))
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound && !create_new => Ok(None),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists && create_new => Ok(None),
-        Err(_) => Err(CredentialError::Unavailable),
+    if create_new {
+        safe(safe_file::create_private_file(path))
+    } else {
+        safe(safe_file::open_existing_private_file(path))
     }
 }
 
@@ -287,25 +160,13 @@ fn try_lock(file: File) -> Result<File, CredentialError> {
 }
 
 fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<bool, CredentialError> {
-    let parent = path.parent().ok_or(CredentialError::Unavailable)?;
-    validate_private_directory(parent)?;
-    let mut temporary = NamedTempFile::new_in(parent).map_err(|_| CredentialError::Unavailable)?;
-    set_private_permissions(temporary.path(), 0o600)?;
-    temporary
-        .write_all(bytes)
-        .and_then(|()| temporary.as_file().sync_all())
-        .map_err(|_| CredentialError::Unavailable)?;
-    match temporary.persist_noclobber(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(_) => Err(CredentialError::Unavailable),
-    }
+    safe(safe_file::atomic_write_new_private(path, bytes))
 }
 
 fn sync_directory(path: &Path) -> Result<(), CredentialError> {
-    #[cfg(unix)]
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| CredentialError::Unavailable)?;
-    Ok(())
+    safe(safe_file::sync_directory(path))
+}
+
+fn safe<T>(result: Result<T, SafeFileError>) -> Result<T, CredentialError> {
+    result.map_err(|_| CredentialError::Unavailable)
 }

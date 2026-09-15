@@ -102,6 +102,7 @@ impl DurablePort for SessionDurablePort {
 #[derive(Clone)]
 pub(crate) struct DataStore {
     store: BoneStore,
+    configs: crate::file_config::FileConfigs,
     #[cfg(test)]
     faults: Arc<TestFaults>,
 }
@@ -126,6 +127,12 @@ struct TestFaults {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct WorkspaceCatalog {
     items: Vec<WorkspaceInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ProjectConfigTrust {
+    root: PathBuf,
+    digest: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -698,10 +705,20 @@ impl DataStore {
             .map(|saved| saved.external_effect))
     }
 
+    #[cfg(test)]
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        let data_dir = data_dir.into();
+        Self::open_with_home(&data_dir, data_dir.join(".bone"))
+    }
+
+    pub fn open_with_home(
+        data_dir: impl Into<PathBuf>,
+        bone_home: impl Into<PathBuf>,
+    ) -> Result<Self, StoreError> {
         let roots = StoreRoots::new(data_dir.into())?;
         Ok(Self {
             store: BoneStore::open_at(roots)?,
+            configs: crate::file_config::FileConfigs::open(bone_home.into())?,
             #[cfg(test)]
             faults: Arc::new(TestFaults {
                 agent_record_saves_before_failure: AtomicUsize::new(NO_AGENT_RECORD_FAILURE),
@@ -1000,7 +1017,7 @@ impl DataStore {
             .canonicalize()
             .map_err(|error| StoreError::io("resolve workspace", root, error))?;
         let document = self.store.document::<WorkspaceCatalog>(catalog_key());
-        self.store.transaction(|transaction| {
+        let workspace = self.store.transaction(|transaction| {
             let snapshot = transaction.read(&document)?;
             let mut catalog = snapshot.value.unwrap_or_default();
             if let Some(workspace) = catalog.items.iter().find(|item| item.root == root) {
@@ -1013,7 +1030,11 @@ impl DataStore {
             catalog.items.push(workspace.clone());
             transaction.replace(&document, &catalog, snapshot.revision)?;
             Ok(workspace)
-        })
+        })?;
+        let trusted = self.project_trust_digest(&workspace)?;
+        self.configs
+            .load_workspace(&workspace, trusted.as_deref())?;
+        Ok(workspace)
     }
 
     pub fn workspace_by_id(&self, id: WorkspaceId) -> Result<Option<WorkspaceInfo>, StoreError> {
@@ -3146,12 +3167,7 @@ impl DataStore {
     }
 
     pub fn global_settings(&self) -> Result<RuntimeSettings, StoreError> {
-        Ok(self
-            .store
-            .document::<RuntimeSettings>(global_config_key())
-            .read()?
-            .value
-            .unwrap_or_default())
+        Ok(self.configs.user_settings())
     }
 
     pub fn config(&self, scope: ConfigScope) -> Result<RuntimeOverrides, StoreError> {
@@ -3165,9 +3181,13 @@ impl DataStore {
                     tools: Some(global.tools),
                 })
             }
-            _ => Ok(self
+            ConfigScope::Workspace(id) => {
+                self.ensure_workspace_config_loaded(id)?;
+                Ok(self.configs.overrides(id))
+            }
+            ConfigScope::Session(session) => Ok(self
                 .store
-                .document::<RuntimeOverrides>(config_key(scope))
+                .document::<RuntimeOverrides>(session_config_key(session))
                 .read()?
                 .value
                 .unwrap_or_default()),
@@ -3180,33 +3200,37 @@ impl DataStore {
         change: ConfigChange,
     ) -> Result<RuntimeOverrides, StoreError> {
         match scope {
-            ConfigScope::User => {
-                let document = self.store.document::<RuntimeSettings>(global_config_key());
-                let next = self.store.transaction(|transaction| {
+            ConfigScope::User => self.configs.update(scope, change),
+            ConfigScope::Workspace(workspace) => {
+                self.ensure_workspace_config_loaded(workspace)?;
+                let update = self.configs.update_workspace(workspace, change)?;
+                let info = self
+                    .workspace_by_id(workspace)?
+                    .ok_or(StoreError::Corrupt {
+                        message: "workspace does not exist",
+                    })?;
+                let trust = ProjectConfigTrust {
+                    root: info.root,
+                    digest: update.digest.clone(),
+                };
+                let document = self
+                    .store
+                    .document::<ProjectConfigTrust>(project_trust_key(workspace));
+                self.store.transaction(|transaction| {
                     let snapshot = transaction.read(&document)?;
-                    let mut settings = snapshot.value.unwrap_or_default();
-                    match change {
-                        ConfigChange::Model(value) => {
-                            settings.worker = value.clone();
-                            settings.coordinator = value;
-                        }
-                        ConfigChange::Worker(value) => settings.worker = value,
-                        ConfigChange::Coordinator(value) => settings.coordinator = value,
-                        ConfigChange::Limits(value) => settings.limits = value.unwrap_or_default(),
-                        ConfigChange::Tools(value) => settings.tools = value.unwrap_or_default(),
-                    }
-                    transaction.replace(&document, &settings, snapshot.revision)?;
-                    Ok(settings)
+                    transaction.replace(&document, &trust, snapshot.revision)
                 })?;
-                Ok(RuntimeOverrides {
-                    worker: next.worker,
-                    coordinator: next.coordinator,
-                    limits: Some(next.limits),
-                    tools: Some(next.tools),
-                })
+                if !self.configs.mark_trusted(workspace, &update.digest) {
+                    return Err(StoreError::ConfigConflict {
+                        path: self.project_config_status(workspace)?.path,
+                    });
+                }
+                Ok(update.values)
             }
-            _ => {
-                let document = self.store.document::<RuntimeOverrides>(config_key(scope));
+            ConfigScope::Session(session) => {
+                let document = self
+                    .store
+                    .document::<RuntimeOverrides>(session_config_key(session));
                 let values = self.store.transaction(|transaction| {
                     let snapshot = transaction.read(&document)?;
                     let mut values = snapshot.value.unwrap_or_default();
@@ -3229,26 +3253,134 @@ impl DataStore {
     }
 
     pub fn profiles(&self) -> Result<Vec<Profile>, StoreError> {
-        Ok(self
-            .store
-            .document::<Vec<Profile>>(profiles_key())
-            .read()?
-            .value
-            .unwrap_or_else(|| vec![Profile::chatgpt()]))
+        Ok(self.configs.profiles())
     }
 
     pub fn save_profile(&self, profile: Profile) -> Result<(), StoreError> {
-        let document = self.store.document::<Vec<Profile>>(profiles_key());
+        self.configs.save_profile(profile)
+    }
+
+    pub fn project_config_status(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<crate::ProjectConfigStatus, StoreError> {
+        self.ensure_workspace_config_loaded(workspace)?;
+        self.configs
+            .project_status(workspace)
+            .ok_or(StoreError::Corrupt {
+                message: "workspace configuration was not loaded",
+            })
+    }
+
+    pub fn reload_user_config(&self) -> Result<(), StoreError> {
+        self.configs.reload_user()
+    }
+
+    pub fn reload_workspace_config(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<crate::ProjectConfigStatus, StoreError> {
+        let info = self
+            .workspace_by_id(workspace)?
+            .ok_or(StoreError::Corrupt {
+                message: "workspace does not exist",
+            })?;
+        let trusted = self.project_trust_digest(&info)?;
+        self.configs.load_workspace(&info, trusted.as_deref())
+    }
+
+    pub fn reload_config(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<crate::ProjectConfigStatus, StoreError> {
+        let info = self
+            .workspace_by_id(workspace)?
+            .ok_or(StoreError::Corrupt {
+                message: "workspace does not exist",
+            })?;
+        let trusted = self.project_trust_digest(&info)?;
+        self.configs.reload_all(&info, trusted.as_deref())
+    }
+
+    pub fn trust_project_config(&self, workspace: WorkspaceId) -> Result<(), StoreError> {
+        let status = self.project_config_status(workspace)?;
+        let digest = self
+            .configs
+            .project_digest(workspace)
+            .ok_or(StoreError::Corrupt {
+                message: "project has no configuration file",
+            })?;
+        let _lock = self.configs.lock_project(workspace)?;
+        if !self
+            .configs
+            .verify_project_digest_locked(workspace, &digest)?
+        {
+            return Err(StoreError::ConfigConflict { path: status.path });
+        }
+        let info = self
+            .workspace_by_id(workspace)?
+            .ok_or(StoreError::Corrupt {
+                message: "workspace does not exist",
+            })?;
+        let trust = ProjectConfigTrust {
+            root: info.root,
+            digest: digest.clone(),
+        };
+        let document = self
+            .store
+            .document::<ProjectConfigTrust>(project_trust_key(workspace));
         self.store.transaction(|transaction| {
             let snapshot = transaction.read(&document)?;
-            let mut profiles = snapshot.value.unwrap_or_else(|| vec![Profile::chatgpt()]);
-            match profiles.iter_mut().find(|item| item.id == profile.id) {
-                Some(current) => *current = profile,
-                None => profiles.push(profile),
+            transaction.replace(&document, &trust, snapshot.revision)
+        })?;
+        if !self.configs.mark_trusted(workspace, &digest) {
+            return Err(StoreError::ConfigConflict { path: status.path });
+        }
+        Ok(())
+    }
+
+    pub fn revoke_project_config_trust(&self, workspace: WorkspaceId) -> Result<(), StoreError> {
+        let document = self
+            .store
+            .document::<ProjectConfigTrust>(project_trust_key(workspace));
+        self.store.transaction(|transaction| {
+            let snapshot = transaction.read(&document)?;
+            if snapshot.value.is_some() {
+                transaction.delete(&document, snapshot.revision)?;
             }
-            transaction.replace(&document, &profiles, snapshot.revision)?;
             Ok(())
-        })
+        })?;
+        self.configs.mark_untrusted(workspace);
+        Ok(())
+    }
+
+    fn project_trust_digest(
+        &self,
+        workspace: &WorkspaceInfo,
+    ) -> Result<Option<String>, StoreError> {
+        self.store
+            .document::<ProjectConfigTrust>(project_trust_key(workspace.id))
+            .read()
+            .map(|snapshot| {
+                snapshot
+                    .value
+                    .filter(|trust| trust.root == workspace.root)
+                    .map(|trust| trust.digest)
+            })
+    }
+
+    fn ensure_workspace_config_loaded(&self, workspace: WorkspaceId) -> Result<(), StoreError> {
+        if self.configs.project_status(workspace).is_some() {
+            return Ok(());
+        }
+        let info = self
+            .workspace_by_id(workspace)?
+            .ok_or(StoreError::Corrupt {
+                message: "workspace does not exist",
+            })?;
+        let trusted = self.project_trust_digest(&info)?;
+        self.configs.load_workspace(&info, trusted.as_deref())?;
+        Ok(())
     }
 
     fn update_session_with_event(
@@ -3769,21 +3901,12 @@ fn journal_key(session: SessionId) -> JournalKey {
     JournalKey::new(format!("app/session/{session}"))
 }
 
-fn global_config_key() -> DocumentKey {
-    DocumentKey::new(NAMESPACE, "config/user")
+fn session_config_key(session: SessionId) -> DocumentKey {
+    DocumentKey::new(NAMESPACE, format!("config/session/{session}"))
 }
 
-fn config_key(scope: ConfigScope) -> DocumentKey {
-    let key = match scope {
-        ConfigScope::User => "config/user".to_owned(),
-        ConfigScope::Workspace(id) => format!("config/workspace/{id}"),
-        ConfigScope::Session(id) => format!("config/session/{id}"),
-    };
-    DocumentKey::new(NAMESPACE, key)
-}
-
-fn profiles_key() -> DocumentKey {
-    DocumentKey::new(NAMESPACE, "profiles")
+fn project_trust_key(workspace: WorkspaceId) -> DocumentKey {
+    DocumentKey::new(NAMESPACE, format!("config/trust/{workspace}"))
 }
 
 fn write_prefix(workspace: WorkspaceId) -> String {
@@ -4658,5 +4781,124 @@ mod tests {
                 .value
                 .is_some()
         );
+    }
+
+    #[test]
+    fn project_config_trust_survives_reopen_and_is_invalidated_by_new_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        let project_dir = root.join(".bone");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let config_path = project_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "schema_version = 1\n[overrides.worker]\nprofile = \"chatgpt\"\nmodel = \"gpt-5.6-terra\"\n",
+        )
+        .unwrap();
+        let data = temporary.path().join("data");
+
+        let store = DataStore::open(&data).unwrap();
+        let workspace = store.workspace(&root).unwrap();
+        assert!(!store.project_config_status(workspace.id).unwrap().trusted);
+        assert!(
+            store
+                .config(ConfigScope::Workspace(workspace.id))
+                .unwrap()
+                .worker
+                .is_none()
+        );
+        store.trust_project_config(workspace.id).unwrap();
+        drop(store);
+
+        let reopened = DataStore::open(&data).unwrap();
+        let same_workspace = reopened.workspace(&root).unwrap();
+        assert_eq!(same_workspace.id, workspace.id);
+        assert!(
+            reopened
+                .project_config_status(workspace.id)
+                .unwrap()
+                .trusted
+        );
+        assert_eq!(
+            reopened
+                .config(ConfigScope::Workspace(workspace.id))
+                .unwrap()
+                .worker
+                .unwrap()
+                .model,
+            "gpt-5.6-terra"
+        );
+
+        std::fs::write(&config_path, "schema_version = 1\n[overrides]\n").unwrap();
+        let status = reopened.reload_workspace_config(workspace.id).unwrap();
+        assert!(!status.trusted);
+        assert!(
+            reopened
+                .config(ConfigScope::Workspace(workspace.id))
+                .unwrap()
+                .worker
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_sqlite_user_workspace_and_profile_documents_are_ignored() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let store = DataStore::open(temporary.path().join("data")).unwrap();
+        let workspace = store.workspace(&root).unwrap();
+        let selection = ModelSelection::new(ProfileId::chatgpt(), "legacy-model").unwrap();
+        let settings = RuntimeSettings {
+            worker: Some(selection.clone()),
+            ..RuntimeSettings::default()
+        };
+        let overrides = RuntimeOverrides {
+            worker: Some(selection),
+            ..RuntimeOverrides::default()
+        };
+        let old_user = store
+            .store
+            .document::<RuntimeSettings>(DocumentKey::new(NAMESPACE, "config/user"));
+        let old_workspace = store.store.document::<RuntimeOverrides>(DocumentKey::new(
+            NAMESPACE,
+            format!("config/workspace/{}", workspace.id),
+        ));
+        let old_profiles = store
+            .store
+            .document::<Vec<Profile>>(DocumentKey::new(NAMESPACE, "profiles"));
+        store
+            .store
+            .transaction(|transaction| {
+                let user = transaction.read(&old_user)?;
+                let project = transaction.read(&old_workspace)?;
+                let profiles = transaction.read(&old_profiles)?;
+                transaction.replace(&old_user, &settings, user.revision)?;
+                transaction.replace(&old_workspace, &overrides, project.revision)?;
+                transaction.replace(
+                    &old_profiles,
+                    &vec![
+                        Profile::new(
+                            ProfileId::new("legacy").unwrap(),
+                            "Legacy",
+                            bone_adapters::llm::EndpointConfig::OpenAiResponses { base_url: None },
+                        )
+                        .unwrap(),
+                    ],
+                    profiles.revision,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(store.config(ConfigScope::User).unwrap().worker.is_none());
+        assert!(
+            store
+                .config(ConfigScope::Workspace(workspace.id))
+                .unwrap()
+                .worker
+                .is_none()
+        );
+        assert_eq!(store.profiles().unwrap(), vec![Profile::chatgpt()]);
     }
 }

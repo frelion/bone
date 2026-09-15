@@ -1,6 +1,6 @@
 //! Concrete composition of saved profiles, private credentials, and models.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use bone_adapters::{
     ConfiguredModel, ModelAdapter,
@@ -27,9 +27,9 @@ use crate::{
 /// endpoint, including Rig's refresh lock and the credential-cache lease.
 #[derive(Clone, Default)]
 pub(crate) struct ProviderConnector {
+    bone_home: PathBuf,
     chatgpt: Arc<Mutex<ChatGptState>>,
     chatgpt_operation: Arc<RwLock<()>>,
-    volatile_api_keys: Arc<RwLock<HashMap<ProfileId, VolatileApiKey>>>,
     #[cfg(test)]
     test_endpoints: HashMap<ProfileId, Endpoint>,
 }
@@ -45,15 +45,10 @@ struct ChatGptConnection {
     endpoint: Endpoint,
 }
 
-struct VolatileApiKey {
-    profile: Profile,
-    key: Arc<ApiKey>,
-}
-
 impl ChatGptState {
     fn credentials(&mut self) -> Result<ChatGptCredentials, CredentialError> {
         if self.credentials.is_none() {
-            self.credentials = Some(ChatGptCredentials::default_for_current_user()?);
+            return Err(CredentialError::Unavailable);
         }
         Ok(self
             .credentials
@@ -76,8 +71,16 @@ impl ChatGptState {
 }
 
 impl ProviderConnector {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(bone_home: PathBuf) -> Self {
+        Self {
+            bone_home: bone_home.clone(),
+            chatgpt: Arc::new(Mutex::new(ChatGptState {
+                credentials: ChatGptCredentials::at(bone_home).ok(),
+                connection: None,
+                closed: false,
+            })),
+            ..Self::default()
+        }
     }
 
     #[cfg(test)]
@@ -243,10 +246,10 @@ impl ProviderConnector {
             })
             .await;
         }
-        self.volatile_api_keys.write().await.remove(&profile.id);
         let profile = profile.clone();
+        let bone_home = self.bone_home.clone();
         credential_task(profile.id.clone(), move || {
-            ApiKeyCredentials::for_profile(&profile)
+            ApiKeyCredentials::for_profile(&bone_home, &profile)
                 .and_then(|credentials| credentials.clear())
                 .map_err(|error| api_key_error(profile.id, error))
         })
@@ -278,35 +281,13 @@ impl ProviderConnector {
             return Err(ProviderConnectError::InvalidProfile(profile.id.clone()));
         }
         let profile = profile.clone();
+        let bone_home = self.bone_home.clone();
         credential_task(profile.id.clone(), move || {
-            ApiKeyCredentials::for_profile(&profile)
+            ApiKeyCredentials::for_profile(&bone_home, &profile)
                 .and_then(|credentials| credentials.save(&key))
                 .map_err(|error| api_key_error(profile.id, error))
         })
         .await
-    }
-
-    /// Keep an API key only for the lifetime of this App process.
-    ///
-    /// Headless clients use this path in containers that intentionally lack a
-    /// desktop credential service. The key is never persisted or serialized.
-    pub(crate) async fn set_volatile_api_key(
-        &self,
-        profile: &Profile,
-        key: ApiKey,
-    ) -> Result<(), ProviderConnectError> {
-        validate_profile(profile)?;
-        if matches!(profile.endpoint, EndpointConfig::ChatGptSubscription) {
-            return Err(ProviderConnectError::InvalidProfile(profile.id.clone()));
-        }
-        self.volatile_api_keys.write().await.insert(
-            profile.id.clone(),
-            VolatileApiKey {
-                profile: profile.clone(),
-                key: Arc::new(key),
-            },
-        );
-        Ok(())
     }
 
     async fn connect_chatgpt(&self) -> Result<Arc<ChatGptConnection>, ProviderConnectError> {
@@ -352,26 +333,15 @@ impl ProviderConnector {
                         .endpoint
                         .clone()
                 } else {
-                    let volatile = self
-                        .volatile_api_keys
-                        .read()
-                        .await
-                        .get(&profile.id)
-                        .filter(|saved| saved.profile == *profile)
-                        .map(|saved| Arc::clone(&saved.key));
-                    match volatile {
-                        Some(key) => api_endpoint(profile, key.as_ref())?,
-                        None => {
-                            let owned_profile = profile.clone();
-                            let key = credential_task(profile.id.clone(), move || {
-                                ApiKeyCredentials::for_profile(&owned_profile)
-                                    .and_then(|credentials| credentials.read())
-                                    .map_err(|error| api_key_error(owned_profile.id, error))
-                            })
-                            .await?;
-                            api_endpoint(profile, &key)?
-                        }
-                    }
+                    let owned_profile = profile.clone();
+                    let bone_home = self.bone_home.clone();
+                    let key = credential_task(profile.id.clone(), move || {
+                        ApiKeyCredentials::for_profile(&bone_home, &owned_profile)
+                            .and_then(|credentials| credentials.read())
+                            .map_err(|error| api_key_error(owned_profile.id, error))
+                    })
+                    .await?;
+                    api_endpoint(profile, &key)?
                 };
                 endpoints.insert(profile.id.clone(), endpoint.clone());
                 endpoint
@@ -483,7 +453,7 @@ async fn credential_task<T: Send + 'static>(
 ) -> Result<T, ProviderConnectError> {
     tokio::task::spawn_blocking(operation)
         .await
-        .map_err(|_| ProviderConnectError::CredentialUnavailable(profile))?
+        .map_err(|_| credential_problem(profile, crate::CredentialProblemKind::Unavailable))?
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -498,8 +468,8 @@ pub(crate) enum ProviderConnectError {
     InvalidModelOptions(ProfileId),
     #[error("profile `{0}` requires sign-in or an API key")]
     LoginRequired(ProfileId),
-    #[error("credential storage is unavailable for profile `{0}`")]
-    CredentialUnavailable(ProfileId),
+    #[error("{0}")]
+    Credential(crate::CredentialProblem),
     #[error("authorization failed for profile `{0}`")]
     AuthorizationFailed(ProfileId),
     #[error("profile `{0}` is in use")]
@@ -508,19 +478,32 @@ pub(crate) enum ProviderConnectError {
 
 fn api_key_error(profile: ProfileId, error: ApiKeyCredentialError) -> ProviderConnectError {
     match error {
-        ApiKeyCredentialError::MissingApiKey => ProviderConnectError::LoginRequired(profile),
+        ApiKeyCredentialError::MissingApiKey => {
+            credential_problem(profile, crate::CredentialProblemKind::Missing)
+        }
+        ApiKeyCredentialError::EndpointMismatch => {
+            credential_problem(profile, crate::CredentialProblemKind::EndpointMismatch)
+        }
         ApiKeyCredentialError::InvalidApiKey | ApiKeyCredentialError::Unavailable => {
-            ProviderConnectError::CredentialUnavailable(profile)
+            credential_problem(profile, crate::CredentialProblemKind::Unavailable)
         }
     }
+}
+
+fn credential_problem(
+    profile: ProfileId,
+    kind: crate::CredentialProblemKind,
+) -> ProviderConnectError {
+    ProviderConnectError::Credential(crate::CredentialProblem { profile, kind })
 }
 
 fn chatgpt_error(error: CredentialError) -> ProviderConnectError {
     match error {
         CredentialError::Busy => ProviderConnectError::Busy(ProfileId::chatgpt()),
-        CredentialError::Unavailable => {
-            ProviderConnectError::CredentialUnavailable(ProfileId::chatgpt())
-        }
+        CredentialError::Unavailable => credential_problem(
+            ProfileId::chatgpt(),
+            crate::CredentialProblemKind::Unavailable,
+        ),
     }
 }
 

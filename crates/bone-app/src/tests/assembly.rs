@@ -74,7 +74,7 @@ async fn provider_assembly_completes_an_input_and_preserves_history_after_reopen
         })
         .collect();
     let providers = ProviderConnector::with_endpoints(endpoints);
-    let app = App::with_provider_connector(AppOptions::new(&data), providers.clone())
+    let app = App::with_provider_connector(AppOptions::isolated(&data), providers.clone())
         .await
         .unwrap();
     for profile in &profiles {
@@ -173,7 +173,7 @@ async fn provider_assembly_completes_an_input_and_preserves_history_after_reopen
     drop(session);
     drop(app);
 
-    let reopened = App::with_provider_connector(AppOptions::new(&data), providers)
+    let reopened = App::with_provider_connector(AppOptions::isolated(&data), providers)
         .await
         .unwrap();
     let session = reopened.session(session_id).await.unwrap();
