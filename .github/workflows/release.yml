@@ -121,7 +121,7 @@ jobs:
           docker run --rm \
             --volume "$PWD/dist:/dist:ro" \
             alpine:3.22 \
-            sh -c 'mkdir -p /tmp/workspace; /dist/${{ matrix.asset }} run --workspace /tmp/workspace --data-dir /tmp/data --prompt smoke --timeout-seconds 1 >/tmp/result.json; test "$?" -eq 3; grep -q '"status": "failed"' /tmp/result.json'
+            sh -c 'apk add --no-cache git >/dev/null; mkdir -p /tmp/workspace; BONE_HOME=/tmp/bone-home /dist/${{ matrix.asset }} run --workspace /tmp/workspace --data-dir /tmp/data --prompt smoke --timeout-seconds 1 >/tmp/result.json; test "$?" -eq 3; grep -q failed /tmp/result.json'
 
       - name: Upload binary
         uses: actions/upload-artifact@v7.0.1
