@@ -18,7 +18,7 @@ fn local_control_revokes_session_compaction_without_stranding_other_waiters() {
                     let effects = work(
                         &mut kernel,
                         call,
-                        WorkStep::Delegate(vec![assignment("child", &[])]),
+                        WorkStep::delegate(vec![assignment("child", &[])]),
                     );
                     let (call, child) = work_calls(&effects)
                         .into_iter()
@@ -236,7 +236,7 @@ fn routing_handoff_read_permission_does_not_expose_child_records() {
     let effects = work(
         &mut kernel,
         call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     );
     let child = work_calls(&effects)
         .into_iter()

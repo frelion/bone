@@ -55,7 +55,7 @@ DurableCommit 原子提交新增 Record 与结构化 DurableSnapshot，使用 co
 
 Runtime 在提交成功后才发布对应状态与依赖 effect。恢复传入 DurableRestore：revision、快照和原始记录；快照不重复包含所有正文。Kernel 恢复结构化状态并隔离旧调用，未完成执行按明确中断规则处理，Unknown 外部写不盲目重放。
 
-App 实现 SQLite DurablePort 并投影产品历史；Core 是新执行状态的权威。恢复统一使用 Core 快照与记录；旧格式不迁移，缺失必需字段直接报错。Workspace 写互斥和外部核查仍属于宿主。
+App 实现 SQLite DurablePort 并投影产品历史；Core 是新执行状态的权威。恢复统一使用 Core 快照与记录；Core snapshot v1/v2 → v3 补上旧 Job 不存在的纠错/委派字段，并转换旧 pending Delegate。当前版本缺失必需字段仍直接报错。更早的历史格式不迁移。Workspace 写互斥和外部核查仍属于宿主。
 
 ## 已完成与后续候选
 
@@ -64,6 +64,8 @@ App 实现 SQLite DurablePort 并投影产品历史；Core 是新执行状态的
 已完成 B：Core commit/restore、App SQLite 接入、提交前门禁、快照与正文分离、恢复中断语义。
 
 已完成 C：Core 公共 Session 投影、独立 Session checkpoint、组合预算、共享 compact 协议、按需分页和压缩。
+
+2026-09-15 已完成 D：Worker 提案校验拒绝返回同一 Job，连续 3 次或累计 8 次拒绝才耗尽纠错预算；拒绝不提交提案内容、不确认输入已审阅。委派与等待原子提交，整组普通成功合并唤醒；叶子不能继续委派，子树预算受所有祖先约束且不因完成返还。外部写与恢复策略不变。详见 [Job 控制协议重构](job-control-protocol.md)。
 
 后续候选：负责人原子转交、有界输入批次、更细 provider token 容量接口、按任务选择 Worker 模型、后台预压缩、原文惰性加载和 retention。只有实际需求与评测证明必要再增加。
 

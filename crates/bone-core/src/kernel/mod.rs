@@ -6,13 +6,13 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AdmissionError, AgentLimits, AgentLimitsError, AgentView, Assignment, Await, Call, CallError,
-    CallId, CallKind, CallProgress, CallStatus, CallView, Completion, ControlOutcome, DeliveryKind,
-    DeliveryTarget, Effect, Event, ExternalEffect, Input, InputId, InputOutcome, InputReceipt,
-    InputStatus, InputView, InquiryResponse, InquiryResult, JobId, JobOutcome, JobSpec, JobStatus,
-    JobView, KernelDecision, MonoTime, Origin, OutcomeKind, OwnedAction, Owner, ReadQuery, Record,
-    RecordBody, RecordRange, ReportDraft, Seq, ToolEffect, ToolOutcome, ToolSpec, WorkProposal,
-    WorkStep,
+    AdmissionError, AfterDelegation, AgentLimits, AgentLimitsError, AgentView, Assignment, Await,
+    Call, CallError, CallId, CallKind, CallProgress, CallStatus, CallView, Completion,
+    ControlOutcome, DelegationLimits, DeliveryKind, DeliveryTarget, Effect, Event, ExternalEffect,
+    Input, InputId, InputOutcome, InputReceipt, InputStatus, InputView, InquiryResponse,
+    InquiryResult, JobId, JobOutcome, JobSpec, JobStatus, JobView, KernelDecision, MonoTime,
+    Origin, OutcomeKind, OwnedAction, Owner, ReadQuery, Record, RecordBody, RecordRange,
+    ReportDraft, Seq, ToolEffect, ToolOutcome, ToolSpec, WorkProposal, WorkRejections, WorkStep,
     context::{self, PreparedWork},
     job::{Job, JobContext, JobState, PendingStep, WaitState},
 };

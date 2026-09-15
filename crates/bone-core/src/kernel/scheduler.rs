@@ -354,6 +354,40 @@ impl Kernel {
         {
             return false;
         }
+        if let JobState::Waiting(WaitState::Jobs(jobs)) = &job.state
+            && !self.job_group_ready(jobs)
+        {
+            // Keep partial success unread for eventual review, but do not call
+            // the model merely to acknowledge it. Other required facts interrupt.
+            return job.context.records.iter().any(|seq| {
+                if *seq <= job.context.read_through {
+                    return false;
+                }
+                match self.records.get(seq).map(|record| &record.body) {
+                    Some(RecordBody::Delivery {
+                        source,
+                        kind: DeliveryKind::ChildCreated,
+                        ..
+                    }) => !matches!(self.records.get(source).map(|record| &record.body),
+                            Some(RecordBody::JobCreated { job, .. }) if jobs.contains(job)),
+                    Some(RecordBody::Delivery {
+                        source,
+                        kind: DeliveryKind::Outcome,
+                        ..
+                    }) => !matches!(self.records.get(source).map(|record| &record.body),
+                            Some(RecordBody::Outcome { job, outcome })
+                            if jobs.contains(job) && outcome.kind == OutcomeKind::Completed),
+                    Some(
+                        RecordBody::Delivery { .. }
+                        | RecordBody::ReadResult { .. }
+                        | RecordBody::ToolFinished { .. }
+                        | RecordBody::ImportedMemory { .. }
+                        | RecordBody::WorkRejected { .. },
+                    ) => true,
+                    _ => false,
+                }
+            });
+        }
         matches!(job.state, JobState::Ready) || self.has_unread_required(id)
     }
 
@@ -387,6 +421,7 @@ impl Kernel {
                     matches!(
                         record.body,
                         RecordBody::Delivery { .. }
+                            | RecordBody::WorkRejected { .. }
                             | RecordBody::ReadResult { .. }
                             | RecordBody::ToolFinished { .. }
                             | RecordBody::ImportedMemory { .. }

@@ -1940,6 +1940,11 @@ fn wait_reason(runtime: RuntimeId, wait: &WaitView) -> WaitReason {
             id: call.0,
         }),
         WaitView::Until(_) => WaitReason::Timer,
+        WaitView::Jobs(jobs) => WaitReason::Jobs(
+            jobs.iter()
+                .map(|job| JobRef { runtime, id: job.0 })
+                .collect(),
+        ),
         WaitView::User { .. } => WaitReason::User,
         WaitView::Job { job, .. } => WaitReason::Job(JobRef { runtime, id: job.0 }),
         WaitView::Result { job, .. } => WaitReason::Result(JobRef { runtime, id: job.0 }),

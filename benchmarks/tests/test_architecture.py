@@ -1,15 +1,48 @@
 import json
 import subprocess
+import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from benchmarks.architecture import FIXTURES, analyze, make_case
-from benchmarks.behavior import one_trial
+from benchmarks.behavior import CORE_RECORD_EXPORT, one_trial
 
 
 class ArchitectureTests(unittest.TestCase):
+    def test_core_diagnostics_only_export_records_from_app_namespace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            records = [{"body": {"WorkRejected": {"message": "invalid reference"}}}]
+            state = json.dumps({"records": records, "snapshot": "not exported"})
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE documents(namespace TEXT,key TEXT,payload_json TEXT)")
+                db.executemany("INSERT INTO documents VALUES(?,?,?)", [
+                    ("app", "core/test", json.dumps({"chunks": 2})),
+                    ("app", "core-chunks/test/0", json.dumps(state[:20])),
+                    ("app", "core-chunks/test/1", json.dumps(state[20:])),
+                    ("profile", "core/secret", '"do not export"'),
+                ])
+            before = path.read_bytes()
+            output = subprocess.run([sys.executable, "-c", CORE_RECORD_EXPORT, str(path)], capture_output=True, text=True, check=True)
+            self.assertEqual(json.loads(output.stdout), [{"core": "core/test", "records": records}])
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_kernel_contract_bounds_are_opt_in_and_do_not_change_fixture_or_prompt(self):
+        for workload, mode, limits in [
+            ("single", "single", (0, 1)),
+            ("independent", "delegated", (2, 2)),
+            ("dependent", "delegated", (2, 2)),
+            ("independent", "auto", (None, None)),
+        ]:
+            original = make_case(workload, mode)
+            bounded = make_case(workload, mode, enforce_job_contract=True)
+            self.assertEqual((original.job_budget, original.job_depth), (None, None))
+            self.assertEqual((bounded.job_budget, bounded.job_depth), limits)
+            self.assertEqual((original.prompt, original.setup, original.verifier), (bounded.prompt, bounded.setup, bounded.verifier))
+
     def test_result_survives_interrupted_container_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             trial = Path(directory) / "trial"
@@ -24,6 +57,44 @@ class ArchitectureTests(unittest.TestCase):
             with patch("benchmarks.behavior.run", side_effect=fake_run), patch("benchmarks.behavior.auth_root", return_value=Path(directory)):
                 with self.assertRaises(KeyboardInterrupt):
                     one_trial(Path(directory) / "bone", "test", make_case("single", "single"), trial)
+            self.assertTrue(json.loads((trial / "trial-result.json").read_text())["passed"])
+
+    def test_zero_job_budget_is_forwarded_to_headless_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trial = Path(directory) / "trial"
+            calls = []
+
+            def fake_run(command, **kwargs):
+                calls.append(command)
+                if "--provider" in command:
+                    (trial / "bone-result.json").write_text(json.dumps({"status": "completed", "exit_code": 0}))
+                return subprocess.CompletedProcess(command, 0, stdout="")
+
+            with patch("benchmarks.behavior.run", side_effect=fake_run), patch("benchmarks.behavior.auth_root", return_value=Path(directory)):
+                result = one_trial(Path(directory) / "bone", "test", make_case("single", "single", enforce_job_contract=True), trial)
+            command = next(command for command in calls if "--provider" in command)
+            self.assertEqual(command[command.index("--job-budget") + 1], "0")
+            self.assertEqual(command[command.index("--job-depth") + 1], "1")
+            self.assertTrue(result["passed"])
+
+    def test_diagnostic_failure_does_not_mask_result_or_skip_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trial = Path(directory) / "trial"
+            calls = []
+
+            def fake_run(command, **kwargs):
+                calls.append(command)
+                if "--provider" in command:
+                    (trial / "bone-result.json").write_text(json.dumps({"status": "completed", "exit_code": 0}))
+                if CORE_RECORD_EXPORT in command:
+                    raise OSError("diagnostic unavailable")
+                return subprocess.CompletedProcess(command, 0, stdout="")
+
+            with patch("benchmarks.behavior.run", side_effect=fake_run), patch("benchmarks.behavior.auth_root", return_value=Path(directory)):
+                result = one_trial(Path(directory) / "bone", "test", make_case("single", "single"), trial)
+            self.assertTrue(result["passed"])
+            self.assertEqual((trial / "core-records-error.log").read_text(), "diagnostic unavailable")
+            self.assertEqual(calls[-1][:2], ["podman", "rm"])
             self.assertTrue(json.loads((trial / "trial-result.json").read_text())["passed"])
 
     def test_verifiers_reject_stubs_and_accept_correct_implementations(self):

@@ -11,16 +11,15 @@ impl Kernel {
         effects: &mut Vec<Effect>,
     ) {
         if let Err(message) = self.validate_proposal(job, call_entry, &proposal) {
-            self.record(
-                Origin::Call(call),
-                RecordBody::Audit {
-                    message: message.clone(),
-                },
-                effects,
-            );
-            self.finish_job(job, OutcomeKind::Failed, Completion::new(message), effects);
+            self.reject_work(job, call, message, effects);
             return;
         }
+
+        self.jobs
+            .get_mut(&job)
+            .expect("job exists")
+            .work_rejections
+            .consecutive = 0;
 
         let (seen_through, _) = call_entry.work_context();
         for input in self.inputs.values_mut() {
@@ -75,6 +74,43 @@ impl Kernel {
             },
             effects,
         );
+    }
+
+    /// Validation refusals are feedback, not proof that the requested work failed.
+    /// Do not acknowledge input review or store any part of the rejected proposal.
+    fn reject_work(
+        &mut self,
+        job: JobId,
+        call: CallId,
+        message: String,
+        effects: &mut Vec<Effect>,
+    ) {
+        let entry = self.jobs.get_mut(&job).expect("job exists");
+        entry.work_rejections.consecutive = entry.work_rejections.consecutive.saturating_add(1);
+        entry.work_rejections.total = entry.work_rejections.total.saturating_add(1);
+        let budget = entry.work_rejections.clone();
+        let exhausted = budget.exhausted();
+        let receipt = self.record(
+            Origin::Call(call),
+            RecordBody::WorkRejected {
+                job,
+                call,
+                message: message.clone(),
+                budget,
+            },
+            effects,
+        );
+        self.attach(job, receipt.seq);
+        if exhausted {
+            self.finish_job(
+                job,
+                OutcomeKind::Failed,
+                Completion::new(format!("work correction budget exhausted: {message}")),
+                effects,
+            );
+        } else {
+            self.make_ready(job);
+        }
     }
 
     fn validate_proposal(
@@ -134,9 +170,11 @@ impl Kernel {
                 }
                 Ok(())
             }
-            WorkStep::Delegate(assignments) => {
-                self.validate_assignments(Some(job), &self.jobs[&job].inputs, assignments)
-            }
+            WorkStep::Delegate(delegation) => self.validate_assignments(
+                Some(job),
+                &self.jobs[&job].inputs,
+                &delegation.assignments,
+            ),
             WorkStep::Wait(wait) => self.validate_wait(job, wait),
             WorkStep::AskUser(question) => {
                 let has_reply_key = self.jobs[&job]
@@ -249,6 +287,19 @@ impl Kernel {
 
     fn validate_wait(&self, job: JobId, wait: &Await) -> Result<(), String> {
         match wait {
+            Await::Jobs(jobs) => {
+                let distinct = jobs.iter().copied().collect::<BTreeSet<_>>();
+                if jobs.is_empty()
+                    || distinct.len() != jobs.len()
+                    || jobs
+                        .iter()
+                        .any(|target| *target == job || !self.can_access_job(job, *target))
+                {
+                    Err("job group must contain distinct owned descendants".into())
+                } else {
+                    Ok(())
+                }
+            }
             Await::Tool(call) => {
                 if self
                     .calls
@@ -320,7 +371,8 @@ impl Kernel {
                 }
             }
             WorkStep::Tool(tool) => self.start_tool(job, pending, tool, effects),
-            WorkStep::Delegate(assignments) => {
+            WorkStep::Delegate(delegation) => {
+                let assignments = delegation.assignments;
                 if self.active_jobs() + assignments.len() > self.limits.active_jobs {
                     let rejected = self.record(
                         Origin::Call(pending.call),
@@ -330,12 +382,30 @@ impl Kernel {
                         effects,
                     );
                     self.attach(job, rejected.seq);
+                    self.make_ready(job);
                 } else {
-                    for assignment in assignments {
-                        self.create_job(Owner::Job(job), assignment, effects);
+                    let children = assignments
+                        .into_iter()
+                        .map(|assignment| self.create_job(Owner::Job(job), assignment, effects))
+                        .collect::<Vec<_>>();
+                    let record = self.record(
+                        Origin::Call(pending.call),
+                        RecordBody::Delegated {
+                            job,
+                            call: pending.call,
+                            children: children.clone(),
+                            continuation: delegation.continuation,
+                        },
+                        effects,
+                    );
+                    self.attach(job, record.seq);
+                    match delegation.continuation {
+                        AfterDelegation::Continue => self.make_ready(job),
+                        AfterDelegation::WaitAll => {
+                            self.install_wait(now, job, Await::Jobs(children), effects)
+                        }
                     }
                 }
-                self.make_ready(job);
             }
             WorkStep::Wait(wait) => self.install_wait(now, job, wait, effects),
             WorkStep::AskUser(question) => {
@@ -465,6 +535,7 @@ impl Kernel {
             JobState::Ready => true,
             JobState::Finished(_) => false,
             JobState::Waiting(wait) => match wait {
+                WaitState::Jobs(jobs) => self.job_group_ready(jobs),
                 WaitState::Tool(call) => !self.calls.get(call).is_some_and(CallEntry::running),
                 WaitState::Until(deadline) => *deadline <= now,
                 WaitState::Job {
@@ -535,6 +606,16 @@ impl Kernel {
 
     fn install_wait(&mut self, now: MonoTime, job: JobId, wait: Await, effects: &mut Vec<Effect>) {
         let state = match wait {
+            Await::Jobs(jobs) => {
+                if self.job_group_ready(&jobs) {
+                    for target in jobs {
+                        self.deliver_outcome(job, target, effects);
+                    }
+                    self.make_ready(job);
+                    return;
+                }
+                WaitState::Jobs(jobs)
+            }
             Await::Tool(call) => {
                 if !self.calls[&call].running() {
                     self.make_ready(job);
@@ -586,6 +667,12 @@ impl Kernel {
             }
         };
         self.jobs.get_mut(&job).expect("job exists").state = JobState::Waiting(state);
+    }
+
+    pub(super) fn job_group_ready(&self, jobs: &[JobId]) -> bool {
+        jobs.iter().any(|id| self.jobs.get(id).is_none_or(|entry| {
+            matches!(&entry.state, JobState::Finished(outcome) if outcome.kind != OutcomeKind::Completed)
+        })) || jobs.iter().all(|id| matches!(self.jobs[id].state, JobState::Finished(_)))
     }
 
     fn running_tools(&self) -> usize {
@@ -741,26 +828,32 @@ impl Kernel {
                 effects,
             ),
         }
-        self.wake_job_waiters(job, record.seq, effects);
+        self.wake_job_waiters(job, effects);
     }
 
-    fn wake_job_waiters(&mut self, producer: JobId, outcome: Seq, effects: &mut Vec<Effect>) {
+    fn wake_job_waiters(&mut self, producer: JobId, effects: &mut Vec<Effect>) {
         let waiting = self
             .jobs
             .iter()
-            .filter_map(|(id, entry)| match entry.state {
-                JobState::Waiting(WaitState::Job { job, .. }) if job == producer => Some(*id),
-                JobState::Waiting(WaitState::Result { job, .. }) if job == producer => Some(*id),
+            .filter_map(|(id, entry)| match &entry.state {
+                JobState::Waiting(WaitState::Job { job, .. }) if *job == producer => Some(*id),
+                JobState::Waiting(WaitState::Result { job, .. }) if *job == producer => Some(*id),
+                JobState::Waiting(WaitState::Jobs(jobs))
+                    if jobs.contains(&producer) && self.job_group_ready(jobs) =>
+                {
+                    Some(*id)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
         for job in waiting {
-            self.deliver(
-                DeliveryTarget::Job(job),
-                outcome,
-                DeliveryKind::Outcome,
-                effects,
-            );
+            let targets = match &self.jobs[&job].state {
+                JobState::Waiting(WaitState::Jobs(jobs)) => jobs.clone(),
+                _ => vec![producer],
+            };
+            for target in targets {
+                self.deliver_outcome(job, target, effects);
+            }
             self.make_ready(job);
         }
     }

@@ -18,6 +18,9 @@ pub struct AgentLimits {
     pub tool_slots: usize,
     pub active_jobs: usize,
     pub job_depth: usize,
+    /// Lifetime descendant budget per root; zero disables delegation.
+    #[serde(default = "default_job_budget")]
+    pub job_budget: usize,
     pub pending_inputs: usize,
     pub inquiries: usize,
     /// Acceptance ceiling for a serialized context DTO or complete original
@@ -91,6 +94,7 @@ impl Default for AgentLimits {
             tool_slots: 8,
             active_jobs: 64,
             job_depth: 8,
+            job_budget: default_job_budget(),
             pending_inputs: 32,
             inquiries: 32,
             context_bytes: 96 * 1024,
@@ -98,6 +102,10 @@ impl Default for AgentLimits {
             tool_output_bytes: 1024 * 1024,
         }
     }
+}
+
+fn default_job_budget() -> usize {
+    16
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

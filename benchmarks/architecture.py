@@ -77,7 +77,7 @@ TASKS = {
 }
 
 
-def make_case(workload: str, mode: str, timeout_seconds: int = 120) -> Case:
+def make_case(workload: str, mode: str, timeout_seconds: int = 120, *, enforce_job_contract: bool = False) -> Case:
     files = FIXTURES[workload]
     setup = " && ".join(
         f"printf %s {shlex.quote(content)} > {shlex.quote(name)}"
@@ -98,7 +98,9 @@ def make_case(workload: str, mode: str, timeout_seconds: int = 120) -> Case:
         "Work in /app. " + TASKS[workload] + "\n" + instructions[mode]
         + "\nInspect the supplied files. Do not modify test_task.py. Run python3 test_task.py before completing."
     )
-    return Case(f"{workload}-{mode}", prompt, verifier, setup, timeout_seconds=timeout_seconds)
+    budget = (0 if mode == "single" else 2) if enforce_job_contract and mode != "auto" else None
+    depth = (1 if mode == "single" else 2) if enforce_job_contract and mode != "auto" else None
+    return Case(f"{workload}-{mode}", prompt, verifier, setup, timeout_seconds=timeout_seconds, job_budget=budget, job_depth=depth)
 
 
 def analyze(entries: list[dict], workload: str, mode: str) -> dict:
@@ -141,6 +143,7 @@ def main() -> int:
     parser.add_argument("--mode", action="append", choices=MODES)
     parser.add_argument("--case", action="append", choices=[f"{w}-{m}" for w in FIXTURES for m in (("single",) if w == "single" else MODES)])
     parser.add_argument("--timeout-seconds", type=int, default=120)
+    parser.add_argument("--enforce-job-contract", action="store_true", help="enforce single/delegated upper bounds through the candidate's Job limits; report separately from prompt-only baseline")
     parser.add_argument("--results-dir", type=Path, default=ROOT / "benchmarks/results/architecture")
     args = parser.parse_args()
     if args.attempts < 1:
@@ -166,6 +169,7 @@ def main() -> int:
         "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
         "attempts": args.attempts,
         "timeout_seconds": args.timeout_seconds,
+        "job_contract": "kernel" if args.enforce_job_contract else "prompt-only",
         "fixtures_sha256": hashlib.sha256(json.dumps(FIXTURES, sort_keys=True).encode()).hexdigest(),
     }
     (destination / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -178,7 +182,7 @@ def main() -> int:
             for mode in modes:
                 if (workload, mode) not in selected:
                     continue
-                case = make_case(workload, mode, args.timeout_seconds)
+                case = make_case(workload, mode, args.timeout_seconds, enforce_job_contract=args.enforce_job_contract)
                 trial = destination / f"{case.name}-{attempt}"
                 result = one_trial(args.binary, args.model, case, trial)
                 result.update(workload=workload, mode=mode, attempt=attempt)

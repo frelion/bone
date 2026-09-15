@@ -4,7 +4,7 @@ use crate::{DurableError, DurableSnapshot};
 impl Kernel {
     pub(crate) fn durable_snapshot(&self) -> Result<DurableSnapshot, DurableError> {
         Ok(DurableSnapshot {
-            version: 1,
+            version: 3,
             through: Seq(self.next_seq - 1),
             epoch: self.epoch,
             payload: serde_json::to_value(self)
@@ -15,12 +15,50 @@ impl Kernel {
     /// Reconstitute facts, then interrupt old execution without scheduling any calls.
     /// Recovery effects and the resulting snapshot must be committed before use.
     pub(crate) fn restore(
-        snapshot: DurableSnapshot,
+        mut snapshot: DurableSnapshot,
         records: Vec<Arc<Record>>,
         limits: AgentLimits,
         tools: Vec<ToolSpec>,
     ) -> Result<(Self, Vec<Effect>), DurableError> {
-        if snapshot.version != 1 {
+        if snapshot.version == 1 || snapshot.version == 2 {
+            // Version 1 predates correction budgets. Migrate only that version;
+            // missing counters in newer snapshots must fail, never reset a budget.
+            let jobs = snapshot
+                .payload
+                .get_mut("jobs")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| {
+                    DurableError::Invalid("missing jobs in version 1 snapshot".into())
+                })?;
+            for job in jobs.values_mut() {
+                let job = job
+                    .as_object_mut()
+                    .ok_or_else(|| DurableError::Invalid("invalid version 1 job".into()))?;
+                if snapshot.version == 1 {
+                    job.entry("work_rejections")
+                        .or_insert_with(|| serde_json::json!({"consecutive":0,"total":0}));
+                }
+                job.entry("delegation").or_insert_with(|| serde_json::json!({
+                    "max_descendants": limits.job_budget, "max_depth": limits.job_depth.saturating_sub(1)
+                }));
+                if let Some(delegate) = job
+                    .get_mut("state")
+                    .and_then(|state| state.pointer_mut("/Waiting/Commit/step/Delegate"))
+                    && let Some(assignments) = delegate.as_array()
+                {
+                    let mut assignments = assignments.clone();
+                    for assignment in &mut assignments {
+                        if let Some(assignment) = assignment.as_object_mut() {
+                            assignment.entry("delegation").or_insert_with(
+                                || serde_json::json!({"max_descendants":0,"max_depth":0}),
+                            );
+                        }
+                    }
+                    *delegate =
+                        serde_json::json!({"assignments":assignments,"continuation":"Continue"});
+                }
+            }
+        } else if snapshot.version != 3 {
             return Err(DurableError::UnsupportedVersion(snapshot.version));
         }
         let configured =

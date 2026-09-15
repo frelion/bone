@@ -397,6 +397,10 @@ impl Kernel {
                 .then_some(*seq)
         });
         if let Some(outcome) = outcome {
+            if self.records.values().any(|record| matches!(record.body,
+                RecordBody::Delivery { to: DeliveryTarget::Job(job), source, kind: DeliveryKind::Outcome }
+                if job == target && source == outcome
+            )) { return; }
             self.deliver(
                 DeliveryTarget::Job(target),
                 outcome,

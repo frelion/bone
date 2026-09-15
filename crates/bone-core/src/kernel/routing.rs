@@ -312,6 +312,39 @@ impl Kernel {
         self.enqueue_job(job);
     }
 
+    pub(crate) fn delegation_capacity(&self, job: JobId) -> DelegationLimits {
+        let mut remaining = usize::MAX;
+        let mut depth = self.limits.job_depth.saturating_sub(self.job_depth(job));
+        let mut distance = 0;
+        let mut current = job;
+        loop {
+            let entry = &self.jobs[&current];
+            // Finished descendants still count: completing jobs cannot refill a budget.
+            let used = self
+                .jobs
+                .keys()
+                .filter(|id| **id != current && self.owns(current, **id))
+                .count();
+            remaining = remaining.min(entry.delegation.max_descendants.saturating_sub(used));
+            depth = depth.min(entry.delegation.max_depth.saturating_sub(distance));
+            if let Owner::Job(parent) = entry.owner {
+                current = parent;
+                distance += 1;
+            } else {
+                remaining = remaining.min(self.limits.job_budget.saturating_sub(used));
+                break;
+            }
+        }
+        if remaining == 0 || depth == 0 {
+            DelegationLimits::default()
+        } else {
+            DelegationLimits {
+                max_descendants: remaining,
+                max_depth: depth,
+            }
+        }
+    }
+
     pub(super) fn validate_assignments(
         &self,
         source: Option<JobId>,
@@ -320,6 +353,25 @@ impl Kernel {
     ) -> Result<(), String> {
         if assignments.is_empty() {
             return Err("delegate requires at least one assignment".into());
+        }
+        if let Some(job) = source {
+            let capacity = self.delegation_capacity(job);
+            if capacity.max_depth == 0 || assignments.len() > capacity.max_descendants {
+                return Err(
+                    "delegation exceeds this job's remaining subtree budget or depth".into(),
+                );
+            }
+            for assignment in assignments {
+                let requested = assignment.delegation;
+                if (requested.max_depth == 0) != (requested.max_descendants == 0)
+                    || requested.max_depth > capacity.max_depth - 1
+                    || requested.max_descendants > capacity.max_descendants - assignments.len()
+                {
+                    return Err(
+                        "child delegation limits must fit the parent's remaining authority".into(),
+                    );
+                }
+            }
         }
         let depth = source.map_or(1, |job| self.job_depth(job) + 1);
         if depth > self.limits.job_depth {
@@ -373,7 +425,16 @@ impl Kernel {
             inputs,
             evidence,
             seed,
+            delegation,
         } = assignment;
+        let delegation = if matches!(owner, Owner::Job(_)) {
+            delegation
+        } else {
+            DelegationLimits {
+                max_descendants: self.limits.job_budget,
+                max_depth: self.limits.job_depth.saturating_sub(1),
+            }
+        };
         self.jobs.insert(
             id,
             Job {
@@ -386,6 +447,8 @@ impl Kernel {
                 active_call: None,
                 context: JobContext::default(),
                 report: None,
+                work_rejections: WorkRejections::default(),
+                delegation,
             },
         );
         let created = self.record(

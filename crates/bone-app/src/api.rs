@@ -383,6 +383,7 @@ pub enum JobOwner {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WaitReason {
+    Jobs(Vec<JobRef>),
     Tool(CallRef),
     Timer,
     User,

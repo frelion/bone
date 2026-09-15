@@ -49,9 +49,18 @@ Return exactly one submit_work call: optional concise note, optional public repo
 answers only to inquiries present in this call (use an empty answers array when there are none), \
 and one mutually exclusive next step. Delegate \
 independent work as child jobs. PublishResult exposes an early result; Finish carries \
-the final outcome. A capacity Audit after Delegate means no child was created, so \
-reconsider or proceed locally. Every turn must take an available action. After \
-delegating, wait on that child; use a tool wait only for a tool call. Tool requests \
+the final outcome. WorkRejected means no part of that proposal was applied; correct \
+the reported error in this Job. Child assignments include delegation limits: use \
+zero descendants and zero depth for a leaf that performs its own work. Grant further \
+delegation only for a concrete nested deliverable; never exceed parent capacity or \
+the user's decomposition constraints. Every descendant consumes all ancestor budgets, \
+even after finishing. Three consecutive or eight total rejections exhaust \
+the correction budget. A capacity Audit after Delegate means no child was created, so \
+reconsider or proceed locally. Delegate includes a continuation: use WaitAll when \
+you need that batch's results, or Continue when you have independent work. WaitAll \
+parks this Job until all succeed or an interruption needs a decision. Use Wait.Jobs \
+to await an existing group, not timed polling. Continue acknowledges an interruption \
+while keeping an unsatisfied wait. Use a tool wait only for a tool call. Tool requests \
 are proposals, not proof of execution. Reply is a public message, not proof of \
 completion; after Reply, Finish only when the job contract is satisfied, otherwise \
 continue the work. Never repeat the same reply.";
@@ -215,8 +224,9 @@ fn work_schema(input: &WorkInput) -> Value {
     evidence_ids.dedup();
     let evidence = evidence_schema(&evidence_ids);
     let input_ids = input.inputs.iter().map(|input| input.0).collect::<Vec<_>>();
-    let assignment = assignment_schema(evidence.clone(), &input_ids);
-    let read = read_schema();
+    let mut assignment = assignment_schema(evidence.clone(), &input_ids);
+    assignment["properties"]["delegation"] = delegation_limits_schema(input.delegation);
+    let read = work_read_schema(input);
     let report = report_schema(evidence.clone());
     let completion = completion_schema(evidence);
     let duration = object(json!({
@@ -241,6 +251,10 @@ fn work_schema(input: &WorkInput) -> Value {
     if !child_ids.is_empty() {
         waits.push(tagged("Job", enum_id_schema(&child_ids)));
         waits.push(tagged(
+            "Jobs",
+            json!({"type":"array", "items":enum_id_schema(&child_ids), "minItems":1}),
+        ));
+        waits.push(tagged(
             "Result",
             object(json!({
                 "job": enum_id_schema(&child_ids),
@@ -263,13 +277,21 @@ fn work_schema(input: &WorkInput) -> Value {
         ])
     }));
     let mut steps = vec![
-        tagged("Delegate", json!({"type":"array", "items":assignment})),
         tagged("Wait", wait),
         tagged("Read", read),
         tagged("PublishResult", report.clone()),
         tagged("Finish", completion.clone()),
         tagged("Fail", completion),
     ];
+    if input.delegation.max_descendants > 0 && input.delegation.max_depth > 0 {
+        steps.insert(0, tagged("Delegate", object(json!({
+            "assignments": {"type":"array", "items":assignment, "minItems":1, "maxItems":input.delegation.max_descendants},
+            "continuation": {"type":"string", "enum":["WaitAll", "Continue"]}
+        }))));
+    }
+    if input.waiting.is_some() {
+        steps.push(json!({"type":"string", "enum":["Continue"]}));
+    }
     if !child_ids.is_empty() {
         steps.push(tagged(
             "Inquire",
@@ -348,8 +370,29 @@ fn assignment_schema(evidence: Value, inputs: &[u64]) -> Value {
         "spec": spec_schema(),
         "inputs": enum_ids_schema(inputs),
         "evidence": evidence,
-        "seed": {"type":"null"}
+        "seed": {"type":"null"},
+        "delegation": object(json!({
+            "max_descendants": {"type":"integer", "minimum":0},
+            "max_depth": {"type":"integer", "minimum":0}
+        }))
     }))
+}
+
+fn delegation_limits_schema(capacity: crate::DelegationLimits) -> Value {
+    let leaf = object(json!({
+        "max_descendants": {"type":"integer", "enum":[0]},
+        "max_depth": {"type":"integer", "enum":[0]}
+    }));
+    if capacity.max_descendants < 2 || capacity.max_depth < 2 {
+        return leaf;
+    }
+    any(vec![
+        leaf,
+        object(json!({
+            "max_descendants": {"type":"integer", "minimum":1, "maximum":capacity.max_descendants - 1},
+            "max_depth": {"type":"integer", "minimum":1, "maximum":capacity.max_depth - 1}
+        })),
+    ])
 }
 
 fn spec_schema() -> Value {
@@ -376,6 +419,10 @@ fn completion_schema(evidence: Value) -> Value {
 }
 
 fn read_schema() -> Value {
+    read_schema_with_job_ref(id_schema())
+}
+
+fn read_schema_with_job_ref(job_ref: Value) -> Value {
     any(vec![
         tagged(
             "Jobs",
@@ -384,12 +431,32 @@ fn read_schema() -> Value {
                 "after": nullable(id_schema())
             })),
         ),
-        tagged("Job", id_schema()),
+        tagged("Job", job_ref),
         tagged(
             "Record",
             object(json!({"id":id_schema(), "offset":{"type":"integer", "minimum":0}})),
         ),
     ])
+}
+
+fn work_read_schema(input: &WorkInput) -> Value {
+    let mut ids = vec![input.job.0];
+    ids.extend(input.children.iter().map(|card| card.id.0));
+    // A directory read can expose descendants not in the initial child cards.
+    // Keep Jobs pagination and Record paging unrestricted by this visible set:
+    // they are the discovery path back to older authorized references.
+    for record in &input.records {
+        if let Ok(crate::RecordBody::ReadResult {
+            requester, jobs, ..
+        }) = serde_json::from_str::<crate::RecordBody>(&record.content)
+            && requester == crate::DeliveryTarget::Job(input.job)
+        {
+            ids.extend(jobs.iter().map(|card| card.id.0));
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    read_schema_with_job_ref(enum_id_schema(&ids))
 }
 
 fn tool_call_schema(tools: &[ToolSpec]) -> Value {
@@ -521,6 +588,10 @@ mod tests {
 
     fn work_input() -> WorkInput {
         WorkInput {
+            delegation: crate::DelegationLimits {
+                max_descendants: 16,
+                max_depth: 7,
+            },
             job: JobId(3),
             revision: 1,
             role: WorkerRole::User,
@@ -657,7 +728,7 @@ mod tests {
             target: crate::RouteTarget::New,
             handoff: "inspect the parser".into(),
         }]);
-        let proposal = WorkProposal::new(WorkStep::Delegate(vec![Assignment::new(JobSpec::new(
+        let proposal = WorkProposal::new(WorkStep::delegate(vec![Assignment::new(JobSpec::new(
             "inspect the parser",
             "parser sources only",
             "report the failing branch",
@@ -859,6 +930,83 @@ mod tests {
             json!([2, 5])
         );
         assert_eq!(schema["properties"]["seed"], json!({"type": "null"}));
+    }
+
+    #[test]
+    fn delegation_schema_matches_the_nonempty_kernel_contract() {
+        let schema = work_schema(&work_input());
+        let delegate = schema["properties"]["step"]["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|step| step["properties"].get("Delegate"))
+            .unwrap();
+        assert_eq!(delegate["properties"]["assignments"]["minItems"], json!(1));
+    }
+
+    #[test]
+    fn leaf_contract_hides_delegation_and_child_authority_cannot_escalate() {
+        let mut input = work_input();
+        input.delegation = crate::DelegationLimits::default();
+        assert!(!has_work_step(&work_schema(&input), "Delegate"));
+        let schema = delegation_limits_schema(crate::DelegationLimits {
+            max_descendants: 2,
+            max_depth: 1,
+        });
+        assert_eq!(schema["properties"]["max_descendants"]["enum"], json!([0]));
+        assert_eq!(schema["properties"]["max_depth"]["enum"], json!([0]));
+        let schema = delegation_limits_schema(crate::DelegationLimits {
+            max_descendants: 4,
+            max_depth: 3,
+        });
+        assert_eq!(
+            schema["anyOf"][1]["properties"]["max_descendants"]["maximum"],
+            json!(3)
+        );
+        assert_eq!(
+            schema["anyOf"][1]["properties"]["max_depth"]["maximum"],
+            json!(2)
+        );
+    }
+
+    #[test]
+    fn job_reads_use_visible_refs_without_removing_directory_or_record_paging() {
+        let mut input = work_input();
+        let card = JobCard {
+            id: JobId(7),
+            spec: JobSpec::new("child", "workspace", "verified"),
+            status: JobStatus::Running,
+            report: None,
+            latest_handoff: None,
+        };
+        input.children.push(card.clone());
+        for (requester, id) in [(input.job, JobId(9)), (JobId(99), JobId(100))] {
+            input.records.push(crate::RecordView {
+                source: Seq(id.0),
+                origin: crate::Origin::Kernel,
+                offset: 0,
+                next_offset: None,
+                content: serde_json::to_string(&crate::RecordBody::ReadResult {
+                    requester: crate::DeliveryTarget::Job(requester),
+                    query: crate::ReadQuery::Jobs {
+                        parent: Some(input.job),
+                        after: Some(JobId(7)),
+                    },
+                    next_job: Some(id),
+                    jobs: vec![JobCard { id, ..card.clone() }],
+                    record: None,
+                })
+                .unwrap(),
+            });
+        }
+        let schema = work_read_schema(&input);
+        assert_eq!(
+            schema["anyOf"][1]["properties"]["Job"]["enum"],
+            json!([input.job.0, 7, 9])
+        );
+        let generic = read_schema();
+        assert_eq!(schema["anyOf"][0], generic["anyOf"][0]);
+        assert_eq!(schema["anyOf"][2], generic["anyOf"][2]);
     }
 
     #[test]

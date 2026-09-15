@@ -157,6 +157,19 @@ pub enum RecordBody {
     Audit {
         message: String,
     },
+    /// A side-effect-free refusal delivered back to the same Job for correction.
+    WorkRejected {
+        job: JobId,
+        call: CallId,
+        message: String,
+        budget: crate::WorkRejections,
+    },
+    Delegated {
+        job: JobId,
+        call: CallId,
+        children: Vec<JobId>,
+        continuation: crate::AfterDelegation,
+    },
     Stopped,
 }
 
@@ -312,6 +325,8 @@ pub struct WorkInput {
     pub role: WorkerRole,
     /// Whether `AskUser` is available for this particular user-owned turn.
     pub can_ask_user: bool,
+    /// Effective remaining delegation capacity, including ancestor ceilings.
+    pub delegation: crate::DelegationLimits,
     pub spec: JobSpec,
     /// Input IDs this job may pass to a delegated child.
     pub inputs: Vec<InputId>,
@@ -441,6 +456,7 @@ fn work_input(
         job: job_id,
         revision: job.revision,
         role,
+        delegation: kernel.delegation_capacity(job_id),
         can_ask_user: role == WorkerRole::User
             && job
                 .inputs

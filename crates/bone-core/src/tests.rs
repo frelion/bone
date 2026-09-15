@@ -19,6 +19,12 @@ const NOW: MonoTime = MonoTime(Duration::ZERO);
 #[path = "tests/context_regressions.rs"]
 mod context_regressions;
 
+#[path = "tests/work_rejections.rs"]
+mod work_rejections;
+
+#[path = "tests/delegation.rs"]
+mod delegation;
+
 fn spec(goal: &str) -> JobSpec {
     JobSpec::new(goal, format!("{goal} scope"), format!("{goal} done"))
 }
@@ -536,7 +542,7 @@ fn parent_finish_waits_for_a_cancelled_child_external_write() {
     let calls = calls_by_goal(work_calls(&work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     )));
     let (child_call, child) = calls["child"].clone();
     work(
@@ -603,7 +609,7 @@ fn delegate_capacity_rejection_is_returned_to_the_parent_worker() {
     let effects = work(
         &mut kernel,
         call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     );
 
     assert!(!finished_as(&kernel, parent.job, OutcomeKind::Failed));
@@ -768,7 +774,7 @@ fn delegate_validates_the_whole_batch_before_writing_any_part() {
             evidence: Vec::new(),
         }),
         answers: Vec::new(),
-        step: WorkStep::Delegate(vec![assignment("valid child", &[input.id]), invalid]),
+        step: WorkStep::delegate(vec![assignment("valid child", &[input.id]), invalid]),
     };
     kernel.step(
         NOW,
@@ -779,7 +785,16 @@ fn delegate_validates_the_whole_batch_before_writing_any_part() {
     );
 
     assert_eq!(kernel.jobs.len(), 1);
-    assert!(finished_as(&kernel, work_input.job, OutcomeKind::Failed));
+    assert!(!matches!(
+        kernel.job_status(work_input.job),
+        JobStatus::Finished(_)
+    ));
+    assert_eq!(kernel.jobs[&work_input.job].work_rejections.total, 1);
+    assert_eq!(
+        kernel.inputs[&input.id].pending_review_by,
+        Some(work_input.job)
+    );
+    assert_eq!(kernel.jobs[&work_input.job].context.read_through, Seq::ZERO);
     assert!(!kernel.records.values().any(|record| matches!(
         &record.body,
         RecordBody::Note { text, .. } if text == "must not be committed"
@@ -793,7 +808,7 @@ fn delegate_validates_the_whole_batch_before_writing_any_part() {
 }
 
 #[test]
-fn oversized_tool_call_fails_without_persisting_or_starting_the_request() {
+fn oversized_tool_call_is_rejected_without_persisting_or_starting_the_request() {
     let limits = AgentLimits {
         context_bytes: 4_096,
         item_bytes: 128,
@@ -825,14 +840,18 @@ fn oversized_tool_call_fails_without_persisting_or_starting_the_request() {
         )),
     );
 
-    assert!(finished_as(&kernel, work_input.job, OutcomeKind::Failed));
+    assert!(!matches!(
+        kernel.job_status(work_input.job),
+        JobStatus::Finished(_)
+    ));
+    assert_eq!(kernel.jobs[&work_input.job].work_rejections.total, 1);
     assert!(
         starts(&effects).all(|(_, call)| !matches!(call, Call::Tool(_))),
         "an oversized request must never reach the tool port"
     );
     assert!(kernel.records.values().any(|record| matches!(
         &record.body,
-        RecordBody::Audit { message } if message == "tool call exceeds item_bytes"
+        RecordBody::WorkRejected { message, .. } if message == "tool call exceeds item_bytes"
     )));
     assert!(!kernel.records.values().any(|record| matches!(
         record.body,
@@ -1110,7 +1129,7 @@ fn finish_waits_for_children_and_requires_their_delivery_to_be_read() {
     let calls = calls_by_goal(work_calls(&work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     )));
     let (parent_call, _) = &calls["parent"];
     let (child_call, child_input) = &calls["child"];
@@ -1313,7 +1332,7 @@ fn a_completed_tool_is_a_valid_wait_target_for_an_earlier_worker_snapshot() {
     let calls = calls_by_goal(work_calls(&work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     )));
     let (parent_call, _) = &calls["parent"];
     let (child_call, child) = &calls["child"];
@@ -1633,7 +1652,7 @@ fn a_completed_child_seeds_only_its_explicit_paginated_evidence() {
     let calls = calls_by_goal(work_calls(&work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("research", &[])]),
+        WorkStep::delegate(vec![assignment("research", &[])]),
     )));
     let (stale_parent_call, _) = &calls["parent"];
     let (child_call, child_input) = &calls["research"];
@@ -1704,7 +1723,7 @@ fn a_completed_child_seeds_only_its_explicit_paginated_evidence() {
     let effects = work(
         &mut kernel,
         fresh_parent_call,
-        WorkStep::Delegate(vec![follow_up]),
+        WorkStep::delegate(vec![follow_up]),
     );
 
     let follow_up = *kernel.jobs.keys().max().unwrap();
@@ -1812,7 +1831,11 @@ fn a_completed_child_seeds_only_its_explicit_paginated_evidence() {
             offset: 0,
         }),
     );
-    assert!(finished_as(&kernel, follow_up, OutcomeKind::Failed));
+    assert!(!matches!(
+        kernel.job_status(follow_up),
+        JobStatus::Finished(_)
+    ));
+    assert_eq!(kernel.jobs[&follow_up].work_rejections.total, 1);
     assert!(!kernel.records.values().any(|record| {
         matches!(
             record.body,
@@ -1825,7 +1848,7 @@ fn a_completed_child_seeds_only_its_explicit_paginated_evidence() {
     assert!(kernel.records.values().any(|record| {
         matches!(
             &record.body,
-            RecordBody::Audit { message } if message == "worker cannot read that record"
+            RecordBody::WorkRejected { message, .. } if message == "worker cannot read that record"
         )
     }));
 }
@@ -1844,7 +1867,7 @@ fn a_parent_can_read_only_evidence_explicitly_shared_by_a_child_outcome() {
     let calls = calls_by_goal(work_calls(&work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     )));
     let child = calls["child"].1.job;
     work(
@@ -1931,7 +1954,14 @@ fn a_parent_can_read_only_evidence_explicitly_shared_by_a_child_outcome() {
             offset: 0,
         }),
     );
-    assert!(finished_as(&kernel, parent.job, OutcomeKind::Failed));
+    assert!(!matches!(
+        kernel.job_status(parent.job),
+        JobStatus::Finished(_)
+    ));
+    assert_eq!(kernel.jobs[&parent.job].work_rejections.total, 1);
+    assert!(!kernel.records.values().any(|record| matches!(
+        record.body, RecordBody::ReadResult { query: ReadQuery::Record { id, .. }, .. } if id == private
+    )));
 }
 
 #[test]
@@ -1947,7 +1977,7 @@ fn stop_terminalizes_the_forest_and_late_turns_cannot_restart_it() {
     let running = work_calls(&work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     ));
 
     assert_eq!(
@@ -2111,7 +2141,7 @@ fn inquiry_to_a_finished_job_returns_its_outcome_without_stale_delivery() {
     let calls = calls_by_goal(work_calls(&work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     )));
     let (parent_call, _) = &calls["parent"];
     let (child_call, child) = &calls["child"];
@@ -2180,7 +2210,7 @@ fn inquiry_answer_explicitly_grants_its_evidence_to_the_requester() {
     let calls = calls_by_goal(work_calls(&work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     )));
     let child = calls["child"].1.job;
     work(
@@ -2437,7 +2467,7 @@ fn a_waiting_job_can_replace_its_own_user_question() {
     let calls = calls_by_goal(work_calls(&work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     )));
     work(
         &mut kernel,
@@ -2544,7 +2574,7 @@ fn a_parent_waiting_for_its_child_receives_one_outcome_delivery() {
     let calls = calls_by_goal(work_calls(&work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     )));
     let child = calls["child"].1.job;
     work(
@@ -2987,7 +3017,7 @@ fn parent_finish_waits_until_an_unknown_descendant_write_is_resolved() {
     let calls = calls_by_goal(work_calls(&work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     )));
     let (child_call, child) = calls["child"].clone();
     work(
@@ -3292,6 +3322,14 @@ fn routed_input_stays_a_global_commit_barrier_until_a_worker_reviews_it() {
     );
     assert!(!starts(&routed).any(|(_, call)| matches!(call, Call::Tool(_))));
     let (review_call, review) = work_calls(&routed).pop().unwrap();
+    let refused = work(&mut kernel, review_call, WorkStep::delegate(vec![]));
+    assert_eq!(
+        kernel.inputs[&update.id].pending_review_by,
+        Some(review.job)
+    );
+    assert!(!starts(&refused).any(|(_, call)| matches!(call, Call::Tool(_))));
+    let (review_call, retry) = work_calls(&refused).pop().unwrap();
+    assert_eq!(retry.job, review.job);
     let effects = work(
         &mut kernel,
         review_call,
@@ -3406,7 +3444,7 @@ fn delegated_worker_cannot_update_session_constraints() {
     let effects = work(
         &mut kernel,
         parent_call,
-        WorkStep::Delegate(vec![assignment("child", &[input.id])]),
+        WorkStep::delegate(vec![assignment("child", &[input.id])]),
     );
     let (child_call, child) = work_calls(&effects)
         .into_iter()
@@ -3422,7 +3460,11 @@ fn delegated_worker_cannot_update_session_constraints() {
         },
     );
     assert!(kernel.constraints.is_empty());
-    assert!(finished_as(&kernel, child.job, OutcomeKind::Failed));
+    assert!(!matches!(
+        kernel.job_status(child.job),
+        JobStatus::Finished(_)
+    ));
+    assert_eq!(kernel.jobs[&child.job].work_rejections.total, 1);
 }
 
 #[test]
@@ -3442,7 +3484,7 @@ fn worker_control_is_limited_to_its_owned_descendants() {
     let effects = work(
         &mut kernel,
         owner_call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     );
     let mut calls = calls_by_goal(work_calls(&effects));
     let (owner_call, _) = calls.remove("owner").unwrap();
@@ -3640,7 +3682,7 @@ fn session_projection_includes_root_publication_but_not_child_publication() {
     let effects = work(
         &mut kernel,
         call,
-        WorkStep::Delegate(vec![assignment("child", &[])]),
+        WorkStep::delegate(vec![assignment("child", &[])]),
     );
     let call = work_calls(&effects)
         .into_iter()

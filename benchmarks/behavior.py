@@ -30,6 +30,8 @@ class Case:
     read_only: bool = False
     expected_status: str = "completed"
     timeout_seconds: int = 600
+    job_budget: int | None = None
+    job_depth: int | None = None
 
 
 CASES = (
@@ -139,6 +141,27 @@ def auth_root() -> Path:
     return config
 
 
+CORE_RECORD_EXPORT = """
+import json, sqlite3, sys
+with sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True) as db:
+    exported = []
+    for key, payload in db.execute("SELECT key,payload_json FROM documents WHERE namespace='app' AND key LIKE 'core/%'"):
+        manifest = json.loads(payload)
+        chunks = []
+        for index in range(manifest['chunks']):
+            chunk_key = 'core-chunks/' + key.removeprefix('core/') + '/' + str(index)
+            row = db.execute("SELECT payload_json FROM documents WHERE namespace='app' AND key=?", (chunk_key,)).fetchone()
+            if row is None:
+                raise ValueError('missing core chunk')
+            chunks.append(json.loads(row[0]))
+        state = json.loads(''.join(chunks))
+        exported.append({'core': key, 'records': state['records']})
+    if not exported:
+        raise ValueError('no core state found')
+    print(json.dumps(exported))
+"""
+
+
 def one_trial(binary: Path, model: str, case: Case, trial_dir: Path) -> dict[str, object]:
     trial_dir.mkdir(parents=True, exist_ok=False)
     prompt = trial_dir / "prompt.txt"
@@ -177,6 +200,10 @@ def one_trial(binary: Path, model: str, case: Case, trial_dir: Path) -> dict[str
         ]
         if case.read_only:
             args.append("--read-only")
+        if case.job_budget is not None:
+            args.extend(("--job-budget", str(case.job_budget)))
+        if case.job_depth is not None:
+            args.extend(("--job-depth", str(case.job_depth)))
         agent = run(["podman", "exec", container, *args], check=False)
         agent_output = agent.stdout
         (trial_dir / "agent.log").write_text(agent_output, encoding="utf-8")
@@ -205,14 +232,24 @@ def one_trial(binary: Path, model: str, case: Case, trial_dir: Path) -> dict[str
         return outcome
     finally:
         try:
-            if outcome is not None:
-                (trial_dir / "trial-result.json").write_text(
-                    json.dumps(outcome, indent=2) + "\n", encoding="utf-8"
-                )
-            if verifier_output:
-                (trial_dir / "verifier.log").write_text(verifier_output, encoding="utf-8")
+            try:
+                diagnostic = run(["podman", "exec", container, "python3", "-c", CORE_RECORD_EXPORT, "/tmp/bone-data/bone.sqlite3"], check=False)
+                diagnostic_file = "core-records.json" if diagnostic.returncode == 0 else "core-records-error.log"
+                (trial_dir / diagnostic_file).write_text(diagnostic.stdout, encoding="utf-8")
+            except (OSError, subprocess.SubprocessError) as error:
+                (trial_dir / "core-records-error.log").write_text(str(error), encoding="utf-8")
         finally:
-            run(["podman", "rm", "--force", container], check=False)
+            # Persist outcomes even when diagnostic capture fails; cleanup must
+            # never discard the only evidence of the actual task result.
+            try:
+                if outcome is not None:
+                    (trial_dir / "trial-result.json").write_text(
+                        json.dumps(outcome, indent=2) + "\n", encoding="utf-8"
+                    )
+                if verifier_output:
+                    (trial_dir / "verifier.log").write_text(verifier_output, encoding="utf-8")
+            finally:
+                run(["podman", "rm", "--force", container], check=False)
 
 
 def parse_args() -> argparse.Namespace:

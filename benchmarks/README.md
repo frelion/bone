@@ -1,5 +1,7 @@
 # BONE real-world evaluation system
 
+For local architecture checks using Podman and an existing ChatGPT subscription login, use `python3 -m benchmarks.architecture` (Python 3.11+), documented below. The Harbor/API-key prerequisites in the next sections apply to that separate runner, not to the local architecture checks.
+
 This directory measures whether BONE can complete real software-engineering work in isolated project containers. Terminal-Bench 2 is the primary public benchmark. Each task is scored by its independent verifier, so BONE's own claim that it finished is never treated as success.
 
 ## What is pinned
@@ -144,6 +146,15 @@ python3 -m benchmarks.behavior \
   --baseline-binary target/linux-baseline/release/bone
 ```
 
+The headless Job contract can additionally enforce descendant and depth ceilings
+with `--job-budget` and `--job-depth`. For architecture trials, opt in with
+`python3 -m benchmarks.architecture --binary <candidate> --enforce-job-contract`.
+The metadata distinguishes kernel-enforced trials from the default prompt-only
+trials; compare prompt-only baseline/candidate runs separately from contract tests.
+Use Python 3.11+ explicitly if the system `python3` points to an older interpreter.
+To reuse a particular running Podman VM without changing the global default,
+set `CONTAINER_CONNECTION` for the runner process.
+
 Candidate cases run three times by default; baseline cases run once. Prompts,
 native results, trajectories, verifier logs, and the aggregate `summary.json`
 are written below `benchmarks/results/behavior/`. Credentials are mounted from
@@ -192,6 +203,12 @@ to repeat one condition. Trials run sequentially to avoid cross-trial model load
 `--case independent-auto` selects an exact condition; `--timeout-seconds` defaults
 to 120 for these small tasks. Each completed trial saves `trial-result.json`
 before container cleanup, so an interrupted cleanup cannot lose its result.
+Before cleanup the runner also reads the trial's SQLite Core chunks in read-only
+mode and saves only Core records to `core-records.json`, or an explicit
+`core-records-error.log` if capture fails. It does not export profiles or the auth
+cache. Records can contain fixture contents and model notes, so keep raw trial
+artifacts local and review them before sharing. These private records supplement,
+but do not change, the public-history efficiency metrics below.
 
 `summary.json` separates task success from compliance with the requested Job
 structure. Profiles report child model-call overlap and parent model-call count.
@@ -204,3 +221,6 @@ or the usefulness of delegation on larger tasks.
 
 The initial investigation, failed optimization experiments, and architecture
 recommendations are recorded in [the study](../docs/job-efficiency-study.md).
+The implemented protocol is described in [Job control](../docs/job-control-protocol.md).
+The retained and rejected candidates, bounded acceptance results, and limits are
+recorded in [the validation report](../docs/job-control-validation.md).

@@ -35,6 +35,7 @@ pub struct Assignment {
     pub inputs: Vec<InputId>,
     pub evidence: Vec<Seq>,
     pub seed: Option<JobId>,
+    pub delegation: DelegationLimits,
 }
 
 impl Assignment {
@@ -44,8 +45,18 @@ impl Assignment {
             inputs: Vec::new(),
             evidence: Vec::new(),
             seed: None,
+            delegation: DelegationLimits::default(),
         }
     }
+}
+
+/// A subtree ceiling, not a reservation. Descendants also consume every
+/// ancestor's remaining budget. Zero/zero is an explicitly non-delegating leaf.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationLimits {
+    pub max_descendants: usize,
+    pub max_depth: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +130,24 @@ pub struct WorkProposal {
     pub step: WorkStep,
 }
 
+/// A rejected proposal has not committed its note, report, answers, or action.
+/// Counts belong to the Job, not a model call; successful proposals reset only
+/// the consecutive count. This is not a retry policy for external effects.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkRejections {
+    pub consecutive: u32,
+    pub total: u32,
+}
+
+impl WorkRejections {
+    pub const CONSECUTIVE_LIMIT: u32 = 3;
+    pub const TOTAL_LIMIT: u32 = 8;
+
+    pub fn exhausted(&self) -> bool {
+        self.consecutive >= Self::CONSECUTIVE_LIMIT || self.total >= Self::TOTAL_LIMIT
+    }
+}
+
 impl WorkProposal {
     pub fn new(step: WorkStep) -> Self {
         Self {
@@ -134,7 +163,7 @@ impl WorkProposal {
 pub enum WorkStep {
     Continue,
     Tool(ToolCall),
-    Delegate(Vec<Assignment>),
+    Delegate(Delegation),
     Wait(Await),
     AskUser(String),
     Inquire {
@@ -158,10 +187,42 @@ pub enum WorkStep {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Delegation {
+    pub assignments: Vec<Assignment>,
+    pub continuation: AfterDelegation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AfterDelegation {
+    Continue,
+    WaitAll,
+}
+
+impl WorkStep {
+    /// Delegate while retaining independent work in the parent.
+    pub fn delegate(assignments: Vec<Assignment>) -> Self {
+        Self::Delegate(Delegation {
+            assignments,
+            continuation: AfterDelegation::Continue,
+        })
+    }
+
+    /// Atomically create a batch and wait for its results, or an interruption.
+    pub fn delegate_and_wait(assignments: Vec<Assignment>) -> Self {
+        Self::Delegate(Delegation {
+            assignments,
+            continuation: AfterDelegation::WaitAll,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Await {
     Tool(CallId),
     After(Duration),
     Job(JobId),
+    Jobs(Vec<JobId>),
     Result { job: JobId, after: Seq },
 }
 
@@ -218,6 +279,7 @@ pub enum JobStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WaitView {
     Tool(CallId),
+    Jobs(Vec<JobId>),
     Until(MonoTimeView),
     User {
         question: Seq,
@@ -274,6 +336,8 @@ pub(crate) struct Job {
     pub active_call: Option<CallId>,
     pub context: JobContext,
     pub report: Option<Seq>,
+    pub work_rejections: WorkRejections,
+    pub delegation: DelegationLimits,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -286,6 +350,7 @@ pub(crate) enum JobState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum WaitState {
     Tool(CallId),
+    Jobs(Vec<JobId>),
     Until(MonoTime),
     User {
         question: Seq,
@@ -324,6 +389,7 @@ impl WaitState {
     pub fn view(&self) -> WaitView {
         match self {
             Self::Tool(call) => WaitView::Tool(*call),
+            Self::Jobs(jobs) => WaitView::Jobs(jobs.clone()),
             Self::Until(time) => WaitView::Until((*time).into()),
             Self::User { question } => WaitView::User {
                 question: *question,

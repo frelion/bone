@@ -43,6 +43,8 @@ OPTIONS:\n\
     --trajectory PATH         Write the complete durable event history as JSON\n\
     --result PATH             Also write the final JSON result to PATH\n\
     --read-only               Disable workspace-writing tools\n\
+    --job-budget N            Lifetime descendant limit per root (0 forbids delegation)\n\
+    --job-depth N             Maximum Job tree depth including root (1 forbids children)\n\
 \n\
 MODEL OPTIONS:\n\
     --model ID                Configure a model for this workspace\n\
@@ -122,6 +124,8 @@ struct Options {
     trajectory: Option<PathBuf>,
     result: Option<PathBuf>,
     read_only: bool,
+    job_budget: Option<usize>,
+    job_depth: Option<usize>,
     model: Option<String>,
     provider: Provider,
     base_url: Option<String>,
@@ -241,6 +245,29 @@ async fn execute(options: Options) -> Result<u8, String> {
     )
     .await
     .map_err(|error| format!("could not configure workspace tools: {error}"))?;
+
+    if options.job_budget.is_some() || options.job_depth.is_some() {
+        let resolved = app
+            .resolved_workspace_config(workspace.id)
+            .await
+            .map_err(|error| format!("could not resolve workspace config: {error}"))?;
+        let config = resolved
+            .desired
+            .map_err(|error| format!("invalid workspace config: {error:?}"))?;
+        let mut limits = config.limits;
+        if let Some(budget) = options.job_budget {
+            limits.job_budget = budget;
+        }
+        if let Some(depth) = options.job_depth {
+            limits.job_depth = depth;
+        }
+        app.update_config(
+            ConfigScope::Workspace(workspace.id),
+            ConfigChange::Limits(Some(limits)),
+        )
+        .await
+        .map_err(|error| format!("could not configure Job limits: {error}"))?;
+    }
 
     let session = app
         .create_session(workspace.id, options.title.clone())
@@ -527,6 +554,8 @@ fn parse(args: &[OsString]) -> Result<ParseResult, String> {
     let mut trajectory = None;
     let mut result = None;
     let mut read_only = false;
+    let mut job_budget = None;
+    let mut job_depth = None;
     let mut model = None;
     let mut provider = Provider::OpenAiResponses;
     let mut base_url = None;
@@ -555,6 +584,22 @@ fn parse(args: &[OsString]) -> Result<ParseResult, String> {
             "--prompt" => prompt = Some(value.to_owned()),
             "--prompt-file" => prompt_file = Some(value.to_owned()),
             "--title" => title = value.to_owned(),
+            "--job-budget" => {
+                job_budget = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "--job-budget must be a nonnegative integer")?,
+                )
+            }
+            "--job-depth" => {
+                let depth = value
+                    .parse::<usize>()
+                    .map_err(|_| "--job-depth must be a positive integer")?;
+                if depth == 0 {
+                    return Err("--job-depth must be greater than zero".into());
+                }
+                job_depth = Some(depth);
+            }
             "--timeout-seconds" => {
                 let seconds = value
                     .parse::<u64>()
@@ -602,6 +647,8 @@ fn parse(args: &[OsString]) -> Result<ParseResult, String> {
         trajectory,
         result,
         read_only,
+        job_budget,
+        job_depth,
         model,
         provider,
         base_url,
@@ -665,6 +712,25 @@ mod tests {
         assert_eq!(options.provider, Provider::OpenAiChat);
         assert_eq!(options.timeout, Duration::from_secs(60));
         assert!(!options.read_only);
+    }
+
+    #[test]
+    fn parses_explicit_job_limits_and_rejects_invalid_bounds() {
+        let args =
+            ["--prompt", "do it", "--job-budget", "0", "--job-depth", "1"].map(OsString::from);
+        let ParseResult::Run(options) = parse(&args).unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(options.job_budget, Some(0));
+        assert_eq!(options.job_depth, Some(1));
+        for (flag, value) in [
+            ("--job-budget", "-1"),
+            ("--job-depth", "0"),
+            ("--job-depth", "no"),
+        ] {
+            let args = ["--prompt", "do it", flag, value].map(OsString::from);
+            assert!(parse(&args).is_err());
+        }
     }
 
     #[test]
