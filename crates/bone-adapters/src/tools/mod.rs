@@ -20,6 +20,7 @@ mod error;
 mod glob;
 mod grep;
 mod patch;
+pub mod presentation;
 mod read;
 mod search_walk;
 mod tool;

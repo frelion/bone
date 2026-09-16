@@ -37,7 +37,7 @@ pub struct ReadOutput {
     pub line_truncated: bool,
 }
 
-/// Read a UTF-8 text file with line numbers and bounded output.
+/// Read a UTF-8 text file with original line endings and bounded output.
 #[derive(Clone, Debug)]
 pub struct ReadTool {
     environment: ToolEnvironment,
@@ -58,7 +58,7 @@ impl Tool for ReadTool {
         ToolDefinition::new(
             "read",
             format!(
-                "Read a UTF-8 text file inside workspace `{}` with line numbers. Relative paths use that workspace root. Files are limited to {} bytes and output to {} lines or {} bytes; use offset and limit to continue. A truncated long-line tail is omitted.",
+                "Read a UTF-8 text file inside workspace `{}` as original text with separate start_line/end_line metadata. Relative paths use that workspace root. Files are limited to {} bytes and output to {} lines or {} bytes; use offset and limit to continue. A truncated long-line tail is omitted.",
                 self.environment.workspace_root().display(),
                 self.environment.limits.max_read_file_bytes,
                 self.environment.limits.max_read_lines,
@@ -152,56 +152,15 @@ impl Tool for ReadTool {
             line_number += 1;
         }
 
-        let mut rendered = Vec::new();
-        let mut output_bytes = 0usize;
+        let mut content = String::new();
+        let mut returned_lines = 0usize;
         let mut next_offset = None;
         let mut line_truncated = false;
         let mut last_rendered_line = None;
 
-        while rendered.len() < limit {
-            let next_line_number = line_number + 1;
-            let prefix = format!("{next_line_number:>6}\t");
-            let separator_bytes = usize::from(!rendered.is_empty());
-            if output_bytes + separator_bytes + prefix.len()
-                > self.environment.limits.max_output_bytes
-            {
-                return Err(ToolError::InvalidArgs(format!(
-                    "max_output_bytes ({}) is too small to render the line-number prefix for line {next_line_number}",
-                    self.environment.limits.max_output_bytes
-                )));
-            }
-            let available = self
-                .environment
-                .limits
-                .max_output_bytes
-                .saturating_sub(output_bytes + separator_bytes + prefix.len());
-            let Some(line) = read_line_capped(
-                &mut reader,
-                available.saturating_add(2),
-                &mut scan_remaining,
-            )
-            .await
-            .map_err(|error| ToolError::io_display("read file", &resolved.display, error))?
-            else {
-                if rendered.is_empty() && offset > 1 {
-                    return Err(ToolError::InvalidArgs(format!(
-                        "offset {offset} is beyond the end of {}",
-                        resolved.display
-                    )));
-                }
-                break;
-            };
-            line_number = next_line_number;
-            let bytes = strip_line_terminator(&line.bytes);
-            let text = decode_utf8_prefix(bytes, line.capped).map_err(|error| {
-                ToolError::io_display("decode UTF-8 file", &resolved.display, error)
-            })?;
-
-            if line.capped || text.len() > available {
-                let partial = utf8_prefix(text, available);
-                rendered.push(format!("{prefix}{partial}"));
-                last_rendered_line = Some(line_number);
-                line_truncated = true;
+        while returned_lines < limit {
+            let available = self.environment.limits.max_output_bytes - content.len();
+            if available == 0 {
                 if !reader
                     .fill_buf()
                     .await
@@ -212,14 +171,33 @@ impl Tool for ReadTool {
                 }
                 break;
             }
-
-            rendered.push(format!("{prefix}{text}"));
-            output_bytes += separator_bytes + prefix.len() + text.len();
+            let Some(line) = read_line_capped(&mut reader, available, &mut scan_remaining)
+                .await
+                .map_err(|error| ToolError::io_display("read file", &resolved.display, error))?
+            else {
+                if returned_lines == 0 && offset > 1 {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "offset {offset} is beyond the end of {}",
+                        resolved.display
+                    )));
+                }
+                break;
+            };
+            line_number += 1;
+            returned_lines += 1;
+            let text = decode_utf8_prefix(&line.bytes, line.capped).map_err(|error| {
+                ToolError::io_display("decode UTF-8 file", &resolved.display, error)
+            })?;
+            content.push_str(text);
             last_rendered_line = Some(line_number);
+            line_truncated = line.capped;
+            if line.capped {
+                break;
+            }
         }
 
         if next_offset.is_none()
-            && rendered.len() == limit
+            && (returned_lines == limit || line_truncated)
             && !reader
                 .fill_buf()
                 .await
@@ -233,7 +211,7 @@ impl Tool for ReadTool {
             path: resolved.display,
             start_line: offset,
             end_line: last_rendered_line,
-            content: rendered.join("\n"),
+            content,
             truncated: next_offset.is_some() || line_truncated,
             next_offset,
             line_truncated,
@@ -325,16 +303,6 @@ fn validate_utf8_chunk(tail: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-fn strip_line_terminator(mut bytes: &[u8]) -> &[u8] {
-    if bytes.ends_with(b"\n") {
-        bytes = &bytes[..bytes.len() - 1];
-    }
-    if bytes.ends_with(b"\r") {
-        bytes = &bytes[..bytes.len() - 1];
-    }
-    bytes
-}
-
 fn decode_utf8_prefix(bytes: &[u8], capped: bool) -> io::Result<&str> {
     match std::str::from_utf8(bytes) {
         Ok(text) => Ok(text),
@@ -346,12 +314,54 @@ fn decode_utf8_prefix(bytes: &[u8], capped: bool) -> io::Result<&str> {
     }
 }
 
-fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
-    let mut end = max_bytes.min(value.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
+use super::presentation::{self, TextSection, ToolSummary};
+
+pub(super) fn summary(
+    args: &serde_json::Value,
+    output: Option<&serde_json::Value>,
+) -> Option<ToolSummary> {
+    let subject = presentation::short(args["path"].as_str()?);
+    let result = match output {
+        Some(output) => {
+            let start = output["start_line"].as_u64()?;
+            let text = match output.get("end_line")?.as_u64() {
+                Some(end) => format!("lines {start}–{end}"),
+                None if output["end_line"].is_null() && output["content"].as_str()?.is_empty() => {
+                    "empty file".to_owned()
+                }
+                None => return None,
+            };
+            Some(presentation::result(text, output))
+        }
+        None => args["offset"]
+            .as_u64()
+            .map(|start| format!("from line {start}")),
+    };
+    Some(ToolSummary { subject, result })
+}
+
+pub(super) fn details(
+    _args: &serde_json::Value,
+    output: &serde_json::Value,
+) -> Option<Vec<TextSection>> {
+    let mut sections = vec![TextSection {
+        heading: Some(output["path"].as_str()?.to_owned()),
+        text: output["content"].as_str()?.to_owned(),
+        first_line: Some(usize::try_from(output["start_line"].as_u64()?).ok()?),
+    }];
+    if output["line_truncated"].as_bool() == Some(true) {
+        sections.push(presentation::section(
+            "Notice",
+            "The remainder of the last returned line was omitted.",
+        ));
     }
-    &value[..end]
+    if let Some(next) = output["next_offset"].as_u64() {
+        sections.push(presentation::section(
+            "Continue",
+            format!("Read from line {next}"),
+        ));
+    }
+    Some(presentation::with_notices(sections, output))
 }
 
 #[cfg(test)]
@@ -361,7 +371,30 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn reads_numbered_pages_and_reports_continuation() {
+    async fn preserves_original_line_endings_and_final_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = "你好\r\n\r\nlast\tline";
+        tokio::fs::write(temp.path().join("raw.txt"), original)
+            .await
+            .unwrap();
+        let output = ToolEnvironment::new(temp.path())
+            .unwrap()
+            .read()
+            .call(ReadArgs {
+                path: "raw.txt".into(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.content, original);
+        assert_eq!(output.start_line, 1);
+        assert_eq!(output.end_line, Some(3));
+        assert!(!output.truncated);
+    }
+
+    #[tokio::test]
+    async fn reads_raw_pages_and_reports_continuation() {
         let temp = tempfile::tempdir().unwrap();
         tokio::fs::write(temp.path().join("sample.txt"), "one\ntwo\nthree\n")
             .await
@@ -377,7 +410,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(output.content, "     2\ttwo");
+        assert_eq!(output.content, "two\n");
         assert_eq!(output.next_offset, Some(3));
         assert!(output.truncated);
     }
@@ -523,7 +556,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn errors_instead_of_returning_a_non_advancing_cursor() {
+    async fn a_one_byte_budget_returns_a_truncated_prefix() {
         let temp = tempfile::tempdir().unwrap();
         tokio::fs::write(temp.path().join("sample.txt"), "one\n")
             .await
@@ -544,7 +577,10 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(result, Err(ToolError::InvalidArgs(_))));
+        let output = result.unwrap();
+        assert_eq!(output.content, "o");
+        assert!(output.line_truncated);
+        assert_eq!(output.next_offset, None);
     }
 
     #[tokio::test]

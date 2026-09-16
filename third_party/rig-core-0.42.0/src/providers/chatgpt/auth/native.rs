@@ -6,8 +6,54 @@ use crate::providers::internal::device_auth::{
 };
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use fs2::FileExt;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::path::PathBuf;
+use std::{
+    fs::{File, OpenOptions},
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+// Acquisition never blocks a runtime or blocking-pool thread. Dropping the
+// future closes the file and releases an acquired lock.
+async fn cache_lock(path: Option<&Path>) -> Result<Option<File>, AuthError> {
+    let Some(path) = path else { return Ok(None) };
+    let lock_path = path.with_extension("lock");
+    crate::providers::internal::device_auth::ensure_parent_dir(&lock_path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if std::fs::symlink_metadata(&lock_path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(AuthError::Message("Unsafe ChatGPT credential lock".into()));
+    }
+    let file = options.open(lock_path)?;
+    let acquire = async {
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Some(file)),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(AuthError::from(error)),
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(35), acquire)
+        .await
+        .map_err(|_| AuthError::Message("Timed out waiting for ChatGPT credential update".into()))?
+}
+
+/// Clear credentials without revoking requests that have already started.
+pub async fn clear_cache(path: &Path) -> Result<(), AuthError> {
+    let _lock = cache_lock(Some(path)).await?;
+    remove_json_record(Some(path))
+}
 
 const CHATGPT_AUTH_BASE: &str = "https://auth.openai.com";
 const CHATGPT_DEVICE_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -24,6 +70,8 @@ pub(super) struct PlatformAuthenticator {
     auth_file: Option<PathBuf>,
     device_code_handler: DeviceCodeHandler,
     allow_device_flow: bool,
+    #[cfg(test)]
+    refresh_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -77,16 +125,17 @@ impl PlatformAuthenticator {
             auth_file,
             device_code_handler,
             allow_device_flow,
+            #[cfg(test)]
+            refresh_url: CHATGPT_OAUTH_TOKEN_URL.to_owned(),
         }
     }
 
     pub(super) async fn auth_context_oauth(&self) -> Result<AuthContext, AuthError> {
+        let lock = cache_lock(self.auth_file.as_deref()).await?;
         let mut record: AuthRecord = match read_json_record(self.auth_file.as_deref()) {
             Ok(record) => record,
-            // A partial previous write must not permanently brick explicit
-            // connection. Only an interactive authenticator may discard it;
-            // request-time authenticators remain non-interactive and require a
-            // deliberate reconnect.
+            // Discard unusable authorization under the transaction lock.
+            // Only explicit login may start device authorization afterward.
             Err(AuthError::Json(_)) => {
                 remove_json_record(self.auth_file.as_deref())?;
                 if self.allow_device_flow {
@@ -139,7 +188,10 @@ impl PlatformAuthenticator {
             ));
         }
 
+        // Waiting for a person to authorize must never own the cache lock.
+        drop(lock);
         let fresh = self.login_device_flow().await?;
+        let _lock = cache_lock(self.auth_file.as_deref()).await?;
         write_json_record(self.auth_file.as_deref(), &fresh)?;
         Ok(AuthContext {
             access_token: fresh.access_token.unwrap_or_default(),
@@ -151,6 +203,7 @@ impl PlatformAuthenticator {
         &self,
         rejected_access_token: &str,
     ) -> Result<AuthContext, AuthError> {
+        let _lock = cache_lock(self.auth_file.as_deref()).await?;
         let record: AuthRecord = match read_json_record(self.auth_file.as_deref()) {
             Ok(record) => record,
             Err(AuthError::Json(_)) => {
@@ -196,10 +249,11 @@ impl PlatformAuthenticator {
         }
     }
 
-    pub(super) fn invalidate_after_rejection_oauth(
+    pub(super) async fn invalidate_after_rejection_oauth(
         &self,
         rejected_access_token: &str,
     ) -> Result<(), AuthError> {
+        let _lock = cache_lock(self.auth_file.as_deref()).await?;
         let record: AuthRecord = match read_json_record(self.auth_file.as_deref()) {
             Ok(record) => record,
             Err(AuthError::Json(_)) => {
@@ -313,8 +367,12 @@ impl PlatformAuthenticator {
             .extend_pairs(form)
             .finish();
 
+        #[cfg(test)]
+        let token_url = &self.refresh_url;
+        #[cfg(not(test))]
+        let token_url = CHATGPT_OAUTH_TOKEN_URL;
         let response = client
-            .post(CHATGPT_OAUTH_TOKEN_URL)
+            .post(token_url)
             .header(
                 reqwest::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded",
@@ -357,6 +415,7 @@ impl PlatformAuthenticator {
 /// a different authority.
 fn no_redirect_client() -> Result<reqwest::Client, AuthError> {
     reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(Into::into)
@@ -573,6 +632,7 @@ mod tests {
         assert!(error.contains("reconnect"), "{error}");
         assert!(!error.contains("sentinel-secret"), "{error}");
         assert!(!path.exists(), "corrupt cache must be invalidated");
+        std::fs::remove_file(directory.join("auth.lock")).expect("remove lock fixture");
         std::fs::remove_dir(directory).expect("clean temporary directory");
     }
 
@@ -603,6 +663,7 @@ mod tests {
 
         assert_eq!(context.access_token, newer);
         std::fs::remove_file(path).expect("remove credential fixture");
+        std::fs::remove_file(directory.join("auth.lock")).expect("remove lock fixture");
         std::fs::remove_dir(directory).expect("clean temporary directory");
     }
 
@@ -634,11 +695,12 @@ mod tests {
 
         assert!(error.contains("reconnect"), "{error}");
         assert!(!path.exists(), "rejected cache must be invalidated");
+        std::fs::remove_file(directory.join("auth.lock")).expect("remove lock fixture");
         std::fs::remove_dir(directory).expect("clean temporary directory");
     }
 
-    #[test]
-    fn invalidation_only_removes_the_rejected_token_generation() {
+    #[tokio::test]
+    async fn invalidation_only_removes_the_rejected_token_generation() {
         let directory = std::env::temp_dir().join(format!(
             "rig-chatgpt-invalidate-generation-{}-{}",
             std::process::id(),
@@ -658,16 +720,190 @@ mod tests {
         let auth =
             PlatformAuthenticator::new(Some(path.clone()), DeviceCodeHandler::default(), false);
         auth.invalidate_after_rejection_oauth("stale-token")
+            .await
             .expect("a stale rejection must not remove newer credentials");
         assert!(path.exists(), "newer credential generation must survive");
 
         auth.invalidate_after_rejection_oauth(&current)
+            .await
             .expect("the currently rejected generation should be invalidated");
         assert!(
             !path.exists(),
             "rejected credential generation must be removed"
         );
+        std::fs::remove_file(directory.join("auth.lock")).expect("remove lock fixture");
         std::fs::remove_dir(directory).expect("clean temporary directory");
+    }
+
+    #[tokio::test]
+    async fn cancelled_lock_wait_releases_its_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let held = super::cache_lock(Some(&path)).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(40),
+                super::cache_lock(Some(&path))
+            )
+            .await
+            .is_err()
+        );
+        drop(held);
+        let reacquired = tokio::time::timeout(
+            std::time::Duration::from_millis(40),
+            super::cache_lock(Some(&path)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(reacquired);
+    }
+
+    #[tokio::test]
+    async fn logout_waits_for_the_transaction_and_old_clients_cannot_restore_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let token = unexpired_access_token("before-logout");
+        let record = super::AuthRecord {
+            access_token: Some(token.clone()),
+            refresh_token: Some("refresh-fixture".into()),
+            expires_at: super::extract_expiration_timestamp(&token),
+            ..Default::default()
+        };
+        super::write_json_record(Some(&path), &record).unwrap();
+        let client =
+            PlatformAuthenticator::new(Some(path.clone()), DeviceCodeHandler::default(), false);
+        assert_eq!(
+            client.auth_context_oauth().await.unwrap().access_token,
+            token
+        );
+        let transaction = super::cache_lock(Some(&path)).await.unwrap();
+        let mut logout = Box::pin(super::clear_cache(&path));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(40), &mut logout)
+                .await
+                .is_err()
+        );
+        assert!(path.exists());
+        drop(transaction);
+        logout.await.unwrap();
+        assert!(!path.exists());
+        assert!(client.refresh_after_rejection_oauth(&token).await.is_err());
+        assert!(!path.exists());
+    }
+
+    // Invoked in separate OS processes by the contention test below.
+    #[tokio::test]
+    async fn oauth_transaction_child() {
+        let Ok(path) = std::env::var("BONE_RIG_AUTH_CHILD") else {
+            return;
+        };
+        let mut auth =
+            PlatformAuthenticator::new(Some(path.into()), DeviceCodeHandler::default(), false);
+        auth.refresh_url = std::env::var("BONE_RIG_AUTH_TOKEN_URL").unwrap();
+        let context = auth.refresh_after_rejection_oauth("expired").await.unwrap();
+        assert_eq!(
+            super::decode_jwt_claims(&context.access_token)["marker"],
+            "newer"
+        );
+    }
+
+    #[test]
+    fn separate_processes_refresh_one_generation_once() {
+        use std::{
+            io::{Read, Write},
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let record = super::AuthRecord {
+            access_token: Some("expired".into()),
+            refresh_token: Some("refresh-fixture".into()),
+            expires_at: Some(1),
+            ..Default::default()
+        };
+        super::write_json_record(Some(&path), &record).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            let mut requests = 0;
+            while !server_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 2048];
+                loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                requests += 1;
+                // Keep the refresh transaction open while the other process contends.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let body = serde_json::json!({
+                    "access_token": unexpired_access_token("newer"),
+                    "refresh_token": "rotated-refresh-fixture"
+                })
+                .to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+            requests
+        });
+        let spawn = || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "providers::chatgpt::auth::native::tests::oauth_transaction_child",
+                    "--nocapture",
+                ])
+                .env("BONE_RIG_AUTH_CHILD", &path)
+                .env("BONE_RIG_AUTH_TOKEN_URL", &url)
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn();
+        let mut second = spawn();
+        let first_status = first.wait().unwrap();
+        let second_status = second.wait().unwrap();
+        stop.store(true, Ordering::Release);
+        let requests = server.join().unwrap();
+        assert!(first_status.success());
+        assert!(second_status.success());
+        assert_eq!(requests, 1);
+        let updated: super::AuthRecord = super::read_json_record(Some(&path)).unwrap();
+        assert_eq!(
+            updated.refresh_token.as_deref(),
+            Some("rotated-refresh-fixture")
+        );
     }
 
     #[test]

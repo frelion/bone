@@ -18,9 +18,9 @@ mod tests;
 
 pub use config::{AgentLimits, AgentLimitsError};
 pub use context::{
-    BackgroundEntry, Checkpoint, CheckpointDraft, CompactInput, CompactScope, CoordinateInput,
+    BackgroundEntry, Checkpoint, CheckpointDraft, CompactInput, CompactScope, ConversationInput,
     DeliveryKind, DeliveryTarget, InquiryResult, JobCard, Origin, Record, RecordBody, RecordRange,
-    RecordView, SessionCheckpoint, SessionContext, WorkInput, WorkerRole,
+    RecordView, SessionCheckpoint, SessionContext, WorkInput,
 };
 pub use durable::*;
 pub use job::*;

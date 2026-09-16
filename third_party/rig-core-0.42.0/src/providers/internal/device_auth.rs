@@ -5,7 +5,6 @@
 use super::auth::AuthError;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-#[cfg(unix)]
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -63,10 +62,8 @@ pub(crate) fn read_json_record<T: Default + DeserializeOwned>(
 
 /// Writes a JSON record to `path`, a no-op when no path is configured.
 ///
-/// Native Unix writes are crash-safe: the complete record is synced to a
-/// private sibling file and atomically renamed over the destination before the
-/// directory entry is synced. Other native platforms retain the previous
-/// replace behavior until they have an equivalent portable replacement API.
+/// Writes a private sibling file and atomically replaces the destination.
+/// Unix also syncs the directory entry after replacement.
 pub(crate) fn write_json_record<T: Serialize>(
     path: Option<&Path>,
     record: &T,
@@ -78,16 +75,16 @@ pub(crate) fn write_json_record<T: Serialize>(
     ensure_parent_dir(path)?;
     let bytes = serde_json::to_vec_pretty(record)?;
 
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| AuthError::from(error.error))?;
     #[cfg(unix)]
-    {
-        atomic_write_unix(path, &bytes)
-    }
-
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)?;
-        Ok(())
-    }
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Removes a cached JSON record. A missing path or file is already the desired
@@ -102,65 +99,6 @@ pub(crate) fn remove_json_record(path: Option<&Path>) -> Result<(), AuthError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
-}
-
-#[cfg(unix)]
-fn atomic_write_unix(path: &Path, bytes: &[u8]) -> Result<(), AuthError> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("auth.json");
-
-    // `create_new` prevents following a pre-existing link. The random suffix
-    // also makes the sibling name impractical to predict between attempts.
-    let mut last_collision = None;
-    for _ in 0..16 {
-        let temporary = parent.join(format!(
-            ".{file_name}.{}.{}.tmp",
-            std::process::id(),
-            fastrand::u64(..)
-        ));
-        let opened = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary);
-        let mut file = match opened {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                last_collision = Some(error);
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-
-        let result = (|| -> Result<(), AuthError> {
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&temporary, path)?;
-            std::fs::File::open(parent)?.sync_all()?;
-            Ok(())
-        })();
-
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        return result;
-    }
-
-    Err(last_collision
-        .unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "temporary credential file collision",
-            )
-        })
-        .into())
 }
 
 #[cfg(all(test, unix))]

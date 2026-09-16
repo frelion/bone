@@ -31,10 +31,6 @@ pub enum Error {
     ConfigFile(String),
     #[error("configuration file changed outside BONE: {0}")]
     ConfigConflict(std::path::PathBuf),
-    #[error("project configuration is not trusted: {0}")]
-    ProjectConfigUntrusted(std::path::PathBuf),
-    #[error("profile {0} is still in use")]
-    ProfileBusy(ProfileId),
     #[error(
         "credentials for profile {profile} were saved, but running sessions did not reload: {message}"
     )]
@@ -59,9 +55,6 @@ impl From<crate::storage::StoreError> for Error {
             }
             crate::storage::StoreError::ConfigFile { message } => Self::ConfigFile(message),
             crate::storage::StoreError::ConfigConflict { path } => Self::ConfigConflict(path),
-            crate::storage::StoreError::ProjectConfigUntrusted { path } => {
-                Self::ProjectConfigUntrusted(path)
-            }
             error => Self::Storage(error.to_string()),
         }
     }

@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, watch};
 
 use crate::{
-    CallRef, DataStore, RuntimeConfig, RuntimeId, SessionId, SessionSeq, ToolMode,
-    UnresolvedWriteView, WorkspaceId,
+    CallRef, DataStore, RuntimeConfig, RuntimeId, SessionId, SessionSeq, UnresolvedWriteView,
+    WorkspaceId,
     storage::{Lease, StoreError},
 };
 
@@ -92,25 +92,23 @@ pub(crate) fn assemble(
     config: &RuntimeConfig,
     context: ToolContext,
 ) -> Result<Vec<Arc<dyn ToolPort>>, bone_adapters::tools::ToolError> {
-    let environment = ToolEnvironment::with_limits(&config.workspace, config.tools.limits.clone())?;
+    let environment = ToolEnvironment::with_limits(&config.workspace, config.tools.clone())?;
     let mut tools = read_only_tools(&environment);
     tools.push(Arc::new(SessionHistory {
         store: context.store.clone(),
         session: context.session,
         tool_output_bytes: config.limits.tool_output_bytes,
     }));
-    if config.tools.mode == ToolMode::WorkspaceWrite {
-        tools.push(Arc::new(WriteTool::new(
-            environment.apply_patch(),
-            context.clone(),
-            |_| ExternalEffect::Applied,
-        )));
-        tools.push(Arc::new(WriteTool::new(
-            environment.bash(),
-            context,
-            bash_effect,
-        )));
-    }
+    tools.push(Arc::new(WriteTool::new(
+        environment.apply_patch(),
+        context.clone(),
+        |_| ExternalEffect::Applied,
+    )));
+    tools.push(Arc::new(WriteTool::new(
+        environment.bash(),
+        context,
+        bash_effect,
+    )));
     Ok(tools)
 }
 
@@ -351,6 +349,70 @@ fn bash_effect(output: &BashOutput) -> ExternalEffect {
     } else {
         ExternalEffect::Applied
     }
+}
+
+pub(crate) fn history_summary(
+    arguments: &Value,
+    outcome: Option<&ToolOutcome>,
+) -> crate::ToolSummary {
+    crate::ToolSummary {
+        subject: format!(
+            "History after #{}",
+            arguments.get("after").and_then(Value::as_u64).unwrap_or(0)
+        ),
+        result: outcome
+            .and_then(|outcome| outcome.result.as_ref().ok())
+            .and_then(|value| {
+                value.get("items").and_then(Value::as_array).map(|items| {
+                    format!(
+                        "{} events{}",
+                        items.len(),
+                        if value["omitted"] == true {
+                            " · partial"
+                        } else if value["has_more"] == true {
+                            " · more available"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+            }),
+    }
+}
+
+pub(crate) fn history_details(outcome: &ToolOutcome) -> Option<crate::ToolDetails> {
+    let value = outcome.result.as_ref().ok()?;
+    let items = value.get("items")?.as_array()?;
+    let mut text = String::new();
+    for item in items {
+        let sequence = item.get("sequence")?;
+        let event = item.get("event")?.as_object()?;
+        for (kind, fields) in event {
+            use std::fmt::Write as _;
+            let tool = fields.get("tool").and_then(Value::as_str).unwrap_or("");
+            let _ = writeln!(text, "#{sequence} · {kind} {tool}");
+            if let Some(body) = ["text", "message", "summary"]
+                .iter()
+                .find_map(|key| fields.get(key).and_then(Value::as_str))
+            {
+                let _ = writeln!(text, "{body}");
+            }
+        }
+        text.push('\n');
+    }
+    if value.get("has_more").and_then(Value::as_bool) == Some(true) {
+        text.push_str("More history is available.\n");
+    }
+    if value.get("omitted").and_then(Value::as_bool) == Some(true) {
+        text.push_str("Some events were omitted to fit the output limit.\n");
+    }
+    Some(crate::ToolDetails {
+        sections: vec![crate::TextSection {
+            heading: Some("Session history".into()),
+            text,
+            first_line: None,
+        }],
+    })
 }
 
 #[cfg(test)]

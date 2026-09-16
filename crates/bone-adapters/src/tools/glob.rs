@@ -269,6 +269,48 @@ fn run_glob(
     })
 }
 
+use super::presentation::{self, TextSection, ToolSummary};
+
+pub(super) fn summary(
+    args: &serde_json::Value,
+    output: Option<&serde_json::Value>,
+) -> Option<ToolSummary> {
+    Some(ToolSummary {
+        subject: presentation::short(args["pattern"].as_str()?),
+        result: match output {
+            Some(output) => Some(presentation::result(
+                format!("{} paths", output["paths"].as_array()?.len()),
+                output,
+            )),
+            None => None,
+        },
+    })
+}
+
+pub(super) fn details(
+    args: &serde_json::Value,
+    output: &serde_json::Value,
+) -> Option<Vec<TextSection>> {
+    let paths = output["paths"]
+        .as_array()?
+        .iter()
+        .map(|path| path.as_str())
+        .collect::<Option<Vec<_>>>()?;
+    let mut sections = vec![presentation::section("Pattern", args["pattern"].as_str()?)];
+    if let Some(path) = args["path"].as_str() {
+        sections.push(presentation::section("Search root", path));
+    }
+    sections.push(presentation::section(
+        "Paths",
+        if paths.is_empty() {
+            "No paths found".to_owned()
+        } else {
+            paths.join("\n")
+        },
+    ));
+    Some(presentation::with_notices(sections, output))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

@@ -12,7 +12,7 @@ fn run_help_documents_the_machine_contract() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("--trajectory PATH"));
-    assert!(stdout.contains("--trust-project-config"));
+    assert!(!stdout.contains("--trust-project-config"));
     assert!(!stdout.contains("--api-key-env"));
     assert!(stdout.contains("Exit codes: 0 completed"));
 }
@@ -167,7 +167,7 @@ fn explicit_model_uses_the_user_credential_file_contract() {
 }
 
 #[test]
-fn project_config_requires_an_explicit_headless_trust_flag() {
+fn project_config_is_loaded_without_a_trust_flag() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace = temporary.path().join("workspace");
     std::fs::create_dir_all(workspace.join(".bone")).unwrap();
@@ -179,7 +179,7 @@ fn project_config_requires_an_explicit_headless_trust_flag() {
     let data = temporary.path().join("data");
     let home = temporary.path().join("home");
 
-    let rejected = Command::new(env!("CARGO_BIN_EXE_bone"))
+    let result = Command::new(env!("CARGO_BIN_EXE_bone"))
         .arg("run")
         .arg("--workspace")
         .arg(&workspace)
@@ -189,32 +189,9 @@ fn project_config_requires_an_explicit_headless_trust_flag() {
         .env("BONE_HOME", &home)
         .output()
         .unwrap();
-    assert_eq!(rejected.status.code(), Some(1));
+    assert_eq!(result.status.code(), Some(3));
     assert!(
-        String::from_utf8(rejected.stderr)
-            .unwrap()
-            .contains("--trust-project-config")
-    );
-
-    let trusted = Command::new(env!("CARGO_BIN_EXE_bone"))
-        .arg("run")
-        .arg("--workspace")
-        .arg(&workspace)
-        .arg("--data-dir")
-        .arg(&data)
-        .args([
-            "--prompt",
-            "inspect",
-            "--timeout-seconds",
-            "1",
-            "--trust-project-config",
-        ])
-        .env("BONE_HOME", &home)
-        .output()
-        .unwrap();
-    assert_eq!(trusted.status.code(), Some(3));
-    assert!(
-        !String::from_utf8(trusted.stderr)
+        !String::from_utf8(result.stderr)
             .unwrap()
             .contains("not trusted")
     );

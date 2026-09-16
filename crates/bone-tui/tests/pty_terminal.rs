@@ -14,6 +14,56 @@ use std::{
 };
 
 #[test]
+fn closing_the_terminal_during_initialization_or_input_exits() {
+    for initialized in [false, true] {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut process = PtyBone::spawn(
+            &temporary.path().join("data"),
+            temporary.path(),
+            Duration::from_secs(5),
+        );
+        if initialized {
+            process.enable_keyboard_protocol();
+            process.wait_for_bytes(b"Select model");
+        } else {
+            // Close during the synchronous query, before the reader is spawned.
+            process.wait_for_bytes(b"\x1b[?u");
+        }
+        process.disconnect_terminal();
+        // A disconnected terminal may report an I/O error; the contract is exit.
+        process.wait_for_exit();
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn draft_failure_or_timeout_never_reopens_the_ui_after_quit() {
+    for fault in ["fail", "pending"] {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut process = PtyBone::spawn_with_faults(
+            &temporary.path().join("data"),
+            temporary.path(),
+            Duration::from_secs(8),
+            None,
+            Some(fault),
+        );
+        process.enable_keyboard_protocol();
+        process.write(&[0x04]);
+        process.wait_for_bytes(b"\x1b[?1049l");
+        if fault == "pending" {
+            assert!(
+                process.child.0.try_wait().unwrap().is_none(),
+                "terminal returns to the shell before the draft deadline"
+            );
+        }
+        assert!(!process.wait_for_exit().success());
+        let output = process.finish_capture();
+        assert_terminal_protocol_restored(&output);
+        assert!(!terminal_visible_text(&output).contains("session is still open"));
+    }
+}
+
+#[test]
 fn real_binary_restores_every_terminal_mode_after_visible_quit_flow() {
     let temporary = tempfile::tempdir().expect("temporary workspace");
     let workspace = temporary.path().join("workspace");
@@ -321,8 +371,13 @@ fn assert_terminal_protocol_restored(output: &[u8]) {
 }
 
 fn assert_no_decorative_terminal_mutations(output: &[u8]) {
+    assert!(
+        output
+            .utf8_chunks()
+            .all(|chunk| { !chunk.valid().contains('\u{9d}') && !chunk.invalid().contains(&0x9d) }),
+        "BONE must not emit a C1 OSC control"
+    );
     for sequence in [
-        b"\x9d".as_slice(),
         b"\x1b[0 q".as_slice(),
         b"\x1b[1 q".as_slice(),
         b"\x1b[2 q".as_slice(),
@@ -443,7 +498,7 @@ struct PtyBone {
 
 impl PtyBone {
     fn spawn(data: &std::path::Path, workspace: &std::path::Path, timeout: Duration) -> Self {
-        Self::spawn_with_test_panic(data, workspace, timeout, None)
+        Self::spawn_with_faults(data, workspace, timeout, None, None)
     }
 
     #[cfg(debug_assertions)]
@@ -452,14 +507,15 @@ impl PtyBone {
         workspace: &std::path::Path,
         timeout: Duration,
     ) -> Self {
-        Self::spawn_with_test_panic(data, workspace, timeout, Some(500))
+        Self::spawn_with_faults(data, workspace, timeout, Some(500), None)
     }
 
-    fn spawn_with_test_panic(
+    fn spawn_with_faults(
         data: &std::path::Path,
         workspace: &std::path::Path,
         timeout: Duration,
         panic_after_ms: Option<u64>,
+        exit_draft: Option<&str>,
     ) -> Self {
         let (master, slave) = open_pty(120, 40);
         let inherited_attributes = TerminalAttributes::read(&master);
@@ -479,6 +535,10 @@ impl PtyBone {
         // touching the test runner's native macOS clipboard.
         command.env("SSH_TTY", "bone-pty-test");
         command.env_remove("BONE_TUI_TEST_BACKGROUND_PANIC_AFTER_MS");
+        command.env_remove("BONE_TUI_TEST_EXIT_DRAFT");
+        if let Some(fault) = exit_draft {
+            command.env("BONE_TUI_TEST_EXIT_DRAFT", fault);
+        }
         if let Some(delay) = panic_after_ms {
             command.env("BONE_TUI_TEST_BACKGROUND_PANIC_AFTER_MS", delay.to_string());
         }
@@ -639,6 +699,14 @@ impl PtyBone {
         }
     }
 
+    fn disconnect_terminal(&mut self) {
+        self.stop_reader.store(true, Ordering::Release);
+        if let Some(read_task) = self.read_task.take() {
+            read_task.join().expect("PTY reader");
+        }
+        self.master.take();
+    }
+
     fn finish_capture(&mut self) -> Vec<u8> {
         self.assert_terminal_attributes_restored();
         self.stop_reader.store(true, Ordering::Release);
@@ -717,6 +785,14 @@ fn open_pty(width: u16, height: u16) -> (File, File) {
         "openpty failed: {}",
         std::io::Error::last_os_error()
     );
+    // Neither endpoint may leak into the child except the explicitly installed
+    // stdin/stdout/stderr; an inherited master prevents terminal EOF forever.
+    for descriptor in [master, slave] {
+        assert_ne!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) },
+            -1
+        );
+    }
     unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
 }
 

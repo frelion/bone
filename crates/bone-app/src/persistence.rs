@@ -129,12 +129,6 @@ struct WorkspaceCatalog {
     items: Vec<WorkspaceInfo>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ProjectConfigTrust {
-    root: PathBuf,
-    digest: String,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SavedSession {
     pub info: SessionInfo,
@@ -1031,9 +1025,7 @@ impl DataStore {
             transaction.replace(&document, &catalog, snapshot.revision)?;
             Ok(workspace)
         })?;
-        let trusted = self.project_trust_digest(&workspace)?;
-        self.configs
-            .load_workspace(&workspace, trusted.as_deref())?;
+        self.configs.load_workspace(&workspace)?;
         Ok(workspace)
     }
 
@@ -2129,7 +2121,7 @@ impl DataStore {
                     InputState::Posting { runtime: id }
                         | InputState::Accepted { runtime: id }
                         | InputState::WaitingForUser { runtime: id, .. }
-                        | InputState::RoutingFailed { runtime: id, .. }
+                        | InputState::ConversationFailed { runtime: id, .. }
                         if id == runtime.id
                 )
             })
@@ -3203,29 +3195,7 @@ impl DataStore {
             ConfigScope::User => self.configs.update(scope, change),
             ConfigScope::Workspace(workspace) => {
                 self.ensure_workspace_config_loaded(workspace)?;
-                let update = self.configs.update_workspace(workspace, change)?;
-                let info = self
-                    .workspace_by_id(workspace)?
-                    .ok_or(StoreError::Corrupt {
-                        message: "workspace does not exist",
-                    })?;
-                let trust = ProjectConfigTrust {
-                    root: info.root,
-                    digest: update.digest.clone(),
-                };
-                let document = self
-                    .store
-                    .document::<ProjectConfigTrust>(project_trust_key(workspace));
-                self.store.transaction(|transaction| {
-                    let snapshot = transaction.read(&document)?;
-                    transaction.replace(&document, &trust, snapshot.revision)
-                })?;
-                if !self.configs.mark_trusted(workspace, &update.digest) {
-                    return Err(StoreError::ConfigConflict {
-                        path: self.project_config_status(workspace)?.path,
-                    });
-                }
-                Ok(update.values)
+                self.configs.update_workspace(workspace, change)
             }
             ConfigScope::Session(session) => {
                 let document = self
@@ -3285,8 +3255,7 @@ impl DataStore {
             .ok_or(StoreError::Corrupt {
                 message: "workspace does not exist",
             })?;
-        let trusted = self.project_trust_digest(&info)?;
-        self.configs.load_workspace(&info, trusted.as_deref())
+        self.configs.load_workspace(&info)
     }
 
     pub fn reload_config(
@@ -3298,75 +3267,7 @@ impl DataStore {
             .ok_or(StoreError::Corrupt {
                 message: "workspace does not exist",
             })?;
-        let trusted = self.project_trust_digest(&info)?;
-        self.configs.reload_all(&info, trusted.as_deref())
-    }
-
-    pub fn trust_project_config(&self, workspace: WorkspaceId) -> Result<(), StoreError> {
-        let status = self.project_config_status(workspace)?;
-        let digest = self
-            .configs
-            .project_digest(workspace)
-            .ok_or(StoreError::Corrupt {
-                message: "project has no configuration file",
-            })?;
-        let _lock = self.configs.lock_project(workspace)?;
-        if !self
-            .configs
-            .verify_project_digest_locked(workspace, &digest)?
-        {
-            return Err(StoreError::ConfigConflict { path: status.path });
-        }
-        let info = self
-            .workspace_by_id(workspace)?
-            .ok_or(StoreError::Corrupt {
-                message: "workspace does not exist",
-            })?;
-        let trust = ProjectConfigTrust {
-            root: info.root,
-            digest: digest.clone(),
-        };
-        let document = self
-            .store
-            .document::<ProjectConfigTrust>(project_trust_key(workspace));
-        self.store.transaction(|transaction| {
-            let snapshot = transaction.read(&document)?;
-            transaction.replace(&document, &trust, snapshot.revision)
-        })?;
-        if !self.configs.mark_trusted(workspace, &digest) {
-            return Err(StoreError::ConfigConflict { path: status.path });
-        }
-        Ok(())
-    }
-
-    pub fn revoke_project_config_trust(&self, workspace: WorkspaceId) -> Result<(), StoreError> {
-        let document = self
-            .store
-            .document::<ProjectConfigTrust>(project_trust_key(workspace));
-        self.store.transaction(|transaction| {
-            let snapshot = transaction.read(&document)?;
-            if snapshot.value.is_some() {
-                transaction.delete(&document, snapshot.revision)?;
-            }
-            Ok(())
-        })?;
-        self.configs.mark_untrusted(workspace);
-        Ok(())
-    }
-
-    fn project_trust_digest(
-        &self,
-        workspace: &WorkspaceInfo,
-    ) -> Result<Option<String>, StoreError> {
-        self.store
-            .document::<ProjectConfigTrust>(project_trust_key(workspace.id))
-            .read()
-            .map(|snapshot| {
-                snapshot
-                    .value
-                    .filter(|trust| trust.root == workspace.root)
-                    .map(|trust| trust.digest)
-            })
+        self.configs.reload_all(&info)
     }
 
     fn ensure_workspace_config_loaded(&self, workspace: WorkspaceId) -> Result<(), StoreError> {
@@ -3378,8 +3279,7 @@ impl DataStore {
             .ok_or(StoreError::Corrupt {
                 message: "workspace does not exist",
             })?;
-        let trusted = self.project_trust_digest(&info)?;
-        self.configs.load_workspace(&info, trusted.as_deref())?;
+        self.configs.load_workspace(&info)?;
         Ok(())
     }
 
@@ -3449,7 +3349,13 @@ pub(crate) enum AcceptanceError {
 fn public_agent_event(runtime: RuntimeId, record: &Record) -> Option<SessionEvent> {
     use bone_core::RecordBody;
     match &record.body {
-        RecordBody::JobCreated { job, spec, owner } => Some(SessionEvent::JobCreated {
+        RecordBody::JobCreated {
+            job,
+            spec,
+            owner,
+            allowed_tools,
+        } => Some(SessionEvent::JobCreated {
+            allowed_tools: allowed_tools.clone(),
             job: crate::JobRef { runtime, id: job.0 },
             owner: match owner {
                 bone_core::Owner::User => crate::JobOwner::User,
@@ -3457,7 +3363,6 @@ fn public_agent_event(runtime: RuntimeId, record: &Record) -> Option<SessionEven
                     runtime,
                     id: parent.0,
                 }),
-                bone_core::Owner::Routing(_) => crate::JobOwner::Routing,
             },
             goal: spec.goal.clone(),
             scope: spec.scope.clone(),
@@ -3474,16 +3379,7 @@ fn public_agent_event(runtime: RuntimeId, record: &Record) -> Option<SessionEven
                 id: call.0,
             },
             job: job.map(|job| crate::JobRef { runtime, id: job.0 }),
-            kind: match kind {
-                bone_core::CallKind::Coordinate => crate::ActivityKind::Coordinate,
-                bone_core::CallKind::Work => crate::ActivityKind::Work,
-                bone_core::CallKind::Compact => crate::ActivityKind::Compact,
-                bone_core::CallKind::Tool => crate::ActivityKind::Tool {
-                    name: tool
-                        .as_ref()
-                        .map_or_else(|| "tool".into(), |request| request.name.clone()),
-                },
-            },
+            kind: crate::ActivityKind::from_call(*kind, tool.as_deref()),
         }),
         RecordBody::CallFinished {
             call,
@@ -3497,8 +3393,7 @@ fn public_agent_event(runtime: RuntimeId, record: &Record) -> Option<SessionEven
             error: error.clone(),
             external_effect: *external_effect,
         }),
-        RecordBody::Reply { job, inputs, text } => Some(SessionEvent::Reply {
-            job: crate::JobRef { runtime, id: job.0 },
+        RecordBody::Reply { inputs, text } => Some(SessionEvent::Reply {
             inputs: inputs.iter().map(|id| InputId(id.0)).collect(),
             text: text.clone(),
         }),
@@ -3514,10 +3409,16 @@ fn public_agent_event(runtime: RuntimeId, record: &Record) -> Option<SessionEven
                 text: question.clone(),
             })
         }
-        RecordBody::InputRoutingFailed { inputs, message } => Some(SessionEvent::RoutingFailed {
-            runtime,
-            inputs: inputs.iter().map(|id| InputId(id.0)).collect(),
-            message: message.clone(),
+        RecordBody::ConversationFailed { inputs, message } => {
+            Some(SessionEvent::ConversationFailed {
+                runtime,
+                inputs: inputs.iter().map(|id| InputId(id.0)).collect(),
+                message: message.clone(),
+            })
+        }
+        RecordBody::JobNeedsInput { job, question } => Some(SessionEvent::JobNeedsInput {
+            job: crate::JobRef { runtime, id: job.0 },
+            question: question.clone(),
         }),
         RecordBody::Outcome { job, outcome } => Some(SessionEvent::JobFinished {
             job: crate::JobRef { runtime, id: job.0 },
@@ -3542,6 +3443,7 @@ fn public_agent_event(runtime: RuntimeId, record: &Record) -> Option<SessionEven
             },
             job: crate::JobRef { runtime, id: job.0 },
             tool: request.name.clone(),
+            arguments: request.arguments.clone(),
             outcome: outcome.as_ref().clone(),
         }),
         _ => None,
@@ -3641,32 +3543,39 @@ fn result_summary(
     version: SessionSeq,
     stored: &StoredEvent,
 ) -> Option<StoredResult> {
-    let (event, evidence) = match stored {
-        StoredEvent::App(event) => (event.clone(), Vec::new()),
-        StoredEvent::Agent { runtime, record } => {
-            let evidence = match &record.body {
-                bone_core::RecordBody::Outcome { outcome, .. } => outcome
-                    .completion
-                    .evidence
-                    .iter()
-                    .map(|record| EvidenceRef {
-                        session,
-                        record: record.0,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            (public_agent_event(*runtime, record)?, evidence)
-        }
-    };
-    let SessionEvent::JobFinished {
-        job,
-        outcome,
-        summary,
-        remaining,
-    } = event
-    else {
-        return None;
+    let (job, outcome, summary, remaining, evidence) = match stored {
+        StoredEvent::App(SessionEvent::JobFinished {
+            job,
+            outcome,
+            summary,
+            remaining,
+        }) => (*job, *outcome, summary, remaining, Vec::new()),
+        StoredEvent::Agent {
+            runtime,
+            record:
+                Record {
+                    body: bone_core::RecordBody::Outcome { job, outcome },
+                    ..
+                },
+        } => (
+            crate::JobRef {
+                runtime: *runtime,
+                id: job.0,
+            },
+            outcome.kind,
+            &outcome.completion.summary,
+            &outcome.completion.remaining,
+            outcome
+                .completion
+                .evidence
+                .iter()
+                .map(|record| EvidenceRef {
+                    session,
+                    record: record.0,
+                })
+                .collect(),
+        ),
+        _ => return None,
     };
     Some(StoredResult {
         result: ResultRef {
@@ -3675,8 +3584,8 @@ fn result_summary(
             version,
         },
         outcome,
-        summary,
-        remaining,
+        summary: summary.clone(),
+        remaining: remaining.clone(),
         evidence,
     })
 }
@@ -3905,10 +3814,6 @@ fn session_config_key(session: SessionId) -> DocumentKey {
     DocumentKey::new(NAMESPACE, format!("config/session/{session}"))
 }
 
-fn project_trust_key(workspace: WorkspaceId) -> DocumentKey {
-    DocumentKey::new(NAMESPACE, format!("config/trust/{workspace}"))
-}
-
 fn write_prefix(workspace: WorkspaceId) -> String {
     format!("write/{workspace}/")
 }
@@ -3947,7 +3852,7 @@ mod tests {
     use bone_adapters::tools::BashOutput;
 
     #[test]
-    fn public_history_projects_job_and_call_lifecycle_without_tool_arguments() {
+    fn public_history_preserves_call_arguments_for_presentation() {
         let runtime = RuntimeId::new();
         let job = bone_core::JobId(3);
         let call = bone_core::CallId(7);
@@ -3956,6 +3861,7 @@ mod tests {
             seq: bone_core::Seq(1),
             origin: bone_core::Origin::Kernel,
             body: bone_core::RecordBody::JobCreated {
+                allowed_tools: std::collections::BTreeSet::from(["bash".into()]),
                 job,
                 spec,
                 owner: bone_core::Owner::User,
@@ -3989,9 +3895,41 @@ mod tests {
                 call: CallRef { runtime, id: 7 },
                 job: Some(JobRef { runtime, id: 3 }),
                 kind: ActivityKind::Tool {
-                    name: "bash".into()
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "secret argument"}),
                 },
             })
+        );
+
+        let arguments = serde_json::json!({"command": "echo 中文", "cwd":"src"});
+        let tool_finished = Record {
+            seq: bone_core::Seq(3),
+            origin: bone_core::Origin::Call(call),
+            body: bone_core::RecordBody::ToolFinished {
+                call,
+                job,
+                request: Arc::new(bone_core::ToolCall::new("bash", arguments.clone())),
+                outcome: Arc::new(ToolOutcome::value(
+                    serde_json::json!({"stdout":"中文\n","stderr":"","exit_code":0,"timed_out":false,"truncated":false}),
+                )),
+            },
+        };
+        let Some(SessionEvent::ToolFinished {
+            tool,
+            arguments: saved,
+            outcome,
+            ..
+        }) = public_agent_event(runtime, &tool_finished)
+        else {
+            panic!("tool completion must be projected");
+        };
+        assert_eq!(saved, arguments);
+        let detail = crate::tool_details(&tool, &saved, &outcome);
+        assert!(
+            detail
+                .sections
+                .iter()
+                .any(|section| section.text == "中文\n")
         );
 
         let finished = Record {
@@ -4081,7 +4019,6 @@ mod tests {
                     seq: bone_core::Seq(1),
                     origin: bone_core::Origin::Kernel,
                     body: bone_core::RecordBody::Reply {
-                        job: bone_core::JobId(1),
                         inputs: vec![bone_core::InputId(1)],
                         text: "older reply".into(),
                     },
@@ -4096,7 +4033,6 @@ mod tests {
                     seq: bone_core::Seq(2),
                     origin: bone_core::Origin::Kernel,
                     body: bone_core::RecordBody::Reply {
-                        job: bone_core::JobId(1),
                         inputs: vec![bone_core::InputId(1)],
                         text: latest.clone(),
                     },
@@ -4243,7 +4179,6 @@ mod tests {
                     seq: bone_core::Seq(sequence),
                     origin: bone_core::Origin::Kernel,
                     body: bone_core::RecordBody::Reply {
-                        job: bone_core::JobId(1),
                         inputs: vec![bone_core::InputId(1)],
                         text: latest_reply.clone(),
                     },
@@ -4784,7 +4719,7 @@ mod tests {
     }
 
     #[test]
-    fn project_config_trust_survives_reopen_and_is_invalidated_by_new_bytes() {
+    fn project_config_loads_on_open_and_reload() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("workspace");
         let project_dir = root.join(".bone");
@@ -4799,26 +4734,20 @@ mod tests {
 
         let store = DataStore::open(&data).unwrap();
         let workspace = store.workspace(&root).unwrap();
-        assert!(!store.project_config_status(workspace.id).unwrap().trusted);
-        assert!(
+        assert_eq!(
             store
                 .config(ConfigScope::Workspace(workspace.id))
                 .unwrap()
                 .worker
-                .is_none()
+                .unwrap()
+                .model,
+            "gpt-5.6-terra"
         );
-        store.trust_project_config(workspace.id).unwrap();
         drop(store);
 
         let reopened = DataStore::open(&data).unwrap();
         let same_workspace = reopened.workspace(&root).unwrap();
         assert_eq!(same_workspace.id, workspace.id);
-        assert!(
-            reopened
-                .project_config_status(workspace.id)
-                .unwrap()
-                .trusted
-        );
         assert_eq!(
             reopened
                 .config(ConfigScope::Workspace(workspace.id))
@@ -4830,8 +4759,7 @@ mod tests {
         );
 
         std::fs::write(&config_path, "schema_version = 1\n[overrides]\n").unwrap();
-        let status = reopened.reload_workspace_config(workspace.id).unwrap();
-        assert!(!status.trusted);
+        reopened.reload_workspace_config(workspace.id).unwrap();
         assert!(
             reopened
                 .config(ConfigScope::Workspace(workspace.id))

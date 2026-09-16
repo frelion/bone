@@ -4,17 +4,12 @@
 //! not start a proxy or a Codex agent, and it is not the public OpenAI Platform
 //! API. The explicit [`connect`] call may ask the user to complete a
 //! device-code login; later requests reuse and refresh BONE's independently
-//! managed ChatGPT token cache through a caller-provided cache lease.
+//! managed ChatGPT token cache at a caller-provided private path.
 //!
 //! Never point Rig's `auth_file` option at `~/.codex/auth.json`. Codex and Rig
 //! use different file schemas and independent refresh-token lifecycles.
 
-use rig_core::{
-    client::CompletionClient,
-    completion::{CompletionError, CompletionModel, CompletionRequest, CompletionResponse},
-    providers::chatgpt as rig_chatgpt,
-    streaming::StreamingCompletionResponse,
-};
+use rig_core::{client::CompletionClient, providers::chatgpt as rig_chatgpt};
 #[cfg(feature = "test-utils")]
 use rig_core::{
     http_client::HttpClientExt,
@@ -23,7 +18,6 @@ use rig_core::{
 use std::{
     fmt::{self, Debug},
     path::Path,
-    sync::Arc,
 };
 
 use crate::llm::{
@@ -66,16 +60,6 @@ impl From<ConfigError> for Error {
     }
 }
 
-/// A live, application-owned lease for Rig's ChatGPT OAuth cache file.
-///
-/// The application owns cache placement, access control, and exclusive
-/// lifetime management. This adapter only needs the already-validated path
-/// and retains the capability in every endpoint and model it creates.
-pub trait ChatGptAuthCache: Send + Sync + 'static {
-    /// The private cache file that Rig may read and update.
-    fn auth_file(&self) -> &Path;
-}
-
 /// Device-code details for the application's explicit ChatGPT connection UI.
 ///
 /// Treat the short code as ephemeral authentication material: display it only
@@ -96,31 +80,20 @@ impl Debug for DeviceCodePrompt {
     }
 }
 
-/// Explicitly connect an in-process ChatGPT subscription endpoint.
-///
-/// No API key, sidecar, or local HTTP proxy is required. The caller acquires
-/// `auth` from the product application; it owns a validated OAuth cache path
-/// and its exclusive lease. Rig remains the sole owner of the cache schema
-/// and refresh lifecycle.
-///
-/// This call authorizes before returning, so a later model request never
-/// surprises the caller by starting a device-code flow. The returned endpoint
-/// and every model selected from it retain the lease until they are dropped.
-pub async fn connect<F, A>(
+/// Explicitly authorize a private OAuth cache, allowing device-code login.
+pub async fn connect<F>(
     endpoint_id: impl Into<String>,
-    auth: A,
+    auth_file: &Path,
     on_device_code: F,
 ) -> Result<Endpoint, Error>
 where
     F: Fn(DeviceCodePrompt) + Send + Sync + 'static,
-    A: ChatGptAuthCache,
 {
     let endpoint_id = endpoint_id.into();
     validate_endpoint_id(&endpoint_id)?;
-    let auth_file = auth.auth_file().to_path_buf();
     let interactive_client = rig_chatgpt::Client::builder()
         .oauth()
-        .auth_file(&auth_file)
+        .auth_file(auth_file)
         .allow_device_flow(true)
         .on_device_code(move |prompt| {
             on_device_code(DeviceCodePrompt {
@@ -140,23 +113,14 @@ where
         .await
         .map_err(|_| Error::AuthorizationFailed)?;
 
-    connect_cached(endpoint_id, auth).await
+    connect_cached(endpoint_id, auth_file)
 }
 
-/// Connect using the existing OAuth cache, refreshing tokens when necessary.
-///
-/// This entry point never begins a device-code login. Missing or unusable
-/// authorization returns [`Error::AuthorizationFailed`], so applications can
-/// expose an explicit sign-in action before retrying runtime creation.
-pub async fn connect_cached<A>(endpoint_id: impl Into<String>, auth: A) -> Result<Endpoint, Error>
-where
-    A: ChatGptAuthCache,
-{
+/// Construct an endpoint without authorizing or accessing the network.
+/// Each request loads current credentials and refreshes them when necessary.
+pub fn connect_cached(endpoint_id: impl Into<String>, auth_file: &Path) -> Result<Endpoint, Error> {
     let endpoint_id = endpoint_id.into();
     validate_endpoint_id(&endpoint_id)?;
-    let auth: Arc<dyn ChatGptAuthCache> = Arc::new(auth);
-    let auth_file = auth.auth_file().to_path_buf();
-
     // Runtime requests must fail instead of unexpectedly starting an
     // interactive device-code flow.
     let client = rig_chatgpt::Client::builder()
@@ -170,19 +134,11 @@ where
         .build()
         .map_err(|_| Error::InvalidClientConfiguration)?;
 
-    client
-        .authorize()
-        .await
-        .map_err(|_| Error::AuthorizationFailed)?;
-
     Endpoint::from_model_factory_with_support(
         endpoint_id,
         Protocol::OpenAiResponses,
         RequestSupport::CHATGPT_SUBSCRIPTION,
-        move |model_id| LeasedModel {
-            inner: client.completion_model(model_id).with_strict_tools(),
-            _auth: auth.clone(),
-        },
+        move |model_id| client.completion_model(model_id).with_strict_tools(),
     )
     .map_err(Into::into)
 }
@@ -212,33 +168,11 @@ where
     )
 }
 
-#[derive(Clone)]
-struct LeasedModel<M> {
-    inner: M,
-    _auth: Arc<dyn ChatGptAuthCache>,
-}
-
-impl<M> CompletionModel for LeasedModel<M>
-where
-    M: CompletionModel + Send + Sync,
-{
-    async fn completion(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse, CompletionError> {
-        self.inner.completion(request).await
-    }
-
-    async fn stream(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<StreamingCompletionResponse, CompletionError> {
-        self.inner.stream(request).await
-    }
-
-    fn capabilities(&self) -> rig_core::completion::ProviderCapabilities {
-        self.inner.capabilities()
-    }
+/// Remove cached authorization using the refresh transaction lock.
+pub async fn clear_cache(auth_file: &Path) -> Result<(), Error> {
+    rig_chatgpt::clear_cache(auth_file)
+        .await
+        .map_err(|_| Error::AuthorizationFailed)
 }
 
 fn user_agent() -> String {

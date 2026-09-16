@@ -1,12 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
-
-use super::{ChatGptAuthCache, DeviceCodePrompt, Error, LeasedModel};
+use super::{DeviceCodePrompt, Error};
 
 #[test]
 fn service_errors_and_device_codes_are_redacted() {
@@ -24,37 +16,12 @@ fn service_errors_and_device_codes_are_redacted() {
     assert!(!rendered.contains("SENTINEL-CODE"));
 }
 
-struct DropProbe {
-    dropped: Arc<AtomicBool>,
-    path: PathBuf,
-}
-
-impl Drop for DropProbe {
-    fn drop(&mut self) {
-        self.dropped.store(true, Ordering::Release);
-    }
-}
-
-impl ChatGptAuthCache for DropProbe {
-    fn auth_file(&self) -> &Path {
-        &self.path
-    }
-}
-
 #[test]
-fn leased_models_keep_the_auth_cache_alive() {
-    let dropped = Arc::new(AtomicBool::new(false));
-    let cache: Arc<dyn ChatGptAuthCache> = Arc::new(DropProbe {
-        dropped: Arc::clone(&dropped),
-        path: PathBuf::from("/private/cache/auth.json"),
-    });
-    let model = LeasedModel {
-        inner: (),
-        _auth: Arc::clone(&cache),
-    };
-
-    drop(cache);
-    assert!(!dropped.load(Ordering::Acquire));
-    drop(model);
-    assert!(dropped.load(Ordering::Acquire));
+fn cached_endpoint_construction_never_authorizes() {
+    let directory = tempfile::tempdir().unwrap();
+    let auth = directory.path().join("auth.json");
+    let endpoint = super::connect_cached("chatgpt", &auth).unwrap();
+    assert!(endpoint.model("offline-model").is_ok());
+    assert!(!auth.exists());
+    assert!(!auth.with_extension("lock").exists());
 }

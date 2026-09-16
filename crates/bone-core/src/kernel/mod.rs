@@ -8,18 +8,18 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AdmissionError, AfterDelegation, AgentLimits, AgentLimitsError, AgentView, Assignment, Await,
     Call, CallError, CallId, CallKind, CallProgress, CallStatus, CallView, Completion,
-    ControlOutcome, DelegationLimits, DeliveryKind, DeliveryTarget, Effect, Event, ExternalEffect,
-    Input, InputId, InputOutcome, InputReceipt, InputStatus, InputView, InquiryResponse,
-    InquiryResult, JobId, JobOutcome, JobSpec, JobStatus, JobView, KernelDecision, MonoTime,
+    ControlOutcome, ConversationStep, DelegationLimits, DeliveryKind, DeliveryTarget, Effect,
+    Event, ExternalEffect, Input, InputId, InputOutcome, InputReceipt, InputStatus, InputView,
+    InquiryResponse, InquiryResult, JobId, JobOutcome, JobSpec, JobStatus, JobView, MonoTime,
     Origin, OutcomeKind, OwnedAction, Owner, ReadQuery, Record, RecordBody, RecordRange,
     ReportDraft, Seq, ToolEffect, ToolOutcome, ToolSpec, WorkProposal, WorkRejections, WorkStep,
     context::{self, PreparedWork},
     job::{Job, JobContext, JobState, PendingStep, WaitState},
 };
 
+mod conversation;
 mod durable;
 mod exchange;
-mod routing;
 mod scheduler;
 mod work;
 
@@ -28,18 +28,7 @@ pub(crate) struct InputEntry {
     pub accepted_at: Seq,
     pub finished: Option<InputOutcome>,
     pub required_jobs: BTreeSet<JobId>,
-    pub pending_review_by: Option<JobId>,
-    pub routing: Seq,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum Requester {
-    Inputs,
-    #[allow(dead_code)]
-    Job {
-        job: JobId,
-        revision: u64,
-    },
+    pub pending: bool,
 }
 
 #[derive(Clone)]
@@ -52,29 +41,14 @@ pub(crate) enum KernelControl {
     ResolveWrite { call: CallId, result: ToolOutcome },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Routing {
-    pub requester: Requester,
-    pub inputs: Vec<InputId>,
-    pub request: Option<String>,
-    pub records: Vec<Seq>,
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Conversation {
     pub active_call: Option<CallId>,
-    pub state: RoutingState,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum RoutingState {
-    Ready,
-    WaitingInquiry(Seq),
-    WaitingForUser(Seq),
-    Failed(Seq),
-    Closed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-enum ReplyTarget {
-    Routing(Seq),
-    Job(JobId),
+    pub records: Vec<Seq>,
+    pub ready: bool,
+    pub question: Option<Seq>,
+    pub failure: Option<Seq>,
+    pub rejections: WorkRejections,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,8 +60,8 @@ pub(crate) struct Inquiry {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum CallTask {
-    Coordinate {
-        routing: Seq,
+    Converse {
+        seen_through: Seq,
     },
     Work {
         job: JobId,
@@ -164,7 +138,7 @@ impl CallEntry {
 
     fn kind(&self) -> CallKind {
         match &self.task {
-            CallTask::Coordinate { .. } => CallKind::Coordinate,
+            CallTask::Converse { .. } => CallKind::Converse,
             CallTask::Work { .. } => CallKind::Work,
             CallTask::Compact { .. } | CallTask::SessionCompact { .. } => CallKind::Compact,
             CallTask::Tool { .. } => CallKind::Tool,
@@ -173,7 +147,7 @@ impl CallEntry {
 
     fn job(&self) -> Option<JobId> {
         match &self.task {
-            CallTask::Coordinate { .. } | CallTask::SessionCompact { .. } => None,
+            CallTask::Converse { .. } | CallTask::SessionCompact { .. } => None,
             CallTask::Work { job, .. }
             | CallTask::Compact { job, .. }
             | CallTask::Tool { job, .. } => Some(*job),
@@ -182,7 +156,7 @@ impl CallEntry {
 
     fn revision(&self) -> u64 {
         match &self.task {
-            CallTask::Coordinate { .. } | CallTask::SessionCompact { .. } => 0,
+            CallTask::Converse { .. } | CallTask::SessionCompact { .. } => 0,
             CallTask::Work { revision, .. }
             | CallTask::Compact { revision, .. }
             | CallTask::Tool { revision, .. } => *revision,
@@ -242,21 +216,18 @@ pub(crate) struct Kernel {
     #[serde(skip)]
     pub records: BTreeMap<Seq, Arc<Record>>,
     pub inquiries: BTreeMap<Seq, Inquiry>,
-    pub routings: BTreeMap<Seq, Routing>,
+    pub conversation: Conversation,
     #[serde(skip)]
     pub tools: BTreeMap<String, ToolSpec>,
     pub constraints: String,
     pub constraints_revision: u64,
     pub epoch: u64,
-    pub user_question: Option<JobId>,
     #[serde(skip)]
     suspended: bool,
     #[serde(skip)]
     interactive_ready: VecDeque<JobId>,
     #[serde(skip)]
     background_ready: VecDeque<JobId>,
-    #[serde(skip)]
-    routing_ready: VecDeque<Seq>,
     next_job: u64,
     next_call: u64,
     next_seq: u64,
@@ -273,16 +244,14 @@ impl Kernel {
             calls: BTreeMap::new(),
             records: BTreeMap::new(),
             inquiries: BTreeMap::new(),
-            routings: BTreeMap::new(),
+            conversation: Conversation::default(),
             tools: registry,
             constraints: String::new(),
             constraints_revision: 0,
             epoch: 0,
-            user_question: None,
             suspended: false,
             interactive_ready: VecDeque::new(),
             background_ready: VecDeque::new(),
-            routing_ready: VecDeque::new(),
             next_job: 1,
             next_call: 1,
             next_seq: 1,
@@ -306,111 +275,68 @@ impl Kernel {
             }
             return Err(AdmissionError::ConflictingInput);
         }
-        let reply = match input.reply_to {
-            Some(reply_to) => {
-                let (target, question) = self
-                    .reply_target(reply_to)
-                    .ok_or(AdmissionError::InvalidReply)?;
-                if input
-                    .expected_question
-                    .is_some_and(|expected| expected != question)
-                {
-                    return Err(AdmissionError::StaleReply);
-                }
-                Some(target)
-            }
-            None if input.expected_question.is_some() => {
+        if let Some(reply_to) = input.reply_to {
+            if self
+                .inputs
+                .get(&reply_to)
+                .is_none_or(|entry| entry.finished.is_some())
+            {
                 return Err(AdmissionError::InvalidReply);
             }
-            None => None,
-        };
-        let pending = self
-            .inputs
-            .values()
-            .filter(|entry| {
-                entry.finished.is_none() && self.input(entry.accepted_at).reply_to.is_none()
-            })
-            .count();
-        let pending_reply = self.inputs.values().any(|entry| {
-            entry.finished.is_none()
-                && self.input(entry.accepted_at).reply_to.is_some()
-                && matches!(
-                    self.routings[&entry.routing].state,
-                    RoutingState::Ready | RoutingState::WaitingInquiry(_)
-                )
-        });
-        if reply.is_some() && pending_reply
-            || reply.is_none() && pending >= self.limits.pending_inputs
+            let question = self
+                .conversation
+                .question
+                .ok_or(AdmissionError::InvalidReply)?;
+            let RecordBody::Clarification { inputs, .. } = &self.records[&question].body else {
+                unreachable!()
+            };
+            if !inputs.contains(&reply_to) {
+                return Err(AdmissionError::InvalidReply);
+            }
+            if input
+                .expected_question
+                .is_some_and(|expected| expected != question)
+            {
+                return Err(AdmissionError::StaleReply);
+            }
+        } else if input.expected_question.is_some() {
+            return Err(AdmissionError::InvalidReply);
+        }
+        if input.reply_to.is_none()
+            && self
+                .inputs
+                .values()
+                .filter(|entry| entry.finished.is_none())
+                .count()
+                >= self.limits.pending_inputs
         {
             return Err(AdmissionError::Busy);
         }
-
         let mut effects = Vec::new();
-        let input_record = self.record(
+        self.invalidate_conversation_call(&mut effects);
+        let record = self.record(
             Origin::User(input.id),
             RecordBody::Input(input.clone()),
             &mut effects,
         );
-        let routing = match reply {
-            Some(ReplyTarget::Routing(routing)) => {
-                let route = self
-                    .routings
-                    .get_mut(&routing)
-                    .expect("input points to its routing");
-                route.inputs.push(input.id);
-                route.records.push(input_record.seq);
-                route.state = RoutingState::Ready;
-                self.enqueue_routing(routing);
-                routing
-            }
-            Some(ReplyTarget::Job(job)) => {
-                self.accept_user_reply(job, input.id, input_record.seq, &mut effects)
-            }
-            None => {
-                let (mut inputs, mut records) = self.supersede_input_routings(&mut effects);
-                inputs.push(input.id);
-                records.push(input_record.seq);
-                let routing = self.open_input_routing(inputs.clone(), records, &mut effects);
-                for pending in inputs.into_iter().filter(|id| *id != input.id) {
-                    self.inputs
-                        .get_mut(&pending)
-                        .expect("a superseded input is still pending")
-                        .routing = routing;
-                }
-                routing
-            }
-        };
-        let required_jobs = match reply {
-            Some(ReplyTarget::Job(job)) => BTreeSet::from([job]),
-            _ => BTreeSet::new(),
-        };
-        let pending_review_by = match reply {
-            Some(ReplyTarget::Job(job)) => Some(job),
-            _ => None,
-        };
         let receipt = InputReceipt {
             id: input.id,
-            accepted_at: input_record.seq,
+            accepted_at: record.seq,
         };
         self.inputs.insert(
             input.id,
             InputEntry {
-                accepted_at: input_record.seq,
+                accepted_at: record.seq,
                 finished: None,
-                required_jobs,
-                pending_review_by,
-                routing,
+                required_jobs: BTreeSet::new(),
+                pending: true,
             },
         );
-        if let Some(ReplyTarget::Job(job)) = reply {
-            self.deliver(
-                DeliveryTarget::Job(job),
-                input_record.seq,
-                DeliveryKind::Input,
-                &mut effects,
-            );
-            self.make_ready(job);
-        }
+        self.conversation.records.push(record.seq);
+        self.conversation.question = None;
+        self.conversation.failure = None;
+        self.conversation.rejections = WorkRejections::default();
+        self.conversation.ready = true;
         self.advance(now, &mut effects);
         Ok((receipt, effects))
     }
@@ -419,9 +345,9 @@ impl Kernel {
         let mut effects = Vec::new();
         self.expire(now, &mut effects);
         match event {
-            Event::CoordinateFinished { call, result } => {
+            Event::ConverseFinished { call, result } => {
                 let result = self.bound_model_result(result);
-                self.coordinate_finished(now, call, result, &mut effects)
+                self.converse_finished(call, result, &mut effects)
             }
             Event::WorkFinished { call, result } => {
                 let result = self.bound_model_result(result);
@@ -531,18 +457,9 @@ impl Kernel {
             .collect::<Vec<_>>();
         for call in model_calls {
             match &self.calls[&call].task {
-                CallTask::Coordinate { routing } => {
-                    if self
-                        .routings
-                        .get(routing)
-                        .is_some_and(|entry| entry.active_call == Some(call))
-                    {
-                        self.routings
-                            .get_mut(routing)
-                            .expect("routing exists")
-                            .active_call = None;
-                        self.enqueue_routing(*routing);
-                    }
+                CallTask::Converse { .. } => {
+                    self.conversation.active_call = None;
+                    self.conversation.ready = true;
                 }
                 CallTask::Work { job, .. } | CallTask::Compact { job, .. } => {
                     if self
@@ -641,38 +558,28 @@ impl Kernel {
         if let Some(outcome) = &input.finished {
             return InputStatus::Finished(outcome.clone());
         }
-        if let Some(job) = self.user_question
-            && self.jobs[&job].inputs.contains(&id)
-            && let JobState::Waiting(WaitState::User {
-                question: question_seq,
-            }) = self.jobs[&job].state
+        if let Some(question_seq) = self.conversation.question
+            && let RecordBody::Clarification { inputs, question } =
+                &self.records[&question_seq].body
+            && inputs.contains(&id)
         {
-            return match &self.records[&question_seq].body {
-                RecordBody::Clarification { question, .. } => InputStatus::WaitingForUser {
-                    question: question.clone(),
-                    question_seq,
-                },
-                _ => unreachable!("a user wait points to its clarification"),
+            return InputStatus::WaitingForUser {
+                question: question.clone(),
+                question_seq,
             };
         }
-        match self.routings[&input.routing].state {
-            RoutingState::WaitingForUser(record) => match &self.records[&record].body {
-                RecordBody::Clarification { question, .. } => InputStatus::WaitingForUser {
-                    question: question.clone(),
-                    question_seq: record,
-                },
-                _ => unreachable!("waiting routing points to its clarification"),
-            },
-            RoutingState::Failed(record) => match &self.records[&record].body {
-                RecordBody::InputRoutingFailed { message, .. } | RecordBody::Audit { message } => {
-                    InputStatus::RoutingFailed {
-                        message: message.clone(),
-                    }
-                }
-                _ => unreachable!("failed routing points to its audit record"),
-            },
-            RoutingState::Closed => InputStatus::Handled,
-            RoutingState::Ready | RoutingState::WaitingInquiry(_) => InputStatus::Routing,
+        if let Some(record) = self.conversation.failure
+            && let RecordBody::ConversationFailed { inputs, message } = &self.records[&record].body
+            && inputs.contains(&id)
+        {
+            return InputStatus::ConversationFailed {
+                message: message.clone(),
+            };
+        }
+        if input.pending {
+            InputStatus::Thinking
+        } else {
+            InputStatus::Handled
         }
     }
 
@@ -733,6 +640,7 @@ impl Kernel {
     fn job_view(&self, id: JobId) -> JobView {
         let job = &self.jobs[&id];
         JobView {
+            allowed_tools: job.allowed_tools.clone(),
             id,
             spec: job.spec.clone(),
             owner: job.owner,

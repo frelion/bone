@@ -309,10 +309,6 @@ fn conversation_rendering_has_no_bone_or_you_speaker_prefixes() {
                 sequence: bone_app::SessionSeq(2),
                 occurred_at: 2,
                 event: SessionEvent::Reply {
-                    job: bone_app::JobRef {
-                        runtime: bone_app::RuntimeId::new(),
-                        id: 1,
-                    },
                     inputs: vec![bone_app::InputId(1)],
                     text: "UNIQUE_ASSISTANT_BODY".into(),
                 },

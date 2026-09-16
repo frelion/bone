@@ -4,7 +4,7 @@ use crate::{DurableError, DurableSnapshot};
 impl Kernel {
     pub(crate) fn durable_snapshot(&self) -> Result<DurableSnapshot, DurableError> {
         Ok(DurableSnapshot {
-            version: 3,
+            version: 5,
             through: Seq(self.next_seq - 1),
             epoch: self.epoch,
             payload: serde_json::to_value(self)
@@ -15,50 +15,12 @@ impl Kernel {
     /// Reconstitute facts, then interrupt old execution without scheduling any calls.
     /// Recovery effects and the resulting snapshot must be committed before use.
     pub(crate) fn restore(
-        mut snapshot: DurableSnapshot,
+        snapshot: DurableSnapshot,
         records: Vec<Arc<Record>>,
         limits: AgentLimits,
         tools: Vec<ToolSpec>,
     ) -> Result<(Self, Vec<Effect>), DurableError> {
-        if snapshot.version == 1 || snapshot.version == 2 {
-            // Version 1 predates correction budgets. Migrate only that version;
-            // missing counters in newer snapshots must fail, never reset a budget.
-            let jobs = snapshot
-                .payload
-                .get_mut("jobs")
-                .and_then(serde_json::Value::as_object_mut)
-                .ok_or_else(|| {
-                    DurableError::Invalid("missing jobs in version 1 snapshot".into())
-                })?;
-            for job in jobs.values_mut() {
-                let job = job
-                    .as_object_mut()
-                    .ok_or_else(|| DurableError::Invalid("invalid version 1 job".into()))?;
-                if snapshot.version == 1 {
-                    job.entry("work_rejections")
-                        .or_insert_with(|| serde_json::json!({"consecutive":0,"total":0}));
-                }
-                job.entry("delegation").or_insert_with(|| serde_json::json!({
-                    "max_descendants": limits.job_budget, "max_depth": limits.job_depth.saturating_sub(1)
-                }));
-                if let Some(delegate) = job
-                    .get_mut("state")
-                    .and_then(|state| state.pointer_mut("/Waiting/Commit/step/Delegate"))
-                    && let Some(assignments) = delegate.as_array()
-                {
-                    let mut assignments = assignments.clone();
-                    for assignment in &mut assignments {
-                        if let Some(assignment) = assignment.as_object_mut() {
-                            assignment.entry("delegation").or_insert_with(
-                                || serde_json::json!({"max_descendants":0,"max_depth":0}),
-                            );
-                        }
-                    }
-                    *delegate =
-                        serde_json::json!({"assignments":assignments,"continuation":"Continue"});
-                }
-            }
-        } else if snapshot.version != 3 {
+        if snapshot.version != 5 {
             return Err(DurableError::UnsupportedVersion(snapshot.version));
         }
         let configured =
@@ -91,9 +53,7 @@ impl Kernel {
             || kernel.calls.keys().any(|id| id.0 >= kernel.next_call)
             || kernel.inputs.iter().any(|(id, input)| {
                 !matches!(kernel.records.get(&input.accepted_at).map(|record| &record.body), Some(RecordBody::Input(value)) if value.id == *id)
-                    || !kernel.routings.contains_key(&input.routing)
                     || input.required_jobs.iter().any(|job| !kernel.jobs.contains_key(job))
-                    || input.pending_review_by.is_some_and(|job| !kernel.jobs.contains_key(&job))
             })
             || kernel.jobs.values().any(|job| {
                 job.inputs.iter().any(|input| !kernel.inputs.contains_key(input))
@@ -147,9 +107,7 @@ impl Kernel {
         for job in kernel.jobs.values_mut() {
             job.active_call = None;
         }
-        for route in kernel.routings.values_mut() {
-            route.active_call = None;
-        }
+        kernel.conversation.active_call = None;
         let jobs = kernel
             .jobs
             .iter()
@@ -164,21 +122,31 @@ impl Kernel {
                 &mut effects,
             );
         }
-        let routes = kernel
-            .routings
-            .iter()
-            .filter(|(_, route)| {
-                !matches!(route.state, RoutingState::Closed | RoutingState::Failed(_))
+        let unfinished = kernel
+            .inputs
+            .iter_mut()
+            .filter_map(|(id, input)| {
+                if input.finished.is_some() {
+                    return None;
+                }
+                input.finished = Some(InputOutcome::Failed);
+                input.pending = false;
+                Some(*id)
             })
-            .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        for route in routes {
-            kernel.fail_routing(route, "routing interrupted by restore".into(), &mut effects);
+        for input in unfinished {
+            kernel.record(
+                Origin::Kernel,
+                RecordBody::InputFinished {
+                    input,
+                    outcome: InputOutcome::Failed,
+                },
+                &mut effects,
+            );
         }
-        kernel.finish_inputs(&mut effects);
+        kernel.conversation = Conversation::default();
         kernel.interactive_ready.clear();
         kernel.background_ready.clear();
-        kernel.routing_ready.clear();
         Ok((kernel, effects))
     }
 }
@@ -235,16 +203,91 @@ mod tests {
         );
         restored.step(
             MonoTime::default(),
-            Event::CoordinateFinished {
+            Event::ConverseFinished {
                 call: old_call,
-                result: Ok(KernelDecision::Assign(vec![crate::RouteDelivery {
+                result: Ok(ConversationStep::Start(vec![Assignment {
                     inputs: vec![InputId(1)],
-                    target: crate::RouteTarget::New,
-                    handoff: "stale".into(),
+                    ..Assignment::new(JobSpec::new("stale", "scope", "done"))
                 }])),
             },
         );
         assert!(restored.jobs.is_empty());
+    }
+
+    #[test]
+    fn restore_closes_pending_question_and_releases_input_capacity() {
+        let limits = AgentLimits {
+            pending_inputs: 1,
+            ..AgentLimits::default()
+        };
+        let mut kernel = Kernel::new(limits.clone(), vec![]).unwrap();
+        kernel
+            .accept(MonoTime::default(), Input::new(InputId(1), "old request"))
+            .unwrap();
+        let call = kernel.conversation.active_call.unwrap();
+        kernel.step(
+            MonoTime::default(),
+            Event::ConverseFinished {
+                call,
+                result: Ok(ConversationStep::Ask {
+                    inputs: vec![InputId(1)],
+                    question: "Which file?".into(),
+                }),
+            },
+        );
+        assert!(kernel.conversation.question.is_some());
+        let (mut restored, effects) = Kernel::restore(
+            kernel.durable_snapshot().unwrap(),
+            records(&kernel),
+            limits,
+            vec![],
+        )
+        .unwrap();
+        assert!(restored.conversation.question.is_none());
+        assert!(restored.conversation.failure.is_none());
+        assert_eq!(
+            restored.inputs[&InputId(1)].finished,
+            Some(InputOutcome::Failed)
+        );
+        assert!(
+            effects
+                .iter()
+                .all(|effect| matches!(effect, Effect::Notify(_)))
+        );
+        let (_, effects) = restored
+            .accept(MonoTime::default(), Input::new(InputId(2), "new request"))
+            .unwrap();
+        let context = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Start { call, .. } => match call.as_ref() {
+                    Call::Converse(input) => Some(input),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("new conversation call");
+        assert_eq!(
+            context
+                .inputs
+                .iter()
+                .map(|input| input.id)
+                .collect::<Vec<_>>(),
+            vec![InputId(2)]
+        );
+        assert!(
+            serde_json::to_string(&context.background)
+                .unwrap()
+                .contains("old request")
+        );
+        let (_, effects) = Kernel::restore(
+            restored.durable_snapshot().unwrap(),
+            records(&restored),
+            AgentLimits::default(),
+            vec![],
+        )
+        .unwrap();
+        assert!(!effects.iter().any(|effect| matches!(effect, Effect::Notify(record) if matches!(record.body, RecordBody::InputFinished { input: InputId(1), .. }))));
     }
 
     #[test]
@@ -253,15 +296,11 @@ mod tests {
         kernel
             .accept(MonoTime::default(), Input::new(InputId(1), "write"))
             .unwrap();
-        let routing = kernel.inputs[&InputId(1)].routing;
         kernel
-            .apply_decision(
-                MonoTime::default(),
-                routing,
-                KernelDecision::Assign(vec![crate::RouteDelivery {
+            .apply_conversation(
+                ConversationStep::Start(vec![Assignment {
                     inputs: vec![InputId(1)],
-                    target: crate::RouteTarget::New,
-                    handoff: "write".into(),
+                    ..Assignment::new(JobSpec::new("write", "scope", "done"))
                 }]),
                 &mut vec![],
             )
@@ -295,7 +334,11 @@ mod tests {
             ExternalEffect::Unknown
         );
         assert!(matches!(restored.jobs[&job].state, JobState::Finished(_)));
-        assert!(restored.inputs[&InputId(1)].pending_review_by.is_none());
+        assert!(!restored.inputs[&InputId(1)].pending);
+        assert_eq!(
+            restored.inputs[&InputId(1)].finished,
+            Some(InputOutcome::Failed)
+        );
         assert!(
             effects
                 .iter()

@@ -39,7 +39,6 @@ struct Loaded<T> {
 struct ProjectState {
     root: PathBuf,
     loaded: Loaded<ProjectConfig>,
-    trusted: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,14 +63,7 @@ struct ProjectConfig {
 pub struct ProjectConfigStatus {
     pub path: PathBuf,
     pub exists: bool,
-    pub trusted: bool,
     pub overrides: RuntimeOverrides,
-}
-
-pub(crate) struct ProjectConfigUpdate {
-    pub(crate) values: RuntimeOverrides,
-    pub(crate) digest: String,
-    _lock: File,
 }
 
 impl Default for UserConfig {
@@ -120,16 +112,12 @@ impl FileConfigs {
     pub(crate) fn load_workspace(
         &self,
         workspace: &WorkspaceInfo,
-        trusted_digest: Option<&str>,
     ) -> Result<ProjectConfigStatus, StoreError> {
         let path = checked_project_path(&workspace.root, false)?;
         let loaded = load_project(&path)?;
-        let trusted = loaded.digest.is_none()
-            || trusted_digest.is_some_and(|expected| Some(expected) == loaded.digest.as_deref());
         let status = ProjectConfigStatus {
             path,
             exists: loaded.digest.is_some(),
-            trusted,
             overrides: loaded.value.overrides.clone(),
         };
         self.inner
@@ -141,7 +129,6 @@ impl FileConfigs {
                 ProjectState {
                     root: workspace.root.clone(),
                     loaded,
-                    trusted,
                 },
             );
         Ok(status)
@@ -156,18 +143,14 @@ impl FileConfigs {
     pub(crate) fn reload_all(
         &self,
         workspace: &WorkspaceInfo,
-        trusted_digest: Option<&str>,
     ) -> Result<ProjectConfigStatus, StoreError> {
         // Parse and validate both files before publishing either snapshot.
         let user = load_user(&self.bone_home)?;
         let path = checked_project_path(&workspace.root, false)?;
         let loaded = load_project(&path)?;
-        let trusted = loaded.digest.is_none()
-            || trusted_digest.is_some_and(|expected| Some(expected) == loaded.digest.as_deref());
         let status = ProjectConfigStatus {
             path,
             exists: loaded.digest.is_some(),
-            trusted,
             overrides: loaded.value.overrides.clone(),
         };
         let mut state = self.inner.lock().expect("file config mutex poisoned");
@@ -177,7 +160,6 @@ impl FileConfigs {
             ProjectState {
                 root: workspace.root.clone(),
                 loaded,
-                trusted,
             },
         );
         Ok(status)
@@ -209,7 +191,6 @@ impl FileConfigs {
             .expect("file config mutex poisoned")
             .projects
             .get(&workspace)
-            .filter(|project| project.trusted)
             .map(|project| project.loaded.value.overrides.clone())
             .unwrap_or_default()
     }
@@ -223,28 +204,8 @@ impl FileConfigs {
             .map(|project| ProjectConfigStatus {
                 path: project_path(&project.root),
                 exists: project.loaded.digest.is_some(),
-                trusted: project.trusted,
                 overrides: project.loaded.value.overrides.clone(),
             })
-    }
-
-    pub(crate) fn project_digest(&self, workspace: WorkspaceId) -> Option<String> {
-        self.inner
-            .lock()
-            .expect("file config mutex poisoned")
-            .projects
-            .get(&workspace)
-            .and_then(|project| project.loaded.digest.clone())
-    }
-
-    pub(crate) fn mark_trusted(&self, workspace: WorkspaceId, digest: &str) -> bool {
-        let mut state = self.inner.lock().expect("file config mutex poisoned");
-        let Some(project) = state.projects.get_mut(&workspace) else {
-            return false;
-        };
-        let matches = project.loaded.digest.as_deref() == Some(digest);
-        project.trusted = matches;
-        matches
     }
 
     pub(crate) fn lock_project(&self, workspace: WorkspaceId) -> Result<File, StoreError> {
@@ -286,37 +247,6 @@ impl FileConfigs {
         }
     }
 
-    pub(crate) fn verify_project_digest_locked(
-        &self,
-        workspace: WorkspaceId,
-        digest: &str,
-    ) -> Result<bool, StoreError> {
-        let state = self.inner.lock().expect("file config mutex poisoned");
-        let Some(project) = state.projects.get(&workspace) else {
-            return Ok(false);
-        };
-        if project.loaded.digest.as_deref() != Some(digest) {
-            return Ok(false);
-        }
-        ensure_unchanged(
-            &project_path(&project.root),
-            project.loaded.digest.as_deref(),
-        )?;
-        Ok(true)
-    }
-
-    pub(crate) fn mark_untrusted(&self, workspace: WorkspaceId) {
-        if let Some(project) = self
-            .inner
-            .lock()
-            .expect("file config mutex poisoned")
-            .projects
-            .get_mut(&workspace)
-        {
-            project.trusted = false;
-        }
-    }
-
     pub(crate) fn update(
         &self,
         scope: ConfigScope,
@@ -352,8 +282,8 @@ impl FileConfigs {
         &self,
         workspace: WorkspaceId,
         change: ConfigChange,
-    ) -> Result<ProjectConfigUpdate, StoreError> {
-        let lock = self.lock_project(workspace)?;
+    ) -> Result<RuntimeOverrides, StoreError> {
+        let _lock = self.lock_project(workspace)?;
         let mut state = self.inner.lock().expect("file config mutex poisoned");
         let project = state
             .projects
@@ -361,11 +291,6 @@ impl FileConfigs {
             .ok_or(StoreError::Corrupt {
                 message: "workspace configuration was not loaded",
             })?;
-        if project.loaded.digest.is_some() && !project.trusted {
-            return Err(StoreError::ProjectConfigUntrusted {
-                path: project_path(&project.root),
-            });
-        }
         let path = checked_project_path(&project.root, true)?;
         ensure_unchanged(&path, project.loaded.digest.as_deref())?;
         let mut next = project.loaded.value.clone();
@@ -377,13 +302,7 @@ impl FileConfigs {
             value: next,
             digest: Some(digest.clone()),
         };
-        // Trust is committed by DataStore while `lock` is still held.
-        project.trusted = false;
-        Ok(ProjectConfigUpdate {
-            values,
-            digest,
-            _lock: lock,
-        })
+        Ok(values)
     }
 
     pub(crate) fn save_profile(&self, profile: Profile) -> Result<(), StoreError> {
@@ -436,7 +355,7 @@ fn validate_user(config: &UserConfig) -> Result<(), StoreError> {
     }
     crate::config::validate_agent_limits(&config.settings.limits)
         .map_err(|error| config_field_error("settings.limits", error))?;
-    crate::config::validate_tool_settings(&config.settings.tools)
+    crate::config::validate_tool_limits(&config.settings.tools)
         .map_err(|error| config_field_error("settings.tools", error))?;
     Ok(())
 }
@@ -479,7 +398,7 @@ fn validate_project(config: &ProjectConfig) -> Result<(), StoreError> {
             .map_err(|error| config_field_error("overrides.limits", error))?;
     }
     if let Some(tools) = &config.overrides.tools {
-        crate::config::validate_tool_settings(tools)
+        crate::config::validate_tool_limits(tools)
             .map_err(|error| config_field_error("overrides.tools", error))?;
     }
     Ok(())
@@ -706,7 +625,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::{ConfigChange, ConfigScope, ToolMode, ToolSettings};
+    use crate::{ConfigChange, ConfigScope, ToolLimits};
 
     #[test]
     fn user_file_detects_external_edits_instead_of_overwriting_them() {
@@ -716,10 +635,7 @@ mod tests {
         configs
             .update(
                 ConfigScope::User,
-                ConfigChange::Tools(Some(ToolSettings {
-                    mode: ToolMode::ReadOnly,
-                    ..ToolSettings::default()
-                })),
+                ConfigChange::Tools(Some(ToolLimits::default())),
             )
             .unwrap();
         fs::write(home.join("config.toml"), "schema_version = 1\n").unwrap();
@@ -738,10 +654,7 @@ mod tests {
         first
             .update(
                 ConfigScope::User,
-                ConfigChange::Tools(Some(ToolSettings {
-                    mode: ToolMode::ReadOnly,
-                    ..ToolSettings::default()
-                })),
+                ConfigChange::Tools(Some(ToolLimits::default())),
             )
             .unwrap();
         assert!(matches!(
@@ -769,13 +682,13 @@ mod tests {
         };
         let configs = FileConfigs::open(home).unwrap();
         assert!(matches!(
-            configs.load_workspace(&workspace, None),
+            configs.load_workspace(&workspace),
             Err(StoreError::UnsafeStorage { .. })
         ));
     }
 
     #[test]
-    fn project_file_is_inert_until_its_exact_digest_is_trusted() {
+    fn project_file_is_loaded_immediately() {
         let temporary = tempfile::tempdir().unwrap();
         let home = temporary.path().join(".bone");
         let root = temporary.path().join("workspace");
@@ -790,16 +703,13 @@ mod tests {
             root,
         };
         let configs = FileConfigs::open(home).unwrap();
-        let status = configs.load_workspace(&workspace, None).unwrap();
+        let status = configs.load_workspace(&workspace).unwrap();
         assert!(status.exists);
-        assert!(!status.trusted);
-        let digest = configs.project_digest(workspace.id).unwrap();
-        assert!(configs.mark_trusted(workspace.id, &digest));
-        assert!(configs.project_status(workspace.id).unwrap().trusted);
+        assert_eq!(configs.overrides(workspace.id), RuntimeOverrides::default());
     }
 
     #[test]
-    fn project_write_stays_untrusted_until_the_store_commits_its_digest() {
+    fn project_write_updates_the_loaded_snapshot() {
         let temporary = tempfile::tempdir().unwrap();
         let home = temporary.path().join("home");
         let root = temporary.path().join("workspace");
@@ -809,22 +719,23 @@ mod tests {
             root,
         };
         let configs = FileConfigs::open(home).unwrap();
-        configs.load_workspace(&workspace, None).unwrap();
-        let update = configs
+        configs.load_workspace(&workspace).unwrap();
+        let expected = RuntimeOverrides {
+            tools: Some(ToolLimits::default()),
+            ..RuntimeOverrides::default()
+        };
+        let updated = configs
             .update_workspace(
                 workspace.id,
-                ConfigChange::Tools(Some(ToolSettings {
-                    mode: ToolMode::WorkspaceWrite,
-                    ..ToolSettings::default()
-                })),
+                ConfigChange::Tools(Some(ToolLimits::default())),
             )
             .unwrap();
-        assert!(!configs.project_status(workspace.id).unwrap().trusted);
-        assert!(configs.mark_trusted(workspace.id, &update.digest));
+        assert_eq!(updated, expected);
+        assert_eq!(configs.overrides(workspace.id), expected);
     }
 
     #[test]
-    fn trust_rejects_bytes_changed_after_review() {
+    fn project_write_rejects_external_changes() {
         let temporary = tempfile::tempdir().unwrap();
         let home = temporary.path().join(".bone");
         let root = temporary.path().join("workspace");
@@ -836,15 +747,14 @@ mod tests {
             root,
         };
         let configs = FileConfigs::open(home).unwrap();
-        configs.load_workspace(&workspace, None).unwrap();
-        let digest = configs.project_digest(workspace.id).unwrap();
+        configs.load_workspace(&workspace).unwrap();
         fs::write(
             &path,
             "schema_version = 1\n[overrides.worker]\nprofile = \"chatgpt\"\nmodel = \"changed\"\n",
         )
         .unwrap();
         assert!(matches!(
-            configs.verify_project_digest_locked(workspace.id, &digest),
+            configs.update_workspace(workspace.id, ConfigChange::Tools(None)),
             Err(StoreError::ConfigConflict { .. })
         ));
     }
@@ -872,30 +782,25 @@ mod tests {
         configs
             .update(
                 ConfigScope::User,
-                ConfigChange::Tools(Some(ToolSettings {
-                    mode: ToolMode::ReadOnly,
-                    ..ToolSettings::default()
-                })),
+                ConfigChange::Tools(Some(ToolLimits::default())),
             )
             .unwrap();
         let workspace = WorkspaceInfo {
             id: WorkspaceId::new(),
             root,
         };
-        configs.load_workspace(&workspace, None).unwrap();
+        configs.load_workspace(&workspace).unwrap();
 
-        fs::write(
-            home.join("config.toml"),
-            "schema_version = 1\n[settings.tools]\nmode = \"workspace_write\"\n",
-        )
-        .unwrap();
+        let mut edited = UserConfig::default();
+        edited.settings.tools.max_bash_timeout = std::time::Duration::from_secs(300);
+        fs::write(home.join("config.toml"), toml::to_string(&edited).unwrap()).unwrap();
         fs::write(
             workspace.root.join(".bone/config.toml"),
             "schema_version = 999\n",
         )
         .unwrap();
-        assert!(configs.reload_all(&workspace, None).is_err());
-        assert_eq!(configs.user_settings().tools.mode, ToolMode::ReadOnly);
+        assert!(configs.reload_all(&workspace).is_err());
+        assert_eq!(configs.user_settings().tools, ToolLimits::default());
     }
 
     #[cfg(unix)]
@@ -913,14 +818,11 @@ mod tests {
             root,
         };
         let configs = FileConfigs::open(home).unwrap();
-        configs.load_workspace(&workspace, None).unwrap();
+        configs.load_workspace(&workspace).unwrap();
         fs::set_permissions(&project_dir, fs::Permissions::from_mode(0o500)).unwrap();
         let result = configs.update_workspace(
             workspace.id,
-            ConfigChange::Tools(Some(ToolSettings {
-                mode: ToolMode::WorkspaceWrite,
-                ..ToolSettings::default()
-            })),
+            ConfigChange::Tools(Some(ToolLimits::default())),
         );
         fs::set_permissions(&project_dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());

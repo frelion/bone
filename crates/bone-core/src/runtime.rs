@@ -695,7 +695,7 @@ impl Actor {
                 Effect::Start { id, call, timeout } => {
                     if self.cancelled_before_start.remove(&id) {
                         let failure = match call.as_ref() {
-                            Call::Coordinate(_) => CallFailure::Coordinate,
+                            Call::Converse(_) => CallFailure::Converse,
                             Call::Work(_) => CallFailure::Work,
                             Call::Compact(_) => CallFailure::Compact,
                             Call::Tool(_) => CallFailure::Tool(ToolEffect::ReadOnly),
@@ -717,7 +717,7 @@ impl Actor {
                         _ => None,
                     };
                     let failure = match call.as_ref() {
-                        Call::Coordinate(_) => CallFailure::Coordinate,
+                        Call::Converse(_) => CallFailure::Converse,
                         Call::Work(_) => CallFailure::Work,
                         Call::Compact(_) => CallFailure::Compact,
                         Call::Tool(_) => CallFailure::Tool(
@@ -849,9 +849,9 @@ async fn run_call(
     context: CallContext,
 ) -> Event {
     match call {
-        Call::Coordinate(input) => {
-            let result = model.coordinate(input, context).await;
-            Event::CoordinateFinished { call: id, result }
+        Call::Converse(input) => {
+            let result = model.converse(input, context).await;
+            Event::ConverseFinished { call: id, result }
         }
         Call::Work(input) => {
             let result = model.work(input, context).await;
@@ -871,7 +871,7 @@ async fn run_call(
 
 #[derive(Clone, Copy)]
 enum CallFailure {
-    Coordinate,
+    Converse,
     Work,
     Compact,
     Tool(ToolEffect),
@@ -883,7 +883,7 @@ fn failed_event(id: CallId, call: CallFailure, kind: CallErrorKind, message: &st
         message: message.into(),
     };
     match call {
-        CallFailure::Coordinate => Event::CoordinateFinished {
+        CallFailure::Converse => Event::ConverseFinished {
             call: id,
             result: Err(error),
         },
@@ -938,9 +938,41 @@ mod tests {
 
     use super::*;
     use crate::{
-        Await, CallKind, CheckpointDraft, CompactInput, CoordinateInput, DurableReceipt,
+        Await, CallKind, CheckpointDraft, CompactInput, ConversationInput, DurableReceipt,
         PortFuture, ToolSpec, WorkInput, WorkProposal, WorkStep,
     };
+
+    fn conversation_step(input: ConversationInput, goal: &str) -> crate::ConversationStep {
+        let unassigned = input
+            .inputs
+            .iter()
+            .filter(|candidate| {
+                !input
+                    .jobs
+                    .iter()
+                    .any(|job| job.inputs.contains(&candidate.id))
+            })
+            .map(|input| input.id)
+            .collect::<Vec<_>>();
+        if !unassigned.is_empty() {
+            let mut assignment =
+                crate::Assignment::new(crate::JobSpec::new(goal, "test", "finished"));
+            assignment.inputs = unassigned;
+            return crate::ConversationStep::Start(vec![assignment]);
+        }
+        if input
+            .jobs
+            .iter()
+            .all(|job| matches!(job.status, crate::JobStatus::Finished(_)))
+        {
+            return crate::ConversationStep::Reply {
+                inputs: input.inputs.iter().map(|input| input.id).collect(),
+                text: "finished".into(),
+                outcome: crate::InputOutcome::Completed,
+            };
+        }
+        crate::ConversationStep::Wait
+    }
 
     #[test]
     fn shutdown_report_requires_explicit_commit_status() {
@@ -1015,18 +1047,12 @@ mod tests {
     }
 
     impl ModelPort for CancellableWorkerModel {
-        fn coordinate(
+        fn converse(
             &self,
-            input: CoordinateInput,
+            input: ConversationInput,
             _: CallContext,
-        ) -> PortFuture<Result<crate::KernelDecision, CallError>> {
-            Box::pin(future::ready(Ok(crate::KernelDecision::Assign(vec![
-                crate::RouteDelivery {
-                    inputs: input.inputs.iter().map(|input| input.id).collect(),
-                    target: crate::RouteTarget::New,
-                    handoff: "work".into(),
-                },
-            ]))))
+        ) -> PortFuture<Result<crate::ConversationStep, CallError>> {
+            Box::pin(future::ready(Ok(conversation_step(input, "work"))))
         }
         fn work(
             &self,
@@ -1137,7 +1163,7 @@ mod tests {
         .await
         .unwrap();
         agent
-            .post(Input::new(InputId(1), "active routing"))
+            .post(Input::new(InputId(1), "active conversation"))
             .await
             .unwrap();
         assert_eq!(old_starts.recv().await, Some(()));
@@ -1257,18 +1283,12 @@ mod tests {
 
     struct WriteModel;
     impl ModelPort for WriteModel {
-        fn coordinate(
+        fn converse(
             &self,
-            input: CoordinateInput,
+            input: ConversationInput,
             _: CallContext,
-        ) -> PortFuture<Result<crate::KernelDecision, CallError>> {
-            Box::pin(future::ready(Ok(crate::KernelDecision::Assign(vec![
-                crate::RouteDelivery {
-                    inputs: input.inputs.iter().map(|input| input.id).collect(),
-                    target: crate::RouteTarget::New,
-                    handoff: "write".into(),
-                },
-            ]))))
+        ) -> PortFuture<Result<crate::ConversationStep, CallError>> {
+            Box::pin(future::ready(Ok(conversation_step(input, "write"))))
         }
         fn work(
             &self,
@@ -1430,7 +1450,7 @@ mod tests {
             assert!(commits[1].records.iter().any(|record| matches!(
                 record.body,
                 crate::RecordBody::CallStarted {
-                    kind: CallKind::Coordinate,
+                    kind: CallKind::Converse,
                     ..
                 }
             )));
@@ -1473,17 +1493,22 @@ mod tests {
     }
 
     impl ModelPort for PanicOnceModel {
-        fn coordinate(
+        fn converse(
             &self,
-            _: CoordinateInput,
+            input: ConversationInput,
             _: CallContext,
-        ) -> PortFuture<Result<crate::KernelDecision, CallError>> {
+        ) -> PortFuture<Result<crate::ConversationStep, CallError>> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
             let _ = self.started.send(attempt);
             if attempt == 0 {
-                panic!("synchronous coordinate panic");
+                panic!("synchronous converse panic");
             }
-            Box::pin(async { Ok(crate::KernelDecision::Clarify("retry routing".into())) })
+            Box::pin(async move {
+                Ok(crate::ConversationStep::Ask {
+                    inputs: input.inputs.iter().map(|input| input.id).collect(),
+                    question: "retry conversation".into(),
+                })
+            })
         }
 
         fn work(
@@ -1504,7 +1529,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn synchronous_port_panic_releases_the_coordination_slot() {
+    async fn synchronous_port_panic_releases_the_conversation_slot() {
         let (started, mut starts) = mpsc::unbounded_channel();
         let agent = Agent::with_ports(
             Arc::new(PanicOnceModel {
@@ -1573,11 +1598,11 @@ mod tests {
     }
 
     impl ModelPort for PendingModel {
-        fn coordinate(
+        fn converse(
             &self,
-            _: CoordinateInput,
+            _: ConversationInput,
             _: CallContext,
-        ) -> PortFuture<Result<crate::KernelDecision, CallError>> {
+        ) -> PortFuture<Result<crate::ConversationStep, CallError>> {
             let _ = self.started.send(());
             Box::pin(future::pending())
         }
@@ -1655,7 +1680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconfigure_moves_pending_coordination_to_the_new_model() {
+    async fn reconfigure_moves_pending_conversation_to_the_new_model() {
         let (old_started, mut old_starts) = mpsc::unbounded_channel();
         let agent = Agent::with_ports(
             Arc::new(PendingModel {
@@ -1805,19 +1830,12 @@ mod tests {
     struct MaxWaitModel;
 
     impl ModelPort for MaxWaitModel {
-        fn coordinate(
+        fn converse(
             &self,
-            input: CoordinateInput,
+            input: ConversationInput,
             _: CallContext,
-        ) -> PortFuture<Result<crate::KernelDecision, CallError>> {
-            let inputs = input.inputs.into_iter().map(|input| input.id).collect();
-            Box::pin(async move {
-                Ok(crate::KernelDecision::Assign(vec![crate::RouteDelivery {
-                    inputs,
-                    target: crate::RouteTarget::New,
-                    handoff: "wait".into(),
-                }]))
-            })
+        ) -> PortFuture<Result<crate::ConversationStep, CallError>> {
+            Box::pin(async move { Ok(conversation_step(input, "wait")) })
         }
 
         fn work(

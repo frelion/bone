@@ -61,11 +61,8 @@ impl Kernel {
                 self.jobs.get_mut(&job).expect("requester exists").state =
                     JobState::Waiting(WaitState::Inquiry(id));
             }
-            DeliveryTarget::Routing(routing) => {
-                self.routings
-                    .get_mut(&routing)
-                    .expect("requester exists")
-                    .state = RoutingState::WaitingInquiry(id);
+            DeliveryTarget::Conversation => {
+                self.conversation.ready = false;
             }
         }
         self.deliver(
@@ -93,12 +90,8 @@ impl Kernel {
                     self.make_ready(job);
                 }
             }
-            DeliveryTarget::Routing(routing) => {
-                if self.routings.get(&routing).is_some_and(|route| {
-                    matches!(route.state, RoutingState::WaitingInquiry(waiting) if waiting == id)
-                }) {
-                    self.make_routing_ready(routing);
-                }
+            DeliveryTarget::Conversation => {
+                self.conversation.ready = true;
             }
         }
     }
@@ -143,44 +136,30 @@ impl Kernel {
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             }
-            (DeliveryTarget::Routing(routing), ReadQuery::Jobs { parent, .. }) => {
-                let route = &self.routings[&routing];
-                if let (Requester::Job { job, .. }, Some(parent)) = (route.requester, parent)
-                    && !self.owns(job, *parent)
-                {
-                    return Err("worker routing cannot list an unrelated tree".into());
-                }
-                Ok(())
-            }
-            (DeliveryTarget::Routing(routing), ReadQuery::Job(target)) => self
-                .routing_can_access(&self.routings[&routing], *target)
+            (DeliveryTarget::Conversation, ReadQuery::Jobs { .. }) => Ok(()),
+            (DeliveryTarget::Conversation, ReadQuery::Job(target)) => self
+                .jobs
+                .contains_key(target)
                 .then_some(())
-                .ok_or_else(|| "routing cannot read that job".into()),
-            (DeliveryTarget::Routing(routing), ReadQuery::Record { id, offset }) => {
-                let route = &self.routings[&routing];
-                let allowed = route
-                    .records
-                    .iter()
-                    .any(|record| *record == *id || self.attached_record_grants(*record, *id))
-                    || self
-                        .records
-                        .get(id)
-                        .is_some_and(|record| context::session_public(self, record))
-                    || self.public_record(*id)
-                    || self.records.get(id).is_some_and(|record| {
-                        matches!(record.body, RecordBody::RoutingHandoff { job, .. }
-                            if self.jobs.get(&job).is_some_and(|entry| entry.owner == Owner::User))
-                    })
-                    || self.public_evidence(*id)
-                    || matches!(route.requester, Requester::Job { job, .. } if self.can_read_record(job, *id));
-                if !allowed {
-                    return Err("routing cannot read that record".into());
+                .ok_or_else(|| "conversation cannot read that job".into()),
+            (DeliveryTarget::Conversation, ReadQuery::Record { id, offset }) => {
+                if !self.can_read_conversation_record(*id) {
+                    return Err("conversation cannot read that record".into());
                 }
                 context::view(&self.records[id], *offset, self.limits.item_bytes)
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             }
         }
+    }
+
+    pub(super) fn can_read_conversation_record(&self, id: Seq) -> bool {
+        self.conversation.records.iter().any(|record| *record == id || self.attached_record_grants(*record, id))
+            || self.records.get(&id).is_some_and(|record| context::session_public(self, record))
+            || self.public_record(id)
+            || self.records.get(&id).is_some_and(|record| matches!(record.body,
+                RecordBody::JobMessage { job, .. } if self.jobs.get(&job).is_some_and(|entry| entry.owner == Owner::User)))
+            || self.public_evidence(id)
     }
 
     pub(super) fn read(
@@ -204,16 +183,13 @@ impl Kernel {
                             }
                             None => {
                                 matches!(job.owner, Owner::User)
-                                    && !matches!(job.state, JobState::Finished(_))
                             }
                         };
                         (belongs && after.is_none_or(|after| *id > after)).then_some(*id)
                     })
                     .filter(|id| match requester {
                         DeliveryTarget::Job(job) => self.can_access_job(job, *id),
-                        DeliveryTarget::Routing(routing) => {
-                            self.routing_can_access(&self.routings[&routing], *id)
-                        }
+                        DeliveryTarget::Conversation => true,
                     })
                     .take(context::DIRECTORY_PAGE + 1)
                     .collect::<Vec<_>>();
@@ -226,7 +202,7 @@ impl Kernel {
                         }
                         jobs = page.into_iter().map(|id| context::card(self, id)).collect();
                     }
-                    DeliveryTarget::Routing(routing) => {
+                    DeliveryTarget::Conversation => {
                         for (index, id) in ids.iter().take(context::DIRECTORY_PAGE).enumerate() {
                             jobs.push(context::card(self, *id));
                             let has_more = index + 1 < ids.len();
@@ -241,7 +217,7 @@ impl Kernel {
                                     record: None,
                                 },
                             };
-                            if !context::coordinate_read_fits(self, routing, &candidate)
+                            if !context::conversation_read_fits(self, &candidate)
                                 .map_err(|error| error.to_string())?
                             {
                                 jobs.pop();
@@ -272,13 +248,13 @@ impl Kernel {
             jobs,
             record: record_range,
         };
-        if let DeliveryTarget::Routing(routing) = requester {
+        if let DeliveryTarget::Conversation = requester {
             let candidate = Record {
                 seq: self.peek_seq(),
                 origin: Origin::Kernel,
                 body: body.clone(),
             };
-            if !context::coordinate_read_fits(self, routing, &candidate)
+            if !context::conversation_read_fits(self, &candidate)
                 .map_err(|error| error.to_string())?
             {
                 return Err(context::ContextError::TooLarge.to_string());
@@ -290,13 +266,9 @@ impl Kernel {
                 self.attach(job, record.seq);
                 self.enqueue_job(job);
             }
-            DeliveryTarget::Routing(routing) => {
-                self.routings
-                    .get_mut(&routing)
-                    .expect("routing exists")
-                    .records
-                    .push(record.seq);
-                self.make_routing_ready(routing);
+            DeliveryTarget::Conversation => {
+                self.conversation.records.push(record.seq);
+                self.conversation.ready = true;
             }
         }
         Ok(())
@@ -318,7 +290,6 @@ impl Kernel {
         effects: &mut Vec<Effect>,
     ) {
         if matches!(target, DeliveryTarget::Job(job) if self.jobs.get(&job).is_none_or(|entry| matches!(entry.state, JobState::Finished(_))))
-            || matches!(target, DeliveryTarget::Routing(routing) if self.routings.get(&routing).is_none_or(|entry| matches!(entry.state, RoutingState::Closed | RoutingState::Failed(_))))
         {
             return;
         }
@@ -340,13 +311,9 @@ impl Kernel {
                 }
                 self.enqueue_job(job);
             }
-            DeliveryTarget::Routing(routing) => {
-                let route = self
-                    .routings
-                    .get_mut(&routing)
-                    .expect("delivery target exists");
-                route.records.push(record.seq);
-                self.make_routing_ready(routing);
+            DeliveryTarget::Conversation => {
+                self.conversation.records.push(record.seq);
+                self.conversation.ready = true;
             }
         }
     }
@@ -414,13 +381,6 @@ impl Kernel {
         source == target || self.owns(source, target)
     }
 
-    pub(super) fn routing_can_access(&self, route: &Routing, target: JobId) -> bool {
-        match route.requester {
-            Requester::Inputs => self.jobs.contains_key(&target),
-            Requester::Job { job, .. } => self.can_access_job(job, target),
-        }
-    }
-
     pub(super) fn owns(&self, root: JobId, target: JobId) -> bool {
         let mut current = Some(target);
         while let Some(job) = current {
@@ -433,17 +393,6 @@ impl Kernel {
             };
         }
         false
-    }
-
-    pub(crate) fn is_investigation(&self, job: JobId) -> bool {
-        let mut current = job;
-        loop {
-            match self.jobs[&current].owner {
-                Owner::Routing(_) => return true,
-                Owner::Job(parent) => current = parent,
-                Owner::User => return false,
-            }
-        }
     }
 
     pub(super) fn can_read_record(&self, job: JobId, seq: Seq) -> bool {

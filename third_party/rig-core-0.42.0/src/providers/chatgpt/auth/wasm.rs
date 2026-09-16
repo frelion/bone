@@ -30,7 +30,7 @@ impl PlatformAuthenticator {
         ))
     }
 
-    pub(super) fn invalidate_after_rejection_oauth(
+    pub(super) async fn invalidate_after_rejection_oauth(
         &self,
         _access_token: &str,
     ) -> Result<(), AuthError> {

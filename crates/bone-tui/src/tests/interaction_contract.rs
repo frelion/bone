@@ -12,8 +12,8 @@ use crate::{
     input::terminal_event,
     layout::{ClickTarget, PaneDivider},
     state::{
-        Action, KeyboardOwner, ModelPanel, ModelScreen, Overlay, PointerCapture, SessionNavRow,
-        SessionUi, UiEvent, UiState, WorkspaceTarget, update,
+        Action, Effect, KeyboardOwner, ModelChoice, ModelPanel, ModelScreen, Overlay,
+        PointerCapture, SessionNavRow, SessionUi, UiEvent, UiState, WorkspaceTarget, update,
     },
     ui::interaction::ScrollTarget,
     view::{self, FrameSnapshot},
@@ -53,16 +53,20 @@ fn fixture() -> UiState {
         items: vec![HistoryEntry {
             sequence: SessionSeq(1),
             occurred_at: 0,
-            event: SessionEvent::JobFinished {
+            event: SessionEvent::ToolFinished {
+                call: bone_app::CallRef {
+                    runtime: bone_app::RuntimeId::new(),
+                    id: 1,
+                },
                 job: bone_app::JobRef {
                     runtime: bone_app::RuntimeId::new(),
                     id: 1,
                 },
-                outcome: bone_app::OutcomeKind::Completed,
-                summary: (0..100)
-                    .map(|line| format!("result line {line}\n"))
-                    .collect(),
-                remaining: vec![],
+                tool: "read".into(),
+                arguments: serde_json::json!({"path": "result.txt"}),
+                outcome: bone_app::ToolOutcome::value(serde_json::json!({
+                    "lines": (0..100).map(|line| format!("result line {line}")).collect::<Vec<_>>()
+                })),
             },
         }],
         older_cursor: None,
@@ -70,6 +74,21 @@ fn fixture() -> UiState {
     });
     state.session_ui.insert(info.id, ui);
     state
+}
+
+fn chatgpt_add_panel(state: &mut UiState) {
+    let mut models = ModelPanel::new(state.selected);
+    models.screen = ModelScreen::Add { selected: 0 };
+    models.profiles.push(bone_app::Profile::chatgpt());
+    models.choices.push(ModelChoice {
+        selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), "gpt-test")
+            .unwrap(),
+        profile_label: "ChatGPT".into(),
+        label: "GPT Test".into(),
+        note: "Test".into(),
+        recommended: true,
+    });
+    state.overlay = Some(Overlay::Models(models));
 }
 
 fn render(state: &mut UiState, width: u16, height: u16) -> (String, FrameSnapshot) {
@@ -293,7 +312,7 @@ fn mouse_model_overlays_keep_input_visible_and_controls_within_their_surface() {
                     Action::SelectModel(_)
                         | Action::ChooseConnection(_)
                         | Action::CloseOverlay
-                        | Action::ActivatePanel
+                        | Action::RetryLogin
                 )
             )
         }) {
@@ -317,6 +336,85 @@ fn mouse_model_overlays_keep_input_visible_and_controls_within_their_surface() {
             KeyboardOwner::Workspace(WorkspaceTarget::Composer)
         );
     }
+}
+
+#[test]
+fn model_panel_has_one_keyboard_truth_and_an_independent_pointer_route() {
+    let mut state = fixture();
+    chatgpt_add_panel(&mut state);
+    let (_, snapshot) = render(&mut state, 80, 24);
+    let choice = click_action(&snapshot, Action::ChooseConnection(0));
+
+    let down = terminal_event(
+        mouse(MouseEventKind::Down(MouseButton::Left), choice.x, choice.y),
+        Some(&snapshot),
+        &state,
+    )
+    .unwrap();
+    assert!(update(&mut state, down).is_empty());
+    let up = terminal_event(
+        mouse(MouseEventKind::Up(MouseButton::Left), choice.x, choice.y),
+        Some(&snapshot),
+        &state,
+    )
+    .unwrap();
+    let effects = update(&mut state, up);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::SetModel { selection, .. }] if selection.model == "gpt-test"
+    ));
+    assert_eq!(
+        state.keyboard,
+        KeyboardOwner::Workspace(WorkspaceTarget::Composer),
+        "a pointer action must not acquire keyboard ownership"
+    );
+
+    let mut state = fixture();
+    chatgpt_add_panel(&mut state);
+    let enter = terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        None,
+        &state,
+    )
+    .unwrap();
+    assert!(matches!(&enter, UiEvent::Action(Action::ActivatePanel)));
+    let effects = update(&mut state, enter);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::SetModel { selection, .. }] if selection.model == "gpt-test"
+    ));
+    assert!(state.keyboard.is_overlay());
+    let (text, _) = render(&mut state, 80, 24);
+    assert!(text.contains("Applying model…"));
+}
+
+#[test]
+fn model_panel_selection_style_follows_keyboard_ownership() {
+    let mut state = fixture();
+    chatgpt_add_panel(&mut state);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut snapshot = None;
+    terminal
+        .draw(|frame| snapshot = Some(view::render(frame, &state)))
+        .unwrap();
+    let choice = click_action(&snapshot.unwrap(), Action::ChooseConnection(0));
+    assert_eq!(
+        terminal.backend().buffer()[(choice.x, choice.y)].bg,
+        crate::ui::theme::INPUT
+    );
+
+    state.enter_overlay();
+    let mut active_snapshot = None;
+    terminal
+        .draw(|frame| {
+            active_snapshot = Some(view::render(frame, &state));
+        })
+        .unwrap();
+    let choice = click_action(&active_snapshot.unwrap(), Action::ChooseConnection(0));
+    assert_eq!(
+        terminal.backend().buffer()[(choice.x, choice.y)].bg,
+        crate::ui::theme::SELECTED
+    );
 }
 
 #[test]

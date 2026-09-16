@@ -149,7 +149,7 @@ fn revoked_session_compaction_cannot_fail_its_requester_or_install_a_checkpoint(
                 assert!(context::session_checkpoint(&kernel).is_none());
                 assert!(!matches!(
                     input_status(&kernel, input.id),
-                    InputStatus::RoutingFailed { .. }
+                    InputStatus::ConversationFailed { .. }
                 ));
                 if let Some(job) = worker {
                     assert!(!matches!(kernel.job_status(job), JobStatus::Finished(_)));
@@ -175,55 +175,48 @@ fn root_directory_exposes_readable_bounded_assignment_history() {
     let (_, effects) = kernel.accept(NOW, first.clone()).unwrap();
     let effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(&effects),
-            result: Ok(route_new("parser request", &[first.id])),
+        Event::ConverseFinished {
+            call: converse_call(&effects),
+            result: Ok(start_jobs("parser request", &[first.id])),
         },
     );
     let (_, root) = work_calls(&effects).pop().unwrap();
-    let first_handoff = context::card(&kernel, root.job).latest_handoff.unwrap();
     let correction = Input::new(InputId(9911), "include lexer");
     let (_, effects) = kernel.accept(NOW, correction.clone()).unwrap();
-    route_existing(&mut kernel, &effects, root.job, &[correction.id]);
-    let latest = context::card(&kernel, root.job).latest_handoff.unwrap();
-    assert!(
-        matches!(&kernel.records[&latest].body, RecordBody::RoutingHandoff { inputs, previous, .. }
-        if inputs == &[correction.id] && *previous == Some(first_handoff))
-    );
+    send_existing(&mut kernel, &effects, root.job, &[correction.id]);
+    let card = context::card(&kernel, root.job);
+    assert_eq!(card.inputs, vec![first.id, correction.id]);
     let (_, effects) = kernel
         .accept(NOW, Input::new(InputId(9912), "adjust parser again"))
         .unwrap();
-    let (_, Call::Coordinate(directory)) = starts(&effects).next().unwrap() else {
-        panic!("router")
+    let (_, Call::Converse(directory)) = starts(&effects).next().unwrap() else {
+        panic!("conversation")
     };
-    assert_eq!(directory.jobs[0].latest_handoff, Some(latest));
+    assert_eq!(directory.jobs[0].inputs, card.inputs);
     assert!(serde_json::to_vec(directory).unwrap().len() <= kernel.limits.context_bytes);
-    let mut call = coordinate_call(&effects);
-    for (source, expected_input) in [(latest, correction.id), (first_handoff, first.id)] {
+    let mut call = converse_call(&effects);
+    for expected_input in [first.id, correction.id] {
+        let source = kernel.inputs[&expected_input].accepted_at;
         let effects = kernel.step(
             NOW,
-            Event::CoordinateFinished {
+            Event::ConverseFinished {
                 call,
-                result: Ok(KernelDecision::Read(ReadQuery::Record {
+                result: Ok(ConversationStep::Read(ReadQuery::Record {
                     id: source,
                     offset: 0,
                 })),
             },
         );
-        let (_, Call::Coordinate(read)) = starts(&effects).next().unwrap() else {
-            panic!("router read")
+        let (_, Call::Converse(read)) = starts(&effects).next().unwrap() else {
+            panic!("read")
         };
-        assert!(read.records.iter().any(|record| {
-            record.source == source
-                && matches!(serde_json::from_str::<RecordBody>(&record.content),
-                Ok(RecordBody::RoutingHandoff { inputs, .. }) if inputs.contains(&expected_input))
-        }));
-        call = coordinate_call(&effects);
+        assert!(read.records.iter().any(|record| record.source == source));
+        call = converse_call(&effects);
     }
 }
 
 #[test]
-fn routing_handoff_read_permission_does_not_expose_child_records() {
+fn job_message_read_permission_does_not_expose_child_records() {
     let mut kernel = kernel();
     let input = Input::new(InputId(9915), "delegate work");
     let (call, root) = create_roots(
@@ -244,34 +237,43 @@ fn routing_handoff_read_permission_does_not_expose_child_records() {
         .unwrap()
         .1
         .job;
-    let source = context::card(&kernel, root.job).latest_handoff.unwrap();
-    // Simulate a historical handoff owned by a child; the record kind alone
-    // must not grant the new router access to a private job's intent.
+    let source = kernel
+        .records
+        .values()
+        .find_map(|record| {
+            matches!(record.body, RecordBody::JobCreated { job, .. } if job == child)
+                .then_some(record.seq)
+        })
+        .unwrap();
     let mut record = kernel.records[&source].as_ref().clone();
-    if let RecordBody::RoutingHandoff { job, .. } = &mut record.body {
-        *job = child;
-    }
+    record.body = RecordBody::JobMessage {
+        job: child,
+        inputs: vec![],
+        text: "private".into(),
+    };
     kernel.records.insert(source, std::sync::Arc::new(record));
     let next = Input::new(InputId(9916), "unrelated work");
     let (_, effects) = kernel.accept(NOW, next.clone()).unwrap();
     kernel.step(
         NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(&effects),
-            result: Ok(KernelDecision::Read(ReadQuery::Record {
+        Event::ConverseFinished {
+            call: converse_call(&effects),
+            result: Ok(ConversationStep::Read(ReadQuery::Record {
                 id: source,
                 offset: 0,
             })),
         },
     );
-    assert!(matches!(
-        input_status(&kernel, next.id),
-        InputStatus::RoutingFailed { .. }
-    ));
+    assert!(
+        kernel
+            .records
+            .values()
+            .any(|record| matches!(record.body, RecordBody::ConversationRejected { .. }))
+    );
 }
 
 #[test]
-fn user_questions_survive_session_projection_and_can_be_read_by_later_routing() {
+fn user_questions_survive_session_projection_and_can_be_read_by_later_conversation() {
     for worker_question in [false, true] {
         let mut kernel = kernel();
         let original = Input::new(InputId(9920), "choose a destination");
@@ -280,22 +282,32 @@ fn user_questions_survive_session_projection_and_can_be_read_by_later_routing() 
         if worker_question {
             let effects = kernel.step(
                 NOW,
-                Event::CoordinateFinished {
-                    call: coordinate_call(&effects),
-                    result: Ok(route_new("choose destination", &[original.id])),
+                Event::ConverseFinished {
+                    call: converse_call(&effects),
+                    result: Ok(start_jobs("choose destination", &[original.id])),
                 },
             );
             work(
                 &mut kernel,
                 work_calls(&effects)[0].0,
-                WorkStep::AskUser(question.into()),
+                WorkStep::NeedInput(question.into()),
+            );
+            converse_step(
+                &mut kernel,
+                ConversationStep::Ask {
+                    inputs: vec![original.id],
+                    question: question.into(),
+                },
             );
         } else {
             kernel.step(
                 NOW,
-                Event::CoordinateFinished {
-                    call: coordinate_call(&effects),
-                    result: Ok(KernelDecision::Clarify(question.into())),
+                Event::ConverseFinished {
+                    call: converse_call(&effects),
+                    result: Ok(ConversationStep::Ask {
+                        inputs: vec![original.id],
+                        question: question.into(),
+                    }),
                 },
             );
         }
@@ -316,41 +328,44 @@ fn user_questions_survive_session_projection_and_can_be_read_by_later_routing() 
             .accept(NOW, Input::new(InputId(9922), "use that choice again"))
             .unwrap();
         // A prior router call may need to retire before the newest routing starts.
-        let effects = if starts(&effects).any(|(_, call)| matches!(call, Call::Coordinate(_))) {
+        let effects = if starts(&effects).any(|(_, call)| matches!(call, Call::Converse(_))) {
             effects
         } else {
-            let call = coordinate_call(&reply_effects);
+            let call = converse_call(&reply_effects);
             kernel.step(
                 NOW,
-                Event::CoordinateFinished {
+                Event::ConverseFinished {
                     call,
-                    result: Ok(KernelDecision::Clarify("stale".into())),
+                    result: Ok(ConversationStep::Ask {
+                        inputs: vec![original.id],
+                        question: "stale".into(),
+                    }),
                 },
             )
         };
-        let (_, Call::Coordinate(coordinate)) = starts(&effects).next().unwrap() else {
-            panic!("router")
+        let (_, Call::Converse(conversation)) = starts(&effects).next().unwrap() else {
+            panic!("conversation")
         };
-        let inputs = coordinate
+        let inputs = conversation
             .inputs
             .iter()
             .map(|input| input.id)
             .collect::<Vec<_>>();
         kernel.step(
             NOW,
-            Event::CoordinateFinished {
-                call: coordinate_call(&effects),
-                result: Ok(route_new("use the choice", &inputs)),
+            Event::ConverseFinished {
+                call: converse_call(&effects),
+                result: Ok(start_jobs("use the choice", &inputs)),
             },
         );
         let (_, effects) = kernel
             .accept(NOW, Input::new(InputId(9923), "remember the destination"))
             .unwrap();
-        let (_, Call::Coordinate(coordinate)) = starts(&effects).next().unwrap() else {
+        let (_, Call::Converse(conversation)) = starts(&effects).next().unwrap() else {
             panic!("new router")
         };
         assert!(
-            serde_json::to_string(&coordinate.background)
+            serde_json::to_string(&conversation)
                 .unwrap()
                 .contains(question)
         );
@@ -363,16 +378,16 @@ fn user_questions_survive_session_projection_and_can_be_read_by_later_routing() 
         );
         let effects = kernel.step(
             NOW,
-            Event::CoordinateFinished {
-                call: coordinate_call(&effects),
-                result: Ok(KernelDecision::Read(ReadQuery::Record {
+            Event::ConverseFinished {
+                call: converse_call(&effects),
+                result: Ok(ConversationStep::Read(ReadQuery::Record {
                     id: question_seq,
                     offset: 0,
                 })),
             },
         );
-        let (_, Call::Coordinate(read)) = starts(&effects).next().unwrap() else {
-            panic!("router read")
+        let (_, Call::Converse(read)) = starts(&effects).next().unwrap() else {
+            panic!("conversation read")
         };
         assert!(
             read.records
@@ -380,4 +395,69 @@ fn user_questions_survive_session_projection_and_can_be_read_by_later_routing() 
                 .any(|record| record.source == question_seq && record.content.contains(question))
         );
     }
+}
+
+#[test]
+fn conversation_inputs_follow_acceptance_order_not_numeric_ids() {
+    let mut kernel = kernel();
+    kernel
+        .accept(NOW, Input::new(InputId(99), "first request"))
+        .unwrap();
+    kernel
+        .accept(NOW, Input::new(InputId(1), "new correction"))
+        .unwrap();
+    let input = context::prepare_conversation(&kernel).unwrap();
+    assert_eq!(
+        input
+            .inputs
+            .iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        vec![InputId(99), InputId(1)]
+    );
+}
+
+#[test]
+fn public_session_checkpoint_does_not_cover_unconsumed_conversation_feedback() {
+    let mut kernel = kernel();
+    let (_, effects) = kernel
+        .accept(NOW, Input::new(InputId(1), "do work"))
+        .unwrap();
+    kernel.step(
+        NOW,
+        Event::ConverseFinished {
+            call: converse_call(&effects),
+            result: Ok(ConversationStep::Wait),
+        },
+    );
+    let feedback = kernel
+        .records
+        .values()
+        .find_map(|record| {
+            matches!(record.body, RecordBody::ConversationRejected { .. }).then_some(record.seq)
+        })
+        .unwrap();
+    let (receipt, _) = kernel
+        .accept(NOW, Input::new(InputId(2), "more context"))
+        .unwrap();
+    let seq = Seq(kernel.records.keys().next_back().unwrap().0 + 1);
+    kernel.records.insert(
+        seq,
+        std::sync::Arc::new(crate::Record {
+            seq,
+            origin: crate::Origin::Kernel,
+            body: RecordBody::SessionCheckpoint {
+                checkpoint: std::sync::Arc::new(crate::SessionCheckpoint {
+                    through: receipt.accepted_at,
+                    summary: "public messages only".into(),
+                    evidence: Vec::new(),
+                }),
+            },
+        }),
+    );
+    let input = context::prepare_conversation(&kernel).unwrap();
+    assert!(
+        input.records.iter().any(|record| record.source == feedback),
+        "public compaction must not acknowledge private conversation feedback"
+    );
 }

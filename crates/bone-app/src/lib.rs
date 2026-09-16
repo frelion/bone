@@ -12,6 +12,7 @@ mod credentials;
 mod error;
 mod file_config;
 mod persistence;
+mod presentation;
 mod providers;
 mod safe_file;
 mod session;
@@ -21,10 +22,12 @@ mod workspace_changes;
 
 pub use api::*;
 pub use app::{App, LoginAttempt};
+pub use bone_adapters::tools::presentation::{TextSection, ToolDetails, ToolSummary};
 pub use config::*;
 pub use credentials::{ApiKey, ApiKeyCredentialError};
 pub use error::{Error, Result};
 pub use file_config::ProjectConfigStatus;
+pub use presentation::{tool_details, tool_summary};
 pub use session::Session;
 
 pub use bone_adapters::{
@@ -36,6 +39,7 @@ pub use bone_adapters::{
 };
 pub use bone_core::{
     AgentLimits, CallError, CallErrorKind, ExternalEffect, InputOutcome, OutcomeKind, ToolOutcome,
+    ToolSelection,
 };
 
 pub(crate) use persistence::{DataStore, SavedRuntime, SavedSession};

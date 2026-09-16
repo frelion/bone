@@ -35,7 +35,7 @@ pub(super) fn status_tone(state: &UiState, index: usize) -> Option<Color> {
                 InputState::WaitingForUser { .. } => {
                     return Some(theme::WARNING);
                 }
-                InputState::RoutingFailed { .. } | InputState::Rejected { .. } => {
+                InputState::ConversationFailed { .. } | InputState::Rejected { .. } => {
                     return Some(DANGER);
                 }
                 _ => {}
@@ -270,7 +270,6 @@ pub(super) fn problem_status(problem: &bone_app::AppProblem) -> (&'static str, C
                 ("Endpoint changed", theme::WARNING)
             }
         },
-        ProfileBusy(_) => ("Profile busy", theme::WARNING),
         Provider(_) => ("Provider error", DANGER),
         Storage(_) => ("Storage error", DANGER),
         Tools(_) => ("Tool error", DANGER),

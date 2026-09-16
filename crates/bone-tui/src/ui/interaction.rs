@@ -227,7 +227,7 @@ impl FrameHits {
                         },
                     );
                 }
-                result.push_str(&crate::text::sanitize_external(part));
+                result.push_str(part);
                 had_text = true;
             }
         }

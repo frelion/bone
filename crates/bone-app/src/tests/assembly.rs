@@ -4,7 +4,7 @@ use bone_adapters::llm::{
 };
 use rig_core::{
     providers::openai,
-    test_utils::{MockHttpResponse, RecordingHttpClient},
+    test_utils::{MockHttpResponse, SequencedHttpClient},
 };
 use serde_json::Value;
 
@@ -32,12 +32,46 @@ fn submission_response(name: &str, arguments: Value) -> String {
 }
 
 #[tokio::test]
-async fn provider_assembly_completes_an_input_and_preserves_history_after_reopen() {
+async fn conversation_owns_replies_across_greeting_job_and_reopened_followup() {
     let temporary = tempfile::tempdir().unwrap();
     let data = temporary.path().join("data");
-    let workspace_root = temporary.path().join("workspace");
-    std::fs::create_dir(&workspace_root).unwrap();
-
+    let root = temporary.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let reply = |id, text: &str| ConversationStep::Reply {
+        inputs: vec![bone_core::InputId(id)],
+        text: text.into(),
+        outcome: InputOutcome::Completed,
+    };
+    let mut task = Assignment::new(JobSpec::new(
+        "inspect the parser",
+        "read-only",
+        "report findings",
+    ));
+    task.inputs = vec![bone_core::InputId(2)];
+    task.tools = Some(ToolSelection::ReadOnly);
+    let transports = [
+        SequencedHttpClient::new(
+            [
+                reply(1, "Hello!"),
+                ConversationStep::Start(vec![task]),
+                reply(2, "The parser is correct."),
+                reply(3, "As we found earlier, the parser is correct."),
+            ]
+            .into_iter()
+            .map(|step| {
+                MockHttpResponse::success(submission_response(
+                    "submit_conversation",
+                    json!({"step": step}),
+                ))
+            }),
+        ),
+        SequencedHttpClient::new([MockHttpResponse::success(submission_response(
+            "submit_work",
+            json!(WorkProposal::new(WorkStep::Finish(Completion::new(
+                "internal parser findings"
+            )))),
+        ))]),
+    ];
     let profiles = ["coordinator", "worker"].map(|name| {
         Profile::new(
             ProfileId::new(name).unwrap(),
@@ -48,15 +82,6 @@ async fn provider_assembly_completes_an_input_and_preserves_history_after_reopen
         )
         .unwrap()
     });
-    let transports = [
-        RecordingHttpClient::default(),
-        RecordingHttpClient::new(submission_response(
-            "submit_work",
-            json!(WorkProposal::new(WorkStep::Finish(Completion::new(
-                "offline assembly completed"
-            )))),
-        )),
-    ];
     let endpoints = profiles
         .iter()
         .zip(&transports)
@@ -72,156 +97,119 @@ async fn provider_assembly_completes_an_input_and_preserves_history_after_reopen
                 openai_responses_endpoint(profile.id.as_str(), client).unwrap(),
             )
         })
-        .collect();
-    let providers = ProviderConnector::with_endpoints(endpoints);
-    let app = App::with_provider_connector(AppOptions::isolated(&data), providers.clone())
+        .collect::<std::collections::HashMap<_, _>>();
+    let providers = ProviderConnector::with_endpoints(endpoints.clone());
+    let app = App::with_provider_connector(AppOptions::isolated(&data), providers)
         .await
         .unwrap();
     for profile in &profiles {
         app.save_profile(profile.clone()).await.unwrap();
     }
-    let workspace = app.open_workspace(&workspace_root).await.unwrap();
+    let workspace = app.open_workspace(&root).await.unwrap();
     let session = app
-        .create_session(workspace.id, "Offline production assembly")
+        .create_session(workspace.id, "Conversation assembly")
         .await
         .unwrap();
-
-    // Queue first so the fixed coordinator response uses the actual public ID.
-    let receipt = session
-        .submit(SubmitInput::new("complete this offline"))
-        .await
-        .unwrap();
-    transports[0].set_response(MockHttpResponse::success(submission_response(
-        "submit_coordination",
-        json!({
-            "decision": KernelDecision::Assign(vec![RouteDelivery {
-                inputs: vec![bone_core::InputId(receipt.input.0)],
-                target: RouteTarget::New,
-                handoff: "offline assembly".into(),
-            }])
-        }),
-    )));
-
-    let selections = [
-        (&profiles[0], ReasoningEffort::High),
-        (&profiles[1], ReasoningEffort::Low),
-    ]
-    .map(|(profile, effort)| {
-        let mut selection =
+    for (index, profile) in profiles.iter().enumerate() {
+        let mut model =
             ModelSelection::new(profile.id.clone(), format!("{}-model", profile.id)).unwrap();
-        selection.options = Some(ModelOptions::OpenAiResponses {
-            reasoning: Reasoning::new().effort(effort),
+        model.options = Some(ModelOptions::OpenAiResponses {
+            reasoning: Reasoning::new().effort(if index == 0 {
+                ReasoningEffort::High
+            } else {
+                ReasoningEffort::Low
+            }),
         });
-        selection
-    });
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Coordinator(Some(selections[0].clone())),
-    )
-    .await
-    .unwrap();
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Worker(Some(selections[1].clone())),
-    )
-    .await
-    .unwrap();
-    assert_completed(wait_for_input(&session, receipt.input).await);
-
-    for (transport, role, submission, effort) in [
-        (&transports[0], "coordinator", "submit_coordination", "high"),
-        (&transports[1], "worker", "submit_work", "low"),
+        let change = if index == 0 {
+            ConfigChange::Coordinator(Some(model))
+        } else {
+            ConfigChange::Worker(Some(model))
+        };
+        app.update_config(ConfigScope::User, change).await.unwrap();
+    }
+    session.reload_config().await.unwrap();
+    let greeting = session.submit(SubmitInput::new("Hello")).await.unwrap();
+    assert_eq!(greeting.input.0, 1);
+    assert_completed(wait_for_input(&session, greeting.input).await);
+    assert!(session.snapshot().await.unwrap().jobs.is_empty());
+    assert_eq!(transports[0].requests().len(), 1);
+    assert!(transports[1].requests().is_empty());
+    let task = session
+        .submit(SubmitInput::new(
+            "Inspect the parser without modifying files",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(task.input.0, 2);
+    assert_completed(wait_for_input(&session, task.input).await);
+    let snapshot = session.snapshot().await.unwrap();
+    assert_eq!(snapshot.jobs.len(), 1);
+    assert_eq!(
+        snapshot.jobs[0].allowed_tools,
+        ["glob", "grep", "read", "session_history"]
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    );
+    let history = session.history(SessionSeq(0), 256).await.unwrap();
+    let replies = history
+        .items
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            SessionEvent::Reply { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replies, ["Hello!", "The parser is correct."]);
+    assert!(history.items.iter().any(|entry| matches!(&entry.event, SessionEvent::JobFinished { summary, .. } if summary == "internal parser findings")));
+    for (index, role, submission, effort) in [
+        (0, "coordinator", "submit_conversation", "high"),
+        (1, "worker", "submit_work", "low"),
     ] {
-        let requests = transport.requests();
-        assert_eq!(requests.len(), 1, "expected one {role} call");
-        let request = &requests[0];
-        assert_eq!(request.uri, format!("https://{role}.example/v1/responses"));
-        let body: Value = serde_json::from_slice(&request.body).unwrap();
-        assert_eq!(body["model"], format!("{role}-model"));
+        let requests = transports[index].requests();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            requests[0].uri,
+            format!("https://{role}.example/v1/responses")
+        );
         assert_eq!(body["reasoning"]["effort"], effort);
         assert_eq!(body["tools"][0]["name"], submission);
-        assert_eq!(
-            body["tool_choice"],
-            json!({"type": "function", "name": submission})
-        );
-        let context = body["input"][0]["content"][0]["text"]
-            .as_str()
-            .expect("agent context should be sent as text");
-        let expected_context = if role == "coordinator" {
-            "complete this offline"
-        } else {
-            "offline assembly"
-        };
-        assert!(
-            context.contains(expected_context),
-            "{role} context omitted `{expected_context}`"
-        );
     }
-
-    let history = session.history(SessionSeq(0), 256).await.unwrap();
-    assert!(!history.has_more);
-    assert!(history.items.iter().any(|entry| matches!(
-        &entry.event,
-        SessionEvent::RuntimeStarted { config, .. }
-            if config.coordinator.profile == profiles[0]
-                && config.worker.profile == profiles[1]
-                && config.coordinator.selection == selections[0]
-                && config.worker.selection == selections[1]
-    )));
-    let session_id = session.id();
+    let id = session.id();
     app.shutdown().await.unwrap();
     drop(session);
     drop(app);
-
-    let reopened = App::with_provider_connector(AppOptions::isolated(&data), providers)
+    let reopened = App::with_provider_connector(
+        AppOptions::isolated(&data),
+        ProviderConnector::with_endpoints(endpoints),
+    )
+    .await
+    .unwrap();
+    let session = reopened.session(id).await.unwrap();
+    let followup = session
+        .submit(SubmitInput::new("What did we conclude earlier?"))
         .await
         .unwrap();
-    let session = reopened.session(session_id).await.unwrap();
+    assert_eq!(followup.input.0, 3);
+    assert_completed(wait_for_input(&session, followup.input).await);
+    assert_eq!(transports[0].requests().len(), 4);
+    assert_eq!(transports[1].requests().len(), 1);
+    let requests = transports[0].requests();
+    let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+    let context = body["input"][0]["content"][0]["text"].as_str().unwrap();
+    assert!(context.contains("The parser is correct."));
+    assert!(context.contains("What did we conclude earlier?"));
     let restored = session.history(SessionSeq(0), 256).await.unwrap();
-    assert!(!restored.has_more);
     assert!(restored.items.starts_with(&history.items));
     assert_eq!(
         restored
             .items
             .iter()
-            .filter(|entry| matches!(
-                entry.event,
-                SessionEvent::InputFinished { input, outcome: InputOutcome::Completed, .. }
-                    if input == receipt.input
-            ))
+            .filter(|entry| matches!(entry.event, SessionEvent::Reply { .. }))
             .count(),
-        1
+        3
     );
-
-    let next_input = receipt.input.0 + 1;
-    transports[0].set_response(MockHttpResponse::success(submission_response(
-        "submit_coordination",
-        json!({
-            "decision": KernelDecision::Assign(vec![RouteDelivery {
-                inputs: vec![bone_core::InputId(next_input)],
-                target: RouteTarget::New,
-                handoff: "continue after durable restart".into(),
-            }])
-        }),
-    )));
-    let second = session
-        .submit(SubmitInput::new("continue after reopening"))
-        .await
-        .unwrap();
-    assert_eq!(second.input.0, next_input);
-    assert_completed(wait_for_input(&session, second.input).await);
-
-    let coordinator_requests = transports[0].requests();
-    assert_eq!(coordinator_requests.len(), 2);
-    let body: Value = serde_json::from_slice(&coordinator_requests[1].body).unwrap();
-    let context = body["input"][0]["content"][0]["text"]
-        .as_str()
-        .expect("restored coordinator context should be text");
-    assert!(context.contains("continue after reopening"));
-    assert!(
-        context.contains("offline assembly completed"),
-        "durable Session memory omitted the prior root outcome"
-    );
-    assert_eq!(transports[1].requests().len(), 2);
+    assert_eq!(transports[0].remaining_responses(), 0);
+    assert_eq!(transports[1].remaining_responses(), 0);
     reopened.shutdown().await.unwrap();
 }

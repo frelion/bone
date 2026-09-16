@@ -21,9 +21,9 @@ const TITLE_INSET: u16 = 2;
 
 pub(super) fn keyboard_hint(state: &UiState) -> &'static str {
     if state.keyboard.is_overlay() {
-        "esc back · f6 return to input"
+        "↑↓ move · enter choose · f6 input"
     } else {
-        "back · f6 use panel keyboard"
+        "click or enter choose · f6 keyboard"
     }
 }
 
@@ -128,11 +128,6 @@ pub(super) fn render(
                 .clamp(5, if spacious { 22 } else { 14 }) as u16,
                 "Choose model",
             ),
-            ModelScreen::Reasoning { model, .. } => (
-                (models.reasoning_efforts(*model).len() * usize::from(stride) + 6)
-                    .clamp(7, if spacious { 20 } else { 13 }) as u16,
-                "Choose reasoning depth",
-            ),
             ModelScreen::Manage { .. } => (
                 (models.profiles.len().max(1) * usize::from(stride) + 4)
                     .clamp(5, if spacious { 22 } else { 14 }) as u16,
@@ -150,8 +145,19 @@ pub(super) fn render(
     }
     hits.push_scroll(area, crate::ui::interaction::ScrollTarget::Overlay);
     let shell = render_shell(frame, plan.screen, area, title);
+    let busy = match panel {
+        Overlay::Models(models) => state
+            .model_operation
+            .filter(|operation| operation.session == models.session)
+            .map(|operation| match operation.kind {
+                ModelOperationKind::Load => "loading models…",
+                ModelOperationKind::Apply => "switching model…",
+            }),
+        Overlay::Objects(_) | Overlay::Help => None,
+    };
     frame.render_widget(
-        Paragraph::new(keyboard_hint(state)).style(Style::default().fg(MUTED)),
+        Paragraph::new(busy.unwrap_or_else(|| keyboard_hint(state)))
+            .style(Style::default().fg(if busy.is_some() { INFO } else { MUTED })),
         shell.back,
     );
     let stride = shell.stride;
@@ -202,8 +208,9 @@ pub(super) fn render(
                         stride,
                     );
                     frame.render_widget(
-                        Paragraph::new(single_line_external(label))
-                            .style(menu_style(index == objects.selected)),
+                        Paragraph::new(single_line_external(label)).style(menu_style(
+                            index == objects.selected && state.keyboard.is_overlay(),
+                        )),
                         row,
                     );
                     hits.push(ClickRegion {
@@ -275,7 +282,7 @@ pub(super) fn render(
                                 row,
                                 state,
                                 choice,
-                                index == selected,
+                                index == selected && state.keyboard.is_overlay(),
                                 stride > 1,
                             );
                         } else {
@@ -285,7 +292,9 @@ pub(super) fn render(
                                 "Manage connections…"
                             };
                             frame.render_widget(
-                                Paragraph::new(label).style(model_menu_style(index == selected)),
+                                Paragraph::new(label).style(model_menu_style(
+                                    index == selected && state.keyboard.is_overlay(),
+                                )),
                                 row,
                             );
                         }
@@ -294,67 +303,6 @@ pub(super) fn render(
                             target: ClickTarget::Action(Action::SelectModel(index)),
                         });
                     }
-                }
-            }
-            ModelScreen::Reasoning { model, selected } => {
-                let Some(choice) = models.choices.get(*model) else {
-                    return Some(area);
-                };
-                let preset = models.preset(*model);
-                let configured = state
-                    .model_facts
-                    .as_ref()
-                    .and_then(|facts| facts.saved.as_ref().ok())
-                    .filter(|resolved| {
-                        resolved.selection.profile == choice.selection.profile
-                            && resolved.selection.model == choice.selection.model
-                    })
-                    .and_then(|resolved| crate::state::model_effort(&resolved.selection));
-                let choices = models.reasoning_efforts(*model);
-                let choices_y = if inner.height >= 5 {
-                    frame.render_widget(
-                        Paragraph::new(Line::from(vec![
-                            Span::styled(&choice.label, theme::label(INK)),
-                            Span::styled(
-                                format!("  {}", choice.profile_label),
-                                Style::default().fg(MUTED),
-                            ),
-                        ])),
-                        Rect::new(inner.x, inner.y, inner.width, 1),
-                    );
-                    frame.render_widget(
-                        Paragraph::new("How much time should this model spend reasoning?")
-                            .style(theme::body(MUTED)),
-                        Rect::new(inner.x, inner.y + 1, inner.width, 1),
-                    );
-                    inner.y + 2
-                } else {
-                    inner.y
-                };
-                let choices_height = inner.bottom().saturating_sub(choices_y);
-                let capacity = usize::from(choices_height / stride);
-                let cursor = (*selected).min(choices.len().saturating_sub(1));
-                let start = cursor.saturating_sub(capacity.saturating_sub(1));
-                for (index, effort) in choices.iter().enumerate().skip(start).take(capacity) {
-                    let row = Rect::new(
-                        inner.x,
-                        choices_y + (index - start) as u16 * stride,
-                        inner.width,
-                        stride,
-                    );
-                    render_reasoning_choice(
-                        frame,
-                        row,
-                        *effort,
-                        index == *selected,
-                        configured == Some(*effort),
-                        preset.and_then(|preset| preset.default_reasoning) == Some(*effort),
-                        spacious,
-                    );
-                    hits.push(ClickRegion {
-                        area: row,
-                        target: ClickTarget::Action(Action::SelectModel(index)),
-                    });
                 }
             }
             ModelScreen::Manage { selected } => {
@@ -401,8 +349,9 @@ pub(super) fn render(
                             label
                         };
                         frame.render_widget(
-                            Paragraph::new(super::sanitize_external(&label))
-                                .style(menu_style(index == *selected)),
+                            Paragraph::new(super::sanitize_external(&label)).style(menu_style(
+                                index == *selected && state.keyboard.is_overlay(),
+                            )),
                             row,
                         );
                         hits.push(ClickRegion {
@@ -452,12 +401,13 @@ pub(super) fn render(
                         1,
                     );
                     frame.render_widget(
-                        Paragraph::new("Retry sign-in").style(menu_style(true)),
+                        Paragraph::new("Retry sign-in")
+                            .style(menu_style(state.keyboard.is_overlay())),
                         action,
                     );
                     hits.push(ClickRegion {
                         area: action,
-                        target: ClickTarget::Action(Action::ActivatePanel),
+                        target: ClickTarget::Action(Action::RetryLogin),
                     });
                 }
             }
@@ -486,7 +436,6 @@ pub(super) fn render(
                 "Mouse drag    Select; release to copy".to_owned(),
                 "/model        Models & connections".to_owned(),
                 "/reload-config Reload configuration files".to_owned(),
-                "/trust-config Trust current project config".to_owned(),
                 "/details      Latest task / tool".to_owned(),
             ];
             let text = lines.join("\n");
@@ -728,57 +677,6 @@ fn render_model_choice(
     frame.render_widget(Paragraph::new(lines).style(theme::surface(background)), row);
 }
 
-fn render_reasoning_choice(
-    frame: &mut Frame<'_>,
-    row: Rect,
-    effort: bone_app::ReasoningEffort,
-    selected: bool,
-    configured: bool,
-    recommended: bool,
-    spacious: bool,
-) {
-    let background = if selected { theme::PANEL } else { INPUT };
-    let (name, note) = reasoning_copy(effort);
-    let mut title = name.to_owned();
-    if configured {
-        title.push_str(" · ✓ Current");
-    } else if recommended {
-        title.push_str(" · Recommended");
-    }
-    let pointer = if selected { "› " } else { "  " };
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            pointer,
-            theme::label_on(if selected { INFO } else { background }, background),
-        ),
-        Span::styled(title, theme::label_on(INK, background)),
-        Span::styled(
-            format!("  {}", effort.as_str()),
-            theme::body_on(MUTED, background),
-        ),
-    ])];
-    if spacious {
-        lines.push(Line::from(vec![
-            Span::styled("  ", theme::body_on(MUTED, background)),
-            Span::styled(note, theme::body_on(MUTED, background)),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(lines).style(theme::surface(background)), row);
-}
-
-fn reasoning_copy(effort: bone_app::ReasoningEffort) -> (&'static str, &'static str) {
-    use bone_app::ReasoningEffort;
-    match effort {
-        ReasoningEffort::None => ("Instant", "Lowest latency, without deliberate reasoning"),
-        ReasoningEffort::Minimal => ("Quick", "Minimal reasoning for very simple work"),
-        ReasoningEffort::Low => ("Fast", "Light reasoning for straightforward work"),
-        ReasoningEffort::Medium => ("Balanced", "A good default for everyday work"),
-        ReasoningEffort::High => ("Deep", "More reasoning for complex tasks"),
-        ReasoningEffort::Xhigh => ("Extra deep", "For hard problems; responses take longer"),
-        ReasoningEffort::Max => ("Maximum", "Use the maximum reasoning available"),
-    }
-}
-
 pub(super) fn menu_style(selected: bool) -> Style {
     if selected {
         theme::label_on(INK, theme::SELECTED)
@@ -821,6 +719,7 @@ mod grouped_menu_tests {
             models.profiles = vec![bone_app::Profile::chatgpt(); 5];
             let row_count = models.row_count();
             state.overlay = Some(Overlay::Models(models));
+            state.enter_overlay();
             for selected in 0..row_count {
                 let Some(Overlay::Models(models)) = &mut state.overlay else {
                     unreachable!();
@@ -939,7 +838,7 @@ mod grouped_menu_tests {
             plan.unwrap()
                 .hit_regions()
                 .into_iter()
-                .any(|hit| { hit.target == ClickTarget::Action(Action::ActivatePanel) })
+                .any(|hit| { hit.target == ClickTarget::Action(Action::RetryLogin) })
         );
     }
 }

@@ -1670,6 +1670,44 @@ fn logical_line_count(content: &str) -> usize {
     }
 }
 
+use super::presentation::{self, TextSection, ToolSummary};
+
+pub(super) fn summary(
+    _args: &serde_json::Value,
+    output: Option<&serde_json::Value>,
+) -> Option<ToolSummary> {
+    Some(ToolSummary {
+        subject: "Workspace changes".to_owned(),
+        result: match output {
+            Some(output) => Some(format!("{} files", output["changes"].as_array()?.len())),
+            None => None,
+        },
+    })
+}
+
+pub(super) fn details(
+    _args: &serde_json::Value,
+    output: &serde_json::Value,
+) -> Option<Vec<TextSection>> {
+    let mut sections = Vec::new();
+    for change in output["changes"].as_array()? {
+        let mut heading = change["path"].as_str()?.to_owned();
+        if let Some(destination) = change["moved_to"].as_str() {
+            heading.push_str(&format!(" → {destination}"));
+        }
+        sections.push(presentation::section(
+            heading,
+            format!(
+                "{} · +{} −{} lines",
+                change["kind"].as_str()?,
+                change["added_lines"].as_u64()?,
+                change["removed_lines"].as_u64()?
+            ),
+        ));
+    }
+    Some(sections)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

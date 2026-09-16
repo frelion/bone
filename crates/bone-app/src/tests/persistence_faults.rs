@@ -7,33 +7,32 @@ use std::{
 };
 
 use bone_core::{
-    CallContext, CallError, CheckpointDraft, CompactInput, Completion, CoordinateInput,
-    KernelDecision, ModelPort, PortFuture, WorkInput, WorkProposal, WorkStep,
+    CallContext, CallError, CheckpointDraft, CompactInput, Completion, ConversationInput,
+    ConversationStep, ModelPort, PortFuture, WorkInput, WorkProposal, WorkStep,
 };
 use tokio::sync::Notify;
 
-use super::{assert_completed, configure_test_model, route_input, wait_for_input};
+use super::{assert_completed, configure_test_model, converse_for_work, wait_for_input};
 use crate::*;
 
 #[derive(Default)]
 struct GatedModel {
-    coordinate_calls: AtomicUsize,
-    work_calls: AtomicUsize,
-    coordinate_started: Notify,
-    release_first_coordinate: Arc<Notify>,
+    conversation_calls: AtomicUsize,
+    conversation_started: Notify,
+    release_first_conversation: Arc<Notify>,
 }
 
 impl ModelPort for GatedModel {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         _: CallContext,
-    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let call = self.coordinate_calls.fetch_add(1, Ordering::SeqCst);
-        self.coordinate_started.notify_one();
-        let decision = route_input(&input, "answer");
+    ) -> PortFuture<std::result::Result<ConversationStep, CallError>> {
+        let call = self.conversation_calls.fetch_add(1, Ordering::SeqCst);
+        self.conversation_started.notify_one();
+        let decision = converse_for_work(&input, "answer");
         if call == 0 {
-            let release = Arc::clone(&self.release_first_coordinate);
+            let release = Arc::clone(&self.release_first_conversation);
             Box::pin(async move {
                 release.notified().await;
                 Ok(decision)
@@ -48,13 +47,10 @@ impl ModelPort for GatedModel {
         _: WorkInput,
         _: CallContext,
     ) -> PortFuture<std::result::Result<WorkProposal, CallError>> {
-        let call = self.work_calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            Ok(WorkProposal::new(if call == 0 {
-                WorkStep::Reply("first reply".into())
-            } else {
-                WorkStep::Finish(Completion::new("finished"))
-            }))
+        Box::pin(async {
+            Ok(WorkProposal::new(WorkStep::Finish(Completion::new(
+                "finished",
+            ))))
         })
     }
 
@@ -103,25 +99,28 @@ async fn agent_record_failure_blocks_execution_and_recovers_the_partial_archive(
     let store = app.test_store();
 
     let first = session.submit(SubmitInput::new("first")).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), model.coordinate_started.notified())
-        .await
-        .expect("coordinator did not start");
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        model.conversation_started.notified(),
+    )
+    .await
+    .expect("coordinator did not start");
 
     session.snapshot().await.unwrap();
     let through_before_failure = store.session(session.id()).unwrap().unwrap().agent_through;
     store.fail_agent_record_saves_after(1);
-    model.release_first_coordinate.notify_one();
+    model.release_first_conversation.notify_one();
 
     wait_for_storage_problem(&session).await;
     let through_at_failure = store.session(session.id()).unwrap().unwrap().agent_through;
     assert_eq!(through_at_failure, through_before_failure + 1);
 
-    let calls_while_blocked = model.coordinate_calls.load(Ordering::SeqCst);
+    let calls_while_blocked = model.conversation_calls.load(Ordering::SeqCst);
     let second = session.submit(SubmitInput::new("second")).await.unwrap();
     // Round-trip through the session and core actors while archival is still blocked.
     assert!(matches!(session.snapshot().await, Err(Error::Storage(_))));
     assert_eq!(
-        model.coordinate_calls.load(Ordering::SeqCst),
+        model.conversation_calls.load(Ordering::SeqCst),
         calls_while_blocked,
         "durable submit must stay queued while Agent history is not durable"
     );
@@ -143,7 +142,7 @@ async fn agent_record_failure_blocks_execution_and_recovers_the_partial_archive(
     );
     let _ = session.retry(second.input).await.unwrap();
     assert_completed(wait_for_input(&session, second.input).await);
-    assert!(model.coordinate_calls.load(Ordering::SeqCst) > calls_while_blocked);
+    assert!(model.conversation_calls.load(Ordering::SeqCst) > calls_while_blocked);
 
     let history = session.history(SessionSeq(0), 256).await.unwrap();
     assert!(history.items.iter().any(|entry| matches!(
@@ -177,15 +176,18 @@ async fn failed_runtime_config_persistence_never_restarts_execution() {
         .await
         .unwrap();
     session.submit(SubmitInput::new("start")).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), model.coordinate_started.notified())
-        .await
-        .expect("coordinator did not start");
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        model.conversation_started.notified(),
+    )
+    .await
+    .expect("coordinator did not start");
 
     let store = app.test_store();
     store.fail_runtime_reconfigure(true);
     let limits = AgentLimits {
         background_workers: 5,
-        ..AgentLimits::default()
+        ..crate::config::RuntimeSettings::default().limits
     };
     let result = app
         .update_config(
@@ -193,7 +195,11 @@ async fn failed_runtime_config_persistence_never_restarts_execution() {
             ConfigChange::Limits(Some(limits.clone())),
         )
         .await;
-    assert!(matches!(result, Err(Error::Storage(_))), "{result:?}");
+    result.unwrap();
+    assert!(matches!(
+        session.reload_config().await,
+        Err(Error::Storage(_))
+    ));
     // App observations are archived asynchronously. Suspension revokes model
     // authority immediately, but its cancellation result still needs a durable
     // commit and projection before activity disappears from the cached view.
@@ -201,7 +207,7 @@ async fn failed_runtime_config_persistence_never_restarts_execution() {
     let blocked = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             assert_eq!(
-                model.coordinate_calls.load(Ordering::SeqCst),
+                model.conversation_calls.load(Ordering::SeqCst),
                 1,
                 "failed configuration must never start another coordinator"
             );
@@ -216,7 +222,7 @@ async fn failed_runtime_config_persistence_never_restarts_execution() {
     .expect("cancelled activity was not durably projected");
     assert!(blocked.activity.is_empty(), "{blocked:?}");
     assert_eq!(
-        model.coordinate_calls.load(Ordering::SeqCst),
+        model.conversation_calls.load(Ordering::SeqCst),
         1,
         "new configuration must not run before its runtime boundary is durable"
     );
@@ -229,7 +235,7 @@ async fn failed_runtime_config_persistence_never_restarts_execution() {
             .unwrap()
             .config
             .limits,
-        AgentLimits::default()
+        crate::config::RuntimeSettings::default().limits
     );
 
     store.fail_runtime_reconfigure(false);
@@ -239,10 +245,13 @@ async fn failed_runtime_config_persistence_never_restarts_execution() {
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), model.coordinate_started.notified())
-        .await
-        .expect("execution did not resume after the boundary became durable");
-    assert!(model.coordinate_calls.load(Ordering::SeqCst) >= 2);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        model.conversation_started.notified(),
+    )
+    .await
+    .expect("execution did not resume after the boundary became durable");
+    assert!(model.conversation_calls.load(Ordering::SeqCst) >= 2);
     app.shutdown().await.unwrap();
 }
 
@@ -269,15 +278,18 @@ async fn closing_reaches_core_while_session_is_waiting_for_an_input_commit() {
         ConfigScope::Session(session.id()),
         ConfigChange::Limits(Some(AgentLimits {
             shutdown_grace: Duration::from_millis(30),
-            ..AgentLimits::default()
+            ..crate::config::RuntimeSettings::default().limits
         })),
     )
     .await
     .unwrap();
     session.submit(SubmitInput::new("first")).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), model.coordinate_started.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        model.conversation_started.notified(),
+    )
+    .await
+    .unwrap();
     session.snapshot().await.unwrap();
 
     let store = app.test_store();
@@ -296,7 +308,7 @@ async fn closing_reaches_core_while_session_is_waiting_for_an_input_commit() {
     store.pause_core_commits(false);
     let result = result.expect("App close did not reach the blocked Core actor");
     assert!(matches!(result, Err(Error::Agent(_))), "{result:?}");
-    assert_eq!(model.coordinate_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(model.conversation_calls.load(Ordering::SeqCst), 1);
 
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -351,7 +363,7 @@ async fn closing_during_startup_reports_an_unresolved_commit() {
     let result =
         result.expect("close should interrupt startup without waiting for the transaction");
     assert!(matches!(result, Err(Error::Agent(_))), "{result:?}");
-    assert_eq!(model.coordinate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(model.conversation_calls.load(Ordering::SeqCst), 0);
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match session.close_runtime().await {
@@ -363,7 +375,7 @@ async fn closing_during_startup_reports_an_unresolved_commit() {
     })
     .await
     .expect("resolved startup commit should allow closing");
-    model.release_first_coordinate.notify_one();
+    model.release_first_conversation.notify_one();
     let continued = session
         .submit(SubmitInput::new("continue after startup close"))
         .await

@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc};
 
 use bone_core::{CallError, ExternalEffect, InputOutcome, OutcomeKind, ToolOutcome};
 use serde::{Deserialize, Serialize};
@@ -324,7 +324,7 @@ pub enum InputState {
         question: QuestionId,
         text: String,
     },
-    RoutingFailed {
+    ConversationFailed {
         runtime: RuntimeId,
         message: String,
     },
@@ -378,7 +378,6 @@ pub enum JobState {
 pub enum JobOwner {
     User,
     Job(JobRef),
-    Routing,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -390,7 +389,6 @@ pub enum WaitReason {
     Job(JobRef),
     Result(JobRef),
     Inquiry,
-    Coordination,
     Commit,
 }
 
@@ -577,6 +575,7 @@ pub struct AcceptancePage {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JobView {
+    pub allowed_tools: BTreeSet<String>,
     pub id: JobRef,
     pub owner: JobOwner,
     pub inputs: Vec<InputId>,
@@ -589,10 +588,27 @@ pub struct JobView {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ActivityKind {
-    Coordinate,
+    Converse,
     Work,
     Compact,
-    Tool { name: String },
+    Tool {
+        name: String,
+        arguments: serde_json::Value,
+    },
+}
+
+impl ActivityKind {
+    pub(crate) fn from_call(kind: bone_core::CallKind, tool: Option<&bone_core::ToolCall>) -> Self {
+        match kind {
+            bone_core::CallKind::Converse => Self::Converse,
+            bone_core::CallKind::Work => Self::Work,
+            bone_core::CallKind::Compact => Self::Compact,
+            bone_core::CallKind::Tool => Self::Tool {
+                name: tool.map_or_else(|| "tool".into(), |tool| tool.name.clone()),
+                arguments: tool.map_or(serde_json::Value::Null, |tool| tool.arguments.clone()),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -662,7 +678,6 @@ pub enum AppProblem {
     Configuration(ConfigProblem),
     LoginRequired(crate::ProfileId),
     Credential(CredentialProblem),
-    ProfileBusy(crate::ProfileId),
     Provider(String),
     Storage(String),
     Tools(String),
@@ -771,6 +786,7 @@ pub enum SessionEvent {
         runtime: RuntimeId,
     },
     JobCreated {
+        allowed_tools: BTreeSet<String>,
         job: JobRef,
         owner: JobOwner,
         goal: String,
@@ -788,7 +804,6 @@ pub enum SessionEvent {
         external_effect: ExternalEffect,
     },
     Reply {
-        job: JobRef,
         inputs: Vec<InputId>,
         text: String,
     },
@@ -797,10 +812,14 @@ pub enum SessionEvent {
         inputs: Vec<InputId>,
         text: String,
     },
-    RoutingFailed {
+    ConversationFailed {
         runtime: RuntimeId,
         inputs: Vec<InputId>,
         message: String,
+    },
+    JobNeedsInput {
+        job: JobRef,
+        question: String,
     },
     JobFinished {
         job: JobRef,
@@ -823,6 +842,7 @@ pub enum SessionEvent {
         call: CallRef,
         job: JobRef,
         tool: String,
+        arguments: serde_json::Value,
         outcome: ToolOutcome,
     },
     Interrupted {

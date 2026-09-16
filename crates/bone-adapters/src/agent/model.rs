@@ -1,6 +1,6 @@
 use bone_core::{
-    CallContext, CallError, CallErrorKind, CheckpointDraft, CompactInput, CoordinateInput,
-    KernelDecision, ModelPort, PortFuture, WorkInput, WorkProposal, model_contract,
+    CallContext, CallError, CallErrorKind, CheckpointDraft, CompactInput, ConversationInput,
+    ConversationStep, ModelPort, PortFuture, WorkInput, WorkProposal, model_contract,
 };
 
 use crate::llm::{
@@ -68,13 +68,13 @@ impl ModelAdapter {
 }
 
 impl ModelPort for ModelAdapter {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         context: CallContext,
-    ) -> PortFuture<Result<KernelDecision, CallError>> {
+    ) -> PortFuture<Result<ConversationStep, CallError>> {
         invoke(self.coordinator.clone(), context, move || {
-            model_contract::coordinate(input)
+            model_contract::converse(input)
         })
     }
 
@@ -185,7 +185,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bone_core::{
-        CoordinateInput, Input, InputId, KernelDecision, Seq, SessionContext, model_contract,
+        ConversationInput, ConversationStep, Input, InputId, SessionContext, model_contract,
     };
     use rig_core::{
         completion::{
@@ -304,12 +304,11 @@ mod tests {
         .with_finish_reason(FinishReason::ToolCalls)
     }
 
-    fn coordinate_input() -> CoordinateInput {
-        CoordinateInput {
-            routing: Seq(1),
+    fn conversation_input() -> ConversationInput {
+        ConversationInput {
+            tools: Vec::new(),
+            constraints_revision: 0,
             inputs: vec![Input::new(InputId(2), "inspect the parser")],
-            source: None,
-            request: Some("create a focused job".into()),
             constraints: "read only".into(),
             background: Arc::new(SessionContext::default()),
             jobs: Vec::new(),
@@ -374,12 +373,15 @@ mod tests {
         let model = recording_model(
             Arc::clone(&requests),
             submission(
-                "submit_coordination",
-                json!(KernelDecision::Clarify("unused".into())),
+                "submit_conversation",
+                json!(ConversationStep::Ask {
+                    inputs: vec![InputId(2)],
+                    question: "unused".into()
+                }),
             ),
         );
 
-        let error = execute::<KernelDecision, _>(model, true, || {
+        let error = execute::<ConversationStep, _>(model, true, || {
             panic!("a pre-cancelled call must not construct its contract")
         })
         .await
@@ -400,7 +402,7 @@ mod tests {
         ));
 
         let error = execute(model, false, || {
-            model_contract::coordinate(coordinate_input())
+            model_contract::converse(conversation_input())
         })
         .await
         .expect_err("provider failure must cross the port as a CallError");
@@ -415,9 +417,12 @@ mod tests {
     #[tokio::test]
     async fn request_carries_the_bound_contract_specific_choice_and_configured_options() {
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let decision = KernelDecision::Clarify("which parser?".into());
-        let input = coordinate_input();
-        let expected_contract = model_contract::coordinate(input.clone()).unwrap();
+        let decision = ConversationStep::Ask {
+            inputs: vec![InputId(2)],
+            question: "which parser?".into(),
+        };
+        let input = conversation_input();
+        let expected_contract = model_contract::converse(input.clone()).unwrap();
         let expected_instructions = expected_contract.instructions().to_owned();
         let (expected_context_label, expected_context) = expected_contract.context();
         let expected_context_label = expected_context_label.to_owned();
@@ -428,7 +433,7 @@ mod tests {
         let expected_schema = expected_schema.clone();
         let model = recording_model(
             Arc::clone(&requests),
-            submission("submit_coordination", json!({"decision": decision})),
+            submission("submit_conversation", json!({"step": decision})),
         );
         let model = ConfiguredModel::new(
             model.model().clone(),
@@ -438,7 +443,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = execute(model, false, move || model_contract::coordinate(input))
+        let result = execute(model, false, move || model_contract::converse(input))
             .await
             .unwrap();
         assert_eq!(result, decision);
@@ -486,11 +491,11 @@ mod tests {
             response([("wrong_submission", json!({"Clarify": "question"}))]),
             response([
                 (
-                    "submit_coordination",
+                    "submit_conversation",
                     json!({"decision": {"Clarify": "question"}}),
                 ),
                 (
-                    "submit_coordination",
+                    "submit_conversation",
                     json!({"decision": {"Clarify": "question"}}),
                 ),
             ]),
@@ -498,11 +503,11 @@ mod tests {
 
         for response in responses {
             let error = decode_response(
-                model_contract::coordinate(coordinate_input()).unwrap(),
+                model_contract::converse(conversation_input()).unwrap(),
                 response,
             )
             .expect_err("invalid submission cardinality or name must fail");
-            assert!(error.message.contains("exactly one submit_coordination"));
+            assert!(error.message.contains("exactly one submit_conversation"));
         }
     }
 
@@ -511,14 +516,14 @@ mod tests {
         for finish_reason in [FinishReason::Length, FinishReason::ContentFilter] {
             let response = response_with_finish(
                 [(
-                    "submit_coordination",
+                    "submit_conversation",
                     json!({"decision": {"Clarify": "question"}}),
                 )],
                 Some(finish_reason),
             );
 
             let error = decode_response(
-                model_contract::coordinate(coordinate_input()).unwrap(),
+                model_contract::converse(conversation_input()).unwrap(),
                 response,
             )
             .expect_err("truncated or filtered output must fail");

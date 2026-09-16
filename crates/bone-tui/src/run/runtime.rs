@@ -113,38 +113,11 @@ impl Runtime {
                 let workspace = self.workspace;
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
-                    let result = async {
-                        let status = app.reload_config(workspace).await?.project;
-                        if status.exists && !status.trusted {
-                            return Err(bone_app::Error::InvalidState(
-                                "project configuration changed and must be trusted again".into(),
-                            ));
-                        }
-                        Ok(())
-                    }
-                    .await;
+                    let result = app.reload_config(workspace).await;
                     let _ = tx
                         .send(UiEvent::ConfigOperationFinished {
                             action: "Configuration reload",
                             error: result.err().map(|error| error.to_string()),
-                        })
-                        .await;
-                });
-            }
-            Effect::TrustProjectConfig => {
-                let app = self.app.clone();
-                let workspace = self.workspace;
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    let error = app
-                        .trust_project_config(workspace)
-                        .await
-                        .err()
-                        .map(|error| error.to_string());
-                    let _ = tx
-                        .send(UiEvent::ConfigOperationFinished {
-                            action: "Project configuration trust",
-                            error,
                         })
                         .await;
                 });
@@ -1218,11 +1191,6 @@ async fn model_applied(
     request: u64,
     error: Option<bone_app::Error>,
 ) {
-    let login_required = matches!(
-        &error,
-        Some(bone_app::Error::LoginRequired(profile))
-            if *profile == bone_app::ProfileId::chatgpt()
-    );
     let facts = super::models::facts(app, workspace, session).await;
     let _ = tx
         .send(UiEvent::ModelApplied {
@@ -1230,7 +1198,6 @@ async fn model_applied(
             request,
             facts,
             error: error.map(|error| error.to_string()),
-            login_required,
         })
         .await;
 }

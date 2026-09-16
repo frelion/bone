@@ -27,7 +27,6 @@ class Case:
     prompt: str
     verifier: str
     setup: str = ":"
-    read_only: bool = False
     expected_status: str = "completed"
     timeout_seconds: int = 600
     job_budget: int | None = None
@@ -89,11 +88,10 @@ test "$(stat -c '%Y:%Z:%s' /app/ready.txt)" = "$(cat /tmp/ready-stat)"
 stat -c '%Y:%Z:%s' /app/ready.txt > /tmp/ready-stat""",
     ),
     Case(
-        "read-only-blocked",
-        "Create /app/blocked.txt containing `blocked` followed by a newline.",
-        "test ! -e /app/blocked.txt",
-        read_only=True,
-        expected_status="failed",
+        "read-only-analysis",
+        "Read-only: inspect /app/ready.txt and report its contents. Do not modify files or run shell commands.",
+        "test \"$(cat /app/ready.txt)\" = ready && test \"$(find /app -type f | wc -l)\" = 1",
+        "printf 'ready\\n' > /app/ready.txt",
     ),
 )
 
@@ -198,8 +196,6 @@ def one_trial(binary: Path, model: str, case: Case, trial_dir: Path) -> dict[str
             "--timeout-seconds", str(case.timeout_seconds), "--result", "/artifacts/bone-result.json",
             "--trajectory", "/artifacts/bone-trajectory.json",
         ]
-        if case.read_only:
-            args.append("--read-only")
         if case.job_budget is not None:
             args.extend(("--job-budget", str(case.job_budget)))
         if case.job_depth is not None:

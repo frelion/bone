@@ -782,6 +782,81 @@ fn match_kind_rank(kind: &str) -> u8 {
     }
 }
 
+use super::presentation::{self, TextSection, ToolSummary};
+
+pub(super) fn summary(
+    args: &serde_json::Value,
+    output: Option<&serde_json::Value>,
+) -> Option<ToolSummary> {
+    Some(ToolSummary {
+        subject: presentation::short(args["pattern"].as_str()?),
+        result: match output {
+            Some(output) => Some(presentation::result(
+                format!("{} matches", output["match_count"].as_u64()?),
+                output,
+            )),
+            None => None,
+        },
+    })
+}
+
+pub(super) fn details(
+    args: &serde_json::Value,
+    output: &serde_json::Value,
+) -> Option<Vec<TextSection>> {
+    let mut sections = vec![presentation::section("Pattern", args["pattern"].as_str()?)];
+    if let Some(path) = args["path"].as_str() {
+        sections.push(presentation::section("Search root", path));
+    }
+    if let Some(glob) = args["glob"].as_str() {
+        sections.push(presentation::section("File filter", glob));
+    }
+    let count = output["match_count"].as_u64()?;
+    sections.push(presentation::section("Matches", format!("{count} matches")));
+    let mut current_path = "";
+    let mut text = String::new();
+    for matched in output["matches"].as_array()? {
+        let path = matched["path"].as_str()?;
+        if path != current_path {
+            if !text.is_empty() {
+                sections.push(presentation::section(
+                    current_path,
+                    std::mem::take(&mut text),
+                ));
+            }
+            current_path = path;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "{}{} {}",
+            matched["line_number"].as_u64()?,
+            if matched["kind"].as_str()? == "match" {
+                ":"
+            } else {
+                "-"
+            },
+            matched["text"].as_str()?
+        ));
+        if matched["line_truncated"].as_bool() == Some(true) {
+            text.push_str(" … [truncated]");
+        }
+    }
+    if !text.is_empty() {
+        sections.push(presentation::section(current_path, text));
+    }
+    for (key, label) in [
+        ("binary_files_skipped", "binary files skipped"),
+        ("oversized_files_skipped", "oversized files skipped"),
+    ] {
+        if let Some(count) = output[key].as_u64().filter(|count| *count > 0) {
+            sections.push(presentation::section("Skipped", format!("{count} {label}")));
+        }
+    }
+    Some(presentation::with_notices(sections, output))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     CallId, CallKind, CallProgress, CallView, Input, InputId, JobId, JobSpec, JobStatus,
     MonoTimeView, Owner, ReadQuery, ReportDraft, Seq, ToolCall, ToolOutcome, ToolSpec, WaitView,
-    job::JobState,
-    kernel::{Kernel, Requester},
+    job::JobState, kernel::Kernel,
 };
 
 pub(crate) const DIRECTORY_PAGE: usize = 16;
@@ -30,21 +29,22 @@ pub struct Record {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RecordBody {
     Input(Input),
-    RoutingStarted {
-        inputs: Vec<InputId>,
-        source: Option<JobId>,
+    ConversationRejected {
+        call: CallId,
+        message: String,
+        budget: crate::WorkRejections,
     },
-    RoutingFinished {
-        routing: Seq,
-    },
-    RoutingHandoff {
+    JobMessage {
         job: JobId,
         inputs: Vec<InputId>,
         text: String,
-        #[serde(deserialize_with = "serde::Deserialize::deserialize")]
-        previous: Option<Seq>,
+    },
+    JobNeedsInput {
+        job: JobId,
+        question: String,
     },
     JobCreated {
+        allowed_tools: std::collections::BTreeSet<String>,
         job: JobId,
         spec: JobSpec,
         owner: Owner,
@@ -122,7 +122,6 @@ pub enum RecordBody {
         checkpoint: Arc<Checkpoint>,
     },
     Reply {
-        job: JobId,
         inputs: Vec<InputId>,
         text: String,
     },
@@ -130,7 +129,7 @@ pub enum RecordBody {
         inputs: Vec<InputId>,
         question: String,
     },
-    InputRoutingFailed {
+    ConversationFailed {
         inputs: Vec<InputId>,
         message: String,
     },
@@ -187,7 +186,7 @@ pub enum InquiryResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryTarget {
     Job(JobId),
-    Routing(Seq),
+    Conversation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,7 +198,6 @@ pub enum DeliveryKind {
     Inquiry,
     InquiryResult,
     Read,
-    Coordination,
     DependencyChanged,
     Memory,
 }
@@ -254,13 +252,12 @@ pub struct RecordView {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCard {
+    pub inputs: Vec<InputId>,
+    pub allowed_tools: std::collections::BTreeSet<String>,
     pub id: JobId,
     pub spec: JobSpec,
     pub status: JobStatus,
     pub report: Option<ReportDraft>,
-    /// Read this record, then its `previous` links, for assigned inputs and intent.
-    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
-    pub latest_handoff: Option<Seq>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,11 +294,10 @@ impl BackgroundEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CoordinateInput {
-    pub routing: Seq,
+pub struct ConversationInput {
+    pub tools: Vec<ToolSpec>,
+    pub constraints_revision: u64,
     pub inputs: Vec<Input>,
-    pub source: Option<JobId>,
-    pub request: Option<String>,
     pub constraints: String,
     pub background: Arc<SessionContext>,
     pub jobs: Vec<JobCard>,
@@ -310,21 +306,10 @@ pub struct CoordinateInput {
     pub records: Vec<RecordView>,
 }
 
-/// The authority carried by one worker call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WorkerRole {
-    User,
-    Delegated,
-    Investigation,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkInput {
     pub job: JobId,
     pub revision: u64,
-    pub role: WorkerRole,
-    /// Whether `AskUser` is available for this particular user-owned turn.
-    pub can_ask_user: bool,
     /// Effective remaining delegation capacity, including ancestor ceilings.
     pub delegation: crate::DelegationLimits,
     pub spec: JobSpec,
@@ -363,8 +348,6 @@ pub(crate) enum PreparedWork {
 pub(crate) enum ContextError {
     #[error("job {0} does not exist")]
     MissingJob(JobId),
-    #[error("routing {0} does not exist")]
-    MissingRouting(Seq),
     #[error("record {0} is unavailable")]
     MissingRecord(Seq),
     #[error("record offset is not a UTF-8 boundary")]
@@ -445,23 +428,10 @@ fn work_input(
         .collect::<Vec<_>>();
     let records = expand_records(kernel, &local, page_bytes)?;
     let seen_through = local.last().copied().unwrap_or(job.context.read_through);
-    let role = if kernel.is_investigation(job_id) {
-        WorkerRole::Investigation
-    } else if matches!(job.owner, Owner::User) {
-        WorkerRole::User
-    } else {
-        WorkerRole::Delegated
-    };
     let input = WorkInput {
         job: job_id,
         revision: job.revision,
-        role,
         delegation: kernel.delegation_capacity(job_id),
-        can_ask_user: role == WorkerRole::User
-            && job
-                .inputs
-                .iter()
-                .any(|input| kernel.inputs[input].finished.is_none()),
         spec: job.spec.clone(),
         inputs: job.inputs.clone(),
         constraints: kernel.constraints.clone(),
@@ -502,35 +472,25 @@ fn work_input(
         tools: kernel
             .tools
             .values()
-            .filter(|tool| {
-                role != WorkerRole::Investigation || tool.effect == crate::ToolEffect::ReadOnly
-            })
+            .filter(|tool| job.allowed_tools.contains(&tool.name))
             .cloned()
             .collect(),
     };
     Ok((input, seen_through))
 }
 
-pub(crate) fn prepare_coordinate(
-    kernel: &Kernel,
-    routing_id: Seq,
-) -> Result<CoordinateInput, ContextError> {
-    let (mut input, has_read_result) = coordinate_input(kernel, routing_id, None)?;
+pub(crate) fn prepare_conversation(kernel: &Kernel) -> Result<ConversationInput, ContextError> {
+    let (mut input, has_read) = conversation_input(kernel, None)?;
     if encoded_len(&input) > kernel.limits.context_bytes {
         return Err(ContextError::TooLarge);
     }
-    if has_read_result {
+    if has_read {
         return Ok(input);
     }
-
     let roots = kernel
         .jobs
-        .keys()
-        .copied()
-        .filter(|id| {
-            matches!(kernel.jobs[id].owner, Owner::User)
-                && !matches!(kernel.jobs[id].state, JobState::Finished(_))
-        })
+        .iter()
+        .filter_map(|(id, job)| (job.owner == Owner::User).then_some(*id))
         .collect::<Vec<_>>();
     for (index, id) in roots.iter().take(DIRECTORY_PAGE).enumerate() {
         let mut candidate = input.clone();
@@ -547,42 +507,44 @@ pub(crate) fn prepare_coordinate(
     Ok(input)
 }
 
-pub(crate) fn session_can_help_coordinate(kernel: &Kernel, routing: Seq) -> bool {
-    coordinate_input(kernel, routing, None).is_ok_and(|(mut input, _)| {
+pub(crate) fn session_can_help_conversation(kernel: &Kernel) -> bool {
+    conversation_input(kernel, None).is_ok_and(|(mut input, _)| {
         input.background = Arc::new(SessionContext::default());
         encoded_len(&input) <= kernel.limits.context_bytes
     })
 }
 
-pub(crate) fn coordinate_read_fits(
+pub(crate) fn conversation_read_fits(
     kernel: &Kernel,
-    routing_id: Seq,
     candidate: &Record,
 ) -> Result<bool, ContextError> {
-    let (input, _) = coordinate_input(kernel, routing_id, Some(candidate))?;
+    let (input, _) = conversation_input(kernel, Some(candidate))?;
     Ok(encoded_len(&input) <= kernel.limits.context_bytes)
 }
 
-fn coordinate_input(
+fn conversation_input(
     kernel: &Kernel,
-    routing_id: Seq,
     read_override: Option<&Record>,
-) -> Result<(CoordinateInput, bool), ContextError> {
-    let routing = kernel
-        .routings
-        .get(&routing_id)
-        .ok_or(ContextError::MissingRouting(routing_id))?;
-    let latest_read = read_override.is_none().then(|| {
-        routing.records.iter().rev().find(|seq| {
-            **seq > routing_id
-                && kernel
-                    .records
-                    .get(seq)
-                    .is_some_and(|record| matches!(record.body, RecordBody::ReadResult { .. }))
+) -> Result<(ConversationInput, bool), ContextError> {
+    let latest_read = read_override
+        .is_none()
+        .then(|| {
+            kernel
+                .conversation
+                .records
+                .iter()
+                .rev()
+                .find(|seq| {
+                    kernel
+                        .records
+                        .get(seq)
+                        .is_some_and(|record| matches!(record.body, RecordBody::ReadResult { .. }))
+                })
+                .copied()
         })
-    });
-    let latest_read = latest_read.flatten().copied();
-    let projected = routing
+        .flatten();
+    let projected = kernel
+        .conversation
         .records
         .iter()
         .copied()
@@ -590,8 +552,12 @@ fn coordinate_input(
             !kernel
                 .records
                 .get(seq)
-                .is_some_and(|record| matches!(record.body, RecordBody::ReadResult { .. }))
-                || Some(*seq) == latest_read
+                .is_some_and(|record| session_public(kernel, record))
+                && (!kernel
+                    .records
+                    .get(seq)
+                    .is_some_and(|record| matches!(record.body, RecordBody::ReadResult { .. }))
+                    || Some(*seq) == latest_read)
         })
         .collect::<Vec<_>>();
     let mut positions = BTreeMap::new();
@@ -620,30 +586,28 @@ fn coordinate_input(
             )?;
         }
     }
-    let input = CoordinateInput {
-        routing: routing_id,
-        inputs: routing
-            .inputs
-            .iter()
-            .filter_map(|id| {
-                kernel
-                    .inputs
-                    .get(id)
-                    .map(|entry| kernel.input(entry.accepted_at).clone())
-            })
-            .collect(),
-        source: match routing.requester {
-            Requester::Inputs => None,
-            Requester::Job { job, .. } => Some(job),
-        },
-        request: routing.request.clone(),
+    let mut pending = kernel
+        .inputs
+        .values()
+        .filter(|entry| entry.finished.is_none())
+        .collect::<Vec<_>>();
+    pending.sort_by_key(|entry| entry.accepted_at);
+    let inputs = pending
+        .into_iter()
+        .map(|entry| kernel.input(entry.accepted_at).clone())
+        .collect();
+    let input = ConversationInput {
+        inputs,
+        constraints_revision: kernel.constraints_revision,
+        tools: kernel.tools.values().cloned().collect(),
         constraints: kernel.constraints.clone(),
         background: session_background(
             kernel,
-            &routing
+            &kernel
                 .inputs
-                .iter()
-                .filter_map(|id| kernel.inputs.get(id).map(|input| input.accepted_at))
+                .values()
+                .filter(|entry| entry.finished.is_none())
+                .map(|entry| entry.accepted_at)
                 .chain(records.iter().map(|record| record.source))
                 .collect::<Vec<_>>(),
         ),
@@ -735,7 +699,9 @@ pub(crate) fn prepare_compact(
 pub(crate) fn session_public(kernel: &Kernel, record: &Record) -> bool {
     match &record.body {
         RecordBody::Input(_) | RecordBody::Reply { .. } | RecordBody::Clarification { .. } => true,
-        RecordBody::Published { job, .. } | RecordBody::Outcome { job, .. } => kernel
+        RecordBody::Published { job, .. }
+        | RecordBody::Outcome { job, .. }
+        | RecordBody::JobNeedsInput { job, .. } => kernel
             .jobs
             .get(job)
             .is_some_and(|job| job.owner == Owner::User),
@@ -842,6 +808,8 @@ fn pageable(kernel: &Kernel, seq: Seq) -> Result<bool, ContextError> {
 pub(crate) fn card(kernel: &Kernel, id: JobId) -> JobCard {
     let job = &kernel.jobs[&id];
     JobCard {
+        inputs: job.inputs.clone(),
+        allowed_tools: job.allowed_tools.clone(),
         id,
         spec: job.spec.clone(),
         status: kernel.job_status(id),
@@ -849,15 +817,7 @@ pub(crate) fn card(kernel: &Kernel, id: JobId) -> JobCard {
             RecordBody::Report { report, .. } => Some(report.clone()),
             _ => None,
         }),
-        latest_handoff: latest_handoff(kernel, id),
     }
-}
-
-pub(crate) fn latest_handoff(kernel: &Kernel, job: JobId) -> Option<Seq> {
-    kernel.records.values().rev().find_map(|record| {
-        matches!(record.body, RecordBody::RoutingHandoff { job: owner, .. } if owner == job)
-            .then_some(record.seq)
-    })
 }
 
 fn expand_records(

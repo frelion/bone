@@ -71,6 +71,13 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState, geometry: KeyGeometry) 
         return Some(Action::ToggleOverlayKeyboard);
     }
 
+    // A visible panel owns an unmodified Enter as soon as the user expresses
+    // keyboard intent. Merely opening it with the pointer still leaves typing
+    // in the workspace.
+    if exact(&key, KeyCode::Enter, KeyModifiers::NONE) && state.overlay.is_some() {
+        return Some(Action::ActivatePanel);
+    }
+
     if matches!(state.keyboard, KeyboardOwner::Overlay { .. })
         && let Some(panel) = &state.overlay
     {

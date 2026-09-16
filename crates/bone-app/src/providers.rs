@@ -10,11 +10,7 @@ use bone_adapters::{
         service::chatgpt_subscription::{self, DeviceCodePrompt},
     },
 };
-use bone_core::{
-    CallContext, CallError, CheckpointDraft, CompactInput, CoordinateInput, KernelDecision,
-    ModelPort, PortFuture, WorkInput, WorkProposal,
-};
-use tokio::sync::{Mutex, RwLock};
+use bone_core::ModelPort;
 
 use crate::{
     config::{Profile, ProfileId, ResolvedModel, RuntimeConfig},
@@ -23,70 +19,29 @@ use crate::{
     },
 };
 
-/// API-key endpoints are rebuilt per runtime. ChatGPT runtimes share an
-/// endpoint, including Rig's refresh lock and the credential-cache lease.
+/// Constructs model ports; credentials are loaded by each OAuth request.
 #[derive(Clone, Default)]
 pub(crate) struct ProviderConnector {
     bone_home: PathBuf,
-    chatgpt: Arc<Mutex<ChatGptState>>,
-    chatgpt_operation: Arc<RwLock<()>>,
+    credentials: Option<ChatGptCredentials>,
     #[cfg(test)]
     test_endpoints: HashMap<ProfileId, Endpoint>,
-}
-
-#[derive(Default)]
-struct ChatGptState {
-    credentials: Option<ChatGptCredentials>,
-    connection: Option<Arc<ChatGptConnection>>,
-    closed: bool,
-}
-
-struct ChatGptConnection {
-    endpoint: Endpoint,
-}
-
-impl ChatGptState {
-    fn credentials(&mut self) -> Result<ChatGptCredentials, CredentialError> {
-        if self.credentials.is_none() {
-            return Err(CredentialError::Unavailable);
-        }
-        Ok(self
-            .credentials
-            .as_ref()
-            .expect("credentials initialized")
-            .clone())
-    }
-
-    fn release_idle(&mut self, profile: &ProfileId) -> Result<(), ProviderConnectError> {
-        if self
-            .connection
-            .as_ref()
-            .is_some_and(|connection| Arc::strong_count(connection) > 1)
-        {
-            return Err(ProviderConnectError::Busy(profile.clone()));
-        }
-        self.connection = None;
-        Ok(())
-    }
 }
 
 impl ProviderConnector {
     pub(crate) fn new(bone_home: PathBuf) -> Self {
         Self {
-            bone_home: bone_home.clone(),
-            chatgpt: Arc::new(Mutex::new(ChatGptState {
-                credentials: ChatGptCredentials::at(bone_home).ok(),
-                connection: None,
-                closed: false,
-            })),
-            ..Self::default()
+            credentials: ChatGptCredentials::at(bone_home.clone()).ok(),
+            bone_home,
+            #[cfg(test)]
+            test_endpoints: HashMap::new(),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_endpoints(endpoints: HashMap<ProfileId, Endpoint>) -> Self {
+    pub(crate) fn with_endpoints(test_endpoints: HashMap<ProfileId, Endpoint>) -> Self {
         Self {
-            test_endpoints: endpoints,
+            test_endpoints,
             ..Self::default()
         }
     }
@@ -94,13 +49,15 @@ impl ProviderConnector {
     #[cfg(test)]
     pub(crate) fn with_chatgpt_credentials(credentials: ChatGptCredentials) -> Self {
         Self {
-            chatgpt: Arc::new(Mutex::new(ChatGptState {
-                credentials: Some(credentials),
-                connection: None,
-                closed: false,
-            })),
+            credentials: Some(credentials),
             ..Self::default()
         }
+    }
+
+    fn credentials(&self) -> Result<&ChatGptCredentials, ProviderConnectError> {
+        self.credentials
+            .as_ref()
+            .ok_or_else(|| chatgpt_error(CredentialError::Unavailable))
     }
 
     /// Build the existing Agent model adapter without starting a runtime or
@@ -140,45 +97,12 @@ impl ProviderConnector {
         #[cfg(test)]
         endpoints.extend(self.test_endpoints.clone());
         let coordinator = self
-            .configured_model(&runtime.coordinator, chatgpt.as_deref(), &mut endpoints)
+            .configured_model(&runtime.coordinator, chatgpt.as_ref(), &mut endpoints)
             .await?;
         let worker = self
-            .configured_model(&runtime.worker, chatgpt.as_deref(), &mut endpoints)
+            .configured_model(&runtime.worker, chatgpt.as_ref(), &mut endpoints)
             .await?;
-        Ok(Arc::new(ConnectedModels {
-            adapter: ModelAdapter::new(coordinator, worker),
-            chatgpt,
-        }))
-    }
-
-    /// Prove that one model can be constructed from its saved connection
-    /// without starting a Session or an interactive sign-in flow.
-    pub(crate) async fn prepare_model(
-        &self,
-        model: &ResolvedModel,
-    ) -> Result<(), ProviderConnectError> {
-        validate_profile(&model.profile)?;
-        if model.selection.profile != model.profile.id {
-            return Err(ProviderConnectError::InvalidProfile(
-                model.profile.id.clone(),
-            ));
-        }
-        model
-            .selection
-            .validate()
-            .map_err(|_| ProviderConnectError::InvalidModel(model.profile.id.clone()))?;
-
-        let chatgpt = if matches!(model.profile.endpoint, EndpointConfig::ChatGptSubscription) {
-            Some(self.connect_chatgpt().await?)
-        } else {
-            None
-        };
-        let mut endpoints = HashMap::new();
-        #[cfg(test)]
-        endpoints.extend(self.test_endpoints.clone());
-        self.configured_model(model, chatgpt.as_deref(), &mut endpoints)
-            .await?;
-        Ok(())
+        Ok(Arc::new(ModelAdapter::new(coordinator, worker)))
     }
 
     /// The caller owns cancellation by dropping this future and exposes the
@@ -195,56 +119,17 @@ impl ProviderConnector {
         if !matches!(profile.endpoint, EndpointConfig::ChatGptSubscription) {
             return Err(ProviderConnectError::InvalidProfile(profile.id.clone()));
         }
-        let _operation = self
-            .chatgpt_operation
-            .try_write()
-            .map_err(|_| ProviderConnectError::Busy(profile.id.clone()))?;
-        let mut state = self
-            .chatgpt
-            .try_lock()
-            .map_err(|_| ProviderConnectError::Busy(profile.id.clone()))?;
-        if state.closed {
-            return Err(ProviderConnectError::Closed);
-        }
-        if state
-            .connection
-            .as_ref()
-            .is_some_and(|connection| Arc::strong_count(connection) > 1)
-        {
-            // A live runtime already holds an authenticated connection. Login
-            // is idempotent in that state; replacing its credentials would
-            // invalidate work that still owns the connection.
-            return Ok(());
-        }
-        state.release_idle(&profile.id)?;
-        let auth = acquire_chatgpt(&mut state).await?;
-        let endpoint = chatgpt_subscription::connect(profile.id.as_str(), auth, on_device_code)
+        let auth = self.credentials()?.auth_file().map_err(chatgpt_error)?;
+        chatgpt_subscription::connect(profile.id.as_str(), &auth, on_device_code)
             .await
             .map_err(|_| ProviderConnectError::AuthorizationFailed(profile.id.clone()))?;
-        state.connection = Some(Arc::new(ChatGptConnection { endpoint }));
         Ok(())
     }
 
     pub(crate) async fn logout(&self, profile: &Profile) -> Result<(), ProviderConnectError> {
         validate_profile(profile)?;
         if matches!(profile.endpoint, EndpointConfig::ChatGptSubscription) {
-            let _operation = self
-                .chatgpt_operation
-                .try_write()
-                .map_err(|_| ProviderConnectError::Busy(profile.id.clone()))?;
-            let mut state = self
-                .chatgpt
-                .try_lock()
-                .map_err(|_| ProviderConnectError::Busy(profile.id.clone()))?;
-            if state.closed {
-                return Err(ProviderConnectError::Closed);
-            }
-            state.release_idle(&profile.id)?;
-            let credentials = state.credentials().map_err(chatgpt_error)?;
-            return credential_task(profile.id.clone(), move || {
-                credentials.clear().map_err(chatgpt_error)
-            })
-            .await;
+            return self.credentials()?.clear().await.map_err(chatgpt_error);
         }
         let profile = profile.clone();
         let bone_home = self.bone_home.clone();
@@ -254,21 +139,6 @@ impl ProviderConnector {
                 .map_err(|error| api_key_error(profile.id, error))
         })
         .await
-    }
-
-    /// Release idle process-local connections during App shutdown without
-    /// deleting credentials needed by the next App instance.
-    pub(crate) async fn close(&self) -> Result<(), ProviderConnectError> {
-        let _operation = self
-            .chatgpt_operation
-            .try_write()
-            .map_err(|_| ProviderConnectError::Busy(ProfileId::chatgpt()))?;
-        let mut state = self
-            .chatgpt
-            .try_lock()
-            .map_err(|_| ProviderConnectError::Busy(ProfileId::chatgpt()))?;
-        state.closed = true;
-        state.release_idle(&ProfileId::chatgpt())
     }
 
     pub(crate) async fn set_api_key(
@@ -290,37 +160,20 @@ impl ProviderConnector {
         .await
     }
 
-    async fn connect_chatgpt(&self) -> Result<Arc<ChatGptConnection>, ProviderConnectError> {
+    async fn connect_chatgpt(&self) -> Result<Endpoint, ProviderConnectError> {
         let profile = ProfileId::chatgpt();
-        let _operation = self
-            .chatgpt_operation
-            .try_read()
-            .map_err(|_| ProviderConnectError::Busy(profile.clone()))?;
-        let mut state = self.chatgpt.lock().await;
-        if state.closed {
-            return Err(ProviderConnectError::Closed);
+        let auth = self.credentials()?.auth_file().map_err(chatgpt_error)?;
+        if !auth.exists() {
+            return Err(ProviderConnectError::LoginRequired(profile));
         }
-        if let Some(connection) = &state.connection {
-            return Ok(Arc::clone(connection));
-        }
-        let auth = acquire_chatgpt(&mut state).await?;
-        let endpoint = chatgpt_subscription::connect_cached(profile.as_str(), auth)
-            .await
-            .map_err(|error| match error {
-                chatgpt_subscription::Error::AuthorizationFailed => {
-                    ProviderConnectError::LoginRequired(profile.clone())
-                }
-                _ => ProviderConnectError::InvalidProfile(profile.clone()),
-            })?;
-        let connection = Arc::new(ChatGptConnection { endpoint });
-        state.connection = Some(Arc::clone(&connection));
-        Ok(connection)
+        chatgpt_subscription::connect_cached(profile.as_str(), &auth)
+            .map_err(|_| ProviderConnectError::InvalidProfile(profile))
     }
 
     async fn configured_model(
         &self,
         resolved: &ResolvedModel,
-        chatgpt: Option<&ChatGptConnection>,
+        chatgpt: Option<&Endpoint>,
         endpoints: &mut HashMap<ProfileId, Endpoint>,
     ) -> Result<ConfiguredModel, ProviderConnectError> {
         let profile = &resolved.profile;
@@ -330,7 +183,6 @@ impl ProviderConnector {
                 let endpoint = if matches!(profile.endpoint, EndpointConfig::ChatGptSubscription) {
                     chatgpt
                         .expect("ChatGPT connection resolved before model selection")
-                        .endpoint
                         .clone()
                 } else {
                     let owned_profile = profile.clone();
@@ -352,59 +204,6 @@ impl ProviderConnector {
             .map_err(|_| ProviderConnectError::InvalidModel(profile.id.clone()))?;
         ConfiguredModel::new(model, resolved.selection.options.clone())
             .map_err(|_| ProviderConnectError::InvalidModelOptions(profile.id.clone()))
-    }
-}
-
-async fn acquire_chatgpt(
-    state: &mut ChatGptState,
-) -> Result<crate::credentials::ChatGptAuthLease, ProviderConnectError> {
-    let credentials = state.credentials().map_err(chatgpt_error)?;
-    credential_task(ProfileId::chatgpt(), move || {
-        credentials.acquire().map_err(chatgpt_error)
-    })
-    .await
-}
-
-/// Retain the shared connection through both runtime and individual call
-/// lifetimes, including calls still draining after runtime shutdown.
-struct ConnectedModels {
-    adapter: ModelAdapter,
-    chatgpt: Option<Arc<ChatGptConnection>>,
-}
-
-impl ConnectedModels {
-    fn retain_connection<T: Send + 'static>(&self, future: PortFuture<T>) -> PortFuture<T> {
-        let connection = self.chatgpt.clone();
-        Box::pin(async move {
-            let _connection = connection;
-            future.await
-        })
-    }
-}
-
-impl ModelPort for ConnectedModels {
-    fn coordinate(
-        &self,
-        input: CoordinateInput,
-        context: CallContext,
-    ) -> PortFuture<Result<KernelDecision, CallError>> {
-        self.retain_connection(self.adapter.coordinate(input, context))
-    }
-
-    fn work(
-        &self,
-        input: WorkInput,
-        context: CallContext,
-    ) -> PortFuture<Result<WorkProposal, CallError>> {
-        self.retain_connection(self.adapter.work(input, context))
-    }
-
-    fn compact(
-        &self,
-        input: CompactInput,
-        context: CallContext,
-    ) -> PortFuture<Result<CheckpointDraft, CallError>> {
-        self.retain_connection(self.adapter.compact(input, context))
     }
 }
 
@@ -458,8 +257,6 @@ async fn credential_task<T: Send + 'static>(
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum ProviderConnectError {
-    #[error("the provider connector is closed")]
-    Closed,
     #[error("profile `{0}` has invalid endpoint settings")]
     InvalidProfile(ProfileId),
     #[error("profile `{0}` has an invalid model selection")]
@@ -472,8 +269,6 @@ pub(crate) enum ProviderConnectError {
     Credential(crate::CredentialProblem),
     #[error("authorization failed for profile `{0}`")]
     AuthorizationFailed(ProfileId),
-    #[error("profile `{0}` is in use")]
-    Busy(ProfileId),
 }
 
 fn api_key_error(profile: ProfileId, error: ApiKeyCredentialError) -> ProviderConnectError {
@@ -499,7 +294,6 @@ fn credential_problem(
 
 fn chatgpt_error(error: CredentialError) -> ProviderConnectError {
     match error {
-        CredentialError::Busy => ProviderConnectError::Busy(ProfileId::chatgpt()),
         CredentialError::Unavailable => credential_problem(
             ProfileId::chatgpt(),
             crate::CredentialProblemKind::Unavailable,
@@ -509,234 +303,56 @@ fn chatgpt_error(error: CredentialError) -> ProviderConnectError {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, task::Poll};
-
-    use bone_adapters::llm::Protocol;
-    use bone_adapters::llm::service::chatgpt_subscription::ChatGptAuthCache;
-
     use super::*;
 
-    #[test]
-    fn api_profiles_use_the_selected_protocol() {
-        for (config, protocol) in [
-            (
-                EndpointConfig::OpenAiResponses { base_url: None },
-                Protocol::OpenAiResponses,
-            ),
-            (
-                EndpointConfig::OpenAiChatCompletions { base_url: None },
-                Protocol::OpenAiChatCompletions,
-            ),
-            (
-                EndpointConfig::AnthropicMessages { base_url: None },
-                Protocol::AnthropicMessages,
-            ),
-        ] {
-            let profile = Profile::new(ProfileId::new("test").unwrap(), "Test", config).unwrap();
-            let endpoint =
-                api_endpoint(&profile, &ApiKey::new("test-key".into()).unwrap()).unwrap();
-            assert_eq!(endpoint.id(), "test");
-            assert_eq!(endpoint.protocol(), protocol);
+    fn runtime(workspace: PathBuf) -> RuntimeConfig {
+        let resolved = ResolvedModel {
+            selection: crate::config::ModelSelection::new(ProfileId::chatgpt(), "offline-model")
+                .unwrap(),
+            profile: Profile::chatgpt(),
+        };
+        RuntimeConfig {
+            coordinator: resolved.clone(),
+            worker: resolved,
+            limits: bone_core::AgentLimits::default(),
+            tools: crate::ToolLimits::default(),
+            workspace,
         }
     }
 
     #[tokio::test]
-    async fn runtime_connection_without_cached_auth_requires_explicit_login() {
+    async fn cached_endpoints_do_not_refresh_and_live_ports_do_not_block_logout() {
         let directory = tempfile::tempdir().unwrap();
         let credentials = ChatGptCredentials::at(directory.path().join("credentials")).unwrap();
-        let connector = ProviderConnector::with_chatgpt_credentials(credentials.clone());
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            connector.connect_chatgpt(),
+        let auth = credentials.auth_file().unwrap();
+        // An expired token would require network access if construction authorized.
+        crate::safe_file::atomic_write_private(
+            &auth,
+            br#"{"access_token":"expired","refresh_token":"unused","expires_at":1}"#,
         )
-        .await
         .unwrap();
+        let first = ProviderConnector::with_chatgpt_credentials(credentials.clone());
+        let second = ProviderConnector::with_chatgpt_credentials(credentials);
+        let runtime = runtime(directory.path().to_path_buf());
+        let _first_port = first.connect(&runtime).await.unwrap();
+        let _second_port = second.connect(&runtime).await.unwrap();
+
+        first.logout(&Profile::chatgpt()).await.unwrap();
+        assert!(!auth.exists());
         assert!(matches!(
-            result,
+            second.connect(&runtime).await,
             Err(ProviderConnectError::LoginRequired(_))
         ));
-        credentials.clear().unwrap();
     }
 
     #[tokio::test]
-    async fn runtime_connection_is_busy_while_interactive_login_owns_the_state() {
+    async fn missing_cache_requires_explicit_login_without_starting_network() {
         let directory = tempfile::tempdir().unwrap();
         let credentials = ChatGptCredentials::at(directory.path().join("credentials")).unwrap();
         let connector = ProviderConnector::with_chatgpt_credentials(credentials);
-        let _interactive_login = connector.chatgpt_operation.write().await;
-
-        let result = connector.connect_chatgpt().await;
-
         assert!(matches!(
-            result,
-            Err(ProviderConnectError::Busy(profile)) if profile == ProfileId::chatgpt()
+            connector.connect_chatgpt().await,
+            Err(ProviderConnectError::LoginRequired(_))
         ));
-        assert_eq!(
-            connector.close().await,
-            Err(ProviderConnectError::Busy(ProfileId::chatgpt()))
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_runtime_connections_wait_and_share_the_cached_connection() {
-        let directory = tempfile::tempdir().unwrap();
-        let credentials = ChatGptCredentials::at(directory.path().join("credentials")).unwrap();
-        let lease = credentials.acquire().unwrap();
-        std::fs::write(
-            lease.auth_file(),
-            br#"{"access_token":"offline-test-token","expires_at":4102444800,"account_id":"offline-account"}"#,
-        )
-        .unwrap();
-        drop(lease);
-        let connector = ProviderConnector::with_chatgpt_credentials(credentials);
-
-        let state = connector.chatgpt.lock().await;
-        let mut first = Box::pin(connector.connect_chatgpt());
-        std::future::poll_fn(|context| match first.as_mut().poll(context) {
-            Poll::Pending => Poll::Ready(()),
-            Poll::Ready(_) => panic!("the first connection did not contend on runtime state"),
-        })
-        .await;
-        let mut second = Box::pin(connector.connect_chatgpt());
-        std::future::poll_fn(|context| match second.as_mut().poll(context) {
-            Poll::Pending => Poll::Ready(()),
-            Poll::Ready(_) => panic!("the second connection did not contend on runtime state"),
-        })
-        .await;
-        drop(state);
-
-        let (first, second) = tokio::join!(first, second);
-        let first = first.unwrap();
-        let second = second.unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-    }
-
-    #[tokio::test]
-    async fn model_preflight_reuses_a_live_chatgpt_connection() {
-        let directory = tempfile::tempdir().unwrap();
-        let credentials = ChatGptCredentials::at(directory.path().join("credentials")).unwrap();
-        let lease = credentials.acquire().unwrap();
-        std::fs::write(
-            lease.auth_file(),
-            br#"{"access_token":"offline-test-token","expires_at":4102444800,"account_id":"offline-account"}"#,
-        )
-        .unwrap();
-        drop(lease);
-        let connector = ProviderConnector::with_chatgpt_credentials(credentials);
-        let resolved = ResolvedModel {
-            selection: crate::config::ModelSelection::new(ProfileId::chatgpt(), "gpt-5.4").unwrap(),
-            profile: Profile::chatgpt(),
-        };
-        let runtime = RuntimeConfig {
-            coordinator: resolved.clone(),
-            worker: resolved.clone(),
-            limits: bone_core::AgentLimits::default(),
-            tools: crate::config::ToolSettings::default(),
-            workspace: directory.path().to_path_buf(),
-        };
-
-        let live_runtime = connector.connect(&runtime).await.unwrap();
-        connector.prepare_model(&resolved).await.unwrap();
-        connector.prepare_model(&resolved).await.unwrap();
-        connector.login(&Profile::chatgpt(), |_| {}).await.unwrap();
-
-        drop(live_runtime);
-        connector.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn close_prevents_a_later_login_from_reopening_the_connector() {
-        let directory = tempfile::tempdir().unwrap();
-        let credentials = ChatGptCredentials::at(directory.path().join("credentials")).unwrap();
-        let connector = ProviderConnector::with_chatgpt_credentials(credentials);
-        connector.close().await.unwrap();
-
-        assert_eq!(
-            connector.login(&Profile::chatgpt(), |_| {}).await,
-            Err(ProviderConnectError::Closed)
-        );
-        assert!(connector.chatgpt.lock().await.connection.is_none());
-    }
-
-    #[tokio::test]
-    async fn cached_auth_is_shared_and_logout_waits_for_all_runtimes() {
-        let directory = tempfile::tempdir().unwrap();
-        let credentials = ChatGptCredentials::at(directory.path().join("credentials")).unwrap();
-        let lease = credentials.acquire().unwrap();
-        let auth_file = lease.auth_file().to_path_buf();
-        std::fs::write(&auth_file, br#"{"access_token":"offline-test-token","expires_at":4102444800,"account_id":"offline-account"}"#).unwrap();
-        drop(lease);
-        let connector = ProviderConnector::with_chatgpt_credentials(credentials.clone());
-        let selection =
-            crate::config::ModelSelection::new(ProfileId::chatgpt(), "offline-model").unwrap();
-        let resolved = ResolvedModel {
-            selection,
-            profile: Profile::chatgpt(),
-        };
-        let runtime = RuntimeConfig {
-            coordinator: resolved.clone(),
-            worker: resolved,
-            limits: bone_core::AgentLimits::default(),
-            tools: crate::config::ToolSettings::default(),
-            workspace: directory.path().to_path_buf(),
-        };
-        let first = connector.connect(&runtime).await.unwrap();
-        let second = connector.connect(&runtime).await.unwrap();
-        let shared = connector.chatgpt.lock().await;
-        assert_eq!(Arc::strong_count(shared.connection.as_ref().unwrap()), 3);
-        drop(shared);
-        assert_eq!(
-            connector.logout(&Profile::chatgpt()).await,
-            Err(ProviderConnectError::Busy(ProfileId::chatgpt()))
-        );
-        drop(first);
-        assert_eq!(
-            connector.logout(&Profile::chatgpt()).await,
-            Err(ProviderConnectError::Busy(ProfileId::chatgpt()))
-        );
-        drop(second);
-        connector.logout(&Profile::chatgpt()).await.unwrap();
-        assert!(!auth_file.exists());
-    }
-
-    #[test]
-    fn in_flight_model_future_retains_connection_after_adapter_drops() {
-        let endpoint = openai_responses::official("chatgpt", "test-key").unwrap();
-        let model = endpoint.model("test-model").unwrap();
-        let connection = Arc::new(ChatGptConnection { endpoint });
-        let mut state = ChatGptState {
-            connection: Some(Arc::clone(&connection)),
-            ..ChatGptState::default()
-        };
-        let models = ConnectedModels {
-            adapter: ModelAdapter::new(model.clone(), model),
-            chatgpt: Some(connection),
-        };
-        let future = models.retain_connection(Box::pin(std::future::pending::<()>()));
-        drop(models);
-        assert_eq!(
-            state.release_idle(&ProfileId::chatgpt()),
-            Err(ProviderConnectError::Busy(ProfileId::chatgpt()))
-        );
-        drop(future);
-        state.release_idle(&ProfileId::chatgpt()).unwrap();
-    }
-
-    #[test]
-    fn idle_connections_are_released_but_live_runtime_connections_block_logout() {
-        let endpoint = openai_responses::official("chatgpt", "test-key").unwrap();
-        let live = Arc::new(ChatGptConnection { endpoint });
-        let mut state = ChatGptState {
-            connection: Some(Arc::clone(&live)),
-            ..ChatGptState::default()
-        };
-        assert_eq!(
-            state.release_idle(&ProfileId::chatgpt()),
-            Err(ProviderConnectError::Busy(ProfileId::chatgpt()))
-        );
-        assert!(state.connection.is_some());
-        drop(live);
-        state.release_idle(&ProfileId::chatgpt()).unwrap();
-        assert!(state.connection.is_none());
     }
 }

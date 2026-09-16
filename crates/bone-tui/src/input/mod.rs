@@ -1419,7 +1419,7 @@ mod panel_keyboard_tests {
     }
 
     #[test]
-    fn actual_model_button_click_preserves_input_and_exposes_keyboard_hint() {
+    fn actual_model_button_click_preserves_input_while_models_load() {
         let mut state = UiState::default();
         let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
         let mut snapshot = None;
@@ -1465,7 +1465,7 @@ mod panel_keyboard_tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(text.contains("f6 use panel keyboard"));
+        assert!(text.contains("loading models…"));
         key(&mut state, KeyCode::Char('x'));
         assert_eq!(state.draft(), "x");
         key(&mut state, KeyCode::F(6));

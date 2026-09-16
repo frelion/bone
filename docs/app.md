@@ -95,7 +95,7 @@ SubmitInput
 ```text
 Queued(problem?) → Posting(runtime) → Accepted(runtime)
        │                                  ├── WaitingForUser
-       │                                  ├── RoutingFailed
+       │                                  ├── ConversationFailed
        │                                  └── Finished(outcome)
        ├── Rejected
        ├── Cancelled
@@ -105,7 +105,7 @@ Queued(problem?) → Posting(runtime) → Accepted(runtime)
 - 缺少模型、配置无效、登录未就绪、provider 启动失败或 Core 暂时 Busy 时，已保存输入保持 `Queued`，Session 按顺序重试。
 - Agent 明确拒绝一个已保存输入时，App 记录 `Rejected`；不会让它永久停在队列中。
 - `WaitingForUser` 返回完整 `QuestionId`。前端把它原样放回 `SubmitInput::answer`，App 与 Core 共同验证问题仍然有效。
-- `retry` 只用于普通 Queued 或同一 Runtime 的 `RoutingFailed`。已经 Finished / Interrupted 的需求通过新 Submit 表达。
+- `retry` 只用于普通 Queued 或同一 Runtime 的 `ConversationFailed`。已经 Finished / Interrupted 的需求通过新 Submit 表达。
 - `stop` 与 submit、retry、Job control 使用同一 Session 命令顺序：它取消此前排队和已经投递的工作，此后到达的提交可以开始新工作。
 
 Session command channel 有界。已经持久化的 Queued 输入当前没有单独的总量上限；Core 对待处理 Input 和活跃 Job 有自己的容量限制。
@@ -148,7 +148,7 @@ Session override 留在 SQLite。`BONE_HOME` 必须是绝对路径；平台默�
 项目文件只能引用用户级 Profile ID，不能声明 Profile、Endpoint、凭据路径或 secret。
 两个 TOML 文件都带 `schema_version = 1`，未知字段和未知版本会被拒绝。
 
-`RuntimeOverrides` 包含 Worker、Coordinator、`AgentLimits` 和 `ToolSettings`。没有 Coordinator override 时它跟随最终 Worker；没有任何 Worker 时，resolved desired 为 `ConfigProblem::NeedsModel`。这不会阻止打开 Workspace、Session、历史或草稿。
+`RuntimeOverrides` 包含 Worker、Coordinator、`AgentLimits` 和 `ToolLimits`。没有 Coordinator override 时它跟随最终 Worker；没有任何 Worker 时，resolved desired 为 `ConfigProblem::NeedsModel`。这不会阻止打开 Workspace、Session、历史或草稿。
 
 `ConfigChange` 每次只修改一个字段。传入 `None` 清除本作用域 override；User 的 limits / tools 清除后回到类型默认值。文件写入在 App-owned advisory lock 内重新比较载入时的 SHA-256 摘要，因此并发 BONE 进程或外部编辑不会静默覆盖；成功写入使用同目录临时文件、同步和原子替换。项目 `.bone` 必须是真实目录，配置文件也不能是符号链接。
 
@@ -158,24 +158,22 @@ Session override 留在 SQLite。`BONE_HOME` 必须是绝对路径；平台默�
 `ReloadConfigOutcome` 会明确给出项目文件是否存在、是否仍受信任。细粒度 embedder 仍可用
 `reload_user_config` / `reload_workspace_config`。TUI 的 `/reload-config` 使用组合接口。
 
-首次发现项目配置时，它不参与解析，也不能借此开启写工具。SQLite 以 canonical
-Workspace root 对应配置原始字节的 SHA-256 保存信任记录；内容一变就必须重新确认。
-TUI 用 `/trust-config` 明确认可当前摘要，headless 必须传
-`--trust-project-config`，否则明确失败。信任不涉及任何 secret，并可通过 App API 撤销。
+项目配置在打开工作区或执行 `/reload-config` 时解析并生效。配置文件使用严格 schema
+校验；写入时通过文件锁和摘要检查避免覆盖外部修改。
 
-`App::update_config(scope, change).await` 是当前 App 进程内的生效屏障：
+`App::update_config(scope, change).await` 的成功边界是保存并通知：
 
 1. 校验并持久化 desired override；
 2. 找出受影响的所有已打开 Session；
-3. 每个 Session 阻止新调度并解析完整 `RuntimeConfig`；
-4. 对 Running Agent 原子更换模型、工具和 limits，先持久化 `RuntimeReconfigured`，再恢复调度；
-5. 等待所有目标 Session 返回确认。
+3. 向这些 Session 排入配置变更通知并返回，不等待 provider 或网络。
+
+Session 收到通知后解析完整 `RuntimeConfig`。已有 Runtime 会先暂停新调度，再在独立任务中装配模型；actor 仍可处理 stop、close 和更新的配置通知。只有最新 desired 配置可以安装：它原子更换模型、工具和 limits，先持久化 `RuntimeReconfigured`，再恢复调度。显式 `Session::reload_config` 才等待运行中 Runtime 完成重配。
 
 运行中配置成功时保留 `RuntimeId`、Job 图和在途工具。旧模型调用失去提交资格并用新模型重新调度；已经开始的工具使用启动时捕获的端口和 limit 收尾。
 
-如果普通 role/tool 配置无法装配，保存值不回滚，旧 running config 仍可查询，但 Agent 保持 suspended，不再启动新模型或工具。面向前端的 `ConfigChange::Model` 会先检查 ChatGPT cached auth，再以一个配置事务同时写 worker/coordinator；需要交互登录时返回 `LoginRequired` 且不改原选择。修复配置后再次 `update_config`，或修复凭据后调用 `Session::reload_config`，会在同一 Job 图上重试。API key 更新会强制刷新所有实际引用该 profile 的已打开 Session。fan-out 不是跨 Session 回滚事务：已经成功应用的 Session 不因另一 Session 失败而倒退。
+如果配置无法装配，保存值不回滚，旧 running config 仍可查询，但 Agent 保持 suspended，不再启动新模型或工具。`ConfigChange::Model` 只校验静态的 profile/model 关系，不读取 OAuth cache；缺少登录会由 Session 异步暴露为 `LoginRequired`。修复配置后再次 `update_config`，或修复凭据后调用 `Session::reload_config`，会在同一 Job 图上重试。API key 更新会强制刷新所有实际引用该 profile 的已打开 Session。
 
-调用方取消 `update_config` / `save_profile` Future 只停止等待，不撤销已经交给 App 的变更。后续配置操作、`resolved_config` 与 shutdown 会在同一屏障后继续。
+调用方取消 `update_config` Future 不撤销已持久化的变更。`resolved_config` 同时返回 durable desired 与当前 running config，前端可直接呈现两者短暂不一致的应用过程。`save_profile` 与 App 级 reload 同样在保存并通知后返回；只有显式的 `Session::reload_config` 等待该 Session 的运行中 Runtime 完成应用。
 
 这个生效保证只覆盖同一 App 实例。没有跨进程配置 watcher；外部修改要到显式 reload
 或下一次 App 启动才会载入，写操作发现摘要变化则返回冲突。
@@ -200,20 +198,22 @@ API key 只保存在 `$BONE_HOME/credentials.toml`。目录在 Unix 上要求 `0
 不在 shell 参数或 `bone run` 环境中传递 secret。
 
 ChatGPT subscription 使用 `$BONE_HOME/providers/chatgpt-subscription/auth.json` 与
-`auth.lock`。App 持有对 cache 的互斥 lease，但不解析或复制其 JSON，也不把它与 API-key
-文件混合。普通 Runtime 启动只尝试 cached auth；缺少登录时暴露
-`LoginRequired(ProfileId)`，不会自行弹出设备流程。
+`auth.lock`。App 只验证并传递私有 cache 路径，不解析或复制其 JSON，也不把它与 API-key
+文件混合。构造 Endpoint 是纯本地操作；真正的模型请求由 Rig 读取、刷新并提交 cache。
+缺少登录时暴露 `LoginRequired(ProfileId)`，不会自行弹出设备流程。
 
-`App::login` 显式返回 `LoginAttempt`，其 watch 状态为 Connecting、DeviceCode、Succeeded、Failed 或 Cancelled。丢弃或调用 `cancel` 会结束本次交互等待。登录、连接、logout 和 App shutdown 在同一个 provider operation 边界协调；冲突返回 `ProfileBusy`。live Runtime 仍持有凭据能力时，logout 不会删除 cache。
+`App::login` 显式返回 `LoginAttempt`，其 watch 状态为 Connecting、DeviceCode、Succeeded、Failed 或 Cancelled。丢弃或调用 `cancel` 会结束本次交互等待。普通 Runtime 不会自行启动交互登录；logout 直接参与下面的 cache 事务。
+
+Rig 为每次 cache 事务取得跨进程文件锁：锁内重新读取记录，按需完成 refresh，并以同目录临时文件原子替换；invalidate 与 logout 使用同一把锁。等待设备授权的人机阶段不持锁，成功提交时再取锁。锁等待和 HTTP 请求都有界且取消安全，因此一个 App 不再以生命周期 lease 排斥另一个 App。logout 清除 cache；已经取得请求上下文的在途请求自行结束。
 
 ## Runtime 装配与旧会话背景
 
 首次有 Queued 输入需要执行时，Session 惰性创建 Runtime。启动流程是：
 
 1. 读取 User / Workspace / Session overrides 与 Profile；
-2. 取得 API key 或 ChatGPT cached auth 能力；
+2. 取得 API key，或为 ChatGPT 构造绑定私有 cache 路径的 Endpoint；
 3. 构造 Worker / Coordinator `ModelAdapter`；
-4. 以 canonical Workspace root 和 `ToolSettings` 构造工具；
+4. 以 canonical Workspace root 和 `ToolLimits` 构造工具；
 5. 从 durable public history 中选取预算内的近期 `BootstrapContext`；
 6. 创建 `Agent::with_ports_and_background`，持久化 RuntimeStarted 后投递输入。
 
@@ -223,7 +223,7 @@ App 不恢复旧 Runtime 的 future、Job ID 或工具调用。bootstrap history
 
 ## 写工具与外部效果
 
-`ToolMode::ReadOnly` 安装 `read`、`glob`、`grep` 和 `session_history`。`WorkspaceWrite` 另外安装受 App 包装的 `apply_patch` 与 `bash`。
+App 始终安装 `read`、`glob`、`grep`、`session_history`，以及受 App 包装的 `apply_patch`、`bash`。`ToolLimits` 只配置工具执行限制，不再保存工具模式。每个 Job 的工具授权由 Core 在创建时确定并保存，App 只把实际授权投影到 Job 详情。输入文本不额外携带权限配置。
 
 一次写调用的顺序是：
 
@@ -274,7 +274,7 @@ App 在 `<data_dir>/bone.sqlite3` 和私有 `leases/` 下保存自己的数据�
 
 ## 错误与前端契约
 
-公开 `Error` 和 `AppProblem` 提供前端可匹配的边界，包括 Closed、Workspace / Session 不存在、SessionBusy、RequestConflict、StaleRuntime、WriteInProgress、InvalidState、Configuration、LoginRequired、ProfileBusy、Provider、Storage、Tools 和 Agent。
+公开 `Error` 和 `AppProblem` 提供前端可匹配的边界，包括 Closed、Workspace / Session 不存在、SessionBusy、RequestConflict、StaleRuntime、WriteInProgress、InvalidState、Configuration、LoginRequired、Provider、Storage、Tools 和 Agent。
 
 `SessionView::problem` 用于异步启动、归档或配置失败。前端应匹配枚举并提供恢复动作；字符串消息用于诊断，不应成为状态判断协议。
 

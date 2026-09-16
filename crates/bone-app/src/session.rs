@@ -7,7 +7,7 @@ use std::{
 };
 
 use bone_core::{
-    Agent, AgentError, AgentView, CallError, CallKind, CallStatus, ControlOutcome, ExternalEffect,
+    Agent, AgentError, AgentView, CallError, CallStatus, ControlOutcome, ExternalEffect,
     Input as AgentInput, InputId as AgentInputId, InputStatus as AgentInputStatus, JobId,
     JobStatus, Owner, Record, RecordBody, Seq, ToolOutcome, WaitView,
 };
@@ -64,8 +64,18 @@ impl Session {
     }
 
     pub(crate) async fn apply_persisted_config(&self, force: bool) -> Result<()> {
-        self.request(|reply| Command::ConfigChanged { force, reply })
+        self.request(|reply| Command::ConfigChanged {
+            force,
+            reply: Some(reply),
+        })
+        .await
+    }
+
+    pub(crate) async fn notify_config_changed(&self, force: bool) -> Result<()> {
+        self.commands
+            .send(Command::ConfigChanged { force, reply: None })
             .await
+            .map_err(|_| Error::Closed)
     }
 
     pub async fn submit(&self, input: SubmitInput) -> Result<SubmissionReceipt> {
@@ -267,6 +277,7 @@ impl Session {
                 inputs: inputs.into_iter().map(|input| (input.id, input)).collect(),
                 runtime: None,
                 starting: None,
+                preparing: None,
                 runtime_state: RuntimeState::Detached,
                 problem: None,
                 config_blocked: false,
@@ -433,7 +444,7 @@ enum Command {
     },
     ConfigChanged {
         force: bool,
-        reply: oneshot::Sender<Result<()>>,
+        reply: Option<oneshot::Sender<Result<()>>>,
     },
     RuntimeDirty(RuntimeId),
     WriteCompleted(CallRef),
@@ -467,6 +478,12 @@ struct RuntimeReady {
     result: Result<(Agent, bone_core::Observation)>,
 }
 
+struct PreparingConfig {
+    config: RuntimeConfig,
+    task: tokio::task::JoinHandle<Result<Arc<dyn bone_core::ModelPort>>>,
+    reply: Option<oneshot::Sender<Result<()>>>,
+}
+
 struct SessionTask {
     store: DataStore,
     backend: RuntimeBackend,
@@ -475,6 +492,7 @@ struct SessionTask {
     inputs: BTreeMap<InputId, InputView>,
     runtime: Option<RunningRuntime>,
     starting: Option<StartingRuntime>,
+    preparing: Option<PreparingConfig>,
     runtime_state: RuntimeState,
     problem: Option<AppProblem>,
     config_blocked: bool,
@@ -493,12 +511,35 @@ struct SessionTask {
 
 impl SessionTask {
     async fn run(mut self) {
-        while let Some(command) = self.commands.recv().await {
-            if self.handle(command).await {
-                break;
+        loop {
+            tokio::select! {
+                command = self.commands.recv() => {
+                    let Some(command) = command else { break };
+                    if self.handle(command).await { break; }
+                }
+                prepared = async {
+                    match &mut self.preparing {
+                        Some(preparing) => (&mut preparing.task).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let preparing = self.preparing.take().expect("preparation completed");
+                    let result = match prepared {
+                        Ok(Ok(model)) => self.install_config(preparing.config, model).await,
+                        Ok(Err(error)) => Err(error),
+                        Err(error) => Err(Error::Agent(format!("model preparation failed: {error}"))),
+                    };
+                    if let Err(error) = &result { self.record_execution_error(error).await; }
+                    if result.is_ok() && let Some(next) = &mut self.preparing {
+                        next.reply = preparing.reply;
+                    } else if let Some(reply) = preparing.reply {
+                        let _ = reply.send(result);
+                    }
+                }
             }
         }
-        if self.runtime.is_some() {
+        self.cancel_config().await;
+        if self.runtime.is_some() || self.starting.is_some() {
             let _ = self.close_runtime().await;
         }
         self.shutdown_target.send_replace(None);
@@ -523,6 +564,12 @@ impl SessionTask {
                             self.record_execution_error(&error).await;
                         }
                         let _ = reply.send(Ok(receipt));
+                        if self.config_blocked
+                            && self.preparing.is_none()
+                            && let Err(error) = self.apply_config(false).await
+                        {
+                            self.record_execution_error(&error).await;
+                        }
                         if let Err(error) = self.deliver_queued().await {
                             self.record_execution_error(&error).await;
                         }
@@ -681,7 +728,13 @@ impl SessionTask {
                 if let Err(error) = &result {
                     self.record_execution_error(error).await;
                 }
-                let _ = reply.send(result);
+                if result.is_ok()
+                    && let Some(preparing) = &mut self.preparing
+                {
+                    preparing.reply = reply;
+                } else if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
             }
             Command::RuntimeDirty(runtime) => {
                 if self
@@ -826,7 +879,7 @@ impl SessionTask {
                     },
                 )
             }
-            InputState::RoutingFailed { runtime, .. } => {
+            InputState::ConversationFailed { runtime, .. } => {
                 let current = self.current_runtime(runtime)?;
                 let outcome = current
                     .agent
@@ -834,7 +887,7 @@ impl SessionTask {
                     .await
                     .map_err(agent_error)?;
                 self.refresh_runtime().await?;
-                let restored = restored_routing_inputs(
+                let restored = restored_conversation_inputs(
                     runtime,
                     &self.inputs,
                     &self.current_runtime(runtime)?.view,
@@ -872,6 +925,7 @@ impl SessionTask {
     }
 
     async fn stop(&mut self) -> Result<CommandReceipt> {
+        self.cancel_config().await;
         let queued = self
             .inputs
             .values()
@@ -1144,6 +1198,7 @@ impl SessionTask {
     }
 
     async fn apply_config(&mut self, force: bool) -> Result<()> {
+        self.cancel_config().await;
         let config = match self.resolve_config() {
             Ok(config) => config,
             Err(Error::Configuration(problem)) => {
@@ -1164,7 +1219,7 @@ impl SessionTask {
             }
         };
 
-        if let Some(runtime) = &self.runtime {
+        if self.runtime.is_some() {
             let current = match &self.runtime_state {
                 RuntimeState::Running { config, .. } => config.as_ref(),
                 _ => return Err(Error::InvalidState("running runtime has no config".into())),
@@ -1174,27 +1229,15 @@ impl SessionTask {
                 return self.publish();
             }
 
-            let id = runtime.id;
-            let agent = runtime.agent.clone();
             self.suspend_for_config().await?;
             self.set_queued_problem(None)?;
-            let ports = self.runtime_tools(&config, id)?;
-            let model = self.backend.connect(&config).await?;
-            agent
-                .reconfigure(model, ports, config.limits.clone())
-                .await
-                .map_err(reconfigure_error)?;
-            self.store
-                .reconfigure_runtime(self.info.id, id, config.clone())?;
-            self.runtime_state = RuntimeState::Running {
-                id,
-                config: Box::new(config),
-            };
-            self.refresh_runtime().await?;
-            agent.resume_scheduling().await.map_err(agent_error)?;
-            self.config_blocked = false;
-            self.problem = None;
-            self.deliver_queued().await?;
+            let backend = self.backend.clone();
+            let desired = config.clone();
+            self.preparing = Some(PreparingConfig {
+                config,
+                task: tokio::spawn(async move { backend.connect(&desired).await }),
+                reply: None,
+            });
             return self.publish();
         }
 
@@ -1206,6 +1249,53 @@ impl SessionTask {
         self.set_queued_problem(None)?;
         self.deliver_queued().await?;
         self.publish()
+    }
+
+    async fn install_config(
+        &mut self,
+        config: RuntimeConfig,
+        model: Arc<dyn bone_core::ModelPort>,
+    ) -> Result<()> {
+        // A notification may still be queued when preparation completes. Never
+        // install an older selection over a more recently persisted one.
+        if self.resolve_config()? != config {
+            return self.apply_config(false).await;
+        }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("configuration prepared for live runtime");
+        let id = runtime.id;
+        let agent = runtime.agent.clone();
+        let ports = self.runtime_tools(&config, id)?;
+        agent
+            .reconfigure(model, ports, config.limits.clone())
+            .await
+            .map_err(reconfigure_error)?;
+        self.store
+            .reconfigure_runtime(self.info.id, id, config.clone())?;
+        self.runtime_state = RuntimeState::Running {
+            id,
+            config: Box::new(config),
+        };
+        self.refresh_runtime().await?;
+        agent.resume_scheduling().await.map_err(agent_error)?;
+        self.config_blocked = false;
+        self.problem = None;
+        self.deliver_queued().await?;
+        self.publish()
+    }
+
+    async fn cancel_config(&mut self) {
+        if let Some(preparing) = self.preparing.take() {
+            preparing.task.abort();
+            let _ = preparing.task.await;
+            if let Some(reply) = preparing.reply {
+                let _ = reply.send(Err(Error::InvalidState(
+                    "configuration application was superseded or stopped".into(),
+                )));
+            }
+        }
     }
 
     async fn suspend_for_config(&mut self) -> Result<()> {
@@ -1531,6 +1621,7 @@ impl SessionTask {
     }
 
     async fn close_runtime(&mut self) -> Result<CloseReport> {
+        self.cancel_config().await;
         let _ = self.cancel_start().await;
         let Some(runtime) = &self.runtime else {
             let guard = self.durable_gate.try_lock().map_err(|_| {
@@ -1740,35 +1831,16 @@ pub(crate) fn input_changes(
     inputs: &BTreeMap<InputId, InputView>,
 ) -> Vec<(InputId, InputState)> {
     match &record.body {
-        RecordBody::Input(answer) => {
-            let (Some(reply_to), Some(expected)) = (answer.reply_to, answer.expected_question)
-            else {
-                return Vec::new();
-            };
-            match inputs.get(&InputId(reply_to.0)).map(|input| &input.state) {
-                Some(InputState::WaitingForUser {
-                    runtime: owner,
-                    question,
-                    ..
-                }) if *owner == runtime && question.record == expected.0 => inputs
-                    .iter()
-                    .filter_map(|(id, input)| match &input.state {
-                        InputState::WaitingForUser {
-                            runtime: owner,
-                            question,
-                            ..
-                        } if *owner == runtime && question.record == expected.0 => {
-                            Some((*id, InputState::Accepted { runtime }))
-                        }
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            }
-        }
-        RecordBody::RoutingStarted { inputs, .. } => inputs
+        // Core records only accepted input and clears the conversation's current
+        // question for either an explicit answer or a new user message.
+        RecordBody::Input(_) => inputs
             .iter()
-            .map(|input| (InputId(input.0), InputState::Accepted { runtime }))
+            .filter_map(|(id, input)| match &input.state {
+                InputState::WaitingForUser { runtime: owner, .. } if *owner == runtime => {
+                    Some((*id, InputState::Accepted { runtime }))
+                }
+                _ => None,
+            })
             .collect(),
         RecordBody::Clarification { inputs, question } => inputs
             .iter()
@@ -1788,12 +1860,12 @@ pub(crate) fn input_changes(
                 )
             })
             .collect(),
-        RecordBody::InputRoutingFailed { inputs, message } => inputs
+        RecordBody::ConversationFailed { inputs, message } => inputs
             .iter()
             .map(|input| {
                 (
                     InputId(input.0),
-                    InputState::RoutingFailed {
+                    InputState::ConversationFailed {
                         runtime,
                         message: message.clone(),
                     },
@@ -1811,7 +1883,7 @@ pub(crate) fn input_changes(
     }
 }
 
-pub(crate) fn restored_routing_inputs(
+pub(crate) fn restored_conversation_inputs(
     runtime: RuntimeId,
     inputs: &BTreeMap<InputId, InputView>,
     agent: &AgentView,
@@ -1823,10 +1895,10 @@ pub(crate) fn restored_routing_inputs(
             let id = InputId(input.input.id.0);
             (matches!(
                 inputs.get(&id).map(|input| &input.state),
-                Some(InputState::RoutingFailed { runtime: owner, .. }) if *owner == runtime
+                Some(InputState::ConversationFailed { runtime: owner, .. }) if *owner == runtime
             ) && matches!(
                 input.status,
-                AgentInputStatus::Routing | AgentInputStatus::Handled
+                AgentInputStatus::Thinking | AgentInputStatus::Handled
             ))
             .then_some(id)
         })
@@ -1838,7 +1910,6 @@ fn app_problem(error: &Error) -> Option<AppProblem> {
         Error::Configuration(problem) => Some(AppProblem::Configuration(problem.clone())),
         Error::LoginRequired(profile) => Some(AppProblem::LoginRequired(profile.clone())),
         Error::Credential(problem) => Some(AppProblem::Credential(problem.clone())),
-        Error::ProfileBusy(profile) => Some(AppProblem::ProfileBusy(profile.clone())),
         Error::Provider(message) => Some(AppProblem::Provider(message.clone())),
         Error::Storage(message) => Some(AppProblem::Storage(message.clone())),
         Error::Tools(message) => Some(AppProblem::Tools(message.clone())),
@@ -1865,6 +1936,7 @@ fn project_runtime(runtime: RuntimeId, view: &AgentView) -> (Vec<JobView>, Vec<A
         .jobs
         .iter()
         .map(|job| JobView {
+            allowed_tools: job.allowed_tools.clone(),
             id: JobRef {
                 runtime,
                 id: job.id.0,
@@ -1875,7 +1947,6 @@ fn project_runtime(runtime: RuntimeId, view: &AgentView) -> (Vec<JobView>, Vec<A
                     runtime,
                     id: owner.0,
                 }),
-                Owner::Routing(_) => JobOwner::Routing,
             },
             inputs: job.inputs.iter().map(|input| InputId(input.0)).collect(),
             goal: job.spec.goal.clone(),
@@ -1914,17 +1985,7 @@ fn project_runtime(runtime: RuntimeId, view: &AgentView) -> (Vec<JobView>, Vec<A
                 id: call.id.0,
             },
             job: call.job.map(|job| JobRef { runtime, id: job.0 }),
-            kind: match call.kind {
-                CallKind::Coordinate => ActivityKind::Coordinate,
-                CallKind::Work => ActivityKind::Work,
-                CallKind::Compact => ActivityKind::Compact,
-                CallKind::Tool => ActivityKind::Tool {
-                    name: call
-                        .tool
-                        .as_ref()
-                        .map_or_else(|| "tool".into(), |tool| tool.name.clone()),
-                },
-            },
+            kind: ActivityKind::from_call(call.kind, call.tool.as_deref()),
             progress: call
                 .progress
                 .as_ref()
@@ -1950,7 +2011,6 @@ fn wait_reason(runtime: RuntimeId, wait: &WaitView) -> WaitReason {
         WaitView::Job { job, .. } => WaitReason::Job(JobRef { runtime, id: job.0 }),
         WaitView::Result { job, .. } => WaitReason::Result(JobRef { runtime, id: job.0 }),
         WaitView::Inquiry(_) => WaitReason::Inquiry,
-        WaitView::Coordination(_) => WaitReason::Coordination,
         WaitView::Commit => WaitReason::Commit,
     }
 }
@@ -1987,19 +2047,19 @@ fn reconfigure_error(error: AgentError) -> Error {
 mod shutdown_forwarding_tests {
     use super::*;
     use bone_core::{
-        AgentLimits, CallContext, CheckpointDraft, CompactInput, CoordinateInput, KernelDecision,
-        ModelPort, PortFuture, WorkInput, WorkProposal,
+        AgentLimits, CallContext, CheckpointDraft, CompactInput, ConversationInput,
+        ConversationStep, ModelPort, PortFuture, WorkInput, WorkProposal,
     };
     use std::{future::pending, time::Duration};
 
     struct PendingModel(mpsc::UnboundedSender<CallContext>);
 
     impl ModelPort for PendingModel {
-        fn coordinate(
+        fn converse(
             &self,
-            _: CoordinateInput,
+            _: ConversationInput,
             context: CallContext,
-        ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
+        ) -> PortFuture<std::result::Result<ConversationStep, CallError>> {
             self.0.send(context).unwrap();
             Box::pin(pending())
         }

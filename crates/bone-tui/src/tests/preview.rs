@@ -143,9 +143,9 @@ fn render_preview_artifact() {
     let runtime = RuntimeId::new();
     let events = [
         SessionEvent::InputSubmitted { input: InputId(1), request_id: RequestId::new(), text: "切换会话时保留新草稿，补上回归测试。".into(), reply_to: None },
-        SessionEvent::Reply { job: JobRef { runtime, id: 1 }, inputs: vec![InputId(1)], text: "已修复提交回执对新草稿的误清理。\n\n现在只有提交版本与当前草稿一致时，输入才会清空。\n会话切换会分别保留草稿、光标和阅读位置。\n\n```rust\nif receipt.revision == draft.revision {\n    draft.clear();\n}\n```".into() },
+        SessionEvent::Reply { inputs: vec![InputId(1)], text: "已修复提交回执对新草稿的误清理。\n\n现在只有提交版本与当前草稿一致时，输入才会清空。\n会话切换会分别保留草稿、光标和阅读位置。\n\n```rust\nif receipt.revision == draft.revision {\n    draft.clear();\n}\n```".into() },
         SessionEvent::InputSubmitted { input: InputId(2), request_id: RequestId::new(), text: "再检查中文和组合字符，别让光标跳位。".into(), reply_to: None },
-        SessionEvent::Reply { job: JobRef { runtime, id: 2 }, inputs: vec![InputId(2)], text: "我会把输入定位按实际字符宽度一起验证。".into() }
+        SessionEvent::Reply { inputs: vec![InputId(2)], text: "我会把输入定位按实际字符宽度一起验证。".into() }
     ];
     let mut history = events
         .into_iter()
@@ -162,10 +162,6 @@ fn render_preview_artifact() {
                 sequence: SessionSeq(history.len() as u64 + 1),
                 occurred_at: history.len() as i64,
                 event: SessionEvent::Reply {
-                    job: JobRef {
-                        runtime,
-                        id: number + 2,
-                    },
                     inputs: Vec::new(),
                     text: format!(
                         "## Finding {number}\n\nThe draft remains attached to its session.\n\n```rust\nlet draft = session.draft();\nsave(draft).await?;\n```\n\n- Preserve pending text\n- Restore the reading position\n"
@@ -173,6 +169,130 @@ fn render_preview_artifact() {
                 },
             });
         }
+    }
+    if matches!(scenario.as_str(), "tool-presentation" | "tool-details") {
+        use serde_json::json;
+        let job = JobRef { runtime, id: 1 };
+        let mut events = vec![SessionEvent::InputSubmitted {
+            input: InputId(1),
+            request_id: RequestId::new(),
+            text: "检查草稿保存逻辑，修复问题并运行测试。".into(),
+            reply_to: None,
+        }];
+        for (name, arguments, result) in [
+            (
+                "glob",
+                json!({"pattern":"**/*draft*.rs", "path":"crates"}),
+                json!({"paths":["crates/bone-tui/src/state/draft.rs", "crates/bone-app/src/draft.rs"], "truncated":false, "warnings":[]}),
+            ),
+            (
+                "read",
+                json!({"path":"crates/bone-tui/src/state/draft.rs", "offset":20}),
+                json!({"path":"crates/bone-tui/src/state/draft.rs", "start_line":20, "end_line":27, "content":"pub fn save_draft(session: &mut Session) {\n    let revision = session.draft.revision();\n    // 保留提交之后继续输入的文字。\n    if session.receipt.revision == revision {\n        session.draft.clear();\n    }\n    session.persist();\n}\n", "truncated":false, "line_truncated":false, "next_offset":null}),
+            ),
+            (
+                "bash",
+                json!({"command":"cargo test -p bone-tui draft"}),
+                json!({"stdout":"running 12 tests\ntest result: ok. 12 passed; 0 failed\n", "stderr":"", "exit_code":0, "timed_out":false, "truncated":false}),
+            ),
+            (
+                "apply_patch",
+                json!({"patch":"*** Begin Patch\n*** Update File: crates/bone-tui/src/state/draft.rs\n*** End Patch"}),
+                json!({"summary":"Updated draft revision check", "changes":[{"kind":"update", "path":"crates/bone-tui/src/state/draft.rs", "moved_to":null, "added_lines":3, "removed_lines":1}]}),
+            ),
+        ] {
+            events.push(SessionEvent::ToolFinished {
+                call: bone_app::CallRef {
+                    runtime,
+                    id: events.len() as u64,
+                },
+                job,
+                tool: name.into(),
+                arguments,
+                outcome: bone_app::ToolOutcome::value(result),
+            });
+        }
+        events.push(SessionEvent::Reply {
+            inputs: vec![InputId(1)],
+            text: "草稿按版本保存，提交回执不会清空后续输入。\n正在检查剩余调用路径。".into(),
+        });
+        history = events
+            .into_iter()
+            .enumerate()
+            .map(|(i, event)| HistoryEntry {
+                sequence: SessionSeq(i as u64 + 1),
+                occurred_at: i as i64,
+                event,
+            })
+            .collect();
+        let model = state
+            .model_facts
+            .as_ref()
+            .unwrap()
+            .saved
+            .as_ref()
+            .unwrap()
+            .clone();
+        let snapshot = Arc::make_mut(ui.snapshot.as_mut().unwrap());
+        snapshot.runtime = RuntimeState::Running {
+            id: runtime,
+            config: Box::new(bone_app::RuntimeConfig {
+                coordinator: model.clone(),
+                worker: model,
+                limits: Default::default(),
+                tools: Default::default(),
+                workspace: Default::default(),
+            }),
+        };
+        snapshot.history_through = SessionSeq(history.len() as u64);
+        snapshot.activity.push(bone_app::ActivityView {
+            call: bone_app::CallRef { runtime, id: 9 },
+            job: Some(job),
+            kind: bone_app::ActivityKind::Tool {
+                name: "grep".into(),
+                arguments: json!({"pattern":"persist_draft", "path":"crates/bone-tui/src"}),
+            },
+            progress: Some("Checking remaining call sites".into()),
+        });
+        state.activity_frame = 3;
+    }
+    if scenario == "conversation-turns" {
+        let job = JobRef { runtime, id: 1 };
+        let events = vec![
+            SessionEvent::InputSubmitted { input: InputId(1), request_id: RequestId::new(), text: "先只分析输入焦点，不要修改。".into(), reply_to: None },
+            SessionEvent::InputAccepted { input: InputId(1), runtime },
+            SessionEvent::JobFinished { job, outcome: bone_app::OutcomeKind::Completed, summary: "INTERNAL_RESULT_MUST_STAY_IN_DETAILS".into(), remaining: vec![] },
+            SessionEvent::Reply { inputs: vec![InputId(1)], text: "问题在鼠标点击路径：右栏点击改变了键盘输入目标。建议让右栏操作只更新阅读状态。文件尚未修改。".into() },
+            SessionEvent::InputFinished { input: InputId(1), runtime, outcome: bone_app::InputOutcome::Completed },
+            SessionEvent::InputSubmitted { input: InputId(2), request_id: RequestId::new(), text: "现在实现，并保留拖选复制。".into(), reply_to: None },
+            SessionEvent::Reply { inputs: vec![InputId(2)], text: "已完成修改。右栏点击和滚动不会夺走中栏输入焦点，拖选松开仍会复制。交互回归测试通过。".into() },
+            SessionEvent::InputFinished { input: InputId(2), runtime, outcome: bone_app::InputOutcome::Completed },
+        ];
+        history = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| HistoryEntry {
+                sequence: SessionSeq(index as u64 + 1),
+                occurred_at: index as i64,
+                event,
+            })
+            .collect();
+        let snapshot = Arc::make_mut(ui.snapshot.as_mut().unwrap());
+        snapshot.jobs.push(bone_app::JobView {
+            id: job,
+            owner: bone_app::JobOwner::User,
+            inputs: vec![InputId(1)],
+            goal: "分析输入焦点".into(),
+            scope: "只分析，不修改".into(),
+            done_when: "定位原因".into(),
+            allowed_tools: ["read".into(), "grep".into(), "glob".into()].into(),
+            state: bone_app::JobState::Finished {
+                outcome: bone_app::OutcomeKind::Completed,
+                summary: "INTERNAL_RESULT_MUST_STAY_IN_DETAILS".into(),
+            },
+            report: None,
+        });
+        snapshot.history_through = SessionSeq(history.len() as u64);
     }
     let snapshot_through = history.last().map_or(SessionSeq(0), |entry| entry.sequence);
     ui.transcript.open(RecentHistoryPage {
@@ -191,6 +311,12 @@ fn render_preview_artifact() {
             },
         }),
     );
+    if scenario == "tool-details" {
+        update(
+            &mut state,
+            UiEvent::Action(Action::OpenHistory(SessionSeq(3))),
+        );
+    }
     if scenario == "commands" {
         update(
             &mut state,

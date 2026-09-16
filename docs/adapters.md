@@ -109,7 +109,7 @@ EOF 而没有 terminal 是 `IncompleteStream`；截断、过滤或反序列化�
 
 `ModelAdapter` 持有两个已连接并验证过的 `ConfiguredModel`：
 
-- Coordinator 执行 `model_contract::coordinate`；
+- 会话模型执行 `model_contract::converse`；
 - Worker 执行 `model_contract::work` 和 `compact`。
 
 每个 Core port 方法只进行一次 provider 调用。Adapter 把 Core 提供的 instructions、context JSON 和提交 schema 构造成一次强制 specific-tool Request，并要求模型返回恰好一个正确命名的提交调用。截断输出、零个或多个提交、错误工具名以及 schema decode 失败都转换为 `CallError`。
@@ -122,13 +122,13 @@ Core Runtime 在 Future 外层掌握 timeout 和提交资格。ModelAdapter 在�
 
 | 工具 | 行为 |
 | --- | --- |
-| `read` | 带一基行号的 UTF-8 文件分页；同时限制文件、行数和输出字节 |
+| `read` | UTF-8 文件分页，正文保留源文本，行号由界面展示；同时限制文件、行数和输出字节 |
 | `glob` | workspace walker 上的 glob；尊重有界的本地 ignore 文件，限制遍历和结果 |
 | `grep` | 基于 ripgrep Rust libraries 的 regex / literal 搜索；支持 glob、上下文、binary 检测和有界结果 |
 | `apply_patch` | Codex patch grammar 的 Add / Update / Delete / Move；全量解析与 staging 后再提交 |
 | `bash` | 一次非交互 `bash -c`；限制 cwd、deadline、stdout / stderr，并清理 Unix process group |
 
-`read_only_tools` 只把 read、glob、grep 注册成 Core `ToolPort`。App 自己添加 `session_history`，并只在 `WorkspaceWrite` 模式下用带 durable write tracking 的 adapter 注册 apply_patch 与 bash。工具 effect 由代码注册时决定，不能由模型 arguments 改写。
+`read_only_tools` 把 read、glob、grep 注册成 Core `ToolPort`。App 添加 `session_history`，并用带 durable write tracking 的 adapter 注册 apply_patch 与 bash。工具目录始终完整；每个 Job 能调用哪些工具由 Core 的固定授权集合决定。工具 effect 由代码注册时决定，不能由模型 arguments 改写。Adapter 不维护第二套权限规则。
 
 工具调用需要活跃 Tokio runtime。Core 负责调用级 timeout、并发、soft progress 和 cooperative cancellation；具体工具仍可有更窄的领域 deadline。参数只能缩小 hard limits，不能扩大。
 
@@ -174,9 +174,9 @@ Bash 分别限制 stdout 和 stderr，非零退出是结构化工具失败。Uni
 
 ## ChatGPT subscription 与 Rig 边界
 
-ChatGPT subscription connector 接受由 App 获取的窄 OAuth-cache capability。lease 保护一个经过验证的 private `auth.json` path；Rig 独占该文件的 JSON schema、token refresh 和网络协议，Adapters 不搜索 credential root、不读取 OAuth bytes，也不删除 cache。
+ChatGPT subscription connector 接受 App 验证过的 private `auth.json` path。构造 cached Endpoint 不读取凭据；每次模型请求由 Rig 在需要时读取或刷新 token。Rig 独占 JSON schema、OAuth 网络协议和跨进程 cache 事务，Adapters 不搜索 credential root，也不读取 OAuth bytes。
 
-`Endpoint` 和从它创建的 `Model` 都持有这份 capability，防止使用期间被 logout 删除。subscription backend 不支持的 `max_output_tokens` 或 structured-output schema 会在本地拒绝。
+refresh、rejected-token invalidate 和 logout 在同一把文件锁下重新读取并原子提交，因此并发进程共享 cache 时不会形成 refresh storm，也不会用旧 401 删除新 token。设备授权等待在锁外进行。subscription backend 不支持的 `max_output_tokens` 或 structured-output schema 会在本地拒绝。
 
 Workspace 固定使用本地 [Rig 0.42.0 hardening patch](../patches/rig-core-0.42.0-chatgpt-hardening.md)。升级 Rig 时必须重跑独立 patch tests 和 BONE 的 provider contracts，确认上游已覆盖补丁退出条件后才能删除。
 

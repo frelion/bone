@@ -82,27 +82,7 @@ pub(super) fn render(
         );
         render_transcript(frame, transcript, state, hits)
     };
-    let status = state
-        .status_text()
-        .map(str::to_owned)
-        .or_else(|| {
-            state
-                .selected_ui()
-                .and_then(|ui| ui.snapshot.as_ref())
-                .map(|snapshot| {
-                    if let Some(problem) = &snapshot.problem {
-                        problem_hint(problem, composer_area.width.saturating_sub(4)).into()
-                    } else if state
-                        .selected_ui()
-                        .is_some_and(|ui| ui.transcript.reading())
-                    {
-                        "Reading history · PgDn for latest".into()
-                    } else {
-                        runtime_label(&snapshot.runtime).into()
-                    }
-                })
-        })
-        .unwrap_or_default();
+    let status = execution_status(state, composer_area.width.saturating_sub(4));
     let status_tone = status_tone(state);
     let status_area = Rect::new(
         composer_area.x + 2,
@@ -134,6 +114,11 @@ pub(super) fn render(
                 "Question ended · keep as draft",
                 ClickTarget::Action(Action::ConvertAnswer),
             )
+        };
+        let label = if state.activity_animation_active() {
+            format!("{status} · {label}")
+        } else {
+            label.to_owned()
         };
         frame.render_widget(
             Paragraph::new(label).style(theme::body_on(theme::WARNING, theme::PANEL)),
@@ -181,6 +166,9 @@ fn problem_hint(problem: &bone_app::AppProblem, width: u16) -> &'static str {
 }
 
 fn status_tone(state: &UiState) -> ratatui::style::Color {
+    if state.activity_animation_active() {
+        return theme::INFO;
+    }
     if state.status.is_some() {
         return theme::MUTED;
     }
@@ -313,8 +301,26 @@ fn render_transcript(
     let mut links = Vec::new();
     let mut anchors = Vec::new();
     let mut copy_items = Vec::new();
+    let mut previous_compact = false;
     for entry in session.transcript.entries() {
-        let mut rendered = message::render(&entry.event, area.width);
+        let (mut rendered, text) =
+            if let bone_app::SessionEvent::ToolFinished { outcome, .. } = &entry.event {
+                // Share the existing bounded source cache with tool summaries. Animation
+                // frames must not reinterpret results or create another copy of them.
+                let text = session
+                    .transcript
+                    .copy_text(entry.sequence, || message::copy_text(&entry.event, &[]));
+                let label = text
+                    .split_once('\n')
+                    .map_or(text.as_ref(), |(label, _)| label);
+                (message::render_tool(outcome, label, area.width), text)
+            } else {
+                let rendered = message::render(&entry.event, area.width);
+                let text = session.transcript.copy_text(entry.sequence, || {
+                    message::copy_text(&entry.event, &rendered)
+                });
+                (rendered, text)
+            };
         if reader_selects(
             state,
             crate::state::reader::ReaderSource::History(entry.sequence),
@@ -323,9 +329,6 @@ fn render_transcript(
                 row.line.style = row.line.style.bg(theme::SELECTED);
             }
         }
-        let text = session.transcript.copy_text(entry.sequence, || {
-            message::copy_text(&entry.event, &rendered)
-        });
         let copy_rows: Vec<_> = rendered
             .iter()
             .enumerate()
@@ -355,7 +358,8 @@ fn render_transcript(
             copy_items.push((rows.len(), text, entry.sequence.0, copy_rows));
             continue;
         }
-        if !rows.is_empty() {
+        let compact = compact_event(&entry.event);
+        if !rows.is_empty() && !(previous_compact && compact) {
             rows.push(Line::default());
             anchors.push(crate::layout::ContentAnchor {
                 sequence: entry.sequence,
@@ -363,12 +367,12 @@ fn render_transcript(
                 part: crate::layout::AnchorPart::Separator,
             });
         }
+        previous_compact = compact;
         let source_row = rows.len();
         copy_items.push((source_row, text, entry.sequence.0, copy_rows));
         let target = match entry.event {
             bone_app::SessionEvent::ToolFinished { .. }
-            | bone_app::SessionEvent::JobFinished { .. }
-            | bone_app::SessionEvent::RoutingFailed { .. }
+            | bone_app::SessionEvent::ConversationFailed { .. }
             | bone_app::SessionEvent::InputRejected { .. } => {
                 Some(ClickTarget::Action(Action::OpenHistory(entry.sequence)))
             }
@@ -415,17 +419,29 @@ fn render_transcript(
                 break;
             }
             let name = match &activity.kind {
-                ActivityKind::Coordinate => "Coordinating",
-                ActivityKind::Work => "Working",
-                ActivityKind::Compact => "Compacting context",
-                ActivityKind::Tool { name } => name,
+                ActivityKind::Converse => "Responding".to_owned(),
+                ActivityKind::Work => "Working".to_owned(),
+                ActivityKind::Compact => "Compacting context".to_owned(),
+                ActivityKind::Tool { name, arguments } => {
+                    let summary = bone_app::tool_summary(name, arguments, None);
+                    let mut subject = if summary.subject == *name {
+                        name.to_owned()
+                    } else {
+                        format!("{name} · {}", summary.subject)
+                    };
+                    if let Some(result) = summary.result {
+                        subject.push_str(" · ");
+                        subject.push_str(&result);
+                    }
+                    subject
+                }
             };
             let body = activity.progress.as_deref().map_or_else(
-                || single_line_external(name),
+                || single_line_external(&name),
                 |progress| {
                     format!(
                         "{}  {}",
-                        single_line_external(name),
+                        single_line_external(&name),
                         single_line_external(progress)
                     )
                 },
@@ -448,27 +464,22 @@ fn render_transcript(
     // live tail and must not be inserted into the user's older reading window.
     if session.transcript.at_tail() {
         if let Some(snapshot) = &session.snapshot {
-            for question in crate::state::answer::active_questions(snapshot) {
+            if let Some(question) = crate::state::answer::current_question(snapshot) {
                 let in_history = session.transcript.entries().any(|entry| {
                     matches!(entry.event,
                     bone_app::SessionEvent::QuestionAsked { question: id, .. } if id == question.id)
                 });
                 if !in_history {
+                    links.push((
+                        rows.len(),
+                        ClickTarget::Action(Action::AnswerQuestion(question.id)),
+                    ));
                     rows.extend(message::body_rows(
                         question.text,
                         usize::from(area.width),
                         theme::WARNING,
                     ));
                 }
-                links.push((
-                    rows.len(),
-                    ClickTarget::Action(Action::AnswerQuestion(question.id)),
-                ));
-                rows.push(message::compact(
-                    "?",
-                    &format!("[answer] {}", question.text),
-                    theme::WARNING,
-                ));
             }
             for candidate in
                 crate::state::answer::recoverable_inputs(snapshot, session.transcript.entries())
@@ -599,12 +610,51 @@ fn visible_rows(
     rows[end.saturating_sub(viewport)..end].to_vec()
 }
 
-fn runtime_label(runtime: &RuntimeState) -> &'static str {
-    match runtime {
-        RuntimeState::Detached => "",
-        RuntimeState::Starting => "Starting",
-        RuntimeState::Running { .. } => "",
-        RuntimeState::Closing { .. } => "Stopping",
+fn execution_status(state: &UiState, width: u16) -> String {
+    if let Some(problem) = state
+        .selected_ui()
+        .and_then(|ui| ui.snapshot.as_ref())
+        .and_then(|snapshot| snapshot.problem.as_ref())
+    {
+        return problem_hint(problem, width).into();
+    }
+    let reading = state
+        .selected_ui()
+        .is_some_and(|ui| ui.transcript.reading());
+    if let Some((label, active)) = state.execution_feedback() {
+        const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let mut text = if active {
+            format!("{} {}", SPINNER[state.activity_frame], label)
+        } else {
+            label.to_owned()
+        };
+        if reading {
+            text.push_str(" · Reading history · PgDn for latest");
+        }
+        // Transient notices may explain a failed action; they never hide active work.
+        if !active && let Some(notice) = state.status_text() {
+            return notice.to_owned();
+        }
+        return text;
+    }
+    state.status_text().map(str::to_owned).unwrap_or_else(|| {
+        if reading {
+            "Reading history · PgDn for latest".into()
+        } else {
+            String::new()
+        }
+    })
+}
+
+fn compact_event(event: &bone_app::SessionEvent) -> bool {
+    use bone_app::SessionEvent;
+    match event {
+        SessionEvent::ToolFinished { outcome, .. } => outcome.result.is_ok(),
+        SessionEvent::InputFinished { outcome, .. } => *outcome != bone_app::InputOutcome::Failed,
+        SessionEvent::InputCancelled { .. }
+        | SessionEvent::AcceptanceRecorded { .. }
+        | SessionEvent::WriteResolved { .. } => true,
+        _ => false,
     }
 }
 
@@ -624,6 +674,191 @@ mod tests {
     };
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::Arc;
+
+    #[test]
+    fn feedback_tracks_work_and_stops_for_waiting_failure_and_completion() {
+        let (mut state, q) = fixture();
+        assert_eq!(state.execution_feedback(), None, "idle runtime is not work");
+        for (input_state, expected, animated) in [
+            (
+                InputState::Posting { runtime: q.runtime },
+                "Preparing next step",
+                true,
+            ),
+            (
+                InputState::Accepted { runtime: q.runtime },
+                "Preparing next step",
+                true,
+            ),
+            (active_input(q).state, "Waiting for your answer", false),
+            (
+                InputState::ConversationFailed {
+                    runtime: q.runtime,
+                    message: "denied".into(),
+                },
+                "Request failed · open error for details",
+                false,
+            ),
+            (
+                InputState::Finished {
+                    runtime: q.runtime,
+                    outcome: bone_app::InputOutcome::Completed,
+                },
+                "Completed",
+                false,
+            ),
+        ] {
+            let snapshot =
+                Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap());
+            let mut input = active_input(q);
+            input.state = input_state;
+            snapshot.inputs = vec![input];
+            assert_eq!(state.execution_feedback(), Some((expected, animated)));
+            assert_eq!(state.activity_animation_active(), animated);
+        }
+    }
+
+    #[test]
+    fn a_blocked_worker_does_not_invent_a_user_question() {
+        let (mut state, q) = fixture();
+        let snapshot = Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap());
+        snapshot.inputs.clear();
+        snapshot.jobs.push(JobView {
+            id: JobRef {
+                runtime: q.runtime,
+                id: 1,
+            },
+            owner: JobOwner::User,
+            inputs: vec![],
+            goal: "blocked work".into(),
+            scope: "scope".into(),
+            done_when: "done".into(),
+            allowed_tools: ["read".into()].into(),
+            state: JobState::Waiting(bone_app::WaitReason::User),
+            report: None,
+        });
+        assert!(crate::state::answer::current_question(snapshot).is_none());
+        assert_ne!(
+            state.execution_feedback(),
+            Some(("Waiting for your answer", false))
+        );
+        let snapshot = Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap());
+        snapshot.activity.push(bone_app::ActivityView {
+            call: bone_app::CallRef {
+                runtime: q.runtime,
+                id: 2,
+            },
+            job: None,
+            kind: ActivityKind::Converse,
+            progress: None,
+        });
+        assert_eq!(state.execution_feedback(), Some(("Responding", true)));
+    }
+
+    #[test]
+    fn activity_ticks_keep_reading_draft_focus_and_details_unchanged() {
+        use crate::state::{UiEvent, update};
+        let (mut state, q) = fixture();
+        let ui = state.selected_ui_mut().unwrap();
+        ui.draft = "中文草稿".into();
+        ui.transcript.scroll_up(5);
+        let snapshot = Arc::make_mut(ui.snapshot.as_mut().unwrap());
+        let mut input = active_input(q);
+        input.state = InputState::Accepted { runtime: q.runtime };
+        snapshot.inputs.push(input);
+        state.details = Some(crate::state::ReaderState {
+            content: crate::state::reader::ReaderContent::from_history(
+                state.selected.unwrap(),
+                &HistoryEntry {
+                    sequence: SessionSeq(1),
+                    occurred_at: 0,
+                    event: SessionEvent::ConversationFailed {
+                        runtime: q.runtime,
+                        inputs: vec![],
+                        message: "older failure".into(),
+                    },
+                },
+            )
+            .unwrap(),
+            scroll: 3,
+        });
+        state.status = Some(crate::state::Status::from("old notice"));
+        let before = execution_status(&state, 100);
+        assert!(before.contains("Preparing next step"));
+        assert!(before.contains("Reading history"));
+        let keyboard = state.keyboard;
+        assert!(update(&mut state, UiEvent::ActivityTick).is_empty());
+        assert_ne!(execution_status(&state, 100), before);
+        assert_eq!(state.keyboard, keyboard);
+        assert_eq!(state.selected_ui().unwrap().draft(), "中文草稿");
+        assert!(state.selected_ui().unwrap().transcript.reading());
+        assert_eq!(state.details.as_ref().unwrap().scroll, 3);
+        Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap())
+            .inputs
+            .clear();
+        state.dirty = false;
+        let frame = state.activity_frame;
+        update(&mut state, UiEvent::ActivityTick);
+        assert_eq!(state.activity_frame, frame);
+        assert!(!state.dirty);
+    }
+
+    #[test]
+    fn running_tool_shows_its_object_and_live_progress() {
+        let (mut state, q) = fixture();
+        let snapshot = Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap());
+        snapshot.activity.push(bone_app::ActivityView {
+            call: bone_app::CallRef {
+                runtime: q.runtime,
+                id: 1,
+            },
+            job: None,
+            kind: ActivityKind::Tool {
+                name: "read".into(),
+                arguments: serde_json::json!({"path":"src/main.rs","offset":20}),
+            },
+            progress: Some("Reading contents".into()),
+        });
+        let (text, _, _) = render_rows(&state, 10);
+        assert!(text.contains("read · src/main.rs · from line 20"));
+        assert!(text.contains("Reading contents"));
+    }
+
+    #[test]
+    fn compact_events_share_spacing_but_errors_keep_a_boundary() {
+        let (mut state, q) = fixture();
+        let events = vec![
+            SessionEvent::InputAccepted {
+                runtime: q.runtime,
+                input: InputId(1),
+            },
+            SessionEvent::InputCancelled { input: InputId(1) },
+            SessionEvent::ConversationFailed {
+                runtime: q.runtime,
+                inputs: vec![],
+                message: "failure".into(),
+            },
+        ];
+        replace_history(
+            state.selected_ui_mut().unwrap(),
+            events
+                .into_iter()
+                .enumerate()
+                .map(|(index, event)| HistoryEntry {
+                    sequence: SessionSeq(index as u64 + 1),
+                    occurred_at: 0,
+                    event,
+                })
+                .collect(),
+        );
+        let (text, _, metrics) = render_rows(&state, 12);
+        let rows: Vec<_> = text.lines().collect();
+        assert!(!text.contains("Request received"));
+        assert!(rows[0].contains("Request cancelled"));
+        assert!(rows[1].trim().is_empty());
+        assert!(rows[2].contains("failure"));
+        assert_eq!(metrics.total_rows, 3);
+    }
 
     #[test]
     fn title_focus_uses_only_the_blinking_caret_and_keeps_the_rule_neutral() {
@@ -914,10 +1149,6 @@ mod tests {
                     reply_to: None,
                 },
                 1 => SessionEvent::Reply {
-                    job: JobRef {
-                        runtime: question.runtime,
-                        id: 1,
-                    },
                     inputs: vec![],
                     text: source,
                 },
@@ -993,10 +1224,6 @@ mod tests {
                     sequence: SessionSeq(1),
                     occurred_at: 0,
                     event: SessionEvent::Reply {
-                        job: JobRef {
-                            runtime: question.runtime,
-                            id: 1,
-                        },
                         inputs: vec![],
                         text: "长中文与代码内容\n".repeat(50),
                     },
@@ -1140,13 +1367,33 @@ mod tests {
             .inputs
             .push(active_input(q));
         let (text, hits, metrics) = render_rows(&state, 8);
-        assert!(text.contains("[answer] Which scope?"));
+        assert_eq!(text.matches("Which scope?").count(), 1);
         assert!(!text.contains("Start with a clear request"));
         assert!(
             hits.iter()
                 .any(|h| h.target == ClickTarget::Action(Action::AnswerQuestion(q)))
         );
         assert!(metrics.total_rows > 0);
+        replace_history(
+            state.selected_ui_mut().unwrap(),
+            vec![HistoryEntry {
+                sequence: SessionSeq(1),
+                occurred_at: 0,
+                event: SessionEvent::QuestionAsked {
+                    question: q,
+                    inputs: vec![q.reply_to],
+                    text: "Which scope?".into(),
+                },
+            }],
+        );
+        let (text, hits, _) = render_rows(&state, 8);
+        assert_eq!(text.matches("Which scope?").count(), 1);
+        assert_eq!(
+            hits.iter()
+                .filter(|hit| hit.target == ClickTarget::Action(Action::AnswerQuestion(q)))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1205,6 +1452,7 @@ mod tests {
             state: InputState::Queued { problem: None },
         });
         snapshot.jobs.push(JobView {
+            allowed_tools: ["read".to_owned(), "glob".to_owned()].into(),
             id: JobRef {
                 runtime: q.runtime,
                 id: 9,
@@ -1230,10 +1478,6 @@ mod tests {
                 sequence: SessionSeq(1),
                 occurred_at: 0,
                 event: SessionEvent::Reply {
-                    job: JobRef {
-                        runtime: q.runtime,
-                        id: 1,
-                    },
                     inputs: vec![InputId(1)],
                     text: (0..30).map(|i| format!("History row {i}\n")).collect(),
                 },
@@ -1242,7 +1486,7 @@ mod tests {
         ui.transcript.scroll_up(1);
         let (text, hits, _) = render_rows(&state, 8);
         assert!(!text.contains("Live job"));
-        assert!(!text.contains("[answer]"));
+        assert!(!text.contains("Which scope?"));
         assert!(!text.contains("Retry"));
         assert!(
             hits.is_empty(),
@@ -1293,6 +1537,7 @@ mod tests {
         Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap())
             .jobs
             .push(JobView {
+                allowed_tools: ["read".to_owned(), "glob".to_owned()].into(),
                 id: job,
                 owner: JobOwner::User,
                 inputs: vec![InputId(1)],

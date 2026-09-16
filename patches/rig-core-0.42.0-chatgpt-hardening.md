@@ -19,6 +19,7 @@ Upstream baseline:
 
 The local delta is deliberately limited to these files:
 
+- `Cargo.toml`
 - `src/providers/internal/device_auth.rs`
 - `src/providers/chatgpt/auth/mod.rs`
 - `src/providers/chatgpt/auth/native.rs`
@@ -27,24 +28,24 @@ The local delta is deliberately limited to these files:
 
 The delta provides:
 
-- atomic Unix credential replacement using a private sibling file, file and
-  directory sync, and same-directory rename;
+- atomic credential replacement using a private same-directory temporary file;
+  Unix also syncs the containing directory;
+- one cancellable cross-process cache transaction for read, refresh, atomic
+  write, rejected-token invalidation, and explicit removal;
+- bounded lock acquisition and OAuth HTTP requests; the human device-code wait
+  happens outside the cache lock and only the final commit reacquires it;
 - corrupt-cache invalidation, with recovery reserved for explicit interactive
   authorization;
-- a single-flight refresh after a rejected access-token generation, followed
-  by at most one unary or streaming request retry;
+- a cross-process single-flight refresh after a rejected access-token
+  generation, followed by at most one unary or streaming request retry;
+- generation-aware invalidation, so an old 401 cannot delete a newer token;
 - invalidation after an unusable refresh token;
 - stable redaction for unary/streaming 401 or 403 responses and Responses SSE
   provider-error envelopes, while retaining non-authentication transport and
   structured parse errors.
 
-The non-Unix writer intentionally retains Rig's original replacement behavior.
-BONE's managed ChatGPT subscription connector is Unix-only, so this is not a
-weaker path for the supported integration. Do not claim atomic credential
-writes on another platform until Rig gains a platform-appropriate atomic
-replacement implementation there.
-
 Before removing the vendored path dependency during a Rig upgrade, verify that
 the upstream release contains equivalent regression tests for atomic writes,
+cross-process refresh serialization, cancellation while waiting for the lock,
 corrupt cache recovery, rejected-token generation handling, retry bounds, and
 unary plus SSE error redaction.

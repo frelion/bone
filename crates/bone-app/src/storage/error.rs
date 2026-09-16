@@ -24,8 +24,6 @@ pub enum StoreError {
     ConfigFile { message: String },
     #[error("configuration file changed outside BONE: {path}")]
     ConfigConflict { path: PathBuf },
-    #[error("project configuration is not trusted: {path}")]
-    ProjectConfigUntrusted { path: PathBuf },
     #[error(
         "stored document changed since it was read (expected revision {expected}, actual {actual})"
     )]

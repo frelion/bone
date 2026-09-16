@@ -7,9 +7,9 @@ use std::{
 };
 
 use bone_app::{
-    AgentLimits, App, AppOptions, AppProblem, ConfigChange, ConfigScope, EndpointConfig,
-    HistoryEntry, InputId, InputOutcome, InputState, ModelSelection, Profile, ProfileId, Session,
-    SessionEvent, SessionSeq, SubmitInput, ToolLimits, ToolMode, ToolSettings,
+    App, AppOptions, AppProblem, ConfigChange, ConfigScope, EndpointConfig, HistoryEntry, InputId,
+    InputOutcome, InputState, ModelSelection, Profile, ProfileId, Session, SessionEvent,
+    SessionSeq, SubmitInput,
 };
 use serde::Serialize;
 
@@ -43,7 +43,6 @@ OPTIONS:\n\
     --timeout-seconds N       Wall-clock limit (default: 1800)\n\
     --trajectory PATH         Write the complete durable event history as JSON\n\
     --result PATH             Also write the final JSON result to PATH\n\
-    --read-only               Disable workspace-writing tools\n\
     --job-budget N            Lifetime descendant limit per root (0 forbids delegation)\n\
     --job-depth N             Maximum Job tree depth including root (1 forbids children)\n\
 \n\
@@ -52,7 +51,6 @@ MODEL OPTIONS:\n\
     --provider NAME           openai-responses (default), openai-chat, anthropic,\n\
                               or chatgpt (uses an existing subscription login)\n\
     --base-url URL            HTTPS URL for a compatible provider\n\
-    --trust-project-config    Trust the current .bone/config.toml digest\n\
 \n\
 If --model is omitted, `run` uses the model already configured in BONE.\n\
 Exit codes: 0 completed, 2 usage, 3 failed, 4 needs input, 124 timeout, 130 interrupted.\n";
@@ -126,13 +124,11 @@ struct Options {
     timeout: Duration,
     trajectory: Option<PathBuf>,
     result: Option<PathBuf>,
-    read_only: bool,
     job_budget: Option<usize>,
     job_depth: Option<usize>,
     model: Option<String>,
     provider: Provider,
     base_url: Option<String>,
-    trust_project_config: bool,
 }
 
 #[derive(Debug)]
@@ -160,7 +156,6 @@ struct RunReport {
     workspace: PathBuf,
     duration_ms: u128,
     summary: Option<String>,
-    remaining: Vec<String>,
     message: Option<String>,
     changed_files: Vec<String>,
     trajectory: Option<PathBuf>,
@@ -280,67 +275,9 @@ async fn execute(options: Options) -> Result<u8, String> {
         .await
         .map_err(|error| format!("could not open workspace: {error}"))?;
 
-    let project_status = app
-        .project_config_status(workspace.id)
-        .await
-        .map_err(|error| format!("could not inspect project configuration: {error}"))?;
-    if project_status.exists && !project_status.trusted {
-        if options.trust_project_config {
-            app.trust_project_config(workspace.id)
-                .await
-                .map_err(|error| format!("could not trust project configuration: {error}"))?;
-        } else {
-            return Err("project .bone/config.toml is not trusted; review it and rerun with --trust-project-config".into());
-        }
-    }
-
     if let Some(model) = &options.model {
         configure_model(&app, workspace.id, &options, model).await?;
     }
-    let tool_limits = ToolLimits::default();
-    if !options.read_only {
-        // A previous failed launch may have persisted write mode with limits that
-        // cannot be resolved together. Temporarily restoring read-only mode lets
-        // us preserve every effective agent limit except the incompatible timeout.
-        app.update_config(
-            ConfigScope::Workspace(workspace.id),
-            ConfigChange::Tools(Some(ToolSettings {
-                mode: ToolMode::ReadOnly,
-                limits: tool_limits.clone(),
-            })),
-        )
-        .await
-        .map_err(|error| format!("could not prepare workspace tools: {error}"))?;
-        let resolved = app
-            .resolved_workspace_config(workspace.id)
-            .await
-            .map_err(|error| format!("could not resolve workspace config: {error}"))?;
-        if let Ok(config) = resolved.desired {
-            let mut agent_limits = config.limits;
-            if raise_tool_timeout(&mut agent_limits, &tool_limits) {
-                app.update_config(
-                    ConfigScope::Workspace(workspace.id),
-                    ConfigChange::Limits(Some(agent_limits)),
-                )
-                .await
-                .map_err(|error| format!("could not configure agent limits: {error}"))?;
-            }
-        }
-    }
-    app.update_config(
-        ConfigScope::Workspace(workspace.id),
-        ConfigChange::Tools(Some(ToolSettings {
-            mode: if options.read_only {
-                ToolMode::ReadOnly
-            } else {
-                ToolMode::WorkspaceWrite
-            },
-            limits: tool_limits,
-        })),
-    )
-    .await
-    .map_err(|error| format!("could not configure workspace tools: {error}"))?;
-
     if options.job_budget.is_some() || options.job_depth.is_some() {
         let resolved = app
             .resolved_workspace_config(workspace.id)
@@ -387,7 +324,7 @@ async fn execute(options: Options) -> Result<u8, String> {
     if let Some(path) = &options.trajectory {
         write_json(path, &history)?;
     }
-    let (summary, remaining) = final_result(&history);
+    let summary = final_result(&history, receipt.input);
     let changed_files = read_changed_files(&app, workspace.id).await?;
     let (status, exit_code, message) = classify(completion);
     let report = RunReport {
@@ -399,7 +336,6 @@ async fn execute(options: Options) -> Result<u8, String> {
         workspace: workspace.root,
         duration_ms: started.elapsed().as_millis(),
         summary,
-        remaining,
         message,
         changed_files,
         trajectory: options.trajectory,
@@ -415,14 +351,6 @@ async fn execute(options: Options) -> Result<u8, String> {
         .await
         .map_err(|error| format!("could not shut down cleanly: {error}"))?;
     Ok(exit_code)
-}
-
-fn raise_tool_timeout(agent: &mut AgentLimits, tools: &ToolLimits) -> bool {
-    if agent.tool_timeout > tools.max_bash_timeout {
-        return false;
-    }
-    agent.tool_timeout = tools.max_bash_timeout + Duration::from_secs(1);
-    true
 }
 
 async fn configure_model(
@@ -471,7 +399,7 @@ async fn wait_for_completion(session: &Session, input: InputId, timeout: Duratio
                 InputState::WaitingForUser { text, .. } => {
                     return Completion::NeedsInput(text.clone());
                 }
-                InputState::RoutingFailed { message, .. } => {
+                InputState::ConversationFailed { message, .. } => {
                     return Completion::Terminal(InputState::Rejected {
                         message: message.clone(),
                     });
@@ -556,17 +484,11 @@ async fn read_history_since(
     }
 }
 
-fn final_result(history: &[HistoryEntry]) -> (Option<String>, Vec<String>) {
-    history
-        .iter()
-        .rev()
-        .find_map(|entry| match &entry.event {
-            SessionEvent::JobFinished {
-                summary, remaining, ..
-            } => Some((Some(summary.clone()), remaining.clone())),
-            _ => None,
-        })
-        .unwrap_or_default()
+fn final_result(history: &[HistoryEntry], input: InputId) -> Option<String> {
+    history.iter().rev().find_map(|entry| match &entry.event {
+        SessionEvent::Reply { inputs, text } if inputs.contains(&input) => Some(text.clone()),
+        _ => None,
+    })
 }
 
 async fn read_changed_files(
@@ -648,13 +570,11 @@ fn parse(args: &[OsString]) -> Result<ParseResult, String> {
     let mut timeout = Duration::from_secs(1800);
     let mut trajectory = None;
     let mut result = None;
-    let mut read_only = false;
     let mut job_budget = None;
     let mut job_depth = None;
     let mut model = None;
     let mut provider = Provider::OpenAiResponses;
     let mut base_url = None;
-    let mut trust_project_config = false;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index]
@@ -662,16 +582,6 @@ fn parse(args: &[OsString]) -> Result<ParseResult, String> {
             .ok_or_else(|| "arguments must be valid UTF-8".to_owned())?;
         if flag == "--help" || flag == "-h" {
             return Ok(ParseResult::Help);
-        }
-        if flag == "--read-only" {
-            read_only = true;
-            index += 1;
-            continue;
-        }
-        if flag == "--trust-project-config" {
-            trust_project_config = true;
-            index += 1;
-            continue;
         }
         let value = args
             .get(index + 1)
@@ -745,13 +655,11 @@ fn parse(args: &[OsString]) -> Result<ParseResult, String> {
         timeout,
         trajectory,
         result,
-        read_only,
         job_budget,
         job_depth,
         model,
         provider,
         base_url,
-        trust_project_config,
     })))
 }
 
@@ -791,6 +699,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn report_uses_the_matching_conversation_reply_and_explicit_input_completion() {
+        let runtime = bone_app::RuntimeId::new();
+        let event = |sequence, event| HistoryEntry {
+            sequence: SessionSeq(sequence),
+            occurred_at: 0,
+            event,
+        };
+        let mut history = vec![
+            event(
+                1,
+                SessionEvent::Reply {
+                    inputs: vec![InputId(1)],
+                    text: "final user answer".into(),
+                },
+            ),
+            event(
+                2,
+                SessionEvent::JobFinished {
+                    job: bone_app::JobRef { runtime, id: 1 },
+                    outcome: bone_app::OutcomeKind::Completed,
+                    summary: "internal child summary".into(),
+                    remaining: vec![],
+                },
+            ),
+            event(
+                3,
+                SessionEvent::Reply {
+                    inputs: vec![InputId(2)],
+                    text: "other request".into(),
+                },
+            ),
+        ];
+        assert_eq!(
+            final_result(&history, InputId(1)).as_deref(),
+            Some("final user answer")
+        );
+        assert!(terminal_state(&history, InputId(1)).is_none());
+        history.push(event(
+            4,
+            SessionEvent::InputFinished {
+                runtime,
+                input: InputId(1),
+                outcome: InputOutcome::Completed,
+            },
+        ));
+        assert!(matches!(
+            terminal_state(&history, InputId(1)),
+            Some(InputState::Finished { .. })
+        ));
+    }
+
+    #[test]
     fn parses_benchmark_options() {
         let parsed = parse(&[
             "--prompt".into(),
@@ -810,7 +770,6 @@ mod tests {
         assert_eq!(options.model.as_deref(), Some("gpt-test"));
         assert_eq!(options.provider, Provider::OpenAiChat);
         assert_eq!(options.timeout, Duration::from_secs(60));
-        assert!(!options.read_only);
     }
 
     #[test]
@@ -850,21 +809,5 @@ mod tests {
         assert_eq!((status, code), ("timeout", 124));
         let (status, code, _) = classify(Completion::NeedsInput("which file?".into()));
         assert_eq!((status, code), ("needs_input", 4));
-    }
-
-    #[test]
-    fn write_tools_only_raise_an_incompatible_agent_timeout() {
-        let tools = ToolLimits::default();
-        let mut limits = AgentLimits {
-            background_workers: 7,
-            ..AgentLimits::default()
-        };
-        assert!(raise_tool_timeout(&mut limits, &tools));
-        assert_eq!(
-            limits.tool_timeout,
-            tools.max_bash_timeout + Duration::from_secs(1)
-        );
-        assert_eq!(limits.background_workers, 7);
-        assert!(!raise_tool_timeout(&mut limits, &tools));
     }
 }

@@ -10,10 +10,10 @@ use std::{
     time::Duration,
 };
 
-use bone_adapters::llm::{EndpointConfig, service::chatgpt_subscription::ChatGptAuthCache};
+use bone_adapters::llm::EndpointConfig;
 use bone_core::{
-    CallContext, CallError, CheckpointDraft, CompactInput, Completion, CoordinateInput,
-    KernelDecision, ModelPort, PortFuture, RecordBody, RouteDelivery, RouteTarget, ToolCall,
+    Assignment, CallContext, CallError, CheckpointDraft, CompactInput, Completion,
+    ConversationInput, ConversationStep, JobSpec, ModelPort, PortFuture, RecordBody, ToolCall,
     ToolEffect, ToolPort, ToolSpec, WorkInput, WorkProposal, WorkStep,
 };
 use serde_json::json;
@@ -24,34 +24,68 @@ use crate::{persistence::ResolveWriteResult, *};
 mod assembly;
 mod persistence_faults;
 
-fn route_input(input: &CoordinateInput, handoff: impl Into<String>) -> KernelDecision {
-    KernelDecision::Assign(vec![RouteDelivery {
-        inputs: input.inputs.iter().map(|input| input.id).collect(),
-        target: RouteTarget::New,
-        handoff: handoff.into(),
-    }])
+fn converse_for_work(input: &ConversationInput, goal: impl Into<String>) -> ConversationStep {
+    let unassigned = input
+        .inputs
+        .iter()
+        .filter(|candidate| {
+            !input
+                .jobs
+                .iter()
+                .any(|job| job.inputs.contains(&candidate.id))
+        })
+        .map(|input| input.id)
+        .collect::<Vec<_>>();
+    if !unassigned.is_empty() {
+        let mut assignment = Assignment::new(JobSpec::new(goal, "user request", "verified"));
+        assignment.inputs = unassigned;
+        return ConversationStep::Start(vec![assignment]);
+    }
+    let finished = input
+        .inputs
+        .iter()
+        .filter_map(|candidate| {
+            let mut jobs = input
+                .jobs
+                .iter()
+                .filter(|job| job.inputs.contains(&candidate.id));
+            let outcome =
+                jobs.try_fold(InputOutcome::Completed, |current, job| match &job.status {
+                    bone_core::JobStatus::Finished(result) => Some(match result.kind {
+                        OutcomeKind::Failed => InputOutcome::Failed,
+                        OutcomeKind::Cancelled if current == InputOutcome::Completed => {
+                            InputOutcome::Cancelled
+                        }
+                        _ => current,
+                    }),
+                    _ => None,
+                })?;
+            Some((candidate.id, outcome))
+        })
+        .collect::<Vec<_>>();
+    if let Some((_, outcome)) = finished.first() {
+        return ConversationStep::Reply {
+            inputs: finished
+                .iter()
+                .filter(|(_, value)| value == outcome)
+                .map(|(id, _)| *id)
+                .collect(),
+            text: "the answer".into(),
+            outcome: outcome.clone(),
+        };
+    }
+    ConversationStep::Wait
 }
 
-fn has_routing_handoff(input: &WorkInput, expected: &str) -> bool {
-    input.records.iter().any(|record| {
-        matches!(
-            serde_json::from_str::<RecordBody>(&record.content),
-            Ok(RecordBody::RoutingHandoff { text, .. }) if text == expected
-        )
-    })
-}
-
-struct CompletingModel {
-    work_calls: AtomicUsize,
-}
+struct CompletingModel;
 
 impl ModelPort for CompletingModel {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         _: CallContext,
-    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let decision = route_input(&input, "answer");
+    ) -> PortFuture<std::result::Result<ConversationStep, CallError>> {
+        let decision = converse_for_work(&input, "answer");
         Box::pin(async move { Ok(decision) })
     }
 
@@ -60,13 +94,10 @@ impl ModelPort for CompletingModel {
         _: WorkInput,
         _: CallContext,
     ) -> PortFuture<std::result::Result<WorkProposal, CallError>> {
-        let call = self.work_calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            Ok(WorkProposal::new(if call == 0 {
-                WorkStep::Reply("the answer".into())
-            } else {
-                WorkStep::Finish(Completion::new("finished"))
-            }))
+        Box::pin(async {
+            Ok(WorkProposal::new(WorkStep::Finish(Completion::new(
+                "finished",
+            ))))
         })
     }
 
@@ -84,12 +115,12 @@ struct PatchingModel {
 }
 
 impl ModelPort for PatchingModel {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         _: CallContext,
-    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let decision = route_input(&input, "patch");
+    ) -> PortFuture<std::result::Result<ConversationStep, CallError>> {
+        let decision = converse_for_work(&input, "patch");
         Box::pin(async move { Ok(decision) })
     }
 
@@ -123,35 +154,38 @@ impl ModelPort for PatchingModel {
 }
 
 #[derive(Clone, Copy)]
-enum FirstRoutingResult {
+enum FirstConversationResult {
     Fail,
     Clarify,
 }
 
-struct PausedRoutingModel {
-    first: FirstRoutingResult,
+struct PausedConversationModel {
+    first: FirstConversationResult,
     calls: AtomicUsize,
     continue_second: Arc<Notify>,
 }
 
-impl ModelPort for PausedRoutingModel {
-    fn coordinate(
+impl ModelPort for PausedConversationModel {
+    fn converse(
         &self,
-        _: CoordinateInput,
+        input: ConversationInput,
         _: CallContext,
-    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
+    ) -> PortFuture<std::result::Result<ConversationStep, CallError>> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         if call == 0 {
             let result = match self.first {
-                FirstRoutingResult::Fail => Err(CallError::failed("routing failed")),
-                FirstRoutingResult::Clarify => Ok(KernelDecision::Clarify("which target?".into())),
+                FirstConversationResult::Fail => Err(CallError::failed("conversation failed")),
+                FirstConversationResult::Clarify => Ok(ConversationStep::Ask {
+                    inputs: input.inputs.iter().map(|input| input.id).collect(),
+                    question: "which target?".into(),
+                }),
             };
             return Box::pin(async move { result });
         }
         let gate = Arc::clone(&self.continue_second);
         Box::pin(async move {
             gate.notified().await;
-            Err(CallError::failed("test routing stopped"))
+            Err(CallError::failed("test conversation stopped"))
         })
     }
 
@@ -182,12 +216,12 @@ struct AlwaysToolModel;
 struct EvidenceModel;
 
 impl ModelPort for EvidenceModel {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         _: CallContext,
-    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let decision = route_input(&input, "produce cited evidence");
+    ) -> PortFuture<std::result::Result<ConversationStep, CallError>> {
+        let decision = converse_for_work(&input, "produce cited evidence");
         Box::pin(async move { Ok(decision) })
     }
 
@@ -252,13 +286,13 @@ impl ToolPort for EvidenceTool {
 struct SelectiveBarrierModel;
 
 impl ModelPort for SelectiveBarrierModel {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         _: CallContext,
-    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
+    ) -> PortFuture<std::result::Result<ConversationStep, CallError>> {
         let goal = input.inputs[0].text.clone();
-        let decision = route_input(&input, goal);
+        let decision = converse_for_work(&input, goal);
         Box::pin(async move { Ok(decision) })
     }
 
@@ -268,7 +302,7 @@ impl ModelPort for SelectiveBarrierModel {
         _: CallContext,
     ) -> PortFuture<std::result::Result<WorkProposal, CallError>> {
         Box::pin(async move {
-            let step = if has_routing_handoff(&input, "block") && input.calls.is_empty() {
+            let step = if input.spec.goal == "block" && input.calls.is_empty() {
                 WorkStep::Tool(ToolCall::new("shutdown_barrier", json!({})))
             } else {
                 WorkStep::Finish(Completion::new("finished"))
@@ -291,12 +325,12 @@ struct PausableWorkModel {
 }
 
 impl ModelPort for PausableWorkModel {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         _: CallContext,
-    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let decision = route_input(&input, "resume");
+    ) -> PortFuture<std::result::Result<ConversationStep, CallError>> {
+        let decision = converse_for_work(&input, "resume");
         Box::pin(async move { Ok(decision) })
     }
 
@@ -326,12 +360,12 @@ impl ModelPort for PausableWorkModel {
 }
 
 impl ModelPort for AlwaysToolModel {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         _: CallContext,
-    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let decision = route_input(&input, "wait");
+    ) -> PortFuture<std::result::Result<ConversationStep, CallError>> {
+        let decision = converse_for_work(&input, "wait");
         Box::pin(async move { Ok(decision) })
     }
 
@@ -438,12 +472,12 @@ impl ToolPort for ShutdownBarrierTool {
 }
 
 impl ModelPort for BlockingBashModel {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         _: CallContext,
-    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        let decision = route_input(&input, "write");
+    ) -> PortFuture<std::result::Result<ConversationStep, CallError>> {
+        let decision = converse_for_work(&input, "write");
         Box::pin(async move { Ok(decision) })
     }
 
@@ -509,9 +543,7 @@ async fn configured_app() -> (tempfile::TempDir, App, WorkspaceInfo) {
     std::fs::create_dir(&workspace_root).unwrap();
     let app = App::with_ports(
         AppOptions::isolated(temporary.path().join("data")),
-        Arc::new(CompletingModel {
-            work_calls: AtomicUsize::new(0),
-        }),
+        Arc::new(CompletingModel),
         Vec::new(),
     )
     .await
@@ -519,6 +551,115 @@ async fn configured_app() -> (tempfile::TempDir, App, WorkspaceInfo) {
     configure_test_model(&app).await;
     let workspace = app.open_workspace(workspace_root).await.unwrap();
     (temporary, app, workspace)
+}
+
+async fn wait_for_config(app: &App, session: &Session) {
+    let mut observed = session.observe();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let config = app.resolved_config(session.id()).await.unwrap();
+            if config.desired.as_ref().ok() == config.running.as_ref() {
+                return;
+            }
+            observed.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("saved configuration should reach the runtime");
+}
+
+#[tokio::test]
+async fn hung_model_preparation_does_not_block_controls_and_latest_selection_wins() {
+    struct Cancelled(Arc<AtomicUsize>);
+    impl Drop for Cancelled {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let started = Arc::new(Notify::new());
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let backend = crate::app::RuntimeBackend::Factory(Arc::new({
+        let started = started.clone();
+        let cancelled = cancelled.clone();
+        move |config| {
+            let started = started.clone();
+            let cancelled = cancelled.clone();
+            Box::pin(async move {
+                if config.worker.selection.model == "blocked" {
+                    let _cancelled = Cancelled(cancelled);
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Ok(Arc::new(CompletingModel) as Arc<dyn ModelPort>)
+            })
+        }
+    }));
+    let app =
+        App::with_backend(AppOptions::isolated(temporary.path().join("data")), backend).unwrap();
+    configure_test_model(&app).await;
+    let workspace = app.open_workspace(temporary.path()).await.unwrap();
+    let session = app
+        .create_session(workspace.id, "Responsive configuration")
+        .await
+        .unwrap();
+    let receipt = session.submit(SubmitInput::new("start")).await.unwrap();
+    assert_completed(wait_for_input(&session, receipt.input).await);
+    let select = |model: &str| {
+        ConfigChange::Model(Some(
+            ModelSelection::new(ProfileId::new("test").unwrap(), model).unwrap(),
+        ))
+    };
+    for round in 0..3 {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            app.update_config(ConfigScope::Session(session.id()), select("blocked")),
+        )
+        .await
+        .expect("saving must not wait for connection")
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), session.save_draft("still editable"))
+            .await
+            .expect("draft command should stay responsive")
+            .unwrap();
+        match round {
+            0 => {
+                tokio::time::timeout(Duration::from_secs(1), session.stop())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            1 => {
+                app.update_config(ConfigScope::Session(session.id()), select("latest"))
+                    .await
+                    .unwrap();
+                wait_for_config(&app, &session).await;
+                assert_eq!(
+                    app.resolved_config(session.id())
+                        .await
+                        .unwrap()
+                        .running
+                        .unwrap()
+                        .worker
+                        .selection
+                        .model,
+                    "latest"
+                );
+                let receipt = session.submit(SubmitInput::new("continue")).await.unwrap();
+                assert_completed(wait_for_input(&session, receipt.input).await);
+            }
+            _ => {
+                tokio::time::timeout(Duration::from_secs(1), app.shutdown())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+        assert_eq!(cancelled.load(Ordering::SeqCst), round + 1);
+    }
 }
 
 async fn workspace_write_session() -> (tempfile::TempDir, App, WorkspaceInfo, Session) {
@@ -536,18 +677,8 @@ async fn workspace_write_session() -> (tempfile::TempDir, App, WorkspaceInfo, Se
     app.update_config(
         ConfigScope::User,
         ConfigChange::Limits(Some(AgentLimits {
-            tool_timeout: Duration::from_secs(601),
             shutdown_grace: Duration::from_millis(10),
-            ..AgentLimits::default()
-        })),
-    )
-    .await
-    .unwrap();
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Tools(Some(ToolSettings {
-            mode: ToolMode::WorkspaceWrite,
-            limits: ToolLimits::default(),
+            ..crate::config::RuntimeSettings::default().limits
         })),
     )
     .await
@@ -1332,9 +1463,7 @@ async fn create_session_request_is_durable_and_idempotent() {
     app.shutdown().await.unwrap();
     let reopened = App::with_ports(
         AppOptions::isolated(temporary.path().join("data")),
-        Arc::new(CompletingModel {
-            work_calls: AtomicUsize::new(0),
-        }),
+        Arc::new(CompletingModel),
         Vec::new(),
     )
     .await
@@ -2041,9 +2170,7 @@ async fn idle_session_release_closes_external_handles_and_releases_cross_app_lea
     let data_dir = temporary.path().join("data");
     let app = App::with_model(
         AppOptions::isolated(data_dir.clone()),
-        Arc::new(CompletingModel {
-            work_calls: AtomicUsize::new(0),
-        }),
+        Arc::new(CompletingModel),
     )
     .await
     .unwrap();
@@ -2054,14 +2181,9 @@ async fn idle_session_release_closes_external_handles_and_releases_cross_app_lea
         .await
         .unwrap();
     let held_clone = session.clone();
-    let other = App::with_model(
-        AppOptions::isolated(data_dir),
-        Arc::new(CompletingModel {
-            work_calls: AtomicUsize::new(0),
-        }),
-    )
-    .await
-    .unwrap();
+    let other = App::with_model(AppOptions::isolated(data_dir), Arc::new(CompletingModel))
+        .await
+        .unwrap();
     assert!(matches!(
         other.session(session.id()).await,
         Err(Error::SessionBusy(id)) if id == session.id()
@@ -2272,8 +2394,8 @@ async fn input_limit_keeps_the_agent_record_inside_the_journal_envelope() {
     let (app, workspace) = app_with_model(
         &temporary.path().join("data"),
         &workspace_root,
-        Arc::new(PausedRoutingModel {
-            first: FirstRoutingResult::Fail,
+        Arc::new(PausedConversationModel {
+            first: FirstConversationResult::Fail,
             calls: AtomicUsize::new(0),
             continue_second,
         }),
@@ -2292,7 +2414,7 @@ async fn input_limit_keeps_the_agent_record_inside_the_journal_envelope() {
     wait_for_input_state_with_timeout(
         &session,
         receipt.input,
-        |state| matches!(state, InputState::RoutingFailed { .. }),
+        |state| matches!(state, InputState::ConversationFailed { .. }),
         Duration::from_secs(10),
     )
     .await;
@@ -2340,8 +2462,8 @@ async fn a_history_cursor_beyond_the_storage_range_is_an_empty_page() {
     let (app, workspace) = app_with_model(
         &temporary.path().join("data"),
         &workspace_root,
-        Arc::new(PausedRoutingModel {
-            first: FirstRoutingResult::Clarify,
+        Arc::new(PausedConversationModel {
+            first: FirstConversationResult::Clarify,
             calls: AtomicUsize::new(0),
             continue_second: Arc::new(Notify::new()),
         }),
@@ -2405,7 +2527,7 @@ async fn oversized_frontend_metadata_does_not_stop_a_runtime() {
 }
 
 #[tokio::test]
-async fn retrying_a_routing_failure_restores_the_input_to_accepted() {
+async fn retrying_a_conversation_failure_restores_the_input_to_accepted() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace_root = temporary.path().join("workspace");
     std::fs::create_dir(&workspace_root).unwrap();
@@ -2413,8 +2535,8 @@ async fn retrying_a_routing_failure_restores_the_input_to_accepted() {
     let (app, workspace) = app_with_model(
         &temporary.path().join("data"),
         &workspace_root,
-        Arc::new(PausedRoutingModel {
-            first: FirstRoutingResult::Fail,
+        Arc::new(PausedConversationModel {
+            first: FirstConversationResult::Fail,
             calls: AtomicUsize::new(0),
             continue_second: Arc::clone(&continue_second),
         }),
@@ -2423,7 +2545,7 @@ async fn retrying_a_routing_failure_restores_the_input_to_accepted() {
     let session = app.create_session(workspace.id, "Retry").await.unwrap();
     let receipt = session.submit(SubmitInput::new("try it")).await.unwrap();
     wait_for_input_state(&session, receipt.input, |state| {
-        matches!(state, InputState::RoutingFailed { .. })
+        matches!(state, InputState::ConversationFailed { .. })
     })
     .await;
 
@@ -2449,8 +2571,8 @@ async fn answering_a_clarification_immediately_clears_the_question_state() {
     let (app, workspace) = app_with_model(
         &temporary.path().join("data"),
         &workspace_root,
-        Arc::new(PausedRoutingModel {
-            first: FirstRoutingResult::Clarify,
+        Arc::new(PausedConversationModel {
+            first: FirstConversationResult::Clarify,
             calls: AtomicUsize::new(0),
             continue_second: Arc::clone(&continue_second),
         }),
@@ -2505,6 +2627,7 @@ async fn config_changes_apply_to_the_running_runtime() {
     )
     .await
     .unwrap();
+    wait_for_config(&app, &session).await;
     let changed = app.resolved_config(session.id()).await.unwrap();
     let desired = changed.desired.unwrap();
     assert_eq!(desired.worker.selection.model, "new-model");
@@ -2582,9 +2705,9 @@ async fn model_change_and_explicit_reload_reconnect_an_equal_runtime() {
             )
         })
         .count();
-    assert_eq!(
-        reconfigurations, 2,
-        "both a model selection and explicit reload must cross the runtime connection boundary"
+    assert!(
+        (1..=2).contains(&reconfigurations),
+        "queued equal selections may coalesce, but explicit reload must cross the connection boundary"
     );
     app.shutdown().await.unwrap();
 }
@@ -2666,7 +2789,7 @@ async fn model_change_is_validated_before_either_role_is_persisted() {
 }
 
 #[tokio::test]
-async fn chatgpt_model_preflight_is_atomic_before_any_session_exists() {
+async fn chatgpt_model_selection_is_saved_without_credentials() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace_root = temporary.path().join("workspace");
     std::fs::create_dir(&workspace_root).unwrap();
@@ -2694,26 +2817,7 @@ async fn chatgpt_model_preflight_is_atomic_before_any_session_exists() {
     )
     .await
     .unwrap();
-    let before = app.config(scope).await.unwrap();
-
     let selected = ModelSelection::new(ProfileId::chatgpt(), "gpt-5.4").unwrap();
-    assert!(matches!(
-        app.update_config(scope, ConfigChange::Model(Some(selected.clone())))
-            .await,
-        Err(Error::LoginRequired(profile)) if profile == ProfileId::chatgpt()
-    ));
-    assert_eq!(app.config(scope).await.unwrap(), before);
-    assert_eq!(before.worker, Some(old_worker));
-    assert_eq!(before.coordinator, Some(old_coordinator));
-
-    let auth = credentials.acquire().unwrap();
-    std::fs::write(
-        auth.auth_file(),
-        br#"{"access_token":"offline-test-token","expires_at":4102444800,"account_id":"offline-account"}"#,
-    )
-    .unwrap();
-    drop(auth);
-
     let saved = app
         .update_config(scope, ConfigChange::Model(Some(selected.clone())))
         .await
@@ -2748,7 +2852,7 @@ async fn workspace_config_only_reconfigures_sessions_in_that_workspace() {
 
     let limits = AgentLimits {
         background_workers: 5,
-        ..AgentLimits::default()
+        ..crate::config::RuntimeSettings::default().limits
     };
     app.update_config(
         ConfigScope::Workspace(first_workspace.id),
@@ -2756,6 +2860,8 @@ async fn workspace_config_only_reconfigures_sessions_in_that_workspace() {
     )
     .await
     .unwrap();
+
+    wait_for_config(&app, &first).await;
 
     assert_eq!(
         app.resolved_config(first.id())
@@ -2773,7 +2879,7 @@ async fn workspace_config_only_reconfigures_sessions_in_that_workspace() {
             .running
             .unwrap()
             .limits,
-        AgentLimits::default()
+        crate::config::RuntimeSettings::default().limits
     );
     app.shutdown().await.unwrap();
 }
@@ -2799,6 +2905,7 @@ async fn profile_changes_reconfigure_sessions_that_use_the_profile() {
     .await
     .unwrap();
 
+    wait_for_config(&app, &session).await;
     let running = app
         .resolved_config(session.id())
         .await
@@ -2829,9 +2936,11 @@ async fn an_unusable_live_config_is_not_reported_as_applied() {
         .running
         .unwrap();
 
+    app.update_config(ConfigScope::User, ConfigChange::Worker(None))
+        .await
+        .unwrap();
     assert!(matches!(
-        app.update_config(ConfigScope::User, ConfigChange::Worker(None))
-            .await,
+        session.reload_config().await,
         Err(Error::Configuration(ConfigProblem::NeedsModel))
     ));
 
@@ -2942,13 +3051,11 @@ async fn login_recovers_sessions_after_credentials_are_repaired() {
         .unwrap()
         .desired
         .unwrap();
-    let auth = credentials.acquire().unwrap();
-    std::fs::write(
-        auth.auth_file(),
+    crate::safe_file::atomic_write_private(
+        &credentials.auth_file().unwrap(),
         br#"{"access_token":"offline-test-token","expires_at":4102444800,"account_id":"offline-account"}"#,
     )
     .unwrap();
-    drop(auth);
     let login = app.login(profile_id.clone()).await.unwrap();
     let mut login_states = login.observe();
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -3027,7 +3134,7 @@ async fn a_rejected_agent_limit_change_keeps_the_same_job_running() {
             ConfigScope::Session(session.id()),
             ConfigChange::Limits(Some(AgentLimits {
                 context_bytes: 0,
-                ..AgentLimits::default()
+                ..crate::config::RuntimeSettings::default().limits
             })),
         )
         .await,
@@ -3048,9 +3155,7 @@ async fn closing_a_config_blocked_runtime_allows_a_clean_restart() {
     let (app, workspace) = app_with_model(
         &temporary.path().join("data"),
         &workspace_root,
-        Arc::new(CompletingModel {
-            work_calls: AtomicUsize::new(0),
-        }),
+        Arc::new(CompletingModel),
     )
     .await;
     let session = app.create_session(workspace.id, "Restart").await.unwrap();
@@ -3061,17 +3166,18 @@ async fn closing_a_config_blocked_runtime_allows_a_clean_restart() {
     let result = app
         .update_config(
             ConfigScope::Session(session.id()),
-            ConfigChange::Tools(Some(ToolSettings {
-                mode: ToolMode::WorkspaceWrite,
-                limits: ToolLimits {
-                    default_bash_timeout: Duration::from_secs(1),
-                    max_bash_timeout: Duration::from_secs(1),
-                    ..ToolLimits::default()
-                },
+            ConfigChange::Tools(Some(ToolLimits {
+                default_bash_timeout: Duration::from_secs(1),
+                max_bash_timeout: Duration::from_secs(1),
+                ..ToolLimits::default()
             })),
         )
         .await;
-    assert!(matches!(result, Err(Error::Tools(_))), "{result:?}");
+    result.unwrap();
+    assert!(matches!(
+        session.reload_config().await,
+        Err(Error::Tools(_))
+    ));
     std::fs::create_dir(&workspace_root).unwrap();
 
     session.close_runtime().await.unwrap();
@@ -3132,9 +3238,7 @@ async fn resolved_config_does_not_report_a_crashed_runtime_as_live() {
     };
     let app = App::with_ports(
         AppOptions::isolated(data),
-        Arc::new(CompletingModel {
-            work_calls: AtomicUsize::new(0),
-        }),
+        Arc::new(CompletingModel),
         Vec::new(),
     )
     .await
@@ -3184,7 +3288,7 @@ async fn app_shutdown_is_dispatched_to_all_sessions_before_waiting_for_any_one()
         ConfigScope::User,
         ConfigChange::Limits(Some(AgentLimits {
             shutdown_grace: Duration::from_secs(60),
-            ..AgentLimits::default()
+            ..crate::config::RuntimeSettings::default().limits
         })),
     )
     .await
@@ -3254,7 +3358,7 @@ async fn config_reload_reaches_idle_sessions_without_waiting_for_a_closing_sessi
 
     let limits = AgentLimits {
         background_workers: 5,
-        ..AgentLimits::default()
+        ..crate::config::RuntimeSettings::default().limits
     };
     let updating = {
         let app = app.clone();
@@ -3279,24 +3383,20 @@ async fn config_reload_reaches_idle_sessions_without_waiting_for_a_closing_sessi
     })
     .await
     .expect("an idle session should reload while another session is closing");
-    assert!(!updating.is_finished());
-    let mut resolving = Box::pin(app.resolved_config(idle.id()));
-    // Poll the query into the held configuration gate before testing that it waits.
-    assert_pending(resolving.as_mut()).await;
-
-    updating.abort();
-    assert!(updating.await.unwrap_err().is_cancelled());
-    // The persisted update owns the gate even after its caller has been cancelled.
-    assert_pending(resolving.as_mut()).await;
+    tokio::time::timeout(Duration::from_secs(1), updating)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let resolved = tokio::time::timeout(Duration::from_secs(1), app.resolved_config(idle.id()))
+        .await
+        .unwrap()
+        .unwrap();
 
     barrier.release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(3), closing_task)
         .await
         .unwrap()
-        .unwrap()
-        .unwrap();
-    let resolved = tokio::time::timeout(Duration::from_secs(3), resolving)
-        .await
         .unwrap()
         .unwrap();
     assert_eq!(resolved.desired.unwrap().limits, limits);
@@ -3316,7 +3416,7 @@ async fn app_shutdown_linearizes_with_a_write_waiting_to_record_its_intent() {
             if view.borrow().activity.iter().any(|activity| {
                 matches!(
                     &activity.kind,
-                    ActivityKind::Tool { name } if name == "apply_patch"
+                    ActivityKind::Tool { name, .. } if name == "apply_patch"
                 )
             }) {
                 break;
@@ -3352,7 +3452,7 @@ async fn close_runtime_linearizes_with_a_write_waiting_to_record_its_intent() {
             if view.borrow().activity.iter().any(|activity| {
                 matches!(
                     &activity.kind,
-                    ActivityKind::Tool { name } if name == "apply_patch"
+                    ActivityKind::Tool { name, .. } if name == "apply_patch"
                 )
             }) {
                 break;
@@ -3406,18 +3506,8 @@ async fn a_detached_write_keeps_the_session_lease_until_execution_finishes() {
     app.update_config(
         ConfigScope::User,
         ConfigChange::Limits(Some(AgentLimits {
-            tool_timeout: Duration::from_secs(601),
             shutdown_grace: Duration::from_millis(10),
-            ..AgentLimits::default()
-        })),
-    )
-    .await
-    .unwrap();
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Tools(Some(ToolSettings {
-            mode: ToolMode::WorkspaceWrite,
-            limits: ToolLimits::default(),
+            ..crate::config::RuntimeSettings::default().limits
         })),
     )
     .await
@@ -3451,14 +3541,9 @@ async fn a_detached_write_keeps_the_session_lease_until_execution_finishes() {
     .await
     .unwrap();
 
-    let contender = App::with_model(
-        AppOptions::isolated(&data),
-        Arc::new(CompletingModel {
-            work_calls: AtomicUsize::new(0),
-        }),
-    )
-    .await
-    .unwrap();
+    let contender = App::with_model(AppOptions::isolated(&data), Arc::new(CompletingModel))
+        .await
+        .unwrap();
     let busy = matches!(
         contender.session(session.id()).await,
         Err(Error::SessionBusy(id)) if id == session.id()
@@ -3499,12 +3584,12 @@ struct RecoveryWriteModel(std::sync::atomic::AtomicBool);
 
 #[cfg(unix)]
 impl ModelPort for RecoveryWriteModel {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         _: CallContext,
-    ) -> PortFuture<std::result::Result<KernelDecision, CallError>> {
-        Box::pin(async move { Ok(route_input(&input, "write")) })
+    ) -> PortFuture<std::result::Result<ConversationStep, CallError>> {
+        Box::pin(async move { Ok(converse_for_work(&input, "write")) })
     }
     fn work(
         &self,
@@ -3552,13 +3637,10 @@ async fn restored_unknown_write_resolves_against_original_runtime_ledger() {
         .await;
         app.update_config(
             ConfigScope::User,
-            ConfigChange::Tools(Some(ToolSettings {
-                mode: ToolMode::WorkspaceWrite,
-                limits: ToolLimits {
-                    default_bash_timeout: Duration::from_secs(1),
-                    max_bash_timeout: Duration::from_secs(1),
-                    ..ToolLimits::default()
-                },
+            ConfigChange::Tools(Some(ToolLimits {
+                default_bash_timeout: Duration::from_secs(1),
+                max_bash_timeout: Duration::from_secs(1),
+                ..ToolLimits::default()
             })),
         )
         .await
@@ -3672,30 +3754,27 @@ async fn a_timed_out_bash_write_is_persisted_as_an_unknown_external_effect() {
     .await;
     app.update_config(
         ConfigScope::User,
-        ConfigChange::Limits(Some(AgentLimits {
-            // Keep the Agent's outer deadline well beyond Bash's own
-            // one-second deadline so this test exercises Bash cleanup and
-            // write auditing instead of racing the two timeout layers.
-            tool_timeout: Duration::from_secs(10),
-            ..AgentLimits::default()
-        })),
-    )
-    .await
-    .unwrap();
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Tools(Some(ToolSettings {
-            mode: ToolMode::WorkspaceWrite,
-            limits: ToolLimits {
-                default_bash_timeout: Duration::from_secs(1),
-                max_bash_timeout: Duration::from_secs(1),
-                ..ToolLimits::default()
-            },
+        ConfigChange::Tools(Some(ToolLimits {
+            default_bash_timeout: Duration::from_secs(1),
+            max_bash_timeout: Duration::from_secs(1),
+            ..ToolLimits::default()
         })),
     )
     .await
     .unwrap();
 
+    app.update_config(
+        ConfigScope::User,
+        ConfigChange::Limits(Some(AgentLimits {
+            // Keep the Agent's outer deadline well beyond Bash's own
+            // one-second deadline so this test exercises Bash cleanup and
+            // write auditing instead of racing the two timeout layers.
+            tool_timeout: Duration::from_secs(10),
+            ..crate::config::RuntimeSettings::default().limits
+        })),
+    )
+    .await
+    .unwrap();
     let session = app
         .create_session(workspace.id, "Bash timeout")
         .await
@@ -3797,24 +3876,6 @@ async fn workspace_writes_are_recorded_by_the_app_tool_adapter() {
     )
     .await
     .unwrap();
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Limits(Some(AgentLimits {
-            tool_timeout: Duration::from_secs(601),
-            ..AgentLimits::default()
-        })),
-    )
-    .await
-    .unwrap();
-    app.update_config(
-        ConfigScope::User,
-        ConfigChange::Tools(Some(ToolSettings {
-            mode: ToolMode::WorkspaceWrite,
-            limits: ToolLimits::default(),
-        })),
-    )
-    .await
-    .unwrap();
     let workspace = app.open_workspace(&workspace_root).await.unwrap();
     let session = app.create_session(workspace.id, "Write").await.unwrap();
     let receipt = session.submit(SubmitInput::new("write it")).await.unwrap();
@@ -3902,9 +3963,7 @@ async fn app_queries_workspace_writes_authoritatively() {
     std::fs::create_dir(&root).unwrap();
     let app = App::with_ports(
         AppOptions::isolated(temporary.path().join("data")),
-        Arc::new(CompletingModel {
-            work_calls: AtomicUsize::new(0),
-        }),
+        Arc::new(CompletingModel),
         Vec::new(),
     )
     .await
@@ -3956,9 +4015,7 @@ async fn app_shutdown_reports_crash_writes_from_unopened_sessions() {
     };
     let app = App::with_ports(
         AppOptions::isolated(data),
-        Arc::new(CompletingModel {
-            work_calls: AtomicUsize::new(0),
-        }),
+        Arc::new(CompletingModel),
         Vec::new(),
     )
     .await
@@ -4103,7 +4160,7 @@ async fn a_finished_write_stays_blocking_until_its_agent_record_is_saved() {
 }
 
 #[test]
-fn an_answer_clears_every_input_waiting_on_the_same_question() {
+fn accepted_input_clears_the_current_question_for_answers_and_new_messages() {
     use bone_core::{
         Input as AgentInput, InputId as AgentInputId, Origin, Record, RecordBody, Seq,
     };
@@ -4131,23 +4188,31 @@ fn an_answer_clears_every_input_waiting_on_the_same_question() {
             },
         );
     }
-    let record = Record {
-        seq: Seq(8),
-        origin: Origin::User(AgentInputId(3)),
-        body: RecordBody::Input(
-            AgentInput::new(AgentInputId(3), "the library")
-                .answering(AgentInputId(1), Seq(question_record)),
-        ),
-    };
-
-    let changes = crate::session::input_changes(runtime, &record, &inputs);
-    assert_eq!(
-        changes,
-        vec![
-            (InputId(1), InputState::Accepted { runtime }),
-            (InputId(2), InputState::Accepted { runtime }),
-        ]
-    );
+    let other_runtime = RuntimeId::new();
+    let mut other = inputs[&InputId(1)].clone();
+    if let InputState::WaitingForUser { runtime, .. } = &mut other.state {
+        *runtime = other_runtime;
+    }
+    other.id = InputId(9);
+    inputs.insert(other.id, other);
+    for input in [
+        AgentInput::new(AgentInputId(3), "the library")
+            .answering(AgentInputId(1), Seq(question_record)),
+        AgentInput::new(AgentInputId(3), "never mind; inspect the other module"),
+    ] {
+        let record = Record {
+            seq: Seq(8),
+            origin: Origin::User(AgentInputId(3)),
+            body: RecordBody::Input(input),
+        };
+        assert_eq!(
+            crate::session::input_changes(runtime, &record, &inputs),
+            vec![
+                (InputId(1), InputState::Accepted { runtime }),
+                (InputId(2), InputState::Accepted { runtime }),
+            ]
+        );
+    }
 }
 
 #[test]
@@ -4164,7 +4229,7 @@ fn retry_reconciles_every_failed_input_that_the_agent_restored() {
                 request_id: RequestId::new(),
                 text: format!("input {}", id.0),
                 reply_to: None,
-                state: InputState::RoutingFailed {
+                state: InputState::ConversationFailed {
                     runtime,
                     message: "failed".into(),
                 },
@@ -4173,11 +4238,11 @@ fn retry_reconciles_every_failed_input_that_the_agent_restored() {
     }
     let agent = bone_core::AgentView {
         inputs: [
-            (1, InputStatus::Routing),
+            (1, InputStatus::Thinking),
             (2, InputStatus::Handled),
             (
                 3,
-                InputStatus::RoutingFailed {
+                InputStatus::ConversationFailed {
                     message: "still failed".into(),
                 },
             ),
@@ -4194,7 +4259,7 @@ fn retry_reconciles_every_failed_input_that_the_agent_restored() {
     };
 
     assert_eq!(
-        crate::session::restored_routing_inputs(runtime, &inputs, &agent),
+        crate::session::restored_conversation_inputs(runtime, &inputs, &agent),
         vec![InputId(1), InputId(2)]
     );
 }

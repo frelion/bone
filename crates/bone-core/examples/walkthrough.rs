@@ -3,26 +3,43 @@
 use std::{error::Error, sync::Arc};
 
 use bone_core::{
-    Agent, AgentLimits, CallContext, CallError, CheckpointDraft, CompactInput, CoordinateInput,
-    Input, InputId, InputStatus, KernelDecision, ModelPort, PortFuture, RouteDelivery, RouteTarget,
-    WorkInput, WorkProposal, WorkStep,
+    Agent, AgentLimits, Assignment, CallContext, CallError, CheckpointDraft, CompactInput,
+    ConversationInput, ConversationStep, Input, InputId, InputOutcome, InputStatus, JobSpec,
+    JobStatus, ModelPort, PortFuture, WorkInput, WorkProposal, WorkStep,
 };
 
 struct DemoModel;
 
 impl ModelPort for DemoModel {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         _: CallContext,
-    ) -> PortFuture<Result<KernelDecision, CallError>> {
+    ) -> PortFuture<Result<ConversationStep, CallError>> {
         let inputs = input.inputs.iter().map(|input| input.id).collect();
         Box::pin(async move {
-            Ok(KernelDecision::Assign(vec![RouteDelivery {
-                inputs,
-                target: RouteTarget::New,
-                handoff: "answer the request".into(),
-            }]))
+            if input.jobs.is_empty() {
+                Ok(ConversationStep::Start(vec![Assignment {
+                    inputs,
+                    ..Assignment::new(JobSpec::new(
+                        "show one complete lifecycle",
+                        "demo",
+                        "report the result",
+                    ))
+                }]))
+            } else if input
+                .jobs
+                .iter()
+                .all(|job| matches!(job.status, JobStatus::Finished(_)))
+            {
+                Ok(ConversationStep::Reply {
+                    inputs,
+                    text: "The demonstration completed.".into(),
+                    outcome: InputOutcome::Completed,
+                })
+            } else {
+                Ok(ConversationStep::Wait)
+            }
         })
     }
 

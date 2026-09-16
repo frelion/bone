@@ -13,8 +13,8 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::Style,
-    text::Line,
-    widgets::{Block, Paragraph},
+    text::{Line, Span},
+    widgets::{Block, Clear, Paragraph},
 };
 
 const TITLE_INSET: u16 = 2;
@@ -40,6 +40,7 @@ pub(crate) fn render(
     if area.is_empty() {
         return ReaderMetrics::default();
     }
+    frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default().style(Style::default().bg(theme::RAIL)),
         area,
@@ -106,7 +107,12 @@ pub(crate) fn render(
         rows: (scroll..(scroll + usize::from(body.height)).min(rows.len()))
             .map(|row| {
                 TextRow::new(
-                    Rect::new(body.x, body.y + (row - scroll) as u16, body.width, 1),
+                    Rect::new(
+                        body.x + rows.gutter,
+                        body.y + (row - scroll) as u16,
+                        body.width.saturating_sub(rows.gutter),
+                        1,
+                    ),
                     &content.text,
                     rows.range(row),
                 )
@@ -115,9 +121,28 @@ pub(crate) fn render(
     }];
     let mut visible: Vec<Line<'_>> = rows
         .iter()
+        .enumerate()
         .skip(scroll)
         .take(usize::from(body.height))
-        .map(Line::raw)
+        .map(|(row, text)| {
+            if rows.gutter == 0 {
+                return Line::raw(text);
+            }
+            let number = rows
+                .line_number(row)
+                .map(|number| number.to_string())
+                .unwrap_or_default();
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{number:>width$} ",
+                        width = usize::from(rows.gutter.saturating_sub(1))
+                    ),
+                    theme::body(theme::MUTED),
+                ),
+                Span::raw(text),
+            ])
+        })
         .collect();
     if let Some(inputs) = inputs {
         for row in (scroll + visible.len())
@@ -256,6 +281,7 @@ mod tests {
         state.orphan_draft = "continue typing".into();
         state.details = Some(ReaderState {
             content: ReaderContent {
+                numbered: Vec::new(),
                 layout_cache: Default::default(),
                 session: SessionId::new(),
                 source: ReaderSource::History(SessionSeq(1)),
@@ -309,6 +335,7 @@ mod tests {
     #[test]
     fn reader_title_uses_a_neutral_surface_without_orange() {
         let content = ReaderContent {
+            numbered: Vec::new(),
             layout_cache: Default::default(),
             session: SessionId::new(),
             source: ReaderSource::History(SessionSeq(1)),
@@ -370,6 +397,7 @@ mod tests {
             history_through: SessionSeq(0),
             problem: None,
             jobs: vec![JobView {
+                allowed_tools: ["read".to_owned(), "glob".to_owned()].into(),
                 id,
                 owner: JobOwner::User,
                 inputs: (0..1_000_000)
@@ -546,6 +574,7 @@ mod tests {
                 call: CallRef { runtime, id: 2 },
                 job: JobRef { runtime, id: 7 },
                 tool: "read".into(),
+                arguments: serde_json::json!({}),
                 outcome,
             },
         }
@@ -556,6 +585,7 @@ mod tests {
     fn one_mib_reader_scroll_measurement() {
         let text = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\n".repeat(16645);
         let content = ReaderContent {
+            numbered: Vec::new(),
             layout_cache: Default::default(),
             session: SessionId::new(),
             source: ReaderSource::History(SessionSeq(1)),
@@ -601,6 +631,7 @@ mod tests {
     fn one_mib_newlines_reader_scroll_measurement() {
         let text = "\n".repeat(1024 * 1024);
         let content = ReaderContent {
+            numbered: Vec::new(),
             layout_cache: Default::default(),
             session: SessionId::new(),
             source: ReaderSource::History(SessionSeq(1)),
@@ -653,11 +684,11 @@ mod tests {
         assert_eq!(content.session, session);
         assert_eq!(content.source, ReaderSource::History(SessionSeq(17)));
         assert!(content.text.contains(&value));
-        assert!(content.text.contains("External effect: Unknown"));
+        assert!(content.text.contains("External effects are unknown"));
         let failed =
             ReaderContent::from_history(session, &tool(ToolOutcome::failed("full\nerror")))
                 .unwrap();
-        assert!(failed.text.contains("Kind: Failed\n\nfull\nerror"));
+        assert!(failed.text.contains("Error\nfull\nerror"));
     }
 
     #[test]
@@ -680,6 +711,7 @@ mod tests {
             history_through: SessionSeq(0),
             problem: None,
             jobs: vec![JobView {
+                allowed_tools: ["read".to_owned(), "glob".to_owned()].into(),
                 id,
                 owner: JobOwner::User,
                 inputs: vec![bone_app::InputId(4)],
@@ -703,7 +735,14 @@ mod tests {
             .is_none()
         );
         let mut content = ReaderContent::from_job(&view, id).unwrap();
-        for value in ["goal", "scope", "done", "Paused", "report"] {
+        for value in [
+            "goal",
+            "scope",
+            "done",
+            "Paused",
+            "report",
+            "Allowed tools\nglob, read",
+        ] {
             assert!(content.text.contains(value), "missing {value}");
         }
         let before = content.wrapped_rows(36);
@@ -714,6 +753,9 @@ mod tests {
         content.refresh_job(&changed);
         assert!(!std::sync::Arc::ptr_eq(&before, &content.wrapped_rows(36)));
         assert!(content.wrapped_rows(36).iter().any(|row| row == "Running"));
+        changed.jobs[0].allowed_tools.clear();
+        content.refresh_job(&changed);
+        assert!(content.text.contains("Allowed tools\nNone"));
         changed.jobs.clear();
         content.refresh_job(&changed);
         assert!(
@@ -727,6 +769,7 @@ mod tests {
     #[test]
     fn reader_layout_reuses_only_the_current_text_and_width() {
         let mut content = ReaderContent {
+            numbered: Vec::new(),
             layout_cache: Default::default(),
             session: SessionId::new(),
             source: ReaderSource::History(SessionSeq(1)),
@@ -750,6 +793,7 @@ mod tests {
     #[test]
     fn scrolling_reaches_tail_beyond_u16_and_resize_clamps() {
         let content = ReaderContent {
+            numbered: Vec::new(),
             layout_cache: Default::default(),
             session: SessionId::new(),
             source: ReaderSource::History(SessionSeq(1)),
@@ -783,6 +827,7 @@ mod tests {
     #[test]
     fn external_controls_and_tiny_areas_do_not_escape_the_reader() {
         let content = ReaderContent {
+            numbered: Vec::new(),
             layout_cache: Default::default(),
             session: SessionId::new(),
             source: ReaderSource::History(SessionSeq(1)),

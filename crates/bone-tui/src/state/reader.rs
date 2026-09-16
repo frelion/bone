@@ -17,7 +17,14 @@ pub(crate) struct ReaderContent {
     pub source: ReaderSource,
     pub title: String,
     pub text: std::sync::Arc<str>,
+    pub numbered: Vec<NumberedText>,
     pub layout_cache: std::cell::RefCell<Option<ReaderLayout>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NumberedText {
+    pub range: std::ops::Range<usize>,
+    pub first_line: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +39,8 @@ pub(crate) struct ReaderLayout {
 pub(crate) struct ReaderRows {
     text: std::sync::Arc<str>,
     starts: Box<[u32]>,
+    pub gutter: u16,
+    numbers: Vec<(usize, usize)>,
 }
 impl ReaderRows {
     pub fn len(&self) -> usize {
@@ -40,11 +49,17 @@ impl ReaderRows {
     pub fn range(&self, row: usize) -> std::ops::Range<usize> {
         crate::ui::selection::row_range(&self.text, &self.starts, row)
     }
+    pub fn line_number(&self, row: usize) -> Option<usize> {
+        self.numbers
+            .binary_search_by_key(&row, |(row, _)| *row)
+            .ok()
+            .map(|index| self.numbers[index].1)
+    }
     pub fn iter(&self) -> impl ExactSizeIterator<Item = String> + '_ {
         (0..self.len()).map(|row| crate::ui::selection::display_text(&self.text[self.range(row)]))
     }
     pub fn allocated_bytes(&self) -> usize {
-        std::mem::size_of_val(&*self.starts)
+        std::mem::size_of_val(&*self.starts) + std::mem::size_of_val(self.numbers.as_slice())
     }
 }
 
@@ -54,6 +69,7 @@ impl PartialEq for ReaderContent {
             && self.source == other.source
             && self.title == other.title
             && self.text == other.text
+            && self.numbered == other.numbered
     }
 }
 impl Eq for ReaderContent {}
@@ -68,10 +84,44 @@ impl ReaderContent {
         {
             return std::sync::Arc::clone(&layout.rows);
         }
-        let starts = crate::ui::selection::source_starts(&self.text, width).into_boxed_slice();
+        let mut numbered_starts = Vec::new();
+        for section in &self.numbered {
+            let mut offset = section.range.start;
+            for (index, line) in self.text[section.range.clone()]
+                .split_inclusive('\n')
+                .enumerate()
+            {
+                numbered_starts.push((offset, section.first_line + index));
+                offset += line.len();
+            }
+        }
+        let gutter = numbered_starts
+            .iter()
+            .map(|(_, number)| number.to_string().len() + 1)
+            .max()
+            .unwrap_or(0);
+        let gutter = if gutter < width { gutter } else { 0 };
+        let starts = crate::ui::selection::source_starts(&self.text, width.saturating_sub(gutter))
+            .into_boxed_slice();
+        let numbers = if numbered_starts.is_empty() {
+            Vec::new()
+        } else {
+            starts
+                .iter()
+                .enumerate()
+                .filter_map(|(row, start)| {
+                    numbered_starts
+                        .binary_search_by_key(&(*start as usize), |(byte, _)| *byte)
+                        .ok()
+                        .map(|index| (row, numbered_starts[index].1))
+                })
+                .collect()
+        };
         let rows = std::sync::Arc::new(ReaderRows {
             text: self.text.clone(),
             starts,
+            gutter: gutter as u16,
+            numbers,
         });
         // Charge the shared source once and the packed source offsets.
         let bytes = rows
@@ -119,10 +169,10 @@ impl ReaderContent {
     /// do not become synthetic Jobs and a missing Job is not replaced by another.
     pub fn from_history(session: SessionId, entry: &HistoryEntry) -> Option<Self> {
         let (title, text) = match &entry.event {
-            SessionEvent::RoutingFailed {
+            SessionEvent::ConversationFailed {
                 runtime, message, ..
             } => (
-                "Routing failed".into(),
+                "Conversation failed".into(),
                 format!(
                     "{message}\n\nRuntime: {runtime}\nHistory: {}",
                     entry.sequence.0
@@ -136,36 +186,43 @@ impl ReaderContent {
                 ),
             ),
             SessionEvent::ToolFinished {
-                call,
-                job,
                 tool,
+                arguments,
                 outcome,
+                ..
             } => {
-                // Both ToolOutcome fields are preserved. A plain string result is
-                // shown verbatim; structured values retain all their JSON fields.
-                let result = match &outcome.result {
-                    Ok(value) => match value.as_str() {
-                        Some(text) => format!("Result: success\n\n{text}"),
-                        // Preserve every field without allowing indentation to
-                        // multiply a bounded App result into an oversized reader.
-                        None => format!("Result: success\n\n{value}"),
-                    },
-                    Err(error) => {
-                        format!("Result: error\nKind: {:?}\n\n{}", error.kind, error.message)
+                let summary = bone_app::tool_summary(tool, arguments, Some(outcome));
+                let details = bone_app::tool_details(tool, arguments, outcome);
+                let mut text = String::new();
+                let mut numbered = Vec::new();
+                for section in details.sections {
+                    if !text.is_empty() {
+                        if !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push('\n');
                     }
-                };
-                (
-                    tool.clone(),
-                    format!(
-                        "Tool: {tool}\nExternal effect: {:?}\n\n{result}\n\nCall: {} / {}\nJob: {} / {}\nHistory: {}",
-                        outcome.external_effect,
-                        call.runtime,
-                        call.id,
-                        job.runtime,
-                        job.id,
-                        entry.sequence.0,
-                    ),
-                )
+                    if let Some(heading) = section.heading {
+                        text.push_str(&heading);
+                        text.push('\n');
+                    }
+                    let start = text.len();
+                    text.push_str(&section.text);
+                    if let Some(first_line) = section.first_line {
+                        numbered.push(NumberedText {
+                            range: start..text.len(),
+                            first_line,
+                        });
+                    }
+                }
+                return Some(Self {
+                    session,
+                    source: ReaderSource::History(entry.sequence),
+                    title: format!("{tool} · {}", summary.subject),
+                    text: text.into(),
+                    numbered,
+                    layout_cache: Default::default(),
+                });
             }
             SessionEvent::JobFinished {
                 job,
@@ -193,6 +250,7 @@ impl ReaderContent {
             source: ReaderSource::History(entry.sequence),
             title,
             text: text.into(),
+            numbered: Vec::new(),
             layout_cache: Default::default(),
         })
     }
@@ -208,13 +266,22 @@ impl ReaderContent {
         };
         let owner = match job.owner {
             JobOwner::User => "User".to_owned(),
-            JobOwner::Routing => "Routing".to_owned(),
             JobOwner::Job(owner) => format!("Job {} / {}", owner.runtime, owner.id),
         };
         let mut text = format!(
             "Goal\n{}\n\nState\n{state}\n\nDone when\n{}\n\nScope\n{}",
             job.goal, job.done_when, job.scope,
         );
+        let tools = if job.allowed_tools.is_empty() {
+            "None".to_owned()
+        } else {
+            job.allowed_tools
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        text.push_str(&format!("\n\nAllowed tools\n{tools}"));
         if let Some(report) = &job.report {
             text.push_str(&format!("\n\nReport\n{}", report.summary));
         }
@@ -231,6 +298,7 @@ impl ReaderContent {
                 job.goal.clone()
             },
             text: text.into(),
+            numbered: Vec::new(),
             layout_cache: Default::default(),
         })
     }
@@ -252,6 +320,39 @@ impl ReaderContent {
 #[cfg(test)]
 mod projection_budget_tests {
     use super::*;
+
+    #[test]
+    fn line_numbers_disappear_when_the_complete_gutter_does_not_fit() {
+        let content = ReaderContent {
+            session: SessionId::new(),
+            source: ReaderSource::History(SessionSeq(1)),
+            title: "source".into(),
+            text: "界abc\nnext\n".into(),
+            numbered: vec![NumberedText {
+                range: 0..12,
+                first_line: 10000,
+            }],
+            layout_cache: Default::default(),
+        };
+        for width in 1..=6 {
+            assert_eq!(content.wrapped_rows(width).gutter, 0);
+        }
+        let rows = content.wrapped_rows(8);
+        assert_eq!(rows.gutter, 6);
+        assert_eq!(rows.line_number(0), Some(10000));
+        assert_eq!(
+            rows.line_number(1),
+            None,
+            "soft wraps do not repeat line numbers"
+        );
+        assert_eq!(
+            rows.numbers
+                .iter()
+                .map(|(_, number)| *number)
+                .collect::<Vec<_>>(),
+            [10000, 10001]
+        );
+    }
 
     #[test]
     fn bounded_nested_json_stays_compact_lossless_and_inert() {
@@ -279,19 +380,13 @@ mod projection_budget_tests {
                 call: bone_app::CallRef { runtime, id: 1 },
                 job: JobRef { runtime, id: 2 },
                 tool: "session_history".into(),
+                arguments: serde_json::json!({}),
                 outcome,
             },
         };
         let content = ReaderContent::from_history(SessionId::new(), &entry).unwrap();
         assert!(content.text.len() < encoded.len() + 512);
-        let json = content
-            .text
-            .split_once("Result: success\n\n")
-            .unwrap()
-            .1
-            .split_once("\n\nCall:")
-            .unwrap()
-            .0;
+        let json = content.text.split_once("Result\n").unwrap().1;
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(json).unwrap(),
             value

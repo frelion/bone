@@ -5,8 +5,8 @@ use serde_json::Value;
 
 use crate::tools::{Tool, ToolEnvironment};
 
-/// The agent's initial tool set. Classification belongs to the adapter, never
-/// to model-supplied arguments. Write tools need their own effect-aware adapter.
+/// Read-only tool adapters. Classification belongs to the adapter, never
+/// to model-supplied arguments. Write tools use an effect-aware application adapter.
 pub fn read_only_tools(environment: &ToolEnvironment) -> Vec<Arc<dyn ToolPort>> {
     vec![
         Arc::new(ReadOnlyTool::new(environment.read())),
@@ -73,7 +73,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_agent_tools_are_read_only_and_intentionally_narrow() {
+    fn read_only_adapters_preserve_tool_effects() {
         let workspace = tempfile::tempdir().unwrap();
         let environment = ToolEnvironment::new(workspace.path()).unwrap();
         let tools = read_only_tools(&environment);

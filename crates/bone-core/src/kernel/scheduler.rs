@@ -1,12 +1,6 @@
 use super::*;
 
 impl Kernel {
-    pub(super) fn enqueue_routing(&mut self, routing: Seq) {
-        if !self.routing_ready.contains(&routing) {
-            self.routing_ready.push_back(routing);
-        }
-    }
-
     pub(super) fn enqueue_job(&mut self, job: JobId) {
         let Some(entry) = self.jobs.get(&job) else {
             return;
@@ -35,21 +29,12 @@ impl Kernel {
         self.enqueue_job(job);
     }
 
-    pub(super) fn make_routing_ready(&mut self, routing: Seq) {
-        self.routings
-            .get_mut(&routing)
-            .expect("routing exists")
-            .state = RoutingState::Ready;
-        self.enqueue_routing(routing);
-    }
-
     pub(super) fn advance(&mut self, now: MonoTime, effects: &mut Vec<Effect>) {
         if !self.suspended {
             self.process_candidates(now, effects);
-            self.schedule_routing(effects);
+            self.schedule_conversation(effects);
             self.schedule_workers(effects);
         }
-        self.finish_inputs(effects);
     }
 
     pub(super) fn expire(&mut self, now: MonoTime, effects: &mut Vec<Effect>) {
@@ -92,54 +77,42 @@ impl Kernel {
         }
     }
 
-    fn schedule_routing(&mut self, effects: &mut Vec<Effect>) {
-        if self
-            .calls
-            .values()
-            .any(|call| call.kind() == CallKind::Coordinate && call.running())
+    fn schedule_conversation(&mut self, effects: &mut Vec<Effect>) {
+        if !self.conversation.ready
+            || self.conversation.question.is_some()
+            || self.conversation.failure.is_some()
+            || self.conversation.active_call.is_some()
+            || self
+                .calls
+                .values()
+                .any(|call| call.kind() == CallKind::Converse && call.running())
         {
             return;
         }
-        let scans = self.routing_ready.len();
-        for _ in 0..scans {
-            let Some(routing) = self.routing_ready.pop_front() else {
-                return;
-            };
-            let ready = self.routings.get(&routing).is_some_and(|entry| {
-                entry.state == RoutingState::Ready && entry.active_call.is_none()
-            });
-            if !ready {
-                continue;
+        match context::prepare_conversation(self) {
+            Ok(input) => {
+                let call = self.start_call(
+                    CallTask::Converse {
+                        seen_through: Seq(self.next_seq - 1),
+                    },
+                    Call::Converse(input),
+                    self.limits.coordination_timeout,
+                    effects,
+                );
+                self.conversation.active_call = Some(call);
+                self.conversation.ready = false;
             }
-            match context::prepare_coordinate(self, routing) {
-                Ok(input) => {
-                    let call = self.start_coordination(input, effects);
-                    self.routings
-                        .get_mut(&routing)
-                        .expect("routing exists")
-                        .active_call = Some(call);
-                    return;
-                }
-                Err(error) => {
-                    if context::session_can_help_coordinate(self, routing)
-                        && self.session_compacting()
-                    {
-                        self.enqueue_routing(routing);
+            Err(error) => {
+                if context::session_can_help_conversation(self) {
+                    if self.session_compacting() {
                         return;
                     }
-                    if context::session_can_help_coordinate(self, routing)
-                        && let Ok(input) = context::prepare_session_compact(self)
-                    {
-                        self.start_session_compaction(
-                            input,
-                            DeliveryTarget::Routing(routing),
-                            effects,
-                        );
-                        self.enqueue_routing(routing);
+                    if let Ok(input) = context::prepare_session_compact(self) {
+                        self.start_session_compaction(input, DeliveryTarget::Conversation, effects);
                         return;
                     }
-                    self.fail_routing(routing, error.to_string(), effects);
                 }
+                self.fail_conversation(error.to_string(), effects);
             }
         }
     }
@@ -191,20 +164,6 @@ impl Kernel {
         for job in deferred {
             self.enqueue_job(job);
         }
-    }
-
-    fn start_coordination(
-        &mut self,
-        input: crate::CoordinateInput,
-        effects: &mut Vec<Effect>,
-    ) -> CallId {
-        let routing = input.routing;
-        self.start_call(
-            CallTask::Coordinate { routing },
-            Call::Coordinate(input),
-            self.limits.coordination_timeout,
-            effects,
-        )
     }
 
     fn start_work(
@@ -439,31 +398,47 @@ impl Kernel {
             }
             current = match entry.owner {
                 Owner::Job(parent) => Some(parent),
-                Owner::User | Owner::Routing(_) => None,
+                Owner::User => None,
             };
         }
         false
     }
 
-    pub(super) fn coordinate_finished(
+    pub(super) fn converse_finished(
         &mut self,
-        now: MonoTime,
         call: CallId,
-        result: Result<KernelDecision, CallError>,
+        result: Result<ConversationStep, CallError>,
         effects: &mut Vec<Effect>,
     ) {
-        let Some(routing) = self.finish_routing_call(call, result.as_ref().err().cloned(), effects)
-        else {
+        let Some(entry) = self.calls.get(&call) else {
             return;
         };
-        match result {
-            Ok(decision) => {
-                if let Err(message) = self.apply_decision(now, routing, decision, effects) {
-                    self.fail_routing(routing, message, effects);
-                }
-            }
-            Err(error) => self.fail_routing(routing, error.message, effects),
+        let CallTask::Converse { seen_through } = entry.task else {
+            return;
+        };
+        if !entry.running() {
+            return;
         }
+        let eligible = self.conversation.active_call == Some(call);
+        self.finish_model_call(call, result.as_ref().err().cloned(), effects);
+        if !eligible {
+            self.discard_model_result::<()>(call, effects);
+            return;
+        }
+        self.conversation.active_call = None;
+        // Results arriving during this call still need a conversation turn after it commits.
+        let notified = self.conversation.ready;
+        match result {
+            Ok(step) => match self.apply_conversation(step, effects) {
+                Ok(()) => {
+                    self.conversation.rejections.consecutive = 0;
+                    self.conversation.records.retain(|seq| *seq > seen_through);
+                }
+                Err(message) => self.reject_conversation(call, message, effects),
+            },
+            Err(error) => self.fail_conversation(error.message, effects),
+        }
+        self.conversation.ready |= notified;
     }
 
     pub(super) fn work_finished(
@@ -557,15 +532,7 @@ impl Kernel {
                     );
                 }
                 Err(error) => match requester {
-                    DeliveryTarget::Routing(routing) => {
-                        if self
-                            .routings
-                            .get(&routing)
-                            .is_some_and(|route| route.state != RoutingState::Closed)
-                        {
-                            self.fail_routing(routing, error.message, effects);
-                        }
-                    }
+                    DeliveryTarget::Conversation => self.fail_conversation(error.message, effects),
                     DeliveryTarget::Job(job) => self.finish_job(
                         job,
                         OutcomeKind::Failed,
@@ -593,35 +560,6 @@ impl Kernel {
                 effects,
             ),
         }
-    }
-
-    fn finish_routing_call(
-        &mut self,
-        call: CallId,
-        error: Option<CallError>,
-        effects: &mut Vec<Effect>,
-    ) -> Option<Seq> {
-        let entry = self.calls.get(&call)?.clone();
-        let CallTask::Coordinate { routing } = &entry.task else {
-            return None;
-        };
-        let routing = *routing;
-        if !entry.running() {
-            return None;
-        }
-        let eligible = self
-            .routings
-            .get(&routing)
-            .is_some_and(|route| route.active_call == Some(call));
-        self.finish_model_call(call, error, effects);
-        if let Some(route) = self.routings.get_mut(&routing)
-            && route.active_call == Some(call)
-        {
-            route.active_call = None;
-        }
-        eligible
-            .then_some(routing)
-            .or_else(|| self.discard_model_result(call, effects))
     }
 
     fn finish_job_call(

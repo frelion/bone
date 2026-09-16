@@ -41,8 +41,20 @@ pub(super) fn render(
         _ => return None,
     };
     let shell = super::overlay::render_shell(frame, plan.screen, area, title);
+    let hint = state.status_text().unwrap_or_else(|| {
+        if models.busy(state.model_operation) {
+            "Applying model…"
+        } else {
+            super::overlay::keyboard_hint(state)
+        }
+    });
     frame.render_widget(
-        Paragraph::new(super::overlay::keyboard_hint(state)).style(theme::body(MUTED)),
+        Paragraph::new(single_line_external(hint)).style(theme::body(match &state.status {
+            Some(status) if status.is_error() => DANGER,
+            Some(_) => INFO,
+            None if models.busy(state.model_operation) => INFO,
+            None => MUTED,
+        })),
         shell.back,
     );
     hits.push(ClickRegion {
@@ -66,8 +78,8 @@ pub(super) fn render(
             .any(|profile| profile.id.as_str() == "anthropic");
         let options = [
             (
-                "ChatGPT · sign in",
-                "Uses your subscription · opens a browser",
+                "ChatGPT · use subscription",
+                "Uses existing sign-in · asks only when required",
             ),
             (
                 if has_openai {
@@ -110,7 +122,9 @@ pub(super) fn render(
                 } else {
                     (*label).into()
                 })
-                .style(super::overlay::menu_style(*selected == index)),
+                .style(super::overlay::menu_style(
+                    *selected == index && state.keyboard.is_overlay(),
+                )),
                 row,
             );
             hits.push(ClickRegion {
@@ -137,7 +151,9 @@ pub(super) fn render(
                 stride,
             );
             frame.render_widget(
-                Paragraph::new(kind.label()).style(super::overlay::menu_style(*selected == index)),
+                Paragraph::new(kind.label()).style(super::overlay::menu_style(
+                    *selected == index && state.keyboard.is_overlay(),
+                )),
                 row,
             );
             hits.push(ClickRegion {

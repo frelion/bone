@@ -18,6 +18,10 @@
 
 mod auth;
 
+/// Clear the OAuth cache using the same transaction lock as token refresh.
+#[cfg(not(target_family = "wasm"))]
+pub use auth::clear_cache;
+
 use crate::client::{self, ApiKey, DebugExt, Provider, ProviderBuilder, ProviderClient, Transport};
 use crate::completion::{self, CompletionError, NormalizeCompletionResponse};
 use crate::http_client::{self, HttpClientExt};

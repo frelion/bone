@@ -4,11 +4,10 @@ use serde_json::json;
 
 use crate::{
     AdmissionError, AgentLimits, Assignment, Await, CallId, CheckpointDraft, CompactInput,
-    Completion, ControlOutcome, DeliveryTarget, ExternalEffect, Input, InputId, InputOutcome,
-    InputStatus, InquiryAnswer, InquiryResponse, JobSpec, JobStatus, KernelDecision, MonoTime,
-    OutcomeKind, ReadQuery, RecordBody, ReportDraft, RouteDelivery, RouteTarget, Seq,
-    SessionContext, ToolCall, ToolEffect, ToolOutcome, ToolSpec, WorkInput, WorkProposal, WorkStep,
-    WorkerRole,
+    Completion, ControlOutcome, ConversationStep, DeliveryTarget, ExternalEffect, Input, InputId,
+    InputOutcome, InputStatus, InquiryAnswer, InquiryResponse, JobSpec, JobStatus, MonoTime,
+    OutcomeKind, ReadQuery, RecordBody, ReportDraft, Seq, SessionContext, ToolCall, ToolEffect,
+    ToolOutcome, ToolSpec, WorkInput, WorkProposal, WorkStep,
     context::{self, PreparedWork},
     kernel::{Kernel, KernelControl},
     ports::{Call, Effect, Event},
@@ -25,6 +24,15 @@ mod work_rejections;
 #[path = "tests/delegation.rs"]
 mod delegation;
 
+#[path = "tests/tool_permissions.rs"]
+mod tool_permissions;
+
+#[path = "tests/conversation_contract.rs"]
+mod conversation_contract;
+
+#[path = "tests/evidence_contract.rs"]
+mod evidence_contract;
+
 fn spec(goal: &str) -> JobSpec {
     JobSpec::new(goal, format!("{goal} scope"), format!("{goal} done"))
 }
@@ -35,29 +43,31 @@ fn assignment(goal: &str, inputs: &[InputId]) -> Assignment {
     assignment
 }
 
-fn route_new(goal: &str, inputs: &[InputId]) -> KernelDecision {
-    KernelDecision::Assign(vec![RouteDelivery {
-        inputs: inputs.to_vec(),
-        target: RouteTarget::New,
-        handoff: goal.into(),
-    }])
+fn start_jobs(goal: &str, inputs: &[InputId]) -> ConversationStep {
+    ConversationStep::Start(vec![assignment(goal, inputs)])
 }
 
-fn route_existing(
+fn send_existing(
     kernel: &mut Kernel,
-    routing_effects: &[Effect],
+    effects: &[Effect],
     job: crate::JobId,
     inputs: &[InputId],
 ) -> Vec<Effect> {
+    let question = match kernel.jobs[&job].state {
+        crate::job::JobState::Waiting(crate::job::WaitState::User { question }) => Some(question),
+        _ => None,
+    };
     kernel.step(
         NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(routing_effects),
-            result: Ok(KernelDecision::Assign(vec![RouteDelivery {
+        Event::ConverseFinished {
+            call: converse_call(effects),
+            result: Ok(ConversationStep::Send {
+                job,
                 inputs: inputs.to_vec(),
-                target: RouteTarget::Existing(job),
-                handoff: "review the new user input".into(),
-            }])),
+                message: "review new user input".into(),
+                question,
+                tools: None,
+            }),
         },
     )
 }
@@ -77,9 +87,9 @@ fn starts(effects: &[Effect]) -> impl Iterator<Item = (CallId, &Call)> {
     })
 }
 
-fn coordinate_call(effects: &[Effect]) -> CallId {
+fn converse_call(effects: &[Effect]) -> CallId {
     starts(effects)
-        .find_map(|(id, call)| matches!(call, Call::Coordinate(_)).then_some(id))
+        .find_map(|(id, call)| matches!(call, Call::Converse(_)).then_some(id))
         .unwrap()
 }
 
@@ -87,7 +97,7 @@ fn work_calls(effects: &[Effect]) -> Vec<(CallId, WorkInput)> {
     starts(effects)
         .filter_map(|(id, call)| match call {
             Call::Work(input) => Some((id, input.clone())),
-            Call::Coordinate(_) | Call::Compact(_) | Call::Tool(_) => None,
+            Call::Converse(_) | Call::Compact(_) | Call::Tool(_) => None,
         })
         .collect()
 }
@@ -101,7 +111,7 @@ fn tool_call(effects: &[Effect]) -> CallId {
 fn compact_call(effects: &[Effect]) -> Option<(CallId, CompactInput)> {
     starts(effects).find_map(|(id, call)| match call {
         Call::Compact(input) => Some((id, input.clone())),
-        Call::Coordinate(_) | Call::Work(_) | Call::Tool(_) => None,
+        Call::Converse(_) | Call::Work(_) | Call::Tool(_) => None,
     })
 }
 
@@ -111,22 +121,31 @@ fn create_roots(
     assignments: Vec<Assignment>,
 ) -> Vec<(CallId, WorkInput)> {
     let (_, effects) = kernel.accept(NOW, input).unwrap();
-    let mut assignments = assignments.into_iter();
-    let first = assignments.next().expect("tests create at least one root");
     let effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(&effects),
-            result: Ok(KernelDecision::Assign(vec![RouteDelivery {
-                inputs: first.inputs,
-                target: RouteTarget::New,
-                handoff: first.spec.goal,
-            }])),
+        Event::ConverseFinished {
+            call: converse_call(&effects),
+            result: Ok(ConversationStep::Start(assignments)),
         },
     );
-    let mut effects = effects;
-    kernel.test_add_user_roots(NOW, assignments.collect(), &mut effects);
     work_calls(&effects)
+}
+
+fn converse_step(kernel: &mut Kernel, step: ConversationStep) -> Vec<Effect> {
+    let call = if let Some(call) = kernel.conversation.active_call {
+        call
+    } else {
+        kernel.conversation.ready = true;
+        let effects = kernel.step(NOW, Event::Tick);
+        converse_call(&effects)
+    };
+    kernel.step(
+        NOW,
+        Event::ConverseFinished {
+            call,
+            result: Ok(step),
+        },
+    )
 }
 
 fn work(kernel: &mut Kernel, call: CallId, step: WorkStep) -> Vec<Effect> {
@@ -145,7 +164,7 @@ fn calls_by_goal(calls: Vec<(CallId, WorkInput)>) -> BTreeMap<String, (CallId, W
         .map(|(call, input)| {
             let handoff = input.records.iter().find_map(|record| {
                 match serde_json::from_str::<RecordBody>(&record.content).ok()? {
-                    RecordBody::RoutingHandoff { job, text, .. } if job == input.job => Some(text),
+                    RecordBody::JobMessage { job, text, .. } if job == input.job => Some(text),
                     _ => None,
                 }
             });
@@ -169,36 +188,6 @@ fn input_status(kernel: &Kernel, id: InputId) -> InputStatus {
 
 fn finished_as(kernel: &Kernel, job: crate::JobId, kind: OutcomeKind) -> bool {
     matches!(kernel.job_status(job), JobStatus::Finished(outcome) if outcome.kind == kind)
-}
-
-#[test]
-fn a_user_reply_is_visible_to_the_follow_up_call_before_finish() {
-    let mut kernel = kernel();
-    let input = Input::new(InputId(901), "answer once");
-    let (call, first) = create_roots(
-        &mut kernel,
-        input.clone(),
-        vec![assignment("answer once", &[input.id])],
-    )
-    .pop()
-    .unwrap();
-
-    let effects = work(&mut kernel, call, WorkStep::Reply("done".into()));
-    let (finish_call, follow_up) = work_calls(&effects).pop().unwrap();
-    assert_eq!(follow_up.job, first.job);
-    assert!(follow_up.records.iter().any(|record| {
-        matches!(
-            serde_json::from_str::<RecordBody>(&record.content),
-            Ok(RecordBody::Reply { text, .. }) if text == "done"
-        )
-    }));
-
-    let _ = work(
-        &mut kernel,
-        finish_call,
-        WorkStep::Finish(Completion::new("done")),
-    );
-    assert!(finished_as(&kernel, first.job, OutcomeKind::Completed));
 }
 
 #[test]
@@ -231,7 +220,10 @@ fn active_reconfigure_restarts_model_work_without_losing_the_job() {
     );
     let (replacement, restarted) = work_calls(&effects).pop().unwrap();
     assert_eq!(restarted.job, job);
-    assert_eq!(restarted.tools, vec![replacement_tool]);
+    assert!(
+        restarted.tools.is_empty(),
+        "new tools are not granted to existing jobs"
+    );
     assert_ne!(replacement, call);
 
     let _ = work(
@@ -395,7 +387,10 @@ fn reconfigure_keeps_running_tools_and_discards_pending_model_decisions() {
         .into_iter()
         .find(|(_, work)| work.job == second.job)
         .unwrap();
-    assert_eq!(restarted.tools, vec![replacement_tool]);
+    assert!(
+        restarted.tools.is_empty(),
+        "new tools are not granted to existing jobs"
+    );
 }
 
 #[test]
@@ -631,11 +626,11 @@ fn delegate_capacity_rejection_is_returned_to_the_parent_worker() {
 }
 
 #[test]
-fn a_new_input_supersedes_an_in_flight_routing_and_discards_its_late_result() {
+fn a_new_input_supersedes_an_in_flight_conversation_and_discards_its_late_result() {
     let mut kernel = kernel();
     let old = Input::new(InputId(201), "use implementation A");
     let (_, old_effects) = kernel.accept(NOW, old.clone()).unwrap();
-    let old_call = coordinate_call(&old_effects);
+    let old_call = converse_call(&old_effects);
 
     let new = Input::new(InputId(202), "correction: use implementation B");
     let (_, superseding) = kernel.accept(NOW, new.clone()).unwrap();
@@ -644,19 +639,19 @@ fn a_new_input_supersedes_an_in_flight_routing_and_discards_its_late_result() {
             .iter()
             .any(|effect| matches!(effect, Effect::Cancel(call) if *call == old_call))
     );
-    assert!(!starts(&superseding).any(|(_, call)| matches!(call, Call::Coordinate(_))));
+    assert!(!starts(&superseding).any(|(_, call)| matches!(call, Call::Converse(_))));
 
     let effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call: old_call,
-            result: Ok(route_new("implementation A", &[old.id])),
+            result: Ok(start_jobs("implementation A", &[old.id])),
         },
     );
     assert!(kernel.jobs.is_empty());
     let (current_call, current) = starts(&effects)
         .find_map(|(call, effect)| match effect {
-            Call::Coordinate(input) => Some((call, input)),
+            Call::Converse(input) => Some((call, input)),
             _ => None,
         })
         .unwrap();
@@ -671,17 +666,17 @@ fn a_new_input_supersedes_an_in_flight_routing_and_discards_its_late_result() {
 
     kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call: current_call,
-            result: Ok(route_new("implementation B", &[old.id, new.id])),
+            result: Ok(start_jobs("implementation B", &[old.id, new.id])),
         },
     );
     assert_eq!(
         kernel.jobs.values().next().unwrap().spec.goal,
-        "Handle the assigned user request."
+        "implementation B"
     );
     let (_, retry) = kernel.control(NOW, KernelControl::Retry(old.id));
-    assert!(!starts(&retry).any(|(_, call)| matches!(call, Call::Coordinate(_))));
+    assert!(!starts(&retry).any(|(_, call)| matches!(call, Call::Converse(_))));
 }
 
 #[test]
@@ -691,21 +686,21 @@ fn retrying_an_old_failed_input_uses_the_newest_combined_batch() {
     let (_, effects) = kernel.accept(NOW, old.clone()).unwrap();
     kernel.step(
         NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(&effects),
+        Event::ConverseFinished {
+            call: converse_call(&effects),
             result: Err(crate::CallError::failed("temporary failure")),
         },
     );
     assert!(matches!(
         input_status(&kernel, old.id),
-        InputStatus::RoutingFailed { .. }
+        InputStatus::ConversationFailed { .. }
     ));
 
     let new = Input::new(InputId(204), "correction: use implementation B");
     let (_, effects) = kernel.accept(NOW, new.clone()).unwrap();
     let (call, combined) = starts(&effects)
         .find_map(|(call, effect)| match effect {
-            Call::Coordinate(input) => Some((call, input)),
+            Call::Converse(input) => Some((call, input)),
             _ => None,
         })
         .unwrap();
@@ -719,21 +714,21 @@ fn retrying_an_old_failed_input_uses_the_newest_combined_batch() {
     );
     assert!(combined.records.iter().any(|view| matches!(
         kernel.records[&view.source].body,
-        RecordBody::InputRoutingFailed { .. }
+        RecordBody::ConversationFailed { .. }
     )));
 
     kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call,
-            result: Ok(route_new("implementation B", &[old.id, new.id])),
+            result: Ok(start_jobs("implementation B", &[old.id, new.id])),
         },
     );
     let (_, retry) = kernel.control(NOW, KernelControl::Retry(old.id));
-    assert!(!starts(&retry).any(|(_, call)| matches!(call, Call::Coordinate(_))));
+    assert!(!starts(&retry).any(|(_, call)| matches!(call, Call::Converse(_))));
     assert_eq!(
         kernel.jobs.values().next().unwrap().spec.goal,
-        "Handle the assigned user request."
+        "implementation B"
     );
 }
 
@@ -790,10 +785,7 @@ fn delegate_validates_the_whole_batch_before_writing_any_part() {
         JobStatus::Finished(_)
     ));
     assert_eq!(kernel.jobs[&work_input.job].work_rejections.total, 1);
-    assert_eq!(
-        kernel.inputs[&input.id].pending_review_by,
-        Some(work_input.job)
-    );
+    assert!(!kernel.inputs[&input.id].pending);
     assert_eq!(kernel.jobs[&work_input.job].context.read_through, Seq::ZERO);
     assert!(!kernel.records.values().any(|record| matches!(
         &record.body,
@@ -1040,78 +1032,48 @@ fn record_paging_always_advances_across_multibyte_utf8() {
 }
 
 #[test]
-fn an_unread_required_input_that_exceeds_context_fails_before_work_starts() {
-    let limits = AgentLimits {
-        context_bytes: 2_000,
-        item_bytes: 128,
-        ..AgentLimits::default()
-    };
-    let mut kernel = Kernel::new(limits, Vec::new()).unwrap();
+fn an_unread_required_input_that_exceeds_context_cannot_be_compacted_away() {
+    let mut kernel = kernel();
     let original = Input::new(InputId(1), "ask before continuing");
-    let (work_call, work_input) = create_roots(
+    let (call, job) = create_roots(
         &mut kernel,
         original.clone(),
         vec![assignment("reader", &[original.id])],
     )
     .pop()
     .unwrap();
-    let job = work_input.job;
     work(
         &mut kernel,
-        work_call,
-        WorkStep::AskUser("provide the full material".into()),
+        call,
+        WorkStep::NeedInput("provide the full material".into()),
     );
-    let read_before_answer = kernel.jobs[&job].context.read_through;
-
-    let oversized =
-        Input::new(InputId(2), "oversized-required-input-".repeat(200)).replying_to(original.id);
-    let oversized_id = oversized.id;
-    let (_, effects) = kernel.accept(NOW, oversized).unwrap();
-    assert!(
-        !work_calls(&effects)
-            .iter()
-            .any(|(_, input)| input.job == job)
-    );
-    let (compact_call, _) =
-        compact_call(&effects).expect("only the already-read prefix is compacted");
-
-    let effects = kernel.step(
-        NOW,
-        Event::CompactFinished {
-            call: compact_call,
-            result: Ok(CheckpointDraft {
-                summary: "initial request read".into(),
-                evidence: Vec::new(),
-            }),
+    converse_step(
+        &mut kernel,
+        ConversationStep::Ask {
+            inputs: vec![original.id],
+            question: "provide the full material".into(),
         },
     );
-
-    assert!(!starts(&effects).any(|(_, call)| {
-        matches!(call, Call::Work(input) if input.job == job)
-            || matches!(call, Call::Compact(input) if matches!(input.scope, crate::CompactScope::Job { job: id, .. } if id == job))
-    }));
-    let JobStatus::Finished(outcome) = kernel.job_status(job) else {
-        panic!("oversized job must fail while preparing its context");
-    };
-    assert_eq!(outcome.kind, OutcomeKind::Failed);
+    let read_before = kernel.jobs[&job.job].context.read_through;
+    kernel.limits.context_bytes = 2_000;
+    kernel.limits.item_bytes = 128;
+    let input =
+        Input::new(InputId(2), "oversized-required-input-".repeat(200)).replying_to(original.id);
+    let (_, effects) = kernel.accept(NOW, input).unwrap();
+    assert!(work_calls(&effects).is_empty());
     assert!(
-        outcome
-            .completion
-            .summary
-            .contains("required context exceeds the configured model input budget")
+        compact_call(&effects).is_none(),
+        "new user authority cannot be summarized before processing"
     );
-    assert_eq!(kernel.jobs[&job].context.read_through, read_before_answer);
     assert!(matches!(
-        input_status(&kernel, oversized_id),
-        InputStatus::RoutingFailed { .. }
+        input_status(&kernel, InputId(2)),
+        InputStatus::ConversationFailed { .. }
     ));
-    let (outcome, retry_effects) = kernel.control(NOW, KernelControl::Retry(oversized_id));
-    assert_eq!(outcome, ControlOutcome::Applied);
     assert!(matches!(
-        input_status(&kernel, oversized_id),
-        InputStatus::RoutingFailed { .. }
+        kernel.job_status(job.job),
+        JobStatus::Waiting(crate::WaitView::User { .. })
     ));
-    assert!(!starts(&retry_effects).any(|(_, call)| matches!(call, Call::Work(_))));
+    assert_eq!(kernel.jobs[&job.job].context.read_through, read_before);
 }
 
 #[test]
@@ -1174,10 +1136,7 @@ fn finish_waits_for_children_and_requires_their_delivery_to_be_read() {
         WorkStep::Finish(crate::Completion::new("parent complete")),
     );
     assert!(finished_as(&kernel, parent, OutcomeKind::Completed));
-    assert_eq!(
-        input_status(&kernel, input.id),
-        InputStatus::Finished(InputOutcome::Completed)
-    );
+    assert_eq!(input_status(&kernel, input.id), InputStatus::Handled);
 }
 
 #[test]
@@ -1327,8 +1286,6 @@ fn a_completed_tool_is_a_valid_wait_target_for_an_earlier_worker_snapshot() {
     )
     .pop()
     .unwrap();
-    assert_eq!(parent.role, WorkerRole::User);
-    assert!(parent.can_ask_user);
     let calls = calls_by_goal(work_calls(&work(
         &mut kernel,
         parent_call,
@@ -1336,8 +1293,6 @@ fn a_completed_tool_is_a_valid_wait_target_for_an_earlier_worker_snapshot() {
     )));
     let (parent_call, _) = &calls["parent"];
     let (child_call, child) = &calls["child"];
-    assert_eq!(child.role, WorkerRole::Delegated);
-    assert!(!child.can_ask_user);
     let effects = work(
         &mut kernel,
         *child_call,
@@ -2026,9 +1981,12 @@ fn clarification_reply_uses_the_reserved_input_envelope() {
     let (_, effects) = kernel.accept(NOW, input.clone()).unwrap();
     kernel.step(
         NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(&effects),
-            result: Ok(KernelDecision::Clarify("which target?".into())),
+        Event::ConverseFinished {
+            call: converse_call(&effects),
+            result: Ok(ConversationStep::Ask {
+                inputs: vec![InputId(1)],
+                question: "which target?".into(),
+            }),
         },
     );
 
@@ -2039,7 +1997,7 @@ fn clarification_reply_uses_the_reserved_input_envelope() {
     let reply = Input::new(InputId(3), "the library target").replying_to(input.id);
     let (_, effects) = kernel.accept(NOW, reply).unwrap();
 
-    assert!(starts(&effects).any(|(_, call)| matches!(call, Call::Coordinate(_))));
+    assert!(starts(&effects).any(|(_, call)| matches!(call, Call::Converse(_))));
 }
 
 #[test]
@@ -2049,9 +2007,12 @@ fn clarification_reply_atomically_checks_the_question_sequence() {
     let (_, effects) = kernel.accept(NOW, input.clone()).unwrap();
     kernel.step(
         NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(&effects),
-            result: Ok(KernelDecision::Clarify("which target?".into())),
+        Event::ConverseFinished {
+            call: converse_call(&effects),
+            result: Ok(ConversationStep::Ask {
+                inputs: vec![InputId(1)],
+                question: "which target?".into(),
+            }),
         },
     );
     let question_seq = match input_status(&kernel, input.id) {
@@ -2076,56 +2037,7 @@ fn clarification_reply_atomically_checks_the_question_sequence() {
             Input::new(InputId(3), "the library target").answering(input.id, question_seq),
         )
         .unwrap();
-    assert!(starts(&effects).any(|(_, call)| matches!(call, Call::Coordinate(_))));
-}
-
-#[test]
-fn a_job_question_delivers_its_answer_without_reopening_old_routings() {
-    let mut kernel = kernel();
-    let original = Input::new(InputId(1), "build the feature");
-    let mut calls = create_roots(
-        &mut kernel,
-        original.clone(),
-        vec![assignment("builder", &[original.id])],
-    );
-    let (call, work_input) = calls.pop().unwrap();
-    let job = work_input.job;
-    work(
-        &mut kernel,
-        call,
-        WorkStep::AskUser("which public name?".into()),
-    );
-
-    assert!(matches!(
-        input_status(&kernel, original.id),
-        InputStatus::WaitingForUser { question, .. } if question == "which public name?"
-    ));
-    assert!(
-        kernel
-            .routings
-            .values()
-            .all(|routing| routing.state == crate::kernel::RoutingState::Closed)
-    );
-
-    let answer = Input::new(InputId(2), "call it Agent").replying_to(original.id);
-    let (_, effects) = kernel.accept(NOW, answer).unwrap();
-    assert!(!starts(&effects).any(|(_, call)| matches!(call, Call::Coordinate(_))));
-    let (_, resumed) = work_calls(&effects)
-        .into_iter()
-        .find(|(_, input)| input.job == job)
-        .unwrap();
-    assert!(resumed.records.iter().any(|view| {
-        matches!(&kernel.records[&view.source].body, RecordBody::Input(input) if input.id == InputId(2))
-    }));
-    assert!(resumed.records.iter().any(|view| {
-        matches!(&kernel.records[&view.source].body, RecordBody::Clarification { question, .. } if question == "which public name?")
-    }));
-    assert!(
-        kernel
-            .routings
-            .values()
-            .all(|routing| routing.state == crate::kernel::RoutingState::Closed)
-    );
+    assert!(starts(&effects).any(|(_, call)| matches!(call, Call::Converse(_))));
 }
 
 #[test]
@@ -2297,9 +2209,9 @@ fn compaction_replaces_only_an_already_read_prefix() {
     let (_, effects) = kernel.accept(NOW, input.clone()).unwrap();
     let mut effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(&effects),
-            result: Ok(route_new("long job", &[input.id])),
+        Event::ConverseFinished {
+            call: converse_call(&effects),
+            result: Ok(start_jobs("long job", &[input.id])),
         },
     );
 
@@ -2370,7 +2282,7 @@ fn changing_constraints_discards_a_finish_frozen_under_the_old_constraints() {
     let job = work_input.job;
 
     let update = Input::new(InputId(2), "all work must now stay read-only");
-    let (_, routing_effects) = kernel.accept(NOW, update.clone()).unwrap();
+    let (_, conversation_effects) = kernel.accept(NOW, update.clone()).unwrap();
     work(
         &mut kernel,
         work_call,
@@ -2381,16 +2293,15 @@ fn changing_constraints_discards_a_finish_frozen_under_the_old_constraints() {
         crate::job::JobState::Waiting(crate::job::WaitState::Commit(_))
     ));
 
-    let routed = route_existing(&mut kernel, &routing_effects, job, &[update.id]);
+    let routed = send_existing(&mut kernel, &conversation_effects, job, &[update.id]);
     assert!(!matches!(kernel.job_status(job), JobStatus::Finished(_)));
-    let (review_call, review) = work_calls(&routed)
+    let (_review_call, review) = work_calls(&routed)
         .into_iter()
         .find(|(_, input)| input.job == job)
         .unwrap();
-    let effects = work(
+    let effects = converse_step(
         &mut kernel,
-        review_call,
-        WorkStep::UpdateConstraints {
+        ConversationStep::UpdateConstraints {
             source: update.id,
             expected_revision: review.constraints_revision,
             constraints: "read-only work only".into(),
@@ -2421,16 +2332,20 @@ fn changing_constraints_cancels_an_in_flight_model_authority() {
     let (_, reviewer) = roots.remove("constraint reviewer").unwrap();
 
     let update = Input::new(InputId(2), "new global constraint");
-    let (_, routing_effects) = kernel.accept(NOW, update.clone()).unwrap();
-    let routed = route_existing(&mut kernel, &routing_effects, reviewer.job, &[update.id]);
-    let (review_call, review) = work_calls(&routed)
+    let (_, conversation_effects) = kernel.accept(NOW, update.clone()).unwrap();
+    let routed = send_existing(
+        &mut kernel,
+        &conversation_effects,
+        reviewer.job,
+        &[update.id],
+    );
+    let (_review_call, review) = work_calls(&routed)
         .into_iter()
         .find(|(_, input)| input.job == reviewer.job)
         .unwrap();
-    let effects = work(
+    let effects = converse_step(
         &mut kernel,
-        review_call,
-        WorkStep::UpdateConstraints {
+        ConversationStep::UpdateConstraints {
             source: update.id,
             expected_revision: review.constraints_revision,
             constraints: "new constraint".into(),
@@ -2450,49 +2365,6 @@ fn changing_constraints_cancels_an_in_flight_model_authority() {
     assert!(!matches!(
         kernel.job_status(stale_input.job),
         JobStatus::Finished(_)
-    ));
-}
-
-#[test]
-fn a_waiting_job_can_replace_its_own_user_question() {
-    let mut kernel = kernel();
-    let input = Input::new(InputId(1), "parent work needs clarification");
-    let (parent_call, parent_input) = create_roots(
-        &mut kernel,
-        input.clone(),
-        vec![assignment("parent", &[input.id])],
-    )
-    .pop()
-    .unwrap();
-    let calls = calls_by_goal(work_calls(&work(
-        &mut kernel,
-        parent_call,
-        WorkStep::delegate(vec![assignment("child", &[])]),
-    )));
-    work(
-        &mut kernel,
-        calls["parent"].0,
-        WorkStep::AskUser("first question?".into()),
-    );
-    let effects = work(
-        &mut kernel,
-        calls["child"].0,
-        WorkStep::Finish(Completion::new("child result")),
-    );
-    let parent_call = work_calls(&effects)
-        .into_iter()
-        .find(|(_, work)| work.job == parent_input.job)
-        .expect("child outcome wakes the waiting parent")
-        .0;
-    work(
-        &mut kernel,
-        parent_call,
-        WorkStep::AskUser("better question?".into()),
-    );
-
-    assert!(matches!(
-        input_status(&kernel, input.id),
-        InputStatus::WaitingForUser { question, .. } if question == "better question?"
     ));
 }
 
@@ -2525,15 +2397,14 @@ fn changing_constraints_requests_cancellation_of_an_in_flight_tool() {
 
     let update = Input::new(InputId(2), "writes are now forbidden");
     let (_, effects) = kernel.accept(NOW, update.clone()).unwrap();
-    let routed = route_existing(&mut kernel, &effects, reviewer.job, &[update.id]);
-    let (review_call, review) = work_calls(&routed)
+    let routed = send_existing(&mut kernel, &effects, reviewer.job, &[update.id]);
+    let (_review_call, review) = work_calls(&routed)
         .into_iter()
         .find(|(_, worker)| worker.job == reviewer.job)
         .unwrap();
-    let effects = work(
+    let effects = converse_step(
         &mut kernel,
-        review_call,
-        WorkStep::UpdateConstraints {
+        ConversationStep::UpdateConstraints {
             source: update.id,
             expected_revision: review.constraints_revision,
             constraints: "do not write".into(),
@@ -2618,7 +2489,7 @@ fn a_parent_waiting_for_its_child_receives_one_outcome_delivery() {
 }
 
 #[test]
-fn coordinator_root_directory_is_bounded_and_uses_an_exclusive_cursor() {
+fn conversation_root_directory_is_bounded_and_uses_an_exclusive_cursor() {
     let mut kernel = kernel();
     let input = Input::new(InputId(1), "create many independent jobs");
     let assignments = (0..18)
@@ -2631,7 +2502,7 @@ fn coordinator_root_directory_is_bounded_and_uses_an_exclusive_cursor() {
         .unwrap();
     let (call, page) = starts(&effects)
         .find_map(|(call, item)| match item {
-            Call::Coordinate(input) => Some((call, input.clone())),
+            Call::Converse(input) => Some((call, input.clone())),
             _ => None,
         })
         .unwrap();
@@ -2648,9 +2519,9 @@ fn coordinator_root_directory_is_bounded_and_uses_an_exclusive_cursor() {
 
     kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call,
-            result: Ok(KernelDecision::Read(ReadQuery::Jobs {
+            result: Ok(ConversationStep::Read(ReadQuery::Jobs {
                 parent: None,
                 after: Some(cursor),
             })),
@@ -2665,18 +2536,13 @@ fn coordinator_root_directory_is_bounded_and_uses_an_exclusive_cursor() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(remaining.0.len(), 1);
+    assert_eq!(remaining.0.len(), 2);
     assert_eq!(*remaining.1, None);
-    assert!(
-        remaining
-            .0
-            .iter()
-            .all(|job| job.id > cursor && job.id != finished)
-    );
+    assert!(remaining.0.iter().all(|job| job.id > cursor));
 }
 
 #[test]
-fn coordinator_directory_pages_obey_context_budget_without_accumulating_old_pages() {
+fn conversation_directory_pages_obey_context_budget_without_accumulating_old_pages() {
     let limits = AgentLimits {
         context_bytes: 3_000,
         item_bytes: 1_024,
@@ -2702,7 +2568,7 @@ fn coordinator_directory_pages_obey_context_budget_without_accumulating_old_page
         .unwrap();
     let (mut call, first) = starts(&effects)
         .find_map(|(call, effect)| match effect {
-            Call::Coordinate(input) => Some((call, input.clone())),
+            Call::Converse(input) => Some((call, input.clone())),
             _ => None,
         })
         .unwrap();
@@ -2716,22 +2582,22 @@ fn coordinator_directory_pages_obey_context_budget_without_accumulating_old_page
         assert!(pages <= 18, "directory cursor did not advance");
         let effects = kernel.step(
             NOW,
-            Event::CoordinateFinished {
+            Event::ConverseFinished {
                 call,
-                result: Ok(KernelDecision::Read(ReadQuery::Jobs {
+                result: Ok(ConversationStep::Read(ReadQuery::Jobs {
                     parent: None,
                     after: Some(after),
                 })),
             },
         );
-        let (next_call, coordinate) = starts(&effects)
+        let (next_call, conversation) = starts(&effects)
             .find_map(|(call, effect)| match effect {
-                Call::Coordinate(input) => Some((call, input.clone())),
+                Call::Converse(input) => Some((call, input.clone())),
                 _ => None,
             })
-            .expect("a legal directory page starts the next coordination call");
-        assert!(serde_json::to_vec(&coordinate).unwrap().len() <= limits.context_bytes);
-        let visible_results = coordinate
+            .expect("a legal directory page starts the next conversation call");
+        assert!(serde_json::to_vec(&conversation).unwrap().len() <= limits.context_bytes);
+        let visible_results = conversation
             .records
             .iter()
             .filter(|view| {
@@ -2765,12 +2631,12 @@ fn coordinator_directory_pages_obey_context_budget_without_accumulating_old_page
     assert_eq!(seen.len(), 18);
     assert!(!kernel.records.values().any(|record| matches!(
         &record.body,
-        RecordBody::InputRoutingFailed { inputs, .. } if inputs.contains(&InputId(302))
+        RecordBody::ConversationFailed { inputs, .. } if inputs.contains(&InputId(302))
     )));
 }
 
 #[test]
-fn coordinator_read_preflight_deduplicates_existing_record_views() {
+fn conversation_read_preflight_deduplicates_existing_record_views() {
     let mut kernel = Kernel::new(
         AgentLimits {
             item_bytes: 128,
@@ -2785,32 +2651,32 @@ fn coordinator_read_preflight_deduplicates_existing_record_views() {
             Input::new(InputId(401), "existing context input ".repeat(6)),
         )
         .unwrap();
-    let call = coordinate_call(&effects);
+    let call = converse_call(&effects);
     let effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call,
-            result: Ok(KernelDecision::Read(ReadQuery::Record {
+            result: Ok(ConversationStep::Read(ReadQuery::Record {
                 id: receipt.accepted_at,
                 offset: 0,
             })),
         },
     );
-    let (call, coordinate) = starts(&effects)
+    let (call, conversation) = starts(&effects)
         .find_map(|(call, effect)| match effect {
-            Call::Coordinate(input) => Some((call, input.clone())),
+            Call::Converse(input) => Some((call, input.clone())),
             _ => None,
         })
         .unwrap();
-    let full_size = serde_json::to_vec(&coordinate).unwrap().len();
+    let full_size = serde_json::to_vec(&conversation).unwrap().len();
     kernel.limits.context_bytes = full_size + 1;
     assert!(kernel.limits.validate().is_ok());
 
     let effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call,
-            result: Ok(KernelDecision::Read(ReadQuery::Record {
+            result: Ok(ConversationStep::Read(ReadQuery::Record {
                 id: receipt.accepted_at,
                 offset: 0,
             })),
@@ -2818,7 +2684,7 @@ fn coordinator_read_preflight_deduplicates_existing_record_views() {
     );
     let (_, projected) = starts(&effects)
         .find_map(|(call, effect)| match effect {
-            Call::Coordinate(input) => Some((call, input)),
+            Call::Converse(input) => Some((call, input)),
             _ => None,
         })
         .expect("the deduplicated projection fits");
@@ -2835,12 +2701,12 @@ fn coordinator_read_preflight_deduplicates_existing_record_views() {
         !kernel
             .records
             .values()
-            .any(|record| matches!(&record.body, RecordBody::InputRoutingFailed { .. }))
+            .any(|record| matches!(&record.body, RecordBody::ConversationFailed { .. }))
     );
 }
 
 #[test]
-fn coordinator_last_directory_page_accounts_for_null_cursor_bytes() {
+fn conversation_last_directory_page_accounts_for_null_cursor_bytes() {
     let mut kernel = Kernel::new(
         AgentLimits {
             item_bytes: 128,
@@ -2861,31 +2727,31 @@ fn coordinator_last_directory_page_accounts_for_null_cursor_bytes() {
     let (_, effects) = kernel
         .accept(NOW, Input::new(InputId(502), "read all roots"))
         .unwrap();
-    let call = coordinate_call(&effects);
+    let call = converse_call(&effects);
     let effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call,
-            result: Ok(KernelDecision::Read(ReadQuery::Jobs {
+            result: Ok(ConversationStep::Read(ReadQuery::Jobs {
                 parent: None,
                 after: None,
             })),
         },
     );
-    let (call, coordinate) = starts(&effects)
+    let (call, conversation) = starts(&effects)
         .find_map(|(call, effect)| match effect {
-            Call::Coordinate(input) => Some((call, input.clone())),
+            Call::Converse(input) => Some((call, input.clone())),
             _ => None,
         })
         .unwrap();
-    let full_size = serde_json::to_vec(&coordinate).unwrap().len();
+    let full_size = serde_json::to_vec(&conversation).unwrap().len();
     kernel.limits.context_bytes = full_size - 1;
 
     let effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call,
-            result: Ok(KernelDecision::Read(ReadQuery::Jobs {
+            result: Ok(ConversationStep::Read(ReadQuery::Jobs {
                 parent: None,
                 after: None,
             })),
@@ -2893,7 +2759,7 @@ fn coordinator_last_directory_page_accounts_for_null_cursor_bytes() {
     );
     let (call, projected) = starts(&effects)
         .find_map(|(call, effect)| match effect {
-            Call::Coordinate(input) => Some((call, input)),
+            Call::Converse(input) => Some((call, input)),
             _ => None,
         })
         .expect("the page falls back to one card");
@@ -2911,9 +2777,9 @@ fn coordinator_last_directory_page_accounts_for_null_cursor_bytes() {
 
     let effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call,
-            result: Ok(KernelDecision::Read(ReadQuery::Jobs {
+            result: Ok(ConversationStep::Read(ReadQuery::Jobs {
                 parent: None,
                 after: page.1,
             })),
@@ -2921,7 +2787,7 @@ fn coordinator_last_directory_page_accounts_for_null_cursor_bytes() {
     );
     let (_, projected) = starts(&effects)
         .find_map(|(call, effect)| match effect {
-            Call::Coordinate(input) => Some((call, input)),
+            Call::Converse(input) => Some((call, input)),
             _ => None,
         })
         .expect("the last card fits its final page");
@@ -2940,7 +2806,7 @@ fn coordinator_last_directory_page_accounts_for_null_cursor_bytes() {
         !kernel
             .records
             .values()
-            .any(|record| matches!(&record.body, RecordBody::InputRoutingFailed { .. }))
+            .any(|record| matches!(&record.body, RecordBody::ConversationFailed { .. }))
     );
     assert!(full_size > kernel.limits.item_bytes);
 }
@@ -2952,38 +2818,42 @@ fn a_new_input_supersedes_a_clarification_and_preserves_its_context() {
     let (_, effects) = kernel.accept(NOW, old.clone()).unwrap();
     kernel.step(
         NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(&effects),
-            result: Ok(KernelDecision::Clarify("which target?".into())),
+        Event::ConverseFinished {
+            call: converse_call(&effects),
+            result: Ok(ConversationStep::Ask {
+                inputs: vec![old.id],
+                question: "which target?".into(),
+            }),
         },
     );
 
     let new = Input::new(InputId(702), "new correction");
     let (_, effects) = kernel.accept(NOW, new.clone()).unwrap();
-    let (call, coordinate) = starts(&effects)
+    let (call, conversation) = starts(&effects)
         .find_map(|(call, effect)| match effect {
-            Call::Coordinate(input) => Some((call, input)),
+            Call::Converse(input) => Some((call, input)),
             _ => None,
         })
         .unwrap();
     assert_eq!(
-        coordinate
+        conversation
             .inputs
             .iter()
             .map(|input| input.id)
             .collect::<Vec<_>>(),
         vec![old.id, new.id]
     );
-    assert!(coordinate.records.iter().any(|view| matches!(
-        kernel.records[&view.source].body,
-        RecordBody::Clarification { .. }
-    )));
+    assert!(
+        serde_json::to_string(&conversation.background)
+            .unwrap()
+            .contains("which target?")
+    );
 
     let effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call,
-            result: Ok(route_new("handle corrected request", &[old.id, new.id])),
+            result: Ok(start_jobs("handle corrected request", &[old.id, new.id])),
         },
     );
     assert!(starts(&effects).any(|(_, call)| matches!(call, Call::Work(_))));
@@ -3084,7 +2954,7 @@ fn parent_finish_waits_until_an_unknown_descendant_write_is_resolved() {
 }
 
 #[test]
-fn coordinator_initial_directory_accounts_for_null_cursor_bytes() {
+fn conversation_initial_directory_accounts_for_null_cursor_bytes() {
     let mut kernel = Kernel::new(
         AgentLimits {
             item_bytes: 128,
@@ -3105,57 +2975,22 @@ fn coordinator_initial_directory_accounts_for_null_cursor_bytes() {
     let (_, effects) = kernel
         .accept(NOW, Input::new(InputId(602), "show the root directory"))
         .unwrap();
-    let coordinate = starts(&effects)
+    let conversation = starts(&effects)
         .find_map(|(_, effect)| match effect {
-            Call::Coordinate(input) => Some(input.clone()),
+            Call::Converse(input) => Some(input.clone()),
             _ => None,
         })
         .unwrap();
-    assert_eq!(coordinate.jobs.len(), 2);
-    assert_eq!(coordinate.next_job, None);
-    let full_size = serde_json::to_vec(&coordinate).unwrap().len();
+    assert_eq!(conversation.jobs.len(), 2);
+    assert_eq!(conversation.next_job, None);
+    let full_size = serde_json::to_vec(&conversation).unwrap().len();
     kernel.limits.context_bytes = full_size - 1;
 
-    let projected = context::prepare_coordinate(&kernel, coordinate.routing)
+    let projected = context::prepare_conversation(&kernel)
         .expect("the initial directory falls back to one card");
     assert!(serde_json::to_vec(&projected).unwrap().len() <= kernel.limits.context_bytes);
     assert_eq!(projected.jobs.len(), 1);
     assert_eq!(projected.next_job, Some(projected.jobs[0].id));
-}
-
-#[test]
-fn router_rejects_empty_and_duplicate_input_assignments_without_partial_state() {
-    for decision in [
-        KernelDecision::Assign(Vec::new()),
-        KernelDecision::Assign(vec![
-            RouteDelivery {
-                inputs: vec![InputId(901)],
-                target: RouteTarget::New,
-                handoff: "first".into(),
-            },
-            RouteDelivery {
-                inputs: vec![InputId(901)],
-                target: RouteTarget::New,
-                handoff: "duplicate".into(),
-            },
-        ]),
-    ] {
-        let mut kernel = kernel();
-        let input = Input::new(InputId(901), "route me exactly once");
-        let (_, effects) = kernel.accept(NOW, input.clone()).unwrap();
-        kernel.step(
-            NOW,
-            Event::CoordinateFinished {
-                call: coordinate_call(&effects),
-                result: Ok(decision),
-            },
-        );
-        assert!(kernel.jobs.is_empty());
-        assert!(matches!(
-            input_status(&kernel, input.id),
-            InputStatus::RoutingFailed { .. }
-        ));
-    }
 }
 
 #[test]
@@ -3172,81 +3007,30 @@ fn assigned_input_stays_open_until_its_responsible_root_finishes() {
     assert_eq!(input_status(&kernel, input.id), InputStatus::Handled);
     work(&mut kernel, call, WorkStep::Finish(Completion::new("done")));
     assert!(finished_as(&kernel, worker.job, OutcomeKind::Completed));
-    assert_eq!(
-        input_status(&kernel, input.id),
-        InputStatus::Finished(InputOutcome::Completed)
-    );
+    assert_eq!(input_status(&kernel, input.id), InputStatus::Handled);
 }
 
 #[test]
-fn user_worker_updates_constraints_with_delivered_input_and_revision() {
-    let mut kernel = kernel();
-    let original = Input::new(InputId(903), "start the task");
-    let (_, root) = create_roots(
-        &mut kernel,
-        original.clone(),
-        vec![assignment("root", &[original.id])],
-    )
-    .pop()
-    .unwrap();
-
-    let update = Input::new(InputId(904), "all further work must be read-only");
-    let (_, effects) = kernel.accept(NOW, update.clone()).unwrap();
-    let effects = kernel.step(
-        NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(&effects),
-            result: Ok(KernelDecision::Assign(vec![RouteDelivery {
-                inputs: vec![update.id],
-                target: RouteTarget::Existing(root.job),
-                handoff: "apply the user's new constraint".into(),
-            }])),
-        },
-    );
-    let (call, worker) = work_calls(&effects)
-        .into_iter()
-        .find(|(_, worker)| worker.job == root.job)
-        .unwrap();
-    assert_eq!(worker.constraints_revision, 0);
-    let effects = work(
-        &mut kernel,
-        call,
-        WorkStep::UpdateConstraints {
-            source: update.id,
-            expected_revision: worker.constraints_revision,
-            constraints: "read-only work only".into(),
-        },
-    );
-    assert_eq!(kernel.constraints, "read-only work only");
-    assert_eq!(kernel.constraints_revision, 1);
-    assert!(work_calls(&effects).iter().any(|(_, worker)| {
-        worker.job == root.job
-            && worker.constraints == "read-only work only"
-            && worker.constraints_revision == 1
-    }));
-}
-
-#[test]
-fn routed_inputs_are_delivered_in_acceptance_order_even_if_router_reverses_them() {
+fn assigned_inputs_are_delivered_in_acceptance_order_even_if_model_reverses_them() {
     let mut kernel = kernel();
     let old = Input::new(InputId(905), "original request");
     let (_, old_effects) = kernel.accept(NOW, old.clone()).unwrap();
-    let old_call = coordinate_call(&old_effects);
+    let old_call = converse_call(&old_effects);
     let new = Input::new(InputId(906), "newer correction");
     kernel.accept(NOW, new.clone()).unwrap();
     let effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call: old_call,
-            result: Ok(route_new("stale result", &[old.id])),
+            result: Ok(start_jobs("stale result", &[old.id])),
         },
     );
-    let current = coordinate_call(&effects);
+    let current = converse_call(&effects);
     let effects = kernel.step(
         NOW,
-        Event::CoordinateFinished {
+        Event::ConverseFinished {
             call: current,
-            result: Ok(route_new("review both", &[new.id, old.id])),
+            result: Ok(start_jobs("review both", &[new.id, old.id])),
         },
     );
     let (_, worker) = work_calls(&effects).pop().unwrap();
@@ -3264,7 +3048,7 @@ fn routed_inputs_are_delivered_in_acceptance_order_even_if_router_reverses_them(
 }
 
 #[test]
-fn router_rejects_a_paused_existing_root_instead_of_stranding_the_input() {
+fn conversation_rejects_a_paused_existing_root_instead_of_stranding_the_input() {
     let mut kernel = kernel();
     let original = Input::new(InputId(907), "pause this root");
     let (_, root) = create_roots(
@@ -3278,193 +3062,13 @@ fn router_rejects_a_paused_existing_root_instead_of_stranding_the_input() {
 
     let update = Input::new(InputId(908), "continue the paused work");
     let (_, effects) = kernel.accept(NOW, update.clone()).unwrap();
-    route_existing(&mut kernel, &effects, root.job, &[update.id]);
-    assert!(matches!(
-        input_status(&kernel, update.id),
-        InputStatus::RoutingFailed { .. }
-    ));
-    assert!(!kernel.inputs[&update.id].required_jobs.contains(&root.job));
-}
-
-#[test]
-fn routed_input_stays_a_global_commit_barrier_until_a_worker_reviews_it() {
-    let tool = ToolSpec {
-        name: "write".into(),
-        description: "write once".into(),
-        parameters: json!({ "type": "object" }),
-        effect: ToolEffect::ExternalWrite,
-    };
-    let mut kernel = kernel_with(tool);
-    let original = Input::new(InputId(909), "prepare a write");
-    let (writer_call, _) = create_roots(
-        &mut kernel,
-        original.clone(),
-        vec![assignment("writer", &[original.id])],
-    )
-    .pop()
-    .unwrap();
-
-    let update = Input::new(InputId(910), "do not write anything");
-    let (_, routing_effects) = kernel.accept(NOW, update.clone()).unwrap();
-    let blocked = work(
-        &mut kernel,
-        writer_call,
-        WorkStep::Tool(ToolCall::new("write", json!({}))),
-    );
-    assert!(!starts(&blocked).any(|(_, call)| matches!(call, Call::Tool(_))));
-
-    let routed = kernel.step(
-        NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(&routing_effects),
-            result: Ok(route_new("review the constraint", &[update.id])),
-        },
-    );
-    assert!(!starts(&routed).any(|(_, call)| matches!(call, Call::Tool(_))));
-    let (review_call, review) = work_calls(&routed).pop().unwrap();
-    let refused = work(&mut kernel, review_call, WorkStep::delegate(vec![]));
-    assert_eq!(
-        kernel.inputs[&update.id].pending_review_by,
-        Some(review.job)
-    );
-    assert!(!starts(&refused).any(|(_, call)| matches!(call, Call::Tool(_))));
-    let (review_call, retry) = work_calls(&refused).pop().unwrap();
-    assert_eq!(retry.job, review.job);
-    let effects = work(
-        &mut kernel,
-        review_call,
-        WorkStep::UpdateConstraints {
-            source: update.id,
-            expected_revision: review.constraints_revision,
-            constraints: "do not write".into(),
-        },
-    );
-    assert_eq!(kernel.constraints, "do not write");
-    assert!(!starts(&effects).any(|(_, call)| matches!(call, Call::Tool(_))));
-}
-
-#[test]
-fn failed_first_worker_review_keeps_the_commit_barrier_and_can_be_retried() {
-    let tool = ToolSpec {
-        name: "write".into(),
-        description: "write once".into(),
-        parameters: json!({ "type": "object" }),
-        effect: ToolEffect::ExternalWrite,
-    };
-    let mut kernel = kernel_with(tool);
-    let original = Input::new(InputId(913), "prepare a write");
-    let (writer_call, _) = create_roots(
-        &mut kernel,
-        original.clone(),
-        vec![assignment("writer", &[original.id])],
-    )
-    .pop()
-    .unwrap();
-
-    let update = Input::new(InputId(914), "do not write anything");
-    let (_, routing_effects) = kernel.accept(NOW, update.clone()).unwrap();
-    let blocked = work(
-        &mut kernel,
-        writer_call,
-        WorkStep::Tool(ToolCall::new("write", json!({}))),
-    );
-    assert!(!starts(&blocked).any(|(_, call)| matches!(call, Call::Tool(_))));
-
-    let routed = kernel.step(
-        NOW,
-        Event::CoordinateFinished {
-            call: coordinate_call(&routing_effects),
-            result: Ok(route_new("review the constraint", &[update.id])),
-        },
-    );
-    let (review_call, review) = work_calls(&routed).pop().unwrap();
-    let effects = kernel.step(
-        NOW,
-        Event::WorkFinished {
-            call: review_call,
-            result: Err(crate::CallError::failed("worker model timed out")),
-        },
-    );
-
-    assert!(finished_as(&kernel, review.job, OutcomeKind::Failed));
-    assert!(matches!(
-        input_status(&kernel, update.id),
-        InputStatus::RoutingFailed { .. }
-    ));
+    send_existing(&mut kernel, &effects, root.job, &[update.id]);
     assert!(
-        !kernel.inputs[&update.id]
-            .required_jobs
-            .contains(&review.job)
+        kernel
+            .records
+            .values()
+            .any(|record| matches!(&record.body, RecordBody::ConversationRejected { .. }))
     );
-    assert!(!starts(&effects).any(|(_, call)| matches!(call, Call::Tool(_))));
-
-    let (_, retry_effects) = kernel.control(NOW, KernelControl::Retry(update.id));
-    assert!(starts(&retry_effects).any(|(_, call)| matches!(call, Call::Coordinate(_))));
-    assert!(!starts(&retry_effects).any(|(_, call)| matches!(call, Call::Tool(_))));
-}
-
-#[test]
-fn cancelling_a_worker_before_its_first_review_cancels_the_input_without_a_stale_barrier() {
-    let mut kernel = kernel();
-    let input = Input::new(InputId(915), "a request that will be cancelled");
-    let (call, worker) = create_roots(
-        &mut kernel,
-        input.clone(),
-        vec![assignment("worker", &[input.id])],
-    )
-    .pop()
-    .unwrap();
-    assert!(kernel.inputs[&input.id].pending_review_by == Some(worker.job));
-
-    let (_, effects) = kernel.control(NOW, KernelControl::Cancel(worker.job));
-
-    assert!(
-        effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::Cancel(id) if *id == call))
-    );
-    assert_eq!(
-        input_status(&kernel, input.id),
-        InputStatus::Finished(InputOutcome::Cancelled)
-    );
-    assert!(kernel.inputs[&input.id].pending_review_by.is_none());
-}
-
-#[test]
-fn delegated_worker_cannot_update_session_constraints() {
-    let mut kernel = kernel();
-    let input = Input::new(InputId(911), "delegate safely");
-    let (parent_call, parent) = create_roots(
-        &mut kernel,
-        input.clone(),
-        vec![assignment("parent", &[input.id])],
-    )
-    .pop()
-    .unwrap();
-    let effects = work(
-        &mut kernel,
-        parent_call,
-        WorkStep::delegate(vec![assignment("child", &[input.id])]),
-    );
-    let (child_call, child) = work_calls(&effects)
-        .into_iter()
-        .find(|(_, worker)| worker.job != parent.job)
-        .unwrap();
-    work(
-        &mut kernel,
-        child_call,
-        WorkStep::UpdateConstraints {
-            source: input.id,
-            expected_revision: child.constraints_revision,
-            constraints: "unauthorized".into(),
-        },
-    );
-    assert!(kernel.constraints.is_empty());
-    assert!(!matches!(
-        kernel.job_status(child.job),
-        JobStatus::Finished(_)
-    ));
-    assert_eq!(kernel.jobs[&child.job].work_rejections.total, 1);
 }
 
 #[test]
@@ -3533,6 +3137,14 @@ fn kernel_with_session_history() -> Kernel {
                 }),
             },
         );
+        converse_step(
+            &mut kernel,
+            ConversationStep::Reply {
+                inputs: vec![input.id],
+                text: "done".into(),
+                outcome: InputOutcome::Completed,
+            },
+        );
     }
     kernel
 }
@@ -3577,12 +3189,13 @@ fn session_compaction_is_public_bounded_and_does_not_complete_pending_inputs() {
         assert!(kernel.inputs[&current.id].finished.is_none());
     }
     assert!(compactions > 0);
-    let (_, Call::Coordinate(coordinate)) = starts(&effects).next().expect("router resumes") else {
-        panic!("expected router");
+    let (_, Call::Converse(conversation)) = starts(&effects).next().expect("conversation resumes")
+    else {
+        panic!("expected conversation");
     };
-    assert_eq!(coordinate.inputs, vec![current]);
+    assert_eq!(conversation.inputs, vec![current]);
     assert!(
-        coordinate
+        conversation
             .background
             .entries
             .iter()
@@ -3623,7 +3236,7 @@ fn combined_worker_budget_compacts_session_when_job_has_no_read_prefix() {
     };
     assert_eq!(compact.scope, crate::CompactScope::Session);
     assert_eq!(kernel.jobs[&worker.job].context.read_through, Seq::ZERO);
-    assert!(kernel.inputs[&input.id].pending_review_by.is_some());
+    assert!(!kernel.inputs[&input.id].pending);
 }
 
 #[test]
@@ -3650,7 +3263,7 @@ fn invalid_session_checkpoint_fails_once_and_keeps_raw_history() {
     assert!(kernel.records.contains_key(&source));
     assert!(matches!(
         input_status(&kernel, input.id),
-        InputStatus::RoutingFailed { .. }
+        InputStatus::ConversationFailed { .. }
     ));
     assert!(kernel.inputs[&input.id].finished.is_none());
 }
@@ -3700,8 +3313,8 @@ fn session_projection_includes_root_publication_but_not_child_publication() {
     let (_, effects) = kernel
         .accept(NOW, Input::new(InputId(9011), "new independent input"))
         .unwrap();
-    let (_, Call::Coordinate(input)) = starts(&effects)
-        .find(|(_, call)| matches!(call, Call::Coordinate(_)))
+    let (_, Call::Converse(input)) = starts(&effects)
+        .find(|(_, call)| matches!(call, Call::Converse(_)))
         .unwrap()
     else {
         unreachable!()
@@ -3728,11 +3341,19 @@ fn session_projection_keeps_a_root_direct_finish() {
         WorkStep::Finish(Completion::new("ROOT_DIRECT_CONCLUSION")),
     );
 
+    converse_step(
+        &mut kernel,
+        ConversationStep::Reply {
+            inputs: vec![input.id],
+            text: "done".into(),
+            outcome: InputOutcome::Completed,
+        },
+    );
     let (_, effects) = kernel
         .accept(NOW, Input::new(InputId(9013), "what happened before?"))
         .unwrap();
-    let (_, Call::Coordinate(input)) = starts(&effects)
-        .find(|(_, call)| matches!(call, Call::Coordinate(_)))
+    let (_, Call::Converse(input)) = starts(&effects)
+        .find(|(_, call)| matches!(call, Call::Converse(_)))
         .unwrap()
     else {
         unreachable!()
@@ -3790,8 +3411,8 @@ fn summarizing_a_pending_review_input_never_acknowledges_it() {
     let second = Input::new(InputId(9031), "second requirement ".repeat(50));
     let mut preview = kernel.clone();
     let (_, effects) = preview.accept(NOW, second.clone()).unwrap();
-    let (_, Call::Coordinate(coordinate)) = starts(&effects)
-        .find(|(_, call)| matches!(call, Call::Coordinate(_)))
+    let (_, Call::Converse(conversation)) = starts(&effects)
+        .find(|(_, call)| matches!(call, Call::Converse(_)))
         .unwrap()
     else {
         unreachable!()
@@ -3799,12 +3420,12 @@ fn summarizing_a_pending_review_input_never_acknowledges_it() {
     let mut limits = kernel.limits.clone();
     // Force the mandatory public background itself over budget. Directory
     // cards are pageable and must not be what makes this request overflow.
-    let mut mandatory = coordinate.clone();
+    let mut mandatory = conversation.clone();
     mandatory.jobs.clear();
     mandatory.next_job = None;
     mandatory.background = std::sync::Arc::new(SessionContext::default());
     let mandatory_bytes = serde_json::to_vec(&mandatory).unwrap().len();
-    let background_bytes = serde_json::to_vec(&coordinate.background).unwrap().len();
+    let background_bytes = serde_json::to_vec(&conversation.background).unwrap().len();
     limits.context_bytes = mandatory_bytes + background_bytes / 2;
     limits.item_bytes = 512;
     kernel.limits = limits;
@@ -3823,7 +3444,7 @@ fn summarizing_a_pending_review_input_never_acknowledges_it() {
             }),
         },
     );
-    assert_eq!(kernel.inputs[&first.id].pending_review_by, Some(owner.job));
+    assert!(!kernel.inputs[&first.id].pending);
     assert!(kernel.inputs[&first.id].finished.is_none());
     assert_eq!(kernel.jobs[&owner.job].context.read_through, Seq::ZERO);
     assert!(kernel.inputs[&second.id].finished.is_none());

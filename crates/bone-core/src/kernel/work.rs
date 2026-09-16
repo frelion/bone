@@ -22,11 +22,6 @@ impl Kernel {
             .consecutive = 0;
 
         let (seen_through, _) = call_entry.work_context();
-        for input in self.inputs.values_mut() {
-            if input.pending_review_by == Some(job) && input.accepted_at <= seen_through {
-                input.pending_review_by = None;
-            }
-        }
         if let Some(entry) = self.jobs.get_mut(&job) {
             entry.context.read_through = entry.context.read_through.max(seen_through);
         }
@@ -162,11 +157,14 @@ impl Kernel {
                     return Err("tool arguments must be an object".into());
                 }
                 self.validate_model_item("tool call", tool)?;
-                let Some(spec) = self.tools.get(&tool.name) else {
+                let Some(_) = self.tools.get(&tool.name) else {
                     return Err(format!("unknown tool: {}", tool.name));
                 };
-                if spec.effect == ToolEffect::ExternalWrite && self.is_investigation(job) {
-                    return Err("routing investigations may use only read-only tools".into());
+                if !self.jobs[&job].allowed_tools.contains(&tool.name) {
+                    return Err(format!(
+                        "job {job} is not authorized to use tool: {}",
+                        tool.name
+                    ));
                 }
                 Ok(())
             }
@@ -176,19 +174,21 @@ impl Kernel {
                 &delegation.assignments,
             ),
             WorkStep::Wait(wait) => self.validate_wait(job, wait),
-            WorkStep::AskUser(question) => {
-                let has_reply_key = self.jobs[&job]
-                    .inputs
-                    .iter()
-                    .any(|input| self.inputs[input].finished.is_none());
-                if question.trim().is_empty()
-                    || !matches!(self.jobs[&job].owner, Owner::User)
-                    || !has_reply_key
-                {
-                    return Err("only a user-owned job may ask a non-empty user question".into());
+            WorkStep::NeedInput(question) => {
+                if question.trim().is_empty() {
+                    return Err("question must not be empty".into());
                 }
-                self.validate_model_item("user question", question)?;
-                Ok(())
+                self.validate_model_item("job question", question)
+            }
+            WorkStep::Respond {
+                job: target,
+                question,
+                message,
+            } => {
+                if self.jobs.get(target).is_none_or(|entry| entry.owner != Owner::Job(job) || !matches!(entry.state, JobState::Waiting(WaitState::User { question: expected }) if expected == *question)) {
+                    return Err("respond requires the exact pending question of an owned child".into());
+                }
+                self.validate_model_item("job response", message)
             }
             WorkStep::Inquire {
                 job: target,
@@ -207,7 +207,7 @@ impl Kernel {
                 job: target,
                 action: _,
             } => {
-                if self.is_investigation(job) || *target == job || !self.owns(job, *target) {
+                if *target == job || !self.owns(job, *target) {
                     Err("a worker may control only its active child tree".into())
                 } else if self
                     .jobs
@@ -219,33 +219,8 @@ impl Kernel {
                     Ok(())
                 }
             }
-            WorkStep::UpdateConstraints {
-                source,
-                expected_revision,
-                constraints,
-            } => {
-                let valid_source = self.jobs[&job].inputs.contains(source)
-                    && self
-                        .inputs
-                        .get(source)
-                        .is_some_and(|input| input.finished.is_none());
-                if !matches!(self.jobs[&job].owner, Owner::User)
-                    || !valid_source
-                    || *expected_revision != self.constraints_revision
-                {
-                    return Err("constraint update lacks current user authority".into());
-                }
-                self.validate_model_item("session constraints", constraints)
-            }
             WorkStep::Read(query) => self.validate_read(DeliveryTarget::Job(job), query),
             WorkStep::PublishResult(report) => self.validate_report(job, report),
-            WorkStep::Reply(text) => {
-                if text.trim().is_empty() || !matches!(self.jobs[&job].owner, Owner::User) {
-                    Err("only a user-owned job may send a non-empty reply".into())
-                } else {
-                    self.validate_model_item("reply", text)
-                }
-            }
             WorkStep::Finish(completion) | WorkStep::Fail(completion) => {
                 self.validate_completion(job, completion)
             }
@@ -351,11 +326,10 @@ impl Kernel {
         let unread = self.has_unread_required(job);
         let stale_sensitive = match &pending.step {
             WorkStep::Delegate(_)
-            | WorkStep::AskUser(_)
-            | WorkStep::Reply(_)
+            | WorkStep::NeedInput(_)
             | WorkStep::Finish(_)
             | WorkStep::ControlOwned { .. }
-            | WorkStep::UpdateConstraints { .. } => true,
+            | WorkStep::Respond { .. } => true,
             WorkStep::Tool(tool) => self.tools[&tool.name].effect == ToolEffect::ExternalWrite,
             _ => false,
         };
@@ -408,19 +382,32 @@ impl Kernel {
                 }
             }
             WorkStep::Wait(wait) => self.install_wait(now, job, wait, effects),
-            WorkStep::AskUser(question) => {
-                let another_question = self.user_question.is_some_and(|owner| owner != job);
-                if self.has_open_input_routing() && self.user_question == Some(job) {
-                    debug_assert!(matches!(
-                        self.jobs[&job].state,
-                        JobState::Waiting(WaitState::User { .. })
-                    ));
-                } else if another_question || self.has_open_input_routing() {
-                    self.jobs.get_mut(&job).expect("job exists").state =
-                        JobState::Waiting(WaitState::Commit(pending));
-                } else {
-                    self.ask_user(job, question, effects);
+            WorkStep::NeedInput(question) => self.need_input(job, question, effects),
+            WorkStep::Respond {
+                job: target,
+                question,
+                message,
+            } => {
+                if !matches!(self.jobs[&target].state, JobState::Waiting(WaitState::User { question: expected }) if expected == question)
+                {
+                    self.make_ready(job);
+                    return;
                 }
+                let record = self.record(
+                    Origin::Job {
+                        job,
+                        revision: self.jobs[&job].revision,
+                    },
+                    RecordBody::JobMessage {
+                        job: target,
+                        inputs: Vec::new(),
+                        text: message,
+                    },
+                    effects,
+                );
+                self.attach(target, record.seq);
+                self.make_ready(target);
+                self.make_ready(job);
             }
             WorkStep::Inquire {
                 job: target,
@@ -443,39 +430,6 @@ impl Kernel {
                 }
                 self.make_ready(job);
             }
-            WorkStep::UpdateConstraints {
-                source,
-                expected_revision: _,
-                constraints,
-            } => {
-                if self.constraints != constraints {
-                    self.constraints = constraints.clone();
-                    self.constraints_revision += 1;
-                    let changed = self.record(
-                        Origin::Call(pending.call),
-                        RecordBody::ConstraintsChanged {
-                            source,
-                            revision: self.constraints_revision,
-                            constraints,
-                        },
-                        effects,
-                    );
-                    self.attach(job, changed.seq);
-                    let jobs = self
-                        .jobs
-                        .iter()
-                        .filter_map(|(id, entry)| {
-                            (!matches!(entry.state, JobState::Finished(_))).then_some(*id)
-                        })
-                        .collect::<Vec<_>>();
-                    for active in jobs {
-                        self.invalidate_job_calls(active, effects);
-                        self.enqueue_job(active);
-                    }
-                } else {
-                    self.make_ready(job);
-                }
-            }
             WorkStep::Read(query) => match self.read(DeliveryTarget::Job(job), query, effects) {
                 Ok(()) => {
                     if matches!(self.jobs[&job].state, JobState::Ready) {
@@ -496,24 +450,6 @@ impl Kernel {
                 self.wake_result_waiters(job, record.seq, effects);
                 if matches!(self.jobs[&job].state, JobState::Ready) {
                     self.enqueue_job(job);
-                }
-            }
-            WorkStep::Reply(text) => {
-                if self.has_open_input_routing() {
-                    self.jobs.get_mut(&job).expect("job exists").state =
-                        JobState::Waiting(WaitState::Commit(pending));
-                } else {
-                    let inputs = self.jobs[&job].inputs.clone();
-                    let reply = self.record(
-                        Origin::Job {
-                            job,
-                            revision: self.jobs[&job].revision,
-                        },
-                        RecordBody::Reply { job, inputs, text },
-                        effects,
-                    );
-                    self.attach(job, reply.seq);
-                    self.make_ready(job);
                 }
             }
             WorkStep::Finish(completion) => {
@@ -559,11 +495,6 @@ impl Kernel {
                             .is_some_and(|entry| matches!(entry.state, JobState::Finished(_)))
                 }
                 WaitState::Inquiry(inquiry) => !self.inquiries.contains_key(inquiry),
-                WaitState::Coordination(routing) => {
-                    self.routings.get(routing).is_none_or(|route| {
-                        matches!(route.state, RoutingState::Closed | RoutingState::Failed(_))
-                    })
-                }
                 WaitState::User { .. } | WaitState::Commit(_) => false,
             },
         }
@@ -580,7 +511,7 @@ impl Kernel {
         let blocked = self.running_tools() >= self.limits.tool_slots
             || self.job_has_running_tool(job)
             || (spec.effect == ToolEffect::ExternalWrite
-                && (self.has_open_input_routing() || self.has_unresolved_write()));
+                && (self.has_pending_input() || self.has_unresolved_write()));
         if blocked {
             self.jobs.get_mut(&job).expect("job exists").state =
                 JobState::Waiting(WaitState::Commit(pending));
@@ -696,7 +627,7 @@ impl Kernel {
     }
 
     fn finish_blocked(&self, job: JobId) -> bool {
-        (!self.is_investigation(job) && self.has_open_input_routing())
+        self.has_pending_input()
             || self.has_unread_required(job)
             || self.inquiries.values().any(|inquiry| inquiry.target == job)
             || self.job_has_running_tool(job)
@@ -706,7 +637,7 @@ impl Kernel {
             || self.subtree_has_unresolved_write(job)
     }
 
-    fn subtree_has_unresolved_write(&self, root: JobId) -> bool {
+    pub(super) fn subtree_has_unresolved_write(&self, root: JobId) -> bool {
         self.calls.values().any(|call| {
             call.job().is_some_and(|job| self.owns(root, job))
                 && call.tool_effect() == Some(ToolEffect::ExternalWrite)
@@ -727,28 +658,6 @@ impl Kernel {
             .is_none_or(|entry| matches!(entry.state, JobState::Finished(_)))
         {
             return;
-        }
-        match kind {
-            OutcomeKind::Failed => {
-                self.fail_pending_reviews(job, completion.summary.clone(), effects)
-            }
-            OutcomeKind::Cancelled => self.clear_pending_reviews(job),
-            OutcomeKind::Completed => {
-                if self
-                    .inputs
-                    .values()
-                    .any(|input| input.pending_review_by == Some(job))
-                {
-                    self.fail_pending_reviews(
-                        job,
-                        "worker completed before reviewing its assigned input".into(),
-                        effects,
-                    );
-                }
-            }
-        }
-        if self.user_question == Some(job) {
-            self.user_question = None;
         }
         if kind != OutcomeKind::Completed {
             let children = self.children_of(job).collect::<Vec<_>>();
@@ -804,7 +713,10 @@ impl Kernel {
         self.jobs.get_mut(&job).expect("job exists").active_call = None;
 
         match owner {
-            Owner::User => {}
+            Owner::User => {
+                self.conversation.records.push(record.seq);
+                self.conversation.ready = true;
+            }
             Owner::Job(parent) => {
                 self.deliver(
                     DeliveryTarget::Job(parent),
@@ -821,12 +733,6 @@ impl Kernel {
                     self.make_ready(parent);
                 }
             }
-            Owner::Routing(routing) => self.deliver(
-                DeliveryTarget::Routing(routing),
-                record.seq,
-                DeliveryKind::Outcome,
-                effects,
-            ),
         }
         self.wake_job_waiters(job, effects);
     }
@@ -948,7 +854,6 @@ impl Kernel {
         ) {
             self.jobs.get_mut(&job).expect("job exists").state = JobState::Ready;
         }
-        self.invalidate_job_routings(job, effects);
     }
 
     pub(super) fn invalidate_job_calls(&mut self, job: JobId, effects: &mut Vec<Effect>) {
@@ -982,10 +887,7 @@ impl Kernel {
             .values()
             .any(|call| matches!(call.state, CallState::Running))
             || !self.inquiries.is_empty()
-            || self
-                .routings
-                .values()
-                .any(|routing| !matches!(routing.state, RoutingState::Closed))
+            || self.conversation.active_call.is_some()
             || self
                 .jobs
                 .values()
@@ -1010,14 +912,9 @@ impl Kernel {
                 effects,
             );
         }
-        for routing in self.routings.values_mut() {
-            if !matches!(routing.state, RoutingState::Closed) {
-                routing.state = RoutingState::Closed;
-                routing.active_call = None;
-            }
-        }
-        self.user_question = None;
-        self.routing_ready.clear();
+        self.conversation.active_call = None;
+        self.conversation.question = None;
+        self.conversation.ready = false;
         self.interactive_ready.clear();
         self.background_ready.clear();
         let roots = self
@@ -1052,6 +949,7 @@ impl Kernel {
                 effects,
             );
         }
+        self.conversation.ready = false;
         self.record(Origin::Kernel, RecordBody::Stopped, effects);
         true
     }

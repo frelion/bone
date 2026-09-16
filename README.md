@@ -1,6 +1,6 @@
 # BONE
 
-BONE 是一个用 Rust 编写的 coding agent。当前 workspace 包含可信执行内核、基础设施适配器、headless 应用层和终端界面。
+BONE 是一个用 Rust 编写的 coding agent。一个内核管理持续会话与执行 Job：Kernel model 负责理解和回应用户，Worker model 在固定工具权限内执行任务。当前 workspace 包含可信执行内核、基础设施适配器、headless 应用层和终端界面。
 
 ```text
 future desktop / web / automation
@@ -59,8 +59,10 @@ bone run \
   --result ./artifacts/bone-result.json
 ```
 
-也可以用 `--prompt-file issue.md` 从文件读取任务。headless 模式默认允许修改
-workspace；只做调查时加 `--read-only`。`bone run` 不读取 API-key 环境变量；API key
+也可以用 `--prompt-file issue.md` 从文件读取任务。交互界面和 headless 使用相同的
+Job 工具授权：普通任务默认可使用全部已注册工具；只做调查时，在请求中说明
+“只读分析，不要修改”。会话模型提出限制，Core 创建权限固定的 Job，并在每次工具
+调用前校验授权。`bone run` 不读取 API-key 环境变量；API key
 必须已经由 TUI 保存，或通过 stdin 交给 `bone credentials set`，最终写入
 `$BONE_HOME/credentials.toml`（默认 `~/.bone/credentials.toml`）。
 运行 `bone run --help` 可查看 provider、自定义 HTTPS endpoint、项目配置授权、超时和
@@ -102,7 +104,7 @@ Runtime 配置按以下顺序解析：
 Session override > Project override > User setting
 ```
 
-`App::update_config` 保存一项类型化变更，并等待所有受影响的已打开 Session 处理它。面向前端的 `ConfigChange::Model` 会校验模型选择，并在一个事务中同时选择 worker/coordinator；ChatGPT 还会先检查缓存登录，需要授权时不会覆盖原选择。配置有效时，运行中的 Agent 保留 Runtime ID、Job 图和在途工具，撤销旧模型提交资格并使用新端口继续；其他配置无法装配时，Session 暂停新执行并暴露可匹配的问题，直到配置或凭据修复。
+`App::update_config` 校验并保存一项类型化变更，然后把最新 desired 配置通知给受影响的已打开 Session；它不等待模型连接或网络认证。面向前端的 `ConfigChange::Model` 会在一个事务中同时选择 worker/coordinator。运行中的 Session 异步装配新端口，期间保留 Runtime ID、Job 图和在途工具；旧模型调用失去提交资格并在新模型上重新调度，已经开始的工具继续收尾。装配失败时 Session 保持暂停并暴露可匹配的问题，直到配置或凭据修复。
 
 ## 持久化边界
 

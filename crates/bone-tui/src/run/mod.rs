@@ -68,7 +68,6 @@ pub async fn run() -> Result<(), RunError> {
         })?;
     let app = App::open(app_options).await?;
     let workspace = app.open_workspace(launch.workspace).await?;
-    let project_config = app.project_config_status(workspace.id).await?;
     let overview = app.workspace_overview(workspace.id).await?;
     let last_active = app.last_active_session(workspace.id).await?;
     let model_facts = models::ModelFacts::from(app.resolved_workspace_config(workspace.id).await?);
@@ -93,19 +92,6 @@ pub async fn run() -> Result<(), RunError> {
             model_facts,
         },
     ));
-    if project_config.exists && !project_config.trusted {
-        let changes = summarize_project_config(&project_config.overrides);
-        effects.extend(update(
-            &mut state,
-            UiEvent::ConfigOperationFinished {
-                action: "Project configuration",
-                error: Some(format!(
-                    "not trusted ({changes}); review .bone/config.toml and run /trust-config to confirm"
-                )),
-            },
-        ));
-    }
-
     // Install process signal handlers before changing terminal modes. Registering inside
     // the spawned forwarding tasks leaves a window where the OS default action
     // can terminate the process without allowing `TerminalSession` to restore.
@@ -123,6 +109,8 @@ pub async fn run() -> Result<(), RunError> {
     let mut draft_ticker = tokio::time::interval(Duration::from_millis(500));
     draft_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     draft_ticker.tick().await;
+    let mut activity_ticker = tokio::time::interval(Duration::from_millis(120));
+    activity_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let caret_sleep = tokio::time::sleep(CARET_PHASE);
     tokio::pin!(caret_sleep);
     let mut frame_snapshot = None;
@@ -193,9 +181,20 @@ pub async fn run() -> Result<(), RunError> {
             }
         }
         if shutdown {
+            if let Err(error) = terminal.restore() {
+                record_shutdown_error(&mut shutdown_error, error.to_string());
+            }
             loop {
                 let result = wait_for_draft_flush(
-                    runtime.flush_drafts(&mut state),
+                    async {
+                        #[cfg(debug_assertions)]
+                        match std::env::var("BONE_TUI_TEST_EXIT_DRAFT").as_deref() {
+                            Ok("fail") => return Err("injected draft failure".into()),
+                            Ok("pending") => return std::future::pending().await,
+                            _ => {}
+                        }
+                        runtime.flush_drafts(&mut state).await
+                    },
                     &mut process_signals,
                     &panic_signal,
                     !panic_handled,
@@ -219,26 +218,10 @@ pub async fn run() -> Result<(), RunError> {
                 }
                 match result {
                     FlushWait::Completed(Ok(())) => break 'run,
-                    FlushWait::Completed(Err(_)) if !termination_received => {
-                        shutdown = false;
-                        state.quitting = false;
-                        state.status =
-                            Some("Your draft could not be saved; the session is still open".into());
-                        state.dirty = true;
-                        break;
-                    }
                     FlushWait::Completed(Err(error)) => {
                         shutdown_error
                             .get_or_insert_with(|| format!("终止时草稿未能保存：{error}"));
                         break 'run;
-                    }
-                    FlushWait::TimedOut if !termination_received => {
-                        shutdown = false;
-                        state.quitting = false;
-                        state.status =
-                            Some("Draft saving timed out; the session is still open".into());
-                        state.dirty = true;
-                        break;
                     }
                     FlushWait::TimedOut => {
                         shutdown_error.get_or_insert_with(|| "终止时草稿保存超时".into());
@@ -276,17 +259,7 @@ pub async fn run() -> Result<(), RunError> {
                     }
                     #[cfg(unix)]
                     FlushWait::Process(ProcessSignal::Suspend) => {
-                        if termination_received {
-                            suspend_process()?;
-                        } else {
-                            suspend_and_resume(
-                                &mut terminal,
-                                &mut events,
-                                &panic_signal,
-                                &mut state,
-                                &mut frame_snapshot,
-                            )?;
-                        }
+                        suspend_process()?;
                         // The interrupted flush future was dropped. Retry it after
                         // continuation; draft persistence is idempotent.
                         continue;
@@ -308,20 +281,32 @@ pub async fn run() -> Result<(), RunError> {
                     );
                     None
                 } else {
-                    let event = require_terminal_event(event)?;
-                    if let Event::Mouse(mouse) = &event {
-                        effects.extend(update(&mut state, UiEvent::PointerMoved {
-                            column: mouse.column,
-                            row: mouse.row,
-                        }));
+                    match require_terminal_event(event) {
+                        Ok(event) => {
+                            if let Event::Mouse(mouse) = &event {
+                                effects.extend(update(&mut state, UiEvent::PointerMoved {
+                                    column: mouse.column,
+                                    row: mouse.row,
+                                }));
+                            }
+                            terminal_event(event, frame_snapshot.as_ref(), &state)
+                        }
+                        Err(error) => {
+                            termination_received = true;
+                            record_shutdown_error(&mut shutdown_error, error.to_string());
+                            if let Err(error) = terminal.restore() {
+                                record_shutdown_error(&mut shutdown_error, error.to_string());
+                            }
+                            Some(UiEvent::Action(Action::Quit))
+                        }
                     }
-                    terminal_event(event, frame_snapshot.as_ref(), &state)
                 }
             },
             event = rx.recv() => event,
             ready = ready_rx.recv() => {
                 ready.and_then(|ready| runtime.accept_ready(ready, &state))
             },
+            _ = activity_ticker.tick(), if state.activity_animation_active() => Some(UiEvent::ActivityTick),
             _ = overview_ticker.tick() => Some(UiEvent::RefreshOverviewRequested),
             _ = draft_ticker.tick() => Some(UiEvent::PersistDraftsRequested),
             _ = &mut caret_sleep, if state.blinking_caret_active() => Some(UiEvent::CaretBlink),
@@ -454,33 +439,6 @@ pub async fn run() -> Result<(), RunError> {
         return Err(RunError::Io(restore_error));
     }
     Ok(())
-}
-
-fn summarize_project_config(overrides: &bone_app::RuntimeOverrides) -> String {
-    let mut changes = Vec::new();
-    if let Some(worker) = &overrides.worker {
-        changes.push(format!("worker {}/{}", worker.profile, worker.model));
-    }
-    if let Some(coordinator) = &overrides.coordinator {
-        changes.push(format!(
-            "coordinator {}/{}",
-            coordinator.profile, coordinator.model
-        ));
-    }
-    if let Some(tools) = &overrides.tools {
-        changes.push(format!("tools {:?}", tools.mode));
-    }
-    if let Some(limits) = &overrides.limits {
-        changes.push(format!(
-            "limits jobs={}, depth={}, tool-slots={}",
-            limits.job_budget, limits.job_depth, limits.tool_slots
-        ));
-    }
-    if changes.is_empty() {
-        "no runtime overrides".into()
-    } else {
-        changes.join(", ")
-    }
 }
 
 fn record_shutdown_error(target: &mut Option<String>, message: impl AsRef<str>) {

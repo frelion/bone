@@ -14,6 +14,8 @@ mod wasm;
 
 #[cfg(not(target_family = "wasm"))]
 use native as platform;
+#[cfg(not(target_family = "wasm"))]
+pub use native::clear_cache;
 #[cfg(target_family = "wasm")]
 use wasm as platform;
 
@@ -184,7 +186,9 @@ impl Authenticator {
             AuthSource::AccessToken { .. } => Ok(()),
             AuthSource::OAuth => {
                 let _guard = self.state_lock.lock().await;
-                self.platform.invalidate_after_rejection_oauth(access_token)
+                self.platform
+                    .invalidate_after_rejection_oauth(access_token)
+                    .await
             }
             #[cfg(test)]
             AuthSource::RejectionTest { control, .. } => {

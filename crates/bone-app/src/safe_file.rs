@@ -35,19 +35,6 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<PathBuf, SafeFileE
     Ok(fs::canonicalize(path)?)
 }
 
-pub(crate) fn private_directory_exists(path: &Path) -> Result<bool, SafeFileError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {
-            validate_directory(path)?;
-            validate_owner(path)?;
-            validate_private_mode(path, 0o077)?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
-
 pub(crate) fn validate_private_file(path: &Path) -> Result<(), SafeFileError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -168,26 +155,6 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<(), Safe
     atomic_write(path, bytes, true)
 }
 
-pub(crate) fn atomic_write_new_private(path: &Path, bytes: &[u8]) -> Result<bool, SafeFileError> {
-    let parent = path
-        .parent()
-        .ok_or(SafeFileError::Unsafe("file has no parent"))?;
-    ensure_private_directory(parent)?;
-    let mut temporary = NamedTempFile::new_in(parent)?;
-    set_mode(temporary.path(), 0o600)?;
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    match temporary.persist_noclobber(path) {
-        Ok(file) => {
-            validate_open_private_file(&file)?;
-            sync_directory(parent)?;
-            Ok(true)
-        }
-        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error.error.into()),
-    }
-}
-
 pub(crate) fn atomic_write_regular(path: &Path, bytes: &[u8]) -> Result<(), SafeFileError> {
     atomic_write(path, bytes, false)
 }
@@ -252,20 +219,6 @@ fn validate_owner(path: &Path) -> Result<(), SafeFileError> {
             return Err(SafeFileError::Unsafe("must be owned by the current user"));
         }
     }
-    Ok(())
-}
-
-fn validate_private_mode(path: &Path, forbidden: u32) -> Result<(), SafeFileError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if fs::symlink_metadata(path)?.permissions().mode() & forbidden != 0 {
-            return Err(SafeFileError::Unsafe(
-                "must not grant group or other access",
-            ));
-        }
-    }
-    let _ = forbidden;
     Ok(())
 }
 

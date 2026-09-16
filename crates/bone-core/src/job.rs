@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,10 +31,18 @@ impl JobSpec {
     }
 }
 
+/// Tool authority requested at creation; jobs retain only the resolved set.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolSelection {
+    ReadOnly,
+    Only(Vec<String>),
+}
+
 /// Model-supplied contents of a new job. Ownership is always assigned by code.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Assignment {
+    pub tools: Option<ToolSelection>,
     pub spec: JobSpec,
     pub inputs: Vec<InputId>,
     pub evidence: Vec<Seq>,
@@ -42,6 +54,7 @@ impl Assignment {
     pub fn new(spec: JobSpec) -> Self {
         Self {
             spec,
+            tools: None,
             inputs: Vec::new(),
             evidence: Vec::new(),
             seed: None,
@@ -63,7 +76,6 @@ pub struct DelegationLimits {
 pub enum Owner {
     User,
     Job(JobId),
-    Routing(Seq),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,7 +177,12 @@ pub enum WorkStep {
     Tool(ToolCall),
     Delegate(Delegation),
     Wait(Await),
-    AskUser(String),
+    NeedInput(String),
+    Respond {
+        job: JobId,
+        question: Seq,
+        message: String,
+    },
     Inquire {
         job: JobId,
         question: String,
@@ -174,14 +191,8 @@ pub enum WorkStep {
         job: JobId,
         action: OwnedAction,
     },
-    UpdateConstraints {
-        source: InputId,
-        expected_revision: u64,
-        constraints: String,
-    },
     Read(ReadQuery),
     PublishResult(ReportDraft),
-    Reply(String),
     Finish(Completion),
     Fail(Completion),
 }
@@ -239,25 +250,37 @@ pub enum ReadQuery {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RouteTarget {
-    Existing(JobId),
-    New,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RouteDelivery {
-    pub inputs: Vec<InputId>,
-    pub target: RouteTarget,
-    pub handoff: String,
-}
-
+/// One conversation action. Tool execution belongs exclusively to jobs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum KernelDecision {
-    Assign(Vec<RouteDelivery>),
+pub enum ConversationStep {
+    Reply {
+        inputs: Vec<InputId>,
+        text: String,
+        outcome: crate::InputOutcome,
+    },
+    Ask {
+        inputs: Vec<InputId>,
+        question: String,
+    },
+    Start(Vec<Assignment>),
+    Send {
+        job: JobId,
+        inputs: Vec<InputId>,
+        message: String,
+        question: Option<Seq>,
+        tools: Option<ToolSelection>,
+    },
+    Control {
+        job: JobId,
+        action: OwnedAction,
+    },
     Read(ReadQuery),
-    Clarify(String),
+    UpdateConstraints {
+        source: InputId,
+        expected_revision: u64,
+        constraints: String,
+    },
+    Wait,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,7 +317,6 @@ pub enum WaitView {
         after: Seq,
     },
     Inquiry(Seq),
-    Coordination(Seq),
     Commit,
 }
 
@@ -316,6 +338,7 @@ impl From<MonoTime> for MonoTimeView {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobView {
+    pub allowed_tools: BTreeSet<String>,
     pub id: JobId,
     pub spec: JobSpec,
     pub owner: Owner,
@@ -327,6 +350,7 @@ pub struct JobView {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Job {
+    pub allowed_tools: BTreeSet<String>,
     pub spec: JobSpec,
     pub inputs: Vec<InputId>,
     pub owner: Owner,
@@ -365,8 +389,6 @@ pub(crate) enum WaitState {
         after: Seq,
     },
     Inquiry(Seq),
-    #[allow(dead_code)]
-    Coordination(Seq),
     Commit(PendingStep),
 }
 
@@ -408,7 +430,6 @@ impl WaitState {
                 after: *after,
             },
             Self::Inquiry(id) => WaitView::Inquiry(*id),
-            Self::Coordination(id) => WaitView::Coordination(*id),
             Self::Commit(_) => WaitView::Commit,
         }
     }

@@ -63,7 +63,7 @@ def build_profile(entries: list[dict[str, Any]]) -> dict[str, Any]:
     calls: list[dict[str, Any]] = []
     read_paths: dict[str, set[int]] = defaultdict(set)
     last_successful_test: int | None = None
-    final_job: int | None = None
+    final_input: int | None = None
 
     for entry in entries:
         name, data = variant(entry["event"])
@@ -138,8 +138,8 @@ def build_profile(entries: list[dict[str, Any]]) -> dict[str, Any]:
             )
             job["finished_ms"] = timestamp - origin
             job["outcome"] = data["outcome"]
-            if job.get("parent") is None:
-                final_job = timestamp
+        elif name == "InputFinished":
+            final_input = timestamp
 
     intervals = [(call["started_ms"], call["finished_ms"]) for call in calls]
     totals = Counter()
@@ -162,8 +162,8 @@ def build_profile(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "call_counts": dict(sorted(counts.items())),
         "call_duration_ms": dict(sorted(totals.items())),
         "post_verification_ms": (
-            final_job - last_successful_test
-            if final_job is not None and last_successful_test is not None
+            final_input - last_successful_test
+            if final_input is not None and last_successful_test is not None
             else None
         ),
         "duplicate_reads_across_jobs": duplicates,

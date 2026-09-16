@@ -707,10 +707,6 @@ fn large_reply(sequence: u64, bytes: usize) -> HistoryEntry {
         sequence: bone_app::SessionSeq(sequence),
         occurred_at: sequence as i64,
         event: SessionEvent::Reply {
-            job: bone_app::JobRef {
-                runtime: bone_app::RuntimeId::new(),
-                id: sequence,
-            },
             inputs: Vec::new(),
             text: "x".repeat(bytes),
         },

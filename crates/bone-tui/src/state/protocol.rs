@@ -68,6 +68,7 @@ pub enum Action {
     PanelPrevious,
     PanelNext,
     ActivatePanel,
+    RetryLogin,
     ToggleOverlayKeyboard,
     CloseOverlay,
     OverlayBack,
@@ -156,7 +157,6 @@ pub enum UiEvent {
         request: u64,
         facts: Option<super::ModelFacts>,
         error: Option<String>,
-        login_required: bool,
     },
 
     Action(Action),
@@ -261,6 +261,7 @@ pub enum UiEvent {
         message: String,
     },
     CaretBlink,
+    ActivityTick,
     Resized,
 }
 
@@ -280,7 +281,6 @@ pub enum SessionOperationKind {
 pub enum Effect {
     CopyText(String),
     ReloadConfig,
-    TrustProjectConfig,
     SaveConnection {
         request: u64,
         session: Option<SessionId>,

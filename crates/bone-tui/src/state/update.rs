@@ -18,6 +18,13 @@ use super::{
 use super::{ModelPanel, ModelScreen, Overlay, ReaderState};
 
 pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
+    if matches!(event, UiEvent::ActivityTick) {
+        if state.activity_animation_active() {
+            state.activity_frame = (state.activity_frame + 1) % 10;
+            state.dirty = true;
+        }
+        return Vec::new();
+    }
     if matches!(event, UiEvent::CaretBlink) {
         if state.blinking_caret_active() {
             state.caret_visible = !state.caret_visible;
@@ -102,16 +109,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             request,
             facts,
             error,
-            login_required,
-        } => overlay::model_applied(
-            state,
-            session,
-            request,
-            facts,
-            error,
-            login_required,
-            &mut effects,
-        ),
+        } => overlay::model_applied(state, session, request, facts, error, &mut effects),
         UiEvent::Action(action) => handle_action(state, action, &mut effects),
         UiEvent::PointerMoved { .. } | UiEvent::PointerLeft | UiEvent::CancelPointerCapture => {
             unreachable!("pointer state returns before business dispatch")
@@ -592,6 +590,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             state.pointer.capture = None;
             state.pointer.press = None;
         }
+        UiEvent::ActivityTick => unreachable!("activity tick returns before event dispatch"),
         UiEvent::CaretBlink => unreachable!("caret blink returns before event dispatch"),
     }
     trim_editor_history(state);
@@ -655,9 +654,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                 if let Some(editor) = editor
                     && let Some(range) = editor.selection()
                 {
-                    effects.push(Effect::CopyText(crate::text::sanitize_external(
-                        &editor.text()[range],
-                    )));
+                    effects.push(Effect::CopyText(editor.text()[range].to_owned()));
                 }
             }
             state.pointer.capture = None;
@@ -759,7 +756,11 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         }
         Action::ChooseConnection(index) => overlay::choose_connection(state, index, effects),
         Action::SaveConnection => overlay::save_connection(state, effects),
-        Action::ActivatePanel => overlay::activate(state, effects),
+        Action::ActivatePanel => {
+            enter_overlay(state, effects);
+            overlay::activate(state, effects);
+        }
+        Action::RetryLogin => overlay::activate(state, effects),
         Action::ScrollOverlay { amount, max } => {
             state.overlay_scroll = state.overlay_scroll.saturating_add_signed(amount).min(max);
         }
@@ -1255,9 +1256,7 @@ fn execute_command(
                 .selected_ui()
                 .and_then(|ui| ui.snapshot.as_ref())
                 .and_then(|snapshot| {
-                    super::answer::active_questions(snapshot)
-                        .first()
-                        .map(|question| question.id)
+                    super::answer::current_question(snapshot).map(|question| question.id)
                 });
             if let Some(question) = question {
                 handle_action(state, Action::AnswerQuestion(question), effects);
@@ -1320,11 +1319,6 @@ fn execute_command(
             clear_current_draft(state, effects);
             effects.push(Effect::ReloadConfig);
             set_selection_status(state, "Reloading configuration…");
-        }
-        CommandKind::TrustConfig if argument.is_empty() => {
-            clear_current_draft(state, effects);
-            effects.push(Effect::TrustProjectConfig);
-            set_selection_status(state, "Trusting current project configuration…");
         }
         CommandKind::Details if argument.is_empty() => {
             clear_current_draft(state, effects);
@@ -2529,6 +2523,7 @@ mod panel_draft_tests {
                     },
                     job,
                     tool: "read_file".into(),
+                    arguments: serde_json::json!({}),
                     outcome: bone_app::ToolOutcome {
                         result: Ok(serde_json::json!("x".repeat(1024 * 1024))),
                         external_effect: bone_app::ExternalEffect::None,
@@ -2547,6 +2542,7 @@ mod panel_draft_tests {
             history_through: SessionSeq(2),
             problem: None,
             jobs: vec![bone_app::JobView {
+                allowed_tools: ["read".to_owned(), "glob".to_owned()].into(),
                 id: job,
                 owner: bone_app::JobOwner::User,
                 inputs: vec![],
@@ -2636,6 +2632,7 @@ mod panel_draft_tests {
             history_through: SessionSeq(0),
             problem: None,
             jobs: vec![bone_app::JobView {
+                allowed_tools: ["read".to_owned(), "glob".to_owned()].into(),
                 id: job,
                 owner: bone_app::JobOwner::User,
                 inputs: vec![],

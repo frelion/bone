@@ -91,36 +91,32 @@ fn running_runtime(snapshot: &SessionView) -> Option<RuntimeId> {
 fn matching_question(
     inputs: &[InputView],
     runtime: Option<RuntimeId>,
-    id: QuestionId,
 ) -> Option<ActiveQuestion<'_>> {
-    if runtime != Some(id.runtime) {
-        return None;
-    }
+    let current = runtime?;
     inputs.iter().find_map(|input| match &input.state {
         InputState::WaitingForUser {
             runtime,
             question,
             text,
-        } if *runtime == id.runtime && *question == id && input.id == id.reply_to => {
-            Some(ActiveQuestion { id, text })
+        } if *runtime == current
+            && question.runtime == current
+            && input.id == question.reply_to =>
+        {
+            Some(ActiveQuestion {
+                id: *question,
+                text,
+            })
         }
         _ => None,
     })
 }
 
 pub fn active_question(snapshot: &SessionView, id: QuestionId) -> Option<ActiveQuestion<'_>> {
-    matching_question(&snapshot.inputs, running_runtime(snapshot), id)
+    current_question(snapshot).filter(|question| question.id == id)
 }
 
-pub fn active_questions(snapshot: &SessionView) -> Vec<ActiveQuestion<'_>> {
-    snapshot
-        .inputs
-        .iter()
-        .filter_map(|input| match &input.state {
-            InputState::WaitingForUser { question, .. } => active_question(snapshot, *question),
-            _ => None,
-        })
-        .collect()
+pub fn current_question(snapshot: &SessionView) -> Option<ActiveQuestion<'_>> {
+    matching_question(&snapshot.inputs, running_runtime(snapshot))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,7 +134,7 @@ pub enum RecoveryCandidate {
 
 pub fn recovery_candidate(input: &InputView) -> Option<RecoveryCandidate> {
     match &input.state {
-        InputState::Queued { .. } | InputState::RoutingFailed { .. } => {
+        InputState::Queued { .. } | InputState::ConversationFailed { .. } => {
             Some(RecoveryCandidate::Retry { input: input.id })
         }
         InputState::Cancelled | InputState::Rejected { .. } | InputState::Interrupted { .. } => {
@@ -285,14 +281,16 @@ mod tests {
             },
         )];
         assert_eq!(
-            matching_question(&inputs, Some(q.runtime), q).unwrap().text,
+            matching_question(&inputs, Some(q.runtime)).unwrap().text,
             "Scope?"
         );
-        assert!(matching_question(&inputs, Some(RuntimeId::new()), q).is_none());
+        assert!(matching_question(&inputs, Some(RuntimeId::new())).is_none());
         assert!(
-            matching_question(&inputs, Some(q.runtime), QuestionId { record: 8, ..q }).is_none()
+            matching_question(&inputs, Some(q.runtime))
+                .filter(|question| question.id == QuestionId { record: 8, ..q })
+                .is_none()
         );
-        assert!(active_questions(&snapshot(inputs)).is_empty());
+        assert!(current_question(&snapshot(inputs)).is_none());
     }
 
     #[test]
@@ -346,7 +344,7 @@ mod tests {
             recovery_candidate(&input(
                 2,
                 "text",
-                InputState::RoutingFailed {
+                InputState::ConversationFailed {
                     runtime: q.runtime,
                     message: "network".into()
                 }

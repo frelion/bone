@@ -613,6 +613,53 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) -> bool {
     true
 }
 
+use super::presentation::{self, TextSection, ToolSummary};
+
+pub(super) fn summary(
+    args: &serde_json::Value,
+    output: Option<&serde_json::Value>,
+) -> Option<ToolSummary> {
+    Some(ToolSummary {
+        subject: presentation::short(args["command"].as_str()?),
+        result: match output {
+            Some(output) => {
+                let status = if output["timed_out"].as_bool()? {
+                    "timed out".to_owned()
+                } else if let Some(code) = output["exit_code"].as_i64() {
+                    format!("exit {code}")
+                } else if output["exit_code"].is_null() {
+                    "terminated without exit code".to_owned()
+                } else {
+                    return None;
+                };
+                Some(presentation::result(status, output))
+            }
+            None => None,
+        },
+    })
+}
+
+pub(super) fn details(
+    args: &serde_json::Value,
+    output: &serde_json::Value,
+) -> Option<Vec<TextSection>> {
+    let mut sections = vec![presentation::section("Command", args["command"].as_str()?)];
+    if let Some(cwd) = args["cwd"].as_str() {
+        sections.push(presentation::section("Working directory", cwd));
+    }
+    for (field, label) in [("stdout", "Standard output"), ("stderr", "Standard error")] {
+        let text = output[field].as_str()?;
+        if !text.is_empty() {
+            sections.push(presentation::section(label, text));
+        }
+    }
+    sections.push(presentation::section(
+        "Status",
+        summary(args, Some(output))?.result?,
+    ));
+    Some(sections)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;

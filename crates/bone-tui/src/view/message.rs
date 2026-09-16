@@ -24,41 +24,13 @@ pub(super) fn render(event: &SessionEvent, width: u16) -> Vec<MessageRow> {
         SessionEvent::InputSubmitted { text, .. } => user_message(text, width),
         SessionEvent::Reply { text, .. } => reply_message(text, width),
         SessionEvent::QuestionAsked { text, .. } => message_body(text, width, WARNING),
-        SessionEvent::ToolFinished { tool, outcome, .. } => {
-            let mut rows = vec![MessageRow::text(
-                compact(
-                    "›",
-                    &format!(
-                        "{}  {}",
-                        tool,
-                        if outcome.result.is_ok() {
-                            "done"
-                        } else {
-                            "failed"
-                        }
-                    ),
-                    if outcome.result.is_ok() {
-                        SUCCESS
-                    } else {
-                        DANGER
-                    },
-                ),
-                0,
-            )];
-            if let Err(error) = &outcome.result {
-                rows.extend(error_preview(&error.message, width).into_iter().map(
-                    |(byte, text)| {
-                        MessageRow::text(Line::styled(text, Style::default().fg(DANGER)), byte + 1)
-                    },
-                ));
-            }
-            rows
+        SessionEvent::ToolFinished { outcome, .. } => {
+            render_tool(outcome, &tool_label(event), width as u16)
         }
-        SessionEvent::RoutingFailed { message, .. }
+        SessionEvent::ConversationFailed { message, .. }
         | SessionEvent::InputRejected { message, .. } => {
             vec![MessageRow::text(compact("·", message, DANGER), 0)]
         }
-        SessionEvent::JobFinished { summary, .. } => message_body(summary, width, INK),
         SessionEvent::AcceptanceRecorded { reason, .. } => {
             vec![MessageRow::text(compact("·", reason, SUCCESS), 0)]
         }
@@ -66,28 +38,90 @@ pub(super) fn render(event: &SessionEvent, width: u16) -> Vec<MessageRow> {
             compact("·", "Execution interrupted.", WARNING),
             0,
         )],
-        SessionEvent::InputAccepted { .. } => {
-            vec![MessageRow::text(compact("·", "Request received", MUTED), 0)]
-        }
         SessionEvent::InputCancelled { .. } => vec![MessageRow::text(
             compact("·", "Request cancelled", MUTED),
             0,
         )],
-        SessionEvent::InputFinished { outcome, .. } => vec![MessageRow::text(
-            compact("·", &format!("Request {outcome:?}"), MUTED),
-            0,
-        )],
+        SessionEvent::InputFinished { outcome, .. } => match outcome {
+            bone_app::InputOutcome::Completed => Vec::new(),
+            bone_app::InputOutcome::Failed => {
+                vec![MessageRow::text(compact("·", "Request failed", DANGER), 0)]
+            }
+            bone_app::InputOutcome::Cancelled => vec![MessageRow::text(
+                compact("·", "Request cancelled", WARNING),
+                0,
+            )],
+        },
         SessionEvent::WriteResolved { evidence, .. } => {
             vec![MessageRow::text(compact("·", evidence, SUCCESS), 0)]
         }
         // Runtime and execution lifecycle are transport plumbing, not conversation content.
-        SessionEvent::RuntimeStarted { .. }
+        SessionEvent::InputAccepted { .. }
+        | SessionEvent::JobFinished { .. }
+        | SessionEvent::JobNeedsInput { .. }
+        | SessionEvent::RuntimeStarted { .. }
         | SessionEvent::RuntimeReconfigured { .. }
         | SessionEvent::RuntimeClosed { .. }
         | SessionEvent::JobCreated { .. }
         | SessionEvent::CallStarted { .. }
         | SessionEvent::CallFinished { .. } => Vec::new(),
     }
+}
+
+pub(super) fn render_tool(
+    outcome: &bone_app::ToolOutcome,
+    label: &str,
+    width: u16,
+) -> Vec<MessageRow> {
+    let mut rows = vec![MessageRow::text(
+        compact(
+            "›",
+            label,
+            if outcome.result.is_ok() { INK } else { DANGER },
+        ),
+        0,
+    )];
+    if let Err(error) = &outcome.result {
+        rows.extend(
+            error_preview(&error.message, usize::from(width.max(1)))
+                .into_iter()
+                .map(|(byte, text)| {
+                    MessageRow::text(
+                        Line::styled(text, Style::default().fg(DANGER)),
+                        label.len() + 1 + byte,
+                    )
+                }),
+        );
+    }
+    rows
+}
+
+fn tool_label(event: &SessionEvent) -> String {
+    let SessionEvent::ToolFinished {
+        tool,
+        arguments,
+        outcome,
+        ..
+    } = event
+    else {
+        unreachable!("tool labels only apply to tool events")
+    };
+    let summary = bone_app::tool_summary(tool, arguments, Some(outcome));
+    let mut label = tool.to_owned();
+    if summary.subject != *tool {
+        label.push_str("  ");
+        label.push_str(&summary.subject);
+    }
+    if outcome.result.is_ok()
+        && let Some(result) = summary.result
+    {
+        label.push_str(" · ");
+        label.push_str(&result);
+    }
+    if outcome.result.is_err() {
+        label.push_str(" · failed");
+    }
+    super::single_line_external(&label)
 }
 
 impl MessageRow {
@@ -188,17 +222,8 @@ pub(super) fn copy_text(event: &SessionEvent, rows: &[MessageRow]) -> std::sync:
         SessionEvent::InputSubmitted { text, .. }
         | SessionEvent::Reply { text, .. }
         | SessionEvent::QuestionAsked { text, .. } => text.as_str().into(),
-        SessionEvent::JobFinished { summary, .. } => summary.as_str().into(),
-        SessionEvent::ToolFinished { tool, outcome, .. } => {
-            let mut text = format!(
-                "{}  {}",
-                tool,
-                if outcome.result.is_ok() {
-                    "done"
-                } else {
-                    "failed"
-                }
-            );
+        SessionEvent::ToolFinished { outcome, .. } => {
+            let mut text = tool_label(event);
             if let Err(error) = &outcome.result {
                 text.push('\n');
                 text.push_str(&error.message);
@@ -237,10 +262,9 @@ pub(super) fn copy_row(
     Some(match event {
         SessionEvent::InputSubmitted { .. } => (row.byte, 2),
         SessionEvent::Reply { .. } => (row.byte, 2),
-        SessionEvent::QuestionAsked { .. } | SessionEvent::JobFinished { .. } => (row.byte, 0),
-        SessionEvent::ToolFinished { tool, outcome, .. } if index > 0 => {
-            let header_len = tool.len() + if outcome.result.is_ok() { 6 } else { 8 };
-            (header_len + row.byte, if width >= 4 { 2 } else { 0 })
+        SessionEvent::QuestionAsked { .. } => (row.byte, 0),
+        SessionEvent::ToolFinished { .. } if index > 0 => {
+            (row.byte, if width >= 4 { 2 } else { 0 })
         }
         _ => (0, if row.line.spans.len() > 1 { 2 } else { 0 }),
     })
@@ -372,6 +396,55 @@ mod tests {
     }
 
     #[test]
+    fn task_results_and_success_lifecycle_do_not_become_conversation_replies() {
+        let runtime = RuntimeId::new();
+        let job = bone_app::JobRef { runtime, id: 1 };
+        let events = [
+            SessionEvent::InputAccepted {
+                input: InputId(1),
+                runtime,
+            },
+            SessionEvent::JobFinished {
+                job,
+                outcome: bone_app::OutcomeKind::Completed,
+                summary: "INTERNAL_TASK_RESULT".into(),
+                remaining: vec![],
+            },
+            SessionEvent::InputFinished {
+                runtime,
+                input: InputId(1),
+                outcome: bone_app::InputOutcome::Completed,
+            },
+        ];
+        for event in events {
+            let rows = render(&event, 80);
+            assert!(rows.is_empty());
+            assert!(copy_text(&event, &rows).is_empty());
+        }
+        let reply = SessionEvent::Reply {
+            inputs: vec![InputId(1)],
+            text: "USER_ANSWER".into(),
+        };
+        assert!(visible_text(&rendered_lines(&reply, 80)).contains("USER_ANSWER"));
+        for outcome in [
+            bone_app::InputOutcome::Failed,
+            bone_app::InputOutcome::Cancelled,
+        ] {
+            assert!(
+                !render(
+                    &SessionEvent::InputFinished {
+                        runtime,
+                        input: InputId(1),
+                        outcome,
+                    },
+                    80
+                )
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn source_rows_preserve_sanitized_unicode_wrapping() {
         for value in [
             "",
@@ -425,10 +498,6 @@ mod tests {
     #[test]
     fn reply_omits_a_sanitized_empty_final_fragment() {
         let reply = |text: &str| SessionEvent::Reply {
-            job: bone_app::JobRef {
-                runtime: RuntimeId::new(),
-                id: 1,
-            },
             inputs: vec![InputId(1)],
             text: text.into(),
         };
@@ -445,10 +514,6 @@ mod tests {
             reply_to: None,
         };
         let assistant = SessionEvent::Reply {
-            job: bone_app::JobRef {
-                runtime: RuntimeId::new(),
-                id: 1,
-            },
             inputs: vec![InputId(1)],
             text: "UNIQUE_ASSISTANT_BODY".into(),
         };
@@ -490,6 +555,7 @@ mod tool_error_tests {
         let runtime = bone_app::RuntimeId::new();
         SessionEvent::ToolFinished {
             tool: "read".into(),
+            arguments: serde_json::json!({}),
             call: bone_app::CallRef { runtime, id: 1 },
             job: bone_app::JobRef { runtime, id: 1 },
             outcome: bone_app::ToolOutcome::failed(message),
@@ -517,7 +583,7 @@ mod tool_error_tests {
             assert!(
                 rows[1..]
                     .iter()
-                    .all(|row| message.is_char_boundary(row.byte - 1))
+                    .all(|row| message.is_char_boundary(row.byte - tool_label(&event).len() - 1))
             );
             assert!(rows.windows(2).all(|pair| pair[0].byte <= pair[1].byte));
         }
@@ -532,7 +598,10 @@ mod tool_error_tests {
             let event = failure(message);
             let rows = render(&event, 40);
             assert!(rows.len() <= 4);
-            assert!(rows.iter().all(|row| row.byte <= 4097));
+            assert!(
+                rows.iter()
+                    .all(|row| row.byte <= tool_label(&event).len() + 4097)
+            );
             assert!(
                 rows.last()
                     .unwrap()

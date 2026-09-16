@@ -6,7 +6,7 @@ BONE 的测试目标是证明三个 crate 之间的边界和关键状态交错�
 
 | 层 | 主要证明 | 替身边界 |
 | --- | --- | --- |
-| Core Kernel | 输入 routing、Job 权限、Context、等待、终态与迟到结果 | 直接驱动 Event；不启动 Tokio task |
+| Core Kernel | 持续会话、Job 权限、Context、等待、显式结案与迟到结果 | 直接驱动 Event；不启动 Tokio task |
 | Core Runtime | 端口调度、timeout、取消、reconfigure、shutdown 与资源释放 | 脚本化 ModelPort / ToolPort |
 | Adapters unit | request / response value、工具算法、path 与 limit | 内存值或临时 workspace |
 | Provider contract | BONE 经过生产协议转换后发送和接收的真实 wire shape | 离线 recording transport + fixture |
@@ -22,8 +22,9 @@ Kernel tests 位于 [`crates/bone-core/src/tests.rs`](../crates/bone-core/src/te
 
 这层负责覆盖：
 
-- 相同 / 冲突 Input ID、回答问题的 sequence 检查和新输入合并 routing；
-- root create/update、委派原子性、owner 权限、调查只读和 Job depth / capacity；
+- 相同 / 冲突 Input ID、回答问题的 sequence 检查和新输入使旧会话提案失效；
+- 问候直接回复而不创建 Job，Job 完成不自动完成输入，只有会话明确结案；
+- root create/update、委派原子性、固定工具权限和 Job depth / capacity；
 - 每个 Worker 只得到自己的 Context、显式 evidence 授权、目录与 Record 分页；
 - 完整序列化预算、checkpoint 覆盖范围、大工具结果的有界预览与继续分页；
 - 工具完成恰好发生在 `Await::Tool` 提案提交前后的竞态；
@@ -87,11 +88,11 @@ App tests 使用临时 data directory、真实 `bone.sqlite3`、真实 journal /
 - submit 的事务回执、RequestId 幂等 / 冲突和输入状态；
 - 未选模型、登录缺失、lazy Runtime startup、retry 与 stop 顺序；
 - watch snapshot + history cursor 的无丢失组合，包括空公开页但 cursor 前进；
-- 三层配置解析、字段级并发更新、生效屏障、失败后 suspended 和重试；
+- 三层配置解析、字段级并发更新、保存后通知、显式 reload 应答、失败后 suspended 和重试；
 - Runtime ID 对 stale Job / Call / Question control 的隔离；
 - Runtime Record 归档、存储失败后重放以及 restart 的 Interrupted / Queued 区分；
 - 写入前记录、Workspace gate、未知写阻塞、核查、close 与 shutdown 报告；
-- profile、API-key slot 和 ChatGPT auth lease 的 ownership。
+- profile、API-key slot，以及 ChatGPT cache 的跨进程 refresh / invalidate / logout 事务。
 
 CAS 并发测试必须让所有 contender 使用同一个初始 revision，并用 barrier 同时起跑；断言严格一个成功、其余为 conflict，再读取最终 value。测试生产查询时要调用真实生产方法，不能复制一份 SQL 后只证明那份测试 SQL 正确。
 
@@ -110,7 +111,7 @@ happy path helper 必须返回并核对具体 outcome。`Completed` 场景不能
 
 这些场景不应塞进每次毫秒级 unit suite。崩溃测试使用独立 helper process 和临时目录；长会话先作为显式 measurement，建立稳定环境和阈值后再决定是否进 CI。
 
-TUI 自身随后增加三类测试：纯 reducer 状态表、宽 / 窄布局 snapshot，以及用真实 App test backend 驱动的少量交互链路。终端字节解析与 Agent 业务不变量不在 TUI 重测。
+TUI 自身随后增加三类测试：纯 reducer 状态表、宽 / 窄布局 snapshot，以及用真实 App test backend 驱动的少量交互链路。PTY 门禁还必须覆盖初始化查询和正常运行中的终端 EOF，以及草稿保存失败或超时后的不可逆退出与终端恢复。终端字节解析与 Agent 业务不变量不在 TUI 重测。
 
 ## 断言与替身规范
 

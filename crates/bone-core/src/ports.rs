@@ -5,8 +5,8 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    CallId, CheckpointDraft, CompactInput, CoordinateInput, InputId, JobId, JobView,
-    KernelDecision, Seq, WorkInput, WorkProposal,
+    CallId, CheckpointDraft, CompactInput, ConversationInput, ConversationStep, InputId, JobId,
+    JobView, Seq, WorkInput, WorkProposal,
 };
 
 pub type PortFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -57,9 +57,9 @@ pub struct InputReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputStatus {
-    Routing,
+    Thinking,
     WaitingForUser { question: String, question_seq: Seq },
-    RoutingFailed { message: String },
+    ConversationFailed { message: String },
     Handled,
     Finished(InputOutcome),
 }
@@ -100,6 +100,9 @@ pub enum ToolEffect {
     ExternalWrite,
 }
 
+/// A tool name is a stable capability identity supplied by the trusted host.
+/// Reconfiguration may change availability, but must not repurpose an existing name
+/// or change its effect. Job permissions constrain model calls, not host code.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
@@ -169,7 +172,7 @@ impl ToolOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CallKind {
-    Coordinate,
+    Converse,
     Work,
     Compact,
     Tool,
@@ -285,11 +288,11 @@ impl CallContext {
 
 /// One invocation per method; implementations keep no private agent loop.
 pub trait ModelPort: Send + Sync + 'static {
-    fn coordinate(
+    fn converse(
         &self,
-        input: CoordinateInput,
+        input: ConversationInput,
         context: CallContext,
-    ) -> PortFuture<Result<KernelDecision, CallError>>;
+    ) -> PortFuture<Result<ConversationStep, CallError>>;
 
     fn work(
         &self,
@@ -311,7 +314,7 @@ pub trait ToolPort: Send + Sync + 'static {
 
 #[derive(Clone, Debug)]
 pub(crate) enum Call {
-    Coordinate(CoordinateInput),
+    Converse(ConversationInput),
     Work(WorkInput),
     Compact(CompactInput),
     Tool(Arc<ToolCall>),
@@ -319,9 +322,9 @@ pub(crate) enum Call {
 
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
-    CoordinateFinished {
+    ConverseFinished {
         call: CallId,
-        result: Result<KernelDecision, CallError>,
+        result: Result<ConversationStep, CallError>,
     },
     WorkFinished {
         call: CallId,

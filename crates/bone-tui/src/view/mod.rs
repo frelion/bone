@@ -454,6 +454,7 @@ mod region_tests {
                     source: crate::state::reader::ReaderSource::History(bone_app::SessionSeq(1)),
                     title: "reader".into(),
                     text: "content".into(),
+                    numbered: Vec::new(),
                     layout_cache: std::cell::RefCell::new(None),
                 },
                 scroll: 0,

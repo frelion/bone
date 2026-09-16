@@ -1,6 +1,8 @@
 use std::process::ExitCode;
 
 mod headless;
+#[path = "terminal/main_error.rs"]
+mod terminal_error;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -22,7 +24,7 @@ async fn main() -> ExitCode {
     match bone_tui::run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("BONE could not start: {error}");
+            terminal_error::write(&format_args!("BONE could not start: {error}"));
             ExitCode::FAILURE
         }
     }

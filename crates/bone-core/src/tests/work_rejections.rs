@@ -20,10 +20,7 @@ fn empty_delegation_returns_feedback_and_can_finish_in_the_same_job() {
     assert_eq!(retry.job, initial.job);
     assert_eq!(kernel.jobs.len(), 1);
     assert_eq!(kernel.jobs[&initial.job].context.read_through, Seq::ZERO);
-    assert_eq!(
-        kernel.inputs[&InputId(1)].pending_review_by,
-        Some(initial.job)
-    );
+    assert!(!kernel.inputs[&InputId(1)].pending);
     assert!(retry.records.iter().any(|record| matches!(
         serde_json::from_str::<RecordBody>(&record.content),
         Ok(RecordBody::WorkRejected { job, call: rejected, message, budget })
@@ -46,7 +43,7 @@ fn empty_delegation_returns_feedback_and_can_finish_in_the_same_job() {
             total: 1
         }
     );
-    assert!(kernel.inputs[&InputId(1)].pending_review_by.is_none());
+    assert!(!kernel.inputs[&InputId(1)].pending);
 }
 
 #[test]
@@ -213,7 +210,7 @@ fn correction_budget_survives_snapshot_round_trip_and_existing_restore_policy() 
     let (call, initial) = root(&mut kernel);
     work(&mut kernel, call, WorkStep::delegate(vec![]));
     let snapshot = kernel.durable_snapshot().unwrap();
-    assert_eq!(snapshot.version(), 3);
+    assert_eq!(snapshot.version(), 5);
     let snapshot = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
     let (restored, effects) = Kernel::restore(
         snapshot,
@@ -235,7 +232,7 @@ fn correction_budget_survives_snapshot_round_trip_and_existing_restore_policy() 
 }
 
 #[test]
-fn only_legacy_snapshots_may_omit_correction_counters() {
+fn missing_correction_counters_and_legacy_snapshots_are_rejected() {
     let mut kernel = kernel();
     let (_, initial) = root(&mut kernel);
     let mut snapshot = kernel.durable_snapshot().unwrap();
@@ -252,16 +249,10 @@ fn only_legacy_snapshots_may_omit_correction_counters() {
         )
         .is_err()
     );
-    snapshot.version = 1;
-    let (restored, _) = Kernel::restore(
-        snapshot,
-        kernel.records.values().cloned().collect(),
-        AgentLimits::default(),
-        vec![],
-    )
-    .unwrap();
-    assert_eq!(
-        restored.jobs[&initial.job].work_rejections,
-        WorkRejections::default()
-    );
+    for version in [1, 2, 3, 4] {
+        snapshot.version = version;
+        assert!(
+            matches!(Kernel::restore(snapshot.clone(), kernel.records.values().cloned().collect(), AgentLimits::default(), vec![]), Err(crate::DurableError::UnsupportedVersion(v)) if v == version)
+        );
+    }
 }

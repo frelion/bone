@@ -20,7 +20,7 @@ use crate::{
     SessionReleaseReceipt, SessionReleaseStatus, WorkspaceChangeCursor, WorkspaceChangePage,
     WorkspaceFileCursor, WorkspaceFilePage, WorkspaceFileSource, WorkspaceFileView, WorkspaceId,
     WorkspaceInfo, WorkspaceOverview,
-    config::{resolve_model, resolve_runtime, validate_agent_limits, validate_tool_settings},
+    config::{resolve_model, resolve_runtime, validate_agent_limits, validate_tool_limits},
     providers::ProviderConnectError,
 };
 
@@ -63,7 +63,13 @@ pub(crate) enum RuntimeBackend {
         model: Arc<dyn ModelPort>,
         tools: Option<Vec<Arc<dyn ToolPort>>>,
     },
+    #[cfg(test)]
+    Factory(Arc<ModelFactory>),
 }
+
+#[cfg(test)]
+type ModelFactory =
+    dyn Fn(RuntimeConfig) -> bone_core::PortFuture<Result<Arc<dyn ModelPort>>> + Send + Sync;
 
 impl RuntimeBackend {
     pub(crate) async fn connect(&self, config: &RuntimeConfig) -> Result<Arc<dyn ModelPort>> {
@@ -71,14 +77,8 @@ impl RuntimeBackend {
             Self::Providers(providers) => providers.connect(config).await.map_err(Into::into),
             #[cfg(test)]
             Self::Ports { model, .. } => Ok(Arc::clone(model)),
-        }
-    }
-
-    async fn prepare_model(&self, model: &crate::ResolvedModel) -> Result<()> {
-        match self {
-            Self::Providers(providers) => providers.prepare_model(model).await.map_err(Into::into),
             #[cfg(test)]
-            Self::Ports { .. } => Ok(()),
+            Self::Factory(connect) => connect(config.clone()).await,
         }
     }
 
@@ -97,11 +97,19 @@ impl RuntimeBackend {
             #[cfg(test)]
             Self::Ports { tools: None, .. } => crate::tools::assemble(config, context)
                 .map_err(|error| Error::Tools(error.to_string())),
+            #[cfg(test)]
+            Self::Factory(_) => Ok(Vec::new()),
         }
     }
 }
 
 impl App {
+    #[cfg(test)]
+    pub(crate) fn with_backend(options: AppOptions, backend: RuntimeBackend) -> Result<Self> {
+        let store = DataStore::open_with_home(&options.data_dir, &options.bone_home)?;
+        let providers = ProviderConnector::new(options.bone_home);
+        Ok(Self::from_parts(store, backend, providers))
+    }
     #[cfg(test)]
     pub(crate) fn test_store(&self) -> DataStore {
         self.inner.store.clone()
@@ -652,22 +660,6 @@ impl App {
             .map_err(Into::into)
     }
 
-    pub async fn trust_project_config(&self, workspace: WorkspaceId) -> Result<()> {
-        let _update = self.inner.config_updates.lock().await;
-        self.ensure_open()?;
-        self.inner.store.trust_project_config(workspace)?;
-        let targets = self.active_sessions(Some(workspace)).await;
-        reload_sessions(&targets, false).await
-    }
-
-    pub async fn revoke_project_config_trust(&self, workspace: WorkspaceId) -> Result<()> {
-        let _update = self.inner.config_updates.lock().await;
-        self.ensure_open()?;
-        self.inner.store.revoke_project_config_trust(workspace)?;
-        let targets = self.active_sessions(Some(workspace)).await;
-        reload_sessions(&targets, false).await
-    }
-
     pub async fn reload_user_config(&self) -> Result<()> {
         let _update = self.inner.config_updates.lock().await;
         self.ensure_open()?;
@@ -683,15 +675,13 @@ impl App {
         let _update = self.inner.config_updates.lock().await;
         self.ensure_open()?;
         let status = self.inner.store.reload_workspace_config(workspace)?;
-        // An edited file loses trust immediately. Reload even in that state so
-        // a previously trusted write-tool override cannot remain live.
         let targets = self.active_sessions(Some(workspace)).await;
         reload_sessions(&targets, false).await?;
         Ok(status)
     }
 
-    /// Atomically reload user and project files, then reconfigure each open
-    /// Session once. Invalid input leaves the currently running snapshots intact.
+    /// Atomically reload user and project files, then notify open Sessions.
+    /// Application results are available through each Session's observation.
     pub async fn reload_config(
         &self,
         workspace: WorkspaceId,
@@ -717,10 +707,8 @@ impl App {
             .collect()
     }
 
-    /// Persist one override and wait for every affected open Session. Success
-    /// means all applied it; a failure does not roll back Sessions that did.
-    /// Once dispatched, cancelling the future stops waiting but does not revoke
-    /// the update.
+    /// Persist one override and notify affected Sessions. Success means the
+    /// selection is saved; observe each Session for its application result.
     pub async fn update_config(
         &self,
         scope: ConfigScope,
@@ -744,17 +732,13 @@ impl App {
             }
             ConfigChange::Tools(value) => {
                 if let Some(value) = value {
-                    validate_tool_settings(value)
+                    validate_tool_limits(value)
                         .map_err(|error| Error::InvalidState(error.to_string()))?;
                 }
             }
         }
 
-        let app = self.clone();
-        await_app_task(tokio::spawn(async move {
-            app.apply_config_update(scope, change).await
-        }))
-        .await
+        self.apply_config_update(scope, change).await
     }
 
     async fn apply_config_update(
@@ -765,15 +749,12 @@ impl App {
         let _update = self.inner.config_updates.lock().await;
         self.ensure_open()?;
         self.ensure_scope(scope)?;
-        if let ConfigChange::Model(Some(selection)) = &change {
-            let model = resolve_model(selection.clone(), &self.inner.store.profiles()?)
+        if let ConfigChange::Model(Some(selection))
+        | ConfigChange::Worker(Some(selection))
+        | ConfigChange::Coordinator(Some(selection)) = &change
+        {
+            resolve_model(selection.clone(), &self.inner.store.profiles()?)
                 .map_err(Error::Configuration)?;
-            if matches!(
-                model.profile.endpoint,
-                bone_adapters::llm::EndpointConfig::ChatGptSubscription
-            ) {
-                self.inner.backend.prepare_model(&model).await?;
-            }
         }
         let sessions = self.inner.sessions.lock().await;
         let force_model = matches!(&change, ConfigChange::Model(Some(_)));
@@ -798,6 +779,7 @@ impl App {
             }
         }
         drop(sessions);
+        drop(_update);
         let (forced_result, ordinary_result) = tokio::join!(
             reload_sessions(&forced, true),
             reload_sessions(&ordinary, false)
@@ -861,19 +843,12 @@ impl App {
         self.inner.store.profiles().map_err(Into::into)
     }
 
-    /// Save a profile and apply its resolved value to open Sessions. A failure
-    /// does not roll back Sessions that already applied it.
-    /// Once dispatched, cancelling the future stops waiting but does not revoke
-    /// the update.
+    /// Save a profile and notify open Sessions to apply its resolved value.
     pub async fn save_profile(&self, profile: Profile) -> Result<()> {
         profile
             .validate()
             .map_err(|error| Error::InvalidState(error.to_string()))?;
-        let app = self.clone();
-        await_app_task(tokio::spawn(
-            async move { app.apply_profile(profile).await },
-        ))
-        .await
+        self.apply_profile(profile).await
     }
 
     async fn apply_profile(&self, profile: Profile) -> Result<()> {
@@ -887,6 +862,7 @@ impl App {
             .map(|session| session.handle.clone())
             .collect::<Vec<_>>();
         drop(sessions);
+        drop(_update);
         reload_sessions(&targets, false).await
     }
 
@@ -1210,11 +1186,6 @@ async fn finish_shutdown(inner: Arc<AppInner>) -> Result<AppShutdownReport> {
             _ => {}
         }
     }
-    if let Err(error) = inner.providers.close().await
-        && first_error.is_none()
-    {
-        first_error = Some(error.into());
-    }
     if let Some(error) = first_error {
         return Err(error);
     }
@@ -1238,10 +1209,8 @@ async fn finish_shutdown(inner: Arc<AppInner>) -> Result<AppShutdownReport> {
 impl From<ProviderConnectError> for Error {
     fn from(error: ProviderConnectError) -> Self {
         match error {
-            ProviderConnectError::Closed => Self::Closed,
             ProviderConnectError::LoginRequired(profile) => Self::LoginRequired(profile),
             ProviderConnectError::Credential(problem) => Self::Credential(problem),
-            ProviderConnectError::Busy(profile) => Self::ProfileBusy(profile),
             error => Self::Provider(error.to_string()),
         }
     }
@@ -1322,32 +1291,15 @@ fn resolve_session_config(
 }
 
 async fn reload_sessions(sessions: &[Session], force: bool) -> Result<()> {
-    let reloads = sessions
-        .iter()
-        .cloned()
-        .map(|session| tokio::spawn(async move { session.apply_persisted_config(force).await }))
-        .collect::<Vec<_>>();
-
-    let mut first_error = None;
-    for reload in reloads {
-        let result = reload.await;
-        match result {
-            Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
-            Err(error) if first_error.is_none() => {
-                first_error = Some(Error::InvalidState(format!(
-                    "session configuration task failed: {error}"
-                )));
-            }
-            _ => {}
+    for session in sessions {
+        // A Session may close after the App snapshots its handles. The saved
+        // configuration is still valid and will apply when it is next opened.
+        match session.notify_config_changed(force).await {
+            Ok(()) | Err(Error::Closed) => {}
+            Err(error) => return Err(error),
         }
     }
-    first_error.map_or(Ok(()), Err)
-}
-
-async fn await_app_task<T>(task: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
-    task.await.map_err(|error| {
-        Error::InvalidState(format!("application configuration task failed: {error}"))
-    })?
+    Ok(())
 }
 
 #[cfg(test)]

@@ -115,7 +115,6 @@ pub enum CommandKind {
     Help,
     Model,
     ReloadConfig,
-    TrustConfig,
     Details,
     Answer,
     Recover,
@@ -147,12 +146,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "reload-config",
         usage: "",
         summary: "Reload user and project configuration",
-    },
-    CommandSpec {
-        kind: CommandKind::TrustConfig,
-        name: "trust-config",
-        usage: "",
-        summary: "Trust the current project configuration",
     },
     CommandSpec {
         kind: CommandKind::Answer,
@@ -317,6 +310,7 @@ pub struct UiState {
     pub(crate) keyboard: KeyboardOwner,
     last_center: WorkspaceTarget,
     pub(crate) caret_visible: bool,
+    pub(crate) activity_frame: usize,
     pub(crate) orphan_draft: crate::editor::EditorBuffer,
     pub pending_create: Option<PendingCreate>,
     pub slash_selection: usize,
@@ -350,6 +344,7 @@ impl Default for UiState {
             keyboard: KeyboardOwner::Workspace(WorkspaceTarget::Composer),
             last_center: WorkspaceTarget::Composer,
             caret_visible: true,
+            activity_frame: 0,
             orphan_draft: Default::default(),
             pending_create: None,
             slash_selection: 0,
@@ -463,6 +458,108 @@ impl UiState {
         if self.last_center == WorkspaceTarget::SessionTitle {
             self.last_center = WorkspaceTarget::Composer;
         }
+    }
+
+    /// Derived from outstanding work, never from the mere existence of a runtime.
+    pub(crate) fn execution_feedback(&self) -> Option<(&str, bool)> {
+        use bone_app::{ActivityKind, InputState, JobState, RuntimeState};
+        if self
+            .pending_create
+            .as_ref()
+            .is_some_and(|pending| !pending.failed && pending.first_input.is_some())
+        {
+            return Some(("Sending request", true));
+        }
+        let ui = self.selected_ui()?;
+        if ui
+            .submitting
+            .as_ref()
+            .or(ui.bootstrap_submission.as_ref())
+            .is_some_and(|pending| !pending.failed)
+        {
+            return Some(("Sending request", true));
+        }
+        let snapshot = ui.snapshot.as_ref()?;
+        if snapshot.problem.is_some() {
+            return None;
+        }
+        match snapshot.runtime {
+            RuntimeState::Detached => return None,
+            RuntimeState::Starting => return Some(("Starting", true)),
+            RuntimeState::Closing { .. } => return Some(("Stopping", true)),
+            RuntimeState::Running { .. } => {}
+        }
+        if let Some(activity) = snapshot.activity.last() {
+            let label = activity
+                .progress
+                .as_deref()
+                .unwrap_or(match &activity.kind {
+                    ActivityKind::Converse => "Responding",
+                    ActivityKind::Work => "Waiting for model response",
+                    ActivityKind::Compact => "Compacting context",
+                    ActivityKind::Tool { name, .. } => name,
+                });
+            return Some((label, true));
+        }
+        if snapshot
+            .jobs
+            .iter()
+            .any(|job| matches!(job.state, JobState::Ready | JobState::Running))
+        {
+            return Some(("Working", true));
+        }
+        if snapshot
+            .inputs
+            .iter()
+            .any(|input| matches!(input.state, InputState::WaitingForUser { .. }))
+        {
+            return Some(("Waiting for your answer", false));
+        }
+        if snapshot
+            .jobs
+            .iter()
+            .any(|job| matches!(job.state, JobState::Paused))
+        {
+            return Some(("Paused", false));
+        }
+        if snapshot
+            .jobs
+            .iter()
+            .any(|job| matches!(job.state, JobState::Waiting(_)))
+        {
+            return Some(("Waiting for work to finish", true));
+        }
+        if snapshot.inputs.iter().any(|input| {
+            matches!(
+                input.state,
+                InputState::Posting { .. } | InputState::Accepted { .. }
+            )
+        }) {
+            return Some(("Preparing next step", true));
+        }
+        snapshot.inputs.last().map(|input| {
+            (
+                match &input.state {
+                    InputState::Queued { .. } => "Request queued",
+                    InputState::ConversationFailed { .. } | InputState::Rejected { .. } => {
+                        "Request failed · open error for details"
+                    }
+                    InputState::Finished { outcome, .. } => match outcome {
+                        bone_app::InputOutcome::Completed => "Completed",
+                        bone_app::InputOutcome::Failed => "Request failed · open error for details",
+                        bone_app::InputOutcome::Cancelled => "Cancelled",
+                    },
+                    InputState::Cancelled => "Cancelled",
+                    InputState::Interrupted { .. } => "Interrupted",
+                    _ => "",
+                },
+                false,
+            )
+        })
+    }
+
+    pub(crate) fn activity_animation_active(&self) -> bool {
+        !self.quitting && self.execution_feedback().is_some_and(|(_, active)| active)
     }
 
     pub(crate) fn blinking_caret_active(&self) -> bool {

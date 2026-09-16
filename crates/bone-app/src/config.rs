@@ -319,36 +319,28 @@ impl ModelSelection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ToolMode {
-    #[default]
-    ReadOnly,
-    WorkspaceWrite,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ToolSettings {
-    pub mode: ToolMode,
-    pub limits: ToolLimits,
-}
-
-impl Default for ToolSettings {
-    fn default() -> Self {
-        Self {
-            mode: ToolMode::ReadOnly,
-            limits: ToolLimits::default(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeSettings {
     pub worker: Option<ModelSelection>,
     pub coordinator: Option<ModelSelection>,
     pub limits: AgentLimits,
-    pub tools: ToolSettings,
+    pub tools: ToolLimits,
+}
+
+impl Default for RuntimeSettings {
+    fn default() -> Self {
+        let tools = ToolLimits::default();
+        Self {
+            worker: None,
+            coordinator: None,
+            limits: AgentLimits {
+                tool_timeout: tools.max_bash_timeout + std::time::Duration::from_secs(1),
+                ..AgentLimits::default()
+            },
+            tools,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -357,7 +349,7 @@ pub struct RuntimeOverrides {
     pub worker: Option<ModelSelection>,
     pub coordinator: Option<ModelSelection>,
     pub limits: Option<AgentLimits>,
-    pub tools: Option<ToolSettings>,
+    pub tools: Option<ToolLimits>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -373,7 +365,7 @@ pub enum ConfigChange {
     Worker(Option<ModelSelection>),
     Coordinator(Option<ModelSelection>),
     Limits(Option<AgentLimits>),
-    Tools(Option<ToolSettings>),
+    Tools(Option<ToolLimits>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -400,7 +392,7 @@ pub struct RuntimeConfig {
     pub coordinator: ResolvedModel,
     pub worker: ResolvedModel,
     pub limits: AgentLimits,
-    pub tools: ToolSettings,
+    pub tools: ToolLimits,
     pub workspace: PathBuf,
 }
 
@@ -474,15 +466,13 @@ fn validate_runtime(
     worker: &ModelSelection,
     coordinator: &ModelSelection,
     limits: &AgentLimits,
-    tools: &ToolSettings,
+    tools: &ToolLimits,
 ) -> Result<(), ConfigError> {
     worker.validate()?;
     coordinator.validate()?;
     validate_agent_limits(limits)?;
-    validate_tool_settings(tools)?;
-    if tools.mode == ToolMode::WorkspaceWrite
-        && limits.tool_timeout <= tools.limits.max_bash_timeout
-    {
+    validate_tool_limits(tools)?;
+    if limits.tool_timeout <= tools.max_bash_timeout {
         return Err(ConfigError::InvalidToolTimeout);
     }
     Ok(())
@@ -499,13 +489,10 @@ pub(crate) fn validate_agent_limits(limits: &AgentLimits) -> Result<(), ConfigEr
     Ok(())
 }
 
-pub(crate) fn validate_tool_settings(tools: &ToolSettings) -> Result<(), ConfigError> {
-    tools
-        .limits
-        .validate()
-        .map_err(|_| ConfigError::InvalidLimits)?;
-    if tools.limits.max_output_bytes > MAX_TOOL_STREAM_BYTES
-        || tools.limits.max_patch_bytes > MAX_PERSISTED_VALUE_BYTES
+pub(crate) fn validate_tool_limits(tools: &ToolLimits) -> Result<(), ConfigError> {
+    tools.validate().map_err(|_| ConfigError::InvalidLimits)?;
+    if tools.max_output_bytes > MAX_TOOL_STREAM_BYTES
+        || tools.max_patch_bytes > MAX_PERSISTED_VALUE_BYTES
     {
         return Err(ConfigError::PersistentPayloadLimit);
     }
@@ -560,9 +547,22 @@ mod tests {
         RuntimeSettings {
             worker: Some(model("user-worker")),
             coordinator: None,
-            limits: AgentLimits::default(),
-            tools: ToolSettings::default(),
+            limits: RuntimeSettings::default().limits,
+            tools: ToolLimits::default(),
         }
+    }
+
+    #[test]
+    fn application_defaults_allow_bash_to_finish_before_the_outer_deadline() {
+        let settings = settings();
+        assert!(settings.limits.tool_timeout > settings.tools.max_bash_timeout);
+        let mut limits = settings.limits.clone();
+        limits.tool_timeout = settings.tools.max_bash_timeout;
+        let worker = settings.worker.unwrap();
+        assert_eq!(
+            validate_runtime(&worker, &worker, &limits, &settings.tools),
+            Err(ConfigError::InvalidToolTimeout)
+        );
     }
 
     #[test]
@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn bash_stream_limits_leave_room_for_json_escaping() {
         let mut oversized_stream = settings();
-        oversized_stream.tools.limits.max_output_bytes = MAX_TOOL_STREAM_BYTES + 1;
+        oversized_stream.tools.max_output_bytes = MAX_TOOL_STREAM_BYTES + 1;
         let error = resolve_runtime(
             &oversized_stream,
             None,

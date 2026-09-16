@@ -53,10 +53,6 @@ fn fixture(event: SessionEvent) -> UiState {
 
 fn reply(text: &str) -> UiState {
     fixture(SessionEvent::Reply {
-        job: bone_app::JobRef {
-            runtime: bone_app::RuntimeId::new(),
-            id: 1,
-        },
         inputs: vec![],
         text: text.into(),
     })
@@ -68,6 +64,7 @@ fn tool() -> UiState {
         call: bone_app::CallRef { runtime, id: 1 },
         job: bone_app::JobRef { runtime, id: 1 },
         tool: "read".into(),
+        arguments: serde_json::json!({}),
         outcome: bone_app::ToolOutcome {
             result: Ok(
                 serde_json::json!({"lines": (0..100).map(|n| format!("line {n}: 中文 e\u{301}")).collect::<Vec<_>>()}),
@@ -542,7 +539,7 @@ fn failed_requests_open_complete_copyable_details_without_taking_keyboard_focus(
         "provider detail: gpt-5.3 rejected\n".repeat(60)
     );
     for event in [
-        SessionEvent::RoutingFailed {
+        SessionEvent::ConversationFailed {
             runtime: bone_app::RuntimeId::new(),
             inputs: vec![bone_app::InputId(1)],
             message: message.clone(),
@@ -621,5 +618,72 @@ fn failed_requests_open_complete_copyable_details_without_taking_keyboard_focus(
             assert_eq!(state.keyboard, owner);
             assert_eq!(state.draft(), "ab界cd");
         }
+    }
+}
+
+#[test]
+fn read_details_render_line_numbers_but_copy_original_text_after_wrapping() {
+    let text = "    let value = \"中文🙂 e\u{301} and a long line that wraps in the details panel\";\r\n\tfinish();\n";
+    for width in [60, 160] {
+        let runtime = bone_app::RuntimeId::new();
+        let mut state = fixture(SessionEvent::ToolFinished {
+            call: bone_app::CallRef { runtime, id: 1 },
+            job: bone_app::JobRef { runtime, id: 1 },
+            tool: "read".into(),
+            arguments: serde_json::json!({"path":"src/main.rs", "offset":20}),
+            outcome: bone_app::ToolOutcome::value(serde_json::json!({
+                "path":"src/main.rs", "start_line":20, "end_line":21,
+                "content":text, "truncated":false, "line_truncated":false
+            })),
+        });
+        let keyboard = state.keyboard;
+        let frame = draw(&mut state, width, 40);
+        let start = position(&frame, transcript(&state), 0);
+        mouse(
+            &mut state,
+            &frame,
+            MouseEventKind::Down(MouseButton::Left),
+            start,
+        );
+        mouse(
+            &mut state,
+            &frame,
+            MouseEventKind::Up(MouseButton::Left),
+            start,
+        );
+        let content = &state.details.as_ref().unwrap().content;
+        let range = content.numbered[0].range.clone();
+        assert_eq!(&content.text[range.clone()], text);
+        let source = CopySource::Details {
+            session: content.session,
+            source: content.source,
+        };
+        let frame = draw(&mut state, width, 40);
+        let start = position(&frame, source, range.start);
+        let end = position(&frame, source, range.end);
+        // Numbers sit outside selectable source text.
+        assert!(frame.text_at(start.0 - 1, start.1).is_none());
+        mouse(
+            &mut state,
+            &frame,
+            MouseEventKind::Down(MouseButton::Left),
+            start,
+        );
+        mouse(
+            &mut state,
+            &frame,
+            MouseEventKind::Drag(MouseButton::Left),
+            end,
+        );
+        assert_eq!(
+            copied(mouse(
+                &mut state,
+                &frame,
+                MouseEventKind::Up(MouseButton::Left),
+                end
+            )),
+            [text]
+        );
+        assert_eq!(state.keyboard, keyboard);
     }
 }

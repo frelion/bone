@@ -38,15 +38,17 @@ class ProfileTests(unittest.TestCase):
             entry(1_260, {"ToolFinished": {"job": root, "tool": "bash", "outcome": {"result": {"Ok": {"exit_code": 0, "stdout": "Ran 2 tests in 0.1s\n\nOK\n", "stderr": ""}}}}}),
             entry(1_280, {"JobFinished": {"job": child, "outcome": "Completed"}}),
             entry(1_300, {"JobFinished": {"job": root, "outcome": "Completed"}}),
+            entry(1_330, {"Reply": {"inputs": [1], "text": "Verified and finished."}}),
+            entry(1_330, {"InputFinished": {"input": 1, "outcome": "Completed"}}),
         ]
 
         profile = build_profile(trajectory)
 
-        self.assertEqual(profile["wall_duration_ms"], 300)
+        self.assertEqual(profile["wall_duration_ms"], 330)
         self.assertEqual(profile["call_active_union_ms"], 150)
-        self.assertEqual(profile["outside_call_ms"], 150)
+        self.assertEqual(profile["outside_call_ms"], 180)
         self.assertEqual(profile["call_counts"], {"tool:bash": 1, "work": 1})
-        self.assertEqual(profile["post_verification_ms"], 40)
+        self.assertEqual(profile["post_verification_ms"], 70)
         self.assertEqual(
             profile["duplicate_reads_across_jobs"],
             [{"path": "a.py", "jobs": [1, 2]}],

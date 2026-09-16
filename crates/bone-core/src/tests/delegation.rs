@@ -193,13 +193,10 @@ fn new_user_input_interrupts_a_group_wait() {
     );
     let update = Input::new(InputId(2), "stop and review this changed requirement");
     let (_, effects) = kernel.accept(NOW, update.clone()).unwrap();
-    let effects = route_existing(&mut kernel, &effects, parent.job, &[update.id]);
+    let effects = send_existing(&mut kernel, &effects, parent.job, &[update.id]);
     let calls = work_calls(&effects);
     assert!(calls.iter().any(|(_, input)| input.job == parent.job));
-    assert_eq!(
-        kernel.inputs[&update.id].pending_review_by,
-        Some(parent.job)
-    );
+    assert!(!kernel.inputs[&update.id].pending);
 }
 
 #[test]
@@ -468,49 +465,6 @@ fn snapshot_preserves_subtree_limits_and_missing_current_limits_are_invalid() {
     assert!(
         Kernel::restore(
             invalid,
-            kernel.records.values().cloned().collect(),
-            AgentLimits::default(),
-            vec![]
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn legacy_pending_delegation_migrates_without_replaying_and_v2_counters_are_required() {
-    let mut kernel = kernel();
-    let (call, root) = parent(&mut kernel);
-    for version in [1, 2] {
-        let mut snapshot = kernel.durable_snapshot().unwrap();
-        snapshot.version = version;
-        let job = &mut snapshot.payload["jobs"][root.job.to_string()];
-        job.as_object_mut().unwrap().remove("delegation");
-        if version == 1 {
-            job.as_object_mut().unwrap().remove("work_rejections");
-        }
-        let mut legacy = serde_json::to_value(assignment("old child", &[])).unwrap();
-        legacy.as_object_mut().unwrap().remove("delegation");
-        job["state"] = json!({"Waiting":{"Commit":{"call":call,"step":{"Delegate":[legacy]}}}});
-        let (restored, effects) = Kernel::restore(
-            snapshot,
-            kernel.records.values().cloned().collect(),
-            AgentLimits::default(),
-            vec![],
-        )
-        .unwrap();
-        assert_eq!(restored.jobs.len(), 1);
-        assert!(finished_as(&restored, root.job, OutcomeKind::Failed));
-        assert!(starts(&effects).next().is_none());
-    }
-    let mut snapshot = kernel.durable_snapshot().unwrap();
-    snapshot.version = 2;
-    snapshot.payload["jobs"][root.job.to_string()]
-        .as_object_mut()
-        .unwrap()
-        .remove("work_rejections");
-    assert!(
-        Kernel::restore(
-            snapshot,
             kernel.records.values().cloned().collect(),
             AgentLimits::default(),
             vec![]
