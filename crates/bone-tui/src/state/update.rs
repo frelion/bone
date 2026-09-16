@@ -1,18 +1,21 @@
 use bone_app::{RequestId, SessionId, SubmitInput};
 
-use crate::editor::{CursorMove, EditCommand};
+#[cfg(test)]
+use crate::editor::CursorMove;
+use crate::editor::EditCommand;
 
 use super::{
     HISTORY_CACHE_BYTES, Status,
     answer::{self, AnswerDraft, RecoveryCandidate},
+    details,
     model::*,
-    panel,
+    overlay,
     protocol::*,
     title::{AutoTitleSettlement, ManualTitleSettlement, TitleCommit, TitleWrite},
 };
 
 #[cfg(test)]
-use super::{ModelPanel, ModelScreen, Panel, ReaderPanel};
+use super::{ModelPanel, ModelScreen, Overlay, ReaderState};
 
 pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
     if matches!(event, UiEvent::CaretBlink) {
@@ -21,6 +24,32 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             state.dirty = true;
         }
         return Vec::new();
+    }
+    match event {
+        UiEvent::PointerMoved { column, row } => {
+            let position = Some((column, row));
+            if state.pointer.position != position {
+                state.pointer.position = position;
+                state.dirty = true;
+            }
+            return Vec::new();
+        }
+        UiEvent::PointerLeft => {
+            state.pointer.press = None;
+            state.pointer.selection = None;
+            state.pointer.position = None;
+            state.pointer.capture = None;
+            state.dirty = true;
+            return Vec::new();
+        }
+        UiEvent::CancelPointerCapture => {
+            state.pointer.press = None;
+            state.pointer.selection = None;
+            state.pointer.capture = None;
+            state.dirty = true;
+            return Vec::new();
+        }
+        _ => {}
     }
     // Scheduling background work does not change the screen. In particular,
     // the 500ms draft timer must not continually re-show the native caret.
@@ -46,35 +75,35 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             session,
             error,
             key_saved,
-        } => panel::connection_saved(state, request, session, error, key_saved, &mut effects),
+        } => overlay::connection_saved(state, request, session, error, key_saved, &mut effects),
 
         UiEvent::LoginChanged {
             request,
             state: login,
-        } => panel::login_changed(state, request, login, &mut effects),
+        } => overlay::login_changed(state, request, login, &mut effects),
         UiEvent::ModelFactsLoaded {
             session,
             request,
             facts,
-        } => panel::model_facts_loaded(state, session, request, facts),
+        } => overlay::model_facts_loaded(state, session, request, facts),
         UiEvent::ModelsFailed {
             session,
             request,
             error,
-        } => panel::models_failed(state, session, request, error),
+        } => overlay::models_failed(state, session, request, error),
         UiEvent::ModelsLoaded {
             session,
             request,
             choices,
             profiles,
-        } => panel::models_loaded(state, session, request, choices, profiles),
+        } => overlay::models_loaded(state, session, request, choices, profiles),
         UiEvent::ModelApplied {
             session,
             request,
             facts,
             error,
             login_required,
-        } => panel::model_applied(
+        } => overlay::model_applied(
             state,
             session,
             request,
@@ -84,6 +113,9 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             &mut effects,
         ),
         UiEvent::Action(action) => handle_action(state, action, &mut effects),
+        UiEvent::PointerMoved { .. } | UiEvent::PointerLeft | UiEvent::CancelPointerCapture => {
+            unreachable!("pointer state returns before business dispatch")
+        }
         UiEvent::WorkspaceOpened {
             label,
             rows,
@@ -174,7 +206,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     .get(&session)
                     .is_some_and(|ui| ui.generation == generation)
             {
-                panel::refresh_reader(state, &snapshot);
+                details::refresh_reader(state, &snapshot);
             }
             if state
                 .session_ui
@@ -263,11 +295,13 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     .iter()
                     .any(|row| row.id() == id && !row.info().archived)
             }) {
+                overlay::dismiss_session(state, &mut effects);
                 state.selected = None;
+                state.details = None;
+                state.cancel_editor_capture();
                 state.clear_title_edit();
-                panel::dismiss(state, &mut effects);
                 state.remove_title_focus();
-                panel::refresh_model_facts(state, &mut effects);
+                overlay::refresh_model_facts(state, &mut effects);
             }
             if state.session_candidate.is_some_and(|id| {
                 !state
@@ -295,6 +329,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             session,
             request_id,
         } => {
+            let previous_answer = state.selected_ui().and_then(|ui| ui.selected_answer);
             let mut auto_title = None;
             let mut submitted = false;
             if let Some(ui) = state.session_ui.get_mut(&session)
@@ -348,6 +383,9 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                     first_input: auto_title.first_input,
                 });
             }
+            if previous_answer != state.selected_ui().and_then(|ui| ui.selected_answer) {
+                state.cancel_editor_capture();
+            }
         }
         UiEvent::SubmitFailed {
             session,
@@ -387,7 +425,7 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                         .session_rows
                         .insert(0, SessionNavRow::provisional(info.clone()));
                 }
-                if state.focus == Focus::SessionTitle {
+                if state.workspace_target() == WorkspaceTarget::SessionTitle {
                     commit_title_edit(state, &mut effects);
                 }
                 select_session(state, info.id, &mut effects);
@@ -550,15 +588,9 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
                 state.status = Some(Status::session(session, generation, message));
             }
         }
-        UiEvent::Resized { width, height } => {
-            state.dragging_divider = None;
-            if !crate::layout::right_rail_available(width, height) {
-                let center = state.last_center_focus();
-                if state.focus == Focus::RightRail {
-                    state.set_focus(center);
-                    state.caret_visible = true;
-                }
-            }
+        UiEvent::Resized => {
+            state.pointer.capture = None;
+            state.pointer.press = None;
         }
         UiEvent::CaretBlink => unreachable!("caret blink returns before event dispatch"),
     }
@@ -568,65 +600,102 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
 }
 
 fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>) {
-    state.caret_visible = true;
-    let leaves_title = matches!(
-        action,
-        Action::OpenModels
-            | Action::OpenHistory(_)
-            | Action::OpenJob(_)
-            | Action::SelectSession(_)
-            | Action::OpenCandidate
-            | Action::Quit
-    );
-    if state.focus == Focus::SessionTitle && leaves_title {
-        commit_title_edit(state, effects);
-    }
-    if !matches!(action, Action::BeginPaneResize(_) | Action::DragPane { .. }) {
-        state.dragging_divider = None;
-    }
-    let continuous = matches!(
-        (&action, state.focus),
-        (
-            Action::Edit {
-                target: EditorTarget::SessionTitle,
-                command: EditCommand::Insert { typing: true, .. }
-                    | EditCommand::Move {
-                        cursor: CursorMove::Up { .. } | CursorMove::Down { .. },
-                        ..
-                    },
-            },
-            Focus::SessionTitle,
-        ) | (
-            Action::Edit {
-                target: EditorTarget::Composer,
-                command: EditCommand::Insert { typing: true, .. }
-                    | EditCommand::Move {
-                        cursor: CursorMove::Up { .. } | CursorMove::Down { .. },
-                        ..
-                    },
-            },
-            Focus::Composer,
-        )
-    );
-    if !continuous {
-        if state.focus == Focus::SessionTitle && state.titles.edit_target().is_some() {
-            state.titles.break_interaction();
-        } else {
-            state.editor_mut().break_interaction();
-        }
-    }
     match action {
-        Action::BeginPaneResize(divider) => state.dragging_divider = Some(divider),
+        Action::PressPointer {
+            target,
+            position,
+            text,
+        } => {
+            state.pointer.capture = Some(PointerCapture::Content);
+            state.pointer.press = Some(super::PointerPress {
+                target: target.map(|target| *target),
+                position,
+                dragged: false,
+            });
+            state.pointer.selection = text.map(|(anchor, original)| super::TextSelection {
+                anchor,
+                end: anchor,
+                original,
+            });
+        }
+        Action::DragTextSelection { point } => {
+            if let Some(press) = &mut state.pointer.press {
+                press.dragged = true;
+            }
+            if let Some(selection) = &mut state.pointer.selection
+                && let Some(point) = point
+            {
+                selection.end = point;
+            }
+        }
+        Action::ReleasePointer { click, point, text } => {
+            state.pointer.capture = None;
+            state.pointer.press = None;
+            if let Some(selection) = &mut state.pointer.selection
+                && let Some(point) = point
+            {
+                selection.end = point;
+            }
+            if let Some(text) = text
+                && !text.is_empty()
+            {
+                effects.push(Effect::CopyText(text));
+            }
+            if let Some(click) = click {
+                handle_action(state, *click, effects);
+            }
+        }
+        Action::FinishEditorSelection { target, byte } => {
+            if state.pointer.capture == Some(PointerCapture::Editor(target)) {
+                edit(state, target, EditCommand::Point { byte, extend: true });
+                let editor = match target {
+                    EditorTarget::Composer => Some(state.editor()),
+                    EditorTarget::SessionTitle => state.title_editor(),
+                };
+                if let Some(editor) = editor
+                    && let Some(range) = editor.selection()
+                {
+                    effects.push(Effect::CopyText(crate::text::sanitize_external(
+                        &editor.text()[range],
+                    )));
+                }
+            }
+            state.pointer.capture = None;
+        }
+        Action::BeginPaneResize(divider) => {
+            state.pointer.press = None;
+            state.pointer.selection = None;
+            state.pointer.capture = Some(PointerCapture::Divider(divider))
+        }
         Action::DragPane { widths, finish } => {
-            if state.dragging_divider.is_some() {
+            if matches!(state.pointer.capture, Some(PointerCapture::Divider(_))) {
                 state.pane_widths = widths;
                 if finish {
-                    state.dragging_divider = None;
+                    state.pointer.capture = None;
                 }
             }
         }
-        Action::EndPaneResize => {}
-        Action::Edit { target, command } => edit(state, target, command, effects),
+        Action::EndPointerCapture => state.pointer.capture = None,
+        Action::PointEditor {
+            target,
+            byte,
+            extend,
+            begin,
+        } => {
+            let active = match target {
+                EditorTarget::Composer => WorkspaceTarget::Composer,
+                EditorTarget::SessionTitle => WorkspaceTarget::SessionTitle,
+            };
+            if state.keyboard == KeyboardOwner::Workspace(active) {
+                if begin {
+                    state.pointer.press = None;
+                    state.pointer.selection = None;
+                    state.pointer.capture = Some(PointerCapture::Editor(target));
+                }
+                edit(state, target, EditCommand::Point { byte, extend });
+            }
+        }
+        Action::Edit { target, command } => edit(state, target, command),
         Action::CommitTitle => commit_title_edit(state, effects),
         Action::CancelTitle => {
             let target = state.titles.edit_target();
@@ -644,66 +713,82 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
             }) {
                 state.status = None;
             }
-            state.set_focus(Focus::Composer);
+            state.set_workspace_target(WorkspaceTarget::Composer);
         }
         Action::StartSlashCommand => {
-            if state.panel.is_none()
+            if state.overlay.is_none()
                 && state.draft().is_empty()
                 && state
                     .selected_ui()
                     .is_none_or(|ui| ui.selected_answer.is_none())
             {
-                set_action_focus(state, Focus::Composer, effects);
                 state.editor_mut().apply(EditCommand::Insert {
                     text: "/".into(),
                     typing: true,
                 });
+                if state.keyboard == KeyboardOwner::Workspace(WorkspaceTarget::Composer) {
+                    state.caret_visible = true;
+                }
             }
         }
-        Action::OpenModels => panel::open_models(state, effects),
-        Action::SelectObject(index) => panel::select_object(state, index, effects),
-        Action::OpenHistory(sequence) => panel::open_history(state, sequence, effects),
-        Action::OpenJob(job) => panel::open_job(state, job, effects),
-        Action::PanelPrevious => panel::panel_previous(state),
-        Action::PanelNext => panel::panel_next(state),
-        Action::SelectModel(index) => panel::select_model(state, index, effects),
-        Action::SetupText(value) => panel::setup_text(state, value),
-        Action::SetupClear => panel::setup_clear(state),
-        Action::SetupBackspace => panel::setup_backspace(state),
-        Action::NextField | Action::PreviousField => {
-            panel::move_setup_field(state, matches!(action, Action::NextField));
+        Action::ToggleOverlayKeyboard => {
+            if state.keyboard.is_overlay() {
+                state.leave_overlay();
+            } else {
+                enter_overlay(state, effects);
+            }
         }
-        Action::SelectField(field) => panel::select_setup_field(state, field),
-        Action::ChooseConnection(index) => panel::choose_connection(state, index, effects),
-        Action::SaveConnection => panel::save_connection(state, effects),
-        Action::ActivatePanel => panel::activate(state, effects),
-        Action::ScrollPanel { amount, max } => panel::scroll_reader(state, amount, max),
+        Action::CloseOverlay => overlay::dismiss(state, effects),
+        Action::OverlayBack => {
+            overlay::escape(state, effects);
+        }
+        Action::CloseDetails => state.details = None,
+        Action::OpenModels => overlay::open_models(state, effects),
+        Action::SelectObject(index) => overlay::select_object(state, index, effects),
+        Action::OpenHistory(sequence) => details::open_history(state, sequence),
+        Action::OpenJob(job) => details::open_job(state, job),
+        Action::PanelPrevious => overlay::panel_previous(state),
+        Action::PanelNext => overlay::panel_next(state),
+        Action::SelectModel(index) => overlay::select_model(state, index, effects),
+        Action::SetupText(value) => overlay::setup_text(state, value),
+        Action::SetupClear => overlay::setup_clear(state),
+        Action::SetupBackspace => overlay::setup_backspace(state),
+        Action::NextField | Action::PreviousField => {
+            state.cancel_editor_capture();
+            overlay::move_setup_field(state, matches!(action, Action::NextField));
+        }
+        Action::ChooseConnection(index) => overlay::choose_connection(state, index, effects),
+        Action::SaveConnection => overlay::save_connection(state, effects),
+        Action::ActivatePanel => overlay::activate(state, effects),
+        Action::ScrollOverlay { amount, max } => {
+            state.overlay_scroll = state.overlay_scroll.saturating_add_signed(amount).min(max);
+        }
+        Action::ScrollDetails { amount, max } => details::scroll_reader(state, amount, max),
 
-        Action::Focus(focus) => {
+        #[cfg(test)]
+        Action::SetWorkspaceTarget(focus) => {
             set_action_focus(state, focus, effects);
         }
-        Action::FocusLeft => match state.focus {
-            Focus::SessionTitle | Focus::Composer => {
-                set_action_focus(state, Focus::Sessions, effects)
+        Action::FocusLeft => match state.workspace_target() {
+            WorkspaceTarget::SessionTitle | WorkspaceTarget::Composer => {
+                set_action_focus(state, WorkspaceTarget::Sessions, effects)
             }
-            Focus::RightRail => set_action_focus(state, state.last_center_focus(), effects),
-            Focus::Sessions => {}
+            WorkspaceTarget::Sessions => {}
         },
-        Action::FocusRight => match state.focus {
-            Focus::Sessions => set_action_focus(state, state.last_center_focus(), effects),
-            Focus::SessionTitle | Focus::Composer => {
-                set_action_focus(state, Focus::RightRail, effects)
+        Action::FocusRight => match state.workspace_target() {
+            WorkspaceTarget::Sessions => {
+                set_action_focus(state, state.last_center_target(), effects)
             }
-            Focus::RightRail => {}
+            WorkspaceTarget::SessionTitle | WorkspaceTarget::Composer => {}
         },
         Action::FocusUp => {
-            if state.focus == Focus::Composer {
-                set_action_focus(state, Focus::SessionTitle, effects);
+            if state.workspace_target() == WorkspaceTarget::Composer {
+                set_action_focus(state, WorkspaceTarget::SessionTitle, effects);
             }
         }
         Action::FocusDown => {
-            if state.focus == Focus::SessionTitle {
-                set_action_focus(state, Focus::Composer, effects);
+            if state.workspace_target() == WorkspaceTarget::SessionTitle {
+                set_action_focus(state, WorkspaceTarget::Composer, effects);
             }
         }
         Action::SelectPrevious => move_session(state, -1),
@@ -724,22 +809,32 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::SelectSlashPrevious => move_slash(state, -1),
         Action::SelectSlashNext => move_slash(state, 1),
         Action::CompleteSlash => complete_slash(state),
-        Action::ExecuteCommand(kind) => {
-            if let Some(index) = state
-                .slash_matches()
-                .iter()
-                .position(|command| command.kind == kind)
-            {
-                state.slash_selection = index;
-                submit(state, effects);
+        Action::DismissCommands => {
+            state.slash_dismissed = Some(state.draft_identity());
+        }
+        Action::PrepareCommand(kind) => {
+            if let Some(spec) = COMMANDS.iter().find(|spec| spec.kind == kind) {
+                let text = format!(
+                    "/{}{}",
+                    spec.name,
+                    if spec.usage.is_empty() { "" } else { " " }
+                );
+                let cursor = text.len();
+                state.editor_mut().replace_user(text, cursor);
+                state.slash_dismissed = None;
+                state.cancel_editor_capture();
+                if state.keyboard == KeyboardOwner::Workspace(WorkspaceTarget::Composer) {
+                    state.caret_visible = true;
+                }
             }
         }
-        Action::Submit => submit(state, effects),
-        Action::ClickSubmit => {
-            set_action_focus(state, Focus::Composer, effects);
-            submit(state, effects);
+        Action::ExecuteCommand { kind, argument } => {
+            execute_command(state, kind, &argument, effects)
         }
+        Action::CommandError(message) => set_selection_status(state, message),
+        Action::Submit => submit(state, effects),
         Action::AnswerQuestion(question) => {
+            state.cancel_editor_capture();
             if let Some(ui) = state.selected_ui_mut() {
                 if ui
                     .snapshot
@@ -750,7 +845,6 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
                         .entry(question)
                         .or_insert_with(|| AnswerDraft::new(question));
                     ui.selected_answer = Some(question);
-                    set_action_focus(state, Focus::Composer, effects);
                     state.status = None;
                 } else {
                     state.status = Some(Status::selection(
@@ -766,13 +860,14 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::RetryInput(input) => recover_input(state, input, true, effects),
         Action::RetrySubmission => retry_submission(state, effects),
         Action::Escape => {
-            if panel::escape(state, effects) {
+            state.pointer.capture = None;
+            if overlay::escape(state, effects) {
                 return;
             }
-            if state.focus == Focus::Sessions {
+            if state.workspace_target() == WorkspaceTarget::Sessions {
                 state.session_candidate = state.selected;
                 state.session_scroll = None;
-                state.set_focus(state.last_center_focus());
+                state.set_workspace_target(state.last_center_target());
                 return;
             }
             if state.slash_palette_visible() {
@@ -800,6 +895,7 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         }
         Action::Stop => effects.extend(stop_selected(state)),
         Action::Quit => {
+            commit_title_edit(state, effects);
             prepare_exit(state);
             dispatch_title_writes(state.titles.flush_for_exit(), effects);
             effects.push(Effect::Shutdown);
@@ -807,16 +903,11 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
     }
 }
 
-fn edit(
-    state: &mut UiState,
-    target: EditorTarget,
-    mut command: EditCommand,
-    effects: &mut Vec<Effect>,
-) {
-    if state.panel.is_some() {
+fn edit(state: &mut UiState, target: EditorTarget, mut command: EditCommand) {
+    if state.keyboard.is_overlay() {
         return;
     }
-    let points = matches!(&command, EditCommand::Point { .. });
+    state.caret_visible = true;
     let changes_text = matches!(
         &command,
         EditCommand::Insert { .. }
@@ -829,9 +920,7 @@ fn edit(
     );
     match target {
         EditorTarget::Composer => {
-            if points {
-                set_action_focus(state, Focus::Composer, effects);
-            } else if state.focus != Focus::Composer {
+            if state.workspace_target() != WorkspaceTarget::Composer {
                 return;
             }
             state.editor_mut().apply(command);
@@ -842,9 +931,7 @@ fn edit(
             }
         }
         EditorTarget::SessionTitle => {
-            if points {
-                set_action_focus(state, Focus::SessionTitle, effects);
-            } else if state.focus != Focus::SessionTitle {
+            if state.workspace_target() != WorkspaceTarget::SessionTitle {
                 return;
             }
             if !state.begin_title_edit() {
@@ -878,12 +965,23 @@ fn edit(
 /// Moves focus for a user action and commits the title exactly when that move
 /// leaves the title editor. Keeping this at the focus mutation point avoids
 /// persisting a title for unrelated scrolling or divider gestures.
-fn set_action_focus(state: &mut UiState, focus: Focus, effects: &mut Vec<Effect>) {
-    if state.focus == Focus::SessionTitle && focus != Focus::SessionTitle {
+fn set_action_focus(state: &mut UiState, focus: WorkspaceTarget, effects: &mut Vec<Effect>) {
+    if state.workspace_target() == WorkspaceTarget::SessionTitle
+        && focus != WorkspaceTarget::SessionTitle
+    {
         commit_title_edit(state, effects);
     }
-    if focus != Focus::SessionTitle || state.begin_title_edit() {
-        state.set_focus(focus);
+    if focus != WorkspaceTarget::SessionTitle || state.begin_title_edit() {
+        state.set_workspace_target(focus);
+    }
+}
+
+fn enter_overlay(state: &mut UiState, effects: &mut Vec<Effect>) {
+    if state.overlay.is_some() && !state.keyboard.is_overlay() {
+        if state.workspace_target() == WorkspaceTarget::SessionTitle {
+            commit_title_edit(state, effects);
+        }
+        state.enter_overlay();
     }
 }
 
@@ -905,18 +1003,8 @@ fn prepare_exit(state: &mut UiState) {
 }
 
 fn submit(state: &mut UiState, effects: &mut Vec<Effect>) {
-    if state.focus != Focus::Composer {
-        return;
-    }
     let text = state.draft().to_owned();
     if text.trim().is_empty() {
-        return;
-    }
-    let answering = state
-        .selected_ui()
-        .is_some_and(|ui| ui.selected_answer.is_some());
-    if !answering && let Some(command) = text.trim_start().strip_prefix('/') {
-        execute_command(state, command, effects);
         return;
     }
     if state.selected_ui().is_none() {
@@ -1035,6 +1123,7 @@ fn create_for_first_input(state: &mut UiState, text: String, effects: &mut Vec<E
 }
 
 fn leave_answer(state: &mut UiState) {
+    state.cancel_editor_capture();
     if let Some(ui) = state.selected_ui_mut() {
         ui.selected_answer = None;
     }
@@ -1042,6 +1131,7 @@ fn leave_answer(state: &mut UiState) {
 }
 
 fn convert_answer(state: &mut UiState) {
+    state.cancel_editor_capture();
     if let Some(ui) = state.selected_ui_mut() {
         let Some(question) = ui.selected_answer else {
             return;
@@ -1066,6 +1156,7 @@ fn recover_input(
     retry: bool,
     effects: &mut Vec<Effect>,
 ) {
+    state.cancel_editor_capture();
     let Some(ui) = state.selected_ui_mut() else {
         return;
     };
@@ -1091,10 +1182,6 @@ fn recover_input(
             ));
         }
         Some(RecoveryCandidate::Restore { text, reply_to, .. }) if !retry => {
-            set_action_focus(state, Focus::Composer, effects);
-            let Some(ui) = state.selected_ui_mut() else {
-                return;
-            };
             if let Some(question) = reply_to {
                 let answer = ui
                     .answer_drafts
@@ -1151,27 +1238,16 @@ fn retry_submission(state: &mut UiState, effects: &mut Vec<Effect>) {
     ));
 }
 
-fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
-    let trimmed = raw.trim();
-    let mut parts = trimmed.splitn(2, char::is_whitespace);
-    let typed = parts.next().unwrap_or_default();
-    let argument = parts.next().unwrap_or_default().trim();
-    let selected = if let Some(command) = COMMANDS.iter().find(|command| command.name == typed) {
-        Some(*command)
-    } else if argument.is_empty() {
-        state
-            .slash_matches()
-            .get(state.slash_selection)
-            .copied()
-            .copied()
-            .or_else(|| COMMANDS.iter().find(|spec| spec.name == typed).copied())
-    } else {
-        COMMANDS.iter().find(|spec| spec.name == typed).copied()
-    };
-    let Some(selected) = selected else {
-        set_selection_status(state, format!("Unknown command: /{typed}"));
-        return;
-    };
+fn execute_command(
+    state: &mut UiState,
+    kind: CommandKind,
+    argument: &str,
+    effects: &mut Vec<Effect>,
+) {
+    let selected = COMMANDS
+        .iter()
+        .find(|spec| spec.kind == kind)
+        .expect("registered command kind");
     match selected.kind {
         CommandKind::Answer if argument.is_empty() => {
             clear_current_draft(state, effects);
@@ -1237,7 +1313,8 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
 
         CommandKind::Model if argument.is_empty() => {
             clear_current_draft(state, effects);
-            panel::open_models(state, effects);
+            overlay::open_models(state, effects);
+            enter_overlay(state, effects);
         }
         CommandKind::ReloadConfig if argument.is_empty() => {
             clear_current_draft(state, effects);
@@ -1251,7 +1328,9 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
         }
         CommandKind::Details if argument.is_empty() => {
             clear_current_draft(state, effects);
-            panel::open_objects(state, effects);
+            if overlay::open_objects(state, effects) {
+                enter_overlay(state, effects);
+            }
         }
 
         CommandKind::New => {
@@ -1317,14 +1396,14 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
             });
         }
         CommandKind::Sessions if argument.is_empty() => {
-            state.set_focus(Focus::Sessions);
+            state.set_workspace_target(WorkspaceTarget::Sessions);
             clear_current_draft(state, effects);
         }
         CommandKind::Rename if argument.is_empty() => {
             if state.selected_ui().is_some() {
                 clear_current_draft(state, effects);
                 state.begin_title_edit();
-                state.set_focus(Focus::SessionTitle);
+                state.set_workspace_target(WorkspaceTarget::SessionTitle);
                 state.caret_visible = true;
             } else {
                 set_selection_status(state, "There is no session to rename");
@@ -1341,13 +1420,12 @@ fn execute_command(state: &mut UiState, raw: &str, effects: &mut Vec<Effect>) {
         }
         CommandKind::Help if argument.is_empty() => {
             clear_current_draft(state, effects);
-            panel::open_help(state, effects);
+            overlay::open_help(state, effects);
+            enter_overlay(state, effects);
         }
         CommandKind::Quit if argument.is_empty() => {
             clear_current_draft(state, effects);
-            prepare_exit(state);
-            dispatch_title_writes(state.titles.flush_for_exit(), effects);
-            effects.push(Effect::Shutdown);
+            handle_action(state, Action::Quit, effects);
         }
         _ => {
             let usage = if selected.usage.is_empty() {
@@ -1451,6 +1529,9 @@ fn complete_slash(state: &mut UiState) {
                 .apply(EditCommand::Replace { text: replacement });
         }
         state.slash_dismissed = None;
+        if state.keyboard == KeyboardOwner::Workspace(WorkspaceTarget::Composer) {
+            state.caret_visible = true;
+        }
     }
 }
 
@@ -1495,7 +1576,13 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
     if state.selected == Some(id) {
         return;
     }
-    panel::dismiss(state, effects);
+    if state.workspace_target() == WorkspaceTarget::SessionTitle {
+        commit_title_edit(state, effects);
+    }
+    state.finish_keyboard_interaction();
+    state.cancel_editor_capture();
+    state.details = None;
+    overlay::dismiss_session(state, effects);
     if let Some(previous) = state.selected
         && let Some(ui) = state.session_ui.get(&previous)
         && ui.draft.revision() <= ui.saved_draft_revision
@@ -1508,7 +1595,7 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
         });
     }
     state.selected = Some(id);
-    panel::refresh_model_facts(state, effects);
+    overlay::refresh_model_facts(state, effects);
     state.slash_dismissed = None;
     let generation = state.generation();
     let ui = state
@@ -1531,7 +1618,7 @@ fn select_session(state: &mut UiState, id: SessionId, effects: &mut Vec<Effect>)
     // Opening another Session changes content, not the user's chosen region.
     // If the title already owned focus, prepare the new title editor without
     // moving focus there from any other region.
-    if state.focus == Focus::SessionTitle {
+    if state.workspace_target() == WorkspaceTarget::SessionTitle {
         state.begin_title_edit();
     }
 }
@@ -1650,6 +1737,12 @@ fn trim_history_to_limit(state: &mut UiState, limit: usize) {
 }
 
 #[cfg(test)]
+fn keyboard_submit(state: &mut UiState) -> Vec<Effect> {
+    let action = crate::input::commands::submit_action(state);
+    update(state, UiEvent::Action(action))
+}
+
+#[cfg(test)]
 fn test_editor(command: EditCommand) -> Action {
     Action::Edit {
         target: EditorTarget::Composer,
@@ -1714,7 +1807,7 @@ mod tests {
     fn unknown_slash_is_never_submitted() {
         let mut state = UiState::default();
         update(&mut state, UiEvent::Action(test_insert("/does-not-exist")));
-        let effects = update(&mut state, UiEvent::Action(Action::Submit));
+        let effects = keyboard_submit(&mut state);
         assert!(effects.is_empty());
         assert_eq!(state.orphan_draft.text(), "/does-not-exist");
     }
@@ -1724,9 +1817,9 @@ mod tests {
         let mut state = UiState::default();
         update(&mut state, UiEvent::Action(test_insert("/model")));
 
-        let effects = update(&mut state, UiEvent::Action(Action::Submit));
+        let effects = keyboard_submit(&mut state);
 
-        assert!(matches!(state.panel, Some(Panel::Models(_))));
+        assert!(matches!(state.overlay, Some(Overlay::Models(_))));
         assert!(matches!(
             effects.as_slice(),
             [Effect::LoadModelFacts { .. }, Effect::LoadModels { .. }]
@@ -1742,10 +1835,10 @@ mod tests {
             UiEvent::Action(test_insert("/model chatgpt hidden-id")),
         );
 
-        let effects = update(&mut state, UiEvent::Action(Action::Submit));
+        let effects = keyboard_submit(&mut state);
 
         assert!(effects.is_empty());
-        assert!(state.panel.is_none());
+        assert!(state.overlay.is_none());
         assert_eq!(state.status_text(), Some("Usage: /model"));
         assert_eq!(state.draft(), "/model chatgpt hidden-id");
     }
@@ -1753,10 +1846,12 @@ mod tests {
     #[test]
     fn command_hint_starts_slash_only_for_an_empty_composer() {
         let mut state = UiState::default();
-        state.set_focus(Focus::Sessions);
+        state.set_workspace_target(WorkspaceTarget::Sessions);
         update(&mut state, UiEvent::Action(Action::StartSlashCommand));
         assert_eq!(state.draft(), "/");
-        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Sessions);
+        assert!(!state.slash_palette_visible());
+        update(&mut state, UiEvent::Action(Action::FocusRight));
         assert!(state.slash_palette_visible());
 
         update(&mut state, UiEvent::Action(test_insert("keep")));
@@ -1769,7 +1864,7 @@ mod tests {
     fn orphan_text_is_kept_until_new_session_exists() {
         let mut state = UiState::default();
         update(&mut state, UiEvent::Action(test_insert("keep me")));
-        let effects = update(&mut state, UiEvent::Action(Action::Submit));
+        let effects = keyboard_submit(&mut state);
         assert!(matches!(effects.as_slice(), [Effect::CreateSession { .. }]));
         assert_eq!(state.orphan_draft.text(), "keep me");
     }
@@ -2462,8 +2557,8 @@ mod panel_draft_tests {
                 report: None,
             }],
         }));
-        panel::open_objects(&mut state, &mut Vec::new());
-        let Some(Panel::Objects(objects)) = &state.panel else {
+        overlay::open_objects(&mut state, &mut Vec::new());
+        let Some(Overlay::Objects(objects)) = &state.overlay else {
             panic!("object menu")
         };
         let choices = &objects.choices;
@@ -2475,14 +2570,14 @@ mod panel_draft_tests {
             .unwrap();
         update(&mut state, UiEvent::Action(Action::SelectObject(target)));
         assert!(
-            matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content.source == ReaderSource::History(SessionSeq(1)) && reader.content.text.contains("Done"))
+            matches!(&state.details, Some(reader) if reader.content.source == ReaderSource::History(SessionSeq(1)) && reader.content.text.contains("Done"))
         );
         assert_drafts(&state, question);
-        update(&mut state, UiEvent::Action(Action::Escape));
-        panel::open_objects(&mut state, &mut Vec::new());
+        update(&mut state, UiEvent::Action(Action::CloseDetails));
+        overlay::open_objects(&mut state, &mut Vec::new());
         update(&mut state, UiEvent::Action(Action::ActivatePanel));
         assert!(
-            matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content.source == ReaderSource::Job(job))
+            matches!(&state.details, Some(reader) if reader.content.source == ReaderSource::Job(job))
         );
         assert_drafts(&state, question);
     }
@@ -2490,7 +2585,7 @@ mod panel_draft_tests {
     #[test]
     fn expired_or_cross_session_object_menu_never_substitutes_another_object() {
         let (mut state, question) = fixture();
-        panel::open_objects(&mut state, &mut Vec::new());
+        overlay::open_objects(&mut state, &mut Vec::new());
         state
             .selected_ui_mut()
             .unwrap()
@@ -2501,12 +2596,12 @@ mod panel_draft_tests {
                 snapshot_through: SessionSeq(0),
             });
         update(&mut state, UiEvent::Action(Action::ActivatePanel));
-        assert!(matches!(state.panel, Some(Panel::Objects(_))));
+        assert!(matches!(state.overlay, Some(Overlay::Objects(_))));
         assert!(state.status_text().unwrap().contains("no longer loaded"));
         assert_drafts(&state, question);
         state.selected = Some(SessionId::new());
         update(&mut state, UiEvent::Action(Action::SelectObject(0)));
-        assert!(matches!(state.panel, Some(Panel::Objects(_))));
+        assert!(matches!(state.overlay, Some(Overlay::Objects(_))));
         assert!(state.status_text().unwrap().contains("session changed"));
     }
 
@@ -2551,11 +2646,11 @@ mod panel_draft_tests {
                 report: None,
             }],
         };
-        state.panel = Some(Panel::Reader(ReaderPanel {
+        state.details = Some(ReaderState {
             content: super::super::reader::ReaderContent::from_job(&snapshot, job).unwrap(),
             scroll: 8,
-        }));
-        let focus = state.focus;
+        });
+        let focus = state.workspace_target();
         snapshot.jobs[0].state = bone_app::JobState::Finished {
             outcome: OutcomeKind::Completed,
             summary: "New result".into(),
@@ -2568,9 +2663,7 @@ mod panel_draft_tests {
                 snapshot: std::sync::Arc::new(snapshot.clone()),
             },
         );
-        assert!(
-            matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content.text.contains("Running"))
-        );
+        assert!(matches!(&state.details, Some(reader) if reader.content.text.contains("Running")));
         update(
             &mut state,
             UiEvent::SessionChanged {
@@ -2580,7 +2673,7 @@ mod panel_draft_tests {
             },
         );
         assert!(
-            matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content.text.contains("New result"))
+            matches!(&state.details, Some(reader) if reader.content.text.contains("New result"))
         );
         // Same numeric ID in another runtime is a different job, never a substitute.
         snapshot.jobs[0].id.runtime = RuntimeId::new();
@@ -2593,10 +2686,10 @@ mod panel_draft_tests {
             },
         );
         assert!(
-            matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content.source == super::super::reader::ReaderSource::Job(job) && reader.content.text.contains("no longer in the current snapshot") && !reader.content.text.contains("New result"))
+            matches!(&state.details, Some(reader) if reader.content.source == super::super::reader::ReaderSource::Job(job) && reader.content.text.contains("no longer in the current snapshot") && !reader.content.text.contains("New result"))
         );
-        assert!(matches!(&state.panel, Some(Panel::Reader(reader)) if reader.scroll == 8));
-        assert_eq!(state.focus, focus);
+        assert!(matches!(&state.details, Some(reader) if reader.scroll == 8));
+        assert_eq!(state.workspace_target(), focus);
         assert_drafts(&state, question);
 
         let original = super::super::reader::ReaderContent::from_history(
@@ -2610,10 +2703,10 @@ mod panel_draft_tests {
                 .unwrap(),
         )
         .unwrap();
-        state.panel = Some(Panel::Reader(ReaderPanel {
+        state.details = Some(ReaderState {
             content: original.clone(),
             scroll: 0,
-        }));
+        });
         update(
             &mut state,
             UiEvent::SessionChanged {
@@ -2622,7 +2715,7 @@ mod panel_draft_tests {
                 snapshot: std::sync::Arc::new(snapshot),
             },
         );
-        assert!(matches!(&state.panel, Some(Panel::Reader(reader)) if reader.content == original));
+        assert!(matches!(&state.details, Some(reader) if reader.content == original));
     }
 
     #[test]
@@ -2631,9 +2724,11 @@ mod panel_draft_tests {
         for panel in ["model", "details", "help"] {
             let mut effects = Vec::new();
             match panel {
-                "model" => panel::open_models(&mut state, &mut effects),
-                "details" => panel::open_objects(&mut state, &mut effects),
-                _ => panel::open_help(&mut state, &mut effects),
+                "model" => overlay::open_models(&mut state, &mut effects),
+                "details" => {
+                    overlay::open_objects(&mut state, &mut effects);
+                }
+                _ => overlay::open_help(&mut state, &mut effects),
             }
             assert!(
                 effects.iter().all(|effect| !matches!(
@@ -2641,7 +2736,7 @@ mod panel_draft_tests {
                     Effect::SaveDraft { .. } | Effect::Submit { .. }
                 ))
             );
-            assert!(state.panel.is_some());
+            assert!(state.overlay.is_some());
             if panel == "model" {
                 let request = state.model_operation.expect("model load").request;
                 let session = state.selected;
@@ -2665,16 +2760,16 @@ mod panel_draft_tests {
                 );
                 update(&mut state, UiEvent::Action(Action::SetupBackspace));
                 assert!(matches!(
-                    &state.panel,
-                    Some(Panel::Models(ModelPanel {
+                    &state.overlay,
+                    Some(Overlay::Models(ModelPanel {
                         screen: ModelScreen::Setup(form),
                         ..
                     })) if form.label == "e\u{301}"
                 ));
                 update(&mut state, UiEvent::Action(Action::SetupBackspace));
                 assert!(matches!(
-                    &state.panel,
-                    Some(Panel::Models(ModelPanel {
+                    &state.overlay,
+                    Some(Overlay::Models(ModelPanel {
                         screen: ModelScreen::Setup(form),
                         ..
                     })) if form.label.is_empty()
@@ -2682,10 +2777,10 @@ mod panel_draft_tests {
                 update(&mut state, UiEvent::Action(Action::Escape));
                 update(&mut state, UiEvent::Action(Action::Escape));
                 update(&mut state, UiEvent::Action(Action::Escape));
-                assert!(matches!(state.panel, Some(Panel::Models(_))));
+                assert!(matches!(state.overlay, Some(Overlay::Models(_))));
             }
             update(&mut state, UiEvent::Action(Action::Escape));
-            assert!(state.panel.is_none());
+            assert!(state.overlay.is_none());
             assert_drafts(&state, question);
         }
     }
@@ -2698,11 +2793,11 @@ mod panel_draft_tests {
         assert!(
             update(
                 &mut state,
-                UiEvent::Action(Action::Focus(Focus::SessionTitle))
+                UiEvent::Action(Action::SetWorkspaceTarget(WorkspaceTarget::SessionTitle))
             )
             .is_empty()
         );
-        assert_eq!(state.focus, Focus::SessionTitle);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::SessionTitle);
         state.titles.apply_edit(EditCommand::Replace {
             text: "  New title  ".into(),
         });
@@ -2781,7 +2876,8 @@ mod panel_draft_tests {
 // trimmed first; current text and revisions are never part of eviction.
 fn trim_editor_history(state: &mut UiState) {
     let selected = state.selected;
-    let title_active = state.focus == Focus::SessionTitle && state.title_editor().is_some();
+    let title_active =
+        state.workspace_target() == WorkspaceTarget::SessionTitle && state.title_editor().is_some();
     let mut editors = Vec::new();
     for (id, ui) in &mut state.session_ui {
         editors.push((
@@ -2835,7 +2931,7 @@ mod session_browsing_tests {
             .collect();
         let mut effects = Vec::new();
         select_session(&mut state, ids[0], &mut effects);
-        state.set_focus(Focus::Sessions);
+        state.set_workspace_target(WorkspaceTarget::Sessions);
         state.selected_ui_mut().unwrap().draft = "unsent original".into();
         (state, ids)
     }
@@ -2851,37 +2947,36 @@ mod session_browsing_tests {
             |effect| matches!(effect, Effect::OpenSession { session, .. } if *session == ids[1])
         ));
         assert_eq!(state.selected, Some(ids[1]));
-        assert_eq!(state.focus, Focus::Sessions);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Sessions);
         assert_eq!(state.session_ui[&ids[0]].draft(), "unsent original");
         update(&mut state, UiEvent::Action(Action::SelectSession(ids[2])));
         assert_eq!(state.selected, Some(ids[2]));
         assert_eq!(state.session_candidate, Some(ids[2]));
-        assert_eq!(state.focus, Focus::Sessions);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Sessions);
     }
 
     #[test]
     fn session_switch_preserves_every_workspace_focus_region() {
         for focus in [
-            Focus::Sessions,
-            Focus::SessionTitle,
-            Focus::Composer,
-            Focus::RightRail,
+            WorkspaceTarget::Sessions,
+            WorkspaceTarget::SessionTitle,
+            WorkspaceTarget::Composer,
         ] {
             let (mut state, ids) = fixture();
-            if focus == Focus::SessionTitle {
+            if focus == WorkspaceTarget::SessionTitle {
                 update(
                     &mut state,
-                    UiEvent::Action(Action::Focus(Focus::SessionTitle)),
+                    UiEvent::Action(Action::SetWorkspaceTarget(WorkspaceTarget::SessionTitle)),
                 );
             } else {
-                state.set_focus(focus);
+                state.set_workspace_target(focus);
             }
 
             update(&mut state, UiEvent::Action(Action::SelectSession(ids[1])));
 
             assert_eq!(state.selected, Some(ids[1]));
-            assert_eq!(state.focus, focus);
-            if focus == Focus::SessionTitle {
+            assert_eq!(state.workspace_target(), focus);
+            if focus == WorkspaceTarget::SessionTitle {
                 let ui = state.selected_ui().unwrap();
                 assert_eq!(state.titles.edit_target(), Some(ui.id));
             }
@@ -2905,7 +3000,7 @@ mod session_browsing_tests {
         assert!(update(&mut state, UiEvent::Action(Action::Escape)).is_empty());
         assert_eq!(state.selected, Some(ids[0]));
         assert_eq!(state.session_candidate, Some(ids[0]));
-        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
         assert_eq!(state.single_pane(), crate::layout::SinglePane::Conversation);
         assert_eq!(state.session_scroll, None);
     }
@@ -2929,14 +3024,12 @@ mod final_integration_regressions {
     }
 
     #[test]
-    fn pointer_submission_focuses_composer_but_reading_submission_does_not() {
+    fn pointer_submission_preserves_focus_and_sends_the_composer_draft() {
         let mut state = UiState::default();
         state.orphan_draft = "send this".into();
-        state.set_focus(Focus::SessionTitle);
-        assert!(update(&mut state, UiEvent::Action(Action::Submit)).is_empty());
-        assert!(state.pending_create.is_none());
-        let effects = update(&mut state, UiEvent::Action(Action::ClickSubmit));
-        assert_eq!(state.focus, Focus::Composer);
+        state.set_workspace_target(WorkspaceTarget::SessionTitle);
+        let effects = update(&mut state, UiEvent::Action(Action::Submit));
+        assert_eq!(state.workspace_target(), WorkspaceTarget::SessionTitle);
         assert!(matches!(effects.as_slice(), [Effect::CreateSession { .. }]));
         assert_eq!(
             state
@@ -3319,18 +3412,18 @@ mod focus_state_tests {
 
     #[test]
     fn session_rail_returns_to_the_center_region_it_came_from() {
-        for center in [Focus::SessionTitle, Focus::Composer] {
+        for center in [WorkspaceTarget::SessionTitle, WorkspaceTarget::Composer] {
             let mut state = state_with_session();
-            act(&mut state, Action::Focus(center));
+            act(&mut state, Action::SetWorkspaceTarget(center));
             act(&mut state, Action::FocusLeft);
-            assert_eq!(state.focus, Focus::Sessions);
-            assert_eq!(state.last_center_focus(), center);
+            assert_eq!(state.workspace_target(), WorkspaceTarget::Sessions);
+            assert_eq!(state.last_center_target(), center);
 
             act(&mut state, Action::FocusLeft);
-            assert_eq!(state.last_center_focus(), center);
+            assert_eq!(state.last_center_target(), center);
 
             act(&mut state, Action::FocusRight);
-            assert_eq!(state.focus, center);
+            assert_eq!(state.workspace_target(), center);
         }
     }
 
@@ -3339,23 +3432,23 @@ mod focus_state_tests {
         let mut state = state_with_session();
 
         act(&mut state, Action::FocusUp);
-        assert_eq!(state.focus, Focus::SessionTitle);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::SessionTitle);
         act(&mut state, Action::FocusLeft);
         act(&mut state, Action::FocusRight);
-        assert_eq!(state.focus, Focus::SessionTitle);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::SessionTitle);
 
         act(&mut state, Action::FocusDown);
-        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
         act(&mut state, Action::FocusLeft);
         act(&mut state, Action::FocusRight);
-        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
     }
 
     #[test]
-    fn dragging_a_selection_focuses_the_composer() {
+    fn pointing_at_an_inactive_editor_does_not_change_focus_or_selection() {
         let mut state = UiState::default();
         state.orphan_draft = "abc".into();
-        state.set_focus(Focus::SessionTitle);
+        state.set_workspace_target(WorkspaceTarget::SessionTitle);
 
         act(
             &mut state,
@@ -3365,53 +3458,55 @@ mod focus_state_tests {
             }),
         );
 
-        assert_eq!(state.focus, Focus::Composer);
-        assert_eq!(state.editor().selection(), Some(1..3));
+        assert_eq!(state.workspace_target(), WorkspaceTarget::SessionTitle);
+        assert_eq!(state.editor().selection(), None);
+        assert_eq!(state.draft_cursor(), 3);
     }
 
     #[test]
     fn session_created_does_not_steal_focus_after_the_request_started() {
-        for focus in [Focus::Sessions, Focus::RightRail] {
-            let mut state = UiState::default();
-            act(&mut state, test_insert("first input"));
-            let effects = update(&mut state, UiEvent::Action(Action::Submit));
-            assert!(matches!(effects.as_slice(), [Effect::CreateSession { .. }]));
-            let request_id = state.pending_create.as_ref().unwrap().request_id;
-            act(&mut state, Action::Focus(focus));
+        let focus = WorkspaceTarget::Sessions;
+        let mut state = UiState::default();
+        act(&mut state, test_insert("first input"));
+        let effects = keyboard_submit(&mut state);
+        assert!(matches!(effects.as_slice(), [Effect::CreateSession { .. }]));
+        let request_id = state.pending_create.as_ref().unwrap().request_id;
+        act(&mut state, Action::SetWorkspaceTarget(focus));
 
-            let info = bone_app::SessionInfo {
-                id: SessionId::new(),
-                workspace: bone_app::WorkspaceId::new(),
-                title: "new session".into(),
-                archived: false,
-            };
-            update(
-                &mut state,
-                UiEvent::SessionCreated {
-                    request_id,
-                    info: info.clone(),
-                },
-            );
+        let info = bone_app::SessionInfo {
+            id: SessionId::new(),
+            workspace: bone_app::WorkspaceId::new(),
+            title: "new session".into(),
+            archived: false,
+        };
+        update(
+            &mut state,
+            UiEvent::SessionCreated {
+                request_id,
+                info: info.clone(),
+            },
+        );
 
-            assert_eq!(state.selected, Some(info.id));
-            assert_eq!(state.focus, focus);
-        }
+        assert_eq!(state.selected, Some(info.id));
+        assert_eq!(state.workspace_target(), focus);
     }
 
     #[test]
-    fn slash_new_focuses_composer_before_async_completion() {
+    fn preparing_slash_keeps_workspace_role_until_keyboard_navigation() {
         let mut state = UiState::default();
-        state.set_focus(Focus::Sessions);
+        state.set_workspace_target(WorkspaceTarget::Sessions);
 
         act(&mut state, Action::StartSlashCommand);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Sessions);
+        act(&mut state, Action::FocusRight);
         act(&mut state, test_insert("new"));
-        let effects = update(&mut state, UiEvent::Action(Action::Submit));
+        let effects = keyboard_submit(&mut state);
 
         assert!(matches!(effects.as_slice(), [Effect::CreateSession { .. }]));
-        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
     }
 
-    fn state_with_reader_history(focus: Focus) -> (UiState, bone_app::SessionSeq) {
+    fn state_with_reader_history(focus: WorkspaceTarget) -> (UiState, bone_app::SessionSeq) {
         let sequence = bone_app::SessionSeq(1);
         let runtime = bone_app::RuntimeId::new();
         let info = bone_app::SessionInfo {
@@ -3439,28 +3534,100 @@ mod focus_state_tests {
         state.session_rows.push(test_session_row(info.clone()));
         state.selected = Some(info.id);
         state.session_ui.insert(info.id, ui);
-        state.set_focus(focus);
+        state.set_workspace_target(focus);
         (state, sequence)
     }
 
     #[test]
-    fn reader_restores_the_exact_workspace_focus() {
+    fn opening_and_closing_details_preserves_workspace_owner() {
         for focus in [
-            Focus::Sessions,
-            Focus::SessionTitle,
-            Focus::Composer,
-            Focus::RightRail,
+            WorkspaceTarget::Sessions,
+            WorkspaceTarget::SessionTitle,
+            WorkspaceTarget::Composer,
         ] {
             let (mut state, sequence) = state_with_reader_history(focus);
 
             act(&mut state, Action::OpenHistory(sequence));
-            assert!(matches!(state.panel, Some(Panel::Reader(_))));
-            assert_eq!(state.focus, focus);
+            assert!(state.details.is_some());
+            assert_eq!(state.workspace_target(), focus);
 
-            act(&mut state, Action::Escape);
-            assert!(state.panel.is_none());
-            assert_eq!(state.focus, focus);
+            act(&mut state, Action::CloseDetails);
+            assert!(state.details.is_none());
+            assert_eq!(state.workspace_target(), focus);
         }
+    }
+
+    #[test]
+    fn reader_and_pointer_motion_do_not_split_typing_undo() {
+        let (mut state, sequence) = state_with_reader_history(WorkspaceTarget::Composer);
+        for text in ["first", "second"] {
+            act(
+                &mut state,
+                test_editor(EditCommand::Insert {
+                    text: text.into(),
+                    typing: true,
+                }),
+            );
+            act(&mut state, Action::OpenHistory(sequence));
+            update(&mut state, UiEvent::PointerMoved { column: 20, row: 4 });
+            act(&mut state, Action::ScrollDetails { amount: 3, max: 20 });
+        }
+        act(&mut state, test_editor(EditCommand::Undo));
+        assert_eq!(state.draft(), "");
+    }
+
+    #[test]
+    fn closing_keyboard_overlay_restores_title_and_editor_capture_ends_on_keyboard_switch() {
+        let mut state = state_with_session();
+        act(
+            &mut state,
+            Action::SetWorkspaceTarget(WorkspaceTarget::SessionTitle),
+        );
+        act(
+            &mut state,
+            Action::PointEditor {
+                target: EditorTarget::SessionTitle,
+                byte: 2,
+                extend: false,
+                begin: true,
+            },
+        );
+        assert_eq!(
+            state.pointer.capture,
+            Some(PointerCapture::Editor(EditorTarget::SessionTitle))
+        );
+        overlay::open_help(&mut state, &mut Vec::new());
+        act(&mut state, Action::ToggleOverlayKeyboard);
+        assert_eq!(state.pointer.capture, None);
+        assert_eq!(
+            state.keyboard,
+            KeyboardOwner::Overlay {
+                return_to: WorkspaceTarget::SessionTitle
+            }
+        );
+        act(&mut state, Action::CloseOverlay);
+        assert_eq!(
+            state.keyboard,
+            KeyboardOwner::Workspace(WorkspaceTarget::SessionTitle)
+        );
+    }
+
+    #[test]
+    fn failed_details_command_does_not_enter_an_existing_mouse_overlay() {
+        let mut state = UiState::default();
+        overlay::open_help(&mut state, &mut Vec::new());
+        act(
+            &mut state,
+            Action::ExecuteCommand {
+                kind: CommandKind::Details,
+                argument: String::new(),
+            },
+        );
+        assert_eq!(
+            state.keyboard,
+            KeyboardOwner::Workspace(WorkspaceTarget::Composer)
+        );
+        assert!(matches!(state.overlay, Some(Overlay::Help)));
     }
 
     #[test]
@@ -3468,15 +3635,21 @@ mod focus_state_tests {
         let mut state = UiState::default();
 
         act(&mut state, Action::FocusUp);
-        assert_eq!(state.focus, Focus::Composer);
-        act(&mut state, Action::Focus(Focus::SessionTitle));
-        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
+        act(
+            &mut state,
+            Action::SetWorkspaceTarget(WorkspaceTarget::SessionTitle),
+        );
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
     }
 
     #[test]
     fn overview_removal_repairs_an_orphaned_title_focus() {
         let mut state = state_with_session();
-        act(&mut state, Action::Focus(Focus::SessionTitle));
+        act(
+            &mut state,
+            Action::SetWorkspaceTarget(WorkspaceTarget::SessionTitle),
+        );
         assert!(state.titles.edit_target().is_some());
         let overview_request = state.generation();
         state.overview_request = Some(overview_request);
@@ -3490,59 +3663,45 @@ mod focus_state_tests {
         );
 
         assert_eq!(state.selected, None);
-        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
         assert!(state.titles.edit_target().is_none());
     }
 
     #[test]
     fn overview_removal_repairs_the_remembered_title_region() {
-        for focus in [Focus::Sessions, Focus::RightRail] {
-            let mut state = state_with_session();
-            state.set_focus(Focus::SessionTitle);
-            state.set_focus(focus);
-            assert_eq!(state.last_center_focus(), Focus::SessionTitle);
-            let overview_request = state.generation();
-            state.overview_request = Some(overview_request);
-
-            update(
-                &mut state,
-                UiEvent::OverviewLoaded {
-                    generation: overview_request,
-                    rows: vec![],
-                },
-            );
-
-            assert_eq!(state.focus, focus);
-            assert_eq!(state.last_center_focus(), Focus::Composer);
-            act(
-                &mut state,
-                if focus == Focus::Sessions {
-                    Action::FocusRight
-                } else {
-                    Action::FocusLeft
-                },
-            );
-            assert_eq!(state.focus, Focus::Composer);
-        }
-    }
-
-    #[test]
-    fn resize_repairs_the_real_focus_while_a_panel_is_open() {
+        let focus = WorkspaceTarget::Sessions;
         let mut state = state_with_session();
-        state.set_focus(Focus::RightRail);
-        panel::open_help(&mut state, &mut Vec::new());
+        state.set_workspace_target(WorkspaceTarget::SessionTitle);
+        state.set_workspace_target(focus);
+        assert_eq!(state.last_center_target(), WorkspaceTarget::SessionTitle);
+        let overview_request = state.generation();
+        state.overview_request = Some(overview_request);
 
         update(
             &mut state,
-            UiEvent::Resized {
-                width: 100,
-                height: 24,
+            UiEvent::OverviewLoaded {
+                generation: overview_request,
+                rows: vec![],
             },
         );
-        assert_eq!(state.focus, Focus::Composer);
-        assert!(matches!(state.panel, Some(Panel::Help)));
+
+        assert_eq!(state.workspace_target(), focus);
+        assert_eq!(state.last_center_target(), WorkspaceTarget::Composer);
+        act(&mut state, Action::FocusRight);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
+    }
+
+    #[test]
+    fn resize_preserves_focus_while_a_panel_is_open() {
+        let mut state = state_with_session();
+        state.set_workspace_target(WorkspaceTarget::Composer);
+        overlay::open_help(&mut state, &mut Vec::new());
+
+        update(&mut state, UiEvent::Resized);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
+        assert!(matches!(state.overlay, Some(Overlay::Help)));
         act(&mut state, Action::Escape);
-        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
     }
 
     #[test]
@@ -3550,12 +3709,12 @@ mod focus_state_tests {
         let mut state = UiState::default();
         act(&mut state, test_insert("/help"));
 
-        act(&mut state, Action::Submit);
+        keyboard_submit(&mut state);
 
-        assert!(matches!(state.panel, Some(Panel::Help)));
-        assert_eq!(state.focus, Focus::Composer);
+        assert!(matches!(state.overlay, Some(Overlay::Help)));
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
         act(&mut state, Action::Escape);
-        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
     }
 }
 
@@ -3618,7 +3777,10 @@ mod title_rename_tests {
     }
 
     fn dirty_title(state: &mut UiState, title: &str) {
-        update(state, UiEvent::Action(Action::Focus(Focus::SessionTitle)));
+        update(
+            state,
+            UiEvent::Action(Action::SetWorkspaceTarget(WorkspaceTarget::SessionTitle)),
+        );
         state
             .titles
             .apply_edit(EditCommand::Replace { text: title.into() });
@@ -3853,7 +4015,7 @@ mod title_rename_tests {
     fn create_and_submit_owned_statuses_clear_on_exact_completion() {
         let mut state = UiState::default();
         state.orphan_draft = "first input".into();
-        update(&mut state, UiEvent::Action(Action::Submit));
+        keyboard_submit(&mut state);
         let request = state.pending_create.as_ref().unwrap().request_id;
         let created = session_info(
             bone_app::WorkspaceId::new(),
@@ -3872,7 +4034,7 @@ mod title_rename_tests {
         let ui = state.session_ui.get_mut(&created.id).unwrap();
         ui.bootstrap_submission = None;
         ui.draft = "retry me".into();
-        let submit_request = update(&mut state, UiEvent::Action(Action::Submit))
+        let submit_request = keyboard_submit(&mut state)
             .into_iter()
             .find_map(|effect| match effect {
                 Effect::Submit { input, .. } => Some(input.request_id),
@@ -3902,7 +4064,7 @@ mod title_rename_tests {
     fn create_and_submit_completions_preserve_newer_unowned_status() {
         let mut state = UiState::default();
         state.orphan_draft = "first input".into();
-        update(&mut state, UiEvent::Action(Action::Submit));
+        keyboard_submit(&mut state);
         let request = state.pending_create.as_ref().unwrap().request_id;
         let created = session_info(
             bone_app::WorkspaceId::new(),
@@ -3925,7 +4087,7 @@ mod title_rename_tests {
         let ui = state.session_ui.get_mut(&created.id).unwrap();
         ui.bootstrap_submission = None;
         ui.draft = "retry me".into();
-        let submit = update(&mut state, UiEvent::Action(Action::Submit));
+        let submit = keyboard_submit(&mut state);
         let submit_request = submit
             .iter()
             .find_map(|effect| match effect {
@@ -3985,7 +4147,7 @@ mod title_rename_tests {
         set_committed_session_title(&mut state, first.id, title.into());
         update(
             &mut state,
-            UiEvent::Action(Action::Focus(Focus::SessionTitle)),
+            UiEvent::Action(Action::SetWorkspaceTarget(WorkspaceTarget::SessionTitle)),
         );
 
         update(
@@ -4023,16 +4185,7 @@ mod title_rename_tests {
         for action in [
             Action::FocusLeft,
             Action::FocusDown,
-            Action::Focus(Focus::Composer),
-            test_editor(EditCommand::Point {
-                byte: 0,
-                extend: false,
-            }),
-            test_editor(EditCommand::Point {
-                byte: 0,
-                extend: true,
-            }),
-            Action::ClickSubmit,
+            Action::SetWorkspaceTarget(WorkspaceTarget::Composer),
         ] {
             let (mut state, first, _) = fixture();
             dirty_title(&mut state, "Committed on leave");
@@ -4040,7 +4193,7 @@ mod title_rename_tests {
             let (session, request, title) = rename_effect(&effects);
             assert_eq!((session, title), (first.id, "Committed on leave".into()));
             assert_ne!(request, 0);
-            assert_ne!(state.focus, Focus::SessionTitle);
+            assert_ne!(state.workspace_target(), WorkspaceTarget::SessionTitle);
         }
 
         let (mut state, first, second) = fixture();
@@ -4160,7 +4313,7 @@ mod title_rename_tests {
         let (mut state, first, _) = fixture();
         let ui = state.session_ui.get_mut(&first.id).unwrap();
         ui.draft = "/new".into();
-        let create = update(&mut state, UiEvent::Action(Action::Submit));
+        let create = keyboard_submit(&mut state);
         assert!(
             create
                 .iter()
@@ -4193,7 +4346,7 @@ mod title_rename_tests {
         let (mut state, first, _) = fixture();
         update(
             &mut state,
-            UiEvent::Action(Action::Focus(Focus::SessionTitle)),
+            UiEvent::Action(Action::SetWorkspaceTarget(WorkspaceTarget::SessionTitle)),
         );
         update(
             &mut state,
@@ -4238,7 +4391,7 @@ mod title_rename_tests {
     fn manual_intent_wins_before_or_after_an_auto_title_receipt() {
         let (mut state, first, _) = fixture();
         state.session_ui.get_mut(&first.id).unwrap().draft = "first input".into();
-        let submitted = update(&mut state, UiEvent::Action(Action::Submit));
+        let submitted = keyboard_submit(&mut state);
         let request_id = submitted
             .iter()
             .find_map(|effect| match effect {

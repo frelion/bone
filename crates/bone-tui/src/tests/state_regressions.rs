@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use crate::{
     editor::{CursorMove, EditCommand},
-    layout::{HitTarget, SinglePane},
+    layout::SinglePane,
     state::{
-        Action, EditorTarget, Effect, Focus, SessionNavRow, SessionUi, UiEvent, UiState, update,
+        Action, EditorTarget, Effect, SessionNavRow, SessionUi, UiEvent, UiState, WorkspaceTarget,
+        update,
     },
     view,
 };
@@ -13,6 +14,11 @@ use bone_app::{
     SessionReleaseReceipt, SessionReleaseStatus, SessionView, WorkspaceId,
 };
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+fn keyboard_submit(state: &mut UiState) -> Vec<Effect> {
+    let action = crate::input::commands::submit_action(state);
+    update(state, UiEvent::Action(action))
+}
 
 fn info(workspace: WorkspaceId, title: &str) -> SessionInfo {
     SessionInfo {
@@ -93,7 +99,7 @@ fn stale_submit_failure_identity_cannot_mark_another_sessions_request_failed() {
     let mut state = opened(&[a.clone(), b.clone()]);
 
     paste(&mut state, "request A");
-    let a_effects = update(&mut state, UiEvent::Action(Action::Submit));
+    let a_effects = keyboard_submit(&mut state);
     let a_request = a_effects
         .iter()
         .find_map(|effect| match effect {
@@ -102,9 +108,12 @@ fn stale_submit_failure_identity_cannot_mark_another_sessions_request_failed() {
         })
         .unwrap();
     update(&mut state, UiEvent::Action(Action::SelectSession(b.id)));
-    update(&mut state, UiEvent::Action(Action::Focus(Focus::Composer)));
+    update(
+        &mut state,
+        UiEvent::Action(Action::SetWorkspaceTarget(WorkspaceTarget::Composer)),
+    );
     paste(&mut state, "request B");
-    let b_effects = update(&mut state, UiEvent::Action(Action::Submit));
+    let b_effects = keyboard_submit(&mut state);
     let b_request = b_effects
         .iter()
         .find_map(|effect| match effect {
@@ -114,7 +123,7 @@ fn stale_submit_failure_identity_cannot_mark_another_sessions_request_failed() {
         .unwrap_or_else(|| {
             panic!(
                 "missing B submit; effects={b_effects:?}, focus={:?}, selected={:?}, draft={:?}",
-                state.focus,
+                state.workspace_target(),
                 state.selected,
                 state.draft()
             )
@@ -185,7 +194,7 @@ fn new_from_existing_session_clears_only_the_unchanged_source_draft() {
     let source = info(workspace, "source");
     let mut unchanged = opened(std::slice::from_ref(&source));
     paste(&mut unchanged, "/new named");
-    let created = update(&mut unchanged, UiEvent::Action(Action::Submit));
+    let created = keyboard_submit(&mut unchanged);
     let (request_id, _, _) = create_effect(&created);
     update(
         &mut unchanged,
@@ -198,7 +207,7 @@ fn new_from_existing_session_clears_only_the_unchanged_source_draft() {
 
     let mut edited = opened(std::slice::from_ref(&source));
     paste(&mut edited, "/new named");
-    let created = update(&mut edited, UiEvent::Action(Action::Submit));
+    let created = keyboard_submit(&mut edited);
     let (request_id, _, _) = create_effect(&created);
     paste(&mut edited, " plus a newer edit");
     update(
@@ -218,7 +227,7 @@ fn new_from_existing_session_clears_only_the_unchanged_source_draft() {
 fn create_failure_retry_reuses_the_exact_request_contract() {
     let mut state = UiState::default();
     paste(&mut state, "/new stable title");
-    let first = update(&mut state, UiEvent::Action(Action::Submit));
+    let first = keyboard_submit(&mut state);
     let contract = create_effect(&first);
     update(
         &mut state,
@@ -227,7 +236,7 @@ fn create_failure_retry_reuses_the_exact_request_contract() {
             message: "temporary failure".into(),
         },
     );
-    let retry = update(&mut state, UiEvent::Action(Action::Submit));
+    let retry = keyboard_submit(&mut state);
     assert_eq!(create_effect(&retry), contract);
 }
 
@@ -235,7 +244,7 @@ fn create_failure_retry_reuses_the_exact_request_contract() {
 fn edited_failed_new_does_not_replay_and_explicit_retry_reuses_identity() {
     let mut state = UiState::default();
     paste(&mut state, "/new A");
-    let first = update(&mut state, UiEvent::Action(Action::Submit));
+    let first = keyboard_submit(&mut state);
     let contract_a = create_effect(&first);
     assert_eq!(contract_a.1, "A");
     assert!(!contract_a.2);
@@ -248,7 +257,7 @@ fn edited_failed_new_does_not_replay_and_explicit_retry_reuses_identity() {
     );
 
     replace_orphan_draft(&mut state, "/new B");
-    let changed = update(&mut state, UiEvent::Action(Action::Submit));
+    let changed = keyboard_submit(&mut state);
     assert!(
         !changed
             .iter()
@@ -269,7 +278,7 @@ fn edited_failed_new_does_not_replay_and_explicit_retry_reuses_identity() {
     );
 
     replace_orphan_draft(&mut state, "/new --retry");
-    let retried = update(&mut state, UiEvent::Action(Action::Submit));
+    let retried = keyboard_submit(&mut state);
     assert_eq!(
         create_effect(&retried),
         contract_a,
@@ -289,7 +298,7 @@ fn escape_dismisses_slash_palette_without_destroying_its_draft() {
         assert_eq!(state.slash_dismissed, Some(identity));
         assert!(!state.slash_palette_visible());
         assert!(state.slash_matches().is_empty());
-        assert_eq!(state.focus, Focus::Composer);
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
     }
 }
 
@@ -299,7 +308,7 @@ fn a_slash_draft_does_not_capture_escape_after_focus_leaves_the_composer() {
     paste(&mut state, "/");
     assert!(state.slash_palette_visible());
     update(&mut state, UiEvent::Action(Action::FocusLeft));
-    assert_eq!(state.focus, Focus::Sessions);
+    assert_eq!(state.workspace_target(), WorkspaceTarget::Sessions);
     assert!(!state.slash_palette_visible());
 
     update(&mut state, UiEvent::Action(Action::Escape));
@@ -314,7 +323,7 @@ fn slash_quit_clears_command_text_while_quit_action_preserves_normal_draft() {
     let session = info(workspace, "quit");
     let mut slash = opened(std::slice::from_ref(&session));
     paste(&mut slash, "/quit");
-    let effects = update(&mut slash, UiEvent::Action(Action::Submit));
+    let effects = keyboard_submit(&mut slash);
     assert!(slash.session_ui[&session.id].draft().is_empty());
     assert!(
         effects
@@ -509,17 +518,14 @@ fn rail_viewport_keeps_selection_visible_and_footer_hits_the_rail() {
         .collect();
     let target = sessions[17].id;
     let mut state = opened(&sessions);
-    state.focus = Focus::Sessions;
+    state.set_workspace_target(WorkspaceTarget::Sessions);
     update(&mut state, UiEvent::Action(Action::SelectSession(target)));
     assert_eq!(state.selected, Some(target));
     assert_eq!(state.session_candidate, Some(target));
-    assert_eq!(state.focus, Focus::Sessions);
+    assert_eq!(state.workspace_target(), WorkspaceTarget::Sessions);
     let rendered = render_plan(&state, 120, 14);
     let rail = rendered.layout.session_rail.unwrap();
-    assert_eq!(
-        rendered.hit(rail.x + 1, rail.bottom() - 1),
-        Some(HitTarget::SessionRail)
-    );
+    assert_eq!(rendered.hit(rail.x + 1, rail.bottom() - 1), None);
 }
 
 #[test]

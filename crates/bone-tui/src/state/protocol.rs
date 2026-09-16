@@ -7,7 +7,9 @@ use bone_app::{
 
 use crate::editor::EditCommand;
 
-use super::model::{Focus, SessionNavRow};
+use super::model::SessionNavRow;
+#[cfg(test)]
+use super::model::WorkspaceTarget;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EditorTarget {
     Composer,
@@ -16,18 +18,40 @@ pub enum EditorTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
+    PressPointer {
+        target: Option<Box<crate::layout::ClickTarget>>,
+        position: (u16, u16),
+        text: Option<(crate::ui::selection::TextPoint, Arc<str>)>,
+    },
+    DragTextSelection {
+        point: Option<crate::ui::selection::TextPoint>,
+    },
+    ReleasePointer {
+        click: Option<Box<Action>>,
+        point: Option<crate::ui::selection::TextPoint>,
+        text: Option<String>,
+    },
+    FinishEditorSelection {
+        target: EditorTarget,
+        byte: usize,
+    },
     BeginPaneResize(crate::layout::PaneDivider),
     DragPane {
         widths: crate::layout::PaneWidths,
         finish: bool,
     },
-    EndPaneResize,
+    EndPointerCapture,
+    PointEditor {
+        target: EditorTarget,
+        byte: usize,
+        extend: bool,
+        begin: bool,
+    },
     SetupText(super::SecretText),
     SetupBackspace,
     SetupClear,
     NextField,
     PreviousField,
-    SelectField(super::SetupField),
     SaveConnection,
     ChooseConnection(usize),
     Edit {
@@ -44,13 +68,22 @@ pub enum Action {
     PanelPrevious,
     PanelNext,
     ActivatePanel,
+    ToggleOverlayKeyboard,
+    CloseOverlay,
+    OverlayBack,
+    CloseDetails,
     SelectModel(usize),
-    ScrollPanel {
+    ScrollOverlay {
+        amount: isize,
+        max: usize,
+    },
+    ScrollDetails {
         amount: isize,
         max: usize,
     },
 
-    Focus(Focus),
+    #[cfg(test)]
+    SetWorkspaceTarget(WorkspaceTarget),
     FocusLeft,
     FocusRight,
     FocusUp,
@@ -65,9 +98,14 @@ pub enum Action {
     SelectSlashPrevious,
     SelectSlashNext,
     CompleteSlash,
-    ExecuteCommand(super::CommandKind),
+    DismissCommands,
+    PrepareCommand(super::CommandKind),
+    ExecuteCommand {
+        kind: super::CommandKind,
+        argument: String,
+    },
+    CommandError(String),
     Submit,
-    ClickSubmit,
     AnswerQuestion(QuestionId),
     LeaveAnswer,
     ConvertAnswer,
@@ -122,6 +160,12 @@ pub enum UiEvent {
     },
 
     Action(Action),
+    PointerMoved {
+        column: u16,
+        row: u16,
+    },
+    PointerLeft,
+    CancelPointerCapture,
     WorkspaceOpened {
         label: String,
         rows: Vec<SessionNavRow>,
@@ -217,10 +261,7 @@ pub enum UiEvent {
         message: String,
     },
     CaretBlink,
-    Resized {
-        width: u16,
-        height: u16,
-    },
+    Resized,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,6 +278,7 @@ pub enum SessionOperationKind {
 
 #[derive(Debug)]
 pub enum Effect {
+    CopyText(String),
     ReloadConfig,
     TrustProjectConfig,
     SaveConnection {

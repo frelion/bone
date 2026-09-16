@@ -35,7 +35,7 @@ fn real_binary_restores_every_terminal_mode_after_visible_quit_flow() {
 }
 
 #[test]
-fn real_binary_never_changes_the_users_cursor_appearance() {
+fn real_binary_never_changes_the_users_text_caret_appearance() {
     let temporary = tempfile::tempdir().expect("temporary workspace");
     let workspace = temporary.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -275,6 +275,7 @@ fn assert_terminal_protocol_restored(output: &[u8]) {
     let pop = find_sequence(output, b"\x1b[<1u");
     let bracketed_paste_off = find_sequence(output, b"\x1b[?2004l");
     let focus_change_off = find_sequence(output, b"\x1b[?1004l");
+    let pointer_reset = find_sequence(output, b"\x1b]22;\x1b\\");
     let leave_screen = find_sequence(output, b"\x1b[?1049l");
     assert!(
         push < pop,
@@ -283,8 +284,18 @@ fn assert_terminal_protocol_restored(output: &[u8]) {
     assert!(
         pop < bracketed_paste_off
             && bracketed_paste_off < focus_change_off
-            && focus_change_off < leave_screen,
+            && focus_change_off < pointer_reset
+            && pointer_reset < leave_screen,
         "temporary terminal modes must be released in reverse acquisition order"
+    );
+    assert_eq!(
+        sequence_count(output, b"\x1b[?1049h"),
+        sequence_count(output, b"\x1b]22;\x1b\\"),
+        "each terminal activation must reset the mouse pointer before leaving"
+    );
+    assert!(
+        find_last_sequence(output, b"\x1b]22;") == find_last_sequence(output, b"\x1b]22;\x1b\\"),
+        "the final mouse pointer operation must restore the terminal default"
     );
     for (enable, disable) in [
         (b"\x1b[?1049h".as_slice(), b"\x1b[?1049l".as_slice()),
@@ -311,7 +322,6 @@ fn assert_terminal_protocol_restored(output: &[u8]) {
 
 fn assert_no_decorative_terminal_mutations(output: &[u8]) {
     for sequence in [
-        b"\x1b]".as_slice(),
         b"\x9d".as_slice(),
         b"\x1b[0 q".as_slice(),
         b"\x1b[1 q".as_slice(),
@@ -327,6 +337,15 @@ fn assert_no_decorative_terminal_mutations(output: &[u8]) {
                 .any(|window| window == sequence),
             "BONE must not emit host-persistent or decorative terminal mutations: {sequence:?}"
         );
+    }
+    for (index, sequence) in output.windows(2).enumerate() {
+        if sequence == b"\x1b]" {
+            let sequence = &output[index..];
+            assert!(
+                sequence.starts_with(b"\x1b]22;") || sequence.starts_with(b"\x1b]52;c;"),
+                "only mouse pointer and explicit clipboard writes may use OSC"
+            );
+        }
     }
     assert!(
         !contains_window_resize(output),
@@ -456,6 +475,9 @@ impl PtyBone {
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        // Exercise the client-terminal clipboard path on every host OS, without
+        // touching the test runner's native macOS clipboard.
+        command.env("SSH_TTY", "bone-pty-test");
         command.env_remove("BONE_TUI_TEST_BACKGROUND_PANIC_AFTER_MS");
         if let Some(delay) = panic_after_ms {
             command.env("BONE_TUI_TEST_BACKGROUND_PANIC_AFTER_MS", delay.to_string());
@@ -807,4 +829,112 @@ fn clear_modified_enter_and_ctrl_d_preserve_the_exact_unsent_draft() {
         assert!(snapshot.inputs.is_empty(), "Shift+Enter must not submit");
         app.shutdown().await.unwrap();
     });
+}
+
+#[test]
+fn real_mouse_overlay_scrolling_and_resizing_keep_the_composer_keyboard_owner() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    let data = temporary.path().join("data");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut process = PtyBone::spawn(&data, &workspace, Duration::from_secs(15));
+    process.wait_for_bytes(b"\x1b[?1049h");
+    process.enable_keyboard_protocol();
+    process.write(b"before");
+    // SGR coordinates are one-based. At 120×40 the model footer is on row 38.
+    process.write(b"\x1b[<0;39;38M\x1b[<0;39;38m");
+    process.wait_for_bytes(b"Choose model");
+    // Scroll over the overlay and transcript, then drag the left divider.
+    process.write(b"\x1b[<65;50;28M\x1b[<64;50;10M");
+    process.write(b"\x1b[<0;32;10M\x1b[<32;45;25M\x1b[<0;45;25m");
+    process.write(b"-after\x04");
+    assert!(process.wait_for_exit().success());
+    process.wait_for_bytes(b"\x1b[?1049l");
+    let output = process.finish_capture();
+    assert_terminal_protocol_restored(&output);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let app = bone_app::App::open(bone_app::AppOptions::isolated(&data))
+            .await
+            .unwrap();
+        let workspace = app.open_workspace(&workspace).await.unwrap();
+        let sessions = app.list_sessions(workspace.id).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        let snapshot = app
+            .session(sessions[0].id)
+            .await
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.draft, "before-after");
+        assert!(snapshot.inputs.is_empty());
+        app.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn real_mouse_release_copies_utf8_and_keeps_the_editor_selection() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    let data = temporary.path().join("data");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut process = PtyBone::spawn(&data, &workspace, Duration::from_secs(15));
+    process.wait_for_bytes(b"\x1b[?1049h");
+    process.enable_keyboard_protocol();
+    let text = "中文 alpha";
+    process.write(text.as_bytes());
+    // No final Drag event: release itself must determine the selected range.
+    process.write(b"\x1b[<0;39;34M\x1b[<0;49;34m");
+    let copied = format!("\x1b]52;c;{}\x1b\\", STANDARD.encode(text));
+    process.wait_for_bytes(copied.as_bytes());
+    process.write(b"replacement\x04");
+    assert!(process.wait_for_exit().success());
+    process.wait_for_bytes(b"\x1b[?1049l");
+    let output = process.finish_capture();
+    assert_terminal_protocol_restored(&output);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let app = bone_app::App::open(bone_app::AppOptions::isolated(&data))
+            .await
+            .unwrap();
+        let workspace = app.open_workspace(&workspace).await.unwrap();
+        let sessions = app.list_sessions(workspace.id).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        let snapshot = app
+            .session(sessions[0].id)
+            .await
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.draft, "replacement");
+        assert!(snapshot.inputs.is_empty());
+        app.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn hovering_without_clicks_emits_the_requested_pointer_shapes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut process = PtyBone::spawn(
+        &temporary.path().join("data"),
+        &workspace,
+        Duration::from_secs(15),
+    );
+    process.wait_for_bytes(b"\x1b[?1049h");
+    process.enable_keyboard_protocol();
+    process.wait_for_bytes(b"Select model");
+    // SGR 35 reports motion with no button down, using one-based coordinates.
+    process.write(b"\x1b[<35;39;38M");
+    process.wait_for_bytes(b"\x1b]22;pointer\x1b\\");
+    process.write(b"\x1b[<35;32;10M");
+    process.wait_for_bytes(b"\x1b]22;ew-resize\x1b\\");
+    process.write(b"\x1b[<35;39;34M");
+    process.wait_for_bytes(b"\x1b]22;text\x1b\\");
+    process.write(&[0x04]);
+    assert!(process.wait_for_exit().success());
+    process.wait_for_bytes(b"\x1b[?1049l");
+    assert_terminal_protocol_restored(&process.finish_capture());
 }

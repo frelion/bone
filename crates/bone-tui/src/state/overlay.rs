@@ -1,18 +1,19 @@
-use bone_app::{LoginState, ModelSelection, Profile, SessionId, SessionSeq};
+#[cfg(test)]
+use bone_app::SessionSeq;
+use bone_app::{LoginState, ModelSelection, Profile, SessionId};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
-    ConnectionForm, ConnectionKind, Effect, ModelChoice, ModelFacts, SecretText, SetupField,
-    Status, UiState,
+    ConnectionForm, ConnectionKind, Effect, ModelChoice, ModelFacts, SecretText, Status, UiState,
+    details::{ReaderState, pin_reading},
     reader::{ReaderContent, ReaderSource},
 };
 
 #[derive(Debug)]
-pub(crate) enum Panel {
+pub(crate) enum Overlay {
     Objects(ObjectPanel),
     Models(ModelPanel),
     Help,
-    Reader(ReaderPanel),
 }
 
 #[derive(Debug)]
@@ -20,12 +21,6 @@ pub(crate) struct ObjectPanel {
     pub(crate) session: SessionId,
     pub(crate) choices: Vec<(ReaderSource, String)>,
     pub(crate) selected: usize,
-}
-
-#[derive(Debug)]
-pub(crate) struct ReaderPanel {
-    pub(crate) content: ReaderContent,
-    pub(crate) scroll: usize,
 }
 
 #[derive(Debug)]
@@ -119,7 +114,7 @@ impl ModelOperation {
 pub(super) fn open_models(state: &mut UiState, effects: &mut Vec<Effect>) {
     let session = state.selected;
     state.status = None;
-    replace(state, Panel::Models(ModelPanel::new(session)), effects);
+    replace(state, Overlay::Models(ModelPanel::new(session)), effects);
     if state.model_facts.is_none() {
         request_model_facts(state, effects);
     }
@@ -127,7 +122,7 @@ pub(super) fn open_models(state: &mut UiState, effects: &mut Vec<Effect>) {
 }
 
 pub(super) fn open_help(state: &mut UiState, effects: &mut Vec<Effect>) {
-    replace(state, Panel::Help, effects);
+    replace(state, Overlay::Help, effects);
 }
 
 fn load_models(state: &mut UiState, session: Option<SessionId>, effects: &mut Vec<Effect>) {
@@ -176,7 +171,7 @@ pub(super) fn model_facts_loaded(
     });
     if needs_model
         && !models_are_loading
-        && let Some(Panel::Models(models)) = &mut state.panel
+        && let Some(Overlay::Models(models)) = &mut state.overlay
         && models.session == session
         && matches!(models.screen, ModelScreen::List { .. })
     {
@@ -214,7 +209,7 @@ pub(super) fn models_loaded(
                 .and_then(|facts| facts.saved.as_ref().ok())
         })
         .map(|model| model.selection.clone());
-    let Some(Panel::Models(models)) = &mut state.panel else {
+    let Some(Overlay::Models(models)) = &mut state.overlay else {
         return;
     };
     if models.session != session {
@@ -256,7 +251,7 @@ pub(super) fn models_failed(
     if state.selected != session {
         return;
     }
-    if let Some(Panel::Models(models)) = &mut state.panel
+    if let Some(Overlay::Models(models)) = &mut state.overlay
         && models.session == session
         && matches!(models.screen, ModelScreen::List { .. })
         && state.status.is_none()
@@ -291,24 +286,24 @@ pub(super) fn model_applied(
         return;
     }
     let matching_panel = matches!(
-        &state.panel,
-        Some(Panel::Models(models))
+        &state.overlay,
+        Some(Overlay::Models(models))
             if models.session == session
     );
     let failed = error.is_some();
     state.model_facts_request = state.generation();
     state.model_facts = facts;
     if login_required && matching_panel {
-        let Some(panel) = state.panel.take() else {
+        let Some(panel) = state.overlay.take() else {
             return;
         };
-        let Panel::Models(models) = panel else {
+        let Overlay::Models(models) = panel else {
             unreachable!()
         };
         if let Some(selection) = models.pending_selection.clone() {
             start_model_login(state, models, selection, effects);
         } else {
-            state.panel = Some(Panel::Models(models));
+            state.overlay = Some(Overlay::Models(models));
             state.status = Some(Status::panel_request(
                 session,
                 request,
@@ -317,11 +312,11 @@ pub(super) fn model_applied(
         }
         return;
     }
-    if matching_panel || state.panel.is_none() {
+    if matching_panel || state.overlay.is_none() {
         if let Some(error) = error {
             let message = format!("Model switch failed: {error}");
             state.status = Some(Status::panel_request(session, request, message.clone()));
-            if let Some(Panel::Models(models)) = &mut state.panel
+            if let Some(Overlay::Models(models)) = &mut state.overlay
                 && matches!(models.screen, ModelScreen::Login { .. })
             {
                 models.screen = ModelScreen::Login {
@@ -350,17 +345,17 @@ pub(super) fn connection_saved(
     key_saved: bool,
     effects: &mut Vec<Effect>,
 ) {
-    let Some(panel) = state.panel.take() else {
+    let Some(panel) = state.overlay.take() else {
         reconcile_connection_save(state, effects);
         return;
     };
-    let Panel::Models(mut models) = panel else {
-        state.panel = Some(panel);
+    let Overlay::Models(mut models) = panel else {
+        state.overlay = Some(panel);
         reconcile_connection_save(state, effects);
         return;
     };
     let ModelScreen::Setup(form) = &mut models.screen else {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         reconcile_connection_save(state, effects);
         return;
     };
@@ -368,7 +363,7 @@ pub(super) fn connection_saved(
         || models.session != session
         || form.pending_request != Some(request)
     {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         reconcile_connection_save(state, effects);
         return;
     }
@@ -382,13 +377,13 @@ pub(super) fn connection_saved(
         };
         if key_saved {
             form.key_was_sent = false;
-            state.panel = Some(Panel::Models(models));
+            state.overlay = Some(Overlay::Models(models));
             state.status = Some(Status::panel_request(session, request, message));
             return_to_models(state, effects);
             return;
         }
         state.status = Some(Status::panel_request(session, request, message));
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         reconcile_model_facts(state, effects);
         return;
     }
@@ -400,7 +395,7 @@ pub(super) fn connection_saved(
     {
         state.status = None;
     }
-    state.panel = Some(Panel::Models(models));
+    state.overlay = Some(Overlay::Models(models));
     dismiss(state, effects);
     refresh_model_facts(state, effects);
 }
@@ -409,8 +404,8 @@ fn reconcile_connection_save(state: &mut UiState, effects: &mut Vec<Effect>) {
     let current = state.selected;
     if state.model_operation.is_none()
         && matches!(
-            &state.panel,
-            Some(Panel::Models(models))
+            &state.overlay,
+            Some(Overlay::Models(models))
                 if models.session == current && matches!(models.screen, ModelScreen::List { .. })
         )
     {
@@ -426,15 +421,15 @@ pub(super) fn login_changed(
     effects: &mut Vec<Effect>,
 ) {
     let selected = state.selected;
-    let Some(panel) = state.panel.take() else {
+    let Some(panel) = state.overlay.take() else {
         return;
     };
-    let Panel::Models(mut models) = panel else {
-        state.panel = Some(panel);
+    let Overlay::Models(mut models) = panel else {
+        state.overlay = Some(panel);
         return;
     };
     if models.session != selected {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         return;
     }
     let ModelScreen::Login {
@@ -442,11 +437,11 @@ pub(super) fn login_changed(
         state: current_state,
     } = &mut models.screen
     else {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         return;
     };
     if *current != request {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         return;
     }
     let succeeded = matches!(login, LoginState::Succeeded);
@@ -460,59 +455,21 @@ pub(super) fn login_changed(
             state.status = None;
         }
         let Some(selection) = models.pending_selection.clone() else {
-            state.panel = Some(Panel::Models(models));
+            state.overlay = Some(Overlay::Models(models));
             dismiss(state, effects);
             refresh_model_facts(state, effects);
             return;
         };
         apply_selection(state, models, selection, true, effects);
     } else {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
     }
 }
 
-pub(super) fn open_history(state: &mut UiState, sequence: SessionSeq, effects: &mut Vec<Effect>) {
-    let Some(content) = state.selected_ui().and_then(|ui| {
-        ui.transcript
-            .find(sequence)
-            .and_then(|entry| ReaderContent::from_history(ui.id, entry))
-    }) else {
-        return;
-    };
-    pin_reading(state);
-    replace(
-        state,
-        Panel::Reader(ReaderPanel { content, scroll: 0 }),
-        effects,
-    );
-}
-
-pub(super) fn open_job(state: &mut UiState, job: bone_app::JobRef, effects: &mut Vec<Effect>) {
-    let Some(content) = state
-        .selected_ui()
-        .and_then(|ui| ui.snapshot.as_ref())
-        .and_then(|snapshot| ReaderContent::from_job(snapshot, job))
-    else {
-        return;
-    };
-    pin_reading(state);
-    replace(
-        state,
-        Panel::Reader(ReaderPanel { content, scroll: 0 }),
-        effects,
-    );
-}
-
-pub(super) fn refresh_reader(state: &mut UiState, snapshot: &bone_app::SessionView) {
-    if let Some(Panel::Reader(reader)) = &mut state.panel {
-        reader.content.refresh_job(snapshot);
-    }
-}
-
-pub(super) fn open_objects(state: &mut UiState, effects: &mut Vec<Effect>) {
+pub(super) fn open_objects(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
     let Some(ui) = state.selected_ui() else {
         state.status = Some(Status::selection(None, "There is no session to inspect"));
-        return;
+        return false;
     };
     let session = ui.id;
     let mut choices = Vec::new();
@@ -541,17 +498,18 @@ pub(super) fn open_objects(state: &mut UiState, effects: &mut Vec<Effect>) {
     state.status = None;
     replace(
         state,
-        Panel::Objects(ObjectPanel {
+        Overlay::Objects(ObjectPanel {
             session,
             choices,
             selected: 0,
         }),
         effects,
     );
+    true
 }
 
 pub(super) fn select_object(state: &mut UiState, index: usize, effects: &mut Vec<Effect>) {
-    let Some(Panel::Objects(objects)) = &mut state.panel else {
+    let Some(Overlay::Objects(objects)) = &mut state.overlay else {
         return;
     };
     if index >= objects.choices.len() {
@@ -562,8 +520,8 @@ pub(super) fn select_object(state: &mut UiState, index: usize, effects: &mut Vec
 }
 
 fn open_object(state: &mut UiState, effects: &mut Vec<Effect>) {
-    let Some((session, source)) = (match &state.panel {
-        Some(Panel::Objects(objects)) => objects
+    let Some((session, source)) = (match &state.overlay {
+        Some(Overlay::Objects(objects)) => objects
             .choices
             .get(objects.selected)
             .map(|(source, _)| (objects.session, *source)),
@@ -590,11 +548,8 @@ fn open_object(state: &mut UiState, effects: &mut Vec<Effect>) {
     });
     if let Some(content) = content {
         pin_reading(state);
-        replace(
-            state,
-            Panel::Reader(ReaderPanel { content, scroll: 0 }),
-            effects,
-        );
+        state.details = Some(ReaderState { content, scroll: 0 });
+        dismiss(state, effects);
         state.status = None;
     } else {
         state.status = Some(Status::selection(
@@ -604,18 +559,12 @@ fn open_object(state: &mut UiState, effects: &mut Vec<Effect>) {
     }
 }
 
-fn pin_reading(state: &mut UiState) {
-    if let Some(ui) = state.selected_ui_mut() {
-        ui.transcript.pin_reading();
-    }
-}
-
 pub(super) fn panel_previous(state: &mut UiState) {
-    match &mut state.panel {
-        Some(Panel::Objects(objects)) => {
+    match &mut state.overlay {
+        Some(Overlay::Objects(objects)) => {
             objects.selected = objects.selected.saturating_sub(1);
         }
-        Some(Panel::Models(ModelPanel {
+        Some(Overlay::Models(ModelPanel {
             screen:
                 ModelScreen::List { selected }
                 | ModelScreen::Reasoning { selected, .. }
@@ -629,11 +578,11 @@ pub(super) fn panel_previous(state: &mut UiState) {
 }
 
 pub(super) fn panel_next(state: &mut UiState) {
-    match &mut state.panel {
-        Some(Panel::Objects(objects)) => {
+    match &mut state.overlay {
+        Some(Overlay::Objects(objects)) => {
             objects.selected = (objects.selected + 1).min(objects.choices.len().saturating_sub(1));
         }
-        Some(Panel::Models(models)) => {
+        Some(Overlay::Models(models)) => {
             let row_count = models.row_count();
             match &mut models.screen {
                 ModelScreen::List { selected }
@@ -651,44 +600,44 @@ pub(super) fn panel_next(state: &mut UiState) {
 }
 
 pub(super) fn activate(state: &mut UiState, effects: &mut Vec<Effect>) {
-    match &state.panel {
-        Some(Panel::Objects(objects)) => {
+    match &state.overlay {
+        Some(Overlay::Objects(objects)) => {
             let selected = objects.selected;
             select_object(state, selected, effects);
         }
-        Some(Panel::Models(ModelPanel {
+        Some(Overlay::Models(ModelPanel {
             screen: ModelScreen::List { selected },
             ..
         })) => {
             let selected = *selected;
             select_model(state, selected, effects);
         }
-        Some(Panel::Models(ModelPanel {
+        Some(Overlay::Models(ModelPanel {
             screen: ModelScreen::Reasoning { selected, .. },
             ..
         })) => {
             let selected = *selected;
             select_model(state, selected, effects);
         }
-        Some(Panel::Models(ModelPanel {
+        Some(Overlay::Models(ModelPanel {
             screen: ModelScreen::Add { selected } | ModelScreen::Advanced { selected },
             ..
         })) => {
             let selected = *selected;
             choose_connection(state, selected, effects);
         }
-        Some(Panel::Models(ModelPanel {
+        Some(Overlay::Models(ModelPanel {
             screen: ModelScreen::Manage { selected },
             ..
         })) => {
             let selected = *selected;
             select_model(state, selected, effects);
         }
-        Some(Panel::Models(ModelPanel {
+        Some(Overlay::Models(ModelPanel {
             screen: ModelScreen::Setup(_),
             ..
         })) => save_connection(state, effects),
-        Some(Panel::Models(ModelPanel {
+        Some(Overlay::Models(ModelPanel {
             screen:
                 ModelScreen::Login {
                     state: LoginState::Failed { .. } | LoginState::Cancelled,
@@ -700,21 +649,11 @@ pub(super) fn activate(state: &mut UiState, effects: &mut Vec<Effect>) {
     }
 }
 
-pub(super) fn scroll_reader(state: &mut UiState, amount: isize, max: usize) {
-    if let Some(Panel::Reader(reader)) = &mut state.panel {
-        reader.scroll = reader
-            .scroll
-            .min(max)
-            .saturating_add_signed(amount)
-            .min(max);
-    }
-}
-
 pub(super) fn setup_text(state: &mut UiState, mut value: SecretText) {
-    let Some(Panel::Models(ModelPanel {
+    let Some(Overlay::Models(ModelPanel {
         screen: ModelScreen::Setup(form),
         ..
-    })) = &mut state.panel
+    })) = &mut state.overlay
     else {
         return;
     };
@@ -722,16 +661,24 @@ pub(super) fn setup_text(state: &mut UiState, mut value: SecretText) {
         return;
     }
     let text = form.text_mut();
+    let previous_len = text.len();
     for ch in value.take().chars().filter(|ch| !ch.is_control()) {
         if text.len() + ch.len_utf8() <= 16 * 1024 {
             text.push(ch);
         }
     }
+    if text.len() != previous_len {
+        state.caret_visible = true;
+    }
 }
 
 pub(super) fn setup_clear(state: &mut UiState) {
     if let Some(form) = setup_mut(state) {
-        form.text_mut().clear();
+        let text = form.text_mut();
+        if !text.is_empty() {
+            text.clear();
+            state.caret_visible = true;
+        }
     }
 }
 
@@ -742,27 +689,23 @@ pub(super) fn setup_backspace(state: &mut UiState) {
     let text = form.text_mut();
     if let Some((byte, _)) = text.grapheme_indices(true).next_back() {
         text.truncate(byte);
+        state.caret_visible = true;
     }
 }
 
 pub(super) fn move_setup_field(state: &mut UiState, forward: bool) {
     if let Some(form) = setup_mut(state) {
+        let previous = form.field;
         form.move_field(forward);
-    }
-}
-
-pub(super) fn select_setup_field(state: &mut UiState, field: SetupField) {
-    let Some(form) = setup_mut(state) else {
-        return;
-    };
-    if form.fields().contains(&field) {
-        form.field = field;
+        if form.field != previous {
+            state.caret_visible = true;
+        }
     }
 }
 
 fn setup_mut(state: &mut UiState) -> Option<&mut ConnectionForm> {
-    match &mut state.panel {
-        Some(Panel::Models(ModelPanel {
+    match &mut state.overlay {
+        Some(Overlay::Models(ModelPanel {
             screen: ModelScreen::Setup(form),
             ..
         })) if form.pending_request.is_none() => Some(form),
@@ -771,21 +714,21 @@ fn setup_mut(state: &mut UiState) -> Option<&mut ConnectionForm> {
 }
 
 pub(super) fn select_model(state: &mut UiState, index: usize, effects: &mut Vec<Effect>) {
-    let Some(panel) = state.panel.take() else {
+    let Some(panel) = state.overlay.take() else {
         return;
     };
-    let Panel::Models(mut models) = panel else {
-        state.panel = Some(panel);
+    let Overlay::Models(mut models) = panel else {
+        state.overlay = Some(panel);
         return;
     };
     if models.session != state.selected || models.busy(state.model_operation) {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         return;
     }
     match models.screen {
         ModelScreen::List { .. } => {
             if index >= models.row_count() {
-                state.panel = Some(Panel::Models(models));
+                state.overlay = Some(Overlay::Models(models));
                 return;
             }
             models.screen = ModelScreen::List { selected: index };
@@ -815,7 +758,7 @@ pub(super) fn select_model(state: &mut UiState, index: usize, effects: &mut Vec<
                         model: index,
                         selected,
                     };
-                    state.panel = Some(Panel::Models(models));
+                    state.overlay = Some(Overlay::Models(models));
                     state.status = None;
                     return;
                 }
@@ -836,11 +779,11 @@ pub(super) fn select_model(state: &mut UiState, index: usize, effects: &mut Vec<
         }
         ModelScreen::Reasoning { model, .. } => {
             let Some(choice) = models.choices.get(model) else {
-                state.panel = Some(Panel::Models(models));
+                state.overlay = Some(Overlay::Models(models));
                 return;
             };
             let Some(effort) = models.reasoning_efforts(model).get(index).copied() else {
-                state.panel = Some(Panel::Models(models));
+                state.overlay = Some(Overlay::Models(models));
                 return;
             };
             let mut selection = choice.selection.clone();
@@ -857,7 +800,7 @@ pub(super) fn select_model(state: &mut UiState, index: usize, effects: &mut Vec<
         }
         ModelScreen::Manage { .. } => {
             let Some(profile) = models.profiles.get(index).cloned() else {
-                state.panel = Some(Panel::Models(models));
+                state.overlay = Some(Overlay::Models(models));
                 return;
             };
             models.screen = ModelScreen::Manage { selected: index };
@@ -873,24 +816,24 @@ pub(super) fn select_model(state: &mut UiState, index: usize, effects: &mut Vec<
             models.screen = ModelScreen::Setup(Box::new(form));
         }
         _ => {
-            state.panel = Some(Panel::Models(models));
+            state.overlay = Some(Overlay::Models(models));
             return;
         }
     }
-    state.panel = Some(Panel::Models(models));
+    state.overlay = Some(Overlay::Models(models));
     state.status = None;
 }
 
 pub(super) fn choose_connection(state: &mut UiState, index: usize, effects: &mut Vec<Effect>) {
-    let Some(panel) = state.panel.take() else {
+    let Some(panel) = state.overlay.take() else {
         return;
     };
-    let Panel::Models(mut models) = panel else {
-        state.panel = Some(panel);
+    let Overlay::Models(mut models) = panel else {
+        state.overlay = Some(panel);
         return;
     };
     if models.session != state.selected {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         return;
     }
     let kind = match models.screen {
@@ -902,7 +845,7 @@ pub(super) fn choose_connection(state: &mut UiState, index: usize, effects: &mut
                     .find(|profile| profile.id == bone_app::ProfileId::chatgpt());
                 let selection = profile.and_then(|profile| recommended_selection(&models, profile));
                 let Some(selection) = selection else {
-                    state.panel = Some(Panel::Models(models));
+                    state.overlay = Some(Overlay::Models(models));
                     state.status = Some(Status::selection(
                         state.selected,
                         "ChatGPT has no recommended model",
@@ -936,7 +879,7 @@ pub(super) fn choose_connection(state: &mut UiState, index: usize, effects: &mut
                         ConnectionForm::edit_selection(&profile, selection)
                             .expect("API profiles have an editable connection form"),
                     ));
-                    state.panel = Some(Panel::Models(models));
+                    state.overlay = Some(Overlay::Models(models));
                     state.status = None;
                     return;
                 }
@@ -944,29 +887,29 @@ pub(super) fn choose_connection(state: &mut UiState, index: usize, effects: &mut
             }
             3 => {
                 models.screen = ModelScreen::Advanced { selected: 0 };
-                state.panel = Some(Panel::Models(models));
+                state.overlay = Some(Overlay::Models(models));
                 state.status = None;
                 return;
             }
             _ => {
-                state.panel = Some(Panel::Models(models));
+                state.overlay = Some(Overlay::Models(models));
                 return;
             }
         },
         ModelScreen::Advanced { .. } => {
             let Some(kind) = ConnectionKind::ADVANCED.get(index).copied() else {
-                state.panel = Some(Panel::Models(models));
+                state.overlay = Some(Overlay::Models(models));
                 return;
             };
             kind
         }
         _ => {
-            state.panel = Some(Panel::Models(models));
+            state.overlay = Some(Overlay::Models(models));
             return;
         }
     };
     models.screen = ModelScreen::Setup(Box::new(ConnectionForm::new(kind)));
-    state.panel = Some(Panel::Models(models));
+    state.overlay = Some(Overlay::Models(models));
     state.status = None;
 }
 
@@ -1020,7 +963,7 @@ fn start_model_login(
 
 fn begin_login(state: &mut UiState, mut models: ModelPanel, effects: &mut Vec<Effect>) {
     if connection_change_blocked(state) {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         state.status = Some(Status::selection_notice(
             state.selected,
             "Wait for active conversations to finish before signing in",
@@ -1032,7 +975,7 @@ fn begin_login(state: &mut UiState, mut models: ModelPanel, effects: &mut Vec<Ef
         request,
         state: LoginState::Connecting,
     };
-    state.panel = Some(Panel::Models(models));
+    state.overlay = Some(Overlay::Models(models));
     state.status = None;
     effects.push(Effect::Login {
         profile: bone_app::ProfileId::chatgpt(),
@@ -1041,11 +984,11 @@ fn begin_login(state: &mut UiState, mut models: ModelPanel, effects: &mut Vec<Ef
 }
 
 fn retry_login(state: &mut UiState, effects: &mut Vec<Effect>) {
-    let Some(panel) = state.panel.take() else {
+    let Some(panel) = state.overlay.take() else {
         return;
     };
-    let Panel::Models(models) = panel else {
-        state.panel = Some(panel);
+    let Overlay::Models(models) = panel else {
+        state.overlay = Some(panel);
         return;
     };
     begin_login(state, models, effects);
@@ -1067,12 +1010,12 @@ fn apply_selection(
         .running_model()
         .is_some_and(|current| current.selection == selection);
     if saved_is_selected && running_is_selected && !force {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         dismiss(state, effects);
         return;
     }
     if model_change_blocked(state) {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         state.status = Some(Status::selection_notice(
             state.selected,
             "Wait for the conversation to finish loading or responding before switching models",
@@ -1086,7 +1029,7 @@ fn apply_selection(
         request,
         kind: ModelOperationKind::Apply,
     });
-    state.panel = Some(Panel::Models(models));
+    state.overlay = Some(Overlay::Models(models));
     state.status = None;
     effects.push(Effect::SetModel {
         session,
@@ -1123,35 +1066,35 @@ fn connection_change_blocked(state: &UiState) -> bool {
 }
 
 pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
-    let Some(panel) = state.panel.take() else {
+    let Some(panel) = state.overlay.take() else {
         return;
     };
-    let Panel::Models(mut models) = panel else {
-        state.panel = Some(panel);
+    let Overlay::Models(mut models) = panel else {
+        state.overlay = Some(panel);
         return;
     };
     if models.session != state.selected {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         return;
     }
     let ModelScreen::Setup(form) = &mut models.screen else {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         return;
     };
     if form.pending_request.is_some() {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         return;
     }
     let (profile, selection) = match form.validated() {
         Ok(value) => value,
         Err(error) => {
-            state.panel = Some(Panel::Models(models));
+            state.overlay = Some(Overlay::Models(models));
             state.status = Some(Status::selection(state.selected, error));
             return;
         }
     };
     if connection_change_blocked(state) {
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         state.status = Some(Status::selection_notice(
             state.selected,
             "Wait for active conversations to finish before changing a connection",
@@ -1163,7 +1106,7 @@ pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
     form.key_was_sent = !form.key.is_empty();
     let key = (!form.key.is_empty()).then(|| SecretText::from(form.key.take()));
     let session = models.session;
-    state.panel = Some(Panel::Models(models));
+    state.overlay = Some(Overlay::Models(models));
     state.status = None;
     effects.push(Effect::SaveConnection {
         request,
@@ -1176,7 +1119,7 @@ pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
 }
 
 fn return_to_models(state: &mut UiState, effects: &mut Vec<Effect>) {
-    let Some(Panel::Models(models)) = &mut state.panel else {
+    let Some(Overlay::Models(models)) = &mut state.overlay else {
         return;
     };
     models.screen = ModelScreen::List { selected: 0 };
@@ -1187,20 +1130,20 @@ fn return_to_models(state: &mut UiState, effects: &mut Vec<Effect>) {
 }
 
 fn return_to_model_list(state: &mut UiState) {
-    if let Some(Panel::Models(models)) = &mut state.panel {
+    if let Some(Overlay::Models(models)) = &mut state.overlay {
         models.screen = ModelScreen::List { selected: 0 };
         models.pending_selection = None;
     }
 }
 
 pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
-    let Some(panel) = &state.panel else {
+    let Some(panel) = &state.overlay else {
         return false;
     };
     let apply_pending = matches!(
         (panel, state.model_operation),
         (
-            Panel::Models(models),
+            Overlay::Models(models),
             Some(ModelOperation {
                 kind: ModelOperationKind::Apply,
                 ..
@@ -1209,7 +1152,7 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
     );
     let save_pending = matches!(
         panel,
-        Panel::Models(ModelPanel {
+        Overlay::Models(ModelPanel {
             screen: ModelScreen::Setup(form),
             ..
         }) if form.pending_request.is_some()
@@ -1221,18 +1164,19 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
         ));
         return true;
     }
+    state.overlay_scroll = 0;
     match panel {
-        Panel::Models(ModelPanel {
+        Overlay::Models(ModelPanel {
             screen: ModelScreen::Reasoning { model, .. },
             ..
         }) => {
             let model = *model;
             state.status = None;
-            if let Some(Panel::Models(models)) = &mut state.panel {
+            if let Some(Overlay::Models(models)) = &mut state.overlay {
                 models.screen = ModelScreen::List { selected: model };
             }
         }
-        Panel::Models(ModelPanel {
+        Overlay::Models(ModelPanel {
             screen: ModelScreen::Login { .. },
             ..
         }) => {
@@ -1240,12 +1184,12 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
             state.status = None;
             return_to_models(state, effects);
         }
-        Panel::Models(ModelPanel {
+        Overlay::Models(ModelPanel {
             screen: ModelScreen::Setup(_),
             ..
         }) => {
             state.status = None;
-            if let Some(Panel::Models(models)) = &mut state.panel
+            if let Some(Overlay::Models(models)) = &mut state.overlay
                 && let ModelScreen::Setup(form) = &models.screen
             {
                 models.screen = if form.edits_existing_connection() {
@@ -1257,47 +1201,60 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
                 };
             }
         }
-        Panel::Models(ModelPanel {
+        Overlay::Models(ModelPanel {
             screen: ModelScreen::Advanced { .. },
             ..
         }) => {
             state.status = None;
-            if let Some(Panel::Models(models)) = &mut state.panel {
+            if let Some(Overlay::Models(models)) = &mut state.overlay {
                 models.screen = ModelScreen::Add { selected: 0 };
             }
         }
-        Panel::Models(ModelPanel {
+        Overlay::Models(ModelPanel {
             screen: ModelScreen::Add { .. } | ModelScreen::Manage { .. },
             ..
         }) => {
             state.status = None;
             return_to_model_list(state);
         }
-        Panel::Models(ModelPanel {
+        Overlay::Models(ModelPanel {
             screen: ModelScreen::List { .. },
             ..
         })
-        | Panel::Objects(_)
-        | Panel::Help
-        | Panel::Reader(_) => dismiss(state, effects),
+        | Overlay::Objects(_)
+        | Overlay::Help => dismiss(state, effects),
     }
     true
 }
 
-pub(super) fn dismiss(state: &mut UiState, effects: &mut Vec<Effect>) {
-    cancel_login(state, effects);
-    state.panel = None;
+pub(super) fn dismiss_session(state: &mut UiState, effects: &mut Vec<Effect>) {
+    let belongs_to_selected = match &state.overlay {
+        Some(Overlay::Objects(objects)) => Some(objects.session) == state.selected,
+        Some(Overlay::Models(models)) => models.session == state.selected,
+        _ => false,
+    };
+    if belongs_to_selected {
+        dismiss(state, effects);
+    }
 }
 
-fn replace(state: &mut UiState, panel: Panel, effects: &mut Vec<Effect>) {
+pub(super) fn dismiss(state: &mut UiState, effects: &mut Vec<Effect>) {
     cancel_login(state, effects);
-    state.panel = Some(panel);
+    state.overlay = None;
+    state.overlay_scroll = 0;
+    state.leave_overlay();
+}
+
+fn replace(state: &mut UiState, panel: Overlay, effects: &mut Vec<Effect>) {
+    cancel_login(state, effects);
+    state.overlay = Some(panel);
+    state.overlay_scroll = 0;
 }
 
 fn cancel_login(state: &UiState, effects: &mut Vec<Effect>) {
     if matches!(
-        &state.panel,
-        Some(Panel::Models(ModelPanel {
+        &state.overlay,
+        Some(Overlay::Models(ModelPanel {
             screen: ModelScreen::Login { .. },
             ..
         }))
@@ -1309,7 +1266,7 @@ fn cancel_login(state: &UiState, effects: &mut Vec<Effect>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{Action, Focus, UiEvent, update};
+    use crate::state::{Action, SetupField, UiEvent, WorkspaceTarget, update};
 
     fn choice(model: &str) -> ModelChoice {
         ModelChoice {
@@ -1382,14 +1339,14 @@ mod tests {
     fn setup_panel(state: &mut UiState, form: ConnectionForm) {
         let mut models = ModelPanel::new(state.selected);
         models.screen = ModelScreen::Setup(Box::new(form));
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
     }
 
     #[test]
     fn each_panel_instance_owns_only_its_legal_navigation_state() {
         let session = SessionId::new();
         let mut state = UiState::default();
-        state.panel = Some(Panel::Objects(ObjectPanel {
+        state.overlay = Some(Overlay::Objects(ObjectPanel {
             session,
             choices: vec![
                 (ReaderSource::History(SessionSeq(1)), "one".into()),
@@ -1399,8 +1356,8 @@ mod tests {
         }));
         panel_previous(&mut state);
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Objects(objects)) if objects.selected == 0
+            &state.overlay,
+            Some(Overlay::Objects(objects)) if objects.selected == 0
         ));
 
         let content = ReaderContent {
@@ -1410,21 +1367,21 @@ mod tests {
             text: "body".into(),
             layout_cache: std::cell::RefCell::new(None),
         };
-        state.panel = Some(Panel::Reader(ReaderPanel { content, scroll: 7 }));
+        state.details = Some(ReaderState { content, scroll: 7 });
         panel_next(&mut state);
-        scroll_reader(&mut state, -2, 20);
+        super::super::details::scroll_reader(&mut state, -2, 20);
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Reader(reader)) if reader.scroll == 5
+            &state.details,
+            Some(reader) if reader.scroll == 5
         ));
 
         let mut models = ModelPanel::new(None);
         models.screen = ModelScreen::Add { selected: 3 };
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         panel_previous(&mut state);
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::Add { selected: 2 },
                 ..
             }))
@@ -1434,12 +1391,12 @@ mod tests {
     #[test]
     fn closing_a_panel_never_rewrites_workspace_focus() {
         let mut state = UiState::default();
-        state.set_focus(Focus::Sessions);
+        state.set_workspace_target(WorkspaceTarget::Sessions);
         open_help(&mut state, &mut Vec::new());
         dismiss(&mut state, &mut Vec::new());
-        assert!(state.panel.is_none());
-        assert_eq!(state.focus, Focus::Sessions);
-        assert_eq!(state.last_center_focus(), Focus::Composer);
+        assert!(state.overlay.is_none());
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Sessions);
+        assert_eq!(state.last_center_target(), WorkspaceTarget::Composer);
     }
 
     #[test]
@@ -1450,7 +1407,7 @@ mod tests {
             request: 41,
             state: LoginState::Connecting,
         };
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         let mut effects = Vec::new();
 
         open_models(&mut state, &mut effects);
@@ -1464,8 +1421,8 @@ mod tests {
             ]
         ));
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::List { .. },
                 ..
             }))
@@ -1474,7 +1431,7 @@ mod tests {
         effects.clear();
         open_help(&mut state, &mut effects);
         assert!(effects.is_empty());
-        assert!(matches!(state.panel, Some(Panel::Help)));
+        assert!(matches!(state.overlay, Some(Overlay::Help)));
     }
 
     #[test]
@@ -1495,15 +1452,15 @@ mod tests {
         assert_eq!(request(&state, ModelOperationKind::Load), current);
         assert_eq!(state.status_text(), Some("new panel status"));
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(models)) if models.choices.is_empty()
+            &state.overlay,
+            Some(Overlay::Models(models)) if models.choices.is_empty()
         ));
 
         models_loaded(&mut state, None, current, vec![choice("fresh")], vec![]);
         assert!(state.model_operation.is_none());
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(models))
+            &state.overlay,
+            Some(Overlay::Models(models))
                 if models.choices.first().unwrap().selection.model == "fresh"
         ));
     }
@@ -1529,8 +1486,8 @@ mod tests {
 
             assert_eq!(
                 matches!(
-                    state.panel,
-                    Some(Panel::Models(ModelPanel {
+                    state.overlay,
+                    Some(Overlay::Models(ModelPanel {
                         screen: ModelScreen::Add { .. },
                         ..
                     }))
@@ -1550,8 +1507,8 @@ mod tests {
 
         models_loaded(&mut state, None, load, vec![], vec![Profile::chatgpt()]);
         assert!(matches!(
-            state.panel,
-            Some(Panel::Models(ModelPanel {
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::List { .. },
                 ..
             }))
@@ -1567,8 +1524,8 @@ mod tests {
             }),
         );
         assert!(matches!(
-            state.panel,
-            Some(Panel::Models(ModelPanel {
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::Add { .. },
                 ..
             }))
@@ -1593,8 +1550,8 @@ mod tests {
             }),
         );
         assert!(matches!(
-            state.panel,
-            Some(Panel::Models(ModelPanel {
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::List { .. },
                 ..
             }))
@@ -1602,8 +1559,8 @@ mod tests {
 
         models_loaded(&mut state, None, load, vec![], vec![Profile::chatgpt()]);
         assert!(matches!(
-            state.panel,
-            Some(Panel::Models(ModelPanel {
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::Add { .. },
                 ..
             }))
@@ -1618,8 +1575,8 @@ mod tests {
         ready_models(&mut state, vec![choice("first"), choice("second")]);
 
         assert!(matches!(
-            state.panel,
-            Some(Panel::Models(ModelPanel {
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::List { selected: 1 },
                 ..
             }))
@@ -1653,8 +1610,8 @@ mod tests {
         select_model(&mut state, 0, &mut effects);
         assert!(effects.is_empty());
         assert!(matches!(
-            state.panel,
-            Some(Panel::Models(ModelPanel {
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::Reasoning {
                     model: 0,
                     selected: 2
@@ -1681,12 +1638,12 @@ mod tests {
             model: 4,
             selected: 1,
         };
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
 
         assert!(escape(&mut state, &mut Vec::new()));
         assert!(matches!(
-            state.panel,
-            Some(Panel::Models(ModelPanel {
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::List { selected: 4 },
                 ..
             }))
@@ -1728,7 +1685,7 @@ mod tests {
 
         assert!(effects.is_empty());
         assert_eq!(state.model_operation, operation);
-        assert!(matches!(state.panel, Some(Panel::Models(_))));
+        assert!(matches!(state.overlay, Some(Overlay::Models(_))));
         assert_eq!(state.status_text(), Some("Finishing the model change…"));
     }
 
@@ -1742,7 +1699,7 @@ mod tests {
         select_model(&mut state, 0, &mut effects);
 
         assert!(effects.is_empty());
-        assert!(state.panel.is_none());
+        assert!(state.overlay.is_none());
         assert!(state.model_operation.is_none());
     }
 
@@ -1806,7 +1763,7 @@ mod tests {
                 .unwrap()
                 .contains("finish loading or responding")
         );
-        assert!(matches!(state.panel, Some(Panel::Models(_))));
+        assert!(matches!(state.overlay, Some(Overlay::Models(_))));
     }
 
     #[test]
@@ -1837,8 +1794,8 @@ mod tests {
         assert_eq!(state.status_text(), Some("new panel status"));
         assert_eq!(state.model_label(), Some("visible model"));
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(models)) if models.choices.is_empty()
+            &state.overlay,
+            Some(Overlay::Models(models)) if models.choices.is_empty()
         ));
         assert!(matches!(
             effects.as_slice(),
@@ -1851,7 +1808,7 @@ mod tests {
         let session = SessionId::new();
         let mut state = UiState::default();
         state.selected = Some(session);
-        state.panel = Some(Panel::Models(ModelPanel::new(Some(session))));
+        state.overlay = Some(Overlay::Models(ModelPanel::new(Some(session))));
         state.model_facts = Some(facts("visible model"));
         let mut effects = Vec::new();
         load_models(&mut state, Some(session), &mut effects);
@@ -1898,7 +1855,7 @@ mod tests {
             false,
             &mut Vec::new(),
         );
-        assert!(state.panel.is_none());
+        assert!(state.overlay.is_none());
         assert_eq!(state.model_label(), Some("new"));
         assert_ne!(state.model_facts_request, stale_facts);
 
@@ -1987,7 +1944,7 @@ mod tests {
             request: 41,
             state: LoginState::Connecting,
         };
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         let mut effects = Vec::new();
         assert!(escape(&mut state, &mut effects));
         assert_eq!(
@@ -2008,8 +1965,8 @@ mod tests {
                 .any(|effect| matches!(effect, Effect::LoadModelFacts { .. }))
         );
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::List { selected: 0 },
                 ..
             }))
@@ -2017,8 +1974,8 @@ mod tests {
 
         login_changed(&mut state, 41, LoginState::Succeeded, &mut Vec::new());
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::List { .. },
                 ..
             }))
@@ -2053,8 +2010,8 @@ mod tests {
         let request = *request;
         let session = *session;
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::Setup(form),
                 ..
             })) if form.pending_request == Some(request)
@@ -2073,8 +2030,8 @@ mod tests {
 
         assert!(state.status_text().unwrap().contains("Re-enter"));
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::Setup(form),
                 ..
             })) if form.pending_request.is_none() && form.key.is_empty()
@@ -2117,8 +2074,8 @@ mod tests {
         );
 
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::List { .. },
                 ..
             }))
@@ -2144,7 +2101,7 @@ mod tests {
             note: "Test".into(),
             recommended: true,
         });
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         let mut effects = Vec::new();
         choose_connection(&mut state, 0, &mut effects);
         let [Effect::SetModel { request: apply, .. }] = effects.as_slice() else {
@@ -2166,8 +2123,8 @@ mod tests {
         };
         let login = *login;
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::Login {
                     request,
                     state: LoginState::Connecting
@@ -2183,8 +2140,8 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::Login { request, .. },
                 ..
             })) if *request == login
@@ -2193,8 +2150,8 @@ mod tests {
         effects.clear();
         login_changed(&mut state, login, LoginState::Succeeded, &mut effects);
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::Login {
                     state: LoginState::Succeeded,
                     ..
@@ -2246,7 +2203,7 @@ mod tests {
             note: "Test".into(),
             recommended: true,
         });
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         let mut effects = Vec::new();
 
         choose_connection(&mut state, 0, &mut effects);
@@ -2288,15 +2245,15 @@ mod tests {
             note: "Recommended".into(),
             recommended: true,
         });
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         let mut effects = Vec::new();
 
         choose_connection(&mut state, 1, &mut effects);
 
         assert!(effects.is_empty());
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::Setup(form),
                 ..
             })) if form.edits_existing_connection()
@@ -2383,8 +2340,8 @@ mod tests {
 
         assert_eq!(state.status_text(), Some("new pending status"));
         assert!(matches!(
-            &state.panel,
-            Some(Panel::Models(ModelPanel {
+            &state.overlay,
+            Some(Overlay::Models(ModelPanel {
                 screen: ModelScreen::Setup(form),
                 ..
             })) if form.kind == ConnectionKind::AnthropicApi
@@ -2414,19 +2371,19 @@ mod tests {
             })
             .collect();
         state.selected = Some(first);
-        state.set_focus(Focus::Sessions);
+        state.set_workspace_target(WorkspaceTarget::Sessions);
         let mut models = ModelPanel::new(Some(first));
         models.screen = ModelScreen::Login {
             request: 7,
             state: LoginState::Connecting,
         };
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
 
         let effects = update(&mut state, UiEvent::Action(Action::SelectSession(second)));
 
         assert_eq!(state.selected, Some(second));
-        assert_eq!(state.focus, Focus::Sessions);
-        assert!(state.panel.is_none());
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Sessions);
+        assert!(state.overlay.is_none());
         assert_eq!(
             effects
                 .iter()

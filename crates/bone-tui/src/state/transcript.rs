@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
 
 use bone_app::{HistoryCursor, HistoryEntry, HistoryPage, RecentHistoryPage, SessionSeq};
 
@@ -12,6 +16,7 @@ pub(crate) const HISTORY_CACHE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) struct TranscriptState {
     entries: VecDeque<HistoryEntry>,
     bytes: usize,
+    copy_cache: RefCell<BTreeMap<SessionSeq, Arc<str>>>,
     cursor: SessionSeq,
     older_cursor: Option<HistoryCursor>,
     older_loading: bool,
@@ -25,6 +30,23 @@ pub(crate) struct TranscriptState {
 }
 
 impl TranscriptState {
+    pub(crate) fn copy_text(
+        &self,
+        sequence: SessionSeq,
+        make: impl FnOnce() -> Arc<str>,
+    ) -> Arc<str> {
+        if let Some(text) = self.copy_cache.borrow().get(&sequence) {
+            return Arc::clone(text);
+        }
+        let text = make();
+        let mut cache = self.copy_cache.borrow_mut();
+        let used: usize = cache.values().map(|text| text.len() + 64).sum();
+        if self.bytes + used + text.len() + 64 <= HISTORY_CACHE_BYTES {
+            cache.insert(sequence, Arc::clone(&text));
+        }
+        text
+    }
+
     pub(crate) fn entries(&self) -> impl DoubleEndedIterator<Item = &HistoryEntry> {
         self.entries.iter()
     }
@@ -251,6 +273,12 @@ impl TranscriptState {
     pub(crate) fn allocated_bytes(&self) -> usize {
         self.bytes
             + self
+                .copy_cache
+                .borrow()
+                .values()
+                .map(|text| text.len() + 64)
+                .sum::<usize>()
+            + self
                 .metrics
                 .as_ref()
                 .map_or(0, |metrics| metrics.allocated_bytes())
@@ -270,6 +298,7 @@ impl TranscriptState {
     }
 
     pub(crate) fn clear_layouts(&mut self) {
+        self.copy_cache.get_mut().clear();
         self.metrics = None;
         self.older_metrics = None;
     }
@@ -303,11 +332,17 @@ impl TranscriptState {
         }?;
         let bytes = history_entry_bytes(&entry);
         self.bytes = self.bytes.saturating_sub(bytes);
-        Some(bytes)
+        let copied = self
+            .copy_cache
+            .get_mut()
+            .remove(&entry.sequence)
+            .map_or(0, |text| text.len() + 64);
+        Some(bytes + copied)
     }
 
     fn replace(&mut self, page: RecentHistoryPage) {
         self.entries.clear();
+        self.copy_cache.get_mut().clear();
         self.bytes = 0;
         for entry in page.items {
             self.push_back(entry);
@@ -319,11 +354,24 @@ impl TranscriptState {
     fn push_back(&mut self, entry: HistoryEntry) {
         self.bytes = self.bytes.saturating_add(history_entry_bytes(&entry));
         self.entries.push_back(entry);
+        self.trim_copy_cache();
     }
 
     fn push_front(&mut self, entry: HistoryEntry) {
         self.bytes = self.bytes.saturating_add(history_entry_bytes(&entry));
         self.entries.push_front(entry);
+        self.trim_copy_cache();
+    }
+
+    fn trim_copy_cache(&mut self) {
+        let cache = self.copy_cache.get_mut();
+        let mut bytes = self.bytes + cache.values().map(|text| text.len() + 64).sum::<usize>();
+        while bytes > HISTORY_CACHE_BYTES {
+            let Some((_, text)) = cache.pop_first() else {
+                break;
+            };
+            bytes -= text.len() + 64;
+        }
     }
 
     fn trim_front(&mut self) {
@@ -343,6 +391,7 @@ impl TranscriptState {
                 break;
             };
             self.bytes = self.bytes.saturating_sub(history_entry_bytes(&entry));
+            self.copy_cache.get_mut().remove(&entry.sequence);
         }
     }
 
@@ -363,6 +412,7 @@ impl TranscriptState {
                 break;
             };
             self.bytes = self.bytes.saturating_sub(history_entry_bytes(&entry));
+            self.copy_cache.get_mut().remove(&entry.sequence);
             evicted.push(entry.sequence);
             self.newer_missing = true;
         }
@@ -546,5 +596,27 @@ mod tests {
 
         transcript.recent_history_failed();
         assert!(!transcript.recent_loading);
+    }
+    #[test]
+    fn copy_projection_is_reused_accounted_and_invalidated_with_history() {
+        let mut transcript = TranscriptState::default();
+        transcript.open(recent([1, 2]));
+        let baseline = transcript.allocated_bytes();
+        let original = transcript.copy_text(SessionSeq(1), || Arc::from("original"));
+        let again = transcript.copy_text(SessionSeq(1), || panic!("recomputed cached projection"));
+        assert!(Arc::ptr_eq(&original, &again));
+        assert_eq!(
+            transcript.allocated_bytes(),
+            baseline + "original".len() + 64
+        );
+        let before = transcript.allocated_bytes();
+        let removed = transcript.evict_one().unwrap();
+        assert_eq!(transcript.allocated_bytes(), before - removed);
+        assert!(transcript.copy_cache.borrow().is_empty());
+        transcript.open(recent([1]));
+        assert_eq!(
+            &*transcript.copy_text(SessionSeq(1), || Arc::from("updated")),
+            "updated"
+        );
     }
 }

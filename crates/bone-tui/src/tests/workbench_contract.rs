@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use crate::{
     editor::EditCommand,
-    layout::{HitTarget, SinglePane},
+    layout::{ClickTarget, SinglePane},
     state::{
-        Action, EditorTarget, Effect, Focus, SessionNavRow, SessionUi, UiEvent, UiState, update,
+        Action, EditorTarget, Effect, SessionNavRow, SessionUi, UiEvent, UiState, WorkspaceTarget,
+        update,
     },
     view,
 };
@@ -13,6 +14,11 @@ use bone_app::{
     WorkspaceId,
 };
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+fn keyboard_submit(state: &mut UiState) -> Vec<Effect> {
+    let action = crate::input::commands::submit_action(state);
+    update(state, UiEvent::Action(action))
+}
 
 fn session(workspace: WorkspaceId, title: &str) -> SessionInfo {
     SessionInfo {
@@ -88,7 +94,7 @@ fn slash_new_creates_directly_without_a_dialog_and_cannot_be_submitted_twice() {
     let mut state = opened_state(&[info]);
     update(&mut state, UiEvent::Action(insert("/new")));
 
-    let first = update(&mut state, UiEvent::Action(Action::Submit));
+    let first = keyboard_submit(&mut state);
     assert!(
         matches!(first.as_slice(), [Effect::CreateSession { .. }]),
         "/new must create a session instead of becoming user input: {first:?}"
@@ -105,7 +111,7 @@ fn slash_new_creates_directly_without_a_dialog_and_cannot_be_submitted_twice() {
         "the in-flight creation identity must be retained"
     );
 
-    let second = update(&mut state, UiEvent::Action(Action::Submit));
+    let second = keyboard_submit(&mut state);
     assert!(
         second.is_empty(),
         "repeated Enter must retain one in-flight creation identity: {second:?}"
@@ -138,7 +144,7 @@ fn unknown_slash_command_is_not_sent_as_a_product_request() {
         UiEvent::Action(insert("/definitely-not-a-command")),
     );
 
-    let effects = update(&mut state, UiEvent::Action(Action::Submit));
+    let effects = keyboard_submit(&mut state);
     assert!(
         !effects
             .iter()
@@ -164,10 +170,13 @@ fn drafts_and_submission_receipts_remain_bound_to_their_session_and_identity() {
         &mut state,
         UiEvent::Action(Action::SelectSession(second.id)),
     );
-    update(&mut state, UiEvent::Action(Action::Focus(Focus::Composer)));
+    update(
+        &mut state,
+        UiEvent::Action(Action::SetWorkspaceTarget(WorkspaceTarget::Composer)),
+    );
     update(&mut state, UiEvent::Action(insert("second draft")));
     let generation = state.session_ui[&second.id].generation;
-    let submitted = update(&mut state, UiEvent::Action(Action::Submit));
+    let submitted = keyboard_submit(&mut state);
     let request_id = submitted
         .iter()
         .find_map(|effect| match effect {
@@ -221,21 +230,21 @@ fn public_focus_actions_restore_the_center_region_the_user_left() {
     let workspace = WorkspaceId::new();
     let info = session(workspace, "focus");
     let mut state = opened_state(&[info]);
-    assert_eq!(state.focus, Focus::Composer);
+    assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
 
     update(&mut state, UiEvent::Action(Action::FocusLeft));
-    assert_eq!(state.focus, Focus::Sessions);
+    assert_eq!(state.workspace_target(), WorkspaceTarget::Sessions);
     update(&mut state, UiEvent::Action(Action::FocusRight));
-    assert_eq!(state.focus, Focus::Composer);
+    assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
 
     update(&mut state, UiEvent::Action(Action::FocusUp));
-    assert_eq!(state.focus, Focus::SessionTitle);
+    assert_eq!(state.workspace_target(), WorkspaceTarget::SessionTitle);
     update(&mut state, UiEvent::Action(Action::FocusLeft));
-    assert_eq!(state.focus, Focus::Sessions);
+    assert_eq!(state.workspace_target(), WorkspaceTarget::Sessions);
     update(&mut state, UiEvent::Action(Action::FocusRight));
-    assert_eq!(state.focus, Focus::SessionTitle);
+    assert_eq!(state.workspace_target(), WorkspaceTarget::SessionTitle);
     update(&mut state, UiEvent::Action(Action::FocusDown));
-    assert_eq!(state.focus, Focus::Composer);
+    assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
 }
 
 #[test]
@@ -257,7 +266,7 @@ fn composer_geometry_is_contained_by_the_center_surface() {
 }
 
 #[test]
-fn right_rail_is_an_explicit_focus_target_without_phantom_actions() {
+fn right_rail_has_no_keyboard_focus_target() {
     let (_, plan) = render(&UiState::default(), 180, 44);
     let blank = plan
         .layout
@@ -265,14 +274,14 @@ fn right_rail_is_an_explicit_focus_target_without_phantom_actions() {
         .expect("wide layout blank extension");
     assert_eq!(
         plan.hit(blank.x, blank.y),
-        Some(HitTarget::PaneDivider(crate::layout::PaneDivider::Right))
+        Some(ClickTarget::PaneDivider(crate::layout::PaneDivider::Right))
     );
     for y in blank.y..blank.bottom() {
         for x in blank.x.saturating_add(1)..blank.right() {
             assert_eq!(
                 plan.hit(x, y),
-                Some(HitTarget::Action(Action::Focus(Focus::RightRail))),
-                "the visible right rail must have one stable focus target at ({x}, {y})"
+                None,
+                "the visible right rail must not capture keyboard focus at ({x}, {y})"
             );
         }
     }
@@ -365,8 +374,8 @@ fn minimum_menu_scrolls_to_selected_command_and_hits_it() {
         assert!(screen.contains(command.name));
         assert!(
             plan.hit_regions()
-                .iter()
-                .any(|r| r.target == HitTarget::Action(Action::ExecuteCommand(command.kind)))
+                .into_iter()
+                .any(|r| r.target == ClickTarget::Action(Action::PrepareCommand(command.kind)))
         );
     }
 }
@@ -377,7 +386,7 @@ fn submission_receipt_survives_leaving_and_reopening_its_session() {
     let second = session(workspace, "second");
     let mut state = opened_state(&[first.clone(), second.clone()]);
     update(&mut state, UiEvent::Action(insert("original")));
-    let effects = update(&mut state, UiEvent::Action(Action::Submit));
+    let effects = keyboard_submit(&mut state);
     let request_id = effects
         .iter()
         .find_map(|e| match e {
@@ -390,7 +399,10 @@ fn submission_receipt_survives_leaving_and_reopening_its_session() {
         UiEvent::Action(Action::SelectSession(second.id)),
     );
     update(&mut state, UiEvent::Action(Action::SelectSession(first.id)));
-    update(&mut state, UiEvent::Action(Action::Focus(Focus::Composer)));
+    update(
+        &mut state,
+        UiEvent::Action(Action::SetWorkspaceTarget(WorkspaceTarget::Composer)),
+    );
     update(&mut state, UiEvent::Action(insert(" plus new edit")));
     update(
         &mut state,
@@ -402,7 +414,7 @@ fn submission_receipt_survives_leaving_and_reopening_its_session() {
     assert!(state.selected_ui().unwrap().submitting.is_none());
     assert_eq!(state.draft(), "original plus new edit");
     assert!(
-        update(&mut state, UiEvent::Action(Action::Submit))
+        keyboard_submit(&mut state)
             .iter()
             .any(|e| matches!(e, Effect::Submit { .. }))
     );
@@ -427,20 +439,244 @@ fn comfortable_session_targets_include_padding_but_exclude_inter_item_gaps() {
         let (_, plan) = render(&state, 120, height);
         let row = plan
             .hit_regions()
-            .iter()
-            .find(|hit| hit.target == HitTarget::Session(first))
+            .into_iter()
+            .find(|hit| hit.target == ClickTarget::Session(first))
             .unwrap();
         assert_eq!(row.area.height, 3);
         for y in row.area.y..row.area.bottom() {
-            assert_eq!(plan.hit(row.area.x + 2, y), Some(HitTarget::Session(first)));
+            assert_eq!(
+                plan.hit(row.area.x + 2, y),
+                Some(ClickTarget::Session(first))
+            );
         }
-        assert_eq!(
-            plan.hit(row.area.x + 2, row.area.bottom()),
-            Some(HitTarget::SessionRail)
-        );
+        assert_eq!(plan.hit(row.area.x + 2, row.area.bottom()), None);
         if height >= 24 {
             assert_eq!(plan.layout.composer.unwrap().height, 6);
         }
         assert!(plan.layout.transcript.unwrap().height >= 3);
     }
+}
+
+#[test]
+fn mouse_browsing_and_resizing_preserve_the_live_editor_selection() {
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    let info = session(WorkspaceId::new(), "mouse focus");
+    let mut state = opened_state(&[info]);
+    update(&mut state, UiEvent::Action(insert("abcdef")));
+    for (byte, extend) in [(2, false), (4, true)] {
+        update(
+            &mut state,
+            UiEvent::Action(Action::Edit {
+                target: EditorTarget::Composer,
+                command: EditCommand::Point { byte, extend },
+            }),
+        );
+    }
+    let (_, frame) = render(&state, 180, 44);
+    let right = frame.layout.extension_blank.unwrap();
+    let title = frame.layout.session_header.unwrap();
+    let transcript = frame.layout.transcript.unwrap();
+    let left = frame.layout.session_rail.unwrap();
+    for (kind, x, y) in [
+        (
+            MouseEventKind::Down(MouseButton::Left),
+            right.x + 3,
+            right.y + 1,
+        ),
+        (
+            MouseEventKind::Down(MouseButton::Left),
+            title.x + 1,
+            title.y,
+        ),
+        (MouseEventKind::Down(MouseButton::Left), left.x, left.y),
+        (
+            MouseEventKind::ScrollDown,
+            transcript.x + 2,
+            transcript.y + 2,
+        ),
+        (MouseEventKind::Down(MouseButton::Left), right.x, right.y),
+        (
+            MouseEventKind::Drag(MouseButton::Left),
+            right.x - 5,
+            right.y,
+        ),
+        (MouseEventKind::Up(MouseButton::Left), right.x - 5, right.y),
+    ] {
+        if let Some(event) = crate::input::terminal_event(
+            Event::Mouse(MouseEvent {
+                kind,
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Some(&frame),
+            &state,
+        ) {
+            update(&mut state, event);
+        }
+        assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
+        assert_eq!(state.draft_cursor(), 4);
+        assert_eq!(state.editor().selection(), Some(2..4));
+    }
+    let event = crate::input::terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE)),
+        Some(&frame),
+        &state,
+    )
+    .unwrap();
+    update(&mut state, event);
+    assert_eq!(state.draft(), "abXef");
+}
+
+#[test]
+fn mouse_command_candidates_prepare_without_focus_and_enter_executes() {
+    use crate::state::{CommandKind, KeyboardOwner};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    let info = session(WorkspaceId::new(), "keyboard focus");
+    for (prefix, kind, target) in [
+        ("/ren", CommandKind::Rename, WorkspaceTarget::SessionTitle),
+        ("/ses", CommandKind::Sessions, WorkspaceTarget::Sessions),
+    ] {
+        let mut state = opened_state(std::slice::from_ref(&info));
+        update(&mut state, UiEvent::Action(insert(prefix)));
+        let (_, frame) = render(&state, 180, 44);
+        let candidate = frame
+            .hit_regions()
+            .into_iter()
+            .find(|region| region.target == ClickTarget::Action(Action::PrepareCommand(kind)))
+            .expect("command candidate");
+        for event_kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let event = crate::input::terminal_event(
+                Event::Mouse(MouseEvent {
+                    kind: event_kind,
+                    column: candidate.area.x,
+                    row: candidate.area.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                Some(&frame),
+                &state,
+            )
+            .expect("candidate click");
+            assert!(update(&mut state, event).is_empty());
+            if event_kind == MouseEventKind::Down(MouseButton::Left) {
+                assert_eq!(state.draft(), prefix, "press does not activate a candidate");
+            }
+        }
+        assert_eq!(
+            state.keyboard,
+            KeyboardOwner::Workspace(WorkspaceTarget::Composer)
+        );
+        assert_eq!(
+            state.draft().trim(),
+            if kind == CommandKind::Rename {
+                "/rename"
+            } else {
+                "/sessions"
+            }
+        );
+        let (_, prepared) = render(&state, 180, 44);
+        assert!(
+            !prepared
+                .hit_regions()
+                .iter()
+                .any(|hit| hit.target == ClickTarget::Action(Action::Submit))
+        );
+        let event = crate::input::terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(&prepared),
+            &state,
+        )
+        .expect("keyboard command execution");
+        update(&mut state, event);
+        assert_eq!(state.keyboard, KeyboardOwner::Workspace(target));
+        assert_eq!(state.draft(), "");
+    }
+}
+
+#[test]
+fn mouse_switching_sessions_preserves_each_draft_and_the_keyboard_role() {
+    let workspace = WorkspaceId::new();
+    let first = session(workspace, "first");
+    let second = session(workspace, "second");
+    let mut state = opened_state(&[first.clone(), second.clone()]);
+    update(&mut state, UiEvent::Action(insert("first draft")));
+    update(
+        &mut state,
+        UiEvent::Action(Action::SelectSession(second.id)),
+    );
+    assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
+    update(&mut state, UiEvent::Action(insert("second draft")));
+    update(&mut state, UiEvent::Action(Action::SelectSession(first.id)));
+    assert_eq!(state.workspace_target(), WorkspaceTarget::Composer);
+    assert_eq!(state.draft(), "first draft");
+    assert_eq!(state.draft_cursor(), "first draft".len());
+    update(
+        &mut state,
+        UiEvent::Action(Action::SelectSession(second.id)),
+    );
+    assert_eq!(state.draft(), "second draft");
+}
+
+#[test]
+fn mouse_panel_preserves_title_selection_and_session_switch_commits_the_edit() {
+    let workspace = WorkspaceId::new();
+    let first = session(workspace, "first");
+    let second = session(workspace, "second");
+    let mut state = opened_state(&[first.clone(), second.clone()]);
+    update(&mut state, UiEvent::Action(Action::FocusUp));
+    update(
+        &mut state,
+        UiEvent::Action(Action::Edit {
+            target: EditorTarget::SessionTitle,
+            command: EditCommand::Insert {
+                text: " edited".into(),
+                typing: true,
+            },
+        }),
+    );
+    for (byte, extend) in [(0, false), (5, true)] {
+        update(
+            &mut state,
+            UiEvent::Action(Action::Edit {
+                target: EditorTarget::SessionTitle,
+                command: EditCommand::Point { byte, extend },
+            }),
+        );
+    }
+    let effects = update(&mut state, UiEvent::Action(Action::OpenModels));
+    assert!(
+        effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::RenameSession { .. }))
+    );
+    assert_eq!(state.title_editor().unwrap().selection(), Some(0..5));
+    update(
+        &mut state,
+        UiEvent::Action(Action::Edit {
+            target: EditorTarget::SessionTitle,
+            command: EditCommand::Insert {
+                text: "FIRST".into(),
+                typing: true,
+            },
+        }),
+    );
+    assert_eq!(state.title_text(), Some("FIRST edited"));
+    update(&mut state, UiEvent::Action(Action::Escape));
+    let effects = update(
+        &mut state,
+        UiEvent::Action(Action::SelectSession(second.id)),
+    );
+    assert_eq!(state.workspace_target(), WorkspaceTarget::SessionTitle);
+    assert!(effects.iter().any(|effect| matches!(effect,
+        Effect::RenameSession { session, title, .. } if *session == first.id && title == "FIRST edited"
+    )));
+    assert_eq!(state.title_text(), Some("second"));
 }

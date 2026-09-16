@@ -16,7 +16,7 @@ use crossterm::event::{self, Event};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::{Notify, mpsc};
 
-use super::{capabilities::TerminalCapabilities, modes::ModeLease};
+use super::{capabilities::TerminalCapabilities, modes::ModeLease, output::PointerShape};
 
 pub(crate) type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -420,6 +420,10 @@ impl TerminalSession {
         self.capabilities
             .as_ref()
             .expect("terminal capabilities exist while the session is active")
+    }
+
+    pub(crate) fn set_pointer_shape(&mut self, shape: PointerShape) -> io::Result<()> {
+        self.modes.set_pointer_shape(shape)
     }
 
     pub(crate) fn panic_signal(&self) -> PanicSignal {

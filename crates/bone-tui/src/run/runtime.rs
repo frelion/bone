@@ -43,6 +43,7 @@ pub(super) struct Runtime {
     exit_draft_request: Option<CreateSessionRequest>,
     tx: mpsc::Sender<UiEvent>,
     ready_tx: mpsc::Sender<SessionReady>,
+    clipboard: mpsc::UnboundedSender<String>,
 }
 
 pub(super) enum SessionReady {
@@ -67,6 +68,28 @@ impl Runtime {
         tx: mpsc::Sender<UiEvent>,
         ready_tx: mpsc::Sender<SessionReady>,
     ) -> Self {
+        let (clipboard, mut copies) = mpsc::unbounded_channel::<String>();
+        let copy_events = tx.clone();
+        // A single consumer preserves copy order without blocking terminal input.
+        tokio::spawn(async move {
+            while let Some(text) = copies.recv().await {
+                let result =
+                    tokio::task::spawn_blocking(move || crate::terminal::copy_text(&text)).await;
+                let error = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(error) => Some(error.to_string()),
+                };
+                if let Some(error) = error {
+                    let _ = copy_events
+                        .send(UiEvent::ConfigOperationFinished {
+                            action: "Copy",
+                            error: Some(error),
+                        })
+                        .await;
+                }
+            }
+        });
         Self {
             login: None,
             app,
@@ -76,11 +99,15 @@ impl Runtime {
             exit_draft_request: None,
             tx,
             ready_tx,
+            clipboard,
         }
     }
 
     pub(super) async fn apply(&mut self, effect: Effect) -> bool {
         match effect {
+            Effect::CopyText(text) => {
+                let _ = self.clipboard.send(text);
+            }
             Effect::ReloadConfig => {
                 let app = self.app.clone();
                 let workspace = self.workspace;

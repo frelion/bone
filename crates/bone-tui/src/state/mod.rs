@@ -1,8 +1,9 @@
 pub mod answer;
 pub mod connection;
 pub use connection::*;
+mod details;
 mod model;
-mod panel;
+mod overlay;
 mod protocol;
 pub(crate) mod reader;
 mod status;
@@ -10,8 +11,9 @@ mod title;
 mod transcript;
 mod update;
 
+pub(crate) use details::ReaderState;
 pub use model::*;
-pub(crate) use panel::*;
+pub(crate) use overlay::*;
 pub use protocol::*;
 pub(crate) use status::Status;
 #[cfg(test)]

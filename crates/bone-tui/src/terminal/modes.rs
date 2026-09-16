@@ -11,7 +11,10 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 
-use super::capabilities::TerminalCapabilities;
+use super::{
+    capabilities::TerminalCapabilities,
+    output::{PointerShape, reset_pointer},
+};
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 compile_error!("bone-tui supports Windows, Linux/WSL, and macOS");
@@ -21,6 +24,7 @@ enum TerminalMode {
     Raw,
     AlternateScreen,
     MouseCapture,
+    PointerShape,
     #[cfg(unix)]
     FocusChange,
     #[cfg(unix)]
@@ -159,6 +163,7 @@ impl ModeBackend for CrosstermModes {
             TerminalMode::MouseCapture => {
                 execute!(io::stdout(), EnableMouseCapture)
             }
+            TerminalMode::PointerShape => PointerShape::Default.write(&mut io::stdout().lock()),
             #[cfg(unix)]
             TerminalMode::FocusChange => {
                 execute!(io::stdout(), EnableFocusChange)
@@ -190,6 +195,7 @@ impl ModeBackend for CrosstermModes {
             TerminalMode::MouseCapture => {
                 execute!(io::stdout(), DisableMouseCapture)
             }
+            TerminalMode::PointerShape => reset_pointer(&mut io::stdout().lock()),
             #[cfg(unix)]
             TerminalMode::FocusChange => {
                 execute!(io::stdout(), DisableFocusChange)
@@ -284,12 +290,14 @@ impl WindowsConsoleModes {
 /// sole owner and restores the ledger after its input worker has joined.
 pub(super) struct ModeLease {
     ledger: ModeLedger<CrosstermModes>,
+    pointer_shape: Option<PointerShape>,
 }
 
 impl ModeLease {
     pub(super) fn prepare() -> io::Result<Self> {
         Ok(Self {
             ledger: ModeLedger::new(CrosstermModes::capture()?),
+            pointer_shape: None,
         })
     }
 
@@ -300,6 +308,8 @@ impl ModeLease {
         self.ledger.enable(TerminalMode::Raw)?;
         self.ledger.enable(TerminalMode::AlternateScreen)?;
         self.ledger.enable(TerminalMode::MouseCapture)?;
+        self.ledger.enable(TerminalMode::PointerShape)?;
+        self.pointer_shape = Some(PointerShape::Default);
         // Native Windows consoles report focus changes without a mode toggle.
         // Restricting this ANSI protocol to Unix also keeps the exact Windows
         // console snapshot as the only focus-related host contract.
@@ -327,7 +337,16 @@ impl ModeLease {
     }
 
     pub(super) fn restore(&mut self) -> io::Result<()> {
+        self.pointer_shape = None;
         self.ledger.restore()
+    }
+
+    pub(super) fn set_pointer_shape(&mut self, shape: PointerShape) -> io::Result<()> {
+        if self.pointer_shape != Some(shape) {
+            shape.write(&mut io::stdout().lock())?;
+            self.pointer_shape = Some(shape);
+        }
+        Ok(())
     }
 }
 
@@ -462,6 +481,22 @@ mod tests {
                 Call::Disable(TerminalMode::Raw),
             ]
         );
+    }
+
+    #[test]
+    fn failed_pointer_setup_is_reset_before_leaving_the_alternate_screen() {
+        let backend = RecordingBackend {
+            enable_failure: Some(TerminalMode::PointerShape),
+            ..RecordingBackend::default()
+        };
+        let mut ledger = ModeLedger::new(backend);
+        ledger.enable(TerminalMode::AlternateScreen).unwrap();
+        assert!(ledger.enable(TerminalMode::PointerShape).is_err());
+        ledger.restore().unwrap();
+        assert!(ledger.backend.calls.ends_with(&[
+            Call::Disable(TerminalMode::PointerShape),
+            Call::Disable(TerminalMode::AlternateScreen),
+        ]));
     }
 
     #[cfg(unix)]

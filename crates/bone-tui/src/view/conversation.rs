@@ -8,13 +8,19 @@ use ratatui::{
 };
 
 use crate::{
-    layout::{HitRegion, HitTarget, LayoutMode, LayoutPlan, TranscriptMetrics},
-    state::{Action, CommandSpec, Focus, UiState},
-    ui::{caret, focus, interaction::HitMap, theme},
-    view::{composer, message, single_line_external, slash_palette},
+    layout::{ClickRegion, ClickTarget, LayoutMode, LayoutPlan, TranscriptMetrics},
+    state::{Action, UiState, WorkspaceTarget},
+    ui::{
+        focus,
+        interaction::SurfaceHits,
+        selection::{CopySource, SelectableText, TextRow},
+        theme,
+    },
+    view::{composer, message, single_line_external},
 };
 
 pub(super) struct RenderedConversation {
+    pub(super) caret: Option<(u16, u16)>,
     pub(super) metrics: Option<TranscriptMetrics>,
     pub(super) composer_row_origin: Option<usize>,
     pub(super) title_byte_origin: Option<usize>,
@@ -23,14 +29,14 @@ pub(super) struct RenderedConversation {
 pub(super) fn render(
     frame: &mut Frame<'_>,
     plan: &LayoutPlan,
-    hits: &mut HitMap,
+    hits: &mut SurfaceHits,
     state: &UiState,
-    slash_matches: &[&CommandSpec],
     previous_composer_row: usize,
 ) -> RenderedConversation {
     if plan.mode == LayoutMode::TooSmall {
         render_too_small(frame, plan.conversation.unwrap_or(plan.screen), state);
         return RenderedConversation {
+            caret: None,
             metrics: None,
             composer_row_origin: None,
             title_byte_origin: None,
@@ -40,20 +46,26 @@ pub(super) fn render(
         (plan.session_header, plan.transcript, plan.composer)
     else {
         return RenderedConversation {
+            caret: None,
             metrics: None,
             composer_row_origin: None,
             title_byte_origin: None,
         };
     };
-    hits.push(HitRegion {
+    hits.push(ClickRegion {
         area: header,
-        target: HitTarget::SessionTitle,
+        target: ClickTarget::Editor(crate::state::EditorTarget::SessionTitle),
     });
-    hits.push(HitRegion {
-        area: transcript,
-        target: HitTarget::Conversation,
-    });
-    let title_byte_origin = render_header(frame, header, state);
+
+    let (title_byte_origin, title_caret) = render_header(frame, header, state);
+    if let (Some(session), Some(text)) = (state.selected, state.title_text()) {
+        hits.push_text(SelectableText {
+            source: CopySource::Title(session),
+            item: 0,
+            text: text.into(),
+            rows: vec![TextRow::new(header, text, title_byte_origin..text.len())],
+        });
+    }
     if crate::layout::comfortable(plan.screen) {
         paint_rule(
             frame,
@@ -61,7 +73,15 @@ pub(super) fn render(
             theme::STRUCTURE,
         );
     }
-    let metrics = render_transcript(frame, transcript, state, hits);
+    let metrics = if state.details.is_some() && plan.extension_blank.is_none() {
+        None
+    } else {
+        hits.push_scroll(
+            transcript,
+            crate::ui::interaction::ScrollTarget::Conversation,
+        );
+        render_transcript(frame, transcript, state, hits)
+    };
     let status = state
         .status_text()
         .map(str::to_owned)
@@ -92,14 +112,13 @@ pub(super) fn render(
         composer_area.width.saturating_sub(4),
         1,
     );
-    if state.panel.is_none() {
+    {
         frame.render_widget(
             Paragraph::new(single_line_external(&status)).style(theme::body(status_tone)),
             status_area,
         );
     }
-    if state.panel.is_none()
-        && let Some(ui) = state.selected_ui()
+    if let Some(ui) = state.selected_ui()
         && let Some(answer) = ui.active_answer()
     {
         let active = ui.snapshot.as_ref().is_some_and(|snapshot| {
@@ -108,24 +127,24 @@ pub(super) fn render(
         let (label, target) = if active {
             (
                 "Answering · back to draft",
-                HitTarget::Action(Action::LeaveAnswer),
+                ClickTarget::Action(Action::LeaveAnswer),
             )
         } else {
             (
                 "Question ended · keep as draft",
-                HitTarget::Action(Action::ConvertAnswer),
+                ClickTarget::Action(Action::ConvertAnswer),
             )
         };
         frame.render_widget(
             Paragraph::new(label).style(theme::body_on(theme::WARNING, theme::PANEL)),
             status_area,
         );
-        hits.push(HitRegion {
+        hits.push(ClickRegion {
             area: status_area,
             target,
         });
     }
-    let composer_row_origin = composer::render(
+    let (composer_row_origin, composer_caret) = composer::render(
         frame,
         plan.screen,
         composer_area,
@@ -133,17 +152,8 @@ pub(super) fn render(
         state,
         previous_composer_row,
     );
-    if state.slash_palette_visible() {
-        slash_palette::render(
-            frame,
-            plan.screen,
-            composer_area,
-            hits,
-            state,
-            slash_matches,
-        );
-    }
     RenderedConversation {
+        caret: composer_caret.or(title_caret),
         metrics,
         composer_row_origin: Some(composer_row_origin),
         title_byte_origin: Some(title_byte_origin),
@@ -215,8 +225,13 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     );
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) -> usize {
-    let focused = focus::workspace_focused(state, Focus::SessionTitle) && state.selected.is_some();
+fn render_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &UiState,
+) -> (usize, Option<(u16, u16)>) {
+    let focused =
+        focus::workspace_focused(state, WorkspaceTarget::SessionTitle) && state.selected.is_some();
     let fallback = state.title_text().unwrap_or("New conversation");
     let (title, cursor, selection_cells, byte_origin) = if focused {
         state.title_editor().map_or_else(
@@ -258,14 +273,9 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &UiState) -> usize {
                 .set_fg(theme::INK);
         }
     }
-    if focused && area.width > 0 {
-        caret::place(
-            frame,
-            (area.x + cursor.min(area.width.saturating_sub(1)), area.y),
-            state.caret_visible,
-        );
-    }
-    byte_origin
+    let caret = (focused && area.width > 0)
+        .then_some((area.x + cursor.min(area.width.saturating_sub(1)), area.y));
+    (byte_origin, caret)
 }
 
 fn paint_rule(frame: &mut Frame<'_>, area: Rect, tone: ratatui::style::Color) {
@@ -279,7 +289,7 @@ fn paint_rule(frame: &mut Frame<'_>, area: Rect, tone: ratatui::style::Color) {
 }
 
 fn reader_selects(state: &UiState, source: crate::state::reader::ReaderSource) -> bool {
-    matches!(&state.panel, Some(crate::state::Panel::Reader(reader))
+    matches!(&state.details, Some(reader)
         if Some(reader.content.session) == state.selected && reader.content.source == source)
 }
 
@@ -287,7 +297,7 @@ fn render_transcript(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &UiState,
-    hits: &mut HitMap,
+    hits: &mut SurfaceHits,
 ) -> Option<TranscriptMetrics> {
     let Some(session) = state.selected_ui() else {
         frame.render_widget(
@@ -302,6 +312,7 @@ fn render_transcript(
     let mut rows = Vec::<Line<'static>>::new();
     let mut links = Vec::new();
     let mut anchors = Vec::new();
+    let mut copy_items = Vec::new();
     for entry in session.transcript.entries() {
         let mut rendered = message::render(&entry.event, area.width);
         if reader_selects(
@@ -312,7 +323,36 @@ fn render_transcript(
                 row.line.style = row.line.style.bg(theme::SELECTED);
             }
         }
+        let text = session.transcript.copy_text(entry.sequence, || {
+            message::copy_text(&entry.event, &rendered)
+        });
+        let copy_rows: Vec<_> = rendered
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                message::copy_row(&entry.event, row, index, area.width).map(|(byte, gutter)| {
+                    let width = if matches!(
+                        &entry.event,
+                        bone_app::SessionEvent::InputSubmitted { .. }
+                            | bone_app::SessionEvent::Reply { .. }
+                    ) {
+                        area.width.saturating_sub(4).max(1)
+                    } else {
+                        let displayed = row.line.width().min(usize::from(area.width)) as u16;
+                        let ellipsis = u16::from(
+                            row.line
+                                .spans
+                                .last()
+                                .is_some_and(|span| span.content.ends_with('…')),
+                        );
+                        displayed.saturating_sub(gutter).saturating_sub(ellipsis)
+                    };
+                    (byte, gutter, width)
+                })
+            })
+            .collect();
         if rendered.is_empty() {
+            copy_items.push((rows.len(), text, entry.sequence.0, copy_rows));
             continue;
         }
         if !rows.is_empty() {
@@ -324,17 +364,20 @@ fn render_transcript(
             });
         }
         let source_row = rows.len();
+        copy_items.push((source_row, text, entry.sequence.0, copy_rows));
         let target = match entry.event {
             bone_app::SessionEvent::ToolFinished { .. }
-            | bone_app::SessionEvent::JobFinished { .. } => {
-                Some(HitTarget::Action(Action::OpenHistory(entry.sequence)))
+            | bone_app::SessionEvent::JobFinished { .. }
+            | bone_app::SessionEvent::RoutingFailed { .. }
+            | bone_app::SessionEvent::InputRejected { .. } => {
+                Some(ClickTarget::Action(Action::OpenHistory(entry.sequence)))
             }
             bone_app::SessionEvent::QuestionAsked { question, .. }
                 if session.snapshot.as_ref().is_some_and(|snapshot| {
                     crate::state::answer::active_question(snapshot, question).is_some()
                 }) =>
             {
-                Some(HitTarget::Action(Action::AnswerQuestion(question)))
+                Some(ClickTarget::Action(Action::AnswerQuestion(question)))
             }
             _ => None,
         };
@@ -364,7 +407,7 @@ fn render_transcript(
                 if reader_selects(state, crate::state::reader::ReaderSource::Job(job.id)) {
                     line.style = line.style.bg(theme::SELECTED);
                 }
-                ephemeral.push((line, Some(HitTarget::Action(Action::OpenJob(job.id)))));
+                ephemeral.push((line, Some(ClickTarget::Action(Action::OpenJob(job.id)))));
             }
         }
         for activity in snapshot.activity.iter().rev() {
@@ -419,7 +462,7 @@ fn render_transcript(
                 }
                 links.push((
                     rows.len(),
-                    HitTarget::Action(Action::AnswerQuestion(question.id)),
+                    ClickTarget::Action(Action::AnswerQuestion(question.id)),
                 ));
                 rows.push(message::compact(
                     "?",
@@ -432,11 +475,11 @@ fn render_transcript(
             {
                 let (target, label) = match candidate {
                     crate::state::answer::RecoveryCandidate::Retry { input } => (
-                        HitTarget::Action(Action::RetryInput(input)),
+                        ClickTarget::Action(Action::RetryInput(input)),
                         format!("Retry saved input #{}", input.0),
                     ),
                     crate::state::answer::RecoveryCandidate::Restore { input, .. } => (
-                        HitTarget::Action(Action::RestoreInput(input)),
+                        ClickTarget::Action(Action::RestoreInput(input)),
                         format!("Restore input #{} to draft", input.0),
                     ),
                 };
@@ -449,7 +492,7 @@ fn render_transcript(
             .as_ref()
             .is_some_and(|pending| pending.failed)
         {
-            links.push((rows.len(), HitTarget::Action(Action::RetrySubmission)));
+            links.push((rows.len(), ClickTarget::Action(Action::RetrySubmission)));
             rows.push(message::compact(
                 "↳",
                 "Retry original submission",
@@ -502,9 +545,35 @@ fn render_transcript(
     });
     let end = (start + viewport).min(rows.len());
     let visible = rows[start..end].to_vec();
+    for (origin, text, item, copy_rows) in copy_items {
+        let mapped = copy_rows
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, copy)| {
+                let global = origin + index;
+                let (byte, gutter, width) = copy?;
+                if global < start || global >= end || gutter >= area.width {
+                    return None;
+                }
+                let row_area = Rect::new(
+                    area.x + gutter,
+                    area.y + (global - start) as u16,
+                    width.min(area.width - gutter),
+                    1,
+                );
+                Some(TextRow::new(row_area, &text, byte..text.len()))
+            })
+            .collect();
+        hits.push_text(SelectableText {
+            source: CopySource::Transcript(state.selected.unwrap()),
+            item,
+            text,
+            rows: mapped,
+        });
+    }
     for (row, target) in links {
         if row >= start && row < end {
-            hits.push(HitRegion {
+            hits.push(ClickRegion {
                 area: Rect::new(area.x, area.y + (row - start) as u16, area.width, 1),
                 target,
             });
@@ -544,7 +613,7 @@ mod tests {
     use super::*;
 
     use crate::{
-        layout::{HitRegion, HitTarget},
+        layout::{ClickRegion, ClickTarget},
         state::{PendingSubmission, SessionUi},
     };
     use bone_app::{
@@ -561,25 +630,31 @@ mod tests {
         let header = Rect::new(4, 1, 30, 1);
         let rule = Rect::new(2, 3, 32, 1);
         for (focus_state, panel, caret_visible, expected_orange_cells) in [
-            (crate::state::Focus::SessionTitle, None, true, 1),
-            (crate::state::Focus::SessionTitle, None, false, 0),
-            (crate::state::Focus::Composer, None, true, 0),
+            (crate::state::WorkspaceTarget::SessionTitle, None, true, 1),
+            (crate::state::WorkspaceTarget::SessionTitle, None, false, 0),
+            (crate::state::WorkspaceTarget::Composer, None, true, 0),
             (
-                crate::state::Focus::SessionTitle,
-                Some(crate::state::Panel::Help),
+                crate::state::WorkspaceTarget::SessionTitle,
+                Some(crate::state::Overlay::Help),
                 true,
                 0,
             ),
         ] {
             let (mut state, _) = fixture();
-            state.focus = focus_state;
-            state.panel = panel;
+            state.set_workspace_target(focus_state);
+            state.overlay = panel;
+            if state.overlay.is_some() {
+                state.enter_overlay();
+            }
             state.caret_visible = caret_visible;
             assert!(state.begin_title_edit());
             let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
             terminal
                 .draw(|frame| {
-                    render_header(frame, header, &state);
+                    let (_, caret) = render_header(frame, header, &state);
+                    if let Some(caret) = caret {
+                        crate::ui::caret::place(frame, caret, state.caret_visible);
+                    }
                     paint_rule(frame, rule, theme::STRUCTURE);
                 })
                 .unwrap();
@@ -613,7 +688,7 @@ mod tests {
             .summary
             .session
             .title = title.into();
-        state.focus = crate::state::Focus::SessionTitle;
+        state.set_workspace_target(crate::state::WorkspaceTarget::SessionTitle);
         state.caret_visible = true;
         assert!(state.begin_title_edit());
         crate::state::update(
@@ -641,7 +716,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(12, 3)).unwrap();
         terminal
             .draw(|frame| {
-                render_header(frame, header, &state);
+                let (_, caret) = render_header(frame, header, &state);
+                if let Some(caret) = caret {
+                    crate::ui::caret::place(frame, caret, state.caret_visible);
+                }
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -785,7 +863,7 @@ mod tests {
         });
     }
 
-    fn render_rows(state: &UiState, height: u16) -> (String, Vec<HitRegion>, TranscriptMetrics) {
+    fn render_rows(state: &UiState, height: u16) -> (String, Vec<ClickRegion>, TranscriptMetrics) {
         render_width(state, 80, height)
     }
 
@@ -793,9 +871,9 @@ mod tests {
         state: &UiState,
         width: u16,
         height: u16,
-    ) -> (String, Vec<HitRegion>, TranscriptMetrics) {
+    ) -> (String, Vec<ClickRegion>, TranscriptMetrics) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let mut hits = HitMap::default();
+        let mut hits = SurfaceHits::default();
         let mut metrics = None;
         terminal
             .draw(|frame| {
@@ -1066,7 +1144,7 @@ mod tests {
         assert!(!text.contains("Start with a clear request"));
         assert!(
             hits.iter()
-                .any(|h| h.target == HitTarget::Action(Action::AnswerQuestion(q)))
+                .any(|h| h.target == ClickTarget::Action(Action::AnswerQuestion(q)))
         );
         assert!(metrics.total_rows > 0);
     }
@@ -1105,9 +1183,9 @@ mod tests {
         assert!(text.contains("Restore input #3 to draft"));
         assert!(text.contains("Retry original submission"));
         for target in [
-            HitTarget::Action(Action::RetryInput(InputId(2))),
-            HitTarget::Action(Action::RestoreInput(InputId(3))),
-            HitTarget::Action(Action::RetrySubmission),
+            ClickTarget::Action(Action::RetryInput(InputId(2))),
+            ClickTarget::Action(Action::RestoreInput(InputId(3))),
+            ClickTarget::Action(Action::RetrySubmission),
         ] {
             assert!(hits.iter().any(|h| h.target == target));
         }
@@ -1193,7 +1271,7 @@ mod tests {
         assert!(
             !hits
                 .iter()
-                .any(|h| matches!(h.target, HitTarget::Action(Action::AnswerQuestion(_))))
+                .any(|h| matches!(h.target, ClickTarget::Action(Action::AnswerQuestion(_))))
         );
         Arc::make_mut(state.selected_ui_mut().unwrap().snapshot.as_mut().unwrap())
             .inputs
@@ -1201,7 +1279,7 @@ mod tests {
         let (_, hits, _) = render_rows(&state, 8);
         assert!(
             hits.iter()
-                .any(|h| h.target == HitTarget::Action(Action::AnswerQuestion(q)))
+                .any(|h| h.target == ClickTarget::Action(Action::AnswerQuestion(q)))
         );
     }
 
@@ -1227,7 +1305,7 @@ mod tests {
         let (text, hits, _) = render_rows(&state, 4);
         let hit = hits
             .iter()
-            .find(|h| h.target == HitTarget::Action(Action::OpenJob(job)))
+            .find(|h| h.target == ClickTarget::Action(Action::OpenJob(job)))
             .expect("job details hit");
         assert!(
             text.lines()

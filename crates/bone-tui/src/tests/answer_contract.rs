@@ -1,7 +1,8 @@
 use crate::{
     editor::{CursorMove, EditCommand},
     state::{
-        Action, EditorTarget, Effect, Focus, SessionNavRow, SessionUi, UiEvent, UiState, update,
+        Action, EditorTarget, Effect, SessionNavRow, SessionUi, UiEvent, UiState, WorkspaceTarget,
+        update,
     },
 };
 use bone_app::{
@@ -342,7 +343,7 @@ fn first_input_create_failure_reuses_identity_and_keeps_text() {
         matches!(retry.as_slice(), [Effect::CreateSession { request_id: actual, .. }] if *actual == request_id)
     );
     assert_eq!(s.draft(), "first request later");
-    assert_eq!(s.focus, Focus::Composer);
+    assert_eq!(s.workspace_target(), WorkspaceTarget::Composer);
 }
 
 #[test]

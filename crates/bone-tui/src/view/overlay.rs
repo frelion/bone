@@ -2,10 +2,10 @@ use super::single_line_external;
 #[cfg(test)]
 use crate::state::ModelPanel;
 use crate::{
-    layout::{HitRegion, HitTarget, LayoutPlan, floating_menu_stride, floating_panel_area},
-    state::{Action, ModelOperationKind, ModelScreen, Panel, UiState},
+    layout::{ClickRegion, ClickTarget, LayoutPlan, floating_menu_stride},
+    state::{Action, ModelOperationKind, ModelScreen, Overlay, UiState},
     ui::{
-        interaction::HitMap,
+        interaction::SurfaceHits,
         theme::{self, INFO, INK, INPUT, MUTED},
     },
 };
@@ -19,9 +19,18 @@ use ratatui::{
 
 const TITLE_INSET: u16 = 2;
 
+pub(super) fn keyboard_hint(state: &UiState) -> &'static str {
+    if state.keyboard.is_overlay() {
+        "esc back · f6 return to input"
+    } else {
+        "back · f6 use panel keyboard"
+    }
+}
+
 pub(super) struct FloatingPanel {
     pub(super) inner: Rect,
     pub(super) back: Rect,
+    pub(super) close: Rect,
     pub(super) stride: u16,
 }
 
@@ -33,7 +42,7 @@ pub(super) fn render_shell(
     area: Rect,
     title: &str,
 ) -> FloatingPanel {
-    let spacious = crate::layout::comfortable(screen);
+    let spacious = crate::layout::comfortable(screen) && area.height >= 10;
     let chrome: u16 = if spacious { 4 } else { 0 };
     frame.render_widget(Clear, area);
     frame.render_widget(Block::default().style(theme::surface(INPUT)), area);
@@ -51,7 +60,12 @@ pub(super) fn render_shell(
     );
     frame.render_widget(
         Paragraph::new(title).style(theme::label_on(INK, title_background)),
-        Rect::new(inner.x, title_y, inner.width, 1),
+        Rect::new(inner.x, title_y, inner.width.saturating_sub(2), 1),
+    );
+    let close = Rect::new(area.right().saturating_sub(3), title_y, 1, 1);
+    frame.render_widget(
+        Paragraph::new("×").style(theme::label_on(MUTED, title_background)),
+        close,
     );
     if spacious {
         frame.render_widget(
@@ -73,64 +87,39 @@ pub(super) fn render_shell(
     FloatingPanel {
         inner,
         back,
-        stride: floating_menu_stride(screen),
+        close,
+        stride: if spacious { 2 } else { 1 },
     }
 }
 
 pub(super) fn render(
     frame: &mut Frame<'_>,
     plan: &LayoutPlan,
-    hits: &mut HitMap,
-    reader_max_scroll: &mut usize,
+    hits: &mut SurfaceHits,
+    editor: Option<Rect>,
     state: &UiState,
-) {
-    let Some(panel) = &state.panel else {
-        return;
+) -> Option<Rect> {
+    let Some(panel) = &state.overlay else {
+        return None;
     };
-    hits.clear();
-    if let Panel::Reader(reader) = panel {
-        let area = plan
-            .extension_blank
-            .or(plan.conversation)
-            .unwrap_or(plan.screen);
-        let metrics = super::reader::render(
-            frame,
-            area,
-            &reader.content,
-            state.selected_ui().and_then(|ui| ui.snapshot.as_deref()),
-            reader.scroll,
-        );
-        *reader_max_scroll = metrics.max_scroll;
-        hits.push(HitRegion {
-            area: metrics.body,
-            target: HitTarget::Reader,
-        });
-        hits.push(HitRegion {
-            area: metrics.back,
-            target: HitTarget::Action(Action::Escape),
-        });
-        return;
-    }
-    if let Panel::Models(models) = panel
+    if let Overlay::Models(models) = panel
         && matches!(
             models.screen,
             ModelScreen::Add { .. } | ModelScreen::Advanced { .. } | ModelScreen::Setup(_)
         )
     {
-        super::connection::render(frame, plan, hits, state, models);
-        return;
+        return super::connection::render(frame, plan, hits, state, models, editor);
     }
 
-    let surface = plan.composer.unwrap_or(plan.screen);
     let spacious = crate::layout::comfortable(plan.screen);
     let stride = floating_menu_stride(plan.screen);
     let (height, title) = match panel {
-        Panel::Help => (16, "Keyboard help"),
-        Panel::Objects(objects) => (
+        Overlay::Help => (16, "Keyboard help"),
+        Overlay::Objects(objects) => (
             objects.choices.len().clamp(1, 12) as u16 * stride + 3,
             "Tasks & tools · enter open",
         ),
-        Panel::Models(models) => match &models.screen {
+        Overlay::Models(models) => match &models.screen {
             ModelScreen::List { .. } => (
                 (models.row_count() * usize::from(stride)
                     + state.model_configuration_summary().lines().count()
@@ -151,22 +140,36 @@ pub(super) fn render(
             ),
             ModelScreen::Login { .. } => (10, "Sign in to ChatGPT"),
             ModelScreen::Add { .. } | ModelScreen::Advanced { .. } | ModelScreen::Setup(_) => {
-                return;
+                return None;
             }
         },
-        Panel::Reader(_) => return,
     };
-    let area = floating_panel_area(plan.screen, surface, height);
+    let area = plan.overlay_area(height, editor);
+    if area.height < 3 {
+        return None;
+    }
+    hits.push_scroll(area, crate::ui::interaction::ScrollTarget::Overlay);
     let shell = render_shell(frame, plan.screen, area, title);
+    frame.render_widget(
+        Paragraph::new(keyboard_hint(state)).style(Style::default().fg(MUTED)),
+        shell.back,
+    );
+    let stride = shell.stride;
+    hits.push(ClickRegion {
+        area: shell.close,
+        target: ClickTarget::Action(Action::CloseOverlay),
+    });
     let mut inner = shell.inner;
-    hits.push(HitRegion {
+    hits.push(ClickRegion {
         area: shell.back,
-        target: HitTarget::Action(Action::Escape),
+        target: ClickTarget::Action(Action::OverlayBack),
     });
 
     match panel {
-        Panel::Objects(objects) => {
-            if let Some(error) = &state.status {
+        Overlay::Objects(objects) => {
+            if let Some(error) = &state.status
+                && inner.height > stride
+            {
                 frame.render_widget(
                     Paragraph::new(single_line_external(error.text()))
                         .style(Style::default().fg(theme::DANGER)),
@@ -203,14 +206,14 @@ pub(super) fn render(
                             .style(menu_style(index == objects.selected)),
                         row,
                     );
-                    hits.push(HitRegion {
+                    hits.push(ClickRegion {
                         area: row,
-                        target: HitTarget::Action(Action::SelectObject(index)),
+                        target: ClickTarget::Action(Action::SelectObject(index)),
                     });
                 }
             }
         }
-        Panel::Models(models) => match &models.screen {
+        Overlay::Models(models) => match &models.screen {
             ModelScreen::List { selected } => {
                 if let Some(status) = &state.status {
                     let height = 2.min(inner.height.saturating_sub(1));
@@ -255,72 +258,47 @@ pub(super) fn render(
                         inner,
                     );
                 } else {
-                    let action_stride = if spacious && inner.height >= 5 { 2 } else { 1 };
-                    let action_height = (1 + action_stride * 2).min(inner.height);
-                    let model_area = Rect::new(
-                        inner.x,
-                        inner.y,
-                        inner.width,
-                        inner.height.saturating_sub(action_height),
-                    );
-                    let choices_area = model_area;
-                    let capacity = usize::from(choices_area.height / stride);
-                    let cursor = (*selected).min(models.choices.len().saturating_sub(1));
-                    let start = cursor.saturating_sub(capacity.saturating_sub(1));
-                    for (index, choice) in
-                        models.choices.iter().enumerate().skip(start).take(capacity)
-                    {
+                    let stride = stride.min(inner.height.max(1));
+                    let capacity = usize::from(inner.height / stride);
+                    let selected = (*selected).min(models.row_count().saturating_sub(1));
+                    let start = selected.saturating_sub(capacity.saturating_sub(1));
+                    for index in (start..models.row_count()).take(capacity) {
                         let row = Rect::new(
-                            choices_area.x,
-                            choices_area.y + (index - start) as u16 * stride,
-                            choices_area.width,
+                            inner.x,
+                            inner.y + (index - start) as u16 * stride,
+                            inner.width,
                             stride,
                         );
-                        render_model_choice(
-                            frame,
-                            row,
-                            state,
-                            choice,
-                            index == *selected,
-                            spacious,
-                        );
-                        hits.push(HitRegion {
-                            area: row,
-                            target: HitTarget::Action(Action::SelectModel(index)),
-                        });
-                    }
-                    if action_height > 0 {
-                        let action_y = inner.bottom().saturating_sub(action_height);
-                        frame.render_widget(
-                            Paragraph::new("Connections").style(Style::default().fg(MUTED)),
-                            Rect::new(inner.x, action_y, inner.width, 1),
-                        );
-                        for (offset, label) in ["+ Add account or API…", "Manage connections…"]
-                            .into_iter()
-                            .enumerate()
-                        {
-                            let index = models.choices.len() + offset;
-                            let row = Rect::new(
-                                inner.x,
-                                action_y + 1 + offset as u16 * action_stride,
-                                inner.width,
-                                action_stride,
+                        if let Some(choice) = models.choices.get(index) {
+                            render_model_choice(
+                                frame,
+                                row,
+                                state,
+                                choice,
+                                index == selected,
+                                stride > 1,
                             );
+                        } else {
+                            let label = if index == models.choices.len() {
+                                "+ Add account or API…"
+                            } else {
+                                "Manage connections…"
+                            };
                             frame.render_widget(
-                                Paragraph::new(label).style(model_menu_style(index == *selected)),
+                                Paragraph::new(label).style(model_menu_style(index == selected)),
                                 row,
                             );
-                            hits.push(HitRegion {
-                                area: row,
-                                target: HitTarget::Action(Action::SelectModel(index)),
-                            });
                         }
+                        hits.push(ClickRegion {
+                            area: row,
+                            target: ClickTarget::Action(Action::SelectModel(index)),
+                        });
                     }
                 }
             }
             ModelScreen::Reasoning { model, selected } => {
                 let Some(choice) = models.choices.get(*model) else {
-                    return;
+                    return Some(area);
                 };
                 let preset = models.preset(*model);
                 let configured = state
@@ -332,24 +310,27 @@ pub(super) fn render(
                             && resolved.selection.model == choice.selection.model
                     })
                     .and_then(|resolved| crate::state::model_effort(&resolved.selection));
-                frame.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(&choice.label, theme::label(INK)),
-                        Span::styled(
-                            format!("  {}", choice.profile_label),
-                            Style::default().fg(MUTED),
-                        ),
-                    ])),
-                    Rect::new(inner.x, inner.y, inner.width, 1),
-                );
-                let hint_y = inner.y.saturating_add(1);
-                frame.render_widget(
-                    Paragraph::new("How much time should this model spend reasoning?")
-                        .style(Style::default().fg(MUTED)),
-                    Rect::new(inner.x, hint_y, inner.width, 1),
-                );
                 let choices = models.reasoning_efforts(*model);
-                let choices_y = hint_y.saturating_add(if spacious { 2 } else { 1 });
+                let choices_y = if inner.height >= 5 {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(&choice.label, theme::label(INK)),
+                            Span::styled(
+                                format!("  {}", choice.profile_label),
+                                Style::default().fg(MUTED),
+                            ),
+                        ])),
+                        Rect::new(inner.x, inner.y, inner.width, 1),
+                    );
+                    frame.render_widget(
+                        Paragraph::new("How much time should this model spend reasoning?")
+                            .style(theme::body(MUTED)),
+                        Rect::new(inner.x, inner.y + 1, inner.width, 1),
+                    );
+                    inner.y + 2
+                } else {
+                    inner.y
+                };
                 let choices_height = inner.bottom().saturating_sub(choices_y);
                 let capacity = usize::from(choices_height / stride);
                 let cursor = (*selected).min(choices.len().saturating_sub(1));
@@ -370,9 +351,9 @@ pub(super) fn render(
                         preset.and_then(|preset| preset.default_reasoning) == Some(*effort),
                         spacious,
                     );
-                    hits.push(HitRegion {
+                    hits.push(ClickRegion {
                         area: row,
-                        target: HitTarget::Action(Action::SelectModel(index)),
+                        target: ClickTarget::Action(Action::SelectModel(index)),
                     });
                 }
             }
@@ -424,9 +405,9 @@ pub(super) fn render(
                                 .style(menu_style(index == *selected)),
                             row,
                         );
-                        hits.push(HitRegion {
+                        hits.push(ClickRegion {
                             area: row,
-                            target: HitTarget::Action(Action::SelectModel(index)),
+                            target: ClickTarget::Action(Action::SelectModel(index)),
                         });
                     }
                 }
@@ -451,33 +432,38 @@ pub(super) fn render(
                     }
                     bone_app::LoginState::Cancelled => ("Sign-in cancelled".to_owned(), true),
                 };
-                let body = Rect::new(
-                    inner.x,
-                    inner.y,
-                    inner.width,
-                    inner.height.saturating_sub(u16::from(retry)),
+                let text = super::sanitize_external(&text);
+                let starts = crate::ui::selection::source_starts(&text, usize::from(inner.width));
+                let retry_index = starts.len();
+                let max =
+                    (retry_index + usize::from(retry)).saturating_sub(usize::from(inner.height));
+                let start = state.overlay_scroll.min(max);
+                hits.push_scroll(
+                    area,
+                    crate::ui::interaction::ScrollTarget::OverlayContent { max },
                 );
-                frame.render_widget(
-                    Paragraph::new(super::sanitize_external(&text))
-                        .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(INK)),
-                    body,
-                );
-                if retry && inner.height > 0 {
-                    let action = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
+                render_copyable_text(frame, hits, inner, text, &starts, start);
+                if retry && retry_index >= start && retry_index < start + usize::from(inner.height)
+                {
+                    let action = Rect::new(
+                        inner.x,
+                        inner.y + (retry_index - start) as u16,
+                        inner.width,
+                        1,
+                    );
                     frame.render_widget(
                         Paragraph::new("Retry sign-in").style(menu_style(true)),
                         action,
                     );
-                    hits.push(HitRegion {
+                    hits.push(ClickRegion {
                         area: action,
-                        target: HitTarget::Action(Action::ActivatePanel),
+                        target: ClickTarget::Action(Action::ActivatePanel),
                     });
                 }
             }
             ModelScreen::Add { .. } | ModelScreen::Advanced { .. } | ModelScreen::Setup(_) => {}
         },
-        Panel::Help => {
+        Overlay::Help => {
             let shift_enter = if state.terminal_capabilities.shift_enter_supported() {
                 "Shift+Enter   New line in input".to_owned()
             } else {
@@ -497,35 +483,74 @@ pub(super) fn render(
                 "Ctrl+D        Save drafts and quit".to_owned(),
                 "Esc           Back, then stop".to_owned(),
                 "Ctrl+Z/Y      Undo / redo in input".to_owned(),
+                "Mouse drag    Select; release to copy".to_owned(),
                 "/model        Models & connections".to_owned(),
                 "/reload-config Reload configuration files".to_owned(),
                 "/trust-config Trust current project config".to_owned(),
                 "/details      Latest task / tool".to_owned(),
             ];
-            frame.render_widget(
-                Paragraph::new(lines.map(Line::from).to_vec())
-                    .style(Style::default().fg(INK))
-                    .wrap(Wrap { trim: false }),
+            let text = lines.join("\n");
+            let starts = crate::ui::selection::source_starts(&text, usize::from(inner.width));
+            let max = starts.len().saturating_sub(usize::from(inner.height));
+            hits.push_scroll(
+                area,
+                crate::ui::interaction::ScrollTarget::OverlayContent { max },
+            );
+            render_copyable_text(
+                frame,
+                hits,
                 inner,
+                text,
+                &starts,
+                state.overlay_scroll.min(max),
             );
         }
-        Panel::Reader(_) => {}
     }
+    Some(area)
 }
+fn render_copyable_text(
+    frame: &mut Frame<'_>,
+    hits: &mut SurfaceHits,
+    area: Rect,
+    text: String,
+    starts: &[u32],
+    start: usize,
+) {
+    use crate::ui::selection::{CopySource, SelectableText, TextRow, display_text, row_range};
+    let mut lines = Vec::new();
+    let mut rows = Vec::new();
+    for source_row in (start..starts.len()).take(usize::from(area.height)) {
+        let range = row_range(&text, starts, source_row);
+        lines.push(Line::from(display_text(&text[range.clone()])));
+        rows.push(TextRow::new(
+            Rect::new(area.x, area.y + rows.len() as u16, area.width, 1),
+            &text,
+            range,
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme::body(INK)), area);
+    hits.push_text(SelectableText {
+        source: CopySource::Overlay,
+        item: 0,
+        text: text.into(),
+        rows,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::{ModelScreen, ObjectPanel};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Modifier};
 
-    fn models(screen: ModelScreen) -> Panel {
+    fn models(screen: ModelScreen) -> Overlay {
         let mut models = ModelPanel::new(None);
         models.screen = screen;
-        Panel::Models(models)
+        Overlay::Models(models)
     }
 
-    fn objects(choices: Vec<(crate::state::reader::ReaderSource, String)>) -> Panel {
-        Panel::Objects(ObjectPanel {
+    fn objects(choices: Vec<(crate::state::reader::ReaderSource, String)>) -> Overlay {
+        Overlay::Objects(ObjectPanel {
             session: bone_app::SessionId::new(),
             choices,
             selected: 0,
@@ -549,7 +574,7 @@ mod tests {
         for (width, height) in [(40, 12), (80, 24), (140, 24), (160, 40)] {
             for panel in [
                 models(ModelScreen::List { selected: 0 }),
-                Panel::Help,
+                Overlay::Help,
                 models(ModelScreen::Login {
                     request: 1,
                     state: bone_app::LoginState::Connecting,
@@ -561,7 +586,7 @@ mod tests {
                 )]),
             ] {
                 let mut state = UiState::default();
-                state.panel = Some(panel);
+                state.overlay = Some(panel);
                 state.status = Some("Invalid value".into());
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 let mut plan = None;
@@ -576,19 +601,15 @@ mod tests {
                         region.area.right() <= width && region.area.bottom() <= height,
                         "{region:?} in {width}x{height}"
                     );
-                    assert!(!matches!(
-                        region.target,
-                        HitTarget::Composer | HitTarget::Action(Action::ClickSubmit)
-                    ));
                 }
                 let back = plan
                     .hit_regions()
-                    .iter()
-                    .find(|region| region.target == HitTarget::Action(Action::Escape))
+                    .into_iter()
+                    .find(|region| region.target == ClickTarget::Action(Action::OverlayBack))
                     .unwrap();
                 assert_eq!(
                     plan.hit(back.area.x, back.area.y),
-                    Some(HitTarget::Action(Action::Escape))
+                    Some(ClickTarget::Action(Action::OverlayBack))
                 );
             }
         }
@@ -597,11 +618,12 @@ mod tests {
     #[test]
     fn panel_title_uses_a_neutral_active_surface_without_orange() {
         let mut state = UiState::default();
-        state.panel = Some(Panel::Help);
+        state.overlay = Some(Overlay::Help);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut overlay = None;
         terminal
             .draw(|frame| {
-                crate::view::render(frame, &state);
+                overlay = crate::view::render(frame, &state).overlay_area();
             })
             .unwrap();
 
@@ -619,18 +641,20 @@ mod tests {
         assert_eq!(title.fg, INK);
         assert_eq!(title.bg, theme::FOCUS_SURFACE);
         assert!(title.modifier.contains(Modifier::BOLD));
-        assert!(
-            buffer
-                .content()
-                .iter()
-                .all(|cell| cell.fg != theme::FOCUS_MARK && cell.bg != theme::FOCUS_MARK)
-        );
+        let overlay = overlay.unwrap();
+        for y in overlay.y..overlay.bottom() {
+            for x in overlay.x..overlay.right() {
+                let cell = &buffer[(x, y)];
+                assert_ne!(cell.fg, theme::FOCUS_MARK);
+                assert_ne!(cell.bg, theme::FOCUS_MARK);
+            }
+        }
     }
 
     #[test]
     fn help_names_only_the_declared_focus_and_editor_shortcuts() {
         let mut state = UiState::default();
-        state.panel = Some(Panel::Help);
+        state.overlay = Some(Overlay::Help);
         let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         terminal
             .draw(|frame| {
@@ -796,9 +820,9 @@ mod grouped_menu_tests {
             }
             models.profiles = vec![bone_app::Profile::chatgpt(); 5];
             let row_count = models.row_count();
-            state.panel = Some(Panel::Models(models));
+            state.overlay = Some(Overlay::Models(models));
             for selected in 0..row_count {
-                let Some(Panel::Models(models)) = &mut state.panel else {
+                let Some(Overlay::Models(models)) = &mut state.overlay else {
                     unreachable!();
                 };
                 models.screen = ModelScreen::List { selected };
@@ -810,12 +834,12 @@ mod grouped_menu_tests {
                 let plan = plan.unwrap();
                 let hit = plan
                     .hit_regions()
-                    .iter()
-                    .find(|hit| hit.target == HitTarget::Action(Action::SelectModel(selected)))
+                    .into_iter()
+                    .find(|hit| hit.target == ClickTarget::Action(Action::SelectModel(selected)))
                     .expect("selected action remains visible");
                 assert_eq!(
                     plan.hit(hit.area.x, hit.area.y),
-                    Some(HitTarget::Action(Action::SelectModel(selected)))
+                    Some(ClickTarget::Action(Action::SelectModel(selected)))
                 );
                 let buffer = terminal.backend().buffer();
                 assert_eq!(buffer[(hit.area.x, hit.area.y)].bg, theme::PANEL);
@@ -823,12 +847,12 @@ mod grouped_menu_tests {
                 for y in 0..height {
                     let line: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
                     if line.trim() == "Connections" {
-                        assert!(!plan.hit_regions().iter().any(|hit| hit.area.y == y
-                            && matches!(hit.target, HitTarget::Action(Action::SelectModel(_)))));
+                        assert!(!plan.hit_regions().into_iter().any(|hit| hit.area.y == y
+                            && matches!(hit.target, ClickTarget::Action(Action::SelectModel(_)))));
                     }
                 }
             }
-            let Some(Panel::Models(models)) = &mut state.panel else {
+            let Some(Overlay::Models(models)) = &mut state.overlay else {
                 unreachable!();
             };
             models.choices.clear();
@@ -840,8 +864,8 @@ mod grouped_menu_tests {
                     let plan = crate::view::render(frame, &state);
                     assert!(
                         plan.hit_regions()
-                            .iter()
-                            .any(|hit| hit.target == HitTarget::Action(Action::SelectModel(0)))
+                            .into_iter()
+                            .any(|hit| hit.target == ClickTarget::Action(Action::SelectModel(0)))
                     );
                 })
                 .unwrap();
@@ -849,7 +873,7 @@ mod grouped_menu_tests {
     }
 
     #[test]
-    fn compact_error_state_keeps_the_selected_model_and_connection_actions_visible() {
+    fn compact_error_state_keeps_each_selected_model_action_reachable() {
         let profile = bone_app::Profile::chatgpt();
         let resolved = |model: &str| bone_app::ResolvedModel {
             selection: bone_app::ModelSelection::new(profile.id.clone(), model).unwrap(),
@@ -873,29 +897,25 @@ mod grouped_menu_tests {
             })
             .collect();
         models.screen = ModelScreen::List { selected: 1 };
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        let mut plan = None;
-        terminal
-            .draw(|frame| plan = Some(crate::view::render(frame, &state)))
-            .unwrap();
-        let plan = plan.unwrap();
-
         for index in [1, 2, 3] {
-            assert!(
-                plan.hit_regions()
-                    .iter()
-                    .any(|hit| { hit.target == HitTarget::Action(Action::SelectModel(index)) })
-            );
+            let Some(Overlay::Models(models)) = state.overlay.as_mut() else {
+                unreachable!()
+            };
+            models.screen = ModelScreen::List { selected: index };
+            let mut plan = None;
+            terminal
+                .draw(|frame| plan = Some(crate::view::render(frame, &state)))
+                .unwrap();
+            let plan = plan.unwrap();
+            let hit = plan
+                .hit_regions()
+                .into_iter()
+                .find(|hit| hit.target == ClickTarget::Action(Action::SelectModel(index)))
+                .expect("selected action stays visible in the bounded viewport");
+            assert_eq!(plan.hit(hit.area.x, hit.area.y), Some(hit.target.clone()));
         }
-        let screen = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(screen.contains("✓ Configured"));
     }
 
     #[test]
@@ -908,7 +928,7 @@ mod grouped_menu_tests {
                 message: "authorization expired".into(),
             },
         };
-        state.panel = Some(Panel::Models(models));
+        state.overlay = Some(Overlay::Models(models));
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         let mut plan = None;
         terminal
@@ -918,8 +938,8 @@ mod grouped_menu_tests {
         assert!(
             plan.unwrap()
                 .hit_regions()
-                .iter()
-                .any(|hit| { hit.target == HitTarget::Action(Action::ActivatePanel) })
+                .into_iter()
+                .any(|hit| { hit.target == ClickTarget::Action(Action::ActivatePanel) })
         );
     }
 }

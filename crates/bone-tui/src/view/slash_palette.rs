@@ -1,19 +1,19 @@
 use ratatui::{Frame, layout::Rect, widgets::Paragraph};
 
 use crate::{
-    layout::{HitRegion, HitTarget, attached_floating_panel_area, floating_menu_stride},
+    layout::{ClickRegion, ClickTarget, attached_floating_panel_area, floating_menu_stride},
     state::{Action, CommandSpec, UiState},
-    ui::{interaction::HitMap, theme},
+    ui::{interaction::SurfaceHits, theme},
 };
 
 pub(super) fn render(
     frame: &mut Frame<'_>,
     screen: Rect,
     composer: Rect,
-    hits: &mut HitMap,
+    hits: &mut SurfaceHits,
     state: &UiState,
     matches: &[&CommandSpec],
-) {
+) -> Rect {
     let stride = floating_menu_stride(screen);
     let area = attached_floating_panel_area(
         screen,
@@ -22,19 +22,17 @@ pub(super) fn render(
             .saturating_mul(stride)
             .saturating_add(3),
     );
-    let shell = super::panels::render_shell(frame, screen, area, "Commands");
+    let shell = super::overlay::render_shell(frame, screen, area, "Commands");
 
-    // The complete surface captures pointer input so its title, padding and
-    // blank rows cannot fall through to the conversation underneath it.
-    hits.push(HitRegion {
-        area,
-        target: HitTarget::Capture,
-    });
-    hits.push(HitRegion {
+    hits.push(ClickRegion {
         area: shell.back,
-        target: HitTarget::Action(Action::Escape),
+        target: ClickTarget::Action(Action::DismissCommands),
     });
 
+    hits.push(ClickRegion {
+        area: shell.close,
+        target: ClickTarget::Action(Action::DismissCommands),
+    });
     let capacity = usize::from(shell.inner.height / shell.stride).max(1);
     let start = state
         .slash_selection
@@ -45,7 +43,7 @@ pub(super) fn render(
                 .style(theme::body_on(theme::MUTED, theme::INPUT)),
             shell.inner,
         );
-        return;
+        return area;
     }
 
     for (index, command) in matches.iter().enumerate().skip(start).take(capacity) {
@@ -61,14 +59,16 @@ pub(super) fn render(
             format!("/{}", command.name)
         };
         frame.render_widget(
-            Paragraph::new(label).style(super::panels::menu_style(index == state.slash_selection)),
+            Paragraph::new(label).style(super::overlay::menu_style(index == state.slash_selection)),
             row,
         );
-        hits.push(HitRegion {
+        hits.push(ClickRegion {
             area: row,
-            target: HitTarget::Action(Action::ExecuteCommand(command.kind)),
+            target: ClickTarget::Action(Action::PrepareCommand(command.kind)),
         });
     }
+    hits.push_scroll(area, crate::ui::interaction::ScrollTarget::Commands);
+    area
 }
 
 #[cfg(test)]
@@ -88,12 +88,7 @@ mod tests {
                 .unwrap();
             let snapshot = snapshot.unwrap();
             let composer = snapshot.layout.composer.expect("composer");
-            let palette = snapshot
-                .hit_regions()
-                .iter()
-                .find(|hit| hit.target == HitTarget::Capture)
-                .expect("slash panel")
-                .area;
+            let palette = snapshot.overlay_area().expect("slash panel");
             assert_eq!((palette.x, palette.width), (composer.x, composer.width));
             assert!(palette.bottom() < composer.y);
             assert!(palette.y > snapshot.layout.screen.y);
@@ -111,12 +106,7 @@ mod tests {
             .unwrap();
 
         let plan = snapshot.unwrap();
-        let area = plan
-            .hit_regions()
-            .iter()
-            .find(|hit| hit.target == HitTarget::Capture)
-            .expect("slash panel")
-            .area;
+        let area = plan.overlay_area().expect("slash panel");
         let buffer = terminal.backend().buffer();
         let title = (area.y..area.bottom())
             .find_map(|y| {
@@ -133,19 +123,15 @@ mod tests {
 
         let selected = plan
             .hit_regions()
-            .iter()
-            .find(|hit| matches!(hit.target, HitTarget::Action(Action::ExecuteCommand(_))))
+            .into_iter()
+            .find(|hit| matches!(hit.target, ClickTarget::Action(Action::PrepareCommand(_))))
             .expect("selected command row")
             .area;
         for x in selected.x..selected.right() {
             assert_eq!(buffer[(x, selected.y)].bg, theme::SELECTED);
             assert_ne!(buffer[(x, selected.y)].bg, theme::FOCUS_MARK);
         }
-        assert!(
-            plan.hit_regions()
-                .iter()
-                .any(|hit| hit.target == HitTarget::Capture && hit.area == area)
-        );
+        assert_eq!(plan.overlay_area(), Some(area));
     }
 
     #[test]
@@ -158,12 +144,7 @@ mod tests {
             .draw(|frame| snapshot = Some(crate::view::render(frame, &state)))
             .unwrap();
         let snapshot = snapshot.unwrap();
-        let area = snapshot
-            .hit_regions()
-            .iter()
-            .find(|hit| hit.target == HitTarget::Capture)
-            .expect("slash panel")
-            .area;
+        let area = snapshot.overlay_area().expect("slash panel");
         let screen = terminal
             .backend()
             .buffer()
@@ -172,6 +153,6 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("No matching commands"));
-        assert_eq!(snapshot.hit(area.x + 1, area.y), Some(HitTarget::Capture));
+        assert_eq!(snapshot.hit(area.x + 1, area.y), None);
     }
 }

@@ -113,14 +113,7 @@ pub async fn run() -> Result<(), RunError> {
     let (mut terminal, mut events): (TerminalSession, TerminalEvents) = TerminalSession::enter()?;
     let panic_signal = terminal.panic_signal();
     state.terminal_capabilities = terminal.capabilities().clone();
-    let viewport = terminal.terminal().size()?;
-    effects.extend(update(
-        &mut state,
-        UiEvent::Resized {
-            width: viewport.width,
-            height: viewport.height,
-        },
-    ));
+    effects.extend(update(&mut state, UiEvent::Resized));
     #[cfg(debug_assertions)]
     schedule_test_background_panic();
     let mut overview_ticker = tokio::time::interval(Duration::from_secs(5));
@@ -316,6 +309,12 @@ pub async fn run() -> Result<(), RunError> {
                     None
                 } else {
                     let event = require_terminal_event(event)?;
+                    if let Event::Mouse(mouse) = &event {
+                        effects.extend(update(&mut state, UiEvent::PointerMoved {
+                            column: mouse.column,
+                            row: mouse.row,
+                        }));
+                    }
                     terminal_event(event, frame_snapshot.as_ref(), &state)
                 }
             },
@@ -369,13 +368,43 @@ pub async fn run() -> Result<(), RunError> {
         };
         if let Some(event) = next {
             let caret_was_active = state.blinking_caret_active();
+            let previous_keyboard = state.keyboard;
             let reset_caret = matches!(
                 event,
-                UiEvent::Action(_) | UiEvent::CaretBlink | UiEvent::Resized { .. }
-            );
+                UiEvent::Action(
+                    Action::Edit { .. }
+                        | Action::PointEditor { .. }
+                        | Action::FinishEditorSelection { .. }
+                        | Action::SetupText(_)
+                        | Action::SetupBackspace
+                        | Action::SetupClear
+                        | Action::FocusLeft
+                        | Action::FocusRight
+                        | Action::FocusUp
+                        | Action::FocusDown
+                        | Action::NextField
+                        | Action::PreviousField
+                        | Action::ToggleOverlayKeyboard
+                        | Action::CommitTitle
+                        | Action::CancelTitle
+                ) | UiEvent::CaretBlink
+                    | UiEvent::Resized
+            ) || state.keyboard
+                == crate::state::KeyboardOwner::Workspace(crate::state::WorkspaceTarget::Composer)
+                && matches!(
+                    event,
+                    UiEvent::Action(
+                        Action::PrepareCommand(_)
+                            | Action::CompleteSlash
+                            | Action::StartSlashCommand
+                    )
+                );
             runtime.accept_event(&event);
             effects.extend(update(&mut state, event));
-            if reset_caret || !caret_was_active && state.blinking_caret_active() {
+            if reset_caret
+                || previous_keyboard != state.keyboard
+                || !caret_was_active && state.blinking_caret_active()
+            {
                 caret_sleep
                     .as_mut()
                     .reset(tokio::time::Instant::now() + CARET_PHASE);
@@ -528,6 +557,21 @@ fn render_dirty(
         ));
     })?;
     *frame_snapshot = rendered;
+    if let Some(snapshot) = frame_snapshot.as_ref() {
+        if state
+            .pointer
+            .selection
+            .as_ref()
+            .is_some_and(|selection| !snapshot.selection_valid(selection))
+        {
+            state.pointer.selection = None;
+            if state.pointer.capture == Some(crate::state::PointerCapture::Content) {
+                state.pointer.capture = None;
+                state.pointer.press = None;
+            }
+        }
+        terminal.set_pointer_shape(snapshot.pointer_shape(state))?;
+    }
     if let Some(metrics) = frame_snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.transcript_metrics.clone())
@@ -688,14 +732,7 @@ fn suspend_and_resume(
     }
     *events = terminal.resume()?;
     state.terminal_capabilities = terminal.capabilities().clone();
-    let viewport = terminal.terminal().size()?;
-    let _ = update(
-        state,
-        UiEvent::Resized {
-            width: viewport.width,
-            height: viewport.height,
-        },
-    );
+    let _ = update(state, UiEvent::Resized);
     state.caret_visible = true;
     *frame_snapshot = None;
     state.dirty = true;

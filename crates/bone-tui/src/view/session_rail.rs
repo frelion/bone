@@ -1,9 +1,9 @@
 use crate::{
-    layout::{HitRegion, HitTarget, LayoutPlan},
-    state::{Focus, UiState},
+    layout::{ClickRegion, ClickTarget, LayoutPlan},
+    state::{UiState, WorkspaceTarget},
     ui::{
         focus,
-        interaction::HitMap,
+        interaction::SurfaceHits,
         theme::{self, DANGER, INK, MUTED, RAIL, SELECTED},
     },
     view::single_line_external,
@@ -64,16 +64,18 @@ pub(super) fn status_tone(state: &UiState, index: usize) -> Option<Color> {
     }
 }
 
-pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap, state: &UiState) {
+pub(super) fn render(
+    frame: &mut Frame<'_>,
+    plan: &LayoutPlan,
+    hits: &mut SurfaceHits,
+    state: &UiState,
+) {
     let Some(area) = plan.session_rail else {
         return;
     };
-    hits.push(HitRegion {
-        area,
-        target: HitTarget::SessionRail,
-    });
+    hits.push_scroll(area, crate::ui::interaction::ScrollTarget::Sessions);
     frame.render_widget(Block::default().style(theme::surface(RAIL)), area);
-    let active = focus::workspace_focused(state, Focus::Sessions);
+    let active = focus::workspace_focused(state, WorkspaceTarget::Sessions);
     let project = state
         .workspace_label
         .as_ref()
@@ -100,9 +102,9 @@ pub(super) fn render(frame: &mut Frame<'_>, plan: &LayoutPlan, hits: &mut HitMap
     for row in &plan.session_rows {
         render_session_row(frame, plan, state, row.index, row.area, active, now);
         if let Some(session) = state.session_rows.get(row.index) {
-            hits.push(HitRegion {
+            hits.push(ClickRegion {
                 area: row.area,
-                target: HitTarget::Session(session.id()),
+                target: ClickTarget::Session(session.id()),
             });
         }
     }
@@ -281,7 +283,7 @@ mod tests {
     use super::*;
     use crate::{
         layout::SinglePane,
-        state::{Focus, SessionNavRow},
+        state::{SessionNavRow, WorkspaceTarget},
     };
     use bone_app::{SessionId, SessionInfo, SessionSeq, SessionSummary, WorkspaceId};
     use ratatui::{Terminal, backend::TestBackend};
@@ -333,7 +335,7 @@ mod tests {
         .collect();
         state.selected = Some(current.id);
         state.session_candidate = Some(candidate.id);
-        state.focus = Focus::Sessions;
+        state.set_workspace_target(WorkspaceTarget::Sessions);
         state.workspace_label = Some("Workspace".into());
         let plan = LayoutPlan::calculate_with_widths(
             Rect::new(0, 0, 120, 24),
@@ -352,7 +354,7 @@ mod tests {
         let (state, plan) = fixture();
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         terminal
-            .draw(|frame| render(frame, &plan, &mut HitMap::default(), &state))
+            .draw(|frame| render(frame, &plan, &mut SurfaceHits::default(), &state))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let current = plan.session_rows.iter().find(|row| row.index == 0).unwrap();
@@ -405,7 +407,7 @@ mod tests {
         state.session_rows[1].summary.projection_pending = true;
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         terminal
-            .draw(|frame| render(frame, &plan, &mut HitMap::default(), &state))
+            .draw(|frame| render(frame, &plan, &mut SurfaceHits::default(), &state))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let row = plan.session_rows.iter().find(|row| row.index == 1).unwrap();
@@ -423,7 +425,7 @@ mod tests {
     #[test]
     fn an_empty_focused_rail_uses_its_header_without_a_new_session_button() {
         let mut state = UiState::default();
-        state.focus = Focus::Sessions;
+        state.set_workspace_target(WorkspaceTarget::Sessions);
         state.workspace_label = Some("Workspace".into());
         let plan = LayoutPlan::calculate_with_widths(
             Rect::new(0, 0, 120, 24),
@@ -436,7 +438,7 @@ mod tests {
         );
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         terminal
-            .draw(|frame| render(frame, &plan, &mut HitMap::default(), &state))
+            .draw(|frame| render(frame, &plan, &mut SurfaceHits::default(), &state))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let header = (plan.session_rail.unwrap().x + 3, 1);

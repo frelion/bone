@@ -27,23 +27,24 @@ pub(crate) struct ReaderLayout {
     rows: std::sync::Arc<ReaderRows>,
 }
 
-/// Contiguous display text plus exact row boundaries avoids a String allocation
-/// and its metadata per empty row. Offsets always address UTF-8 row boundaries.
+/// Original source plus packed row starts; only viewport text is materialized.
 #[derive(Debug)]
 pub(crate) struct ReaderRows {
-    text: String,
-    ends: Box<[u32]>,
+    text: std::sync::Arc<str>,
+    starts: Box<[u32]>,
 }
 impl ReaderRows {
     pub fn len(&self) -> usize {
-        self.ends.len().saturating_sub(1)
+        self.starts.len()
     }
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> {
-        (0..self.len())
-            .map(|index| &self.text[self.ends[index] as usize..self.ends[index + 1] as usize])
+    pub fn range(&self, row: usize) -> std::ops::Range<usize> {
+        crate::ui::selection::row_range(&self.text, &self.starts, row)
+    }
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = String> + '_ {
+        (0..self.len()).map(|row| crate::ui::selection::display_text(&self.text[self.range(row)]))
     }
     pub fn allocated_bytes(&self) -> usize {
-        self.text.capacity() + std::mem::size_of_val(&*self.ends)
+        std::mem::size_of_val(&*self.starts)
     }
 }
 
@@ -67,24 +68,12 @@ impl ReaderContent {
         {
             return std::sync::Arc::clone(&layout.rows);
         }
-        let wrapped = crate::text::wrap_text(&self.text, width);
-        let mut text = String::with_capacity(wrapped.iter().map(String::len).sum());
-        let mut ends = Vec::with_capacity(wrapped.len() + 1);
-        ends.push(0);
-        for row in wrapped {
-            text.push_str(&row);
-            ends.push(text.len());
-        }
-        let ends = ends
-            .into_iter()
-            .map(|offset| {
-                u32::try_from(offset)
-                    .expect("reader row offset exceeds the current App projection limits")
-            })
-            .collect();
-        let rows = std::sync::Arc::new(ReaderRows { text, ends });
-        // Charge both the Reader's projected source and the packed display copy.
-        // The Arc identity key shares that source allocation; it is not a third copy.
+        let starts = crate::ui::selection::source_starts(&self.text, width).into_boxed_slice();
+        let rows = std::sync::Arc::new(ReaderRows {
+            text: self.text.clone(),
+            starts,
+        });
+        // Charge the shared source once and the packed source offsets.
         let bytes = rows
             .allocated_bytes()
             .saturating_add(self.text.len())
@@ -130,6 +119,22 @@ impl ReaderContent {
     /// do not become synthetic Jobs and a missing Job is not replaced by another.
     pub fn from_history(session: SessionId, entry: &HistoryEntry) -> Option<Self> {
         let (title, text) = match &entry.event {
+            SessionEvent::RoutingFailed {
+                runtime, message, ..
+            } => (
+                "Routing failed".into(),
+                format!(
+                    "{message}\n\nRuntime: {runtime}\nHistory: {}",
+                    entry.sequence.0
+                ),
+            ),
+            SessionEvent::InputRejected { input, message } => (
+                "Input rejected".into(),
+                format!(
+                    "{message}\n\nInput: {}\nHistory: {}",
+                    input.0, entry.sequence.0
+                ),
+            ),
             SessionEvent::ToolFinished {
                 call,
                 job,

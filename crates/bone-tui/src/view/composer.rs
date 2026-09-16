@@ -1,8 +1,8 @@
 use crate::{
     input::{BindingHint, status_baseline_bindings},
-    layout::{HitRegion, HitTarget},
-    state::{Action, Focus, UiState},
-    ui::{caret, focus, interaction::HitMap, theme},
+    layout::{ClickRegion, ClickTarget},
+    state::{Action, UiState, WorkspaceTarget},
+    ui::{focus, interaction::SurfaceHits, theme},
     view::single_line_external,
 };
 use ratatui::{
@@ -17,17 +17,17 @@ pub(super) fn render(
     frame: &mut Frame<'_>,
     screen: Rect,
     area: Rect,
-    hits: &mut HitMap,
+    hits: &mut SurfaceHits,
     state: &UiState,
     previous_row_origin: usize,
-) -> usize {
+) -> (usize, Option<(u16, u16)>) {
     let draft = state.draft();
     let cursor = state.draft_cursor();
     // Slash commands keep editor focus and the same application-owned caret.
-    let focused = focus::workspace_focused(state, Focus::Composer);
-    hits.push(HitRegion {
+    let focused = focus::workspace_focused(state, WorkspaceTarget::Composer);
+    hits.push(ClickRegion {
         area,
-        target: HitTarget::Composer,
+        target: ClickTarget::Editor(crate::state::EditorTarget::Composer),
     });
     let surface = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(2));
     frame.render_widget(
@@ -58,6 +58,30 @@ pub(super) fn render(
         )),
         input,
     );
+    if !focused {
+        use crate::ui::selection::{CopySource, SelectableText, TextRow, row_range, source_starts};
+        let starts = source_starts(draft, usize::from(input.width));
+        let rows = (viewport.row_origin..starts.len())
+            .take(usize::from(input.height))
+            .enumerate()
+            .map(|(screen_row, source_row)| {
+                TextRow::new(
+                    Rect::new(input.x, input.y + screen_row as u16, input.width, 1),
+                    draft,
+                    row_range(draft, &starts, source_row),
+                )
+            })
+            .collect();
+        hits.push_text(SelectableText {
+            source: CopySource::Composer {
+                session: state.selected,
+                question: state.selected_ui().and_then(|ui| ui.selected_answer),
+            },
+            item: 0,
+            text: draft.into(),
+            rows,
+        });
+    }
     if focused && let Some(selection) = state.editor().selection() {
         for (x, y, width) in crate::editor::selection_cells(
             draft,
@@ -80,9 +104,7 @@ pub(super) fn render(
         Paragraph::new(model).style(theme::body_on(theme::MUTED, theme::PANEL)),
         geometry.model,
     );
-    if state.panel.is_none()
-        && let Some(bindings) = geometry.bindings
-    {
+    if let Some(bindings) = geometry.bindings {
         let hints = status_baseline_bindings(state.terminal_capabilities.shift_enter_supported());
         frame.render_widget(
             Paragraph::new(binding_line(&hints, geometry.binding_count))
@@ -90,15 +112,13 @@ pub(super) fn render(
             bindings,
         );
     }
-    if state.panel.is_none()
-        && let Some(commands) = geometry.commands
-    {
+    if let Some(commands) = geometry.commands {
         frame.render_widget(
             Paragraph::new("/ commands").style(theme::body(theme::MUTED)),
             commands,
         );
     }
-    if state.panel.is_none() {
+    {
         let actionable = !draft.trim().is_empty()
             && state
                 .selected_ui()
@@ -112,20 +132,20 @@ pub(super) fn render(
             }),
             action_area,
         );
-        if actionable && !state.slash_palette_visible() {
-            hits.push(HitRegion {
+        if actionable && !state.command_mode() {
+            hits.push(ClickRegion {
                 area: action_area,
-                target: HitTarget::Action(Action::ClickSubmit),
+                target: ClickTarget::Action(Action::Submit),
             });
         }
-        hits.push(HitRegion {
+        hits.push(ClickRegion {
             area: geometry.model,
-            target: HitTarget::Action(Action::OpenModels),
+            target: ClickTarget::Action(Action::OpenModels),
         });
         if let Some(commands) = geometry.commands {
-            hits.push(HitRegion {
+            hits.push(ClickRegion {
                 area: Rect::new(commands.x, commands.y, 10, 1),
-                target: HitTarget::Action(Action::StartSlashCommand),
+                target: ClickTarget::Action(Action::StartSlashCommand),
             });
         }
     }
@@ -160,19 +180,14 @@ pub(super) fn render(
             Paragraph::new(label).style(Style::default().fg(theme::MUTED).bg(theme::PANEL)),
             stop,
         );
-        hits.push(HitRegion {
+        hits.push(ClickRegion {
             area: stop,
-            target: HitTarget::Action(Action::Stop),
+            target: ClickTarget::Action(Action::Stop),
         });
     }
-    if focused && input.width > 0 && input.height > 0 {
-        caret::place(
-            frame,
-            (input.x + viewport.cursor_x, input.y + viewport.cursor_y),
-            state.caret_visible,
-        );
-    }
-    viewport.row_origin
+    let caret = (focused && input.width > 0 && input.height > 0)
+        .then_some((input.x + viewport.cursor_x, input.y + viewport.cursor_y));
+    (viewport.row_origin, caret)
 }
 
 /// Shared by paint and pointer registration, including intermediate pane widths.
@@ -256,7 +271,14 @@ fn action(area: Rect, state: &UiState) -> (Rect, &'static str) {
         .and_then(|ui| ui.submitting.as_ref())
         .is_some_and(|pending| !pending.failed);
     let answering = session.is_some_and(|ui| ui.selected_answer.is_some());
-    let label = if pending {
+    let label = if state.command_mode() {
+        match state.keyboard {
+            crate::state::KeyboardOwner::Workspace(WorkspaceTarget::Composer) => "enter execute",
+            crate::state::KeyboardOwner::Workspace(WorkspaceTarget::SessionTitle) => "ctrl+↓ input",
+            crate::state::KeyboardOwner::Workspace(WorkspaceTarget::Sessions) => "ctrl+→ return",
+            crate::state::KeyboardOwner::Overlay { .. } => "f6 return",
+        }
+    } else if pending {
         "Saving…"
     } else if answering {
         if session.is_some_and(|ui| {
@@ -292,11 +314,21 @@ fn action(area: Rect, state: &UiState) -> (Rect, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::HitTarget;
+    use crate::layout::ClickTarget;
     use ratatui::{Terminal, backend::TestBackend};
 
     fn render(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-        super::render(frame, frame.area(), area, &mut HitMap::default(), state, 0);
+        let (_, caret) = super::render(
+            frame,
+            frame.area(),
+            area,
+            &mut SurfaceHits::default(),
+            state,
+            0,
+        );
+        if let Some(caret) = caret {
+            crate::ui::caret::place(frame, caret, state.caret_visible);
+        }
     }
 
     #[test]
@@ -386,19 +418,22 @@ mod tests {
     fn composer_focus_uses_only_the_blinking_caret() {
         let area = Rect::new(0, 0, 72, 6);
         for (focus_state, panel, caret_visible, expected_orange_cells) in [
-            (crate::state::Focus::Composer, None, true, 1),
-            (crate::state::Focus::Composer, None, false, 0),
-            (crate::state::Focus::SessionTitle, None, true, 0),
+            (crate::state::WorkspaceTarget::Composer, None, true, 1),
+            (crate::state::WorkspaceTarget::Composer, None, false, 0),
+            (crate::state::WorkspaceTarget::SessionTitle, None, true, 0),
             (
-                crate::state::Focus::Composer,
-                Some(crate::state::Panel::Help),
+                crate::state::WorkspaceTarget::Composer,
+                Some(crate::state::Overlay::Help),
                 true,
                 0,
             ),
         ] {
             let mut state = UiState::default();
-            state.focus = focus_state;
-            state.panel = panel;
+            state.set_workspace_target(focus_state);
+            state.overlay = panel;
+            if state.overlay.is_some() {
+                state.enter_overlay();
+            }
             state.caret_visible = caret_visible;
             state.orphan_draft = "draft".into();
             let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
@@ -429,12 +464,12 @@ mod tests {
     }
 
     #[test]
-    fn inactive_composer_preserves_text_without_action_hints() {
+    fn mouse_overlay_preserves_composer_text_and_actions() {
         let mut state = UiState::default();
         state.orphan_draft = "preserved draft".into();
-        state.panel = Some(crate::state::Panel::Models(crate::state::ModelPanel::new(
-            None,
-        )));
+        state.overlay = Some(crate::state::Overlay::Models(
+            crate::state::ModelPanel::new(None),
+        ));
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         terminal
             .draw(|frame| render(frame, Rect::new(0, 0, 72, 5), &state))
@@ -446,10 +481,7 @@ mod tests {
             .collect();
         assert!(text.contains("preserved draft"));
         assert!(text.contains("Select model"));
-        assert!(!text.contains("enter save"));
-        assert!(!text.contains("/ commands"));
-        assert!(!text.contains("ctrl+c clear"));
-        assert!(!text.contains("ctrl+d exit"));
+        assert!(text.contains("enter save"));
         assert!(!text.contains('›'));
     }
 
@@ -471,7 +503,7 @@ mod tests {
             for offset in 0.."Select model".len().min(usize::from(geometry.model.width)) {
                 assert_eq!(
                     plan.hit(geometry.model.x + offset as u16, geometry.model.y),
-                    Some(HitTarget::Action(Action::OpenModels)),
+                    Some(ClickTarget::Action(Action::OpenModels)),
                     "width {width}"
                 );
             }
@@ -479,13 +511,13 @@ mod tests {
             assert!(
                 !plan
                     .hit_regions()
-                    .iter()
-                    .any(|region| region.target == HitTarget::Action(Action::StartSlashCommand))
+                    .into_iter()
+                    .any(|region| region.target == ClickTarget::Action(Action::StartSlashCommand))
             );
             let submit = action(area, &state).0;
             assert_eq!(
                 plan.hit(submit.x, submit.y),
-                Some(HitTarget::Action(Action::ClickSubmit))
+                Some(ClickTarget::Action(Action::Submit))
             );
 
             let empty = UiState::default();
@@ -505,20 +537,21 @@ mod tests {
                 for x in commands.x..commands.x + 10 {
                     assert_eq!(
                         empty_plan.hit(x, commands.y),
-                        Some(HitTarget::Action(Action::StartSlashCommand)),
+                        Some(ClickTarget::Action(Action::StartSlashCommand)),
                         "width {width}"
                     );
                 }
                 assert_ne!(
                     empty_plan.hit(commands.x + 11, commands.y),
-                    Some(HitTarget::Action(Action::StartSlashCommand))
+                    Some(ClickTarget::Action(Action::StartSlashCommand))
                 );
             } else {
                 assert!(
                     !empty_plan
                         .hit_regions()
-                        .iter()
-                        .any(|region| region.target == HitTarget::Action(Action::StartSlashCommand)),
+                        .into_iter()
+                        .any(|region| region.target
+                            == ClickTarget::Action(Action::StartSlashCommand)),
                     "hidden commands at width {width}"
                 );
             }

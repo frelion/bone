@@ -1,7 +1,7 @@
 use bone_app::SessionSeq;
 use ratatui::layout::Rect;
 
-pub use crate::ui::interaction::{HitRegion, HitTarget};
+pub use crate::ui::interaction::{ClickRegion, ClickTarget};
 
 const SESSION_RAIL_WIDTH: u16 = 32;
 const EXTENSION_WIDTH: u16 = 40;
@@ -341,6 +341,51 @@ pub(crate) fn attached_floating_panel_area(screen: Rect, composer: Rect, body_he
 }
 
 impl LayoutPlan {
+    /// Details belong to the workspace even when there is no right column.
+    pub(crate) fn details_area(&self) -> Option<Rect> {
+        self.extension_blank.or(self.transcript)
+    }
+
+    /// Fit the single overlay into the workspace while exposing its keyboard editor.
+    pub(crate) fn overlay_area(&self, body_height: u16, editor: Option<Rect>) -> Rect {
+        let column = self.conversation.unwrap_or(self.screen);
+        let mut available = Rect::new(
+            column.x + 1,
+            self.screen.y + 1,
+            column.width.saturating_sub(2),
+            self.screen.height.saturating_sub(2),
+        );
+        if let Some(editor) = editor {
+            let above = Rect::new(
+                available.x,
+                available.y,
+                available.width,
+                editor.y.saturating_sub(available.y),
+            );
+            let below_y = editor.bottom().min(available.bottom());
+            let below = Rect::new(
+                available.x,
+                below_y,
+                available.width,
+                available.bottom().saturating_sub(below_y),
+            );
+            available = if above.height >= below.height {
+                above
+            } else {
+                below
+            };
+        }
+        let height = body_height
+            .saturating_add(if comfortable(self.screen) { 4 } else { 0 })
+            .min(available.height);
+        Rect::new(
+            available.x,
+            available.bottom().saturating_sub(height),
+            available.width,
+            height,
+        )
+    }
+
     pub fn calculate_with_widths(
         screen: Rect,
         single_pane: SinglePane,
@@ -476,10 +521,6 @@ fn session_window(
         })
         .collect();
     (start, max_start, rows)
-}
-
-pub(crate) fn right_rail_available(width: u16, height: u16) -> bool {
-    mode_for(Rect::new(0, 0, width, height)) == LayoutMode::Wide
 }
 
 fn mode_for(area: Rect) -> LayoutMode {

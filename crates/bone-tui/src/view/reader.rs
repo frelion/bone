@@ -2,7 +2,13 @@
 //!
 //! The caller owns selection, loading, focus and scroll. This module performs no
 //! App calls and never interprets tool text as a status or a command.
-use crate::{state::reader::ReaderContent, ui::theme};
+use crate::{
+    state::reader::ReaderContent,
+    ui::{
+        selection::{CopySource, SelectableText, TextRow},
+        theme,
+    },
+};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -13,16 +19,17 @@ use ratatui::{
 
 const TITLE_INSET: u16 = 2;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ReaderMetrics {
     pub max_scroll: usize,
     pub body: Rect,
     /// The caller can register a pointer target for returning to the source.
     pub back: Rect,
+    pub texts: Vec<SelectableText>,
 }
 
 /// Render in any caller-provided area. The caller must retain the returned clamp
-/// after resize and route Esc locally before global execution-stop handling.
+/// after resize and provide a local close action.
 pub(crate) fn render(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -38,14 +45,17 @@ pub(crate) fn render(
         area,
     );
     let padding = u16::from(area.width >= 8) * 3;
+    let spacious = area.height >= 5;
+    let top_padding = u16::from(spacious);
     let inner = Rect::new(
         area.x + padding,
-        area.y + u16::from(area.height > 1),
+        area.y + top_padding,
         area.width.saturating_sub(padding * 2),
-        area.height.saturating_sub(1),
+        area.height.saturating_sub(top_padding),
     );
     let back = Rect::new(inner.x, area.bottom() - 1, inner.width, 1);
-    if inner.height > 1 {
+    let show_title = area.height >= 3;
+    if show_title {
         let title = super::single_line_external(&content.title);
         let title_row = Rect::new(inner.x, inner.y, inner.width, 1);
         let title_background = theme::SELECTED;
@@ -64,12 +74,8 @@ pub(crate) fn render(
             ),
         );
     }
-    let body = Rect::new(
-        inner.x,
-        (inner.y + 2).min(inner.bottom()),
-        inner.width,
-        inner.height.saturating_sub(3),
-    );
+    let body_y = inner.y + u16::from(show_title) + u16::from(spacious);
+    let body = Rect::new(inner.x, body_y, inner.width, back.y.saturating_sub(body_y));
     let rows = content.wrapped_rows(usize::from(inner.width));
     let inputs = content.job_inputs(snapshot);
     let width = usize::from(inner.width).max(1);
@@ -89,6 +95,24 @@ pub(crate) fn render(
         total_rows.saturating_sub(usize::from(body.height))
     };
     let scroll = scroll.min(max_scroll);
+    let source = CopySource::Details {
+        session: content.session,
+        source: content.source,
+    };
+    let mut texts = vec![SelectableText {
+        source,
+        item: 0,
+        text: content.text.clone(),
+        rows: (scroll..(scroll + usize::from(body.height)).min(rows.len()))
+            .map(|row| {
+                TextRow::new(
+                    Rect::new(body.x, body.y + (row - scroll) as u16, body.width, 1),
+                    &content.text,
+                    rows.range(row),
+                )
+            })
+            .collect(),
+    }];
     let mut visible: Vec<Line<'_>> = rows
         .iter()
         .skip(scroll)
@@ -105,11 +129,48 @@ pub(crate) fn render(
             if tail == 0 {
                 visible.push(Line::raw(""));
             } else if let Some(heading) = input_heading.get(tail - 1) {
+                let value = format!("Inputs ({})", inputs.len());
+                let heading_starts = crate::ui::selection::source_starts(&value, width);
+                let range = crate::ui::selection::row_range(&value, &heading_starts, tail - 1);
+                let mapped = TextRow::new(
+                    Rect::new(body.x, body.y + (row - scroll) as u16, body.width, 1),
+                    &value,
+                    range,
+                );
+                if let Some(text) = texts.last_mut().filter(|text| text.item == 1) {
+                    text.rows.push(mapped);
+                } else {
+                    texts.push(SelectableText {
+                        source,
+                        item: 1,
+                        text: value.into(),
+                        rows: vec![mapped],
+                    });
+                }
                 visible.push(Line::raw(heading.as_str()));
             } else {
                 let offset = tail - 1 - input_heading.len();
                 let index = offset / input_row_height;
                 let part = offset % input_row_height;
+                let item = index as u64 + 2;
+                let value = inputs[index].0.to_string();
+                let start = (part * width).min(value.len());
+                let end = ((part + 1) * width).min(value.len());
+                let text_row = TextRow::new(
+                    Rect::new(body.x, body.y + (row - scroll) as u16, body.width, 1),
+                    &value,
+                    start..end,
+                );
+                if let Some(text) = texts.last_mut().filter(|text| text.item == item) {
+                    text.rows.push(text_row);
+                } else {
+                    texts.push(SelectableText {
+                        source,
+                        item,
+                        text: value.into(),
+                        rows: vec![text_row],
+                    });
+                }
                 visible.push(Line::raw(input_id_fragment(inputs[index], width, part)));
             }
         }
@@ -120,13 +181,13 @@ pub(crate) fn render(
     );
     let footer = if inner.width >= 30 && max_scroll > 0 {
         format!(
-            "esc back · {}–{} / {}",
+            "close details · {}–{} / {}",
             scroll + 1,
             (scroll + usize::from(body.height)).min(total_rows),
             total_rows
         )
     } else {
-        "esc back".to_owned()
+        "close details".to_owned()
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(theme::MUTED)),
@@ -136,6 +197,7 @@ pub(crate) fn render(
         max_scroll,
         body,
         back,
+        texts,
     }
 }
 
@@ -180,6 +242,68 @@ mod tests {
                 assert_eq!(rendered.trim_end(), id.to_string());
             }
         }
+    }
+
+    #[test]
+    fn smallest_workspace_shows_and_scrolls_details_without_covering_the_composer() {
+        use crate::{
+            layout::ClickTarget,
+            state::{Action, ReaderState, UiState, update},
+        };
+        use crossterm::event::{Event, KeyModifiers, MouseEvent, MouseEventKind};
+
+        let mut state = UiState::default();
+        state.orphan_draft = "continue typing".into();
+        state.details = Some(ReaderState {
+            content: ReaderContent {
+                layout_cache: Default::default(),
+                session: SessionId::new(),
+                source: ReaderSource::History(SessionSeq(1)),
+                title: "Detail title".into(),
+                text: (0..12)
+                    .map(|index| format!("line{index:02}\n"))
+                    .collect::<String>()
+                    .into(),
+            },
+            scroll: 0,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut snapshot = None;
+        terminal
+            .draw(|frame| snapshot = Some(crate::view::render(frame, &state)))
+            .unwrap();
+        assert!(find_text(terminal.backend().buffer(), "line00").is_some());
+        assert!(find_text(terminal.backend().buffer(), "continue typing").is_some());
+        let snapshot = snapshot.unwrap();
+        let area = snapshot.layout.details_area().unwrap();
+        assert!(area.bottom() <= snapshot.layout.composer.unwrap().y);
+        assert!(
+            snapshot
+                .hit_regions()
+                .iter()
+                .any(|region| region.target == ClickTarget::Action(Action::CloseDetails))
+        );
+        let event = crate::input::terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: area.x + 3,
+                row: area.y + 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Some(&snapshot),
+            &state,
+        )
+        .expect("details wheel input");
+        update(&mut state, event);
+        assert_eq!(state.details.as_ref().unwrap().scroll, 3);
+        terminal
+            .draw(|frame| {
+                crate::view::render(frame, &state);
+            })
+            .unwrap();
+        assert!(find_text(terminal.backend().buffer(), "line03").is_some());
+        assert!(find_text(terminal.backend().buffer(), "line00").is_none());
+        assert_eq!(state.draft(), "continue typing");
     }
 
     #[test]
@@ -285,6 +409,53 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(visible.contains(&u64::MAX.to_string()));
+        // Selection resolves offscreen virtual IDs from the same snapshot without
+        // cloning the million-element list or serializing the whole document.
+        snapshot = {
+            use crate::ui::{
+                interaction::{FrameHits, SurfaceHits},
+                selection::TextPoint,
+            };
+            let source = CopySource::Details {
+                session: content.session,
+                source: content.source,
+            };
+            let input_pointer = snapshot.jobs[0].inputs.as_ptr();
+            let shared = std::sync::Arc::new(snapshot);
+            {
+                let mut hits = SurfaceHits::default();
+                for text in metrics.texts.iter().cloned() {
+                    hits.push_text(text);
+                }
+                hits.push_job_inputs(source, shared.clone());
+                let hits = FrameHits::new(hits, None);
+                let first = TextPoint {
+                    source,
+                    item: 2,
+                    byte: 0,
+                };
+                let third = TextPoint {
+                    source,
+                    item: 4,
+                    byte: 20,
+                };
+                assert_eq!(
+                    hits.source_content(first).as_deref(),
+                    Some((u64::MAX - 999_999).to_string().as_str())
+                );
+                assert_eq!(
+                    hits.copy_between(first, third),
+                    Some(
+                        (0..3)
+                            .map(|i| (u64::MAX - 999_999 + i).to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                );
+                assert_eq!(shared.jobs[0].inputs.as_ptr(), input_pointer);
+            }
+            std::sync::Arc::try_unwrap(shared).unwrap()
+        };
         // Changing associations does not duplicate the source or invalidate body layout.
         snapshot.jobs[0].inputs.push(bone_app::InputId(0));
         content.refresh_job(&snapshot);

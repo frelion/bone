@@ -4,14 +4,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::{
     editor::{CursorMove, EditCommand},
-    state::{Action, EditorTarget, Focus, ModelScreen, Panel, UiState},
+    state::{Action, EditorTarget, KeyboardOwner, ModelScreen, Overlay, UiState, WorkspaceTarget},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct KeyGeometry {
     pub(super) composer_width: Option<u16>,
-    pub(super) reader_max_scroll: Option<usize>,
-    pub(super) right_rail_visible: bool,
 }
 
 /// One shortcut rendered in the composer's status baseline.
@@ -55,8 +53,8 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState, geometry: KeyGeometry) 
     // Enter chords are exact. This guard prevents a modified Enter from
     // activating a panel or a session after falling through another branch.
     if key.code == KeyCode::Enter && key.modifiers != KeyModifiers::NONE {
-        return (state.panel.is_none()
-            && state.focus == Focus::Composer
+        return (!matches!(state.keyboard, KeyboardOwner::Overlay { .. })
+            && state.workspace_target() == WorkspaceTarget::Composer
             && key.modifiers == KeyModifiers::SHIFT)
             .then(|| {
                 edit(
@@ -69,8 +67,14 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState, geometry: KeyGeometry) 
             });
     }
 
-    if let Some(panel) = &state.panel {
-        return panel_action(key, panel, geometry);
+    if exact(&key, KeyCode::F(6), KeyModifiers::NONE) && state.overlay.is_some() {
+        return Some(Action::ToggleOverlayKeyboard);
+    }
+
+    if matches!(state.keyboard, KeyboardOwner::Overlay { .. })
+        && let Some(panel) = &state.overlay
+    {
+        return overlay_action(key, panel);
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -81,28 +85,21 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState, geometry: KeyGeometry) 
         }
         return match key.code {
             KeyCode::Left => Some(Action::FocusLeft),
-            KeyCode::Right
-                if !matches!(state.focus, Focus::SessionTitle | Focus::Composer)
-                    || geometry.right_rail_visible =>
-            {
-                Some(Action::FocusRight)
-            }
+            KeyCode::Right => Some(Action::FocusRight),
             KeyCode::Up => Some(Action::FocusUp),
             KeyCode::Down => Some(Action::FocusDown),
-            KeyCode::Char('c') if state.focus == Focus::Composer => {
+            KeyCode::Char('c') if state.workspace_target() == WorkspaceTarget::Composer => {
                 Some(edit(EditorTarget::Composer, EditCommand::Clear))
             }
-            KeyCode::Char('z') => {
-                editor_target(state.focus).map(|target| edit(target, EditCommand::Undo))
-            }
-            KeyCode::Char('y') => {
-                editor_target(state.focus).map(|target| edit(target, EditCommand::Redo))
-            }
+            KeyCode::Char('z') => editor_target(state.workspace_target())
+                .map(|target| edit(target, EditCommand::Undo)),
+            KeyCode::Char('y') => editor_target(state.workspace_target())
+                .map(|target| edit(target, EditCommand::Redo)),
             _ => None,
         };
     }
 
-    if let Some(target) = editor_target(state.focus)
+    if let Some(target) = editor_target(state.workspace_target())
         && key
             .modifiers
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
@@ -141,30 +138,42 @@ pub(super) fn key_action(key: KeyEvent, state: &UiState, geometry: KeyGeometry) 
     }
 
     let slash_open = state.slash_palette_visible();
-    let editor_target = editor_target(state.focus);
+    let editor_target = editor_target(state.workspace_target());
     let action = match key.code {
-        KeyCode::Esc if state.focus == Focus::SessionTitle => Some(Action::CancelTitle),
+        KeyCode::Esc if state.workspace_target() == WorkspaceTarget::SessionTitle => {
+            Some(Action::CancelTitle)
+        }
         KeyCode::Esc => Some(Action::Escape),
         KeyCode::Up if slash_open => Some(Action::SelectSlashPrevious),
         KeyCode::Down if slash_open => Some(Action::SelectSlashNext),
         KeyCode::Tab if slash_open => Some(Action::CompleteSlash),
-        KeyCode::Up if state.focus == Focus::Sessions => Some(Action::SelectPrevious),
-        KeyCode::Down if state.focus == Focus::Sessions => Some(Action::SelectNext),
-        KeyCode::Enter if state.focus == Focus::Sessions => Some(Action::OpenCandidate),
+        KeyCode::Up if state.workspace_target() == WorkspaceTarget::Sessions => {
+            Some(Action::SelectPrevious)
+        }
+        KeyCode::Down if state.workspace_target() == WorkspaceTarget::Sessions => {
+            Some(Action::SelectNext)
+        }
+        KeyCode::Enter if state.workspace_target() == WorkspaceTarget::Sessions => {
+            Some(Action::OpenCandidate)
+        }
         KeyCode::PageUp if editor_target.is_some() => Some(Action::ScrollUp(10)),
         KeyCode::PageDown if editor_target.is_some() => Some(Action::ScrollDown(10)),
-        KeyCode::Enter if state.focus == Focus::SessionTitle => Some(Action::CommitTitle),
-        KeyCode::Enter if state.focus == Focus::Composer => Some(Action::Submit),
+        KeyCode::Enter if state.workspace_target() == WorkspaceTarget::SessionTitle => {
+            Some(Action::CommitTitle)
+        }
+        KeyCode::Enter if state.workspace_target() == WorkspaceTarget::Composer => {
+            Some(super::commands::submit_action(state))
+        }
         _ => None,
     };
     action.or_else(|| editor_key_action(key, editor_target?, geometry))
 }
 
-fn editor_target(focus: Focus) -> Option<EditorTarget> {
+fn editor_target(focus: WorkspaceTarget) -> Option<EditorTarget> {
     match focus {
-        Focus::Composer => Some(EditorTarget::Composer),
-        Focus::SessionTitle => Some(EditorTarget::SessionTitle),
-        Focus::Sessions | Focus::RightRail => None,
+        WorkspaceTarget::Composer => Some(EditorTarget::Composer),
+        WorkspaceTarget::SessionTitle => Some(EditorTarget::SessionTitle),
+        WorkspaceTarget::Sessions => None,
     }
 }
 
@@ -213,10 +222,10 @@ fn exact(key: &KeyEvent, code: KeyCode, modifiers: KeyModifiers) -> bool {
     key.code == code && key.modifiers == modifiers
 }
 
-fn panel_action(key: KeyEvent, panel: &Panel, geometry: KeyGeometry) -> Option<Action> {
+fn overlay_action(key: KeyEvent, panel: &Overlay) -> Option<Action> {
     if matches!(
         panel,
-        Panel::Models(models) if matches!(models.screen, ModelScreen::Setup(_))
+        Overlay::Models(models) if matches!(models.screen, ModelScreen::Setup(_))
     ) {
         if exact(&key, KeyCode::Char('u'), KeyModifiers::CONTROL) {
             return Some(Action::SetupClear);
@@ -252,18 +261,6 @@ fn panel_action(key: KeyEvent, panel: &Panel, geometry: KeyGeometry) -> Option<A
     }
     match key.code {
         KeyCode::Esc => Some(Action::Escape),
-        KeyCode::Up | KeyCode::PageUp if matches!(panel, Panel::Reader(_)) => {
-            geometry.reader_max_scroll.map(|max| Action::ScrollPanel {
-                amount: if key.code == KeyCode::PageUp { -10 } else { -1 },
-                max,
-            })
-        }
-        KeyCode::Down | KeyCode::PageDown if matches!(panel, Panel::Reader(_)) => {
-            geometry.reader_max_scroll.map(|max| Action::ScrollPanel {
-                amount: if key.code == KeyCode::PageDown { 10 } else { 1 },
-                max,
-            })
-        }
         KeyCode::Up => Some(Action::PanelPrevious),
         KeyCode::Down => Some(Action::PanelNext),
         KeyCode::Enter => Some(Action::ActivatePanel),
@@ -285,31 +282,16 @@ mod tests {
             state,
             KeyGeometry {
                 composer_width: Some(37),
-                reader_max_scroll: Some(29),
-                right_rail_visible: true,
             },
         )
     }
 
-    fn reader_panel() -> Panel {
-        Panel::Reader(crate::state::ReaderPanel {
-            content: crate::state::reader::ReaderContent {
-                session: bone_app::SessionId::new(),
-                source: crate::state::reader::ReaderSource::History(bone_app::SessionSeq(1)),
-                title: "reader".into(),
-                text: "content".into(),
-                layout_cache: std::cell::RefCell::new(None),
-            },
-            scroll: 0,
-        })
-    }
-
-    fn setup_panel() -> Panel {
+    fn setup_panel() -> Overlay {
         let mut models = crate::state::ModelPanel::new(None);
         models.screen = ModelScreen::Setup(Box::new(crate::state::ConnectionForm::new(
             crate::state::ConnectionKind::OpenAiApi,
         )));
-        Panel::Models(models)
+        Overlay::Models(models)
     }
 
     #[test]
@@ -333,7 +315,8 @@ mod tests {
     #[test]
     fn model_setup_rejects_control_modified_navigation() {
         let mut state = UiState::default();
-        state.panel = Some(setup_panel());
+        state.overlay = Some(setup_panel());
+        state.enter_overlay();
 
         assert!(matches!(
             action_for_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL), &state),
@@ -432,16 +415,12 @@ mod tests {
 
     #[test]
     fn geometry_bound_keys_do_not_invent_measurements() {
-        let mut state = UiState::default();
+        let state = UiState::default();
         let measured = KeyGeometry {
             composer_width: Some(51),
-            reader_max_scroll: Some(73),
-            right_rail_visible: false,
         };
         let unavailable = KeyGeometry {
             composer_width: None,
-            reader_max_scroll: None,
-            right_rail_visible: false,
         };
 
         assert!(matches!(
@@ -456,24 +435,7 @@ mod tests {
         ));
         assert!(key_action(key(KeyCode::Down, KeyModifiers::NONE), &state, unavailable,).is_none());
         assert!(
-            key_action(key(KeyCode::Right, KeyModifiers::CONTROL), &state, measured,).is_none()
-        );
-
-        state.panel = Some(reader_panel());
-        assert!(matches!(
-            key_action(key(KeyCode::PageDown, KeyModifiers::NONE), &state, measured),
-            Some(Action::ScrollPanel {
-                amount: 10,
-                max: 73,
-            })
-        ));
-        assert!(
-            key_action(
-                key(KeyCode::PageDown, KeyModifiers::NONE),
-                &state,
-                unavailable,
-            )
-            .is_none()
+            key_action(key(KeyCode::Right, KeyModifiers::CONTROL), &state, measured,).is_some()
         );
     }
 }

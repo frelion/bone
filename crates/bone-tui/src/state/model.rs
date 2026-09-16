@@ -7,18 +7,58 @@ use crate::layout::SinglePane;
 
 use super::{
     TranscriptState,
-    panel::{ModelOperation, Panel},
+    overlay::{ModelOperation, Overlay},
     status::Status,
     title::TitleState,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Focus {
+pub enum WorkspaceTarget {
     Sessions,
     SessionTitle,
     #[default]
     Composer,
-    RightRail,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyboardOwner {
+    Workspace(WorkspaceTarget),
+    Overlay { return_to: WorkspaceTarget },
+}
+
+impl KeyboardOwner {
+    pub(crate) fn is_overlay(self) -> bool {
+        matches!(self, Self::Overlay { .. })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PointerCapture {
+    Content,
+    Divider(crate::layout::PaneDivider),
+    Editor(super::EditorTarget),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TextSelection {
+    pub anchor: crate::ui::selection::TextPoint,
+    pub end: crate::ui::selection::TextPoint,
+    pub original: Arc<str>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PointerPress {
+    pub target: Option<crate::layout::ClickTarget>,
+    pub position: (u16, u16),
+    pub dragged: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct PointerState {
+    pub(crate) position: Option<(u16, u16)>,
+    pub(crate) capture: Option<PointerCapture>,
+    pub(crate) press: Option<PointerPress>,
+    pub(crate) selection: Option<TextSelection>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,7 +134,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         kind: CommandKind::Sessions,
         name: "sessions",
         usage: "",
-        summary: "Focus sessions",
+        summary: "WorkspaceTarget sessions",
     },
     CommandSpec {
         kind: CommandKind::Model,
@@ -258,8 +298,10 @@ pub enum DraftSource {
 #[derive(Debug)]
 pub struct UiState {
     pub(crate) pane_widths: crate::layout::PaneWidths,
-    pub(crate) dragging_divider: Option<crate::layout::PaneDivider>,
-    pub(crate) panel: Option<Panel>,
+    pub(crate) pointer: PointerState,
+    pub(crate) overlay: Option<Overlay>,
+    pub(crate) overlay_scroll: usize,
+    pub(crate) details: Option<super::ReaderState>,
     pub(crate) model_facts_request: u64,
     pub(crate) model_operation: Option<ModelOperation>,
     pub(super) titles: TitleState,
@@ -272,8 +314,8 @@ pub struct UiState {
     pub session_candidate: Option<SessionId>,
     pub session_scroll: Option<usize>,
     pub session_ui: BTreeMap<SessionId, SessionUi>,
-    pub(crate) focus: Focus,
-    last_center: Focus,
+    pub(crate) keyboard: KeyboardOwner,
+    last_center: WorkspaceTarget,
     pub(crate) caret_visible: bool,
     pub(crate) orphan_draft: crate::editor::EditorBuffer,
     pub pending_create: Option<PendingCreate>,
@@ -290,8 +332,10 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             pane_widths: Default::default(),
-            dragging_divider: None,
-            panel: None,
+            pointer: PointerState::default(),
+            overlay: None,
+            overlay_scroll: 0,
+            details: None,
             model_facts_request: 0,
             model_operation: None,
             titles: TitleState::default(),
@@ -303,8 +347,8 @@ impl Default for UiState {
             session_candidate: None,
             session_scroll: None,
             session_ui: BTreeMap::new(),
-            focus: Focus::Composer,
-            last_center: Focus::Composer,
+            keyboard: KeyboardOwner::Workspace(WorkspaceTarget::Composer),
+            last_center: WorkspaceTarget::Composer,
             caret_visible: true,
             orphan_draft: Default::default(),
             pending_create: None,
@@ -338,30 +382,92 @@ impl UiState {
         }
     }
 
-    /// Sets workspace focus while remembering the latest center-column target.
-    pub(crate) fn set_focus(&mut self, focus: Focus) {
-        self.focus = focus;
-        if matches!(focus, Focus::SessionTitle | Focus::Composer) {
-            self.last_center = focus;
+    pub(crate) fn workspace_target(&self) -> WorkspaceTarget {
+        match self.keyboard {
+            KeyboardOwner::Workspace(target) => target,
+            KeyboardOwner::Overlay { return_to } => return_to,
         }
     }
 
-    pub(crate) const fn last_center_focus(&self) -> Focus {
+    pub(crate) fn cancel_editor_capture(&mut self) {
+        if matches!(
+            self.pointer.capture,
+            Some(PointerCapture::Editor(_) | PointerCapture::Content)
+        ) {
+            self.pointer.capture = None;
+            self.pointer.press = None;
+        }
+    }
+
+    pub(super) fn finish_keyboard_interaction(&mut self) {
+        match self.keyboard {
+            KeyboardOwner::Workspace(WorkspaceTarget::Composer) => {
+                self.editor_mut().break_interaction()
+            }
+            KeyboardOwner::Workspace(WorkspaceTarget::SessionTitle) => {
+                self.titles.break_interaction()
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn set_workspace_target(&mut self, target: WorkspaceTarget) {
+        if self.keyboard != KeyboardOwner::Workspace(target) {
+            self.finish_keyboard_interaction();
+            self.cancel_editor_capture();
+            self.caret_visible = true;
+        }
+        self.keyboard = KeyboardOwner::Workspace(target);
+        if matches!(
+            target,
+            WorkspaceTarget::SessionTitle | WorkspaceTarget::Composer
+        ) {
+            self.last_center = target;
+        }
+    }
+
+    pub(crate) fn enter_overlay(&mut self) {
+        if self.overlay.is_some() && !self.keyboard.is_overlay() {
+            self.finish_keyboard_interaction();
+            self.overlay_scroll = 0;
+            self.cancel_editor_capture();
+            self.keyboard = KeyboardOwner::Overlay {
+                return_to: self.workspace_target(),
+            };
+            self.caret_visible = true;
+        }
+    }
+
+    pub(crate) fn leave_overlay(&mut self) {
+        if let KeyboardOwner::Overlay { return_to } = self.keyboard {
+            self.set_workspace_target(return_to);
+        }
+    }
+
+    pub(crate) const fn last_center_target(&self) -> WorkspaceTarget {
         self.last_center
     }
 
     pub(crate) fn remove_title_focus(&mut self) {
-        if self.focus == Focus::SessionTitle {
-            self.set_focus(Focus::Composer);
+        self.cancel_editor_capture();
+        match &mut self.keyboard {
+            KeyboardOwner::Workspace(target) if *target == WorkspaceTarget::SessionTitle => {
+                *target = WorkspaceTarget::Composer;
+                self.caret_visible = true;
+            }
+            KeyboardOwner::Overlay { return_to } if *return_to == WorkspaceTarget::SessionTitle => {
+                *return_to = WorkspaceTarget::Composer;
+            }
+            _ => {}
         }
-        if self.last_center == Focus::SessionTitle {
-            self.last_center = Focus::Composer;
+        if self.last_center == WorkspaceTarget::SessionTitle {
+            self.last_center = WorkspaceTarget::Composer;
         }
     }
 
     pub(crate) fn blinking_caret_active(&self) -> bool {
-        match &self.panel {
-            Some(Panel::Models(models))
+        match self.overlay.as_ref().filter(|_| self.keyboard.is_overlay()) {
+            Some(Overlay::Models(models))
                 if models
                     .setup()
                     .is_some_and(|form| form.pending_request.is_none()) =>
@@ -370,8 +476,11 @@ impl UiState {
             }
             Some(_) => false,
             None => {
-                matches!(self.focus, Focus::SessionTitle | Focus::Composer)
-                    && (self.focus != Focus::SessionTitle || self.selected.is_some())
+                matches!(
+                    self.workspace_target(),
+                    WorkspaceTarget::SessionTitle | WorkspaceTarget::Composer
+                ) && (self.workspace_target() != WorkspaceTarget::SessionTitle
+                    || self.selected.is_some())
             }
         }
     }
@@ -587,11 +696,18 @@ impl UiState {
     }
 
     pub fn single_pane(&self) -> SinglePane {
-        if self.focus == Focus::Sessions {
+        if self.workspace_target() == WorkspaceTarget::Sessions {
             SinglePane::Sessions
         } else {
             SinglePane::Conversation
         }
+    }
+
+    pub(crate) fn command_mode(&self) -> bool {
+        self.draft().trim_start().starts_with('/')
+            && self
+                .selected_ui()
+                .is_none_or(|ui| ui.selected_answer.is_none())
     }
 
     pub fn slash_matches(&self) -> Vec<&'static CommandSpec> {
@@ -607,12 +723,11 @@ impl UiState {
     /// Whether the Composer's command surface is open, independently of
     /// whether the current query matches a command.
     pub fn slash_palette_visible(&self) -> bool {
-        self.slash_query().is_some()
+        !self.keyboard.is_overlay() && self.overlay.is_none() && self.slash_query().is_some()
     }
 
     fn slash_query(&self) -> Option<&str> {
-        if self.focus != Focus::Composer
-            || self.panel.is_some()
+        if self.workspace_target() != WorkspaceTarget::Composer
             || self
                 .selected_ui()
                 .is_some_and(|ui| ui.selected_answer.is_some())

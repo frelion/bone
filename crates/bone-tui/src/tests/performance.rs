@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    state::{Action, Focus, HISTORY_CACHE_BYTES, SessionNavRow, UiEvent, UiState},
+    state::{Action, HISTORY_CACHE_BYTES, SessionNavRow, UiEvent, UiState, WorkspaceTarget},
     view,
 };
 use bone_app::{HistoryEntry, HistoryPage, SessionEvent, SessionId, SessionInfo, WorkspaceId};
@@ -43,7 +43,7 @@ fn populated_state() -> UiState {
             .insert(info.id, crate::state::SessionUi::new(info.id, 1));
     }
     state.selected = state.session_rows.first().map(SessionNavRow::id);
-    state.focus = Focus::SessionTitle;
+    state.set_workspace_target(WorkspaceTarget::SessionTitle);
     state
 }
 

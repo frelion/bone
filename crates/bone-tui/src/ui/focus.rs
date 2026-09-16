@@ -1,14 +1,14 @@
-//! Focus ownership shared by every interactive region.
+//! WorkspaceTarget ownership shared by every interactive region.
 //!
 //! Workspace regions choose their own visible expression: selection surface in
-//! the rails and a caret in editors. Modal panels own the scope while open.
+//! the rails and a caret in editors. Panels own the scope only after explicit keyboard activation.
 
-use crate::state::{Focus, UiState};
+use crate::state::{UiState, WorkspaceTarget};
 
-/// Modal panels own input while open; otherwise the workspace focus is the
+/// Keyboard-activated panels own input; otherwise the workspace focus is the
 /// single source of truth for every visible region.
-pub(crate) fn workspace_focused(state: &UiState, focus: Focus) -> bool {
-    state.panel.is_none() && state.focus == focus
+pub(crate) fn workspace_focused(state: &UiState, focus: WorkspaceTarget) -> bool {
+    state.keyboard == crate::state::KeyboardOwner::Workspace(focus)
 }
 
 #[cfg(test)]
@@ -18,15 +18,15 @@ mod tests {
     #[test]
     fn panels_suspend_workspace_focus() {
         for focus in [
-            Focus::Sessions,
-            Focus::SessionTitle,
-            Focus::Composer,
-            Focus::RightRail,
+            WorkspaceTarget::Sessions,
+            WorkspaceTarget::SessionTitle,
+            WorkspaceTarget::Composer,
         ] {
             let mut state = UiState::default();
-            state.focus = focus;
+            state.set_workspace_target(focus);
             assert!(workspace_focused(&state, focus));
-            state.panel = Some(crate::state::Panel::Help);
+            state.overlay = Some(crate::state::Overlay::Help);
+            state.enter_overlay();
             assert!(!workspace_focused(&state, focus));
         }
     }

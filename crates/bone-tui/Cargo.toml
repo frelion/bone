@@ -11,6 +11,7 @@ name = "bone"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 bone-app = { path = "../bone-app" }
 crossterm = "0.28"
 futures-util.workspace = true

@@ -15,6 +15,7 @@ pub(super) struct MessageRow {
     pub line: Line<'static>,
     pub byte: usize,
     pub part: AnchorPart,
+    copyable: bool,
 }
 
 pub(super) fn render(event: &SessionEvent, width: u16) -> Vec<MessageRow> {
@@ -95,6 +96,7 @@ impl MessageRow {
             line,
             byte,
             part: AnchorPart::Text,
+            copyable: true,
         }
     }
 }
@@ -167,43 +169,81 @@ fn error_preview(message: &str, width: usize) -> Vec<(usize, String)> {
 
 /// Wrap display text and retain the original UTF-8 byte at each visual row.
 fn wrapped_source(value: &str, width: usize) -> Vec<(usize, String)> {
-    let width = width.max(1);
-    let mut clean = String::new();
-    let mut source_map = Vec::new();
-    for (byte, character) in value.char_indices() {
-        let mut encoded = [0; 4];
-        let displayed = crate::text::display_grapheme(character.encode_utf8(&mut encoded));
-        let displayed = if displayed == "\t" {
-            "    "
-        } else {
-            displayed.as_ref()
-        };
-        if !displayed.is_empty() {
-            source_map.push((clean.len(), byte));
-            clean.push_str(displayed);
-        }
-    }
+    let starts = crate::ui::selection::source_starts(value, width);
+    (0..starts.len())
+        .map(|row| {
+            let range = crate::ui::selection::row_range(value, &starts, row);
+            (
+                range.start,
+                crate::ui::selection::display_text(&value[range]),
+            )
+        })
+        .collect()
+}
 
-    let mut rows = vec![(0, String::new())];
-    let mut column = 0;
-    for (clean_byte, grapheme) in clean.grapheme_indices(true) {
-        let source_byte = source_map
-            [source_map.partition_point(|(display_byte, _)| *display_byte <= clean_byte) - 1]
-            .1;
-        if grapheme == "\n" {
-            rows.push((source_byte + 1, String::new()));
-            column = 0;
-            continue;
+/// Copy content is the original body for rich messages, and plain semantic
+/// labels for compact events. No terminal padding or message decoration enters it.
+pub(super) fn copy_text(event: &SessionEvent, rows: &[MessageRow]) -> std::sync::Arc<str> {
+    match event {
+        SessionEvent::InputSubmitted { text, .. }
+        | SessionEvent::Reply { text, .. }
+        | SessionEvent::QuestionAsked { text, .. } => text.as_str().into(),
+        SessionEvent::JobFinished { summary, .. } => summary.as_str().into(),
+        SessionEvent::ToolFinished { tool, outcome, .. } => {
+            let mut text = format!(
+                "{}  {}",
+                tool,
+                if outcome.result.is_ok() {
+                    "done"
+                } else {
+                    "failed"
+                }
+            );
+            if let Err(error) = &outcome.result {
+                text.push('\n');
+                text.push_str(&error.message);
+            }
+            text.into()
         }
-        let cells = UnicodeWidthStr::width(grapheme);
-        if column > 0 && column + cells > width {
-            rows.push((source_byte, String::new()));
-            column = 0;
-        }
-        rows.last_mut().unwrap().1.push_str(grapheme);
-        column += cells;
+        _ => rows
+            .iter()
+            .map(|row| {
+                let spans = if row.line.spans.len() > 1 {
+                    &row.line.spans[1..]
+                } else {
+                    &row.line.spans[..]
+                };
+                spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into(),
     }
-    rows
+}
+
+/// Returns the source offset and the layout-only left gutter for this row.
+pub(super) fn copy_row(
+    event: &SessionEvent,
+    row: &MessageRow,
+    index: usize,
+    width: u16,
+) -> Option<(usize, u16)> {
+    if !row.copyable || row.part != AnchorPart::Text {
+        return None;
+    }
+    Some(match event {
+        SessionEvent::InputSubmitted { .. } => (row.byte, 2),
+        SessionEvent::Reply { .. } => (row.byte, 2),
+        SessionEvent::QuestionAsked { .. } | SessionEvent::JobFinished { .. } => (row.byte, 0),
+        SessionEvent::ToolFinished { tool, outcome, .. } if index > 0 => {
+            let header_len = tool.len() + if outcome.result.is_ok() { 6 } else { 8 };
+            (header_len + row.byte, if width >= 4 { 2 } else { 0 })
+        }
+        _ => (0, if row.line.spans.len() > 1 { 2 } else { 0 }),
+    })
 }
 
 fn user_message(value: &str, width: usize) -> Vec<MessageRow> {
@@ -213,6 +253,7 @@ fn user_message(value: &str, width: usize) -> Vec<MessageRow> {
         line: blank(),
         byte: 0,
         part: AnchorPart::UserTop,
+        copyable: false,
     }];
     rows.extend(
         wrapped_source(value, content_width)
@@ -236,6 +277,7 @@ fn user_message(value: &str, width: usize) -> Vec<MessageRow> {
         line: blank(),
         byte: value.len(),
         part: AnchorPart::UserBottom,
+        copyable: false,
     });
     rows
 }
@@ -257,10 +299,12 @@ fn reply_message(value: &str, width: usize) -> Vec<MessageRow> {
             if code {
                 let language = clean.trim_start().trim_start_matches('`').trim();
                 if !language.is_empty() {
-                    rows.push(MessageRow::text(
+                    let mut label = MessageRow::text(
                         Line::styled(format!("  {language}"), Style::default().fg(CODE_LABEL)),
                         base,
-                    ));
+                    );
+                    label.copyable = false;
+                    rows.push(label);
                 }
             }
             base += source_line.len();
@@ -340,10 +384,12 @@ mod tests {
         ] {
             for width in [1, 2, 5, 12] {
                 let rows = wrapped_source(value, width);
-                assert_eq!(
-                    rows.iter().map(|(_, text)| text).collect::<Vec<_>>(),
-                    wrap_text(value, width).iter().collect::<Vec<_>>()
-                );
+                let starts = crate::ui::selection::source_starts(value, width);
+                assert_eq!(rows.len(), starts.len());
+                for (index, (_, rendered)) in rows.iter().enumerate() {
+                    let range = crate::ui::selection::row_range(value, &starts, index);
+                    assert_eq!(rendered, &crate::ui::selection::display_text(&value[range]));
+                }
                 assert!(rows.iter().all(|(byte, _)| value.is_char_boundary(*byte)));
                 assert!(rows.windows(2).all(|pair| pair[0].0 <= pair[1].0));
             }

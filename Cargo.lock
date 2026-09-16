@@ -162,6 +162,7 @@ dependencies = [
 name = "bone-tui"
 version = "0.4.0"
 dependencies = [
+ "base64",
  "bone-app",
  "crossterm",
  "crossterm_winapi",

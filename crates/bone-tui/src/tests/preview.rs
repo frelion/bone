@@ -7,7 +7,8 @@ use std::{env, fmt::Write as _, fs, path::PathBuf, sync::Arc, time::SystemTime};
 use crate::{
     editor::EditCommand,
     state::{
-        Action, EditorTarget, Effect, Focus, SessionNavRow, SessionUi, UiEvent, UiState, update,
+        Action, EditorTarget, Effect, SessionNavRow, SessionUi, UiEvent, UiState, WorkspaceTarget,
+        update,
     },
     view,
 };
@@ -278,16 +279,15 @@ fn render_preview_artifact() {
     }
     match scenario.as_str() {
         "sessions" => {
-            state.focus = Focus::Sessions;
+            state.set_workspace_target(WorkspaceTarget::Sessions);
             state.session_candidate = state.session_rows.get(1).map(SessionNavRow::id);
         }
         "title" => {
             update(
                 &mut state,
-                UiEvent::Action(Action::Focus(Focus::SessionTitle)),
+                UiEvent::Action(Action::SetWorkspaceTarget(WorkspaceTarget::SessionTitle)),
             );
         }
-        "right" => state.focus = Focus::RightRail,
         _ => {}
     }
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

@@ -18,6 +18,9 @@ pub(crate) const SELECTED: Color = Color::Rgb(48, 48, 48);
 /// Quiet, persistent boundaries between regions.
 pub(crate) const STRUCTURE: Color = Color::Rgb(40, 40, 40);
 /// A temporarily captured structural control, such as a dragged divider.
+pub(crate) const HOVER: Color = Color::Rgb(38, 38, 38);
+pub(crate) const HOVER_SELECTED: Color = Color::Rgb(62, 62, 62);
+pub(crate) const STRUCTURE_HOVER: Color = Color::Rgb(78, 78, 78);
 pub(crate) const STRUCTURE_ACTIVE: Color = Color::Rgb(112, 112, 112);
 /// The only saturated workspace accent: current-session identity and carets.
 pub(crate) const FOCUS_MARK: Color = Color::Rgb(250, 178, 131);
