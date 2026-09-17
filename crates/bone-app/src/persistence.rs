@@ -4827,6 +4827,6 @@ mod tests {
                 .worker
                 .is_none()
         );
-        assert_eq!(store.profiles().unwrap(), vec![Profile::chatgpt()]);
+        assert!(store.profiles().unwrap().is_empty());
     }
 }

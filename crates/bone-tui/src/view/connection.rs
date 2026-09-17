@@ -27,6 +27,14 @@ pub(super) fn render(
 ) -> Option<Rect> {
     let desired = match &models.screen {
         ModelScreen::Setup(form) => form.fields().len() as u16 * 2 + 7,
+        ModelScreen::ModelForm(form) => {
+            if form.remove {
+                10
+            } else {
+                11
+            }
+        }
+        ModelScreen::AddModel { .. } => 13,
         ModelScreen::Add { .. } | ModelScreen::Advanced { .. } => 13,
         _ => return None,
     };
@@ -36,8 +44,11 @@ pub(super) fn render(
     }
     let title = match &models.screen {
         ModelScreen::Add { .. } => "Models / Add connection",
+        ModelScreen::AddModel { .. } => "Models / Add model",
         ModelScreen::Advanced { .. } => "Models / Custom connection",
         ModelScreen::Setup(form) => form.kind.label(),
+        ModelScreen::ModelForm(form) if form.remove => "Models / Remove model",
+        ModelScreen::ModelForm(_) => "Models / Add model",
         _ => return None,
     };
     let shell = super::overlay::render_shell(frame, plan.screen, area, title);
@@ -90,7 +101,7 @@ pub(super) fn render(
                 if has_openai {
                     "Keeps the model you already selected"
                 } else {
-                    "API key only · uses the recommended model"
+                    "API key only · add models next"
                 },
             ),
             (
@@ -102,10 +113,10 @@ pub(super) fn render(
                 if has_anthropic {
                     "Keeps the model you already selected"
                 } else {
-                    "API key only · uses the recommended model"
+                    "API key only · add models next"
                 },
             ),
-            ("Custom / advanced", "Compatible service URL and model ID"),
+            ("Custom / advanced", "Compatible service URL and API key"),
         ];
         let capacity = usize::from(body.height / stride);
         let start = selected.saturating_sub(capacity.saturating_sub(1));
@@ -164,6 +175,163 @@ pub(super) fn render(
         hits.push_scroll(area, crate::ui::interaction::ScrollTarget::Overlay);
         return Some(area);
     }
+    let is_model_form = matches!(&models.screen, ModelScreen::ModelForm(_));
+    if is_model_form {
+        let ModelScreen::ModelForm(form) = &models.screen else {
+            unreachable!()
+        };
+        if body.height >= 4 {
+            frame.render_widget(
+                Paragraph::new(single_line_external(state.status_text().unwrap_or(
+                    if form.remove {
+                        "enter remove model · esc cancel"
+                    } else {
+                        "space toggle apply · enter save"
+                    },
+                )))
+                .style(theme::body(MUTED)),
+                Rect::new(body.x, body.y, body.width, 1),
+            );
+            body.y += 1;
+            body.height -= 1;
+        }
+        let row = Rect::new(body.x, body.y, body.width, 1);
+        let selected = state.keyboard.is_overlay();
+        let background = if selected { SELECTED } else { INPUT };
+        frame.render_widget(Block::default().style(theme::surface(background)), row);
+        frame.render_widget(
+            Paragraph::new("Model").style(if selected {
+                theme::label_on(INK, background)
+            } else {
+                theme::body_on(MUTED, background)
+            }),
+            Rect::new(row.x, row.y, 8.min(row.width), 1),
+        );
+        let input = Rect::new(
+            row.x + 8.min(row.width),
+            row.y,
+            row.width.saturating_sub(8),
+            1,
+        );
+        let (text, cursor) = input_query(&form.model, input.width, "model ID");
+        frame.render_widget(
+            Paragraph::new(text).style(theme::body_on(
+                if form.model.is_empty() { MUTED } else { INK },
+                background,
+            )),
+            input,
+        );
+        if selected && !form.remove && form.pending_request.is_none() && input.width > 2 {
+            caret::place(frame, (input.x + cursor, input.y), state.caret_visible);
+        }
+        let save_y = if form.remove {
+            body.y + 1
+        } else {
+            let apply = Rect::new(body.x, body.y + 1, body.width, 1);
+            let apply_label = if form.apply {
+                "✓ Apply to current scope"
+            } else {
+                "  Save to catalog only"
+            };
+            frame.render_widget(
+                Paragraph::new(apply_label).style(theme::body_on(
+                    if form.apply { INK } else { MUTED },
+                    background,
+                )),
+                apply,
+            );
+            if form.pending_request.is_none() {
+                hits.push(ClickRegion {
+                    area: apply,
+                    target: ClickTarget::Action(Action::ToggleModelApply),
+                });
+            }
+            body.y + 2
+        };
+        let save = Rect::new(body.x, save_y, body.width, 1);
+        frame.render_widget(
+            Paragraph::new(if form.pending_request.is_some() {
+                if form.remove {
+                    "Removing…"
+                } else {
+                    "Saving…"
+                }
+            } else if form.remove {
+                "enter remove model"
+            } else if form.apply {
+                "enter save & use model"
+            } else {
+                "enter save model"
+            })
+            .style(theme::label(if form.pending_request.is_some() {
+                INFO
+            } else {
+                INK
+            })),
+            save,
+        );
+        if form.pending_request.is_none() {
+            hits.push(ClickRegion {
+                area: save,
+                target: ClickTarget::Action(Action::SaveConnection),
+            });
+        }
+        hits.push_scroll(
+            area,
+            crate::ui::interaction::ScrollTarget::OverlayContent { max: 0 },
+        );
+        return Some(area);
+    }
+    if let ModelScreen::AddModel { selected } = &models.screen {
+        let capacity = usize::from(body.height / stride).max(1);
+        if models.profiles.is_empty() {
+            let row = Rect::new(body.x, body.y, body.width, stride);
+            frame.render_widget(
+                Paragraph::new("No connections · choose Add account first")
+                    .style(super::overlay::menu_style(state.keyboard.is_overlay())),
+                row,
+            );
+            hits.push(ClickRegion {
+                area: row,
+                target: ClickTarget::Action(Action::SelectModel(0)),
+            });
+        } else {
+            let start = selected.saturating_sub(capacity.saturating_sub(1));
+            for (index, profile) in models
+                .profiles
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(capacity)
+            {
+                let row = Rect::new(
+                    body.x,
+                    body.y + (index - start) as u16 * stride,
+                    body.width,
+                    stride,
+                );
+                let label = if stride > 1 {
+                    format!("{}\nadd a model to this connection", profile.label)
+                } else {
+                    profile.label.clone()
+                };
+                frame.render_widget(
+                    Paragraph::new(super::sanitize_external(&label)).style(
+                        super::overlay::menu_style(
+                            *selected == index && state.keyboard.is_overlay(),
+                        ),
+                    ),
+                    row,
+                );
+                hits.push(ClickRegion {
+                    area: row,
+                    target: ClickTarget::Action(Action::SelectModel(index)),
+                });
+            }
+        }
+        hits.push_scroll(area, crate::ui::interaction::ScrollTarget::Overlay);
+        return Some(area);
+    }
     let ModelScreen::Setup(form) = &models.screen else {
         return Some(area);
     };
@@ -204,7 +372,7 @@ pub(super) fn render(
         let row = Rect::new(body.x, body.y + (index - start) as u16, body.width, 1);
         let (label, value, placeholder) = match field {
             SetupField::Label => ("Name", form.label.as_str(), "connection name"),
-            SetupField::BaseUrl => ("URL", form.base_url.as_str(), "https://… (required)"),
+            SetupField::BaseUrl => ("URL", form.base_url.as_str(), "http(s)://… (required)"),
             SetupField::Key => (
                 "Key",
                 if form.key.as_str().is_empty() {
@@ -217,10 +385,10 @@ pub(super) fn render(
                 } else if form.edits_existing_connection() {
                     "blank: keep key unchanged"
                 } else {
-                    "API key required"
+                    "optional · blank for local services"
                 },
             ),
-            SetupField::Model => ("Model", form.model.as_str(), "model ID"),
+            SetupField::Model => ("Model", form.model.as_str(), "model ID (optional)"),
         };
         let selected = state.keyboard.is_overlay() && form.field == *field;
         let background = if selected { SELECTED } else { INPUT };
@@ -256,14 +424,12 @@ pub(super) fn render(
         let row = Rect::new(body.x, body.y + (save_index - start) as u16, body.width, 1);
         let label = if form.pending_request.is_some() {
             "Saving…"
-        } else if form.changes_model() {
-            "enter save & use changed model"
         } else if form.edits_existing_connection() {
             "enter save connection"
         } else if form.kind.advanced() {
-            "enter save & use model · tab next field"
+            "enter save connection · tab next field"
         } else {
-            "enter save & use recommended model"
+            "enter save connection"
         };
         frame.render_widget(
             Paragraph::new(label).style(theme::label(if form.pending_request.is_some() {
@@ -378,7 +544,6 @@ mod tests {
                 bone_app::EndpointConfig::OpenAiResponses { base_url: None },
             )
             .unwrap(),
-            None,
         )
         .unwrap();
         form.key_was_sent = true;

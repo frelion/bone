@@ -51,7 +51,7 @@
 - `/new [title]`：直接创建 Session，无确认框；省略标题时，App 在首次提交后生成标题。
 - `/sessions`：聚焦 Session rail。
 - `/rename`：进入当前 Session 的单行内联标题编辑；`/rename <title>` 直接写入并提交标题。
-- `/model`：唯一的模型入口，不接受隐藏的 profile/model 参数。首次缺模型时直接选择 ChatGPT 账号、OpenAI API、Anthropic API 或自定义服务，并把首次选择保存为 workspace 默认，之后的新 Session 直接继承；ChatGPT 会先检查缓存登录，缺失时打开浏览器授权，成功后自动重试同一次模型选择。官方 API 表单只要求密钥并选择推荐模型，自定义服务才显示协议、HTTPS 地址和模型 ID。普通列表展示各已保存连接的本地推荐目录，并明确标出 Current、Conversation、Workspace 或 Configured；它不冒充账号的远端可用模型目录。Manage 中的官方连接只更新密钥；自定义连接只有在用户显式修改 Model 字段时才切换模型。完成首次设置后，选中 Session 时的切换同时更新该 Session 的 worker/coordinator；未选中 Session 时更新 workspace。响应执行中禁止切换，密钥与设备码保持脱敏；不再提供独立 `/login`、`/connect` 或旧 `/model <profile> <model>` 语法。
+- `/model`：唯一的模型入口，不接受隐藏的 profile/model 参数。列表只显示用户保存的连接和模型，以及当前仍在使用但尚未保存到目录的选择；没有隐式 ChatGPT、官方预设、推荐文案或模型营销介绍。`Add connection` 一次填写名称、协议、HTTP(S) 地址、可选密钥和可选的第一个模型；`Add model` 只填写模型 ID 并保存到选中的连接，连接和模型目录共用同一条保存路径。选择支持 OpenAI Responses 的模型后，下一步明确选择 `provider default`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`；其他协议直接应用，不隐藏默认思考深度。ChatGPT 账号只有用户主动进入添加连接时才出现。删除保存的模型只移除连接目录项；如果它仍被 worker、coordinator、workspace 或 session 使用，当前选择会继续显示。选中 Session 时的切换同时更新该 Session 的 worker/coordinator；未选中 Session 时更新 workspace。响应执行中禁止切换，密钥与设备码保持脱敏；不再提供独立 `/login`、`/connect` 或旧 `/model <profile> <model>` 语法。
 - `/answer`：回答当前仍有效的问题，使用独立缓冲和完整 QuestionId；过期答案只能明确转为普通草稿，不会自动当新请求发送。
 - `/details`：列出当前任务及已加载历史中的工具/任务结果，选择后读取完整对象；鼠标也可从可见对象行进入。
 - `/recover`：恢复最近可恢复输入的原文。

@@ -86,7 +86,7 @@ impl Default for ProjectConfig {
 }
 
 fn default_profiles() -> Vec<Profile> {
-    vec![Profile::chatgpt()]
+    Vec::new()
 }
 
 impl FileConfigs {
@@ -625,7 +625,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::{ConfigChange, ConfigScope, ToolLimits};
+    use crate::{ConfigChange, ConfigScope, EndpointConfig, ProfileId, ToolLimits};
 
     #[test]
     fn user_file_detects_external_edits_instead_of_overwriting_them() {
@@ -661,6 +661,41 @@ mod tests {
             second.update(ConfigScope::User, ConfigChange::Tools(None)),
             Err(StoreError::ConfigConflict { .. })
         ));
+    }
+
+    #[test]
+    fn new_user_config_has_no_implicit_profiles() {
+        let temporary = tempfile::tempdir().unwrap();
+        let configs = FileConfigs::open(temporary.path().join(".bone")).unwrap();
+
+        assert!(configs.profiles().is_empty());
+    }
+
+    #[test]
+    fn profile_models_are_persisted_with_the_profile() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join(".bone");
+        let configs = FileConfigs::open(home.clone()).unwrap();
+        let mut profile = Profile::new(
+            ProfileId::new("local").unwrap(),
+            "Local",
+            EndpointConfig::OpenAiResponses {
+                base_url: Some("http://127.0.0.1:8080/v1".into()),
+            },
+        )
+        .unwrap();
+        profile.add_model("qwen").unwrap();
+        profile.add_model("deepseek").unwrap();
+        configs.save_profile(profile.clone()).unwrap();
+
+        let reloaded = FileConfigs::open(home).unwrap();
+        assert_eq!(
+            reloaded
+                .profiles()
+                .into_iter()
+                .find(|item| item.id == profile.id),
+            Some(profile)
+        );
     }
 
     #[cfg(unix)]

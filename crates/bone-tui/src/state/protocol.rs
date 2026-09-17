@@ -74,6 +74,9 @@ pub enum Action {
     OverlayBack,
     CloseDetails,
     SelectModel(usize),
+    SelectReasoning(usize),
+    DeleteModel,
+    ToggleModelApply,
     ScrollOverlay {
         amount: isize,
         max: usize,

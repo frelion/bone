@@ -177,7 +177,20 @@ impl Runtime {
                 let tx = self.tx.clone();
                 self.login = Some(
                     tokio::spawn(async move {
-                        match app.login(profile).await {
+                        let result = async {
+                            if profile == bone_app::ProfileId::chatgpt()
+                                && !app
+                                    .profiles()
+                                    .await?
+                                    .iter()
+                                    .any(|saved| saved.id == profile)
+                            {
+                                app.save_profile(bone_app::Profile::chatgpt()).await?;
+                            }
+                            app.login(profile).await
+                        }
+                        .await;
+                        match result {
                             Ok(attempt) => {
                                 let mut changes = attempt.observe();
                                 let mut opened_browser = false;

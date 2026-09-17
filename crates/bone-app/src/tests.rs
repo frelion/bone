@@ -2803,6 +2803,7 @@ async fn chatgpt_model_selection_is_saved_without_credentials() {
     )
     .await
     .unwrap();
+    app.save_profile(Profile::chatgpt()).await.unwrap();
     let workspace = app.open_workspace(workspace_root).await.unwrap();
     let scope = ConfigScope::Workspace(workspace.id);
 

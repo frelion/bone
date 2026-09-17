@@ -19,6 +19,8 @@ use crate::{
     },
 };
 
+const COMPATIBLE_ENDPOINT_KEY: &str = "bone-compatible-endpoint";
+
 /// Constructs model ports; credentials are loaded by each OAuth request.
 #[derive(Clone, Default)]
 pub(crate) struct ProviderConnector {
@@ -187,12 +189,27 @@ impl ProviderConnector {
                 } else {
                     let owned_profile = profile.clone();
                     let bone_home = self.bone_home.clone();
-                    let key = credential_task(profile.id.clone(), move || {
+                    let key = match credential_task(profile.id.clone(), move || {
                         ApiKeyCredentials::for_profile(&bone_home, &owned_profile)
                             .and_then(|credentials| credentials.read())
                             .map_err(|error| api_key_error(owned_profile.id, error))
                     })
-                    .await?;
+                    .await
+                    {
+                        Ok(key) => key,
+                        Err(ProviderConnectError::Credential(problem))
+                            if profile.endpoint.base_url().is_some()
+                                && matches!(
+                                    problem.kind,
+                                    crate::CredentialProblemKind::Missing
+                                        | crate::CredentialProblemKind::EndpointMismatch
+                                ) =>
+                        {
+                            ApiKey::new(COMPATIBLE_ENDPOINT_KEY.into())
+                                .expect("static compatible endpoint key is valid")
+                        }
+                        Err(error) => return Err(error),
+                    };
                     api_endpoint(profile, &key)?
                 };
                 endpoints.insert(profile.id.clone(), endpoint.clone());
@@ -354,5 +371,33 @@ mod tests {
             connector.connect_chatgpt().await,
             Err(ProviderConnectError::LoginRequired(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn compatible_endpoint_without_saved_key_is_constructed() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = Profile::new(
+            ProfileId::new("local").unwrap(),
+            "Local",
+            EndpointConfig::OpenAiResponses {
+                base_url: Some("http://127.0.0.1:11434/v1".into()),
+            },
+        )
+        .unwrap();
+        let selection =
+            crate::config::ModelSelection::new(profile.id.clone(), "local-model").unwrap();
+        let resolved = ResolvedModel { profile, selection };
+        let runtime = RuntimeConfig {
+            coordinator: resolved.clone(),
+            worker: resolved,
+            limits: bone_core::AgentLimits::default(),
+            tools: crate::ToolLimits::default(),
+            workspace: directory.path().to_path_buf(),
+        };
+
+        ProviderConnector::new(directory.path().to_path_buf())
+            .connect(&runtime)
+            .await
+            .expect("compatible services may omit API keys");
     }
 }

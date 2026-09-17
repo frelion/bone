@@ -48,7 +48,11 @@ pub(crate) fn terminal_event(
                 if matches!(
                     &state.overlay,
                     Some(crate::state::Overlay::Models(models))
-                        if matches!(models.screen, crate::state::ModelScreen::Setup(_))
+                        if matches!(
+                            &models.screen,
+                            crate::state::ModelScreen::Setup(_)
+                                | crate::state::ModelScreen::ModelForm(_)
+                        )
                 ) =>
             {
                 Some(Action::SetupText(text.into()))

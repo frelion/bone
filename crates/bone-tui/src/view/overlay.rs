@@ -21,7 +21,19 @@ const TITLE_INSET: u16 = 2;
 
 pub(super) fn keyboard_hint(state: &UiState) -> &'static str {
     if state.keyboard.is_overlay() {
-        "↑↓ move · enter choose · f6 input"
+        if matches!(
+            &state.overlay,
+            Some(Overlay::Models(models)) if matches!(models.screen, ModelScreen::List { .. })
+        ) {
+            "↑↓ move · enter choose · delete remove · f6 input"
+        } else if matches!(
+            &state.overlay,
+            Some(Overlay::Models(models)) if matches!(models.screen, ModelScreen::Reasoning { .. })
+        ) {
+            "↑↓/←→ choose · enter apply · esc back"
+        } else {
+            "↑↓ move · enter choose · f6 input"
+        }
     } else {
         "click or enter choose · f6 keyboard"
     }
@@ -104,8 +116,12 @@ pub(super) fn render(
     };
     if let Overlay::Models(models) = panel
         && matches!(
-            models.screen,
-            ModelScreen::Add { .. } | ModelScreen::Advanced { .. } | ModelScreen::Setup(_)
+            &models.screen,
+            ModelScreen::Add { .. }
+                | ModelScreen::AddModel { .. }
+                | ModelScreen::Advanced { .. }
+                | ModelScreen::Setup(_)
+                | ModelScreen::ModelForm(_)
         )
     {
         return super::connection::render(frame, plan, hits, state, models, editor);
@@ -128,13 +144,22 @@ pub(super) fn render(
                 .clamp(5, if spacious { 22 } else { 14 }) as u16,
                 "Choose model",
             ),
+            ModelScreen::Reasoning { .. } => (
+                (crate::state::REASONING_EFFORTS.len() * usize::from(stride) + 4)
+                    .clamp(5, if spacious { 22 } else { 14 }) as u16,
+                "Choose reasoning",
+            ),
             ModelScreen::Manage { .. } => (
                 (models.profiles.len().max(1) * usize::from(stride) + 4)
                     .clamp(5, if spacious { 22 } else { 14 }) as u16,
                 "Manage connections",
             ),
             ModelScreen::Login { .. } => (10, "Sign in to ChatGPT"),
-            ModelScreen::Add { .. } | ModelScreen::Advanced { .. } | ModelScreen::Setup(_) => {
+            ModelScreen::Add { .. }
+            | ModelScreen::AddModel { .. }
+            | ModelScreen::Advanced { .. }
+            | ModelScreen::Setup(_)
+            | ModelScreen::ModelForm(_) => {
                 return None;
             }
         },
@@ -151,7 +176,7 @@ pub(super) fn render(
             .filter(|operation| operation.session == models.session)
             .map(|operation| match operation.kind {
                 ModelOperationKind::Load => "loading models…",
-                ModelOperationKind::Apply => "switching model…",
+                ModelOperationKind::Apply => "Applying model…",
             }),
         Overlay::Objects(_) | Overlay::Help => None,
     };
@@ -258,7 +283,7 @@ pub(super) fn render(
                 {
                     let label = match operation.kind {
                         ModelOperationKind::Load => "Loading models…",
-                        ModelOperationKind::Apply => "Switching model…",
+                        ModelOperationKind::Apply => "Applying model…",
                     };
                     frame.render_widget(
                         Paragraph::new(label).style(Style::default().fg(MUTED)),
@@ -286,10 +311,14 @@ pub(super) fn render(
                                 stride > 1,
                             );
                         } else {
-                            let label = if index == models.choices.len() {
+                            let label = if models.profiles.is_empty() {
                                 "+ Add account or API…"
                             } else {
-                                "Manage connections…"
+                                match index.saturating_sub(models.choices.len()) {
+                                    0 => "+ Add model…",
+                                    1 => "+ Add account or API…",
+                                    _ => "Manage connections…",
+                                }
                             };
                             frame.render_widget(
                                 Paragraph::new(label).style(model_menu_style(
@@ -303,6 +332,34 @@ pub(super) fn render(
                             target: ClickTarget::Action(Action::SelectModel(index)),
                         });
                     }
+                }
+            }
+            ModelScreen::Reasoning { selected, .. } => {
+                let capacity = usize::from(inner.height / stride).max(1);
+                let selected = (*selected).min(crate::state::REASONING_EFFORTS.len() - 1);
+                let start = selected.saturating_sub(capacity.saturating_sub(1));
+                for (index, effort) in crate::state::REASONING_EFFORTS
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(capacity)
+                {
+                    let row = Rect::new(
+                        inner.x,
+                        inner.y + (index - start) as u16 * stride,
+                        inner.width,
+                        stride,
+                    );
+                    let label = reasoning_label(*effort);
+                    frame.render_widget(
+                        Paragraph::new(single_line_external(label))
+                            .style(menu_style(index == selected && state.keyboard.is_overlay())),
+                        row,
+                    );
+                    hits.push(ClickRegion {
+                        area: row,
+                        target: ClickTarget::Action(Action::SelectReasoning(index)),
+                    });
                 }
             }
             ModelScreen::Manage { selected } => {
@@ -340,7 +397,7 @@ pub(super) fn render(
                             }
                             _ => (
                                 format!("{} · edit", profile.label),
-                                "Connection settings and model ID",
+                                "Connection settings and API key",
                             ),
                         };
                         let label = if spacious {
@@ -411,7 +468,11 @@ pub(super) fn render(
                     });
                 }
             }
-            ModelScreen::Add { .. } | ModelScreen::Advanced { .. } | ModelScreen::Setup(_) => {}
+            ModelScreen::Add { .. }
+            | ModelScreen::AddModel { .. }
+            | ModelScreen::Advanced { .. }
+            | ModelScreen::Setup(_)
+            | ModelScreen::ModelForm(_) => {}
         },
         Overlay::Help => {
             let shift_enter = if state.terminal_capabilities.shift_enter_supported() {
@@ -640,10 +701,22 @@ fn model_choice_label(state: &UiState, choice: &crate::state::ModelChoice) -> St
         parts.push(format!("✓ {marker}"));
     }
     parts.push(choice.label.clone());
-    if choice.recommended {
-        parts.push("Recommended".into());
+    if let Some(effort) = crate::state::model_effort(&choice.selection) {
+        parts.push(effort.as_str().into());
     }
     parts.join(" · ")
+}
+
+fn reasoning_label(effort: bone_app::ReasoningEffort) -> &'static str {
+    match effort {
+        bone_app::ReasoningEffort::None => "provider default",
+        bone_app::ReasoningEffort::Minimal => "minimal",
+        bone_app::ReasoningEffort::Low => "low",
+        bone_app::ReasoningEffort::Medium => "medium",
+        bone_app::ReasoningEffort::High => "high",
+        bone_app::ReasoningEffort::Xhigh => "xhigh",
+        bone_app::ReasoningEffort::Max => "max",
+    }
 }
 
 fn render_model_choice(
@@ -669,7 +742,7 @@ fn render_model_choice(
         lines.push(Line::from(vec![
             Span::styled("  ", theme::body_on(MUTED, background)),
             Span::styled(
-                super::single_line_external(&format!("{} · {}", choice.profile_label, choice.note)),
+                super::single_line_external(&choice.profile_label),
                 theme::body_on(MUTED, background),
             ),
         ]));
@@ -712,8 +785,6 @@ mod grouped_menu_tests {
                     .unwrap(),
                     profile_label: "ChatGPT".into(),
                     label: format!("Model {index}"),
-                    note: "Test model".into(),
-                    recommended: index == 0,
                 });
             }
             models.profiles = vec![bone_app::Profile::chatgpt(); 5];
@@ -791,10 +862,9 @@ mod grouped_menu_tests {
                 selection: bone_app::ModelSelection::new(profile.id.clone(), model).unwrap(),
                 profile_label: "ChatGPT".into(),
                 label: model.into(),
-                note: "Test model".into(),
-                recommended: false,
             })
             .collect();
+        models.profiles = vec![profile.clone()];
         models.screen = ModelScreen::List { selected: 1 };
         state.overlay = Some(Overlay::Models(models));
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();

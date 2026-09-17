@@ -134,8 +134,6 @@ fn explicit_model_uses_the_user_credential_file_contract() {
             "inspect this project",
             "--model",
             "offline-model",
-            "--base-url",
-            "https://127.0.0.1:1/v1",
             "--timeout-seconds",
             "10",
         ])

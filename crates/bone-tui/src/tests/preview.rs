@@ -339,25 +339,18 @@ fn render_preview_artifact() {
         scenario.as_str(),
         "models" | "reasoning" | "connection" | "form"
     ) {
-        let choices = bone_app::Profile::chatgpt()
-            .model_presets()
-            .iter()
-            .map(|preset| {
-                let mut selection =
-                    bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), preset.id)
-                        .unwrap();
-                selection.options = preset.default_reasoning.map(|effort| {
-                    bone_app::ModelOptions::OpenAiResponses {
-                        reasoning: bone_app::Reasoning::new().effort(effort),
-                    }
-                });
-                crate::state::ModelChoice {
-                    selection,
-                    profile_label: "ChatGPT".into(),
-                    label: preset.label.into(),
-                    note: preset.note.into(),
-                    recommended: preset.recommended,
-                }
+        let models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+        let mut profile = bone_app::Profile::chatgpt();
+        for model in models {
+            profile.add_model(model).unwrap();
+        }
+        let choices = models
+            .into_iter()
+            .map(|model| crate::state::ModelChoice {
+                selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), model)
+                    .unwrap(),
+                profile_label: profile.label.clone(),
+                label: model.into(),
             })
             .collect::<Vec<_>>();
         let model_count = choices.len();
@@ -370,7 +363,7 @@ fn render_preview_artifact() {
                         session,
                         request,
                         choices: choices.clone(),
-                        profiles: vec![bone_app::Profile::chatgpt()],
+                        profiles: vec![profile.clone()],
                     },
                 );
             }

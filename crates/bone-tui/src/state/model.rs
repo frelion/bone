@@ -571,6 +571,15 @@ impl UiState {
             {
                 true
             }
+            Some(Overlay::Models(models))
+                if matches!(
+                    &models.screen,
+                    super::ModelScreen::ModelForm(form)
+                        if !form.remove && form.pending_request.is_none()
+                ) =>
+            {
+                true
+            }
             Some(_) => false,
             None => {
                 matches!(

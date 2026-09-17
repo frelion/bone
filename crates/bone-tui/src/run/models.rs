@@ -1,4 +1,4 @@
-//! Model choices come from each saved connection's local provider catalogue.
+//! Model choices come from saved connections and the models currently in use.
 
 use bone_app::{
     App, ConfigChange, ConfigScope, ModelSelection, Profile, RuntimeOverrides, SessionId,
@@ -10,8 +10,6 @@ pub struct ModelChoice {
     pub selection: ModelSelection,
     pub profile_label: String,
     pub label: String,
-    pub note: String,
-    pub recommended: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,51 +210,41 @@ pub(crate) async fn load(
     let profiles = profiles(app).await?;
     let mut choices = Vec::new();
     for profile in &profiles {
-        for preset in profile.model_presets() {
-            let mut selection =
-                ModelSelection::new(profile.id.clone(), preset.id).expect("built-in model preset");
-            if let Some(effort) = preset.default_reasoning {
-                selection.options = Some(bone_app::ModelOptions::OpenAiResponses {
-                    reasoning: bone_app::Reasoning::new().effort(effort),
-                });
-            }
-            choices.push(ModelChoice {
-                selection,
-                profile_label: provider_label(profile),
-                label: preset.label.into(),
-                note: preset.note.into(),
-                recommended: preset.recommended,
-            });
+        for model in &profile.models {
+            append_choice(
+                &mut choices,
+                ModelSelection::new(profile.id.clone(), model.clone())
+                    .expect("validated profile model"),
+                profile,
+                model.clone(),
+            );
         }
     }
+    // Apply broader scopes first so the nearest runtime selection wins when
+    // the same profile/model is configured with different options.
+    append_scope(
+        &mut choices,
+        app.config(ConfigScope::User).await?,
+        &profiles,
+    );
+    append_scope(
+        &mut choices,
+        app.config(ConfigScope::Workspace(workspace)).await?,
+        &profiles,
+    );
     if let Some(session) = session {
-        append_custom(
+        append_scope(
             &mut choices,
-            app.config(ConfigScope::Session(session)).await?.worker,
+            app.config(ConfigScope::Session(session)).await?,
             &profiles,
         );
     }
-    append_custom(
-        &mut choices,
-        app.config(ConfigScope::Workspace(workspace)).await?.worker,
-        &profiles,
-    );
-    append_custom(
-        &mut choices,
-        app.config(ConfigScope::User).await?.worker,
-        &profiles,
-    );
     Ok(choices)
 }
 
-fn provider_label(profile: &Profile) -> String {
-    match profile.endpoint {
-        bone_app::EndpointConfig::ChatGptSubscription => "ChatGPT".into(),
-        bone_app::EndpointConfig::OpenAiResponses { base_url: None }
-        | bone_app::EndpointConfig::OpenAiChatCompletions { base_url: None } => "OpenAI API".into(),
-        bone_app::EndpointConfig::AnthropicMessages { base_url: None } => "Anthropic API".into(),
-        _ => profile.label.clone(),
-    }
+fn append_scope(choices: &mut Vec<ModelChoice>, overrides: RuntimeOverrides, profiles: &[Profile]) {
+    append_custom(choices, overrides.coordinator, profiles);
+    append_custom(choices, overrides.worker, profiles);
 }
 
 fn append_custom(
@@ -271,18 +259,25 @@ fn append_custom(
     else {
         return;
     };
-    if !profile.model_presets().is_empty() {
-        return;
-    }
-    if choices.iter().any(|choice| choice.selection == selection) {
+    append_choice(choices, selection.clone(), profile, selection.model);
+}
+
+fn append_choice(
+    choices: &mut Vec<ModelChoice>,
+    selection: ModelSelection,
+    profile: &Profile,
+    label: String,
+) {
+    if let Some(choice) = choices.iter_mut().find(|choice| {
+        choice.selection.profile == selection.profile && choice.selection.model == selection.model
+    }) {
+        choice.selection = selection;
         return;
     }
     choices.push(ModelChoice {
-        label: selection.model.clone(),
+        label,
         selection,
-        profile_label: provider_label(profile),
-        note: "Custom model".into(),
-        recommended: false,
+        profile_label: profile.label.clone(),
     });
 }
 
@@ -317,8 +312,9 @@ mod tests {
     use bone_app::{AppOptions, ProfileId};
 
     #[test]
-    fn unknown_models_for_curated_and_missing_profiles_are_omitted() {
+    fn unknown_models_for_known_profiles_are_kept_and_missing_profiles_are_omitted() {
         let profile = Profile::chatgpt();
+        let profile_id = profile.id.clone();
         let selection = ModelSelection::new(profile.id.clone(), "configured-model").unwrap();
         let mut choices = Vec::new();
         append_custom(
@@ -348,20 +344,61 @@ mod tests {
             Some(ModelSelection::new(ProfileId::new("missing").unwrap(), "model").unwrap()),
             &[profile],
         );
-        assert!(choices.is_empty());
+        assert_eq!(choices.len(), 1);
+        assert!(
+            choices
+                .iter()
+                .all(|choice| choice.selection.profile == profile_id)
+        );
+    }
+
+    #[test]
+    fn nearer_scope_replaces_the_same_model_options() {
+        let profile = Profile::new(
+            ProfileId::new("openai").unwrap(),
+            "OpenAI",
+            bone_app::EndpointConfig::OpenAiResponses { base_url: None },
+        )
+        .unwrap();
+        let mut broad = ModelSelection::new(profile.id.clone(), "gpt-test").unwrap();
+        broad.options = Some(
+            serde_json::from_value(serde_json::json!({
+                "type": "openai_responses", "reasoning": { "effort": "high" }
+            }))
+            .unwrap(),
+        );
+        let narrow = ModelSelection::new(profile.id.clone(), "gpt-test").unwrap();
+        let mut choices = Vec::new();
+        append_scope(
+            &mut choices,
+            RuntimeOverrides {
+                worker: Some(broad),
+                ..RuntimeOverrides::default()
+            },
+            std::slice::from_ref(&profile),
+        );
+        append_scope(
+            &mut choices,
+            RuntimeOverrides {
+                worker: Some(narrow),
+                ..RuntimeOverrides::default()
+            },
+            std::slice::from_ref(&profile),
+        );
+
+        assert_eq!(choices.len(), 1);
+        assert!(choices[0].selection.options.is_none());
     }
 
     #[tokio::test]
-    async fn load_combines_saved_connection_presets_with_the_selected_custom_model() {
+    async fn load_starts_empty_and_keeps_the_selected_custom_model() {
         let root = tempfile::tempdir().unwrap();
         let app = App::open(AppOptions::isolated(root.path().join("data")))
             .await
             .unwrap();
         let workspace = app.open_workspace(root.path()).await.unwrap();
         let initial = load(&app, workspace.id, None).await.unwrap();
-        assert!(initial.iter().any(|choice| {
-            choice.selection.profile == ProfileId::chatgpt() && choice.recommended
-        }));
+        assert!(initial.is_empty());
         assert_eq!(
             facts(&app, workspace.id, None)
                 .await
@@ -391,7 +428,36 @@ mod tests {
             .find(|choice| choice.selection == selection)
             .unwrap();
         assert_eq!(selected.label, "private-model");
-        assert_eq!(selected.note, "Custom model");
+        assert_eq!(selected.profile_label, "Custom API");
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_keeps_a_coordinator_only_custom_model_visible() {
+        let root = tempfile::tempdir().unwrap();
+        let app = App::open(AppOptions::isolated(root.path().join("data")))
+            .await
+            .unwrap();
+        let workspace = app.open_workspace(root.path()).await.unwrap();
+        let custom = Profile::new(
+            ProfileId::new("custom-api").unwrap(),
+            "Custom API",
+            bone_app::EndpointConfig::OpenAiResponses {
+                base_url: Some("https://example.invalid/v1".into()),
+            },
+        )
+        .unwrap();
+        app.save_profile(custom.clone()).await.unwrap();
+        let selection = ModelSelection::new(custom.id, "coordinator-only").unwrap();
+        app.update_config(
+            ConfigScope::Workspace(workspace.id),
+            ConfigChange::Coordinator(Some(selection.clone())),
+        )
+        .await
+        .unwrap();
+
+        let choices = load(&app, workspace.id, None).await.unwrap();
+        assert!(choices.iter().any(|choice| choice.selection == selection));
         app.shutdown().await.unwrap();
     }
 }

@@ -232,7 +232,26 @@ fn exact(key: &KeyEvent, code: KeyCode, modifiers: KeyModifiers) -> bool {
 fn overlay_action(key: KeyEvent, panel: &Overlay) -> Option<Action> {
     if matches!(
         panel,
-        Overlay::Models(models) if matches!(models.screen, ModelScreen::Setup(_))
+        Overlay::Models(models) if matches!(models.screen, ModelScreen::List { .. })
+    ) && exact(&key, KeyCode::Delete, KeyModifiers::NONE)
+    {
+        return Some(Action::DeleteModel);
+    }
+    if matches!(
+        panel,
+        Overlay::Models(models)
+            if matches!(&models.screen, ModelScreen::ModelForm(form) if !form.remove)
+    ) && exact(&key, KeyCode::Char(' '), KeyModifiers::NONE)
+    {
+        return Some(Action::ToggleModelApply);
+    }
+    if matches!(
+        panel,
+        Overlay::Models(models)
+            if matches!(
+                models.screen,
+                ModelScreen::Setup(_) | ModelScreen::ModelForm(_)
+            )
     ) {
         if exact(&key, KeyCode::Char('u'), KeyModifiers::CONTROL) {
             return Some(Action::SetupClear);
@@ -256,6 +275,19 @@ fn overlay_action(key: KeyEvent, panel: &Overlay) -> Option<Action> {
             {
                 Some(Action::SetupText(ch.to_string().into()))
             }
+            _ => None,
+        };
+    }
+
+    if matches!(
+        panel,
+        Overlay::Models(models) if matches!(models.screen, ModelScreen::Reasoning { .. })
+    ) {
+        return match key.code {
+            KeyCode::Left => Some(Action::PanelPrevious),
+            KeyCode::Right => Some(Action::PanelNext),
+            KeyCode::Up => Some(Action::PanelPrevious),
+            KeyCode::Down => Some(Action::PanelNext),
             _ => None,
         };
     }
@@ -297,6 +329,14 @@ mod tests {
         let mut models = crate::state::ModelPanel::new(None);
         models.screen = ModelScreen::Setup(Box::new(crate::state::ConnectionForm::new(
             crate::state::ConnectionKind::OpenAiApi,
+        )));
+        Overlay::Models(models)
+    }
+
+    fn model_form_panel() -> Overlay {
+        let mut models = crate::state::ModelPanel::new(None);
+        models.screen = ModelScreen::ModelForm(Box::new(crate::state::ModelForm::new(
+            bone_app::Profile::chatgpt(),
         )));
         Overlay::Models(models)
     }
@@ -356,6 +396,26 @@ mod tests {
         assert!(matches!(
             action_for_key(key(KeyCode::Down, KeyModifiers::NONE), &state),
             Some(Action::NextField)
+        ));
+    }
+
+    #[test]
+    fn model_form_keeps_text_save_and_apply_toggle_on_one_keyboard_route() {
+        let mut state = UiState::default();
+        state.overlay = Some(model_form_panel());
+        state.enter_overlay();
+
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('q'), KeyModifiers::NONE), &state),
+            Some(Action::SetupText(_))
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char(' '), KeyModifiers::NONE), &state),
+            Some(Action::ToggleModelApply)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Enter, KeyModifiers::NONE), &state),
+            Some(Action::ActivatePanel)
         ));
     }
 

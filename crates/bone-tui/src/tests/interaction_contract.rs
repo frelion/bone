@@ -85,8 +85,26 @@ fn chatgpt_add_panel(state: &mut UiState) {
             .unwrap(),
         profile_label: "ChatGPT".into(),
         label: "GPT Test".into(),
-        note: "Test".into(),
-        recommended: true,
+    });
+    state.overlay = Some(Overlay::Models(models));
+}
+
+fn responses_model_panel(state: &mut UiState) {
+    let mut profile = bone_app::Profile::new(
+        bone_app::ProfileId::new("test-api").unwrap(),
+        "Test API",
+        bone_app::EndpointConfig::OpenAiResponses {
+            base_url: Some("http://127.0.0.1:8080/v1".into()),
+        },
+    )
+    .unwrap();
+    profile.add_model("gpt-test").unwrap();
+    let mut models = ModelPanel::new(state.selected);
+    models.profiles.push(profile.clone());
+    models.choices.push(ModelChoice {
+        selection: bone_app::ModelSelection::new(profile.id, "gpt-test").unwrap(),
+        profile_label: profile.label,
+        label: "gpt-test".into(),
     });
     state.overlay = Some(Overlay::Models(models));
 }
@@ -341,9 +359,9 @@ fn mouse_model_overlays_keep_input_visible_and_controls_within_their_surface() {
 #[test]
 fn model_panel_has_one_keyboard_truth_and_an_independent_pointer_route() {
     let mut state = fixture();
-    chatgpt_add_panel(&mut state);
+    responses_model_panel(&mut state);
     let (_, snapshot) = render(&mut state, 80, 24);
-    let choice = click_action(&snapshot, Action::ChooseConnection(0));
+    let choice = click_action(&snapshot, Action::SelectModel(0));
 
     let down = terminal_event(
         mouse(MouseEventKind::Down(MouseButton::Left), choice.x, choice.y),
@@ -354,6 +372,31 @@ fn model_panel_has_one_keyboard_truth_and_an_independent_pointer_route() {
     assert!(update(&mut state, down).is_empty());
     let up = terminal_event(
         mouse(MouseEventKind::Up(MouseButton::Left), choice.x, choice.y),
+        Some(&snapshot),
+        &state,
+    )
+    .unwrap();
+    let effects = update(&mut state, up);
+    assert!(effects.is_empty());
+    let (_, snapshot) = render(&mut state, 80, 24);
+    let reasoning = click_action(&snapshot, Action::SelectReasoning(3));
+    let down = terminal_event(
+        mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            reasoning.x,
+            reasoning.y,
+        ),
+        Some(&snapshot),
+        &state,
+    )
+    .unwrap();
+    assert!(update(&mut state, down).is_empty());
+    let up = terminal_event(
+        mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            reasoning.x,
+            reasoning.y,
+        ),
         Some(&snapshot),
         &state,
     )
@@ -370,7 +413,7 @@ fn model_panel_has_one_keyboard_truth_and_an_independent_pointer_route() {
     );
 
     let mut state = fixture();
-    chatgpt_add_panel(&mut state);
+    responses_model_panel(&mut state);
     let enter = terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         None,
@@ -378,6 +421,14 @@ fn model_panel_has_one_keyboard_truth_and_an_independent_pointer_route() {
     )
     .unwrap();
     assert!(matches!(&enter, UiEvent::Action(Action::ActivatePanel)));
+    let effects = update(&mut state, enter);
+    assert!(effects.is_empty());
+    let enter = terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        None,
+        &state,
+    )
+    .unwrap();
     let effects = update(&mut state, enter);
     assert!(matches!(
         effects.as_slice(),

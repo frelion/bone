@@ -50,7 +50,7 @@ println!("{}", response.text().unwrap_or_default());
 - `OpenAiChatCompletions { base_url }`；
 - `AnthropicMessages { base_url }`。
 
-`None` base URL 使用官方 endpoint；compatible URL 必须是无嵌入凭据、无 query 的绝对 HTTP(S) URL。Adapters 允许 HTTP 以支持受控嵌入和本地测试，App Profile 层进一步限制为 HTTPS。
+`None` base URL 使用官方 endpoint；compatible URL 必须是无嵌入凭据、无 query 的绝对 HTTP(S) URL。App 与 Adapters 使用同一条校验规则，HTTP 可用于本地和受控兼容服务。
 
 公开 endpoint constructors 是：
 

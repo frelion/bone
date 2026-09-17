@@ -183,11 +183,13 @@ Session 收到通知后解析完整 `RuntimeConfig`。已有 Runtime 会先暂�
 `Profile` 只保存稳定 `ProfileId`、显示名和非 secret 的 `EndpointConfig`。支持：
 
 - ChatGPT subscription；
-- OpenAI Responses official / HTTPS compatible；
-- OpenAI Chat Completions official / HTTPS compatible；
-- Anthropic Messages official / HTTPS compatible。
+- OpenAI Responses official / HTTP or HTTPS compatible；
+- OpenAI Chat Completions official / HTTP or HTTPS compatible；
+- Anthropic Messages official / HTTP or HTTPS compatible。
 
-App 层只允许 HTTPS compatible URL，禁止把凭据嵌入 base URL。模型选择保存 profile ID、model ID 和与 endpoint protocol 匹配的类型化 `ModelOptions`。
+兼容服务 URL 必须是绝对 HTTP(S) 地址，不能包含用户名、密码或 query；请求不跟随重定向。
+Profile 同时保存手动添加的模型 ID 列表，模型选择保存 profile ID、model ID 和与 endpoint
+protocol 匹配的类型化 `ModelOptions`。HTTP 地址是否可信由配置使用者负责。
 
 API key 只保存在 `$BONE_HOME/credentials.toml`。目录在 Unix 上要求 `0700`，文件要求
 `0600`，且拒绝符号链接、额外硬链接和非普通文件；更新使用文件锁、私有临时文件、同步

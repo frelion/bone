@@ -4,10 +4,21 @@ use bone_app::{LoginState, ModelSelection, Profile, SessionId};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
-    ConnectionForm, ConnectionKind, Effect, ModelChoice, ModelFacts, SecretText, Status, UiState,
+    ConnectionForm, ConnectionKind, Effect, ModelChoice, ModelFacts, ModelForm, SecretText, Status,
+    UiState,
     details::{ReaderState, pin_reading},
     reader::{ReaderContent, ReaderSource},
 };
+
+pub(crate) const REASONING_EFFORTS: [bone_app::ReasoningEffort; 7] = [
+    bone_app::ReasoningEffort::None,
+    bone_app::ReasoningEffort::Minimal,
+    bone_app::ReasoningEffort::Low,
+    bone_app::ReasoningEffort::Medium,
+    bone_app::ReasoningEffort::High,
+    bone_app::ReasoningEffort::Xhigh,
+    bone_app::ReasoningEffort::Max,
+];
 
 #[derive(Debug)]
 pub(crate) enum Overlay {
@@ -28,17 +39,39 @@ pub(crate) struct ModelPanel {
     pub(crate) session: Option<SessionId>,
     pub(crate) choices: Vec<ModelChoice>,
     pub(crate) profiles: Vec<Profile>,
+    pub(crate) return_to_add_model: bool,
+    pending_selection: Option<ModelSelection>,
+    pending_reasoning: bool,
     pub(crate) screen: ModelScreen,
 }
 
 #[derive(Debug)]
 pub(crate) enum ModelScreen {
-    List { selected: usize },
-    Add { selected: usize },
-    Advanced { selected: usize },
-    Manage { selected: usize },
+    List {
+        selected: usize,
+    },
+    Reasoning {
+        selected: usize,
+        selection: ModelSelection,
+    },
+    AddModel {
+        selected: usize,
+    },
+    Add {
+        selected: usize,
+    },
+    Advanced {
+        selected: usize,
+    },
+    Manage {
+        selected: usize,
+    },
     Setup(Box<ConnectionForm>),
-    Login { request: u64, state: LoginState },
+    ModelForm(Box<ModelForm>),
+    Login {
+        request: u64,
+        state: LoginState,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,28 +93,25 @@ impl ModelPanel {
             session,
             choices: Vec::new(),
             profiles: Vec::new(),
+            return_to_add_model: false,
+            pending_selection: None,
+            pending_reasoning: false,
             screen: ModelScreen::List { selected: 0 },
         }
     }
 
     pub(crate) fn row_count(&self) -> usize {
         match &self.screen {
-            ModelScreen::List { .. } => self.choices.len() + 2,
+            ModelScreen::List { .. } => {
+                self.choices.len() + if self.profiles.is_empty() { 1 } else { 3 }
+            }
+            ModelScreen::Reasoning { .. } => REASONING_EFFORTS.len(),
+            ModelScreen::AddModel { .. } => self.profiles.len().max(1),
             ModelScreen::Add { .. } => 4,
             ModelScreen::Advanced { .. } => ConnectionKind::ADVANCED.len(),
             ModelScreen::Manage { .. } => self.profiles.len(),
-            ModelScreen::Setup(_) | ModelScreen::Login { .. } => 0,
+            ModelScreen::Setup(_) | ModelScreen::ModelForm(_) | ModelScreen::Login { .. } => 0,
         }
-    }
-
-    pub(crate) fn preset(&self, choice: usize) -> Option<&'static bone_app::ModelPreset> {
-        let choice = self.choices.get(choice)?;
-        self.profiles
-            .iter()
-            .find(|profile| profile.id == choice.selection.profile)?
-            .model_presets()
-            .iter()
-            .find(|preset| preset.id == choice.selection.model)
     }
 
     pub(crate) fn setup(&self) -> Option<&ConnectionForm> {
@@ -302,29 +332,45 @@ pub(super) fn connection_saved(
         reconcile_connection_save(state, effects);
         return;
     };
-    let ModelScreen::Setup(form) = &mut models.screen else {
+    let pending_request = match &models.screen {
+        ModelScreen::Setup(form) => form.pending_request,
+        ModelScreen::ModelForm(form) => form.pending_request,
+        _ => None,
+    };
+    let Some(pending_request) = pending_request else {
         state.overlay = Some(Overlay::Models(models));
         reconcile_connection_save(state, effects);
         return;
     };
-    if state.selected != session
-        || models.session != session
-        || form.pending_request != Some(request)
-    {
+    if state.selected != session || models.session != session || pending_request != request {
         state.overlay = Some(Overlay::Models(models));
         reconcile_connection_save(state, effects);
         return;
     }
 
     if let Some(error) = error {
-        form.pending_request = None;
-        let message = if form.key_was_sent && !key_saved {
+        models.pending_selection = None;
+        models.pending_reasoning = false;
+        let (key_was_sent, is_connection) = match &mut models.screen {
+            ModelScreen::Setup(form) => {
+                form.pending_request = None;
+                (form.key_was_sent, true)
+            }
+            ModelScreen::ModelForm(form) => {
+                form.pending_request = None;
+                (false, false)
+            }
+            _ => (false, false),
+        };
+        let message = if is_connection && key_was_sent && !key_saved {
             format!("{error} Re-enter the API key before retrying.")
         } else {
             error
         };
-        if key_saved {
-            form.key_was_sent = false;
+        if key_saved || !is_connection {
+            if let ModelScreen::Setup(form) = &mut models.screen {
+                form.key_was_sent = false;
+            }
             state.overlay = Some(Overlay::Models(models));
             state.status = Some(Status::panel_request(session, request, message));
             return_to_models(state, effects);
@@ -336,6 +382,11 @@ pub(super) fn connection_saved(
         return;
     }
 
+    let keep_model_panel =
+        matches!(&models.screen, ModelScreen::ModelForm(_)) || models.return_to_add_model;
+    let pending_selection = models.pending_selection.take();
+    let pending_reasoning = models.pending_reasoning;
+    models.pending_reasoning = false;
     if state
         .status
         .as_ref()
@@ -344,8 +395,21 @@ pub(super) fn connection_saved(
         state.status = None;
     }
     state.overlay = Some(Overlay::Models(models));
-    dismiss(state, effects);
-    refresh_model_facts(state, effects);
+    if pending_reasoning && let Some(selection) = pending_selection {
+        if let Some(Overlay::Models(models)) = &mut state.overlay {
+            models.screen = ModelScreen::Reasoning {
+                selected: reasoning_index(&selection),
+                selection,
+            };
+        }
+        return;
+    }
+    if keep_model_panel {
+        return_to_models(state, effects);
+    } else {
+        dismiss(state, effects);
+        refresh_model_facts(state, effects);
+    }
 }
 
 fn reconcile_connection_save(state: &mut UiState, effects: &mut Vec<Effect>) {
@@ -402,9 +466,14 @@ pub(super) fn login_changed(
         {
             state.status = None;
         }
+        let return_to_add_model = models.return_to_add_model;
         state.overlay = Some(Overlay::Models(models));
-        dismiss(state, effects);
-        refresh_model_facts(state, effects);
+        if return_to_add_model {
+            return_to_models(state, effects);
+        } else {
+            dismiss(state, effects);
+            refresh_model_facts(state, effects);
+        }
     } else {
         state.overlay = Some(Overlay::Models(models));
     }
@@ -511,6 +580,8 @@ pub(super) fn panel_previous(state: &mut UiState) {
         Some(Overlay::Models(ModelPanel {
             screen:
                 ModelScreen::List { selected }
+                | ModelScreen::Reasoning { selected, .. }
+                | ModelScreen::AddModel { selected }
                 | ModelScreen::Add { selected }
                 | ModelScreen::Advanced { selected }
                 | ModelScreen::Manage { selected },
@@ -529,12 +600,14 @@ pub(super) fn panel_next(state: &mut UiState) {
             let row_count = models.row_count();
             match &mut models.screen {
                 ModelScreen::List { selected }
+                | ModelScreen::Reasoning { selected, .. }
+                | ModelScreen::AddModel { selected }
                 | ModelScreen::Add { selected }
                 | ModelScreen::Advanced { selected }
                 | ModelScreen::Manage { selected } => {
                     *selected = (*selected + 1).min(row_count.saturating_sub(1));
                 }
-                ModelScreen::Setup(_) | ModelScreen::Login { .. } => {}
+                ModelScreen::Setup(_) | ModelScreen::ModelForm(_) | ModelScreen::Login { .. } => {}
             }
         }
         _ => {}
@@ -555,6 +628,20 @@ pub(super) fn activate(state: &mut UiState, effects: &mut Vec<Effect>) {
             select_model(state, selected, effects);
         }
         Some(Overlay::Models(ModelPanel {
+            screen: ModelScreen::Reasoning { selected, .. },
+            ..
+        })) => {
+            let selected = *selected;
+            select_reasoning(state, selected, effects);
+        }
+        Some(Overlay::Models(ModelPanel {
+            screen: ModelScreen::AddModel { selected },
+            ..
+        })) => {
+            let selected = *selected;
+            select_model(state, selected, effects);
+        }
+        Some(Overlay::Models(ModelPanel {
             screen: ModelScreen::Add { selected } | ModelScreen::Advanced { selected },
             ..
         })) => {
@@ -569,7 +656,7 @@ pub(super) fn activate(state: &mut UiState, effects: &mut Vec<Effect>) {
             select_model(state, selected, effects);
         }
         Some(Overlay::Models(ModelPanel {
-            screen: ModelScreen::Setup(_),
+            screen: ModelScreen::Setup(_) | ModelScreen::ModelForm(_),
             ..
         })) => save_connection(state, effects),
         Some(Overlay::Models(ModelPanel {
@@ -585,17 +672,9 @@ pub(super) fn activate(state: &mut UiState, effects: &mut Vec<Effect>) {
 }
 
 pub(super) fn setup_text(state: &mut UiState, mut value: SecretText) {
-    let Some(Overlay::Models(ModelPanel {
-        screen: ModelScreen::Setup(form),
-        ..
-    })) = &mut state.overlay
-    else {
+    let Some(text) = setup_text_mut(state) else {
         return;
     };
-    if form.pending_request.is_some() {
-        return;
-    }
-    let text = form.text_mut();
     let previous_len = text.len();
     for ch in value.take().chars().filter(|ch| !ch.is_control()) {
         if text.len() + ch.len_utf8() <= 16 * 1024 {
@@ -608,20 +687,18 @@ pub(super) fn setup_text(state: &mut UiState, mut value: SecretText) {
 }
 
 pub(super) fn setup_clear(state: &mut UiState) {
-    if let Some(form) = setup_mut(state) {
-        let text = form.text_mut();
-        if !text.is_empty() {
-            text.clear();
-            state.caret_visible = true;
-        }
+    if let Some(text) = setup_text_mut(state)
+        && !text.is_empty()
+    {
+        text.clear();
+        state.caret_visible = true;
     }
 }
 
 pub(super) fn setup_backspace(state: &mut UiState) {
-    let Some(form) = setup_mut(state) else {
+    let Some(text) = setup_text_mut(state) else {
         return;
     };
-    let text = form.text_mut();
     if let Some((byte, _)) = text.grapheme_indices(true).next_back() {
         text.truncate(byte);
         state.caret_visible = true;
@@ -638,6 +715,19 @@ pub(super) fn move_setup_field(state: &mut UiState, forward: bool) {
     }
 }
 
+pub(super) fn toggle_model_apply(state: &mut UiState) {
+    if let Some(Overlay::Models(ModelPanel {
+        screen: ModelScreen::ModelForm(form),
+        ..
+    })) = &mut state.overlay
+        && !form.remove
+        && form.pending_request.is_none()
+    {
+        form.apply = !form.apply;
+        state.caret_visible = true;
+    }
+}
+
 fn setup_mut(state: &mut UiState) -> Option<&mut ConnectionForm> {
     match &mut state.overlay {
         Some(Overlay::Models(ModelPanel {
@@ -646,6 +736,68 @@ fn setup_mut(state: &mut UiState) -> Option<&mut ConnectionForm> {
         })) if form.pending_request.is_none() => Some(form),
         _ => None,
     }
+}
+
+fn setup_text_mut(state: &mut UiState) -> Option<&mut String> {
+    match &mut state.overlay {
+        Some(Overlay::Models(ModelPanel {
+            screen: ModelScreen::Setup(form),
+            ..
+        })) if form.pending_request.is_none() => Some(form.text_mut()),
+        Some(Overlay::Models(ModelPanel {
+            screen: ModelScreen::ModelForm(form),
+            ..
+        })) if form.pending_request.is_none() => Some(form.text_mut()),
+        _ => None,
+    }
+}
+
+pub(super) fn delete_model(state: &mut UiState, effects: &mut Vec<Effect>) {
+    let Some(panel) = state.overlay.take() else {
+        return;
+    };
+    let Overlay::Models(mut models) = panel else {
+        state.overlay = Some(panel);
+        return;
+    };
+    if models.session != state.selected || models.busy(state.model_operation) {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    }
+    let ModelScreen::List { selected } = models.screen else {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    };
+    let Some(choice) = models.choices.get(selected).cloned() else {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    };
+    let Some(profile) = models
+        .profiles
+        .iter()
+        .find(|profile| profile.id == choice.selection.profile)
+        .cloned()
+    else {
+        state.overlay = Some(Overlay::Models(models));
+        state.status = Some(Status::selection(
+            state.selected,
+            "This model's connection is no longer available",
+        ));
+        return;
+    };
+    if !profile.has_model(&choice.selection.model) {
+        state.overlay = Some(Overlay::Models(models));
+        state.status = Some(Status::selection(
+            state.selected,
+            "Only saved models can be removed",
+        ));
+        return;
+    }
+    models.screen =
+        ModelScreen::ModelForm(Box::new(ModelForm::remove(profile, choice.selection.model)));
+    state.overlay = Some(Overlay::Models(models));
+    state.status = None;
+    save_connection(state, effects);
 }
 
 pub(super) fn select_model(state: &mut UiState, index: usize, effects: &mut Vec<Effect>) {
@@ -672,15 +824,39 @@ pub(super) fn select_model(state: &mut UiState, index: usize, effects: &mut Vec<
                 .get(index)
                 .map(|choice| choice.selection.clone())
             {
-                let selection = complete_selection(state, &models, index, selection);
-                apply_selection(state, models, selection, false, effects);
+                if supports_reasoning(&models, &selection) {
+                    models.screen = ModelScreen::Reasoning {
+                        selected: reasoning_index(&selection),
+                        selection,
+                    };
+                    state.overlay = Some(Overlay::Models(models));
+                    state.status = None;
+                } else {
+                    apply_selection(state, models, selection, false, effects);
+                }
                 return;
             }
-            if index == models.choices.len() {
+            let action = index.saturating_sub(models.choices.len());
+            if models.profiles.is_empty() {
+                models.return_to_add_model = true;
+                models.screen = ModelScreen::Add { selected: 0 };
+            } else if action == 0 {
+                models.screen = ModelScreen::AddModel { selected: 0 };
+            } else if action == 1 {
                 models.screen = ModelScreen::Add { selected: 0 };
             } else {
                 models.screen = ModelScreen::Manage { selected: 0 };
             }
+        }
+        ModelScreen::AddModel { .. } => {
+            let Some(profile) = models.profiles.get(index).cloned() else {
+                if models.profiles.is_empty() && index == 0 {
+                    models.screen = ModelScreen::Add { selected: 0 };
+                }
+                state.overlay = Some(Overlay::Models(models));
+                return;
+            };
+            models.screen = ModelScreen::ModelForm(Box::new(ModelForm::new(profile)));
         }
         ModelScreen::Manage { .. } => {
             let Some(profile) = models.profiles.get(index).cloned() else {
@@ -688,12 +864,11 @@ pub(super) fn select_model(state: &mut UiState, index: usize, effects: &mut Vec<
                 return;
             };
             models.screen = ModelScreen::Manage { selected: index };
-            let selection = current_or_recommended_selection(state, &models, &profile);
             if profile.id == bone_app::ProfileId::chatgpt() {
                 begin_login(state, models, effects);
                 return;
             }
-            let Some(form) = ConnectionForm::edit_selection(&profile, selection) else {
+            let Some(form) = ConnectionForm::edit_selection(&profile) else {
                 unreachable!("ChatGPT handled above")
             };
             models.screen = ModelScreen::Setup(Box::new(form));
@@ -722,21 +897,7 @@ pub(super) fn choose_connection(state: &mut UiState, index: usize, effects: &mut
     let kind = match models.screen {
         ModelScreen::Add { .. } => match index {
             0 => {
-                let profile = models
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.id == bone_app::ProfileId::chatgpt());
-                let choice = profile.and_then(|profile| recommended_choice(&models, profile));
-                let Some((index, selection)) = choice else {
-                    state.overlay = Some(Overlay::Models(models));
-                    state.status = Some(Status::selection(
-                        state.selected,
-                        "ChatGPT has no recommended model",
-                    ));
-                    return;
-                };
-                let selection = complete_selection(state, &models, index, selection);
-                apply_selection(state, models, selection, false, effects);
+                begin_login(state, models, effects);
                 return;
             }
             1 | 2 => {
@@ -757,9 +918,8 @@ pub(super) fn choose_connection(state: &mut UiState, index: usize, effects: &mut
                     .find(|profile| profile.id == id)
                     .cloned()
                 {
-                    let selection = current_or_recommended_selection(state, &models, &profile);
                     models.screen = ModelScreen::Setup(Box::new(
-                        ConnectionForm::edit_selection(&profile, selection)
+                        ConnectionForm::edit_selection(&profile)
                             .expect("API profiles have an editable connection form"),
                     ));
                     state.overlay = Some(Overlay::Models(models));
@@ -796,24 +956,37 @@ pub(super) fn choose_connection(state: &mut UiState, index: usize, effects: &mut
     state.status = None;
 }
 
-fn recommended_choice(models: &ModelPanel, profile: &Profile) -> Option<(usize, ModelSelection)> {
-    models
-        .choices
-        .iter()
-        .enumerate()
-        .find(|(_, choice)| choice.selection.profile == profile.id && choice.recommended)
-        .or_else(|| {
-            models
-                .choices
-                .iter()
-                .enumerate()
-                .find(|(_, choice)| choice.selection.profile == profile.id)
-        })
-        .map(|(index, choice)| (index, choice.selection.clone()))
-}
-
-fn recommended_selection(models: &ModelPanel, profile: &Profile) -> Option<ModelSelection> {
-    recommended_choice(models, profile).map(|(_, selection)| selection)
+pub(super) fn select_reasoning(state: &mut UiState, index: usize, effects: &mut Vec<Effect>) {
+    let Some(panel) = state.overlay.take() else {
+        return;
+    };
+    let Overlay::Models(mut models) = panel else {
+        state.overlay = Some(panel);
+        return;
+    };
+    if models.session != state.selected || models.busy(state.model_operation) {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    }
+    let ModelScreen::Reasoning { selection, .. } = &models.screen else {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    };
+    let Some(effort) = REASONING_EFFORTS.get(index).copied() else {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    };
+    let mut selection = selection.clone();
+    selection.options = (effort != bone_app::ReasoningEffort::None).then(|| {
+        bone_app::ModelOptions::OpenAiResponses {
+            reasoning: bone_app::Reasoning::new().effort(effort),
+        }
+    });
+    models.screen = ModelScreen::Reasoning {
+        selected: index,
+        selection: selection.clone(),
+    };
+    apply_selection(state, models, selection, false, effects);
 }
 
 fn same_model(left: &ModelSelection, right: &ModelSelection) -> bool {
@@ -826,44 +999,28 @@ fn model_effort(selection: &ModelSelection) -> Option<bone_app::ReasoningEffort>
     }
 }
 
-fn complete_selection(
-    state: &UiState,
-    models: &ModelPanel,
-    index: usize,
-    mut selection: ModelSelection,
-) -> ModelSelection {
-    let current_effort = state
-        .model_facts
-        .as_ref()
-        .and_then(|facts| facts.saved.as_ref().ok())
-        .map(|resolved| &resolved.selection)
-        .filter(|current| same_model(current, &selection))
-        .and_then(model_effort);
-    let effort = current_effort.or_else(|| {
-        models
-            .preset(index)
-            .and_then(|preset| preset.default_reasoning)
-    });
-    if let Some(effort) = effort {
-        selection.options = Some(bone_app::ModelOptions::OpenAiResponses {
-            reasoning: bone_app::Reasoning::new().effort(effort),
-        });
-    }
-    selection
+fn supports_reasoning(models: &ModelPanel, selection: &ModelSelection) -> bool {
+    models
+        .profiles
+        .iter()
+        .find(|profile| profile.id == selection.profile)
+        .is_some_and(|profile| {
+            matches!(
+                profile.endpoint,
+                bone_app::EndpointConfig::ChatGptSubscription
+                    | bone_app::EndpointConfig::OpenAiResponses { .. }
+            )
+        })
 }
 
-fn current_or_recommended_selection(
-    state: &UiState,
-    models: &ModelPanel,
-    profile: &Profile,
-) -> Option<ModelSelection> {
-    state
-        .model_facts
-        .as_ref()
-        .and_then(|facts| facts.saved.as_ref().ok())
-        .filter(|resolved| resolved.selection.profile == profile.id)
-        .map(|resolved| resolved.selection.clone())
-        .or_else(|| recommended_selection(models, profile))
+fn reasoning_index(selection: &ModelSelection) -> usize {
+    model_effort(selection)
+        .and_then(|effort| {
+            REASONING_EFFORTS
+                .iter()
+                .position(|candidate| *candidate == effort)
+        })
+        .unwrap_or(0)
 }
 
 fn begin_login(state: &mut UiState, mut models: ModelPanel, effects: &mut Vec<Effect>) {
@@ -947,26 +1104,58 @@ pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
         state.overlay = Some(Overlay::Models(models));
         return;
     }
-    let ModelScreen::Setup(form) = &mut models.screen else {
-        state.overlay = Some(Overlay::Models(models));
-        return;
-    };
-    if form.pending_request.is_some() {
-        state.overlay = Some(Overlay::Models(models));
-        return;
-    }
-    let (profile, selection) = match form.validated() {
-        Ok(value) => value,
-        Err(error) => {
+    let request = state.generation();
+    let (profile, selection, key) = match &mut models.screen {
+        ModelScreen::Setup(form) => {
+            if form.pending_request.is_some() {
+                state.overlay = Some(Overlay::Models(models));
+                return;
+            }
+            let (profile, selection) = match form.validated() {
+                Ok(value) => value,
+                Err(error) => {
+                    state.overlay = Some(Overlay::Models(models));
+                    state.status = Some(Status::selection(state.selected, error));
+                    return;
+                }
+            };
+            form.pending_request = Some(request);
+            form.key_was_sent = !form.key.is_empty();
+            let key = (!form.key.is_empty()).then(|| SecretText::from(form.key.take()));
+            (profile, selection, key)
+        }
+        ModelScreen::ModelForm(form) => {
+            if form.pending_request.is_some() {
+                state.overlay = Some(Overlay::Models(models));
+                return;
+            }
+            let (profile, selection) = match form.validated() {
+                Ok(value) => value,
+                Err(error) => {
+                    state.overlay = Some(Overlay::Models(models));
+                    state.status = Some(Status::selection(state.selected, error));
+                    return;
+                }
+            };
+            form.pending_request = Some(request);
+            (profile, selection, None)
+        }
+        _ => {
             state.overlay = Some(Overlay::Models(models));
-            state.status = Some(Status::selection(state.selected, error));
             return;
         }
     };
-    let request = state.generation();
-    form.pending_request = Some(request);
-    form.key_was_sent = !form.key.is_empty();
-    let key = (!form.key.is_empty()).then(|| SecretText::from(form.key.take()));
+    let pending_reasoning = selection.as_ref().is_some_and(|_| {
+        matches!(
+            &profile.endpoint,
+            bone_app::EndpointConfig::OpenAiResponses { .. }
+        )
+    });
+    if pending_reasoning {
+        models.pending_selection = selection.clone();
+        models.pending_reasoning = true;
+    }
+    let selection = if pending_reasoning { None } else { selection };
     let session = models.session;
     state.overlay = Some(Overlay::Models(models));
     state.status = None;
@@ -984,7 +1173,13 @@ fn return_to_models(state: &mut UiState, effects: &mut Vec<Effect>) {
     let Some(Overlay::Models(models)) = &mut state.overlay else {
         return;
     };
-    models.screen = ModelScreen::List { selected: 0 };
+    let return_to_add_model = models.return_to_add_model;
+    models.return_to_add_model = false;
+    models.screen = if return_to_add_model {
+        ModelScreen::AddModel { selected: 0 }
+    } else {
+        ModelScreen::List { selected: 0 }
+    };
     let session = models.session;
     load_models(state, session, effects);
     refresh_model_facts(state, effects);
@@ -992,6 +1187,7 @@ fn return_to_models(state: &mut UiState, effects: &mut Vec<Effect>) {
 
 fn return_to_model_list(state: &mut UiState) {
     if let Some(Overlay::Models(models)) = &mut state.overlay {
+        models.return_to_add_model = false;
         models.screen = ModelScreen::List { selected: 0 };
     }
 }
@@ -1010,13 +1206,14 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
             })
         ) if models.session == state.selected
     );
-    let save_pending = matches!(
-        panel,
-        Overlay::Models(ModelPanel {
-            screen: ModelScreen::Setup(form),
-            ..
-        }) if form.pending_request.is_some()
-    );
+    let save_pending = match panel {
+        Overlay::Models(models) => match &models.screen {
+            ModelScreen::Setup(form) => form.pending_request.is_some(),
+            ModelScreen::ModelForm(form) => form.pending_request.is_some(),
+            _ => false,
+        },
+        _ => false,
+    };
     if apply_pending || save_pending {
         state.status = Some(Status::selection_notice(
             state.selected,
@@ -1033,6 +1230,15 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
             effects.push(Effect::CancelLogin);
             state.status = None;
             return_to_models(state, effects);
+        }
+        Overlay::Models(ModelPanel {
+            screen: ModelScreen::Reasoning { .. },
+            ..
+        }) => {
+            state.status = None;
+            if let Some(Overlay::Models(models)) = &mut state.overlay {
+                models.screen = ModelScreen::List { selected: 0 };
+            }
         }
         Overlay::Models(ModelPanel {
             screen: ModelScreen::Setup(_),
@@ -1052,6 +1258,15 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
             }
         }
         Overlay::Models(ModelPanel {
+            screen: ModelScreen::ModelForm(_),
+            ..
+        }) => {
+            state.status = None;
+            if let Some(Overlay::Models(models)) = &mut state.overlay {
+                models.screen = ModelScreen::AddModel { selected: 0 };
+            }
+        }
+        Overlay::Models(ModelPanel {
             screen: ModelScreen::Advanced { .. },
             ..
         }) => {
@@ -1061,7 +1276,8 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
             }
         }
         Overlay::Models(ModelPanel {
-            screen: ModelScreen::Add { .. } | ModelScreen::Manage { .. },
+            screen:
+                ModelScreen::AddModel { .. } | ModelScreen::Add { .. } | ModelScreen::Manage { .. },
             ..
         }) => {
             state.status = None;
@@ -1127,8 +1343,6 @@ mod tests {
             .unwrap(),
             profile_label: "Test API".into(),
             label: model.into(),
-            note: "Test model".into(),
-            recommended: false,
         }
     }
 
@@ -1190,6 +1404,123 @@ mod tests {
         let mut models = ModelPanel::new(state.selected);
         models.screen = ModelScreen::Setup(Box::new(form));
         state.overlay = Some(Overlay::Models(models));
+    }
+
+    #[test]
+    fn add_model_enters_the_one_field_form_and_delete_returns_to_the_list() {
+        let mut profile = bone_app::Profile::new(
+            bone_app::ProfileId::new("custom-api").unwrap(),
+            "Custom API",
+            bone_app::EndpointConfig::OpenAiResponses {
+                base_url: Some("http://127.0.0.1:8080/v1".into()),
+            },
+        )
+        .unwrap();
+        profile.add_model("model-a").unwrap();
+        let selection = bone_app::ModelSelection::new(profile.id.clone(), "model-a").unwrap();
+        let mut models = ModelPanel::new(None);
+        models.profiles = vec![profile.clone()];
+        models.screen = ModelScreen::AddModel { selected: 0 };
+        state_with_models(&mut models, selection);
+    }
+
+    #[test]
+    fn adding_a_connection_from_an_empty_catalogue_returns_to_add_model() {
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.screen = ModelScreen::List { selected: 0 };
+        state.overlay = Some(Overlay::Models(models));
+        let mut effects = Vec::new();
+        select_model(&mut state, 0, &mut effects);
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
+                screen: ModelScreen::Add { .. },
+                return_to_add_model: true,
+                ..
+            }))
+        ));
+
+        choose_connection(&mut state, 1, &mut effects);
+        let Some(Overlay::Models(ModelPanel {
+            screen: ModelScreen::Setup(form),
+            ..
+        })) = state.overlay.as_mut()
+        else {
+            panic!("connection form")
+        };
+        form.key = SecretText::from("secret".to_owned());
+        save_connection(&mut state, &mut effects);
+        let request = effects.iter().find_map(|effect| {
+            if let Effect::SaveConnection { request, .. } = effect {
+                Some(*request)
+            } else {
+                None
+            }
+        });
+        connection_saved(
+            &mut state,
+            request.expect("save request"),
+            None,
+            None,
+            true,
+            &mut effects,
+        );
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
+                screen: ModelScreen::AddModel { .. },
+                return_to_add_model: false,
+                ..
+            }))
+        ));
+    }
+
+    fn state_with_models(models: &mut ModelPanel, selection: bone_app::ModelSelection) {
+        let mut state = UiState::default();
+        models.choices = vec![ModelChoice {
+            selection,
+            profile_label: "Custom API".into(),
+            label: "model-a".into(),
+        }];
+        state.overlay = Some(Overlay::Models(std::mem::replace(
+            models,
+            ModelPanel::new(None),
+        )));
+        let mut effects = Vec::new();
+        select_model(&mut state, 0, &mut effects);
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
+                screen: ModelScreen::ModelForm(_),
+                ..
+            }))
+        ));
+        let Some(Overlay::Models(models)) = state.overlay.as_mut() else {
+            unreachable!()
+        };
+        models.screen = ModelScreen::List { selected: 0 };
+        delete_model(&mut state, &mut effects);
+        let request = match &state.overlay {
+            Some(Overlay::Models(ModelPanel {
+                screen: ModelScreen::ModelForm(form),
+                ..
+            })) => form.pending_request.expect("delete request"),
+            _ => panic!("delete should use the model save path"),
+        };
+        connection_saved(&mut state, request, None, None, false, &mut effects);
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
+                screen: ModelScreen::List { .. },
+                ..
+            }))
+        ));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadModels { .. }))
+        );
     }
 
     #[test]
@@ -1400,7 +1731,7 @@ mod tests {
     }
 
     #[test]
-    fn curated_model_selection_applies_its_default_reasoning_in_one_action() {
+    fn selecting_a_responses_model_opens_reasoning_before_apply() {
         let mut state = UiState::default();
         state.model_facts = Some(facts("existing"));
         let mut effects = Vec::new();
@@ -1416,16 +1747,23 @@ mod tests {
                 selection,
                 profile_label: "ChatGPT".into(),
                 label: "GPT-5.6 Terra".into(),
-                note: "Balanced".into(),
-                recommended: true,
             }],
             vec![bone_app::Profile::chatgpt()],
         );
 
         effects.clear();
         select_model(&mut state, 0, &mut effects);
+        assert!(effects.is_empty());
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
+                screen: ModelScreen::Reasoning { selected: 0, .. },
+                ..
+            }))
+        ));
+        select_reasoning(&mut state, 3, &mut effects);
         let [Effect::SetModel { selection, .. }] = effects.as_slice() else {
-            panic!("one model choice must apply a complete selection")
+            panic!("reasoning choice must apply a complete selection")
         };
         assert_eq!(
             model_effort(selection),
@@ -1434,7 +1772,53 @@ mod tests {
     }
 
     #[test]
-    fn first_use_selects_a_model_from_the_list_in_one_action() {
+    fn adding_a_responses_model_chooses_reasoning_after_the_connection_is_saved() {
+        let profile = bone_app::Profile::new(
+            bone_app::ProfileId::new("local").unwrap(),
+            "Local",
+            bone_app::EndpointConfig::OpenAiResponses {
+                base_url: Some("http://127.0.0.1:11434/v1".into()),
+            },
+        )
+        .unwrap();
+        let mut form = ModelForm::new(profile.clone());
+        form.model = "local-model".into();
+        let mut models = ModelPanel::new(None);
+        models.profiles = vec![profile];
+        models.screen = ModelScreen::ModelForm(Box::new(form));
+        let mut state = UiState::default();
+        state.overlay = Some(Overlay::Models(models));
+
+        let mut effects = Vec::new();
+        save_connection(&mut state, &mut effects);
+        let request = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::SaveConnection { request, .. } => Some(*request),
+                _ => None,
+            })
+            .expect("save request");
+        connection_saved(&mut state, request, None, None, false, &mut effects);
+
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
+                screen: ModelScreen::Reasoning { .. },
+                ..
+            }))
+        ));
+        effects.clear();
+        select_reasoning(&mut state, 2, &mut effects);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SetModel { selection, .. }]
+                if selection.model == "local-model"
+                    && model_effort(selection) == Some(bone_app::ReasoningEffort::Low)
+        ));
+    }
+
+    #[test]
+    fn first_use_selects_a_model_then_reasoning_from_the_list() {
         let mut state = UiState::default();
         state.model_facts = Some(ModelFacts {
             saved: Err(bone_app::ConfigProblem::NeedsModel),
@@ -1455,8 +1839,6 @@ mod tests {
                 .unwrap(),
                 profile_label: "ChatGPT".into(),
                 label: "GPT-5.6 Terra".into(),
-                note: "Balanced".into(),
-                recommended: true,
             }],
             vec![bone_app::Profile::chatgpt()],
         );
@@ -1470,13 +1852,22 @@ mod tests {
 
         effects.clear();
         activate(&mut state, &mut effects);
+        assert!(effects.is_empty());
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
+                screen: ModelScreen::Reasoning { selected: 0, .. },
+                ..
+            }))
+        ));
+        activate(&mut state, &mut effects);
         assert!(matches!(
             effects.as_slice(),
             [Effect::SetModel {
                 workspace_default: true,
                 selection,
                 ..
-            }] if model_effort(selection) == Some(bone_app::ReasoningEffort::Medium)
+            }] if selection.options.is_none()
         ));
     }
 
@@ -1910,25 +2301,52 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_onboarding_selects_the_model_without_inventing_a_login_requirement() {
+    fn chatgpt_onboarding_starts_login_without_inventing_a_model() {
         let mut state = UiState::default();
         let mut models = ModelPanel::new(None);
         models.screen = ModelScreen::Add { selected: 0 };
         models.profiles.push(Profile::chatgpt());
-        models.choices.push(ModelChoice {
-            selection: ModelSelection::new(bone_app::ProfileId::chatgpt(), "gpt-test").unwrap(),
-            profile_label: "ChatGPT".into(),
-            label: "GPT Test".into(),
-            note: "Test".into(),
-            recommended: true,
-        });
         state.overlay = Some(Overlay::Models(models));
         let mut effects = Vec::new();
         choose_connection(&mut state, 0, &mut effects);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::SetModel { selection, .. }] if selection.model == "gpt-test"
+            [Effect::Login { profile, .. }] if *profile == bone_app::ProfileId::chatgpt()
         ));
+    }
+
+    #[test]
+    fn chatgpt_onboarding_returns_to_add_model_after_login() {
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.return_to_add_model = true;
+        models.screen = ModelScreen::Login {
+            request: 41,
+            state: LoginState::Connecting,
+        };
+        state.overlay = Some(Overlay::Models(models));
+
+        let mut effects = Vec::new();
+        login_changed(&mut state, 41, LoginState::Succeeded, &mut effects);
+
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::Models(ModelPanel {
+                screen: ModelScreen::AddModel { .. },
+                return_to_add_model: false,
+                ..
+            }))
+        ));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadModels { .. }))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadModelFacts { .. }))
+        );
     }
 
     #[test]
@@ -1962,26 +2380,12 @@ mod tests {
         let mut models = ModelPanel::new(Some(session));
         models.screen = ModelScreen::Add { selected: 0 };
         models.profiles.push(Profile::chatgpt());
-        models.choices.push(ModelChoice {
-            selection: ModelSelection::new(bone_app::ProfileId::chatgpt(), "gpt-test").unwrap(),
-            profile_label: "ChatGPT".into(),
-            label: "GPT Test".into(),
-            note: "Test".into(),
-            recommended: true,
-        });
         state.overlay = Some(Overlay::Models(models));
         let mut effects = Vec::new();
 
         choose_connection(&mut state, 0, &mut effects);
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::SetModel {
-                session: Some(target),
-                workspace_default: true,
-                ..
-            }] if *target == session
-        ));
+        assert!(matches!(effects.as_slice(), [Effect::Login { .. }]));
     }
 
     #[test]
@@ -2008,8 +2412,6 @@ mod tests {
             selection,
             profile_label: "OpenAI API".into(),
             label: "GPT-5.6 Sol".into(),
-            note: "Recommended".into(),
-            recommended: true,
         });
         state.overlay = Some(Overlay::Models(models));
         let mut effects = Vec::new();
@@ -2023,7 +2425,7 @@ mod tests {
                 screen: ModelScreen::Setup(form),
                 ..
             })) if form.edits_existing_connection()
-                && form.fields() == [SetupField::Key]
+                && form.fields() == [SetupField::Key, SetupField::Model]
         ));
     }
 

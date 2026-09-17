@@ -50,7 +50,7 @@ MODEL OPTIONS:\n\
     --model ID                Configure a model for this workspace\n\
     --provider NAME           openai-responses (default), openai-chat, anthropic,\n\
                               or chatgpt (uses an existing subscription login)\n\
-    --base-url URL            HTTPS URL for a compatible provider\n\
+    --base-url URL            HTTP(S) URL for a compatible provider\n\
 \n\
 If --model is omitted, `run` uses the model already configured in BONE.\n\
 Exit codes: 0 completed, 2 usage, 3 failed, 4 needs input, 124 timeout, 130 interrupted.\n";
@@ -64,7 +64,7 @@ USAGE:\n\
 OPTIONS:\n\
     --provider NAME    openai-responses, openai-chat, or anthropic\n\
     --profile ID       Profile ID (default: headless provider profile)\n\
-    --base-url URL     HTTPS URL for a compatible provider\n";
+    --base-url URL     HTTP(S) URL for a compatible provider\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Provider {

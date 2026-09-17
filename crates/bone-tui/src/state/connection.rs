@@ -98,7 +98,7 @@ pub struct ConnectionForm {
     pub(crate) key_was_sent: bool,
     id: ProfileId,
     original_endpoint: Option<EndpointConfig>,
-    original_selection: Option<ModelSelection>,
+    models: Vec<String>,
 }
 
 impl ConnectionForm {
@@ -125,11 +125,11 @@ impl ConnectionForm {
             key_was_sent: false,
             id,
             original_endpoint: None,
-            original_selection: None,
+            models: Vec::new(),
         }
     }
 
-    pub fn edit_selection(profile: &Profile, selection: Option<ModelSelection>) -> Option<Self> {
+    pub fn edit_selection(profile: &Profile) -> Option<Self> {
         let kind = match &profile.endpoint {
             EndpointConfig::ChatGptSubscription => return None,
             EndpointConfig::OpenAiResponses { base_url: None } => ConnectionKind::OpenAiApi,
@@ -144,17 +144,12 @@ impl ConnectionForm {
                 ConnectionKind::CustomAnthropicMessages
             }
         };
-        let selection = selection.filter(|selection| selection.profile == profile.id);
         let mut form = Self::new(kind);
         form.original_endpoint = Some(profile.endpoint.clone());
         form.id = profile.id.clone();
         form.label = profile.label.clone();
         form.base_url = profile.endpoint.base_url().unwrap_or_default().into();
-        form.model = selection
-            .as_ref()
-            .map(|selection| selection.model.clone())
-            .unwrap_or_default();
-        form.original_selection = selection;
+        form.models = profile.models.clone();
         Some(form)
     }
 
@@ -167,7 +162,7 @@ impl ConnectionForm {
                 SetupField::Model,
             ]
         } else {
-            &[SetupField::Key]
+            &[SetupField::Key, SetupField::Model]
         }
     }
 
@@ -193,9 +188,6 @@ impl ConnectionForm {
         if self.key_was_sent && self.key.is_empty() {
             return Err("Re-enter the API key before retrying".into());
         }
-        if self.original_endpoint.is_none() && self.key.is_empty() {
-            return Err("Enter an API key".into());
-        }
         if self.kind.advanced() && self.base_url.trim().is_empty() {
             return Err("Enter the service URL".into());
         }
@@ -209,66 +201,80 @@ impl ConnectionForm {
             self.kind.endpoint(base_url),
         )
         .map_err(|error| error.to_string())?;
-        if self.key.is_empty()
-            && self
-                .original_endpoint
-                .as_ref()
-                .is_some_and(|original| *original != profile.endpoint)
-        {
-            return Err("Endpoint changed: enter an API key for the new endpoint".into());
-        }
-
-        if self.edits_existing_connection() && !self.kind.advanced() {
-            return Ok((profile, None));
-        }
-        if self.edits_existing_connection() && self.model.trim().is_empty() {
-            return Ok((profile, None));
-        }
-
-        let (model, default_reasoning) = if self.kind.advanced() {
-            (self.model.trim(), None)
-        } else if let Some(original) = &self.original_selection {
-            (original.model.as_str(), None)
+        let mut profile = profile;
+        profile.models = self.models.clone();
+        let selection = if self.model.is_empty() {
+            None
         } else {
-            let preset = profile
-                .model_presets()
-                .iter()
-                .find(|preset| preset.recommended)
-                .or_else(|| profile.model_presets().first())
-                .ok_or_else(|| "This provider has no recommended model".to_owned())?;
-            (preset.id, preset.default_reasoning)
+            profile
+                .add_model(&self.model)
+                .map_err(|error| error.to_string())?;
+            Some(
+                ModelSelection::new(profile.id.clone(), self.model.clone())
+                    .map_err(|error| error.to_string())?,
+            )
         };
-        let mut selection = if let Some(original) = &self.original_selection
-            && original.model == model
-        {
-            original.clone()
-        } else {
-            ModelSelection::new(self.id.clone(), model).map_err(|error| error.to_string())?
-        };
-        if let Some(effort) = default_reasoning {
-            selection.options = Some(bone_app::ModelOptions::OpenAiResponses {
-                reasoning: bone_app::Reasoning::new().effort(effort),
-            });
-        }
-        let changes_model = self
-            .original_selection
-            .as_ref()
-            .is_none_or(|original| *original != selection);
-        Ok((profile, changes_model.then_some(selection)))
+        Ok((profile, selection))
     }
 
     pub(crate) fn edits_existing_connection(&self) -> bool {
         self.original_endpoint.is_some()
     }
+}
 
-    pub(crate) fn changes_model(&self) -> bool {
-        self.kind.advanced()
-            && self.edits_existing_connection()
-            && !self.model.trim().is_empty()
-            && self
-                .original_selection
-                .as_ref()
-                .is_none_or(|selection| selection.model != self.model.trim())
+/// A one-field form for adding a model to an existing connection.
+#[derive(Debug)]
+pub struct ModelForm {
+    pub profile: Profile,
+    pub model: String,
+    pub apply: bool,
+    pub remove: bool,
+    pub pending_request: Option<u64>,
+}
+
+impl ModelForm {
+    pub fn new(profile: Profile) -> Self {
+        Self {
+            profile,
+            model: String::new(),
+            apply: true,
+            remove: false,
+            pending_request: None,
+        }
+    }
+
+    pub fn remove(profile: Profile, model: impl Into<String>) -> Self {
+        Self {
+            profile,
+            model: model.into(),
+            apply: false,
+            remove: true,
+            pending_request: None,
+        }
+    }
+
+    pub fn text_mut(&mut self) -> &mut String {
+        &mut self.model
+    }
+
+    pub fn validated(&self) -> Result<(Profile, Option<ModelSelection>), String> {
+        let model = self.model.as_str();
+        let mut profile = self.profile.clone();
+        if self.remove {
+            if !profile.remove_model(model) {
+                return Err("This model is not saved on the connection".into());
+            }
+            return Ok((profile, None));
+        }
+        profile
+            .add_model(model)
+            .map_err(|error| error.to_string())?;
+        let selection = self
+            .apply
+            .then(|| ModelSelection::new(profile.id.clone(), model))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        Ok((profile, selection))
     }
 }
 
@@ -277,25 +283,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn official_api_only_requires_a_key_and_chooses_the_recommended_model() {
+    fn official_api_accepts_an_empty_key_and_optional_model() {
         let mut form = ConnectionForm::new(ConnectionKind::OpenAiApi);
-        assert_eq!(form.fields(), &[SetupField::Key]);
-        assert_eq!(form.validated().unwrap_err(), "Enter an API key");
-        form.key = "secret".to_owned().into();
+        assert_eq!(form.fields(), &[SetupField::Key, SetupField::Model]);
         let (profile, selection) = form.validated().unwrap();
-        let selection = selection.unwrap();
         assert_eq!(profile.label, "OpenAI API");
         assert_eq!(profile.endpoint.base_url(), None);
-        assert!(
-            profile
-                .model_presets()
-                .iter()
-                .any(|preset| preset.recommended && preset.id == selection.model)
-        );
+        assert_eq!(selection, None);
+
+        form.model = "gpt-test".into();
+        let (profile, selection) = form.validated().unwrap();
+        assert_eq!(profile.models, vec!["gpt-test"]);
+        assert_eq!(selection.unwrap().model, "gpt-test");
     }
 
     #[test]
-    fn official_connections_are_singletons_and_manage_never_changes_the_model() {
+    fn official_connections_are_singletons_and_keep_saved_models() {
         let first = ConnectionForm::new(ConnectionKind::OpenAiApi);
         let second = ConnectionForm::new(ConnectionKind::OpenAiApi);
         assert_eq!(first.id, ProfileId::new("openai").unwrap());
@@ -307,16 +310,16 @@ mod tests {
             EndpointConfig::OpenAiResponses { base_url: None },
         )
         .unwrap();
-        let selection = ModelSelection::new(profile.id.clone(), "gpt-5.5").unwrap();
-        let mut edit = ConnectionForm::edit_selection(&profile, Some(selection)).unwrap();
+        let mut edit = ConnectionForm::edit_selection(&profile).unwrap();
         edit.key = "replacement-key".to_owned().into();
 
-        let (_, selection) = edit.validated().unwrap();
+        let (edited, selection) = edit.validated().unwrap();
         assert_eq!(selection, None);
+        assert_eq!(edited.models, profile.models);
     }
 
     #[test]
-    fn advanced_connection_edit_can_explicitly_switch_model() {
+    fn advanced_connection_edit_does_not_touch_models() {
         let profile = Profile::new(
             ProfileId::new("existing").unwrap(),
             "Existing",
@@ -325,17 +328,17 @@ mod tests {
             },
         )
         .unwrap();
-        let current = ModelSelection::new(profile.id.clone(), "old-model").unwrap();
-        let mut edit = ConnectionForm::edit_selection(&profile, Some(current.clone())).unwrap();
-        assert!(edit.fields().contains(&SetupField::Model));
-        assert_eq!(edit.validated().unwrap().1, None);
-
-        edit.model = "new-model".into();
-        assert!(edit.changes_model());
+        let edit = ConnectionForm::edit_selection(&profile).unwrap();
         assert_eq!(
-            edit.validated().unwrap().1,
-            Some(ModelSelection::new(profile.id, "new-model").unwrap())
+            edit.fields(),
+            &[
+                SetupField::Label,
+                SetupField::BaseUrl,
+                SetupField::Key,
+                SetupField::Model,
+            ]
         );
+        assert_eq!(edit.validated().unwrap().1, None);
     }
 
     #[test]
@@ -348,26 +351,72 @@ mod tests {
             },
         )
         .unwrap();
-        let edit = ConnectionForm::edit_selection(&profile, None).unwrap();
+        let edit = ConnectionForm::edit_selection(&profile).unwrap();
 
-        assert!(edit.model.is_empty());
-        assert!(!edit.changes_model());
+        assert!(edit.models.is_empty());
         assert_eq!(edit.validated().unwrap().1, None);
     }
 
     #[test]
-    fn advanced_connection_requires_explicit_url_and_model() {
+    fn advanced_connection_requires_explicit_url_but_not_a_model() {
         let mut form = ConnectionForm::new(ConnectionKind::CustomOpenAiResponses);
-        form.key = "secret".to_owned().into();
         assert_eq!(form.validated().unwrap_err(), "Enter the service URL");
         form.base_url = "https://example.invalid/v1".into();
-        assert!(form.validated().is_err());
-        form.model = "custom-model".into();
         assert!(form.validated().is_ok());
     }
 
     #[test]
-    fn endpoint_change_requires_a_fresh_key() {
+    fn model_form_adds_and_validates_one_model() {
+        let profile = Profile::new(
+            ProfileId::new("custom").unwrap(),
+            "Custom",
+            EndpointConfig::OpenAiResponses {
+                base_url: Some("http://127.0.0.1:8080/v1".into()),
+            },
+        )
+        .unwrap();
+        let mut form = ModelForm::new(profile.clone());
+        assert!(form.validated().is_err());
+        form.model = "model-a".into();
+        let (saved, selection) = form.validated().unwrap();
+        assert_eq!(saved.models, vec!["model-a"]);
+        assert_eq!(selection.unwrap().model, "model-a");
+        let mut duplicate = profile;
+        duplicate.add_model("model-a").unwrap();
+        let mut form = ModelForm::new(duplicate);
+        form.model = "model-a".into();
+        assert!(form.validated().is_err());
+
+        let mut invalid = ModelForm::new(saved.clone());
+        invalid.model = " model-b ".into();
+        assert!(invalid.validated().is_err());
+
+        let mut catalog_only = ModelForm::new(saved);
+        catalog_only.model = "model-b".into();
+        catalog_only.apply = false;
+        let (_, selection) = catalog_only.validated().unwrap();
+        assert_eq!(selection, None);
+    }
+
+    #[test]
+    fn model_form_removes_a_saved_model_without_changing_runtime_selection() {
+        let mut profile = Profile::new(
+            ProfileId::new("custom").unwrap(),
+            "Custom",
+            EndpointConfig::OpenAiResponses {
+                base_url: Some("http://127.0.0.1:8080/v1".into()),
+            },
+        )
+        .unwrap();
+        profile.add_model("model-a").unwrap();
+        let form = ModelForm::remove(profile, "model-a");
+        let (saved, selection) = form.validated().unwrap();
+        assert!(saved.models.is_empty());
+        assert_eq!(selection, None);
+    }
+
+    #[test]
+    fn endpoint_change_keeps_an_optional_key_optional() {
         let profile = Profile::new(
             ProfileId::new("existing").unwrap(),
             "Existing",
@@ -376,12 +425,9 @@ mod tests {
             },
         )
         .unwrap();
-        let mut edited = ConnectionForm::edit_selection(&profile, None).unwrap();
+        let mut edited = ConnectionForm::edit_selection(&profile).unwrap();
         assert!(edited.edits_existing_connection());
         edited.base_url = "https://new.example/v1".into();
-        assert_eq!(
-            edited.validated().unwrap_err(),
-            "Endpoint changed: enter an API key for the new endpoint"
-        );
+        assert!(edited.validated().is_ok());
     }
 }
