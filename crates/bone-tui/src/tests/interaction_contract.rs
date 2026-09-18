@@ -76,9 +76,9 @@ fn fixture() -> UiState {
     state
 }
 
-fn chatgpt_add_panel(state: &mut UiState) {
+fn chatgpt_kind_panel(state: &mut UiState) {
     let mut models = ModelPanel::new(state.selected);
-    models.screen = ModelScreen::Add { selected: 0 };
+    models.screen = ModelScreen::Kind { selected: 0 };
     models.profiles.push(bone_app::Profile::chatgpt());
     models.choices.push(ModelChoice {
         selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), "gpt-test")
@@ -442,7 +442,7 @@ fn model_panel_has_one_keyboard_truth_and_an_independent_pointer_route() {
 #[test]
 fn model_panel_selection_style_follows_keyboard_ownership() {
     let mut state = fixture();
-    chatgpt_add_panel(&mut state);
+    chatgpt_kind_panel(&mut state);
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let mut snapshot = None;
     terminal

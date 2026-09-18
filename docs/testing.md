@@ -56,25 +56,27 @@ Runtime 单元测试位于 [`runtime.rs`](../crates/bone-core/src/runtime.rs)，
 普通 unit tests 与实现放在同一模块，证明 BONE 自己的转换和算法：
 
 - `EndpointConfig`、`ModelOptions`、Request validation 和身份 / secret redaction；
-- replay、tool correlation、terminal Response 和 stream state machine；
+- terminal Response、stream state machine 和模型调用只走 streaming 的边界；
 - read / glob / grep 的 path、UTF-8、ignore、binary、遍历与输出 limits；
 - apply_patch grammar、context matching、stage / commit / rollback 和 concurrent change；
 - Bash deadline、stdout / stderr bound、environment 与 Unix process-group cleanup。
 
 这层允许真实临时目录、文件和子进程，因为它们正是工具的生产依赖。测试完成后不得访问 workspace 外部状态或依赖用户 shell 配置。
 
+`Model::stream` 是唯一的模型调用入口，这条边界由三层固定：`llm/model.rs` 只把 Rig 的 `stream` 擦除进 `Model`（`exposes_one_bone_completion_path` 证明一次 BONE 调用只触发一次 provider 调用并恰好得到一个 terminal，`incomplete_stream_is_an_explicit_terminal_error` 证明没有 terminal 的 EOF 是显式 `IncompleteStream`）；`llm/protocol/` 的三个 constructor 通过 test-only `ScriptedStreamingClient` 回放 SSE fixture，断言真实 method、URL、headers 与 body；`agent/model.rs::streamed_text_is_reported_as_bounded_progress_records` 证明 delta 只合并成有界的进度记录，决策仍来自 terminal Response。`Request` 只带 BONE 真正发送的字段：`agent/model.rs::request_carries_the_bound_contract_specific_choice_and_configured_options` 核对强制 submission tool 与已验证 options，provider contracts 用 `body["max_tokens"].is_null()` / `body["max_output_tokens"].is_null()` 固定「调用方没有设置的上限就不上线」。replay 面不存在：`InputItem` 只有带来源归属的文本一种形态，协议层也没有把响应转回输入的入口，因此测试不再构造 tool result 或跨轮身份核对场景。
+
 Provider contracts 位于 [`crates/bone-adapters/tests/`](../crates/bone-adapters/tests/)，fixture 位于 [`fixtures/`](../crates/bone-adapters/tests/fixtures/)，共享 recording transport 位于 [`support/`](../crates/bone-adapters/tests/support/)。
 
 | Contract | 覆盖范围 |
 | --- | --- |
 | `model_contract.rs` | endpoint、protocol、model identity 和公开边界 |
-| `openai_responses_contract.rs` | `/responses`、headers、reasoning、tools、replay、SSE terminal、usage 与错误 |
-| `openai_chat_completions_contract.rs` | `/chat/completions`、tools、replay、SSE terminal、usage 与错误 |
+| `openai_responses_contract.rs` | `/responses`、headers、reasoning、tools、SSE terminal、usage 与错误 |
+| `openai_chat_completions_contract.rs` | `/chat/completions`、tools、SSE terminal、usage 与错误 |
 | `anthropic_messages_contract.rs` | `/v1/messages`、thinking / text、tools、SSE terminal、cache usage 与错误 |
-| `chatgpt_subscription_contract.rs` | Codex Responses URL、auth / headers、forced SSE/body、replay、identity 与 redaction |
+| `chatgpt_subscription_contract.rs` | Codex Responses URL、auth / headers、forced SSE/body、identity 与 redaction |
 | `tools_configuration.rs` | ToolEnvironment defaults、serialized limit 和 workspace configuration |
 
-Request JSON 按解析后的语义比较，不把对象 key 顺序当契约。fixture 只保存稳定的 provider 输入输出，不包含 real token、device code、OAuth payload 或完整生产错误。test transport 只补 Rig test doubles 没有记录的 metadata，并且只在 `test-utils` feature 下编译。
+Request JSON 按解析后的语义比较，不把对象 key 顺序当契约。fixture 只保存稳定的 provider 输入输出，不包含 real token、device code、OAuth payload 或完整生产错误。test transport 只补 Rig test doubles 没有记录的 metadata，并且只在 `test-utils` feature 下编译；它只服务流式路径，unary 调用直接失败，而不是被一个空的成功 body 掩盖。
 
 Provider contract 不测试 BONE 生产路径没有启用的 Rig option，也不复制验证第三方内部实现。需要兼容差异时，先用一个离线 fixture 复现，再添加最小 typed option。
 
@@ -92,7 +94,8 @@ App tests 使用临时 data directory、真实 `bone.sqlite3`、真实 journal /
 - Runtime ID 对 stale Job / Call / Question control 的隔离；
 - Runtime Record 归档、存储失败后重放以及 restart 的 Interrupted / Queued 区分；
 - 写入前记录、Workspace gate、未知写阻塞、核查、close 与 shutdown 报告；
-- profile、API-key slot，以及 ChatGPT cache 的跨进程 refresh / invalidate / logout 事务。
+- profile、API-key slot，以及 ChatGPT cache 的跨进程 refresh / invalidate / logout 事务；
+- 删除连接：不存在的 id 返回 `Ok` 且不产生第二份事实，只移除指定连接并保持其余顺序，ChatGPT cache 随删除一起清掉，仍选择它的 Session 报告 `ConfigProblem::MissingProfile` 并保留原选择。见 `tests.rs::deleting_a_profile_rewrites_the_config_and_keeps_the_others_in_order`、`deleting_an_unsaved_profile_is_a_noop_that_leaves_the_config_alone`、`deleting_a_chatgpt_profile_drops_its_cached_credentials`、`deleting_a_profile_leaves_selecting_sessions_reporting_a_missing_profile`，以及 `file_config.rs::delete_profile_rewrites_the_file_and_keeps_the_remaining_order`、`delete_profile_is_idempotent_for_an_unsaved_id`、`deleting_an_unsaved_profile_does_not_create_the_config_file`。
 
 CAS 并发测试必须让所有 contender 使用同一个初始 revision，并用 barrier 同时起跑；断言严格一个成功、其余为 conflict，再读取最终 value。测试生产查询时要调用真实生产方法，不能复制一份 SQL 后只证明那份测试 SQL 正确。
 
@@ -111,7 +114,29 @@ happy path helper 必须返回并核对具体 outcome。`Completed` 场景不能
 
 这些场景不应塞进每次毫秒级 unit suite。崩溃测试使用独立 helper process 和临时目录；长会话先作为显式 measurement，建立稳定环境和阈值后再决定是否进 CI。
 
-TUI 自身随后增加三类测试：纯 reducer 状态表、宽 / 窄布局 snapshot，以及用真实 App test backend 驱动的少量交互链路。PTY 门禁还必须覆盖初始化查询和正常运行中的终端 EOF，以及草稿保存失败或超时后的不可逆退出与终端恢复。终端字节解析与 Agent 业务不变量不在 TUI 重测。
+TUI 自身随后增加三类测试：纯 reducer 状态表、宽 / 窄布局 snapshot，以及用真实 App test backend 驱动的少量交互链路。PTY 门禁还必须覆盖初始化查询和正常运行中的终端 EOF（`pty_terminal.rs::closing_the_terminal_during_initialization_or_input_exits`），以及草稿保存失败或超时后的不可逆退出与终端恢复（`pty_terminal.rs::draft_failure_or_timeout_never_reopens_the_ui_after_quit`）。终端字节解析与 Agent 业务不变量不在 TUI 重测。
+
+`/model` 面板是「连接 = tab」结构，契约测试至少覆盖下表条目；键位列就是 [`tui-platform-architecture.md`](tui-platform-architecture.md) 5.6 节冻结键位表的可执行版本：
+
+| 契约 | 断言 | 位置 |
+| --- | --- | --- |
+| tab 条只列已保存连接 | 打开面板时 tab 条等于已保存 `Profile` 加末尾 `+ Add connection`；未保存的连接类型不占 tab，只在 kind picker 里出现 | `state/overlay.rs::the_tab_strip_walks_connections_and_clamps_at_the_add_tab`、`the_add_tab_has_no_models_and_its_last_row_opens_the_kind_picker` |
+| tab 开窗与裁剪 | 当前 tab 始终在窗口内且可点；单个 label 比整条更宽时被裁剪而不是丢弃 | `view/overlay.rs::every_connection_and_the_add_tab_own_a_click_target`、`a_windowed_strip_keeps_the_current_tab_visible`、`a_label_wider_than_the_strip_is_clipped_and_still_clickable` |
+| 左右 / 上下分工 | 左右只在 Tab 屏产生 `PreviousTab` / `NextTab` 并在两端 clamp；上下的行移动在 Tab、Kind 与 Reasoning 保留 | `input/keymap.rs::tab_arrows_move_between_connections_only_on_the_tab_screen`、`the_tab_screen_keeps_the_vertical_row_keys`、`the_kind_picker_keeps_one_vertical_route_to_every_connection_kind` |
+| tab 内的模型可见性 | 每个 tab 只展示属于它的模型：目录项在前，连接自己保存但目录未发布的模型在后，且不会串到相邻 tab | `state/overlay.rs::a_stale_connection_never_shows_a_manual_model_from_another_connection`、`a_reload_keeps_the_tab_inside_the_strip_and_lands_a_new_connection_on_its_own_tab` |
+| 末行手工输入 | 末行 Enter 进 `ModelInput`；`ModelText` / `ModelBackspace` / `ModelClear` 只作用于当前 tab，空白输入只报 status，合法 ID 才变成 `ModelSelection` | `state/overlay.rs::the_manual_model_editor_belongs_to_the_current_tab`；`input/keymap.rs::the_manual_model_editor_mirrors_the_form_keys`；`view/connection.rs::the_manual_model_editor_shows_its_value_and_an_apply_action` |
+| `e` 与 `d` 只作用于连接 | add tab 上没有编辑器动作；`e` 进 Setup（ChatGPT 进 Login）；`d` 进 `ConfirmDelete` | `state/overlay.rs::the_add_tab_has_nothing_to_edit_or_delete`、`editing_a_chatgpt_tab_restarts_sign_in_without_a_form`；`input/keymap.rs::connection_editing_keys_stay_out_of_text_fields` |
+| 删除确认 | `ConfirmDelete` 只接受 `y` / `n` / Esc；确认后对话框立即关闭并恰好记一次 `ModelOperationKind::Delete`，第二次确认与 Esc 都被拒绝，迟到回报按 `request` 丢弃 | `state/overlay.rs::a_confirmed_delete_records_its_request_and_closes_the_dialog`；`input/keymap.rs::delete_confirmation_answers_yes_no_or_escape`；`view/connection.rs::the_delete_confirmation_names_the_connection_and_offers_y_and_n` |
+| 删除结果 | 成功回 Tab 第一行并重新加载目录；失败只留一条面板 status，面板随即恢复可用 | `state/overlay.rs::a_failed_delete_stays_visible_and_leaves_the_panel_usable`；`view/overlay.rs::a_pending_delete_names_itself_and_keeps_the_strip` |
+| 移除已保存模型 | `Delete` 只移除连接保存过的模型；目录里出现但连接没保存过的模型没有可移除对象，只报 status | `state/overlay.rs::a_saved_model_is_removed_from_its_tab_and_the_strip_reloads`、`a_model_the_connection_never_saved_cannot_be_removed`；`view/connection.rs::the_removal_form_only_offers_removal` |
+| reasoning 门禁 | ChatGPT 订阅与 OpenAI Responses 的连接在选中模型或保存带模型的连接时先开 `Reasoning`，其余协议直接应用 | `state/overlay.rs::selecting_a_responses_model_opens_reasoning_before_apply`、`saving_a_connection_with_a_responses_model_chooses_reasoning_first` |
+| 已连接类型不重复索要凭据 | kind picker 标注 `Already connected · opens its tab`，选择它跳到已有 tab 而不重开表单 | `state/overlay.rs::choosing_a_saved_official_kind_opens_its_tab_instead_of_asking_again`；`view/connection.rs::the_kind_picker_names_a_connection_that_already_has_a_tab` |
+| 添加与登录 | 从 add tab 走完 form 或登录后回到 tab 条并重新加载目录；失败的表单保留输入并要求重输密钥 | `state/overlay.rs::adding_a_connection_from_the_add_tab_returns_to_the_tab_strip`、`the_kind_picker_starts_chatgpt_login_without_inventing_a_model`、`signing_in_returns_to_the_tab_strip_and_reloads_the_strip`、`saved_key_failure_returns_to_models_without_requesting_the_secret_again`；`view/connection.rs::failed_key_save_prompts_reentry_instead_of_suggesting_blank`、`pending_save_shows_progress_without_an_action_or_caret` |
+| 迟到回执 | 只有匹配当前在途操作的回执才生效：切换 Session 或重开面板后到达的 load / save / login 回执必须同时匹配 session 与 request，delete 回执按 request + kind 结算自己的 pending；不匹配的回执不改状态 | `state/overlay.rs::stale_load_receipts_cannot_finish_or_mutate_a_reopened_panel`、`late_connection_receipt_preserves_a_new_form_and_its_status`、`cancelled_login_reloads_saved_catalogue_and_rejects_its_late_receipt`、`session_switch_dismisses_login_without_changing_focus` |
+| secret 边界 | API key 只经 `SecretText`（`Debug` 输出 `[redacted]`）进入 `SetupText`，model ID 是普通 `String` | `view/connection.rs::connection_form_masks_key_and_keeps_all_fields_and_actions_inside_small_screens`；`input/mod.rs::setup_keyboard_ownership_controls_fields_and_secret_paste`、`connection_form_keys_and_paste_use_secret_safe_actions`、`command_chords_do_not_become_model_text`；`input/keymap.rs::the_manual_model_editor_mirrors_the_form_keys`；`state/connection.rs` 的 `SecretText` |
+| 键盘与指针一致 | 点击直接派发该行的 action 但不夺取键盘所有权；键盘仍在 workspace 时打字与粘贴进 Composer，未修饰 Enter 或 `F6` 才把所有权交给面板，两条路径产生同一个 `Effect` | `tests/interaction_contract.rs::model_panel_has_one_keyboard_truth_and_an_independent_pointer_route`、`mouse_model_overlays_keep_input_visible_and_controls_within_their_surface`；`input/mod.rs::mouse_panel_keeps_typing_and_paste_in_composer_until_f6` |
+
+keymap 表在 `input/keymap.rs` 中按屏幕逐格断言「有 action / 返回 `None`」，不复制 reducer 逻辑：左右键在 ModelInput、Kind、Setup、Reasoning、ConfirmDelete、Login 上都必须是 `None`，`y` / `n` / `d` / `e` 只在各自允许的屏幕生效，并拒绝带修饰符的近似按键。
 
 ## 断言与替身规范
 

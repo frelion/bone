@@ -26,8 +26,7 @@ async fn openai_chat_completions_live_certification() {
                 InputSource::User,
                 "Reply with one short greeting.",
             )])
-            .instructions("Be concise.")
-            .max_output_tokens(64),
+            .instructions("Be concise."),
         )
         .await
         .expect("OpenAI Chat Completions request should succeed");

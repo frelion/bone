@@ -433,6 +433,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_keeps_every_saved_model_of_a_connection_visible() {
+        let root = tempfile::tempdir().unwrap();
+        let app = App::open(AppOptions::isolated(root.path().join("data")))
+            .await
+            .unwrap();
+        let workspace = app.open_workspace(root.path()).await.unwrap();
+        let mut custom = Profile::new(
+            ProfileId::new("custom-api").unwrap(),
+            "Custom API",
+            bone_app::EndpointConfig::OpenAiResponses {
+                base_url: Some("https://example.invalid/v1".into()),
+            },
+        )
+        .unwrap();
+        // A model typed on the connection's tab and one saved in its form: both
+        // belong to that connection's tab even though no scope selects them.
+        custom.add_model("manual-model").unwrap();
+        custom.add_model("second-model").unwrap();
+        app.save_profile(custom.clone()).await.unwrap();
+
+        let choices = load(&app, workspace.id, None).await.unwrap();
+        for model in ["manual-model", "second-model"] {
+            let choice = choices
+                .iter()
+                .find(|choice| choice.selection.model == model)
+                .unwrap_or_else(|| panic!("{model} must stay visible on its connection"));
+            assert_eq!(choice.selection.profile, custom.id);
+        }
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn load_keeps_a_coordinator_only_custom_model_visible() {
         let root = tempfile::tempdir().unwrap();
         let app = App::open(AppOptions::isolated(root.path().join("data")))

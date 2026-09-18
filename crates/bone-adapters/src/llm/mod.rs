@@ -1,8 +1,8 @@
 //! One model interface over explicit LLM protocol endpoints.
 //!
 //! The public boundary is deliberately small: select a [`Model`], build one
-//! ordered [`Request`], then call [`Model::complete`] or [`Model::stream`].
-//! Provider clients and wire-specific request types stay behind that boundary.
+//! ordered [`Request`], then call [`Model::stream`]. Provider clients and
+//! wire-specific request types stay behind that boundary.
 
 #![forbid(unsafe_code)]
 
@@ -28,15 +28,13 @@ pub use item::{InputItem, InputSource};
 pub use model::Model;
 pub use output::OutputItem;
 pub use protocol::Protocol;
-pub use request::{OutputFormat, Request};
+pub use request::Request;
 pub use response::{FinishReason, Response, ResponseOrigin, Usage};
 pub use streaming::{ResponseStream, StreamEvent, ToolCallDelta};
-pub use tool::{ToolCall, ToolChoice, ToolDefinition, ToolOutput};
+pub use tool::{ToolCall, ToolDefinition, ToolOutput};
 
 #[cfg(test)]
-pub(crate) use model::{RequestOrigin, RequestSupport};
-#[cfg(test)]
-pub(crate) use tool::ToolCallIdentities;
+pub(crate) use model::RequestOrigin;
 
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]

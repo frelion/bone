@@ -19,11 +19,11 @@ use crate::{
     AcceptanceRequestId, AcceptanceSubmission, AttentionItem, CallRef, ConfigChange, ConfigScope,
     EvidenceAvailability, EvidenceCursor, EvidencePage, EvidenceRef, EvidenceSourceKind,
     EvidenceSummary, HistoryCursor, HistoryEntry, HistoryPage, InputId, InputState, InputView,
-    JobRef, Profile, QuestionId, RecentHistoryPage, RequestId, ResultArtifact, ResultPage,
-    ResultRef, ResultSummary, RuntimeConfig, RuntimeId, RuntimeOverrides, RuntimeSettings,
-    SessionEvent, SessionId, SessionInfo, SessionSeq, SessionSummary, SubmissionReceipt,
-    SubmitInput, UnresolvedWriteStatus, UnresolvedWriteView, WorkspaceId, WorkspaceInfo,
-    WorkspaceOverview, WriteResolution,
+    JobRef, Profile, ProfileId, QuestionId, RecentHistoryPage, RequestId, ResultArtifact,
+    ResultPage, ResultRef, ResultSummary, RuntimeConfig, RuntimeId, RuntimeOverrides,
+    RuntimeSettings, SessionEvent, SessionId, SessionInfo, SessionSeq, SessionSummary,
+    SubmissionReceipt, SubmitInput, UnresolvedWriteStatus, UnresolvedWriteView, WorkspaceId,
+    WorkspaceInfo, WorkspaceOverview, WriteResolution,
     storage::{
         BoneStore, DocumentKey, Journal, JournalAppend, JournalKey, Lease, LeaseKey,
         MAX_JOURNAL_ENTRY_BYTES, Revision, StoreError, StoreRoots, WriteTransaction,
@@ -3228,6 +3228,10 @@ impl DataStore {
 
     pub fn save_profile(&self, profile: Profile) -> Result<(), StoreError> {
         self.configs.save_profile(profile)
+    }
+
+    pub fn delete_profile(&self, profile: &ProfileId) -> Result<(), StoreError> {
+        self.configs.delete_profile(profile)
     }
 
     pub fn project_config_status(

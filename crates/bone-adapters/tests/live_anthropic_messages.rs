@@ -26,8 +26,7 @@ async fn anthropic_messages_live_smoke() {
                 InputSource::User,
                 "Reply with exactly: ok",
             )])
-            .instructions("Be concise and follow the requested output exactly.")
-            .max_output_tokens(32),
+            .instructions("Be concise and follow the requested output exactly."),
         )
         .await
         .expect("Anthropic Messages request should succeed");

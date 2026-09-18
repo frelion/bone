@@ -44,20 +44,20 @@ pub(crate) fn terminal_event(
         Event::Mouse(mouse) => pointer::action(mouse, snapshot, state),
         Event::Resize(_, _) => return Some(UiEvent::Resized),
         Event::Paste(text) => match state.keyboard {
-            KeyboardOwner::Overlay { .. }
-                if matches!(
-                    &state.overlay,
-                    Some(crate::state::Overlay::Models(models))
-                        if matches!(
-                            &models.screen,
-                            crate::state::ModelScreen::Setup(_)
-                                | crate::state::ModelScreen::ModelForm(_)
-                        )
-                ) =>
-            {
-                Some(Action::SetupText(text.into()))
-            }
-            KeyboardOwner::Overlay { .. } => None,
+            KeyboardOwner::Overlay { .. } => match &state.overlay {
+                Some(crate::state::Overlay::Models(models)) => match &models.screen {
+                    crate::state::ModelScreen::Setup(_)
+                    | crate::state::ModelScreen::ModelForm(_) => {
+                        Some(Action::SetupText(text.into()))
+                    }
+                    // A model identifier is long and is normally copied from
+                    // provider documentation, so the manual model editor
+                    // accepts a paste. It is not a secret, so it stays plain.
+                    crate::state::ModelScreen::ModelInput { .. } => Some(Action::ModelText(text)),
+                    _ => None,
+                },
+                _ => None,
+            },
             KeyboardOwner::Workspace(target) => {
                 let target = match target {
                     WorkspaceTarget::SessionTitle => EditorTarget::SessionTitle,
@@ -136,8 +136,8 @@ fn model_panel(screen: crate::state::ModelScreen) -> crate::state::Overlay {
 }
 
 #[cfg(test)]
-fn model_list_panel() -> crate::state::Overlay {
-    model_panel(crate::state::ModelScreen::List { selected: 0 })
+fn model_tab_panel() -> crate::state::Overlay {
+    model_panel(crate::state::ModelScreen::Tab { selected: 0 })
 }
 
 #[cfg(test)]
@@ -458,7 +458,7 @@ mod model_keyboard_tests {
     #[test]
     fn command_chords_do_not_become_model_text() {
         let mut state = UiState::default();
-        state.overlay = Some(model_list_panel());
+        state.overlay = Some(model_tab_panel());
         state.enter_overlay();
         for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
             assert!(
@@ -1182,7 +1182,7 @@ mod input_chord_tests {
             assert!(test_key_action(clear, &state).is_none());
         }
         state.set_workspace_target(WorkspaceTarget::Composer);
-        for panel in [model_list_panel(), Overlay::Help, model_setup_panel()] {
+        for panel in [model_tab_panel(), Overlay::Help, model_setup_panel()] {
             state.overlay = Some(panel);
             state.enter_overlay();
             assert!(test_key_action(clear, &state).is_none());
@@ -1255,7 +1255,7 @@ mod input_chord_tests {
             );
         }
         state.set_workspace_target(WorkspaceTarget::Composer);
-        for panel in [model_list_panel(), Overlay::Help, model_setup_panel()] {
+        for panel in [model_tab_panel(), Overlay::Help, model_setup_panel()] {
             state.overlay = Some(panel);
             state.enter_overlay();
             for modifiers in [
@@ -1303,7 +1303,7 @@ mod input_chord_tests {
                 .is_none()
             );
         }
-        for panel in [model_list_panel(), Overlay::Help, model_setup_panel()] {
+        for panel in [model_tab_panel(), Overlay::Help, model_setup_panel()] {
             state.overlay = Some(panel);
             state.enter_overlay();
             assert!(matches!(

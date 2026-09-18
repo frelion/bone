@@ -1,5 +1,5 @@
 event: message_start
-data: {"type":"message_start","message":{"id":"msg_thinking_1","type":"message","role":"assistant","content":[],"model":"claude-test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"cache_creation_input_tokens":9,"cache_read_input_tokens":4,"output_tokens":0,"cache_creation":{"ephemeral_1h_input_tokens":6,"ephemeral_5m_input_tokens":3}}}}
+data: {"type":"message_start","message":{"id":"msg_thinking_1","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":3,"cache_creation_input_tokens":9,"cache_read_input_tokens":4,"output_tokens":0,"cache_creation":{"ephemeral_1h_input_tokens":6,"ephemeral_5m_input_tokens":3}}}}
 
 event: content_block_start
 data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}

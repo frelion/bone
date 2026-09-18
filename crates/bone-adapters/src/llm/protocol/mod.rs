@@ -6,6 +6,9 @@ pub mod anthropic_messages;
 pub mod openai_chat_completions;
 pub mod openai_responses;
 
+#[cfg(test)]
+pub(crate) mod test_client;
+
 /// The wire contract used for requests, responses, and streaming events.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

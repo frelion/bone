@@ -21,8 +21,7 @@ use std::{
 };
 
 use crate::llm::{
-    ConfigError, Endpoint, Protocol, error::validate_endpoint_id, model::RequestSupport,
-    protocol::no_redirect_http_client,
+    ConfigError, Endpoint, Protocol, error::validate_endpoint_id, protocol::no_redirect_http_client,
 };
 
 /// A redacted ChatGPT subscription service failure.
@@ -134,12 +133,9 @@ pub fn connect_cached(endpoint_id: impl Into<String>, auth_file: &Path) -> Resul
         .build()
         .map_err(|_| Error::InvalidClientConfiguration)?;
 
-    Endpoint::from_model_factory_with_support(
-        endpoint_id,
-        Protocol::OpenAiResponses,
-        RequestSupport::CHATGPT_SUBSCRIPTION,
-        move |model_id| client.completion_model(model_id).with_strict_tools(),
-    )
+    Endpoint::from_model_factory(endpoint_id, Protocol::OpenAiResponses, move |model_id| {
+        client.completion_model(model_id).with_strict_tools()
+    })
     .map_err(Into::into)
 }
 
@@ -160,12 +156,9 @@ where
         + Sync
         + 'static,
 {
-    Endpoint::from_model_factory_with_support(
-        endpoint_id,
-        Protocol::OpenAiResponses,
-        RequestSupport::CHATGPT_SUBSCRIPTION,
-        move |model_id| client.completion_model(model_id).with_strict_tools(),
-    )
+    Endpoint::from_model_factory(endpoint_id, Protocol::OpenAiResponses, move |model_id| {
+        client.completion_model(model_id).with_strict_tools()
+    })
 }
 
 /// Remove cached authorization using the refresh transaction lock.

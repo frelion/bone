@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ConfigChange, ConfigScope, Profile, RuntimeOverrides, WorkspaceId, WorkspaceInfo,
+    ConfigChange, ConfigScope, Profile, ProfileId, RuntimeOverrides, WorkspaceId, WorkspaceInfo,
     config::RuntimeSettings,
     safe_file::{self, SafeFileError},
     storage::StoreError,
@@ -320,6 +320,39 @@ impl FileConfigs {
             Some(current) => *current = profile,
             None => next.profiles.push(profile),
         }
+        validate_user(&next)?;
+        let digest = write_private_toml(&path, &next)?;
+        state.user = Loaded {
+            value: next,
+            digest: Some(digest),
+        };
+        Ok(())
+    }
+
+    /// Remove one saved profile and rewrite the user configuration. Removing
+    /// an id that is not saved is a no-op that leaves the file untouched, so a
+    /// repeated delete never fails and never creates a configuration file.
+    pub(crate) fn delete_profile(&self, profile: &ProfileId) -> Result<(), StoreError> {
+        let path = self.bone_home.join("config.toml");
+        let lock_path = self.bone_home.join("config.lock");
+        let _lock = safe(
+            safe_file::lock_private_file(&lock_path),
+            "lock user configuration",
+            &lock_path,
+        )?;
+        let mut state = self.inner.lock().expect("file config mutex poisoned");
+        ensure_unchanged(&path, state.user.digest.as_deref())?;
+        if !state
+            .user
+            .value
+            .profiles
+            .iter()
+            .any(|item| item.id == *profile)
+        {
+            return Ok(());
+        }
+        let mut next = state.user.value.clone();
+        next.profiles.retain(|item| item.id != *profile);
         validate_user(&next)?;
         let digest = write_private_toml(&path, &next)?;
         state.user = Loaded {
@@ -696,6 +729,81 @@ mod tests {
                 .find(|item| item.id == profile.id),
             Some(profile)
         );
+    }
+
+    #[test]
+    fn delete_profile_rewrites_the_file_and_keeps_the_remaining_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join(".bone");
+        let configs = FileConfigs::open(home.clone()).unwrap();
+        let profiles = [
+            Profile::new(
+                ProfileId::new("first").unwrap(),
+                "First",
+                EndpointConfig::OpenAiResponses { base_url: None },
+            )
+            .unwrap(),
+            Profile::new(
+                ProfileId::new("second").unwrap(),
+                "Second",
+                EndpointConfig::OpenAiResponses { base_url: None },
+            )
+            .unwrap(),
+            Profile::chatgpt(),
+        ];
+        for profile in profiles.clone() {
+            configs.save_profile(profile).unwrap();
+        }
+        let path = home.join("config.toml");
+        let before = fs::read_to_string(&path).unwrap();
+
+        configs.delete_profile(&profiles[1].id).unwrap();
+
+        let expected = vec![profiles[0].clone(), profiles[2].clone()];
+        assert_eq!(configs.profiles(), expected);
+        let after = fs::read_to_string(&path).unwrap();
+        assert_ne!(after, before);
+        assert!(!after.contains("Second"));
+        assert!(after.contains("First"));
+        // A fresh reader observes the removal too: it is durable, not a view
+        // over in-memory state.
+        assert_eq!(FileConfigs::open(home).unwrap().profiles(), expected);
+    }
+
+    #[test]
+    fn delete_profile_is_idempotent_for_an_unsaved_id() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join(".bone");
+        let configs = FileConfigs::open(home.clone()).unwrap();
+        let saved = Profile::new(
+            ProfileId::new("saved").unwrap(),
+            "Saved",
+            EndpointConfig::OpenAiResponses { base_url: None },
+        )
+        .unwrap();
+        configs.save_profile(saved.clone()).unwrap();
+        let path = home.join("config.toml");
+        let before = fs::read(&path).unwrap();
+
+        let missing = ProfileId::new("missing").unwrap();
+        configs.delete_profile(&missing).unwrap();
+        configs.delete_profile(&missing).unwrap();
+
+        assert_eq!(configs.profiles(), vec![saved]);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn deleting_an_unsaved_profile_does_not_create_the_config_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join(".bone");
+        let configs = FileConfigs::open(home.clone()).unwrap();
+
+        configs
+            .delete_profile(&ProfileId::new("missing").unwrap())
+            .unwrap();
+
+        assert!(!home.join("config.toml").exists());
     }
 
     #[cfg(unix)]

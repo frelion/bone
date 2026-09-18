@@ -9,7 +9,7 @@ use rig_core::{
     wasm_compat::{WasmCompatSend, WasmCompatSync},
 };
 
-use crate::llm::{ConfigError, Endpoint, Error, ErrorKind, Model, Protocol, model::RequestSupport};
+use crate::llm::{ConfigError, Endpoint, Error, ErrorKind, Model, Protocol};
 
 pub fn error(kind: ErrorKind, message: impl Into<String>) -> Error {
     Error::new(kind, message)
@@ -72,11 +72,6 @@ pub fn chatgpt_model<M>(
 where
     M: CompletionModel + Clone + Send + Sync + 'static,
 {
-    let endpoint = Endpoint::from_model_factory_with_support(
-        endpoint_id,
-        protocol,
-        RequestSupport::CHATGPT_SUBSCRIPTION,
-        move |_| inner.clone(),
-    )?;
+    let endpoint = Endpoint::from_model_factory(endpoint_id, protocol, move |_| inner.clone())?;
     endpoint.model(model_id)
 }

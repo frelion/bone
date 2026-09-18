@@ -1,5 +1,5 @@
 use std::{
-    future::Future,
+    future::{self, Future},
     sync::{Arc, Mutex},
 };
 
@@ -9,54 +9,41 @@ use rig_core::{
         self, HeaderMap, HttpClientExt, LazyBody, Method, MultipartForm, Request, Response,
         StreamingResponse,
     },
-    test_utils::{CapturedHttpRequest, MockStreamingClient, RecordingHttpClient},
+    test_utils::{CapturedHttpRequest, MockStreamingClient},
     wasm_compat::WasmCompatSend,
 };
 
 /// Request metadata Rig's test doubles do not retain themselves.
+///
+/// Every integration test compiles this module separately, so a contract that
+/// asserts only on the URI leaves the other fields unread in its own binary.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct CapturedRequestMetadata {
     pub method: Method,
     pub uri: String,
     pub headers: HeaderMap,
 }
 
-/// A small integration-test transport composed from Rig's supported doubles.
+/// The shared transport for BONE's provider contracts.
 ///
-/// Unary request bodies are captured by [`RecordingHttpClient`]. This wrapper
-/// also records method metadata and streaming request bodies while letting the
-/// same concrete type serve SSE fixtures, so protocol constructors exercise
-/// their generic custom-transport path.
+/// Streaming is the only model-call mode, so this double serves the streaming
+/// path only: it records method metadata and request bodies while replaying one
+/// scripted SSE fixture, which lets a protocol constructor exercise its generic
+/// custom-transport path. A unary call is a test error, not an empty success.
 #[derive(Clone, Debug, Default)]
 pub struct ScriptedHttpClient {
-    unary: RecordingHttpClient,
     streaming: MockStreamingClient,
     metadata: Arc<Mutex<Vec<CapturedRequestMetadata>>>,
     streaming_requests: Arc<Mutex<Vec<CapturedHttpRequest>>>,
 }
 
 impl ScriptedHttpClient {
-    pub fn unary_json(body: &'static str) -> Self {
-        Self {
-            unary: RecordingHttpClient::new(body),
-            ..Self::default()
-        }
-    }
-
-    pub fn unary_error(status: &'static str, body: &'static str) -> Self {
-        Self {
-            unary: RecordingHttpClient::with_error_response(
-                status.parse().expect("test status must be valid"),
-                body,
-            ),
-            ..Self::default()
-        }
-    }
-
-    pub fn sse(body: &'static str) -> Self {
+    /// Serve `body` as the SSE response to every streaming request.
+    pub fn sse(body: impl AsRef<[u8]>) -> Self {
         Self {
             streaming: MockStreamingClient {
-                sse_bytes: body.as_bytes().to_vec().into(),
+                sse_bytes: body.as_ref().to_vec().into(),
             },
             ..Self::default()
         }
@@ -67,10 +54,6 @@ impl ScriptedHttpClient {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
-    }
-
-    pub fn unary_requests(&self) -> Vec<CapturedHttpRequest> {
-        self.unary.requests()
     }
 
     // Each integration test compiles this shared support module separately;
@@ -99,25 +82,27 @@ impl ScriptedHttpClient {
 impl HttpClientExt for ScriptedHttpClient {
     fn send<T, U>(
         &self,
-        request: Request<T>,
+        _request: Request<T>,
     ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
     where
         T: Into<Bytes> + WasmCompatSend,
         U: From<Bytes> + WasmCompatSend + 'static,
     {
-        self.record(&request);
-        self.unary.send(request)
+        future::ready(Err(http_client::Error::InvalidStatusCode(
+            http::StatusCode::NOT_IMPLEMENTED,
+        )))
     }
 
     fn send_multipart<U>(
         &self,
-        request: Request<MultipartForm>,
+        _request: Request<MultipartForm>,
     ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
     where
         U: From<Bytes> + WasmCompatSend + 'static,
     {
-        self.record(&request);
-        self.unary.send_multipart(request)
+        future::ready(Err(http_client::Error::InvalidStatusCode(
+            http::StatusCode::NOT_IMPLEMENTED,
+        )))
     }
 
     fn send_streaming<T>(

@@ -210,35 +210,21 @@ fn validate_api_key(api_key: &str) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use rig_core::test_utils::RecordingHttpClient;
+    use futures_util::StreamExt;
     use serde_json::json;
 
-    use crate::llm::{InputItem, InputSource, Request};
+    use crate::llm::{
+        InputItem, InputSource, Request, StreamEvent,
+        protocol::test_client::ScriptedStreamingClient,
+    };
 
     use super::*;
 
-    const TEXT_RESPONSE: &str = r#"{
-        "id":"resp_test_1",
-        "object":"response",
-        "created_at":0,
-        "status":"completed",
-        "model":"openai-test-model",
-        "usage":{
-            "input_tokens":1,
-            "input_tokens_details":{"cached_tokens":0},
-            "output_tokens":1,
-            "output_tokens_details":{"reasoning_tokens":0},
-            "total_tokens":2
-        },
-        "output":[{
-            "type":"message",
-            "id":"msg_test_1",
-            "status":"completed",
-            "role":"assistant",
-            "content":[{"type":"output_text","annotations":[],"text":"ok"}]
-        }],
-        "tools":[]
-    }"#;
+    const TEXT_STREAM: &str = r#"data: {"type":"response.output_text.delta","item_id":"msg_test_1","output_index":0,"content_index":0,"sequence_number":1,"delta":"ok"}
+
+data: {"type":"response.completed","sequence_number":2,"response":{"id":"resp_test_1","object":"response","created_at":0,"status":"completed","model":"openai-test-model","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"output":[{"type":"message","id":"msg_test_1","status":"completed","role":"assistant","content":[{"type":"output_text","annotations":[],"text":"ok"}]}],"tools":[]}}
+
+"#;
 
     #[test]
     fn builds_an_official_responses_endpoint_without_network_io() {
@@ -265,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn compatible_constructor_sets_the_real_wire_url_and_headers() {
-        let transport = RecordingHttpClient::new(TEXT_RESPONSE);
+        let transport = ScriptedStreamingClient::sse(TEXT_STREAM);
         let endpoint = compatible_with_http_client(
             "gateway-a",
             "test-only-key",
@@ -274,19 +260,32 @@ mod tests {
         )
         .unwrap();
 
-        endpoint
+        let mut stream = endpoint
             .model("openai-test-model")
             .unwrap()
-            .complete(
-                Request::new([InputItem::external(InputSource::User, "hello")])
-                    .max_output_tokens(8),
-            )
+            .stream(Request::new([InputItem::external(
+                InputSource::User,
+                "hello",
+            )]))
             .await
             .unwrap();
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            if matches!(event.unwrap(), StreamEvent::Completed(_)) {
+                completed = true;
+            }
+        }
+        assert!(
+            completed,
+            "the fixture stream must reach a terminal response"
+        );
 
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].uri, "https://gateway.example/v1/responses");
+        // BONE sends no output bound of its own.
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("max_output_tokens").is_none());
         assert_eq!(
             requests[0]
                 .headers

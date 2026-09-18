@@ -26,8 +26,7 @@ async fn openai_responses_live_certification() {
                 InputSource::User,
                 "Reply with one short greeting.",
             )])
-            .instructions("Be concise.")
-            .max_output_tokens(64),
+            .instructions("Be concise."),
         )
         .await
         .expect("OpenAI Responses request should succeed");

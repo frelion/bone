@@ -1,12 +1,22 @@
+use futures_util::StreamExt;
+
 use bone_core::{
-    CallContext, CallError, CallErrorKind, CheckpointDraft, CompactInput, ConversationInput,
-    ConversationStep, ModelPort, PortFuture, WorkInput, WorkProposal, model_contract,
+    CallContext, CallError, CallErrorKind, CallProgress, CheckpointDraft, CompactInput,
+    ConversationInput, ConversationStep, ModelPort, PortFuture, WorkInput, WorkProposal,
+    model_contract,
 };
 
 use crate::llm::{
-    InputItem, InputSource, Model, ModelOptions, ModelOptionsError, Request, Response, ToolChoice,
+    InputItem, InputSource, Model, ModelOptions, ModelOptionsError, Request, Response, StreamEvent,
     ToolDefinition,
 };
+
+/// How much streamed text to accumulate before reporting progress.
+///
+/// The kernel records every distinct progress value, so reporting each token
+/// would turn one model call into thousands of durable records. Coalescing to
+/// a short line keeps the live view responsive without that write volume.
+const PROGRESS_CHUNK_BYTES: usize = 48;
 
 /// A connected model with protocol-specific request defaults already checked.
 #[derive(Clone, Debug)]
@@ -108,17 +118,34 @@ where
     O: Send + 'static,
     F: FnOnce() -> Result<model_contract::ModelCall<O>, CallError> + Send + 'static,
 {
-    Box::pin(async move { execute(model, context.cancellation_requested(), contract).await })
+    Box::pin(async move {
+        let cancellation_requested = context.cancellation_requested();
+        execute(
+            model,
+            cancellation_requested,
+            |progress| {
+                context.report_progress(progress);
+            },
+            contract,
+        )
+        .await
+    })
 }
 
-async fn execute<O, F>(
+/// Execute one contract against the model and report streamed text for display.
+///
+/// Progress reporting is injected rather than read from a [`CallContext`] so
+/// the streaming loop stays testable without constructing a runtime context.
+async fn execute<O, F, R>(
     model: ConfiguredModel,
     cancellation_requested: bool,
+    report: R,
     contract: F,
 ) -> Result<O, CallError>
 where
     O: Send + 'static,
     F: FnOnce() -> Result<model_contract::ModelCall<O>, CallError> + Send + 'static,
+    R: Fn(CallProgress),
 {
     if cancellation_requested {
         return Err(cancelled());
@@ -139,16 +166,56 @@ where
         submission_description,
         submission_schema.clone(),
     )])
-    .tool_choice(ToolChoice::Specific(vec![submission_name.clone()]));
+    .require_tool(submission_name.clone());
     let request = model.apply_to(request);
-    let response = model.model().complete(request).await.map_err(|error| {
-        CallError::failed(format!(
-            "model request failed ({:?}): {error}",
-            error.kind()
-        ))
-    })?;
 
-    decode_response(contract, response)
+    // The stream is the only model-call mode. Deltas drive the live view
+    // through the call's existing progress channel; the terminal response is
+    // what the contract decodes, so a display-only failure never changes the
+    // decision.
+    let mut stream = model
+        .model()
+        .stream(request)
+        .await
+        .map_err(provider_failure)?;
+    let mut pending = String::new();
+    while let Some(event) = stream.next().await {
+        match event.map_err(provider_failure)? {
+            StreamEvent::TextDelta(text) | StreamEvent::ReasoningDelta(text) => {
+                pending.push_str(&text);
+                if pending.len() >= PROGRESS_CHUNK_BYTES {
+                    report_text(&report, std::mem::take(&mut pending));
+                }
+            }
+            StreamEvent::Completed(response) => {
+                report_text(&report, std::mem::take(&mut pending));
+                return decode_response(contract, response);
+            }
+            _ => {}
+        }
+    }
+    Err(CallError::failed(
+        "model stream ended without a complete response",
+    ))
+}
+
+/// Report streamed text for display. A dropped update is not an error: the
+/// terminal response still carries everything the model produced.
+fn report_text(report: &impl Fn(CallProgress), text: String) {
+    if text.is_empty() {
+        return;
+    }
+    report(CallProgress {
+        message: text,
+        percent: None,
+    });
+}
+
+fn provider_failure(error: crate::llm::Error) -> CallError {
+    CallError::failed(format!(
+        "model request failed ({:?}): {error}",
+        error.kind()
+    ))
 }
 
 fn decode_response<O>(
@@ -187,22 +254,26 @@ mod tests {
     use bone_core::{
         ConversationInput, ConversationStep, Input, InputId, SessionContext, model_contract,
     };
+    use futures_util::stream;
     use rig_core::{
         completion::{
             AssistantContent, CompletionError, CompletionModel, CompletionRequest,
             CompletionResponse, FinishReason, Usage,
         },
         message::{
-            Message, ToolCall as RigToolCall, ToolChoice as RigToolChoice, ToolFunction,
+            Message, Text, ToolCall as RigToolCall, ToolChoice as RigToolChoice, ToolFunction,
             UserContent,
         },
-        streaming::StreamingCompletionResponse,
+        streaming::{
+            RawStreamingChoice, RawStreamingToolCall, StreamFinal, StreamPartId,
+            StreamingCompletionResponse,
+        },
     };
     use serde_json::{Value, json};
 
     use super::*;
     use crate::llm::{
-        ModelOptions, Protocol, RequestOrigin, RequestSupport, ToolCallIdentities,
+        ModelOptions, Protocol, RequestOrigin,
         protocol::openai_responses::{Reasoning, ReasoningEffort},
     };
 
@@ -234,17 +305,19 @@ mod tests {
     impl CompletionModel for RecordingModel {
         async fn completion(
             &self,
-            request: CompletionRequest,
+            _request: CompletionRequest,
         ) -> Result<CompletionResponse, CompletionError> {
-            self.requests.lock().unwrap().push(request);
-            Ok(self.response.clone())
+            unreachable!("the agent adapter streams")
         }
 
+        /// Streaming is the agent's only model-call mode, so the double emits
+        /// its tool call as one complete stream item.
         async fn stream(
             &self,
-            _request: CompletionRequest,
+            request: CompletionRequest,
         ) -> Result<StreamingCompletionResponse, CompletionError> {
-            unreachable!("the agent adapter uses unary completion")
+            self.requests.lock().unwrap().push(request);
+            Ok(streaming_response(&self.response))
         }
     }
 
@@ -256,15 +329,56 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<CompletionResponse, CompletionError> {
-            Err(CompletionError::ProviderError("request rejected".into()))
+            unreachable!("the agent adapter streams")
         }
 
         async fn stream(
             &self,
             _request: CompletionRequest,
         ) -> Result<StreamingCompletionResponse, CompletionError> {
-            unreachable!("the agent adapter uses unary completion")
+            Ok(StreamingCompletionResponse::stream(
+                "test-provider",
+                Box::pin(stream::iter([Err(CompletionError::ProviderError(
+                    "request rejected".into(),
+                ))])) as rig_core::streaming::StreamingResult,
+            ))
         }
+    }
+
+    /// Replay a fixture response through a stream.
+    ///
+    /// The stream carries the same items a provider would, plus the terminal
+    /// record that lets it aggregate into a complete response. Without that
+    /// record the call would look truncated.
+    fn streaming_response(response: &CompletionResponse) -> StreamingCompletionResponse {
+        let mut items = response
+            .choice
+            .clone()
+            .into_iter()
+            .map(|item| {
+                Ok(match item {
+                    AssistantContent::Text(text) => RawStreamingChoice::Message(text.text),
+                    AssistantContent::ToolCall(call) => RawStreamingChoice::ToolCall(
+                        RawStreamingToolCall::new(
+                            StreamPartId::wire(call.id.as_str().to_owned()),
+                            call.function.name.clone(),
+                            call.function.arguments.clone(),
+                        )
+                        .with_call_id(call.id.as_str().to_owned()),
+                    ),
+                    other => panic!("the agent double only emits text and tool calls: {other:?}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut terminal = StreamFinal::new("test-provider", response.usage);
+        if let Some(reason) = response.finish_reason() {
+            terminal = terminal.with_finish_reason(reason.clone());
+        }
+        items.push(Ok(RawStreamingChoice::FinalResponse(terminal)));
+        // Rig's normalizer is what aggregates the items into the terminal
+        // response, so the double observes the same path a provider stream does.
+        let stream = rig_core::streaming::normalize_stream(Box::pin(stream::iter(items)), Ok);
+        StreamingCompletionResponse::stream("test-provider", stream)
     }
 
     fn model(protocol: Protocol) -> Model {
@@ -272,7 +386,6 @@ mod tests {
             Arc::from("test-endpoint"),
             protocol,
             Arc::from("test-model"),
-            RequestSupport::FULL,
             UnusedModel,
         )
     }
@@ -285,7 +398,6 @@ mod tests {
             Arc::from("test-endpoint"),
             Protocol::OpenAiResponses,
             Arc::from("test-model"),
-            RequestSupport::FULL,
             RecordingModel { requests, response },
         )
         .into()
@@ -345,7 +457,6 @@ mod tests {
                 model_id: Arc::from("test-model"),
             }),
             response,
-            ToolCallIdentities::default(),
         )
         .unwrap()
     }
@@ -381,9 +492,12 @@ mod tests {
             ),
         );
 
-        let error = execute::<ConversationStep, _>(model, true, || {
-            panic!("a pre-cancelled call must not construct its contract")
-        })
+        let error = execute::<ConversationStep, _, _>(
+            model,
+            true,
+            |_| {},
+            || panic!("a pre-cancelled call must not construct its contract"),
+        )
         .await
         .expect_err("a pre-cancelled call must stop locally");
 
@@ -397,13 +511,15 @@ mod tests {
             Arc::from("test-endpoint"),
             Protocol::OpenAiResponses,
             Arc::from("test-model"),
-            RequestSupport::FULL,
             FailingModel,
         ));
 
-        let error = execute(model, false, || {
-            model_contract::converse(conversation_input())
-        })
+        let error = execute(
+            model,
+            false,
+            |_| {},
+            || model_contract::converse(conversation_input()),
+        )
         .await
         .expect_err("provider failure must cross the port as a CallError");
 
@@ -443,9 +559,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = execute(model, false, move || model_contract::converse(input))
-            .await
-            .unwrap();
+        let result = execute(
+            model,
+            false,
+            |_| {},
+            move || model_contract::converse(input),
+        )
+        .await
+        .unwrap();
         assert_eq!(result, decision);
 
         let mut requests = requests.lock().unwrap();
@@ -482,6 +603,51 @@ mod tests {
             },
             other => panic!("expected serialized agent context, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn streamed_text_is_reported_as_bounded_progress_records() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        // Three deltas: two that fill a progress chunk each, and a short tail
+        // that must still be reported when the terminal response arrives.
+        let parts = [PROGRESS_CHUNK_BYTES, PROGRESS_CHUNK_BYTES, 1].map(|len| "x".repeat(len));
+        let response = CompletionResponse::new(
+            parts
+                .iter()
+                .cloned()
+                .map(|part| AssistantContent::Text(Text::new(part)))
+                .collect(),
+            Usage::default(),
+            "test",
+        )
+        .with_finish_reason(FinishReason::Stop);
+        let model = recording_model(Arc::clone(&requests), response);
+        let reported = Arc::new(Mutex::new(Vec::new()));
+
+        let result = execute(
+            model,
+            false,
+            {
+                let reported = Arc::clone(&reported);
+                move |progress: CallProgress| reported.lock().unwrap().push(progress)
+            },
+            || model_contract::converse(conversation_input()),
+        )
+        .await;
+
+        // The contract expects a submission tool call, so the call fails after
+        // the stream ended; what matters here is what was reported on the way.
+        assert!(result.is_err());
+        let reported = reported.lock().unwrap();
+        assert_eq!(reported.len(), 3);
+        for progress in reported.iter() {
+            assert!(progress.message.len() <= PROGRESS_CHUNK_BYTES);
+            assert_eq!(progress.percent, None);
+        }
+        assert_eq!(
+            reported.iter().map(|p| p.message.len()).sum::<usize>(),
+            parts.iter().map(String::len).sum::<usize>()
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use bone_app::{LoginState, ModelSelection, Profile, SessionId};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
-    ConnectionForm, ConnectionKind, Effect, ModelChoice, ModelFacts, ModelForm, SecretText, Status,
+    ConnectionForm, Effect, KindChoice, ModelChoice, ModelFacts, ModelForm, SecretText, Status,
     UiState,
     details::{ReaderState, pin_reading},
     reader::{ReaderContent, ReaderSource},
@@ -39,35 +39,49 @@ pub(crate) struct ModelPanel {
     pub(crate) session: Option<SessionId>,
     pub(crate) choices: Vec<ModelChoice>,
     pub(crate) profiles: Vec<Profile>,
-    pub(crate) return_to_add_model: bool,
+    /// The tab the panel shows: an index into `profiles`. `profiles.len()` is
+    /// the trailing "add connection" tab, so a connection that was never
+    /// configured occupies no tab.
+    pub(crate) tab: usize,
+    /// Set until a freshly opened panel has seen its first load reply. That one
+    /// reply lands the strip on the connection the current model belongs to;
+    /// every later reload keeps the tab the user chose.
+    follow_current_model: bool,
     pending_selection: Option<ModelSelection>,
     pending_reasoning: bool,
     pub(crate) screen: ModelScreen,
 }
 
+/// One screen of the connections-then-models panel.
+///
+/// The first screen is always the tab strip: one tab per saved connection plus
+/// the trailing add tab. Choosing a model, editing or deleting a connection and
+/// adding one are all reachable from there.
 #[derive(Debug)]
 pub(crate) enum ModelScreen {
-    List {
+    /// A connection tab. `selected` is a row of [`ModelPanel::tab_row_count`]:
+    /// `0..tab_models().len()` are that connection's models and the last row is
+    /// the manual model input.
+    Tab {
+        selected: usize,
+    },
+    ModelInput {
+        value: String,
+    },
+    Kind {
+        selected: usize,
+    },
+    Setup(Box<ConnectionForm>),
+    ModelForm(Box<ModelForm>),
+    /// Deleting the current connection. `selected` is the tab row to come back
+    /// to when the user declines, so cancelling costs nothing.
+    ConfirmDelete {
         selected: usize,
     },
     Reasoning {
         selected: usize,
         selection: ModelSelection,
     },
-    AddModel {
-        selected: usize,
-    },
-    Add {
-        selected: usize,
-    },
-    Advanced {
-        selected: usize,
-    },
-    Manage {
-        selected: usize,
-    },
-    Setup(Box<ConnectionForm>),
-    ModelForm(Box<ModelForm>),
     Login {
         request: u64,
         state: LoginState,
@@ -85,6 +99,7 @@ pub(crate) struct ModelOperation {
 pub(crate) enum ModelOperationKind {
     Load,
     Apply,
+    Delete,
 }
 
 impl ModelPanel {
@@ -93,24 +108,74 @@ impl ModelPanel {
             session,
             choices: Vec::new(),
             profiles: Vec::new(),
-            return_to_add_model: false,
+            tab: 0,
+            follow_current_model: true,
             pending_selection: None,
             pending_reasoning: false,
-            screen: ModelScreen::List { selected: 0 },
+            screen: ModelScreen::Tab { selected: 0 },
         }
+    }
+
+    /// Whether the current tab is the trailing "add connection" tab.
+    pub(crate) fn tab_is_add(&self) -> bool {
+        self.tab == self.profiles.len()
+    }
+
+    /// The saved connection behind the current tab, if it is not the add tab.
+    pub(crate) fn tab_profile(&self) -> Option<&Profile> {
+        if self.tab_is_add() {
+            None
+        } else {
+            self.profiles.get(self.tab)
+        }
+    }
+
+    /// The models of the current tab: the catalog entries of its connection,
+    /// followed by every model saved on the connection that the catalog did not
+    /// publish. A model added by hand stays visible on its own connection.
+    pub(crate) fn tab_models(&self) -> Vec<ModelSelection> {
+        let Some(profile) = self.tab_profile() else {
+            return Vec::new();
+        };
+        let mut models: Vec<ModelSelection> = self
+            .choices
+            .iter()
+            .filter(|choice| choice.selection.profile == profile.id)
+            .map(|choice| choice.selection.clone())
+            .collect();
+        for model in &profile.models {
+            if models.iter().any(|saved| saved.model == *model) {
+                continue;
+            }
+            if let Ok(selection) = ModelSelection::new(profile.id.clone(), model.clone()) {
+                models.push(selection);
+            }
+        }
+        models
+    }
+
+    /// The rows of the current tab: its models plus the manual input row.
+    pub(crate) fn tab_row_count(&self) -> usize {
+        self.tab_models().len() + 1
+    }
+
+    /// The row of `selection` inside the current tab, if the tab still shows it.
+    fn tab_row_of(&self, selection: &ModelSelection) -> Option<usize> {
+        self.tab_models()
+            .iter()
+            .position(|candidate| same_model(candidate, selection))
     }
 
     pub(crate) fn row_count(&self) -> usize {
         match &self.screen {
-            ModelScreen::List { .. } => {
-                self.choices.len() + if self.profiles.is_empty() { 1 } else { 3 }
-            }
+            ModelScreen::Tab { .. } => self.tab_row_count(),
             ModelScreen::Reasoning { .. } => REASONING_EFFORTS.len(),
-            ModelScreen::AddModel { .. } => self.profiles.len().max(1),
-            ModelScreen::Add { .. } => 4,
-            ModelScreen::Advanced { .. } => ConnectionKind::ADVANCED.len(),
-            ModelScreen::Manage { .. } => self.profiles.len(),
-            ModelScreen::Setup(_) | ModelScreen::ModelForm(_) | ModelScreen::Login { .. } => 0,
+            ModelScreen::Kind { .. } => KindChoice::ALL.len(),
+            ModelScreen::ModelInput { .. }
+            | ModelScreen::Setup(_)
+            | ModelScreen::ModelForm(_)
+            | ModelScreen::ConfirmDelete { .. }
+            | ModelScreen::Login { .. } => 0,
         }
     }
 
@@ -123,6 +188,33 @@ impl ModelPanel {
 
     pub(crate) fn busy(&self, operation: Option<ModelOperation>) -> bool {
         operation.is_some_and(|operation| operation.session == self.session)
+    }
+
+    /// Keep the current tab inside `0..=profiles.len()`, preferring the
+    /// connection it showed before the profile list changed.
+    ///
+    /// A save that rewrites the connection list keeps the user on the
+    /// connection they were editing, and a new connection lands on its own tab
+    /// because the trailing add tab shifts one to the right.
+    fn clamp_tab(&mut self, previous: Option<bone_app::ProfileId>) {
+        if let Some(previous) = previous
+            && let Some(index) = self
+                .profiles
+                .iter()
+                .position(|profile| profile.id == previous)
+        {
+            self.tab = index;
+            return;
+        }
+        self.tab = self.tab.min(self.profiles.len());
+    }
+
+    /// Keep the selected row inside the current tab.
+    fn clamp_selection(&mut self) {
+        let last = self.tab_row_count().saturating_sub(1);
+        if let ModelScreen::Tab { selected } = &mut self.screen {
+            *selected = (*selected).min(last);
+        }
     }
 }
 
@@ -217,19 +309,32 @@ pub(super) fn models_loaded(
     if models.session != session {
         return;
     }
+    let previous_tab = models.tab_profile().map(|profile| profile.id.clone());
     models.choices = choices;
     models.profiles = profiles;
-    let row_count = models.row_count();
-    if let ModelScreen::List { selected } = &mut models.screen {
-        *selected = preferred
-            .as_ref()
-            .and_then(|selection| {
-                models
-                    .choices
-                    .iter()
-                    .position(|choice| same_model(&choice.selection, selection))
-            })
-            .unwrap_or_else(|| (*selected).min(row_count.saturating_sub(1)));
+    // A fresh open lands on the connection the current model belongs to. Every
+    // later reload keeps the tab the user chose — including the add tab, whose
+    // index shifts onto a connection the user just saved.
+    if std::mem::take(&mut models.follow_current_model)
+        && let Some(selection) = preferred.as_ref()
+    {
+        models.tab = models
+            .profiles
+            .iter()
+            .position(|profile| profile.id == selection.profile)
+            .unwrap_or(0);
+    } else {
+        models.clamp_tab(previous_tab);
+    }
+    let preferred_row = preferred.as_ref().and_then(|selection| {
+        models
+            .tab_models()
+            .iter()
+            .position(|candidate| same_model(candidate, selection))
+    });
+    let last_row = models.tab_row_count().saturating_sub(1);
+    if let ModelScreen::Tab { selected } = &mut models.screen {
+        *selected = preferred_row.unwrap_or_else(|| (*selected).min(last_row));
     }
 }
 
@@ -251,7 +356,7 @@ pub(super) fn models_failed(
     }
     if let Some(Overlay::Models(models)) = &mut state.overlay
         && models.session == session
-        && matches!(models.screen, ModelScreen::List { .. })
+        && matches!(models.screen, ModelScreen::Tab { .. })
         && state.status.is_none()
     {
         state.status = Some(Status::panel_request(session, request, error));
@@ -382,8 +487,6 @@ pub(super) fn connection_saved(
         return;
     }
 
-    let keep_model_panel =
-        matches!(&models.screen, ModelScreen::ModelForm(_)) || models.return_to_add_model;
     let pending_selection = models.pending_selection.take();
     let pending_reasoning = models.pending_reasoning;
     models.pending_reasoning = false;
@@ -404,12 +507,9 @@ pub(super) fn connection_saved(
         }
         return;
     }
-    if keep_model_panel {
-        return_to_models(state, effects);
-    } else {
-        dismiss(state, effects);
-        refresh_model_facts(state, effects);
-    }
+    // The connection list just changed, so the strip is the only screen that
+    // can still be trusted: it reloads and keeps the current tab in range.
+    return_to_models(state, effects);
 }
 
 fn reconcile_connection_save(state: &mut UiState, effects: &mut Vec<Effect>) {
@@ -418,7 +518,7 @@ fn reconcile_connection_save(state: &mut UiState, effects: &mut Vec<Effect>) {
         && matches!(
             &state.overlay,
             Some(Overlay::Models(models))
-                if models.session == current && matches!(models.screen, ModelScreen::List { .. })
+                if models.session == current && matches!(models.screen, ModelScreen::Tab { .. })
         )
     {
         load_models(state, current, effects);
@@ -466,14 +566,10 @@ pub(super) fn login_changed(
         {
             state.status = None;
         }
-        let return_to_add_model = models.return_to_add_model;
         state.overlay = Some(Overlay::Models(models));
-        if return_to_add_model {
-            return_to_models(state, effects);
-        } else {
-            dismiss(state, effects);
-            refresh_model_facts(state, effects);
-        }
+        // Signing in may have created the ChatGPT connection, so the strip
+        // reloads and keeps the tab in range instead of trusting a stale list.
+        return_to_models(state, effects);
     } else {
         state.overlay = Some(Overlay::Models(models));
     }
@@ -579,12 +675,9 @@ pub(super) fn panel_previous(state: &mut UiState) {
         }
         Some(Overlay::Models(ModelPanel {
             screen:
-                ModelScreen::List { selected }
+                ModelScreen::Tab { selected }
                 | ModelScreen::Reasoning { selected, .. }
-                | ModelScreen::AddModel { selected }
-                | ModelScreen::Add { selected }
-                | ModelScreen::Advanced { selected }
-                | ModelScreen::Manage { selected },
+                | ModelScreen::Kind { selected },
             ..
         })) => *selected = selected.saturating_sub(1),
         _ => {}
@@ -599,18 +692,70 @@ pub(super) fn panel_next(state: &mut UiState) {
         Some(Overlay::Models(models)) => {
             let row_count = models.row_count();
             match &mut models.screen {
-                ModelScreen::List { selected }
+                ModelScreen::Tab { selected }
                 | ModelScreen::Reasoning { selected, .. }
-                | ModelScreen::AddModel { selected }
-                | ModelScreen::Add { selected }
-                | ModelScreen::Advanced { selected }
-                | ModelScreen::Manage { selected } => {
+                | ModelScreen::Kind { selected } => {
                     *selected = (*selected + 1).min(row_count.saturating_sub(1));
                 }
-                ModelScreen::Setup(_) | ModelScreen::ModelForm(_) | ModelScreen::Login { .. } => {}
+                ModelScreen::ModelInput { .. }
+                | ModelScreen::Setup(_)
+                | ModelScreen::ModelForm(_)
+                | ModelScreen::ConfirmDelete { .. }
+                | ModelScreen::Login { .. } => {}
             }
         }
         _ => {}
+    }
+}
+
+/// Move to the previous connection tab. Only the tab strip has a horizontal
+/// axis, and the move clamps at the first tab instead of wrapping around.
+pub(super) fn previous_tab(state: &mut UiState) {
+    let Some(Overlay::Models(models)) = &mut state.overlay else {
+        return;
+    };
+    if !matches!(models.screen, ModelScreen::Tab { .. }) {
+        return;
+    }
+    models.tab = models.tab.min(models.profiles.len()).saturating_sub(1);
+    models.clamp_selection();
+}
+
+/// Move to the next connection tab, clamping at the trailing add tab.
+pub(super) fn next_tab(state: &mut UiState) {
+    let Some(Overlay::Models(models)) = &mut state.overlay else {
+        return;
+    };
+    if !matches!(models.screen, ModelScreen::Tab { .. }) {
+        return;
+    }
+    models.tab = (models.tab + 1).min(models.profiles.len());
+    models.clamp_selection();
+}
+
+/// Show the tab the user clicked, leaving whatever sub-screen was open.
+pub(super) fn select_tab(state: &mut UiState, index: usize, effects: &mut Vec<Effect>) {
+    let Some(panel) = state.overlay.take() else {
+        return;
+    };
+    let Overlay::Models(mut models) = panel else {
+        state.overlay = Some(panel);
+        return;
+    };
+    if models.session != state.selected
+        || models.busy(state.model_operation)
+        || index > models.profiles.len()
+    {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    }
+    let cancels_login = matches!(models.screen, ModelScreen::Login { .. });
+    models.tab = index;
+    models.screen = ModelScreen::Tab { selected: 0 };
+    state.overlay = Some(Overlay::Models(models));
+    state.status = None;
+    if cancels_login {
+        effects.push(Effect::CancelLogin);
     }
 }
 
@@ -621,7 +766,7 @@ pub(super) fn activate(state: &mut UiState, effects: &mut Vec<Effect>) {
             select_object(state, selected, effects);
         }
         Some(Overlay::Models(ModelPanel {
-            screen: ModelScreen::List { selected },
+            screen: ModelScreen::Tab { selected },
             ..
         })) => {
             let selected = *selected;
@@ -635,26 +780,16 @@ pub(super) fn activate(state: &mut UiState, effects: &mut Vec<Effect>) {
             select_reasoning(state, selected, effects);
         }
         Some(Overlay::Models(ModelPanel {
-            screen: ModelScreen::AddModel { selected },
-            ..
-        })) => {
-            let selected = *selected;
-            select_model(state, selected, effects);
-        }
-        Some(Overlay::Models(ModelPanel {
-            screen: ModelScreen::Add { selected } | ModelScreen::Advanced { selected },
+            screen: ModelScreen::Kind { selected },
             ..
         })) => {
             let selected = *selected;
             choose_connection(state, selected, effects);
         }
         Some(Overlay::Models(ModelPanel {
-            screen: ModelScreen::Manage { selected },
+            screen: ModelScreen::ModelInput { .. },
             ..
-        })) => {
-            let selected = *selected;
-            select_model(state, selected, effects);
-        }
+        })) => apply_model_input(state, effects),
         Some(Overlay::Models(ModelPanel {
             screen: ModelScreen::Setup(_) | ModelScreen::ModelForm(_),
             ..
@@ -715,19 +850,6 @@ pub(super) fn move_setup_field(state: &mut UiState, forward: bool) {
     }
 }
 
-pub(super) fn toggle_model_apply(state: &mut UiState) {
-    if let Some(Overlay::Models(ModelPanel {
-        screen: ModelScreen::ModelForm(form),
-        ..
-    })) = &mut state.overlay
-        && !form.remove
-        && form.pending_request.is_none()
-    {
-        form.apply = !form.apply;
-        state.caret_visible = true;
-    }
-}
-
 fn setup_mut(state: &mut UiState) -> Option<&mut ConnectionForm> {
     match &mut state.overlay {
         Some(Overlay::Models(ModelPanel {
@@ -752,6 +874,99 @@ fn setup_text_mut(state: &mut UiState) -> Option<&mut String> {
     }
 }
 
+/// The manual model identifier editor shares the connection form's
+/// grapheme-safe, 16 KiB bounded editing. A model ID is not a secret, so it
+/// needs no redaction and accepts a paste.
+fn model_input_mut(state: &mut UiState) -> Option<&mut String> {
+    match &mut state.overlay {
+        Some(Overlay::Models(ModelPanel {
+            screen: ModelScreen::ModelInput { value },
+            ..
+        })) => Some(value),
+        _ => None,
+    }
+}
+
+pub(super) fn model_text(state: &mut UiState, text: String) {
+    let Some(value) = model_input_mut(state) else {
+        return;
+    };
+    let previous_len = value.len();
+    for ch in text.chars().filter(|ch| !ch.is_control()) {
+        if value.len() + ch.len_utf8() <= 16 * 1024 {
+            value.push(ch);
+        }
+    }
+    if value.len() != previous_len {
+        state.caret_visible = true;
+    }
+}
+
+pub(super) fn model_backspace(state: &mut UiState) {
+    let Some(value) = model_input_mut(state) else {
+        return;
+    };
+    if let Some((byte, _)) = value.grapheme_indices(true).next_back() {
+        value.truncate(byte);
+        state.caret_visible = true;
+    }
+}
+
+pub(super) fn model_clear(state: &mut UiState) {
+    if let Some(value) = model_input_mut(state)
+        && !value.is_empty()
+    {
+        value.clear();
+        state.caret_visible = true;
+    }
+}
+
+/// Apply the manually typed model identifier to the current tab's connection.
+pub(super) fn apply_model_input(state: &mut UiState, effects: &mut Vec<Effect>) {
+    let Some(panel) = state.overlay.take() else {
+        return;
+    };
+    let Overlay::Models(models) = panel else {
+        state.overlay = Some(panel);
+        return;
+    };
+    if models.session != state.selected || models.busy(state.model_operation) {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    }
+    let ModelScreen::ModelInput { value } = &models.screen else {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    };
+    let model = value.trim().to_owned();
+    if model.is_empty() {
+        state.overlay = Some(Overlay::Models(models));
+        state.status = Some(Status::selection(state.selected, "Enter a model ID"));
+        return;
+    }
+    let Some(profile) = models.tab_profile().cloned() else {
+        state.overlay = Some(Overlay::Models(models));
+        state.status = Some(Status::selection(
+            state.selected,
+            "Choose a connection before entering a model",
+        ));
+        return;
+    };
+    let Ok(selection) = ModelSelection::new(profile.id.clone(), model) else {
+        state.overlay = Some(Overlay::Models(models));
+        state.status = Some(Status::selection(
+            state.selected,
+            "This model ID is not valid",
+        ));
+        return;
+    };
+    apply_selection(state, models, selection, false, effects);
+}
+
+/// Remove a model saved on the current tab's connection.
+///
+/// A catalog entry that was never saved on the connection has nothing to
+/// remove, so the confirmation screen is only reachable for saved models.
 pub(super) fn delete_model(state: &mut UiState, effects: &mut Vec<Effect>) {
     let Some(panel) = state.overlay.take() else {
         return;
@@ -764,28 +979,19 @@ pub(super) fn delete_model(state: &mut UiState, effects: &mut Vec<Effect>) {
         state.overlay = Some(Overlay::Models(models));
         return;
     }
-    let ModelScreen::List { selected } = models.screen else {
+    let ModelScreen::Tab { selected } = models.screen else {
         state.overlay = Some(Overlay::Models(models));
         return;
     };
-    let Some(choice) = models.choices.get(selected).cloned() else {
+    let Some(profile) = models.tab_profile().cloned() else {
         state.overlay = Some(Overlay::Models(models));
         return;
     };
-    let Some(profile) = models
-        .profiles
-        .iter()
-        .find(|profile| profile.id == choice.selection.profile)
-        .cloned()
-    else {
+    let Some(selection) = models.tab_models().get(selected).cloned() else {
         state.overlay = Some(Overlay::Models(models));
-        state.status = Some(Status::selection(
-            state.selected,
-            "This model's connection is no longer available",
-        ));
         return;
     };
-    if !profile.has_model(&choice.selection.model) {
+    if !profile.has_model(&selection.model) {
         state.overlay = Some(Overlay::Models(models));
         state.status = Some(Status::selection(
             state.selected,
@@ -793,8 +999,7 @@ pub(super) fn delete_model(state: &mut UiState, effects: &mut Vec<Effect>) {
         ));
         return;
     }
-    models.screen =
-        ModelScreen::ModelForm(Box::new(ModelForm::remove(profile, choice.selection.model)));
+    models.screen = ModelScreen::ModelForm(Box::new(ModelForm::remove(profile, selection.model)));
     state.overlay = Some(Overlay::Models(models));
     state.status = None;
     save_connection(state, effects);
@@ -813,75 +1018,46 @@ pub(super) fn select_model(state: &mut UiState, index: usize, effects: &mut Vec<
         return;
     }
     match models.screen {
-        ModelScreen::List { .. } => {
-            if index >= models.row_count() {
+        ModelScreen::Tab { .. } => {
+            if models.tab_is_add() {
+                models.screen = ModelScreen::Kind { selected: 0 };
                 state.overlay = Some(Overlay::Models(models));
+                state.status = None;
                 return;
             }
-            models.screen = ModelScreen::List { selected: index };
-            if let Some(selection) = models
-                .choices
-                .get(index)
-                .map(|choice| choice.selection.clone())
-            {
-                if supports_reasoning(&models, &selection) {
-                    models.screen = ModelScreen::Reasoning {
-                        selected: reasoning_index(&selection),
-                        selection,
+            let rows = models.tab_models();
+            if index >= rows.len() {
+                if index == rows.len() {
+                    // The last row of every connection tab types a model ID
+                    // the catalog does not publish.
+                    models.screen = ModelScreen::ModelInput {
+                        value: String::new(),
                     };
                     state.overlay = Some(Overlay::Models(models));
                     state.status = None;
                 } else {
-                    apply_selection(state, models, selection, false, effects);
+                    state.overlay = Some(Overlay::Models(models));
                 }
                 return;
             }
-            let action = index.saturating_sub(models.choices.len());
-            if models.profiles.is_empty() {
-                models.return_to_add_model = true;
-                models.screen = ModelScreen::Add { selected: 0 };
-            } else if action == 0 {
-                models.screen = ModelScreen::AddModel { selected: 0 };
-            } else if action == 1 {
-                models.screen = ModelScreen::Add { selected: 0 };
+            let selection = rows[index].clone();
+            models.screen = ModelScreen::Tab { selected: index };
+            if supports_reasoning(&models, &selection) {
+                models.screen = ModelScreen::Reasoning {
+                    selected: reasoning_index(&selection),
+                    selection,
+                };
+                state.overlay = Some(Overlay::Models(models));
+                state.status = None;
             } else {
-                models.screen = ModelScreen::Manage { selected: 0 };
+                apply_selection(state, models, selection, false, effects);
             }
-        }
-        ModelScreen::AddModel { .. } => {
-            let Some(profile) = models.profiles.get(index).cloned() else {
-                if models.profiles.is_empty() && index == 0 {
-                    models.screen = ModelScreen::Add { selected: 0 };
-                }
-                state.overlay = Some(Overlay::Models(models));
-                return;
-            };
-            models.screen = ModelScreen::ModelForm(Box::new(ModelForm::new(profile)));
-        }
-        ModelScreen::Manage { .. } => {
-            let Some(profile) = models.profiles.get(index).cloned() else {
-                state.overlay = Some(Overlay::Models(models));
-                return;
-            };
-            models.screen = ModelScreen::Manage { selected: index };
-            if profile.id == bone_app::ProfileId::chatgpt() {
-                begin_login(state, models, effects);
-                return;
-            }
-            let Some(form) = ConnectionForm::edit_selection(&profile) else {
-                unreachable!("ChatGPT handled above")
-            };
-            models.screen = ModelScreen::Setup(Box::new(form));
         }
         _ => {
             state.overlay = Some(Overlay::Models(models));
-            return;
         }
     }
-    state.overlay = Some(Overlay::Models(models));
-    state.status = None;
 }
-
 pub(super) fn choose_connection(state: &mut UiState, index: usize, effects: &mut Vec<Effect>) {
     let Some(panel) = state.overlay.take() else {
         return;
@@ -890,70 +1066,188 @@ pub(super) fn choose_connection(state: &mut UiState, index: usize, effects: &mut
         state.overlay = Some(panel);
         return;
     };
-    if models.session != state.selected {
+    if models.session != state.selected || models.busy(state.model_operation) {
         state.overlay = Some(Overlay::Models(models));
         return;
     }
-    let kind = match models.screen {
-        ModelScreen::Add { .. } => match index {
-            0 => {
-                begin_login(state, models, effects);
-                return;
-            }
-            1 | 2 => {
-                let (id, kind) = if index == 1 {
-                    (
-                        bone_app::ProfileId::new("openai").unwrap(),
-                        ConnectionKind::OpenAiApi,
-                    )
-                } else {
-                    (
-                        bone_app::ProfileId::new("anthropic").unwrap(),
-                        ConnectionKind::AnthropicApi,
-                    )
-                };
-                if let Some(profile) = models
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.id == id)
-                    .cloned()
-                {
-                    models.screen = ModelScreen::Setup(Box::new(
-                        ConnectionForm::edit_selection(&profile)
-                            .expect("API profiles have an editable connection form"),
-                    ));
-                    state.overlay = Some(Overlay::Models(models));
-                    state.status = None;
-                    return;
-                }
-                kind
-            }
-            3 => {
-                models.screen = ModelScreen::Advanced { selected: 0 };
-                state.overlay = Some(Overlay::Models(models));
-                state.status = None;
-                return;
-            }
-            _ => {
-                state.overlay = Some(Overlay::Models(models));
-                return;
-            }
-        },
-        ModelScreen::Advanced { .. } => {
-            let Some(kind) = ConnectionKind::ADVANCED.get(index).copied() else {
-                state.overlay = Some(Overlay::Models(models));
-                return;
-            };
-            kind
-        }
-        _ => {
-            state.overlay = Some(Overlay::Models(models));
-            return;
-        }
+    let Some(choice) = KindChoice::ALL.get(index).copied() else {
+        state.overlay = Some(Overlay::Models(models));
+        return;
     };
-    models.screen = ModelScreen::Setup(Box::new(ConnectionForm::new(kind)));
+    // A connection kind that is already saved has a tab: choosing it opens that
+    // tab instead of asking for the same details a second time.
+    if let Some(tab) = models
+        .profiles
+        .iter()
+        .position(|profile| choice.already_connected(profile))
+    {
+        models.tab = tab;
+        models.screen = ModelScreen::Tab { selected: 0 };
+        state.overlay = Some(Overlay::Models(models));
+        state.status = Some(Status::selection_notice(
+            state.selected,
+            format!("Already connected: {}", choice.label()),
+        ));
+        return;
+    }
+    match choice {
+        KindChoice::ChatGpt => begin_login(state, models, effects),
+        KindChoice::Api(kind) => {
+            models.screen = ModelScreen::Setup(Box::new(ConnectionForm::new(kind)));
+            state.overlay = Some(Overlay::Models(models));
+            state.status = None;
+        }
+    }
+}
+
+/// Open the current connection for editing. Only the tab strip reacts, and the
+/// add tab has nothing to edit.
+pub(super) fn edit_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
+    let Some(panel) = state.overlay.take() else {
+        return;
+    };
+    let Overlay::Models(mut models) = panel else {
+        state.overlay = Some(panel);
+        return;
+    };
+    if models.session != state.selected
+        || models.busy(state.model_operation)
+        || !matches!(models.screen, ModelScreen::Tab { .. })
+    {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    }
+    let Some(profile) = models.tab_profile().cloned() else {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    };
+    if profile.id == bone_app::ProfileId::chatgpt() {
+        begin_login(state, models, effects);
+        return;
+    }
+    let Some(form) = ConnectionForm::edit_selection(&profile) else {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    };
+    models.screen = ModelScreen::Setup(Box::new(form));
     state.overlay = Some(Overlay::Models(models));
     state.status = None;
+}
+
+/// Ask for confirmation before deleting the current connection. Only the tab
+/// strip reacts, and the add tab has nothing to delete.
+pub(super) fn delete_connection(state: &mut UiState) {
+    let Some(panel) = state.overlay.take() else {
+        return;
+    };
+    let Overlay::Models(mut models) = panel else {
+        state.overlay = Some(panel);
+        return;
+    };
+    if models.session != state.selected
+        || models.busy(state.model_operation)
+        || !matches!(models.screen, ModelScreen::Tab { .. })
+        || models.tab_profile().is_none()
+    {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    }
+    let selected = match models.screen {
+        ModelScreen::Tab { selected } => selected,
+        _ => 0,
+    };
+    models.screen = ModelScreen::ConfirmDelete { selected };
+    state.overlay = Some(Overlay::Models(models));
+    state.status = None;
+}
+
+/// Delete the connection the user just confirmed.
+///
+/// The dialog closes immediately and the tab screen reports progress through
+/// the pending operation, so a second confirmation cannot queue a second delete
+/// while the first one is still in flight.
+pub(super) fn confirm_delete_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
+    let Some(panel) = state.overlay.take() else {
+        return;
+    };
+    let Overlay::Models(mut models) = panel else {
+        state.overlay = Some(panel);
+        return;
+    };
+    if models.session != state.selected
+        || models.busy(state.model_operation)
+        || !matches!(models.screen, ModelScreen::ConfirmDelete { .. })
+    {
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    }
+    let Some(profile) = models.tab_profile().cloned() else {
+        models.screen = ModelScreen::Tab { selected: 0 };
+        state.overlay = Some(Overlay::Models(models));
+        return;
+    };
+    let session = models.session;
+    let request = state.generation();
+    models.screen = ModelScreen::Tab { selected: 0 };
+    state.overlay = Some(Overlay::Models(models));
+    state.status = None;
+    state.model_operation = Some(ModelOperation {
+        session,
+        request,
+        kind: ModelOperationKind::Delete,
+    });
+    effects.push(Effect::DeleteConnection {
+        request,
+        profile: profile.id,
+    });
+}
+
+/// The result of [`Effect::DeleteConnection`].
+///
+/// The request alone decides whether this reply is current: a delete that
+/// outlived a session switch must still clear its pending operation, or the
+/// panel would stay busy forever. A stale reply changes nothing.
+pub(super) fn connection_deleted(
+    state: &mut UiState,
+    request: u64,
+    error: Option<String>,
+    effects: &mut Vec<Effect>,
+) {
+    let current = state.model_operation.is_some_and(|operation| {
+        operation.request == request && operation.kind == ModelOperationKind::Delete
+    });
+    if !current {
+        return;
+    }
+    state.model_operation = None;
+    if let Some(error) = error {
+        state.status = Some(Status::panel_request(
+            state.selected,
+            request,
+            format!("Connection was not deleted: {error}"),
+        ));
+        return;
+    }
+    if state
+        .status
+        .as_ref()
+        .is_some_and(|status| status.belongs_to_panel_request(state.selected, request))
+    {
+        state.status = None;
+    }
+    // The deleted connection is gone from the strip; reload so the tab the
+    // panel shows is a tab that exists.
+    let session = match &mut state.overlay {
+        Some(Overlay::Models(models)) if models.session == state.selected => {
+            models.screen = ModelScreen::Tab { selected: 0 };
+            Some(models.session)
+        }
+        _ => None,
+    };
+    if let Some(session) = session {
+        load_models(state, session, effects);
+    }
+    reconcile_model_facts(state, effects);
 }
 
 pub(super) fn select_reasoning(state: &mut UiState, index: usize, effects: &mut Vec<Effect>) {
@@ -1169,26 +1463,22 @@ pub(super) fn save_connection(state: &mut UiState, effects: &mut Vec<Effect>) {
     });
 }
 
+/// Leave a sub-screen for the tab strip of the same connection, reloading the
+/// catalog and the saved facts alongside it.
 fn return_to_models(state: &mut UiState, effects: &mut Vec<Effect>) {
     let Some(Overlay::Models(models)) = &mut state.overlay else {
         return;
     };
-    let return_to_add_model = models.return_to_add_model;
-    models.return_to_add_model = false;
-    models.screen = if return_to_add_model {
-        ModelScreen::AddModel { selected: 0 }
-    } else {
-        ModelScreen::List { selected: 0 }
-    };
+    models.screen = ModelScreen::Tab { selected: 0 };
     let session = models.session;
     load_models(state, session, effects);
     refresh_model_facts(state, effects);
 }
 
-fn return_to_model_list(state: &mut UiState) {
+/// Leave a sub-screen for the tab strip without scheduling any work.
+fn show_tab(state: &mut UiState, selected: usize) {
     if let Some(Overlay::Models(models)) = &mut state.overlay {
-        models.return_to_add_model = false;
-        models.screen = ModelScreen::List { selected: 0 };
+        models.screen = ModelScreen::Tab { selected };
     }
 }
 
@@ -1214,7 +1504,17 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
         },
         _ => false,
     };
-    if apply_pending || save_pending {
+    let delete_pending = matches!(
+        (panel, state.model_operation),
+        (
+            Overlay::Models(models),
+            Some(ModelOperation {
+                kind: ModelOperationKind::Delete,
+                ..
+            })
+        ) if models.session == state.selected
+    );
+    if apply_pending || save_pending || delete_pending {
         state.status = Some(Status::selection_notice(
             state.selected,
             "Finishing the model change…",
@@ -1232,59 +1532,49 @@ pub(super) fn escape(state: &mut UiState, effects: &mut Vec<Effect>) -> bool {
             return_to_models(state, effects);
         }
         Overlay::Models(ModelPanel {
-            screen: ModelScreen::Reasoning { .. },
+            screen: ModelScreen::Reasoning { selection, .. },
+            ..
+        }) => {
+            // Back to the row the reasoning picker was opened from.
+            let selected = selection.clone();
+            state.status = None;
+            let row = match &state.overlay {
+                Some(Overlay::Models(models)) => models.tab_row_of(&selected).unwrap_or(0),
+                _ => 0,
+            };
+            show_tab(state, row);
+        }
+        Overlay::Models(ModelPanel {
+            screen: ModelScreen::ModelInput { .. },
+            ..
+        }) => {
+            // Back to the manual-input row the editor was opened from.
+            let row = match &state.overlay {
+                Some(Overlay::Models(models)) => models.tab_row_count().saturating_sub(1),
+                _ => 0,
+            };
+            state.status = None;
+            show_tab(state, row);
+        }
+        // Declining the delete returns to the row the user was on, so `d`
+        // followed by `n` costs nothing.
+        Overlay::Models(ModelPanel {
+            screen: ModelScreen::ConfirmDelete { selected },
+            ..
+        }) => {
+            let selected = *selected;
+            state.status = None;
+            show_tab(state, selected);
+        }
+        Overlay::Models(ModelPanel {
+            screen: ModelScreen::Setup(_) | ModelScreen::ModelForm(_) | ModelScreen::Kind { .. },
             ..
         }) => {
             state.status = None;
-            if let Some(Overlay::Models(models)) = &mut state.overlay {
-                models.screen = ModelScreen::List { selected: 0 };
-            }
+            show_tab(state, 0);
         }
         Overlay::Models(ModelPanel {
-            screen: ModelScreen::Setup(_),
-            ..
-        }) => {
-            state.status = None;
-            if let Some(Overlay::Models(models)) = &mut state.overlay
-                && let ModelScreen::Setup(form) = &models.screen
-            {
-                models.screen = if form.edits_existing_connection() {
-                    ModelScreen::Manage { selected: 0 }
-                } else if form.kind.advanced() {
-                    ModelScreen::Advanced { selected: 0 }
-                } else {
-                    ModelScreen::Add { selected: 0 }
-                };
-            }
-        }
-        Overlay::Models(ModelPanel {
-            screen: ModelScreen::ModelForm(_),
-            ..
-        }) => {
-            state.status = None;
-            if let Some(Overlay::Models(models)) = &mut state.overlay {
-                models.screen = ModelScreen::AddModel { selected: 0 };
-            }
-        }
-        Overlay::Models(ModelPanel {
-            screen: ModelScreen::Advanced { .. },
-            ..
-        }) => {
-            state.status = None;
-            if let Some(Overlay::Models(models)) = &mut state.overlay {
-                models.screen = ModelScreen::Add { selected: 0 };
-            }
-        }
-        Overlay::Models(ModelPanel {
-            screen:
-                ModelScreen::AddModel { .. } | ModelScreen::Add { .. } | ModelScreen::Manage { .. },
-            ..
-        }) => {
-            state.status = None;
-            return_to_model_list(state);
-        }
-        Overlay::Models(ModelPanel {
-            screen: ModelScreen::List { .. },
+            screen: ModelScreen::Tab { .. },
             ..
         })
         | Overlay::Objects(_)
@@ -1332,18 +1622,46 @@ fn cancel_login(state: &UiState, effects: &mut Vec<Effect>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{Action, SetupField, UiEvent, WorkspaceTarget, update};
+    use crate::state::{Action, ConnectionKind, SetupField, UiEvent, WorkspaceTarget, update};
 
-    fn choice(model: &str) -> ModelChoice {
+    /// A connection whose endpoint never claims a reasoning picker, so a row
+    /// click applies the model directly.
+    fn profile_with_id(id: &str) -> Profile {
+        Profile::new(
+            bone_app::ProfileId::new(id).unwrap(),
+            id,
+            bone_app::EndpointConfig::OpenAiChatCompletions {
+                base_url: Some(format!("https://{id}.example.test/v1")),
+            },
+        )
+        .unwrap()
+    }
+
+    fn choice_for(profile: &Profile, model: &str) -> ModelChoice {
         ModelChoice {
-            selection: bone_app::ModelSelection::new(
-                bone_app::ProfileId::new("test-api").unwrap(),
-                model,
-            )
-            .unwrap(),
-            profile_label: "Test API".into(),
+            selection: bone_app::ModelSelection::new(profile.id.clone(), model).unwrap(),
+            profile_label: profile.label.clone(),
             label: model.into(),
         }
+    }
+
+    fn choice(model: &str) -> ModelChoice {
+        choice_for(&profile_with_id("test-api"), model)
+    }
+
+    /// The connections a choice list belongs to, one per profile id.
+    fn profiles_of(choices: &[ModelChoice]) -> Vec<Profile> {
+        let mut profiles: Vec<Profile> = Vec::new();
+        for choice in choices {
+            if profiles
+                .iter()
+                .any(|profile| profile.id == choice.selection.profile)
+            {
+                continue;
+            }
+            profiles.push(profile_with_id(choice.selection.profile.as_str()));
+        }
+        profiles
     }
 
     fn facts(model: &str) -> ModelFacts {
@@ -1384,7 +1702,18 @@ mod tests {
         operation.request
     }
 
-    fn ready_models(state: &mut UiState, choices: Vec<ModelChoice>) -> u64 {
+    fn panel(state: &UiState) -> &ModelPanel {
+        match &state.overlay {
+            Some(Overlay::Models(models)) => models,
+            _ => panic!("model panel"),
+        }
+    }
+
+    fn screen(state: &UiState) -> &ModelScreen {
+        &panel(state).screen
+    }
+
+    fn ready_panel(state: &mut UiState, profiles: Vec<Profile>, choices: Vec<ModelChoice>) -> u64 {
         if state.model_facts.is_none() {
             state.model_facts = Some(facts("existing"));
         }
@@ -1395,9 +1724,14 @@ mod tests {
             effects.as_slice(),
             [Effect::LoadModels { request, .. }] if *request == load
         ));
-        models_loaded(state, state.selected, load, choices, vec![]);
+        models_loaded(state, state.selected, load, choices, profiles);
         assert!(state.model_operation.is_none());
         load
+    }
+
+    fn ready_models(state: &mut UiState, choices: Vec<ModelChoice>) -> u64 {
+        let profiles = profiles_of(&choices);
+        ready_panel(state, profiles, choices)
     }
 
     fn setup_panel(state: &mut UiState, form: ConnectionForm) {
@@ -1407,39 +1741,393 @@ mod tests {
     }
 
     #[test]
-    fn add_model_enters_the_one_field_form_and_delete_returns_to_the_list() {
-        let mut profile = bone_app::Profile::new(
-            bone_app::ProfileId::new("custom-api").unwrap(),
-            "Custom API",
-            bone_app::EndpointConfig::OpenAiResponses {
-                base_url: Some("http://127.0.0.1:8080/v1".into()),
-            },
-        )
-        .unwrap();
+    fn a_saved_model_is_removed_from_its_tab_and_the_strip_reloads() {
+        let mut profile = profile_with_id("custom-api");
         profile.add_model("model-a").unwrap();
-        let selection = bone_app::ModelSelection::new(profile.id.clone(), "model-a").unwrap();
+        let mut state = UiState::default();
         let mut models = ModelPanel::new(None);
         models.profiles = vec![profile.clone()];
-        models.screen = ModelScreen::AddModel { selected: 0 };
-        state_with_models(&mut models, selection);
+        models.choices = vec![choice_for(&profile, "model-a")];
+        models.screen = ModelScreen::Tab { selected: 0 };
+        state.overlay = Some(Overlay::Models(models));
+        let mut effects = Vec::new();
+
+        delete_model(&mut state, &mut effects);
+
+        let Some(Overlay::Models(ModelPanel {
+            screen: ModelScreen::ModelForm(form),
+            ..
+        })) = state.overlay.as_mut()
+        else {
+            panic!("removal should use the model form")
+        };
+        assert_eq!(form.model, "model-a");
+        let request = form.pending_request.expect("remove request");
+        connection_saved(&mut state, request, None, None, false, &mut effects);
+
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadModels { .. }))
+        );
     }
 
     #[test]
-    fn adding_a_connection_from_an_empty_catalogue_returns_to_add_model() {
+    fn a_model_the_connection_never_saved_cannot_be_removed() {
+        let profile = profile_with_id("custom-api");
         let mut state = UiState::default();
         let mut models = ModelPanel::new(None);
-        models.screen = ModelScreen::List { selected: 0 };
+        models.profiles = vec![profile.clone()];
+        models.choices = vec![choice_for(&profile, "catalog-only")];
+        models.screen = ModelScreen::Tab { selected: 0 };
+        state.overlay = Some(Overlay::Models(models));
+        let mut effects = Vec::new();
+
+        delete_model(&mut state, &mut effects);
+
+        assert!(effects.is_empty());
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
+        assert_eq!(
+            state.status_text(),
+            Some("Only saved models can be removed")
+        );
+    }
+
+    #[test]
+    fn the_tab_strip_walks_connections_and_clamps_at_the_add_tab() {
+        let first = profile_with_id("first");
+        let second = profile_with_id("second");
+        let mut state = UiState::default();
+        ready_panel(
+            &mut state,
+            vec![first, second],
+            vec![choice_for(&profile_with_id("second"), "model-a")],
+        );
+
+        assert_eq!(panel(&state).tab, 0);
+        next_tab(&mut state);
+        assert_eq!(panel(&state).tab, 1);
+        assert_eq!(
+            panel(&state)
+                .tab_profile()
+                .map(|profile| profile.id.clone()),
+            Some(bone_app::ProfileId::new("second").unwrap())
+        );
+        next_tab(&mut state);
+        assert!(panel(&state).tab_is_add());
+        next_tab(&mut state);
+        assert!(panel(&state).tab_is_add());
+        previous_tab(&mut state);
+        previous_tab(&mut state);
+        assert_eq!(panel(&state).tab, 0);
+        previous_tab(&mut state);
+        assert_eq!(panel(&state).tab, 0);
+    }
+
+    #[test]
+    fn a_reload_keeps_the_tab_inside_the_strip_and_lands_a_new_connection_on_its_own_tab() {
+        let first = profile_with_id("first");
+        let second = profile_with_id("second");
+        let mut state = UiState::default();
+        let mut effects = Vec::new();
+        ready_panel(&mut state, vec![first.clone()], vec![]);
+
+        // Saving from the add tab shifts the new connection under the cursor
+        // instead of leaving it on the trailing tab.
+        models_tab(&mut state, 1);
+        load_models(&mut state, None, &mut effects);
+        let load = request(&state, ModelOperationKind::Load);
+        models_loaded(
+            &mut state,
+            None,
+            load,
+            vec![choice_for(&second, "model-a")],
+            vec![first.clone(), second.clone()],
+        );
+        assert_eq!(
+            panel(&state)
+                .tab_profile()
+                .map(|profile| profile.id.clone()),
+            Some(second.id.clone())
+        );
+
+        // Deleting the connection the strip showed moves the tab back inside
+        // the remaining tabs.
+        models_tab(&mut state, 1);
+        load_models(&mut state, None, &mut effects);
+        let load = request(&state, ModelOperationKind::Load);
+        models_loaded(&mut state, None, load, vec![], vec![first]);
+        assert!(panel(&state).tab_is_add());
+        assert_eq!(panel(&state).tab, 1);
+    }
+
+    fn models_tab(state: &mut UiState, tab: usize) {
+        let Some(Overlay::Models(models)) = &mut state.overlay else {
+            panic!("model panel")
+        };
+        models.tab = tab;
+    }
+
+    #[test]
+    fn escape_leaves_every_sub_screen_for_the_tab_strip() {
+        let profile = profile_with_id("custom-api");
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.profiles = vec![profile.clone()];
+        models.choices = vec![
+            choice_for(&profile, "model-a"),
+            choice_for(&profile, "model-b"),
+        ];
+        models.tab = 0;
+        models.screen = ModelScreen::ConfirmDelete { selected: 1 };
+        state.overlay = Some(Overlay::Models(models));
+        let mut effects = Vec::new();
+
+        assert!(escape(&mut state, &mut effects));
+        assert!(effects.is_empty());
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 1 }));
+
+        models_screen(&mut state, ModelScreen::Kind { selected: 3 });
+        assert!(escape(&mut state, &mut effects));
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
+
+        models_screen(&mut state, ModelScreen::ModelInput { value: "x".into() });
+        assert!(escape(&mut state, &mut effects));
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 2 }));
+
+        models_screen(
+            &mut state,
+            ModelScreen::Reasoning {
+                selected: 0,
+                selection: bone_app::ModelSelection::new(profile.id.clone(), "model-b").unwrap(),
+            },
+        );
+        assert!(escape(&mut state, &mut effects));
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 1 }));
+
+        // Only the tab strip itself dismisses the panel.
+        assert!(escape(&mut state, &mut effects));
+        assert!(state.overlay.is_none());
+    }
+
+    fn models_screen(state: &mut UiState, screen: ModelScreen) {
+        let Some(Overlay::Models(models)) = &mut state.overlay else {
+            panic!("model panel")
+        };
+        models.screen = screen;
+    }
+
+    #[test]
+    fn a_confirmed_delete_records_its_request_and_closes_the_dialog() {
+        let profile = profile_with_id("only");
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.profiles = vec![profile.clone()];
+        models.screen = ModelScreen::Tab { selected: 0 };
+        state.overlay = Some(Overlay::Models(models));
+        let mut effects = Vec::new();
+
+        delete_connection(&mut state);
+        assert!(matches!(screen(&state), ModelScreen::ConfirmDelete { .. }));
+        confirm_delete_connection(&mut state, &mut effects);
+
+        let [
+            Effect::DeleteConnection {
+                request,
+                profile: deleted,
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("delete effect")
+        };
+        assert_eq!(*deleted, profile.id);
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
+        assert_eq!(
+            state.model_operation,
+            Some(ModelOperation {
+                session: None,
+                request: *request,
+                kind: ModelOperationKind::Delete,
+            })
+        );
+
+        // A second confirmation finds no dialog, and Escape cannot close the
+        // panel out from under the delete that is still in flight.
+        let mut second = Vec::new();
+        confirm_delete_connection(&mut state, &mut second);
+        assert!(second.is_empty());
+        assert!(escape(&mut state, &mut second));
+        assert!(second.is_empty());
+        assert!(state.overlay.is_some());
+        assert_eq!(state.status_text(), Some("Finishing the model change…"));
+
+        // The reply clears the operation even when it arrives late: a stale
+        // request changes nothing, and the current one clears the delete flag
+        // so the panel is never permanently busy.
+        connection_deleted(&mut state, request.wrapping_add(1), None, &mut second);
+        assert_eq!(
+            state.model_operation.map(|operation| operation.kind),
+            Some(ModelOperationKind::Delete)
+        );
+        connection_deleted(&mut state, *request, None, &mut second);
+        assert_ne!(
+            state.model_operation.map(|operation| operation.kind),
+            Some(ModelOperationKind::Delete)
+        );
+        assert!(
+            second
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadModels { .. }))
+        );
+    }
+
+    #[test]
+    fn a_failed_delete_stays_visible_and_leaves_the_panel_usable() {
+        let profile = profile_with_id("only");
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.profiles = vec![profile];
+        models.screen = ModelScreen::Tab { selected: 0 };
+        state.overlay = Some(Overlay::Models(models));
+        let mut effects = Vec::new();
+        delete_connection(&mut state);
+        confirm_delete_connection(&mut state, &mut effects);
+        let [Effect::DeleteConnection { request, .. }] = effects.as_slice() else {
+            panic!("delete effect")
+        };
+        let request = *request;
+
+        connection_deleted(
+            &mut state,
+            request,
+            Some("keychain unavailable".into()),
+            &mut Vec::new(),
+        );
+
+        assert!(state.model_operation.is_none());
+        assert_eq!(
+            state.status_text(),
+            Some("Connection was not deleted: keychain unavailable")
+        );
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
+        // The panel is no longer busy, so the strip moves again.
+        next_tab(&mut state);
+        assert!(panel(&state).tab_is_add());
+    }
+
+    #[test]
+    fn the_manual_model_editor_belongs_to_the_current_tab() {
+        let first = profile_with_id("first");
+        let second = profile_with_id("second");
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.profiles = vec![first.clone(), second.clone()];
+        models.choices = vec![
+            choice_for(&first, "model-a"),
+            choice_for(&second, "model-b"),
+        ];
+        models.tab = 1;
+        models.screen = ModelScreen::Tab { selected: 1 };
+        state.overlay = Some(Overlay::Models(models));
+        let mut effects = Vec::new();
+
+        // Row 1 is the manual row of the second connection, not its neighbour's
+        // model.
+        select_model(&mut state, 1, &mut effects);
+        assert!(matches!(
+            screen(&state),
+            ModelScreen::ModelInput { value } if value.is_empty()
+        ));
+
+        model_text(&mut state, "  manual-model  ".into());
+        model_backspace(&mut state);
+        assert!(matches!(
+            screen(&state),
+            ModelScreen::ModelInput { value } if value == "  manual-model "
+        ));
+        model_clear(&mut state);
+        apply_model_input(&mut state, &mut effects);
+        assert!(effects.is_empty());
+        assert_eq!(state.status_text(), Some("Enter a model ID"));
+
+        models_screen(
+            &mut state,
+            ModelScreen::ModelInput {
+                value: " manual-model ".into(),
+            },
+        );
+        apply_model_input(&mut state, &mut effects);
+        let [Effect::SetModel { selection, .. }] = effects.as_slice() else {
+            panic!("manual input must apply a model")
+        };
+        assert_eq!(selection.profile, second.id);
+        assert_eq!(selection.model, "manual-model");
+    }
+
+    #[test]
+    fn the_add_tab_has_no_models_and_its_last_row_opens_the_kind_picker() {
+        let first = profile_with_id("first");
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.profiles = vec![first.clone()];
+        models.choices = vec![choice_for(&first, "model-a")];
+        models.tab = 1;
+        models.screen = ModelScreen::Tab { selected: 0 };
+        state.overlay = Some(Overlay::Models(models));
+
+        assert!(panel(&state).tab_is_add());
+        assert!(panel(&state).tab_models().is_empty());
+        assert_eq!(panel(&state).tab_row_count(), 1);
+
+        let mut effects = Vec::new();
+        select_model(&mut state, 0, &mut effects);
+        assert!(matches!(screen(&state), ModelScreen::Kind { selected: 0 }));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn a_stale_connection_never_shows_a_manual_model_from_another_connection() {
+        let first = profile_with_id("first");
+        let mut second = profile_with_id("second");
+        second.add_model("manual-model").unwrap();
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.profiles = vec![first.clone(), second.clone()];
+        models.choices = vec![choice_for(&first, "catalog-model")];
+        models.tab = 0;
+        state.overlay = Some(Overlay::Models(models));
+
+        // The catalog did not publish `manual-model`; the connection did, so it
+        // stays visible on its own tab and nowhere else.
+        assert_eq!(
+            panel(&state)
+                .tab_models()
+                .iter()
+                .map(|selection| selection.model.clone())
+                .collect::<Vec<_>>(),
+            vec!["catalog-model".to_owned()]
+        );
+        models_tab(&mut state, 1);
+        assert_eq!(
+            panel(&state)
+                .tab_models()
+                .iter()
+                .map(|selection| selection.model.clone())
+                .collect::<Vec<_>>(),
+            vec!["manual-model".to_owned()]
+        );
+    }
+
+    #[test]
+    fn adding_a_connection_from_the_add_tab_returns_to_the_tab_strip() {
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.screen = ModelScreen::Tab { selected: 0 };
         state.overlay = Some(Overlay::Models(models));
         let mut effects = Vec::new();
         select_model(&mut state, 0, &mut effects);
-        assert!(matches!(
-            state.overlay,
-            Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::Add { .. },
-                return_to_add_model: true,
-                ..
-            }))
-        ));
+        assert!(matches!(screen(&state), ModelScreen::Kind { selected: 0 }));
 
         choose_connection(&mut state, 1, &mut effects);
         let Some(Overlay::Models(ModelPanel {
@@ -1466,56 +2154,7 @@ mod tests {
             true,
             &mut effects,
         );
-        assert!(matches!(
-            state.overlay,
-            Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::AddModel { .. },
-                return_to_add_model: false,
-                ..
-            }))
-        ));
-    }
-
-    fn state_with_models(models: &mut ModelPanel, selection: bone_app::ModelSelection) {
-        let mut state = UiState::default();
-        models.choices = vec![ModelChoice {
-            selection,
-            profile_label: "Custom API".into(),
-            label: "model-a".into(),
-        }];
-        state.overlay = Some(Overlay::Models(std::mem::replace(
-            models,
-            ModelPanel::new(None),
-        )));
-        let mut effects = Vec::new();
-        select_model(&mut state, 0, &mut effects);
-        assert!(matches!(
-            state.overlay,
-            Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::ModelForm(_),
-                ..
-            }))
-        ));
-        let Some(Overlay::Models(models)) = state.overlay.as_mut() else {
-            unreachable!()
-        };
-        models.screen = ModelScreen::List { selected: 0 };
-        delete_model(&mut state, &mut effects);
-        let request = match &state.overlay {
-            Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::ModelForm(form),
-                ..
-            })) => form.pending_request.expect("delete request"),
-            _ => panic!("delete should use the model save path"),
-        };
-        connection_saved(&mut state, request, None, None, false, &mut effects);
-        assert!(matches!(
-            state.overlay,
-            Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::List { .. },
-                ..
-            }))
-        ));
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
         assert!(
             effects
                 .iter()
@@ -1558,13 +2197,13 @@ mod tests {
         ));
 
         let mut models = ModelPanel::new(None);
-        models.screen = ModelScreen::Add { selected: 3 };
+        models.screen = ModelScreen::Kind { selected: 3 };
         state.overlay = Some(Overlay::Models(models));
         panel_previous(&mut state);
         assert!(matches!(
             &state.overlay,
             Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::Add { selected: 2 },
+                screen: ModelScreen::Kind { selected: 2 },
                 ..
             }))
         ));
@@ -1605,7 +2244,7 @@ mod tests {
         assert!(matches!(
             &state.overlay,
             Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::List { .. },
+                screen: ModelScreen::Tab { .. },
                 ..
             }))
         ));
@@ -1659,7 +2298,7 @@ mod tests {
         assert!(matches!(
             state.overlay,
             Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::List { .. },
+                screen: ModelScreen::Tab { .. },
                 ..
             }))
         ));
@@ -1676,7 +2315,7 @@ mod tests {
         assert!(matches!(
             state.overlay,
             Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::List { .. },
+                screen: ModelScreen::Tab { .. },
                 ..
             }))
         ));
@@ -1699,7 +2338,7 @@ mod tests {
         assert!(matches!(
             state.overlay,
             Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::List { .. },
+                screen: ModelScreen::Tab { .. },
                 ..
             }))
         ));
@@ -1708,7 +2347,7 @@ mod tests {
         assert!(matches!(
             state.overlay,
             Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::List { .. },
+                screen: ModelScreen::Tab { .. },
                 ..
             }))
         ));
@@ -1724,7 +2363,7 @@ mod tests {
         assert!(matches!(
             state.overlay,
             Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::List { selected: 1 },
+                screen: ModelScreen::Tab { selected: 1 },
                 ..
             }))
         ));
@@ -1772,22 +2411,12 @@ mod tests {
     }
 
     #[test]
-    fn adding_a_responses_model_chooses_reasoning_after_the_connection_is_saved() {
-        let profile = bone_app::Profile::new(
-            bone_app::ProfileId::new("local").unwrap(),
-            "Local",
-            bone_app::EndpointConfig::OpenAiResponses {
-                base_url: Some("http://127.0.0.1:11434/v1".into()),
-            },
-        )
-        .unwrap();
-        let mut form = ModelForm::new(profile.clone());
-        form.model = "local-model".into();
-        let mut models = ModelPanel::new(None);
-        models.profiles = vec![profile];
-        models.screen = ModelScreen::ModelForm(Box::new(form));
+    fn saving_a_connection_with_a_responses_model_chooses_reasoning_first() {
         let mut state = UiState::default();
-        state.overlay = Some(Overlay::Models(models));
+        let mut form = ConnectionForm::new(ConnectionKind::CustomOpenAiResponses);
+        form.base_url = "http://127.0.0.1:11434/v1".into();
+        form.model = "local-model".into();
+        setup_panel(&mut state, form);
 
         let mut effects = Vec::new();
         save_connection(&mut state, &mut effects);
@@ -1800,13 +2429,7 @@ mod tests {
             .expect("save request");
         connection_saved(&mut state, request, None, None, false, &mut effects);
 
-        assert!(matches!(
-            state.overlay,
-            Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::Reasoning { .. },
-                ..
-            }))
-        ));
+        assert!(matches!(screen(&state), ModelScreen::Reasoning { .. }));
         effects.clear();
         select_reasoning(&mut state, 2, &mut effects);
         assert!(matches!(
@@ -1845,7 +2468,7 @@ mod tests {
         assert!(matches!(
             state.overlay,
             Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::List { selected: 0 },
+                screen: ModelScreen::Tab { selected: 0 },
                 ..
             }))
         ));
@@ -2179,7 +2802,7 @@ mod tests {
         assert!(matches!(
             &state.overlay,
             Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::List { selected: 0 },
+                screen: ModelScreen::Tab { selected: 0 },
                 ..
             }))
         ));
@@ -2188,7 +2811,7 @@ mod tests {
         assert!(matches!(
             &state.overlay,
             Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::List { .. },
+                screen: ModelScreen::Tab { .. },
                 ..
             }))
         ));
@@ -2288,7 +2911,7 @@ mod tests {
         assert!(matches!(
             &state.overlay,
             Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::List { .. },
+                screen: ModelScreen::Tab { .. },
                 ..
             }))
         ));
@@ -2301,13 +2924,13 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_onboarding_starts_login_without_inventing_a_model() {
+    fn the_kind_picker_starts_chatgpt_login_without_inventing_a_model() {
         let mut state = UiState::default();
         let mut models = ModelPanel::new(None);
-        models.screen = ModelScreen::Add { selected: 0 };
-        models.profiles.push(Profile::chatgpt());
+        models.screen = ModelScreen::Kind { selected: 0 };
         state.overlay = Some(Overlay::Models(models));
         let mut effects = Vec::new();
+
         choose_connection(&mut state, 0, &mut effects);
         assert!(matches!(
             effects.as_slice(),
@@ -2316,10 +2939,9 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_onboarding_returns_to_add_model_after_login() {
+    fn signing_in_returns_to_the_tab_strip_and_reloads_the_strip() {
         let mut state = UiState::default();
         let mut models = ModelPanel::new(None);
-        models.return_to_add_model = true;
         models.screen = ModelScreen::Login {
             request: 41,
             state: LoginState::Connecting,
@@ -2329,14 +2951,7 @@ mod tests {
         let mut effects = Vec::new();
         login_changed(&mut state, 41, LoginState::Succeeded, &mut effects);
 
-        assert!(matches!(
-            state.overlay,
-            Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::AddModel { .. },
-                return_to_add_model: false,
-                ..
-            }))
-        ));
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
         assert!(
             effects
                 .iter()
@@ -2378,8 +2993,7 @@ mod tests {
             running: None,
         });
         let mut models = ModelPanel::new(Some(session));
-        models.screen = ModelScreen::Add { selected: 0 };
-        models.profiles.push(Profile::chatgpt());
+        models.screen = ModelScreen::Kind { selected: 0 };
         state.overlay = Some(Overlay::Models(models));
         let mut effects = Vec::new();
 
@@ -2389,7 +3003,7 @@ mod tests {
     }
 
     #[test]
-    fn add_routes_an_existing_official_connection_to_key_management() {
+    fn choosing_a_saved_official_kind_opens_its_tab_instead_of_asking_again() {
         let profile = Profile::new(
             bone_app::ProfileId::new("openai").unwrap(),
             "OpenAI API",
@@ -2406,8 +3020,8 @@ mod tests {
             running: None,
         });
         let mut models = ModelPanel::new(None);
-        models.screen = ModelScreen::Add { selected: 1 };
-        models.profiles.push(profile);
+        models.screen = ModelScreen::Kind { selected: 1 };
+        models.profiles.push(profile.clone());
         models.choices.push(ModelChoice {
             selection,
             profile_label: "OpenAI API".into(),
@@ -2419,14 +3033,59 @@ mod tests {
         choose_connection(&mut state, 1, &mut effects);
 
         assert!(effects.is_empty());
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
+        assert_eq!(panel(&state).tab, 0);
+        assert_eq!(
+            state.status_text().map(str::to_owned),
+            Some(format!(
+                "Already connected: {}",
+                ConnectionKind::OpenAiApi.label()
+            ))
+        );
+
+        // `e` is the way back into its key and model fields.
+        edit_connection(&mut state, &mut effects);
         assert!(matches!(
-            &state.overlay,
-            Some(Overlay::Models(ModelPanel {
-                screen: ModelScreen::Setup(form),
-                ..
-            })) if form.edits_existing_connection()
-                && form.fields() == [SetupField::Key, SetupField::Model]
+            screen(&state),
+            ModelScreen::Setup(form)
+                if form.edits_existing_connection()
+                    && form.fields() == [SetupField::Key, SetupField::Model]
         ));
+    }
+
+    #[test]
+    fn editing_a_chatgpt_tab_restarts_sign_in_without_a_form() {
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        models.profiles.push(Profile::chatgpt());
+        state.overlay = Some(Overlay::Models(models));
+        let mut effects = Vec::new();
+
+        edit_connection(&mut state, &mut effects);
+
+        assert!(matches!(screen(&state), ModelScreen::Login { .. }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Login { profile, .. }] if *profile == bone_app::ProfileId::chatgpt()
+        ));
+    }
+
+    #[test]
+    fn the_add_tab_has_nothing_to_edit_or_delete() {
+        let mut state = UiState::default();
+        let mut models = ModelPanel::new(None);
+        state.overlay = Some(Overlay::Models(std::mem::replace(
+            &mut models,
+            ModelPanel::new(None),
+        )));
+        let mut effects = Vec::new();
+
+        edit_connection(&mut state, &mut effects);
+        delete_connection(&mut state);
+
+        assert!(effects.is_empty());
+        assert!(matches!(screen(&state), ModelScreen::Tab { .. }));
+        assert!(panel(&state).tab_is_add());
     }
 
     #[test]

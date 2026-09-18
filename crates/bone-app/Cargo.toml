@@ -24,6 +24,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 bone-adapters = { path = "../bone-adapters", features = ["test-utils"] }
+bytes.workspace = true
 rig-core = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["test-util"] }
 

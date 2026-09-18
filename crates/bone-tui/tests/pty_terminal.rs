@@ -919,7 +919,7 @@ fn real_mouse_overlay_scrolling_and_resizing_keep_the_composer_keyboard_owner() 
     process.write(b"before");
     // SGR coordinates are one-based. At 120×40 the model footer is on row 38.
     process.write(b"\x1b[<0;39;38M\x1b[<0;39;38m");
-    process.wait_for_bytes(b"Choose model");
+    process.wait_for_bytes(b"Connections & models");
     // Scroll over the overlay and transcript, then drag the left divider.
     process.write(b"\x1b[<65;50;28M\x1b[<64;50;10M");
     process.write(b"\x1b[<0;32;10M\x1b[<32;45;25M\x1b[<0;45;25m");

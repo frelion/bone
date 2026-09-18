@@ -164,6 +164,18 @@ impl Runtime {
                         .await;
                 });
             }
+            Effect::DeleteConnection { request, profile } => {
+                let app = self.app.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let error = app
+                        .delete_profile(profile)
+                        .await
+                        .err()
+                        .map(|error| error.to_string());
+                    let _ = tx.send(UiEvent::ConnectionDeleted { request, error }).await;
+                });
+            }
             Effect::CancelLogin => {
                 if let Some(login) = self.login.take() {
                     login.abort();
@@ -1702,5 +1714,67 @@ mod lifecycle_tests {
         runtime.login = Some(observer.abort_handle());
         runtime.shutdown().await.unwrap();
         assert!(observer.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_connection_reports_its_request_and_repeats_as_a_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        let app = App::open(bone_app::AppOptions::isolated(root.path().join("data")))
+            .await
+            .unwrap();
+        let workspace = app.open_workspace(root.path()).await.unwrap();
+        let profile = bone_app::Profile::new(
+            bone_app::ProfileId::new("configured-api").unwrap(),
+            "Configured API",
+            bone_app::EndpointConfig::OpenAiChatCompletions {
+                base_url: Some("https://example.invalid/v1".into()),
+            },
+        )
+        .unwrap();
+        app.save_profile(profile.clone()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let (ready_tx, _ready_rx) = mpsc::channel(1);
+        let mut runtime = Runtime::new(app.clone(), workspace.id, tx, ready_tx);
+
+        assert!(
+            !runtime
+                .apply(Effect::DeleteConnection {
+                    request: 31,
+                    profile: profile.id.clone(),
+                })
+                .await
+        );
+        assert!(matches!(
+            receive_event(&mut rx).await,
+            UiEvent::ConnectionDeleted {
+                request: 31,
+                error: None
+            }
+        ));
+        assert!(
+            app.profiles()
+                .await
+                .unwrap()
+                .iter()
+                .all(|saved| saved.id != profile.id)
+        );
+
+        // Deleting an id that is already gone is a success, not an error.
+        assert!(
+            !runtime
+                .apply(Effect::DeleteConnection {
+                    request: 32,
+                    profile: profile.id.clone(),
+                })
+                .await
+        );
+        assert!(matches!(
+            receive_event(&mut rx).await,
+            UiEvent::ConnectionDeleted {
+                request: 32,
+                error: None
+            }
+        ));
+        runtime.shutdown().await.unwrap();
     }
 }

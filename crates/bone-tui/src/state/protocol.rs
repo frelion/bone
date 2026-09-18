@@ -75,8 +75,16 @@ pub enum Action {
     CloseDetails,
     SelectModel(usize),
     SelectReasoning(usize),
+    PreviousTab,
+    NextTab,
+    SelectTab(usize),
+    EditConnection,
+    DeleteConnection,
+    ConfirmDeleteConnection,
+    ModelText(String),
+    ModelBackspace,
+    ModelClear,
     DeleteModel,
-    ToggleModelApply,
     ScrollOverlay {
         amount: isize,
         max: usize,
@@ -134,6 +142,10 @@ pub enum UiEvent {
         session: Option<SessionId>,
         error: Option<String>,
         key_saved: bool,
+    },
+    ConnectionDeleted {
+        request: u64,
+        error: Option<String>,
     },
     LoginChanged {
         request: u64,
@@ -310,6 +322,10 @@ pub enum Effect {
         request: u64,
         workspace_default: bool,
         selection: bone_app::ModelSelection,
+    },
+    DeleteConnection {
+        request: u64,
+        profile: bone_app::ProfileId,
     },
     OpenSession {
         session: SessionId,

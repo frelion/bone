@@ -2,38 +2,30 @@ use std::{collections::HashSet, fmt};
 
 use rig_core::{
     completion::CompletionRequest,
-    message::{AssistantContent, Message, UserContent},
+    message::{Message, ToolChoice as RigToolChoice},
 };
-use serde_json::Value;
 
 use crate::llm::{
-    Error, InputItem, ModelOptions, Protocol, ToolChoice, ToolDefinition,
-    item::{InputItemKind, InputSource},
-    model::{RequestOrigin, RequestSupport},
-    tool::ToolCallIdentities,
+    Error, InputItem, ModelOptions, ModelOptionsError, ToolDefinition, item::InputSource,
+    model::RequestOrigin,
 };
-
-/// Desired response representation.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq)]
-pub enum OutputFormat {
-    Text,
-    JsonSchema(Value),
-}
 
 /// One complete model call.
 ///
 /// `input` is the entire ordered context: prior committed items and the new
 /// input use the same representation. Instructions remain a separate,
 /// higher-authority field.
+///
+/// A request carries only what BONE actually sends: text input, instructions,
+/// tools, one required tool, and the selected model's protocol-scoped options.
+/// A missing option is added together with the code path that needs it, rather
+/// than carried as surface nothing sets.
 #[derive(Clone)]
 pub struct Request {
     input: Vec<InputItem>,
     instructions: Option<String>,
     tools: Vec<ToolDefinition>,
-    tool_choice: Option<ToolChoice>,
-    output: OutputFormat,
-    max_output_tokens: Option<u64>,
+    required_tool: Option<String>,
     options: Option<ModelOptions>,
 }
 
@@ -44,9 +36,7 @@ impl fmt::Debug for Request {
             .field("input_count", &self.input.len())
             .field("has_instructions", &self.instructions.is_some())
             .field("tool_count", &self.tools.len())
-            .field("tool_choice", &self.tool_choice)
-            .field("output", &self.output)
-            .field("max_output_tokens", &self.max_output_tokens)
+            .field("required_tool", &self.required_tool)
             .field("options", &self.options)
             .finish()
     }
@@ -58,9 +48,7 @@ impl Request {
             input: input.into_iter().collect(),
             instructions: None,
             tools: Vec::new(),
-            tool_choice: None,
-            output: OutputFormat::Text,
-            max_output_tokens: None,
+            required_tool: None,
             options: None,
         }
     }
@@ -75,18 +63,13 @@ impl Request {
         self
     }
 
-    pub fn tool_choice(mut self, tool_choice: ToolChoice) -> Self {
-        self.tool_choice = Some(tool_choice);
-        self
-    }
-
-    pub fn output(mut self, output: OutputFormat) -> Self {
-        self.output = output;
-        self
-    }
-
-    pub fn max_output_tokens(mut self, max_output_tokens: u64) -> Self {
-        self.max_output_tokens = Some(max_output_tokens);
+    /// Require the model to call exactly this tool.
+    ///
+    /// This is how BONE asks for structure — through one forced submission tool
+    /// — so it never asks a provider to enforce a JSON schema. A response
+    /// without that call is a protocol error, not a text answer.
+    pub fn require_tool(mut self, name: impl Into<String>) -> Self {
+        self.required_tool = Some(name.into());
         self
     }
 
@@ -95,57 +78,16 @@ impl Request {
         self
     }
 
-    pub(crate) fn into_rig(
-        self,
-        origin: &RequestOrigin,
-        support: RequestSupport,
-    ) -> Result<(CompletionRequest, ToolCallIdentities), Error> {
-        let previous_tool_calls = self.validate(origin, support)?;
+    pub(crate) fn into_rig(self, origin: &RequestOrigin) -> Result<CompletionRequest, Error> {
+        self.validate(origin)?;
 
-        let mut messages =
-            Vec::with_capacity(self.input.len() + usize::from(self.instructions.is_some()));
+        let capacity = self.input.len() + usize::from(self.instructions.is_some());
+        let mut messages = Vec::with_capacity(capacity);
         if let Some(instructions) = self.instructions {
             messages.push(Message::system(instructions));
         }
+        messages.extend(self.input.into_iter().map(InputItem::into_message));
 
-        let mut pending_results = Vec::<UserContent>::new();
-        let flush_results = |messages: &mut Vec<Message>, results: &mut Vec<UserContent>| {
-            if !results.is_empty() {
-                messages.push(Message::User {
-                    content: std::mem::take(results),
-                });
-            }
-        };
-
-        for item in self.input {
-            match item.kind {
-                InputItemKind::ToolResult { call, output } => {
-                    pending_results.push(call.result_content(output));
-                }
-                InputItemKind::External { source, text } => {
-                    flush_results(&mut messages, &mut pending_results);
-                    messages.push(InputItem::external_message(source, text));
-                }
-                InputItemKind::AssistantExample(text) => {
-                    flush_results(&mut messages, &mut pending_results);
-                    messages.push(InputItem::assistant_example_message(text));
-                }
-                InputItemKind::AssistantReplay { message, .. } => {
-                    flush_results(&mut messages, &mut pending_results);
-                    messages.push(message);
-                }
-            }
-        }
-        flush_results(&mut messages, &mut pending_results);
-
-        let output_schema = match self.output {
-            OutputFormat::Text => None,
-            OutputFormat::JsonSchema(value) => Some(
-                serde_json::from_value::<schemars::Schema>(value).map_err(|error| {
-                    Error::invalid(format!("invalid JSON output schema: {error}"))
-                })?,
-            ),
-        };
         let additional_params = self.options.map(ModelOptions::into_additional_params);
         let request = CompletionRequest {
             model: None,
@@ -158,23 +100,21 @@ impl Request {
                 .map(ToolDefinition::into_rig)
                 .collect(),
             temperature: None,
-            max_tokens: self.max_output_tokens,
-            tool_choice: self.tool_choice.map(ToolChoice::into_rig),
+            max_tokens: None,
+            tool_choice: self.required_tool.map(|name| RigToolChoice::Specific {
+                function_names: vec![name],
+            }),
             additional_params,
-            output_schema,
+            output_schema: None,
             record_telemetry_content: false,
         };
         request
             .validate_message_content()
             .map_err(Error::from_rig)?;
-        Ok((request, previous_tool_calls))
+        Ok(request)
     }
 
-    fn validate(
-        &self,
-        origin: &RequestOrigin,
-        support: RequestSupport,
-    ) -> Result<ToolCallIdentities, Error> {
+    fn validate(&self, origin: &RequestOrigin) -> Result<(), Error> {
         if self.input.is_empty() {
             return Err(Error::invalid("model request input is empty"));
         }
@@ -185,40 +125,17 @@ impl Request {
         {
             return Err(Error::invalid("model instructions are empty"));
         }
-        if self.max_output_tokens == Some(0) {
-            return Err(Error::invalid(
-                "max_output_tokens must be greater than zero",
-            ));
-        }
-        if self.max_output_tokens.is_some() && !support.max_output_tokens {
-            return Err(Error::unsupported(format!(
-                "endpoint `{}` does not support max_output_tokens",
-                origin.endpoint_id
-            )));
-        }
-        if matches!(self.output, OutputFormat::JsonSchema(_)) && !support.structured_output {
-            return Err(Error::unsupported(format!(
-                "endpoint `{}` does not support structured output",
-                origin.endpoint_id
-            )));
-        }
-        let has_tool_result = self
-            .input
-            .iter()
-            .any(|item| matches!(item.kind, InputItemKind::ToolResult { .. }));
-        if origin.protocol == Protocol::OpenAiChatCompletions
-            && matches!(self.output, OutputFormat::JsonSchema(_))
-            && !self.tools.is_empty()
-            && !has_tool_result
-        {
-            return Err(Error::unsupported(
-                "OpenAI Chat Completions cannot enforce structured output on an initial tool turn",
-            ));
-        }
         if let Some(options) = &self.options {
             options
                 .validate_for_protocol(origin.protocol)
-                .map_err(|error| Error::invalid(error.to_string()))?;
+                .map_err(|error| match error {
+                    // An option that belongs to another wire shape is never
+                    // dropped silently: it is rejected as unsupported.
+                    ModelOptionsError::UnsupportedProtocol { .. } => {
+                        Error::unsupported(error.to_string())
+                    }
+                    ModelOptionsError::EmptyOpenAiResponses => Error::invalid(error.to_string()),
+                })?;
         }
 
         let mut tool_names = HashSet::new();
@@ -246,73 +163,24 @@ impl Request {
             }
         }
 
-        if self.tool_choice.is_some() && self.tools.is_empty() {
-            return Err(Error::invalid(
-                "tool_choice requires at least one tool definition",
-            ));
+        if let Some(name) = &self.required_tool
+            && !tool_names.contains(name.as_str())
+        {
+            return Err(Error::invalid(format!(
+                "required tool `{name}` is not defined"
+            )));
         }
 
-        if let Some(ToolChoice::Specific(names)) = &self.tool_choice {
-            if names.is_empty() {
-                return Err(Error::invalid("specific tool choice is empty"));
-            }
-            if let Some(name) = names
-                .iter()
-                .find(|name| !tool_names.contains(name.as_str()))
-            {
-                return Err(Error::invalid(format!(
-                    "tool choice names undefined tool `{name}`"
-                )));
-            }
-            let unique_names = names.iter().collect::<HashSet<_>>();
-            if unique_names.len() != names.len() {
-                return Err(Error::invalid("specific tool choice repeats a tool name"));
-            }
-            if names.len() > 1 && origin.protocol != Protocol::OpenAiResponses {
-                return Err(Error::unsupported(format!(
-                    "{} supports only one specifically selected tool",
-                    origin.protocol
-                )));
-            }
-        }
-
-        let mut previous_tool_calls = ToolCallIdentities::default();
         for item in &self.input {
-            match &item.kind {
-                InputItemKind::External {
-                    source: InputSource::Named(name),
-                    text,
-                } => {
-                    if name.trim().is_empty() {
-                        return Err(Error::invalid("named input source is empty"));
-                    }
-                    if text.is_empty() {
-                        return Err(Error::invalid("external input text is empty"));
-                    }
-                }
-                InputItemKind::External { text, .. } | InputItemKind::AssistantExample(text) => {
-                    if text.is_empty() {
-                        return Err(Error::invalid("input text is empty"));
-                    }
-                }
-                InputItemKind::AssistantReplay {
-                    origin: item_origin,
-                    message,
-                } => {
-                    origin.ensure_same(item_origin)?;
-                    if let Message::Assistant { content, .. } = message {
-                        for content in content {
-                            if let AssistantContent::ToolCall(call) = content {
-                                previous_tool_calls.insert(call)?;
-                            }
-                        }
-                    }
-                }
-                InputItemKind::ToolResult { call, .. } => {
-                    origin.ensure_same(&call.origin)?;
-                }
+            if item.text.is_empty() {
+                return Err(Error::invalid("input text is empty"));
+            }
+            if let InputSource::Named(name) = &item.source
+                && name.trim().is_empty()
+            {
+                return Err(Error::invalid("named input source is empty"));
             }
         }
-        Ok(previous_tool_calls)
+        Ok(())
     }
 }

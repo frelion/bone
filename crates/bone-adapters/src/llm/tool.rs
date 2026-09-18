@@ -1,63 +1,9 @@
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
-use rig_core::message::{ToolCall as RigToolCall, ToolResultContent, UserContent};
+use rig_core::message::{ToolCall as RigToolCall, ToolResultContent};
 use serde_json::Value;
 
-use crate::llm::{Error, model::RequestOrigin};
-
-/// Every correlation namespace seen in committed assistant history.
-///
-/// Keeping this inside `bone-adapters` lets callers treat a [`ToolCall`] as one
-/// opaque capability while the model boundary still rejects duplicate wire
-/// handles before any tool can be executed.
-#[derive(Default)]
-pub(crate) struct ToolCallIdentities {
-    ids: HashSet<String>,
-    provider_call_ids: HashSet<String>,
-    provider_item_ids: HashSet<String>,
-}
-
-impl ToolCallIdentities {
-    pub(crate) fn insert(&mut self, call: &RigToolCall) -> Result<(), Error> {
-        if !self.ids.insert(call.id.as_str().to_owned()) {
-            return Err(Error::protocol(
-                "model response reused a tool-call identifier",
-            ));
-        }
-
-        if let Some(provider) = &call.provider {
-            if provider.call_id.is_empty() {
-                return Err(Error::protocol(
-                    "model response contained an empty provider tool-call identifier",
-                ));
-            }
-            if !self.provider_call_ids.insert(provider.call_id.clone()) {
-                return Err(Error::protocol(
-                    "model response reused a provider tool-call identifier",
-                ));
-            }
-            if let Some(item_id) = &provider.item_id {
-                if item_id.is_empty() {
-                    return Err(Error::protocol(
-                        "model response contained an empty provider tool item identifier",
-                    ));
-                }
-                if !self.provider_item_ids.insert(item_id.clone()) {
-                    return Err(Error::protocol(
-                        "model response reused a provider tool item identifier",
-                    ));
-                }
-            }
-        }
-
-        if call.function.name.trim().is_empty() {
-            return Err(Error::protocol(
-                "model response contained a tool call with an empty name",
-            ));
-        }
-        Ok(())
-    }
-}
+use crate::llm::model::RequestOrigin;
 
 /// A function the model may ask the caller to execute.
 #[derive(Clone, Debug, PartialEq)]
@@ -97,29 +43,6 @@ impl ToolDefinition {
     }
 }
 
-/// An explicit constraint on how the model may select supplied tools.
-///
-/// Omit [`crate::llm::Request::tool_choice`] for ordinary automatic selection.
-#[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ToolChoice {
-    None,
-    Required,
-    Specific(Vec<String>),
-}
-
-impl ToolChoice {
-    pub(crate) fn into_rig(self) -> rig_core::message::ToolChoice {
-        match self {
-            Self::None => rig_core::message::ToolChoice::None,
-            Self::Required => rig_core::message::ToolChoice::Required,
-            Self::Specific(function_names) => {
-                rig_core::message::ToolChoice::Specific { function_names }
-            }
-        }
-    }
-}
-
 /// One complete tool invocation requested by a model.
 #[derive(Clone, PartialEq)]
 pub struct ToolCall {
@@ -145,15 +68,6 @@ impl ToolCall {
     /// Parsed JSON arguments produced by the model.
     pub fn arguments(&self) -> &Value {
         &self.inner.function.arguments
-    }
-
-    pub(crate) fn result_content(&self, output: ToolOutput) -> UserContent {
-        UserContent::tool_result_for(
-            self.inner.id.clone(),
-            self.inner.provider.clone(),
-            self.inner.function.name.clone(),
-            output.content,
-        )
     }
 }
 

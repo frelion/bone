@@ -2,9 +2,7 @@ use std::{fmt, sync::Arc};
 
 use rig_core::completion::CompletionModel;
 
-use crate::llm::{
-    ConfigError, Model, Protocol, error::validate_endpoint_id, model::RequestSupport,
-};
+use crate::llm::{ConfigError, Model, Protocol, error::validate_endpoint_id};
 
 type ModelFactory = dyn Fn(String) -> Model + Send + Sync;
 
@@ -52,19 +50,6 @@ impl Endpoint {
         F: Fn(String) -> M + Send + Sync + 'static,
         M: CompletionModel + Send + Sync + 'static,
     {
-        Self::from_model_factory_with_support(endpoint_id, protocol, RequestSupport::FULL, factory)
-    }
-
-    pub(crate) fn from_model_factory_with_support<F, M>(
-        endpoint_id: impl Into<String>,
-        protocol: Protocol,
-        support: RequestSupport,
-        factory: F,
-    ) -> Result<Self, ConfigError>
-    where
-        F: Fn(String) -> M + Send + Sync + 'static,
-        M: CompletionModel + Send + Sync + 'static,
-    {
         let endpoint_id = endpoint_id.into();
         validate_endpoint_id(&endpoint_id)?;
 
@@ -76,7 +61,6 @@ impl Endpoint {
                 Arc::clone(&model_endpoint_id),
                 protocol,
                 Arc::from(model_id),
-                support,
                 inner,
             )
         });

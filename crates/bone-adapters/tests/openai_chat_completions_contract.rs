@@ -3,24 +3,73 @@ mod support;
 use std::error::Error as _;
 
 use bone_adapters::llm::{
-    ErrorKind, FinishReason, InputItem, InputSource, OutputFormat, OutputItem, Protocol, Request,
-    StreamEvent, ToolChoice, ToolDefinition, ToolOutput, testing::openai_chat_completions_endpoint,
+    Error, ErrorKind, FinishReason, InputItem, InputSource, Model, OutputItem, Protocol, Request,
+    Response, StreamEvent, ToolDefinition, testing::openai_chat_completions_endpoint,
 };
 use futures_util::StreamExt;
-use rig_core::{completion::CompletionError, providers::openai as rig_openai};
+use rig_core::{
+    completion::CompletionError, providers::openai as rig_openai,
+    test_utils::HttpErrorStreamingClient,
+};
 use serde_json::Value;
 use support::transport::ScriptedHttpClient;
 
-const TEXT_RESPONSE: &str = include_str!("fixtures/openai_chat_completions/text_response.json");
-const TOOL_RESPONSE: &str = include_str!("fixtures/openai_chat_completions/tool_response.json");
 const TEXT_STREAM: &str = include_str!("fixtures/openai_chat_completions/text_stream.sse");
 const TRUNCATED_STREAM: &str =
     include_str!("fixtures/openai_chat_completions/truncated_stream.sse");
 const ERROR_RESPONSE: &str = include_str!("fixtures/openai_chat_completions/error_response.json");
 
+/// The streamed form of the tool fixture: the same function call, delivered the
+/// way a streaming Chat Completions turn delivers it, plus the terminal record.
+const TOOL_STREAM: &str = r#"data: {"id":"chatcmpl_tool_1","object":"chat.completion.chunk","created":1700000001,"model":"chat-test-model","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_chat_test_1","type":"function","function":{"name":"inspect_path","arguments":""}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl_tool_1","object":"chat.completion.chunk","created":1700000001,"model":"chat-test-model","choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"id":null,"type":"function","function":{"name":null,"arguments":"{\"path\":\"/tmp/bone\"}"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl_tool_1","object":"chat.completion.chunk","created":1700000001,"model":"chat-test-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":null}
+
+data: {"id":"chatcmpl_tool_1","object":"chat.completion.chunk","created":1700000001,"model":"chat-test-model","choices":[],"usage":{"prompt_tokens":18,"completion_tokens":12,"total_tokens":30}}
+
+data: [DONE]
+
+"#;
+
+/// Drive one streaming call to the single terminal response it must end with.
+///
+/// Deltas are display-only, so every behavioural assertion in this file reads
+/// the terminal [`Response`]: the one trustworthy record of the call.
+async fn streamed_response(model: &Model, request: Request) -> Response {
+    let mut stream = model.stream(request).await.expect("stream should open");
+    let mut terminal = None;
+    while let Some(item) = stream.next().await {
+        if let StreamEvent::Completed(response) = item.expect("stream item should be valid") {
+            terminal = Some(response);
+        }
+    }
+    terminal.expect("stream must end with one complete response")
+}
+
+/// Drive one rejected streaming call to the single failure it must end with.
+async fn streamed_error(model: &Model, request: Request) -> Error {
+    let mut stream = match model.stream(request).await {
+        Ok(stream) => stream,
+        Err(error) => return error,
+    };
+    let mut failure = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(StreamEvent::Completed(_)) => {
+                panic!("a rejected call must not report a completed response")
+            }
+            Ok(_) => {}
+            Err(error) => failure = Some(error),
+        }
+    }
+    failure.expect("a rejected stream must end with one explicit error")
+}
+
 #[tokio::test]
 async fn sends_chat_completions_wire_and_preserves_all_identities() {
-    let transport = ScriptedHttpClient::unary_json(TEXT_RESPONSE);
+    let transport = ScriptedHttpClient::sse(TEXT_STREAM);
     let client = rig_openai::CompletionsClient::builder()
         .api_key("test-only-key")
         .base_url("https://gateway.example/v1")
@@ -33,14 +82,11 @@ async fn sends_chat_completions_wire_and_preserves_all_identities() {
         .model("chat-test-model")
         .expect("model should build");
 
-    let response = model
-        .complete(
-            Request::new([user("hello")])
-                .instructions("Answer briefly.")
-                .max_output_tokens(64),
-        )
-        .await
-        .expect("fixture should parse");
+    let response = streamed_response(
+        &model,
+        Request::new([user("hello")]).instructions("Answer briefly."),
+    )
+    .await;
 
     assert_eq!(endpoint.id(), "chat-test");
     assert_eq!(endpoint.protocol(), Protocol::OpenAiChatCompletions);
@@ -48,7 +94,7 @@ async fn sends_chat_completions_wire_and_preserves_all_identities() {
     assert_eq!(model.protocol(), Protocol::OpenAiChatCompletions);
     assert_eq!(model.id(), "chat-test-model");
     assert_eq!(response.origin().provider(), "openai");
-    assert_eq!(response.response_id(), Some("chatcmpl_text_1"));
+    assert_eq!(response.response_id(), Some("chatcmpl_stream_1"));
     assert_eq!(
         response.origin().reported_model_id(),
         Some("chat-test-model")
@@ -56,11 +102,11 @@ async fn sends_chat_completions_wire_and_preserves_all_identities() {
     assert_eq!(response.finish_reason(), Some(&FinishReason::Stop));
     assert!(matches!(
         response.items(),
-        [OutputItem::Text(text)] if text == "Hello from Chat Completions."
+        [OutputItem::Text(text)] if text == "Hello stream"
     ));
     assert_eq!(response.usage().input_tokens, 8);
-    assert_eq!(response.usage().output_tokens, 5);
-    assert_eq!(response.usage().total_tokens, 13);
+    assert_eq!(response.usage().output_tokens, 3);
+    assert_eq!(response.usage().total_tokens, 11);
 
     let metadata = transport.requests();
     assert_eq!(metadata.len(), 1);
@@ -78,12 +124,13 @@ async fn sends_chat_completions_wire_and_preserves_all_identities() {
         Some("Bearer test-only-key")
     );
 
-    let requests = transport.unary_requests();
+    let requests = transport.streaming_requests();
     assert_eq!(requests.len(), 1);
     let body: Value =
         serde_json::from_slice(&requests[0].body).expect("request body should be JSON");
     assert_eq!(body["model"], "chat-test-model");
-    assert_eq!(body["max_tokens"], 64);
+    // BONE sends no output-token bound of its own.
+    assert!(body["max_tokens"].is_null());
     assert_eq!(body["messages"][0]["role"], "system");
     assert_eq!(body["messages"][0]["content"][0]["type"], "text");
     assert_eq!(body["messages"][0]["content"][0]["text"], "Answer briefly.");
@@ -92,8 +139,8 @@ async fn sends_chat_completions_wire_and_preserves_all_identities() {
 }
 
 #[tokio::test]
-async fn maps_tool_calls_and_replays_the_opaque_response_and_result() {
-    let transport = ScriptedHttpClient::unary_json(TOOL_RESPONSE);
+async fn maps_tools_to_the_chat_completions_wire_shape() {
+    let transport = ScriptedHttpClient::sse(TOOL_STREAM);
     let client = rig_openai::CompletionsClient::builder()
         .api_key("test-only-key")
         .http_client(transport.clone())
@@ -104,28 +151,13 @@ async fn maps_tool_calls_and_replays_the_opaque_response_and_result() {
         .model("chat-test-model")
         .expect("model should build");
 
-    let unsupported = model
-        .complete(
-            Request::new([user("inspect and return JSON")])
-                .tools([inspect_path()])
-                .output(OutputFormat::JsonSchema(serde_json::json!({
-                    "type": "object"
-                }))),
-        )
-        .await
-        .expect_err("the initial tool turn cannot enforce a response schema");
-    assert_eq!(unsupported.kind(), ErrorKind::UnsupportedOption);
-    assert!(transport.requests().is_empty());
-
-    let response = model
-        .complete(
-            Request::new([user("inspect the path")])
-                .max_output_tokens(64)
-                .tools([inspect_path()])
-                .tool_choice(ToolChoice::Specific(vec!["inspect_path".to_owned()])),
-        )
-        .await
-        .expect("tool fixture should parse");
+    let response = streamed_response(
+        &model,
+        Request::new([user("inspect the path")])
+            .tools([inspect_path()])
+            .require_tool("inspect_path"),
+    )
+    .await;
 
     assert_eq!(response.finish_reason(), Some(&FinishReason::ToolCalls));
     let call = response
@@ -136,7 +168,7 @@ async fn maps_tool_calls_and_replays_the_opaque_response_and_result() {
     assert_eq!(call.name(), "inspect_path");
     assert_eq!(call.arguments()["path"], "/tmp/bone");
 
-    let first_requests = transport.unary_requests();
+    let first_requests = transport.streaming_requests();
     let first_body: Value =
         serde_json::from_slice(&first_requests[0].body).expect("first request body should be JSON");
     assert_eq!(first_body["tools"][0]["type"], "function");
@@ -146,70 +178,6 @@ async fn maps_tool_calls_and_replays_the_opaque_response_and_result() {
         first_body["tool_choice"]["function"]["name"],
         "inspect_path"
     );
-
-    let replay = response
-        .into_item()
-        .expect("tool response should be replayable as one opaque item");
-    let second_transport = ScriptedHttpClient::unary_json(TEXT_RESPONSE);
-    let second_client = rig_openai::CompletionsClient::builder()
-        .api_key("test-only-key")
-        .http_client(second_transport.clone())
-        .build()
-        .expect("test client should build");
-    let second_model = openai_chat_completions_endpoint("chat-tools", second_client)
-        .expect("endpoint should build")
-        .model("chat-test-model")
-        .expect("model should build");
-
-    second_model
-        .complete(
-            Request::new([
-                user("inspect the path"),
-                replay,
-                InputItem::tool_result(&call, ToolOutput::text("path is a directory")),
-            ])
-            .tools([inspect_path()])
-            .output(OutputFormat::JsonSchema(serde_json::json!({
-                "type": "object"
-            })))
-            .max_output_tokens(64),
-        )
-        .await
-        .expect("second-turn fixture should parse");
-
-    let second_metadata = second_transport.requests();
-    assert_eq!(second_metadata.len(), 1);
-    assert_eq!(
-        second_metadata[0].uri,
-        "https://api.openai.com/v1/chat/completions"
-    );
-
-    let second_requests = second_transport.unary_requests();
-    let second_body: Value = serde_json::from_slice(&second_requests[0].body)
-        .expect("second request body should be JSON");
-    assert_eq!(second_body["response_format"]["type"], "json_schema");
-    let messages = second_body["messages"]
-        .as_array()
-        .expect("messages should be an array");
-    let assistant_call = messages
-        .iter()
-        .find(|message| message["role"] == "assistant")
-        .and_then(|message| message["tool_calls"].as_array())
-        .and_then(|calls| calls.first())
-        .expect("assistant tool call should be replayed");
-    let tool_result = messages
-        .iter()
-        .find(|message| message["role"] == "tool")
-        .expect("tool result should be sent");
-    assert_eq!(assistant_call["id"], "call_chat_test_1");
-    assert_eq!(assistant_call["type"], "function");
-    assert_eq!(assistant_call["function"]["name"], "inspect_path");
-    assert_eq!(
-        assistant_call["function"]["arguments"],
-        r#"{"path":"/tmp/bone"}"#
-    );
-    assert_eq!(tool_result["tool_call_id"], "call_chat_test_1");
-    assert_eq!(tool_result["content"], "path is a directory");
 }
 
 #[tokio::test]
@@ -226,7 +194,7 @@ async fn stream_emits_text_and_exactly_one_completed_response() {
         .model("chat-test-model")
         .expect("model should build");
     let mut stream = model
-        .stream(Request::new([user("hello")]).max_output_tokens(32))
+        .stream(Request::new([user("hello")]))
         .await
         .expect("fixture stream should open");
     let mut text = String::new();
@@ -273,7 +241,7 @@ async fn truncated_stream_ends_with_one_explicit_error_and_no_completed_response
         .model("chat-test-model")
         .expect("model should build");
     let mut stream = model
-        .stream(Request::new([user("hello")]).max_output_tokens(32))
+        .stream(Request::new([user("hello")]))
         .await
         .expect("fixture stream should open");
     let mut text = String::new();
@@ -298,10 +266,13 @@ async fn truncated_stream_ends_with_one_explicit_error_and_no_completed_response
 
 #[tokio::test]
 async fn preserves_chat_http_error_status_body_and_path() {
-    let transport = ScriptedHttpClient::unary_error("429", ERROR_RESPONSE);
+    // A stream opens with the same POST a unary call sends, so a rejected
+    // stream-open is where a non-success status and its error body arrive.
+    let transport =
+        HttpErrorStreamingClient::new(http::StatusCode::TOO_MANY_REQUESTS, ERROR_RESPONSE);
     let client = rig_openai::CompletionsClient::builder()
         .api_key("test-only-key")
-        .http_client(transport.clone())
+        .http_client(transport)
         .build()
         .expect("test client should build");
     let model = openai_chat_completions_endpoint("chat-error", client)
@@ -309,10 +280,7 @@ async fn preserves_chat_http_error_status_body_and_path() {
         .model("chat-test-model")
         .expect("model should build");
 
-    let error = model
-        .complete(Request::new([user("hello")]))
-        .await
-        .expect_err("429 response must fail");
+    let error = streamed_error(&model, Request::new([user("hello")])).await;
 
     assert_eq!(error.kind(), ErrorKind::Provider);
     let source = error
@@ -332,10 +300,6 @@ async fn preserves_chat_http_error_status_body_and_path() {
             .expect("fixture is valid JSON")
             .expect("provider body should be retained")["error"]["code"],
         "invalid_value"
-    );
-    assert_eq!(
-        transport.requests()[0].uri,
-        "https://api.openai.com/v1/chat/completions"
     );
 }
 

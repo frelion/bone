@@ -866,6 +866,36 @@ impl App {
         reload_sessions(&targets, false).await
     }
 
+    /// Delete one saved connection and its stored credentials. Deleting an id
+    /// that is not saved is a no-op, so a repeated delete never fails.
+    ///
+    /// Sessions that still select the removed connection keep their selection;
+    /// they resolve to [`ConfigProblem::MissingProfile`] until it is changed.
+    pub async fn delete_profile(&self, profile: ProfileId) -> Result<()> {
+        let _update = self.inner.config_updates.lock().await;
+        self.ensure_open()?;
+        let profile = match self.profile(&profile) {
+            Ok(profile) => profile,
+            Err(Error::Configuration(ConfigProblem::MissingProfile(_))) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        self.inner
+            .providers
+            .logout(&profile)
+            .await
+            .map_err(Error::from)?;
+        self.inner.store.delete_profile(&profile.id)?;
+        let sessions = self.inner.sessions.lock().await;
+        let targets = sessions
+            .values()
+            .filter(|session| !session.releasing)
+            .map(|session| session.handle.clone())
+            .collect::<Vec<_>>();
+        drop(sessions);
+        drop(_update);
+        reload_sessions(&targets, false).await
+    }
+
     pub async fn set_api_key(&self, profile: ProfileId, key: ApiKey) -> Result<()> {
         self.ensure_open()?;
         let profile = self.profile(&profile)?;

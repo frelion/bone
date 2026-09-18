@@ -97,21 +97,27 @@ fn validate_api_key(api_key: &str) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use rig_core::test_utils::RecordingHttpClient;
+    use futures_util::StreamExt;
 
     use super::*;
-    use crate::llm::{InputItem, InputSource, Request};
+    use crate::llm::{
+        InputItem, InputSource, Request, StreamEvent,
+        protocol::test_client::ScriptedStreamingClient,
+    };
 
-    const TEXT_RESPONSE: &str = r#"{
-        "id":"msg_test_1",
-        "type":"message",
-        "role":"assistant",
-        "model":"claude-test",
-        "content":[{"type":"text","text":"ok"}],
-        "stop_reason":"end_turn",
-        "stop_sequence":null,
-        "usage":{"input_tokens":1,"output_tokens":1}
-    }"#;
+    const TEXT_STREAM: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_test_1","type":"message","role":"assistant","content":[],"model":"claude-test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"cache_creation_input_tokens":null,"cache_read_input_tokens":null,"output_tokens":0}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
 
     #[test]
     fn builds_official_and_compatible_endpoints_without_network_io() {
@@ -159,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn compatible_constructor_normalizes_the_real_wire_url_and_headers() {
-        let transport = RecordingHttpClient::new(TEXT_RESPONSE);
+        let transport = ScriptedStreamingClient::sse(TEXT_STREAM);
         let endpoint = compatible_with_http_client(
             "anthropic-gateway",
             "test-only-key",
@@ -168,15 +174,25 @@ mod tests {
         )
         .unwrap();
 
-        endpoint
-            .model("claude-test")
+        let mut stream = endpoint
+            .model("claude-sonnet-4-6")
             .unwrap()
-            .complete(
-                Request::new([InputItem::external(InputSource::User, "hello")])
-                    .max_output_tokens(8),
-            )
+            .stream(Request::new([InputItem::external(
+                InputSource::User,
+                "hello",
+            )]))
             .await
             .unwrap();
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            if matches!(event.unwrap(), StreamEvent::Completed(_)) {
+                completed = true;
+            }
+        }
+        assert!(
+            completed,
+            "the fixture stream must reach a terminal response"
+        );
 
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);

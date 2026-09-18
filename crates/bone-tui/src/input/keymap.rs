@@ -232,18 +232,10 @@ fn exact(key: &KeyEvent, code: KeyCode, modifiers: KeyModifiers) -> bool {
 fn overlay_action(key: KeyEvent, panel: &Overlay) -> Option<Action> {
     if matches!(
         panel,
-        Overlay::Models(models) if matches!(models.screen, ModelScreen::List { .. })
+        Overlay::Models(models) if matches!(models.screen, ModelScreen::Tab { .. })
     ) && exact(&key, KeyCode::Delete, KeyModifiers::NONE)
     {
         return Some(Action::DeleteModel);
-    }
-    if matches!(
-        panel,
-        Overlay::Models(models)
-            if matches!(&models.screen, ModelScreen::ModelForm(form) if !form.remove)
-    ) && exact(&key, KeyCode::Char(' '), KeyModifiers::NONE)
-    {
-        return Some(Action::ToggleModelApply);
     }
     if matches!(
         panel,
@@ -292,14 +284,69 @@ fn overlay_action(key: KeyEvent, panel: &Overlay) -> Option<Action> {
         };
     }
 
+    if let Overlay::Models(models) = panel {
+        // The manual model editor mirrors the connection form's field editing,
+        // but a model identifier is not a secret.
+        if matches!(models.screen, ModelScreen::ModelInput { .. }) {
+            if exact(&key, KeyCode::Char('u'), KeyModifiers::CONTROL) {
+                return Some(Action::ModelClear);
+            }
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                return None;
+            }
+            return match key.code {
+                KeyCode::Esc => Some(Action::Escape),
+                KeyCode::Enter => Some(Action::ActivatePanel),
+                KeyCode::Backspace => Some(Action::ModelBackspace),
+                KeyCode::Char(ch) => Some(Action::ModelText(ch.to_string())),
+                _ => None,
+            };
+        }
+        // Deleting a connection answers yes or no, and nothing else.
+        if matches!(models.screen, ModelScreen::ConfirmDelete { .. }) {
+            return match key.code {
+                KeyCode::Char('y') if key.modifiers == KeyModifiers::NONE => {
+                    Some(Action::ConfirmDeleteConnection)
+                }
+                KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => Some(Action::Escape),
+                KeyCode::Esc => Some(Action::Escape),
+                _ => None,
+            };
+        }
+        // Signing in has no rows to move through and no field to type into.
+        // Enter retries a failed attempt - the same action the rendered row
+        // carries, so the keyboard and the pointer agree.
+        if matches!(models.screen, ModelScreen::Login { .. }) {
+            return match key.code {
+                KeyCode::Esc => Some(Action::Escape),
+                KeyCode::Enter => Some(Action::ActivatePanel),
+                _ => None,
+            };
+        }
+    }
+
     if key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         return None;
     }
+    // The tab strip is the only screen with a horizontal axis: it moves between
+    // connections, and `d`/`e` act on the connection the tab shows. Neither key
+    // can be typed here, so a bare letter is unambiguous.
+    let on_tab = matches!(
+        panel,
+        Overlay::Models(models) if matches!(models.screen, ModelScreen::Tab { .. })
+    );
     match key.code {
         KeyCode::Esc => Some(Action::Escape),
+        KeyCode::Left if on_tab => Some(Action::PreviousTab),
+        KeyCode::Right if on_tab => Some(Action::NextTab),
+        KeyCode::Char('d') if on_tab => Some(Action::DeleteConnection),
+        KeyCode::Char('e') if on_tab => Some(Action::EditConnection),
         KeyCode::Up => Some(Action::PanelPrevious),
         KeyCode::Down => Some(Action::PanelNext),
         KeyCode::Enter => Some(Action::ActivatePanel),
@@ -334,10 +381,18 @@ mod tests {
     }
 
     fn model_form_panel() -> Overlay {
+        let mut profile = bone_app::Profile::chatgpt();
+        profile.add_model("model-a").unwrap();
         let mut models = crate::state::ModelPanel::new(None);
-        models.screen = ModelScreen::ModelForm(Box::new(crate::state::ModelForm::new(
-            bone_app::Profile::chatgpt(),
+        models.screen = ModelScreen::ModelForm(Box::new(crate::state::ModelForm::remove(
+            profile, "model-a",
         )));
+        Overlay::Models(models)
+    }
+
+    fn model_screen_panel(screen: ModelScreen) -> Overlay {
+        let mut models = crate::state::ModelPanel::new(None);
+        models.screen = screen;
         Overlay::Models(models)
     }
 
@@ -400,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn model_form_keeps_text_save_and_apply_toggle_on_one_keyboard_route() {
+    fn model_form_keeps_text_and_save_on_one_keyboard_route() {
         let mut state = UiState::default();
         state.overlay = Some(model_form_panel());
         state.enter_overlay();
@@ -410,13 +465,306 @@ mod tests {
             Some(Action::SetupText(_))
         ));
         assert!(matches!(
-            action_for_key(key(KeyCode::Char(' '), KeyModifiers::NONE), &state),
-            Some(Action::ToggleModelApply)
+            action_for_key(key(KeyCode::Enter, KeyModifiers::NONE), &state),
+            Some(Action::ActivatePanel)
+        ));
+    }
+
+    fn tab_panel() -> Overlay {
+        model_screen_panel(ModelScreen::Tab { selected: 0 })
+    }
+
+    #[test]
+    fn tab_arrows_move_between_connections_only_on_the_tab_screen() {
+        let mut state = UiState::default();
+        state.overlay = Some(tab_panel());
+        state.enter_overlay();
+        assert!(matches!(
+            action_for_key(key(KeyCode::Left, KeyModifiers::NONE), &state),
+            Some(Action::PreviousTab)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Right, KeyModifiers::NONE), &state),
+            Some(Action::NextTab)
+        ));
+
+        for screen in [
+            ModelScreen::Kind { selected: 0 },
+            ModelScreen::ModelInput {
+                value: String::new(),
+            },
+            ModelScreen::ConfirmDelete { selected: 0 },
+            ModelScreen::Reasoning {
+                selected: 0,
+                selection: bone_app::ModelSelection::new(bone_app::ProfileId::chatgpt(), "model")
+                    .unwrap(),
+            },
+            ModelScreen::ModelForm(Box::new(crate::state::ModelForm::remove(
+                bone_app::Profile::chatgpt(),
+                "model",
+            ))),
+        ] {
+            let mut state = UiState::default();
+            state.overlay = Some(model_screen_panel(screen));
+            state.enter_overlay();
+            for code in [KeyCode::Left, KeyCode::Right] {
+                assert!(
+                    !matches!(
+                        action_for_key(key(code, KeyModifiers::NONE), &state),
+                        Some(Action::PreviousTab | Action::NextTab)
+                    ),
+                    "{code:?} must not move tabs off the strip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_tab_screen_keeps_the_vertical_row_keys() {
+        let mut state = UiState::default();
+        state.overlay = Some(tab_panel());
+        state.enter_overlay();
+        assert!(matches!(
+            action_for_key(key(KeyCode::Up, KeyModifiers::NONE), &state),
+            Some(Action::PanelPrevious)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Down, KeyModifiers::NONE), &state),
+            Some(Action::PanelNext)
         ));
         assert!(matches!(
             action_for_key(key(KeyCode::Enter, KeyModifiers::NONE), &state),
             Some(Action::ActivatePanel)
         ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Esc, KeyModifiers::NONE), &state),
+            Some(Action::Escape)
+        ));
+    }
+
+    #[test]
+    fn connection_editing_keys_stay_out_of_text_fields() {
+        let mut state = UiState::default();
+        state.overlay = Some(tab_panel());
+        state.enter_overlay();
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('d'), KeyModifiers::NONE), &state),
+            Some(Action::DeleteConnection)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('e'), KeyModifiers::NONE), &state),
+            Some(Action::EditConnection)
+        ));
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            for code in [KeyCode::Char('d'), KeyCode::Char('e')] {
+                assert!(
+                    !matches!(
+                        action_for_key(key(code, modifiers), &state),
+                        Some(Action::DeleteConnection | Action::EditConnection)
+                    ),
+                    "{code:?} with {modifiers:?} must not act on the connection"
+                );
+            }
+        }
+        // ctrl+d stays the global exit, never a connection shortcut.
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL), &state),
+            Some(Action::Quit)
+        ));
+
+        state.overlay = Some(model_screen_panel(ModelScreen::ModelInput {
+            value: String::new(),
+        }));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('d'), KeyModifiers::NONE), &state),
+            Some(Action::ModelText(text)) if text == "d"
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('e'), KeyModifiers::NONE), &state),
+            Some(Action::ModelText(text)) if text == "e"
+        ));
+
+        state.overlay = Some(setup_panel());
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('d'), KeyModifiers::NONE), &state),
+            Some(Action::SetupText(text)) if text.as_str() == "d"
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('e'), KeyModifiers::NONE), &state),
+            Some(Action::SetupText(text)) if text.as_str() == "e"
+        ));
+    }
+
+    #[test]
+    fn the_manual_model_editor_mirrors_the_form_keys() {
+        let mut state = UiState::default();
+        state.overlay = Some(model_screen_panel(ModelScreen::ModelInput {
+            value: String::new(),
+        }));
+        state.enter_overlay();
+        assert!(matches!(
+            action_for_key(key(KeyCode::Esc, KeyModifiers::NONE), &state),
+            Some(Action::Escape)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Enter, KeyModifiers::NONE), &state),
+            Some(Action::ActivatePanel)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Backspace, KeyModifiers::NONE), &state),
+            Some(Action::ModelBackspace)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL), &state),
+            Some(Action::ModelClear)
+        ));
+        assert!(
+            action_for_key(
+                key(
+                    KeyCode::Char('u'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ),
+                &state
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('中'), KeyModifiers::NONE), &state),
+            Some(Action::ModelText(text)) if text == "中"
+        ));
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Tab,
+        ] {
+            assert!(
+                action_for_key(key(code, KeyModifiers::NONE), &state).is_none(),
+                "{code:?} does not edit the model identifier"
+            );
+        }
+        let typed = action_for_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &state).unwrap();
+        assert!(!format!("{typed:?}").contains("SecretText"));
+    }
+
+    #[test]
+    fn delete_confirmation_answers_yes_no_or_escape() {
+        let mut state = UiState::default();
+        state.overlay = Some(model_screen_panel(ModelScreen::ConfirmDelete {
+            selected: 0,
+        }));
+        state.enter_overlay();
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &state),
+            Some(Action::ConfirmDeleteConnection)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Char('n'), KeyModifiers::NONE), &state),
+            Some(Action::Escape)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Esc, KeyModifiers::NONE), &state),
+            Some(Action::Escape)
+        ));
+        // Enter keeps the shell's global meaning; the confirmation screen has
+        // no activation, so the panel ignores it.
+        assert!(matches!(
+            action_for_key(key(KeyCode::Enter, KeyModifiers::NONE), &state),
+            Some(Action::ActivatePanel)
+        ));
+        for code in [
+            KeyCode::Char('d'),
+            KeyCode::Char('e'),
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Backspace,
+        ] {
+            assert!(
+                action_for_key(key(code, KeyModifiers::NONE), &state).is_none(),
+                "{code:?} is not an answer to the confirmation"
+            );
+        }
+        assert!(
+            action_for_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL), &state).is_none(),
+            "a modified y is not a confirmation"
+        );
+    }
+
+    #[test]
+    fn the_login_screen_answers_escape_and_retry() {
+        let mut state = UiState::default();
+        state.overlay = Some(model_screen_panel(ModelScreen::Login {
+            request: 1,
+            state: bone_app::LoginState::Failed {
+                message: "authorization expired".into(),
+            },
+        }));
+        state.enter_overlay();
+        assert!(matches!(
+            action_for_key(key(KeyCode::Esc, KeyModifiers::NONE), &state),
+            Some(Action::Escape)
+        ));
+        // Enter retries, matching the rendered "Retry sign-in" row.
+        assert!(matches!(
+            action_for_key(key(KeyCode::Enter, KeyModifiers::NONE), &state),
+            Some(Action::ActivatePanel)
+        ));
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('d'),
+            KeyCode::Char('e'),
+            KeyCode::Char('y'),
+            KeyCode::Char('n'),
+            KeyCode::Char('x'),
+            KeyCode::Backspace,
+        ] {
+            assert!(
+                action_for_key(key(code, KeyModifiers::NONE), &state).is_none(),
+                "{code:?} is not a sign-in key"
+            );
+        }
+        assert!(
+            action_for_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL), &state).is_none(),
+            "the login screen has no field to clear"
+        );
+    }
+
+    #[test]
+    fn the_kind_picker_keeps_one_vertical_route_to_every_connection_kind() {
+        let mut state = UiState::default();
+        state.overlay = Some(model_screen_panel(ModelScreen::Kind { selected: 0 }));
+        state.enter_overlay();
+        assert!(matches!(
+            action_for_key(key(KeyCode::Up, KeyModifiers::NONE), &state),
+            Some(Action::PanelPrevious)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Down, KeyModifiers::NONE), &state),
+            Some(Action::PanelNext)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Enter, KeyModifiers::NONE), &state),
+            Some(Action::ActivatePanel)
+        ));
+        assert!(matches!(
+            action_for_key(key(KeyCode::Esc, KeyModifiers::NONE), &state),
+            Some(Action::Escape)
+        ));
+        for code in [KeyCode::Char('d'), KeyCode::Char('e')] {
+            assert!(
+                !matches!(
+                    action_for_key(key(code, KeyModifiers::NONE), &state),
+                    Some(Action::DeleteConnection | Action::EditConnection)
+                ),
+                "{code:?} is inert while choosing a kind"
+            );
+        }
     }
 
     #[test]

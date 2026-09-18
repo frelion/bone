@@ -208,6 +208,19 @@ ChatGPT subscription 使用 `$BONE_HOME/providers/chatgpt-subscription/auth.json
 
 Rig 为每次 cache 事务取得跨进程文件锁：锁内重新读取记录，按需完成 refresh，并以同目录临时文件原子替换；invalidate 与 logout 使用同一把锁。等待设备授权的人机阶段不持锁，成功提交时再取锁。锁等待和 HTTP 请求都有界且取消安全，因此一个 App 不再以生命周期 lease 排斥另一个 App。logout 清除 cache；已经取得请求上下文的在途请求自行结束。
 
+### `App::delete_profile`
+
+`App::delete_profile(ProfileId)` 删除一个已保存连接及其凭据，语义固定：
+
+1. 先取 `config_updates` 屏障并确认 App 仍打开，整个删除与同一屏障下的其他配置写入互斥。
+2. 用 `App::profile` 查这个 id；**不存在的 id 直接返回 `Ok(())`**，所以重复删除是幂等的，不会报 `MissingProfile`。
+3. 连接存在时调用已有的 provider `logout(&profile)`：API-key 连接清掉由 Endpoint 指纹决定的 `credentials.toml` 槽位，ChatGPT subscription 清掉 `providers/chatgpt-subscription/auth.json`，两者都丢弃进程内 volatile key。删除不另写一套凭据代码，凭据与连接身份的一致性规则与 logout 完全相同。
+4. 再从 `$BONE_HOME/config.toml` 的 `profiles` 移除该 Profile。`DataStore::delete_profile` 委托给文件配置层：加锁、确认摘要未变、`retain` 掉目标项、重新校验并原子重写；id 不在文件里时既不改写也不创建文件，因此这一层同样幂等。
+5. 随后收集所有非 releasing 的 Session handle，`drop` 句柄后调用 `reload_sessions(&targets, false)`，与 `apply_profile` 同形地让受影响的 Session 重新解析配置。
+6. **悬空的 `ModelSelection` 不主动清理**：仍然选择该连接的 Session 保留原选择，`resolve_model` 产出 `ConfigProblem::MissingProfile`，由前端接管；TUI 因此在模型面板上显示 `Model setup needs attention`，用户重新选一个模型即可修复。App 不猜测替代连接，也不静默改写已保存的选择。
+
+删除连接与从连接里移除一个模型是两件事：`resolve_model` 只要求 profile 存在，所以仅把某个模型从连接的 `models` 列表里移除（而不是删除 profile）不会让仍在使用它的 Session 变成 `MissingProfile`。
+
 ## Runtime 装配与旧会话背景
 
 首次有 Queued 输入需要执行时，Session 惰性创建 Runtime。启动流程是：

@@ -99,26 +99,24 @@ fn validate_api_key(api_key: &str) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use rig_core::test_utils::RecordingHttpClient;
+    use futures_util::StreamExt;
     use serde_json::Value;
 
     use super::*;
-    use crate::llm::{InputItem, InputSource, Request};
+    use crate::llm::{
+        InputItem, InputSource, Request, StreamEvent,
+        protocol::test_client::ScriptedStreamingClient,
+    };
 
-    const TEXT_RESPONSE: &str = r#"{
-        "id":"chatcmpl_test_1",
-        "object":"chat.completion",
-        "created":0,
-        "model":"chat-test",
-        "system_fingerprint":null,
-        "choices":[{
-            "index":0,
-            "message":{"role":"assistant","content":"ok"},
-            "logprobs":null,
-            "finish_reason":"stop"
-        }],
-        "usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
-    }"#;
+    const TEXT_STREAM: &str = r#"data: {"id":"chatcmpl_test_1","object":"chat.completion.chunk","created":0,"model":"chat-test","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl_test_1","object":"chat.completion.chunk","created":0,"model":"chat-test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}
+
+data: {"id":"chatcmpl_test_1","object":"chat.completion.chunk","created":0,"model":"chat-test","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}
+
+data: [DONE]
+
+"#;
 
     #[test]
     fn builds_official_endpoint_without_network_io() {
@@ -134,7 +132,7 @@ mod tests {
 
     #[tokio::test]
     async fn compatible_constructor_sends_the_chat_completions_wire_contract() {
-        let transport = RecordingHttpClient::new(TEXT_RESPONSE);
+        let transport = ScriptedStreamingClient::sse(TEXT_STREAM);
         let endpoint = compatible_with_http_client(
             "chat-gateway",
             "test-only-key",
@@ -143,16 +141,25 @@ mod tests {
         )
         .unwrap();
 
-        endpoint
+        let mut stream = endpoint
             .model("chat-test")
             .unwrap()
-            .complete(
+            .stream(
                 Request::new([InputItem::external(InputSource::User, "hello")])
-                    .instructions("Answer briefly.")
-                    .max_output_tokens(16),
+                    .instructions("Answer briefly."),
             )
             .await
             .unwrap();
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            if matches!(event.unwrap(), StreamEvent::Completed(_)) {
+                completed = true;
+            }
+        }
+        assert!(
+            completed,
+            "the fixture stream must reach a terminal response"
+        );
 
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);
@@ -176,7 +183,8 @@ mod tests {
 
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["model"], "chat-test");
-        assert_eq!(body["max_tokens"], 16);
+        // BONE sends no output bound of its own.
+        assert!(body.get("max_tokens").is_none());
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(body["messages"][0]["content"][0]["text"], "Answer briefly.");

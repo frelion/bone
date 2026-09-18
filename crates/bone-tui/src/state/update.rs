@@ -83,6 +83,9 @@ pub fn update(state: &mut UiState, event: UiEvent) -> Vec<Effect> {
             error,
             key_saved,
         } => overlay::connection_saved(state, request, session, error, key_saved, &mut effects),
+        UiEvent::ConnectionDeleted { request, error } => {
+            overlay::connection_deleted(state, request, error, &mut effects);
+        }
 
         UiEvent::LoginChanged {
             request,
@@ -748,8 +751,16 @@ fn handle_action(state: &mut UiState, action: Action, effects: &mut Vec<Effect>)
         Action::PanelNext => overlay::panel_next(state),
         Action::SelectModel(index) => overlay::select_model(state, index, effects),
         Action::SelectReasoning(index) => overlay::select_reasoning(state, index, effects),
+        Action::PreviousTab => overlay::previous_tab(state),
+        Action::NextTab => overlay::next_tab(state),
+        Action::SelectTab(index) => overlay::select_tab(state, index, effects),
+        Action::EditConnection => overlay::edit_connection(state, effects),
+        Action::DeleteConnection => overlay::delete_connection(state),
+        Action::ConfirmDeleteConnection => overlay::confirm_delete_connection(state, effects),
+        Action::ModelText(value) => overlay::model_text(state, value),
+        Action::ModelBackspace => overlay::model_backspace(state),
+        Action::ModelClear => overlay::model_clear(state),
         Action::DeleteModel => overlay::delete_model(state, effects),
-        Action::ToggleModelApply => overlay::toggle_model_apply(state),
         Action::SetupText(value) => overlay::setup_text(state, value),
         Action::SetupClear => overlay::setup_clear(state),
         Action::SetupBackspace => overlay::setup_backspace(state),
@@ -2749,10 +2760,12 @@ mod panel_draft_tests {
                         profiles: vec![],
                     },
                 );
-                let add = 0;
-                update(&mut state, UiEvent::Action(Action::SelectModel(add)));
+                // With no saved connection the first screen is the tab strip
+                // holding only the trailing add tab; its last row opens the
+                // kind picker, and a compatible service starts on its label.
+                let add_row = 0;
+                update(&mut state, UiEvent::Action(Action::SelectModel(add_row)));
                 update(&mut state, UiEvent::Action(Action::ChooseConnection(3)));
-                update(&mut state, UiEvent::Action(Action::ChooseConnection(0)));
                 update(&mut state, UiEvent::Action(Action::SetupClear));
                 update(
                     &mut state,
@@ -2774,10 +2787,15 @@ mod panel_draft_tests {
                         ..
                     })) if form.label.is_empty()
                 ));
+                // Escape only leaves the form: the panel stays on its tab.
                 update(&mut state, UiEvent::Action(Action::Escape));
-                update(&mut state, UiEvent::Action(Action::Escape));
-                update(&mut state, UiEvent::Action(Action::Escape));
-                assert!(matches!(state.overlay, Some(Overlay::Models(_))));
+                assert!(matches!(
+                    &state.overlay,
+                    Some(Overlay::Models(ModelPanel {
+                        screen: ModelScreen::Tab { .. },
+                        ..
+                    }))
+                ));
             }
             update(&mut state, UiEvent::Action(Action::Escape));
             assert!(state.overlay.is_none());
@@ -2908,6 +2926,646 @@ fn trim_editor_history(state: &mut UiState) {
             }
             bytes -= before - editor.history_bytes();
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_tab_tests {
+    use super::*;
+    use crate::state::{ModelOperation, ModelOperationKind};
+
+    fn profile(id: &str) -> bone_app::Profile {
+        bone_app::Profile::new(
+            bone_app::ProfileId::new(id).unwrap(),
+            id,
+            bone_app::EndpointConfig::OpenAiChatCompletions {
+                base_url: Some(format!("https://{id}.example.test/v1")),
+            },
+        )
+        .unwrap()
+    }
+
+    fn choice(profile: &bone_app::Profile, model: &str) -> ModelChoice {
+        ModelChoice {
+            selection: bone_app::ModelSelection::new(profile.id.clone(), model).unwrap(),
+            profile_label: profile.label.clone(),
+            label: model.into(),
+        }
+    }
+
+    fn panel(state: &UiState) -> &ModelPanel {
+        match state.overlay.as_ref() {
+            Some(Overlay::Models(panel)) => panel,
+            _ => panic!("model panel"),
+        }
+    }
+
+    fn screen(state: &UiState) -> &ModelScreen {
+        &panel(state).screen
+    }
+
+    /// Open /model and answer its load with a saved connection per profile.
+    fn open_panel(
+        state: &mut UiState,
+        profiles: Vec<bone_app::Profile>,
+        choices: Vec<ModelChoice>,
+    ) {
+        update(state, UiEvent::Action(Action::OpenModels));
+        let request = state.model_operation.expect("model load").request;
+        let session = state.selected;
+        update(
+            state,
+            UiEvent::ModelsLoaded {
+                session,
+                request,
+                choices,
+                profiles,
+            },
+        );
+    }
+
+    /// Deliver one more load reply for a panel that already has its profiles.
+    fn reload_panel(
+        state: &mut UiState,
+        profiles: Vec<bone_app::Profile>,
+        choices: Vec<ModelChoice>,
+    ) {
+        let session = state.selected;
+        let request = 7;
+        state.model_operation = Some(ModelOperation {
+            session,
+            request,
+            kind: ModelOperationKind::Load,
+        });
+        update(
+            state,
+            UiEvent::ModelsLoaded {
+                session,
+                request,
+                choices,
+                profiles,
+            },
+        );
+    }
+
+    #[test]
+    fn a_fresh_open_lands_on_the_connection_the_current_model_belongs_to() {
+        let first = profile("first");
+        let second = profile("second");
+        let mut state = UiState::default();
+        state.model_facts = Some(ModelFacts {
+            saved: Ok(bone_app::ResolvedModel {
+                selection: bone_app::ModelSelection::new(second.id.clone(), "model-b").unwrap(),
+                profile: second.clone(),
+            }),
+            running: None,
+        });
+        open_panel(
+            &mut state,
+            vec![first.clone(), second.clone()],
+            vec![choice(&first, "model-a"), choice(&second, "model-b")],
+        );
+        assert_eq!(
+            panel(&state).tab,
+            1,
+            "a fresh open follows the connection the current model belongs to"
+        );
+
+        // Choosing another tab survives a reload: only a fresh open moves it.
+        update(&mut state, UiEvent::Action(Action::PreviousTab));
+        assert_eq!(panel(&state).tab, 0);
+        reload_panel(
+            &mut state,
+            vec![first.clone(), second],
+            vec![
+                choice(&first, "model-a"),
+                choice(&profile("second"), "model-b"),
+            ],
+        );
+        assert_eq!(
+            panel(&state).tab,
+            0,
+            "a reload keeps the tab the user chose"
+        );
+    }
+
+    #[test]
+    fn the_strip_switches_connections_and_every_connection_keeps_its_own_rows() {
+        let first = profile("first");
+        let second = profile("second");
+        let mut state = UiState::default();
+        open_panel(
+            &mut state,
+            vec![first.clone(), second.clone()],
+            vec![choice(&first, "model-a"), choice(&second, "model-b")],
+        );
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
+
+        update(&mut state, UiEvent::Action(Action::NextTab));
+        assert_eq!(panel(&state).tab, 1);
+        assert_eq!(panel(&state).tab_models()[0].model, "model-b");
+        assert_eq!(
+            panel(&state)
+                .tab_profile()
+                .map(|profile| profile.id.clone()),
+            Some(second.id.clone())
+        );
+
+        update(&mut state, UiEvent::Action(Action::NextTab));
+        assert!(panel(&state).tab_is_add());
+        assert!(panel(&state).tab_models().is_empty());
+        update(&mut state, UiEvent::Action(Action::NextTab));
+        assert_eq!(panel(&state).tab, 2);
+
+        update(&mut state, UiEvent::Action(Action::SelectTab(0)));
+        assert_eq!(panel(&state).tab, 0);
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
+        // A tab that does not exist changes nothing.
+        update(&mut state, UiEvent::Action(Action::SelectTab(9)));
+        assert_eq!(panel(&state).tab, 0);
+    }
+
+    #[test]
+    fn entering_a_model_id_applies_it_to_the_current_tab() {
+        let first = profile("first");
+        let second = profile("second");
+        let mut state = UiState::default();
+        open_panel(
+            &mut state,
+            vec![first.clone(), second.clone()],
+            vec![choice(&first, "model-a"), choice(&second, "model-b")],
+        );
+        update(&mut state, UiEvent::Action(Action::NextTab));
+
+        // Enter on the last row opens the manual editor.
+        update(&mut state, UiEvent::Action(Action::SelectModel(1)));
+        assert!(matches!(
+            screen(&state),
+            ModelScreen::ModelInput { value } if value.is_empty()
+        ));
+
+        // An empty value is refused without an effect.
+        let effects = update(&mut state, UiEvent::Action(Action::ActivatePanel));
+        assert!(effects.is_empty());
+        assert_eq!(state.status_text(), Some("Enter a model ID"));
+
+        update(
+            &mut state,
+            UiEvent::Action(Action::ModelText("  manual-model  ".into())),
+        );
+        let effects = update(&mut state, UiEvent::Action(Action::ActivatePanel));
+        let [Effect::SetModel { selection, .. }] = effects.as_slice() else {
+            panic!("a manual model must be applied")
+        };
+        assert_eq!(selection.profile, second.id);
+        assert_eq!(selection.model, "manual-model");
+    }
+
+    #[test]
+    fn a_pasted_model_id_reaches_the_manual_editor() {
+        use crate::input::terminal_event;
+        use crossterm::event::Event;
+        let first = profile("first");
+        let mut state = UiState::default();
+        open_panel(
+            &mut state,
+            vec![first.clone()],
+            vec![choice(&first, "model-a")],
+        );
+        update(&mut state, UiEvent::Action(Action::SelectModel(1)));
+        state.enter_overlay();
+
+        let event = terminal_event(Event::Paste("pasted-model".into()), None, &state)
+            .expect("the manual editor accepts a paste");
+        update(&mut state, event);
+
+        assert!(matches!(
+            screen(&state),
+            ModelScreen::ModelInput { value } if value == "pasted-model"
+        ));
+    }
+
+    #[test]
+    fn deleting_the_current_connection_needs_a_confirmation() {
+        let first = profile("first");
+        let second = profile("second");
+        let mut state = UiState::default();
+        open_panel(
+            &mut state,
+            vec![first, second.clone()],
+            vec![choice(&second, "model-a"), choice(&second, "model-b")],
+        );
+        update(&mut state, UiEvent::Action(Action::SelectTab(1)));
+        // Move the cursor without activating a model, so no apply is pending.
+        update(&mut state, UiEvent::Action(Action::PanelNext));
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 1 }));
+
+        let effects = update(&mut state, UiEvent::Action(Action::DeleteConnection));
+        assert!(effects.is_empty());
+        assert!(matches!(
+            screen(&state),
+            ModelScreen::ConfirmDelete { selected: 1 }
+        ));
+
+        // Enter is inert on the confirmation screen; only "y" deletes.
+        let effects = update(&mut state, UiEvent::Action(Action::ActivatePanel));
+        assert!(effects.is_empty());
+        assert!(matches!(screen(&state), ModelScreen::ConfirmDelete { .. }));
+
+        // "n" is Escape for this screen: back to the strip, on the row the user
+        // was on, with no effect.
+        let effects = update(&mut state, UiEvent::Action(Action::Escape));
+        assert!(effects.is_empty());
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 1 }));
+        assert_eq!(panel(&state).tab, 1);
+
+        update(&mut state, UiEvent::Action(Action::DeleteConnection));
+        let effects = update(&mut state, UiEvent::Action(Action::ConfirmDeleteConnection));
+        let [
+            Effect::DeleteConnection {
+                request,
+                profile: deleted,
+            },
+        ] = effects.as_slice()
+        else {
+            panic!("a confirmed delete must send one effect")
+        };
+        assert_eq!(*deleted, second.id);
+        let request = *request;
+
+        // The strip is still current, and the reply reloads it.
+        let effects = update(
+            &mut state,
+            UiEvent::ConnectionDeleted {
+                request,
+                error: None,
+            },
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadModels { .. }))
+        );
+        assert_eq!(panel(&state).tab, 1);
+        assert!(!panel(&state).tab_is_add());
+    }
+
+    #[test]
+    fn a_confirmed_delete_cannot_be_confirmed_twice() {
+        let only = profile("only");
+        let mut state = UiState::default();
+        open_panel(&mut state, vec![only], vec![]);
+
+        update(&mut state, UiEvent::Action(Action::DeleteConnection));
+        let effects = update(&mut state, UiEvent::Action(Action::ConfirmDeleteConnection));
+        assert_eq!(effects.len(), 1);
+        // The dialog closes at once and the pending operation reports progress.
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
+        assert_eq!(
+            state.model_operation.map(|operation| operation.kind),
+            Some(ModelOperationKind::Delete)
+        );
+
+        // A second confirmation finds no dialog and no effect.
+        let effects = update(&mut state, UiEvent::Action(Action::ConfirmDeleteConnection));
+        assert!(effects.is_empty());
+
+        // Escape cannot close the panel out from under a delete in flight.
+        update(&mut state, UiEvent::Action(Action::Escape));
+        assert!(state.overlay.is_some());
+        assert!(
+            state
+                .status_text()
+                .is_some_and(|status| status.contains("Finishing"))
+        );
+
+        // The reply clears the operation, so the panel is usable again.
+        let request = state.model_operation.expect("pending delete").request;
+        update(
+            &mut state,
+            UiEvent::ConnectionDeleted {
+                request,
+                error: Some("keychain unavailable".into()),
+            },
+        );
+        assert_ne!(
+            state.model_operation.map(|operation| operation.kind),
+            Some(ModelOperationKind::Delete)
+        );
+        assert!(
+            state
+                .status_text()
+                .is_some_and(|status| status.contains("Connection was not deleted"))
+        );
+    }
+
+    #[test]
+    fn a_stale_delete_reply_is_ignored() {
+        let only = profile("only");
+        let mut state = UiState::default();
+        open_panel(&mut state, vec![only], vec![]);
+        update(&mut state, UiEvent::Action(Action::DeleteConnection));
+        let effects = update(&mut state, UiEvent::Action(Action::ConfirmDeleteConnection));
+        let [Effect::DeleteConnection { request, .. }] = effects.as_slice() else {
+            panic!("delete effect")
+        };
+        let request = *request;
+
+        // A reply for a request nobody is waiting on changes nothing.
+        let effects = update(
+            &mut state,
+            UiEvent::ConnectionDeleted {
+                request: request.wrapping_add(1),
+                error: Some("keychain unavailable".into()),
+            },
+        );
+        assert!(effects.is_empty());
+        assert!(state.status_text().is_none());
+        assert_eq!(
+            state.model_operation.map(|operation| operation.kind),
+            Some(ModelOperationKind::Delete)
+        );
+    }
+
+    #[test]
+    fn saving_a_connection_keeps_the_tab_inside_the_strip() {
+        let mut state = UiState::default();
+        open_panel(&mut state, vec![], vec![]);
+        update(&mut state, UiEvent::Action(Action::SelectModel(0)));
+        update(&mut state, UiEvent::Action(Action::ChooseConnection(3)));
+        update(&mut state, UiEvent::Action(Action::SetupClear));
+        update(
+            &mut state,
+            UiEvent::Action(Action::SetupText("label".to_owned().into())),
+        );
+        update(&mut state, UiEvent::Action(Action::NextField));
+        update(
+            &mut state,
+            UiEvent::Action(Action::SetupText(
+                "https://a.example.test/v1".to_owned().into(),
+            )),
+        );
+        let effects = update(&mut state, UiEvent::Action(Action::SaveConnection));
+        let [Effect::SaveConnection { request, .. }] = effects.as_slice() else {
+            panic!("save effect")
+        };
+        let request = *request;
+
+        let effects = update(
+            &mut state,
+            UiEvent::ConnectionSaved {
+                request,
+                session: None,
+                error: None,
+                key_saved: false,
+            },
+        );
+        assert!(matches!(screen(&state), ModelScreen::Tab { .. }));
+        let load = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::LoadModels { request, .. } => Some(*request),
+                _ => None,
+            })
+            .expect("the strip reloads after a save");
+        // The connection appears one tab to the left of the add tab the panel
+        // was showing.
+        update(
+            &mut state,
+            UiEvent::ModelsLoaded {
+                session: None,
+                request: load,
+                choices: vec![],
+                profiles: vec![profile("saved")],
+            },
+        );
+        assert_eq!(panel(&state).tab, 0);
+        assert!(!panel(&state).tab_is_add());
+    }
+
+    #[test]
+    fn signing_in_keeps_the_tab_inside_the_strip() {
+        let mut state = UiState::default();
+        open_panel(&mut state, vec![], vec![]);
+        update(&mut state, UiEvent::Action(Action::SelectModel(0)));
+        let effects = update(&mut state, UiEvent::Action(Action::ChooseConnection(0)));
+        let [Effect::Login { request, .. }] = effects.as_slice() else {
+            panic!("chatgpt onboarding must ask for a sign-in")
+        };
+        let request = *request;
+
+        let effects = update(
+            &mut state,
+            UiEvent::LoginChanged {
+                request,
+                state: bone_app::LoginState::Succeeded,
+            },
+        );
+        assert!(matches!(screen(&state), ModelScreen::Tab { .. }));
+        let load = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::LoadModels { request, .. } => Some(*request),
+                _ => None,
+            })
+            .expect("the strip reloads after a sign-in");
+        update(
+            &mut state,
+            UiEvent::ModelsLoaded {
+                session: None,
+                request: load,
+                choices: vec![],
+                profiles: vec![bone_app::Profile::chatgpt()],
+            },
+        );
+        assert_eq!(panel(&state).tab, 0);
+        assert_eq!(
+            panel(&state)
+                .tab_profile()
+                .map(|profile| profile.id.clone()),
+            Some(bone_app::ProfileId::chatgpt())
+        );
+    }
+
+    #[test]
+    fn deleting_the_only_connection_leaves_the_add_tab() {
+        let only = profile("only");
+        let mut state = UiState::default();
+        open_panel(&mut state, vec![only], vec![]);
+        update(&mut state, UiEvent::Action(Action::DeleteConnection));
+        let effects = update(&mut state, UiEvent::Action(Action::ConfirmDeleteConnection));
+        let [Effect::DeleteConnection { request, .. }] = effects.as_slice() else {
+            panic!("delete effect")
+        };
+        let request = *request;
+
+        let effects = update(
+            &mut state,
+            UiEvent::ConnectionDeleted {
+                request,
+                error: None,
+            },
+        );
+        let load = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::LoadModels { request, .. } => Some(*request),
+                _ => None,
+            })
+            .expect("the strip reloads after a delete");
+        update(
+            &mut state,
+            UiEvent::ModelsLoaded {
+                session: None,
+                request: load,
+                choices: vec![],
+                profiles: vec![],
+            },
+        );
+        assert!(panel(&state).tab_is_add());
+        assert_eq!(panel(&state).tab, 0);
+        assert_eq!(panel(&state).tab_row_count(), 1);
+    }
+
+    #[test]
+    fn editing_a_connection_takes_the_form_and_returns_to_the_same_tab() {
+        let first = profile("first");
+        let second = profile("second");
+        let mut state = UiState::default();
+        open_panel(&mut state, vec![first, second], vec![]);
+        update(&mut state, UiEvent::Action(Action::NextTab));
+
+        update(&mut state, UiEvent::Action(Action::EditConnection));
+        assert!(matches!(screen(&state), ModelScreen::Setup(_)));
+
+        // Saving the edit reloads the same connection's tab.
+        let effects = update(&mut state, UiEvent::Action(Action::SaveConnection));
+        let [Effect::SaveConnection { request, .. }] = effects.as_slice() else {
+            panic!("save effect")
+        };
+        let request = *request;
+        let effects = update(
+            &mut state,
+            UiEvent::ConnectionSaved {
+                request,
+                session: None,
+                error: None,
+                key_saved: false,
+            },
+        );
+        let load = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::LoadModels { request, .. } => Some(*request),
+                _ => None,
+            })
+            .expect("the strip reloads after an edit");
+        update(
+            &mut state,
+            UiEvent::ModelsLoaded {
+                session: None,
+                request: load,
+                choices: vec![],
+                profiles: vec![profile("first"), profile("second")],
+            },
+        );
+        assert_eq!(panel(&state).tab, 1);
+        assert_eq!(
+            panel(&state)
+                .tab_profile()
+                .map(|profile| profile.id.clone()),
+            Some(bone_app::ProfileId::new("second").unwrap())
+        );
+    }
+
+    #[test]
+    fn tab_moves_only_act_on_the_strip() {
+        let first = profile("first");
+        let second = profile("second");
+        let mut state = UiState::default();
+        open_panel(&mut state, vec![first, second], vec![]);
+
+        update(&mut state, UiEvent::Action(Action::EditConnection));
+        assert!(matches!(screen(&state), ModelScreen::Setup(_)));
+        update(&mut state, UiEvent::Action(Action::NextTab));
+        update(&mut state, UiEvent::Action(Action::PreviousTab));
+        assert_eq!(panel(&state).tab, 0);
+
+        // Choosing a tab is the way back to the strip from a sub-screen.
+        update(&mut state, UiEvent::Action(Action::SelectTab(1)));
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
+        assert_eq!(panel(&state).tab, 1);
+        assert_eq!(
+            panel(&state)
+                .tab_profile()
+                .map(|profile| profile.id.clone()),
+            Some(bone_app::ProfileId::new("second").unwrap())
+        );
+    }
+
+    #[test]
+    fn clicking_a_tab_leaves_the_sign_in_screen() {
+        let mut state = UiState::default();
+        open_panel(&mut state, vec![], vec![]);
+        update(&mut state, UiEvent::Action(Action::SelectModel(0)));
+        let effects = update(&mut state, UiEvent::Action(Action::ChooseConnection(0)));
+        assert!(matches!(effects.as_slice(), [Effect::Login { .. }]));
+
+        let effects = update(&mut state, UiEvent::Action(Action::SelectTab(0)));
+        assert!(matches!(effects.as_slice(), [Effect::CancelLogin]));
+        assert!(matches!(screen(&state), ModelScreen::Tab { .. }));
+    }
+
+    #[test]
+    fn a_pending_load_blocks_every_connection_action() {
+        let mut state = UiState::default();
+        update(&mut state, UiEvent::Action(Action::OpenModels));
+        assert_eq!(
+            state.model_operation.map(|operation| operation.kind),
+            Some(ModelOperationKind::Load)
+        );
+        let before = panel(&state).tab;
+
+        for action in [
+            Action::SelectModel(0),
+            Action::SelectTab(1),
+            Action::NextTab,
+            Action::EditConnection,
+            Action::DeleteConnection,
+            Action::ActivatePanel,
+        ] {
+            let effects = update(&mut state, UiEvent::Action(action));
+            assert!(effects.is_empty());
+        }
+
+        assert_eq!(panel(&state).tab, before);
+        assert!(matches!(screen(&state), ModelScreen::Tab { selected: 0 }));
+    }
+
+    #[test]
+    fn bare_d_and_e_are_typed_where_text_is_edited() {
+        let mut state = UiState::default();
+        open_panel(&mut state, vec![], vec![]);
+        update(&mut state, UiEvent::Action(Action::SelectModel(0)));
+        update(&mut state, UiEvent::Action(Action::ChooseConnection(1)));
+
+        update(&mut state, UiEvent::Action(Action::SetupClear));
+        for ch in ['d', 'e'] {
+            update(
+                &mut state,
+                UiEvent::Action(Action::SetupText(ch.to_string().into())),
+            );
+        }
+        let Some(Overlay::Models(ModelPanel {
+            screen: ModelScreen::Setup(form),
+            ..
+        })) = &state.overlay
+        else {
+            panic!("connection form")
+        };
+        assert_eq!(form.key.as_str(), "de");
+        // The form is still open: neither letter acted on a connection.
+        assert_eq!(state.model_operation.map(|operation| operation.kind), None);
     }
 }
 

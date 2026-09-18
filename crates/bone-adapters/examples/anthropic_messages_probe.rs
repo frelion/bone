@@ -1,8 +1,8 @@
 use std::{env, error::Error, io};
 
 use bone_adapters::llm::{
-    InputItem, InputSource, Request, Response, StreamEvent, ToolCallDelta, ToolChoice,
-    ToolDefinition, protocol::anthropic_messages,
+    InputItem, InputSource, Request, Response, StreamEvent, ToolCallDelta, ToolDefinition,
+    protocol::anthropic_messages,
 };
 use futures_util::StreamExt;
 use serde_json::json;
@@ -31,13 +31,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let model = endpoint.model(&model_id)?;
 
     let mut request = Request::new([InputItem::external(InputSource::User, mode.prompt())])
-        .instructions("This is a protocol-boundary probe. Follow the user request exactly.")
-        .max_output_tokens(1_024);
+        .instructions("This is a protocol-boundary probe. Follow the user request exactly.");
 
     if matches!(mode, Mode::Tool) {
         request = request
             .tools([inspect_path_definition()])
-            .tool_choice(ToolChoice::Specific(vec!["inspect_path".to_owned()]));
+            .require_tool("inspect_path");
     }
 
     println!("endpoint: {}", model.endpoint_id());
@@ -52,11 +51,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut stream = model.stream(request).await?;
     let mut completed = None;
+    let mut streamed = Streamed::default();
 
     while let Some(item) = stream.next().await {
         match item {
             Ok(event) => {
-                if let Some(response) = print_event(event)? {
+                if let Some(response) = print_event(event, &mut streamed)? {
                     completed = Some(response);
                 }
             }
@@ -71,8 +71,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
     })?;
     println!("\n[aggregated.output]\n{:#?}", response.items());
+    streamed.report(&response);
 
     Ok(())
+}
+
+/// Display state for the live stream. Deltas are shown as they arrive; the
+/// terminal response stays the record the probe reports.
+#[derive(Default)]
+struct Streamed {
+    text: String,
+    reasoning: String,
+    text_deltas: usize,
+    reasoning_deltas: usize,
+}
+
+impl Streamed {
+    fn report(&self, response: &Response) {
+        let terminal = response.text().unwrap_or_default();
+        println!(
+            "[streamed.summary] text_deltas={} reasoning_deltas={} text_bytes={} reasoning_bytes={} matches_aggregated_text={}",
+            self.text_deltas,
+            self.reasoning_deltas,
+            self.text.len(),
+            self.reasoning.len(),
+            self.text == terminal
+        );
+        if !self.reasoning.is_empty() {
+            println!("[streamed.reasoning] {:?}", self.reasoning);
+        }
+    }
 }
 
 impl Mode {
@@ -133,10 +161,20 @@ fn inspect_path_definition() -> ToolDefinition {
     )
 }
 
-fn print_event(event: StreamEvent) -> Result<Option<Response>, serde_json::Error> {
+fn print_event(
+    event: StreamEvent,
+    streamed: &mut Streamed,
+) -> Result<Option<Response>, serde_json::Error> {
     match event {
         StreamEvent::TextDelta(text) => {
+            streamed.text_deltas += 1;
+            streamed.text.push_str(&text);
             println!("[text.delta] {text:?}");
+        }
+        StreamEvent::ReasoningDelta(reasoning) => {
+            streamed.reasoning_deltas += 1;
+            streamed.reasoning.push_str(&reasoning);
+            println!("[reasoning.delta] {reasoning:?}");
         }
         StreamEvent::ToolCallDelta { id, delta } => match delta {
             ToolCallDelta::Name(name) => {
@@ -174,9 +212,27 @@ fn print_event(event: StreamEvent) -> Result<Option<Response>, serde_json::Error
 
 fn print_help() {
     println!(
-        "Anthropic Messages boundary probe\n\n\
-         Usage:\n  cargo run -p bone-adapters --example anthropic_messages_probe -- [text|tool]\n\n\
-         Required environment:\n  ANTHROPIC_API_KEY\n  BONE_ANTHROPIC_MODEL\n\n\
-         Optional environment:\n  ANTHROPIC_BASE_URL  Anthropic-compatible endpoint base URL"
+        "\
+Inspect BONE's Anthropic Messages boundary.
+
+Usage:
+  cargo run -p bone-adapters --example anthropic_messages_probe -- [text|tool]
+
+Required environment:
+  ANTHROPIC_API_KEY      API key
+  BONE_ANTHROPIC_MODEL   Messages-capable model identifier
+
+Optional environment:
+  ANTHROPIC_BASE_URL     Anthropic Messages-compatible API root
+
+Streaming:
+  Text and reasoning deltas print as they arrive; the terminal response is
+  reprinted as the aggregated output with its tool calls.
+
+Modes:
+  text   Observe text, reasoning, terminal, and aggregated events (default)
+  tool   Force one inspect_path call and display it without executing it
+
+This probe calls /v1/messages. It never falls back to another protocol."
     );
 }

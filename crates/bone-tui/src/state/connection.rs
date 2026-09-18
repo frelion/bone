@@ -40,12 +40,6 @@ pub enum ConnectionKind {
 }
 
 impl ConnectionKind {
-    pub const ADVANCED: [Self; 3] = [
-        Self::CustomOpenAiResponses,
-        Self::CustomOpenAiChatCompletions,
-        Self::CustomAnthropicMessages,
-    ];
-
     pub fn label(self) -> &'static str {
         match self {
             Self::OpenAiApi => "OpenAI API",
@@ -63,6 +57,21 @@ impl ConnectionKind {
                 | Self::CustomOpenAiChatCompletions
                 | Self::CustomAnthropicMessages
         )
+    }
+
+    /// The profile identifier of a connection kind that has exactly one
+    /// possible connection. A compatible service has none: two gateways of the
+    /// same kind are two connections.
+    fn official_id(self) -> Option<ProfileId> {
+        match self {
+            Self::OpenAiApi => Some(ProfileId::new("openai").expect("static profile identifier")),
+            Self::AnthropicApi => {
+                Some(ProfileId::new("anthropic").expect("static profile identifier"))
+            }
+            Self::CustomOpenAiResponses
+            | Self::CustomOpenAiChatCompletions
+            | Self::CustomAnthropicMessages => None,
+        }
     }
 
     fn endpoint(self, base_url: Option<String>) -> EndpointConfig {
@@ -84,6 +93,53 @@ pub enum SetupField {
     BaseUrl,
     Key,
     Model,
+}
+
+/// One row of the connection-kind picker behind the trailing "add" tab.
+///
+/// ChatGPT subscription authorization has no connection form, so it is a row of
+/// this picker next to every [`ConnectionKind`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KindChoice {
+    ChatGpt,
+    Api(ConnectionKind),
+}
+
+impl KindChoice {
+    /// The picker order: the subscription first, the two official API keys
+    /// next, and the compatible services last.
+    pub const ALL: [Self; 6] = [
+        Self::ChatGpt,
+        Self::Api(ConnectionKind::OpenAiApi),
+        Self::Api(ConnectionKind::AnthropicApi),
+        Self::Api(ConnectionKind::CustomOpenAiResponses),
+        Self::Api(ConnectionKind::CustomOpenAiChatCompletions),
+        Self::Api(ConnectionKind::CustomAnthropicMessages),
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ChatGpt => "ChatGPT · use subscription",
+            Self::Api(kind) => kind.label(),
+        }
+    }
+
+    pub fn note(self) -> &'static str {
+        match self {
+            Self::ChatGpt => "Sign in with your ChatGPT subscription",
+            Self::Api(kind) if kind.advanced() => "Compatible service URL and API key",
+            Self::Api(_) => "API key only · add models next",
+        }
+    }
+
+    /// Whether a saved connection already is the one this row would create.
+    /// Choosing it opens that tab instead of asking for the same details twice.
+    pub fn already_connected(self, profile: &Profile) -> bool {
+        match self {
+            Self::ChatGpt => profile.id == ProfileId::chatgpt(),
+            Self::Api(kind) => kind.official_id().is_some_and(|id| profile.id == id),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -108,12 +164,10 @@ impl ConnectionForm {
         } else {
             SetupField::Key
         };
-        let id = match kind {
-            ConnectionKind::OpenAiApi => ProfileId::new("openai").unwrap(),
-            ConnectionKind::AnthropicApi => ProfileId::new("anthropic").unwrap(),
-            _ => ProfileId::new(format!("connection-{}", RequestId::new()))
-                .expect("UUID profile identifier"),
-        };
+        let id = kind.official_id().unwrap_or_else(|| {
+            ProfileId::new(format!("connection-{}", RequestId::new()))
+                .expect("UUID profile identifier")
+        });
         Self {
             kind,
             label: kind.label().into(),
@@ -222,33 +276,23 @@ impl ConnectionForm {
     }
 }
 
-/// A one-field form for adding a model to an existing connection.
+/// A one-field form that removes one model from a connection's saved list.
+///
+/// Adding a model happens on the connection's tab (type a model ID) or in the
+/// connection form's Model field, so this form only ever removes: a model row
+/// the connection does not have saved has nothing to remove.
 #[derive(Debug)]
 pub struct ModelForm {
     pub profile: Profile,
     pub model: String,
-    pub apply: bool,
-    pub remove: bool,
     pub pending_request: Option<u64>,
 }
 
 impl ModelForm {
-    pub fn new(profile: Profile) -> Self {
-        Self {
-            profile,
-            model: String::new(),
-            apply: true,
-            remove: false,
-            pending_request: None,
-        }
-    }
-
     pub fn remove(profile: Profile, model: impl Into<String>) -> Self {
         Self {
             profile,
             model: model.into(),
-            apply: false,
-            remove: true,
             pending_request: None,
         }
     }
@@ -260,21 +304,10 @@ impl ModelForm {
     pub fn validated(&self) -> Result<(Profile, Option<ModelSelection>), String> {
         let model = self.model.as_str();
         let mut profile = self.profile.clone();
-        if self.remove {
-            if !profile.remove_model(model) {
-                return Err("This model is not saved on the connection".into());
-            }
-            return Ok((profile, None));
+        if !profile.remove_model(model) {
+            return Err("This model is not saved on the connection".into());
         }
-        profile
-            .add_model(model)
-            .map_err(|error| error.to_string())?;
-        let selection = self
-            .apply
-            .then(|| ModelSelection::new(profile.id.clone(), model))
-            .transpose()
-            .map_err(|error| error.to_string())?;
-        Ok((profile, selection))
+        Ok((profile, None))
     }
 }
 
@@ -366,40 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn model_form_adds_and_validates_one_model() {
-        let profile = Profile::new(
-            ProfileId::new("custom").unwrap(),
-            "Custom",
-            EndpointConfig::OpenAiResponses {
-                base_url: Some("http://127.0.0.1:8080/v1".into()),
-            },
-        )
-        .unwrap();
-        let mut form = ModelForm::new(profile.clone());
-        assert!(form.validated().is_err());
-        form.model = "model-a".into();
-        let (saved, selection) = form.validated().unwrap();
-        assert_eq!(saved.models, vec!["model-a"]);
-        assert_eq!(selection.unwrap().model, "model-a");
-        let mut duplicate = profile;
-        duplicate.add_model("model-a").unwrap();
-        let mut form = ModelForm::new(duplicate);
-        form.model = "model-a".into();
-        assert!(form.validated().is_err());
-
-        let mut invalid = ModelForm::new(saved.clone());
-        invalid.model = " model-b ".into();
-        assert!(invalid.validated().is_err());
-
-        let mut catalog_only = ModelForm::new(saved);
-        catalog_only.model = "model-b".into();
-        catalog_only.apply = false;
-        let (_, selection) = catalog_only.validated().unwrap();
-        assert_eq!(selection, None);
-    }
-
-    #[test]
-    fn model_form_removes_a_saved_model_without_changing_runtime_selection() {
+    fn model_form_removes_only_a_model_saved_on_the_connection() {
         let mut profile = Profile::new(
             ProfileId::new("custom").unwrap(),
             "Custom",
@@ -409,6 +409,12 @@ mod tests {
         )
         .unwrap();
         profile.add_model("model-a").unwrap();
+        let form = ModelForm::remove(profile.clone(), "model-b");
+        assert_eq!(
+            form.validated().unwrap_err(),
+            "This model is not saved on the connection"
+        );
+
         let form = ModelForm::remove(profile, "model-a");
         let (saved, selection) = form.validated().unwrap();
         assert!(saved.models.is_empty());

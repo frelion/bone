@@ -1,20 +1,19 @@
 use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use rig_core::{
-    completion::{CompletionError, CompletionModel, CompletionRequest, CompletionResponse},
+    completion::{CompletionError, CompletionModel, CompletionRequest},
     streaming::StreamingCompletionResponse,
 };
 
-use crate::llm::{Error, Protocol, Request, Response, ResponseStream};
-
-type CompletionFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<CompletionResponse, CompletionError>> + Send + 'a>>;
+use crate::llm::{Error, Protocol, Request, ResponseStream};
 
 type StreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<StreamingCompletionResponse, CompletionError>> + Send + 'a>>;
 
+/// A provider model behind BONE's one call shape.
+///
+/// Only `stream` is erased, because only `stream` is ever called.
 trait ErasedModel: Send + Sync {
-    fn complete(&self, request: CompletionRequest) -> CompletionFuture<'_>;
     fn stream(&self, request: CompletionRequest) -> StreamFuture<'_>;
 }
 
@@ -22,10 +21,6 @@ impl<M> ErasedModel for M
 where
     M: CompletionModel + Send + Sync + 'static,
 {
-    fn complete(&self, request: CompletionRequest) -> CompletionFuture<'_> {
-        Box::pin(CompletionModel::completion(self, request))
-    }
-
     fn stream(&self, request: CompletionRequest) -> StreamFuture<'_> {
         Box::pin(CompletionModel::stream(self, request))
     }
@@ -38,44 +33,10 @@ pub(crate) struct RequestOrigin {
     pub(crate) model_id: Arc<str>,
 }
 
-impl RequestOrigin {
-    pub(crate) fn ensure_same(&self, other: &Self) -> Result<(), Error> {
-        if self == other {
-            Ok(())
-        } else {
-            Err(Error::invalid(
-                "assistant and tool state can only be replayed to the model that produced it",
-            ))
-        }
-    }
-}
-
-/// Endpoint-specific request facts that prevent accepted options from being
-/// silently discarded. Kept private rather than exposed as a capability
-/// registry.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RequestSupport {
-    pub(crate) max_output_tokens: bool,
-    pub(crate) structured_output: bool,
-}
-
-impl RequestSupport {
-    pub(crate) const FULL: Self = Self {
-        max_output_tokens: true,
-        structured_output: true,
-    };
-
-    pub(crate) const CHATGPT_SUBSCRIPTION: Self = Self {
-        max_output_tokens: false,
-        structured_output: false,
-    };
-}
-
 /// A selected model behind one configured endpoint.
 #[derive(Clone)]
 pub struct Model {
     origin: Arc<RequestOrigin>,
-    support: RequestSupport,
     inner: Arc<dyn ErasedModel>,
 }
 
@@ -95,7 +56,6 @@ impl Model {
         endpoint_id: Arc<str>,
         protocol: Protocol,
         id: Arc<str>,
-        support: RequestSupport,
         inner: impl CompletionModel + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -104,7 +64,6 @@ impl Model {
                 protocol,
                 model_id: id,
             }),
-            support,
             inner: Arc::new(inner),
         }
     }
@@ -124,26 +83,14 @@ impl Model {
         &self.origin.model_id
     }
 
-    /// Execute one complete request.
-    pub async fn complete(&self, request: Request) -> Result<Response, Error> {
-        let (request, previous_tool_calls) = request.into_rig(&self.origin, self.support)?;
-        let response = self
-            .inner
-            .complete(request)
-            .await
-            .map_err(Error::from_rig)?;
-        Response::from_rig(Arc::clone(&self.origin), response, previous_tool_calls)
-    }
-
     /// Open one streaming request.
+    ///
+    /// This is the only model-call entry point. A caller that only wants the
+    /// final result consumes the stream to its terminal event.
     pub async fn stream(&self, request: Request) -> Result<ResponseStream, Error> {
-        let (request, previous_tool_calls) = request.into_rig(&self.origin, self.support)?;
+        let request = request.into_rig(&self.origin)?;
         let stream = self.inner.stream(request).await.map_err(Error::from_rig)?;
-        Ok(ResponseStream::new(
-            stream,
-            Arc::clone(&self.origin),
-            previous_tool_calls,
-        ))
+        Ok(ResponseStream::new(stream, Arc::clone(&self.origin)))
     }
 }
 
@@ -160,12 +107,14 @@ mod tests {
             AssistantContent, CompletionError, CompletionModel, CompletionRequest,
             CompletionResponse, Usage,
         },
-        message::{ToolCall as RigToolCall, ToolFunction},
-        streaming::{StreamingCompletionResponse, StreamingResult},
+        streaming::StreamingCompletionResponse,
     };
 
     use super::*;
-    use crate::llm::{ErrorKind, InputItem, InputSource};
+    use crate::llm::{
+        ErrorKind, InputItem, InputSource, ModelOptions, Response, StreamEvent,
+        protocol::openai_responses::{Reasoning, ReasoningEffort},
+    };
 
     #[derive(Clone)]
     struct FakeModel {
@@ -190,9 +139,81 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<StreamingCompletionResponse, CompletionError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let inner: StreamingResult = Box::pin(stream::empty());
-            Ok(StreamingCompletionResponse::stream("fake", inner))
+            Ok(streaming(CompletionResponse::new(
+                vec![AssistantContent::text("ok")],
+                Usage::default(),
+                "fake",
+            )))
         }
+    }
+
+    /// Replay a response through a stream, the way Rig normalizes a provider
+    /// stream into an aggregated response.
+    fn streaming(response: CompletionResponse) -> StreamingCompletionResponse {
+        use rig_core::streaming::{
+            RawStreamingChoice, RawStreamingToolCall, StreamFinal, StreamPartId, WireId,
+            normalize_stream,
+        };
+        let mut items = response
+            .choice
+            .into_iter()
+            .map(|item| {
+                Ok(match item {
+                    AssistantContent::Text(text) => RawStreamingChoice::Message(text.text),
+                    AssistantContent::ToolCall(call) => {
+                        let provider = call.provider.as_ref();
+                        let call_id = provider.map_or_else(
+                            || call.id.as_str().to_owned(),
+                            |provider| provider.call_id.clone(),
+                        );
+                        let item_id = provider.and_then(|provider| provider.item_id.clone());
+                        let mut streamed = RawStreamingToolCall::new(
+                            StreamPartId::wire(call_id.clone()),
+                            call.function.name.clone(),
+                            call.function.arguments.clone(),
+                        )
+                        .with_call_id(call_id);
+                        streamed.tool_id = item_id.and_then(WireId::new);
+                        RawStreamingChoice::ToolCall(streamed)
+                    }
+                    AssistantContent::Reasoning(reasoning) => RawStreamingChoice::Message(
+                        reasoning
+                            .content
+                            .iter()
+                            .filter_map(|part| match part {
+                                rig_core::completion::message::ReasoningContent::Text {
+                                    text,
+                                    ..
+                                } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    AssistantContent::Image(_) => {
+                        panic!("an image cannot be replayed through a stream fixture")
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        items.push(Ok(RawStreamingChoice::FinalResponse(StreamFinal::new(
+            "fake",
+            response.usage,
+        ))));
+        let stream = normalize_stream(Box::pin(stream::iter(items)), Ok);
+        StreamingCompletionResponse::stream("fake", stream)
+    }
+
+    /// Drive a call to its single terminal response.
+    async fn complete(model: &Model, request: Request) -> Result<Response, Error> {
+        let mut stream = model.stream(request).await?;
+        let mut terminal = None;
+        while let Some(item) = stream.next().await {
+            if let StreamEvent::Completed(response) = item? {
+                terminal = Some(response);
+            }
+        }
+        terminal.ok_or_else(Error::incomplete_stream)
     }
 
     fn model(calls: Arc<AtomicUsize>) -> Model {
@@ -200,7 +221,6 @@ mod tests {
             Arc::from("fake-endpoint"),
             Protocol::OpenAiResponses,
             Arc::from("fake-model"),
-            RequestSupport::FULL,
             FakeModel { calls },
         )
     }
@@ -209,13 +229,12 @@ mod tests {
     async fn exposes_one_bone_completion_path() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model = model(Arc::clone(&calls));
-        let response = model
-            .complete(Request::new([InputItem::external(
-                InputSource::User,
-                "hello",
-            )]))
-            .await
-            .unwrap();
+        let response = complete(
+            &model,
+            Request::new([InputItem::external(InputSource::User, "hello")]),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(response.text().as_deref(), Some("ok"));
         assert_eq!(response.origin().endpoint_id(), "fake-endpoint");
@@ -226,31 +245,82 @@ mod tests {
     #[tokio::test]
     async fn validates_before_dispatch() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let error = model(Arc::clone(&calls))
-            .complete(Request::new([]))
+        let error = complete(&model(Arc::clone(&calls)), Request::new([]))
             .await
             .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidRequest);
         assert_eq!(calls.load(Ordering::Relaxed), 0);
 
-        let error = model(Arc::clone(&calls))
-            .complete(
-                Request::new([InputItem::external(InputSource::User, "hello")]).options(
-                    crate::llm::ModelOptions::OpenAiResponses {
-                        reasoning: crate::llm::protocol::openai_responses::Reasoning::new(),
-                    },
-                ),
-            )
-            .await
-            .unwrap_err();
+        // A reasoning effort is meaningful only on the Responses contract, and
+        // an explicit request option must never be dropped silently.
+        let anthropic = Model::new(
+            Arc::from("fake-endpoint"),
+            Protocol::AnthropicMessages,
+            Arc::from("fake-model"),
+            FakeModel {
+                calls: Arc::clone(&calls),
+            },
+        );
+        let error = complete(
+            &anthropic,
+            Request::new([InputItem::external(InputSource::User, "hello")]).options(
+                ModelOptions::OpenAiResponses {
+                    reasoning: Reasoning::new().effort(ReasoningEffort::High),
+                },
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnsupportedOption);
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        // An option that carries no actual control is a malformed request, not
+        // an endpoint limitation.
+        let error = complete(
+            &model(Arc::clone(&calls)),
+            Request::new([InputItem::external(InputSource::User, "hello")]).options(
+                ModelOptions::OpenAiResponses {
+                    reasoning: Reasoning::new(),
+                },
+            ),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidRequest);
         assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn incomplete_stream_is_an_explicit_terminal_error() {
-        let mut stream = model(Arc::new(AtomicUsize::new(0)))
+        /// A provider stream that ends without a terminal record.
+        #[derive(Clone)]
+        struct EmptyStream;
+
+        impl CompletionModel for EmptyStream {
+            async fn completion(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse, CompletionError> {
+                unreachable!("the streaming path is the only one")
+            }
+
+            async fn stream(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<StreamingCompletionResponse, CompletionError> {
+                let inner: rig_core::streaming::StreamingResult = Box::pin(stream::empty());
+                Ok(StreamingCompletionResponse::stream("fake", inner))
+            }
+        }
+
+        let model = Model::new(
+            Arc::from("fake-endpoint"),
+            Protocol::OpenAiResponses,
+            Arc::from("fake-model"),
+            EmptyStream,
+        );
+        let mut stream = model
             .stream(Request::new([InputItem::external(
                 InputSource::User,
                 "hello",
@@ -263,112 +333,23 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
-    #[derive(Clone)]
-    struct ReusedProviderItemModel {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl CompletionModel for ReusedProviderItemModel {
-        async fn completion(
-            &self,
-            _request: CompletionRequest,
-        ) -> Result<CompletionResponse, CompletionError> {
-            let turn = self.calls.fetch_add(1, Ordering::Relaxed);
-            let call_id = if turn == 0 {
-                "call-first"
-            } else {
-                "call-second"
-            };
-            let call = RigToolCall::from_dual_wire(
-                "reused-provider-item",
-                call_id,
-                ToolFunction::new("inspect".to_owned(), serde_json::json!({})),
-            );
-            Ok(CompletionResponse::new(
-                vec![AssistantContent::ToolCall(call)],
-                Usage::default(),
-                "fake",
-            ))
-        }
-
-        async fn stream(
-            &self,
-            _request: CompletionRequest,
-        ) -> Result<StreamingCompletionResponse, CompletionError> {
-            unreachable!("identity test uses unary completion")
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_provider_tool_identity_reuse_across_turns() {
-        let model = Model::new(
-            Arc::from("fake-endpoint"),
-            Protocol::OpenAiResponses,
-            Arc::from("fake-model"),
-            RequestSupport::FULL,
-            ReusedProviderItemModel {
-                calls: Arc::new(AtomicUsize::new(0)),
-            },
-        );
-        let user = InputItem::external(InputSource::User, "inspect");
-        let first = model
-            .complete(Request::new([user.clone()]))
-            .await
-            .expect("first tool identity is unique");
-        let replay = first.into_item().expect("tool call is replayable");
-
-        let error = model
-            .complete(Request::new([
-                user,
-                replay,
-                InputItem::external(InputSource::User, "inspect again"),
-            ]))
-            .await
-            .expect_err("a provider item id cannot be reused");
-
-        assert_eq!(error.kind(), ErrorKind::Protocol);
-        assert!(error.to_string().contains("provider tool item identifier"));
-    }
-
-    #[derive(Clone)]
-    struct ImageModel;
-
-    impl CompletionModel for ImageModel {
-        async fn completion(
-            &self,
-            _request: CompletionRequest,
-        ) -> Result<CompletionResponse, CompletionError> {
-            Ok(CompletionResponse::new(
-                vec![AssistantContent::Image(Default::default())],
-                Usage::default(),
-                "fake",
-            ))
-        }
-
-        async fn stream(
-            &self,
-            _request: CompletionRequest,
-        ) -> Result<StreamingCompletionResponse, CompletionError> {
-            unreachable!("image boundary test uses unary completion")
-        }
-    }
-
+    /// An image cannot survive BONE's response conversion, and the failure is
+    /// explicit rather than a silently dropped item. This is a conversion
+    /// boundary, so it is asserted at the conversion.
     #[tokio::test]
     async fn unsupported_image_output_is_an_explicit_protocol_error() {
-        let model = Model::new(
-            Arc::from("fake-endpoint"),
-            Protocol::OpenAiResponses,
-            Arc::from("fake-model"),
-            RequestSupport::FULL,
-            ImageModel,
+        let origin = Arc::new(RequestOrigin {
+            endpoint_id: Arc::from("fake-endpoint"),
+            protocol: Protocol::OpenAiResponses,
+            model_id: Arc::from("fake-model"),
+        });
+        let response = CompletionResponse::new(
+            vec![AssistantContent::Image(Default::default())],
+            Usage::default(),
+            "fake",
         );
 
-        let error = model
-            .complete(Request::new([InputItem::external(
-                InputSource::User,
-                "make an image",
-            )]))
-            .await
+        let error = Response::from_rig(origin, response)
             .expect_err("image output must not disappear from a successful response");
 
         assert_eq!(error.kind(), ErrorKind::Protocol);

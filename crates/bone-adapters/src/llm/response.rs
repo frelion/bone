@@ -1,14 +1,11 @@
 use std::{fmt, sync::Arc};
 
-use rig_core::{
-    completion::{AssistantContent, CompletionResponse, FinishReason as RigFinishReason},
-    message::{Message, ReasoningContent},
+use rig_core::completion::{
+    AssistantContent, CompletionResponse, FinishReason as RigFinishReason,
+    message::ReasoningContent,
 };
 
-use crate::llm::{
-    Error, InputItem, OutputItem, Protocol, ToolCall, model::RequestOrigin,
-    tool::ToolCallIdentities,
-};
+use crate::llm::{Error, OutputItem, Protocol, ToolCall, model::RequestOrigin};
 
 /// Why a model stopped generating.
 #[non_exhaustive]
@@ -112,15 +109,11 @@ struct ResponseData {
     finish_reason: Option<FinishReason>,
     message_id: Option<String>,
     response_id: Option<String>,
-    provider_request_id: Option<String>,
-    replay: Option<Message>,
 }
 
 /// One completed model response.
 ///
-/// Cloning is cheap. Full normalized assistant state is retained privately so
-/// [`Response::into_item`] can replay it without callers handling reasoning
-/// signatures or provider correlation identifiers.
+/// Cloning is cheap.
 #[derive(Clone)]
 pub struct Response {
     inner: Arc<ResponseData>,
@@ -145,7 +138,6 @@ impl fmt::Debug for Response {
             .field("finish_reason", &self.inner.finish_reason)
             .field("message_id", &self.inner.message_id)
             .field("response_id", &self.inner.response_id)
-            .field("provider_request_id", &self.inner.provider_request_id)
             .finish()
     }
 }
@@ -154,14 +146,12 @@ impl Response {
     pub(crate) fn from_rig(
         origin: Arc<RequestOrigin>,
         response: CompletionResponse,
-        mut previous_tool_calls: ToolCallIdentities,
     ) -> Result<Self, Error> {
         let mut items = Vec::new();
         for item in &response.choice {
             match item {
                 AssistantContent::Text(text) => items.push(OutputItem::Text(text.text.clone())),
                 AssistantContent::ToolCall(call) => {
-                    previous_tool_calls.insert(call)?;
                     items.push(OutputItem::ToolCall(ToolCall::from_rig(
                         Arc::clone(&origin),
                         call.clone(),
@@ -190,10 +180,6 @@ impl Response {
             }
         }
 
-        let replay = (!response.choice.is_empty()).then(|| Message::Assistant {
-            id: response.message_id.clone(),
-            content: response.choice.clone(),
-        });
         let response_origin = ResponseOrigin {
             request: origin,
             provider: response.provider.clone(),
@@ -206,8 +192,6 @@ impl Response {
             finish_reason: response.finish_reason().map(FinishReason::from_rig),
             message_id: response.message_id,
             response_id: response.response_id,
-            provider_request_id: response.provider_request_id,
-            replay,
         };
         Ok(Self {
             inner: Arc::new(data),
@@ -255,19 +239,5 @@ impl Response {
 
     pub fn response_id(&self) -> Option<&str> {
         self.inner.response_id.as_deref()
-    }
-
-    pub fn provider_request_id(&self) -> Option<&str> {
-        self.inner.provider_request_id.as_deref()
-    }
-
-    /// Convert this exact response into its canonical next-request item.
-    ///
-    /// `None` means the provider legally returned no assistant content;
-    /// fabricating an empty history item would make the next request invalid.
-    pub fn into_item(self) -> Option<InputItem> {
-        self.inner.replay.clone().map(|message| {
-            InputItem::assistant_replay(Arc::clone(&self.inner.origin.request), message)
-        })
     }
 }

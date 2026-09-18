@@ -263,6 +263,60 @@ Unicode UAX #29 定义 extended grapheme cluster；UAX #11 说明 East Asian Wid
 
 overview 返回时以 projection cursor 是否追上 `history_through` 计算 `projection_pending`。pending 为 true 时，消息计数与回复预览只描述已物化前缀，前端不能把它们呈现为完整事实。Session rail 的回复行显示 `Loading history…`，第三行计数显示 `… msgs`；后续 overview tick 继续推进，完成后才显示最终的回复预览和消息计数。
 
+### 5.6 `/model` 面板的屏幕机
+
+`/model` 的第一屏永远是连接 tab 条，而不是扁平的模型列表。tab 只呈现已保存的 `Profile`：每个已保存连接一个 tab，末尾固定追加一个 `+ Add connection` tab。没有保存过的连接类型不占 tab，它们只出现在新建流程的 kind picker 里，因此 tab 条等于用户的持久配置，而不是一份 provider 功能目录。
+
+**刚打开时停在哪个 tab**由 `ModelPanel::follow_current_model` 决定：它为真时（面板刚创建、还没收到过装载回报）tab 落在当前模型所属的连接上，随后这个标志被消耗掉。之后所有重新装载都保留用户选的 tab，包括停在 add tab 上的那种情况——用户从 add tab 保存了一个新连接时，原来的下标正好落到新连接自己的 tab 上，而不是被拉回当前模型所在的连接。
+
+`ModelScreen` 就是这台状态机的全部屏幕：
+
+| 屏幕 | 内容 | 进入方式 |
+| --- | --- | --- |
+| `Tab { selected }` | 当前连接的模型行，末行是手工输入 | 打开面板、Esc 返回，以及保存或删除之后 |
+| `ModelInput { value }` | 手工 model ID 编辑器 | `Tab` 末行 Enter |
+| `Kind { selected }` | `KindChoice::ALL` 的六行连接类型 picker | 在 `+ Add connection` tab 上 Enter |
+| `Setup(ConnectionForm)` | 连接表单：名称 / URL / 密钥 / 首个模型 | 选完 kind，或在已保存连接的 tab 上按 `e` |
+| `ModelForm(ModelForm)` | 从连接移除一个已保存模型 | `Tab` 上按 `Delete` |
+| `Reasoning { selected, selection }` | 该选择的 reasoning effort | 在 ChatGPT 订阅或 OpenAI Responses 连接上选中模型 |
+| `ConfirmDelete { selected }` | 删除确认，只接受 y / n | 已保存连接的 tab 上按 `d` |
+| `Login { request, state }` | ChatGPT 设备授权 | ChatGPT 连接需要授权时 |
+
+`Tab { selected }` 的行语义由 `ModelPanel` 的 helper 统一定义：`tab_is_add()` 判断当前是否末尾的 add tab，`tab_profile()` 返回当前 tab 背后的 `Profile`（add tab 为 `None`），`tab_models()` 给出属于当前 tab 的模型（连接目录项在前，连接已保存但目录没有发布的模型在后），`tab_row_count()` 等于这些行数再加一。因此 `selected` 落在 `0..tab_models().len()` 时是模型行，等于 `tab_models().len()` 时就是「手工输入 model ID」行；末行在 add tab 上渲染为 `+ Add connection…` 并打开 kind picker，在普通连接上渲染为 `Enter a model ID…`。向 App 请求的是当前连接的目录项加上当前仍在使用的选择，不是账号的远端模型清单。
+
+kind picker 的六行是固定的 `KindChoice::ALL`：`ChatGPT · use subscription`，然后是 `OpenAI API`、`Anthropic API`、`OpenAI-compatible Responses`、`OpenAI-compatible Chat Completions`、`Anthropic-compatible Messages`。`ChatGPT`、`OpenAI API`、`Anthropic API` 各对应一个只会存在一份的连接（固定 `ProfileId` 分别是 `chatgpt`、`openai`、`anthropic`）；三个 compatible 类型没有固定 id，每次新建生成一个新的 `connection-<uuid>`，因为同一类型的两个网关就是两个连接。选择已经保存的类型不会第二次索要凭据：该行改标 `Already connected · opens its tab`，Enter 直接跳到对应 tab。`ConnectionKind` 决定 `EndpointConfig` 与表单字段：官方 OpenAI 与 compatible Responses 走 `OpenAiResponses`，官方 Anthropic 与 compatible Messages 走 `AnthropicMessages`，compatible Chat Completions 走 `OpenAiChatCompletions`；官方表单只有 Key 与 Model 两个字段，compatible 类型才多出 Name 与 URL。
+
+连接表单保存时若填了模型，且该 profile 的 endpoint 是 `ChatGptSubscription` 或 `OpenAiResponses`，保存成功后不停留在 tab 条而是先进入 `Reasoning`；其余协议直接应用。选择模型时用同一条规则判定：模型行 Enter 在有 reasoning 的连接上先开 effort 选择，否则直接应用。`Reasoning` 的七行是 `provider default`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；选 `provider default` 会清空 `ModelOptions`，其余写成一个 `ModelOptions::OpenAiResponses`。
+
+删除只作用于连接：`d` 进 `ConfirmDelete`，确认后 reducer 立刻关掉对话框、在 tab 条上记下 `ModelOperationKind::Delete`，并恰好发出一个 `Effect::DeleteConnection { request, profile }`，所以第二次确认在第一次完成前会被 busy 拒绝。`Delete` 键删除的是当前连接里已保存的模型：目录里出现但连接没有保存的模型没有可移除的对象，reducer 只回一条 status。App 的删除先清凭据再从 `config.toml` 移除 profile（见 [App](app.md)），成功回报后回到 tab 条的第一行并重新加载目录；此刻 `follow_current_model` 已被消耗，所以这次重新装载不会把 tab 移到别处，只是 tab 数减少后做越界收敛。
+
+`Login` 携带 Connecting、DeviceCode、Succeeded、Failed、Cancelled 五个状态；DeviceCode 显示 verification URI 与 user code，只有 Failed 与 Cancelled 渲染可点的 `Retry sign-in` 行。Esc 先发 `Effect::CancelLogin` 再回到 tab 条。API key 只经 `SecretText` 进入 `SetupText`，`Action` 与 `UiState` 的 `Debug` 都不呈现它；model ID 是普通文本，所以面板取得键盘所有权后手工编辑器与连接表单都接受粘贴，其余屏幕对粘贴保持惰性。
+
+键位表（`bone-tui` 的唯一 keymap，逐屏断言「有 action / 返回 `None`」）：
+
+| 键 | Tab | ModelInput | Kind | Setup / ModelForm | Reasoning | ConfirmDelete | Login |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| ← / → | `PreviousTab` / `NextTab` | 无 | 无 | 无 | `PanelPrevious` / `PanelNext` | 无 | 无 |
+| ↑ / ↓ | `PanelPrevious` / `PanelNext` | 无 | `PanelPrevious` / `PanelNext` | `PreviousField` / `NextField` | `PanelPrevious` / `PanelNext` | 无 | 无 |
+| Enter | 选中模型；末行进 `ModelInput`；add tab 进 `Kind` | 应用 model ID | 选连接类型 | 保存连接 / 移除模型 | 应用 effort | 面板没有激活目标，忽略 | 重试登录（仅 Failed / Cancelled） |
+| `d` | `DeleteConnection` → `ConfirmDelete` | 无 | 无 | 无 | 无 | 无 | 无 |
+| `e` | `EditConnection`（ChatGPT 直接进登录） | 无 | 无 | 无 | 无 | 无 | 无 |
+| `y` / `n` | 无 | 无 | 无 | 无 | 无 | `ConfirmDeleteConnection` / 回 Tab | 无 |
+| 字符 | 无 | `ModelText` | 无 | `SetupText` | 无 | 无 | 无 |
+| Backspace | 无 | `ModelBackspace` | 无 | `SetupBackspace` | 无 | 无 | 无 |
+| `Ctrl+U` | 无 | `ModelClear` | 无 | `SetupClear` | 无 | 无 | 无 |
+| `Delete` | `DeleteModel`（仅已保存模型） | 无 | 无 | 无 | 无 | 无 | 无 |
+| Esc | 关闭面板 | 回 Tab 末行 | 回 Tab 第一行 | 回 Tab 第一行 | 回 Tab 该模型行 | 回 Tab 原行 | 先 `CancelLogin`，再回 Tab |
+
+规则细节：
+
+- 未修饰 Enter 先由 shell 统一变成 `ActivatePanel`（面板打开时总是先取键盘所有权），再由各屏幕的 `activate` 分支决定语义；因此 `ConfirmDelete` 收到 Enter 也不会作答，它只认 `y`、`n` 和 Esc。
+- `Setup` 与 `ModelForm` 的字段切换同时接受 `Tab` / `Shift+Tab` 和 ↑ / ↓（提示行写作 `tab fields · ctrl+u clear field`），`Ctrl+U` 清空当前字段；其余屏幕的 `Tab` / `BackTab` 不产生 action。
+- 左右方向键只在 `Tab` 上产生 action，`d` 与 `e` 同样只作用于 tab 条；add tab 上没有可编辑或可删除的连接，两者都是 no-op。所有带 Ctrl / Alt 修饰的近似按键一律返回 `None`，`Ctrl+D` 在任何屏幕都保持全局退出。
+- 有 apply、save 或 delete 在途时 Esc 不离开屏幕，只报 `Finishing the model change…`。`ModelOperation { session, request, kind }` 记录在途操作：load、apply 与 save 的回执必须同时匹配 session 与 request，delete 只按 request + kind 判定，让一个跨越 Session 切换的删除仍能结算自己的 pending 状态；不匹配的迟到回执不改状态。
+- tab 条按显示宽度开窗，当前 tab 始终可见且可点，两端用 `‹` / `›` 表示被隐藏；单个 label 比整条更宽时被裁剪而不是丢弃。Tab 屏用自己的 `esc close · ←/→ connection · ↑↓ model · enter choose · d delete · e edit` 取代通用的 esc 提示，其余屏幕各自命名本屏的键。
+- 鼠标与键盘共享同一张表：tab 格是 `SelectTab(index)`，模型行是 `SelectModel(index)`，kind 行是 `ChooseConnection(index)`，确认屏的 `[y] delete connection` / `[n] cancel` 是 `ConfirmDeleteConnection` / `Escape`，登录失败行是 `RetryLogin`，`esc back` 行与 `×` 分别是 `OverlayBack` / `CloseOverlay`。点击直接派发该行的 action，但不取得键盘所有权：面板由指针打开时键盘仍在 workspace，打字与粘贴进 Composer，只有未修饰 Enter 或 `F6` 把所有权交给面板。
+
 ## 6. 零宿主污染契约
 
 ### 6.1 运行期允许的临时状态

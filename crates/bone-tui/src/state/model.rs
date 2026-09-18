@@ -571,12 +571,11 @@ impl UiState {
             {
                 true
             }
+            // The manual model editor is the only model field a caret belongs
+            // to; the removal form and the connection-kind picker are not
+            // editable text.
             Some(Overlay::Models(models))
-                if matches!(
-                    &models.screen,
-                    super::ModelScreen::ModelForm(form)
-                        if !form.remove && form.pending_request.is_none()
-                ) =>
+                if matches!(&models.screen, super::ModelScreen::ModelInput { .. }) =>
             {
                 true
             }

@@ -1,14 +1,154 @@
+use std::{
+    collections::VecDeque,
+    future::Future,
+    sync::{Arc, Mutex},
+};
+
 use bone_adapters::llm::{
     protocol::openai_responses::{Reasoning, ReasoningEffort},
     testing::openai_responses_endpoint,
 };
+use bytes::Bytes;
 use rig_core::{
+    http_client::{
+        self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
+    },
     providers::openai,
-    test_utils::{MockHttpResponse, SequencedHttpClient},
+    test_utils::{CapturedHttpRequest, MockStreamingClient},
+    wasm_compat::WasmCompatSend,
 };
 use serde_json::Value;
 
 use super::*;
+
+/// Script one completed Responses turn that calls `name` with `arguments`.
+///
+/// Streaming is the only model-call mode, so a scripted turn is the SSE frames
+/// the protocol consumes: the `response.output_item.done` frame is what
+/// reconstructs the tool call, and the terminal `response.completed` frame is
+/// what proves the provider ended the turn.
+fn submission_stream(name: &str, arguments: Value) -> String {
+    let response: Value = serde_json::from_str(&submission_response(name, arguments))
+        .expect("the scripted submission is valid JSON");
+    let call = response["output"][0].clone();
+    format!(
+        "data: {}\n\ndata: {}\n\n",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "sequence_number": 1,
+            "item": call,
+        }),
+        json!({
+            "type": "response.completed",
+            "sequence_number": 2,
+            "response": response,
+        }),
+    )
+}
+
+/// A transport that serves one scripted SSE turn per streaming call and keeps
+/// the requests the provider client actually sent.
+///
+/// Rig's sequenced double answers only the unary path, which no longer exists
+/// on BONE's model-call path, so this double replays the streaming wire while
+/// preserving the same per-call script and request record the assembly
+/// assertions read.
+#[derive(Clone, Debug, Default)]
+struct SequencedStreamingHttpClient {
+    unary: MockStreamingClient,
+    requests: Arc<Mutex<Vec<CapturedHttpRequest>>>,
+    responses: Arc<Mutex<VecDeque<Bytes>>>,
+}
+
+impl SequencedStreamingHttpClient {
+    /// Create a client that serves the supplied SSE turns in order.
+    fn new(responses: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            unary: MockStreamingClient::default(),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(responses.into_iter().map(Bytes::from).collect())),
+        }
+    }
+
+    /// Return the requests captured so far.
+    fn requests(&self) -> Vec<CapturedHttpRequest> {
+        match self.requests.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Return the number of scripted turns that have not been consumed.
+    fn remaining_responses(&self) -> usize {
+        match self.responses.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+
+    fn next_response(&self) -> Option<Bytes> {
+        match self.responses.lock() {
+            Ok(mut guard) => guard.pop_front(),
+            Err(poisoned) => poisoned.into_inner().pop_front(),
+        }
+    }
+}
+
+impl HttpClientExt for SequencedStreamingHttpClient {
+    fn send<T, U>(
+        &self,
+        request: Request<T>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    where
+        T: Into<Bytes> + WasmCompatSend,
+        U: From<Bytes> + WasmCompatSend + 'static,
+    {
+        // The model-call path never sends a unary request, so the unscripted
+        // double is exactly the rejection a reintroduced unary call deserves.
+        self.unary.send(request)
+    }
+
+    fn send_multipart<U>(
+        &self,
+        request: Request<MultipartForm>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    where
+        U: From<Bytes> + WasmCompatSend + 'static,
+    {
+        self.unary.send_multipart(request)
+    }
+
+    fn send_streaming<T>(
+        &self,
+        request: Request<T>,
+    ) -> impl Future<Output = http_client::Result<StreamingResponse>> + WasmCompatSend
+    where
+        T: Into<Bytes> + WasmCompatSend,
+    {
+        let (parts, body) = request.into_parts();
+        let captured = CapturedHttpRequest {
+            uri: parts.uri.to_string(),
+            headers: parts.headers.clone(),
+            body: body.into(),
+        };
+        match self.requests.lock() {
+            Ok(mut guard) => guard.push(captured),
+            Err(poisoned) => poisoned.into_inner().push(captured),
+        }
+        let response = MockStreamingClient {
+            sse_bytes: self.next_response().unwrap_or_default(),
+        };
+        let body: Vec<u8> = Vec::new();
+        // The scripted turn is owned by the returned future: the double
+        // borrows it for exactly this one call.
+        async move {
+            response
+                .send_streaming(Request::from_parts(parts, body))
+                .await
+        }
+    }
+}
 
 fn submission_response(name: &str, arguments: Value) -> String {
     json!({
@@ -50,7 +190,7 @@ async fn conversation_owns_replies_across_greeting_job_and_reopened_followup() {
     task.inputs = vec![bone_core::InputId(2)];
     task.tools = Some(ToolSelection::ReadOnly);
     let transports = [
-        SequencedHttpClient::new(
+        SequencedStreamingHttpClient::new(
             [
                 reply(1, "Hello!"),
                 ConversationStep::Start(vec![task]),
@@ -58,19 +198,14 @@ async fn conversation_owns_replies_across_greeting_job_and_reopened_followup() {
                 reply(3, "As we found earlier, the parser is correct."),
             ]
             .into_iter()
-            .map(|step| {
-                MockHttpResponse::success(submission_response(
-                    "submit_conversation",
-                    json!({"step": step}),
-                ))
-            }),
+            .map(|step| submission_stream("submit_conversation", json!({"step": step}))),
         ),
-        SequencedHttpClient::new([MockHttpResponse::success(submission_response(
+        SequencedStreamingHttpClient::new([submission_stream(
             "submit_work",
             json!(WorkProposal::new(WorkStep::Finish(Completion::new(
                 "internal parser findings"
             )))),
-        ))]),
+        )]),
     ];
     let profiles = ["coordinator", "worker"].map(|name| {
         Profile::new(

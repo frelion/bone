@@ -16,16 +16,28 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
 const TITLE_INSET: u16 = 2;
+
+/// The trailing tab that starts a new connection.
+const ADD_TAB_LABEL: &str = "+ Add connection";
+
+/// Tabs are separated by a vertical rule that owns no click target.
+const TAB_SEPARATOR: &str = "│";
+const TAB_SEPARATOR_WIDTH: usize = 1;
+
+/// The tab screen names its own keys instead of the shell's generic hint.
+const TAB_SHORTCUTS: &str =
+    "esc close · ←/→ connection · ↑↓ model · enter choose · d delete · e edit";
 
 pub(super) fn keyboard_hint(state: &UiState) -> &'static str {
     if state.keyboard.is_overlay() {
         if matches!(
             &state.overlay,
-            Some(Overlay::Models(models)) if matches!(models.screen, ModelScreen::List { .. })
+            Some(Overlay::Models(models)) if matches!(models.screen, ModelScreen::Tab { .. })
         ) {
-            "↑↓ move · enter choose · delete remove · f6 input"
+            TAB_SHORTCUTS
         } else if matches!(
             &state.overlay,
             Some(Overlay::Models(models)) if matches!(models.screen, ModelScreen::Reasoning { .. })
@@ -117,11 +129,11 @@ pub(super) fn render(
     if let Overlay::Models(models) = panel
         && matches!(
             &models.screen,
-            ModelScreen::Add { .. }
-                | ModelScreen::AddModel { .. }
-                | ModelScreen::Advanced { .. }
+            ModelScreen::Kind { .. }
+                | ModelScreen::ModelInput { .. }
                 | ModelScreen::Setup(_)
                 | ModelScreen::ModelForm(_)
+                | ModelScreen::ConfirmDelete { .. }
         )
     {
         return super::connection::render(frame, plan, hits, state, models, editor);
@@ -136,30 +148,25 @@ pub(super) fn render(
             "Tasks & tools · enter open",
         ),
         Overlay::Models(models) => match &models.screen {
-            ModelScreen::List { .. } => (
-                (models.row_count() * usize::from(stride)
+            ModelScreen::Tab { .. } => (
+                (models.tab_row_count() * usize::from(stride)
                     + state.model_configuration_summary().lines().count()
-                    + 4
+                    + 5
                     + if state.status.is_some() { 2 } else { 0 })
-                .clamp(5, if spacious { 22 } else { 14 }) as u16,
-                "Choose model",
+                .clamp(7, if spacious { 24 } else { 16 }) as u16,
+                "Connections & models",
             ),
             ModelScreen::Reasoning { .. } => (
                 (crate::state::REASONING_EFFORTS.len() * usize::from(stride) + 4)
                     .clamp(5, if spacious { 22 } else { 14 }) as u16,
                 "Choose reasoning",
             ),
-            ModelScreen::Manage { .. } => (
-                (models.profiles.len().max(1) * usize::from(stride) + 4)
-                    .clamp(5, if spacious { 22 } else { 14 }) as u16,
-                "Manage connections",
-            ),
             ModelScreen::Login { .. } => (10, "Sign in to ChatGPT"),
-            ModelScreen::Add { .. }
-            | ModelScreen::AddModel { .. }
-            | ModelScreen::Advanced { .. }
+            ModelScreen::Kind { .. }
+            | ModelScreen::ModelInput { .. }
             | ModelScreen::Setup(_)
-            | ModelScreen::ModelForm(_) => {
+            | ModelScreen::ModelForm(_)
+            | ModelScreen::ConfirmDelete { .. } => {
                 return None;
             }
         },
@@ -177,6 +184,7 @@ pub(super) fn render(
             .map(|operation| match operation.kind {
                 ModelOperationKind::Load => "loading models…",
                 ModelOperationKind::Apply => "Applying model…",
+                ModelOperationKind::Delete => "Deleting connection…",
             }),
         Overlay::Objects(_) | Overlay::Help => None,
     };
@@ -246,7 +254,24 @@ pub(super) fn render(
             }
         }
         Overlay::Models(models) => match &models.screen {
-            ModelScreen::List { selected } => {
+            ModelScreen::Tab { selected } => {
+                // The tab screen names its keys on the escape row. In a compact
+                // layout that row is the last row of the body, so keep the body
+                // above it instead of painting over the hint.
+                if shell.back.y >= inner.y && shell.back.y < inner.bottom() {
+                    inner.height = shell.back.y.saturating_sub(inner.y);
+                }
+                if inner.height == 0 {
+                    return Some(area);
+                }
+                render_tab_strip(
+                    frame,
+                    hits,
+                    models,
+                    Rect::new(inner.x, inner.y, inner.width, 1),
+                );
+                inner.y = inner.y.saturating_add(1);
+                inner.height = inner.height.saturating_sub(1);
                 if let Some(status) = &state.status {
                     let height = 2.min(inner.height.saturating_sub(1));
                     frame.render_widget(
@@ -281,9 +306,12 @@ pub(super) fn render(
                     .model_operation
                     .filter(|operation| operation.session == models.session)
                 {
+                    // A connection delete keeps the strip on screen and reports
+                    // what it is doing, so the panel never looks idle mid-delete.
                     let label = match operation.kind {
                         ModelOperationKind::Load => "Loading models…",
                         ModelOperationKind::Apply => "Applying model…",
+                        ModelOperationKind::Delete => "Deleting connection…",
                     };
                     frame.render_widget(
                         Paragraph::new(label).style(Style::default().fg(MUTED)),
@@ -292,40 +320,35 @@ pub(super) fn render(
                 } else {
                     let stride = stride.min(inner.height.max(1));
                     let capacity = usize::from(inner.height / stride);
-                    let selected = (*selected).min(models.row_count().saturating_sub(1));
+                    if capacity == 0 {
+                        return Some(area);
+                    }
+                    let rows = models.tab_models();
+                    let total = models.tab_row_count();
+                    let selected = (*selected).min(total.saturating_sub(1));
                     let start = selected.saturating_sub(capacity.saturating_sub(1));
-                    for index in (start..models.row_count()).take(capacity) {
+                    for index in start..total.min(start + capacity) {
                         let row = Rect::new(
                             inner.x,
                             inner.y + (index - start) as u16 * stride,
                             inner.width,
                             stride,
                         );
-                        if let Some(choice) = models.choices.get(index) {
-                            render_model_choice(
+                        let selected = index == selected && state.keyboard.is_overlay();
+                        if let Some(selection) = rows.get(index) {
+                            render_model_selection(
                                 frame,
                                 row,
                                 state,
-                                choice,
-                                index == selected && state.keyboard.is_overlay(),
-                                stride > 1,
+                                selection,
+                                models.tab_profile(),
+                                selected,
                             );
                         } else {
-                            let label = if models.profiles.is_empty() {
-                                "+ Add account or API…"
-                            } else {
-                                match index.saturating_sub(models.choices.len()) {
-                                    0 => "+ Add model…",
-                                    1 => "+ Add account or API…",
-                                    _ => "Manage connections…",
-                                }
-                            };
-                            frame.render_widget(
-                                Paragraph::new(label).style(model_menu_style(
-                                    index == selected && state.keyboard.is_overlay(),
-                                )),
-                                row,
-                            );
+                            // The last row of every tab types a model ID the
+                            // catalog does not publish; on the add tab it opens
+                            // the connection-kind picker instead.
+                            render_manual_model_row(frame, row, models.tab_is_add(), selected);
                         }
                         hits.push(ClickRegion {
                             area: row,
@@ -360,62 +383,6 @@ pub(super) fn render(
                         area: row,
                         target: ClickTarget::Action(Action::SelectReasoning(index)),
                     });
-                }
-            }
-            ModelScreen::Manage { selected } => {
-                if models.profiles.is_empty() {
-                    frame.render_widget(
-                        Paragraph::new("No connections").style(Style::default().fg(MUTED)),
-                        inner,
-                    );
-                } else {
-                    let start = selected
-                        .saturating_sub(usize::from(inner.height / stride).saturating_sub(1));
-                    for (index, profile) in models
-                        .profiles
-                        .iter()
-                        .enumerate()
-                        .skip(start)
-                        .take(usize::from(inner.height / stride))
-                    {
-                        let row = Rect::new(
-                            inner.x,
-                            inner.y + (index - start) as u16 * stride,
-                            inner.width,
-                            stride,
-                        );
-                        let (label, note) = match &profile.endpoint {
-                            bone_app::EndpointConfig::ChatGptSubscription => (
-                                "ChatGPT account · sign in".to_owned(),
-                                "Check or refresh sign-in",
-                            ),
-                            bone_app::EndpointConfig::OpenAiResponses { base_url: None } => {
-                                ("OpenAI API · update key".to_owned(), "Keeps your model")
-                            }
-                            bone_app::EndpointConfig::AnthropicMessages { base_url: None } => {
-                                ("Anthropic API · update key".to_owned(), "Keeps your model")
-                            }
-                            _ => (
-                                format!("{} · edit", profile.label),
-                                "Connection settings and API key",
-                            ),
-                        };
-                        let label = if spacious {
-                            format!("{label}\n{note}")
-                        } else {
-                            label
-                        };
-                        frame.render_widget(
-                            Paragraph::new(super::sanitize_external(&label)).style(menu_style(
-                                index == *selected && state.keyboard.is_overlay(),
-                            )),
-                            row,
-                        );
-                        hits.push(ClickRegion {
-                            area: row,
-                            target: ClickTarget::Action(Action::SelectModel(index)),
-                        });
-                    }
                 }
             }
             ModelScreen::Login { state: login, .. } => {
@@ -468,11 +435,11 @@ pub(super) fn render(
                     });
                 }
             }
-            ModelScreen::Add { .. }
-            | ModelScreen::AddModel { .. }
-            | ModelScreen::Advanced { .. }
+            ModelScreen::Kind { .. }
+            | ModelScreen::ModelInput { .. }
             | ModelScreen::Setup(_)
-            | ModelScreen::ModelForm(_) => {}
+            | ModelScreen::ModelForm(_)
+            | ModelScreen::ConfirmDelete { .. } => {}
         },
         Overlay::Help => {
             let shift_enter = if state.terminal_capabilities.shift_enter_supported() {
@@ -583,7 +550,7 @@ mod tests {
     fn editable_panels_keep_cursor_and_actions_inside_small_screens() {
         for (width, height) in [(40, 12), (80, 24), (140, 24), (160, 40)] {
             for panel in [
-                models(ModelScreen::List { selected: 0 }),
+                models(ModelScreen::Tab { selected: 0 }),
                 Overlay::Help,
                 models(ModelScreen::Login {
                     request: 1,
@@ -695,13 +662,13 @@ mod tests {
     }
 }
 
-fn model_choice_label(state: &UiState, choice: &crate::state::ModelChoice) -> String {
+fn model_row_label(state: &UiState, selection: &bone_app::ModelSelection) -> String {
     let mut parts = Vec::new();
-    if let Some(marker) = state.model_selection_marker(&choice.selection) {
+    if let Some(marker) = state.model_selection_marker(selection) {
         parts.push(format!("✓ {marker}"));
     }
-    parts.push(choice.label.clone());
-    if let Some(effort) = crate::state::model_effort(&choice.selection) {
+    parts.push(selection.model.clone());
+    if let Some(effort) = crate::state::model_effort(selection) {
         parts.push(effort.as_str().into());
     }
     parts.join(" · ")
@@ -719,18 +686,20 @@ fn reasoning_label(effort: bone_app::ReasoningEffort) -> &'static str {
     }
 }
 
-fn render_model_choice(
+/// One model row of a connection tab. The tab already names the connection, so
+/// the row only has to identify the model and its state.
+fn render_model_selection(
     frame: &mut Frame<'_>,
     row: Rect,
     state: &UiState,
-    choice: &crate::state::ModelChoice,
+    selection: &bone_app::ModelSelection,
+    profile: Option<&bone_app::Profile>,
     selected: bool,
-    spacious: bool,
 ) {
     let background = if selected { theme::PANEL } else { INPUT };
     let pointer = if selected { "› " } else { "  " };
     let pointer_tone = if selected { INFO } else { background };
-    let title = model_choice_label(state, choice);
+    let title = model_row_label(state, selection);
     let mut lines = vec![Line::from(vec![
         Span::styled(pointer, theme::label_on(pointer_tone, background)),
         Span::styled(
@@ -738,16 +707,178 @@ fn render_model_choice(
             theme::label_on(INK, background),
         ),
     ])];
-    if spacious {
+    if row.height > 1
+        && let Some(profile) = profile
+    {
         lines.push(Line::from(vec![
             Span::styled("  ", theme::body_on(MUTED, background)),
             Span::styled(
-                super::single_line_external(&choice.profile_label),
+                super::single_line_external(&profile.label),
                 theme::body_on(MUTED, background),
             ),
         ]));
     }
     frame.render_widget(Paragraph::new(lines).style(theme::surface(background)), row);
+}
+
+/// The last row of a tab: the manual model editor, or the entry that opens the
+/// connection-kind picker when the trailing add tab is selected.
+fn render_manual_model_row(frame: &mut Frame<'_>, row: Rect, add_tab: bool, selected: bool) {
+    let background = if selected { theme::PANEL } else { INPUT };
+    let label = if add_tab {
+        "+ Add connection…"
+    } else {
+        "Enter a model ID…"
+    };
+    let pointer = if selected { "› " } else { "  " };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                pointer,
+                theme::label_on(if selected { INFO } else { background }, background),
+            ),
+            Span::styled(label, theme::label_on(INK, background)),
+        ]))
+        .style(theme::surface(background)),
+        row,
+    );
+}
+
+/// Draw the connection tabs and register one click target per tab.
+///
+/// The strip is windowed by display width so the current tab always stays
+/// visible; `‹` and `›` mark the ends the window hides.
+fn render_tab_strip(
+    frame: &mut Frame<'_>,
+    hits: &mut SurfaceHits,
+    models: &crate::state::ModelPanel,
+    strip: Rect,
+) {
+    if strip.width == 0 || strip.height == 0 {
+        return;
+    }
+    let mut labels: Vec<String> = models
+        .profiles
+        .iter()
+        .map(|profile| format!(" {} ", single_line_external(&profile.label)))
+        .collect();
+    labels.push(format!(" {ADD_TAB_LABEL} "));
+    let widths: Vec<usize> = labels
+        .iter()
+        .map(|label| UnicodeWidthStr::width(label.as_str()))
+        .collect();
+    let tab = models.tab.min(labels.len() - 1);
+    let (start, end, left_hidden, right_hidden) =
+        tab_window(&widths, tab, usize::from(strip.width), TAB_SEPARATOR_WIDTH);
+    let mut x = strip.x;
+    if left_hidden {
+        frame.render_widget(
+            Paragraph::new("‹").style(Style::default().fg(MUTED)),
+            Rect::new(x, strip.y, 1, 1),
+        );
+        x += 1;
+    }
+    let right_edge = strip.right().saturating_sub(u16::from(right_hidden));
+    for index in start..end {
+        let remaining = right_edge.saturating_sub(x);
+        if remaining == 0 {
+            break;
+        }
+        // A profile label may outgrow the whole strip. Clip it rather than
+        // dropping it: the tab the user is on must stay painted and clickable.
+        let requested = widths[index] as u16;
+        let width = requested.min(remaining);
+        let row = Rect::new(x, strip.y, width, 1);
+        let style = if index == tab {
+            theme::label_on(INFO, theme::PANEL)
+        } else {
+            theme::body_on(MUTED, INPUT)
+        };
+        frame.render_widget(Paragraph::new(labels[index].as_str()).style(style), row);
+        hits.push(ClickRegion {
+            area: row,
+            target: ClickTarget::Action(Action::SelectTab(index)),
+        });
+        x += width;
+        if width < requested {
+            // Nothing after an over-wide tab can fit on this strip.
+            break;
+        }
+        if index + 1 < end {
+            frame.render_widget(
+                Paragraph::new(TAB_SEPARATOR).style(Style::default().fg(theme::STRUCTURE)),
+                Rect::new(x, strip.y, TAB_SEPARATOR_WIDTH as u16, 1),
+            );
+            x += TAB_SEPARATOR_WIDTH as u16;
+        }
+    }
+    if right_hidden {
+        frame.render_widget(
+            Paragraph::new("›").style(Style::default().fg(MUTED)),
+            Rect::new(strip.right() - 1, strip.y, 1, 1),
+        );
+    }
+}
+
+/// The contiguous tab window that keeps `tab` visible.
+///
+/// The window never splits a tab, so the caller only has to report whether
+/// either end was cut off. A tab wider than the strip still gets the window to
+/// itself and is clipped by the caller.
+fn tab_window(
+    widths: &[usize],
+    tab: usize,
+    available: usize,
+    separator: usize,
+) -> (usize, usize, bool, bool) {
+    let mut start = tab;
+    let mut end = tab + 1;
+    let mut used = widths[tab];
+    loop {
+        let mut grew = false;
+        if end < widths.len() {
+            let cost = separator + widths[end];
+            if used + cost <= available {
+                used += cost;
+                end += 1;
+                grew = true;
+            }
+        }
+        if start > 0 {
+            let cost = separator + widths[start - 1];
+            if used + cost <= available {
+                used += cost;
+                start -= 1;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    // The truncation markers take one column each; drop tabs away from the
+    // cursor until both the window and its markers fit.
+    loop {
+        let markers = usize::from(start > 0) + usize::from(end < widths.len());
+        if used + markers <= available {
+            break;
+        }
+        let right = end - tab;
+        let left = tab - start;
+        if end < widths.len() && (right >= left || start == tab) && end > start + 1 {
+            end -= 1;
+            used -= separator + widths[end];
+        } else if start < tab && start + 1 < end {
+            used -= separator + widths[start];
+            start += 1;
+        } else if end > start + 1 {
+            end -= 1;
+            used -= separator + widths[end];
+        } else {
+            break;
+        }
+    }
+    (start, end, start > 0, end < widths.len())
 }
 
 pub(super) fn menu_style(selected: bool) -> Style {
@@ -758,121 +889,250 @@ pub(super) fn menu_style(selected: bool) -> Style {
     }
 }
 
-fn model_menu_style(selected: bool) -> Style {
-    if selected {
-        theme::label_on(INK, theme::PANEL)
-    } else {
-        theme::body_on(INK, INPUT)
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
-mod grouped_menu_tests {
+mod tab_strip_tests {
     use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
-    #[test]
-    fn grouping_keeps_every_model_action_reachable_and_headers_inert() {
-        for (width, height) in [(40, 12), (80, 24), (160, 40)] {
-            let mut state = UiState::default();
-            let mut models = ModelPanel::new(None);
-            for index in 0..4 {
-                models.choices.push(crate::state::ModelChoice {
-                    selection: bone_app::ModelSelection::new(
-                        bone_app::ProfileId::chatgpt(),
-                        format!("model-{index}"),
-                    )
-                    .unwrap(),
-                    profile_label: "ChatGPT".into(),
-                    label: format!("Model {index}"),
-                });
+    use crate::state::{ModelChoice, ModelPanel, ModelScreen, Overlay};
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+
+    fn profile(id: &str) -> bone_app::Profile {
+        bone_app::Profile::new(
+            bone_app::ProfileId::new(id).unwrap(),
+            id,
+            bone_app::EndpointConfig::OpenAiChatCompletions {
+                base_url: Some(format!("https://{id}.example.test/v1")),
+            },
+        )
+        .unwrap()
+    }
+
+    fn choice(profile: &bone_app::Profile, model: &str) -> ModelChoice {
+        ModelChoice {
+            selection: bone_app::ModelSelection::new(profile.id.clone(), model).unwrap(),
+            profile_label: profile.label.clone(),
+            label: model.into(),
+        }
+    }
+
+    /// A tab screen with `connections` saved connections and `models` catalog
+    /// entries on each of them.
+    fn tab_state(connections: usize, models: usize) -> UiState {
+        let mut panel = ModelPanel::new(None);
+        for index in 0..connections {
+            let profile = profile(&format!("connection-{index}"));
+            for model in 0..models {
+                panel
+                    .choices
+                    .push(choice(&profile, &format!("model-{index}-{model}")));
             }
-            models.profiles = vec![bone_app::Profile::chatgpt(); 5];
-            let row_count = models.row_count();
-            state.overlay = Some(Overlay::Models(models));
-            state.enter_overlay();
-            for selected in 0..row_count {
-                let Some(Overlay::Models(models)) = &mut state.overlay else {
-                    unreachable!();
-                };
-                models.screen = ModelScreen::List { selected };
-                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-                let mut plan = None;
-                terminal
-                    .draw(|frame| plan = Some(crate::view::render(frame, &state)))
-                    .unwrap();
-                let plan = plan.unwrap();
-                let hit = plan
+            panel.profiles.push(profile);
+        }
+        panel.screen = ModelScreen::Tab { selected: 0 };
+        let mut state = UiState::default();
+        state.overlay = Some(Overlay::Models(panel));
+        state
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (buffer.area.x..buffer.area.right())
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    fn draw(state: &UiState, width: u16, height: u16) -> (crate::view::FrameSnapshot, Buffer) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut plan = None;
+        terminal
+            .draw(|frame| plan = Some(crate::view::render(frame, state)))
+            .unwrap();
+        (plan.unwrap(), terminal.backend().buffer().clone())
+    }
+
+    fn tab_hits(plan: &crate::view::FrameSnapshot) -> Vec<usize> {
+        plan.hit_regions()
+            .into_iter()
+            .filter_map(|hit| match hit.target {
+                ClickTarget::Action(Action::SelectTab(index)) => Some(index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn select_tab(state: &mut UiState, tab: usize) {
+        let Some(Overlay::Models(panel)) = &mut state.overlay else {
+            unreachable!()
+        };
+        panel.tab = tab;
+    }
+
+    #[test]
+    fn every_connection_and_the_add_tab_own_a_click_target() {
+        // A wide strip paints every tab.
+        let state = tab_state(3, 2);
+        let (plan, _) = draw(&state, 160, 40);
+        for index in 0..4 {
+            let region = plan
+                .hit_regions()
+                .into_iter()
+                .find(|hit| hit.target == ClickTarget::Action(Action::SelectTab(index)))
+                .unwrap_or_else(|| panic!("tab {index} is missing on a wide strip"));
+            assert_eq!(
+                plan.hit(region.area.x, region.area.y),
+                Some(ClickTarget::Action(Action::SelectTab(index)))
+            );
+        }
+
+        // A narrow strip windows the tabs, and every tab it paints is clickable.
+        for (width, height) in [(40, 12), (60, 16), (80, 24)] {
+            let state = tab_state(3, 2);
+            let (plan, _) = draw(&state, width, height);
+            let hits = tab_hits(&plan);
+            assert!(!hits.is_empty(), "no tab is clickable in {width}x{height}");
+            for index in hits {
+                let region = plan
                     .hit_regions()
                     .into_iter()
-                    .find(|hit| hit.target == ClickTarget::Action(Action::SelectModel(selected)))
-                    .expect("selected action remains visible");
+                    .find(|hit| hit.target == ClickTarget::Action(Action::SelectTab(index)))
+                    .unwrap();
                 assert_eq!(
-                    plan.hit(hit.area.x, hit.area.y),
-                    Some(ClickTarget::Action(Action::SelectModel(selected)))
+                    plan.hit(region.area.x, region.area.y),
+                    Some(ClickTarget::Action(Action::SelectTab(index)))
                 );
-                let buffer = terminal.backend().buffer();
-                assert_eq!(buffer[(hit.area.x, hit.area.y)].bg, theme::PANEL);
-                assert_ne!(buffer[(hit.area.x, hit.area.y)].bg, theme::FOCUS_MARK);
-                for y in 0..height {
-                    let line: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
-                    if line.trim() == "Connections" {
-                        assert!(!plan.hit_regions().into_iter().any(|hit| hit.area.y == y
-                            && matches!(hit.target, ClickTarget::Action(Action::SelectModel(_)))));
-                    }
-                }
             }
-            let Some(Overlay::Models(models)) = &mut state.overlay else {
-                unreachable!();
-            };
-            models.choices.clear();
-            models.profiles.clear();
-            models.screen = ModelScreen::List { selected: 0 };
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal
-                .draw(|frame| {
-                    let plan = crate::view::render(frame, &state);
-                    assert!(
-                        plan.hit_regions()
-                            .into_iter()
-                            .any(|hit| hit.target == ClickTarget::Action(Action::SelectModel(0)))
-                    );
-                })
-                .unwrap();
         }
     }
 
     #[test]
-    fn compact_error_state_keeps_each_selected_model_action_reachable() {
-        let profile = bone_app::Profile::chatgpt();
-        let resolved = |model: &str| bone_app::ResolvedModel {
-            selection: bone_app::ModelSelection::new(profile.id.clone(), model).unwrap(),
-            profile: profile.clone(),
-        };
-        let mut state = UiState::default();
-        state.model_facts = Some(crate::state::ModelFacts {
-            saved: Ok(resolved("configured-model")),
-            running: Some(resolved("current-model")),
-        });
-        state.status = Some("Model switch failed".into());
-        let mut models = ModelPanel::new(None);
-        models.choices = ["current-model", "configured-model"]
+    fn the_current_tab_is_highlighted_and_the_others_stay_muted() {
+        let mut state = tab_state(2, 1);
+        select_tab(&mut state, 1);
+        state.enter_overlay();
+        let (plan, buffer) = draw(&state, 80, 24);
+
+        let current = plan
+            .hit_regions()
             .into_iter()
-            .map(|model| crate::state::ModelChoice {
-                selection: bone_app::ModelSelection::new(profile.id.clone(), model).unwrap(),
-                profile_label: "ChatGPT".into(),
-                label: model.into(),
-            })
-            .collect();
-        models.profiles = vec![profile.clone()];
-        models.screen = ModelScreen::List { selected: 1 };
-        state.overlay = Some(Overlay::Models(models));
+            .find(|hit| hit.target == ClickTarget::Action(Action::SelectTab(1)))
+            .unwrap();
+        let other = plan
+            .hit_regions()
+            .into_iter()
+            .find(|hit| hit.target == ClickTarget::Action(Action::SelectTab(0)))
+            .unwrap();
+        assert_eq!(buffer[(current.area.x, current.area.y)].bg, theme::PANEL);
+        assert_ne!(
+            buffer[(current.area.x, current.area.y)].bg,
+            theme::FOCUS_MARK
+        );
+        assert_eq!(buffer[(other.area.x, other.area.y)].bg, INPUT);
+    }
+
+    #[test]
+    fn a_windowed_strip_keeps_the_current_tab_visible() {
+        let mut state = tab_state(8, 1);
+        select_tab(&mut state, 7);
+        let (plan, buffer) = draw(&state, 40, 12);
+
+        let current = plan
+            .hit_regions()
+            .into_iter()
+            .find(|hit| hit.target == ClickTarget::Action(Action::SelectTab(7)))
+            .expect("the current tab must stay painted");
+        assert_eq!(
+            plan.hit(current.area.x, current.area.y),
+            Some(ClickTarget::Action(Action::SelectTab(7)))
+        );
+        // The strip reports the tabs it hid to the left.
+        let strip = row_text(&buffer, current.area.y);
+        assert!(strip.contains('‹'), "{strip:?}");
+        assert!(!tab_hits(&plan).contains(&0));
+
+        // A tab in the middle hides tabs at both ends.
+        select_tab(&mut state, 3);
+        let (plan, buffer) = draw(&state, 40, 12);
+        let strip = row_text(
+            &buffer,
+            plan.hit_regions()
+                .into_iter()
+                .find(|hit| hit.target == ClickTarget::Action(Action::SelectTab(3)))
+                .expect("the current tab must stay painted")
+                .area
+                .y,
+        );
+        assert!(strip.contains('‹'), "{strip:?}");
+        assert!(strip.contains('›'), "{strip:?}");
+        assert!(!tab_hits(&plan).contains(&8));
+    }
+
+    #[test]
+    fn a_label_wider_than_the_strip_is_clipped_and_still_clickable() {
+        let mut state = tab_state(0, 0);
+        let Some(Overlay::Models(panel)) = &mut state.overlay else {
+            unreachable!()
+        };
+        let label = "c".repeat(128);
+        let mut wide = profile("wide");
+        wide.label = label.clone();
+        panel.profiles.push(wide);
+        panel.screen = ModelScreen::Tab { selected: 0 };
+        state.enter_overlay();
+
+        let (plan, buffer) = draw(&state, 40, 12);
+        let region = plan
+            .hit_regions()
+            .into_iter()
+            .find(|hit| hit.target == ClickTarget::Action(Action::SelectTab(0)))
+            .expect("an over-wide tab must not be dropped");
+        assert!(region.area.width > 0);
+        assert_eq!(
+            plan.hit(region.area.x, region.area.y),
+            Some(ClickTarget::Action(Action::SelectTab(0)))
+        );
+        assert!(row_text(&buffer, region.area.y).contains('c'));
+    }
+
+    #[test]
+    fn the_last_row_of_a_connection_types_a_model_and_the_add_tab_adds_one() {
+        let mut state = tab_state(1, 2);
+        let (_, buffer) = draw(&state, 80, 24);
+        assert!(buffer_text(&buffer).contains("Enter a model ID…"));
+
+        select_tab(&mut state, 1);
+        let (plan, buffer) = draw(&state, 80, 24);
+        assert!(buffer_text(&buffer).contains("+ Add connection…"));
+        assert!(!buffer_text(&buffer).contains("Enter a model ID…"));
+        // The add tab holds only that one row.
+        let rows = plan
+            .hit_regions()
+            .into_iter()
+            .filter(|hit| matches!(hit.target, ClickTarget::Action(Action::SelectModel(_))))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target, ClickTarget::Action(Action::SelectModel(0)));
+    }
+
+    #[test]
+    fn every_painted_model_row_is_clickable_inside_a_small_panel() {
+        let mut state = tab_state(1, 6);
+        state.status = Some("Model switch failed".into());
+        state.enter_overlay();
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        for index in [1, 2, 3] {
-            let Some(Overlay::Models(models)) = state.overlay.as_mut() else {
+
+        // Walk the cursor down the tab so every row is painted at some point.
+        for selected in 0..7 {
+            let Some(Overlay::Models(panel)) = state.overlay.as_mut() else {
                 unreachable!()
             };
-            models.screen = ModelScreen::List { selected: index };
+            panel.screen = ModelScreen::Tab { selected };
             let mut plan = None;
             terminal
                 .draw(|frame| plan = Some(crate::view::render(frame, &state)))
@@ -881,34 +1141,56 @@ mod grouped_menu_tests {
             let hit = plan
                 .hit_regions()
                 .into_iter()
-                .find(|hit| hit.target == ClickTarget::Action(Action::SelectModel(index)))
-                .expect("selected action stays visible in the bounded viewport");
+                .find(|hit| hit.target == ClickTarget::Action(Action::SelectModel(selected)))
+                .expect("the selected row stays inside the bounded viewport");
             assert_eq!(plan.hit(hit.area.x, hit.area.y), Some(hit.target.clone()));
+        }
+    }
+
+    #[test]
+    fn a_pending_delete_names_itself_and_keeps_the_strip() {
+        let mut state = tab_state(2, 2);
+        state.model_operation = Some(crate::state::ModelOperation {
+            session: None,
+            request: 7,
+            kind: ModelOperationKind::Delete,
+        });
+        let (plan, buffer) = draw(&state, 80, 24);
+
+        assert!(buffer_text(&buffer).contains("Deleting connection…"));
+        assert!(buffer_text(&buffer).contains("connection-0"));
+        assert!(buffer_text(&buffer).contains("connection-1"));
+        assert!(!tab_hits(&plan).is_empty());
+    }
+
+    #[test]
+    fn the_tab_screen_replaces_the_generic_escape_hint() {
+        let mut state = tab_state(1, 1);
+        state.enter_overlay();
+        let (_, buffer) = draw(&state, 120, 30);
+        let rendered = buffer_text(&buffer);
+        for key in ["esc", "←/→", "↑↓", "enter", "d delete", "e edit"] {
+            assert!(rendered.contains(key), "missing {key} in the tab hint");
         }
     }
 
     #[test]
     fn failed_login_has_a_pointer_retry_action() {
         let mut state = UiState::default();
-        let mut models = ModelPanel::new(None);
-        models.screen = ModelScreen::Login {
+        let mut panel = ModelPanel::new(None);
+        panel.screen = ModelScreen::Login {
             request: 1,
             state: bone_app::LoginState::Failed {
                 message: "authorization expired".into(),
             },
         };
-        state.overlay = Some(Overlay::Models(models));
-        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        let mut plan = None;
-        terminal
-            .draw(|frame| plan = Some(crate::view::render(frame, &state)))
-            .unwrap();
+        state.overlay = Some(Overlay::Models(panel));
+        let (plan, _) = draw(&state, 40, 12);
 
         assert!(
-            plan.unwrap()
-                .hit_regions()
+            plan.hit_regions()
                 .into_iter()
-                .any(|hit| { hit.target == ClickTarget::Action(Action::RetryLogin) })
+                .any(|hit| hit.target == ClickTarget::Action(Action::RetryLogin))
         );
     }
 }

@@ -2,31 +2,38 @@
 
 `bone-adapters` 是 BONE 的基础设施边界。它包含两个彼此独立的能力集合：
 
-- `llm` 把 provider wire protocol 收敛成一次 `Request → Response` 或 `ResponseStream`；
+- `llm` 把 provider wire protocol 收敛成一次 `Request → ResponseStream`；
 - `tools` 提供 workspace 内的原生读、搜索、补丁和进程工具。
 
 crate root 的 `ModelAdapter` 和 tool-port adapters 再把它们接到 `bone-core::ModelPort` / `ToolPort`。Adapters 不拥有 Session、配置存储、凭据位置、授权政策或另一套 Agent loop。
 
 ## LLM 边界
 
-调用方先取得 `Endpoint`，再选择 `Model`，最后提交一份完整有序的 `Request`：
+调用方先取得 `Endpoint`，再选择 `Model`，最后提交一份完整有序的 `Request`。`Model::stream` 是唯一的模型调用入口，只想要最终结果的调用方把 stream 消费到 terminal 事件：
 
 ```rust,no_run
 use bone_adapters::llm::{
-    InputItem, InputSource, Request,
+    InputItem, InputSource, Request, StreamEvent,
     protocol::openai_responses,
 };
+use futures_util::StreamExt;
 
 # async fn run(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
 let endpoint = openai_responses::official("primary", api_key)?;
 let model = endpoint.model("model-id")?;
-let response = model.complete(
+let mut stream = model.stream(
     Request::new([InputItem::external(InputSource::User, "Hello")])
-        .instructions("Answer briefly")
-        .max_output_tokens(512),
+        .instructions("Answer briefly"),
 ).await?;
 
-println!("{}", response.text().unwrap_or_default());
+let mut completed = None;
+while let Some(event) = stream.next().await {
+    if let StreamEvent::Completed(response) = event? {
+        completed = Some(response);
+    }
+}
+
+println!("{}", completed.expect("one terminal response").text().unwrap_or_default());
 # Ok(())
 # }
 ```
@@ -59,49 +66,45 @@ println!("{}", response.text().unwrap_or_default());
 - `anthropic_messages::official` / `compatible`；
 - `chatgpt_subscription::connect` / `connect_cached`。
 
-`ModelOptions` 是模型级、协议特定控制的唯一表示，同时用于持久配置和 `Request`。当前只有 OpenAI Responses reasoning 控制；它在构造 `ConfiguredModel` 时校验为非空且 protocol 匹配，之后每次请求只应用已经验证的值。不会维护一套持久 options、一套请求 options 和手写 JSON 之间的重复转换，也不会把不支持的字段静默丢给其他协议。
+`ModelOptions` 是模型级、协议特定控制的唯一表示，同时用于持久配置和 `Request`。当前只有 OpenAI Responses reasoning 控制：`ConfiguredModel::new` 在构造时校验它与 `model.protocol()` 匹配，`Request` 在发网前再拒绝空的 Responses options，之后每次请求只应用已经验证的值。不会维护一套持久 options、一套请求 options 和手写 JSON 之间的重复转换，也不会把不支持的字段静默丢给其他协议。
 
 API key 和 OAuth cache 都不属于 `EndpointConfig` 或 `ModelOptions`。App 在 composition root 取得凭据后才构造 live Endpoint。
 
-## Request、上下文与 replay
+## Request、上下文与身份
 
-`Request` 包含：
+`Request` 只包含 BONE 真正会发的东西：
 
-- 完整、按顺序排列的 `InputItem`；
+- 有序的输入文本（`InputItem::external`，其来源区分用户输入与具名上下文块）；
 - 独立的高权限 instructions；
-- tool definitions 和可选 `ToolChoice`；
-- `OutputFormat::Text` 或 JSON schema；
-- 可选最大输出 token；
+- tool definitions 和 `require_tool`（模型必须调用的那一个）；
 - 可选、与 Model protocol 一致的 `ModelOptions`。
 
-`InputItem` 区分外部内容、assistant example、真实 assistant replay 和工具结果。上下文来源不会仅靠文本标签伪造角色；provider 原生 opaque replay 数据只来自 BONE 先前收到并保存的真实响应。
+`InputItem` 只有一种形态：带来源归属的文本。上下文来源不会仅靠文本标签伪造角色，也不存在 assistant example、assistant replay 或工具结果 item。
 
-工具结果必须通过完整 `ToolCall` 构造，不能只传一个 loose string ID。这样 public correlation ID、provider call ID 和 item ID 都能与 committed history 核对。相邻工具结果在 wire protocol 需要时合并成同一 user-result batch。
-
-`Response::into_item` 是把一次真实完成响应加入下一轮 replay 的唯一入口。Adapters 不伪造 provider assistant message，也不会把业务工具运行藏在模型接口内。
+没有多轮 replay 面：生产路径每一轮上下文都由 kernel 重新构造（见 [Core](core.md) 的 job 树与 context 组装），从不把 provider 的 assistant message、reasoning signature 或 tool result 回放给模型。既然回放不存在，协议层对应的那几项能力——响应转成下一轮输入、工具结果 item、跨轮核对 provider 工具身份——也一并删除，而不是留一层没有调用方的兼容面。
 
 Request 在网络 I/O 前验证：
 
 - input、instructions、tool name / description 和 schema 合法；
-- explicit tool choice 引用已经声明的工具；
-- replay 与工具结果的身份没有冲突或复用；
-- endpoint 支持请求的输出 token、structured output 和 protocol options；
-- OpenAI Chat Completions 初始 tool turn 不使用它无法保证的 JSON schema 组合。
+- `require_tool` 指向已经声明的工具；
+- `ModelOptions` 非空且与 endpoint protocol 一致。
 
-一个调用方传入的选项要么被明确发送，要么在网络前返回 typed error。
+一个调用方传入的选项要么被明确发送，要么在网络前返回 typed error，不会被静默丢弃。没有调用方设置的选项不存在——包括输出 token 上限和 JSON schema 输出：需要时连同需要它的调用路径一起加回来，而不是先留着一个空档。
+
+Anthropic 的 `/v1/messages` 要求每个请求都带 `max_tokens`，而 BONE 不发送自己的上限，因此这个值全部来自 Rig 的 per-model 默认表（`claude-sonnet-4-6` → 64000）。BONE 不自己编造这个数字；代价是 Rig 表里没有的 model id（例如某些 Anthropic-compatible 网关自定的名字）会以 `max_tokens must be set for Anthropic` 明确失败，而不是被一个猜测的上限静默截断。
 
 ## Response 与 streaming
 
-unary 和 streaming 最终都产生相同的 `Response`。它包含有序 `OutputItem`、usage、finish reason、响应 / 请求 ID 和来源身份；`text()` 只是汇总文本的便利方法，完整工具调用仍从 terminal Response 读取。
+streaming 是唯一的模型调用模式，terminal `Response` 是模型输出的唯一可信记录。它包含有序 `OutputItem`、usage、finish reason、响应 / 请求 ID 和来源身份；`text()` 只是汇总文本的便利方法，完整工具调用仍从 terminal Response 读取。
 
-`ResponseStream` 可以发出文本和工具参数 delta 供界面显示，但成功流必须满足：
+`ResponseStream` 可以发出文本、reasoning 和工具参数 delta 供界面显示，但成功流必须满足：
 
 1. provider 发出真实 terminal；
 2. adapter 完整 drain 并聚合响应；
 3. 恰好发出一个 `StreamEvent::Completed(Response)`；
 4. 随后结束。
 
-EOF 而没有 terminal 是 `IncompleteStream`；截断、过滤或反序列化失败不会把 partial output 提交成成功响应。第一个 provider stream error 立即成为终态，adapter 不继续等待一个已经失败的连接。完整工具调用只有 terminal `Response` 这一处可信来源。
+delta 只服务显示，consumer 只拿最终结果时可以忽略它们。EOF 而没有 terminal 是 `IncompleteStream`；截断、过滤或反序列化失败不会把 partial output 提交成成功响应。第一个 provider stream error 立即成为终态，adapter 不继续等待一个已经失败的连接。完整工具调用只有 terminal `Response` 这一处可信来源。
 
 `ErrorKind` 区分配置、请求、传输、provider、协议、stream 不完整等稳定类别；provider request ID 与经过大小约束的错误正文会保留用于诊断，secret 不进入错误。
 
@@ -114,7 +117,7 @@ EOF 而没有 terminal 是 `IncompleteStream`；截断、过滤或反序列化�
 
 每个 Core port 方法只进行一次 provider 调用。Adapter 把 Core 提供的 instructions、context JSON 和提交 schema 构造成一次强制 specific-tool Request，并要求模型返回恰好一个正确命名的提交调用。截断输出、零个或多个提交、错误工具名以及 schema decode 失败都转换为 `CallError`。
 
-Core Runtime 在 Future 外层掌握 timeout 和提交资格。ModelAdapter 在调用前尊重已经到达的取消信号，但不宣称能停止 provider 已经开始的远端计算。当前 Agent 路径使用 unary `complete`；通用 `llm` streaming API 留给需要增量显示的其他调用方，Core 只在完整结构化提案结束后提交状态。
+Core Runtime 在 Future 外层掌握 timeout 和提交资格。ModelAdapter 在调用前尊重已经到达的取消信号，但不宣称能停止 provider 已经开始的远端计算。模型调用走 streaming：文本和 reasoning delta 合并成短进度记录，通过调用已有的 progress channel 上报给界面，而 Core 只在完整结构化提案结束后提交状态，所以显示层的失败不会改变决策。
 
 ## 原生工具
 
@@ -176,7 +179,7 @@ Bash 分别限制 stdout 和 stderr，非零退出是结构化工具失败。Uni
 
 ChatGPT subscription connector 接受 App 验证过的 private `auth.json` path。构造 cached Endpoint 不读取凭据；每次模型请求由 Rig 在需要时读取或刷新 token。Rig 独占 JSON schema、OAuth 网络协议和跨进程 cache 事务，Adapters 不搜索 credential root，也不读取 OAuth bytes。
 
-refresh、rejected-token invalidate 和 logout 在同一把文件锁下重新读取并原子提交，因此并发进程共享 cache 时不会形成 refresh storm，也不会用旧 401 删除新 token。设备授权等待在锁外进行。subscription backend 不支持的 `max_output_tokens` 或 structured-output schema 会在本地拒绝。
+refresh、rejected-token invalidate 和 logout 在同一把文件锁下重新读取并原子提交，因此并发进程共享 cache 时不会形成 refresh storm，也不会用旧 401 删除新 token。设备授权等待在锁外进行。subscription backend 不支持的请求选项 BONE 根本不发送，因此没有需要本地拒绝的兼容判断。
 
 Workspace 固定使用本地 [Rig 0.42.0 hardening patch](../patches/rig-core-0.42.0-chatgpt-hardening.md)。升级 Rig 时必须重跑独立 patch tests 和 BONE 的 provider contracts，确认上游已覆盖补丁退出条件后才能删除。
 

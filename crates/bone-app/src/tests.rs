@@ -3104,6 +3104,160 @@ async fn login_recovers_sessions_after_credentials_are_repaired() {
 }
 
 #[tokio::test]
+async fn deleting_a_profile_rewrites_the_config_and_keeps_the_others_in_order() {
+    let temporary = tempfile::tempdir().unwrap();
+    let options = AppOptions::isolated(temporary.path().join("data"));
+    let config_path = options.bone_home.join("config.toml");
+    let app = App::with_ports(options, Arc::new(CompletingModel), Vec::new())
+        .await
+        .unwrap();
+    let profiles = [
+        Profile::new(
+            ProfileId::new("first").unwrap(),
+            "First",
+            EndpointConfig::OpenAiResponses { base_url: None },
+        )
+        .unwrap(),
+        Profile::new(
+            ProfileId::new("second").unwrap(),
+            "Second",
+            EndpointConfig::OpenAiResponses { base_url: None },
+        )
+        .unwrap(),
+        Profile::new(
+            ProfileId::new("third").unwrap(),
+            "Third",
+            EndpointConfig::OpenAiResponses { base_url: None },
+        )
+        .unwrap(),
+    ];
+    for profile in profiles.clone() {
+        app.save_profile(profile).await.unwrap();
+    }
+    let before = std::fs::read_to_string(&config_path).unwrap();
+
+    app.delete_profile(profiles[1].id.clone()).await.unwrap();
+
+    let expected = vec![profiles[0].clone(), profiles[2].clone()];
+    assert_eq!(app.profiles().await.unwrap(), expected);
+    let after = std::fs::read_to_string(&config_path).unwrap();
+    assert_ne!(after, before, "the saved configuration must be rewritten");
+    assert!(!after.contains("Second"));
+    assert!(after.contains("First"));
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn deleting_an_unsaved_profile_is_a_noop_that_leaves_the_config_alone() {
+    let temporary = tempfile::tempdir().unwrap();
+    let options = AppOptions::isolated(temporary.path().join("data"));
+    let config_path = options.bone_home.join("config.toml");
+    let app = App::with_ports(options, Arc::new(CompletingModel), Vec::new())
+        .await
+        .unwrap();
+    let saved = Profile::new(
+        ProfileId::new("saved").unwrap(),
+        "Saved",
+        EndpointConfig::OpenAiResponses { base_url: None },
+    )
+    .unwrap();
+    app.save_profile(saved.clone()).await.unwrap();
+    let before = std::fs::read(&config_path).unwrap();
+
+    let missing = ProfileId::new("missing").unwrap();
+    app.delete_profile(missing.clone()).await.unwrap();
+    app.delete_profile(missing).await.unwrap();
+
+    assert_eq!(app.profiles().await.unwrap(), vec![saved]);
+    assert_eq!(std::fs::read(&config_path).unwrap(), before);
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn deleting_a_chatgpt_profile_drops_its_cached_credentials() {
+    let temporary = tempfile::tempdir().unwrap();
+    let credentials =
+        crate::credentials::ChatGptCredentials::at(temporary.path().join("chatgpt-credentials"))
+            .unwrap();
+    let providers = ProviderConnector::with_chatgpt_credentials(credentials.clone());
+    let app = App::with_provider_connector(
+        AppOptions::isolated(temporary.path().join("data")),
+        providers,
+    )
+    .await
+    .unwrap();
+    let profile = Profile::chatgpt();
+    app.save_profile(profile.clone()).await.unwrap();
+    let auth_file = credentials.auth_file().unwrap();
+    crate::safe_file::atomic_write_private(
+        &auth_file,
+        br#"{"access_token":"offline-test-token","expires_at":4102444800,"account_id":"offline-account"}"#,
+    )
+    .unwrap();
+    assert!(auth_file.exists());
+
+    app.delete_profile(profile.id.clone()).await.unwrap();
+
+    assert!(!auth_file.exists());
+    assert!(
+        app.profiles().await.unwrap().is_empty(),
+        "a deleted ChatGPT connection must not come back as a default"
+    );
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn deleting_a_profile_leaves_selecting_sessions_reporting_a_missing_profile() {
+    let (_temporary, app, workspace) = configured_app().await;
+    let session = app
+        .create_session(workspace.id, "Removed profile")
+        .await
+        .unwrap();
+    let removed = ProfileId::new("test").unwrap();
+    assert!(
+        app.profiles()
+            .await
+            .unwrap()
+            .iter()
+            .any(|saved| saved.id == removed)
+    );
+
+    app.delete_profile(removed.clone()).await.unwrap();
+
+    assert!(
+        !app.profiles()
+            .await
+            .unwrap()
+            .iter()
+            .any(|saved| saved.id == removed)
+    );
+    assert_eq!(
+        app.resolved_config(session.id()).await.unwrap().desired,
+        Err(ConfigProblem::MissingProfile(removed.clone()))
+    );
+    // The dangling selection keeps its model and profile, so the reload tells
+    // the Session to report the problem the frontend takes over.
+    let mut observed = session.observe();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if observed.borrow().problem
+                == Some(AppProblem::Configuration(ConfigProblem::MissingProfile(
+                    removed.clone(),
+                )))
+            {
+                return;
+            }
+            observed.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("deleting a profile must reach the sessions that selected it");
+    // The selection is deliberately kept, so a repeated delete is a no-op.
+    app.delete_profile(removed).await.unwrap();
+    app.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_rejected_agent_limit_change_keeps_the_same_job_running() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace_root = temporary.path().join("workspace");

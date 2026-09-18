@@ -9,7 +9,7 @@ use rig_core::streaming::{
     StreamedAssistantContent, StreamingCompletionResponse, ToolCallDeltaContent as RigToolCallDelta,
 };
 
-use crate::llm::{Error, Response, model::RequestOrigin, tool::ToolCallIdentities};
+use crate::llm::{Error, Response, model::RequestOrigin};
 
 /// One partial tool-call field emitted while a call is assembling.
 #[non_exhaustive]
@@ -22,12 +22,20 @@ pub enum ToolCallDelta {
 /// One event from a streaming model call.
 ///
 /// Every fully consumed stream ends in exactly one terminal item: either
-/// `Completed(Response)` or `Err(Error)`.
+/// `Completed(Response)` or `Err(Error)`. Deltas are for display only: the
+/// terminal response is the single trustworthy record of what the model
+/// produced, so a consumer that only needs the result may ignore them.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
     TextDelta(String),
-    ToolCallDelta { id: String, delta: ToolCallDelta },
+    /// Incremental reasoning text, as DeepSeek reports through
+    /// `reasoning_content` and OpenAI as reasoning summaries.
+    ReasoningDelta(String),
+    ToolCallDelta {
+        id: String,
+        delta: ToolCallDelta,
+    },
     Completed(Response),
 }
 
@@ -35,20 +43,14 @@ pub enum StreamEvent {
 pub struct ResponseStream {
     inner: Option<StreamingCompletionResponse>,
     origin: Arc<RequestOrigin>,
-    previous_tool_calls: ToolCallIdentities,
     finished: bool,
 }
 
 impl ResponseStream {
-    pub(crate) fn new(
-        inner: StreamingCompletionResponse,
-        origin: Arc<RequestOrigin>,
-        previous_tool_calls: ToolCallIdentities,
-    ) -> Self {
+    pub(crate) fn new(inner: StreamingCompletionResponse, origin: Arc<RequestOrigin>) -> Self {
         Self {
             inner: Some(inner),
             origin,
-            previous_tool_calls,
             finished: false,
         }
     }
@@ -98,10 +100,16 @@ impl Stream for ResponseStream {
                             delta,
                         })));
                     }
+                    StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                        return Poll::Ready(Some(Ok(StreamEvent::ReasoningDelta(reasoning))));
+                    }
+                    // A complete reasoning block is not re-emitted as a delta:
+                    // its text already reached the caller through
+                    // `ReasoningDelta`, and a summary still appears in the
+                    // terminal response.
+                    StreamedAssistantContent::Reasoning { .. }
                     // Rig finishes aggregation only on the poll *after* Final.
-                    StreamedAssistantContent::Final(_)
-                    | StreamedAssistantContent::Reasoning { .. }
-                    | StreamedAssistantContent::ReasoningDelta { .. }
+                    | StreamedAssistantContent::Final(_)
                     | StreamedAssistantContent::Unknown(_) => {}
                 },
                 Poll::Ready(None) => {
@@ -120,9 +128,8 @@ impl Stream for ResponseStream {
                         .unwrap_or_default();
                     let response =
                         rig_core::completion::CompletionResponse::from(inner).with_raw(raw);
-                    let previous_tool_calls = std::mem::take(&mut this.previous_tool_calls);
                     return Poll::Ready(Some(
-                        Response::from_rig(Arc::clone(&this.origin), response, previous_tool_calls)
+                        Response::from_rig(Arc::clone(&this.origin), response)
                             .map(StreamEvent::Completed),
                     ));
                 }
