@@ -359,7 +359,7 @@ fn render_transcript(
             continue;
         }
         let compact = compact_event(&entry.event);
-        if !rows.is_empty() && !(previous_compact && compact) {
+        if !(rows.is_empty() || previous_compact && compact) {
             rows.push(Line::default());
             anchors.push(crate::layout::ContentAnchor {
                 sequence: entry.sequence,
