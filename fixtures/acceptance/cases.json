@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "small_repair",
+      "category": "small_repair",
+      "workspace": "small_repair",
+      "prompts": ["Fix totals.py: total must ignore None, return 0 for an empty sequence, and correctly sum positive and negative numbers. Keep the existing public function name. Verify the change."],
+      "checks": [{"kind": "python", "files": ["totals.py"], "code": "assert total([]) == 0\nassert total([None, 3, -2, None]) == 1\nassert total([0, None]) == 0"}]
+    },
+    {
+      "id": "independent_tasks",
+      "category": "independent_tasks",
+      "workspace": "independent_tasks",
+      "prompts": ["Complete these two independent fixes, using separate internal jobs when available: slug.py slug must trim whitespace, lowercase words, collapse whitespace into one hyphen, and discard punctuation; clamp.py clamp must bound a number inclusively and raise ValueError when lower exceeds upper. Verify both."],
+      "checks": [
+        {"kind": "python", "files": ["slug.py"], "code": "assert slug('  Hello,   World!  ') == 'hello-world'\nassert slug('') == ''\nassert slug('a b c') == 'a-b-c'"},
+        {"kind": "python", "files": ["clamp.py"], "code": "assert clamp(5, 0, 10) == 5\nassert clamp(-1, 0, 10) == 0\nassert clamp(11, 0, 10) == 10\ntry:\n    clamp(1, 2, 0)\nexcept ValueError:\n    pass\nelse:\n    raise AssertionError('invalid bounds accepted')"}
+      ]
+    },
+    {
+      "id": "sequential_dependency",
+      "category": "sequential_dependency",
+      "workspace": "sequential_dependency",
+      "prompts": ["First define contract.json as a JSON Schema object describing an event with properties event_id (string), occurred_at (string), and amount_cents (integer), all required. Then implement consumer.py parse_event(raw_json), following that exact contract, returning a dict and rejecting missing fields or incorrect types (including boolean amounts) with ValueError. Have the implementation job wait for the contract job result if you use multiple jobs. Verify both."],
+      "checks": [
+        {"kind": "json_fields", "path": "contract.json", "required": ["event_id", "occurred_at", "amount_cents"]},
+        {"kind": "python", "files": ["consumer.py"], "code": "import json\nevent = {'event_id': 'evt-1', 'occurred_at': '2026-09-30', 'amount_cents': 125}\nassert parse_event(json.dumps(event)) == event\nfor bad in ({}, dict(event, amount_cents='125'), dict(event, amount_cents=True)):\n    try:\n        parse_event(json.dumps(bad))\n    except ValueError:\n        pass\n    else:\n        raise AssertionError('invalid event accepted')"}
+      ]
+    },
+    {
+      "id": "followup_constraint",
+      "category": "followup_constraint",
+      "workspace": "followup_constraint",
+      "prompts": [
+        "Implement greeting.py greet(name), returning 'Hello, NAME!' with NAME stripped of surrounding whitespace. Verify it without leaving test files.",
+        "Continue that work: change the greeting to 'Welcome, NAME.' and reject blank names with ValueError. Keep the public function name and do not create or modify any file other than greeting.py. Verify without leaving test files."
+      ],
+      "checks": [{"kind": "python", "files": ["greeting.py"], "code": "assert greet(' Ada ') == 'Welcome, Ada.'\ntry:\n    greet('   ')\nexcept ValueError:\n    pass\nelse:\n    raise AssertionError('blank accepted')"}],
+      "allowed_files": ["greeting.py"]
+    },
+    {
+      "id": "long_context",
+      "category": "long_context",
+      "workspace": "long_context",
+      "long_context_lines": 3600,
+      "prompts": ["Read requirements.txt in pages. It contains many irrelevant archive lines and three authoritative KEEP_RULE entries. Implement report.py render_report(rows) following all three KEEP_RULE entries. Rows are dicts with name and amount_cents. Verify negative amounts and ordering. Preserve requirements.txt exactly."],
+      "checks": [{"kind": "python", "files": ["report.py"], "code": "assert render_report([{'name': 'Bob', 'amount_cents': -125}, {'name': 'Ada', 'amount_cents': 7}]) == 'name,amount_cents\\nAda,7\\nBob,-125\\n'\nassert render_report([]) == 'name,amount_cents\\n'"}],
+      "unchanged_files": ["requirements.txt"]
+    },
+    {
+      "id": "recovery",
+      "category": "recovery",
+      "workspace": "recovery",
+      "prompts": [
+        "Implement ledger.py record(path, entry_id): append entry_id followed by a newline to the text file at path only if that exact entry_id is not already present, returning True when appended and False otherwise. Verify it without leaving test files.",
+        "The process has been restarted using this same saved session. Continue the ledger work and verify the existing implementation still prevents duplicates. Keep the public function signature."
+      ],
+      "checks": [{"kind": "python", "files": ["ledger.py"], "code": "import tempfile\nfrom pathlib import Path\nwith tempfile.TemporaryDirectory() as directory:\n    path = Path(directory) / 'ledger.txt'\n    assert record(path, 'entry-1') is True\n    assert record(path, 'entry-1') is False\n    assert record(path, 'entry-2') is True\n    assert path.read_text() == 'entry-1\\nentry-2\\n'"}],
+      "note": "Each prompt runs in a separate process against one saved session. Crash and UnknownWrite behavior are separately covered by scripted Runtime acceptance tests."
+    }
+  ]
+}

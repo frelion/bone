@@ -1,0 +1,32 @@
+{
+  "type": "followup_repair",
+  "case_id": "recovery",
+  "session_id": "ee3550ca-51af-4ba2-aae1-6a6a2b3807ef",
+  "original_baseline_passed": false,
+  "status": "completed",
+  "passed": true,
+  "verification": {
+    "passed": true,
+    "checks": [
+      {
+        "check": 1,
+        "kind": "python",
+        "passed": true
+      }
+    ]
+  },
+  "metrics": {
+    "model_calls": 4,
+    "input_tokens": 12760,
+    "output_tokens": 527,
+    "total_tokens": 13287,
+    "cost_usd": null
+  },
+  "wall_seconds": 18.415393208,
+  "event_counts": {
+    "jobs": 1,
+    "summaries": 0,
+    "summary_model_calls": 0
+  },
+  "event_counts_source": "saved followup history filtered by corrective root input"
+}

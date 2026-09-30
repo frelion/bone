@@ -1,46 +1,38 @@
-[workspace]
-members = [
-    "crates/bone-app",
-    "crates/bone-core",
-    "crates/bone-adapters",
-    "crates/bone-tui",
-]
-exclude = ["third_party/rig-core-0.42.0", "third_party/crossterm-0.28.1"]
-resolver = "3"
-
-[workspace.package]
-version = "0.4.2"
+[package]
+name = "bone"
+version = "0.5.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.96"
+description = "One conversational agent, persistent internal jobs, native Rig providers"
+license = "MIT"
 
-[workspace.dependencies]
-bytes = "1"
+[features]
+default = []
+bedrock = ["dep:rig-bedrock"]
+vertexai = ["dep:rig-vertexai"]
+candle = ["dep:rig-candle"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 fs2 = "0.4"
-globset = "0.4"
-grep-regex = "0.1"
-grep-searcher = "0.1"
-http = "1"
-ignore = "0.4"
 libc = "0.2"
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-rig-core = { version = "=0.42.0", path = "third_party/rig-core-0.42.0", default-features = false }
-rusqlite = "0.40.2"
-rustix = { version = "1", features = ["fs", "process"] }
-schemars = "1"
+rig-core = { git = "https://github.com/0xPlaygrounds/rig", rev = "063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a", default-features = false, features = ["reqwest", "rustls"] }
+rig-reqwest = { git = "https://github.com/0xPlaygrounds/rig", rev = "063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a", default-features = false, features = ["rustls"] }
+rig-bedrock = { git = "https://github.com/0xPlaygrounds/rig", rev = "063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a", optional = true }
+rig-vertexai = { git = "https://github.com/0xPlaygrounds/rig", rev = "063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a", optional = true }
+rig-candle = { git = "https://github.com/0xPlaygrounds/rig", rev = "063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a", optional = true }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-tempfile = "3"
-thiserror = "2"
 toml = "0.9"
-tokio = "1"
-url = "2"
+tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["serde", "v4"] }
-walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 strip = "symbols"
-
-[patch.crates-io]
-crossterm = { path = "third_party/crossterm-0.28.1" }

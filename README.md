@@ -1,146 +1,163 @@
 # BONE
 
-BONE 是一个用 Rust 编写的 coding agent。一个内核管理持续会话与执行 Job：Kernel model 负责理解和回应用户，Worker model 在固定工具权限内执行任务。当前 workspace 包含可信执行内核、基础设施适配器、headless 应用层和终端界面。
+BONE 是一个 Rust 编写的 coding agent。用户与一个 agent 对话；agent 在内部 Job 中保留正在进行的工作、等待关系和局部上下文。用户直接提出任务和后续指令，无需创建或选择 Job。
 
-```text
-future desktop / web / automation
-                    │
-                    ▼
-                bone-tui
-                    │
-                    ▼
-                bone-app
-               ╱        ╲
-              ▼          ▼
-       bone-adapters ──► bone-core
-```
+这是从零重写的单 crate 实现。模型连接、消息、工具定义、返回结果和流解析使用官方 Rig SDK，固定到 Git 提交 `063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a`。会话状态与事件存于 SQLite。架构边界见 [architecture.md](docs/architecture.md)，验收和消融方法见 [verification.md](docs/verification.md)。
 
-- [`bone-core`](crates/bone-core/) 是唯一的 Agent 状态机：解释输入、组织 Job、构造局部上下文、授权模型与工具调用，并裁决取消、完成和迟到结果。
-- [`bone-adapters`](crates/bone-adapters/) 实现 LLM 协议、模型端口和 workspace 内的读、搜索、补丁与命令工具。它依赖 Core 的端口，Core 不依赖任何 provider、文件系统或进程实现。
-- [`bone-app`](crates/bone-app/) 是 composition root：管理 Workspace、Session、配置、凭据、SQLite 持久化、外部写事实和 Runtime 生命周期，并向所有前端提供同一套 Rust API。
-- [`bone-tui`](crates/bone-tui/) 提供可直接运行的 `bone` 终端程序。
+## 构建与配置
 
-原来的 `bone-store` 已成为 `bone-app` 的私有模块。新的 TUI 是独立前端，只依赖 `bone-app`。
-
-## 下载和运行
-
-从 [GitHub Releases](https://github.com/frelion/bone/releases/latest) 下载与你的系统匹配的文件：
-
-| 系统 | 文件 |
-| --- | --- |
-| Linux x86-64 | `bone-linux-x86_64` |
-| Linux ARM64 | `bone-linux-aarch64` |
-| macOS Intel | `bone-macos-x86_64` |
-| macOS Apple Silicon | `bone-macos-aarch64` |
-| Windows x86-64 | `bone-windows-x86_64.exe` |
-
-Linux 和 macOS 下载后赋予执行权限即可运行：
+需要 Rust 1.96 或更新版本；本地协议验收还需要 Python 3。
 
 ```sh
-chmod +x ./bone-*
-./bone-linux-x86_64 # 按实际下载的文件名替换
+cargo build --locked
+cargo install --path . --locked
+bone providers
 ```
 
-Windows 可直接运行下载的 `.exe`。`SHA256SUMS` 可用于校验下载文件。
-两个 Linux 发布文件均以 musl 静态链接，不依赖目标系统的 glibc、DBus 或 Secret Service。
+`bone providers` 从 Rig 的注册表列出全部 provider/protocol 组合，并加入 Cohere、Ollama 和本次构建启用的官方 companion provider。某些 provider 支持多种协议，使用列出的限定名称，例如 `moonshot/openai:MODEL`。
 
-### 在项目里执行一次任务
-
-交互使用直接运行 `bone`。自动化、真实场景测试或 CI 使用同一个二进制的
-`bone run`，它不启动 TUI，完成后在 stdout 输出 JSON：
+默认数据目录是 `~/.bone/v2`。`--data-dir DIR` 或 `BONE_DATA_DIR` 可指定独立目录。生成基础配置：
 
 ```sh
-# 先运行 bone，在 Models & connections 中保存 API key
-bone run \
-  --workspace /path/to/project \
-  --prompt '修复失败的测试，并运行相关测试验证修改' \
-  --model gpt-5.6-sol \
-  --trajectory ./artifacts/bone-trajectory.json \
-  --result ./artifacts/bone-result.json
+mkdir -p ~/.bone/v2
+bone config > ~/.bone/v2/config.toml
 ```
 
-也可以用 `--prompt-file issue.md` 从文件读取任务。交互界面和 headless 使用相同的
-Job 工具授权：普通任务默认可使用全部已注册工具；只做调查时，在请求中说明
-“只读分析，不要修改”。会话模型提出限制，Core 创建权限固定的 Job，并在每次工具
-调用前校验授权。`bone run` 不读取 API-key 环境变量；API key
-必须已经由 TUI 保存，或通过 stdin 交给 `bone credentials set`，最终写入
-`$BONE_HOME/credentials.toml`（默认 `~/.bone/credentials.toml`）。
-运行 `bone run --help` 可查看 provider、自定义 HTTPS endpoint、项目配置授权、超时和
-退出码参数。
+配置中的模型引用和 provider 配置由 Rig 负责解析；API key 用环境变量提供。以下配置引用变量名称，不保存 key 值：
 
-权威 benchmark 的 Harbor 适配、公开测试集选择和结果留存规范见
-[`benchmarks/README.md`](benchmarks/README.md)。
+```toml
+default_profile = "work"
 
-## 最小使用路径
+[profiles.work]
+model = "openai/openai:gpt-5.4"
+credential_env = "OPENAI_API_KEY"
+max_tokens = 4096
 
-`App` 打开一份宿主指定的数据目录；Workspace 精确绑定到一个已经存在的目录；Session 是可持久恢复的用户工作单元。
-
-```rust,no_run
-use bone_app::{App, AppOptions, SessionSeq, SubmitInput};
-
-# async fn run() -> bone_app::Result<()> {
-let app = App::open(AppOptions::with_paths(
-    "/absolute/path/to/app-data",
-    "/absolute/path/to/bone-home",
-)).await?;
-let workspace = app.open_workspace("/absolute/path/to/workspace").await?;
-let session = app.create_session(workspace.id, "Investigate build").await?;
-
-let mut changes = session.observe();
-let receipt = session.submit(SubmitInput::new("Find the failing test")).await?;
-let page = session.history(SessionSeq(0), 100).await?;
-
-# let _ = (&mut changes, receipt, page);
-app.shutdown().await?;
-# Ok(())
-# }
+[profiles.subscription]
+model = "chatgpt/openai:gpt-6-luna"
+reuse_codex_login = true
 ```
 
-提交成功表示输入及其幂等键已经持久化，不表示 Agent 已经执行完成。未选模型、缺少凭据或 provider 暂时不可用时，输入保留在 Session 中等待恢复。当前状态通过 `Session::observe` / `snapshot` 获取，耐久历史通过 `Session::history` 按游标读取。
+未设置 `credential_env` 时，普通注册 provider 使用 Rig 原生环境变量规则，包括 endpoint 和备用凭据。显式 endpoint 使用原生 `ProviderRef` 的配置形式，例如：
 
-Runtime 配置按以下顺序解析：
+```toml
+[profiles.gateway]
+credential_env = "OPENAI_API_KEY"
 
-```text
-Session override > Project override > User setting
+[profiles.gateway.model]
+model = "YOUR_MODEL_ID"
+
+[profiles.gateway.model.config.openai]
+api_key = "[redacted]"
+base_url = "https://YOUR_GATEWAY/v1"
+dialect = "openai"
+auth = "Bearer"
+route = "Responses"
 ```
 
-`App::update_config` 校验并保存一项类型化变更，然后把最新 desired 配置通知给受影响的已打开 Session；它不等待模型连接或网络认证。面向前端的 `ConfigChange::Model` 会在一个事务中同时选择 worker/coordinator。运行中的 Session 异步装配新端口，期间保留 Runtime ID、Job 图和在途工具；旧模型调用失去提交资格并在新模型上重新调度，已经开始的工具继续收尾。装配失败时 Session 保持暂停并暴露可匹配的问题，直到配置或凭据修复。
+这里的 `api_key` 是 Rig 序列化的占位符，运行时从 `credential_env` 注入真实值。`additional_params` 是原生 `CompletionRequest` 的额外参数对象；例如 `[profiles.work.additional_params.reasoning]` 下的 `effort = "low"`，具体参数需被所选模型支持。
 
-## 持久化边界
-
-`AppOptions` 分别携带 SQLite `data_dir` 与文件配置根目录 `bone_home`。平台默认的
-`bone_home` 是 `BONE_HOME` 指定的绝对目录，否则为 `~/.bone`。User 配置与 Profiles
-位于 `config.toml`，API key 位于权限受限的 `credentials.toml`，ChatGPT OAuth cache
-位于 `providers/`；SQLite 只保留 Session override、项目配置的摘要信任记录和其他运行
-状态。旧 SQLite User/Workspace 配置与系统 Keyring 不迁移，升级后需重新配置连接。
-
-一次外部写在调用前记录意图，在结果被匹配的 Agent 事实确认前保持阻塞。进程退出后，App 恢复产品状态并把丢失 Runtime 的未完成输入标为 `Interrupted`，不会猜测或自动重放结果未知的外部写。`App::unresolved_writes` 是 Workspace 级的权威查询入口。
-
-## 文档
-
-长期维护的设计文档只有以下六个入口：
-
-- [Core](docs/core.md)：Job、Context、调度、权限、并发和模型行为契约。
-- [App](docs/app.md)：Workspace / Session API、配置、持久化、恢复和外部写。
-- [Adapters](docs/adapters.md)：LLM 协议、模型适配器、内置工具和安全边界。
-- [Testing](docs/testing.md)：测试分层、替身规范、执行矩阵和 live certification。
-- [TUI](docs/tui.md)：下一阶段前端的产品边界、状态流和验收范围。
-- 本文件：项目定位、依赖方向和开发入口。
-
-公开 Rust 类型、字段和方法以 crate rustdoc 为准；上述文档只维护跨模块不变量和设计取舍。固定的 Rig 上游补丁边界记录在 [`patches/`](patches/) 中。
-
-## 验证
-
-普通变更应至少通过：
+命令行可直接选择原生引用；已有配置时，`--model` 只覆盖所选（或默认）profile 的模型，保留凭据来源、额外参数和输出上限，并验证它们与新 provider 的兼容性。没有配置时创建命令行临时 recipe。`BONE_MODEL` 也可提供此引用。`.env.local` 不会自动加载。
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --all-features --locked
-cargo test --workspace --doc --all-features --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
+bone --model openai:gpt-5.4 run '说明这个项目的测试入口' --read-only
+bone --model ollama:qwen3 chat
 ```
 
-`--all-features` 会启用只用于离线协议契约的 `test-utils`。真实 provider 测试是显式、可能收费的独立入口，详见 [Testing](docs/testing.md)。
+Ollama 的上述命令连接本机默认 daemon。Cohere 使用 `cohere:MODEL` 和 `COHERE_API_KEY`。自定义 Cohere/Ollama endpoint 可在 profile 的 `model` 对象中使用各自原生配置，如 `ollama = { base_url = "http://localhost:11434", api_key = "[redacted]" }` 以及 `model = "qwen3"`。
 
-[`legacy/`](legacy/) 只保存历史材料，不属于 workspace build；[`third_party/`](third_party/) 保存固定版本的上游源码与本地补丁。
+## API key 与订阅登录
+
+通过当前 shell 或凭据管理工具注入所需的 API key 环境变量，然后运行命令。BONE 不将 API key 写入 profile 配置。
+
+已有 Codex subscription 登录可直接复用。上面的 `subscription` profile 在每次请求前只读 `${CODEX_HOME:-~/.codex}/auth.json` 的当前 access token 和 account ID，交给 Rig 公开的 `AuthSource::AccessToken`。它不转换、复制、刷新或写入 Codex 的认证文件；认证过期时先刷新 Codex 登录，再运行 BONE。
+
+```sh
+bone --profile subscription chat
+```
+
+若需要 BONE 自己管理独立订阅缓存，设 `reuse_codex_login = false`，再使用 Rig 原生 device flow：
+
+```sh
+bone --profile subscription login
+bone --profile subscription chat
+```
+
+也可以选择一个尚未创建 `config.toml` 的独立数据目录，使用命令行 profile：
+
+```sh
+bone --data-dir ~/.bone-personal --profile personal --model chatgpt:gpt-6-luna login
+bone --data-dir ~/.bone-personal --profile personal --model chatgpt:gpt-6-luna chat
+```
+
+BONE 独立登录的订阅缓存仅存于当前数据目录的 `profiles/PROFILE/auth.json`。每次调用重新通过 Rig 读取或刷新缓存，并持有该缓存的跨进程锁直到该调用结束。复用 Codex 登录时，锁由认证文件的 canonical 路径标识，保存在固定 `~/.bone/v2/credential-locks`，因此不同数据目录和 profile 仍共享同一来源的调用锁。等待锁可随调用取消。普通运行不会启动交互登录。独立缓存失效或 HTTP 401 会报告重新登录；显式 `login` 成功后才替换已有缓存。开启复用时，`bone login` 只检查现有 Codex 登录资料是否可加载，不发起登录或联网验证。
+
+## 使用会话
+
+```sh
+bone --profile work run '修复失败测试，并运行相关测试' --workspace /path/to/project --json
+bone --profile work chat --workspace /path/to/project
+bone sessions
+bone history SESSION_ID --json
+bone --profile work resume SESSION_ID --workspace /path/to/project --json
+bone --profile work run '后续要求：仅修改 parser.rs' --session SESSION_ID
+```
+
+`run` 的 prompt 是位置参数。`chat` 中使用 `/stop`、`/resume`、`/quit`；Ctrl+C 暂停会话。会话 ID 出现在运行结果中，可用于恢复或查看记录。Job ID 是内部诊断信息；后续工作通常沿用同一个 session。
+
+内部 Job 的提问会直接显示到会话，普通回复自动回答最近一个未答问题，无需选择 Job。多个问题同时等待时，其余问题保留在历史中。`run --json` 的等待结果包含 `question_id`，自动化可以用 `bone run '回答内容' --session SESSION_ID --reply-to QUESTION_ID --json` 回答指定问题。每条新回复有独立调用预算，原委托继续保留在会话中。
+
+默认每个根用户输入与它引起的内部工作共享 64 次模型调用和 16 个新 Job 的预算，最多同时执行 3 个动作。可以通过 `--max-calls`、`--max-jobs`、`--max-parallel`、`--context-chars`、`--model-timeout-seconds` 和 `--timeout-seconds` 控制运行。`--single-job` 与 `--no-compaction` 用于消融。上下文摘要压缩预算内已完成的安全前缀，保留未处理输入的原文，完整工具 batch 不会被截断。
+
+## 工具权限与中断写入
+
+`--read-only` 禁用 `write_file` 与 `shell`。文件工具限制在 workspace 内，拒绝路径向上遍历和已知 symlink escape。`write_file` 必须携带读取结果的 SHA-256；创建新文件使用 `expected_sha256 = null`。
+
+`shell` 在 workspace 中以当前本地用户权限运行，没有 OS sandbox。命令超时或取消时会终止所启动的进程组；输出最多保留每个流 32 KiB。不要把进程组终止等同于撤销已发生的外部效果。
+
+中断或无法确认完成的写操作记录为未知写；进一步写入需要先核查。文件替换后目录同步失败也属于未知效果。查看 session history 与实际文件/外部状态，再记录观察：
+
+```sh
+bone reconcile SESSION_ID CALL_ID --note '核查后的实际结果和证据'
+bone --profile work resume SESSION_ID
+```
+
+`reconcile` 记录检查结果并解除写入阻塞，不自动重放旧命令。恢复会话可以继续读取和核查；未知效果不能据此报告为成功。
+
+## 官方 companion provider
+
+```sh
+cargo build --locked --features bedrock,vertexai,candle
+```
+
+- Bedrock：`--model bedrock:MODEL_ID`，使用 AWS SDK 的环境凭据与区域。
+- Vertex AI：`--model vertexai:MODEL_ID`，使用官方 SDK 的 Application Default Credentials 与配置。
+- Candle：在 profile 中设置本地 artifact 路径；Rig Candle 负责加载和原生 completion。
+
+```toml
+[profiles.local.model.candle]
+config = "/absolute/path/config.json"
+tokenizer = "/absolute/path/tokenizer.json"
+weights = "/absolute/path/model.gguf"
+gguf = true
+```
+
+云 provider 工厂和 Candle 工厂已通过 `cargo check --all-features`。构建成功不能证明账号可用、区域支持或 checkpoint 可推理；这些真实连接和 artifact 推理仍需对应环境验收。
+
+## 验证与数据版本
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --locked
+cargo check --all-features --locked
+python3 -B -m unittest discover -s tests -p 'test_ablate.py' -v
+```
+
+协议测试使用本地 Responses/SSE fixture、合成凭据和临时目录，验证原生模型调用、流收集、401 不重试、内部工作、工具和恢复。消融脚本默认只生成实验安排；只有显式 `--run` 才请求模型。离线测试不代表真实模型质量、效率提升或 subscription 登录成功。
+
+新实现默认使用 `~/.bone/v2`，不自动导入旧会话或旧凭据。显式 `reuse_codex_login` 仅按用户选择读取现有 Codex 登录，不属于缓存迁移。旧实现保留在 Git 历史中。本次重写没有延续旧的多 crate/TUI 接口；当前用户入口是本仓库的 `bone` CLI。
+
+最终离线验收通过 65 项 Rust 测试、5 项 Python 测试、Clippy 和全部 feature 编译。复用现有 Codex 登录、使用 `chatgpt:gpt-6-luna` 的中文连续对话 5/5 通过，覆盖解释、修改、继续、停止与恢复。正式消融 18 次中 15 次通过；三个失败均为关闭压缩后的上下文超限。小任务多 Job 开销更高，不能据此宣称普遍效率收益。
+
+一次真实 API-key 验证收到 HTTP 429 `credit_balance_exhausted`，没有成功的模型响应，也没有盲目重试。其他 provider 的真实连接、云 companion 请求和 Candle artifact 推理尚未实测。完整实验、保留的失败记录和验证边界见 [verification.md](docs/verification.md)。

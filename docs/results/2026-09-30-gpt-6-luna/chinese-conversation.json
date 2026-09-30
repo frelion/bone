@@ -1,0 +1,491 @@
+{
+  "schema_version": 1,
+  "experiment": "chinese_natural_conversation",
+  "model": "chatgpt:gpt-6-luna",
+  "credential_source": "existing Codex login (read-only reuse)",
+  "binary_sha256": "830b265fe3bd095c45d465aa6356dcd0aa7ffa8282ccc89311e786e30d2ce26f",
+  "max_calls_per_turn": 16,
+  "timeout_seconds_per_turn": 120,
+  "max_tokens": 8192,
+  "initial_source": "def greet(name):\n    return f\"Hi, {name}!\"\n",
+  "prompts": [
+    "先解释 greeting.py 的行为，不修改文件",
+    "改一下：非空名字strip后返回Hello, 名字!，纯空白ValueError，验证",
+    "继续：Hello改Welcome，保留校验",
+    "停止",
+    "继续，总结刚才完成了什么，不再修改文件"
+  ],
+  "permission_policy": "all normal tools available; natural-language read-only constraints checked externally",
+  "artifacts_dir": "/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-chinese-conversation-bmw3du62",
+  "session_id": "11a9c8ef-55c8-4db3-943b-da8ed559f749",
+  "rounds": [
+    {
+      "number": 1,
+      "prompt": "先解释 greeting.py 的行为，不修改文件",
+      "returncode": 0,
+      "wall_seconds": 9.535,
+      "recovered_receipt_without_retry": true,
+      "returncode_source": "completed CLI receipt (harness interrupted before storing exit code)",
+      "result": {
+        "input_id": "48bdc025-1e02-4e28-a11b-a50827615a78",
+        "metrics": {
+          "cost": null,
+          "elapsed_ms": 9535,
+          "input_tokens": 3397,
+          "model_calls": 3,
+          "observed_input_tokens": 3397,
+          "observed_output_tokens": 110,
+          "output_tokens": 110,
+          "total_tokens": 3507
+        },
+        "question_id": null,
+        "session_id": "11a9c8ef-55c8-4db3-943b-da8ed559f749",
+        "status": "completed",
+        "text": "`greeting.py` 定义了一个 `greet(name)` 函数：传入名字后，它会返回字符串 `\"Hi, \"` 加上该名字和感叹号。例如，`greet(\"Lin\")` 会返回 `\"Hi, Lin!\"`。文件没有调用这个函数，也没有其他副作用。",
+        "unknown_writes": {}
+      },
+      "file_sha256_before": "c43128cac197de3975ac42f690e19042df8d305fa3bc5e7a20ac818bb0f5b397",
+      "file_sha256_after": "c43128cac197de3975ac42f690e19042df8d305fa3bc5e7a20ac818bb0f5b397",
+      "model_calls": [
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "d94c3f17-92b8-4297-bf28-fa4818a644a3"
+        },
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "7dbf8bab-7ffb-40a1-b3cb-787b5deabffb"
+        },
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "7e30254c-46e4-4b8e-864b-7fa1846458de"
+        }
+      ],
+      "native_tools": [
+        "list_files",
+        "read_file"
+      ],
+      "snapshot_paused": false,
+      "checks": [
+        {
+          "check": "cli_success",
+          "passed": true
+        },
+        {
+          "check": "json_result",
+          "passed": true
+        },
+        {
+          "check": "same_session",
+          "passed": true
+        },
+        {
+          "check": "calls_with_job_identity",
+          "passed": true
+        },
+        {
+          "check": "call_budget",
+          "passed": true
+        },
+        {
+          "check": "no_unknown_writes",
+          "passed": true
+        },
+        {
+          "check": "natural_language_no_modification",
+          "passed": true
+        },
+        {
+          "check": "no_write_file_invocation",
+          "passed": true
+        },
+        {
+          "check": "completed_result",
+          "passed": true
+        },
+        {
+          "check": "explains_actual_hi_behavior",
+          "passed": true
+        }
+      ],
+      "external_verifier": null,
+      "passed": true
+    },
+    {
+      "number": 2,
+      "prompt": "改一下：非空名字strip后返回Hello, 名字!，纯空白ValueError，验证",
+      "returncode": 0,
+      "wall_seconds": 18.805908834,
+      "recovered_receipt_without_retry": false,
+      "returncode_source": "subprocess",
+      "result": {
+        "input_id": "3c873340-696f-4ddc-8072-654ab1b08f47",
+        "metrics": {
+          "cost": null,
+          "elapsed_ms": 18772,
+          "input_tokens": 7993,
+          "model_calls": 5,
+          "observed_input_tokens": 7993,
+          "observed_output_tokens": 479,
+          "output_tokens": 479,
+          "total_tokens": 8472
+        },
+        "question_id": null,
+        "session_id": "11a9c8ef-55c8-4db3-943b-da8ed559f749",
+        "status": "completed",
+        "text": "已修改 `greeting.py`：`greet(name)` 会先去除名字两端空白，再返回 `Hello, 名字!`；如果名字为空或仅含空白字符，则抛出 `ValueError`。\n\n验证通过：带首尾空白的名字返回预期结果，空字符串、空格和制表符/换行组成的字符串都会抛出 `ValueError`。",
+        "unknown_writes": {}
+      },
+      "file_sha256_before": "c43128cac197de3975ac42f690e19042df8d305fa3bc5e7a20ac818bb0f5b397",
+      "file_sha256_after": "a781513bff37e484c980797ca9b65054f0121f83e380283387c91a7ef261a573",
+      "model_calls": [
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "5d7a5912-7f20-4477-8f25-e0e53fb981c7"
+        },
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "e9f393fe-79a6-409a-8b14-85859fba220e"
+        },
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "6b0dd433-5e0c-46f3-ace2-f2a4895a7626"
+        },
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "dc632c60-c37f-43ae-a1cc-19f7c4b03f43"
+        },
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "80926c61-8b15-4621-92fe-39f0e213ff73"
+        }
+      ],
+      "native_tools": [
+        "read_file",
+        "write_file",
+        "shell",
+        "shell"
+      ],
+      "snapshot_paused": false,
+      "checks": [
+        {
+          "check": "cli_success",
+          "passed": true
+        },
+        {
+          "check": "json_result",
+          "passed": true
+        },
+        {
+          "check": "same_session",
+          "passed": true
+        },
+        {
+          "check": "calls_with_job_identity",
+          "passed": true
+        },
+        {
+          "check": "call_budget",
+          "passed": true
+        },
+        {
+          "check": "no_unknown_writes",
+          "passed": true
+        },
+        {
+          "check": "external_function_assertions",
+          "passed": true
+        },
+        {
+          "check": "completed_result",
+          "passed": true
+        }
+      ],
+      "external_verifier": {
+        "passed": true,
+        "returncode": 0,
+        "stderr": "",
+        "cases": 8
+      },
+      "passed": true
+    },
+    {
+      "number": 3,
+      "prompt": "继续：Hello改Welcome，保留校验",
+      "returncode": 0,
+      "wall_seconds": 12.632217375,
+      "recovered_receipt_without_retry": false,
+      "returncode_source": "subprocess",
+      "result": {
+        "input_id": "844633f3-2096-463d-b87e-c37ffe7a081f",
+        "metrics": {
+          "cost": null,
+          "elapsed_ms": 12593,
+          "input_tokens": 8844,
+          "model_calls": 4,
+          "observed_input_tokens": 8844,
+          "observed_output_tokens": 290,
+          "output_tokens": 290,
+          "total_tokens": 9134
+        },
+        "question_id": null,
+        "session_id": "11a9c8ef-55c8-4db3-943b-da8ed559f749",
+        "status": "completed",
+        "text": "已将问候语改为 `Welcome`，并保留原有空白处理和校验。验证通过：`greet('  Lin  ')` 返回 `Welcome, Lin!`，空字符串及纯空白仍会抛出 `ValueError`。",
+        "unknown_writes": {}
+      },
+      "file_sha256_before": "a781513bff37e484c980797ca9b65054f0121f83e380283387c91a7ef261a573",
+      "file_sha256_after": "4b0999f2990b03a9742d6089d073f66c0ab76c432665d87865c2a230a930b1ce",
+      "model_calls": [
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "98c63d46-b70a-4cc3-a3bb-f37865118526"
+        },
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "33493c3d-2beb-4afa-abbf-cc5edd23ca4e"
+        },
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "9e6e8d56-531c-4610-9a66-c396c0cc4b58"
+        },
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "bcb20125-0852-4e5a-9748-73b57acd1882"
+        }
+      ],
+      "native_tools": [
+        "read_file",
+        "write_file",
+        "shell"
+      ],
+      "snapshot_paused": false,
+      "checks": [
+        {
+          "check": "cli_success",
+          "passed": true
+        },
+        {
+          "check": "json_result",
+          "passed": true
+        },
+        {
+          "check": "same_session",
+          "passed": true
+        },
+        {
+          "check": "calls_with_job_identity",
+          "passed": true
+        },
+        {
+          "check": "call_budget",
+          "passed": true
+        },
+        {
+          "check": "no_unknown_writes",
+          "passed": true
+        },
+        {
+          "check": "external_function_assertions",
+          "passed": true
+        },
+        {
+          "check": "completed_result",
+          "passed": true
+        }
+      ],
+      "external_verifier": {
+        "passed": true,
+        "returncode": 0,
+        "stderr": "",
+        "cases": 8
+      },
+      "passed": true
+    },
+    {
+      "number": 4,
+      "prompt": "停止",
+      "returncode": 0,
+      "wall_seconds": 3.060093708,
+      "recovered_receipt_without_retry": false,
+      "returncode_source": "subprocess",
+      "result": {
+        "input_id": "49e06a0f-de96-4531-b7dd-79993b5f9e31",
+        "metrics": {
+          "cost": null,
+          "elapsed_ms": 3042,
+          "input_tokens": 2498,
+          "model_calls": 1,
+          "observed_input_tokens": 2498,
+          "observed_output_tokens": 21,
+          "output_tokens": 21,
+          "total_tokens": 2519
+        },
+        "question_id": null,
+        "session_id": "11a9c8ef-55c8-4db3-943b-da8ed559f749",
+        "status": "paused",
+        "text": "Work is paused.",
+        "unknown_writes": {}
+      },
+      "file_sha256_before": "4b0999f2990b03a9742d6089d073f66c0ab76c432665d87865c2a230a930b1ce",
+      "file_sha256_after": "4b0999f2990b03a9742d6089d073f66c0ab76c432665d87865c2a230a930b1ce",
+      "model_calls": [
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "5624e2f9-ad1e-493e-b797-895b9ffbb2ae"
+        }
+      ],
+      "native_tools": [
+        "pause_work"
+      ],
+      "snapshot_paused": true,
+      "checks": [
+        {
+          "check": "cli_success",
+          "passed": true
+        },
+        {
+          "check": "json_result",
+          "passed": true
+        },
+        {
+          "check": "same_session",
+          "passed": true
+        },
+        {
+          "check": "calls_with_job_identity",
+          "passed": true
+        },
+        {
+          "check": "call_budget",
+          "passed": true
+        },
+        {
+          "check": "no_unknown_writes",
+          "passed": true
+        },
+        {
+          "check": "native_pause_work",
+          "passed": true
+        },
+        {
+          "check": "paused_snapshot",
+          "passed": true
+        },
+        {
+          "check": "paused_result",
+          "passed": true
+        }
+      ],
+      "external_verifier": null,
+      "passed": true
+    },
+    {
+      "number": 5,
+      "prompt": "继续，总结刚才完成了什么，不再修改文件",
+      "returncode": 0,
+      "wall_seconds": 5.027721416999995,
+      "recovered_receipt_without_retry": false,
+      "returncode_source": "subprocess",
+      "result": {
+        "input_id": "f5d8359d-1268-40b6-9c91-fc97e0e01ac2",
+        "metrics": {
+          "cost": null,
+          "elapsed_ms": 5010,
+          "input_tokens": 2556,
+          "model_calls": 1,
+          "observed_input_tokens": 2556,
+          "observed_output_tokens": 65,
+          "output_tokens": 65,
+          "total_tokens": 2621
+        },
+        "question_id": null,
+        "session_id": "11a9c8ef-55c8-4db3-943b-da8ed559f749",
+        "status": "completed",
+        "text": "刚才已将 `greeting.py` 的问候语从 `Hello` 改为 `Welcome`，保留了去除名字首尾空白及空名字抛出 `ValueError` 的校验。验证通过。按你的要求，这次不再修改文件。",
+        "unknown_writes": {}
+      },
+      "file_sha256_before": "4b0999f2990b03a9742d6089d073f66c0ab76c432665d87865c2a230a930b1ce",
+      "file_sha256_after": "4b0999f2990b03a9742d6089d073f66c0ab76c432665d87865c2a230a930b1ce",
+      "model_calls": [
+        {
+          "job_id": "a747fe38-61d9-4356-a99c-8d26d4e399b8",
+          "call_id": "52a1b006-0a4f-49f5-8850-f819cf03b2a9"
+        }
+      ],
+      "native_tools": [],
+      "snapshot_paused": false,
+      "checks": [
+        {
+          "check": "cli_success",
+          "passed": true
+        },
+        {
+          "check": "json_result",
+          "passed": true
+        },
+        {
+          "check": "same_session",
+          "passed": true
+        },
+        {
+          "check": "calls_with_job_identity",
+          "passed": true
+        },
+        {
+          "check": "call_budget",
+          "passed": true
+        },
+        {
+          "check": "no_unknown_writes",
+          "passed": true
+        },
+        {
+          "check": "natural_language_no_modification",
+          "passed": true
+        },
+        {
+          "check": "no_write_file_invocation",
+          "passed": true
+        },
+        {
+          "check": "completed_result",
+          "passed": true
+        },
+        {
+          "check": "context_continuation",
+          "passed": true
+        }
+      ],
+      "external_verifier": null,
+      "passed": true
+    }
+  ],
+  "passed": true,
+  "outcome": "passed",
+  "started_at_utc": "2026-09-30T12:52:25Z",
+  "conversation_checks": [
+    {
+      "check": "five_public_inputs_same_session",
+      "passed": true
+    },
+    {
+      "check": "all_model_calls_have_job",
+      "passed": true
+    },
+    {
+      "check": "user_never_selected_job",
+      "passed": true
+    }
+  ],
+  "wall_seconds": 49.06094133399999,
+  "final_greeting_source": "def greet(name):\n    name = name.strip()\n    if not name:\n        raise ValueError(\"name must not be empty\")\n    return f\"Welcome, {name}!\"\n",
+  "harness_wall_seconds_after_receipt_recovery": 39.637283208,
+  "wall_seconds_scope": "Sum of five CLI execution times; verifier recovery gap excluded. First round uses saved CLI elapsed_ms; no model request was retried.",
+  "harness_note": "First round CLI completed successfully, then the verifier could not open the SQLite WAL store in mode=ro. The verifier was repaired to read the durable CLI-exit snapshot using immutable=1 and recovered the existing first-round receipt without retrying. Remaining four rounds continued the same session.",
+  "aggregate_metrics": {
+    "model_calls": 14,
+    "input_tokens": 25288,
+    "output_tokens": 965,
+    "total_tokens": 26253
+  }
+}

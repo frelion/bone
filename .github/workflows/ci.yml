@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,90 +14,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  benchmark-contracts:
-    name: Benchmark contracts
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-      - uses: astral-sh/setup-uv@v7
-      - run: python -m unittest discover -s benchmarks/tests -v
-      - run: python -m benchmarks.suite validate --all
-      - name: Import the adapter with pinned Harbor
-        run: >-
-          uv run --with harbor==0.23.0 python -c
-          "from benchmarks.harbor.agent import BoneAgent; assert BoneAgent.name() == 'bone'"
-      - name: Let pinned Harbor resolve the smoke configuration
-        run: python -m benchmarks.suite validate terminal-bench-2-smoke --harbor
-
-  msrv:
-    name: Rust 1.88 compatibility
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets --all-features --locked
-
   rust:
-    name: Rust checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: Rust checks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --workspace --all-targets --all-features --locked
-      - run: cargo test --workspace --doc --all-features --locked
-      - run: cargo doc --workspace --no-deps --all-features --locked
-        env:
-          RUSTDOCFLAGS: -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: python3 -B -m unittest discover -s tests -p 'test_ablate.py' -v
 
-  rig-patch:
-    name: Rig ChatGPT hardening
+  companion-providers:
+    name: Compile official companion providers
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
-      - run: >-
-          cargo test --manifest-path third_party/rig-core-0.42.0/Cargo.toml
-          --no-default-features --features reqwest,rustls,test-utils
-          --locked --lib providers::chatgpt
-      - run: >-
-          cargo test --manifest-path third_party/rig-core-0.42.0/Cargo.toml
-          --no-default-features --features reqwest,rustls,test-utils
-          --locked --lib atomic_json_write_replaces_complete_private_record
-
-  macos:
-    name: macOS checks
-    runs-on: macos-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets --all-features --locked
-      - run: 'cargo test -p bone-app --lib storage:: --locked'
-      - run: cargo test -p bone-tui --all-targets --all-features --locked
-
-  windows:
-    name: Windows checks
-    runs-on: windows-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets --all-features --locked
-      - run: 'cargo test -p bone-app --lib storage:: --locked'
-      - run: cargo test -p bone-tui --all-targets --all-features --locked
+        with:
+          key: companion-providers
+      - run: cargo check --locked --all-features
