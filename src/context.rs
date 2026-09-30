@@ -101,16 +101,48 @@ fn retained(
             );
         }
         if let Some(mut message) = event_message(event)? {
-            if event.kind == "input"
-                && event.data["source"] == "user"
-                && event.job_id.as_deref() != Some(job.id.as_str())
-                && !pinned.contains(id.as_str())
-            {
-                message = Message::user(format!(
-                    "Shared session instruction, not your assigned task; revision {}: {}",
+            if event.kind == "input" {
+                let (status, instruction) = if job.active_input.as_ref() == Some(id) {
+                    (
+                        "ACTIVE",
+                        "This is the task assigned to this job now; fulfill it under the latest applicable session instructions.",
+                    )
+                } else if job.inbox.contains(id) {
+                    (
+                        "QUEUED",
+                        "Retained for later continuation, not the current task. Do not execute or deliver this input in place of the ACTIVE task; an older conflicting instruction does not override a newer request.",
+                    )
+                } else if event.data["source"] == "user"
+                    && event.job_id.as_ref().is_some_and(|owner| owner != &job.id)
+                {
+                    (
+                        "SHARED",
+                        "Public instruction from another job. Its relevant constraints and corrections remain authoritative, including when newer than the ACTIVE input. Do not take over its separately assigned work.",
+                    )
+                } else {
+                    (
+                        "HISTORICAL",
+                        "Earlier input for background. Preserve continuing constraints, but do not repeat completed or superseded actions.",
+                    )
+                };
+                let header = format!(
+                    "[BONE INPUT id={}; revision={}; status={}; source={}; original_job={}]\n{}\nOriginal input follows:\n",
+                    event.id,
                     event.revision,
-                    serde_json::to_string(&message)?
-                ));
+                    status,
+                    event.data["source"].as_str().unwrap_or("unknown"),
+                    event.job_id.as_deref().unwrap_or("unknown"),
+                    instruction
+                );
+                let Message::User { content } = &mut message else {
+                    anyhow::bail!(
+                        "input event {} does not contain a native user message",
+                        event.id
+                    );
+                };
+                // Add routing context in a separate native text part. Every
+                // original part and its provider fields stay unchanged.
+                content.insert(0, UserContent::text(header));
             }
             messages.push((id.clone(), message));
         }
@@ -137,6 +169,13 @@ pub fn serialized_chars(request: &CompletionRequest) -> Result<usize> {
     Ok(serde_json::to_string(request)?.chars().count())
 }
 
+fn source_note(ids: &[String]) -> Message {
+    Message::user(format!(
+        "Lookup index for the preceding transcript events, in order: {}. Keep only selected IDs needed to retrieve important evidence or unfinished requirements with job_inspect(event_id=...). Do not copy the full index into the summary, and do not describe model/tool event IDs as user-message IDs.",
+        serde_json::to_string(ids).expect("string IDs serialize")
+    ))
+}
+
 /// Return a completed history prefix for a native summarization call. Tool call
 /// batches are indivisible; unfinished batches and pending inputs stay verbatim.
 pub fn compaction_prefix(
@@ -158,6 +197,40 @@ pub fn compaction_prefix(
         return Ok(None);
     }
 
+    prefix_from_entries(job, background, entries, max_prefix_chars, true)
+}
+
+fn preview_tool_results(entries: &mut [(String, Message)], limit: usize) -> Result<bool> {
+    let mut changed = false;
+    for (id, message) in entries {
+        if let Message::User { content } = message {
+            for part in content {
+                if let UserContent::ToolResult(result) = part {
+                    let original = serde_json::to_string(&result.content)?;
+                    if original.chars().count() <= limit {
+                        continue;
+                    }
+                    result.content = vec![rig_core::message::ToolResultContent::Json {
+                        value: serde_json::json!({
+                            "truncated":true,"event_id":id,"preview":original.chars().take(limit/12).collect::<String>(),
+                            "instruction":"Incomplete tool preview. Use job_inspect(event_id=...) to read the exact original result before claiming verification."
+                        }),
+                    }];
+                    changed = true;
+                }
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn prefix_from_entries(
+    job: &Job,
+    background: Option<Message>,
+    mut entries: Vec<(String, Message)>,
+    max_prefix_chars: usize,
+    may_preview: bool,
+) -> Result<Option<(Vec<Message>, Vec<String>)>> {
     let mut open_calls = BTreeSet::new();
     let mut cycle_open = false;
     let mut boundaries = Vec::new();
@@ -209,7 +282,14 @@ pub fn compaction_prefix(
     for (index, (_, message)) in entries[..candidate_end].iter().enumerate() {
         prefix_chars += serde_json::to_string(message)?.chars().count();
         message_count += 1;
-        let serialized_array_chars = prefix_chars + message_count.saturating_sub(1) + 2;
+        let sources = entries[..=index]
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let note_chars = serde_json::to_string(&source_note(&sources))?
+            .chars()
+            .count();
+        let serialized_array_chars = prefix_chars + note_chars + message_count + 2;
         if serialized_array_chars > max_prefix_chars {
             break;
         }
@@ -217,12 +297,19 @@ pub fn compaction_prefix(
             end = Some(index + 1);
         }
     }
-    let Some(end) = end else { return Ok(None) };
+    let Some(end) = end else {
+        if may_preview
+            && preview_tool_results(&mut entries, (max_prefix_chars / 16).clamp(512, 2048))?
+        {
+            return prefix_from_entries(job, background, entries, max_prefix_chars, false);
+        }
+        return Ok(None);
+    };
     let mut prefix = Vec::new();
     if let Some(background) = background {
         prefix.push(background);
     }
-    let mut ids = covered;
+    let mut ids = BTreeSet::new();
     let pending = pinned(job);
     let mut new_covered = 0;
     for (id, message) in &entries[..end] {
@@ -236,6 +323,12 @@ pub fn compaction_prefix(
     if new_covered == 0 {
         return Ok(None);
     }
+    prefix.push(source_note(
+        &entries[..end]
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+    ));
     Ok(Some((prefix, ids.into_iter().collect())))
 }
 
@@ -257,6 +350,19 @@ mod tests {
         job.history.push(id.clone());
         events.insert(id.clone(), event);
         id
+    }
+
+    fn original_input(message: &Message) -> Message {
+        let Message::User { content } = message else {
+            panic!("expected native user message")
+        };
+        let UserContent::Text(marker) = &content[0] else {
+            panic!("missing routing text")
+        };
+        assert!(marker.text.starts_with("[BONE INPUT id="));
+        Message::User {
+            content: content[1..].to_vec(),
+        }
     }
 
     fn response(message: Message) -> CompletionResponse {
@@ -332,7 +438,7 @@ mod tests {
         let (prefix, ids) = compaction_prefix(&job, &events, 1, usize::MAX)
             .unwrap()
             .unwrap();
-        assert_eq!(prefix.len(), 18);
+        assert_eq!(prefix.len(), 19);
         assert_eq!(
             ids.into_iter().collect::<BTreeSet<_>>(),
             original_ids.into_iter().collect()
@@ -397,8 +503,8 @@ mod tests {
         job.inbox.push_back(queued);
         let history = build_history(&job, &events).unwrap();
         assert_eq!(history.len(), 3);
-        assert_eq!(history[1], Message::user("active"));
-        assert_eq!(history[2], Message::user("queued"));
+        assert_eq!(original_input(&history[1]), Message::user("active"));
+        assert_eq!(original_input(&history[2]), Message::user("queued"));
     }
 
     #[test]
@@ -426,7 +532,7 @@ mod tests {
         let (prefix, covered) = compaction_prefix(&job, &events, 1, usize::MAX)
             .unwrap()
             .unwrap();
-        assert_eq!(prefix.len(), 2);
+        assert_eq!(prefix.len(), 3);
         assert_eq!(covered.len(), 2);
     }
 
@@ -452,7 +558,7 @@ mod tests {
         let (prefix, covered_ids) = compaction_prefix(&job, &events, 1, usize::MAX)
             .unwrap()
             .unwrap();
-        assert_eq!(prefix[0], Message::user("keep working"));
+        assert_eq!(original_input(&prefix[0]), Message::user("keep working"));
         assert!(!covered_ids.contains(&input));
         let summary = Event::new(
             "session",
@@ -462,7 +568,7 @@ mod tests {
         job.summary = Some(summary.id.clone());
         events.insert(summary.id.clone(), summary);
         let replay = build_history(&job, &events).unwrap();
-        assert_eq!(replay[1], Message::user("keep working"));
+        assert_eq!(original_input(&replay[1]), Message::user("keep working"));
         assert_eq!(replay.len(), 2);
     }
 
@@ -496,15 +602,9 @@ mod tests {
         let UserContent::Text(text) = &content[0] else {
             panic!("shared instruction lost text")
         };
-        assert!(
-            text.text
-                .starts_with("Shared session instruction, not your assigned task; revision 9:")
-        );
-        let serialized = text.text.split_once(": ").unwrap().1;
-        assert_eq!(
-            serde_json::from_str::<Message>(serialized).unwrap(),
-            Message::user(instruction)
-        );
+        assert!(text.text.contains("status=SHARED"));
+        assert!(text.text.contains("revision=9"));
+        assert_eq!(original_input(&history[0]), Message::user(instruction));
         let (_, covered) = compaction_prefix(&job, &events, 1, usize::MAX)
             .unwrap()
             .unwrap();
@@ -524,9 +624,20 @@ mod tests {
         job.active_input = Some(input.id.clone());
         job.history.push(input.id.clone());
         events.insert(input.id.clone(), input);
+        let history = build_history(&job, &events).unwrap();
         assert_eq!(
-            build_history(&job, &events).unwrap(),
-            vec![Message::user("do the assigned task")]
+            original_input(&history[0]),
+            Message::user("do the assigned task")
+        );
+        assert!(
+            serde_json::to_string(&history[0])
+                .unwrap()
+                .contains("status=ACTIVE")
+        );
+        assert!(
+            !serde_json::to_string(&history[0])
+                .unwrap()
+                .contains("status=SHARED")
         );
     }
 
@@ -550,29 +661,130 @@ mod tests {
             );
         }
         let history = build_history(&job, &events).unwrap();
-        let budget = serde_json::to_string(&history[..4])
-            .unwrap()
-            .chars()
-            .count();
+        let mut fitting = history[..4].to_vec();
+        fitting.push(source_note(&job.history[..4]));
+        let budget = serde_json::to_string(&fitting).unwrap().chars().count();
         let (prefix, ids) = compaction_prefix(&job, &events, 1, budget)
             .unwrap()
             .unwrap();
         assert_eq!(
             prefix.len(),
-            4,
+            5,
             "maximal fitting prefix should contain two whole cycles"
         );
         assert_eq!(ids.len(), 4);
         assert!(serde_json::to_string(&prefix).unwrap().chars().count() <= budget);
-        let too_small = serde_json::to_string(&history[..2])
+        let mut first_cycle = history[..2].to_vec();
+        first_cycle.push(source_note(&job.history[..2]));
+        let too_small = serde_json::to_string(&first_cycle).unwrap().chars().count() - 1;
+        let (preview, _) = compaction_prefix(&job, &events, 1, too_small)
             .unwrap()
-            .chars()
-            .count()
-            - 1;
+            .unwrap();
+        assert!(serde_json::to_string(&preview).unwrap().chars().count() <= too_small);
         assert!(
-            compaction_prefix(&job, &events, 1, too_small)
+            serde_json::to_string(&preview)
                 .unwrap()
-                .is_none()
+                .contains("Incomplete tool preview")
         );
+    }
+
+    #[test]
+    fn oversized_complete_tool_batch_has_explicit_native_previews_and_exact_source_ids() {
+        let mut job = Job::new("large reads");
+        let mut events = BTreeMap::new();
+        let input = append(
+            &mut job,
+            &mut events,
+            "input",
+            json!({"message":Message::user("Do not lose this full user requirement"),"source":"user"}),
+        );
+        job.active_input = Some(input.clone());
+        let first = call("large-a", "read_file");
+        let second = call("large-b", "read_file");
+        append(
+            &mut job,
+            &mut events,
+            "model_message",
+            json!({"response":response(Message::Assistant {id:None,content:vec![AssistantContent::ToolCall(first.clone()),AssistantContent::ToolCall(second.clone())]})}),
+        );
+        let result = append(
+            &mut job,
+            &mut events,
+            "tool_result",
+            json!({"message":Message::tool_results(vec![first.result(vec![ToolResultContent::Json {value:json!({"text":"a".repeat(32*1024)})}]),second.result(vec![ToolResultContent::Json {value:json!({"text":"b".repeat(32*1024)})}])])}),
+        );
+        let original = events[&result].clone();
+        let (prefix, covered) = compaction_prefix(&job, &events, 1, 16_000)
+            .unwrap()
+            .unwrap();
+        assert!(serde_json::to_string(&prefix).unwrap().chars().count() <= 16_000);
+        assert_eq!(
+            original_input(&prefix[0]),
+            Message::user("Do not lose this full user requirement")
+        );
+        assert!(!covered.contains(&input));
+        assert!(covered.contains(&result));
+        let Message::User { content } = &prefix[2] else {
+            panic!("missing native tool results")
+        };
+        for (part, call) in content.iter().zip([first, second]) {
+            let UserContent::ToolResult(tool) = part else {
+                panic!("wrong native content")
+            };
+            assert_eq!(tool.call, call.id);
+            assert_eq!(tool.name, call.function.name);
+            let ToolResultContent::Json { value } = &tool.content[0] else {
+                panic!("missing explicit preview")
+            };
+            assert_eq!(value["truncated"], true);
+            assert_eq!(value["event_id"], result);
+        }
+        assert_eq!(
+            events[&result], original,
+            "original audit body must remain intact"
+        );
+    }
+
+    #[test]
+    fn failed_old_read_only_input_is_queued_and_current_write_request_is_unambiguously_active() {
+        let mut job = Job::new("continuing project");
+        let mut events = BTreeMap::new();
+        let mut old = Event::new(
+            "session",
+            "input",
+            json!({"source":"user","message":Message::user("Only explain the existing code. Do not edit files.")}),
+        );
+        old.job_id = Some(job.id.clone());
+        old.revision = 1;
+        job.inbox.push_back(old.id.clone());
+        job.history.push(old.id.clone());
+        events.insert(old.id.clone(), old.clone());
+        let native: Message=serde_json::from_value(json!({"role":"user","content":[{"type":"text","text":"Modify the UTC validation now. 中文 🦀","additional_params":{"provider_signature":"keep-exact"}},{"type":"text","text":"Verify \"quoted\" constraints and\nkeep original formatting."}]})).unwrap();
+        let mut current = Event::new(
+            "session",
+            "input",
+            json!({"source":"user","message":native}),
+        );
+        current.job_id = Some(job.id.clone());
+        current.revision = 5;
+        job.active_input = Some(current.id.clone());
+        job.history.push(current.id.clone());
+        events.insert(current.id.clone(), current.clone());
+        let durable = events.clone();
+        let history = build_history(&job, &events).unwrap();
+        let old_rendered = serde_json::to_string(&history[0]).unwrap();
+        assert!(old_rendered.contains("status=QUEUED"));
+        assert!(old_rendered.contains(&old.id));
+        assert!(old_rendered.contains("not the current task"));
+        let current_rendered = serde_json::to_string(&history[1]).unwrap();
+        assert!(current_rendered.contains("status=ACTIVE"));
+        assert!(current_rendered.contains(&current.id));
+        assert!(current_rendered.contains("revision=5"));
+        assert_eq!(original_input(&history[1]), native);
+        assert_eq!(
+            original_input(&history[0]),
+            Message::user("Only explain the existing code. Do not edit files.")
+        );
+        assert_eq!(events, durable);
     }
 }

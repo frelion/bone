@@ -24,19 +24,32 @@ use crate::config::{ModelReference, Profile, validate_profile_name};
 /// The private guard serializes subscription refresh AND inference across processes.
 pub struct ModelConnection {
     pub model: DynModel<Completion>,
-    pub job_id: String,
-    pub call_id: String,
     _credential_lock: Option<CredentialLock>,
 }
 
-struct CredentialLock(File);
+/// A credential lease acquired without making a provider request. Runtime waits
+/// for this cancellable stage before starting the connection/inference deadline.
+pub struct PreparedModel {
+    profile: Profile,
+    data_dir: PathBuf,
+    profile_name: String,
+    http: DynHttpClient,
+    auth: Option<Authenticator>,
+    credential_lock: Option<CredentialLock>,
+}
+
+// At most two descriptors: the stable source lock and its legacy HOME path.
+struct CredentialLock(Vec<File>);
 
 impl Drop for CredentialLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
+        for file in &self.0 {
+            let _ = FileExt::unlock(file);
+        }
     }
 }
 
+#[cfg(test)]
 pub async fn connect(
     profile: &Profile,
     data_dir: &Path,
@@ -55,7 +68,7 @@ pub async fn connect(
     .await
 }
 
-/// Transport injection is native Rig HTTP; no BONE provider protocol sits in between.
+#[cfg(test)]
 pub async fn connect_with(
     profile: &Profile,
     data_dir: &Path,
@@ -64,110 +77,170 @@ pub async fn connect_with(
     call_id: &str,
     http: DynHttpClient,
 ) -> Result<ModelConnection> {
+    prepare_with(profile, data_dir, profile_name, job_id, call_id, http)
+        .await?
+        .connect()
+        .await
+}
+
+pub async fn prepare(
+    profile: &Profile,
+    data_dir: &Path,
+    profile_name: &str,
+    job_id: &str,
+    call_id: &str,
+) -> Result<PreparedModel> {
+    prepare_with(
+        profile,
+        data_dir,
+        profile_name,
+        job_id,
+        call_id,
+        DynHttpClient::new(rig_reqwest::shared()),
+    )
+    .await
+}
+
+/// Transport injection stays native Rig HTTP. Preparing owns only local state;
+/// authentication (including an OAuth refresh) starts in `connect` below.
+async fn prepare_with(
+    profile: &Profile,
+    data_dir: &Path,
+    profile_name: &str,
+    job_id: &str,
+    call_id: &str,
+    http: DynHttpClient,
+) -> Result<PreparedModel> {
     ensure!(
         !job_id.trim().is_empty() && !call_id.trim().is_empty(),
         "every model invocation requires a JobId and CallId"
     );
     validate_profile_name(profile_name)?;
     profile.validate()?;
-    let mut credential_lock = None;
-    let model = match &profile.model {
-        ModelReference::Registry(reference) if profile.is_subscription() => {
-            let (guard, auth_file, source) = if profile.reuse_codex_login {
-                let (guard, canonical_source) = lock_codex_source(
-                    &codex_auth_file()?,
-                    &crate::config::default_data_dir().join("credential-locks"),
-                )
-                .await?;
-                (guard, None, load_codex_login(&canonical_source)?)
-            } else {
-                let (guard, auth_file) = lock_profile(data_dir, profile_name).await?;
-                (guard, Some(auth_file), AuthSource::OAuth)
-            };
-            let ProviderConfig::OpenAi(config) = reference.config("") else {
-                bail!("ChatGPT requires its native OpenAI dialect")
-            };
-            let auth = Authenticator::new(source, auth_file, DeviceCodeHandler::new(|_| {}), false);
-            let client = config
-                .connect(http)
-                .authenticate(&auth)
-                .await
-                .map_err(|error| authentication_error(profile_name, error))?;
-            if !profile.reuse_codex_login {
-                restrict_cache_permissions(&self::auth_file(data_dir, profile_name)?)?;
-            }
-            credential_lock = Some(guard);
-            client.completion(reference.model()).erase()
-        }
-        ModelReference::Registry(reference) => {
-            if let Some(name) = &profile.credential_env {
-                reference.completion_model_with(
-                    read_credential(
-                        name,
-                        reference.id().is_none_or(|id| id.requires_credential()),
-                    )?,
-                    http,
-                )
-            } else {
-                // Let Rig read every native endpoint and alternate-auth variable for
-                // registered selections. Explicit recipes preserve their own endpoint.
-                let config = match reference.provider() {
-                    Provider::Registered(id) => native_env_config(*id)?,
-                    Provider::Configured(config) => {
-                        let id = config.id().context("configured provider has no registered credential source; set credential_env")?;
-                        let native = native_env_config(id)?;
-                        let mut configured = config.clone();
-                        if let (ProviderConfig::OpenAi(recipe), ProviderConfig::OpenAi(resolved)) =
-                            (&mut configured, &native)
-                            && resolved.auth != recipe.dialect.quirks.auth
-                        {
-                            recipe.auth = resolved.auth;
-                        }
-                        let secret = match native {
-                            ProviderConfig::OpenAi(c) => c.api_key,
-                            ProviderConfig::Anthropic(c) => c.api_key,
-                            ProviderConfig::Gemini(c) => c.api_key,
-                        };
-                        configured.with_credential(secret)
-                    }
-                };
-                configured_model(config, reference.model(), http)
-            }
-        }
-        ModelReference::Cohere { cohere, model } => {
-            let mut config = cohere.clone();
-            config.api_key = read_credential(
-                profile
-                    .credential_env
-                    .as_deref()
-                    .unwrap_or("COHERE_API_KEY"),
-                true,
-            )?
-            .into();
-            config.connect(http).completion(model).erase()
-        }
-        ModelReference::Ollama { ollama, model } => {
-            let mut config = ollama.clone();
-            config.api_key = read_credential(
-                profile
-                    .credential_env
-                    .as_deref()
-                    .unwrap_or("OLLAMA_API_KEY"),
-                false,
-            )?
-            .into();
-            config.connect(http).completion(model).erase()
-        }
-        ModelReference::Bedrock { bedrock } => bedrock_model(bedrock)?,
-        ModelReference::VertexAi { vertexai } => vertexai_model(vertexai)?,
-        ModelReference::Candle { candle } => candle_model(candle).await?,
+    let (credential_lock, auth) = if profile.is_subscription() {
+        let (guard, auth_file, source) = if profile.reuse_codex_login {
+            let (guard, canonical_source) = lock_codex_source_with_legacy(
+                &codex_auth_file()?,
+                &crate::config::user_home()?.join(".bone/v2/credential-locks"),
+                &crate::config::default_data_dir().join("credential-locks"),
+            )
+            .await?;
+            (guard, None, load_codex_login(&canonical_source)?)
+        } else {
+            let (guard, auth_file) = lock_profile(data_dir, profile_name).await?;
+            (guard, Some(auth_file), AuthSource::OAuth)
+        };
+        let auth = Authenticator::new(source, auth_file, DeviceCodeHandler::new(|_| {}), false);
+        (Some(guard), Some(auth))
+    } else {
+        (None, None)
     };
-    Ok(ModelConnection {
-        model,
-        job_id: job_id.into(),
-        call_id: call_id.into(),
-        _credential_lock: credential_lock,
+    Ok(PreparedModel {
+        profile: profile.clone(),
+        data_dir: data_dir.to_owned(),
+        profile_name: profile_name.to_owned(),
+        http,
+        auth,
+        credential_lock,
     })
+}
+
+impl PreparedModel {
+    pub async fn connect(self) -> Result<ModelConnection> {
+        let Self {
+            profile,
+            data_dir,
+            profile_name,
+            http,
+            auth,
+            credential_lock,
+        } = self;
+        let model = match &profile.model {
+            ModelReference::Registry(reference) if profile.is_subscription() => {
+                let ProviderConfig::OpenAi(config) = reference.config("") else {
+                    bail!("ChatGPT requires its native OpenAI dialect")
+                };
+                let auth = auth.context("subscription was not prepared")?;
+                let client = config
+                    .connect(http)
+                    .authenticate(&auth)
+                    .await
+                    .map_err(|error| authentication_error(&profile_name, error))?;
+                if !profile.reuse_codex_login {
+                    restrict_cache_permissions(&self::auth_file(&data_dir, &profile_name)?)?;
+                }
+                client.completion(reference.model()).erase()
+            }
+            ModelReference::Registry(reference) => {
+                if let Some(name) = &profile.credential_env {
+                    reference.completion_model_with(
+                        read_credential(
+                            name,
+                            reference.id().is_none_or(|id| id.requires_credential()),
+                        )?,
+                        http,
+                    )
+                } else {
+                    // Let Rig read every native endpoint and alternate-auth variable for
+                    // registered selections. Explicit recipes preserve their own endpoint.
+                    let config = match reference.provider() {
+                        Provider::Registered(id) => native_env_config(*id)?,
+                        Provider::Configured(config) => {
+                            let id = config.id().context("configured provider has no registered credential source; set credential_env")?;
+                            let native = native_env_config(id)?;
+                            let mut configured = config.clone();
+                            if let (
+                                ProviderConfig::OpenAi(recipe),
+                                ProviderConfig::OpenAi(resolved),
+                            ) = (&mut configured, &native)
+                                && resolved.auth != recipe.dialect.quirks.auth
+                            {
+                                recipe.auth = resolved.auth;
+                            }
+                            let secret = match native {
+                                ProviderConfig::OpenAi(c) => c.api_key,
+                                ProviderConfig::Anthropic(c) => c.api_key,
+                                ProviderConfig::Gemini(c) => c.api_key,
+                            };
+                            configured.with_credential(secret)
+                        }
+                    };
+                    configured_model(config, reference.model(), http)
+                }
+            }
+            ModelReference::Cohere { cohere, model } => {
+                let mut config = cohere.clone();
+                config.api_key = read_credential(
+                    profile
+                        .credential_env
+                        .as_deref()
+                        .unwrap_or("COHERE_API_KEY"),
+                    true,
+                )?
+                .into();
+                config.connect(http).completion(model).erase()
+            }
+            ModelReference::Ollama { ollama, model } => {
+                let mut config = ollama.clone();
+                config.api_key = read_credential(
+                    profile
+                        .credential_env
+                        .as_deref()
+                        .unwrap_or("OLLAMA_API_KEY"),
+                    false,
+                )?
+                .into();
+                config.connect(http).completion(model).erase()
+            }
+            ModelReference::Bedrock { bedrock } => bedrock_model(bedrock)?,
+            ModelReference::VertexAi { vertexai } => vertexai_model(vertexai)?,
+            ModelReference::Candle { candle } => candle_model(candle).await?,
+        };
+        Ok(ModelConnection {
+            model,
+            _credential_lock: credential_lock,
+        })
+    }
 }
 
 fn configured_model(
@@ -342,9 +415,18 @@ async fn lock_profile(data_dir: &Path, profile_name: &str) -> Result<(Credential
     Ok((guard, auth_file))
 }
 
+#[cfg(test)]
 async fn lock_codex_source(
     source: &Path,
     lock_directory: &Path,
+) -> Result<(CredentialLock, PathBuf)> {
+    lock_codex_source_with_legacy(source, lock_directory, lock_directory).await
+}
+
+async fn lock_codex_source_with_legacy(
+    source: &Path,
+    stable_directory: &Path,
+    legacy_directory: &Path,
 ) -> Result<(CredentialLock, PathBuf)> {
     let canonical_source = source.canonicalize().map_err(|_| {
         anyhow::anyhow!(
@@ -355,7 +437,21 @@ async fn lock_codex_source(
         "{:x}",
         Sha256::digest(canonical_source.as_os_str().as_encoded_bytes())
     );
-    let guard = acquire_credential_lock(&lock_directory.join(format!("{identity}.lock"))).await?;
+    let lock_path = |directory: &Path| -> Result<PathBuf> {
+        std::fs::create_dir_all(directory)
+            .context("cannot create BONE subscription lock directory")?;
+        Ok(directory.canonicalize()?.join(format!("{identity}.lock")))
+    };
+    let stable = lock_path(stable_directory)?;
+    let legacy = lock_path(legacy_directory)?;
+    // Every new process acquires the same OS-user home lock first, independent
+    // of HOME/CODEX_HOME/data directory. Also retain the prior HOME lock so an
+    // old process using that location cannot run concurrently with this one.
+    let mut guard = acquire_credential_lock(&stable).await?;
+    if stable != legacy {
+        let mut legacy_guard = acquire_credential_lock(&legacy).await?;
+        guard.0.append(&mut legacy_guard.0);
+    }
     Ok((guard, canonical_source))
 }
 
@@ -379,7 +475,7 @@ async fn acquire_credential_lock(path: &Path) -> Result<CredentialLock> {
         .context("cannot open BONE subscription lock")?;
     loop {
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(CredentialLock(file)),
+            Ok(()) => return Ok(CredentialLock(vec![file])),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 // This future owns the unopened lease candidate. Cancellation
                 // closes it immediately; no blocking worker survives the call.
@@ -483,6 +579,231 @@ async fn candle_model(_: &crate::config::CandleArtifacts) -> Result<DynModel<Com
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn codex_source_uses_one_stable_lock_across_different_legacy_homes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("auth.json");
+        std::fs::write(&source, "{}").unwrap();
+        let stable = root.path().join("os-home-locks");
+        let home_a = root.path().join("home-a-locks");
+        let home_b = root.path().join("home-b-locks");
+        let (owner, _) = lock_codex_source_with_legacy(&source, &stable, &home_a)
+            .await
+            .unwrap();
+        assert_eq!(owner.0.len(), 2);
+        let waiting_source = source.clone();
+        let waiter = tokio::spawn(async move {
+            lock_codex_source_with_legacy(&waiting_source, &stable, &home_b).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(
+            !waiter.is_finished(),
+            "different HOME bypassed source ownership"
+        );
+        drop(owner);
+        let (next, _) = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.0.len(), 2);
+        drop(next);
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "{}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_source_deduplicates_stable_and_legacy_directory_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("auth.json");
+        std::fs::write(&source, "{}").unwrap();
+        let stable = root.path().join("locks");
+        std::fs::create_dir(&stable).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&stable, &alias).unwrap();
+        let (guard, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            lock_codex_source_with_legacy(&source, &stable, &alias),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(guard.0.len(), 1, "same physical lock was acquired twice");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn legacy_codex_owner_blocks_new_lock_and_cancellation_releases_stable() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("auth.json");
+        std::fs::write(&source, "{}").unwrap();
+        let identity = format!(
+            "{:x}",
+            Sha256::digest(
+                source
+                    .canonicalize()
+                    .unwrap()
+                    .as_os_str()
+                    .as_encoded_bytes()
+            )
+        );
+        let stable = root.path().join("stable");
+        let legacy = root.path().join("legacy");
+        let legacy_path = legacy.join(format!("{identity}.lock"));
+        let stable_path = stable.join(format!("{identity}.lock"));
+        let old_owner = acquire_credential_lock(&legacy_path).await.unwrap();
+        let waiter =
+            tokio::spawn(
+                async move { lock_codex_source_with_legacy(&source, &stable, &legacy).await },
+            );
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(
+            !waiter.is_finished(),
+            "new process bypassed legacy ownership"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(60),
+                acquire_credential_lock(&stable_path)
+            )
+            .await
+            .is_err()
+        );
+        waiter.abort();
+        assert!(matches!(waiter.await, Err(error) if error.is_cancelled()));
+        let stable_owner = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquire_credential_lock(&stable_path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(40),
+                acquire_credential_lock(&legacy_path)
+            )
+            .await
+            .is_err()
+        );
+        drop(stable_owner);
+        drop(old_owner);
+        let legacy_owner = acquire_credential_lock(&legacy_path).await.unwrap();
+        drop(legacy_owner);
+    }
+
+    #[tokio::test]
+    async fn credential_queue_wait_does_not_consume_the_connection_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = cached_subscription(directory.path());
+        let owner = prepare(&profile, directory.path(), "test", "owner", "call-owner")
+            .await
+            .unwrap();
+        let data = directory.path().to_owned();
+        let queued_profile = profile.clone();
+        let waiter = tokio::spawn(async move {
+            let prepared =
+                prepare(&queued_profile, &data, "test", "waiting", "call-waiting").await?;
+            tokio::time::timeout(std::time::Duration::from_millis(100), prepared.connect()).await?
+        });
+        // Longer than the inference allowance, but no provider/authentication
+        // request has begun. The queued invocation must still be eligible.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(!waiter.is_finished());
+        drop(owner);
+        let connection = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(connection.model.name(), "chatgpt");
+        drop(connection);
+    }
+
+    #[tokio::test]
+    async fn cancelling_preparation_leaves_no_queued_credential_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = cached_subscription(directory.path());
+        let owner = prepare(&profile, directory.path(), "test", "owner", "call-owner")
+            .await
+            .unwrap();
+        let data = directory.path().to_owned();
+        let waiting_profile = profile.clone();
+        let waiter = tokio::spawn(async move {
+            prepare(&waiting_profile, &data, "test", "waiting", "call-waiting").await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        waiter.abort();
+        assert!(matches!(waiter.await, Err(error) if error.is_cancelled()));
+        drop(owner);
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            prepare(&profile, directory.path(), "test", "next", "call-next"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(next);
+    }
+
+    #[tokio::test]
+    async fn inference_timeout_after_preparation_releases_the_credential_lease() {
+        use futures_util::StreamExt;
+        use rig_core::providers::registry::ProviderRef;
+        let directory = tempfile::tempdir().unwrap();
+        let mut profile = cached_subscription(directory.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted, connected) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
+            // Hold the local response open past the inference deadline.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let ModelReference::Registry(reference) = &profile.model else {
+            panic!("registry fixture");
+        };
+        let ProviderConfig::OpenAi(config) = reference.config("") else {
+            panic!("native ChatGPT fixture");
+        };
+        profile.model = ModelReference::Registry(
+            ProviderRef::configured(
+                ProviderConfig::OpenAi(config.with_base_url(format!("http://{address}/v1"))),
+                "fixture",
+            )
+            .unwrap(),
+        );
+        let prepared = prepare(&profile, directory.path(), "test", "job", "call")
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(120), async {
+            let connection = prepared.connect().await?;
+            let mut stream = connection
+                .model
+                .stream(rig_core::completion::CompletionRequest::new("fixture"))?;
+            while let Some(item) = stream.next().await {
+                item?;
+            }
+            stream.finish().await.map_err(anyhow::Error::from)
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(
+            connected.await.is_ok(),
+            "native request reached the local fixture"
+        );
+        let (lease, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            lock_profile(directory.path(), "test"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(lease);
+        server.abort();
+    }
 
     #[tokio::test]
     async fn cancelling_a_profile_lock_waiter_leaves_no_hidden_lease() {

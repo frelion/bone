@@ -1,0 +1,64 @@
+{
+  "passed": false,
+  "session_id": "c9d9c92c-b566-474a-aa33-da770fa0bc7a",
+  "rounds": 12,
+  "kernel_faults": [],
+  "quality_failures": [
+    {
+      "round": 5,
+      "kind": "independent_checks_failed"
+    },
+    {
+      "round": 6,
+      "kind": "independent_checks_failed"
+    },
+    {
+      "round": 7,
+      "kind": "independent_checks_failed"
+    },
+    {
+      "round": 8,
+      "kind": "independent_checks_failed"
+    },
+    {
+      "round": 9,
+      "kind": "independent_checks_failed"
+    },
+    {
+      "round": 10,
+      "kind": "independent_checks_failed"
+    },
+    {
+      "round": 11,
+      "kind": "independent_checks_failed"
+    },
+    {
+      "round": 12,
+      "kind": "independent_checks_failed"
+    }
+  ],
+  "coverage_failures": [],
+  "execution_failures": [
+    {
+      "round": 1,
+      "kind": "control_or_provider_failure",
+      "status": "failed",
+      "exit_code": 1
+    }
+  ],
+  "needs_review": true,
+  "metrics": {
+    "model_calls": 75,
+    "input_tokens": null,
+    "output_tokens": null,
+    "total_tokens": null,
+    "cost": null
+  },
+  "wall_seconds": 655.0185632069999,
+  "final_quality_passed": false,
+  "allowed_files_passed": true,
+  "binary_sha256": "f277303015bd9a94e62ad71ef0896abae8836fa609b29b02db4ae9f284a30b9a",
+  "config_sha256": "046e27b9f13d3476fc70c4f3dd787b50ee0dbbf4756983b1b978082e13dd0c69",
+  "task_sha256": "76c551358e990cceebe10c578115a856bae76dcb079c37746f400b72d52e5d78",
+  "verifier_sha256": "d4702472a034ec8f602f73f6fcfa35c71ff64ffaddbc5d56777dea0e7307adae"
+}

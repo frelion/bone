@@ -34,6 +34,9 @@ pub struct Job {
     pub summary: Option<String>,
     pub wait_for: Vec<String>,
     pub current_call: Option<String>,
+    /// Last public instruction incorporated into this job's history or summary.
+    #[serde(default)]
+    pub public_revision: u64,
 }
 
 impl Job {
@@ -48,6 +51,7 @@ impl Job {
             summary: None,
             wait_for: Vec::new(),
             current_call: None,
+            public_revision: 0,
         }
     }
 }
@@ -157,6 +161,20 @@ impl Event {
                 .as_millis()
                 .to_string(),
         }
+    }
+
+    /// Only scheduling metadata remains resident after a transcript is archived.
+    pub(crate) fn metadata(&self) -> Self {
+        let mut event = self.clone();
+        if let Some(data) = event.data.as_object_mut() {
+            if let Some(usage) = data.get("response").and_then(|r| r.get("usage")).cloned() {
+                data.insert("usage".into(), usage);
+            }
+            for field in ["message", "response", "stream_items", "covered_ids"] {
+                data.remove(field);
+            }
+        }
+        event
     }
 }
 

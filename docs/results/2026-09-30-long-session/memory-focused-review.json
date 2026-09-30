@@ -1,0 +1,76 @@
+{
+  "review": "cold_original_requirement_recovery",
+  "passed": true,
+  "scope": "First original input recovered in full with valid source references; CSV and dry-run restored with correct checkpoint detail boundaries.",
+  "preconditions": {
+    "pending_empty": true,
+    "original_inputs_delivered_and_cold": true,
+    "summaries_before": 12
+  },
+  "first_original_input_full_read": true,
+  "second_original_input_full_read": false,
+  "source_references": [
+    {
+      "id": "122a583a-d241-4682-834e-692be01ec23d",
+      "kind": "input",
+      "source": "user",
+      "revision": 9
+    },
+    {
+      "id": "347cb694-cb2e-40a2-ad85-470dfef62692",
+      "kind": "input",
+      "source": "user",
+      "revision": 10
+    },
+    {
+      "id": "7e24b1ee-8e20-489c-be8e-395bdf70ea3b",
+      "kind": "input",
+      "source": "user",
+      "revision": 7
+    },
+    {
+      "id": "8401d634-edcb-46d6-81cb-302c32603a9f",
+      "kind": "input",
+      "source": "user",
+      "revision": 1
+    },
+    {
+      "id": "8a826087-85bf-4fbe-8113-075b65c977c7",
+      "kind": "input",
+      "source": "user",
+      "revision": 6
+    },
+    {
+      "id": "a6f0a1bd-ca79-4dac-b9dc-6484b53b0613",
+      "kind": "input",
+      "source": "user",
+      "revision": 11
+    }
+  ],
+  "files_unchanged_independent_hash_check": true,
+  "write_starts": [],
+  "original_nine_tests_passed": true,
+  "limitations": [
+    "The second original input was retrieved only as a truncated users-only preview.",
+    "Four invented CLI input IDs failed lookup before the model corrected the ID.",
+    "Two new summaries occurred: one before lookup, one after the first original input was read in full.",
+    "No general efficiency conclusion is supported."
+  ],
+  "lookup_errors": [
+    "reading event a6f0a1bd-79e8-424b-4da4-68a1bd471f0f: Query returned no rows",
+    "reading event a6f0a1bd-7c93-4f4c-a26e-017bb127760d: Query returned no rows",
+    "reading event a6f0a1bd-7c9d-648a-4dc9-b64b8b0613: Query returned no rows",
+    "reading event a6f0a1bd-cb2e-40a2-ad85-470dfef62692: Query returned no rows"
+  ],
+  "metrics": {
+    "cost": null,
+    "elapsed_ms": 120001,
+    "input_tokens": 85796,
+    "model_calls": 21,
+    "observed_input_tokens": 85796,
+    "observed_output_tokens": 2525,
+    "output_tokens": 2525,
+    "total_tokens": 88321
+  },
+  "binary_sha256": "cfbb414a09e20eb64061629e105cff4164ad9c63ee582b0ba4eb2d7c3277147f"
+}

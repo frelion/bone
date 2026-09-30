@@ -10,7 +10,6 @@ use std::{
 
 use bone::{
     config::{Config, ModelReference, Profile},
-    model,
     runtime::{Engine, RunOptions},
     state::Event,
 };
@@ -79,7 +78,7 @@ impl Fixture {
             additional_params: None,
             max_tokens: None,
         };
-        let auth = model::auth_file(&data, "fixture").unwrap();
+        let auth = data.join("profiles/fixture/auth.json");
         std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
         std::fs::write(
             auth,
@@ -168,26 +167,33 @@ async fn child_question_surfaces_and_plain_reply_completes_its_native_call_and_p
     let fixture = Fixture::new(child_question_turns());
     let mut engine = fixture.engine();
     let root = engine.post("ROOT_TASK", None).unwrap();
-    let root_job = engine.state.focus.clone().unwrap();
+    let root_job = engine.state().focus.clone().unwrap();
     drive_until(&mut engine, |engine| question(engine, &root).is_some()).await;
     let question = question(&engine, &root).unwrap();
     let child_job = question.job_id.as_ref().unwrap();
     assert_ne!(child_job, &root_job);
     assert_eq!(question.root_input.as_deref(), Some(root.as_str()));
-    assert_eq!(engine.state.focus.as_ref(), Some(child_job));
+    assert_eq!(engine.state().focus.as_ref(), Some(child_job));
     assert!(engine.is_unanswered_question(&question));
 
     let answer = engine.post("ANSWER_JSON", None).unwrap();
-    let answer_event = engine.events().find(|event| event.id == answer).unwrap();
+    let answer_event = engine
+        .events()
+        .unwrap()
+        .into_iter()
+        .find(|event| event.id == answer)
+        .unwrap();
     assert_eq!(answer_event.job_id.as_ref(), Some(child_job));
     assert_eq!(answer_event.reply_to.as_deref(), Some(question.id.as_str()));
     assert_eq!(answer_event.root_input.as_deref(), Some(answer.as_str()));
-    assert!(engine.state.budgets.contains_key(&root));
-    assert!(engine.state.budgets.contains_key(&answer));
+    assert!(engine.state().budgets.contains_key(&root));
+    assert!(engine.state().budgets.contains_key(&answer));
     assert!(!engine.is_unanswered_question(&question));
     assert!(engine.result(&root).is_none());
     let result = engine
         .events()
+        .unwrap()
+        .into_iter()
         .find(|event| {
             event.kind == "tool_result" && event.data["tool_key"] == question.data["tool_key"]
         })
@@ -197,9 +203,9 @@ async fn child_question_surfaces_and_plain_reply_completes_its_native_call_and_p
     let serialized = serde_json::to_string(&result.data["message"]).unwrap();
     assert!(serialized.contains(&answer));
     assert!(!serialized.contains("ANSWER_JSON"));
-    let revision = engine.state.revision;
+    let revision = engine.state().revision;
     assert!(engine.post("duplicate answer", Some(&question.id)).is_err());
-    assert_eq!(engine.state.revision, revision);
+    assert_eq!(engine.state().revision, revision);
 
     drive_until(&mut engine, |engine| {
         engine
@@ -208,22 +214,24 @@ async fn child_question_surfaces_and_plain_reply_completes_its_native_call_and_p
     })
     .await;
     assert_eq!(
-        engine.event_text(engine.result(&root).unwrap()),
+        engine.event_text(engine.result(&root).unwrap()).unwrap(),
         "Root task done."
     );
     assert_eq!(
-        engine.event_text(engine.result(&answer).unwrap()),
+        engine.event_text(engine.result(&answer).unwrap()).unwrap(),
         "Answer received."
     );
     assert!(
         !engine
             .events()
-            .any(|event| engine.is_unanswered_question(event))
+            .unwrap()
+            .into_iter()
+            .any(|event| engine.is_unanswered_question(&event))
     );
-    assert!(engine.events().any(|event| {
+    assert!(engine.events().unwrap().into_iter().any(|event| {
         event.kind == "delivery"
             && event.reply_to == question.reply_to
-            && engine.event_text(event) == "Child task done."
+            && engine.event_text(&event).unwrap() == "Child task done."
     }));
 }
 
@@ -243,6 +251,8 @@ async fn plain_reply_chooses_latest_unanswered_question_and_leaves_the_other_ope
     drive_until(&mut engine, |engine| {
         engine
             .events()
+            .unwrap()
+            .into_iter()
             .filter(|event| engine.is_unanswered_question(event))
             .count()
             == 2
@@ -250,8 +260,9 @@ async fn plain_reply_chooses_latest_unanswered_question_and_leaves_the_other_ope
     .await;
     let questions: Vec<Event> = engine
         .events()
+        .unwrap()
+        .into_iter()
         .filter(|event| engine.is_unanswered_question(event))
-        .cloned()
         .collect();
     let latest = questions.last().unwrap();
     assert_eq!(engine.result(&root).unwrap().id, latest.id);
@@ -259,6 +270,8 @@ async fn plain_reply_chooses_latest_unanswered_question_and_leaves_the_other_ope
     assert_eq!(
         engine
             .events()
+            .unwrap()
+            .into_iter()
             .find(|event| event.id == answer)
             .unwrap()
             .reply_to
@@ -272,6 +285,8 @@ async fn plain_reply_chooses_latest_unanswered_question_and_leaves_the_other_ope
     assert_eq!(
         engine
             .events()
+            .unwrap()
+            .into_iter()
             .find(|event| event.id == older_answer)
             .unwrap()
             .job_id,
@@ -280,7 +295,9 @@ async fn plain_reply_chooses_latest_unanswered_question_and_leaves_the_other_ope
     assert!(
         !engine
             .events()
-            .any(|event| engine.is_unanswered_question(event))
+            .unwrap()
+            .into_iter()
+            .any(|event| engine.is_unanswered_question(&event))
     );
 }
 

@@ -1,0 +1,164 @@
+{
+  "case": "utc",
+  "session_id": "c9d9c92c-b566-474a-aa33-da770fa0bc7a",
+  "binary_sha256": "cfbb414a09e20eb64061629e105cff4164ad9c63ee582b0ba4eb2d7c3277147f",
+  "config_sha256": "046e27b9f13d3476fc70c4f3dd787b50ee0dbbf4756983b1b978082e13dd0c69",
+  "context_chars": 32000,
+  "max_calls": 48,
+  "timeout_seconds": 300,
+  "summaries_before": 9,
+  "original_input_ids": [
+    "0e1cb3e0-ef5a-4968-96ac-8add2128ed1e",
+    "562d4528-7284-403f-9a8f-bfddc571d026"
+  ],
+  "file_hashes_before": {
+    "ledger/exports.py": "11fa7dd743859a8449486cc16c6085be0867686dcd658dcfa0c40b40632a3a26",
+    "ledger/service.py": "ea6b01dcb519ddb56f6e6bddcfc927d2e9248a6e1dfd4a81015064cbdc2fd2c0",
+    "ledger/__init__.py": "9baa5dbdf023871b28564640ff4ba7d64825c1e8627c6e58145e8efad2713893",
+    "ledger/cli.py": "8b2cf1c964db00ce8e4009fbe5ed17ad0fc8cacd042583c82c70c8c7af547b39",
+    "ledger/storage.py": "b670f4f70505cf1ba4a3fb80b7aba5b85362594676ffd98accc357f521a2ddd9"
+  },
+  "preconditions_verified": true,
+  "exit_code": 0,
+  "status": "completed",
+  "input_id": "715e501d-8a9b-45d4-b933-7b62dd282e36",
+  "text": "Updated `ledger/storage.py` to require RFC3339 UTC timestamps with uppercase `T` and a terminal uppercase `Z`. The original timestamp is no longer trimmed, and `datetime` parsing rejects impossible dates and times. Since library writes and stored-record reads use this validator, invalid timestamps are rejected there as well; writes validate all records before opening the ledger, preventing malformed input from causing a partial replacement.\n\nVerified with `python3 -B`: the two specified invalid timestamps and timestamps with surrounding whitespace raise `ValueError`, a valid fractional-second timestamp is accepted, and an invalid stored record is rejected on read. The write check confirmed the existing ledger contents remain unchanged after invalid input. No files beyond `ledger/storage.py` were changed, and the temporary test directory was removed.",
+  "metrics": {
+    "cost": null,
+    "elapsed_ms": 72618,
+    "input_tokens": 29302,
+    "model_calls": 8,
+    "observed_input_tokens": 29302,
+    "observed_output_tokens": 2345,
+    "output_tokens": 2345,
+    "total_tokens": 31647
+  },
+  "wall_seconds": 72.638134417,
+  "verification": {
+    "passed": true,
+    "run": 9,
+    "skipped": 0,
+    "failures": [],
+    "errors": []
+  },
+  "file_hashes_after": {
+    "ledger/exports.py": "11fa7dd743859a8449486cc16c6085be0867686dcd658dcfa0c40b40632a3a26",
+    "ledger/service.py": "ea6b01dcb519ddb56f6e6bddcfc927d2e9248a6e1dfd4a81015064cbdc2fd2c0",
+    "ledger/__init__.py": "9baa5dbdf023871b28564640ff4ba7d64825c1e8627c6e58145e8efad2713893",
+    "ledger/cli.py": "8b2cf1c964db00ce8e4009fbe5ed17ad0fc8cacd042583c82c70c8c7af547b39",
+    "ledger/storage.py": "31df8221b4d46f15af05fb156bd091fe1140c1354826b44024801b42dd09cba8"
+  },
+  "files_unchanged": false,
+  "new_summary_count": 1,
+  "new_tool_calls": [
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "path": "ledger/storage.py"
+        },
+        "name": "read_file"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_4iYjaTHlg6P4JLA98tPod5QS",
+          "item_id": "fc_0ab93b621c09e16c016abd28102d0487d0b0145604a57109ed"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "path": "."
+        },
+        "name": "list_files"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_RTXOta4iUMDA4JAIv7Cous8d",
+          "item_id": "fc_0d06ddaba3a38b25016abd281cb51887d09c4bf15f32364913"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "path": "ledger"
+        },
+        "name": "list_files"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_p8gPdB1QgnooUQKytugT8XbT",
+          "item_id": "fc_0d06ddaba3a38b25016abd281f3e3887d0a2d3bb06f1c5bf3f"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "path": "ledger/storage.py"
+        },
+        "name": "read_file"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_Ef1iZRRjrzeksEcMVZvWdBQm",
+          "item_id": "fc_0d06ddaba3a38b25016abd2822503887d083eade34f5c14c48"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "content": "\"\"\"UTF-8 JSON Lines persistence.\"\"\"\n\nimport json\nimport re\nfrom datetime import datetime\nfrom pathlib import Path\n\n\n_FIELDS = {\"id\", \"account\", \"amount_cents\", \"timestamp\"}\n_RFC3339_UTC = re.compile(\n    r\"\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z\\Z\"\n)\n\n\ndef _validate_event(event):\n    if not isinstance(event, dict) or set(event) != _FIELDS:\n        raise ValueError(\"event must contain exactly id, account, amount_cents, and timestamp\")\n    result = dict(event)\n    for field in (\"id\", \"account\"):\n        value = result[field]\n        if not isinstance(value, str) or not value.strip():\n            raise ValueError(\"{} must be a nonempty string\".format(field))\n        result[field] = value.strip()\n    amount = result[\"amount_cents\"]\n    if isinstance(amount, bool) or not isinstance(amount, int):\n        raise ValueError(\"amount_cents must be an integer\")\n    timestamp = result[\"timestamp\"]\n    if not isinstance(timestamp, str) or not _RFC3339_UTC.fullmatch(timestamp):\n        raise ValueError(\"timestamp must be a valid RFC3339 UTC instant ending in Z\")\n    try:\n        datetime.fromisoformat(timestamp[:-1] + \"+00:00\")\n    except ValueError as exc:\n        raise ValueError(\"timestamp must be a valid RFC3339 UTC instant ending in Z\") from exc\n    result[\"timestamp\"] = timestamp\n    return result\n\n\ndef read_events(path):\n    \"\"\"Read and validate events from a UTF-8 JSON Lines ledger.\"\"\"\n    ledger = Path(path)\n    if not ledger.exists():\n        return []\n    events = []\n    by_id = {}\n    try:\n        with ledger.open(\"r\", encoding=\"utf-8\") as stream:\n            for line_number, line in enumerate(stream, 1):\n                if not line.strip():\n                    raise ValueError(\"blank JSON Lines record at line {}\".format(line_number))\n                try:\n                    event = json.loads(line)\n                except (json.JSONDecodeError, UnicodeDecodeError) as exc:\n                    raise ValueError(\"invalid JSON at line {}\".format(line_number)) from exc\n                try:\n                    event = _validate_event(event)\n                except ValueError as exc:\n                    raise ValueError(\"invalid event at line {}: {}\".format(line_number, exc)) from exc\n                previous = by_id.get(event[\"id\"])\n                if previous is not None and previous != event:\n                    raise ValueError(\"event ID already exists with different payload\")\n                by_id[event[\"id\"]] = event\n                events.append(event)\n    except UnicodeDecodeError as exc:\n        raise ValueError(\"ledger is not valid UTF-8\") from exc\n    return events\n\n\ndef write_events(path, events):\n    \"\"\"Validate and replace the ledger with UTF-8 JSON Lines records.\"\"\"\n    records = [_validate_event(event) for event in events]\n    ledger = Path(path)\n    ledger.parent.mkdir(parents=True, exist_ok=True)\n    with ledger.open(\"w\", encoding=\"utf-8\", newline=\"\\n\") as stream:\n        for event in records:\n            stream.write(json.dumps(event, ensure_ascii=False, separators=(\",\", \":\")))\n            stream.write(\"\\n\")\n",
+          "expected_sha256": "b670f4f70505cf1ba4a3fb80b7aba5b85362594676ffd98accc357f521a2ddd9",
+          "path": "ledger/storage.py"
+        },
+        "name": "write_file"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_Ic59xzwjjp5DKk4hoZA5hEiq",
+          "item_id": "fc_0d06ddaba3a38b25016abd2829bab887d0a4b1caed36417539"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "command": "python3 -B - <<'PY'\nfrom ledger.storage import _validate_event, write_events, read_events\nfrom pathlib import Path\nimport tempfile\nbase = dict(id='x', account='a', amount_cents=1)\nfor ts in ('2026-02-30T12:00:00Z', '2026-10-01T12:00:00+00:00', ' 2026-10-01T12:00:00Z', '2026-10-01T12:00:00Z '):\n    try:\n        _validate_event(dict(base, timestamp=ts))\n    except ValueError:\n        pass\n    else:\n        raise AssertionError(ts)\nassert _validate_event(dict(base, timestamp='2026-10-01T12:00:00.123Z'))['timestamp'] == '2026-10-01T12:00:00.123Z'\nwith tempfile.TemporaryDirectory() as d:\n    p = Path(d) / 'ledger.jsonl'\n    p.write_text('{\"id\":\"x\",\"account\":\"a\",\"amount_cents\":1,\"timestamp\":\"2026-02-30T12:00:00Z\"}\\n', encoding='utf-8')\n    try:\n        read_events(p)\n    except ValueError:\n        pass\n    else:\n        raise AssertionError('read accepted invalid stored record')\n    p.write_text('preserve', encoding='utf-8')\n    try:\n        write_events(p, [dict(base, timestamp='2026-02-30T12:00:00Z')])\n    except ValueError:\n        pass\n    else:\n        raise AssertionError('write accepted invalid timestamp')\n    assert p.read_text(encoding='utf-8') == 'preserve'\nprint('timestamp validation checks passed')\nPY"
+        },
+        "name": "shell"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_LKpRw8qvnNiOXkIXGckf9QgF",
+          "item_id": "fc_0d06ddaba3a38b25016abd283bff0487d087660861133f7a46"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    }
+  ],
+  "new_write_starts": [
+    "61163dc1-ae5e-40c6-a366-d30d60ffb373",
+    "d6a30262-efaa-412a-bb03-5ba2f277aff9"
+  ],
+  "needs_independent_review": true
+}

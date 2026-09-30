@@ -208,6 +208,40 @@ pub fn default_data_dir() -> PathBuf {
         .join(".bone/v2")
 }
 
+#[cfg(unix)]
+pub(crate) fn user_home() -> Result<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    // getpwuid_r returns a pointer into our buffer, used before it is dropped.
+    let error = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            record.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    ensure!(
+        error == 0 && !result.is_null(),
+        "cannot find stable home directory for current user"
+    );
+    let record = unsafe { record.assume_init() };
+    ensure!(!record.pw_dir.is_null(), "user home directory is missing");
+    let home = unsafe { CStr::from_ptr(record.pw_dir) };
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn user_home() -> Result<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .context("user home directory is missing")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

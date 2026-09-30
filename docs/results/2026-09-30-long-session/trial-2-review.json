@@ -1,0 +1,53 @@
+{
+  "review": "trial_2_independent_audit",
+  "formal_result_passed": false,
+  "execution_failure": {
+    "round": 1,
+    "kind": "http_request_send_failure",
+    "usage_unknown": true
+  },
+  "quality_failure": {
+    "rounds": [
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12
+    ],
+    "distinct_defects": 1,
+    "kind": "UTC_only_timestamp_requirement_not_implemented",
+    "final_external_checks_passed": 8,
+    "final_external_checks_total": 9
+  },
+  "control": {
+    "paused_round7": true,
+    "all_no_write_checks_passed": true,
+    "allowed_files_passed": true,
+    "observed_kernel_faults": []
+  },
+  "semantic_memory": {
+    "round6_deferred_check_passed": true,
+    "confounded_by_failed_original_input_pinned": true,
+    "evidence_observed_during_round5": "SQLite snapshot original input in inbox; first three summary covered_ids exclude it. context::pinned keeps inbox verbatim.",
+    "original_input_id": "0e1cb3e0-ef5a-4968-96ac-8add2128ed1e",
+    "conclusion": "Does not independently establish recovery after the original input was summarized."
+  },
+  "metrics": {
+    "model_calls": 75,
+    "formal_total_tokens": null,
+    "observed_successful_input_tokens": 274820,
+    "observed_successful_output_tokens": 18643,
+    "cost": null,
+    "wall_seconds": 655.0185632069999
+  },
+  "final_event_counts": {
+    "jobs": 1,
+    "summaries": 9
+  },
+  "binary_sha256": "f277303015bd9a94e62ad71ef0896abae8836fa609b29b02db4ae9f284a30b9a",
+  "task_sha256": "76c551358e990cceebe10c578115a856bae76dcb079c37746f400b72d52e5d78",
+  "verifier_sha256": "d4702472a034ec8f602f73f6fcfa35c71ff64ffaddbc5d56777dea0e7307adae"
+}

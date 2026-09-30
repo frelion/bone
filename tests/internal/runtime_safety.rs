@@ -2,10 +2,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use bone::config::{ModelReference, Profile};
-use bone::runtime::{Engine, RunOptions};
-use bone::state::{Budget, Event, Job, JobState, SessionState, UnknownWrite};
-use bone::store::Store;
+use crate::config::{ModelReference, Profile};
+use crate::runtime::{Engine, RunOptions};
+use crate::state::{Budget, Event, Job, JobState, SessionState, UnknownWrite};
+use crate::store::Store;
 use rig_core::completion::{AssistantContent, CompletionResponse, Message, Usage};
 use rig_core::message::{CallId, ToolCall, ToolFunction, ToolName};
 use rig_core::providers::openai::{OpenAIConfig, Route};
@@ -39,7 +39,7 @@ impl Fixture {
             .join("bone-workspace-locks")
             .join(format!(
                 "{}.pending",
-                bone::tools::sha256(workspace.as_os_str().as_encoded_bytes())
+                crate::tools::sha256(workspace.as_os_str().as_encoded_bytes())
             ));
         let store = Store::open(data.join("sessions.sqlite3")).unwrap();
         let mut state = SessionState::new(&workspace);
@@ -169,6 +169,11 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.marker);
+        // This fixture owns a unique temporary workspace; engine values are
+        // dropped before it. Remove only its injected unresolved marker.
+        if let Ok((_, marker)) = crate::runtime::workspace_write_paths(&self.workspace) {
+            let _ = std::fs::remove_file(marker);
+        }
     }
 }
 
@@ -245,7 +250,7 @@ fn native_profile(endpoint: String) -> Profile {
 async fn uncertain_write_can_resume_and_reconcile_without_reappearing_on_restart() {
     let fixture = Fixture::new(vec![write_call()], true);
     let mut engine = fixture.engine();
-    assert!(engine.state.unknown_writes.contains_key(&fixture.call));
+    assert!(engine.state().unknown_writes.contains_key(&fixture.call));
     engine.resume().unwrap();
     // Exercise scheduling after its instruction epoch changes. The native
     // placeholder keeps the old operation completed for replay purposes.
@@ -259,7 +264,7 @@ async fn uncertain_write_can_resume_and_reconcile_without_reappearing_on_restart
     drop(engine);
     let reopened = fixture.engine();
     assert!(
-        reopened.state.unknown_writes.is_empty(),
+        reopened.state().unknown_writes.is_empty(),
         "a reconciled write became uncertain again"
     );
     let records = fixture.store().events(&fixture.session).unwrap();
@@ -277,8 +282,8 @@ async fn uncertain_write_can_resume_and_reconcile_without_reappearing_on_restart
             .count(),
         1
     );
-    let history = bone::context::build_history(
-        &reopened.state.jobs[&fixture.job],
+    let history = crate::context::build_history(
+        &reopened.state().jobs[&fixture.job],
         &records
             .into_iter()
             .map(|event| (event.id.clone(), event))
@@ -308,7 +313,7 @@ fn failed_marker_reconciliation_preserves_the_unknown_write() {
             .resolve_write(&fixture.call, "Inspected files.")
             .is_err()
     );
-    assert!(engine.state.unknown_writes.contains_key(&fixture.call));
+    assert!(engine.state().unknown_writes.contains_key(&fixture.call));
     assert!(
         fixture
             .store()
@@ -366,7 +371,7 @@ async fn tool_start_transaction_failure_leaves_no_workspace_marker_or_effect() {
     assert!(
         !fixture
             .store()
-            .events(&engine.state.id)
+            .events(&engine.state().id)
             .unwrap()
             .iter()
             .any(|event| event.kind == "tool_started")
@@ -387,9 +392,11 @@ async fn new_input_follows_results_for_every_call_in_the_previous_batch() {
         .post("New instruction supersedes the old batch", None)
         .unwrap();
     for _ in 0..5 {
-        if engine.state.jobs[&fixture.job].history.contains(&input)
+        if engine.state().jobs[&fixture.job].history.contains(&input)
             && engine
                 .events()
+                .unwrap()
+                .into_iter()
                 .filter(|event| event.kind == "tool_result")
                 .count()
                 >= 2
@@ -398,7 +405,7 @@ async fn new_input_follows_results_for_every_call_in_the_previous_batch() {
         }
         engine.step().await.unwrap();
     }
-    let job = &engine.state.jobs[&fixture.job];
+    let job = &engine.state().jobs[&fixture.job];
     let position = job
         .history
         .iter()
@@ -406,7 +413,9 @@ async fn new_input_follows_results_for_every_call_in_the_previous_batch() {
         .expect("new input reached history");
     let records: BTreeMap<_, _> = engine
         .events()
-        .map(|event| (event.id.as_str(), event))
+        .unwrap()
+        .into_iter()
+        .map(|event| (event.id.clone(), event))
         .collect();
     let result_positions: Vec<_> = job
         .history
@@ -421,7 +430,11 @@ async fn new_input_follows_results_for_every_call_in_the_previous_batch() {
         "a newer user turn split the previous native tool batch"
     );
     assert!(
-        !engine.events().any(|event| event.kind == "tool_started"),
+        !engine
+            .events()
+            .unwrap()
+            .into_iter()
+            .any(|event| event.kind == "tool_started"),
         "superseded tools executed"
     );
 }
@@ -447,17 +460,17 @@ async fn a_new_user_input_is_admitted_after_the_previous_input_exhausted_its_bud
         .post("New instruction with its own fresh allowance", None)
         .unwrap();
     for _ in 0..5 {
-        if engine.state.jobs[&fixture.job].active_input.as_deref() == Some(&new) {
+        if engine.state().jobs[&fixture.job].active_input.as_deref() == Some(&new) {
             break;
         }
         engine.step().await.unwrap();
     }
     assert_eq!(
-        engine.state.jobs[&fixture.job].active_input.as_deref(),
+        engine.state().jobs[&fixture.job].active_input.as_deref(),
         Some(new.as_str()),
         "the exhausted old input blocked admission of the new input"
     );
-    assert!(engine.events().any(|event|event.kind=="model_started"&&event.root_input.as_deref()==Some(&new)), "the new input never received its own model allowance");
+    assert!(engine.events().unwrap().into_iter().any(|event|event.kind=="model_started"&&event.root_input.as_deref()==Some(&new)), "the new input never received its own model allowance");
 }
 
 #[test]
@@ -466,6 +479,8 @@ fn crash_recovery_records_one_owned_native_placeholder_for_the_uncertain_operati
     let engine = fixture.engine();
     let results: Vec<_> = engine
         .events()
+        .unwrap()
+        .into_iter()
         .filter(|event| event.kind == "tool_result")
         .collect();
     assert_eq!(results.len(), 1);
@@ -479,11 +494,13 @@ fn crash_recovery_records_one_owned_native_placeholder_for_the_uncertain_operati
     assert_eq!(
         reopened
             .events()
+            .unwrap()
+            .into_iter()
             .filter(|event| event.kind == "tool_result")
             .count(),
         1
     );
-    assert!(reopened.state.unknown_writes.contains_key(&fixture.call));
+    assert!(reopened.state().unknown_writes.contains_key(&fixture.call));
 }
 
 #[tokio::test]
@@ -563,17 +580,23 @@ async fn resume_during_a_running_native_model_call_preserves_its_revision_and_ca
         .await
         .unwrap()
         .unwrap();
-    let revision = engine.state.revision;
-    let job = engine.state.focus.clone().unwrap();
-    let call = engine.state.jobs[&job].current_call.clone().unwrap();
-    assert_eq!(engine.state.jobs[&job].state, JobState::Running);
+    let revision = engine.state().revision;
+    let job = engine.state().focus.clone().unwrap();
+    let call = engine.state().jobs[&job].current_call.clone().unwrap();
+    assert_eq!(engine.state().jobs[&job].state, JobState::Running);
     engine.resume().unwrap();
-    assert_eq!(engine.state.revision, revision);
+    assert_eq!(engine.state().revision, revision);
     assert_eq!(
-        engine.state.jobs[&job].current_call.as_deref(),
+        engine.state().jobs[&job].current_call.as_deref(),
         Some(call.as_str())
     );
-    assert!(!engine.events().any(|event| event.kind == "model_cancelled"));
+    assert!(
+        !engine
+            .events()
+            .unwrap()
+            .into_iter()
+            .any(|event| event.kind == "model_cancelled")
+    );
     release.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), engine.step())
         .await
@@ -581,10 +604,15 @@ async fn resume_during_a_running_native_model_call_preserves_its_revision_and_ca
         .unwrap();
     let result = engine.result(&input).unwrap();
     assert_eq!(result.kind, "delivery");
-    assert_eq!(engine.event_text(result), "Finished without interruption.");
+    assert_eq!(
+        engine.event_text(result).unwrap(),
+        "Finished without interruption."
+    );
     assert_eq!(
         engine
             .events()
+            .unwrap()
+            .into_iter()
             .filter(|event| event.kind == "model_started")
             .count(),
         1
@@ -648,12 +676,14 @@ async fn consecutive_user_inputs_prioritize_the_new_instruction_through_its_tool
         );
     }
     assert_eq!(
-        engine.event_text(engine.result(&new).expect("new input must deliver")),
+        engine
+            .event_text(engine.result(&new).expect("new input must deliver"))
+            .unwrap(),
         "New instruction completed."
     );
     assert!(
         engine
-            .state
+            .state()
             .jobs
             .values()
             .any(|job| job.inbox.contains(&old) || job.active_input.as_ref() == Some(&old)),
@@ -661,6 +691,8 @@ async fn consecutive_user_inputs_prioritize_the_new_instruction_through_its_tool
     );
     let actions: Vec<_> = engine
         .events()
+        .unwrap()
+        .into_iter()
         .filter(|event| event.kind == "tool_started")
         .collect();
     assert_eq!(actions.len(), 1);
@@ -678,14 +710,16 @@ async fn consecutive_user_inputs_prioritize_the_new_instruction_through_its_tool
             .unwrap();
     }
     assert_eq!(
-        engine.event_text(engine.result(&old).expect("old input must continue")),
+        engine
+            .event_text(engine.result(&old).expect("old input must continue"))
+            .unwrap(),
         "Earlier work continued."
     );
     let requests = server.await.unwrap();
     assert_eq!(requests.len(), 3);
     let first = serde_json::to_string(&requests[0]).unwrap();
     assert!(
-        first.contains(&format!("active input {new}")),
+        first.contains(&format!("status=ACTIVE with ID {new}")),
         "the first native request was assigned to the older input"
     );
     assert!(first.contains("New instruction takes priority"));

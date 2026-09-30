@@ -5,7 +5,7 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-use bone::{
+use crate::{
     config::{ModelReference, Profile},
     model,
 };

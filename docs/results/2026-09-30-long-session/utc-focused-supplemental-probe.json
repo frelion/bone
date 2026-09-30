@@ -1,0 +1,213 @@
+{
+  "passed": true,
+  "workspace_unchanged": true,
+  "cases": [
+    {
+      "operation": "add",
+      "timestamp": " 2026-10-01T12:00:00Z",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "write_events",
+      "timestamp": " 2026-10-01T12:00:00Z",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "read_events",
+      "timestamp": " 2026-10-01T12:00:00Z",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "invalid event at line 1: timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "cli",
+      "timestamp": " 2026-10-01T12:00:00Z",
+      "observed": {
+        "exit_code": 2,
+        "stdout": "",
+        "stderr": "error: timestamp must be a valid RFC3339 UTC instant ending in Z\n"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "add",
+      "timestamp": "2026-10-01T12:00:00Z ",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "write_events",
+      "timestamp": "2026-10-01T12:00:00Z ",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "read_events",
+      "timestamp": "2026-10-01T12:00:00Z ",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "invalid event at line 1: timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "cli",
+      "timestamp": "2026-10-01T12:00:00Z ",
+      "observed": {
+        "exit_code": 2,
+        "stdout": "",
+        "stderr": "error: timestamp must be a valid RFC3339 UTC instant ending in Z\n"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "add",
+      "timestamp": "\t2026-10-01T12:00:00Z\n",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "write_events",
+      "timestamp": "\t2026-10-01T12:00:00Z\n",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "read_events",
+      "timestamp": "\t2026-10-01T12:00:00Z\n",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "invalid event at line 1: timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "cli",
+      "timestamp": "\t2026-10-01T12:00:00Z\n",
+      "observed": {
+        "exit_code": 2,
+        "stdout": "",
+        "stderr": "error: timestamp must be a valid RFC3339 UTC instant ending in Z\n"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "add",
+      "timestamp": "2026-02-30T12:00:00Z",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "write_events",
+      "timestamp": "2026-02-30T12:00:00Z",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "read_events",
+      "timestamp": "2026-02-30T12:00:00Z",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "invalid event at line 1: timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "cli",
+      "timestamp": "2026-02-30T12:00:00Z",
+      "observed": {
+        "exit_code": 2,
+        "stdout": "",
+        "stderr": "error: timestamp must be a valid RFC3339 UTC instant ending in Z\n"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "add",
+      "timestamp": "2026-10-01T12:00:00+00:00",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "write_events",
+      "timestamp": "2026-10-01T12:00:00+00:00",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "read_events",
+      "timestamp": "2026-10-01T12:00:00+00:00",
+      "observed": {
+        "error_type": "ValueError",
+        "message": "invalid event at line 1: timestamp must be a valid RFC3339 UTC instant ending in Z"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    },
+    {
+      "operation": "cli",
+      "timestamp": "2026-10-01T12:00:00+00:00",
+      "observed": {
+        "exit_code": 2,
+        "stdout": "",
+        "stderr": "error: timestamp must be a valid RFC3339 UTC instant ending in Z\n"
+      },
+      "bytes_unchanged": true,
+      "passed": true
+    }
+  ],
+  "model_calls": 0,
+  "cost": null
+}

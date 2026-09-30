@@ -1,0 +1,29 @@
+{
+  "passed": false,
+  "session_id": "ace38353-3098-4957-b95f-3ed8b317d29d",
+  "rounds": 12,
+  "kernel_faults": [],
+  "quality_failures": [
+    {
+      "round": 6,
+      "kind": "deferred_work_missing_from_explanation"
+    }
+  ],
+  "coverage_failures": [],
+  "execution_failures": [],
+  "needs_review": false,
+  "metrics": {
+    "model_calls": 104,
+    "input_tokens": 442990,
+    "output_tokens": 27464,
+    "total_tokens": 470454,
+    "cost": null
+  },
+  "wall_seconds": 807.7152349589999,
+  "final_quality_passed": true,
+  "allowed_files_passed": true,
+  "binary_sha256": "1f9b7b54fdf1f1f63ae4c68e8c079554fc34245b79ee752757415f5872ef0633",
+  "config_sha256": "046e27b9f13d3476fc70c4f3dd787b50ee0dbbf4756983b1b978082e13dd0c69",
+  "task_sha256": "76c551358e990cceebe10c578115a856bae76dcb079c37746f400b72d52e5d78",
+  "verifier_sha256": "d4702472a034ec8f602f73f6fcfa35c71ff64ffaddbc5d56777dea0e7307adae"
+}

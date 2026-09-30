@@ -227,7 +227,7 @@ fn real_runtime_repairs_file_and_persists_owned_effects() {
         "def total(values):\n    return sum(value for value in values if value is not None)\n";
     let fixture = Fixture::new(json!([
         tool("read_file",json!({"path":"totals.py"}),"call_read"),
-        tool("write_file",json!({"path":"totals.py","content":after,"expected_sha256":bone::tools::sha256(before.as_bytes())}),"call_write"),
+        tool("write_file",json!({"path":"totals.py","content":after,"expected_sha256":format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(before.as_bytes()))}),"call_write"),
         {"text":"Fixed totals.py and verified empty values and None."}
     ]));
     std::fs::write(fixture.workspace.join("totals.py"), before).unwrap();
@@ -398,19 +398,23 @@ async fn two_jobs_deliver_to_exact_assignment_ids_before_waiter_continues() {
     drive_until_result(&mut engine, &input).await;
     let assigned: Vec<_> = engine
         .events()
+        .unwrap()
+        .into_iter()
         .filter(|event| event.kind == "input" && event.data["source"] == "job")
         .map(|event| event.id.clone())
         .collect();
     assert_eq!(assigned.len(), 2);
     for assignment in &assigned {
         let reply = engine
-            .events()
+            .events().unwrap().into_iter()
             .find(|event| event.kind == "delivery" && event.reply_to.as_ref() == Some(assignment))
-            .unwrap_or_else(|| panic!("assignment has no exact delivery; compact fixture trace: {:?}",engine.events().map(|event|json!({"kind":event.kind,"job":event.job_id,"reply_to":event.reply_to,"error":event.data.get("error"),"choice":event.data.get("response").and_then(|response|response.get("choice"))})).collect::<Vec<_>>()));
-        assert_ne!(reply.job_id.as_ref(), engine.state.focus.as_ref());
+            .unwrap_or_else(|| panic!("assignment has no exact delivery; compact fixture trace: {:?}",engine.events().unwrap().into_iter().map(|event|json!({"kind":event.kind,"job":event.job_id,"reply_to":event.reply_to,"error":event.data.get("error"),"choice":event.data.get("response").and_then(|response|response.get("choice"))})).collect::<Vec<_>>()));
+        assert_ne!(reply.job_id.as_ref(), engine.state().focus.as_ref());
     }
     let waited = engine
         .events()
+        .unwrap()
+        .into_iter()
         .find(|event| event.kind == "tool_result" && event.data["tool_name"] == "job_wait")
         .expect("wait produced no native tool result");
     let result = serde_json::to_string(&waited.data["message"]).unwrap();
@@ -418,10 +422,10 @@ async fn two_jobs_deliver_to_exact_assignment_ids_before_waiter_continues() {
     assert!(result.contains("A delivered") && result.contains("B delivered"));
     assert_eq!(engine.result(&input).unwrap().kind, "delivery");
     assert_eq!(fixture.request_count(), 5);
-    assert_eq!(engine.state.jobs.len(), 3);
+    assert_eq!(engine.state().jobs.len(), 3);
     assert!(
         engine
-            .state
+            .state()
             .jobs
             .values()
             .all(|job| job.state == bone::state::JobState::Idle)
@@ -442,7 +446,12 @@ async fn new_instruction_blocks_unstarted_write_proposals() {
     let mut engine = fixture.engine(None, bone::runtime::RunOptions::default());
     let old = engine.post("Create stale.txt", None).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !engine.events().any(|event| event.kind == "model_message") {
+        while !engine
+            .events()
+            .unwrap()
+            .into_iter()
+            .any(|event| event.kind == "model_message")
+        {
             engine.step().await.unwrap();
             assert!(
                 !engine.is_quiescent(),
@@ -453,25 +462,39 @@ async fn new_instruction_blocks_unstarted_write_proposals() {
     })
     .await
     .unwrap();
-    assert!(!engine.events().any(|event| event.kind == "tool_started"));
-    let before = engine.state.revision;
+    assert!(
+        !engine
+            .events()
+            .unwrap()
+            .into_iter()
+            .any(|event| event.kind == "tool_started")
+    );
+    let before = engine.state().revision;
     let newest = engine
         .post(
             "Do not write any files. Acknowledge this changed constraint.",
             None,
         )
         .unwrap();
-    assert!(engine.state.revision > before);
+    assert!(engine.state().revision > before);
     drive_until_result(&mut engine, &newest).await;
     assert!(!fixture.workspace.join("stale.txt").exists());
     assert!(
         !engine
             .events()
+            .unwrap()
+            .into_iter()
             .any(|event| event.kind == "tool_started" && event.data["tool_name"] == "write_file")
     );
-    assert!(engine.events().any(|event| event.kind == "tool_result"
-        && event.data["tool_name"] == "write_file"
-        && event.data.to_string().contains("cancelled")));
+    assert!(
+        engine
+            .events()
+            .unwrap()
+            .into_iter()
+            .any(|event| event.kind == "tool_result"
+                && event.data["tool_name"] == "write_file"
+                && event.data.to_string().contains("cancelled"))
+    );
     assert!(
         engine
             .result(&old)
@@ -491,7 +514,7 @@ async fn interrupted_write_survives_restart_and_requires_reconciliation() {
     ]));
     let mut engine = fixture.engine(None, bone::runtime::RunOptions::default());
     let input = engine.post("Append once to effect.txt", None).unwrap();
-    let session = engine.state.id.clone();
+    let session = engine.state().id.clone();
     tokio::time::timeout(Duration::from_secs(10), async {
         while !fixture.workspace.join("effect.txt").exists() {
             let _ = tokio::time::timeout(Duration::from_millis(20), engine.step()).await;
@@ -505,11 +528,11 @@ async fn interrupted_write_survives_restart_and_requires_reconciliation() {
     .await
     .unwrap();
     engine.stop().unwrap();
-    assert_eq!(engine.state.unknown_writes.len(), 1);
-    let call = engine.state.unknown_writes.keys().next().unwrap().clone();
+    assert_eq!(engine.state().unknown_writes.len(), 1);
+    let call = engine.state().unknown_writes.keys().next().unwrap().clone();
     drop(engine);
     let mut restored = fixture.engine(Some(&session), bone::runtime::RunOptions::default());
-    assert!(restored.state.unknown_writes.contains_key(&call));
+    assert!(restored.state().unknown_writes.contains_key(&call));
     restored.resume().unwrap();
     drive_until_result(&mut restored, &input).await;
     assert_eq!(
@@ -525,12 +548,14 @@ async fn interrupted_write_survives_restart_and_requires_reconciliation() {
     assert_eq!(
         restored
             .events()
+            .unwrap()
+            .into_iter()
             .filter(|event| event.kind == "tool_started" && event.data["tool_name"] == "shell")
             .count(),
         1,
         "interrupted append was replayed"
     );
-    assert!(restored.state.unknown_writes.contains_key(&call));
+    assert!(restored.state().unknown_writes.contains_key(&call));
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap(),
         "x"
@@ -541,7 +566,7 @@ async fn interrupted_write_survives_restart_and_requires_reconciliation() {
             "Inspected effect.txt: already appended once; do not append again",
         )
         .unwrap();
-    assert!(restored.state.unknown_writes.is_empty());
+    assert!(restored.state().unknown_writes.is_empty());
     restored.resume().unwrap();
     drive_until_result(&mut restored, &input).await;
     assert_eq!(
@@ -564,7 +589,7 @@ fn alternating_ablation_records_all_local_trials_and_usage() {
             json!({"path":"totals.py"}),
             "call_ablate_read",
         ));
-        turns.push(tool("write_file",json!({"path":"totals.py","content":after,"expected_sha256":bone::tools::sha256(before.as_bytes())}),"call_ablate_write"));
+        turns.push(tool("write_file",json!({"path":"totals.py","content":after,"expected_sha256":format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(before.as_bytes()))}),"call_ablate_write"));
         turns.push(json!({"text":"The repair is complete"}));
     }
     let fixture = Fixture::new(Value::Array(turns));

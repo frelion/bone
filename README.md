@@ -90,7 +90,7 @@ bone --data-dir ~/.bone-personal --profile personal --model chatgpt:gpt-6-luna l
 bone --data-dir ~/.bone-personal --profile personal --model chatgpt:gpt-6-luna chat
 ```
 
-BONE 独立登录的订阅缓存仅存于当前数据目录的 `profiles/PROFILE/auth.json`。每次调用重新通过 Rig 读取或刷新缓存，并持有该缓存的跨进程锁直到该调用结束。复用 Codex 登录时，锁由认证文件的 canonical 路径标识，保存在固定 `~/.bone/v2/credential-locks`，因此不同数据目录和 profile 仍共享同一来源的调用锁。等待锁可随调用取消。普通运行不会启动交互登录。独立缓存失效或 HTTP 401 会报告重新登录；显式 `login` 成功后才替换已有缓存。开启复用时，`bone login` 只检查现有 Codex 登录资料是否可加载，不发起登录或联网验证。
+BONE 独立登录的订阅缓存仅存于当前数据目录的 `profiles/PROFILE/auth.json`。每次调用重新通过 Rig 读取或刷新缓存，并持有该缓存的跨进程锁直到该调用结束。复用 Codex 登录时，锁由认证文件的 canonical 路径标识，保存在固定 `~/.bone/v2/credential-locks`，因此不同数据目录和 profile 仍共享同一来源的调用锁。等待锁可随调用取消，不消耗单次模型请求的超时；CLI 总运行时限仍包含排队时间。普通运行不会启动交互登录。独立缓存失效或 HTTP 401 会报告重新登录；显式 `login` 成功后才替换已有缓存。开启复用时，`bone login` 只检查现有 Codex 登录资料是否可加载，不发起登录或联网验证。
 
 ## 使用会话
 
@@ -107,7 +107,11 @@ bone --profile work run '后续要求：仅修改 parser.rs' --session SESSION_I
 
 内部 Job 的提问会直接显示到会话，普通回复自动回答最近一个未答问题，无需选择 Job。多个问题同时等待时，其余问题保留在历史中。`run --json` 的等待结果包含 `question_id`，自动化可以用 `bone run '回答内容' --session SESSION_ID --reply-to QUESTION_ID --json` 回答指定问题。每条新回复有独立调用预算，原委托继续保留在会话中。
 
-默认每个根用户输入与它引起的内部工作共享 64 次模型调用和 16 个新 Job 的预算，最多同时执行 3 个动作。可以通过 `--max-calls`、`--max-jobs`、`--max-parallel`、`--context-chars`、`--model-timeout-seconds` 和 `--timeout-seconds` 控制运行。`--single-job` 与 `--no-compaction` 用于消融。上下文摘要压缩预算内已完成的安全前缀，保留未处理输入的原文，完整工具 batch 不会被截断。
+默认每个根用户输入与它引起的内部工作共享 64 次模型调用和 16 个新 Job 的预算，最多同时执行 3 个动作。可以通过 `--max-calls`、`--max-jobs`、`--max-parallel`、`--context-chars`、`--model-timeout-seconds` 和 `--timeout-seconds` 控制运行。`--single-job` 与 `--no-compaction` 用于消融。上下文摘要压缩预算内已完成的安全前缀，保留未处理输入的原文，不拆散工具调用与结果的配对。如果一个完整批次本身超过摘要预算，摘要请求使用带原文引用的有界结果预览。
+
+摘要后的原文仍在 SQLite，Agent 可按事件 ID 分页回查。Idle/Closed Job 的历史正文按需加载；会话事件元信息仍随历史增长。`bone history` 是完整审计读取，可能占用较多内存。
+
+Rust 库的执行操作通过 `runtime::Engine`：`post`、`step`、`stop`、`resume`。`state()` 和 `options()` 只读；`read_event`、`events` 以及库级 `sessions`、`session`、`history` 供观察与审计。模型、工具和存储实现不直接公开，避免绕过 Job 的归属和恢复规则。
 
 ## 工具权限与中断写入
 
@@ -123,6 +127,10 @@ bone --profile work resume SESSION_ID
 ```
 
 `reconcile` 记录检查结果并解除写入阻塞，不自动重放旧命令。恢复会话可以继续读取和核查；未知效果不能据此报告为成功。
+
+workspace 锁和未知写标记存放在操作系统用户目录的 `~/.bone/workspace-locks`，独立于数据目录和临时目录。同一系统用户、相同 canonical workspace 根共享写锁；嵌套但根不同的 workspace 不共享。前台 shell 继承实际锁；BONE 被硬杀后仍在运行的 shell 结束前，同根的其他会话不能写入或核销它的未知结果。该保证不覆盖主动关闭继承文件描述符、自行脱离的后台程序。已有文件的哈希复核也无法消除与任意外部编辑器之间的最后竞争窗口。
+
+如果动作完成后的 SQLite 提交失败，执行器停止后续状态修改并要求重新打开，以持久记录恢复；未知写仍需核查。
 
 ## 官方 companion provider
 
@@ -158,6 +166,10 @@ python3 -B -m unittest discover -s tests -p 'test_ablate.py' -v
 
 新实现默认使用 `~/.bone/v2`，不自动导入旧会话或旧凭据。显式 `reuse_codex_login` 仅按用户选择读取现有 Codex 登录，不属于缓存迁移。旧实现保留在 Git 历史中。本次重写没有延续旧的多 crate/TUI 接口；当前用户入口是本仓库的 `bone` CLI。
 
-最终离线验收通过 65 项 Rust 测试、5 项 Python 测试、Clippy 和全部 feature 编译。复用现有 Codex 登录、使用 `chatgpt:gpt-6-luna` 的中文连续对话 5/5 通过，覆盖解释、修改、继续、停止与恢复。正式消融 18 次中 15 次通过；三个失败均为关闭压缩后的上下文超限。小任务多 Job 开销更高，不能据此宣称普遍效率收益。
+长会话加固后的离线验收通过 97 项 Rust 检查（含 3 项公共接口编译失败检查）、5 项 Python 测试、Clippy 和全部 feature 编译。包括 12 轮续接、多次压缩、跨 Job 原始要求回查、当前与排队输入区分、纠正指令恢复、真实硬杀 shell、存储故障注入及稳定订阅锁。2,200 条大事件经四次压缩重开后，原文仍能回查。
+
+两次真实 12 轮复杂任务的完整验收均保留失败：一次摘要遗漏具体待办，一次首轮网络失败后旧输入干扰当前任务、UTC 功能漏实现。修复后在原 Session 续接，已从冷历史查回具体要求；明确纠错后原 9 项功能检查全过。它验证了长会话恢复与纠错链路，尚不能作为无人干预任务成功率的保证。
+
+此前重写阶段，复用现有 Codex 登录、使用 `chatgpt:gpt-6-luna` 的中文连续对话 5/5 通过，覆盖解释、修改、继续、停止与恢复。正式消融 18 次中 15 次通过；三个失败均为关闭压缩后的上下文超限。小任务多 Job 开销更高，不能据此宣称普遍效率收益。
 
 一次真实 API-key 验证收到 HTTP 429 `credit_balance_exhausted`，没有成功的模型响应，也没有盲目重试。其他 provider 的真实连接、云 companion 请求和 Candle artifact 推理尚未实测。完整实验、保留的失败记录和验证边界见 [verification.md](docs/verification.md)。

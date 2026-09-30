@@ -1,0 +1,50 @@
+{
+  "review": "explicit_utc_correction",
+  "passed": true,
+  "original_formal_trial_2_passed": false,
+  "original_nine_tests_passed": true,
+  "changed_files_independent_hash_check": [
+    "ledger/storage.py"
+  ],
+  "after_hashes_match_record": true,
+  "effect_ownership_passed": true,
+  "supplemental_checks": {
+    "passed": true,
+    "count": 20,
+    "operations": [
+      "add",
+      "write_events",
+      "read_events",
+      "cli"
+    ],
+    "invalid_inputs": [
+      "leading space",
+      "trailing space",
+      "tab/newline whitespace",
+      "impossible calendar date",
+      "UTC offset instead of terminal uppercase Z"
+    ],
+    "bytes_unchanged_all_cases": true,
+    "workspace_unchanged": true,
+    "model_calls": 0,
+    "cases_and_results": "supplemental-probe.json",
+    "reproduction": "python3 -B probe.py --workspace /path/to/final/workspace"
+  },
+  "metrics": {
+    "cost": null,
+    "elapsed_ms": 72618,
+    "input_tokens": 29302,
+    "model_calls": 8,
+    "observed_input_tokens": 29302,
+    "observed_output_tokens": 2345,
+    "output_tokens": 2345,
+    "total_tokens": 31647
+  },
+  "wall_seconds": 72.638134417,
+  "new_summary_count": 1,
+  "binary_sha256": "cfbb414a09e20eb64061629e105cff4164ad9c63ee582b0ba4eb2d7c3277147f",
+  "limitations": [
+    "This is an explicit same-session corrective followup; original 12-round quality failures remain failed.",
+    "No automatic retry policy or generalized success-rate claim follows from this result."
+  ]
+}

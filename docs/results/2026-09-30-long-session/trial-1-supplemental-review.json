@@ -1,0 +1,68 @@
+{
+  "reviews": [
+    {
+      "review": "timestamp_surrounding_whitespace",
+      "after_completed_round": 9,
+      "input": {
+        "id": "space-probe",
+        "account": "A",
+        "amount_cents": 7,
+        "timestamp": " 2026-10-01T12:00:00Z "
+      },
+      "expected": "ValueError without creating the ledger, because only IDs/accounts have whitespace normalization and timestamps must be RFC3339 UTC ending in Z",
+      "observed": {
+        "accepted": true,
+        "returned": true,
+        "stored": [
+          {
+            "id": "space-probe",
+            "account": "A",
+            "amount_cents": 7,
+            "timestamp": "2026-10-01T12:00:00Z"
+          }
+        ]
+      },
+      "contract_round": 5,
+      "classification": "model_quality",
+      "source_sha256": {
+        "ledger/exports.py": "d780a9607a2c96fb6c7525b0047cc1fcaaa717a3a654872d245a073b5300a75d",
+        "ledger/service.py": "548dde0293a2c286a1ba4336d4407097b997418113bbebbe803ed9b9e42ff135",
+        "ledger/__init__.py": "9baa5dbdf023871b28564640ff4ba7d64825c1e8627c6e58145e8efad2713893",
+        "ledger/cli.py": "fcc1237915a25db92cc0f1b04a2c380c76845f7d54eb47ba34da68455d69f0af",
+        "ledger/storage.py": "1792140ca09fc268b0c7be00dc909d90c070942665983decb7d47c88eaf736ed"
+      }
+    },
+    {
+      "review": "timestamp_surrounding_whitespace_final",
+      "after_completed_round": 12,
+      "input": {
+        "id": "space-probe",
+        "account": "A",
+        "amount_cents": 7,
+        "timestamp": " 2026-10-01T12:00:00Z "
+      },
+      "expected": "ValueError without creating ledger for raw timestamp outside the RFC3339 UTC format.",
+      "observed": {
+        "accepted": true,
+        "returned": true,
+        "stored": [
+          {
+            "id": "space-probe",
+            "account": "A",
+            "amount_cents": 7,
+            "timestamp": "2026-10-01T12:00:00Z"
+          }
+        ]
+      },
+      "contract_round": 5,
+      "classification": "model_quality",
+      "source_sha256": {
+        "ledger/__init__.py": "9baa5dbdf023871b28564640ff4ba7d64825c1e8627c6e58145e8efad2713893",
+        "ledger/cli.py": "5e66c11087ad173004358737273573a9049864ace39192eab5b11d1007f5f4e3",
+        "ledger/exports.py": "d780a9607a2c96fb6c7525b0047cc1fcaaa717a3a654872d245a073b5300a75d",
+        "ledger/service.py": "548dde0293a2c286a1ba4336d4407097b997418113bbebbe803ed9b9e42ff135",
+        "ledger/storage.py": "259d89ae1f5ed243e0c13cd68038188bcf7ed850f1a294264f8e4094512ded2a"
+      }
+    }
+  ]
+}

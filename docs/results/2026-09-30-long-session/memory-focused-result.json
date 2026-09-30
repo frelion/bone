@@ -1,0 +1,461 @@
+{
+  "case": "memory",
+  "session_id": "ace38353-3098-4957-b95f-3ed8b317d29d",
+  "binary_sha256": "cfbb414a09e20eb64061629e105cff4164ad9c63ee582b0ba4eb2d7c3277147f",
+  "config_sha256": "046e27b9f13d3476fc70c4f3dd787b50ee0dbbf4756983b1b978082e13dd0c69",
+  "context_chars": 32000,
+  "max_calls": 48,
+  "timeout_seconds": 300,
+  "summaries_before": 12,
+  "original_input_ids": [
+    "8401d634-edcb-46d6-81cb-302c32603a9f",
+    "c0412770-d93e-467f-8a78-474ad04d57cc"
+  ],
+  "file_hashes_before": {
+    "ledger/exports.py": "d780a9607a2c96fb6c7525b0047cc1fcaaa717a3a654872d245a073b5300a75d",
+    "ledger/service.py": "548dde0293a2c286a1ba4336d4407097b997418113bbebbe803ed9b9e42ff135",
+    "ledger/__init__.py": "9baa5dbdf023871b28564640ff4ba7d64825c1e8627c6e58145e8efad2713893",
+    "ledger/cli.py": "5e66c11087ad173004358737273573a9049864ace39192eab5b11d1007f5f4e3",
+    "ledger/storage.py": "cf842fb0e684f097d05db87e6195d8e4c22743cf1c6f220e05ddbff1f6486979"
+  },
+  "preconditions_verified": true,
+  "exit_code": 0,
+  "status": "completed",
+  "input_id": "435ac407-b33b-4241-9267-e905ae5bdbc4",
+  "text": "At the checkpoint, the deliberately deferred deliverables were **stable CSV export** and **the CLI, including dry-run support**.\n\nThe original project statement, input `8401d634-edcb-46d6-81cb-302c32603a9f` (revision 1), lists the requirements: \u201ca UTF-8 JSON Lines event ledger, exact integer cents, idempotent IDs, account queries, stable CSV export, and a CLI with dry-run support.\u201d The checkpoint request, input `8a826087-85bf-4fbe-8113-075b65c977c7` (revision 6), specifically asks what remains after the storage/mutation work; the pause request is input `7e24b1ee-8e20-489c-be8e-395bdf70ea3b` (revision 7).\n\n**Details not specified at that checkpoint:** the precise CSV schema, sorting and quoting rules, row-count return, and parent-directory behavior; and the CLI syntax, output shapes, and dry-run semantics. Those were specified later, in CSV requirements input `122a583a-d241-4682-834e-692be01ec23d` (revision 9) and CLI requirements input `a6f0a1bd-ca79-4dac-b9dc-6484b53b0613` (revision 11). Account querying was already named in the original requirements, but its detailed `service.balance` contract came later in input `347cb694-cb2e-40a2-ad85-470dfef62692` (revision 10).",
+  "metrics": {
+    "cost": null,
+    "elapsed_ms": 120001,
+    "input_tokens": 85796,
+    "model_calls": 21,
+    "observed_input_tokens": 85796,
+    "observed_output_tokens": 2525,
+    "output_tokens": 2525,
+    "total_tokens": 88321
+  },
+  "wall_seconds": 120.024137458,
+  "verification": {
+    "passed": true,
+    "run": 9,
+    "skipped": 0,
+    "failures": [],
+    "errors": []
+  },
+  "file_hashes_after": {
+    "ledger/exports.py": "d780a9607a2c96fb6c7525b0047cc1fcaaa717a3a654872d245a073b5300a75d",
+    "ledger/service.py": "548dde0293a2c286a1ba4336d4407097b997418113bbebbe803ed9b9e42ff135",
+    "ledger/__init__.py": "9baa5dbdf023871b28564640ff4ba7d64825c1e8627c6e58145e8efad2713893",
+    "ledger/cli.py": "5e66c11087ad173004358737273573a9049864ace39192eab5b11d1007f5f4e3",
+    "ledger/storage.py": "cf842fb0e684f097d05db87e6195d8e4c22743cf1c6f220e05ddbff1f6486979"
+  },
+  "files_unchanged": true,
+  "new_summary_count": 2,
+  "new_tool_calls": [
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "limit": 100,
+          "users_only": true
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_T2azaqBLDtNgIwbKJAiELA8J",
+          "item_id": "fc_0789064c0b8958a6016abd278cca3087d0a2b07195d78e49f0"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "before_id": "ce39d7b3-724c-4fd8-90da-d56fd932440d",
+          "limit": 100,
+          "users_only": true
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_hLYCrdqfd0CHM4lfVNzxMxNM",
+          "item_id": "fc_0789064c0b8958a6016abd278f4cdc87d0b74a68417eb56055"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "limit": 10,
+          "users_only": true
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_Red1UlIyYxLQS8NCFL0lGcXJ",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27a4481887d097fc88a45bf413e5"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "before_id": "ce39d7b3-724c-4fd8-90da-d56fd932440d",
+          "limit": 20,
+          "users_only": true
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_oP3JgCF2zbcxZFSRnjOv70be",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27a6e1f887d0b139ba0a3f073ebd"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "before_id": "347cb694-cb2e-40a2-ad85-470dfef62692",
+          "limit": 20,
+          "users_only": true
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_tMF339kxr73oAYNm412mJFqQ",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27a953ec87d09021010daaeaeb58"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "before_id": "338f4e9a-53c0-4704-9649-edf31e1b22e5",
+          "limit": 10,
+          "users_only": true
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_LwS42Ag0FnO9dVW2ekSpRceH",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27acb15487d0a8e661277ad280d6"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "before_id": "c0412770-d93e-467f-8a78-474ad04d57cc",
+          "limit": 3,
+          "users_only": true
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_ZX3SUICIbQml6NsvnzeLdXFF",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27b02af487d0a1d4b9073e7ac4f9"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "66f7cb7e-4a15-46eb-9d42-e4422a88690f"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_7bYfF47hsBjaufGWVqOamBki",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27b40ea887d09e79bac2620c75fe"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "122a583a-d241-4682-834e-692be01ec23d"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_QPcWiJ8Otut6t95xyJGCwtbp",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27b74dd487d0b77f602d6aa0a979"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "a6f0a1bd-79e8-424b-4da4-68a1bd471f0f"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_ZR83bcm3KwNLSydfZjQs3g3Y",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27ba404887d09830e38624f301c5"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "a6f0a1bd-7c93-4f4c-a26e-017bb127760d"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_ckUP6gVIX9qewDnHZGPXPnFV",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27be0ab087d0bec5a5958c919205"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "a6f0a1bd-7c9d-648a-4dc9-b64b8b0613"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_lSDp5hH0twm33s02jSZWpfv4",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27c153f487d0aedd281dcfd790bd"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "a6f0a1bd-cb2e-40a2-ad85-470dfef62692"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_07Yxi3E7TqsDXMAsIsZhW5HO",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27c45f5087d0a3a63f593f667b1b"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "a6f0a1bd-ca79-4dac-b9dc-6484b53b0613"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_iiRIFSq2X9ZzN2apJBxoC6wn",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27c90e3087d08c7a5d876374997f"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "8a826087-85bf-4fbe-8113-075b65c977c7"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_bIcHmiKv6zPOeJBomeIWxdLy",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27cbb34887d09b3696dc8e194752"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "8401d634-edcb-46d6-81cb-302c32603a9f"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_FkkYQL9PpcEnX2RhGVK4ZZpH",
+          "item_id": "fc_09aad2e43ddc9b6f016abd27d07b2887d0b2671dac772018ac"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "limit": 30,
+          "users_only": true
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_WiQLGYMEhtQtXBAExTzcSTSR",
+          "item_id": "fc_021101e88a35cd5b016abd27edffb887d093b437d824a0e117"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "8401d634-edcb-46d6-81cb-302c32603a9f"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_pnfLRMkwZiu6HlDyDrf6UpCd",
+          "item_id": "fc_021101e88a35cd5b016abd27f4fd6087d0afeb77b827c49347"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "8a826087-85bf-4fbe-8113-075b65c977c7"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_Wa3IoEGvMSGRNEXo57Zn3MAQ",
+          "item_id": "fc_021101e88a35cd5b016abd27f4fd7887d09378617ab8303913"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "7e24b1ee-8e20-489c-be8e-395bdf70ea3b"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_SfuuOhwDVb3ZP38W99pMXrDG",
+          "item_id": "fc_021101e88a35cd5b016abd27f4fd8487d0a6b5b34acca9c4bc"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "122a583a-d241-4682-834e-692be01ec23d"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_ZHts4zC2R5SyaufRjFr8aGKw",
+          "item_id": "fc_021101e88a35cd5b016abd27f4fd9087d0929e46a45bfb3bda"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "a6f0a1bd-ca79-4dac-b9dc-6484b53b0613"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_OABNPCtPPFbcZzz9SSz6V9kg",
+          "item_id": "fc_021101e88a35cd5b016abd27f4fd9c87d09d5656daccf89191"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    },
+    {
+      "additional_params": null,
+      "function": {
+        "arguments": {
+          "event_id": "347cb694-cb2e-40a2-ad85-470dfef62692"
+        },
+        "name": "job_inspect"
+      },
+      "id": {
+        "provider": {
+          "call_id": "call_muOv8R2WBMFGCRxAwZ1yJxT1",
+          "item_id": "fc_021101e88a35cd5b016abd27f4fda487d093e7fe77e2729b0e"
+        }
+      },
+      "signature": null,
+      "type": "toolcall"
+    }
+  ],
+  "new_write_starts": [],
+  "needs_independent_review": true
+}

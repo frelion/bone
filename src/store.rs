@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::json;
@@ -19,7 +19,6 @@ pub struct Store {
 /// Held for the whole session runtime, including recovery and shutdown.
 pub struct SessionLease {
     file: File,
-    pub session_id: String,
 }
 
 impl Drop for SessionLease {
@@ -34,10 +33,10 @@ impl Store {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
-        let lock_directory = path.with_extension("session-locks");
-        fs::create_dir_all(&lock_directory)?;
         let connection = Connection::open(path)
             .with_context(|| format!("opening session store {}", path.display()))?;
+        let lock_directory = path.canonicalize()?.with_extension("session-locks");
+        fs::create_dir_all(&lock_directory)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -54,10 +53,30 @@ impl Store {
                  session_id TEXT NOT NULL REFERENCES sessions(id),
                  call_id TEXT,
                  revision INTEGER NOT NULL CHECK (revision >= 0),
-                 payload TEXT NOT NULL
+                 payload TEXT NOT NULL,
+                 job_id TEXT,
+                 metadata TEXT
              );
              CREATE INDEX IF NOT EXISTS events_session_order ON events(session_id, sequence);
              CREATE INDEX IF NOT EXISTS events_call ON events(session_id, call_id);",
+        )?;
+        let columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(events)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<BTreeSet<_>, _>>()?
+        };
+        if !columns.contains("job_id") {
+            connection.execute("ALTER TABLE events ADD COLUMN job_id TEXT", [])?;
+        }
+        if !columns.contains("metadata") {
+            connection.execute("ALTER TABLE events ADD COLUMN metadata TEXT", [])?;
+        }
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE events SET job_id = json_extract(payload, '$.job_id'), metadata = json_set(json_remove(payload, '$.data.message', '$.data.response', '$.data.stream_items', '$.data.covered_ids'), '$.data.usage', json_extract(payload, '$.data.response.usage')) WHERE metadata IS NULL;
+             CREATE INDEX IF NOT EXISTS events_job_order ON events(session_id, job_id, sequence);
+             COMMIT;"
         )?;
         Ok(Self {
             connection,
@@ -82,10 +101,7 @@ impl Store {
             .open(path)?;
         file.try_lock_exclusive()
             .with_context(|| format!("session {id} is already owned by another process"))?;
-        Ok(SessionLease {
-            file,
-            session_id: id.to_owned(),
-        })
+        Ok(SessionLease { file })
     }
 
     pub fn create_session(&self, state: &SessionState) -> Result<()> {
@@ -105,7 +121,7 @@ impl Store {
             "INSERT INTO sessions (id, revision, snapshot) VALUES (?1, 0, ?2)",
             params![state.id, snapshot],
         )?;
-        validate_references(&transaction, state)?;
+        validate_references(&transaction, state, None)?;
         transaction.commit()?;
         Ok(())
     }
@@ -147,6 +163,82 @@ impl Store {
         payloads
             .into_iter()
             .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .collect()
+    }
+
+    /// Projection avoids loading native transcript bodies into the live runtime.
+    pub fn event_metadata(&self, session_id: &str) -> Result<Vec<Event>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT metadata FROM events WHERE session_id = ?1 ORDER BY sequence")?;
+        statement
+            .query_map([session_id], |row| row.get::<_, String>(0))?
+            .map(|row| serde_json::from_str(&row?).map_err(Into::into))
+            .collect()
+    }
+
+    pub fn read_event(&self, session_id: &str, id: &str) -> Result<Event> {
+        let payload: String = self
+            .connection
+            .query_row(
+                "SELECT payload FROM events WHERE session_id = ?1 AND id = ?2",
+                params![session_id, id],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("reading event {id}"))?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    pub fn read_events(&self, session_id: &str, ids: &BTreeSet<String>) -> Result<Vec<Event>> {
+        let ids = ids.iter().collect::<Vec<_>>();
+        let mut result = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let sql = format!(
+                "SELECT payload FROM events WHERE session_id = ? AND id IN ({})",
+                vec!["?"; chunk.len()].join(",")
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let values = std::iter::once(session_id).chain(chunk.iter().map(|id| id.as_str()));
+            let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+                row.get::<_, String>(0)
+            })?;
+            for row in rows {
+                result.push(serde_json::from_str(&row?)?);
+            }
+        }
+        ensure!(
+            result.len() == ids.len(),
+            "working history refers to missing events"
+        );
+        Ok(result)
+    }
+
+    /// Reverse chronological audit metadata, independently of compacted history.
+    pub fn job_records(
+        &self,
+        session_id: &str,
+        job_id: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let before_sequence: i64 = if let Some(before) = before {
+            self.connection
+                .query_row(
+                    "SELECT sequence FROM events WHERE session_id=?1 AND job_id=?2 AND id=?3",
+                    params![session_id, job_id, before],
+                    |row| row.get(0),
+                )
+                .context("before_id is not an audit record of this job")?
+        } else {
+            i64::MAX
+        };
+        let mut statement = self.connection.prepare("SELECT metadata FROM events WHERE session_id=?1 AND job_id=?2 AND sequence<?3 ORDER BY sequence DESC LIMIT ?4")?;
+        statement
+            .query_map(
+                params![session_id, job_id, before_sequence, i64::try_from(limit)?],
+                |row| row.get::<_, String>(0),
+            )?
+            .map(|row| serde_json::from_str(&row?).map_err(Into::into))
             .collect()
     }
 
@@ -197,11 +289,11 @@ impl Store {
                 );
             }
             transaction.execute(
-                "INSERT INTO events (id, session_id, call_id, revision, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![event.id, event.session_id, event.call_id, i64::try_from(event.revision)?, serde_json::to_string(event)?],
+                "INSERT INTO events (id, session_id, call_id, revision, payload, job_id, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![event.id, event.session_id, event.call_id, i64::try_from(event.revision)?, serde_json::to_string(event)?, event.job_id, serde_json::to_string(&event.metadata())?],
             )?;
         }
-        validate_references(&transaction, state)?;
+        validate_references(&transaction, state, Some(&existing))?;
         for event in events {
             for id in event.reply_to.iter().chain(event.root_input.iter()) {
                 ensure!(
@@ -223,7 +315,7 @@ impl Store {
     pub fn recover_session(&self, id: &str) -> Result<SessionState> {
         let mut state = self.load_session(id)?;
         let original = state.clone();
-        let events = self.events(id)?;
+        let events = self.event_metadata(id)?;
         let mut unfinished = BTreeMap::new();
         for event in &events {
             let Some(call_id) = &event.call_id else {
@@ -345,11 +437,11 @@ fn event_exists(transaction: &Transaction<'_>, session_id: &str, id: &str) -> Re
     )?)
 }
 
-fn validate_references(transaction: &Transaction<'_>, state: &SessionState) -> Result<()> {
-    let mut references: BTreeSet<&str> = state.pending_inputs.iter().map(String::as_str).collect();
-    references.extend(state.budgets.keys().map(String::as_str));
+fn references(state: &SessionState) -> BTreeSet<&str> {
+    let mut ids: BTreeSet<_> = state.pending_inputs.iter().map(String::as_str).collect();
+    ids.extend(state.budgets.keys().map(String::as_str));
     for job in state.jobs.values() {
-        references.extend(
+        ids.extend(
             job.inbox
                 .iter()
                 .chain(job.active_input.iter())
@@ -358,21 +450,52 @@ fn validate_references(transaction: &Transaction<'_>, state: &SessionState) -> R
                 .chain(job.summary.iter())
                 .map(String::as_str),
         );
+    }
+    for write in state.unknown_writes.values() {
+        ids.extend(write.root_input.iter().map(String::as_str));
+    }
+    ids
+}
+
+fn validate_references(
+    transaction: &Transaction<'_>,
+    state: &SessionState,
+    previous: Option<&SessionState>,
+) -> Result<()> {
+    // Immutable event IDs already checked in the prior atomic snapshot need no
+    // further point queries. Validate only newly introduced references in batches.
+    let previous_ids = previous.map(references).unwrap_or_default();
+    let references = references(state)
+        .difference(&previous_ids)
+        .copied()
+        .collect::<Vec<_>>();
+    for chunk in references.chunks(500) {
+        let sql = format!(
+            "SELECT COUNT(*) FROM events WHERE session_id = ? AND id IN ({})",
+            vec!["?"; chunk.len()].join(",")
+        );
+        let values = std::iter::once(state.id.as_str()).chain(chunk.iter().copied());
+        let count: i64 =
+            transaction.query_row(&sql, rusqlite::params_from_iter(values), |row| row.get(0))?;
+        ensure!(
+            count == i64::try_from(chunk.len())?,
+            "session snapshot refers to missing event"
+        );
+    }
+    for job in state.jobs.values() {
         if let Some(call_id) = &job.current_call {
+            if previous
+                .and_then(|s| s.jobs.get(&job.id))
+                .is_some_and(|old| old.current_call.as_ref() == Some(call_id))
+            {
+                continue;
+            }
             let exists: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM events WHERE session_id = ?1 AND call_id = ?2)",
                 params![state.id, call_id],
                 |row| row.get(0),
             )?;
             ensure!(exists, "job {} refers to missing call {call_id}", job.id);
-        }
-    }
-    for write in state.unknown_writes.values() {
-        references.extend(write.root_input.iter().map(String::as_str));
-    }
-    for id in references {
-        if !event_exists(transaction, &state.id, id)? {
-            bail!("session snapshot refers to missing event {id}");
         }
     }
     Ok(())

@@ -5,7 +5,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bone::config::{Config, Profile, default_data_dir};
 use bone::runtime::{Engine, RunOptions};
-use bone::store::Store;
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -132,7 +131,7 @@ async fn execute(cli: Cli) -> Result<()> {
     let data = cli.data_dir.clone().unwrap_or_else(default_data_dir);
     match &cli.command {
         Command::Providers { json } => {
-            let names = bone::model::providers();
+            let names = bone::providers();
             if *json {
                 println!("{}", serde_json::to_string(&names)?);
             } else {
@@ -143,8 +142,7 @@ async fn execute(cli: Cli) -> Result<()> {
         }
         Command::Config => println!("{}", toml::to_string_pretty(&Config::default())?),
         Command::Sessions { json } => {
-            let store = Store::open(data.join("sessions.sqlite3"))?;
-            let sessions = store.list_sessions()?;
+            let sessions = bone::sessions(&data)?;
             if *json {
                 println!("{}", serde_json::to_string(&sessions)?);
             } else {
@@ -159,9 +157,7 @@ async fn execute(cli: Cli) -> Result<()> {
             }
         }
         Command::History { session_id, json } => {
-            let store = Store::open(data.join("sessions.sqlite3"))?;
-            store.load_session(session_id)?;
-            let events = store.events(session_id)?;
+            let events = bone::history(&data, session_id)?;
             if *json {
                 println!("{}", serde_json::to_string(&events)?);
             } else {
@@ -172,7 +168,7 @@ async fn execute(cli: Cli) -> Result<()> {
         }
         Command::Login => {
             let (name, profile) = select_profile(&cli, &data)?;
-            bone::model::login(&profile, &data, &name).await?;
+            bone::login(&profile, &data, &name).await?;
             println!(
                 "{}: {name}",
                 if profile.reuse_codex_login {
@@ -188,9 +184,7 @@ async fn execute(cli: Cli) -> Result<()> {
             note,
         } => {
             let (name, profile) = select_profile(&cli, &data)?;
-            let workspace = Store::open(data.join("sessions.sqlite3"))?
-                .load_session(session_id)?
-                .workspace;
+            let workspace = bone::session(&data, session_id)?.workspace;
             let mut engine = Engine::open(
                 &data,
                 &workspace,
@@ -254,15 +248,15 @@ fn select_profile(cli: &Cli, data: &Path) -> Result<(String, Profile)> {
 
 fn resumed_input(engine: &Engine) -> Result<String> {
     engine
-        .state
+        .state()
         .pending_inputs
         .front()
         .or_else(|| {
             engine
-                .state
+                .state()
                 .focus
                 .as_ref()
-                .and_then(|id| engine.state.jobs.get(id))
+                .and_then(|id| engine.state().jobs.get(id))
                 .and_then(|job| job.active_input.as_ref().or(job.inbox.front()))
         })
         .cloned()
@@ -274,9 +268,7 @@ fn open(cli: &Cli, data: &Path, run: &RunArgs, session: Option<&str>) -> Result<
     let workspace = if let Some(path) = &run.workspace {
         path.clone()
     } else if let Some(id) = session {
-        Store::open(data.join("sessions.sqlite3"))?
-            .load_session(id)?
-            .workspace
+        bone::session(data, id)?.workspace
     } else {
         std::env::current_dir()?
     };
@@ -292,15 +284,15 @@ fn report(engine: &Engine, input: &str, status: &str, text: &str, json_output: b
         println!(
             "{}",
             serde_json::to_string(
-                &json!({"session_id":engine.state.id,"input_id":input,"status":status,"text":text,"question_id":question_id,"metrics":engine.metrics(input),"unknown_writes":engine.state.unknown_writes})
+                &json!({"session_id":engine.state().id,"input_id":input,"status":status,"text":text,"question_id":question_id,"metrics":engine.metrics(input),"unknown_writes":engine.state().unknown_writes})
             )?
         );
     } else {
         if !text.is_empty() {
             println!("{text}");
         }
-        eprintln!("Session: {} ({status})", engine.state.id);
-        for write in engine.state.unknown_writes.values() {
+        eprintln!("Session: {} ({status})", engine.state().id);
+        for write in engine.state().unknown_writes.values() {
             eprintln!(
                 "Unconfirmed write {}: {}. Inspect effects, then use bone reconcile with --note.",
                 write.call_id, write.tool_name
@@ -329,16 +321,17 @@ async fn run_to_result(
             let status = match event.kind.as_str() {
                 "delivery" => "completed",
                 "question" => "waiting",
+                "input_paused" => "paused",
                 _ => "failed",
             };
-            let text = engine.event_text(event);
+            let text = engine.event_text(event)?;
             report(engine, input, status, &text, json_output)?;
             if status == "failed" {
                 bail!("input failed; details are recorded in session history");
             }
             return Ok(());
         }
-        if engine.state.paused {
+        if engine.state().paused {
             report(engine, input, "paused", "Work is paused.", json_output)?;
             return Ok(());
         }
@@ -346,7 +339,7 @@ async fn run_to_result(
             events=engine.step()=>{
                 let events=events?;
                 if events.is_empty() && engine.is_quiescent(){
-                    let status=if engine.state.unknown_writes.is_empty(){"waiting"}else{"paused"};
+                    let status=if engine.state().unknown_writes.is_empty(){"waiting"}else{"paused"};
                     report(engine,input,status,"Work is waiting for input or reconciliation.",json_output)?;return Ok(());
                 }
                 if events.is_empty(){tokio::time::sleep(Duration::from_millis(20)).await;}
@@ -360,16 +353,13 @@ async fn run_to_result(
 async fn chat(engine: &mut Engine) -> Result<()> {
     eprintln!(
         "BONE · Session {}\nType normally. /stop, /resume, /quit",
-        engine.state.id
+        engine.state().id
     );
     let interactive = std::io::stdin().is_terminal();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut input_closed = false;
-    for question in engine
-        .events()
-        .filter(|event| engine.is_unanswered_question(event))
-    {
-        println!("{}", engine.event_text(question));
+    for question in engine.unanswered_questions() {
+        println!("{}", engine.event_text(question)?);
     }
     if interactive {
         print!("> ");
@@ -393,11 +383,14 @@ async fn chat(engine: &mut Engine) -> Result<()> {
                 let updates=updates?;
                 if updates.is_empty()&&!engine.is_quiescent(){tokio::time::sleep(Duration::from_millis(20)).await;}
                 for event in updates{
-                    if matches!(event.kind.as_str(),"delivery"|"question"|"failure"){
+                    if matches!(event.kind.as_str(),"delivery"|"question"|"failure"|"input_paused"){
                         // Internal assignment deliveries are consumed by their waiting job.
-                        let public=event.reply_to.as_ref().and_then(|id|engine.events().find(|e|&e.id==id)).is_some_and(|e|e.data["source"]==Value::String("user".into()));
+                        let public=match event.reply_to.as_deref() {
+                            Some(id)=>engine.read_event(id)?.data["source"]==Value::String("user".into()),
+                            None=>false,
+                        };
                         let visible=if event.kind=="question"{engine.is_unanswered_question(&event)}else{public};
-                        if visible{println!("{}",engine.event_text(&event));if interactive{print!("> ");std::io::stdout().flush()?;}}
+                        if visible{println!("{}",engine.event_text(&event)?);if interactive{print!("> ");std::io::stdout().flush()?;}}
                     }
                 }
                 if input_closed&&engine.is_quiescent(){break;}
@@ -456,7 +449,7 @@ mod tests {
         engine.step().await.unwrap(); // Persist the model intent without awaiting it.
         assert_eq!(
             engine
-                .state
+                .state()
                 .jobs
                 .values()
                 .next()
@@ -469,7 +462,7 @@ mod tests {
             .post("first explain, before continuing", None)
             .unwrap();
         engine.stop().unwrap();
-        let session = engine.state.id.clone();
+        let session = engine.state().id.clone();
         drop(engine);
         let mut recovered = Engine::open(
             &data,

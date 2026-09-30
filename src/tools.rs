@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
 pub const OUTPUT_LIMIT: usize = 32 * 1024;
+const FILE_LIMIT: u64 = 16 * 1024 * 1024;
 
 pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
     let mut tools = vec![
@@ -26,8 +27,8 @@ pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
         ),
         definition(
             "job_inspect",
-            "Inspect internal jobs and their pending input IDs; optionally read one job's recent records. Jobs are contexts of this same agent.",
-            json!({"job_id":{"type":"string"}}),
+            "Recover original session evidence after summaries. With users_only=true, page all session user inputs using before_id (an input ID) and limit (input count). With event_id, read the event's readable body, including summary and model response text; raw=true returns the original Event JSON instead. offset and limit are characters in event mode; use next_offset to continue. With job_id, page that job's original records using before_id and limit (record count). Results report truncation and next_before_id for record pagination. Omit users_only, job_id and event_id for the job catalog.",
+            json!({"job_id":{"type":"string"},"event_id":{"type":"string"},"users_only":{"type":"boolean"},"raw":{"type":"boolean"},"before_id":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}}),
             &[],
         ),
         definition(
@@ -44,7 +45,7 @@ pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
         ),
     ];
     if !read_only {
-        tools.push(definition("write_file", "Replace a workspace file only if expected_sha256 matches the hash returned by read_file. For a NEW file pass expected_sha256=null. All contents must be provided.", json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":["string","null"]}}), &["path","content","expected_sha256"]));
+        tools.push(definition("write_file", "Replace a workspace file using expected_sha256 from read_file. Content and file identity are checked again immediately before replacement; an external writer racing after that check can still change it. For a NEW file pass expected_sha256=null; creation never overwrites an existing target. Existing files are limited to 16 MiB. All contents must be provided.", json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":["string","null"]}}), &["path","content","expected_sha256"]));
         tools.push(definition("shell", "Run a shell command in the workspace with the user's local privileges. Treat as a write operation. Output is bounded; timed-out commands require reconciliation. Prefer read_file/list_files for inspection.", json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300}}), &["command"]));
     }
     if !single_job {
@@ -130,9 +131,14 @@ pub struct ToolOutcome {
     pub uncertain: bool,
 }
 
-pub async fn execute(workspace: &Path, name: &str, args: &Value) -> ToolOutcome {
+pub async fn execute(
+    workspace: &Path,
+    name: &str,
+    args: &Value,
+    write_leases: Option<[std::sync::Arc<std::fs::File>; 2]>,
+) -> ToolOutcome {
     if name == "shell" {
-        return match shell(workspace, args).await {
+        return match shell(workspace, args, write_leases.as_ref()).await {
             Ok(outcome) => outcome,
             Err(error) => ToolOutcome {
                 content: json!({"error":format!("{error:#}")}),
@@ -161,16 +167,16 @@ fn file_tool(workspace: &Path, name: &str, args: &Value) -> Result<Value> {
         "read_file" => {
             ensure!(path.is_file(), "path is not a regular file");
             ensure!(
-                std::fs::metadata(&path)?.len() <= 16 * 1024 * 1024,
+                std::fs::metadata(&path)?.len() <= FILE_LIMIT,
                 "file exceeds 16 MiB; use a bounded shell command"
             );
             let mut bytes = Vec::new();
             use std::io::Read;
             std::fs::File::open(&path)?
-                .take(16 * 1024 * 1024 + 1)
+                .take(FILE_LIMIT + 1)
                 .read_to_end(&mut bytes)?;
             ensure!(
-                bytes.len() <= 16 * 1024 * 1024,
+                bytes.len() as u64 <= FILE_LIMIT,
                 "file exceeds 16 MiB; use a bounded shell command"
             );
             let text = std::str::from_utf8(&bytes).context("file is not UTF-8")?;
@@ -206,25 +212,118 @@ fn file_tool(workspace: &Path, name: &str, args: &Value) -> Result<Value> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct FileVersion {
+    sha256: String,
+    bytes: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileVersion {
+    fn metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            sha256: String::new(),
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
+}
+
+/// A fixed buffer and byte ceiling bound hashing even if a file grows while read.
+fn file_version(path: &Path) -> Result<Option<FileVersion>> {
+    use std::io::Read;
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(metadata.is_file(), "path is not a regular file");
+    ensure!(
+        metadata.len() <= FILE_LIMIT,
+        "file exceeds 16 MiB; use a bounded shell command"
+    );
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A target changed into a FIFO between metadata and open must not hang.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file(), "path is not a regular file");
+    let mut version = FileVersion::metadata(&metadata);
+    ensure!(
+        version.bytes <= FILE_LIMIT,
+        "file exceeds 16 MiB; use a bounded shell command"
+    );
+    let mut reader = file.take(FILE_LIMIT + 1);
+    let mut hash = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        ensure!(
+            bytes <= FILE_LIMIT,
+            "file exceeds 16 MiB; use a bounded shell command"
+        );
+        hash.update(&buffer[..count]);
+    }
+    ensure!(
+        version == FileVersion::metadata(&reader.get_ref().metadata()?),
+        "file changed while checking it; read it again before replacing it"
+    );
+    version.sha256 = format!("{:x}", hash.finalize());
+    Ok(Some(version))
+}
+
 fn write_file(
     workspace: &Path,
     args: &Value,
     sync_directory: fn(&Path) -> std::io::Result<()>,
 ) -> ToolOutcome {
-    let mut renamed = false;
+    write_file_prepared(workspace, args, sync_directory, |_| Ok(()))
+}
+
+fn write_file_prepared(
+    workspace: &Path,
+    args: &Value,
+    sync_directory: fn(&Path) -> std::io::Result<()>,
+    before_install: impl FnOnce(&Path) -> Result<()>,
+) -> ToolOutcome {
+    let mut installed = false;
     let result = (|| -> Result<Value> {
         let path = workspace_path(workspace, string_arg(args, "path")?)?;
         let content = string_arg(args, "content")?;
         let expected = args
             .get("expected_sha256")
             .context("expected_sha256 is required (null for a new file)")?;
-        if path.exists() {
-            ensure!(path.is_file(), "path is not a regular file");
+        let original = file_version(&path)?;
+        if let Some(original) = &original {
             let expected = expected
                 .as_str()
                 .context("existing file requires its expected SHA-256")?;
             ensure!(
-                sha256(&std::fs::read(&path)?) == expected,
+                original.sha256 == expected,
                 "file changed; read it again before replacing it"
             );
         } else {
@@ -233,7 +332,8 @@ fn write_file(
         let parent = path.parent().context("file needs a parent")?;
         std::fs::create_dir_all(parent)?;
         let _ = workspace_path(workspace, string_arg(args, "path")?)?;
-        let temporary = parent.join(format!(".bone-{}.tmp", uuid::Uuid::new_v4()));
+        let canonical_parent = parent.canonicalize()?;
+        let temporary = canonical_parent.join(format!(".bone-{}.tmp", uuid::Uuid::new_v4()));
         let replacement = (|| -> Result<()> {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
@@ -245,9 +345,28 @@ fn write_file(
             }
             file.write_all(content.as_bytes())?;
             file.sync_all()?;
-            std::fs::rename(&temporary, &path)?;
-            renamed = true;
-            sync_directory(parent)?;
+            before_install(&path)?;
+            let _ = workspace_path(workspace, string_arg(args, "path")?)?;
+            ensure!(
+                parent.canonicalize()? == canonical_parent,
+                "file's parent directory changed; inspect it before replacing it"
+            );
+            if original.is_some() {
+                ensure!(
+                    file_version(&path)? == original,
+                    "file changed during replacement preparation; read it again before replacing it"
+                );
+                // This narrows the external-writer race; it is not an atomic CAS.
+                std::fs::rename(&temporary, &path)?;
+                installed = true;
+            } else {
+                // Both names share one directory/filesystem. Unlike rename,
+                // hard_link fails atomically if another writer created the target.
+                std::fs::hard_link(&temporary, &path)?;
+                installed = true;
+                std::fs::remove_file(&temporary)?;
+            }
+            sync_directory(&canonical_parent)?;
             Ok(())
         })();
         if replacement.is_err() {
@@ -262,12 +381,12 @@ fn write_file(
             uncertain: false,
         },
         Err(error) => ToolOutcome {
-            content: if renamed {
-                json!({"error":format!("{error:#}"),"effect":"unknown","instruction":"The file was replaced but directory durability could not be confirmed. Inspect it before retrying."})
+            content: if installed {
+                json!({"error":format!("{error:#}"),"effect":"unknown","instruction":"The target was installed but cleanup or directory durability could not be confirmed. Inspect it before retrying."})
             } else {
                 json!({"error":format!("{error:#}")})
             },
-            uncertain: renamed,
+            uncertain: installed,
         },
     }
 }
@@ -299,7 +418,11 @@ impl Drop for ProcessGroup {
     }
 }
 
-async fn shell(workspace: &Path, args: &Value) -> Result<ToolOutcome> {
+async fn shell(
+    workspace: &Path,
+    args: &Value,
+    write_leases: Option<&[std::sync::Arc<std::fs::File>; 2]>,
+) -> Result<ToolOutcome> {
     let command = string_arg(args, "command")?;
     let seconds = args
         .get("timeout_seconds")
@@ -315,7 +438,31 @@ async fn shell(workspace: &Path, args: &Value) -> Result<ToolOutcome> {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
-    cmd.process_group(0);
+    {
+        use std::os::fd::AsRawFd;
+        cmd.process_group(0);
+        if let Some(leases) = write_leases {
+            let fds = [leases[0].as_raw_fd(), leases[1].as_raw_fd()];
+            // SAFETY: the lease lives through spawn. fcntl is async-signal-safe;
+            // this hook runs only in the fork child and alters only its fd flags.
+            // Parent flags stay CLOEXEC. Ordinary shell descendants retain the
+            // physical stable AND legacy workspace leases if BONE is killed
+            // before they stop. Older executables observe only the legacy lock.
+            unsafe {
+                cmd.pre_exec(move || {
+                    for fd in fds {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags < 0
+                            || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
     let mut child = cmd.spawn()?;
     let _group = ProcessGroup(child.id().context("shell did not start")?);
     let stdout = child.stdout.take().context("missing stdout")?;
@@ -348,14 +495,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let args = json!({"path":"x","content":"one","expected_sha256":null});
         assert!(
-            execute(dir.path(), "write_file", &args)
+            execute(dir.path(), "write_file", &args, None)
                 .await
                 .content
                 .get("error")
                 .is_none()
         );
         assert!(
-            execute(dir.path(), "write_file", &args)
+            execute(dir.path(), "write_file", &args, None)
                 .await
                 .content
                 .get("error")
@@ -363,7 +510,7 @@ mod tests {
         );
         let args = json!({"path":"x","content":"two","expected_sha256":sha256(b"one")});
         assert!(
-            execute(dir.path(), "write_file", &args)
+            execute(dir.path(), "write_file", &args, None)
                 .await
                 .content
                 .get("error")
@@ -398,7 +545,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = std::fs::File::create(dir.path().join("huge")).unwrap();
         file.set_len(512 * 1024 * 1024).unwrap();
-        let outcome = execute(dir.path(), "read_file", &json!({"path":"huge"})).await;
+        let outcome = execute(dir.path(), "read_file", &json!({"path":"huge"}), None).await;
         assert!(
             outcome.content["error"]
                 .as_str()
@@ -413,7 +560,7 @@ mod tests {
         for index in 0..1002 {
             std::fs::File::create(dir.path().join(format!("file-{index}"))).unwrap();
         }
-        let outcome = execute(dir.path(), "list_files", &json!({})).await;
+        let outcome = execute(dir.path(), "list_files", &json!({}), None).await;
         assert_eq!(outcome.content["entries"].as_array().unwrap().len(), 1000);
         assert_eq!(outcome.content["truncated"], true);
     }
@@ -434,10 +581,223 @@ mod tests {
             dir.path(),
             "shell",
             &json!({"command":"printf test; exit 7"}),
+            None,
         )
         .await;
         assert_eq!(out.content["stdout"], "test");
         assert_eq!(out.content["exit_code"], 7);
         assert!(!out.uncertain);
+    }
+
+    #[test]
+    fn external_save_during_preparation_is_not_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.py");
+        std::fs::write(&path, "original").unwrap();
+        let outcome = write_file_prepared(
+            directory.path(),
+            &json!({"path":"source.py","content":"agent replacement","expected_sha256":sha256(b"original")}),
+            |_| Ok(()),
+            |path| {
+                std::fs::write(path, "editor save")?;
+                Ok(())
+            },
+        );
+        assert!(!outcome.uncertain);
+        assert!(
+            outcome.content["error"]
+                .as_str()
+                .unwrap()
+                .contains("changed during")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "editor save");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_replacement_with_identical_content_is_detected_by_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.py");
+        std::fs::write(&path, "original").unwrap();
+        let outcome = write_file_prepared(
+            directory.path(),
+            &json!({"path":"source.py","content":"agent replacement","expected_sha256":sha256(b"original")}),
+            |_| Ok(()),
+            |path| {
+                let other = path.with_extension("editor-save");
+                std::fs::write(&other, "original")?;
+                std::fs::rename(other, path)?;
+                Ok(())
+            },
+        );
+        assert!(!outcome.uncertain);
+        assert!(
+            outcome.content["error"]
+                .as_str()
+                .unwrap()
+                .contains("changed during")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+    }
+
+    #[test]
+    fn new_file_creation_does_not_replace_a_target_created_during_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new.py");
+        let outcome = write_file_prepared(
+            directory.path(),
+            &json!({"path":"new.py","content":"agent content","expected_sha256":null}),
+            |_| Ok(()),
+            |path| {
+                std::fs::write(path, "external new file")?;
+                Ok(())
+            },
+        );
+        assert!(!outcome.uncertain);
+        assert!(outcome.content["error"].is_string());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "external new file");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn new_file_directory_sync_failure_is_unknown_after_the_atomic_create() {
+        let directory = tempfile::tempdir().unwrap();
+        let outcome = write_file(
+            directory.path(),
+            &json!({"path":"new.py","content":"new content","expected_sha256":null}),
+            |_| Err(std::io::Error::other("injected directory sync failure")),
+        );
+        assert!(outcome.uncertain);
+        assert_eq!(outcome.content["effect"], "unknown");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("new.py")).unwrap(),
+            "new content"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn write_hash_rejects_an_oversized_existing_file_before_loading_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("growing.log");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(512 * 1024 * 1024)
+            .unwrap();
+        let outcome = write_file(
+            directory.path(),
+            &json!({"path":"growing.log","content":"replacement","expected_sha256":"previous-hash"}),
+            |_| Ok(()),
+        );
+        assert!(!outcome.uncertain);
+        assert!(
+            outcome.content["error"]
+                .as_str()
+                .unwrap()
+                .contains("16 MiB")
+        );
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 512 * 1024 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper for the killed-parent lease test"]
+    fn inherited_lease_shell_helper() {
+        use fs2::FileExt;
+        let directory =
+            std::path::PathBuf::from(std::env::var_os("BONE_TOOL_LEASE_TEST_DIR").unwrap());
+        let lease = std::sync::Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(directory.join("lease.lock"))
+                .unwrap(),
+        );
+        lease.try_lock_exclusive().unwrap();
+        let legacy = std::sync::Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(directory.join("legacy.lock"))
+                .unwrap(),
+        );
+        legacy.try_lock_exclusive().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(execute(
+            &directory,
+            "shell",
+            &json!({"command":"printf ready > shell.started; sleep 2; printf finished > shell.finished","timeout_seconds":10}),
+            Some([lease, legacy]),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killed_parent_does_not_release_the_frontground_shells_physical_lease() {
+        use fs2::FileExt;
+        use std::process::{Command, Stdio};
+        let directory = tempfile::tempdir().unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(directory.path().join("lease.lock"))
+            .unwrap();
+        let legacy = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(directory.path().join("legacy.lock"))
+            .unwrap();
+        let mut parent = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::tests::inherited_lease_shell_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("BONE_TOOL_LEASE_TEST_DIR", directory.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !directory.path().join("shell.started").exists() {
+            if started.elapsed() > Duration::from_secs(5) {
+                let _ = parent.kill();
+                let _ = parent.wait();
+                panic!("shell helper did not start");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+        // This is the exact kernel lock check used when recovering a write.
+        assert_eq!(
+            lock.try_lock_exclusive().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            legacy.try_lock_exclusive().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let stopped = std::time::Instant::now();
+        loop {
+            if lock.try_lock_exclusive().is_ok() && legacy.try_lock_exclusive().is_ok() {
+                break;
+            }
+            assert!(
+                stopped.elapsed() < Duration::from_secs(5),
+                "orphan shell did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("shell.finished")).unwrap(),
+            "finished"
+        );
+        FileExt::unlock(&lock).unwrap();
+        FileExt::unlock(&legacy).unwrap();
     }
 }

@@ -68,9 +68,221 @@ billable. A scripted-server pass demonstrates protocol and runtime behavior,
 not model quality or an efficiency gain. Efficiency conclusions require the
 actual recorded paired runs, including their failures.
 
+## Long, multi-turn task gate
+
+`fixtures/long_task/task.json` specifies twelve successive inputs for one saved
+Session. The task builds a five-file Python ledger: normalized records, exact
+integer cents, idempotent writes, batch rollback, a revised UTC timestamp rule,
+account queries, stable CSV and a CLI with deferred dry-run support. Explanation
+turns require unchanged files. A natural pause is followed by continuation in a
+new CLI process. The final verifier stays outside the agent workspace.
+
+```sh
+# Inspect the twelve inputs; no requests.
+python3 -B scripts/long_task.py
+
+# Use a copied binary and a dedicated data directory with a chosen profile.
+python3 -B scripts/long_task.py --run --bone /absolute/path/to/frozen-bone \
+  --data-dir /absolute/path/to/data --profile subscription \
+  --output-dir /absolute/path/to/new-results
+```
+
+Default limits are 48 calls per input, 32,000 serialized context characters,
+300 seconds per turn and three parallel actions. The gate requires at least two
+actual summary events. It fingerprints the binary, configuration, task and
+independent verifier; changing any during the run stops further requests.
+
+Each round retains stdout, stderr, original event history, independent checks
+and file-hash comparison outcomes. Model quality failures, execution failures, kernel invariants
+and missing coverage are reported separately. A delivered answer alone is not a
+passing result. Unknown costs remain `null`. Failed rounds are retained even if
+a later turn fixes the code; an explicit correction is reported separately.
+
+`tests/long_session.rs` drives the same public Session API and actual CLI against
+a local scripted native provider. It tests repeated compaction and reopening,
+exact dependency replies, handoff and changed instructions, natural pause
+completion, and a real parent-process hard kill while its shell is still alive.
+Private-module fault tests additionally inject transaction failure and populate
+large durable transcripts. Their purpose is runtime correctness; they do not
+measure real-model task success.
+
+### First live long-session run: a preserved memory failure
+
+The first frozen hardening binary
+`1f9b7b54fdf1f1f63ae4c68e8c079554fc34245b79ee752757415f5872ef0633`
+ran all twelve inputs with `chatgpt:gpt-6-luna` using the existing Codex login.
+The fixed limits above were unchanged. It made 104 model calls, reported 442,990
+input and 27,464 output tokens (470,454 total), emitted eleven summaries, and
+took 807.72 seconds. Cost was unreported.
+
+The complete gate **failed**. All control outcomes, file checks and final nine
+code checks passed, but round six failed the deferred-work requirement: its
+answer did not recover the original CSV and dry-run commitments. The first
+summary retained both; the second reduced them to generic export/CLI work.
+Recovery then traversed mixed audit pages without reaching the original inputs.
+Reading summary events returned raw SDK JSON whose first page was occupied by
+covered IDs and encrypted reasoning, rather than readable summary text. The
+original instructions were still present in SQLite.
+
+The progress display originally printed only the code verifier's boolean as
+`checks_passed`; that did not include the deferred-work check. Its final result
+correctly marked the run failed. The display was subsequently changed to show
+the separate checks and their combined result. The failed measurements and
+original answer remain in [trial-1-result.json](results/2026-09-30-long-session/trial-1-result.json),
+[trial-1-rounds.jsonl](results/2026-09-30-long-session/trial-1-rounds.jsonl), and
+[trial-1-memory-failure.json](results/2026-09-30-long-session/trial-1-memory-failure.json).
+
+The resulting correction uses the existing history tool and input index:
+user-input-only pagination, readable event text by default, raw JSON on explicit
+request, and summary instructions that preserve precise unfulfilled commitments
+without copying the whole ID index. It adds no memory service or task layer.
+
+A supplementary review also checked raw timestamps with surrounding whitespace,
+an edge not covered by the frozen verifier. The generated code accepted and
+trimmed them. An explicit followup in the same Session required rejecting that
+raw format. On the same first binary, four additional calls (22,194 tokens,
+33.00 seconds, unknown cost) produced a correction passing twelve supplementary
+checks and the original nine checks. This is reported separately, not used to
+change the first run's failed outcome. Evidence is in
+[supplemental-review.json](results/2026-09-30-long-session/trial-1-supplemental-review.json)
+and [explicit-timestamp-followup.json](results/2026-09-30-long-session/trial-1-explicit-timestamp-followup.json).
+
+Raw output, histories and generated workspaces are retained locally at
+`/Users/zzhang/.bone/acceptance/2026-09-30-long-session-ecnv0gdn`.
+`strict-timestamp-followup/workspace-before` preserves the original twelve-turn
+final files; `trial-1/workspace` includes the subsequent explicit correction.
+
+### Second live run: old queued input and current assignment
+
+The second frozen binary
+`f277303015bd9a94e62ad71ef0896abae8836fa609b29b02db4ae9f284a30b9a`
+ran the same twelve inputs, model, limits, task and verifier. The complete gate
+again **failed**: the first model request failed with an HTTP transport error,
+and rounds five through twelve retained one functional defect, missing strict
+UTC timestamp validation. The final external result was eight of nine checks.
+There were 75 calls, nine summaries and 655.02 seconds of execution. The known
+successful calls reported 293,463 tokens; because the first request's usage is
+unknown, aggregate token fields and cost remain `null`.
+
+The failed first input remained queued and pinned verbatim: it asked for
+inspection without edits. In round five, the model answered that older task
+instead of implementing the current UTC requirement. Runtime records identified
+the correct current input, but the native user messages did not label their
+input IDs or active/queued status. This is an observed task-following failure
+with contextual ambiguity, not proof that the scheduler selected the wrong ID.
+
+The correction adds a derived identity text part to each native input, matching
+the preamble's active ID and distinguishing queued, historical and shared
+inputs. Original message parts and provider fields remain unchanged. A
+regression covers the failed read-only input beside the newer edit request.
+Round six answered CSV/dry-run correctly, but its original input was still
+pinned; that result alone cannot establish recovery from compressed history.
+
+All control and ownership checks, no-write phases and file boundaries passed
+apart from the first transport failure. Eight later quality-failure records
+refer to the same UTC gap. Evidence:
+[result](results/2026-09-30-long-session/trial-2-result.json),
+[rounds](results/2026-09-30-long-session/trial-2-rounds.jsonl), and
+[independent review](results/2026-09-30-long-session/trial-2-review.json).
+
+### Focused continuation on the original failed Sessions
+
+The third frozen binary
+`cfbb414a09e20eb64061629e105cff4164ad9c63ee582b0ba4eb2d7c3277147f`
+was tested on the original saved Sessions with the same model and execution
+limits. These are explicit continuation checks, not replacement twelve-turn
+trials or a controlled efficiency comparison.
+
+| Continuation | Calls | Reported tokens | Seconds | Additional summaries | External result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Recover original deferred requirements in trial one | 21 | 88,321 | 120.02 | 2 | CSV/dry-run recovered with valid sources; unchanged files; 9/9 code checks |
+| Correct UTC validation in trial two | 8 | 31,647 | 72.64 | 1 | Current edit completed; 9/9 original code checks |
+
+Before the memory check, all Jobs had empty active/inbox slots, the first two
+inputs had already delivered, both were absent from the hot history, and twelve
+summary events existed. The new prompt supplied neither the CSV nor dry-run
+answer. The model used user-input pagination and read the complete first
+original input from SQLite. Its six final source IDs and revisions were valid,
+and it distinguished the deferred features from details supplied later.
+No write action started and all file hashes were unchanged.
+
+This did not show perfect retrieval efficiency: the second input was only
+previewed, not read in full, and four incorrectly copied CLI event IDs produced
+lookup errors before the model recovered the correct ID. A further summary
+occurred before the full original-input read and another after it. The result
+demonstrates cold-history recovery, not that summaries retain every detail or
+that the model never needs to recover from its own retrieval mistakes.
+
+The UTC correction supplied the concrete independent failures and explicitly
+requested implementation, also clarifying that raw timestamp whitespace must
+be rejected. The same Session still contained the original queued read-only
+input. The new input completed and the original nine external checks passed.
+Independent supplementary probes rejected five invalid timestamp forms across
+library add/write/read and the CLI (20 checks), preserved the tested data bytes,
+and left workspace hashes unchanged. Only `ledger/storage.py` changed during the
+model's correction. The probe script remains at `utc-focused/probe.py`; its
+[case results](results/2026-09-30-long-session/utc-focused-supplemental-probe.json)
+are retained here.
+
+Neither focused result changes the failed status of its original full trial;
+this is evidence for continuation and correction, not an autonomous success-rate
+claim. Costs remain unknown. The pre-correction trial-two workspace is retained
+at `utc-focused/workspace-before` under the local artifact directory.
+
+Compact continuation evidence is retained alongside the original trials:
+[memory result](results/2026-09-30-long-session/memory-focused-result.json),
+[memory review](results/2026-09-30-long-session/memory-focused-review.json),
+[UTC result](results/2026-09-30-long-session/utc-focused-result.json), and
+[UTC review](results/2026-09-30-long-session/utc-focused-review.json).
+
 ## Validation status
 
-Observed offline validation:
+### Long-session hardening (2026-09-30)
+
+Offline gates passed after the hardening, history-retrieval, input-identity and credential-lock changes: 97 Rust checks (including
+three compile-fail API boundary checks), five Python harness checks,
+`cargo fmt --check`, Clippy with warnings denied, and the all-features compile
+check. One ignored Rust entry is a subprocess helper explicitly executed by its
+passing hard-kill parent test, not an omitted acceptance scenario. The final
+suite includes the independent oversized-context and cross-Job
+original-requirement retrieval tests.
+
+After the third binary's live checks, final code review found that changing
+`HOME` while pointing `CODEX_HOME` at the same login source could split credential
+locks. The existing OS-user-home helper now serves both workspace and credential
+lock locations; reuse holds a stable lock plus the current legacy HOME lock,
+deduplicating canonical directory aliases. Three synthetic regressions cover
+different legacy locations sharing the stable lock, alias deduplication, and
+cancelling a new caller while an older caller holds the legacy lock. This final
+lock-location correction received offline validation and independent code
+review; it made no additional live requests. The third binary's metrics remain
+attributed to its recorded hash, not to this later source change.
+
+The working-set stress test seeds 2,200 large native events (10,572,657 bytes of
+original event data), then summarizes and reopens four times. Serialized
+resident event data stays about 0.91–0.93 MB; the original records remain
+retrievable. This measures cached event data, not process RSS or a constant
+memory bound. A separate test opens 80 Idle/Closed Jobs with 100 KB source
+bodies and retains less than 100 KB of serialized event cache.
+
+Fault checks cover a completion-transaction failure followed by reopening,
+legacy unknown-write markers, current and legacy locks held by a foreground
+shell after its owner is killed, and rejection of reconciliation or competing
+writes until that shell exits. A recovery test interrupts between input
+preparation and model start to verify that an older shared correction remains
+visible. A natural-pause regression drives the runtime after the next answer
+to ensure the old pause cannot trigger again.
+
+Two default 32 KiB file results exceed the 32,000-character request limit in the
+oversized-context fixture. It verifies a real summary, native call/result
+pairing, actual `job_inspect` pagination, eventual delivery, and both original
+SQLite records. The fallback was already implemented when this independent
+integration test ran; the integration result is a post-fix validation, not a
+recorded pre-fix failure.
+
+### Initial rebuild baseline
+
+Observed offline validation before the long-session hardening:
 
 - Final macOS checks passed: `cargo fmt --check`, Clippy with warnings denied,
   all 65 Rust tests, and `cargo check --locked --all-features`. The latter
