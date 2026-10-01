@@ -1,0 +1,44 @@
+{
+  "code_commit": "86c68c1f8efc28fc05381b14e2dee3e2dc58a554",
+  "branch": "codex/bone-rebuild",
+  "binary": "/Users/zzhang/Documents/ChatGPT/BONE/target/debug/bone",
+  "frozen_binary": "/Users/zzhang/.bone/acceptance/2026-10-01-flagship-core/final-product/bone",
+  "binary_sha256": "6cff37eef89365324bf3de4940cc4712659a906600bf54d5ef80fb30f4d70ba5",
+  "code_files": {
+    "src/config.rs": "85ff6716eff2e9af973997d9852855fdbebe843ab5e07e84c7a834945abdb8a5",
+    "src/context.rs": "f706ae359a82b770960afddc1f59cbc2a1718c6094fb63a6be844221a0e5d53e",
+    "src/lib.rs": "552fbb91655c2d5459bfd8c34f821b53ea0640abfa1674ca9a3ad846f367485e",
+    "src/main.rs": "44397d21d5d2978e479cee29bed06787375cf4099f70406cee49520974abed45",
+    "src/model.rs": "77d12bac14bf6a4b5fb243e93140ac681b7e518b0d12142d7d0ff21537b142dd",
+    "src/runtime.rs": "570987988db6129e9fbd24979f1f53dedca651c739dab504698b88c72a7a1777",
+    "src/state.rs": "e28b81f6af68cd9182702d8d08ecd4493cb428561d929f36d75ca3618e7f306d",
+    "src/store.rs": "1e2fbf4da1ff285ae1cff1a8ed3aeb1f11237d07f2f5241ef156b5e258d0d76c",
+    "src/tools.rs": "4cba73f6990676e6f799db4e56ceab0e459083c559e5dd23e653a97dd1b1593a"
+  },
+  "native_tool_names": [
+    "read_file",
+    "search_files",
+    "list_files",
+    "job_inspect",
+    "ask_user",
+    "input_resolve",
+    "pause_work",
+    "edit_file",
+    "write_file",
+    "shell",
+    "job_send",
+    "job_wait",
+    "job_handoff",
+    "job_close",
+    "job_control"
+  ],
+  "runtime_context_state_store_model_config_match_live_candidate_runner": true,
+  "product_tool_implementation": "Sol-assisted, independently 27/27 verified; model candidate retained separately",
+  "default_features_build": true,
+  "live_model": "chatgpt:gpt-6-luna",
+  "credentials": "existing Codex subscription read-only; no credential copied into artifacts",
+  "build_files": {
+    "Cargo.toml": "79d0b5b3d2a9b5ad5b4b92fd1be6253adca1e5013a8c7bc59b4477fe3eb55f7d",
+    "Cargo.lock": "91c2619f27d8f02a97f75513e6f95535297613866d73f8493bce548d6a2c6f75"
+  }
+}

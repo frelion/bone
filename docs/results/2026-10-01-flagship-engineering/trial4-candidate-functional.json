@@ -1,0 +1,160 @@
+{
+  "passed": false,
+  "passed_count": 24,
+  "total": 27,
+  "binary_sha256": "769d5dc51440b8a13ad32fda3027eb75fd2b6636826e66044b9451ff24d51040",
+  "verifier_sha256": "edcc07f9c664e6012ceb5cc0eccdf1725f59d09f5126cb4c4492d8a77c2bdc19",
+  "checks": [
+    {
+      "name": "literal_occurrences_raw_hash_line_order",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "cursor_full_walk_limit_changes",
+      "passed": false,
+      "error_excerpt": "{'error': 'invalid or forged search cursor'}"
+    },
+    {
+      "name": "default50_and_max200",
+      "passed": false,
+      "error_excerpt": "{'matches': [{'byte_offset': 0, 'line': 1, 'path': 'many.txt', 'sha256': '0edff5f696d3312467d26798f50fde215f5f8f9d9b531feb9b49ee62e2f63e6b', 'snippet': 'needle\\nneedle\\nneedle\\nnee"
+    },
+    {
+      "name": "output_snippet_bound_and_progress",
+      "passed": false,
+      "error_excerpt": "{'error': 'invalid or forged search cursor'}"
+    },
+    {
+      "name": "binary_generated_symlinks_skipped",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "empty_query",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "search_limit_0",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "search_limit_201",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "search_limit_-1",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "search_bad_path_../outside",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "search_bad_path_/tmp",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "search_bad_path_escape",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "search_bad_path_alias.txt",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "invalid_cursor",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "cursor_query_path_binding_and_source_change",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "edit_original_non_cascading_CRLF_unicode_mode",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "edit_rejected_missing",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "edit_rejected_duplicate",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "edit_rejected_overlap",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "edit_rejected_second_invalid_atomic",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "edit_rejected_empty_old",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "edit_rejected_empty_array",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "edit_stale_hash",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "edit_readonly_denied",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "edit_path_and_type_rejections",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "legacy_write_file_compatibility",
+      "passed": true,
+      "error_excerpt": null
+    },
+    {
+      "name": "cli_native_tool_catalog_policy_no_profile_no_session",
+      "passed": true,
+      "error_excerpt": null
+    }
+  ],
+  "raw_result": "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial4-summary-fix/candidate-functional/result.json",
+  "raw_result_sha256": "13be8d07d945f22160368846fd31f78453a753d866c76d394f75237c4c439963",
+  "source_manifest": {
+    "base": "aec1fa33c3b27817cbf05772ad8e340761698b38",
+    "patch_sha256": "3b87ca6470f3d619ff97d2ae282635e64a1b373f2824d5d2164126364d50a6ec",
+    "files": {
+      "README.md": "288a9f2e5cf3c4b0b08ba6528a69c2aa8b307504ac91f0dbcdfcfffdb725a738",
+      "src/lib.rs": "b9cf95b697382fc3dee8efdb7a94f4df788de6aabe8d9e8ad835cbb360904084",
+      "src/main.rs": "940e4ef88f9d542153b7296a1787e69b64296cdce91b5f576a8e5f2dad3545dc",
+      "src/tools.rs": "84e114ba54dc2293eca17815ecb1cb6c126673c7f615c6cdd18d6d5ae5bdca6b",
+      "tests/acceptance.rs": "01cfa0c53b875ebdd90a59ebc5135563d23aa3e1074159a47634fdedec3db9e0"
+    },
+    "source": "BONE autonomous candidate; no Sol source integrated; preserved original time cap and summary interventions",
+    "binary_sha256": "769d5dc51440b8a13ad32fda3027eb75fd2b6636826e66044b9451ff24d51040"
+  },
+  "verdict": "FAIL: model-generated candidate, before external functional feedback"
+}

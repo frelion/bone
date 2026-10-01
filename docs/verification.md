@@ -20,12 +20,12 @@ task, failed attempt, independent verdicts, call ownership, unknown usage and
 coverage limits. This is one real repository feature, not evidence of general
 long-task reliability or an alternating performance ablation.
 
-## Flagship core work in progress (2026-10-01)
+## Flagship core engineering delivery (2026-10-01)
 
 The [current report](results/2026-10-01-flagship-engineering/README.md) preserves
 three failed search/edit engineering attempts, the native instruction/template
-and summary authority fixes, and the larger-context continuation. An unfinished
-live gate is not a passing result. Queued-input settlement, failed-descendant
+and summary authority fixes, and the larger-context continuation. The original
+time-capped gate remains failed. Queued-input settlement, failed-descendant
 recovery and fresh-tool-result consumption have separate public API and fault
 regressions.
 
@@ -37,6 +37,31 @@ helper ignored), formatting, all-target Clippy, all-features compilation and
 the CLI build. These checks establish tool/runtime contracts, not autonomous
 success by the real model. The implementation adds no scheduler or durable
 state abstraction; source search and edits still execute only inside a Job.
+
+The real-model candidate subsequently completed all ten conversational phases,
+including a true cold-original lookup, persistent natural pause, new-process
+continuation and settlement of the older inputs. Its first external functional
+verdict was 24/27, and the requested real-workspace tool demonstration was still
+missing. Explicit functional feedback produced 27/27; a later compiler diagnostic
+removed one unused local binding. The full candidate test run passed 126 tests
+with one ignored helper; final formatting and all-target/all-feature Clippy
+passed. These interventions are recorded rather than attributed to the first
+delivery.
+
+A final native Job demonstration used the candidate's own generated tools to
+search actual repository source, verify a whole-file hash, create a temporary
+file, perform a non-cascading guarded edit, read back the exact result and remove
+the temporary file. Source hashes were unchanged. The runtime, context, store,
+state, model and configuration modules of this runner match the delivered core
+byte-for-byte; only the previously verified summary patch was added to the
+candidate source in a private build copy. No Sol tool implementation was injected.
+
+The cumulative Session used 164 model calls and 2001.40 active seconds, including
+the failed calls and supplemental recoveries. Final input queues and unknown
+writes were empty. Three failed calls lack complete usage, so total token usage
+and cost remain unknown. The independent final review distinguishes corrected
+delivery success from the preserved original failure. This one repository task
+does not establish arbitrary-task reliability or a new statistical ablation.
 
 ## Scenario fixtures
 

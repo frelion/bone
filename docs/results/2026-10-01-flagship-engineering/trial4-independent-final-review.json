@@ -1,0 +1,138 @@
+{
+  "original_gate_verdict": "FAIL_time_cap",
+  "supplementary_coverage_pass": true,
+  "overall_engineering_gate_pass": false,
+  "unmet_phase9_obligation": "Repository source search plus Engine/Job exact edit of self-created temporary example not demonstrated; phase9 and phase10 explicitly admit this. Offline evaluator tests are not a substitute.",
+  "functional_verdict": {
+    "passed": false,
+    "passed_checks": 24,
+    "total_checks": 27,
+    "binary_sha256": "769d5dc51440b8a13ad32fda3027eb75fd2b6636826e66044b9451ff24d51040",
+    "failed_checks": [
+      "cursor_full_walk_limit_changes",
+      "default50_and_max200",
+      "output_snippet_bound_and_progress"
+    ]
+  },
+  "historical_phase3_failure_rounds_preserved": 2,
+  "model_starts": 128,
+  "completed_summaries": 9,
+  "active_wall_seconds": 1811.1037113329999,
+  "all_job_readonly_pass": true,
+  "phase5": "Verified original lookup while original queued/pinned; not cold recovery.",
+  "phase10": {
+    "original_evicted_before_post": true,
+    "read_pages": [
+      {
+        "id": "bb989ea9-d770-4ac4-89d0-1e938495cf1b",
+        "offset": 0,
+        "next_offset": 3984,
+        "chars": 3984
+      },
+      {
+        "id": "5e3619c2-e39b-491f-9c25-619103c95035",
+        "offset": 3900,
+        "next_offset": null,
+        "chars": 1096
+      },
+      {
+        "id": "63ad2e85-da03-49ff-95fa-5c697d0a43d4",
+        "offset": 0,
+        "next_offset": 3984,
+        "chars": 3984
+      }
+    ],
+    "three_original_commitment_spans": {
+      "编辑只匹配原文件而不级联": true,
+      "搜索hash覆盖完整文件": true,
+      "read-only仍能源码搜索": true
+    },
+    "answer_references_original": true
+  },
+  "settlements": [
+    {
+      "event_id": "ce6fd2e0-e3d7-4005-9e86-6bfdf22cfc80",
+      "input": "1edd8802-205f-45b3-b81e-8216bebbf413",
+      "actor_input": "de02ebab-5751-493e-bbf0-f9ea718dae51",
+      "phase": 8,
+      "outcome": "completed",
+      "reason": "搜索、局部编辑及其安全/分页测试和文档，加上本次 CLI 发现实现与 Engine 回归，已完成完整原契约。",
+      "evidence_event_ids": [],
+      "revision": 18,
+      "further_model_starts": []
+    },
+    {
+      "event_id": "ce5504ed-b695-4e75-be46-e81064ff011b",
+      "input": "23d921fa-08e8-46a6-9d3d-4088c81a554e",
+      "actor_input": "de02ebab-5751-493e-bbf0-f9ea718dae51",
+      "phase": 8,
+      "outcome": "superseded",
+      "reason": "后续 ACTIVE 指令明确要求完成此前暂缓的工具发现 CLI，本阶段暂缓安排已被覆盖。",
+      "evidence_event_ids": [],
+      "revision": 18,
+      "further_model_starts": []
+    }
+  ],
+  "settlement_reason_review": "Initial completed at phase8 is model-reported settlement and mechanism success, not factual correctness guarantee: frozen external suite later failed3/27 search pagination/bounds/progress cases. Clarification superseded by newer explicit CLI instruction is reasonable. Original gate remains FAIL; supplementary coverage does not establish delivery success.",
+  "old_stop_model_replay": [],
+  "final_jobs": [
+    {
+      "id": "fae547e8-c446-4c9d-a910-7797c065c014",
+      "state": "Idle",
+      "active_input": null,
+      "inbox": []
+    }
+  ],
+  "final_pending_inputs": [],
+  "unknown_writes": {},
+  "original_budgets": {
+    "1edd8802-205f-45b3-b81e-8216bebbf413": {
+      "calls_used": 2,
+      "max_calls": 48,
+      "jobs_used": 0,
+      "max_jobs": 16
+    },
+    "23d921fa-08e8-46a6-9d3d-4088c81a554e": {
+      "calls_used": 9,
+      "max_calls": 48,
+      "jobs_used": 0,
+      "max_jobs": 16
+    },
+    "74dbed23-a040-47e0-82d2-d34ee46a475a": {
+      "calls_used": 41,
+      "max_calls": 48,
+      "jobs_used": 0,
+      "max_jobs": 16
+    }
+  },
+  "model_tool_ownership_errors": [],
+  "usage": {
+    "calls_with_usage": 125,
+    "calls_missing_usage": [
+      {
+        "id": "1e19d25d-b05d-482d-a76f-d4d9a9779596",
+        "call_id": "9862011a-6f15-4c20-8401-ccb9f2ba9b38",
+        "purpose": "summary",
+        "input": "74dbed23-a040-47e0-82d2-d34ee46a475a"
+      },
+      {
+        "id": "b37b5f5c-6644-4490-8032-5b119b0c6499",
+        "call_id": "b1694353-b856-4b4a-81cd-eb6ddf11b274",
+        "purpose": "summary",
+        "input": "74dbed23-a040-47e0-82d2-d34ee46a475a"
+      },
+      {
+        "id": "bf5efcca-736d-49a1-a4d0-328f85f3eae2",
+        "call_id": "7e1eed70-f800-4dae-bee8-a8079b46f666",
+        "purpose": "summary",
+        "input": "74dbed23-a040-47e0-82d2-d34ee46a475a"
+      }
+    ],
+    "observed_input_tokens": 2005927,
+    "observed_output_tokens": 33283,
+    "full_total_tokens": null,
+    "cost": null,
+    "missing_usage_not_zero": true
+  },
+  "stop_replay_boundary": "after native input_paused, excludes the model call that legitimately executes pause_work"
+}

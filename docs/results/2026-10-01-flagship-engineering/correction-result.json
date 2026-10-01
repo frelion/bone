@@ -1,0 +1,31 @@
+{
+  "original_gate_verdict": "FAIL_time_cap",
+  "exit_code": 0,
+  "limit_reason": null,
+  "valid_receipt_identity": true,
+  "completed": true,
+  "receipt": {
+    "input_id": "9f5b93ba-7aea-4675-9a81-cb94185044ac",
+    "metrics": {
+      "cost": null,
+      "elapsed_ms": 119700,
+      "input_tokens": 350439,
+      "model_calls": 19,
+      "observed_input_tokens": 350439,
+      "observed_output_tokens": 3682,
+      "output_tokens": 3682,
+      "total_tokens": 354121
+    },
+    "question_id": null,
+    "session_id": "3f17c0e6-00e1-450a-8953-bfd351b666cc",
+    "status": "completed",
+    "text": "已修复 `search_files` 的跨进程游标校验：改用稳定的 SHA-256 完整性标签，不再依赖进程内随机密钥；现有游标对查询、路径、排除目录和源文件内容的校验仍保留。\n\n针对短行分页，结果 snippet 改为只包含匹配文本，避免重复上下文过早耗尽输出额度。新增回归验证了 300 行输入首批返回 200 条、结果不超过 32768 字节，并可用第一页游标请求下一页；游标篡改、查询或路径不匹配及源文件变更的既有回归也通过。\n\n相关两项定向测试通过，未提交或推送。本轮没有执行真实源码搜索或临时示例编辑演示；这些仍留待下一轮。",
+    "unknown_writes": {}
+  },
+  "wall_seconds": 119.817649,
+  "active_wall_seconds": 1930.921360333,
+  "model_starts": 147,
+  "new_model_starts": 19,
+  "unknown_writes": {},
+  "cost": null
+}

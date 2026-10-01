@@ -1,0 +1,34 @@
+{
+  "source_patch_sha256": "1d071633c42d42a83d81142b711859bf86ba4357f8bdecb03610fc26ee3d60f0",
+  "commands": [
+    {
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ],
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "log": "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-lint-correction/independent-clippy.log",
+      "log_sha256": "d7dae192715495fa89ccbe279af3efb9792c1dae1768228e369035e68a1df673"
+    }
+  ],
+  "prior_complete_tests": {
+    "passed": 126,
+    "ignored": 1,
+    "source_delta_since_test": "only removal of an unused local binding; verified exact source equality otherwise"
+  },
+  "prior_functional_verdict": "27/27 before the same nonfunctional binding removal"
+}

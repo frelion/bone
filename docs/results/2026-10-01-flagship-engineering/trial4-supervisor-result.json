@@ -1,0 +1,17 @@
+{
+  "exit_reason": "completed_phases_7_10",
+  "completed_phases_7_10": true,
+  "full_coverage_passed": true,
+  "model_starts": 128,
+  "active_wall_seconds": 1811.1037113329999,
+  "fingerprint": {
+    "runner_sha256": "848e32fb2068c153e83859560da6ebebdb4a277fee420b6a40943a7b13bda9d8",
+    "config_sha256": "a8ae34936d85ddd5881ab0658974e7f954cdd28ef0ff36a6ba8b693358580aee",
+    "gate_manifest_sha256": "a76669c65b5e5e3d8aace8cfbde599af1aeb751f3e53fd5bfa3b7bba6f5dc36c",
+    "supervisor_sha256": "48e50641a7c4159cea748fce539a2b4165b42c32af9e4bd7651b8ace57aefb16",
+    "session_id": "3f17c0e6-00e1-450a-8953-bfd351b666cc"
+  },
+  "records": "records.json",
+  "coverage": "coverage.json",
+  "configuration_unchanged": true
+}

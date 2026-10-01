@@ -1,0 +1,15 @@
+{
+  "base": "aec1fa33c3b27817cbf05772ad8e340761698b38",
+  "patch_sha256": "8f2b5e9894a7cc6be49051c7dfc0ab708a0ed303a202614321915fa0a4659be5",
+  "files": {
+    "README.md": "288a9f2e5cf3c4b0b08ba6528a69c2aa8b307504ac91f0dbcdfcfffdb725a738",
+    "src/lib.rs": "b9cf95b697382fc3dee8efdb7a94f4df788de6aabe8d9e8ad835cbb360904084",
+    "src/main.rs": "940e4ef88f9d542153b7296a1787e69b64296cdce91b5f576a8e5f2dad3545dc",
+    "src/tools.rs": "056287063ebf02fbb7f4d369efafbaf54bdf3ad3101591c42c1b6e8b4fc6241f",
+    "tests/acceptance.rs": "01cfa0c53b875ebdd90a59ebc5135563d23aa3e1074159a47634fdedec3db9e0"
+  },
+  "feedback_provided": true,
+  "implementation_code_provided": false,
+  "source": "BONE candidate after explicit external failure feedback",
+  "binary_sha256": "fe7198e3f94583da8a28614f276c5087b68524aab656e38fbffd5cbdaf308f19"
+}

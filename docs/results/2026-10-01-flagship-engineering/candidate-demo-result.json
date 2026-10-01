@@ -1,0 +1,217 @@
+{
+  "kind": "supplementary_candidate_tool_demo_not_original_verdict",
+  "prior_artifact": "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-lint-correction",
+  "original_failures_preserved": true,
+  "session_id": "3f17c0e6-00e1-450a-8953-bfd351b666cc",
+  "input_id": "37b6f66c-7a98-446a-87d0-c400bd7c3843",
+  "exit_code": 0,
+  "limit_reason": null,
+  "signals": [],
+  "receipt": {
+    "input_id": "37b6f66c-7a98-446a-87d0-c400bd7c3843",
+    "metrics": {
+      "cost": null,
+      "elapsed_ms": 44627,
+      "input_tokens": 126505,
+      "model_calls": 11,
+      "observed_input_tokens": 126505,
+      "observed_output_tokens": 1192,
+      "output_tokens": 1192,
+      "total_tokens": 127697
+    },
+    "question_id": null,
+    "session_id": "3f17c0e6-00e1-450a-8953-bfd351b666cc",
+    "status": "completed",
+    "text": "演示已完成。检索到 `src/runtime.rs` 中 `fn start_model` 位于第 1119 行、byte offset 41187；文件 SHA-256 为 `fda8ff3d7f95965ce902e138100ccd8ffd8ce7427596127a59fbd148c9a58874`，已读取核对原文。\n\n临时文件原始内容为 `alpha\\nbeta\\n`，SHA-256：`e49c81e2d2f84e259d40e2fb8192f3bcd198b355184845d76d8f58807d0d78ee`；批量编辑并核实后内容为 `beta\\ngamma\\n`，SHA-256：`aa5989aacb57830a365b63654addd2b3e7427ce3e8869f52e261ac98cc318734`。清理命令执行成功（退出码 0）。\n\n本轮仅为工具演示，不代表此前失败验收或其他工程需求已通过。",
+    "unknown_writes": {}
+  },
+  "model_starts": 164,
+  "new_model_starts": 11,
+  "wall_seconds": 45.452332708,
+  "active_wall_seconds": 2001.403215833,
+  "checks": {
+    "exact_post_delivery": true,
+    "source_hashes_unchanged": true,
+    "actual_search_full_hash_and_location": true,
+    "exclusive_new_file_created": true,
+    "original_hash_read": true,
+    "native_noncascading_edit_succeeded": true,
+    "final_exact_content_and_hash_read": true,
+    "cleanup_only_shell_succeeded": true,
+    "temporary_file_absent": true,
+    "only_demo_file_write_actions": true,
+    "no_delegation_or_other_tool_actions": true,
+    "all_tool_calls_have_job_and_call_ownership": true,
+    "observed_action_order": true,
+    "exactly_one_new_user_input": true,
+    "same_session": true,
+    "original_events_unchanged": true,
+    "no_calls_for_other_inputs": true,
+    "unknown_writes_empty": true,
+    "global_and_input_call_caps": true,
+    "global_and_phase_time_caps": true,
+    "frozen_runner_and_config_unchanged": true
+  },
+  "demonstration_passed": true,
+  "tool_evidence": [
+    {
+      "event_id": "e6bceb36-485f-4b7d-a73a-9179d11bc7d6",
+      "job_id": "fae547e8-c446-4c9d-a910-7797c065c014",
+      "call_id": "6df1535b-ae00-4fdf-a0c9-253d50e45b59",
+      "name": "search_files",
+      "arguments": {
+        "path": "src/runtime.rs",
+        "query": "fn start_model"
+      },
+      "result_event_ids": [
+        "53eb7ede-db20-4afb-b2e0-84cb217030c8"
+      ],
+      "successful_result": true
+    },
+    {
+      "event_id": "df6aac45-cbba-406d-a235-9fd898f9ffe2",
+      "job_id": "fae547e8-c446-4c9d-a910-7797c065c014",
+      "call_id": "b64e0b4a-31f9-4d55-a37c-0b96887e0d7b",
+      "name": "read_file",
+      "arguments": {
+        "limit": 600,
+        "offset": 41150,
+        "path": "src/runtime.rs"
+      },
+      "result_event_ids": [
+        "cc47ba25-79d1-4af7-89c8-fff5ad9ca37e"
+      ],
+      "successful_result": true
+    },
+    {
+      "event_id": "ea7872fd-9182-4435-870e-a5025bf564de",
+      "job_id": "fae547e8-c446-4c9d-a910-7797c065c014",
+      "call_id": "595ca7b9-bda6-44bd-838a-e587281600df",
+      "name": "write_file",
+      "arguments": {
+        "content": "alpha\nbeta\n",
+        "expected_sha256": null,
+        "path": "bone-demo-a106417dae4f4d1abf9ce6b6609dd30e.txt"
+      },
+      "result_event_ids": [
+        "0fadfd47-a787-48b5-ad56-e77176a1e8cd"
+      ],
+      "successful_result": true
+    },
+    {
+      "event_id": "eb80e7c8-10f4-4a20-b8c9-b7161721560b",
+      "job_id": "fae547e8-c446-4c9d-a910-7797c065c014",
+      "call_id": "94102a92-3e84-450d-9e9a-628c3eba4b2e",
+      "name": "read_file",
+      "arguments": {
+        "path": "bone-demo-a106417dae4f4d1abf9ce6b6609dd30e.txt"
+      },
+      "result_event_ids": [
+        "7e07b8db-3608-4be4-906d-3775157d1ea4"
+      ],
+      "successful_result": true
+    },
+    {
+      "event_id": "50625ccf-317c-4c36-9710-ab39ae471603",
+      "job_id": "fae547e8-c446-4c9d-a910-7797c065c014",
+      "call_id": "203ea5d8-dfa6-43ac-ba38-99875078d3b3",
+      "name": "search_files",
+      "arguments": {
+        "path": "src/runtime.rs",
+        "query": "fn start_model"
+      },
+      "result_event_ids": [
+        "818f2ac9-f1cc-409b-afd5-d3f0399cae38"
+      ],
+      "successful_result": true
+    },
+    {
+      "event_id": "bd149fed-2e77-4a58-a483-97bf811c1132",
+      "job_id": "fae547e8-c446-4c9d-a910-7797c065c014",
+      "call_id": "d10017a1-3ded-4d5e-9643-3e6f25c963f8",
+      "name": "read_file",
+      "arguments": {
+        "limit": 100,
+        "offset": 41187,
+        "path": "src/runtime.rs"
+      },
+      "result_event_ids": [
+        "1a74de91-2407-4a24-a249-388c7f987629"
+      ],
+      "successful_result": true
+    },
+    {
+      "event_id": "8694eddf-b716-4536-b237-e2d0cba07119",
+      "job_id": "fae547e8-c446-4c9d-a910-7797c065c014",
+      "call_id": "50be47b7-692a-4376-9978-25b6e6567e1f",
+      "name": "edit_file",
+      "arguments": {
+        "edits": [
+          {
+            "new_text": "beta",
+            "old_text": "alpha"
+          },
+          {
+            "new_text": "gamma",
+            "old_text": "beta"
+          }
+        ],
+        "expected_sha256": "e49c81e2d2f84e259d40e2fb8192f3bcd198b355184845d76d8f58807d0d78ee",
+        "path": "bone-demo-a106417dae4f4d1abf9ce6b6609dd30e.txt"
+      },
+      "result_event_ids": [
+        "d7e1c1a7-04b4-4862-83ac-ae6cefcbaffd"
+      ],
+      "successful_result": true
+    },
+    {
+      "event_id": "133392ce-ddfa-444e-a29f-ccd12fb30bd2",
+      "job_id": "fae547e8-c446-4c9d-a910-7797c065c014",
+      "call_id": "9cd14a63-553a-443b-8962-f6a2a3a15fb8",
+      "name": "read_file",
+      "arguments": {
+        "path": "bone-demo-a106417dae4f4d1abf9ce6b6609dd30e.txt"
+      },
+      "result_event_ids": [
+        "3eb9b82e-04cd-42dc-9d21-8fb676fdce3d"
+      ],
+      "successful_result": true
+    },
+    {
+      "event_id": "5af885d9-04ef-415f-b735-7e22b70e9f3b",
+      "job_id": "fae547e8-c446-4c9d-a910-7797c065c014",
+      "call_id": "0b22c25e-ceea-4915-b1bc-ec278829017c",
+      "name": "shell",
+      "arguments": {
+        "command": "rm -- bone-demo-a106417dae4f4d1abf9ce6b6609dd30e.txt"
+      },
+      "result_event_ids": [
+        "7d06a961-0088-4c77-af88-5d8840e31089"
+      ],
+      "successful_result": true
+    }
+  ],
+  "verification": {
+    "runtime_sha256": "fda8ff3d7f95965ce902e138100ccd8ffd8ce7427596127a59fbd148c9a58874",
+    "initial_demo_sha256": "e49c81e2d2f84e259d40e2fb8192f3bcd198b355184845d76d8f58807d0d78ee",
+    "final_demo_sha256": "aa5989aacb57830a365b63654addd2b3e7427ce3e8869f52e261ac98cc318734",
+    "search_matches": [
+      {
+        "byte_offset": 41187,
+        "line": 1119,
+        "path": "src/runtime.rs",
+        "sha256": "fda8ff3d7f95965ce902e138100ccd8ffd8ce7427596127a59fbd148c9a58874",
+        "snippet": "fn start_model"
+      },
+      {
+        "byte_offset": 41187,
+        "line": 1119,
+        "path": "src/runtime.rs",
+        "sha256": "fda8ff3d7f95965ce902e138100ccd8ffd8ce7427596127a59fbd148c9a58874",
+        "snippet": "fn start_model"
+      }
+    ]
+  },
+  "unknown_writes": {},
+  "cost": null
+}

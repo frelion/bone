@@ -1,0 +1,39 @@
+{
+  "passed": true,
+  "checks": [
+    {
+      "phase": 2,
+      "input_id": "407097f7-39eb-4bf8-a410-d926f2281ba0",
+      "exercise_status": "exercised",
+      "passed": true,
+      "start_index": 54,
+      "end_index_exclusive": 68,
+      "boundary": "delivery",
+      "boundary_id": "4e20890d-1665-4308-baf5-8051ec600ab5",
+      "violations": []
+    },
+    {
+      "phase": 5,
+      "input_id": "8a06b41b-fa05-4224-9864-693cb1a0b68c",
+      "exercise_status": "exercised",
+      "passed": true,
+      "start_index": 251,
+      "end_index_exclusive": 267,
+      "boundary": "delivery",
+      "boundary_id": "5010cea9-57e1-429c-824e-136c172f4c64",
+      "violations": []
+    },
+    {
+      "phase": 10,
+      "input_id": "af597d40-faca-48c0-ae77-af209acd6237",
+      "exercise_status": "exercised",
+      "passed": true,
+      "start_index": 493,
+      "end_index_exclusive": 542,
+      "boundary": "delivery",
+      "boundary_id": "33c2610f-7593-495e-8aa8-29265b04317b",
+      "violations": []
+    }
+  ],
+  "semantics": "All Jobs; input append order to first later user input or matching delivery. Only new tool_started records count; pre-input starts are excluded even if their results arrive later. Old proposal revision does not authorize a new start after a read-only instruction."
+}

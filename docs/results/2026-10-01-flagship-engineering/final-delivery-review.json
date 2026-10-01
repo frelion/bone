@@ -1,0 +1,121 @@
+{
+  "original_engineering_gate_verdict": "FAIL: original phase3 time cap; first delivered candidate24/27; original phase9 demonstration absent",
+  "corrected_delivery_verdict": "functional27/27 and supplementary real native tool demonstration PASS",
+  "autonomy_attribution": "Model-authored candidate, after scope clarification, multiple explicit supplementary recovery windows, core summary-task fix, external3functionalfailure feedback, compiler unused-binding diagnostic feedback, and detailed demonstration prompt. Not first-delivery success or proof of flagship maturity. Root production uses separately attributed Sol-assisted tool implementation; demonstration uses autonomous candidate tools with only2core summary-fix source deltas.",
+  "checks": {
+    "exact_prior_native_events_unchanged": true,
+    "one_new_public_input": true,
+    "same_session": true,
+    "new_all_model_tool_actions_same_input": true,
+    "actual_search_complete_hash_position": true,
+    "native_read_edit_read_noncascading_hashes": true,
+    "created_exact_source_hash": true,
+    "cleanup_succeeded": true,
+    "demo_file_absent": true,
+    "workspace_source_hashes_unchanged": true,
+    "candidate_tool_bytes_equal_private_runner_source": true,
+    "only_private_extra_source_files": true,
+    "runner_binary_hash_frozen": true,
+    "original_candidate_sources_match_frozen_manifest": true,
+    "final_idle_empty": true,
+    "unknown_writes_empty": true,
+    "global_limits": true,
+    "new_input_limits": true
+  },
+  "model_starts": 164,
+  "active_wall_seconds": 2001.403215833,
+  "new_demo_calls": 11,
+  "new_demo_seconds": 45.452332708,
+  "demo_native_tool_names": [
+    "search_files",
+    "read_file",
+    "write_file",
+    "read_file",
+    "search_files",
+    "read_file",
+    "edit_file",
+    "read_file",
+    "shell"
+  ],
+  "demo_tool_event_ids": [
+    "93dc48b5-3beb-4082-9928-d0ff646f351d",
+    "96b10174-87ce-47e8-aa16-1d97ee176be3",
+    "a4d4864a-16ae-4461-a4fd-2d98704a5c53",
+    "b4e49a89-1921-4ac9-8c1e-ce6fc3e750d7",
+    "7beb4fc0-bb31-4789-90ed-2580150b2ea7",
+    "18d965b2-39a3-4bb4-ada3-f2d3a630f036",
+    "fbf3e1fb-003a-46ce-baef-7ebe4b5b3dc7",
+    "7a5f8849-49e4-485e-9643-c7b61a325748",
+    "ecfcbcf3-78ef-4c62-ac1b-e9f1a24beb18"
+  ],
+  "runtime_full_hash": "fda8ff3d7f95965ce902e138100ccd8ffd8ce7427596127a59fbd148c9a58874",
+  "runtime_match_offset": 41187,
+  "temporary_hash_before": "e49c81e2d2f84e259d40e2fb8192f3bcd198b355184845d76d8f58807d0d78ee",
+  "temporary_hash_after": "aa5989aacb57830a365b63654addd2b3e7427ce3e8869f52e261ac98cc318734",
+  "private_source_extra_files": [
+    "src/context.rs",
+    "src/runtime.rs"
+  ],
+  "functional_binary_sha256": "fe7198e3f94583da8a28614f276c5087b68524aab656e38fbffd5cbdaf308f19",
+  "final_runner_sha256": "036cb8676f4eaa0ef5685912725138dcfb728baffe996c39afcad3d340454419",
+  "functional_to_final_delta": "Root freeze records only unused local text binding removal; independent functional27 result pertains precedingfe7198binary; finalcandidate lint verified separately, not rerun here.",
+  "prior_cold_recall": {
+    "original_evicted_before_post": true,
+    "read_pages": [
+      {
+        "id": "bb989ea9-d770-4ac4-89d0-1e938495cf1b",
+        "offset": 0,
+        "next_offset": 3984,
+        "chars": 3984
+      },
+      {
+        "id": "5e3619c2-e39b-491f-9c25-619103c95035",
+        "offset": 3900,
+        "next_offset": null,
+        "chars": 1096
+      },
+      {
+        "id": "63ad2e85-da03-49ff-95fa-5c697d0a43d4",
+        "offset": 0,
+        "next_offset": 3984,
+        "chars": 3984
+      }
+    ],
+    "three_original_commitment_spans": {
+      "编辑只匹配原文件而不级联": true,
+      "搜索hash覆盖完整文件": true,
+      "read-only仍能源码搜索": true
+    },
+    "answer_references_original": true
+  },
+  "prior_all_job_readonly_pass": true,
+  "prior_settlements": [
+    {
+      "event_id": "ce6fd2e0-e3d7-4005-9e86-6bfdf22cfc80",
+      "input": "1edd8802-205f-45b3-b81e-8216bebbf413",
+      "actor_input": "de02ebab-5751-493e-bbf0-f9ea718dae51",
+      "phase": 8,
+      "outcome": "completed",
+      "reason": "搜索、局部编辑及其安全/分页测试和文档，加上本次 CLI 发现实现与 Engine 回归，已完成完整原契约。",
+      "evidence_event_ids": [],
+      "revision": 18,
+      "further_model_starts": []
+    },
+    {
+      "event_id": "ce5504ed-b695-4e75-be46-e81064ff011b",
+      "input": "23d921fa-08e8-46a6-9d3d-4088c81a554e",
+      "actor_input": "de02ebab-5751-493e-bbf0-f9ea718dae51",
+      "phase": 8,
+      "outcome": "superseded",
+      "reason": "后续 ACTIVE 指令明确要求完成此前暂缓的工具发现 CLI，本阶段暂缓安排已被覆盖。",
+      "evidence_event_ids": [],
+      "revision": 18,
+      "further_model_starts": []
+    }
+  ],
+  "prior_old_stop_replays": [],
+  "final_state_id": "3f17c0e6-00e1-450a-8953-bfd351b666cc",
+  "cost": null,
+  "usage_boundary": "Earlier3summarycalls missing final usage; full cumulative token total unknown, not zero. Demo committed metrics only describe new11calls.",
+  "no_evaluator_model_calls": true
+}

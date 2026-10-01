@@ -1,0 +1,224 @@
+{
+  "passed": true,
+  "checks": [
+    {
+      "name": "ten_logical_phases_recorded",
+      "passed": true,
+      "category": "coverage",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "actual_source_mutation_preempted_by_explanation",
+      "passed": true,
+      "category": "coverage",
+      "detail": {
+        "changed_source_paths": [
+          "src/tools.rs"
+        ],
+        "recorded_status": "preempted_by_explanation"
+      },
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "at_least_three_completed_compactions",
+      "passed": true,
+      "category": "coverage",
+      "detail": {
+        "completed": 9
+      },
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "single_session",
+      "passed": true,
+      "category": "core",
+      "detail": [
+        "3f17c0e6-00e1-450a-8953-bfd351b666cc"
+      ],
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "phase_input_ids_valid_unique",
+      "passed": true,
+      "category": "coverage",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "model_tool_call_ownership",
+      "passed": true,
+      "category": "core",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "original_source_id_exists",
+      "passed": true,
+      "category": "coverage",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "original_summary_covered",
+      "passed": true,
+      "category": "coverage",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "original_settled_before_final_recall",
+      "passed": true,
+      "category": "coverage",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "original_not_pending_active_or_queued",
+      "passed": true,
+      "category": "coverage",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "original_evicted_from_all_hot_job_histories",
+      "passed": true,
+      "category": "coverage",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "actual_final_original_event_relevant_evidence_read",
+      "passed": true,
+      "category": "coverage",
+      "detail": {
+        "pages": 3,
+        "covered_chars": 4996,
+        "total_chars": [
+          4996
+        ],
+        "original_commitment_spans_found": {
+          "编辑只匹配原文件而不级联": true,
+          "搜索hash覆盖完整文件": true,
+          "read-only仍能源码搜索": true
+        }
+      },
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "phase2_no_source_changes",
+      "passed": true,
+      "category": "quality",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "phase2_no_shell_or_write_started",
+      "passed": true,
+      "category": "core",
+      "detail": [],
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "phase5_no_source_changes",
+      "passed": true,
+      "category": "quality",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "phase5_no_shell_or_write_started",
+      "passed": true,
+      "category": "core",
+      "detail": [],
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "phase10_no_source_changes",
+      "passed": true,
+      "category": "quality",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "phase10_no_shell_or_write_started",
+      "passed": true,
+      "category": "core",
+      "detail": [],
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "natural_pause_state_persisted",
+      "passed": true,
+      "category": "core",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "natural_pause_event",
+      "passed": true,
+      "category": "core",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "resume_uses_new_process",
+      "passed": true,
+      "category": "coverage",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "resumed_state_not_paused",
+      "passed": true,
+      "category": "core",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "no_new_actions_between_pause_and_resume",
+      "passed": true,
+      "category": "core",
+      "detail": [],
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "final_unknown_writes_empty",
+      "passed": true,
+      "category": "core",
+      "detail": null,
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "final_old_work_settled_no_pending",
+      "passed": true,
+      "category": "quality",
+      "detail": [],
+      "exercise_status": "exercised"
+    },
+    {
+      "name": "experiment_total_call_budget",
+      "passed": true,
+      "category": "execution",
+      "detail": {
+        "started": 128
+      },
+      "exercise_status": "exercised"
+    }
+  ],
+  "completed_compactions": 9,
+  "model_starts": 128,
+  "known_reported_usage": {
+    "input_tokens": 2005927,
+    "output_tokens": 33283,
+    "total_tokens": 2039210
+  },
+  "aggregate_usage_known": false,
+  "unknown_usage_call_ids": [
+    "9862011a-6f15-4c20-8401-ccb9f2ba9b38",
+    "b1694353-b856-4b4a-81cd-eb6ddf11b274",
+    "7e1eed70-f800-4dae-bee8-a8079b46f666"
+  ],
+  "cold_recovery_established": true,
+  "not_exercised_checks": []
+}

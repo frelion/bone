@@ -1,0 +1,33 @@
+{
+  "original_gate_verdict": "FAIL_time_cap",
+  "receipt": {
+    "input_id": "148d271d-a6d9-48ab-b6ca-4adc2800628c",
+    "metrics": {
+      "cost": null,
+      "elapsed_ms": 24231,
+      "input_tokens": 130173,
+      "model_calls": 6,
+      "observed_input_tokens": 130173,
+      "observed_output_tokens": 412,
+      "output_tokens": 412,
+      "total_tokens": 130585
+    },
+    "question_id": null,
+    "session_id": "3f17c0e6-00e1-450a-8953-bfd351b666cc",
+    "status": "completed",
+    "text": "已移除 `src/tools.rs` 中未使用的 `text` 变量，未压制警告，也未扩展功能。`cargo clippy --locked --all-targets --all-features -- -D warnings` 和 `cargo check --locked --all-features` 均通过。未提交或推送；真实源码搜索和临时示例编辑演示未在本轮执行。",
+    "unknown_writes": {}
+  },
+  "exit_code": 0,
+  "valid_receipt_identity": true,
+  "completed": true,
+  "wall_seconds": 25.029522791999998,
+  "active_wall_seconds": 1955.950883125,
+  "model_starts": 153,
+  "new_model_starts": 6,
+  "unknown_writes": {},
+  "cost": null,
+  "implementation_feedback": true,
+  "functional_verification_before_this_round": "27/27",
+  "failed_gate_before_this_round": "Clippy unused variable"
+}
