@@ -244,7 +244,7 @@ async fn execute(cli: Cli) -> Result<()> {
         }
         Command::Chat { run } => {
             let mut engine = open(&cli, &data, run, run.session.as_deref())?;
-            chat(&mut engine).await?;
+            chat(&mut engine, run.timeout_seconds).await?;
         }
     }
     Ok(())
@@ -346,6 +346,11 @@ async fn run_to_result(
         {
             let status = match event.kind.as_str() {
                 "delivery" => "completed",
+                "input_resolved" => match event.data["outcome"].as_str() {
+                    Some("completed") => "completed",
+                    Some("superseded") => "superseded",
+                    _ => "failed",
+                },
                 "question" => "waiting",
                 "input_paused" => "paused",
                 _ => "failed",
@@ -376,7 +381,7 @@ async fn run_to_result(
     }
 }
 
-async fn chat(engine: &mut Engine) -> Result<()> {
+async fn chat(engine: &mut Engine, seconds: u64) -> Result<()> {
     eprintln!(
         "BONE · Session {}\nType normally. /stop, /resume, /quit",
         engine.state().id
@@ -384,6 +389,10 @@ async fn chat(engine: &mut Engine) -> Result<()> {
     let interactive = std::io::stdin().is_terminal();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut input_closed = false;
+    let duration = Duration::from_secs(seconds.max(1));
+    let deadline = tokio::time::sleep(duration);
+    tokio::pin!(deadline);
+    let mut deadline_armed = !engine.is_quiescent();
     for question in engine.unanswered_questions() {
         println!("{}", engine.event_text(question)?);
     }
@@ -392,16 +401,19 @@ async fn chat(engine: &mut Engine) -> Result<()> {
         std::io::stdout().flush()?;
     }
     loop {
+        if engine.is_quiescent() {
+            deadline_armed = false;
+        }
         tokio::select! {
             line=lines.next_line(),if !input_closed=>{
                 match line?{
                     None=>{input_closed=true;if engine.is_quiescent(){break;}},
                     Some(line)=>match line.trim(){
                         "/quit"=>{engine.stop()?;break;},
-                        "/stop"=>{engine.stop()?;println!("Stopped.");},
-                        "/resume"=>{engine.resume()?;},
+                        "/stop"=>{engine.stop()?;deadline_armed=false;println!("Stopped.");},
+                        "/resume"=>{engine.resume()?;deadline.as_mut().reset(tokio::time::Instant::now()+duration);deadline_armed=true;},
                         ""=>{},
-                        _=>{engine.post(&line,None)?;}
+                        _=>{engine.post(&line,None)?;deadline.as_mut().reset(tokio::time::Instant::now()+duration);deadline_armed=true;}
                     }
                 }
             }
@@ -421,7 +433,13 @@ async fn chat(engine: &mut Engine) -> Result<()> {
                 }
                 if input_closed&&engine.is_quiescent(){break;}
             }
-            _=tokio::signal::ctrl_c()=>{engine.stop()?;println!("Stopped. /resume to continue; /quit to exit.");if input_closed{break;}}
+            _=&mut deadline,if deadline_armed=>{
+                engine.stop()?;
+                deadline_armed=false;
+                println!("Execution time limit reached. Work is paused; /resume to continue.");
+                if input_closed{break;}
+            }
+            _=tokio::signal::ctrl_c()=>{engine.stop()?;deadline_armed=false;println!("Stopped. /resume to continue; /quit to exit.");if input_closed{break;}}
         }
     }
     Ok(())

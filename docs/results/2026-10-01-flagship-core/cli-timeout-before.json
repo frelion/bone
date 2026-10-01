@@ -1,0 +1,8 @@
+{
+  "baseline": "8119f3b",
+  "command": "cargo test --locked --test question_routing chat_deadline -- --nocapture",
+  "result": "2 failed before passing timeout_seconds to chat",
+  "model_case": "Printed LATE_RESPONSE_MUST_NOT_BE_DELIVERED after configured deadline; no pause",
+  "write_case": "Finished delayed shell despite configured deadline; no unknown-write pause",
+  "after": "2/2 pass, including new-process resume and preserved unknown write"
+}

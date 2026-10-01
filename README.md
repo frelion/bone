@@ -124,11 +124,13 @@ Rust 库的执行操作通过 `runtime::Engine`：`post`、`step`、`stop`、`re
 
 `--read-only` 禁用 `write_file` 与 `shell`。文件工具限制在 workspace 内，拒绝路径向上遍历和已知 symlink escape。`write_file` 必须携带读取结果的 SHA-256；创建新文件使用 `expected_sha256 = null`。
 
-`read_file` 默认返回 8 KiB，按 `next_offset` 继续读取；显式 `limit` 最大为 32 KiB。较小默认页减少多文件批次在工作模型看到源码前就触发预览摘要的情况。显式大页或过多并行读取仍可能超过上下文上限。
+`read_file` 默认返回 8 KiB，按 `next_offset` 继续读取；显式 `limit` 最大为 32 KiB。刚返回的结果先交给工作模型；超限时压缩更早的已消费历史，再为新结果提供带原文引用的有界预览。Agent 可回查原事件补全省略部分。单条用户输入或原生调用参数本身无法装入上下文时仍会明确失败。
 
 `shell` 在 workspace 中以当前本地用户权限运行，没有 OS sandbox。命令超时或取消时会终止所启动的进程组；输出最多保留每个流 32 KiB。不要把进程组终止等同于撤销已发生的外部效果。
 
 命令默认超时为 60 秒；编译或集成测试可显式指定 `timeout_seconds`，有效范围 1～3600 秒。`run` / `resume` 的整体 `--timeout-seconds` 截止时间仍适用。无效超时值会报错；真正超时或取消后仍需核查未知写，不会自动重试。
+
+`chat --timeout-seconds` 限制从最新普通输入或 `/resume` 开始的一段工作；等待用户时不计时。到期后持久暂停，可以继续同一对话。新输入重启时限，不重置旧请求的模型调用额度。
 
 中断或无法确认完成的写操作记录为未知写；进一步写入需要先核查。文件替换后目录同步失败也属于未知效果。查看 session history 与实际文件/外部状态，再记录观察：
 

@@ -390,3 +390,79 @@ fn chat_prints_question_from_delegated_job() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Which output format should I use?"));
 }
+
+#[test]
+fn chat_deadline_pauses_a_model_call_and_preserves_resumable_input() {
+    let fixture = Fixture::new(json!([
+        {"delay_seconds":3,"text":"LATE_RESPONSE_MUST_NOT_BE_DELIVERED"},
+        {"text":"Resumed after the deadline."}
+    ]));
+    let mut command = fixture.command();
+    command
+        .arg("chat")
+        .arg("--workspace")
+        .arg(&fixture.workspace)
+        .args(["--timeout-seconds", "1", "--model-timeout-seconds", "10"]);
+    let output = bounded_output(command, Some("Finish this task.\n"));
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Execution time limit reached"), "{text}");
+    assert!(!text.contains("LATE_RESPONSE_MUST_NOT_BE_DELIVERED"));
+    let saved = bone::sessions(&fixture.data).unwrap().pop().unwrap();
+    assert!(saved.paused);
+    assert!(saved.unknown_writes.is_empty());
+    let history = bone::history(&fixture.data, &saved.id).unwrap();
+    assert!(history.iter().any(|event| event.kind == "cancelled"));
+    assert!(!history.iter().any(|event| event.kind == "delivery"));
+
+    let mut command = fixture.command();
+    command.args(["resume", &saved.id, "--timeout-seconds", "10", "--json"]);
+    let output = bounded_output(command, None);
+    assert!(output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["text"], "Resumed after the deadline.");
+}
+
+#[test]
+fn chat_deadline_retains_unknown_write_and_does_not_repeat_it_on_reopen() {
+    let fixture = Fixture::new(json!([
+        {"output":[tool("long-write","shell",json!({"command":"printf started > started.txt; sleep 5; printf finished > finished.txt","timeout_seconds":10}))]},
+        {"text":"Do not claim an interrupted write completed."}
+    ]));
+    let mut command = fixture.command();
+    command
+        .arg("chat")
+        .arg("--workspace")
+        .arg(&fixture.workspace)
+        .args(["--timeout-seconds", "1"]);
+    let output = bounded_output(command, Some("Perform the write.\n"));
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Execution time limit reached"), "{text}");
+    let saved = bone::sessions(&fixture.data).unwrap().pop().unwrap();
+    assert!(saved.paused);
+    assert_eq!(saved.unknown_writes.len(), 1);
+    assert!(fixture.workspace.join("started.txt").exists());
+    assert!(!fixture.workspace.join("finished.txt").exists());
+    let reopened = Engine::open(
+        &fixture.data,
+        &fixture.workspace,
+        Some(&saved.id),
+        fixture.profile.clone(),
+        "fixture".into(),
+        RunOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(reopened.state().unknown_writes.len(), 1);
+    assert!(reopened.state().paused);
+    assert_eq!(
+        reopened
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "tool_started")
+            .count(),
+        1
+    );
+}

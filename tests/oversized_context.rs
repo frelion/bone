@@ -204,15 +204,68 @@ fixture.main()
             .unwrap()
             .contains("next_offset")
     );
+    let inspect_observation = requests
+        .iter()
+        .find(|request| {
+            request["body"]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == "inspect-original"
+                })
+        })
+        .unwrap();
+    assert_eq!(
+        inspect_observation["summary"], false,
+        "Raw lookup was summarized before the work model could consume it"
+    );
 }
 
 #[tokio::test]
 async fn default_source_pages_reach_work_model_before_summary_and_can_continue() {
+    source_pages_probe(
+        &["src/lib.rs", "src/store.rs", "src/main.rs", "README.md"],
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn nine_default_source_pages_receive_bounded_work_previews_before_summary() {
+    source_pages_probe(
+        &[
+            "src/lib.rs",
+            "src/store.rs",
+            "src/main.rs",
+            "src/runtime.rs",
+            "src/model.rs",
+            "src/tools.rs",
+            "src/context.rs",
+            "src/config.rs",
+            "README.md",
+        ],
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn old_consumed_history_can_be_summarized_without_covering_fresh_source_pages() {
+    source_pages_probe(
+        &["src/lib.rs", "src/store.rs", "src/main.rs", "README.md"],
+        true,
+    )
+    .await;
+}
+
+async fn source_pages_probe(source_paths: &[&str], preload: bool) {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(workspace.join("src")).unwrap();
-    let sources: Vec<_> = ["src/lib.rs", "src/store.rs", "src/main.rs", "README.md"]
-        .into_iter()
+    let sources: Vec<_> = source_paths
+        .iter()
+        .copied()
         .map(|path| {
             let text =
                 std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap();
@@ -223,18 +276,67 @@ async fn default_source_pages_reach_work_model_before_summary_and_can_continue()
     assert!(sources[1].1.len() > 8192);
     let script = root.path().join("script.json");
     let requests = root.path().join("requests.jsonl");
+    let mut turns = vec![
+        json!({"output":sources.iter().enumerate().map(|(index,(path,_))| json!({"type":"function_call","name":"read_file","call_id":format!("source-{index}"),"arguments":{"path":path}})).collect::<Vec<_>>() }),
+        json!({"contains":["source-0","source-1","source-2","source-3"],"output":[{"type":"function_call","name":"read_file","call_id":"store-next","arguments":{"path":"src/store.rs","offset":8192}}]}),
+        json!({"contains":["store-next","next_offset"],"text":"SOURCE_PAGES_CONSUMED"}),
+    ];
+    if preload {
+        turns.insert(0,json!({"text":format!("EARLY_REQUIREMENT: signed integer cents. {}", "Earlier consumed work. ".repeat(1500))}));
+    }
+    if source_paths.len() > 4 {
+        turns.truncate(1);
+        turns.extend((0..16).map(|_| json!({"output":[{"type":"inspect_or_continue"}]})));
+    }
     std::fs::write(&script, serde_json::to_vec(&json!({
-        "turns":[
-            {"output":sources.iter().enumerate().map(|(index,(path,_))| json!({"type":"function_call","name":"read_file","call_id":format!("source-{index}"),"arguments":{"path":path}})).collect::<Vec<_>>()},
-            {"contains":["source-0","source-1","source-2","source-3","next_offset"],"output":[{"type":"function_call","name":"read_file","call_id":"store-next","arguments":{"path":"src/store.rs","offset":8192}}]},
-            {"contains":["store-next","next_offset"],"text":"SOURCE_PAGES_CONSUMED"}
-        ],
-        "summary":"INCOMPLETE_PREVIEW_MUST_NOT_REPLACE_FRESH_SOURCE_PAGES"
+        "turns":turns,
+        "summary":"EARLY_REQUIREMENT: signed integer cents. Earlier work consumed; source pages for the current task must remain available."
     })).unwrap()).unwrap();
+    let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/long_task/server.py");
+    let mut command = Command::new("python3");
+    command.arg("-B");
+    if source_paths.len() > 4 {
+        let launcher = root.path().join("inspect-server.py");
+        std::fs::write(&launcher,r#"
+import importlib.util, json, sys
+spec=importlib.util.spec_from_file_location('long_fixture',sys.argv.pop(1))
+fixture=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+expand=fixture.wire.expand_output
+state={'target':None,'offset':0,'seen':set(),'followup':False}
+def substitute(output,body):
+    def collect(value):
+        if isinstance(value,str):
+            try: collect(json.loads(value))
+            except ValueError: pass
+        elif isinstance(value,list):
+            for part in value: collect(part)
+        elif isinstance(value,dict):
+            if state['target'] is None and value.get('truncated') and value.get('preview_source_chars',0)>len(value.get('preview','')):
+                state['target']=value['event_id']
+            if value.get('event_id')==state['target'] and 'raw' in value and 'offset' in value and 'next_offset' in value:
+                if value['offset'] not in state['seen']:
+                    state['seen'].add(value['offset'])
+                    state['offset']=value['next_offset']
+            for part in value.values(): collect(part)
+    collect(body.get('input',[]))
+    if output and output[0].get('type')=='inspect_or_continue':
+        if state['offset'] is not None:
+            return [{'type':'function_call','name':'job_inspect','call_id':'inspect-page-%s'%state['offset'],'arguments':{'event_id':state['target'],'offset':state['offset'],'limit':4000}}]
+        if not state['followup']:
+            state['followup']=True
+            return [{'type':'function_call','name':'read_file','call_id':'store-next','arguments':{'path':'src/store.rs','offset':8192}}]
+        return [{'type':'message','role':'assistant','content':[{'type':'output_text','text':'SOURCE_PAGES_CONSUMED','annotations':[]}]}]
+    return expand(output,body)
+fixture.wire.expand_output=substitute
+fixture.main()
+"#).unwrap();
+        command.arg(launcher).arg(server_path);
+    } else {
+        command.arg(server_path);
+    }
     let mut server = LocalServer(
-        Command::new("python3")
-            .arg("-B")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/long_task/server.py"))
+        command
             .arg("--script")
             .arg(script)
             .arg("--requests")
@@ -273,11 +375,27 @@ async fn default_source_pages_reach_work_model_before_summary_and_can_continue()
         "fixture".into(),
         RunOptions {
             context_chars: 64_000,
-            max_calls: 8,
+            max_calls: 20,
             ..Default::default()
         },
     )
     .unwrap();
+    if preload {
+        let old = engine
+            .post(
+                "Remember signed integer cents for the continuing implementation.",
+                None,
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while engine.result(&old).is_none() {
+                engine.step().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(engine.result(&old).unwrap().kind, "delivery");
+    }
     let input = engine
         .post(
             "Inspect the four source files and follow file-page cursors before implementing.",
@@ -330,15 +448,27 @@ async fn default_source_pages_reach_work_model_before_summary_and_can_continue()
         while !original.is_char_boundary(end) {
             end -= 1;
         }
-        assert_eq!(page["text"], original[..end]);
-        assert_eq!(
-            page["next_offset"],
-            if end < original.len() {
-                json!(end)
-            } else {
-                Value::Null
-            }
-        );
+        if source_paths.len() > 4 && page["truncated"] == true {
+            let event_id = page["event_id"].as_str().unwrap();
+            let audit = engine.read_event(event_id).unwrap();
+            assert_eq!(tool_payload(&audit)["text"], original[..end]);
+            assert!(page["preview"].as_str().unwrap().contains("sha256"));
+            assert!(
+                page.get("total_chars").is_none(),
+                "Preview length was confused with the inspect cursor extent"
+            );
+            assert!(page["instruction"].as_str().unwrap().contains("offset=0"));
+        } else {
+            assert_eq!(page["text"], original[..end]);
+            assert_eq!(
+                page["next_offset"],
+                if end < original.len() {
+                    json!(end)
+                } else {
+                    Value::Null
+                }
+            );
+        }
     }
     let last = requests
         .iter()
@@ -354,6 +484,60 @@ async fn default_source_pages_reach_work_model_before_summary_and_can_continue()
         })
         .unwrap();
     assert_eq!(last["summary"], false);
+    if preload {
+        assert!(requests.iter().any(|request| request["summary"] == true));
+        assert!(
+            serde_json::to_string(&last["body"])
+                .unwrap()
+                .contains("signed integer cents")
+        );
+    }
+    if source_paths.len() > 4 {
+        let events = engine.events().unwrap();
+        let inspected: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == "tool_result" && event.data["tool_name"] == "job_inspect")
+            .map(tool_payload)
+            .collect();
+        assert!(
+            inspected.len() > 1,
+            "Probe did not retrieve an omitted page tail"
+        );
+        let target = inspected[0]["event_id"].as_str().unwrap().to_owned();
+        assert_eq!(inspected[0]["offset"], 0);
+        let original =
+            serde_json::to_string(&tool_payload(&engine.read_event(&target).unwrap())).unwrap();
+        let mut recovered = String::new();
+        let mut next = Some(0_usize);
+        for page in &inspected {
+            assert_eq!(page["event_id"], target);
+            assert_eq!(page["offset"].as_u64().unwrap() as usize, next.unwrap());
+            recovered.push_str(page["text"].as_str().unwrap());
+            next = page["next_offset"].as_u64().map(|value| value as usize);
+        }
+        assert!(next.is_none());
+        assert_eq!(
+            recovered, original,
+            "The omitted source page tail was not recovered exactly"
+        );
+        for page in &inspected {
+            let id = format!("inspect-page-{}", page["offset"]);
+            let first_observation = requests
+                .iter()
+                .find(|request| {
+                    request["body"]["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|item| item["type"] == "function_call_output" && item["call_id"] == id)
+                })
+                .unwrap();
+            assert_eq!(
+                first_observation["summary"], false,
+                "A retrieval page was summarized before work observation"
+            );
+        }
+    }
     let result = last["body"]["input"]
         .as_array()
         .unwrap()
@@ -371,6 +555,25 @@ async fn default_source_pages_reach_work_model_before_summary_and_can_continue()
         engine.event_text(engine.result(&input).unwrap()).unwrap(),
         "SOURCE_PAGES_CONSUMED"
     );
+}
+
+fn tool_payload(event: &bone::state::Event) -> Value {
+    use rig_core::{
+        completion::Message,
+        message::{ToolResultContent, UserContent},
+    };
+    let Message::User { content } = serde_json::from_value(event.data["message"].clone()).unwrap()
+    else {
+        panic!("missing tool message")
+    };
+    let UserContent::ToolResult(result) = &content[0] else {
+        panic!("missing native tool result")
+    };
+    match &result.content[0] {
+        ToolResultContent::Text(text) => serde_json::from_str(&text.text).unwrap(),
+        ToolResultContent::Json { value } => value.clone(),
+        _ => panic!("unexpected tool result content"),
+    }
 }
 
 fn read_requests(path: &PathBuf) -> Vec<Value> {

@@ -1,0 +1,38 @@
+{
+  "baseline_head": "8119f3b",
+  "transport": "loopback fixture only; no real model or credentials",
+  "default_page_bytes": 8192,
+  "context_chars": 64000,
+  "source_files": [
+    "src/lib.rs",
+    "src/store.rs",
+    "src/main.rs",
+    "src/runtime.rs",
+    "src/model.rs",
+    "src/tools.rs",
+    "src/context.rs",
+    "src/config.rs",
+    "README.md"
+  ],
+  "failure": "Fresh nine-file batch entered a summary request before any work model consumed its results. Next work request contained no original source tool outputs.",
+  "first_result_request_summary": true,
+  "preview_output_chars": [
+    415,
+    415,
+    415,
+    415,
+    415,
+    415,
+    415,
+    415,
+    419
+  ],
+  "wire_trace": "/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-flagship-probe-v410wxu8/default-pages-requests.json",
+  "wire_trace_sha256": "058e9ec8d545e0c8833d0a894f3ff5b1fb10b2b332c672136bdd1fecbc8b6eca",
+  "fix": "Infer fresh suffix from latest committed native assistant ToolCalls; compact older consumed prefix only. Bound fresh native WORK results against total history budget with readable previews/exact event IDs. Preserve original events, IDs, names and call arguments. Inspect starts at offset0 and subsequent inspect cursors recover omitted tail.",
+  "targeted_verification": [
+    "context::tests 12/12 PASS",
+    "oversized_context 4/4 PASS including nine source pages, old prefix, full inspect recovery",
+    "clippy --lib --test oversized_context -D warnings PASS"
+  ]
+}

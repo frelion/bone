@@ -508,8 +508,10 @@ impl Engine {
     pub fn result(&self, input: &str) -> Option<&Event> {
         let terminal_id = self.terminal(input).map(|event| &event.id);
         self.records().rev().find(|e| {
-            (matches!(e.kind.as_str(), "delivery" | "failure" | "input_paused")
-                && e.reply_to.as_deref() == Some(input)
+            (matches!(
+                e.kind.as_str(),
+                "delivery" | "failure" | "input_paused" | "input_resolved"
+            ) && e.reply_to.as_deref() == Some(input)
                 && (e.kind != "failure" || terminal_id == Some(&e.id)))
                 || (self.is_unanswered_question(e)
                     && (e.reply_to.as_deref() == Some(input)
@@ -544,6 +546,7 @@ impl Engine {
             .as_str()
             .or_else(|| event.data["question"].as_str())
             .or_else(|| event.data["error"].as_str())
+            .or_else(|| event.data["reason"].as_str())
             .unwrap_or("")
             .to_owned())
     }
@@ -1108,11 +1111,20 @@ impl Engine {
             )? {
                 Some(prefix) => Some(prefix),
                 None => {
-                    self.fail(
-                        id,
-                        "context limit reached; no complete prefix can be safely summarized",
-                    )?;
-                    return Ok(());
+                    match context::bounded_work_history(
+                        &self.state.jobs[id],
+                        &self.events,
+                        history_budget,
+                    )? {
+                        Some(history) => {
+                            request.chat_history = history;
+                            None
+                        }
+                        None => {
+                            self.fail(id,"required inputs or native tool-call arguments cannot fit the configured context limit; use smaller source pages or smaller edits")?;
+                            return Ok(());
+                        }
+                    }
                 }
             }
         } else {
@@ -1540,8 +1552,10 @@ impl Engine {
 
     fn terminal(&self, input: &str) -> Option<&Event> {
         let event = self.records().rev().find(|e| {
-            matches!(e.kind.as_str(), "delivery" | "failure" | "input_paused")
-                && e.reply_to.as_deref() == Some(input)
+            matches!(
+                e.kind.as_str(),
+                "delivery" | "failure" | "input_paused" | "input_resolved"
+            ) && e.reply_to.as_deref() == Some(input)
         })?;
         if event.kind == "failure"
             && self.state.jobs.values().any(|j| {
@@ -1597,6 +1611,66 @@ impl Engine {
         self.commit(state, vec![event])
     }
 
+    fn ensure_input_resolvable(&self, job: &str, input: &str) -> Result<()> {
+        let root = self.root(input)?;
+        ensure!(
+            !self
+                .state
+                .unknown_writes
+                .values()
+                .any(|write| write.root_input.is_none()
+                    || write.root_input.as_deref() == Some(&root)),
+            "input has unresolved associated write effects"
+        );
+        ensure!(
+            !self
+                .running
+                .values()
+                .any(|running| running.origin.input == input),
+            "input has an in-flight action"
+        );
+        for pending in self.pending_tools(job)? {
+            let proposal = pending.key.split(':').next().context("invalid tool key")?;
+            ensure!(
+                self.events[proposal].reply_to.as_deref() != Some(input),
+                "input has an unfinished native tool batch"
+            );
+        }
+        // Descendants retain their exact input identities even if an intermediate
+        // assignment failed. Settling an ancestor never cancels that work.
+        let mut descendants = BTreeSet::from([input.to_owned()]);
+        loop {
+            let mut changed = false;
+            for event in self.records().filter(|e| e.kind == "input") {
+                if event.data["sender_input"]
+                    .as_str()
+                    .is_some_and(|sender| descendants.contains(sender))
+                {
+                    ensure!(
+                        self.terminal(&event.id).is_some(),
+                        "input has a live delegated assignment: {}",
+                        event.id
+                    );
+                    ensure!(
+                        !self
+                            .state
+                            .jobs
+                            .values()
+                            .any(|owner| owner.active_input.as_ref() == Some(&event.id)
+                                || owner.inbox.contains(&event.id)),
+                        "input has a retained delegated assignment: {}",
+                        event.id
+                    );
+                    changed |= descendants.insert(event.id.clone());
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn internal_tool(&mut self, id: &str, tool: &PendingTool) -> Result<()> {
         let name = tool.call.function.name.as_str();
         let args = &tool.call.function.arguments;
@@ -1617,6 +1691,69 @@ impl Engine {
         let mut events = Vec::new();
         let content = match name {
             "job_inspect" => self.inspect(args)?,
+            "input_resolve" => {
+                let resolutions = args["resolutions"]
+                    .as_array()
+                    .context("resolutions must be an array")?;
+                ensure!(!resolutions.is_empty(), "resolutions must not be empty");
+                let mut selected = BTreeSet::new();
+                // Validate the entire batch before changing any queue or recording
+                // a settlement. Ownership follows the current queue after handoff.
+                for resolution in resolutions {
+                    let target = tools::string_arg(resolution, "input_id")?;
+                    ensure!(selected.insert(target), "duplicate input ID: {target}");
+                    ensure!(target != input, "cannot resolve the ACTIVE input");
+                    ensure!(
+                        state.jobs[id].inbox.iter().any(|i| i == target),
+                        "input is not queued in this job: {target}"
+                    );
+                    let original = self.events.get(target).context("input does not exist")?;
+                    ensure!(original.kind == "input", "target is not an input");
+                    let outcome = tools::string_arg(resolution, "outcome")?;
+                    ensure!(
+                        matches!(outcome, "completed" | "superseded"),
+                        "invalid resolution outcome"
+                    );
+                    let reason = tools::string_arg(resolution, "reason")?;
+                    ensure!(!reason.trim().is_empty(), "resolution reason is empty");
+                    if let Some(evidence) = resolution.get("evidence_event_ids") {
+                        for value in evidence
+                            .as_array()
+                            .context("evidence_event_ids must be an array")?
+                        {
+                            let evidence_id = value
+                                .as_str()
+                                .context("evidence event ID must be a string")?;
+                            ensure!(
+                                self.events.contains_key(evidence_id),
+                                "evidence event does not exist: {evidence_id}"
+                            );
+                        }
+                    }
+                    self.ensure_input_resolvable(id, target)?;
+                }
+                let mut settled = Vec::new();
+                for resolution in resolutions {
+                    let target = resolution["input_id"].as_str().unwrap();
+                    let mut event = self.event(id, "input_resolved", json!({
+                        "outcome":resolution["outcome"], "reason":resolution["reason"],
+                        "actor_input":input, "actor_job":id, "tool_key":tool.key,
+                        "evidence_event_ids":resolution.get("evidence_event_ids").cloned().unwrap_or_else(|| json!([]))
+                    }));
+                    event.reply_to = Some(target.to_owned());
+                    event.root_input = self.events[target].root_input.clone();
+                    state
+                        .jobs
+                        .get_mut(id)
+                        .unwrap()
+                        .inbox
+                        .retain(|i| i != target);
+                    state.pending_inputs.retain(|i| i != target);
+                    settled.push(json!({"input_id":target,"event_id":event.id,"outcome":resolution["outcome"],"reason":resolution["reason"]}));
+                    events.push(event);
+                }
+                json!({"resolutions":settled})
+            }
             "job_send" => {
                 let message = tools::string_arg(args, "message")?;
                 ensure!(!message.trim().is_empty(), "assignment is empty");
@@ -2025,7 +2162,7 @@ impl Engine {
             if let Some(event) = self.terminal(id) {
                 let text = self.event_text(event)?;
                 let preview = text.chars().take(per_result).collect::<String>();
-                let record = json!({"input_id":id,"event_id":event.id,"response_event":event.data.get("response_event"),"status":event.kind,"text":preview,"truncated":preview.chars().count()<text.chars().count()});
+                let record = json!({"input_id":id,"event_id":event.id,"response_event":event.data.get("response_event"),"status":event.kind,"outcome":event.data.get("outcome"),"actor_input":event.data.get("actor_input"),"evidence_event_ids":event.data.get("evidence_event_ids"),"text":preview,"truncated":preview.chars().count()<text.chars().count()});
                 let chars = serde_json::to_string(&record)?.chars().count();
                 if size + chars > budget {
                     break;
@@ -2060,7 +2197,7 @@ impl Engine {
             let event = if let Some(pending) = pending {
                 self.tool_result(&id, &pending, results, None, false)?
             } else {
-                self.event(&id,"context_note",json!({"message":Message::user(format!("The requested work has finished. Inspect these results before delivering: {results}"))}))
+                self.event(&id,"context_note",json!({"message":Message::user(format!("The requested inputs have settled. Inspect their outcomes before delivering; superseded work is not a successful assignment delivery: {results}"))}))
             };
             let mut state = self.state.clone();
             let job = state.jobs.get_mut(&id).unwrap();
@@ -2076,7 +2213,7 @@ impl Engine {
         let job = &self.state.jobs[id];
         let catalog=self.state.jobs.values().take(32).map(|j|json!({"id":j.id,"title":j.title,"state":j.state,"active_input":j.active_input})).collect::<Vec<_>>();
         Ok(format!(
-            "You are BONE, the one agent in this conversation. You are currently working inside job {id} ({title}). Jobs are your internal continuing work contexts; never ask the user to create, select or manage them. Every thought and action belongs to this job.\nYour current task is only the input marked status=ACTIVE with ID {input} in this request. Match that marker to its original content. QUEUED inputs are retained for later and must not replace the current task; HISTORICAL and SHARED inputs supply relevant background and corrections. Follow the newest applicable instruction by revision when older instructions conflict. Current input markers override any routing state described in an earlier summary. Use tools to inspect actual files and verify results. Reply with a final answer only after this input is handled. Preserve original constraints. When earlier work was overtaken by a newer message, consider whether it is already completed or superseded; do not repeat its effects.\nContinue related work here. Create other jobs only when independent work or a separate continuing context benefits the task. job_send returns an exact input_id; use job_wait instead of polling. You may send a followup to an existing idle job. Use job_handoff before acting to transfer conversation responsibility. Waiting and handoff must be sole tool calls in their batch. When the user asks to stop, call pause_work. To pause/resume other work after a changed instruction, use job_control. If instructions are unclear, ask_user.\nFile tools are confined to workspace {workspace}; shell has local user privileges. Do not claim an operation succeeded unless tool evidence verifies it. Tools disabled by the session permission policy must not be worked around.\nPublic user instructions are included in the history with their revisions. Apply newer relevant corrections to your work; other jobs' assignments remain theirs. When an earlier requirement or unfinished commitment is unclear in a summary, use job_inspect(users_only=true) to find original session instructions, then job_inspect(event_id=...) for their complete readable text. Follow next_before_id and next_offset when truncated. Do not conclude that a specification is missing just because its summary is vague.\nJOB CATALOG:\n{catalog}\nExecution budget shared by this input and its delegated jobs: {budget}",
+            "You are BONE, the one agent in this conversation. You are currently working inside job {id} ({title}). Jobs are your internal continuing work contexts; never ask the user to create, select or manage them. Every thought and action belongs to this job.\nYour current task is only the input marked status=ACTIVE with ID {input} in this request. Match that marker to its original content. QUEUED inputs are retained for later and must not replace the current task; HISTORICAL and SHARED inputs supply relevant background and corrections. Follow the newest applicable instruction by revision when older instructions conflict. Current input markers override any routing state described in an earlier summary. Use tools to inspect actual files and verify results. Reply with a final answer only after this input is handled. Preserve original constraints. When the ACTIVE request incorporates earlier work, inspect QUEUED requests and explicitly use input_resolve after verifying their work is completed or a newer instruction supersedes them. Give a concrete reason; leave independent queued work unresolved. A final answer settles only the ACTIVE input. Do not repeat completed or superseded effects.\nContinue related work here. Create other jobs only when independent work or a separate continuing context benefits the task. job_send returns an exact input_id; use job_wait instead of polling. You may send a followup to an existing idle job. Use job_handoff before acting to transfer conversation responsibility. Waiting and handoff must be sole tool calls in their batch. When the user asks to stop, call pause_work. To pause/resume other work after a changed instruction, use job_control. If instructions are unclear, ask_user.\nFile tools are confined to workspace {workspace}; shell has local user privileges. Do not claim an operation succeeded unless tool evidence verifies it. Tools disabled by the session permission policy must not be worked around.\nPublic user instructions are included in the history with their revisions. Apply newer relevant corrections to your work; other jobs' assignments remain theirs. When an earlier requirement or unfinished commitment is unclear in a summary, use job_inspect(users_only=true) to find original session instructions, then job_inspect(event_id=...) for their complete readable text. Follow next_before_id and next_offset when truncated. Do not conclude that a specification is missing just because its summary is vague.\nJOB CATALOG:\n{catalog}\nExecution budget shared by this input and its delegated jobs: {budget}",
             title = job.title,
             input = job.active_input.as_deref().unwrap_or(""),
             workspace = self.state.workspace.display(),
@@ -2459,6 +2596,367 @@ mod tests {
         )
     }
 
+    fn native_proposal(
+        engine: &mut Engine,
+        job: &str,
+        name: &str,
+        arguments: Value,
+    ) -> PendingTool {
+        use rig_core::message::{CallId, ToolFunction, ToolName};
+        let call = ToolCall::new(
+            CallId::from_wire(new_id()),
+            ToolFunction {
+                name: ToolName::new(name).unwrap(),
+                arguments,
+            },
+        );
+        let event = engine.event(job, "model_message", json!({"response":native_response(Message::Assistant {id:None,content:vec![rig_core::completion::AssistantContent::ToolCall(call.clone())]})}));
+        let key = format!("{}:{}", event.id, serde_json::to_string(&call.id).unwrap());
+        engine.append_history(job, event).unwrap();
+        PendingTool { call, key }
+    }
+
+    fn resolution_proposal(engine: &mut Engine, job: &str, resolutions: Value) -> PendingTool {
+        native_proposal(
+            engine,
+            job,
+            "input_resolve",
+            json!({"resolutions":resolutions}),
+        )
+    }
+
+    #[test]
+    fn input_resolution_validation_is_atomic_and_preserves_independent_work_and_budgets() {
+        let (_directory, mut engine) = fixture_engine();
+        let first = engine
+            .post("Original implementation request", None)
+            .unwrap();
+        engine.prepare_pending_input().unwrap();
+        let unrelated = engine.post("Independent queued task", None).unwrap();
+        let current = engine
+            .post("Finish the revised implementation", None)
+            .unwrap();
+        engine.prepare_pending_input().unwrap();
+        let job = engine.state.focus.clone().unwrap();
+        let mut foreign = Job::new("Foreign queued input");
+        foreign.state = JobState::Ready;
+        let mut foreign_input = engine.event(
+            &foreign.id,
+            "input",
+            json!({"message":Message::user("foreign"),"source":"job","sender_input":current}),
+        );
+        foreign_input.reply_to = None;
+        foreign_input.root_input = Some(current.clone());
+        foreign.inbox.push_back(foreign_input.id.clone());
+        let foreign_id = foreign_input.id.clone();
+        let mut state = engine.state.clone();
+        state.jobs.insert(foreign.id.clone(), foreign);
+        engine.commit(state, vec![foreign_input]).unwrap();
+        let valid = json!({"input_id":first,"outcome":"completed","reason":"Original work verified under the revised contract","evidence_event_ids":[current]});
+        let invalid = [
+            json!([valid.clone(), {"input_id":current,"outcome":"completed","reason":"cannot settle active"}]),
+            json!([valid.clone(), valid.clone()]),
+            json!([{ "input_id":first,"outcome":"completed","reason":" "}]),
+            json!([{ "input_id":first,"outcome":"merged","reason":"unsupported"}]),
+            json!([{ "input_id":first,"outcome":"superseded","reason":"replaced","evidence_event_ids":["missing"]}]),
+            json!([{ "input_id":"missing","outcome":"completed","reason":"missing"}]),
+            json!([valid.clone(), {"input_id":foreign_id,"outcome":"completed","reason":"foreign"}]),
+            json!([{ "input_id":first,"outcome":"superseded","reason":"replaced","evidence_event_ids":null}]),
+            json!([]),
+        ];
+        for resolutions in invalid {
+            let tool = resolution_proposal(&mut engine, &job, resolutions);
+            let before = engine.state.clone();
+            let count = engine.events().unwrap().len();
+            assert!(engine.internal_tool(&job, &tool).is_err());
+            assert_eq!(engine.state, before);
+            assert_eq!(engine.events().unwrap().len(), count);
+            // Answer the rejected proposal exactly as the scheduler does.
+            let event = engine
+                .tool_result(&job, &tool, json!({"error":"rejected"}), None, false)
+                .unwrap();
+            engine.append_history(&job, event).unwrap();
+        }
+        let tool = resolution_proposal(&mut engine, &job, json!([valid]));
+        let budgets = engine.state.budgets.clone();
+        engine.internal_tool(&job, &tool).unwrap();
+        assert_eq!(engine.state.budgets, budgets);
+        assert_eq!(engine.state.jobs[&job].inbox, VecDeque::from([unrelated]));
+        assert_eq!(
+            engine.state.jobs[&job].active_input.as_deref(),
+            Some(current.as_str())
+        );
+        let settled = engine.result(&first).unwrap();
+        assert_eq!(settled.kind, "input_resolved");
+        assert_eq!(settled.data["actor_input"], current);
+        assert_eq!(settled.data["outcome"], "completed");
+        assert_eq!(settled.root_input.as_deref(), Some(first.as_str()));
+        assert_eq!(engine.read_event(&first).unwrap().kind, "input");
+    }
+
+    #[test]
+    fn resolution_wakes_exact_waiters_with_distinct_outcomes() {
+        let (_directory, mut engine) = fixture_engine();
+        let old = engine.post("Old bounds", None).unwrap();
+        engine.prepare_pending_input().unwrap();
+        let other = engine.post("Unrelated request", None).unwrap();
+        let current = engine.post("Changed bounds", None).unwrap();
+        engine.prepare_pending_input().unwrap();
+        let owner = engine.state.focus.clone().unwrap();
+        let mut waiter = Job::new("Wait on changed requirement");
+        waiter.state = JobState::Waiting;
+        waiter.wait_for = vec![old.clone()];
+        let waiter_id = waiter.id.clone();
+        let mut waiter_input = engine.event(&waiter_id, "input", json!({"message":Message::user("Wait for the original input"),"source":"job","sender_input":current}));
+        waiter_input.reply_to = None;
+        waiter_input.root_input = Some(current.clone());
+        waiter.active_input = Some(waiter_input.id.clone());
+        let mut still_waiting = Job::new("Wait on independent task");
+        still_waiting.state = JobState::Waiting;
+        still_waiting.wait_for = vec![other];
+        let waiting_id = still_waiting.id.clone();
+        let mut state = engine.state.clone();
+        state.jobs.insert(waiter_id.clone(), waiter);
+        state.jobs.insert(waiting_id.clone(), still_waiting);
+        engine.commit(state, vec![waiter_input]).unwrap();
+        let wait_call = native_proposal(
+            &mut engine,
+            &waiter_id,
+            "job_wait",
+            json!({"input_ids":[old]}),
+        );
+        let tool = resolution_proposal(
+            &mut engine,
+            &owner,
+            json!([{"input_id":old,"outcome":"superseded","reason":"New bounds replace the old bounds"}]),
+        );
+        engine.internal_tool(&owner, &tool).unwrap();
+        engine.wake_waiters().unwrap();
+        assert_eq!(engine.state.jobs[&waiter_id].state, JobState::Ready);
+        assert!(engine.state.jobs[&waiter_id].wait_for.is_empty());
+        assert_eq!(engine.state.jobs[&waiting_id].state, JobState::Waiting);
+        let results = engine.wait_results(std::slice::from_ref(&old)).unwrap();
+        assert_eq!(results["results"][0]["input_id"], old);
+        assert_eq!(results["results"][0]["status"], "input_resolved");
+        assert_eq!(results["results"][0]["outcome"], "superseded");
+        assert_eq!(results["results"][0]["actor_input"], current);
+        let answered = engine
+            .events()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == "tool_result" && e.data["tool_key"] == wait_call.key)
+            .unwrap();
+        let message: Message = serde_json::from_value(answered.data["message"].clone()).unwrap();
+        let Message::User { content } = message else {
+            panic!("missing native result")
+        };
+        let rig_core::message::UserContent::ToolResult(result) = &content[0] else {
+            panic!("missing native result")
+        };
+        assert_eq!(result.call, wait_call.call.id);
+        assert_eq!(result.name.as_str(), "job_wait");
+        assert!(
+            serde_json::to_string(&result.content)
+                .unwrap()
+                .contains("superseded")
+        );
+        assert!(
+            !engine
+                .events()
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "delivery" && e.reply_to.as_deref() == Some(old.as_str()))
+        );
+    }
+
+    #[test]
+    fn resolution_ownership_follows_handoff_queue_without_rewriting_original_input() {
+        let (_directory, mut engine) = fixture_engine();
+        let old = engine.post("Original task", None).unwrap();
+        engine.prepare_pending_input().unwrap();
+        let source = engine.state.focus.clone().unwrap();
+        let mut target = Job::new("Handoff target");
+        target.active_input = Some(old.clone());
+        target.state = JobState::Ready;
+        target.history.push(old.clone());
+        let target_id = target.id.clone();
+        let mut state = engine.state.clone();
+        state.jobs.get_mut(&source).unwrap().active_input = None;
+        state.jobs.get_mut(&source).unwrap().state = JobState::Idle;
+        state.focus = Some(target_id.clone());
+        state.jobs.insert(target_id.clone(), target);
+        engine.commit(state, vec![]).unwrap();
+        engine.post("Newer task", None).unwrap();
+        engine.prepare_pending_input().unwrap();
+        let tool = resolution_proposal(
+            &mut engine,
+            &target_id,
+            json!([{"input_id":old,"outcome":"superseded","reason":"Newer instruction replaced the task after handoff"}]),
+        );
+        engine.internal_tool(&target_id, &tool).unwrap();
+        assert!(engine.state.jobs[&target_id].inbox.is_empty());
+        assert_eq!(
+            engine.read_event(&old).unwrap().job_id.as_deref(),
+            Some(source.as_str())
+        );
+        assert_eq!(
+            engine.result(&old).unwrap().job_id.as_deref(),
+            Some(target_id.as_str())
+        );
+    }
+
+    #[test]
+    fn resolution_rejects_unknown_effects_unfinished_batches_and_live_descendants() {
+        let (_directory, mut engine) = fixture_engine();
+        let old = engine.post("Original work", None).unwrap();
+        engine.prepare_pending_input().unwrap();
+        engine.post("Current work", None).unwrap();
+        engine.prepare_pending_input().unwrap();
+        let owner = engine.state.focus.clone().unwrap();
+        engine.state.unknown_writes.insert(
+            "unknown".into(),
+            UnknownWrite {
+                call_id: "unknown".into(),
+                job_id: owner.clone(),
+                root_input: Some(old.clone()),
+                tool_name: "shell".into(),
+            },
+        );
+        assert!(
+            engine
+                .ensure_input_resolvable(&owner, &old)
+                .unwrap_err()
+                .to_string()
+                .contains("write effects")
+        );
+        engine.state.unknown_writes.clear();
+
+        let mut child = Job::new("Delegated work");
+        child.state = JobState::Paused;
+        let mut child_input = engine.event(
+            &child.id,
+            "input",
+            json!({"message":Message::user("child"),"source":"job","sender_input":old}),
+        );
+        child_input.reply_to = None;
+        child_input.root_input = Some(old.clone());
+        child.active_input = Some(child_input.id.clone());
+        let mut failure = engine.event(&child.id, "failure", json!({"error":"child failed"}));
+        failure.reply_to = Some(child_input.id.clone());
+        failure.root_input = Some(old.clone());
+        let mut grandchild = Job::new("Live descendant");
+        grandchild.state = JobState::Ready;
+        let mut descendant = engine.event(&grandchild.id, "input", json!({"message":Message::user("descendant"),"source":"job","sender_input":child_input.id}));
+        descendant.root_input = Some(old.clone());
+        grandchild.inbox.push_back(descendant.id.clone());
+        let mut state = engine.state.clone();
+        state.jobs.insert(child.id.clone(), child);
+        state.jobs.insert(grandchild.id.clone(), grandchild);
+        engine
+            .commit(state, vec![child_input, failure, descendant])
+            .unwrap();
+        assert!(
+            engine
+                .ensure_input_resolvable(&owner, &old)
+                .unwrap_err()
+                .to_string()
+                .contains("delegated")
+        );
+        // Unanswered original proposals are also rejected, even if reconstructed
+        // from an older snapshot rather than the usual admission path.
+        let mut pending = cycles(&engine, &owner, 1, 16).remove(0);
+        pending.reply_to = Some(old.clone());
+        engine.append_history(&owner, pending).unwrap();
+        assert!(
+            engine
+                .ensure_input_resolvable(&owner, &old)
+                .unwrap_err()
+                .to_string()
+                .contains("unfinished native")
+        );
+    }
+
+    #[test]
+    fn failed_retained_child_blocks_parent_settlement_across_public_resume_until_completed() {
+        let (_directory, mut engine) = fixture_engine();
+        let old = engine.post("Parent implementation", None).unwrap();
+        engine.prepare_pending_input().unwrap();
+        engine.post("Current instruction", None).unwrap();
+        engine.prepare_pending_input().unwrap();
+        let owner = engine.state.focus.clone().unwrap();
+        let mut child = Job::new("Retained failed child");
+        let child_id = child.id.clone();
+        child.state = JobState::Paused;
+        let mut assigned = engine.event(&child_id, "input", json!({"message":Message::user("Continue parent implementation"),"source":"job","sender_input":old}));
+        assigned.reply_to = None;
+        assigned.root_input = Some(old.clone());
+        let assigned_id = assigned.id.clone();
+        child.active_input = Some(assigned_id.clone());
+        child.history.push(assigned_id.clone());
+        let mut failure = engine.event(
+            &child_id,
+            "failure",
+            json!({"error":"Build failed; correction is still needed"}),
+        );
+        failure.reply_to = Some(assigned_id.clone());
+        failure.root_input = Some(old.clone());
+        let mut state = engine.state.clone();
+        state.jobs.insert(child_id.clone(), child);
+        engine.commit(state, vec![assigned, failure]).unwrap();
+        assert_eq!(engine.terminal(&assigned_id).unwrap().kind, "failure");
+        let tool = resolution_proposal(
+            &mut engine,
+            &owner,
+            json!([{"input_id":old,"outcome":"completed","reason":"Cannot claim completion while failed child remains resumable"}]),
+        );
+        let before = engine.state.clone();
+        let event_count = engine.events().unwrap().len();
+        let error = engine.internal_tool(&owner, &tool).unwrap_err();
+        assert!(error.to_string().contains("retained delegated"));
+        assert_eq!(engine.state, before);
+        assert_eq!(engine.events().unwrap().len(), event_count);
+        let rejected = engine
+            .tool_result(
+                &owner,
+                &tool,
+                json!({"error":error.to_string()}),
+                None,
+                false,
+            )
+            .unwrap();
+        engine.append_history(&owner, rejected).unwrap();
+
+        engine.resume().unwrap();
+        assert_eq!(engine.state.jobs[&child_id].state, JobState::Ready);
+        assert_eq!(
+            engine.state.jobs[&child_id].active_input.as_deref(),
+            Some(assigned_id.as_str())
+        );
+        assert!(engine.terminal(&assigned_id).is_none());
+        assert!(engine.result(&old).is_none());
+        assert!(engine.state.jobs[&owner].inbox.contains(&old));
+        assert!(engine.ensure_input_resolvable(&owner, &old).is_err());
+
+        let response = engine.event(
+            &child_id,
+            "model_message",
+            json!({"response":native_response(Message::assistant("Build corrected and verified"))}),
+        );
+        let response_id = response.id.clone();
+        engine.append_history(&child_id, response).unwrap();
+        engine.deliver(&child_id, &response_id).unwrap();
+        assert!(engine.state.jobs[&child_id].active_input.is_none());
+        assert_eq!(engine.terminal(&assigned_id).unwrap().kind, "delivery");
+        let tool = resolution_proposal(
+            &mut engine,
+            &owner,
+            json!([{"input_id":old,"outcome":"completed","reason":"The child has now completed and provided verification","evidence_event_ids":[response_id]}]),
+        );
+        engine.internal_tool(&owner, &tool).unwrap();
+        assert_eq!(engine.result(&old).unwrap().kind, "input_resolved");
+        assert!(!engine.state.jobs[&owner].inbox.contains(&old));
+    }
+
     fn cycles(engine: &Engine, job: &str, count: usize, bytes: usize) -> Vec<Event> {
         use rig_core::message::{CallId, ToolFunction, ToolName};
         let mut events = Vec::new();
@@ -2517,6 +3015,7 @@ mod tests {
         let session = engine.state.id.clone();
         let workspace = engine.state.workspace.clone();
         drop(engine);
+        let mut previous_fresh = Vec::<String>::new();
         for round in 0..4 {
             let mut engine = Engine::open(
                 &directory.path().join("data"),
@@ -2532,13 +3031,25 @@ mod tests {
                 cache_bytes(&engine) < durable_bytes / 4,
                 "large original bodies leaked into live cache"
             );
-            assert!(engine.state.jobs[&job_id].history.len() <= 2);
+            if previous_fresh.is_empty() {
+                assert!(engine.state.jobs[&job_id].history.len() <= 2);
+            } else {
+                assert_eq!(
+                    engine.state.jobs[&job_id].history,
+                    [vec![input.clone()], previous_fresh.clone()].concat(),
+                    "Unobserved native results must survive summary and reopen"
+                );
+            }
             assert_eq!(
                 engine.read_event(&original_event.id).unwrap(),
                 original_event
             );
             engine.resume().unwrap();
             let events = cycles(&engine, &job_id, 8, 1024);
+            let fresh: Vec<_> = events[events.len() - 2..]
+                .iter()
+                .map(|event| event.id.clone())
+                .collect();
             let mut state = engine.state.clone();
             state
                 .jobs
@@ -2546,6 +3057,14 @@ mod tests {
                 .unwrap()
                 .history
                 .extend(events.iter().map(|e| e.id.clone()));
+            // New work responses consumed the previous round's fresh pair.
+            // The final pair has no subsequent committed work response yet.
+            let expected_covered: BTreeSet<_> = state.jobs[&job_id]
+                .history
+                .iter()
+                .filter(|id| *id != &input && !fresh.contains(id))
+                .cloned()
+                .collect();
             engine.commit(state, events).unwrap();
             let (_, covered) =
                 context::compaction_prefix(&engine.state.jobs[&job_id], &engine.events, 1, 96_000)
@@ -2553,8 +3072,13 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 covered.len(),
-                16,
+                if round == 0 { 14 } else { 16 },
                 "previously summarized IDs must not accumulate"
+            );
+            assert_eq!(
+                covered.iter().cloned().collect::<BTreeSet<_>>(),
+                expected_covered,
+                "Summary must cover exactly consumed pairs, never fresh or already summarized events"
             );
             let origin = Origin {
                 job: job_id.clone(),
@@ -2584,12 +3108,26 @@ mod tests {
                 })
                 .unwrap();
             task.abort();
-            assert_eq!(engine.state.jobs[&job_id].history, vec![input.clone()]);
+            assert_eq!(
+                engine.state.jobs[&job_id].history,
+                [vec![input.clone()], fresh.clone()].concat()
+            );
             assert_eq!(engine.state.jobs[&job_id].public_revision, 1);
             assert!(engine.pending_tools(&job_id).unwrap().is_empty());
             let history =
                 context::build_history(&engine.state.jobs[&job_id], &engine.events).unwrap();
-            assert_eq!(history.len(), 2);
+            assert_eq!(history.len(), 4);
+            let fresh_response: CompletionResponse = serde_json::from_value(
+                engine.read_event(&fresh[0]).unwrap().data["response"].clone(),
+            )
+            .unwrap();
+            assert_eq!(Some(history[2].clone()), fresh_response.message());
+            let fresh_result: Message = serde_json::from_value(
+                engine.read_event(&fresh[1]).unwrap().data["message"].clone(),
+            )
+            .unwrap();
+            assert_eq!(history[3], fresh_result);
+            previous_fresh = fresh;
             let page = engine.inspect(&json!({"job_id":job_id,"limit":2})).unwrap();
             assert!(page["next_before_id"].is_string());
             let next_page = engine

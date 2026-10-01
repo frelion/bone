@@ -41,6 +41,12 @@ pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
             &["question"],
         ),
         definition(
+            "input_resolve",
+            "Explicitly settle selected QUEUED inputs owned by your current job after considering their original requests. completed means their work is actually done; superseded means a newer instruction replaced that request, not that its work succeeded. Give a concrete nonempty reason and optional existing audit evidence event IDs. When the ACTIVE request incorporates earlier work, resolve those queued inputs only after their requirements are fulfilled or explicitly superseded. Leave independent work queued. Cannot resolve ACTIVE/foreign inputs, unknown writes, unfinished tool batches or live delegated assignments. Does not execute or cancel external work.",
+            json!({"resolutions":{"type":"array","minItems":1,"items":{"type":"object","properties":{"input_id":{"type":"string"},"outcome":{"type":"string","enum":["completed","superseded"]},"reason":{"type":"string","minLength":1},"evidence_event_ids":{"type":"array","items":{"type":"string"}}},"required":["input_id","outcome","reason"],"additionalProperties":false}}}),
+            &["resolutions"],
+        ),
+        definition(
             "pause_work",
             "Pause all work in this session when the user asks to stop. Use alone.",
             json!({"reason":{"type":"string"}}),

@@ -164,6 +164,138 @@ pub fn build_history(job: &Job, events: &BTreeMap<String, Event>) -> Result<Vec<
     Ok(result)
 }
 
+// Only a subsequent committed work response proves that the preceding results
+// were consumed. Summary responses and cancelled/failed work calls do not.
+fn fresh_tool_frontier(entries: &[(String, Message)]) -> Option<usize> {
+    let index = entries
+        .iter()
+        .rposition(|(_, message)| matches!(message, Message::Assistant { .. }))?;
+    matches!(&entries[index].1, Message::Assistant {content,..}
+        if content.iter().any(|part|matches!(part,AssistantContent::ToolCall(_))))
+    .then_some(index)
+}
+
+fn readable_result(content: &[rig_core::message::ToolResultContent]) -> Result<String> {
+    use rig_core::message::ToolResultContent;
+    let mut parts = Vec::new();
+    for part in content {
+        let value = match part {
+            ToolResultContent::Text(text) => {
+                match serde_json::from_str::<serde_json::Value>(&text.text) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        parts.push(text.text.clone());
+                        continue;
+                    }
+                }
+            }
+            ToolResultContent::Json { value } => value.clone(),
+            ToolResultContent::Image(_) => {
+                parts.push("[Image result; retrieve its original audit event]".into());
+                continue;
+            }
+        };
+        // Source and inspect pages carry a text field. Unescape its actual
+        // contents and keep the hash/page metadata beside the readable preview.
+        if let Some(mut object) = value.as_object().cloned()
+            && let Some(text) = object
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        {
+            object.remove("text");
+            if let Some(offset) = object.remove("next_offset") {
+                object.insert("original_result_next_offset".into(), offset);
+            }
+            parts.push(format!("{}\n{text}", serde_json::to_string(&object)?));
+        } else {
+            parts.push(serde_json::to_string(&value)?);
+        }
+    }
+    Ok(parts.join("\n"))
+}
+
+/// Project only fresh result bodies into a WORK request. Original events and
+/// native call IDs/names/arguments remain untouched. A single character budget
+/// is selected against the serialized whole history, including JSON escaping.
+pub fn bounded_work_history(
+    job: &Job,
+    events: &BTreeMap<String, Event>,
+    history_budget: usize,
+) -> Result<Option<Vec<Message>>> {
+    let (background, covered) = summary(job, events)?;
+    let entries = retained(job, events, &covered)?;
+    let Some(frontier) = fresh_tool_frontier(&entries) else {
+        return Ok(None);
+    };
+    let max_chars = entries[frontier..]
+        .iter()
+        .filter_map(|(_, message)| match message {
+            Message::User { content } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            UserContent::ToolResult(result) => Some(readable_result(&result.content)),
+            _ => None,
+        })
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .map(|text| text.chars().count())
+        .max()
+        .unwrap_or(0);
+    let candidate = |limit: usize| -> Result<Vec<Message>> {
+        let mut projected = entries.clone();
+        for (event_id, message) in &mut projected[frontier..] {
+            if let Message::User { content } = message {
+                for part in content {
+                    if let UserContent::ToolResult(result) = part {
+                        let text = readable_result(&result.content)?;
+                        let preview = rig_core::message::ToolResultContent::Json {
+                            value: serde_json::json!({
+                            "truncated":true,"event_id":event_id,"preview_source_chars":text.chars().count(),
+                                "preview":text.chars().take(limit).collect::<String>(),
+                            "instruction":"Incomplete readable tool preview. Start job_inspect(event_id=..., offset=0, limit=...) to retrieve exact original evidence; continue only using inspect.next_offset. Any original_result_next_offset belongs to the unabridged source result, not this preview. Inspect the omitted page tail before advancing read_file or claiming verification."
+                            }),
+                        };
+                        // Small results cost less than the reference wrapper;
+                        // keep those verbatim even in a projected batch.
+                        if serde_json::to_string(&result.content)?.chars().count()
+                            > serde_json::to_string(&vec![preview.clone()])?
+                                .chars()
+                                .count()
+                        {
+                            result.content = vec![preview];
+                        }
+                    }
+                }
+            }
+        }
+        let mut history = Vec::new();
+        history.extend(background.clone());
+        history.extend(projected.into_iter().map(|(_, message)| message));
+        Ok(history)
+    };
+    let mut best = candidate(0)?;
+    if serde_json::to_string(&best)?.chars().count() > history_budget {
+        // Required user inputs or the native tool call arguments themselves
+        // cannot fit. Never shrink or rewrite those arguments silently.
+        return Ok(None);
+    }
+    let (mut low, mut high) = (0, max_chars);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        let history = candidate(middle)?;
+        if serde_json::to_string(&history)?.chars().count() <= history_budget {
+            low = middle;
+            best = history;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(Some(best))
+}
+
 /// Count the whole native request, including instructions, tools, and options.
 pub fn serialized_chars(request: &CompletionRequest) -> Result<usize> {
     Ok(serde_json::to_string(request)?.chars().count())
@@ -185,7 +317,7 @@ pub fn compaction_prefix(
     max_prefix_chars: usize,
 ) -> Result<Option<(Vec<Message>, Vec<String>)>> {
     let (background, covered) = summary(job, events)?;
-    let entries = retained(job, events, &covered)?;
+    let mut entries = retained(job, events, &covered)?;
     let mut total = 0;
     if let Some(message) = &background {
         total += serde_json::to_string(message)?.chars().count();
@@ -197,6 +329,9 @@ pub fn compaction_prefix(
         return Ok(None);
     }
 
+    if let Some(frontier) = fresh_tool_frontier(&entries) {
+        entries.truncate(frontier);
+    }
     prefix_from_entries(job, background, entries, max_prefix_chars, true)
 }
 
@@ -438,10 +573,10 @@ mod tests {
         let (prefix, ids) = compaction_prefix(&job, &events, 1, usize::MAX)
             .unwrap()
             .unwrap();
-        assert_eq!(prefix.len(), 19);
+        assert_eq!(prefix.len(), 16);
         assert_eq!(
             ids.into_iter().collect::<BTreeSet<_>>(),
-            original_ids.into_iter().collect()
+            original_ids[..15].iter().cloned().collect()
         );
     }
 
@@ -508,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn one_large_complete_tool_cycle_can_be_compacted_but_an_unfinished_cycle_cannot() {
+    fn one_large_cycle_stays_fresh_until_the_next_committed_work_response() {
         let mut job = Job::new("work");
         let mut events = BTreeMap::new();
         let call = call("large-read", "read_file");
@@ -528,6 +663,37 @@ mod tests {
             &mut events,
             "tool_result",
             json!({"message":Message::tool_results(vec![call.result(vec![ToolResultContent::Json {value:json!({"text":"x".repeat(32*1024)})}])])}),
+        );
+        // A failed or cancelled work call did not consume these results.
+        append(
+            &mut job,
+            &mut events,
+            "model_failed",
+            json!({"error":"cancelled before response"}),
+        );
+        assert!(
+            compaction_prefix(&job, &events, 1, usize::MAX)
+                .unwrap()
+                .is_none()
+        );
+        let original = events.clone();
+        let bounded = bounded_work_history(&job, &events, 8000).unwrap().unwrap();
+        assert!(serde_json::to_string(&bounded).unwrap().chars().count() <= 8000);
+        assert_eq!(
+            bounded[0],
+            build_history(&job, &events).unwrap()[0],
+            "Native tool call arguments or identity changed"
+        );
+        assert_eq!(
+            events, original,
+            "Projection altered immutable audit events"
+        );
+        let next = self::call("next-work", "read_file");
+        append(
+            &mut job,
+            &mut events,
+            "model_message",
+            json!({"response":response(Message::Assistant {id:None,content:vec![AssistantContent::ToolCall(next)]})}),
         );
         let (prefix, covered) = compaction_prefix(&job, &events, 1, usize::MAX)
             .unwrap()
@@ -714,6 +880,13 @@ mod tests {
             json!({"message":Message::tool_results(vec![first.result(vec![ToolResultContent::Json {value:json!({"text":"a".repeat(32*1024)})}]),second.result(vec![ToolResultContent::Json {value:json!({"text":"b".repeat(32*1024)})}])])}),
         );
         let original = events[&result].clone();
+        let next = call("next-work", "read_file");
+        append(
+            &mut job,
+            &mut events,
+            "model_message",
+            json!({"response":response(Message::Assistant {id:None,content:vec![AssistantContent::ToolCall(next)]})}),
+        );
         let (prefix, covered) = compaction_prefix(&job, &events, 1, 16_000)
             .unwrap()
             .unwrap();
@@ -743,6 +916,30 @@ mod tests {
             events[&result], original,
             "original audit body must remain intact"
         );
+    }
+
+    #[test]
+    fn fresh_native_call_arguments_are_never_silently_shortened_to_fit() {
+        let mut job = Job::new("large edit");
+        let mut events = BTreeMap::new();
+        let mut edit = call("edit", "write_file");
+        edit.function.arguments =
+            json!({"path":"large.rs","content":"x".repeat(20_000),"expected_sha256":null});
+        append(
+            &mut job,
+            &mut events,
+            "model_message",
+            json!({"response":response(Message::Assistant {id:None,content:vec![AssistantContent::ToolCall(edit.clone())]})}),
+        );
+        append(
+            &mut job,
+            &mut events,
+            "tool_result",
+            json!({"message":Message::tool_result(edit.id,ToolName::new("write_file").unwrap(),"installed")}),
+        );
+        let original = events.clone();
+        assert!(bounded_work_history(&job, &events, 8000).unwrap().is_none());
+        assert_eq!(events, original);
     }
 
     #[test]
