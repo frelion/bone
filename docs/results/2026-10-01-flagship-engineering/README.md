@@ -32,3 +32,13 @@
 修正搜索 snippet 后，独立冻结工具合同 27/27 通过；明确选择该实现集成到主仓库。原始 BONE 自主候选仍单独运行，未被替换或提供实现反馈。新增 `search_files`、`edit_file` 和 `bone tools` 原生 schema 发现，执行路径继续经 Engine/Job，未修改调度器或增加持久状态。
 
 集成门禁：136 项 Rust 测试通过、1 项子进程 helper 忽略；fmt、全部 targets Clippy、全部 features 编译及 CLI build 通过。主仓库冻结二进制再经同一独立功能合同 27/27 通过。`sol-tools-initial.json`、`sol-tools-revised.json`、`sol-tools-integrated.json` 保存三次 verdict；`integration-manifest.json`、`integration-gates.json` 保存来源哈希与统一门禁。这是经外部反馈修复后的 Sol 辅助交付，不能用于宣称 6-luna 自主完成了这次工程任务。
+
+## 摘要任务边界修复与补充恢复
+
+第四轮超时后的两次补充恢复，分别使用 high、medium，在同一个原输入、同一份工程历史上再次遇到 180 秒摘要超时。两次都有大量流式正文，包含模拟工具调用及重复字符；并非没有响应。原生工具调用没有发生，未知写为空。固定 Rig 的 ChatGPT 订阅 wire 会移除 `max_output_tokens`，所以不能把本地摘要的 2048 配置当作服务端输出上限。短普通调用仍成功，但这不证明摘要路径正常。
+
+最小修复是在摘要资料之后追加原生用户任务：本次只总结，不能继续执行历史工程任务；仅本次摘要没有工具。它先计入请求固定开销，再选择历史，不创建持久输入、Job 或额外调用。独立离线比较同一失败快照：历史与 covered IDs 完全相同，请求由 119,229 增至 119,800 字符，低于 128k。这里比较的是重建的原生请求，不是捕获的 HTTP 包。见 `summary-request-comparison.json`、`summary-fix-summary-patch-review.json`。实际协议回归和完整统一门禁通过，见 `summary-fix-gates.json`。
+
+补充实验沿用 `aec1fa3` 的工具，仅应用这两处摘要实现修改，没有引入 Sol 工具实现或修改自主候选源码。6-luna/medium 的下一次摘要在 19.719 秒完成，第三阶段随后交付，普通“继续”、原始三项承诺回查、自然“停止”也完成。累计仍包含所有失败：62 次模型启动、5 次完成摘要、1,205.77 秒。独立审核确认回查实际读取原输入两页；解释/回查窗口所有 Job 没有新写或 shell，哈希不变；Session 原生暂停、未知写为空。原输入仍 pinned/queued，因此这项回查不能宣称冷历史检索。两个旧输入尚未结算，后续阶段和功能验收仍待完成，原门禁继续保留 `FAIL_time_cap`。见 `summary-fix-phase1-6-review.json`。
+
+这一次成功恢复说明修复帮助了这个具体故障，不是统计性消融结论，也不能证明任意长度、任意仓库的工程成功率。只读架构交叉审查未发现所审边界的新阻断项，范围与限制见 `architecture-review.json`。

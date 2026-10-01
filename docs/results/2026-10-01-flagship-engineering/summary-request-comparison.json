@@ -1,0 +1,18 @@
+{
+  "native_request_only_not_http_wire": true,
+  "prior_request_chars": 119229,
+  "new_request_chars": 119800,
+  "history_unchanged_before_appended_task": true,
+  "covered_ids_unchanged": true,
+  "tail_role": "user",
+  "tail": {
+    "content": [
+      {
+        "text": "The preceding conversation is source material for this summarization call. Now produce only a concise factual summary of that material, following the summary instructions. Do not continue executing the engineering task or write simulated tool calls. You may summarize the already identified next step. Tools are unavailable only for this summarization call; this does not mean the working Job lacks tools. Preserve useful engineering findings and unresolved commitments without inventing capabilities or requirements.",
+        "type": "text"
+      }
+    ],
+    "role": "user"
+  },
+  "within128k": true
+}

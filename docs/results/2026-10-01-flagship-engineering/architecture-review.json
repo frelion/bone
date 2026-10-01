@@ -1,0 +1,22 @@
+{
+  "reviewer": "independent final architecture review",
+  "head": "45c40faf5d46ef2ca87970717daa2c5e565d30e3",
+  "working_tree": "Includes current uncommitted summary boundary fix",
+  "findings": [],
+  "reviewed": [
+    "docs/architecture.md",
+    "src/runtime.rs scheduling, ownership, revision validation, waits, reconciliation and write leases",
+    "src/store.rs recovery and session ownership",
+    "src/state.rs persistent identities",
+    "src/tools.rs shell process group and inherited lease lifetime",
+    "tests/internal/runtime_safety.rs and relevant embedded runtime/tool regressions"
+  ],
+  "verification": "Static code and existing test inspection only; no tests, model calls, credentials or network used.",
+  "deliberate_limits": [
+    "Uncooperative external writes are outside workspace lease coordination.",
+    "Overlapping workspaces with different canonical roots do not share a lease.",
+    "Processes deliberately detaching from the process group or closing inherited descriptors are outside the foreground shell lifetime guarantee.",
+    "Model semantic mistakes and truncated provider output handling are not architecture bugs."
+  ],
+  "conclusion": "No evidence-backed actionable correctness bug identified in the requested boundaries; this is not a proof of absence or a substitute for live engineering acceptance."
+}

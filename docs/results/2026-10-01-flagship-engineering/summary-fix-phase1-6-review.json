@@ -1,0 +1,48 @@
+{
+  "original_gate_verdict": "FAIL_time_cap",
+  "supplementary_phase1_6_result": "natural_pause_completed",
+  "model_starts": 62,
+  "summary_count": 5,
+  "phase3_failure_rounds_preserved": 2,
+  "phase5_exact_delivery_pair": true,
+  "phase5_before_after_hashes_same": true,
+  "phase5_original_pages": [
+    {
+      "result_event_id": "923cd22a-f2ec-4cdb-97d5-7d357e31608e",
+      "offset": 0,
+      "next_offset": 3984,
+      "chars": 3984
+    },
+    {
+      "result_event_id": "ae85c660-c157-4695-ad6a-6e67942adea3",
+      "offset": 3984,
+      "next_offset": null,
+      "chars": 1012
+    }
+  ],
+  "phase5_commitments_original_read": {
+    "编辑只匹配原文件而不级联": true,
+    "搜索hash覆盖完整文件": true,
+    "read-only仍能源码搜索": true
+  },
+  "phase5_answer_references_original": true,
+  "phase5_cold_history_claim": false,
+  "phase5_cold_reason": "original remains queued/pinned; this is verified original lookup, not cold recovery",
+  "phase6_paused_native_events": [
+    "f9aca51d-2c7b-4174-a8de-dd64b0ddf5ef"
+  ],
+  "phase6_state_paused": true,
+  "phase6_result_kind": "input_paused",
+  "unknown_writes": {},
+  "retained_unsettled_inputs": [
+    {
+      "job_id": "fae547e8-c446-4c9d-a910-7797c065c014",
+      "input_ids": [
+        "1edd8802-205f-45b3-b81e-8216bebbf413",
+        "23d921fa-08e8-46a6-9d3d-4088c81a554e"
+      ]
+    }
+  ],
+  "settlement_status": "original initial input and clarification remain inbox; phase3/4 delivery does not settle those inputs. Final cold/settlement gate not yet satisfied.",
+  "overall_trial_pass": false
+}

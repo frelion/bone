@@ -69,6 +69,8 @@ route = "Responses"
 
 这里的 `api_key` 是 Rig 序列化的占位符，运行时从 `credential_env` 注入真实值。`additional_params` 是原生 `CompletionRequest` 的额外参数对象；例如 `[profiles.work.additional_params.reasoning]` 下的 `effort = "low"`，具体参数需被所选模型支持。
 
+`max_tokens` 也遵循 Rig 的原生 provider 行为。本次固定版本的 ChatGPT 订阅接入不向服务端发送 `max_output_tokens`，因此该路径不能用它保证输出 token 上限；BONE 的调用额度、上下文大小与运行时限仍独立生效。
+
 命令行可直接选择原生引用；已有配置时，`--model` 只覆盖所选（或默认）profile 的模型，保留凭据来源、额外参数和输出上限，并验证它们与新 provider 的兼容性。没有配置时创建命令行临时 recipe。`BONE_MODEL` 也可提供此引用。`.env.local` 不会自动加载。
 
 ```sh

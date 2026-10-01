@@ -1146,10 +1146,13 @@ impl Engine {
             params.remove("tools");
             params.remove("tool_choice");
         }
+        // Reserve the final native task before selecting a source prefix.
+        let mut summary_overhead = summary_template.clone();
+        summary_overhead.chat_history.push(context::summary_task());
         let summary_budget = self
             .options
             .context_chars
-            .saturating_sub(context::serialized_chars(&summary_template)? + 64);
+            .saturating_sub(context::serialized_chars(&summary_overhead)? + 64);
         if history_budget == 0 || summary_budget == 0 {
             self.fail(
                 id,
@@ -1195,6 +1198,7 @@ impl Engine {
         let covered = if let Some((messages, covered)) = compact {
             request = summary_template;
             request.chat_history.extend(messages);
+            request.chat_history.push(context::summary_task());
             Some(covered)
         } else {
             None

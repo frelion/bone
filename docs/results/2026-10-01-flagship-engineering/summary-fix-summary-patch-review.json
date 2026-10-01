@@ -1,0 +1,61 @@
+{
+  "patch_verdict": "no blocker found; suitable to commit as bounded summary task-boundary fix",
+  "changes": [
+    "one ephemeral native final User summary task",
+    "reserve serialized tail in summary_budget before prefix selection",
+    "append only in summary branch"
+  ],
+  "native_wire_regression_test": "Actual loopback Responses request asserts last input User summary task, no durable input ID/index impersonation, tools absent, fullrequest<=64000, consumed source beforetask, durable userinputcountunchanged.",
+  "counterexample_review": [
+    "Small context may select a shorter prefix or fail boundedly; final complete request check remains present.",
+    "A native User role here is internal summary task only; no durable Session input or Job/budget identity added.",
+    "This improves summary generation boundary; does not prove tool/results correctness, settlement/cold recovery or eliminate all degeneration."
+  ],
+  "prefix_comparison": {
+    "native_request_only_not_http_wire": true,
+    "prior_request_chars": 119229,
+    "new_request_chars": 119800,
+    "history_unchanged_before_appended_task": true,
+    "covered_ids_unchanged": true,
+    "tail_role": "user",
+    "tail": {
+      "content": [
+        {
+          "text": "The preceding conversation is source material for this summarization call. Now produce only a concise factual summary of that material, following the summary instructions. Do not continue executing the engineering task or write simulated tool calls. You may summarize the already identified next step. Tools are unavailable only for this summarization call; this does not mean the working Job lacks tools. Preserve useful engineering findings and unresolved commitments without inventing capabilities or requirements.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    },
+    "within128k": true
+  },
+  "all_job_readonly": [
+    {
+      "phase": 2,
+      "input_id": "407097f7-39eb-4bf8-a410-d926f2281ba0",
+      "exercise_status": "exercised",
+      "passed": true,
+      "start_index": 54,
+      "end_index_exclusive": 68,
+      "boundary": "delivery",
+      "boundary_id": "4e20890d-1665-4308-baf5-8051ec600ab5",
+      "violations": []
+    },
+    {
+      "phase": 5,
+      "input_id": "8a06b41b-fa05-4224-9864-693cb1a0b68c",
+      "exercise_status": "exercised",
+      "passed": true,
+      "start_index": 251,
+      "end_index_exclusive": 267,
+      "boundary": "delivery",
+      "boundary_id": "5010cea9-57e1-429c-824e-136c172f4c64",
+      "violations": []
+    },
+    {
+      "phase": 10,
+      "passed": null,
+      "exercise_status": "not_exercised"
+    }
+  ]
+}

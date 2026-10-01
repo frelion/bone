@@ -1,0 +1,60 @@
+[
+  {
+    "command": [
+      "cargo",
+      "fmt",
+      "--check"
+    ],
+    "exit_code": 0,
+    "seconds": 0.140198625,
+    "log": "/Users/zzhang/.bone/acceptance/2026-10-01-flagship-core/summary-fix-integration/1.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "--quiet"
+    ],
+    "exit_code": 0,
+    "seconds": 23.692706417,
+    "log": "/Users/zzhang/.bone/acceptance/2026-10-01-flagship-core/summary-fix-integration/2.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "clippy",
+      "--locked",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "seconds": 2.417602624999997,
+    "log": "/Users/zzhang/.bone/acceptance/2026-10-01-flagship-core/summary-fix-integration/3.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "check",
+      "--locked",
+      "--all-features"
+    ],
+    "exit_code": 0,
+    "seconds": 5.752996083999996,
+    "log": "/Users/zzhang/.bone/acceptance/2026-10-01-flagship-core/summary-fix-integration/4.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "bone"
+    ],
+    "exit_code": 0,
+    "seconds": 0.15999200000000258,
+    "log": "/Users/zzhang/.bone/acceptance/2026-10-01-flagship-core/summary-fix-integration/5.log"
+  }
+]

@@ -501,7 +501,52 @@ fixture.main()
         .unwrap();
     assert_eq!(last["summary"], false);
     if preload {
-        assert!(requests.iter().any(|request| request["summary"] == true));
+        let events = engine.events().unwrap();
+        let summary_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| request["summary"] == true)
+            .collect();
+        assert!(!summary_requests.is_empty());
+        for summary in summary_requests {
+            let body = &summary["body"];
+            assert!(
+                serde_json::to_string(body).unwrap().chars().count() <= 64_000,
+                "complete native wire summary request exceeds the context cap"
+            );
+            assert!(body["tools"].as_array().is_none_or(Vec::is_empty));
+            assert!(
+                body["instructions"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Summarize this job")
+            );
+            let items = body["input"].as_array().unwrap();
+            let task = items.last().expect("summary must end with a native task");
+            assert_eq!(task["role"], "user");
+            let task_text = task["content"][0]["text"].as_str().unwrap();
+            assert!(!task_text.is_empty());
+            assert!(
+                !task_text.contains("[BONE INPUT id="),
+                "summary task must not impersonate a posted user input"
+            );
+            assert!(
+                events.iter().all(|event| !task_text.contains(&event.id)),
+                "the last message must be the new task, not the source lookup index"
+            );
+            assert!(
+                items[..items.len() - 1].iter().any(|item| {
+                    serde_json::to_string(item)
+                        .unwrap()
+                        .contains("signed integer cents")
+                }),
+                "original consumed material must precede the task"
+            );
+        }
+        assert_eq!(
+            events.iter().filter(|event| event.kind == "input").count(),
+            2,
+            "ephemeral summary task must not create a durable input"
+        );
         assert!(
             serde_json::to_string(&last["body"])
                 .unwrap()
