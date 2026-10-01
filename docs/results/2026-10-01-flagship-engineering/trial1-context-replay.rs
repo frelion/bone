@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use serde_json::{Value,json};
 use rig_core::completion::{CompletionRequest,Message};
-#[path="/Users/zzhang/.codex/worktrees/flagship-engineering/BONE/src/state.rs"] mod state;
-#[path="/Users/zzhang/.codex/worktrees/flagship-engineering/BONE/src/context.rs"] mod context;
-#[path="/Users/zzhang/.codex/worktrees/flagship-engineering/BONE/src/tools.rs"] mod tools;
+#[path="/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial1/replay-frozen-src/state.rs"] mod state;
+#[path="/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial1/replay-frozen-src/context.rs"] mod context;
+#[path="/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial1/replay-frozen-src/tools.rs"] mod tools;
 struct Probe {state:state::SessionState}
 impl Probe {
 fn root(&self,input:&str)->Result<String>{Ok(input.to_owned())}

@@ -5,7 +5,7 @@
   "history_sha256": "0621f07612dc32fc5a168feb5ab61dc2b3e6eec26d73f4e84e665b27d71f2a78",
   "state_sha256": "3a028e32298c76eada576f25b2d7d2f9b2563ac750420fd756a267f2a81d1e12",
   "replay_source_path": "/Users/zzhang/Documents/ChatGPT/BONE/docs/results/2026-10-01-flagship-engineering/trial1-context-replay.rs",
-  "replay_source_sha256": "eae9ddaecc673079015d2d3ba140f15c39cf8d8881f08036cf9c6a5b47a176c9",
+  "replay_source_sha256": "8027b9293597b5ab52c6286776092cf7087cb9ae036223965d25f8f11bb5dfa0",
   "temporary_native_executable_path": "/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-request-probe-i7dvl5gr/probe",
   "temporary_native_executable_sha256": "6906c34f45db4b51e494353e5fbb13441dbda9e94d2139a0c97d14a1f1f04370",
   "native_source_hashes": {
@@ -303,5 +303,34 @@
     "Repaired counts isolate template-preservation change and keep original summaries unchanged; new user-background wrapper/prompt effects require regression and next real trial.",
     "Protocol-visible observation does not prove the model understood or retained code; no independent causal success claim.",
     "No raw reasoning, encrypted provider data, authorization headers, or credentials are included."
-  ]
+  ],
+  "initial_replay_evidence": {
+    "source_sha256": "eae9ddaecc673079015d2d3ba140f15c39cf8d8881f08036cf9c6a5b47a176c9",
+    "preserved_source_path": "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial1/trial1-context-replay-original.rs",
+    "executable_path": "/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-request-probe-i7dvl5gr/probe",
+    "executable_sha256": "6906c34f45db4b51e494353e5fbb13441dbda9e94d2139a0c97d14a1f1f04370",
+    "native_source_hashes": {
+      "/Users/zzhang/.codex/worktrees/flagship-engineering/BONE/src/state.rs": "e28b81f6af68cd9182702d8d08ecd4493cb428561d929f36d75ca3618e7f306d",
+      "/Users/zzhang/.codex/worktrees/flagship-engineering/BONE/src/context.rs": "777f644eae0ebdf05c3edf99767e88b1c5f7301e8e827976a17fc877ac1199dd",
+      "/Users/zzhang/.codex/worktrees/flagship-engineering/BONE/src/tools.rs": "6e0482bef0e08afe29a703032a89085323b531a28ae71b9b614073ae13a37cfc",
+      "/Users/zzhang/.codex/worktrees/flagship-engineering/BONE/src/runtime.rs": "4e0f702f497a2d5252b3fb60aeb9ecf2497d05a97bc610d5a59c31a24459e1d8"
+    }
+  },
+  "frozen_source_commit": "f468c0b48a01346bbbb59ecd2fec19c625d57238",
+  "frozen_native_source_hashes": {
+    "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial1/replay-frozen-src/runtime.rs": "4e0f702f497a2d5252b3fb60aeb9ecf2497d05a97bc610d5a59c31a24459e1d8",
+    "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial1/replay-frozen-src/tools.rs": "6e0482bef0e08afe29a703032a89085323b531a28ae71b9b614073ae13a37cfc",
+    "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial1/replay-frozen-src/state.rs": "e28b81f6af68cd9182702d8d08ecd4493cb428561d929f36d75ca3618e7f306d",
+    "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial1/replay-frozen-src/context.rs": "777f644eae0ebdf05c3edf99767e88b1c5f7301e8e827976a17fc877ac1199dd"
+  },
+  "reproduction_command": "python3 /Users/zzhang/Documents/ChatGPT/BONE/docs/results/2026-10-01-flagship-engineering/trial1-context-replay.py",
+  "reproduction_notes": "Verify saved source/export hashes, compile this Rust probe directly using cached pinned Rig rlibs into a fresh temporary directory, then replay exported events/state without network or production/candidate writes. The probe now loads immutable trial1/replay-frozen-src modules, independent of the current candidate checkout. Initial script/executable hashes are preserved separately.",
+  "reproduction_helper_path": "/Users/zzhang/Documents/ChatGPT/BONE/docs/results/2026-10-01-flagship-engineering/trial1-context-replay.py",
+  "reproduction_helper_sha256": "34efdaa133a4641e2e27603073d630ec46e7f60072162bf977cc3d576e560035",
+  "frozen_replay_verification": {
+    "result": "passed",
+    "requests_replayed": 48,
+    "projection_requests_matched": 3,
+    "scope": "All selected native budget/template-preservation metrics, source preview sizes, and original audit immutability match the first replay. No network requests or candidate writes."
+  }
 }
