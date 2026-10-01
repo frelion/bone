@@ -1,0 +1,33 @@
+{
+  "attempt": "4-clarified",
+  "outcome": "failed_original_phase3_time_budget",
+  "model": "chatgpt:gpt-6-luna",
+  "reasoning_effort": "high",
+  "context_chars": 128000,
+  "runner_commit": "aec1fa33c3b27817cbf05772ad8e340761698b38",
+  "initial_scope_clarification": true,
+  "session_id": "3f17c0e6-00e1-450a-8953-bfd351b666cc",
+  "original_input_id": "1edd8802-205f-45b3-b81e-8216bebbf413",
+  "exit_reason": "time_cap",
+  "model_starts": 50,
+  "completed_responses": 49,
+  "cancelled_unreported_calls": 1,
+  "observed_usage": {
+    "input_tokens": 849890,
+    "output_tokens": 18788,
+    "total_tokens": 868678
+  },
+  "complete_usage": null,
+  "cost": null,
+  "wall_seconds": 769.860575292,
+  "summary_count": 4,
+  "unknown_writes": {},
+  "first_source_mutation_preemption": true,
+  "phase2_all_job_no_writes": "passed_independent_persisted_audit",
+  "phase3": "source and documentation modified, self tests ran; no delivery within 600 seconds; active input retains 36 of 48 calls used",
+  "phases4_through10": "not_exercised",
+  "functional_verdict": "not_run_unfinished_delivery",
+  "source_origin": "BONE generated in isolated candidate, no Sol implementation feedback",
+  "private_artifact_directory": "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial4-clarified",
+  "supplemental_recovery": "planned separately; original failure remains a failure"
+}
