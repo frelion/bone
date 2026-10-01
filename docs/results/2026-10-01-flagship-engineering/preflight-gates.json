@@ -1,0 +1,55 @@
+[
+  {
+    "command": [
+      "cargo",
+      "fmt",
+      "--check"
+    ],
+    "returncode": 0,
+    "seconds": 0.111258709
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "--quiet"
+    ],
+    "returncode": 0,
+    "seconds": 24.310170791
+  },
+  {
+    "command": [
+      "cargo",
+      "clippy",
+      "--locked",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "returncode": 0,
+    "seconds": 1.9221162909999983
+  },
+  {
+    "command": [
+      "cargo",
+      "check",
+      "--locked",
+      "--all-features"
+    ],
+    "returncode": 0,
+    "seconds": 1.3439603330000018
+  },
+  {
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "bone"
+    ],
+    "returncode": 0,
+    "seconds": 2.221278667
+  }
+]

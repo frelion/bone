@@ -60,10 +60,10 @@ pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
     if !single_job {
         tools.extend([
             definition("job_send", "Send a bounded assignment to another internal job. Omit job_id to create one; otherwise continue an existing job. Returns input_id; wait on that exact input ID. Every created job shares this input's budget.", json!({"job_id":{"type":"string"},"title":{"type":"string"},"message":{"type":"string"}}), &["message"]),
-            definition("job_wait", "Suspend until the specified input IDs each receive a delivery or failure. Use alone; no polling and no model slot is occupied while waiting.", json!({"input_ids":{"type":"array","items":{"type":"string"},"minItems":1}}), &["input_ids"]),
+            definition("job_wait", "Suspend until the specified input IDs each receive a delivery, failure, or input_resolved with its explicit completed/superseded outcome. Use alone; no polling and no model slot is occupied while waiting.", json!({"input_ids":{"type":"array","items":{"type":"string"},"minItems":1}}), &["input_ids"]),
             definition("job_handoff", "Transfer the current original input and conversation focus to an idle existing job, or a new job if job_id is omitted. Only before tools have acted on this input; use alone. The target owns its response.", json!({"job_id":{"type":"string"},"title":{"type":"string"}}), &[]),
             definition("job_close", "Close an idle internal job while retaining its records. Current or busy jobs cannot be closed.", json!({"job_id":{"type":"string"}}), &["job_id"]),
-            definition("job_control", "Pause or resume another job after a changed user instruction. A resumed job receives current session instructions.", json!({"job_id":{"type":"string"},"state":{"type":"string","enum":["paused","ready"]}}), &["job_id","state"]),
+            definition("job_control", "Pause another job or explicitly authorize retry of its retained work with ready. Default session resume leaves old work under ended ancestors paused; ready is an explicit Agent action and retains its original input and shared budget. A retried job receives current session instructions.", json!({"job_id":{"type":"string"},"state":{"type":"string","enum":["paused","ready"]}}), &["job_id","state"]),
         ]);
     }
     tools

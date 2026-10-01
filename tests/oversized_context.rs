@@ -172,6 +172,7 @@ fixture.main()
         "CONTINUED_AFTER_OVERSIZED_BATCH"
     );
     let requests = read_requests(&requests);
+    let job_id = engine.read_event(&input).unwrap().job_id.unwrap();
     let mut saw_pair = false;
     for request in &requests {
         let items = request["body"]["input"].as_array().unwrap();
@@ -187,7 +188,15 @@ fixture.main()
                 );
                 assert!(items.iter().any(|item| item["type"] == "function_call_output" && item["call_id"] == id));
             }
-            saw_pair = true;
+            if request["summary"] == false {
+                saw_pair = true;
+                assert_work_instructions(&request["body"], &job_id, &input);
+                assert!(
+                    serde_json::to_string(items)
+                        .unwrap()
+                        .contains("Read both files using explicit 32 KiB limits")
+                );
+            }
             assert!(serde_json::to_string(items).unwrap().contains("truncated"));
         }
     }
@@ -432,6 +441,13 @@ fixture.main()
         "Fresh source pages were summarized before the work model could inspect them"
     );
     let items = first_continuation["body"]["input"].as_array().unwrap();
+    let job_id = engine.read_event(&input).unwrap().job_id.unwrap();
+    assert_work_instructions(&first_continuation["body"], &job_id, &input);
+    assert!(
+        serde_json::to_string(items)
+            .unwrap()
+            .contains("Inspect the four source files and follow file-page cursors")
+    );
     for (index, (_, original)) in sources.iter().enumerate() {
         let id = format!("source-{index}");
         assert!(
@@ -555,6 +571,15 @@ fixture.main()
         engine.event_text(engine.result(&input).unwrap()).unwrap(),
         "SOURCE_PAGES_CONSUMED"
     );
+}
+
+fn assert_work_instructions(body: &Value, job_id: &str, input_id: &str) {
+    let instructions = body["instructions"]
+        .as_str()
+        .expect("bounded work lost its native system preamble");
+    assert!(instructions.contains(&format!("currently working inside job {job_id}")));
+    assert!(instructions.contains(&format!("status=ACTIVE with ID {input_id}")));
+    assert!(instructions.contains("When the user asks to stop, call pause_work"));
 }
 
 fn tool_payload(event: &bone::state::Event) -> Value {

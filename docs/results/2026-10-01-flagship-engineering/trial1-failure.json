@@ -1,0 +1,39 @@
+{
+  "attempt": 1,
+  "outcome": "failed_before_first_source_mutation",
+  "runner_commit": "f468c0b48a01346bbbb59ecd2fec19c625d57238",
+  "contract_manifest_sha256": "263fc89ff3f8e508167c88a192a487cdc67827406721d9a5bda1136210fa3ebb",
+  "model": "chatgpt:gpt-6-luna",
+  "context_chars": 48000,
+  "wall_seconds": 318.236779584,
+  "model_starts": 48,
+  "summary_count": 11,
+  "source_changes": [],
+  "initial_input_id": "2e50dc27-5f94-48a6-b6f8-b460697c945a",
+  "session_id": "779b54a2-e51a-463b-8eda-8a0ad54bb22f",
+  "failure": "input call budget exhausted",
+  "metrics": {
+    "cost": null,
+    "elapsed_ms": 318190,
+    "input_tokens": 294174,
+    "model_calls": 48,
+    "observed_input_tokens": 294174,
+    "observed_output_tokens": 10505,
+    "output_tokens": 10505,
+    "total_tokens": 304679
+  },
+  "unknown_writes": {},
+  "functional_gate": "not_run: no implementation/delivery",
+  "phases2_through10": "not_exercised",
+  "coverage_passed": false,
+  "observed_core_invariants": [
+    "all model/tool calls attributed to jobs and root input",
+    "call budget enforced",
+    "no unknown write effects at stop"
+  ],
+  "private_evidence_directory": "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial1",
+  "inferences": [
+    "No claim that 11 summaries establish successful long-task execution.",
+    "Source-read repetition and summary authority drift require separate diagnosis."
+  ]
+}

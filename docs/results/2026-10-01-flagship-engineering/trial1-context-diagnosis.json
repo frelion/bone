@@ -1,0 +1,307 @@
+{
+  "trial": "2026-10-01-workspace-engineering-trial1",
+  "method": "Read-only replay of final exported events/state using actual frozen native Rig/source modules, standalone rustc linked cached rlibs; no Cargo shared-target build, network calls, or source/event mutation. Event indices are zero-based in phase1-6-history.json.",
+  "history_path": "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial1/phase1-6-history.json",
+  "history_sha256": "0621f07612dc32fc5a168feb5ab61dc2b3e6eec26d73f4e84e665b27d71f2a78",
+  "state_sha256": "3a028e32298c76eada576f25b2d7d2f9b2563ac750420fd756a267f2a81d1e12",
+  "replay_source_path": "/Users/zzhang/Documents/ChatGPT/BONE/docs/results/2026-10-01-flagship-engineering/trial1-context-replay.rs",
+  "replay_source_sha256": "eae9ddaecc673079015d2d3ba140f15c39cf8d8881f08036cf9c6a5b47a176c9",
+  "temporary_native_executable_path": "/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-request-probe-i7dvl5gr/probe",
+  "temporary_native_executable_sha256": "6906c34f45db4b51e494353e5fbb13441dbda9e94d2139a0c97d14a1f1f04370",
+  "native_source_hashes": {
+    "/Users/zzhang/.codex/worktrees/flagship-engineering/BONE/src/state.rs": "e28b81f6af68cd9182702d8d08ecd4493cb428561d929f36d75ca3618e7f306d",
+    "/Users/zzhang/.codex/worktrees/flagship-engineering/BONE/src/context.rs": "777f644eae0ebdf05c3edf99767e88b1c5f7301e8e827976a17fc877ac1199dd",
+    "/Users/zzhang/.codex/worktrees/flagship-engineering/BONE/src/tools.rs": "6e0482bef0e08afe29a703032a89085323b531a28ae71b9b614073ae13a37cfc",
+    "/Users/zzhang/.codex/worktrees/flagship-engineering/BONE/src/runtime.rs": "4e0f702f497a2d5252b3fb60aeb9ecf2497d05a97bc610d5a59c31a24459e1d8"
+  },
+  "rig_git_sha": "063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a",
+  "context_chars": 48000,
+  "call_counts": {
+    "work": 37,
+    "summary": 11,
+    "total": 48
+  },
+  "projection_requests": [
+    {
+      "audit_unmodified": true,
+      "event_index": 72,
+      "history_budget": 38558,
+      "new_bone_preamble_present": true,
+      "old_bone_preamble_present": false,
+      "overhead_chars": 9378,
+      "projected": true,
+      "purpose": "work",
+      "raw_request_chars": 52835,
+      "repaired_request_chars": 47935,
+      "summary_chars": 684,
+      "system_message_chars": 2880,
+      "tools": [
+        {
+          "body_bytes": 0,
+          "name": "read_file",
+          "preview_bytes": 30029,
+          "truncated": true
+        }
+      ],
+      "work_request_chars": 45054,
+      "fresh_event_ids": [
+        "fcd2de72-86d9-40de-abd1-b2993afb7e32",
+        "300b4cc3-ae62-4fd7-b21e-8546238a8105"
+      ],
+      "model_started_event_id": "77d33984-5312-4fab-a34c-664dcd96a3c2",
+      "native_budget_chars": 48000,
+      "request_delta_chars": 2881,
+      "delta_note": "2880 serialized system-message characters plus one message-array separator."
+    },
+    {
+      "audit_unmodified": true,
+      "event_index": 137,
+      "history_budget": 38558,
+      "new_bone_preamble_present": true,
+      "old_bone_preamble_present": false,
+      "overhead_chars": 9378,
+      "projected": true,
+      "purpose": "work",
+      "raw_request_chars": 51898,
+      "repaired_request_chars": 47935,
+      "summary_chars": 1805,
+      "system_message_chars": 2880,
+      "tools": [
+        {
+          "body_bytes": 0,
+          "name": "read_file",
+          "preview_bytes": 29002,
+          "truncated": true
+        }
+      ],
+      "work_request_chars": 45054,
+      "fresh_event_ids": [
+        "7990bab9-3de2-4f57-a1a8-32358a34dd13",
+        "3053a8a6-a258-477e-847f-41b851fce08c"
+      ],
+      "model_started_event_id": "e736bf6b-87a1-4801-9071-8a4456262b28",
+      "native_budget_chars": 48000,
+      "request_delta_chars": 2881,
+      "delta_note": "2880 serialized system-message characters plus one message-array separator."
+    },
+    {
+      "audit_unmodified": true,
+      "event_index": 152,
+      "history_budget": 38558,
+      "new_bone_preamble_present": true,
+      "old_bone_preamble_present": false,
+      "overhead_chars": 9378,
+      "projected": true,
+      "purpose": "work",
+      "raw_request_chars": 54665,
+      "repaired_request_chars": 47935,
+      "summary_chars": 987,
+      "system_message_chars": 2880,
+      "tools": [
+        {
+          "body_bytes": 0,
+          "name": "read_file",
+          "preview_bytes": 28288,
+          "truncated": true
+        }
+      ],
+      "work_request_chars": 45054,
+      "fresh_event_ids": [
+        "72ec820b-7ef5-4691-bd5e-a6f3ebbdcdb3",
+        "ea3a944b-d850-435a-9c2c-537b33263e21"
+      ],
+      "model_started_event_id": "023d92a6-285f-4896-baeb-7a3eafcd0644",
+      "native_budget_chars": 48000,
+      "request_delta_chars": 2881,
+      "delta_note": "2880 serialized system-message characters plus one message-array separator."
+    }
+  ],
+  "summary_fresh_crosschecks": [
+    {
+      "event_index": 33,
+      "event_id": "b056dbe3-de85-4bb8-85f3-a643a4a72345",
+      "summary_text_chars": 2401,
+      "observation_section_chars": 388,
+      "observation_section_method": "Characters in completed/current-progress/observed section, including status and generic observations; not a token or semantic accuracy score.",
+      "covered_count": 14,
+      "fresh_event_ids": [
+        "961e92ab-92e4-4e03-8e53-6721ca385fc1",
+        "f1041e5d-3a9c-496d-bee6-6637f47ee6fe"
+      ],
+      "covered_fresh_ids": [],
+      "source_input_still_pinned": true
+    },
+    {
+      "event_index": 43,
+      "event_id": "39724e14-8510-4161-8625-e3a9298940df",
+      "summary_text_chars": 2550,
+      "observation_section_chars": 473,
+      "observation_section_method": "Characters in completed/current-progress/observed section, including status and generic observations; not a token or semantic accuracy score.",
+      "covered_count": 4,
+      "fresh_event_ids": [
+        "e0c4b44d-b2d4-42b2-b3f2-6694316057f8",
+        "e22f7c02-82b1-4c91-bab0-826f56c84265"
+      ],
+      "covered_fresh_ids": [],
+      "source_input_still_pinned": true
+    },
+    {
+      "event_index": 61,
+      "event_id": "48ca73d5-b3eb-4c4f-bd43-781368dd4b6d",
+      "summary_text_chars": 670,
+      "observation_section_chars": 241,
+      "observation_section_method": "Characters in completed/current-progress/observed section, including status and generic observations; not a token or semantic accuracy score.",
+      "covered_count": 8,
+      "fresh_event_ids": [
+        "2e3c8db1-66f5-482b-b150-7da345c195e4",
+        "5ac177b9-7600-49b2-9f78-a8026e3e342b"
+      ],
+      "covered_fresh_ids": [],
+      "source_input_still_pinned": true
+    },
+    {
+      "event_index": 71,
+      "event_id": "0d303efc-714a-4f3a-a165-4d96e879533b",
+      "summary_text_chars": 604,
+      "observation_section_chars": 68,
+      "observation_section_method": "Characters in completed/current-progress/observed section, including status and generic observations; not a token or semantic accuracy score.",
+      "covered_count": 4,
+      "fresh_event_ids": [
+        "fcd2de72-86d9-40de-abd1-b2993afb7e32",
+        "300b4cc3-ae62-4fd7-b21e-8546238a8105"
+      ],
+      "covered_fresh_ids": [],
+      "source_input_still_pinned": true
+    },
+    {
+      "event_index": 76,
+      "event_id": "54588444-1731-4ca8-a6aa-2014275b4f95",
+      "summary_text_chars": 920,
+      "observation_section_chars": 168,
+      "observation_section_method": "Characters in completed/current-progress/observed section, including status and generic observations; not a token or semantic accuracy score.",
+      "covered_count": 2,
+      "fresh_event_ids": [
+        "ff9cea63-ca6f-4b01-8395-91ce7fc69ae2",
+        "369d0857-1c28-4258-b99d-d6a1d5e203c4"
+      ],
+      "covered_fresh_ids": [],
+      "source_input_still_pinned": true
+    },
+    {
+      "event_index": 124,
+      "event_id": "1663660a-686b-4c81-a2cc-0bf093c5af68",
+      "summary_text_chars": 3636,
+      "observation_section_chars": 350,
+      "observation_section_method": "Characters in completed/current-progress/observed section, including status and generic observations; not a token or semantic accuracy score.",
+      "covered_count": 28,
+      "fresh_event_ids": [
+        "95e62b83-3efd-4382-a6e1-79321cb4e681",
+        "1d29d596-f2e2-4112-b634-035766c5ce73"
+      ],
+      "covered_fresh_ids": [],
+      "source_input_still_pinned": true
+    },
+    {
+      "event_index": 130,
+      "event_id": "9d097073-9305-4ff4-b722-35d3a7b6e214",
+      "summary_text_chars": 1831,
+      "observation_section_chars": 311,
+      "observation_section_method": "Characters in completed/current-progress/observed section, including status and generic observations; not a token or semantic accuracy score.",
+      "covered_count": 2,
+      "fresh_event_ids": [
+        "8b81f643-eb45-4eb4-945e-ff26ad619075",
+        "d90dba1f-d630-448c-8521-beae510eee6f"
+      ],
+      "covered_fresh_ids": [],
+      "source_input_still_pinned": true
+    },
+    {
+      "event_index": 136,
+      "event_id": "a022f1a8-b29c-4cc4-bf67-8f761dc639b9",
+      "summary_text_chars": 1720,
+      "observation_section_chars": 225,
+      "observation_section_method": "Characters in completed/current-progress/observed section, including status and generic observations; not a token or semantic accuracy score.",
+      "covered_count": 2,
+      "fresh_event_ids": [
+        "7990bab9-3de2-4f57-a1a8-32358a34dd13",
+        "3053a8a6-a258-477e-847f-41b851fce08c"
+      ],
+      "covered_fresh_ids": [],
+      "source_input_still_pinned": true
+    },
+    {
+      "event_index": 142,
+      "event_id": "d2d56655-e812-4de8-b671-316bf6acbfab",
+      "summary_text_chars": 973,
+      "observation_section_chars": 254,
+      "observation_section_method": "Characters in completed/current-progress/observed section, including status and generic observations; not a token or semantic accuracy score.",
+      "covered_count": 2,
+      "fresh_event_ids": [
+        "59243d7a-719e-4f67-ac64-0b64021ec55f",
+        "786aea2b-acb2-4a9d-86cf-fe5add76dd6b"
+      ],
+      "covered_fresh_ids": [],
+      "source_input_still_pinned": true
+    },
+    {
+      "event_index": 151,
+      "event_id": "8edcd8b8-23ac-4356-8fe7-8f7408d27078",
+      "summary_text_chars": 908,
+      "observation_section_chars": 95,
+      "observation_section_method": "Characters in completed/current-progress/observed section, including status and generic observations; not a token or semantic accuracy score.",
+      "covered_count": 4,
+      "fresh_event_ids": [
+        "72ec820b-7ef5-4691-bd5e-a6f3ebbdcdb3",
+        "ea3a944b-d850-435a-9c2c-537b33263e21"
+      ],
+      "covered_fresh_ids": [],
+      "source_input_still_pinned": true
+    },
+    {
+      "event_index": 157,
+      "event_id": "3a4a50f2-4a08-4686-a9c6-0726cb408c9a",
+      "summary_text_chars": 908,
+      "observation_section_chars": 238,
+      "observation_section_method": "Characters in completed/current-progress/observed section, including status and generic observations; not a token or semantic accuracy score.",
+      "covered_count": 2,
+      "fresh_event_ids": [
+        "954e7b2b-6d7b-4e3b-8861-1fbb37582aa3",
+        "83f94dc7-fa2a-4de0-ae5c-97be84b10734"
+      ],
+      "covered_fresh_ids": [],
+      "source_input_still_pinned": true
+    }
+  ],
+  "summary_all_text_chars": 17121,
+  "summary_observation_sections_chars": 2811,
+  "input_original_text_chars": 4996,
+  "input_native_serialized_chars": 5069,
+  "input_with_routing_header_native_history_array_chars": 5372,
+  "authority_drift_examples": [
+    {
+      "event_index": 124,
+      "safe_excerpt": "CLI tool-schema discovery is a required part of the full task, despite the earlier background note calling it a later task."
+    },
+    {
+      "event_index": 136,
+      "safe_excerpt": "用户明确要求 CLI 工具目录发现先保留为后续待办，不要实现。"
+    },
+    {
+      "event_index": 151,
+      "safe_excerpt": "同一摘要既要求原生工具 schema 发现 CLI，又说保留 CLI 工具目录发现待办，不要实现。"
+    }
+  ],
+  "findings": [
+    "Three bounded WORK requests lost the entire native template/preamble; the earlier generated summary became their leading system instruction. Template preservation repair yields47935 native request chars within48000.",
+    "No summary covered the latest fresh native model/tool-result pair. Source previews in those three requests were28288–30029 UTF-8 bytes, not empty/tiny.",
+    "Most generated summary content restates original requirements still pinned verbatim; completed/observed section size is a coarse upper bound on useful engineering findings, not proof of technical memory.",
+    "Eleven 2048-token summary calls consumed the same48-call budget. Late turns alternate large re-read/work and summary. No claim that context increase or prompt changes alone guarantee engineering success."
+  ],
+  "source_storage_unchanged": true,
+  "limits": [
+    "Replay uses frozen source paths and cached native libraries; verify listed source/export hashes before reproduction.",
+    "Repaired counts isolate template-preservation change and keep original summaries unchanged; new user-background wrapper/prompt effects require regression and next real trial.",
+    "Protocol-visible observation does not prove the model understood or retained code; no independent causal success claim.",
+    "No raw reasoning, encrypted provider data, authorization headers, or credentials are included."
+  ]
+}
