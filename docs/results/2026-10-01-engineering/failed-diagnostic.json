@@ -1,0 +1,50 @@
+{
+  "outcome": "failed_interrupted_diagnostic_not_engineering_acceptance",
+  "counts": {
+    "input": 1,
+    "model_started": 25,
+    "model_message": 16,
+    "input_handled": 1,
+    "tool_started": 43,
+    "tool_result": 46,
+    "summary": 8
+  },
+  "model_starts_by_purpose": {
+    "work": 16,
+    "summary": 9
+  },
+  "completed_work_responses": 16,
+  "completed_summary_responses": 8,
+  "known_successful_usage": {
+    "cache_creation_input_tokens": 0,
+    "cached_input_tokens": 0,
+    "input_tokens": 126895,
+    "output_tokens": 6181,
+    "reasoning_tokens": 925,
+    "total_tokens": 133076
+  },
+  "aggregate_usage_known": false,
+  "aggregate_usage_reason": "25th started call is summary with no persisted response/usage before SIGTERM; completed usage is lower bound",
+  "elapsed_first_to_last_event_seconds": 188.138,
+  "read_counts_by_path": {
+    "src/store.rs": 9,
+    "src/main.rs": 8,
+    "src/lib.rs": 8,
+    "README.md": 3
+  },
+  "read_results_next_start_summary": 25,
+  "read_results_next_start_work": 3,
+  "current_source_diff_stat": "",
+  "planned_revision_pause_reached": false,
+  "bounded_preview_source_fact": "Frozen candidate base 36d338d src/context.rs uses original.chars().take(limit/12); caller clamps limit to 512..2048; hence preview content max170 chars, not512. Actual requests were not recorded; source establishes truncation mechanism, events establish covering-before-work order.",
+  "qualification": "Some final smaller read results precede a work start before later summary. Do not claim all original code results were unobserved. No feature implementation, delivery, pause/restart or requirement-update acceptance was reached.",
+  "evidence_sha256": {
+    "interrupted-diagnostic-events.json": "1a7b183f24b345e8009d611ffc8432dacd96f60ab8ac5d324fa440ea283bc00c",
+    "interrupted-diagnostic-state.json": "dadb4f45924502eb5dacf898a477754caadf832da0dad20da6af7832bbcfe19e",
+    "interrupted-diagnostic.json": "e0ca2e4b68f6187fd0f51d9b0bac02f847c2b2538037d1ef3aa50e48bd8d71db",
+    "experiment.json": "239b892dca79f4d8ecc3a5902a045ecebe8a554d49f97663c6d67dc7b448a280"
+  },
+  "total_tokens": null,
+  "cost": null,
+  "stop_reason": "Root sent SIGTERM after repeated read/summary cycles without implementation; planned revision/pause/restart not reached."
+}

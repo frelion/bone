@@ -9,14 +9,17 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
 pub const OUTPUT_LIMIT: usize = 32 * 1024;
+const DEFAULT_READ_LIMIT: usize = 8 * 1024;
 const FILE_LIMIT: u64 = 16 * 1024 * 1024;
+const DEFAULT_SHELL_TIMEOUT_SECONDS: u64 = 60;
+const MAX_SHELL_TIMEOUT_SECONDS: u64 = 3600;
 
 pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
     let mut tools = vec![
         definition(
             "read_file",
-            "Read a workspace UTF-8 file. Returns its SHA-256 for safe replacement; offset and limit are bytes.",
-            json!({"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}}),
+            "Read a bounded page of a workspace UTF-8 file. Default page is 8192 bytes; an explicit limit can request up to 32768 bytes. Follow next_offset with another read_file call until the needed code is available; a page is not the complete file. Returns the entire file's SHA-256 for safe replacement. offset and limit are bytes.",
+            json!({"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"default":DEFAULT_READ_LIMIT,"maximum":OUTPUT_LIMIT}}),
             &["path"],
         ),
         definition(
@@ -46,7 +49,7 @@ pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
     ];
     if !read_only {
         tools.push(definition("write_file", "Replace a workspace file using expected_sha256 from read_file. Content and file identity are checked again immediately before replacement; an external writer racing after that check can still change it. For a NEW file pass expected_sha256=null; creation never overwrites an existing target. Existing files are limited to 16 MiB. All contents must be provided.", json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":["string","null"]}}), &["path","content","expected_sha256"]));
-        tools.push(definition("shell", "Run a shell command in the workspace with the user's local privileges. Treat as a write operation. Output is bounded; timed-out commands require reconciliation. Prefer read_file/list_files for inspection.", json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":300}}), &["command"]));
+        tools.push(definition("shell", "Run a shell command in the workspace with the user's local privileges. Treat as a write operation. Default timeout is 60 seconds; choose a longer timeout up to 3600 seconds for builds or integration tests. The session's overall deadline still applies. Output is bounded; timed-out commands require reconciliation. Prefer read_file/list_files for inspection.", json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_SECONDS,"default":DEFAULT_SHELL_TIMEOUT_SECONDS}}), &["command"]));
     }
     if !single_job {
         tools.extend([
@@ -188,7 +191,7 @@ fn file_tool(workspace: &Path, name: &str, args: &Value) -> Result<Value> {
             let limit = (args
                 .get("limit")
                 .and_then(Value::as_u64)
-                .unwrap_or(OUTPUT_LIMIT as u64) as usize)
+                .unwrap_or(DEFAULT_READ_LIMIT as u64) as usize)
                 .min(OUTPUT_LIMIT);
             let mut end = start.saturating_add(limit).min(text.len());
             while !text.is_char_boundary(end) {
@@ -418,17 +421,27 @@ impl Drop for ProcessGroup {
     }
 }
 
+fn shell_timeout_seconds(args: &Value) -> Result<u64> {
+    let Some(value) = args.get("timeout_seconds") else {
+        return Ok(DEFAULT_SHELL_TIMEOUT_SECONDS);
+    };
+    let seconds = value
+        .as_u64()
+        .context("timeout_seconds must be an integer")?;
+    ensure!(
+        (1..=MAX_SHELL_TIMEOUT_SECONDS).contains(&seconds),
+        "timeout_seconds must be between 1 and {MAX_SHELL_TIMEOUT_SECONDS}"
+    );
+    Ok(seconds)
+}
+
 async fn shell(
     workspace: &Path,
     args: &Value,
     write_leases: Option<&[std::sync::Arc<std::fs::File>; 2]>,
 ) -> Result<ToolOutcome> {
     let command = string_arg(args, "command")?;
-    let seconds = args
-        .get("timeout_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(60)
-        .clamp(1, 300);
+    let seconds = shell_timeout_seconds(args)?;
     let mut cmd = tokio::process::Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(command)
@@ -490,6 +503,46 @@ async fn shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shell_timeout_accepts_long_builds_and_rejects_invalid_explicit_values() {
+        assert_eq!(shell_timeout_seconds(&json!({})).unwrap(), 60);
+        for seconds in [1, 60, 900, 3600] {
+            assert_eq!(
+                shell_timeout_seconds(&json!({"timeout_seconds":seconds})).unwrap(),
+                seconds
+            );
+        }
+        for value in [
+            json!(0),
+            json!(-1),
+            json!(3601),
+            json!(1.5),
+            json!("900"),
+            json!(true),
+            Value::Null,
+        ] {
+            let error = shell_timeout_seconds(&json!({"timeout_seconds":value})).unwrap_err();
+            assert!(error.to_string().contains("timeout_seconds"));
+        }
+    }
+
+    #[test]
+    fn shell_timeout_schema_matches_runtime_limits() {
+        let tool = definitions(true, false)
+            .into_iter()
+            .find(|tool| tool.name.as_str() == "shell")
+            .unwrap();
+        let schema = &tool.parameters["properties"]["timeout_seconds"];
+        assert_eq!(schema["type"], "integer");
+        assert_eq!(schema["minimum"], 1);
+        assert_eq!(schema["maximum"], MAX_SHELL_TIMEOUT_SECONDS);
+        assert_eq!(schema["default"], DEFAULT_SHELL_TIMEOUT_SECONDS);
+        assert_eq!(
+            shell_timeout_seconds(&json!({"timeout_seconds":schema["maximum"]})).unwrap(),
+            MAX_SHELL_TIMEOUT_SECONDS
+        );
+    }
+
     #[tokio::test]
     async fn replacements_require_matching_content() {
         let dir = tempfile::tempdir().unwrap();

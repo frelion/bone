@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "session_id": "985d43a6-2905-432e-a2ef-145648c35f36",
+  "sources": [
+    {
+      "path": "/Users/zzhang/.bone/acceptance/2026-10-01-engineering-aso_81nh/trial-2/resume/history.stdout",
+      "sha256": "ca16224761df4073a52f3dc41ace86c50151eeb6e61893afcd277519b88e952d"
+    },
+    {
+      "path": "/Users/zzhang/.bone/acceptance/2026-10-01-engineering-aso_81nh/trial-2/phase1.json",
+      "sha256": "ea77898f91b9b91bb6ded6606de9266b51bd5faf13d1130e7b81f4dad960b025"
+    },
+    {
+      "path": "/Users/zzhang/.bone/acceptance/2026-10-01-engineering-aso_81nh/trial-2/phase1-state.json",
+      "sha256": "25daaf93f498b4ccdf31ec443f47d5b1a97ad5b125a642504821d6f61729ff2d"
+    },
+    {
+      "path": "/Users/zzhang/.bone/acceptance/2026-10-01-engineering-aso_81nh/trial-2/resume/result.json",
+      "sha256": "5dfc76abc57d7e051b9dc2d9e08f6bbe5d0aa248e7a68d8661391c547c4b54e7"
+    },
+    {
+      "path": "/Users/zzhang/.bone/acceptance/2026-10-01-engineering-aso_81nh/trial-2/resume/sessions.stdout",
+      "sha256": "833905430c358907ce3b0a291ce399bc7fd1720d7f33439f55c76b0c0461fe9b"
+    },
+    {
+      "path": "/Users/zzhang/.bone/acceptance/2026-10-01-engineering-aso_81nh/trial-2/independent/cli-result.json",
+      "sha256": "c740704dec144df64a827e0803fdfa769335c81fe457769f5758bbdc06152e3e"
+    },
+    {
+      "path": "/Users/zzhang/.bone/acceptance/2026-10-01-engineering-aso_81nh/trial-2/independent/public-api-result.json",
+      "sha256": "4474b9daf81bf4d2d4d53a10f4bec225fcbc65538b945b8df710bab989d11911"
+    }
+  ],
+  "privacy": "Whitelist only event ownership metadata, native toolcall function arguments for shell commands, native tool results and usage; no response.raw, reasoning, encrypted content or signatures included. Long shell output has bounded excerpts plus exact original event references.",
+  "event_count": 123,
+  "event_counts": {
+    "input": 3,
+    "model_started": 28,
+    "model_message": 24,
+    "input_handled": 2,
+    "tool_started": 30,
+    "tool_result": 30,
+    "cancelled": 1,
+    "stopped": 1,
+    "summary": 3,
+    "delivery": 1
+  },
+  "checks": {
+    "expected_counts": true,
+    "unique_event_ids": true,
+    "single_session": true,
+    "all_model_and_tool_starts_owned": true,
+    "every_model_start_has_exactly_one_result_or_cancellation": true,
+    "all_30_external_tool_starts_have_matching_native_call_result_pairs": true,
+    "stale_tool_start_or_result_events_after_new_revision": [],
+    "paused_and_final_unknown_writes_empty": true,
+    "uncertain_tool_results": 0,
+    "paused_without_inflight_external_calls": true
+  },
+  "job_count": 1,
+  "multijob_exercised": false,
+  "input_lifecycle": [
+    {
+      "input_id": "c7a1dbdc-b4d4-402c-abc6-f24a02e97c42",
+      "revision": 1,
+      "source": "user"
+    },
+    {
+      "input_id": "426fbcb3-85f6-4d37-a43d-6c61624f0501",
+      "revision": 2,
+      "source": "user"
+    },
+    {
+      "input_id": "0fcfd1fa-85de-4b39-87c3-23468b9dc20c",
+      "revision": 4,
+      "source": "user"
+    }
+  ],
+  "pause_boundary": {
+    "requirement_revision": 2,
+    "cancelled": {
+      "id": "11c57140-69b3-49be-8919-cf5dd04da458",
+      "kind": "cancelled",
+      "revision": 2,
+      "job_id": "1b0189ee-3363-4bc8-8559-02b2ea6558fe",
+      "call_id": "16255736-a1cc-4b71-9fcb-a7ab2f36c8b8",
+      "reply_to": "426fbcb3-85f6-4d37-a43d-6c61624f0501",
+      "root_input": "426fbcb3-85f6-4d37-a43d-6c61624f0501"
+    },
+    "stopped": {
+      "id": "79fba20f-8008-490d-a7ef-c06c64ee826e",
+      "kind": "stopped",
+      "revision": 3,
+      "job_id": null,
+      "call_id": null,
+      "reply_to": null,
+      "root_input": null
+    },
+    "paused_state_revision": 3,
+    "phase1_exit_reason": "intentional_pause_after_revision_model_started",
+    "resumed_by_new_user_input_revision": 4,
+    "resume_method": "Separate CLI process posts ordinary continuation input, rather than public Engine::resume on same input."
+  },
+  "usage": {
+    "model_starts": 28,
+    "completed_calls_with_usage": 27,
+    "cancelled_calls_without_usage": 1,
+    "known_total_tokens_lower_bound": 243333,
+    "total_tokens": null,
+    "cost": null,
+    "reason": "Cancelled call has no usage; known usage is not the complete experiment token total. No price estimate."
+  },
+  "self_correction": {
+    "failed_fmt_commands": 1,
+    "failed_compile_commands": 1,
+    "other_failed_shell_commands": 0,
+    "format_correction": {
+      "failed_result": "a9d40b07-3cf9-4136-8e95-9983853d00bd",
+      "next_command_event": "c6511301-fb0a-487d-b06e-f0027b8f63d5",
+      "action": "BONE ran cargo fmt before cargo test."
+    },
+    "compile_correction": {
+      "failed_result": "b2caae1c-6295-4232-afb7-bd633ea292f2",
+      "next_command_event": "af95283f-321f-4f6f-b473-2fd9fcc88101",
+      "action": "BONE removed unsupported clap usize parser .range expression, formatted and reran cargo test successfully."
+    }
+  },
+  "final_validation": {
+    "cargo_test": {
+      "status": "passed_in_recorded_tool_result",
+      "result_event_id": "c54064df-1781-4f3c-a525-37fae16b449b",
+      "test_result_lines": [
+        "test result: ok. 73 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.99s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.25s",
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s",
+        "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s"
+      ]
+    },
+    "fmt_and_clippy": {
+      "status": "passed_in_recorded_tool_result",
+      "command": "cargo fmt --check && cargo clippy --all-targets -- -D warnings",
+      "result_event_id": "d3055ca6-1dc2-41fd-a856-d6eeadba6853",
+      "exit_code": 0
+    },
+    "git_diff_check": {
+      "status": "passed_in_recorded_tool_result",
+      "result_event_id": "6ce2e936-26c3-491c-b2c4-18a1d236e0e1",
+      "exit_code": 0
+    },
+    "independent_cli": {
+      "passed": true,
+      "passed_checks": 22,
+      "total_checks": 22,
+      "source": "/Users/zzhang/.bone/acceptance/2026-10-01-engineering-aso_81nh/trial-2/independent/cli-result.json"
+    },
+    "independent_public_api": {
+      "passed": true,
+      "passed_checks": 17,
+      "total_checks": 17,
+      "source": "/Users/zzhang/.bone/acceptance/2026-10-01-engineering-aso_81nh/trial-2/independent/public-api-result.json"
+    },
+    "correction_feedback_from_independent_grader": "None, as confirmed by root; all recorded BONE self-corrections precede independent grade."
+  },
+  "completion_scope": {
+    "latest_input_completed": true,
+    "delivery": {
+      "id": "af862690-9453-4c57-87fc-8783f828f193",
+      "kind": "delivery",
+      "revision": 4,
+      "job_id": "1b0189ee-3363-4bc8-8559-02b2ea6558fe",
+      "call_id": null,
+      "reply_to": "0fcfd1fa-85de-4b39-87c3-23468b9dc20c",
+      "root_input": "0fcfd1fa-85de-4b39-87c3-23468b9dc20c"
+    },
+    "final_unknown_writes": {},
+    "final_session_paused": false,
+    "final_jobs": [
+      {
+        "id": "1b0189ee-3363-4bc8-8559-02b2ea6558fe",
+        "state": "Ready",
+        "active_input": null,
+        "inbox": [
+          "c7a1dbdc-b4d4-402c-abc6-f24a02e97c42",
+          "426fbcb3-85f6-4d37-a43d-6c61624f0501"
+        ],
+        "current_call": null
+      }
+    ],
+    "whole_session_quiescence_proven": false,
+    "limitation": "Initial and changed-requirement inputs remain in the one Job inbox, state Ready. This trial proves latest continuation delivery and candidate grade, not that every historical input is terminal or no future step could resume an old input."
+  },
+  "projection": {
+    "omitted": "Per-call arrays and shell result bodies retained in private artifact root",
+    "full_audit_sha256": "b49d88b8a2c24dde834874789942c66496764282a5e5ac1982d5f98c0ceac90a"
+  }
+}

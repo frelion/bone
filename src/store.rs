@@ -177,6 +177,45 @@ impl Store {
             .collect()
     }
 
+    /// Read a bounded page in append order. The cursor must belong to this session.
+    pub fn history_page(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<Event>, bool)> {
+        ensure!(
+            (1..=1_000).contains(&limit),
+            "limit must be between 1 and 1000"
+        );
+        let mut sequence = 0_i64;
+        if let Some(cursor) = after {
+            sequence = self
+                .connection
+                .query_row(
+                    "SELECT sequence FROM events WHERE session_id = ?1 AND id = ?2",
+                    params![session_id, cursor],
+                    |row| row.get(0),
+                )
+                .with_context(|| format!("unknown cursor {cursor} for session {session_id}"))?;
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT payload FROM events WHERE session_id = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3"
+        )?;
+        let payloads = statement
+            .query_map(params![session_id, sequence, (limit + 1) as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_more = payloads.len() > limit;
+        let events = payloads
+            .into_iter()
+            .take(limit)
+            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .collect::<Result<Vec<Event>>>()?;
+        Ok((events, has_more))
+    }
+
     pub fn read_event(&self, session_id: &str, id: &str) -> Result<Event> {
         let payload: String = self
             .connection
@@ -528,6 +567,24 @@ mod tests {
         state.pending_inputs.push_back(input.id.clone());
         state.budgets.insert(input.id.clone(), Budget::new(5, 3));
         (directory, store, state, input)
+    }
+
+    #[test]
+    fn history_page_uses_append_order_and_bounded_cursor_reads() {
+        let (_directory, store, mut state, first) = fixture();
+        store.commit(&state, std::slice::from_ref(&first)).unwrap();
+        let mut second = Event::new(&state.id, "second", json!({"body":"original"}));
+        second.revision = 2;
+        state.revision = 2;
+        store.commit(&state, std::slice::from_ref(&second)).unwrap();
+        let (page, more) = store.history_page(&state.id, None, 1).unwrap();
+        assert_eq!(page, vec![first.clone()]);
+        assert!(more);
+        let (last, more) = store.history_page(&state.id, Some(&first.id), 1).unwrap();
+        assert_eq!(last, vec![second]);
+        assert!(!more);
+        assert!(store.history_page(&state.id, Some("unknown"), 1).is_err());
+        assert!(store.history_page(&state.id, None, 0).is_err());
     }
 
     #[test]

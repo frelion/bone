@@ -5,6 +5,21 @@ real runtime. It supplies only a dummy key and writes all state to temporary
 directories. It does not read personal configuration or make real model calls.
 The server records request bodies, never authorization headers.
 
+## Real repository engineering gate (2026-10-01)
+
+BONE implemented history pagination in this repository using `gpt-6-luna`, with
+an injected requirement change, a persisted pause and continuation in a new CLI
+process. A failed read/summary-loop diagnostic is retained. After reducing the
+default read page, the rerun's first delivery passed 22 frozen CLI checks and
+17 additional public API checks without implementation feedback. The exact
+candidate patch was integrated and those checks passed again alongside 102 Rust
+checks, formatting, Clippy and all-features compilation.
+
+The [engineering report](results/2026-10-01-engineering/README.md) preserves the
+task, failed attempt, independent verdicts, call ownership, unknown usage and
+coverage limits. This is one real repository feature, not evidence of general
+long-task reliability or an alternating performance ablation.
+
 ## Scenario fixtures
 
 `fixtures/acceptance/cases.json` describes six scenarios:
@@ -273,7 +288,7 @@ preparation and model start to verify that an older shared correction remains
 visible. A natural-pause regression drives the runtime after the next answer
 to ensure the old pause cannot trigger again.
 
-Two default 32 KiB file results exceed the 32,000-character request limit in the
+Two explicit 32 KiB file results exceed the 32,000-character request limit in the
 oversized-context fixture. It verifies a real summary, native call/result
 pairing, actual `job_inspect` pagination, eventual delivery, and both original
 SQLite records. The fallback was already implemented when this independent

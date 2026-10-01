@@ -1,0 +1,22 @@
+{
+  "exit_code": 0,
+  "wall_seconds": 198.10955479199998,
+  "response": {
+    "input_id": "0fcfd1fa-85de-4b39-87c3-23468b9dc20c",
+    "metrics": {
+      "cost": null,
+      "elapsed_ms": 197329,
+      "input_tokens": 190606,
+      "model_calls": 21,
+      "observed_input_tokens": 190606,
+      "observed_output_tokens": 4864,
+      "output_tokens": 4864,
+      "total_tokens": 195470
+    },
+    "question_id": null,
+    "session_id": "985d43a6-2905-432e-a2ef-145648c35f36",
+    "status": "completed",
+    "text": "已完成历史分页需求。工作区修改涉及 `src/store.rs`、`src/lib.rs`、`src/main.rs` 和 `README.md`。\n\n- 存储分页按 session 的持久化追加顺序读取事件正文，并至多额外读取一条记录判断 `has_more`；不会先载入整个会话再截取。\n- 提供公开 `bone::history_page(data_dir, session_id, after, limit)` API，以及 CLI 的 `--limit`、`--after` 分页选项。默认页大小为 100，有效范围为 1～1000；指定任一选项即启用分页。未分页时的 `bone::history` 和 CLI 输出保持原有行为。\n- 分页 JSON 提供 `events`、`next_cursor`、`has_more`；文本模式保留事件行并显示续读信息。未知 session 或无效游标会报错。\n- 文档说明了分页调用和游标用法，并注明分页读取原始事件内容，不需要模型配置、不发模型请求、不修改 session revision，也不获取执行 session 独占锁。\n- 新增存储分页回归测试，覆盖追加顺序、游标续读、末页状态、未知游标及无效页大小。\n\n**验证结果：**`cargo test` 通过（73 项通过，1 项忽略；集成测试和文档测试均通过）；`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings` 和 `git diff --check` 均通过。没有提交或推送 Git。",
+    "unknown_writes": {}
+  }
+}

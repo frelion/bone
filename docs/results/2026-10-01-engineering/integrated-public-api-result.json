@@ -1,0 +1,76 @@
+{
+  "passed": true,
+  "checks": [
+    {
+      "name": "api_first_page",
+      "passed": true
+    },
+    {
+      "name": "api_original_payload_not_metadata",
+      "passed": true
+    },
+    {
+      "name": "cli_original_payload_not_metadata",
+      "passed": true
+    },
+    {
+      "name": "api_max_limit",
+      "passed": true
+    },
+    {
+      "name": "api_empty_page",
+      "passed": true
+    },
+    {
+      "name": "api_unknown_session",
+      "passed": true
+    },
+    {
+      "name": "api_unknown_cursor",
+      "passed": true
+    },
+    {
+      "name": "api_cross_session_cursor",
+      "passed": true
+    },
+    {
+      "name": "api_invalid_limit_0",
+      "passed": true
+    },
+    {
+      "name": "api_invalid_limit_1001",
+      "passed": true
+    },
+    {
+      "name": "api_invalid_limit_18446744073709551615",
+      "passed": true
+    },
+    {
+      "name": "api_lookahead_bad_payload",
+      "passed": true
+    },
+    {
+      "name": "api_requested_bad_payload",
+      "passed": true
+    },
+    {
+      "name": "api_audit_while_execution_locked",
+      "passed": true
+    },
+    {
+      "name": "cli_audit_while_execution_locked",
+      "passed": true
+    },
+    {
+      "name": "no_config_created",
+      "passed": true
+    },
+    {
+      "name": "snapshot_unchanged",
+      "passed": true
+    }
+  ],
+  "caller": "/Users/zzhang/.bone/acceptance/2026-10-01-engineering-aso_81nh/trial-2/integrated/public-api-caller",
+  "caller_sha256": "a0ea66ccf7855582320354f6c3ae042173a011c03079f7913b592a09a9f2902a",
+  "scope": "additional contract checks; frozen CLI verifier remains unchanged"
+}

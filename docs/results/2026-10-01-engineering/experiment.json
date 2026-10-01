@@ -1,0 +1,20 @@
+{
+  "candidate_base_commit": "36d338d",
+  "candidate_workspace": "/Users/zzhang/.codex/worktrees/engineering-dogfood/BONE",
+  "runner_binary_sha256": "87dfca967ae66952f725d32150d8bdc5da067e51808e7e851bd9e484c0685b63",
+  "runner_source_patch_sha256": "50d8a659c1bb62bf48c6c32f48cda478bf7aaad580fffbe2cc68e1e5227de845",
+  "model": "chatgpt:gpt-6-luna",
+  "config_sha256": "046e27b9f13d3476fc70c4f3dd787b50ee0dbbf4756983b1b978082e13dd0c69",
+  "context_chars": 64000,
+  "max_parallel": 3,
+  "total_call_budget": 96,
+  "phase1_timeout_seconds": 900,
+  "resume_timeout_seconds": 1800,
+  "independent_contract_sha256": "cffc2430020c31ebcbb87030566941e01558acd72f09c5f8861d2391a484eb63",
+  "independent_verifier_sha256": "a59d6f3a687db301dd6b017b91a8a2cf1921824c6f0486757cded37e92f12453",
+  "preflight_rust_checks": 101,
+  "legacy_fixture_without_config_passed": true,
+  "driver_binary_sha256": "7ab6510dc409b75798b5a131e5229aa1d87b0dd97721891b8375adc63af11d75",
+  "driver_source_sha256": "11e7153f6e48696627cff2217662420b60c573a63799e2bae0715f00c1f7492b",
+  "change_from_first_diagnostic": "Default read_file page 8192 bytes; tool description explains next_offset. Same task/model/budget and clean candidate baseline."
+}

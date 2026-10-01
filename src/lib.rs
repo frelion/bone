@@ -52,3 +52,29 @@ mod provider_contract;
 #[cfg(test)]
 #[path = "../tests/internal/runtime_safety.rs"]
 mod runtime_safety;
+
+/// A page of original persisted events in append order.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryPage {
+    pub events: Vec<state::Event>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+/// Read at most `limit` events after an event ID (default limit 100; maximum 1000).
+pub fn history_page(
+    data_dir: &Path,
+    id: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<HistoryPage> {
+    let store = store::Store::open(data_dir.join("sessions.sqlite3"))?;
+    store.load_session(id)?;
+    let (events, has_more) = store.history_page(id, after, limit)?;
+    let next_cursor = events.last().map(|event| event.id.clone());
+    Ok(HistoryPage {
+        events,
+        next_cursor,
+        has_more,
+    })
+}

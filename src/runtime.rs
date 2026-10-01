@@ -506,9 +506,11 @@ impl Engine {
     }
 
     pub fn result(&self, input: &str) -> Option<&Event> {
+        let terminal_id = self.terminal(input).map(|event| &event.id);
         self.records().rev().find(|e| {
             (matches!(e.kind.as_str(), "delivery" | "failure" | "input_paused")
-                && e.reply_to.as_deref() == Some(input))
+                && e.reply_to.as_deref() == Some(input)
+                && (e.kind != "failure" || terminal_id == Some(&e.id)))
                 || (self.is_unanswered_question(e)
                     && (e.reply_to.as_deref() == Some(input)
                         || e.root_input.as_deref() == Some(input)))
@@ -2405,6 +2407,44 @@ mod tests {
         )
         .unwrap();
         (directory, engine)
+    }
+
+    #[test]
+    fn resumed_input_hides_historical_failure_until_new_result() {
+        let (_directory, mut engine) = fixture_engine();
+        let input = engine.post("Complete the implementation", None).unwrap();
+        engine.prepare_pending_input().unwrap();
+        let job = engine.state().focus.clone().unwrap();
+        engine.fail(&job, "temporary provider failure").unwrap();
+        let failure = engine.result(&input).unwrap().clone();
+        assert_eq!(failure.kind, "failure");
+
+        engine.resume().unwrap();
+        assert!(engine.result(&input).is_none());
+        assert!(engine.terminal(&input).is_none());
+        assert_eq!(engine.read_event(&failure.id).unwrap().kind, "failure");
+
+        let response = engine.event(
+            &job,
+            "model_message",
+            json!({"response":native_response(Message::assistant("Completed and verified"))}),
+        );
+        let response_id = response.id.clone();
+        engine.append_history(&job, response).unwrap();
+        engine.deliver(&job, &response_id).unwrap();
+        let delivered = engine.result(&input).unwrap();
+        assert_eq!(delivered.kind, "delivery");
+        assert_eq!(
+            engine.event_text(delivered).unwrap(),
+            "Completed and verified"
+        );
+        assert!(
+            engine
+                .events()
+                .unwrap()
+                .iter()
+                .any(|event| event.id == failure.id)
+        );
     }
 
     fn native_response(message: Message) -> CompletionResponse {

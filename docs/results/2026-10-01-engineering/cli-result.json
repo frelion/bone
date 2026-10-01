@@ -1,0 +1,95 @@
+{
+  "binary": "/Users/zzhang/.bone/acceptance/2026-10-01-engineering-aso_81nh/trial-2/independent/bone-candidate",
+  "binary_sha256": "0c698be78bdd7ce7646839e6e24c97940c620fd81f7d7c71bf9398f8d50d2025",
+  "passed": true,
+  "checks": [
+    {
+      "name": "legacy_array",
+      "passed": true
+    },
+    {
+      "name": "first_page_raw_order",
+      "passed": true
+    },
+    {
+      "name": "default_100_after",
+      "passed": true
+    },
+    {
+      "name": "exact_boundary",
+      "passed": true
+    },
+    {
+      "name": "last_cursor_empty",
+      "passed": true
+    },
+    {
+      "name": "empty",
+      "passed": true
+    },
+    {
+      "name": "one",
+      "passed": true
+    },
+    {
+      "name": "max_limit",
+      "passed": true
+    },
+    {
+      "name": "mixed_limit_full_walk",
+      "passed": true
+    },
+    {
+      "name": "reject_missing_1",
+      "passed": true
+    },
+    {
+      "name": "reject_primary_absent",
+      "passed": true
+    },
+    {
+      "name": "reject_primary_o-0000",
+      "passed": true
+    },
+    {
+      "name": "reject_primary_x' OR 1=1 --",
+      "passed": true
+    },
+    {
+      "name": "invalid_limit_0",
+      "passed": true
+    },
+    {
+      "name": "invalid_limit_1001",
+      "passed": true
+    },
+    {
+      "name": "invalid_limit_-1",
+      "passed": true
+    },
+    {
+      "name": "invalid_limit_abc",
+      "passed": true
+    },
+    {
+      "name": "lookahead_does_not_parse_damage",
+      "passed": true
+    },
+    {
+      "name": "requested_damage_fails",
+      "passed": true
+    },
+    {
+      "name": "append_and_reopen",
+      "passed": true
+    },
+    {
+      "name": "text_cursor",
+      "passed": true
+    },
+    {
+      "name": "snapshot_unchanged_no_config",
+      "passed": true
+    }
+  ]
+}

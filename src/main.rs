@@ -60,6 +60,10 @@ enum Command {
         session_id: String,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        after: Option<String>,
     },
     Providers {
         #[arg(long)]
@@ -156,13 +160,35 @@ async fn execute(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::History { session_id, json } => {
-            let events = bone::history(&data, session_id)?;
-            if *json {
-                println!("{}", serde_json::to_string(&events)?);
+        Command::History {
+            session_id,
+            json,
+            limit,
+            after,
+        } => {
+            if limit.is_some() || after.is_some() {
+                let page =
+                    bone::history_page(&data, session_id, after.as_deref(), limit.unwrap_or(100))?;
+                if *json {
+                    println!("{}", serde_json::to_string(&page)?);
+                } else {
+                    for event in &page.events {
+                        println!("{}  {}  {}", event.timestamp, event.kind, event.data);
+                    }
+                    println!(
+                        "next_cursor: {}",
+                        page.next_cursor.as_deref().unwrap_or("null")
+                    );
+                    println!("has_more: {}", page.has_more);
+                }
             } else {
-                for event in events {
-                    println!("{}  {}  {}", event.timestamp, event.kind, event.data);
+                let events = bone::history(&data, session_id)?;
+                if *json {
+                    println!("{}", serde_json::to_string(&events)?);
+                } else {
+                    for event in events {
+                        println!("{}  {}  {}", event.timestamp, event.kind, event.data);
+                    }
                 }
             }
         }

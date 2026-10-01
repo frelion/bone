@@ -109,7 +109,14 @@ bone --profile work run '后续要求：仅修改 parser.rs' --session SESSION_I
 
 默认每个根用户输入与它引起的内部工作共享 64 次模型调用和 16 个新 Job 的预算，最多同时执行 3 个动作。可以通过 `--max-calls`、`--max-jobs`、`--max-parallel`、`--context-chars`、`--model-timeout-seconds` 和 `--timeout-seconds` 控制运行。`--single-job` 与 `--no-compaction` 用于消融。上下文摘要压缩预算内已完成的安全前缀，保留未处理输入的原文，不拆散工具调用与结果的配对。如果一个完整批次本身超过摘要预算，摘要请求使用带原文引用的有界结果预览。
 
-摘要后的原文仍在 SQLite，Agent 可按事件 ID 分页回查。Idle/Closed Job 的历史正文按需加载；会话事件元信息仍随历史增长。`bone history` 是完整审计读取，可能占用较多内存。
+摘要后的原文仍在 SQLite，Agent 可按事件 ID 分页回查。Idle/Closed Job 的历史正文按需加载；会话事件元信息仍随历史增长。`bone history` 是完整审计读取，可能占用较多内存。长会话可按事件 ID 有界续读：
+
+```sh
+bone history SESSION_ID --limit 100 --json
+bone history SESSION_ID --after LAST_EVENT_ID --limit 100 --json
+```
+
+任一分页选项启用分页模式；默认页大小为 100，有效范围为 1～1000。分页 JSON 包含 `events`、`next_cursor` 和 `has_more`；将非空页的 `next_cursor` 作为下一次 `--after`。文本分页保留事件行并显示相同续读信息。分页按存储追加顺序读取原始事件（包括摘要压缩前的内容），未知 session 或不属于该 session 的游标会报错。Rust 调用方可使用 `bone::history_page(data_dir, session_id, after, limit)`；该只读审计 API 不需要模型配置或请求，不修改 session revision，也不取得执行 session 独占锁。
 
 Rust 库的执行操作通过 `runtime::Engine`：`post`、`step`、`stop`、`resume`。`state()` 和 `options()` 只读；`read_event`、`events` 以及库级 `sessions`、`session`、`history` 供观察与审计。模型、工具和存储实现不直接公开，避免绕过 Job 的归属和恢复规则。
 
@@ -117,7 +124,11 @@ Rust 库的执行操作通过 `runtime::Engine`：`post`、`step`、`stop`、`re
 
 `--read-only` 禁用 `write_file` 与 `shell`。文件工具限制在 workspace 内，拒绝路径向上遍历和已知 symlink escape。`write_file` 必须携带读取结果的 SHA-256；创建新文件使用 `expected_sha256 = null`。
 
+`read_file` 默认返回 8 KiB，按 `next_offset` 继续读取；显式 `limit` 最大为 32 KiB。较小默认页减少多文件批次在工作模型看到源码前就触发预览摘要的情况。显式大页或过多并行读取仍可能超过上下文上限。
+
 `shell` 在 workspace 中以当前本地用户权限运行，没有 OS sandbox。命令超时或取消时会终止所启动的进程组；输出最多保留每个流 32 KiB。不要把进程组终止等同于撤销已发生的外部效果。
+
+命令默认超时为 60 秒；编译或集成测试可显式指定 `timeout_seconds`，有效范围 1～3600 秒。`run` / `resume` 的整体 `--timeout-seconds` 截止时间仍适用。无效超时值会报错；真正超时或取消后仍需核查未知写，不会自动重试。
 
 中断或无法确认完成的写操作记录为未知写；进一步写入需要先核查。文件替换后目录同步失败也属于未知效果。查看 session history 与实际文件/外部状态，再记录观察：
 
@@ -169,6 +180,8 @@ python3 -B -m unittest discover -s tests -p 'test_ablate.py' -v
 长会话加固后的离线验收通过 97 项 Rust 检查（含 3 项公共接口编译失败检查）、5 项 Python 测试、Clippy 和全部 feature 编译。包括 12 轮续接、多次压缩、跨 Job 原始要求回查、当前与排队输入区分、纠正指令恢复、真实硬杀 shell、存储故障注入及稳定订阅锁。2,200 条大事件经四次压缩重开后，原文仍能回查。
 
 两次真实 12 轮复杂任务的完整验收均保留失败：一次摘要遗漏具体待办，一次首轮网络失败后旧输入干扰当前任务、UTC 功能漏实现。修复后在原 Session 续接，已从冷历史查回具体要求；明确纠错后原 9 项功能检查全过。它验证了长会话恢复与纠错链路，尚不能作为无人干预任务成功率的保证。
+
+2026-10-01 真实仓库验收中，BONE 使用 `gpt-6-luna` 自行实现了本项目的历史分页，覆盖存储、公共 API、CLI、测试和文档，并经历需求追加及暂停后跨进程续做。修复默认读取过大导致的首轮停滞后，重跑的首次交付通过独立检查 39/39；集成后 Rust 检查 102 项通过。首轮失败、28 次模型调用和 3 次摘要的重跑证据见 [工程验收记录](docs/results/2026-10-01-engineering/README.md)。这是一个真实需求的成功样本，尚未证明数小时或大型陌生仓库任务的稳定性。
 
 此前重写阶段，复用现有 Codex 登录、使用 `chatgpt:gpt-6-luna` 的中文连续对话 5/5 通过，覆盖解释、修改、继续、停止与恢复。正式消融 18 次中 15 次通过；三个失败均为关闭压缩后的上下文超限。小任务多 Job 开销更高，不能据此宣称普遍效率收益。
 

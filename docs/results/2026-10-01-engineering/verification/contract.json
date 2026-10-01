@@ -1,0 +1,34 @@
+{
+  "task": "bounded original history pagination",
+  "version": 1,
+  "flags": {
+    "limit": {
+      "default": 100,
+      "min": 1,
+      "max": 1000
+    },
+    "after": "exclusive event ID scoped to session"
+  },
+  "ordering": "persisted append sequence",
+  "json_page": {
+    "events": "original Event[]",
+    "next_cursor": "last returned ID or null for empty page",
+    "has_more": "boolean; row lookahead without parsing unreturned payload"
+  },
+  "compatibility": [
+    "bone::history unchanged",
+    "unpaginated CLI JSON array unchanged"
+  ],
+  "required": [
+    "public Rust pagination API",
+    "offline tests",
+    "documentation",
+    "unknown session/cursor and cross-session cursor rejected",
+    "new appends readable",
+    "bounded payload reading",
+    "audit without configuration/model requests"
+  ],
+  "hidden_tests_visible_to_candidate": false,
+  "markdown_sha256": "cffc2430020c31ebcbb87030566941e01558acd72f09c5f8861d2391a484eb63",
+  "verifier_sha256": "a59d6f3a687db301dd6b017b91a8a2cf1921824c6f0486757cded37e92f12453"
+}

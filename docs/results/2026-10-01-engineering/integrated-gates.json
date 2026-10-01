@@ -1,0 +1,61 @@
+{
+  "commands": [
+    {
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.122
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--quiet"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 25.149
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 3.856
+    },
+    {
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "--all-features"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 6.199
+    },
+    {
+      "command": [
+        "cargo",
+        "build",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 7.704
+    }
+  ],
+  "rust_passed": 102,
+  "cli_checks": 22,
+  "public_api_checks": 17,
+  "binary_sha256": "27cb47aa96e88d51f339240adc12c36b8515db82f6362abe066e304cbd4ed830",
+  "candidate_patch_sha256": "cf464982024e5f44f50381c2b548be113c718bfecb141e834f1b3dbde5e44df1",
+  "candidate_source_exactly_integrated": true
+}
