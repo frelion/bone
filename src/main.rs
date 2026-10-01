@@ -69,6 +69,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Describe usable tool schemas without configuration, authentication or execution.
+    Tools {
+        #[arg(long)]
+        read_only: bool,
+        #[arg(long)]
+        single_job: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Sign in to a ChatGPT subscription profile using Rig's device flow.
     Login,
     /// Print a minimal native provider configuration.
@@ -132,8 +141,25 @@ async fn main() {
 }
 
 async fn execute(cli: Cli) -> Result<()> {
+    if let Command::Tools {
+        read_only,
+        single_job,
+        json,
+    } = &cli.command
+    {
+        let definitions = bone::tool_definitions(*single_job, *read_only);
+        if *json {
+            println!("{}", serde_json::to_string(&definitions)?);
+        } else {
+            for definition in definitions {
+                println!("{}\t{}", definition.name, definition.description);
+            }
+        }
+        return Ok(());
+    }
     let data = cli.data_dir.clone().unwrap_or_else(default_data_dir);
     match &cli.command {
+        Command::Tools { .. } => unreachable!("metadata command returned before session setup"),
         Command::Providers { json } => {
             let names = bone::providers();
             if *json {

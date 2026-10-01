@@ -26,6 +26,16 @@ mod tools;
 
 pub use model::{login, providers};
 
+/// Describe available tools without opening configuration or an execution session.
+/// These are the actual native Rig schemas used by the runtime; this metadata
+/// function does not expose the private tool executor.
+pub fn tool_definitions(
+    single_job: bool,
+    read_only: bool,
+) -> Vec<rig_core::completion::ToolDefinition> {
+    tools::definitions(single_job, read_only)
+}
+
 use std::path::Path;
 
 /// Inspect saved sessions without taking execution ownership.
@@ -61,7 +71,7 @@ pub struct HistoryPage {
     pub has_more: bool,
 }
 
-/// Read at most `limit` events after an event ID (default limit 100; maximum 1000).
+/// Read at most `limit` events after an event ID. Rust callers supply 1–1000; the CLI default is 100.
 pub fn history_page(
     data_dir: &Path,
     id: &str,

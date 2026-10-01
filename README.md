@@ -4,6 +4,18 @@ BONE 是一个 Rust 编写的 coding agent。用户与一个 agent 对话；agen
 
 这是从零重写的单 crate 实现。模型连接、消息、工具定义、返回结果和流解析使用官方 Rig SDK，固定到 Git 提交 `063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a`。会话状态与事件存于 SQLite。架构边界见 [architecture.md](docs/architecture.md)，验收和消融方法见 [verification.md](docs/verification.md)。
 
+## 查看可用工具
+
+```sh
+bone tools
+bone tools --json
+bone tools --read-only --single-job --json
+```
+
+该命令只输出运行时使用的 Rig 原生 `ToolDefinition` 元数据；JSON 为定义数组，文本为名称与描述。它不读取配置或认证、不连接模型、不创建会话，也不执行文件工具。`--read-only` 保留 `search_files`，移除 `edit_file`、`write_file` 和 `shell`；`--single-job` 移除跨 Job 控制工具，保留当前 Job 的普通工具。传入全局 profile/model 选项不会触发模型配置。
+
+普通搜索和编辑仍须经过 `run/chat → Engine → Job → tool`，元数据入口不公开执行器。工具用法、实现来源与验证边界见 [工程工具](docs/engineering-tools.md)。
+
 ## 构建与配置
 
 需要 Rust 1.96 或更新版本；本地协议验收还需要 Python 3。
@@ -122,7 +134,7 @@ Rust 库的执行操作通过 `runtime::Engine`：`post`、`step`、`stop`、`re
 
 ## 工具权限与中断写入
 
-`--read-only` 禁用 `write_file` 与 `shell`。文件工具限制在 workspace 内，拒绝路径向上遍历和已知 symlink escape。`write_file` 必须携带读取结果的 SHA-256；创建新文件使用 `expected_sha256 = null`。
+`--read-only` 禁用 `edit_file`、`write_file` 与 `shell`，保留 `search_files` 等读取工具。文件工具限制在 workspace 内，拒绝路径向上遍历和已知 symlink escape。`write_file` 必须携带读取结果的 SHA-256；创建新文件使用 `expected_sha256 = null`。
 
 `read_file` 默认返回 8 KiB，按 `next_offset` 继续读取；显式 `limit` 最大为 32 KiB。刚返回的结果先交给工作模型；超限时压缩更早的已消费历史，再为新结果提供带原文引用的有界预览。Agent 可回查原事件补全省略部分。单条用户输入或原生调用参数本身无法装入上下文时仍会明确失败。
 

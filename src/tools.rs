@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use rig_core::completion::ToolDefinition;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -21,6 +22,12 @@ pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
             "Read a bounded page of a workspace UTF-8 file. Default page is 8192 bytes; an explicit limit can request up to 32768 bytes. Follow next_offset with another read_file call until the needed code is available; a page is not the complete file. Returns the entire file's SHA-256 for safe replacement. offset and limit are bytes.",
             json!({"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"default":DEFAULT_READ_LIMIT,"maximum":OUTPUT_LIMIT}}),
             &["path"],
+        ),
+        definition(
+            "search_files",
+            "Search exact nonempty text in a workspace UTF-8 file or directory tree. Default limit 50, maximum 200. Results are ordered by relative path then UTF-8 byte offset; follow next_cursor for remaining matches. Symlinks, .git/target/node_modules/.bone directories, binary/non-UTF8 and files over 16 MiB are skipped. Snippets contain at most 1024 characters; queries longer than that may have their tail omitted. Cursor verifies request, exclusions, source hash and position; concurrent tree mutation is not snapshot-isolated.",
+            json!({"query":{"type":"string","minLength":1},"path":{"type":"string","default":"."},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50},"cursor":{"type":"string"}}),
+            &["query"],
         ),
         definition(
             "list_files",
@@ -54,6 +61,7 @@ pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
         ),
     ];
     if !read_only {
+        tools.push(definition("edit_file", "Apply exact text edits to an existing workspace UTF-8 file (at most 16 MiB) using its whole-file expected_sha256. Each old_text must occur exactly once in the original source, including overlapping occurrences; edit spans cannot overlap. All edits are validated before replacement and do not cascade. Untouched bytes and permissions are preserved. Final identity checks narrow external-writer races but are not atomic CAS.", json!({"path":{"type":"string"},"expected_sha256":{"type":"string"},"edits":{"type":"array","minItems":1,"items":{"type":"object","properties":{"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"}},"required":["old_text","new_text"],"additionalProperties":false}}}), &["path","expected_sha256","edits"]));
         tools.push(definition("write_file", "Replace a workspace file using expected_sha256 from read_file. Content and file identity are checked again immediately before replacement; an external writer racing after that check can still change it. For a NEW file pass expected_sha256=null; creation never overwrites an existing target. Existing files are limited to 16 MiB. All contents must be provided.", json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":["string","null"]}}), &["path","content","expected_sha256"]));
         tools.push(definition("shell", "Run a shell command in the workspace with the user's local privileges. Treat as a write operation. Default timeout is 60 seconds; choose a longer timeout up to 3600 seconds for builds or integration tests. The session's overall deadline still applies. Output is bounded; timed-out commands require reconciliation. Prefer read_file/list_files for inspection.", json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_SECONDS,"default":DEFAULT_SHELL_TIMEOUT_SECONDS}}), &["command"]));
     }
@@ -83,11 +91,14 @@ fn definition(
 }
 
 pub fn is_external(name: &str) -> bool {
-    matches!(name, "read_file" | "list_files" | "write_file" | "shell")
+    matches!(
+        name,
+        "read_file" | "list_files" | "search_files" | "write_file" | "edit_file" | "shell"
+    )
 }
 
 pub fn is_write(name: &str) -> bool {
-    matches!(name, "write_file" | "shell")
+    matches!(name, "write_file" | "edit_file" | "shell")
 }
 pub fn is_control(name: &str) -> bool {
     matches!(name, "job_wait" | "job_handoff" | "ask_user" | "pause_work")
@@ -155,6 +166,14 @@ pub async fn execute(
             },
         };
     }
+    if name == "edit_file" {
+        return edit_file_prepared(
+            workspace,
+            args,
+            |parent| std::fs::File::open(parent)?.sync_all(),
+            |_| Ok(()),
+        );
+    }
     if name == "write_file" {
         return write_file(workspace, args, |parent| {
             std::fs::File::open(parent)?.sync_all()
@@ -168,6 +187,9 @@ pub async fn execute(
 }
 
 fn file_tool(workspace: &Path, name: &str, args: &Value) -> Result<Value> {
+    if name == "search_files" {
+        return search_files(workspace, args);
+    }
     let path = workspace_path(
         workspace,
         args.get("path").and_then(Value::as_str).unwrap_or("."),
@@ -219,6 +241,424 @@ fn file_tool(workspace: &Path, name: &str, args: &Value) -> Result<Value> {
         }
         _ => bail!("unknown external tool: {name}"),
     }
+}
+
+const SEARCH_EXCLUSIONS: [&str; 4] = [".git", "target", "node_modules", ".bone"];
+
+/// Stricter than legacy read/write paths: these tools never follow any symlink,
+/// including one pointing inside the workspace. Recheck before installation.
+fn source_path(workspace: &Path, relative: &str) -> Result<(PathBuf, String)> {
+    let path = Path::new(relative);
+    ensure!(
+        !path.is_absolute(),
+        "path must be relative to the workspace"
+    );
+    let root = workspace.canonicalize()?;
+    let mut target = root.clone();
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                let part = part.to_str().context("path is not UTF-8")?;
+                parts.push(part);
+                target.push(part);
+                let metadata =
+                    std::fs::symlink_metadata(&target).context("source path is missing")?;
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "symlink paths are not allowed"
+                );
+            }
+            _ => bail!("parent traversal and absolute paths are not allowed"),
+        }
+    }
+    Ok((
+        target,
+        if parts.is_empty() {
+            ".".to_owned()
+        } else {
+            parts.join("/")
+        },
+    ))
+}
+
+fn source_bytes(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "source is not a regular file"
+    );
+    ensure!(metadata.len() <= FILE_LIMIT, "file exceeds 16 MiB");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    ensure!(file.metadata()?.is_file(), "source is not a regular file");
+    let mut bytes = Vec::new();
+    file.take(FILE_LIMIT + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= FILE_LIMIT, "file exceeds 16 MiB");
+    Ok(bytes)
+}
+
+// Cursor is a consistency token, not an authorization token: its checksum is
+// public and a known algorithm can construct a valid position. Every decoded
+// request/path/version/occurrence is still revalidated before reading results.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchCursor {
+    version: u8,
+    request: String,
+    path: String,
+    sha256: String,
+    byte_offset: usize,
+}
+fn cursor_encode(cursor: &SearchCursor) -> Result<String> {
+    let bytes = serde_json::to_vec(cursor)?;
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("{hex}.{}", sha256(&bytes)))
+}
+fn cursor_decode(text: &str) -> Result<SearchCursor> {
+    ensure!(
+        text.len() <= OUTPUT_LIMIT,
+        "invalid search cursor: too long"
+    );
+    let (hex, checksum) = text.split_once('.').context("invalid search cursor")?;
+    ensure!(
+        hex.len().is_multiple_of(2),
+        "invalid search cursor encoding"
+    );
+    let bytes = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair)?;
+            Ok(u8::from_str_radix(pair, 16)?)
+        })
+        .collect::<Result<Vec<_>>>()
+        .context("invalid search cursor encoding")?;
+    ensure!(sha256(&bytes) == checksum, "invalid search cursor checksum");
+    let cursor: SearchCursor =
+        serde_json::from_slice(&bytes).context("invalid search cursor data")?;
+    ensure!(cursor.version == 1, "invalid search cursor version");
+    Ok(cursor)
+}
+
+fn search_paths(
+    root: &Path,
+    target: &Path,
+    paths: &mut Vec<PathBuf>,
+    skipped: &mut usize,
+    skipped_directories: &mut usize,
+) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(target)?;
+    if metadata.file_type().is_symlink() {
+        *skipped += 1;
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        if target != root
+            && target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| SEARCH_EXCLUSIONS.contains(&name))
+        {
+            *skipped_directories += 1;
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(target)? {
+            search_paths(root, &entry?.path(), paths, skipped, skipped_directories)?;
+        }
+    } else if metadata.is_file() {
+        if target.strip_prefix(root)?.to_str().is_some() {
+            paths.push(target.to_owned());
+        } else {
+            *skipped += 1;
+        }
+    } else {
+        *skipped += 1;
+    }
+    Ok(())
+}
+
+// A preview belongs to the matched line(s), not unrelated following lines.
+// Reserve enough of the scalar budget for the full query when it fits; left
+// context never pushes its end outside the 1024-character preview.
+fn search_snippet(text: &str, offset: usize, query: &str) -> String {
+    let query_end = offset + query.len();
+    let left_budget = 1024_usize.saturating_sub(query.chars().count()).min(128);
+    let start = text[..offset]
+        .char_indices()
+        .rev()
+        .take(left_budget)
+        .take_while(|(_, character)| *character != '\n')
+        .last()
+        .map_or(offset, |(start, _)| start);
+    let right_limit = if query.ends_with('\n') { 0 } else { 1024 };
+    text[start..query_end]
+        .chars()
+        .chain(
+            text[query_end..]
+                .chars()
+                .take_while(|character| *character != '\n')
+                .take(right_limit),
+        )
+        .take(1024)
+        .collect()
+}
+
+fn search_files(workspace: &Path, args: &Value) -> Result<Value> {
+    let query = string_arg(args, "query")?;
+    ensure!(!query.is_empty(), "query cannot be empty");
+    let limit = args
+        .get("limit")
+        .map(|value| value.as_u64().context("limit must be an integer"))
+        .transpose()?
+        .unwrap_or(50);
+    ensure!(
+        (1..=200).contains(&limit),
+        "limit must be between 1 and 200"
+    );
+    let relative = args
+        .get("path")
+        .map(|value| value.as_str().context("path must be a string"))
+        .transpose()?
+        .unwrap_or(".");
+    let (target, normalized) = source_path(workspace, relative)?;
+    let root = workspace.canonicalize()?;
+    let components: Vec<_> = normalized.split('/').collect();
+    let excluded = components.iter().enumerate().any(|(index, name)| {
+        SEARCH_EXCLUSIONS.contains(name) && (index + 1 < components.len() || target.is_dir())
+    });
+    ensure!(
+        !excluded || args.get("cursor").is_none(),
+        "search cursor points inside an excluded directory"
+    );
+    if excluded {
+        return Ok(
+            json!({"matches":[],"next_cursor":null,"truncated":false,"scanned_files":0,"skipped_files":0,"skipped_directories":1}),
+        );
+    }
+    let request = sha256(&serde_json::to_vec(
+        &json!({"query":query,"path":normalized,"exclusions":SEARCH_EXCLUSIONS}),
+    )?);
+    let cursor = args
+        .get("cursor")
+        .map(|value| cursor_decode(value.as_str().context("cursor must be a string")?))
+        .transpose()?;
+    if let Some(cursor) = &cursor {
+        ensure!(
+            cursor.request == request,
+            "search cursor does not match query, path or exclusions"
+        );
+        let (reference, reference_path) = source_path(workspace, &cursor.path)
+            .context("search cursor reference is missing or retyped")?;
+        ensure!(
+            reference_path == cursor.path
+                && (reference == target || reference.starts_with(&target)),
+            "search cursor is outside the requested path"
+        );
+        ensure!(!Path::new(&cursor.path).parent().unwrap_or(Path::new("")).components().any(|part| matches!(part,Component::Normal(name) if SEARCH_EXCLUSIONS.iter().any(|skip| name==*skip))), "search cursor points inside an excluded directory");
+        let bytes =
+            source_bytes(&reference).context("search cursor reference is missing or retyped")?;
+        ensure!(
+            sha256(&bytes) == cursor.sha256,
+            "search cursor reference file changed"
+        );
+        ensure!(!bytes.contains(&0), "search cursor reference is binary");
+        let text =
+            std::str::from_utf8(&bytes).context("search cursor reference is no longer UTF-8")?;
+        ensure!(
+            text.match_indices(query)
+                .any(|(offset, _)| offset == cursor.byte_offset),
+            "invalid search cursor occurrence position"
+        );
+    }
+    let mut paths = Vec::new();
+    let mut skipped = 0;
+    let mut skipped_directories = 0;
+    search_paths(
+        &root,
+        &target,
+        &mut paths,
+        &mut skipped,
+        &mut skipped_directories,
+    )?;
+    paths.sort();
+    let mut scanned = 0;
+    let mut matches = Vec::new();
+    let mut last: Option<SearchCursor> = None;
+    let mut has_next = false;
+    'files: for path in paths {
+        let relative = path
+            .strip_prefix(&root)?
+            .to_str()
+            .context("file path is not UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if cursor.as_ref().is_some_and(|cursor| relative < cursor.path) {
+            continue;
+        }
+        // Symlink/type/size checks are repeated because the tree may have changed.
+        let bytes =
+            match source_path(workspace, &relative).and_then(|(path, _)| source_bytes(&path)) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(text) if !bytes.contains(&0) => text,
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        };
+        scanned += 1;
+        let hash = sha256(&bytes);
+        ensure!(
+            !cursor
+                .as_ref()
+                .is_some_and(|cursor| relative == cursor.path && hash != cursor.sha256),
+            "search cursor reference file changed during traversal"
+        );
+        let mut line = 1;
+        let mut line_offset = 0;
+        for (offset, _) in text.match_indices(query) {
+            line += text.as_bytes()[line_offset..offset]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count();
+            line_offset = offset;
+            if cursor
+                .as_ref()
+                .is_some_and(|cursor| relative == cursor.path && offset <= cursor.byte_offset)
+            {
+                continue;
+            }
+            if matches.len() >= limit as usize {
+                has_next = true;
+                break 'files;
+            }
+            let record = json!({"path":relative,"line":line,"byte_offset":offset,"snippet":search_snippet(text, offset, query),"sha256":hash});
+            let next = SearchCursor {
+                version: 1,
+                request: request.clone(),
+                path: relative.clone(),
+                sha256: hash.clone(),
+                byte_offset: offset,
+            };
+            matches.push(record);
+            // Reserve an actual continuation, even for the final page, so a
+            // later lookahead never makes an already accepted page too large.
+            let projected = json!({"matches":matches,"next_cursor":cursor_encode(&next)?,"truncated":true,"scanned_files":usize::MAX,"skipped_files":usize::MAX,"skipped_directories":usize::MAX});
+            if serde_json::to_vec(&projected)?.len() > OUTPUT_LIMIT {
+                matches.pop();
+                ensure!(
+                    !matches.is_empty(),
+                    "search match cannot fit the bounded output"
+                );
+                has_next = true;
+                break 'files;
+            }
+            last = Some(next);
+        }
+    }
+    let next = if has_next {
+        Some(cursor_encode(
+            last.as_ref()
+                .context("search produced an empty continuation")?,
+        )?)
+    } else {
+        None
+    };
+    let result = json!({"matches":matches,"next_cursor":next,"truncated":has_next,"scanned_files":scanned,"skipped_files":skipped,"skipped_directories":skipped_directories});
+    ensure!(
+        serde_json::to_vec(&result)?.len() <= OUTPUT_LIMIT,
+        "search result exceeds output limit"
+    );
+    Ok(result)
+}
+
+fn edit_file_prepared(
+    workspace: &Path,
+    args: &Value,
+    sync_directory: fn(&Path) -> std::io::Result<()>,
+    before_install: impl FnOnce(&Path) -> Result<()>,
+) -> ToolOutcome {
+    let prepared = (|| -> Result<(Value, usize)> {
+        let relative = string_arg(args, "path")?;
+        let (path, _) = source_path(workspace, relative)?;
+        let bytes = source_bytes(&path)?;
+        let source = std::str::from_utf8(&bytes).context("source file is not UTF-8")?;
+        let expected = string_arg(args, "expected_sha256")?;
+        ensure!(
+            sha256(&bytes) == expected,
+            "file changed; expected SHA-256 does not match"
+        );
+        let edits = args["edits"].as_array().context("edits must be an array")?;
+        ensure!(!edits.is_empty(), "edits cannot be empty");
+        let mut spans = Vec::new();
+        for edit in edits {
+            let old = string_arg(edit, "old_text")?;
+            let new = string_arg(edit, "new_text")?;
+            ensure!(!old.is_empty(), "old_text cannot be empty");
+            let start = source
+                .find(old)
+                .context("old_text is absent from the original source")?;
+            // Advance one Unicode scalar rather than old.len(): overlapping
+            // occurrences ("aa" in "aaa") are ambiguous too.
+            let after_start = start + source[start..].chars().next().unwrap().len_utf8();
+            ensure!(
+                !source[after_start..].contains(old),
+                "old_text occurs more than once in the original source"
+            );
+            spans.push((start, start + old.len(), new));
+        }
+        spans.sort_by_key(|span| span.0);
+        ensure!(
+            spans.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+            "original edit spans overlap"
+        );
+        let mut content = String::new();
+        let mut offset = 0;
+        for (start, end, new) in spans {
+            content.push_str(&source[offset..start]);
+            content.push_str(new);
+            offset = end;
+        }
+        content.push_str(&source[offset..]);
+        Ok((
+            json!({"path":relative,"expected_sha256":expected,"content":content}),
+            edits.len(),
+        ))
+    })();
+    let (replacement, count) = match prepared {
+        Ok(value) => value,
+        Err(error) => {
+            return ToolOutcome {
+                content: json!({"error":format!("{error:#}")}),
+                uncertain: false,
+            };
+        }
+    };
+    let mut outcome = write_file_prepared(workspace, &replacement, sync_directory, |path| {
+        before_install(path)?;
+        source_path(workspace, string_arg(args, "path")?)?;
+        Ok(())
+    });
+    if outcome.content.get("error").is_none() {
+        outcome.content["edits_applied"] = json!(count);
+    }
+    outcome
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -858,5 +1298,426 @@ mod tests {
         );
         FileExt::unlock(&lock).unwrap();
         FileExt::unlock(&legacy).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod workspace_engineering_tests {
+    use super::*;
+
+    fn page(dir: &Path, query: &str, limit: usize, cursor: Option<&Value>) -> Value {
+        let mut args = json!({"query":query,"limit":limit});
+        if let Some(cursor) = cursor {
+            args["cursor"] = cursor.clone();
+        }
+        search_files(dir, &args).unwrap()
+    }
+    fn edits(dir: &Path, source: &str, edits: Value) -> ToolOutcome {
+        std::fs::write(dir.join("source"), source).unwrap();
+        edit_file_prepared(
+            dir,
+            &json!({"path":"source","expected_sha256":sha256(source.as_bytes()),"edits":edits}),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+    }
+
+    #[test]
+    fn search_native_schema_modes_and_final_bounds() {
+        let readonly = definitions(true, true);
+        let search = readonly
+            .iter()
+            .find(|tool| tool.name.as_str() == "search_files")
+            .unwrap();
+        assert_eq!(search.parameters["properties"]["limit"]["default"], 50);
+        assert_eq!(search.parameters["properties"]["limit"]["maximum"], 200);
+        assert!(
+            !readonly
+                .iter()
+                .any(|tool| tool.name.as_str() == "edit_file")
+        );
+        assert!(is_external("search_files") && !is_write("search_files"));
+        assert!(is_external("edit_file") && is_write("edit_file"));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "q ".repeat(220)).unwrap();
+        assert_eq!(
+            search_files(dir.path(), &json!({"query":"q"})).unwrap()["matches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            50
+        );
+        assert!(
+            page(dir.path(), "q", 200, None)["matches"]
+                .as_array()
+                .unwrap()
+                .len()
+                <= 200
+        );
+        for args in [
+            json!({"query":""}),
+            json!({"query":"q","limit":0}),
+            json!({"query":"q","limit":201}),
+            json!({"query":"q","limit":1.5}),
+            json!({"query":"q","limit":"50"}),
+        ] {
+            assert!(search_files(dir.path(), &args).is_err());
+        }
+    }
+
+    #[test]
+    fn short_line_search_returns_default50_max200_pages_without_unrelated_line_repetition() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "needle\r\n".repeat(240);
+        std::fs::write(dir.path().join("many.txt"), &source).unwrap();
+        let default = search_files(dir.path(), &json!({"query":"needle"})).unwrap();
+        assert_eq!(default["matches"].as_array().unwrap().len(), 50);
+        let first = page(dir.path(), "needle", 200, None);
+        assert_eq!(first["matches"].as_array().unwrap().len(), 200);
+        assert_eq!(first["truncated"], true);
+        assert!(serde_json::to_vec(&first).unwrap().len() <= OUTPUT_LIMIT);
+        for record in first["matches"].as_array().unwrap() {
+            assert_eq!(record["snippet"], "needle\r");
+            assert_eq!(record["sha256"], sha256(source.as_bytes()));
+        }
+        let last = page(dir.path(), "needle", 200, Some(&first["next_cursor"]));
+        assert_eq!(last["matches"].as_array().unwrap().len(), 40);
+        assert_eq!(last["matches"][0]["byte_offset"], 200 * 8);
+        assert_eq!(last["matches"][0]["line"], 201);
+        assert_eq!(last["truncated"], false);
+        assert!(last["next_cursor"].is_null());
+        assert_eq!(
+            search_snippet("before needle\nAFTER", 7, "needle\n"),
+            "before needle\n"
+        );
+        let source = format!(
+            "{}命中\r\n下一行{}\n不要附带",
+            "左".repeat(1600),
+            "右".repeat(1600)
+        );
+        let offset = source.find("命中").unwrap();
+        let snippet = search_snippet(&source, offset, "命中\r\n下一行");
+        assert!(snippet.contains("命中\r\n下一行"));
+        assert_eq!(snippet.chars().count(), 1024);
+        assert!(!snippet.contains("不要附带"));
+    }
+
+    #[test]
+    fn unicode_crlf_paging_occurrences_and_whole_file_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = "é café café\r\n末 café\r\ntail not matched";
+        std::fs::write(dir.path().join("a"), a).unwrap();
+        std::fs::write(dir.path().join("z"), "café").unwrap();
+        let mut found = Vec::new();
+        let mut cursor = None;
+        loop {
+            let current = page(dir.path(), "café", 1, cursor.as_ref());
+            let records = current["matches"].as_array().unwrap();
+            assert_eq!(records.len(), 1);
+            found.extend(records.iter().cloned());
+            if current["next_cursor"].is_null() {
+                assert_eq!(current["truncated"], false);
+                break;
+            }
+            cursor = Some(current["next_cursor"].clone());
+        }
+        assert_eq!(
+            found
+                .iter()
+                .map(|value| value["path"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["a", "a", "a", "z"]
+        );
+        assert_eq!(
+            found
+                .iter()
+                .map(|value| value["byte_offset"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![3, 9, 20, 0]
+        );
+        assert_eq!(
+            found
+                .iter()
+                .map(|value| value["line"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2, 1]
+        );
+        for value in &found[..3] {
+            assert_eq!(value["sha256"], sha256(a.as_bytes()));
+            assert!(value["snippet"].as_str().unwrap().contains("café"));
+        }
+        let current = page(dir.path(), "café", 1, None);
+        std::fs::write(dir.path().join("a"), format!("{a} altered tail")).unwrap();
+        assert!(
+            search_files(
+                dir.path(),
+                &json!({"query":"café","cursor":current["next_cursor"]})
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("changed")
+        );
+    }
+
+    #[test]
+    fn search_nonoverlap_and_empty_last_page() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "aaaaa").unwrap();
+        let first = page(dir.path(), "aa", 1, None);
+        assert_eq!(first["matches"][0]["byte_offset"], 0);
+        let last = page(dir.path(), "aa", 200, Some(&first["next_cursor"]));
+        assert_eq!(last["matches"][0]["byte_offset"], 2);
+        assert!(last["next_cursor"].is_null());
+        assert_eq!(last["truncated"], false);
+        assert!(
+            page(dir.path(), "missing", 1, None)["matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_output_ceiling_produces_contiguous_smaller_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a"),
+            format!("{}{}", "X".repeat(160), "é\\\n".repeat(1500)),
+        )
+        .unwrap();
+        let mut cursor = None;
+        let mut offsets = Vec::new();
+        loop {
+            let current = page(dir.path(), "X", 200, cursor.as_ref());
+            assert!(serde_json::to_vec(&current).unwrap().len() <= OUTPUT_LIMIT);
+            assert!(current["matches"].as_array().unwrap().len() < 200);
+            for value in current["matches"].as_array().unwrap() {
+                assert!(value["snippet"].as_str().unwrap().chars().count() <= 1024);
+                offsets.push(value["byte_offset"].as_u64().unwrap());
+            }
+            if current["next_cursor"].is_null() {
+                break;
+            }
+            cursor = Some(current["next_cursor"].clone());
+        }
+        assert_eq!(offsets, (0..160).collect::<Vec<u64>>());
+        let query = "é".repeat(1200);
+        std::fs::write(dir.path().join("long-query"), &query).unwrap();
+        let result = search_files(dir.path(), &json!({"query":query,"path":"long-query"})).unwrap();
+        assert_eq!(
+            result["matches"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            1024
+        );
+    }
+
+    #[test]
+    fn cursor_rejects_bad_checksum_version_position_request_removed_and_retyped_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "q q").unwrap();
+        let first = page(dir.path(), "q", 1, None);
+        let valid = first["next_cursor"].as_str().unwrap();
+        for invalid in ["garbage".to_owned(), format!("{valid}0")] {
+            assert!(search_files(dir.path(), &json!({"query":"q","cursor":invalid})).is_err());
+        }
+        for args in [
+            json!({"query":"different","cursor":valid}),
+            json!({"query":"q","path":"a","cursor":valid}),
+        ] {
+            assert!(search_files(dir.path(), &args).is_err());
+        }
+        let mut cursor = cursor_decode(valid).unwrap();
+        cursor.version = 2;
+        assert!(
+            search_files(
+                dir.path(),
+                &json!({"query":"q","cursor":cursor_encode(&cursor).unwrap()})
+            )
+            .is_err()
+        );
+        cursor.version = 1;
+        cursor.byte_offset = 1;
+        assert!(
+            search_files(
+                dir.path(),
+                &json!({"query":"q","cursor":cursor_encode(&cursor).unwrap()})
+            )
+            .is_err()
+        );
+        std::fs::remove_file(dir.path().join("a")).unwrap();
+        assert!(search_files(dir.path(), &json!({"query":"q","cursor":valid})).is_err());
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        assert!(search_files(dir.path(), &json!({"query":"q","cursor":valid})).is_err());
+    }
+
+    #[test]
+    fn search_skips_binary_oversize_and_exclusions_without_touching_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        for skip in SEARCH_EXCLUSIONS {
+            std::fs::create_dir(dir.path().join(skip)).unwrap();
+            std::fs::write(dir.path().join(skip).join("hidden"), "q").unwrap();
+        }
+        std::fs::write(dir.path().join("bad-utf8"), [0xff]).unwrap();
+        std::fs::write(dir.path().join("binary"), b"q\0").unwrap();
+        let huge = std::fs::File::create(dir.path().join("huge")).unwrap();
+        huge.set_len(FILE_LIMIT + 1).unwrap();
+        std::fs::write(dir.path().join("good"), "q").unwrap();
+        let result = page(dir.path(), "q", 50, None);
+        assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(result["matches"][0]["path"], "good");
+        assert_eq!(result["scanned_files"], 1);
+        assert_eq!(result["skipped_files"], 3);
+        assert_eq!(result["skipped_directories"], 4);
+        let excluded =
+            search_files(dir.path(), &json!({"query":"q","path":"target/hidden"})).unwrap();
+        assert!(excluded["matches"].as_array().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_and_edit_reject_all_explicit_symlinks_and_bad_paths() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source"), "q q").unwrap();
+        std::fs::write(outside.path().join("file"), "q").unwrap();
+        symlink(dir.path().join("source"), dir.path().join("inside-link")).unwrap();
+        symlink(outside.path(), dir.path().join("dir-link")).unwrap();
+        let result = page(dir.path(), "q", 50, None);
+        assert_eq!(result["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(result["skipped_files"], 2);
+        for path in ["inside-link", "dir-link/file", "../source", "/tmp/absolute"] {
+            assert!(search_files(dir.path(), &json!({"path":path,"query":"q"})).is_err());
+            let outcome = edit_file_prepared(
+                dir.path(),
+                &json!({"path":path,"expected_sha256":sha256(b"q q"),"edits":[{"old_text":"q","new_text":"x"}]}),
+                |_| Ok(()),
+                |_| Ok(()),
+            );
+            assert!(outcome.content.get("error").is_some() && !outcome.uncertain);
+        }
+        assert_eq!(std::fs::read(dir.path().join("source")).unwrap(), b"q q");
+    }
+
+    #[test]
+    fn edit_uses_original_spans_non_cascading_and_preserves_unicode_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "alpha\r\nβeta\r\n末\r\n";
+        let outcome = edits(
+            dir.path(),
+            source,
+            json!([{"old_text":"alpha","new_text":"βeta"},{"old_text":"βeta","new_text":"γamma"}]),
+        );
+        assert!(outcome.content.get("error").is_none());
+        let expected = "βeta\r\nγamma\r\n末\r\n";
+        assert_eq!(
+            std::fs::read(dir.path().join("source")).unwrap(),
+            expected.as_bytes()
+        );
+        assert_eq!(outcome.content["sha256"], sha256(expected.as_bytes()));
+        assert_eq!(outcome.content["bytes"], expected.len());
+        assert_eq!(outcome.content["edits_applied"], 2);
+    }
+
+    #[test]
+    fn edit_batch_validation_rejects_repeated_overlapping_absent_empty_and_stale_without_install() {
+        let dir = tempfile::tempdir().unwrap();
+        for (source, batch) in [
+            ("aaa", json!([{"old_text":"aa","new_text":"x"}])),
+            (
+                "abc",
+                json!([{"old_text":"ab","new_text":"x"},{"old_text":"bc","new_text":"y"}]),
+            ),
+            (
+                "abc",
+                json!([{"old_text":"ab","new_text":"x"},{"old_text":"ab","new_text":"y"}]),
+            ),
+            (
+                "abc",
+                json!([{"old_text":"ab","new_text":"x"},{"old_text":"missing","new_text":"y"}]),
+            ),
+            ("abc", json!([{"old_text":"","new_text":"x"}])),
+            ("abc", json!([])),
+        ] {
+            let outcome = edits(dir.path(), source, batch);
+            assert!(outcome.content.get("error").is_some() && !outcome.uncertain);
+            assert_eq!(
+                std::fs::read(dir.path().join("source")).unwrap(),
+                source.as_bytes()
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+        let outcome = edit_file_prepared(
+            dir.path(),
+            &json!({"path":"source","expected_sha256":"stale","edits":[{"old_text":"abc","new_text":"x"}]}),
+            |_| Ok(()),
+            |_| Ok(()),
+        );
+        assert!(outcome.content.get("error").is_some());
+        assert_eq!(std::fs::read(dir.path().join("source")).unwrap(), b"abc");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_preserves_mode_and_reuses_final_identity_and_uncertain_durability() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let args = json!({"path":"source","expected_sha256":sha256(b"old"),"edits":[{"old_text":"old","new_text":"new"}]});
+        let outcome = edit_file_prepared(dir.path(), &args, |_| Ok(()), |_| Ok(()));
+        assert!(outcome.content.get("error").is_none());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        std::fs::write(&path, "old").unwrap();
+        let outcome = edit_file_prepared(
+            dir.path(),
+            &args,
+            |_| Ok(()),
+            |path| {
+                std::fs::write(path, "raced")?;
+                Ok(())
+            },
+        );
+        assert!(outcome.content.get("error").is_some() && !outcome.uncertain);
+        assert_eq!(std::fs::read(&path).unwrap(), b"raced");
+        std::fs::write(&path, "old").unwrap();
+        let outcome = edit_file_prepared(
+            dir.path(),
+            &args,
+            |_| Err(std::io::Error::other("durability fault")),
+            |_| Ok(()),
+        );
+        assert!(outcome.uncertain);
+        assert_eq!(outcome.content["effect"], "unknown");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn edit_rejects_missing_directory_invalid_utf8_and_oversize_before_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("directory")).unwrap();
+        std::fs::write(dir.path().join("invalid"), [0xff]).unwrap();
+        std::fs::File::create(dir.path().join("huge"))
+            .unwrap()
+            .set_len(FILE_LIMIT + 1)
+            .unwrap();
+        for path in ["missing", "directory", "invalid", "huge"] {
+            let outcome = edit_file_prepared(
+                dir.path(),
+                &json!({"path":path,"expected_sha256":"bad","edits":[{"old_text":"old","new_text":"new"}]}),
+                |_| Ok(()),
+                |_| Ok(()),
+            );
+            assert!(outcome.content.get("error").is_some() && !outcome.uncertain);
+        }
+        assert!(!dir.path().join("missing").exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
     }
 }

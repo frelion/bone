@@ -20,6 +20,24 @@ task, failed attempt, independent verdicts, call ownership, unknown usage and
 coverage limits. This is one real repository feature, not evidence of general
 long-task reliability or an alternating performance ablation.
 
+## Flagship core work in progress (2026-10-01)
+
+The [current report](results/2026-10-01-flagship-engineering/README.md) preserves
+three failed search/edit engineering attempts, the native instruction/template
+and summary authority fixes, and the larger-context continuation. An unfinished
+live gate is not a passing result. Queued-input settlement, failed-descendant
+recovery and fresh-tool-result consumption have separate public API and fault
+regressions.
+
+Source search, atomic-batch text-edit validation and passive native tool metadata
+were implemented separately by GPT-6.1-Sol. Their frozen independent functional
+suite first passed 26/27, exposed a snippet/page-size defect, and passed 27/27
+after correction. The root integration passed 136 Rust checks (one subprocess
+helper ignored), formatting, all-target Clippy, all-features compilation and
+the CLI build. These checks establish tool/runtime contracts, not autonomous
+success by the real model. The implementation adds no scheduler or durable
+state abstraction; source search and edits still execute only inside a Job.
+
 ## Scenario fixtures
 
 `fixtures/acceptance/cases.json` describes six scenarios:

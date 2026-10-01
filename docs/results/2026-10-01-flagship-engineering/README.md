@@ -15,4 +15,16 @@
 
 ## 验证状态
 
-修复后统一门禁：121 项 Rust 测试通过、1 项忽略；格式、全部 targets Clippy（warnings 为错误）、全部 features 编译及 CLI build 均通过。恢复逻辑另经只读交叉审查，未发现阻断项。第二轮真实任务尚待记录。第二轮保持原任务、模型、48k 上下文和预算；首轮失败永久保留，不以增加资源掩盖结果。一次再验也不构成统计性的消融结论。
+修复后统一门禁：121 项 Rust 测试通过、1 项忽略；格式、全部 targets Clippy（warnings 为错误）、全部 features 编译及 CLI build 均通过。恢复逻辑另经只读交叉审查，未发现阻断项。第二轮保持原任务、模型、48k 上下文和预算，仍在第一阶段失败：222.05 秒、48 次调用、11 次摘要、两个 Job、没有源码修改。37 个完成的 WORK 响应均保留 BONE 系统指令，provider 确认推理强度为默认 medium；290,885 个已报告 token，费用未知。见 `trial2-failure.json`。这证明修正请求构造不等于已经具备工程执行能力。
+
+第三轮仅把同一 `gpt-6-luna` 的原生 reasoning effort 设为 high；代码、任务、上下文和额度不变，实际回执已确认 high。557.46 秒内耗尽 48 次调用，其中 18 次摘要，仍没有源码修改；327,961 个已报告 token，费用未知。见 `trial3-failure.json`。提高推理强度没有解决这一配置下的工程推进问题。
+
+第四轮只把上下文改为 128,000 字符，继续使用 high 和同样的调用额度。2 次调用后，模型询问完整合同中的 CLI 发现条款是否属于当前阶段；原始计划确实同时包含后续条款，不能把这次合理提问算作重复读取或完成。保留原始 trial4 的提问、暂停和全部证据，在新的工件目录通过 SQLite backup 继续同一 Session；普通用户输入只澄清“先实现 search_files/edit_file，CLI 留在后续”，不提供实现或验收答案。续跑保留原输入身份、原预算、原 2 次调用和 12.18 秒累计时间，另记澄清输入。
+
+所有失败永久保留；单次配置实验不构成统计性的消融结论。并行的 Sol 工程工具备用实现位于独立私有目录，绝不作为 BONE 自主产物记分。其首次独立功能验收 26/27 通过：短行搜索的 snippet 包含太多后续行，提前占满输出上限，未满足默认页条数；保留该失败后修复再验。
+
+## Sol 辅助功能集成
+
+修正搜索 snippet 后，独立冻结工具合同 27/27 通过；明确选择该实现集成到主仓库。原始 BONE 自主候选仍单独运行，未被替换或提供实现反馈。新增 `search_files`、`edit_file` 和 `bone tools` 原生 schema 发现，执行路径继续经 Engine/Job，未修改调度器或增加持久状态。
+
+集成门禁：136 项 Rust 测试通过、1 项子进程 helper 忽略；fmt、全部 targets Clippy、全部 features 编译及 CLI build 通过。主仓库冻结二进制再经同一独立功能合同 27/27 通过。`sol-tools-initial.json`、`sol-tools-revised.json`、`sol-tools-integrated.json` 保存三次 verdict；`integration-manifest.json`、`integration-gates.json` 保存来源哈希与统一门禁。这是经外部反馈修复后的 Sol 辅助交付，不能用于宣称 6-luna 自主完成了这次工程任务。

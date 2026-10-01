@@ -1,0 +1,213 @@
+{
+  "attempt": 2,
+  "runner_commit": "aec1fa33c3b27817cbf05772ad8e340761698b38",
+  "outcome": "failed_before_first_source_mutation",
+  "configuration": "same model/default medium, context48000, input48/global200 limits as trial1; core fixes integrated",
+  "wall_seconds": 222.046983083,
+  "model_starts": 48,
+  "summary_count": 11,
+  "metrics": {
+    "cost": null,
+    "elapsed_ms": 222002,
+    "input_tokens": 284850,
+    "model_calls": 48,
+    "observed_input_tokens": 284850,
+    "observed_output_tokens": 6035,
+    "output_tokens": 6035,
+    "total_tokens": 290885
+  },
+  "unknown_writes": {},
+  "jobs": 2,
+  "source_changes": [],
+  "functional_gate": "not_run: no implementation/delivery",
+  "phases2_through10": "not_exercised",
+  "work_response_instruction_checks": [
+    {
+      "event_id": "3c028bf5-77e0-4851-a1f5-4b5a7befe4b5",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "a4aa11f9-8755-4bc1-94b0-b28f6b6f74dc",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "65f13f6f-3b8a-4a09-af0e-ee0bd92373a7",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "b3064f8f-6112-4fe0-9f9b-c1909f00c290",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "b32ef40b-2d76-4e35-884c-250073ec072b",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "37b48e20-09b7-4098-aa8e-3aa23f7b6da4",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "6bcabeca-f071-4c5b-9d7d-e50e9dc4520c",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "3b9b0a49-a2ac-458c-825f-647a3599c355",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "a3824b1a-81e4-4e9c-a6f1-3c836ebff9d1",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "cae87da2-f461-4a89-9337-ddb1f0f92a9d",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "103bd9f4-b1ce-4888-8ae0-f17e682b6e6c",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "f1ca2344-4da3-4247-8e46-8a3fbe5535cf",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "893214c3-ff06-4728-af9b-c8e06eaa1546",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "7040bd80-dced-491c-af15-ff4084cc2e51",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "1dca2ab1-e929-4742-a670-b38507dc075b",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "a329badc-5534-4469-a4b8-457e6f5139b6",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "4a4f3ce1-a4a2-42df-ad03-96e9d3b6cbf8",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "0d7927ff-72fa-41c4-aade-48f4d6fdcdf5",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "db924dfb-6071-4b91-9a83-4c188c4c0c44",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "5592a5ef-a15e-4ff1-b387-4967bc16f460",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "3f204ee9-9686-477a-81ee-ae52351feb99",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "587fa429-9b88-4eff-a2d2-a76de6ffee48",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "3a4fd77e-0928-4e23-bf67-6c35c61c6a01",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "58f62d97-85d2-4c1f-81a1-af58a6938a94",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "a453d5e5-187e-49bb-b7a2-b1a4373289dc",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "70d68f79-1ce0-4cf3-8f2c-d952f8850aea",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "eace3164-62f1-4eed-88f0-d513bb38a4e8",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "33c85baa-ce53-493f-a930-6d12734f4622",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "7bee59dd-c117-4216-9232-8d9a44b21432",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "d5770615-4a96-4400-9e1b-5c3b0a2d858c",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "d026a4f2-ec48-49e5-9141-65e6ec287df6",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "c0e33298-ae8c-4b23-8eaf-10bb55acb1e3",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "bfce3b28-4810-4c98-bd79-a539638f5438",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "94c7bf3f-56c7-4681-a097-cb3cb3194e83",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "a857bfd7-a158-42c7-b0d9-3aaaf47f3025",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "9973c3cd-ccca-4b36-9502-758d99df979e",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    },
+    {
+      "event_id": "c23b6b04-689c-452f-a8a8-e63712dbcc8b",
+      "bone_instructions_present": true,
+      "reasoning_effort": "medium"
+    }
+  ],
+  "private_evidence_directory": "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial2",
+  "conclusion": "Native BONE instructions present in every completed work response, but no engineering progress. Core correctness repair does not establish task success."
+}

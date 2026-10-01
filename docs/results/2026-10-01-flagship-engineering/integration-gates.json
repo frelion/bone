@@ -1,0 +1,60 @@
+[
+  {
+    "command": [
+      "cargo",
+      "fmt",
+      "--check"
+    ],
+    "exit_code": 0,
+    "seconds": 0.119770333,
+    "log": "/Users/zzhang/.bone/acceptance/2026-10-01-flagship-core/integration-1/1.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "--quiet"
+    ],
+    "exit_code": 0,
+    "seconds": 33.216317290999996,
+    "log": "/Users/zzhang/.bone/acceptance/2026-10-01-flagship-core/integration-1/2.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "clippy",
+      "--locked",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "seconds": 2.6983758340000037,
+    "log": "/Users/zzhang/.bone/acceptance/2026-10-01-flagship-core/integration-1/3.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "check",
+      "--locked",
+      "--all-features"
+    ],
+    "exit_code": 0,
+    "seconds": 29.712239208000007,
+    "log": "/Users/zzhang/.bone/acceptance/2026-10-01-flagship-core/integration-1/4.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "bone"
+    ],
+    "exit_code": 0,
+    "seconds": 3.3104735410000075,
+    "log": "/Users/zzhang/.bone/acceptance/2026-10-01-flagship-core/integration-1/5.log"
+  }
+]

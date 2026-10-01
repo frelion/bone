@@ -1,0 +1,118 @@
+{
+  "binary_sha256": "c51baca17c53704603b0fe0112e4c12a8c1d7b52c67ac52eb44da234b3bd72a1",
+  "pilot": false,
+  "passed": true,
+  "checks": [
+    {
+      "name": "literal_occurrences_raw_hash_line_order",
+      "passed": true
+    },
+    {
+      "name": "cursor_full_walk_limit_changes",
+      "passed": true
+    },
+    {
+      "name": "default50_and_max200",
+      "passed": true
+    },
+    {
+      "name": "output_snippet_bound_and_progress",
+      "passed": true
+    },
+    {
+      "name": "binary_generated_symlinks_skipped",
+      "passed": true
+    },
+    {
+      "name": "empty_query",
+      "passed": true
+    },
+    {
+      "name": "search_limit_0",
+      "passed": true
+    },
+    {
+      "name": "search_limit_201",
+      "passed": true
+    },
+    {
+      "name": "search_limit_-1",
+      "passed": true
+    },
+    {
+      "name": "search_bad_path_../outside",
+      "passed": true
+    },
+    {
+      "name": "search_bad_path_/tmp",
+      "passed": true
+    },
+    {
+      "name": "search_bad_path_escape",
+      "passed": true
+    },
+    {
+      "name": "search_bad_path_alias.txt",
+      "passed": true
+    },
+    {
+      "name": "invalid_cursor",
+      "passed": true
+    },
+    {
+      "name": "cursor_query_path_binding_and_source_change",
+      "passed": true
+    },
+    {
+      "name": "edit_original_non_cascading_CRLF_unicode_mode",
+      "passed": true
+    },
+    {
+      "name": "edit_rejected_missing",
+      "passed": true
+    },
+    {
+      "name": "edit_rejected_duplicate",
+      "passed": true
+    },
+    {
+      "name": "edit_rejected_overlap",
+      "passed": true
+    },
+    {
+      "name": "edit_rejected_second_invalid_atomic",
+      "passed": true
+    },
+    {
+      "name": "edit_rejected_empty_old",
+      "passed": true
+    },
+    {
+      "name": "edit_rejected_empty_array",
+      "passed": true
+    },
+    {
+      "name": "edit_stale_hash",
+      "passed": true
+    },
+    {
+      "name": "edit_readonly_denied",
+      "passed": true
+    },
+    {
+      "name": "edit_path_and_type_rejections",
+      "passed": true
+    },
+    {
+      "name": "legacy_write_file_compatibility",
+      "passed": true
+    },
+    {
+      "name": "cli_native_tool_catalog_policy_no_profile_no_session",
+      "passed": true
+    }
+  ],
+  "verifier_sha256": "edcc07f9c664e6012ceb5cc0eccdf1725f59d09f5126cb4c4492d8a77c2bdc19",
+  "origin": "Sol-assisted integrated feature verification, not autonomous BONE result",
+  "private_artifact_directory": "/Users/zzhang/.bone/acceptance/2026-10-01-sol-assisted-tools-verification-integrated"
+}

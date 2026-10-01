@@ -1,0 +1,15 @@
+{
+  "binary_sha256": "c51baca17c53704603b0fe0112e4c12a8c1d7b52c67ac52eb44da234b3bd72a1",
+  "source_sha256": {
+    "src/tools.rs": "4cba73f6990676e6f799db4e56ceab0e459083c559e5dd23e653a97dd1b1593a",
+    "src/main.rs": "44397d21d5d2978e479cee29bed06787375cf4099f70406cee49520974abed45",
+    "src/lib.rs": "552fbb91655c2d5459bfd8c34f821b53ea0640abfa1674ca9a3ad846f367485e",
+    "tests/engineering_cli.rs": "6e32ed61c4612da31ec0f27ea4ecc884f760f4a675e197b6aa38de6767feec88",
+    "src/runtime.rs": "fda8ff3d7f95965ce902e138100ccd8ffd8ce7427596127a59fbd148c9a58874",
+    "src/context.rs": "7c7297b0aa72732985448b819f577542fd4578e1378604f2827840c2024b262a"
+  },
+  "rust_tests_passed": 136,
+  "rust_tests_ignored": 1,
+  "origin": "Sol-assisted engineering tools integrated into root; Engine unchanged from aec1fa3",
+  "cost": null
+}

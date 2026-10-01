@@ -1,0 +1,30 @@
+{
+  "attempt": 3,
+  "runner_commit": "aec1fa33c3b27817cbf05772ad8e340761698b38",
+  "outcome": "failed_before_first_source_mutation",
+  "configuration": "same code/model/contract/context48000/input48/global200 as trial2; only reasoning effort high",
+  "wall_seconds": 557.45842625,
+  "model_starts": 48,
+  "summary_count": 18,
+  "metrics": {
+    "cost": null,
+    "elapsed_ms": 557400,
+    "input_tokens": 308186,
+    "model_calls": 48,
+    "observed_input_tokens": 308186,
+    "observed_output_tokens": 19775,
+    "output_tokens": 19775,
+    "total_tokens": 327961
+  },
+  "unknown_writes": {},
+  "source_changes": [],
+  "functional_gate": "not_run: no implementation/delivery",
+  "phases2_through10": "not_exercised",
+  "completed_work_responses": 30,
+  "reported_efforts": [
+    "high"
+  ],
+  "all_completed_work_keep_bone_instructions": true,
+  "private_evidence_directory": "/Users/zzhang/.bone/acceptance/2026-10-01-workspace-engineering-trial3",
+  "conclusion": "High reasoning did not produce engineering progress at context48000; compaction frequency increased. No causal proof that context increase will succeed."
+}

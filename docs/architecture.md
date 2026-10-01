@@ -4,7 +4,7 @@
 
 依赖方向是 `CLI → Engine → Store / context / model / tools`。这是一个 crate 内的具体模块关系，没有 provider trait、动态插件容器或通用事件总线。
 
-库的执行入口只有 `runtime::Engine`。`model`、`tools`、`context` 和 `store` 是私有模块，执行器的 state/options 只能借用读取。`sessions`、`session`、`history` 提供脱离执行器的审计快照；修改快照不会修改会话。独立的 `login`、`providers` 只负责凭据设置和能力发现，不执行模型任务。编译失败测试验证调用者无法绕过 Job 直接执行模型或工具。
+库的执行入口只有 `runtime::Engine`。`model`、`tools`、`context` 和 `store` 是私有模块，执行器的 state/options 只能借用读取。`sessions`、`session`、`history` 提供脱离执行器的审计快照；修改快照不会修改会话。独立的 `login`、`providers` 只负责凭据设置和能力发现，不执行模型任务。`tool_definitions` 与 CLI `tools` 只返回运行时实际使用的 Rig 元数据，不暴露执行器。编译失败测试验证调用者无法绕过 Job 直接执行模型或工具。
 
 ```mermaid
 flowchart LR
@@ -32,6 +32,7 @@ flowchart LR
 | faulted 标记 | 外部动作完成后 SQLite 提交失败，内存不能继续作为依据 | Engine 的一个布尔值与普通 guard 足够 | 后续动作可能基于未持久化状态执行 | 1 个非持久标记；拒绝修改并要求从 SQLite 重开 |
 | input_resolve | 新请求已完成旧要求，队列却再次启动旧工作 | 内部工具函数和现有 Event 足够；无需输入状态表或别名图 | 提示词无法将实际排队请求结算，旧工作继续消耗预算或重复效果 | 1 个内部工具和事件种类；修改队列与事件同事务提交，预算不移动 |
 | 最新工具结果保护 | 九个默认源码页在工作模型看到前即被摘要替换 | 从原生 work response 推导边界，构造有界原生结果视图即可 | 单纯缩小默认文件页仍会发生读/压缩循环 | context 普通函数；没有新增持久消费标记，原文与调用身份不变 |
+| search_files / edit_file | 跨文件定位与局部修改是源码任务的直接需求，整文件替换增加读取和生成负担 | 普通函数与原生 ToolDefinition 足够；edit 复用现有写入准备 | 删除后只能逐页读取、整文件生成或使用通用 shell | 无新持久状态或调度分支；工具模块增加具体函数、一个可校验分页位置结构；CLI/库仅增加元数据入口 |
 
 ## 关键边界
 
@@ -72,6 +73,8 @@ SQLite 保留完整原文。执行器只缓存事件元信息与当前工作需�
 Session lease 阻止同时改同一会话。Workspace write lease 串行化同一系统用户、相同 canonical workspace 根下 BONE 的文件写入和 shell 调用；嵌套或重叠但根不同的 workspace 不共享这把锁。锁与未知写标记保存在操作系统用户主目录的 `~/.bone/workspace-locks`，不随数据目录、`HOME` 或 `TMPDIR` 改变。旧锁兼容检查只覆盖当前临时目录；切换 `TMPDIR` 不会迁移或清除其他临时目录中的旧标记，遗留标记需回到对应环境核对。
 
 该锁不能阻止用户或其他程序修改文件。`write_file` 在准备替换前后核对预期哈希与文件身份；新文件通过 create-if-absent 安装，不能覆盖期间出现的新文件。已有文件的最后检查与替换之间仍存在与不配合外部写入者的竞争窗口，不能声称 OS 级 compare-and-swap。未知写的记录不是完成证据，reconcile 是用户核查后的观察事实。
+
+`edit_file` 先在原文件中验证唯一且不重叠的匹配，再复用同一安装流程，编辑不级联。`search_files` 以有界页提供命中和完整文件 hash；游标验证请求与引用文件，校验和不是授权签名，也没有整棵树的快照隔离。二者沿用已有 Job 动作、权限、租约和审计分类，无需修改调度内核。
 
 取消请求不代表物理写入已经停止。写任务、执行器及 Unix 前台 shell 子进程持有实际文件锁；父进程被硬杀后，仍在执行的 shell 保持写入所有权。核销未知结果必须重新取得锁，重启不自动重放写操作。主动关闭继承描述符或自行脱离进程组的任意后台程序不在这个前台生命周期保证内。
 
