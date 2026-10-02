@@ -88,3 +88,22 @@ pub fn history_page(
         has_more,
     })
 }
+
+/// Read the last `limit` records before a cursor, returned in append order.
+/// A missing cursor selects the end of the log; `next_cursor` points toward older records.
+pub fn history_before(
+    data_dir: &Path,
+    id: &str,
+    before: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<HistoryPage> {
+    let store = store::Store::open(data_dir.join("sessions.sqlite3"))?;
+    store.load_session(id)?;
+    let (events, has_more) = store.history_before(id, before, limit)?;
+    let next_cursor = events.first().map(|event| event.id.clone());
+    Ok(HistoryPage {
+        events,
+        next_cursor,
+        has_more,
+    })
+}

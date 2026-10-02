@@ -1,1 +1,3 @@
-third_party/crossterm-0.28.1/** text=auto eol=lf
+# Terminal cell snapshots retain padding; transcript bodies retain native text.
+docs/results/*/preview-*.txt whitespace=-blank-at-eol
+docs/results/*/live-session.html whitespace=-blank-at-eol

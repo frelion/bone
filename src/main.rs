@@ -5,9 +5,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bone::config::{Config, Profile, default_data_dir};
 use bone::runtime::{Engine, RunOptions};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, FromArgMatches, Parser, Subcommand};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
+
+mod tui;
 
 #[derive(Parser)]
 #[command(
@@ -24,7 +26,7 @@ struct Cli {
     #[arg(long, global = true, env = "BONE_MODEL")]
     model: Option<String>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -41,6 +43,11 @@ enum Command {
     },
     /// Converse while work continues; /stop, /resume and /quit control the session.
     Chat {
+        #[command(flatten)]
+        run: RunArgs,
+    },
+    /// Chat in a terminal interface with live, read-only action inspection.
+    Tui {
         #[command(flatten)]
         run: RunArgs,
     },
@@ -91,7 +98,16 @@ enum Command {
     },
 }
 
-#[derive(Args, Clone)]
+impl Default for Command {
+    fn default() -> Self {
+        let matches = RunArgs::augment_args(clap::Command::new("bone")).get_matches_from(["bone"]);
+        Self::Tui {
+            run: RunArgs::from_arg_matches(&matches).expect("valid default run arguments"),
+        }
+    }
+}
+
+#[derive(Args, Clone, Debug, PartialEq, Eq)]
 struct RunArgs {
     #[arg(long)]
     workspace: Option<PathBuf>,
@@ -140,12 +156,13 @@ async fn main() {
     }
 }
 
-async fn execute(cli: Cli) -> Result<()> {
+async fn execute(mut cli: Cli) -> Result<()> {
+    let command = cli.command.take().unwrap_or_default();
     if let Command::Tools {
         read_only,
         single_job,
         json,
-    } = &cli.command
+    } = &command
     {
         let definitions = bone::tool_definitions(*single_job, *read_only);
         if *json {
@@ -158,7 +175,7 @@ async fn execute(cli: Cli) -> Result<()> {
         return Ok(());
     }
     let data = cli.data_dir.clone().unwrap_or_else(default_data_dir);
-    match &cli.command {
+    match &command {
         Command::Tools { .. } => unreachable!("metadata command returned before session setup"),
         Command::Providers { json } => {
             let names = bone::providers();
@@ -271,6 +288,18 @@ async fn execute(cli: Cli) -> Result<()> {
         Command::Chat { run } => {
             let mut engine = open(&cli, &data, run, run.session.as_deref())?;
             chat(&mut engine, run.timeout_seconds).await?;
+        }
+        Command::Tui { run } => {
+            tui::require_terminal()?;
+            let (profile_name, profile) = select_profile(&cli, &data)?;
+            let profiles = Config::load(&data)?.profiles.into_iter().collect();
+            let settings = tui::Settings {
+                profile_name,
+                profile,
+                profiles,
+            };
+            let mut engine = open(&cli, &data, run, run.session.as_deref())?;
+            tui::run(&mut engine, &data, settings, run.timeout_seconds).await?;
         }
     }
     Ok(())
@@ -393,16 +422,31 @@ async fn run_to_result(
             return Ok(());
         }
         tokio::select! {
-            events=engine.step()=>{
-                let events=events?;
-                if events.is_empty() && engine.is_quiescent(){
-                    let status=if engine.state().unknown_writes.is_empty(){"waiting"}else{"paused"};
-                    report(engine,input,status,"Work is waiting for input or reconciliation.",json_output)?;return Ok(());
+            events = engine.step() => {
+                let events = events?;
+                if events.is_empty() && engine.is_quiescent() {
+                    let status = if engine.state().unknown_writes.is_empty() {
+                        "waiting"
+                    } else {
+                        "paused"
+                    };
+                    report(engine, input, status, "Work is waiting for input or reconciliation.", json_output)?;
+                    return Ok(());
                 }
-                if events.is_empty(){tokio::time::sleep(Duration::from_millis(20)).await;}
+                if events.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
             }
-            _=tokio::signal::ctrl_c()=>{engine.stop()?;report(engine,input,"paused","Stopped.",json_output)?;return Ok(());}
-            _=&mut deadline=>{engine.stop()?;report(engine,input,"paused","Execution time limit reached.",json_output)?;bail!("execution time limit reached");}
+            _ = tokio::signal::ctrl_c() => {
+                engine.stop()?;
+                report(engine, input, "paused", "Stopped.", json_output)?;
+                return Ok(());
+            }
+            _ = &mut deadline => {
+                engine.stop()?;
+                report(engine, input, "paused", "Execution time limit reached.", json_output)?;
+                bail!("execution time limit reached");
+            }
         }
     }
 }
@@ -431,41 +475,84 @@ async fn chat(engine: &mut Engine, seconds: u64) -> Result<()> {
             deadline_armed = false;
         }
         tokio::select! {
-            line=lines.next_line(),if !input_closed=>{
-                match line?{
-                    None=>{input_closed=true;if engine.is_quiescent(){break;}},
-                    Some(line)=>match line.trim(){
-                        "/quit"=>{engine.stop()?;break;},
-                        "/stop"=>{engine.stop()?;deadline_armed=false;println!("Stopped.");},
-                        "/resume"=>{engine.resume()?;deadline.as_mut().reset(tokio::time::Instant::now()+duration);deadline_armed=true;},
-                        ""=>{},
-                        _=>{engine.post(&line,None)?;deadline.as_mut().reset(tokio::time::Instant::now()+duration);deadline_armed=true;}
+            line = lines.next_line(), if !input_closed => {
+                match line? {
+                    None => {
+                        input_closed = true;
+                        if engine.is_quiescent() {
+                            break;
+                        }
                     }
+                    Some(line) => match line.trim() {
+                        "/quit" => {
+                            engine.stop()?;
+                            break;
+                        }
+                        "/stop" => {
+                            engine.stop()?;
+                            deadline_armed = false;
+                            println!("Stopped.");
+                        }
+                        "/resume" => {
+                            engine.resume()?;
+                            deadline.as_mut().reset(tokio::time::Instant::now() + duration);
+                            deadline_armed = true;
+                        }
+                        "" => {}
+                        _ => {
+                            engine.post(&line, None)?;
+                            deadline.as_mut().reset(tokio::time::Instant::now() + duration);
+                            deadline_armed = true;
+                        }
+                    },
                 }
             }
-            updates=engine.step(),if !engine.is_quiescent()=>{
-                let updates=updates?;
-                if updates.is_empty()&&!engine.is_quiescent(){tokio::time::sleep(Duration::from_millis(20)).await;}
-                for event in updates{
-                    if matches!(event.kind.as_str(),"delivery"|"question"|"failure"|"input_paused"){
+            updates = engine.step(), if !engine.is_quiescent() => {
+                let updates = updates?;
+                if updates.is_empty() && !engine.is_quiescent() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                for event in updates {
+                    if matches!(event.kind.as_str(), "delivery" | "question" | "failure" | "input_paused") {
                         // Internal assignment deliveries are consumed by their waiting job.
-                        let public=match event.reply_to.as_deref() {
-                            Some(id)=>engine.read_event(id)?.data["source"]==Value::String("user".into()),
-                            None=>false,
+                        let public = match event.reply_to.as_deref() {
+                            Some(id) => engine.read_event(id)?.data["source"] == Value::String("user".into()),
+                            None => false,
                         };
-                        let visible=if event.kind=="question"{engine.is_unanswered_question(&event)}else{public};
-                        if visible{println!("{}",engine.event_text(&event)?);if interactive{print!("> ");std::io::stdout().flush()?;}}
+                        let visible = if event.kind == "question" {
+                            engine.is_unanswered_question(&event)
+                        } else {
+                            public
+                        };
+                        if visible {
+                            println!("{}", engine.event_text(&event)?);
+                            if interactive {
+                                print!("> ");
+                                std::io::stdout().flush()?;
+                            }
+                        }
                     }
                 }
-                if input_closed&&engine.is_quiescent(){break;}
+                if input_closed && engine.is_quiescent() {
+                    break;
+                }
             }
-            _=&mut deadline,if deadline_armed=>{
+            _ = &mut deadline, if deadline_armed => {
                 engine.stop()?;
-                deadline_armed=false;
+                deadline_armed = false;
                 println!("Execution time limit reached. Work is paused; /resume to continue.");
-                if input_closed{break;}
+                if input_closed {
+                    break;
+                }
             }
-            _=tokio::signal::ctrl_c()=>{engine.stop()?;deadline_armed=false;println!("Stopped. /resume to continue; /quit to exit.");if input_closed{break;}}
+            _ = tokio::signal::ctrl_c() => {
+                engine.stop()?;
+                deadline_armed = false;
+                println!("Stopped. /resume to continue; /quit to exit.");
+                if input_closed {
+                    break;
+                }
+            }
         }
     }
     Ok(())
@@ -474,6 +561,81 @@ async fn chat(engine: &mut Engine, seconds: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_cli_uses_the_explicit_tui_defaults() {
+        let bare = Cli::try_parse_from(["bone"]).unwrap();
+        let explicit = Cli::try_parse_from(["bone", "tui"]).unwrap();
+        let Command::Tui { run: bare_run } = bare.command.unwrap_or_default() else {
+            panic!("bare invocation must select TUI");
+        };
+        let Some(Command::Tui { run: explicit_run }) = explicit.command else {
+            panic!("explicit TUI must remain available");
+        };
+        assert_eq!(bare_run, explicit_run);
+    }
+
+    #[test]
+    fn implicit_tui_preserves_global_options_and_explicit_commands() {
+        let cli = Cli::try_parse_from([
+            "bone",
+            "--data-dir",
+            "/tmp/bone-cli-test",
+            "--profile",
+            "subscription",
+            "--model",
+            "chatgpt:gpt-6-luna",
+        ])
+        .unwrap();
+        assert_eq!(cli.data_dir, Some(PathBuf::from("/tmp/bone-cli-test")));
+        assert_eq!(cli.profile.as_deref(), Some("subscription"));
+        assert_eq!(cli.model.as_deref(), Some("chatgpt:gpt-6-luna"));
+        assert!(matches!(
+            cli.command.unwrap_or_default(),
+            Command::Tui { .. }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "bone",
+            "run",
+            "inspect the project",
+            "--read-only",
+            "--max-calls",
+            "7",
+            "--profile",
+            "work",
+        ])
+        .unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("work"));
+        let Some(Command::Run { prompt, run, .. }) = cli.command else {
+            panic!("explicit run must retain its arguments");
+        };
+        assert_eq!(prompt, "inspect the project");
+        assert!(run.read_only);
+        assert_eq!(run.max_calls, 7);
+        assert!(matches!(
+            Cli::try_parse_from(["bone", "tools", "--json"])
+                .unwrap()
+                .command,
+            Some(Command::Tools { json: true, .. })
+        ));
+        assert!(Cli::try_parse_from(["bone", "unknown-command"]).is_err());
+        assert!(Cli::try_parse_from(["bone", "run"]).is_err());
+        assert_eq!(
+            Cli::try_parse_from(["bone", "--help"])
+                .err()
+                .unwrap()
+                .kind(),
+            clap::error::ErrorKind::DisplayHelp
+        );
+        assert_eq!(
+            Cli::try_parse_from(["bone", "--version"])
+                .err()
+                .unwrap()
+                .kind(),
+            clap::error::ErrorKind::DisplayVersion
+        );
+    }
 
     #[test]
     fn model_override_preserves_selected_subscription_credentials_and_limits() {

@@ -1,0 +1,251 @@
+{
+  "title": "看一次真实工程任务如何发生",
+  "subtitle": "在隔离 BONE Rust 仓库中实现源码搜索与安全局部编辑。浏览原始对话、模型返回、工具参数和结果，以及失败、续做与外部介入。",
+  "sessions": [
+    {
+      "database": "2026-10-01-workspace-engineering-demo/data/sessions.sqlite3",
+      "session_id": "3f17c0e6-00e1-450a-8953-bfd351b666cc",
+      "active_seconds": 2001.403215833,
+      "meta": {
+        "title": "主案例：实现搜索与安全编辑，直到纠正和实际演示",
+        "description": "Agent 在已有的真实 Rust 项目中增加 search_files、edit_file 和原生工具目录 CLI。原始十阶段输入预先冻结；后续保留了范围澄清、核心故障修复、追加恢复窗口、功能与编译反馈。这里是同一个持久 Session 的最终完整记录，没有拼接不同 Agent 的成功片段。",
+        "model": "chatgpt:gpt-6-luna（前段 high，补充恢复后 medium）",
+        "project": {
+          "name": "BONE · 隔离工程候选",
+          "workspace": "/Users/zzhang/.codex/worktrees/flagship-engineering/BONE",
+          "language": "Rust / 单 Cargo package",
+          "baseline": "aec1fa3；后续执行器补入两处摘要任务边界修复，工具仍来自候选",
+          "task": "读懂现有文件工具与安全写入机制，实现完整文件 hash 的源码搜索、匹配原文的非级联局部编辑、分页和只读权限，再补回归、文档及 bone tools 入口。途中接受规格替换、先解释、停止和新进程继续。",
+          "files": [
+            "Cargo.toml",
+            "src/runtime.rs",
+            "src/context.rs",
+            "src/state.rs",
+            "src/store.rs",
+            "src/model.rs",
+            "src/config.rs",
+            "src/tools.rs",
+            "src/main.rs",
+            "src/lib.rs",
+            "tests/acceptance.rs",
+            "README.md"
+          ],
+          "changes": [
+            {
+              "path": "README.md",
+              "added": 9,
+              "removed": 1
+            },
+            {
+              "path": "src/lib.rs",
+              "added": 14,
+              "removed": 0
+            },
+            {
+              "path": "src/main.rs",
+              "added": 30,
+              "removed": 0
+            },
+            {
+              "path": "src/tools.rs",
+              "added": 440,
+              "removed": 3
+            },
+            {
+              "path": "tests/acceptance.rs",
+              "added": 45,
+              "removed": 0
+            }
+          ]
+        },
+        "outcome": {
+          "label": "补充纠正与演示完成；原限时验收失败保留",
+          "description": "首次交付独立功能验收 24/27；外部反馈后 27/27。随后清理一个未使用变量并通过静态检查，最终执行真实源码搜索与临时文件的创建、读取、非级联编辑、读回及清理。最终 Session Idle、队列和未知写为空。27/27 对应清理未使用变量之前的版本；最终源码只删除该无用声明，未重跑整份功能合同。"
+        },
+        "caveats": [
+          "14 条外部对话是 supervisor/测试脚本发送的自然输入，不是现场由人逐句键入，也不是 Agent 自己提出任务。原文全部保留，可展开查看。",
+          "这次会话实际只有一个持久 Job。没有独立 job_created 事件；其他案例的 Job 创建证据单独展示，不混入本次过程。",
+          "原始第三阶段 600 秒限时失败，以及两次摘要 180 秒超时都保留。后续恢复、外部修复和详细演示要求使它完成，不构成首交付成功或任意项目成功率。",
+          "可读正文与行动事件保留；不透明 provider reasoning 从分享版本中省略；模型请求的完整 HTTP 内容不在这些 Session 事件中。摘要是模型实际输出，可能含错误，应与原文和行动对照。",
+          "累计活跃执行约 33 分钟；自然经过约 80 分钟含外部分析、暂停与构建。3 次失败调用缺完整用量，总 token 与费用未知。主仓库另外集成的 Sol 辅助工具不是这个候选的自主产物。",
+          "分享版本省略不透明 reasoning/encrypted 块及凭据/传输字段。源事件指纹标识 SQLite 原文；导出事件指纹标识脱敏 JSON。"
+        ],
+        "milestones": [
+          {
+            "event_id": "1edd8802-205f-45b3-b81e-8216bebbf413",
+            "label": "01 / 原始任务与合同",
+            "description": "先读完整委托：项目、三项承诺、工具限制和阶段范围。"
+          },
+          {
+            "event_id": "b81c2851-de48-455f-b8c6-3f7df3d02d1f",
+            "label": "02 / Agent 提问",
+            "description": "它发现当前要求与完整合同的 CLI 范围冲突。"
+          },
+          {
+            "event_id": "407097f7-39eb-4bf8-a410-d926f2281ba0",
+            "label": "03 / 先解释，暂停修改",
+            "description": "看新要求之后做了哪些动作，答复如何描述实际进度。"
+          },
+          {
+            "event_id": "74dbed23-a040-47e0-82d2-d34ee46a475a",
+            "label": "04 / 途中替换规格",
+            "description": "页大小从 100/1000 改为 50/200，并增加排除目录。"
+          },
+          {
+            "event_id": "70d1cb0b-4f96-4310-9b7d-4df28c98e3c1",
+            "label": "05 / 失败与恢复窗口",
+            "description": "原限时门禁中止，随后两次摘要超时；外部修复后再恢复。"
+          },
+          {
+            "event_id": "596b0290-6d12-4f48-bd5e-890e32372319",
+            "label": "06 / 自然停止与继续",
+            "description": "停止输入、Agent pause_work、新进程的继续均可追踪。"
+          },
+          {
+            "event_id": "ce6fd2e0-e3d7-4005-9e86-6bfdf22cfc80",
+            "label": "07 / 结算旧输入",
+            "description": "Agent 用 input_resolve 完成或替代旧请求。结算是声明，不等于独立验收通过。"
+          },
+          {
+            "event_id": "af597d40-faca-48c0-ae77-af209acd6237",
+            "label": "08 / 回查原始承诺",
+            "description": "看它怎样找回已离开工作历史的原文，以及承认未做的演示。"
+          },
+          {
+            "event_id": "9f5b93ba-7aea-4675-9a81-cb94185044ac",
+            "label": "09 / 24/27 后的纠正",
+            "description": "外部给失败现象，Agent 自己定位并修改跨进程游标和 snippet。"
+          },
+          {
+            "event_id": "37b6f66c-7a98-446a-87d0-c400bd7c3843",
+            "label": "10 / 工具真实行动",
+            "description": "沿 search → read → write → edit → read → cleanup 看参数、结果及最终交付。"
+          }
+        ],
+        "annotations": [
+          {
+            "after_event_id": "ed284f17-97a7-4d9a-9ad6-bd6720012a80",
+            "title": "外部阶段澄清与持久续接",
+            "text": "运行器收到提问后暂停，操作者用 SQLite backup 延续同一 Session，再发送下一条范围澄清。backup 是外部操作，不是 Agent 的工具调用。",
+            "source": "trial4-timeout.json / 工程验收 README"
+          },
+          {
+            "after_event_id": "e1399f46-c198-4836-aae7-0556d6e24947",
+            "title": "原始验收在此失败",
+            "text": "第三阶段超过 600 秒，外部 supervisor 中止执行；此前累计 50 次模型启动、769.86 秒。事件中的 user stopped session 是通用停止原因，此处实际是外部限时门禁触发。原始 verdict 永久保留 FAIL_time_cap。",
+            "source": "docs/results/2026-10-01-flagship-engineering/trial4-timeout.json"
+          },
+          {
+            "before_event_id": "518d1a34-410e-4e0d-b421-519243bce222",
+            "title": "两次摘要超时后的外部核心修复",
+            "text": "前面 high、medium 的两次补充恢复都在摘要调用中超时。操作者修复原生摘要请求的任务边界，只让本次调用总结历史；没有注入候选工具代码。此处再次显式恢复，下一次摘要完成。恢复窗口和修复均不是 Agent 自主行动。",
+            "source": "summary-request-comparison.json / summary-fix-phase1-6-review.json"
+          },
+          {
+            "before_event_id": "a71ed4e3-d972-43d8-b607-82ef11230399",
+            "title": "外部启动新的 CLI 进程",
+            "text": "自然停止后，操作者从已持久化 Session 启动新 CLI 进程，继续预先冻结的后四阶段对话。内核保持旧输入身份、额度和事件。",
+            "source": "trial4-supervisor-result.json"
+          },
+          {
+            "after_event_id": "33c2610f-7593-495e-8aa8-29265b04317b",
+            "title": "独立验收第一次只有 24/27",
+            "text": "任务声明完成后，外部冻结功能合同发现跨进程游标与 snippet 分页失败；原先要求的临时工具演示也没有做。下一条输入给出失败现象，不提供实现。",
+            "source": "trial4-candidate-functional.json / trial4-independent-final-review.json"
+          },
+          {
+            "after_event_id": "279647c4-bd55-46bd-b49b-da597ec5c524",
+            "title": "功能纠正达 27/27，但静态检查仍报错",
+            "text": "外部重跑同一冻结功能合同达到 27/27；完整门禁发现未使用变量。下一条输入给编译诊断。这个 27/27 不属于首次交付。",
+            "source": "correction-candidate-functional-result.json / correction-candidate-gates-result.json"
+          },
+          {
+            "after_event_id": "4cbc9738-5e74-46d4-8096-59c81e347fd2",
+            "title": "独立静态检查通过，演示仍需另做",
+            "text": "外部确认最终候选仅比功能合同通过版少一条无用声明，fmt、全 targets / 全 features Clippy 通过。演示运行器此时使用候选自己的工具实现。随后给出明确演示步骤，要求只在同一 Job 内行动。",
+            "source": "lint-correction-independent-gates.json / final-candidate-manifest.json"
+          },
+          {
+            "after_event_id": "521f2844-074a-43bd-b7e7-d735a8bf67ff",
+            "title": "这轮演示独立核查通过",
+            "text": "独立检查确认原生 search/read/write/edit/read/shell 配对，源码 hash 不变，临时文件已删除，21 项演示检查通过；累计 164 次模型启动。该结果只证明这个已修正任务链，不覆盖此前限时失败。",
+            "source": "candidate-demo-result.json / final-delivery-review.json"
+          }
+        ]
+      }
+    },
+    {
+      "database": "2026-10-01-workspace-engineering-trial2/data/sessions.sqlite3",
+      "session_id": "270cf5f5-8945-45a5-96e8-a7f836789676",
+      "immutable": true,
+      "active_seconds": 222.046983083,
+      "meta": {
+        "title": "对照案例：Agent 创建第二个 Job，仍耗尽额度",
+        "description": "更早的独立失败运行。同样的工程需求，48k 字符上下文、medium 推理强度、共享 48 次调用额度。Agent 实际调用 job_send 创建另一份工作上下文，然后用 job_wait 等待。这次没有源码交付，全部失败保留。",
+        "model": "chatgpt:gpt-6-luna / medium",
+        "project": {
+          "name": "BONE · 早期独立失败候选",
+          "language": "Rust",
+          "baseline": "aec1fa3",
+          "task": "同样实现 search_files 和 edit_file。Agent 自行决定内部 Job，创建不是外部硬编码的分工。",
+          "files": [
+            "src/tools.rs",
+            "src/runtime.rs",
+            "tests/acceptance.rs"
+          ],
+          "changes": []
+        },
+        "outcome": {
+          "label": "失败：没有源码修改，调用额度耗尽",
+          "description": "48 次调用，其中 11 次摘要；两个 Job 最终 Paused。功能验收与后续阶段未执行。可用它观察重复读取、拆分、等待与共享额度的实际效果。"
+        },
+        "caveats": [
+          "这个案例与主案例是不同 Session；不将它的 Job 创建拼进主案例。",
+          "只有一条外部输入；另一条 source=job 输入由 Agent 的 job_send 生成。没有独立 job_created 事件，创建由原生调用、内部输入和返回的 job_id 共同证明。",
+          "这是失败记录。多 Job 的存在本身不能证明工程效率或任务质量。该冻结数据库没有 WAL，以 immutable 只读模式导出。",
+          "分享版本省略不透明 reasoning/encrypted 块及凭据/传输字段。源事件指纹标识 SQLite 原文；导出事件指纹标识脱敏 JSON。"
+        ],
+        "milestones": [
+          {
+            "event_id": "c17b056b-80cf-4a5c-9131-bbd9699a2fbb",
+            "label": "01 / 同样的原始委托",
+            "description": "一条外部输入，共享调用额度。"
+          },
+          {
+            "event_id": "37b48e20-09b7-4098-aa8e-3aa23f7b6da4",
+            "label": "02 / Agent 决定拆分",
+            "description": "模型返回 job_send 原生调用，指定标题与输入，不存在另一个 Agent。"
+          },
+          {
+            "event_id": "f2920dc8-dbc7-4613-bed0-264eb25c76be",
+            "label": "03 / 新 Job 的内部输入",
+            "description": "原事件携带 sender_job、sender_input 和同一个 root_input。"
+          },
+          {
+            "event_id": "176bd12b-308c-421e-a954-e83edde1612f",
+            "label": "04 / 创建结果",
+            "description": "job_send 返回真实的 job_id 与 input_id，可跟踪后续归属。"
+          },
+          {
+            "event_id": "58f62d97-85d2-4c1f-81a1-af58a6938a94",
+            "label": "05 / 等待具体输入",
+            "description": "job_wait 指向内部输入，之后取得失败结果。"
+          },
+          {
+            "event_id": "ea7bb547-be26-415c-8415-24c1bbf7cedc",
+            "label": "06 / 额度耗尽",
+            "description": "拆分没有重置执行额度；没有形成源码交付。"
+          }
+        ],
+        "annotations": [
+          {
+            "after_event_id": "2988e3be-6285-488d-8506-2fe17fa51adf",
+            "title": "外部诊断结论",
+            "text": "37 个完成工作响应均保留 BONE 指令；仍没有源码修改。工具配对或持久指令正确，不等于模型能推进任务。功能合同与阶段 2–10 均未执行。",
+            "source": "docs/results/2026-10-01-flagship-engineering/trial2-failure.json"
+          }
+        ]
+      }
+    }
+  ]
+}

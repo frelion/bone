@@ -15,6 +15,7 @@ candle = ["dep:rig-candle"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util = "0.3"
 fs2 = "0.4"
 libc = "0.2"
@@ -24,12 +25,15 @@ rig-bedrock = { git = "https://github.com/0xPlaygrounds/rig", rev = "063bcf0e9ce
 rig-vertexai = { git = "https://github.com/0xPlaygrounds/rig", rev = "063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a", optional = true }
 rig-candle = { git = "https://github.com/0xPlaygrounds/rig", rev = "063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a", optional = true }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 toml = "0.9"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

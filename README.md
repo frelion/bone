@@ -4,7 +4,7 @@ BONE 是一个 Rust 编写的 coding agent。用户与一个 agent 对话；agen
 
 这是从零重写的单 crate 实现。模型连接、消息、工具定义、返回结果和流解析使用官方 Rig SDK，固定到 Git 提交 `063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a`。会话状态与事件存于 SQLite。架构边界见 [architecture.md](docs/architecture.md)，验收和消融方法见 [verification.md](docs/verification.md)。
 
-当前工程基线通过 136 项 Rust 检查和 27 项独立工具检查；同一内核使用 `gpt-6-luna` 完成了跨进程、多轮修改与冷历史回查的真实仓库任务，并在外部反馈修正后通过功能验收和实际工具演示。原先失败、人工介入及验证边界保留在[工程交付记录](docs/results/2026-10-01-flagship-engineering/README.md)中；这不是通用任务成功率保证。
+当前 Rust 回归 167 项通过、1 项忽略；TUI 的真实终端与订阅验证见 [TUI 验收记录](docs/results/2026-10-01-tui/README.md)。同一内核使用 `gpt-6-luna` 完成了跨进程、多轮修改与冷历史回查的真实仓库任务，并在外部反馈修正后通过功能验收和实际工具演示。原先失败、人工介入及验证边界保留在[工程交付记录](docs/results/2026-10-01-flagship-engineering/README.md)中；这不是通用任务成功率保证。
 
 ## 查看可用工具
 
@@ -16,7 +16,7 @@ bone tools --read-only --single-job --json
 
 该命令只输出运行时使用的 Rig 原生 `ToolDefinition` 元数据；JSON 为定义数组，文本为名称与描述。它不读取配置或认证、不连接模型、不创建会话，也不执行文件工具。`--read-only` 保留 `search_files`，移除 `edit_file`、`write_file` 和 `shell`；`--single-job` 移除跨 Job 控制工具，保留当前 Job 的普通工具。传入全局 profile/model 选项不会触发模型配置。
 
-普通搜索和编辑仍须经过 `run/chat → Engine → Job → tool`，元数据入口不公开执行器。工具用法、实现来源与验证边界见 [工程工具](docs/engineering-tools.md)。
+普通搜索和编辑仍须经过 `run/chat/tui → Engine → Job → tool`，元数据入口不公开执行器。工具用法、实现来源与验证边界见 [工程工具](docs/engineering-tools.md)。
 
 ## 构建与配置
 
@@ -24,9 +24,14 @@ bone tools --read-only --single-job --json
 
 ```sh
 cargo build --locked
-cargo install --path . --locked
+cargo install --path . --locked --force
+bone --version
 bone providers
 ```
+
+安装后的版本应为 `bone 0.5.0`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
+
+`target/release/bone` 是构建目录内的文件，只有在包含它的 checkout 中才能通过相对路径运行。安装后的 `bone` 可在任意项目目录中使用。
 
 `bone providers` 从 Rig 的注册表列出全部 provider/protocol 组合，并加入 Cohere、Ollama 和本次构建启用的官方 companion provider。某些 provider 支持多种协议，使用列出的限定名称，例如 `moonshot/openai:MODEL`。
 
@@ -107,6 +112,38 @@ bone --data-dir ~/.bone-personal --profile personal --model chatgpt:gpt-6-luna c
 ```
 
 BONE 独立登录的订阅缓存仅存于当前数据目录的 `profiles/PROFILE/auth.json`。每次调用重新通过 Rig 读取或刷新缓存，并持有该缓存的跨进程锁直到该调用结束。复用 Codex 登录时，锁由认证文件的 canonical 路径标识，保存在固定 `~/.bone/v2/credential-locks`，因此不同数据目录和 profile 仍共享同一来源的调用锁。等待锁可随调用取消，不消耗单次模型请求的超时；CLI 总运行时限仍包含排队时间。普通运行不会启动交互登录。独立缓存失效或 HTTP 401 会报告重新登录；显式 `login` 成功后才替换已有缓存。开启复用时，`bone login` 只检查现有 Codex 登录资料是否可加载，不发起登录或联网验证。
+
+## 终端界面
+
+```sh
+bone
+bone tui
+cargo run --locked -- tui
+bone --profile subscription tui --workspace /path/to/project
+bone --profile subscription tui --session SESSION_ID
+```
+
+TUI 默认显示全宽对话、Markdown 答复和工具行动，复用现有订阅与模型配置。Job 由 Agent 自动管理。原生 Rig 流实时显示为“输出中（未交付）”；新要求、暂停或调用结束会清除旧预览，正式交付以 SQLite 记录为准。
+
+| 操作 | 按键 / 命令 |
+| --- | --- |
+| 发送 / 换行 | Enter / Shift+Enter、Alt+Enter、Ctrl+J |
+| 命令面板 / 文件引用 | Ctrl+P / `@文件` 后 Tab，或 Ctrl+O |
+| 输入历史 / 编辑 / 撤销 | ↑↓；Ctrl+A/E/U/K/W；Ctrl+Z / Alt+Z |
+| 外部编辑器 | Ctrl+G，使用 VISUAL / EDITOR，返回草稿后 Enter 才发送 |
+| 搜索对话 / 活动详情 | Ctrl+F / F2；活动 Enter 查看原文 |
+| 暂停 / 恢复 / 退出 | Ctrl+C / Ctrl+R / Ctrl+Q |
+| 会话 / 模型 / 状态 | `/sessions`、`/new`、`/model`、`/status` |
+| 修改 / 导出 / 复制 | `/diff`、`/export`、`/copy` |
+| 更早记录 / 帮助 | `/older`、`/help`、F1 |
+
+草稿及最近输入独立、原子保存在数据目录的 `tui/` 下。多行粘贴、文件补全、恢复草稿和外部编辑器均不自动提交。切换会话会保存并暂停旧工作，打开的未完成工作保持暂停。模型选择使用已配置 profile 或 `/model provider:model` 原生引用，不限制模型名单；同 provider 保留原有 endpoint 和凭据来源，跨 provider 使用其独立接入配置。切换后 Ctrl+R 继续，配置文件不被修改。
+
+界面支持中文/emoji/组合字符、鼠标滚动、Markdown/code/diff 和 NO_COLOR。F2 按需打开只读内部事件面板；不足 100 列时切换主面板。启动按页读取最近 40 条记录，`/older` 向前浏览；完整历史留在 SQLite。最近预览有明确数量和字符上限。模型预览允许丢帧，不承担持久化或交付职责；工具输出在工具完成后显示。
+
+`/diff` 只检查 staged/unstaged 修改与文件状态；`/export` 导出本地 HTML 对话与行动日志；`/copy` 使用系统剪贴板。用户的界面操作不发起 Agent 模型或工作区写工具。Agent 的行动始终由 Engine/Job 执行；未知写必须核查，再使用 `bone reconcile`。TUI 需要交互终端，管道输入使用 `bone chat`。
+
+详见 [终端界面设计与验收](docs/tui.md)。离线 PTY 验收：`python3 tests/tui_pty.py`，仅连接本地 fixture，不读取真实凭据。
 
 ## 使用会话
 

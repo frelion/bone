@@ -1,0 +1,37 @@
+BONE TUI render fixture — synthetic data, not a real model run
+ BONE  · provider/model · 工作中                                                
+ 你                                                                             
+ 给这个 CLI 增加错误恢复，并保留 Unicode 输入 👩‍💻。                              
+                                                                                
+ Agent · 进度                                                                   
+ 实现计划                                                                       
+ - 检查状态持久化与输入边界                                                     
+ - 修复失败恢复，并运行回归测试                                                 
+                                                                                
+ 修改集中在 src/tui/view.rs。                                                   
+                                                                                
+ 工具 · read_file                                                               
+ 完成 · src/tui/view.rs                                                         
+ 读取输入编辑与恢复流程。                                                       
+                                                                                
+ 工具 · apply_patch                                                             
+ 完成 · 输入恢复                                                                
+   diff                                                                         
+   @@ recover_draft                                                             
+   - draft.clear();                                                             
+   + draft = previous.clone();                                                  
+                                                                                
+                                                                                
+ Agent · 输出中（未交付）                                                       
+ 边界处理已完成，正在验证多行粘贴与组合字符。                                   
+ 这段是未交付的流式预览。                                                       
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+┌ 输入 · Enter 发送 · Shift+Enter 换行 ────────────────────────────────────────┐
+│补充：失败时保留当前草稿。                                                    │
+│请验证中文、emoji 和多行输入。                                                │
+└──────────────────────────────────────────────────────────────────────────────┘
+ 渲染测试数据 · 非真实模型运行 · Ctrl+P 命令 · Ctrl+O 文件                      
+ BONE · provider/model · fixture · 2 / 24 calls · 1,240 tokens · 可写 · 工作中 ·

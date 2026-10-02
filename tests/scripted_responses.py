@@ -4,6 +4,8 @@
 Prints its loopback port once. The script is a JSON object with a `turns` array.
 Each turn may require `contains` strings in the request JSON, pause via
 `delay_seconds`, return `http_status`, or provide `output` Responses items.
+Optional `delta_chunk_chars` splits text fragments; `event_delay_seconds`
+or an `event_delays` mapping flushes SSE frames with per-event delays.
 Only request JSON bodies are recorded, never authorization headers.
 """
 
@@ -68,7 +70,7 @@ def expand_output(output, body):
     return replace(output)
 
 
-def response_events(output, number, usage):
+def response_events(output, number, usage, delta_chunk_chars=0):
     response_id = "resp_fixture_%d" % number
     base = {"id": response_id, "object": "response", "created_at": 1,
             "model": "fixture", "status": "in_progress", "output": []}
@@ -109,11 +111,15 @@ def response_events(output, number, usage):
                     "output_index": index, "content_index": content_index,
                     "part": {"type": "output_text", "text": "", "annotations": []},
                 }
-                yield "response.output_text.delta", {
-                    "type": "response.output_text.delta", "item_id": item["id"],
-                    "output_index": index, "content_index": content_index,
-                    "delta": content.get("text", ""),
-                }
+                text = content.get("text", "")
+                chunks = [text] if not delta_chunk_chars else [text[offset:offset + delta_chunk_chars]
+                    for offset in range(0, len(text), delta_chunk_chars)]
+                for chunk in chunks:
+                    yield "response.output_text.delta", {
+                        "type": "response.output_text.delta", "item_id": item["id"],
+                        "output_index": index, "content_index": content_index,
+                        "delta": chunk,
+                    }
                 yield "response.output_text.done", {
                     "type": "response.output_text.done", "item_id": item["id"],
                     "output_index": index, "content_index": content_index,
@@ -194,7 +200,7 @@ def main():
                                            "content": [{"type": "output_text", "text": turn.get("text", "done"), "annotations": []}]}])
             output = expand_output(output, body)
             usage = turn.get("usage", {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
-            events = list(response_events(output, number, usage))
+            events = list(response_events(output, number, usage, turn.get("delta_chunk_chars", 0)))
             for sequence, (_name, event) in enumerate(events):
                 event["sequence_number"] = sequence
             streaming = body.get("stream", False)
@@ -208,8 +214,17 @@ def main():
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             try:
-                self.wfile.write(payload)
-                self.wfile.flush()
+                if streaming and (turn.get("event_delay_seconds") or turn.get("event_delays") or turn.get("delta_chunk_chars")):
+                    # Keep Content-Length framing but flush each SSE frame separately:
+                    # clients receive genuine deltas before response.completed.
+                    for name, event in events:
+                        time.sleep(turn.get("event_delays", {}).get(name, turn.get("event_delay_seconds", 0)))
+                        frame = "event: %s\ndata: %s\n\n" % (name, json.dumps(event))
+                        self.wfile.write(frame.encode())
+                        self.wfile.flush()
+                else:
+                    self.wfile.write(payload)
+                    self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
 

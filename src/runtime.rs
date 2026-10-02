@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -82,6 +83,65 @@ enum Completed {
     },
 }
 
+/// Ephemeral observation of one Rig native stream item. Durable responses remain authoritative.
+#[derive(Clone, Debug)]
+pub struct ModelProgress {
+    pub job_id: String,
+    pub call_id: String,
+    pub revision: u64,
+    pub purpose: String,
+    pub item: Value,
+}
+
+const MODEL_PROGRESS_RECORDS: usize = 128;
+const MODEL_PROGRESS_ITEM_BYTES: usize = 32 * 1024;
+
+#[derive(Default)]
+struct ProgressObserver {
+    enabled: AtomicBool,
+    queue: Mutex<VecDeque<ModelProgress>>,
+}
+
+impl ProgressObserver {
+    fn push(&self, origin: &Origin, purpose: &str, item: &Value, bytes: usize) {
+        if !self.enabled.load(Ordering::Relaxed) || bytes > MODEL_PROGRESS_ITEM_BYTES {
+            return;
+        }
+        // Observation must never hold up a model stream. Contention drops the item.
+        if let Ok(mut queue) = self.queue.try_lock() {
+            if queue.len() == MODEL_PROGRESS_RECORDS {
+                queue.pop_front();
+            }
+            queue.push_back(ModelProgress {
+                job_id: origin.job.clone(),
+                call_id: origin.call.clone(),
+                revision: origin.revision,
+                purpose: purpose.to_owned(),
+                item: item.clone(),
+            });
+        }
+    }
+
+    fn drain(&self, revision: u64, paused: bool) -> Vec<ModelProgress> {
+        self.enabled.store(true, Ordering::Relaxed);
+        match self.queue.try_lock() {
+            Ok(mut queue) => queue
+                .drain(..)
+                .filter(|item| !paused && item.revision == revision)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn clear(&self) {
+        // The engine is the only consumer; a producer only holds this lock while cloning
+        // one bounded item. Clearing is independent of task completion and persistence.
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.clear();
+        }
+    }
+}
+
 /// Public operations are session-level. Job IDs are exposed in diagnostics only.
 pub struct Engine {
     state: SessionState,
@@ -92,6 +152,7 @@ pub struct Engine {
     loaded: BTreeSet<String>,
     public_inputs: BTreeMap<u64, String>,
     notifications: VecDeque<Event>,
+    model_progress: Arc<ProgressObserver>,
     tasks: JoinSet<Completed>,
     running: BTreeMap<String, Running>,
     write_lease: Option<WriteLease>,
@@ -157,6 +218,7 @@ impl Engine {
             loaded: BTreeSet::new(),
             public_inputs,
             notifications: VecDeque::new(),
+            model_progress: Arc::new(ProgressObserver::default()),
             tasks: JoinSet::new(),
             running: BTreeMap::new(),
             write_lease: None,
@@ -321,12 +383,20 @@ impl Engine {
         Ok(id)
     }
 
+    /// Begin observing and drain available native items. Items may be dropped under
+    /// load; callers must render the committed response as the final result.
+    pub fn drain_model_progress(&mut self) -> Vec<ModelProgress> {
+        self.model_progress
+            .drain(self.state.revision, self.state.paused)
+    }
+
     pub fn stop(&mut self) -> Result<()> {
         self.ensure_healthy()?;
         let mut state = self.state.clone();
         state.revision += 1;
         state.paused = true;
         let mut additions = Vec::new();
+        self.model_progress.clear();
         let running = std::mem::take(&mut self.running);
         for (_, task) in running {
             task.abort.abort();
@@ -491,6 +561,21 @@ impl Engine {
             .push(event.id.clone());
         self.commit(state, vec![event])?;
         lease.clear()?;
+        Ok(())
+    }
+
+    /// Replace the recipe used for future model calls while retaining the session lease.
+    /// The caller controls whether and when paused work resumes.
+    pub fn set_profile(&mut self, profile: Profile, profile_name: String) -> Result<()> {
+        self.ensure_healthy()?;
+        ensure!(
+            self.is_quiescent(),
+            "profile can only change while the engine is quiescent"
+        );
+        profile.validate()?;
+        crate::config::validate_profile_name(&profile_name)?;
+        self.profile = profile;
+        self.profile_name = profile_name;
         Ok(())
     }
 
@@ -1237,6 +1322,8 @@ impl Engine {
         let data_dir = self.data_dir.clone();
         let name = self.profile_name.clone();
         let task_origin = origin.clone();
+        let progress = Arc::clone(&self.model_progress);
+        let purpose = if covered.is_some() { "summary" } else { "work" };
         let timeout = self.options.model_timeout_seconds;
         let abort = self.tasks.spawn(async move {
             let mut stream_items = Vec::new();
@@ -1260,11 +1347,13 @@ impl Engine {
                         let item =
                             item.map_err(|e| model::call_error_for_profile(&profile, &name, e))?;
                         let value = serde_json::to_value(item)?;
-                        bytes = bytes.saturating_add(serde_json::to_vec(&value)?.len());
+                        let item_bytes = serde_json::to_vec(&value)?.len();
+                        bytes = bytes.saturating_add(item_bytes);
                         ensure!(
                             bytes <= 8 * 1024 * 1024,
                             "model stream exceeded the 8 MiB response limit"
                         );
+                        progress.push(&task_origin, purpose, &value, item_bytes);
                         stream_items.push(value);
                     }
                     let response = stream
@@ -2584,6 +2673,102 @@ impl WriteLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_switch_validates_before_mutation_and_preserves_paused_session() {
+        let (_directory, mut engine) = fixture_engine();
+        let mut invalid = Profile::from_model("ollama:next").unwrap();
+        invalid.additional_params = Some(json!(false));
+        assert!(engine.set_profile(invalid, "next".into()).is_err());
+        assert_eq!(engine.profile_name, "fixture");
+        engine.post("remain paused", None).unwrap();
+        engine.stop().unwrap();
+        let before = serde_json::to_value(&engine.state).unwrap();
+        engine
+            .set_profile(Profile::from_model("ollama:next").unwrap(), "next".into())
+            .unwrap();
+        assert_eq!(engine.profile_name, "next");
+        assert_eq!(serde_json::to_value(&engine.state).unwrap(), before);
+    }
+
+    fn progress_origin(revision: u64) -> Origin {
+        Origin {
+            job: "job".into(),
+            input: "input".into(),
+            root: "root".into(),
+            call: "call".into(),
+            revision,
+        }
+    }
+
+    #[test]
+    fn model_progress_is_opt_in_bounded_lossy_and_preserves_native_item() {
+        use rig_core::streaming::{Item, UnknownPayload};
+        let content =
+            serde_json::to_value(rig_core::message::AssistantContent::text("done")).unwrap();
+        assert_eq!(content, json!({"type":"text","text":"done"}));
+        let transcript = json!([
+            {"item":"event","value":{"event":"start","part":0,"kind":"text"}},
+            {"item":"event","value":{"event":"text","part":0,"text":"done"}},
+            {"item":"event","value":{"event":"end","part":0,"content":content}}
+        ]);
+        let native = rig_core::streaming::Transcript::parse(transcript.clone()).unwrap();
+        assert_eq!(serde_json::to_value(native).unwrap(), transcript);
+        let observer = ProgressObserver::default();
+        let native = Item::<rig_core::streaming::StreamEvent>::Unknown(UnknownPayload::from(
+            json!({"provider_field":"native"}),
+        ));
+        let item = serde_json::to_value(native).unwrap();
+        assert_eq!(
+            item,
+            json!({"item":"unknown","value":{"provider_field":"native"}})
+        );
+        observer.push(&progress_origin(3), "work", &item, 64);
+        assert!(observer.queue.lock().unwrap().is_empty());
+        assert!(observer.drain(3, false).is_empty());
+        for _ in 0..MODEL_PROGRESS_RECORDS + 2 {
+            observer.push(&progress_origin(3), "work", &item, 64);
+        }
+        observer.push(
+            &progress_origin(3),
+            "work",
+            &item,
+            MODEL_PROGRESS_ITEM_BYTES + 1,
+        );
+        assert_eq!(observer.queue.lock().unwrap().len(), MODEL_PROGRESS_RECORDS);
+        let records = observer.drain(3, false);
+        assert_eq!(records.len(), MODEL_PROGRESS_RECORDS);
+        assert_eq!(records[0].item, item);
+        assert_eq!(records[0].job_id, "job");
+        assert_eq!(records[0].call_id, "call");
+        assert_eq!(records[0].purpose, "work");
+        let guard = observer.queue.lock().unwrap();
+        observer.push(&progress_origin(3), "work", &item, 64);
+        drop(guard);
+        assert!(observer.drain(3, false).is_empty());
+    }
+
+    #[test]
+    fn model_progress_drops_stale_revisions_and_stop_clears_it() {
+        let (_directory, mut engine) = fixture_engine();
+        engine.drain_model_progress();
+        let revision = engine.state.revision;
+        let item = json!({"item":"event","value":{"event":"text","part":0,"text":"native"}});
+        engine
+            .model_progress
+            .push(&progress_origin(revision + 1), "work", &item, 80);
+        assert!(engine.drain_model_progress().is_empty());
+        engine
+            .model_progress
+            .push(&progress_origin(revision), "work", &item, 80);
+        engine.stop().unwrap();
+        assert!(engine.model_progress.queue.lock().unwrap().is_empty());
+        // A racing producer from the aborted call cannot reappear after stop.
+        engine
+            .model_progress
+            .push(&progress_origin(revision), "work", &item, 80);
+        assert!(engine.drain_model_progress().is_empty());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborted_write_keeps_ownership_until_its_future_actually_exits() {

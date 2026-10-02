@@ -1,0 +1,17 @@
+{
+  "version": "bone 0.5.0",
+  "failure": "relative release path did not exist in the app terminal worktree",
+  "default_command": "TUI",
+  "cli_parser_checks_passed": 2,
+  "clippy_all_targets": true,
+  "installed_path_from_user_worktree_started": true,
+  "ctrl_q_clean_exit": true,
+  "observed_model": "chatgpt/openai:gpt-6-luna",
+  "credential_source_changed": false,
+  "platform": "macOS",
+  "previous_version": "0.2.1",
+  "installed_target": "~/.cargo/bin/bone",
+  "previous_launcher_backed_up": true,
+  "entrypoint_fix": "Existing PATH launcher repointed to installed binary; previous launcher preserved locally",
+  "workspace_condition": "Terminal was in another worktree without the relative release build"
+}

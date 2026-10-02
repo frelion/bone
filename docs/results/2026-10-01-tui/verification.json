@@ -1,0 +1,52 @@
+{
+  "rust_tests": {
+    "passed": 163,
+    "ignored": 1
+  },
+  "clippy_all_targets": true,
+  "all_features_compile": true,
+  "pty_cases_passed": 15,
+  "release_pty_cases_passed": 15,
+  "release_build": true,
+  "live": {
+    "date": "2026-10-01",
+    "scope": "production TUI real subscription two-turn readonly smoke",
+    "model": "chatgpt:gpt-6-luna",
+    "credential_source": "existing Codex login reused; no credential values copied",
+    "session_id": "5c946784-1109-4832-9699-20f88231f010",
+    "job_count": 1,
+    "user_turns": 2,
+    "answers": [
+      "名称：bone  \n版本：0.5.0",
+      "bone@0.5.0"
+    ],
+    "model_calls": 3,
+    "tools": [
+      "read_file"
+    ],
+    "all_calls_job_owned": true,
+    "unknown_writes": 0,
+    "terminal_restored": true,
+    "passed": true,
+    "data_directory": "~/.bone/acceptance/2026-10-01-tui/production-live"
+  },
+  "platform": "macOS",
+  "runtime_model": "chatgpt:gpt-6-luna",
+  "provider_live_scope": "existing Codex subscription only",
+  "tool_output_streaming": false,
+  "pre_merge_hygiene": {
+    "date": "2026-10-02",
+    "rust_tests": {
+      "passed": 167,
+      "ignored": 1
+    },
+    "clippy_all_targets": true,
+    "focused_pty_cases_passed": [
+      "commands",
+      "sessions",
+      "stale"
+    ],
+    "shareable_trace_regression": true,
+    "release_install": true
+  }
+}

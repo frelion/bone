@@ -1,0 +1,22 @@
+{
+  "date": "2026-10-01",
+  "scope": "production TUI real subscription two-turn readonly smoke",
+  "model": "chatgpt:gpt-6-luna",
+  "credential_source": "existing Codex login reused; no credential values copied",
+  "session_id": "5c946784-1109-4832-9699-20f88231f010",
+  "job_count": 1,
+  "user_turns": 2,
+  "answers": [
+    "名称：bone  \n版本：0.5.0",
+    "bone@0.5.0"
+  ],
+  "model_calls": 3,
+  "tools": [
+    "read_file"
+  ],
+  "all_calls_job_owned": true,
+  "unknown_writes": 0,
+  "terminal_restored": true,
+  "passed": true,
+  "data_directory": "~/.bone/acceptance/2026-10-01-tui/production-live"
+}
