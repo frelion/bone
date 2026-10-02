@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-02",
+  "kind": "local HTML prototype only",
+  "browser": "installed Chrome, headless Playwright",
+  "grids": 72,
+  "checks": [
+    "no future results",
+    "immutable reader snapshot",
+    "source-row anchor across resize",
+    "palette/check/audit parent return",
+    "explicit reply target",
+    "draft preservation",
+    "arrival leaves old body fixed",
+    "unknown evidence identity",
+    "same object at narrow/wide"
+  ],
+  "mobile": {
+    "viewport": 390,
+    "pageWidth": 390,
+    "terminalScroller": true
+  },
+  "pageErrors": [],
+  "productionTuiTested": false,
+  "limitations": [
+    "Synthetic events; no model or tool execution",
+    "Native terminal scrollback and editable contract are not simulated",
+    "No actual terminal key dispatch, clipboard or selection proof"
+  ]
+}
