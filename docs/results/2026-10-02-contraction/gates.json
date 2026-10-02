@@ -1,0 +1,121 @@
+{
+  "date": "2026-10-02",
+  "baseline_commit": "a7ab2aa723649e79fe5c8858b60ccb8ddc38008f",
+  "branch": "codex/contraction",
+  "source_sha256": {
+    "tests/support/mod.rs": "8b68ffb4e80b459a4522d9f0f756c645f238882010230ce09528e48579e17aa0",
+    "tests/support/server.rs": "96cc873f9907be51b4b0f53d988bd08ead838ecffe1d34ab0f57848115dcf2e7",
+    "tests/unit/cli.rs": "54f3b11f80df8250754873452068a6ab8ec8f030e0e9ff1b4dc2a4e551614816",
+    "tests/unit/config.rs": "8bbe6e84706cad2cb25cb1302bb1b686e48fa8598911cb7dccea51da4ee0dbc1",
+    "tests/unit/context.rs": "eafc0f4561f0abe2986ae28632757020e7e5a140d722b9ea888f859b0ba1a129",
+    "tests/unit/model.rs": "53fed2229b6b34732db1db350226903c64f2549464f91ec4ddd12caf18bfd025",
+    "tests/unit/runtime.rs": "1b8a1459510e1afde672249d0f132e718596f80547de9a5a37c40612da475585",
+    "tests/unit/state.rs": "048a7578dd9246991357d63a1ac07ec4e91026c979d04331cb6a584c1bc340f7",
+    "tests/unit/store.rs": "57ee4c0592b97149e39eb947d5d69d49bed202f806c3741149a50c0f7d166959",
+    "tests/unit/tools.rs": "c6947860a0dbaea918bd11fddd8d67456b9ea24109d95697b3067863c9301549",
+    "tests/unit/tools_engineering.rs": "66f7725e8b12145c463f3ce05c22ea7bf8fb8b4464ad22c650c25ce6292c25ee",
+    "tests/unit/tui.rs": "c3054e370dda70d96673e1fd529f3e9c4e9c068d0ccd217fac7b9bd809cb20aa",
+    "tests/unit/tui_services.rs": "154bad0327fa47f7abe74be993ebedcf98b2cd7510a901776ad1c74b0357b302",
+    "tests/unit/tui_view.rs": "9e7d218f2ece7098705a0e9c357af0b89aea8b435730201e27e2bf5c4f500f59",
+    "Cargo.lock": "92d58d7f46566c9e445d19ecf46f273309c0d7342e07b835c7e6ee10eda3979f",
+    "Cargo.toml": "61d86eb0bc968717ae91a35145bcb0856605b09bc711625481c5ac6031cd4408",
+    "scripts/ablate.py": "8ec36961bb4c781d5709160a367a18d81d02942c91becc76ea97a89d14b5898b",
+    "scripts/export_trace.py": "b186168854b59f291f5624471ba874c9be0d3fc1c7350703f23d0302464fc0b3",
+    "scripts/long_task.py": "b74aff7a0ff2c5ab05f4d257c3d398c6a4676e7abd7db5691293b109ee9d9f60",
+    "src/config.rs": "5acbdce62fd9bd3e965d5d2ffd47de6594007bca19855e3baa5f97fe94289b98",
+    "src/context.rs": "8d8c2929396316acd9c590b311a93869ac33239b4202109f9e7a210dee2f2bf4",
+    "src/lib.rs": "62da379ccc67da4acb131e9e83cfa3aeec973bf16cf30aa19d50d6ea17dec04c",
+    "src/main.rs": "f827938f619d3c90352e6ce005475bb46370b751fb261315be67735c9c635925",
+    "src/model.rs": "b7b2c0af9c55510582b35c64881862ff8f2b3ce6fc002bb7152856ed60c2f291",
+    "src/runtime.rs": "ebd38b03aca9335bb61f6a0bb09a86a82af12e7eb700af198be0180559f7d2ab",
+    "src/state.rs": "3973f9b2302d3ceceb1e2ba6233e83135aa984907ffec516f33f8c700c26cab8",
+    "src/store.rs": "32bdc2bd9440519e36459b6dc26d2cf0869754430724bf0ef48f5650b05bf2e5",
+    "src/tools.rs": "ddb64b9646e60446073f55244947ffc59a8e0034ad24a0162e4fee92d21cedbd",
+    "src/tui.rs": "5d7d39a98d40f9ceab322338b96ea115bbba2438d2938314069665d5e74f7ea6",
+    "src/tui/services.rs": "d3b06332112f279c00c91aad31d3c7e3ea035ff4d9aed2fdc29e94fc08ca19c5",
+    "src/tui/view.rs": "3eab6e40a01ec1221e77de7bb4502ece9ce820818958d9acd9071cb43640fd69",
+    "tests/acceptance.rs": "e235a8a144d3f9db85e70fa6357997d64f7de6a9e398d671de92941489203a08",
+    "tests/engineering_cli.rs": "e8e47a78fc1f21d2f8fa87aa066be37b5b18debf9445a33319165012be899632",
+    "tests/input_lifecycle.rs": "0abf90daab2fa3d8d108cedd3d64d7b8c87480beebfbbfde9789e17c3ce4297b",
+    "tests/internal/provider_contract.rs": "a301b28d83da4c4b75afc721cad9929898baa4a3d04b9c5ce16d1c355cf44844",
+    "tests/internal/runtime_safety.rs": "efdde364b39a8b6f61eb34d69a970737eddfd5628883db5fbada853d63ebad08",
+    "tests/long_session.rs": "3a4dcf4c807ef187cb1c49e6d18ba2dfc21b957921a20a9445df845a8a890517",
+    "tests/oversized_context.rs": "d1d10b18f33174cc53b7a379ae8805b583b697b622270a0f23b975a2077b1fb3",
+    "tests/question_routing.rs": "e7f171c88b3c2f9a16d92278ed81919e5f66fef8f9d941e7ed24e15960351c86",
+    "tests/resume_lifecycle.rs": "362dfb01778b471f1d0a54a6465092b84f75965b6ea757da3545bc1145ba7a26",
+    "tests/scripted_responses.py": "49efc6333272bf8150332ea3cd17c080cf04fbcea252c50aef3143357da271fd",
+    "tests/test_ablate.py": "924d085f6441800ba8729d8d29357655e4877585435b41a89b343fe7e6a77be8",
+    "tests/test_export_trace.py": "04b78fa6f32b450bfcdc18590486e504edc3ea85eabedacb25823d5f7d422293",
+    "tests/tui_pty.py": "e89dd1dbb8d55e1c18585f53baae32a9be6259bf00e2f3f99809d32125d8ef6f"
+  },
+  "checks": [
+    {
+      "command": "cargo test --locked",
+      "passed": true,
+      "passed_count": 166,
+      "ignored_count": 1,
+      "includes_doc_tests": true,
+      "subgroups": {
+        "library": 99,
+        "binary": 27,
+        "integration": 37,
+        "compile_fail_docs": 3
+      }
+    },
+    {
+      "command": "cargo clippy --locked --all-targets --all-features -- -D warnings",
+      "passed": true
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "passed": true
+    },
+    {
+      "command": "python3 -B -m unittest discover -s tests -p 'test_*.py' -v",
+      "passed": true,
+      "passed_count": 6
+    },
+    {
+      "command": "python3 -B tests/tui_pty.py --binary target/debug/bone",
+      "passed": true,
+      "cases": [
+        "paste",
+        "concurrent",
+        "pause",
+        "question",
+        "failure",
+        "stream",
+        "stale",
+        "stream-stop",
+        "commands",
+        "completion",
+        "sessions",
+        "signal",
+        "interactive-editor",
+        "editor-signal",
+        "unicode"
+      ]
+    },
+    {
+      "command": "cargo install --path . --locked --force --offline",
+      "passed": true,
+      "installed_binary": "/Users/zzhang/.cargo/bin/bone",
+      "path_entry": "/opt/homebrew/bin/bone",
+      "version": "bone 0.5.0"
+    },
+    {
+      "command": "python3 -B tests/tui_pty.py --binary /Users/zzhang/.cargo/bin/bone --case paste",
+      "passed": true,
+      "cases": [
+        "paste"
+      ],
+      "binary_sha256": "447b388812a8040d628c40c06a4e01c6def96cf516e8cedb657fb839a2e9672c"
+    }
+  ],
+  "coverage": "Local protocol and execution contracts; synthetic credentials and temporary workspaces. No new live-provider quality or performance experiment.",
+  "test_changes": {
+    "removed_generator": "render_fixture_snapshots",
+    "merged_assertions": "native_projection_keeps_text_and_ignores_opaque_reasoning retained in existing export/native-text contract",
+    "added": "configured_endpoint_uses_rig_native_environment_credentials"
+  }
+}

@@ -15,7 +15,8 @@ use crossterm::execute;
 use futures_util::StreamExt;
 use ratatui::DefaultTerminal;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use services::native_text;
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -90,7 +91,6 @@ struct App {
     older: Option<String>,
     settings: Settings,
     parts: BTreeMap<String, BTreeMap<u64, String>>,
-    finished: BTreeSet<String>,
     last_input: Option<String>,
     last_saved: services::UiSaved,
     changed_at: Option<Instant>,
@@ -110,7 +110,6 @@ impl App {
             older: None,
             settings,
             parts: BTreeMap::new(),
-            finished: BTreeSet::new(),
             last_input: None,
             last_saved: services::UiSaved::default(),
             changed_at: None,
@@ -126,24 +125,15 @@ impl App {
     fn load(&mut self, engine: &mut Engine, data: &Path) -> Result<()> {
         self.ui = View::new();
         self.parts.clear();
-        self.finished.clear();
         self.last_input = None;
         self.cursor = None;
         self.older = None;
         self.files = None;
         self.file_range = None;
-        if let Some(task) = self.file_index.take() {
-            task.abort();
-        }
-        if let Some(task) = self.session_index.take() {
-            task.abort();
-        }
-        if let Some(task) = self.diff.take() {
-            task.abort();
-        }
-        if let Some(task) = self.export.take() {
-            task.abort();
-        }
+        abort_task(&mut self.file_index);
+        abort_task(&mut self.session_index);
+        abort_task(&mut self.diff);
+        abort_task(&mut self.export);
         // Read one original at a time: native responses can be several MiB.
         // Keep IDs during the backward traversal, then project in append order.
         let mut ids = Vec::new();
@@ -235,10 +225,6 @@ impl App {
         {
             self.ui.remove_message(&format!("live:{call}"));
             self.parts.remove(call);
-            self.finished.insert(call.clone());
-            if self.finished.len() > 512 {
-                self.finished.clear();
-            }
         }
         ingest(engine, event, &mut self.ui)
     }
@@ -307,7 +293,6 @@ impl App {
         for progress in engine.drain_model_progress() {
             if progress.purpose == "summary"
                 || engine.state().focus.as_ref() != Some(&progress.job_id)
-                || self.finished.contains(&progress.call_id)
                 || engine
                     .state()
                     .jobs
@@ -368,9 +353,7 @@ impl App {
         self.ui
             .open_picker(PickerKind::Session, Vec::new(), String::new());
         self.ui.notice = "正在读取项目会话…".into();
-        if let Some(task) = self.session_index.take() {
-            task.abort();
-        }
+        abort_task(&mut self.session_index);
         let data = data.to_owned();
         let workspace = engine.state().workspace.clone();
         let current = engine.state().id.clone();
@@ -380,34 +363,24 @@ impl App {
         Ok(())
     }
     fn models(&mut self) {
-        let mut items = self
-            .settings
-            .profiles
-            .iter()
-            .map(|(name, profile)| PickerItem {
-                label: format!(
-                    "{}{}",
-                    model_label(profile),
-                    if *name == self.settings.profile_name
-                        && model_label(profile) == model_label(&self.settings.profile)
-                    {
-                        " · 当前"
-                    } else {
-                        ""
-                    }
-                ),
+        let current = model_label(&self.settings.profile);
+        let mut matched = false;
+        let mut items = Vec::new();
+        for (name, profile) in &self.settings.profiles {
+            let label = model_label(profile);
+            let active = *name == self.settings.profile_name && label == current;
+            matched |= active;
+            items.push(PickerItem {
+                label: format!("{label}{}", if active { " · 当前" } else { "" }),
                 detail: format!("配置：{name}"),
                 value: name.clone(),
-            })
-            .collect::<Vec<_>>();
-        if !self.settings.profiles.iter().any(|(name, profile)| {
-            *name == self.settings.profile_name
-                && model_label(profile) == model_label(&self.settings.profile)
-        }) {
+            });
+        }
+        if !matched {
             items.insert(
                 0,
                 PickerItem {
-                    label: format!("{} · 当前", model_label(&self.settings.profile)),
+                    label: format!("{current} · 当前"),
                     detail: "当前配置".into(),
                     value: "@current".into(),
                 },
@@ -493,10 +466,16 @@ impl App {
         self.ui.notice = "模型已切换；工作保留，Ctrl+R 继续。配置文件未修改".into();
         Ok(())
     }
+    fn has_tasks(&self) -> bool {
+        self.file_index.is_some()
+            || self.session_index.is_some()
+            || self.diff.is_some()
+            || self.export.is_some()
+    }
     async fn tasks(&mut self) {
-        if self.session_index.as_ref().is_some_and(|t| t.is_finished()) {
-            match self.session_index.take().unwrap().await {
-                Ok(Ok(items)) => {
+        if let Some(result) = finished_task(&mut self.session_index).await {
+            match result {
+                Ok(items) => {
                     if let Some(picker) = self
                         .ui
                         .picker
@@ -507,13 +486,12 @@ impl App {
                         self.ui.notice = "按对话标题或 Session ID 搜索；Enter 打开".into();
                     }
                 }
-                result => self.ui.notice = format!("读取会话失败：{result:?}"),
+                Err(error) => self.ui.notice = format!("读取会话失败：{error:#}"),
             }
         }
-        if self.file_index.as_ref().is_some_and(|t| t.is_finished()) {
-            let task = self.file_index.take().unwrap();
-            match task.await {
-                Ok(Ok(files)) => {
+        if let Some(result) = finished_task(&mut self.file_index).await {
+            match result {
+                Ok(files) => {
                     if let Some(picker) = self
                         .ui
                         .picker
@@ -525,12 +503,12 @@ impl App {
                     self.files = Some(files);
                     self.ui.notice = "文件引用只插入草稿；发送后由 Agent 读取".into();
                 }
-                result => self.ui.notice = format!("文件索引失败：{result:?}"),
+                Err(error) => self.ui.notice = format!("文件索引失败：{error:#}"),
             }
         }
-        if self.diff.as_ref().is_some_and(|t| t.is_finished()) {
-            match self.diff.take().unwrap().await {
-                Ok(Ok(text)) => {
+        if let Some(result) = finished_task(&mut self.diff).await {
+            match result {
+                Ok(text) => {
                     if self
                         .ui
                         .detail
@@ -540,12 +518,12 @@ impl App {
                         self.ui.detail = Some(("项目修改（只读）".into(), text));
                     }
                 }
-                result => self.ui.notice = format!("修改检查失败：{result:?}"),
+                Err(error) => self.ui.notice = format!("修改检查失败：{error:#}"),
             }
         }
-        if self.export.as_ref().is_some_and(|t| t.is_finished()) {
-            match self.export.take().unwrap().await {
-                Ok(Ok(path)) => {
+        if let Some(result) = finished_task(&mut self.export).await {
+            match result {
+                Ok(path) => {
                     self.ui.notice = "HTML 导出完成".into();
                     self.ui.detail = Some((
                         "HTML 导出完成".into(),
@@ -555,7 +533,7 @@ impl App {
                         ),
                     ));
                 }
-                result => self.ui.notice = format!("导出失败：{result:?}"),
+                Err(error) => self.ui.notice = format!("导出失败：{error:#}"),
             }
         }
     }
@@ -564,6 +542,7 @@ impl App {
         engine: &mut Engine,
         data: &Path,
         terminal: &mut Terminal,
+        input: &mut Option<EventStream>,
         text: &str,
     ) -> Result<bool> {
         let (command, args) = text
@@ -623,9 +602,7 @@ impl App {
                 self.ui.detail = Some(("会话状态".into(), detail));
             }
             "/diff" => {
-                if let Some(task) = self.diff.take() {
-                    task.abort();
-                }
+                abort_task(&mut self.diff);
                 let workspace = engine.state().workspace.clone();
                 self.diff = Some(tokio::spawn(
                     async move { services::git_diff(&workspace).await },
@@ -673,7 +650,7 @@ impl App {
                     self.ui.detail = Some(("更早会话原文 · /older 继续向前".into(), text));
                 }
             }
-            "/editor" => self.editor(engine, data, terminal).await?,
+            "/editor" => self.editor(engine, data, terminal, input).await?,
             _ => bail!("未知命令 {command}；Ctrl+P 或 /help 查看命令（未发送给模型）"),
         }
         Ok(false)
@@ -683,6 +660,7 @@ impl App {
         engine: &mut Engine,
         data: &Path,
         terminal: &mut Terminal,
+        input: &mut Option<EventStream>,
     ) -> Result<()> {
         let editor = std::env::var("VISUAL")
             .or_else(|_| std::env::var("EDITOR"))
@@ -710,6 +688,7 @@ impl App {
             let mut file = options.open(&path)?;
             file.write_all(self.ui.draft.as_bytes())?;
         }
+        drop(input.take());
         terminal.suspend();
         // EDITOR is the user's local command; the draft path is passed as a separate argument.
         #[cfg(unix)]
@@ -741,6 +720,7 @@ impl App {
             }
         }.await;
         let restored = terminal.reopen();
+        *input = Some(EventStream::new());
         let edited = (|| -> Result<String> {
             ensure!(
                 result.context("start external editor")?.success(),
@@ -766,6 +746,26 @@ impl App {
         self.save(engine, data)?;
         Ok(())
     }
+}
+
+fn abort_task<T>(slot: &mut Option<tokio::task::JoinHandle<T>>) {
+    if let Some(task) = slot.take() {
+        task.abort();
+    }
+}
+async fn finished_task<T>(
+    slot: &mut Option<tokio::task::JoinHandle<Result<T>>>,
+) -> Option<Result<T>> {
+    if !slot.as_ref()?.is_finished() {
+        return None;
+    }
+    Some(
+        slot.take()
+            .unwrap()
+            .await
+            .context("UI task failed")
+            .and_then(|result| result),
+    )
 }
 
 fn model_label(profile: &Profile) -> String {
@@ -820,32 +820,33 @@ fn profile_with_model(current: &Profile, value: &str) -> Result<Profile> {
     next.validate()?;
     Ok(next)
 }
+const COMMANDS: &[(&str, &str)] = &[
+    ("/new", "新对话，当前工作保存并暂停"),
+    ("/sessions", "搜索并打开当前项目的会话"),
+    ("/model", "选择模型配置；/model 原生名称可覆盖当前模型"),
+    ("/status", "模型、执行限制、用量与未确认写入"),
+    ("/diff", "查看 Git 修改，包括 staged 与 unstaged"),
+    ("/files", "插入项目文件引用"),
+    ("/search", "搜索当前对话；Ctrl+F"),
+    ("/older", "分页读取更早会话原文"),
+    ("/export", "导出本地 HTML 对话与行动报告"),
+    ("/editor", "用 VISUAL / EDITOR 编辑长输入"),
+    ("/copy", "复制最后一条完整答复到系统剪贴板"),
+    ("/details", "展开或隐藏内部事件记录"),
+    ("/stop", "暂停所有工作"),
+    ("/resume", "恢复暂停工作"),
+    ("/help", "键盘帮助"),
+    ("/quit", "保存并退出"),
+];
 fn command_items() -> Vec<PickerItem> {
-    [
-        ("/new", "新对话，当前工作保存并暂停"),
-        ("/sessions", "搜索并打开当前项目的会话"),
-        ("/model", "选择模型配置；/model 原生名称可覆盖当前模型"),
-        ("/status", "模型、执行限制、用量与未确认写入"),
-        ("/diff", "查看 Git 修改，包括 staged 与 unstaged"),
-        ("/files", "插入项目文件引用"),
-        ("/search", "搜索当前对话；Ctrl+F"),
-        ("/older", "分页读取更早会话原文"),
-        ("/export", "导出本地 HTML 对话与行动报告"),
-        ("/editor", "用 VISUAL / EDITOR 编辑长输入"),
-        ("/copy", "复制最后一条完整答复到系统剪贴板"),
-        ("/details", "展开或隐藏内部事件记录"),
-        ("/stop", "暂停所有工作"),
-        ("/resume", "恢复暂停工作"),
-        ("/help", "键盘帮助"),
-        ("/quit", "保存并退出"),
-    ]
-    .into_iter()
-    .map(|(label, detail)| PickerItem {
-        label: label.into(),
-        detail: detail.into(),
-        value: label.into(),
-    })
-    .collect()
+    COMMANDS
+        .iter()
+        .map(|&(label, detail)| PickerItem {
+            label: label.into(),
+            detail: detail.into(),
+            value: label.into(),
+        })
+        .collect()
 }
 fn file_items(files: &[String]) -> Vec<PickerItem> {
     files
@@ -983,15 +984,9 @@ pub(super) async fn run(
     } else {
         engine.stop()
     };
-    if let Some(task) = app.diff.take() {
-        task.abort();
-    }
-    if let Some(task) = app.file_index.take() {
-        task.abort();
-    }
-    if let Some(task) = app.session_index.take() {
-        task.abort();
-    }
+    abort_task(&mut app.diff);
+    abort_task(&mut app.file_index);
+    abort_task(&mut app.session_index);
     drop(terminal);
     eprintln!("Session: {}", engine.state().id);
     result?;
@@ -1044,9 +1039,7 @@ async fn event_loop(
                             KeyCode::Char('p') if control => app.commands(String::new()),
                             KeyCode::Char('o') if control => app.complete_file(engine),
                             KeyCode::Char('g') if control => {
-                                drop(input.take());
-                                if let Err(error) = app.editor(engine, data, terminal).await { app.ui.notice = format!("编辑失败：{error:#}"); }
-                                input = Some(EventStream::new());
+                                if let Err(error) = app.editor(engine, data, terminal, &mut input).await { app.ui.notice = format!("编辑失败：{error:#}"); }
                             },
                             KeyCode::Tab if app.ui.focus == Focus::Input && !app.ui.has_modal()
                                 && (app.ui.draft.starts_with('/') || app.ui.draft[..app.ui.cursor()].split_whitespace().last().is_some_and(|t| t.starts_with('@'))) => {
@@ -1058,9 +1051,7 @@ async fn event_loop(
                                     let result = match kind {
                                         PickerKind::Command => {
                                             let previous = if app.ui.draft.trim_start().starts_with('/') { Some(app.ui.take_draft()) } else { None };
-                                            if value == "/editor" { drop(input.take()); }
-                                            let result = app.command(engine, data, terminal, &value).await;
-                                            if value == "/editor" { input = Some(EventStream::new()); }
+                                            let result = app.command(engine, data, terminal, &mut input, &value).await;
                                             if result.is_err() && let Some(previous) = previous { app.ui.paste(&previous); }
                                             result
                                         },
@@ -1069,7 +1060,7 @@ async fn event_loop(
                                         PickerKind::File => {
                                             let reference = if value.contains(char::is_whitespace) { format!("@\"{value}\" ") } else { format!("@{value} ") };
                                             if let Some(range) = app.file_range.take() { app.ui.replace_range(range, &reference); }
-                                            else { app.ui.insert_at_cursor(&reference); }
+                                            else { app.ui.paste(&reference); }
                                             Ok(false)
                                         },
                                     };
@@ -1085,10 +1076,7 @@ async fn event_loop(
                                             if text.trim_start().starts_with('/') {
                                                 // Keep an unknown command in the editor; do not turn it into agent input.
                                                 app.ui.take_draft();
-                                                let editing = text.trim() == "/editor";
-                                                if editing { drop(input.take()); }
-                                                let result = app.command(engine, data, terminal, &text).await;
-                                                if editing { input = Some(EventStream::new()); }
+                                                let result = app.command(engine, data, terminal, &mut input, &text).await;
                                                 match result {
                                                     Ok(true) => return Ok(()),
                                                     Ok(false) => {},
@@ -1135,8 +1123,8 @@ async fn event_loop(
                 pause(engine,&mut app.ui)?; app.clear_preview(); deadline = None;
                 app.ui.notice = "运行时限已到，已暂停；Ctrl+R 继续".into(); app.sync(engine,data)?; dirty = true;
             },
-            _ = tick.tick(), if !engine.is_quiescent() || app.file_index.is_some() || app.session_index.is_some() || app.diff.is_some() || app.export.is_some() || app.changed_at.is_some() => {
-                let pending = app.file_index.is_some() || app.session_index.is_some() || app.diff.is_some() || app.export.is_some();
+            _ = tick.tick(), if !engine.is_quiescent() || app.has_tasks() || app.changed_at.is_some() => {
+                let pending = app.has_tasks();
                 app.tasks().await;
                 dirty |= app.progress(engine) || !engine.is_quiescent() || pending;
                 if app.changed_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(500))
@@ -1207,27 +1195,6 @@ fn status(engine: &Engine) -> String {
         "等待工作结果".into()
     } else {
         "就绪".into()
-    }
-}
-
-fn native_text(value: &Value) -> String {
-    match value {
-        Value::Array(items) => items
-            .iter()
-            .map(native_text)
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        Value::Object(item) => match item.get("type").and_then(Value::as_str) {
-            Some("reasoning" | "encrypted" | "toolcall") => String::new(),
-            Some("text") => item
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .into(),
-            _ => item.get("content").map(native_text).unwrap_or_default(),
-        },
-        _ => String::new(),
     }
 }
 
@@ -1334,17 +1301,14 @@ fn readable_tool_output(text: &str) -> String {
         );
     }
     if value.get("stdout").is_some() || value.get("stderr").is_some() {
-        return format!(
-            "exit: {}\n{}{}{}",
-            value["exit_code"],
-            value["stdout"].as_str().unwrap_or(""),
-            if value["stderr"].as_str().is_some_and(|s| !s.is_empty()) {
-                "\nstderr:\n"
-            } else {
-                ""
-            },
-            value["stderr"].as_str().unwrap_or("")
-        );
+        let stdout = value["stdout"].as_str().unwrap_or("");
+        let stderr = value["stderr"].as_str().unwrap_or("");
+        let error_output = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!("\nstderr:\n{stderr}")
+        };
+        return format!("exit: {}\n{stdout}{error_output}", value["exit_code"]);
     }
     if let Some(body) = value["text"].as_str() {
         return body.into();
@@ -1421,15 +1385,12 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         .transpose()?
         .unwrap_or(false);
     let user = event.kind == "input" && event.data["source"] == "user";
+    let body = event_body(engine, event)?;
+    let arguments = tool_arguments(engine, event)?;
     if user
         || event.kind == "question"
         || (public && matches!(event.kind.as_str(), "delivery" | "failure" | "input_paused"))
     {
-        let text = if user {
-            native_text(&event.data["message"])
-        } else {
-            engine.event_text(event)?
-        };
         let role = if user {
             "你"
         } else if event.kind == "question" {
@@ -1441,7 +1402,7 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         };
         ui.push_message(Message {
             role: role.into(),
-            text,
+            text: body.clone(),
             event_id: Some(event.id.clone()),
         });
     }
@@ -1458,16 +1419,15 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         && !name.starts_with("job_")
         && !matches!(name, "ask_user" | "question")
     {
-        let arguments = tool_arguments(engine, event)?;
         let label = arguments
             .as_ref()
             .and_then(|args| args["path"].as_str().or(args["command"].as_str()))
             .map(|text| text.chars().take(180).collect::<String>())
             .unwrap_or_default();
         let result = if event.kind == "tool_result" {
-            event_body(engine, event)?
+            body.as_str()
         } else {
-            String::new()
+            ""
         };
         let failed = event.data["error"].is_string()
             || result.starts_with("错误：")
@@ -1475,7 +1435,7 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
                 .lines()
                 .next()
                 .is_some_and(|line| line.starts_with("exit: ") && line != "exit: 0")
-            || serde_json::from_str::<Value>(&result)
+            || serde_json::from_str::<Value>(result)
                 .ok()
                 .is_some_and(|v| v.get("error").is_some());
         let phase = if event.kind == "tool_started" {
@@ -1582,11 +1542,10 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         "stale" => ("过期结果仅入历史".into(), Tone::Normal),
         _ => (event.kind.clone(), Tone::Normal),
     };
-    let text = event_body(engine, event)?;
-    let preview = if let Some(arguments) = tool_arguments(engine, event)? {
-        format!("参数 {}\n{}", serde_json::to_string(&arguments)?, text)
-    } else if !text.is_empty() {
-        text
+    let preview = if let Some(arguments) = arguments {
+        format!("参数 {}\n{}", serde_json::to_string(&arguments)?, body)
+    } else if !body.is_empty() {
+        body
     } else {
         format!("{} · event {}", event.kind, event.id)
     };
@@ -1601,64 +1560,5 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn native_projection_keeps_text_and_ignores_opaque_reasoning() {
-        let content = serde_json::json!([
-            {"type":"reasoning","content":[{"type":"text","text":"hidden"}]},
-            {"type":"encrypted","content":"opaque"},
-            {"type":"text","text":"可读正文"},
-            {"type":"toolresult","content":[{"type":"text","text":"result"}]}
-        ]);
-        assert_eq!(native_text(&content), "可读正文\n\nresult");
-    }
-
-    #[test]
-    fn changing_a_model_keeps_endpoint_and_does_not_move_credentials_between_providers() {
-        let current: Profile = serde_json::from_value(serde_json::json!({
-            "model":{"model":"old","config":{"openai":{"api_key":"","base_url":"http://127.0.0.1:1234/v1","dialect":"openai","route":"Responses","auth":"Bearer"}}},
-            "credential_env":"LOCAL_FIXTURE_KEY","max_tokens":4000
-        })).unwrap();
-        let next = profile_with_model(&current, "openai:new-model").unwrap();
-        let encoded = serde_json::to_value(&next).unwrap();
-        assert_eq!(
-            encoded["model"]["config"]["openai"]["base_url"],
-            "http://127.0.0.1:1234/v1"
-        );
-        assert_eq!(encoded["model"]["model"], "new-model");
-        assert_eq!(next.credential_env, current.credential_env);
-        let changed = profile_with_model(&current, "ollama:arbitrary-native-name").unwrap();
-        assert!(changed.credential_env.is_none());
-        assert!(profile_with_model(&current, "missing-provider:model").is_err());
-    }
-
-    #[test]
-    fn write_preview_describes_proposed_content_without_fabricating_additions() {
-        let preview = proposed_change_preview(
-            "write_file",
-            &serde_json::json!({"content":"existing replacement\nsecond line"}),
-        );
-        assert!(preview.contains("拟写入内容（可能覆盖现有文件）"));
-        assert!(preview.contains("```text\nexisting replacement\nsecond line\n```"));
-        assert!(!preview.contains("```diff"));
-        assert!(!preview.contains("+ existing"));
-    }
-
-    #[test]
-    fn tool_projection_preserves_real_lines_and_failed_shell_status() {
-        assert_eq!(
-            readable_tool_output(r#"{"text":"第一行\n第二行","bytes":22}"#),
-            "第一行\n第二行"
-        );
-        assert_eq!(
-            readable_tool_output(r#"{"exit_code":2,"stdout":"out\n","stderr":"problem"}"#),
-            "exit: 2\nout\n\nstderr:\nproblem"
-        );
-        assert!(
-            readable_tool_output(r#"{"error":"cancelled","effect":"unknown"}"#)
-                .contains("需要核查")
-        );
-    }
-}
+#[path = "../tests/unit/tui.rs"]
+mod tests;

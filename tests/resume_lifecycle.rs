@@ -1,79 +1,24 @@
 //! Public API boundaries for default recovery versus explicit retry of retained work.
 use bone::{
-    config::{ModelReference, Profile},
     runtime::{Engine, RunOptions},
     state::JobState,
 };
-use rig_core::providers::{
-    openai::{OpenAIConfig, Route},
-    registry::{ProviderConfig, ProviderRef},
-};
 use serde_json::{Value, json};
-use std::{
-    io::{BufRead, BufReader},
-    path::Path,
-    process::{Child, Command, Stdio},
-    time::Duration,
-};
+use std::time::Duration;
 
+mod support;
 struct Fixture {
-    dir: tempfile::TempDir,
-    server: Child,
-    profile: Profile,
+    local: support::Fixture,
     turns: Vec<Value>,
     options: RunOptions,
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = self.server.kill();
-        let _ = self.server.wait();
-    }
-}
 impl Fixture {
     fn new(turns: Vec<Value>) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("workspace")).unwrap();
-        std::fs::write(
-            dir.path().join("script.json"),
-            serde_json::to_vec(&json!({"reload_script":true,"turns":turns})).unwrap(),
-        )
-        .unwrap();
-        let mut server = Command::new("python3")
-            .arg("-B")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/long_task/server.py"))
-            .arg("--script")
-            .arg(dir.path().join("script.json"))
-            .arg("--requests")
-            .arg(dir.path().join("requests.jsonl"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let mut port = String::new();
-        BufReader::new(server.stdout.take().unwrap())
-            .read_line(&mut port)
-            .unwrap();
-        let mut native = OpenAIConfig::new("")
-            .with_base_url(format!("http://127.0.0.1:{}/v1", port.trim()))
-            .with_route(Route::Responses);
-        native.dialect = rig_core::providers::openai::wire::LLAMACPP;
-        native.auth = native.dialect.quirks.auth;
-        let profile = Profile {
-            model: ModelReference::Registry(
-                ProviderRef::configured(ProviderConfig::OpenAi(native), "fixture").unwrap(),
-            ),
-            credential_env: Some(format!(
-                "BONE_RESUME_EMPTY_{}",
-                uuid::Uuid::new_v4().simple()
-            )),
-            reuse_codex_login: false,
-            additional_params: None,
-            max_tokens: None,
-        };
         Self {
-            dir,
-            server,
-            profile,
+            local: support::Fixture::script(
+                json!({"reload_script":true,"turns":turns}),
+                "fixtures/long_task/server.py",
+            ),
             turns,
             options: RunOptions {
                 read_only: true,
@@ -84,20 +29,12 @@ impl Fixture {
         }
     }
     fn open(&self, session: Option<&str>) -> Engine {
-        Engine::open(
-            &self.dir.path().join("data"),
-            &self.dir.path().join("workspace"),
-            session,
-            self.profile.clone(),
-            "fixture".into(),
-            self.options.clone(),
-        )
-        .unwrap()
+        self.local.engine(session, self.options.clone())
     }
     fn append(&mut self, turns: Vec<Value>) {
         self.turns.extend(turns);
         std::fs::write(
-            self.dir.path().join("script.json"),
+            &self.local.responses,
             serde_json::to_vec(&json!({"reload_script":true,"turns":self.turns})).unwrap(),
         )
         .unwrap();
@@ -128,14 +65,9 @@ fn initial_turns(parent_failed: bool) -> Vec<Value> {
     turns
 }
 async fn until(engine: &mut Engine, predicate: impl Fn(&Engine) -> bool) {
-    tokio::time::timeout(Duration::from_secs(8), async {
-        while !predicate(engine) {
-            engine.step().await.unwrap();
-        }
-    })
-    .await
-    .expect("fixture did not reach expected lifecycle boundary");
+    support::drive_until(engine, Duration::from_secs(8), predicate).await;
 }
+
 fn child(engine: &Engine) -> (String, String) {
     let job = engine
         .state()

@@ -16,6 +16,8 @@
 //!     engine.state().jobs.clear();
 //! }
 //! ```
+use std::path::Path;
+
 pub mod config;
 mod context;
 mod model;
@@ -36,8 +38,6 @@ pub fn tool_definitions(
     tools::definitions(single_job, read_only)
 }
 
-use std::path::Path;
-
 /// Inspect saved sessions without taking execution ownership.
 pub fn sessions(data_dir: &Path) -> anyhow::Result<Vec<state::SessionState>> {
     store::Store::open(data_dir.join("sessions.sqlite3"))?.list_sessions()
@@ -54,14 +54,6 @@ pub fn history(data_dir: &Path, id: &str) -> anyhow::Result<Vec<state::Event>> {
     store.load_session(id)?;
     store.events(id)
 }
-
-#[cfg(test)]
-#[path = "../tests/internal/provider_contract.rs"]
-mod provider_contract;
-
-#[cfg(test)]
-#[path = "../tests/internal/runtime_safety.rs"]
-mod runtime_safety;
 
 /// A page of original persisted events in append order.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -107,3 +99,11 @@ pub fn history_before(
         has_more,
     })
 }
+
+#[cfg(test)]
+#[path = "../tests/internal/provider_contract.rs"]
+mod provider_contract;
+
+#[cfg(test)]
+#[path = "../tests/internal/runtime_safety.rs"]
+mod runtime_safety;

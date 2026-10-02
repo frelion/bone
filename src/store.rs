@@ -184,36 +184,7 @@ impl Store {
         after: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<Event>, bool)> {
-        ensure!(
-            (1..=1_000).contains(&limit),
-            "limit must be between 1 and 1000"
-        );
-        let mut sequence = 0_i64;
-        if let Some(cursor) = after {
-            sequence = self
-                .connection
-                .query_row(
-                    "SELECT sequence FROM events WHERE session_id = ?1 AND id = ?2",
-                    params![session_id, cursor],
-                    |row| row.get(0),
-                )
-                .with_context(|| format!("unknown cursor {cursor} for session {session_id}"))?;
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT payload FROM events WHERE session_id = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3"
-        )?;
-        let payloads = statement
-            .query_map(params![session_id, sequence, (limit + 1) as i64], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let has_more = payloads.len() > limit;
-        let events = payloads
-            .into_iter()
-            .take(limit)
-            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
-            .collect::<Result<Vec<Event>>>()?;
-        Ok((events, has_more))
+        self.history_slice(session_id, after, limit, false)
     }
 
     /// Read older records in append order without traversing the whole log.
@@ -223,11 +194,21 @@ impl Store {
         before: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<Event>, bool)> {
+        self.history_slice(session_id, before, limit, true)
+    }
+
+    fn history_slice(
+        &self,
+        session_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        backwards: bool,
+    ) -> Result<(Vec<Event>, bool)> {
         ensure!(
             (1..=1_000).contains(&limit),
             "limit must be between 1 and 1000"
         );
-        let sequence = match before {
+        let sequence = match cursor {
             Some(cursor) => self
                 .connection
                 .query_row(
@@ -236,11 +217,20 @@ impl Store {
                     |row| row.get::<_, i64>(0),
                 )
                 .with_context(|| format!("unknown cursor {cursor} for session {session_id}"))?,
-            None => i64::MAX,
+            None => {
+                if backwards {
+                    i64::MAX
+                } else {
+                    0
+                }
+            }
         };
-        let mut statement = self.connection.prepare(
+        let query = if backwards {
             "SELECT payload FROM events WHERE session_id = ?1 AND sequence < ?2 ORDER BY sequence DESC LIMIT ?3"
-        )?;
+        } else {
+            "SELECT payload FROM events WHERE session_id = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3"
+        };
+        let mut statement = self.connection.prepare(query)?;
         let payloads = statement
             .query_map(params![session_id, sequence, (limit + 1) as i64], |row| {
                 row.get::<_, String>(0)
@@ -252,7 +242,9 @@ impl Store {
             .take(limit)
             .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
             .collect::<Result<Vec<Event>>>()?;
-        events.reverse();
+        if backwards {
+            events.reverse();
+        }
         Ok((events, more))
     }
 
@@ -581,351 +573,5 @@ fn validate_references(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::{Budget, Job};
-
-    fn fixture() -> (tempfile::TempDir, Store, SessionState, Event) {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path().join("bone.sqlite")).unwrap();
-        let mut state = SessionState::new(directory.path());
-        let job = Job::new("main");
-        state.focus = Some(job.id.clone());
-        state.jobs.insert(job.id.clone(), job.clone());
-        store.create_session(&state).unwrap();
-        let mut input = Event::new(&state.id, "input", json!({"text": "hello"}));
-        input.job_id = Some(job.id.clone());
-        input.root_input = Some(input.id.clone());
-        input.revision = 1;
-        state.revision = 1;
-        state
-            .jobs
-            .get_mut(&job.id)
-            .unwrap()
-            .inbox
-            .push_back(input.id.clone());
-        state.pending_inputs.push_back(input.id.clone());
-        state.budgets.insert(input.id.clone(), Budget::new(5, 3));
-        (directory, store, state, input)
-    }
-
-    #[test]
-    fn history_page_uses_append_order_and_bounded_cursor_reads() {
-        let (_directory, store, mut state, first) = fixture();
-        store.commit(&state, std::slice::from_ref(&first)).unwrap();
-        let mut second = Event::new(&state.id, "second", json!({"body":"original"}));
-        second.revision = 2;
-        state.revision = 2;
-        store.commit(&state, std::slice::from_ref(&second)).unwrap();
-        let (page, more) = store.history_page(&state.id, None, 1).unwrap();
-        assert_eq!(page, vec![first.clone()]);
-        assert!(more);
-        let (last, more) = store.history_page(&state.id, Some(&first.id), 1).unwrap();
-        assert_eq!(last, vec![second]);
-        assert!(!more);
-        assert!(store.history_page(&state.id, Some("unknown"), 1).is_err());
-        assert!(store.history_page(&state.id, None, 0).is_err());
-    }
-
-    #[test]
-    fn history_before_preserves_append_order_and_session_scoped_backward_cursor() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Store::open(directory.path().join("sessions.sqlite3")).unwrap();
-        let state = SessionState::new(directory.path());
-        let foreign = SessionState::new(directory.path());
-        store.create_session(&state).unwrap();
-        store.create_session(&foreign).unwrap();
-        let mut expected = Vec::new();
-        let foreign_event = Event::new(&foreign.id, "notice", json!({"text":"foreign"}));
-        for index in 0..5 {
-            let mut event = Event::new(&state.id, "notice", json!({"index":index}));
-            // Timestamp ties and reverse lexical IDs must not alter append order.
-            event.timestamp = "1".into();
-            event.id = format!("event-{}", 5 - index);
-            store.commit(&state, std::slice::from_ref(&event)).unwrap();
-            expected.push(event);
-            if index == 1 {
-                store
-                    .commit(&foreign, std::slice::from_ref(&foreign_event))
-                    .unwrap();
-            }
-        }
-        let tail = crate::history_before(directory.path(), &state.id, None, 2).unwrap();
-        assert_eq!(tail.events, expected[3..]);
-        assert!(tail.has_more);
-        assert_eq!(tail.next_cursor.as_deref(), Some(expected[3].id.as_str()));
-        let older =
-            crate::history_before(directory.path(), &state.id, tail.next_cursor.as_deref(), 2)
-                .unwrap();
-        assert_eq!(older.events, expected[1..3]);
-        assert!(older.has_more);
-        let first =
-            crate::history_before(directory.path(), &state.id, older.next_cursor.as_deref(), 2)
-                .unwrap();
-        assert_eq!(first.events, expected[..1]);
-        assert!(!first.has_more);
-        let combined = first
-            .events
-            .into_iter()
-            .chain(older.events)
-            .chain(tail.events)
-            .collect::<Vec<_>>();
-        assert_eq!(combined, expected);
-        let empty =
-            crate::history_before(directory.path(), &state.id, first.next_cursor.as_deref(), 2)
-                .unwrap();
-        assert!(empty.events.is_empty());
-        assert!(empty.next_cursor.is_none());
-        assert!(!empty.has_more);
-        assert!(
-            crate::history_before(directory.path(), &state.id, Some(&foreign_event.id), 2).is_err()
-        );
-        assert!(crate::history_before(directory.path(), &state.id, Some("unknown"), 2).is_err());
-        assert!(crate::history_before(directory.path(), &state.id, None, 0).is_err());
-        assert!(crate::history_before(directory.path(), &state.id, None, 1001).is_err());
-        assert_eq!(
-            crate::history_before(directory.path(), &foreign.id, None, 2)
-                .unwrap()
-                .events,
-            vec![foreign_event]
-        );
-    }
-
-    #[test]
-    fn restart_keeps_snapshot_and_one_copy_of_native_message() {
-        let (directory, store, mut state, input) = fixture();
-        store.commit(&state, &[input]).unwrap();
-        let mut message = Event::new(
-            &state.id,
-            "model_message",
-            json!({"role":"assistant", "content":[{"type":"text", "text":"native"}]}),
-        );
-        message.job_id = state.focus.clone();
-        message.revision = 2;
-        state.revision = 2;
-        state
-            .jobs
-            .get_mut(state.focus.as_ref().unwrap())
-            .unwrap()
-            .history
-            .push(message.id.clone());
-        store
-            .commit(&state, std::slice::from_ref(&message))
-            .unwrap();
-        drop(store);
-        let restarted = Store::open(directory.path().join("bone.sqlite")).unwrap();
-        assert_eq!(restarted.load_session(&state.id).unwrap(), state);
-        assert_eq!(
-            restarted.events(&state.id).unwrap().last().unwrap(),
-            &message
-        );
-        assert!(!serde_json::to_string(&state).unwrap().contains("native"));
-    }
-
-    #[test]
-    fn duplicate_ids_are_idempotent_and_conflicts_rollback() {
-        let (_directory, store, mut state, input) = fixture();
-        store.commit(&state, std::slice::from_ref(&input)).unwrap();
-        store.commit(&state, std::slice::from_ref(&input)).unwrap();
-        assert_eq!(store.events(&state.id).unwrap().len(), 1);
-        let previous = state.clone();
-        state.revision += 1;
-        let mut fresh = Event::new(&state.id, "summary", json!({}));
-        fresh.revision = state.revision;
-        let mut conflict = input;
-        conflict.data = json!({"text": "changed"});
-        assert!(store.commit(&state, &[fresh, conflict]).is_err());
-        assert_eq!(store.load_session(&state.id).unwrap(), previous);
-        assert_eq!(store.events(&state.id).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn job_transitions_preserve_instruction_revision_and_reject_regression() {
-        let (_directory, store, mut state, input) = fixture();
-        store.commit(&state, &[input]).unwrap();
-        state
-            .jobs
-            .get_mut(state.focus.as_ref().unwrap())
-            .unwrap()
-            .state = JobState::Ready;
-        let mut event = Event::new(&state.id, "context_note", json!({"reason":"ready"}));
-        event.revision = state.revision;
-        store.commit(&state, &[event]).unwrap();
-        assert_eq!(store.load_session(&state.id).unwrap(), state);
-        assert_eq!(store.events(&state.id).unwrap().len(), 2);
-        state.revision = 0;
-        assert!(store.commit(&state, &[]).is_err());
-        assert_eq!(store.load_session(&state.id).unwrap().revision, 1);
-    }
-
-    #[test]
-    fn sqlite_fault_after_event_insert_rolls_back_snapshot_and_events() {
-        let (_directory, store, state, input) = fixture();
-        let before = store.load_session(&state.id).unwrap();
-        store.connection.execute_batch("CREATE TRIGGER inject_fault BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'injected disk write fault'); END;").unwrap();
-        assert!(store.commit(&state, std::slice::from_ref(&input)).is_err());
-        assert_eq!(store.load_session(&state.id).unwrap(), before);
-        assert!(store.events(&state.id).unwrap().is_empty());
-        store
-            .connection
-            .execute_batch("DROP TRIGGER inject_fault;")
-            .unwrap();
-        store.commit(&state, &[input]).unwrap();
-    }
-
-    #[test]
-    fn dangling_references_roll_back() {
-        let (_directory, store, mut state, input) = fixture();
-        state.pending_inputs.push_back("missing".into());
-        assert!(store.commit(&state, &[input]).is_err());
-        assert_eq!(store.load_session(&state.id).unwrap().revision, 0);
-        assert!(store.events(&state.id).unwrap().is_empty());
-    }
-
-    #[test]
-    fn session_ownership_is_exclusive_and_released() {
-        let (directory, store, state, _) = fixture();
-        let another = Store::open(directory.path().join("bone.sqlite")).unwrap();
-        let lease = store.acquire_session(&state.id).unwrap();
-        assert!(another.acquire_session(&state.id).is_err());
-        drop(lease);
-        assert!(another.acquire_session(&state.id).is_ok());
-    }
-
-    #[test]
-    fn recovery_pauses_work_and_records_uncertain_writes_without_replay() {
-        let (directory, store, mut state, input) = fixture();
-        let mut started = Event::new(
-            &state.id,
-            "tool_started",
-            json!({"effect":"write", "tool_name":"write_file"}),
-        );
-        started.job_id = state.focus.clone();
-        started.root_input = Some(input.id.clone());
-        started.call_id = Some("tool-call-1".into());
-        started.revision = 1;
-        let job = state.jobs.get_mut(state.focus.as_ref().unwrap()).unwrap();
-        job.active_input = Some(job.inbox.pop_front().unwrap());
-        job.current_call = started.call_id.clone();
-        job.state = JobState::Running;
-        let original_input = job.active_input.clone();
-        store.commit(&state, &[input, started]).unwrap();
-        drop(store);
-        let store = Store::open(directory.path().join("bone.sqlite")).unwrap();
-        let _lease = store.acquire_session(&state.id).unwrap();
-        let recovered = store.recover_session(&state.id).unwrap();
-        assert!(recovered.paused);
-        let job = &recovered.jobs[state.focus.as_ref().unwrap()];
-        assert_eq!(job.state, JobState::Paused);
-        assert_eq!(job.active_input, original_input);
-        assert_eq!(job.current_call.as_deref(), Some("tool-call-1"));
-        assert_eq!(
-            recovered.unknown_writes["tool-call-1"].tool_name,
-            "write_file"
-        );
-        assert!(!directory.path().join("output.txt").exists());
-        assert_eq!(store.recover_session(&state.id).unwrap(), recovered);
-        assert_eq!(store.events(&state.id).unwrap().len(), 3);
-    }
-
-    #[test]
-    fn restart_pauses_queued_and_waiting_work_and_preserves_idle_and_closed_jobs() {
-        let (_directory, store, mut state, input) = fixture();
-        let original_job = state.focus.clone().unwrap();
-        state.jobs.get_mut(&original_job).unwrap().state = JobState::Ready;
-        let mut waiting = Job::new("waiting");
-        waiting.state = JobState::Waiting;
-        waiting.wait_for.push(input.id.clone());
-        let waiting_id = waiting.id.clone();
-        let mut idle_with_work = Job::new("queued");
-        idle_with_work.inbox.push_back(input.id.clone());
-        let queued_id = idle_with_work.id.clone();
-        let idle = Job::new("idle");
-        let idle_id = idle.id.clone();
-        let mut closed = Job::new("closed");
-        closed.state = JobState::Closed;
-        let closed_id = closed.id.clone();
-        for job in [waiting, idle_with_work, idle, closed] {
-            state.jobs.insert(job.id.clone(), job);
-        }
-        store.commit(&state, std::slice::from_ref(&input)).unwrap();
-        let recovered = store.recover_session(&state.id).unwrap();
-        assert!(recovered.paused);
-        for id in [&original_job, &waiting_id, &queued_id] {
-            assert_eq!(recovered.jobs[id].state, JobState::Paused);
-        }
-        assert_eq!(
-            recovered.jobs[&original_job].inbox,
-            state.jobs[&original_job].inbox
-        );
-        assert_eq!(recovered.jobs[&waiting_id].wait_for, vec![input.id]);
-        assert_eq!(recovered.jobs[&idle_id].state, JobState::Idle);
-        assert_eq!(recovered.jobs[&closed_id].state, JobState::Closed);
-        assert_eq!(store.recover_session(&state.id).unwrap(), recovered);
-        assert_eq!(store.events(&state.id).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn uncertain_native_result_stays_unknown_until_explicit_reconciliation() {
-        let (_directory, store, mut state, input) = fixture();
-        let mut started = Event::new(
-            &state.id,
-            "tool_started",
-            json!({"effect":"write","tool_name":"write_file"}),
-        );
-        started.job_id = state.focus.clone();
-        started.call_id = Some("uncertain-call".into());
-        started.root_input = Some(input.id.clone());
-        started.revision = 1;
-        let mut result = Event::new(&state.id, "tool_result", json!({"uncertain":true}));
-        result.job_id = state.focus.clone();
-        result.call_id = started.call_id.clone();
-        result.revision = 1;
-        store.commit(&state, &[input, started, result]).unwrap();
-        state = store.recover_session(&state.id).unwrap();
-        assert!(state.unknown_writes.contains_key("uncertain-call"));
-        state.unknown_writes.remove("uncertain-call");
-        let mut reconciled = Event::new(
-            &state.id,
-            "tool_reconciled",
-            json!({"observation":"inspected"}),
-        );
-        reconciled.job_id = state.focus.clone();
-        reconciled.call_id = Some("uncertain-call".into());
-        reconciled.revision = state.revision;
-        store.commit(&state, &[reconciled]).unwrap();
-        assert!(
-            store
-                .recover_session(&state.id)
-                .unwrap()
-                .unknown_writes
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn finished_write_is_not_uncertain_after_restart() {
-        let (_directory, store, mut state, input) = fixture();
-        let mut started = Event::new(&state.id, "tool_started", json!({"effect":"write"}));
-        started.job_id = state.focus.clone();
-        started.call_id = Some("completed".into());
-        started.revision = 1;
-        let mut result = Event::new(&state.id, "tool_result", json!({"ok":true}));
-        result.job_id = state.focus.clone();
-        result.call_id = started.call_id.clone();
-        result.revision = 1;
-        state
-            .jobs
-            .get_mut(state.focus.as_ref().unwrap())
-            .unwrap()
-            .state = JobState::Idle;
-        store.commit(&state, &[input, started, result]).unwrap();
-        assert!(
-            store
-                .recover_session(&state.id)
-                .unwrap()
-                .unknown_writes
-                .is_empty()
-        );
-    }
-}
+#[path = "../tests/unit/store.rs"]
+mod tests;

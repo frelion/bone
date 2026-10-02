@@ -1,192 +1,10 @@
 //! Independent CLI acceptance through a scripted localhost Responses endpoint.
-use std::{
-    collections::BTreeMap,
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
+use std::{path::Path, process::Command, time::Duration};
 
-use bone::config::{Config, ModelReference, Profile};
-use rig_core::providers::{
-    openai::{OpenAIConfig, Route},
-    registry::{ProviderConfig, ProviderRef},
-};
 use serde_json::{Value, json};
-use tempfile::TempDir;
 
-struct Fixture {
-    _root: TempDir,
-    data: PathBuf,
-    workspace: PathBuf,
-    requests: PathBuf,
-    server: Child,
-}
-
-impl Fixture {
-    fn new(turns: Value) -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let data = root.path().join("data");
-        let workspace = root.path().join("workspace");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::create_dir_all(&workspace).unwrap();
-        let script = root.path().join("responses.json");
-        let requests = root.path().join("requests.jsonl");
-        std::fs::write(
-            &script,
-            serde_json::to_vec(&json!({"turns":turns})).unwrap(),
-        )
-        .unwrap();
-        let mut server = Command::new("python3")
-            .arg("-B")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scripted_responses.py"))
-            .arg("--script")
-            .arg(script)
-            .arg("--requests")
-            .arg(&requests)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(server.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let port: u16 = line.trim().parse().expect("fixture server startup port");
-        let native = OpenAIConfig::new("")
-            .with_base_url(format!("http://127.0.0.1:{port}/v1"))
-            .with_route(Route::Responses);
-        let profile = Profile {
-            model: ModelReference::Registry(
-                ProviderRef::configured(ProviderConfig::OpenAi(native), "fixture").unwrap(),
-            ),
-            credential_env: Some("BONE_ACCEPTANCE_DUMMY_KEY".into()),
-            reuse_codex_login: false,
-            additional_params: Some(json!({"reasoning":{"effort":"low"}})),
-            max_tokens: None,
-        };
-        let config = Config {
-            default_profile: "fixture".into(),
-            profiles: BTreeMap::from([("fixture".into(), profile)]),
-        };
-        std::fs::write(data.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
-        Self {
-            _root: root,
-            data,
-            workspace,
-            requests,
-            server,
-        }
-    }
-
-    fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_bone"));
-        command
-            .env("BONE_ACCEPTANCE_DUMMY_KEY", "fixture-dummy")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("CHATGPT_ACCESS_TOKEN")
-            .env_remove("BONE_MODEL")
-            .arg("--data-dir")
-            .arg(&self.data);
-        command
-    }
-
-    fn run(&self, prompt: &str, session: Option<&str>, extra: &[&str]) -> (Output, Value) {
-        let mut command = self.command();
-        command
-            .arg("run")
-            .arg(prompt)
-            .arg("--workspace")
-            .arg(&self.workspace)
-            .arg("--profile")
-            .arg("fixture")
-            .arg("--json");
-        if let Some(id) = session {
-            command.arg("--session").arg(id);
-        }
-        command.args(extra);
-        let output = bounded_output(command);
-        let document = serde_json::from_slice(&output.stdout).expect("CLI JSON document");
-        (output, document)
-    }
-
-    fn history(&self, session: &str) -> Vec<Value> {
-        let mut command = self.command();
-        command.arg("history").arg(session).arg("--json");
-        let output = bounded_output(command);
-        assert!(output.status.success(), "history failed");
-        serde_json::from_slice(&output.stdout).expect("history event array")
-    }
-
-    fn request_count(&self) -> usize {
-        std::fs::read_to_string(&self.requests)
-            .unwrap_or_default()
-            .lines()
-            .count()
-    }
-
-    fn engine(
-        &self,
-        session: Option<&str>,
-        options: bone::runtime::RunOptions,
-    ) -> bone::runtime::Engine {
-        let mut profile = Config::load(&self.data)
-            .unwrap()
-            .profile(Some("fixture"))
-            .unwrap()
-            .clone();
-        let ModelReference::Registry(reference) = &profile.model else {
-            panic!("native registry fixture");
-        };
-        let ProviderConfig::OpenAi(mut native) = reference.config("") else {
-            panic!("OpenAI wire fixture");
-        };
-        // Optional local auth lets direct Engine tests avoid mutating process
-        // environment while other acceptance tests execute concurrently.
-        native.dialect = rig_core::providers::openai::wire::LLAMACPP;
-        native.auth = native.dialect.quirks.auth;
-        profile.model = ModelReference::Registry(
-            ProviderRef::configured(ProviderConfig::OpenAi(native), "fixture").unwrap(),
-        );
-        bone::runtime::Engine::open(
-            &self.data,
-            &self.workspace,
-            session,
-            profile,
-            "fixture".into(),
-            options,
-        )
-        .unwrap()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = self.server.kill();
-        let _ = self.server.wait();
-    }
-}
-
-fn bounded_output(mut command: Command) -> Output {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(40);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("fixture CLI exceeded 40 seconds");
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
+mod support;
+use support::{Fixture, bounded_output};
 
 fn tool(name: &str, arguments: Value, call: &str) -> Value {
     json!({"output":[{"type":"function_call","name":name,"arguments":arguments,"call_id":call}]})
@@ -225,7 +43,7 @@ fn real_runtime_repairs_file_and_persists_owned_effects() {
     let before = "def total(values):\n    return sum(values)\n";
     let after =
         "def total(values):\n    return sum(value for value in values if value is not None)\n";
-    let fixture = Fixture::new(json!([
+    let fixture = Fixture::turns(json!([
         tool("read_file",json!({"path":"totals.py"}),"call_read"),
         tool("write_file",json!({"path":"totals.py","content":after,"expected_sha256":format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(before.as_bytes()))}),"call_write"),
         {"text":"Fixed totals.py and verified empty values and None."}
@@ -250,7 +68,7 @@ fn real_runtime_repairs_file_and_persists_owned_effects() {
 
 #[test]
 fn idle_job_accepts_followup_after_process_restart() {
-    let fixture = Fixture::new(
+    let fixture = Fixture::turns(
         json!([{"text":"First answer."},{"contains":["First answer.","Revised instruction"],"text":"Updated answer."}]),
     );
     let (first_output, first) = fixture.run("Initial instruction", None, &[]);
@@ -274,7 +92,7 @@ fn idle_job_accepts_followup_after_process_restart() {
 
 #[test]
 fn handoff_moves_focus_and_followup_to_target_job() {
-    let fixture = Fixture::new(json!([
+    let fixture = Fixture::turns(json!([
         tool("job_handoff",json!({"title":"Focused implementation"}),"call_handoff"),
         {"text":"Target delivery."},
         {"contains":["Target delivery.","Continue target"],"text":"Target continued."}
@@ -304,7 +122,7 @@ fn handoff_moves_focus_and_followup_to_target_job() {
 
 #[test]
 fn provider_failure_is_persisted_and_does_not_report_success() {
-    let fixture = Fixture::new(json!([{"http_status":503}]));
+    let fixture = Fixture::turns(json!([{"http_status":503}]));
     let (output, result) = fixture.run("Complete this instruction.", None, &[]);
     assert!(!output.status.success());
     assert_eq!(result["status"], "failed");
@@ -324,7 +142,7 @@ fn provider_failure_is_persisted_and_does_not_report_success() {
 
 #[test]
 fn failed_request_does_not_turn_partial_usage_into_a_known_total() {
-    let fixture = Fixture::new(json!([
+    let fixture = Fixture::turns(json!([
         tool("list_files", json!({}), "call_usage_inspection"),
         {"http_status":503}
     ]));
@@ -381,7 +199,7 @@ async fn two_jobs_deliver_to_exact_assignment_ids_before_waiter_continues() {
     assign["match_job_title"] = json!("Conversation");
     let mut wait = tool("job_wait", json!({"input_ids":"$input_ids"}), "call_wait");
     wait["match_job_title"] = json!("Conversation");
-    let fixture = Fixture::new(json!([
+    let fixture = Fixture::turns(json!([
         assign, wait,
         {"match_job_title":"A","text":"A delivered"},
         {"match_job_title":"B","text":"B delivered"},
@@ -440,7 +258,7 @@ async fn new_instruction_blocks_unstarted_write_proposals() {
         "call_stale_write",
     );
     stale["contains"] = json!(["Create stale.txt"]);
-    let fixture = Fixture::new(
+    let fixture = Fixture::turns(
         json!([stale,{"contains":["Do not write any files"],"text":"New constraint accepted; no files written"}]),
     );
     let mut engine = fixture.engine(None, bone::runtime::RunOptions::default());
@@ -506,7 +324,7 @@ async fn new_instruction_blocks_unstarted_write_proposals() {
 
 #[tokio::test]
 async fn interrupted_write_survives_restart_and_requires_reconciliation() {
-    let fixture = Fixture::new(json!([
+    let fixture = Fixture::turns(json!([
         tool("shell",json!({"command":"printf x >> effect.txt; sleep 5","timeout_seconds":10}),"call_append_once"),
         tool("read_file",json!({"path":"effect.txt"}),"call_inspect_effect"),
         {"text":"Effect observed; waiting for explicit reconciliation"},
@@ -592,8 +410,8 @@ fn alternating_ablation_records_all_local_trials_and_usage() {
         turns.push(tool("write_file",json!({"path":"totals.py","content":after,"expected_sha256":format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(before.as_bytes()))}),"call_ablate_write"));
         turns.push(json!({"text":"The repair is complete"}));
     }
-    let fixture = Fixture::new(Value::Array(turns));
-    let records = fixture._root.path().join("ablation.jsonl");
+    let fixture = Fixture::turns(Value::Array(turns));
+    let records = fixture.root.path().join("ablation.jsonl");
     let mut command = Command::new("python3");
     command
         .arg("-B")
@@ -608,10 +426,10 @@ fn alternating_ablation_records_all_local_trials_and_usage() {
         .arg("--output")
         .arg(&records)
         .arg("--artifacts-dir")
-        .arg(fixture._root.path().join("artifacts"))
+        .arg(fixture.root.path().join("artifacts"))
         .arg("--case")
         .arg("small_repair")
-        .env("BONE_ACCEPTANCE_DUMMY_KEY", "fixture-dummy")
+        .env("BONE_TEST_DUMMY_KEY", "fixture-dummy")
         .env_remove("BONE_MODEL");
     let output = bounded_output(command);
     assert!(output.status.success(), "local ablation failed");

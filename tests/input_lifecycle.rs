@@ -1,80 +1,22 @@
 //! Reproduce preserved inputs becoming active again after consolidated delivery.
-use std::{
-    io::{BufRead, BufReader},
-    path::Path,
-    process::{Child, Command, Stdio},
-    time::Duration,
-};
+use std::time::Duration;
 
 use bone::{
-    config::{ModelReference, Profile},
     runtime::{Engine, RunOptions},
     state::JobState,
 };
-use rig_core::providers::{
-    openai::{OpenAIConfig, Route},
-    registry::{ProviderConfig, ProviderRef},
-};
 use serde_json::json;
 
-struct Server(Child);
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn fixture(script_body: serde_json::Value) -> (tempfile::TempDir, Server, Profile) {
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::create_dir(directory.path().join("workspace")).unwrap();
-    let script = directory.path().join("script.json");
-    std::fs::write(&script, serde_json::to_vec(&script_body).unwrap()).unwrap();
-    let mut server = Server(
-        Command::new("python3")
-            .arg("-B")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/long_task/server.py"))
-            .arg("--script")
-            .arg(script)
-            .arg("--requests")
-            .arg(directory.path().join("requests.jsonl"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
-    let mut port = String::new();
-    BufReader::new(server.0.stdout.take().unwrap())
-        .read_line(&mut port)
-        .unwrap();
-    let mut native = OpenAIConfig::new("")
-        .with_base_url(format!("http://127.0.0.1:{}/v1", port.trim()))
-        .with_route(Route::Responses);
-    native.dialect = rig_core::providers::openai::wire::LLAMACPP;
-    native.auth = native.dialect.quirks.auth;
-    let profile = Profile {
-        model: ModelReference::Registry(
-            ProviderRef::configured(ProviderConfig::OpenAi(native), "fixture").unwrap(),
-        ),
-        credential_env: Some(format!(
-            "BONE_LIFECYCLE_EMPTY_{}",
-            uuid::Uuid::new_v4().simple()
-        )),
-        reuse_codex_login: false,
-        additional_params: None,
-        max_tokens: None,
-    };
-    (directory, server, profile)
+mod support;
+fn fixture(script: serde_json::Value) -> support::Fixture {
+    support::Fixture::script(script, "fixtures/long_task/server.py")
 }
 
 async fn until_result(engine: &mut Engine, input: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while engine.result(input).is_none() {
-            engine.step().await.unwrap();
-        }
+    support::drive_until(engine, Duration::from_secs(5), |engine| {
+        engine.result(input).is_some()
     })
-    .await
-    .expect("input did not finish");
+    .await;
 }
 
 async fn until_started(engine: &mut Engine, input: &str) {
@@ -94,52 +36,15 @@ async fn until_started(engine: &mut Engine, input: &str) {
 
 #[tokio::test]
 async fn consolidated_delivery_leaves_prior_inputs_runnable_after_restart() {
-    let directory = tempfile::tempdir().unwrap();
-    let workspace = directory.path().join("workspace");
-    let data = directory.path().join("data");
-    std::fs::create_dir(&workspace).unwrap();
-    let script = directory.path().join("script.json");
-    let requests = directory.path().join("requests.jsonl");
-    std::fs::write(&script, serde_json::to_vec(&json!({"turns":[
+    let fixture = fixture(json!({"turns":[
         {"match_last_user_contains":"INITIAL_ENGINEERING_REQUEST", "delay_seconds":2, "text":"Initial result must be cancelled"},
         {"match_last_user_contains":"REVISED_ENGINEERING_REQUEST", "delay_seconds":2, "text":"Revised result must be cancelled"},
         {"match_last_user_contains":"CONTINUE_CONSOLIDATED_WORK", "text":"Completed the implementation including the revised contract and verification."},
         {"text":"Unexpected duplicate work"}
-    ]})).unwrap()).unwrap();
-    let mut server = Server(
-        Command::new("python3")
-            .arg("-B")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/long_task/server.py"))
-            .arg("--script")
-            .arg(script)
-            .arg("--requests")
-            .arg(requests)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
-    let mut port = String::new();
-    BufReader::new(server.0.stdout.take().unwrap())
-        .read_line(&mut port)
-        .unwrap();
-    let mut native = OpenAIConfig::new("")
-        .with_base_url(format!("http://127.0.0.1:{}/v1", port.trim()))
-        .with_route(Route::Responses);
-    native.dialect = rig_core::providers::openai::wire::LLAMACPP;
-    native.auth = native.dialect.quirks.auth;
-    let profile = Profile {
-        model: ModelReference::Registry(
-            ProviderRef::configured(ProviderConfig::OpenAi(native), "fixture").unwrap(),
-        ),
-        credential_env: Some(format!(
-            "BONE_LIFECYCLE_EMPTY_{}",
-            uuid::Uuid::new_v4().simple()
-        )),
-        reuse_codex_login: false,
-        additional_params: None,
-        max_tokens: None,
-    };
+    ]}));
+    let data = fixture.data.clone();
+    let workspace = fixture.workspace.clone();
+    let profile = fixture.local_profile();
     let options = RunOptions {
         single_job: true,
         read_only: true,
@@ -219,12 +124,13 @@ async fn consolidated_delivery_leaves_prior_inputs_runnable_after_restart() {
 
 #[tokio::test]
 async fn explicit_resolution_survives_restart_and_preserves_independent_queued_input() {
-    let (directory, _server, profile) = fixture(json!({"reload_script":true,"turns":[
+    let fixture = fixture(json!({"reload_script":true,"turns":[
         {"match_last_user_contains":"INITIAL", "delay_seconds":2,"text":"cancelled original"},
         {"match_last_user_contains":"REVISED", "delay_seconds":2,"text":"cancelled revision"}
     ]}));
-    let data = directory.path().join("data");
-    let workspace = directory.path().join("workspace");
+    let data = fixture.data.clone();
+    let workspace = fixture.workspace.clone();
+    let profile = fixture.local_profile();
     std::fs::write(workspace.join("evidence.txt"), "IMPLEMENTATION_VERIFIED").unwrap();
     let options = RunOptions {
         single_job: true,
@@ -270,7 +176,7 @@ async fn explicit_resolution_survives_restart_and_preserves_independent_queued_i
             None,
         )
         .unwrap();
-    std::fs::write(directory.path().join("script.json"),serde_json::to_vec(&json!({"reload_script":true,"turns":[
+    std::fs::write(&fixture.responses,serde_json::to_vec(&json!({"reload_script":true,"turns":[
         {"output":[{"type":"function_call","name":"read_file","call_id":"verify","arguments":{"path":"evidence.txt"}}]},
         {"contains":["IMPLEMENTATION_VERIFIED"],"output":[{"type":"function_call","name":"input_resolve","call_id":"settle","arguments":{"resolutions":[
             {"input_id":initial,"outcome":"completed","reason":"The implementation evidence was inspected and verifies the original work"},
@@ -345,7 +251,7 @@ async fn explicit_resolution_survives_restart_and_preserves_independent_queued_i
             1
         );
     }
-    let requests = std::fs::read_to_string(directory.path().join("requests.jsonl")).unwrap();
+    let requests = std::fs::read_to_string(&fixture.requests).unwrap();
     assert!(requests.contains("input_resolve"));
     assert!(requests.contains("settle"));
 }

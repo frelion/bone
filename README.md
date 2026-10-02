@@ -4,7 +4,7 @@ BONE 是一个 Rust 编写的 coding agent。用户与一个 agent 对话；agen
 
 这是从零重写的单 crate 实现。模型连接、消息、工具定义、返回结果和流解析使用官方 Rig SDK，固定到 Git 提交 `063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a`。会话状态与事件存于 SQLite。架构边界见 [architecture.md](docs/architecture.md)，验收和消融方法见 [verification.md](docs/verification.md)。
 
-当前 Rust 回归 167 项通过、1 项忽略；TUI 的真实终端与订阅验证见 [TUI 验收记录](docs/results/2026-10-01-tui/README.md)。同一内核使用 `gpt-6-luna` 完成了跨进程、多轮修改与冷历史回查的真实仓库任务，并在外部反馈修正后通过功能验收和实际工具演示。原先失败、人工介入及验证边界保留在[工程交付记录](docs/results/2026-10-01-flagship-engineering/README.md)中；这不是通用任务成功率保证。
+测试入口与覆盖边界见 [测试地图](tests/README.md)，本次实际删减与复验见 [收缩记录](docs/results/2026-10-02-contraction/README.md)。TUI 的真实终端与订阅验证见 [TUI 验收记录](docs/results/2026-10-01-tui/README.md)。同一内核使用 `gpt-6-luna` 完成了跨进程、多轮修改与冷历史回查的真实仓库任务，并在外部反馈修正后通过功能验收和实际工具演示。原先失败、人工介入及验证边界保留在[工程交付记录](docs/results/2026-10-01-flagship-engineering/README.md)中；这不是通用任务成功率保证。
 
 ## 查看可用工具
 

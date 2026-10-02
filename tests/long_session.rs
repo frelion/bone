@@ -1,142 +1,36 @@
 //! Long sessions and hard interruption through public Engine/CLI entry points.
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
+    collections::BTreeSet,
+    path::Path,
     process::{Child, Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
 use bone::{
-    config::{Config, ModelReference, Profile},
     runtime::{Engine, RunOptions},
     state::Event,
 };
-use rig_core::providers::{
-    openai::{OpenAIConfig, Route},
-    registry::{ProviderConfig, ProviderRef},
-};
 use serde_json::{Value, json};
 
-struct Fixture {
-    root: tempfile::TempDir,
-    data: PathBuf,
-    workspace: PathBuf,
-    requests: PathBuf,
-    responses: PathBuf,
-    profile: Profile,
-    server: Child,
-}
+mod support;
+use support::bounded_output;
 
+struct Fixture(support::Fixture);
+impl std::ops::Deref for Fixture {
+    type Target = support::Fixture;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 impl Fixture {
-    fn new(script: Value) -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let data = root.path().join("data");
-        let workspace = root.path().join("workspace");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::create_dir_all(&workspace).unwrap();
-        let responses = root.path().join("responses.json");
-        let requests = root.path().join("requests.jsonl");
-        std::fs::write(&responses, serde_json::to_vec(&script).unwrap()).unwrap();
-        let mut server = Command::new("python3")
-            .arg("-B")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/long_task/server.py"))
-            .arg("--script")
-            .arg(&responses)
-            .arg("--requests")
-            .arg(&requests)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut port = String::new();
-        BufReader::new(server.stdout.take().unwrap())
-            .read_line(&mut port)
-            .unwrap();
-        let native = OpenAIConfig::new("")
-            .with_base_url(format!("http://127.0.0.1:{}/v1", port.trim()))
-            .with_route(Route::Responses);
-        let profile = Profile {
-            model: ModelReference::Registry(
-                ProviderRef::configured(ProviderConfig::OpenAi(native), "fixture").unwrap(),
-            ),
-            credential_env: Some("BONE_LONG_SESSION_DUMMY_KEY".into()),
-            reuse_codex_login: false,
-            additional_params: None,
-            max_tokens: None,
-        };
-        let config = Config {
-            default_profile: "fixture".into(),
-            profiles: BTreeMap::from([("fixture".into(), profile.clone())]),
-        };
-        std::fs::write(data.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
-        Self {
-            root,
-            data,
-            workspace,
-            requests,
-            responses,
-            profile,
-            server,
-        }
-    }
-
-    fn engine(&self, session: Option<&str>, options: RunOptions) -> Engine {
-        let ModelReference::Registry(reference) = &self.profile.model else {
-            unreachable!()
-        };
-        let ProviderConfig::OpenAi(mut native) = reference.config("") else {
-            unreachable!()
-        };
-        native.dialect = rig_core::providers::openai::wire::LLAMACPP;
-        native.auth = native.dialect.quirks.auth;
-        let mut profile = self.profile.clone();
-        // Optional-bearer native fixture never reads a personal provider key.
-        profile.credential_env = Some(format!(
-            "BONE_LONG_SESSION_EMPTY_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        profile.model = ModelReference::Registry(
-            ProviderRef::configured(ProviderConfig::OpenAi(native), "fixture").unwrap(),
-        );
-        Engine::open(
-            &self.data,
-            &self.workspace,
-            session,
-            profile,
-            "fixture".into(),
-            options,
-        )
-        .unwrap()
-    }
-
-    fn command(&self, data: &Path) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_bone"));
-        command
-            .env("BONE_LONG_SESSION_DUMMY_KEY", "long-session-synthetic-key")
-            .env_remove("BONE_MODEL")
-            .env_remove("OPENAI_API_KEY")
-            .env_remove("CHATGPT_ACCESS_TOKEN")
-            .arg("--data-dir")
-            .arg(data);
-        command
-    }
-
-    fn requests(&self) -> Vec<Value> {
-        std::fs::read_to_string(&self.requests)
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
+    fn script(script: Value, server: &str) -> Self {
+        Self(support::Fixture::script(script, server))
     }
 }
-
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::write(self.workspace.join("release"), "release");
-        let _ = self.server.kill();
-        let _ = self.server.wait();
     }
 }
 
@@ -210,9 +104,12 @@ async fn twelve_turns_compact_repeatedly_and_resume_without_losing_original_cons
         if round == 12 { turn["contains"] = json!(["EARLY_CONSTRAINT", "UNFINISHED_WORK"]); }
         turn
     }).collect();
-    let fixture = Fixture::new(json!({"turns":turns,
+    let fixture = Fixture::script(
+        json!({"turns":turns,
         "summary":"EARLY_CONSTRAINT: signed integer cents. UNFINISHED_WORK: CLI dry-run remains pending. Preserve revisions and all completed round results.",
-        "summary_contains":["EARLY_CONSTRAINT","UNFINISHED_WORK"]}));
+        "summary_contains":["EARLY_CONSTRAINT","UNFINISHED_WORK"]}),
+        "fixtures/long_task/server.py",
+    );
     let options = RunOptions {
         context_chars: 20_000,
         max_calls: 24,
@@ -306,14 +203,17 @@ async fn exact_wait_handoff_and_late_instruction_preserve_native_protocol() {
     send["match_job_title"] = json!("Conversation");
     let mut wait = call("job_wait", "wait_exact", json!({"input_ids":"$input_ids"}));
     wait["match_job_title"] = json!("Conversation");
-    let fixture = Fixture::new(json!({"turns":[send, wait,
+    let fixture = Fixture::script(
+        json!({"turns":[send, wait,
         {"match_job_title":"A","text":"A exact delivery"},
         {"match_job_title":"B","text":"B exact delivery"},
         {"match_job_title":"Conversation","contains":["A exact delivery","B exact delivery"],"text":"Assigned work delivered"},
         call("job_handoff","handoff",json!({"title":"Ledger"})),
         {"text":"Focused ledger work continues"},
         call("write_file","stale_write",json!({"path":"stale.txt","content":"obsolete","expected_sha256":null})),
-        {"contains":["LATEST_CONSTRAINT"],"text":"Latest instruction honored"}]}));
+        {"contains":["LATEST_CONSTRAINT"],"text":"Latest instruction honored"}]}),
+        "fixtures/long_task/server.py",
+    );
     let mut engine = fixture.engine(
         None,
         RunOptions {
@@ -388,8 +288,11 @@ async fn archived_public_requirements_and_summary_are_readable_across_job_handof
         .flat_map(|round| [call("read_file", &format!("audit_read_{round}"), json!({"path":"audit.txt"})),
             json!({"text":format!("Completed audit work. {}", "observed history ".repeat(350))})])
         .collect();
-    let fixture = Fixture::new(json!({"reload_script":true,"turns":turns,
-        "summary":"Completed storage and mutation work. Export and CLI remain pending."}));
+    let fixture = Fixture::script(
+        json!({"reload_script":true,"turns":turns,
+        "summary":"Completed storage and mutation work. Export and CLI remain pending."}),
+        "fixtures/long_task/server.py",
+    );
     std::fs::write(
         fixture.workspace.join("audit.txt"),
         "Read-only audit fixture",
@@ -557,28 +460,8 @@ async fn archived_public_requirements_and_summary_are_readable_across_job_handof
     native_tool_outputs_have_calls(&fixture.requests());
 }
 
-fn bounded_output(mut command: Command) -> Output {
-    let child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    finish_child(child)
-}
-
-fn finish_child(mut child: Child) -> Output {
-    let deadline = Instant::now() + Duration::from_secs(25);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("fixture CLI stalled");
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+fn finish_child(child: Child) -> Output {
+    support::finish_child(child, Duration::from_secs(25))
 }
 
 #[tokio::test]
@@ -589,14 +472,17 @@ async fn killed_owner_cannot_reconcile_or_allow_competing_writes_until_its_shell
         json!({"path":"intruder.txt","content":"unsafe","expected_sha256":null}),
     );
     competing["match_last_user_contains"] = json!("Attempt another workspace write");
-    let fixture = Fixture::new(json!({"turns":[
+    let fixture = Fixture::script(
+        json!({"turns":[
         call("shell","original_effect",json!({"command":"printf x >> effect.txt; i=0; while [ ! -e release ] && [ \"$i\" -lt 400 ]; do sleep 0.05; i=$((i+1)); done; printf y >> effect.txt","timeout_seconds":25})),
         competing,
         {"match_last_user_contains":"Attempt another workspace write","text":"Competing write was blocked"},
         call("read_file","inspect_original",json!({"path":"effect.txt"})),
         {"text":"Original effect inspected, awaiting explicit reconciliation"},
-        {"text":"Reconciled original operation without replay"}]}));
-    let mut command = fixture.command(&fixture.data);
+        {"text":"Reconciled original operation without replay"}]}),
+        "fixtures/long_task/server.py",
+    );
+    let mut command = fixture.command_at(&fixture.data);
     command
         .arg("run")
         .arg("Perform the original effect once")
@@ -621,7 +507,7 @@ async fn killed_owner_cannot_reconcile_or_allow_competing_writes_until_its_shell
     }
     owner.kill().unwrap();
     owner.wait().unwrap();
-    let mut sessions = fixture.command(&fixture.data);
+    let mut sessions = fixture.command_at(&fixture.data);
     sessions.arg("sessions").arg("--json");
     let states: Value = serde_json::from_slice(&bounded_output(sessions).stdout).unwrap();
     let session = states[0]["id"].as_str().unwrap().to_owned();
@@ -646,7 +532,7 @@ async fn killed_owner_cannot_reconcile_or_allow_competing_writes_until_its_shell
         other_data.join("config.toml"),
     )
     .unwrap();
-    let mut contender = fixture.command(&other_data);
+    let mut contender = fixture.command_at(&other_data);
     contender
         .arg("run")
         .arg("Attempt another workspace write")
@@ -738,8 +624,9 @@ fn long_task_harness_keeps_model_quality_failures_and_raw_rounds() {
             json!({"text":format!("CSV export and CLI dry-run remain pending. Round {round}: {}", "observed history ".repeat(350))})
         }
     }).collect();
-    let fixture = Fixture::new(
+    let fixture = Fixture::script(
         json!({"turns":turns,"summary":"Preserve pending CSV export, CLI dry-run, integer cents, and UTC constraints."}),
+        "fixtures/long_task/server.py",
     );
     let artifacts = fixture.root.path().join("dogfood");
     let mut command = Command::new("python3");
@@ -757,7 +644,7 @@ fn long_task_harness_keeps_model_quality_failures_and_raw_rounds() {
         .arg(&artifacts)
         .arg("--context-chars")
         .arg("20000")
-        .env("BONE_LONG_SESSION_DUMMY_KEY", "long-session-synthetic-key")
+        .env("BONE_TEST_DUMMY_KEY", "long-session-synthetic-key")
         .env_remove("BONE_MODEL");
     let output = bounded_output(command);
     assert!(
@@ -816,11 +703,14 @@ fn long_task_harness_keeps_model_quality_failures_and_raw_rounds() {
 
 #[tokio::test]
 async fn completed_natural_pause_is_not_consumed_again_after_continuation() {
-    let fixture = Fixture::new(json!({"turns":[
-        call("pause_work", "natural_pause", json!({"reason":"user pause request"})),
-        {"text":"The new continuation is complete"},
-        call("pause_work", "unexpected_pause_replay", json!({"reason":"old pause input was replayed"}))
-    ]}));
+    let fixture = Fixture::script(
+        json!({"turns":[
+            call("pause_work", "natural_pause", json!({"reason":"user pause request"})),
+            {"text":"The new continuation is complete"},
+            call("pause_work", "unexpected_pause_replay", json!({"reason":"old pause input was replayed"}))
+        ]}),
+        "fixtures/long_task/server.py",
+    );
     let mut engine = fixture.engine(
         None,
         RunOptions {

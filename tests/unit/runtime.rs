@@ -1,0 +1,1149 @@
+use super::*;
+
+#[test]
+fn profile_switch_validates_before_mutation_and_preserves_paused_session() {
+    let (_directory, mut engine) = fixture_engine();
+    let mut invalid = Profile::from_model("ollama:next").unwrap();
+    invalid.additional_params = Some(json!(false));
+    assert!(engine.set_profile(invalid, "next".into()).is_err());
+    assert_eq!(engine.profile_name, "fixture");
+    engine.post("remain paused", None).unwrap();
+    engine.stop().unwrap();
+    let before = serde_json::to_value(&engine.state).unwrap();
+    engine
+        .set_profile(Profile::from_model("ollama:next").unwrap(), "next".into())
+        .unwrap();
+    assert_eq!(engine.profile_name, "next");
+    assert_eq!(serde_json::to_value(&engine.state).unwrap(), before);
+}
+
+fn progress_origin(revision: u64) -> Origin {
+    Origin {
+        job: "job".into(),
+        input: "input".into(),
+        root: "root".into(),
+        call: "call".into(),
+        revision,
+    }
+}
+
+#[test]
+fn model_progress_is_opt_in_bounded_lossy_and_preserves_native_item() {
+    use rig_core::streaming::{Item, UnknownPayload};
+    let content = serde_json::to_value(rig_core::message::AssistantContent::text("done")).unwrap();
+    assert_eq!(content, json!({"type":"text","text":"done"}));
+    let transcript = json!([
+        {"item":"event","value":{"event":"start","part":0,"kind":"text"}},
+        {"item":"event","value":{"event":"text","part":0,"text":"done"}},
+        {"item":"event","value":{"event":"end","part":0,"content":content}}
+    ]);
+    let native = rig_core::streaming::Transcript::parse(transcript.clone()).unwrap();
+    assert_eq!(serde_json::to_value(native).unwrap(), transcript);
+    let observer = ProgressObserver::default();
+    let native = Item::<rig_core::streaming::StreamEvent>::Unknown(UnknownPayload::from(
+        json!({"provider_field":"native"}),
+    ));
+    let item = serde_json::to_value(native).unwrap();
+    assert_eq!(
+        item,
+        json!({"item":"unknown","value":{"provider_field":"native"}})
+    );
+    observer.push(&progress_origin(3), "work", &item, 64);
+    assert!(observer.queue.lock().unwrap().is_empty());
+    assert!(observer.drain(3, false).is_empty());
+    for _ in 0..MODEL_PROGRESS_RECORDS + 2 {
+        observer.push(&progress_origin(3), "work", &item, 64);
+    }
+    observer.push(
+        &progress_origin(3),
+        "work",
+        &item,
+        MODEL_PROGRESS_ITEM_BYTES + 1,
+    );
+    assert_eq!(observer.queue.lock().unwrap().len(), MODEL_PROGRESS_RECORDS);
+    let records = observer.drain(3, false);
+    assert_eq!(records.len(), MODEL_PROGRESS_RECORDS);
+    assert_eq!(records[0].item, item);
+    assert_eq!(records[0].job_id, "job");
+    assert_eq!(records[0].call_id, "call");
+    assert_eq!(records[0].purpose, "work");
+    let guard = observer.queue.lock().unwrap();
+    observer.push(&progress_origin(3), "work", &item, 64);
+    drop(guard);
+    assert!(observer.drain(3, false).is_empty());
+}
+
+#[test]
+fn model_progress_drops_stale_revisions_and_stop_clears_it() {
+    let (_directory, mut engine) = fixture_engine();
+    engine.drain_model_progress();
+    let revision = engine.state.revision;
+    let item = json!({"item":"event","value":{"event":"text","part":0,"text":"native"}});
+    engine
+        .model_progress
+        .push(&progress_origin(revision + 1), "work", &item, 80);
+    assert!(engine.drain_model_progress().is_empty());
+    engine
+        .model_progress
+        .push(&progress_origin(revision), "work", &item, 80);
+    engine.stop().unwrap();
+    assert!(engine.model_progress.queue.lock().unwrap().is_empty());
+    // A racing producer from the aborted call cannot reappear after stop.
+    engine
+        .model_progress
+        .push(&progress_origin(revision), "work", &item, 80);
+    assert!(engine.drain_model_progress().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_write_keeps_ownership_until_its_future_actually_exits() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut lease = WriteLease::acquire(workspace.path(), "session", "call")
+        .unwrap()
+        .unwrap();
+    lease.arm("session", "call", workspace.path()).unwrap();
+    let marker = lease.marker.clone();
+    let task_lock = Arc::clone(&lease.file);
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let task = tokio::spawn(async move {
+        let _workspace_ownership = task_lock;
+        entered.send(()).unwrap();
+        // Like a synchronous file operation, this cannot observe abort
+        // until its current poll finishes.
+        let _ = blocked.recv();
+    });
+    lease.task = Some(task.abort_handle());
+    started.await.unwrap();
+    task.abort();
+    assert!(!task.is_finished());
+    assert!(lease.ensure_stopped().is_err());
+    assert!(lease.clear().is_err());
+    // The engine's lease is now dropped. Another owner still cannot clear
+    // the marker because the physical task retains the same locked file.
+    assert!(WriteLease::lock_existing(workspace.path(), "session", "call").is_err());
+    assert!(marker.exists());
+    release.send(()).unwrap();
+    let _ = task.await;
+    WriteLease::lock_existing(workspace.path(), "session", "call")
+        .unwrap()
+        .clear()
+        .unwrap();
+    assert!(!marker.exists());
+    assert!(
+        WriteLease::acquire(workspace.path(), "next", "next-call")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn wait_cycle_uses_input_owners_and_ignores_already_terminal_replies() {
+    let mut state = SessionState::new(".");
+    let mut first = Job::new("first");
+    let mut second = Job::new("second");
+    let mut third = Job::new("third");
+    first.active_input = Some("input-a".into());
+    second.active_input = Some("input-b".into());
+    third.inbox.push_back("input-c".into());
+    first.wait_for = vec!["input-b".into(), "input-c".into()];
+    second.wait_for = vec!["input-a".into()];
+    for job in [first, second, third] {
+        state.jobs.insert(job.id.clone(), job);
+    }
+    assert!(has_wait_cycle(&state, |_| false));
+    assert!(!has_wait_cycle(&state, |input| input == "input-b"));
+    // A reply for another input cannot discharge this dependency.
+    assert!(has_wait_cycle(&state, |input| input == "other-input-b"));
+}
+
+fn open_fixture_engine(directory: &Path, workspace: &Path, session: Option<&str>) -> Engine {
+    Engine::open(
+        &directory.join("data"),
+        workspace,
+        session,
+        Profile::from_model("ollama:unused-local-fixture").unwrap(),
+        "fixture".into(),
+        RunOptions::default(),
+    )
+    .unwrap()
+}
+
+fn fixture_engine() -> (tempfile::TempDir, Engine) {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let engine = open_fixture_engine(directory.path(), &workspace, None);
+    (directory, engine)
+}
+
+#[test]
+fn resumed_input_hides_historical_failure_until_new_result() {
+    let (_directory, mut engine) = fixture_engine();
+    let input = engine.post("Complete the implementation", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let job = engine.state().focus.clone().unwrap();
+    engine.fail(&job, "temporary provider failure").unwrap();
+    let failure = engine.result(&input).unwrap().clone();
+    assert_eq!(failure.kind, "failure");
+
+    engine.resume().unwrap();
+    assert!(engine.result(&input).is_none());
+    assert!(engine.terminal(&input).is_none());
+    assert_eq!(engine.read_event(&failure.id).unwrap().kind, "failure");
+
+    let response = engine.event(
+        &job,
+        "model_message",
+        json!({"response":native_response(Message::assistant("Completed and verified"))}),
+    );
+    let response_id = response.id.clone();
+    engine.append_history(&job, response).unwrap();
+    engine.deliver(&job, &response_id).unwrap();
+    let delivered = engine.result(&input).unwrap();
+    assert_eq!(delivered.kind, "delivery");
+    assert_eq!(
+        engine.event_text(delivered).unwrap(),
+        "Completed and verified"
+    );
+    assert!(
+        engine
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| event.id == failure.id)
+    );
+}
+
+fn native_response(message: Message) -> CompletionResponse {
+    let Message::Assistant { content, .. } = message else {
+        panic!("expected assistant")
+    };
+    CompletionResponse::new(
+        content,
+        rig_core::completion::Usage::default(),
+        "ollama",
+        json!({}),
+    )
+}
+
+fn native_proposal(engine: &mut Engine, job: &str, name: &str, arguments: Value) -> PendingTool {
+    use rig_core::message::{CallId, ToolFunction, ToolName};
+    let call = ToolCall::new(
+        CallId::from_wire(new_id()),
+        ToolFunction {
+            name: ToolName::new(name).unwrap(),
+            arguments,
+        },
+    );
+    let event = engine.event(job, "model_message", json!({"response":native_response(Message::Assistant {id:None,content:vec![rig_core::completion::AssistantContent::ToolCall(call.clone())]})}));
+    let key = format!("{}:{}", event.id, serde_json::to_string(&call.id).unwrap());
+    engine.append_history(job, event).unwrap();
+    PendingTool { call, key }
+}
+
+fn resolution_proposal(engine: &mut Engine, job: &str, resolutions: Value) -> PendingTool {
+    native_proposal(
+        engine,
+        job,
+        "input_resolve",
+        json!({"resolutions":resolutions}),
+    )
+}
+
+#[test]
+fn input_resolution_validation_is_atomic_and_preserves_independent_work_and_budgets() {
+    let (_directory, mut engine) = fixture_engine();
+    let first = engine
+        .post("Original implementation request", None)
+        .unwrap();
+    engine.prepare_pending_input().unwrap();
+    let unrelated = engine.post("Independent queued task", None).unwrap();
+    let current = engine
+        .post("Finish the revised implementation", None)
+        .unwrap();
+    engine.prepare_pending_input().unwrap();
+    let job = engine.state.focus.clone().unwrap();
+    let mut foreign = Job::new("Foreign queued input");
+    foreign.state = JobState::Ready;
+    let mut foreign_input = engine.event(
+        &foreign.id,
+        "input",
+        json!({"message":Message::user("foreign"),"source":"job","sender_input":current}),
+    );
+    foreign_input.reply_to = None;
+    foreign_input.root_input = Some(current.clone());
+    foreign.inbox.push_back(foreign_input.id.clone());
+    let foreign_id = foreign_input.id.clone();
+    let mut state = engine.state.clone();
+    state.jobs.insert(foreign.id.clone(), foreign);
+    engine.commit(state, vec![foreign_input]).unwrap();
+    let valid = json!({"input_id":first,"outcome":"completed","reason":"Original work verified under the revised contract","evidence_event_ids":[current]});
+    let invalid = [
+        json!([valid.clone(), {"input_id":current,"outcome":"completed","reason":"cannot settle active"}]),
+        json!([valid.clone(), valid.clone()]),
+        json!([{ "input_id":first,"outcome":"completed","reason":" "}]),
+        json!([{ "input_id":first,"outcome":"merged","reason":"unsupported"}]),
+        json!([{ "input_id":first,"outcome":"superseded","reason":"replaced","evidence_event_ids":["missing"]}]),
+        json!([{ "input_id":"missing","outcome":"completed","reason":"missing"}]),
+        json!([valid.clone(), {"input_id":foreign_id,"outcome":"completed","reason":"foreign"}]),
+        json!([{ "input_id":first,"outcome":"superseded","reason":"replaced","evidence_event_ids":null}]),
+        json!([]),
+    ];
+    for resolutions in invalid {
+        let tool = resolution_proposal(&mut engine, &job, resolutions);
+        let before = engine.state.clone();
+        let count = engine.events().unwrap().len();
+        assert!(engine.internal_tool(&job, &tool).is_err());
+        assert_eq!(engine.state, before);
+        assert_eq!(engine.events().unwrap().len(), count);
+        // Answer the rejected proposal exactly as the scheduler does.
+        let event = engine
+            .tool_result(&job, &tool, json!({"error":"rejected"}), None, false)
+            .unwrap();
+        engine.append_history(&job, event).unwrap();
+    }
+    let tool = resolution_proposal(&mut engine, &job, json!([valid]));
+    let budgets = engine.state.budgets.clone();
+    engine.internal_tool(&job, &tool).unwrap();
+    assert_eq!(engine.state.budgets, budgets);
+    assert_eq!(engine.state.jobs[&job].inbox, VecDeque::from([unrelated]));
+    assert_eq!(
+        engine.state.jobs[&job].active_input.as_deref(),
+        Some(current.as_str())
+    );
+    let settled = engine.result(&first).unwrap();
+    assert_eq!(settled.kind, "input_resolved");
+    assert_eq!(settled.data["actor_input"], current);
+    assert_eq!(settled.data["outcome"], "completed");
+    assert_eq!(settled.root_input.as_deref(), Some(first.as_str()));
+    assert_eq!(engine.read_event(&first).unwrap().kind, "input");
+}
+
+#[test]
+fn resolution_wakes_exact_waiters_with_distinct_outcomes() {
+    let (_directory, mut engine) = fixture_engine();
+    let old = engine.post("Old bounds", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let other = engine.post("Unrelated request", None).unwrap();
+    let current = engine.post("Changed bounds", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let owner = engine.state.focus.clone().unwrap();
+    let mut waiter = Job::new("Wait on changed requirement");
+    waiter.state = JobState::Waiting;
+    waiter.wait_for = vec![old.clone()];
+    let waiter_id = waiter.id.clone();
+    let mut waiter_input = engine.event(&waiter_id, "input", json!({"message":Message::user("Wait for the original input"),"source":"job","sender_input":current}));
+    waiter_input.reply_to = None;
+    waiter_input.root_input = Some(current.clone());
+    waiter.active_input = Some(waiter_input.id.clone());
+    let mut still_waiting = Job::new("Wait on independent task");
+    still_waiting.state = JobState::Waiting;
+    still_waiting.wait_for = vec![other];
+    let waiting_id = still_waiting.id.clone();
+    let mut state = engine.state.clone();
+    state.jobs.insert(waiter_id.clone(), waiter);
+    state.jobs.insert(waiting_id.clone(), still_waiting);
+    engine.commit(state, vec![waiter_input]).unwrap();
+    let wait_call = native_proposal(
+        &mut engine,
+        &waiter_id,
+        "job_wait",
+        json!({"input_ids":[old]}),
+    );
+    let tool = resolution_proposal(
+        &mut engine,
+        &owner,
+        json!([{"input_id":old,"outcome":"superseded","reason":"New bounds replace the old bounds"}]),
+    );
+    engine.internal_tool(&owner, &tool).unwrap();
+    engine.wake_waiters().unwrap();
+    assert_eq!(engine.state.jobs[&waiter_id].state, JobState::Ready);
+    assert!(engine.state.jobs[&waiter_id].wait_for.is_empty());
+    assert_eq!(engine.state.jobs[&waiting_id].state, JobState::Waiting);
+    let results = engine.wait_results(std::slice::from_ref(&old)).unwrap();
+    assert_eq!(results["results"][0]["input_id"], old);
+    assert_eq!(results["results"][0]["status"], "input_resolved");
+    assert_eq!(results["results"][0]["outcome"], "superseded");
+    assert_eq!(results["results"][0]["actor_input"], current);
+    let answered = engine
+        .events()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == "tool_result" && e.data["tool_key"] == wait_call.key)
+        .unwrap();
+    let message: Message = serde_json::from_value(answered.data["message"].clone()).unwrap();
+    let Message::User { content } = message else {
+        panic!("missing native result")
+    };
+    let rig_core::message::UserContent::ToolResult(result) = &content[0] else {
+        panic!("missing native result")
+    };
+    assert_eq!(result.call, wait_call.call.id);
+    assert_eq!(result.name.as_str(), "job_wait");
+    assert!(
+        serde_json::to_string(&result.content)
+            .unwrap()
+            .contains("superseded")
+    );
+    assert!(
+        !engine
+            .events()
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "delivery" && e.reply_to.as_deref() == Some(old.as_str()))
+    );
+}
+
+#[test]
+fn resolution_ownership_follows_handoff_queue_without_rewriting_original_input() {
+    let (_directory, mut engine) = fixture_engine();
+    let old = engine.post("Original task", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let source = engine.state.focus.clone().unwrap();
+    let mut target = Job::new("Handoff target");
+    target.active_input = Some(old.clone());
+    target.state = JobState::Ready;
+    target.history.push(old.clone());
+    let target_id = target.id.clone();
+    let mut state = engine.state.clone();
+    state.jobs.get_mut(&source).unwrap().active_input = None;
+    state.jobs.get_mut(&source).unwrap().state = JobState::Idle;
+    state.focus = Some(target_id.clone());
+    state.jobs.insert(target_id.clone(), target);
+    engine.commit(state, vec![]).unwrap();
+    engine.post("Newer task", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let tool = resolution_proposal(
+        &mut engine,
+        &target_id,
+        json!([{"input_id":old,"outcome":"superseded","reason":"Newer instruction replaced the task after handoff"}]),
+    );
+    engine.internal_tool(&target_id, &tool).unwrap();
+    assert!(engine.state.jobs[&target_id].inbox.is_empty());
+    assert_eq!(
+        engine.read_event(&old).unwrap().job_id.as_deref(),
+        Some(source.as_str())
+    );
+    assert_eq!(
+        engine.result(&old).unwrap().job_id.as_deref(),
+        Some(target_id.as_str())
+    );
+}
+
+#[test]
+fn resolution_rejects_unknown_effects_unfinished_batches_and_live_descendants() {
+    let (_directory, mut engine) = fixture_engine();
+    let old = engine.post("Original work", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    engine.post("Current work", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let owner = engine.state.focus.clone().unwrap();
+    engine.state.unknown_writes.insert(
+        "unknown".into(),
+        UnknownWrite {
+            call_id: "unknown".into(),
+            job_id: owner.clone(),
+            root_input: Some(old.clone()),
+            tool_name: "shell".into(),
+        },
+    );
+    assert!(
+        engine
+            .ensure_input_resolvable(&owner, &old)
+            .unwrap_err()
+            .to_string()
+            .contains("write effects")
+    );
+    engine.state.unknown_writes.clear();
+
+    let mut child = Job::new("Delegated work");
+    child.state = JobState::Paused;
+    let mut child_input = engine.event(
+        &child.id,
+        "input",
+        json!({"message":Message::user("child"),"source":"job","sender_input":old}),
+    );
+    child_input.reply_to = None;
+    child_input.root_input = Some(old.clone());
+    child.active_input = Some(child_input.id.clone());
+    let mut failure = engine.event(&child.id, "failure", json!({"error":"child failed"}));
+    failure.reply_to = Some(child_input.id.clone());
+    failure.root_input = Some(old.clone());
+    let mut grandchild = Job::new("Live descendant");
+    grandchild.state = JobState::Ready;
+    let mut descendant = engine.event(
+        &grandchild.id,
+        "input",
+        json!({"message":Message::user("descendant"),"source":"job","sender_input":child_input.id}),
+    );
+    descendant.root_input = Some(old.clone());
+    grandchild.inbox.push_back(descendant.id.clone());
+    let mut state = engine.state.clone();
+    state.jobs.insert(child.id.clone(), child);
+    state.jobs.insert(grandchild.id.clone(), grandchild);
+    engine
+        .commit(state, vec![child_input, failure, descendant])
+        .unwrap();
+    assert!(
+        engine
+            .ensure_input_resolvable(&owner, &old)
+            .unwrap_err()
+            .to_string()
+            .contains("delegated")
+    );
+    // Unanswered original proposals are also rejected, even if reconstructed
+    // from an older snapshot rather than the usual admission path.
+    let mut pending = cycles(&engine, &owner, 1, 16).remove(0);
+    pending.reply_to = Some(old.clone());
+    engine.append_history(&owner, pending).unwrap();
+    assert!(
+        engine
+            .ensure_input_resolvable(&owner, &old)
+            .unwrap_err()
+            .to_string()
+            .contains("unfinished native")
+    );
+}
+
+#[test]
+fn failed_retained_child_blocks_parent_settlement_across_public_resume_until_completed() {
+    let (_directory, mut engine) = fixture_engine();
+    let old = engine.post("Parent implementation", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    engine.post("Current instruction", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let owner = engine.state.focus.clone().unwrap();
+    let mut child = Job::new("Retained failed child");
+    let child_id = child.id.clone();
+    child.state = JobState::Paused;
+    let mut assigned = engine.event(&child_id, "input", json!({"message":Message::user("Continue parent implementation"),"source":"job","sender_input":old}));
+    assigned.reply_to = None;
+    assigned.root_input = Some(old.clone());
+    let assigned_id = assigned.id.clone();
+    child.active_input = Some(assigned_id.clone());
+    child.history.push(assigned_id.clone());
+    let mut failure = engine.event(
+        &child_id,
+        "failure",
+        json!({"error":"Build failed; correction is still needed"}),
+    );
+    failure.reply_to = Some(assigned_id.clone());
+    failure.root_input = Some(old.clone());
+    let mut state = engine.state.clone();
+    state.jobs.insert(child_id.clone(), child);
+    engine.commit(state, vec![assigned, failure]).unwrap();
+    assert_eq!(engine.terminal(&assigned_id).unwrap().kind, "failure");
+    let tool = resolution_proposal(
+        &mut engine,
+        &owner,
+        json!([{"input_id":old,"outcome":"completed","reason":"Cannot claim completion while failed child remains resumable"}]),
+    );
+    let before = engine.state.clone();
+    let event_count = engine.events().unwrap().len();
+    let error = engine.internal_tool(&owner, &tool).unwrap_err();
+    assert!(error.to_string().contains("retained delegated"));
+    assert_eq!(engine.state, before);
+    assert_eq!(engine.events().unwrap().len(), event_count);
+    let rejected = engine
+        .tool_result(
+            &owner,
+            &tool,
+            json!({"error":error.to_string()}),
+            None,
+            false,
+        )
+        .unwrap();
+    engine.append_history(&owner, rejected).unwrap();
+
+    engine.resume().unwrap();
+    assert_eq!(engine.state.jobs[&child_id].state, JobState::Ready);
+    assert_eq!(
+        engine.state.jobs[&child_id].active_input.as_deref(),
+        Some(assigned_id.as_str())
+    );
+    assert!(engine.terminal(&assigned_id).is_none());
+    assert!(engine.result(&old).is_none());
+    assert!(engine.state.jobs[&owner].inbox.contains(&old));
+    assert!(engine.ensure_input_resolvable(&owner, &old).is_err());
+
+    let response = engine.event(
+        &child_id,
+        "model_message",
+        json!({"response":native_response(Message::assistant("Build corrected and verified"))}),
+    );
+    let response_id = response.id.clone();
+    engine.append_history(&child_id, response).unwrap();
+    engine.deliver(&child_id, &response_id).unwrap();
+    assert!(engine.state.jobs[&child_id].active_input.is_none());
+    assert_eq!(engine.terminal(&assigned_id).unwrap().kind, "delivery");
+    let tool = resolution_proposal(
+        &mut engine,
+        &owner,
+        json!([{"input_id":old,"outcome":"completed","reason":"The child has now completed and provided verification","evidence_event_ids":[response_id]}]),
+    );
+    engine.internal_tool(&owner, &tool).unwrap();
+    assert_eq!(engine.result(&old).unwrap().kind, "input_resolved");
+    assert!(!engine.state.jobs[&owner].inbox.contains(&old));
+}
+
+fn cycles(engine: &Engine, job: &str, count: usize, bytes: usize) -> Vec<Event> {
+    use rig_core::message::{CallId, ToolFunction, ToolName};
+    let mut events = Vec::new();
+    for _ in 0..count {
+        let call = ToolCall::new(
+            CallId::from_wire(new_id()),
+            ToolFunction {
+                name: ToolName::new("read_file").unwrap(),
+                arguments: json!({"path":"evidence.txt"}),
+            },
+        );
+        let model = engine.event(job,"model_message", json!({"response":native_response(Message::Assistant {id:None,content:vec![rig_core::completion::AssistantContent::ToolCall(call.clone())]})}));
+        let key = format!("{}:{}", model.id, serde_json::to_string(&call.id).unwrap());
+        let result = engine.event(job,"tool_result", json!({"message":Message::tool_result(call.id, call.function.name, format!("EXACT_EVIDENCE_{}", "证".repeat(bytes/3))),"tool_key":key,"uncertain":false}));
+        events.extend([model, result]);
+    }
+    events
+}
+
+fn cache_bytes(engine: &Engine) -> usize {
+    engine
+        .events
+        .values()
+        .map(|e| serde_json::to_vec(e).unwrap().len())
+        .sum()
+}
+
+#[tokio::test]
+async fn thousands_of_large_events_stay_archived_across_repeated_summaries_and_restarts() {
+    let (directory, mut engine) = fixture_engine();
+    let input = engine
+        .post("Original requirement: retain exact evidence.", None)
+        .unwrap();
+    engine.prepare_pending_input().unwrap();
+    let job_id = engine.state.focus.clone().unwrap();
+    let events = cycles(&engine, &job_id, 1100, 8192);
+    let original_event = events[1].clone();
+    let mut state = engine.state.clone();
+    let ids: Vec<_> = events.iter().map(|e| e.id.clone()).collect();
+    state
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .history
+        .extend(ids.clone());
+    let summary = engine.event(&job_id,"summary",json!({"response":native_response(Message::assistant("Exact evidence remains available through audit IDs.")),"covered_ids":ids}));
+    state.jobs.get_mut(&job_id).unwrap().summary = Some(summary.id.clone());
+    state.jobs.get_mut(&job_id).unwrap().public_revision = 1;
+    let mut all = events;
+    all.push(summary);
+    engine.store.commit(&state, &all).unwrap();
+    let durable_bytes: usize = all
+        .iter()
+        .map(|e| serde_json::to_vec(e).unwrap().len())
+        .sum();
+    let session = engine.state.id.clone();
+    let workspace = engine.state.workspace.clone();
+    drop(engine);
+    let mut previous_fresh = Vec::<String>::new();
+    for round in 0..4 {
+        let mut engine = open_fixture_engine(directory.path(), &workspace, Some(&session));
+        assert!(engine.events.len() > 2200);
+        assert!(
+            cache_bytes(&engine) < durable_bytes / 4,
+            "large original bodies leaked into live cache"
+        );
+        if previous_fresh.is_empty() {
+            assert!(engine.state.jobs[&job_id].history.len() <= 2);
+        } else {
+            assert_eq!(
+                engine.state.jobs[&job_id].history,
+                [vec![input.clone()], previous_fresh.clone()].concat(),
+                "Unobserved native results must survive summary and reopen"
+            );
+        }
+        assert_eq!(
+            engine.read_event(&original_event.id).unwrap(),
+            original_event
+        );
+        engine.resume().unwrap();
+        let events = cycles(&engine, &job_id, 8, 1024);
+        let fresh: Vec<_> = events[events.len() - 2..]
+            .iter()
+            .map(|event| event.id.clone())
+            .collect();
+        let mut state = engine.state.clone();
+        state
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .history
+            .extend(events.iter().map(|e| e.id.clone()));
+        // New work responses consumed the previous round's fresh pair.
+        // The final pair has no subsequent committed work response yet.
+        let expected_covered: BTreeSet<_> = state.jobs[&job_id]
+            .history
+            .iter()
+            .filter(|id| *id != &input && !fresh.contains(id))
+            .cloned()
+            .collect();
+        engine.commit(state, events).unwrap();
+        let (_, covered) =
+            context::compaction_prefix(&engine.state.jobs[&job_id], &engine.events, 1, 96_000)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            covered.len(),
+            if round == 0 { 14 } else { 16 },
+            "previously summarized IDs must not accumulate"
+        );
+        assert_eq!(
+            covered.iter().cloned().collect::<BTreeSet<_>>(),
+            expected_covered,
+            "Summary must cover exactly consumed pairs, never fresh or already summarized events"
+        );
+        let origin = Origin {
+            job: job_id.clone(),
+            input: input.clone(),
+            root: input.clone(),
+            call: new_id(),
+            revision: engine.state.revision,
+        };
+        let task = tokio::spawn(std::future::pending::<()>());
+        engine.running.insert(
+            origin.call.clone(),
+            Running {
+                origin: origin.clone(),
+                abort: task.abort_handle(),
+                tool: None,
+            },
+        );
+        engine
+            .complete(Completed::Model {
+                origin,
+                response: Ok(native_response(Message::assistant(format!(
+                    "Round {round}: preserve requirement and audit {}",
+                    original_event.id
+                )))),
+                covered: Some(covered),
+                stream_items: vec![],
+            })
+            .unwrap();
+        task.abort();
+        assert_eq!(
+            engine.state.jobs[&job_id].history,
+            [vec![input.clone()], fresh.clone()].concat()
+        );
+        assert_eq!(engine.state.jobs[&job_id].public_revision, 1);
+        assert!(engine.pending_tools(&job_id).unwrap().is_empty());
+        let history = context::build_history(&engine.state.jobs[&job_id], &engine.events).unwrap();
+        assert_eq!(history.len(), 4);
+        let fresh_response: CompletionResponse =
+            serde_json::from_value(engine.read_event(&fresh[0]).unwrap().data["response"].clone())
+                .unwrap();
+        assert_eq!(Some(history[2].clone()), fresh_response.message());
+        let fresh_result: Message =
+            serde_json::from_value(engine.read_event(&fresh[1]).unwrap().data["message"].clone())
+                .unwrap();
+        assert_eq!(history[3], fresh_result);
+        previous_fresh = fresh;
+        let page = engine.inspect(&json!({"job_id":job_id,"limit":2})).unwrap();
+        assert!(page["next_before_id"].is_string());
+        let next_page = engine
+            .inspect(&json!({"job_id":job_id,"limit":2,"before_id":page["next_before_id"]}))
+            .unwrap();
+        assert_ne!(page["records"][0]["id"], next_page["records"][0]["id"]);
+        // Read exactly the original Unicode JSON through bounded chunks.
+        let mut recovered = String::new();
+        let mut offset = 0;
+        loop {
+            let chunk = engine
+                .inspect(
+                    &json!({"event_id":original_event.id,"offset":offset,"limit":500,"raw":true}),
+                )
+                .unwrap();
+            assert!(serde_json::to_string(&chunk).unwrap().chars().count() < 8_000);
+            recovered.push_str(chunk["text"].as_str().unwrap());
+            let Some(next) = chunk["next_offset"].as_u64() else {
+                break;
+            };
+            offset = next;
+        }
+        assert_eq!(
+            serde_json::from_str::<Event>(&recovered).unwrap(),
+            original_event
+        );
+        assert!(engine.inspect(&json!({"event_id":"absent"})).is_err());
+        assert!(
+            engine
+                .inspect(&json!({"job_id":job_id,"before_id":"absent"}))
+                .is_err()
+        );
+        eprintln!(
+            "archive round {round}: events={}, durable_seed_bytes={durable_bytes}, resident_event_bytes={}",
+            engine.events.len(),
+            cache_bytes(&engine)
+        );
+    }
+}
+
+#[tokio::test]
+async fn idle_and_closed_jobs_do_not_keep_large_native_bodies_resident() {
+    let (directory, mut engine) = fixture_engine();
+    let mut state = engine.state.clone();
+    let mut events = Vec::new();
+    for index in 0..80 {
+        let mut job = Job::new(format!("finished-{index}"));
+        if index % 2 == 0 {
+            job.state = JobState::Closed;
+        }
+        let mut event = Event::new(
+            &state.id,
+            "model_message",
+            json!({"response":native_response(Message::assistant("large".repeat(20_000)))}),
+        );
+        event.job_id = Some(job.id.clone());
+        job.history.push(event.id.clone());
+        state.jobs.insert(job.id.clone(), job);
+        events.push(event);
+    }
+    engine.commit(state, events).unwrap();
+    let session = engine.state.id.clone();
+    let workspace = engine.state.workspace.clone();
+    drop(engine);
+    let mut engine = open_fixture_engine(directory.path(), &workspace, Some(&session));
+    assert!(engine.loaded.is_empty());
+    assert!(cache_bytes(&engine) < 100_000);
+    let input = engine.post("continue here", None).unwrap();
+    let focus = engine.state.focus.clone().unwrap();
+    assert!(engine.loaded.contains(&input));
+    assert_eq!(engine.state.jobs[&focus].state, JobState::Ready);
+}
+
+#[tokio::test]
+async fn completion_transaction_failure_poison_blocks_actions_and_restart_recovers_unknown_write() {
+    use rig_core::message::{CallId, ToolFunction, ToolName};
+    let (directory, mut engine) = fixture_engine();
+    let input = engine.post("write once", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let job = engine.state.focus.clone().unwrap();
+    let call = ToolCall::new(
+        CallId::from_wire("write"),
+        ToolFunction {
+            name: ToolName::new("write_file").unwrap(),
+            arguments: json!({"path":"result","content":"one"}),
+        },
+    );
+    let event = engine.event(&job,"model_message",json!({"response":native_response(Message::Assistant {id:None,content:vec![rig_core::completion::AssistantContent::ToolCall(call.clone())]})}));
+    let tool = PendingTool {
+        key: format!("{}:{}", event.id, serde_json::to_string(&call.id).unwrap()),
+        call,
+    };
+    engine.append_history(&job, event).unwrap();
+    let origin = Origin {
+        job: job.clone(),
+        input: input.clone(),
+        root: input,
+        call: new_id(),
+        revision: engine.state.revision,
+    };
+    let mut started = engine.event(
+        &job,
+        "tool_started",
+        json!({"effect":"write","tool_name":"write_file","tool_key":tool.key}),
+    );
+    started.call_id = Some(origin.call.clone());
+    let mut state = engine.state.clone();
+    state.jobs.get_mut(&job).unwrap().state = JobState::Running;
+    state.jobs.get_mut(&job).unwrap().current_call = Some(origin.call.clone());
+    engine.commit(state, vec![started]).unwrap();
+    let lease = WriteLease::acquire(&engine.state.workspace, &engine.state.id, &origin.call)
+        .unwrap()
+        .unwrap();
+    lease
+        .arm(&engine.state.id, &origin.call, &engine.data_dir)
+        .unwrap();
+    engine.write_lease = Some(lease);
+    let task = tokio::spawn(std::future::pending::<()>());
+    engine.running.insert(
+        origin.call.clone(),
+        Running {
+            origin: origin.clone(),
+            abort: task.abort_handle(),
+            tool: Some(tool.clone()),
+        },
+    );
+    let db = rusqlite::Connection::open(engine.data_dir.join("sessions.sqlite3")).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_result BEFORE INSERT ON events WHEN json_extract(NEW.payload,'$.kind')='tool_result' BEGIN SELECT RAISE(ABORT,'injected completion commit failure'); END;").unwrap();
+    assert!(
+        engine
+            .complete(Completed::Tool {
+                origin: origin.clone(),
+                tool,
+                outcome: tools::ToolOutcome {
+                    content: json!({"written":true}),
+                    uncertain: false
+                }
+            })
+            .is_err()
+    );
+    assert!(engine.faulted);
+    assert!(
+        engine
+            .step()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("reopen")
+    );
+    assert!(engine.post("new instruction", None).is_err());
+    assert!(engine.stop().is_err());
+    assert!(engine.resume().is_err());
+    assert!(engine.read_event(&engine.order[0]).is_ok());
+    db.execute_batch("DROP TRIGGER reject_result").unwrap();
+    let session = engine.state.id.clone();
+    let workspace = engine.state.workspace.clone();
+    drop(engine);
+    let mut recovered = open_fixture_engine(directory.path(), &workspace, Some(&session));
+    assert!(recovered.state.paused);
+    assert_eq!(recovered.state.jobs[&job].state, JobState::Paused);
+    assert!(recovered.state.unknown_writes.contains_key(&origin.call));
+    recovered
+        .resolve_write(&origin.call, "inspected result; effect recorded")
+        .unwrap();
+    task.abort();
+}
+
+#[test]
+fn legacy_unknown_marker_migrates_without_disappearing_or_authorizing_new_writes() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (_, legacy) = WriteLease::legacy_paths(workspace.path()).unwrap();
+    let info = json!({"session_id":"old","call_id":"unfinished"});
+    std::fs::write(&legacy, serde_json::to_vec(&info).unwrap()).unwrap();
+    assert!(WriteLease::acquire(workspace.path(), "new", "newcall").is_err());
+    let (_, stable) = WriteLease::paths(workspace.path()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(&stable).unwrap()).unwrap(),
+        info
+    );
+    assert!(legacy.exists());
+    assert!(WriteLease::lock_existing(workspace.path(), "new", "newcall").is_err());
+    WriteLease::lock_existing(workspace.path(), "old", "unfinished")
+        .unwrap()
+        .clear()
+        .unwrap();
+    assert!(!legacy.exists());
+    assert!(!stable.exists());
+}
+
+#[tokio::test]
+async fn restart_between_input_preparation_and_model_start_keeps_older_shared_corrections() {
+    let (directory, mut engine) = fixture_engine();
+    engine.post("start", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let first = engine.state.focus.clone().unwrap();
+    engine.incorporate_public_inputs(&first).unwrap();
+    let mut state = engine.state.clone();
+    let second = Job::new("another continuing context");
+    let second_id = second.id.clone();
+    state.jobs.insert(second_id.clone(), second);
+    state.focus = Some(second_id.clone());
+    engine.commit(state, vec![]).unwrap();
+    let correction = engine
+        .post("GLOBAL CORRECTION: preserve the original data", None)
+        .unwrap();
+    engine.prepare_pending_input().unwrap();
+    let mut state = engine.state.clone();
+    state.focus = Some(first.clone());
+    engine.commit(state, vec![]).unwrap();
+    let newest = engine
+        .post("continue with this new own input", None)
+        .unwrap();
+    engine.prepare_pending_input().unwrap();
+    assert!(engine.state.jobs[&first].history.contains(&newest));
+    assert!(!engine.state.jobs[&first].history.contains(&correction));
+    let prior_cursor = engine.state.jobs[&first].public_revision;
+    let session = engine.state.id.clone();
+    let workspace = engine.state.workspace.clone();
+    drop(engine);
+    let mut engine = open_fixture_engine(directory.path(), &workspace, Some(&session));
+    assert_eq!(engine.state.jobs[&first].public_revision, prior_cursor);
+    engine.resume().unwrap();
+    engine.incorporate_public_inputs(&first).unwrap();
+    assert!(engine.state.jobs[&first].history.contains(&correction));
+    let history = context::build_history(&engine.state.jobs[&first], &engine.events).unwrap();
+    assert!(
+        serde_json::to_string(&history)
+            .unwrap()
+            .contains("GLOBAL CORRECTION")
+    );
+}
+
+#[tokio::test]
+async fn waiting_on_long_child_results_returns_bounded_previews_and_exact_audit_references() {
+    let (_directory, mut engine) = fixture_engine();
+    engine.options.context_chars = 16_000;
+    let parent_input = engine.post("verify all delegated output", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let mut state = engine.state.clone();
+    let mut events = Vec::new();
+    let mut inputs = Vec::new();
+    for index in 0..10 {
+        let job = Job::new(format!("child {index}"));
+        let mut input = Event::new(
+            &state.id,
+            "input",
+            json!({"message":Message::user("produce evidence"),"source":"job"}),
+        );
+        input.job_id = Some(job.id.clone());
+        input.root_input = Some(parent_input.clone());
+        inputs.push(input.id.clone());
+        let mut response = Event::new(
+            &state.id,
+            "model_message",
+            json!({"response":native_response(Message::assistant("verified exact output".repeat(5000)))}),
+        );
+        response.job_id = Some(job.id.clone());
+        response.reply_to = Some(input.id.clone());
+        let mut delivery = Event::new(&state.id, "delivery", json!({"response_event":response.id}));
+        delivery.job_id = Some(job.id.clone());
+        delivery.reply_to = Some(input.id.clone());
+        state.jobs.insert(job.id.clone(), job);
+        events.extend([input, response, delivery]);
+    }
+    engine.commit(state, events).unwrap();
+    let results = engine.wait_results(&inputs).unwrap();
+    assert!(serde_json::to_string(&results).unwrap().chars().count() < 3_000);
+    assert!(
+        results["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["truncated"] == true && r["response_event"].is_string())
+    );
+    let original = engine
+        .read_event(results["results"][0]["response_event"].as_str().unwrap())
+        .unwrap();
+    assert!(serde_json::to_string(&original).unwrap().len() > 100_000);
+}
+
+#[tokio::test]
+async fn user_input_lookup_skips_audit_noise_and_crosses_job_boundaries() {
+    let (_directory, mut engine) = fixture_engine();
+    engine.options.context_chars = 32_000;
+    let first = engine
+        .post(
+            "Original requirement: preserve the exact public interface and named output format",
+            None,
+        )
+        .unwrap();
+    let original_job = engine.state.focus.clone().unwrap();
+    let mut state = engine.state.clone();
+    let second = Job::new("later context");
+    let second_id = second.id.clone();
+    state.jobs.insert(second_id.clone(), second);
+    state.focus = Some(second_id.clone());
+    engine.commit(state, vec![]).unwrap();
+    let mut expected = vec![first.clone()];
+    for round in 0..5 {
+        let input = engine
+            .post(&format!("Later instruction {round}"), None)
+            .unwrap();
+        expected.push(input);
+        let audit = (0..100)
+            .map(|_| {
+                engine.event(
+                    &second_id,
+                    "model_started",
+                    json!({"diagnostic":"audit noise"}),
+                )
+            })
+            .collect();
+        engine.commit(engine.state.clone(), audit).unwrap();
+    }
+    assert!(engine.events.len() > 500);
+    let mut ids = Vec::new();
+    let mut before = None;
+    loop {
+        let page = engine
+            .inspect(&json!({"users_only":true,"job_id":second_id,"limit":2,"before_id":before}))
+            .unwrap();
+        for record in page["records"].as_array().unwrap() {
+            ids.push(record["id"].as_str().unwrap().to_owned());
+        }
+        if !page["truncated"].as_bool().unwrap() {
+            break;
+        }
+        before = Some(page["next_before_id"].as_str().unwrap().to_owned());
+    }
+    expected.reverse();
+    assert_eq!(ids, expected);
+    let original = engine
+        .inspect(&json!({"users_only":true,"limit":32}))
+        .unwrap();
+    assert!(
+        original["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == first && r["job_id"] == original_job)
+    );
+    assert!(
+        engine
+            .inspect(&json!({"users_only":true,"before_id":engine.order.last().unwrap()}))
+            .is_err()
+    );
+    let full = engine.inspect(&json!({"event_id":first})).unwrap();
+    assert!(
+        full["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Original requirement:")
+    );
+    assert_eq!(full["raw"], false);
+}
+
+#[tokio::test]
+async fn readable_summary_pages_skip_native_metadata_and_preserve_every_character() {
+    let (_directory, mut engine) = fixture_engine();
+    engine.post("inspect earlier requirements", None).unwrap();
+    let job = engine.state.focus.clone().unwrap();
+    let expected="Exact unfinished interface: preserve quoted \"names\", Unicode 中文 and emoji 🦀.\nRequired output format and option semantics stay explicit. ".repeat(12);
+    let mut response =
+        serde_json::to_value(native_response(Message::assistant(expected.clone()))).unwrap();
+    response["choice"].as_array_mut().unwrap().insert(0,json!({"type":"reasoning","issuer":"chatgpt","id":"opaque-reasoning","content":[{"type":"encrypted","content":"sealed-opaque".repeat(2000)}]}));
+    response["raw"] = json!({"instructions":"large raw request".repeat(2000)});
+    let summary = engine.event(
+        &job,
+        "summary",
+        json!({"response":response,"covered_ids":(0..100).map(|_|new_id()).collect::<Vec<_>>() }),
+    );
+    let id = summary.id.clone();
+    engine
+        .commit(engine.state.clone(), vec![summary.clone()])
+        .unwrap();
+    let mut text = String::new();
+    let mut offset = 0;
+    loop {
+        let page = engine
+            .inspect(&json!({"event_id":id,"offset":offset,"limit":37}))
+            .unwrap();
+        assert_eq!(page["offset"], offset);
+        assert_eq!(page["total_chars"], expected.chars().count());
+        let part = page["text"].as_str().unwrap();
+        text.push_str(part);
+        let Some(next) = page["next_offset"].as_u64() else {
+            break;
+        };
+        assert_eq!(next as usize, offset + part.chars().count());
+        offset = next as usize;
+    }
+    assert_eq!(text, expected);
+    assert!(!text.contains("sealed-opaque"));
+    let original = engine
+        .inspect(&json!({"event_id":id,"raw":true,"limit":1}))
+        .unwrap();
+    assert_eq!(original["text"], "{");
+    assert_eq!(original["raw"], true);
+    assert_eq!(engine.read_event(&id).unwrap(), summary);
+}

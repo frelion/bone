@@ -1,9 +1,4 @@
 //! Local native Rig protocol contracts. These fixtures use only synthetic credentials.
-use std::{
-    io::{BufRead, BufReader},
-    path::Path,
-    process::{Child, Command, Stdio},
-};
 
 use crate::{
     config::{ModelReference, Profile},
@@ -20,16 +15,12 @@ use rig_core::{
 };
 use serde_json::{Value, json};
 
+#[path = "../support/server.rs"]
+mod server;
 struct Fixture {
-    process: Child,
+    _process: server::Server,
     directory: tempfile::TempDir,
     profile: Profile,
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
-    }
 }
 
 fn fixture(turns: Value) -> Fixture {
@@ -40,21 +31,11 @@ fn fixture(turns: Value) -> Fixture {
         serde_json::to_vec(&json!({"turns": turns})).unwrap(),
     )
     .unwrap();
-    let mut process = Command::new("python3")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scripted_responses.py"))
-        .arg("--script")
-        .arg(&script)
-        .arg("--requests")
-        .arg(directory.path().join("requests.jsonl"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(process.stdout.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    let port: u16 = line.trim().parse().expect("local fixture prints its port");
+    let (process, port) = server::Server::script(
+        "tests/scripted_responses.py",
+        &script,
+        &directory.path().join("requests.jsonl"),
+    );
     let native = OpenAIConfig::with_key(&chatgpt::DIALECT, "")
         .with_base_url(format!("http://127.0.0.1:{port}/v1"));
     let profile = Profile {
@@ -70,7 +51,7 @@ fn fixture(turns: Value) -> Fixture {
     std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
     std::fs::write(auth, r#"{"access_token":"bone-synthetic-token","expires_at":4102444800,"account_id":"bone-test-account"}"#).unwrap();
     Fixture {
-        process,
+        _process: process,
         directory,
         profile,
     }

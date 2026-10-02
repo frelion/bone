@@ -90,7 +90,6 @@ pub(super) struct View {
     cursor: usize,
     conversation_scroll: usize,
     conversation_max: usize,
-    conversation_width: usize,
     follow_conversation: bool,
     selected: usize,
     activity_top: usize,
@@ -125,7 +124,7 @@ impl View {
             search_total: 0,
             started: std::time::Instant::now(),
             transcript_cache: Vec::new(),
-            cache_width: 0,
+            cache_width: 80,
             cache_dirty: true,
             messages: Vec::new(),
             activities: Vec::new(),
@@ -137,7 +136,6 @@ impl View {
             cursor: 0,
             conversation_scroll: 0,
             conversation_max: 0,
-            conversation_width: 80,
             follow_conversation: true,
             selected: 0,
             activity_top: 0,
@@ -219,7 +217,7 @@ impl View {
             let old = self.messages.remove(0);
             characters =
                 characters.saturating_sub(old.text.chars().count() + old.role.chars().count());
-            let removed_lines = markdown(&old.text, self.conversation_width).len() + 2;
+            let removed_lines = markdown(&old.text, self.cache_width).len() + 2;
             self.conversation_scroll = self.conversation_scroll.saturating_sub(removed_lines);
             self.conversation_max = self.conversation_max.saturating_sub(removed_lines);
         }
@@ -273,9 +271,6 @@ impl View {
     }
     pub fn cursor(&self) -> usize {
         self.cursor
-    }
-    pub fn insert_at_cursor(&mut self, text: &str) {
-        self.paste(text);
     }
     pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str) {
         if range.start <= range.end
@@ -450,6 +445,14 @@ impl View {
             }
             self.cursor = self.draft.len();
         }
+    }
+    fn line_start(&self) -> usize {
+        self.draft[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
+    }
+    fn line_end(&self) -> usize {
+        self.draft[self.cursor..]
+            .find('\n')
+            .map_or(self.draft.len(), |i| self.cursor + i)
     }
     fn word_left(&self) -> usize {
         let mut start = self.cursor;
@@ -643,17 +646,7 @@ impl View {
             return;
         }
         if self.detail.is_some() {
-            match key.code {
-                KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
-                KeyCode::Down => self.detail_scroll = (self.detail_scroll + 1).min(self.detail_max),
-                KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
-                KeyCode::PageDown => {
-                    self.detail_scroll = (self.detail_scroll + 10).min(self.detail_max)
-                }
-                KeyCode::Home => self.detail_scroll = 0,
-                KeyCode::End => self.detail_scroll = self.detail_max,
-                _ => {}
-            }
+            scroll_key(key.code, &mut self.detail_scroll, self.detail_max, 10);
             return;
         }
         match key.code {
@@ -698,12 +691,10 @@ impl View {
                     }
                 }
                 KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.cursor = self.draft[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
+                    self.cursor = self.line_start()
                 }
                 KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.cursor = self.draft[self.cursor..]
-                        .find('\n')
-                        .map_or(self.draft.len(), |i| self.cursor + i)
+                    self.cursor = self.line_end()
                 }
                 KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.cursor = self.previous()
@@ -712,17 +703,11 @@ impl View {
                     self.cursor = self.next()
                 }
                 KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let start = self.word_left();
-                    self.snapshot();
-                    self.draft.replace_range(start..self.cursor, "");
-                    self.cursor = start;
+                    self.replace_range(self.word_left()..self.cursor, "");
                 }
                 KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let end = self.draft[self.cursor..]
-                        .find('\n')
-                        .map_or(self.draft.len(), |i| self.cursor + i);
-                    self.snapshot();
-                    self.draft.replace_range(self.cursor..end, "");
+                    let end = self.line_end();
+                    self.replace_range(self.cursor..end, "");
                 }
                 KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
                     self.cursor = self.word_left()
@@ -742,10 +727,7 @@ impl View {
                 KeyCode::Up => self.vertical(false),
                 KeyCode::Down => self.vertical(true),
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.snapshot();
-                    let start = self.draft[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
-                    self.draft.replace_range(start..self.cursor, "");
-                    self.cursor = start;
+                    self.replace_range(self.line_start()..self.cursor, "");
                 }
                 KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.paste("\n")
@@ -766,24 +748,13 @@ impl View {
                 }
                 KeyCode::Left => self.cursor = self.previous(),
                 KeyCode::Right => self.cursor = self.next(),
-                KeyCode::Home => {
-                    self.cursor = self.draft[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
-                }
-                KeyCode::End => {
-                    self.cursor = self.draft[self.cursor..]
-                        .find('\n')
-                        .map_or(self.draft.len(), |i| self.cursor + i)
-                }
+                KeyCode::Home => self.cursor = self.line_start(),
+                KeyCode::End => self.cursor = self.line_end(),
                 KeyCode::Backspace => {
-                    self.snapshot();
-                    let start = self.previous();
-                    self.draft.replace_range(start..self.cursor, "");
-                    self.cursor = start;
+                    self.replace_range(self.previous()..self.cursor, "");
                 }
                 KeyCode::Delete => {
-                    self.snapshot();
-                    let end = self.next();
-                    self.draft.replace_range(self.cursor..end, "");
+                    self.replace_range(self.cursor..self.next(), "");
                 }
                 KeyCode::PageUp => {
                     if self.terminal_width < 100 && self.narrow_activity {
@@ -810,42 +781,22 @@ impl View {
                 _ => {}
             },
             Focus::Conversation => {
-                match key.code {
-                    KeyCode::Up => {
-                        self.conversation_scroll = self.conversation_scroll.saturating_sub(1)
-                    }
-                    KeyCode::Down => {
-                        self.conversation_scroll =
-                            (self.conversation_scroll + 1).min(self.conversation_max)
-                    }
-                    KeyCode::PageUp => {
-                        self.conversation_scroll = self.conversation_scroll.saturating_sub(10)
-                    }
-                    KeyCode::PageDown => {
-                        self.conversation_scroll =
-                            (self.conversation_scroll + 10).min(self.conversation_max)
-                    }
-                    KeyCode::Home => self.conversation_scroll = 0,
-                    KeyCode::End => self.conversation_scroll = self.conversation_max,
-                    _ => return,
+                if scroll_key(
+                    key.code,
+                    &mut self.conversation_scroll,
+                    self.conversation_max,
+                    10,
+                ) {
+                    self.follow_conversation = self.conversation_scroll == self.conversation_max;
                 }
-                self.follow_conversation = self.conversation_scroll == self.conversation_max;
             }
             Focus::Activity => {
-                let max = self.activities.len().saturating_sub(1);
-                match key.code {
-                    KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-                    KeyCode::Down => self.selected = (self.selected + 1).min(max),
-                    KeyCode::PageUp => {
-                        self.selected = self.selected.saturating_sub(self.activity_height.max(1))
-                    }
-                    KeyCode::PageDown => {
-                        self.selected = (self.selected + self.activity_height.max(1)).min(max)
-                    }
-                    KeyCode::Home => self.selected = 0,
-                    KeyCode::End => self.selected = max,
-                    _ => {}
-                }
+                scroll_key(
+                    key.code,
+                    &mut self.selected,
+                    self.activities.len().saturating_sub(1),
+                    self.activity_height.max(1),
+                );
             }
         }
     }
@@ -927,8 +878,8 @@ impl View {
                 horizontal: 1,
                 vertical: 0,
             });
-            self.conversation_width = inner.width.max(1) as usize;
-            if self.cache_dirty || self.cache_width != self.conversation_width {
+            let width = inner.width.max(1) as usize;
+            if self.cache_dirty || self.cache_width != width {
                 let mut lines = Vec::new();
                 if self.messages.is_empty() {
                     lines.push(Line::styled(
@@ -949,11 +900,11 @@ impl View {
                             .fg(if tool || streaming { MUTED } else { ACCENT })
                             .add_modifier(Modifier::BOLD),
                     ));
-                    lines.extend(markdown(&message.text, self.conversation_width));
+                    lines.extend(markdown(&message.text, width));
                     lines.push(Line::from(""));
                 }
                 self.transcript_cache = lines;
-                self.cache_width = self.conversation_width;
+                self.cache_width = width;
                 self.cache_dirty = false;
             }
             let mut search_lines = None;
@@ -1126,24 +1077,26 @@ impl View {
                 inner,
             );
         } else if self.show_help {
-            let help = "直接输入任务，Enter 发送。\nShift+Enter / Alt+Enter / Ctrl+J 换行；粘贴多行保持在输入框。\n↑↓ 移动行光标，首尾行召回历史；Alt+←→ 移动单词。\nCtrl+A/E 行首尾；Ctrl+U/K 删除至行首尾；Ctrl+W 删除单词。\nCtrl+Z 撤销 / Alt+Z 重做；Ctrl+F 搜索对话。\nCtrl+P 命令菜单；Ctrl+O / @文件 Tab 引用；Ctrl+G 外部编辑器。\n/sessions 会话；/model 模型；/status 用量与限制。\n/diff 项目修改；/export 导出；/older 更早原文。\nTab 切换焦点；窄屏仅在输入与当前主面板间切换。Esc 返回输入。\n对话：上下 / PageUp / PageDown 滚动，Home / End 到首尾。\n对话展示最近最多 150 条、约 16 万字符；单条预览最多 1.6 万字符。\n界面预览省略的历史和原文保留在会话记录。\n活动展示最近 400 条：上下选择，Enter 浏览原生事件详情。\nF2：宽屏显示或隐藏活动；窄屏切换对话与活动主面板。\nCtrl+C 暂停行动；Ctrl+R 恢复；Ctrl+Q 退出。\n\nF1 或 Esc 关闭帮助。";
-            render_overlay(frame, area, " 帮助 ", help, 0);
-        } else if let Some((title, detail)) = &self.detail {
-            let overlay = overlay_rect(area);
-            let content = markdown(
-                &Self::sanitize(detail),
-                overlay.width.saturating_sub(2).max(1) as usize,
-            );
-            self.detail_max = content
-                .len()
-                .saturating_sub(overlay.height.saturating_sub(2) as usize);
-            self.detail_scroll = self.detail_scroll.min(self.detail_max);
+            let help = "直接输入任务，Enter 发送。\nShift+Enter / Alt+Enter / Ctrl+J 换行；粘贴多行保持在输入框。\n↑↓ 移动行光标，首尾行召回历史；Alt+←→ 移动单词。\nCtrl+A/E 行首尾；Ctrl+U/K 删除至行首尾；Ctrl+W 删除单词。\nCtrl+Z 撤销 / Alt+Z 重做；Ctrl+F 搜索对话。\nCtrl+P 命令菜单；Ctrl+O / @文件 Tab 引用；Ctrl+G 外部编辑器。\nTab 切换焦点；窄屏仅在输入与当前主面板间切换。Esc 返回输入。\n对话：上下 / PageUp / PageDown 滚动，Home / End 到首尾。\n对话展示最近最多 150 条、约 16 万字符；单条预览最多 1.6 万字符。\n界面预览省略的历史和原文保留在会话记录。\n活动展示最近 400 条：上下选择，Enter 浏览原生事件详情。\nF2：宽屏显示或隐藏活动；窄屏切换对话与活动主面板。\nCtrl+C 暂停行动；Ctrl+R 恢复；Ctrl+Q 退出。\n\nF1 或 Esc 关闭帮助。";
+            let commands = super::COMMANDS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(" ");
             render_overlay(
+                frame,
+                area,
+                " 帮助 ",
+                &format!("{help}\n\n{commands}"),
+                &mut 0,
+            );
+        } else if let Some((title, detail)) = &self.detail {
+            self.detail_max = render_overlay(
                 frame,
                 area,
                 &format!(" {} · Esc 关闭 ", Self::sanitize(title)),
                 detail,
-                self.detail_scroll,
+                &mut self.detail_scroll,
             );
         } else {
             self.detail_scroll = 0;
@@ -1248,6 +1201,19 @@ impl View {
     }
 }
 
+fn scroll_key(key: KeyCode, position: &mut usize, max: usize, page: usize) -> bool {
+    *position = match key {
+        KeyCode::Up => position.saturating_sub(1),
+        KeyCode::Down => (*position + 1).min(max),
+        KeyCode::PageUp => position.saturating_sub(page),
+        KeyCode::PageDown => (*position + page).min(max),
+        KeyCode::Home => 0,
+        KeyCode::End => max,
+        _ => return false,
+    };
+    true
+}
+
 fn filtered(picker: &Picker) -> Vec<&PickerItem> {
     let query = picker.query.to_lowercase();
     picker
@@ -1347,7 +1313,13 @@ fn overlay_rect(area: Rect) -> Rect {
     })
 }
 
-fn render_overlay(frame: &mut Frame, area: Rect, title: &str, text: &str, scroll: usize) {
+fn render_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    text: &str,
+    scroll: &mut usize,
+) -> usize {
     let rect = overlay_rect(area);
     frame.render_widget(Clear, rect);
     frame.render_widget(
@@ -1358,15 +1330,19 @@ fn render_overlay(frame: &mut Frame, area: Rect, title: &str, text: &str, scroll
         horizontal: 1,
         vertical: 1,
     });
-    let lines = markdown(&View::sanitize(text), inner.width.max(1) as usize)
+    let content = markdown(&View::sanitize(text), inner.width.max(1) as usize);
+    let max = content.len().saturating_sub(inner.height as usize);
+    *scroll = (*scroll).min(max);
+    let lines = content
         .into_iter()
-        .skip(scroll)
+        .skip(*scroll)
         .take(inner.height as usize)
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(BACKGROUND).fg(TEXT)),
         inner,
     );
+    max
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -1407,478 +1383,5 @@ fn wrap_with_cursor(text: &str, cursor: usize, width: usize) -> (Vec<String>, us
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    #[test]
-    fn render_fixture_snapshots() {
-        let Ok(directory) = std::env::var("BONE_TUI_SNAPSHOT_DIR") else {
-            return;
-        };
-        use ratatui::{Terminal, backend::TestBackend};
-        let directory = std::path::Path::new(&directory);
-        std::fs::create_dir_all(directory).unwrap();
-        fn escape(text: &str) -> String {
-            text.replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('"', "&quot;")
-        }
-        fn color(color: Color, fallback: &str) -> String {
-            match color {
-                Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
-                Color::Cyan | Color::LightCyan => "#78c9d4".into(),
-                Color::Green | Color::LightGreen => "#93c58c".into(),
-                Color::Red | Color::LightRed => "#ed9292".into(),
-                Color::DarkGray => "#9a9da5".into(),
-                Color::Yellow | Color::LightYellow => "#e1c589".into(),
-                _ => fallback.into(),
-            }
-        }
-        for width in [80, 120] {
-            let height = 36;
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            let state = bone::state::SessionState::new("/fixture/BONE");
-            let mut view = View::new();
-            view.session_label = "fixture".into();
-            view.usage = "2 / 24 calls · 1,240 tokens · 可写".into();
-            view.live_status = "工作中 · 12s".into();
-            view.notice = "渲染测试数据 · 非真实模型运行 · Ctrl+P 命令 · Ctrl+O 文件".into();
-            for (role, text, id) in [
-                (
-                    "你",
-                    "给这个 CLI 增加错误恢复，并保留 Unicode 输入 👩‍💻。",
-                    "fixture-user",
-                ),
-                (
-                    "Agent · 进度",
-                    "## 实现计划\n- 检查状态持久化与输入边界\n- 修复失败恢复，并运行回归测试\n\n修改集中在 `src/tui/view.rs`。",
-                    "fixture-plan",
-                ),
-                (
-                    "工具 · read_file",
-                    "完成 · src/tui/view.rs\n读取输入编辑与恢复流程。",
-                    "fixture-tool",
-                ),
-                (
-                    "工具 · apply_patch",
-                    "完成 · 输入恢复\n```diff\n@@ recover_draft\n- draft.clear();\n+ draft = previous.clone();\n```",
-                    "fixture-diff",
-                ),
-                (
-                    "Agent · 输出中（未交付）",
-                    "边界处理已完成，正在验证多行粘贴与组合字符。\n这段是未交付的流式预览。",
-                    "fixture-live",
-                ),
-            ] {
-                view.push_message(Message {
-                    role: role.into(),
-                    text: text.into(),
-                    event_id: Some(id.into()),
-                });
-            }
-            view.paste("补充：失败时保留当前草稿。\n请验证中文、emoji 和多行输入。");
-            terminal
-                .draw(|f| view.render(f, &state, "provider/model", "工作中"))
-                .unwrap();
-            let buffer = terminal.backend().buffer();
-            let mut plain =
-                String::from("BONE TUI render fixture — synthetic data, not a real model run\n");
-            let mut svg = format!(
-                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\"><title>BONE TUI render fixture — synthetic data, not a real model run</title><rect width=\"100%\" height=\"100%\" fill=\"#111318\"/><text x=\"10\" y=\"20\" fill=\"#a0a4ad\" font-size=\"12\" font-family=\"monospace\">Render fixture · synthetic data · {} columns</text><g font-family=\"'SFMono-Regular', 'Noto Sans Mono CJK SC', monospace\" font-size=\"14\">",
-                width * 9 + 20,
-                height * 20 + 40,
-                width * 9 + 20,
-                height * 20 + 40,
-                width
-            );
-            for y in 0..height {
-                let mut skip = 0;
-                for x in 0..width {
-                    let cell = &buffer[(x, y)];
-                    if skip > 0 {
-                        skip -= 1;
-                        continue;
-                    }
-                    let symbol = cell.symbol();
-                    plain.push_str(symbol);
-                    let cells = UnicodeWidthStr::width(symbol).max(1);
-                    skip = cells.saturating_sub(1);
-                    let reversed = cell.modifier.contains(Modifier::REVERSED);
-                    let foreground = color(
-                        if reversed { cell.bg } else { cell.fg },
-                        if reversed { "#111318" } else { "#dcdfe5" },
-                    );
-                    let background = color(
-                        if reversed { cell.fg } else { cell.bg },
-                        if reversed { "#dcdfe5" } else { "#111318" },
-                    );
-                    if background != "#111318" {
-                        svg.push_str(&format!(
-                            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"20\" fill=\"{}\"/>",
-                            x * 9 + 10,
-                            y * 20 + 28,
-                            cells * 9,
-                            background
-                        ));
-                    }
-                    if symbol != " " {
-                        svg.push_str(&format!(
-                            "<text x=\"{}\" y=\"{}\" fill=\"{}\"{}>{}</text>",
-                            x * 9 + 10,
-                            y * 20 + 44,
-                            foreground,
-                            if cell.modifier.contains(Modifier::BOLD) {
-                                " font-weight=\"bold\""
-                            } else {
-                                ""
-                            },
-                            escape(symbol)
-                        ));
-                    }
-                }
-                plain.push('\n');
-            }
-            svg.push_str("</g></svg>");
-            std::fs::write(directory.join(format!("preview-{width}.txt")), plain).unwrap();
-            std::fs::write(directory.join(format!("preview-{width}.svg")), svg).unwrap();
-        }
-    }
-
-    #[test]
-    fn modal_paste_targets_query_and_never_mutates_hidden_draft() {
-        let mut view = View::new();
-        view.paste("草稿");
-        view.start_search("find");
-        view.handle_paste("👩‍💻\n中");
-        assert_eq!(view.search.as_deref(), Some("find👩‍💻 中"));
-        assert_eq!(view.draft, "草稿");
-        view.handle_paste(&"x".repeat(4096));
-        assert_eq!(view.search.as_deref(), Some("find👩‍💻 中"));
-        view.handle_key(key(KeyCode::Esc));
-        view.detail = Some(("详情".into(), "body".into()));
-        view.handle_paste("hidden");
-        assert_eq!(view.draft, "草稿");
-    }
-
-    #[test]
-    fn oversized_paste_preserves_draft_cursor_and_undo() {
-        let mut view = View::new();
-        view.paste("原文👩‍💻");
-        view.handle_key(key(KeyCode::Left));
-        let before = (view.draft.clone(), view.cursor, view.undo.len());
-        view.paste(&"中".repeat(50_000));
-        assert_eq!((view.draft.clone(), view.cursor, view.undo.len()), before);
-        assert!(view.notice.contains("128 KiB"));
-        view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
-        assert!(view.draft.contains('\n'));
-    }
-    #[test]
-    fn stream_updates_cannot_exceed_history_preview_bounds() {
-        let mut view = View::new();
-        for i in 0..20 {
-            view.push_message(Message {
-                role: "AI".into(),
-                text: "small".into(),
-                event_id: Some(i.to_string()),
-            });
-        }
-        for i in 0..20 {
-            view.upsert_message(Message {
-                role: "AI".into(),
-                text: "e\u{301}".repeat(20_000),
-                event_id: Some(i.to_string()),
-            });
-        }
-        assert!(
-            view.messages
-                .iter()
-                .map(|m| m.text.chars().count() + m.role.chars().count())
-                .sum::<usize>()
-                <= 160_000
-        );
-        for message in &view.messages {
-            assert!(message.text.chars().count() <= 16_000);
-            assert!(!message.text.ends_with('e'));
-        }
-        for i in 0..20 {
-            view.remember_prompt(&format!("{i}{}", "中".repeat(30_000)));
-        }
-        assert!(view.history.iter().map(String::len).sum::<usize>() <= 1024 * 1024);
-    }
-
-    #[test]
-    fn picker_filters_selects_and_closes_without_editing_prompt() {
-        let mut view = View::new();
-        view.paste("任务");
-        view.open_picker(
-            PickerKind::Command,
-            vec![
-                PickerItem {
-                    label: "Sessions".into(),
-                    detail: "Resume history".into(),
-                    value: "/resume".into(),
-                },
-                PickerItem {
-                    label: "Model".into(),
-                    detail: String::new(),
-                    value: "/model".into(),
-                },
-            ],
-            "ssn".into(),
-        );
-        assert_eq!(
-            view.picker_value(),
-            Some((PickerKind::Command, "/resume".into()))
-        );
-        view.handle_key(key(KeyCode::Esc));
-        assert!(view.picker.is_none());
-        assert_eq!(view.draft, "任务");
-    }
-    #[test]
-    fn multiline_editor_history_and_undo_preserve_unicode() {
-        let mut view = View::new();
-        view.paste("中文\n👩‍💻a");
-        view.handle_key(key(KeyCode::Up));
-        assert_eq!(view.cursor, "中".len());
-        view.handle_key(key(KeyCode::Down));
-        assert_eq!(view.cursor, "中文\n👩‍💻".len());
-        view.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
-        view.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
-        assert_eq!(view.draft, "中文\n👩‍💻a");
-        view.take_draft();
-        view.remember_prompt("旧任务");
-        view.handle_key(key(KeyCode::Up));
-        assert_eq!(view.draft, "旧任务");
-        view.handle_key(key(KeyCode::Down));
-        assert_eq!(view.draft, "");
-    }
-    #[test]
-    fn markdown_styles_diff_and_bounds_cells() {
-        let lines = markdown("# 标题\n`代码`\n```diff\n+新增\n-删除\n@@ chunk\n```", 8);
-        assert!(lines.iter().any(|l| l.style.fg == Some(Color::Green)
-            || l.spans.iter().any(|s| s.style.fg == Some(Color::Green))));
-        assert!(lines.iter().any(|l| l.style.fg == Some(Color::Red)
-            || l.spans.iter().any(|s| s.style.fg == Some(Color::Red))));
-        for line in lines {
-            assert!(line.width() <= 8);
-        }
-    }
-    #[test]
-    fn transcript_cache_invalidates_and_search_is_explicit() {
-        let state = bone::state::SessionState::new("/tmp/work");
-        use ratatui::{Terminal, backend::TestBackend};
-        let mut view = View::new();
-        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
-        view.upsert_message(Message {
-            role: "AI".into(),
-            text: "needle".into(),
-            event_id: Some("1".into()),
-        });
-        view.start_search("needle");
-        terminal
-            .draw(|f| view.render(f, &state, "m", "idle"))
-            .unwrap();
-        assert!(!view.cache_dirty);
-        assert!(view.search.is_some());
-        view.handle_key(key(KeyCode::Esc));
-        assert!(view.search.is_none());
-        view.remove_message("1");
-        assert!(view.messages.is_empty());
-        assert!(view.cache_dirty);
-    }
-
-    #[test]
-    fn editing_preserves_graphemes_and_wide_characters() {
-        let mut view = View::new();
-        view.paste("中文👩‍💻e\u{301}");
-        view.handle_key(key(KeyCode::Backspace));
-        assert_eq!(view.draft, "中文👩‍💻");
-        view.handle_key(key(KeyCode::Left));
-        view.handle_key(key(KeyCode::Delete));
-        assert_eq!(view.draft, "中文");
-        view.handle_key(key(KeyCode::Left));
-        view.paste("你好");
-        assert_eq!(view.draft, "中你好文");
-    }
-
-    #[test]
-    fn pasted_lines_and_enter_do_not_submit() {
-        let mut view = View::new();
-        view.paste("第一行\r\n第二行\r第三行");
-        view.handle_key(key(KeyCode::Enter));
-        assert_eq!(view.draft, "第一行\n第二行\n第三行");
-        assert_eq!(view.take_draft(), "第一行\n第二行\n第三行");
-        assert!(view.draft.is_empty());
-    }
-
-    #[test]
-    fn strips_terminal_sequences_and_controls() {
-        let safe = View::sanitize("中文\x1b[31m红\x1b[0m\x07\r\x1b]52;c;secret\x07\n\t好\u{85}");
-        assert_eq!(safe, "中文红\n    好");
-        assert!(safe.chars().all(|c| !c.is_control() || c == '\n'));
-    }
-
-    #[test]
-    fn cursor_uses_cells_after_wrapping() {
-        let (lines, row, col) = wrap_with_cursor("中文a", "中文a".len(), 4);
-        assert_eq!(lines, ["中文", "a"]);
-        assert_eq!((row, col), (1, 1));
-        let (_, row, col) = wrap_with_cursor("e\u{301}👩‍💻", "e\u{301}👩‍💻".len(), 8);
-        assert_eq!((row, col), (0, 3));
-    }
-
-    #[test]
-    fn scrolled_markdown_eviction_keeps_the_visible_message() {
-        let mut view = View::new();
-        view.conversation_width = 8;
-        view.push_message(Message {
-            role: "Agent".into(),
-            text: "```text\nabcdefgh\n```".into(),
-            event_id: None,
-        });
-        for index in 1..150 {
-            view.push_message(Message {
-                role: "Agent".into(),
-                text: format!("item {index}"),
-                event_id: None,
-            });
-        }
-        // Two extra lines frame each message. Code indentation wraps its body
-        // onto two lines, so the first message occupies six rendered lines.
-        view.follow_conversation = false;
-        view.conversation_scroll = 9;
-        view.conversation_max = 450;
-        view.push_message(Message {
-            role: "Agent".into(),
-            text: "item 150".into(),
-            event_id: None,
-        });
-        assert_eq!(view.messages[0].text, "item 1");
-        assert_eq!(view.conversation_scroll, 3);
-        assert_eq!(view.conversation_max, 444);
-        assert!(!view.follow_conversation);
-    }
-
-    #[test]
-    fn activity_eviction_retains_selected_event() {
-        let mut view = View::new();
-        for index in 0..400 {
-            view.push_activity(Activity {
-                event_id: index.to_string(),
-                title: "行动".into(),
-                detail: String::new(),
-                tone: Tone::Normal,
-            });
-        }
-        view.selected = 100;
-        view.activity_top = 90;
-        view.push_activity(Activity {
-            event_id: "400".into(),
-            title: "行动".into(),
-            detail: String::new(),
-            tone: Tone::Normal,
-        });
-        assert_eq!(view.activities.len(), 400);
-        assert_eq!(view.selected_event(), Some("100"));
-        assert_eq!(view.activity_top, 89);
-    }
-
-    #[test]
-    fn message_preview_limits_are_unicode_safe_and_bounded() {
-        let mut view = View::new();
-        for index in 0..160 {
-            view.push_message(Message {
-                role: "用户".into(),
-                text: "中文".into(),
-                event_id: Some(index.to_string()),
-            });
-        }
-        assert_eq!(view.messages.len(), 150);
-        assert_eq!(
-            view.messages.first().unwrap().event_id.as_deref(),
-            Some("10")
-        );
-        for _ in 0..12 {
-            view.push_message(Message {
-                role: "AI".into(),
-                text: "\x1b[31m中".repeat(20_000),
-                event_id: None,
-            });
-        }
-        let text = &view.messages.last().unwrap().text;
-        assert_eq!(text.chars().count(), 16_000);
-        assert!(text.ends_with("[界面预览已省略，原文保留在会话记录]"));
-        assert!(
-            view.messages
-                .iter()
-                .map(|m| m.text.chars().count() + m.role.chars().count())
-                .sum::<usize>()
-                <= 160_000
-        );
-    }
-
-    #[test]
-    fn renders_narrow_wide_and_modal_views_without_terminal_controls() {
-        let state = bone::state::SessionState::new("/tmp/中文\x07workspace");
-        use ratatui::{Terminal, backend::TestBackend};
-        for (width, height) in [(120, 30), (80, 20), (8, 6), (4, 3)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            let mut view = View::new();
-            view.paste("中文\n👩‍💻\n第三行");
-            view.push_message(Message {
-                role: "用户".into(),
-                text: "\x1b[31m任务\x07详情".into(),
-                event_id: None,
-            });
-            view.push_activity(Activity {
-                event_id: "event-1".into(),
-                title: "工具完成".into(),
-                detail: "原生事件".into(),
-                tone: Tone::Success,
-            });
-            view.notice = "状态\r\x07正常".into();
-            terminal
-                .draw(|frame| view.render(frame, &state, "model\x1b[0m", "idle\x07"))
-                .unwrap();
-            for cell in terminal.backend().buffer().content() {
-                assert!(cell.symbol().chars().all(|c| !c.is_control()));
-            }
-            if width == 80 {
-                view.handle_key(key(KeyCode::F(2)));
-                view.handle_key(key(KeyCode::Tab));
-                terminal
-                    .draw(|frame| view.render(frame, &state, "model", "idle"))
-                    .unwrap();
-                assert_eq!(view.focus, Focus::Activity);
-                assert_eq!(view.selected_event(), Some("event-1"));
-                let text = terminal
-                    .backend()
-                    .buffer()
-                    .content()
-                    .iter()
-                    .map(|cell| cell.symbol())
-                    .collect::<String>();
-                assert!(text.replace(' ', "").contains("原生事件"));
-                view.handle_key(key(KeyCode::Tab));
-                assert_eq!(view.focus, Focus::Input);
-                view.handle_key(key(KeyCode::F(2)));
-                view.handle_key(key(KeyCode::Tab));
-                assert_eq!(view.focus, Focus::Conversation);
-            }
-            view.show_help = true;
-            terminal
-                .draw(|frame| view.render(frame, &state, "model", "idle"))
-                .unwrap();
-            view.show_help = false;
-            view.detail = Some(("事件".into(), "详情\n".repeat(40)));
-            terminal
-                .draw(|frame| view.render(frame, &state, "model", "idle"))
-                .unwrap();
-        }
-    }
-}
+#[path = "../../tests/unit/tui_view.rs"]
+mod tests;

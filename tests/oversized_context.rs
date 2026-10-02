@@ -1,28 +1,11 @@
 //! A complete native tool batch must remain usable when its results exceed context.
-use std::{
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    time::Duration,
-};
+use std::{path::Path, process::Command, time::Duration};
 
-use bone::{
-    config::{ModelReference, Profile},
-    runtime::{Engine, RunOptions},
-};
-use rig_core::providers::{
-    openai::{OpenAIConfig, Route},
-    registry::{ProviderConfig, ProviderRef},
-};
+use bone::runtime::{Engine, RunOptions};
 use serde_json::{Value, json};
 
-struct LocalServer(Child);
-impl Drop for LocalServer {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+mod support;
+use support::read_requests;
 
 #[tokio::test]
 async fn oversized_parallel_read_results_keep_originals_and_allow_continuation() {
@@ -82,41 +65,17 @@ def substitute(output, body):
 fixture.wire.expand_output = substitute
 fixture.main()
 "#).unwrap();
-    let mut server = LocalServer(
-        Command::new("python3")
-            .arg("-B")
-            .arg(launcher)
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/long_task/server.py"))
-            .arg("--script")
-            .arg(script)
-            .arg("--requests")
-            .arg(&requests)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
-    let mut port = String::new();
-    BufReader::new(server.0.stdout.take().unwrap())
-        .read_line(&mut port)
-        .unwrap();
-    let mut native = OpenAIConfig::new("")
-        .with_base_url(format!("http://127.0.0.1:{}/v1", port.trim()))
-        .with_route(Route::Responses);
-    native.dialect = rig_core::providers::openai::wire::LLAMACPP;
-    native.auth = native.dialect.quirks.auth;
-    let profile = Profile {
-        model: ModelReference::Registry(
-            ProviderRef::configured(ProviderConfig::OpenAi(native), "fixture").unwrap(),
-        ),
-        credential_env: Some(format!(
-            "BONE_OVERSIZED_EMPTY_{}",
-            uuid::Uuid::new_v4().simple()
-        )),
-        reuse_codex_login: false,
-        additional_params: None,
-        max_tokens: None,
-    };
+    let mut command = Command::new("python3");
+    command
+        .arg("-B")
+        .arg(launcher)
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/long_task/server.py"))
+        .arg("--script")
+        .arg(script)
+        .arg("--requests")
+        .arg(&requests);
+    let (_server, port) = support::Server::start(command);
+    let profile = support::local_profile(port);
     let mut engine = Engine::open(
         &data,
         &workspace,
@@ -344,38 +303,13 @@ fixture.main()
     } else {
         command.arg(server_path);
     }
-    let mut server = LocalServer(
-        command
-            .arg("--script")
-            .arg(script)
-            .arg("--requests")
-            .arg(&requests)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
-    let mut port = String::new();
-    BufReader::new(server.0.stdout.take().unwrap())
-        .read_line(&mut port)
-        .unwrap();
-    let mut native = OpenAIConfig::new("")
-        .with_base_url(format!("http://127.0.0.1:{}/v1", port.trim()))
-        .with_route(Route::Responses);
-    native.dialect = rig_core::providers::openai::wire::LLAMACPP;
-    native.auth = native.dialect.quirks.auth;
-    let profile = Profile {
-        model: ModelReference::Registry(
-            ProviderRef::configured(ProviderConfig::OpenAi(native), "fixture").unwrap(),
-        ),
-        credential_env: Some(format!(
-            "BONE_SOURCE_PAGES_EMPTY_{}",
-            uuid::Uuid::new_v4().simple()
-        )),
-        reuse_codex_login: false,
-        additional_params: None,
-        max_tokens: None,
-    };
+    command
+        .arg("--script")
+        .arg(script)
+        .arg("--requests")
+        .arg(&requests);
+    let (_server, port) = support::Server::start(command);
+    let profile = support::local_profile(port);
     let mut engine = Engine::open(
         &root.path().join("data"),
         &workspace,
@@ -644,12 +578,4 @@ fn tool_payload(event: &bone::state::Event) -> Value {
         ToolResultContent::Json { value } => value.clone(),
         _ => panic!("unexpected tool result content"),
     }
-}
-
-fn read_requests(path: &PathBuf) -> Vec<Value> {
-    std::fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
 }

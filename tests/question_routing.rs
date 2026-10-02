@@ -1,15 +1,12 @@
 //! User questions are visible and answerable without choosing an internal job.
 //! Every model request stays on a scripted localhost endpoint with synthetic auth.
 use std::{
-    collections::BTreeMap,
-    io::{BufRead, BufReader, Write},
-    path::{Path, PathBuf},
-    process::{Child, Command, Output, Stdio},
-    time::{Duration, Instant},
+    process::{Command, Output},
+    time::Duration,
 };
 
 use bone::{
-    config::{Config, ModelReference, Profile},
+    config::ModelReference,
     runtime::{Engine, RunOptions},
     state::Event,
 };
@@ -23,82 +20,39 @@ use rig_core::{
 };
 use serde_json::{Value, json};
 
-struct Fixture {
-    _directory: tempfile::TempDir,
-    data: PathBuf,
-    workspace: PathBuf,
-    profile: Profile,
-    server: Child,
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = self.server.kill();
-        let _ = self.server.wait();
+mod support;
+struct Fixture(support::Fixture);
+impl std::ops::Deref for Fixture {
+    type Target = support::Fixture;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
-
 impl Fixture {
     fn new(turns: Value) -> Self {
-        let directory = tempfile::tempdir().unwrap();
-        let data = directory.path().join("data");
-        let workspace = directory.path().join("workspace");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::create_dir_all(&workspace).unwrap();
-        let script = directory.path().join("responses.json");
-        std::fs::write(
-            &script,
-            serde_json::to_vec(&json!({"turns":turns})).unwrap(),
-        )
-        .unwrap();
-        let mut server = Command::new("python3")
-            .arg("-B")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scripted_responses.py"))
-            .arg("--script")
-            .arg(script)
-            .arg("--requests")
-            .arg(directory.path().join("requests.jsonl"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(server.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let port: u16 = line.trim().parse().expect("fixture port");
-        let native = OpenAIConfig::with_key(&chatgpt::DIALECT, "")
-            .with_base_url(format!("http://127.0.0.1:{port}/v1"));
-        let profile = Profile {
-            model: ModelReference::Registry(
-                ProviderRef::configured(ProviderConfig::OpenAi(native), "fixture").unwrap(),
-            ),
-            credential_env: None,
-            reuse_codex_login: false,
-            additional_params: None,
-            max_tokens: None,
+        let mut local = support::Fixture::turns(turns);
+        let ModelReference::Registry(reference) = &local.profile.model else {
+            unreachable!()
         };
-        let auth = data.join("profiles/fixture/auth.json");
+        let ProviderConfig::OpenAi(native) = reference.config("") else {
+            unreachable!()
+        };
+        let native = OpenAIConfig::with_key(&chatgpt::DIALECT, "").with_base_url(native.base_url);
+        local.profile.model = ModelReference::Registry(
+            ProviderRef::configured(ProviderConfig::OpenAi(native), "fixture").unwrap(),
+        );
+        local.profile.credential_env = None;
+        local.profile.additional_params = None;
+        let auth = local.data.join("profiles/fixture/auth.json");
         std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
         std::fs::write(
             auth,
             r#"{"access_token":"question-routing-synthetic-token","expires_at":4102444800}"#,
         )
         .unwrap();
-        let config = Config {
-            default_profile: "fixture".into(),
-            profiles: BTreeMap::from([("fixture".into(), profile.clone())]),
-        };
-        std::fs::write(data.join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
-        Self {
-            _directory: directory,
-            data,
-            workspace,
-            profile,
-            server,
-        }
+        local.save_config();
+        Self(local)
     }
-
     fn engine(&self) -> Engine {
         Engine::open(
             &self.data,
@@ -116,15 +70,8 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_bone"));
-        command
-            .env_remove("BONE_MODEL")
-            .env_remove("CHATGPT_ACCESS_TOKEN")
-            .env_remove("OPENAI_API_KEY")
-            .arg("--data-dir")
-            .arg(&self.data)
-            .arg("--profile")
-            .arg("fixture");
+        let mut command = self.0.command();
+        command.arg("--profile").arg("fixture");
         command
     }
 }
@@ -144,15 +91,8 @@ fn child_question_turns() -> Value {
     ])
 }
 
-async fn drive_until(engine: &mut Engine, mut predicate: impl FnMut(&Engine) -> bool) {
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while !predicate(engine) {
-            engine.step().await.unwrap();
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("scripted question workflow completes within 15 seconds");
+async fn drive_until(engine: &mut Engine, predicate: impl FnMut(&Engine) -> bool) {
+    support::drive_until(engine, Duration::from_secs(15), predicate).await;
 }
 
 fn question(engine: &Engine, input: &str) -> Option<Event> {
@@ -301,30 +241,8 @@ async fn plain_reply_chooses_latest_unanswered_question_and_leaves_the_other_ope
     );
 }
 
-fn bounded_output(mut command: Command, input: Option<&str>) -> Output {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if input.is_some() {
-        command.stdin(Stdio::piped());
-    }
-    let mut child = command.spawn().unwrap();
-    if let Some(input) = input {
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
-    }
-    let started = Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        if started.elapsed() > Duration::from_secs(20) {
-            let _ = child.kill();
-            let output = child.wait_with_output().unwrap();
-            panic!("CLI timed out: {}", String::from_utf8_lossy(&output.stderr));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    child.wait_with_output().unwrap()
+fn bounded_output(command: Command, input: Option<&str>) -> Output {
+    support::output_with_input(command, input, Duration::from_secs(20))
 }
 
 #[test]

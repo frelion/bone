@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -135,6 +135,19 @@ pub fn files(workspace: &Path) -> Result<Vec<String>> {
     files.sort();
     Ok(files)
 }
+async fn read_output(
+    stream: impl tokio::io::AsyncRead + Unpin,
+    limit: usize,
+    error: &str,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    stream
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    ensure!(bytes.len() <= limit, "{error}");
+    Ok(bytes)
+}
 async fn git_output(workspace: &Path, args: &[&str], limit: usize) -> Result<String> {
     let mut command = tokio::process::Command::new("git");
     command
@@ -154,26 +167,14 @@ async fn git_output(workspace: &Path, args: &[&str], limit: usize) -> Result<Str
     let mut child = command.spawn().context("start read-only git inspection")?;
     let stdout = child.stdout.take().context("missing git stdout")?;
     let stderr = child.stderr.take().context("missing git stderr")?;
-    let read = |stream: tokio::process::ChildStdout| async move {
-        let mut bytes = Vec::new();
-        stream
-            .take(limit as u64 + 1)
-            .read_to_end(&mut bytes)
-            .await?;
-        ensure!(
-            bytes.len() <= limit,
+    let (out, err) = tokio::try_join!(
+        read_output(
+            stdout,
+            limit,
             "git output exceeds 2 MiB; narrow the workspace changes"
-        );
-        Ok::<_, anyhow::Error>(bytes)
-    };
-    let out = read(stdout);
-    let err = async move {
-        let mut bytes = Vec::new();
-        stderr.take(8193).read_to_end(&mut bytes).await?;
-        ensure!(bytes.len() <= 8192, "git error output exceeds 8 KiB");
-        Ok::<_, anyhow::Error>(bytes)
-    };
-    let (out, err) = tokio::try_join!(out, err)?;
+        ),
+        read_output(stderr, 8192, "git error output exceeds 8 KiB"),
+    )?;
     let status = child.wait().await?;
     ensure!(
         status.success(),
@@ -233,13 +234,19 @@ fn escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 fn text(value: &Value) -> String {
+    project_text(value, "\n", true)
+}
+pub(super) fn native_text(value: &Value) -> String {
+    project_text(value, "\n\n", false)
+}
+fn project_text(value: &Value, separator: &str, include_json: bool) -> String {
     match value {
         Value::Array(items) => items
             .iter()
-            .map(text)
+            .map(|item| project_text(item, separator, include_json))
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
-            .join("\n"),
+            .join(separator),
         Value::Object(item) => match item.get("type").and_then(Value::as_str) {
             Some("text") => item
                 .get("text")
@@ -247,8 +254,13 @@ fn text(value: &Value) -> String {
                 .unwrap_or_default()
                 .into(),
             Some("reasoning" | "encrypted" | "toolcall") => String::new(),
-            Some("json") => item.get("value").map(Value::to_string).unwrap_or_default(),
-            _ => item.get("content").map(text).unwrap_or_default(),
+            Some("json") if include_json => {
+                item.get("value").map(Value::to_string).unwrap_or_default()
+            }
+            _ => item
+                .get("content")
+                .map(|content| project_text(content, separator, include_json))
+                .unwrap_or_default(),
         },
         _ => String::new(),
     }
@@ -269,78 +281,71 @@ fn preview(mut text: String) -> String {
 }
 pub fn export(data: &Path, session: &str) -> Result<PathBuf> {
     session_path(data, session)?;
+    let mut responses = HashMap::new();
     let mut events = Vec::new();
+    let mut inputs = BTreeSet::new();
     let mut cursor = None;
     let mut source_bytes = 0usize;
+    let mut html = format!(
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>BONE {}</title><style>body{{max-width:960px;margin:40px auto;padding:0 24px;font:16px system-ui;background:#101218;color:#e3e6ed}}article{{padding:16px 0;border-bottom:1px solid #303644}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#9ba6b9}}</style><body><h1>BONE session {}</h1>",
+        escape(session),
+        escape(session)
+    );
     loop {
         let page = bone::history_page(data, session, cursor.as_deref(), 20)?;
         cursor = page.next_cursor;
         for mut event in page.events {
-            // Keep only readable, allowlisted fields while resolving delivery references.
-            // Large tool originals and opaque transport blocks stay in SQLite.
-            let data = &event.data;
-            event.data = match event.kind.as_str() {
-                "input" => {
-                    serde_json::json!({"source":data["source"], "message":[{"type":"text", "text":text(&data["message"])}]})
+            let data = std::mem::take(&mut event.data);
+            let body = match event.kind.as_str() {
+                "input" if data["source"] == "user" => {
+                    inputs.insert(event.id.clone());
+                    text(&data["message"])
                 }
-                "model_message" => {
-                    serde_json::json!({"response":{"choice":[{"type":"text", "text":text(&data["response"]["choice"])}]}})
-                }
-                "delivery" => serde_json::json!({"response_event":data["response_event"]}),
-                "question" => serde_json::json!({"question":data["question"]}),
-                "failure" => serde_json::json!({"error":data["error"]}),
-                "input_paused" => serde_json::json!({"text":data["text"]}),
-                "tool_started" => {
-                    serde_json::json!({"tool_name":data["tool_name"], "effect":data["effect"]})
-                }
-                "tool_result" | "tool_reconciled" => {
-                    serde_json::json!({"message":[{"type":"text", "text":preview(text(&data["message"]))}]})
-                }
+                "model_message" => text(&data["response"]["choice"]),
+                "delivery" => data["response_event"].as_str().unwrap_or_default().into(),
+                "question" => data["question"].as_str().unwrap_or_default().into(),
+                "failure" => data["error"].as_str().unwrap_or_default().into(),
+                "input_paused" => data["text"].as_str().unwrap_or_default().into(),
+                "tool_started" => format!(
+                    "{} ({})",
+                    data["tool_name"].as_str().unwrap_or("tool"),
+                    data["effect"].as_str().unwrap_or("unknown")
+                ),
+                "tool_result" | "tool_reconciled" => preview(text(&data["message"])),
                 _ => continue,
             };
-            source_bytes = source_bytes.saturating_add(serde_json::to_vec(&event)?.len());
+            // Project readable content directly, retaining references until every
+            // record in the session has been indexed. A transaction can append a
+            // delivery before its referenced input or response.
+            source_bytes =
+                source_bytes.saturating_add(body.len() + serde_json::to_vec(&event)?.len());
             ensure!(
                 source_bytes <= 32 * 1024 * 1024,
                 "session export exceeds 32 MiB; original events remain in SQLite"
             );
-            events.push(event);
+            if event.kind == "model_message" {
+                responses.insert(event.id, body);
+                continue;
+            }
+            events.push((event, body));
         }
         if !page.has_more {
             break;
         }
         ensure!(cursor.is_some(), "history cursor did not advance");
     }
-    let by_id: HashMap<_, _> = events.iter().map(|e| (e.id.as_str(), e)).collect();
-    let mut html = format!(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'\"><title>BONE {}</title><style>body{{max-width:960px;margin:40px auto;padding:0 24px;font:16px system-ui;background:#101218;color:#e3e6ed}}article{{padding:16px 0;border-bottom:1px solid #303644}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}small{{color:#9ba6b9}}</style><body><h1>BONE session {}</h1>",
-        escape(session),
-        escape(session)
-    );
-    for event in &events {
-        let user = event.kind == "input" && event.data["source"] == "user";
-        let public = event
-            .reply_to
-            .as_deref()
-            .and_then(|id| by_id.get(id))
-            .is_some_and(|e| e.data["source"] == "user");
-        let body = match event.kind.as_str() {
-            "input" if user => text(&event.data["message"]),
-            "question" => event.data["question"].as_str().unwrap_or_default().into(),
-            "delivery" if public => event.data["response_event"]
-                .as_str()
-                .and_then(|id| by_id.get(id))
-                .map(|e| text(&e.data["response"]["choice"]))
-                .unwrap_or_default(),
-            "failure" if public => event.data["error"].as_str().unwrap_or_default().into(),
-            "input_paused" if public => event.data["text"].as_str().unwrap_or_default().into(),
-            "tool_started" => format!(
-                "{} ({})",
-                event.data["tool_name"].as_str().unwrap_or("tool"),
-                event.data["effect"].as_str().unwrap_or("unknown")
-            ),
-            "tool_result" | "tool_reconciled" => preview(text(&event.data["message"])),
-            _ => continue,
-        };
+    for (event, mut body) in events {
+        if matches!(event.kind.as_str(), "delivery" | "failure" | "input_paused")
+            && !event
+                .reply_to
+                .as_ref()
+                .is_some_and(|id| inputs.contains(id))
+        {
+            continue;
+        }
+        if event.kind == "delivery" {
+            body = responses.get(&body).cloned().unwrap_or_default();
+        }
         html.push_str(&format!("<article><h2>{}</h2><small>event {} · job {} · call {} · root input {} · timestamp {}</small><pre>{}</pre></article>", escape(&event.kind), escape(&event.id), escape(event.job_id.as_deref().unwrap_or("—")), escape(event.call_id.as_deref().unwrap_or("—")), escape(event.root_input.as_deref().unwrap_or("—")), escape(&event.timestamp), escape(&body)));
         ensure!(
             html.len() <= 32 * 1024 * 1024,
@@ -361,109 +366,5 @@ pub fn export(data: &Path, session: &str) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn drafts_roundtrip_and_reject_corruption_and_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load(dir.path(), "session").unwrap().draft, "");
-        let saved = UiSaved {
-            draft: "中文 draft".into(),
-            history: vec!["one".into()],
-        };
-        save(dir.path(), "session", &saved).unwrap();
-        assert_eq!(load(dir.path(), "session").unwrap().history, saved.history);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(session_path(dir.path(), "session").unwrap())
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-        fs::write(session_path(dir.path(), "session").unwrap(), "broken").unwrap();
-        assert!(load(dir.path(), "session").is_err());
-        assert!(save(dir.path(), "../escape", &saved).is_err());
-        assert!(
-            save(
-                dir.path(),
-                "session",
-                &UiSaved {
-                    draft: "a".repeat(DRAFT_LIMIT + 1),
-                    history: vec![]
-                }
-            )
-            .is_err()
-        );
-    }
-    #[test]
-    fn html_and_opaque_content_are_safe() {
-        assert_eq!(
-            escape("</script><>&\"'"),
-            "&lt;/script&gt;&lt;&gt;&amp;&quot;&#39;"
-        );
-        assert_eq!(
-            text(
-                &serde_json::json!([{"type":"reasoning","text":"secret"},{"type":"text","text":"visible"}])
-            ),
-            "visible"
-        );
-    }
-    #[tokio::test]
-    async fn git_inspection_reports_untracked_paths_and_non_repositories() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(git_diff(dir.path()).await.is_err());
-        let status = std::process::Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
-        fs::write(dir.path().join("untracked.txt"), "unchanged by inspection").unwrap();
-        let output = git_diff(dir.path()).await.unwrap();
-        assert!(output.contains("?? untracked.txt"));
-        assert_eq!(
-            fs::read_to_string(dir.path().join("untracked.txt")).unwrap(),
-            "unchanged by inspection"
-        );
-    }
-    #[tokio::test]
-    async fn export_reads_durable_conversation_and_escapes_script_markup() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("data");
-        let profile = bone::config::Profile::from_model("openai:gpt-4o-mini").unwrap();
-        let mut engine = bone::runtime::Engine::open(
-            &data,
-            dir.path(),
-            None,
-            profile,
-            "test".into(),
-            Default::default(),
-        )
-        .unwrap();
-        engine
-            .post("hello </script><script>alert(1)</script>", None)
-            .unwrap();
-        let path = export(&data, &engine.state().id).unwrap();
-        let html = fs::read_to_string(path).unwrap();
-        assert!(html.contains("hello &lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
-        assert!(!html.contains("<script>"));
-        assert!(html.contains("root input"));
-        assert!(preview("中".repeat(50_000)).ends_with("complete original remains in SQLite.]"));
-    }
-    #[test]
-    fn file_index_ignores_generated_hidden_and_symlinks() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("main.rs"), "").unwrap();
-        fs::create_dir(dir.path().join("target")).unwrap();
-        fs::write(dir.path().join("target/generated.rs"), "").unwrap();
-        fs::write(dir.path().join(".hidden"), "").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
-        assert_eq!(files(dir.path()).unwrap(), vec!["main.rs"]);
-    }
-}
+#[path = "../../tests/unit/tui_services.rs"]
+mod tests;
