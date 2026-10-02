@@ -1,0 +1,56 @@
+{
+  "recorded_at": "2026-10-02T10:33:25.195881+00:00",
+  "branch": "codex/tui-workflow",
+  "base_commit": "a0e88f1a53f09426f90ca35b35bdcc8ba224820e",
+  "source_sha256": "1b6022f9475de83b4d37155741ba34039ffdcd1be15acd46023ed2f7cc4a318f",
+  "source_hash_scope": "sorted Cargo.toml, Cargo.lock and src/tests .rs/.py; path + NUL + bytes + NUL",
+  "debug_binary_sha256": "2ecd69d3717e865ba303e30c6834d3f3a99ca6023d3c0ba96ba9cfcb5f7adcac",
+  "installed_version": "bone 0.7.0",
+  "installed_entry": "/opt/homebrew/bin/bone",
+  "installed_target": "/Users/zzhang/.cargo/bin/bone",
+  "installed_binary_sha256": "e2fc28e5688a97e9cf28c6a27c8deeb838c06d25b03cb4e0d7722b6a4fdcc608",
+  "rust_tests": 205,
+  "ignored": 1,
+  "python_tests": 8,
+  "commands": [
+    {
+      "command": "cargo test --locked",
+      "exit_code": 0,
+      "passed": 205,
+      "ignored": 1,
+      "scope": "Final source; core, integration, provider contracts, CLI/TUI and docs",
+      "log": "rust-tests.txt"
+    },
+    {
+      "command": "cargo test --locked --bin bone",
+      "exit_code": 0,
+      "passed": 61,
+      "scope": "Final TUI, CLI, UI services source including terminal diff border regression"
+    },
+    {
+      "command": "cargo fmt -- --check",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo clippy --locked --all-targets --all-features -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo build --locked",
+      "exit_code": 0
+    },
+    {
+      "command": "python3 -B -m unittest discover -s tests -p test_*.py",
+      "exit_code": 0,
+      "passed": 8
+    },
+    {
+      "command": "cargo install --path . --locked --offline --force",
+      "exit_code": 0
+    }
+  ],
+  "scope": "TUI interaction design and existing Session/Job invariants. Real model quality reported separately, costs unknown.",
+  "pty_cases": 52,
+  "pty_passed": 52,
+  "real_installed_model_task": "PASS"
+}

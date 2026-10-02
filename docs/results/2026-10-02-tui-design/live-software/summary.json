@@ -1,0 +1,54 @@
+{
+  "status": "PASS",
+  "error": null,
+  "scope": "Production TUI, real gpt-6-luna subscription calls, reused existing Codex login; isolated Python repo",
+  "binary_sha256": "e2fc28e5688a97e9cf28c6a27c8deeb838c06d25b03cb4e0d7722b6a4fdcc608",
+  "workspace": "/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-design-live-sq33xzjg/workspace",
+  "checks": {
+    "source_unchanged_before_answer": true,
+    "tests_unchanged": true,
+    "independent_tests_pass": true,
+    "tools_have_job": true,
+    "explicit_reply_link": true,
+    "modified_source_only": true,
+    "terminal_restored": true
+  },
+  "timeline": [
+    {
+      "stage": "01 新版生产 TUI / 80×24",
+      "elapsed_seconds": 0.2
+    },
+    {
+      "stage": "02 Agent 真实检查正在执行",
+      "elapsed_seconds": 5.31
+    },
+    {
+      "stage": "03 插话已纳入 / 问题到达 / 草稿仍默认新要求",
+      "elapsed_seconds": 20.07
+    },
+    {
+      "stage": "04 显式选择回复目标",
+      "elapsed_seconds": 20.48
+    },
+    {
+      "stage": "05 修复交付 / 检查与文件证据",
+      "elapsed_seconds": 52.34
+    },
+    {
+      "stage": "06 一次命令直达完整交付",
+      "elapsed_seconds": 52.86
+    },
+    {
+      "stage": "07 同一交付 / 120×40",
+      "elapsed_seconds": 53.33
+    },
+    {
+      "stage": "08 返回原对话阅读位置",
+      "elapsed_seconds": 53.66
+    }
+  ],
+  "model_calls": 8,
+  "tool_calls": 5,
+  "frames": 9,
+  "cost": null
+}

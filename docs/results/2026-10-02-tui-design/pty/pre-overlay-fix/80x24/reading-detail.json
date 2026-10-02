@@ -1,0 +1,122 @@
+{
+  "scenario": "reading-detail",
+  "scope": "Real PTY; synthetic protocol fixture, no real model or personal credentials",
+  "status": "PASS",
+  "error": null,
+  "binary": "/Users/zzhang/Documents/ChatGPT/BONE/target/debug/bone",
+  "binary_sha256_at_start": "84866e5a3b71e5fa0a9646627e2237ea3a4a7bfa17715f58ffe7b3be2ec4ffa8",
+  "frames": [
+    {
+      "step": "Start: idle terminal",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n 描述任务，BONE 会在当前工作区执行。                                            \n / 命令   @ 文件   Ctrl+F 搜索   F1 帮助                                        \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：暂无活动调用 · 输入 / 或 @ 显示候选 · Tab 补全 · Enter 发送 · F1 帮助    \n 输入目标：新要求 · Enter 发送                                                  \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 0,
+      "events": 0,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        23,
+        15
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Engineering transcript shows a collapsed tool alongside answer",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 18d431a9                                                       \n Review implementation.txt and report.                                          \n                                                                                \n   工具 · read_file · implementation.txt · 返回 5414 字节 · 43a8eb80            \n   Agent                                                                        \n REVIEW_COMPLETE                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：输入 18d431a9 已交付 · /delivery 查看                                    \n 输入目标：新要求 · Enter 发送                                                  \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 2,
+      "events": 9,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        19,
+        59
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Selected tool opens complete readable output",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 18d431a9                                                       \n Revie┌ 结果原文 · c7606306 · D 审计 · Ctrl+P /audit 审计 · Esc 返回 ────┐      \n      │TOOL_BEGIN                                                        │      \n › 工具engineering line 0: original implementation evidence              │      \n   Age│engineering line 1: original implementation evidence              │      \n REVIE│engineering line 2: original implementation evidence              │      \n      │engineering line 3: original implementation evidence              │      \n      │engineering line 4: original implementation evidence              │      \n      │engineering line 5: original implementation evidence              │      \n      │engineering line 6: original implementation evidence              │      \n      │engineering line 7: original implementation evidence              │      \n      │engineering line 8: original implementation evidence              │      \n      │engineering line 9: original implementation evidence              │      \n      │engineering line 10: original implementation evidence             │      \n      │engineering line 11: original implementation evidence             │      \n      │engineering line 12: original implementation evidence             │      \n──────│engineering line 13: original implementation evidence             │──────\n 当前：engineering line 14: original implementation evidence             │      \n 输入目──────────────────────────────────────────────────────────────────┘      \n│ 描述任务，或输入 / 命令、@ 文件                                               \n 阅读：↑↓ 选择 · Enter 展开 · d 原文 · y 复制 · F6 输入 · F2 审计               \n 阅读：第 1 行 · 0 次新内容更新 · End 到最新                                    ",
+      "requests": 2,
+      "events": 9,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        20,
+        74
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Selected tool audit displays the durable event and its metadata",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 18d431a9                                                       \n Revie┌ 审计原文 · c7606306 · Ctrl+P /audit 审计 · Esc 返回 ─────────────┐      \n      │event: c7606306-05e0-436b-ace2-72dd34bd1489                       │      \n › 工具kind: tool_result                                                 │      \n   Age│job: e501e8f8-5180-44f7-97af-fcfd13bddcb2                         │      \n REVIE│call: 43a8eb80-b018-44eb-9476-a460e0ddafe9                        │      \n      │reply_to: 18d431a9-b5a5-4f2c-8b72-a41c38278be2                    │      \n      │root_input: 18d431a9-b5a5-4f2c-8b72-a41c38278be2                  │      \n      │revision: 1                                                       │      \n      │timestamp (Unix ms): 1790936693773                                │      \n      │                                                                  │      \n      │持久事件原文                                                      │      \n      │{                                                                 │      \n      │  \"message\": {                                                    │      \n      │    \"content\": [                                                  │      \n      │      {                                                           │      \n──────│        \"call\": {                                                 │──────\n 当前：          \"provider\": {                                           │      \n 输入目──────────────────────────────────────────────────────────────────┘      \n│ 描述任务，或输入 / 命令、@ 文件                                               \n 阅读：↑↓ 选择 · Enter 展开 · d 原文 · y 复制 · F6 输入 · F2 审计               \n 阅读：第 1 行 · 0 次新内容更新 · End 到最新                                    ",
+      "requests": 2,
+      "events": 9,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        19,
+        60
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Full selected tool copied through fixture clipboard; no model request",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 18d431a9                                                       \n Revie┌ 审计原文 · c7606306 · Ctrl+P /audit 审计 · Esc 返回 ─────────────┐      \n      │event: c7606306-05e0-436b-ace2-72dd34bd1489                       │      \n › 工具kind: tool_result                                                 │      \n   Age│job: e501e8f8-5180-44f7-97af-fcfd13bddcb2                         │      \n REVIE│call: 43a8eb80-b018-44eb-9476-a460e0ddafe9                        │      \n      │reply_to: 18d431a9-b5a5-4f2c-8b72-a41c38278be2                    │      \n      │root_input: 18d431a9-b5a5-4f2c-8b72-a41c38278be2                  │      \n      │revision: 1                                                       │      \n      │timestamp (Unix ms): 1790936693773                                │      \n      │                                                                  │      \n      │持久事件原文                                                      │      \n      │{                                                                 │      \n      │  \"message\": {                                                    │      \n      │    \"content\": [                                                  │      \n      │      {                                                           │      \n──────│        \"call\": {                                                 │──────\n 当前：          \"provider\": {                                           │306完 \n 输入目──────────────────────────────────────────────────────────────────┘      \n│ 描述任务，或输入 / 命令、@ 文件                                               \n 阅读：↑↓ 选择 · Enter 展开 · d 原文 · y 复制 · F6 输入 · F2 审计               \n 阅读：第 1 行 · 0 次新内容更新 · End 到最新                                    ",
+      "requests": 2,
+      "events": 9,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        19,
+        79
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Esc from audit restores the readable result",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 18d431a9                                                       \n Revie┌ 结果原文 · c7606306 · D 审计 · Ctrl+P /audit 审计 · Esc 返回 ────┐      \n      │TOOL_BEGIN                                                        │      \n › 工具engineering line 0: original implementation evidence              │      \n   Age│engineering line 1: original implementation evidence              │      \n REVIE│engineering line 2: original implementation evidence              │      \n      │engineering line 3: original implementation evidence              │      \n      │engineering line 4: original implementation evidence              │      \n      │engineering line 5: original implementation evidence              │      \n      │engineering line 6: original implementation evidence              │      \n      │engineering line 7: original implementation evidence              │      \n      │engineering line 8: original implementation evidence              │      \n      │engineering line 9: original implementation evidence              │      \n      │engineering line 10: original implementation evidence             │      \n      │engineering line 11: original implementation evidence             │      \n      │engineering line 12: original implementation evidence             │      \n──────│engineering line 13: original implementation evidence             │──────\n 当前：engineering line 14: original implementation evidence             │306完 \n 输入目──────────────────────────────────────────────────────────────────┘      \n│ 描述任务，或输入 / 命令、@ 文件                                               \n 阅读：↑↓ 选择 · Enter 展开 · d 原文 · y 复制 · F6 输入 · F2 审计               \n 阅读：第 1 行 · 0 次新内容更新 · End 到最新                                    ",
+      "requests": 2,
+      "events": 9,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        19,
+        60
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Before exit: live alternate screen",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 18d431a9                                                       \n Review implementation.txt and report.                                          \n                                                                                \n › 工具 · read_file · implementation.txt · 返回 5414 字节 · 43a8eb80            \n   Agent                                                                        \n REVIEW_COMPLETE                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：输入 18d431a9 已交付 · /delivery 查看 · 已复制tool_result c7606306完整文 \n 输入目标：新要求 · Enter 发送                                                  \n│ 描述任务，或输入 / 命令、@ 文件                                               \n 阅读：↑↓ 选择 · Enter 展开 · d 原文 · y 复制 · F6 输入 · F2 审计               \n 阅读：第 1 行 · 0 次新内容更新 · End 到最新                                    ",
+      "requests": 2,
+      "events": 9,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        19,
+        79
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    }
+  ]
+}

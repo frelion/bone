@@ -1,0 +1,154 @@
+{
+  "scenario": "shell-live",
+  "scope": "Real PTY; synthetic protocol fixture, no real model or personal credentials",
+  "status": "PASS",
+  "error": null,
+  "binary": "/Users/zzhang/Documents/ChatGPT/BONE/target/debug/bone",
+  "binary_sha256_at_start": "2ecd69d3717e865ba303e30c6834d3f3a99ca6023d3c0ba96ba9cfcb5f7adcac",
+  "frames": [
+    {
+      "step": "Start: idle terminal",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n 描述任务，BONE 会在当前工作区执行。                                            \n / 命令   @ 文件   Ctrl+F 搜索   F1 帮助                                        \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：暂无活动调用 · 输入 / 或 @ 显示候选 · Tab 补全 · Enter 发送 · F1 帮助    \n 输入目标：新要求 · Enter 发送                                                  \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 0,
+      "events": 0,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        23,
+        15
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Real shell still running; stdout and stderr visible",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 803e314d                                                       \n Inspect module.py and run its checks; keep terminal responsive.                \n                                                                                \n   工具 · read_file · module.py · 返回 24 字节 · 4b0b19c8                       \n   工具 · shell · 执行中 · 实时日志（尾部预览，最终记录保留原文）               \n stdout: LIVE_STDOUT_READY                                                      \n stderr: LIVE_STDERR_READY                                                      \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：工作中 · 1 项正在执行 · 0s · 输入 803e314d 已纳入执行                    \n 输入目标：新要求 · Enter 发送                                                  \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 2,
+      "events": 9,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        8,
+        26
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Running evidence contains only the original action, before a final result exists",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 803e314d                                                       \n┌ 行动原文 · 77d475c5 · /audit 审计 · Ctrl+P /audit 审计 · Esc 返回 ───────────┐\n│此记录没有正文；/audit 查看持久事件与审计元信息                               │\n│                                                                              │\n│原生工具参数                                                                  │\n│{                                                                             │\n│  \"command\": \"printf \\\"LIVE_STDOUT_READY\\\\n\\\"; printf \\\"LIVE_STDERR_READY\\\\n\\\"│\n│ >&2; while [ ! -e release-shell ]; do sleep 0.05; done; touch shell-finished\"│\n│,                                                                             │\n│  \"timeout_seconds\": 15                                                       │\n│}                                                                             │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n└──────────────────────────────────────────────────────────────────────────────┘\n│Preserve this follow-up draft                                                  \n 阅读：↑↓ 选择 · Enter 展开 · d 原文 · y 复制 · F6 输入 · F2 审计               \n 阅读：最新内容                                                                 ",
+      "requests": 2,
+      "events": 9,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        23,
+        27
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Paused real shell; unknown write retained",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 803e314d                                                       \n Inspect module.py and run its checks; keep terminal responsive.                \n                                                                                \n   工具 · read_file · module.py · 返回 24 字节 · 4b0b19c8                       \n   工具 · shell · 结果未知 · 需核查 /reconcile · printf \"LIVE_STDOUT_READY\\n\";… \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：需核查 1 项写入 · /reconcile · 工作已暂停；Ctrl+R 恢复，Ctrl+Q 退出      \n 输入目标：新要求 · Enter 发送                                                  \n│Preserve this follow-up draft                                                  \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 2,
+      "events": 12,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        19,
+        74
+      ],
+      "paused": true,
+      "unknown_writes": 1
+    },
+    {
+      "step": "Reconciliation evidence reads the actual interrupted command",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 803e314d                                                       \n┌ 核查证据 · e2113ca0 · Ctrl+P /audit 审计 · Esc 返回 ─────────────────────────┐\n│调用 e2113ca0-caa1-41c1-9266-f2496ceadd24                                     │\n│实际效果未确认；检查文件、Git diff、进程或工具实际结果后，在核查表单记录观察。│\n│                                                                              │\n│                                                                              │\n│{\"effect\":\"unknown\",\"instruction\":\"Inspect the current state. Further writes a│\n│re blocked until the user records reconciliation; never repeat this operation │\n│automatically.\"}                                                              │\n│                                                                              │\n│原生工具参数                                                                  │\n│{                                                                             │\n│  \"command\": \"printf \\\"LIVE_STDOUT_READY\\\\n\\\"; printf \\\"LIVE_STDERR_READY\\\\n\\\"│\n│ >&2; while [ ! -e release-shell ]; do sleep 0.05; done; touch shell-finished\"│\n│,                                                                             │\n│  \"timeout_seconds\": 15                                                       │\n│}                                                                             │\n│                                                                              │\n└──────────────────────────────────────────────────────────────────────────────┘\n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 2,
+      "events": 12,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        21,
+        2
+      ],
+      "paused": true,
+      "unknown_writes": 1
+    },
+    {
+      "step": "Cancel restores original multiline draft, target and insertion cursor",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 803e314d                                                       \n Inspect module.py and run its checks; keep terminal responsive.                \n                                                                                \n   工具 · read_file · module.py · 返回 24 字节 · 4b0b19c8                       \n   工具 · shell · 结果未知 · 需核查 /reconcile · printf \"LIVE_STDOUT_READY\\n\";… \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：需核查 1 项写入 · /reconcile · 已取消核查；原草稿、目标与阅读位置已恢复，\n 输入目标：新要求 · Enter 发送                                                  \n│KEEP_!FIRST_LINE                                                               \n│KEEP_SECOND_LINE                                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 2,
+      "events": 12,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        20,
+        17
+      ],
+      "paused": true,
+      "unknown_writes": 1
+    },
+    {
+      "step": "Reconciliation evidence reads the actual interrupted command",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 803e314d                                                       \n┌ 核查证据 · e2113ca0 · Ctrl+P /audit 审计 · Esc 返回 ─────────────────────────┐\n│调用 e2113ca0-caa1-41c1-9266-f2496ceadd24                                     │\n│实际效果未确认；检查文件、Git diff、进程或工具实际结果后，在核查表单记录观察。│\n│                                                                              │\n│                                                                              │\n│{\"effect\":\"unknown\",\"instruction\":\"Inspect the current state. Further writes a│\n│re blocked until the user records reconciliation; never repeat this operation │\n│automatically.\"}                                                              │\n│                                                                              │\n│原生工具参数                                                                  │\n│{                                                                             │\n│  \"command\": \"printf \\\"LIVE_STDOUT_READY\\\\n\\\"; printf \\\"LIVE_STDERR_READY\\\\n\\\"│\n│ >&2; while [ ! -e release-shell ]; do sleep 0.05; done; touch shell-finished\"│\n│,                                                                             │\n│  \"timeout_seconds\": 15                                                       │\n│}                                                                             │\n│                                                                              │\n└──────────────────────────────────────────────────────────────────────────────┘\n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 2,
+      "events": 12,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        21,
+        2
+      ],
+      "paused": true,
+      "unknown_writes": 1
+    },
+    {
+      "step": "Recorded observation clears unknown write and keeps session paused",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 803e314d                                                       \n Inspect module.py and run its checks; keep terminal responsive.                \n                                                                                \n   工具 · read_file · module.py · 返回 24 字节 · 4b0b19c8                       \n   工具 · shell · 结果未知 · 需核查 /reconcile · printf \"LIVE_STDOUT_READY\\n\";… \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：已暂停 · Ctrl+R 恢复 · 已记录核查结果；执行仍暂停，Ctrl+R 显式恢复       \n 输入目标：新要求 · Enter 发送                                                  \n│KEEP_!FIRST_LINE                                                               \n│KEEP_SECOND_LINE                                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 2,
+      "events": 13,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        21,
+        62
+      ],
+      "paused": true,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Before exit: live alternate screen",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 803e314d                                                       \n Inspect module.py and run its checks; keep terminal responsive.                \n                                                                                \n   工具 · read_file · module.py · 返回 24 字节 · 4b0b19c8                       \n   工具 · shell · 结果未知 · 需核查 /reconcile · printf \"LIVE_STDOUT_READY\\n\";… \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：已暂停 · Ctrl+R 恢复 · 已记录核查结果；执行仍暂停，Ctrl+R 显式恢复       \n 输入目标：新要求 · Enter 发送                                                  \n│KEEP_!FIRST_LINE                                                               \n│KEEP_SECOND_LINE                                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 2,
+      "events": 13,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        21,
+        62
+      ],
+      "paused": true,
+      "unknown_writes": 0
+    }
+  ]
+}

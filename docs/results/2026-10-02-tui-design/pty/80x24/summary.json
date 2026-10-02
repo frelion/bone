@@ -1,0 +1,110 @@
+{
+  "size": "80x24",
+  "binary": "/Users/zzhang/Documents/ChatGPT/BONE/target/debug/bone",
+  "results": [
+    {
+      "scenario": "slash-inline",
+      "status": "PASS"
+    },
+    {
+      "scenario": "multiline-undo",
+      "status": "PASS"
+    },
+    {
+      "scenario": "shell-live",
+      "status": "PASS"
+    },
+    {
+      "scenario": "exit-resume",
+      "status": "PASS"
+    },
+    {
+      "scenario": "reading-detail",
+      "status": "PASS"
+    },
+    {
+      "scenario": "persistent-search",
+      "status": "PASS"
+    },
+    {
+      "scenario": "question-target",
+      "status": "PASS"
+    },
+    {
+      "scenario": "question-independent",
+      "status": "PASS"
+    },
+    {
+      "scenario": "reader-delivery",
+      "status": "PASS"
+    },
+    {
+      "scenario": "tool-density",
+      "status": "PASS"
+    },
+    {
+      "scenario": "reconcile-reply",
+      "status": "PASS"
+    },
+    {
+      "scenario": "paste",
+      "status": "PASS"
+    },
+    {
+      "scenario": "concurrent",
+      "status": "PASS"
+    },
+    {
+      "scenario": "pause",
+      "status": "PASS"
+    },
+    {
+      "scenario": "question",
+      "status": "PASS"
+    },
+    {
+      "scenario": "failure",
+      "status": "PASS"
+    },
+    {
+      "scenario": "stream",
+      "status": "PASS"
+    },
+    {
+      "scenario": "stale",
+      "status": "PASS"
+    },
+    {
+      "scenario": "stream-stop",
+      "status": "PASS"
+    },
+    {
+      "scenario": "commands",
+      "status": "PASS"
+    },
+    {
+      "scenario": "completion",
+      "status": "PASS"
+    },
+    {
+      "scenario": "sessions",
+      "status": "PASS"
+    },
+    {
+      "scenario": "signal",
+      "status": "PASS"
+    },
+    {
+      "scenario": "interactive-editor",
+      "status": "PASS"
+    },
+    {
+      "scenario": "editor-signal",
+      "status": "PASS"
+    },
+    {
+      "scenario": "unicode",
+      "status": "PASS"
+    }
+  ]
+}

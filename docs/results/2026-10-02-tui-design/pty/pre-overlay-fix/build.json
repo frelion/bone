@@ -1,0 +1,26 @@
+{
+  "started_at": "2026-10-02T10:24:40.673837+00:00",
+  "binary": "/Users/zzhang/Documents/ChatGPT/BONE/target/debug/bone",
+  "binary_version": "bone 0.7.0",
+  "binary_sha256": "84866e5a3b71e5fa0a9646627e2237ea3a4a7bfa17715f58ffe7b3be2ec4ffa8",
+  "git_head": "a0e88f1a53f09426f90ca35b35bdcc8ba224820e",
+  "source_fingerprint_sha256": "f0c8360b749048412608116e99eb8d7b09fdff15cc5d40e4f50f141627eae2e0",
+  "source_scope": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "src/config.rs",
+    "src/context.rs",
+    "src/lib.rs",
+    "src/main.rs",
+    "src/model.rs",
+    "src/runtime.rs",
+    "src/state.rs",
+    "src/store.rs",
+    "src/tools.rs",
+    "src/tui/services.rs",
+    "src/tui/view.rs",
+    "src/tui.rs"
+  ],
+  "harness_sha256": "6f6d2ca1fdc6f8f023113720fc40c0d554cc4511627a54a2b82da788590424ef",
+  "scope": "Real PTY, scripted loopback model, synthetic credentials, isolated temporary workspace/data"
+}

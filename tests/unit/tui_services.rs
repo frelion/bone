@@ -130,6 +130,33 @@ async fn export_reads_durable_conversation_and_escapes_script_markup() {
             .unwrap();
     }
     transaction.commit().unwrap();
+    let delivered = latest_delivery(&data, &engine.state().id).unwrap().unwrap();
+    for _ in 0..300 {
+        let event = bone::state::Event::new(
+            &engine.state().id,
+            "audit_marker",
+            serde_json::json!({"note":"delivery is outside the UI window"}),
+        );
+        connection
+            .execute(
+                "INSERT INTO events (id,session_id,revision,payload) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![
+                    event.id,
+                    event.session_id,
+                    0,
+                    serde_json::to_string(&event).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        latest_delivery(&data, &engine.state().id)
+            .unwrap()
+            .unwrap()
+            .id,
+        delivered.id,
+    );
+    assert!(latest_delivery(&data, "another-session").unwrap().is_none());
     let path = export(&data, &engine.state().id).unwrap();
     let html = fs::read_to_string(path).unwrap();
     assert!(html.contains("hello &lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));

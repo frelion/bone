@@ -1,0 +1,146 @@
+[
+  {
+    "step": "01 新版生产 TUI / 80×24",
+    "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n 描述任务，BONE 会在当前工作区执行。                                            \n / 命令   @ 文件   Ctrl+F 搜索   F1 帮助                                        \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：暂无活动调用 · 输入 / 或 @ 显示候选 · Tab 补全 · Enter 发送 · F1 帮助    \n 输入目标：新要求 · Enter 发送                                                  \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+    "requests": 0,
+    "events": 0,
+    "size": [
+      24,
+      80
+    ],
+    "cursor": [
+      23,
+      15
+    ],
+    "paused": false,
+    "unknown_writes": 0
+  },
+  {
+    "step": "02 Agent 真实检查正在执行",
+    "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 9c06add0                                                       \n 修复过期 token 被接受的问题。先运行 python3 -B -m unittest -v 确认失败，再定位 \n 源码。保留 authorize(token, now) API，不修改测试，不提交 Git。                 \n                                                                                \n   工具 · list_files · 返回 4 项 · 7aa70d3f                                     \n   工具 · shell · 执行中 · 实时日志（尾部预览，最终记录保留原文）               \n stdout: AUTH_CHECK_RUNNING                                                     \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：工作中 · 1 项正在执行 · 5s · 输入 9c06add0 已纳入执行                    \n 输入目标：新要求 · Enter 发送                                                  \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+    "requests": 2,
+    "events": 9,
+    "size": [
+      24,
+      80
+    ],
+    "cursor": [
+      19,
+      32
+    ],
+    "paused": false,
+    "unknown_writes": 0
+  },
+  {
+    "step": "03 插话已纳入 / 问题到达 / 草稿仍默认新要求",
+    "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 9c06add0                                                       \n 修复过期 token 被接受的问题。先运行 python3 -B -m unittest -v 确认失败，再定位 \n 源码。保留 authorize(token, now) API，不修改测试，不提交 Git。                 \n                                                                                \n   工具 · list_files · 返回 4 项 · 7aa70d3f                                     \n   失败 · exit 1 · test_boundary (test_auth.AuthorizationTests) ... FAIL · 工…  \n   你 · 已纳入 · ee52ad23                                                       \n 只解释原因，先不要改文件。请用 ask_user 问我过期时希望返回哪个状态码，等我回答 \n 再改。                                                                         \n                                                                                \n   Agent · 提问                                                                 \n 测试显示过期及边界时刻（expires_at <= now）目前错误地返回 200。你希望过期 toke \n n 返回哪个状态码？                                                             \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：最近工具失败 shell 0b9bb8cc · 1 个问题待回答 · /questions · 问题 82a5eff2\n 输入目标：新要求 · Enter 发送 · /questions 选择待答问题                        \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+    "requests": 3,
+    "events": 15,
+    "size": [
+      24,
+      80
+    ],
+    "cursor": [
+      20,
+      56
+    ],
+    "paused": false,
+    "unknown_writes": 0
+  },
+  {
+    "step": "04 显式选择回复目标",
+    "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 9c06add0                                                       \n 修复过期 token 被接受的问题。先运行 python3 -B -m unittest -v 确认失败，再定位 \n 源码。保留 authorize(token, now) API，不修改测试，不提交 Git。                 \n                                                                                \n   工具 · list_files · 返回 4 项 · 7aa70d3f                                     \n   失败 · exit 1 · test_boundary (test_auth.AuthorizationTests) ... FAIL · 工…  \n   你 · 已纳入 · ee52ad23                                                       \n 只解释原因，先不要改文件。请用 ask_user 问我过期时希望返回哪个状态码，等我回答 \n 再改。                                                                         \n                                                                                \n   Agent · 提问                                                                 \n 测试显示过期及边界时刻（expires_at <= now）目前错误地返回 200。你希望过期 toke \n n 返回哪个状态码？                                                             \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：最近工具失败 shell 0b9bb8cc · 1 个问题待回答 · /questions · 已选择回复 82\n 输入目标：回复 82a5eff2 · 测试显示过期及边界时刻（… · Enter 发送 · /message    \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+    "requests": 3,
+    "events": 15,
+    "size": [
+      24,
+      80
+    ],
+    "cursor": [
+      21,
+      45
+    ],
+    "paused": false,
+    "unknown_writes": 0
+  },
+  {
+    "step": "05 修复交付 / 检查与文件证据",
+    "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n n 返回哪个状态码？                                                             \n                                                                                \n   你 · 已纳入 · b5cac47f                                                       \n 返回 401；现在允许修改 auth.py，并运行原有12项测试验证。不要改测试、不要提交Gi \n t。                                                                            \n                                                                                \n   工具 · read_file · auth.py · 返回 445 字节 · 08e2e0a8                        \n   工具 · edit_file · auth.py · 返回 446 字节 · 82c1185b                        \n   工具 · shell · python3 -B -m unitte · exit 0 · stdout 1 行 · stderr 17 行 ·… \n   工具 · input_resolve · 返回 1 行 · eac4976b                                  \n   Agent                                                                        \n 已修复 auth.py 中过期判断反向的问题：过期或恰好到期（expires_at <= now）的 tok \n en 现在返回 401，未过期的 token 返回 200。authorize(token, now) API 保持不变。 \n                                                                                \n 原有 12 项测试全部通过；未修改测试，也未提交 Git。                             \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：输入 b5cac47f 已交付 · /delivery 查看                                    \n 输入目标：新要求 · Enter 发送                                                  \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+    "requests": 8,
+    "events": 38,
+    "size": [
+      24,
+      80
+    ],
+    "cursor": [
+      19,
+      80
+    ],
+    "paused": false,
+    "unknown_writes": 0
+  },
+  {
+    "step": "06 一次命令直达完整交付",
+    "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n n 返回哪个状态码？                                                             \n┌ 交付 08c61245 · 输入 b5cac47f · Ctrl+P /audit 审计 · Esc 返回 ───────────────┐\n│已修复 `auth.py` 中过期判断反向的问题：过期或恰好到期（`expires_at <= now`）的│\n│ token 现在返回 401，未过期的 token 返回 200。`authorize(token, now)` API 保持│\n│不变。                                                                        │\n│                                                                              │\n│原有 12 项测试全部通过；未修改测试，也未提交 Git。                            │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n│                                                                              │\n└──────────────────────────────────────────────────────────────────────────────┘\n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+    "requests": 8,
+    "events": 38,
+    "size": [
+      24,
+      80
+    ],
+    "cursor": [
+      21,
+      33
+    ],
+    "paused": false,
+    "unknown_writes": 0
+  },
+  {
+    "step": "07 同一交付 / 120×40",
+    "screen": " BONE / workspace                                                                                                       \n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 9c06add0                                                                                               \n┌ 交付 08c61245 · 输入 b5cac47f · Ctrl+P /audit 审计 · Esc 返回 ───────────────────────────────────────────────────────┐\n│已修复 `auth.py` 中过期判断反向的问题：过期或恰好到期（`expires_at <= now`）的 token 现在返回 401，未过期的 token 返回│\n│ 200。`authorize(token, now)` API 保持不变。                                                                          │\n│                                                                                                                      │\n│原有 12 项测试全部通过；未修改测试，也未提交 Git。                                                                    │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n│                                                                                                                      │\n└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\n│ 描述任务，或输入 / 命令、@ 文件                                                                                       \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                                                            \n 阅读：最新内容                                                                                                         ",
+    "requests": 8,
+    "events": 38,
+    "size": [
+      40,
+      120
+    ],
+    "cursor": [
+      39,
+      15
+    ],
+    "paused": false,
+    "unknown_writes": 0
+  },
+  {
+    "step": "08 返回原对话阅读位置",
+    "screen": " BONE / workspace                                                                                                       \n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 9c06add0                                                                                               \n 修复过期 token 被接受的问题。先运行 python3 -B -m unittest -v 确认失败，再定位源码。保留 authorize(token, now) API，不 \n 修改测试，不提交 Git。                                                                                                 \n                                                                                                                        \n   工具 · list_files · 返回 4 项 · 7aa70d3f                                                                             \n   失败 · exit 1 · test_boundary (test_auth.AuthorizationTests) ... FAIL · 工具 · shell                                 \n   你 · 已纳入 · ee52ad23                                                                                               \n 只解释原因，先不要改文件。请用 ask_user 问我过期时希望返回哪个状态码，等我回答再改。                                   \n                                                                                                                        \n   Agent · 提问                                                                                                         \n 测试显示过期及边界时刻（expires_at <= now）目前错误地返回 200。你希望过期 token 返回哪个状态码？                       \n                                                                                                                        \n   你 · 已纳入 · b5cac47f                                                                                               \n 返回 401；现在允许修改 auth.py，并运行原有12项测试验证。不要改测试、不要提交Git。                                      \n                                                                                                                        \n   工具 · read_file · auth.py · 返回 445 字节 · 08e2e0a8                                                                \n   工具 · edit_file · auth.py · 返回 446 字节 · 82c1185b                                                                \n   工具 · shell · python3 -B -m unitte · exit 0 · stdout 1 行 · stderr 17 行 · ea4af36f                                 \n   工具 · input_resolve · 返回 1 行 · eac4976b                                                                          \n   Agent                                                                                                                \n 已修复 auth.py 中过期判断反向的问题：过期或恰好到期（expires_at <= now）的 token 现在返回 401，未过期的 token 返回 200 \n 。authorize(token, now) API 保持不变。                                                                                 \n                                                                                                                        \n 原有 12 项测试全部通过；未修改测试，也未提交 Git。                                                                     \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n 当前：输入 b5cac47f 已交付 · /delivery 查看                                                                            \n 输入目标：新要求 · Enter 发送                                                                                          \n│ 描述任务，或输入 / 命令、@ 文件                                                                                       \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                                                            \n 阅读：最新内容                                                                                                         ",
+    "requests": 8,
+    "events": 38,
+    "size": [
+      40,
+      120
+    ],
+    "cursor": [
+      37,
+      2
+    ],
+    "paused": false,
+    "unknown_writes": 0
+  },
+  {
+    "step": "Before exit: live alternate screen",
+    "screen": " BONE / workspace                                                                                                       \n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n   你 · 已纳入 · 9c06add0                                                                                               \n 修复过期 token 被接受的问题。先运行 python3 -B -m unittest -v 确认失败，再定位源码。保留 authorize(token, now) API，不 \n 修改测试，不提交 Git。                                                                                                 \n                                                                                                                        \n   工具 · list_files · 返回 4 项 · 7aa70d3f                                                                             \n   失败 · exit 1 · test_boundary (test_auth.AuthorizationTests) ... FAIL · 工具 · shell                                 \n   你 · 已纳入 · ee52ad23                                                                                               \n 只解释原因，先不要改文件。请用 ask_user 问我过期时希望返回哪个状态码，等我回答再改。                                   \n                                                                                                                        \n   Agent · 提问                                                                                                         \n 测试显示过期及边界时刻（expires_at <= now）目前错误地返回 200。你希望过期 token 返回哪个状态码？                       \n                                                                                                                        \n   你 · 已纳入 · b5cac47f                                                                                               \n 返回 401；现在允许修改 auth.py，并运行原有12项测试验证。不要改测试、不要提交Git。                                      \n                                                                                                                        \n   工具 · read_file · auth.py · 返回 445 字节 · 08e2e0a8                                                                \n   工具 · edit_file · auth.py · 返回 446 字节 · 82c1185b                                                                \n   工具 · shell · python3 -B -m unitte · exit 0 · stdout 1 行 · stderr 17 行 · ea4af36f                                 \n   工具 · input_resolve · 返回 1 行 · eac4976b                                                                          \n   Agent                                                                                                                \n 已修复 auth.py 中过期判断反向的问题：过期或恰好到期（expires_at <= now）的 token 现在返回 401，未过期的 token 返回 200 \n 。authorize(token, now) API 保持不变。                                                                                 \n                                                                                                                        \n 原有 12 项测试全部通过；未修改测试，也未提交 Git。                                                                     \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n                                                                                                                        \n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n 当前：输入 b5cac47f 已交付 · /delivery 查看                                                                            \n 输入目标：新要求 · Enter 发送                                                                                          \n│ 描述任务，或输入 / 命令、@ 文件                                                                                       \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                                                            \n 阅读：最新内容                                                                                                         ",
+    "requests": 8,
+    "events": 38,
+    "size": [
+      40,
+      120
+    ],
+    "cursor": [
+      37,
+      2
+    ],
+    "paused": false,
+    "unknown_writes": 0
+  }
+]

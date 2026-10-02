@@ -16,12 +16,12 @@ use futures_util::StreamExt;
 use ratatui::DefaultTerminal;
 use serde_json::Value;
 use services::native_text;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
-use view::{Activity, Focus, Message, PickerItem, PickerKind, Tone, View};
+use view::{Activity, Draft, Focus, Message, PickerItem, PickerKind, Tone, View};
 
 /// Concrete launch recipes, not a second runtime or model abstraction.
 pub(super) struct Settings {
@@ -105,8 +105,15 @@ struct App {
     search_query: String,
     completion_key: Option<(String, usize)>,
     tool_previews: BTreeMap<String, Message>,
+    tool_observations: BTreeMap<String, (String, String)>,
     reply_target: Option<String>,
-    dismissed_questions: BTreeSet<String>,
+    drafts: BTreeMap<String, Draft>,
+    reconcile_call: Option<String>,
+    detail_event: Option<String>,
+    detail_sources: BTreeMap<String, String>,
+    last_tool_failure: Option<String>,
+    notice_seen: String,
+    notice_until: Option<Instant>,
     mouse_capture: bool,
 }
 impl App {
@@ -131,8 +138,15 @@ impl App {
             search_query: String::new(),
             completion_key: None,
             tool_previews: BTreeMap::new(),
+            tool_observations: BTreeMap::new(),
             reply_target: None,
-            dismissed_questions: BTreeSet::new(),
+            drafts: BTreeMap::new(),
+            reconcile_call: None,
+            detail_event: None,
+            detail_sources: BTreeMap::new(),
+            last_tool_failure: None,
+            notice_seen: String::new(),
+            notice_until: None,
             mouse_capture: true,
         }
     }
@@ -140,7 +154,15 @@ impl App {
         self.ui = View::new();
         self.parts.clear();
         self.tool_previews.clear();
+        self.tool_observations.clear();
         self.reply_target = None;
+        self.drafts.clear();
+        self.reconcile_call = None;
+        self.detail_event = None;
+        self.detail_sources.clear();
+        self.last_tool_failure = None;
+        self.notice_seen.clear();
+        self.notice_until = None;
         self.completion_key = None;
         self.search_query.clear();
         abort_task(&mut self.search);
@@ -211,9 +233,30 @@ impl App {
         self.metadata(engine);
         Ok(())
     }
+    fn refresh_latest(&mut self, engine: &mut Engine, data: &Path) -> Result<()> {
+        ensure!(
+            self.reconcile_call.is_none(),
+            "先记录或取消核查表单，再返回最新记录；原草稿与核查草稿均保留"
+        );
+        self.save(engine, data)?;
+        let active = self.ui.draft_snapshot();
+        let inactive = std::mem::take(&mut self.drafts);
+        let target = self.reply_target.clone();
+        let refreshed = self.load(engine, data);
+        self.ui.restore_draft(active);
+        self.drafts = inactive;
+        self.reply_target = target;
+        self.metadata(engine);
+        refreshed?;
+        self.ui.notice = "已返回最新记录；草稿、光标、选区与回复目标已保留".into();
+        Ok(())
+    }
     fn save(&mut self, engine: &Engine, data: &Path) -> Result<()> {
         let saved = services::UiSaved {
-            draft: self.ui.draft().clone(),
+            draft: self
+                .ui
+                .temporary_draft_text()
+                .unwrap_or_else(|| self.ui.draft()),
             history: self.ui.history(),
             reply_to: self.reply_target.clone(),
         };
@@ -233,6 +276,7 @@ impl App {
             self.ui.remove_message(&format!("live:{call}"));
         }
         self.parts.clear();
+        self.tool_observations.clear();
         for (_, original) in std::mem::take(&mut self.tool_previews) {
             self.ui.upsert_message(original);
         }
@@ -242,7 +286,10 @@ impl App {
         if event.kind == "input_handled"
             && event.data["input_id"].as_str() == self.last_input.as_deref()
         {
-            self.ui.notice = "新要求已纳入执行".into();
+            self.ui.notice = format!(
+                "输入 {} 已纳入执行",
+                short_id(self.last_input.as_deref().unwrap_or(""))
+            );
         }
         if event.kind == "input" && event.data["source"] == "user" {
             self.last_input = Some(event.id.clone());
@@ -267,7 +314,53 @@ impl App {
         {
             self.tool_previews.remove(call);
         }
+        if event.kind == "question" && engine.is_unanswered_question(event) {
+            self.ui.notice = format!(
+                "问题 {} 待回答；/questions 显式选择回复目标",
+                short_id(&event.id)
+            );
+        }
+        if event.kind == "tool_result" && tool_failed(engine, event)? {
+            self.last_tool_failure = Some(format!(
+                "{} {}",
+                event.data["tool_name"].as_str().unwrap_or("tool"),
+                short_id(event.call_id.as_deref().unwrap_or(&event.id))
+            ));
+        }
+        if event.reply_to.as_deref() == self.last_input.as_deref()
+            && matches!(
+                event.kind.as_str(),
+                "delivery" | "failure" | "input_paused" | "input_resolved"
+            )
+        {
+            self.ui.notice.clear();
+        }
         ingest(engine, event, &mut self.ui)?;
+        if event.kind == "tool_result"
+            && let Some(call) = &event.call_id
+            && let Some((stdout, stderr)) = self.tool_observations.remove(call)
+        {
+            let final_body = event_body(engine, event)?;
+            if [&stdout, &stderr]
+                .iter()
+                .any(|text| !text.is_empty() && !final_body.contains(text.as_str()))
+            {
+                let key = format!("tool:{call}");
+                if let Some(mut message) = self
+                    .ui
+                    .messages
+                    .iter()
+                    .find(|m| m.event_id.as_deref() == Some(&key))
+                    .cloned()
+                {
+                    message.text.push_str("\n\n实时观察与最终持久正文不完全一致；此处展示最终记录，实时观察不作为交付证据。");
+                    if let Some(summary) = &mut message.summary {
+                        summary.push_str(" · 实时观察与最终原文不同");
+                    }
+                    self.ui.upsert_message(message);
+                }
+            }
+        }
         self.update_older_after_trim(engine, previous_head.as_deref());
         Ok(())
     }
@@ -312,45 +405,46 @@ impl App {
     }
     fn metadata(&mut self, engine: &Engine) {
         let questions = engine.unanswered_questions();
-        if self.reply_target.is_none() && self.ui.draft().is_empty() {
-            self.reply_target = questions
-                .iter()
-                .rev()
-                .find(|q| !self.dismissed_questions.contains(&q.id))
-                .map(|q| q.id.clone());
-        }
-        self.ui.reply_label = self
-            .reply_target
-            .as_ref()
-            .and_then(|id| questions.iter().find(|q| &q.id == id))
-            .map(|q| {
+        self.ui.reply_label = if let Some(call) = &self.reconcile_call {
+            format!(
+                "核查 {} · Enter 记录 · Esc 取消 · Ctrl+D 证据",
+                short_id(call)
+            )
+        } else if let Some(id) = &self.reply_target {
+            if let Some(question) = questions.iter().find(|q| &q.id == id) {
                 format!(
-                    "回复：{} · Esc 改发新指令 · /questions 选择",
-                    q.data["question"]
-                        .as_str()
-                        .unwrap_or("")
-                        .chars()
-                        .take(60)
-                        .collect::<String>()
+                    "回复 {} · {} · Enter 发送 · /message",
+                    short_id(id),
+                    question_summary(question.data["question"].as_str().unwrap_or("问题"), 24)
                 )
-            })
-            .unwrap_or_else(|| {
-                if self.reply_target.is_some() {
-                    "回复目标已失效；草稿保留，Esc 改发新指令或 /questions 重选".into()
+            } else {
+                "回复目标失效 · 草稿保留 · /message 明确改发".into()
+            }
+        } else {
+            format!(
+                "新要求 · Enter 发送{}",
+                if questions.is_empty() {
+                    ""
                 } else {
-                    String::new()
+                    " · /questions 选择待答问题"
                 }
-            });
+            )
+        };
+        if self.ui.notice != self.notice_seen {
+            self.notice_seen = self.ui.notice.clone();
+            self.notice_until =
+                (!self.ui.notice.is_empty()).then(|| Instant::now() + Duration::from_secs(8));
+        }
         self.ui.busy = !engine.is_quiescent();
         self.ui.session_label = engine.state().id.chars().take(8).collect();
         self.ui.live_status = if self.ui.busy {
             format!(
                 "{} · {}s",
-                status(engine),
+                self.current_status(engine),
                 self.elapsed_from.elapsed().as_secs()
             )
         } else {
-            status(engine)
+            self.current_status(engine)
         };
     }
     fn refresh_usage(&mut self, engine: &Engine) {
@@ -435,6 +529,7 @@ impl App {
             buffer.push_str(&clipped);
             let text = parts.values().cloned().collect::<Vec<_>>().join("\n\n");
             self.ui.upsert_message(Message {
+                summary: None,
                 role: "Agent · 输出中（未交付）".into(),
                 text,
                 event_id: Some(format!("live:{}", progress.call_id)),
@@ -457,7 +552,12 @@ impl App {
                 self.tool_previews
                     .insert(progress.call_id.clone(), original);
             }
+            self.tool_observations.insert(
+                progress.call_id.clone(),
+                (progress.stdout.clone(), progress.stderr.clone()),
+            );
             self.ui.upsert_message(Message {
+                summary: None,
                 role: format!("工具 · {}", progress.tool_name),
                 text: format!(
                     "执行中 · 实时日志（尾部预览，最终记录保留原文）\nstdout:\n{}\nstderr:\n{}",
@@ -554,7 +654,7 @@ impl App {
             engine.options().clone(),
         )?;
         *engine = next;
-        self.dismissed_questions.clear();
+        self.drafts.clear();
         self.load(engine, data)?;
         self.ui.notice = if id.is_some() {
             "会话已打开；未完成工作保持暂停，Ctrl+R 继续"
@@ -600,11 +700,13 @@ impl App {
             return Ok(());
         }
         self.completion_key = Some(key);
-        if self.ui.focus != Focus::Input || self.ui.has_modal() {
+        if self.reconcile_call.is_some() || self.ui.focus != Focus::Input || self.ui.has_modal() {
             return Ok(());
         }
         let prefix = &draft[..cursor];
-        if draft.starts_with('/') && !prefix.contains(char::is_whitespace) {
+        if is_complete_command(prefix) && cursor == draft.len() {
+            self.ui.close_completion();
+        } else if draft.starts_with('/') && !prefix.contains(char::is_whitespace) {
             self.ui
                 .open_completion(PickerKind::Command, command_items(), prefix.to_owned());
         } else if let Some(query) = prefix.strip_prefix("/model ") {
@@ -634,17 +736,6 @@ impl App {
             self.ui.close_completion();
         }
         Ok(())
-    }
-    fn completion_is_exact(&self) -> bool {
-        self.ui.picker_value().is_some_and(|(kind, value)| {
-            let expected = match kind {
-                PickerKind::Command => value,
-                PickerKind::Model => format!("/model {value}"),
-                PickerKind::Session => format!("/sessions {value}"),
-                _ => return false,
-            };
-            self.ui.draft().trim() == expected
-        })
     }
     fn complete_inline(&mut self, kind: PickerKind, value: &str) {
         self.ui.close_completion();
@@ -746,12 +837,148 @@ impl App {
             .open_picker(PickerKind::Question, items, String::new());
         self.ui.notice = "选择要回答的问题；Esc 返回，草稿保留".into();
     }
-    fn cancel_reply(&mut self, engine: &Engine) {
-        self.dismissed_questions
-            .extend(engine.unanswered_questions().iter().map(|q| q.id.clone()));
-        self.reply_target = None;
-        self.ui.reply_label.clear();
-        self.ui.notice = "现在发送新指令；/questions 可重新选择回复目标".into();
+    fn switch_target(&mut self, target: Option<String>) {
+        while self.ui.has_modal() || self.ui.show_activity {
+            self.ui.close_layer();
+        }
+        self.ui.focus = Focus::Input;
+        if self.reply_target == target {
+            return;
+        }
+        let previous = self.reply_target.clone().unwrap_or_default();
+        self.drafts.insert(previous, self.ui.draft_snapshot());
+        let next = target.clone().unwrap_or_default();
+        let draft = self.drafts.remove(&next).unwrap_or_else(View::empty_draft);
+        self.ui.restore_draft(draft);
+        self.reply_target = target;
+        self.ui.focus = Focus::Input;
+    }
+    fn bind_reply(&mut self, engine: &Engine, id: &str) -> Result<()> {
+        ensure!(
+            engine.unanswered_questions().iter().any(|q| q.id == id),
+            "回复目标已失效；草稿和原目标保留，/questions 查看待答问题"
+        );
+        self.switch_target(Some(id.to_owned()));
+        self.ui.notice = format!(
+            "已选择回复 {}；Enter 回答，/message 返回新要求草稿",
+            short_id(id)
+        );
+        Ok(())
+    }
+    fn cancel_reply(&mut self) {
+        self.switch_target(None);
+        self.ui.notice = "已切换新要求草稿；Enter 发送新要求".into();
+    }
+    fn begin_reconcile(&mut self, engine: &mut Engine, call: &str) -> Result<()> {
+        ensure!(
+            self.reconcile_call.is_none(),
+            "已有核查表单；Esc 取消后重新选择"
+        );
+        ensure!(
+            engine.state().unknown_writes.contains_key(call),
+            "该未知写入已失效；原草稿保留"
+        );
+        pause(engine, &mut self.ui)?;
+        self.ui.begin_temporary_draft();
+        self.reconcile_call = Some(call.to_owned());
+        self.ui.notice =
+            "核查表单：填写检查过程和实际效果；Enter 记录，Esc 取消，Ctrl+D 阅读证据".into();
+        self.metadata(engine);
+        Ok(())
+    }
+    fn reconcile_editor_active(&self) -> bool {
+        self.reconcile_call.is_some()
+            && self.ui.focus == Focus::Input
+            && !self.ui.has_modal()
+            && !self.ui.show_activity
+    }
+    fn handle_reconcile_key(
+        &mut self,
+        engine: &mut Engine,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<bool> {
+        if !self.reconcile_editor_active() {
+            return Ok(false);
+        }
+        match key.code {
+            KeyCode::Esc => self.cancel_reconcile(),
+            KeyCode::Enter
+                if !key.modifiers.intersects(
+                    KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ) =>
+            {
+                self.submit_reconcile(engine)?
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+    fn cancel_reconcile(&mut self) {
+        self.ui.restore_temporary_draft();
+        self.reconcile_call = None;
+        self.ui.notice = "已取消核查；原草稿、目标与阅读位置已恢复，执行仍暂停".into();
+    }
+    fn submit_reconcile(&mut self, engine: &mut Engine) -> Result<()> {
+        let call = self.reconcile_call.as_deref().context("没有核查表单")?;
+        engine.resolve_write(call, self.ui.draft().trim())?;
+        self.ui.restore_temporary_draft();
+        self.reconcile_call = None;
+        self.ui.notice = "已记录核查结果；执行仍暂停，Ctrl+R 显式恢复".into();
+        Ok(())
+    }
+    fn expire_notice(&mut self) -> bool {
+        if self
+            .notice_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.ui.notice.clear();
+            self.notice_seen.clear();
+            self.notice_until = None;
+            return true;
+        }
+        false
+    }
+    fn current_status(&self, engine: &Engine) -> String {
+        current_status(
+            engine,
+            self.last_input.as_deref(),
+            self.last_tool_failure.as_deref(),
+        )
+    }
+    fn open_delivery(&mut self, engine: &Engine, data: &Path) -> Result<()> {
+        let event =
+            services::latest_delivery(data, &engine.state().id)?.context("此会话还没有持久交付")?;
+        self.detail_event = Some(event.id.clone());
+        self.ui.open_detail(
+            format!(
+                "交付 {} · 输入 {}",
+                short_id(&event.id),
+                short_id(event.reply_to.as_deref().unwrap_or(""))
+            ),
+            detail(engine, &event)?,
+        );
+        self.remember_detail_source();
+        Ok(())
+    }
+    fn remember_detail_source(&mut self) {
+        if let (Some((title, _)), Some(id)) = (&self.ui.detail, &self.detail_event) {
+            self.detail_sources.insert(title.clone(), id.clone());
+        }
+    }
+    fn open_audit(&mut self, engine: &Engine) -> Result<()> {
+        let id = if let Some((title, _)) = &self.ui.detail {
+            self.detail_sources.get(title).cloned()
+        } else {
+            self.selected_record(engine)
+        }
+        .context("先选择持久记录，再查看审计元信息")?;
+        self.detail_event = Some(id.clone());
+        self.ui.open_detail(
+            format!("审计原文 · {}", short_id(&id)),
+            audit_detail(&engine.read_event(&id)?)?,
+        );
+        self.remember_detail_source();
+        Ok(())
     }
     fn reconciliations(&mut self, engine: &Engine) {
         let items = engine
@@ -786,45 +1013,79 @@ impl App {
         let id = self
             .selected_record(engine)
             .context("选择一条持久消息后查看原文")?;
-        self.ui.detail = Some((
-            "消息与行动原文（只读）".into(),
-            detail(engine, &engine.read_event(&id)?)?,
-        ));
+        let observation = self
+            .ui
+            .selected_message()
+            .filter(|m| m.text.starts_with("执行中 · 实时日志"))
+            .map(|m| m.text.clone());
+        let source = detail(engine, &engine.read_event(&id)?)?;
+        let title = if observation.is_some() {
+            format!("实时观察快照 · {} · 未交付", short_id(&id))
+        } else {
+            format!("结果原文 · {} · D 审计", short_id(&id))
+        };
+        let text = observation
+            .map(|text| format!("{text}\n\n已持久化启动记录\n{source}"))
+            .unwrap_or(source);
+        self.detail_event = Some(id);
+        self.ui.open_detail(title, text);
+        self.remember_detail_source();
         Ok(())
     }
     async fn copy_selected(&mut self, engine: &Engine) -> Result<()> {
-        let text = if self.ui.detail.is_some() {
-            self.ui
-                .detail
-                .as_ref()
-                .map(|(_, text)| text.clone())
-                .unwrap_or_default()
-        } else if self.ui.focus == Focus::Input
-            && !self.ui.has_modal()
-            && self.ui.selected_input_text().is_some()
+        ensure!(
+            !self.ui.show_help,
+            "当前对象是键盘帮助；Esc 返回后选择草稿或持久记录复制"
+        );
+        let (object, text) = if let Some((title, text)) = &self.ui.detail {
+            (format!("详情 {title}"), text.clone())
+        } else if self.ui.picker.is_some() {
+            let (_, value) = self
+                .ui
+                .picker_value()
+                .context("当前候选列表没有选中的对象")?;
+            ("当前候选".into(), value)
+        } else if self.ui.focus == Focus::Input {
+            if let Some(selection) = self.ui.selected_input_text() {
+                ("输入选区".into(), selection)
+            } else {
+                let label = if self.reconcile_call.is_some() {
+                    "核查草稿"
+                } else if self.reply_target.is_some() {
+                    "回复草稿"
+                } else {
+                    "新要求草稿"
+                };
+                (label.into(), self.ui.draft())
+            }
+        } else if self.ui.focus == Focus::Conversation
+            && self
+                .ui
+                .selected_message()
+                .is_some_and(|m| m.text.starts_with("执行中 · 实时日志"))
         {
-            self.ui.selected_input_text().unwrap_or_default()
-        } else if let Some(id) = self.selected_record(engine) {
+            (
+                "实时观察尾部（未交付）".into(),
+                self.ui.selected_message().unwrap().text.clone(),
+            )
+        } else {
+            let id = if self.ui.focus == Focus::Activity {
+                self.ui.selected_event().map(str::to_owned)
+            } else {
+                self.selected_record(engine)
+            }
+            .context("当前对象没有持久原文；选择一条持久消息后复制")?;
             let event = engine.read_event(&id)?;
-            let body = event_body(engine, &event)?;
-            if event.kind == "tool_started" {
+            let body = if event.kind == "tool_started" {
                 detail(engine, &event)?
             } else {
-                body
-            }
-        } else {
-            let id = self
-                .ui
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.role == "Agent")
-                .and_then(|m| m.event_id.as_deref())
-                .context("还没有可复制的消息；Tab 进入对话选择")?;
-            event_body(engine, &engine.read_event(id)?)?
+                event_body(engine, &event)?
+            };
+            (format!("{} {}", event.kind, short_id(&id)), body)
         };
+        ensure!(!text.is_empty(), "{object}没有可复制文字");
         copy_to_clipboard(&text).await?;
-        self.ui.notice = "已复制完整原文".into();
+        self.ui.notice = format!("已复制{object}完整文字");
         Ok(())
     }
     fn load_older(&mut self, engine: &Engine, data: &Path) -> Result<()> {
@@ -923,13 +1184,14 @@ impl App {
             match result {
                 Ok(path) => {
                     self.ui.notice = "HTML 导出完成".into();
-                    self.ui.detail = Some((
-                        "HTML 导出完成".into(),
+                    self.detail_event = None;
+                    self.ui.open_detail(
+                        "HTML 导出完成",
                         format!(
                             "{}\n\n报告包含持久化对话、工具行动和归属信息。可以用浏览器打开这个本地文件。",
                             path.display()
                         ),
-                    ));
+                    );
                 }
                 Err(error) => self.ui.notice = format!("导出失败：{error:#}"),
             }
@@ -950,7 +1212,7 @@ impl App {
         let args = args.trim();
         match command {
             "/quit" | "/exit" => return Ok(true),
-            "/help" => self.ui.show_help = true,
+            "/help" => self.ui.open_help(),
             "/stop" => {
                 pause(engine, &mut self.ui)?;
                 self.clear_preview();
@@ -976,23 +1238,19 @@ impl App {
             "/files" => self.complete_file(engine),
             "/search" => self.start_search(engine, data, args),
             "/questions" => self.questions(engine),
-            "/reply" => {
-                ensure!(
-                    engine.unanswered_questions().iter().any(|q| q.id == args),
-                    "提问已失效或未找到；/questions 查看待回答的问题"
-                );
-                self.reply_target = Some(args.to_owned());
-                self.dismissed_questions.remove(args);
-            }
+            "/reply" => self.bind_reply(engine, args)?,
+            "/message" => self.cancel_reply(),
+            "/delivery" => self.open_delivery(engine, data)?,
+            "/audit" => self.open_audit(engine)?,
             "/reconcile" => {
                 if args.is_empty() {
                     self.reconciliations(engine);
-                } else {
-                    let (call, note) = args
-                        .split_once(char::is_whitespace)
-                        .context("用法：/reconcile CALL_ID 核查过程和实际结果")?;
+                } else if let Some((call, note)) = args.split_once(char::is_whitespace) {
+                    pause(engine, &mut self.ui)?;
                     engine.resolve_write(call, note.trim())?;
-                    self.ui.notice = "已记录核查结果；Ctrl+R 显式恢复工作".into();
+                    self.ui.notice = "已记录核查结果；执行仍暂停，Ctrl+R 显式恢复".into();
+                } else {
+                    self.begin_reconcile(engine, args)?;
                 }
             }
             "/mouse" => {
@@ -1023,7 +1281,7 @@ impl App {
                     } else {
                         "可写"
                     },
-                    status(engine),
+                    self.current_status(engine),
                     serde_json::to_string_pretty(engine.options())?,
                     self.last_input
                         .as_ref()
@@ -1038,7 +1296,8 @@ impl App {
                         .unwrap_or(Value::Null),
                     serde_json::to_string_pretty(&state.unknown_writes)?
                 );
-                self.ui.detail = Some(("会话状态".into(), detail));
+                self.detail_event = None;
+                self.ui.open_detail("会话状态", detail);
             }
             "/diff" => {
                 abort_task(&mut self.diff);
@@ -1046,7 +1305,9 @@ impl App {
                 self.diff = Some(tokio::spawn(
                     async move { services::git_diff(&workspace).await },
                 ));
-                self.ui.detail = Some(("项目修改（只读）".into(), "正在读取 Git 修改…".into()));
+                self.detail_event = None;
+                self.ui
+                    .open_detail("项目修改（只读）", "正在读取 Git 修改…");
             }
             "/export" => {
                 ensure!(self.export.is_none(), "export is already running");
@@ -1059,10 +1320,7 @@ impl App {
             }
             "/copy" => self.copy_selected(engine).await?,
             "/older" => self.load_older(engine, data)?,
-            "/latest" => {
-                self.save(engine, data)?;
-                self.load(engine, data)?;
-            }
+            "/latest" => self.refresh_latest(engine, data)?,
             "/editor" => self.editor(engine, data, terminal, input).await?,
             _ => bail!("未知命令 {command}；Ctrl+P 或 /help 查看命令（未发送给模型）"),
         }
@@ -1244,7 +1502,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/diff", "查看 Git 修改，包括 staged 与 unstaged"),
     ("/files", "插入项目文件引用"),
     ("/search", "搜索整个会话的持久原文；Ctrl+F"),
-    ("/questions", "选择待回答的问题；Esc 改发新指令"),
+    ("/questions", "显式选择回复目标；Esc 返回原阅读层"),
+    ("/message", "返回新要求草稿，明确切换发送目标"),
+    ("/delivery", "直达最近持久交付及其输入来源"),
+    ("/audit", "查看当前持久结果的审计原文"),
     ("/reply", "指定问题 ID 作为回复目标"),
     ("/reconcile", "核查未知写入并记录实际结果"),
     ("/mouse", "切换鼠标滚动和终端原生文本选择"),
@@ -1252,7 +1513,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/latest", "返回最近对话窗口，保留草稿"),
     ("/export", "导出本地 HTML 对话与行动报告"),
     ("/editor", "用 VISUAL / EDITOR 编辑长输入"),
-    ("/copy", "复制选中的消息或工具原文；否则复制最近答复"),
+    ("/copy", "复制当前草稿、选区、详情或明确选中的持久对象"),
     ("/details", "展开或隐藏内部事件记录"),
     ("/stop", "暂停所有工作"),
     ("/resume", "恢复暂停工作"),
@@ -1455,10 +1716,10 @@ async fn event_loop(
         if dirty {
             app.metadata(engine);
             let model = model_label(&app.settings.profile);
-            terminal.terminal.draw(|frame| {
-                app.ui
-                    .render(frame, engine.state(), &model, &status(engine))
-            })?;
+            let fact = app.current_status(engine);
+            terminal
+                .terminal
+                .draw(|frame| app.ui.render(frame, engine.state(), &model, &fact))?;
             dirty = false;
         }
         if engine.is_quiescent() {
@@ -1474,13 +1735,21 @@ async fn event_loop(
                         match key.code {
                             KeyCode::Char('q') if control => return Ok(()),
                             KeyCode::Char('c') if control => {
-                                if app.ui.focus == Focus::Input && !app.ui.has_modal() && app.ui.selected_input_text().is_some() { if let Err(error) = app.copy_selected(engine).await { app.ui.notice = format!("复制失败：{error:#}"); } }
-                                else { pause(engine, &mut app.ui)?; app.clear_preview(); deadline = None; }
+                                pause(engine, &mut app.ui)?; app.clear_preview(); deadline = None;
                             },
                             KeyCode::Char('y') if control => { if let Err(error) = app.copy_selected(engine).await { app.ui.notice = format!("复制失败：{error:#}"); } },
                             KeyCode::Char('f') if control => app.start_search(engine, data, ""),
-                            KeyCode::Esc if !app.ui.has_modal() && app.reply_target.is_some() => {
-                                app.ui.close_completion(); app.cancel_reply(engine);
+                            KeyCode::Esc if app.reconcile_editor_active() => { app.handle_reconcile_key(engine, key)?; },
+                            KeyCode::Char('d') if control && app.reconcile_call.is_some() => {
+                                if let Some(call) = app.reconcile_call.clone() {
+                                    match reconciliation_detail(engine, &call) {
+                                        Ok(text) => { app.detail_event = engine.read_call_event(&call, "tool_result").or_else(|_| engine.read_call_event(&call, "tool_started")).ok().map(|e| e.id); app.ui.open_detail(format!("核查证据 · {}", short_id(&call)), text); app.remember_detail_source(); },
+                                        Err(error) => app.ui.notice = format!("读取核查证据失败：{error:#}"),
+                                    }
+                                }
+                            },
+                            KeyCode::Char('D') if !control && (app.ui.detail.is_some() || app.ui.focus == Focus::Conversation) => {
+                                if let Err(error) = app.open_audit(engine) { app.ui.notice = format!("读取审计失败：{error:#}"); }
                             },
                             KeyCode::Char('d') if app.ui.focus == Focus::Conversation && !app.ui.has_modal() => {
                                 if let Err(error) = app.open_selected(engine) { app.ui.notice = format!("读取失败：{error:#}"); }
@@ -1488,6 +1757,7 @@ async fn event_loop(
                             KeyCode::Char('y') if app.ui.focus == Focus::Conversation && !app.ui.has_modal() => {
                                 if let Err(error) = app.copy_selected(engine).await { app.ui.notice = format!("复制失败：{error:#}"); }
                             },
+                            KeyCode::Char('r') if control && app.reconcile_call.is_some() => app.ui.notice = "先记录或取消核查；执行仍暂停".into(),
                             KeyCode::Char('r') if control => { resume(engine, &mut app.ui); deadline = Some(Instant::now()+duration); },
                             KeyCode::Char('p') if control => app.commands(String::new()),
                             KeyCode::Char('o') if control => app.complete_file(engine),
@@ -1495,41 +1765,30 @@ async fn event_loop(
                                 if let Err(error) = app.editor(engine, data, terminal, &mut input).await { app.ui.notice = format!("编辑失败：{error:#}"); }
                             },
                             KeyCode::Tab | KeyCode::Enter if app.ui.is_completion() && app.ui.picker_value().is_some()
-                                && (key.code == KeyCode::Tab || !app.completion_is_exact())
                                 && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
                                 if let Some((kind, value)) = app.ui.picker_value() { app.complete_inline(kind, &value); }
                             },
                             KeyCode::Enter if app.ui.picker.is_some() && !app.ui.is_completion() => {
                                 if let Some((kind, value)) = app.ui.picker_value() {
-                                    app.ui.picker = None;
+                                    app.ui.close_layer();
                                     let result = match kind {
                                         PickerKind::Command => {
-                                            let previous = if app.ui.draft().trim_start().starts_with('/') { Some(app.ui.take_draft()) } else { None };
-                                            let result = app.command(engine, data, terminal, &mut input, &value).await;
-                                            if result.is_err() && let Some(previous) = previous { app.ui.paste(&previous); }
-                                            result
+                                            if app.reconcile_call.is_some() && !matches!(value.as_str(), "/copy" | "/help" | "/stop" | "/status" | "/audit" | "/diff" | "/quit") {
+                                                Err(anyhow::anyhow!("先记录或取消当前核查表单；原草稿仍保留"))
+                                            } else {
+                                                app.command(engine, data, terminal, &mut input, &value).await
+                                            }
                                         },
                                         PickerKind::Session => app.switch_session(engine, data, Some(&value)).map(|_|false),
                                         PickerKind::Model => app.set_model(engine, &value).map(|_|false),
                                         PickerKind::History => {
                                             app.ui.select_message(&value);
                                             engine.read_event(&value).and_then(|e| detail(engine, &e)).map(|text| {
-                                                app.ui.detail = Some((format!("搜索原文 · {}", app.search_query), text)); false
+                                                app.detail_event = Some(value.clone()); app.ui.open_detail(format!("搜索原文 · {} · {} · /audit 审计", app.search_query, short_id(&value)), text); app.remember_detail_source(); false
                                             })
                                         },
-                                        PickerKind::Question => {
-                                            if engine.unanswered_questions().iter().any(|q| q.id == value) {
-                                                app.reply_target = Some(value.clone()); app.dismissed_questions.remove(&value);
-                                                app.ui.focus = Focus::Input;
-                                                app.ui.notice = "回复目标已选定；Enter 回答，Esc 改发新指令".into(); Ok(false)
-                                            } else { Err(anyhow::anyhow!("该问题已失效；/questions 刷新")) }
-                                        },
-                                        PickerKind::Reconcile => {
-                                            let read = reconciliation_detail(engine, &value)?;
-                                            app.ui.take_draft(); app.ui.paste(&format!("/reconcile {value} "));
-                                            app.ui.detail = Some(("核查未知写入".into(), format!("先查看实际文件、Git diff、测试输出或相关进程，确认发生了什么。\n\n关闭此窗口，在草稿的 /reconcile 命令后填写核查过程和实际结果，再 Enter 记录。核查后 Ctrl+R 显式恢复；这条记录不会自动重放未知操作。\n\n{read}")));
-                                            Ok(false)
-                                        },
+                                        PickerKind::Question => app.bind_reply(engine, &value).map(|_| false),
+                                        PickerKind::Reconcile => app.begin_reconcile(engine, &value).map(|_| false),
                                         PickerKind::File => {
                                             let reference = if value.contains(char::is_whitespace) { format!("@\"{value}\" ") } else { format!("@{value} ") };
                                             if let Some(range) = app.file_range.take() { app.ui.replace_range(range, &reference); }
@@ -1541,6 +1800,10 @@ async fn event_loop(
                                 }
                             },
                             _ if app.ui.has_modal() => app.ui.handle_key(key),
+                            KeyCode::Enter if app.reconcile_editor_active()
+                                && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
+                                if let Err(error) = app.handle_reconcile_key(engine, key) { app.ui.notice = format!("记录失败：{error:#}；核查草稿保留"); }
+                            },
                             KeyCode::Enter if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
                                 match app.ui.focus {
                                     Focus::Input => {
@@ -1549,19 +1812,23 @@ async fn event_loop(
                                             app.ui.close_completion();
                                             if text.trim_start().starts_with('/') {
                                                 // Keep an unknown command in the editor; do not turn it into agent input.
+                                                let command_draft = app.ui.draft_snapshot();
                                                 app.ui.take_draft();
                                                 let result = app.command(engine, data, terminal, &mut input, &text).await;
                                                 match result {
                                                     Ok(true) => return Ok(()),
                                                     Ok(false) => {},
-                                                    Err(error) => { app.ui.paste(&text); app.ui.notice = format!("操作失败：{error:#}；草稿已保留"); },
+                                                    Err(error) => { app.ui.restore_draft(command_draft); app.ui.notice = format!("操作失败：{error:#}；草稿已保留"); },
                                                 }
                                             } else {
                                                 let posted = if let Some(target) = app.reply_target.as_deref() { engine.post(&text, Some(target)) } else { engine.post_message(&text) };
                                                 match posted {
-                                                    Ok(_) => { app.ui.remember_prompt(&text); app.ui.take_draft(); app.clear_preview();
-                                                        app.reply_target = None;
-                                                        app.ui.notice = "已保存 · 等待纳入执行；运行中可追加新要求".into();
+                                                    Ok(id) => { app.ui.remember_prompt(&text); app.ui.take_draft(); app.clear_preview();
+                                                        let sent_target = app.reply_target.clone();
+                                                        app.drafts.remove(&sent_target.clone().unwrap_or_default());
+                                                        if sent_target.is_some() { app.switch_target(None); }
+                                                        app.last_input = Some(id.clone());
+                                                        app.ui.notice = format!("输入 {} 已接收 · 等待纳入执行", short_id(&id));
                                                         app.elapsed_from = Instant::now(); deadline = Some(Instant::now()+duration); },
                                                     Err(error) => app.ui.notice = format!("发送失败：{error:#}；草稿已保留"),
                                                 }
@@ -1571,7 +1838,7 @@ async fn event_loop(
                                     Focus::Activity => {
                                         if let Some(id) = app.ui.selected_event().map(str::to_owned) {
                                             match engine.read_event(&id).and_then(|e| detail(engine, &e)) {
-                                                Ok(text) => app.ui.detail = Some(("行动原文（只读）".into(), text)),
+                                                Ok(text) => { app.detail_event = Some(id.clone()); app.ui.open_detail(format!("行动原文 · {} · /audit 审计", short_id(&id)), text); app.remember_detail_source(); },
                                                 Err(error) => app.ui.notice = format!("读取记录失败：{error:#}"),
                                             }
                                         }
@@ -1601,10 +1868,10 @@ async fn event_loop(
                 pause(engine,&mut app.ui)?; app.clear_preview(); deadline = None;
                 app.ui.notice = "运行时限已到，已暂停；Ctrl+R 继续".into(); app.sync(engine,data)?; dirty = true;
             },
-            _ = tick.tick(), if !engine.is_quiescent() || app.has_tasks() || app.changed_at.is_some() => {
+            _ = tick.tick(), if !engine.is_quiescent() || app.has_tasks() || app.changed_at.is_some() || app.notice_until.is_some() => {
                 let pending = app.has_tasks();
                 app.tasks().await;
-                dirty |= app.progress(engine) || !engine.is_quiescent() || pending;
+                dirty |= app.progress(engine) || !engine.is_quiescent() || pending || app.expire_notice();
                 if app.changed_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(500))
                     && let Err(error) = app.save(engine,data) {
                     app.ui.notice = format!("草稿保存失败：{error:#}"); app.changed_at = None; dirty = true;
@@ -1641,29 +1908,72 @@ async fn next_terminal(input: &mut Option<EventStream>) -> Result<TerminalEvent>
         .map_err(Into::into)
 }
 
-fn status(engine: &Engine) -> String {
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn terminal_label(kind: &str) -> &str {
+    match kind {
+        "delivery" => "已交付",
+        "failure" => "执行失败",
+        "input_paused" => "已暂停",
+        "input_resolved" => "已结算",
+        _ => "等待处理",
+    }
+}
+
+fn is_complete_command(text: &str) -> bool {
+    COMMANDS.iter().any(|(command, _)| *command == text)
+        && !matches!(
+            text,
+            "/reply" | "/model" | "/sessions" | "/search" | "/reconcile"
+        )
+}
+
+fn current_status(engine: &Engine, input: Option<&str>, tool_failure: Option<&str>) -> String {
     let state = engine.state();
     if !state.unknown_writes.is_empty() {
-        return format!(
-            "需核查 {} 项写入 · /reconcile 核查",
-            state.unknown_writes.len()
-        );
+        return format!("需核查 {} 项写入 · /reconcile", state.unknown_writes.len());
     }
     if state.paused {
         return "已暂停 · Ctrl+R 恢复".into();
     }
-    if !engine.unanswered_questions().is_empty() {
-        return "等待回答 · /questions 选择 · Esc 发新指令".into();
+    let terminal = input.and_then(|id| engine.result(id)).filter(|e| {
+        matches!(
+            e.kind.as_str(),
+            "delivery" | "failure" | "input_paused" | "input_resolved"
+        )
+    });
+    if let Some(event) = terminal {
+        return format!(
+            "输入 {} {}{}",
+            short_id(input.unwrap_or("")),
+            terminal_label(&event.kind),
+            if event.kind == "delivery" {
+                " · /delivery 查看"
+            } else {
+                ""
+            }
+        );
     }
+    if !state.pending_inputs.is_empty() {
+        return format!(
+            "{} 条输入已接收 · 等待纳入执行{}",
+            state.pending_inputs.len(),
+            tool_failure.map(|_| " · 有工具失败记录").unwrap_or("")
+        );
+    }
+    let questions = engine.unanswered_questions().len();
     let running = state
         .jobs
         .values()
         .filter(|job| job.state == JobState::Running)
         .count();
-    if running > 0 {
-        return format!("工作中 · {running} 项正在执行");
-    }
-    if !engine.is_quiescent() {
+    let activity = if questions > 0 {
+        format!("{questions} 个问题待回答 · /questions")
+    } else if running > 0 {
+        format!("工作中 · {running} 项正在执行")
+    } else if !engine.is_quiescent() {
         "正在安排工作".into()
     } else if state
         .jobs
@@ -1672,12 +1982,190 @@ fn status(engine: &Engine) -> String {
     {
         "等待工作结果".into()
     } else {
-        "就绪".into()
+        "暂无活动调用".into()
+    };
+    if let Some(failure) = tool_failure {
+        format!("最近工具失败 {failure} · {activity}")
+    } else {
+        activity
     }
 }
 
+fn raw_tool_output(engine: &Engine, event: &Event) -> Result<String> {
+    let text = engine.event_text(event)?;
+    Ok(if text.is_empty() {
+        native_text(&event.data["message"])
+    } else {
+        text
+    })
+}
+
+fn tool_failed(engine: &Engine, event: &Event) -> Result<bool> {
+    if event.data["uncertain"] == true {
+        return Ok(false);
+    }
+    let value = serde_json::from_str::<Value>(&raw_tool_output(engine, event)?).ok();
+    Ok(event.data["error"].is_string()
+        || value.as_ref().is_some_and(|v| {
+            v["error"].is_string() || v["exit_code"].as_i64().is_some_and(|code| code != 0)
+        }))
+}
+
+fn question_summary(question: &str, max_width: usize) -> String {
+    let source = question.replace(['\n', '\r'], " ");
+    let mut width = 0;
+    let mut result = String::new();
+    for character in source.chars() {
+        let size = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + size > max_width {
+            result.push('…');
+            break;
+        }
+        width += size;
+        result.push(character);
+    }
+    result
+}
+
+fn failure_marker(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("...")
+        && ["ok", "ignored", "skipped", "expected failure"]
+            .iter()
+            .any(|ending| lower.trim_end().ends_with(ending))
+    {
+        return false;
+    }
+    lower.contains("traceback")
+        || lower.contains("错误")
+        || lower.contains("失败")
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|word| {
+                matches!(
+                    word,
+                    "fail" | "failed" | "failure" | "error" | "panic" | "panicked"
+                ) || word.ends_with("error")
+            })
+}
+
+fn tool_failure_observation(
+    engine: &Engine,
+    event: &Event,
+    body: &str,
+) -> Result<(Option<i64>, String)> {
+    let raw = raw_tool_output(engine, event)?;
+    let value = serde_json::from_str::<Value>(&raw).ok();
+    let exit = value.as_ref().and_then(|v| v["exit_code"].as_i64());
+    let stderr = value
+        .as_ref()
+        .and_then(|v| v["stderr"].as_str())
+        .unwrap_or("");
+    let stdout = value
+        .as_ref()
+        .and_then(|v| v["stdout"].as_str())
+        .unwrap_or("");
+    let error = value
+        .as_ref()
+        .and_then(|v| v["error"].as_str())
+        .or_else(|| event.data["error"].as_str());
+    let observed = format!("{stderr}\n{stdout}");
+    let lines: Vec<_> = observed
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if let Some(line) = lines
+        .iter()
+        .find(|line| {
+            failure_marker(line)
+                && !line
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("traceback")
+        })
+        .or_else(|| lines.iter().find(|line| failure_marker(line)))
+    {
+        return Ok((exit, line.trim().into()));
+    }
+    if let Some(error) = error {
+        return Ok((exit, format!("工具报告：{error}")));
+    }
+    let stream = if !stderr.trim().is_empty() {
+        Some(("stderr", stderr))
+    } else if !stdout.trim().is_empty() {
+        Some(("stdout", stdout))
+    } else {
+        None
+    };
+    if let Some((name, text)) = stream {
+        let tail = text
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        return Ok((exit, format!("{name}尾部观察：{}", tail.trim())));
+    }
+    let lines: Vec<_> = body
+        .lines()
+        .filter(|line| {
+            !line.trim().is_empty()
+                && *line != "stderr:"
+                && *line != "stdout:"
+                && !line.starts_with("exit:")
+        })
+        .collect();
+    let observation = lines
+        .iter()
+        .find(|line| failure_marker(line))
+        .map(|line| line.trim().to_owned())
+        .unwrap_or_else(|| "工具报告失败；查看完整结果".into());
+    Ok((exit, observation))
+}
+
+fn tool_summary(engine: &Engine, event: &Event, body: &str) -> Result<String> {
+    let raw = raw_tool_output(engine, event)?;
+    let value = serde_json::from_str::<Value>(&raw).ok();
+    let result = if let Some(value) = value {
+        if let Some(exit) = value["exit_code"].as_i64() {
+            format!(
+                "exit {exit} · stdout {} 行 · stderr {} 行",
+                value["stdout"].as_str().unwrap_or("").lines().count(),
+                value["stderr"].as_str().unwrap_or("").lines().count()
+            )
+        } else if let Some(entries) = value["entries"].as_array() {
+            format!("返回 {} 项", entries.len())
+        } else if let Some(matches) = value["matches"].as_array() {
+            format!("返回 {} 处匹配", matches.len())
+        } else if let Some(bytes) = value["bytes"].as_u64() {
+            format!("返回 {bytes} 字节")
+        } else {
+            format!("返回 {} 行", body.lines().count())
+        }
+    } else {
+        format!("返回 {} 行", body.lines().count())
+    };
+    let target = tool_arguments(engine, event)?.and_then(|args| {
+        args["path"]
+            .as_str()
+            .or_else(|| args["command"].as_str())
+            .or_else(|| args["query"].as_str())
+            .map(|s| s.replace('\n', " ").chars().take(20).collect::<String>())
+    });
+    Ok(format!(
+        "{}{result} · {}",
+        target.map(|t| format!("{t} · ")).unwrap_or_default(),
+        short_id(event.call_id.as_deref().unwrap_or(&event.id))
+    ))
+}
+
 fn reconciliation_detail(engine: &Engine, call: &str) -> Result<String> {
-    detail(engine, &engine.read_call_event(call, "tool_started")?)
+    let event = engine
+        .read_call_event(call, "tool_result")
+        .or_else(|_| engine.read_call_event(call, "tool_started"))?;
+    Ok(format!(
+        "调用 {call}\n实际效果未确认；检查文件、Git diff、进程或工具实际结果后，在核查表单记录观察。\n\n{}",
+        detail(engine, &event)?
+    ))
 }
 
 fn tool_arguments(engine: &Engine, event: &Event) -> Result<Option<Value>> {
@@ -1699,9 +2187,9 @@ fn tool_arguments(engine: &Engine, event: &Event) -> Result<Option<Value>> {
         .map(|choice| choice["function"]["arguments"].clone()))
 }
 
-fn detail(engine: &Engine, event: &Event) -> Result<String> {
-    let metadata = format!(
-        "event: {}\nkind: {}\njob: {}\ncall: {}\nreply_to: {}\nroot_input: {}\nrevision: {}\ntimestamp (Unix ms): {}\n",
+fn audit_detail(event: &Event) -> Result<String> {
+    Ok(format!(
+        "event: {}\nkind: {}\njob: {}\ncall: {}\nreply_to: {}\nroot_input: {}\nrevision: {}\ntimestamp (Unix ms): {}\n\n持久事件原文\n{}",
         event.id,
         event.kind,
         event.job_id.as_deref().unwrap_or("—"),
@@ -1709,33 +2197,26 @@ fn detail(engine: &Engine, event: &Event) -> Result<String> {
         event.reply_to.as_deref().unwrap_or("—"),
         event.root_input.as_deref().unwrap_or("—"),
         event.revision,
-        event.timestamp
-    );
-    let text = event_body(engine, event)?;
-    let mut output = metadata;
+        event.timestamp,
+        serde_json::to_string_pretty(&event.data)?
+    ))
+}
+
+fn detail(engine: &Engine, event: &Event) -> Result<String> {
+    let mut output = event_body(engine, event)?;
+    if output.is_empty() {
+        output = "此记录没有正文；/audit 查看持久事件与审计元信息".into();
+    }
     if let Some(arguments) = tool_arguments(engine, event)? {
-        let diff =
+        let preview =
             proposed_change_preview(event.data["tool_name"].as_str().unwrap_or(""), &arguments);
-        if !diff.is_empty() {
-            output.push_str(&format!("\n修改预览（以工具执行结果为准）\n{diff}\n"));
+        if !preview.is_empty() {
+            output.push_str(&format!("\n\n提议修改（以实际结果为准）\n{preview}"));
         }
         output.push_str(&format!(
-            "\n原生工具参数\n{}\n",
+            "\n\n原生工具参数\n{}",
             serde_json::to_string_pretty(&arguments)?
         ));
-    }
-    if !text.is_empty() {
-        output.push_str("\n原文\n");
-        output.push_str(&text);
-    } else {
-        // Model metadata is useful; opaque provider reasoning/transport blocks
-        // are not presented as a readable explanation of the Agent's thinking.
-        let mut data = event.data.clone();
-        if let Some(object) = data.as_object_mut() {
-            object.remove("response");
-            object.remove("stream_items");
-        }
-        output.push_str(&serde_json::to_string_pretty(&data)?);
     }
     if event.kind == "model_message" {
         let calls: Vec<_> = event.data["response"]["choice"]
@@ -1746,7 +2227,7 @@ fn detail(engine: &Engine, event: &Event) -> Result<String> {
             .collect();
         if !calls.is_empty() {
             output.push_str(&format!(
-                "\n原生工具提议\n{}",
+                "\n\n原生工具提议\n{}",
                 serde_json::to_string_pretty(&calls)?
             ));
         }
@@ -1790,6 +2271,12 @@ fn readable_tool_output(text: &str) -> String {
         } else {
             format!("\nstderr:\n{stderr}")
         };
+        if value["exit_code"].as_i64().is_some_and(|code| code != 0) && !stderr.trim().is_empty() {
+            return format!(
+                "stderr:\n{stderr}\nexit: {}\nstdout:\n{stdout}",
+                value["exit_code"]
+            );
+        }
         return format!("exit: {}\n{stdout}{error_output}", value["exit_code"]);
     }
     if let Some(body) = value["text"].as_str() {
@@ -1874,7 +2361,7 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         || (public && matches!(event.kind.as_str(), "delivery" | "failure" | "input_paused"))
     {
         let role = if user {
-            "你"
+            "你 · 已接收"
         } else if event.kind == "question" {
             "Agent · 提问"
         } else if event.kind == "failure" {
@@ -1883,10 +2370,28 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
             "Agent"
         };
         ui.push_message(Message {
-            role: role.into(),
+            summary: None,
+            role: if user {
+                format!("{role} · {}", short_id(&event.id))
+            } else {
+                role.into()
+            },
             text: body.clone(),
             event_id: Some(event.id.clone()),
         });
+    }
+    if event.kind == "input_handled"
+        && let Some(id) = event.data["input_id"].as_str()
+    {
+        let input = engine.read_event(id)?;
+        if input.data["source"] == "user" {
+            ui.upsert_message(Message {
+                role: format!("你 · 已纳入 · {}", short_id(id)),
+                text: event_body(engine, &input)?,
+                event_id: Some(id.into()),
+                summary: None,
+            });
+        }
     }
     let job = event
         .job_id
@@ -1911,15 +2416,7 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         } else {
             ""
         };
-        let failed = event.data["error"].is_string()
-            || result.starts_with("错误：")
-            || result
-                .lines()
-                .next()
-                .is_some_and(|line| line.starts_with("exit: ") && line != "exit: 0")
-            || serde_json::from_str::<Value>(result)
-                .ok()
-                .is_some_and(|v| v.get("error").is_some());
+        let failed = tool_failed(engine, event)?;
         let phase = if event.kind == "tool_started" {
             "执行中"
         } else if event.data["uncertain"] == true {
@@ -1929,13 +2426,33 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         } else {
             "完成"
         };
-        let text = format!(
-            "{}{}{}\n{}",
-            phase,
-            if label.is_empty() { "" } else { " · " },
-            label,
-            result
-        );
+        let failure = if failed {
+            Some(tool_failure_observation(engine, event, result)?)
+        } else {
+            None
+        };
+        let text = if let Some((_, observation)) = &failure {
+            format!("{phase}\n{observation}\n{label}\n{result}")
+        } else {
+            format!(
+                "{}{}{}\n{}",
+                phase,
+                if label.is_empty() { "" } else { " · " },
+                label,
+                result
+            )
+        };
+        let summary = if let Some((exit, observation)) = failure {
+            Some(format!(
+                "失败{} · {observation}",
+                exit.map(|code| format!(" · exit {code}"))
+                    .unwrap_or_default()
+            ))
+        } else if event.kind == "tool_result" && event.data["uncertain"] != true {
+            Some(tool_summary(engine, event, result)?)
+        } else {
+            None
+        };
         let changes = arguments
             .as_ref()
             .map(|args| proposed_change_preview(name, args))
@@ -1946,6 +2463,7 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
             format!("{text}\n提议修改（以工具执行结果为准）\n{changes}")
         };
         ui.upsert_message(Message {
+            summary,
             role: format!("工具 · {name}"),
             text,
             event_id: Some(format!(
@@ -1964,6 +2482,7 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         let text = native_text(&event.data["response"]["choice"]);
         if !text.is_empty() {
             ui.push_message(Message {
+                summary: None,
                 role: "Agent · 进度".into(),
                 text,
                 event_id: Some(event.id.clone()),

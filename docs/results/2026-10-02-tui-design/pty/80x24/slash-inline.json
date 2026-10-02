@@ -1,0 +1,106 @@
+{
+  "scenario": "slash-inline",
+  "scope": "Real PTY; synthetic protocol fixture, no real model or personal credentials",
+  "status": "PASS",
+  "error": null,
+  "binary": "/Users/zzhang/Documents/ChatGPT/BONE/target/debug/bone",
+  "binary_sha256_at_start": "2ecd69d3717e865ba303e30c6834d3f3a99ca6023d3c0ba96ba9cfcb5f7adcac",
+  "frames": [
+    {
+      "step": "Start: idle terminal",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n 描述任务，BONE 会在当前工作区执行。                                            \n / 命令   @ 文件   Ctrl+F 搜索   F1 帮助                                        \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：暂无活动调用 · 输入 / 或 @ 显示候选 · Tab 补全 · Enter 发送 · F1 帮助    \n 输入目标：新要求 · Enter 发送                                                  \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 0,
+      "events": 0,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        23,
+        15
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Typing / shows commands without opening a separate panel",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n 描述任务，BONE 会在当前工作区执行。                                            \n / 命令   @ 文件   Ctrl+F 搜索   F1 帮助                                        \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n┌ 命令 · / · ↑↓ 选择 · Tab 插入 · Esc 关闭 ────────────────────────────────────┐\n│› /new  新对话，当前工作保存并暂停                                            │\n│  /sessions  搜索并打开当前项目的会话                                         │\n│  /model  选择模型配置；/model 原生名称可覆盖当前模型                         │\n│  /status  模型、执行限制、用量与未确认写入                                   │\n│  /diff  查看 Git 修改，包括 staged 与 unstaged                               │\n│  /files  插入项目文件引用                                                    │\n└──────────────────────────────────────────────────────────────────────────────┘\n│/                                                                              \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 0,
+      "events": 0,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        21,
+        32
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Candidate Enter inserts /status without executing it",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n 描述任务，BONE 会在当前工作区执行。                                            \n / 命令   @ 文件   Ctrl+F 搜索   F1 帮助                                        \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：暂无活动调用 · 已补全；Enter 才执行或发送                                \n 输入目标：新要求 · Enter 发送                                                  \n│/status                                                                        \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 0,
+      "events": 0,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        21,
+        10
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Tab inserts /status; no model request",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n 描述任务，BONE 会在当前工作区执行。                                            \n / 命令   @ 文件   Ctrl+F 搜索   F1 帮助                                        \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：暂无活动调用 · 已补全；Enter 才执行或发送                                \n 输入目标：新要求 · Enter 发送                                                  \n│/status                                                                        \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 0,
+      "events": 0,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        21,
+        10
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Status opens through the completed command",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n 描述任务，BONE 会在当前工作区执行。                                            \n┌ 会话状态 · Ctrl+P /audit 审计 · Esc 返回 ────────────────────────────────────┐\n│Session: e6129b6c-dd9b-4a4d-b071-801082a6086a                                 │\n│Workspace: /private/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-tui-p│\n│ty-t1pj7ow9/workspace                                                         │\n│Model: openai/openai:fixture                                                  │\n│Profile: fixture                                                              │\n│Mode: 可写                                                                    │\n│Status: 暂无活动调用                                                          │\n│                                                                              │\n│Limits                                                                        │\n│{                                                                             │\n│  \"max_calls\": 16,                                                            │\n│  \"max_jobs\": 16,                                                             │\n│  \"max_parallel\": 1,                                                          │\n│  \"context_chars\": 96000,                                                     │\n│  \"single_job\": false,                                                        │\n│  \"no_compaction\": false,                                                     │\n└──────────────────────────────────────────────────────────────────────────────┘\n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 0,
+      "events": 0,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        21,
+        33
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "Before exit: live alternate screen",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n 描述任务，BONE 会在当前工作区执行。                                            \n / 命令   @ 文件   Ctrl+F 搜索   F1 帮助                                        \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：暂无活动调用 · 已补全；Enter 才执行或发送                                \n 输入目标：新要求 · Enter 发送                                                  \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 0,
+      "events": 0,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        21,
+        2
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    }
+  ]
+}

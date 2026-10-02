@@ -100,6 +100,27 @@ pub fn save(data: &Path, session: &str, saved: &UiSaved) -> Result<()> {
     atomic_write(&session_path(data, session)?, &serde_json::to_vec(saved)?)
 }
 
+/// Jump to a durable delivery without loading a long session's tool bodies.
+pub fn latest_delivery(data: &Path, session: &str) -> Result<Option<bone::state::Event>> {
+    use rusqlite::OptionalExtension;
+    let connection = rusqlite::Connection::open_with_flags(
+        data.join("sessions.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let payload: Option<String> = connection
+        .query_row(
+            "SELECT payload FROM events WHERE session_id = ?1
+             AND json_extract(payload, '$.kind') = 'delivery'
+             ORDER BY sequence DESC LIMIT 1",
+            [session],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload
+        .map(|text| serde_json::from_str(&text).context("invalid durable delivery record"))
+        .transpose()
+}
+
 pub fn files(workspace: &Path) -> Result<Vec<String>> {
     let root = workspace
         .canonicalize()

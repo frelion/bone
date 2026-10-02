@@ -1,0 +1,26 @@
+{
+  "scenario": "editor-signal",
+  "scope": "Real PTY; synthetic protocol fixture, no real model or personal credentials",
+  "status": "PASS",
+  "error": null,
+  "binary": "/Users/zzhang/Documents/ChatGPT/BONE/target/debug/bone",
+  "binary_sha256_at_start": "2ecd69d3717e865ba303e30c6834d3f3a99ca6023d3c0ba96ba9cfcb5f7adcac",
+  "frames": [
+    {
+      "step": "Start: idle terminal",
+      "screen": " BONE / workspace                                                               \n────────────────────────────────────────────────────────────────────────────────\n 描述任务，BONE 会在当前工作区执行。                                            \n / 命令   @ 文件   Ctrl+F 搜索   F1 帮助                                        \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n────────────────────────────────────────────────────────────────────────────────\n 当前：暂无活动调用 · 输入 / 或 @ 显示候选 · Tab 补全 · Enter 发送 · F1 帮助    \n 输入目标：新要求 · Enter 发送                                                  \n│ 描述任务，或输入 / 命令、@ 文件                                               \n Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助                    \n 阅读：最新内容                                                                 ",
+      "requests": 0,
+      "events": 0,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        23,
+        15
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    }
+  ]
+}

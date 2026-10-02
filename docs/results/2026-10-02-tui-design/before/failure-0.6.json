@@ -1,0 +1,41 @@
+{
+  "scenario": "failure-0.6",
+  "scope": "Real PTY; synthetic protocol fixture, no real model or personal credentials",
+  "status": "PASS",
+  "error": null,
+  "binary": "/Users/zzhang/.cargo/bin/bone",
+  "frames": [
+    {
+      "step": "BONE 0.6 start before the design changes",
+      "screen": " BONE  · openai/openai:fixture · 就绪                                           \n 描述任务，BONE 会在当前工作区执行。                                            \n / 命令   @ 文件   Ctrl+F 搜索   F1 快捷键                                      \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n┌ 输入 · Enter 发送 · Shift+Enter 换行 ────────────────────────────────────────┐\n│ 描述任务，或输入 / 命令、@ 文件                                              │\n└──────────────────────────────────────────────────────────────────────────────┘\n 输入 / 或 @ 显示候选 · Tab 补全 · Enter 发送 · F1 帮助                         \n workspace · openai/openai:fixture · f65526f4 · 可写 · 就绪                     ",
+      "requests": 0,
+      "events": 0,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        23,
+        59
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    },
+    {
+      "step": "BONE 0.6 model failed, before quit",
+      "screen": " BONE  · openai/openai:fixture · 就绪                                           \n   你                                                                           \n Inspect this project.                                                          \n                                                                                \n   执行失败                                                                     \n ProviderResponseError: status 422 Unprocessable Entity: {\"error\": {\"message\":  \n \"scripted fixture error\", \"type\": \"fixture\"}}                                  \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n┌ 输入 · Enter 发送 · Shift+Enter 换行 ────────────────────────────────────────┐\n│ 描述任务，或输入 / 命令、@ 文件                                              │\n└──────────────────────────────────────────────────────────────────────────────┘\n 已保存 · 等待纳入执行；运行中可追加新要求                                      \n workspace · openai/openai:fixture · f65526f4 · 本次 1 / 16 calls · ? tokens ·  ",
+      "requests": 1,
+      "events": 4,
+      "size": [
+        24,
+        80
+      ],
+      "cursor": [
+        6,
+        46
+      ],
+      "paused": false,
+      "unknown_writes": 0
+    }
+  ]
+}

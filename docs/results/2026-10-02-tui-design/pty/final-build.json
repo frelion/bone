@@ -1,0 +1,77 @@
+{
+  "started_at": "2026-10-02T10:29:28.619316+00:00",
+  "binary": "/Users/zzhang/Documents/ChatGPT/BONE/target/debug/bone",
+  "binary_version": "bone 0.7.0",
+  "binary_sha256": "2ecd69d3717e865ba303e30c6834d3f3a99ca6023d3c0ba96ba9cfcb5f7adcac",
+  "git_head": "a0e88f1a53f09426f90ca35b35bdcc8ba224820e",
+  "source_fingerprint_sha256": "f9a8edb98eef74dbaba33fecbacfc9bddba78cb31f3aa60bd73d975e05f751ae",
+  "source_scope": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "src/config.rs",
+    "src/context.rs",
+    "src/lib.rs",
+    "src/main.rs",
+    "src/model.rs",
+    "src/runtime.rs",
+    "src/state.rs",
+    "src/store.rs",
+    "src/tools.rs",
+    "src/tui/services.rs",
+    "src/tui/view.rs",
+    "src/tui.rs"
+  ],
+  "harness_sha256": "6f6d2ca1fdc6f8f023113720fc40c0d554cc4511627a54a2b82da788590424ef",
+  "scope": "Real PTY, scripted loopback model, synthetic credentials, isolated temporary workspace/data",
+  "completed_at": "2026-10-02T10:31:41.580469+00:00",
+  "source_unchanged": true,
+  "harness_unchanged": true,
+  "binary_unchanged": true,
+  "case_count": 52,
+  "pass_count": 52,
+  "case_binary_hashes": [
+    "2ecd69d3717e865ba303e30c6834d3f3a99ca6023d3c0ba96ba9cfcb5f7adcac"
+  ],
+  "reading_overlay_border_checks": [
+    {
+      "suite_size": "80x24",
+      "frame_size": [
+        24,
+        80
+      ],
+      "scenario": "reading-detail",
+      "step": "Selected tool opens complete readable output",
+      "border_complete": true
+    },
+    {
+      "suite_size": "80x24",
+      "frame_size": [
+        40,
+        120
+      ],
+      "scenario": "reader-delivery",
+      "step": "Delivery entry opens the existing long answer directly",
+      "border_complete": true
+    },
+    {
+      "suite_size": "120x40",
+      "frame_size": [
+        40,
+        120
+      ],
+      "scenario": "reading-detail",
+      "step": "Selected tool opens complete readable output",
+      "border_complete": true
+    },
+    {
+      "suite_size": "120x40",
+      "frame_size": [
+        24,
+        80
+      ],
+      "scenario": "reader-delivery",
+      "step": "Delivery entry opens the existing long answer directly",
+      "border_complete": true
+    }
+  ]
+}
