@@ -278,24 +278,33 @@ fn long_agent_delivery_remains_readable_without_expanding() {
     view.toggle_selected_message();
     let expanded = message_lines(view.selected_message().unwrap(), 80, true, true);
     assert_eq!(expanded.len(), folded.len());
-    assert_eq!(
-        expanded
-            .iter()
-            .flat_map(|l| &l.spans)
-            .map(|s| s.content.as_ref())
+    let visible_text = |rows: &[Line<'_>]| {
+        rows.iter()
+            .flat_map(|line| {
+                line.spans
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, span)| {
+                        !(*index == 0 && matches!(span.content.as_ref(), "› " | "  "))
+                    })
+                    .flat_map(|(_, span)| {
+                        span.content
+                            .chars()
+                            .filter(|character| !character.is_whitespace())
+                    })
+            })
             .collect::<String>()
-            .matches("中文原文")
-            .count(),
-        4000
-    );
-    assert!(
-        folded
-            .iter()
-            .flat_map(|line| &line.spans)
-            .map(|span| span.content.as_ref())
-            .collect::<String>()
-            .contains("交付尾部")
-    );
+    };
+    let expected = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    for rows in [&folded, &expanded] {
+        let visible = visible_text(rows);
+        assert_eq!(visible, expected);
+        assert_eq!(visible.matches("中文原文").count(), 4000);
+        assert!(visible.ends_with("交付尾部"));
+    }
     assert_eq!(view.selected_message().unwrap().text, text);
 }
 
@@ -381,6 +390,33 @@ fn inline_completion_preserves_typing_and_selection_paste_undo() {
     view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
     view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
     assert_eq!(view.selected_input_text().as_deref(), Some("lo"));
+    use ratatui::{Terminal, backend::TestBackend};
+    let state = bone::state::SessionState::new("/tmp/work");
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| {
+            view.render(frame, &state, "m", "idle");
+            // Monochrome terminals discard color while preserving text attributes.
+            for cell in &mut frame.buffer_mut().content {
+                cell.fg = Color::Reset;
+                cell.bg = Color::Reset;
+            }
+        })
+        .unwrap();
+    let position = terminal.backend().cursor_position();
+    let cursor = &terminal.backend().buffer()[(position.x, position.y)];
+    let selected_tail = &terminal.backend().buffer()[(position.x + 1, position.y)];
+    assert!(terminal.backend().cursor_visible());
+    assert_eq!(cursor.symbol(), "l");
+    assert!(cursor.modifier.contains(Modifier::REVERSED));
+    assert_eq!(selected_tail.symbol(), "o");
+    assert!(selected_tail.modifier.contains(Modifier::UNDERLINED));
+    assert!(!selected_tail.modifier.contains(Modifier::REVERSED));
+    assert!(
+        !terminal.backend().buffer()[(position.x - 1, position.y)]
+            .modifier
+            .contains(Modifier::UNDERLINED)
+    );
     view.handle_paste("世界");
     assert_eq!(view.draft(), "中文\nhel世界");
     view.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
@@ -988,11 +1024,12 @@ fn overlay_borders_survive_terminal_diff_over_chinese_background() {
     for (width, height) in [(80, 24), (120, 40)] {
         let mut view = View::new();
         view.push_message(Message {
-            role: "Agent".into(),
-            text: "修复过期 token；保留原接口。".into(),
+            role: "Agent · 输出中（未交付）".into(),
+            text: "修复过期".repeat(200),
             event_id: Some("background".into()),
             summary: None,
         });
+        view.follow_conversation = false;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| view.render(frame, &state, "m", "idle"))
@@ -1003,13 +1040,238 @@ fn overlay_borders_survive_terminal_diff_over_chinese_background() {
         terminal
             .draw(|frame| view.render(frame, &state, "m", "idle"))
             .unwrap();
-        let rect = overlay_rect(Rect::new(0, 0, width, height));
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(rect.x, rect.y)].symbol(), "┌");
-        assert_eq!(buffer[(rect.right() - 1, rect.y)].symbol(), "┐");
-        for row in rect.y + 1..rect.bottom() - 1 {
-            assert_eq!(buffer[(rect.x, row)].symbol(), "│");
-            assert_eq!(buffer[(rect.right() - 1, row)].symbol(), "│");
+        let top = (0..height)
+            .find(|&row| buffer[(0, row)].symbol() == "┌")
+            .expect("overlay top corner is drawn");
+        let bottom = (top + 1..height)
+            .find(|&row| buffer[(0, row)].symbol() == "└")
+            .expect("overlay bottom corner is drawn");
+        assert_eq!(buffer[(width - 1, top)].symbol(), "┐");
+        for row in top + 1..bottom {
+            assert_eq!(buffer[(0, row)].symbol(), "│");
+            assert_eq!(buffer[(width - 1, row)].symbol(), "│");
         }
     }
+}
+
+#[test]
+fn transcript_keeps_original_paragraphs_without_person_role_headers() {
+    let user = Message {
+        role: "你 · 已纳入 · ab123456".into(),
+        text: "请解释原因".into(),
+        event_id: Some("user".into()),
+        summary: None,
+    };
+    let answer = Message {
+        role: "Agent".into(),
+        text: "这是具体原因。".into(),
+        event_id: Some("answer".into()),
+        summary: None,
+    };
+    let user_rows = message_lines(&user, 78, false, false);
+    let answer_rows = message_lines(&answer, 78, false, false);
+    assert!(user_rows[0].spans[0].content.starts_with("│ "));
+    let visible = user_rows
+        .iter()
+        .chain(&answer_rows)
+        .flat_map(|line| &line.spans)
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    for hidden in ["你 ·", "Agent", "ab123456", "已纳入"] {
+        assert!(!visible.contains(hidden));
+    }
+    assert!(visible.contains("请解释原因"));
+    assert!(visible.contains("这是具体原因。"));
+    let question = Message {
+        role: "Agent · 提问".into(),
+        text: "要使用哪个状态码？".into(),
+        event_id: Some("q".into()),
+        summary: None,
+    };
+    assert_eq!(
+        message_lines(&question, 78, false, false)[0].spans[0].content,
+        "提问"
+    );
+}
+
+#[test]
+fn composer_keeps_chinese_first_character_and_native_cursor_through_wrap_and_focus() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let state = bone::state::SessionState::new("/tmp/work");
+    for (width, height) in [(80, 24), (120, 40)] {
+        let mut view = View::new();
+        view.paste("首字中文");
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
+            .unwrap();
+        assert!(terminal.backend().cursor_visible());
+        let position = terminal.backend().cursor_position();
+        assert_eq!(position.x, 9);
+        assert_eq!(terminal.backend().buffer()[(1, position.y)].symbol(), "首");
+        assert!(
+            terminal.backend().buffer()[(position.x, position.y)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        view.take_draft();
+        view.paste("首中文字abc\n末尾");
+        terminal
+            .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
+            .unwrap();
+        let draft = view.draft();
+        let cursor = view.cursor();
+        for (resize_width, resize_height) in [(12, 10), (width, height)] {
+            terminal.backend_mut().resize(resize_width, resize_height);
+            terminal
+                .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
+                .unwrap();
+            assert_eq!(view.draft(), draft);
+            assert_eq!(view.cursor(), cursor);
+        }
+        let position = terminal.backend().cursor_position();
+        assert_eq!(position.x, 5);
+        assert_eq!(terminal.backend().buffer()[(1, position.y)].symbol(), "末");
+        assert_eq!(
+            terminal.backend().buffer()[(1, position.y - 1)].symbol(),
+            "首"
+        );
+        let first_row = (1..width)
+            .map(|x| terminal.backend().buffer()[(x, position.y - 1)].symbol())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(first_row.contains("首中文字abc"));
+        view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(view.selected_input_text().as_deref(), Some("尾"));
+        let selected_cursor = view.cursor();
+        for (resize_width, resize_height) in [(12, 10), (width, height)] {
+            terminal.backend_mut().resize(resize_width, resize_height);
+            terminal
+                .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
+                .unwrap();
+            assert_eq!(view.selected_input_text().as_deref(), Some("尾"));
+            assert_eq!(view.cursor(), selected_cursor);
+        }
+        view.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert!(view.draft().is_empty());
+        view.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT));
+        assert_eq!(view.draft(), draft);
+        view.paste(&format!("\n{}\n末尾", "中".repeat(180)));
+        terminal
+            .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
+            .unwrap();
+        let position = terminal.backend().cursor_position();
+        assert_eq!(position.x, 5);
+        assert_eq!(terminal.backend().buffer()[(1, position.y)].symbol(), "末");
+        assert_eq!(terminal.backend().buffer()[(3, position.y)].symbol(), "尾");
+        let wrapped_cursor = view.cursor();
+        for (resize_width, resize_height) in [(12, 10), (width, height)] {
+            terminal.backend_mut().resize(resize_width, resize_height);
+            terminal
+                .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
+                .unwrap();
+            assert_eq!(view.cursor(), wrapped_cursor);
+        }
+        let position = terminal.backend().cursor_position();
+        assert_eq!(position.x, 5);
+        assert_eq!(terminal.backend().buffer()[(1, position.y)].symbol(), "末");
+        assert_eq!(terminal.backend().buffer()[(3, position.y)].symbol(), "尾");
+        view.handle_key(key(KeyCode::F(6)));
+        terminal
+            .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
+            .unwrap();
+        assert!(!terminal.backend().cursor_visible());
+        view.handle_key(key(KeyCode::F(6)));
+        view.open_completion(
+            PickerKind::Command,
+            vec![PickerItem {
+                label: "help".into(),
+                detail: String::new(),
+                value: "/help".into(),
+            }],
+            String::new(),
+        );
+        terminal
+            .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
+            .unwrap();
+        assert!(terminal.backend().cursor_visible());
+        view.close_completion();
+        view.open_help();
+        terminal
+            .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
+            .unwrap();
+        assert!(!terminal.backend().cursor_visible());
+    }
+}
+
+#[test]
+fn running_action_and_receipt_remain_separate_while_input_stays_editable() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let state = bone::state::SessionState::new("/tmp/work");
+    let mut view = View::new();
+    view.busy = true;
+    view.live_status = "shell · cargo check · 12s".into();
+    view.feedback_detail = "已发送 · 草稿已清空".into();
+    view.reply_label = "新要求 · Enter 发送".into();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    let initial = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(80)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>();
+    let action_row = initial
+        .iter()
+        .position(|line| line.contains("cargo check"))
+        .unwrap();
+    let receipt_row = initial
+        .iter()
+        .position(|line| line.replace(' ', "").contains("草稿已清空"))
+        .unwrap();
+    assert_ne!(action_row, receipt_row);
+    assert!(
+        !initial
+            .iter()
+            .any(|line| line.replace(' ', "").contains("输入目标"))
+    );
+    assert!(initial[action_row].contains("12s"));
+    view.spinner_tick = 1;
+    view.paste("继续补充");
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    let next_action = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(80)
+        .nth(action_row)
+        .unwrap()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert_ne!(initial[action_row], next_action);
+    assert_eq!(view.draft(), "继续补充");
+    assert!(terminal.backend().cursor_visible());
+    view.open_detail("结果", "captured raw");
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    let action = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(80)
+        .nth(action_row)
+        .unwrap()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(action.contains("cargo check"));
+    assert!(action.contains("12s"));
 }

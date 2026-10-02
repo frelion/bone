@@ -29,7 +29,7 @@ bone --version
 bone providers
 ```
 
-安装后的版本应为 `bone 0.7.0`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
+安装后的版本应为 `bone 0.7.1`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
 
 `target/release/bone` 是构建目录内的文件，只有在包含它的 checkout 中才能通过相对路径运行。安装后的 `bone` 可在任意项目目录中使用。
 
@@ -124,6 +124,10 @@ bone --profile subscription tui --session SESSION_ID
 ```
 
 TUI 默认显示全宽对话、Markdown 答复和工具行动，复用现有订阅与模型配置。Job 由 Agent 自动管理。原生 Rig 流实时显示为“输出中（未交付）”；新要求、暂停或调用结束会清除旧预览，正式交付以 SQLite 记录为准。
+
+默认正文不显示“你 / Agent”标题，原话以细竖线区分。输入框显示编辑焦点和真实终端光标。运行行固定显示实际动作、耗时与活动标记；输入回执独立显示，后台仍在执行时不会被较早的交付覆盖。
+
+本轮修复、改前后终端过程及真实模型复验见 [0.7.1 反馈修复](docs/results/2026-10-02-tui-feedback/README.md)。
 
 | 操作 | 按键 / 命令 |
 | --- | --- |

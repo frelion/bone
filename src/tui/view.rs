@@ -106,6 +106,7 @@ struct TemporaryDraft {
 #[derive(Debug)]
 pub(super) struct View {
     editor: TextArea<'static>,
+    editor_size: Option<(u16, u16)>,
     pub reply_label: String,
     message_selected: Option<usize>,
     expanded: std::collections::HashSet<String>,
@@ -115,6 +116,8 @@ pub(super) struct View {
     pub session_label: String,
     pub busy: bool,
     pub live_status: String,
+    pub feedback_detail: String,
+    pub spinner_tick: usize,
     pub picker: Option<Picker>,
     history: Vec<String>,
     history_index: Option<usize>,
@@ -155,6 +158,7 @@ impl View {
     pub fn new() -> Self {
         Self {
             editor: new_editor(),
+            editor_size: None,
             reply_label: String::new(),
             message_selected: None,
             expanded: Default::default(),
@@ -164,6 +168,8 @@ impl View {
             session_label: String::new(),
             busy: false,
             live_status: String::new(),
+            feedback_detail: String::new(),
+            spinner_tick: 0,
             picker: None,
             history: Vec::new(),
             history_index: None,
@@ -1113,8 +1119,11 @@ impl View {
             );
             return;
         }
-        let input_width = area.width.saturating_sub(2).max(1) as usize;
-        let input_height = wrap(&self.draft(), input_width).len().clamp(1, 5) as u16;
+        let input_width = area.width.saturating_sub(1).max(1) as usize;
+        let draft_rows = wrap(&self.draft(), input_width).len();
+        let input_height = draft_rows.clamp(1, 5) as u16 + 2;
+        let explicit_target =
+            !self.reply_label.is_empty() && !self.reply_label.starts_with("新要求");
         let regions = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1123,7 +1132,7 @@ impl View {
                 Constraint::Min(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(u16::from(explicit_target)),
                 Constraint::Length(input_height),
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -1141,12 +1150,10 @@ impl View {
             )),
             regions[0],
         );
-        for index in [1, 3] {
-            frame.render_widget(
-                Paragraph::new("─".repeat(area.width as usize)).style(Style::default().fg(MUTED)),
-                regions[index],
-            );
-        }
+        frame.render_widget(
+            Paragraph::new("─".repeat(area.width as usize)).style(Style::default().fg(MUTED)),
+            regions[1],
+        );
         if self.show_activity {
             self.render_activity(frame, regions[2]);
         } else {
@@ -1281,47 +1288,89 @@ impl View {
         } else {
             &self.live_status
         };
-        let fact = if self.notice.is_empty() {
-            Self::sanitize(fact)
-        } else {
+        let running = if self.busy {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
             format!(
-                "{} · {}",
-                Self::sanitize(fact),
-                Self::sanitize(&self.notice).replace('\n', " ")
+                " {} {}",
+                frames[self.spinner_tick % frames.len()],
+                Self::sanitize(fact)
             )
+        } else {
+            format!(" {}", Self::sanitize(fact))
         };
         frame.render_widget(
-            Paragraph::new(format!(" 当前：{fact}")).style(Style::default().fg(ACCENT)),
+            Paragraph::new(running).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            regions[3],
+        );
+        let feedback = if self.feedback_detail.is_empty() {
+            &self.notice
+        } else {
+            &self.feedback_detail
+        };
+        frame.render_widget(
+            Paragraph::new(fit_line(
+                &format!(" {}", Self::sanitize(feedback).replace('\n', " ")),
+                area.width as usize,
+            ))
+            .style(Style::default().fg(MUTED)),
             regions[4],
         );
-        let target = if self.reply_label.is_empty() {
-            "新要求"
-        } else {
-            &self.reply_label
-        };
-        frame.render_widget(
-            Paragraph::new(format!(" 输入目标：{}", Self::sanitize(target)))
-                .style(Style::default().fg(MUTED)),
-            regions[5],
-        );
-        self.editor
-            .set_block(
-                Block::default()
-                    .borders(Borders::LEFT)
-                    .border_style(Style::default().fg(if self.focus == Focus::Input {
-                        ACCENT
-                    } else {
-                        MUTED
-                    })),
+        if explicit_target {
+            frame.render_widget(
+                Paragraph::new(format!(" {}", Self::sanitize(&self.reply_label))),
+                regions[5],
             );
-        self.editor
-            .set_cursor_style(if self.focus == Focus::Input && !self.has_modal() {
-                Style::default().add_modifier(Modifier::REVERSED)
+        }
+        let editing = self.focus == Focus::Input && !self.has_modal() && !self.show_activity;
+        let mut input_title = if editing {
+            if self.busy {
+                " 输入中 · 运行时可继续输入 ".to_owned()
             } else {
-                Style::default()
-            });
+                " 输入中 ".to_owned()
+            }
+        } else if self.has_modal() {
+            " 草稿保留 · Esc 返回上一层 ".to_owned()
+        } else {
+            " 草稿只读 · F6 返回编辑 ".to_owned()
+        };
+        if draft_rows > 1 {
+            input_title.push_str(&format!("· 多行 {draft_rows} "));
+        }
+        self.editor.set_block(
+            Block::default()
+                .borders(Borders::TOP | Borders::BOTTOM | Borders::LEFT)
+                .title(input_title)
+                .border_style(Style::default().fg(if editing { ACCENT } else { MUTED })),
+        );
+        self.editor.set_cursor_style(if editing {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        });
         frame.render_widget(&self.editor, regions[6]);
-        let keys = if self.show_activity {
+        let editor_inner = self.editor.block().unwrap().inner(regions[6]);
+        let editor_size = (editor_inner.width, editor_inner.height);
+        if self.editor_size != Some(editor_size) {
+            // Native rendering refreshes the wrap map first. Reset the old viewport,
+            // then restore the original text cursor; both APIs preserve selection.
+            let cursor = self.editor.cursor();
+            if let (Ok(row), Ok(col)) = (u16::try_from(cursor.0), u16::try_from(cursor.1)) {
+                for _ in 0..3 {
+                    self.editor.scroll((-i16::MAX, 0));
+                }
+                self.editor.move_cursor(CursorMove::Jump(row, col));
+                frame.render_widget(Clear, regions[6]);
+                frame.render_widget(&self.editor, regions[6]);
+            }
+            self.editor_size = Some(editor_size);
+        }
+        let keys = if self.has_modal() {
+            if self.picker.is_some() {
+                "候选：↑↓ 选择 · Enter 确认 · Esc 返回上一层"
+            } else {
+                "阅读层：↑↓ / PageDown 滚动 · Esc 返回上一层 · Ctrl+C 暂停"
+            }
+        } else if self.show_activity {
             "审计：↑↓ 选择 · Enter 原文 · Esc 返回"
         } else if self.focus == Focus::Input {
             "Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助"
@@ -1358,14 +1407,15 @@ impl View {
         if let Some(picker) = &self.picker {
             let rect = if picker.inline {
                 let height = (filtered(picker).len().clamp(1, 6) + 2) as u16;
+                let height = height.min(regions[2].height);
                 Rect::new(
-                    regions[6].x,
-                    regions[6].y.saturating_sub(height),
-                    regions[6].width,
-                    height.min(regions[6].y.saturating_sub(area.y)),
+                    regions[2].x,
+                    regions[2].bottom().saturating_sub(height),
+                    regions[2].width,
+                    height,
                 )
             } else {
-                overlay_rect(area)
+                overlay_rect(regions[2])
             };
             frame.render_widget(Clear, rect);
             frame.render_widget(
@@ -1422,14 +1472,14 @@ impl View {
                 inner,
             );
         } else if self.show_help {
-            let help = "直接输入任务，Enter 发送。\nShift+Enter / Alt+Enter / Ctrl+J 换行；粘贴多行保持在输入框。\n↑↓ 移动光标；Alt+↑↓ 召回历史；Ctrl+←→ 移动单词。\nCtrl+A/E 行首尾；Ctrl+K 删除至行尾；Ctrl+W 删除单词。\nShift+方向键选区；Ctrl+Y复制选区或当前原文。\nCtrl+Z 撤销 / Alt+Z 重做；Ctrl+F 搜索对话。\nCtrl+P 命令菜单；Ctrl+O / @文件 Tab 引用；Ctrl+G 外部编辑器。\nF6 切换输入与阅读；Tab 只插入补全或编辑。Esc 返回上一层。\n对话：↑↓ / j k 选择消息；Enter 展开折叠；d 原文；y 复制。\nPageUp / PageDown 滚动，Home / End 到首尾。\nAgent 交付保留完整段落；工具默认摘要，Enter 展开。\n窗口最多256条/8MiB，单条128KiB预览。\n展开预览；d 原文 / y 复制完整记录；Ctrl+F 搜索持久历史。\n活动展示最近 400 条：上下选择，Enter 浏览原生事件详情。\nF2 打开审计；Esc 返回原阅读位置。\nCtrl+C 暂停；Ctrl+Y 复制选区或原文；Ctrl+R 恢复；Ctrl+Q 退出。\n\nF1 或 Esc 关闭帮助。";
+            let help = "直接输入任务，Enter 发送。\nShift+Enter / Alt+Enter / Ctrl+J 换行；粘贴多行保持在输入框。\n↑↓ 移动光标；Alt+↑↓ 召回历史；Ctrl+←→ 移动单词。\nCtrl+A/E 行首尾；Ctrl+K 删除至行尾；Ctrl+W 删除单词。\nShift+方向键选区；Ctrl+Y复制选区或当前原文。\nCtrl+Z 撤销 / Alt+Z 重做；Ctrl+F 搜索对话。\nCtrl+P 命令菜单；Ctrl+O / @文件 Tab 引用；Ctrl+G 外部编辑器。\nF6 切换输入与阅读；Tab 只插入补全或编辑。Esc 返回上一层。\n对话：↑↓ / j k 选择消息；Enter 展开折叠；d 原文；y 复制。\nPageUp / PageDown 滚动，Home / End 到首尾。\n交付保留完整段落；工具默认摘要，Enter 展开。\n窗口最多256条/8MiB，单条128KiB预览。\n展开预览；d 原文 / y 复制完整记录；Ctrl+F 搜索持久历史。\n活动展示最近 400 条：上下选择，Enter 浏览原生事件详情。\nF2 打开审计；Esc 返回原阅读位置。\nCtrl+C 暂停；Ctrl+Y 复制选区或原文；Ctrl+R 恢复；Ctrl+Q 退出。\n\nF1 或 Esc 关闭帮助。";
             let commands = super::COMMANDS
                 .iter()
                 .map(|(name, _)| *name)
                 .collect::<Vec<_>>()
                 .join(" ");
             let help_text = format!("{help}\n\n{commands}");
-            let width = overlay_rect(area).width.saturating_sub(2).max(1) as usize;
+            let width = overlay_rect(regions[2]).width.saturating_sub(2).max(1) as usize;
             preserve_overlay_offset(
                 &help_text,
                 self.detail_width,
@@ -1439,18 +1489,18 @@ impl View {
             self.detail_width = width;
             self.detail_max = render_overlay(
                 frame,
-                area,
+                regions[2],
                 " 帮助 · ↑↓ / PageDown 滚动 · Esc 返回 ",
                 &help_text,
                 &mut self.detail_scroll,
             );
         } else if let Some((title, detail)) = &self.detail {
-            let width = overlay_rect(area).width.saturating_sub(2).max(1) as usize;
+            let width = overlay_rect(regions[2]).width.saturating_sub(2).max(1) as usize;
             preserve_overlay_offset(detail, self.detail_width, width, &mut self.detail_scroll);
             self.detail_width = width;
             self.detail_max = render_overlay(
                 frame,
-                area,
+                regions[2],
                 &format!(
                     " {} · Ctrl+P /audit 审计 · Esc 返回 ",
                     Self::sanitize(title)
@@ -1460,6 +1510,23 @@ impl View {
             );
         } else {
             self.detail_scroll = 0;
+        }
+        if editing {
+            let inner = self
+                .editor
+                .block()
+                .map_or(regions[6], |block| block.inner(regions[6]));
+            let cursor = {
+                let buffer = frame.buffer_mut();
+                (inner.y..inner.bottom()).find_map(|y| {
+                    (inner.x..inner.right())
+                        .find(|&x| buffer[(x, y)].modifier.contains(Modifier::REVERSED))
+                        .map(|x| (x, y))
+                })
+            };
+            if let Some(cursor) = cursor {
+                frame.set_cursor_position(cursor);
+            }
         }
         if std::env::var_os("NO_COLOR").is_some()
             || std::env::var("TERM").is_ok_and(|term| term == "dumb")
@@ -1596,7 +1663,11 @@ fn new_editor() -> TextArea<'static> {
     editor.set_wrap_mode(WrapMode::Glyph);
     editor.set_max_histories(100);
     editor.set_cursor_line_style(Style::default());
-    editor.set_selection_style(Style::default().bg(Color::DarkGray));
+    editor.set_selection_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::UNDERLINED),
+    );
     editor.set_placeholder_text("描述任务，或输入 / 命令、@ 文件");
     editor.set_placeholder_style(Style::default().fg(MUTED));
     editor
@@ -1621,12 +1692,12 @@ fn message_key(message: &Message) -> String {
         format!("anonymous:{:x}", hash.finish())
     })
 }
-fn message_lines(
+fn message_projection(
     message: &Message,
     width: usize,
     expanded: bool,
     selected: bool,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let tool = message.role.starts_with("工具");
     let status = if message.role.contains("失败")
         || message.role.contains("错误")
@@ -1669,6 +1740,7 @@ fn message_lines(
         ACCENT
     };
     let mut result = Vec::new();
+    let mut offsets = Vec::new();
     let fallback = if status == Color::Red {
         let mut lines = message.text.lines().filter(|line| !line.trim().is_empty());
         let first = lines.next().unwrap_or("失败");
@@ -1715,25 +1787,77 @@ fn message_lines(
                 }
             }
         }
-    } else {
+    } else if tool {
         result.push(Line::styled(
-            format!("{} {}", if selected { "›" } else { " " }, message.role),
+            format!(
+                "{} {} · 原文",
+                if selected { "›" } else { " " },
+                message.role.trim_start_matches("工具 · ")
+            ),
             Style::default().fg(status).add_modifier(Modifier::BOLD),
         ));
-        if tool {
-            result.extend(
-                wrap(&message.text, width)
-                    .into_iter()
-                    .map(|s| Line::styled(s, Style::default().fg(MUTED))),
-            );
+        offsets.push(0);
+        let body = wrap(&message.text, width)
+            .into_iter()
+            .map(|line| Line::styled(line, Style::default().fg(MUTED)))
+            .collect::<Vec<_>>();
+        offsets.extend(source_offsets(&message.text, &body));
+        result.extend(body);
+    } else {
+        let user =
+            message.role.starts_with('你') || matches!(message.role.as_str(), "用户" | "User");
+        let state = if message.role.contains("提问") {
+            Some("提问")
+        } else if message.role.contains("输出中") || message.role.contains("未交付") {
+            Some("输出中 · 尚未交付")
+        } else if status == Color::Red {
+            Some("执行失败")
         } else {
-            result.extend(markdown(&message.text, width));
+            None
+        };
+        if let Some(state) = state {
+            result.push(Line::styled(
+                state,
+                Style::default().fg(status).add_modifier(Modifier::BOLD),
+            ));
+            offsets.push(0);
         }
+        let indent = if user || selected { 2 } else { 0 };
+        let mut body = markdown(&message.text, width.saturating_sub(indent).max(1));
+        offsets.extend(source_offsets(&message.text, &body));
+        for (index, line) in body.iter_mut().enumerate() {
+            if user || selected {
+                line.spans.insert(
+                    0,
+                    Span::raw(if selected && index == 0 {
+                        "› "
+                    } else if user {
+                        "│ "
+                    } else {
+                        "  "
+                    }),
+                );
+            }
+        }
+        result.extend(body);
     }
-    if !tool || expanded {
+    if tool && !expanded {
+        offsets.push(0);
+        offsets.extend(source_offsets(&message.text, &result[1..]));
+    } else {
+        offsets.push(offsets.last().copied().unwrap_or(0));
         result.push(Line::from(""));
     }
-    result
+    (result, offsets)
+}
+
+fn message_lines(
+    message: &Message,
+    width: usize,
+    expanded: bool,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    message_projection(message, width, expanded, selected).0
 }
 
 fn fit_line(text: &str, width: usize) -> String {
@@ -1782,28 +1906,6 @@ fn source_offsets(text: &str, rows: &[Line<'_>]) -> Vec<usize> {
             start.unwrap_or(cursor)
         })
         .collect()
-}
-
-fn message_projection(
-    message: &Message,
-    width: usize,
-    expanded: bool,
-    selected: bool,
-) -> (Vec<Line<'static>>, Vec<usize>) {
-    let lines = message_lines(message, width, expanded, selected);
-    let mut offsets = vec![0; lines.len()];
-    let compact_tool = message.role.starts_with("工具") && !expanded;
-    let body_end = lines.len().saturating_sub(usize::from(!compact_tool));
-    if body_end > 1 {
-        let body = &lines[1..body_end];
-        let mapped = source_offsets(&message.text, body);
-        offsets[1..body_end].copy_from_slice(&mapped);
-        if !compact_tool {
-            // Blank paragraph separators retain the preceding source location.
-            offsets[body_end] = offsets[body_end - 1];
-        }
-    }
-    (lines, offsets)
 }
 
 fn preserve_overlay_offset(text: &str, old_width: usize, new_width: usize, scroll: &mut usize) {

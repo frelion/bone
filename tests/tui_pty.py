@@ -32,7 +32,7 @@ def tool(name, arguments):
 
 
 class Fixture:
-    def __init__(self, binary, turns, size=(30, 110)):
+    def __init__(self, binary, turns, size=(30, 110), max_parallel=1):
         self.directory = tempfile.TemporaryDirectory(prefix="bone-tui-pty-")
         self.root = Path(self.directory.name)
         self.data = self.root / "data"
@@ -79,14 +79,17 @@ auth = "Bearer"
         env["PATH"] = str(self.root) + os.pathsep + env.get("PATH", "")
         self.env = env
         self.binary = binary
+        self.max_parallel = max_parallel
         self.binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
         self.proc = subprocess.Popen([str(binary), "--data-dir", str(self.data), "--profile", "fixture", "tui",
-            "--workspace", str(self.workspace), "--max-parallel", "1", "--max-calls", "16"],
+            "--workspace", str(self.workspace), "--max-parallel", str(max_parallel), "--max-calls", "16"],
             stdin=self.slave, stdout=self.slave, stderr=self.slave, env=env, start_new_session=True)
         self.output = bytearray()
         self.answered_queries = 0
         self.frames = []
         self.terminal_cursor = (0, 0)
+        self.cursor_visible = False
+        self.cell_styles = []
 
     def resize(self, rows, cols):
         self.rows, self.cols = rows, cols
@@ -132,7 +135,13 @@ auth = "Bearer"
     def screen(self):
         """Replay the VT operations emitted by ratatui, including cursor diff updates."""
         grid = [[" " for _ in range(self.cols)] for _ in range(self.rows)]
+        styles = [[(None, None, ()) for _ in range(self.cols)] for _ in range(self.rows)]
+        foreground = background = None
+        attributes = set()
+        cursor_visible = True
         row = col = 0
+        def current_style():
+            return foreground, background, tuple(sorted(attributes))
         def erase_span(y, start, end):
             if not 0 <= y < self.rows:
                 return
@@ -140,19 +149,49 @@ auth = "Bearer"
                 # Erasing either half of a wide glyph removes the glyph itself.
                 if grid[y][x] == "" and x > 0:
                     grid[y][x - 1] = " "
+                    styles[y][x - 1] = current_style()
                 if x + 1 < self.cols and grid[y][x + 1] == "":
                     grid[y][x + 1] = " "
+                    styles[y][x + 1] = current_style()
                 grid[y][x] = " "
+                styles[y][x] = current_style()
         source = self.output.decode("utf-8", errors="replace")
         source = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", source)
         tokens = re.findall(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b.|[^\x1b]", source)
         for token in tokens:
             if token.startswith("\x1b["):
                 args, op = token[2:-1], token[-1]
+                if args == '?25' and op in 'hl':
+                    cursor_visible = op == 'h'
+                    continue
                 if any(ch not in "0123456789;" for ch in args):
                     continue
                 values = [int(v) if v else 0 for v in args.split(";")] if args else [0]
                 n = values[0] or 1
+                if op == 'm':
+                    i = 0
+                    names = {1:'bold',2:'dim',3:'italic',4:'underline',5:'blink',6:'blink',7:'reverse',8:'hidden',9:'strike'}
+                    resets = {22:('bold','dim'),23:('italic',),24:('underline',),25:('blink',),27:('reverse',),28:('hidden',),29:('strike',)}
+                    while i < len(values):
+                        value = values[i]
+                        if value == 0: foreground = background = None; attributes.clear()
+                        elif value in names: attributes.add(names[value])
+                        elif value in resets: attributes.difference_update(resets[value])
+                        elif 30 <= value <= 37 or 90 <= value <= 97: foreground = ('ansi',value)
+                        elif 40 <= value <= 47 or 100 <= value <= 107: background = ('ansi',value)
+                        elif value == 39: foreground = None
+                        elif value == 49: background = None
+                        elif value in (38,48) and i + 2 < len(values):
+                            if values[i + 1] == 5:
+                                color = ('index',values[i + 2]); i += 2
+                            elif values[i + 1] == 2 and i + 4 < len(values):
+                                color = ('rgb',*values[i + 2:i + 5]); i += 4
+                            else:
+                                color = None
+                            if value == 38: foreground = color
+                            else: background = color
+                        i += 1
+                    continue
                 if op in "Hf":
                     row = max(0, values[0] - 1)
                     col = max(0, (values[1] if len(values) > 1 else 1) - 1)
@@ -166,6 +205,7 @@ auth = "Bearer"
                 elif op == "d": row = n - 1
                 elif op == "J" and values[0] in (2, 3):
                     grid = [[" " for _ in range(self.cols)] for _ in range(self.rows)]
+                    styles = [[current_style() for _ in range(self.cols)] for _ in range(self.rows)]
                 elif op == "J" and values[0] == 0:
                     erase_span(row, col, self.cols)
                     for y in range(row + 1, self.rows): erase_span(y, 0, self.cols)
@@ -194,9 +234,23 @@ auth = "Bearer"
                     width = 2 if unicodedata.east_asian_width(token) in "WF" else 1
                     erase_span(row, col, col + width)
                     grid[row][col] = token
-                    if width == 2 and col + 1 < self.cols: grid[row][col + 1] = ""
+                    styles[row][col] = current_style()
+                    if width == 2 and col + 1 < self.cols:
+                        grid[row][col + 1] = ""
+                        styles[row][col + 1] = current_style()
                     col += width
         self.terminal_cursor = (row, col)
+        self.terminal_cells = grid
+        self.cursor_visible = cursor_visible
+        self.cell_styles = []
+        for y, line in enumerate(styles):
+            start = 0
+            while start < self.cols:
+                end = start + 1
+                while end < self.cols and line[end] == line[start]: end += 1
+                if line[start] != (None, None, ()):
+                    self.cell_styles.append({'row':y,'start':start,'end':end,'fg':line[start][0],'bg':line[start][1],'attributes':line[start][2]})
+                start = end
         return "\n".join("".join(line) for line in grid)
 
     def capture(self, label):
@@ -210,17 +264,22 @@ auth = "Bearer"
         self.frames.append({"step": label, "screen": screen, "requests": len(self.calls()),
             "events": len(self.events()), "size": [self.rows, self.cols],
             "cursor": list(self.terminal_cursor), "paused": snapshot.get("paused"),
-            "unknown_writes": len(snapshot.get("unknown_writes", {}))})
+            "cursor_visible": self.cursor_visible, "cell_styles": self.cell_styles,
+            "cells": self.terminal_cells,
+            "unknown_writes": len(snapshot.get("unknown_writes", {})),
+            "running_jobs": sum(str(job.get('state','')).lower() == 'running' for job in snapshot.get('jobs', {}).values()),
+            "job_states": {key:job.get('state') for key,job in snapshot.get('jobs', {}).items()}})
 
     def evidence(self, directory, name, error=None):
         directory.mkdir(parents=True, exist_ok=True)
         document = {"scenario": name, "scope": "Real PTY; synthetic protocol fixture, no real model or personal credentials",
-            "status": "FAIL" if error else "PASS", "error": str(error) if error else None,
-            "binary": str(self.binary), "binary_sha256_at_start": self.binary_sha256, "frames": self.frames}
-        (directory / (name + ".json")).write_text(json.dumps(document, ensure_ascii=False, indent=2))
+            "status": 'OBSERVED' if getattr(self,'observation_mode',False) else ("FAIL" if error else "PASS"), "error": str(error) if error else None,
+            "binary": str(self.binary), "binary_sha256_at_start": self.binary_sha256, "max_parallel": self.max_parallel,
+            "checks": getattr(self,'acceptance_checks',None), "frames": self.frames}
+        (directory / (name + ".json")).write_text(json.dumps(document, ensure_ascii=False, separators=(',', ':')))
         cards = "".join("<section><h2>" + html.escape(frame["step"]) + "</h2><p>Requests: " + str(frame["requests"]) +
             "; events: " + str(frame["events"]) + "; terminal: " + str(frame["size"][1]) + "×" + str(frame["size"][0]) +
-            "; paused: " + str(frame["paused"]) + "; unknown writes: " + str(frame["unknown_writes"]) + "</p><pre>" + html.escape(frame["screen"]) + "</pre></section>" for frame in self.frames)
+            "; paused: " + str(frame["paused"]) + "; unknown writes: " + str(frame["unknown_writes"]) + "</p><pre>" + styled_frame(frame) + "</pre></section>" for frame in self.frames)
         page = '<!doctype html><meta charset="utf-8"><title>BONE PTY ' + html.escape(name) + '</title><style>body{font:16px system-ui;margin:32px;background:#f5f3ed;color:#172b36}pre{font:13px monospace;white-space:pre;background:#18232b;color:#e5edf2;padding:16px;overflow:auto}section{margin:24px 0}</style><h1>' + html.escape(name) + '</h1><p>' + html.escape(document["scope"]) + '</p><p>' + document["status"] + '</p>' + ('<pre>' + html.escape(str(error)) + '</pre>' if error else '') + cards
         (directory / (name + ".html")).write_text(page)
 
@@ -229,7 +288,7 @@ auth = "Bearer"
         self.output.clear()
         self.answered_queries = 0
         self.proc = subprocess.Popen([str(self.binary), "--data-dir", str(self.data), "--profile", "fixture", "tui",
-            "--workspace", str(self.workspace), "--session", session, "--max-parallel", "1", "--max-calls", "16"],
+            "--workspace", str(self.workspace), "--session", session, "--max-parallel", str(self.max_parallel), "--max-calls", "16"],
             stdin=self.slave, stdout=self.slave, stderr=self.slave, env=self.env, start_new_session=True)
         self.wait(lambda: b'\x1b[?1049h' in self.output, "reopened TUI startup")
 
@@ -275,8 +334,65 @@ auth = "Bearer"
         self.directory.cleanup()
 
 
-def run_case(binary, name, turns, action, size=(30, 110), evidence_dir=None):
-    fixture = Fixture(binary, turns, size)
+def styled_frame(frame):
+    """Render recorded VT cells/SGR; browser palette approximates terminal ANSI."""
+    palette = ['#111111','#cc5555','#55bb66','#ddbb55','#6688dd','#bb66cc','#55bbcc','#dddddd',
+        '#777777','#ff7777','#88dd99','#ffe077','#99bbff','#ee99ff','#88eeff','#ffffff']
+    def color(value, default):
+        if value is None: return default
+        kind, *parts = value
+        if kind == 'rgb': return '#%02x%02x%02x' % tuple(parts)
+        if kind == 'ansi':
+            code = parts[0]
+            return palette[code - (90 if code >= 90 and code < 100 else 100 if code >= 100 else 40 if code >= 40 else 30) + (8 if code >= 90 else 0)]
+        index = parts[0]
+        if index < 16: return palette[index]
+        if index >= 232: return '#%02x%02x%02x' % ((8 + (index - 232) * 10,) * 3)
+        index -= 16; cube = [0,95,135,175,215,255]
+        return '#%02x%02x%02x' % (cube[index // 36],cube[index // 6 % 6],cube[index % 6])
+    cells = frame.get('cells')
+    if cells is None: return html.escape(frame['screen'])
+    styles = {}
+    for run in frame.get('cell_styles',[]):
+        for x in range(run['start'],run['end']): styles[(run['row'],x)] = run
+    result = []
+    for y, row in enumerate(cells):
+        line = []
+        x = 0
+        while x < len(row):
+            text = row[x]
+            if not text:
+                x += 1
+                continue
+            end = x + 1
+            while end < len(row) and not row[end]: end += 1
+            run = styles.get((y,x))
+            cursor = frame.get('cursor') if frame.get('cursor_visible') else None
+            # Only merge actual one-cell ASCII with identical recorded SGR.
+            # Wide/combined glyphs retain their own recorded cell span.
+            if end == x+1 and len(text)==1 and ord(text)<128 and cursor != [y,x]:
+                while end < len(row) and len(row[end])==1 and ord(row[end])<128 and styles.get((y,end))==run and cursor != [y,end]:
+                    text += row[end]
+                    end += 1
+            width = end - x
+            attrs = run['attributes'] if run else ()
+            fg = color(run['fg'] if run else None,'#e5edf2');bg = color(run['bg'] if run else None,'#18232b')
+            if 'reverse' in attrs: fg,bg = bg,fg
+            css = f'display:inline-block;flex:0 0 {width}ch;width:{width}ch;overflow:hidden;color:{fg};background:{bg}'
+            if 'bold' in attrs: css += ';font-weight:700'
+            if 'dim' in attrs: css += ';opacity:.7'
+            if 'italic' in attrs: css += ';font-style:italic'
+            if 'underline' in attrs: css += ';text-decoration:underline'
+            if frame.get('cursor_visible') and frame.get('cursor') == [y,x]: css += ';outline:1px solid #f3f7ff;outline-offset:-1px'
+            line.append('<span style="'+css+'">'+html.escape(text)+'</span>')
+            x = end
+        result.append('<span style="display:flex;white-space:pre;font-family:monospace;line-height:1.35">'+''.join(line)+'</span>')
+    return ''.join(result)
+
+
+def run_case(binary, name, turns, action, size=(30, 110), evidence_dir=None, observe=False):
+    fixture = Fixture(binary, turns, size, max_parallel=2 if name == 'feedback-flow' else 1)
+    fixture.observation_mode = observe
     try:
         fixture.wait(lambda: b'\x1b[?1049h' in fixture.output, "TUI startup")
         fixture.capture("Start: idle terminal")
@@ -284,7 +400,7 @@ def run_case(binary, name, turns, action, size=(30, 110), evidence_dir=None):
         fixture.capture("Final terminal")
         if evidence_dir:
             fixture.evidence(evidence_dir, name)
-        print("PASS", name)
+        print("OBSERVED" if observe else "PASS", name)
     except Exception as error:
         fixture.capture("Failure: current terminal")
         if evidence_dir:
@@ -331,6 +447,8 @@ def concurrent_input(f):
     f.wait(lambda: len(f.calls()) == 1, 'first model call')
     f.send('ADDED_CONSTRAINT\r')
     f.wait(lambda: 'ADDED_CONSTRAINT' in json.dumps(f.events()), 'input accepted while model runs')
+    f.capture('Follow-up input is shown with a receipt while the earlier model runs')
+    assert 'ADDED_CONSTRAINT' in f.screen() and re.search('已接收|已纳入',f.screen()), 'running input lacks visible original words and receipt'
     f.wait(lambda: len(f.calls()) >= 2, 'second request')
     assert 'ADDED_CONSTRAINT' in json.dumps(f.calls()[1:]), 'new constraint absent from follow-up model request'
     f.wait(lambda: f.visible('CONSTRAINT_ACCEPTED'), 'new constraint reply rendered')
@@ -390,7 +508,9 @@ def failure(f):
     f.wait(lambda: any(e.get('kind') == 'error' for e in f.events()) or f.visible('失败'), 'failure visible before exit')
     assert f.proc.poll() is None, 'recoverable model failure terminated TUI'
     f.capture('Model HTTP failure remains actionable before exit')
-    status_line = next((line for line in f.screen().splitlines() if '当前：' in line), '')
+    lines = f.screen().splitlines()
+    input_top = next((i for i,line in enumerate(lines) if '┌' in line and '输入中' in line),None)
+    status_line = lines[input_top-2] if input_top is not None and input_top >= 2 else ''
     assert '失败' in status_line, 'failure missing from primary status'
     assert '就绪' not in status_line, 'failed work presented as ready'
     f.quit()
@@ -400,9 +520,104 @@ def live_stream(f):
     f.send('STREAM_TASK\r')
     f.wait(lambda: 'LIVE_PREVIEW' in f.screen(), 'native live delta displayed')
     assert not any(e.get('kind') == 'model_message' for e in f.events()), 'preview only appeared after durable completion'
+    f.capture('Native SSE preview before any durable model message')
+    assert '未交付' in f.screen(), 'native streaming preview presented as delivered'
+    assert not re.search(r'(?m)^\s*(?:你\s*·|Agent(?:\s*·|\s*$))',f.screen()), 'default stream shows user/Agent role headers'
     f.wait(lambda: any(e.get('kind') == 'model_message' for e in f.events()), 'native final committed')
     f.wait(lambda: 'LIVE_PREVIEW' in f.screen(), 'final response rendered')
     f.quit()
+
+
+def feedback_flow(f):
+    """One workflow: real input, model SSE, silent child shell and cancellation."""
+    f.acceptance_checks = []
+    def check(name, passed, observed):
+        f.acceptance_checks.append({'name':name,'passed':bool(passed),'observed':observed})
+    def frame(label):
+        f.capture(label)
+        return f.frames[-1]
+    def spinner(capture):
+        return ''.join(c for c in capture['screen'] if c in '⠋⠙⠹⠸⠼⠴⠦⠧')
+    def editor_bounds(capture):
+        lines = capture['screen'].splitlines()
+        tops = [(y,line.find('┌')) for y,line in enumerate(lines) if '┌' in line and ('输入中' in line or '草稿只读' in line)]
+        if not tops: return None
+        y,x = tops[-1]
+        bottom = next((j for j in range(y+1,len(lines)) if capture['cells'][j][x] == '└'),None)
+        return (y,x,bottom) if bottom is not None else None
+    def cursor_inside(capture):
+        bounds = editor_bounds(capture)
+        y,x = capture['cursor']
+        return capture['cursor_visible'] and bounds is not None and bounds[0] < y < bounds[2] and bounds[1] < x < capture['size'][1]-1
+
+    draft = '中文光标'*35 + 'FEEDBACK_DRAFT_TAIL'
+    f.send('\x1b[200~'+draft+'\x1b[201~')
+    f.pump(.15)
+    f.send(b'\x01' + b'\x1b[C'*45 + b'!')
+    expected = draft[:45]+'!'+draft[45:]
+    f.wait(lambda:any(d.get('draft')==expected for d in f.saved_drafts()),'wrapped editing keys and insertion are fully processed')
+    middle = frame('Chinese wrapped draft: middle character and visible editing cursor')
+    y,x = middle['cursor']
+    cursor_cell = middle['cells'][y][x] if 0 <= y < f.rows and 0 <= x < f.cols else None
+    check('wrapped middle cursor remains inside framed editable input', cursor_inside(middle), {'cursor':middle['cursor'],'visible':middle['cursor_visible'],'bounds':editor_bounds(middle)})
+    check('hardware cursor points to next actual Chinese character', cursor_cell == expected[46], {'cell':cursor_cell,'expected':expected[46]})
+    f.send(b'\x05')
+    f.pump(.25)
+    end = frame('Chinese wrapped draft: end caret is visible')
+    check('wrapped end cursor is visible inside input',cursor_inside(end),{'cursor':end['cursor'],'bounds':editor_bounds(end)})
+    y,x = end['cursor']
+    end_at_tail = 0 <= y < f.rows and 0 < x < f.cols and end['cells'][y][x-1] == expected[-1] and end['cells'][y][x] == ' '
+    check('end caret follows the actual wrapped draft tail',end_at_tail,end['cursor'])
+    check('send has not happened while draft is being edited',not f.calls() and not any(e['kind']=='input' for e in f.events()),len(f.calls()))
+    f.send(b'\x1b[17~')
+    read = frame('F6 reading: draft read only and hardware cursor hidden')
+    check('reading focus has explicit read-only input and hides cursor','草稿只读' in read['screen'] and not read['cursor_visible'],{'cursor_visible':read['cursor_visible'],'read_only': '草稿只读' in read['screen']})
+    f.send(b'\x1b[17~')
+    edit = frame('F6 returns to editing: same end caret and editable frame')
+    check('F6 restores editor position and explicit input focus',cursor_inside(edit) and edit['cursor']==end['cursor'] and '输入中' in edit['screen'],{'cursor':edit['cursor'],'prior':end['cursor']})
+    f.send('\r')
+    f.wait(lambda:len(f.calls())>=1,'silent model request starts')
+    silent_a = frame('Sent input: exact original words, receipt and silent model A')
+    f.pump(.23)
+    silent_b = frame('Silent model B: spinner advances before any output')
+    inputs = [e for e in f.events() if e['kind']=='input']
+    sent_text = ''.join(part.get('text','') for part in inputs[0].get('data',{}).get('message',{}).get('content',[])) if inputs else None
+    check('sent input is preserved exactly as a durable input',len(inputs)==1 and sent_text==expected,{'input_count':len(inputs),'sent_text':sent_text,'expected':expected})
+    check('sent words and receipt are visible','FEEDBACK_DRAFT_TAIL' in silent_a['screen'] and bool(re.search('已接收|已纳入|已发送',silent_a['screen'])),silent_a['screen'])
+    check('silent model gives changing activity feedback',bool(spinner(silent_a)) and spinner(silent_a)!=spinner(silent_b),[spinner(silent_a),spinner(silent_b)])
+    f.wait(lambda:'FLOW_MODEL_PREVIEW' in f.screen(),'real SSE preview appears')
+    preview = frame('Streaming model: live preview is explicitly not delivered')
+    check('stream preview is visible before durable model completion',not any(e['kind']=='model_message' and 'FLOW_MODEL_PREVIEW' in json.dumps(e) for e in f.events()),preview['events'])
+    check('stream preview is distinguished from final delivery',bool(re.search('未交付|输出中|生成中|接收输出',preview['screen'])),preview['screen'])
+    f.wait(lambda:any(e['kind']=='model_message' and 'ROOT_BACKGROUND_DELIVERY' in json.dumps(e) for e in f.events()) and any(e['kind']=='tool_started' and e.get('data',{}).get('tool_name')=='shell' for e in f.events()),'original root waits for its silent child')
+    # A parent cannot deliver its own outstanding assignment. A subsequent,
+    # independent input can settle while the original child's shell still runs.
+    f.send('FRONT_QUICK_REPLY\r')
+    f.wait(lambda:any(e['kind']=='delivery' and any(i['kind']=='input' and i['id']==e.get('reply_to') and 'FRONT_QUICK_REPLY' in json.dumps(i) for i in f.events()) for e in f.events()),'independent foreground input delivered while old child runs')
+    foreground = next(e for e in f.events() if e['kind']=='input' and 'FRONT_QUICK_REPLY' in json.dumps(e))
+    delivered = next(e for e in f.events() if e['kind']=='delivery' and e.get('reply_to')==foreground['id'])
+    check('independent foreground has its actual matching delivery',True,{'input_id':foreground['id'],'delivery_id':delivered['id'],'reply_to':delivered['reply_to']})
+    f.wait(lambda:any(e['kind']=='model_message' and 'ROOT_CONTINUES_WAITING' in json.dumps(e) for e in f.events()),'parent returns to waiting for original child after independent delivery')
+    shell_a = frame('Root has delivered, background shell is still silent and active A')
+    f.pump(.23)
+    shell_b = frame('Background silent shell B: root delivery must not hide activity')
+    check('background shell really remains active after root delivery',shell_a['running_jobs']>0 and not (f.workspace/'FEEDBACK_WORKER_DONE').exists(),shell_a['job_states'])
+    check('delivered input does not replace active execution status',bool(re.search('正在执行|执行命令|后台|运行中',shell_a['screen'])) and bool(spinner(shell_a)),shell_a['screen'])
+    check('silent background shell spinner continues',bool(spinner(shell_a)) and spinner(shell_a)!=spinner(shell_b),[spinner(shell_a),spinner(shell_b)])
+    for capture in (silent_a,silent_b,preview,shell_a,shell_b):
+        check('default body has no user/Agent role header: '+capture['step'],not bool(re.search(r'(?m)^\s*(?:你\s*·|Agent(?:\s*·|\s*$))',capture['screen'])),capture['step'])
+    f.send(b'\x03')
+    f.wait(lambda:f.state().get('paused') and f.state().get('unknown_writes'),'pause records uncertain real shell write')
+    paused_a = frame('Pause: spinner stops; uncertain writes require reconciliation')
+    f.pump(.23)
+    paused_b = frame('Paused B: no continued activity or claim all processes terminated')
+    check('paused screen stops spinner',not spinner(paused_a) and not spinner(paused_b),[spinner(paused_a),spinner(paused_b)])
+    check('pause reflects uncertainty without false global termination',bool(re.search('暂停|核查',paused_a['screen'])) and not bool(re.search('全部已停止|全部终止|所有进程已终止',paused_a['screen'])),{'paused':paused_a['paused'],'unknown_writes':paused_a['unknown_writes']})
+    check('cancelled shell has no invented future output or worker delivery',not (f.workspace/'FEEDBACK_WORKER_DONE').exists() and not any('WORKER_FINAL_MUST_NOT_APPEAR' in json.dumps(e) for e in f.events()),len(f.events()))
+    f.quit()
+    failed = [c['name'] for c in f.acceptance_checks if not c['passed']]
+    if failed and not f.observation_mode:
+        raise AssertionError('; '.join(failed))
 
 
 def stale_stream(f):
@@ -680,6 +895,9 @@ def live_shell(f):
         f.send('\r')
         f.wait(lambda: '核查表单' in f.screen(), 'reconciliation uses a separate form')
         f.send(b'\x04')
+        f.wait(lambda:'核查证据' in f.screen(),'reconciliation evidence reader opens')
+        if 'LIVE_STDOUT_READY' not in f.screen():
+            f.send(b'\x1b[6~')  # Narrow viewport: read the actual parameter section.
         f.wait(lambda: 'LIVE_STDOUT_READY' in f.screen(), 'reconcile evidence contains original shell command')
         f.capture('Reconciliation evidence reads the actual interrupted command')
         f.send(b'\x1b')
@@ -699,7 +917,7 @@ def live_shell(f):
             expected = 'KEEP_!FIRST_LINE\nKEEP_SECOND_LINE'
             f.wait(lambda: any(d.get('draft') == expected for d in f.saved_drafts()), 'cancel restores multiline draft and exact insertion cursor')
             assert f.state().get('unknown_writes'), 'cancel resolved an unknown write'
-            assert '输入目标：新要求' in f.screen(), 'cancel changed the input target'
+            assert any(d.get('draft')==expected and d.get('reply_to') is None for d in f.saved_drafts()), 'cancel changed the durable input target'
             f.capture('Cancel restores original multiline draft, target and insertion cursor')
         else:
             f.send('Checked workspace: shell-finished absent; process cancelled.\r')
@@ -915,6 +1133,9 @@ def reconcile_keeps_reply_target(f):
     f.wait(lambda: '核查表单' in f.screen(), 'separate reconciliation form opened')
     f.send('CANCEL_THIS_NOTE')
     f.send(b'\x04')
+    f.wait(lambda:'核查证据' in f.screen(),'reply reconciliation evidence reader opens')
+    if 'REPLY_WORKER_STARTED' not in f.screen():
+        f.send(b'\x1b[6~')
     f.wait(lambda: 'REPLY_WORKER_STARTED' in f.screen(), 'worker evidence opened')
     f.capture('Reconcile evidence overlays a separate note, retaining the original reply target')
     f.send(b'\x1b')
@@ -924,7 +1145,8 @@ def reconcile_keeps_reply_target(f):
     f.send('!')
     expected = 'ANSWER_!FIRST_LINE\nANSWER_SECOND_LINE'
     f.wait(lambda: any(d.get('draft') == expected for d in f.saved_drafts()), 'cancel restores reply draft at original insertion cursor')
-    assert question['id'][:8] in next((line for line in f.screen().splitlines() if '输入目标：' in line), ''), 'reconciliation cancel lost the specific reply target'
+    assert any(d.get('draft')==expected and d.get('reply_to')==question['id'] for d in f.saved_drafts()), 'reconciliation cancel lost the saved specific reply target'
+    assert '回复 '+question['id'][:8] in f.screen(), 'specific reply target is not visible after reconciliation cancel'
     assert len(f.calls()) == count, 'read or cancel replayed model work'
     assert len([e for e in f.events() if e['kind'] == 'input']) == before, 'reconciliation cancel submitted reply draft'
     assert f.state().get('paused') and f.state().get('unknown_writes'), 'reconciliation cancel changed execution state'
@@ -944,13 +1166,21 @@ def exit_resume(f):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/bone')
-    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','reconcile-reply'])
+    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','reconcile-reply','feedback-flow'])
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument('--size', default='80x24', choices=['80x24', '120x40'], help='real terminal columns x rows')
     parser.add_argument('--keep-going', action='store_true', help='record every selected scenario, then fail if any failed')
+    parser.add_argument('--observe-feedback', action='store_true', help='record old feedback-flow failures as observations, never as a passing gate')
     args = parser.parse_args()
     verify_vt_replay()
     cases = [
+        ('feedback-flow', [
+            {'match_job_title':'Conversation','delay_seconds':1.6,'output':[tool('job_send',{'title':'Worker','message':'Run the silent worker.'})]},
+            {'match_job_title':'Conversation','text':'FLOW_MODEL_PREVIEW\nROOT_BACKGROUND_DELIVERY','delta_chunk_chars':14,'event_delay_seconds':.1,'event_delays':{'response.completed':1.6}},
+            {'match_job_title':'Worker','output':[tool('shell',{'command':'while [ ! -e release-feedback-worker ]; do sleep 0.05; done; touch FEEDBACK_WORKER_DONE','timeout_seconds':30})]},
+            {'match_job_title':'Conversation','contains':['FRONT_QUICK_REPLY'],'text':'INDEPENDENT_FOREGROUND_DELIVERED'},
+            {'match_job_title':'Conversation','delay_seconds':.1,'text':'ROOT_CONTINUES_WAITING'},
+            {'match_job_title':'Worker','text':'WORKER_FINAL_MUST_NOT_APPEAR'}],feedback_flow),
         ('slash-inline', [], slash_inline),
         ('multiline-undo', [{'contains':['第一行 e\u0301👩‍💻!', '第二行 preserve cents'], 'text':'MULTILINE_EDITOR_ACCEPTED'}], multiline_undo),
         ('shell-live', [
@@ -1008,8 +1238,9 @@ def main():
         if args.case is None or args.case == name:
             cols, rows = (int(value) for value in args.size.split('x'))
             try:
-                run_case(args.binary.resolve(), name, turns, action, size=(rows, cols), evidence_dir=args.evidence_dir)
-                results.append({'scenario': name, 'status': 'PASS'})
+                observe = args.observe_feedback and name == 'feedback-flow'
+                run_case(args.binary.resolve(), name, turns, action, size=(rows, cols), evidence_dir=args.evidence_dir, observe=observe)
+                results.append({'scenario': name, 'status': 'OBSERVED' if observe else 'PASS'})
             except Exception as error:
                 results.append({'scenario': name, 'status': 'FAIL', 'error': str(error)})
                 print('FAIL', name, str(error), flush=True)

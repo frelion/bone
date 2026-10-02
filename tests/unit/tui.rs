@@ -579,3 +579,164 @@ fn reconcile_editor_keys_do_not_cancel_or_submit_from_audit_or_nested_reader() {
     app.cancel_reply();
     assert_eq!(app.ui.draft(), "original draft");
 }
+
+#[path = "../support/server.rs"]
+mod feedback_server;
+
+fn execution_feedback_fixture(
+    turns: serde_json::Value,
+) -> (tempfile::TempDir, Engine, App, feedback_server::Server) {
+    use rig_core::providers::{
+        openai::{OpenAIConfig, Route},
+        registry::{ProviderConfig, ProviderRef},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("responses.json");
+    let requests = dir.path().join("requests.jsonl");
+    std::fs::write(
+        &script,
+        serde_json::to_vec(&serde_json::json!({"turns":turns})).unwrap(),
+    )
+    .unwrap();
+    let (server, port) =
+        feedback_server::Server::script("tests/scripted_responses.py", &script, &requests);
+    let mut native = OpenAIConfig::new("")
+        .with_base_url(format!("http://127.0.0.1:{port}/v1"))
+        .with_route(Route::Responses);
+    native.dialect = rig_core::providers::openai::wire::LLAMACPP;
+    native.auth = native.dialect.quirks.auth;
+    let profile = Profile {
+        model: ModelReference::Registry(
+            ProviderRef::configured(ProviderConfig::OpenAi(native), "feedback-fixture").unwrap(),
+        ),
+        credential_env: Some(format!("BONE_TEST_EMPTY_{}", uuid::Uuid::new_v4().simple())),
+        reuse_codex_login: false,
+        additional_params: None,
+        max_tokens: None,
+    };
+    let engine = Engine::open(
+        &dir.path().join("data"),
+        dir.path(),
+        None,
+        profile.clone(),
+        "feedback-fixture".into(),
+        Default::default(),
+    )
+    .unwrap();
+    let app = App::new(Settings {
+        profile_name: "feedback-fixture".into(),
+        profile,
+        profiles: vec![],
+    });
+    (dir, engine, app, server)
+}
+
+#[tokio::test]
+async fn an_old_delivery_cannot_hide_a_new_real_model_call_or_restart_its_clock() {
+    let (dir, mut engine, mut app, _server) = execution_feedback_fixture(serde_json::json!([
+        {"text":"first completed delivery"}, {"delay_seconds":1,"text":"later response"}
+    ]));
+    let data = dir.path().join("data");
+    let first = engine.post_message("first requirement").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            engine.step().await.unwrap();
+            app.sync(&engine, &data).unwrap();
+            if engine
+                .result(&first)
+                .is_some_and(|event| event.kind == "delivery")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(app.ui.live_status.contains("已完成"));
+    assert!(!app.ui.busy);
+    engine
+        .post_message("new work after the displayed delivery")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = engine.step().await.unwrap();
+            if events.iter().any(|event| event.kind == "model_started") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // Keep the old displayed input association: execution facts must still win.
+    assert_eq!(app.last_input.as_deref(), Some(first.as_str()));
+    assert_eq!(engine.result(&first).unwrap().kind, "delivery");
+    app.metadata(&engine);
+    assert!(app.ui.live_status.starts_with("思考中"));
+    assert!(app.ui.live_status.contains("s"));
+    assert!(!app.ui.live_status.contains("完成"));
+    assert!(app.ui.busy);
+    let call = engine
+        .state()
+        .jobs
+        .values()
+        .find_map(|job| job.current_call.clone())
+        .unwrap();
+    let started = app.active_calls[&call].started;
+    app.metadata(&engine);
+    assert_eq!(app.active_calls[&call].started, started);
+    pause(&mut engine, &mut app.ui).unwrap();
+    app.metadata(&engine);
+    assert!(app.ui.live_status.starts_with("已暂停"));
+    assert!(!app.ui.busy);
+    assert_eq!(app.ui.spinner_tick, 0);
+}
+
+#[tokio::test]
+async fn a_quiet_real_shell_animates_and_waiting_for_a_reply_does_not() {
+    let (dir, mut engine, mut app, _server) = execution_feedback_fixture(serde_json::json!([
+        {"output":[{"type":"function_call","call_id":"quiet-shell","name":"shell","arguments":{"command":"sleep 0.6"}}]},
+        {"output":[{"type":"function_call","call_id":"ask-next","name":"ask_user","arguments":{"question":"Which file should be read?"}}]}
+    ]));
+    let data = dir.path().join("data");
+    engine
+        .post_message("run the local quiet command then ask a question")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = engine.step().await.unwrap();
+            app.sync(&engine, &data).unwrap();
+            if events
+                .iter()
+                .any(|event| event.kind == "tool_started" && event.data["tool_name"] == "shell")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    app.ui.notice.clear();
+    app.metadata(&engine);
+    assert!(app.ui.live_status.starts_with("执行命令 · sleep 0.6"));
+    assert!(app.ui.busy);
+    assert!(app.ui.feedback_detail.contains("尚未产生输出"));
+    let spinner = app.ui.spinner_tick;
+    tokio::time::sleep(Duration::from_millis(160)).await;
+    app.metadata(&engine);
+    assert!(app.ui.spinner_tick > spinner);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            engine.step().await.unwrap();
+            app.sync(&engine, &data).unwrap();
+            if !engine.unanswered_questions().is_empty() {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    app.metadata(&engine);
+    assert!(app.ui.live_status.starts_with("等待回复"));
+    assert!(!app.ui.busy);
+    assert_eq!(app.ui.spinner_tick, 0);
+}

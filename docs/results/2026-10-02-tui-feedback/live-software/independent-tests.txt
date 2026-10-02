@@ -1,0 +1,18 @@
+AUTH_CHECK_RUNNING
+test_boolean_expiry (test_auth.AuthorizationTests) ... ok
+test_boundary (test_auth.AuthorizationTests) ... ok
+test_empty_subject (test_auth.AuthorizationTests) ... ok
+test_expired (test_auth.AuthorizationTests) ... ok
+test_fractional_expiry (test_auth.AuthorizationTests) ... ok
+test_future (test_auth.AuthorizationTests) ... ok
+test_missing_expiry (test_auth.AuthorizationTests) ... ok
+test_negative_expiry (test_auth.AuthorizationTests) ... ok
+test_none (test_auth.AuthorizationTests) ... ok
+test_not_dict (test_auth.AuthorizationTests) ... ok
+test_string_expiry (test_auth.AuthorizationTests) ... ok
+test_valid (test_auth.AuthorizationTests) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 12.002s
+
+OK

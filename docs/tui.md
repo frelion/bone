@@ -1,8 +1,10 @@
 # BONE 开发终端
 
-BONE 0.7 的 TUI 使用 Ratatui + Crossterm，输入编辑采用 ratatui-textarea，Markdown 采用 tui-markdown。默认以工作段落呈现对话，工具证据按需展开；Job 是 Agent 内部单元。
+BONE 0.7.1 的 TUI 使用 Ratatui + Crossterm，输入编辑采用 ratatui-textarea，Markdown 采用 tui-markdown。默认以工作段落呈现对话，工具证据按需展开；Job 是 Agent 内部单元。
 
 本轮生产终端、真实软件任务和验证边界见 [交付记录](results/2026-10-02-tui-design/README.md)及[可浏览过程](results/2026-10-02-tui-design/overview.html)。设计约束见 [DESIGN.md](../DESIGN.md)，后续需求见 [产品需求](tui-requirements.md)。
+
+0.7.1 的输入光标、固定运行反馈与默认正文修正见 [反馈修复记录](results/2026-10-02-tui-feedback/README.md)。
 
 ## 启动
 
@@ -13,7 +15,7 @@ bone --profile subscription --model chatgpt:gpt-6-luna tui --workspace /path/to/
 bone --profile subscription tui --session SESSION_ID --workspace /path/to/project
 ```
 
-安装用 `cargo install --path . --locked --force`，`bone --version` 应为 `bone 0.7.0`。安装后的 `bone` 可以在任意项目目录使用。终端必须为交互式 TTY，`TERM=dumb` 会给出明确错误。
+安装用 `cargo install --path . --locked --force`，`bone --version` 应为 `bone 0.7.1`。安装后的 `bone` 可以在任意项目目录使用。终端必须为交互式 TTY，`TERM=dumb` 会给出明确错误。
 
 现有 subscription 配置继续使用原有登录，不需要重新登录。切换模型保留会话工作和额度，先暂停，Ctrl+R 显式继续；`/model` 仅修改当前运行，不写回 config.toml。
 
@@ -43,6 +45,10 @@ bone --profile subscription tui --session SESSION_ID --workspace /path/to/projec
 Ctrl+C 在任意焦点始终暂停，即使输入中有选区。Ctrl+Y 按当前可见界面复制详情、输入选区或选中消息。Esc 返回上一层及其阅读位置。系统剪贴板使用 macOS pbcopy 或 Linux wl-copy/xclip/xsel。
 
 ## 运行、提问与阅读
+
+默认正文取消“你 / Agent”标题；原话用左侧细竖线区分，结果直接显示段落。输入框标明编辑或只读状态，编辑时显示真实终端光标。普通新要求不占用额外目标条；回复、核查或目标失效才显示目标。
+
+运行行固定在输入框上方，按 Job 的实际模型或工具调用显示动作、耗时和活动标记；等待用户时没有运行动画。后台调用仍在进行时，较早的交付不会覆盖运行状态。输入已保存、已纳入以及失败事实显示在独立反馈行。模态正文和候选列表保留底部输入与运行信息。
 
 模型预览明确标记为“输出中（未交付）”。成功工具收为一行；Shell 未退出时显示 stdout/stderr 的短尾部，完整观察可展开，最终工具记录替换预览。失败先显示退出码与关键原因。未知写入、暂停、输入交付和待答问题分别表达；输入与停止仍可操作。模型及用量在 `/status` 查看。
 

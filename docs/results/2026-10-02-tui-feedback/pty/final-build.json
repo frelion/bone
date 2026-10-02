@@ -1,0 +1,56 @@
+{
+  "started_at": "2026-10-02T12:42:12.842877+00:00",
+  "binary": "/Users/zzhang/Documents/ChatGPT/BONE/target/debug/bone",
+  "binary_version": "bone 0.7.1",
+  "binary_sha256": "06b369416b51bffa2944ce21fc080d39b68a3402dcc870f63d50ae752e6f18fb",
+  "source_scope": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "src/config.rs",
+    "src/context.rs",
+    "src/lib.rs",
+    "src/main.rs",
+    "src/model.rs",
+    "src/runtime.rs",
+    "src/state.rs",
+    "src/store.rs",
+    "src/tools.rs",
+    "src/tui.rs",
+    "src/tui/services.rs",
+    "src/tui/view.rs"
+  ],
+  "source_fingerprint_sha256": "428da94e974b2b7d6da9b377c597401ccae6847f87bbc05471cbc6e6c78c24f7",
+  "source_fingerprint_algorithm": "sha256(relative UTF8 path + NUL + bytes + NUL, sorted src with Cargo manifests first)",
+  "harness_sha256": "f7bcfc09dc1005e960b08bffbf2b20e0148981cd40de337a9a67b6155e7b60ac",
+  "git_head": "f443cd07bb2e83a82277c01435bd60f62b9fa8e0",
+  "scope": "Real PTY synthetic loopback; isolated data/workspace; no real model/credentials",
+  "completed_at": "2026-10-02T12:43:03.494237+00:00",
+  "source_unchanged": true,
+  "harness_unchanged": true,
+  "binary_unchanged": true,
+  "case_count": 10,
+  "pass_count": 10,
+  "case_binary_hashes": [
+    "06b369416b51bffa2944ce21fc080d39b68a3402dcc870f63d50ae752e6f18fb"
+  ],
+  "recorded_delivery_border_checks": [
+    {
+      "scenario": "reader-delivery",
+      "suite_size": "80x24",
+      "frame_size": [
+        40,
+        120
+      ],
+      "full_width_border_complete": true
+    },
+    {
+      "scenario": "reader-delivery",
+      "suite_size": "120x40",
+      "frame_size": [
+        24,
+        80
+      ],
+      "full_width_border_complete": true
+    }
+  ]
+}

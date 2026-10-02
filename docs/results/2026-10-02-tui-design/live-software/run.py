@@ -87,7 +87,11 @@ class RealTerminal(Fixture):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary',type=Path,default=ROOT/'target/debug/bone')
+    parser.add_argument('--output-dir', type=Path, default=HERE,
+                        help='Keep a new execution separate from the original evidence.')
     args=parser.parse_args()
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
     f=RealTerminal(args.binary.resolve())
     status='FAIL'; error=None; checks={}; timeline=[]
     def stage(name):
@@ -126,12 +130,12 @@ def main():
         stage('08 返回原对话阅读位置')
         checks['tests_unchanged']=(f.workspace/'test_auth.py').read_text()==TESTS
         verification=subprocess.run(['python3','-B','-m','unittest','-v'],cwd=f.workspace,capture_output=True,text=True)
-        (HERE/'independent-tests.txt').write_text(verification.stdout+verification.stderr)
+        (output_dir/'independent-tests.txt').write_text(verification.stdout+verification.stderr)
         checks['independent_tests_pass']=verification.returncode==0
         checks['tools_have_job'] = all(e.get('job_id') for e in f.events() if e['kind'] in ('model_started','tool_started','tool_result'))
         checks['explicit_reply_link']=any(e['kind']=='input' and e.get('reply_to')==question['id'] for e in f.events())
         diff=subprocess.run(['git','diff','--no-ext-diff','--no-textconv'],cwd=f.workspace,capture_output=True,text=True,check=True).stdout
-        (HERE/'final.diff').write_text(diff)
+        (output_dir/'final.diff').write_text(diff)
         checks['modified_source_only']='test_auth.py' not in diff and 'auth.py' in diff
         assert all(checks.values()),checks
         status='PASS'
@@ -142,15 +146,14 @@ def main():
         if f.proc.poll() is None:f.quit()
         checks['terminal_restored']=termios.tcgetattr(f.slave)==f.original
         summary={'status':status,'error':error,'scope':'Production TUI, real gpt-6-luna subscription calls, reused existing Codex login; isolated Python repo','binary_sha256':f.binary_sha256,'workspace':str(f.workspace),'checks':checks,'timeline':timeline,'model_calls':len(f.calls()),'tool_calls':sum(e['kind']=='tool_started' for e in events),'frames':len(f.frames),'cost':None}
-        HERE.mkdir(parents=True,exist_ok=True)
-        (HERE/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
-        (HERE/'screens.json').write_text(json.dumps(f.frames,ensure_ascii=False,indent=2)+'\n')
-        (HERE/'events.json').write_text(json.dumps(events,ensure_ascii=False,indent=2)+'\n')
-        (HERE/'auth.py').write_text((f.workspace/'auth.py').read_text())
-        (HERE/'test_auth.py').write_text(TESTS)
+        (output_dir/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
+        (output_dir/'screens.json').write_text(json.dumps(f.frames,ensure_ascii=False,indent=2)+'\n')
+        (output_dir/'events.json').write_text(json.dumps(events,ensure_ascii=False,indent=2)+'\n')
+        (output_dir/'auth.py').write_text((f.workspace/'auth.py').read_text())
+        (output_dir/'test_auth.py').write_text(TESTS)
         frames=''.join('<section><h2>'+html.escape(x['step'])+'</h2><pre>'+html.escape(x['screen'])+'</pre></section>' for x in f.frames)
         records=''.join('<details><summary>'+html.escape(f'{i+1:03} · {event["kind"]} · Job {event.get("job_id") or "Session"} · reply_to {event.get("reply_to") or "—"}')+'</summary><pre>'+html.escape(json.dumps(event,ensure_ascii=False,indent=2))+'</pre></details>' for i,event in enumerate(events))
-        (HERE/'report.html').write_text('<!doctype html><meta charset="utf-8"><title>BONE 0.7 real model</title><style>body{max-width:1150px;margin:32px auto;padding:20px;font:15px system-ui;background:#f3f1ea;color:#272d29}pre{font:13px/1.5 Menlo,monospace;white-space:pre;overflow:auto;padding:18px;background:#18201b;color:#dbe2da}section{margin:30px 0}details{border-top:1px solid #c9d2c7;padding:12px 0}summary{cursor:pointer}</style><h1>真实模型 / 生产 TUI / 鉴权修复</h1><p>'+html.escape(summary['scope'])+'</p><pre>'+html.escape(json.dumps(summary,ensure_ascii=False,indent=2))+'</pre>'+frames+'<h2>持久执行记录：对话、Job 与行动</h2><p>按 SQLite 事件顺序，点击展开原生记录；费用未知。记录仅来自本次隔离仓库任务。</p>'+records)
+        (output_dir/'report.html').write_text('<!doctype html><meta charset="utf-8"><title>BONE real model</title><style>body{max-width:1150px;margin:32px auto;padding:20px;font:15px system-ui;background:#f3f1ea;color:#272d29}pre{font:13px/1.5 Menlo,monospace;white-space:pre;overflow:auto;padding:18px;background:#18201b;color:#dbe2da}section{margin:30px 0}details{border-top:1px solid #c9d2c7;padding:12px 0}summary{cursor:pointer}</style><h1>真实模型 / 生产 TUI / 鉴权修复</h1><p>'+html.escape(summary['scope'])+'</p><pre>'+html.escape(json.dumps(summary,ensure_ascii=False,indent=2))+'</pre>'+frames+'<h2>持久执行记录：对话、Job 与行动</h2><p>按 SQLite 事件顺序，点击展开原生记录；费用未知。记录仅来自本次隔离仓库任务。</p>'+records)
         print(json.dumps(summary,ensure_ascii=False),flush=True);f.close()
     return 0 if status=='PASS' else 1
 

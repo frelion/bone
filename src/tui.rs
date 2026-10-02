@@ -85,6 +85,12 @@ impl Drop for Terminal {
     }
 }
 
+struct ActiveCall {
+    phase: &'static str,
+    target: String,
+    started: Instant,
+}
+
 struct App {
     ui: View,
     cursor: Option<String>,
@@ -92,6 +98,8 @@ struct App {
     settings: Settings,
     parts: BTreeMap<String, BTreeMap<u64, String>>,
     last_input: Option<String>,
+    last_admitted_input: Option<String>,
+    active_calls: BTreeMap<String, ActiveCall>,
     last_saved: services::UiSaved,
     changed_at: Option<Instant>,
     elapsed_from: Instant,
@@ -125,6 +133,8 @@ impl App {
             settings,
             parts: BTreeMap::new(),
             last_input: None,
+            last_admitted_input: None,
+            active_calls: BTreeMap::new(),
             last_saved: services::UiSaved::default(),
             changed_at: None,
             elapsed_from: Instant::now(),
@@ -167,6 +177,8 @@ impl App {
         self.search_query.clear();
         abort_task(&mut self.search);
         self.last_input = None;
+        self.last_admitted_input = None;
+        self.active_calls.clear();
         self.cursor = None;
         self.older = None;
         self.files = None;
@@ -242,10 +254,14 @@ impl App {
         let active = self.ui.draft_snapshot();
         let inactive = std::mem::take(&mut self.drafts);
         let target = self.reply_target.clone();
+        let admitted = self.last_admitted_input.clone();
         let refreshed = self.load(engine, data);
         self.ui.restore_draft(active);
         self.drafts = inactive;
         self.reply_target = target;
+        if admitted == self.last_input {
+            self.last_admitted_input = admitted;
+        }
         self.metadata(engine);
         refreshed?;
         self.ui.notice = "已返回最新记录；草稿、光标、选区与回复目标已保留".into();
@@ -286,6 +302,7 @@ impl App {
         if event.kind == "input_handled"
             && event.data["input_id"].as_str() == self.last_input.as_deref()
         {
+            self.last_admitted_input = self.last_input.clone();
             self.ui.notice = format!(
                 "输入 {} 已纳入执行",
                 short_id(self.last_input.as_deref().unwrap_or(""))
@@ -293,6 +310,7 @@ impl App {
         }
         if event.kind == "input" && event.data["source"] == "user" {
             self.last_input = Some(event.id.clone());
+            self.last_admitted_input = None;
             self.ui
                 .remember_prompt(&native_text(&event.data["message"]));
         }
@@ -435,17 +453,112 @@ impl App {
             self.notice_until =
                 (!self.ui.notice.is_empty()).then(|| Instant::now() + Duration::from_secs(8));
         }
-        self.ui.busy = !engine.is_quiescent();
-        self.ui.session_label = engine.state().id.chars().take(8).collect();
-        self.ui.live_status = if self.ui.busy {
-            format!(
-                "{} · {}s",
-                self.current_status(engine),
-                self.elapsed_from.elapsed().as_secs()
-            )
+        self.cache_active_calls(engine);
+        self.ui.busy = execution_active(engine.state());
+        self.ui.spinner_tick = if self.ui.busy {
+            (self.elapsed_from.elapsed().as_millis() / 140) as usize
         } else {
-            self.current_status(engine)
+            0
         };
+        self.ui.session_label = engine.state().id.chars().take(8).collect();
+        self.ui.live_status = self.current_status(engine);
+        self.ui.feedback_detail = self.feedback_detail(engine);
+    }
+    fn cache_active_calls(&mut self, engine: &Engine) {
+        self.active_calls.retain(|call, _| {
+            engine.state().jobs.values().any(|job| {
+                job.state == JobState::Running && job.current_call.as_ref() == Some(call)
+            })
+        });
+        for job in engine
+            .state()
+            .jobs
+            .values()
+            .filter(|job| job.state == JobState::Running)
+        {
+            if let Some(call) = &job.current_call
+                && !self.active_calls.contains_key(call)
+            {
+                let feedback = active_call(engine, call).unwrap_or(ActiveCall {
+                    phase: "正在执行",
+                    target: String::new(),
+                    started: Instant::now(),
+                });
+                self.active_calls.insert(call.clone(), feedback);
+            }
+        }
+    }
+    fn selected_active_call(&self, engine: &Engine) -> Option<(&str, &ActiveCall)> {
+        let preferred = engine
+            .state()
+            .focus
+            .as_ref()
+            .and_then(|id| engine.state().jobs.get(id))
+            .filter(|job| job.state == JobState::Running)
+            .and_then(|job| job.current_call.as_ref())
+            .and_then(|call| self.active_calls.get_key_value(call));
+        preferred
+            .or_else(|| {
+                engine
+                    .state()
+                    .jobs
+                    .values()
+                    .filter(|job| job.state == JobState::Running)
+                    .filter_map(|job| job.current_call.as_ref())
+                    .find_map(|call| self.active_calls.get_key_value(call))
+            })
+            .map(|(id, feedback)| (id.as_str(), feedback))
+    }
+    fn feedback_detail(&self, engine: &Engine) -> String {
+        if !self.ui.notice.is_empty() {
+            return self.ui.notice.clone();
+        }
+        if self
+            .last_input
+            .as_ref()
+            .is_some_and(|id| engine.state().pending_inputs.contains(id))
+        {
+            return if engine.state().paused {
+                "新要求已接收 · 暂停等待恢复"
+            } else {
+                "新要求已接收 · 等待纳入执行"
+            }
+            .into();
+        }
+        if let Some((call, feedback)) = self.selected_active_call(engine) {
+            if let Some(failure) = &self.last_tool_failure {
+                return format!("最近工具失败 {failure} · 当前执行仍在继续");
+            }
+            if feedback.phase == "执行命令" {
+                return if self
+                    .tool_observations
+                    .get(call)
+                    .is_some_and(|(out, err)| !out.is_empty() || !err.is_empty())
+                {
+                    "正在接收命令输出"
+                } else {
+                    "命令尚未产生输出；执行仍在继续"
+                }
+                .into();
+            }
+            if self
+                .parts
+                .get(call)
+                .is_some_and(|parts| parts.values().any(|text| !text.is_empty()))
+            {
+                return "正在接收输出".into();
+            }
+            if self.last_admitted_input == self.last_input && self.last_input.is_some() {
+                return "新要求已纳入 · 正在处理".into();
+            }
+        }
+        if engine.state().paused && !engine.unanswered_questions().is_empty() {
+            return "待答问题仍保留 · /questions 选择回复".into();
+        }
+        if let Some(failure) = &self.last_tool_failure {
+            return format!("最近工具失败 {failure}");
+        }
+        String::new()
     }
     fn refresh_usage(&mut self, engine: &Engine) {
         self.ui.usage = if let Some(input) = &self.last_input {
@@ -939,6 +1052,41 @@ impl App {
         false
     }
     fn current_status(&self, engine: &Engine) -> String {
+        if !engine.state().paused
+            && engine.state().unknown_writes.is_empty()
+            && let Some((call, feedback)) = self.selected_active_call(engine)
+        {
+            let phase = if feedback.phase == "思考中"
+                && self
+                    .parts
+                    .get(call)
+                    .is_some_and(|parts| parts.values().any(|text| !text.is_empty()))
+            {
+                "输出中"
+            } else {
+                feedback.phase
+            };
+            let count = engine
+                .state()
+                .jobs
+                .values()
+                .filter(|job| job.state == JobState::Running && job.current_call.is_some())
+                .count();
+            let parallel = if count > 1 {
+                format!(" · {count} 项并行")
+            } else {
+                String::new()
+            };
+            return format!(
+                "{phase}{} · {}s{parallel}",
+                if feedback.target.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", feedback.target)
+                },
+                feedback.started.elapsed().as_secs()
+            );
+        }
         current_status(
             engine,
             self.last_input.as_deref(),
@@ -1160,7 +1308,7 @@ impl App {
                         picker.items = file_items(&files);
                     }
                     self.files = Some(files);
-                    self.ui.notice = "文件引用只插入草稿；发送后由 Agent 读取".into();
+                    self.ui.notice = "文件引用只插入草稿；发送后读取文件".into();
                 }
                 Err(error) => self.ui.notice = format!("文件索引失败：{error:#}"),
             }
@@ -1716,7 +1864,7 @@ async fn event_loop(
         if dirty {
             app.metadata(engine);
             let model = model_label(&app.settings.profile);
-            let fact = app.current_status(engine);
+            let fact = app.ui.live_status.clone();
             terminal
                 .terminal
                 .draw(|frame| app.ui.render(frame, engine.state(), &model, &fact))?;
@@ -1828,6 +1976,7 @@ async fn event_loop(
                                                         app.drafts.remove(&sent_target.clone().unwrap_or_default());
                                                         if sent_target.is_some() { app.switch_target(None); }
                                                         app.last_input = Some(id.clone());
+                                                        app.last_admitted_input = None;
                                                         app.ui.notice = format!("输入 {} 已接收 · 等待纳入执行", short_id(&id));
                                                         app.elapsed_from = Instant::now(); deadline = Some(Instant::now()+duration); },
                                                     Err(error) => app.ui.notice = format!("发送失败：{error:#}；草稿已保留"),
@@ -1871,7 +2020,8 @@ async fn event_loop(
             _ = tick.tick(), if !engine.is_quiescent() || app.has_tasks() || app.changed_at.is_some() || app.notice_until.is_some() => {
                 let pending = app.has_tasks();
                 app.tasks().await;
-                dirty |= app.progress(engine) || !engine.is_quiescent() || pending || app.expire_notice();
+                let expired_notice = app.expire_notice();
+                dirty |= app.progress(engine) || !engine.is_quiescent() || pending || expired_notice;
                 if app.changed_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(500))
                     && let Err(error) = app.save(engine,data) {
                     app.ui.notice = format!("草稿保存失败：{error:#}"); app.changed_at = None; dirty = true;
@@ -1930,6 +2080,70 @@ fn is_complete_command(text: &str) -> bool {
         )
 }
 
+fn execution_active(state: &bone::state::SessionState) -> bool {
+    !state.paused
+        && state.unknown_writes.is_empty()
+        && state.jobs.values().any(|job| {
+            job.state == JobState::Ready
+                || (job.state == JobState::Running && job.current_call.is_some())
+        })
+}
+
+fn active_call(engine: &Engine, call: &str) -> Result<ActiveCall> {
+    let event = engine
+        .read_call_event(call, "tool_started")
+        .or_else(|_| engine.read_call_event(call, "model_started"))?;
+    let phase = if event.kind == "model_started" {
+        if event.data["purpose"] == "summary" {
+            "整理上下文"
+        } else {
+            "思考中"
+        }
+    } else {
+        match event.data["tool_name"].as_str().unwrap_or("") {
+            "shell" => "执行命令",
+            "read_file" => "读取文件",
+            "search_files" => "搜索文件",
+            "list_files" => "查看文件",
+            "write_file" => "写入文件",
+            "edit_file" => "修改文件",
+            _ => "执行工具",
+        }
+    };
+    let target = if event.kind == "tool_started" {
+        tool_arguments(engine, &event)?
+            .and_then(|args| {
+                args["path"]
+                    .as_str()
+                    .or_else(|| args["command"].as_str())
+                    .or_else(|| args["query"].as_str())
+                    .map(|text| question_summary(text, 24))
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let age_ms = event
+        .timestamp
+        .parse::<u64>()
+        .ok()
+        .and_then(|stamp| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|now| (now.as_millis().min(u64::MAX as u128) as u64).saturating_sub(stamp))
+        })
+        .unwrap_or(0);
+    let started = Instant::now()
+        .checked_sub(Duration::from_millis(age_ms))
+        .unwrap_or_else(Instant::now);
+    Ok(ActiveCall {
+        phase,
+        target,
+        started,
+    })
+}
+
 fn current_status(engine: &Engine, input: Option<&str>, tool_failure: Option<&str>) -> String {
     let state = engine.state();
     if !state.unknown_writes.is_empty() {
@@ -1938,57 +2152,51 @@ fn current_status(engine: &Engine, input: Option<&str>, tool_failure: Option<&st
     if state.paused {
         return "已暂停 · Ctrl+R 恢复".into();
     }
-    let terminal = input.and_then(|id| engine.result(id)).filter(|e| {
+    let active = state
+        .jobs
+        .values()
+        .filter(|job| job.state == JobState::Running && job.current_call.is_some())
+        .count();
+    if active > 0 {
+        return if active == 1 {
+            "正在执行".into()
+        } else {
+            format!("正在执行 · {active} 项并行")
+        };
+    }
+    if state.jobs.values().any(|job| job.state == JobState::Ready) {
+        return "处理中".into();
+    }
+    let terminal = input.and_then(|id| engine.result(id)).filter(|event| {
         matches!(
-            e.kind.as_str(),
+            event.kind.as_str(),
             "delivery" | "failure" | "input_paused" | "input_resolved"
         )
     });
-    if let Some(event) = terminal {
-        return format!(
-            "输入 {} {}{}",
-            short_id(input.unwrap_or("")),
-            terminal_label(&event.kind),
-            if event.kind == "delivery" {
-                " · /delivery 查看"
-            } else {
-                ""
-            }
-        );
+    if terminal.is_some_and(|event| event.kind != "delivery") {
+        return terminal_label(&terminal.unwrap().kind).into();
     }
     if !state.pending_inputs.is_empty() {
-        return format!(
-            "{} 条输入已接收 · 等待纳入执行{}",
-            state.pending_inputs.len(),
-            tool_failure.map(|_| " · 有工具失败记录").unwrap_or("")
-        );
+        return format!("{} 条新要求已接收 · 等待处理", state.pending_inputs.len());
     }
     let questions = engine.unanswered_questions().len();
-    let running = state
-        .jobs
-        .values()
-        .filter(|job| job.state == JobState::Running)
-        .count();
-    let activity = if questions > 0 {
-        format!("{questions} 个问题待回答 · /questions")
-    } else if running > 0 {
-        format!("工作中 · {running} 项正在执行")
-    } else if !engine.is_quiescent() {
-        "正在安排工作".into()
-    } else if state
+    if questions > 0 {
+        return format!("等待回复 · {questions} 个问题 · /questions");
+    }
+    if state
         .jobs
         .values()
         .any(|job| job.state == JobState::Waiting)
     {
-        "等待工作结果".into()
-    } else {
-        "暂无活动调用".into()
-    };
-    if let Some(failure) = tool_failure {
-        format!("最近工具失败 {failure} · {activity}")
-    } else {
-        activity
+        return "等待工作结果".into();
     }
+    if terminal.is_some() {
+        return "本次已完成 · /delivery 查看".into();
+    }
+    if let Some(failure) = tool_failure {
+        return format!("最近工具失败 {failure} · 暂无活动调用");
+    }
+    "等待输入".into()
 }
 
 fn raw_tool_output(engine: &Engine, event: &Event) -> Result<String> {

@@ -1,0 +1,36 @@
+{
+  "size": "120x40",
+  "binary": "/Users/zzhang/Documents/ChatGPT/BONE/target/debug/bone",
+  "results": [
+    {
+      "scenario": "feedback-flow",
+      "status": "PASS",
+      "error": null,
+      "binary_sha256_at_start": "06b369416b51bffa2944ce21fc080d39b68a3402dcc870f63d50ae752e6f18fb"
+    },
+    {
+      "scenario": "stream",
+      "status": "PASS",
+      "error": null,
+      "binary_sha256_at_start": "06b369416b51bffa2944ce21fc080d39b68a3402dcc870f63d50ae752e6f18fb"
+    },
+    {
+      "scenario": "concurrent",
+      "status": "PASS",
+      "error": null,
+      "binary_sha256_at_start": "06b369416b51bffa2944ce21fc080d39b68a3402dcc870f63d50ae752e6f18fb"
+    },
+    {
+      "scenario": "shell-live",
+      "status": "PASS",
+      "error": null,
+      "binary_sha256_at_start": "06b369416b51bffa2944ce21fc080d39b68a3402dcc870f63d50ae752e6f18fb"
+    },
+    {
+      "scenario": "reader-delivery",
+      "status": "PASS",
+      "error": null,
+      "binary_sha256_at_start": "06b369416b51bffa2944ce21fc080d39b68a3402dcc870f63d50ae752e6f18fb"
+    }
+  ]
+}
