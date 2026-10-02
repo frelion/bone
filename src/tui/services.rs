@@ -22,6 +22,8 @@ const SAVED_LIMIT: usize = 6 * (DRAFT_LIMIT + HISTORY_LIMIT) + 4096;
 pub struct UiSaved {
     pub draft: String,
     pub history: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 fn session_path(data: &Path, session: &str) -> Result<PathBuf> {
     ensure!(
@@ -36,6 +38,13 @@ fn session_path(data: &Path, session: &str) -> Result<PathBuf> {
 }
 fn validate(saved: &UiSaved) -> Result<()> {
     ensure!(saved.draft.len() <= DRAFT_LIMIT, "draft exceeds 128 KiB");
+    ensure!(
+        saved
+            .reply_to
+            .as_ref()
+            .is_none_or(|id| !id.is_empty() && id.len() <= 128),
+        "invalid saved reply target"
+    );
     ensure!(
         saved.history.len() <= 100
             && saved.history.iter().map(String::len).sum::<usize>() <= HISTORY_LIMIT,
@@ -220,11 +229,79 @@ pub async fn git_diff(workspace: &Path) -> Result<String> {
             )
             .await?,
         );
+        let paths = git_output(
+            &root,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            256 * 1024,
+        )
+        .await?;
+        let remaining = OUTPUT_LIMIT.saturating_sub(output.len());
+        let inspect_root = root.clone();
+        let additions =
+            tokio::task::spawn_blocking(move || untracked_diff(&inspect_root, &paths, remaining))
+                .await??;
+        output.push_str(&additions);
         ensure!(output.len() <= OUTPUT_LIMIT, "git output exceeds 2 MiB");
         Ok(output)
     })
     .await
     .context("git inspection timed out after 10 seconds")?
+}
+// Inspect new files as part of the real workspace diff; do not run user diff drivers.
+fn untracked_diff(root: &Path, paths: &str, limit: usize) -> Result<String> {
+    let mut output = String::from("\nUntracked file contents\n");
+    for relative in paths.split('\0').filter(|p| !p.is_empty()) {
+        let path = root.join(relative);
+        ensure!(path.starts_with(root), "invalid untracked file path");
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            continue;
+        }
+        let label = format!("{:?}", relative);
+        let mut patch =
+            format!("\ndiff --git a/{label} b/{label}\nnew file\n--- /dev/null\n+++ b/{label}\n");
+        if metadata.is_symlink() {
+            patch.push_str(&format!("+symlink → {}\n", fs::read_link(&path)?.display()));
+        } else {
+            ensure!(
+                path.canonicalize()?.starts_with(root),
+                "untracked file escapes workspace"
+            );
+            let mut bytes = Vec::new();
+            fs::File::open(&path)?
+                .take(256 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            let truncated = bytes.len() > 256 * 1024;
+            bytes.truncate(256 * 1024);
+            if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+                patch.push_str("[binary file; content not rendered]\n");
+            } else {
+                let text = std::str::from_utf8(&bytes)?;
+                for line in text.lines() {
+                    patch.push('+');
+                    patch.push_str(line);
+                    patch.push('\n');
+                }
+                if !text.is_empty() && !text.ends_with('\n') {
+                    patch.push_str("\\ No newline at end of file\n");
+                }
+            }
+            if truncated {
+                patch.push_str(
+                    "[file preview capped at 256 KiB; inspect the file for the complete content]\n",
+                );
+            }
+        }
+        if output.len() + patch.len() + 128 > limit {
+            output.push_str("\n[remaining untracked content omitted: 2 MiB inspection limit]\n");
+            break;
+        }
+        output.push_str(&patch);
+    }
+    if output.len() > limit {
+        return Ok(String::new());
+    }
+    Ok(output)
 }
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")

@@ -100,6 +100,27 @@ pub fn history_before(
     })
 }
 
+/// A readable match in an original persisted event, independent of screen wrapping.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryMatch {
+    pub event_id: String,
+    pub kind: String,
+    pub snippet: String,
+}
+
+/// Search complete persisted readable text using at most one original event at a time.
+/// Matching is case-insensitive; `limit` is 1–100. Opaque provider blocks are excluded.
+pub fn history_search(
+    data_dir: &Path,
+    id: &str,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<HistoryMatch>> {
+    let store = store::Store::open(data_dir.join("sessions.sqlite3"))?;
+    store.load_session(id)?;
+    store.history_search(id, query, limit)
+}
+
 #[cfg(test)]
 #[path = "../tests/internal/provider_contract.rs"]
 mod provider_contract;

@@ -1,85 +1,92 @@
 # BONE 开发终端
 
-当前版本具备基本操作和执行回归，日常交互仍有明显缺口。成熟 TUI 的交互、技术依赖和验收要求见 [差距与产品需求](tui-requirements.md)；下表的“实现”表示存在能力，不表示体验已达到 Pi/OpenCode 水平。
+BONE 0.6 的 TUI 使用 Ratatui + Crossterm，输入编辑采用 ratatui-textarea，Markdown 采用 tui-markdown。对话、文件工具和运行日志在同一阅读区；Job 是 Agent 内部单元。
 
-## 使用
+本轮交付、逐屏操作和验证边界见 [交付记录](results/2026-10-02-tui-product/README.md)及[可浏览过程](results/2026-10-02-tui-product/index.html)。后续需求见 [产品需求](tui-requirements.md)。
+
+## 启动
 
 ```sh
 bone
-bone tui
-./target/release/bone tui
-cargo run --locked -- tui
-# 现有配置默认使用 ChatGPT 订阅 gpt-6-luna
-bone --profile subscription tui --workspace /path/to/project
-bone --profile subscription tui --session SESSION_ID
+bone tui --workspace /path/to/project
+bone --profile subscription --model chatgpt:gpt-6-luna tui --workspace /path/to/project
+bone --profile subscription tui --session SESSION_ID --workspace /path/to/project
 ```
 
-安装入口用 `cargo install --path . --locked --force` 更新，`bone --version` 应为 `bone 0.5.0`。`./target/release/bone` 只在构建它的目录中存在；在另一个 checkout 或 worktree 中启动时，使用安装后的 `bone`，或完整的二进制路径。无子命令时默认打开 TUI。
+安装用 `cargo install --path . --locked --force`，`bone --version` 应为 `bone 0.6.0`。安装后的 `bone` 可以在任意项目目录使用。终端必须为交互式 TTY，`TERM=dumb` 会给出明确错误。
 
-正常输入任务即可。用户控制会话，不选择内部 Job。界面默认将对话和工程工具行动放在一起，底部是可恢复的多行编辑器；内部事件归属信息通过 F2 和详情浏览。
+现有 subscription 配置继续使用原有登录，不需要重新登录。切换模型保留会话工作和额度，先暂停，Ctrl+R 显式继续；`/model` 仅修改当前运行，不写回 config.toml。
 
-## 对照依据
+## 输入与命令
 
-本次对照的是终端开发的交互能力：Codex 的持续编码循环与会话恢复、Claude Code 的多行编辑与历史搜索、OpenCode 的文件引用/命令/外部编辑器、Pi 的终端交互与持久会话。依据各自的官方资料：
+输入 `/` 即显示命令，继续输入筛选；输入 `@` 自动索引项目文件。↑↓选候选，Tab 插入；Enter 选择不完整候选也只插入。命令完整键入或补全后，再 Enter 才执行。例如 `/st` → Tab → Enter；完整键入 `/status` 可以直接 Enter。Ctrl+P 命令菜单中的 Enter 执行选项。
 
-- [Codex CLI](https://learn.chatgpt.com/docs/codex/cli)
-- [Claude Code interactive mode](https://code.claude.com/docs/en/interactive-mode)
-- [OpenCode TUI](https://opencode.ai/docs/tui/)
-- [Pi 终端使用指南](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/usage.md)
+文件补全只插入引用。发送后由 Agent 在 Job 中决定读取。粘贴多行、选候选、草稿恢复均不会自动发送。
 
-这份交付覆盖 BONE 的本地终端工作流。表中的实现状态仅描述本项目，不代表与这些产品所有扩展、权限系统、跨设备功能等逐项相同。
+| 操作 | 键位 |
+| --- | --- |
+| 发送 / 换行 | Enter / Shift+Enter、Alt+Enter、Ctrl+J |
+| 视觉行导航 / 历史草稿 | ↑↓ / Alt+↑↓ |
+| 单词 / 行首尾 | Ctrl+←→ / Ctrl+A、Ctrl+E |
+| 选区 / 删除单词、行尾 | Shift+方向键 / Ctrl+W、Ctrl+K |
+| 撤销 / 重做 | Ctrl+Z / Alt+Z |
+| 外部编辑器 | Ctrl+G；使用 VISUAL 或 EDITOR |
+| 命令 / 文件 / 全文搜索 | Ctrl+P / Ctrl+O / Ctrl+F |
+| 切换输入、对话、活动焦点 | Tab；已有候选时先确认候选 |
+| 选择消息 / 展开折叠 | 对话中的 ↑↓、j/k / Enter |
+| 原文 / 完整复制 | 对话中的 d / y；详情中 Ctrl+Y |
+| 滚动 / 首尾 | PageUp、PageDown / Home、End |
+| 暂停 / 恢复 / 退出 | Ctrl+C / Ctrl+R / Ctrl+Q |
+| 帮助 / 活动记录 | F1 / F2 |
 
-| 能力 | BONE 实现 | 验收方式 |
-| --- | --- | --- |
-| 实时模型输出 | 观察原生 Rig 事件；预览与正式交付区分 | 延迟 SSE 的输出先于持久化完成事件 |
-| 打断与补充要求 | 输入优先；旧版本预览清除；Engine 控制取消 | PTY + SQLite 版本/归属校验 |
-| 工程过程可见 | 工具启动/结果、Markdown、代码块、diff；F2 原文详情 | 真实内核工具事件、渲染测试 |
-| 编辑器 | Unicode grapheme、软换行、多行光标、单词/行编辑、undo/redo、历史 | emoji/组合字符精确编辑与草稿核对 |
-| 外部编辑器 | VISUAL/EDITOR；切换终端模式；返回草稿 | 真实 PTY stdin 与 SIGTERM 故障检查 |
-| 命令与补全 | Ctrl+P 命令、@文件 Tab/Ctrl+O、模糊选择器 | 不触发模型，Enter 仅选路径 |
-| 会话管理 | 标题/ID 搜索、/new、/sessions、独立草稿恢复 | 重启后草稿不自动发送、会话实际切换 |
-| 模型选择 | 已配置 profile + 原生 provider:model 引用 | 模型切换保留工作与额度；endpoint/认证来源保持 |
-| 用量与限制 | 本次请求 token/call、模式、耗时；/status | 原生 usage，缺失显示未知，费用不猜测 |
-| 历史浏览 | 最近记录有界加载；更早记录向前分页；搜索预览 | 向前连续分页、无重复/缺口、跨 session cursor 拒绝 |
-| 修改检查与报告 | /diff、/copy、/export 本地 HTML | Git 只读检查、安全 HTML、完整正式答复读取 |
-| 终端兼容与恢复 | 宽/窄/微小窗口、NO_COLOR、粘贴保护、退出恢复 | PTY resize/termios/alternate screen、渲染测试 |
+Ctrl+C 在输入框有选区时复制，否则暂停。Ctrl+Y 按当前可见界面复制详情、输入选区或选中消息。系统剪贴板使用 macOS pbcopy 或 Linux wl-copy/xclip/xsel。
+
+## 运行、提问与阅读
+
+模型预览明确标记为“输出中（未交付）”。Shell 未退出时显示 stdout/stderr 尾部，最终工具记录替换预览。执行失败、结果未知和成功完成分别显示；输入与停止仍可操作。
+
+输入栏显示回复的具体问题。`/questions` 选择待回答的问题；Esc 取消回复，随后作为新指令发送。新问题不会接管正在编辑的独立草稿，失效目标不会改投另一问题。运行中新要求持久化后，旧结果不能启动过期外部动作。
+
+最近会话按页加载。`/older` 在正常对话区往前翻页，`/latest` 返回最近窗口；草稿保留。Ctrl+F 或 `/search 文本` 搜索完整 SQLite 原文，包含工具命令、路径、结果，独立于当前窗口和换行宽度；选择命中后读取完整原文。
+
+对话窗口最多 256 条、8 MiB，单条预览最多 128 KiB。超限会说明原文入口；d/y 和搜索从 SQLite 读取完整记录。工具日志按原样阅读，Markdown 用于对话内容。
 
 ## 命令
 
-- `/new` 创建新会话，旧工作保存并暂停。
-- `/sessions` 搜索当前项目会话；`/sessions SESSION_ID` 直接打开。
-- `/model` 选择已配置 profile；`/model PROFILE` 或 `/model provider:model` 切换。
-- `/status` 显示真实执行配置、用量、会话 ID 与未知写。
-- `/diff` 异步检查 staged、unstaged 和文件状态，不修改仓库。
-- `/files` 打开文件选择器；文件引用发送后，由 Agent 在 Job 中决定读取。
-- `/search [文本]` 或 Ctrl+F 搜索当前加载的对话预览。
-- `/older` 分页浏览更早的原文。
-- `/export` 生成数据目录 `tui/exports/` 下的本地 HTML，界面显示完整路径。
-- `/copy` 复制最后一条正式答复；macOS 使用 pbcopy，Linux 使用 wl-copy/xclip/xsel。
-- `/editor` 或 Ctrl+G 打开外部编辑器；`EDITOR="code --wait"`、`EDITOR=vim` 等。
-- `/details` 或 F2 展开内部活动。`/stop`、`/resume`、`/quit` 控制会话。
-- `/help` 或 F1 查看键盘操作。未知命令保留草稿，不发送给模型。
+| 命令 | 用途 |
+| --- | --- |
+| `/new`、`/sessions [ID]` | 创建、搜索或打开当前项目会话；旧工作先保存并暂停 |
+| `/model [PROFILE 或 provider:model]` | 选择配置或原生模型引用 |
+| `/status` | 模型、执行额度、会话信息和未知写入 |
+| `/questions`、`/reply ID` | 选择明确的回复目标 |
+| `/stop`、`/resume` | 暂停、显式恢复 |
+| `/files` | 文件引用选择 |
+| `/search [文本]`、`/older`、`/latest` | 全记录搜索、历史翻页、返回最近窗口 |
+| `/diff` | 异步读取 staged/unstaged 修改及未跟踪文件实际内容 |
+| `/reconcile [CALL_ID 核查结论]` | 查看未知写原始参数；记录实际核查结果 |
+| `/copy`、`/export` | 复制原文、导出本地 HTML 对话与行动报告 |
+| `/mouse` | 切换鼠标滚动与终端原生文本选择 |
+| `/editor`、`/details`、`/help` | 外部编辑、活动记录、帮助 |
+| `/quit` | 保存草稿、暂停工作、恢复终端；打印完整恢复命令 |
 
-## 内核边界
+未知写入先查看实际文件、Git diff、测试或进程结果。记录核查结论后仍保持暂停，Ctrl+R 才继续。记录结论不重放未知操作，也不能绕过仍活跃的物理写 lease。
 
-TUI 只通过 Session 接口发送输入、推进执行、停止、恢复与读取记录。所有 Agent 的理解、规划、摘要、模型调用和工作区工具操作仍归属 Job。界面命令由用户主动操作；查看 Git 或导出报告不消耗 Agent 请求额度。
+## 技术边界
 
-运行中的模型事件由可选、有界、允许丢帧的观察队列传递；保留原生 Rig JSON 和 job/call/revision 归属。无界缓存、每个 token 写入数据库、观察者阻塞模型调用均被避免。持久化完成结果是最终依据，隐藏推理/加密块不作为正文显示。工具 stdout/stderr 目前在工具完成后呈现，未增加另一套工具流协议。
+TUI 通过 Session 级 Engine 发送输入、执行、停止、恢复和读取记录。所有 Agent 模型与工作区工具仍归属 Job。用户的 Git 检查、复制、报告导出是显式界面操作。
 
-切换模型先暂停工作，验证新配置后仅改变接入 recipe，不重置历史、输入额度或未知写。跨 provider 的临时切换不沿用旧 provider 的凭据变量。模型切换暂不写回 config.toml；重新启动按正常 profile 参数选择。
+模型观察保留 Rig 原生事件。工具观察仅提供每调用最新有界尾部快照，不替代最终持久结果。观察可丢帧且不阻塞调用；旧 revision、已结束 call 和停止后的预览会拒绝。每调用仅有一份持久原文，界面不写入每个 token。
 
-草稿文件和导出使用 Unix 0600、原子安装与 fsync；不保存认证信息。目录索引有界且不跟随 symlink。Git 检查禁用外部 diff/textconv/fsmonitor，限制时长和输出；HTML 内容转义并禁用脚本。错误保持可见，恢复历史和未知写均沿用内核规则。
+草稿与报告使用原子写入及 Unix 0600；不保存认证信息。文件索引有界且不跟随 symlink。Git 检查禁用外部 diff/textconv/fsmonitor，并限制时间与输出；未跟踪文件超出预览限制会标注。HTML 内容转义且不执行原文脚本。
 
 ## 验证
 
 ```sh
 cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo check --locked --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --locked
 python3 -u -B tests/tui_pty.py --binary target/debug/bone
+python3 -B -m unittest discover -s tests -p 'test_*.py'
 ```
 
-终端验收使用本地 Responses fixture 与合成凭据。覆盖原生流提前可见、旧预览清理、停止、问题路由、Unicode 编辑/历史/搜索、粘贴/补全不发送、命令不绕过内核、会话/模型切换、草稿重启、真实编辑器输入、退出与 SIGTERM 恢复；编辑器挂起时也检查子进程被清理。
-
-[测试渲染快照](results/2026-10-01-tui/preview-120.svg) 来自实际 Ratatui TestBackend，明确标注为测试数据。模型实测与 PTY 仿真分开记录；验收结果见 [运行记录](results/2026-10-01-tui/README.md)。
+真实 PTY 使用本地协议 fixture 验证输入、屏幕、实际文件工具、SQLite 归属和终端恢复；真实订阅的软件修复另行记录。测试范围与尚未交付的需求分开列在 [交付记录](results/2026-10-02-tui-product/README.md)。

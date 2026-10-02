@@ -6,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -45,6 +46,9 @@ pub(super) enum PickerKind {
     Session,
     File,
     Model,
+    History,
+    Question,
+    Reconcile,
 }
 #[derive(Debug, Clone)]
 pub(super) struct PickerItem {
@@ -58,11 +62,17 @@ pub(super) struct Picker {
     pub query: String,
     pub selected: usize,
     pub items: Vec<PickerItem>,
+    pub inline: bool,
 }
 
 #[derive(Debug)]
 pub(super) struct View {
-    pub draft: String,
+    editor: TextArea<'static>,
+    pub reply_label: String,
+    message_selected: Option<usize>,
+    expanded: std::collections::HashSet<String>,
+    message_offsets: Vec<usize>,
+    selection_needs_scroll: bool,
     pub usage: String,
     pub session_label: String,
     pub busy: bool,
@@ -71,11 +81,6 @@ pub(super) struct View {
     history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
-    undo: Vec<(String, usize)>,
-    redo: Vec<(String, usize)>,
-    search: Option<String>,
-    search_selected: usize,
-    search_total: usize,
     started: std::time::Instant,
     transcript_cache: Vec<Line<'static>>,
     cache_width: usize,
@@ -87,7 +92,6 @@ pub(super) struct View {
     pub show_activity: bool,
     pub show_help: bool,
     pub detail: Option<(String, String)>,
-    cursor: usize,
     conversation_scroll: usize,
     conversation_max: usize,
     follow_conversation: bool,
@@ -108,7 +112,12 @@ const ACCENT: Color = Color::Cyan;
 impl View {
     pub fn new() -> Self {
         Self {
-            draft: String::new(),
+            editor: new_editor(),
+            reply_label: String::new(),
+            message_selected: None,
+            expanded: Default::default(),
+            message_offsets: Vec::new(),
+            selection_needs_scroll: false,
             usage: String::new(),
             session_label: String::new(),
             busy: false,
@@ -117,11 +126,6 @@ impl View {
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
-            undo: Vec::new(),
-            redo: Vec::new(),
-            search: None,
-            search_selected: 0,
-            search_total: 0,
             started: std::time::Instant::now(),
             transcript_cache: Vec::new(),
             cache_width: 80,
@@ -133,7 +137,6 @@ impl View {
             show_activity: false,
             show_help: false,
             detail: None,
-            cursor: 0,
             conversation_scroll: 0,
             conversation_max: 0,
             follow_conversation: true,
@@ -191,41 +194,63 @@ impl View {
             .take(256)
             .collect();
         message.text = Self::sanitize(&message.text);
-        const OMITTED: &str = "\n\n[界面预览已省略，原文保留在会话记录]";
-        if message.text.chars().count() > 16_000 {
-            let budget = 16_000 - OMITTED.chars().count();
-            let mut count = 0;
-            message.text = message
+        const OMITTED: &str = "\n\n[显示预览，d 原文 / y 复制完整记录]";
+        if message.text.len() > 128 * 1024 {
+            let budget = 128 * 1024 - OMITTED.len();
+            let end = message
                 .text
-                .graphemes(true)
-                .take_while(|g| {
-                    count += g.chars().count();
-                    count <= budget
-                })
-                .collect();
+                .grapheme_indices(true)
+                .map(|(i, g)| i + g.len())
+                .take_while(|&end| end <= budget)
+                .last()
+                .unwrap_or(0);
+            message.text.truncate(end);
             message.text.push_str(OMITTED);
         }
         message
     }
-    fn trim_messages(&mut self) {
-        let mut characters = self
-            .messages
-            .iter()
-            .map(|m| m.text.chars().count() + m.role.chars().count())
-            .sum::<usize>();
-        while self.messages.len() > 150 || characters > 160_000 {
-            let old = self.messages.remove(0);
-            characters =
-                characters.saturating_sub(old.text.chars().count() + old.role.chars().count());
-            let removed_lines = markdown(&old.text, self.cache_width).len() + 2;
-            self.conversation_scroll = self.conversation_scroll.saturating_sub(removed_lines);
-            self.conversation_max = self.conversation_max.saturating_sub(removed_lines);
-        }
-    }
     pub fn push_message(&mut self, message: Message) {
         self.cache_dirty = true;
         self.messages.push(Self::preview(message));
-        self.trim_messages();
+        self.trim_messages(true);
+    }
+    pub fn first_message_id(&self) -> Option<&str> {
+        self.messages.first()?.event_id.as_deref()
+    }
+    fn trim_messages(&mut self, from_head: bool) {
+        let bytes =
+            |m: &Message| m.role.len() + m.text.len() + m.event_id.as_ref().map_or(0, String::len);
+        let mut total = self.messages.iter().map(bytes).sum::<usize>();
+        while self.messages.len() > 256 || total > 8 * 1024 * 1024 {
+            let index = if from_head {
+                0
+            } else {
+                self.messages.len() - 1
+            };
+            let removed = self.messages.remove(index);
+            total -= bytes(&removed);
+            let key = message_key(&removed);
+            if from_head {
+                let height = message_lines(
+                    &removed,
+                    self.cache_width,
+                    self.expanded.contains(&key),
+                    false,
+                )
+                .len();
+                self.conversation_scroll = self.conversation_scroll.saturating_sub(height);
+            }
+            self.expanded.remove(&key);
+            self.message_selected = match self.message_selected {
+                Some(selected) if selected == index => {
+                    self.notice = "所选消息已移出预览窗口；Ctrl+F 搜索持久原文".into();
+                    self.selection_needs_scroll = false;
+                    None
+                }
+                Some(selected) if selected > index => Some(selected - 1),
+                selected => selected,
+            };
+        }
     }
 
     pub fn push_activity(&mut self, mut activity: Activity) {
@@ -259,52 +284,99 @@ impl View {
         self.trim_history();
         self.history_index = None;
     }
-    pub fn searching(&self) -> bool {
-        self.search.is_some()
-    }
     pub fn has_modal(&self) -> bool {
-        self.searching() || self.picker.is_some() || self.show_help || self.detail.is_some()
+        self.picker.as_ref().is_some_and(|p| !p.inline) || self.show_help || self.detail.is_some()
     }
-    pub fn start_search(&mut self, query: &str) {
-        self.search = Some(Self::sanitize(query));
-        self.search_selected = 0;
+    pub fn draft(&self) -> String {
+        self.editor.lines().join("\n")
     }
     pub fn cursor(&self) -> usize {
-        self.cursor
+        let ratatui_textarea::DataCursor(row, col) = self.editor.cursor();
+        self.editor
+            .lines()
+            .iter()
+            .take(row)
+            .map(|s| s.len() + 1)
+            .sum::<usize>()
+            + self.editor.lines()[row]
+                .chars()
+                .take(col)
+                .map(char::len_utf8)
+                .sum::<usize>()
+    }
+    fn move_to_byte(&mut self, offset: usize) {
+        let draft = self.draft();
+        let prefix = &draft[..offset];
+        let row = prefix.bytes().filter(|&b| b == b'\n').count();
+        let col = prefix
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count();
+        self.editor.move_cursor(CursorMove::Jump(
+            row.min(u16::MAX as usize) as u16,
+            col.min(u16::MAX as usize) as u16,
+        ));
+        for _ in u16::MAX as usize..row {
+            self.editor.move_cursor(CursorMove::Down);
+        }
+        for _ in u16::MAX as usize..col {
+            self.editor.move_cursor(CursorMove::Forward);
+        }
+    }
+    pub fn selected_input_text(&self) -> Option<String> {
+        if self.focus != Focus::Input || self.has_modal() {
+            return None;
+        }
+        let ((a, b), (c, d)) = self.editor.selection_range()?;
+        if (a, b) == (c, d) {
+            return None;
+        }
+        let mut lines = Vec::new();
+        for row in a..=c {
+            lines.push(
+                self.editor.lines()[row]
+                    .chars()
+                    .skip(if row == a { b } else { 0 })
+                    .take(if row == c {
+                        d - if row == a { b } else { 0 }
+                    } else {
+                        usize::MAX
+                    })
+                    .collect::<String>(),
+            );
+        }
+        Some(lines.join("\n"))
     }
     pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str) {
-        if range.start <= range.end
-            && range.end <= self.draft.len()
-            && self.draft.is_char_boundary(range.start)
-            && self.draft.is_char_boundary(range.end)
-            && (range.start == self.draft.len()
-                || self
-                    .draft
-                    .grapheme_indices(true)
-                    .any(|(i, _)| i == range.start))
-            && (range.end == self.draft.len()
-                || self
-                    .draft
-                    .grapheme_indices(true)
-                    .any(|(i, _)| i == range.end))
+        let draft = self.draft();
+        let boundary = |i| i == draft.len() || draft.grapheme_indices(true).any(|(p, _)| p == i);
+        if range.start > range.end
+            || range.end > draft.len()
+            || !boundary(range.start)
+            || !boundary(range.end)
         {
-            let safe = Self::sanitize(text);
-            if self.draft.len() - (range.end - range.start) + safe.len() > 128 * 1024 {
-                self.notice = "输入最多 128 KiB；此次插入未接受，原输入已保留".into();
-                return;
+            return;
+        }
+        let safe = Self::sanitize(text);
+        if draft.len() - range.len() + safe.len() > 128 * 1024 {
+            self.notice = "输入最多 128 KiB；此次插入未接受，原输入已保留".into();
+            return;
+        }
+        self.editor.cancel_selection();
+        self.move_to_byte(range.start);
+        if !range.is_empty() {
+            self.editor.start_selection();
+            self.move_to_byte(range.end);
+        }
+        if safe.is_empty() {
+            if !range.is_empty() {
+                self.editor.delete_char();
             }
-            self.snapshot();
-            self.draft.replace_range(range.clone(), &safe);
-            self.cursor = range.start + safe.len();
-            self.fix_cursor();
+        } else {
+            self.editor.insert_str(safe);
         }
-    }
-    fn snapshot(&mut self) {
-        self.undo.push((self.draft.clone(), self.cursor));
-        if self.undo.len() > 100 {
-            self.undo.remove(0);
-        }
-        self.redo.clear();
     }
     fn trim_history(&mut self) {
         let mut bytes = self.history.iter().map(String::len).sum::<usize>();
@@ -330,15 +402,21 @@ impl View {
                 .position(|m| m.event_id.as_ref() == Some(id))
         }) {
             self.messages[index] = Self::preview(message);
-            self.trim_messages();
+            self.trim_messages(true);
         } else {
             self.push_message(message);
         }
     }
     pub fn remove_message(&mut self, event_id: &str) {
         self.cache_dirty = true;
+        let selected_id = self.selected_message_id().map(str::to_owned);
         self.messages
             .retain(|m| m.event_id.as_deref() != Some(event_id));
+        self.message_selected = selected_id.as_deref().and_then(|id| {
+            self.messages
+                .iter()
+                .position(|m| m.event_id.as_deref() == Some(id))
+        });
     }
     pub fn open_picker(&mut self, kind: PickerKind, items: Vec<PickerItem>, query: String) {
         self.picker = Some(Picker {
@@ -346,7 +424,94 @@ impl View {
             query,
             selected: 0,
             items,
+            inline: false,
         });
+    }
+    pub fn open_completion(&mut self, kind: PickerKind, items: Vec<PickerItem>, query: String) {
+        let selected = self
+            .picker
+            .as_ref()
+            .filter(|p| p.inline && p.kind == kind)
+            .map_or(0, |p| p.selected);
+        self.open_picker(kind, items, query);
+        let picker = self.picker.as_mut().unwrap();
+        picker.inline = true;
+        picker.selected = selected.min(filtered(picker).len().saturating_sub(1));
+    }
+    pub fn is_completion(&self) -> bool {
+        self.picker.as_ref().is_some_and(|p| p.inline)
+    }
+    pub fn close_completion(&mut self) {
+        if self.is_completion() {
+            self.picker = None;
+        }
+    }
+    pub fn selected_message(&self) -> Option<&Message> {
+        self.messages.get(self.message_selected?)
+    }
+    pub fn selected_message_id(&self) -> Option<&str> {
+        self.selected_message()?.event_id.as_deref()
+    }
+    pub fn select_message(&mut self, id: &str) -> bool {
+        let Some(index) = self
+            .messages
+            .iter()
+            .position(|m| m.event_id.as_deref() == Some(id))
+        else {
+            return false;
+        };
+        self.message_selected = Some(index);
+        self.selection_needs_scroll = true;
+        self.focus = Focus::Conversation;
+        self.follow_conversation = false;
+        self.cache_dirty = true;
+        true
+    }
+    pub fn toggle_selected_message(&mut self) {
+        if let Some(message) = self.selected_message() {
+            let key = self
+                .selected_message_id()
+                .map(str::to_owned)
+                .unwrap_or_else(|| message_key(message));
+            if !self.expanded.remove(&key) {
+                self.expanded.insert(key);
+            }
+            self.cache_dirty = true;
+        }
+    }
+    pub fn prepend_messages(&mut self, messages: Vec<Message>) {
+        let existing = self
+            .messages
+            .iter()
+            .filter_map(|m| m.event_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut older = messages
+            .into_iter()
+            .filter(|m| m.event_id.as_ref().is_none_or(|id| !existing.contains(id)))
+            .map(Self::preview)
+            .collect::<Vec<_>>();
+        let shift = older
+            .iter()
+            .map(|m| {
+                message_lines(
+                    m,
+                    self.cache_width,
+                    self.expanded.contains(&message_key(m)),
+                    false,
+                )
+                .len()
+            })
+            .sum::<usize>();
+        if !self.follow_conversation {
+            self.conversation_scroll += shift;
+        }
+        if let Some(index) = self.message_selected.as_mut() {
+            *index += older.len();
+        }
+        older.append(&mut self.messages);
+        self.messages = older;
+        self.trim_messages(false);
+        self.cache_dirty = true;
     }
     pub fn picker_value(&self) -> Option<(PickerKind, String)> {
         let p = self.picker.as_ref()?;
@@ -355,7 +520,7 @@ impl View {
             .map(|item| (p.kind, item.value.clone()))
     }
     pub fn handle_mouse(&mut self, event: MouseEvent) {
-        if self.show_help || self.searching() {
+        if self.show_help {
             return;
         }
         if let Some(picker) = self.picker.as_mut() {
@@ -394,84 +559,30 @@ impl View {
             _ => {}
         }
     }
-    fn vertical(&mut self, down: bool) {
-        let start = self.draft[..self.cursor].rfind('\n').map_or(0, |p| p + 1);
-        let end = self.draft[self.cursor..]
-            .find('\n')
-            .map_or(self.draft.len(), |p| self.cursor + p);
-        let col = UnicodeWidthStr::width(&self.draft[start..self.cursor]);
-        let target = if down && end < self.draft.len() {
-            let next = end + 1;
-            let last = self.draft[next..]
-                .find('\n')
-                .map_or(self.draft.len(), |p| next + p);
-            Some((next, last))
-        } else if !down && start > 0 {
-            let last = start - 1;
-            let first = self.draft[..last].rfind('\n').map_or(0, |p| p + 1);
-            Some((first, last))
+    fn recall_history(&mut self, down: bool) {
+        if self.history.is_empty() {
+            return;
+        }
+        if self.history_index.is_none() {
+            self.history_draft = self.draft();
+        }
+        let index = if down {
+            self.history_index.map_or(self.history.len(), |i| i + 1)
         } else {
-            None
+            self.history_index
+                .unwrap_or(self.history.len())
+                .saturating_sub(1)
         };
-        if let Some((first, last)) = target {
-            let mut cells = 0;
-            self.cursor = first;
-            for (offset, g) in self.draft[first..last].grapheme_indices(true) {
-                if cells + UnicodeWidthStr::width(g) > col {
-                    break;
-                }
-                cells += UnicodeWidthStr::width(g);
-                self.cursor = first + offset + g.len();
-            }
-        } else if !self.history.is_empty() {
-            if self.history_index.is_none() {
-                self.history_draft = self.draft.clone();
-            }
-            let index = if down {
-                self.history_index
-                    .map(|i| i + 1)
-                    .unwrap_or(self.history.len())
-            } else {
-                self.history_index
-                    .unwrap_or(self.history.len())
-                    .saturating_sub(1)
-            };
-            if index >= self.history.len() {
-                self.history_index = None;
-                self.draft = self.history_draft.clone();
-            } else {
-                self.history_index = Some(index);
-                self.draft = self.history[index].clone();
-            }
-            self.cursor = self.draft.len();
-        }
+        let text = if index >= self.history.len() {
+            self.history_index = None;
+            self.history_draft.clone()
+        } else {
+            self.history_index = Some(index);
+            self.history[index].clone()
+        };
+        self.editor = new_editor();
+        self.editor.insert_str(text);
     }
-    fn line_start(&self) -> usize {
-        self.draft[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
-    }
-    fn line_end(&self) -> usize {
-        self.draft[self.cursor..]
-            .find('\n')
-            .map_or(self.draft.len(), |i| self.cursor + i)
-    }
-    fn word_left(&self) -> usize {
-        let mut start = self.cursor;
-        for (i, g) in self.draft[..self.cursor].grapheme_indices(true).rev() {
-            if !g.trim().is_empty() {
-                start = i;
-                break;
-            }
-            start = i;
-        }
-        for (i, g) in self.draft[..start].grapheme_indices(true).rev() {
-            if g.trim().is_empty() {
-                break;
-            }
-            start = i;
-        }
-        start
-    }
-
     pub fn toggle_inspector(&mut self) {
         if self.terminal_width < 100 {
             self.narrow_activity = !self.narrow_activity;
@@ -492,17 +603,10 @@ impl View {
     }
     pub fn handle_paste(&mut self, text: &str) {
         let query = Self::sanitize(text).replace('\n', " ");
-        if let Some(picker) = self.picker.as_mut() {
+        if let Some(picker) = self.picker.as_mut().filter(|p| !p.inline) {
             if picker.query.len() + query.len() <= 4096 {
                 picker.query.push_str(&query);
                 picker.selected = 0;
-            } else {
-                self.notice = "搜索输入最多 4 KiB；此次粘贴未接受".into();
-            }
-        } else if let Some(search) = self.search.as_mut() {
-            if search.len() + query.len() <= 4096 {
-                search.push_str(&query);
-                self.search_selected = 0;
             } else {
                 self.notice = "搜索输入最多 4 KiB；此次粘贴未接受".into();
             }
@@ -514,25 +618,19 @@ impl View {
     }
 
     pub fn paste(&mut self, text: &str) {
-        self.fix_cursor();
-        // Normalize pasted line endings before stripping other terminal controls.
         let text = Self::sanitize(&text.replace("\r\n", "\n").replace('\r', "\n"));
-        if self.draft.len() + text.len() > 128 * 1024 {
+        let selected = self.selected_input_text().map_or(0, |s| s.len());
+        if self.draft().len() - selected + text.len() > 128 * 1024 {
             self.notice = "输入最多 128 KiB；此次粘贴未接受，原输入已保留".into();
             return;
         }
-        self.snapshot();
-        self.draft.insert_str(self.cursor, &text);
-        self.cursor += text.len();
-        self.fix_cursor();
+        self.editor.insert_str(text);
         self.focus = Focus::Input;
     }
-
     pub fn take_draft(&mut self) -> String {
-        self.cursor = 0;
-        self.undo.clear();
-        self.redo.clear();
-        std::mem::take(&mut self.draft)
+        let draft = self.draft();
+        self.editor = new_editor();
+        draft
     }
 
     pub fn selected_event(&self) -> Option<&str> {
@@ -541,40 +639,21 @@ impl View {
             .map(|activity| activity.event_id.as_str())
     }
 
-    fn fix_cursor(&mut self) {
-        self.cursor = self.cursor.min(self.draft.len());
-        if self.cursor != self.draft.len() {
-            self.cursor = self
-                .draft
-                .grapheme_indices(true)
-                .map(|(offset, _)| offset)
-                .find(|&offset| offset >= self.cursor)
-                .unwrap_or(self.draft.len());
-        }
-    }
-
-    fn previous(&self) -> usize {
-        self.draft
-            .grapheme_indices(true)
-            .map(|(offset, _)| offset)
-            .take_while(|&offset| offset < self.cursor)
-            .last()
-            .unwrap_or(0)
-    }
-
-    fn next(&self) -> usize {
-        self.draft
-            .grapheme_indices(true)
-            .map(|(offset, _)| offset)
-            .find(|&offset| offset > self.cursor)
-            .unwrap_or(self.draft.len())
-    }
-
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        if let Some(p) = self.picker.as_mut() {
+        if let Some(p) = self.picker.as_mut().filter(|p| {
+            !p.inline
+                || matches!(
+                    key.code,
+                    KeyCode::Esc
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                )
+        }) {
             match key.code {
                 KeyCode::Esc => self.picker = None,
                 KeyCode::Up => p.selected = p.selected.saturating_sub(1),
@@ -602,35 +681,6 @@ impl View {
             }
             return;
         }
-        if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.search = Some(String::new());
-            self.search_selected = 0;
-            return;
-        }
-        if let Some(query) = self.search.as_mut() {
-            match key.code {
-                KeyCode::Esc => self.search = None,
-                KeyCode::Backspace => {
-                    query.pop();
-                    self.search_selected = 0;
-                }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    if query.len() + c.len_utf8() <= 4096 {
-                        query.push(c);
-                        self.search_selected = 0;
-                    }
-                }
-                KeyCode::Enter | KeyCode::Down => self.search_selected += 1,
-                KeyCode::Up => self.search_selected = self.search_selected.saturating_sub(1),
-                _ => {}
-            }
-            return;
-        }
-        self.fix_cursor();
         if key.code == KeyCode::F(1) {
             self.show_help = !self.show_help;
             return;
@@ -665,123 +715,151 @@ impl View {
                     } else {
                         Focus::Input
                     };
-                    return;
+                } else {
+                    self.focus = match self.focus {
+                        Focus::Input => Focus::Conversation,
+                        Focus::Conversation if self.show_activity => Focus::Activity,
+                        _ => Focus::Input,
+                    };
                 }
-                self.focus = match self.focus {
-                    Focus::Input => Focus::Conversation,
-                    Focus::Conversation if self.show_activity => Focus::Activity,
-                    _ => Focus::Input,
-                };
+                if self.focus == Focus::Conversation
+                    && self.message_selected.is_none()
+                    && !self.messages.is_empty()
+                {
+                    self.message_selected = Some(self.messages.len() - 1);
+                    self.selection_needs_scroll = true;
+                    self.cache_dirty = true;
+                }
                 return;
             }
             _ => {}
         }
         match self.focus {
-            Focus::Input => match key.code {
-                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(old) = self.undo.pop() {
-                        self.redo.push((self.draft.clone(), self.cursor));
-                        (self.draft, self.cursor) = old;
-                    }
-                }
-                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    if let Some(next) = self.redo.pop() {
-                        self.undo.push((self.draft.clone(), self.cursor));
-                        (self.draft, self.cursor) = next;
-                    }
-                }
-                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.cursor = self.line_start()
-                }
-                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.cursor = self.line_end()
-                }
-                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.cursor = self.previous()
-                }
-                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.cursor = self.next()
-                }
-                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.replace_range(self.word_left()..self.cursor, "");
-                }
-                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let end = self.line_end();
-                    self.replace_range(self.cursor..end, "");
-                }
-                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
-                    self.cursor = self.word_left()
-                }
-                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
-                    while self.cursor < self.draft.len()
-                        && !self.draft[self.cursor..].starts_with(char::is_whitespace)
+            Focus::Input => {
+                match key.code {
+                    KeyCode::Enter if key.modifiers.is_empty() => {}
+                    KeyCode::Enter | KeyCode::Char('j')
+                        if key.code == KeyCode::Enter
+                            || key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
-                        self.cursor = self.next();
+                        self.paste("\n")
                     }
-                    while self.cursor < self.draft.len()
-                        && self.draft[self.cursor..].starts_with(char::is_whitespace)
+                    KeyCode::Up | KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                        self.recall_history(key.code == KeyCode::Down)
+                    }
+                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.editor.undo();
+                    }
+                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        self.editor.redo();
+                    }
+                    KeyCode::PageUp | KeyCode::PageDown => {
+                        self.focus = if self.terminal_width < 100 && self.narrow_activity {
+                            Focus::Activity
+                        } else {
+                            Focus::Conversation
+                        };
+                        self.handle_key(key);
+                    }
+                    KeyCode::Left | KeyCode::Right | KeyCode::Backspace | KeyCode::Delete
+                        if key.modifiers.is_empty()
+                            || (key.modifiers == KeyModifiers::SHIFT
+                                && matches!(key.code, KeyCode::Left | KeyCode::Right)) =>
                     {
-                        self.cursor = self.next();
+                        // textarea uses character columns. Keep deletion/navigation atomic for emoji and combining clusters.
+                        let draft = self.draft();
+                        let cursor = self.cursor();
+                        let previous = draft
+                            .grapheme_indices(true)
+                            .map(|(i, _)| i)
+                            .take_while(|&i| i < cursor)
+                            .last()
+                            .unwrap_or(0);
+                        let next = draft
+                            .grapheme_indices(true)
+                            .map(|(i, _)| i)
+                            .find(|&i| i > cursor)
+                            .unwrap_or(draft.len());
+                        if self.selected_input_text().is_some()
+                            && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+                        {
+                            self.editor.delete_char();
+                        } else {
+                            match key.code {
+                                KeyCode::Left => {
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        if self.editor.selection_range().is_none() {
+                                            self.editor.start_selection();
+                                        }
+                                    } else {
+                                        self.editor.cancel_selection();
+                                    }
+                                    self.move_to_byte(previous);
+                                }
+                                KeyCode::Right => {
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        if self.editor.selection_range().is_none() {
+                                            self.editor.start_selection();
+                                        }
+                                    } else {
+                                        self.editor.cancel_selection();
+                                    }
+                                    self.move_to_byte(next);
+                                }
+                                KeyCode::Backspace if previous < cursor => {
+                                    self.replace_range(previous..cursor, "")
+                                }
+                                KeyCode::Delete if cursor < next => {
+                                    self.replace_range(cursor..next, "")
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        self.paste(&c.to_string())
+                    }
+                    _ => {
+                        self.editor.input(key);
+                        let draft = self.draft();
+                        let cursor = self.cursor();
+                        if cursor < draft.len()
+                            && !draft.grapheme_indices(true).any(|(i, _)| i == cursor)
+                        {
+                            let boundary = draft
+                                .grapheme_indices(true)
+                                .map(|(i, _)| i)
+                                .find(|&i| i > cursor)
+                                .unwrap_or(draft.len());
+                            self.move_to_byte(boundary);
+                        }
                     }
                 }
-                KeyCode::Up => self.vertical(false),
-                KeyCode::Down => self.vertical(true),
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.replace_range(self.line_start()..self.cursor, "");
-                }
-                KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.paste("\n")
-                }
-                KeyCode::Enter
-                    if key.modifiers.intersects(
-                        KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::CONTROL,
-                    ) =>
-                {
-                    self.paste("\n")
-                }
-                KeyCode::Char(c)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    self.paste(&c.to_string())
-                }
-                KeyCode::Left => self.cursor = self.previous(),
-                KeyCode::Right => self.cursor = self.next(),
-                KeyCode::Home => self.cursor = self.line_start(),
-                KeyCode::End => self.cursor = self.line_end(),
-                KeyCode::Backspace => {
-                    self.replace_range(self.previous()..self.cursor, "");
-                }
-                KeyCode::Delete => {
-                    self.replace_range(self.cursor..self.next(), "");
-                }
-                KeyCode::PageUp => {
-                    if self.terminal_width < 100 && self.narrow_activity {
-                        self.focus = Focus::Activity;
-                        self.selected = self.selected.saturating_sub(self.activity_height.max(1));
-                        return;
-                    }
-                    self.focus = Focus::Conversation;
-                    self.follow_conversation = false;
-                    self.conversation_scroll = self.conversation_scroll.saturating_sub(10);
-                }
-                KeyCode::PageDown => {
-                    if self.terminal_width < 100 && self.narrow_activity {
-                        self.focus = Focus::Activity;
-                        self.selected = (self.selected + self.activity_height.max(1))
-                            .min(self.activities.len().saturating_sub(1));
-                        return;
-                    }
-                    self.focus = Focus::Conversation;
-                    self.conversation_scroll =
-                        (self.conversation_scroll + 10).min(self.conversation_max);
-                    self.follow_conversation = self.conversation_scroll == self.conversation_max;
-                }
-                _ => {}
-            },
+            }
             Focus::Conversation => {
-                if scroll_key(
+                if matches!(
+                    key.code,
+                    KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k')
+                ) {
+                    if !self.messages.is_empty() {
+                        let current = self.message_selected.unwrap_or(self.messages.len() - 1);
+                        self.message_selected =
+                            Some(if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
+                                (current + 1).min(self.messages.len() - 1)
+                            } else {
+                                current.saturating_sub(1)
+                            });
+                        self.follow_conversation = false;
+                        self.cache_dirty = true;
+                        self.selection_needs_scroll = true;
+                    }
+                } else if key.code == KeyCode::Enter {
+                    self.toggle_selected_message();
+                } else if scroll_key(
                     key.code,
                     &mut self.conversation_scroll,
                     self.conversation_max,
@@ -824,10 +902,8 @@ impl View {
             );
             return;
         }
-        self.fix_cursor();
         let input_width = area.width.saturating_sub(2).max(1) as usize;
-        let (draft_lines, cursor_row, cursor_col) =
-            wrap_with_cursor(&Self::sanitize(&self.draft), self.cursor, input_width);
+        let draft_lines = wrap(&self.draft(), input_width);
         let input_height = (draft_lines.len() + 2)
             .clamp(3, 7)
             .min(area.height.saturating_sub(5) as usize) as u16;
@@ -880,6 +956,16 @@ impl View {
             });
             let width = inner.width.max(1) as usize;
             if self.cache_dirty || self.cache_width != width {
+                let anchor = if self.cache_width != width && !self.follow_conversation {
+                    self.message_offsets
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, offset)| **offset <= self.conversation_scroll)
+                        .map(|(index, offset)| (index, self.conversation_scroll - offset))
+                } else {
+                    None
+                };
                 let mut lines = Vec::new();
                 if self.messages.is_empty() {
                     lines.push(Line::styled(
@@ -891,49 +977,39 @@ impl View {
                         Style::default().fg(MUTED),
                     ));
                 }
-                for message in &self.messages {
-                    let tool = message.role.starts_with("工具");
-                    let streaming = message.role.contains("输出中");
-                    lines.push(Line::styled(
-                        message.role.clone(),
-                        Style::default()
-                            .fg(if tool || streaming { MUTED } else { ACCENT })
-                            .add_modifier(Modifier::BOLD),
+                self.message_offsets.clear();
+                for (index, message) in self.messages.iter().enumerate() {
+                    self.message_offsets.push(lines.len());
+                    lines.extend(message_lines(
+                        message,
+                        width,
+                        self.expanded.contains(&message_key(message)),
+                        self.message_selected == Some(index),
                     ));
-                    lines.extend(markdown(&message.text, width));
-                    lines.push(Line::from(""));
+                }
+                if let Some((index, offset)) = anchor
+                    && let Some(&start) = self.message_offsets.get(index)
+                {
+                    let end = self
+                        .message_offsets
+                        .get(index + 1)
+                        .copied()
+                        .unwrap_or(lines.len());
+                    self.conversation_scroll = start + offset.min(end.saturating_sub(start + 1));
+                }
+                if self.selection_needs_scroll {
+                    if let Some(index) = self.message_selected
+                        && let Some(&offset) = self.message_offsets.get(index)
+                    {
+                        self.conversation_scroll = offset;
+                    }
+                    self.selection_needs_scroll = false;
                 }
                 self.transcript_cache = lines;
                 self.cache_width = width;
                 self.cache_dirty = false;
             }
-            let mut search_lines = None;
-            let mut matches = Vec::new();
-            if self.search.as_ref().is_some_and(|q| !q.is_empty()) {
-                search_lines = Some(self.transcript_cache.clone());
-            }
-            let lines = search_lines.as_mut().unwrap_or(&mut self.transcript_cache);
-            if let Some(query) = self.search.as_ref().filter(|q| !q.is_empty()) {
-                for (index, line) in lines.iter_mut().enumerate() {
-                    let text = line
-                        .spans
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect::<String>();
-                    if text.to_lowercase().contains(&query.to_lowercase()) {
-                        matches.push(index);
-                        *line = line
-                            .clone()
-                            .style(Style::default().add_modifier(Modifier::REVERSED));
-                    }
-                }
-                if !matches.is_empty() {
-                    self.search_selected %= matches.len();
-                    self.conversation_scroll = matches[self.search_selected];
-                    self.follow_conversation = false;
-                }
-            }
-            self.search_total = matches.len();
+            let lines = &self.transcript_cache;
             self.conversation_max = lines.len().saturating_sub(inner.height as usize);
             if self.follow_conversation {
                 self.conversation_scroll = self.conversation_max;
@@ -955,49 +1031,29 @@ impl View {
                 self.render_activity(frame, activity_area);
             }
         }
-        frame.render_widget(
-            block(
-                " 输入 · Enter 发送 · Shift+Enter 换行 ",
-                self.focus == Focus::Input,
-            ),
-            regions[2],
-        );
-        let input_inner = regions[2].inner(ratatui::layout::Margin {
-            horizontal: 1,
-            vertical: 1,
-        });
-        let input_top = cursor_row.saturating_sub(input_inner.height.saturating_sub(1) as usize);
-        let visible = draft_lines
-            .into_iter()
-            .skip(input_top)
-            .take(input_inner.height as usize)
-            .map(Line::from)
-            .collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(visible), input_inner);
-        if self.focus == Focus::Input
-            && !self.show_help
-            && self.detail.is_none()
-            && self.picker.is_none()
-            && self.search.is_none()
-            && input_inner.height > 0
-        {
-            frame.set_cursor_position((
-                input_inner.x + cursor_col.min(input_inner.width.saturating_sub(1) as usize) as u16,
-                input_inner.y + (cursor_row - input_top) as u16,
-            ));
-        }
-        let footer = if let Some(query) = &self.search {
-            format!(
-                " 搜索: {} · {}/{} · ↑↓ / Enter 下一个 · Esc 关闭",
-                query,
-                if self.search_total == 0 {
-                    0
-                } else {
-                    self.search_selected + 1
-                },
-                self.search_total
-            )
+        let title = if self.reply_label.is_empty() {
+            " 输入 · Enter 发送 · Shift+Enter 换行 ".to_owned()
         } else {
+            format!(" 输入 · {} ", Self::sanitize(&self.reply_label))
+        };
+        self.editor.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(if self.focus == Focus::Input {
+                    ACCENT
+                } else {
+                    MUTED
+                })),
+        );
+        self.editor
+            .set_cursor_style(if self.focus == Focus::Input && !self.has_modal() {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            });
+        frame.render_widget(&self.editor, regions[2]);
+        let footer = {
             format!(
                 " {} · {} · {} · {} · {}",
                 state
@@ -1030,11 +1086,30 @@ impl View {
             regions[3],
         );
         if let Some(picker) = &self.picker {
-            let rect = overlay_rect(area);
+            let rect = if picker.inline {
+                let height = (filtered(picker).len().clamp(1, 6) + 2) as u16;
+                Rect::new(
+                    regions[2].x,
+                    regions[2].y.saturating_sub(height),
+                    regions[2].width,
+                    height.min(regions[2].y.saturating_sub(area.y)),
+                )
+            } else {
+                overlay_rect(area)
+            };
             frame.render_widget(Clear, rect);
             frame.render_widget(
                 block(
-                    &format!(" {:?} · {} · Esc 关闭 ", picker.kind, picker.query),
+                    &format!(
+                        " {} · {} · {} ",
+                        picker_title(picker.kind),
+                        picker.query,
+                        if picker.inline {
+                            "↑↓ 选择 · Tab 插入 · Esc 关闭"
+                        } else {
+                            "Enter 选择 · Esc 关闭"
+                        }
+                    ),
                     true,
                 ),
                 rect,
@@ -1077,7 +1152,7 @@ impl View {
                 inner,
             );
         } else if self.show_help {
-            let help = "直接输入任务，Enter 发送。\nShift+Enter / Alt+Enter / Ctrl+J 换行；粘贴多行保持在输入框。\n↑↓ 移动行光标，首尾行召回历史；Alt+←→ 移动单词。\nCtrl+A/E 行首尾；Ctrl+U/K 删除至行首尾；Ctrl+W 删除单词。\nCtrl+Z 撤销 / Alt+Z 重做；Ctrl+F 搜索对话。\nCtrl+P 命令菜单；Ctrl+O / @文件 Tab 引用；Ctrl+G 外部编辑器。\nTab 切换焦点；窄屏仅在输入与当前主面板间切换。Esc 返回输入。\n对话：上下 / PageUp / PageDown 滚动，Home / End 到首尾。\n对话展示最近最多 150 条、约 16 万字符；单条预览最多 1.6 万字符。\n界面预览省略的历史和原文保留在会话记录。\n活动展示最近 400 条：上下选择，Enter 浏览原生事件详情。\nF2：宽屏显示或隐藏活动；窄屏切换对话与活动主面板。\nCtrl+C 暂停行动；Ctrl+R 恢复；Ctrl+Q 退出。\n\nF1 或 Esc 关闭帮助。";
+            let help = "直接输入任务，Enter 发送。\nShift+Enter / Alt+Enter / Ctrl+J 换行；粘贴多行保持在输入框。\n↑↓ 移动光标；Alt+↑↓ 召回历史；Ctrl+←→ 移动单词。\nCtrl+A/E 行首尾；Ctrl+K 删除至行尾；Ctrl+W 删除单词。\nShift+方向键选区；Ctrl+Y复制选区或当前原文。\nCtrl+Z 撤销 / Alt+Z 重做；Ctrl+F 搜索对话。\nCtrl+P 命令菜单；Ctrl+O / @文件 Tab 引用；Ctrl+G 外部编辑器。\nTab 切换焦点；窄屏仅在输入与当前主面板间切换。Esc 返回输入。\n对话：↑↓ / j k 选择消息；Enter 展开折叠；d 原文；y 复制。\nPageUp / PageDown 滚动，Home / End 到首尾。\n长消息默认折叠；窗口最多256条/8MiB，单条128KiB预览。\n展开预览；d 原文 / y 复制完整记录；Ctrl+F 搜索持久历史。\n活动展示最近 400 条：上下选择，Enter 浏览原生事件详情。\nF2：宽屏显示或隐藏活动；窄屏切换对话与活动主面板。\nCtrl+C：有输入选区时复制，否则暂停；Ctrl+R 恢复；Ctrl+Q 退出。\n\nF1 或 Esc 关闭帮助。";
             let commands = super::COMMANDS
                 .iter()
                 .map(|(name, _)| *name)
@@ -1215,6 +1290,9 @@ fn scroll_key(key: KeyCode, position: &mut usize, max: usize, page: usize) -> bo
 }
 
 fn filtered(picker: &Picker) -> Vec<&PickerItem> {
+    if picker.kind == PickerKind::History {
+        return picker.items.iter().collect();
+    }
     let query = picker.query.to_lowercase();
     picker
         .items
@@ -1228,67 +1306,136 @@ fn filtered(picker: &Picker) -> Vec<&PickerItem> {
         })
         .collect()
 }
+fn new_editor() -> TextArea<'static> {
+    let mut editor = TextArea::default();
+    editor.set_wrap_mode(WrapMode::Glyph);
+    editor.set_max_histories(100);
+    editor.set_cursor_line_style(Style::default());
+    editor.set_selection_style(Style::default().bg(Color::DarkGray));
+    editor.set_placeholder_text("描述任务，或输入 / 命令、@ 文件");
+    editor.set_placeholder_style(Style::default().fg(MUTED));
+    editor
+}
+fn picker_title(kind: PickerKind) -> &'static str {
+    match kind {
+        PickerKind::Command => "命令",
+        PickerKind::Session => "会话",
+        PickerKind::File => "文件",
+        PickerKind::Model => "模型",
+        PickerKind::History => "搜索历史",
+        PickerKind::Question => "问题",
+        PickerKind::Reconcile => "核对变更",
+    }
+}
+fn message_key(message: &Message) -> String {
+    message.event_id.clone().unwrap_or_else(|| {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::hash::DefaultHasher::new();
+        message.role.hash(&mut hash);
+        message.text.hash(&mut hash);
+        format!("anonymous:{:x}", hash.finish())
+    })
+}
+fn message_lines(
+    message: &Message,
+    width: usize,
+    expanded: bool,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    let tool = message.role.starts_with("工具");
+    let status = if message.role.contains("失败")
+        || message.role.contains("错误")
+        || (tool
+            && message
+                .text
+                .lines()
+                .next()
+                .is_some_and(|s| s.starts_with("失败") || s.starts_with("错误")))
+    {
+        Color::Red
+    } else if tool
+        && message.text.lines().next().is_some_and(|s| {
+            s.starts_with("结果未知") || s.starts_with("未知") || s.starts_with("待核对")
+        })
+    {
+        Color::Yellow
+    } else if message.role.contains("输出中")
+        || message.role.contains("运行")
+        || (tool
+            && message
+                .text
+                .lines()
+                .next()
+                .is_some_and(|s| s.starts_with("执行中") || s.starts_with("运行中")))
+    {
+        Color::Blue
+    } else if tool
+        && (message.role.contains("完成")
+            || message
+                .text
+                .lines()
+                .next()
+                .is_some_and(|s| s.starts_with("完成")))
+    {
+        Color::Green
+    } else if tool {
+        Color::Yellow
+    } else {
+        ACCENT
+    };
+    let mut body = if tool {
+        wrap(&message.text, width)
+            .into_iter()
+            .map(|s| Line::styled(s, Style::default().fg(MUTED)))
+            .collect::<Vec<_>>()
+    } else {
+        markdown(&message.text, width)
+    };
+    let limit = if tool { 6 } else { 20 };
+    let folded = !expanded && body.len() > limit;
+    let mut result = vec![Line::styled(
+        format!(
+            "{} {}{}",
+            if selected { "›" } else { " " },
+            message.role,
+            if folded { " · Enter 展开" } else { "" }
+        ),
+        Style::default().fg(status).add_modifier(Modifier::BOLD),
+    )];
+    if folded {
+        let omitted = body.len() - limit;
+        body.truncate(limit);
+        body.push(Line::styled(
+            format!("… 还有 {omitted} 行 · Enter 展开 · d 原文"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    result.extend(body);
+    result.push(Line::from(""));
+    result
+}
 fn markdown(text: &str, width: usize) -> Vec<Line<'static>> {
+    let parsed = tui_markdown::from_str(text);
     let mut result = Vec::new();
-    let mut code = false;
-    let mut diff = false;
-    for raw in text.split('\n') {
-        if let Some(language) = raw.strip_prefix("```") {
-            code = !code;
-            diff = code && language.trim() == "diff";
-            result.push(Line::styled(
-                if code {
-                    format!("  {}", language.trim())
+    for line in parsed.lines {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut cells = 0;
+        for span in line.spans {
+            for g in span.content.graphemes(true) {
+                let size = UnicodeWidthStr::width(g);
+                if cells + size > width.max(1) && cells > 0 {
+                    result.push(Line::from(std::mem::take(&mut spans)).style(line.style));
+                    cells = 0;
+                }
+                if let Some(last) = spans.last_mut().filter(|s| s.style == span.style) {
+                    last.content.to_mut().push_str(g);
                 } else {
-                    String::new()
-                },
-                Style::default().fg(MUTED),
-            ));
-            continue;
-        }
-        let style = if (diff || !code) && raw.starts_with('+') {
-            Style::default().fg(Color::Green)
-        } else if (diff || !code) && raw.starts_with('-') && !raw.starts_with("- ") {
-            Style::default().fg(Color::Red)
-        } else if raw.starts_with("@@") {
-            Style::default().fg(ACCENT)
-        } else if !code && raw.starts_with('#') {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else if code {
-            Style::default().fg(MUTED)
-        } else {
-            Style::default()
-        };
-        let rendered = if !code && raw.starts_with('#') {
-            raw.trim_start_matches('#').trim_start().to_owned()
-        } else if code {
-            format!("  {raw}")
-        } else {
-            raw.to_owned()
-        };
-        for line in wrap(&rendered, width) {
-            if code {
-                result.push(Line::styled(line, style));
-            } else {
-                let mut inline = false;
-                let spans = line
-                    .split('`')
-                    .map(|part| {
-                        let current = inline;
-                        inline = !inline;
-                        Span::styled(
-                            part.to_owned(),
-                            if current {
-                                style.add_modifier(Modifier::BOLD)
-                            } else {
-                                style
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                result.push(Line::from(spans));
+                    spans.push(Span::styled(g.to_owned(), span.style));
+                }
+                cells += size;
             }
         }
+        result.push(Line::from(spans).style(line.style));
     }
     result
 }
@@ -1330,7 +1477,10 @@ fn render_overlay(
         horizontal: 1,
         vertical: 1,
     });
-    let content = markdown(&View::sanitize(text), inner.width.max(1) as usize);
+    let content = wrap(&View::sanitize(text), inner.width.max(1) as usize)
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
     let max = content.len().saturating_sub(inner.height as usize);
     *scroll = (*scroll).min(max);
     let lines = content

@@ -1,0 +1,42 @@
+ BONE  · chatgpt/openai:gpt-6-luna · 就绪                                                                                                   
+ 描述任务，BONE 会在当前工作区执行。                                                                                                        
+ / 命令   @ 文件   Ctrl+F 搜索   F1 快捷键                                                                                                  
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+┌ 输入 · Enter 发送 · Shift+Enter 换行 ────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│Update this small Python project. retry_after_seconds(value, now=None) currently handles integer Retry-After only. Preserve integer suppor│
+│t and add HTTP-date support using injected timezone-aware datetime now (default current UTC), clamp expired dates to 0. Add meaningful uni│
+│ttest coverage with deterministic dates, run python3 -m unittest -v, and report the changes and test result. Use existing files. Shell out│
+│put observation: include a short verification command printing verification-start, sleeping 1 second, then printing verification-end so li│
+│veprogress can be inspected.                                                                                                            │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Enter 发送 · Shift+Enter 换行 · Ctrl+P 命令 · @文件 Tab 补全                                                                               
+ bone-real-software-jek_rb3y · chatgpt/openai:gpt-6-luna · 944a9bd8 · 可写 · 就绪                                                           

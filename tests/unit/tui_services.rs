@@ -6,9 +6,14 @@ fn drafts_roundtrip_and_reject_corruption_and_paths() {
     let saved = UiSaved {
         draft: "中文 draft".into(),
         history: vec!["one".into()],
+        reply_to: Some("question-id".into()),
     };
     save(dir.path(), "session", &saved).unwrap();
     assert_eq!(load(dir.path(), "session").unwrap().history, saved.history);
+    assert_eq!(
+        load(dir.path(), "session").unwrap().reply_to,
+        saved.reply_to
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -30,7 +35,8 @@ fn drafts_roundtrip_and_reject_corruption_and_paths() {
             "session",
             &UiSaved {
                 draft: "a".repeat(DRAFT_LIMIT + 1),
-                history: vec![]
+                history: vec![],
+                reply_to: None,
             }
         )
         .is_err()
@@ -64,6 +70,8 @@ async fn git_inspection_reports_untracked_paths_and_non_repositories() {
     fs::write(dir.path().join("untracked.txt"), "unchanged by inspection").unwrap();
     let output = git_diff(dir.path()).await.unwrap();
     assert!(output.contains("?? untracked.txt"));
+    assert!(output.contains("+unchanged by inspection"));
+    assert!(output.contains("No newline at end of file"));
     assert_eq!(
         fs::read_to_string(dir.path().join("untracked.txt")).unwrap(),
         "unchanged by inspection"

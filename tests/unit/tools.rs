@@ -308,3 +308,45 @@ fn killed_parent_does_not_release_the_frontground_shells_physical_lease() {
     FileExt::unlock(&lock).unwrap();
     FileExt::unlock(&legacy).unwrap();
 }
+
+#[tokio::test]
+async fn observed_shell_drains_beyond_preview_and_keeps_timeout_uncertainty() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let bytes = Arc::new(AtomicUsize::new(0));
+    let received = Arc::clone(&bytes);
+    let observer: ToolObserver = Arc::new(move |_, chunk| {
+        received.fetch_add(chunk.len(), Ordering::Relaxed);
+    });
+    let outcome = execute_with_progress(directory.path(), "shell", &json!({"command":"i=0; while [ $i -lt 4000 ]; do printf 0123456789; i=$((i + 1)); done; printf error >&2; exit 7"}), None, Some(Arc::clone(&observer))).await;
+    assert_eq!(bytes.load(Ordering::Relaxed), 40_005);
+    assert_eq!(
+        outcome.content["stdout"].as_str().unwrap().len(),
+        OUTPUT_LIMIT
+    );
+    assert_eq!(outcome.content["stderr"], "error");
+    assert_eq!(outcome.content["exit_code"], 7);
+    assert_eq!(outcome.content["truncated"], true);
+    assert!(!outcome.uncertain);
+    bytes.store(0, Ordering::Relaxed);
+    let timed_out = execute_with_progress(
+        directory.path(),
+        "shell",
+        &json!({"command":"printf observed-before-timeout; sleep 5", "timeout_seconds":1}),
+        None,
+        Some(observer),
+    )
+    .await;
+    assert!(bytes.load(Ordering::Relaxed) > 0);
+    assert!(timed_out.uncertain);
+    assert_eq!(timed_out.content["effect"], "unknown");
+    assert!(
+        timed_out.content["error"]
+            .as_str()
+            .unwrap()
+            .contains("timed out")
+    );
+}

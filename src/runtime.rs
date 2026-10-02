@@ -93,6 +93,67 @@ pub struct ModelProgress {
     pub item: Value,
 }
 
+/// Lossy live shell tails. Committed tool results remain the authoritative output.
+#[derive(Clone, Debug, Serialize)]
+pub struct ToolProgress {
+    pub job_id: String,
+    pub call_id: String,
+    pub revision: u64,
+    pub tool_name: String,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+const TOOL_PROGRESS_BYTES: usize = 16 * 1024;
+const TOOL_PROGRESS_CALLS: usize = 128;
+
+struct ObservedTool {
+    origin: Origin,
+    name: String,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    dirty: bool,
+}
+
+#[derive(Default)]
+struct ToolProgressObserver {
+    enabled: AtomicBool,
+    calls: Mutex<BTreeMap<String, ObservedTool>>,
+}
+
+impl ToolProgressObserver {
+    fn push(&self, origin: &Origin, name: &str, stderr: bool, bytes: &[u8]) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        // A slow or contended observer must never delay draining process pipes.
+        if let Ok(mut calls) = self.calls.try_lock() {
+            if !calls.contains_key(&origin.call) && calls.len() == TOOL_PROGRESS_CALLS {
+                calls.pop_first();
+            }
+            let call = calls
+                .entry(origin.call.clone())
+                .or_insert_with(|| ObservedTool {
+                    origin: origin.clone(),
+                    name: name.into(),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    dirty: false,
+                });
+            let tail = if stderr {
+                &mut call.stderr
+            } else {
+                &mut call.stdout
+            };
+            tail.extend_from_slice(bytes);
+            if tail.len() > TOOL_PROGRESS_BYTES {
+                tail.drain(..tail.len() - TOOL_PROGRESS_BYTES);
+            }
+            call.dirty = true;
+        }
+    }
+}
+
 const MODEL_PROGRESS_RECORDS: usize = 128;
 const MODEL_PROGRESS_ITEM_BYTES: usize = 32 * 1024;
 
@@ -153,6 +214,7 @@ pub struct Engine {
     public_inputs: BTreeMap<u64, String>,
     notifications: VecDeque<Event>,
     model_progress: Arc<ProgressObserver>,
+    tool_progress: Arc<ToolProgressObserver>,
     tasks: JoinSet<Completed>,
     running: BTreeMap<String, Running>,
     write_lease: Option<WriteLease>,
@@ -219,6 +281,7 @@ impl Engine {
             public_inputs,
             notifications: VecDeque::new(),
             model_progress: Arc::new(ProgressObserver::default()),
+            tool_progress: Arc::new(ToolProgressObserver::default()),
             tasks: JoinSet::new(),
             running: BTreeMap::new(),
             write_lease: None,
@@ -260,6 +323,16 @@ impl Engine {
         self.store.read_event(&self.state.id, id)
     }
 
+    /// Read one original call record from this session without loading the whole transcript.
+    pub fn read_call_event(&self, call_id: &str, kind: &str) -> Result<Event> {
+        let event = self
+            .records()
+            .rev()
+            .find(|event| event.call_id.as_deref() == Some(call_id) && event.kind == kind)
+            .context("call record was not found in this session")?;
+        self.read_event(&event.id)
+    }
+
     pub fn unanswered_questions(&self) -> Vec<&Event> {
         self.records()
             .filter(|event| self.is_unanswered_question(event))
@@ -270,7 +343,23 @@ impl Engine {
         self.order.iter().filter_map(|id| self.events.get(id))
     }
 
+    /// Post conversational input, automatically answering the latest pending question
+    /// when no explicit target is supplied (the original CLI/API behavior).
     pub fn post(&mut self, text: &str, reply_to: Option<&str>) -> Result<String> {
+        self.post_input(text, reply_to, true)
+    }
+
+    /// Post an independent user instruction even when a question is awaiting a reply.
+    pub fn post_message(&mut self, text: &str) -> Result<String> {
+        self.post_input(text, None, false)
+    }
+
+    fn post_input(
+        &mut self,
+        text: &str,
+        reply_to: Option<&str>,
+        automatic_reply: bool,
+    ) -> Result<String> {
         self.ensure_healthy()?;
         ensure!(!text.trim().is_empty(), "message must not be empty");
         let question = if let Some(reply) = reply_to {
@@ -284,14 +373,16 @@ impl Engine {
             );
             ensure!(
                 self.is_unanswered_question(question),
-                "question has already been answered or its job is closed"
+                "question is no longer awaiting an answer; choose another question or send an independent message"
             );
             Some(question.clone())
-        } else {
+        } else if automatic_reply {
             self.records()
                 .rev()
                 .find(|event| self.is_unanswered_question(event))
                 .cloned()
+        } else {
+            None
         };
         self.cancel_models("new user input")?;
         let mut state = self.state.clone();
@@ -390,6 +481,41 @@ impl Engine {
             .drain(self.state.revision, self.state.paused)
     }
 
+    /// Enable live shell observation and collect changed snapshots for owned calls.
+    pub fn drain_tool_progress(&mut self) -> Vec<ToolProgress> {
+        self.tool_progress.enabled.store(true, Ordering::Relaxed);
+        let Ok(mut calls) = self.tool_progress.calls.try_lock() else {
+            return Vec::new();
+        };
+        calls.retain(|id, call| {
+            !self.faulted
+                && !self.state.paused
+                && call.origin.revision == self.state.revision
+                && self
+                    .state
+                    .jobs
+                    .get(&call.origin.job)
+                    .and_then(|job| job.current_call.as_ref())
+                    == Some(id)
+        });
+        calls
+            .values_mut()
+            .filter_map(|call| {
+                if !std::mem::take(&mut call.dirty) {
+                    return None;
+                }
+                Some(ToolProgress {
+                    job_id: call.origin.job.clone(),
+                    call_id: call.origin.call.clone(),
+                    revision: call.origin.revision,
+                    tool_name: call.name.clone(),
+                    stdout: String::from_utf8_lossy(&call.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&call.stderr).into_owned(),
+                })
+            })
+            .collect()
+    }
+
     pub fn stop(&mut self) -> Result<()> {
         self.ensure_healthy()?;
         let mut state = self.state.clone();
@@ -397,6 +523,9 @@ impl Engine {
         state.paused = true;
         let mut additions = Vec::new();
         self.model_progress.clear();
+        if let Ok(mut calls) = self.tool_progress.calls.lock() {
+            calls.clear();
+        }
         let running = std::mem::take(&mut self.running);
         for (_, task) in running {
             task.abort.abort();
@@ -1460,12 +1589,18 @@ impl Engine {
         let workspace = self.state.workspace.clone();
         let task_origin = origin.clone();
         let task_tool = tool.clone();
+        let progress = Arc::clone(&self.tool_progress);
+        let observed_origin = origin.clone();
+        let observed_name = name.to_owned();
+        let observer: tools::ToolObserver = Arc::new(move |stderr, bytes| {
+            progress.push(&observed_origin, &observed_name, stderr, bytes);
+        });
         let abort = self.tasks.spawn(async move {
             // Cancellation cannot interrupt synchronous file operations. Keep
             // workspace ownership until this future is actually dropped.
             let _write_lock = task_write_lock;
             let _legacy_lock = task_legacy_lock;
-            let outcome = tools::execute(
+            let outcome = tools::execute_with_progress(
                 &workspace,
                 task_tool.call.function.name.as_str(),
                 &task_tool.call.function.arguments,
@@ -1473,6 +1608,7 @@ impl Engine {
                     .as_ref()
                     .zip(_legacy_lock.as_ref())
                     .map(|(stable, legacy)| [Arc::clone(stable), Arc::clone(legacy)]),
+                Some(observer),
             )
             .await;
             Completed::Tool {

@@ -1147,3 +1147,216 @@ async fn readable_summary_pages_skip_native_metadata_and_preserve_every_characte
     assert_eq!(original["raw"], true);
     assert_eq!(engine.read_event(&id).unwrap(), summary);
 }
+
+#[tokio::test]
+async fn shell_progress_precedes_completion_and_keeps_final_output_after_new_input() {
+    let (_directory, mut engine) = fixture_engine();
+    engine.post("run a build", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let job = engine.state.focus.clone().unwrap();
+    assert!(engine.drain_tool_progress().is_empty());
+    let tool = native_proposal(
+        &mut engine,
+        &job,
+        "shell",
+        json!({"command":"printf 'early 中文'; printf 'warning' >&2; while [ ! -f release ]; do sleep 0.01; done; printf ' final'"}),
+    );
+    engine.start_tool(&job, tool).unwrap();
+    let call = engine.state.jobs[&job].current_call.clone().unwrap();
+    assert!(
+        engine
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "tool_started" && event.call_id.as_ref() == Some(&call))
+    );
+    let observed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let records = engine.drain_tool_progress();
+            if let Some(record) = records
+                .into_iter()
+                .find(|record| record.stdout.contains("中文") && record.stderr.contains("warning"))
+            {
+                break record;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(observed.call_id, call);
+    assert_eq!(observed.job_id, job);
+    assert_eq!(observed.tool_name, "shell");
+    assert!(
+        !engine.tasks.is_empty(),
+        "observation waited for final completion"
+    );
+    assert!(
+        !engine
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "tool_result")
+    );
+    engine.post("add a new requirement", None).unwrap();
+    assert!(
+        engine.drain_tool_progress().is_empty(),
+        "old revision leaked after new input"
+    );
+    std::fs::write(engine.state.workspace.join("release"), "").unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(3), engine.tasks.join_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    engine.complete(done).unwrap();
+    assert!(
+        engine.drain_tool_progress().is_empty(),
+        "finished call preview returned"
+    );
+    let result = engine
+        .events()
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "tool_result")
+        .unwrap();
+    let text = serde_json::to_string(&result.data).unwrap();
+    assert!(text.contains("early 中文 final"));
+    assert!(text.contains("warning"));
+    assert!(engine.state.unknown_writes.is_empty());
+}
+
+#[test]
+fn tool_observation_is_opt_in_bounded_and_rejects_unowned_or_stopped_calls() {
+    let (_directory, mut engine) = fixture_engine();
+    engine.post("observe", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let job = engine.state.focus.clone().unwrap();
+    let mut origin = progress_origin(engine.state.revision);
+    origin.job = job.clone();
+    engine
+        .tool_progress
+        .push(&origin, "shell", false, b"before opt in");
+    assert!(engine.tool_progress.calls.lock().unwrap().is_empty());
+    engine.drain_tool_progress();
+    engine.state.jobs.get_mut(&job).unwrap().current_call = Some(origin.call.clone());
+    for _ in 0..10 {
+        engine
+            .tool_progress
+            .push(&origin, "shell", false, "中文".repeat(2000).as_bytes());
+    }
+    engine.tool_progress.push(&origin, "shell", true, b"stderr");
+    let records = engine.drain_tool_progress();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].stderr, "stderr");
+    assert!(records[0].stdout.len() <= TOOL_PROGRESS_BYTES + 3);
+    assert!(
+        engine.drain_tool_progress().is_empty(),
+        "unchanged snapshot returned"
+    );
+    engine
+        .tool_progress
+        .push(&origin, "shell", false, b"unowned");
+    engine.state.jobs.get_mut(&job).unwrap().current_call = None;
+    assert!(engine.drain_tool_progress().is_empty());
+    engine.stop().unwrap();
+    engine
+        .tool_progress
+        .push(&origin, "shell", false, b"racing producer");
+    assert!(engine.drain_tool_progress().is_empty());
+    for index in 0..TOOL_PROGRESS_CALLS + 5 {
+        origin.call = format!("call-{index}");
+        engine
+            .tool_progress
+            .push(&origin, "shell", false, b"bounded");
+    }
+    assert_eq!(
+        engine.tool_progress.calls.lock().unwrap().len(),
+        TOOL_PROGRESS_CALLS
+    );
+}
+
+#[test]
+fn independent_messages_and_explicit_question_replies_keep_their_routing() {
+    let (_directory, mut engine) = fixture_engine();
+    let root = engine.post("parent work", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let parent = engine.state.focus.clone().unwrap();
+    let tool = native_proposal(
+        &mut engine,
+        &parent,
+        "ask_user",
+        json!({"question":"First question?"}),
+    );
+    engine.internal_tool(&parent, &tool).unwrap();
+    let first = engine.unanswered_questions()[0].id.clone();
+    let original_budget = engine.state.budgets[&root].clone();
+
+    let mut child = Job::new("child");
+    let child_id = child.id.clone();
+    let mut assigned = engine.event(
+        &child_id,
+        "input",
+        json!({"source":"job","message":Message::user("child work"),"sender_input":root}),
+    );
+    assigned.reply_to = None;
+    assigned.root_input = Some(root.clone());
+    child.active_input = Some(assigned.id.clone());
+    child.history.push(assigned.id.clone());
+    let mut state = engine.state.clone();
+    state.jobs.insert(child_id.clone(), child);
+    engine.commit(state, vec![assigned]).unwrap();
+    let tool = native_proposal(
+        &mut engine,
+        &child_id,
+        "ask_user",
+        json!({"question":"Second question?"}),
+    );
+    engine.internal_tool(&child_id, &tool).unwrap();
+    let second = engine.unanswered_questions().last().unwrap().id.clone();
+    let independent = engine
+        .post_message("new instruction, not an answer")
+        .unwrap();
+    assert!(engine.read_event(&independent).unwrap().reply_to.is_none());
+    assert_eq!(engine.unanswered_questions().len(), 2);
+    assert_eq!(engine.state.budgets[&root], original_budget);
+    assert_eq!(
+        engine.read_event(&independent).unwrap().root_input.as_ref(),
+        Some(&independent)
+    );
+
+    let reply = engine.post("answer first", Some(&first)).unwrap();
+    assert_eq!(
+        engine.read_event(&reply).unwrap().reply_to.as_ref(),
+        Some(&first)
+    );
+    assert_eq!(
+        engine.read_event(&reply).unwrap().job_id.as_ref(),
+        Some(&parent)
+    );
+    assert_eq!(
+        engine
+            .unanswered_questions()
+            .iter()
+            .map(|q| q.id.clone())
+            .collect::<Vec<_>>(),
+        vec![second.clone()]
+    );
+    let before = engine.state.clone();
+    let error = engine.post("stale answer", Some(&first)).unwrap_err();
+    assert!(error.to_string().contains("no longer awaiting"));
+    assert_eq!(engine.state, before);
+    assert!(engine.post("wrong target", Some(&independent)).is_err());
+    assert_eq!(engine.state, before);
+    let automatic = engine.post("legacy automatic answer", None).unwrap();
+    assert_eq!(
+        engine.read_event(&automatic).unwrap().reply_to.as_ref(),
+        Some(&second)
+    );
+    assert_eq!(
+        engine.read_event(&automatic).unwrap().job_id.as_ref(),
+        Some(&child_id)
+    );
+    assert!(engine.unanswered_questions().is_empty());
+    assert_eq!(engine.state.budgets[&root], original_budget);
+}

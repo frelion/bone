@@ -1,0 +1,175 @@
+<!doctype html><meta charset="utf-8"><title>BONE PTY shell-live</title><style>body{font:16px system-ui;margin:32px;background:#f5f3ed;color:#172b36}pre{font:13px monospace;white-space:pre-wrap;background:#18232b;color:#e5edf2;padding:16px;overflow:auto}section{margin:24px 0}</style><h1>shell-live</h1><p>Real PTY; synthetic protocol fixture, no real model or personal credentials</p><p>PASS</p><section><h2>Start: idle terminal</h2><p>Requests: 0; events: 0</p><pre> BONE  · openai/openai:fixture · 就绪                                                                         
+ 描述任务，BONE 会在当前工作区执行。                                                                          
+ / 命令   @ 文件   Ctrl+F 搜索   F1 快捷键                                                                    
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+┌ 输入 · Enter 发送 · Shift+Enter 换行 ──────────────────────────────────────────────────────────────────────┐
+│ 描述任务，或输入 / 命令、@ 文件                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ 输入 / 或 @ 显示候选 · Tab 补全 · Enter 发送 · F1 帮助                                                       
+ workspace · openai/openai:fixture · a98c4fc8 · 可写 · 就绪                                                   </pre></section><section><h2>Real shell still running; stdout and stderr visible</h2><p>Requests: 2; events: 9</p><pre> BONE ⠸ · openai/openai:fixture · 工作中 · 1 项正在执行                                                       
+   你                                                                                            
+ Inspect module.py and run its checks; keep terminal responsive.                                              
+                                                                                                              
+   工具 · read_file                                                                                           
+ 完成 · module.py                                                                                             
+ def compute(): return 7                                                                                      
+                                                                                                              
+                                                                                                              
+   工具 · shell · Enter 展开                                                                                  
+ 执行中 · 实时日志（尾部预览，最终记录保留原文）                                                              
+ stdout:                                                                                                      
+ LIVE_STDOUT_READY                                                                                            
+                                                                                                              
+ stderr:                                                                                                      
+ LIVE_STDERR_READY                                                                                            
+ … 还有 1 行 · Enter 展开 · d 原文                                                                            
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+┌ 输入 · Enter 发送 · Shift+Enter 换行 ──────────────────────────────────────────────────────────────────────┐
+│ 描述任务，或输入 / 命令、@ 文件                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ 新要求已纳入执行                                                                            
+ workspace · openai/openai:fixture · a98c4fc8 · 本次 2 /16 calls · 30 tokens · 可写 · 工作中 · 1 项正在执行 ·</pre></section><section><h2>Paused real shell; unknown write retained</h2><p>Requests: 2; events: 12</p><pre> BONE  · openai/openai:fixture · 需核查 1 项写入 · /reconcile 核查                                            
+   你                                                                                            
+ Inspect module.py and run its checks; keep terminal responsive.                                              
+                                                                                                              
+   工具 · read_file                                                                                           
+ 完成 · module.py                                                                                             
+ def compute(): return 7                                                                                      
+                                                                                                              
+                                                                                                              
+   工具 · shell                                                                                             
+ 结果未知 ·需核查 /reconcile·printf &quot;LIVE_STDOUT_READY\n&quot;; printf &quot;LIVE_STDERR_READY\n&quot; &gt;&amp;2; while [ ! -e  
+ release-shell ]; do sleep 0.05; done; touch shell-finished                                                   
+ {&quot;effect&quot;:&quot;unknown&quot;,&quot;instruction&quot;:&quot;Inspect the current state. Further writes are blocked until the user reco 
+ rds reconciliation; never repeat this operation automatically.&quot;}                                             
+                                                                                                              
+                                                                                                              
+                                                                                                       
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+┌ 输入 · Enter 发送 · Shift+Enter 换行 ──────────────────────────────────────────────────────────────────────┐
+│Preserve this follow-up draft                                                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ 工作已暂停；Ctrl+R恢复，Ctrl+Q 退出                                                                  
+ workspace · openai/openai:fixture · a98c4fc8 · 本次 2 /16 calls · 30 tokens · 可写 · 需核查 1 项写入 · /reco</pre></section><section><h2>Unknown write detail retains actual command and requires observed evidence</h2><p>Requests: 2; events: 12</p><pre> BONE  · openai/openai:fixture · 需核查 1 项写入 · /reconcile 核查                                            
+   你                                                                                            
+ Inspect module.py and run its checks; keep terminal responsive.                                              
+        ┌ 核查未知写入 · Esc 关闭───────────────────────────────────────────────────────────────────┐        
+   工具 │先查看实际文件、Git diff、测试输出或相关进程，确认发生了什么。                              │        
+ 完成 · │                                                                                            │        
+ def com│关闭此窗口，在草稿的 /reconcile 命令后填写核查过程和实际结果，再 Enter 记录。核查后 Ctrl+R  │        
+        │显式恢复；这条记录不会自动重放未知操作。                                                    │        
+        │                                                                                            │        
+   工具 │event: 7ee9f1fe-2bf0-4f82-876e-71e64bb0796c                                                 │        
+ 结果未知kind: tool_started                                                                        │[ ! -e  
+ release│job: be998e73-3f5c-40d6-95fe-95594d272d6d                                                   │        
+ {&quot;effec│call: fb070931-3f79-42e9-9b99-4d073cb9d4cc                                                  │er reco 
+ rds rec│reply_to: ec34291f-0398-480e-8987-23e2723f8cbe                                              │        
+        │root_input: ec34291f-0398-480e-8987-23e2723f8cbe                                            │        
+        │revision: 1                                                                                 │        
+      │timestamp (Unixms): 1790922747257                                                          │        
+      │                                                                                      │        
+        │原生工具参数                                                                                │        
+      │{                                                                                │        
+        │  &quot;command&quot;: &quot;printf \&quot;LIVE_STDOUT_READY\\n\&quot;; printf \&quot;LIVE_STDERR_READY\\n\&quot; &gt;&amp;2; while [ │        
+        │! -e release-shell ];do sleep 0.05; done; touch shell-finished&quot;,                           │        
+      │  &quot;timeout_seconds&quot;: 15                                                                 │        
+        │}                                                                                           │        
+        │{                                                                                           │        
+┌ 输入 ·│  &quot;effect&quot;: &quot;write&quot;,                                                                      │───────┐
+│/reconc└────────────────────────────────────────────────────────────────────────────────────────────┘       │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ 先检查实际文件/进程结果，记录核查结论后显式恢复                                                            
+ workspace · openai/openai:fixture · a98c4fc8 · 本次 2 /16 calls · 30 tokens · 可写 · 需核查 1 项写入 · /reco</pre></section><section><h2>Recorded observation clears unknown write and keeps session paused</h2><p>Requests: 2; events: 13</p><pre> BONE  · openai/openai:fixture · 已暂停 · Ctrl+R 恢复                                                       
+   你                                                                                            
+ Inspect module.py and run its checks; keep terminal responsive.                                              
+                                                                                                     
+   工具 · read_file                                                                     
+ 完成 · module.py                                                                                             
+ def compute(): return7                                                             
+                                                                                          
+                                                                                                              
+   工具 · shell                                                                                               
+ 结果未知 · 需核查 /reconcile·printf &quot;LIVE_STDOUT_READY\n&quot;; printf &quot;LIVE_STDERR_READY\n&quot; &gt;&amp;2; while [ ! -e  
+ release-shell ]; do sleep 0.05; done; touch shell-finished                                                   
+ {&quot;effect&quot;:&quot;unknown&quot;,&quot;instruction&quot;:&quot;Inspect the current state. Further writes are blocked until the user reco 
+ rds reconciliation; never repeat this operation automatically.&quot;}                                             
+                                                                                                              
+                                                                                                              
+                                                                                                           
+                                                                                                      
+                                                                                                              
+                                                                                                 
+                                                                                                    
+                                                                                              
+                                                                                                      
+                                                                                                              
+                                                                                                        
+┌ 输入 · Enter 发送 · Shift+Enter 换行 ──────────────────────────────────────────────────────────────────────┐
+│ 描述任务，或输入 / 命令、@ 文件                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ 已记录核查结果；Ctrl+R显式恢复工作                                                                  
+ workspace · openai/openai:fixture · a98c4fc8 · 本次 2 /16 calls · 30 tokens · 可写 · 已暂停 · Ctrl+R 恢复   </pre></section><section><h2>Final terminal</h2><p>Requests: 2; events: 13</p><pre> BONE  · openai/openai:fixture · 已暂停 · Ctrl+R 恢复                                                       
+   你                                                                                            
+ Inspect module.py and run its checks; keep terminal responsive.                                              
+                                                                                                     
+   工具 · read_file                                                                     
+ 完成 · module.py                                                                                             
+ def compute(): return7                                                             
+                                                                                          
+                                                                                                              
+   工具 · shell                                                                                               
+ 结果未知 · 需核查 /reconcile·printf &quot;LIVE_STDOUT_READY\n&quot;; printf &quot;LIVE_STDERR_READY\n&quot; &gt;&amp;2; while [ ! -e  
+ release-shell ]; do sleep 0.05; done; touch shell-finished                                                   
+ {&quot;effect&quot;:&quot;unknown&quot;,&quot;instruction&quot;:&quot;Inspect the current state. Further writes are blocked until the user reco 
+ rds reconciliation; never repeat this operation automatically.&quot;}                                             
+                                                                                                              
+                                                                                                              
+                                                                                                           
+                                                                                                      
+                                                                                                              
+                                                                                                 
+                                                                                                    
+                                                                                              
+                                                                                                      
+                                                                                                              
+                                                                                                        
+┌ 输入 · Enter 发送 · Shift+Enter 换行 ──────────────────────────────────────────────────────────────────────┐
+│ 描述任务，或输入 / 命令、@ 文件                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ 已记录核查结果；Ctrl+R显式恢复工作                                                                  
+打开后 Ctrl+R 恢复暂停的工作。lders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-tui-pty-bk4nvdl1/data&#x27; --profile </pre></section>

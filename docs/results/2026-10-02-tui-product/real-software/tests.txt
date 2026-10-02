@@ -1,0 +1,10 @@
+test_expired_http_date_clamps_to_zero (test_retry_after.RetryAfterTests) ... ok
+test_http_date_uses_timezone_offsets (test_retry_after.RetryAfterTests) ... ok
+test_http_date_with_injected_utc_now (test_retry_after.RetryAfterTests) ... ok
+test_integer (test_retry_after.RetryAfterTests) ... ok
+test_integer_whitespace_and_negative_values (test_retry_after.RetryAfterTests) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.000s
+
+OK

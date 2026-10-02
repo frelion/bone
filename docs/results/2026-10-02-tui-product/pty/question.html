@@ -1,0 +1,59 @@
+<!doctype html><meta charset="utf-8"><title>BONE PTY question</title><style>body{font:16px system-ui;margin:32px;background:#f5f3ed;color:#172b36}pre{font:13px monospace;white-space:pre-wrap;background:#18232b;color:#e5edf2;padding:16px;overflow:auto}section{margin:24px 0}</style><h1>question</h1><p>Real PTY; synthetic protocol fixture, no real model or personal credentials</p><p>PASS</p><section><h2>Start: idle terminal</h2><p>Requests: 0; events: 0</p><pre> BONE  · openai/openai:fixture · 就绪                                                                         
+ 描述任务，BONE 会在当前工作区执行。                                                                          
+ / 命令   @ 文件   Ctrl+F 搜索   F1 快捷键                                                                    
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+┌ 输入 · Enter 发送 · Shift+Enter 换行 ──────────────────────────────────────────────────────────────────────┐
+│ 描述任务，或输入 / 命令、@ 文件                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ 输入 / 或 @ 显示候选 · Tab 补全 · Enter 发送 · F1 帮助                                                       
+ workspace · openai/openai:fixture · 5f4be46b · 可写 · 就绪                                                   </pre></section><section><h2>Final terminal</h2><p>Requests: 6; events: 25</p><pre> BONE  · openai/openai:fixture · 就绪                                                            
+   你                                                        ┌ 活动 · 只读 · 最近 400 · Enter 详┐
+ ROOT_TASK                                                         │  Conversation · 准备调用 job_wait│
+                                                                │  Child · 调用模型 · 思考工作     │
+   Agent · 提问                                                           │  Child · 准备调用 ask_user       │
+ Which output format should I use?                                        │  Child · 向你提问                │
+                                                                          │  Child · 收到你的输入            │
+   你                                                                     │  Child · ask_user 返回           │
+ ANSWER_JSON                                                              │  Child · 调用模型 · 思考工作     │
+                                                                          │  Child · 模型返回                │
+   Agent                                                             │  Child · 已纳入新指令            │
+ Answer received.                                                         │  Child · 本轮交付                │
+                                                                          │  Child · 调用模型 · 思考工作     │
+ › Agent                                                                │  Child · 模型返回                │
+ Root task done.                                                          │  Child · 本轮交付                │
+                                                                          │  Conversation · job_wait 返回    │
+                                                                          │  Conversation · 调用模型 · 思考工│
+                                                                  │  Conversation · 模型返回         │
+                                                                          │› Conversation · 本轮交付         │
+                                                              │─ 选中活动预览 · Enter 详情 ─     │
+                                                        │Root task done.                   │
+                                                                  │                                  │
+┌ 命令 · /quit · ↑↓ 选择· Tab 插入 · Esc 关闭──────────────────────────────────────────────────────────────┐
+│› /quit  保存并退出                                                                                     │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ 输入 · Enter发送 · Shift+Enter 换行 ──────────────────────────────────────────────────────────────────────┐
+│/quit Session: 5f4be46b-a77f-4cc1-a033-dffdf9aa1e82                                                         │
+继续：bone --data-dir &#x27;/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-tui-pty-hbshtil_/data&#x27; --profile 
+打开后 Ctrl+R 恢复暂停的工作。                                                                      
+ workspace · openai/openai:fixture · 5f4be46b · 本次 1 /16 calls · 15 tokens · 可写 · 就绪             </pre></section>

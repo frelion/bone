@@ -347,3 +347,102 @@ fn finished_write_is_not_uncertain_after_restart() {
     store.commit(&state, &[input, started, result]).unwrap();
     assert_known_writes(&store, &state);
 }
+
+#[test]
+fn complete_history_search_crosses_pages_and_excludes_opaque_native_parts() {
+    let (_directory, store, state, input) = fixture();
+    store.commit(&state, &[input]).unwrap();
+    let mut expected = Vec::new();
+    for index in 0..45 {
+        let (kind, data) = match index {
+            0 => (
+                "input",
+                json!({"message":[{"type":"text","text":format!("{} Needle 中文", "x".repeat(20_000))}]}),
+            ),
+            1 => (
+                "input",
+                json!({"message":[{"type":"text","text":"{\"custom\":\"LITERAL_JSON\"}"}]}),
+            ),
+            22 => (
+                "model_message",
+                json!({"response":{"choice":[{"type":"reasoning","text":"OPAQUE_ONLY"},{"type":"encrypted","content":[{"type":"text","text":"OPAQUE_ONLY"}]},{"type":"toolcall","function":{"arguments":{"text":"OPAQUE_ONLY","path":"src/searchable.rs","command":"cargo check"}}},{"type":"text","text":"needle in original model output"}]}}),
+            ),
+            44 => (
+                "tool_result",
+                json!({"message":[{"type":"toolresult","content":[{"type":"text","text":"{\"stdout\":\"NEEDLE tool output\",\"stderr\":\"real warning\",\"opaque\":\"OPAQUE_ONLY\"}"}]}]}),
+            ),
+            _ => (
+                "context_note",
+                json!({"message":[{"type":"text","text":"noise"}]}),
+            ),
+        };
+        let event = call_event(&state, kind, "unused", data);
+        if [0, 22, 44].contains(&index) {
+            expected.push(event.id.clone());
+        }
+        store.commit(&state, &[event]).unwrap();
+    }
+    assert_eq!(
+        store
+            .history_search(&state.id, "LITERAL_JSON", 100)
+            .unwrap()
+            .len(),
+        1
+    );
+    let found = store.history_search(&state.id, "needle", 100).unwrap();
+    assert_eq!(
+        found
+            .iter()
+            .map(|found| found.event_id.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(found[0].snippet.contains("Needle 中文"));
+    assert!(
+        found
+            .iter()
+            .all(|found| found.snippet.chars().count() <= 240)
+    );
+    assert_eq!(
+        store.history_search(&state.id, "needle", 1).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        store
+            .history_search(&state.id, "searchable.rs", 100)
+            .unwrap()[0]
+            .event_id,
+        expected[1]
+    );
+    assert_eq!(
+        store.history_search(&state.id, "cargo check", 100).unwrap()[0].event_id,
+        expected[1]
+    );
+    assert!(
+        store
+            .history_search(&state.id, "OPAQUE_ONLY", 100)
+            .unwrap()
+            .is_empty()
+    );
+    for (query, limit) in [("", 1), ("needle", 0), ("needle", 101)] {
+        assert!(store.history_search(&state.id, query, limit).is_err());
+    }
+    let foreign = SessionState::new(state.workspace.clone());
+    store.create_session(&foreign).unwrap();
+    assert!(
+        store
+            .history_search(&foreign.id, "needle", 100)
+            .unwrap()
+            .is_empty()
+    );
+    // Read-only search leaves the snapshot and source event body intact.
+    assert_eq!(store.load_session(&state.id).unwrap(), state);
+    assert!(
+        store
+            .read_event(&state.id, &expected[0])
+            .unwrap()
+            .data
+            .to_string()
+            .contains(&"x".repeat(20_000))
+    );
+}

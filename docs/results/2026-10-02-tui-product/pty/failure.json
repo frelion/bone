@@ -1,0 +1,28 @@
+{
+  "scenario": "failure",
+  "scope": "Real PTY; synthetic protocol fixture, no real model or personal credentials",
+  "status": "PASS",
+  "error": null,
+  "frames": [
+    {
+      "step": "Start: idle terminal",
+      "screen": " BONE  · openai/openai:fixture · 就绪                                           \n 描述任务，BONE 会在当前工作区执行。                                            \n / 命令   @ 文件   Ctrl+F 搜索   F1 快捷键                                      \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n┌ 输入 · Enter 发送 · Shift+Enter 换行 ────────────────────────────────────────┐\n│ 描述任务，或输入 / 命令、@ 文件                                              │\n└──────────────────────────────────────────────────────────────────────────────┘\n 输入 / 或 @ 显示候选 · Tab 补全 · Enter 发送 · F1 帮助                         \n workspace · openai/openai:fixture · 58d82af2 · 可写 · 就绪                     ",
+      "requests": 0,
+      "events": 0,
+      "size": [
+        20,
+        80
+      ]
+    },
+    {
+      "step": "Final terminal",
+      "screen": " BONE  · openai/openai:fixture · 就绪                                    \n   你                                                              \n FAIL_TASK                                                               \n                                                                                \n   执行失败                                                                     \n ProviderResponseError: status 422 Unprocessable Entity: {\"error\": {\"message\":  \n \"scripted fixture error\", \"type\": \"fixture\"}}Session: 58d82af2-4869-43fd-8a4a-e\n继续：bone --data-dir '/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-tui\n打开后 Ctrl+R 恢复暂停的工作。                                                  \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n┌ 输入 · Enter 发送 · Shift+Enter 换行 ────────────────────────────────────────┐\n│ 描述任务，或输入 / 命令、@ 文件                                              │\n└──────────────────────────────────────────────────────────────────────────────┘\n 已保存 ·等待纳入执行；运行中可追加新要求                                  \n workspace · openai/openai:fixture · 58d82af2 · 本次 1 /16 calls · ? tokens ·  ",
+      "requests": 1,
+      "events": 5,
+      "size": [
+        20,
+        80
+      ]
+    }
+  ]
+}

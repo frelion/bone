@@ -248,6 +248,69 @@ impl Store {
         Ok((events, more))
     }
 
+    pub fn history_search(
+        &self,
+        session_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::HistoryMatch>> {
+        ensure!(
+            !query.trim().is_empty() && query.len() <= 4096,
+            "query must contain 1–4096 bytes of text"
+        );
+        ensure!(
+            (1..=100).contains(&limit),
+            "search limit must be between 1 and 100"
+        );
+        let query = query.to_lowercase();
+        let mut matches = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (events, more) = self.history_page(session_id, cursor.as_deref(), 1)?;
+            let Some(event) = events.into_iter().next() else {
+                break;
+            };
+            cursor = Some(event.id.clone());
+            let text = match event.kind.as_str() {
+                "input" | "tool_result" | "context_note" => readable_text(&event.data["message"]),
+                "model_message" | "summary" | "stale" => {
+                    readable_text(&event.data["response"]["choice"])
+                }
+                "question" | "failure" | "input_paused" | "write_unknown" | "tool_reconciled" => {
+                    readable_text(&event.data)
+                }
+                _ => String::new(),
+            };
+            if let Some(offset) = text.to_lowercase().find(&query) {
+                // Lowercasing can change byte length (e.g. İ), so map the match
+                // back to original character indices before selecting context.
+                let mut lower_bytes = 0;
+                let start = text
+                    .chars()
+                    .take_while(|character| {
+                        let before = lower_bytes;
+                        lower_bytes += character.to_lowercase().map(char::len_utf8).sum::<usize>();
+                        before < offset
+                    })
+                    .count()
+                    .saturating_sub(60);
+                let snippet = text.chars().skip(start).take(240).collect();
+                matches.push(crate::HistoryMatch {
+                    event_id: event.id,
+                    kind: event.kind,
+                    snippet,
+                });
+                if matches.len() == limit {
+                    break;
+                }
+            }
+            if !more {
+                break;
+            }
+        }
+        Ok(matches)
+    }
+
     pub fn read_event(&self, session_id: &str, id: &str) -> Result<Event> {
         let payload: String = self
             .connection
@@ -460,6 +523,82 @@ impl Store {
             self.commit(&state, &[event])?;
         }
         Ok(state)
+    }
+}
+
+/// Project only native readable parts and known tool evidence. Transport metadata,
+/// hidden reasoning and encrypted blocks are excluded. Tool paths and commands
+/// are searchable without projecting arbitrary argument/transport fields.
+fn readable_text(value: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .map(readable_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("reasoning" | "encrypted") => String::new(),
+            Some("toolcall") => {
+                let args = &value["function"]["arguments"];
+                ["path", "command"]
+                    .iter()
+                    .filter_map(|key| args.get(*key))
+                    .map(readable_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            Some("text") => object.get("text").map(readable_text).unwrap_or_default(),
+            Some("json") => object.get("value").map(readable_text).unwrap_or_default(),
+            Some("toolresult") => value["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|part| {
+                    // BONE stores structured tool evidence in native text parts.
+                    // Decode only tool results; a user's literal JSON stays verbatim.
+                    if part["type"] == "text"
+                        && let Some(text) = part["text"].as_str()
+                        && let Ok(parsed) = serde_json::from_str::<Value>(text)
+                    {
+                        return readable_text(&parsed);
+                    }
+                    readable_text(part)
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Some(_) => object.get("content").map(readable_text).unwrap_or_default(),
+            None => [
+                "text",
+                "stdout",
+                "stderr",
+                "error",
+                "reason",
+                "question",
+                "instruction",
+                "observation",
+                "note",
+                "path",
+                "snippet",
+                "preview",
+                "command",
+                "files",
+                "matches",
+                "results",
+                "message",
+                "content",
+            ]
+            .iter()
+            .filter_map(|key| object.get(*key))
+            .map(readable_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        },
+        _ => String::new(),
     }
 }
 

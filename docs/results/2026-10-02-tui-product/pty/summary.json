@@ -1,0 +1,129 @@
+{
+  "reviewed_at": "2026-10-02T06:16:17.700395+00:00",
+  "binary": "target/debug/bone",
+  "version": "bone 0.6.0",
+  "sha256": "3d0852bfb8f33cb210187a66fb44e07e5ea3a94776ae20dbef3789f26d6b4464",
+  "source_base_commit": "761580c4c6487a47b19186b8c8d8d487a31825f7",
+  "source_state": "Uncommitted codex/tui-product implementation at validation time; source base commit is not the implementation commit.",
+  "command": "python3 -u tests/tui_pty.py --evidence-dir docs/results/2026-10-02-tui-product/pty",
+  "scope": "Real PTY with synthetic loopback Responses fixture; real local shell execution; no real model, personal credentials or native GUI selection trial. Clipboard uses an isolated fixture pbcopy. Persistent-search seeds native-shaped SQLite fixture events.",
+  "case_count": 22,
+  "passed": 22,
+  "cases": [
+    {
+      "name": "commands",
+      "status": "PASS",
+      "evidence": "commands.html"
+    },
+    {
+      "name": "completion",
+      "status": "PASS",
+      "evidence": "completion.html"
+    },
+    {
+      "name": "concurrent",
+      "status": "PASS",
+      "evidence": "concurrent.html"
+    },
+    {
+      "name": "editor-signal",
+      "status": "PASS",
+      "evidence": "editor-signal.html"
+    },
+    {
+      "name": "exit-resume",
+      "status": "PASS",
+      "evidence": "exit-resume.html"
+    },
+    {
+      "name": "failure",
+      "status": "PASS",
+      "evidence": "failure.html"
+    },
+    {
+      "name": "interactive-editor",
+      "status": "PASS",
+      "evidence": "interactive-editor.html"
+    },
+    {
+      "name": "multiline-undo",
+      "status": "PASS",
+      "evidence": "multiline-undo.html"
+    },
+    {
+      "name": "paste",
+      "status": "PASS",
+      "evidence": "paste.html"
+    },
+    {
+      "name": "pause",
+      "status": "PASS",
+      "evidence": "pause.html"
+    },
+    {
+      "name": "persistent-search",
+      "status": "PASS",
+      "evidence": "persistent-search.html"
+    },
+    {
+      "name": "question-target",
+      "status": "PASS",
+      "evidence": "question-target.html"
+    },
+    {
+      "name": "question",
+      "status": "PASS",
+      "evidence": "question.html"
+    },
+    {
+      "name": "reading-detail",
+      "status": "PASS",
+      "evidence": "reading-detail.html"
+    },
+    {
+      "name": "sessions",
+      "status": "PASS",
+      "evidence": "sessions.html"
+    },
+    {
+      "name": "shell-live",
+      "status": "PASS",
+      "evidence": "shell-live.html"
+    },
+    {
+      "name": "signal",
+      "status": "PASS",
+      "evidence": "signal.html"
+    },
+    {
+      "name": "slash-inline",
+      "status": "PASS",
+      "evidence": "slash-inline.html"
+    },
+    {
+      "name": "stale",
+      "status": "PASS",
+      "evidence": "stale.html"
+    },
+    {
+      "name": "stream-stop",
+      "status": "PASS",
+      "evidence": "stream-stop.html"
+    },
+    {
+      "name": "stream",
+      "status": "PASS",
+      "evidence": "stream.html"
+    },
+    {
+      "name": "unicode",
+      "status": "PASS",
+      "evidence": "unicode.html"
+    }
+  ],
+  "screen_replay_tests": {
+    "command": "python3 -B -m unittest discover -s tests -p test_tui_screen.py -v",
+    "passed": 2
+  },
+  "evidence_bytes": 504416
+}

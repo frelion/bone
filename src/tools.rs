@@ -151,14 +151,28 @@ pub struct ToolOutcome {
     pub uncertain: bool,
 }
 
+/// Job-owned pipe observation; the callback never changes execution or its result.
+pub type ToolObserver = std::sync::Arc<dyn Fn(bool, &[u8]) + Send + Sync>;
+
+#[cfg(test)]
 pub async fn execute(
     workspace: &Path,
     name: &str,
     args: &Value,
     write_leases: Option<[std::sync::Arc<std::fs::File>; 2]>,
 ) -> ToolOutcome {
+    execute_with_progress(workspace, name, args, write_leases, None).await
+}
+
+pub async fn execute_with_progress(
+    workspace: &Path,
+    name: &str,
+    args: &Value,
+    write_leases: Option<[std::sync::Arc<std::fs::File>; 2]>,
+    observer: Option<ToolObserver>,
+) -> ToolOutcome {
     if name == "shell" {
-        return match shell(workspace, args, write_leases.as_ref()).await {
+        return match shell(workspace, args, write_leases.as_ref(), observer.as_ref()).await {
             Ok(outcome) => outcome,
             Err(error) => ToolOutcome {
                 content: json!({"error":format!("{error:#}")}),
@@ -840,7 +854,11 @@ fn write_file_prepared(
     }
 }
 
-async fn drain(mut reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<(Vec<u8>, bool)> {
+async fn drain(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    observer: Option<&ToolObserver>,
+    stderr: bool,
+) -> std::io::Result<(Vec<u8>, bool)> {
     let mut out = Vec::new();
     let mut buf = [0_u8; 8192];
     let mut truncated = false;
@@ -848,6 +866,9 @@ async fn drain(mut reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result
         let count = reader.read(&mut buf).await?;
         if count == 0 {
             break;
+        }
+        if let Some(observer) = observer {
+            observer(stderr, &buf[..count]);
         }
         let take = count.min(OUTPUT_LIMIT.saturating_sub(out.len()));
         out.extend_from_slice(&buf[..take]);
@@ -885,6 +906,7 @@ async fn shell(
     workspace: &Path,
     args: &Value,
     write_leases: Option<&[std::sync::Arc<std::fs::File>; 2]>,
+    observer: Option<&ToolObserver>,
 ) -> Result<ToolOutcome> {
     let command = string_arg(args, "command")?;
     let seconds = shell_timeout_seconds(args)?;
@@ -927,7 +949,11 @@ async fn shell(
     let stdout = child.stdout.take().context("missing stdout")?;
     let stderr = child.stderr.take().context("missing stderr")?;
     let wait = async {
-        let (status, out, err) = tokio::try_join!(child.wait(), drain(stdout), drain(stderr))?;
+        let (status, out, err) = tokio::try_join!(
+            child.wait(),
+            drain(stdout, observer, false),
+            drain(stderr, observer, true)
+        )?;
         Ok::<_, std::io::Error>((status, out, err))
     };
     match tokio::time::timeout(Duration::from_secs(seconds), wait).await {

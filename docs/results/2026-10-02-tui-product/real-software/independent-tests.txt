@@ -1,0 +1,8 @@
+test_dates (__main__.IndependentAcceptance) ... ok
+test_delta_and_trim (__main__.IndependentAcceptance) ... ok
+test_invalid (__main__.IndependentAcceptance) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.000s
+
+OK

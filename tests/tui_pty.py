@@ -3,8 +3,11 @@
 Only synthetic credentials and a scripted loopback Responses endpoint are used.
 """
 import argparse
+import html
 import fcntl
 import json
+import copy
+import uuid
 import os
 from pathlib import Path
 import pty
@@ -67,6 +70,12 @@ auth = "Bearer"
         editor.chmod(0o700)
         env["EDITOR"] = str(editor)
         env["VISUAL"] = str(editor)
+        self.clipboard = self.root / "clipboard.txt"
+        clipboard = self.root / "pbcopy"
+        clipboard.write_text('#!/bin/sh\ncat > "$BONE_TUI_CLIPBOARD_FILE"\n')
+        clipboard.chmod(0o700)
+        env["BONE_TUI_CLIPBOARD_FILE"] = str(self.clipboard)
+        env["PATH"] = str(self.root) + os.pathsep + env.get("PATH", "")
         self.env = env
         self.binary = binary
         self.proc = subprocess.Popen([str(binary), "--data-dir", str(self.data), "--profile", "fixture", "tui",
@@ -74,6 +83,7 @@ auth = "Bearer"
             stdin=self.slave, stdout=self.slave, stderr=self.slave, env=env, start_new_session=True)
         self.output = bytearray()
         self.answered_queries = 0
+        self.frames = []
 
     def resize(self, rows, cols):
         self.rows, self.cols = rows, cols
@@ -109,8 +119,7 @@ auth = "Bearer"
 
     def visible(self, text):
         # Ratatui diff output uses cursor moves instead of literal spaces.
-        output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", self.output.decode("utf-8", errors="replace"))
-        return re.sub(r"\s+", "", text) in re.sub(r"\s+", "", output)
+        return re.sub(r"\s+", "", text) in re.sub(r"\s+", "", self.screen())
 
     def screen(self):
         """Replay the VT operations emitted by ratatui, including cursor diff updates."""
@@ -146,12 +155,35 @@ auth = "Bearer"
             elif token == "\n": row = min(self.rows - 1, row + 1)
             elif token == "\b": col = max(0, col - 1)
             elif token >= " " and row < self.rows and col < self.cols:
-                width = 0 if unicodedata.combining(token) else (2 if unicodedata.east_asian_width(token) in "WF" else 1)
-                if width:
+                previous = col - 1
+                while previous >= 0 and grid[row][previous] == "":
+                    previous -= 1
+                joined = previous >= 0 and grid[row][previous].endswith("\u200d")
+                zero_width = unicodedata.combining(token) or token in ("\u200d", "\ufe0e", "\ufe0f") or 0x1f3fb <= ord(token) <= 0x1f3ff
+                if zero_width or joined:
+                    if previous >= 0:
+                        grid[row][previous] += token
+                else:
+                    width = 2 if unicodedata.east_asian_width(token) in "WF" else 1
                     grid[row][col] = token
                     if width == 2 and col + 1 < self.cols: grid[row][col + 1] = ""
                     col += width
         return "\n".join("".join(line) for line in grid)
+
+    def capture(self, label):
+        self.pump(.08)
+        self.frames.append({"step": label, "screen": self.screen(), "requests": len(self.calls()),
+            "events": len(self.events()), "size": [self.rows, self.cols]})
+
+    def evidence(self, directory, name, error=None):
+        directory.mkdir(parents=True, exist_ok=True)
+        document = {"scenario": name, "scope": "Real PTY; synthetic protocol fixture, no real model or personal credentials",
+            "status": "FAIL" if error else "PASS", "error": str(error) if error else None, "frames": self.frames}
+        (directory / (name + ".json")).write_text(json.dumps(document, ensure_ascii=False, indent=2))
+        cards = "".join("<section><h2>" + html.escape(frame["step"]) + "</h2><p>Requests: " + str(frame["requests"]) +
+            "; events: " + str(frame["events"]) + "</p><pre>" + html.escape(frame["screen"]) + "</pre></section>" for frame in self.frames)
+        page = '<!doctype html><meta charset="utf-8"><title>BONE PTY ' + html.escape(name) + '</title><style>body{font:16px system-ui;margin:32px;background:#f5f3ed;color:#172b36}pre{font:13px monospace;white-space:pre-wrap;background:#18232b;color:#e5edf2;padding:16px;overflow:auto}section{margin:24px 0}</style><h1>' + html.escape(name) + '</h1><p>' + html.escape(document["scope"]) + '</p><p>' + document["status"] + '</p>' + ('<pre>' + html.escape(str(error)) + '</pre>' if error else '') + cards
+        (directory / (name + ".html")).write_text(page)
 
     def restart(self, session):
         assert self.proc.poll() is not None
@@ -203,12 +235,21 @@ auth = "Bearer"
         self.directory.cleanup()
 
 
-def run_case(binary, name, turns, action, size=(30, 110)):
+def run_case(binary, name, turns, action, size=(30, 110), evidence_dir=None):
     fixture = Fixture(binary, turns, size)
     try:
         fixture.wait(lambda: b'\x1b[?1049h' in fixture.output, "TUI startup")
+        fixture.capture("Start: idle terminal")
         action(fixture)
+        fixture.capture("Final terminal")
+        if evidence_dir:
+            fixture.evidence(evidence_dir, name)
         print("PASS", name)
+    except Exception as error:
+        fixture.capture("Failure: current terminal")
+        if evidence_dir:
+            fixture.evidence(evidence_dir, name, error)
+        raise
     finally:
         fixture.close()
 
@@ -359,7 +400,7 @@ def command_draft_editor(f):
     assert 'EDITOR_REFERENCE_ONLY' in json.dumps(f.calls()), 'agent missing submitted editor draft'
     count = len(f.events())
     f.send('/older\r')
-    f.wait(lambda: '更早会话原文' in f.screen() or '已经是最早的记录' in f.screen(), 'older records read-only view or earliest boundary')
+    f.wait(lambda: '更早会话原文' in f.screen() or '已载入最早对话' in f.screen() or '已经是最早的记录' in f.screen(), 'older records read-only view or earliest boundary')
     if '更早会话原文' in f.screen():
         f.send('READ_ONLY_OLDER_PROBE')
         f.pump(.2)
@@ -372,9 +413,8 @@ def command_draft_editor(f):
 def file_completion(f):
     (f.workspace / 'reference-unique.txt').write_text('FILE_CONTENT_MUST_NOT_AUTOEXECUTE')
     f.send('Read @reference-u')
+    f.wait(lambda: 'reference-unique.txt' in f.screen(), 'inline file completion offers matching path')
     f.send('\t')
-    f.wait(lambda: 'reference-unique.txt' in f.screen(), 'file picker offers matching path')
-    f.send('\r')
     f.pump(.2)
     assert '@reference-unique.txt' in f.screen(), 'file completion did not insert reference'
     assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'completion submitted draft'
@@ -422,12 +462,12 @@ def unicode_history_search(f):
     prompt = '中文e\u0301👩‍💻试'
     assert prompt in json.dumps(f.calls(), ensure_ascii=False), 'Unicode cursor edit corrupted graphemes'
     count = len(f.calls())
-    f.send(b'\x1b[A')
+    f.send(b'\x1b[1;3A')  # Alt+Up recalls history; plain Up moves textarea cursor.
     def recalled():
         drafts = list((f.data / 'tui').glob('*.json'))
         return any(json.loads(path.read_text()).get('draft') == prompt for path in drafts)
     f.wait(recalled, 'history recalled exact Unicode draft')
-    f.send(b'\x1b[B')
+    f.send(b'\x1b[1;3B')
     f.pump(.2)
     assert len(f.calls()) == count, 'history navigation submitted prompt'
     f.send(b'\x06')
@@ -484,12 +524,213 @@ def signal_cleanup(f):
     assert b'\x1b[?1049l' in f.output, 'SIGTERM left alternate screen'
 
 
+def slash_inline(f):
+    f.send('/')
+    f.wait(lambda: '/new' in f.screen() and '/status' in f.screen(), 'slash candidates immediately visible', timeout=3)
+    f.capture("Typing / shows commands without opening a separate panel")
+    f.send('sta')
+    f.wait(lambda: '/status' in f.screen(), 'slash candidates filter')
+    f.send('\t')
+    f.pump(.2)
+    assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'Tab submitted command to agent'
+    f.wait(lambda: any(d.get('draft', '').strip() == '/status' for d in f.saved_drafts()), 'Tab retains completed command draft')
+    f.capture("Tab inserts /status; no model request")
+    f.send('\r')
+    f.pump(.3)
+    assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'status reached model'
+    f.capture("Status opens through the completed command")
+    f.send(b'\x1b')
+    f.quit()
+
+
+
+def multiline_undo(f):
+    original = '第一行 e\u0301👩‍💻\n第二行 preserve cents'
+    f.send(b'\x1b[200~' + original.encode() + b'\x1b[201~')
+    f.wait(lambda: 'preserve cents' in f.screen(), 'multiline Unicode paste remains editable')
+    assert not f.calls(), 'paste executed before Enter'
+    f.capture("Unicode multiline paste remains a draft")
+    f.send(b'\x1a')  # Ctrl+Z undoes the whole paste operation.
+    f.wait(lambda: 'preserve cents' not in f.screen(), 'undo removes pasted operation')
+    f.send(b'\x1bz')  # Alt+Z restores paste.
+    f.wait(lambda: 'preserve cents' in f.screen(), 'redo restores multiline paste')
+    f.send(b'\x1b[A\x05!')  # Visual Up then Ctrl+E inserts in first line.
+    expected = '第一行 e\u0301👩‍💻!\n第二行 preserve cents'
+    f.wait(lambda: any(d.get('draft') == expected for d in f.saved_drafts()), 'Up navigates multiline draft without recalling history')
+    f.capture("Undo, redo and visual-line cursor editing preserve Unicode")
+    f.send('\r')
+    f.wait(lambda: 'MULTILINE_EDITOR_ACCEPTED' in f.screen(), 'edited multiline prompt submitted')
+    assert any(e['kind'] == 'input' and e['data']['message']['content'][0]['text'] == expected for e in f.events()), 'editor changed graphemes or line boundaries'
+    f.quit()
+
+def live_shell(f):
+    (f.workspace / 'module.py').write_text('def compute(): return 7\n')
+    f.send('Inspect module.py and run its checks; keep terminal responsive.\r')
+    f.wait(lambda: any(e.get('kind') == 'tool_started' and e.get('data', {}).get('tool_name') == 'shell' for e in f.events()), 'shell actually started')
+    f.wait(lambda: 'LIVE_STDOUT_READY' in f.screen() and 'LIVE_STDERR_READY' in f.screen(), 'both live shell streams visible before exit', timeout=3)
+    assert not (f.workspace / 'shell-finished').exists(), 'shell already finished before preview'
+    assert not any(e.get('kind') == 'tool_result' and e.get('data', {}).get('tool_name') == 'shell' for e in f.events()), 'shell preview appeared after result'
+    f.capture("Real shell still running; stdout and stderr visible")
+    f.send('Preserve this follow-up draft')
+    f.wait(lambda: 'Preserve this follow-up draft' in f.screen(), 'input responsive during running shell', timeout=3)
+    f.send(b'\x03')
+    f.wait(lambda: f.state().get('paused'), 'Ctrl+C pauses running shell', timeout=3)
+    f.wait(lambda: bool(f.state().get('unknown_writes')), 'interrupted shell needs reconciliation')
+    f.capture("Paused real shell; unknown write retained")
+    assert not (f.workspace / 'shell-finished').exists(), 'cancelled shell kept executing'
+    f.send(b'\x01\x0b')  # Clear preserved draft before the local command.
+    f.send('/reconcile\r')
+    f.wait(lambda: 'shell' in f.screen() and '结果未知' in f.screen(), 'unknown write picker identifies interrupted shell')
+    f.send('\r')
+    f.wait(lambda: 'LIVE_STDOUT_READY' in f.screen(), 'reconcile opens original shell arguments')
+    f.capture("Unknown write detail retains actual command and requires observed evidence")
+    f.send(b'\x1b')
+    f.pump(.2)
+    call = next(iter(f.state()['unknown_writes']))
+    f.send(b'\x01\x0b')
+    f.send('/reconcile ' + call + ' Checked workspace: shell-finished absent; process cancelled.\r')
+    f.wait(lambda: not f.state().get('unknown_writes'), 'observed reconciliation recorded')
+    assert f.state().get('paused'), 'reconcile automatically resumed work'
+    assert len(f.calls()) == 2, 'reconciliation reissued model or shell work'
+    f.capture("Recorded observation clears unknown write and keeps session paused")
+    f.quit()
+
+
+def reading_detail_copy(f):
+    content = 'TOOL_BEGIN\n' + ''.join(f'engineering line {n}: original implementation evidence\n' for n in range(100)) + 'TOOL_FULL_END'
+    (f.workspace / 'implementation.txt').write_text(content)
+    f.send('Review implementation.txt and report.\r')
+    f.wait(lambda: 'REVIEW_COMPLETE' in f.screen(), 'engineering response complete')
+    count = len(f.calls())
+    f.capture("Engineering transcript shows a collapsed tool alongside answer")
+    f.send('\t')  # Conversation focus; latest answer selected.
+    f.send(b'\x1b[A')  # Select preceding read_file result.
+    f.send('d')
+    f.wait(lambda: 'tool_result' in f.screen() and 'implementation.txt' in f.screen(), 'selected tool opens original full detail')
+    f.capture("Selected tool detail displays original event and arguments")
+    f.send(b'\x19')
+    f.wait(lambda: f.clipboard.exists() and 'TOOL_FULL_END' in f.clipboard.read_text(), 'copy detail includes tail outside visible viewport')
+    copied = f.clipboard.read_text()
+    assert 'TOOL_BEGIN' in copied and 'engineering line 99' in copied, 'detail copy silently truncated tool body'
+    assert len(f.calls()) == count, 'reading or copying invoked agent'
+    f.capture("Full selected tool copied through fixture clipboard; no model request")
+    f.send(b'\x1b')
+    f.pump(.2)
+    f.clipboard.unlink()
+    f.send('\ty')  # Esc returns to input; Tab restores selected Conversation message.
+    f.wait(lambda: f.clipboard.exists() and 'TOOL_FULL_END' in f.clipboard.read_text(), 'selected message copy preserves full original tool output')
+    assert len(f.calls()) == count, 'selected message copy invoked agent'
+    f.quit()
+
+
+def persistent_search(f):
+    f.send('ARCHIVE_REQUIRED_FLAG: preserve the original signed cents requirement.\r')
+    f.wait(lambda: 'ARCHIVE_ACKNOWLEDGED' in f.screen(), 'original archived requirement answered')
+    original = f.events()
+    state = f.state()
+    session = state['id']
+    owner = state['focus']
+    input_template = next(e for e in original if e['kind'] == 'input')
+    model_template = next(e for e in original if e['kind'] == 'model_message')
+    delivery_template = next(e for e in original if e['kind'] == 'delivery')
+    f.quit()
+    # Long-history setup copies already validated native event shapes. It does not
+    # run 70 synthetic model turns merely to push the real first requirement out
+    # of the startup page. The following browsing/search actions use a real PTY.
+    with sqlite3.connect(f.data / 'sessions.sqlite3') as connection:
+        snapshot = json.loads(connection.execute('SELECT snapshot FROM sessions WHERE id=?', (session,)).fetchone()[0])
+        for n in range(70):
+            user, response, delivery = (copy.deepcopy(template) for template in (input_template, model_template, delivery_template))
+            for event in (user, response, delivery):
+                event['id'] = str(uuid.uuid4())
+            user['root_input'] = user['id']
+            user['data']['message'] = {'role': 'user', 'content': [{'type': 'text', 'text': f'Later engineering request {n}'}]}
+            response['reply_to'] = delivery['reply_to'] = user['id']
+            response['root_input'] = delivery['root_input'] = user['id']
+            response['data']['response']['choice'] = [{'type': 'text', 'text': f'Later engineering answer {n}'}]
+            delivery['data']['response_event'] = response['id']
+            for event in (user, response, delivery):
+                connection.execute('INSERT INTO events (id,session_id,revision,payload,job_id) VALUES (?,?,?,?,?)', (event['id'],session,event['revision'],json.dumps(event),event.get('job_id')))
+            snapshot['jobs'][owner]['history'].extend([user['id'], response['id']])
+        connection.execute('UPDATE sessions SET snapshot=? WHERE id=?', (json.dumps(snapshot), session))
+    f.restart(session)
+    f.pump(.3)
+    assert 'ARCHIVE_REQUIRED_FLAG' not in f.screen(), 'target was still in the loaded recent page'
+    f.capture("Reopened long session; original requirement is outside startup page")
+    before = len(f.events())
+    f.send('/older\t\r')
+    f.pump(.3)
+    assert len(f.events()) == before, 'browsing older events mutated conversation'
+    f.send('/search ARCHIVE_REQUIRED_FLAG\r')
+    f.wait(lambda: 'ARCHIVE_REQUIRED_FLAG' in f.screen(), 'persistent full-history search finds unloaded original requirement')
+    f.capture("Full SQLite search finds original requirement after browsing older history")
+    f.send('\r')
+    f.wait(lambda: 'signed cents requirement' in f.screen(), 'search selection opens exact original body')
+    assert len(f.events()) == before and len(f.calls()) == 1, 'search or opening hit invoked model/state mutation'
+    f.capture("Selected history hit opens original requirement without executing work")
+    f.send(b'\x1b')
+    f.quit()
+
+
+def explicit_question_target(f):
+    f.send('Coordinate the two choices.\r')
+    f.wait(lambda: len([e for e in f.events() if e['kind'] == 'question']) == 2, 'two pending questions')
+    questions = [e for e in f.events() if e['kind'] == 'question']
+    selected = next(e for e in questions if 'ROOT_FORMAT' in e['data']['question'])
+    f.capture("Two pending questions remain independently addressable")
+    f.send('/reply ' + selected['id'] + '\r')
+    f.pump(.3)
+    f.send('ROOT_ANSWER_JSON\r')
+    f.wait(lambda: any(e['kind'] == 'input' and e.get('reply_to') == selected['id'] for e in f.events()), 'answer explicitly links chosen question')
+    f.wait(lambda: 'ROOT_ANSWER_ACCEPTED' in f.screen(), 'selected question resumes its own work')
+    f.capture("Explicit answer targets earlier root question, leaves child question pending")
+    child = next(e for e in questions if e['id'] != selected['id'])
+    assert not any(e['kind'] == 'input' and e.get('reply_to') == child['id'] for e in f.events()), 'another pending question was answered accidentally'
+    f.send(b'\x1b')  # Cancel current pending-reply target.
+    f.pump(.2)  # A standalone Esc must not become an Alt+O sequence.
+    f.send('/latest\r')
+    f.pump(.3)
+    f.capture("Returning to latest history preserves cancelled reply routing")
+    f.send('ORDINARY_NEW_REQUIREMENT\r')
+    f.wait(lambda: any(e['kind'] == 'input' and 'ORDINARY_NEW_REQUIREMENT' in json.dumps(e) for e in f.events()), 'ordinary input accepted after cancelling reply mode')
+    ordinary = next(e for e in f.events() if e['kind'] == 'input' and 'ORDINARY_NEW_REQUIREMENT' in json.dumps(e))
+    assert ordinary.get('reply_to') not in {q['id'] for q in questions}, 'Esc only hid banner but still answered pending question'
+    f.capture("Esc cancels reply routing; new instruction does not answer child question")
+    f.quit()
+
+
+def exit_resume(f):
+    session = f.state()['id']
+    f.quit()
+    # After restoring the alternate screen, verify the actual exit output only.
+    tail = bytes(f.output).rsplit(b'\x1b[?1049l', 1)[-1].decode('utf-8', errors='replace')
+    for part in ('bone', '--data-dir', str(f.data), '--profile', 'fixture', 'tui', '--session', session, '--workspace', str(f.workspace)):
+        assert part in tail, f'exit resume command missing {part}'
+    f.capture("Exit restores terminal and prints a complete resume command")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/bone')
-    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal'])
+    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target'])
+    parser.add_argument("--evidence-dir", type=Path)
     args = parser.parse_args()
     cases = [
+        ('slash-inline', [], slash_inline),
+        ('multiline-undo', [{'contains':['第一行 e\u0301👩‍💻!', '第二行 preserve cents'], 'text':'MULTILINE_EDITOR_ACCEPTED'}], multiline_undo),
+        ('shell-live', [
+            {'output': [tool('read_file', {'path': 'module.py'})]},
+            {'output': [tool('shell', {'command': 'printf "LIVE_STDOUT_READY\\n"; printf "LIVE_STDERR_READY\\n" >&2; while [ ! -e release-shell ]; do sleep 0.05; done; touch shell-finished', 'timeout_seconds': 15})]},
+            {'text': 'ENGINEERING_CHECKS_COMPLETE'}], live_shell),
+        ('exit-resume', [], exit_resume),
+        ('reading-detail', [{'output': [tool('read_file', {'path': 'implementation.txt'})]}, {'text': 'REVIEW_COMPLETE'}], reading_detail_copy),
+        ('persistent-search', [{'text': 'ARCHIVE_ACKNOWLEDGED'}], persistent_search),
+        ('question-target', [
+            {'match_job_title': 'Conversation', 'output': [tool('job_send', {'title': 'Child', 'message': 'CHILD_WORK'})]},
+            {'match_job_title': 'Conversation', 'output': [tool('ask_user', {'question': 'ROOT_FORMAT: choose output'})]},
+            {'match_job_title': 'Child', 'output': [tool('ask_user', {'question': 'CHILD_FORMAT: choose encoding'})]},
+            {'match_job_title': 'Conversation', 'contains': ['ROOT_ANSWER_JSON'], 'text': 'ROOT_ANSWER_ACCEPTED'},
+            {'text': 'ORDINARY_NEW_ACCEPTED'}], explicit_question_target),
         ('paste', [{'contains':['PASTE_ONE','PASTE_TWO'], 'text':'PASTE_ACCEPTED'}], paste_and_enter),
         ('concurrent', [{'delay_seconds':2,'text':'INITIAL_COMPLETE'}, {'contains':['ADDED_CONSTRAINT'],'text':'CONSTRAINT_ACCEPTED'}], concurrent_input),
         ('pause', [{'delay_seconds':2,'text':'PAUSE_COMPLETE'}, {'text':'PAUSE_COMPLETE'}], pause_resume),
@@ -514,7 +755,7 @@ def main():
     ]
     for name, turns, action in cases:
         if args.case is None or args.case == name:
-            run_case(args.binary.resolve(), name, turns, action, size=(20,80) if name == 'failure' else (30,110))
+            run_case(args.binary.resolve(), name, turns, action, size=(20,80) if name == 'failure' else (30,110), evidence_dir=args.evidence_dir)
 
 
 if __name__ == '__main__':

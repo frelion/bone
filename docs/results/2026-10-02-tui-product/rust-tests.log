@@ -1,0 +1,245 @@
+
+running 105 tests
+test config::tests::unsafe_profile_names_and_empty_companion_models_are_rejected ... ok
+test context::tests::handed_off_active_input_stays_a_native_assigned_user_message ... ok
+test config::tests::native_config_roundtrip_preserves_route_endpoint_and_omits_key ... ok
+test context::tests::active_and_queued_inputs_are_pinned_even_when_a_summary_covers_them ... ok
+test context::tests::native_batch_ids_and_provider_fields_survive_history_replay ... ok
+test context::tests::failed_old_read_only_input_is_queued_and_current_write_request_is_unambiguously_active ... ok
+test context::tests::derived_summary_is_user_background_and_keeps_original_inputs_and_tool_pairs ... ok
+test context::tests::compaction_preserves_an_unfinished_batch ... ok
+test context::tests::shared_user_instructions_keep_complete_text_and_can_enter_a_summary ... ok
+test context::tests::ongoing_input_survives_compaction_of_its_older_tool_cycles ... ok
+test context::tests::compaction_keeps_whole_batches_and_covers_the_maximal_complete_prefix ... ok
+test context::tests::fresh_native_call_arguments_are_never_silently_shortened_to_fit ... ok
+test model::tests::codex_source_deduplicates_stable_and_legacy_directory_aliases ... ok
+test context::tests::summary_prefix_fits_its_budget_without_splitting_a_long_tool_batch ... ok
+test model::tests::invalid_codex_login_errors_never_echo_credential_values ... ok
+test context::tests::oversized_complete_tool_batch_has_explicit_native_previews_and_exact_source_ids ... ok
+test context::tests::one_large_cycle_stays_fresh_until_the_next_committed_work_response ... ok
+test model::tests::cancelling_a_profile_lock_waiter_leaves_no_hidden_lease ... ok
+test model::tests::model_connections_require_persistable_invocation_ids ... ok
+test model::tests::reuse_codex_login_reads_current_access_token_without_modifying_source ... ok
+test model::tests::codex_source_symlink_alias_shares_lock_but_distinct_sources_do_not ... ok
+test model::tests::codex_source_uses_one_stable_lock_across_different_legacy_homes ... ok
+test model::tests::reused_codex_source_serializes_across_distinct_profile_caches ... ok
+test model::tests::legacy_codex_owner_blocks_new_lock_and_cancellation_releases_stable ... ok
+test runtime::tests::aborted_write_keeps_ownership_until_its_future_actually_exits ... ok
+test runtime::tests::completion_transaction_failure_poison_blocks_actions_and_restart_recovers_unknown_write ... ok
+test runtime::tests::failed_retained_child_blocks_parent_settlement_across_public_resume_until_completed ... ok
+test provider_contract::every_registered_provider_constructs_a_native_erased_completion_model ... ok
+test model::tests::cached_subscription_guard_survives_native_stream_creation ... ok
+test model::tests::missing_oauth_cache_never_starts_device_flow ... ok
+test model::tests::invalid_oauth_cache_reports_login_without_cache_contents ... ok
+test provider_contract::unauthorized_native_call_exits_once_with_explicit_relogin_instruction ... ok
+test runtime::tests::model_progress_is_opt_in_bounded_lossy_and_preserves_native_item ... ok
+test provider_contract::subscription_native_call_and_stream_preserve_text_tools_usage_and_parameters ... ok
+test runtime::tests::legacy_unknown_marker_migrates_without_disappearing_or_authorizing_new_writes ... ok
+test runtime::tests::model_progress_drops_stale_revisions_and_stop_clears_it ... ok
+test runtime::tests::profile_switch_validates_before_mutation_and_preserves_paused_session ... ok
+test runtime::tests::independent_messages_and_explicit_question_replies_keep_their_routing ... ok
+test runtime::tests::resolution_ownership_follows_handoff_queue_without_rewriting_original_input ... ok
+test runtime::tests::resolution_rejects_unknown_effects_unfinished_batches_and_live_descendants ... ok
+test runtime::tests::resolution_wakes_exact_waiters_with_distinct_outcomes ... ok
+test runtime::tests::resumed_input_hides_historical_failure_until_new_result ... ok
+test runtime::tests::readable_summary_pages_skip_native_metadata_and_preserve_every_character ... ok
+test runtime::tests::restart_between_input_preparation_and_model_start_keeps_older_shared_corrections ... ok
+test runtime::tests::wait_cycle_uses_input_owners_and_ignores_already_terminal_replies ... ok
+test runtime::tests::tool_observation_is_opt_in_bounded_and_rejects_unowned_or_stopped_calls ... ok
+test runtime::tests::input_resolution_validation_is_atomic_and_preserves_independent_work_and_budgets ... ok
+test runtime_safety::a_new_user_input_is_admitted_after_the_previous_input_exhausted_its_budget ... ok
+test model::tests::cancelling_preparation_leaves_no_queued_credential_lease ... ok
+test runtime::tests::shell_progress_precedes_completion_and_keeps_final_output_after_new_input ... ok
+test runtime_safety::failed_marker_reconciliation_preserves_the_unknown_write ... ok
+test runtime_safety::crash_recovery_records_one_owned_native_placeholder_for_the_uncertain_operation ... ok
+test runtime_safety::consecutive_user_inputs_prioritize_the_new_instruction_through_its_tool_workflow ... ok
+test runtime_safety::new_input_follows_results_for_every_call_in_the_previous_batch ... ok
+test state::tests::budget_reservations_do_not_overrun ... ok
+test runtime_safety::resume_during_a_running_native_model_call_preserves_its_revision_and_call ... ok
+test model::tests::inference_timeout_after_preparation_releases_the_credential_lease ... ok
+test runtime_safety::tool_start_transaction_failure_leaves_no_workspace_marker_or_effect ... ok
+test store::tests::dangling_references_roll_back ... ok
+test store::tests::duplicate_ids_are_idempotent_and_conflicts_rollback ... ok
+test runtime::tests::waiting_on_long_child_results_returns_bounded_previews_and_exact_audit_references ... ok
+test store::tests::finished_write_is_not_uncertain_after_restart ... ok
+test runtime::tests::user_input_lookup_skips_audit_noise_and_crosses_job_boundaries ... ok
+test store::tests::history_page_uses_append_order_and_bounded_cursor_reads ... ok
+test runtime_safety::uncertain_write_can_resume_and_reconcile_without_reappearing_on_restart ... ok
+test store::tests::job_transitions_preserve_instruction_revision_and_reject_regression ... ok
+test store::tests::recovery_pauses_work_and_records_uncertain_writes_without_replay ... ok
+test store::tests::restart_keeps_snapshot_and_one_copy_of_native_message ... ok
+test store::tests::session_ownership_is_exclusive_and_released ... ok
+test store::tests::sqlite_fault_after_event_insert_rolls_back_snapshot_and_events ... ok
+test store::tests::history_before_preserves_append_order_and_session_scoped_backward_cursor ... ok
+test store::tests::restart_pauses_queued_and_waiting_work_and_preserves_idle_and_closed_jobs ... ok
+test tools::tests::inherited_lease_shell_helper ... ignored, subprocess helper for the killed-parent lease test
+test tools::tests::directory_sync_failure_preserves_unknown_outcome_after_replacement ... ok
+test tools::tests::external_save_during_preparation_is_not_overwritten ... ok
+test tools::tests::external_replacement_with_identical_content_is_detected_by_identity ... ok
+test tools::tests::new_file_creation_does_not_replace_a_target_created_during_preparation ... ok
+test tools::tests::new_file_directory_sync_failure_is_unknown_after_the_atomic_create ... ok
+test store::tests::uncertain_native_result_stays_unknown_until_explicit_reconciliation ... ok
+test tools::tests::shell_timeout_accepts_long_builds_and_rejects_invalid_explicit_values ... ok
+test tools::tests::shell_timeout_schema_matches_runtime_limits ... ok
+test tools::tests::shell_output_is_bounded_and_nonzero_exit_is_reported ... ok
+test tools::tests::sparse_oversized_files_are_rejected_before_loading_contents ... ok
+test tools::tests::traversal_and_symlink_escapes_are_rejected ... ok
+test tools::tests::write_hash_rejects_an_oversized_existing_file_before_loading_it ... ok
+test tools::workspace_engineering_tests::cursor_rejects_bad_checksum_version_position_request_removed_and_retyped_reference ... ok
+test tools::tests::replacements_require_matching_content ... ok
+test tools::workspace_engineering_tests::edit_batch_validation_rejects_repeated_overlapping_absent_empty_and_stale_without_install ... ok
+test tools::workspace_engineering_tests::edit_rejects_missing_directory_invalid_utf8_and_oversize_before_writes ... ok
+test store::tests::complete_history_search_crosses_pages_and_excludes_opaque_native_parts ... ok
+test tools::workspace_engineering_tests::search_and_edit_reject_all_explicit_symlinks_and_bad_paths ... ok
+test tools::workspace_engineering_tests::edit_uses_original_spans_non_cascading_and_preserves_unicode_crlf ... ok
+test tools::workspace_engineering_tests::search_nonoverlap_and_empty_last_page ... ok
+test tools::workspace_engineering_tests::edit_preserves_mode_and_reuses_final_identity_and_uncertain_durability ... ok
+test tools::workspace_engineering_tests::search_skips_binary_oversize_and_exclusions_without_touching_sources ... ok
+test tools::workspace_engineering_tests::unicode_crlf_paging_occurrences_and_whole_file_hash ... ok
+test model::tests::credential_queue_wait_does_not_consume_the_connection_deadline ... ok
+test tools::workspace_engineering_tests::search_native_schema_modes_and_final_bounds ... ok
+test tools::tests::directory_listing_limits_entries_and_reports_truncation ... ok
+test tools::workspace_engineering_tests::search_output_ceiling_produces_contiguous_smaller_pages ... ok
+test runtime::tests::idle_and_closed_jobs_do_not_keep_large_native_bodies_resident ... ok
+test tools::workspace_engineering_tests::short_line_search_returns_default50_max200_pages_without_unrelated_line_repetition ... ok
+test runtime::tests::thousands_of_large_events_stay_archived_across_repeated_summaries_and_restarts ... ok
+test tools::tests::observed_shell_drains_beyond_preview_and_keeps_timeout_uncertainty ... ok
+test tools::tests::killed_parent_does_not_release_the_frontground_shells_physical_lease ... ok
+
+test result: ok. 104 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.48s
+
+
+running 38 tests
+test tui::services::tests::html_and_opaque_content_are_safe ... ok
+test tui::services::tests::file_index_ignores_generated_hidden_and_symlinks ... ok
+test tests::bare_cli_uses_the_explicit_tui_defaults ... ok
+test tui::tests::changing_a_model_keeps_endpoint_and_does_not_move_credentials_between_providers ... ok
+test tests::implicit_tui_preserves_global_options_and_explicit_commands ... ok
+test tui::tests::tool_projection_preserves_real_lines_and_failed_shell_status ... ok
+test tui::tests::write_preview_describes_proposed_content_without_fabricating_additions ... ok
+test tui::view::tests::activity_eviction_retains_selected_event ... ok
+test tests::model_override_preserves_selected_subscription_credentials_and_limits ... ok
+test tui::view::tests::conversation_navigation_and_tool_logs_are_readable ... ok
+test tui::view::tests::cursor_uses_cells_after_wrapping ... ok
+test tui::view::tests::editing_preserves_graphemes_and_wide_characters ... ok
+test tui::view::tests::emoji_selection_and_completion_replacement_follow_grapheme_boundaries ... ok
+test tui::view::tests::inline_completion_preserves_typing_and_selection_paste_undo ... ok
+test tui::services::tests::drafts_roundtrip_and_reject_corruption_and_paths ... ok
+test tui::view::tests::markdown_styles_diff_and_bounds_cells ... ok
+test tui::view::tests::modal_paste_targets_query_and_never_mutates_hidden_draft ... ok
+test tui::view::tests::multiline_editor_history_and_undo_preserve_unicode ... ok
+test tui::view::tests::narrow_conversation_focus_selects_latest_and_tool_status_is_explicit ... ok
+test tui::view::tests::oversized_paste_preserves_draft_cursor_and_undo ... ok
+test tui::view::tests::pasted_lines_and_enter_do_not_submit ... ok
+test tui::view::tests::persisted_history_results_are_not_filtered_by_snippet_and_modal_hides_selection ... ok
+test tui::view::tests::picker_filters_selects_and_closes_without_editing_prompt ... ok
+test tui::view::tests::prepend_retains_reading_anchor_and_selected_message ... ok
+test tui::tests::obsolete_question_keeps_its_draft_and_unknown_result_never_claims_completion ... ok
+test tui::tests::admission_notice_follows_exact_input_identity_across_shared_request_roots ... ok
+test tui::tests::saved_answer_draft_keeps_its_explicit_target_after_reload ... ok
+test tui::view::tests::strips_terminal_sequences_and_controls ... ok
+test tui::view::tests::stream_updates_retain_full_text_and_bounded_prompt_history ... ok
+test tui::view::tests::selected_message_positions_once_and_stream_updates_preserve_scroll ... ok
+test tui::view::tests::visual_line_navigation_keeps_wrapped_draft_and_inline_panel_visible ... ok
+test tui::view::tests::long_messages_expand_without_losing_original_text ... ok
+test tui::services::tests::export_reads_durable_conversation_and_escapes_script_markup ... ok
+test tests::resume_reports_the_new_input_that_preempted_an_older_call ... ok
+test tui::view::tests::renders_narrow_wide_and_modal_views_without_terminal_controls ... ok
+test tui::tests::older_pages_advance_through_internal_only_records ... ok
+test tui::services::tests::git_inspection_reports_untracked_paths_and_non_repositories ... ok
+test tui::view::tests::bounded_window_evicts_opposite_edge_and_retains_draft ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+
+
+running 9 tests
+test new_instruction_blocks_unstarted_write_proposals ... ok
+test two_jobs_deliver_to_exact_assignment_ids_before_waiter_continues ... ok
+test interrupted_write_survives_restart_and_requires_reconciliation ... ok
+test failed_request_does_not_turn_partial_usage_into_a_known_total ... ok
+test provider_failure_is_persisted_and_does_not_report_success ... ok
+test real_runtime_repairs_file_and_persists_owned_effects ... ok
+test handoff_moves_focus_and_followup_to_target_job ... ok
+test idle_job_accepts_followup_after_process_restart ... ok
+test alternating_ablation_records_all_local_trials_and_usage ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s
+
+
+running 4 tests
+test tools_text_describes_each_native_definition_even_with_unusable_data_path ... ok
+test tools_json_matches_native_runtime_definitions_without_configuration_or_session ... ok
+test configured_endpoint_uses_rig_native_environment_credentials ... ok
+test ordinary_read_only_run_executes_source_search_inside_a_persisted_job ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+running 2 tests
+test consolidated_delivery_leaves_prior_inputs_runnable_after_restart ... ok
+test explicit_resolution_survives_restart_and_preserves_independent_queued_input ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+
+running 6 tests
+test completed_natural_pause_is_not_consumed_again_after_continuation ... ok
+test killed_owner_cannot_reconcile_or_allow_competing_writes_until_its_shell_exits ... ok
+test exact_wait_handoff_and_late_instruction_preserve_native_protocol ... ok
+test twelve_turns_compact_repeatedly_and_resume_without_losing_original_constraints ... ok
+test archived_public_requirements_and_summary_are_readable_across_job_handoff ... ok
+test long_task_harness_keeps_model_quality_failures_and_raw_rounds ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.16s
+
+
+running 4 tests
+test default_source_pages_reach_work_model_before_summary_and_can_continue ... ok
+test old_consumed_history_can_be_summarized_without_covering_fresh_source_pages ... ok
+test oversized_parallel_read_results_keep_originals_and_allow_continuation ... ok
+test nine_default_source_pages_receive_bounded_work_previews_before_summary ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+
+
+running 6 tests
+test chat_prints_question_from_delegated_job ... ok
+test run_json_returns_child_question_id_and_explicit_reply_answers_it ... ok
+test plain_reply_chooses_latest_unanswered_question_and_leaves_the_other_open ... ok
+test child_question_surfaces_and_plain_reply_completes_its_native_call_and_parent_work ... ok
+test chat_deadline_retains_unknown_write_and_does_not_repeat_it_on_reopen ... ok
+test chat_deadline_pauses_a_model_call_and_preserves_resumable_input ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+
+running 6 tests
+test failure_without_parent_delivery_preserves_normal_resume ... ok
+test ended_parent_does_not_reactivate_failed_child_on_resume_or_restart ... ok
+test explicit_retry_does_not_survive_a_subsequent_stop_and_restart ... ok
+test real_followup_runs_before_retained_failed_assignment_and_does_not_revive_it ... ok
+test explicit_retry_can_make_new_delegation_after_ancestor_delivery_without_new_budget ... ok
+test unrelated_input_still_resumes_after_stop_and_restart ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s
+
+
+running 3 tests
+test src/lib.rs - (line 14) - compile fail ... ok
+test src/lib.rs - (line 10) - compile fail ... ok
+test src/lib.rs - (line 6) - compile fail ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+
+   Compiling bone v0.6.0 (/Users/zzhang/Documents/ChatGPT/BONE)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.61s
+     Running unittests src/lib.rs (target/debug/deps/bone-63ee5c68ed6db917)
+     Running unittests src/main.rs (target/debug/deps/bone-81a0dec4c2767104)
+     Running tests/acceptance.rs (target/debug/deps/acceptance-c0a4809431736d7b)
+     Running tests/engineering_cli.rs (target/debug/deps/engineering_cli-9b58f96a8d7222a0)
+     Running tests/input_lifecycle.rs (target/debug/deps/input_lifecycle-b1000cf5bdcb6a3d)
+     Running tests/long_session.rs (target/debug/deps/long_session-7b534425953df603)
+     Running tests/oversized_context.rs (target/debug/deps/oversized_context-5dbe388c8508f1bc)
+     Running tests/question_routing.rs (target/debug/deps/question_routing-94b45214cd5b1378)
+     Running tests/resume_lifecycle.rs (target/debug/deps/resume_lifecycle-8ea2f55f321b9315)
+   Doc-tests bone

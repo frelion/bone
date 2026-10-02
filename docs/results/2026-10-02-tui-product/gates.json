@@ -1,0 +1,135 @@
+{
+  "date": "2026-10-02",
+  "scope": "Source gates; authentication/provider credentials not used by fixtures",
+  "gates": [
+    {
+      "name": "rust-tests",
+      "command": [
+        "cargo",
+        "test",
+        "--locked"
+      ],
+      "status": "PASS",
+      "seconds": 14.853,
+      "exit_code": 0,
+      "results": [
+        "test result: ok. 104 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.48s",
+        "test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s",
+        "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s",
+        "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s",
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.16s",
+        "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s",
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s",
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s"
+      ]
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "status": "PASS",
+      "seconds": 1.071,
+      "exit_code": 0,
+      "results": []
+    },
+    {
+      "name": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "status": "PASS",
+      "seconds": 0.146,
+      "exit_code": 0,
+      "results": []
+    },
+    {
+      "name": "diff-whitespace",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "status": "PASS",
+      "seconds": 0.013,
+      "exit_code": 0,
+      "results": []
+    },
+    {
+      "name": "python-tests",
+      "command": [
+        "python3",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_*.py"
+      ],
+      "status": "PASS",
+      "seconds": 0.121,
+      "exit_code": 0,
+      "results": [
+        "Ran 8 tests in 0.077s"
+      ]
+    }
+  ],
+  "source_files_sha256": {
+    "Cargo.toml": "1b0005b9576ad8440e12370884240f6890d43bcfeee3943f39c3ba2bdb8f247c",
+    "Cargo.lock": "c506cecbd5835eed9ab70f441f5c5e27dfbf6243eb8cf2a5b665b12a4c00e049",
+    "src/config.rs": "5acbdce62fd9bd3e965d5d2ffd47de6594007bca19855e3baa5f97fe94289b98",
+    "src/context.rs": "8d8c2929396316acd9c590b311a93869ac33239b4202109f9e7a210dee2f2bf4",
+    "src/lib.rs": "a1d4c8dddcb79d38f63035657708604911ca205eef3f42b6039e0e383d86afba",
+    "src/main.rs": "f827938f619d3c90352e6ce005475bb46370b751fb261315be67735c9c635925",
+    "src/model.rs": "b7b2c0af9c55510582b35c64881862ff8f2b3ce6fc002bb7152856ed60c2f291",
+    "src/runtime.rs": "7cdbee7d983d5ff36f07dbb7a3bfb9447494f4b381a80961883bcc91e0899e89",
+    "src/state.rs": "3973f9b2302d3ceceb1e2ba6233e83135aa984907ffec516f33f8c700c26cab8",
+    "src/store.rs": "7d14449abc42199b359da87a1632c689987133b73bc01382e483c3f2c93b0c93",
+    "src/tools.rs": "2182ca8cc4bffb1eacdbf5f17a9eec68e1db1f253c951616dca3601b7d0a7077",
+    "src/tui/services.rs": "d1d938f67d3704ee7bae4e619aafa6f16ac885da45a6af853c9c8fd6b088d130",
+    "src/tui/view.rs": "516afce880efa06dd88569ef45fa14bc7e084bc6ccb0393664ed472d0ce56548",
+    "src/tui.rs": "60822ee457724c0aecf8c4b7db0cd2056c542e3c155296c11b4ba03a46c367ab",
+    "tests/acceptance.rs": "e235a8a144d3f9db85e70fa6357997d64f7de6a9e398d671de92941489203a08",
+    "tests/engineering_cli.rs": "e8e47a78fc1f21d2f8fa87aa066be37b5b18debf9445a33319165012be899632",
+    "tests/input_lifecycle.rs": "0abf90daab2fa3d8d108cedd3d64d7b8c87480beebfbbfde9789e17c3ce4297b",
+    "tests/internal/provider_contract.rs": "a301b28d83da4c4b75afc721cad9929898baa4a3d04b9c5ce16d1c355cf44844",
+    "tests/internal/runtime_safety.rs": "efdde364b39a8b6f61eb34d69a970737eddfd5628883db5fbada853d63ebad08",
+    "tests/long_session.rs": "3a4dcf4c807ef187cb1c49e6d18ba2dfc21b957921a20a9445df845a8a890517",
+    "tests/oversized_context.rs": "d1d10b18f33174cc53b7a379ae8805b583b697b622270a0f23b975a2077b1fb3",
+    "tests/question_routing.rs": "e7f171c88b3c2f9a16d92278ed81919e5f66fef8f9d941e7ed24e15960351c86",
+    "tests/resume_lifecycle.rs": "362dfb01778b471f1d0a54a6465092b84f75965b6ea757da3545bc1145ba7a26",
+    "tests/scripted_responses.py": "49efc6333272bf8150332ea3cd17c080cf04fbcea252c50aef3143357da271fd",
+    "tests/support/mod.rs": "8b68ffb4e80b459a4522d9f0f756c645f238882010230ce09528e48579e17aa0",
+    "tests/support/server.rs": "96cc873f9907be51b4b0f53d988bd08ead838ecffe1d34ab0f57848115dcf2e7",
+    "tests/test_ablate.py": "924d085f6441800ba8729d8d29357655e4877585435b41a89b343fe7e6a77be8",
+    "tests/test_export_trace.py": "04b78fa6f32b450bfcdc18590486e504edc3ea85eabedacb25823d5f7d422293",
+    "tests/test_tui_screen.py": "1f49974a35f3329599c12bf05f7b9e5837fb6da7a61db34e9f02e1898ce14585",
+    "tests/tui_pty.py": "65f207e1107339029dc838f5f79e590acdf56a05ea6b53bb29705013a8a95899",
+    "tests/unit/cli.rs": "54f3b11f80df8250754873452068a6ab8ec8f030e0e9ff1b4dc2a4e551614816",
+    "tests/unit/config.rs": "8bbe6e84706cad2cb25cb1302bb1b686e48fa8598911cb7dccea51da4ee0dbc1",
+    "tests/unit/context.rs": "eafc0f4561f0abe2986ae28632757020e7e5a140d722b9ea888f859b0ba1a129",
+    "tests/unit/model.rs": "53fed2229b6b34732db1db350226903c64f2549464f91ec4ddd12caf18bfd025",
+    "tests/unit/runtime.rs": "4f75118dfb2855e0ca5a63d457d04457f79b59346d0cc89b6bb85ce9c903c6db",
+    "tests/unit/state.rs": "048a7578dd9246991357d63a1ac07ec4e91026c979d04331cb6a584c1bc340f7",
+    "tests/unit/store.rs": "e0e34cdbce1445531498e86f0ed8954af64127ca1aed7ea9d02f8c2922035e2e",
+    "tests/unit/tools.rs": "2eaf76f2b7f3aa41f33defb4125d6d361b6546998d296544ce4c6fe6f35281b4",
+    "tests/unit/tools_engineering.rs": "66f7725e8b12145c463f3ce05c22ea7bf8fb8b4464ad22c650c25ce6292c25ee",
+    "tests/unit/tui.rs": "bb578f27ec44de43b7e031febfb6e6a1eba6821b0620072733ef6efa0e02257b",
+    "tests/unit/tui_services.rs": "dbae65bcf786a6eda223017830ac71b12d5315a6dd9120f51785de829024fc46",
+    "tests/unit/tui_view.rs": "2ef5bba6bb8ae963b6c94ae46288a551a3456eb2d6a49621c31931a6a351c6b6"
+  }
+}
