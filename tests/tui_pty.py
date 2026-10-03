@@ -765,17 +765,17 @@ def workspace_flow(f):
     f.send(b'\x1b[A\x01'+b'\x1b[C'*4)
     f.wait(lambda:any(d.get('draft')==draft and d.get('reply_to')==question['id'] for d in f.saved_drafts()),'specific question draft is saved')
     f.capture('Reply draft and its exact target before spatial focus changes')
-    f.send(b'\x1b[1;5D')
-    f.capture('Ctrl Left moves focus to session sidebar and hides editor caret')
+    f.send(b'\x1b[1;2D')
+    f.capture('Shift Left moves focus to session sidebar and hides editor caret')
     check('sidebar focus hides editor cursor',not f.cursor_visible)
-    f.send(b'\x1b[1;5C!')
+    f.send(b'\x1b[1;2C!')
     edited = '保留回复!草稿_A\nTARGET_CURSOR_A'
-    f.wait(lambda:any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()),'Ctrl Right restores original editor insertion point')
-    f.send(b'\x1b[1;5A')
-    f.capture('Ctrl Up reads conversation with draft intact')
+    f.wait(lambda:any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()),'Shift Right restores original editor insertion point')
+    f.send(b'\x1b[1;2A')
+    f.capture('Shift Up reads conversation with draft intact')
     check('conversation focus hides editing caret',not f.cursor_visible)
-    f.send(b'\x1b[1;5B')
-    f.capture('Ctrl Down restores editable reply draft')
+    f.send(b'\x1b[1;2B')
+    f.capture('Shift Down restores editable reply draft')
     check('input focus has visible hardware caret',f.cursor_visible)
     before = len(f.calls())
     menu('new')
@@ -784,20 +784,20 @@ def workspace_flow(f):
     f.observed_session = second
     check('session change saves and pauses the source',f.state(original)['paused'] and any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()))
     check('new session and focus actions do not call models',len(f.calls())==before)
-    f.send(b'\x1b[1;5B')
+    f.send(b'\x1b[1;2B')
     body('WORKSPACE_API_A','api_a','fixture')
-    # Left focus + End chooses the older source after the second session's
-    # actual delivery makes it the newest sidebar row.
+    # Current session is pinned first. In this two-session fixture, End
+    # chooses the other session regardless of which is most recently active.
     f.pump(.3)
-    f.send(b'\x1b[1;5D\x1b[F\r')
+    f.send(b'\x1b[1;2D\x1b[F\r')
     f.wait(lambda:'保留回复!草稿_A' in f.screen(),'sidebar opens the original session')
     f.observed_session = original
     f.capture('Sidebar switches back to paused source: reply target and multiline draft remain')
     check('reopened session retains its question target',any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()) and f.visible('回复 '+question['id'][:8]))
-    f.send(b'\x1b[1;5D\x1b[H\r')
+    f.send(b'\x1b[1;2D\x1b[F\r')
     f.wait(lambda:'API_A_ROUTE_CONFIRMED' in f.screen(),'sidebar returns to second session')
     f.observed_session = second
-    f.send(b'\x1b[1;5B')
+    f.send(b'\x1b[1;2B')
     f.send('FORM_DRAFT_PRESERVED')
     f.wait(lambda:any(d.get('draft')=='FORM_DRAFT_PRESERVED' for d in f.saved_drafts()),'form parent draft saved')
     original_config = (f.data/'config.toml').read_bytes()
@@ -855,16 +855,16 @@ def workspace_flow(f):
     original_size = (f.rows,f.cols)
     f.resize(10,26)
     f.pump(.25)
-    f.send(b'\x1b[1;5D')
+    f.send(b'\x1b[1;2D')
     f.capture('Extreme narrow session popover uses the same session focus')
     f.send(b'\x1b')
     f.pump(.12)
-    f.send(b'\x1b[1;5B')
+    f.send(b'\x1b[1;2B')
     f.resize(*original_size)
     f.pump(.3)
     f.screen()
     check('narrow session popover returns to editing focus',f.cursor_visible)
-    check('narrow session popover preserves configured model and draft',any(d.get('draft')=='NARROW_PARENT_DRAFT' for d in f.saved_drafts()) and (f.data/'config.toml').read_bytes()==saved and '[1;5B' not in f.screen())
+    check('narrow session popover preserves configured model and draft',any(d.get('draft')=='NARROW_PARENT_DRAFT' for d in f.saved_drafts()) and (f.data/'config.toml').read_bytes()==saved and '[1;2B' not in f.screen())
     menu('model')
     f.wait(lambda:f.visible('模型名称'),'model modal opens from preserved draft')
     f.resize(10,26)
@@ -883,6 +883,156 @@ def workspace_flow(f):
     complete_vt = before_restart_vt + bytes(f.output)
     check('secrets never reach VT output, input history or durable events',all(secret not in complete_vt.decode('utf-8',errors='replace') and secret not in json.dumps(f.events()) and not any(secret in json.dumps(d) for d in f.saved_drafts()) for secret in secrets))
     f.capture('Completed local connection/session workflow, parent draft preserved')
+    f.quit()
+
+
+def sidebar_flow(f):
+    """Real key/mouse routing over authored history and one loopback delivery."""
+    f.acceptance_checks = []
+    def check(name, passed, observed=None):
+        f.acceptance_checks.append({'name':name,'passed':bool(passed),'observed':observed})
+        assert passed, name
+    def sidebar_lines():
+        f.screen()
+        width = 30 if f.cols >= 100 else 26
+        return [''.join(row[:width]) for row in f.terminal_cells]
+    def locate(title):
+        lines = sidebar_lines()
+        return next((row for row,line in enumerate(lines) if title in line),None)
+    def click(row):
+        # SGR mouse uses one-based terminal coordinates. Click the text area,
+        # avoiding the title/status separator and any scrollbar hit region.
+        f.send(f'\x1b[<0;6;{row+1}M\x1b[<0;6;{row+1}m')
+    def verify_session(session):
+        # Verify the application's actual runtime ID through its local status
+        # reader; sidebar titles themselves cannot prove routing correctness.
+        f.send(b'\x1b[1;2B\x01\x0b')
+        f.send('/status\r')
+        f.wait(lambda:f.visible('Session: '+session),'runtime opens exact session '+session)
+        f.send(b'\x1b')
+        f.pump(.12)
+    original = f.state()['id']
+    f.observed_session = original
+    now = int(time.time()*1000)
+    seeded = {}
+    with closing(sqlite3.connect(f.data/'sessions.sqlite3')) as connection:
+        template = f.state(original)
+        for index in range(32,0,-1):
+            session, job, event = (str(uuid.uuid4()) for _ in range(3))
+            title = f'授权模块 · 收紧中文路径权限与历史配置，保留相同开头以检查辨识 · 任务{index:02}'
+            snapshot = copy.deepcopy(template)
+            snapshot.update(id=session,focus=job,revision=1,pending_inputs=[],paused=False,budgets={},unknown_writes={},jobs={job:{
+                'id':job,'title':'Conversation','state':'Idle','inbox':[],
+                'active_input':None,'history':[event],'summary':None,'wait_for':[],
+                'current_call':None,'public_revision':1}})
+            user = {'id':event,'session_id':session,'job_id':job,'call_id':None,
+                'reply_to':None,'root_input':event,'kind':'input','revision':1,
+                'data':{'source':'user','message':{'role':'user','content':[{'type':'text','text':title}]}},
+                'timestamp':str(now-index*60000)}
+            metadata = copy.deepcopy(user)
+            metadata['data'].pop('message')
+            connection.execute('INSERT INTO sessions(id,revision,snapshot) VALUES(?,?,?)',(session,1,json.dumps(snapshot)))
+            connection.execute('INSERT INTO events(id,session_id,revision,payload,job_id,metadata) VALUES(?,?,?,?,?,?)',
+                (event,session,1,json.dumps(user),job,json.dumps(metadata)))
+            seeded[index] = session
+        connection.commit()
+    # Refresh once through the compatibility reader, then leave it before any
+    # content editing. No model call or private host credential is involved.
+    f.send('/sessions\r')
+    f.wait(lambda:f.visible('授权模块'),'authored conversation index is loaded')
+    f.send(b'\x1b')
+    f.pump(.12)
+    draft = '中文 e\u0301👩‍💻草稿'
+    f.send(draft)
+    f.send(b'\x1b[1;6D\x1b[1;6D\x19')
+    f.wait(lambda:f.clipboard.exists() and f.clipboard.read_text()=='草稿','Ctrl Shift arrows create copyable Chinese selection')
+    f.capture('Native Chinese selection: Ctrl Shift arrows copy the selected text')
+    f.send(b'\x1b[1;2D')
+    f.wait(lambda:bool(f.screen()) and not f.cursor_visible,'Shift Left enters sidebar')
+    f.capture('Shift Left: current session and browsed candidates are separate')
+    f.clipboard.unlink()
+    f.send(b'\x1b[1;2C\x19')
+    f.wait(lambda:f.clipboard.exists() and f.clipboard.read_text()=='草稿' and bool(f.screen()) and f.cursor_visible,'Shift Right restores editor focus and copyable selection')
+    check('focus round trip preserves original selection',f.clipboard.read_text()=='草稿')
+    f.send(b'\x1b[1;2A')
+    f.wait(lambda:bool(f.screen()) and not f.cursor_visible,'Shift Up enters conversation')
+    f.send(b'\x1b[1;2B')
+    f.wait(lambda:bool(f.screen()) and f.cursor_visible,'Shift Down restores input')
+    f.wait(lambda:any(d.get('draft')==draft for d in f.saved_drafts()),'focus navigation preserves saved draft')
+    check('focus and selection do not submit model work',not f.calls() and len(f.events(original))==0)
+    f.send(b'\x01\x0b/')
+    f.wait(lambda:f.visible('/new') and f.visible('/model'),'inline slash candidates open')
+    f.send(b'\x1b[1;2D')
+    f.wait(lambda:bool(f.screen()) and not f.cursor_visible,'Shift Left closes inline completion and enters sidebar')
+    check('inline slash layer closes when focus moves',not f.visible('/connect') and not f.calls() and len(f.events(original))==0)
+    f.capture('Slash suggestions close on Shift Left without executing or changing the draft')
+    f.send(b'\x1b[1;2C\x01\x0b')
+    f.send('授权模块 · SIDEBAR_REFRESH 验证后台交付不会改变会话选择 · 任务00\r')
+    f.wait(lambda:len(f.calls())==1,'single scripted background response is in flight')
+    retained = '原会话未发送草稿'
+    f.send(retained)
+    f.wait(lambda:any(d.get('draft')==retained for d in f.saved_drafts()),'source draft is durable before session browsing')
+    f.send(b'\x1b[1;2D')
+    f.wait(lambda:locate('任务00') is not None,'current input title joins the sidebar index')
+    f.send(b'\x1b[H\x1b[B')
+    f.pump(.15)
+    f.capture('Candidate 01 remains distinct from current 00 while a real response is pending')
+    check('current identity survives long-title truncation',any('当前' in line for line in sidebar_lines()))
+    candidate_row, current_row = locate('任务01'), locate('任务00')
+    selected_rows = {run['row'] for run in f.cell_styles if 'reverse' in run['attributes']}
+    check('candidate highlight is separate from current identity',candidate_row in selected_rows and current_row not in selected_rows,
+        {'candidate_row':candidate_row,'current_row':current_row,'reverse_rows':sorted(selected_rows)})
+    check('sidebar does not display revision as a turn count',not any(re.search(r'\d+\s*轮',line) for line in sidebar_lines()))
+    f.wait(lambda:any(e['kind']=='delivery' for e in f.events(original)),'real model completion triggers asynchronous sidebar refresh')
+    f.pump(.35)
+    f.capture('Background delivery refresh preserves the browsed candidate')
+    f.send('\r')
+    f.wait(lambda:f.state(original)['paused'],'source session is paused by explicit switch')
+    verify_session(seeded[1])
+    f.observed_session = seeded[1]
+    check('background refresh preserves candidate runtime identity',len(f.calls())==1)
+    check('source draft is retained after opening candidate',any(d.get('draft')==retained for d in f.saved_drafts()))
+    f.send(b'\x1b[1;2D\x1b[F')
+    f.wait(lambda:locate('任务32') is not None,'End reaches off-screen session 32')
+    check('session list scroll reaches beyond one viewport',locate('任务01') is None and locate('任务32') is not None)
+    f.capture('A full session list scrolls to its oldest rows; common-prefix long titles retain distinct identifying suffixes')
+    f.send(b'\x1b[H')
+    f.wait(lambda:locate('任务02') is not None,'Home restores visible candidate 02')
+    row = locate('任务02')
+    click(row)
+    verify_session(seeded[2])
+    f.observed_session = seeded[2]
+    check('clicking a title opens its real session and pauses the previous one',f.state(seeded[1])['paused'] and len(f.calls())==1)
+    f.capture('Single click on title opens exact session 02')
+    f.send(b'\x1b[1;2D\x1b[H')
+    f.wait(lambda:locate('任务03') is not None,'candidate 03 is visible')
+    row = locate('任务03')
+    click(row+1)
+    verify_session(seeded[3])
+    f.observed_session = seeded[3]
+    check('clicking metadata opens its real session and pauses the previous one',f.state(seeded[2])['paused'] and len(f.calls())==1)
+    f.capture('Single click on metadata opens exact session 03')
+    f.send('窄屏草稿保持')
+    f.wait(lambda:any(d.get('draft')=='窄屏草稿保持' for d in f.saved_drafts()),'narrow-screen parent draft saved')
+    original_size = (f.rows,f.cols)
+    f.resize(24,42)
+    f.pump(.2)
+    check('narrow layout hides sidebar until requested',not any('会话' in line for line in f.screen().splitlines()[:2]))
+    f.send(b'\x1b[1;2D')
+    f.wait(lambda:f.visible('任务03') and not f.cursor_visible,'Shift Left explicitly opens narrow sidebar')
+    f.capture('42-column terminal opens the same session sidebar explicitly')
+    f.resize(*original_size)
+    f.pump(.2)
+    f.resize(24,42)
+    f.pump(.2)
+    f.send(b'\x1b')
+    f.pump(.12)
+    f.send('!')
+    f.wait(lambda:any(d.get('draft')=='窄屏草稿保持!' for d in f.saved_drafts()),'resize round trip returns to original insertion cursor')
+    check('narrow sidebar and resizing leave runtime and model count unchanged',len(f.calls())==1 and len(f.session_states())==33)
+    f.resize(*original_size)
+    f.pump(.2)
+    f.capture('Escape after resizing restores the original editing draft without submission')
     f.quit()
 
 
@@ -1142,7 +1292,7 @@ def live_shell(f):
     f.send(b'\x1b')
     f.pump(.2)
     assert 'Preserve this follow-up draft' in f.screen(), 'audit return lost editor draft'
-    f.send(b'\x1b[1;2D\x1b[1;2D')  # Shift+Left selects editor text before global stop.
+    f.send(b'\x1b[1;6D\x1b[1;6D')  # Ctrl+Shift+Left selects editor text before global stop.
     f.send(b'\x19')
     f.wait(lambda: f.clipboard.exists() and f.clipboard.read_text() == 'ft', 'Ctrl+Y proves the real editor selection exists before stopping')
     f.send(b'\x03')
@@ -1434,7 +1584,7 @@ def exit_resume(f):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/bone')
-    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','reconcile-reply','feedback-flow','workspace-flow'])
+    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','reconcile-reply','feedback-flow','workspace-flow','sidebar-flow'])
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument('--size', default='80x24', choices=['80x24', '120x40'], help='real terminal columns x rows')
     parser.add_argument('--keep-going', action='store_true', help='record every selected scenario, then fail if any failed')
@@ -1442,6 +1592,7 @@ def main():
     args = parser.parse_args()
     verify_vt_replay()
     cases = [
+        ('sidebar-flow', [{'contains':['SIDEBAR_REFRESH'],'delay_seconds':4,'text':'SIDEBAR_BACKGROUND_DELIVERED'}],sidebar_flow),
         ('workspace-flow', {'api_a':[
             {'match_job_title':'Conversation','contains':['WORKSPACE_SESSION_A'],'output':[tool('job_send',{'title':'NOT_A_SESSION_JOB','message':'Prove jobs are not sessions.'})]},
             {'match_job_title':'Conversation','output':[tool('ask_user',{'question':'WORKSPACE_REPLY_QUESTION: choose a format.'})]},

@@ -24,6 +24,10 @@ pub struct UiSaved {
     pub history: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<(usize, usize)>,
 }
 fn session_path(data: &Path, session: &str) -> Result<PathBuf> {
     ensure!(

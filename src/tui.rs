@@ -264,6 +264,8 @@ impl App {
                     self.ui.set_history(saved.history.clone());
                 }
                 self.ui.paste(&saved.draft);
+                self.ui
+                    .restore_input_position(saved.cursor, saved.selection);
                 self.reply_target = saved.reply_to.clone();
                 self.last_saved = saved;
                 if !self.ui.draft().is_empty() {
@@ -307,6 +309,7 @@ impl App {
         Ok(())
     }
     fn save(&mut self, engine: &Engine, data: &Path) -> Result<()> {
+        let (cursor, selection) = self.ui.input_position();
         let saved = services::UiSaved {
             draft: self
                 .ui
@@ -314,10 +317,14 @@ impl App {
                 .unwrap_or_else(|| self.ui.draft()),
             history: self.ui.history(),
             reply_to: self.reply_target.clone(),
+            cursor: Some(cursor),
+            selection,
         };
         if saved.draft != self.last_saved.draft
             || saved.history != self.last_saved.history
             || saved.reply_to != self.last_saved.reply_to
+            || saved.cursor != self.last_saved.cursor
+            || saved.selection != self.last_saved.selection
         {
             services::save(data, &engine.state().id, &saved)?;
             self.last_saved = saved;
@@ -743,11 +750,12 @@ impl App {
     }
     fn refresh_sessions(&mut self, engine: &Engine, data: &Path) {
         abort_task(&mut self.session_index);
-        self.ui.select_session(&engine.state().id);
+        self.ui.mark_active_session(&engine.state().id);
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
         self.ui.sessions_loading = true;
+        self.ui.sessions_error = None;
         let data = data.to_owned();
         let workspace = engine.state().workspace.clone();
         let current = engine.state().id.clone();
@@ -1151,6 +1159,7 @@ impl App {
             return Ok(());
         }
         let sidebar = self.ui.focus == Focus::Sessions;
+        let return_focus = self.ui.main_focus;
         self.save(engine, data)?;
         pause(engine, &mut self.ui)?;
         self.clear_preview();
@@ -1165,11 +1174,15 @@ impl App {
         *engine = next;
         self.drafts.clear();
         self.load(engine, data)?;
+        self.ui.select_session(&engine.state().id);
         if sidebar {
             self.ui.focus = Focus::Sessions;
+            self.ui.main_focus = return_focus;
         }
-        self.ui.notice = if id.is_some() {
-            "会话已打开；未完成工作保持暂停，Ctrl+R 继续"
+        self.ui.notice = if id.is_some() && engine.state().paused {
+            "会话已打开 · 已暂停，Ctrl+R 继续"
+        } else if id.is_some() {
+            "会话已打开"
         } else {
             "新会话已创建；直接描述任务"
         }
@@ -1712,7 +1725,7 @@ impl App {
                         picker.items = items;
                     }
                 }
-                Err(error) => self.ui.notice = format!("读取会话失败：{error:#}"),
+                Err(_) => self.ui.sessions_error = Some("会话读取失败 · 已有列表保留".into()),
             }
         }
         if let Some(result) = finished_task(&mut self.file_index).await {
@@ -2096,85 +2109,154 @@ fn file_items(files: &[String]) -> Vec<PickerItem> {
         .collect()
 }
 fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<PickerItem>> {
+    // This is a read-only UI projection, like latest_delivery in services.
+    // Reuse one connection: refreshing a list must not rerun Store migrations.
+    let connection = rusqlite::Connection::open_with_flags(
+        data.join("sessions.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    let mut catalog = connection.prepare(
+        "SELECT snapshot FROM sessions
+         WHERE json_extract(snapshot, '$.workspace') = ?1
+         ORDER BY (id = ?2) DESC,
+           COALESCE((SELECT MAX(sequence) FROM events WHERE session_id = sessions.id), 0) DESC,
+           rowid DESC LIMIT 200",
+    )?;
+    let snapshots = catalog.query_map(
+        rusqlite::params![
+            workspace.to_str().context("workspace path is not UTF-8")?,
+            current
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut inputs = connection.prepare(
+        "SELECT payload FROM events WHERE session_id = ?1
+         AND json_extract(payload, '$.kind') = 'input'
+         AND json_extract(payload, '$.data.source') = 'user' ORDER BY sequence",
+    )?;
+    let mut facts = connection.prepare(
+        "SELECT COALESCE(metadata, payload) FROM events WHERE session_id = ?1
+         AND json_extract(COALESCE(metadata, payload), '$.kind') IN ('question','tool_result')
+         ORDER BY sequence",
+    )?;
+    let mut latest = connection.prepare(
+        "SELECT COALESCE(metadata, payload) FROM events WHERE session_id = ?1
+         ORDER BY sequence DESC LIMIT 1",
+    )?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
     let mut items = Vec::new();
-    for session in bone::sessions(data)?
-        .into_iter()
-        .filter(|s| s.workspace == workspace)
-        .take(200)
-    {
-        let last = bone::history_before(data, &session.id, None, 1)?;
-        let mut cursor = None;
-        let title = loop {
-            // Before the first user input, there can be saved stop/config
-            // records. Do not mistake those for the conversation's title.
-            let page = bone::history_page(data, &session.id, cursor.as_deref(), 1)?;
-            if let Some(event) = page
-                .events
-                .first()
-                .filter(|e| e.kind == "input" && e.data["source"] == "user")
-            {
-                break Some(native_text(&event.data["message"]));
+    for snapshot in snapshots {
+        let session: bone::state::SessionState = serde_json::from_str(&snapshot?)?;
+        let mut title = None;
+        for payload in inputs.query_map([&session.id], |row| row.get::<_, String>(0))? {
+            let event: Event = serde_json::from_str(&payload?)?;
+            let text = native_text(&event.data["message"]);
+            if let Some(line) = text.lines().map(str::trim).find(|line| !line.is_empty()) {
+                // Keep both ends of exceptionally long input, without model work.
+                let chars: Vec<char> = line.chars().collect();
+                title = Some(if chars.len() > 160 {
+                    chars[..120].iter().collect::<String>()
+                        + "…"
+                        + &chars[chars.len() - 39..].iter().collect::<String>()
+                } else {
+                    line.to_owned()
+                });
+                break;
             }
-            if !page.has_more {
-                break None;
-            }
-            cursor = page.next_cursor;
-        };
-        let title = title
-            .map(|text| {
-                text.lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(80)
-                    .collect::<String>()
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "新对话".into());
-        let stamp = last
-            .events
-            .last()
-            .and_then(|e| e.timestamp.parse::<u64>().ok())
-            .unwrap_or(0);
-        items.push((
-            stamp,
-            PickerItem {
-                label: format!(
-                    "{title}{}",
-                    if session.id == current {
-                        " · 当前"
-                    } else {
-                        ""
-                    }
-                ),
-                detail: format!(
-                    "{} 轮 · {}",
-                    session.revision,
-                    if session.paused {
-                        "已暂停"
-                    } else if session
-                        .jobs
-                        .values()
-                        .any(|job| matches!(job.state, JobState::Ready | JobState::Running))
-                    {
-                        "进行中"
-                    } else if session
-                        .jobs
-                        .values()
-                        .any(|job| job.state == JobState::Waiting)
-                    {
-                        "等待中"
-                    } else {
-                        "已保存"
-                    }
-                ),
-                value: session.id,
-            },
-        ));
+        }
+        let events = facts
+            .query_map([&session.id], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str::<Event>(&row?)?))
+            .collect::<Result<Vec<_>>>()?;
+        let last = latest
+            .query_map([&session.id], |row| row.get::<_, String>(0))?
+            .next()
+            .transpose()?
+            .map(|payload| serde_json::from_str::<Event>(&payload))
+            .transpose()?;
+        let status = session_status(&session, &events);
+        let time = last
+            .as_ref()
+            .and_then(|event| event.timestamp.parse().ok())
+            .and_then(|stamp| relative_activity_time(stamp, now));
+        let detail = [(!status.is_empty()).then(|| status.to_owned()), time]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        items.push(PickerItem {
+            label: title.unwrap_or_else(|| "新会话".into()),
+            detail,
+            value: session.id,
+        });
     }
-    items.sort_by_key(|(stamp, _)| std::cmp::Reverse(*stamp));
-    Ok(items.into_iter().map(|(_, item)| item).collect())
+    Ok(items)
 }
+fn session_status(session: &bone::state::SessionState, events: &[Event]) -> &'static str {
+    let answered = events
+        .iter()
+        .filter(|event| event.kind == "tool_result")
+        .filter_map(|event| event.data["tool_key"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let has_question = events.iter().any(|question| {
+        question.kind == "question"
+            && question
+                .job_id
+                .as_ref()
+                .and_then(|id| session.jobs.get(id))
+                .is_some_and(|job| job.state != JobState::Closed)
+            && question.data["tool_key"]
+                .as_str()
+                .is_some_and(|key| !answered.contains(key))
+    });
+    if !session.unknown_writes.is_empty() {
+        if session.paused {
+            "待核查 · 已暂停"
+        } else {
+            "待核查"
+        }
+    } else if has_question {
+        if session.paused {
+            "待回复 · 已暂停"
+        } else {
+            "待回复"
+        }
+    } else if session.paused {
+        "已暂停"
+    } else if !session.pending_inputs.is_empty()
+        || session
+            .jobs
+            .values()
+            .any(|job| matches!(job.state, JobState::Ready | JobState::Running))
+    {
+        "进行中"
+    } else if session
+        .jobs
+        .values()
+        .any(|job| job.state == JobState::Waiting)
+    {
+        "等待中"
+    } else {
+        ""
+    }
+}
+fn relative_activity_time(stamp: u64, now: u64) -> Option<String> {
+    let age = now.checked_sub(stamp)? / 1_000;
+    Some(if age < 60 {
+        "刚刚".into()
+    } else if age < 3_600 {
+        format!("{}分前", age / 60)
+    } else if age < 86_400 {
+        format!("{}小时前", age / 3_600)
+    } else {
+        format!("{}天前", age / 86_400)
+    })
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -2455,12 +2537,23 @@ async fn event_loop(
                             },
                             _ => app.ui.handle_key(key),
                         }
+                        if key.code == KeyCode::Left && key.modifiers == KeyModifiers::SHIFT
+                            && app.ui.focus == Focus::Sessions && !app.ui.has_modal() && !app.ui.show_activity {
+                            app.refresh_sessions(engine, data);
+                        }
                         app.refresh_search(engine, data);
                         if let Err(error) = app.refresh_completion(engine, data) { app.ui.notice = format!("补全失败：{error:#}"); }
                         app.changed_at = Some(Instant::now()); dirty = true;
                     },
                     TerminalEvent::Paste(text) => { app.ui.handle_paste(&text); app.refresh_search(engine, data); app.refresh_completion(engine, data)?; app.changed_at = Some(Instant::now()); dirty = true; },
-                    TerminalEvent::Mouse(mouse) => { app.ui.handle_mouse(mouse); dirty = true; },
+                    TerminalEvent::Mouse(mouse) => {
+                        if let Some(id) = app.ui.clicked_session(mouse) {
+                            if let Err(error) = app.switch_session(engine, data, Some(&id)) {
+                                app.ui.notice = format!("会话未切换：{error:#}");
+                            }
+                        } else { app.ui.handle_mouse(mouse); }
+                        dirty = true;
+                    },
                     TerminalEvent::Resize(..) => dirty = true,
                     _ => {},
                 }

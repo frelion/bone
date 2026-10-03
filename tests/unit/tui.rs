@@ -119,7 +119,7 @@ fn model_form_conflict_preserves_connection_parent_draft_and_external_config() {
     app.ui.paste("original parent draft\nsecond line");
     app.ui.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Left,
-        KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
     ));
     let cursor = app.ui.cursor();
     let selection = app.ui.selected_input_text();
@@ -257,7 +257,7 @@ fn sidebar_session_switch_during_reconciliation_keeps_note_target_and_original_d
     app.ui.paste("original answer draft\noriginal second line");
     app.ui.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Left,
-        KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
     ));
     let cursor = app.ui.cursor();
     let selection = app.ui.selected_input_text();
@@ -431,7 +431,7 @@ fn temporary_reconciliation_cancel_and_save_preserve_original_draft_and_target()
     ));
     app.ui.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Right,
-        KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
     ));
     let cursor = app.ui.cursor();
     let selection = app.ui.selected_input_text();
@@ -461,7 +461,7 @@ fn explicit_target_switch_owns_separate_message_and_question_drafts() {
     app.ui.paste("original message draft");
     app.ui.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Left,
-        KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
     ));
     let cursor = app.ui.cursor();
     let selection = app.ui.selected_input_text();
@@ -488,7 +488,7 @@ fn pause_with_input_selection_keeps_draft_and_always_pauses_engine() {
     app.ui.paste("preserve selected draft");
     app.ui.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Left,
-        KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
     ));
     let selection = app.ui.selected_input_text();
     pause(&mut engine, &mut app.ui).unwrap();
@@ -662,7 +662,7 @@ fn latest_history_reload_preserves_all_target_drafts_and_rejects_active_reconcil
     app.ui.paste("original request\nsecond line");
     app.ui.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Left,
-        KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
     ));
     let message_cursor = app.ui.cursor();
     let message_selection = app.ui.selected_input_text();
@@ -674,7 +674,7 @@ fn latest_history_reload_preserves_all_target_drafts_and_rejects_active_reconcil
     ));
     app.ui.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Right,
-        KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
     ));
     let answer_cursor = app.ui.cursor();
     let answer_selection = app.ui.selected_input_text();
@@ -968,4 +968,214 @@ async fn a_quiet_real_shell_animates_and_waiting_for_a_reply_does_not() {
     assert!(app.ui.live_status.starts_with("等待回复"));
     assert!(!app.ui.busy);
     assert_eq!(app.ui.spinner_tick, 0);
+}
+
+#[test]
+fn session_titles_skip_blank_lines_and_catalog_keeps_an_old_current_session() {
+    let (dir, mut engine, _app) = local_app();
+    let data = dir.path().join("data");
+    let workspace = engine.state().workspace.clone();
+    let connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    for _ in 0..205 {
+        let state = bone::state::SessionState::new(&workspace);
+        connection
+            .execute(
+                "INSERT INTO sessions(id,revision,snapshot) VALUES(?1,0,?2)",
+                rusqlite::params![state.id, serde_json::to_string(&state).unwrap()],
+            )
+            .unwrap();
+    }
+    connection.execute_batch("COMMIT").unwrap();
+    let items = session_items(&data, &workspace, &engine.state().id).unwrap();
+    assert_eq!(items.len(), 200);
+    assert_eq!(items[0].value, engine.state().id);
+    assert_eq!(items[0].label, "新会话");
+    assert!(
+        items[0].detail.is_empty(),
+        "unknown activity time must be omitted"
+    );
+    engine
+        .post_message("\n  \n  中文标题保留真实内容  \n第二段")
+        .unwrap();
+    let items = session_items(&data, &workspace, &engine.state().id).unwrap();
+    assert_eq!(items[0].label, "中文标题保留真实内容");
+    assert!(items[0].detail.contains("进行中"));
+    assert!(!items[0].detail.contains("轮"));
+    assert!(!items[0].label.contains("当前"));
+}
+
+#[test]
+fn sidebar_metadata_uses_real_attention_and_pause_facts_without_inventing_rounds() {
+    let mut state = bone::state::SessionState::new("workspace");
+    let mut job = bone::state::Job::new("dependency wait");
+    job.state = JobState::Waiting;
+    let id = job.id.clone();
+    state.jobs.insert(id.clone(), job);
+    assert_eq!(session_status(&state, &[]), "等待中");
+    let mut question = Event::new(
+        &state.id,
+        "question",
+        serde_json::json!({"tool_key":"question-key"}),
+    );
+    question.job_id = Some(id.clone());
+    assert_eq!(session_status(&state, &[question.clone()]), "待回复");
+    state.paused = true;
+    assert_eq!(
+        session_status(&state, &[question.clone()]),
+        "待回复 · 已暂停"
+    );
+    let answered = Event::new(
+        &state.id,
+        "tool_result",
+        serde_json::json!({"tool_key":"question-key"}),
+    );
+    assert_eq!(
+        session_status(&state, &[question.clone(), answered]),
+        "已暂停"
+    );
+    state.unknown_writes.insert(
+        "write".into(),
+        bone::state::UnknownWrite {
+            call_id: "write".into(),
+            job_id: id.clone(),
+            root_input: None,
+            tool_name: "shell".into(),
+        },
+    );
+    assert_eq!(
+        session_status(&state, &[question.clone()]),
+        "待核查 · 已暂停"
+    );
+    state.unknown_writes.clear();
+    state.jobs.get_mut(&id).unwrap().state = JobState::Closed;
+    assert_eq!(session_status(&state, &[question]), "已暂停");
+    state.jobs.get_mut(&id).unwrap().state = JobState::Running;
+    assert_eq!(session_status(&state, &[]), "已暂停");
+    assert_eq!(relative_activity_time(1_000, 60_999), Some("刚刚".into()));
+    assert_eq!(relative_activity_time(1_000, 301_000), Some("5分前".into()));
+    assert_eq!(
+        relative_activity_time(1_000, 7_201_000),
+        Some("2小时前".into())
+    );
+    assert_eq!(
+        relative_activity_time(1_000, 259_201_000),
+        Some("3天前".into())
+    );
+    assert!(relative_activity_time(100, 99).is_none());
+}
+
+#[tokio::test]
+async fn automatic_sidebar_refresh_preserves_the_browsed_session_instead_of_selecting_current() {
+    let (dir, mut engine, mut app) = local_app();
+    let data = dir.path().join("data");
+    let other = Engine::open(
+        &data,
+        &engine.state().workspace,
+        None,
+        app.settings.profile.clone(),
+        "test".into(),
+        Default::default(),
+    )
+    .unwrap();
+    app.ui
+        .set_sessions(session_items(&data, &engine.state().workspace, &engine.state().id).unwrap());
+    app.ui.select_session(&engine.state().id);
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::SHIFT,
+    ));
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Down,
+        KeyModifiers::NONE,
+    ));
+    let selected = app.ui.selected_session().unwrap().to_owned();
+    assert_eq!(selected, other.state().id);
+    engine
+        .post_message("Background event updates current activity")
+        .unwrap();
+    app.refresh_sessions(&engine, &data);
+    assert_eq!(app.ui.selected_session(), Some(selected.as_str()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.session_index.is_some() {
+            app.tasks(&mut engine, &data).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.ui.selected_session(), Some(selected.as_str()));
+    assert_eq!(app.ui.focus, Focus::Sessions);
+    drop(other);
+    app.switch_session(&mut engine, &data, Some(&selected))
+        .unwrap();
+    assert!(!engine.state().paused);
+    assert!(!app.ui.notice.contains("Ctrl+R"));
+    assert!(
+        engine
+            .events()
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event.kind.as_str(), "model_started" | "tool_started"))
+    );
+}
+
+#[test]
+fn switching_sessions_and_reopening_restores_the_exact_multiline_input_position() {
+    let (dir, mut engine, mut app) = local_app();
+    let data = dir.path().join("data");
+    let original = engine.state().id.clone();
+    app.ui.paste("第一行 👩‍💻\n第二行 é 末尾");
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    let position = app.ui.input_position();
+    let text = app.ui.draft();
+    let selection = app.ui.selected_input_text();
+    assert!(selection.is_some());
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Up,
+        KeyModifiers::SHIFT,
+    ));
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::SHIFT,
+    ));
+    app.switch_session(&mut engine, &data, None).unwrap();
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Right,
+        KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.ui.focus, Focus::Conversation);
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::SHIFT,
+    ));
+    app.switch_session(&mut engine, &data, Some(&original))
+        .unwrap();
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Right,
+        KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.ui.focus, Focus::Conversation);
+    assert_eq!(app.ui.draft(), text);
+    assert_eq!(app.ui.input_position(), position);
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Down,
+        KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.ui.selected_input_text(), selection);
+    app.save(&engine, &data).unwrap();
+    let mut reopened = App::new(Settings {
+        profile_name: "test".into(),
+        profile: app.settings.profile.clone(),
+    });
+    reopened.load(&mut engine, &data).unwrap();
+    assert_eq!(reopened.ui.input_position(), position);
+    assert_eq!(reopened.ui.selected_input_text(), selection);
 }

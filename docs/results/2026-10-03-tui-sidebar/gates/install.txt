@@ -1,0 +1,6 @@
+  Installing bone v0.8.1 (/Users/zzhang/Documents/ChatGPT/BONE)
+    Updating crates.io index
+   Compiling bone v0.8.1 (/Users/zzhang/Documents/ChatGPT/BONE)
+    Finished `release` profile [optimized] target(s) in 6.15s
+   Replacing /Users/zzhang/.cargo/bin/bone
+    Replaced package `bone v0.8.1 (/Users/zzhang/Documents/ChatGPT/BONE)` with `bone v0.8.1 (/Users/zzhang/Documents/ChatGPT/BONE)` (executable `bone`)

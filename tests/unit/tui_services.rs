@@ -7,9 +7,16 @@ fn drafts_roundtrip_and_reject_corruption_and_paths() {
         draft: "中文 draft".into(),
         history: vec!["one".into()],
         reply_to: Some("question-id".into()),
+        cursor: Some(3),
+        selection: Some((0, 3)),
     };
     save(dir.path(), "session", &saved).unwrap();
     assert_eq!(load(dir.path(), "session").unwrap().history, saved.history);
+    assert_eq!(load(dir.path(), "session").unwrap().cursor, saved.cursor);
+    assert_eq!(
+        load(dir.path(), "session").unwrap().selection,
+        saved.selection
+    );
     assert_eq!(
         load(dir.path(), "session").unwrap().reply_to,
         saved.reply_to
@@ -37,6 +44,7 @@ fn drafts_roundtrip_and_reject_corruption_and_paths() {
                 draft: "a".repeat(DRAFT_LIMIT + 1),
                 history: vec![],
                 reply_to: None,
+                ..Default::default()
             }
         )
         .is_err()

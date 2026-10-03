@@ -1,0 +1,80 @@
+{
+  "status": "PASS",
+  "complete": true,
+  "results": [
+    {
+      "name": "format",
+      "command": [
+        "cargo",
+        "fmt"
+      ],
+      "exit_code": 0,
+      "seconds": 0.17
+    },
+    {
+      "name": "format-check",
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 0.18
+    },
+    {
+      "name": "rust-tests",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--quiet"
+      ],
+      "exit_code": 0,
+      "seconds": 15.93,
+      "passed_tests": 235
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 1.19
+    },
+    {
+      "name": "python-tests",
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_*.py"
+      ],
+      "exit_code": 0,
+      "seconds": 0.11
+    },
+    {
+      "name": "install",
+      "command": [
+        "cargo",
+        "install",
+        "--path",
+        ".",
+        "--locked",
+        "--force"
+      ],
+      "exit_code": 0,
+      "seconds": 6.18
+    }
+  ]
+}

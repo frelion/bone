@@ -141,9 +141,12 @@ pub(super) struct View {
     form: Option<Form>,
     pub sessions: Vec<PickerItem>,
     pub sessions_loading: bool,
-    session_selected: usize,
+    pub sessions_error: Option<String>,
+    session_selected: Option<usize>,
+    session_top: usize,
+    session_list_area: Rect,
     active_session: Option<String>,
-    main_focus: Focus,
+    pub main_focus: Focus,
     sidebar_width: u16,
     history: Vec<String>,
     history_index: Option<usize>,
@@ -200,7 +203,10 @@ impl View {
             form: None,
             sessions: Vec::new(),
             sessions_loading: false,
-            session_selected: 0,
+            sessions_error: None,
+            session_selected: None,
+            session_top: 0,
+            session_list_area: Rect::default(),
             active_session: None,
             main_focus: Focus::Input,
             sidebar_width: 0,
@@ -403,23 +409,56 @@ impl View {
         let selected = self.selected_session().map(str::to_owned);
         self.sessions = sessions;
         self.session_selected = selected
-            .or_else(|| self.active_session.clone())
             .and_then(|value| self.sessions.iter().position(|item| item.value == value))
-            .unwrap_or(
+            .or_else(|| {
                 self.session_selected
-                    .min(self.sessions.len().saturating_sub(1)),
-            );
+                    .map(|index| index.min(self.sessions.len().saturating_sub(1)))
+                    .filter(|_| !self.sessions.is_empty())
+            })
+            .or_else(|| {
+                self.active_session
+                    .as_ref()
+                    .and_then(|value| self.sessions.iter().position(|item| &item.value == value))
+            })
+            .or_else(|| (!self.sessions.is_empty()).then_some(0));
     }
     pub fn select_session(&mut self, value: &str) {
-        self.active_session = Some(value.to_owned());
         if let Some(index) = self.sessions.iter().position(|item| item.value == value) {
-            self.session_selected = index;
+            self.session_selected = Some(index);
+        }
+    }
+    pub fn mark_active_session(&mut self, value: &str) {
+        self.active_session = Some(value.to_owned());
+        if self.session_selected.is_none() {
+            self.select_session(value);
         }
     }
     pub fn selected_session(&self) -> Option<&str> {
         self.sessions
-            .get(self.session_selected)
+            .get(self.session_selected?)
             .map(|item| item.value.as_str())
+    }
+    pub fn clicked_session(&mut self, event: MouseEvent) -> Option<String> {
+        if !matches!(
+            event.kind,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        ) || self.has_modal()
+            || self.show_activity
+            || !self
+                .session_list_area
+                .contains((event.column, event.row).into())
+        {
+            return None;
+        }
+        let index = self.session_top + usize::from((event.row - self.session_list_area.y) / 2);
+        let value = self.sessions.get(index)?.value.clone();
+        self.close_completion();
+        if self.focus != Focus::Sessions {
+            self.main_focus = self.focus;
+        }
+        self.focus = Focus::Sessions;
+        self.session_selected = Some(index);
+        Some(value)
     }
     pub fn open_form(&mut self, title: impl Into<String>, fields: Vec<FormField>) {
         if fields.is_empty() {
@@ -491,17 +530,54 @@ impl View {
     }
     pub fn cursor(&self) -> usize {
         let ratatui_textarea::DataCursor(row, col) = self.editor.cursor();
-        self.editor
-            .lines()
-            .iter()
-            .take(row)
-            .map(|s| s.len() + 1)
-            .sum::<usize>()
-            + self.editor.lines()[row]
-                .chars()
-                .take(col)
-                .map(char::len_utf8)
-                .sum::<usize>()
+        editor_byte_offset(&self.editor, row, col)
+    }
+    pub fn input_position(&self) -> (usize, Option<(usize, usize)>) {
+        let editor = self
+            .temporary_draft
+            .as_ref()
+            .map_or(&self.editor, |saved| &saved.draft.editor);
+        let ratatui_textarea::DataCursor(row, col) = editor.cursor();
+        let selection = editor.selection_range().and_then(|((a, b), (c, d))| {
+            let start = editor_byte_offset(editor, a, b);
+            let end = editor_byte_offset(editor, c, d);
+            (start != end).then_some((start, end))
+        });
+        (editor_byte_offset(editor, row, col), selection)
+    }
+    pub fn restore_input_position(
+        &mut self,
+        cursor: Option<usize>,
+        selection: Option<(usize, usize)>,
+    ) {
+        let draft = self.draft();
+        let requested = cursor.unwrap_or_else(|| self.cursor());
+        let safe = if requested >= draft.len() {
+            draft.len()
+        } else {
+            draft
+                .grapheme_indices(true)
+                .map(|(offset, _)| offset)
+                .take_while(|&offset| offset <= requested)
+                .last()
+                .unwrap_or(0)
+        };
+        let boundary = |offset| {
+            offset == draft.len() || draft.grapheme_indices(true).any(|(byte, _)| byte == offset)
+        };
+        self.editor.cancel_selection();
+        if let Some((start, end)) = selection
+            && start < end
+            && end <= draft.len()
+            && boundary(start)
+            && boundary(end)
+            && requested == safe
+            && (safe == start || safe == end)
+        {
+            self.move_to_byte(if safe == start { end } else { start });
+            self.editor.start_selection();
+        }
+        self.move_to_byte(safe);
     }
     fn move_to_byte(&mut self, offset: usize) {
         let draft = self.draft();
@@ -911,15 +987,14 @@ impl View {
             return;
         }
         if event.column < self.sidebar_width || self.focus == Focus::Sessions {
-            match event.kind {
-                MouseEventKind::ScrollUp => {
-                    self.session_selected = self.session_selected.saturating_sub(3)
+            if let Some(selected) = self.session_selected.as_mut() {
+                match event.kind {
+                    MouseEventKind::ScrollUp => *selected = selected.saturating_sub(3),
+                    MouseEventKind::ScrollDown => {
+                        *selected = (*selected + 3).min(self.sessions.len().saturating_sub(1))
+                    }
+                    _ => {}
                 }
-                MouseEventKind::ScrollDown => {
-                    self.session_selected =
-                        (self.session_selected + 3).min(self.sessions.len().saturating_sub(1))
-                }
-                _ => {}
             }
             return;
         }
@@ -993,7 +1068,7 @@ impl View {
                 self.notice = "搜索输入最多 4 KiB；此次粘贴未接受".into();
             }
         } else if self.focus == Focus::Sessions {
-            self.notice = "Ctrl+→ 返回输入，再粘贴到草稿".into();
+            self.notice = "返回输入区后再粘贴 · Shift↓".into();
         } else if self.show_activity {
             self.notice = "先按 Esc 或 F6 返回编辑，再粘贴到草稿".into();
         } else if self.show_help || self.detail.is_some() {
@@ -1052,7 +1127,8 @@ impl View {
                     };
                     form.editor_size = None;
                 }
-                KeyCode::Enter | KeyCode::Up | KeyCode::Down => {}
+                KeyCode::Enter => {}
+                KeyCode::Up | KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {}
                 KeyCode::Char('j' | 'm') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
                 KeyCode::Char(c)
                     if !key
@@ -1078,14 +1154,15 @@ impl View {
         }
         if let Some(p) = self.picker.as_mut().filter(|p| {
             !p.inline
-                || matches!(
-                    key.code,
-                    KeyCode::Esc
-                        | KeyCode::Up
-                        | KeyCode::Down
-                        | KeyCode::PageUp
-                        | KeyCode::PageDown
-                )
+                || (key.modifiers != KeyModifiers::SHIFT
+                    && matches!(
+                        key.code,
+                        KeyCode::Esc
+                            | KeyCode::Up
+                            | KeyCode::Down
+                            | KeyCode::PageUp
+                            | KeyCode::PageDown
+                    ))
         }) {
             match key.code {
                 KeyCode::Esc => {
@@ -1132,7 +1209,7 @@ impl View {
             scroll_key(key.code, &mut self.detail_scroll, self.detail_max, 10);
             return;
         }
-        if key.modifiers == KeyModifiers::CONTROL {
+        if key.modifiers == KeyModifiers::SHIFT && !self.show_activity {
             let target = match key.code {
                 KeyCode::Left => Some(Focus::Sessions),
                 KeyCode::Right => Some(if self.focus == Focus::Sessions {
@@ -1146,9 +1223,6 @@ impl View {
             };
             if let Some(target) = target {
                 self.close_completion();
-                if self.show_activity && target != Focus::Activity {
-                    self.close_layer();
-                }
                 if target == Focus::Sessions && self.focus != Focus::Sessions {
                     self.main_focus = if self.focus == Focus::Conversation {
                         Focus::Conversation
@@ -1195,6 +1269,13 @@ impl View {
         }
         match self.focus {
             Focus::Input => {
+                let key = if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                    && matches!(key.code, KeyCode::Up | KeyCode::Down)
+                {
+                    KeyEvent::new(key.code, KeyModifiers::SHIFT)
+                } else {
+                    key
+                };
                 match key.code {
                     KeyCode::Left | KeyCode::Right if key.modifiers == KeyModifiers::ALT => {
                         self.editor.cancel_selection();
@@ -1226,7 +1307,7 @@ impl View {
                     }
                     KeyCode::Left | KeyCode::Right | KeyCode::Backspace | KeyCode::Delete
                         if key.modifiers.is_empty()
-                            || (key.modifiers == KeyModifiers::SHIFT
+                            || (key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
                                 && matches!(key.code, KeyCode::Left | KeyCode::Right)) =>
                     {
                         // textarea uses character columns. Keep deletion/navigation atomic for emoji and combining clusters.
@@ -1343,12 +1424,14 @@ impl View {
                 );
             }
             Focus::Sessions => {
-                scroll_key(
-                    key.code,
-                    &mut self.session_selected,
-                    self.sessions.len().saturating_sub(1),
-                    8,
-                );
+                if let Some(selected) = self.session_selected.as_mut() {
+                    scroll_key(
+                        key.code,
+                        selected,
+                        self.sessions.len().saturating_sub(1),
+                        usize::from(self.session_list_area.height / 2).max(1),
+                    );
+                }
             }
         }
     }
@@ -1361,11 +1444,13 @@ impl View {
         status: &str,
     ) {
         let area = frame.area();
+        self.session_list_area = Rect::default();
         frame.render_widget(
             Block::default().style(Style::default().bg(BACKGROUND).fg(TEXT)),
             area,
         );
         if area.width < 8 || area.height < 10 {
+            self.sidebar_width = 0;
             frame.render_widget(
                 Paragraph::new("请扩大终端窗口").style(Style::default().fg(ACCENT)),
                 area,
@@ -1373,7 +1458,11 @@ impl View {
             return;
         }
         let window = area;
-        self.sidebar_width = if window.width >= 64 { 22 } else { 0 };
+        self.sidebar_width = if window.width >= 80 {
+            (window.width / 4).clamp(26, 32)
+        } else {
+            0
+        };
         let area = if self.sidebar_width > 0 {
             self.render_sessions(
                 frame,
@@ -1612,7 +1701,7 @@ impl View {
         } else if self.has_modal() {
             " 草稿保留 · Esc 返回上一层 ".to_owned()
         } else {
-            " 草稿只读 · Ctrl↓ 编辑 ".to_owned()
+            " 草稿只读 · Shift↓ 编辑 ".to_owned()
         };
         if draft_rows > 1 {
             input_title.push_str(&format!("· 多行 {draft_rows} "));
@@ -1646,15 +1735,15 @@ impl View {
         } else if self.show_activity {
             "审计：↑↓ 选择 · Enter 原文 · Esc 返回"
         } else if self.focus == Focus::Sessions {
-            "会话：↑↓ 选择 · Enter 打开 · Ctrl→ 返回"
+            "↑↓ 选择 · Enter 打开 · Shift→ 返回"
         } else if self.focus == Focus::Input {
             if self.reply_label.starts_with("回复") {
-                "Enter 回答 · Ctrl+P 新要求 · Ctrl← 会话"
+                "Enter 回答 · Ctrl+P 新要求 · Shift← 会话"
             } else {
-                "Enter 发送 · Ctrl↑ 阅读 · Ctrl← 会话"
+                "Enter 发送 · Shift↑ 阅读 · Shift← 会话"
             }
         } else {
-            "↑↓ 选择 · d 原文 · Ctrl↓ 输入 · Ctrl← 会话"
+            "↑↓ 选择 · d 原文 · Shift↓ 输入 · Shift← 会话"
         };
         let position = if self.show_activity {
             format!(
@@ -1677,7 +1766,7 @@ impl View {
         {
             position
         } else if !self.has_modal() && self.focus == Focus::Input && self.unread > 0 {
-            format!("{} 次新内容更新 · Ctrl↑ 阅读 · Enter 发送", self.unread)
+            format!("{} 次新内容更新 · Shift↑ 阅读 · Enter 发送", self.unread)
         } else {
             keys.to_owned()
         };
@@ -1759,7 +1848,7 @@ impl View {
                 inner,
             );
         } else if self.show_help {
-            let help = "直接输入任务，Enter 发送。\nCtrl+← 会话，Ctrl+→ 返回；Ctrl+↑ 正文，Ctrl+↓ 输入。\nShift+Enter / Alt+Enter / Ctrl+J 换行；粘贴多行保持在输入框。\n↑↓ 移动光标；Alt+↑↓ 召回历史；Alt+←→ 移动单词。\nCtrl+A/E 行首尾；Ctrl+K 删除至行尾；Ctrl+W 删除单词。\nShift+方向键选区；Ctrl+Y复制选区或当前原文。\nCtrl+Z 撤销 / Alt+Z 重做；Ctrl+F 搜索对话。\nCtrl+P 操作菜单；Ctrl+O / @文件 Tab 引用；Ctrl+G 外部编辑器。\nF6 切换输入与阅读；Tab 只插入补全或编辑。Esc 返回上一层。\n对话：↑↓ / j k 选择消息；Enter 展开折叠；d 原文；y 复制。\nPageUp / PageDown 滚动，Home / End 到首尾。\n交付保留完整段落；工具默认摘要，Enter 展开。\n窗口最多256条/8MiB，单条128KiB预览。\n展开预览；d 原文 / y 复制完整记录；Ctrl+F 搜索持久历史。\n活动展示最近 400 条：上下选择，Enter 浏览原生事件详情。\nF2 打开审计；Esc 返回原阅读位置。\nCtrl+C 暂停；Ctrl+Y 复制选区或原文；Ctrl+R 恢复；Ctrl+Q 退出。\n\nF1 或 Esc 关闭帮助。";
+            let help = "直接输入任务，Enter 发送。\nShift+← 会话，Shift+→ 返回；Shift+↑ 正文，Shift+↓ 输入。\nShift+Enter / Alt+Enter / Ctrl+J 换行；粘贴多行保持在输入框。\n↑↓ 移动光标；Alt+↑↓ 召回历史；Alt+←→ 移动单词。\nCtrl+A/E 行首尾；Ctrl+K 删除至行尾；Ctrl+W 删除单词。\n输入区 Ctrl+Shift+方向键选区；表单 Shift+方向键选区。\nCtrl+Y复制选区或当前原文。\nCtrl+Z 撤销 / Alt+Z 重做；Ctrl+F 搜索对话。\nCtrl+P 操作菜单；Ctrl+O / @文件 Tab 引用；Ctrl+G 外部编辑器。\nF6 切换输入与阅读；Tab 只插入补全或编辑。Esc 返回上一层。\n对话：↑↓ / j k 选择消息；Enter 展开折叠；d 原文；y 复制。\nPageUp / PageDown 滚动，Home / End 到首尾。\n交付保留完整段落；工具默认摘要，Enter 展开。\n窗口最多256条/8MiB，单条128KiB预览。\n展开预览；d 原文 / y 复制完整记录；Ctrl+F 搜索持久历史。\n活动展示最近 400 条：上下选择，Enter 浏览原生事件详情。\nF2 打开审计；Esc 返回原阅读位置。\nCtrl+C 暂停；Ctrl+Y 复制选区或原文；Ctrl+R 恢复；Ctrl+Q 退出。\n\nF1 或 Esc 关闭帮助。";
             let commands = super::COMMANDS
                 .iter()
                 .map(|(name, _)| *name)
@@ -1826,99 +1915,115 @@ impl View {
         );
         let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
         frame.render_widget(
-            Paragraph::new(if focused { "› 会话" } else { "  会话" })
-                .style(Style::default().add_modifier(Modifier::BOLD)),
+            Paragraph::new("  会话").style(Style::default().add_modifier(Modifier::BOLD)),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
-        self.session_selected = self
-            .session_selected
-            .min(self.sessions.len().saturating_sub(1));
-        let list_height = inner.height.saturating_sub(5) as usize;
-        let top = self
-            .session_selected
-            .saturating_sub(list_height.saturating_sub(1));
-        let rows = if self.sessions.is_empty() {
-            vec![Line::styled(
-                if self.sessions_loading {
-                    "  读取中…"
-                } else {
-                    "  暂无会话"
-                },
-                Style::default().fg(MUTED),
-            )]
-        } else {
-            self.sessions
-                .iter()
-                .enumerate()
-                .skip(top)
-                .take(list_height)
-                .map(|(index, item)| {
-                    let selected = index == self.session_selected;
-                    let active = self.active_session.as_deref() == Some(item.value.as_str());
-                    let mut style = Style::default();
-                    if active {
-                        style = style.add_modifier(Modifier::UNDERLINED);
-                    }
-                    if selected && focused {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    Line::styled(
-                        format!(
-                            "{}{}",
-                            if selected && focused { "› " } else { "  " },
-                            fit_line(
-                                &Self::sanitize(&item.label),
-                                inner.width.saturating_sub(2) as usize
-                            )
-                        ),
-                        style,
-                    )
-                })
-                .collect()
-        };
-        frame.render_widget(
-            Paragraph::new(rows),
-            Rect::new(inner.x, inner.y + 2, inner.width, list_height as u16),
-        );
-        let detail = if self.sessions_loading {
-            "读取中…".to_owned()
-        } else {
-            self.sessions
-                .get(self.session_selected)
-                .map(|item| Self::sanitize(&item.detail).replace('\n', " "))
-                .unwrap_or_default()
-        };
-        let footer = vec![
-            Line::styled(
-                format!(
-                    "  {}",
-                    fit_line(&detail, inner.width.saturating_sub(2) as usize)
-                ),
-                Style::default().fg(MUTED),
-            ),
-            Line::from(if focused {
-                "  Enter 打开"
+        let status = self
+            .sessions_error
+            .as_deref()
+            .unwrap_or(if self.sessions_loading {
+                "读取中…"
             } else {
-                "  Ctrl← 会话"
-            }),
-            Line::styled(
-                if focused {
-                    "  Ctrl→ 返回"
-                } else {
-                    "  Ctrl+P 操作"
-                },
-                Style::default().fg(MUTED),
-            ),
-        ];
+                ""
+            });
         frame.render_widget(
-            Paragraph::new(footer),
-            Rect::new(
-                inner.x,
-                inner.bottom().saturating_sub(3),
-                inner.width,
-                3.min(inner.height),
-            ),
+            Paragraph::new(fit_line(
+                &format!("  {}", Self::sanitize(status).replace('\n', " ")),
+                inner.width as usize,
+            ))
+            .style(Style::default().fg(if self.sessions_error.is_some() {
+                Color::Red
+            } else {
+                MUTED
+            })),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
         );
+        let narrow_navigation = focused && self.sidebar_width == 0;
+        let footer_height = if narrow_navigation { 2 } else { 1 };
+        let capacity = usize::from(inner.height.saturating_sub(2 + footer_height) / 2).max(1);
+        self.session_list_area =
+            Rect::new(inner.x, inner.y + 2, inner.width, (capacity * 2) as u16);
+        if let Some(selected) = self.session_selected {
+            if selected < self.session_top {
+                self.session_top = selected;
+            } else if selected >= self.session_top + capacity {
+                self.session_top = selected + 1 - capacity;
+            }
+        }
+        self.session_top = self
+            .session_top
+            .min(self.sessions.len().saturating_sub(capacity));
+        let width = usize::from(inner.width);
+        let text_width = width.saturating_sub(2);
+        let mut rows = Vec::new();
+        for (index, item) in self
+            .sessions
+            .iter()
+            .enumerate()
+            .skip(self.session_top)
+            .take(capacity)
+        {
+            let selected = self.session_selected == Some(index) && focused;
+            let active = self.active_session.as_deref() == Some(item.value.as_str());
+            let title_style = Style::default().add_modifier(if selected {
+                Modifier::REVERSED | Modifier::BOLD
+            } else if active {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+            let title = format!(
+                "{}{}",
+                if selected { "› " } else { "  " },
+                middle_fit_line(&Self::sanitize(&item.label).replace('\n', " "), text_width),
+            );
+            let detail = Self::sanitize(&item.detail).replace('\n', " ");
+            let detail = if active && detail.is_empty() {
+                "当前".to_owned()
+            } else if active {
+                format!("当前 · {detail}")
+            } else {
+                detail
+            };
+            let metadata = format!("  {}", fit_line(&detail, text_width));
+            let padded = |text: String| {
+                let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+                format!("{text}{}", " ".repeat(padding))
+            };
+            rows.push(Line::styled(padded(title), title_style));
+            rows.push(Line::styled(
+                padded(metadata),
+                if selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+            ));
+        }
+        if rows.is_empty() && !self.sessions_loading && self.sessions_error.is_none() {
+            rows.push(Line::styled("  暂无会话", Style::default().fg(MUTED)));
+        }
+        frame.render_widget(Paragraph::new(rows), self.session_list_area);
+        if narrow_navigation {
+            let navigation = vec![
+                Line::from(fit_line("  ↑↓ 选择 · Enter 打开", width)),
+                Line::from(fit_line("  Shift→ 返回", width)),
+            ];
+            frame.render_widget(
+                Paragraph::new(navigation).style(Style::default().fg(MUTED)),
+                Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 2),
+            );
+        } else if self.sessions.len() > capacity {
+            let position = format!(
+                "  {} / {}",
+                self.session_selected.map_or(0, |index| index + 1),
+                self.sessions.len(),
+            );
+            frame.render_widget(
+                Paragraph::new(fit_line(&position, width)).style(Style::default().fg(MUTED)),
+                Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+            );
+        }
     }
 
     fn render_form(&mut self, frame: &mut Frame, area: Rect) {
@@ -2195,6 +2300,19 @@ fn new_editor() -> TextArea<'static> {
     editor.set_placeholder_style(Style::default().fg(MUTED));
     editor
 }
+fn editor_byte_offset(editor: &TextArea<'_>, row: usize, col: usize) -> usize {
+    editor
+        .lines()
+        .iter()
+        .take(row)
+        .map(|line| line.len() + 1)
+        .sum::<usize>()
+        + editor.lines()[row]
+            .chars()
+            .take(col)
+            .map(char::len_utf8)
+            .sum::<usize>()
+}
 fn picker_title(kind: PickerKind) -> &'static str {
     match kind {
         PickerKind::Command => "命令",
@@ -2399,6 +2517,38 @@ fn fit_line(text: &str, width: usize) -> String {
         result.push('…');
     }
     result
+}
+
+fn middle_fit_line(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width < 3 {
+        return fit_line(text, width);
+    }
+    let tail_budget = 6.min((width - 1) / 2);
+    let mut tail = String::new();
+    let mut tail_width = 0;
+    for grapheme in text.graphemes(true).rev() {
+        let size = UnicodeWidthStr::width(grapheme);
+        if tail_width + size > tail_budget {
+            break;
+        }
+        tail.insert_str(0, grapheme);
+        tail_width += size;
+    }
+    let head_budget = width - 1 - tail_width;
+    let mut head = String::new();
+    let mut head_width = 0;
+    for grapheme in text.graphemes(true) {
+        let size = UnicodeWidthStr::width(grapheme);
+        if head_width + size > head_budget {
+            break;
+        }
+        head.push_str(grapheme);
+        head_width += size;
+    }
+    format!("{head}…{tail}")
 }
 
 // Map displayed rows back to source bytes, skipping Markdown syntax that is not rendered.

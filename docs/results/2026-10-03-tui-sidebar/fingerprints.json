@@ -1,0 +1,123 @@
+{
+  "artifact_stage": "Final installed 0.8.1 PTY acceptance",
+  "binary": "/Users/zzhang/.cargo/bin/bone",
+  "binary_sha256": "08cff694ec56f70a1948dd960c88201581a1e4c8506ff9cbf27ec1824801ecc3",
+  "source_fingerprint": "cf225635b4e10b6f22367ae0cb6da8d31fa7ba25a5511024b0d7502b0e50d300",
+  "source_fingerprint_algorithm": "Sort Cargo.toml, Cargo.lock, src/**/*.rs by relative.as_posix; append relative path + NUL + bytes + NUL to SHA256",
+  "harness_sha256": "52bdd9b62b9f3df14d02c015399d306d125d07d32ca3454863298765f27bedb4",
+  "all_start_end_fingerprints_match": true,
+  "all_cases_pass": true,
+  "results": [
+    {
+      "path": "pty/120x40/sidebar-flow/sidebar-flow.json",
+      "scenario": "sidebar-flow",
+      "size": [
+        40,
+        120
+      ],
+      "no_color": true,
+      "status": "PASS",
+      "checks": 13,
+      "frames": 12,
+      "idle_receipts": [
+        {
+          "step": "Single click on title opens exact session 02",
+          "paused": false,
+          "resume_hint_absent": true
+        },
+        {
+          "step": "Single click on metadata opens exact session 03",
+          "paused": false,
+          "resume_hint_absent": true
+        }
+      ]
+    },
+    {
+      "path": "pty/120x40/workspace-flow/workspace-flow.json",
+      "scenario": "workspace-flow",
+      "size": [
+        40,
+        120
+      ],
+      "no_color": true,
+      "status": "PASS",
+      "checks": 24,
+      "frames": 18,
+      "idle_receipts": []
+    },
+    {
+      "path": "pty/80x24/sidebar-flow/sidebar-flow.json",
+      "scenario": "sidebar-flow",
+      "size": [
+        24,
+        80
+      ],
+      "no_color": true,
+      "status": "PASS",
+      "checks": 13,
+      "frames": 12,
+      "idle_receipts": [
+        {
+          "step": "Single click on title opens exact session 02",
+          "paused": false,
+          "resume_hint_absent": true
+        },
+        {
+          "step": "Single click on metadata opens exact session 03",
+          "paused": false,
+          "resume_hint_absent": true
+        }
+      ]
+    },
+    {
+      "path": "pty/80x24/workspace-flow/workspace-flow.json",
+      "scenario": "workspace-flow",
+      "size": [
+        24,
+        80
+      ],
+      "no_color": true,
+      "status": "PASS",
+      "checks": 24,
+      "frames": 18,
+      "idle_receipts": []
+    },
+    {
+      "path": "pty/color80x24/sidebar-flow/sidebar-flow.json",
+      "scenario": "sidebar-flow",
+      "size": [
+        24,
+        80
+      ],
+      "no_color": false,
+      "status": "PASS",
+      "checks": 13,
+      "frames": 12,
+      "idle_receipts": [
+        {
+          "step": "Single click on title opens exact session 02",
+          "paused": false,
+          "resume_hint_absent": true
+        },
+        {
+          "step": "Single click on metadata opens exact session 03",
+          "paused": false,
+          "resume_hint_absent": true
+        }
+      ]
+    },
+    {
+      "path": "pty/color80x24/workspace-flow/workspace-flow.json",
+      "scenario": "workspace-flow",
+      "size": [
+        24,
+        80
+      ],
+      "no_color": false,
+      "status": "PASS",
+      "checks": 24,
+      "frames": 18,
+      "idle_receipts": []
+    }
+  ]
+}

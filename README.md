@@ -29,7 +29,7 @@ bone --version
 bone providers
 ```
 
-安装后的版本应为 `bone 0.8.0`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
+安装后的版本应为 `bone 0.8.1`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
 
 `target/release/bone` 是构建目录内的文件，只有在包含它的 checkout 中才能通过相对路径运行。安装后的 `bone` 可在任意项目目录中使用。
 
@@ -127,14 +127,16 @@ TUI 左侧切换会话，右侧显示对话、Markdown 答复和工具行动；�
 
 默认正文不显示“你 / Agent”标题，原话以细竖线区分。输入框显示编辑焦点和真实终端光标。运行行固定显示实际动作、耗时与活动标记；输入回执独立显示，后台仍在执行时不会被较早的交付覆盖。
 
-本轮会话栏、连接管理与终端证据见 [0.8.0 工作区交互](docs/results/2026-10-03-tui-workspace/README.md)；此前反馈修复见 [0.7.1](docs/results/2026-10-02-tui-feedback/README.md)。
+0.8.1 使用 Shift+方向键切换焦点，左栏按标题与状态/时间两行呈现，后台刷新保持浏览选择；文本选区使用 Ctrl+Shift+方向键。
+
+本轮左栏实际终端证据见 [0.8.1](docs/results/2026-10-03-tui-sidebar/overview.html)；此前会话栏、连接管理与终端证据见 [0.8.0 工作区交互](docs/results/2026-10-03-tui-workspace/README.md)；此前反馈修复见 [0.7.1](docs/results/2026-10-02-tui-feedback/README.md)。
 
 | 操作 | 按键 / 命令 |
 | --- | --- |
 | 发送 / 换行 | Enter / Shift+Enter、Alt+Enter、Ctrl+J |
 | 命令面板 / 文件引用 | Ctrl+P / `@文件` 后 Tab，或 Ctrl+O |
 | 输入历史 / 编辑 / 撤销 | Alt+↑↓；Ctrl+A/E/K/W；Ctrl+Z / Alt+Z |
-| 会话 / 原主焦点 / 正文 / 输入 | Ctrl+← / Ctrl+→ / Ctrl+↑ / Ctrl+↓ |
+| 会话 / 原主焦点 / 正文 / 输入 | Shift+← / Shift+→ / Shift+↑ / Shift+↓ |
 | 外部编辑器 | Ctrl+G，使用 VISUAL / EDITOR，返回草稿后 Enter 才发送 |
 | 搜索对话 / 完整结果 / 审计 | Ctrl+F / 正文 d / 详情 D；F2 查看活动 |
 | 暂停 / 恢复 / 退出 | Ctrl+C / Ctrl+R / Ctrl+Q |

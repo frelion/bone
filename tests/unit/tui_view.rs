@@ -387,8 +387,14 @@ fn inline_completion_preserves_typing_and_selection_paste_undo() {
     assert!(!view.is_completion());
     view.take_draft();
     view.paste("中文\nhello");
-    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
-    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    view.handle_key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    view.handle_key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
     assert_eq!(view.selected_input_text().as_deref(), Some("lo"));
     use ratatui::{Terminal, backend::TestBackend};
     let state = bone::state::SessionState::new("/tmp/work");
@@ -452,9 +458,15 @@ fn conversation_navigation_and_tool_logs_are_readable() {
 fn emoji_selection_and_completion_replacement_follow_grapheme_boundaries() {
     let mut view = View::new();
     view.paste("中👩‍💻e\u{301}");
-    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    view.handle_key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
     assert_eq!(view.selected_input_text().as_deref(), Some("e\u{301}"));
-    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    view.handle_key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
     assert_eq!(view.selected_input_text().as_deref(), Some("👩‍💻e\u{301}"));
     view.handle_paste("文");
     assert_eq!(view.draft(), "中文");
@@ -573,7 +585,10 @@ fn bounded_window_evicts_opposite_edge_and_retains_draft() {
 fn persisted_history_results_are_not_filtered_by_snippet_and_modal_hides_selection() {
     let mut view = View::new();
     view.paste("draft");
-    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    view.handle_key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
     assert_eq!(view.selected_input_text().as_deref(), Some("t"));
     view.open_picker(
         PickerKind::History,
@@ -637,7 +652,10 @@ fn narrow_conversation_focus_selects_latest_and_tool_status_is_explicit() {
 fn reading_layers_return_to_parent_and_preserve_draft_selection_and_undo() {
     let mut view = View::new();
     view.paste("original👩‍💻");
-    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    view.handle_key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
     let cursor = view.cursor();
     let selection = view.selected_input_text();
     view.open_detail("结果", "result");
@@ -666,7 +684,10 @@ fn temporary_reconciliation_draft_restores_reader_and_original_editor() {
     let mut view = View::new();
     view.paste("草稿👩‍💻");
     view.reply_label = "回答 Q1".into();
-    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    view.handle_key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
     let cursor = view.cursor();
     view.open_detail("旧结果", "captured result");
     view.detail_scroll = 13;
@@ -893,7 +914,15 @@ fn audit_detail_resize_retains_raw_line_and_esc_returns_original_reading() {
     terminal
         .draw(|f| view.render(f, &state, "m", "idle"))
         .unwrap();
-    view.detail_scroll = 264; // Two wrapped rows per original line at this width.
+    let text = &view.detail.as_ref().unwrap().1;
+    let rows = wrap(text, view.detail_width)
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    view.detail_scroll = source_offsets(text, &rows)
+        .iter()
+        .position(|offset| text[*offset..].starts_with("line132_"))
+        .unwrap();
     terminal
         .draw(|f| view.render(f, &state, "m", "idle"))
         .unwrap();
@@ -1034,22 +1063,22 @@ fn overlay_borders_survive_terminal_diff_over_chinese_background() {
         terminal
             .draw(|frame| view.render(frame, &state, "m", "idle"))
             .unwrap();
-        // The old inset edge cut the trailing column of 过 (80) or 期 (120).
-        assert_eq!(terminal.backend().buffer()[(23, 3)].symbol(), "修");
+        let sidebar = (width / 4).clamp(26, 32);
+        assert_eq!(terminal.backend().buffer()[(sidebar + 1, 3)].symbol(), "修");
         view.open_detail("结果", "captured result");
         terminal
             .draw(|frame| view.render(frame, &state, "m", "idle"))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let top = (0..height)
-            .find(|&row| buffer[(22, row)].symbol() == "┌")
+            .find(|&row| buffer[(sidebar, row)].symbol() == "┌")
             .expect("overlay top corner is drawn");
         let bottom = (top + 1..height)
-            .find(|&row| buffer[(22, row)].symbol() == "└")
+            .find(|&row| buffer[(sidebar, row)].symbol() == "└")
             .expect("overlay bottom corner is drawn");
         assert_eq!(buffer[(width - 1, top)].symbol(), "┐");
         for row in top + 1..bottom {
-            assert_eq!(buffer[(22, row)].symbol(), "│");
+            assert_eq!(buffer[(sidebar, row)].symbol(), "│");
             assert_eq!(buffer[(width - 1, row)].symbol(), "│");
         }
     }
@@ -1100,6 +1129,7 @@ fn composer_keeps_chinese_first_character_and_native_cursor_through_wrap_and_foc
     use ratatui::{Terminal, backend::TestBackend};
     let state = bone::state::SessionState::new("/tmp/work");
     for (width, height) in [(80, 24), (120, 40)] {
+        let input_x = (width / 4).clamp(26, 32) + 1;
         let mut view = View::new();
         view.paste("首字中文");
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -1108,8 +1138,11 @@ fn composer_keeps_chinese_first_character_and_native_cursor_through_wrap_and_foc
             .unwrap();
         assert!(terminal.backend().cursor_visible());
         let position = terminal.backend().cursor_position();
-        assert_eq!(position.x, 31);
-        assert_eq!(terminal.backend().buffer()[(23, position.y)].symbol(), "首");
+        assert_eq!(position.x, input_x + 8);
+        assert_eq!(
+            terminal.backend().buffer()[(input_x, position.y)].symbol(),
+            "首"
+        );
         assert!(
             terminal.backend().buffer()[(position.x, position.y)]
                 .modifier
@@ -1131,18 +1164,24 @@ fn composer_keeps_chinese_first_character_and_native_cursor_through_wrap_and_foc
             assert_eq!(view.cursor(), cursor);
         }
         let position = terminal.backend().cursor_position();
-        assert_eq!(position.x, 27);
-        assert_eq!(terminal.backend().buffer()[(23, position.y)].symbol(), "末");
+        assert_eq!(position.x, input_x + 4);
         assert_eq!(
-            terminal.backend().buffer()[(23, position.y - 1)].symbol(),
+            terminal.backend().buffer()[(input_x, position.y)].symbol(),
+            "末"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(input_x, position.y - 1)].symbol(),
             "首"
         );
-        let first_row = (23..width)
+        let first_row = (input_x..width)
             .map(|x| terminal.backend().buffer()[(x, position.y - 1)].symbol())
             .collect::<String>()
             .replace(' ', "");
         assert!(first_row.contains("首中文字abc"));
-        view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        view.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert_eq!(view.selected_input_text().as_deref(), Some("尾"));
         let selected_cursor = view.cursor();
         for (resize_width, resize_height) in [(12, 10), (width, height)] {
@@ -1162,9 +1201,15 @@ fn composer_keeps_chinese_first_character_and_native_cursor_through_wrap_and_foc
             .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
             .unwrap();
         let position = terminal.backend().cursor_position();
-        assert_eq!(position.x, 27);
-        assert_eq!(terminal.backend().buffer()[(23, position.y)].symbol(), "末");
-        assert_eq!(terminal.backend().buffer()[(25, position.y)].symbol(), "尾");
+        assert_eq!(position.x, input_x + 4);
+        assert_eq!(
+            terminal.backend().buffer()[(input_x, position.y)].symbol(),
+            "末"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(input_x + 2, position.y)].symbol(),
+            "尾"
+        );
         let wrapped_cursor = view.cursor();
         for (resize_width, resize_height) in [(12, 10), (width, height)] {
             terminal.backend_mut().resize(resize_width, resize_height);
@@ -1174,9 +1219,15 @@ fn composer_keeps_chinese_first_character_and_native_cursor_through_wrap_and_foc
             assert_eq!(view.cursor(), wrapped_cursor);
         }
         let position = terminal.backend().cursor_position();
-        assert_eq!(position.x, 27);
-        assert_eq!(terminal.backend().buffer()[(23, position.y)].symbol(), "末");
-        assert_eq!(terminal.backend().buffer()[(25, position.y)].symbol(), "尾");
+        assert_eq!(position.x, input_x + 4);
+        assert_eq!(
+            terminal.backend().buffer()[(input_x, position.y)].symbol(),
+            "末"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(input_x + 2, position.y)].symbol(),
+            "尾"
+        );
         view.handle_key(key(KeyCode::F(6)));
         terminal
             .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
@@ -1290,17 +1341,24 @@ fn session_focus_keeps_draft_selection_and_stable_session_identity() {
             })
             .collect::<Vec<_>>();
         view.set_sessions(items.clone());
+        view.mark_active_session("session-20");
         view.select_session("session-20");
         view.paste("保留中文abc");
-        view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        view.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         let cursor = view.cursor();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| view.render(frame, &state, "当前连接 · 原生模型", "idle"))
             .unwrap();
         assert!(terminal.backend().cursor_visible());
-        assert_eq!(terminal.backend().buffer()[(21, 0)].symbol(), "│");
-        view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        assert_eq!(
+            terminal.backend().buffer()[((width / 4).clamp(26, 32) - 1, 0)].symbol(),
+            "│"
+        );
+        view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
         view.handle_key(key(KeyCode::Down));
         assert_eq!(view.selected_session(), Some("session-21"));
         view.handle_paste("should not enter draft");
@@ -1309,7 +1367,15 @@ fn session_focus_keeps_draft_selection_and_stable_session_identity() {
             .draw(|frame| view.render(frame, &state, "当前连接 · 原生模型", "idle"))
             .unwrap();
         assert!(!terminal.backend().cursor_visible());
-        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "›");
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "›")
+        );
         let mut updated = items;
         updated.insert(
             0,
@@ -1321,7 +1387,7 @@ fn session_focus_keeps_draft_selection_and_stable_session_identity() {
         );
         view.set_sessions(updated);
         assert_eq!(view.selected_session(), Some("session-21"));
-        view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
         assert_eq!(view.focus, Focus::Input);
         assert_eq!(view.cursor(), cursor);
         assert_eq!(view.selected_input_text().as_deref(), Some("c"));
@@ -1329,12 +1395,12 @@ fn session_focus_keeps_draft_selection_and_stable_session_identity() {
         assert!(view.draft().is_empty());
         view.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT));
         assert_eq!(view.draft(), "保留中文abc");
-        view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
         assert_eq!(view.focus, Focus::Conversation);
-        view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
-        view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
         assert_eq!(view.focus, Focus::Conversation);
-        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
         assert_eq!(view.focus, Focus::Input);
     }
 }
@@ -1365,11 +1431,19 @@ fn narrow_session_sidebar_is_explicit_and_returns_to_original_reader() {
     view.conversation_scroll = 20;
     assert!(view.conversation_scroll < view.conversation_max);
     let point = view.read_points[20].offset;
-    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
     terminal
         .draw(|frame| view.render(frame, &state, "m", "idle"))
         .unwrap();
-    assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "›");
+    assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), " ");
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.symbol() == "›")
+    );
     assert!(!terminal.backend().cursor_visible());
     for (width, height) in [(80, 24), (42, 24)] {
         terminal.backend_mut().resize(width, height);
@@ -1393,7 +1467,10 @@ fn connection_form_keeps_secrets_out_of_transcript_and_restores_parent_draft() {
     let state = bone::state::SessionState::new("/tmp/work");
     let mut view = View::new();
     view.paste("原中文草稿");
-    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    view.handle_key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
     let cursor = view.cursor();
     view.open_detail("原文", "完整记录");
     view.detail_scroll = 7;
@@ -1435,7 +1512,7 @@ fn connection_form_keeps_secrets_out_of_transcript_and_restores_parent_draft() {
     assert_eq!(view.draft(), "原中文草稿");
     assert!(view.messages.is_empty());
     assert!(view.history().is_empty());
-    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
     assert!(view.form_is_open());
     assert_ne!(view.focus, Focus::Sessions);
     view.open_help();
@@ -1462,4 +1539,248 @@ fn connection_form_keeps_secrets_out_of_transcript_and_restores_parent_draft() {
     assert_eq!(view.selected_input_text().as_deref(), Some("稿"));
     view.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
     assert!(view.draft().is_empty());
+}
+
+#[test]
+fn workspace_shift_navigation_preserves_editor_and_stays_inside_layers() {
+    let mut view = View::new();
+    view.paste("alpha beta\n中文👩‍💻");
+    let draft = view.draft();
+    let end = view.cursor();
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    assert_eq!(view.focus, Focus::Input);
+    assert!(view.cursor() < end);
+    view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+    assert_eq!(view.cursor(), end);
+    view.handle_key(KeyEvent::new(
+        KeyCode::Up,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    assert!(view.selected_input_text().is_some());
+    assert_eq!(view.focus, Focus::Input);
+    let cursor = view.cursor();
+    let selection = view.selected_input_text();
+    view.open_completion(PickerKind::Command, vec![], String::new());
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    assert!(!view.is_completion());
+    assert_eq!(view.focus, Focus::Sessions);
+    view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+    assert_eq!(view.focus, Focus::Input);
+    assert_eq!(
+        (view.draft(), view.cursor(), view.selected_input_text()),
+        (draft, cursor, selection)
+    );
+    view.open_help();
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    assert!(view.show_help);
+    assert_eq!(view.focus, Focus::Input);
+    view.handle_key(key(KeyCode::Esc));
+    view.open_picker(PickerKind::Connection, vec![], String::new());
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    assert!(view.has_modal());
+    assert_eq!(view.focus, Focus::Input);
+    view.handle_key(key(KeyCode::Esc));
+    view.toggle_inspector();
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    assert!(view.show_activity);
+    assert_eq!(view.focus, Focus::Activity);
+}
+
+#[test]
+fn session_rows_distinguish_current_browse_selection_and_keep_refresh_errors_visible() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let state = bone::state::SessionState::new("/tmp/work");
+    let mut view = View::new();
+    let prefix = "同样前缀的很长软件工程任务，需要检查全部约束并修复";
+    view.mark_active_session("a");
+    view.set_sessions(vec![
+        PickerItem {
+            label: format!("{prefix} A"),
+            detail: "运行中 · 刚刚".into(),
+            value: "a".into(),
+        },
+        PickerItem {
+            label: format!("{prefix} B"),
+            detail: "待回答 · 今天".into(),
+            value: "b".into(),
+        },
+    ]);
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    view.handle_key(key(KeyCode::Down));
+    view.mark_active_session("a");
+    view.sessions_loading = true;
+    view.sessions_error = Some("读取失败 · 锁定".into());
+    view.set_sessions(view.sessions.iter().cloned().rev().collect());
+    assert_eq!(view.selected_session(), Some("b"));
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let row_text = |row| {
+        (0..view.sidebar_width - 1)
+            .map(|x| buffer[(x, row)].symbol())
+            .collect::<String>()
+    };
+    assert!(row_text(1).replace(' ', "").contains("读取失败"));
+    assert!(row_text(2).trim_end().ends_with("B"));
+    assert!(row_text(4).trim_end().ends_with("A"));
+    assert!(row_text(5).replace(' ', "").contains("当前"));
+    assert!(row_text(3).replace(' ', "").contains("待回答"));
+    assert_eq!(buffer[(0, 0)].symbol(), " ");
+    assert_eq!(buffer[(0, 2)].symbol(), "›");
+    for row in [2, 3] {
+        assert!(buffer[(0, row)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(24, row)].modifier.contains(Modifier::REVERSED));
+    }
+    assert!(!buffer[(0, 4)].modifier.contains(Modifier::REVERSED));
+    assert!(buffer[(2, 4)].modifier.contains(Modifier::BOLD));
+    for width in 0..35 {
+        let fitted = middle_fit_line(&format!("{prefix} 👩‍💻 A"), width);
+        assert!(UnicodeWidthStr::width(fitted.as_str()) <= width);
+        if width >= 8 {
+            assert!(fitted.ends_with(" A"));
+        }
+    }
+}
+
+#[test]
+fn session_mouse_maps_two_line_viewport_and_ignores_hidden_or_modal_rows() {
+    use crossterm::event::MouseButton;
+    use ratatui::{Terminal, backend::TestBackend};
+    let state = bone::state::SessionState::new("/tmp/work");
+    let mut view = View::new();
+    view.set_sessions(
+        (0..30)
+            .map(|index| PickerItem {
+                label: format!("会话{index}"),
+                detail: "今天".into(),
+                value: index.to_string(),
+            })
+            .collect(),
+    );
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    view.handle_key(key(KeyCode::PageDown));
+    assert_eq!(view.selected_session(), Some("10"));
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    assert_eq!(view.session_top, 1);
+    let click = |row| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 3,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert_eq!(view.clicked_session(click(2)), Some("1".into()));
+    assert_eq!(view.clicked_session(click(5)), Some("2".into()));
+    assert_eq!(view.clicked_session(click(0)), None);
+    assert_eq!(view.clicked_session(click(22)), None);
+    view.open_help();
+    assert_eq!(view.clicked_session(click(2)), None);
+    assert_eq!(view.selected_session(), Some("2"));
+    view.handle_key(key(KeyCode::Esc));
+    view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+    terminal.backend_mut().resize(79, 24);
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    assert_eq!(view.sidebar_width, 0);
+    assert_eq!(view.clicked_session(click(2)), None);
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    assert_eq!(view.clicked_session(click(2)), Some("1".into()));
+    terminal.backend_mut().resize(6, 8);
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    assert_eq!(view.clicked_session(click(2)), None);
+}
+
+#[test]
+fn persisted_input_position_keeps_directed_multiline_grapheme_selection() {
+    let text = "首行👩‍💻e\u{301}\n第二行完成";
+    let start = "首行".len();
+    let end = "首行👩‍💻e\u{301}\n第二".len();
+    for (anchor, cursor) in [(start, end), (end, start)] {
+        let mut original = View::new();
+        original.paste(text);
+        original.move_to_byte(anchor);
+        original.editor.start_selection();
+        original.move_to_byte(cursor);
+        original.focus = Focus::Sessions;
+        let saved = original.input_position();
+        assert_eq!(saved, (cursor, Some((start, end))));
+        let mut restored = View::new();
+        restored.paste(text);
+        restored.restore_input_position(Some(saved.0), saved.1);
+        assert_eq!(
+            restored.selected_input_text().as_deref(),
+            Some("👩‍💻e\u{301}\n第二")
+        );
+        assert_eq!(restored.cursor(), cursor);
+        original.focus = Focus::Input;
+        let extend = KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        original.handle_key(extend);
+        restored.handle_key(extend);
+        assert_eq!(restored.input_position(), original.input_position());
+        assert_eq!(restored.draft(), text);
+    }
+}
+
+#[test]
+fn persisted_input_position_rejects_invalid_ranges_and_aligns_caret_safely() {
+    let text = "中👩‍💻e\u{301}\n文";
+    let emoji = "中".len();
+    let combining = "中👩‍💻".len();
+    let cases = [
+        (1, Some((0, 1)), 0),
+        (emoji + '👩'.len_utf8(), Some((0, emoji)), emoji),
+        (combining + 1, Some((combining, text.len())), combining),
+        (usize::MAX, Some((0, text.len())), text.len()),
+        (emoji, Some((emoji, usize::MAX)), emoji),
+        (emoji, Some((0, combining)), emoji),
+        (emoji, Some((combining, emoji)), emoji),
+        (emoji, Some((emoji, emoji)), emoji),
+    ];
+    for (cursor, selection, safe) in cases {
+        let mut view = View::new();
+        view.paste(text);
+        view.restore_input_position(Some(cursor), selection);
+        assert_eq!(view.cursor(), safe);
+        assert_eq!(view.selected_input_text(), None);
+        assert_eq!(view.draft(), text);
+    }
+    let mut view = View::new();
+    view.paste(text);
+    view.restore_input_position(None, None);
+    assert_eq!(view.input_position(), (text.len(), None));
+}
+
+#[test]
+fn persisted_input_position_uses_original_draft_during_temporary_notes() {
+    let mut view = View::new();
+    view.paste("原稿中文👩‍💻e\u{301}");
+    view.handle_key(KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    let original = view.input_position();
+    view.begin_temporary_draft();
+    view.paste("核查备注");
+    view.handle_key(key(KeyCode::Left));
+    assert_ne!(view.cursor(), original.0);
+    assert_eq!(view.input_position(), original);
+    assert_eq!(
+        view.temporary_draft_text().as_deref(),
+        Some("原稿中文👩‍💻e\u{301}")
+    );
+    assert!(view.restore_temporary_draft());
+    assert_eq!(view.input_position(), original);
 }
