@@ -6,7 +6,7 @@ fn changing_a_model_keeps_endpoint_and_does_not_move_credentials_between_provide
         "model":{"model":"old","config":{"openai":{"api_key":"","base_url":"http://127.0.0.1:1234/v1","dialect":"openai","route":"Responses","auth":"Bearer"}}},
         "credential_env":"LOCAL_FIXTURE_KEY","max_tokens":4000
     })).unwrap();
-    let next = profile_with_model(&current, "openai:new-model").unwrap();
+    let next = current.with_model("openai:new-model").unwrap();
     let encoded = serde_json::to_value(&next).unwrap();
     assert_eq!(
         encoded["model"]["config"]["openai"]["base_url"],
@@ -14,9 +14,9 @@ fn changing_a_model_keeps_endpoint_and_does_not_move_credentials_between_provide
     );
     assert_eq!(encoded["model"]["model"], "new-model");
     assert_eq!(next.credential_env, current.credential_env);
-    let changed = profile_with_model(&current, "ollama:arbitrary-native-name").unwrap();
+    let changed = current.with_model("ollama:arbitrary-native-name").unwrap();
     assert!(changed.credential_env.is_none());
-    assert!(profile_with_model(&current, "missing-provider:model").is_err());
+    assert!(current.with_model("missing-provider:model").is_err());
 }
 
 #[test]
@@ -61,9 +61,239 @@ fn local_app() -> (tempfile::TempDir, Engine, App) {
     let app = App::new(Settings {
         profile_name: "test".into(),
         profile,
-        profiles: vec![],
     });
     (dir, engine, app)
+}
+
+#[test]
+fn session_title_uses_first_real_input_after_initial_stop_and_keeps_narrow_state_visible() {
+    let (dir, mut engine, _app) = local_app();
+    let data = dir.path().join("data");
+    engine.stop().unwrap();
+    engine.post_message("TITLE_FROM_FIRST_REAL_INPUT").unwrap();
+    let events = engine.events().unwrap();
+    assert_eq!(events.first().unwrap().kind, "stopped");
+    let items = session_items(&data, &engine.state().workspace, &engine.state().id).unwrap();
+    let current = items
+        .iter()
+        .find(|item| item.value == engine.state().id)
+        .unwrap();
+    assert!(current.label.contains("TITLE_FROM_FIRST_REAL_INPUT"));
+    assert!(!current.label.contains("新对话"));
+    assert_eq!(current.value, engine.state().id);
+    assert!(!current.detail.contains(&engine.state().id));
+    let status_end = current.detail.find("进行中").unwrap() + "进行中".len();
+    assert!(unicode_width::UnicodeWidthStr::width(&current.detail[..status_end]) <= 20);
+    assert_eq!(engine.events().unwrap().len(), events.len());
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.kind.as_str(), "model_started" | "tool_started"))
+    );
+}
+
+fn replace_connection_field(app: &mut App, text: &str) {
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('a'),
+        KeyModifiers::CONTROL,
+    ));
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL,
+    ));
+    app.ui.handle_paste(text);
+}
+
+#[test]
+fn model_form_conflict_preserves_connection_parent_draft_and_external_config() {
+    let (dir, mut engine, mut app) = local_app();
+    let data = dir.path().join("data");
+    let (mut config, revision) = Config::load_with_revision(&data).unwrap();
+    config.profiles.insert(
+        app.settings.profile_name.clone(),
+        app.settings.profile.clone(),
+    );
+    config.default_profile = app.settings.profile_name.clone();
+    config.save_checked(&data, &revision).unwrap();
+    app.reply_target = Some("explicit-original-target".into());
+    app.ui.paste("original parent draft\nsecond line");
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::SHIFT,
+    ));
+    let cursor = app.ui.cursor();
+    let selection = app.ui.selected_input_text();
+    let old_profile = serde_json::to_value(&app.settings.profile).unwrap();
+    let old_name = app.settings.profile_name.clone();
+    let old_session = engine.state().id.clone();
+    app.model_form(&data).unwrap();
+    replace_connection_field(&mut app, "new-model-not-in-a-list");
+
+    // A second editor commits after this form captured its exact disk revision.
+    let (mut external, external_revision) = Config::load_with_revision(&data).unwrap();
+    external.profiles.insert(
+        "external".into(),
+        Profile::from_model("ollama:external-model").unwrap(),
+    );
+    external.default_profile = "external".into();
+    external.save_checked(&data, &external_revision).unwrap();
+    let external_bytes = std::fs::read(data.join("config.toml")).unwrap();
+    let error = app.submit_connection_form(&mut engine, &data).unwrap_err();
+    assert!(format!("{error:#}").contains("configuration changed"));
+    assert_eq!(
+        std::fs::read(data.join("config.toml")).unwrap(),
+        external_bytes
+    );
+    assert_eq!(app.settings.profile_name, old_name);
+    assert_eq!(
+        serde_json::to_value(&app.settings.profile).unwrap(),
+        old_profile
+    );
+    assert_eq!(engine.state().id, old_session);
+    assert!(engine.state().jobs.is_empty());
+    assert!(
+        engine
+            .events()
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event.kind.as_str(), "model_started" | "tool_started"))
+    );
+    assert!(app.ui.form_is_open());
+    assert!(app.connection_setup.is_some());
+    assert_eq!(
+        app.ui.form_values().unwrap(),
+        vec!["new-model-not-in-a-list"]
+    );
+    assert_eq!(app.ui.draft(), "original parent draft\nsecond line");
+    assert_eq!(
+        app.reply_target.as_deref(),
+        Some("explicit-original-target")
+    );
+    app.ui.close_layer();
+    assert_eq!(app.ui.cursor(), cursor);
+    assert_eq!(app.ui.selected_input_text(), selection);
+}
+
+#[test]
+fn api_final_submit_revalidates_skipped_name_and_cannot_overwrite_competing_key() {
+    let (dir, mut engine, mut app) = local_app();
+    let data = dir.path().join("data");
+    app.ui.paste("parent draft stays untouched");
+    let old_profile = serde_json::to_value(&app.settings.profile).unwrap();
+    let before_events = engine.events().unwrap().len();
+    app.connection_choice(&mut engine, &data, "@api/openai")
+        .unwrap();
+    replace_connection_field(&mut app, "../outside");
+    // Tab skips per-field Enter validation, so final submit must validate again.
+    for _ in 0..3 {
+        app.ui.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        ));
+    }
+    app.ui.handle_paste("synthetic-unsaved-key");
+    assert_eq!(app.ui.form_step(), Some((3, 4)));
+    assert!(app.submit_connection_form(&mut engine, &data).is_err());
+    assert!(!dir.path().join("outside").exists());
+    assert!(app.ui.form_is_open());
+    for _ in 0..3 {
+        app.ui.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+        ));
+    }
+    replace_connection_field(&mut app, "competing");
+    for _ in 0..3 {
+        app.ui.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        ));
+    }
+    let competitor_profile = Profile::from_model("openai:competitor-model").unwrap();
+    std::fs::create_dir_all(data.join("profiles")).unwrap();
+    std::fs::create_dir(data.join("profiles/competing")).unwrap();
+    bone::save_api_key(
+        &data,
+        "competing",
+        &competitor_profile,
+        "synthetic-existing-key",
+    )
+    .unwrap();
+    let key_path = data.join("profiles/competing/api-key");
+    let original_key_bytes = std::fs::read(&key_path).unwrap();
+    let error = app.submit_connection_form(&mut engine, &data).unwrap_err();
+    assert!(format!("{error:#}").contains("连接名称已被使用"));
+    assert_eq!(std::fs::read(key_path).unwrap(), original_key_bytes);
+    assert!(!data.join("config.toml").exists());
+    assert_eq!(engine.events().unwrap().len(), before_events);
+    assert!(engine.state().jobs.is_empty());
+    assert_eq!(
+        serde_json::to_value(&app.settings.profile).unwrap(),
+        old_profile
+    );
+    assert_eq!(app.settings.profile_name, "test");
+    assert!(app.ui.form_is_open());
+    assert_eq!(app.ui.form_values().unwrap()[3], "synthetic-unsaved-key");
+    app.ui.close_layer();
+    assert_eq!(app.ui.draft(), "parent draft stays untouched");
+}
+
+#[test]
+fn sidebar_session_switch_during_reconciliation_keeps_note_target_and_original_draft() {
+    let (dir, mut engine, mut app) = local_app();
+    let data = dir.path().join("data");
+    let other = Engine::open(
+        &data,
+        dir.path(),
+        None,
+        app.settings.profile.clone(),
+        "test".into(),
+        Default::default(),
+    )
+    .unwrap();
+    let other_id = other.state().id.clone();
+    drop(other);
+    app.reply_target = Some("original-question-target".into());
+    app.ui.paste("original answer draft\noriginal second line");
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::SHIFT,
+    ));
+    let cursor = app.ui.cursor();
+    let selection = app.ui.selected_input_text();
+    app.ui.begin_temporary_draft();
+    app.reconcile_call = Some("unknown-call-being-reviewed".into());
+    app.ui.paste("unfinished observed reconciliation note");
+    app.ui.focus = Focus::Sessions;
+    let original_session = engine.state().id.clone();
+    let before_events = engine.events().unwrap().len();
+    assert!(
+        app.switch_session(&mut engine, &data, Some(&other_id))
+            .is_err()
+    );
+    assert_eq!(engine.state().id, original_session);
+    assert_eq!(engine.events().unwrap().len(), before_events);
+    assert_eq!(app.ui.focus, Focus::Sessions);
+    assert_eq!(
+        app.reconcile_call.as_deref(),
+        Some("unknown-call-being-reviewed")
+    );
+    assert_eq!(
+        app.reply_target.as_deref(),
+        Some("original-question-target")
+    );
+    assert_eq!(app.ui.draft(), "unfinished observed reconciliation note");
+    app.cancel_reconcile();
+    assert_eq!(
+        app.ui.draft(),
+        "original answer draft\noriginal second line"
+    );
+    assert_eq!(app.ui.cursor(), cursor);
+    assert_eq!(app.ui.selected_input_text(), selection);
+    assert_eq!(
+        app.reply_target.as_deref(),
+        Some("original-question-target")
+    );
 }
 
 #[test]
@@ -275,12 +505,12 @@ fn exact_completed_command_has_no_inline_layer_and_confirmation_only_inserts() {
         .unwrap();
     assert!(!app.ui.is_completion());
     app.ui.take_draft();
-    app.ui.paste("/sta");
+    app.ui.paste("/he");
     app.refresh_completion(&engine, &dir.path().join("data"))
         .unwrap();
     assert!(app.ui.is_completion());
-    app.complete_inline(PickerKind::Command, "/status");
-    assert_eq!(app.ui.draft(), "/status ");
+    app.complete_inline(PickerKind::Command, "/help");
+    assert_eq!(app.ui.draft(), "/help ");
     assert!(app.ui.detail.is_none());
     assert!(!app.ui.is_completion());
 }
@@ -413,7 +643,7 @@ fn arriving_question_never_binds_an_empty_or_existing_message_draft() {
     app.metadata(&engine);
     assert!(app.reply_target.is_none());
     assert_eq!(app.ui.draft(), "unsent original request");
-    assert!(app.ui.notice.contains("显式选择"));
+    assert!(app.ui.notice.contains("选择回复"));
     app.bind_reply(&engine, &question.id).unwrap();
     app.metadata(&engine);
     assert!(app.ui.reply_label.contains("Choose an option"));
@@ -626,7 +856,6 @@ fn execution_feedback_fixture(
     let app = App::new(Settings {
         profile_name: "feedback-fixture".into(),
         profile,
-        profiles: vec![],
     });
     (dir, engine, app, server)
 }

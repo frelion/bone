@@ -1,0 +1,32 @@
+{
+  "binary_sha256": "20e1d336657da113f8d7de636cc696f2581e63387009f76fb7dac76f1c3f9947",
+  "size": "80x24",
+  "no_color": true,
+  "scope": "Synthetic local PTY regression only; pre-final visual polish binary",
+  "results": [
+    {
+      "scenario": "slash-inline",
+      "status": "PASS"
+    },
+    {
+      "scenario": "sessions",
+      "status": "PASS"
+    },
+    {
+      "scenario": "feedback-flow",
+      "status": "PASS"
+    },
+    {
+      "scenario": "shell-live",
+      "status": "PASS"
+    },
+    {
+      "scenario": "reader-delivery",
+      "status": "PASS"
+    },
+    {
+      "scenario": "reconcile-reply",
+      "status": "PASS"
+    }
+  ]
+}

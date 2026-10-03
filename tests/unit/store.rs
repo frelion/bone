@@ -44,6 +44,69 @@ fn fixture() -> (tempfile::TempDir, Store, SessionState, Event) {
 }
 
 #[test]
+fn commit_waits_for_an_independent_writer_before_reading_its_snapshot() {
+    use std::{cell::RefCell, sync::mpsc};
+    thread_local! {
+        static BUSY_NOTIFY: RefCell<Option<mpsc::Sender<()>>> = const { RefCell::new(None) };
+    }
+    let (directory, store, state, input) = fixture();
+    let writer = Connection::open(directory.path().join("bone.sqlite")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (busy_sender, busy_receiver) = mpsc::channel();
+    let (result_sender, result_receiver) = mpsc::channel();
+    let expected_state = state.clone();
+    let expected_input = input.clone();
+    let worker = std::thread::spawn(move || {
+        BUSY_NOTIFY.with(|slot| *slot.borrow_mut() = Some(busy_sender));
+        store
+            .connection
+            .busy_handler(Some(|attempt| {
+                BUSY_NOTIFY.with(|slot| {
+                    if let Some(sender) = slot.borrow_mut().take() {
+                        let _ = sender.send(());
+                    }
+                });
+                std::thread::sleep(Duration::from_millis(1));
+                attempt < 5000
+            }))
+            .unwrap();
+        let result = store.commit(&state, &[input]);
+        result_sender
+            .send(result.map_err(|error| format!("{error:#}")))
+            .unwrap();
+        store
+    });
+    // The busy callback proves that commit actually reaches the conflicting
+    // writer before it reads. A deferred read→write upgrade skips this callback
+    // and immediately returns SQLITE_BUSY even though a timeout is configured.
+    let waiting = busy_receiver.recv_timeout(Duration::from_secs(3));
+    writer
+        .execute(
+            "UPDATE sessions SET snapshot = snapshot WHERE id = ?1",
+            [&expected_state.id],
+        )
+        .unwrap();
+    writer.execute_batch("COMMIT").unwrap();
+    let committed = result_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    let store = worker.join().unwrap();
+    assert!(
+        waiting.is_ok(),
+        "commit did not wait for the independent writer: {committed:?}"
+    );
+    committed.unwrap();
+    assert_eq!(
+        store.load_session(&expected_state.id).unwrap(),
+        expected_state
+    );
+    assert_eq!(
+        store.events(&expected_state.id).unwrap(),
+        vec![expected_input]
+    );
+}
+
+#[test]
 fn history_page_uses_append_order_and_bounded_cursor_reads() {
     let (_directory, store, mut state, first) = fixture();
     store.commit(&state, std::slice::from_ref(&first)).unwrap();

@@ -1,0 +1,28 @@
+{
+  "scope": "Actual installed release failed; preserved live pre-exit frames, exit stderr is error evidence only",
+  "runs": [
+    {
+      "size": "80x24",
+      "status": "FAIL",
+      "binary_sha256": "987052c4f2448d93fcfc449c1a125d9cdfda905ffdaaad0b48abfdce11bd231d",
+      "source_fingerprint": "e12bbb25bde1c4161ac83204401a52100b59d47a1f54547407a418f9f9e9e21a",
+      "stage": "subscription native delivery",
+      "error": "process exited 1: session commit failed: database is locked",
+      "last_pre_exit_frame": "Restart without --profile retains default API B and arbitrary native model",
+      "evidence": "failures/987052c4/80x24/workspace-flow.json"
+    },
+    {
+      "size": "120x40",
+      "status": "FAIL",
+      "binary_sha256": "987052c4f2448d93fcfc449c1a125d9cdfda905ffdaaad0b48abfdce11bd231d",
+      "source_fingerprint": "e12bbb25bde1c4161ac83204401a52100b59d47a1f54547407a418f9f9e9e21a",
+      "stage": "new session API A native delivery",
+      "error": "process exited 1: session commit failed: database is locked",
+      "last_pre_exit_frame": "Ctrl Down restores editable reply draft",
+      "evidence": "failures/987052c4/120x40/workspace-flow.json"
+    }
+  ],
+  "parallel_runs": "independent data directories and endpoints; no shared SQLite",
+  "production_cause": "Parent identified Store::open migration write racing DEFERRED commit read-to-write upgrade; pending IMMEDIATE transaction fix",
+  "harness_followup": "Explicit contextlib.closing for read-only SQLite handles; does not substitute for production fix"
+}

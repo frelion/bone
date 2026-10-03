@@ -74,7 +74,7 @@ class RealTerminal(Fixture):
         self.original=termios.tcgetattr(self.slave)
         self.rows,self.cols=24,80
         self.resize(self.rows,self.cols)
-        self.output=bytearray(); self.answered_queries=0; self.frames=[]
+        self.output=bytearray(); self.answered_queries=0; self.frames=[]; self.request_routes={}
         self.binary=binary
         self.binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest()
         self.env=dict(os.environ,TERM='xterm-256color')
@@ -104,6 +104,17 @@ def main():
     try:
         f.wait(lambda:b'\x1b[?1049h' in f.output,'startup')
         stage('01 新版生产 TUI / 80×24')
+        f.send('/connect\r')
+        f.wait(lambda:'使用现有 Codex 登录' in f.screen(),'saved connections and sign-in menu')
+        stage('01a 当前连接与统一登录入口')
+        f.send('现有 Codex\r')
+        f.wait(lambda:'现有登录' in f.screen(),'reuse existing Codex form')
+        f.send('\r\r') # Accept suggested unique name and current gpt-6-luna.
+        f.wait(lambda:'首次请求验证认证' in f.screen(),'existing login read and connection saved')
+        assert not f.calls(),'connection setup must not infer outside a Job'
+        checks['login_setup_has_no_model_call']=True
+        checks['saved_connection_reuses_codex']='reuse_codex_login = true' in (f.data/'config.toml').read_text()
+        stage('01b 复用现有登录 / 已保存 / 尚无模型请求')
         f.send('修复过期 token 被接受的问题。先运行 python3 -B -m unittest -v 确认失败，再定位源码。保留 authorize(token, now) API，不修改测试，不提交 Git。\r')
         wait(lambda:any(e['kind']=='tool_started' and e['data'].get('tool_name')=='shell' for e in f.events()),'first real verification starts')
         stage('02 Agent 真实检查正在执行')
@@ -124,7 +135,7 @@ def main():
         f.send('/delivery\r'); f.pump(.4)
         stage('06 一次命令直达完整交付')
         f.resize(40,120); f.pump(.2)
-        f.wait(lambda: any(line.count('─') >= 120 for line in f.screen().splitlines()) and '阅读：' in f.screen().splitlines()[-1], 'production terminal redraws at 120x40')
+        f.wait(lambda: any(line.count('─') >= 90 for line in f.screen().splitlines()) and '阅读层：' in f.screen().splitlines()[-1], 'production terminal redraws at 120x40')
         stage('07 同一交付 / 120×40')
         f.send('\x1b'); f.pump(.2)
         stage('08 返回原对话阅读位置')
@@ -147,7 +158,7 @@ def main():
         checks['terminal_restored']=termios.tcgetattr(f.slave)==f.original
         summary={'status':status,'error':error,'scope':'Production TUI, real gpt-6-luna subscription calls, reused existing Codex login; isolated Python repo','binary_sha256':f.binary_sha256,'workspace':str(f.workspace),'checks':checks,'timeline':timeline,'model_calls':len(f.calls()),'tool_calls':sum(e['kind']=='tool_started' for e in events),'frames':len(f.frames),'cost':None}
         (output_dir/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
-        (output_dir/'screens.json').write_text(json.dumps(f.frames,ensure_ascii=False,indent=2)+'\n')
+        (output_dir/'screens.json').write_text(json.dumps(f.frames,ensure_ascii=False,separators=(',',':'))+'\n')
         (output_dir/'events.json').write_text(json.dumps(events,ensure_ascii=False,indent=2)+'\n')
         (output_dir/'auth.py').write_text((f.workspace/'auth.py').read_text())
         (output_dir/'test_auth.py').write_text(TESTS)

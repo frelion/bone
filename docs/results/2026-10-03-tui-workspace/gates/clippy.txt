@@ -1,0 +1,2 @@
+    Checking bone v0.8.0 (/Users/zzhang/Documents/ChatGPT/BONE)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.02s

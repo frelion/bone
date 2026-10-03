@@ -1,0 +1,10 @@
+{
+  "size": "120x40",
+  "binary": "/Users/zzhang/Documents/ChatGPT/BONE/target/debug/bone",
+  "results": [
+    {
+      "scenario": "workspace-flow",
+      "status": "PASS"
+    }
+  ]
+}

@@ -3,7 +3,7 @@ mod services;
 mod view;
 
 use anyhow::{Context, Result, bail, ensure};
-use bone::config::{ModelReference, Profile};
+use bone::config::{Config, ConfigRevision, ModelReference, Profile, validate_profile_name};
 use bone::runtime::Engine;
 use bone::state::{Event, JobState};
 use crossterm::event::{
@@ -14,6 +14,7 @@ use crossterm::event::{
 use crossterm::execute;
 use futures_util::StreamExt;
 use ratatui::DefaultTerminal;
+use rig_core::providers::chatgpt::auth::{DeviceCodeHandler, DeviceCodePrompt};
 use serde_json::Value;
 use services::native_text;
 use std::collections::BTreeMap;
@@ -21,13 +22,12 @@ use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
-use view::{Activity, Draft, Focus, Message, PickerItem, PickerKind, Tone, View};
+use view::{Activity, Draft, Focus, FormField, Message, PickerItem, PickerKind, Tone, View};
 
 /// Concrete launch recipes, not a second runtime or model abstraction.
 pub(super) struct Settings {
     pub profile_name: String,
     pub profile: Profile,
-    pub profiles: Vec<(String, Profile)>,
 }
 
 pub(super) fn require_terminal() -> Result<()> {
@@ -91,6 +91,36 @@ struct ActiveCall {
     started: Instant,
 }
 
+// One local editing transaction. Its revision protects against overwriting an
+// externally edited config; the form alone owns any unsaved secret text.
+#[derive(Clone)]
+struct ConnectionChange {
+    config: Config,
+    revision: ConfigRevision,
+    name: String,
+    profile: Profile,
+}
+#[derive(Clone)]
+enum ConnectionForm {
+    Model,
+    Api,
+    Subscription,
+}
+#[derive(Clone)]
+struct ConnectionSetup {
+    change: ConnectionChange,
+    form: ConnectionForm,
+}
+struct CredentialReservation {
+    data: PathBuf,
+    name: String,
+}
+impl Drop for CredentialReservation {
+    fn drop(&mut self) {
+        cleanup_connection(&self.data, &self.name);
+    }
+}
+
 struct App {
     ui: View,
     cursor: Option<String>,
@@ -107,6 +137,9 @@ struct App {
     file_index: Option<tokio::task::JoinHandle<Result<Vec<String>>>>,
     files: Option<Vec<String>>,
     session_index: Option<tokio::task::JoinHandle<Result<Vec<PickerItem>>>>,
+    connection_setup: Option<ConnectionSetup>,
+    login: Option<tokio::task::JoinHandle<Result<(ConnectionChange, CredentialReservation)>>>,
+    login_codes: Option<tokio::sync::mpsc::Receiver<DeviceCodePrompt>>,
     diff: Option<tokio::task::JoinHandle<Result<String>>>,
     export: Option<tokio::task::JoinHandle<Result<PathBuf>>>,
     search: Option<tokio::task::JoinHandle<Result<Vec<PickerItem>>>>,
@@ -142,6 +175,9 @@ impl App {
             file_index: None,
             files: None,
             session_index: None,
+            connection_setup: None,
+            login: None,
+            login_codes: None,
             diff: None,
             export: None,
             search: None,
@@ -185,6 +221,8 @@ impl App {
         self.file_range = None;
         abort_task(&mut self.file_index);
         abort_task(&mut self.session_index);
+        self.cancel_login();
+        self.connection_setup = None;
         abort_task(&mut self.diff);
         abort_task(&mut self.export);
         // Read one original at a time: native responses can be several MiB.
@@ -217,7 +255,7 @@ impl App {
         self.ui.notice = if more {
             "已加载最近记录；/older 往前翻页 · Ctrl+F 搜索全部原文"
         } else {
-            "输入 / 或 @ 显示候选 · Tab 补全 · Enter 发送 · F1 帮助"
+            "Enter 发送 · Ctrl+P 操作 · F1 帮助"
         }
         .into();
         match services::load(data, &engine.state().id) {
@@ -243,6 +281,7 @@ impl App {
         engine.drain_tool_progress();
         self.refresh_usage(engine);
         self.metadata(engine);
+        self.refresh_sessions(engine, data);
         Ok(())
     }
     fn refresh_latest(&mut self, engine: &mut Engine, data: &Path) -> Result<()> {
@@ -333,10 +372,7 @@ impl App {
             self.tool_previews.remove(call);
         }
         if event.kind == "question" && engine.is_unanswered_question(event) {
-            self.ui.notice = format!(
-                "问题 {} 待回答；/questions 显式选择回复目标",
-                short_id(&event.id)
-            );
+            self.ui.notice = "有问题待回答 · Ctrl+P 选择回复".into();
         }
         if event.kind == "tool_result" && tool_failed(engine, event)? {
             self.last_tool_failure = Some(format!(
@@ -402,12 +438,17 @@ impl App {
         }
     }
     fn sync(&mut self, engine: &Engine, data: &Path) -> Result<()> {
+        let mut refresh_sessions = false;
         loop {
             let page = bone::history_page(data, &engine.state().id, self.cursor.as_deref(), 20)?;
             if self.older.is_none() {
                 self.older = page.events.first().map(|e| e.id.clone());
             }
             for event in &page.events {
+                refresh_sessions |= matches!(
+                    event.kind.as_str(),
+                    "delivery" | "question" | "stopped" | "resumed" | "failure"
+                );
                 self.ingest(engine, event)?;
             }
             if let Some(next) = page.next_cursor {
@@ -419,6 +460,9 @@ impl App {
         }
         self.refresh_usage(engine);
         self.metadata(engine);
+        if refresh_sessions {
+            self.refresh_sessions(engine, data);
+        }
         Ok(())
     }
     fn metadata(&mut self, engine: &Engine) {
@@ -436,7 +480,7 @@ impl App {
                     question_summary(question.data["question"].as_str().unwrap_or("问题"), 24)
                 )
             } else {
-                "回复目标失效 · 草稿保留 · /message 明确改发".into()
+                "回复目标失效 · 草稿保留 · Ctrl+P 写新要求".into()
             }
         } else {
             format!(
@@ -444,7 +488,7 @@ impl App {
                 if questions.is_empty() {
                     ""
                 } else {
-                    " · /questions 选择待答问题"
+                    " · Ctrl+P 回复问题"
                 }
             )
         };
@@ -553,7 +597,7 @@ impl App {
             }
         }
         if engine.state().paused && !engine.unanswered_questions().is_empty() {
-            return "待答问题仍保留 · /questions 选择回复".into();
+            return "待答问题仍保留 · Ctrl+P 回复问题".into();
         }
         if let Some(failure) = &self.last_tool_failure {
             return format!("最近工具失败 {failure}");
@@ -683,48 +727,395 @@ impl App {
         self.update_older_after_trim(engine, previous_head.as_deref());
         changed
     }
-    fn commands(&mut self, query: String) {
-        self.ui
-            .open_picker(PickerKind::Command, command_items(), query);
+    fn commands(&mut self, engine: &Engine, query: String) {
+        let mut items = command_items();
+        if !engine.unanswered_questions().is_empty() {
+            items.push(action("回复问题", "/questions", "选择等待中的问题"));
+        }
+        if self.reply_target.is_some() {
+            items.push(action("写新要求", "/message", "保存回复草稿，回到新要求"));
+        }
+        if !engine.state().unknown_writes.is_empty() {
+            items.push(action("核查未确认写入", "/reconcile", "记录实际结果后继续"));
+        }
+        items.push(action("查看项目修改", "/diff", "Git 修改 · Ctrl+D"));
+        self.ui.open_picker(PickerKind::Command, items, query);
     }
-    fn sessions(&mut self, engine: &Engine, data: &Path) -> Result<()> {
-        self.ui
-            .open_picker(PickerKind::Session, Vec::new(), String::new());
-        self.ui.notice = "正在读取项目会话…".into();
+    fn refresh_sessions(&mut self, engine: &Engine, data: &Path) {
         abort_task(&mut self.session_index);
+        self.ui.select_session(&engine.state().id);
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        self.ui.sessions_loading = true;
         let data = data.to_owned();
         let workspace = engine.state().workspace.clone();
         let current = engine.state().id.clone();
         self.session_index = Some(tokio::task::spawn_blocking(move || {
             session_items(&data, &workspace, &current)
         }));
+    }
+    fn sessions(&mut self, engine: &Engine, data: &Path) -> Result<()> {
+        self.ui
+            .open_picker(PickerKind::Session, Vec::new(), String::new());
+        self.refresh_sessions(engine, data);
         Ok(())
     }
-    fn models(&mut self) {
-        let current = model_label(&self.settings.profile);
-        let mut matched = false;
+    fn model_form(&mut self, data: &Path) -> Result<()> {
+        let (config, revision) = Config::load_with_revision(data)?;
+        let profile = self.settings.profile.clone();
+        self.ui.open_form(
+            format!("模型 · {}", self.settings.profile_name),
+            vec![field(
+                "模型名称 · 服务商的模型 ID",
+                model_name(&profile),
+                false,
+            )],
+        );
+        self.connection_setup = Some(ConnectionSetup {
+            change: ConnectionChange {
+                config,
+                revision,
+                name: self.settings.profile_name.clone(),
+                profile,
+            },
+            form: ConnectionForm::Model,
+        });
+        Ok(())
+    }
+    fn connections(&mut self, data: &Path) -> Result<()> {
+        let config = Config::load(data)?;
         let mut items = Vec::new();
-        for (name, profile) in &self.settings.profiles {
-            let label = model_label(profile);
-            let active = *name == self.settings.profile_name && label == current;
-            matched |= active;
+        for (name, profile) in &config.profiles {
+            let credentials = if profile.is_subscription() {
+                if bone::has_login(profile, data, name)? {
+                    "登录信息已保存"
+                } else {
+                    "需要登录"
+                }
+            } else if bone::has_api_key(data, name)? {
+                "API key 已保存"
+            } else {
+                "环境变量 / 原生认证"
+            };
             items.push(PickerItem {
-                label: format!("{label}{}", if active { " · 当前" } else { "" }),
-                detail: format!("配置：{name}"),
+                label: format!(
+                    "{name}{}",
+                    if *name == self.settings.profile_name {
+                        " · 当前"
+                    } else {
+                        ""
+                    }
+                ),
+                detail: format!("{} · {credentials}", model_label(profile)),
                 value: name.clone(),
             });
         }
-        if !matched {
-            items.insert(
-                0,
-                PickerItem {
-                    label: format!("{current} · 当前"),
-                    detail: "当前配置".into(),
-                    value: "@current".into(),
-                },
-            );
+        items.extend([
+            action(
+                "ChatGPT · 使用现有 Codex 登录",
+                "@codex",
+                "复用本机登录，凭据不复制",
+            ),
+            action("ChatGPT · 登录", "@login", "浏览器设备登录，BONE 独立保存"),
+            action(
+                "添加 API 连接",
+                "@api",
+                "选择 provider、模型、endpoint 与凭据",
+            ),
+        ]);
+        self.ui
+            .open_picker(PickerKind::Connection, items, String::new());
+        Ok(())
+    }
+    fn connection_choice(&mut self, engine: &mut Engine, data: &Path, value: &str) -> Result<()> {
+        if value == "@api" {
+            let items = bone::providers()
+                .into_iter()
+                .filter(|provider| {
+                    Profile::from_model(&format!("{provider}:model")).is_ok_and(|profile| {
+                        !profile.is_subscription() && profile.endpoint().is_some()
+                    })
+                })
+                .map(|provider| {
+                    let (vendor, protocol) =
+                        provider.split_once('/').unwrap_or((&provider, &provider));
+                    PickerItem {
+                        label: vendor.into(),
+                        detail: if vendor == protocol {
+                            "API 模型".into()
+                        } else {
+                            format!("API 模型 · {protocol} 协议")
+                        },
+                        value: format!("@api/{provider}"),
+                    }
+                })
+                .collect();
+            self.ui
+                .open_picker(PickerKind::Connection, items, String::new());
+            return Ok(());
         }
-        self.ui.open_picker(PickerKind::Model, items, String::new());
+        let (config, revision) = Config::load_with_revision(data)?;
+        let (form, suggested, profile) = match value {
+            "@codex" | "@login" => {
+                let reuse = value == "@codex";
+                let mut profile = Profile::from_model("chatgpt:model")?;
+                profile.reuse_codex_login = reuse;
+                (ConnectionForm::Subscription, "chatgpt".to_owned(), profile)
+            }
+            _ if value.starts_with("@api/") => {
+                let provider = value.trim_start_matches("@api/");
+                (
+                    ConnectionForm::Api,
+                    provider
+                        .split('/')
+                        .next()
+                        .unwrap_or(provider)
+                        .replace('-', "_"),
+                    Profile::from_model(&format!("{provider}:model"))?,
+                )
+            }
+            _ => {
+                let profile = config.profile(Some(value))?.clone();
+                return self.apply_connection(
+                    engine,
+                    data,
+                    ConnectionChange {
+                        config,
+                        revision,
+                        name: value.into(),
+                        profile,
+                    },
+                );
+            }
+        };
+        let name = unused_connection_name(&config, data, &suggested);
+        let model = if profile.provider_identity() == self.settings.profile.provider_identity() {
+            model_name(&self.settings.profile)
+        } else {
+            String::new()
+        };
+        let mut fields = vec![
+            field("连接名称 · 字母、数字、_ 或 -", name.clone(), false),
+            field("模型名称 · 原生名称", model, false),
+        ];
+        let title = match &form {
+            ConnectionForm::Api => {
+                fields.push(field(
+                    "API endpoint · 完整 URL",
+                    profile.endpoint().unwrap_or_default(),
+                    false,
+                ));
+                fields.push(field(
+                    "API key · 留空使用环境变量或原生认证",
+                    String::new(),
+                    true,
+                ));
+                format!(
+                    "添加连接 · {}",
+                    model_provider(&profile).split('/').next().unwrap_or("API")
+                )
+            }
+            ConnectionForm::Subscription => if profile.reuse_codex_login {
+                "ChatGPT · 现有登录"
+            } else {
+                "ChatGPT · 设备登录"
+            }
+            .into(),
+            ConnectionForm::Model => unreachable!(),
+        };
+        self.ui.open_form(title, fields);
+        self.connection_setup = Some(ConnectionSetup {
+            change: ConnectionChange {
+                config,
+                revision,
+                name,
+                profile,
+            },
+            form,
+        });
+        Ok(())
+    }
+    fn submit_connection_form(&mut self, engine: &mut Engine, data: &Path) -> Result<()> {
+        ensure!(self.ui.form_is_editable(), "扩大窗口后编辑和保存；Esc 返回");
+        let values = self.ui.form_values().context("连接表单已关闭")?;
+        let (step, _) = self.ui.form_step().context("连接表单已关闭")?;
+        let setup = self
+            .connection_setup
+            .as_ref()
+            .context("连接表单已失效，请重新打开")?;
+        let value = values[step].trim();
+        match (&setup.form, step) {
+            (ConnectionForm::Model, 0) => {
+                setup.change.profile.with_model(&format!(
+                    "{}:{value}",
+                    model_provider(&setup.change.profile)
+                ))?;
+            }
+            (_, 0) => {
+                validate_profile_name(value)?;
+                ensure!(
+                    !setup.change.config.profiles.contains_key(value)
+                        && !data.join("profiles").join(value).exists(),
+                    "连接名称已存在，请换一个名称"
+                );
+            }
+            (_, 1) => {
+                Profile::from_model(&format!(
+                    "{}:{value}",
+                    model_provider(&setup.change.profile)
+                ))?;
+            }
+            (ConnectionForm::Api, 2) => {
+                setup.change.profile.with_endpoint(value)?;
+            }
+            (ConnectionForm::Api, 3) => ensure!(
+                !values[step].chars().any(char::is_control),
+                "API key 必须是单行文字"
+            ),
+            _ => {}
+        }
+        if !self.ui.advance_form() {
+            return Ok(());
+        }
+        let mut setup = self.connection_setup.take().context("连接表单已关闭")?;
+        let original = setup.clone();
+        let result = (|| -> Result<()> {
+            if matches!(setup.form, ConnectionForm::Model) {
+                setup.change.profile = setup.change.profile.with_model(&format!(
+                    "{}:{}",
+                    model_provider(&setup.change.profile),
+                    values[0].trim()
+                ))?;
+                self.apply_connection(engine, data, setup.change)?;
+            } else {
+                setup.change.name = values[0].trim().into();
+                validate_profile_name(&setup.change.name)?;
+                ensure!(
+                    !setup
+                        .change
+                        .config
+                        .profiles
+                        .contains_key(&setup.change.name),
+                    "连接名称已存在，请换一个名称"
+                );
+                setup.change.profile = setup.change.profile.with_model(&format!(
+                    "{}:{}",
+                    model_provider(&setup.change.profile),
+                    values[1].trim()
+                ))?;
+                if matches!(setup.form, ConnectionForm::Api) {
+                    setup.change.profile = setup.change.profile.with_endpoint(values[2].trim())?;
+                }
+                // Reserve a fresh credential directory. Another setup cannot
+                // overwrite the key while our config transaction is pending.
+                bone::has_api_key(data, &setup.change.name)?; // also rejects credential path symlinks
+                std::fs::create_dir_all(data.join("profiles"))?;
+                std::fs::create_dir(data.join("profiles").join(&setup.change.name))
+                    .context("连接名称已被使用，请重新打开连接列表")?;
+                let name = setup.change.name.clone();
+                let reservation = CredentialReservation {
+                    data: data.to_owned(),
+                    name: name.clone(),
+                };
+                match setup.form {
+                    ConnectionForm::Api => {
+                        if !values[3].trim().is_empty() {
+                            bone::save_api_key(
+                                data,
+                                &name,
+                                &setup.change.profile,
+                                values[3].trim(),
+                            )?;
+                        }
+                        self.apply_connection(engine, data, setup.change)?;
+                    }
+                    ConnectionForm::Subscription => {
+                        self.ui.close_layer();
+                        self.ui.open_detail(
+                            "登录 ChatGPT",
+                            "正在读取登录信息…\n\nEsc 取消，当前连接和草稿保留。",
+                        );
+                        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+                        let handler = DeviceCodeHandler::new(move |prompt| {
+                            let _ = sender.try_send(prompt);
+                        });
+                        let data = data.to_owned();
+                        self.login_codes = Some(receiver);
+                        self.login = Some(tokio::spawn(async move {
+                            bone::login_with(
+                                &setup.change.profile,
+                                &data,
+                                &setup.change.name,
+                                rig_core::http_client::DynHttpClient::new(rig_reqwest::shared()),
+                                handler,
+                            )
+                            .await?;
+                            Ok((setup.change, reservation))
+                        }));
+                    }
+                    ConnectionForm::Model => unreachable!(),
+                }
+            }
+            Ok(())
+        })();
+        if result.is_ok() && self.ui.form_is_open() {
+            self.ui.close_layer();
+        }
+        // A failed transaction keeps all form editors intact. Reopen loads a
+        // fresh revision rather than silently replaying a conflicting save.
+        if result.is_err() {
+            self.connection_setup = Some(original);
+        }
+        result
+    }
+    fn apply_connection(
+        &mut self,
+        engine: &mut Engine,
+        data: &Path,
+        mut change: ConnectionChange,
+    ) -> Result<()> {
+        change.profile.validate()?;
+        change
+            .config
+            .profiles
+            .insert(change.name.clone(), change.profile.clone());
+        change.config.default_profile = change.name.clone();
+        pause(engine, &mut self.ui)?;
+        self.clear_preview();
+        let old_name = self.settings.profile_name.clone();
+        let old_profile = self.settings.profile.clone();
+        engine.set_profile(change.profile.clone(), change.name.clone())?;
+        let mut warning = None;
+        if let Err(error) = change.config.save_checked(data, &change.revision) {
+            let installed = Config::load(data).ok().is_some_and(|saved| {
+                serde_json::to_value(saved).ok() == serde_json::to_value(&change.config).ok()
+            });
+            if !installed {
+                engine.set_profile(old_profile, old_name)?;
+                return Err(error);
+            }
+            warning = Some(format!("配置已安装，磁盘同步失败：{error:#}"));
+        }
+        self.settings.profile_name = change.name;
+        self.settings.profile = change.profile;
+        self.ui.notice = warning
+            .unwrap_or_else(|| "连接与模型已保存 · 首次请求验证认证 · Ctrl+R 继续工作".into());
+        Ok(())
+    }
+    fn cancel_login(&mut self) {
+        abort_task(&mut self.login);
+        self.login_codes = None;
+    }
+    fn start_diff(&mut self, engine: &Engine) {
+        abort_task(&mut self.diff);
+        let workspace = engine.state().workspace.clone();
+        self.diff = Some(tokio::spawn(
+            async move { services::git_diff(&workspace).await },
+        ));
+        self.detail_event = None;
+        self.ui
+            .open_detail("项目修改（只读）", "正在读取 Git 修改…");
     }
     fn complete_file(&mut self, engine: &Engine) {
         let cursor = self.ui.cursor();
@@ -751,10 +1142,15 @@ impl App {
         }
     }
     fn switch_session(&mut self, engine: &mut Engine, data: &Path, id: Option<&str>) -> Result<()> {
+        ensure!(
+            self.reconcile_call.is_none(),
+            "先记录或取消核查，再切换会话；核查草稿保留"
+        );
         if id == Some(engine.state().id.as_str()) {
             self.ui.picker = None;
             return Ok(());
         }
+        let sidebar = self.ui.focus == Focus::Sessions;
         self.save(engine, data)?;
         pause(engine, &mut self.ui)?;
         self.clear_preview();
@@ -769,6 +1165,9 @@ impl App {
         *engine = next;
         self.drafts.clear();
         self.load(engine, data)?;
+        if sidebar {
+            self.ui.focus = Focus::Sessions;
+        }
         self.ui.notice = if id.is_some() {
             "会话已打开；未完成工作保持暂停，Ctrl+R 继续"
         } else {
@@ -777,33 +1176,28 @@ impl App {
         .into();
         Ok(())
     }
-    fn set_model(&mut self, engine: &mut Engine, value: &str) -> Result<()> {
-        if value == "@current" {
-            self.ui.picker = None;
-            return Ok(());
-        }
-        let (name, profile) = if let Some((name, profile)) = self
-            .settings
-            .profiles
-            .iter()
-            .find(|(name, _)| name == value)
-        {
-            (name.clone(), profile.clone())
-        } else if value == self.settings.profile_name {
-            (value.to_owned(), self.settings.profile.clone())
+    fn set_model(&mut self, engine: &mut Engine, data: &Path, value: &str) -> Result<()> {
+        let (config, revision) = Config::load_with_revision(data)?;
+        let native = if Profile::from_model(value).is_ok() {
+            value.to_owned()
         } else {
-            let profile = profile_with_model(&self.settings.profile, value)?;
-            (self.settings.profile_name.clone(), profile)
+            format!("{}:{value}", model_provider(&self.settings.profile))
         };
-        profile.validate()?;
-        pause(engine, &mut self.ui)?;
-        engine.set_profile(profile.clone(), name.clone())?;
-        self.settings.profile_name = name;
-        self.settings.profile = profile;
-        self.clear_preview();
-        self.ui.picker = None;
-        self.ui.notice = "模型已切换；工作保留，Ctrl+R 继续。配置文件未修改".into();
-        Ok(())
+        let profile = self.settings.profile.with_model(&native)?;
+        ensure!(
+            profile.provider_identity() == self.settings.profile.provider_identity(),
+            "切换 provider 请使用 /connect"
+        );
+        self.apply_connection(
+            engine,
+            data,
+            ConnectionChange {
+                config,
+                revision,
+                name: self.settings.profile_name.clone(),
+                profile,
+            },
+        )
     }
     fn refresh_completion(&mut self, engine: &Engine, data: &Path) -> Result<()> {
         let draft = self.ui.draft();
@@ -820,13 +1214,13 @@ impl App {
         if is_complete_command(prefix) && cursor == draft.len() {
             self.ui.close_completion();
         } else if draft.starts_with('/') && !prefix.contains(char::is_whitespace) {
-            self.ui
-                .open_completion(PickerKind::Command, command_items(), prefix.to_owned());
-        } else if let Some(query) = prefix.strip_prefix("/model ") {
-            self.models();
-            let items = self.ui.picker.take().map(|p| p.items).unwrap_or_default();
-            self.ui
-                .open_completion(PickerKind::Model, items, query.to_owned());
+            let items = command_items();
+            if items.iter().any(|item| item.value.starts_with(prefix)) {
+                self.ui
+                    .open_completion(PickerKind::Command, items, prefix.to_owned());
+            } else {
+                self.ui.close_completion();
+            }
         } else if let Some(query) = prefix.strip_prefix("/sessions ") {
             self.sessions(engine, data)?;
             self.ui
@@ -856,10 +1250,6 @@ impl App {
             PickerKind::Command => {
                 self.ui.take_draft();
                 self.ui.paste(&format!("{value} "));
-            }
-            PickerKind::Model => {
-                self.ui.take_draft();
-                self.ui.paste(&format!("/model {value}"));
             }
             PickerKind::Session => {
                 self.ui.take_draft();
@@ -969,13 +1359,10 @@ impl App {
     fn bind_reply(&mut self, engine: &Engine, id: &str) -> Result<()> {
         ensure!(
             engine.unanswered_questions().iter().any(|q| q.id == id),
-            "回复目标已失效；草稿和原目标保留，/questions 查看待答问题"
+            "回复目标已失效；草稿和原目标保留，Ctrl+P 查看待答问题"
         );
         self.switch_target(Some(id.to_owned()));
-        self.ui.notice = format!(
-            "已选择回复 {}；Enter 回答，/message 返回新要求草稿",
-            short_id(id)
-        );
+        self.ui.notice.clear(); // The persistent target strip confirms the selection.
         Ok(())
     }
     fn cancel_reply(&mut self) {
@@ -1182,6 +1569,10 @@ impl App {
     }
     async fn copy_selected(&mut self, engine: &Engine) -> Result<()> {
         ensure!(
+            !self.ui.form_is_open(),
+            "连接表单不复制凭据；Esc 返回原草稿后复制"
+        );
+        ensure!(
             !self.ui.show_help,
             "当前对象是键盘帮助；Esc 返回后选择草稿或持久记录复制"
         );
@@ -1262,8 +1653,35 @@ impl App {
             || self.diff.is_some()
             || self.export.is_some()
             || self.search.is_some()
+            || self.login.is_some()
     }
-    async fn tasks(&mut self) {
+    async fn tasks(&mut self, engine: &mut Engine, data: &Path) {
+        if let Some(prompt) = self
+            .login_codes
+            .as_mut()
+            .and_then(|codes| codes.try_recv().ok())
+            && self.login.is_some()
+        {
+            self.ui.detail = Some((
+                "登录 ChatGPT".into(),
+                format!(
+                    "打开：{}\n\n输入验证码：{}\n\n正在等待浏览器登录。\nEsc 取消，当前连接和草稿保留。",
+                    prompt.verification_uri, prompt.user_code
+                ),
+            ));
+        }
+        if let Some(result) = finished_task(&mut self.login).await {
+            self.login_codes = None;
+            self.ui.close_layer();
+            match result {
+                Ok((change, _reservation)) => {
+                    if let Err(error) = self.apply_connection(engine, data, change) {
+                        self.ui.open_detail("连接未保存", format!("{error:#}\n\n当前连接和草稿保留。Esc 返回后重新打开 /connect。"));
+                    }
+                },
+                Err(_) => self.ui.open_detail("登录未完成", "当前连接和草稿保留。\n检查本机 Codex 登录，或通过 /connect 重新登录。\n\nEsc 返回。"),
+            }
+        }
         if let Some(result) = finished_task(&mut self.search).await {
             match result {
                 Ok(items) => {
@@ -1281,8 +1699,10 @@ impl App {
             }
         }
         if let Some(result) = finished_task(&mut self.session_index).await {
+            self.ui.sessions_loading = false;
             match result {
                 Ok(items) => {
+                    self.ui.set_sessions(items.clone());
                     if let Some(picker) = self
                         .ui
                         .picker
@@ -1290,7 +1710,6 @@ impl App {
                         .filter(|p| p.kind == PickerKind::Session)
                     {
                         picker.items = items;
-                        self.ui.notice = "按对话标题或 Session ID 搜索；Enter 打开".into();
                     }
                 }
                 Err(error) => self.ui.notice = format!("读取会话失败：{error:#}"),
@@ -1378,9 +1797,16 @@ impl App {
             }
             "/model" => {
                 if args.is_empty() {
-                    self.models();
+                    self.model_form(data)?;
                 } else {
-                    self.set_model(engine, args)?;
+                    self.set_model(engine, data, args)?;
+                }
+            }
+            "/connect" => {
+                if args.is_empty() {
+                    self.connections(data)?;
+                } else {
+                    self.connection_choice(engine, data, args)?;
                 }
             }
             "/files" => self.complete_file(engine),
@@ -1448,14 +1874,7 @@ impl App {
                 self.ui.open_detail("会话状态", detail);
             }
             "/diff" => {
-                abort_task(&mut self.diff);
-                let workspace = engine.state().workspace.clone();
-                self.diff = Some(tokio::spawn(
-                    async move { services::git_diff(&workspace).await },
-                ));
-                self.detail_event = None;
-                self.ui
-                    .open_detail("项目修改（只读）", "正在读取 Git 修改…");
+                self.start_diff(engine);
             }
             "/export" => {
                 ensure!(self.export.is_none(), "export is already running");
@@ -1600,71 +2019,59 @@ fn model_label(profile: &Profile) -> String {
         ModelReference::Candle { .. } => "candle".into(),
     }
 }
-fn profile_with_model(current: &Profile, value: &str) -> Result<Profile> {
-    use rig_core::providers::registry::{Provider, ProviderRef};
-    let mut next = Profile::from_model(value)?;
-    let preserved = match (&current.model, &next.model) {
-        (ModelReference::Registry(old), ModelReference::Registry(new))
-            if old.id() == new.id() && old.id().is_some() =>
-        {
-            let reference = match old.provider() {
-                Provider::Registered(id) => ProviderRef::registered(*id, new.model())?,
-                Provider::Configured(config) => {
-                    ProviderRef::configured(config.clone(), new.model())?
-                }
-            };
-            Some(ModelReference::Registry(reference))
-        }
-        (ModelReference::Cohere { cohere, .. }, ModelReference::Cohere { model, .. }) => {
-            Some(ModelReference::Cohere {
-                cohere: cohere.clone(),
-                model: model.clone(),
-            })
-        }
-        (ModelReference::Ollama { ollama, .. }, ModelReference::Ollama { model, .. }) => {
-            Some(ModelReference::Ollama {
-                ollama: ollama.clone(),
-                model: model.clone(),
-            })
-        }
-        (ModelReference::Bedrock { .. }, ModelReference::Bedrock { .. })
-        | (ModelReference::VertexAi { .. }, ModelReference::VertexAi { .. }) => {
-            Some(next.model.clone())
-        }
-        _ => None,
-    };
-    if let Some(model) = preserved {
-        next = current.clone();
-        next.model = model;
+fn model_name(profile: &Profile) -> String {
+    model_label(profile)
+        .split_once(':')
+        .map(|(_, name)| name.to_owned())
+        .unwrap_or_default()
+}
+fn model_provider(profile: &Profile) -> String {
+    model_label(profile)
+        .split_once(':')
+        .map(|(provider, _)| provider.to_owned())
+        .unwrap_or_default()
+}
+fn field(label: &str, value: String, secret: bool) -> FormField {
+    FormField {
+        label: label.into(),
+        value,
+        secret,
     }
-    // A change of provider uses that provider's own credential recipe. A model
-    // change within a provider preserves its endpoint, dialect, and auth source.
-    next.validate()?;
-    Ok(next)
+}
+fn action(label: &str, value: &str, detail: &str) -> PickerItem {
+    PickerItem {
+        label: label.into(),
+        value: value.into(),
+        detail: detail.into(),
+    }
+}
+fn unused_connection_name(config: &Config, data: &Path, base: &str) -> String {
+    for index in 0.. {
+        let name = if index == 0 {
+            base.into()
+        } else {
+            format!("{base}_{index}")
+        };
+        if !config.profiles.contains_key(&name) && !data.join("profiles").join(&name).exists() {
+            return name;
+        }
+    }
+    unreachable!()
+}
+fn cleanup_connection(data: &Path, name: &str) {
+    // Only fresh, reserved directories use this cleanup. An unreadable config
+    // leaves credentials in place; uncertainty must not remove a live source.
+    if Config::load(data)
+        .ok()
+        .is_some_and(|config| !config.profiles.contains_key(name))
+    {
+        let _ = std::fs::remove_dir_all(data.join("profiles").join(name));
+    }
 }
 const COMMANDS: &[(&str, &str)] = &[
     ("/new", "新对话，当前工作保存并暂停"),
-    ("/sessions", "搜索并打开当前项目的会话"),
-    ("/model", "选择模型配置；/model 原生名称可覆盖当前模型"),
-    ("/status", "模型、执行限制、用量与未确认写入"),
-    ("/diff", "查看 Git 修改，包括 staged 与 unstaged"),
-    ("/files", "插入项目文件引用"),
-    ("/search", "搜索整个会话的持久原文；Ctrl+F"),
-    ("/questions", "显式选择回复目标；Esc 返回原阅读层"),
-    ("/message", "返回新要求草稿，明确切换发送目标"),
-    ("/delivery", "直达最近持久交付及其输入来源"),
-    ("/audit", "查看当前持久结果的审计原文"),
-    ("/reply", "指定问题 ID 作为回复目标"),
-    ("/reconcile", "核查未知写入并记录实际结果"),
-    ("/mouse", "切换鼠标滚动和终端原生文本选择"),
-    ("/older", "向前翻页，保留当前阅读位置"),
-    ("/latest", "返回最近对话窗口，保留草稿"),
-    ("/export", "导出本地 HTML 对话与行动报告"),
-    ("/editor", "用 VISUAL / EDITOR 编辑长输入"),
-    ("/copy", "复制当前草稿、选区、详情或明确选中的持久对象"),
-    ("/details", "展开或隐藏内部事件记录"),
-    ("/stop", "暂停所有工作"),
-    ("/resume", "恢复暂停工作"),
+    ("/model", "修改当前连接的模型"),
+    ("/connect", "选择连接，登录 ChatGPT 或添加 API"),
     ("/help", "键盘帮助"),
     ("/quit", "保存并退出"),
 ];
@@ -1695,15 +2102,27 @@ fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<Pic
         .filter(|s| s.workspace == workspace)
         .take(200)
     {
-        let first = bone::history_page(data, &session.id, None, 1)?;
         let last = bone::history_before(data, &session.id, None, 1)?;
-        let title = first
-            .events
-            .first()
-            .filter(|e| e.data["source"] == "user")
-            .map(|e| {
-                native_text(&e.data["message"])
-                    .lines()
+        let mut cursor = None;
+        let title = loop {
+            // Before the first user input, there can be saved stop/config
+            // records. Do not mistake those for the conversation's title.
+            let page = bone::history_page(data, &session.id, cursor.as_deref(), 1)?;
+            if let Some(event) = page
+                .events
+                .first()
+                .filter(|e| e.kind == "input" && e.data["source"] == "user")
+            {
+                break Some(native_text(&event.data["message"]));
+            }
+            if !page.has_more {
+                break None;
+            }
+            cursor = page.next_cursor;
+        };
+        let title = title
+            .map(|text| {
+                text.lines()
                     .next()
                     .unwrap_or("")
                     .chars()
@@ -1729,14 +2148,25 @@ fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<Pic
                     }
                 ),
                 detail: format!(
-                    "{} · {} · {} 轮",
-                    session.id,
+                    "{} 轮 · {}",
+                    session.revision,
                     if session.paused {
                         "已暂停"
+                    } else if session
+                        .jobs
+                        .values()
+                        .any(|job| matches!(job.state, JobState::Ready | JobState::Running))
+                    {
+                        "进行中"
+                    } else if session
+                        .jobs
+                        .values()
+                        .any(|job| job.state == JobState::Waiting)
+                    {
+                        "等待中"
                     } else {
                         "已保存"
-                    },
-                    session.revision
+                    }
                 ),
                 value: session.id,
             },
@@ -1822,6 +2252,7 @@ pub(super) async fn run(
     abort_task(&mut app.session_index);
     abort_task(&mut app.search);
     abort_task(&mut app.export);
+    app.cancel_login();
     drop(terminal);
     eprintln!(
         "Session: {}\n继续：bone --data-dir {} --profile {} --model {} tui --session {} --workspace {}{}\n打开后 Ctrl+R 恢复暂停的工作。",
@@ -1863,7 +2294,11 @@ async fn event_loop(
     loop {
         if dirty {
             app.metadata(engine);
-            let model = model_label(&app.settings.profile);
+            let model = format!(
+                "{} · {}",
+                app.settings.profile_name,
+                model_name(&app.settings.profile)
+            );
             let fact = app.ui.live_status.clone();
             terminal
                 .terminal
@@ -1884,8 +2319,17 @@ async fn event_loop(
                             KeyCode::Char('q') if control => return Ok(()),
                             KeyCode::Char('c') if control => {
                                 pause(engine, &mut app.ui)?; app.clear_preview(); deadline = None;
+                                if app.login.is_some() { app.cancel_login(); app.ui.close_layer(); app.ui.notice = "登录已取消，当前连接保留".into(); }
                             },
                             KeyCode::Char('y') if control => { if let Err(error) = app.copy_selected(engine).await { app.ui.notice = format!("复制失败：{error:#}"); } },
+                            KeyCode::Esc if app.login.is_some() => { app.cancel_login(); app.ui.close_layer(); app.ui.notice = "登录已取消，当前连接和草稿保留".into(); },
+                            KeyCode::F(1) if app.login.is_some() => {},
+                            _ if app.login.is_some() => app.ui.handle_key(key),
+                            KeyCode::Esc if app.ui.form_is_open() => { app.ui.close_layer(); app.connection_setup = None; },
+                            KeyCode::Enter if app.ui.form_is_open() => {
+                                if let Err(error) = app.submit_connection_form(engine, data) { app.ui.form_error(format!("{error:#}")); }
+                            },
+                            _ if app.ui.form_is_open() => app.ui.handle_key(key),
                             KeyCode::Char('f') if control => app.start_search(engine, data, ""),
                             KeyCode::Esc if app.reconcile_editor_active() => { app.handle_reconcile_key(engine, key)?; },
                             KeyCode::Char('d') if control && app.reconcile_call.is_some() => {
@@ -1896,6 +2340,7 @@ async fn event_loop(
                                     }
                                 }
                             },
+                            KeyCode::Char('d') if control => app.start_diff(engine),
                             KeyCode::Char('D') if !control && (app.ui.detail.is_some() || app.ui.focus == Focus::Conversation) => {
                                 if let Err(error) = app.open_audit(engine) { app.ui.notice = format!("读取审计失败：{error:#}"); }
                             },
@@ -1907,7 +2352,7 @@ async fn event_loop(
                             },
                             KeyCode::Char('r') if control && app.reconcile_call.is_some() => app.ui.notice = "先记录或取消核查；执行仍暂停".into(),
                             KeyCode::Char('r') if control => { resume(engine, &mut app.ui); deadline = Some(Instant::now()+duration); },
-                            KeyCode::Char('p') if control => app.commands(String::new()),
+                            KeyCode::Char('p') if control => app.commands(engine, String::new()),
                             KeyCode::Char('o') if control => app.complete_file(engine),
                             KeyCode::Char('g') if control => {
                                 if let Err(error) = app.editor(engine, data, terminal, &mut input).await { app.ui.notice = format!("编辑失败：{error:#}"); }
@@ -1928,7 +2373,7 @@ async fn event_loop(
                                             }
                                         },
                                         PickerKind::Session => app.switch_session(engine, data, Some(&value)).map(|_|false),
-                                        PickerKind::Model => app.set_model(engine, &value).map(|_|false),
+                                        PickerKind::Connection => app.connection_choice(engine, data, &value).map(|_|false),
                                         PickerKind::History => {
                                             app.ui.select_message(&value);
                                             engine.read_event(&value).and_then(|e| detail(engine, &e)).map(|text| {
@@ -1978,7 +2423,8 @@ async fn event_loop(
                                                         app.last_input = Some(id.clone());
                                                         app.last_admitted_input = None;
                                                         app.ui.notice = format!("输入 {} 已接收 · 等待纳入执行", short_id(&id));
-                                                        app.elapsed_from = Instant::now(); deadline = Some(Instant::now()+duration); },
+                                                        app.elapsed_from = Instant::now(); deadline = Some(Instant::now()+duration);
+                                                        app.refresh_sessions(engine, data); },
                                                     Err(error) => app.ui.notice = format!("发送失败：{error:#}；草稿已保留"),
                                                 }
                                             }
@@ -1992,7 +2438,19 @@ async fn event_loop(
                                             }
                                         }
                                     },
-                                    Focus::Conversation => app.ui.toggle_selected_message(),
+                                    Focus::Conversation => {
+                                        let question = app.ui.selected_message().and_then(|m| m.event_id.as_deref())
+                                            .filter(|id| engine.unanswered_questions().iter().any(|q| q.id == *id)).map(str::to_owned);
+                                        if let Some(id) = question {
+                                            if let Err(error) = app.bind_reply(engine, &id) { app.ui.notice = format!("回复目标未切换：{error:#}"); }
+                                        } else { app.ui.toggle_selected_message(); }
+                                    },
+                                    Focus::Sessions => {
+                                        if let Some(id) = app.ui.selected_session().map(str::to_owned)
+                                            && let Err(error) = app.switch_session(engine, data, Some(&id)) {
+                                            app.ui.notice = format!("会话未切换：{error:#}");
+                                        }
+                                    },
                                 }
                             },
                             _ => app.ui.handle_key(key),
@@ -2019,7 +2477,7 @@ async fn event_loop(
             },
             _ = tick.tick(), if !engine.is_quiescent() || app.has_tasks() || app.changed_at.is_some() || app.notice_until.is_some() => {
                 let pending = app.has_tasks();
-                app.tasks().await;
+                app.tasks(engine, data).await;
                 let expired_notice = app.expire_notice();
                 dirty |= app.progress(engine) || !engine.is_quiescent() || pending || expired_notice;
                 if app.changed_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(500))
@@ -2074,10 +2532,6 @@ fn terminal_label(kind: &str) -> &str {
 
 fn is_complete_command(text: &str) -> bool {
     COMMANDS.iter().any(|(command, _)| *command == text)
-        && !matches!(
-            text,
-            "/reply" | "/model" | "/sessions" | "/search" | "/reconcile"
-        )
 }
 
 fn execution_active(state: &bone::state::SessionState) -> bool {
@@ -2181,7 +2635,7 @@ fn current_status(engine: &Engine, input: Option<&str>, tool_failure: Option<&st
     }
     let questions = engine.unanswered_questions().len();
     if questions > 0 {
-        return format!("等待回复 · {questions} 个问题 · /questions");
+        return format!("等待回复 · {questions} 个问题");
     }
     if state
         .jobs
@@ -2191,7 +2645,7 @@ fn current_status(engine: &Engine, input: Option<&str>, tool_failure: Option<&st
         return "等待工作结果".into();
     }
     if terminal.is_some() {
-        return "本次已完成 · /delivery 查看".into();
+        return "本次已完成".into();
     }
     if let Some(failure) = tool_failure {
         return format!("最近工具失败 {failure} · 暂无活动调用");

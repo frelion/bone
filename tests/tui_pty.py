@@ -3,6 +3,7 @@
 Only synthetic credentials and a scripted loopback Responses endpoint are used.
 """
 import argparse
+from contextlib import closing
 import html
 import hashlib
 import fcntl
@@ -27,12 +28,20 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def production_fingerprint():
+    digest = hashlib.sha256()
+    paths = [ROOT/'Cargo.toml',ROOT/'Cargo.lock',*(ROOT/'src').rglob('*.rs')]
+    for path in sorted(paths,key=lambda p:p.relative_to(ROOT).as_posix()):
+        digest.update(path.relative_to(ROOT).as_posix().encode()+b'\0'+path.read_bytes()+b'\0')
+    return digest.hexdigest()
+
+
 def tool(name, arguments):
     return {"type": "function_call", "call_id": name + "-fixture", "name": name, "arguments": arguments}
 
 
 class Fixture:
-    def __init__(self, binary, turns, size=(30, 110), max_parallel=1):
+    def __init__(self, binary, turns, size=(30, 110), max_parallel=1, workspace_connections=False):
         self.directory = tempfile.TemporaryDirectory(prefix="bone-tui-pty-")
         self.root = Path(self.directory.name)
         self.data = self.root / "data"
@@ -40,13 +49,24 @@ class Fixture:
         self.data.mkdir()
         self.workspace.mkdir()
         self.requests = self.root / "requests.jsonl"
-        script = self.root / "turns.json"
-        script.write_text(json.dumps({"turns": turns}))
-        self.server = subprocess.Popen([sys.executable, "-B", str(ROOT / "tests/scripted_responses.py"),
-            "--script", str(script), "--requests", str(self.requests)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        ready, _, _ = select.select([self.server.stdout], [], [], 5)
-        assert ready, "fixture endpoint did not start"
-        port = int(self.server.stdout.readline())
+        self.servers = []
+        self.request_routes = {'api_a':self.requests}
+        def start_endpoint(label, endpoint_turns, requests):
+            script = self.root / (label+'-turns.json')
+            script.write_text(json.dumps({'turns':endpoint_turns}))
+            server = subprocess.Popen([sys.executable,'-B',str(ROOT/'tests/scripted_responses.py'),
+                '--script',str(script),'--requests',str(requests)],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+            self.servers.append(server)
+            ready,_,_ = select.select([server.stdout],[],[],5)
+            assert ready, 'fixture endpoint did not start: '+label
+            return server,int(server.stdout.readline())
+        self.server,port = start_endpoint('api-a',turns['api_a'] if workspace_connections else turns,self.requests)
+        self.api_a_url = f'http://127.0.0.1:{port}/v1'
+        if workspace_connections:
+            self.requests_b = self.root/'requests-b.jsonl'
+            _,port_b = start_endpoint('api-b',turns['api_b'],self.requests_b)
+            self.api_b_url = f'http://127.0.0.1:{port_b}/v1'
+            self.request_routes['api_b'] = self.requests_b
         (self.data / "config.toml").write_text(f'''default_profile = "fixture"
 [profiles.fixture]
 credential_env = "BONE_TUI_FIXTURE_KEY"
@@ -60,12 +80,33 @@ dialect = "openai"
 route = "Responses"
 auth = "Bearer"
 ''')
+        if workspace_connections:
+            # Native ChatGPT wire, but only a fixture endpoint and a cache we
+            # authored. No Codex login source or host credential is read.
+            with (self.data/'config.toml').open('a') as config:
+                config.write(f'''\n[profiles.subscription_fixture]
+reuse_codex_login = false
+[profiles.subscription_fixture.model]
+model = "arbitrary-subscription-fixture-model"
+[profiles.subscription_fixture.model.config.openai]
+api_key = ""
+base_url = "{self.api_b_url}"
+dialect = "chatgpt"
+route = "Responses"
+auth = "Bearer"
+''')
+            auth = self.data/'profiles/subscription_fixture/auth.json'
+            auth.parent.mkdir(parents=True)
+            auth.write_text(json.dumps({'access_token':'synthetic-subscription-only-secret-48117','expires_at':4102444800}))
+            auth.chmod(0o600)
         self.master, self.slave = pty.openpty()
         self.original = termios.tcgetattr(self.slave)
         self.rows, self.cols = size
         self.resize(*size)
         env = {k: v for k, v in os.environ.items() if k not in ("BONE_MODEL", "CHATGPT_ACCESS_TOKEN", "OPENAI_API_KEY")}
         env.update(TERM="xterm-256color", BONE_TUI_FIXTURE_KEY="synthetic-local-only")
+        if workspace_connections:
+            env['BONE_TUI_FIXTURE_B_KEY'] = 'synthetic-second-route-secret-76113'
         editor = self.root / "fixture-editor"
         editor.write_text('#!/bin/sh\nprintf "%s" "EDITOR_REFERENCE_ONLY" > "$1"\n')
         editor.chmod(0o700)
@@ -81,7 +122,11 @@ auth = "Bearer"
         self.binary = binary
         self.max_parallel = max_parallel
         self.binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
-        self.proc = subprocess.Popen([str(binary), "--data-dir", str(self.data), "--profile", "fixture", "tui",
+        self.source_fingerprint = production_fingerprint()
+        self.harness_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        self.explicit_profile = None if workspace_connections else 'fixture'
+        profile_args = ['--profile',self.explicit_profile] if self.explicit_profile else []
+        self.proc = subprocess.Popen([str(binary), "--data-dir", str(self.data), *profile_args, "tui",
             "--workspace", str(self.workspace), "--max-parallel", str(max_parallel), "--max-calls", "16"],
             stdin=self.slave, stdout=self.slave, stderr=self.slave, env=env, start_new_session=True)
         self.output = bytearray()
@@ -263,10 +308,15 @@ auth = "Bearer"
         snapshot = self.state()
         self.frames.append({"step": label, "screen": screen, "requests": len(self.calls()),
             "events": len(self.events()), "size": [self.rows, self.cols],
+            "snapshot_session": snapshot['id'],
+            "sessions": {key:{'paused':value.get('paused'),'unknown_writes':len(value.get('unknown_writes',{})),
+                'job_states':{job_id:job.get('state') for job_id,job in value.get('jobs',{}).items()}}
+                for key,value in self.session_states().items()},
             "cursor": list(self.terminal_cursor), "paused": snapshot.get("paused"),
             "cursor_visible": self.cursor_visible, "cell_styles": self.cell_styles,
             "cells": self.terminal_cells,
             "unknown_writes": len(snapshot.get("unknown_writes", {})),
+            "request_routes": {label:len(self.route_calls(label)) for label in self.request_routes},
             "running_jobs": sum(str(job.get('state','')).lower() == 'running' for job in snapshot.get('jobs', {}).values()),
             "job_states": {key:job.get('state') for key,job in snapshot.get('jobs', {}).items()}})
 
@@ -275,6 +325,9 @@ auth = "Bearer"
         document = {"scenario": name, "scope": "Real PTY; synthetic protocol fixture, no real model or personal credentials",
             "status": 'OBSERVED' if getattr(self,'observation_mode',False) else ("FAIL" if error else "PASS"), "error": str(error) if error else None,
             "binary": str(self.binary), "binary_sha256_at_start": self.binary_sha256, "max_parallel": self.max_parallel,
+            "source_fingerprint_at_start": self.source_fingerprint, "source_fingerprint_at_end": production_fingerprint(),
+            "harness_sha256_at_start": self.harness_sha256, "harness_sha256_at_end": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "no_color": 'NO_COLOR' in self.env,
             "checks": getattr(self,'acceptance_checks',None), "frames": self.frames}
         (directory / (name + ".json")).write_text(json.dumps(document, ensure_ascii=False, separators=(',', ':')))
         cards = "".join("<section><h2>" + html.escape(frame["step"]) + "</h2><p>Requests: " + str(frame["requests"]) +
@@ -287,7 +340,8 @@ auth = "Bearer"
         assert self.proc.poll() is not None
         self.output.clear()
         self.answered_queries = 0
-        self.proc = subprocess.Popen([str(self.binary), "--data-dir", str(self.data), "--profile", "fixture", "tui",
+        profile_args = ['--profile',self.explicit_profile] if self.explicit_profile else []
+        self.proc = subprocess.Popen([str(self.binary), "--data-dir", str(self.data), *profile_args, "tui",
             "--workspace", str(self.workspace), "--session", session, "--max-parallel", str(self.max_parallel), "--max-calls", "16"],
             stdin=self.slave, stdout=self.slave, stderr=self.slave, env=self.env, start_new_session=True)
         self.wait(lambda: b'\x1b[?1049h' in self.output, "reopened TUI startup")
@@ -296,21 +350,36 @@ auth = "Bearer"
         return [json.loads(path.read_text()) for path in (self.data / 'tui').glob('*.json')]
 
     def calls(self):
-        return [json.loads(line) for line in self.requests.read_text().splitlines()] if self.requests.exists() else []
+        return [call for label in self.request_routes for call in self.route_calls(label)]
 
-    def events(self):
+    def route_calls(self, label):
+        path = self.request_routes[label]
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def events(self, session=None):
         db = self.data / "sessions.sqlite3"
         if not db.exists():
             return []
         try:
-            with sqlite3.connect(db) as connection:
-                return [json.loads(row[0]) for row in connection.execute("SELECT payload FROM events ORDER BY sequence")]
+            with closing(sqlite3.connect(db)) as connection:
+                if session is None:
+                    rows = connection.execute("SELECT payload FROM events ORDER BY sequence")
+                else:
+                    rows = connection.execute("SELECT payload FROM events WHERE session_id=? ORDER BY sequence",(session,))
+                return [json.loads(row[0]) for row in rows]
         except sqlite3.OperationalError:
             return []
 
-    def state(self):
-        with sqlite3.connect(self.data / "sessions.sqlite3") as connection:
-            return json.loads(connection.execute("SELECT snapshot FROM sessions LIMIT 1").fetchone()[0])
+    def state(self, session=None):
+        session = session or getattr(self,'observed_session',None)
+        with closing(sqlite3.connect(self.data / "sessions.sqlite3")) as connection:
+            if session is None:
+                return json.loads(connection.execute("SELECT snapshot FROM sessions LIMIT 1").fetchone()[0])
+            return json.loads(connection.execute('SELECT snapshot FROM sessions WHERE id=?',(session,)).fetchone()[0])
+
+    def session_states(self):
+        with closing(sqlite3.connect(self.data/'sessions.sqlite3')) as connection:
+            return {row[0]:json.loads(row[1]) for row in connection.execute('SELECT id,snapshot FROM sessions')}
 
     def quit(self, command=b'\x11'):
         self.capture("Before exit: live alternate screen")
@@ -327,8 +396,9 @@ auth = "Bearer"
         if self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
-        self.server.kill()
-        self.server.wait()
+        for server in self.servers:
+            server.kill()
+            server.wait()
         os.close(self.master)
         os.close(self.slave)
         self.directory.cleanup()
@@ -391,7 +461,8 @@ def styled_frame(frame):
 
 
 def run_case(binary, name, turns, action, size=(30, 110), evidence_dir=None, observe=False):
-    fixture = Fixture(binary, turns, size, max_parallel=2 if name == 'feedback-flow' else 1)
+    fixture = Fixture(binary, turns, size, max_parallel=2 if name in ('feedback-flow','workspace-flow') else 1,
+        workspace_connections=name=='workspace-flow')
     fixture.observation_mode = observe
     try:
         fixture.wait(lambda: b'\x1b[?1049h' in fixture.output, "TUI startup")
@@ -509,7 +580,7 @@ def failure(f):
     assert f.proc.poll() is None, 'recoverable model failure terminated TUI'
     f.capture('Model HTTP failure remains actionable before exit')
     lines = f.screen().splitlines()
-    input_top = next((i for i,line in enumerate(lines) if '┌' in line and '输入中' in line),None)
+    input_top = next((i for i,line in enumerate(lines) if any(c in line for c in '┌╭╔') and '输入中' in line),None)
     status_line = lines[input_top-2] if input_top is not None and input_top >= 2 else ''
     assert '失败' in status_line, 'failure missing from primary status'
     assert '就绪' not in status_line, 'failed work presented as ready'
@@ -539,11 +610,17 @@ def feedback_flow(f):
     def spinner(capture):
         return ''.join(c for c in capture['screen'] if c in '⠋⠙⠹⠸⠼⠴⠦⠧')
     def editor_bounds(capture):
-        lines = capture['screen'].splitlines()
-        tops = [(y,line.find('┌')) for y,line in enumerate(lines) if '┌' in line and ('输入中' in line or '草稿只读' in line)]
+        cells = capture['cells']
+        tops = []
+        for y,row in enumerate(cells):
+            for x,cell in enumerate(row):
+                if cell not in ('┌','╭','╔'): continue
+                right = next((j for j in range(x+1,len(row)) if row[j] in ('┐','╮','╗')),len(row))
+                title = ''.join(row[x:right])
+                if '输入中' in title or '草稿只读' in title: tops.append((y,x))
         if not tops: return None
         y,x = tops[-1]
-        bottom = next((j for j in range(y+1,len(lines)) if capture['cells'][j][x] == '└'),None)
+        bottom = next((j for j in range(y+1,len(cells)) if cells[j][x] in ('└','╰','╚')),None)
         return (y,x,bottom) if bottom is not None else None
     def cursor_inside(capture):
         bounds = editor_bounds(capture)
@@ -618,6 +695,195 @@ def feedback_flow(f):
     failed = [c['name'] for c in f.acceptance_checks if not c['passed']]
     if failed and not f.observation_mode:
         raise AssertionError('; '.join(failed))
+
+
+def workspace_flow(f):
+    """One local protocol workflow; all credentials and both hosts are synthetic."""
+    f.acceptance_checks = []
+    def check(name, passed, observed=None):
+        f.acceptance_checks.append({'name':name,'passed':bool(passed),'observed':observed})
+        assert passed, name
+    def menu(query):
+        f.send(b'\x10')
+        f.pump(.12)
+        f.send(query+'\r')
+    def field(value, next_label=None):
+        f.send(b'\x01\x0b')
+        f.send(value+'\r')
+        if next_label: f.wait(lambda:f.visible('› '+next_label),'next native form field: '+next_label)
+        else: f.pump(.15)
+    def api_form():
+        menu('connect')
+        f.wait(lambda:f.visible('添加 API 连接'),'connection chooser')
+        f.send('添加\r')
+        f.wait(lambda:f.visible('API 模型'),'native provider picker')
+        f.send('openai API 模型\r')  # Vendor plus visible detail, excluding other OpenAI-wire vendors.
+        f.wait(lambda:f.visible('› 连接名称'),'API connection form')
+    def config_string(section, key):
+        # This fixture checks only basic quoted strings in its own config,
+        # keeping the existing system-Python harness dependency free.
+        current = ''
+        for line in (f.data/'config.toml').read_text().splitlines():
+            if line.startswith('['): current = line.strip()[1:-1]
+            elif current == section:
+                match = re.fullmatch(r'\s*'+re.escape(key)+r'\s*=\s*(".*")\s*',line)
+                if match: return json.loads(match.group(1))
+        return None
+    def body(name, route, model):
+        before = len(f.route_calls(route))
+        def delivered():
+            events = f.events(f.observed_session)
+            inputs = {e['id']:e for e in events if e['kind']=='input'}
+            return any(e['kind']=='delivery' and name in json.dumps(inputs.get(e.get('reply_to'),{})) for e in events)
+        f.send(name+'\r')
+        f.wait(delivered,'native delivery: '+name)
+        requests = f.route_calls(route)[before:]
+        models = [call['body'].get('model') for call in requests]
+        check('actual '+route+' request uses '+model, model in models,{'route':route,'models':models})
+    original = f.state()['id']
+    f.observed_session = original
+    f.send('WORKSPACE_SESSION_A\r')
+    f.wait(lambda:any(e['kind']=='question' for e in f.events()),'real question from original session')
+    question = next(e for e in f.events() if e['kind']=='question')
+    f.wait(lambda:any(e['kind']=='delivery' and e.get('job_id')!=question.get('job_id') for e in f.events()),'child job settles independently')
+    f.pump(.3)
+    check('session list is not a job list',len(f.session_states())==1 and len(f.state()['jobs'])==2,{'sessions':1,'jobs':len(f.state()['jobs'])})
+    # The legacy reader shares the asynchronous session-index path. Close it
+    # immediately and type while its result can still arrive.
+    f.send('/sessions\r')
+    f.send(b'\x1b')
+    f.pump(.12)
+    f.send('ASYNC_DRAFT_NOT_STOLEN')
+    f.wait(lambda:any(d.get('draft')=='ASYNC_DRAFT_NOT_STOLEN' for d in f.saved_drafts()),'input survives pending session index')
+    f.pump(.4)
+    f.capture('Session reader cancellation leaves native editing draft intact')
+    check('async session result leaves editable draft intact',any(d.get('draft')=='ASYNC_DRAFT_NOT_STOLEN' for d in f.saved_drafts()) and f.cursor_visible)
+    f.send(b'\x01\x0b')
+    f.send('/reply '+question['id']+'\r')
+    draft = '保留回复草稿_A\nTARGET_CURSOR_A'
+    f.send('\x1b[200~'+draft+'\x1b[201~')
+    f.send(b'\x1b[A\x01'+b'\x1b[C'*4)
+    f.wait(lambda:any(d.get('draft')==draft and d.get('reply_to')==question['id'] for d in f.saved_drafts()),'specific question draft is saved')
+    f.capture('Reply draft and its exact target before spatial focus changes')
+    f.send(b'\x1b[1;5D')
+    f.capture('Ctrl Left moves focus to session sidebar and hides editor caret')
+    check('sidebar focus hides editor cursor',not f.cursor_visible)
+    f.send(b'\x1b[1;5C!')
+    edited = '保留回复!草稿_A\nTARGET_CURSOR_A'
+    f.wait(lambda:any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()),'Ctrl Right restores original editor insertion point')
+    f.send(b'\x1b[1;5A')
+    f.capture('Ctrl Up reads conversation with draft intact')
+    check('conversation focus hides editing caret',not f.cursor_visible)
+    f.send(b'\x1b[1;5B')
+    f.capture('Ctrl Down restores editable reply draft')
+    check('input focus has visible hardware caret',f.cursor_visible)
+    before = len(f.calls())
+    menu('new')
+    f.wait(lambda:len(f.session_states())==2,'actual new SQLite session')
+    second = next(s for s in f.session_states() if s!=original)
+    f.observed_session = second
+    check('session change saves and pauses the source',f.state(original)['paused'] and any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()))
+    check('new session and focus actions do not call models',len(f.calls())==before)
+    f.send(b'\x1b[1;5B')
+    body('WORKSPACE_API_A','api_a','fixture')
+    # Left focus + End chooses the older source after the second session's
+    # actual delivery makes it the newest sidebar row.
+    f.pump(.3)
+    f.send(b'\x1b[1;5D\x1b[F\r')
+    f.wait(lambda:'保留回复!草稿_A' in f.screen(),'sidebar opens the original session')
+    f.observed_session = original
+    f.capture('Sidebar switches back to paused source: reply target and multiline draft remain')
+    check('reopened session retains its question target',any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()) and f.visible('回复 '+question['id'][:8]))
+    f.send(b'\x1b[1;5D\x1b[H\r')
+    f.wait(lambda:'API_A_ROUTE_CONFIRMED' in f.screen(),'sidebar returns to second session')
+    f.observed_session = second
+    f.send(b'\x1b[1;5B')
+    f.send('FORM_DRAFT_PRESERVED')
+    f.wait(lambda:any(d.get('draft')=='FORM_DRAFT_PRESERVED' for d in f.saved_drafts()),'form parent draft saved')
+    original_config = (f.data/'config.toml').read_bytes()
+    before = len(f.calls())
+    api_form()
+    field('fixture_b','模型名称')
+    field('arbitrary-org/model:v2','API endpoint')
+    field('not-an-absolute-url')
+    f.wait(lambda:'未保存' in f.screen(),'invalid endpoint remains unsaved in form')
+    f.capture('Invalid endpoint is a local form failure, preserving current connection and parent draft')
+    check('invalid local endpoint preserves usable config',(f.data/'config.toml').read_bytes()==original_config and len(f.calls())==before)
+    field(f.api_b_url,'API key')
+    key = f.env['BONE_TUI_FIXTURE_B_KEY']
+    f.send(key)
+    f.pump(.2)
+    f.capture('API key native textarea is masked and separate from the conversation draft')
+    check('secret is masked and never becomes main draft',key not in f.screen() and not any(key in json.dumps(d) for d in f.saved_drafts()))
+    f.send(b'\x1b')
+    f.wait(lambda:'FORM_DRAFT_PRESERVED' in f.screen(),'cancel restores form parent editor')
+    check('secret-step cancel preserves prior connection',(f.data/'config.toml').read_bytes()==original_config and len(f.calls())==before)
+    api_form()
+    field('fixture_b','模型名称')
+    field('arbitrary-org/model:v2','API endpoint')
+    field(f.api_b_url,'API key')
+    f.send(key+'\r')
+    f.wait(lambda:config_string('','default_profile')=='fixture_b','API B is durable default')
+    f.capture('API B saved without any model probe; first Job must verify authentication')
+    check('connection save makes no hidden model request',len(f.calls())==before and f.visible('首次请求验证认证'))
+    check('parent editor draft survives successful connection form',any(d.get('draft')=='FORM_DRAFT_PRESERVED' for d in f.saved_drafts()))
+    f.send(b'\x01\x0b\x12')
+    body('WORKSPACE_API_B','api_b','arbitrary-org/model:v2')
+    menu('model')
+    f.wait(lambda:f.visible('模型名称'),'single native model form')
+    native = 'native/any:opaque-model-v9'
+    field(native)
+    f.wait(lambda:config_string('profiles.fixture_b.model','model')==native,'arbitrary native model is persisted')
+    check('model form preserves API B endpoint',config_string('profiles.fixture_b.model.config.openai','base_url')==f.api_b_url)
+    f.send(b'\x12')
+    body('WORKSPACE_NATIVE_MODEL','api_b',native)
+    f.quit()
+    before_restart_vt = bytes(f.output)
+    f.restart(second)
+    f.observed_session = second
+    f.capture('Restart without --profile retains default API B and arbitrary native model')
+    f.send(b'\x12')
+    body('WORKSPACE_RESTART_DEFAULT','api_b',native)
+    f.send('/connect subscription_fixture\r')
+    f.wait(lambda:config_string('','default_profile')=='subscription_fixture','synthetic subscription selected')
+    f.send(b'\x12')
+    body('WORKSPACE_SUBSCRIPTION','api_b','arbitrary-subscription-fixture-model')
+    f.capture('Native ChatGPT protocol uses only authored OAuth cache and local endpoint')
+    saved = (f.data/'config.toml').read_bytes()
+    f.send('NARROW_PARENT_DRAFT')
+    f.wait(lambda:any(d.get('draft')=='NARROW_PARENT_DRAFT' for d in f.saved_drafts()),'narrow parent draft saved')
+    original_size = (f.rows,f.cols)
+    f.resize(10,26)
+    f.pump(.25)
+    f.send(b'\x1b[1;5D')
+    f.capture('Extreme narrow session popover uses the same session focus')
+    f.send(b'\x1b')
+    f.pump(.12)
+    f.send(b'\x1b[1;5B')
+    f.resize(*original_size)
+    f.pump(.3)
+    f.screen()
+    check('narrow session popover returns to editing focus',f.cursor_visible)
+    check('narrow session popover preserves configured model and draft',any(d.get('draft')=='NARROW_PARENT_DRAFT' for d in f.saved_drafts()) and (f.data/'config.toml').read_bytes()==saved and '[1;5B' not in f.screen())
+    menu('model')
+    f.wait(lambda:f.visible('模型名称'),'model modal opens from preserved draft')
+    f.resize(10,26)
+    f.pump(.25)
+    f.capture('Extreme narrow model modal remains cancellable')
+    event_count, request_count = len(f.events()), len(f.calls())
+    f.send('\r')
+    f.pump(.25)
+    check('invisible narrow model field cannot submit',f.visible('扩大窗口') and (f.data/'config.toml').read_bytes()==saved and len(f.events())==event_count and len(f.calls())==request_count)
+    f.capture('Narrow model form explains resizing and rejects invisible submission')
+    f.send(b'\x1b')
+    f.resize(*original_size)
+    f.pump(.3)
+    check('narrow model modal cancel preserves configured model and draft',(f.data/'config.toml').read_bytes()==saved and any(d.get('draft')=='NARROW_PARENT_DRAFT' for d in f.saved_drafts()))
+    secrets = [key,'synthetic-subscription-only-secret-48117']
+    complete_vt = before_restart_vt + bytes(f.output)
+    check('secrets never reach VT output, input history or durable events',all(secret not in complete_vt.decode('utf-8',errors='replace') and secret not in json.dumps(f.events()) and not any(secret in json.dumps(d) for d in f.saved_drafts()) for secret in secrets))
+    f.capture('Completed local connection/session workflow, parent draft preserved')
+    f.quit()
 
 
 def stale_stream(f):
@@ -701,11 +967,11 @@ def file_completion(f):
 
 def session_commands(f):
     original = f.state()['id']
-    f.send('/model definitely-missing-profile\r')
-    f.pump(.3)
-    f.wait(lambda: any(d.get('draft') == '/model definitely-missing-profile' for d in f.saved_drafts()), 'failed model selection retained exact draft')
-    f.send(b'\x01\x0b')
     f.send('/model ollama:fixture-next\r')
+    f.pump(.3)
+    f.wait(lambda: any(d.get('draft') == '/model ollama:fixture-next' for d in f.saved_drafts()), 'model cannot silently change provider; original command draft retained')
+    f.send(b'\x01\x0b')
+    f.send('/model openai:fixture-native-next\r')
     f.pump(.4)
     assert f.state()['paused'], 'model switch resumed work automatically'
     assert not f.calls(), 'model switch executed model request'
@@ -716,14 +982,13 @@ def session_commands(f):
     f.pump(.1)
     f.send('/new\r')
     def session_ids():
-        with sqlite3.connect(f.data / 'sessions.sqlite3') as connection:
+        with closing(sqlite3.connect(f.data / 'sessions.sqlite3')) as connection:
             return [row[0] for row in connection.execute('SELECT id FROM sessions')]
     f.wait(lambda: len(session_ids()) == 2, 'new session created')
     assert original in session_ids()
-    f.send(b'\x10')
-    f.send('sessions\r')  # Palette explicitly executes this argument-taking command.
-    f.wait(lambda: original in f.screen(), 'session picker exposes original UUID')
-    f.send(original + '\r')
+    f.send('/sessions\r')  # Legacy alias stays parseable; sidebar is the normal entry.
+    f.wait(lambda: f.visible('1 轮 · 已暂停'), 'session picker exposes meaningful source status')
+    f.send('已暂停\r')
     f.wait(lambda: '会话已打开' in f.screen() or '会话已打开' in bytes(f.output).decode('utf-8', errors='replace'), 'session picker opens its selected session')
     f.send('/status\r')
     f.wait(lambda: f.visible('Session: ' + original), 'status verifies the actual reopened session UUID')
@@ -807,25 +1072,28 @@ def signal_cleanup(f):
 
 def slash_inline(f):
     f.send('/')
-    f.wait(lambda: '/new' in f.screen() and '/status' in f.screen(), 'slash candidates immediately visible', timeout=3)
+    f.wait(lambda: '/new' in f.screen() and '/connect' in f.screen(), 'five public slash candidates immediately visible', timeout=3)
+    assert set(re.findall(r'/[a-z]+\b',f.screen())) == {'/new','/model','/connect','/help','/quit'}, 'public slash menu is not the five common entries'
+    assert not re.search(r'/(?:status|sessions|audit|reconcile|details|export)\b',f.screen()), 'legacy operations leak into public slash candidates'
     f.capture("Typing / shows commands without opening a separate panel")
-    f.send('sta')
-    f.wait(lambda: '/status' in f.screen(), 'slash candidates filter')
+    f.send('he')
+    f.wait(lambda: '/help' in f.screen(), 'slash candidates filter')
     f.send('\r')
-    f.wait(lambda: any(d.get('draft', '').strip() == '/status' for d in f.saved_drafts()), 'Enter selects candidate into draft only')
+    f.wait(lambda: any(d.get('draft', '').strip() == '/help' for d in f.saved_drafts()), 'Enter selects candidate into draft only')
     assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'candidate Enter executed work'
-    f.capture('Candidate Enter inserts /status without executing it')
+    assert '直接输入任务，Enter 发送' not in f.screen(), 'candidate Enter opened help instead of inserting it'
+    f.capture('Candidate Enter inserts /help without opening it')
     f.send(b'\x01\x0b')
-    f.send('/sta')
+    f.send('/he')
     f.send('\t')
     f.pump(.2)
     assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'Tab submitted command to agent'
-    f.wait(lambda: any(d.get('draft', '').strip() == '/status' for d in f.saved_drafts()), 'Tab retains completed command draft')
-    f.capture("Tab inserts /status; no model request")
+    f.wait(lambda: any(d.get('draft', '').strip() == '/help' for d in f.saved_drafts()), 'Tab retains completed command draft')
+    f.capture("Tab inserts /help; no model request")
     f.send('\r')
-    f.pump(.3)
-    assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'status reached model'
-    f.capture("Status opens through the completed command")
+    f.wait(lambda:'直接输入任务，Enter 发送' in f.screen(),'completed public help command opens its reader')
+    assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'help reached model'
+    f.capture("Help opens through the completed public command")
     f.send(b'\x1b')
     f.quit()
 
@@ -890,7 +1158,7 @@ def live_shell(f):
     f.wait(lambda: any(d.get('draft') == draft for d in f.saved_drafts()), 'multiline draft prepared for reconciliation')
     for cancel in (True, False):
         f.send(b'\x10')  # Command palette preserves editor text and cursor.
-        f.send('reconcile\r')
+        f.send('核查\r')  # Contextual action appears only for actual unknown writes.
         f.wait(lambda: '结果未知' in f.screen(), 'unknown write picker identifies interrupted shell')
         f.send('\r')
         f.wait(lambda: '核查表单' in f.screen(), 'reconciliation uses a separate form')
@@ -977,7 +1245,7 @@ def persistent_search(f):
     # Long-history setup copies already validated native event shapes. It does not
     # run 70 synthetic model turns merely to push the real first requirement out
     # of the startup page. The following browsing/search actions use a real PTY.
-    with sqlite3.connect(f.data / 'sessions.sqlite3') as connection:
+    with closing(sqlite3.connect(f.data / 'sessions.sqlite3')) as connection:
         snapshot = json.loads(connection.execute('SELECT snapshot FROM sessions WHERE id=?', (session,)).fetchone()[0])
         for n in range(70):
             user, response, delivery = (copy.deepcopy(template) for template in (input_template, model_template, delivery_template))
@@ -1081,7 +1349,7 @@ def old_reader_and_delivery(f):
     f.resize(*target)
     f.pump(.5)
     resized = f.screen().splitlines()
-    assert resized[1] == '─' * f.cols and '阅读：' in resized[-1], 'application did not redraw at the real resized terminal geometry'
+    assert f.terminal_cells[1][-1] == '─' and '阅读：' in resized[-1], 'application did not redraw header/footer at the real resized terminal geometry'
     assert 'OLD_INPUT_ANCHOR' in f.screen(), 'resize lost the old reading position'
     f.capture('Resize retains the same old reading anchor')
     calls = len(f.calls())
@@ -1127,7 +1395,7 @@ def reconcile_keeps_reply_target(f):
     count = len(f.calls())
     before = len([e for e in f.events() if e['kind'] == 'input'])
     f.send(b'\x10')
-    f.send('reconcile\r')
+    f.send('核查\r')
     f.wait(lambda: '结果未知' in f.screen(), 'unknown write list opened from reply draft')
     f.send('\r')
     f.wait(lambda: '核查表单' in f.screen(), 'separate reconciliation form opened')
@@ -1166,7 +1434,7 @@ def exit_resume(f):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/bone')
-    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','reconcile-reply','feedback-flow'])
+    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','reconcile-reply','feedback-flow','workspace-flow'])
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument('--size', default='80x24', choices=['80x24', '120x40'], help='real terminal columns x rows')
     parser.add_argument('--keep-going', action='store_true', help='record every selected scenario, then fail if any failed')
@@ -1174,6 +1442,15 @@ def main():
     args = parser.parse_args()
     verify_vt_replay()
     cases = [
+        ('workspace-flow', {'api_a':[
+            {'match_job_title':'Conversation','contains':['WORKSPACE_SESSION_A'],'output':[tool('job_send',{'title':'NOT_A_SESSION_JOB','message':'Prove jobs are not sessions.'})]},
+            {'match_job_title':'Conversation','output':[tool('ask_user',{'question':'WORKSPACE_REPLY_QUESTION: choose a format.'})]},
+            {'match_job_title':'NOT_A_SESSION_JOB','text':'CHILD_JOB_SETTLED'},
+            {'contains':['WORKSPACE_API_A'],'text':'API_A_ROUTE_CONFIRMED'}], 'api_b':[
+            {'contains':['WORKSPACE_API_B'],'text':'API_B_ROUTE_CONFIRMED'},
+            {'contains':['WORKSPACE_NATIVE_MODEL'],'text':'NATIVE_MODEL_ROUTE_CONFIRMED'},
+            {'contains':['WORKSPACE_RESTART_DEFAULT'],'text':'RESTART_DEFAULT_ROUTE_CONFIRMED'},
+            {'contains':['WORKSPACE_SUBSCRIPTION'],'text':'SYNTHETIC_SUBSCRIPTION_ROUTE_CONFIRMED'}]},workspace_flow),
         ('feedback-flow', [
             {'match_job_title':'Conversation','delay_seconds':1.6,'output':[tool('job_send',{'title':'Worker','message':'Run the silent worker.'})]},
             {'match_job_title':'Conversation','text':'FLOW_MODEL_PREVIEW\nROOT_BACKGROUND_DELIVERY','delta_chunk_chars':14,'event_delay_seconds':.1,'event_delays':{'response.completed':1.6}},

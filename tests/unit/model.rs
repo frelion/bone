@@ -437,3 +437,187 @@ async fn model_connections_require_persistable_invocation_ids() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn private_profile_keys_are_isolated_bound_and_prepared_without_requests() {
+    let data = tempfile::tempdir().unwrap();
+    let profile = Profile::from_model("openai:future-model")
+        .unwrap()
+        .with_endpoint("http://127.0.0.1:9123/v1")
+        .unwrap();
+    assert!(!has_api_key(data.path(), "alpha").unwrap());
+    save_api_key(data.path(), "alpha", &profile, "synthetic-alpha-key").unwrap();
+    for invalid in [
+        "   ",
+        "synthetic\tkey",
+        "synthetic\0key",
+        "synthetic\nkey",
+        "synthetic\u{7f}key",
+    ] {
+        assert!(save_api_key(data.path(), "alpha", &profile, invalid).is_err());
+    }
+    assert!(save_api_key(data.path(), "alpha", &profile, &"x".repeat(1024 * 1024)).is_err());
+    save_api_key(data.path(), "beta", &profile, "synthetic-beta-key").unwrap();
+    assert!(has_api_key(data.path(), "alpha").unwrap());
+    let prepared = prepare(&profile, data.path(), "alpha", "job", "call")
+        .await
+        .unwrap();
+    assert!(prepared.api_key.as_deref() == Some("synthetic-alpha-key"));
+    let beta = prepare(&profile, data.path(), "beta", "job", "call")
+        .await
+        .unwrap();
+    assert!(beta.api_key.as_deref() == Some("synthetic-beta-key"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(api_key_file(data.path(), "alpha").unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let different_host = profile.with_endpoint("http://127.0.0.1:9234/v1").unwrap();
+    assert!(
+        prepare(&different_host, data.path(), "alpha", "job", "call")
+            .await
+            .is_err()
+    );
+    let different_provider = profile.with_model("anthropic:another-model").unwrap();
+    assert!(
+        prepare(&different_provider, data.path(), "alpha", "job", "call")
+            .await
+            .is_err()
+    );
+    let different_model = profile.with_model("openai:another-model").unwrap();
+    assert!(
+        prepare(&different_model, data.path(), "alpha", "job", "call")
+            .await
+            .is_ok()
+    );
+    // An explicitly selected but absent variable must fail; it must never
+    // silently fall back to the saved key or a different provider's environment.
+    let mut explicit = profile.clone();
+    explicit.credential_env = Some(format!("BONE_ABSENT_KEY_{}", uuid::Uuid::new_v4().simple()));
+    assert!(
+        prepare(&explicit, data.path(), "alpha", "job", "call")
+            .await
+            .is_err()
+    );
+    // PATH is a guaranteed nonsecret process setting; use it only to verify
+    // explicit-variable precedence without mutating the process environment.
+    explicit.credential_env = Some("PATH".into());
+    let overridden = prepare(&explicit, data.path(), "alpha", "job", "call")
+        .await
+        .unwrap();
+    assert!(overridden.api_key == Some(std::env::var("PATH").unwrap()));
+    let config_text = toml::to_string(&profile).unwrap();
+    assert!(!config_text.contains("synthetic-alpha-key"));
+    remove_api_key(data.path(), "alpha").unwrap();
+    assert!(!has_api_key(data.path(), "alpha").unwrap());
+    assert!(has_api_key(data.path(), "beta").unwrap());
+}
+
+#[test]
+fn local_credential_presence_never_parses_or_exposes_token_text() {
+    let data = tempfile::tempdir().unwrap();
+    let profile = cached_subscription(data.path());
+    let path = auth_file(data.path(), "test").unwrap();
+    std::fs::write(&path, "synthetic-invalid-token-text").unwrap();
+    assert!(has_login(&profile, data.path(), "test").unwrap());
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "synthetic-invalid-token-text"
+    );
+    let key_path = api_key_file(data.path(), "test").unwrap();
+    std::fs::write(&key_path, "not-even-valid-key-json").unwrap();
+    assert!(has_api_key(data.path(), "test").unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_key_paths_cannot_follow_symlinks_outside_the_data_directory() {
+    let data = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let profile = Profile::from_model("openai:fixture").unwrap();
+    std::fs::create_dir(data.path().join("profiles")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), data.path().join("profiles/alpha")).unwrap();
+    assert!(save_api_key(data.path(), "alpha", &profile, "synthetic-secret").is_err());
+    assert!(has_api_key(data.path(), "alpha").is_err());
+    assert!(!outside.path().join("api-key").exists());
+    std::fs::create_dir(data.path().join("profiles/beta")).unwrap();
+    let outside_file = outside.path().join("keep");
+    std::fs::write(&outside_file, "keep-original").unwrap();
+    std::os::unix::fs::symlink(&outside_file, data.path().join("profiles/beta/api-key")).unwrap();
+    assert!(save_api_key(data.path(), "beta", &profile, "synthetic-secret").is_err());
+    assert!(remove_api_key(data.path(), "beta").is_err());
+    assert_eq!(
+        std::fs::read_to_string(outside_file).unwrap(),
+        "keep-original"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_native_login_preserves_old_cache_and_releases_profile_lease() {
+    use rig_core::{
+        http_client::{HeaderMap, HttpMiddleware, Method, Uri},
+        wasm_compat::WasmBoxedFuture,
+    };
+    struct BlockAuth(std::sync::Arc<tokio::sync::Notify>);
+    impl HttpMiddleware for BlockAuth {
+        fn before_request_headers<'a>(
+            &'a self,
+            _: &'a Method,
+            _: &'a Uri,
+            _: &'a mut HeaderMap,
+        ) -> WasmBoxedFuture<'a, rig_core::http_client::Result<()>> {
+            Box::pin(async move {
+                self.0.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+    let data = tempfile::tempdir().unwrap();
+    let profile = cached_subscription(data.path());
+    let auth_path = auth_file(data.path(), "test").unwrap();
+    let original = std::fs::read(&auth_path).unwrap();
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let http =
+        DynHttpClient::new(rig_reqwest::shared()).with_middleware(BlockAuth(started.clone()));
+    let directory = data.path().to_owned();
+    let login = tokio::spawn(async move {
+        login_with(
+            &profile,
+            &directory,
+            "test",
+            http,
+            DeviceCodeHandler::new(|_| {}),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .unwrap();
+    login.abort();
+    assert!(login.await.unwrap_err().is_cancelled());
+    assert_eq!(std::fs::read(&auth_path).unwrap(), original);
+    assert!(
+        std::fs::read_dir(auth_path.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("auth-login-"))
+    );
+    let (lease, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        lock_profile(data.path(), "test"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(lease);
+}

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::json;
 
 use crate::state::{Event, JobState, SessionState, UnknownWrite};
@@ -106,7 +106,8 @@ impl Store {
 
     pub fn create_session(&self, state: &SessionState) -> Result<()> {
         ensure!(state.revision == 0, "new session revision must be zero");
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let snapshot = serde_json::to_string(state)?;
         if let Some(existing) = snapshot_in(&transaction, &state.id)? {
             ensure!(
@@ -380,7 +381,11 @@ impl Store {
     /// Reusing an event ID is allowed only when every field is identical.
     pub fn commit(&self, state: &SessionState, events: &[Event]) -> Result<()> {
         validate_structure(state)?;
-        let transaction = self.connection.unchecked_transaction()?;
+        // These reads always lead to writes. Acquire the writer reservation
+        // before reading so concurrent Store opens/session commits can wait
+        // through busy_timeout rather than failing a deferred WAL upgrade.
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let existing = snapshot_in(&transaction, &state.id)?
             .with_context(|| format!("session {} does not exist", state.id))?;
         ensure!(

@@ -1,0 +1,55 @@
+{
+  "status": "FAIL",
+  "error": "Legacy redraw gate expected 阅读：; current modal footer is 阅读层：. Real model delivered before this harness assertion.",
+  "scope": "Production TUI, real gpt-6-luna subscription calls, reused existing Codex login; isolated Python repo",
+  "binary_sha256": "283bf0e157553b0fbf1363cd52318d91a4750674bba97dfd92e39a27fcfe0660",
+  "workspace": "/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-design-live-_e2gjmh0/workspace",
+  "checks": {
+    "login_setup_has_no_model_call": true,
+    "saved_connection_reuses_codex": true,
+    "source_unchanged_before_answer": true,
+    "terminal_restored": true
+  },
+  "timeline": [
+    {
+      "stage": "01 新版生产 TUI / 80×24",
+      "elapsed_seconds": 1.03
+    },
+    {
+      "stage": "01a 当前连接与统一登录入口",
+      "elapsed_seconds": 1.23
+    },
+    {
+      "stage": "01b 复用现有登录 / 已保存 / 尚无模型请求",
+      "elapsed_seconds": 1.53
+    },
+    {
+      "stage": "02 Agent 真实检查正在执行",
+      "elapsed_seconds": 6.06
+    },
+    {
+      "stage": "03 插话已纳入 / 问题到达 / 草稿仍默认新要求",
+      "elapsed_seconds": 26.24
+    },
+    {
+      "stage": "04 显式选择回复目标",
+      "elapsed_seconds": 26.67
+    },
+    {
+      "stage": "05 修复交付 / 检查与文件证据",
+      "elapsed_seconds": 60.74
+    },
+    {
+      "stage": "06 一次命令直达完整交付",
+      "elapsed_seconds": 61.3
+    },
+    {
+      "stage": "失败或需要进一步核查",
+      "elapsed_seconds": 76.78
+    }
+  ],
+  "model_calls": 8,
+  "tool_calls": 6,
+  "frames": 10,
+  "cost": null
+}

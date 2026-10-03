@@ -794,7 +794,7 @@ fn new_output_preserves_source_location_on_resize_and_end_reaches_latest() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(screen.replace(' ', "").contains("新内容更新"));
-    assert!(!screen.contains("hidden-model"));
+    assert!(screen.contains("hidden-model"));
     view.handle_key(key(KeyCode::End));
     assert!(view.follow_conversation);
     assert_eq!(view.unread, 0);
@@ -1035,21 +1035,21 @@ fn overlay_borders_survive_terminal_diff_over_chinese_background() {
             .draw(|frame| view.render(frame, &state, "m", "idle"))
             .unwrap();
         // The old inset edge cut the trailing column of 过 (80) or 期 (120).
-        assert_eq!(terminal.backend().buffer()[(1, 3)].symbol(), "修");
+        assert_eq!(terminal.backend().buffer()[(23, 3)].symbol(), "修");
         view.open_detail("结果", "captured result");
         terminal
             .draw(|frame| view.render(frame, &state, "m", "idle"))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let top = (0..height)
-            .find(|&row| buffer[(0, row)].symbol() == "┌")
+            .find(|&row| buffer[(22, row)].symbol() == "┌")
             .expect("overlay top corner is drawn");
         let bottom = (top + 1..height)
-            .find(|&row| buffer[(0, row)].symbol() == "└")
+            .find(|&row| buffer[(22, row)].symbol() == "└")
             .expect("overlay bottom corner is drawn");
         assert_eq!(buffer[(width - 1, top)].symbol(), "┐");
         for row in top + 1..bottom {
-            assert_eq!(buffer[(0, row)].symbol(), "│");
+            assert_eq!(buffer[(22, row)].symbol(), "│");
             assert_eq!(buffer[(width - 1, row)].symbol(), "│");
         }
     }
@@ -1108,8 +1108,8 @@ fn composer_keeps_chinese_first_character_and_native_cursor_through_wrap_and_foc
             .unwrap();
         assert!(terminal.backend().cursor_visible());
         let position = terminal.backend().cursor_position();
-        assert_eq!(position.x, 9);
-        assert_eq!(terminal.backend().buffer()[(1, position.y)].symbol(), "首");
+        assert_eq!(position.x, 31);
+        assert_eq!(terminal.backend().buffer()[(23, position.y)].symbol(), "首");
         assert!(
             terminal.backend().buffer()[(position.x, position.y)]
                 .modifier
@@ -1131,13 +1131,13 @@ fn composer_keeps_chinese_first_character_and_native_cursor_through_wrap_and_foc
             assert_eq!(view.cursor(), cursor);
         }
         let position = terminal.backend().cursor_position();
-        assert_eq!(position.x, 5);
-        assert_eq!(terminal.backend().buffer()[(1, position.y)].symbol(), "末");
+        assert_eq!(position.x, 27);
+        assert_eq!(terminal.backend().buffer()[(23, position.y)].symbol(), "末");
         assert_eq!(
-            terminal.backend().buffer()[(1, position.y - 1)].symbol(),
+            terminal.backend().buffer()[(23, position.y - 1)].symbol(),
             "首"
         );
-        let first_row = (1..width)
+        let first_row = (23..width)
             .map(|x| terminal.backend().buffer()[(x, position.y - 1)].symbol())
             .collect::<String>()
             .replace(' ', "");
@@ -1162,9 +1162,9 @@ fn composer_keeps_chinese_first_character_and_native_cursor_through_wrap_and_foc
             .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
             .unwrap();
         let position = terminal.backend().cursor_position();
-        assert_eq!(position.x, 5);
-        assert_eq!(terminal.backend().buffer()[(1, position.y)].symbol(), "末");
-        assert_eq!(terminal.backend().buffer()[(3, position.y)].symbol(), "尾");
+        assert_eq!(position.x, 27);
+        assert_eq!(terminal.backend().buffer()[(23, position.y)].symbol(), "末");
+        assert_eq!(terminal.backend().buffer()[(25, position.y)].symbol(), "尾");
         let wrapped_cursor = view.cursor();
         for (resize_width, resize_height) in [(12, 10), (width, height)] {
             terminal.backend_mut().resize(resize_width, resize_height);
@@ -1174,9 +1174,9 @@ fn composer_keeps_chinese_first_character_and_native_cursor_through_wrap_and_foc
             assert_eq!(view.cursor(), wrapped_cursor);
         }
         let position = terminal.backend().cursor_position();
-        assert_eq!(position.x, 5);
-        assert_eq!(terminal.backend().buffer()[(1, position.y)].symbol(), "末");
-        assert_eq!(terminal.backend().buffer()[(3, position.y)].symbol(), "尾");
+        assert_eq!(position.x, 27);
+        assert_eq!(terminal.backend().buffer()[(23, position.y)].symbol(), "末");
+        assert_eq!(terminal.backend().buffer()[(25, position.y)].symbol(), "尾");
         view.handle_key(key(KeyCode::F(6)));
         terminal
             .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
@@ -1274,4 +1274,192 @@ fn running_action_and_receipt_remain_separate_while_input_stays_editable() {
         .collect::<String>();
     assert!(action.contains("cargo check"));
     assert!(action.contains("12s"));
+}
+
+#[test]
+fn session_focus_keeps_draft_selection_and_stable_session_identity() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let state = bone::state::SessionState::new("/tmp/work");
+    for (width, height) in [(80, 24), (120, 40)] {
+        let mut view = View::new();
+        let items = (0..30)
+            .map(|index| PickerItem {
+                label: format!("会话 {index:02}"),
+                detail: "今天".into(),
+                value: format!("session-{index}"),
+            })
+            .collect::<Vec<_>>();
+        view.set_sessions(items.clone());
+        view.select_session("session-20");
+        view.paste("保留中文abc");
+        view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        let cursor = view.cursor();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| view.render(frame, &state, "当前连接 · 原生模型", "idle"))
+            .unwrap();
+        assert!(terminal.backend().cursor_visible());
+        assert_eq!(terminal.backend().buffer()[(21, 0)].symbol(), "│");
+        view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.selected_session(), Some("session-21"));
+        view.handle_paste("should not enter draft");
+        assert_eq!(view.draft(), "保留中文abc");
+        terminal
+            .draw(|frame| view.render(frame, &state, "当前连接 · 原生模型", "idle"))
+            .unwrap();
+        assert!(!terminal.backend().cursor_visible());
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "›");
+        let mut updated = items;
+        updated.insert(
+            0,
+            PickerItem {
+                label: "刚到达".into(),
+                detail: String::new(),
+                value: "new".into(),
+            },
+        );
+        view.set_sessions(updated);
+        assert_eq!(view.selected_session(), Some("session-21"));
+        view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(view.focus, Focus::Input);
+        assert_eq!(view.cursor(), cursor);
+        assert_eq!(view.selected_input_text().as_deref(), Some("c"));
+        view.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert!(view.draft().is_empty());
+        view.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT));
+        assert_eq!(view.draft(), "保留中文abc");
+        view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(view.focus, Focus::Conversation);
+        view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert_eq!(view.focus, Focus::Conversation);
+        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(view.focus, Focus::Input);
+    }
+}
+
+#[test]
+fn narrow_session_sidebar_is_explicit_and_returns_to_original_reader() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let state = bone::state::SessionState::new("/tmp/work");
+    let mut view = View::new();
+    view.set_sessions(vec![PickerItem {
+        label: "窄屏会话".into(),
+        detail: String::new(),
+        value: "selected".into(),
+    }]);
+    view.push_message(Message {
+        role: "Agent".into(),
+        text: "完整原文\n\n".repeat(100),
+        event_id: Some("reader".into()),
+        summary: None,
+    });
+    view.paste("独立草稿");
+    view.focus = Focus::Conversation;
+    view.follow_conversation = false;
+    let mut terminal = Terminal::new(TestBackend::new(42, 24)).unwrap();
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    view.conversation_scroll = 20;
+    assert!(view.conversation_scroll < view.conversation_max);
+    let point = view.read_points[20].offset;
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "›");
+    assert!(!terminal.backend().cursor_visible());
+    for (width, height) in [(80, 24), (42, 24)] {
+        terminal.backend_mut().resize(width, height);
+        terminal
+            .draw(|frame| view.render(frame, &state, "m", "idle"))
+            .unwrap();
+    }
+    view.handle_key(key(KeyCode::Esc));
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    assert_eq!(view.focus, Focus::Conversation);
+    assert_eq!(view.read_points[view.conversation_scroll].offset, point);
+    assert_eq!(view.draft(), "独立草稿");
+    assert_eq!(view.sidebar_width, 0);
+}
+
+#[test]
+fn connection_form_keeps_secrets_out_of_transcript_and_restores_parent_draft() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let state = bone::state::SessionState::new("/tmp/work");
+    let mut view = View::new();
+    view.paste("原中文草稿");
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    let cursor = view.cursor();
+    view.open_detail("原文", "完整记录");
+    view.detail_scroll = 7;
+    view.open_form(
+        "连接",
+        vec![
+            FormField {
+                label: "模型".into(),
+                value: "native".into(),
+                secret: false,
+            },
+            FormField {
+                label: "密钥".into(),
+                value: String::new(),
+                secret: true,
+            },
+        ],
+    );
+    assert_eq!(view.form_step(), Some((0, 2)));
+    view.handle_paste("-model");
+    assert!(!view.advance_form());
+    view.handle_paste("secret-token-123");
+    view.form_error("密钥尚未验证");
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    let visible = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(!visible.contains("secret-token-123"));
+    assert!(visible.contains('•'));
+    assert!(visible.replace(' ', "").contains("密钥尚未验证"));
+    assert!(terminal.backend().cursor_visible());
+    assert_eq!(view.draft(), "原中文草稿");
+    assert!(view.messages.is_empty());
+    assert!(view.history().is_empty());
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+    assert!(view.form_is_open());
+    assert_ne!(view.focus, Focus::Sessions);
+    view.open_help();
+    view.handle_key(key(KeyCode::Esc));
+    assert_eq!(
+        view.form_values(),
+        Some(vec!["native-model".into(), "secret-token-123".into()])
+    );
+    view.handle_key(key(KeyCode::BackTab));
+    view.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(view.form_values().unwrap()[0], "native");
+    view.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT));
+    view.handle_key(key(KeyCode::Tab));
+    assert!(view.advance_form());
+    view.handle_key(key(KeyCode::Esc));
+    assert!(!view.form_is_open());
+    assert_eq!(
+        view.detail.as_ref().map(|detail| detail.0.as_str()),
+        Some("原文")
+    );
+    assert_eq!(view.detail_scroll, 7);
+    view.handle_key(key(KeyCode::Esc));
+    assert_eq!(view.cursor(), cursor);
+    assert_eq!(view.selected_input_text().as_deref(), Some("稿"));
+    view.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert!(view.draft().is_empty());
 }

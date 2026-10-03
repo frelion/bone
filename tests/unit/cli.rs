@@ -95,7 +95,9 @@ fn model_override_preserves_selected_subscription_credentials_and_limits() {
         assert_eq!(profile.max_tokens, Some(8192));
     }
     let cli = Cli::parse_from(["bone", "--model", "openai:gpt-6-luna", "login"]);
-    assert!(select_profile(&cli, directory.path()).is_err());
+    let (_, profile) = select_profile(&cli, directory.path()).unwrap();
+    assert!(!profile.reuse_codex_login);
+    assert!(profile.credential_env.is_none());
 }
 
 #[tokio::test]

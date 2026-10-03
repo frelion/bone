@@ -1,16 +1,24 @@
 //! Persistent provider recipes. Rig owns provider configuration and its serialization.
 use std::{
     collections::BTreeMap,
+    fs::{File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use fs2::FileExt;
 use rig_core::{
     completion::CompletionRequest,
-    providers::{cohere::CohereConfig, ollama::OllamaConfig, registry::ProviderRef},
+    providers::{
+        cohere::CohereConfig,
+        ollama::OllamaConfig,
+        registry::{Provider, ProviderConfig, ProviderRef},
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// Registry recipes remain native Rig references; companion providers retain their
 /// native configuration too. These are connection recipes, never model responses.
@@ -57,6 +65,95 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Native provider identity, independent of model and endpoint. Credentials
+    /// stored by BONE are bound to this identity and never move across providers.
+    pub fn provider_identity(&self) -> String {
+        match &self.model {
+            ModelReference::Registry(reference) => {
+                let config = reference.config("");
+                format!("{}/{}", config.vendor(), config.format())
+            }
+            ModelReference::Cohere { .. } => "cohere".into(),
+            ModelReference::Ollama { .. } => "ollama".into(),
+            ModelReference::Bedrock { .. } => "bedrock".into(),
+            ModelReference::VertexAi { .. } => "vertexai".into(),
+            ModelReference::Candle { .. } => "candle".into(),
+        }
+    }
+
+    pub fn with_model(&self, value: &str) -> Result<Self> {
+        let mut next = Self::from_model(value)?;
+        if self.provider_identity() == next.provider_identity() {
+            let model = match (&self.model, &next.model) {
+                (ModelReference::Registry(old), ModelReference::Registry(new)) => {
+                    ModelReference::Registry(match old.provider() {
+                        Provider::Registered(id) => ProviderRef::registered(*id, new.model())?,
+                        Provider::Configured(config) => {
+                            ProviderRef::configured(config.clone(), new.model())?
+                        }
+                    })
+                }
+                (ModelReference::Cohere { cohere, .. }, ModelReference::Cohere { model, .. }) => {
+                    ModelReference::Cohere {
+                        cohere: cohere.clone(),
+                        model: model.clone(),
+                    }
+                }
+                (ModelReference::Ollama { ollama, .. }, ModelReference::Ollama { model, .. }) => {
+                    ModelReference::Ollama {
+                        ollama: ollama.clone(),
+                        model: model.clone(),
+                    }
+                }
+                _ => next.model.clone(),
+            };
+            next = self.clone();
+            next.model = model;
+        }
+        next.validate()?;
+        Ok(next)
+    }
+
+    pub fn endpoint(&self) -> Option<String> {
+        match &self.model {
+            ModelReference::Registry(reference) => Some(match reference.config("") {
+                ProviderConfig::OpenAi(config) => config.base_url,
+                ProviderConfig::Anthropic(config) => config.base_url,
+                ProviderConfig::Gemini(config) => config.base_url,
+            }),
+            ModelReference::Cohere { cohere, .. } => Some(cohere.base_url.clone()),
+            ModelReference::Ollama { ollama, .. } => Some(ollama.base_url.clone()),
+            _ => None,
+        }
+    }
+
+    /// Change the host on the native recipe; dialect, route and options stay native.
+    pub fn with_endpoint(&self, endpoint: &str) -> Result<Self> {
+        let uri: rig_core::http_client::Uri = endpoint
+            .parse()
+            .context("endpoint must be an absolute HTTP or HTTPS URL")?;
+        ensure!(
+            matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some(),
+            "endpoint must be an absolute HTTP or HTTPS URL"
+        );
+        let mut next = self.clone();
+        match &mut next.model {
+            ModelReference::Registry(reference) => {
+                let mut config = reference.config("");
+                match &mut config {
+                    ProviderConfig::OpenAi(config) => config.base_url = endpoint.into(),
+                    ProviderConfig::Anthropic(config) => config.base_url = endpoint.into(),
+                    ProviderConfig::Gemini(config) => config.base_url = endpoint.into(),
+                }
+                *reference = ProviderRef::configured(config, reference.model())?;
+            }
+            ModelReference::Cohere { cohere, .. } => cohere.base_url = endpoint.into(),
+            ModelReference::Ollama { ollama, .. } => ollama.base_url = endpoint.into(),
+            _ => bail!("this native provider does not use an API endpoint recipe"),
+        }
+        Ok(next)
+    }
+
     pub fn from_model(reference: &str) -> Result<Self> {
         let model = match reference.split_once(':') {
             Some(("cohere", model)) if !model.is_empty() => ModelReference::Cohere {
@@ -139,6 +236,20 @@ pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
 }
 
+/// Exact on-disk revision, including absence. Never contains credential values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRevision(Option<[u8; 32]>);
+
+impl ConfigRevision {
+    fn read(path: &Path) -> Result<Self> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Self(Some(Sha256::digest(bytes).into()))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self(None)),
+            Err(error) => Err(error).context("cannot read current configuration revision"),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -153,17 +264,61 @@ impl Default for Config {
 
 impl Config {
     pub fn load(data_dir: &Path) -> Result<Self> {
+        Self::load_with_revision(data_dir).map(|(config, _)| config)
+    }
+
+    pub fn load_with_revision(data_dir: &Path) -> Result<(Self, ConfigRevision)> {
         let path = data_dir.join("config.toml");
-        let config = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str::<Self>(&text)
-                .with_context(|| format!("invalid provider configuration in {}", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
+        let (config, revision) = match std::fs::read(&path) {
+            Ok(bytes) => {
+                let revision = ConfigRevision(Some(Sha256::digest(&bytes).into()));
+                let text =
+                    std::str::from_utf8(&bytes).context("provider configuration is not UTF-8")?;
+                (
+                    toml::from_str::<Self>(text).with_context(|| {
+                        format!("invalid provider configuration in {}", path.display())
+                    })?,
+                    revision,
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (Self::default(), ConfigRevision(None))
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("cannot read {}", path.display()));
             }
         };
         config.validate()?;
-        Ok(config)
+        Ok((config, revision))
+    }
+
+    /// Compare the exact loaded revision before committing. Other BONE writers
+    /// share the lock; external edits observed before rename reject the save.
+    pub fn save_checked(
+        &self,
+        data_dir: &Path,
+        expected: &ConfigRevision,
+    ) -> Result<ConfigRevision> {
+        self.validate()?;
+        std::fs::create_dir_all(data_dir).context("cannot create BONE configuration directory")?;
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(data_dir.join("config.lock"))?;
+        lock.try_lock_exclusive()
+            .context("configuration is being saved by another process; retry")?;
+        let path = data_dir.join("config.toml");
+        ensure!(
+            ConfigRevision::read(&path)? == *expected,
+            "configuration changed outside this editor; reopen connections before saving"
+        );
+        let text = toml::to_string_pretty(self)?;
+        write_atomic(&path, text.as_bytes(), Some(expected))?;
+        Ok(ConfigRevision(Some(Sha256::digest(text.as_bytes()).into())))
     }
 
     pub fn profile(&self, name: Option<&str>) -> Result<&Profile> {
@@ -187,6 +342,41 @@ impl Config {
         }
         Ok(())
     }
+}
+
+pub(crate) fn write_atomic(
+    path: &Path,
+    bytes: &[u8],
+    expected: Option<&ConfigRevision>,
+) -> Result<()> {
+    let parent = path.parent().context("saved file parent is missing")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".bone-save-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        if let Some(expected) = expected {
+            ensure!(
+                ConfigRevision::read(path)? == *expected,
+                "configuration changed outside this editor; reopen connections before saving"
+            );
+        }
+        std::fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub fn validate_profile_name(name: &str) -> Result<()> {

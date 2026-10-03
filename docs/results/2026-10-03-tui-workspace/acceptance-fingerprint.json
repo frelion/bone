@@ -1,0 +1,50 @@
+{
+  "binary": "/Users/zzhang/.cargo/bin/bone",
+  "version": "0.8.0",
+  "binary_sha256": "1fd4ef9d339e0bfc13e979f245c4567526d26c04fcfd42b76d7eac2eb14842d3",
+  "source_fingerprint": "0be603ad4ec968c7071a46f4227c58361f149c9869644f481a916ac48cd86eae",
+  "source_algorithm": "relative-path sorted Cargo.toml, Cargo.lock, src/**/*.rs; path + NUL + bytes + NUL",
+  "harness_sha256": "c7603b454bd34250b2b11695149d16907b1192f46b386ea4a35877077888c6e5",
+  "protocol_fixture_sha256": "49efc6333272bf8150332ea3cd17c080cf04fbcea252c50aef3143357da271fd",
+  "startup_end_fingerprints_identical": true,
+  "runs": [
+    {
+      "evidence": "pty/80x24/workspace-flow.json",
+      "status": "PASS",
+      "checks": 24,
+      "live_frames": 18,
+      "no_color": true,
+      "route_requests": {
+        "api_a": 4,
+        "api_b": 4
+      },
+      "color_segments": 0
+    },
+    {
+      "evidence": "pty/120x40/workspace-flow.json",
+      "status": "PASS",
+      "checks": 24,
+      "live_frames": 18,
+      "no_color": true,
+      "route_requests": {
+        "api_a": 4,
+        "api_b": 4
+      },
+      "color_segments": 0
+    },
+    {
+      "evidence": "pty/color/80x24/workspace-flow.json",
+      "status": "PASS",
+      "checks": 24,
+      "live_frames": 18,
+      "no_color": false,
+      "route_requests": {
+        "api_a": 4,
+        "api_b": 4
+      },
+      "color_segments": 553
+    }
+  ],
+  "earlier_debug_regressions": "acceptance-compatibility.json",
+  "earlier_installed_failure": "pty/failure.json"
+}

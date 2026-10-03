@@ -36,6 +36,7 @@ pub struct PreparedModel {
     http: DynHttpClient,
     auth: Option<Authenticator>,
     credential_lock: Option<CredentialLock>,
+    api_key: Option<String>,
 }
 
 // At most two descriptors: the stable source lock and its legacy HOME path.
@@ -96,6 +97,11 @@ pub async fn prepare(
     } else {
         (None, None)
     };
+    let api_key = if profile.is_subscription() {
+        None
+    } else {
+        resolve_api_key(profile, data_dir, profile_name)?
+    };
     Ok(PreparedModel {
         profile: profile.clone(),
         data_dir: data_dir.to_owned(),
@@ -103,6 +109,7 @@ pub async fn prepare(
         http: DynHttpClient::new(rig_reqwest::shared()),
         auth,
         credential_lock,
+        api_key,
     })
 }
 
@@ -115,6 +122,7 @@ impl PreparedModel {
             http,
             auth,
             credential_lock,
+            api_key,
         } = self;
         let model = match &profile.model {
             ModelReference::Registry(reference) if profile.is_subscription() => {
@@ -133,40 +141,20 @@ impl PreparedModel {
                 client.completion(reference.model()).erase()
             }
             ModelReference::Registry(reference) => {
-                if let Some(name) = &profile.credential_env {
-                    reference.completion_model_with(
-                        read_credential(
-                            name,
-                            reference.id().is_none_or(|id| id.requires_credential()),
-                        )?,
-                        http,
-                    )
+                if let Some(key) = api_key {
+                    reference.completion_model_with(key, http)
                 } else {
                     reference.completion_model().map_err(environment_error)?
                 }
             }
             ModelReference::Cohere { cohere, model } => {
                 let mut config = cohere.clone();
-                config.api_key = read_credential(
-                    profile
-                        .credential_env
-                        .as_deref()
-                        .unwrap_or("COHERE_API_KEY"),
-                    true,
-                )?
-                .into();
+                config.api_key = api_key.unwrap_or_default().into();
                 config.connect(http).completion(model).erase()
             }
             ModelReference::Ollama { ollama, model } => {
                 let mut config = ollama.clone();
-                config.api_key = read_credential(
-                    profile
-                        .credential_env
-                        .as_deref()
-                        .unwrap_or("OLLAMA_API_KEY"),
-                    false,
-                )?
-                .into();
+                config.api_key = api_key.unwrap_or_default().into();
                 config.connect(http).completion(model).erase()
             }
             ModelReference::Bedrock { bedrock } => bedrock_model(bedrock)?,
@@ -193,6 +181,182 @@ fn read_credential(name: &str, required: bool) -> Result<String> {
         Ok(value) if !required || !value.is_empty() => Ok(value),
         Err(std::env::VarError::NotPresent) if !required => Ok(String::new()),
         _ => bail!("credential variable `{name}` is missing or invalid"),
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApiKeyRecord {
+    provider: String,
+    endpoint: Option<String>,
+    key: String,
+}
+
+pub fn api_key_file(data_dir: &Path, profile_name: &str) -> Result<PathBuf> {
+    validate_profile_name(profile_name)?;
+    let path = data_dir.join("profiles").join(profile_name).join("api-key");
+    for component in [
+        data_dir.join("profiles"),
+        data_dir.join("profiles").join(profile_name),
+        path.clone(),
+    ] {
+        match std::fs::symlink_metadata(&component) {
+            Ok(metadata) => ensure!(
+                !metadata.file_type().is_symlink(),
+                "BONE credential path must not be a symbolic link"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => bail!("cannot inspect BONE credential path"),
+        }
+    }
+    Ok(path)
+}
+
+pub fn save_api_key(
+    data_dir: &Path,
+    profile_name: &str,
+    profile: &Profile,
+    key: &str,
+) -> Result<()> {
+    profile.validate()?;
+    ensure!(
+        !profile.is_subscription() && profile.endpoint().is_some(),
+        "this native connection does not use a profile API key"
+    );
+    ensure!(
+        !key.trim().is_empty() && key.len() <= 1024 * 1024 && !key.chars().any(char::is_control),
+        "API key must be nonblank and contain no control characters"
+    );
+    let path = api_key_file(data_dir, profile_name)?;
+    let directory = path.parent().context("credential directory is missing")?;
+    std::fs::create_dir_all(directory).context("cannot create BONE credential directory")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    // Recheck after directory creation; never follow an existing profile/key alias.
+    let path = api_key_file(data_dir, profile_name)?;
+    let record = ApiKeyRecord {
+        provider: profile.provider_identity(),
+        endpoint: profile.endpoint(),
+        key: key.into(),
+    };
+    let bytes = serde_json::to_vec(&record)?;
+    ensure!(
+        bytes.len() <= 1024 * 1024,
+        "BONE API key file exceeds the supported size"
+    );
+    crate::config::write_atomic(&path, &bytes, None)
+        .map_err(|_| anyhow::anyhow!("cannot save BONE profile API key"))
+}
+
+pub fn remove_api_key(data_dir: &Path, profile_name: &str) -> Result<()> {
+    let path = api_key_file(data_dir, profile_name)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => bail!("cannot remove BONE profile API key"),
+    }
+}
+
+/// Presence only. Never reads key/token text or contacts a provider.
+pub fn has_api_key(data_dir: &Path, profile_name: &str) -> Result<bool> {
+    local_file_present(&api_key_file(data_dir, profile_name)?)
+}
+
+/// Cache presence does not claim the token is valid or still authorized.
+pub fn has_login(profile: &Profile, data_dir: &Path, profile_name: &str) -> Result<bool> {
+    ensure!(
+        profile.is_subscription(),
+        "connection is not a ChatGPT subscription"
+    );
+    validate_profile_name(profile_name)?;
+    local_file_present(&if profile.reuse_codex_login {
+        codex_auth_file()?
+    } else {
+        auth_file(data_dir, profile_name)?
+    })
+}
+
+fn local_file_present(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() > 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => bail!("cannot inspect local credential file"),
+    }
+}
+
+fn resolve_api_key(
+    profile: &Profile,
+    data_dir: &Path,
+    profile_name: &str,
+) -> Result<Option<String>> {
+    let required = match &profile.model {
+        ModelReference::Registry(reference) => {
+            reference.id().is_none_or(|id| id.requires_credential())
+        }
+        ModelReference::Cohere { .. } => true,
+        ModelReference::Ollama { .. } => false,
+        _ => return Ok(None), // These providers own their native credential chains.
+    };
+    if let Some(name) = &profile.credential_env {
+        return read_credential(name, required).map(Some);
+    }
+    let path = api_key_file(data_dir, profile_name)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            let metadata = file.metadata().context("cannot inspect BONE API key")?;
+            ensure!(
+                metadata.is_file() && metadata.len() <= 1024 * 1024,
+                "BONE API key file is invalid"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                ensure!(
+                    metadata.permissions().mode() & 0o077 == 0,
+                    "BONE API key file must have private permissions (0600)"
+                );
+            }
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|_| anyhow::anyhow!("cannot read BONE API key"))?;
+            let record: ApiKeyRecord = serde_json::from_slice(&bytes).map_err(|_| {
+                anyhow::anyhow!("BONE API key file is invalid; provide the key again")
+            })?;
+            ensure!(
+                record.provider == profile.provider_identity()
+                    && record.endpoint == profile.endpoint(),
+                "saved API key belongs to a different provider or endpoint; provide a key for this connection"
+            );
+            ensure!(
+                !record.key.trim().is_empty() && !record.key.chars().any(char::is_control),
+                "BONE API key file is invalid"
+            );
+            Ok(Some(record.key))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match &profile.model {
+            ModelReference::Cohere { .. } => read_credential("COHERE_API_KEY", true).map(Some),
+            ModelReference::Ollama { .. } => read_credential("OLLAMA_API_KEY", false).map(Some),
+            _ => Ok(None), // Rig resolves its own default environment without mutation.
+        },
+        Err(_) => bail!("cannot read BONE API key"),
+    }
+}
+
+struct LoginStaging(PathBuf);
+impl Drop for LoginStaging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -227,6 +391,7 @@ pub async fn login_with(
     }
     let (_guard, auth_file) = lock_profile(data_dir, profile_name).await?;
     let staging = auth_file.with_file_name(format!("auth-login-{}.json", uuid::Uuid::new_v4()));
+    let _staging_cleanup = LoginStaging(staging.clone());
     let ModelReference::Registry(reference) = &profile.model else {
         unreachable!()
     };

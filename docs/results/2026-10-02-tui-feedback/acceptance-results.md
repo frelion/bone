@@ -46,4 +46,6 @@ python3 tests/tui_pty.py --binary target/debug/bone --case feedback-flow --size 
 - 这里验证硬件光标的 VT 显示命令与 cell 位置，没有实机验证不同终端的光标样式、Linux 原生剪贴板或所有物理进程树的终止。
 - 流式预览转 durable 正文的精确旧阅读锚点、复杂 Markdown 近似渲染与进程重启后的 inactive 草稿仍不在本轮合同中。
 
+正式 10 项运行环境设置了 `NO_COLOR`，实际记录的 fg/bg 为 None；这些证据验证 native 焦点、caret、选区和布局，不宣称实际色彩模式已测。root 另行运行取消 `NO_COLOR` 的同一综合场景，色彩验证单独记录。
+
 JSON 为真实 VT cell/SGR 观察；HTML 使用记录格宽合并同样式 ASCII，宽字/emoji 独立固定格宽、cursor 独立描边。ANSI 色值是浏览器近似。

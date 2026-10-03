@@ -292,11 +292,9 @@ async fn execute(mut cli: Cli) -> Result<()> {
         Command::Tui { run } => {
             tui::require_terminal()?;
             let (profile_name, profile) = select_profile(&cli, &data)?;
-            let profiles = Config::load(&data)?.profiles.into_iter().collect();
             let settings = tui::Settings {
                 profile_name,
                 profile,
-                profiles,
             };
             let mut engine = open(&cli, &data, run, run.session.as_deref())?;
             tui::run(&mut engine, &data, settings, run.timeout_seconds).await?;
@@ -321,8 +319,7 @@ fn select_profile(cli: &Cli, data: &Path) -> Result<(String, Profile)> {
         .unwrap_or_else(|| config.default_profile.clone());
     let mut profile = config.profile(Some(&name))?.clone();
     if let Some(model) = &cli.model {
-        profile.model = Profile::from_model(model)?.model;
-        profile.validate()?;
+        profile = profile.with_model(model)?;
     }
     Ok((name, profile))
 }

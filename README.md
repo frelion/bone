@@ -29,7 +29,7 @@ bone --version
 bone providers
 ```
 
-安装后的版本应为 `bone 0.7.1`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
+安装后的版本应为 `bone 0.8.0`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
 
 `target/release/bone` 是构建目录内的文件，只有在包含它的 checkout 中才能通过相对路径运行。安装后的 `bone` 可在任意项目目录中使用。
 
@@ -123,32 +123,31 @@ bone --profile subscription tui --workspace /path/to/project
 bone --profile subscription tui --session SESSION_ID
 ```
 
-TUI 默认显示全宽对话、Markdown 答复和工具行动，复用现有订阅与模型配置。Job 由 Agent 自动管理。原生 Rig 流实时显示为“输出中（未交付）”；新要求、暂停或调用结束会清除旧预览，正式交付以 SQLite 记录为准。
+TUI 左侧切换会话，右侧显示对话、Markdown 答复和工具行动；当前连接与模型固定可见。`/connect` 统一选择现有连接、ChatGPT 登录或 API，`/model` 自由修改原生模型名；选择保存为下次启动的默认配置。Job 由 Agent 自动管理。原生 Rig 流实时显示为“输出中（未交付）”；新要求、暂停或调用结束会清除旧预览，正式交付以 SQLite 记录为准。
 
 默认正文不显示“你 / Agent”标题，原话以细竖线区分。输入框显示编辑焦点和真实终端光标。运行行固定显示实际动作、耗时与活动标记；输入回执独立显示，后台仍在执行时不会被较早的交付覆盖。
 
-本轮修复、改前后终端过程及真实模型复验见 [0.7.1 反馈修复](docs/results/2026-10-02-tui-feedback/README.md)。
+本轮会话栏、连接管理与终端证据见 [0.8.0 工作区交互](docs/results/2026-10-03-tui-workspace/README.md)；此前反馈修复见 [0.7.1](docs/results/2026-10-02-tui-feedback/README.md)。
 
 | 操作 | 按键 / 命令 |
 | --- | --- |
 | 发送 / 换行 | Enter / Shift+Enter、Alt+Enter、Ctrl+J |
 | 命令面板 / 文件引用 | Ctrl+P / `@文件` 后 Tab，或 Ctrl+O |
 | 输入历史 / 编辑 / 撤销 | Alt+↑↓；Ctrl+A/E/K/W；Ctrl+Z / Alt+Z |
-| 输入 / 正文阅读 | F6；Tab 编辑与候选 |
+| 会话 / 原主焦点 / 正文 / 输入 | Ctrl+← / Ctrl+→ / Ctrl+↑ / Ctrl+↓ |
 | 外部编辑器 | Ctrl+G，使用 VISUAL / EDITOR，返回草稿后 Enter 才发送 |
 | 搜索对话 / 完整结果 / 审计 | Ctrl+F / 正文 d / 详情 D；F2 查看活动 |
 | 暂停 / 恢复 / 退出 | Ctrl+C / Ctrl+R / Ctrl+Q |
-| 会话 / 模型 / 状态 | `/sessions`、`/new`、`/model`、`/status` |
-| 修改 / 导出 / 复制 | `/diff`、`/export`、`/copy` |
-| 更早记录 / 最新交付 / 帮助 | `/older`、`/delivery`、F1 |
+| 新会话 / 模型 / 连接 | `/new` / `/model` / `/connect` |
+| 项目修改 / 复制 / 帮助 | Ctrl+D / Ctrl+Y / F1 或 `/help` |
 
-草稿及最近输入独立、原子保存在数据目录的 `tui/` 下。多行粘贴、文件补全、恢复草稿和外部编辑器均不自动提交。切换会话会保存并暂停旧工作，打开的未完成工作保持暂停。模型选择使用已配置 profile 或 `/model provider:model` 原生引用，不限制模型名单；同 provider 保留原有 endpoint 和凭据来源，跨 provider 使用其独立接入配置。切换后 Ctrl+R 继续，配置文件不被修改。
+草稿及最近输入独立、原子保存在数据目录的 `tui/` 下。多行粘贴、文件补全、恢复草稿和外部编辑器均不自动提交。切换会话保存并暂停旧工作，打开的未完成工作保持暂停。连接和模型保存到配置；API key 单独存放且绑定 endpoint，聊天记录不保存它。设置不做 Job 外的模型探活；首次实际请求验证认证。
 
 界面支持中文/emoji/组合字符、鼠标滚动、Markdown/code/diff 和 NO_COLOR。F2 按需打开全宽内部事件面板。启动按页读取最近 40 条记录，`/older` 向前浏览；完整历史留在 SQLite。最近预览有明确数量和字符上限。模型预览允许丢帧，不承担持久化或交付职责；工具运行时显示 stdout/stderr 短尾部，完成后以持久原文为准。普通成功工具收成一行，失败先显示退出码与关键原因。
 
 `/diff` 检查 staged/unstaged 修改及未跟踪文件实际内容；`/export` 导出本地 HTML 对话与行动日志；`/copy` 使用系统剪贴板。用户的界面操作不发起 Agent 模型或工作区写工具。Agent 的行动始终由 Engine/Job 执行；未知写必须先核查，TUI `/reconcile` 记录结论后仍暂停；Ctrl+R 才继续。TUI 需要交互终端，管道输入使用 `bone chat`。
 
-问题到达只提醒；`/questions` 明确选择回复，`/message` 切回新要求。Esc 返回上一层，保留目标与草稿；Ctrl+C 始终暂停，Ctrl+Y 独立复制。
+问题到达只提醒；选中问题按 Enter 或通过 Ctrl+P 明确选择回复；菜单“写新要求”返回原稿。Esc 返回上一层，保留目标与草稿；Ctrl+C 始终暂停，Ctrl+Y 独立复制。
 
 详见 [终端界面设计与验收](docs/tui.md)。离线 PTY 验收：`python3 tests/tui_pty.py`，仅连接本地 fixture，不读取真实凭据。
 

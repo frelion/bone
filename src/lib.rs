@@ -26,7 +26,9 @@ pub mod state;
 mod store;
 mod tools;
 
-pub use model::{login, providers};
+pub use model::{
+    has_api_key, has_login, login, login_with, providers, remove_api_key, save_api_key,
+};
 
 /// Describe available tools without opening configuration or an execution session.
 /// These are the actual native Rig schemas used by the runtime; this metadata

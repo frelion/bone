@@ -15,6 +15,7 @@ pub(super) enum Focus {
     Input,
     Conversation,
     Activity,
+    Sessions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +47,7 @@ pub(super) enum PickerKind {
     Command,
     Session,
     File,
-    Model,
+    Connection,
     History,
     Question,
     Reconcile,
@@ -67,6 +68,23 @@ pub(super) struct Picker {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct FormField {
+    pub label: String,
+    pub value: String,
+    pub secret: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Form {
+    title: String,
+    fields: Vec<FormField>,
+    editors: Vec<TextArea<'static>>,
+    step: usize,
+    editor_size: Option<(u16, u16)>,
+    error: String,
+}
+
+#[derive(Debug, Clone)]
 struct ReadPoint {
     key: String,
     offset: usize,
@@ -76,6 +94,7 @@ struct ReadPoint {
 #[derive(Debug, Clone)]
 struct LayerReturn {
     picker: Option<Picker>,
+    form: Option<Form>,
     detail: Option<(String, String)>,
     help: bool,
     audit: bool,
@@ -119,6 +138,13 @@ pub(super) struct View {
     pub feedback_detail: String,
     pub spinner_tick: usize,
     pub picker: Option<Picker>,
+    form: Option<Form>,
+    pub sessions: Vec<PickerItem>,
+    pub sessions_loading: bool,
+    session_selected: usize,
+    active_session: Option<String>,
+    main_focus: Focus,
+    sidebar_width: u16,
     history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
@@ -171,6 +197,13 @@ impl View {
             feedback_detail: String::new(),
             spinner_tick: 0,
             picker: None,
+            form: None,
+            sessions: Vec::new(),
+            sessions_loading: false,
+            session_selected: 0,
+            active_session: None,
+            main_focus: Focus::Input,
+            sidebar_width: 0,
             history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
@@ -361,7 +394,97 @@ impl View {
         self.history_index = None;
     }
     pub fn has_modal(&self) -> bool {
-        self.picker.as_ref().is_some_and(|p| !p.inline) || self.show_help || self.detail.is_some()
+        self.picker.as_ref().is_some_and(|p| !p.inline)
+            || self.form.is_some()
+            || self.show_help
+            || self.detail.is_some()
+    }
+    pub fn set_sessions(&mut self, sessions: Vec<PickerItem>) {
+        let selected = self.selected_session().map(str::to_owned);
+        self.sessions = sessions;
+        self.session_selected = selected
+            .or_else(|| self.active_session.clone())
+            .and_then(|value| self.sessions.iter().position(|item| item.value == value))
+            .unwrap_or(
+                self.session_selected
+                    .min(self.sessions.len().saturating_sub(1)),
+            );
+    }
+    pub fn select_session(&mut self, value: &str) {
+        self.active_session = Some(value.to_owned());
+        if let Some(index) = self.sessions.iter().position(|item| item.value == value) {
+            self.session_selected = index;
+        }
+    }
+    pub fn selected_session(&self) -> Option<&str> {
+        self.sessions
+            .get(self.session_selected)
+            .map(|item| item.value.as_str())
+    }
+    pub fn open_form(&mut self, title: impl Into<String>, fields: Vec<FormField>) {
+        if fields.is_empty() {
+            return;
+        }
+        self.enter_layer();
+        let editors = fields
+            .iter()
+            .map(|field| {
+                let mut editor = new_editor();
+                editor.insert_str(Self::sanitize(&field.value).replace('\n', " "));
+                if field.secret {
+                    editor.set_mask_char('•');
+                }
+                editor
+            })
+            .collect();
+        self.form = Some(Form {
+            title: title.into(),
+            fields,
+            editors,
+            step: 0,
+            editor_size: None,
+            error: String::new(),
+        });
+    }
+    pub fn form_is_open(&self) -> bool {
+        self.form.is_some()
+    }
+    pub fn form_is_editable(&self) -> bool {
+        self.form
+            .as_ref()
+            .is_some_and(|form| form.editor_size.is_none_or(|(w, h)| w > 0 && h > 0))
+    }
+    pub fn form_error(&mut self, text: impl Into<String>) {
+        if let Some(form) = self.form.as_mut() {
+            form.error = Self::sanitize(&text.into());
+        }
+    }
+    pub fn form_step(&self) -> Option<(usize, usize)> {
+        self.form
+            .as_ref()
+            .map(|form| (form.step, form.fields.len()))
+    }
+    pub fn form_values(&self) -> Option<Vec<String>> {
+        self.form.as_ref().map(|form| {
+            form.editors
+                .iter()
+                .map(|editor| editor.lines().join("\n"))
+                .collect()
+        })
+    }
+    /// Return true on the last field; the caller validates/saves before closing.
+    pub fn advance_form(&mut self) -> bool {
+        let Some(form) = self.form.as_mut() else {
+            return false;
+        };
+        if form.step + 1 == form.fields.len() {
+            true
+        } else {
+            form.step += 1;
+            form.editor_size = None;
+            form.error.clear();
+            false
+        }
     }
     pub fn draft(&self) -> String {
         self.editor.lines().join("\n")
@@ -503,6 +626,7 @@ impl View {
         self.retain_reading_anchor();
         self.layers.push(LayerReturn {
             picker: self.picker.take().filter(|p| !p.inline),
+            form: self.form.take(),
             detail: self.detail.take(),
             help: self.show_help,
             audit: self.show_activity,
@@ -529,6 +653,7 @@ impl View {
         let active = self.has_modal() || self.show_activity;
         if let Some(parent) = self.layers.pop() {
             self.picker = parent.picker;
+            self.form = parent.form;
             self.detail = parent.detail;
             self.show_help = parent.help;
             self.show_activity = parent.audit;
@@ -563,6 +688,7 @@ impl View {
             self.cache_dirty = true;
         } else {
             self.picker = None;
+            self.form = None;
             self.detail = None;
             self.show_help = false;
             self.show_activity = false;
@@ -592,6 +718,7 @@ impl View {
     }
     pub fn restore_draft(&mut self, draft: Draft) {
         self.editor = draft.editor;
+        self.editor_size = None;
         self.reply_label = draft.label;
     }
     pub fn temporary_draft_text(&self) -> Option<String> {
@@ -735,6 +862,9 @@ impl View {
             .map(|item| (p.kind, item.value.clone()))
     }
     pub fn handle_mouse(&mut self, event: MouseEvent) {
+        if self.form.is_some() {
+            return;
+        }
         if self.show_help {
             match event.kind {
                 MouseEventKind::ScrollUp => {
@@ -775,6 +905,19 @@ impl View {
                 MouseEventKind::ScrollUp => self.selected = self.selected.saturating_sub(3),
                 MouseEventKind::ScrollDown => {
                     self.selected = (self.selected + 3).min(self.activities.len().saturating_sub(1))
+                }
+                _ => {}
+            }
+            return;
+        }
+        if event.column < self.sidebar_width || self.focus == Focus::Sessions {
+            match event.kind {
+                MouseEventKind::ScrollUp => {
+                    self.session_selected = self.session_selected.saturating_sub(3)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.session_selected =
+                        (self.session_selected + 3).min(self.sessions.len().saturating_sub(1))
                 }
                 _ => {}
             }
@@ -828,13 +971,29 @@ impl View {
     }
     pub fn handle_paste(&mut self, text: &str) {
         let query = Self::sanitize(text).replace('\n', " ");
-        if let Some(picker) = self.picker.as_mut().filter(|p| !p.inline) {
+        if let Some(form) = self.form.as_mut() {
+            if form.editor_size == Some((0, 0)) {
+                return;
+            }
+            if form.fields[form.step].secret && text.trim().contains(['\r', '\n']) {
+                form.error = "密钥只能是一行；此次粘贴未接受".into();
+                return;
+            }
+            let editor = &mut form.editors[form.step];
+            if editor.lines().join("\n").len() + query.len() <= 4096 {
+                editor.insert_str(query);
+            } else {
+                self.notice = "字段最多 4 KiB；此次粘贴未接受".into();
+            }
+        } else if let Some(picker) = self.picker.as_mut().filter(|p| !p.inline) {
             if picker.query.len() + query.len() <= 4096 {
                 picker.query.push_str(&query);
                 picker.selected = 0;
             } else {
                 self.notice = "搜索输入最多 4 KiB；此次粘贴未接受".into();
             }
+        } else if self.focus == Focus::Sessions {
+            self.notice = "Ctrl+→ 返回输入，再粘贴到草稿".into();
         } else if self.show_activity {
             self.notice = "先按 Esc 或 F6 返回编辑，再粘贴到草稿".into();
         } else if self.show_help || self.detail.is_some() {
@@ -875,6 +1034,45 @@ impl View {
                 self.close_layer();
             } else {
                 self.open_help();
+            }
+            return;
+        }
+        if self.form.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.close_layer();
+                }
+                _ if !self.form_is_editable() => {}
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let form = self.form.as_mut().unwrap();
+                    form.step = if key.code == KeyCode::BackTab {
+                        form.step.saturating_sub(1)
+                    } else {
+                        (form.step + 1).min(form.fields.len() - 1)
+                    };
+                    form.editor_size = None;
+                }
+                KeyCode::Enter | KeyCode::Up | KeyCode::Down => {}
+                KeyCode::Char('j' | 'm') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.handle_paste(&c.to_string());
+                }
+                KeyCode::Char('z') if key.modifiers == KeyModifiers::CONTROL => {
+                    let form = self.form.as_mut().unwrap();
+                    form.editors[form.step].undo();
+                }
+                KeyCode::Char('z') if key.modifiers == KeyModifiers::ALT => {
+                    let form = self.form.as_mut().unwrap();
+                    form.editors[form.step].redo();
+                }
+                _ => {
+                    let form = self.form.as_mut().unwrap();
+                    form.editors[form.step].input(key);
+                }
             }
             return;
         }
@@ -923,12 +1121,51 @@ impl View {
             return;
         }
         if key.code == KeyCode::Esc {
+            if self.focus == Focus::Sessions && !self.has_modal() && !self.show_activity {
+                self.focus = self.main_focus;
+                return;
+            }
             self.close_layer();
             return;
         }
         if self.show_help || self.detail.is_some() {
             scroll_key(key.code, &mut self.detail_scroll, self.detail_max, 10);
             return;
+        }
+        if key.modifiers == KeyModifiers::CONTROL {
+            let target = match key.code {
+                KeyCode::Left => Some(Focus::Sessions),
+                KeyCode::Right => Some(if self.focus == Focus::Sessions {
+                    self.main_focus
+                } else {
+                    self.focus
+                }),
+                KeyCode::Up => Some(Focus::Conversation),
+                KeyCode::Down => Some(Focus::Input),
+                _ => None,
+            };
+            if let Some(target) = target {
+                self.close_completion();
+                if self.show_activity && target != Focus::Activity {
+                    self.close_layer();
+                }
+                if target == Focus::Sessions && self.focus != Focus::Sessions {
+                    self.main_focus = if self.focus == Focus::Conversation {
+                        Focus::Conversation
+                    } else {
+                        Focus::Input
+                    };
+                }
+                self.focus = target;
+                if target == Focus::Conversation
+                    && self.message_selected.is_none()
+                    && !self.messages.is_empty()
+                {
+                    self.message_selected = Some(self.messages.len() - 1);
+                    self.cache_dirty = true;
+                }
+                return;
+            }
         }
         match key.code {
             KeyCode::F(2) => {
@@ -959,6 +1196,14 @@ impl View {
         match self.focus {
             Focus::Input => {
                 match key.code {
+                    KeyCode::Left | KeyCode::Right if key.modifiers == KeyModifiers::ALT => {
+                        self.editor.cancel_selection();
+                        self.editor.move_cursor(if key.code == KeyCode::Left {
+                            CursorMove::WordBack
+                        } else {
+                            CursorMove::WordForward
+                        });
+                    }
                     KeyCode::Enter if key.modifiers.is_empty() => {}
                     KeyCode::Enter | KeyCode::Char('j')
                         if key.code == KeyCode::Enter
@@ -1097,6 +1342,14 @@ impl View {
                     self.activity_height.max(1),
                 );
             }
+            Focus::Sessions => {
+                scroll_key(
+                    key.code,
+                    &mut self.session_selected,
+                    self.sessions.len().saturating_sub(1),
+                    8,
+                );
+            }
         }
     }
 
@@ -1104,7 +1357,7 @@ impl View {
         &mut self,
         frame: &mut Frame,
         state: &bone::state::SessionState,
-        _model: &str,
+        model: &str,
         status: &str,
     ) {
         let area = frame.area();
@@ -1119,6 +1372,22 @@ impl View {
             );
             return;
         }
+        let window = area;
+        self.sidebar_width = if window.width >= 64 { 22 } else { 0 };
+        let area = if self.sidebar_width > 0 {
+            self.render_sessions(
+                frame,
+                Rect::new(window.x, window.y, self.sidebar_width, window.height),
+            );
+            Rect::new(
+                window.x + self.sidebar_width,
+                window.y,
+                window.width - self.sidebar_width,
+                window.height,
+            )
+        } else {
+            window
+        };
         let input_width = area.width.saturating_sub(1).max(1) as usize;
         let draft_rows = wrap(&self.draft(), input_width).len();
         let input_height = draft_rows.clamp(1, 5) as u16 + 2;
@@ -1131,11 +1400,11 @@ impl View {
                 Constraint::Length(1),
                 Constraint::Min(1),
                 Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(u16::from(!self.feedback_detail.is_empty())),
                 Constraint::Length(u16::from(explicit_target)),
                 Constraint::Length(input_height),
                 Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(0),
             ])
             .split(area);
         let project = state
@@ -1143,9 +1412,25 @@ impl View {
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
+        let identity = format!(
+            " BONE / {} · {}",
+            fit_line(&Self::sanitize(&project), 12),
+            Self::sanitize(model)
+        );
+        let identity = if UnicodeWidthStr::width(identity.as_str()) > area.width as usize {
+            format!(
+                " BONE · {}",
+                fit_line(
+                    &Self::sanitize(model),
+                    area.width.saturating_sub(8) as usize
+                )
+            )
+        } else {
+            identity
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!(" BONE / {}", Self::sanitize(&project)),
+                identity,
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
             regions[0],
@@ -1168,12 +1453,8 @@ impl View {
                 let mut points = Vec::new();
                 if self.messages.is_empty() {
                     lines.push(Line::styled(
-                        "描述任务，BONE 会在当前工作区执行。",
+                        "在下方写下要完成的事。",
                         Style::default().fg(ACCENT),
-                    ));
-                    lines.push(Line::styled(
-                        "/ 命令   @ 文件   Ctrl+F 搜索   F1 帮助",
-                        Style::default().fg(MUTED),
                     ));
                 }
                 self.message_offsets.clear();
@@ -1331,7 +1612,7 @@ impl View {
         } else if self.has_modal() {
             " 草稿保留 · Esc 返回上一层 ".to_owned()
         } else {
-            " 草稿只读 · F6 返回编辑 ".to_owned()
+            " 草稿只读 · Ctrl↓ 编辑 ".to_owned()
         };
         if draft_rows > 1 {
             input_title.push_str(&format!("· 多行 {draft_rows} "));
@@ -1347,24 +1628,16 @@ impl View {
         } else {
             Style::default()
         });
-        frame.render_widget(&self.editor, regions[6]);
-        let editor_inner = self.editor.block().unwrap().inner(regions[6]);
-        let editor_size = (editor_inner.width, editor_inner.height);
-        if self.editor_size != Some(editor_size) {
-            // Native rendering refreshes the wrap map first. Reset the old viewport,
-            // then restore the original text cursor; both APIs preserve selection.
-            let cursor = self.editor.cursor();
-            if let (Ok(row), Ok(col)) = (u16::try_from(cursor.0), u16::try_from(cursor.1)) {
-                for _ in 0..3 {
-                    self.editor.scroll((-i16::MAX, 0));
-                }
-                self.editor.move_cursor(CursorMove::Jump(row, col));
-                frame.render_widget(Clear, regions[6]);
-                frame.render_widget(&self.editor, regions[6]);
+        render_editor(frame, &mut self.editor, &mut self.editor_size, regions[6]);
+        let keys = if let Some(form) = &self.form {
+            if form.editor_size == Some((0, 0)) {
+                "扩大窗口编辑 · Esc 返回"
+            } else if form.step + 1 == form.fields.len() {
+                "Enter 保存 · Tab 换字段 · Esc 取消"
+            } else {
+                "Enter 下一项 · Tab 换字段 · Esc 取消"
             }
-            self.editor_size = Some(editor_size);
-        }
-        let keys = if self.has_modal() {
+        } else if self.has_modal() {
             if self.picker.is_some() {
                 "候选：↑↓ 选择 · Enter 确认 · Esc 返回上一层"
             } else {
@@ -1372,15 +1645,17 @@ impl View {
             }
         } else if self.show_activity {
             "审计：↑↓ 选择 · Enter 原文 · Esc 返回"
+        } else if self.focus == Focus::Sessions {
+            "会话：↑↓ 选择 · Enter 打开 · Ctrl→ 返回"
         } else if self.focus == Focus::Input {
-            "Enter 发送 · Shift+Enter 换行 · F6 阅读 · F2 审计 · F1 帮助"
+            if self.reply_label.starts_with("回复") {
+                "Enter 回答 · Ctrl+P 新要求 · Ctrl← 会话"
+            } else {
+                "Enter 发送 · Ctrl↑ 阅读 · Ctrl← 会话"
+            }
         } else {
-            "阅读：↑↓ 选择 · Enter 展开 · d 原文 · y 复制 · F6 输入 · F2 审计"
+            "↑↓ 选择 · d 原文 · Ctrl↓ 输入 · Ctrl← 会话"
         };
-        frame.render_widget(
-            Paragraph::new(format!(" {keys}")).style(Style::default().fg(MUTED)),
-            regions[7],
-        );
         let position = if self.show_activity {
             format!(
                 "审计 {}/{} · Esc 回到工作段落",
@@ -1396,15 +1671,27 @@ impl View {
                 self.unread
             )
         };
+        let footer = if !self.has_modal()
+            && self.focus == Focus::Conversation
+            && !self.follow_conversation
+        {
+            position
+        } else if !self.has_modal() && self.focus == Focus::Input && self.unread > 0 {
+            format!("{} 次新内容更新 · Ctrl↑ 阅读 · Enter 发送", self.unread)
+        } else {
+            keys.to_owned()
+        };
         frame.render_widget(
-            Paragraph::new(format!(" {position}")).style(Style::default().fg(if self.unread > 0 {
+            Paragraph::new(format!(" {footer}")).style(Style::default().fg(if self.unread > 0 {
                 ACCENT
             } else {
                 MUTED
             })),
-            regions[8],
+            regions[7],
         );
-        if let Some(picker) = &self.picker {
+        if self.form.is_some() {
+            self.render_form(frame, regions[2]);
+        } else if let Some(picker) = &self.picker {
             let rect = if picker.inline {
                 let height = (filtered(picker).len().clamp(1, 6) + 2) as u16;
                 let height = height.min(regions[2].height);
@@ -1472,7 +1759,7 @@ impl View {
                 inner,
             );
         } else if self.show_help {
-            let help = "直接输入任务，Enter 发送。\nShift+Enter / Alt+Enter / Ctrl+J 换行；粘贴多行保持在输入框。\n↑↓ 移动光标；Alt+↑↓ 召回历史；Ctrl+←→ 移动单词。\nCtrl+A/E 行首尾；Ctrl+K 删除至行尾；Ctrl+W 删除单词。\nShift+方向键选区；Ctrl+Y复制选区或当前原文。\nCtrl+Z 撤销 / Alt+Z 重做；Ctrl+F 搜索对话。\nCtrl+P 命令菜单；Ctrl+O / @文件 Tab 引用；Ctrl+G 外部编辑器。\nF6 切换输入与阅读；Tab 只插入补全或编辑。Esc 返回上一层。\n对话：↑↓ / j k 选择消息；Enter 展开折叠；d 原文；y 复制。\nPageUp / PageDown 滚动，Home / End 到首尾。\n交付保留完整段落；工具默认摘要，Enter 展开。\n窗口最多256条/8MiB，单条128KiB预览。\n展开预览；d 原文 / y 复制完整记录；Ctrl+F 搜索持久历史。\n活动展示最近 400 条：上下选择，Enter 浏览原生事件详情。\nF2 打开审计；Esc 返回原阅读位置。\nCtrl+C 暂停；Ctrl+Y 复制选区或原文；Ctrl+R 恢复；Ctrl+Q 退出。\n\nF1 或 Esc 关闭帮助。";
+            let help = "直接输入任务，Enter 发送。\nCtrl+← 会话，Ctrl+→ 返回；Ctrl+↑ 正文，Ctrl+↓ 输入。\nShift+Enter / Alt+Enter / Ctrl+J 换行；粘贴多行保持在输入框。\n↑↓ 移动光标；Alt+↑↓ 召回历史；Alt+←→ 移动单词。\nCtrl+A/E 行首尾；Ctrl+K 删除至行尾；Ctrl+W 删除单词。\nShift+方向键选区；Ctrl+Y复制选区或当前原文。\nCtrl+Z 撤销 / Alt+Z 重做；Ctrl+F 搜索对话。\nCtrl+P 操作菜单；Ctrl+O / @文件 Tab 引用；Ctrl+G 外部编辑器。\nF6 切换输入与阅读；Tab 只插入补全或编辑。Esc 返回上一层。\n对话：↑↓ / j k 选择消息；Enter 展开折叠；d 原文；y 复制。\nPageUp / PageDown 滚动，Home / End 到首尾。\n交付保留完整段落；工具默认摘要，Enter 展开。\n窗口最多256条/8MiB，单条128KiB预览。\n展开预览；d 原文 / y 复制完整记录；Ctrl+F 搜索持久历史。\n活动展示最近 400 条：上下选择，Enter 浏览原生事件详情。\nF2 打开审计；Esc 返回原阅读位置。\nCtrl+C 暂停；Ctrl+Y 复制选区或原文；Ctrl+R 恢复；Ctrl+Q 退出。\n\nF1 或 Esc 关闭帮助。";
             let commands = super::COMMANDS
                 .iter()
                 .map(|(name, _)| *name)
@@ -1501,10 +1788,7 @@ impl View {
             self.detail_max = render_overlay(
                 frame,
                 regions[2],
-                &format!(
-                    " {} · Ctrl+P /audit 审计 · Esc 返回 ",
-                    Self::sanitize(title)
-                ),
+                &format!(" {} · Ctrl+P 审计 · Esc 返回 ", Self::sanitize(title)),
                 detail,
                 &mut self.detail_scroll,
             );
@@ -1512,21 +1796,15 @@ impl View {
             self.detail_scroll = 0;
         }
         if editing {
-            let inner = self
-                .editor
-                .block()
-                .map_or(regions[6], |block| block.inner(regions[6]));
-            let cursor = {
-                let buffer = frame.buffer_mut();
-                (inner.y..inner.bottom()).find_map(|y| {
-                    (inner.x..inner.right())
-                        .find(|&x| buffer[(x, y)].modifier.contains(Modifier::REVERSED))
-                        .map(|x| (x, y))
-                })
-            };
-            if let Some(cursor) = cursor {
-                frame.set_cursor_position(cursor);
-            }
+            set_editor_cursor(frame, &self.editor, regions[6]);
+        }
+        if self.sidebar_width == 0
+            && self.focus == Focus::Sessions
+            && !self.has_modal()
+            && !self.show_activity
+        {
+            frame.render_widget(Clear, window);
+            self.render_sessions(frame, window);
         }
         if std::env::var_os("NO_COLOR").is_some()
             || std::env::var("TERM").is_ok_and(|term| term == "dumb")
@@ -1536,6 +1814,211 @@ impl View {
                 cell.bg = Color::Reset;
             }
         }
+    }
+
+    fn render_sessions(&mut self, frame: &mut Frame, area: Rect) {
+        let focused = self.focus == Focus::Sessions && !self.has_modal() && !self.show_activity;
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(Style::default().fg(MUTED)),
+            area,
+        );
+        let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+        frame.render_widget(
+            Paragraph::new(if focused { "› 会话" } else { "  会话" })
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        self.session_selected = self
+            .session_selected
+            .min(self.sessions.len().saturating_sub(1));
+        let list_height = inner.height.saturating_sub(5) as usize;
+        let top = self
+            .session_selected
+            .saturating_sub(list_height.saturating_sub(1));
+        let rows = if self.sessions.is_empty() {
+            vec![Line::styled(
+                if self.sessions_loading {
+                    "  读取中…"
+                } else {
+                    "  暂无会话"
+                },
+                Style::default().fg(MUTED),
+            )]
+        } else {
+            self.sessions
+                .iter()
+                .enumerate()
+                .skip(top)
+                .take(list_height)
+                .map(|(index, item)| {
+                    let selected = index == self.session_selected;
+                    let active = self.active_session.as_deref() == Some(item.value.as_str());
+                    let mut style = Style::default();
+                    if active {
+                        style = style.add_modifier(Modifier::UNDERLINED);
+                    }
+                    if selected && focused {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    Line::styled(
+                        format!(
+                            "{}{}",
+                            if selected && focused { "› " } else { "  " },
+                            fit_line(
+                                &Self::sanitize(&item.label),
+                                inner.width.saturating_sub(2) as usize
+                            )
+                        ),
+                        style,
+                    )
+                })
+                .collect()
+        };
+        frame.render_widget(
+            Paragraph::new(rows),
+            Rect::new(inner.x, inner.y + 2, inner.width, list_height as u16),
+        );
+        let detail = if self.sessions_loading {
+            "读取中…".to_owned()
+        } else {
+            self.sessions
+                .get(self.session_selected)
+                .map(|item| Self::sanitize(&item.detail).replace('\n', " "))
+                .unwrap_or_default()
+        };
+        let footer = vec![
+            Line::styled(
+                format!(
+                    "  {}",
+                    fit_line(&detail, inner.width.saturating_sub(2) as usize)
+                ),
+                Style::default().fg(MUTED),
+            ),
+            Line::from(if focused {
+                "  Enter 打开"
+            } else {
+                "  Ctrl← 会话"
+            }),
+            Line::styled(
+                if focused {
+                    "  Ctrl→ 返回"
+                } else {
+                    "  Ctrl+P 操作"
+                },
+                Style::default().fg(MUTED),
+            ),
+        ];
+        frame.render_widget(
+            Paragraph::new(footer),
+            Rect::new(
+                inner.x,
+                inner.bottom().saturating_sub(3),
+                inner.width,
+                3.min(inner.height),
+            ),
+        );
+    }
+
+    fn render_form(&mut self, frame: &mut Frame, area: Rect) {
+        let form = self.form.as_mut().unwrap();
+        let rect = overlay_rect(area);
+        if rect.height < 8 || rect.width < 24 {
+            form.editor_size = Some((0, 0));
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new("扩大窗口编辑\nEsc 返回").style(Style::default().fg(ACCENT)),
+                rect,
+            );
+            return;
+        }
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            block(
+                &format!(
+                    " {} · {} / {} ",
+                    Self::sanitize(&form.title),
+                    form.step + 1,
+                    form.fields.len()
+                ),
+                true,
+            ),
+            rect,
+        );
+        let inner = rect.inner(ratatui::layout::Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let regions = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+        let labels = form
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                Span::styled(
+                    format!(
+                        "{}{}  ",
+                        if index == form.step { "› " } else { "" },
+                        Self::sanitize(
+                            field
+                                .label
+                                .split_once(" · ")
+                                .map_or(field.label.as_str(), |(label, _)| label)
+                        )
+                    ),
+                    if index == form.step {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(MUTED)
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(Line::from(labels)), regions[0]);
+        let editor = &mut form.editors[form.step];
+        editor.set_block(
+            Block::default()
+                .borders(Borders::TOP | Borders::BOTTOM | Borders::LEFT)
+                .title(format!(
+                    " {} ",
+                    Self::sanitize(&form.fields[form.step].label)
+                )),
+        );
+        render_editor(frame, editor, &mut form.editor_size, regions[1]);
+        if !form.error.is_empty() {
+            frame.render_widget(
+                Paragraph::new(
+                    wrap(
+                        &format!("未保存 · {}", form.error),
+                        regions[2].width.max(1) as usize,
+                    )
+                    .into_iter()
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+                )
+                .style(Style::default().fg(Color::Red)),
+                regions[2],
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(if form.step + 1 == form.fields.len() {
+                "Enter 保存 · Tab 换字段 · Esc 取消"
+            } else {
+                "Enter 下一项 · Tab 换字段 · Esc 取消"
+            })
+            .style(Style::default().fg(MUTED)),
+            regions[3],
+        );
+        set_editor_cursor(frame, editor, regions[1]);
     }
 
     fn render_activity(&mut self, frame: &mut Frame, area: Rect) {
@@ -1628,6 +2111,46 @@ impl View {
     }
 }
 
+fn render_editor(
+    frame: &mut Frame,
+    editor: &mut TextArea<'static>,
+    previous_size: &mut Option<(u16, u16)>,
+    area: Rect,
+) {
+    frame.render_widget(&*editor, area);
+    let inner = editor.block().map_or(area, |block| block.inner(area));
+    let size = (inner.width, inner.height);
+    if *previous_size != Some(size) {
+        // Render loads the native wrap map. Scroll/Jump preserve selection and undo.
+        let cursor = editor.cursor();
+        if let (Ok(row), Ok(col)) = (u16::try_from(cursor.0), u16::try_from(cursor.1)) {
+            // The SDK negates deltas; three safe steps cover the full u16 viewport.
+            for _ in 0..3 {
+                editor.scroll((-i16::MAX, 0));
+            }
+            editor.move_cursor(CursorMove::Jump(row, col));
+            frame.render_widget(Clear, area);
+            frame.render_widget(&*editor, area);
+        }
+        *previous_size = Some(size);
+    }
+}
+
+fn set_editor_cursor(frame: &mut Frame, editor: &TextArea<'static>, area: Rect) {
+    let inner = editor.block().map_or(area, |block| block.inner(area));
+    let cursor = {
+        let buffer = frame.buffer_mut();
+        (inner.y..inner.bottom()).find_map(|y| {
+            (inner.x..inner.right())
+                .find(|&x| buffer[(x, y)].modifier.contains(Modifier::REVERSED))
+                .map(|x| (x, y))
+        })
+    };
+    if let Some(cursor) = cursor {
+        frame.set_cursor_position(cursor);
+    }
+}
+
 fn scroll_key(key: KeyCode, position: &mut usize, max: usize, page: usize) -> bool {
     *position = match key {
         KeyCode::Up => position.saturating_sub(1),
@@ -1668,7 +2191,7 @@ fn new_editor() -> TextArea<'static> {
             .bg(Color::DarkGray)
             .add_modifier(Modifier::UNDERLINED),
     );
-    editor.set_placeholder_text("描述任务，或输入 / 命令、@ 文件");
+    editor.set_placeholder_text("写下要完成的事");
     editor.set_placeholder_style(Style::default().fg(MUTED));
     editor
 }
@@ -1677,7 +2200,7 @@ fn picker_title(kind: PickerKind) -> &'static str {
         PickerKind::Command => "命令",
         PickerKind::Session => "会话",
         PickerKind::File => "文件",
-        PickerKind::Model => "模型",
+        PickerKind::Connection => "连接",
         PickerKind::History => "搜索历史",
         PickerKind::Question => "问题",
         PickerKind::Reconcile => "核对变更",

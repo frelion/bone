@@ -1,0 +1,112 @@
+{
+  "status": "PASS",
+  "date": "2026-10-03",
+  "source_fingerprint": "0be603ad4ec968c7071a46f4227c58361f149c9869644f481a916ac48cd86eae",
+  "source_fingerprint_scope": "Sorted relative Cargo.toml, Cargo.lock, src/**/*.rs; path+NUL+bytes+NUL",
+  "binary": "/Users/zzhang/.cargo/bin/bone",
+  "binary_sha256": "1fd4ef9d339e0bfc13e979f245c4567526d26c04fcfd42b76d7eac2eb14842d3",
+  "version": "bone 0.8.0",
+  "results": [
+    {
+      "name": "format",
+      "command": [
+        "cargo",
+        "fmt"
+      ],
+      "exit_code": 0,
+      "seconds": 0.19
+    },
+    {
+      "name": "format-check",
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 0.19
+    },
+    {
+      "name": "rust-tests",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--quiet"
+      ],
+      "exit_code": 0,
+      "seconds": 38.78,
+      "passed_tests": 225
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 4.09
+    },
+    {
+      "name": "python-tests",
+      "command": [
+        "python3",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_*.py"
+      ],
+      "exit_code": 0,
+      "seconds": 0.18
+    },
+    {
+      "name": "install",
+      "command": [
+        "cargo",
+        "install",
+        "--path",
+        ".",
+        "--locked",
+        "--force"
+      ],
+      "exit_code": 0,
+      "seconds": 13.33
+    }
+  ],
+  "pty_final": [
+    {
+      "evidence": "pty/80x24/workspace-flow.json",
+      "label": "80×24 · NO_COLOR",
+      "status": "PASS",
+      "checks": 24,
+      "frames": 18,
+      "harness_sha256": "c7603b454bd34250b2b11695149d16907b1192f46b386ea4a35877077888c6e5"
+    },
+    {
+      "evidence": "pty/120x40/workspace-flow.json",
+      "label": "120×40 · NO_COLOR",
+      "status": "PASS",
+      "checks": 24,
+      "frames": 18,
+      "harness_sha256": "c7603b454bd34250b2b11695149d16907b1192f46b386ea4a35877077888c6e5"
+    },
+    {
+      "evidence": "pty/color/80x24/workspace-flow.json",
+      "label": "80×24 · 彩色",
+      "status": "PASS",
+      "checks": 24,
+      "frames": 18,
+      "harness_sha256": "c7603b454bd34250b2b11695149d16907b1192f46b386ea4a35877077888c6e5"
+    }
+  ]
+}
