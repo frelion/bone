@@ -2,9 +2,9 @@
 
 BONE 是一个 Rust 编写的 coding agent。用户与一个 agent 对话；agent 在内部 Job 中保留正在进行的工作、等待关系和局部上下文。用户直接提出任务和后续指令，无需创建或选择 Job。
 
-这是从零重写的单 crate 实现。模型连接、消息、工具定义、返回结果和流解析使用官方 Rig SDK，固定到 Git 提交 `063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a`。会话状态与事件存于 SQLite。架构边界见 [architecture.md](docs/architecture.md)，验收和消融方法见 [verification.md](docs/verification.md)。
+这是从零重写的单 crate 实现。模型连接、消息、工具定义、返回结果和流解析使用官方 Rig SDK，固定到 Git 提交 `063bcf0e9cee2fd5287fbb807e67d3e9d418ba0a`。会话状态与事件存于数据目录的 `sessions.sqlite`。架构边界见 [architecture.md](docs/architecture.md)，验收和消融方法见 [verification.md](docs/verification.md)。
 
-测试入口与覆盖边界见 [测试地图](tests/README.md)，本次实际删减与复验见 [收缩记录](docs/results/2026-10-02-contraction/README.md)。新版 TUI 的交互、逐屏过程与验证范围见 [TUI 设计交付](docs/results/2026-10-02-tui-design/README.md)。同一内核使用 `gpt-6-luna` 完成了跨进程、多轮修改与冷历史回查的真实仓库任务，并在外部反馈修正后通过功能验收和实际工具演示。原先失败、人工介入及验证边界保留在[工程交付记录](docs/results/2026-10-01-flagship-engineering/README.md)中；这不是通用任务成功率保证。
+测试入口与覆盖边界见 [测试地图](tests/README.md)，0.10 的实际删减与复验见 [内核收缩记录](docs/results/2026-10-08-core-simplify/README.md)。此前收缩见 [之前的记录](docs/results/2026-10-02-contraction/README.md)。TUI 的交互、逐屏过程与验证范围见 [TUI 设计交付](docs/results/2026-10-02-tui-design/README.md)。同一内核使用 `gpt-6-luna` 完成了跨进程、多轮修改与冷历史回查的真实仓库任务，并在外部反馈修正后通过功能验收和实际工具演示。原先失败、人工介入及验证边界保留在[工程交付记录](docs/results/2026-10-01-flagship-engineering/README.md)中；这不是通用任务成功率保证。
 
 ## 查看可用工具
 
@@ -20,7 +20,7 @@ bone tools --read-only --single-job --json
 
 ## 构建与配置
 
-macOS、Windows 和 Linux 的预编译包见 [GitHub Releases](https://github.com/frelion/bone/releases/latest)，下载对应架构后解压，安装步骤在包内 `INSTALL.txt`。发布范围见 [0.9.4 发布说明](docs/releases/0.9.4.md)。
+macOS、Windows 和 Linux 的预编译包见 [GitHub Releases](https://github.com/frelion/bone/releases/latest)，下载对应架构后解压，安装步骤在包内 `INSTALL.txt`。已发布版本的范围见 [0.9.4 发布说明](docs/releases/0.9.4.md)。本分支 0.10.0 的行为变化见 [更新说明](docs/releases/0.10.0.md)。
 
 预编译版运行不需要 Rust、Python 或编译器。以下源码构建需要 Rust 1.96 或更新版本；本地协议验收还需要 Python 3。
 
@@ -31,7 +31,7 @@ bone --version
 bone providers
 ```
 
-安装后的版本应为 `bone 0.9.4`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
+源码安装后的版本应为 `bone 0.10.0`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
 
 `target/release/bone` 是构建目录内的文件，只有在包含它的 checkout 中才能通过相对路径运行。安装后的 `bone` 可在任意项目目录中使用。
 
@@ -145,11 +145,11 @@ TUI 左侧切换会话，右侧显示对话、Markdown 答复和工具行动；�
 | 新会话 / 模型 / 连接 | `/new` / `/model` / `/connect` |
 | 项目修改 / 复制 / 帮助 | Ctrl+D / Ctrl+Y / F1 或 `/help` |
 
-所有回复目标的未发送草稿、光标、选区及最近输入原子保存在数据目录的 `tui/` 下，切换和重启后恢复；撤销历史不跨进程保存。多行粘贴、文件补全、恢复草稿和外部编辑器均不自动提交。切换会话保存并暂停旧工作，打开的未完成工作保持暂停。连接和模型保存到配置；API key 单独存放且绑定 endpoint，聊天记录不保存它。设置不做 Job 外的模型探活；首次实际请求验证认证。
+所有回复目标的未发送草稿、光标、选区及最近输入原子保存在数据目录的 `tui/` 下，切换和重启后恢复；撤销历史不跨进程保存。多行粘贴、文件补全、恢复草稿和外部编辑器均不自动提交。切换会话保存草稿，已经打开的工作继续运行；重启后恢复的未完成工作保持暂停。换模型只影响后续调用，已启动的调用保留原模型。连接和模型保存到配置；API key 单独存放且绑定 endpoint，聊天记录不保存它。设置不做 Job 外的模型探活；首次实际请求验证认证。
 
 界面支持中文/emoji/组合字符、鼠标滚动、Markdown/code/diff 和 NO_COLOR。F2 按需打开全宽内部事件面板。启动按页读取最近 40 条记录，上翻至顶部自动读取更早记录；完整历史留在 SQLite。最近预览有明确数量和字符上限。模型预览允许丢帧，不承担持久化或交付职责；工具运行时显示 stdout/stderr 短尾部，完成后以持久原文为准。普通成功工具收成一行，失败先显示退出码与关键原因。
 
-`/diff` 检查 staged/unstaged 修改及未跟踪文件实际内容；`/export` 异步导出本地 HTML 对话与行动日志，完成后 Ctrl+P 查看路径；`/copy` 使用系统剪贴板。用户的界面操作不发起 Agent 模型或工作区写工具。Agent 的行动始终由 Engine/Job 执行；未知写必须先核查，TUI `/reconcile` 记录结论后仍暂停；Ctrl+R 才继续。TUI 需要交互终端，管道输入使用 `bone chat`。
+Ctrl+D 检查 staged/unstaged 修改及未跟踪文件实际内容；Ctrl+P 的“导出对话记录”异步生成本地 HTML 对话与行动日志，完成后在同一菜单查看路径；Ctrl+Y 使用系统剪贴板。用户的界面操作不发起 Agent 模型或工作区写工具。Agent 的行动始终由 Engine/Job 执行；中断结果保留错误、部分输出和未知效果，Agent 通过普通工具检查实际状态后决定下一步；无需人工核销。TUI 需要交互终端，管道输入使用 `bone chat`。
 
 问题到达只提醒；选中问题按 Enter 或通过 Ctrl+P 明确选择回复；菜单“写新要求”返回原稿。Esc 返回上一层，保留目标与草稿；Ctrl+C 始终暂停，Ctrl+Y 独立复制。
 
@@ -191,22 +191,17 @@ Rust 库的执行操作通过 `runtime::Engine`：`post`、`step`、`stop`、`re
 
 `shell` 在 workspace 中以当前本地用户权限运行，没有 OS sandbox。命令超时或取消时会终止所启动的进程组；输出最多保留每个流 32 KiB。不要把进程组终止等同于撤销已发生的外部效果。
 
-命令默认超时为 60 秒；编译或集成测试可显式指定 `timeout_seconds`，有效范围 1～3600 秒。`run` / `resume` 的整体 `--timeout-seconds` 截止时间仍适用。无效超时值会报错；真正超时或取消后仍需核查未知写，不会自动重试。
+命令默认超时为 60 秒；编译或集成测试可显式指定 `timeout_seconds`，有效范围 1～3600 秒。`run` / `resume` 的整体 `--timeout-seconds` 截止时间仍适用。无效超时值会报错；超时或取消保留已经收集的输出，已启动的命令不会自动重试。
 
 `chat --timeout-seconds` 限制从最新普通输入或 `/resume` 开始的一段工作；等待用户时不计时。到期后持久暂停，可以继续同一对话。新输入重启时限，不重置旧请求的模型调用额度。
 
-中断或无法确认完成的写操作记录为未知写；进一步写入需要先核查。文件替换后目录同步失败也属于未知效果。查看 session history 与实际文件/外部状态，再记录观察：
+中断或无法确认完成的动作仍有对应的原生工具结果，明确说明效果未知；文件替换后目录同步失败也如此。Agent 可以读取文件、查看 Git 或外部状态，再决定如何继续。内核不会把未知效果宣称为成功，也不会自动重放已经启动的调用。
 
-```sh
-bone reconcile SESSION_ID CALL_ID --note '核查后的实际结果和证据'
-bone --profile work resume SESSION_ID
-```
+显式停止会暂停会话，向运行中的 shell 发出终止信号，并在真实执行结束后保存输出与结果。退出前收集这些结果。重启时，对没有结果的启动记录补一条中断结果；普通 `resume` 或新消息即可续做，不需要 `/reconcile`。
 
-`reconcile` 记录检查结果并解除写入阻塞，不自动重放旧命令。恢复会话可以继续读取和核查；未知效果不能据此报告为成功。
+workspace 写锁存放在操作系统用户目录的 `~/.bone/workspace-locks`，独立于数据目录和临时目录。同一系统用户、相同 canonical workspace 根共享写锁；嵌套但根不同的 workspace 不共享。前台 shell 继承实际锁；BONE 被硬杀后仍在运行的 shell 结束前，同根的其他会话不能写入。该保证不覆盖主动关闭继承文件描述符、自行脱离的后台程序。已有文件的哈希复核也无法消除与任意外部编辑器之间的最后竞争窗口。
 
-workspace 锁和未知写标记存放在操作系统用户目录的 `~/.bone/workspace-locks`，独立于数据目录和临时目录。同一系统用户、相同 canonical workspace 根共享写锁；嵌套但根不同的 workspace 不共享。前台 shell 继承实际锁；BONE 被硬杀后仍在运行的 shell 结束前，同根的其他会话不能写入或核销它的未知结果。该保证不覆盖主动关闭继承文件描述符、自行脱离的后台程序。已有文件的哈希复核也无法消除与任意外部编辑器之间的最后竞争窗口。
-
-如果动作完成后的 SQLite 提交失败，执行器停止后续状态修改并要求重新打开，以持久记录恢复；未知写仍需核查。
+如果动作完成后的 SQLite 提交失败，执行器停止后续状态修改并要求重新打开，以持久启动记录恢复。
 
 ## 官方 companion provider
 
@@ -240,7 +235,7 @@ python3 -B -m unittest discover -s tests -p 'test_ablate.py' -v
 
 协议测试使用本地 Responses/SSE fixture、合成凭据和临时目录，验证原生模型调用、流收集、401 不重试、内部工作、工具和恢复。消融脚本默认只生成实验安排；只有显式 `--run` 才请求模型。离线测试不代表真实模型质量、效率提升或 subscription 登录成功。
 
-新实现默认使用 `~/.bone/v2`，不自动导入旧会话或旧凭据。显式 `reuse_codex_login` 仅按用户选择读取现有 Codex 登录，不属于缓存迁移。旧实现保留在 Git 历史中。本次重写没有延续旧的多 crate/TUI 接口；当前用户入口是本仓库的 `bone` CLI。
+新实现默认使用 `~/.bone/v2`，本版本会话保存在 `sessions.sqlite`，不导入旧会话文件。显式 `reuse_codex_login` 仅按用户选择读取现有 Codex 登录，不属于缓存迁移。旧实现保留在 Git 历史中。本次重写没有延续旧的多 crate/TUI 接口；当前用户入口是本仓库的 `bone` CLI。
 
 长会话加固后的离线验收通过 97 项 Rust 检查（含 3 项公共接口编译失败检查）、5 项 Python 测试、Clippy 和全部 feature 编译。包括 12 轮续接、多次压缩、跨 Job 原始要求回查、当前与排队输入区分、纠正指令恢复、真实硬杀 shell、存储故障注入及稳定订阅锁。2,200 条大事件经四次压缩重开后，原文仍能回查。
 

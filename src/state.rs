@@ -23,6 +23,7 @@ pub enum JobState {
 /// References in inbox, active_input, history, and wait_for are event IDs.
 /// Native model messages live exclusively in Event.data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Job {
     pub id: String,
     pub title: String,
@@ -35,7 +36,6 @@ pub struct Job {
     pub wait_for: Vec<String>,
     pub current_call: Option<String>,
     /// Last public instruction incorporated into this job's history or summary.
-    #[serde(default)]
     pub public_revision: u64,
 }
 
@@ -58,6 +58,7 @@ impl Job {
 
 /// One allowance shared by all work caused by a root user input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Budget {
     pub calls_used: u32,
     pub max_calls: u32,
@@ -92,14 +93,7 @@ impl Budget {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UnknownWrite {
-    pub call_id: String,
-    pub job_id: String,
-    pub root_input: Option<String>,
-    pub tool_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionState {
     pub id: String,
     pub workspace: PathBuf,
@@ -109,7 +103,6 @@ pub struct SessionState {
     pub jobs: BTreeMap<String, Job>,
     pub budgets: BTreeMap<String, Budget>,
     pub paused: bool,
-    pub unknown_writes: BTreeMap<String, UnknownWrite>,
 }
 
 impl SessionState {
@@ -123,12 +116,12 @@ impl SessionState {
             jobs: BTreeMap::new(),
             budgets: BTreeMap::new(),
             paused: false,
-            unknown_writes: BTreeMap::new(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Event {
     pub id: String,
     pub session_id: String,

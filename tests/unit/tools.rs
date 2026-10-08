@@ -222,26 +222,18 @@ fn inherited_lease_shell_helper() {
             .unwrap(),
     );
     lease.try_lock_exclusive().unwrap();
-    let legacy = std::sync::Arc::new(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(directory.join("legacy.lock"))
-            .unwrap(),
-    );
-    legacy.try_lock_exclusive().unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(execute(
         &directory,
         "shell",
         &json!({"command":"printf ready > shell.started; sleep 2; printf finished > shell.finished","timeout_seconds":10}),
-        Some([lease, legacy]),
+        Some(lease),
     ));
 }
 
 #[cfg(unix)]
 #[test]
-fn killed_parent_does_not_release_the_frontground_shells_physical_lease() {
+fn killed_parent_does_not_release_the_foreground_shells_physical_lease() {
     use fs2::FileExt;
     use std::process::{Command, Stdio};
     let directory = tempfile::tempdir().unwrap();
@@ -250,12 +242,6 @@ fn killed_parent_does_not_release_the_frontground_shells_physical_lease() {
         .write(true)
         .create_new(true)
         .open(directory.path().join("lease.lock"))
-        .unwrap();
-    let legacy = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(directory.path().join("legacy.lock"))
         .unwrap();
     let mut parent = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -285,13 +271,9 @@ fn killed_parent_does_not_release_the_frontground_shells_physical_lease() {
         lock.try_lock_exclusive().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
-    assert_eq!(
-        legacy.try_lock_exclusive().unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock
-    );
     let stopped = std::time::Instant::now();
     loop {
-        if lock.try_lock_exclusive().is_ok() && legacy.try_lock_exclusive().is_ok() {
+        if lock.try_lock_exclusive().is_ok() {
             break;
         }
         assert!(
@@ -305,7 +287,6 @@ fn killed_parent_does_not_release_the_frontground_shells_physical_lease() {
         "finished"
     );
     FileExt::unlock(&lock).unwrap();
-    FileExt::unlock(&legacy).unwrap();
 }
 
 #[tokio::test]
@@ -331,6 +312,7 @@ async fn observed_shell_drains_beyond_preview_and_keeps_timeout_uncertainty() {
         &json!({"command":command}),
         None,
         Some(Arc::clone(&observer)),
+        None,
     )
     .await;
     assert_eq!(bytes.load(Ordering::Relaxed), 40_005);
@@ -354,17 +336,68 @@ async fn observed_shell_drains_beyond_preview_and_keeps_timeout_uncertainty() {
         &json!({"command":command, "timeout_seconds":1}),
         None,
         Some(observer),
+        None,
     )
     .await;
     assert!(bytes.load(Ordering::Relaxed) > 0);
     assert!(timed_out.uncertain);
     assert_eq!(timed_out.content["effect"], "unknown");
+    assert_eq!(timed_out.content["stdout"], "observed-before-timeout");
+    assert_eq!(timed_out.content["interrupted"], true);
     assert!(
         timed_out.content["error"]
             .as_str()
             .unwrap()
             .contains("timed out")
     );
+}
+
+#[tokio::test]
+async fn stop_signal_collects_partial_output_and_terminates_the_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().to_owned();
+    let observed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let notify = std::sync::Arc::clone(&observed);
+    let observer: ToolObserver = std::sync::Arc::new(move |_, bytes| {
+        if !bytes.is_empty() {
+            notify.notify_one();
+        }
+    });
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write('started'); [Threading.Thread]::Sleep(30000); [IO.File]::WriteAllText('must-not-run','bad')\""
+    } else {
+        "printf started; sleep 30; printf bad > must-not-run"
+    };
+    let task = tokio::spawn(async move {
+        execute_with_progress(
+            &workspace,
+            "shell",
+            &json!({"command":command}),
+            None,
+            Some(observer),
+            Some(signal),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(15), observed.notified())
+        .await
+        .unwrap();
+    stop.send(true).unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(outcome.uncertain);
+    assert_eq!(outcome.content["interrupted"], true);
+    assert_eq!(outcome.content["stdout"], "started");
+    assert!(
+        outcome.content["error"]
+            .as_str()
+            .unwrap()
+            .contains("stopped")
+    );
+    assert!(!directory.path().join("must-not-run").exists());
 }
 
 #[cfg(windows)]
@@ -455,14 +488,12 @@ async fn windows_timeout_stops_descendants_before_releasing_workspace_ownership(
         )
     };
     let stable = open_lock("stable.lock");
-    let legacy = open_lock("legacy.lock");
     stable.try_lock_exclusive().unwrap();
-    legacy.try_lock_exclusive().unwrap();
     let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let observed = progress.clone();
     let observer: ToolObserver =
         std::sync::Arc::new(move |_, bytes| observed.lock().unwrap().extend_from_slice(bytes));
-    let outcome = execute_with_progress(directory.path(), "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File parent.ps1","timeout_seconds":15}), Some([stable.clone(), legacy.clone()]), Some(observer)).await;
+    let outcome = execute_with_progress(directory.path(), "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File parent.ps1","timeout_seconds":15}), Some(stable.clone()), Some(observer), None).await;
     assert!(
         directory.path().join("shell.started").exists(),
         "Windows parent/descendant did not reach ready in {}: {}; progress: {}",
@@ -497,9 +528,7 @@ fn windows_owned_shell_helper() {
         )
     };
     let stable = open("stable.lock");
-    let legacy = open("legacy.lock");
     stable.try_lock_exclusive().unwrap();
-    legacy.try_lock_exclusive().unwrap();
     println!(
         "Windows helper requested workspace: {}",
         directory.display()
@@ -510,7 +539,7 @@ fn windows_owned_shell_helper() {
         output.write_all(bytes).unwrap();
         output.flush().unwrap();
     });
-    let outcome = tokio::runtime::Runtime::new().unwrap().block_on(execute_with_progress(&directory, "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File parent.ps1","timeout_seconds":60}), Some([stable, legacy]), Some(observer)));
+    let outcome = tokio::runtime::Runtime::new().unwrap().block_on(execute_with_progress(&directory, "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File parent.ps1","timeout_seconds":60}), Some(stable), Some(observer), None));
     println!("Windows owned-shell outcome: {}", outcome.content);
 }
 
@@ -529,7 +558,6 @@ fn windows_killed_parent_stops_the_shell_and_keeps_recovery_blocked_until_it_sto
             .unwrap()
     };
     let stable = open("stable.lock");
-    let _legacy = open("legacy.lock");
     let helper_log = std::fs::File::create(directory.path().join("helper.log")).unwrap();
     let mut parent = std::process::Command::new(std::env::current_exe().unwrap())
         .args([

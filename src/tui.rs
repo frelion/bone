@@ -12,12 +12,12 @@ use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use ratatui::DefaultTerminal;
 use rig_core::providers::chatgpt::auth::{DeviceCodeHandler, DeviceCodePrompt};
 use serde_json::Value;
 use services::native_text;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -28,6 +28,7 @@ use view::{
 };
 
 /// Concrete launch recipes, not a second runtime or model abstraction.
+#[derive(Clone)]
 pub(super) struct Settings {
     pub profile_name: String,
     pub profile: Profile,
@@ -129,6 +130,7 @@ struct App {
     cursor: Option<String>,
     older: Option<String>,
     settings: Settings,
+    default_settings: Settings,
     parts: BTreeMap<String, BTreeMap<u64, String>>,
     last_input: Option<String>,
     last_admitted_input: Option<String>,
@@ -153,11 +155,14 @@ struct App {
     tool_observations: BTreeMap<String, (String, String)>,
     reply_target: Option<String>,
     drafts: BTreeMap<String, Draft>,
-    reconcile_call: Option<String>,
+    background: BTreeMap<String, Engine>,
+    recipes: BTreeMap<String, Settings>,
+    deadlines: BTreeMap<String, Instant>,
+    duration: Duration,
     detail_event: Option<String>,
     detail_sources: BTreeMap<String, String>,
     last_tool_failure: Option<String>,
-    mouse_capture: bool,
+    exit_requested: bool,
 }
 impl App {
     fn new(settings: Settings) -> Self {
@@ -165,6 +170,7 @@ impl App {
             ui: View::new(),
             cursor: None,
             older: None,
+            default_settings: settings.clone(),
             settings,
             parts: BTreeMap::new(),
             last_input: None,
@@ -190,21 +196,70 @@ impl App {
             tool_observations: BTreeMap::new(),
             reply_target: None,
             drafts: BTreeMap::new(),
-            reconcile_call: None,
+            background: BTreeMap::new(),
+            recipes: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
+            duration: Duration::from_secs(300),
             detail_event: None,
             detail_sources: BTreeMap::new(),
             last_tool_failure: None,
-            mouse_capture: true,
+            exit_requested: false,
         }
     }
+    fn maintain_execution(&mut self, current: &mut Engine) -> Result<()> {
+        let now = Instant::now();
+        for engine in std::iter::once(&mut *current).chain(self.background.values_mut()) {
+            let id = engine.state().id.clone();
+            if engine.is_quiescent() || engine.state().paused {
+                self.deadlines.remove(&id);
+            } else {
+                let deadline = self
+                    .deadlines
+                    .entry(id.clone())
+                    .or_insert(now + self.duration);
+                if now >= *deadline {
+                    engine.stop()?;
+                    self.deadlines.remove(&id);
+                    self.ui.notify("会话运行时限已到；执行正在停止");
+                }
+            }
+        }
+        self.background.retain(|_, engine| !engine.is_quiescent());
+        Ok(())
+    }
+    fn execution_update(
+        &mut self,
+        current: &mut Engine,
+        data: &Path,
+        id: &str,
+        result: Result<Vec<Event>>,
+    ) -> Result<()> {
+        if id == current.state().id {
+            result.context("TUI session execution failed")?;
+            self.progress(current);
+            self.sync(current, data)?;
+        } else {
+            if let Err(error) = result {
+                self.background.remove(id);
+                self.ui
+                    .fail(format!("后台会话 {} 执行失败：{error:#}", short_id(id)));
+            }
+            self.refresh_sessions(current, data);
+        }
+        Ok(())
+    }
     fn load(&mut self, engine: &mut Engine, data: &Path) -> Result<()> {
+        let (name, profile) = engine.profile_recipe();
+        self.settings = Settings {
+            profile_name: name.into(),
+            profile: profile.clone(),
+        };
         self.ui = View::new();
         self.parts.clear();
         self.tool_previews.clear();
         self.tool_observations.clear();
         self.reply_target = None;
         self.drafts.clear();
-        self.reconcile_call = None;
         self.detail_event = None;
         self.detail_sources.clear();
         self.last_tool_failure = None;
@@ -259,7 +314,7 @@ impl App {
                 }
                 self.ui.paste(&saved.draft);
                 self.ui
-                    .restore_input_position(saved.cursor, saved.selection);
+                    .restore_input_position(Some(saved.cursor), saved.selection);
                 self.reply_target = saved.reply_to.clone();
                 self.drafts = saved
                     .drafts
@@ -289,17 +344,17 @@ impl App {
         Ok(())
     }
     fn refresh_latest(&mut self, engine: &mut Engine, data: &Path) -> Result<()> {
-        ensure!(
-            self.reconcile_call.is_none(),
-            "先记录或取消核查表单，再返回最新记录；原草稿与核查草稿均保留"
-        );
         self.save(engine, data)?;
         let active = self.ui.draft_snapshot();
         let inactive = std::mem::take(&mut self.drafts);
         let target = self.reply_target.clone();
         let admitted = self.last_admitted_input.clone();
+        let focus = self.ui.focus;
+        let main_focus = self.ui.main_focus;
         let refreshed = self.load(engine, data);
         self.ui.restore_draft(active);
+        self.ui.focus = focus;
+        self.ui.main_focus = main_focus;
         self.drafts = inactive;
         self.reply_target = target;
         if admitted == self.last_input {
@@ -314,13 +369,10 @@ impl App {
     fn save(&mut self, engine: &Engine, data: &Path) -> Result<()> {
         let (cursor, selection) = self.ui.input_position();
         let saved = services::UiSaved {
-            draft: self
-                .ui
-                .temporary_draft_text()
-                .unwrap_or_else(|| self.ui.draft()),
+            draft: self.ui.draft(),
             history: self.ui.history(),
             reply_to: self.reply_target.clone(),
-            cursor: Some(cursor),
+            cursor,
             selection,
             drafts: self
                 .drafts
@@ -371,10 +423,8 @@ impl App {
             self.ui.remove_message(&format!("live:{call}"));
             self.parts.remove(call);
         }
-        if matches!(
-            event.kind.as_str(),
-            "tool_started" | "tool_result" | "tool_reconciled"
-        ) && let Some(call) = &event.call_id
+        if matches!(event.kind.as_str(), "tool_started" | "tool_result")
+            && let Some(call) = &event.call_id
         {
             self.tool_previews.remove(call);
         }
@@ -471,23 +521,12 @@ impl App {
     }
     fn metadata(&mut self, engine: &Engine) {
         let questions = engine.unanswered_questions();
-        self.ui.input_target = if self.reconcile_call.is_some() {
-            InputTarget::Reconcile
-        } else if self.reply_target.is_some() {
+        self.ui.input_target = if self.reply_target.is_some() {
             InputTarget::Reply
         } else {
             InputTarget::Message
         };
-        self.ui.reply_label = if let Some(call) = &self.reconcile_call {
-            format!(
-                "核查：{}（结果未知）",
-                engine
-                    .state()
-                    .unknown_writes
-                    .get(call)
-                    .map_or("写入操作", |write| write.tool_name.as_str())
-            )
-        } else if let Some(id) = &self.reply_target {
+        self.ui.reply_label = if let Some(id) = &self.reply_target {
             if let Some(question) = questions.iter().find(|q| &q.id == id) {
                 format!(
                     "回复：{}",
@@ -740,10 +779,9 @@ impl App {
         if self.reply_target.is_some() {
             items.push(action("写新要求", "/message", "保存回复草稿，回到新要求"));
         }
-        if !engine.state().unknown_writes.is_empty() {
-            items.push(action("核查未确认写入", "/reconcile", "记录实际结果后继续"));
-        }
+
         items.push(action("查看项目修改", "/diff", "Git 修改 · Ctrl+D"));
+        items.push(action("导出对话记录", "/export", "保存当前对话与行动记录"));
         if self.exported_report.is_some() {
             items.push(action("查看导出报告", "/export show", "报告文件的完整路径"));
         }
@@ -763,12 +801,6 @@ impl App {
         self.session_index = Some(tokio::task::spawn_blocking(move || {
             session_items(&data, &workspace, &current)
         }));
-    }
-    fn sessions(&mut self, engine: &Engine, data: &Path) -> Result<()> {
-        self.ui
-            .open_picker(PickerKind::Session, Vec::new(), String::new());
-        self.refresh_sessions(engine, data);
-        Ok(())
     }
     fn model_form(&mut self, data: &Path) -> Result<()> {
         let (config, revision) = Config::load_with_revision(data)?;
@@ -1090,10 +1122,6 @@ impl App {
             .profiles
             .insert(change.name.clone(), change.profile.clone());
         change.config.default_profile = change.name.clone();
-        if !engine.is_quiescent() {
-            pause(engine, &mut self.ui)?;
-            self.clear_preview();
-        }
         let old_name = self.settings.profile_name.clone();
         let old_profile = self.settings.profile.clone();
         engine.set_profile(change.profile.clone(), change.name.clone())?;
@@ -1110,6 +1138,9 @@ impl App {
         }
         self.settings.profile_name = change.name;
         self.settings.profile = change.profile;
+        self.default_settings = self.settings.clone();
+        self.recipes
+            .insert(engine.state().id.clone(), self.settings.clone());
         if let Some(warning) = warning {
             self.ui.fail(warning);
         } else {
@@ -1162,10 +1193,6 @@ impl App {
         }
     }
     fn switch_session(&mut self, engine: &mut Engine, data: &Path, id: Option<&str>) -> Result<()> {
-        ensure!(
-            self.reconcile_call.is_none(),
-            "先记录或取消核查，再切换会话；核查草稿保留"
-        );
         if id == Some(engine.state().id.as_str()) {
             self.ui.picker = None;
             return Ok(());
@@ -1173,17 +1200,31 @@ impl App {
         let sidebar = self.ui.focus == Focus::Sessions;
         let return_focus = self.ui.main_focus;
         self.save(engine, data)?;
-        pause(engine, &mut self.ui)?;
+        // Open first: a bad target must not change or cancel the current session.
+        let next = if let Some(next) = id.and_then(|id| self.background.remove(id)) {
+            next
+        } else {
+            let recipe = id
+                .and_then(|id| self.recipes.get(id))
+                .unwrap_or(&self.default_settings);
+            Engine::open(
+                data,
+                &engine.state().workspace,
+                id,
+                recipe.profile.clone(),
+                recipe.profile_name.clone(),
+                engine.options().clone(),
+            )?
+        };
         self.clear_preview();
-        let next = Engine::open(
-            data,
-            &engine.state().workspace,
-            id,
-            self.settings.profile.clone(),
-            self.settings.profile_name.clone(),
-            engine.options().clone(),
-        )?;
-        *engine = next;
+        let old_id = engine.state().id.clone();
+        self.recipes.insert(old_id.clone(), self.settings.clone());
+        let previous = std::mem::replace(engine, next);
+        if !previous.is_quiescent() {
+            self.background.insert(old_id, previous);
+        } else {
+            self.deadlines.remove(&old_id);
+        }
         self.drafts.clear();
         self.load(engine, data)?;
         self.ui.select_session(&engine.state().id);
@@ -1225,7 +1266,7 @@ impl App {
             },
         )
     }
-    fn refresh_completion(&mut self, engine: &Engine, data: &Path) -> Result<()> {
+    fn refresh_completion(&mut self, engine: &Engine) -> Result<()> {
         let draft = self.ui.draft();
         let cursor = self.ui.cursor();
         let key = (draft.clone(), cursor);
@@ -1233,7 +1274,7 @@ impl App {
             return Ok(());
         }
         self.completion_key = Some(key);
-        if self.reconcile_call.is_some() || self.ui.focus != Focus::Input || self.ui.has_modal() {
+        if self.ui.focus != Focus::Input || self.ui.has_modal() {
             return Ok(());
         }
         let prefix = &draft[..cursor];
@@ -1247,10 +1288,6 @@ impl App {
             } else {
                 self.ui.close_completion();
             }
-        } else if let Some(query) = prefix.strip_prefix("/sessions ") {
-            self.sessions(engine, data)?;
-            self.ui
-                .open_completion(PickerKind::Session, Vec::new(), query.to_owned());
         } else if prefix.rfind('@').is_some_and(|n| {
             (n == 0 || prefix[..n].ends_with(char::is_whitespace))
                 && (!prefix[n + 1..].contains(char::is_whitespace)
@@ -1276,10 +1313,6 @@ impl App {
             PickerKind::Command => {
                 self.ui.take_draft();
                 self.ui.paste(&format!("{value} "));
-            }
-            PickerKind::Session => {
-                self.ui.take_draft();
-                self.ui.paste(&format!("/sessions {value}"));
             }
             PickerKind::File => {
                 let reference = if value.contains(char::is_whitespace) {
@@ -1395,68 +1428,8 @@ impl App {
         self.switch_target(None);
         self.ui.notify("已切换新要求草稿；Enter 发送新要求");
     }
-    fn begin_reconcile(&mut self, engine: &mut Engine, call: &str) -> Result<()> {
-        ensure!(
-            self.reconcile_call.is_none(),
-            "已有核查表单；Esc 取消后重新选择"
-        );
-        ensure!(
-            engine.state().unknown_writes.contains_key(call),
-            "该未知写入已失效；原草稿保留"
-        );
-        pause(engine, &mut self.ui)?;
-        self.ui.begin_temporary_draft();
-        self.reconcile_call = Some(call.to_owned());
-        self.ui
-            .notify("核查表单：填写检查过程和实际效果；Enter 记录，Esc 取消，Ctrl+D 阅读证据");
-        self.metadata(engine);
-        Ok(())
-    }
-    fn reconcile_editor_active(&self) -> bool {
-        self.reconcile_call.is_some()
-            && self.ui.focus == Focus::Input
-            && !self.ui.has_modal()
-            && !self.ui.show_activity
-    }
-    fn handle_reconcile_key(
-        &mut self,
-        engine: &mut Engine,
-        key: crossterm::event::KeyEvent,
-    ) -> Result<bool> {
-        if !self.reconcile_editor_active() {
-            return Ok(false);
-        }
-        match key.code {
-            KeyCode::Esc => self.cancel_reconcile(),
-            KeyCode::Enter
-                if !key.modifiers.intersects(
-                    KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-                ) =>
-            {
-                self.submit_reconcile(engine)?
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-    fn cancel_reconcile(&mut self) {
-        self.ui.restore_temporary_draft();
-        self.reconcile_call = None;
-        self.ui
-            .notify("已取消核查；原草稿、目标与阅读位置已恢复，执行仍暂停");
-    }
-    fn submit_reconcile(&mut self, engine: &mut Engine) -> Result<()> {
-        let call = self.reconcile_call.as_deref().context("没有核查表单")?;
-        engine.resolve_write(call, self.ui.draft().trim())?;
-        self.ui.restore_temporary_draft();
-        self.reconcile_call = None;
-        self.ui
-            .notify("已记录核查结果；执行仍暂停，Ctrl+R 显式恢复");
-        Ok(())
-    }
     fn current_status(&self, engine: &Engine) -> String {
         if !engine.state().paused
-            && engine.state().unknown_writes.is_empty()
             && let Some((call, feedback)) = self.selected_active_call(engine)
         {
             let phase = if feedback.phase == "思考中"
@@ -1496,21 +1469,7 @@ impl App {
             self.last_tool_failure.as_deref(),
         )
     }
-    fn open_delivery(&mut self, engine: &Engine, data: &Path) -> Result<()> {
-        let event =
-            services::latest_delivery(data, &engine.state().id)?.context("此会话还没有持久交付")?;
-        self.detail_event = Some(event.id.clone());
-        self.ui.open_detail(
-            format!(
-                "交付 {} · 输入 {}",
-                short_id(&event.id),
-                short_id(event.reply_to.as_deref().unwrap_or(""))
-            ),
-            detail(engine, &event)?,
-        );
-        self.remember_detail_source();
-        Ok(())
-    }
+
     fn remember_detail_source(&mut self) {
         if let (Some((title, _)), Some(id)) = (&self.ui.detail, &self.detail_event) {
             self.detail_sources.insert(title.clone(), id.clone());
@@ -1530,22 +1489,6 @@ impl App {
         );
         self.remember_detail_source();
         Ok(())
-    }
-    fn reconciliations(&mut self, engine: &Engine) {
-        let items = engine
-            .state()
-            .unknown_writes
-            .values()
-            .map(|w| PickerItem {
-                label: format!("{} · 结果未知", w.tool_name),
-                detail: w.call_id.clone(),
-                value: w.call_id.clone(),
-            })
-            .collect();
-        self.ui
-            .open_picker(PickerKind::Reconcile, items, String::new());
-        self.ui
-            .notify("先检查实际文件/进程结果，记录核查结论后显式恢复");
     }
     fn selected_record(&self, engine: &Engine) -> Option<String> {
         let id = self.ui.selected_message_id()?;
@@ -1616,9 +1559,7 @@ impl App {
             if let Some(selection) = self.ui.selected_input_text() {
                 ("输入选区".into(), selection)
             } else {
-                let label = if self.reconcile_call.is_some() {
-                    "核查草稿"
-                } else if self.reply_target.is_some() {
+                let label = if self.reply_target.is_some() {
                     "回复草稿"
                 } else {
                     "新要求草稿"
@@ -1792,54 +1733,33 @@ impl App {
             }
         }
     }
-    async fn submit_command(
-        &mut self,
-        engine: &mut Engine,
-        data: &Path,
-        terminal: &mut Terminal,
-        input: &mut Option<EventStream>,
-        text: &str,
-    ) -> Result<bool> {
+    fn submit_command(&mut self, engine: &mut Engine, data: &Path, text: &str) -> Result<bool> {
+        let command = text.split_whitespace().next().unwrap_or("");
+        ensure!(
+            COMMANDS.iter().any(|(public, _)| *public == command),
+            "未知命令 {command}；Ctrl+P 或 /help 查看命令（未发送给模型）"
+        );
         let draft = self.ui.draft_snapshot();
         self.ui.close_completion();
         self.ui.take_draft();
-        let result = self.command(engine, data, terminal, input, text).await;
+        let result = self.command(engine, data, text);
         if result.is_err() {
             self.ui.restore_draft(draft);
         }
         result
     }
 
-    async fn command(
-        &mut self,
-        engine: &mut Engine,
-        data: &Path,
-        terminal: &mut Terminal,
-        input: &mut Option<EventStream>,
-        text: &str,
-    ) -> Result<bool> {
+    fn command(&mut self, engine: &mut Engine, data: &Path, text: &str) -> Result<bool> {
         let (command, args) = text
             .trim()
             .split_once(char::is_whitespace)
             .unwrap_or((text.trim(), ""));
         let args = args.trim();
         match command {
-            "/quit" | "/exit" => return Ok(true),
+            "/quit" => return Ok(true),
             "/help" => self.ui.open_help(),
-            "/stop" => {
-                pause(engine, &mut self.ui)?;
-                self.clear_preview();
-            }
-            "/resume" => resume(engine, &mut self.ui),
             "/new" => {
                 self.switch_session(engine, data, None)?;
-            }
-            "/sessions" => {
-                if args.is_empty() {
-                    self.sessions(engine, data)?;
-                } else {
-                    self.switch_session(engine, data, Some(args))?;
-                }
             }
             "/model" => {
                 if args.is_empty() {
@@ -1855,70 +1775,8 @@ impl App {
                     self.connection_choice(engine, data, args)?;
                 }
             }
-            "/files" => self.complete_file(engine),
-            "/search" => self.start_search(engine, data, args),
             "/questions" => self.questions(engine),
-            "/reply" => self.bind_reply(engine, args)?,
             "/message" => self.cancel_reply(),
-            "/delivery" => self.open_delivery(engine, data)?,
-            "/audit" => self.open_audit(engine)?,
-            "/reconcile" => {
-                if args.is_empty() {
-                    self.reconciliations(engine);
-                } else if let Some((call, note)) = args.split_once(char::is_whitespace) {
-                    pause(engine, &mut self.ui)?;
-                    engine.resolve_write(call, note.trim())?;
-                    self.ui
-                        .notify("已记录核查结果；执行仍暂停，Ctrl+R 显式恢复");
-                } else {
-                    self.begin_reconcile(engine, args)?;
-                }
-            }
-            "/mouse" => {
-                self.mouse_capture = !self.mouse_capture;
-                if self.mouse_capture {
-                    execute!(stdout(), EnableMouseCapture)?;
-                } else {
-                    execute!(stdout(), DisableMouseCapture)?;
-                }
-                self.ui.notify(if self.mouse_capture {
-                    "鼠标滚动已启用；/mouse 切换原生文本选择"
-                } else {
-                    "终端文本选择已启用；/mouse 恢复鼠标滚动"
-                });
-            }
-            "/details" => self.ui.toggle_inspector(),
-            "/status" => {
-                let state = engine.state();
-                let detail = format!(
-                    "Session: {}\nWorkspace: {}\nModel: {}\nProfile: {}\nMode: {}\nStatus: {}\n\nLimits\n{}\n\n本次请求用量\n{}\n\n未知写入（需核查实际效果再 reconcile）\n{}",
-                    state.id,
-                    state.workspace.display(),
-                    model_label(&self.settings.profile),
-                    self.settings.profile_name,
-                    if engine.options().read_only {
-                        "只读"
-                    } else {
-                        "可写"
-                    },
-                    self.current_status(engine),
-                    serde_json::to_string_pretty(engine.options())?,
-                    self.last_input
-                        .as_ref()
-                        .map(|id| {
-                            let root = engine
-                                .read_event(id)
-                                .ok()
-                                .and_then(|e| e.root_input)
-                                .unwrap_or_else(|| id.clone());
-                            engine.metrics(&root)
-                        })
-                        .unwrap_or(Value::Null),
-                    serde_json::to_string_pretty(&state.unknown_writes)?
-                );
-                self.detail_event = None;
-                self.ui.open_detail("会话状态", detail);
-            }
             "/diff" => {
                 self.start_diff(engine);
             }
@@ -1942,10 +1800,6 @@ impl App {
                     self.ui.notify("正在导出对话和行动记录…");
                 }
             }
-            "/copy" => self.copy_selected(engine).await?,
-            "/older" => self.load_older(engine, data)?,
-            "/latest" => self.refresh_latest(engine, data)?,
-            "/editor" => self.editor(engine, data, terminal, input).await?,
             _ => bail!("未知命令 {command}；Ctrl+P 或 /help 查看命令（未发送给模型）"),
         }
         Ok(false)
@@ -1965,8 +1819,6 @@ impl App {
             "invalid editor command"
         );
         self.save(engine, data)?;
-        pause(engine, &mut self.ui)?;
-        self.clear_preview();
         let path = data
             .join("tui")
             .join(format!("editor-{}.txt", uuid::Uuid::new_v4()));
@@ -2013,10 +1865,18 @@ impl App {
             #[cfg(unix)]
             let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
             #[cfg(not(unix))] let mut term = ();
-            tokio::select! {
-                result = child.wait() => result.context("wait for external editor"),
-                _ = termination(&mut term) => { child.start_kill()?; bail!("external editor interrupted by SIGTERM; original draft retained") },
-                _ = tokio::signal::ctrl_c() => { child.start_kill()?; bail!("external editor interrupted; original draft retained") },
+            let mut refresh = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                self.maintain_execution(engine)?;
+                tokio::select! {
+                    result = child.wait() => break result.context("wait for external editor"),
+                    _ = termination(&mut term) => { self.exit_requested = true; child.start_kill()?; bail!("external editor interrupted by SIGTERM; original draft retained") },
+                    _ = tokio::signal::ctrl_c() => { engine.stop()?; child.start_kill()?; bail!("external editor interrupted; original draft retained") },
+                    _ = refresh.tick() => {},
+                    (id, result) = poll_engines(engine, &mut self.background) => {
+                        self.execution_update(engine, data, &id, result)?;
+                    },
+                }
             }
         }.await;
         let restored = terminal.reopen();
@@ -2039,16 +1899,30 @@ impl App {
         })();
         let _ = std::fs::remove_file(&path);
         restored?;
-        if !self.mouse_capture {
-            execute!(stdout(), DisableMouseCapture)?;
-        }
         let text = edited?;
         self.ui.take_draft();
         self.ui.paste(&text);
         self.ui
-            .notify("已返回编辑后的草稿，Enter 才发送；工作已暂停");
+            .notify("已返回编辑后的草稿，Enter 才发送；执行保持继续");
         self.save(engine, data)?;
         Ok(())
+    }
+}
+
+/// Dropping this wait cancels only polling, never Engine-owned execution tasks.
+async fn poll_engines(
+    current: &mut Engine,
+    background: &mut BTreeMap<String, Engine>,
+) -> (String, Result<Vec<Event>>) {
+    let mut waits: FuturesUnordered<_> = std::iter::once(current)
+        .chain(background.values_mut())
+        .filter(|engine| !engine.is_quiescent())
+        .map(|engine| async move { (engine.state().id.clone(), engine.step().await) })
+        .collect();
+    if waits.is_empty() {
+        std::future::pending().await
+    } else {
+        waits.next().await.unwrap()
     }
 }
 
@@ -2132,7 +2006,7 @@ fn cleanup_connection(data: &Path, name: &str) {
     }
 }
 const COMMANDS: &[(&str, &str)] = &[
-    ("/new", "新对话，当前工作保存并暂停"),
+    ("/new", "新对话，当前工作继续执行"),
     ("/model", "修改当前连接的模型"),
     ("/connect", "选择连接，登录 ChatGPT 或添加 API"),
     ("/help", "键盘帮助"),
@@ -2159,10 +2033,9 @@ fn file_items(files: &[String]) -> Vec<PickerItem> {
         .collect()
 }
 fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<SessionItem>> {
-    // This is a read-only UI projection, like latest_delivery in services.
-    // Reuse one connection: refreshing a list must not rerun Store migrations.
+    // Reuse one read-only connection for the session-list projection.
     let connection = rusqlite::Connection::open_with_flags(
-        data.join("sessions.sqlite3"),
+        data.join("sessions.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     connection.busy_timeout(Duration::from_secs(5))?;
@@ -2182,8 +2055,7 @@ fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<Ses
                   AND json_extract(payload, '$.kind') = 'input'
                   AND json_extract(payload, '$.data.source') = 'user')
              OR EXISTS (SELECT 1 FROM json_each(snapshot, '$.jobs'))
-             OR json_array_length(snapshot, '$.pending_inputs') > 0
-             OR EXISTS (SELECT 1 FROM json_each(snapshot, '$.unknown_writes')))
+             OR json_array_length(snapshot, '$.pending_inputs') > 0)
          ORDER BY (id = ?2) DESC,
            COALESCE((SELECT MAX(sequence) FROM events WHERE session_id = sessions.id), 0) DESC,
            rowid DESC LIMIT 200",
@@ -2256,9 +2128,7 @@ fn session_status(session: &bone::state::SessionState, events: &[Event]) -> &'st
                 .as_str()
                 .is_some_and(|key| !answered.contains(key))
     });
-    if !session.unknown_writes.is_empty() {
-        "核查"
-    } else if has_question {
+    if has_question {
         "回复"
     } else if session.paused && has_unfinished_work(session) {
         "暂停"
@@ -2321,11 +2191,11 @@ async fn copy_to_clipboard(text: &str) -> Result<()> {
             drop(stdin);
             ensure!(
                 child.wait().await?.success(),
-                "系统剪贴板不可用；可以使用 /export"
+                "系统剪贴板不可用；Ctrl+P 可导出对话记录"
             );
             return Ok(());
         }
-        bail!("系统剪贴板不可用；可以使用 /export")
+        bail!("系统剪贴板不可用；Ctrl+P 可导出对话记录")
     })
     .await
     .context("clipboard command timed out")?
@@ -2334,7 +2204,11 @@ fn pause(engine: &mut Engine, ui: &mut View) -> Result<()> {
     if !engine.state().paused {
         engine.stop()?;
     }
-    ui.notify("工作已暂停；Ctrl+R 恢复，Ctrl+Q 退出");
+    ui.notify(if engine.is_quiescent() {
+        "工作已停止；Ctrl+R 继续，Ctrl+Q 退出"
+    } else {
+        "停止中；正在终止执行"
+    });
     Ok(())
 }
 fn resume(engine: &mut Engine, ui: &mut View) {
@@ -2354,11 +2228,7 @@ pub(super) async fn run(
     let mut app = App::new(settings);
     let result = event_loop(&mut terminal, engine, data, &mut app, seconds).await;
     let saved = app.save(engine, data);
-    let stopped = if engine.state().paused {
-        Ok(())
-    } else {
-        engine.stop()
-    };
+    let stopped = stop_all(&mut terminal, engine, data, &mut app).await;
     abort_task(&mut app.diff);
     abort_task(&mut app.file_index);
     abort_task(&mut app.session_index);
@@ -2379,9 +2249,7 @@ pub(super) async fn run(
         } else {
             ""
         },
-        if !engine.state().unknown_writes.is_empty() {
-            "先核查未确认写入，再继续工作。"
-        } else if has_unfinished_work(engine.state()) {
+        if has_unfinished_work(engine.state()) {
             "打开后 Ctrl+R 恢复暂停的工作。"
         } else {
             "打开后可继续提出要求。"
@@ -2391,6 +2259,63 @@ pub(super) async fn run(
     saved?;
     stopped
 }
+
+async fn stop_all(
+    terminal: &mut Terminal,
+    current: &mut Engine,
+    data: &Path,
+    app: &mut App,
+) -> Result<()> {
+    let mut failed = BTreeSet::new();
+    let mut first_error = None;
+    for engine in std::iter::once(&mut *current).chain(app.background.values_mut()) {
+        if !engine.state().paused
+            && (!engine.is_quiescent() || has_unfinished_work(engine.state()))
+            && let Err(error) = engine.stop()
+        {
+            failed.insert(engine.state().id.clone());
+            first_error.get_or_insert(error);
+        }
+    }
+    loop {
+        app.metadata(current);
+        let model = format!(
+            "{} · {}",
+            app.settings.profile_name,
+            model_name(&app.settings.profile)
+        );
+        let fact = app.ui.live_status.clone();
+        terminal
+            .terminal
+            .draw(|frame| app.ui.render(frame, current.state(), &model, &fact))?;
+        let next = {
+            let mut waits: FuturesUnordered<_> = std::iter::once(&mut *current)
+                .chain(app.background.values_mut())
+                .filter(|engine| !engine.is_quiescent() && !failed.contains(&engine.state().id))
+                .map(|engine| async move { (engine.state().id.clone(), engine.step().await) })
+                .collect();
+            waits.next().await
+        };
+        let Some((id, result)) = next else {
+            break;
+        };
+        if let Err(error) = result {
+            failed.insert(id.clone());
+            app.ui.fail(format!(
+                "会话 {} 停止记录失败：{error:#}；重新打开可恢复持久记录",
+                short_id(&id)
+            ));
+            first_error.get_or_insert(error);
+        } else if let Err(error) = app.execution_update(current, data, &id, result) {
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 async fn event_loop(
     terminal: &mut Terminal,
     engine: &mut Engine,
@@ -2401,7 +2326,7 @@ async fn event_loop(
     app.load(engine, data)?;
     let mut input = Some(EventStream::new());
     let duration = Duration::from_secs(seconds.max(1));
-    let mut deadline = (!engine.is_quiescent()).then(|| Instant::now() + duration);
+    app.duration = duration;
     let mut cooldown = Instant::now();
     let mut dirty = true;
     let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -2411,6 +2336,9 @@ async fn event_loop(
     #[cfg(not(unix))]
     let mut terminate = ();
     loop {
+        if app.exit_requested {
+            return Ok(());
+        }
         if dirty {
             app.metadata(engine);
             let model = format!(
@@ -2424,9 +2352,7 @@ async fn event_loop(
                 .draw(|frame| app.ui.render(frame, engine.state(), &model, &fact))?;
             dirty = false;
         }
-        if engine.is_quiescent() {
-            deadline = None;
-        }
+        app.maintain_execution(engine)?;
         tokio::select! {
             biased;
             event = next_terminal(&mut input) => {
@@ -2442,7 +2368,7 @@ async fn event_loop(
                         match key.code {
                             KeyCode::Char('q') if control => return Ok(()),
                             KeyCode::Char('c') if control => {
-                                pause(engine, &mut app.ui)?; app.clear_preview(); deadline = None;
+                                pause(engine, &mut app.ui)?; app.clear_preview(); app.deadlines.remove(&engine.state().id);
                                 if app.login.is_some() { app.cancel_login(); app.ui.close_layer(); app.ui.notify("登录已取消，当前连接保留"); }
                             },
                             KeyCode::Char('y') if control => { if let Err(error) = app.copy_selected(engine).await { app.ui.fail(format!("复制失败：{error:#}")); } },
@@ -2455,17 +2381,8 @@ async fn event_loop(
                             },
                             _ if app.ui.form_is_open() => app.ui.handle_key(key),
                             KeyCode::Char('f') if control => app.start_search(engine, data, ""),
-                            KeyCode::Esc if app.reconcile_editor_active() => { app.handle_reconcile_key(engine, key)?; },
-                            KeyCode::Char('d') if control && app.reconcile_call.is_some() => {
-                                if let Some(call) = app.reconcile_call.clone() {
-                                    match reconciliation_detail(engine, &call) {
-                                        Ok(text) => { app.detail_event = engine.read_call_event(&call, "tool_result").or_else(|_| engine.read_call_event(&call, "tool_started")).ok().map(|e| e.id); app.ui.open_detail(format!("核查证据 · {}", short_id(&call)), text); app.remember_detail_source(); },
-                                        Err(error) => app.ui.fail(format!("读取核查证据失败：{error:#}")),
-                                    }
-                                }
-                            },
                             KeyCode::Char('d') if control => app.start_diff(engine),
-                            KeyCode::Char('D') if !control && (app.ui.detail.is_some() || app.ui.focus == Focus::Conversation) => {
+                            KeyCode::Char('D') if !control && (app.ui.detail.is_some() || (app.ui.focus == Focus::Conversation && !app.ui.has_modal())) => {
                                 if let Err(error) = app.open_audit(engine) { app.ui.fail(format!("读取审计失败：{error:#}")); }
                             },
                             KeyCode::Char('d') if app.ui.focus == Focus::Conversation && !app.ui.has_modal() => {
@@ -2474,8 +2391,12 @@ async fn event_loop(
                             KeyCode::Char('y') if app.ui.focus == Focus::Conversation && !app.ui.has_modal() => {
                                 if let Err(error) = app.copy_selected(engine).await { app.ui.fail(format!("复制失败：{error:#}")); }
                             },
-                            KeyCode::Char('r') if control && app.reconcile_call.is_some() => app.ui.notify("先记录或取消核查；执行仍暂停"),
-                            KeyCode::Char('r') if control => { resume(engine, &mut app.ui); deadline = Some(Instant::now()+duration); },
+                            KeyCode::Char('r') if control => { resume(engine, &mut app.ui); app.deadlines.insert(engine.state().id.clone(), Instant::now()+duration); },
+                            KeyCode::End if app.ui.focus == Focus::Conversation && !app.ui.has_modal() => {
+                                if let Err(error) = app.refresh_latest(engine,data) { app.ui.fail(format!("读取最新记录失败：{error:#}")); }
+                                app.ui.handle_key(key);
+                                if let Some(id)=app.ui.messages.last().and_then(|message|message.event_id.clone()) { app.ui.select_message(&id); }
+                            },
                             KeyCode::Char('p') if control => app.commands(engine, String::new()),
                             KeyCode::Char('o') if control => app.complete_file(engine),
                             KeyCode::Char('g') if control => {
@@ -2485,7 +2406,7 @@ async fn event_loop(
                                 && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
                                 if let Some((kind, value)) = app.ui.picker_value() {
                                     if kind == PickerKind::Command && key.code == KeyCode::Enter {
-                                        match app.submit_command(engine, data, terminal, &mut input, &value).await {
+                                        match app.submit_command(engine, data, &value) {
                                             Ok(true) => return Ok(()),
                                             Ok(false) => {},
                                             Err(error) => app.ui.fail(format!("操作失败：{error:#}；草稿已保留")),
@@ -2497,23 +2418,16 @@ async fn event_loop(
                                 if let Some((kind, value)) = app.ui.picker_value() {
                                     app.ui.close_layer();
                                     let result = match kind {
-                                        PickerKind::Command => {
-                                            if app.reconcile_call.is_some() && !matches!(value.as_str(), "/copy" | "/help" | "/stop" | "/status" | "/audit" | "/diff" | "/quit") {
-                                                Err(anyhow::anyhow!("先记录或取消当前核查表单；原草稿仍保留"))
-                                            } else {
-                                                app.command(engine, data, terminal, &mut input, &value).await
-                                            }
-                                        },
+                                        PickerKind::Command => app.command(engine, data, &value),
                                         PickerKind::Session => app.switch_session(engine, data, Some(&value)).map(|_|false),
                                         PickerKind::Connection => app.connection_choice(engine, data, &value).map(|_|false),
                                         PickerKind::History => {
                                             app.ui.select_message(&value);
                                             engine.read_event(&value).and_then(|e| detail(engine, &e)).map(|text| {
-                                                app.detail_event = Some(value.clone()); app.ui.open_detail(format!("搜索原文 · {} · {} · /audit 审计", app.search_query, short_id(&value)), text); app.remember_detail_source(); false
+                                                app.detail_event = Some(value.clone()); app.ui.open_detail(format!("搜索原文 · {} · {} · F2 审计", app.search_query, short_id(&value)), text); app.remember_detail_source(); false
                                             })
                                         },
                                         PickerKind::Question => app.bind_reply(engine, &value).map(|_| false),
-                                        PickerKind::Reconcile => app.begin_reconcile(engine, &value).map(|_| false),
                                         PickerKind::File => {
                                             let reference = if value.contains(char::is_whitespace) { format!("@\"{value}\" ") } else { format!("@{value} ") };
                                             if let Some(range) = app.file_range.take() { app.ui.replace_range(range, &reference); }
@@ -2525,10 +2439,6 @@ async fn event_loop(
                                 }
                             },
                             _ if app.ui.has_modal() => app.ui.handle_key(key),
-                            KeyCode::Enter if app.reconcile_editor_active()
-                                && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
-                                if let Err(error) = app.handle_reconcile_key(engine, key) { app.ui.fail(format!("记录失败：{error:#}；核查草稿保留")); }
-                            },
                             KeyCode::Enter if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
                                 match app.ui.focus {
                                     Focus::Input => {
@@ -2537,7 +2447,7 @@ async fn event_loop(
                                             app.ui.close_completion();
                                             if text.trim_start().starts_with('/') {
                                                 // Keep an unknown command in the editor; do not turn it into agent input.
-                                                let result = app.submit_command(engine, data, terminal, &mut input, &text).await;
+                                                let result = app.submit_command(engine, data, &text);
                                                 match result {
                                                     Ok(true) => return Ok(()),
                                                     Ok(false) => {},
@@ -2553,7 +2463,7 @@ async fn event_loop(
                                                         app.last_input = Some(id.clone());
                                                         app.last_admitted_input = None;
                                                         app.ui.notify("已收到 · 等待纳入执行");
-                                                        app.elapsed_from = Instant::now(); deadline = Some(Instant::now()+duration);
+                                                        app.elapsed_from = Instant::now(); app.deadlines.insert(engine.state().id.clone(), Instant::now()+duration);
                                                         app.refresh_sessions(engine, data); },
                                                     Err(error) => app.ui.fail(format!("发送失败：{error:#}；草稿已保留")),
                                                 }
@@ -2563,7 +2473,7 @@ async fn event_loop(
                                     Focus::Activity => {
                                         if let Some(id) = app.ui.selected_event().map(str::to_owned) {
                                             match engine.read_event(&id).and_then(|e| detail(engine, &e)) {
-                                                Ok(text) => { app.detail_event = Some(id.clone()); app.ui.open_detail(format!("行动原文 · {} · /audit 审计", short_id(&id)), text); app.remember_detail_source(); },
+                                                Ok(text) => { app.detail_event = Some(id.clone()); app.ui.open_detail(format!("行动原文 · {} · F2 审计", short_id(&id)), text); app.remember_detail_source(); },
                                                 Err(error) => app.ui.fail(format!("读取记录失败：{error:#}")),
                                             }
                                         }
@@ -2597,12 +2507,12 @@ async fn event_loop(
                             app.refresh_sessions(engine, data);
                         }
                         app.refresh_search(engine, data);
-                        if let Err(error) = app.refresh_completion(engine, data) { app.ui.fail(format!("补全失败：{error:#}")); }
+                        if let Err(error) = app.refresh_completion(engine) { app.ui.fail(format!("补全失败：{error:#}")); }
                         app.changed_at = Some(Instant::now()); dirty = true;
                     },
                     TerminalEvent::Paste(text) => {
                         if app.ui.notice_tone == Tone::Error && !app.ui.has_modal() && app.ui.focus == Focus::Input { app.ui.notify(""); }
-                        app.ui.handle_paste(&text); app.refresh_search(engine, data); app.refresh_completion(engine, data)?; app.changed_at = Some(Instant::now()); dirty = true;
+                        app.ui.handle_paste(&text); app.refresh_search(engine, data); app.refresh_completion(engine)?; app.changed_at = Some(Instant::now()); dirty = true;
                     },
                     TerminalEvent::Mouse(mouse) => {
                         if let Some(id) = app.ui.clicked_session(mouse) {
@@ -2625,16 +2535,12 @@ async fn event_loop(
                 }
                 if engine.state().revision != revision {
                     app.clear_preview(); app.sync(engine, data)?;
-                    if !engine.is_quiescent() && deadline.is_none() { deadline = Some(Instant::now()+duration); }
+
                 }
             },
             _ = termination(&mut terminate) => return Ok(()),
-            _ = tokio::signal::ctrl_c() => { pause(engine,&mut app.ui)?; app.clear_preview(); deadline = None; app.sync(engine,data)?; dirty = true; },
-            _ = tokio::time::sleep_until(deadline.unwrap_or_else(|| Instant::now()+duration)), if deadline.is_some() => {
-                pause(engine,&mut app.ui)?; app.clear_preview(); deadline = None;
-                app.ui.notify("运行时限已到，已暂停；Ctrl+R 继续"); app.sync(engine,data)?; dirty = true;
-            },
-            _ = tick.tick(), if !engine.is_quiescent() || app.has_tasks() || app.changed_at.is_some() || app.ui.notice_until.is_some() => {
+            _ = tokio::signal::ctrl_c() => { pause(engine,&mut app.ui)?; app.clear_preview(); app.deadlines.remove(&engine.state().id); app.sync(engine,data)?; dirty = true; },
+            _ = tick.tick(), if !engine.is_quiescent() || !app.background.is_empty() || app.has_tasks() || app.changed_at.is_some() || app.ui.notice_until.is_some() => {
                 let pending = app.has_tasks();
                 app.tasks(engine, data).await;
                 let expired_notice = app.ui.expire_notice();
@@ -2645,14 +2551,10 @@ async fn event_loop(
                 }
             },
             _ = tokio::time::sleep_until(cooldown), if Instant::now() < cooldown => {},
-            updates = engine.step(), if !engine.is_quiescent() && Instant::now() >= cooldown => {
-                match updates {
-                    Ok(events) => {
-                        if events.is_empty() { cooldown = Instant::now()+Duration::from_millis(25); }
-                        app.progress(engine); app.sync(engine,data)?; dirty = true;
-                    },
-                    Err(error) => return Err(error.context("TUI session execution failed")),
-                }
+            (id, result) = poll_engines(engine, &mut app.background), if Instant::now() >= cooldown => {
+                if result.as_ref().is_ok_and(Vec::is_empty) { cooldown = Instant::now()+Duration::from_millis(25); }
+                app.execution_update(engine, data, &id, result)?;
+                dirty = true;
             },
         }
     }
@@ -2695,7 +2597,6 @@ fn is_complete_command(text: &str) -> bool {
 
 fn execution_active(state: &bone::state::SessionState) -> bool {
     !state.paused
-        && state.unknown_writes.is_empty()
         && state.jobs.values().any(|job| {
             job.state == JobState::Ready
                 || (job.state == JobState::Running && job.current_call.is_some())
@@ -2771,11 +2672,12 @@ fn active_call(engine: &Engine, call: &str) -> Result<ActiveCall> {
 
 fn current_status(engine: &Engine, input: Option<&str>, tool_failure: Option<&str>) -> String {
     let state = engine.state();
-    if !state.unknown_writes.is_empty() {
-        return format!("需核查 {} 项写入 · /reconcile", state.unknown_writes.len());
+
+    if state.paused && !engine.is_quiescent() {
+        return "停止中 · 等待执行结束".into();
     }
     if state.paused && has_unfinished_work(state) {
-        return "已暂停 · Ctrl+R 恢复".into();
+        return "已停止 · Ctrl+R 继续".into();
     }
     let active = state
         .jobs
@@ -2990,16 +2892,6 @@ fn tool_summary(engine: &Engine, event: &Event, body: &str) -> Result<String> {
     ))
 }
 
-fn reconciliation_detail(engine: &Engine, call: &str) -> Result<String> {
-    let event = engine
-        .read_call_event(call, "tool_result")
-        .or_else(|_| engine.read_call_event(call, "tool_started"))?;
-    Ok(format!(
-        "调用 {call}\n实际效果未确认；检查文件、Git diff、进程或工具实际结果后，在核查表单记录观察。\n\n{}",
-        detail(engine, &event)?
-    ))
-}
-
 fn tool_arguments(engine: &Engine, event: &Event) -> Result<Option<Value>> {
     let Some((source_id, call_key)) = event.data["tool_key"]
         .as_str()
@@ -3037,7 +2929,7 @@ fn audit_detail(event: &Event) -> Result<String> {
 fn detail(engine: &Engine, event: &Event) -> Result<String> {
     let mut output = event_body(engine, event)?;
     if output.is_empty() {
-        output = "此记录没有正文；/audit 查看持久事件与审计元信息".into();
+        output = "此记录没有正文；F2 查看持久事件与审计元信息".into();
     }
     if let Some(arguments) = tool_arguments(engine, event)? {
         let preview =
@@ -3089,7 +2981,7 @@ fn readable_tool_output(text: &str) -> String {
         return format!(
             "错误：{error}\n{}",
             if value["effect"] == "unknown" {
-                "结果未知，需要核查实际效果"
+                "执行中断，实际效果未确认"
             } else {
                 ""
             }
@@ -3258,7 +3150,7 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         };
         let phase = match state {
             ToolState::Running => "执行中",
-            ToolState::Unknown => "结果未知 · 需核查 /reconcile",
+            ToolState::Unknown => "执行中断 · 结果未确认",
             ToolState::Failed => "失败",
             ToolState::Completed => "完成",
         };

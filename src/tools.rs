@@ -15,9 +15,9 @@ const FILE_LIMIT: u64 = 16 * 1024 * 1024;
 const DEFAULT_SHELL_TIMEOUT_SECONDS: u64 = 60;
 const MAX_SHELL_TIMEOUT_SECONDS: u64 = 3600;
 #[cfg(windows)]
-const SHELL_DESCRIPTION: &str = "Run a Windows cmd.exe /D /S /C command in the workspace with the user's local privileges. Use Windows command syntax; invoke powershell.exe -NoProfile -Command explicitly when PowerShell is needed. Treat as a write operation. Default timeout is 60 seconds; choose up to 3600 seconds for builds or integration tests. The session deadline still applies. Output is bounded; timed-out commands require reconciliation. Prefer read_file/list_files for inspection.";
+const SHELL_DESCRIPTION: &str = "Run a Windows cmd.exe /D /S /C command in the workspace with the user's local privileges. Use Windows command syntax; invoke powershell.exe -NoProfile -Command explicitly when PowerShell is needed. Commands share workspace write ownership. Default timeout is 60 seconds; choose up to 3600 seconds for builds or integration tests. The session deadline still applies. Interrupted commands return available output and may have partial effects; inspect current state before deciding the next action. Prefer read_file/list_files for inspection.";
 #[cfg(not(windows))]
-const SHELL_DESCRIPTION: &str = "Run a /bin/sh command in the workspace with the user's local privileges. Treat as a write operation. Default timeout is 60 seconds; choose a longer timeout up to 3600 seconds for builds or integration tests. The session's overall deadline still applies. Output is bounded; timed-out commands require reconciliation. Prefer read_file/list_files for inspection.";
+const SHELL_DESCRIPTION: &str = "Run a /bin/sh command in the workspace with the user's local privileges. Commands share workspace write ownership. Default timeout is 60 seconds; choose a longer timeout up to 3600 seconds for builds or integration tests. The session's overall deadline still applies. Interrupted commands return available output and may have partial effects; inspect current state before deciding the next action. Prefer read_file/list_files for inspection.";
 
 pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
     let mut tools = vec![
@@ -53,7 +53,7 @@ pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
         ),
         definition(
             "input_resolve",
-            "Explicitly settle selected QUEUED inputs owned by your current job after considering their original requests. completed means their work is actually done; superseded means a newer instruction replaced that request, not that its work succeeded. Give a concrete nonempty reason and optional existing audit evidence event IDs. When the ACTIVE request incorporates earlier work, resolve those queued inputs only after their requirements are fulfilled or explicitly superseded. Leave independent work queued. Cannot resolve ACTIVE/foreign inputs, unknown writes, unfinished tool batches or live delegated assignments. Does not execute or cancel external work.",
+            "Explicitly settle selected QUEUED inputs owned by your current job after considering their original requests. completed means their work is actually done; superseded means a newer instruction replaced that request, not that its work succeeded. Give a concrete nonempty reason and optional existing audit evidence event IDs. When the ACTIVE request incorporates earlier work, resolve those queued inputs only after their requirements are fulfilled or explicitly superseded. Leave independent work queued. Cannot resolve ACTIVE or foreign inputs. completed requires all native batches and delegated assignments to be settled. superseded cancels unstarted proposals and outstanding delegated work; started tools retain their actual results, and their effects are not undone.",
             json!({"resolutions":{"type":"array","minItems":1,"items":{"type":"object","properties":{"input_id":{"type":"string"},"outcome":{"type":"string","enum":["completed","superseded"]},"reason":{"type":"string","minLength":1},"evidence_event_ids":{"type":"array","items":{"type":"string"}}},"required":["input_id","outcome","reason"],"additionalProperties":false}}}),
             &["resolutions"],
         ),
@@ -163,20 +163,35 @@ pub async fn execute(
     workspace: &Path,
     name: &str,
     args: &Value,
-    write_leases: Option<[std::sync::Arc<std::fs::File>; 2]>,
+    write_lease: Option<std::sync::Arc<std::fs::File>>,
 ) -> ToolOutcome {
-    execute_with_progress(workspace, name, args, write_leases, None).await
+    execute_with_progress(workspace, name, args, write_lease, None, None).await
 }
 
 pub async fn execute_with_progress(
     workspace: &Path,
     name: &str,
     args: &Value,
-    write_leases: Option<[std::sync::Arc<std::fs::File>; 2]>,
+    write_lease: Option<std::sync::Arc<std::fs::File>>,
     observer: Option<ToolObserver>,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> ToolOutcome {
+    if cancellation.as_ref().is_some_and(|signal| *signal.borrow()) {
+        return ToolOutcome {
+            content: json!({"interrupted":true,"error":"stopped before tool execution"}),
+            uncertain: false,
+        };
+    }
     if name == "shell" {
-        return match shell(workspace, args, write_leases.as_ref(), observer.as_ref()).await {
+        return match shell(
+            workspace,
+            args,
+            write_lease.as_ref(),
+            observer.as_ref(),
+            cancellation,
+        )
+        .await
+        {
             Ok(outcome) => outcome,
             Err(error) => ToolOutcome {
                 content: json!({"error":format!("{error:#}")}),
@@ -258,7 +273,7 @@ fn file_tool(workspace: &Path, name: &str, args: &Value) -> Result<Value> {
 
 const SEARCH_EXCLUSIONS: [&str; 4] = [".git", "target", "node_modules", ".bone"];
 
-/// Stricter than legacy read/write paths: these tools never follow any symlink,
+/// Search and edit paths never follow any symlink,
 /// including one pointing inside the workspace. Recheck before installation.
 fn source_path(workspace: &Path, relative: &str) -> Result<(PathBuf, String)> {
     let path = Path::new(relative);
@@ -879,13 +894,12 @@ fn write_file_prepared(
 }
 
 async fn drain(
-    mut reader: impl tokio::io::AsyncRead + Unpin,
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    output: &mut (Vec<u8>, bool),
     observer: Option<&ToolObserver>,
     stderr: bool,
-) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut out = Vec::new();
+) -> std::io::Result<()> {
     let mut buf = [0_u8; 8192];
-    let mut truncated = false;
     loop {
         let count = reader.read(&mut buf).await?;
         if count == 0 {
@@ -894,23 +908,34 @@ async fn drain(
         if let Some(observer) = observer {
             observer(stderr, &buf[..count]);
         }
-        let take = count.min(OUTPUT_LIMIT.saturating_sub(out.len()));
-        out.extend_from_slice(&buf[..take]);
-        truncated |= take < count;
+        let take = count.min(OUTPUT_LIMIT.saturating_sub(output.0.len()));
+        output.0.extend_from_slice(&buf[..take]);
+        output.1 |= take < count;
     }
-    Ok((out, truncated))
+    Ok(())
 }
 
 #[cfg(unix)]
 struct ProcessGroup(u32);
 #[cfg(unix)]
+impl ProcessGroup {
+    fn terminate(&self) -> std::io::Result<()> {
+        // SAFETY: spawn assigns this child its own process group.
+        if unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+#[cfg(unix)]
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        // SAFETY: the spawned process has its own process group, whose ID is its PID.
-        unsafe {
-            libc::kill(-(self.0 as i32), libc::SIGKILL);
-        }
+        let _ = self.terminate();
     }
 }
 
@@ -931,8 +956,9 @@ fn shell_timeout_seconds(args: &Value) -> Result<u64> {
 async fn shell(
     workspace: &Path,
     args: &Value,
-    write_leases: Option<&[std::sync::Arc<std::fs::File>; 2]>,
+    write_lease: Option<&std::sync::Arc<std::fs::File>>,
     observer: Option<&ToolObserver>,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<ToolOutcome> {
     let command = string_arg(args, "command")?;
     let seconds = shell_timeout_seconds(args)?;
@@ -957,7 +983,7 @@ async fn shell(
         cmd
     };
     #[cfg(windows)]
-    let _group = crate::windows::ProcessGroup::new(write_leases.map(|leases| leases[0].as_ref()))?;
+    let group = crate::windows::ProcessGroup::new(write_lease.map(|lease| lease.as_ref()))?;
     cmd.current_dir(workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -967,22 +993,17 @@ async fn shell(
     {
         use std::os::fd::AsRawFd;
         cmd.process_group(0);
-        if let Some(leases) = write_leases {
-            let fds = [leases[0].as_raw_fd(), leases[1].as_raw_fd()];
+        if let Some(lease) = write_lease {
+            let fd = lease.as_raw_fd();
             // SAFETY: the lease lives through spawn. fcntl is async-signal-safe;
             // this hook runs only in the fork child and alters only its fd flags.
             // Parent flags stay CLOEXEC. Ordinary shell descendants retain the
-            // physical stable AND legacy workspace leases if BONE is killed
-            // before they stop. Older executables observe only the legacy lock.
+            // physical workspace lease if BONE is killed before they stop.
             unsafe {
                 cmd.pre_exec(move || {
-                    for fd in fds {
-                        let flags = libc::fcntl(fd, libc::F_GETFD);
-                        if flags < 0
-                            || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
-                        {
-                            return Err(std::io::Error::last_os_error());
-                        }
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
                     }
                     Ok(())
                 });
@@ -991,33 +1012,79 @@ async fn shell(
     }
     let mut child = cmd.spawn()?;
     #[cfg(unix)]
-    let _group = ProcessGroup(child.id().context("shell did not start")?);
+    let group = ProcessGroup(child.id().context("shell did not start")?);
     #[cfg(windows)]
-    _group.start(&child)?;
-    let stdout = child.stdout.take().context("missing stdout")?;
-    let stderr = child.stderr.take().context("missing stderr")?;
-    let wait = async {
-        let (status, out, err) = tokio::try_join!(
-            child.wait(),
-            drain(stdout, observer, false),
-            drain(stderr, observer, true)
-        )?;
-        Ok::<_, std::io::Error>((status, out, err))
+    group.start(&child)?;
+    let mut stdout = child.stdout.take().context("missing stdout")?;
+    let mut stderr = child.stderr.take().context("missing stderr")?;
+    // Buffers live outside the wait future: cancellation preserves drained bytes.
+    let mut out = (Vec::new(), false);
+    let mut err = (Vec::new(), false);
+    let result = {
+        let wait = async {
+            let (status, (), ()) = tokio::try_join!(
+                child.wait(),
+                drain(&mut stdout, &mut out, observer, false),
+                drain(&mut stderr, &mut err, observer, true)
+            )?;
+            Ok::<_, std::io::Error>(status)
+        };
+        tokio::select! {
+            result = wait => result.map_err(|error| error.to_string()),
+            _ = tokio::time::sleep(Duration::from_secs(seconds)) => Err("shell timed out".to_owned()),
+            _ = wait_for_stop(cancellation) => Err("shell stopped by user".to_owned()),
+        }
     };
-    match tokio::time::timeout(Duration::from_secs(seconds), wait).await {
-        Ok(Ok((status, out, err))) => Ok(ToolOutcome {
-            content: json!({"exit_code":status.code(),"stdout":String::from_utf8_lossy(&out.0),"stderr":String::from_utf8_lossy(&err.0),"truncated":out.1||err.1}),
-            uncertain: false,
-        }),
-        Ok(Err(error)) => Ok(ToolOutcome {
-            content: json!({"error":error.to_string(),"effect":"unknown"}),
-            uncertain: true,
-        }),
-        Err(_) => Ok(ToolOutcome {
-            content: json!({"error":"shell timed out; inspect effects before resuming writes","effect":"unknown"}),
-            uncertain: true,
-        }),
+    let (status, error, termination_error) = match result {
+        Ok(status) => (Some(status), None, None),
+        Err(reason) => {
+            let termination_error = group.terminate().err().map(|error| error.to_string());
+            let _ = child.start_kill();
+            let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .ok()
+                .and_then(Result::ok);
+            // Drain bytes already in the pipes after terminating owned processes.
+            let drained = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::try_join!(
+                    drain(&mut stdout, &mut out, observer, false),
+                    drain(&mut stderr, &mut err, observer, true)
+                )
+            })
+            .await;
+            if !matches!(drained, Ok(Ok(_))) {
+                out.1 = true;
+                err.1 = true;
+            }
+            (status, Some(reason), termination_error)
+        }
+    };
+    let uncertain = error.is_some();
+    let mut content = json!({"exit_code":status.and_then(|status| status.code()),"stdout":String::from_utf8_lossy(&out.0),"stderr":String::from_utf8_lossy(&err.0),"truncated":out.1||err.1});
+    if let Some(error) = error {
+        content["error"] = error.into();
+        content["interrupted"] = true.into();
+        content["effect"] = "unknown".into();
+        content["instruction"] = "Inspect actual effects before deciding the next action. This call will not be replayed automatically.".into();
     }
+    if let Some(error) = termination_error {
+        content["termination_error"] = error.into();
+    }
+    Ok(ToolOutcome { content, uncertain })
+}
+
+async fn wait_for_stop(cancellation: Option<tokio::sync::watch::Receiver<bool>>) {
+    if let Some(mut signal) = cancellation {
+        loop {
+            if *signal.borrow() {
+                return;
+            }
+            if signal.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+    std::future::pending::<()>().await;
 }
 
 #[cfg(test)]

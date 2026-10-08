@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::config::{ModelReference, Profile};
 use crate::runtime::{Engine, RunOptions};
-use crate::state::{Budget, Event, Job, JobState, SessionState, UnknownWrite};
+use crate::state::{Budget, Event, Job, JobState, SessionState};
 use crate::store::Store;
 use rig_core::completion::{AssistantContent, CompletionResponse, Message, Usage};
 use rig_core::message::{CallId, ToolCall, ToolFunction, ToolName};
@@ -20,7 +20,6 @@ struct Fixture {
     job: String,
     call: String,
     tool_key: String,
-    marker: PathBuf,
 }
 
 impl Fixture {
@@ -35,13 +34,7 @@ impl Fixture {
         std::fs::create_dir_all(&data).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
         let workspace = workspace.canonicalize().unwrap();
-        let marker = std::env::temp_dir()
-            .join("bone-workspace-locks")
-            .join(format!(
-                "{}.pending",
-                crate::tools::sha256(workspace.as_os_str().as_encoded_bytes())
-            ));
-        let store = Store::open(data.join("sessions.sqlite3")).unwrap();
+        let store = Store::open(data.join("sessions.sqlite")).unwrap();
         let mut state = SessionState::new(&workspace);
         let job = Job::new("Regression");
         let job_id = job.id.clone();
@@ -96,7 +89,7 @@ impl Fixture {
             let mut placeholder = Event::new(
                 &state.id,
                 "tool_result",
-                json!({"message":Message::tool_result(first.id.clone(),first.function.name.clone(),"Effects unknown; inspect before reconciling."),"tool_key":tool_key,"tool_name":first.function.name,"uncertain":true}),
+                json!({"message":Message::tool_result(first.id.clone(),first.function.name.clone(),"Effects unknown; inspect before deciding the next action."),"tool_key":tool_key,"tool_name":first.function.name,"uncertain":true}),
             );
             placeholder.job_id = Some(job_id.clone());
             placeholder.root_input = Some(input.id.clone());
@@ -106,15 +99,6 @@ impl Fixture {
             if record_placeholder {
                 job.history.push(placeholder.id.clone());
             }
-            state.unknown_writes.insert(
-                call.clone(),
-                UnknownWrite {
-                    call_id: call.clone(),
-                    job_id: job_id.clone(),
-                    root_input: Some(input.id.clone()),
-                    tool_name: first.function.name.to_string(),
-                },
-            );
             events.push(started);
             if record_placeholder {
                 events.push(placeholder);
@@ -132,7 +116,6 @@ impl Fixture {
             job: job_id,
             call,
             tool_key,
-            marker,
         }
     }
 
@@ -162,18 +145,7 @@ impl Fixture {
     }
 
     fn store(&self) -> Store {
-        Store::open(self.data.join("sessions.sqlite3")).unwrap()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.marker);
-        // This fixture owns a unique temporary workspace; engine values are
-        // dropped before it. Remove only its injected unresolved marker.
-        if let Ok((_, marker)) = crate::runtime::workspace_write_paths(&self.workspace) {
-            let _ = std::fs::remove_file(marker);
-        }
+        Store::open(self.data.join("sessions.sqlite")).unwrap()
     }
 }
 
@@ -247,32 +219,19 @@ fn native_profile(endpoint: String) -> Profile {
 }
 
 #[tokio::test]
-async fn uncertain_write_can_resume_and_reconcile_without_reappearing_on_restart() {
+async fn uncertain_result_survives_resume_and_restart_without_replaying_the_attempt() {
     let fixture = Fixture::new(vec![write_call()], true);
     let mut engine = fixture.engine();
-    assert!(engine.state().unknown_writes.contains_key(&fixture.call));
     engine.resume().unwrap();
-    // Exercise scheduling after its instruction epoch changes. The native
-    // placeholder keeps the old operation completed for replay purposes.
+    // The native terminal fact answers the original proposal even after the
+    // instruction epoch changes. Resuming never repeats that operation.
     for _ in 0..2 {
         engine.step().await.unwrap();
     }
     assert!(!fixture.workspace.join("output.txt").exists());
-    engine
-        .resolve_write(&fixture.call, "Inspected output.txt; it was never created.")
-        .unwrap();
     drop(engine);
     let reopened = fixture.engine();
-    assert!(
-        reopened.state().unknown_writes.is_empty(),
-        "a reconciled write became uncertain again"
-    );
-    let records = fixture.store().events(&fixture.session).unwrap();
-    let reconciled = records
-        .iter()
-        .find(|event| event.kind == "tool_reconciled")
-        .unwrap();
-    assert_eq!(reconciled.call_id.as_deref(), Some(fixture.call.as_str()));
+    let records = reopened.events().unwrap();
     assert_eq!(
         records
             .iter()
@@ -280,8 +239,20 @@ async fn uncertain_write_can_resume_and_reconcile_without_reappearing_on_restart
                 |event| event.kind == "tool_started" && event.data["tool_key"] == fixture.tool_key
             )
             .count(),
-        1
+        1,
     );
+    let results: Vec<_> = records
+        .iter()
+        .filter(|event| {
+            event.kind == "tool_result" && event.call_id.as_deref() == Some(&fixture.call)
+        })
+        .collect();
+    assert_eq!(
+        results.len(),
+        1,
+        "the uncertain result was synthesized twice"
+    );
+    assert_eq!(results[0].data["uncertain"], true);
     let history = crate::context::build_history(
         &reopened.state().jobs[&fixture.job],
         &records
@@ -293,40 +264,12 @@ async fn uncertain_write_can_resume_and_reconcile_without_reappearing_on_restart
     assert!(
         serde_json::to_string(&history)
             .unwrap()
-            .contains("Inspected output.txt")
+            .contains("Effects unknown")
     );
-}
-
-#[test]
-fn failed_marker_reconciliation_preserves_the_unknown_write() {
-    let fixture = Fixture::new(vec![write_call()], true);
-    std::fs::create_dir_all(fixture.marker.parent().unwrap()).unwrap();
-    std::fs::write(
-        &fixture.marker,
-        serde_json::to_vec(&json!({"session_id":"another-session","call_id":"another-call"}))
-            .unwrap(),
-    )
-    .unwrap();
-    let mut engine = fixture.engine();
-    assert!(
-        engine
-            .resolve_write(&fixture.call, "Inspected files.")
-            .is_err()
-    );
-    assert!(engine.state().unknown_writes.contains_key(&fixture.call));
-    assert!(
-        fixture
-            .store()
-            .load_session(&fixture.session)
-            .unwrap()
-            .unknown_writes
-            .contains_key(&fixture.call)
-    );
-    assert!(fixture.marker.exists());
 }
 
 #[tokio::test]
-async fn tool_start_transaction_failure_leaves_no_workspace_marker_or_effect() {
+async fn tool_start_transaction_failure_leaves_no_effect_or_start_record() {
     let fixture = Fixture::new(vec![write_call()], false);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -345,7 +288,7 @@ async fn tool_start_transaction_failure_leaves_no_workspace_marker_or_effect() {
     )
     .unwrap();
     engine.post("Write output.txt", None).unwrap();
-    let connection = rusqlite::Connection::open(fixture.data.join("sessions.sqlite3")).unwrap();
+    let connection = rusqlite::Connection::open(fixture.data.join("sessions.sqlite")).unwrap();
     connection.execute_batch("CREATE TRIGGER reject_tool_start BEFORE INSERT ON events WHEN json_extract(NEW.payload, '$.kind') = 'tool_started' BEGIN SELECT RAISE(ABORT, 'injected tool start commit failure'); END;").unwrap();
     let mut rejected = false;
     for _ in 0..6 {
@@ -363,10 +306,6 @@ async fn tool_start_transaction_failure_leaves_no_workspace_marker_or_effect() {
         "tool start did not reach the injected SQLite fault"
     );
     server.await.unwrap();
-    assert!(
-        !fixture.marker.exists(),
-        "database failure leaked an unreconcilable workspace write marker"
-    );
     assert!(!fixture.workspace.join("output.txt").exists());
     assert!(
         !fixture
@@ -375,6 +314,156 @@ async fn tool_start_transaction_failure_leaves_no_workspace_marker_or_effect() {
             .unwrap()
             .iter()
             .any(|event| event.kind == "tool_started")
+    );
+}
+
+#[tokio::test]
+async fn completed_effect_with_a_failed_result_commit_recovers_once_and_can_continue_normally() {
+    let fixture = Fixture::new(vec![write_call()], false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for message in [
+            json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"write_file","arguments":{"path":"effect.txt","content":"effect survived the failed commit","expected_sha256":null}}}]}),
+            json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"effect.txt"}}}]}),
+            json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"write_file","arguments":{"path":"checked.txt","content":"Observed the persisted effect","expected_sha256":null}}}]}),
+            json!({"role":"assistant","content":"Inspected the persisted effect and completed the followup write.","tool_calls":[]}),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_native_request(&mut socket).await);
+            send_native_response(&mut socket, message).await;
+        }
+        requests
+    });
+    let profile = native_profile(endpoint);
+    let mut engine = Engine::open(
+        &fixture.data,
+        &fixture.workspace,
+        None,
+        profile.clone(),
+        "fixture".into(),
+        RunOptions::default(),
+    )
+    .unwrap();
+    let input = engine
+        .post("Write the effect once, then inspect and record it.", None)
+        .unwrap();
+    let session = engine.state().id.clone();
+    let db = rusqlite::Connection::open(fixture.data.join("sessions.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_result BEFORE INSERT ON events WHEN json_extract(NEW.payload,'$.kind')='tool_result' BEGIN SELECT RAISE(ABORT,'injected completion commit failure'); END;").unwrap();
+    let mut rejected = false;
+    for _ in 0..8 {
+        if tokio::time::timeout(std::time::Duration::from_secs(5), engine.step())
+            .await
+            .unwrap()
+            .is_err()
+        {
+            rejected = true;
+            break;
+        }
+    }
+    assert!(
+        rejected,
+        "the actual completed write did not reach the result-commit fault"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap(),
+        "effect survived the failed commit"
+    );
+    assert!(
+        engine
+            .post("must not act after a failed commit", None)
+            .is_err()
+    );
+    assert!(
+        engine
+            .events()
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "tool_result")
+    );
+    drop(engine);
+    db.execute_batch("DROP TRIGGER reject_result").unwrap();
+    let mut engine = Engine::open(
+        &fixture.data,
+        &fixture.workspace,
+        Some(&session),
+        profile.clone(),
+        "fixture".into(),
+        RunOptions::default(),
+    )
+    .unwrap();
+    let recovered: Vec<_> = engine
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "tool_result")
+        .collect();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].data["uncertain"], true);
+    let recovered_id = recovered[0].id.clone();
+    let recovered_call = recovered[0].call_id.clone();
+    engine.resume().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        while engine.result(&input).is_none() {
+            engine.step().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(engine.result(&input).unwrap().kind, "delivery");
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("checked.txt")).unwrap(),
+        "Observed the persisted effect"
+    );
+    let records = engine.events().unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|event| event.kind == "tool_result" && event.call_id == recovered_call)
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|event| event.kind == "tool_started" && event.data["tool_name"] == "write_file")
+            .count(),
+        2,
+        "the original write was replayed instead of inspected"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|event| event.id == recovered_id && event.data["uncertain"] == true)
+    );
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[2]
+            .to_string()
+            .contains("effect survived the failed commit"),
+        "the resumed Agent did not receive the actual file evidence"
+    );
+    drop(engine);
+    let reopened = Engine::open(
+        &fixture.data,
+        &fixture.workspace,
+        Some(&session),
+        profile,
+        "fixture".into(),
+        RunOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|event| event.call_id == recovered_call && event.kind == "tool_result")
+            .count(),
+        1
     );
 }
 
@@ -500,7 +589,7 @@ fn crash_recovery_records_one_owned_native_placeholder_for_the_uncertain_operati
             .count(),
         1
     );
-    assert!(reopened.state().unknown_writes.contains_key(&fixture.call));
+    assert!(!fixture.workspace.join("output.txt").exists());
 }
 
 #[tokio::test]
@@ -697,6 +786,14 @@ async fn consecutive_user_inputs_prioritize_the_new_instruction_through_its_tool
         .collect();
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].root_input.as_deref(), Some(new.as_str()));
+    for _ in 0..4 {
+        engine.step().await.unwrap();
+        assert!(
+            engine.result(&old).is_none(),
+            "delivering the new instruction silently resumed the earlier user request"
+        );
+    }
+    engine.resume().unwrap();
     for _ in 0..6 {
         if engine
             .result(&old)

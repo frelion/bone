@@ -18,9 +18,9 @@
 
 cursor 是一致性位置 token，不是授权凭据或不可伪造的签名；其校验算法公开，知道算法可以构造合法位置。分页不建立整棵树的内容快照、不检测其他文件的变化，也不保证外部写入者并发变更下的跨页隔离。
 
-`edit_file` 只处理已有 UTF-8 普通文件，携带整个原文件的 `expected_sha256` 和非空 `{old_text,new_text}` edits。所有匹配基于原文件，每个非空 `old_text` 必须唯一出现，原始跨度不得重叠；全部验证后一次安装，插入的新文本不会成为后续匹配对象。未触碰字节、CRLF 和权限保留；验证失败不安装。成功返回新 hash、字节数及 edits_applied。安装后 durability 或 cleanup 失败会保留未知结果，必须核查实际文件状态。
+`edit_file` 只处理已有 UTF-8 普通文件，携带整个原文件的 `expected_sha256` 和非空 `{old_text,new_text}` edits。所有匹配基于原文件，每个非空 `old_text` 必须唯一出现，原始跨度不得重叠；全部验证后一次安装，插入的新文本不会成为后续匹配对象。未触碰字节、CRLF 和权限保留；验证失败不安装。成功返回新 hash、字节数及 edits_applied。安装后 durability 或 cleanup 失败会保留未知结果，Agent 读取实际文件状态后决定下一步。
 
-编辑复用已有写入准备、文件身份复查、持久化和未知结果处理。它是外部写工具，受只读权限、workspace lease、取消、过期结果所有权和未知写核查流程约束；哈希与身份复查缩小外部 writer 的竞争窗口，无法承诺原子 CAS。旧 `read_file`、`write_file`、shell 与 history 接口保持兼容。
+编辑复用已有写入准备、文件身份复查、持久化和未知结果处理。它是外部写工具，受只读权限、workspace lease、取消、过期结果所有权和原生中断结果与真实执行生命周期约束；哈希与身份复查缩小外部 writer 的竞争窗口，无法承诺原子 CAS。`read_file`、`write_file`、shell 与 history 沿用现有接口。
 
 ## 验证边界
 

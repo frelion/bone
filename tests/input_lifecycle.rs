@@ -1,4 +1,4 @@
-//! Reproduce preserved inputs becoming active again after consolidated delivery.
+//! Retained user requests stay inspectable without silently becoming new work.
 use std::time::Duration;
 
 use bone::{
@@ -35,7 +35,7 @@ async fn until_started(engine: &mut Engine, input: &str) {
 }
 
 #[tokio::test]
-async fn consolidated_delivery_leaves_prior_inputs_runnable_after_restart() {
+async fn consolidated_delivery_does_not_automatically_repeat_prior_user_requests() {
     let fixture = fixture(json!({"turns":[
         {"match_last_user_contains":"INITIAL_ENGINEERING_REQUEST", "delay_seconds":2, "text":"Initial result must be cancelled"},
         {"match_last_user_contains":"REVISED_ENGINEERING_REQUEST", "delay_seconds":2, "text":"Revised result must be cancelled"},
@@ -83,9 +83,9 @@ async fn consolidated_delivery_leaves_prior_inputs_runnable_after_restart() {
         &data,
         &workspace,
         Some(&session),
-        profile,
+        profile.clone(),
         "fixture".into(),
-        options,
+        options.clone(),
     )
     .unwrap();
     let current = engine
@@ -103,23 +103,76 @@ async fn consolidated_delivery_leaves_prior_inputs_runnable_after_restart() {
     .unwrap();
     assert_eq!(engine.result(&current).unwrap().kind, "delivery");
     let job = &engine.state().jobs[engine.state().focus.as_ref().unwrap()];
-    assert_eq!(job.state, JobState::Ready);
+    assert_eq!(job.state, JobState::Paused);
     assert_eq!(
         job.inbox.iter().cloned().collect::<Vec<_>>(),
         vec![initial.clone(), revised.clone()]
     );
     assert!(engine.result(&initial).is_none());
     assert!(engine.result(&revised).is_none());
+    // model_started is committed before connecting. An interruption can stop
+    // either older request before HTTP admission, so only growth is relevant.
+    let requests_at_delivery = fixture.request_count();
 
-    until_started(&mut engine, &initial).await;
-    let job = &engine.state().jobs[engine.state().focus.as_ref().unwrap()];
-    assert_eq!(job.active_input.as_deref(), Some(initial.as_str()));
-    assert_eq!(engine.state().budgets[&initial].calls_used, 2);
+    for _ in 0..8 {
+        engine.step().await.unwrap();
+    }
+    assert_eq!(engine.state().budgets[&initial].calls_used, 1);
     assert_eq!(engine.state().budgets[&revised].calls_used, 1);
     assert_eq!(engine.state().budgets[&current].calls_used, 1);
-    // Preserve the present failure as a deterministic characterization, rather
-    // than silently clearing unrelated work or injecting a successful result.
-    engine.stop().unwrap();
+    assert_eq!(
+        fixture.request_count(),
+        requests_at_delivery,
+        "the completed continuation revived older user work"
+    );
+    assert!(
+        engine
+            .read_event(&initial)
+            .unwrap()
+            .data
+            .to_string()
+            .contains("INITIAL_ENGINEERING_REQUEST")
+    );
+    assert!(
+        engine
+            .read_event(&revised)
+            .unwrap()
+            .data
+            .to_string()
+            .contains("REVISED_ENGINEERING_REQUEST")
+    );
+    drop(engine);
+    let mut engine = Engine::open(
+        &data,
+        &workspace,
+        Some(&session),
+        profile,
+        "fixture".into(),
+        options,
+    )
+    .unwrap();
+    for _ in 0..8 {
+        engine.step().await.unwrap();
+    }
+    assert_eq!(
+        fixture.request_count(),
+        requests_at_delivery,
+        "reopening revived the older user requests"
+    );
+    assert_eq!(engine.state().budgets[&initial].calls_used, 1);
+    assert_eq!(engine.state().budgets[&revised].calls_used, 1);
+    let events = engine.events().unwrap();
+    for prior in [&initial, &revised] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(
+                    |event| event.kind == "model_started" && event.reply_to.as_ref() == Some(prior)
+                )
+                .count(),
+            1
+        );
+    }
 }
 
 #[tokio::test]

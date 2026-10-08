@@ -230,6 +230,223 @@ async fn real_followup_runs_before_retained_failed_assignment_and_does_not_reviv
 }
 
 #[tokio::test]
+async fn superseding_old_work_cancels_its_unstarted_failed_child_without_requiring_success() {
+    let mut fixture = Fixture::new(initial_turns(true));
+    let mut engine = fixture.open(None);
+    let original = engine
+        .post("Delegate the original implementation", None)
+        .unwrap();
+    until(&mut engine, |engine| {
+        engine.state().jobs.len() == 2
+            && engine
+                .state()
+                .jobs
+                .values()
+                .all(|job| job.state == JobState::Paused)
+    })
+    .await;
+    let (child_job, assigned) = child(&engine);
+    assert_eq!(engine.result(&assigned).unwrap().kind, "failure");
+    let original_budget = engine.state().budgets[&original].clone();
+    fixture.append(vec![
+        call("Conversation", "input_resolve", "supersede-original", json!({"resolutions":[{
+            "input_id":original,"outcome":"superseded","reason":"The user explicitly abandoned this implementation and its delegated work"
+        }]})),
+        json!({"match_job_title":"Conversation","text":"The old implementation was abandoned; its failed child will not be retried."}),
+    ]);
+    let current = engine
+        .post(
+            "Abandon the original implementation and its child. Confirm the changed plan.",
+            None,
+        )
+        .unwrap();
+    until(&mut engine, |engine| engine.result(&current).is_some()).await;
+    assert_eq!(engine.result(&current).unwrap().kind, "delivery");
+    assert_eq!(
+        engine.result(&original).unwrap().data["outcome"],
+        "superseded"
+    );
+    assert_eq!(
+        starts(&engine, &assigned),
+        1,
+        "supersession executed the failed child instead of abandoning it"
+    );
+    assert_eq!(engine.state().budgets[&original], original_budget);
+    let session = engine.state().id.clone();
+    drop(engine);
+    let mut engine = fixture.open(Some(&session));
+    engine.resume().unwrap();
+    for _ in 0..8 {
+        engine.step().await.unwrap();
+    }
+    assert_eq!(
+        starts(&engine, &assigned),
+        1,
+        "resume resurrected a superseded child"
+    );
+    assert_ne!(engine.state().jobs[&child_job].state, JobState::Running);
+    assert!(
+        engine
+            .read_event(&assigned)
+            .unwrap()
+            .data
+            .to_string()
+            .contains("Original delegated work")
+    );
+}
+
+#[tokio::test]
+async fn superseding_a_live_shell_then_resuming_retains_one_real_owned_terminal_result() {
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write('observed-before-supersession'); [IO.File]::AppendAllText('effect.txt', 'x'); [Threading.Thread]::Sleep(10000); [IO.File]::WriteAllText('late.txt', 'must not execute')\""
+    } else {
+        "printf observed-before-supersession; printf x >> effect.txt; sleep 10; printf 'must not execute' > late.txt"
+    };
+    let mut fixture = Fixture::new(vec![
+        call(
+            "Conversation",
+            "job_send",
+            "assign-live-shell",
+            json!({"title":"Child","message":"Execute the original shell once"}),
+        ),
+        call(
+            "Child",
+            "shell",
+            "original-live-shell",
+            json!({"command":command,"timeout_seconds":20}),
+        ),
+        json!({"match_job_title":"Conversation","match_last_user_contains":"ORIGINAL_LIVE_TOOL","delay_seconds":3,"text":"Old response must be cancelled"}),
+    ]);
+    fixture.options.read_only = false;
+    let mut engine = fixture.open(None);
+    let original = engine
+        .post("ORIGINAL_LIVE_TOOL: delegate the operation once", None)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !fixture.local.workspace.join("effect.txt").exists() {
+            let _ = tokio::time::timeout(Duration::from_millis(20), engine.step()).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (child_job, assigned) = child(&engine);
+    let started = engine
+        .events()
+        .unwrap()
+        .into_iter()
+        .find(|event| event.kind == "tool_started" && event.data["tool_name"] == "shell")
+        .unwrap();
+    let original_call = started.call_id.clone();
+    let original_budget = engine.state().budgets[&original].clone();
+    fixture.append(vec![
+        call("Conversation", "input_resolve", "supersede-live-shell", json!({"resolutions":[{
+            "input_id":original,"outcome":"superseded","reason":"The user abandoned the original operation and its delegated work"
+        }]})),
+        json!({"match_job_title":"Conversation","text":"The old work was abandoned and its observed effects remain recorded."}),
+    ]);
+    let current = engine
+        .post(
+            "SUPERSEDE_LIVE_TOOL: abandon the old operation and its child.",
+            None,
+        )
+        .unwrap();
+    until(&mut engine, |engine| {
+        engine
+            .result(&original)
+            .is_some_and(|event| event.data["outcome"] == "superseded")
+    })
+    .await;
+    assert_eq!(engine.state().jobs[&child_job].current_call, original_call);
+    assert!(
+        !engine
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "tool_result" && event.call_id == original_call),
+        "supersession invented a terminal result before draining the started tool"
+    );
+    engine.resume().unwrap();
+    assert_eq!(
+        engine.state().jobs[&child_job].current_call,
+        original_call,
+        "resume erased the live call's ownership"
+    );
+    assert!(
+        !engine
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "tool_result" && event.call_id == original_call),
+        "resume synthesized a second outcome while the tool was still live"
+    );
+    until(&mut engine, |engine| {
+        engine
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "tool_result" && event.call_id == original_call)
+    })
+    .await;
+    until(&mut engine, |engine| engine.result(&current).is_some()).await;
+    assert_eq!(engine.result(&current).unwrap().kind, "delivery");
+    let records = engine.events().unwrap();
+    let results: Vec<_> = records
+        .iter()
+        .filter(|event| event.kind == "tool_result" && event.call_id == original_call)
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].data["uncertain"], true);
+    assert_eq!(results[0].job_id.as_deref(), Some(child_job.as_str()));
+    assert_eq!(results[0].reply_to.as_deref(), Some(assigned.as_str()));
+    assert_eq!(results[0].root_input.as_deref(), Some(original.as_str()));
+    assert!(
+        results[0]
+            .data
+            .to_string()
+            .contains("observed-before-supersession")
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.local.workspace.join("effect.txt")).unwrap(),
+        "x"
+    );
+    assert!(!fixture.local.workspace.join("late.txt").exists());
+    assert_eq!(
+        engine.state().budgets[&original],
+        original_budget,
+        "supersession or resume spent the old budget again"
+    );
+    let session = engine.state().id.clone();
+    drop(engine);
+    let mut engine = fixture.open(Some(&session));
+    engine.resume().unwrap();
+    for _ in 0..8 {
+        engine.step().await.unwrap();
+    }
+    assert_eq!(
+        engine
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "tool_result" && event.call_id == original_call)
+            .count(),
+        1,
+        "restart duplicated the real terminal result"
+    );
+    assert_eq!(
+        engine
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "tool_started" && event.data["tool_name"] == "shell")
+            .count(),
+        1
+    );
+    assert_eq!(engine.state().budgets[&original], original_budget);
+    assert!(!fixture.local.workspace.join("late.txt").exists());
+}
+
+#[tokio::test]
 async fn explicit_retry_can_make_new_delegation_after_ancestor_delivery_without_new_budget() {
     let mut fixture = Fixture::new(initial_turns(false));
     let (mut engine, parent, job, old) = parent_delivery(&fixture).await;

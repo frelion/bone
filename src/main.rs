@@ -51,7 +51,7 @@ enum Command {
         #[command(flatten)]
         run: RunArgs,
     },
-    /// Continue a paused session after inspecting its history.
+    /// Continue a paused session with its saved context.
     Resume {
         session_id: String,
         #[command(flatten)]
@@ -89,13 +89,6 @@ enum Command {
     Login,
     /// Print a minimal native provider configuration.
     Config,
-    /// Record an observed outcome for a write interrupted by a crash or cancellation.
-    Reconcile {
-        session_id: String,
-        call_id: String,
-        #[arg(long)]
-        note: String,
-    },
 }
 
 impl Default for Command {
@@ -247,24 +240,6 @@ async fn execute(mut cli: Cli) -> Result<()> {
                 }
             );
         }
-        Command::Reconcile {
-            session_id,
-            call_id,
-            note,
-        } => {
-            let (name, profile) = select_profile(&cli, &data)?;
-            let workspace = bone::session(&data, session_id)?.workspace;
-            let mut engine = Engine::open(
-                &data,
-                &workspace,
-                Some(session_id),
-                profile,
-                name,
-                RunOptions::default(),
-            )?;
-            engine.resolve_write(call_id, note)?;
-            println!("Recorded the inspected outcome. Resume the session to continue.");
-        }
         Command::Run {
             prompt,
             run,
@@ -362,7 +337,7 @@ fn report(engine: &Engine, input: &str, status: &str, text: &str, json_output: b
         println!(
             "{}",
             serde_json::to_string(
-                &json!({"session_id":engine.state().id,"input_id":input,"status":status,"text":text,"question_id":question_id,"metrics":engine.metrics(input),"unknown_writes":engine.state().unknown_writes})
+                &json!({"session_id":engine.state().id,"input_id":input,"status":status,"text":text,"question_id":question_id,"metrics":engine.metrics(input)})
             )?
         );
     } else {
@@ -370,12 +345,6 @@ fn report(engine: &Engine, input: &str, status: &str, text: &str, json_output: b
             println!("{text}");
         }
         eprintln!("Session: {} ({status})", engine.state().id);
-        for write in engine.state().unknown_writes.values() {
-            eprintln!(
-                "Unconfirmed write {}: {}. Inspect effects, then use bone reconcile with --note.",
-                write.call_id, write.tool_name
-            );
-        }
     }
     Ok(())
 }
@@ -408,6 +377,10 @@ async fn run_to_result(
                 _ => "failed",
             };
             let text = engine.event_text(event)?;
+            if !engine.is_quiescent() && !engine.state().paused {
+                engine.stop()?;
+            }
+            collect_stopped_tools(engine).await?;
             report(engine, input, status, &text, json_output)?;
             if status == "failed" {
                 bail!("input failed; details are recorded in session history");
@@ -415,6 +388,7 @@ async fn run_to_result(
             return Ok(());
         }
         if engine.state().paused {
+            collect_stopped_tools(engine).await?;
             report(engine, input, "paused", "Work is paused.", json_output)?;
             return Ok(());
         }
@@ -422,12 +396,7 @@ async fn run_to_result(
             events = engine.step() => {
                 let events = events?;
                 if events.is_empty() && engine.is_quiescent() {
-                    let status = if engine.state().unknown_writes.is_empty() {
-                        "waiting"
-                    } else {
-                        "paused"
-                    };
-                    report(engine, input, status, "Work is waiting for input or reconciliation.", json_output)?;
+                    report(engine, input, "waiting", "Work is waiting for input.", json_output)?;
                     return Ok(());
                 }
                 if events.is_empty() {
@@ -436,16 +405,27 @@ async fn run_to_result(
             }
             _ = tokio::signal::ctrl_c() => {
                 engine.stop()?;
+                collect_stopped_tools(engine).await?;
                 report(engine, input, "paused", "Stopped.", json_output)?;
                 return Ok(());
             }
             _ = &mut deadline => {
                 engine.stop()?;
+                collect_stopped_tools(engine).await?;
                 report(engine, input, "paused", "Execution time limit reached.", json_output)?;
                 bail!("execution time limit reached");
             }
         }
     }
+}
+
+// A stop request cancels execution, but its already started tools still own
+// their effects. Collect their terminal results before dropping the session.
+async fn collect_stopped_tools(engine: &mut Engine) -> Result<()> {
+    while !engine.is_quiescent() {
+        engine.step().await?;
+    }
+    Ok(())
 }
 
 async fn chat(engine: &mut Engine, seconds: u64) -> Result<()> {
@@ -488,7 +468,7 @@ async fn chat(engine: &mut Engine, seconds: u64) -> Result<()> {
                         "/stop" => {
                             engine.stop()?;
                             deadline_armed = false;
-                            println!("Stopped.");
+                            println!("Stopping. /resume to continue.");
                         }
                         "/resume" => {
                             engine.resume()?;
@@ -545,13 +525,14 @@ async fn chat(engine: &mut Engine, seconds: u64) -> Result<()> {
             _ = tokio::signal::ctrl_c() => {
                 engine.stop()?;
                 deadline_armed = false;
-                println!("Stopped. /resume to continue; /quit to exit.");
+                println!("Stopping. /resume to continue; /quit to exit.");
                 if input_closed {
                     break;
                 }
             }
         }
     }
+    collect_stopped_tools(engine).await?;
     Ok(())
 }
 

@@ -107,7 +107,7 @@ fn active_processes(handle: RawHandle) -> io::Result<u32> {
 }
 
 /// Locks may disappear before Windows finishes terminating a crashed owner's
-/// descendants. Recovery also checks the named kernel job before reconciliation.
+/// descendants. Check the named kernel job before allowing another writer.
 pub(crate) fn ensure_writer_stopped(lease: &File) -> io::Result<()> {
     let name = job_name(lease)?;
     let raw = unsafe {
@@ -134,6 +134,14 @@ pub(crate) fn ensure_writer_stopped(lease: &File) -> io::Result<()> {
 
 pub(crate) struct ProcessGroup(OwnedHandle);
 impl ProcessGroup {
+    pub(crate) fn terminate(&self) -> io::Result<()> {
+        if unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn new(lease: Option<&File>) -> io::Result<Self> {
         let name = match lease {
             Some(file) => job_name(file)?,
@@ -198,12 +206,9 @@ impl ProcessGroup {
 }
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        unsafe {
-            TerminateJobObject(self.0.as_raw_handle(), 1);
-        }
+        let _ = self.terminate();
         // Keep the workspace lease until ordinary termination completes. Any
-        // slower/failing cleanup remains protected by the persistent marker and
-        // the same named job check in WriteLease recovery.
+        // slower cleanup remains protected by the same named kernel job check.
         let deadline = Instant::now() + Duration::from_secs(5);
         while matches!(active_processes(self.0.as_raw_handle()), Ok(n) if n > 0)
             && Instant::now() < deadline

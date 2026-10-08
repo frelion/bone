@@ -1,16 +1,6 @@
 use super::*;
 use crate::state::{Budget, Job};
 
-fn assert_known_writes(store: &Store, state: &SessionState) {
-    assert!(
-        store
-            .recover_session(&state.id)
-            .unwrap()
-            .unknown_writes
-            .is_empty()
-    );
-}
-
 fn call_event(state: &SessionState, kind: &str, call: &str, data: serde_json::Value) -> Event {
     let mut event = Event::new(&state.id, kind, data);
     event.job_id = state.focus.clone();
@@ -21,7 +11,7 @@ fn call_event(state: &SessionState, kind: &str, call: &str, data: serde_json::Va
 
 fn fixture() -> (tempfile::TempDir, Store, SessionState, Event) {
     let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path().join("bone.sqlite")).unwrap();
+    let store = Store::open(directory.path().join("sessions.sqlite")).unwrap();
     let mut state = SessionState::new(directory.path());
     let job = Job::new("main");
     state.focus = Some(job.id.clone());
@@ -50,7 +40,7 @@ fn commit_waits_for_an_independent_writer_before_reading_its_snapshot() {
         static BUSY_NOTIFY: RefCell<Option<mpsc::Sender<()>>> = const { RefCell::new(None) };
     }
     let (directory, store, state, input) = fixture();
-    let writer = Connection::open(directory.path().join("bone.sqlite")).unwrap();
+    let writer = Connection::open(directory.path().join("sessions.sqlite")).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
     let (busy_sender, busy_receiver) = mpsc::channel();
     let (result_sender, result_receiver) = mpsc::channel();
@@ -127,7 +117,7 @@ fn history_page_uses_append_order_and_bounded_cursor_reads() {
 #[test]
 fn history_before_preserves_append_order_and_session_scoped_backward_cursor() {
     let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(directory.path().join("sessions.sqlite3")).unwrap();
+    let store = Store::open(directory.path().join("sessions.sqlite")).unwrap();
     let state = SessionState::new(directory.path());
     let foreign = SessionState::new(directory.path());
     store.create_session(&state).unwrap();
@@ -212,7 +202,7 @@ fn restart_keeps_snapshot_and_one_copy_of_native_message() {
         .commit(&state, std::slice::from_ref(&message))
         .unwrap();
     drop(store);
-    let restarted = Store::open(directory.path().join("bone.sqlite")).unwrap();
+    let restarted = Store::open(directory.path().join("sessions.sqlite")).unwrap();
     assert_eq!(restarted.load_session(&state.id).unwrap(), state);
     assert_eq!(
         restarted.events(&state.id).unwrap().last().unwrap(),
@@ -284,7 +274,7 @@ fn dangling_references_roll_back() {
 #[test]
 fn session_ownership_is_exclusive_and_released() {
     let (directory, store, state, _) = fixture();
-    let another = Store::open(directory.path().join("bone.sqlite")).unwrap();
+    let another = Store::open(directory.path().join("sessions.sqlite")).unwrap();
     let lease = store.acquire_session(&state.id).unwrap();
     assert!(another.acquire_session(&state.id).is_err());
     drop(lease);
@@ -292,7 +282,7 @@ fn session_ownership_is_exclusive_and_released() {
 }
 
 #[test]
-fn recovery_pauses_work_and_records_uncertain_writes_without_replay() {
+fn recovery_pauses_unfinished_execution_without_replay() {
     let (directory, store, mut state, input) = fixture();
     let mut started = call_event(
         &state,
@@ -308,18 +298,14 @@ fn recovery_pauses_work_and_records_uncertain_writes_without_replay() {
     let original_input = job.active_input.clone();
     store.commit(&state, &[input, started]).unwrap();
     drop(store);
-    let store = Store::open(directory.path().join("bone.sqlite")).unwrap();
+    let store = Store::open(directory.path().join("sessions.sqlite")).unwrap();
     let _lease = store.acquire_session(&state.id).unwrap();
     let recovered = store.recover_session(&state.id).unwrap();
     assert!(recovered.paused);
     let job = &recovered.jobs[state.focus.as_ref().unwrap()];
     assert_eq!(job.state, JobState::Paused);
     assert_eq!(job.active_input, original_input);
-    assert_eq!(job.current_call.as_deref(), Some("tool-call-1"));
-    assert_eq!(
-        recovered.unknown_writes["tool-call-1"].tool_name,
-        "write_file"
-    );
+    assert!(job.current_call.is_none());
     assert!(!directory.path().join("output.txt").exists());
     assert_eq!(store.recover_session(&state.id).unwrap(), recovered);
     assert_eq!(store.events(&state.id).unwrap().len(), 3);
@@ -363,8 +349,8 @@ fn restart_pauses_queued_and_waiting_work_and_preserves_idle_and_closed_jobs() {
 }
 
 #[test]
-fn uncertain_native_result_stays_unknown_until_explicit_reconciliation() {
-    let (_directory, store, mut state, input) = fixture();
+fn uncertain_native_result_remains_terminal_after_recovery() {
+    let (_directory, store, state, input) = fixture();
     let mut started = call_event(
         &state,
         "tool_started",
@@ -378,22 +364,22 @@ fn uncertain_native_result_stays_unknown_until_explicit_reconciliation() {
         "uncertain-call",
         json!({"uncertain":true}),
     );
-    store.commit(&state, &[input, started, result]).unwrap();
-    state = store.recover_session(&state.id).unwrap();
-    assert!(state.unknown_writes.contains_key("uncertain-call"));
-    state.unknown_writes.remove("uncertain-call");
-    let reconciled = call_event(
-        &state,
-        "tool_reconciled",
-        "uncertain-call",
-        json!({"observation":"inspected"}),
-    );
-    store.commit(&state, &[reconciled]).unwrap();
-    assert_known_writes(&store, &state);
+    store
+        .commit(&state, &[input, started, result.clone()])
+        .unwrap();
+    let recovered = store.recover_session(&state.id).unwrap();
+    assert_eq!(store.recover_session(&state.id).unwrap(), recovered);
+    let results = store
+        .events(&state.id)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "tool_result")
+        .collect::<Vec<_>>();
+    assert_eq!(results, vec![result]);
 }
 
 #[test]
-fn finished_write_is_not_uncertain_after_restart() {
+fn finished_write_keeps_its_result_after_restart() {
     let (_directory, store, mut state, input) = fixture();
     let started = call_event(
         &state,
@@ -407,8 +393,19 @@ fn finished_write_is_not_uncertain_after_restart() {
         .get_mut(state.focus.as_ref().unwrap())
         .unwrap()
         .state = JobState::Idle;
-    store.commit(&state, &[input, started, result]).unwrap();
-    assert_known_writes(&store, &state);
+    store
+        .commit(&state, &[input, started, result.clone()])
+        .unwrap();
+    store.recover_session(&state.id).unwrap();
+    assert_eq!(
+        store
+            .events(&state.id)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "tool_result")
+            .collect::<Vec<_>>(),
+        vec![result]
+    );
 }
 
 #[test]

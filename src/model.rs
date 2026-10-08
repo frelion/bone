@@ -39,14 +39,11 @@ pub struct PreparedModel {
     api_key: Option<String>,
 }
 
-// At most two descriptors: the stable source lock and its legacy HOME path.
-struct CredentialLock(Vec<File>);
+struct CredentialLock(File);
 
 impl Drop for CredentialLock {
     fn drop(&mut self) {
-        for file in &self.0 {
-            let _ = FileExt::unlock(file);
-        }
+        let _ = FileExt::unlock(&self.0);
     }
 }
 
@@ -81,10 +78,9 @@ pub async fn prepare(
     profile.validate()?;
     let (credential_lock, auth) = if profile.is_subscription() {
         let (guard, auth_file, source) = if profile.reuse_codex_login {
-            let (guard, canonical_source) = lock_codex_source_with_legacy(
+            let (guard, canonical_source) = lock_codex_source(
                 &codex_auth_file()?,
                 &crate::config::user_home()?.join(".bone/v2/credential-locks"),
-                &crate::config::default_data_dir().join("credential-locks"),
             )
             .await?;
             (guard, None, load_codex_login(&canonical_source)?)
@@ -493,10 +489,9 @@ async fn lock_profile(data_dir: &Path, profile_name: &str) -> Result<(Credential
     Ok((guard, auth_file))
 }
 
-async fn lock_codex_source_with_legacy(
+async fn lock_codex_source(
     source: &Path,
-    stable_directory: &Path,
-    legacy_directory: &Path,
+    lock_directory: &Path,
 ) -> Result<(CredentialLock, PathBuf)> {
     let canonical_source = source.canonicalize().map_err(|_| {
         anyhow::anyhow!(
@@ -507,21 +502,14 @@ async fn lock_codex_source_with_legacy(
         "{:x}",
         Sha256::digest(canonical_source.as_os_str().as_encoded_bytes())
     );
-    let lock_path = |directory: &Path| -> Result<PathBuf> {
-        std::fs::create_dir_all(directory)
-            .context("cannot create BONE subscription lock directory")?;
-        Ok(directory.canonicalize()?.join(format!("{identity}.lock")))
-    };
-    let stable = lock_path(stable_directory)?;
-    let legacy = lock_path(legacy_directory)?;
-    // Every new process acquires the same OS-user home lock first, independent
-    // of HOME/CODEX_HOME/data directory. Also retain the prior HOME lock so an
-    // old process using that location cannot run concurrently with this one.
-    let mut guard = acquire_credential_lock(&stable).await?;
-    if stable != legacy {
-        let mut legacy_guard = acquire_credential_lock(&legacy).await?;
-        guard.0.append(&mut legacy_guard.0);
-    }
+    std::fs::create_dir_all(lock_directory)
+        .context("cannot create BONE subscription lock directory")?;
+    let lock = lock_directory
+        .canonicalize()?
+        .join(format!("{identity}.lock"));
+    // All profiles and data directories share the canonical source's lease in
+    // the OS-user home, independent of HOME and CODEX_HOME aliases.
+    let guard = acquire_credential_lock(&lock).await?;
     Ok((guard, canonical_source))
 }
 
@@ -541,7 +529,7 @@ async fn acquire_credential_lock(path: &Path) -> Result<CredentialLock> {
         .context("cannot open BONE subscription lock")?;
     loop {
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(CredentialLock(vec![file])),
+            Ok(()) => return Ok(CredentialLock(file)),
             Err(error) if crate::filesystem::lock_contended(&error) => {
                 // This future owns the unopened lease candidate. Cancellation
                 // closes it immediately; no blocking worker survives the call.

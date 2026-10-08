@@ -1,121 +1,37 @@
 use super::*;
 
-async fn lock_codex_source(
-    source: &Path,
-    lock_directory: &Path,
-) -> Result<(CredentialLock, PathBuf)> {
-    lock_codex_source_with_legacy(source, lock_directory, lock_directory).await
-}
-
-#[tokio::test]
-async fn codex_source_uses_one_stable_lock_across_different_legacy_homes() {
-    let root = tempfile::tempdir().unwrap();
-    let source = root.path().join("auth.json");
-    std::fs::write(&source, "{}").unwrap();
-    let stable = root.path().join("os-home-locks");
-    let home_a = root.path().join("home-a-locks");
-    let home_b = root.path().join("home-b-locks");
-    let (owner, _) = lock_codex_source_with_legacy(&source, &stable, &home_a)
-        .await
-        .unwrap();
-    assert_eq!(owner.0.len(), 2);
-    let waiting_source = source.clone();
-    let waiter = tokio::spawn(async move {
-        lock_codex_source_with_legacy(&waiting_source, &stable, &home_b).await
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    assert!(
-        !waiter.is_finished(),
-        "different HOME bypassed source ownership"
-    );
-    drop(owner);
-    let (next, _) = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(next.0.len(), 2);
-    drop(next);
-    assert_eq!(std::fs::read_to_string(source).unwrap(), "{}");
-}
-
 #[cfg(unix)]
 #[tokio::test]
-async fn codex_source_deduplicates_stable_and_legacy_directory_aliases() {
+async fn codex_source_lock_directory_aliases_share_one_physical_lease() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("auth.json");
     std::fs::write(&source, "{}").unwrap();
-    let stable = root.path().join("locks");
-    std::fs::create_dir(&stable).unwrap();
+    let locks = root.path().join("locks");
+    std::fs::create_dir(&locks).unwrap();
     let alias = root.path().join("alias");
-    std::os::unix::fs::symlink(&stable, &alias).unwrap();
-    let (guard, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        lock_codex_source_with_legacy(&source, &stable, &alias),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(guard.0.len(), 1, "same physical lock was acquired twice");
-    drop(guard);
-}
-
-#[tokio::test]
-async fn legacy_codex_owner_blocks_new_lock_and_cancellation_releases_stable() {
-    let root = tempfile::tempdir().unwrap();
-    let source = root.path().join("auth.json");
-    std::fs::write(&source, "{}").unwrap();
-    let identity = format!(
-        "{:x}",
-        Sha256::digest(
-            source
-                .canonicalize()
-                .unwrap()
-                .as_os_str()
-                .as_encoded_bytes()
-        )
-    );
-    let stable = root.path().join("stable");
-    let legacy = root.path().join("legacy");
-    let legacy_path = legacy.join(format!("{identity}.lock"));
-    let stable_path = stable.join(format!("{identity}.lock"));
-    let old_owner = acquire_credential_lock(&legacy_path).await.unwrap();
-    let waiter =
-        tokio::spawn(async move { lock_codex_source_with_legacy(&source, &stable, &legacy).await });
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    assert!(
-        !waiter.is_finished(),
-        "new process bypassed legacy ownership"
-    );
+    std::os::unix::fs::symlink(&locks, &alias).unwrap();
+    let (owner, resolved) = lock_codex_source(&source, &locks).await.unwrap();
+    assert_eq!(resolved, source.canonicalize().unwrap());
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(60),
-            acquire_credential_lock(&stable_path)
+            lock_codex_source(&source, &alias),
         )
         .await
-        .is_err()
+        .is_err(),
+        "a lock directory alias bypassed source ownership",
     );
-    waiter.abort();
-    assert!(matches!(waiter.await, Err(error) if error.is_cancelled()));
-    let stable_owner = tokio::time::timeout(
+    drop(owner);
+    let (next, resolved_again) = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        acquire_credential_lock(&stable_path),
+        lock_codex_source(&source, &alias),
     )
     .await
     .unwrap()
     .unwrap();
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(40),
-            acquire_credential_lock(&legacy_path)
-        )
-        .await
-        .is_err()
-    );
-    drop(stable_owner);
-    drop(old_owner);
-    let legacy_owner = acquire_credential_lock(&legacy_path).await.unwrap();
-    drop(legacy_owner);
+    assert_eq!(resolved_again, resolved);
+    drop(next);
+    assert_eq!(std::fs::read_to_string(source).unwrap(), "{}");
 }
 
 #[tokio::test]

@@ -470,21 +470,20 @@ fn finish_child(child: Child) -> Output {
 // regression lives with the Windows shell implementation tests.
 #[cfg(unix)]
 #[tokio::test]
-async fn killed_owner_cannot_reconcile_or_allow_competing_writes_until_its_shell_exits() {
+async fn killed_owner_blocks_competing_writes_only_until_its_shell_physically_exits() {
     let mut competing = call(
         "write_file",
         "competing_effect",
-        json!({"path":"intruder.txt","content":"unsafe","expected_sha256":null}),
+        json!({"path":"intruder.txt","content":"written after the original process exited","expected_sha256":null}),
     );
     competing["match_last_user_contains"] = json!("Attempt another workspace write");
     let fixture = Fixture::script(
         json!({"turns":[
         call("shell","original_effect",json!({"command":"printf x >> effect.txt; i=0; while [ ! -e release ] && [ \"$i\" -lt 400 ]; do sleep 0.05; i=$((i+1)); done; printf y >> effect.txt","timeout_seconds":25})),
         competing,
-        {"match_last_user_contains":"Attempt another workspace write","text":"Competing write was blocked"},
+        {"match_last_user_contains":"Attempt another workspace write","text":"Competing write completed after the original process exited"},
         call("read_file","inspect_original",json!({"path":"effect.txt"})),
-        {"text":"Original effect inspected, awaiting explicit reconciliation"},
-        {"text":"Reconciled original operation without replay"}]}),
+        {"contains":["xy"],"text":"Original effect inspected without repeating the interrupted operation"}]}),
         "fixtures/long_task/server.py",
     );
     let mut command = fixture.command_at(&fixture.data);
@@ -517,19 +516,18 @@ async fn killed_owner_cannot_reconcile_or_allow_competing_writes_until_its_shell
     let states: Value = serde_json::from_slice(&bounded_output(sessions).stdout).unwrap();
     let session = states[0]["id"].as_str().unwrap().to_owned();
     let mut engine = fixture.engine(Some(&session), RunOptions::default());
-    assert_eq!(engine.state().unknown_writes.len(), 1);
-    let uncertain = engine.state().unknown_writes.keys().next().unwrap().clone();
+    let recovered_results: Vec<_> = engine
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "tool_result" && event.data["tool_name"] == "shell")
+        .collect();
+    assert_eq!(recovered_results.len(), 1);
+    assert_eq!(recovered_results[0].data["uncertain"], true);
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap(),
         "x"
     );
-    assert!(
-        engine
-            .resolve_write(&uncertain, "The child is still running; must not reconcile")
-            .is_err(),
-        "live shell was reconciled after owner kill"
-    );
-    assert!(engine.state().unknown_writes.contains_key(&uncertain));
     let other_data = fixture.root.path().join("other-data");
     std::fs::create_dir(&other_data).unwrap();
     std::fs::copy(
@@ -552,39 +550,42 @@ async fn killed_owner_cannot_reconcile_or_allow_competing_writes_until_its_shell
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while fixture.requests().len() < 2 && competing_process.try_wait().unwrap().is_none() {
+    while fixture.requests().len() < 2 {
         assert!(
             Instant::now() < deadline,
-            "contender did not start or reject promptly"
+            "contender did not propose its write"
+        );
+        assert!(
+            competing_process.try_wait().unwrap().is_none(),
+            "contender finished while the orphan shell still held its lease"
         );
         thread::sleep(Duration::from_millis(10));
     }
+    // Leave the contender enough time to attempt admission while the old shell
+    // is definitely still alive. It must wait on physical ownership alone.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!fixture.workspace.join("intruder.txt").exists());
+    assert!(competing_process.try_wait().unwrap().is_none());
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap(),
-        "x",
-        "child ended before the lifetime assertion"
+        "x"
     );
-    assert!(
-        engine
-            .resolve_write(&uncertain, "Still waiting for the same original child")
-            .is_err()
-    );
-    // This sentinel is test coordination, not a model/tool effect.
     std::fs::write(fixture.workspace.join("release"), "release").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap() != "xy" {
-        assert!(
-            Instant::now() < deadline,
-            "original child did not finish after release"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let _ = finish_child(competing_process);
-    assert!(!fixture.workspace.join("intruder.txt").exists());
+    let output = finish_child(competing_process);
+    assert!(
+        output.status.success(),
+        "contender remained blocked after physical ownership ended: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "completed");
     assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap(),
         "xy"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("intruder.txt")).unwrap(),
+        "written after the original process exited"
     );
     let input = engine
         .events()
@@ -595,16 +596,7 @@ async fn killed_owner_cannot_reconcile_or_allow_competing_writes_until_its_shell
         .id;
     engine.resume().unwrap();
     drive(&mut engine, &input).await;
-    assert!(engine.state().unknown_writes.contains_key(&uncertain));
-    assert_ne!(engine.result(&input).unwrap().kind, "delivery");
-    engine
-        .resolve_write(
-            &uncertain,
-            "Observed xy from one original operation; never replay it",
-        )
-        .unwrap();
-    engine.resume().unwrap();
-    drive(&mut engine, &input).await;
+    assert_eq!(engine.result(&input).unwrap().kind, "delivery");
     let events = engine.events().unwrap();
     assert_eq!(
         events
@@ -614,10 +606,18 @@ async fn killed_owner_cannot_reconcile_or_allow_competing_writes_until_its_shell
         1
     );
     assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "tool_result" && event.data["tool_name"] == "shell")
+            .count(),
+        1
+    );
+    assert_eq!(
         std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap(),
         "xy"
     );
     effects_are_owned(&events);
+    native_tool_outputs_have_calls(&fixture.requests());
 }
 
 #[test]

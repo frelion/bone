@@ -43,7 +43,7 @@ fn idle_model_switch_keeps_the_session_idle_without_fabricating_a_stop() {
 }
 
 #[test]
-fn changing_a_model_pauses_pending_work_and_preserves_its_input() {
+fn changing_a_model_preserves_pending_work_and_its_input() {
     let (dir, mut engine, mut app) = fixture();
     let input = engine
         .post_message("unfinished engineering request")
@@ -51,8 +51,8 @@ fn changing_a_model_pauses_pending_work_and_preserves_its_input() {
     assert!(!engine.is_quiescent());
     app.set_model(&mut engine, &dir.path().join("data"), "next-model")
         .unwrap();
-    assert!(engine.state().paused);
-    assert!(engine.is_quiescent());
+    assert!(!engine.state().paused);
+    assert!(!engine.is_quiescent());
     assert_eq!(
         crate::tui::event_body(&engine, &engine.read_event(&input).unwrap()).unwrap(),
         "unfinished engineering request"
@@ -63,14 +63,14 @@ fn changing_a_model_pauses_pending_work_and_preserves_its_input() {
             .iter()
             .filter(|event| event.kind == "stopped")
             .count(),
-        1
+        0
     );
     assert!(
         !events
             .iter()
             .any(|event| matches!(event.kind.as_str(), "model_started" | "tool_started"))
     );
-    assert!(app.ui.notice.contains("Ctrl+R"));
+    assert!(!app.ui.notice.contains("Ctrl+R"));
 }
 
 #[test]
@@ -220,9 +220,6 @@ fn input_target_is_a_fact_independent_of_display_copy() {
     app.reply_target = Some("expired-but-still-explicit-question".into());
     app.metadata(&engine);
     assert_eq!(app.ui.input_target, InputTarget::Reply);
-    app.reconcile_call = Some("unknown-write".into());
-    app.metadata(&engine);
-    assert_eq!(app.ui.input_target, InputTarget::Reconcile);
 }
 
 #[test]

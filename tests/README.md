@@ -18,11 +18,11 @@ Rust 回归和 PTY 测试使用本地服务、合成凭据与临时工作区。�
 
 | 位置 | 证明什么 |
 | --- | --- |
-| `unit/runtime.rs`、`unit/store.rs` | 调用归属、过期结果、事务故障、重启、物理写锁、未知写保护、分页 |
+| `unit/runtime.rs`、`unit/store.rs` | 调用归属、过期结果、事务故障、重启、物理写锁、中断结果不重放、分页 |
 | `unit/context.rs` | 原始指令优先级、完整工具批次、按需压缩、原文引用与新结果保护 |
 | `unit/model.rs`、`unit/config.rs`、`unit/state.rs` | 原生配置、凭据锁生命周期、取消与额度 |
 | `unit/tools.rs`、`unit/tools_engineering.rs` | 文件竞态、哈希预期、路径边界、搜索、原子编辑及 shell 生命周期 |
-| `unit/cli.rs`、`unit/tui*.rs` | CLI 默认入口、视图/Unicode、草稿、原生文本投影与 HTML 交付引用 |
+| `unit/cli.rs`、`unit/tui*.rs` | CLI 默认入口、视图/Unicode、草稿、后台 Session 推进、模型后续调用、原生文本投影与 HTML 交付引用 |
 | `internal/provider_contract.rs` | 原生 Rig 构造、请求/流/用量、401 单次失败 |
 | `internal/runtime_safety.rs` | 注入持久化中断状态，验证恢复与输入优先级 |
 | `acceptance.rs` | 通过公开 Engine/CLI 验证修复、协作、转交、打断、故障与实验统计 |

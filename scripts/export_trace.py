@@ -296,7 +296,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--manifest", type=Path, help="JSON with title, subtitle and sessions[] source specifications")
-    inputs.add_argument("--database", type=Path, help="a BONE sessions.sqlite3, opened read-only")
+    inputs.add_argument("--database", type=Path, help="a BONE sessions.sqlite, opened read-only")
     parser.add_argument("--source-root", type=Path, help="Local root for relative manifest database paths")
     parser.add_argument("--session", help="session ID, for --database")
     parser.add_argument("--immutable", action="store_true", help="only for a frozen database with no WAL")

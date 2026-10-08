@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -8,7 +8,7 @@ use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::json;
 
-use crate::state::{Event, JobState, SessionState, UnknownWrite};
+use crate::state::{Event, JobState, SessionState};
 
 /// SQLite is the sole authority for snapshots and immutable event contents.
 pub struct Store {
@@ -55,28 +55,11 @@ impl Store {
                  revision INTEGER NOT NULL CHECK (revision >= 0),
                  payload TEXT NOT NULL,
                  job_id TEXT,
-                 metadata TEXT
+                 metadata TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS events_session_order ON events(session_id, sequence);
-             CREATE INDEX IF NOT EXISTS events_call ON events(session_id, call_id);",
-        )?;
-        let columns = {
-            let mut statement = connection.prepare("PRAGMA table_info(events)")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<std::result::Result<BTreeSet<_>, _>>()?
-        };
-        if !columns.contains("job_id") {
-            connection.execute("ALTER TABLE events ADD COLUMN job_id TEXT", [])?;
-        }
-        if !columns.contains("metadata") {
-            connection.execute("ALTER TABLE events ADD COLUMN metadata TEXT", [])?;
-        }
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             UPDATE events SET job_id = json_extract(payload, '$.job_id'), metadata = json_set(json_remove(payload, '$.data.message', '$.data.response', '$.data.stream_items', '$.data.covered_ids'), '$.data.usage', json_extract(payload, '$.data.response.usage')) WHERE metadata IS NULL;
-             CREATE INDEX IF NOT EXISTS events_job_order ON events(session_id, job_id, sequence);
-             COMMIT;"
+             CREATE INDEX IF NOT EXISTS events_call ON events(session_id, call_id);
+             CREATE INDEX IF NOT EXISTS events_job_order ON events(session_id, job_id, sequence);",
         )?;
         Ok(Self {
             connection,
@@ -277,9 +260,7 @@ impl Store {
                 "model_message" | "summary" | "stale" => {
                     readable_text(&event.data["response"]["choice"])
                 }
-                "question" | "failure" | "input_paused" | "write_unknown" | "tool_reconciled" => {
-                    readable_text(&event.data)
-                }
+                "question" | "failure" | "input_paused" => readable_text(&event.data),
                 _ => String::new(),
             };
             if let Some(offset) = text.to_lowercase().find(&query) {
@@ -454,49 +435,6 @@ impl Store {
     pub fn recover_session(&self, id: &str) -> Result<SessionState> {
         let mut state = self.load_session(id)?;
         let original = state.clone();
-        let events = self.event_metadata(id)?;
-        let mut unfinished = BTreeMap::new();
-        for event in &events {
-            let Some(call_id) = &event.call_id else {
-                continue;
-            };
-            match event.kind.as_str() {
-                "tool_started" | "call_started" => {
-                    unfinished.insert(call_id.clone(), event);
-                }
-                "tool_result"
-                    if event
-                        .data
-                        .get("uncertain")
-                        .and_then(|value| value.as_bool())
-                        == Some(true) => {}
-                "tool_result" | "call_finished" | "call_failed" | "tool_reconciled" => {
-                    unfinished.remove(call_id);
-                }
-                _ => {}
-            }
-        }
-        for (call_id, event) in unfinished {
-            if event.data.get("effect").and_then(|value| value.as_str()) != Some("write") {
-                continue;
-            }
-            let job_id = event.job_id.clone().context("write call has no job ID")?;
-            state
-                .unknown_writes
-                .entry(call_id.clone())
-                .or_insert_with(|| UnknownWrite {
-                    call_id,
-                    job_id,
-                    root_input: event.root_input.clone(),
-                    tool_name: event
-                        .data
-                        .get("tool_name")
-                        .or_else(|| event.data.get("name"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("unknown")
-                        .to_owned(),
-                });
-        }
         for job in state.jobs.values_mut() {
             if job.state != JobState::Closed
                 && (matches!(
@@ -510,20 +448,16 @@ impl Store {
                 job.state = JobState::Paused;
                 state.paused = true;
             }
-        }
-        if !state.unknown_writes.is_empty() {
-            state.paused = true;
+            // No runtime future survives reopening this session. Native tool
+            // results for unfinished starts are recovered by Engine.
+            job.current_call = None;
         }
         if state != original {
             state.revision = state
                 .revision
                 .checked_add(1)
                 .context("session revision overflow")?;
-            let mut event = Event::new(
-                id,
-                "stopped",
-                json!({"reason": "recovered", "unknown_writes": state.unknown_writes.keys().collect::<Vec<_>>() }),
-            );
+            let mut event = Event::new(id, "stopped", json!({"reason": "recovered"}));
             event.revision = state.revision;
             self.commit(&state, &[event])?;
         }
@@ -635,12 +569,6 @@ fn validate_structure(state: &SessionState) -> Result<()> {
             "input budget exceeded"
         );
     }
-    for (key, write) in &state.unknown_writes {
-        ensure!(
-            key == &write.call_id && state.jobs.contains_key(&write.job_id),
-            "invalid unknown write reference"
-        );
-    }
     Ok(())
 }
 
@@ -665,9 +593,6 @@ fn references(state: &SessionState) -> BTreeSet<&str> {
                 .chain(job.summary.iter())
                 .map(String::as_str),
         );
-    }
-    for write in state.unknown_writes.values() {
-        ids.extend(write.root_input.iter().map(String::as_str));
     }
     ids
 }

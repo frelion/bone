@@ -328,10 +328,10 @@ fn chat_deadline_pauses_a_model_call_and_preserves_resumable_input() {
     assert!(!text.contains("LATE_RESPONSE_MUST_NOT_BE_DELIVERED"));
     let saved = bone::sessions(&fixture.data).unwrap().pop().unwrap();
     assert!(saved.paused);
-    assert!(saved.unknown_writes.is_empty());
     let history = bone::history(&fixture.data, &saved.id).unwrap();
     assert!(history.iter().any(|event| event.kind == "cancelled"));
     assert!(!history.iter().any(|event| event.kind == "delivery"));
+    assert!(!history.iter().any(|event| event.kind == "tool_result"));
 
     let mut command = fixture.command();
     command.args(["resume", &saved.id, "--timeout-seconds", "10", "--json"]);
@@ -343,7 +343,7 @@ fn chat_deadline_pauses_a_model_call_and_preserves_resumable_input() {
 }
 
 #[test]
-fn chat_deadline_retains_unknown_write_and_does_not_repeat_it_on_reopen() {
+fn chat_deadline_retains_the_interrupted_tool_fact_and_does_not_repeat_it_on_reopen() {
     let command = if cfg!(windows) {
         "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('started.txt', 'started'); [Threading.Thread]::Sleep(5000); [IO.File]::WriteAllText('finished.txt', 'finished')\""
     } else {
@@ -365,7 +365,6 @@ fn chat_deadline_retains_unknown_write_and_does_not_repeat_it_on_reopen() {
     assert!(text.contains("Execution time limit reached"), "{text}");
     let saved = bone::sessions(&fixture.data).unwrap().pop().unwrap();
     assert!(saved.paused);
-    assert_eq!(saved.unknown_writes.len(), 1);
     assert!(fixture.workspace.join("started.txt").exists());
     assert!(!fixture.workspace.join("finished.txt").exists());
     let reopened = Engine::open(
@@ -377,8 +376,17 @@ fn chat_deadline_retains_unknown_write_and_does_not_repeat_it_on_reopen() {
         RunOptions::default(),
     )
     .unwrap();
-    assert_eq!(reopened.state().unknown_writes.len(), 1);
     assert!(reopened.state().paused);
+    let records = reopened.events().unwrap();
+    let results: Vec<_> = records
+        .iter()
+        .filter(|event| event.kind == "tool_result" && event.data["tool_name"] == "shell")
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].data["uncertain"], true);
+    assert!(results[0].job_id.is_some());
+    assert!(results[0].call_id.is_some());
+    assert!(results[0].root_input.is_some());
     assert_eq!(
         reopened
             .events()

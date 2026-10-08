@@ -68,7 +68,6 @@ pub(super) enum ToolState {
 pub(super) enum InputTarget {
     Message,
     Reply,
-    Reconcile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +78,6 @@ pub(super) enum PickerKind {
     Connection,
     History,
     Question,
-    Reconcile,
 }
 #[derive(Debug, Clone)]
 pub(super) struct PickerItem {
@@ -177,13 +175,6 @@ impl Draft {
 }
 
 #[derive(Debug)]
-struct TemporaryDraft {
-    draft: Draft,
-    layers: Vec<LayerReturn>,
-    parent: LayerReturn,
-}
-
-#[derive(Debug)]
 pub(super) struct View {
     editor: TextArea<'static>,
     editor_size: Option<(u16, u16)>,
@@ -216,7 +207,6 @@ pub(super) struct View {
     history_index: Option<usize>,
     history_draft: String,
     layers: Vec<LayerReturn>,
-    temporary_draft: Option<TemporaryDraft>,
     read_points: Vec<ReadPoint>,
     pending_anchor: Option<ReadPoint>,
     anchor_excerpt: String,
@@ -288,7 +278,6 @@ impl View {
             history_index: None,
             history_draft: String::new(),
             layers: Vec::new(),
-            temporary_draft: None,
             read_points: Vec::new(),
             pending_anchor: None,
             anchor_excerpt: String::new(),
@@ -658,10 +647,7 @@ impl View {
         editor_byte_offset(&self.editor, row, col)
     }
     pub fn input_position(&self) -> (usize, Option<(usize, usize)>) {
-        let editor = self
-            .temporary_draft
-            .as_ref()
-            .map_or(&self.editor, |saved| &saved.draft.editor);
+        let editor = &self.editor;
         let ratatui_textarea::DataCursor(row, col) = editor.cursor();
         let selection = editor.selection_range().and_then(|((a, b), (c, d))| {
             let start = editor_byte_offset(editor, a, b);
@@ -876,38 +862,6 @@ impl View {
         self.editor = draft.editor;
         self.editor_size = None;
         self.reply_label = draft.label;
-    }
-    pub fn temporary_draft_text(&self) -> Option<String> {
-        self.temporary_draft
-            .as_ref()
-            .map(|draft| draft.draft.editor.lines().join("\n"))
-    }
-    pub fn begin_temporary_draft(&mut self) {
-        if self.temporary_draft.is_none() {
-            let draft = self.draft_snapshot();
-            self.enter_layer();
-            let parent = self.layers.pop().unwrap();
-            let layers = std::mem::take(&mut self.layers);
-            self.temporary_draft = Some(TemporaryDraft {
-                draft,
-                layers,
-                parent,
-            });
-            self.editor = new_editor();
-            self.reply_label.clear();
-            self.focus = Focus::Input;
-        }
-    }
-    pub fn restore_temporary_draft(&mut self) -> bool {
-        if let Some(saved) = self.temporary_draft.take() {
-            self.restore_draft(saved.draft);
-            self.layers = saved.layers;
-            self.layers.push(saved.parent);
-            self.close_layer();
-            true
-        } else {
-            false
-        }
     }
     pub fn open_picker(&mut self, kind: PickerKind, items: Vec<PickerItem>, query: String) {
         self.enter_layer();
@@ -1179,7 +1133,7 @@ impl View {
         } else if self.focus == Focus::Sessions {
             self.notify("返回输入区后再粘贴 · Shift↓");
         } else if self.show_activity {
-            self.notify("先按 Esc 或 F6 返回编辑，再粘贴到草稿");
+            self.notify("先按 Esc 或 Shift↓ 返回编辑，再粘贴到草稿");
         } else if self.show_help || self.detail.is_some() {
             self.notify("先按 Esc 返回输入，再粘贴到草稿");
         } else {
@@ -1353,24 +1307,6 @@ impl View {
         match key.code {
             KeyCode::F(2) => {
                 self.toggle_inspector();
-                return;
-            }
-            KeyCode::F(6) => {
-                if self.show_activity {
-                    self.close_layer();
-                }
-                self.focus = if self.focus == Focus::Input {
-                    Focus::Conversation
-                } else {
-                    Focus::Input
-                };
-                if self.focus == Focus::Conversation
-                    && self.message_selected.is_none()
-                    && !self.messages.is_empty()
-                {
-                    self.message_selected = Some(self.messages.len() - 1);
-                    self.cache_dirty = true;
-                }
                 return;
             }
             KeyCode::Tab | KeyCode::BackTab if self.focus != Focus::Input => return,
@@ -2589,7 +2525,6 @@ fn picker_title(kind: PickerKind) -> &'static str {
         PickerKind::Connection => "连接",
         PickerKind::History => "搜索历史",
         PickerKind::Question => "问题",
-        PickerKind::Reconcile => "核对变更",
     }
 }
 fn message_key(message: &Message) -> String {

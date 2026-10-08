@@ -46,17 +46,17 @@ pub fn tool_definitions(
 
 /// Inspect saved sessions without taking execution ownership.
 pub fn sessions(data_dir: &Path) -> anyhow::Result<Vec<state::SessionState>> {
-    store::Store::open(data_dir.join("sessions.sqlite3"))?.list_sessions()
+    store::Store::open(data_dir.join("sessions.sqlite"))?.list_sessions()
 }
 
 /// Read one persisted snapshot. Changing this detached value cannot change a session.
 pub fn session(data_dir: &Path, id: &str) -> anyhow::Result<state::SessionState> {
-    store::Store::open(data_dir.join("sessions.sqlite3"))?.load_session(id)
+    store::Store::open(data_dir.join("sessions.sqlite"))?.load_session(id)
 }
 
 /// Read original event records, including material summarized for model context.
 pub fn history(data_dir: &Path, id: &str) -> anyhow::Result<Vec<state::Event>> {
-    let store = store::Store::open(data_dir.join("sessions.sqlite3"))?;
+    let store = store::Store::open(data_dir.join("sessions.sqlite"))?;
     store.load_session(id)?;
     store.events(id)
 }
@@ -76,7 +76,7 @@ pub fn history_page(
     after: Option<&str>,
     limit: usize,
 ) -> anyhow::Result<HistoryPage> {
-    let store = store::Store::open(data_dir.join("sessions.sqlite3"))?;
+    let store = store::Store::open(data_dir.join("sessions.sqlite"))?;
     store.load_session(id)?;
     let (events, has_more) = store.history_page(id, after, limit)?;
     let next_cursor = events.last().map(|event| event.id.clone());
@@ -95,7 +95,7 @@ pub fn history_before(
     before: Option<&str>,
     limit: usize,
 ) -> anyhow::Result<HistoryPage> {
-    let store = store::Store::open(data_dir.join("sessions.sqlite3"))?;
+    let store = store::Store::open(data_dir.join("sessions.sqlite"))?;
     store.load_session(id)?;
     let (events, has_more) = store.history_before(id, before, limit)?;
     let next_cursor = events.first().map(|event| event.id.clone());
@@ -122,7 +122,7 @@ pub fn history_search(
     query: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<HistoryMatch>> {
-    let store = store::Store::open(data_dir.join("sessions.sqlite3"))?;
+    let store = store::Store::open(data_dir.join("sessions.sqlite"))?;
     store.load_session(id)?;
     store.history_search(id, query, limit)
 }

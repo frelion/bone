@@ -32,7 +32,7 @@ fn modal_paste_targets_query_and_never_mutates_hidden_draft() {
     assert_eq!(view.cursor(), cursor);
     assert_eq!(view.focus, Focus::Activity);
     assert!(view.show_activity);
-    assert!(view.notice.contains("F6"));
+    assert!(view.notice.contains("Shift↓"));
 }
 
 #[test]
@@ -355,7 +355,7 @@ fn renders_narrow_wide_and_modal_views_without_terminal_controls() {
             assert!(text.replace(' ', "").contains("原生事件"));
             view.handle_key(key(KeyCode::Esc));
             assert_eq!(view.focus, Focus::Input);
-            view.handle_key(key(KeyCode::F(6)));
+            view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
             assert_eq!(view.focus, Focus::Conversation);
         }
         view.show_help = true;
@@ -639,7 +639,7 @@ fn narrow_conversation_focus_selects_latest_and_tool_status_is_explicit() {
     terminal
         .draw(|f| view.render(f, &state, "m", "idle"))
         .unwrap();
-    view.handle_key(key(KeyCode::F(6)));
+    view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
     assert_eq!(view.focus, Focus::Conversation);
     assert_eq!(view.selected_message_id(), Some("latest"));
     for (text, state, color) in [
@@ -701,55 +701,13 @@ fn reading_layers_return_to_parent_and_preserve_draft_selection_and_undo() {
 }
 
 #[test]
-fn temporary_reconciliation_draft_restores_reader_and_original_editor() {
+fn tab_keeps_input_and_conversation_focus() {
     let mut view = View::new();
-    view.paste("草稿👩‍💻");
-    view.reply_label = "回答 Q1".into();
-    view.handle_key(KeyEvent::new(
-        KeyCode::Left,
-        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-    ));
-    let cursor = view.cursor();
-    view.open_detail("旧结果", "captured result");
-    view.detail_scroll = 13;
-    view.begin_temporary_draft();
-    assert!(!view.has_modal());
-    assert_eq!(view.focus, Focus::Input);
-    assert_eq!(view.temporary_draft_text().as_deref(), Some("草稿👩‍💻"));
-    view.paste("核查备注");
-    view.open_detail("核查证据", "evidence");
-    view.close_layer();
-    assert_eq!(view.draft(), "核查备注");
-    assert!(view.restore_temporary_draft());
-    assert_eq!(
-        view.detail.as_ref().map(|detail| detail.0.as_str()),
-        Some("旧结果")
-    );
-    assert_eq!(view.detail_scroll, 13);
-    assert_eq!(view.draft(), "草稿👩‍💻");
-    assert_eq!(view.reply_label, "回答 Q1");
-    view.close_layer();
-    assert_eq!(view.cursor(), cursor);
-    assert_eq!(view.selected_input_text().as_deref(), Some("👩‍💻"));
-}
-
-#[test]
-fn tab_keeps_focus_and_f6_switches_reading_and_input() {
-    let mut view = View::new();
-    view.push_message(Message {
-        kind: MessageKind::Delivery,
-        text: "delivery".into(),
-        event_id: Some("e".into()),
-        summary: None,
-    });
     view.handle_key(key(KeyCode::Tab));
     assert_eq!(view.focus, Focus::Input);
-    view.handle_key(key(KeyCode::F(6)));
-    assert_eq!(view.focus, Focus::Conversation);
+    view.focus = Focus::Conversation;
     view.handle_key(key(KeyCode::Tab));
     assert_eq!(view.focus, Focus::Conversation);
-    view.handle_key(key(KeyCode::F(6)));
-    assert_eq!(view.focus, Focus::Input);
 }
 
 #[test]
@@ -1264,12 +1222,12 @@ fn composer_keeps_chinese_first_character_and_native_cursor_through_wrap_and_foc
             terminal.backend().buffer()[(input_x + 2, position.y)].symbol(),
             "尾"
         );
-        view.handle_key(key(KeyCode::F(6)));
+        view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
         terminal
             .draw(|frame| view.render(frame, &state, "m", "暂无活动调用"))
             .unwrap();
         assert!(!terminal.backend().cursor_visible());
-        view.handle_key(key(KeyCode::F(6)));
+        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
         view.open_completion(
             PickerKind::Command,
             vec![PickerItem {
@@ -2097,26 +2055,4 @@ fn persisted_input_position_rejects_invalid_ranges_and_aligns_caret_safely() {
     view.paste(text);
     view.restore_input_position(None, None);
     assert_eq!(view.input_position(), (text.len(), None));
-}
-
-#[test]
-fn persisted_input_position_uses_original_draft_during_temporary_notes() {
-    let mut view = View::new();
-    view.paste("原稿中文👩‍💻e\u{301}");
-    view.handle_key(KeyEvent::new(
-        KeyCode::Left,
-        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-    ));
-    let original = view.input_position();
-    view.begin_temporary_draft();
-    view.paste("核查备注");
-    view.handle_key(key(KeyCode::Left));
-    assert_ne!(view.cursor(), original.0);
-    assert_eq!(view.input_position(), original);
-    assert_eq!(
-        view.temporary_draft_text().as_deref(),
-        Some("原稿中文👩‍💻e\u{301}")
-    );
-    assert!(view.restore_temporary_draft());
-    assert_eq!(view.input_position(), original);
 }

@@ -322,21 +322,280 @@ async fn new_instruction_blocks_unstarted_write_proposals() {
     assert_eq!(engine.result(&newest).unwrap().kind, "delivery");
 }
 
+fn tool_evidence(event: &bone::state::Event) -> Value {
+    use rig_core::message::{ToolResultContent, UserContent};
+    let message: rig_core::completion::Message =
+        serde_json::from_value(event.data["message"].clone()).unwrap();
+    let rig_core::completion::Message::User { content } = message else {
+        panic!("tool result must be a native user message");
+    };
+    let UserContent::ToolResult(result) = &content[0] else {
+        panic!("missing native tool result");
+    };
+    let ToolResultContent::Text(text) = &result.content[0] else {
+        panic!("missing structured tool evidence");
+    };
+    serde_json::from_str(&text.text).unwrap()
+}
+
+fn shell_results(engine: &bone::runtime::Engine) -> Vec<bone::state::Event> {
+    engine
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "tool_result" && event.data["tool_name"] == "shell")
+        .collect()
+}
+
+#[test]
+fn cli_natural_pause_commits_the_live_child_shell_result_before_run_or_resume_exits() {
+    for entry in ["run", "resume"] {
+        let command = if cfg!(windows) {
+            "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write('stdout-before-cli-pause'); [IO.File]::AppendAllText('effect.txt', 'CLI_SHELL_APPEND_ONCE'); [Threading.Thread]::Sleep(20000); [IO.File]::WriteAllText('late.txt', 'too late')\""
+        } else {
+            "printf stdout-before-cli-pause; printf CLI_SHELL_APPEND_ONCE >> effect.txt; sleep 20; printf 'too late' > late.txt"
+        };
+        let mut assign = tool(
+            "job_send",
+            json!({"title":"Child","message":"Produce partial shell evidence and remain running."}),
+            "call_assign_live_child",
+        );
+        assign["match_job_title"] = json!("Conversation");
+        let mut inspect = tool(
+            "read_file",
+            json!({"path":"effect.txt"}),
+            "call_observe_partial_effect",
+        );
+        inspect["match_job_title"] = json!("Conversation");
+        // Allow the concurrently started child to reach its append. The next
+        // request must contain the actual file evidence before it can pause.
+        inspect["delay_seconds"] = json!(3);
+        let mut shell = tool(
+            "shell",
+            json!({"command":command,"timeout_seconds":30}),
+            "call_child_partial",
+        );
+        shell["match_job_title"] = json!("Child");
+        let mut pause = tool("pause_work", json!({}), "call_natural_pause");
+        pause["match_job_title"] = json!("Conversation");
+        pause["contains"] = json!(["CLI_SHELL_APPEND_ONCE", "sha256"]);
+        let fixture = Fixture::turns(json!([assign, inspect, shell, pause]));
+        let prompt = "Start the child, inspect its partial effect, then pause all work.";
+        let (output, result) = if entry == "run" {
+            fixture.run(prompt, None, &["--max-parallel", "2"])
+        } else {
+            let mut engine = fixture.engine(None, bone::runtime::RunOptions::default());
+            engine.post(prompt, None).unwrap();
+            let session = engine.state().id.clone();
+            drop(engine);
+            let mut cli = fixture.command();
+            cli.arg("resume").arg(session).args([
+                "--profile",
+                "fixture",
+                "--json",
+                "--max-parallel",
+                "2",
+            ]);
+            let output = bounded_output(cli);
+            let result = serde_json::from_slice(&output.stdout).expect("CLI resume JSON document");
+            (output, result)
+        };
+        assert!(
+            output.status.success(),
+            "{entry} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            result["status"], "paused",
+            "{entry} did not naturally pause"
+        );
+        let session = result["session_id"].as_str().unwrap();
+        let input = result["input_id"].as_str().unwrap();
+        // Read SQLite without reopening an Engine: recovery must not synthesize
+        // the result that the CLI was required to commit before returning.
+        let events = bone::history(&fixture.data, session).unwrap();
+        let assigned = events
+            .iter()
+            .find(|event| {
+                event.kind == "input"
+                    && event.data["source"] == "job"
+                    && event.data["sender_input"] == input
+            })
+            .unwrap();
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == "tool_started" && event.data["tool_name"] == "shell")
+            .collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "{entry} repeated the original shell attempt"
+        );
+        let results: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == "tool_result" && event.data["tool_name"] == "shell")
+            .collect();
+        assert_eq!(
+            results.len(),
+            1,
+            "{entry} exited without one real terminal result"
+        );
+        let started = starts[0];
+        let stopped = results[0];
+        assert_eq!(stopped.call_id, started.call_id);
+        assert_eq!(stopped.job_id, assigned.job_id);
+        assert_eq!(stopped.reply_to.as_deref(), Some(assigned.id.as_str()));
+        assert_eq!(stopped.root_input.as_deref(), Some(input));
+        assert_eq!(stopped.data["tool_key"], started.data["tool_key"]);
+        assert_eq!(stopped.data["uncertain"], true);
+        let evidence = tool_evidence(stopped);
+        assert_eq!(evidence["stdout"], "stdout-before-cli-pause");
+        assert_eq!(evidence["error"], "shell stopped by user");
+        assert!(evidence.get("exit_code").is_some());
+        let message: rig_core::completion::Message =
+            serde_json::from_value(stopped.data["message"].clone()).unwrap();
+        let rig_core::completion::Message::User { content } = message else {
+            panic!("expected native result");
+        };
+        let rig_core::message::UserContent::ToolResult(native) = &content[0] else {
+            panic!("expected native result part");
+        };
+        let proposal_id = started.data["tool_key"]
+            .as_str()
+            .unwrap()
+            .split(':')
+            .next()
+            .unwrap();
+        let proposal = events.iter().find(|event| event.id == proposal_id).unwrap();
+        let response: rig_core::completion::CompletionResponse =
+            serde_json::from_value(proposal.data["response"].clone()).unwrap();
+        let proposed = response.tool_calls().next().unwrap();
+        assert_eq!(native.call, proposed.id);
+        assert_eq!(native.name, proposed.function.name);
+        assert!(
+            events
+                .iter()
+                .position(|event| event.kind == "input_paused")
+                .unwrap()
+                < events
+                    .iter()
+                    .position(|event| event.id == stopped.id)
+                    .unwrap(),
+            "shell had already finished before the natural pause"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap(),
+            "CLI_SHELL_APPEND_ONCE"
+        );
+        assert!(!fixture.workspace.join("late.txt").exists());
+        assert_eq!(fixture.request_count(), 4);
+        let reopened = fixture.engine(Some(session), bone::runtime::RunOptions::default());
+        assert_eq!(shell_results(&reopened).len(), 1);
+        assert_eq!(shell_results(&reopened)[0].id, stopped.id);
+        assert!(
+            reopened
+                .state()
+                .jobs
+                .values()
+                .all(|job| job.current_call.is_none())
+        );
+    }
+}
+
 #[tokio::test]
-async fn interrupted_write_survives_restart_and_requires_reconciliation() {
+async fn timed_out_partial_write_is_checked_and_followed_by_a_new_write_without_a_manual_gate() {
+    let timeout_seconds = if cfg!(windows) { 3 } else { 1 };
     let command = if cfg!(windows) {
-        "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::AppendAllText('effect.txt', 'x'); [Threading.Thread]::Sleep(5000)\""
+        "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::AppendAllText('effect.txt', 'x'); [Console]::Out.Write('observed-before-timeout'); [Threading.Thread]::Sleep(5000); [IO.File]::WriteAllText('late.txt', 'too late')\""
     } else {
-        "printf x >> effect.txt; sleep 5"
+        "printf x >> effect.txt; printf observed-before-timeout; sleep 5; printf 'too late' > late.txt"
+    };
+    let mut inspect = tool(
+        "read_file",
+        json!({"path":"effect.txt"}),
+        "call_inspect_effect",
+    );
+    inspect["contains"] = json!(["observed-before-timeout"]);
+    let mut finish = tool(
+        "write_file",
+        json!({"path":"checked.txt","content":"Verified one partial append","expected_sha256":null}),
+        "call_record_check",
+    );
+    finish["contains"] = json!(["sha256", "effect.txt"]);
+    let fixture = Fixture::turns(json!([
+        tool("shell",json!({"command":command,"timeout_seconds":timeout_seconds}),"call_append_once"),
+        inspect,
+        finish,
+        {"contains":["Verified one partial append"],"text":"Inspected the partial append and completed the followup write."}
+    ]));
+    let mut engine = fixture.engine(None, bone::runtime::RunOptions::default());
+    let input = engine
+        .post(
+            "Append once, inspect the result if interrupted, and record the check.",
+            None,
+        )
+        .unwrap();
+    drive_until_result(&mut engine, &input).await;
+    assert_eq!(engine.result(&input).unwrap().kind, "delivery");
+    assert_eq!(fixture.request_count(), 4);
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap(),
+        "x"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("checked.txt")).unwrap(),
+        "Verified one partial append"
+    );
+    assert!(
+        !fixture.workspace.join("late.txt").exists(),
+        "timed-out process continued writing"
+    );
+    let results = shell_results(&engine);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].data["uncertain"], true);
+    let evidence = tool_evidence(&results[0]);
+    assert_eq!(evidence["stdout"], "observed-before-timeout");
+    assert!(
+        evidence.get("exit_code").is_some(),
+        "interruption lost process termination evidence"
+    );
+    let events = engine.events().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "tool_started" && event.data["tool_name"] == "shell")
+            .count(),
+        1,
+        "original append replayed"
+    );
+    assert_effect_ownership(
+        &events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[tokio::test]
+async fn explicit_stop_drains_the_owned_tool_and_restart_can_inspect_and_write_normally() {
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write('observed-before-stop'); [IO.File]::AppendAllText('effect.txt', 'x'); [Threading.Thread]::Sleep(5000); [IO.File]::WriteAllText('late.txt', 'too late')\""
+    } else {
+        "printf observed-before-stop; printf x >> effect.txt; sleep 5; printf 'too late' > late.txt"
     };
     let fixture = Fixture::turns(json!([
         tool("shell",json!({"command":command,"timeout_seconds":10}),"call_append_once"),
         tool("read_file",json!({"path":"effect.txt"}),"call_inspect_effect"),
-        {"text":"Effect observed; waiting for explicit reconciliation"},
-        {"contains":["already appended once"],"text":"Observed append reconciled without replay"}
+        tool("write_file",json!({"path":"checked.txt","content":"Observed append once","expected_sha256":null}),"call_record_check"),
+        {"contains":["Observed append once"],"text":"Observed the interrupted append and completed the check without replay."}
     ]));
     let mut engine = fixture.engine(None, bone::runtime::RunOptions::default());
-    let input = engine.post("Append once to effect.txt", None).unwrap();
+    let input = engine
+        .post(
+            "Append once to effect.txt and record the observed result.",
+            None,
+        )
+        .unwrap();
     let session = engine.state().id.clone();
     tokio::time::timeout(Duration::from_secs(10), async {
         while !fixture.workspace.join("effect.txt").exists() {
@@ -351,53 +610,87 @@ async fn interrupted_write_survives_restart_and_requires_reconciliation() {
     .await
     .unwrap();
     engine.stop().unwrap();
-    assert_eq!(engine.state().unknown_writes.len(), 1);
-    let call = engine.state().unknown_writes.keys().next().unwrap().clone();
+    assert!(engine.state().paused);
+    support::drive_until(&mut engine, Duration::from_secs(5), |engine| {
+        !shell_results(engine).is_empty()
+    })
+    .await;
+    assert!(
+        engine
+            .state()
+            .jobs
+            .values()
+            .all(|job| job.current_call.is_none()),
+        "stop returned a terminal fact before the owned tool drained"
+    );
+    let stopped = shell_results(&engine);
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0].data["uncertain"], true);
+    assert_eq!(tool_evidence(&stopped[0])["stdout"], "observed-before-stop");
+    assert!(!fixture.workspace.join("late.txt").exists());
     drop(engine);
     let mut restored = fixture.engine(Some(&session), bone::runtime::RunOptions::default());
-    assert!(restored.state().unknown_writes.contains_key(&call));
+    assert_eq!(
+        shell_results(&restored).len(),
+        1,
+        "restart duplicated an already recorded interruption"
+    );
     restored.resume().unwrap();
     drive_until_result(&mut restored, &input).await;
+    assert_eq!(restored.result(&input).unwrap().kind, "delivery");
+    assert_eq!(fixture.request_count(), 4);
     assert_eq!(
-        fixture.request_count(),
-        3,
-        "read-only inspection did not follow the scripted path"
+        std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap(),
+        "x"
     );
-    assert_ne!(
-        restored.result(&input).unwrap().kind,
-        "delivery",
-        "unreconciled write reported successful completion"
+    assert_eq!(
+        std::fs::read_to_string(fixture.workspace.join("checked.txt")).unwrap(),
+        "Observed append once"
     );
     assert_eq!(
         restored
             .events()
             .unwrap()
-            .into_iter()
+            .iter()
             .filter(|event| event.kind == "tool_started" && event.data["tool_name"] == "shell")
             .count(),
-        1,
-        "interrupted append was replayed"
+        1
     );
-    assert!(restored.state().unknown_writes.contains_key(&call));
+}
+
+#[tokio::test]
+async fn an_uncertain_tool_fact_does_not_block_an_unrelated_valid_reply() {
+    let timeout_seconds = if cfg!(windows) { 3 } else { 1 };
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write('partial'); [Threading.Thread]::Sleep(5000)\""
+    } else {
+        "printf partial; sleep 5"
+    };
+    let fixture = Fixture::turns(json!([
+        tool("shell", json!({"command":command,"timeout_seconds":timeout_seconds}), "call_interrupted"),
+        {"contains":["Explain what a byte is"],"text":"A byte contains eight bits."}
+    ]));
+    let mut engine = fixture.engine(None, bone::runtime::RunOptions::default());
+    engine.post("Perform this command", None).unwrap();
+    support::drive_until(&mut engine, Duration::from_secs(8), |engine| {
+        !shell_results(engine).is_empty()
+    })
+    .await;
+    let question = engine.post_message("Explain what a byte is").unwrap();
+    drive_until_result(&mut engine, &question).await;
+    assert_eq!(engine.result(&question).unwrap().kind, "delivery");
     assert_eq!(
-        std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap(),
-        "x"
+        engine
+            .event_text(engine.result(&question).unwrap())
+            .unwrap(),
+        "A byte contains eight bits."
     );
-    restored
-        .resolve_write(
-            &call,
-            "Inspected effect.txt: already appended once; do not append again",
-        )
-        .unwrap();
-    assert!(restored.state().unknown_writes.is_empty());
-    restored.resume().unwrap();
-    drive_until_result(&mut restored, &input).await;
+    assert_eq!(shell_results(&engine).len(), 1);
     assert_eq!(
-        std::fs::read_to_string(fixture.workspace.join("effect.txt")).unwrap(),
-        "x"
+        shell_results(&engine)[0].data["uncertain"],
+        true,
+        "valid reply erased the old uncertainty fact"
     );
-    assert_eq!(fixture.request_count(), 4);
-    assert_eq!(restored.result(&input).unwrap().kind, "delivery");
 }
 
 #[test]

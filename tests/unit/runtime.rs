@@ -17,6 +17,43 @@ fn profile_switch_validates_before_mutation_and_preserves_paused_session() {
     assert_eq!(serde_json::to_value(&engine.state).unwrap(), before);
 }
 
+#[tokio::test]
+async fn profile_switch_preserves_an_in_flight_call_and_changes_future_recipe() {
+    let (_directory, mut engine) = fixture_engine();
+    let input = engine.post("keep working", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let job = engine.state.focus.clone().unwrap();
+    let origin = Origin {
+        job: job.clone(),
+        input: input.clone(),
+        root: input,
+        call: new_id(),
+        revision: engine.state.revision,
+    };
+    let task = tokio::spawn(std::future::pending::<()>());
+    engine.running.insert(
+        origin.call.clone(),
+        Running {
+            origin: origin.clone(),
+            abort: task.abort_handle(),
+            tool: None,
+            cancellation: None,
+        },
+    );
+    engine.state.jobs.get_mut(&job).unwrap().state = JobState::Running;
+    engine.state.jobs.get_mut(&job).unwrap().current_call = Some(origin.call.clone());
+    let before = engine.state.clone();
+    assert!(!engine.is_quiescent());
+    engine
+        .set_profile(Profile::from_model("ollama:next").unwrap(), "next".into())
+        .unwrap();
+    assert_eq!(engine.profile_recipe().0, "next");
+    assert_eq!(engine.state, before);
+    assert!(engine.running.contains_key(&origin.call));
+    assert!(!task.is_finished());
+    task.abort();
+}
+
 fn progress_origin(revision: u64) -> Origin {
     Origin {
         job: "job".into(),
@@ -98,11 +135,7 @@ fn model_progress_drops_stale_revisions_and_stop_clears_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aborted_write_keeps_ownership_until_its_future_actually_exits() {
     let workspace = tempfile::tempdir().unwrap();
-    let mut lease = WriteLease::acquire(workspace.path(), "session", "call")
-        .unwrap()
-        .unwrap();
-    lease.arm("session", "call", workspace.path()).unwrap();
-    let marker = lease.marker.clone();
+    let lease = WriteLease::acquire(workspace.path()).unwrap().unwrap();
     let task_lock = Arc::clone(&lease.file);
     let (entered, started) = tokio::sync::oneshot::channel();
     let (release, blocked) = std::sync::mpsc::channel();
@@ -113,28 +146,116 @@ async fn aborted_write_keeps_ownership_until_its_future_actually_exits() {
         // until its current poll finishes.
         let _ = blocked.recv();
     });
-    lease.task = Some(task.abort_handle());
     started.await.unwrap();
     task.abort();
     assert!(!task.is_finished());
-    assert!(lease.ensure_stopped().is_err());
-    assert!(lease.clear().is_err());
-    // The engine's lease is now dropped. Another owner still cannot clear
-    // the marker because the physical task retains the same locked file.
-    assert!(WriteLease::lock_existing(workspace.path(), "session", "call").is_err());
-    assert!(marker.exists());
+    drop(lease);
+    // Aborting a task cannot release ownership while its poll still runs.
+    assert!(WriteLease::acquire(workspace.path()).unwrap().is_none());
     release.send(()).unwrap();
     let _ = task.await;
-    WriteLease::lock_existing(workspace.path(), "session", "call")
-        .unwrap()
-        .clear()
-        .unwrap();
-    assert!(!marker.exists());
+    let next = WriteLease::acquire(workspace.path()).unwrap().unwrap();
+    drop(next);
+    assert!(WriteLease::acquire(workspace.path()).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn stop_collects_tool_result_before_releasing_ownership_and_allows_new_work() {
+    let (_directory, mut engine) = fixture_engine();
+    let input = engine.post("run a build", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let job = engine.state.focus.clone().unwrap();
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Write('before stop'); while ($true) { [Threading.Thread]::Sleep(10) }\""
+    } else {
+        "printf 'before stop'; while :; do sleep 0.01; done"
+    };
+    engine.drain_tool_progress();
+    let tool = native_proposal(&mut engine, &job, "shell", json!({"command":command}));
+    engine.start_tool(&job, tool).unwrap();
+    let call = engine.state.jobs[&job].current_call.clone().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if engine
+                .drain_tool_progress()
+                .iter()
+                .any(|record| record.stdout.contains("before stop"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    engine.stop().unwrap();
+    assert!(engine.state.paused);
+    assert_eq!(engine.state.jobs[&job].state, JobState::Running);
+    assert_eq!(engine.state.jobs[&job].current_call.as_ref(), Some(&call));
+    assert!(!engine.is_quiescent());
     assert!(
-        WriteLease::acquire(workspace.path(), "next", "next-call")
+        WriteLease::acquire(&engine.state.workspace)
             .unwrap()
-            .is_some()
+            .is_none()
     );
+    engine.resume().unwrap();
+    assert_eq!(engine.state.jobs[&job].current_call.as_ref(), Some(&call));
+    assert!(engine.running.contains_key(&call));
+    engine
+        .post("Use the new constraint after stopping", None)
+        .unwrap();
+    engine.prepare_pending_input().unwrap();
+    assert_eq!(engine.state.jobs[&job].active_input.as_ref(), Some(&input));
+    assert_eq!(engine.state.jobs[&job].current_call.as_ref(), Some(&call));
+    assert!(
+        engine
+            .events()
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "tool_result")
+    );
+    engine.stop().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !engine.is_quiescent() {
+            engine.step().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(engine.state.jobs[&job].state, JobState::Paused);
+    assert!(engine.state.jobs[&job].current_call.is_none());
+    let results = engine
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "tool_result" && event.call_id.as_deref() == Some(&call))
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].reply_to.as_ref(), Some(&input));
+    assert_eq!(results[0].data["uncertain"], true);
+    let text = engine.readable_event(&results[0]).unwrap();
+    assert!(text.contains("before stop"));
+    assert!(text.contains("interrupted"));
+
+    engine.post("write the next result", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let tool = native_proposal(
+        &mut engine,
+        &job,
+        "write_file",
+        json!({
+            "path":"after-stop.txt","content":"new work","expected_sha256":null,
+        }),
+    );
+    engine.start_tool(&job, tool).unwrap();
+    let done = engine.tasks.join_next().await.unwrap().unwrap();
+    engine.complete(done).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(engine.state.workspace.join("after-stop.txt")).unwrap(),
+        "new work"
+    );
+    assert!(engine.pending_tools(&job).unwrap().is_empty());
 }
 
 #[test]
@@ -215,6 +336,97 @@ fn resumed_input_hides_historical_failure_until_new_result() {
     );
 }
 
+#[tokio::test]
+async fn mixed_queue_runs_internal_assignment_then_parks_old_user_until_resume() {
+    let (_directory, mut engine) = fixture_engine();
+    let older = engine.post("Original engineering work", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let newest = engine.post("Explain the current design", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let job = engine.state.focus.clone().unwrap();
+    let mut assignment = engine.event(
+        &job,
+        "input",
+        json!({"message":Message::user("Independent internal assignment"),"source":"job","sender_input":older}),
+    );
+    assignment.reply_to = None;
+    assignment.root_input = Some(older.clone());
+    let assigned = assignment.id.clone();
+    let mut state = engine.state.clone();
+    state
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .inbox
+        .push_back(assigned.clone());
+    engine.commit(state, vec![assignment]).unwrap();
+    assert_eq!(
+        engine.state.jobs[&job].inbox,
+        VecDeque::from([older.clone(), assigned.clone()])
+    );
+
+    let response = engine.event(
+        &job,
+        "model_message",
+        json!({
+            "response":native_response(Message::assistant("Here is the explanation")),
+        }),
+    );
+    let response_id = response.id.clone();
+    engine.append_history(&job, response).unwrap();
+    engine.admit_input(&job, &newest).unwrap();
+    engine.deliver(&job, &response_id).unwrap();
+    assert_eq!(engine.state.jobs[&job].state, JobState::Ready);
+    engine.schedule().unwrap();
+    assert_eq!(
+        engine.state.jobs[&job].active_input.as_ref(),
+        Some(&assigned)
+    );
+    assert_eq!(
+        engine.state.jobs[&job].inbox,
+        VecDeque::from([older.clone()])
+    );
+
+    let origin = engine
+        .running
+        .values()
+        .find(|running| running.origin.input == assigned)
+        .unwrap()
+        .origin
+        .clone();
+    engine
+        .complete(Completed::Model {
+            origin,
+            response: Ok(native_response(Message::assistant(
+                "Internal assignment completed",
+            ))),
+            covered: None,
+            stream_items: vec![],
+        })
+        .unwrap();
+    assert_eq!(engine.state.jobs[&job].state, JobState::Paused);
+    assert!(engine.state.jobs[&job].active_input.is_none());
+    assert_eq!(
+        engine.state.jobs[&job].inbox,
+        VecDeque::from([older.clone()])
+    );
+    engine.schedule().unwrap();
+    assert!(engine.state.jobs[&job].active_input.is_none());
+    assert!(
+        engine
+            .events()
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "model_started" || event.reply_to.as_ref() != Some(&older))
+    );
+
+    engine.resume().unwrap();
+    engine.schedule().unwrap();
+    assert_eq!(engine.state.jobs[&job].active_input.as_ref(), Some(&older));
+    assert_eq!(engine.state.jobs[&job].state, JobState::Running);
+    engine.stop().unwrap();
+}
+
 fn native_response(message: Message) -> CompletionResponse {
     let Message::Assistant { content, .. } = message else {
         panic!("expected assistant")
@@ -249,6 +461,91 @@ fn resolution_proposal(engine: &mut Engine, job: &str, resolutions: Value) -> Pe
         "input_resolve",
         json!({"resolutions":resolutions}),
     )
+}
+
+#[test]
+fn superseding_queued_ancestor_answers_current_native_call_once_without_moving_budget() {
+    let (_directory, mut engine) = fixture_engine();
+    let ancestor = engine.post("Original engineering request", None).unwrap();
+    engine.prepare_pending_input().unwrap();
+    let owner = engine.state.focus.clone().unwrap();
+    engine.admit_input(&owner, &ancestor).unwrap();
+    let send = native_proposal(
+        &mut engine,
+        &owner,
+        "job_send",
+        json!({
+            "title":"Relay","message":"Prepare a followup assignment",
+        }),
+    );
+    engine.internal_tool(&owner, &send).unwrap();
+    let relay = engine
+        .state
+        .jobs
+        .keys()
+        .find(|id| *id != &owner)
+        .unwrap()
+        .clone();
+    let mut state = engine.state.clone();
+    let job = state.jobs.get_mut(&relay).unwrap();
+    job.active_input = job.inbox.pop_front();
+    job.history.push(job.active_input.clone().unwrap());
+    engine.commit(state, vec![]).unwrap();
+    let returned = native_proposal(
+        &mut engine,
+        &relay,
+        "job_send",
+        json!({
+            "job_id":owner,"message":"Return the followup to the original context",
+        }),
+    );
+    engine.internal_tool(&relay, &returned).unwrap();
+    // Persist the reachable continuation: the returned assignment is active,
+    // while its original user ancestor remains queued in this same Job.
+    let mut state = engine.state.clone();
+    let job = state.jobs.get_mut(&owner).unwrap();
+    let active = job.inbox.pop_back().unwrap();
+    job.inbox
+        .push_front(job.active_input.replace(active.clone()).unwrap());
+    job.history.push(active.clone());
+    engine.commit(state, vec![]).unwrap();
+    assert!(engine.descendant_inputs(&ancestor).contains(&active));
+    let before = engine.state.budgets.clone();
+    let resolve = resolution_proposal(
+        &mut engine,
+        &owner,
+        json!([{
+            "input_id":ancestor,"outcome":"superseded","reason":"The original plan was withdrawn",
+        }]),
+    );
+    engine.internal_tool(&owner, &resolve).unwrap();
+
+    let results = engine
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "tool_result" && event.data["tool_key"] == resolve.key)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert_eq!(result.call_id.as_deref(), Some(resolve.key.as_str()));
+    assert_eq!(result.reply_to.as_ref(), Some(&active));
+    assert_eq!(result.root_input.as_ref(), Some(&ancestor));
+    let message: Message = serde_json::from_value(result.data["message"].clone()).unwrap();
+    let Message::User { content } = message else {
+        panic!("expected native tool result")
+    };
+    let [rig_core::message::UserContent::ToolResult(native)] = content.as_slice() else {
+        panic!("expected exactly one native result part")
+    };
+    assert_eq!(native.call, resolve.call.id);
+    assert_eq!(native.name, resolve.call.function.name);
+    assert!(engine.pending_tools(&owner).unwrap().is_empty());
+    assert_eq!(
+        engine.result(&active).unwrap().data["outcome"],
+        "superseded"
+    );
+    assert_eq!(engine.state.budgets, before);
 }
 
 #[test]
@@ -432,31 +729,13 @@ fn resolution_ownership_follows_handoff_queue_without_rewriting_original_input()
 }
 
 #[test]
-fn resolution_rejects_unknown_effects_unfinished_batches_and_live_descendants() {
+fn resolution_rejects_unfinished_batches_and_live_descendants() {
     let (_directory, mut engine) = fixture_engine();
     let old = engine.post("Original work", None).unwrap();
     engine.prepare_pending_input().unwrap();
     engine.post("Current work", None).unwrap();
     engine.prepare_pending_input().unwrap();
     let owner = engine.state.focus.clone().unwrap();
-    engine.state.unknown_writes.insert(
-        "unknown".into(),
-        UnknownWrite {
-            call_id: "unknown".into(),
-            job_id: owner.clone(),
-            root_input: Some(old.clone()),
-            tool_name: "shell".into(),
-        },
-    );
-    assert!(
-        engine
-            .ensure_input_resolvable(&owner, &old)
-            .unwrap_err()
-            .to_string()
-            .contains("write effects")
-    );
-    engine.state.unknown_writes.clear();
-
     let mut child = Job::new("Delegated work");
     child.state = JobState::Paused;
     let mut child_input = engine.event(
@@ -626,12 +905,8 @@ async fn thousands_of_large_events_stay_archived_across_repeated_summaries_and_r
     let original_event = events[1].clone();
     let mut state = engine.state.clone();
     let ids: Vec<_> = events.iter().map(|e| e.id.clone()).collect();
-    state
-        .jobs
-        .get_mut(&job_id)
-        .unwrap()
-        .history
-        .extend(ids.clone());
+    // Persist the summary and its already-compacted history atomically.
+    // The covered native events remain available in the immutable archive.
     let summary = engine.event(&job_id,"summary",json!({"response":native_response(Message::assistant("Exact evidence remains available through audit IDs.")),"covered_ids":ids}));
     state.jobs.get_mut(&job_id).unwrap().summary = Some(summary.id.clone());
     state.jobs.get_mut(&job_id).unwrap().public_revision = 1;
@@ -716,6 +991,7 @@ async fn thousands_of_large_events_stay_archived_across_repeated_summaries_and_r
                 origin: origin.clone(),
                 abort: task.abort_handle(),
                 tool: None,
+                cancellation: None,
             },
         );
         engine
@@ -821,7 +1097,7 @@ async fn idle_and_closed_jobs_do_not_keep_large_native_bodies_resident() {
 }
 
 #[tokio::test]
-async fn completion_transaction_failure_poison_blocks_actions_and_restart_recovers_unknown_write() {
+async fn completion_transaction_failure_poison_blocks_actions_and_restart_recovers_one_result() {
     use rig_core::message::{CallId, ToolFunction, ToolName};
     let (directory, mut engine) = fixture_engine();
     let input = engine.post("write once", None).unwrap();
@@ -857,11 +1133,8 @@ async fn completion_transaction_failure_poison_blocks_actions_and_restart_recove
     state.jobs.get_mut(&job).unwrap().state = JobState::Running;
     state.jobs.get_mut(&job).unwrap().current_call = Some(origin.call.clone());
     engine.commit(state, vec![started]).unwrap();
-    let lease = WriteLease::acquire(&engine.state.workspace, &engine.state.id, &origin.call)
+    let lease = WriteLease::acquire(&engine.state.workspace)
         .unwrap()
-        .unwrap();
-    lease
-        .arm(&engine.state.id, &origin.call, &engine.data_dir)
         .unwrap();
     engine.write_lease = Some(lease);
     let task = tokio::spawn(std::future::pending::<()>());
@@ -871,9 +1144,10 @@ async fn completion_transaction_failure_poison_blocks_actions_and_restart_recove
             origin: origin.clone(),
             abort: task.abort_handle(),
             tool: Some(tool.clone()),
+            cancellation: None,
         },
     );
-    let db = rusqlite::Connection::open(engine.data_dir.join("sessions.sqlite3")).unwrap();
+    let db = rusqlite::Connection::open(engine.data_dir.join("sessions.sqlite")).unwrap();
     db.execute_batch("CREATE TRIGGER reject_result BEFORE INSERT ON events WHEN json_extract(NEW.payload,'$.kind')='tool_result' BEGIN SELECT RAISE(ABORT,'injected completion commit failure'); END;").unwrap();
     assert!(
         engine
@@ -907,33 +1181,26 @@ async fn completion_transaction_failure_poison_blocks_actions_and_restart_recove
     let mut recovered = open_fixture_engine(directory.path(), &workspace, Some(&session));
     assert!(recovered.state.paused);
     assert_eq!(recovered.state.jobs[&job].state, JobState::Paused);
-    assert!(recovered.state.unknown_writes.contains_key(&origin.call));
-    recovered
-        .resolve_write(&origin.call, "inspected result; effect recorded")
-        .unwrap();
-    task.abort();
-}
-
-#[test]
-fn legacy_unknown_marker_migrates_without_disappearing_or_authorizing_new_writes() {
-    let workspace = tempfile::tempdir().unwrap();
-    let (_, legacy) = WriteLease::legacy_paths(workspace.path()).unwrap();
-    let info = json!({"session_id":"old","call_id":"unfinished"});
-    std::fs::write(&legacy, serde_json::to_vec(&info).unwrap()).unwrap();
-    assert!(WriteLease::acquire(workspace.path(), "new", "newcall").is_err());
-    let (_, stable) = WriteLease::paths(workspace.path()).unwrap();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&std::fs::read(&stable).unwrap()).unwrap(),
-        info
-    );
-    assert!(legacy.exists());
-    assert!(WriteLease::lock_existing(workspace.path(), "new", "newcall").is_err());
-    WriteLease::lock_existing(workspace.path(), "old", "unfinished")
+    let results = recovered
+        .events()
         .unwrap()
-        .clear()
-        .unwrap();
-    assert!(!legacy.exists());
-    assert!(!stable.exists());
+        .into_iter()
+        .filter(|event| {
+            event.kind == "tool_result" && event.call_id.as_deref() == Some(&origin.call)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].data["uncertain"], true);
+    assert!(
+        recovered
+            .readable_event(&results[0])
+            .unwrap()
+            .contains("\"effect\":\"unknown\"")
+    );
+    assert!(recovered.pending_tools(&job).unwrap().is_empty());
+    recovered.resume().unwrap();
+    assert!(WriteLease::acquire(&workspace).unwrap().is_some());
+    task.abort();
 }
 
 #[tokio::test]
@@ -1231,7 +1498,7 @@ async fn shell_progress_precedes_completion_and_keeps_final_output_after_new_inp
     let text = serde_json::to_string(&result.data).unwrap();
     assert!(text.contains("early 中文 final"));
     assert!(text.contains("warning"));
-    assert!(engine.state.unknown_writes.is_empty());
+    assert_eq!(result.data["uncertain"], false);
 }
 
 #[test]
@@ -1356,7 +1623,7 @@ fn independent_messages_and_explicit_question_replies_keep_their_routing() {
     assert_eq!(engine.state, before);
     assert!(engine.post("wrong target", Some(&independent)).is_err());
     assert_eq!(engine.state, before);
-    let automatic = engine.post("legacy automatic answer", None).unwrap();
+    let automatic = engine.post("automatic answer", None).unwrap();
     assert_eq!(
         engine.read_event(&automatic).unwrap().reply_to.as_ref(),
         Some(&second)

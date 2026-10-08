@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tokio::task::{AbortHandle, JoinSet};
 
 use crate::config::Profile;
-use crate::state::{Budget, Event, Job, JobState, SessionState, UnknownWrite, new_id};
+use crate::state::{Budget, Event, Job, JobState, SessionState, new_id};
 use crate::store::{SessionLease, Store};
 use crate::{context, model, tools};
 
@@ -67,6 +67,7 @@ struct Running {
     origin: Origin,
     abort: AbortHandle,
     tool: Option<PendingTool>,
+    cancellation: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 enum Completed {
@@ -247,7 +248,7 @@ impl Engine {
         std::fs::create_dir_all(data_dir)?;
         let workspace = workspace.canonicalize().context("workspace must exist")?;
         ensure!(workspace.is_dir(), "workspace must be a directory");
-        let store = Store::open(data_dir.join("sessions.sqlite3"))?;
+        let store = Store::open(data_dir.join("sessions.sqlite"))?;
         let (state, lease) = if let Some(id) = session_id {
             let lease = store.acquire_session(id)?;
             let prior = store.load_session(id)?;
@@ -292,17 +293,8 @@ impl Engine {
             started: Instant::now(),
             faulted: false,
         };
-        engine.restore_working_set()?;
-        engine.record_unknown_results()?;
-        engine.clear_confirmed_marker()?;
-        for write in engine.state.unknown_writes.values() {
-            WriteLease::restore_unknown(
-                &engine.state.workspace,
-                &engine.state.id,
-                &write.call_id,
-                data_dir,
-            )?;
-        }
+        engine.refresh_working_set()?;
+        engine.recover_tool_results()?;
         Ok(engine)
     }
 
@@ -523,40 +515,23 @@ impl Engine {
         state.paused = true;
         let mut additions = Vec::new();
         self.model_progress.clear();
-        if let Ok(mut calls) = self.tool_progress.calls.lock() {
-            calls.clear();
-        }
-        let running = std::mem::take(&mut self.running);
-        for (_, task) in running {
-            task.abort.abort();
-            if let Some(tool) = task.tool {
-                if tools::is_write(tool.call.function.name.as_str()) {
-                    state.unknown_writes.insert(
-                        task.origin.call.clone(),
-                        UnknownWrite {
-                            call_id: task.origin.call.clone(),
-                            job_id: task.origin.job.clone(),
-                            root_input: Some(task.origin.root.clone()),
-                            tool_name: tool.call.function.name.to_string(),
-                        },
-                    );
-                } else {
-                    let result = self.tool_result(
-                        &task.origin.job,
-                        &tool,
-                        json!({"cancelled":true}),
-                        Some(&task.origin),
-                        false,
-                    )?;
-                    state
-                        .jobs
-                        .get_mut(&task.origin.job)
-                        .unwrap()
-                        .history
-                        .push(result.id.clone());
-                    additions.push(result);
-                }
+        // External tools retain their futures and call ownership until their
+        // actual result arrives. Cancelling the future would discard that fact.
+        for task in self.running.values().filter(|task| task.tool.is_some()) {
+            if let Some(cancellation) = &task.cancellation {
+                let _ = cancellation.send(true);
             }
+        }
+        let models = self
+            .running
+            .iter()
+            .filter(|(_, task)| task.tool.is_none())
+            .map(|(call, _)| call.clone())
+            .collect::<Vec<_>>();
+        for call in models {
+            let task = self.running.remove(&call).unwrap();
+            task.abort.abort();
+            state.jobs.get_mut(&task.origin.job).unwrap().current_call = None;
             let mut event = self.event(
                 &task.origin.job,
                 "cancelled",
@@ -566,6 +541,13 @@ impl Engine {
             additions.push(event);
         }
         for job in state.jobs.values_mut() {
+            if job
+                .current_call
+                .as_ref()
+                .is_some_and(|call| self.running.contains_key(call))
+            {
+                continue;
+            }
             job.current_call = None;
             if matches!(
                 job.state,
@@ -581,8 +563,7 @@ impl Engine {
         );
         event.revision = state.revision;
         additions.push(event);
-        self.commit(state, additions)?;
-        self.record_unknown_results()
+        self.commit(state, additions)
     }
 
     pub fn resume(&mut self) -> Result<()> {
@@ -605,6 +586,13 @@ impl Engine {
             if state.jobs[&id].state != JobState::Paused {
                 continue;
             }
+            if state.jobs[&id]
+                .current_call
+                .as_ref()
+                .is_some_and(|call| self.running.contains_key(call))
+            {
+                continue;
+            }
             let blocked_active = state.jobs[&id]
                 .active_input
                 .as_deref()
@@ -622,12 +610,10 @@ impl Engine {
             if blocked_active && !has_independent {
                 continue;
             }
-            // An interrupted read can safely be abandoned, not silently repeated.
-            // A write's missing result remains blocked until explicit reconciliation.
+            // Started calls receive their result on completion or recovery.
+            // Abandon remaining interrupted proposals without repeating them.
             for pending in self.pending_tools(&id)? {
-                if (blocked_active || self.was_started(&pending.key))
-                    && !self.is_unknown_tool(&state, &pending)
-                {
+                if blocked_active || self.was_started(&pending.key) {
                     let event=self.tool_result(&id,&pending,json!({"interrupted":true,"instruction":"Inspect current state before deciding whether to try again."}),None,false)?;
                     state
                         .jobs
@@ -658,54 +644,18 @@ impl Engine {
         self.commit(state, additions)
     }
 
-    pub fn resolve_write(&mut self, call_id: &str, note: &str) -> Result<()> {
-        self.ensure_healthy()?;
-        ensure!(
-            !note.trim().is_empty(),
-            "record what was inspected and the observed outcome"
-        );
-        let unknown = self
-            .state
-            .unknown_writes
-            .get(call_id)
-            .context("unknown write was not found")?
-            .clone();
-        if let Some(lease) = &self.write_lease {
-            lease.ensure_stopped()?;
-        }
-        // The child may inherit the same kernel file description. Drop the
-        // parent's descriptor and reacquire independently before reconciliation.
-        drop(self.write_lease.take());
-        let lease = WriteLease::lock_existing(&self.state.workspace, &self.state.id, call_id)?;
-        let mut state = self.state.clone();
-        state.unknown_writes.remove(call_id);
-        let mut event=self.event(&unknown.job_id,"tool_reconciled",json!({"message":Message::user(format!("An interrupted write was inspected. Observed outcome: {note}. Do not replay that operation automatically."))}));
-        event.call_id = Some(call_id.to_owned());
-        event.root_input = unknown.root_input;
-        state
-            .jobs
-            .get_mut(&unknown.job_id)
-            .unwrap()
-            .history
-            .push(event.id.clone());
-        self.commit(state, vec![event])?;
-        lease.clear()?;
-        Ok(())
-    }
-
-    /// Replace the recipe used for future model calls while retaining the session lease.
-    /// The caller controls whether and when paused work resumes.
+    /// Replace only the recipe captured by future model calls.
     pub fn set_profile(&mut self, profile: Profile, profile_name: String) -> Result<()> {
         self.ensure_healthy()?;
-        ensure!(
-            self.is_quiescent(),
-            "profile can only change while the engine is quiescent"
-        );
         profile.validate()?;
         crate::config::validate_profile_name(&profile_name)?;
         self.profile = profile;
         self.profile_name = profile_name;
         Ok(())
+    }
+
+    pub fn profile_recipe(&self) -> (&str, &Profile) {
+        (&self.profile_name, &self.profile)
     }
 
     pub fn is_quiescent(&self) -> bool {
@@ -848,41 +798,6 @@ impl Engine {
             })
             .cloned()
             .collect()
-    }
-
-    fn restore_working_set(&mut self) -> Result<()> {
-        // Old snapshots may retain a cumulative history. Remove only IDs whose
-        // native contents are already represented by their committed summary.
-        let mut state = self.state.clone();
-        for job in state.jobs.values_mut() {
-            if let Some(summary_id) = &job.summary {
-                let summary = self.store.read_event(&state.id, summary_id)?;
-                let covered: Vec<String> =
-                    serde_json::from_value(summary.data["covered_ids"].clone())?;
-                let covered: BTreeSet<_> = covered.into_iter().collect();
-                job.history.retain(|id| {
-                    !covered.contains(id)
-                        || job.active_input.as_ref() == Some(id)
-                        || job.inbox.contains(id)
-                });
-            }
-            // An admitted input can enter history before older shared inputs.
-            // Only a committed model start proves sharing already happened.
-            let incorporated = self
-                .records()
-                .filter(|event| {
-                    event.kind == "model_started" && event.job_id.as_deref() == Some(&job.id)
-                })
-                .map(|event| event.revision)
-                .max()
-                .unwrap_or(0);
-            job.public_revision = job.public_revision.max(incorporated);
-        }
-        if state != self.state {
-            self.store.commit(&state, &[])?;
-            self.state = state;
-        }
-        self.refresh_working_set()
     }
 
     fn refresh_working_set(&mut self) -> Result<()> {
@@ -1049,7 +964,18 @@ impl Engine {
                 job.active_input = job
                     .inbox
                     .iter()
-                    .position(|input| !self.has_settled_ancestor(input))
+                    .position(|input| {
+                        !self.has_settled_ancestor(input)
+                            && self
+                                .events
+                                .get(input)
+                                .is_some_and(|event| event.data["source"] == "job")
+                    })
+                    .or_else(|| {
+                        job.inbox
+                            .iter()
+                            .position(|input| !self.has_settled_ancestor(input))
+                    })
                     .and_then(|index| job.inbox.remove(index));
                 if let Some(input) = &job.active_input {
                     if !job.history.contains(input) {
@@ -1181,62 +1107,54 @@ impl Engine {
         self.commit(state, Vec::new())
     }
 
-    fn record_unknown_results(&mut self) -> Result<()> {
-        let unknown = self
-            .state
-            .unknown_writes
-            .values()
+    fn recover_tool_results(&mut self) -> Result<()> {
+        let completed = self
+            .records()
+            .filter(|event| event.kind == "tool_result")
+            .filter_map(|event| event.data["tool_key"].as_str().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        let starts = self
+            .records()
+            .filter(|event| event.kind == "tool_started")
+            .filter(|event| {
+                event.data["tool_key"]
+                    .as_str()
+                    .is_some_and(|key| !completed.contains(key))
+            })
             .cloned()
             .collect::<Vec<_>>();
-        for write in unknown {
-            let start = self
-                .records()
-                .find(|e| e.kind == "tool_started" && e.call_id.as_deref() == Some(&write.call_id))
-                .context("unknown write has no start record")?;
+        for start in starts {
             let key = start.data["tool_key"]
                 .as_str()
-                .context("unknown write has no tool key")?
+                .context("started tool has no tool key")?
                 .to_owned();
-            if self
-                .records()
-                .any(|e| e.kind == "tool_result" && e.data["tool_key"].as_str() == Some(&key))
-            {
-                continue;
-            }
-            let pending = self
-                .pending_tools(&write.job_id)?
-                .into_iter()
-                .find(|p| p.key == key)
-                .context("unknown write has no native tool call")?;
-            let event=self.tool_result(&write.job_id,&pending,json!({"effect":"unknown","instruction":"Inspect the current state. Further writes are blocked until the user records reconciliation; never repeat this operation automatically."}),None,true)?;
-            self.append_history(&write.job_id, event)?;
-        }
-        Ok(())
-    }
-
-    fn clear_confirmed_marker(&self) -> Result<()> {
-        let (_, marker) = workspace_write_paths(&self.state.workspace)?;
-        if let Ok(bytes) = std::fs::read(&marker) {
-            let info: Value = serde_json::from_slice(&bytes)?;
-            if info["session_id"] == self.state.id
-                && let Some(call) = info["call_id"].as_str()
-            {
-                let confirmed = self.records().any(|e| {
-                    e.call_id.as_deref() == Some(call)
-                        && ((e.kind == "tool_result" && e.data["uncertain"] != true)
-                            || e.kind == "tool_reconciled")
-                });
-                if confirmed {
-                    match WriteLease::lock_existing(&self.state.workspace, &self.state.id, call) {
-                        Ok(lease) => lease.clear()?,
-                        Err(error)
-                            if error
-                                .downcast_ref::<std::io::Error>()
-                                .is_some_and(crate::filesystem::lock_contended) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-            }
+            let job = start.job_id.as_deref().context("started tool has no job")?;
+            let proposal_id = key.split(':').next().context("invalid tool key")?;
+            let proposal = self.read_event(proposal_id)?;
+            let response: CompletionResponse =
+                serde_json::from_value(proposal.data["response"].clone())?;
+            let call = response
+                .tool_calls()
+                .find(|call| {
+                    serde_json::to_string(&call.id)
+                        .is_ok_and(|call_id| key == format!("{proposal_id}:{call_id}"))
+                })
+                .context("started tool has no native proposal")?
+                .clone();
+            let pending = PendingTool { call, key };
+            let mut event = self.tool_result(
+                job,
+                &pending,
+                json!({"interrupted":true,"effect":"unknown","instruction":"The prior runtime ended without a tool result. Inspect current state before deciding on a new action; never automatically replay this call."}),
+                None,
+                true,
+            )?;
+            // Recovery belongs to the original call/input, including when a
+            // newer user message was queued before the process ended.
+            event.call_id = start.call_id;
+            event.reply_to = start.reply_to;
+            event.root_input = start.root_input;
+            self.append_history(job, event)?;
         }
         Ok(())
     }
@@ -1252,16 +1170,6 @@ impl Engine {
         self.records()
             .any(|e| e.kind == "tool_started" && e.data["tool_key"].as_str() == Some(key))
     }
-    fn is_unknown_tool(&self, state: &SessionState, tool: &PendingTool) -> bool {
-        self.records().any(|e| {
-            e.kind == "tool_started"
-                && e.data["tool_key"].as_str() == Some(&tool.key)
-                && e.call_id
-                    .as_ref()
-                    .is_some_and(|id| state.unknown_writes.contains_key(id))
-        })
-    }
-
     fn tool_result(
         &self,
         job: &str,
@@ -1508,13 +1416,13 @@ impl Engine {
                 origin,
                 abort,
                 tool: None,
+                cancellation: None,
             },
         );
         Ok(())
     }
 
     fn start_tool(&mut self, id: &str, tool: PendingTool) -> Result<()> {
-        self.clear_confirmed_marker()?;
         let name = tool.call.function.name.as_str();
         if self.options.read_only && tools::is_write(name) {
             let event = self.tool_result(
@@ -1526,14 +1434,8 @@ impl Engine {
             )?;
             return self.append_history(id, event);
         }
-        if tools::is_write(name) {
-            if !self.state.unknown_writes.is_empty() {
-                self.fail(id,"a previous write has unknown effects; inspect and reconcile it before further writes")?;
-                return Ok(());
-            }
-            if self.write_lease.is_some() {
-                return Ok(());
-            }
+        if tools::is_write(name) && self.write_lease.is_some() {
+            return Ok(());
         }
         let input = self.state.jobs[id].active_input.clone().unwrap();
         let origin = Origin {
@@ -1544,7 +1446,7 @@ impl Engine {
             revision: self.state.revision,
         };
         let lease = if tools::is_write(name) {
-            match WriteLease::acquire(&self.state.workspace, &self.state.id, &origin.call) {
+            match WriteLease::acquire(&self.state.workspace) {
                 Ok(Some(lease)) => Some(lease),
                 Ok(None) => return Ok(()),
                 Err(error) => {
@@ -1562,29 +1464,7 @@ impl Engine {
         let mut event=self.event(id,"tool_started",json!({"tool_key":tool.key,"tool_name":name,"effect":if tools::is_write(name){"write"}else{"read"}}));
         event.call_id = Some(origin.call.clone());
         self.commit(state, vec![event])?;
-        if let Some(write_guard) = &lease
-            && let Err(error) = write_guard.arm(&self.state.id, &origin.call, &self.data_dir)
-        {
-            let event = self.tool_result(
-                id,
-                &tool,
-                json!({"error":format!("write was not started: {error:#}")}),
-                Some(&origin),
-                false,
-            )?;
-            let mut state = self.state.clone();
-            let job = state.jobs.get_mut(id).unwrap();
-            job.current_call = None;
-            job.state = JobState::Ready;
-            job.history.push(event.id.clone());
-            self.commit(state, vec![event])?;
-            if let Some(lease) = lease {
-                lease.clear()?;
-            }
-            return Ok(());
-        }
         let task_write_lock = lease.as_ref().map(|lease| Arc::clone(&lease.file));
-        let task_legacy_lock = lease.as_ref().map(|lease| Arc::clone(&lease.legacy_file));
         self.write_lease = lease.or(self.write_lease.take());
         let workspace = self.state.workspace.clone();
         let task_origin = origin.clone();
@@ -1595,20 +1475,18 @@ impl Engine {
         let observer: tools::ToolObserver = Arc::new(move |stderr, bytes| {
             progress.push(&observed_origin, &observed_name, stderr, bytes);
         });
+        let (cancellation, cancelled) = tokio::sync::watch::channel(false);
         let abort = self.tasks.spawn(async move {
             // Cancellation cannot interrupt synchronous file operations. Keep
             // workspace ownership until this future is actually dropped.
             let _write_lock = task_write_lock;
-            let _legacy_lock = task_legacy_lock;
             let outcome = tools::execute_with_progress(
                 &workspace,
                 task_tool.call.function.name.as_str(),
                 &task_tool.call.function.arguments,
-                _write_lock
-                    .as_ref()
-                    .zip(_legacy_lock.as_ref())
-                    .map(|(stable, legacy)| [Arc::clone(stable), Arc::clone(legacy)]),
+                _write_lock.clone(),
                 Some(observer),
+                Some(cancelled),
             )
             .await;
             Completed::Tool {
@@ -1617,17 +1495,13 @@ impl Engine {
                 outcome,
             }
         });
-        if tools::is_write(name)
-            && let Some(lease) = self.write_lease.as_mut()
-        {
-            lease.task = Some(abort.clone());
-        }
         self.running.insert(
             origin.call.clone(),
             Running {
                 origin,
                 abort,
                 tool: Some(tool),
+                cancellation: Some(cancellation),
             },
         );
         Ok(())
@@ -1772,11 +1646,6 @@ impl Engine {
                             } else {
                                 self.commit(state, Vec::new())?;
                             }
-                        } else if !self.state.unknown_writes.is_empty() {
-                            self.fail(
-                                &origin.job,
-                                "cannot deliver success while write effects remain unknown",
-                            )?;
                         } else {
                             self.deliver(&origin.job, &response_event)?;
                         }
@@ -1794,45 +1663,38 @@ impl Engine {
                 let mut state = self.state.clone();
                 let job = state.jobs.get_mut(&origin.job).unwrap();
                 job.current_call = None;
-                job.state = JobState::Ready;
-                if outcome.uncertain {
-                    state.unknown_writes.insert(
-                        origin.call.clone(),
-                        UnknownWrite {
-                            call_id: origin.call.clone(),
-                            job_id: origin.job.clone(),
-                            root_input: Some(origin.root.clone()),
-                            tool_name: tool.call.function.name.to_string(),
-                        },
-                    );
-                    // A native placeholder records uncertainty without confirming the effect.
-                    job.state = JobState::Paused;
-                    let mut event = self.event(&origin.job, "write_unknown", outcome.content);
-                    event.call_id = Some(origin.call);
-                    self.commit(state, vec![event])?;
-                    self.record_unknown_results()?;
+                let superseded = self.terminal(&origin.input).is_some_and(|event| {
+                    event.kind == "input_resolved" && event.data["outcome"] == "superseded"
+                });
+                job.state = if superseded {
+                    if job.active_input.as_ref() == Some(&origin.input) {
+                        job.active_input = None;
+                    }
+                    self.queued_state(job)
+                } else if state.paused || job.state == JobState::Paused {
+                    JobState::Paused
                 } else {
-                    let event = self.tool_result(
-                        &origin.job,
-                        &tool,
-                        outcome.content,
-                        Some(&origin),
-                        false,
-                    )?;
-                    job.history.push(event.id.clone());
-                    if origin.revision != state.revision
-                        && self.state.focus.as_ref() == Some(&origin.job)
-                        && !job.inbox.is_empty()
-                        && let Some(active) = job.active_input.take()
-                    {
-                        job.inbox.push_back(active);
-                    }
-                    self.commit(state, vec![event])?;
-                    if tools::is_write(tool.call.function.name.as_str())
-                        && let Some(lease) = self.write_lease.take()
-                    {
-                        lease.clear()?;
-                    }
+                    JobState::Ready
+                };
+                let event = self.tool_result(
+                    &origin.job,
+                    &tool,
+                    outcome.content,
+                    Some(&origin),
+                    outcome.uncertain,
+                )?;
+                job.history.push(event.id.clone());
+                if !superseded
+                    && origin.revision != state.revision
+                    && self.state.focus.as_ref() == Some(&origin.job)
+                    && !job.inbox.is_empty()
+                    && let Some(active) = job.active_input.take()
+                {
+                    job.inbox.push_back(active);
+                }
+                self.commit(state, vec![event])?;
+                if tools::is_write(tool.call.function.name.as_str()) {
+                    drop(self.write_lease.take());
                 }
             }
         }
@@ -1882,18 +1744,26 @@ impl Engine {
         let current = state.jobs.get_mut(job).unwrap();
         current.active_input = None;
         current.wait_for.clear();
-        current.state = if current.inbox.is_empty() {
+        current.state = self.queued_state(current);
+        self.commit(state, vec![event])
+    }
+
+    // Automatic continuation is for delegated work. Retained user messages
+    // require a new instruction or an explicit resume, even in mixed queues.
+    fn queued_state(&self, job: &Job) -> JobState {
+        if job.inbox.is_empty() {
             JobState::Idle
-        } else if current
-            .inbox
-            .iter()
-            .any(|input| !self.has_settled_ancestor(input))
-        {
+        } else if job.inbox.iter().any(|input| {
+            !self.has_settled_ancestor(input)
+                && self
+                    .events
+                    .get(input)
+                    .is_some_and(|event| event.data["source"] == "job")
+        }) {
             JobState::Ready
         } else {
             JobState::Paused
-        };
-        self.commit(state, vec![event])
+        }
     }
 
     fn fail(&mut self, job: &str, error: &str) -> Result<()> {
@@ -1907,16 +1777,6 @@ impl Engine {
     }
 
     fn ensure_input_resolvable(&self, job: &str, input: &str) -> Result<()> {
-        let root = self.root(input)?;
-        ensure!(
-            !self
-                .state
-                .unknown_writes
-                .values()
-                .any(|write| write.root_input.is_none()
-                    || write.root_input.as_deref() == Some(&root)),
-            "input has unresolved associated write effects"
-        );
         ensure!(
             !self
                 .running
@@ -1931,8 +1791,31 @@ impl Engine {
                 "input has an unfinished native tool batch"
             );
         }
-        // Descendants retain their exact input identities even if an intermediate
-        // assignment failed. Settling an ancestor never cancels that work.
+        // Completion must account for delegated work. Supersession instead
+        // cancels its outstanding proposals, while started effects still settle.
+        for descendant in self
+            .descendant_inputs(input)
+            .into_iter()
+            .filter(|id| id != input)
+        {
+            ensure!(
+                self.terminal(&descendant).is_some(),
+                "input has a live delegated assignment: {descendant}"
+            );
+            ensure!(
+                !self
+                    .state
+                    .jobs
+                    .values()
+                    .any(|owner| owner.active_input.as_ref() == Some(&descendant)
+                        || owner.inbox.contains(&descendant)),
+                "input has a retained delegated assignment: {descendant}"
+            );
+        }
+        Ok(())
+    }
+
+    fn descendant_inputs(&self, input: &str) -> BTreeSet<String> {
         let mut descendants = BTreeSet::from([input.to_owned()]);
         loop {
             let mut changed = false;
@@ -1941,21 +1824,6 @@ impl Engine {
                     .as_str()
                     .is_some_and(|sender| descendants.contains(sender))
                 {
-                    ensure!(
-                        self.terminal(&event.id).is_some(),
-                        "input has a live delegated assignment: {}",
-                        event.id
-                    );
-                    ensure!(
-                        !self
-                            .state
-                            .jobs
-                            .values()
-                            .any(|owner| owner.active_input.as_ref() == Some(&event.id)
-                                || owner.inbox.contains(&event.id)),
-                        "input has a retained delegated assignment: {}",
-                        event.id
-                    );
                     changed |= descendants.insert(event.id.clone());
                 }
             }
@@ -1963,7 +1831,7 @@ impl Engine {
                 break;
             }
         }
-        Ok(())
+        descendants
     }
 
     fn internal_tool(&mut self, id: &str, tool: &PendingTool) -> Result<()> {
@@ -1984,6 +1852,7 @@ impl Engine {
         );
         let mut state = self.state.clone();
         let mut events = Vec::new();
+        let mut cancel_calls = Vec::new();
         let content = match name {
             "job_inspect" => self.inspect(args)?,
             "input_resolve" => {
@@ -2025,7 +1894,82 @@ impl Engine {
                             );
                         }
                     }
-                    self.ensure_input_resolvable(id, target)?;
+                    if outcome == "completed" {
+                        self.ensure_input_resolvable(id, target)?;
+                    }
+                }
+                let superseded = resolutions
+                    .iter()
+                    .filter(|resolution| resolution["outcome"] == "superseded")
+                    .flat_map(|resolution| {
+                        self.descendant_inputs(resolution["input_id"].as_str().unwrap())
+                    })
+                    .collect::<BTreeSet<_>>();
+                // Preserve native call/result pairs for unstarted proposals. The
+                // running tools retain their call ownership until real completion.
+                for owner in self.state.jobs.values() {
+                    for pending in self.pending_tools(&owner.id)? {
+                        if pending.key == tool.key {
+                            continue;
+                        }
+                        let proposal = &self.events[pending.key.split(':').next().unwrap()];
+                        if !proposal
+                            .reply_to
+                            .as_ref()
+                            .is_some_and(|input| superseded.contains(input))
+                            || self.was_started(&pending.key)
+                        {
+                            continue;
+                        }
+                        let mut result = self.tool_result(&owner.id, &pending,
+                            json!({"cancelled":true,"reason":"A newer instruction superseded this input."}), None, false)?;
+                        result.reply_to = proposal.reply_to.clone();
+                        result.root_input = proposal.root_input.clone();
+                        state
+                            .jobs
+                            .get_mut(&owner.id)
+                            .unwrap()
+                            .history
+                            .push(result.id.clone());
+                        events.push(result);
+                    }
+                    let job = state.jobs.get_mut(&owner.id).unwrap();
+                    job.inbox.retain(|input| !superseded.contains(input));
+                    if job
+                        .active_input
+                        .as_ref()
+                        .is_some_and(|input| superseded.contains(input))
+                    {
+                        job.wait_for.clear();
+                        job.state = JobState::Paused;
+                        if job.current_call.is_none() {
+                            job.active_input = None;
+                            job.state = self.queued_state(job);
+                        }
+                    }
+                }
+                for (call, running) in self
+                    .running
+                    .iter()
+                    .filter(|(_, running)| superseded.contains(&running.origin.input))
+                {
+                    cancel_calls.push(call.clone());
+                    if running.tool.is_none() {
+                        let origin = &running.origin;
+                        let job = state.jobs.get_mut(&origin.job).unwrap();
+                        job.current_call = None;
+                        job.active_input = None;
+                        job.state = self.queued_state(job);
+                        let mut event = self.event(
+                            &origin.job,
+                            "model_cancelled",
+                            json!({"reason":"input superseded"}),
+                        );
+                        event.call_id = Some(call.clone());
+                        event.reply_to = Some(origin.input.clone());
+                        event.root_input = Some(origin.root.clone());
+                        events.push(event);
+                    }
                 }
                 let mut settled = Vec::new();
                 for resolution in resolutions {
@@ -2047,6 +1991,28 @@ impl Engine {
                     settled.push(json!({"input_id":target,"event_id":event.id,"outcome":resolution["outcome"],"reason":resolution["reason"]}));
                     events.push(event);
                 }
+                // A waiter for a delegated input must receive its exact outcome,
+                // even when the original assignment never reached a delivery.
+                for target in superseded
+                    .iter()
+                    .filter(|target| !selected.contains(target.as_str()))
+                {
+                    if self
+                        .terminal(target)
+                        .is_some_and(|event| event.kind == "delivery")
+                    {
+                        continue;
+                    }
+                    let original = &self.events[target];
+                    let mut event = self.event(original.job_id.as_deref().unwrap(), "input_resolved",
+                        json!({"outcome":"superseded","reason":"The originating user request was superseded.","actor_input":input,"actor_job":id,"tool_key":tool.key}));
+                    event.reply_to = Some(target.clone());
+                    event.root_input = original.root_input.clone();
+                    events.push(event);
+                }
+                state
+                    .pending_inputs
+                    .retain(|input| !superseded.contains(input));
                 json!({"resolutions":settled})
             }
             "job_send" => {
@@ -2093,17 +2059,15 @@ impl Engine {
                 };
                 if resume_new_work {
                     for pending in self.pending_tools(&target)? {
-                        if !self.is_unknown_tool(&state, &pending) {
-                            let result = self.tool_result(&target, &pending,
-                                json!({"cancelled":true,"reason":"Retained work belongs to an ended input. A newly authorized assignment follows; reconsider original proposals only after explicit retry."}), None, false)?;
-                            state
-                                .jobs
-                                .get_mut(&target)
-                                .unwrap()
-                                .history
-                                .push(result.id.clone());
-                            events.push(result);
-                        }
+                        let result = self.tool_result(&target, &pending,
+                            json!({"cancelled":true,"reason":"Retained work belongs to an ended input. A newly authorized assignment follows; reconsider original proposals only after explicit retry."}), None, false)?;
+                        state
+                            .jobs
+                            .get_mut(&target)
+                            .unwrap()
+                            .history
+                            .push(result.id.clone());
+                        events.push(result);
                     }
                 }
                 let job = state.jobs.get_mut(&target).unwrap();
@@ -2192,11 +2156,7 @@ impl Engine {
                 };
                 let source = state.jobs.get_mut(id).unwrap();
                 source.active_input = None;
-                source.state = if source.inbox.is_empty() {
-                    JobState::Idle
-                } else {
-                    JobState::Ready
-                };
+                source.state = self.queued_state(source);
                 let job = state.jobs.get_mut(&target).unwrap();
                 job.inbox.push_front(input.clone());
                 job.state = JobState::Ready;
@@ -2287,7 +2247,17 @@ impl Engine {
             .history
             .push(event.id.clone());
         events.push(event);
-        self.commit(state, events)
+        self.commit(state, events)?;
+        for call in cancel_calls {
+            if let Some(running) = self.running.get(&call) {
+                if let Some(signal) = &running.cancellation {
+                    let _ = signal.send(true);
+                } else {
+                    self.running.remove(&call).unwrap().abort.abort();
+                }
+            }
+        }
+        Ok(())
     }
 
     fn readable_event(&self, event: &Event) -> Result<String> {
@@ -2553,7 +2523,7 @@ impl Engine {
         let job = &self.state.jobs[id];
         let catalog=self.state.jobs.values().take(32).map(|j|json!({"id":j.id,"title":j.title,"state":j.state,"active_input":j.active_input})).collect::<Vec<_>>();
         Ok(format!(
-            "You are BONE, the one agent in this conversation. You are currently working inside job {id} ({title}). Jobs are your internal continuing work contexts; never ask the user to create, select or manage them. Every thought and action belongs to this job.\nYour current task is only the input marked status=ACTIVE with ID {input} in this request. Match that marker to its original content. QUEUED inputs are retained for later and must not replace the current task; HISTORICAL and SHARED inputs supply relevant background and corrections. Follow the newest applicable instruction by revision when older instructions conflict. Current input markers override any routing state described in an earlier summary. Use tools to inspect actual files and verify results. Reply with a final answer only after this input is handled. Preserve original constraints. When the ACTIVE request incorporates earlier work, inspect QUEUED requests and explicitly use input_resolve after verifying their work is completed or a newer instruction supersedes them. Give a concrete reason; leave independent queued work unresolved. A final answer settles only the ACTIVE input. Do not repeat completed or superseded effects.\nContinue related work here. Create other jobs only when independent work or a separate continuing context benefits the task. job_send returns an exact input_id; use job_wait instead of polling. You may send a followup to an existing idle job. Use job_handoff before acting to transfer conversation responsibility. Waiting and handoff must be sole tool calls in their batch. When the user asks to stop, call pause_work. To pause/resume other work after a changed instruction, use job_control. If instructions are unclear, ask_user.\nFile tools are confined to workspace {workspace}; shell has local user privileges. Do not claim an operation succeeded unless tool evidence verifies it. Tools disabled by the session permission policy must not be worked around.\nPublic user instructions are included in the history with their revisions. Apply newer relevant corrections to your work; other jobs' assignments remain theirs. When an earlier requirement or unfinished commitment is unclear in a summary, use job_inspect(users_only=true) to find original session instructions, then job_inspect(event_id=...) for their complete readable text. Follow next_before_id and next_offset when truncated. Do not conclude that a specification is missing just because its summary is vague.\nJOB CATALOG:\n{catalog}\nExecution budget shared by this input and its delegated jobs: {budget}",
+            "You are BONE, the one agent in this conversation. You are currently working inside job {id} ({title}). Jobs are your internal continuing work contexts; never ask the user to create, select or manage them. Every thought and action belongs to this job.\nYour current task is only the input marked status=ACTIVE with ID {input} in this request. Match that marker to its original content. QUEUED inputs are retained for later and must not replace the current task; HISTORICAL and SHARED inputs supply relevant background and corrections. Follow the newest applicable instruction by revision when older instructions conflict. Current input markers override any routing state described in an earlier summary. Use tools to inspect actual files and verify results. Reply with a final answer only after this input is handled. Preserve original constraints. When the ACTIVE request incorporates earlier work, inspect QUEUED requests and explicitly use input_resolve after verifying their work is completed or a newer instruction supersedes them. Give a concrete reason; leave independent queued work unresolved. A final answer settles only the ACTIVE input. Older user inputs remain available but do not automatically run after it. For an explanation-only request, explain and leave the earlier work paused; resume it only when authorized. Do not repeat completed or superseded effects. Interrupted tool results are ordinary execution facts: inspect actual state with tools and continue under the current instruction. Ask the user only for information or authorization you actually lack; do not ask them to reconcile calls.\nContinue related work here. Create other jobs only when independent work or a separate continuing context benefits the task. job_send returns an exact input_id; use job_wait instead of polling. You may send a followup to an existing idle job. Use job_handoff before acting to transfer conversation responsibility. Waiting and handoff must be sole tool calls in their batch. When the user asks to stop, call pause_work. To pause/resume other work after a changed instruction, use job_control. If instructions are unclear, ask_user.\nFile tools are confined to workspace {workspace}; shell has local user privileges. Do not claim an operation succeeded unless tool evidence verifies it. Tools disabled by the session permission policy must not be worked around.\nPublic user instructions are included in the history with their revisions. Apply newer relevant corrections to your work; other jobs' assignments remain theirs. When an earlier requirement or unfinished commitment is unclear in a summary, use job_inspect(users_only=true) to find original session instructions, then job_inspect(event_id=...) for their complete readable text. Follow next_before_id and next_offset when truncated. Do not conclude that a specification is missing just because its summary is vague.\nJOB CATALOG:\n{catalog}\nExecution budget shared by this input and its delegated jobs: {budget}",
             title = job.title,
             input = job.active_input.as_deref().unwrap_or(""),
             workspace = self.state.workspace.display(),
@@ -2624,188 +2594,45 @@ fn has_wait_cycle(state: &SessionState, is_terminal: impl Fn(&str) -> bool) -> b
         .any(|id| visits(id, state, &mut BTreeSet::new(), &mut done, &is_terminal))
 }
 
-pub(crate) fn workspace_write_paths(workspace: &Path) -> Result<(PathBuf, PathBuf)> {
-    WriteLease::paths(workspace)
-}
-
-/// The lock spans the physical write and its durable completion. A crash leaves
-/// a marker, so another session cannot blindly write over an unknown operation.
+/// Physical ownership lasts as long as the runtime task or shell descendants.
 struct WriteLease {
     file: Arc<File>,
-    marker: PathBuf,
-    task: Option<AbortHandle>,
-    legacy_file: Arc<File>,
-    legacy_marker: PathBuf,
 }
 impl WriteLease {
-    fn paths(workspace: &Path) -> Result<(PathBuf, PathBuf)> {
+    fn path(workspace: &Path) -> Result<PathBuf> {
         let directory = crate::config::user_home()?.join(".bone/workspace-locks");
         std::fs::create_dir_all(&directory)?;
         let name = tools::sha256(workspace.as_os_str().as_encoded_bytes());
-        Ok((
-            directory.join(format!("{name}.lock")),
-            directory.join(format!("{name}.pending")),
-        ))
-    }
-
-    fn legacy_paths(workspace: &Path) -> Result<(PathBuf, PathBuf)> {
-        let directory = std::env::temp_dir().join("bone-workspace-locks");
-        std::fs::create_dir_all(&directory)?;
-        let name = tools::sha256(workspace.as_os_str().as_encoded_bytes());
-        Ok((
-            directory.join(format!("{name}.lock")),
-            directory.join(format!("{name}.pending")),
-        ))
+        Ok(directory.join(format!("{name}.lock")))
     }
 
     fn locked(workspace: &Path) -> Result<Self> {
-        let (path, marker) = Self::paths(workspace)?;
-        let (legacy_path, legacy_marker) = Self::legacy_paths(workspace)?;
-        let open = |path: &Path| -> Result<File> {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path)?;
-            file.try_lock_exclusive()?;
-            Ok(file)
-        };
-        // Keep compatibility ownership while an older executable uses its temp
-        // lock. Never erase its unknown marker just because storage changed.
-        let file = open(&path)?;
-        let legacy_file = open(&legacy_path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(Self::path(workspace)?)?;
+        file.try_lock_exclusive()?;
         #[cfg(windows)]
         crate::windows::ensure_writer_stopped(&file)?;
-        let lease = Self {
+        Ok(Self {
             file: Arc::new(file),
-            marker,
-            task: None,
-            legacy_file: Arc::new(legacy_file),
-            legacy_marker,
-        };
-        if lease.legacy_marker.exists() {
-            let legacy: Value = serde_json::from_slice(&std::fs::read(&lease.legacy_marker)?)?;
-            if lease.marker.exists() {
-                let stable: Value = serde_json::from_slice(&std::fs::read(&lease.marker)?)?;
-                ensure!(
-                    legacy == stable,
-                    "stable and legacy workspace write markers disagree; inspect both before reconciliation"
-                );
-            } else {
-                lease.arm_marker(&lease.marker, &legacy)?;
-            }
-        }
-        Ok(lease)
+        })
     }
 
-    fn acquire(workspace: &Path, _session: &str, _call: &str) -> Result<Option<Self>> {
-        let lease = match Self::locked(workspace) {
-            Ok(lease) => lease,
+    fn acquire(workspace: &Path) -> Result<Option<Self>> {
+        match Self::locked(workspace) {
+            Ok(lease) => Ok(Some(lease)),
             Err(error)
                 if error
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(crate::filesystem::lock_contended) =>
             {
-                return Ok(None);
+                Ok(None)
             }
-            Err(error) => return Err(error),
-        };
-        ensure!(
-            !lease.marker.exists(),
-            "workspace has an unconfirmed write; recover and reconcile the owning session before writing"
-        );
-        Ok(Some(lease))
-    }
-
-    fn restore_unknown(workspace: &Path, session: &str, call: &str, data_dir: &Path) -> Result<()> {
-        let (_, marker) = Self::paths(workspace)?;
-        if marker.exists() {
-            return Ok(());
+            Err(error) => Err(error),
         }
-        let lease = Self::locked(workspace)
-            .context("workspace write is still running or cannot be recovered")?;
-        if !lease.marker.exists() {
-            lease.arm(session, call, data_dir)?;
-        }
-        Ok(())
-    }
-
-    fn arm(&self, session: &str, call: &str, data_dir: &Path) -> Result<()> {
-        let info = json!({"session_id":session,"call_id":call,"store":data_dir.join("sessions.sqlite3").canonicalize().unwrap_or_else(|_|data_dir.join("sessions.sqlite3"))});
-        self.arm_marker(&self.marker, &info)?;
-        self.arm_marker(&self.legacy_marker, &info)
-    }
-
-    fn arm_marker(&self, marker: &Path, info: &Value) -> Result<()> {
-        use std::io::Write;
-        let temporary = marker.with_extension(format!("{}.tmp", new_id()));
-        let result = (|| -> Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(serde_json::to_string(info)?.as_bytes())?;
-            file.sync_all()?;
-            drop(file);
-            crate::filesystem::replace(&temporary, marker)?;
-            crate::filesystem::sync_directory(marker.parent().context("marker parent")?)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(temporary);
-        }
-        result
-    }
-    fn clear(self) -> Result<()> {
-        self.ensure_stopped()?;
-        let markers = [self.marker.clone(), self.legacy_marker.clone()];
-        drop(self);
-        // A child process can outlive its Rust future and hold an inherited fd.
-        // A fresh file description proves physical ownership was released.
-        let mut locks = Vec::new();
-        for marker in &markers {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(marker.with_extension("lock"))?;
-            file.try_lock_exclusive()
-                .context("workspace writer still owns the lock; wait before clearing its marker")?;
-            #[cfg(windows)]
-            crate::windows::ensure_writer_stopped(&file)?;
-            locks.push(file);
-        }
-        for marker in &markers {
-            if marker.exists() {
-                std::fs::remove_file(marker).context("clearing confirmed workspace write")?;
-                crate::filesystem::sync_directory(marker.parent().context("marker parent")?)?;
-            }
-        }
-        Ok(())
-    }
-    fn ensure_stopped(&self) -> Result<()> {
-        ensure!(
-            self.task.as_ref().is_none_or(AbortHandle::is_finished),
-            "workspace write task has not stopped yet; wait before reconciling its effects"
-        );
-        ensure!(
-            Arc::strong_count(&self.file) == 1 && Arc::strong_count(&self.legacy_file) == 1,
-            "workspace write still owns its lock; wait before reconciling its effects"
-        );
-        Ok(())
-    }
-    fn lock_existing(workspace: &Path, session: &str, call: &str) -> Result<Self> {
-        let lease = Self::locked(workspace).context("workspace write is still running")?;
-        if lease.marker.exists() {
-            let info: Value = serde_json::from_slice(&std::fs::read(&lease.marker)?)?;
-            ensure!(
-                info["session_id"] == session && info["call_id"] == call,
-                "write belongs to another session"
-            );
-        }
-        Ok(lease)
     }
 }
 

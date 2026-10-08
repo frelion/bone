@@ -42,7 +42,8 @@ fn tool_projection_preserves_real_lines_and_failed_shell_status() {
         "stderr:\nproblem\nexit: 2\nstdout:\nout\n"
     );
     assert!(
-        readable_tool_output(r#"{"error":"cancelled","effect":"unknown"}"#).contains("需要核查")
+        readable_tool_output(r#"{"error":"cancelled","effect":"unknown"}"#)
+            .contains("实际效果未确认")
     );
 }
 
@@ -239,74 +240,16 @@ fn api_final_submit_revalidates_skipped_name_and_cannot_overwrite_competing_key(
 }
 
 #[test]
-fn sidebar_session_switch_during_reconciliation_keeps_note_target_and_original_draft() {
-    let (dir, mut engine, mut app) = local_app();
-    let data = dir.path().join("data");
-    let other = Engine::open(
-        &data,
-        dir.path(),
-        None,
-        app.settings.profile.clone(),
-        "test".into(),
-        Default::default(),
-    )
-    .unwrap();
-    let other_id = other.state().id.clone();
-    drop(other);
-    app.reply_target = Some("original-question-target".into());
-    app.ui.paste("original answer draft\noriginal second line");
-    app.ui.handle_key(crossterm::event::KeyEvent::new(
-        KeyCode::Left,
-        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-    ));
-    let cursor = app.ui.cursor();
-    let selection = app.ui.selected_input_text();
-    app.ui.begin_temporary_draft();
-    app.reconcile_call = Some("unknown-call-being-reviewed".into());
-    app.ui.paste("unfinished observed reconciliation note");
-    app.ui.focus = Focus::Sessions;
-    let original_session = engine.state().id.clone();
-    let before_events = engine.events().unwrap().len();
-    assert!(
-        app.switch_session(&mut engine, &data, Some(&other_id))
-            .is_err()
-    );
-    assert_eq!(engine.state().id, original_session);
-    assert_eq!(engine.events().unwrap().len(), before_events);
-    assert_eq!(app.ui.focus, Focus::Sessions);
-    assert_eq!(
-        app.reconcile_call.as_deref(),
-        Some("unknown-call-being-reviewed")
-    );
-    assert_eq!(
-        app.reply_target.as_deref(),
-        Some("original-question-target")
-    );
-    assert_eq!(app.ui.draft(), "unfinished observed reconciliation note");
-    app.cancel_reconcile();
-    assert_eq!(
-        app.ui.draft(),
-        "original answer draft\noriginal second line"
-    );
-    assert_eq!(app.ui.cursor(), cursor);
-    assert_eq!(app.ui.selected_input_text(), selection);
-    assert_eq!(
-        app.reply_target.as_deref(),
-        Some("original-question-target")
-    );
-}
-
-#[test]
 fn older_pages_advance_through_internal_only_records() {
     let (dir, mut engine, mut app) = local_app();
     let first = engine.post_message("EARLIEST_PUBLIC_MESSAGE").unwrap();
     let data = dir.path().join("data");
-    let connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+    let connection = rusqlite::Connection::open(data.join("sessions.sqlite")).unwrap();
     for _ in 0..70 {
         let event = Event::new(&engine.state().id, "audit_marker", serde_json::json!({}));
         connection
             .execute(
-                "INSERT INTO events (id,session_id,revision,payload) VALUES (?1,?2,?3,?4)",
+                "INSERT INTO events (id,session_id,revision,payload,job_id,metadata) VALUES (?1,?2,?3,?4,json_extract(?4,'$.job_id'),json_remove(?4,'$.data.message','$.data.response','$.data.stream_items','$.data.covered_ids'))",
                 rusqlite::params![
                     event.id,
                     event.session_id,
@@ -369,7 +312,7 @@ fn obsolete_question_keeps_its_draft_and_unknown_result_never_claims_completion(
         .iter()
         .find(|m| m.event_id.as_deref() == Some("tool:interrupted-write"))
         .unwrap();
-    assert!(card.text.starts_with("结果未知"));
+    assert!(card.text.starts_with("执行中断"));
     assert!(!card.text.starts_with("完成"));
 }
 
@@ -422,41 +365,6 @@ fn saved_answer_draft_keeps_its_explicit_target_after_reload() {
 }
 
 #[test]
-fn temporary_reconciliation_cancel_and_save_preserve_original_draft_and_target() {
-    let (dir, engine, mut app) = local_app();
-    app.reply_target = Some("explicit-question".into());
-    app.ui.paste("line one\nline two");
-    app.ui.handle_key(crossterm::event::KeyEvent::new(
-        KeyCode::Home,
-        KeyModifiers::NONE,
-    ));
-    app.ui.handle_key(crossterm::event::KeyEvent::new(
-        KeyCode::Right,
-        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-    ));
-    let cursor = app.ui.cursor();
-    let selection = app.ui.selected_input_text();
-    app.ui.open_detail("original evidence", "reader content");
-    app.ui.begin_temporary_draft();
-    app.reconcile_call = Some("unknown-call".into());
-    app.ui.paste("inspect actual effects before recording");
-    app.save(&engine, &dir.path().join("data")).unwrap();
-    let saved = services::load(&dir.path().join("data"), &engine.state().id).unwrap();
-    assert_eq!(saved.draft, "line one\nline two");
-    assert_eq!(saved.reply_to.as_deref(), Some("explicit-question"));
-    app.cancel_reconcile();
-    assert_eq!(app.ui.draft(), "line one\nline two");
-    assert_eq!(app.ui.cursor(), cursor);
-    assert_eq!(app.reply_target.as_deref(), Some("explicit-question"));
-    assert_eq!(
-        app.ui.detail.as_ref().map(|(title, _)| title.as_str()),
-        Some("original evidence")
-    );
-    app.ui.close_layer();
-    assert_eq!(app.ui.selected_input_text(), selection);
-}
-
-#[test]
 fn explicit_target_switch_owns_separate_message_and_question_drafts() {
     let (_dir, engine, mut app) = local_app();
     app.ui.paste("original message draft");
@@ -500,15 +408,13 @@ fn pause_with_input_selection_keeps_draft_and_always_pauses_engine() {
 
 #[test]
 fn exact_completed_command_has_no_inline_layer_and_confirmation_only_inserts() {
-    let (dir, engine, mut app) = local_app();
+    let (_dir, engine, mut app) = local_app();
     app.ui.paste("/status");
-    app.refresh_completion(&engine, &dir.path().join("data"))
-        .unwrap();
+    app.refresh_completion(&engine).unwrap();
     assert!(!app.ui.is_completion());
     app.ui.take_draft();
     app.ui.paste("/he");
-    app.refresh_completion(&engine, &dir.path().join("data"))
-        .unwrap();
+    app.refresh_completion(&engine).unwrap();
     assert!(app.ui.is_completion());
     app.complete_inline(PickerKind::Command, "/help");
     assert_eq!(app.ui.draft(), "/help ");
@@ -614,10 +520,10 @@ fn arriving_question_never_binds_an_empty_or_existing_message_draft() {
     question.reply_to = Some(input.clone());
     question.root_input = Some(input);
     let data = dir.path().join("data");
-    let connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+    let connection = rusqlite::Connection::open(data.join("sessions.sqlite")).unwrap();
     connection
         .execute(
-            "INSERT INTO events (id,session_id,revision,payload) VALUES (?1,?2,?3,?4)",
+            "INSERT INTO events (id,session_id,revision,payload,job_id,metadata) VALUES (?1,?2,?3,?4,json_extract(?4,'$.job_id'),json_remove(?4,'$.data.message','$.data.response','$.data.stream_items','$.data.covered_ids'))",
             rusqlite::params![
                 question.id,
                 id,
@@ -657,7 +563,7 @@ fn arriving_question_never_binds_an_empty_or_existing_message_draft() {
 }
 
 #[test]
-fn latest_history_reload_preserves_all_target_drafts_and_rejects_active_reconciliation() {
+fn latest_history_reload_preserves_all_target_drafts() {
     let (dir, mut engine, mut app) = local_app();
     let data = dir.path().join("data");
     app.ui.paste("original request\nsecond line");
@@ -704,24 +610,6 @@ fn latest_history_reload_preserves_all_target_drafts_and_rejects_active_reconcil
     assert_eq!(app.ui.draft(), "unfinished answer\nanswer line two");
     assert_eq!(app.ui.cursor(), answer_cursor);
     assert_eq!(app.ui.selected_input_text(), answer_selection);
-    app.ui.begin_temporary_draft();
-    app.reconcile_call = Some("unknown-call".into());
-    app.ui.paste("temporary inspection note");
-    assert!(app.refresh_latest(&mut engine, &data).is_err());
-    assert_eq!(app.reconcile_call.as_deref(), Some("unknown-call"));
-    assert_eq!(app.ui.draft(), "temporary inspection note");
-    assert_eq!(
-        app.ui.temporary_draft_text().as_deref(),
-        Some("unfinished answer\nanswer line two")
-    );
-    app.cancel_reconcile();
-    assert_eq!(app.ui.draft(), "unfinished answer\nanswer line two");
-    assert_eq!(app.ui.cursor(), answer_cursor);
-    assert_eq!(app.ui.selected_input_text(), answer_selection);
-    assert_eq!(
-        app.reply_target.as_deref(),
-        Some("explicit-question-target")
-    );
 }
 
 #[test]
@@ -754,61 +642,6 @@ fn failed_shell_summary_prefers_failure_markers_and_labels_unmarked_tail_as_obse
     assert_eq!(exit, Some(17));
     assert_eq!(observation, "stderr尾部观察：last observed line");
     assert_eq!(question_summary("多字节问题内容需要截断", 8), "多字节问…");
-}
-
-#[test]
-fn reconcile_editor_keys_do_not_cancel_or_submit_from_audit_or_nested_reader() {
-    let (_dir, mut engine, mut app) = local_app();
-    let input = engine
-        .post_message("durable record for the audit reader")
-        .unwrap();
-    app.ingest(&engine, &engine.read_event(&input).unwrap())
-        .unwrap();
-    pause(&mut engine, &mut app.ui).unwrap();
-    app.ui.paste("original draft");
-    app.ui.begin_temporary_draft();
-    app.reconcile_call = Some("unknown-call".into());
-    app.ui
-        .paste("inspection note that must survive audit navigation");
-    let esc = crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-    let enter = crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-    let audit = crossterm::event::KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
-    app.ui.handle_key(audit);
-    assert!(app.ui.show_activity);
-    assert!(!app.handle_reconcile_key(&mut engine, esc).unwrap());
-    app.ui.handle_key(esc);
-    assert_eq!(app.reconcile_call.as_deref(), Some("unknown-call"));
-    assert_eq!(
-        app.ui.draft(),
-        "inspection note that must survive audit navigation"
-    );
-    app.ui.handle_key(audit);
-    assert!(!app.handle_reconcile_key(&mut engine, enter).unwrap());
-    let record = engine.read_event(app.ui.selected_event().unwrap()).unwrap();
-    app.ui
-        .open_detail("audit original", detail(&engine, &record).unwrap());
-    assert!(!app.handle_reconcile_key(&mut engine, esc).unwrap());
-    app.ui.handle_key(esc);
-    assert!(app.ui.show_activity);
-    assert!(!app.handle_reconcile_key(&mut engine, esc).unwrap());
-    app.ui.handle_key(esc);
-    assert!(app.reconcile_editor_active());
-    assert_eq!(
-        app.ui.draft(),
-        "inspection note that must survive audit navigation"
-    );
-    assert!(engine.state().paused);
-    assert!(app.handle_reconcile_key(&mut engine, esc).unwrap());
-    assert_eq!(app.ui.draft(), "original draft");
-    assert!(app.reconcile_call.is_none());
-    app.ui.handle_key(audit);
-    app.ui.open_detail("nested audit evidence", "read only");
-    app.switch_target(Some("explicit-answer-target".into()));
-    assert!(!app.ui.show_activity);
-    assert!(!app.ui.has_modal());
-    assert_eq!(app.ui.focus, Focus::Input);
-    app.cancel_reply();
-    assert_eq!(app.ui.draft(), "original draft");
 }
 
 #[path = "../support/server.rs"]
@@ -916,7 +749,7 @@ async fn an_old_delivery_cannot_hide_a_new_real_model_call_or_restart_its_clock(
     assert_eq!(app.active_calls[&call].started, started);
     pause(&mut engine, &mut app.ui).unwrap();
     app.metadata(&engine);
-    assert!(app.ui.live_status.starts_with("已暂停"));
+    assert!(app.ui.live_status.starts_with("停止中") || app.ui.live_status.starts_with("已停止"));
     assert!(!app.ui.busy);
     assert_eq!(app.ui.spinner_tick, 0);
 }
@@ -986,7 +819,7 @@ fn session_titles_skip_blank_lines_and_catalog_keeps_an_old_current_session() {
     let (dir, mut engine, _app) = local_app();
     let data = dir.path().join("data");
     let workspace = engine.state().workspace.clone();
-    let connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+    let connection = rusqlite::Connection::open(data.join("sessions.sqlite")).unwrap();
     connection.execute_batch("BEGIN IMMEDIATE").unwrap();
     for _ in 0..205 {
         let state = bone::state::SessionState::new(&workspace);
@@ -1049,7 +882,7 @@ fn session_titles_skip_blank_lines_and_catalog_keeps_an_old_current_session() {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO events(id,session_id,revision,payload) VALUES(?1,?2,0,?3)",
+                "INSERT INTO events (id,session_id,revision,payload,job_id,metadata) VALUES (?1,?2,0,?3,json_extract(?3,'$.job_id'),json_remove(?3,'$.data.message','$.data.response','$.data.stream_items','$.data.covered_ids'))",
                 rusqlite::params![
                     event.id,
                     event.session_id,
@@ -1075,7 +908,7 @@ fn session_catalog_keeps_existing_work_without_a_user_title() {
     let (dir, engine, _app) = local_app();
     let data = dir.path().join("data");
     let workspace = &engine.state().workspace;
-    let connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+    let connection = rusqlite::Connection::open(data.join("sessions.sqlite")).unwrap();
     let mut states = Vec::new();
     for status in [
         JobState::Ready,
@@ -1092,18 +925,6 @@ fn session_catalog_keeps_existing_work_without_a_user_title() {
     let mut pending = bone::state::SessionState::new(workspace);
     pending.pending_inputs.push_back("pending-input".into());
     states.push(pending);
-    let mut unknown = bone::state::SessionState::new(workspace);
-    unknown.unknown_writes.insert(
-        "unknown-call".into(),
-        bone::state::UnknownWrite {
-            call_id: "unknown-call".into(),
-            job_id: "unknown-job".into(),
-            root_input: None,
-            tool_name: "shell".into(),
-        },
-    );
-    let unknown_id = unknown.id.clone();
-    states.push(unknown);
     for state in &states {
         connection
             .execute(
@@ -1119,14 +940,6 @@ fn session_catalog_keeps_existing_work_without_a_user_title() {
         assert_eq!(item.label, "会话");
         assert_eq!(item.updated_at, None);
     }
-    assert_eq!(
-        items
-            .iter()
-            .find(|item| item.value == unknown_id)
-            .unwrap()
-            .detail,
-        "核查"
-    );
     assert!(
         engine.events().unwrap().is_empty(),
         "catalog reads must not create events"
@@ -1143,7 +956,7 @@ fn session_activity_time_comes_from_latest_event_sequence_in_local_time() {
     let events = engine.events().unwrap();
     assert_eq!(events.len(), 3);
     assert_eq!(events.last().unwrap().kind, "stopped");
-    let connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+    let connection = rusqlite::Connection::open(data.join("sessions.sqlite")).unwrap();
     // Deliberately let the first two events have later wall-clock times. The
     // latest persisted event is defined by sequence, even if the clock moved.
     let timestamps = ["1906634040000", "2230305960000", "1728029520000"];
@@ -1211,17 +1024,6 @@ fn sidebar_metadata_uses_real_attention_and_pause_facts_without_inventing_rounds
         session_status(&state, &[question.clone(), answered]),
         "暂停"
     );
-    state.unknown_writes.insert(
-        "write".into(),
-        bone::state::UnknownWrite {
-            call_id: "write".into(),
-            job_id: id.clone(),
-            root_input: None,
-            tool_name: "shell".into(),
-        },
-    );
-    assert_eq!(session_status(&state, &[question.clone()]), "核查");
-    state.unknown_writes.clear();
     state.jobs.get_mut(&id).unwrap().state = JobState::Closed;
     assert_eq!(session_status(&state, &[question]), "");
     state.jobs.get_mut(&id).unwrap().state = JobState::Running;
@@ -1254,7 +1056,7 @@ async fn completed_work_reopens_without_a_spurious_resume_prompt() {
     app.switch_session(&mut engine, &data, None).unwrap();
     app.switch_session(&mut engine, &data, Some(&original))
         .unwrap();
-    assert!(engine.state().paused); // Core recovery policy is unchanged.
+    assert!(!engine.state().paused); // Navigation does not invent a stop for Idle work.
     assert!(!app.ui.notice.contains("Ctrl+R"));
     assert_eq!(app.ui.live_status, "本次已完成");
     assert_eq!(
@@ -1329,7 +1131,7 @@ async fn automatic_sidebar_refresh_preserves_the_browsed_session_instead_of_sele
 }
 
 #[tokio::test]
-async fn new_session_returns_to_input_and_pauses_current_work_instead_of_the_sidebar_candidate() {
+async fn new_session_returns_to_input_without_stopping_current_or_candidate_work() {
     let (dir, mut engine, mut app) = local_app();
     let data = dir.path().join("data");
     engine.post_message("当前执行对象").unwrap();
@@ -1367,7 +1169,7 @@ async fn new_session_returns_to_input_and_pauses_current_work_instead_of_the_sid
     assert_ne!(engine.state().id, candidate);
     assert!(!engine.state().paused);
     assert!(engine.events().unwrap().is_empty());
-    let connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+    let connection = rusqlite::Connection::open(data.join("sessions.sqlite")).unwrap();
     let snapshot = |id: &str| {
         let text: String = connection
             .query_row("SELECT snapshot FROM sessions WHERE id = ?1", [id], |row| {
@@ -1376,7 +1178,8 @@ async fn new_session_returns_to_input_and_pauses_current_work_instead_of_the_sid
             .unwrap();
         serde_json::from_str::<bone::state::SessionState>(&text).unwrap()
     };
-    assert!(snapshot(&original).paused);
+    assert!(!snapshot(&original).paused);
+    assert!(app.background.contains_key(&original));
     assert!(!snapshot(&candidate).paused);
     let before = session_items(&data, &engine.state().workspace, &engine.state().id).unwrap();
     assert_eq!(before.len(), 2);
@@ -1562,4 +1365,237 @@ async fn a_completed_export_keeps_the_active_form_and_parent_draft() {
     app.ui.close_layer();
     assert_eq!(app.ui.draft(), "继续修复之前先保留这份草稿");
     assert!(engine.events().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn background_session_delivers_while_navigation_and_model_change_preserve_execution() {
+    let (dir, mut engine, mut app, _server) = execution_feedback_fixture(serde_json::json!([
+        {"delay_seconds":0.15,"text":"BACKGROUND_DELIVERY"},
+        {"text":"FOLLOWUP_WITH_NEW_MODEL"}
+    ]));
+    let data = dir.path().join("data");
+    let original = engine.state().id.clone();
+    let input = engine.post_message("Complete the original task").unwrap();
+    while !engine
+        .events()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "model_started")
+    {
+        engine.step().await.unwrap();
+    }
+    app.maintain_execution(&mut engine).unwrap();
+    let deadline = app.deadlines[&original];
+    let replacement = app
+        .settings
+        .profile
+        .with_model("llamacpp:next-fixture-model")
+        .unwrap();
+    engine
+        .set_profile(replacement.clone(), "next-profile".into())
+        .unwrap();
+    app.settings = Settings {
+        profile_name: "next-profile".into(),
+        profile: replacement,
+    };
+    assert!(!engine.state().paused);
+    assert!(
+        !engine
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "cancelled" || event.kind == "stopped")
+    );
+    app.switch_session(&mut engine, &data, None).unwrap();
+    assert_ne!(engine.state().id, original);
+    assert_eq!(app.deadlines[&original], deadline);
+    assert!(app.background.contains_key(&original));
+    let selected = engine.state().id.clone();
+    // Cancel a UI wait while the provider is running; the model task survives.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(10),
+            poll_engines(&mut engine, &mut app.background)
+        )
+        .await
+        .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (id, result) = poll_engines(&mut engine, &mut app.background).await;
+            app.execution_update(&mut engine, &data, &id, result)
+                .unwrap();
+            if app.background[&original].result(&input).is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(engine.state().id, selected);
+    app.switch_session(&mut engine, &data, Some(&original))
+        .unwrap();
+    assert_eq!(engine.state().id, original);
+    assert_eq!(engine.profile_recipe().0, "next-profile");
+    assert_eq!(model_name(engine.profile_recipe().1), "next-fixture-model");
+    assert_eq!(engine.result(&input).unwrap().kind, "delivery");
+    assert!(
+        !engine
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "stopped")
+    );
+    let message = engine.post_message("Continue on the new model").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.result(&message).is_none() {
+            engine.step().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        engine.result(&message).unwrap().kind,
+        "delivery",
+        "{:?}",
+        engine.result(&message)
+    );
+    let requests: Vec<serde_json::Value> =
+        std::fs::read_to_string(dir.path().join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    assert_eq!(requests[0]["body"]["model"], "feedback-fixture");
+    assert_eq!(requests[1]["body"]["model"], "next-fixture-model");
+}
+
+#[test]
+fn failed_navigation_leaves_work_and_deadline_intact_and_idle_navigation_releases_lease() {
+    let (dir, mut engine, mut app) = local_app();
+    let data = dir.path().join("data");
+    let original = engine.state().id.clone();
+    engine.post_message("Pending work").unwrap();
+    app.maintain_execution(&mut engine).unwrap();
+    let revision = engine.state().revision;
+    let deadline = app.deadlines[&original];
+    assert!(
+        app.switch_session(&mut engine, &data, Some("missing-session"))
+            .is_err()
+    );
+    assert_eq!(engine.state().id, original);
+    assert_eq!(engine.state().revision, revision);
+    assert_eq!(app.deadlines[&original], deadline);
+    assert!(!engine.state().paused);
+    engine.stop().unwrap();
+    app.switch_session(&mut engine, &data, None).unwrap();
+    assert!(!app.background.contains_key(&original));
+    let reopened = Engine::open(
+        &data,
+        dir.path(),
+        Some(&original),
+        app.settings.profile.clone(),
+        "test".into(),
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(reopened.state().id, original);
+}
+
+#[tokio::test]
+async fn background_deadline_is_enforced_without_navigation_reset() {
+    let (dir, mut engine, mut app) = local_app();
+    let data = dir.path().join("data");
+    engine.post_message("Pending task").unwrap();
+    let original = engine.state().id.clone();
+    app.deadlines
+        .insert(original.clone(), Instant::now() - Duration::from_secs(1));
+    app.switch_session(&mut engine, &data, None).unwrap();
+    app.maintain_execution(&mut engine).unwrap();
+    assert!(!app.background.contains_key(&original));
+    let state = bone::session(&data, &original).unwrap();
+    assert!(state.paused);
+    assert!(!engine.state().paused);
+    assert!(
+        bone::history(&data, &original)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "stopped")
+    );
+}
+
+#[test]
+fn new_session_uses_saved_default_while_live_session_keeps_its_recipe() {
+    let (dir, mut engine, mut app) = local_app();
+    let data = dir.path().join("data");
+    let original = engine.state().id.clone();
+    engine
+        .post_message("Original unfinished work on A")
+        .unwrap();
+    app.switch_session(&mut engine, &data, None).unwrap();
+    let changed = engine.state().id.clone();
+    let (config, revision) = Config::load_with_revision(&data).unwrap();
+    app.apply_connection(
+        &mut engine,
+        &data,
+        ConnectionChange {
+            config,
+            revision,
+            name: "saved-B".into(),
+            profile: Profile::from_model("ollama:model-B").unwrap(),
+        },
+    )
+    .unwrap();
+    engine
+        .post_message("Independent unfinished work on B")
+        .unwrap();
+    app.switch_session(&mut engine, &data, Some(&original))
+        .unwrap();
+    assert_eq!(engine.profile_recipe().0, "test");
+    assert_eq!(model_name(engine.profile_recipe().1), "test-model");
+    app.switch_session(&mut engine, &data, None).unwrap();
+    assert_eq!(engine.profile_recipe().0, "saved-B");
+    assert_eq!(model_name(engine.profile_recipe().1), "model-B");
+    assert_eq!(app.background[&original].profile_recipe().0, "test");
+    assert_eq!(app.background[&changed].profile_recipe().0, "saved-B");
+    assert!(!app.background[&original].state().paused);
+    assert!(!app.background[&changed].state().paused);
+}
+
+#[test]
+fn typed_commands_reject_retired_and_internal_aliases_without_side_effects() {
+    let (dir, mut engine, mut app) = local_app();
+    app.ui.paste("original unsent draft");
+    let before = engine.state().revision;
+    for alias in [
+        "/status",
+        "/sessions",
+        "/audit",
+        "/details",
+        "/exit",
+        "/mouse",
+        "/copy",
+        "/older",
+        "/latest",
+        "/editor",
+        "/files",
+        "/reply",
+        "/search",
+        "/delivery",
+        "/export",
+        "/diff",
+        "/questions",
+        "/message",
+        "/stop",
+        "/resume",
+    ] {
+        assert!(
+            app.submit_command(&mut engine, &dir.path().join("data"), alias)
+                .is_err(),
+            "{alias}"
+        );
+        assert_eq!(app.ui.draft(), "original unsent draft");
+        assert_eq!(engine.state().revision, before);
+        assert!(engine.events().unwrap().is_empty());
+    }
 }

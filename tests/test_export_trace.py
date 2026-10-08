@@ -11,7 +11,7 @@ class ExportTracePrivacyTest(unittest.TestCase):
     def test_shareable_export_omits_private_fields_and_preserves_visible_actions(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
-            database = Path(directory) / 'sessions.sqlite3'
+            database = Path(directory) / 'sessions.sqlite'
             output = Path(directory) / 'trace.html'
             state = {'id': 's', 'workspace': '/project', 'jobs': {}, 'access_token': 'fixture-private-token'}
             event = {'id': 'e', 'session_id': 's', 'kind': 'model_message', 'timestamp': 1,

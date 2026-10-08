@@ -298,6 +298,29 @@ auth = "Bearer"
                 start = end
         return "\n".join("".join(line) for line in grid)
 
+    def action(self, label):
+        self.send(b'\x10')
+        self.pump(.12)
+        self.send(label+'\r')
+        self.pump(.12)
+
+    def reply(self, question):
+        self.action('回复问题')
+        self.send(question['data']['question']+'\r')
+        self.pump(.2)
+
+    def verify_selected_session(self, session):
+        marker='ROUTE_PROBE_'+uuid.uuid4().hex
+        self.send(b'\x1b[1;2B\x01\x0b')
+        self.send(marker)
+        path=self.data/'tui'/(session+'.json')
+        self.wait(lambda:path.exists() and json.loads(path.read_text()).get('draft')==marker,
+            'actual selected Engine persists its exact draft under session '+session)
+        assert self.visible(marker), 'verified persisted draft is not selected on screen'
+        self.send(b'\x01\x0b')
+        self.pump(.12)
+        return session
+
     def capture(self, label):
         self.pump(.08)
         # Layout evidence must come from the live alternate screen, never the
@@ -309,13 +332,12 @@ auth = "Bearer"
         self.frames.append({"step": label, "screen": screen, "requests": len(self.calls()),
             "events": len(self.events()), "size": [self.rows, self.cols],
             "snapshot_session": snapshot['id'],
-            "sessions": {key:{'paused':value.get('paused'),'unknown_writes':len(value.get('unknown_writes',{})),
+            "sessions": {key:{'paused':value.get('paused'),
                 'job_states':{job_id:job.get('state') for job_id,job in value.get('jobs',{}).items()}}
                 for key,value in self.session_states().items()},
             "cursor": list(self.terminal_cursor), "paused": snapshot.get("paused"),
             "cursor_visible": self.cursor_visible, "cell_styles": self.cell_styles,
             "cells": self.terminal_cells,
-            "unknown_writes": len(snapshot.get("unknown_writes", {})),
             "request_routes": {label:len(self.route_calls(label)) for label in self.request_routes},
             "running_jobs": sum(str(job.get('state','')).lower() == 'running' for job in snapshot.get('jobs', {}).values()),
             "job_states": {key:job.get('state') for key,job in snapshot.get('jobs', {}).items()}})
@@ -332,7 +354,7 @@ auth = "Bearer"
         (directory / (name + ".json")).write_text(json.dumps(document, ensure_ascii=False, separators=(',', ':')))
         cards = "".join("<section><h2>" + html.escape(frame["step"]) + "</h2><p>Requests: " + str(frame["requests"]) +
             "; events: " + str(frame["events"]) + "; terminal: " + str(frame["size"][1]) + "×" + str(frame["size"][0]) +
-            "; paused: " + str(frame["paused"]) + "; unknown writes: " + str(frame["unknown_writes"]) + "</p><pre>" + styled_frame(frame) + "</pre></section>" for frame in self.frames)
+            "; paused: " + str(frame["paused"]) + "</p><pre>" + styled_frame(frame) + "</pre></section>" for frame in self.frames)
         page = '<!doctype html><meta charset="utf-8"><title>BONE PTY ' + html.escape(name) + '</title><style>body{font:16px system-ui;margin:32px;background:#f5f3ed;color:#172b36}pre{font:13px monospace;white-space:pre;background:#18232b;color:#e5edf2;padding:16px;overflow:auto}section{margin:24px 0}</style><h1>' + html.escape(name) + '</h1><p>' + html.escape(document["scope"]) + '</p><p>' + document["status"] + '</p>' + ('<pre>' + html.escape(str(error)) + '</pre>' if error else '') + cards
         (directory / (name + ".html")).write_text(page)
 
@@ -357,7 +379,7 @@ auth = "Bearer"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def events(self, session=None):
-        db = self.data / "sessions.sqlite3"
+        db = self.data / "sessions.sqlite"
         if not db.exists():
             return []
         try:
@@ -372,13 +394,13 @@ auth = "Bearer"
 
     def state(self, session=None):
         session = session or getattr(self,'observed_session',None)
-        with closing(sqlite3.connect(self.data / "sessions.sqlite3")) as connection:
+        with closing(sqlite3.connect(self.data / "sessions.sqlite")) as connection:
             if session is None:
                 return json.loads(connection.execute("SELECT snapshot FROM sessions LIMIT 1").fetchone()[0])
             return json.loads(connection.execute('SELECT snapshot FROM sessions WHERE id=?',(session,)).fetchone()[0])
 
     def session_states(self):
-        with closing(sqlite3.connect(self.data/'sessions.sqlite3')) as connection:
+        with closing(sqlite3.connect(self.data/'sessions.sqlite')) as connection:
             return {row[0]:json.loads(row[1]) for row in connection.execute('SELECT id,snapshot FROM sessions')}
 
     def quit(self, command=b'\x11'):
@@ -519,7 +541,7 @@ def concurrent_input(f):
     f.send('ADDED_CONSTRAINT\r')
     f.wait(lambda: 'ADDED_CONSTRAINT' in json.dumps(f.events()), 'input accepted while model runs')
     f.capture('Follow-up input is shown with a receipt while the earlier model runs')
-    assert 'ADDED_CONSTRAINT' in f.screen() and re.search('已接收|已纳入',f.screen()), 'running input lacks visible original words and receipt'
+    assert 'ADDED_CONSTRAINT' in f.screen() and re.search('已收到|已接收|已纳入',f.screen()), 'running input lacks visible original words and receipt'
     f.wait(lambda: len(f.calls()) >= 2, 'second request')
     assert 'ADDED_CONSTRAINT' in json.dumps(f.calls()[1:]), 'new constraint absent from follow-up model request'
     f.wait(lambda: f.visible('CONSTRAINT_ACCEPTED'), 'new constraint reply rendered')
@@ -538,9 +560,9 @@ def pause_resume(f):
     assert any(e.get('kind') == 'input' for e in f.events()), 'pause lost posted input'
     f.send(b'\x12')
     f.wait(lambda: len(f.calls()) > count or f.visible('PAUSE_COMPLETE'), 'resume produces progress')
-    f.send('/stop\r')
+    f.send(b'\x03')
     f.wait(lambda: f.state().get('paused'), '/stop persists paused state')
-    f.send('/resume\r')
+    f.send(b'\x12')
     f.wait(lambda: not f.state().get('paused'), '/resume clears paused state')
     f.quit()
 
@@ -551,7 +573,7 @@ def delegated_question(f):
     question = next(e for e in f.events() if e.get('kind') == 'question')
     assert question.get('job_id'), 'question has no Job attribution'
     f.wait(lambda: 'Which output format' in f.screen(), 'delegated question visible in agent transcript')
-    f.send('/reply ' + question['id'] + '\r')
+    f.reply(question)
     f.pump(.2)
     f.send('ANSWER_JSON\r')
     f.wait(lambda: f.visible('Root task done.'), 'explicit answer resumes delegated workflow')
@@ -580,8 +602,8 @@ def failure(f):
     assert f.proc.poll() is None, 'recoverable model failure terminated TUI'
     f.capture('Model HTTP failure remains actionable before exit')
     lines = f.screen().splitlines()
-    input_top = next((i for i,line in enumerate(lines) if any(c in line for c in '┌╭╔') and '输入中' in line),None)
-    status_line = lines[input_top-2] if input_top is not None and input_top >= 2 else ''
+    input_top = next((i for i,line in reversed(list(enumerate(lines))) if any(c in line for c in '┌╭╔')),None)
+    status_line = '\n'.join(lines[max(0,input_top-2):input_top]) if input_top is not None else ''
     assert '失败' in status_line, 'failure missing from primary status'
     assert '就绪' not in status_line, 'failed work presented as ready'
     f.quit()
@@ -617,7 +639,7 @@ def feedback_flow(f):
                 if cell not in ('┌','╭','╔'): continue
                 right = next((j for j in range(x+1,len(row)) if row[j] in ('┐','╮','╗')),len(row))
                 title = ''.join(row[x:right])
-                if '输入中' in title or '草稿只读' in title: tops.append((y,x))
+                tops.append((y,x))
         if not tops: return None
         y,x = tops[-1]
         bottom = next((j for j in range(y+1,len(cells)) if cells[j][x] in ('└','╰','╚')),None)
@@ -646,12 +668,12 @@ def feedback_flow(f):
     end_at_tail = 0 <= y < f.rows and 0 < x < f.cols and end['cells'][y][x-1] == expected[-1] and end['cells'][y][x] == ' '
     check('end caret follows the actual wrapped draft tail',end_at_tail,end['cursor'])
     check('send has not happened while draft is being edited',not f.calls() and not any(e['kind']=='input' for e in f.events()),len(f.calls()))
-    f.send(b'\x1b[17~')
-    read = frame('F6 reading: draft read only and hardware cursor hidden')
-    check('reading focus has explicit read-only input and hides cursor','草稿只读' in read['screen'] and not read['cursor_visible'],{'cursor_visible':read['cursor_visible'],'read_only': '草稿只读' in read['screen']})
-    f.send(b'\x1b[17~')
-    edit = frame('F6 returns to editing: same end caret and editable frame')
-    check('F6 restores editor position and explicit input focus',cursor_inside(edit) and edit['cursor']==end['cursor'] and '输入中' in edit['screen'],{'cursor':edit['cursor'],'prior':end['cursor']})
+    f.send(b'\x1b[1;2A')
+    read = frame('Shift Up reading: draft read only and hardware cursor hidden')
+    check('reading focus has explicit read-only input and hides cursor','Shift↓ 输入' in read['screen'] and not read['cursor_visible'],{'cursor_visible':read['cursor_visible'],'read_only': 'Shift↓ 输入' in read['screen']})
+    f.send(b'\x1b[1;2B')
+    edit = frame('Shift Down returns to editing: same end caret and editable frame')
+    check('Shift Down restores editor position and explicit input focus',cursor_inside(edit) and edit['cursor']==end['cursor'] and 'Enter 发送' in edit['screen'],{'cursor':edit['cursor'],'prior':end['cursor']})
     f.send('\r')
     f.wait(lambda:len(f.calls())>=1,'silent model request starts')
     silent_a = frame('Sent input: exact original words, receipt and silent model A')
@@ -660,7 +682,7 @@ def feedback_flow(f):
     inputs = [e for e in f.events() if e['kind']=='input']
     sent_text = ''.join(part.get('text','') for part in inputs[0].get('data',{}).get('message',{}).get('content',[])) if inputs else None
     check('sent input is preserved exactly as a durable input',len(inputs)==1 and sent_text==expected,{'input_count':len(inputs),'sent_text':sent_text,'expected':expected})
-    check('sent words and receipt are visible','FEEDBACK_DRAFT_TAIL' in silent_a['screen'] and bool(re.search('已接收|已纳入|已发送',silent_a['screen'])),silent_a['screen'])
+    check('sent words and receipt are visible','中文光标' in silent_a['screen'] and bool(re.search('已收到|已接收|已纳入|已发送',silent_a['screen'])),silent_a['screen'])
     check('silent model gives changing activity feedback',bool(spinner(silent_a)) and spinner(silent_a)!=spinner(silent_b),[spinner(silent_a),spinner(silent_b)])
     f.wait(lambda:'FLOW_MODEL_PREVIEW' in f.screen(),'real SSE preview appears')
     preview = frame('Streaming model: live preview is explicitly not delivered')
@@ -674,7 +696,6 @@ def feedback_flow(f):
     foreground = next(e for e in f.events() if e['kind']=='input' and 'FRONT_QUICK_REPLY' in json.dumps(e))
     delivered = next(e for e in f.events() if e['kind']=='delivery' and e.get('reply_to')==foreground['id'])
     check('independent foreground has its actual matching delivery',True,{'input_id':foreground['id'],'delivery_id':delivered['id'],'reply_to':delivered['reply_to']})
-    f.wait(lambda:any(e['kind']=='model_message' and 'ROOT_CONTINUES_WAITING' in json.dumps(e) for e in f.events()),'parent returns to waiting for original child after independent delivery')
     shell_a = frame('Root has delivered, background shell is still silent and active A')
     f.pump(.23)
     shell_b = frame('Background silent shell B: root delivery must not hide activity')
@@ -684,12 +705,12 @@ def feedback_flow(f):
     for capture in (silent_a,silent_b,preview,shell_a,shell_b):
         check('default body has no user/Agent role header: '+capture['step'],not bool(re.search(r'(?m)^\s*(?:你\s*·|Agent(?:\s*·|\s*$))',capture['screen'])),capture['step'])
     f.send(b'\x03')
-    f.wait(lambda:f.state().get('paused') and f.state().get('unknown_writes'),'pause records uncertain real shell write')
-    paused_a = frame('Pause: spinner stops; uncertain writes require reconciliation')
+    f.wait(lambda:f.state().get('paused') and any(e['kind']=='tool_result' and e.get('data',{}).get('uncertain') for e in f.events()),'stop retains interrupted shell fact')
+    paused_a = frame('Stopped: interrupted execution remains an observed fact')
     f.pump(.23)
     paused_b = frame('Paused B: no continued activity or claim all processes terminated')
     check('paused screen stops spinner',not spinner(paused_a) and not spinner(paused_b),[spinner(paused_a),spinner(paused_b)])
-    check('pause reflects uncertainty without false global termination',bool(re.search('暂停|核查',paused_a['screen'])) and not bool(re.search('全部已停止|全部终止|所有进程已终止',paused_a['screen'])),{'paused':paused_a['paused'],'unknown_writes':paused_a['unknown_writes']})
+    check('pause reflects uncertainty without false global termination',bool(re.search('暂停|停止|中断',paused_a['screen'])) and not bool(re.search('全部已停止|全部终止|所有进程已终止',paused_a['screen'])),{'paused':paused_a['paused']})
     check('cancelled shell has no invented future output or worker delivery',not (f.workspace/'FEEDBACK_WORKER_DONE').exists() and not any('WORKER_FINAL_MUST_NOT_APPEAR' in json.dumps(e) for e in f.events()),len(f.events()))
     f.quit()
     failed = [c['name'] for c in f.acceptance_checks if not c['passed']]
@@ -748,10 +769,8 @@ def workspace_flow(f):
     f.wait(lambda:any(e['kind']=='delivery' and e.get('job_id')!=question.get('job_id') for e in f.events()),'child job settles independently')
     f.pump(.3)
     check('session list is not a job list',len(f.session_states())==1 and len(f.state()['jobs'])==2,{'sessions':1,'jobs':len(f.state()['jobs'])})
-    # The legacy reader shares the asynchronous session-index path. Close it
-    # immediately and type while its result can still arrive.
-    f.send('/sessions\r')
-    f.send(b'\x1b')
+    # Refresh the actual sidebar, then type while its async index can arrive.
+    f.send(b'\x1b[1;2D\x1b[1;2C')
     f.pump(.12)
     f.send('ASYNC_DRAFT_NOT_STOLEN')
     f.wait(lambda:any(d.get('draft')=='ASYNC_DRAFT_NOT_STOLEN' for d in f.saved_drafts()),'input survives pending session index')
@@ -759,7 +778,7 @@ def workspace_flow(f):
     f.capture('Session reader cancellation leaves native editing draft intact')
     check('async session result leaves editable draft intact',any(d.get('draft')=='ASYNC_DRAFT_NOT_STOLEN' for d in f.saved_drafts()) and f.cursor_visible)
     f.send(b'\x01\x0b')
-    f.send('/reply '+question['id']+'\r')
+    f.reply(question)
     draft = '保留回复草稿_A\nTARGET_CURSOR_A'
     f.send('\x1b[200~'+draft+'\x1b[201~')
     f.send(b'\x1b[A\x01'+b'\x1b[C'*4)
@@ -782,7 +801,7 @@ def workspace_flow(f):
     f.wait(lambda:len(f.session_states())==2,'actual new SQLite session')
     second = next(s for s in f.session_states() if s!=original)
     f.observed_session = second
-    check('session change saves and pauses the source',f.state(original)['paused'] and any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()))
+    check('session change saves the source without stopping',not f.state(original)['paused'] and any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()))
     check('new session and focus actions do not call models',len(f.calls())==before)
     f.send(b'\x1b[1;2B')
     body('WORKSPACE_API_A','api_a','fixture')
@@ -792,7 +811,7 @@ def workspace_flow(f):
     f.send(b'\x1b[1;2D\x1b[F\r')
     f.wait(lambda:'保留回复!草稿_A' in f.screen(),'sidebar opens the original session')
     f.observed_session = original
-    f.capture('Sidebar switches back to paused source: reply target and multiline draft remain')
+    f.capture('Sidebar switches back to live source: reply target and multiline draft remain')
     check('reopened session retains its exact target and readable question',any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()) and f.visible('回复：WORKSPACE_REPLY_QUESTION'))
     f.send(b'\x1b[1;2D\x1b[F\r')
     f.wait(lambda:'API_A_ROUTE_CONFIRMED' in f.screen(),'sidebar returns to second session')
@@ -904,26 +923,18 @@ def sidebar_flow(f):
         # avoiding the title/status separator and any scrollbar hit region.
         f.send(f'\x1b[<0;6;{row+1}M\x1b[<0;6;{row+1}m')
     def verify_session(session):
-        # Verify the application's actual runtime ID through its local status
-        # reader; sidebar titles themselves cannot prove routing correctness.
-        f.send(b'\x1b[1;2B\x01\x0b')
-        f.send('/status\r')
-        f.wait(lambda:f.visible('Session: '+session),'runtime opens exact session '+session)
-        status = f.screen()
-        f.send(b'\x1b')
-        f.pump(.12)
-        return status
+        return f.verify_selected_session(session)
     original = f.state()['id']
     f.observed_session = original
     now = int(time.time()*1000)
     seeded = {}
-    with closing(sqlite3.connect(f.data/'sessions.sqlite3')) as connection:
+    with closing(sqlite3.connect(f.data/'sessions.sqlite')) as connection:
         template = f.state(original)
         for index in range(32,0,-1):
             session, job, event = (str(uuid.uuid4()) for _ in range(3))
             title = f'授权模块 · 收紧中文路径权限与历史配置，保留相同开头以检查辨识 · 任务{index:02}'
             snapshot = copy.deepcopy(template)
-            snapshot.update(id=session,focus=job,revision=1,pending_inputs=[],paused=False,budgets={},unknown_writes={},jobs={job:{
+            snapshot.update(id=session,focus=job,revision=1,pending_inputs=[],paused=False,budgets={},jobs={job:{
                 'id':job,'title':'Conversation','state':'Idle','inbox':[],
                 'active_input':None,'history':[event],'summary':None,'wait_for':[],
                 'current_call':None,'public_revision':1}})
@@ -938,11 +949,10 @@ def sidebar_flow(f):
                 (event,session,1,json.dumps(user),job,json.dumps(metadata)))
             seeded[index] = session
         connection.commit()
-    # Refresh once through the compatibility reader, then leave it before any
-    # content editing. No model call or private host credential is involved.
-    f.send('/sessions\r')
+    # Refresh the actual sidebar, then return to the composer.
+    f.send(b'\x1b[1;2D')
     f.wait(lambda:f.visible('授权模块'),'authored conversation index is loaded')
-    f.send(b'\x1b')
+    f.send(b'\x1b[1;2C')
     f.pump(.12)
     draft = '中文 e\u0301👩‍💻草稿'
     f.send(draft)
@@ -993,7 +1003,7 @@ def sidebar_flow(f):
     f.pump(.35)
     f.capture('Background delivery refresh preserves the browsed candidate')
     f.send('\r')
-    f.wait(lambda:f.state(original)['paused'],'source session is paused by explicit switch')
+    assert not f.state(original)['paused'], 'navigation stopped the source session'
     verify_session(seeded[1])
     f.observed_session = seeded[1]
     check('background refresh preserves candidate runtime identity',len(f.calls())==1)
@@ -1009,16 +1019,16 @@ def sidebar_flow(f):
     click(gap_row)
     status = verify_session(seeded[1])
     check('clicking a separator preserves the exact runtime session',
-        'Session: '+seeded[1] in status and len(f.calls())==1,
-        {'clicked_zero_based_row':gap_row,'verified_session':seeded[1],'verification':'/status'})
-    f.capture('Separator click keeps session 01; full runtime ID verified through /status')
+        status==seeded[1] and len(f.calls())==1,
+        {'clicked_zero_based_row':gap_row,'verified_session':seeded[1],'verification':'durable draft route'})
+    f.capture('Separator click keeps session 01; full runtime ID verified through its persisted draft')
     f.send(b'\x1b[1;2D\x1b[H')
     f.wait(lambda:locate('任务02') is not None,'candidate 02 remains available after separator click')
     row = locate('任务02')
     click(row)
     verify_session(seeded[2])
     f.observed_session = seeded[2]
-    check('clicking a title opens its real session and pauses the previous one',f.state(seeded[1])['paused'] and len(f.calls())==1)
+    check('clicking a title opens its real session without stopping the previous one',not f.state(seeded[1])['paused'] and len(f.calls())==1)
     f.capture('Single click on title opens exact session 02')
     f.send(b'\x1b[1;2D\x1b[H')
     f.wait(lambda:locate('任务03') is not None,'candidate 03 is visible')
@@ -1026,7 +1036,7 @@ def sidebar_flow(f):
     click(row + 1)
     verify_session(seeded[3])
     f.observed_session = seeded[3]
-    check('clicking the information line opens the same real session and pauses the previous one',f.state(seeded[2])['paused'] and len(f.calls())==1)
+    check('clicking the information line opens the same real session without stopping the previous one',not f.state(seeded[2])['paused'] and len(f.calls())==1)
     f.capture('Single click on status/time line opens exact session 03')
     f.send('窄屏草稿保持')
     f.wait(lambda:any(d.get('draft')=='窄屏草稿保持' for d in f.saved_drafts()),'narrow-screen parent draft saved')
@@ -1076,7 +1086,7 @@ def product_flow(f):
     original = f.state()['id']
     f.observed_session = original
     titles = [
-        ('收紧 OAuth 回调验证','question'), ('账单迁移 · 回滚前核查','unknown'),
+        ('收紧 OAuth 回调验证','question'), ('账单迁移 · 回滚前核查','paused'),
         ('解释跨域请求为什么失败','idle'), ('修复桌面端输入法组合','paused'),
         ('给导入器补取消入口','ready'), ('阅读 PR 中重复的重试','waiting'),
         ('补齐 Linux 路径转义，保留旧参数兼容 · 终端输入','idle'),
@@ -1085,7 +1095,7 @@ def product_flow(f):
         ('检查缓存失效边界','paused'), ('更新发布说明','idle'),
         ('保留登录后的跳转地址','question'), ('清理构建产物','idle'),
         ('对照新的错误码解释失败原因','idle'), ('调整窄屏表单','idle'),
-        ('迁移用户偏好设置','idle'), ('复查工作区锁冲突','unknown'),
+        ('迁移用户偏好设置','idle'), ('复查工作区锁冲突','paused'),
         ('追踪一次慢请求','idle'), ('阅读上传接口的调用关系','idle'),
         ('修复输入历史中的多行光标','idle'), ('让快捷键提示与实际动作一致','idle'),
         ('删除已经失效的兼容层','idle'), ('定位后台任务重复启动','paused'),
@@ -1096,15 +1106,14 @@ def product_flow(f):
     ]
     # These are mechanical conversation fixtures, never claimed as 32 completed model tasks.
     template = f.state(original)
-    with closing(sqlite3.connect(f.data/'sessions.sqlite3')) as connection:
+    with closing(sqlite3.connect(f.data/'sessions.sqlite')) as connection:
         for index, (title, attention) in reversed(list(enumerate(titles))):
             session, job, event, call = (str(uuid.uuid4()) for _ in range(4))
             snapshot = copy.deepcopy(template)
-            snapshot.update(id=session,focus=job,revision=1,pending_inputs=[],paused=attention in ('paused','unknown'),budgets={},unknown_writes={},jobs={job:{
+            snapshot.update(id=session,focus=job,revision=1,pending_inputs=[],paused=attention=='paused',budgets={},jobs={job:{
                 'id':job,'title':'Conversation','state':{'question':'Waiting','waiting':'Waiting','ready':'Ready','paused':'Ready'}.get(attention,'Idle'),
                 'inbox':[],'active_input':None,'history':[event],'summary':None,
                 'wait_for':['fixture-dependency'] if attention=='waiting' else [],'current_call':None,'public_revision':1}})
-            if attention=='unknown': snapshot['unknown_writes']={call:{'call_id':call,'job_id':job,'root_input':event,'tool_name':'shell'}}
             user={'id':event,'session_id':session,'job_id':job,'call_id':None,'reply_to':None,'root_input':event,'kind':'input','revision':1,
                 'data':{'source':'user','message':{'role':'user','content':[{'type':'text','text':title}]}},'timestamp':str(int(time.time()*1000)-index*60000)}
             metadata=copy.deepcopy(user);metadata['data'].pop('message')
@@ -1140,7 +1149,7 @@ def product_flow(f):
     info=sidebar[candidate_row+1]
     dim_rows={run['row'] for run in f.cell_styles if 'dim' in run['attributes'] and run['start']<width and run['end']>2}
     check('session information shows its real status and persisted local update time',
-        '核查' in info and candidate_time in info and candidate_row+1 in highlighted
+        '暂停' in info and candidate_time in info and candidate_row+1 in highlighted
         and candidate_row+1 not in bold_rows and candidate_row+2 not in highlighted
         and candidate_row+1 not in dim_rows and inactive_row+1 in dim_rows and candidate_row+2 in dim_rows,
         {'information_line':info,'expected_local_timestamp':candidate_time,'timestamp_source':'last authored persistent event','dim_rows':sorted(dim_rows)})
@@ -1225,11 +1234,12 @@ def product_flow(f):
     # Empty sessions have no list entries. Start history through /new; A still
     # owns the unanswered work input and its preserved answer draft.
     existing=set(f.session_states())
+    original_paused=f.state(original)['paused']
     menu('new');f.wait(lambda:len(f.session_states())==len(existing)+1,'fresh history conversation created')
     second=next(session for session in f.session_states() if session not in existing)
     f.observed_session=second
     original_ui=json.dumps(saved(original),ensure_ascii=False)
-    check('separate history work leaves original question and its answer draft paused',f.state(original)['paused'] and answer in original_ui and question['id'] in original_ui)
+    check('separate history work leaves original question and its answer draft intact',f.state(original)['paused']==original_paused and answer in original_ui and question['id'] in original_ui)
     for index in range(12):
         marker='历史回归 '+str(index).zfill(2)+'：复查登录边界，保留会话约束。'
         f.send(marker+'\r')
@@ -1240,7 +1250,7 @@ def product_flow(f):
         f.wait(delivered,'actual local history turn '+str(index))
     f.quit();f.restart(second);f.pump(.2);f.capture('Twelve real local turns: reopening starts with a bounded recent window')
     state=f.state(second)
-    check('completed Idle session keeps its core pause flag without offering empty resumption',state['paused'] and all(job['state']=='Idle' for job in state['jobs'].values())
+    check('completed Idle session remains idle without offering empty resumption',not state['paused'] and all(job['state']=='Idle' for job in state['jobs'].values())
         and not main_has('Ctrl+R') and not main_has('已暂停') and len(f.calls())==13)
     f.send(b'\x1b[1;2A')
     for _ in range(8):
@@ -1283,11 +1293,7 @@ def command_draft_editor(f):
     f.pump(.2)
     f.send(b'\x1b')
     f.pump(.2)
-    f.send('/status\r')
-    f.pump(.2)
-    f.send(b'\x1b')
-    f.pump(.2)
-    f.send('/diff\r')
+    f.send(b'\x04')
     f.pump(.2)
     f.send(b'\x1b')
     f.pump(.2)
@@ -1306,8 +1312,8 @@ def command_draft_editor(f):
     f.wait(lambda: f.visible('EDITOR_ACCEPTED'), 'restored editor draft submitted')
     assert 'EDITOR_REFERENCE_ONLY' in json.dumps(f.calls()), 'agent missing submitted editor draft'
     count = len(f.events())
-    f.send('/older\r')
-    f.wait(lambda: '更早会话原文' in f.screen() or '已载入最早对话' in f.screen() or '已经是最早的记录' in f.screen(), 'older records read-only view or earliest boundary')
+    f.send(b'\x1b[1;2A\x1b[H')
+    f.wait(lambda: 'EDITOR_ACCEPTED' in f.screen() and not f.cursor_visible, 'current history reading stays read-only')
     if '更早会话原文' in f.screen():
         f.send('READ_ONLY_OLDER_PROBE')
         f.pump(.2)
@@ -1387,7 +1393,7 @@ def new_session_flow(f):
         not any('新会话' in line for line in lines) and not bold and f.cursor_visible
         and any('核查登录边界' in line for line in lines), {'bold_rows':sorted(bold)})
     check('starting fresh preserves the old task, question and exact unsent draft',
-        f.state(active)['paused'] and saved(active).get('draft')==retained
+        not f.state(active)['paused'] and saved(active).get('draft')==retained
         and any(e['id']==question['id'] for e in f.events(active)) and len(f.calls())==1)
     f.send('新页可直接输入')
     f.wait(lambda:saved(fresh).get('draft')=='新页可直接输入','fresh composer accepts typing immediately')
@@ -1400,15 +1406,11 @@ def new_session_flow(f):
     check('returning restores the old draft and keeps the new unsent draft',
         saved(fresh).get('draft')=='新页可直接输入' and saved(active).get('draft')==retained and len(f.calls())==1)
     f.capture('Old question, original draft and current title restore together')
-    # /status is a compatibility reader, not a public command-palette entry.
-    # The draft has already been checked; deliberately clear it to query the ID.
-    f.send(b'\x01\x0b');f.send('/status\r')
-    f.wait(lambda:f.visible('Session: '+active),'local status verifies the exact reopened runtime UUID')
-    check('returning opens the original task verified by its complete runtime UUID',
-        f.visible('Session: '+active) and len(f.calls())==1,
-        {'verified_session':active,'verification':'/status','requests':len(f.calls())})
-    f.capture('Returning to the old task is verified through its full real Session ID')
-    f.send(b'\x1b');f.pump(.12)
+    verified=f.verify_selected_session(active)
+    check('returning opens the original task verified by a unique persisted unsent draft',
+        verified==active and len(f.calls())==1,
+        {'verified_session':active,'verification':'durable draft route','requests':len(f.calls())})
+    f.capture('Returning to the old task is verified through its actual Session draft file')
     f.quit()
 
 
@@ -1420,29 +1422,29 @@ def session_commands(f):
     f.send(b'\x01\x0b')
     f.send('/model openai:fixture-native-next\r')
     f.pump(.4)
-    assert f.state()['paused'], 'model switch resumed work automatically'
+    assert not f.state()['paused'], 'model switch fabricated a stop'
     assert not f.calls(), 'model switch executed model request'
-    f.send('/export\r')
+    f.action('导出对话记录')
     f.wait(lambda: bool(list(f.data.rglob('*.html')) + list(f.workspace.rglob('*.html'))), 'real HTML export')
     f.pump(.2)
     f.send(b'\x1b')
     f.pump(.1)
     f.send('/new\r')
     def session_ids():
-        with closing(sqlite3.connect(f.data / 'sessions.sqlite3')) as connection:
+        with closing(sqlite3.connect(f.data / 'sessions.sqlite')) as connection:
             return [row[0] for row in connection.execute('SELECT id FROM sessions')]
     f.wait(lambda: len(session_ids()) == 2, 'new session created')
     assert original in session_ids()
     current=next(session for session in session_ids() if session!=original)
-    f.send('/sessions\r')  # Legacy alias stays parseable; empty sessions are omitted.
+    f.send(b'\x1b[1;2D')
     f.pump(.3)
-    assert not f.visible('已暂停') and not f.visible('新会话'), 'empty command-only sessions became conversation entries'
-    f.send(b'\x1b');f.pump(.12)
-    f.send('/status\r')
-    f.wait(lambda: f.visible('Session: ' + current), 'status verifies /new kept the actual fresh session UUID')
-    f.capture('Empty conversations stay omitted; /new runtime identity is verified through local status')
-    f.send(b'\x1b')
-    f.pump(.2)
+    f.screen()
+    width=max(26,min(32,f.cols//4)) if f.cols>=80 else f.cols
+    sidebar='\n'.join(''.join(row[:width]) for row in f.terminal_cells)
+    assert '已暂停' not in sidebar and '新会话' not in sidebar, 'empty command-only sessions became conversation entries'
+    f.send(b'\x1b[1;2C')
+    f.verify_selected_session(current)
+    f.capture('Empty conversations stay omitted; fresh Session UUID verified through its persisted draft')
     assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'session command created agent inputs'
     f.quit()
 
@@ -1595,52 +1597,17 @@ def live_shell(f):
     f.wait(lambda: f.clipboard.exists() and f.clipboard.read_text() == 'ft', 'Ctrl+Y proves the real editor selection exists before stopping')
     f.send(b'\x03')
     f.wait(lambda: f.state().get('paused'), 'Ctrl+C pauses running shell despite input selection', timeout=3)
-    f.wait(lambda: bool(f.state().get('unknown_writes')), 'interrupted shell needs reconciliation')
-    f.wait(lambda: any(d.get('draft') == 'Preserve this follow-up draft' for d in f.saved_drafts()), 'global pause preserves selected draft')
-    f.capture("Paused real shell; unknown write retained")
+    f.wait(lambda: any(e['kind']=='tool_result' and e.get('data',{}).get('uncertain') for e in f.events()), 'interrupted shell fact is durable')
+    f.wait(lambda: any(d.get('draft') == 'Preserve this follow-up draft' for d in f.saved_drafts()), 'stop preserves selected draft')
     assert not (f.workspace / 'shell-finished').exists(), 'cancelled shell kept executing'
-    f.send(b'\x01\x0b')
-    draft = 'KEEP_FIRST_LINE\nKEEP_SECOND_LINE'
-    f.send(b'\x1b[200~' + draft.encode() + b'\x1b[201~')
-    f.send(b'\x1b[A\x01' + b'\x1b[C' * 5)  # First line, column five.
-    f.wait(lambda: any(d.get('draft') == draft for d in f.saved_drafts()), 'multiline draft prepared for reconciliation')
-    for cancel in (True, False):
-        f.send(b'\x10')  # Command palette preserves editor text and cursor.
-        f.send('核查\r')  # Contextual action appears only for actual unknown writes.
-        f.wait(lambda: '结果未知' in f.screen(), 'unknown write picker identifies interrupted shell')
-        f.send('\r')
-        f.wait(lambda: '核查表单' in f.screen(), 'reconciliation uses a separate form')
-        f.send(b'\x04')
-        f.wait(lambda:'核查证据' in f.screen(),'reconciliation evidence reader opens')
-        if 'LIVE_STDOUT_READY' not in f.screen():
-            f.send(b'\x1b[6~')  # Narrow viewport: read the actual parameter section.
-        f.wait(lambda: 'LIVE_STDOUT_READY' in f.screen(), 'reconcile evidence contains original shell command')
-        f.capture('Reconciliation evidence reads the actual interrupted command')
-        f.send(b'\x1b')
-        f.pump(.2)
-        assert '核查表单' in f.screen(), 'Esc from evidence did not return to its form'
-        f.send(b'\x12')
-        f.pump(.2)
-        assert f.state().get('paused'), 'Ctrl+R resumed while reconciliation form was active'
-        if cancel:
-            f.send('DISCARD_THIS_RECONCILIATION')
-            f.send(b'\x1b')
-            f.pump(.2)
-            # Close any restored picker parent, then edit the preserved cursor.
-            f.send(b'\x1b')
-            f.pump(.2)
-            f.send('!')
-            expected = 'KEEP_!FIRST_LINE\nKEEP_SECOND_LINE'
-            f.wait(lambda: any(d.get('draft') == expected for d in f.saved_drafts()), 'cancel restores multiline draft and exact insertion cursor')
-            assert f.state().get('unknown_writes'), 'cancel resolved an unknown write'
-            assert any(d.get('draft')==expected and d.get('reply_to') is None for d in f.saved_drafts()), 'cancel changed the durable input target'
-            f.capture('Cancel restores original multiline draft, target and insertion cursor')
-        else:
-            f.send('Checked workspace: shell-finished absent; process cancelled.\r')
-    f.wait(lambda: not f.state().get('unknown_writes'), 'observed reconciliation recorded')
-    assert f.state().get('paused'), 'reconcile automatically resumed work'
-    assert len(f.calls()) == 2, 'reconciliation reissued model or shell work'
-    f.capture("Recorded observation clears unknown write and keeps session paused")
+    f.capture('Stopped shell retains its cause and actual output; no reconciliation workflow')
+    count = len(f.calls())
+    f.pump(.3)
+    assert len(f.calls()) == count, 'stopped execution replayed work'
+    f.send(b'\x10')
+    f.pump(.1)
+    assert not re.search('核查表单|/reconcile', f.screen()), 'removed reconciliation flow remains visible'
+    f.send(b'\x1b')
     f.quit()
 
 
@@ -1651,7 +1618,7 @@ def reading_detail_copy(f):
     f.wait(lambda: 'REVIEW_COMPLETE' in f.screen(), 'engineering response complete')
     count = len(f.calls())
     f.capture("Engineering transcript shows a collapsed tool alongside answer")
-    f.send(b'\x1b[17~')  # F6 moves between input and conversation.
+    f.send(b'\x1b[1;2A')  # Shift Up enters conversation reading.
     f.send(b'\x1b[A')  # Select preceding read_file result.
     f.send('d')
     f.wait(lambda: 'TOOL_BEGIN' in f.screen(), 'selected tool opens complete result body')
@@ -1693,7 +1660,7 @@ def persistent_search(f):
     # Long-history setup copies already validated native event shapes. It does not
     # run 70 synthetic model turns merely to push the real first requirement out
     # of the startup page. The following browsing/search actions use a real PTY.
-    with closing(sqlite3.connect(f.data / 'sessions.sqlite3')) as connection:
+    with closing(sqlite3.connect(f.data / 'sessions.sqlite')) as connection:
         snapshot = json.loads(connection.execute('SELECT snapshot FROM sessions WHERE id=?', (session,)).fetchone()[0])
         for n in range(70):
             user, response, delivery = (copy.deepcopy(template) for template in (input_template, model_template, delivery_template))
@@ -1706,22 +1673,25 @@ def persistent_search(f):
             response['data']['response']['choice'] = [{'type': 'text', 'text': f'Later engineering answer {n}'}]
             delivery['data']['response_event'] = response['id']
             for event in (user, response, delivery):
-                connection.execute('INSERT INTO events (id,session_id,revision,payload,job_id) VALUES (?,?,?,?,?)', (event['id'],session,event['revision'],json.dumps(event),event.get('job_id')))
+                metadata=copy.deepcopy(event)
+                for key in ('message','response','stream_items','covered_ids'): metadata['data'].pop(key,None)
+                connection.execute('INSERT INTO events (id,session_id,revision,payload,job_id,metadata) VALUES (?,?,?,?,?,?)', (event['id'],session,event['revision'],json.dumps(event),event.get('job_id'),json.dumps(metadata)))
             snapshot['jobs'][owner]['history'].extend([user['id'], response['id']])
         connection.execute('UPDATE sessions SET snapshot=? WHERE id=?', (json.dumps(snapshot), session))
+        connection.commit()
     f.restart(session)
     f.pump(.3)
     assert 'ARCHIVE_REQUIRED_FLAG' not in f.screen(), 'target was still in the loaded recent page'
     f.capture("Reopened long session; original requirement is outside startup page")
     before = len(f.events())
-    f.send('/older\t\r')
+    f.send(b'\x1b[1;2A\x1b[H')
     f.pump(.3)
     assert len(f.events()) == before, 'browsing older events mutated conversation'
-    f.send('/search ARCHIVE_REQUIRED_FLAG\r')
-    f.wait(lambda: f.visible('original signed cents'), 'persistent full-history search produces a real hit beyond its query title')
+    f.send(b'\x06');f.send('ARCHIVE_REQUIRED_FLAG')
+    f.wait(lambda: f.visible('preserve the original'), 'persistent full-history search produces a real hit beyond its query title')
     f.capture("Full SQLite search finds original requirement after browsing older history")
     f.send('\r')
-    f.wait(lambda: f.visible('搜索原文') and f.visible('original signed cents'), 'search selection opens the original body rather than leaving its picker')
+    f.wait(lambda: f.visible('搜索原文') and f.visible('original signed') and f.visible('cents requirement.'), 'search selection opens the original body rather than leaving its picker')
     f.send(b'\x19')
     f.wait(lambda: f.clipboard.exists() and 'signed cents requirement.' in f.clipboard.read_text(), 'search detail preserves original text across terminal soft wrapping')
     assert len(f.events()) == before and len(f.calls()) == 1, 'search or opening hit invoked model/state mutation'
@@ -1736,7 +1706,7 @@ def explicit_question_target(f):
     questions = [e for e in f.events() if e['kind'] == 'question']
     selected = next(e for e in questions if 'ROOT_FORMAT' in e['data']['question'])
     f.capture("Two pending questions remain independently addressable")
-    f.send('/reply ' + selected['id'] + '\r')
+    f.reply(selected)
     f.pump(.3)
     f.send('ROOT_ANSWER_JSON\r')
     f.wait(lambda: any(e['kind'] == 'input' and e.get('reply_to') == selected['id'] for e in f.events()), 'answer explicitly links chosen question')
@@ -1744,9 +1714,10 @@ def explicit_question_target(f):
     f.capture("Explicit answer targets earlier root question, leaves child question pending")
     child = next(e for e in questions if e['id'] != selected['id'])
     assert not any(e['kind'] == 'input' and e.get('reply_to') == child['id'] for e in f.events()), 'another pending question was answered accidentally'
-    f.send('/message\r')  # Explicitly cancel reply routing; Esc only closes layers.
+    f.reply(child)
+    f.action('写新要求')  # Explicitly cancel reply routing; Esc only closes layers.
     f.pump(.2)
-    f.send('/latest\r')
+    f.send(b'\x1b[1;2A\x1b[F\x1b[1;2B')
     f.pump(.3)
     f.capture("Returning to latest history preserves cancelled reply routing")
     f.send('ORDINARY_NEW_REQUIREMENT\r')
@@ -1779,7 +1750,7 @@ def old_reader_and_delivery(f):
     f.wait(lambda: any(e['kind'] == 'delivery' for e in f.events()), 'first long delivery is durable')
     f.send('NEW_OUTPUT_TASK\r')
     f.wait(lambda: len(f.calls()) == 2, 'second reply is in progress')
-    f.send(b'\x1b[17~\x1b[H')  # F6 and Home browse the old content.
+    f.send(b'\x1b[1;2A\x1b[H')  # Shift Up and Home browse the old content.
     f.wait(lambda: 'OLD_INPUT_ANCHOR' in f.screen(), 'old content in viewport')
     f.capture('Reading old content while a new answer is still pending')
     f.send(b'\x1bOQ')
@@ -1797,13 +1768,12 @@ def old_reader_and_delivery(f):
     f.resize(*target)
     f.pump(.5)
     resized = f.screen().splitlines()
-    assert f.terminal_cells[1][-1] == '─' and '阅读：' in resized[-1], 'application did not redraw header/footer at the real resized terminal geometry'
+    assert len(f.terminal_cells)==target[0] and all(len(row)==target[1] for row in f.terminal_cells) and 'BONE' in resized[0] and ('Shift↓ 输入' in resized[-1] or '阅读：' in resized[-1]), 'application did not redraw header/footer at the real resized terminal geometry'
     assert 'OLD_INPUT_ANCHOR' in f.screen(), 'resize lost the old reading position'
     f.capture('Resize retains the same old reading anchor')
     calls = len(f.calls())
     events = len(f.events())
-    f.send(b'\x1b[17~')  # Back to input, then jump to a real delivered answer.
-    f.send('/delivery\r')
+    f.send(b'\x1b[F');f.pump(.2);f.send('d')
     f.wait(lambda: 'LATEST_DELIVERY_BEGIN' in f.screen(), 'delivery entry opens the latest complete answer')
     f.capture('Delivery entry opens the existing long answer directly')
     f.send(b'\x19')
@@ -1829,44 +1799,67 @@ def quiet_success_and_loud_failure(f):
     f.quit()
 
 
-def reconcile_keeps_reply_target(f):
+def lifecycle_background(f):
+    """Real running shell survives model change, editor suspension and navigation."""
+    original = f.state()['id']
+    f.observed_session = original
+    f.send('LIFECYCLE_ORIGINAL\r')
+    f.wait(lambda:(f.workspace/'worker-started').exists(), 'actual shell has started')
+    f.send('/model openai:future-only-model\r')
+    f.wait(lambda: f.visible('future-only-model'), 'active model changes future recipe')
+    assert not f.state(original)['paused'], 'model change stopped running work'
+    editor = f.root/'fixture-editor'
+    editor.write_text('#!/bin/sh\nprintf "LIFECYCLE_EDITOR_READY"\nIFS= read -r value\nprintf "%s" "$value" > "$1"\n')
+    f.send(b'\x07')
+    f.wait(lambda:f.visible('LIFECYCLE_EDITOR_READY'), 'editor owns the actual terminal')
+    (f.workspace/'release-worker').touch()
+    f.wait(lambda:any(e['kind']=='delivery' and e.get('data',{}).get('response_event') in {m['id'] for m in f.events(original) if m['kind']=='model_message' and 'ORIGINAL_BACKGROUND_DONE' in json.dumps(m)} for e in f.events(original)), 'Job completes while external editor still owns terminal')
+    assert f.proc.poll() is None and not f.state(original)['paused'], 'editor suspension stopped engine'
+    f.send('UNSENT_EDITOR_DRAFT\r')
+    f.wait(lambda:any(d.get('draft')=='UNSENT_EDITOR_DRAFT' for d in f.saved_drafts()), 'editor returns exact unsent draft')
+    assert len(f.calls()) == 2, 'editor submitted draft'
+    assert f.calls()[0]['body']['model']=='fixture' and f.calls()[1]['body']['model']=='future-only-model', 'in-flight/current call recipe boundary violated'
+    f.capture('Original shell completes during editor; future model request uses selected recipe')
+    f.send(b'\x01\x0b')
+    f.send('LIFECYCLE_DELAYED\r')
+    f.wait(lambda:len(f.calls())==3, 'second original request in flight')
+    f.send('/new\r')
+    f.wait(lambda:len(f.session_states())==2, 'navigation selects fresh session')
+    selected = next(s for s in f.session_states() if s != original)
+    f.observed_session = selected
+    f.send('LIFECYCLE_CURRENT\r')
+    f.wait(lambda:any(e['kind']=='model_message' and 'CURRENT_SESSION_DONE' in json.dumps(e) for e in f.events(selected)), 'selected session executes while original session remains active')
+    f.send('CURRENT_UNSENT_DRAFT')
+    f.wait(lambda:any(d.get('draft')=='CURRENT_UNSENT_DRAFT' for d in f.saved_drafts()), 'selected composer stays responsive')
+    f.wait(lambda:any(e['kind']=='delivery' and e.get('data',{}).get('response_event') in {m['id'] for m in f.events(original) if m['kind']=='model_message' and 'DELAYED_BACKGROUND_DONE' in json.dumps(m)} for e in f.events(original)), 'background session delivers after navigation')
+    assert not f.state(original)['paused'] and not any(e['kind']=='stopped' for e in f.events(original)), 'soft navigation cancelled original'
+    assert not any('DELAYED_BACKGROUND_DONE' in json.dumps(e) or 'CURRENT_UNSENT_DRAFT' in json.dumps(e) for e in f.events(selected)), 'background result or draft entered selected session'
+    assert any(e['kind']=='delivery' for e in f.events(selected)), 'selected work did not deliver'
+    assert any(d.get('draft')=='CURRENT_UNSENT_DRAFT' for d in f.saved_drafts()), 'background result overwrote selected draft'
+    f.capture('Background delivery leaves fresh session and its unsent draft selected')
+    f.quit()
+
+
+def stop_keeps_reply_target(f):
     f.send('Coordinate a question and a live worker.\r')
     f.wait(lambda: any(e['kind'] == 'question' for e in f.events()) and any(e['kind'] == 'tool_started' and e.get('data', {}).get('tool_name') == 'shell' for e in f.events()), 'question and live worker are both active')
     question = next(e for e in f.events() if e['kind'] == 'question')
-    f.send('/reply ' + question['id'] + '\r')
+    f.reply(question)
     f.pump(.2)
     draft = 'ANSWER_FIRST_LINE\nANSWER_SECOND_LINE'
     f.send(b'\x1b[200~' + draft.encode() + b'\x1b[201~')
     f.send(b'\x1b[A\x01' + b'\x1b[C' * 7)
     f.send(b'\x03')
-    f.wait(lambda: f.state().get('paused') and bool(f.state().get('unknown_writes')), 'worker interruption records unknown write')
+    f.wait(lambda: f.state().get('paused') and any(e['kind']=='tool_result' and e.get('data',{}).get('uncertain') for e in f.events()), 'worker interruption retains an observed result')
     count = len(f.calls())
     before = len([e for e in f.events() if e['kind'] == 'input'])
-    f.send(b'\x10')
-    f.send('核查\r')
-    f.wait(lambda: '结果未知' in f.screen(), 'unknown write list opened from reply draft')
-    f.send('\r')
-    f.wait(lambda: '核查表单' in f.screen(), 'separate reconciliation form opened')
-    f.send('CANCEL_THIS_NOTE')
-    f.send(b'\x04')
-    f.wait(lambda:'核查证据' in f.screen(),'reply reconciliation evidence reader opens')
-    if 'REPLY_WORKER_STARTED' not in f.screen():
-        f.send(b'\x1b[6~')
-    f.wait(lambda: 'REPLY_WORKER_STARTED' in f.screen(), 'worker evidence opened')
-    f.capture('Reconcile evidence overlays a separate note, retaining the original reply target')
-    f.send(b'\x1b')
-    f.pump(.2)
-    f.send(b'\x1b')
-    f.pump(.2)
     f.send('!')
     expected = 'ANSWER_!FIRST_LINE\nANSWER_SECOND_LINE'
-    f.wait(lambda: any(d.get('draft') == expected for d in f.saved_drafts()), 'cancel restores reply draft at original insertion cursor')
-    assert any(d.get('draft')==expected and d.get('reply_to')==question['id'] for d in f.saved_drafts()), 'reconciliation cancel lost the saved specific reply target'
-    assert f.visible('回复：'+question['data']['question']), 'readable reply question is not visible after reconciliation cancel'
-    assert len(f.calls()) == count, 'read or cancel replayed model work'
-    assert len([e for e in f.events() if e['kind'] == 'input']) == before, 'reconciliation cancel submitted reply draft'
-    assert f.state().get('paused') and f.state().get('unknown_writes'), 'reconciliation cancel changed execution state'
-    f.capture('Cancel restores exact reply target, multiline text and cursor; no input submitted')
+    f.wait(lambda: any(d.get('draft') == expected and d.get('reply_to') == question['id'] for d in f.saved_drafts()), 'stop preserves reply target and exact insertion cursor')
+    assert f.visible('回复：'+question['data']['question']), 'stop lost readable reply question'
+    assert len(f.calls()) == count and len([e for e in f.events() if e['kind']=='input']) == before, 'stop submitted draft or replayed work'
+    assert not (f.workspace/'reply-worker-finished').exists(), 'stopped worker continued effect'
+    f.capture('Explicit stop preserves exact reply target, multiline draft and cursor')
     f.quit()
 
 
@@ -1882,7 +1875,7 @@ def exit_resume(f):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/bone')
-    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','reconcile-reply','feedback-flow','workspace-flow','sidebar-flow','product-flow','new-session-flow'])
+    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','stop-reply','lifecycle-background','feedback-flow','workspace-flow','sidebar-flow','product-flow','new-session-flow'])
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument('--size', default='80x24', choices=['80x24', '120x40'], help='real terminal columns x rows')
     parser.add_argument('--keep-going', action='store_true', help='record every selected scenario, then fail if any failed')
@@ -1890,6 +1883,11 @@ def main():
     args = parser.parse_args()
     verify_vt_replay()
     cases = [
+        ('lifecycle-background', [
+            {'contains':['LIFECYCLE_ORIGINAL'],'output':[tool('shell',{'command':'touch worker-started; while [ ! -e release-worker ]; do sleep 0.05; done; printf \"LIFECYCLE_SHELL_DONE\\n\"','timeout_seconds':10})]},
+            {'text':'ORIGINAL_BACKGROUND_DONE'},
+            {'contains':['LIFECYCLE_DELAYED'],'delay_seconds':1.5,'text':'DELAYED_BACKGROUND_DONE'},
+            {'contains':['LIFECYCLE_CURRENT'],'text':'CURRENT_SESSION_DONE'}], lifecycle_background),
         ('new-session-flow', [{'contains':['NEW_SESSION_TASK'],'delay_seconds':1.8,
             'output':[tool('ask_user',{'question':'核查登录边界：要保留原有跳转地址吗？'})]}],new_session_flow),
         ('product-flow', [{'delay_seconds':1.8,'output':[tool('ask_user',{'question':'失败回调是否继续返回原地址？'})]}]+[
@@ -1912,7 +1910,6 @@ def main():
             {'match_job_title':'Conversation','text':'FLOW_MODEL_PREVIEW\nROOT_BACKGROUND_DELIVERY','delta_chunk_chars':14,'event_delay_seconds':.1,'event_delays':{'response.completed':1.6}},
             {'match_job_title':'Worker','output':[tool('shell',{'command':'while [ ! -e release-feedback-worker ]; do sleep 0.05; done; touch FEEDBACK_WORKER_DONE','timeout_seconds':30})]},
             {'match_job_title':'Conversation','contains':['FRONT_QUICK_REPLY'],'text':'INDEPENDENT_FOREGROUND_DELIVERED'},
-            {'match_job_title':'Conversation','delay_seconds':.1,'text':'ROOT_CONTINUES_WAITING'},
             {'match_job_title':'Worker','text':'WORKER_FINAL_MUST_NOT_APPEAR'}],feedback_flow),
         ('slash-inline', [], slash_inline),
         ('multiline-undo', [{'contains':['第一行 e\u0301👩‍💻!', '第二行 preserve cents'], 'text':'MULTILINE_EDITOR_ACCEPTED'}], multiline_undo),
@@ -1940,12 +1937,12 @@ def main():
             {'output': [tool('read_file', {'path': 'success.txt'})]},
             {'output': [tool('shell', {'command': 'printf "Build step started\\nCHECK_FAILURE_STDERR: compilation failed\\nBuild step finished\\n" >&2; exit 17', 'timeout_seconds': 5})]},
             {'delay_seconds': 2, 'text': 'The check failed; fix CHECK_FAILURE_STDERR before continuing.'}], quiet_success_and_loud_failure),
-        ('reconcile-reply', [
+        ('stop-reply', [
             {'match_job_title': 'Conversation', 'output': [tool('job_send', {'title': 'Worker', 'message': 'Start the worker command.'})]},
             {'match_job_title': 'Conversation', 'output': [tool('ask_user', {'question': 'REPLY_TARGET: which output format?'})]},
-            {'match_job_title': 'Worker', 'output': [tool('shell', {'command': 'printf "REPLY_WORKER_STARTED\\n"; while [ ! -e release-worker ]; do sleep 0.05; done; touch reply-worker-finished', 'timeout_seconds': 15})]}], reconcile_keeps_reply_target),
+            {'match_job_title': 'Worker', 'output': [tool('shell', {'command': 'printf "REPLY_WORKER_STARTED\\n"; while [ ! -e release-worker ]; do sleep 0.05; done; touch reply-worker-finished', 'timeout_seconds': 15})]}], stop_keeps_reply_target),
         ('paste', [{'contains':['PASTE_ONE','PASTE_TWO'], 'text':'PASTE_ACCEPTED'}], paste_and_enter),
-        ('concurrent', [{'delay_seconds':2,'text':'INITIAL_COMPLETE'}, {'contains':['ADDED_CONSTRAINT'],'text':'CONSTRAINT_ACCEPTED'}, {'delay_seconds':2,'text':'Initial work completed with the added constraint.'}], concurrent_input),
+        ('concurrent', [{'delay_seconds':2,'text':'INITIAL_COMPLETE'}, {'contains':['ADDED_CONSTRAINT'],'delay_seconds':.5,'text':'CONSTRAINT_ACCEPTED'}, {'delay_seconds':2,'text':'Initial work completed with the added constraint.'}], concurrent_input),
         ('pause', [{'delay_seconds':2,'text':'PAUSE_COMPLETE'}, {'text':'PAUSE_COMPLETE'}], pause_resume),
         ('question', [
             {'match_job_title':'Conversation','output':[tool('job_send',{'title':'Child','message':'CHILD_TASK'})]},

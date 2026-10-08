@@ -16,7 +16,7 @@ pub(crate) fn summary_task() -> Message {
 
 fn event_message(event: &Event) -> Result<Option<Message>> {
     match event.kind.as_str() {
-        "input" | "tool_result" | "tool_reconciled" | "context_note" => {
+        "input" | "tool_result" | "context_note" => {
             let value = event.data.get("message").with_context(|| {
                 format!("{} event {} has no native message", event.kind, event.id)
             })?;

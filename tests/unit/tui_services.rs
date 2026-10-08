@@ -7,7 +7,7 @@ fn drafts_roundtrip_and_reject_corruption_and_paths() {
         draft: "中文 draft".into(),
         history: vec!["one".into()],
         reply_to: Some("question-id".into()),
-        cursor: Some(3),
+        cursor: 3,
         selection: Some((0, 3)),
         ..Default::default()
     };
@@ -116,7 +116,7 @@ async fn export_reads_durable_conversation_and_escapes_script_markup() {
         serde_json::json!({"response_event":response.id}),
     );
     delivery.reply_to = Some(input);
-    let mut connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+    let mut connection = rusqlite::Connection::open(data.join("sessions.sqlite")).unwrap();
     let input_event = engine
         .read_event(delivery.reply_to.as_deref().unwrap())
         .unwrap();
@@ -128,7 +128,7 @@ async fn export_reads_durable_conversation_and_escapes_script_markup() {
     for event in [delivery, response, input_event] {
         transaction
             .execute(
-                "INSERT INTO events (id, session_id, revision, payload) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO events (id,session_id,revision,payload,job_id,metadata) VALUES (?1,?2,?3,?4,json_extract(?4,'$.job_id'),json_remove(?4,'$.data.message','$.data.response','$.data.stream_items','$.data.covered_ids'))",
                 rusqlite::params![
                     event.id,
                     event.session_id,
@@ -139,7 +139,6 @@ async fn export_reads_durable_conversation_and_escapes_script_markup() {
             .unwrap();
     }
     transaction.commit().unwrap();
-    let delivered = latest_delivery(&data, &engine.state().id).unwrap().unwrap();
     for _ in 0..300 {
         let event = bone::state::Event::new(
             &engine.state().id,
@@ -148,7 +147,7 @@ async fn export_reads_durable_conversation_and_escapes_script_markup() {
         );
         connection
             .execute(
-                "INSERT INTO events (id,session_id,revision,payload) VALUES (?1,?2,?3,?4)",
+                "INSERT INTO events (id,session_id,revision,payload,job_id,metadata) VALUES (?1,?2,?3,?4,json_extract(?4,'$.job_id'),json_remove(?4,'$.data.message','$.data.response','$.data.stream_items','$.data.covered_ids'))",
                 rusqlite::params![
                     event.id,
                     event.session_id,
@@ -158,14 +157,6 @@ async fn export_reads_durable_conversation_and_escapes_script_markup() {
             )
             .unwrap();
     }
-    assert_eq!(
-        latest_delivery(&data, &engine.state().id)
-            .unwrap()
-            .unwrap()
-            .id,
-        delivered.id,
-    );
-    assert!(latest_delivery(&data, "another-session").unwrap().is_none());
     let path = export(&data, &engine.state().id).unwrap();
     let html = fs::read_to_string(path).unwrap();
     assert!(html.contains("hello &lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
@@ -188,13 +179,20 @@ fn file_index_ignores_generated_hidden_and_symlinks() {
 }
 
 #[test]
-fn saved_drafts_are_backward_compatible_and_bounded_without_overwriting_good_state() {
+fn saved_drafts_require_current_fields_and_preserve_good_state_on_invalid_save() {
     let dir = tempfile::tempdir().unwrap();
     let path = session_path(dir.path(), "session").unwrap();
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, r#"{"draft":"legacy draft","history":[]}"#).unwrap();
-    let mut saved = load(dir.path(), "session").unwrap();
-    assert!(saved.drafts.is_empty());
+    assert!(load(dir.path(), "session").is_err());
+    let mut saved = UiSaved {
+        draft: "current draft".into(),
+        ..Default::default()
+    };
+    save(dir.path(), "session", &saved).unwrap();
+    let encoded: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(encoded["cursor"], 0);
+    assert_eq!(encoded["drafts"], serde_json::json!({}));
     saved.drafts.insert(
         "".into(),
         SavedDraft {
