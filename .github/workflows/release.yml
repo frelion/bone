@@ -124,23 +124,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes musl-tools
           echo "CC=musl-gcc" >> "$GITHUB_ENV"
-      - name: Diagnose native musl startup (preflight only)
-        if: runner.os == 'Linux' && needs.prepare.outputs.preflight == 'true'
-        run: |
-          probe_dir="$(mktemp -d)"
-          printf 'fn main() { println!("native musl startup"); }\n' > "$probe_dir/probe.rs"
-          for linker in default musl-gcc; do
-            linker_args=()
-            if test "$linker" = musl-gcc; then linker_args=(-C linker=musl-gcc); fi
-            if rustc --target "$RELEASE_TARGET" "${linker_args[@]}" "$probe_dir/probe.rs" -o "$probe_dir/$linker"; then
-              if "$probe_dir/$linker"; then probe_exit=0; else probe_exit=$?; fi
-              echo "musl startup probe target=$RELEASE_TARGET linker=$linker exit=$probe_exit"
-              readelf --file-header "$probe_dir/$linker" | awk '/Type:|Machine:|Entry point address:/'
-              readelf --program-headers "$probe_dir/$linker" | awk '/INTERP|LOAD|TLS|GNU_STACK/'
-            else
-              echo "musl startup probe target=$RELEASE_TARGET linker=$linker compilation failed"
-            fi
-          done
       - name: Native unit and integration checks (no model credentials)
         run: cargo test --locked --target "$RELEASE_TARGET"
       - name: Build the standard CLI and TUI
