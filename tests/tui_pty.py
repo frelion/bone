@@ -909,8 +909,10 @@ def sidebar_flow(f):
         f.send(b'\x1b[1;2B\x01\x0b')
         f.send('/status\r')
         f.wait(lambda:f.visible('Session: '+session),'runtime opens exact session '+session)
+        status = f.screen()
         f.send(b'\x1b')
         f.pump(.12)
+        return status
     original = f.state()['id']
     f.observed_session = original
     now = int(time.time()*1000)
@@ -977,11 +979,15 @@ def sidebar_flow(f):
     f.send(b'\x1b[H\x1b[B')
     f.pump(.15)
     f.capture('Candidate 01 remains distinct from current 00 while a real response is pending')
-    check('current identity survives long-title truncation',any('•' in line for line in sidebar_lines()))
     candidate_row, current_row = locate('任务01'), locate('任务00')
-    selected_rows = {run['row'] for run in f.cell_styles if 'reverse' in run['attributes']}
-    check('candidate highlight is separate from current identity',candidate_row in selected_rows and current_row not in selected_rows,
-        {'candidate_row':candidate_row,'current_row':current_row,'reverse_rows':sorted(selected_rows)})
+    width = 30 if f.cols >= 100 else 26
+    bold_rows = {run['row'] for run in f.cell_styles if 'bold' in run['attributes'] and run['start']<width and run['end']>2}
+    selected_rows = {run['row'] for run in f.cell_styles if 'reverse' in run['attributes'] and run['start']<width and run['end']>2}
+    check('current identity survives long-title truncation',current_row is not None and current_row in bold_rows,
+        {'current_row':current_row,'bold_rows':sorted(bold_rows)})
+    check('candidate highlight is separate from current identity',
+        candidate_row in selected_rows and candidate_row not in bold_rows and current_row in bold_rows and current_row not in selected_rows,
+        {'candidate_row':candidate_row,'current_row':current_row,'bold_rows':sorted(bold_rows),'reverse_rows':sorted(selected_rows)})
     check('sidebar does not display revision as a turn count',not any(re.search(r'\d+\s*轮',line) for line in sidebar_lines()))
     f.wait(lambda:any(e['kind']=='delivery' for e in f.events(original)),'real model completion triggers asynchronous sidebar refresh')
     f.pump(.35)
@@ -998,6 +1004,16 @@ def sidebar_flow(f):
     f.capture('A full session list scrolls to its oldest rows; common-prefix long titles retain distinct identifying suffixes')
     f.send(b'\x1b[H')
     f.wait(lambda:locate('任务02') is not None,'Home restores visible candidate 02')
+    gap_row = locate('任务02') + 2
+    assert all(cell in ('', ' ', '─') for cell in f.terminal_cells[gap_row][:width-1]), 'session separator contains information'
+    click(gap_row)
+    status = verify_session(seeded[1])
+    check('clicking a separator preserves the exact runtime session',
+        'Session: '+seeded[1] in status and len(f.calls())==1,
+        {'clicked_zero_based_row':gap_row,'verified_session':seeded[1],'verification':'/status'})
+    f.capture('Separator click keeps session 01; full runtime ID verified through /status')
+    f.send(b'\x1b[1;2D\x1b[H')
+    f.wait(lambda:locate('任务02') is not None,'candidate 02 remains available after separator click')
     row = locate('任务02')
     click(row)
     verify_session(seeded[2])
@@ -1007,11 +1023,11 @@ def sidebar_flow(f):
     f.send(b'\x1b[1;2D\x1b[H')
     f.wait(lambda:locate('任务03') is not None,'candidate 03 is visible')
     row = locate('任务03')
-    click(row)
+    click(row + 1)
     verify_session(seeded[3])
     f.observed_session = seeded[3]
-    check('clicking another compact row opens its real session and pauses the previous one',f.state(seeded[2])['paused'] and len(f.calls())==1)
-    f.capture('Single click on a compact session row opens exact session 03')
+    check('clicking the information line opens the same real session and pauses the previous one',f.state(seeded[2])['paused'] and len(f.calls())==1)
+    f.capture('Single click on status/time line opens exact session 03')
     f.send('窄屏草稿保持')
     f.wait(lambda:any(d.get('draft')=='窄屏草稿保持' for d in f.saved_drafts()),'narrow-screen parent draft saved')
     original_size = (f.rows,f.cols)
@@ -1100,17 +1116,42 @@ def product_flow(f):
                 connection.execute('INSERT INTO events(id,session_id,revision,payload,job_id,metadata) VALUES(?,?,?,?,?,?)',
                     (question['id'],session,1,json.dumps(question),job,json.dumps(question)))
         connection.commit()
-    f.send(b'\x1b[1;2D');f.wait(lambda:f.visible('收紧 OAuth'),'mixed authored sidebar index');f.send(b'\x1b[H\x1b[B');f.capture('Real terminal: browse candidate, current session and mixed attention states')
-    check('mixed titles expose distinct required attention words',all(f.visible(word) for word in ('核查','回复','暂停')))
+    f.send(b'\x1b[1;2D');f.wait(lambda:f.visible('收紧 OAuth'),'mixed authored sidebar index');f.send(b'\x1b[H')
+    f.capture('Real terminal: current session is also the keyboard candidate')
     width=(f.cols//4 if f.cols>=80 else 0);width=max(26,min(32,width)) if width else f.cols
     sidebar=[''.join(row[:width]) for row in f.terminal_cells]
-    current_row=next((row for row,line in enumerate(sidebar) if '•' in line and '新会话' in line),None)
+    current_row=next((row for row,line in enumerate(sidebar) if '新会话' in line),None)
+    bold_rows={run['row'] for run in f.cell_styles if 'bold' in run['attributes'] and run['start']<width and run['end']>2}
+    highlighted={run['row'] for run in f.cell_styles if 'reverse' in run['attributes'] and run['start']<width and run['end']>2}
+    check('current title and keyboard candidate styles combine on the same session',
+        current_row is not None and current_row in bold_rows and current_row in highlighted and not f.calls(),
+        {'current_row':current_row,'bold_rows':sorted(bold_rows),'highlighted_rows':sorted(highlighted)})
+    f.send(b'\x1b[B');f.capture('Real terminal: browse candidate, current session and mixed attention states')
+    check('mixed titles expose distinct required attention words',all(f.visible(word) for word in ('核查','回复','暂停')))
+    sidebar=[''.join(row[:width]) for row in f.terminal_cells]
+    current_row=next((row for row,line in enumerate(sidebar) if '新会话' in line),None)
     candidate_row=next((row for row,line in enumerate(sidebar) if '收紧 OAuth' in line),None)
-    highlighted={run['row'] for run in f.cell_styles if 'reverse' in run['attributes'] and run['start']<width}
-    check('current identity and browsed candidate remain different without color',current_row is not None and candidate_row in highlighted and current_row not in highlighted,
-        {'current_row':current_row,'candidate_row':candidate_row,'highlighted_rows':sorted(highlighted)})
+    candidate_time=time.strftime('%m/%d %H:%M',time.localtime(int(user['timestamp'])/1000))
+    bold_rows={run['row'] for run in f.cell_styles if 'bold' in run['attributes'] and run['start']<width and run['end']>2}
+    highlighted={run['row'] for run in f.cell_styles if 'reverse' in run['attributes'] and run['start']<width and run['end']>2}
+    check('current identity and browsed candidate remain different without color',
+        current_row is not None and current_row in bold_rows and current_row not in highlighted and candidate_row in highlighted and candidate_row not in bold_rows,
+        {'current_row':current_row,'candidate_row':candidate_row,'bold_rows':sorted(bold_rows),'highlighted_rows':sorted(highlighted)})
+    info=sidebar[candidate_row+1]
+    dim_rows={run['row'] for run in f.cell_styles if 'dim' in run['attributes'] and run['start']<width and run['end']>2}
+    check('session information shows its real status and persisted local update time',
+        '回复' in info and candidate_time in info and candidate_row+1 in highlighted
+        and candidate_row+1 not in bold_rows and candidate_row+2 not in highlighted
+        and candidate_row+1 not in dim_rows and current_row+1 in dim_rows and candidate_row+2 in dim_rows,
+        {'information_line':info,'expected_local_timestamp':candidate_time,'timestamp_source':'last authored persistent event','dim_rows':sorted(dim_rows)})
     check('authored sidebar list remains a session list',len(f.session_states())==33 and not f.calls())
-    f.send(b'\x1b[1;2B');f.send('修复登录重定向：保持兼容行为，先确认失败回调的处理方式。\r')
+    f.send(b'\x1b[1;2B');f.capture('Real terminal: input focus removes candidate highlight and retains the current title weight')
+    bold_rows={run['row'] for run in f.cell_styles if 'bold' in run['attributes'] and run['start']<width and run['end']>2}
+    highlighted={run['row'] for run in f.cell_styles if 'reverse' in run['attributes'] and run['start']<width and run['end']>2}
+    check('leaving sidebar removes candidate highlight while preserving current identity without model work',
+        current_row in bold_rows and candidate_row not in bold_rows and not highlighted and f.cursor_visible and not f.calls(),
+        {'current_row':current_row,'candidate_row':candidate_row,'bold_rows':sorted(bold_rows),'highlighted_rows':sorted(highlighted),'requests':len(f.calls())})
+    f.send('修复登录重定向：保持兼容行为，先确认失败回调的处理方式。\r')
     f.wait(lambda:len(f.calls())==1,'one actual local model request starts');f.capture('Actual Job: thinking without invented completed tasks')
     f.wait(lambda:any(e['kind']=='question' for e in f.events(original)),'actual question from a Job')
     question=next(e for e in f.events(original) if e['kind']=='question')

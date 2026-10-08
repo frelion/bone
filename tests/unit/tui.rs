@@ -992,9 +992,10 @@ fn session_titles_skip_blank_lines_and_catalog_keeps_an_old_current_session() {
     assert_eq!(items.len(), 200);
     assert_eq!(items[0].value, engine.state().id);
     assert_eq!(items[0].label, "新会话");
-    assert!(
-        items[0].detail.is_empty(),
-        "unknown activity time must be omitted"
+    assert!(items[0].detail.is_empty());
+    assert_eq!(
+        items[0].updated_at, None,
+        "a session without events has no activity time"
     );
     engine
         .post_message("\n  \n  中文标题保留真实内容  \n第二段")
@@ -1004,6 +1005,67 @@ fn session_titles_skip_blank_lines_and_catalog_keeps_an_old_current_session() {
     assert!(items[0].detail.contains("运行"));
     assert!(!items[0].detail.contains("轮"));
     assert!(!items[0].label.contains("当前"));
+    let timestamp = engine.events().unwrap().last().unwrap().timestamp.clone();
+    let expected = connection
+        .query_row(
+            "SELECT strftime('%m/%d %H:%M', ?1 / 1000.0, 'unixepoch', 'localtime')",
+            [&timestamp],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert_eq!(items[0].updated_at, Some(expected));
+}
+
+#[test]
+fn session_activity_time_comes_from_latest_event_sequence_in_local_time() {
+    let (dir, mut engine, _app) = local_app();
+    let data = dir.path().join("data");
+    engine.post_message("首条输入命名会话").unwrap();
+    engine.post_message("第二条输入更新会话").unwrap();
+    engine.stop().unwrap();
+    let events = engine.events().unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events.last().unwrap().kind, "stopped");
+    let connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+    // Deliberately let the first two events have later wall-clock times. The
+    // latest persisted event is defined by sequence, even if the clock moved.
+    let timestamps = ["1906634040000", "2230305960000", "1728029520000"];
+    for (event, timestamp) in events.iter().zip(timestamps) {
+        connection
+            .execute(
+                "UPDATE events SET
+                   payload = json_set(payload, '$.timestamp', ?1),
+                   metadata = json_set(metadata, '$.timestamp', ?1)
+                 WHERE id = ?2",
+                rusqlite::params![timestamp, event.id],
+            )
+            .unwrap();
+    }
+    let local_time = |timestamp: &str| {
+        connection
+            .query_row(
+                "SELECT strftime('%Y/%m/%d', ?1 / 1000.0, 'unixepoch', 'localtime')",
+                [timestamp],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    let items = session_items(&data, &engine.state().workspace, &engine.state().id).unwrap();
+    assert_eq!(items[0].label, "首条输入命名会话");
+    assert_eq!(
+        items[0].updated_at.as_deref(),
+        Some(local_time(timestamps[2]).as_str())
+    );
+    assert!(items[0].updated_at.as_ref().unwrap().starts_with("2024/"));
+    assert_ne!(
+        items[0].updated_at.as_deref(),
+        Some(local_time(timestamps[0]).as_str())
+    );
+    assert_ne!(
+        items[0].updated_at.as_deref(),
+        Some(local_time(timestamps[1]).as_str())
+    );
+    assert_eq!(engine.events().unwrap().len(), events.len());
 }
 
 #[test]

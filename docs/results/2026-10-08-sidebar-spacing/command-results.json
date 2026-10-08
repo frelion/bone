@@ -1,0 +1,74 @@
+{
+  "status": "PASS",
+  "results": [
+    {
+      "name": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 0.19
+    },
+    {
+      "name": "binary-tests",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--quiet",
+        "--bin",
+        "bone"
+      ],
+      "exit_code": 0,
+      "seconds": 4.61,
+      "passed_tests": 100
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 1.12
+    },
+    {
+      "name": "python-tests",
+      "command": [
+        "/usr/bin/python3",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_*.py"
+      ],
+      "exit_code": 0,
+      "seconds": 0.13,
+      "passed_tests": 8
+    },
+    {
+      "name": "install",
+      "command": [
+        "cargo",
+        "install",
+        "--path",
+        ".",
+        "--locked",
+        "--force"
+      ],
+      "exit_code": 0,
+      "seconds": 8.89
+    }
+  ]
+}

@@ -24,7 +24,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use view::{
     Activity, Draft, Focus, FormField, InputTarget, Message, MessageKind, PickerItem, PickerKind,
-    Tone, ToolState, View,
+    SessionItem, Tone, ToolState, View,
 };
 
 /// Concrete launch recipes, not a second runtime or model abstraction.
@@ -139,7 +139,7 @@ struct App {
     file_range: Option<std::ops::Range<usize>>,
     file_index: Option<tokio::task::JoinHandle<Result<Vec<String>>>>,
     files: Option<Vec<String>>,
-    session_index: Option<tokio::task::JoinHandle<Result<Vec<PickerItem>>>>,
+    session_index: Option<tokio::task::JoinHandle<Result<Vec<SessionItem>>>>,
     connection_setup: Option<ConnectionSetup>,
     login: Option<tokio::task::JoinHandle<Result<(ConnectionChange, CredentialReservation)>>>,
     login_codes: Option<tokio::sync::mpsc::Receiver<DeviceCodePrompt>>,
@@ -1737,7 +1737,14 @@ impl App {
                         .as_mut()
                         .filter(|p| p.kind == PickerKind::Session)
                     {
-                        picker.items = items;
+                        picker.items = items
+                            .into_iter()
+                            .map(|item| PickerItem {
+                                label: item.label,
+                                detail: item.detail,
+                                value: item.value,
+                            })
+                            .collect();
                     }
                 }
                 Err(_) => self.ui.sessions_error = Some("会话读取失败 · 已有列表保留".into()),
@@ -2146,7 +2153,7 @@ fn file_items(files: &[String]) -> Vec<PickerItem> {
         })
         .collect()
 }
-fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<PickerItem>> {
+fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<SessionItem>> {
     // This is a read-only UI projection, like latest_delivery in services.
     // Reuse one connection: refreshing a list must not rerun Store migrations.
     let connection = rusqlite::Connection::open_with_flags(
@@ -2155,7 +2162,16 @@ fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<Pic
     )?;
     connection.busy_timeout(Duration::from_secs(5))?;
     let mut catalog = connection.prepare(
-        "SELECT snapshot FROM sessions
+        "SELECT snapshot,
+           (SELECT strftime(
+              CASE WHEN strftime('%Y',
+                json_extract(COALESCE(metadata, payload), '$.timestamp') / 1000.0,
+                'unixepoch', 'localtime') = strftime('%Y', 'now', 'localtime')
+              THEN '%m/%d %H:%M' ELSE '%Y/%m/%d' END,
+              json_extract(COALESCE(metadata, payload), '$.timestamp') / 1000.0,
+              'unixepoch', 'localtime')
+            FROM events WHERE session_id = sessions.id ORDER BY sequence DESC LIMIT 1)
+         FROM sessions
          WHERE json_extract(snapshot, '$.workspace') = ?1
          ORDER BY (id = ?2) DESC,
            COALESCE((SELECT MAX(sequence) FROM events WHERE session_id = sessions.id), 0) DESC,
@@ -2166,7 +2182,7 @@ fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<Pic
             workspace.to_str().context("workspace path is not UTF-8")?,
             current
         ],
-        |row| row.get::<_, String>(0),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
     )?;
     let mut inputs = connection.prepare(
         "SELECT payload FROM events WHERE session_id = ?1
@@ -2180,7 +2196,8 @@ fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<Pic
     )?;
     let mut items = Vec::new();
     for snapshot in snapshots {
-        let session: bone::state::SessionState = serde_json::from_str(&snapshot?)?;
+        let (snapshot, updated_at) = snapshot?;
+        let session: bone::state::SessionState = serde_json::from_str(&snapshot)?;
         let mut title = None;
         for payload in inputs.query_map([&session.id], |row| row.get::<_, String>(0))? {
             let event: Event = serde_json::from_str(&payload?)?;
@@ -2202,10 +2219,11 @@ fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<Pic
             .query_map([&session.id], |row| row.get::<_, String>(0))?
             .map(|row| Ok(serde_json::from_str::<Event>(&row?)?))
             .collect::<Result<Vec<_>>>()?;
-        items.push(PickerItem {
+        items.push(SessionItem {
             label: title.unwrap_or_else(|| "新会话".into()),
             detail: session_status(&session, &events).into(),
             value: session.id,
+            updated_at,
         });
     }
     Ok(items)

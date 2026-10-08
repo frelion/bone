@@ -1368,10 +1368,11 @@ fn session_focus_keeps_draft_selection_and_stable_session_identity() {
     for (width, height) in [(80, 24), (120, 40)] {
         let mut view = View::new();
         let items = (0..30)
-            .map(|index| PickerItem {
+            .map(|index| SessionItem {
                 label: format!("会话 {index:02}"),
                 detail: "今天".into(),
                 value: format!("session-{index}"),
+                updated_at: None,
             })
             .collect::<Vec<_>>();
         view.set_sessions(items.clone());
@@ -1408,15 +1409,20 @@ fn session_focus_keeps_draft_selection_and_stable_session_identity() {
                 .buffer()
                 .content()
                 .iter()
-                .any(|cell| cell.symbol() == "›")
+                .enumerate()
+                .any(
+                    |(index, cell)| index % usize::from(width) < usize::from(view.sidebar_width)
+                        && cell.modifier.contains(Modifier::REVERSED)
+                )
         );
         let mut updated = items;
         updated.insert(
             0,
-            PickerItem {
+            SessionItem {
                 label: "刚到达".into(),
                 detail: String::new(),
                 value: "new".into(),
+                updated_at: None,
             },
         );
         view.set_sessions(updated);
@@ -1444,10 +1450,11 @@ fn narrow_session_sidebar_is_explicit_and_returns_to_original_reader() {
     use ratatui::{Terminal, backend::TestBackend};
     let state = bone::state::SessionState::new("/tmp/work");
     let mut view = View::new();
-    view.set_sessions(vec![PickerItem {
+    view.set_sessions(vec![SessionItem {
         label: "窄屏会话".into(),
         detail: String::new(),
         value: "selected".into(),
+        updated_at: None,
     }]);
     view.push_message(Message {
         kind: MessageKind::Delivery,
@@ -1476,7 +1483,7 @@ fn narrow_session_sidebar_is_explicit_and_returns_to_original_reader() {
             .buffer()
             .content()
             .iter()
-            .any(|cell| cell.symbol() == "›")
+            .any(|cell| cell.modifier.contains(Modifier::REVERSED))
     );
     assert!(!terminal.backend().cursor_visible());
     for (width, height) in [(80, 24), (42, 24)] {
@@ -1628,20 +1635,21 @@ fn session_rows_distinguish_current_browse_selection_and_keep_refresh_errors_vis
     let prefix = "同样前缀的很长软件工程任务，需要检查全部约束并修复";
     view.mark_active_session("a");
     view.set_sessions(vec![
-        PickerItem {
+        SessionItem {
             label: format!("{prefix} A"),
             detail: "运行".into(),
             value: "a".into(),
+            updated_at: Some("10/08 14:30".into()),
         },
-        PickerItem {
+        SessionItem {
             label: format!("{prefix} B"),
             detail: "回复".into(),
             value: "b".into(),
+            updated_at: Some("10/08 14:31".into()),
         },
     ]);
     view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
     view.handle_key(key(KeyCode::Down));
-    view.mark_active_session("a");
     view.sessions_loading = true;
     view.sessions_error = Some("读取失败 · 锁定".into());
     view.set_sessions(view.sessions.iter().cloned().rev().collect());
@@ -1658,22 +1666,74 @@ fn session_rows_distinguish_current_browse_selection_and_keep_refresh_errors_vis
     };
     assert!(row_text(1).replace(' ', "").contains("读取失败"));
     assert!(row_text(2).contains("B"));
-    assert!(row_text(3).contains("A"));
-    assert!(row_text(3).replace(' ', "").contains("运行"));
-    assert!(row_text(2).replace(' ', "").contains("回复"));
+    assert!(!row_text(2).contains("回复"));
+    assert!(row_text(3).replace(' ', "").contains("回复"));
+    assert!(row_text(3).trim_end().ends_with("10/08 14:31"));
+    assert!(row_text(5).contains("A"));
+    assert!(!row_text(5).contains("运行"));
+    assert!(row_text(6).replace(' ', "").contains("运行"));
+    assert!(row_text(6).trim_end().ends_with("10/08 14:30"));
     assert_eq!(buffer[(0, 0)].symbol(), " ");
-    assert_eq!(buffer[(0, 2)].symbol(), "›");
-    assert!(buffer[(0, 2)].modifier.contains(Modifier::REVERSED));
-    // Wide glyph continuation cells are empty in TestBackend; assert the visible
-    // glyphs themselves, including the rightmost attention word.
+    // Both candidate rows share one band; only the active title gains weight.
+    for row in [2, 3] {
+        assert!(buffer[(0, row)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(2, row)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(2, row)].modifier.contains(Modifier::BOLD));
+        assert!(!buffer[(2, row)].modifier.contains(Modifier::DIM));
+        assert!(
+            (0..view.sidebar_width - 2)
+                .filter(|&x| buffer[(x, row)].symbol() != " ")
+                .all(|x| buffer[(x, row)].modifier.contains(Modifier::REVERSED))
+        );
+        assert!(
+            !buffer[(view.sidebar_width - 2, row)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+    assert_eq!(buffer[(2, 4)].symbol(), "─");
+    assert!(buffer[(2, 4)].modifier.contains(Modifier::DIM));
+    assert!((0..view.sidebar_width - 1).all(|x| {
+        !buffer[(x, 4)]
+            .modifier
+            .intersects(Modifier::REVERSED | Modifier::BOLD)
+    }));
+    if std::env::var_os("NO_COLOR").is_none() {
+        assert_eq!(buffer[(2, 4)].fg, MUTED);
+    }
+    assert!(!buffer[(2, 5)].modifier.contains(Modifier::REVERSED));
+    assert!(buffer[(2, 5)].modifier.contains(Modifier::BOLD));
+    assert!(!buffer[(2, 5)].modifier.contains(Modifier::DIM));
+    assert!(buffer[(2, 6)].modifier.contains(Modifier::DIM));
+    assert!((0..view.sidebar_width - 1).all(|x| {
+        !buffer[(x, 6)]
+            .modifier
+            .intersects(Modifier::REVERSED | Modifier::BOLD)
+    }));
+    assert!(!buffer[(2, 0)].modifier.contains(Modifier::BOLD));
+    view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    for row in [2, 3, 5, 6] {
+        assert!(!buffer[(2, row)].modifier.contains(Modifier::REVERSED));
+    }
+    assert!(buffer[(2, 5)].modifier.contains(Modifier::BOLD));
+    assert!(!buffer[(2, 6)].modifier.contains(Modifier::BOLD));
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    view.handle_key(key(KeyCode::Down));
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
     assert!(
-        (0..view.sidebar_width - 1)
-            .filter(|&x| buffer[(x, 2)].symbol() != " ")
-            .all(|x| buffer[(x, 2)].modifier.contains(Modifier::REVERSED))
+        buffer[(2, 5)]
+            .modifier
+            .contains(Modifier::REVERSED | Modifier::BOLD)
     );
-    assert!(!buffer[(0, 3)].modifier.contains(Modifier::REVERSED));
-    assert_eq!(buffer[(1, 3)].symbol(), "•");
-    assert!(buffer[(3, 3)].modifier.contains(Modifier::BOLD));
+    assert!(buffer[(2, 6)].modifier.contains(Modifier::REVERSED));
+    assert!(!buffer[(2, 6)].modifier.contains(Modifier::BOLD));
     for width in 0..35 {
         let fitted = middle_fit_line(&format!("{prefix} 👩‍💻 A"), width);
         assert!(UnicodeWidthStr::width(fitted.as_str()) <= width);
@@ -1684,17 +1744,18 @@ fn session_rows_distinguish_current_browse_selection_and_keep_refresh_errors_vis
 }
 
 #[test]
-fn session_mouse_maps_single_line_viewport_and_ignores_hidden_or_modal_rows() {
+fn session_spacing_keeps_page_navigation_and_mouse_targets_aligned() {
     use crossterm::event::MouseButton;
     use ratatui::{Terminal, backend::TestBackend};
     let state = bone::state::SessionState::new("/tmp/work");
     let mut view = View::new();
     view.set_sessions(
         (0..30)
-            .map(|index| PickerItem {
+            .map(|index| SessionItem {
                 label: format!("会话{index}"),
                 detail: String::new(),
                 value: index.to_string(),
+                updated_at: Some("10/08 14:30".into()),
             })
             .collect(),
     );
@@ -1704,7 +1765,7 @@ fn session_mouse_maps_single_line_viewport_and_ignores_hidden_or_modal_rows() {
         .unwrap();
     view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
     view.handle_key(key(KeyCode::PageDown));
-    assert_eq!(view.selected_session(), Some("21"));
+    assert_eq!(view.selected_session(), Some("7"));
     terminal
         .draw(|frame| view.render(frame, &state, "m", "idle"))
         .unwrap();
@@ -1715,14 +1776,53 @@ fn session_mouse_maps_single_line_viewport_and_ignores_hidden_or_modal_rows() {
         row,
         modifiers: KeyModifiers::NONE,
     };
+    // The title and metadata are one item; the separator owns no item.
     assert_eq!(view.clicked_session(click(2)), Some("1".into()));
-    assert_eq!(view.clicked_session(click(5)), Some("4".into()));
+    assert_eq!(view.clicked_session(click(3)), Some("1".into()));
+    assert_eq!(view.clicked_session(click(4)), None);
+    assert_eq!(view.clicked_session(click(5)), Some("2".into()));
+    assert_eq!(view.clicked_session(click(6)), Some("2".into()));
+    assert_eq!(view.clicked_session(click(7)), None);
+    assert_eq!(view.selected_session(), Some("2"));
     assert_eq!(view.clicked_session(click(0)), None);
     assert_eq!(view.clicked_session(click(23)), None);
     view.open_help();
     assert_eq!(view.clicked_session(click(2)), None);
-    assert_eq!(view.selected_session(), Some("4"));
+    assert_eq!(view.clicked_session(click(3)), None);
+    assert_eq!(view.selected_session(), Some("2"));
     view.handle_key(key(KeyCode::Esc));
+    view.handle_key(key(KeyCode::End));
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    assert_eq!(view.selected_session(), Some("29"));
+    assert_eq!(view.session_top, 23);
+    assert_eq!(view.clicked_session(click(20)), Some("29".into()));
+    assert_eq!(view.clicked_session(click(21)), Some("29".into()));
+    assert_eq!(view.clicked_session(click(22)), None);
+    view.handle_key(key(KeyCode::PageUp));
+    assert_eq!(view.selected_session(), Some("22"));
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    view.handle_key(key(KeyCode::PageDown));
+    assert_eq!(view.selected_session(), Some("29"));
+    terminal.backend_mut().resize(120, 40);
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    assert_eq!(view.session_top, 18);
+    assert_eq!(view.clicked_session(click(35)), Some("29".into()));
+    assert_eq!(view.clicked_session(click(36)), Some("29".into()));
+    assert_eq!(view.clicked_session(click(37)), None);
+    // A leftover title-sized row cannot become a half-visible eighth item.
+    assert_eq!(view.clicked_session(click(38)), None);
+    view.handle_key(key(KeyCode::PageUp));
+    assert_eq!(view.selected_session(), Some("17"));
+    terminal
+        .draw(|frame| view.render(frame, &state, "m", "idle"))
+        .unwrap();
+    view.handle_key(key(KeyCode::Home));
     view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
     terminal.backend_mut().resize(79, 24);
     terminal
@@ -1734,12 +1834,67 @@ fn session_mouse_maps_single_line_viewport_and_ignores_hidden_or_modal_rows() {
     terminal
         .draw(|frame| view.render(frame, &state, "m", "idle"))
         .unwrap();
-    assert_eq!(view.clicked_session(click(2)), Some("1".into()));
+    assert_eq!(view.clicked_session(click(2)), Some("0".into()));
+    assert_eq!(view.clicked_session(click(3)), Some("0".into()));
+    view.handle_key(key(KeyCode::PageDown));
+    assert_eq!(view.selected_session(), Some("7"));
     terminal.backend_mut().resize(6, 8);
     terminal
         .draw(|frame| view.render(frame, &state, "m", "idle"))
         .unwrap();
     assert_eq!(view.clicked_session(click(2)), None);
+}
+
+#[test]
+fn session_metadata_uses_projected_time_and_marks_missing_history_without_fabrication() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let state = bone::state::SessionState::new("/tmp/work");
+    for (width, height) in [(80, 24), (120, 40)] {
+        let mut view = View::new();
+        view.set_sessions(vec![
+            SessionItem {
+                label: "尚未开始".into(),
+                detail: String::new(),
+                value: "new".into(),
+                updated_at: None,
+            },
+            SessionItem {
+                label: "已有工作".into(),
+                detail: String::new(),
+                value: "ready".into(),
+                updated_at: Some("10/08 14:30".into()),
+            },
+            SessionItem {
+                label: "需要回复".into(),
+                detail: "回复".into(),
+                value: "reply".into(),
+                updated_at: Some("10/08 14:31".into()),
+            },
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| view.render(frame, &state, "m", "idle"))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row_text = |row| {
+            (0..view.sidebar_width - 1)
+                .map(|x| buffer[(x, row)].symbol())
+                .collect::<String>()
+        };
+        assert!(row_text(3).replace(' ', "").contains("未开始"));
+        assert!(row_text(3).trim_end().ends_with('—'));
+        assert!(row_text(6).replace(' ', "").contains("就绪"));
+        assert!(row_text(6).trim_end().ends_with("10/08 14:30"));
+        assert!(row_text(9).replace(' ', "").contains("回复"));
+        assert!(row_text(9).trim_end().ends_with("10/08 14:31"));
+        assert_eq!(buffer[(view.sidebar_width - 3, 6)].symbol(), "0");
+        assert_eq!(buffer[(view.sidebar_width - 3, 9)].symbol(), "1");
+        for row in [2, 3, 5, 6, 8, 9] {
+            assert_eq!(buffer[(0, row)].symbol(), " ");
+            assert_eq!(buffer[(1, row)].symbol(), " ");
+            assert_eq!(buffer[(view.sidebar_width - 2, row)].symbol(), " ");
+        }
+    }
 }
 
 #[test]

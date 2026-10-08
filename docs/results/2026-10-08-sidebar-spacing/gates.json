@@ -1,0 +1,119 @@
+{
+  "status": "PASS",
+  "fingerprint": {
+    "version": "bone 0.9.2",
+    "date": "2026-10-08",
+    "source_fingerprint": "6e6a315e340340227303bd6e016b3a5f589e3dc549685533b9a90f011e0ab3b8",
+    "harness_sha256": "e5d42f0d4ad398de0c3cfeae9f94c2d12f318c0646366c5f356e2672bac509ab",
+    "binary_sha256": "0b104a8b06a7625b48875a86cbda02e2c606d71e957f904da0542ddc5a0e3eac",
+    "source_scope": "Sorted relative POSIX Cargo.toml, Cargo.lock and src/**/*.rs, path+NUL+bytes+NUL"
+  },
+  "results": [
+    {
+      "name": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 0.19
+    },
+    {
+      "name": "binary-tests",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--quiet",
+        "--bin",
+        "bone"
+      ],
+      "exit_code": 0,
+      "seconds": 4.61,
+      "passed_tests": 100
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 1.12
+    },
+    {
+      "name": "python-tests",
+      "command": [
+        "/usr/bin/python3",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_*.py"
+      ],
+      "exit_code": 0,
+      "seconds": 0.13,
+      "passed_tests": 8
+    },
+    {
+      "name": "install",
+      "command": [
+        "cargo",
+        "install",
+        "--path",
+        ".",
+        "--locked",
+        "--force"
+      ],
+      "exit_code": 0,
+      "seconds": 8.89
+    }
+  ],
+  "pty": [
+    {
+      "size": "80x24",
+      "case": "product-flow",
+      "checks": 19,
+      "frames": 18,
+      "status": "PASS"
+    },
+    {
+      "size": "80x24",
+      "case": "sidebar-flow",
+      "checks": 14,
+      "frames": 13,
+      "status": "PASS"
+    },
+    {
+      "size": "120x40",
+      "case": "product-flow",
+      "checks": 19,
+      "frames": 18,
+      "status": "PASS"
+    },
+    {
+      "size": "120x40",
+      "case": "sidebar-flow",
+      "checks": 14,
+      "frames": 13,
+      "status": "PASS"
+    },
+    {
+      "size": "color80x24",
+      "case": "product-flow",
+      "checks": 19,
+      "frames": 18,
+      "status": "PASS"
+    }
+  ]
+}

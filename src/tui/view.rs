@@ -88,6 +88,13 @@ pub(super) struct PickerItem {
     pub value: String,
 }
 #[derive(Debug, Clone)]
+pub(super) struct SessionItem {
+    pub label: String,
+    pub detail: String,
+    pub value: String,
+    pub updated_at: Option<String>,
+}
+#[derive(Debug, Clone)]
 pub(super) struct Picker {
     pub kind: PickerKind,
     pub query: String,
@@ -194,7 +201,7 @@ pub(super) struct View {
     pub spinner_tick: usize,
     pub picker: Option<Picker>,
     form: Option<Form>,
-    pub sessions: Vec<PickerItem>,
+    pub sessions: Vec<SessionItem>,
     pub sessions_loading: bool,
     pub sessions_error: Option<String>,
     session_selected: Option<usize>,
@@ -241,6 +248,11 @@ const BACKGROUND: Color = Color::Reset;
 const TEXT: Color = Color::Reset;
 const MUTED: Color = Color::DarkGray;
 const ACCENT: Color = Color::Cyan;
+const SESSION_ROW_HEIGHT: u16 = 3;
+
+fn session_capacity(height: u16) -> usize {
+    usize::from(height.saturating_add(1) / SESSION_ROW_HEIGHT)
+}
 
 impl View {
     pub fn new() -> Self {
@@ -511,7 +523,7 @@ impl View {
             || self.show_help
             || self.detail.is_some()
     }
-    pub fn set_sessions(&mut self, sessions: Vec<PickerItem>) {
+    pub fn set_sessions(&mut self, sessions: Vec<SessionItem>) {
         let selected = self.selected_session().map(str::to_owned);
         self.sessions = sessions;
         self.session_selected = selected
@@ -556,7 +568,14 @@ impl View {
         {
             return None;
         }
-        let index = self.session_top + usize::from(event.row - self.session_list_area.y);
+        let row = event.row - self.session_list_area.y;
+        let offset = usize::from(row / SESSION_ROW_HEIGHT);
+        if row % SESSION_ROW_HEIGHT == SESSION_ROW_HEIGHT - 1
+            || offset >= session_capacity(self.session_list_area.height)
+        {
+            return None;
+        }
+        let index = self.session_top + offset;
         let value = self.sessions.get(index)?.value.clone();
         self.close_completion();
         if self.focus != Focus::Sessions {
@@ -1519,7 +1538,7 @@ impl View {
                         key.code,
                         selected,
                         self.sessions.len().saturating_sub(1),
-                        usize::from(self.session_list_area.height).max(1),
+                        session_capacity(self.session_list_area.height).max(1),
                     );
                 }
             }
@@ -2017,7 +2036,7 @@ impl View {
         );
         let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
         frame.render_widget(
-            Paragraph::new("  会话").style(Style::default().add_modifier(Modifier::BOLD)),
+            Paragraph::new("  会话").style(Style::default().fg(MUTED)),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
         let status = self
@@ -2042,9 +2061,10 @@ impl View {
         );
         let narrow_navigation = focused && self.sidebar_width == 0;
         let footer_height = if narrow_navigation { 2 } else { 1 };
-        let capacity = usize::from(inner.height.saturating_sub(2 + footer_height)).max(1);
-        self.session_list_area = Rect::new(inner.x, inner.y + 2, inner.width, capacity as u16);
-        if let Some(selected) = self.session_selected {
+        let list_height = inner.height.saturating_sub(2 + footer_height);
+        let capacity = session_capacity(list_height);
+        self.session_list_area = Rect::new(inner.x, inner.y + 2, inner.width, list_height);
+        if let Some(selected) = self.session_selected.filter(|_| capacity > 0) {
             if selected < self.session_top {
                 self.session_top = selected;
             } else if selected >= self.session_top + capacity {
@@ -2067,42 +2087,67 @@ impl View {
             let selected = self.session_selected == Some(index) && focused;
             let active = self.active_session.as_deref() == Some(item.value.as_str());
             let row_style = Style::default().add_modifier(if selected {
-                Modifier::REVERSED | Modifier::BOLD
-            } else if active {
-                Modifier::BOLD
+                Modifier::REVERSED
             } else {
                 Modifier::empty()
             });
-            let detail = fit_line(
-                &Self::sanitize(&item.detail).replace('\n', " "),
-                text_width.saturating_sub(3).min(8),
-            );
-            let detail_width = UnicodeWidthStr::width(detail.as_str());
-            let title_width =
-                text_width.saturating_sub(detail_width + usize::from(!detail.is_empty()));
             let title =
-                middle_fit_line(&Self::sanitize(&item.label).replace('\n', " "), title_width);
-            let padding =
-                text_width.saturating_sub(UnicodeWidthStr::width(title.as_str()) + detail_width);
+                middle_fit_line(&Self::sanitize(&item.label).replace('\n', " "), text_width);
+            let title_padding = text_width.saturating_sub(UnicodeWidthStr::width(title.as_str()));
+            let updated_at = item.updated_at.as_deref().filter(|time| !time.is_empty());
+            let time = fit_line(
+                &Self::sanitize(updated_at.unwrap_or("—")).replace('\n', " "),
+                text_width.saturating_sub(1),
+            );
+            let time_width = UnicodeWidthStr::width(time.as_str());
+            let status = if item.detail.is_empty() {
+                if updated_at.is_some() {
+                    "就绪"
+                } else {
+                    "未开始"
+                }
+            } else {
+                &item.detail
+            };
+            let status = fit_line(
+                &Self::sanitize(status).replace('\n', " "),
+                text_width.saturating_sub(time_width + 1),
+            );
+            let info_padding =
+                text_width.saturating_sub(UnicodeWidthStr::width(status.as_str()) + time_width);
+            if !rows.is_empty() {
+                rows.push(Line::styled(
+                    format!("  {}", "─".repeat(text_width)),
+                    Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                ));
+            }
             rows.push(
                 Line::from(vec![
-                    Span::raw(format!(
-                        "{}{} ",
-                        if selected { '›' } else { ' ' },
-                        if active { '•' } else { ' ' }
-                    )),
-                    Span::raw(title),
-                    Span::raw(" ".repeat(padding)),
+                    Span::raw("  "),
                     Span::styled(
-                        detail,
-                        if selected {
-                            Style::default()
+                        title,
+                        Style::default().add_modifier(if active {
+                            Modifier::BOLD
                         } else {
-                            Style::default().fg(MUTED)
-                        },
+                            Modifier::empty()
+                        }),
                     ),
+                    Span::raw(" ".repeat(title_padding)),
                 ])
                 .style(row_style),
+            );
+            rows.push(
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(status),
+                    Span::raw(" ".repeat(info_padding)),
+                    Span::raw(time),
+                ])
+                .style(if selected {
+                    row_style
+                } else {
+                    Style::default().add_modifier(Modifier::DIM)
+                }),
             );
         }
         if rows.is_empty() && !self.sessions_loading && self.sessions_error.is_none() {
@@ -2118,10 +2163,11 @@ impl View {
                 Paragraph::new(navigation).style(Style::default().fg(MUTED)),
                 Rect::new(inner.x, inner.bottom().saturating_sub(2), inner.width, 2),
             );
-        } else if self.sessions.len() > capacity {
+        } else if capacity > 0 && self.sessions.len() > capacity {
             let position = format!(
-                "  {} / {}",
-                self.session_selected.map_or(0, |index| index + 1),
+                "  {}–{} / {}",
+                self.session_top + 1,
+                (self.session_top + capacity).min(self.sessions.len()),
                 self.sessions.len(),
             );
             frame.render_widget(

@@ -1,0 +1,1 @@
+NO_COLOR reset weak colors, making metadata and dividers as bright as titles. One actual installed VT frame and original checks/identity are retained. Final styles use DIM for inactive information and separators, while keeping selected information at normal reverse brightness.
