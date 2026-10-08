@@ -166,24 +166,29 @@ async fn stop_collects_tool_result_before_releasing_ownership_and_allows_new_wor
     engine.prepare_pending_input().unwrap();
     let job = engine.state.focus.clone().unwrap();
     let command = if cfg!(windows) {
-        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Write('before stop'); while ($true) { [Threading.Thread]::Sleep(10) }\""
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Write('before stop'); [Console]::Out.Flush(); [IO.File]::WriteAllText('ready.txt', 'ready'); while ($true) { [Threading.Thread]::Sleep(10) }\""
     } else {
-        "printf 'before stop'; while :; do sleep 0.01; done"
+        "printf 'before stop'; printf 'ready' > ready.txt; while :; do sleep 0.01; done"
     };
     engine.drain_tool_progress();
     let tool = native_proposal(&mut engine, &job, "shell", json!({"command":command}));
     engine.start_tool(&job, tool).unwrap();
     let call = engine.state.jobs[&job].current_call.clone().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if engine
-                .drain_tool_progress()
-                .iter()
-                .any(|record| record.stdout.contains("before stop"))
-            {
-                break;
+    let ready = engine.state.workspace.join("ready.txt");
+    // Live previews are lossy. A physical marker after stdout is flushed proves
+    // the command actually started, independently of observation timing.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while std::fs::read_to_string(&ready).ok().as_deref() != Some("ready") {
+            if engine.running[&call].abort.is_finished() {
+                while engine.running.contains_key(&call) {
+                    engine.step().await.unwrap();
+                }
+                panic!(
+                    "shell ended before readiness: {}",
+                    engine.read_call_event(&call, "tool_result").unwrap().data
+                );
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -216,7 +221,8 @@ async fn stop_collects_tool_result_before_releasing_ownership_and_allows_new_wor
             .all(|event| event.kind != "tool_result")
     );
     engine.stop().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Allow the bounded child wait, pipe drain and Windows job cleanup to finish.
+    tokio::time::timeout(Duration::from_secs(20), async {
         while !engine.is_quiescent() {
             engine.step().await.unwrap();
         }
