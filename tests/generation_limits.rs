@@ -1,5 +1,5 @@
 //! Native Responses endings must never promote an unfinished proposal to an action.
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use bone::runtime::{Engine, RunOptions};
 use futures_util::StreamExt;
@@ -347,7 +347,9 @@ async fn recovery_keeps_earlier_tool_results_without_replaying_their_effects() {
     assert_eq!(fixture.request_count(), 4);
 }
 
-async fn start_delayed_recovery(fixture: &Fixture, engine: &mut Engine, input: &str) {
+async fn start_blocked_recovery(fixture: &Fixture, engine: &mut Engine, input: &str) -> PathBuf {
+    let release = fixture.root.path().join("recovery.release");
+    assert!(!release.exists());
     drive_until(engine, Duration::from_secs(5), |engine| {
         engine
             .events()
@@ -364,7 +366,7 @@ async fn start_delayed_recovery(fixture: &Fixture, engine: &mut Engine, input: &
             .any(|event| event.kind == "model_started" && event.data["recovery_of"].is_string())
     })
     .await;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         while fixture.request_count() < 2 {
             let _ = tokio::time::timeout(Duration::from_millis(20), engine.step()).await;
             tokio::task::yield_now().await;
@@ -372,20 +374,24 @@ async fn start_delayed_recovery(fixture: &Fixture, engine: &mut Engine, input: &
     })
     .await
     .unwrap();
+    // A recorded request cannot produce a response until this test releases it.
+    assert!(!release.exists());
     assert!(engine.result(input).is_none());
+    release
 }
 
 #[tokio::test]
 async fn stop_during_recovery_prevents_actions_and_does_not_refund_reserved_calls() {
     let fixture = Fixture::turns(json!([
         limited(json!([])),
-        {"delay_seconds":1,"output":[write("stopped.txt", "stale", "stopped-write")]},
+        {"release_file":"recovery.release","output":[write("stopped.txt", "stale", "stopped-write")]},
         {"text":"Unexpected restarted recovery"}
     ]));
     let mut engine = fixture.engine(None, options());
     let input = engine.post("Work until stopped.", None).unwrap();
-    start_delayed_recovery(&fixture, &mut engine, &input).await;
+    let release = start_blocked_recovery(&fixture, &mut engine, &input).await;
     engine.stop().unwrap();
+    std::fs::write(release, "released after stop").unwrap();
     assert_eq!(engine.state().budgets[&input].calls_used, 2);
     let cancelled = engine
         .events()
@@ -422,15 +428,16 @@ async fn stop_during_recovery_prevents_actions_and_does_not_refund_reserved_call
 async fn new_user_instruction_invalidates_a_recovery_proposal() {
     let fixture = Fixture::turns(json!([
         limited(json!([])),
-        {"delay_seconds":1,"output":[write("obsolete.txt", "stale", "obsolete-write")]},
+        {"release_file":"recovery.release","output":[write("obsolete.txt", "stale", "obsolete-write")]},
         {"contains":["NEW_INSTRUCTION"],"text":"Explained the revised request."}
     ]));
     let mut engine = fixture.engine(None, options());
     let original = engine.post("Perform the original task.", None).unwrap();
-    start_delayed_recovery(&fixture, &mut engine, &original).await;
+    let release = start_blocked_recovery(&fixture, &mut engine, &original).await;
     let revised = engine
         .post("NEW_INSTRUCTION: explain only, make no file changes.", None)
         .unwrap();
+    std::fs::write(release, "released after new instruction").unwrap();
     finish(&mut engine, &revised).await;
     assert_delivery(&engine, &revised, "Explained the revised request.");
     assert!(!fixture.workspace.join("obsolete.txt").exists());

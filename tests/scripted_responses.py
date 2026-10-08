@@ -10,6 +10,7 @@ or an `event_delays` mapping flushes SSE frames with per-event delays.
 `omit_terminal` ends the stream without a response terminal. Output items marked
 `status: in_progress` keep their partial deltas without sending done frames.
 `match_summary` selects work or compaction requests without guessing call order.
+`release_file` holds a recorded request until that file exists beside the script.
 Only request JSON bodies are recorded, never authorization headers.
 """
 
@@ -203,6 +204,10 @@ def main():
             if not all(fragment in encoded for fragment in turn.get("contains", [])):
                 self.send_error(422, "fixture request expectation failed")
                 return
+            if "release_file" in turn:
+                release = args.script.parent / turn["release_file"]
+                while not release.exists():
+                    time.sleep(0.01)
             time.sleep(turn.get("delay_seconds", 0))
             status = turn.get("http_status", 200)
             if status != 200:
