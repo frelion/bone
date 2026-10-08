@@ -369,15 +369,81 @@ async fn observed_shell_drains_beyond_preview_and_keeps_timeout_uncertainty() {
 
 #[cfg(windows)]
 #[tokio::test]
+async fn windows_shell_rejects_unc_before_starting_the_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("must-not-start");
+    let command = format!("echo unexpected>\"{}\"", marker.display());
+    for workspace in [
+        Path::new(r"\\bone-unc-test\missing-share\workspace"),
+        Path::new(r"\\?\UNC\bone-unc-test\missing-share\workspace"),
+    ] {
+        let outcome = execute(workspace, "shell", &json!({"command":command}), None).await;
+        assert_rejected(&outcome, "map the workspace to a drive letter");
+        assert!(
+            !marker.exists(),
+            "UNC rejection must precede command execution"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_shell_runs_relative_commands_in_the_canonical_workspace() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().canonicalize().unwrap();
+    std::fs::write(workspace.join("cwd-evidence"), "workspace only").unwrap();
+    let cmd = execute(
+        &workspace,
+        "shell",
+        &json!({"command":"cd & if exist cwd-evidence (exit /b 0) else (exit /b 42)"}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        cmd.content["exit_code"],
+        0,
+        "canonical cmd cwd mismatch in {}: {}",
+        workspace.display(),
+        cmd.content
+    );
+    let actual = cmd.content["stdout"].as_str().unwrap().trim();
+    assert_eq!(
+        Path::new(actual).canonicalize().unwrap(),
+        workspace,
+        "cmd actual working directory differs from the workspace"
+    );
+    let powershell = execute(&workspace, "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -Command \"[Console]::WriteLine([Environment]::CurrentDirectory); if (![IO.File]::Exists('cwd-evidence')) { exit 42 }; [IO.File]::WriteAllText('powershell-cwd-evidence','workspace only')\""}), None).await;
+    assert_eq!(
+        powershell.content["exit_code"],
+        0,
+        "PowerShell canonical cwd mismatch in {}: {}",
+        workspace.display(),
+        powershell.content
+    );
+    let actual = powershell.content["stdout"].as_str().unwrap().trim();
+    assert_eq!(
+        Path::new(actual).canonicalize().unwrap(),
+        workspace,
+        "PowerShell actual location differs from the workspace"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("powershell-cwd-evidence")).unwrap(),
+        "workspace only",
+        "PowerShell relative write must stay in the workspace"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
 async fn windows_timeout_stops_descendants_before_releasing_workspace_ownership() {
     use fs2::FileExt;
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(
         directory.path().join("child.ps1"),
-        "Set-Content child.started ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content child.finished finished",
+        "[Console]::WriteLine('child native='+[Environment]::CurrentDirectory+';script='+$PSScriptRoot); [IO.File]::WriteAllText('child.started','ready'); while (![IO.File]::Exists('release')) { [Threading.Thread]::Sleep(10) }; [IO.File]::WriteAllText('child.finished','finished')",
     )
     .unwrap();
-    std::fs::write(directory.path().join("parent.ps1"), "Start-Process powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','child.ps1' -NoNewWindow; while (!(Test-Path child.started)) { Start-Sleep -Milliseconds 10 }; Set-Content shell.started ready; Start-Sleep -Seconds 60").unwrap();
+    std::fs::write(directory.path().join("parent.ps1"), "[Console]::WriteLine('parent native='+[Environment]::CurrentDirectory+';script='+$PSScriptRoot); $start=[Diagnostics.ProcessStartInfo]::new('powershell.exe','-NoProfile -NonInteractive -ExecutionPolicy Bypass -File child.ps1'); $start.UseShellExecute=$false; $child=[Diagnostics.Process]::Start($start); while (![IO.File]::Exists('child.started')) { [Threading.Thread]::Sleep(10) }; [IO.File]::WriteAllText('shell.started','ready'); [Threading.Thread]::Sleep(60000)").unwrap();
     let open_lock = |name| {
         std::sync::Arc::new(
             std::fs::OpenOptions::new()
@@ -392,11 +458,17 @@ async fn windows_timeout_stops_descendants_before_releasing_workspace_ownership(
     let legacy = open_lock("legacy.lock");
     stable.try_lock_exclusive().unwrap();
     legacy.try_lock_exclusive().unwrap();
-    let outcome = execute(directory.path(), "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File parent.ps1","timeout_seconds":15}), Some([stable.clone(), legacy.clone()])).await;
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let observed = progress.clone();
+    let observer: ToolObserver =
+        std::sync::Arc::new(move |_, bytes| observed.lock().unwrap().extend_from_slice(bytes));
+    let outcome = execute_with_progress(directory.path(), "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File parent.ps1","timeout_seconds":15}), Some([stable.clone(), legacy.clone()]), Some(observer)).await;
     assert!(
         directory.path().join("shell.started").exists(),
-        "Windows parent/descendant did not reach ready: {}",
-        outcome.content
+        "Windows parent/descendant did not reach ready in {}: {}; progress: {}",
+        directory.path().display(),
+        outcome.content,
+        String::from_utf8_lossy(&progress.lock().unwrap())
     );
     assert!(outcome.uncertain);
     assert_eq!(outcome.content["effect"], "unknown");
@@ -428,7 +500,17 @@ fn windows_owned_shell_helper() {
     let legacy = open("legacy.lock");
     stable.try_lock_exclusive().unwrap();
     legacy.try_lock_exclusive().unwrap();
-    let outcome = tokio::runtime::Runtime::new().unwrap().block_on(execute(&directory, "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File parent.ps1","timeout_seconds":60}), Some([stable, legacy])));
+    println!(
+        "Windows helper requested workspace: {}",
+        directory.display()
+    );
+    let observer: ToolObserver = std::sync::Arc::new(|_, bytes| {
+        use std::io::Write;
+        let mut output = std::io::stdout().lock();
+        output.write_all(bytes).unwrap();
+        output.flush().unwrap();
+    });
+    let outcome = tokio::runtime::Runtime::new().unwrap().block_on(execute_with_progress(&directory, "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File parent.ps1","timeout_seconds":60}), Some([stable, legacy]), Some(observer)));
     println!("Windows owned-shell outcome: {}", outcome.content);
 }
 
@@ -437,7 +519,7 @@ fn windows_owned_shell_helper() {
 fn windows_killed_parent_stops_the_shell_and_keeps_recovery_blocked_until_it_stops() {
     use fs2::FileExt;
     let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("parent.ps1"), "Set-Content shell.started ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content shell.finished finished").unwrap();
+    std::fs::write(directory.path().join("parent.ps1"), "[Console]::WriteLine('parent native='+[Environment]::CurrentDirectory+';script='+$PSScriptRoot); [IO.File]::WriteAllText('shell.started','ready'); while (![IO.File]::Exists('release')) { [Threading.Thread]::Sleep(10) }; [IO.File]::WriteAllText('shell.finished','finished')").unwrap();
     let open = |name| {
         std::fs::OpenOptions::new()
             .read(true)

@@ -2285,19 +2285,16 @@ fn shell_quote(value: &str) -> String {
 async fn copy_to_clipboard(text: &str) -> Result<()> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
+    #[cfg(windows)]
+    let input: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    #[cfg(windows)]
+    let input = input.as_slice();
+    #[cfg(not(windows))]
+    let input = text.as_bytes();
     let choices: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
     } else if cfg!(windows) {
-        &[(
-            "powershell.exe",
-            &[
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[Console]::InputEncoding=[System.Text.UTF8Encoding]::new(); Set-Clipboard -Value ([Console]::In.ReadToEnd())",
-            ],
-        )]
+        &[("clip.exe", &[])]
     } else {
         &[
             ("wl-copy", &[]),
@@ -2320,7 +2317,7 @@ async fn copy_to_clipboard(text: &str) -> Result<()> {
                 Err(error) => return Err(error.into()),
             };
             let mut stdin = child.stdin.take().context("missing clipboard input")?;
-            stdin.write_all(text.as_bytes()).await?;
+            stdin.write_all(input).await?;
             drop(stdin);
             ensure!(
                 child.wait().await?.success(),

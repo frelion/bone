@@ -93,6 +93,8 @@ def installation(target):
 Extract this ZIP. In PowerShell run .\\bone.exe --version, then .\\bone.exe.
 For a permanent install, copy bone.exe into a directory in your user PATH.
 Use Windows Terminal for the interactive TUI. /new begins a conversation.
+Shell commands use cmd.exe. Map network workspaces to a drive letter;
+UNC working directories are rejected before shell execution.
 """
     baseline = "macOS 15 or newer" if "apple" in target else "Linux (statically linked musl; glibc is not required)"
     return f"""BONE for {baseline}.

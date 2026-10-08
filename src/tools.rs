@@ -936,6 +936,12 @@ async fn shell(
 ) -> Result<ToolOutcome> {
     let command = string_arg(args, "command")?;
     let seconds = shell_timeout_seconds(args)?;
+    #[cfg(windows)]
+    ensure!(
+        !matches!(workspace.components().next(), Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..))),
+        "cmd.exe does not support UNC working directories; map the workspace to a drive letter before running shell commands"
+    );
     #[cfg(unix)]
     let mut cmd = tokio::process::Command::new("/bin/sh");
     #[cfg(unix)]
