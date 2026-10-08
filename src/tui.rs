@@ -1996,10 +1996,15 @@ impl App {
                 .arg(&path);
             command
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         let mut command = {
-            let mut command = tokio::process::Command::new(&editor);
-            command.arg(&path);
+            let mut command = tokio::process::Command::new("cmd.exe");
+            // EDITOR is trusted local command text; the generated draft path is
+            // expanded once inside quotes rather than interpolated as code.
+            command
+                .args(["/D", "/S", "/C"])
+                .raw_arg(format!("{editor} \"%BONE_EDITOR_PATH%\""))
+                .env("BONE_EDITOR_PATH", &path);
             command
         };
         command.kill_on_drop(true);
@@ -2282,6 +2287,17 @@ async fn copy_to_clipboard(text: &str) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let choices: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
+    } else if cfg!(windows) {
+        &[(
+            "powershell.exe",
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::InputEncoding=[System.Text.UTF8Encoding]::new(); Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+            ],
+        )]
     } else {
         &[
             ("wl-copy", &[]),
@@ -2312,7 +2328,7 @@ async fn copy_to_clipboard(text: &str) -> Result<()> {
             );
             return Ok(());
         }
-        bail!("未找到 pbcopy、wl-copy、xclip 或 xsel；可以使用 /export")
+        bail!("系统剪贴板不可用；可以使用 /export")
     })
     .await
     .context("clipboard command timed out")?

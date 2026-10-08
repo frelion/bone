@@ -2675,6 +2675,8 @@ impl WriteLease {
         // lock. Never erase its unknown marker just because storage changed.
         let file = open(&path)?;
         let legacy_file = open(&legacy_path)?;
+        #[cfg(windows)]
+        crate::windows::ensure_writer_stopped(&file)?;
         let lease = Self {
             file: Arc::new(file),
             marker,
@@ -2745,8 +2747,9 @@ impl WriteLease {
                 .open(&temporary)?;
             file.write_all(serde_json::to_string(info)?.as_bytes())?;
             file.sync_all()?;
-            std::fs::rename(&temporary, marker)?;
-            File::open(marker.parent().context("marker parent")?)?.sync_all()?;
+            drop(file);
+            crate::filesystem::replace(&temporary, marker)?;
+            crate::filesystem::sync_directory(marker.parent().context("marker parent")?)?;
             Ok(())
         })();
         if result.is_err() {
@@ -2770,12 +2773,14 @@ impl WriteLease {
                 .open(marker.with_extension("lock"))?;
             file.try_lock_exclusive()
                 .context("workspace writer still owns the lock; wait before clearing its marker")?;
+            #[cfg(windows)]
+            crate::windows::ensure_writer_stopped(&file)?;
             locks.push(file);
         }
         for marker in &markers {
             if marker.exists() {
                 std::fs::remove_file(marker).context("clearing confirmed workspace write")?;
-                File::open(marker.parent().context("marker parent")?)?.sync_all()?;
+                crate::filesystem::sync_directory(marker.parent().context("marker parent")?)?;
             }
         }
         Ok(())

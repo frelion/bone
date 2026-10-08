@@ -5,6 +5,10 @@ use std::{
     path::Path,
     process::{Child, Command, Stdio},
 };
+
+pub fn python_command() -> Command {
+    Command::new(if cfg!(windows) { "python" } else { "python3" })
+}
 pub struct Server(pub Child);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -29,7 +33,7 @@ impl Server {
         (server, port)
     }
     pub fn script(server_path: &str, script: &Path, requests: &Path) -> (Self, u16) {
-        let mut command = Command::new("python3");
+        let mut command = python_command();
         command
             .arg("-B")
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(server_path))

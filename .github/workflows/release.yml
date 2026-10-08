@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag; leave empty to check this commit without a release
+        default: ""
+        required: false
+        type: string
+      publish:
+        description: Publish after every native build and check passes
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RUSTUP_TOOLCHAIN: "1.96.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+      preflight: ${{ steps.version.outputs.preflight }}
+    env:
+      TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+      - id: version
+        name: Match the immutable tag to the package version
+        run: python scripts/release.py validate --tag "$TAG"
+      - name: Create or reuse the draft
+        if: steps.version.outputs.preflight == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --json isDraft --jq .isDraft > draft-state; then
+            test "$(cat draft-state)" = true || { echo "Release is already published; refusing to replace assets." >&2; exit 1; }
+          else
+            if test -f "docs/releases/$VERSION.md"; then
+              gh release create "$TAG" --verify-tag --draft --title "BONE $VERSION" --notes-file "docs/releases/$VERSION.md"
+            else
+              gh release create "$TAG" --verify-tag --draft --title "BONE $VERSION" --generate-notes
+            fi
+          fi
+
+  build:
+    needs: prepare
+    name: Native build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+      RELEASE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+      - name: Install the fixed native Rust toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustup target add "$RELEASE_TARGET"
+          rustc --version --verbose
+          rustc --version --verbose | grep -Fx "host: ${RELEASE_TARGET/-musl/-gnu}"
+      - name: Install the native musl C toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          echo "CC=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
+      - name: Native unit and integration checks (no model credentials)
+        run: cargo test --locked --target "$RELEASE_TARGET"
+      - name: Build the standard CLI and TUI
+        run: cargo build --release --locked --bin bone --target "$RELEASE_TARGET"
+      - name: Smoke test, package, extract and smoke test again
+        run: python scripts/release.py package --tag "$TAG" --target "$RELEASE_TARGET" --commit "$RELEASE_COMMIT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+      GH_TOKEN: ${{ github.token }}
+      PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Require all six matching builds and verify every archive
+        run: python scripts/release.py aggregate --tag "$TAG" --commit "$RELEASE_COMMIT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: manifest-${{ github.run_id }}
+          path: |
+            dist/SHA256SUMS
+            dist/release-builds.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+      - name: Upload only to the draft; publish last
+        if: needs.prepare.outputs.preflight == 'false'
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true
+          gh release upload "$TAG" dist/* --clobber
+          if test "$PUBLISH" = true; then
+            gh release edit "$TAG" --draft=false --latest
+          fi
+          echo "### BONE $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "All six native targets passed tests and extracted-binary smoke checks. Publish: $PUBLISH." >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+      - name: Preflight summary
+        if: needs.prepare.outputs.preflight == 'true'
+        run: |
+          echo "### BONE $TAG preflight" >> "$GITHUB_STEP_SUMMARY"
+          echo "All six native targets passed tests and extracted-binary smoke checks. Packages and SHA256SUMS are workflow artifacts. No Git tag or release was created." >> "$GITHUB_STEP_SUMMARY"
+
+  failure:
+    needs: [prepare, build, publish]
+    if: failure()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Explain the release gate
+        run: |
+          echo "## Release not published" >> "$GITHUB_STEP_SUMMARY"
+          echo "A required build, test, package or upload failed. Publication is gated by every native build succeeding. A prepared draft and successful workflow artifacts are retained for inspection." >> "$GITHUB_STEP_SUMMARY"

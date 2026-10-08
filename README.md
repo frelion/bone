@@ -20,6 +20,8 @@ bone tools --read-only --single-job --json
 
 ## 构建与配置
 
+macOS、Windows 和 Linux 的预编译包见 [GitHub Releases](https://github.com/frelion/bone/releases/latest)，下载对应架构后解压，安装步骤在包内 `INSTALL.txt`。发布范围见 [0.9.4 发布说明](docs/releases/0.9.4.md)。
+
 需要 Rust 1.96 或更新版本；本地协议验收还需要 Python 3。
 
 ```sh
@@ -29,7 +31,7 @@ bone --version
 bone providers
 ```
 
-安装后的版本应为 `bone 0.9.3`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
+安装后的版本应为 `bone 0.9.4`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
 
 `target/release/bone` 是构建目录内的文件，只有在包含它的 checkout 中才能通过相对路径运行。安装后的 `bone` 可在任意项目目录中使用。
 

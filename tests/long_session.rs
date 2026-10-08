@@ -1,10 +1,10 @@
 //! Long sessions and hard interruption through public Engine/CLI entry points.
+use std::{collections::BTreeSet, path::Path, time::Duration};
+#[cfg(unix)]
 use std::{
-    collections::BTreeSet,
-    path::Path,
-    process::{Child, Command, Output, Stdio},
+    process::{Child, Output, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use bone::{
@@ -460,10 +460,15 @@ async fn archived_public_requirements_and_summary_are_readable_across_job_handof
     native_tool_outputs_have_calls(&fixture.requests());
 }
 
+#[cfg(unix)]
 fn finish_child(child: Child) -> Output {
     support::finish_child(child, Duration::from_secs(25))
 }
 
+// Unix descendants retain the physical file leases after an owner dies.
+// Windows instead terminates descendants through its Job Object; its hard-kill
+// regression lives with the Windows shell implementation tests.
+#[cfg(unix)]
 #[tokio::test]
 async fn killed_owner_cannot_reconcile_or_allow_competing_writes_until_its_shell_exits() {
     let mut competing = call(
@@ -629,7 +634,7 @@ fn long_task_harness_keeps_model_quality_failures_and_raw_rounds() {
         "fixtures/long_task/server.py",
     );
     let artifacts = fixture.root.path().join("dogfood");
-    let mut command = Command::new("python3");
+    let mut command = support::python_command();
     command
         .arg("-B")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/long_task.py"))

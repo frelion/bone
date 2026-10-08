@@ -110,13 +110,12 @@ fn traversal_and_symlink_escapes_are_rejected() {
 #[tokio::test]
 async fn shell_output_is_bounded_and_nonzero_exit_is_reported() {
     let dir = tempfile::tempdir().unwrap();
-    let out = execute(
-        dir.path(),
-        "shell",
-        &json!({"command":"printf test; exit 7"}),
-        None,
-    )
-    .await;
+    let command = if cfg!(windows) {
+        "<nul set /p =test & exit /b 7"
+    } else {
+        "printf test; exit 7"
+    };
+    let out = execute(dir.path(), "shell", &json!({"command":command}), None).await;
     assert_eq!(out.content["stdout"], "test");
     assert_eq!(out.content["exit_code"], 7);
     assert!(!out.uncertain);
@@ -148,7 +147,7 @@ fn external_save_during_preparation_is_not_overwritten() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn external_replacement_with_identical_content_is_detected_by_identity() {
     assert_raced_write(
@@ -321,7 +320,19 @@ async fn observed_shell_drains_beyond_preview_and_keeps_timeout_uncertainty() {
     let observer: ToolObserver = Arc::new(move |_, chunk| {
         received.fetch_add(chunk.len(), Ordering::Relaxed);
     });
-    let outcome = execute_with_progress(directory.path(), "shell", &json!({"command":"i=0; while [ $i -lt 4000 ]; do printf 0123456789; i=$((i + 1)); done; printf error >&2; exit 7"}), None, Some(Arc::clone(&observer))).await;
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write('0123456789'*4000); [Console]::Error.Write('error'); exit 7\""
+    } else {
+        "i=0; while [ $i -lt 4000 ]; do printf 0123456789; i=$((i + 1)); done; printf error >&2; exit 7"
+    };
+    let outcome = execute_with_progress(
+        directory.path(),
+        "shell",
+        &json!({"command":command}),
+        None,
+        Some(Arc::clone(&observer)),
+    )
+    .await;
     assert_eq!(bytes.load(Ordering::Relaxed), 40_005);
     assert_eq!(
         outcome.content["stdout"].as_str().unwrap().len(),
@@ -332,10 +343,15 @@ async fn observed_shell_drains_beyond_preview_and_keeps_timeout_uncertainty() {
     assert_eq!(outcome.content["truncated"], true);
     assert!(!outcome.uncertain);
     bytes.store(0, Ordering::Relaxed);
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write('observed-before-timeout'); Start-Sleep -Seconds 5\""
+    } else {
+        "printf observed-before-timeout; sleep 5"
+    };
     let timed_out = execute_with_progress(
         directory.path(),
         "shell",
-        &json!({"command":"printf observed-before-timeout; sleep 5", "timeout_seconds":1}),
+        &json!({"command":command, "timeout_seconds":1}),
         None,
         Some(observer),
     )
@@ -349,4 +365,115 @@ async fn observed_shell_drains_beyond_preview_and_keeps_timeout_uncertainty() {
             .unwrap()
             .contains("timed out")
     );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_timeout_stops_descendants_before_releasing_workspace_ownership() {
+    use fs2::FileExt;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("child.ps1"),
+        "Start-Sleep -Seconds 3; Set-Content child.finished finished",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("parent.ps1"), "Start-Process powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','child.ps1' -NoNewWindow; Set-Content shell.started ready; Start-Sleep -Seconds 20").unwrap();
+    let open_lock = |name| {
+        std::sync::Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(directory.path().join(name))
+                .unwrap(),
+        )
+    };
+    let stable = open_lock("stable.lock");
+    let legacy = open_lock("legacy.lock");
+    stable.try_lock_exclusive().unwrap();
+    legacy.try_lock_exclusive().unwrap();
+    let outcome = execute(directory.path(), "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -File parent.ps1","timeout_seconds":2}), Some([stable.clone(), legacy.clone()])).await;
+    assert!(directory.path().join("shell.started").exists());
+    assert!(outcome.uncertain);
+    assert_eq!(outcome.content["effect"], "unknown");
+    crate::windows::ensure_writer_stopped(&stable).unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !directory.path().join("child.finished").exists(),
+        "timed-out descendant continued writing"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "subprocess helper for the Windows killed-parent job test"]
+fn windows_owned_shell_helper() {
+    use fs2::FileExt;
+    let directory = std::path::PathBuf::from(std::env::var_os("BONE_TOOL_LEASE_TEST_DIR").unwrap());
+    let open = |name| {
+        std::sync::Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(directory.join(name))
+                .unwrap(),
+        )
+    };
+    let stable = open("stable.lock");
+    let legacy = open("legacy.lock");
+    stable.try_lock_exclusive().unwrap();
+    legacy.try_lock_exclusive().unwrap();
+    tokio::runtime::Runtime::new().unwrap().block_on(execute(&directory, "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -File parent.ps1","timeout_seconds":20}), Some([stable, legacy])));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_killed_parent_stops_the_shell_and_keeps_recovery_blocked_until_it_stops() {
+    use fs2::FileExt;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("parent.ps1"), "Set-Content shell.started ready; Start-Sleep -Seconds 3; Set-Content shell.finished finished").unwrap();
+    let open = |name| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(directory.path().join(name))
+            .unwrap()
+    };
+    let stable = open("stable.lock");
+    let _legacy = open("legacy.lock");
+    let mut parent = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tools::tests::windows_owned_shell_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("BONE_TOOL_LEASE_TEST_DIR", directory.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !directory.path().join("shell.started").exists() {
+        if std::time::Instant::now() >= deadline {
+            let _ = parent.kill();
+            let _ = parent.wait();
+            panic!("Windows shell helper did not start");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    parent.kill().unwrap();
+    parent.wait().unwrap();
+    stable.try_lock_exclusive().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while crate::windows::ensure_writer_stopped(&stable).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Windows crashed owner's shell did not stop"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!directory.path().join("shell.finished").exists());
 }

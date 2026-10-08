@@ -113,10 +113,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             options.mode(0o600);
         }
         let mut file = options.open(&temp)?;
+        bone::filesystem::private_file(&file)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temp, path)?;
-        fs::File::open(parent)?.sync_all()?;
+        drop(file);
+        bone::filesystem::replace(&temp, path)?;
+        bone::filesystem::sync_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {

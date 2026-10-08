@@ -344,8 +344,13 @@ fn chat_deadline_pauses_a_model_call_and_preserves_resumable_input() {
 
 #[test]
 fn chat_deadline_retains_unknown_write_and_does_not_repeat_it_on_reopen() {
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('started.txt', 'started'); Start-Sleep -Seconds 5; [IO.File]::WriteAllText('finished.txt', 'finished')\""
+    } else {
+        "printf started > started.txt; sleep 5; printf finished > finished.txt"
+    };
     let fixture = Fixture::new(json!([
-        {"output":[tool("long-write","shell",json!({"command":"printf started > started.txt; sleep 5; printf finished > finished.txt","timeout_seconds":10}))]},
+        {"output":[tool("long-write","shell",json!({"command":command,"timeout_seconds":10}))]},
         {"text":"Do not claim an interrupted write completed."}
     ]));
     let mut command = fixture.command();

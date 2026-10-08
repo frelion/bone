@@ -1,5 +1,5 @@
 //! Independent CLI acceptance through a scripted localhost Responses endpoint.
-use std::{path::Path, process::Command, time::Duration};
+use std::{path::Path, time::Duration};
 
 use serde_json::{Value, json};
 
@@ -324,8 +324,13 @@ async fn new_instruction_blocks_unstarted_write_proposals() {
 
 #[tokio::test]
 async fn interrupted_write_survives_restart_and_requires_reconciliation() {
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::AppendAllText('effect.txt', 'x'); Start-Sleep -Seconds 5\""
+    } else {
+        "printf x >> effect.txt; sleep 5"
+    };
     let fixture = Fixture::turns(json!([
-        tool("shell",json!({"command":"printf x >> effect.txt; sleep 5","timeout_seconds":10}),"call_append_once"),
+        tool("shell",json!({"command":command,"timeout_seconds":10}),"call_append_once"),
         tool("read_file",json!({"path":"effect.txt"}),"call_inspect_effect"),
         {"text":"Effect observed; waiting for explicit reconciliation"},
         {"contains":["already appended once"],"text":"Observed append reconciled without replay"}
@@ -412,7 +417,7 @@ fn alternating_ablation_records_all_local_trials_and_usage() {
     }
     let fixture = Fixture::turns(Value::Array(turns));
     let records = fixture.root.path().join("ablation.jsonl");
-    let mut command = Command::new("python3");
+    let mut command = support::python_command();
     command
         .arg("-B")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ablate.py"))

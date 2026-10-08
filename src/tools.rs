@@ -14,6 +14,10 @@ const DEFAULT_READ_LIMIT: usize = 8 * 1024;
 const FILE_LIMIT: u64 = 16 * 1024 * 1024;
 const DEFAULT_SHELL_TIMEOUT_SECONDS: u64 = 60;
 const MAX_SHELL_TIMEOUT_SECONDS: u64 = 3600;
+#[cfg(windows)]
+const SHELL_DESCRIPTION: &str = "Run a Windows cmd.exe /D /S /C command in the workspace with the user's local privileges. Use Windows command syntax; invoke powershell.exe -NoProfile -Command explicitly when PowerShell is needed. Treat as a write operation. Default timeout is 60 seconds; choose up to 3600 seconds for builds or integration tests. The session deadline still applies. Output is bounded; timed-out commands require reconciliation. Prefer read_file/list_files for inspection.";
+#[cfg(not(windows))]
+const SHELL_DESCRIPTION: &str = "Run a /bin/sh command in the workspace with the user's local privileges. Treat as a write operation. Default timeout is 60 seconds; choose a longer timeout up to 3600 seconds for builds or integration tests. The session's overall deadline still applies. Output is bounded; timed-out commands require reconciliation. Prefer read_file/list_files for inspection.";
 
 pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
     let mut tools = vec![
@@ -63,7 +67,7 @@ pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
     if !read_only {
         tools.push(definition("edit_file", "Apply exact text edits to an existing workspace UTF-8 file (at most 16 MiB) using its whole-file expected_sha256. Each old_text must occur exactly once in the original source, including overlapping occurrences; edit spans cannot overlap. All edits are validated before replacement and do not cascade. Untouched bytes and permissions are preserved. Final identity checks narrow external-writer races but are not atomic CAS.", json!({"path":{"type":"string"},"expected_sha256":{"type":"string"},"edits":{"type":"array","minItems":1,"items":{"type":"object","properties":{"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"}},"required":["old_text","new_text"],"additionalProperties":false}}}), &["path","expected_sha256","edits"]));
         tools.push(definition("write_file", "Replace a workspace file using expected_sha256 from read_file. Content and file identity are checked again immediately before replacement; an external writer racing after that check can still change it. For a NEW file pass expected_sha256=null; creation never overwrites an existing target. Existing files are limited to 16 MiB. All contents must be provided.", json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":["string","null"]}}), &["path","content","expected_sha256"]));
-        tools.push(definition("shell", "Run a shell command in the workspace with the user's local privileges. Treat as a write operation. Default timeout is 60 seconds; choose a longer timeout up to 3600 seconds for builds or integration tests. The session's overall deadline still applies. Output is bounded; timed-out commands require reconciliation. Prefer read_file/list_files for inspection.", json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_SECONDS,"default":DEFAULT_SHELL_TIMEOUT_SECONDS}}), &["command"]));
+        tools.push(definition("shell", SHELL_DESCRIPTION, json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_SECONDS,"default":DEFAULT_SHELL_TIMEOUT_SECONDS}}), &["command"]));
     }
     if !single_job {
         tools.extend([
@@ -181,17 +185,12 @@ pub async fn execute_with_progress(
         };
     }
     if name == "edit_file" {
-        return edit_file_prepared(
-            workspace,
-            args,
-            |parent| std::fs::File::open(parent)?.sync_all(),
-            |_| Ok(()),
-        );
+        return edit_file_prepared(workspace, args, crate::filesystem::sync_directory, |_| {
+            Ok(())
+        });
     }
     if name == "write_file" {
-        return write_file(workspace, args, |parent| {
-            std::fs::File::open(parent)?.sync_all()
-        });
+        return write_file(workspace, args, crate::filesystem::sync_directory);
     }
     let result = file_tool(workspace, name, args);
     ToolOutcome {
@@ -684,6 +683,8 @@ struct FileVersion {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    identity: (u32, u64),
 }
 
 impl FileVersion {
@@ -698,7 +699,19 @@ impl FileVersion {
             device: metadata.dev(),
             #[cfg(unix)]
             inode: metadata.ino(),
+            #[cfg(windows)]
+            identity: (0, 0),
         }
+    }
+
+    fn from_file(file: &std::fs::File) -> std::io::Result<Self> {
+        let version = Self::metadata(&file.metadata()?);
+        #[cfg(windows)]
+        let version = Self {
+            identity: crate::windows::file_identity(file)?,
+            ..version
+        };
+        Ok(version)
     }
 }
 
@@ -730,7 +743,7 @@ fn file_version(path: &Path) -> Result<Option<FileVersion>> {
     };
     let metadata = file.metadata()?;
     ensure!(metadata.is_file(), "path is not a regular file");
-    let mut version = FileVersion::metadata(&metadata);
+    let mut version = FileVersion::from_file(&file)?;
     ensure!(
         version.bytes <= FILE_LIMIT,
         "file exceeds 16 MiB; use a bounded shell command"
@@ -752,7 +765,7 @@ fn file_version(path: &Path) -> Result<Option<FileVersion>> {
         hash.update(&buffer[..count]);
     }
     ensure!(
-        version == FileVersion::metadata(&reader.get_ref().metadata()?),
+        version == FileVersion::from_file(reader.get_ref())?,
         "file changed while checking it; read it again before replacing it"
     );
     version.sha256 = format!("{:x}", hash.finalize());
@@ -804,6 +817,8 @@ fn write_file_prepared(
                 .create_new(true)
                 .open(&temporary)?;
             if let Ok(metadata) = std::fs::metadata(&path) {
+                #[cfg(windows)]
+                crate::filesystem::copy_access(&std::fs::File::open(&path)?, &file)?;
                 file.set_permissions(metadata.permissions())?;
             }
             file.write_all(content.as_bytes())?;
@@ -820,13 +835,22 @@ fn write_file_prepared(
                     "file changed during replacement preparation; read it again before replacing it"
                 );
                 // This narrows the external-writer race; it is not an atomic CAS.
-                std::fs::rename(&temporary, &path)?;
+                drop(file);
+                crate::filesystem::replace(&temporary, &path)?;
                 installed = true;
             } else {
-                // Both names share one directory/filesystem. Unlike rename,
-                // hard_link fails atomically if another writer created the target.
+                // Both names share one directory/filesystem. The commit fails
+                // atomically if another writer has created the target.
+                // Windows uses a write-through move without replace-existing;
+                // Unix keeps the atomic no-clobber hard-link commit.
+                #[cfg(windows)]
+                drop(file);
+                #[cfg(windows)]
+                crate::filesystem::create(&temporary, &path)?;
+                #[cfg(not(windows))]
                 std::fs::hard_link(&temporary, &path)?;
                 installed = true;
+                #[cfg(not(windows))]
                 std::fs::remove_file(&temporary)?;
             }
             sync_directory(&canonical_parent)?;
@@ -877,7 +901,9 @@ async fn drain(
     Ok((out, truncated))
 }
 
+#[cfg(unix)]
 struct ProcessGroup(u32);
+#[cfg(unix)]
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -910,10 +936,23 @@ async fn shell(
 ) -> Result<ToolOutcome> {
     let command = string_arg(args, "command")?;
     let seconds = shell_timeout_seconds(args)?;
+    #[cfg(unix)]
     let mut cmd = tokio::process::Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(workspace)
+    #[cfg(unix)]
+    cmd.arg("-c").arg(command);
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = tokio::process::Command::new("cmd.exe");
+        // The model's shell command is deliberately executable local code.
+        // raw_arg preserves cmd syntax, including quoted executable paths.
+        cmd.args(["/D", "/S", "/C"])
+            .raw_arg(command)
+            .creation_flags(0x0000_0004 /* CREATE_SUSPENDED */);
+        cmd
+    };
+    #[cfg(windows)]
+    let _group = crate::windows::ProcessGroup::new(write_leases.map(|leases| leases[0].as_ref()))?;
+    cmd.current_dir(workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -945,7 +984,10 @@ async fn shell(
         }
     }
     let mut child = cmd.spawn()?;
+    #[cfg(unix)]
     let _group = ProcessGroup(child.id().context("shell did not start")?);
+    #[cfg(windows)]
+    _group.start(&child)?;
     let stdout = child.stdout.take().context("missing stdout")?;
     let stderr = child.stderr.take().context("missing stderr")?;
     let wait = async {

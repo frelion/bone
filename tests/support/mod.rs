@@ -17,6 +17,9 @@ use std::{
 
 mod server;
 pub use server::Server;
+pub fn python_command() -> Command {
+    server::python_command()
+}
 pub fn read_requests(path: &Path) -> Vec<Value> {
     std::fs::read_to_string(path)
         .unwrap_or_default()

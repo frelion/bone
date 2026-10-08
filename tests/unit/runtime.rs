@@ -1150,17 +1150,17 @@ async fn readable_summary_pages_skip_native_metadata_and_preserve_every_characte
 
 #[tokio::test]
 async fn shell_progress_precedes_completion_and_keeps_final_output_after_new_input() {
+    let command = if cfg!(windows) {
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); [Console]::Write('early 中文'); [Console]::Error.Write('warning'); while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; [Console]::Write(' final')\""
+    } else {
+        "printf 'early 中文'; printf 'warning' >&2; while [ ! -f release ]; do sleep 0.01; done; printf ' final'"
+    };
     let (_directory, mut engine) = fixture_engine();
     engine.post("run a build", None).unwrap();
     engine.prepare_pending_input().unwrap();
     let job = engine.state.focus.clone().unwrap();
     assert!(engine.drain_tool_progress().is_empty());
-    let tool = native_proposal(
-        &mut engine,
-        &job,
-        "shell",
-        json!({"command":"printf 'early 中文'; printf 'warning' >&2; while [ ! -f release ]; do sleep 0.01; done; printf ' final'"}),
-    );
+    let tool = native_proposal(&mut engine, &job, "shell", json!({"command":command}));
     engine.start_tool(&job, tool).unwrap();
     let call = engine.state.jobs[&job].current_call.clone().unwrap();
     assert!(

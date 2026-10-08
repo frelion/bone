@@ -1,7 +1,7 @@
 //! Persistent provider recipes. Rig owns provider configuration and its serialization.
 use std::{
     collections::BTreeMap,
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -361,6 +361,7 @@ pub(crate) fn write_atomic(
             options.mode(0o600);
         }
         let mut file = options.open(&temporary)?;
+        crate::filesystem::private_file(&file)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         if let Some(expected) = expected {
@@ -369,8 +370,9 @@ pub(crate) fn write_atomic(
                 "configuration changed outside this editor; reopen connections before saving"
             );
         }
-        std::fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        drop(file);
+        crate::filesystem::replace(&temporary, path)?;
+        crate::filesystem::sync_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -393,7 +395,7 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
 }
 
 pub fn default_data_dir() -> PathBuf {
-    std::env::var_os("HOME")
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".bone/v2")
@@ -426,11 +428,9 @@ pub(crate) fn user_home() -> Result<PathBuf> {
     Ok(PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub(crate) fn user_home() -> Result<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .context("user home directory is missing")
+    crate::windows::user_home().context("cannot find stable OS user profile directory")
 }
 
 #[cfg(test)]

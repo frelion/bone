@@ -1,5 +1,5 @@
 //! A complete native tool batch must remain usable when its results exceed context.
-use std::{path::Path, process::Command, time::Duration};
+use std::{path::Path, time::Duration};
 
 use bone::runtime::{Engine, RunOptions};
 use serde_json::{Value, json};
@@ -65,7 +65,7 @@ def substitute(output, body):
 fixture.wire.expand_output = substitute
 fixture.main()
 "#).unwrap();
-    let mut command = Command::new("python3");
+    let mut command = support::python_command();
     command
         .arg("-B")
         .arg(launcher)
@@ -261,7 +261,7 @@ async fn source_pages_probe(source_paths: &[&str], preload: bool) {
         "summary":"EARLY_REQUIREMENT: signed integer cents. Earlier work consumed; source pages for the current task must remain available."
     })).unwrap()).unwrap();
     let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/long_task/server.py");
-    let mut command = Command::new("python3");
+    let mut command = support::python_command();
     command.arg("-B");
     if source_paths.len() > 4 {
         let launcher = root.path().join("inspect-server.py");

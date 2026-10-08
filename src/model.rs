@@ -230,11 +230,7 @@ pub fn save_api_key(
     let path = api_key_file(data_dir, profile_name)?;
     let directory = path.parent().context("credential directory is missing")?;
     std::fs::create_dir_all(directory).context("cannot create BONE credential directory")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
-    }
+    crate::filesystem::private_directory(directory)?;
     // Recheck after directory creation; never follow an existing profile/key alias.
     let path = api_key_file(data_dir, profile_name)?;
     let record = ApiKeyRecord {
@@ -314,6 +310,8 @@ fn resolve_api_key(
     match options.open(path) {
         Ok(mut file) => {
             let metadata = file.metadata().context("cannot inspect BONE API key")?;
+            #[cfg(windows)]
+            crate::filesystem::check_private(&file)?;
             ensure!(
                 metadata.is_file() && metadata.len() <= 1024 * 1024,
                 "BONE API key file is invalid"
@@ -420,8 +418,11 @@ fn codex_auth_file() -> Result<PathBuf> {
     let directory = if let Some(path) = std::env::var_os("CODEX_HOME").filter(|p| !p.is_empty()) {
         PathBuf::from(path)
     } else {
-        PathBuf::from(std::env::var_os("HOME").context("cannot find Codex login directory")?)
-            .join(".codex")
+        PathBuf::from(
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .context("cannot find Codex login directory")?,
+        )
+        .join(".codex")
     };
     Ok(directory.join("auth.json"))
 }
@@ -469,6 +470,11 @@ fn restrict_cache_permissions(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .context("cannot restrict BONE subscription cache permissions")?;
+    }
+    #[cfg(windows)]
+    {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        crate::filesystem::private_file(&file)?;
     }
     Ok(())
 }
@@ -522,11 +528,7 @@ async fn lock_codex_source_with_legacy(
 async fn acquire_credential_lock(path: &Path) -> Result<CredentialLock> {
     let directory = path.parent().context("subscription lock parent missing")?;
     std::fs::create_dir_all(directory).context("cannot create BONE subscription lock directory")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
-    }
+    crate::filesystem::private_directory(directory)?;
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]

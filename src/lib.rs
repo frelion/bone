@@ -20,11 +20,15 @@ use std::path::Path;
 
 pub mod config;
 mod context;
+#[doc(hidden)]
+pub mod filesystem;
 mod model;
 pub mod runtime;
 pub mod state;
 mod store;
 mod tools;
+#[cfg(windows)]
+mod windows;
 
 pub use model::{
     has_api_key, has_login, login, login_with, providers, remove_api_key, save_api_key,
