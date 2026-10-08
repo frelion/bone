@@ -1,6 +1,6 @@
 # BONE 开发终端
 
-BONE 0.9.2 使用 Ratatui、Crossterm、ratatui-textarea 与 tui-markdown。左侧切换会话，右侧写要求、读结果和查看证据。Job 由 Agent 管理。
+BONE 0.9.3 使用 Ratatui、Crossterm、ratatui-textarea 与 tui-markdown。左侧切换会话，右侧写要求、读结果和查看证据。Job 由 Agent 管理。
 
 ## 启动
 
@@ -10,7 +10,7 @@ bone tui --workspace /path/to/project
 bone tui --session SESSION_ID --workspace /path/to/project
 ```
 
-安装：`cargo install --path . --locked --force`。`bone --version` 应显示 `bone 0.9.2`。必须使用交互式终端；管道输入用 `bone chat`。
+安装：`cargo install --path . --locked --force`。`bone --version` 应显示 `bone 0.9.3`。必须使用交互式终端；管道输入用 `bone chat`。
 
 ## 连接与模型
 
@@ -34,7 +34,7 @@ bone tui --session SESSION_ID --workspace /path/to/project
 
 | 命令 | 用途 |
 | --- | --- |
-| `/new` | 新会话，保存并暂停旧工作 |
+| `/new` | 保存并暂停旧工作，回到新的输入框；首条消息后加入列表 |
 | `/model` | 修改当前模型 |
 | `/connect` | 切换连接、登录或添加 API |
 | `/help` | 键盘帮助 |
@@ -58,7 +58,7 @@ bone tui --session SESSION_ID --workspace /path/to/project
 | 结果原文 / 审计 / 复制 | 正文 d / 详情 D、F2 / Ctrl+Y |
 | 暂停 / 恢复 / 退出 | Ctrl+C / Ctrl+R / Ctrl+Q |
 
-窄于 80 列时会话栏收起，Shift+← 临时打开，Shift+→ 或 Esc 回到原焦点与阅读位置。会话项第一行显示名称，第二行显示真实状态与最近持久活动的本地时间；没有活动时显示未开始与时间占位。项间弱分隔线，当前名称加粗，键盘候选两行反色；返回正文后浏览高亮消失。标题与信息行都打开同一会话，分隔线不打开。长标题保留开头与结尾；页脚显示可见范围。Shift+← 刷新已有列表，异步结果不抢选择或焦点。切换会话先保存草稿与回复目标；未完成工作保持暂停。
+窄于 80 列时会话栏收起，Shift+← 临时打开，Shift+→ 或 Esc 回到原焦点与阅读位置。空白会话不进入侧栏，`/new` 后直接写任务；首条消息持久化后立即显示，已有 Job 或待核查写入的会话仍可找到。会话项第一行显示名称，第二行显示真实状态与最近持久活动的本地时间。项间弱分隔线，当前名称加粗，键盘候选两行反色；返回正文后浏览高亮消失。标题与信息行都打开同一会话，分隔线不打开。长标题保留开头与结尾；页脚显示可见范围。Shift+← 刷新已有列表，异步结果不抢选择或焦点。切换会话先保存草稿与回复目标；未完成工作保持暂停。
 
 表单内 Shift+方向键仍用于原生选区；焦点快捷键不穿透弹层。表单按内容收紧，最后一项可回顾之前的公开值，密钥始终遮罩。表单每个字段有独立编辑器：Enter 下一项或保存，Tab / Shift+Tab 切字段，Esc 取消。窗口不足以显示字段时提示扩大窗口，并停止编辑与保存；Esc 仍可返回。表单、帮助和原文层返回时保留父草稿、光标、选区与撤销记录。核查期间先记录或取消，再切换会话。
 
@@ -74,4 +74,4 @@ bone tui --session SESSION_ID --workspace /path/to/project
 
 `/export` 异步生成本地报告并保留当前操作；完成后 Ctrl+P 的“查看导出报告”显示完整路径，Ctrl+Y 复制。
 
-设计约束见 [DESIGN.md](../DESIGN.md)。0.9.2 的会话栏设计语言与实际前后对照见 [左栏设计](results/2026-10-08-sidebar-spacing/overview.html)。0.9.0 的视觉对抗和完整交互证据见 [产品重构报告](results/2026-10-03-product-refactor/overview.html)。0.8.1 见 [左栏验收](results/2026-10-03-tui-sidebar/overview.html)。此前协议连接与订阅任务的可浏览证据见 [工作区交互报告](results/2026-10-03-tui-workspace/overview.html)。
+设计约束见 [DESIGN.md](../DESIGN.md)。0.9.3 的 `/new` 与空会话隐藏见 [实际回放](results/2026-10-08-new-session/overview.html)。0.9.2 的会话栏设计语言与实际前后对照见 [左栏设计](results/2026-10-08-sidebar-spacing/overview.html)。0.9.0 的视觉对抗和完整交互证据见 [产品重构报告](results/2026-10-03-product-refactor/overview.html)。0.8.1 见 [左栏验收](results/2026-10-03-tui-sidebar/overview.html)。此前协议连接与订阅任务的可浏览证据见 [工作区交互报告](results/2026-10-03-tui-workspace/overview.html)。

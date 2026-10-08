@@ -29,7 +29,7 @@ bone --version
 bone providers
 ```
 
-安装后的版本应为 `bone 0.9.2`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
+安装后的版本应为 `bone 0.9.3`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
 
 `target/release/bone` 是构建目录内的文件，只有在包含它的 checkout 中才能通过相对路径运行。安装后的 `bone` 可在任意项目目录中使用。
 
@@ -127,9 +127,9 @@ TUI 左侧切换会话，右侧显示对话、Markdown 答复和工具行动；�
 
 默认正文不显示“你 / Agent”标题，原话以细竖线区分。输入框显示编辑焦点和真实终端光标。运行行固定显示实际动作、耗时与活动标记；输入回执独立显示，后台仍在执行时不会被较早的交付覆盖。
 
-0.9.2 使用 Shift+方向键切换焦点。会话项先显示名称，再显示真实状态与最近持久活动时间；项间弱分隔线，当前名称加粗，键盘候选两行反色，返回正文后反色消失；表单按内容收紧，保存前回顾公开配置，密钥遮罩。文本选区使用 Ctrl+Shift+方向键，点击输入框恢复编辑。
+0.9.3 使用 Shift+方向键切换焦点。侧栏只展示已有内容或工作的会话，不保留“新会话”占位；`/new` 直接回到输入，发送首条消息后进入列表。会话项先显示名称，再显示真实状态与最近持久活动时间；项间弱分隔线，当前名称加粗，键盘候选两行反色，返回正文后反色消失；表单按内容收紧，保存前回顾公开配置，密钥遮罩。文本选区使用 Ctrl+Shift+方向键，点击输入框恢复编辑。
 
-会话栏设计语言与前后对照见 [0.9.2](docs/results/2026-10-08-sidebar-spacing/overview.html)；完整产品重构的视觉对抗、架构减法与交互证据见 [0.9.0](docs/results/2026-10-03-product-refactor/overview.html)；此前左栏见 [0.8.1](docs/results/2026-10-03-tui-sidebar/overview.html)；此前会话栏、连接管理与终端证据见 [0.8.0 工作区交互](docs/results/2026-10-03-tui-workspace/README.md)；此前反馈修复见 [0.7.1](docs/results/2026-10-02-tui-feedback/README.md)。
+`/new` 与空会话隐藏的实际回放见 [0.9.3](docs/results/2026-10-08-new-session/overview.html)；会话栏设计语言与前后对照见 [0.9.2](docs/results/2026-10-08-sidebar-spacing/overview.html)；完整产品重构的视觉对抗、架构减法与交互证据见 [0.9.0](docs/results/2026-10-03-product-refactor/overview.html)；此前左栏见 [0.8.1](docs/results/2026-10-03-tui-sidebar/overview.html)；此前会话栏、连接管理与终端证据见 [0.8.0 工作区交互](docs/results/2026-10-03-tui-workspace/README.md)；此前反馈修复见 [0.7.1](docs/results/2026-10-02-tui-feedback/README.md)。
 
 | 操作 | 按键 / 命令 |
 | --- | --- |

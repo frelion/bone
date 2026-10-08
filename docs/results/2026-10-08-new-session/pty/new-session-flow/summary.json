@@ -1,0 +1,10 @@
+{
+  "size": "80x24",
+  "binary": "/Users/zzhang/.cargo/bin/bone",
+  "results": [
+    {
+      "scenario": "new-session-flow",
+      "status": "PASS"
+    }
+  ]
+}

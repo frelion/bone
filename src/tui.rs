@@ -1187,7 +1187,7 @@ impl App {
         self.drafts.clear();
         self.load(engine, data)?;
         self.ui.select_session(&engine.state().id);
-        if sidebar {
+        if sidebar && id.is_some() {
             self.ui.focus = Focus::Sessions;
             self.ui.main_focus = return_focus;
         }
@@ -2173,6 +2173,12 @@ fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<Ses
             FROM events WHERE session_id = sessions.id ORDER BY sequence DESC LIMIT 1)
          FROM sessions
          WHERE json_extract(snapshot, '$.workspace') = ?1
+           AND (EXISTS (SELECT 1 FROM events WHERE session_id = sessions.id
+                  AND json_extract(payload, '$.kind') = 'input'
+                  AND json_extract(payload, '$.data.source') = 'user')
+             OR EXISTS (SELECT 1 FROM json_each(snapshot, '$.jobs'))
+             OR json_array_length(snapshot, '$.pending_inputs') > 0
+             OR EXISTS (SELECT 1 FROM json_each(snapshot, '$.unknown_writes')))
          ORDER BY (id = ?2) DESC,
            COALESCE((SELECT MAX(sequence) FROM events WHERE session_id = sessions.id), 0) DESC,
            rowid DESC LIMIT 200",
@@ -2220,7 +2226,7 @@ fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<Ses
             .map(|row| Ok(serde_json::from_str::<Event>(&row?)?))
             .collect::<Result<Vec<_>>>()?;
         items.push(SessionItem {
-            label: title.unwrap_or_else(|| "新会话".into()),
+            label: title.unwrap_or_else(|| "会话".into()),
             detail: session_status(&session, &events).into(),
             value: session.id,
             updated_at,

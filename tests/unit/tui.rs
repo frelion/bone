@@ -988,19 +988,28 @@ fn session_titles_skip_blank_lines_and_catalog_keeps_an_old_current_session() {
             .unwrap();
     }
     connection.execute_batch("COMMIT").unwrap();
-    let items = session_items(&data, &workspace, &engine.state().id).unwrap();
-    assert_eq!(items.len(), 200);
-    assert_eq!(items[0].value, engine.state().id);
-    assert_eq!(items[0].label, "新会话");
-    assert!(items[0].detail.is_empty());
-    assert_eq!(
-        items[0].updated_at, None,
-        "a session without events has no activity time"
+    assert!(
+        session_items(&data, &workspace, &engine.state().id)
+            .unwrap()
+            .is_empty()
+    );
+    engine.stop().unwrap();
+    assert!(
+        session_items(&data, &workspace, &engine.state().id)
+            .unwrap()
+            .is_empty(),
+        "a stop event does not make an unused session visible"
     );
     engine
         .post_message("\n  \n  中文标题保留真实内容  \n第二段")
         .unwrap();
     let items = session_items(&data, &workspace, &engine.state().id).unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "empty rows must not consume the catalog limit"
+    );
+    assert_eq!(items[0].value, engine.state().id);
     assert_eq!(items[0].label, "中文标题保留真实内容");
     assert!(items[0].detail.contains("运行"));
     assert!(!items[0].detail.contains("轮"));
@@ -1014,6 +1023,104 @@ fn session_titles_skip_blank_lines_and_catalog_keeps_an_old_current_session() {
         )
         .unwrap();
     assert_eq!(items[0].updated_at, Some(expected));
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    for index in 0..205 {
+        let state = bone::state::SessionState::new(&workspace);
+        let event = Event::new(
+            &state.id,
+            "input",
+            serde_json::json!({"source":"user", "message":rig_core::completion::Message::user(format!("历史任务 {index}"))}),
+        );
+        connection
+            .execute(
+                "INSERT INTO sessions(id,revision,snapshot) VALUES(?1,0,?2)",
+                rusqlite::params![state.id, serde_json::to_string(&state).unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO events(id,session_id,revision,payload) VALUES(?1,?2,0,?3)",
+                rusqlite::params![
+                    event.id,
+                    event.session_id,
+                    serde_json::to_string(&event).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+    connection.execute_batch("COMMIT").unwrap();
+    let items = session_items(&data, &workspace, &engine.state().id).unwrap();
+    assert_eq!(items.len(), 200);
+    assert_eq!(items[0].value, engine.state().id);
+    assert_eq!(items[0].label, "中文标题保留真实内容");
+    assert!(
+        items[1..]
+            .iter()
+            .all(|item| item.label.starts_with("历史任务 "))
+    );
+}
+
+#[test]
+fn session_catalog_keeps_existing_work_without_a_user_title() {
+    let (dir, engine, _app) = local_app();
+    let data = dir.path().join("data");
+    let workspace = &engine.state().workspace;
+    let connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+    let mut states = Vec::new();
+    for status in [
+        JobState::Ready,
+        JobState::Waiting,
+        JobState::Idle,
+        JobState::Closed,
+    ] {
+        let mut state = bone::state::SessionState::new(workspace);
+        let mut job = bone::state::Job::new("已有工作");
+        job.state = status;
+        state.jobs.insert(job.id.clone(), job);
+        states.push(state);
+    }
+    let mut pending = bone::state::SessionState::new(workspace);
+    pending.pending_inputs.push_back("pending-input".into());
+    states.push(pending);
+    let mut unknown = bone::state::SessionState::new(workspace);
+    unknown.unknown_writes.insert(
+        "unknown-call".into(),
+        bone::state::UnknownWrite {
+            call_id: "unknown-call".into(),
+            job_id: "unknown-job".into(),
+            root_input: None,
+            tool_name: "shell".into(),
+        },
+    );
+    let unknown_id = unknown.id.clone();
+    states.push(unknown);
+    for state in &states {
+        connection
+            .execute(
+                "INSERT INTO sessions(id,revision,snapshot) VALUES(?1,0,?2)",
+                rusqlite::params![state.id, serde_json::to_string(state).unwrap()],
+            )
+            .unwrap();
+    }
+    let items = session_items(&data, workspace, &engine.state().id).unwrap();
+    assert_eq!(items.len(), states.len());
+    for state in states {
+        let item = items.iter().find(|item| item.value == state.id).unwrap();
+        assert_eq!(item.label, "会话");
+        assert_eq!(item.updated_at, None);
+    }
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.value == unknown_id)
+            .unwrap()
+            .detail,
+        "核查"
+    );
+    assert!(
+        engine.events().unwrap().is_empty(),
+        "catalog reads must not create events"
+    );
 }
 
 #[test]
@@ -1157,7 +1264,8 @@ async fn completed_work_reopens_without_a_spurious_resume_prompt() {
 async fn automatic_sidebar_refresh_preserves_the_browsed_session_instead_of_selecting_current() {
     let (dir, mut engine, mut app) = local_app();
     let data = dir.path().join("data");
-    let other = Engine::open(
+    engine.post_message("当前任务").unwrap();
+    let mut other = Engine::open(
         &data,
         &engine.state().workspace,
         None,
@@ -1166,6 +1274,8 @@ async fn automatic_sidebar_refresh_preserves_the_browsed_session_instead_of_sele
         Default::default(),
     )
     .unwrap();
+    other.post_message("另一任务").unwrap();
+    other.stop().unwrap();
     app.ui
         .set_sessions(session_items(&data, &engine.state().workspace, &engine.state().id).unwrap());
     app.ui.select_session(&engine.state().id);
@@ -1197,8 +1307,8 @@ async fn automatic_sidebar_refresh_preserves_the_browsed_session_instead_of_sele
     drop(other);
     app.switch_session(&mut engine, &data, Some(&selected))
         .unwrap();
-    assert!(!engine.state().paused);
-    assert!(!app.ui.notice.contains("Ctrl+R"));
+    assert!(engine.state().paused);
+    assert!(app.ui.notice.contains("Ctrl+R"));
     assert!(
         engine
             .events()
@@ -1206,6 +1316,81 @@ async fn automatic_sidebar_refresh_preserves_the_browsed_session_instead_of_sele
             .iter()
             .all(|event| !matches!(event.kind.as_str(), "model_started" | "tool_started"))
     );
+}
+
+#[tokio::test]
+async fn new_session_returns_to_input_and_pauses_current_work_instead_of_the_sidebar_candidate() {
+    let (dir, mut engine, mut app) = local_app();
+    let data = dir.path().join("data");
+    engine.post_message("当前执行对象").unwrap();
+    let original = engine.state().id.clone();
+    let mut other = Engine::open(
+        &data,
+        &engine.state().workspace,
+        None,
+        app.settings.profile.clone(),
+        "test".into(),
+        Default::default(),
+    )
+    .unwrap();
+    other.post_message("只浏览的候选对象").unwrap();
+    let candidate = other.state().id.clone();
+    app.load(&mut engine, &data).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.session_index.is_some() {
+            app.tasks(&mut engine, &data).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::SHIFT,
+    ));
+    app.ui.select_session(&candidate);
+    assert_eq!(app.ui.focus, Focus::Sessions);
+    assert_eq!(app.ui.selected_session(), Some(candidate.as_str()));
+    app.switch_session(&mut engine, &data, None).unwrap();
+    assert_eq!(app.ui.focus, Focus::Input);
+    assert_ne!(engine.state().id, original);
+    assert_ne!(engine.state().id, candidate);
+    assert!(!engine.state().paused);
+    assert!(engine.events().unwrap().is_empty());
+    let connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+    let snapshot = |id: &str| {
+        let text: String = connection
+            .query_row("SELECT snapshot FROM sessions WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        serde_json::from_str::<bone::state::SessionState>(&text).unwrap()
+    };
+    assert!(snapshot(&original).paused);
+    assert!(!snapshot(&candidate).paused);
+    let before = session_items(&data, &engine.state().workspace, &engine.state().id).unwrap();
+    assert_eq!(before.len(), 2);
+    assert!(!before.iter().any(|item| item.value == engine.state().id));
+    app.ui.paste("新上下文草稿");
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::SHIFT,
+    ));
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Right,
+        KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.ui.focus, Focus::Input);
+    assert_eq!(app.ui.draft(), "新上下文草稿");
+    engine.post_message("新上下文第一条输入").unwrap();
+    let after = session_items(&data, &engine.state().workspace, &engine.state().id).unwrap();
+    assert_eq!(after.len(), 3);
+    assert_eq!(after[0].value, engine.state().id);
+    assert_eq!(after[0].label, "新上下文第一条输入");
+    assert!(other.events().unwrap().iter().all(|event| !matches!(
+        event.kind.as_str(),
+        "stopped" | "model_started" | "tool_started"
+    )));
 }
 
 #[test]
@@ -1239,7 +1424,11 @@ fn switching_sessions_and_reopening_restores_the_exact_multiline_input_position(
         KeyCode::Right,
         KeyModifiers::SHIFT,
     ));
-    assert_eq!(app.ui.focus, Focus::Conversation);
+    assert_eq!(app.ui.focus, Focus::Input);
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Up,
+        KeyModifiers::SHIFT,
+    ));
     app.ui.handle_key(crossterm::event::KeyEvent::new(
         KeyCode::Left,
         KeyModifiers::SHIFT,

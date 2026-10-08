@@ -1,0 +1,28 @@
+{
+  "status": "PASS",
+  "fingerprint": {
+    "version": "0.9.3",
+    "source_fingerprint": "4e74d7da36f9e4091185780a278dfcc86d80f064264e1b3ce22d62ab60a40b70",
+    "harness_sha256": "a1bb1717582cbc89a922f449a9f1d9c91a45f99467d34e36b683317b4549ceb1",
+    "binary_sha256": "859b244b30248f1462310340c4cf721cc69d3157fcc560b272dd546d4d09298d"
+  },
+  "binary_tests": 102,
+  "python_tests": 8,
+  "format": "PASS",
+  "clippy_all_targets_all_features": "PASS",
+  "install": "PASS",
+  "pty": [
+    {
+      "case": "new-session-flow",
+      "checks": 8,
+      "frames": 8,
+      "status": "PASS"
+    },
+    {
+      "case": "product-flow",
+      "checks": 20,
+      "frames": 18,
+      "status": "PASS"
+    }
+  ]
+}

@@ -1117,42 +1117,50 @@ def product_flow(f):
                     (question['id'],session,1,json.dumps(question),job,json.dumps(question)))
         connection.commit()
     f.send(b'\x1b[1;2D');f.wait(lambda:f.visible('收紧 OAuth'),'mixed authored sidebar index');f.send(b'\x1b[H')
-    f.capture('Real terminal: current session is also the keyboard candidate')
+    f.capture('Real terminal: an empty current session has no sidebar placeholder')
     width=(f.cols//4 if f.cols>=80 else 0);width=max(26,min(32,width)) if width else f.cols
     sidebar=[''.join(row[:width]) for row in f.terminal_cells]
-    current_row=next((row for row,line in enumerate(sidebar) if '新会话' in line),None)
+    candidate_row=next((row for row,line in enumerate(sidebar) if '收紧 OAuth' in line),None)
     bold_rows={run['row'] for run in f.cell_styles if 'bold' in run['attributes'] and run['start']<width and run['end']>2}
     highlighted={run['row'] for run in f.cell_styles if 'reverse' in run['attributes'] and run['start']<width and run['end']>2}
-    check('current title and keyboard candidate styles combine on the same session',
-        current_row is not None and current_row in bold_rows and current_row in highlighted and not f.calls(),
-        {'current_row':current_row,'bold_rows':sorted(bold_rows),'highlighted_rows':sorted(highlighted)})
-    f.send(b'\x1b[B');f.capture('Real terminal: browse candidate, current session and mixed attention states')
+    check('empty current session is omitted while a real conversation is selectable',
+        not any('新会话' in line for line in sidebar) and not bold_rows and candidate_row in highlighted and not f.calls(),
+        {'candidate_row':candidate_row,'bold_rows':sorted(bold_rows),'highlighted_rows':sorted(highlighted)})
+    f.send(b'\x1b[B');f.capture('Real terminal: browse persisted conversations without marking one as the empty current session')
     check('mixed titles expose distinct required attention words',all(f.visible(word) for word in ('核查','回复','暂停')))
     sidebar=[''.join(row[:width]) for row in f.terminal_cells]
-    current_row=next((row for row,line in enumerate(sidebar) if '新会话' in line),None)
-    candidate_row=next((row for row,line in enumerate(sidebar) if '收紧 OAuth' in line),None)
-    candidate_time=time.strftime('%m/%d %H:%M',time.localtime(int(user['timestamp'])/1000))
+    inactive_row=next((row for row,line in enumerate(sidebar) if '收紧 OAuth' in line),None)
+    candidate_row=next((row for row,line in enumerate(sidebar) if '账单迁移' in line),None)
+    candidate_time=time.strftime('%m/%d %H:%M',time.localtime((int(user['timestamp'])-60000)/1000))
     bold_rows={run['row'] for run in f.cell_styles if 'bold' in run['attributes'] and run['start']<width and run['end']>2}
     highlighted={run['row'] for run in f.cell_styles if 'reverse' in run['attributes'] and run['start']<width and run['end']>2}
-    check('current identity and browsed candidate remain different without color',
-        current_row is not None and current_row in bold_rows and current_row not in highlighted and candidate_row in highlighted and candidate_row not in bold_rows,
-        {'current_row':current_row,'candidate_row':candidate_row,'bold_rows':sorted(bold_rows),'highlighted_rows':sorted(highlighted)})
+    check('browsing a candidate does not invent a current identity for an empty session',
+        not bold_rows and candidate_row in highlighted and inactive_row not in highlighted,
+        {'candidate_row':candidate_row,'inactive_row':inactive_row,'bold_rows':sorted(bold_rows),'highlighted_rows':sorted(highlighted)})
     info=sidebar[candidate_row+1]
     dim_rows={run['row'] for run in f.cell_styles if 'dim' in run['attributes'] and run['start']<width and run['end']>2}
     check('session information shows its real status and persisted local update time',
-        '回复' in info and candidate_time in info and candidate_row+1 in highlighted
+        '核查' in info and candidate_time in info and candidate_row+1 in highlighted
         and candidate_row+1 not in bold_rows and candidate_row+2 not in highlighted
-        and candidate_row+1 not in dim_rows and current_row+1 in dim_rows and candidate_row+2 in dim_rows,
+        and candidate_row+1 not in dim_rows and inactive_row+1 in dim_rows and candidate_row+2 in dim_rows,
         {'information_line':info,'expected_local_timestamp':candidate_time,'timestamp_source':'last authored persistent event','dim_rows':sorted(dim_rows)})
     check('authored sidebar list remains a session list',len(f.session_states())==33 and not f.calls())
-    f.send(b'\x1b[1;2B');f.capture('Real terminal: input focus removes candidate highlight and retains the current title weight')
+    f.send(b'\x1b[1;2B');f.capture('Real terminal: returning to the empty composer removes all session selection marks')
     bold_rows={run['row'] for run in f.cell_styles if 'bold' in run['attributes'] and run['start']<width and run['end']>2}
     highlighted={run['row'] for run in f.cell_styles if 'reverse' in run['attributes'] and run['start']<width and run['end']>2}
-    check('leaving sidebar removes candidate highlight while preserving current identity without model work',
-        current_row in bold_rows and candidate_row not in bold_rows and not highlighted and f.cursor_visible and not f.calls(),
-        {'current_row':current_row,'candidate_row':candidate_row,'bold_rows':sorted(bold_rows),'highlighted_rows':sorted(highlighted),'requests':len(f.calls())})
+    check('leaving sidebar removes candidate highlight without marking another session current',
+        not bold_rows and not highlighted and f.cursor_visible and not f.calls(),
+        {'bold_rows':sorted(bold_rows),'highlighted_rows':sorted(highlighted),'requests':len(f.calls())})
     f.send('修复登录重定向：保持兼容行为，先确认失败回调的处理方式。\r')
-    f.wait(lambda:len(f.calls())==1,'one actual local model request starts');f.capture('Actual Job: thinking without invented completed tasks')
+    f.wait(lambda:len(f.calls())==1,'one actual local model request starts')
+    f.wait(lambda:f.visible('修复登录重'),'first real input immediately joins the sidebar')
+    f.capture('Actual Job: first input creates the visible current conversation while thinking')
+    sidebar=[''.join(row[:width]) for row in f.terminal_cells]
+    current_row=next((row for row,line in enumerate(sidebar) if '修复登录重' in line),None)
+    bold_rows={run['row'] for run in f.cell_styles if 'bold' in run['attributes'] and run['start']<width and run['end']>2}
+    check('first actual input appears as the current sidebar conversation before completion',
+        current_row is not None and current_row in bold_rows and len(f.calls())==1,
+        {'current_row':current_row,'bold_rows':sorted(bold_rows)})
     f.wait(lambda:any(e['kind']=='question' for e in f.events(original)),'actual question from a Job')
     question=next(e for e in f.events(original) if e['kind']=='question')
     new_draft='保持兼容行为。\n另外保留现有 cookie 名称。'
@@ -1169,7 +1177,7 @@ def product_flow(f):
     # The new session is the only non-authored session without an input event.
     second=next(s for s in f.session_states() if s!=original and not f.events(s))
     f.observed_session=second
-    f.send(b'\x1b[1;2D\x1b[H\x1b[B\r');f.pump(.25);f.send(b'\x1b[1;2B')
+    f.send(b'\x1b[1;2D\x1b[H\r');f.pump(.25);f.send(b'\x1b[1;2B')
     f.wait(lambda:f.visible(answer),'source answer restores after session switch');f.observed_session=original
     check('session switch keeps answer target, caret and selection',saved(original).get('reply_to')==question['id'] and position==(saved(original).get('cursor'),saved(original).get('selection')))
     f.quit();f.restart(original);f.pump(.2);f.capture('Restart restores the actual targeted answer')
@@ -1214,9 +1222,11 @@ def product_flow(f):
     check('inactive empty parent draft has no second reversed caret behind the API form',not reversed_parent,
         {'draft_rows':[draft_top+1,draft_bottom-1],'reverse_runs':reversed_parent})
     f.send(b'\x1b');f.pump(.12)
-    # History runs in the existing empty B. A intentionally still owns an
-    # unanswered work input; using A would also require scripting its resumption.
-    f.send(b'\x1b[1;2D\x1b[H\x1b[B\r');f.pump(.25);f.send(b'\x1b[1;2B')
+    # Empty sessions have no list entries. Start history through /new; A still
+    # owns the unanswered work input and its preserved answer draft.
+    existing=set(f.session_states())
+    menu('new');f.wait(lambda:len(f.session_states())==len(existing)+1,'fresh history conversation created')
+    second=next(session for session in f.session_states() if session not in existing)
     f.observed_session=second
     original_ui=json.dumps(saved(original),ensure_ascii=False)
     check('separate history work leaves original question and its answer draft paused',f.state(original)['paused'] and answer in original_ui and question['id'] in original_ui)
@@ -1321,6 +1331,87 @@ def file_completion(f):
     f.quit()
 
 
+def new_session_flow(f):
+    """Opening an empty composer never inserts a conversation placeholder."""
+    f.scenario_scope = "Installed binary in a real PTY; one actual Engine/Job request to an authored localhost Responses endpoint. No remote model or personal credentials."
+    f.acceptance_checks = []
+    def check(name, passed, observed=None):
+        f.acceptance_checks.append({'name':name,'passed':bool(passed),'observed':observed})
+        assert passed, name
+    def saved(session):
+        path=f.data/'tui'/(session+'.json')
+        return json.loads(path.read_text()) if path.exists() else {}
+    def sidebar_marks():
+        f.screen()
+        width=max(26,min(32,f.cols//4))
+        lines=[''.join(row[:width]) for row in f.terminal_cells]
+        bold={run['row'] for run in f.cell_styles if 'bold' in run['attributes'] and run['start']<width and run['end']>2}
+        return lines,bold
+    original=f.state()['id']
+    f.observed_session=original
+    lines,bold=sidebar_marks()
+    check('startup has an empty composer and no new-session list item',
+        not any('新会话' in line for line in lines) and not bold and f.cursor_visible and not f.calls())
+    f.send('/new\r')
+    f.wait(lambda:len(f.session_states())==2,'slash /new creates a fresh session')
+    active=next(session for session in f.session_states() if session!=original)
+    f.observed_session=active
+    f.capture('/new opens an empty focused composer without inserting a list item')
+    lines,bold=sidebar_marks()
+    check('/new stays local, focuses input and adds no sidebar placeholder',
+        not any('新会话' in line for line in lines) and not bold and f.cursor_visible
+        and not f.calls() and not any(e['kind']=='input' for e in f.events()))
+    f.send('核查登录边界 NEW_SESSION_TASK\r')
+    f.wait(lambda:len(f.calls())==1,'first real user input starts its Job')
+    f.wait(lambda:f.visible('核查登录边界'),'first input becomes a sidebar conversation')
+    f.capture('The first submitted input appears immediately as the current conversation')
+    lines,bold=sidebar_marks()
+    current_row=next((row for row,line in enumerate(lines) if '核查登录边界' in line),None)
+    check('first input is visible and current before the model completes',
+        current_row is not None and current_row in bold and len(f.calls())==1,
+        {'current_row':current_row,'bold_rows':sorted(bold)})
+    f.wait(lambda:any(e['kind']=='question' for e in f.events(active)),'actual Job asks its pending question')
+    question=next(e for e in f.events(active) if e['kind']=='question')
+    retained='旧会话未发送草稿'
+    f.send(retained)
+    f.wait(lambda:saved(active).get('draft')==retained,'old draft is durable before /new')
+    f.send(b'\x1b[1;2D')
+    f.wait(lambda:bool(f.screen()) and not f.cursor_visible,'old conversation sidebar focused')
+    f.send(b'\x10');f.pump(.12);f.send('new\r')
+    f.wait(lambda:len(f.session_states())==3,'same /new action creates fresh composer from sidebar focus')
+    fresh=next(session for session in f.session_states() if session not in (original,active))
+    f.observed_session=fresh
+    f.capture('/new from sidebar focus returns directly to input and preserves the old task')
+    lines,bold=sidebar_marks()
+    check('new composer has no stale current marker and input focus is restored',
+        not any('新会话' in line for line in lines) and not bold and f.cursor_visible
+        and any('核查登录边界' in line for line in lines), {'bold_rows':sorted(bold)})
+    check('starting fresh preserves the old task, question and exact unsent draft',
+        f.state(active)['paused'] and saved(active).get('draft')==retained
+        and any(e['id']==question['id'] for e in f.events(active)) and len(f.calls())==1)
+    f.send('新页可直接输入')
+    f.wait(lambda:saved(fresh).get('draft')=='新页可直接输入','fresh composer accepts typing immediately')
+    check('typing a new draft neither starts a Job nor adds a placeholder',
+        not f.events(fresh) and not f.state(fresh)['jobs'] and len(f.calls())==1)
+    f.capture('Typing directly edits the new draft while the old conversation remains available')
+    f.send(b'\x1b[1;2D\x1b[H\r\x1b[1;2C')
+    f.wait(lambda:saved(active).get('draft')==retained and f.visible(retained),'returning restores the old unsent draft')
+    f.observed_session=active
+    check('returning restores the old draft and keeps the new unsent draft',
+        saved(fresh).get('draft')=='新页可直接输入' and saved(active).get('draft')==retained and len(f.calls())==1)
+    f.capture('Old question, original draft and current title restore together')
+    # /status is a compatibility reader, not a public command-palette entry.
+    # The draft has already been checked; deliberately clear it to query the ID.
+    f.send(b'\x01\x0b');f.send('/status\r')
+    f.wait(lambda:f.visible('Session: '+active),'local status verifies the exact reopened runtime UUID')
+    check('returning opens the original task verified by its complete runtime UUID',
+        f.visible('Session: '+active) and len(f.calls())==1,
+        {'verified_session':active,'verification':'/status','requests':len(f.calls())})
+    f.capture('Returning to the old task is verified through its full real Session ID')
+    f.send(b'\x1b');f.pump(.12)
+    f.quit()
+
+
 def session_commands(f):
     original = f.state()['id']
     f.send('/model ollama:fixture-next\r')
@@ -1342,13 +1433,14 @@ def session_commands(f):
             return [row[0] for row in connection.execute('SELECT id FROM sessions')]
     f.wait(lambda: len(session_ids()) == 2, 'new session created')
     assert original in session_ids()
-    f.send('/sessions\r')  # Legacy alias stays parseable; sidebar is the normal entry.
-    f.wait(lambda: f.visible('1 轮 · 已暂停'), 'session picker exposes meaningful source status')
-    f.send('已暂停\r')
-    f.wait(lambda: '会话已打开' in f.screen() or '会话已打开' in bytes(f.output).decode('utf-8', errors='replace'), 'session picker opens its selected session')
+    current=next(session for session in session_ids() if session!=original)
+    f.send('/sessions\r')  # Legacy alias stays parseable; empty sessions are omitted.
+    f.pump(.3)
+    assert not f.visible('已暂停') and not f.visible('新会话'), 'empty command-only sessions became conversation entries'
+    f.send(b'\x1b');f.pump(.12)
     f.send('/status\r')
-    f.wait(lambda: f.visible('Session: ' + original), 'status verifies the actual reopened session UUID')
-    f.capture('The reopened session identity is verified through its actual local status')
+    f.wait(lambda: f.visible('Session: ' + current), 'status verifies /new kept the actual fresh session UUID')
+    f.capture('Empty conversations stay omitted; /new runtime identity is verified through local status')
     f.send(b'\x1b')
     f.pump(.2)
     assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'session command created agent inputs'
@@ -1790,7 +1882,7 @@ def exit_resume(f):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/bone')
-    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','reconcile-reply','feedback-flow','workspace-flow','sidebar-flow','product-flow'])
+    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','reconcile-reply','feedback-flow','workspace-flow','sidebar-flow','product-flow','new-session-flow'])
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument('--size', default='80x24', choices=['80x24', '120x40'], help='real terminal columns x rows')
     parser.add_argument('--keep-going', action='store_true', help='record every selected scenario, then fail if any failed')
@@ -1798,6 +1890,8 @@ def main():
     args = parser.parse_args()
     verify_vt_replay()
     cases = [
+        ('new-session-flow', [{'contains':['NEW_SESSION_TASK'],'delay_seconds':1.8,
+            'output':[tool('ask_user',{'question':'核查登录边界：要保留原有跳转地址吗？'})]}],new_session_flow),
         ('product-flow', [{'delay_seconds':1.8,'output':[tool('ask_user',{'question':'失败回调是否继续返回原地址？'})]}]+[
             {'match_last_user_contains':'历史回归 '+str(index).zfill(2),'text':
                 '第 '+str(index).zfill(2)+' 轮复查结果\n\n'
